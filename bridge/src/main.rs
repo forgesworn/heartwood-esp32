@@ -3,9 +3,20 @@
 // Pi-side relay bridge for the Heartwood ESP32 signing bunker.
 //
 // Connects to Nostr relays, subscribes to NIP-46 request events addressed to
-// the bunker pubkey, NIP-44 decrypts them, forwards the plaintext NIP-46
-// JSON-RPC over serial to the ESP32, reads the response, NIP-44 encrypts it,
-// and publishes back to the relay.
+// the bunker pubkey, and forwards them to the ESP32 over serial.
+//
+// Two operating modes:
+//
+//   Passthrough mode (--bridge-secret provided):
+//     Authenticates with the ESP32 at startup via a SESSION_AUTH (0x21) frame.
+//     Forwards raw NIP-44 ciphertext to the ESP32 via ENCRYPTED_REQUEST (0x10)
+//     frames. The ESP32 decrypts, signs, re-encrypts and returns ENCRYPTED_RESPONSE
+//     (0x11). The bridge publishes the ciphertext verbatim — no crypto happens here.
+//
+//   Legacy mode (no --bridge-secret):
+//     Bridge NIP-44 decrypts the request, forwards the plaintext NIP-46 JSON-RPC
+//     to the ESP32 via NIP46_REQUEST (0x02) frames, receives the plaintext response,
+//     NIP-44 encrypts it and publishes to the relay.
 //
 // The ESP32 is the brain — it holds the keys and makes all signing decisions.
 // This bridge is a dumb pipe that provides network access.
@@ -33,21 +44,30 @@ struct Cli {
     #[arg(short, long, default_value_t = 115200)]
     baud: u32,
 
-    /// Bunker secret key (nsec or hex) — used for NIP-44 encryption and relay auth
+    /// Bunker secret key (nsec or hex) — used for relay auth and, in legacy mode, NIP-44 crypto
     #[arg(long)]
     bunker_secret: String,
 
     /// Relay URLs (comma-separated)
     #[arg(short, long, default_value = "wss://relay.damus.io,wss://nos.lol")]
     relays: String,
+
+    /// Bridge authentication secret (hex, 64 chars). Must match the ESP32's NVS bridge secret.
+    /// If provided, uses encrypted passthrough mode. If omitted, falls back to legacy mode.
+    #[arg(long)]
+    bridge_secret: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Serial helpers
+// ---------------------------------------------------------------------------
+
 /// Send a NIP-46 JSON-RPC request to the ESP32 over serial and read the response.
+/// Legacy mode only — forwards plaintext, expects a NIP46_RESPONSE (0x03) frame back.
 fn forward_to_esp32(
     port: &mut Box<dyn serialport::SerialPort>,
     request_json: &str,
 ) -> Result<String, String> {
-    // Build and send the request frame
     let frame_bytes = frame::build_frame(FRAME_TYPE_NIP46_REQUEST, request_json.as_bytes())
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
@@ -56,7 +76,99 @@ fn forward_to_esp32(
     std::io::Write::flush(port.as_mut())
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
-    // Read response — hunt for a valid frame (ESP-IDF log noise may be mixed in)
+    read_any_response(port)
+}
+
+/// Authenticate the bridge session with the ESP32.
+///
+/// Sends a SESSION_AUTH (0x21) frame containing the 32-byte bridge secret and
+/// waits for a SESSION_ACK (0x22) frame with status byte 0x00.
+fn authenticate_bridge(
+    port: &mut Box<dyn serialport::SerialPort>,
+    bridge_secret: &[u8; 32],
+) -> Result<(), String> {
+    let frame_bytes = frame::build_frame(FRAME_TYPE_SESSION_AUTH, bridge_secret)
+        .map_err(|e| format!("frame build failed: {:?}", e))?;
+
+    std::io::Write::write_all(port.as_mut(), &frame_bytes)
+        .map_err(|e| format!("serial write failed: {e}"))?;
+    std::io::Write::flush(port.as_mut())
+        .map_err(|e| format!("serial flush failed: {e}"))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
+    let mut pos = 0;
+
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err("timeout waiting for session ACK".into());
+        }
+
+        let mut byte = [0u8; 1];
+        match port.read(&mut byte) {
+            Ok(1) => {
+                if pos < buf.len() {
+                    buf[pos] = byte[0];
+                    pos += 1;
+                }
+
+                if pos >= FRAME_OVERHEAD {
+                    match frame::parse_frame(&buf[..pos]) {
+                        Ok(f) if f.frame_type == FRAME_TYPE_SESSION_ACK => {
+                            if f.payload.first() == Some(&0x00) {
+                                log::info!("Bridge session authenticated");
+                                return Ok(());
+                            } else {
+                                return Err(format!(
+                                    "bridge auth failed: status 0x{:02x}",
+                                    f.payload.first().unwrap_or(&0xFF)
+                                ));
+                            }
+                        }
+                        Err(frame::FrameError::TooShort) => continue,
+                        _ => continue,
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("serial read error: {e}")),
+        }
+    }
+}
+
+/// Send an encrypted NIP-46 request to the ESP32 via an ENCRYPTED_REQUEST (0x10) frame.
+///
+/// Frame payload layout: `[master_pubkey_32][client_pubkey_32][ciphertext_bytes...]`
+///
+/// The ESP32 decrypts, processes, re-encrypts, and returns the response.
+fn forward_encrypted(
+    port: &mut Box<dyn serialport::SerialPort>,
+    master_pubkey: &[u8; 32],
+    client_pubkey: &[u8; 32],
+    ciphertext: &str,
+) -> Result<String, String> {
+    let mut payload = Vec::with_capacity(64 + ciphertext.len());
+    payload.extend_from_slice(master_pubkey);
+    payload.extend_from_slice(client_pubkey);
+    payload.extend_from_slice(ciphertext.as_bytes());
+
+    let frame_bytes = frame::build_frame(FRAME_TYPE_ENCRYPTED_REQUEST, &payload)
+        .map_err(|e| format!("frame build failed: {:?}", e))?;
+
+    std::io::Write::write_all(port.as_mut(), &frame_bytes)
+        .map_err(|e| format!("serial write failed: {e}"))?;
+    std::io::Write::flush(port.as_mut())
+        .map_err(|e| format!("serial flush failed: {e}"))?;
+
+    read_any_response(port)
+}
+
+/// Read a response frame from the ESP32, accepting both NIP46_RESPONSE (0x03, plaintext)
+/// and ENCRYPTED_RESPONSE (0x11, ciphertext) frame types.
+///
+/// Returns the payload as a UTF-8 string (either raw JSON or NIP-44 ciphertext).
+fn read_any_response(port: &mut Box<dyn serialport::SerialPort>) -> Result<String, String> {
     let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
     let mut pos = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -77,7 +189,9 @@ fn forward_to_esp32(
                 if pos >= FRAME_OVERHEAD {
                     match frame::parse_frame(&buf[..pos]) {
                         Ok(response_frame) => {
-                            if response_frame.frame_type == FRAME_TYPE_NIP46_RESPONSE {
+                            if response_frame.frame_type == FRAME_TYPE_NIP46_RESPONSE
+                                || response_frame.frame_type == FRAME_TYPE_ENCRYPTED_RESPONSE
+                            {
                                 return String::from_utf8(response_frame.payload)
                                     .map_err(|e| format!("invalid UTF-8 in response: {e}"));
                             } else if response_frame.frame_type == FRAME_TYPE_NACK {
@@ -91,10 +205,9 @@ fn forward_to_esp32(
                         }
                         Err(frame::FrameError::TooShort) => continue,
                         Err(_) => {
-                            // Bad frame — try to find next magic bytes
-                            if let Some(magic_pos) = buf[1..pos]
-                                .windows(2)
-                                .position(|w| w == &MAGIC_BYTES)
+                            // Bad frame — try to find the next magic byte sequence
+                            if let Some(magic_pos) =
+                                buf[1..pos].windows(2).position(|w| w == &MAGIC_BYTES)
                             {
                                 let new_start = magic_pos + 1;
                                 buf.copy_within(new_start..pos, 0);
@@ -113,16 +226,62 @@ fn forward_to_esp32(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hex decoding (no extra crate needed — bridge secret is exactly 32 bytes)
+// ---------------------------------------------------------------------------
+
+fn decode_hex_32(s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return Err(format!(
+            "--bridge-secret must be 64 hex chars (32 bytes), got {} chars",
+            s.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(format!("invalid hex character: {}", b as char)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
+
+    // Parse bridge secret early so we fail fast on bad input
+    let bridge_secret: Option<[u8; 32]> = match &cli.bridge_secret {
+        Some(hex_str) => Some(decode_hex_32(hex_str).expect("invalid --bridge-secret")),
+        None => None,
+    };
+
+    let passthrough = bridge_secret.is_some();
 
     // Parse bunker keys
     let bunker_keys = Keys::parse(&cli.bunker_secret)?;
     let bunker_pubkey = bunker_keys.public_key();
 
     log::info!("Bunker pubkey: {}", bunker_pubkey.to_bech32()?);
+    log::info!(
+        "Mode: {}",
+        if passthrough { "passthrough (encrypted)" } else { "legacy (bridge decrypts)" }
+    );
 
     // Open serial port (wrapped in Mutex for shared access from async closure)
     let port: Box<dyn serialport::SerialPort> = serialport::new(&cli.port, cli.baud)
@@ -135,9 +294,16 @@ async fn main() -> Result<()> {
     port.write_data_terminal_ready(false).ok();
     port.write_request_to_send(false).ok();
 
-    let port = Mutex::new(port);
-
     log::info!("Serial port {} open", cli.port);
+
+    // Authenticate with the ESP32 if running in passthrough mode
+    if let Some(secret) = &bridge_secret {
+        if let Err(e) = authenticate_bridge(&mut port, secret) {
+            panic!("Session authentication failed: {e}");
+        }
+    }
+
+    let port = Mutex::new(port);
 
     // Connect to relays
     let client = Client::new(bunker_keys.clone());
@@ -158,6 +324,9 @@ async fn main() -> Result<()> {
 
     client.subscribe(filter, None).await?;
     log::info!("Subscribed to NIP-46 events — waiting for requests...");
+
+    // Pre-compute the bunker pubkey bytes once (used in passthrough mode)
+    let master_pubkey_bytes: [u8; 32] = bunker_pubkey.to_bytes();
 
     // Event loop — process incoming NIP-46 requests
     client
@@ -180,62 +349,98 @@ async fn main() -> Result<()> {
                 let client_pubkey = event.pubkey;
                 log::info!("NIP-46 request from {}", client_pubkey);
 
-                // NIP-44 decrypt the content
-                let plaintext = match nip44::decrypt(
-                    bunker_keys.secret_key(),
-                    &client_pubkey,
-                    &event.content,
-                ) {
-                    Ok(pt) => pt,
-                    Err(e) => {
-                        log::error!("NIP-44 decrypt failed: {e}");
-                        return Ok(false);
+                if passthrough {
+                    // -------------------------------------------------------
+                    // Passthrough mode — forward raw ciphertext to ESP32
+                    // -------------------------------------------------------
+                    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+
+                    let response_content = {
+                        let mut port = port.lock().unwrap();
+                        match forward_encrypted(
+                            &mut port,
+                            &master_pubkey_bytes,
+                            &client_pubkey_bytes,
+                            &event.content,
+                        ) {
+                            Ok(resp) => resp,
+                            Err(e) => {
+                                log::error!("ESP32 forward (encrypted) failed: {e}");
+                                return Ok(false);
+                            }
+                        }
+                    };
+
+                    log::info!(
+                        "ESP32 response ({} bytes)",
+                        response_content.len()
+                    );
+
+                    // Publish the response verbatim — the ESP32 has already encrypted it
+                    let response_event = EventBuilder::new(Kind::NostrConnect, response_content)
+                        .tag(Tag::public_key(client_pubkey));
+
+                    match client_clone.send_event_builder(response_event).await {
+                        Ok(output) => log::info!("Response published: {}", output.id()),
+                        Err(e) => log::error!("Failed to publish response: {e}"),
                     }
-                };
-
-                log::info!(
-                    "Decrypted request: {}",
-                    &plaintext[..plaintext.len().min(100)]
-                );
-
-                // Forward to ESP32 over serial (blocking — fine for single-request flow)
-                let response_json = {
-                    let mut port = port.lock().unwrap();
-                    match forward_to_esp32(&mut port, &plaintext) {
-                        Ok(resp) => resp,
+                } else {
+                    // -------------------------------------------------------
+                    // Legacy mode — bridge does NIP-44 decrypt/encrypt
+                    // -------------------------------------------------------
+                    let plaintext = match nip44::decrypt(
+                        bunker_keys.secret_key(),
+                        &client_pubkey,
+                        &event.content,
+                    ) {
+                        Ok(pt) => pt,
                         Err(e) => {
-                            log::error!("ESP32 forward failed: {e}");
+                            log::error!("NIP-44 decrypt failed: {e}");
                             return Ok(false);
                         }
+                    };
+
+                    log::info!(
+                        "Decrypted request: {}",
+                        &plaintext[..plaintext.len().min(100)]
+                    );
+
+                    let response_json = {
+                        let mut port = port.lock().unwrap();
+                        match forward_to_esp32(&mut port, &plaintext) {
+                            Ok(resp) => resp,
+                            Err(e) => {
+                                log::error!("ESP32 forward failed: {e}");
+                                return Ok(false);
+                            }
+                        }
+                    };
+
+                    log::info!(
+                        "ESP32 response: {}",
+                        &response_json[..response_json.len().min(100)]
+                    );
+
+                    let ciphertext = match nip44::encrypt(
+                        bunker_keys.secret_key(),
+                        &client_pubkey,
+                        &response_json,
+                        nip44::Version::default(),
+                    ) {
+                        Ok(ct) => ct,
+                        Err(e) => {
+                            log::error!("NIP-44 encrypt failed: {e}");
+                            return Ok(false);
+                        }
+                    };
+
+                    let response_event = EventBuilder::new(Kind::NostrConnect, ciphertext)
+                        .tag(Tag::public_key(client_pubkey));
+
+                    match client_clone.send_event_builder(response_event).await {
+                        Ok(output) => log::info!("Response published: {}", output.id()),
+                        Err(e) => log::error!("Failed to publish response: {e}"),
                     }
-                };
-
-                log::info!(
-                    "ESP32 response: {}",
-                    &response_json[..response_json.len().min(100)]
-                );
-
-                // NIP-44 encrypt the response
-                let ciphertext = match nip44::encrypt(
-                    bunker_keys.secret_key(),
-                    &client_pubkey,
-                    &response_json,
-                    nip44::Version::default(),
-                ) {
-                    Ok(ct) => ct,
-                    Err(e) => {
-                        log::error!("NIP-44 encrypt failed: {e}");
-                        return Ok(false);
-                    }
-                };
-
-                // Build and publish the response event (kind 24133)
-                let response_event = EventBuilder::new(Kind::NostrConnect, ciphertext)
-                    .tag(Tag::public_key(client_pubkey));
-
-                match client_clone.send_event_builder(response_event).await {
-                    Ok(output) => log::info!("Response published: {}", output.id()),
-                    Err(e) => log::error!("Failed to publish response: {e}"),
                 }
 
                 Ok(false) // keep listening

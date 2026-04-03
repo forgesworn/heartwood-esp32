@@ -6,8 +6,9 @@
 //   sign_event      — shows event on OLED, waits for button approval, signs
 //   get_public_key  — returns the hex public key immediately (no approval needed)
 //
-// All k256 operations run in a dedicated thread with a 32 KiB aligned stack
-// to work around the LoadStoreAlignment fault (EXCCAUSE: 0x05) on Xtensa LX7.
+// All k256 operations run in a dedicated thread with a 64 KiB stack, 4 KiB
+// heap bump, and #[repr(align(32))] buffers to work around k256's unaligned
+// memory access on Xtensa LX7. See CLAUDE.md "Known issues" for details.
 
 use std::time::Duration;
 
@@ -166,9 +167,12 @@ fn do_sign(
 
     let (mut signing_secret, hex_pubkey) = std::thread::Builder::new()
         .name("derive".into())
-        .stack_size(32768)
+        .stack_size(65536)
         .spawn(move || -> Result<([u8; 32], String), String> {
-            #[repr(align(16))]
+            let _bump = vec![0u8; 4096];
+            std::hint::black_box(&_bump);
+            drop(_bump);
+            #[repr(align(32))]
             struct Aligned([u8; 32]);
             let aligned = Aligned(secret_copy);
 
@@ -202,11 +206,14 @@ fn do_sign(
     // Step 3: sign the event ID hash in another aligned thread.
     let sig_bytes: [u8; 64] = std::thread::Builder::new()
         .name("sign".into())
-        .stack_size(32768)
+        .stack_size(65536)
         .spawn(move || -> Result<[u8; 64], String> {
-            #[repr(align(16))]
+            let _bump = vec![0u8; 4096];
+            std::hint::black_box(&_bump);
+            drop(_bump);
+            #[repr(align(32))]
             struct AlignedKey([u8; 32]);
-            #[repr(align(16))]
+            #[repr(align(32))]
             struct AlignedHash([u8; 32]);
             let aligned_key = AlignedKey(signing_secret);
             let aligned_hash = AlignedHash(event_id_bytes);
@@ -249,9 +256,12 @@ fn handle_get_public_key(
 
     let pubkey_result = std::thread::Builder::new()
         .name("pubkey".into())
-        .stack_size(32768)
+        .stack_size(65536)
         .spawn(move || -> Result<String, String> {
-            #[repr(align(16))]
+            let _bump = vec![0u8; 4096];
+            std::hint::black_box(&_bump);
+            drop(_bump);
+            #[repr(align(32))]
             struct Aligned([u8; 32]);
             let aligned = Aligned(secret_copy);
 

@@ -63,31 +63,42 @@ fn main() {
     // --- Button pin (GPIO 0, active low, internal pull-up) ---
     let button_pin = PinDriver::input(peripherals.pins.gpio0, esp_idf_hal::gpio::Pull::Up).expect("button pin");
 
-    // --- USB serial driver — created early, stays alive for the dispatch loop ---
-    let mut usb = UsbSerialDriver::new(
-        peripherals.usb_serial,
-        peripherals.pins.gpio19,
-        peripherals.pins.gpio20,
-        &UsbSerialConfig::new().rx_buffer_size(512),
-    )
-    .expect("USB serial driver init failed");
-
     // --- NVS: check for stored secret ---
     let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
     let (mut nvs, stored_secret) = nvs::read_root_secret(nvs_partition).expect("NVS read failed");
 
     // Obtain the root secret — either from NVS or by waiting for a provision frame.
-    let root_secret: [u8; 32] = match stored_secret {
+    // The USB serial driver is created inside each branch because:
+    // - For provisioning: the host must connect BEFORE we take over USB-Serial-JTAG
+    // - For stored identity: we create it after NVS read for the dispatch loop
+    let (root_secret, mut usb): ([u8; 32], UsbSerialDriver<'_>) = match stored_secret {
         Some(secret) => {
             log::info!("Booted with stored identity");
-            secret
+            let usb = UsbSerialDriver::new(
+                peripherals.usb_serial,
+                peripherals.pins.gpio19,
+                peripherals.pins.gpio20,
+                &UsbSerialConfig::new().rx_buffer_size(512),
+            )
+            .expect("USB serial driver init failed");
+            (secret, usb)
         }
         None => {
             log::info!("No stored secret — entering provisioning mode");
             oled::show_awaiting(&mut display);
 
+            // Create USB serial driver — host is expected to connect after seeing
+            // "Awaiting secret..." on the OLED.
+            let mut usb = UsbSerialDriver::new(
+                peripherals.usb_serial,
+                peripherals.pins.gpio19,
+                peripherals.pins.gpio20,
+                &UsbSerialConfig::new().rx_buffer_size(512),
+            )
+            .expect("USB serial driver init failed");
+
             // Wait until we receive a valid provision frame.
-            loop {
+            let secret = loop {
                 let frame = protocol::read_frame(&mut usb);
                 if frame.frame_type == FRAME_TYPE_PROVISION {
                     if let Some(secret) =
@@ -103,7 +114,8 @@ fn main() {
                     );
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
                 }
-            }
+            };
+            (secret, usb)
         }
     };
 
@@ -118,18 +130,38 @@ fn main() {
     // separate copy moved into the thread.
     let secret_copy = root_secret;
 
+    // k256 LoadStoreAlignment workaround: allocate and free a large buffer to
+    // shift the heap high-water mark before calling k256. On Xtensa LX7, k256's
+    // internal field arithmetic does unaligned memory access that crashes unless
+    // the heap is in a favourable alignment state. Allocating ~8KB shifts the
+    // heap enough to land k256's internal structures on aligned addresses.
+    // This mirrors what happened in Phase 2 when UsbSerialDriver was created
+    // and dropped before derivation.
+    // Run derivation in a thread with large stack. The main FreeRTOS task
+    // has a fixed stack that may not have suitable alignment for k256.
+    // A freshly-allocated thread stack from the heap is more likely to work.
     let npub_result = std::thread::Builder::new()
         .name("derive".into())
-        .stack_size(32768)
+        .stack_size(65536)
         .spawn(move || {
-            #[repr(align(16))]
+            // Heap bump inside the thread to shift alignment
+            let bump = vec![0u8; 4096];
+            std::hint::black_box(&bump);
+            drop(bump);
+
+            #[repr(align(32))]
             struct Aligned([u8; 32]);
             let aligned = Aligned(secret_copy);
             derive::create_tree_root(&aligned.0)
         })
         .expect("thread spawn failed")
-        .join()
-        .expect("derivation panicked");
+        .join();
+
+    let npub_result = match npub_result {
+        Ok(Ok(root)) => Ok(root),
+        Ok(Err(e)) => Err(format!("derivation failed: {e}")),
+        Err(_) => Err("derivation thread crashed".into()),
+    };
 
     match &npub_result {
         Ok(tree_root) => {

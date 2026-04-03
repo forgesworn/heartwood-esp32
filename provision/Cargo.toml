@@ -1,0 +1,15 @@
+[package]
+name = "heartwood-provision"
+version = "0.1.0"
+edition = "2021"
+description = "Provisioning CLI for heartwood-esp32 — derives root secret from mnemonic"
+
+[dependencies]
+heartwood-common = { path = "../common" }
+bip39 = "2"
+bip32 = "0.5"
+serialport = "4"
+crc32fast = "1"
+rpassword = "7"
+zeroize = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }

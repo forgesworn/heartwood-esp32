@@ -114,6 +114,7 @@ pub fn handle_encrypted_request(
         &master.label,
         master.mode,
         master.slot,
+        &master.connect_secret,
         secp,
         display,
         button_pin,

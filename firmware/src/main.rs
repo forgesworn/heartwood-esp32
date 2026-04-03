@@ -267,6 +267,7 @@ fn main() {
                         &master.label,
                         master.mode,
                         master.slot,
+                        &master.connect_secret,
                         &secp,
                         &mut display,
                         &button_pin,

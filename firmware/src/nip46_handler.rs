@@ -64,6 +64,7 @@ pub fn handle_request(
     master_label: &str,
     master_mode: MasterMode,
     master_slot: u8,
+    connect_secret: &[u8; 32],
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
@@ -87,7 +88,6 @@ pub fn handle_request(
     );
 
     // Suppress unused-variable warnings for params not yet used in all branches.
-    let _ = master_label;
     let _ = policy_engine;
 
     match request.method.as_str() {
@@ -99,9 +99,23 @@ pub fn handle_request(
 
         "get_public_key" => Some(handle_get_public_key(master_secret, secp, &request)),
 
-        "connect" => Some(
-            nip46::build_connect_response(&request.id).unwrap_or_default(),
-        ),
+        "connect" => {
+            // params[0] is the client pubkey; params[1] is the optional secret
+            // from the bunker:// URI. Per NIP-46, the secret MUST be present and
+            // MUST match the stored connect secret for this master.
+            let client_secret = request.params.get(1).and_then(|v| v.as_str());
+            let stored_secret_hex = hex_encode(connect_secret);
+            let authorised = match client_secret {
+                Some(s) => constant_time_eq(s.as_bytes(), stored_secret_hex.as_bytes()),
+                None => false,
+            };
+            if authorised {
+                Some(nip46::build_connect_response_with_secret(&request.id, &stored_secret_hex).unwrap_or_default())
+            } else {
+                log::warn!("connect rejected — missing or incorrect secret (master_slot={})", master_slot);
+                Some(build_error_json(&request.id, -1, "unauthorised"))
+            }
+        }
 
         "ping" => Some(
             nip46::build_ping_response(&request.id).unwrap_or_default(),
@@ -772,6 +786,21 @@ fn random_iv_16() -> [u8; 16] {
 /// Falls back to an empty string on serialisation failure (should never occur).
 fn build_error_json(request_id: &str, code: i32, message: &str) -> String {
     nip46::build_error_response(request_id, code, message).unwrap_or_default()
+}
+
+/// Compare two byte slices in constant time to prevent timing-based attacks
+/// when validating connect secrets.
+///
+/// Returns `true` only when both slices are identical in both length and content.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Write a NIP-46 error response directly to USB.

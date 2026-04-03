@@ -335,6 +335,20 @@ pub fn build_connect_response(request_id: &str) -> Result<String, String> {
         .map_err(|e| format!("failed to serialise connect response: {e}"))
 }
 
+/// Build a `connect` success response where the result is the secret hex string.
+///
+/// Per NIP-46, when a secret was provided in the `bunker://` URI the response
+/// result MUST echo back that same secret rather than the generic `"ack"`.
+pub fn build_connect_response_with_secret(request_id: &str, secret_hex: &str) -> Result<String, String> {
+    let response = Nip46Response {
+        id: request_id.to_string(),
+        result: Some(secret_hex.to_string()),
+        error: None,
+    };
+    serde_json::to_string(&response)
+        .map_err(|e| format!("failed to serialise connect response: {e}"))
+}
+
 /// Build a `ping` response (result = "pong").
 pub fn build_ping_response(request_id: &str) -> Result<String, String> {
     let response = Nip46Response {
@@ -546,6 +560,15 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], "conn-1");
         assert_eq!(parsed["result"], "ack");
+    }
+
+    #[test]
+    fn test_build_connect_response_with_secret() {
+        let secret_hex = "aabbccdd".repeat(8);
+        let json = build_connect_response_with_secret("conn-2", &secret_hex).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["id"], "conn-2");
+        assert_eq!(parsed["result"], secret_hex);
     }
 
     #[test]

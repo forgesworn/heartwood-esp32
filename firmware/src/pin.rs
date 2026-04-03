@@ -183,7 +183,7 @@ fn wipe_and_reboot() -> ! {
             std::ptr::null(),
         );
         if !part.is_null() {
-            esp_idf_svc::sys::esp_partition_erase_range(part, 0, (*part).size);
+            esp_idf_svc::sys::esp_partition_erase_range(part, 0, (*part).size as usize);
         }
         esp_idf_svc::sys::esp_restart();
     }

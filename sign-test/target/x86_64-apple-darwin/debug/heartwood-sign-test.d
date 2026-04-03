@@ -1,1 +1,0 @@
-./sign-test/target/x86_64-apple-darwin/debug/heartwood-sign-test: ./common/src/derive.rs ./common/src/encoding.rs ./common/src/frame.rs ./common/src/hex.rs ./common/src/lib.rs ./common/src/nip46.rs ./common/src/types.rs ./sign-test/src/main.rs

@@ -105,7 +105,21 @@ fn main() {
 
     println!("Response JSON:");
     match serde_json::from_str::<serde_json::Value>(&response_json) {
-        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+        Ok(v) => {
+            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+
+            // If this is a get_public_key response, show the npub too.
+            if cli.method == "get_public_key" {
+                if let Some(hex_pubkey) = v.get("result").and_then(|r| r.as_str()) {
+                    if hex_pubkey.len() == 64 {
+                        let npub = heartwood_common::encoding::encode_npub(
+                            &hex_decode_32(hex_pubkey).unwrap_or([0u8; 32]),
+                        );
+                        println!("\nnpub: {npub}");
+                    }
+                }
+            }
+        }
         Err(_) => println!("{response_json}"),
     }
 }
@@ -229,6 +243,18 @@ fn advance_to_magic(buf: Vec<u8>) -> Vec<u8> {
         }
     }
     Vec::new()
+}
+
+/// Decode a 64-char hex string to 32 bytes.
+fn hex_decode_32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]

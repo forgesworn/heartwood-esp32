@@ -17,6 +17,8 @@ serde_json = { version = "1", optional = true }
 hkdf = { version = "0.12", default-features = false, optional = true }
 base64 = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
 chacha20 = { version = "0.9", default-features = false, optional = true }
+aes = { version = "0.8", default-features = false, optional = true }
+cbc = { version = "0.1", default-features = false, features = ["alloc", "block-padding"], optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -28,3 +30,4 @@ k256-backend = ["dep:k256"]
 secp256k1-backend = ["dep:secp256k1"]
 nip46 = ["dep:serde", "dep:serde_json"]
 nip44 = ["dep:chacha20", "dep:hkdf", "dep:base64"]
+nip04 = ["dep:aes", "dep:cbc", "dep:base64"]

@@ -1,0 +1,17 @@
+[package]
+name = "heartwood-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Pi-side relay bridge — forwards NIP-46 between Nostr relays and the ESP32 over serial"
+
+[dependencies]
+heartwood-common = { path = "../common", features = ["nip46"] }
+nostr-connect = "0.44"
+nostr = { version = "0.44", features = ["std", "nip44", "nip46"] }
+nostr-sdk = "0.44"
+serialport = "4"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"

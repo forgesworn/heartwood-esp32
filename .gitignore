@@ -5,3 +5,4 @@ firmware/target/
 common/target/
 provision/target/
 sign-test/target/
+bridge/target/

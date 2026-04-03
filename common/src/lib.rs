@@ -12,3 +12,6 @@ pub mod nip44;
 
 #[cfg(feature = "nip04")]
 pub mod nip04;
+
+#[cfg(feature = "nip46")]
+pub mod policy;

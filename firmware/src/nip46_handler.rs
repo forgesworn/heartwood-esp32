@@ -100,21 +100,43 @@ fn handle_sign_event(
         .map(|h| h.purpose.as_str())
         .unwrap_or("master");
 
-    // Show the signing request and wait for the user to approve or deny.
-    crate::oled::show_sign_request(
-        display,
-        purpose,
-        kind,
-        &content_preview,
-        APPROVAL_TIMEOUT_SECS as u32,
-    );
+    // DEBUG: inline button test — bypass wait_for_press entirely
+    crate::oled::show_error(display, &format!("K{} {}", kind, &content_preview[..content_preview.len().min(15)]));
+    esp_idf_hal::delay::FreeRtos::delay_ms(1000);
 
-    let button_result =
-        wait_for_press(button_pin, Duration::from_secs(APPROVAL_TIMEOUT_SECS));
+    crate::oled::show_error(display, "Hold PRG 2s...");
+    let deadline = std::time::Instant::now() + Duration::from_secs(APPROVAL_TIMEOUT_SECS);
+    let mut pressed = false;
+    let mut press_start = std::time::Instant::now();
+    let button_result = loop {
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        let low = button_pin.is_low();
+        if low && !pressed {
+            pressed = true;
+            press_start = std::time::Instant::now();
+            crate::oled::show_error(display, "PRESSED!");
+        }
+        if !low && pressed {
+            let held = std::time::Instant::now() - press_start;
+            if held >= Duration::from_millis(2000) {
+                crate::oled::show_error(display, "APPROVED!");
+                esp_idf_hal::delay::FreeRtos::delay_ms(500);
+                break Some(ButtonResult::Approve);
+            } else {
+                crate::oled::show_error(display, "DENIED (short)");
+                esp_idf_hal::delay::FreeRtos::delay_ms(500);
+                break Some(ButtonResult::Deny);
+            }
+        }
+        esp_idf_hal::delay::FreeRtos::delay_ms(20);
+    };
 
     match button_result {
         Some(ButtonResult::Approve) => {
             log::info!("sign_event: approved");
+            crate::oled::show_error(display, "Signing...");
             match do_sign(&event, master_secret, request.heartwood.as_ref()) {
                 Ok(signed) => {
                     match nip46::build_sign_response(&request.id, &signed) {
@@ -128,8 +150,10 @@ fn handle_sign_event(
                     }
                     crate::oled::show_result(display, "Signed!");
                 }
-                Err(e) => {
+                Err(ref e) => {
                     log::error!("Signing failed: {e}");
+                    crate::oled::show_error(display, &format!("ERR:{}", &e[..e.len().min(18)]));
+                    esp_idf_hal::delay::FreeRtos::delay_ms(3000);
                     send_error(usb, &request.id, -4, "signing/derivation failure");
                     crate::oled::show_result(display, "Sign error");
                 }

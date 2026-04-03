@@ -1,0 +1,401 @@
+- generic [ref=e2]:
+  - region:
+    - generic:
+      - tooltip "This user is a member of the RustCrypto organization."
+    - generic:
+      - tooltip "This user is a member of the RustCrypto organization."
+  - generic [ref=e3]:
+    - link "Skip to content" [ref=e4] [cursor=pointer]:
+      - /url: "#start-of-content"
+    - banner [ref=e6]:
+      - heading "Navigation Menu" [level=2] [ref=e7]
+      - generic [ref=e8]:
+        - link "Homepage" [ref=e10] [cursor=pointer]:
+          - /url: /
+          - img [ref=e11]
+        - generic [ref=e13]:
+          - navigation "Global" [ref=e16]:
+            - list [ref=e17]:
+              - listitem [ref=e18]:
+                - button "Platform" [ref=e20] [cursor=pointer]:
+                  - text: Platform
+                  - img [ref=e21]
+              - listitem [ref=e23]:
+                - button "Solutions" [ref=e25] [cursor=pointer]:
+                  - text: Solutions
+                  - img [ref=e26]
+              - listitem [ref=e28]:
+                - button "Resources" [ref=e30] [cursor=pointer]:
+                  - text: Resources
+                  - img [ref=e31]
+              - listitem [ref=e33]:
+                - button "Open Source" [ref=e35] [cursor=pointer]:
+                  - text: Open Source
+                  - img [ref=e36]
+              - listitem [ref=e38]:
+                - button "Enterprise" [ref=e40] [cursor=pointer]:
+                  - text: Enterprise
+                  - img [ref=e41]
+              - listitem [ref=e43]:
+                - link "Pricing" [ref=e44] [cursor=pointer]:
+                  - /url: https://github.com/pricing
+                  - generic [ref=e45]: Pricing
+          - generic [ref=e46]:
+            - button "Search or jump to…" [ref=e49] [cursor=pointer]:
+              - img [ref=e51]
+            - link "Sign in" [ref=e54] [cursor=pointer]:
+              - /url: /login?return_to=https%3A%2F%2Fgithub.com%2FRustCrypto%2Felliptic-curves%2Fissues%2F886
+            - link "Sign up" [ref=e55] [cursor=pointer]:
+              - /url: /signup?ref_cta=Sign+up&ref_loc=header+logged+out&ref_page=%2F%3Cuser-name%3E%2F%3Crepo-name%3E%2Fvoltron%2Fissues_fragments%2Fissue_layout&source=header-repo&source_repo=RustCrypto%2Felliptic-curves
+            - button "Appearance settings" [ref=e58] [cursor=pointer]:
+              - img
+  - main [ref=e62]:
+    - generic [ref=e63]:
+      - generic [ref=e64]:
+        - generic [ref=e66]:
+          - img [ref=e67]
+          - link "RustCrypto" [ref=e70] [cursor=pointer]:
+            - /url: /RustCrypto
+          - generic [ref=e71]: /
+          - strong [ref=e72]:
+            - link "elliptic-curves" [ref=e73] [cursor=pointer]:
+              - /url: /RustCrypto/elliptic-curves
+          - generic [ref=e74]: Public
+        - generic [ref=e75]:
+          - list:
+            - listitem [ref=e76]:
+              - link "You must be signed in to change notification settings" [ref=e77] [cursor=pointer]:
+                - /url: /login?return_to=%2FRustCrypto%2Felliptic-curves
+                - img [ref=e78]
+                - text: Notifications
+            - listitem [ref=e80]:
+              - link "Fork 273" [ref=e81] [cursor=pointer]:
+                - /url: /login?return_to=%2FRustCrypto%2Felliptic-curves
+                - img [ref=e82]
+                - text: Fork
+                - generic "273" [ref=e84]
+            - listitem [ref=e85]:
+              - link "You must be signed in to star a repository" [ref=e87] [cursor=pointer]:
+                - /url: /login?return_to=%2FRustCrypto%2Felliptic-curves
+                - img [ref=e88]
+                - text: Star
+                - generic "843 users starred this repository" [ref=e90]: "843"
+      - navigation "Repository" [ref=e91]:
+        - list [ref=e92]:
+          - listitem [ref=e93]:
+            - link "Code" [ref=e94] [cursor=pointer]:
+              - /url: /RustCrypto/elliptic-curves
+              - img [ref=e95]
+              - generic [ref=e97]: Code
+          - listitem [ref=e98]:
+            - link "Issues 33" [ref=e99] [cursor=pointer]:
+              - /url: /RustCrypto/elliptic-curves/issues
+              - img [ref=e100]
+              - generic [ref=e103]: Issues
+              - generic "33" [ref=e104]
+          - listitem [ref=e105]:
+            - link "Pull requests 39" [ref=e106] [cursor=pointer]:
+              - /url: /RustCrypto/elliptic-curves/pulls
+              - img [ref=e107]
+              - generic [ref=e109]: Pull requests
+              - generic "39" [ref=e110]
+          - listitem [ref=e111]:
+            - link "Discussions" [ref=e112] [cursor=pointer]:
+              - /url: /RustCrypto/elliptic-curves/discussions
+              - img [ref=e113]
+              - generic [ref=e115]: Discussions
+          - listitem [ref=e116]:
+            - link "Actions" [ref=e117] [cursor=pointer]:
+              - /url: /RustCrypto/elliptic-curves/actions
+              - img [ref=e118]
+              - generic [ref=e120]: Actions
+          - listitem [ref=e121]:
+            - link "Security and quality 3" [ref=e122] [cursor=pointer]:
+              - /url: /RustCrypto/elliptic-curves/security
+              - img [ref=e123]
+              - generic [ref=e125]: Security and quality
+              - generic "3" [ref=e126]
+          - listitem [ref=e127]:
+            - link "Insights" [ref=e128] [cursor=pointer]:
+              - /url: /RustCrypto/elliptic-curves/pulse
+              - img [ref=e129]
+              - generic [ref=e131]: Insights
+    - generic [ref=e139]:
+      - region "Header" [ref=e141]:
+        - generic [ref=e142]:
+          - 'heading "k256 signal: 10, SIGBUS: access to undefined memory #886" [level=1] [ref=e144]'
+          - generic [ref=e146]:
+            - button "New issue" [ref=e148] [cursor=pointer]:
+              - generic [ref=e150]: New issue
+            - button "Copy link" [ref=e151] [cursor=pointer]:
+              - img [ref=e152]
+      - generic [ref=e160]:
+        - img "Issue" [ref=e161]
+        - text: Open
+      - generic [ref=e165]:
+        - generic [ref=e166]:
+          - generic [ref=e168]:
+            - link "@satoshiotomakan's profile" [ref=e169] [cursor=pointer]:
+              - /url: https://github.com/satoshiotomakan
+              - img "@satoshiotomakan" [ref=e170]
+            - generic [ref=e171]:
+              - heading "Description" [level=2] [ref=e172]
+              - generic [ref=e174]:
+                - generic [ref=e176]:
+                  - generic [ref=e177]:
+                    - link "satoshiotomakan" [ref=e179] [cursor=pointer]:
+                      - /url: https://github.com/satoshiotomakan
+                    - generic [ref=e180]:
+                      - text: opened
+                      - link "on Apr 25, 2023on Apr 25, 2023" [ref=e181] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/issues/886#issue-1682614417
+                        - generic "Apr 25, 2023, 8:42 AM GMT+1" [ref=e182]: on Apr 25, 2023on Apr 25, 2023
+                      - generic [ref=e183]:
+                        - text: ·
+                        - generic [ref=e184]:
+                          - text: edited by
+                          - link "satoshiotomakan" [ref=e185] [cursor=pointer]:
+                            - /url: https://github.com/satoshiotomakan
+                  - generic [ref=e186]:
+                    - button "Open edits" [ref=e189] [cursor=pointer]:
+                      - generic [ref=e191]: Edits
+                      - generic:
+                        - img
+                    - button "Issue body actions" [ref=e194] [cursor=pointer]:
+                      - img [ref=e195]
+                - generic [ref=e197]:
+                  - generic [ref=e199]:
+                    - paragraph [ref=e200]:
+                      - text: When I try to call
+                      - code [ref=e201]: SigningKey::sign_prehash_recoverable
+                      - text: in
+                      - code [ref=e202]: wasm32-unknown-emscripten
+                      - text: ", I get the following error:"
+                    - blockquote [ref=e203]:
+                      - paragraph [ref=e204]: "10, SIGBUS: access to undefined memory"
+                    - paragraph [ref=e205]:
+                      - text: The problems seems to be with the
+                      - code [ref=e206]: precomputed-tables
+                      - text: feature enabled by default.
+                    - paragraph [ref=e207]: "How to test:"
+                    - generic [ref=e208]:
+                      - generic [ref=e209]:
+                        - generic [ref=e210]: "# Cargo.toml"
+                        - text: "[package] name ="
+                        - generic [ref=e211]: "\"k256-test\""
+                        - text: version =
+                        - generic [ref=e212]: "\"0.1.0\""
+                        - text: edition =
+                        - generic [ref=e213]: "\"2021\""
+                        - text: "[dependencies] hex ="
+                        - generic [ref=e214]: "\"0.4.3\""
+                        - text: k256 =
+                        - generic [ref=e215]: "\"0.13.0\""
+                        - generic [ref=e216]: "# The fix:"
+                        - generic [ref=e217]: "# k256 = { version = \"0.13.0\", features = [\"ecdh\", \"ecdsa\", \"schnorr\", \"std\"], default-features = false }"
+                      - button "Copy" [ref=e219] [cursor=pointer]:
+                        - img [ref=e220]
+                    - generic [ref=e223]:
+                      - generic [ref=e224]:
+                        - text: // lib.rs use k256::ecdsa::SigningKey;
+                        - generic [ref=e225]: "#[test]"
+                        - text: "fn test_ecdsa_sign() { let secret = hex::decode(\"afeefca74d9a325cf1d6b6911d61a65c32afa8e02bd5e78e2e4ac2910bab45f5\").unwrap(); let signing = SigningKey::from_slice(&secret); let hash = hex::decode(\"1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8\").unwrap(); let (_signature, _recovery_id) = signing.sign_prehash_recoverable(&hash).unwrap(); }"
+                      - button "Copy" [ref=e227] [cursor=pointer]:
+                        - img [ref=e228]
+                    - paragraph [ref=e231]:
+                      - text: To run the test (
+                      - link "emsdk" [ref=e232] [cursor=pointer]:
+                        - /url: https://github.com/emscripten-core/emsdk.git
+                      - text: should be installed already).
+                    - generic [ref=e233]:
+                      - generic [ref=e234]: source path/to/emsdk/emsdk_env.sh CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUNNER=node cargo test --target wasm32-unknown-emscripten --release
+                      - button "Copy" [ref=e236] [cursor=pointer]:
+                        - img [ref=e237]
+                  - generic:
+                    - toolbar "Reactions"
+          - generic [ref=e241]:
+            - generic [ref=e242]:
+              - heading "Activity" [level=2] [ref=e243]
+              - generic [ref=e244]:
+                - region "Events" [ref=e245]:
+                  - generic [ref=e252]:
+                    - img [ref=e255]
+                    - generic [ref=e257]:
+                      - generic [ref=e259]:
+                        - link "satoshiotomakan" [ref=e261] [cursor=pointer]:
+                          - /url: /satoshiotomakan
+                          - generic [ref=e262]: satoshiotomakan
+                        - text: mentioned this
+                        - link "on Apr 25, 2023on Apr 25, 2023" [ref=e263] [cursor=pointer]:
+                          - /url: https://github.com/RustCrypto/elliptic-curves/issues/886#event-1281498648
+                          - generic "Apr 25, 2023, 8:57 AM GMT+1" [ref=e264]: on Apr 25, 2023on Apr 25, 2023
+                      - region "Issues mentioned" [ref=e267]:
+                        - list [ref=e268]:
+                          - listitem [ref=e269]:
+                            - generic [ref=e270]:
+                              - img "Merged" [ref=e271]
+                              - 'link "[Rust]: Implement Private and Public keys trustwallet/wallet-core#3107" [ref=e273] [cursor=pointer]':
+                                - /url: https://github.com/trustwallet/wallet-core/pull/3107
+                                - text: "[Rust]: Implement Private and Public keys"
+                                - generic [ref=e274]: trustwallet/wallet-core#3107
+                - generic [ref=e275]:
+                  - link "@tarcieri's profile" [ref=e276] [cursor=pointer]:
+                    - /url: https://github.com/tarcieri
+                    - img "tarcieri" [ref=e277]
+                  - generic [ref=e284]:
+                    - generic [ref=e286]:
+                      - heading "tarcieri commented on Apr 25, 2023 on Apr 25, 2023" [level=3] [ref=e287]:
+                        - text: tarcieri commented
+                        - generic "Apr 25, 2023, 3:32 PM GMT+1" [ref=e288]: on Apr 25, 2023 on Apr 25, 2023
+                      - generic [ref=e289]:
+                        - link "tarcieri" [ref=e291] [cursor=pointer]:
+                          - /url: /tarcieri
+                        - link "on Apr 25, 2023on Apr 25, 2023" [ref=e294] [cursor=pointer]:
+                          - /url: https://github.com/RustCrypto/elliptic-curves/issues/886#issuecomment-1521897356
+                          - generic "Apr 25, 2023, 3:32 PM GMT+1" [ref=e295]: on Apr 25, 2023on Apr 25, 2023
+                      - generic [ref=e297]:
+                        - generic "This user is a member of the RustCrypto organization." [ref=e299]: Member
+                        - button "Actions for tarcieri's comment, 3:32 PM on April 25, 2023" [ref=e301] [cursor=pointer]:
+                          - img [ref=e302]
+                    - generic [ref=e304]:
+                      - generic [ref=e306]:
+                        - paragraph [ref=e307]:
+                          - text: cc
+                          - link "@fjarri" [ref=e308] [cursor=pointer]:
+                            - /url: https://github.com/fjarri
+                        - paragraph [ref=e309]:
+                          - text: If this is true, it seems like a bug in
+                          - code [ref=e310]: once_cell
+                      - toolbar "Reactions"
+                - generic [ref=e311]:
+                  - link "@tarcieri's profile" [ref=e312] [cursor=pointer]:
+                    - /url: https://github.com/tarcieri
+                    - img "tarcieri" [ref=e313]
+                  - generic [ref=e320]:
+                    - generic [ref=e322]:
+                      - heading "tarcieri commented on Jul 15, 2025 on Jul 15, 2025" [level=3] [ref=e323]:
+                        - text: tarcieri commented
+                        - generic "Jul 15, 2025, 3:00 PM GMT+1" [ref=e324]: on Jul 15, 2025 on Jul 15, 2025
+                      - generic [ref=e325]:
+                        - link "tarcieri" [ref=e327] [cursor=pointer]:
+                          - /url: /tarcieri
+                        - link "on Jul 15, 2025on Jul 15, 2025" [ref=e330] [cursor=pointer]:
+                          - /url: https://github.com/RustCrypto/elliptic-curves/issues/886#issuecomment-3073726622
+                          - generic "Jul 15, 2025, 3:00 PM GMT+1" [ref=e331]: on Jul 15, 2025on Jul 15, 2025
+                      - generic [ref=e333]:
+                        - generic "This user is a member of the RustCrypto organization." [ref=e335]: Member
+                        - button "Actions for tarcieri's comment, 3:00 PM on July 15, 2025" [ref=e337] [cursor=pointer]:
+                          - img [ref=e338]
+                    - generic [ref=e340]:
+                      - generic [ref=e342]:
+                        - paragraph [ref=e343]: Oh, this is for an emscripten backend. Isn't that deprecated in favor of WASM?
+                        - paragraph [ref=e344]:
+                          - text: The
+                          - code [ref=e345]: precomputed-tables
+                          - text: feature no longer uses
+                          - code [ref=e346]: once_cell
+                          - text: (at least with
+                          - code [ref=e347]: std
+                          - text: available) as of
+                          - link "#1135" [ref=e348] [cursor=pointer]:
+                            - /url: https://github.com/RustCrypto/elliptic-curves/pull/1135
+                          - text: ", perhaps that fixed it?"
+                      - toolbar "Reactions"
+            - generic [ref=e349]:
+              - link "Sign up for free" [ref=e350] [cursor=pointer]:
+                - /url: /signup?return_to=https://github.com/RustCrypto/elliptic-curves/issues/886
+                - generic [ref=e352]: Sign up for free
+              - generic [ref=e353]:
+                - strong [ref=e354]: to join this conversation on GitHub.
+                - text: Already have an account?
+              - link "Sign in to comment" [ref=e355] [cursor=pointer]:
+                - /url: /login?return_to=https://github.com/RustCrypto/elliptic-curves/issues/886
+        - generic [ref=e357]:
+          - heading "Metadata" [level=2] [ref=e358]
+          - generic [ref=e360]:
+            - generic [ref=e362]:
+              - generic [ref=e363]:
+                - heading "Assignees" [level=3]
+              - generic [ref=e364]: No one assigned
+            - generic [ref=e366]:
+              - generic [ref=e367]:
+                - heading "Labels" [level=3]
+              - generic [ref=e368]: No labels
+            - generic [ref=e370]:
+              - generic [ref=e371]:
+                - heading "Type" [level=3]
+              - generic [ref=e372]: No type
+            - generic [ref=e374]:
+              - generic [ref=e375]:
+                - heading "Projects" [level=3]
+              - generic [ref=e376]: No projects
+            - generic [ref=e378]:
+              - generic [ref=e379]:
+                - heading "Milestone" [level=3]
+              - generic [ref=e380]: No milestone
+            - generic [ref=e382]:
+              - generic [ref=e383]:
+                - heading "Relationships" [level=3]
+              - generic [ref=e384]: None yet
+            - generic [ref=e385]:
+              - generic [ref=e387]:
+                - heading "Development" [level=3]
+              - generic [ref=e388]:
+                - generic [ref=e390]:
+                  - button "Code with agent mode" [ref=e392] [cursor=pointer]:
+                    - generic [ref=e393]:
+                      - generic:
+                        - img
+                      - generic [ref=e394]: Code with agent mode
+                  - button "Select code repository" [ref=e397] [cursor=pointer]:
+                    - img [ref=e398]
+                - generic [ref=e400]: No branches or pull requests
+                - list
+            - generic [ref=e401]:
+              - generic [ref=e403]:
+                - heading "Participants" [level=3]
+              - generic [ref=e406]:
+                - link "@tarcieri" [ref=e407] [cursor=pointer]:
+                  - /url: /tarcieri
+                  - img "@tarcieri" [ref=e408]
+                - link "@satoshiotomakan" [ref=e409] [cursor=pointer]:
+                  - /url: /satoshiotomakan
+                  - img "@satoshiotomakan" [ref=e410]
+            - heading "Issue actions" [level=2] [ref=e411]
+            - list
+  - contentinfo [ref=e412]:
+    - heading "Footer" [level=2] [ref=e413]
+    - generic [ref=e414]:
+      - generic [ref=e415]:
+        - link "GitHub Homepage" [ref=e416] [cursor=pointer]:
+          - /url: https://github.com
+          - img [ref=e417]
+        - generic [ref=e419]: © 2026 GitHub, Inc.
+      - navigation "Footer" [ref=e420]:
+        - heading "Footer navigation" [level=3] [ref=e421]
+        - list "Footer navigation" [ref=e422]:
+          - listitem [ref=e423]:
+            - link "Terms" [ref=e424] [cursor=pointer]:
+              - /url: https://docs.github.com/site-policy/github-terms/github-terms-of-service
+          - listitem [ref=e425]:
+            - link "Privacy" [ref=e426] [cursor=pointer]:
+              - /url: https://docs.github.com/site-policy/privacy-policies/github-privacy-statement
+          - listitem [ref=e427]:
+            - link "Security" [ref=e428] [cursor=pointer]:
+              - /url: https://github.com/security
+          - listitem [ref=e429]:
+            - link "Status" [ref=e430] [cursor=pointer]:
+              - /url: https://www.githubstatus.com/
+          - listitem [ref=e431]:
+            - link "Community" [ref=e432] [cursor=pointer]:
+              - /url: https://github.community/
+          - listitem [ref=e433]:
+            - link "Docs" [ref=e434] [cursor=pointer]:
+              - /url: https://docs.github.com/
+          - listitem [ref=e435]:
+            - link "Contact" [ref=e436] [cursor=pointer]:
+              - /url: https://support.github.com?tags=dotcom-footer
+          - listitem [ref=e437]:
+            - button "Manage cookies" [ref=e439] [cursor=pointer]
+          - listitem [ref=e440]:
+            - button "Do not share my personal information" [ref=e442] [cursor=pointer]

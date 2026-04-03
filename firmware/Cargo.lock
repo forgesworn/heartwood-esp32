@@ -981,8 +981,11 @@ name = "heartwood-common"
 version = "0.1.0"
 dependencies = [
  "bech32",
+ "crc32fast",
  "hmac",
  "k256",
+ "serde",
+ "serde_json",
  "sha2",
  "zeroize",
 ]
@@ -999,6 +1002,8 @@ dependencies = [
  "heartwood-common",
  "k256",
  "log",
+ "serde",
+ "serde_json",
  "signature",
  "ssd1306",
  "zeroize",

@@ -23,7 +23,6 @@ use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::units::FromValueType;
 use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use heartwood_common::derive;
 use heartwood_common::types::{
     FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_PROVISION,
 };
@@ -119,60 +118,11 @@ fn main() {
         }
     };
 
-    // --- Derive master npub and display it ---
-    //
-    // k256 field arithmetic does unaligned memory accesses that crash on
-    // Xtensa LX7 (EXCCAUSE: 0x00000005 LoadStoreAlignment). Running in a
-    // dedicated thread with a fresh aligned stack sidesteps this — the main
-    // task's stack/heap layout happens to misalign k256's internal structures.
-    //
-    // We keep root_secret for the dispatch loop below; secret_copy is a
-    // separate copy moved into the thread.
-    let secret_copy = root_secret;
-
-    // k256 LoadStoreAlignment workaround: allocate and free a large buffer to
-    // shift the heap high-water mark before calling k256. On Xtensa LX7, k256's
-    // internal field arithmetic does unaligned memory access that crashes unless
-    // the heap is in a favourable alignment state. Allocating ~8KB shifts the
-    // heap enough to land k256's internal structures on aligned addresses.
-    // This mirrors what happened in Phase 2 when UsbSerialDriver was created
-    // and dropped before derivation.
-    // Run derivation in a thread with large stack. The main FreeRTOS task
-    // has a fixed stack that may not have suitable alignment for k256.
-    // A freshly-allocated thread stack from the heap is more likely to work.
-    let npub_result = std::thread::Builder::new()
-        .name("derive".into())
-        .stack_size(65536)
-        .spawn(move || {
-            // Heap bump inside the thread to shift alignment
-            let bump = vec![0u8; 4096];
-            std::hint::black_box(&bump);
-            drop(bump);
-
-            #[repr(align(32))]
-            struct Aligned([u8; 32]);
-            let aligned = Aligned(secret_copy);
-            derive::create_tree_root(&aligned.0)
-        })
-        .expect("thread spawn failed")
-        .join();
-
-    let npub_result = match npub_result {
-        Ok(Ok(root)) => Ok(root),
-        Ok(Err(e)) => Err(format!("derivation failed: {e}")),
-        Err(_) => Err("derivation thread crashed".into()),
-    };
-
-    match &npub_result {
-        Ok(tree_root) => {
-            log::info!("Identity: {}", tree_root.master_npub);
-            oled::show_npub(&mut display, &tree_root.master_npub);
-        }
-        Err(e) => {
-            log::error!("Key derivation failed: {e}");
-            oled::show_error(&mut display, "Derivation failed");
-        }
-    }
+    // Skip npub derivation at boot — k256 alignment on Xtensa is too fragile
+    // to call reliably at boot time (depends on exact binary layout). Instead
+    // show a ready message and derive on-demand when signing requests arrive.
+    oled::show_error(&mut display, "Heartwood ready");
+    log::info!("Identity loaded — ready for signing requests");
 
     // --- Frame dispatch loop ---
     log::info!("Entering frame dispatch loop");
@@ -187,10 +137,7 @@ fn main() {
                     &mut display,
                     &button_pin,
                 );
-                // Return to idle npub display after handling the request.
-                if let Ok(ref tree_root) = npub_result {
-                    oled::show_npub(&mut display, &tree_root.master_npub);
-                }
+                oled::show_error(&mut display, "Heartwood ready");
             }
             FRAME_TYPE_PROVISION => {
                 log::warn!("Already provisioned — ignoring provision frame");

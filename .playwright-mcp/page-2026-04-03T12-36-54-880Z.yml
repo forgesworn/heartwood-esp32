@@ -1,0 +1,2302 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - region
+    - generic [ref=e3]:
+      - link "Skip to content" [ref=e4] [cursor=pointer]:
+        - /url: "#start-of-content"
+      - banner [ref=e6]:
+        - heading "Navigation Menu" [level=2] [ref=e7]
+        - generic [ref=e8]:
+          - link "Homepage" [ref=e10] [cursor=pointer]:
+            - /url: /
+            - img [ref=e11]
+          - generic [ref=e13]:
+            - navigation "Global" [ref=e16]:
+              - list [ref=e17]:
+                - listitem [ref=e18]:
+                  - button "Platform" [ref=e20] [cursor=pointer]:
+                    - text: Platform
+                    - img [ref=e21]
+                - listitem [ref=e23]:
+                  - button "Solutions" [ref=e25] [cursor=pointer]:
+                    - text: Solutions
+                    - img [ref=e26]
+                - listitem [ref=e28]:
+                  - button "Resources" [ref=e30] [cursor=pointer]:
+                    - text: Resources
+                    - img [ref=e31]
+                - listitem [ref=e33]:
+                  - button "Open Source" [ref=e35] [cursor=pointer]:
+                    - text: Open Source
+                    - img [ref=e36]
+                - listitem [ref=e38]:
+                  - button "Enterprise" [ref=e40] [cursor=pointer]:
+                    - text: Enterprise
+                    - img [ref=e41]
+                - listitem [ref=e43]:
+                  - link "Pricing" [ref=e44] [cursor=pointer]:
+                    - /url: https://github.com/pricing
+                    - generic [ref=e45]: Pricing
+            - generic [ref=e46]:
+              - button "Search or jump to…" [ref=e49] [cursor=pointer]:
+                - img [ref=e51]
+              - link "Sign in" [ref=e54] [cursor=pointer]:
+                - /url: /login?return_to=https%3A%2F%2Fgithub.com%2FRustCrypto%2Felliptic-curves%2Fblob%2Fmaster%2Fk256%2FCHANGELOG.md
+              - link "Sign up" [ref=e55] [cursor=pointer]:
+                - /url: /signup?ref_cta=Sign+up&ref_loc=header+logged+out&ref_page=%2F%3Cuser-name%3E%2F%3Crepo-name%3E%2Fblob%2Fshow&source=header-repo&source_repo=RustCrypto%2Felliptic-curves
+              - button "Appearance settings" [ref=e58] [cursor=pointer]:
+                - img
+    - main [ref=e62]:
+      - generic [ref=e63]:
+        - generic [ref=e64]:
+          - generic [ref=e66]:
+            - img [ref=e67]
+            - link "RustCrypto" [ref=e70] [cursor=pointer]:
+              - /url: /RustCrypto
+            - generic [ref=e71]: /
+            - strong [ref=e72]:
+              - link "elliptic-curves" [ref=e73] [cursor=pointer]:
+                - /url: /RustCrypto/elliptic-curves
+            - generic [ref=e74]: Public
+          - generic [ref=e75]:
+            - list:
+              - listitem [ref=e76]:
+                - link "You must be signed in to change notification settings" [ref=e77] [cursor=pointer]:
+                  - /url: /login?return_to=%2FRustCrypto%2Felliptic-curves
+                  - img [ref=e78]
+                  - text: Notifications
+              - listitem [ref=e80]:
+                - link "Fork 273" [ref=e81] [cursor=pointer]:
+                  - /url: /login?return_to=%2FRustCrypto%2Felliptic-curves
+                  - img [ref=e82]
+                  - text: Fork
+                  - generic "273" [ref=e84]
+              - listitem [ref=e85]:
+                - link "You must be signed in to star a repository" [ref=e87] [cursor=pointer]:
+                  - /url: /login?return_to=%2FRustCrypto%2Felliptic-curves
+                  - img [ref=e88]
+                  - text: Star
+                  - generic "843 users starred this repository" [ref=e90]: "843"
+        - navigation "Repository" [ref=e91]:
+          - list [ref=e92]:
+            - listitem [ref=e93]:
+              - link "Code" [ref=e94] [cursor=pointer]:
+                - /url: /RustCrypto/elliptic-curves
+                - img [ref=e95]
+                - generic [ref=e97]: Code
+            - listitem [ref=e98]:
+              - link "Issues 33" [ref=e99] [cursor=pointer]:
+                - /url: /RustCrypto/elliptic-curves/issues
+                - img [ref=e100]
+                - generic [ref=e103]: Issues
+                - generic "33" [ref=e104]
+            - listitem [ref=e105]:
+              - link "Pull requests 39" [ref=e106] [cursor=pointer]:
+                - /url: /RustCrypto/elliptic-curves/pulls
+                - img [ref=e107]
+                - generic [ref=e109]: Pull requests
+                - generic "39" [ref=e110]
+            - listitem [ref=e111]:
+              - link "Discussions" [ref=e112] [cursor=pointer]:
+                - /url: /RustCrypto/elliptic-curves/discussions
+                - img [ref=e113]
+                - generic [ref=e115]: Discussions
+            - listitem [ref=e116]:
+              - link "Actions" [ref=e117] [cursor=pointer]:
+                - /url: /RustCrypto/elliptic-curves/actions
+                - img [ref=e118]
+                - generic [ref=e120]: Actions
+            - listitem [ref=e121]:
+              - link "Security and quality 3" [ref=e122] [cursor=pointer]:
+                - /url: /RustCrypto/elliptic-curves/security
+                - img [ref=e123]
+                - generic [ref=e125]: Security and quality
+                - generic "3" [ref=e126]
+            - listitem [ref=e127]:
+              - link "Insights" [ref=e128] [cursor=pointer]:
+                - /url: /RustCrypto/elliptic-curves/pulse
+                - img [ref=e129]
+                - generic [ref=e131]: Insights
+      - generic [ref=e139]:
+        - generic [ref=e141]:
+          - generic [ref=e144]:
+            - generic [ref=e145]:
+              - generic [ref=e146]:
+                - heading "Collapse file tree" [level=2] [ref=e147]:
+                  - button "Collapse file tree" [expanded] [ref=e148] [cursor=pointer]:
+                    - img [ref=e149]
+                - heading "Files" [level=2] [ref=e152]
+              - generic [ref=e153]:
+                - button "master branch" [ref=e155] [cursor=pointer]:
+                  - generic [ref=e156]:
+                    - generic [ref=e158]:
+                      - img [ref=e160]
+                      - generic [ref=e163]: master
+                    - generic:
+                      - img
+                - button "Search this repository (forward slash)" [ref=e165] [cursor=pointer]:
+                  - img [ref=e166]
+            - generic [ref=e169]:
+              - img [ref=e171]
+              - combobox "Go to file" [ref=e173]
+            - navigation "File Tree Navigation" [ref=e179]:
+              - tree "Files" [ref=e181]:
+                - treeitem ".cargo" [level=1] [ref=e182]:
+                  - generic [ref=e183] [cursor=pointer]:
+                    - img [ref=e185]
+                    - generic [ref=e187]:
+                      - img [ref=e191]
+                      - generic [ref=e193]: .cargo
+                - treeitem ".github" [level=1] [ref=e194]:
+                  - generic [ref=e195] [cursor=pointer]:
+                    - img [ref=e197]
+                    - generic [ref=e199]:
+                      - img [ref=e203]
+                      - generic [ref=e205]: .github
+                - treeitem "bignp256" [level=1] [ref=e206]:
+                  - generic [ref=e207] [cursor=pointer]:
+                    - img [ref=e209]
+                    - generic [ref=e211]:
+                      - img [ref=e215]
+                      - generic [ref=e217]: bignp256
+                - treeitem "bp256" [level=1] [ref=e218]:
+                  - generic [ref=e219] [cursor=pointer]:
+                    - img [ref=e221]
+                    - generic [ref=e223]:
+                      - img [ref=e227]
+                      - generic [ref=e229]: bp256
+                - treeitem "bp384" [level=1] [ref=e230]:
+                  - generic [ref=e231] [cursor=pointer]:
+                    - img [ref=e233]
+                    - generic [ref=e235]:
+                      - img [ref=e239]
+                      - generic [ref=e241]: bp384
+                - treeitem "ed448-goldilocks" [level=1] [ref=e242]:
+                  - generic [ref=e243] [cursor=pointer]:
+                    - img [ref=e245]
+                    - generic [ref=e247]:
+                      - img [ref=e251]
+                      - generic [ref=e253]: ed448-goldilocks
+                - treeitem "hash2curve" [level=1] [ref=e254]:
+                  - generic [ref=e255] [cursor=pointer]:
+                    - img [ref=e257]
+                    - generic [ref=e259]:
+                      - img [ref=e263]
+                      - generic [ref=e265]: hash2curve
+                - treeitem "k256" [expanded] [level=1] [ref=e266]:
+                  - generic [ref=e267] [cursor=pointer]:
+                    - img [ref=e269]
+                    - generic [ref=e271]:
+                      - img [ref=e275]
+                      - generic [ref=e277]: k256
+                  - group "k256" [ref=e278]:
+                    - treeitem "benches" [level=2] [ref=e279]:
+                      - generic [ref=e280] [cursor=pointer]:
+                        - img [ref=e285]
+                        - generic [ref=e287]:
+                          - img [ref=e291]
+                          - generic [ref=e293]: benches
+                    - treeitem "proptest-regressions" [level=2] [ref=e294]:
+                      - generic [ref=e295] [cursor=pointer]:
+                        - img [ref=e300]
+                        - generic [ref=e302]:
+                          - img [ref=e306]
+                          - generic [ref=e308]: proptest-regressions
+                    - treeitem "src" [level=2] [ref=e309]:
+                      - generic [ref=e310] [cursor=pointer]:
+                        - img [ref=e315]
+                        - generic [ref=e317]:
+                          - img [ref=e321]
+                          - generic [ref=e323]: src
+                    - treeitem "CHANGELOG.md" [level=2] [ref=e324]:
+                      - generic [ref=e329] [cursor=pointer]:
+                        - img [ref=e332]
+                        - generic [ref=e334]: CHANGELOG.md
+                    - treeitem "Cargo.toml" [level=2] [ref=e335]:
+                      - generic [ref=e340] [cursor=pointer]:
+                        - img [ref=e343]
+                        - generic [ref=e345]: Cargo.toml
+                    - treeitem "LICENSE-APACHE" [level=2] [ref=e346]:
+                      - generic [ref=e351] [cursor=pointer]:
+                        - img [ref=e354]
+                        - generic [ref=e356]: LICENSE-APACHE
+                    - treeitem "LICENSE-MIT" [level=2] [ref=e357]:
+                      - generic [ref=e362] [cursor=pointer]:
+                        - img [ref=e365]
+                        - generic [ref=e367]: LICENSE-MIT
+                    - treeitem "README.md" [level=2] [ref=e368]:
+                      - generic [ref=e373] [cursor=pointer]:
+                        - img [ref=e376]
+                        - generic [ref=e378]: README.md
+                - treeitem "p192" [level=1] [ref=e379]:
+                  - generic [ref=e380] [cursor=pointer]:
+                    - img [ref=e382]
+                    - generic [ref=e384]:
+                      - img [ref=e388]
+                      - generic [ref=e390]: p192
+                - treeitem "p224" [level=1] [ref=e391]:
+                  - generic [ref=e392] [cursor=pointer]:
+                    - img [ref=e394]
+                    - generic [ref=e396]:
+                      - img [ref=e400]
+                      - generic [ref=e402]: p224
+                - treeitem "p256" [level=1] [ref=e403]:
+                  - generic [ref=e404] [cursor=pointer]:
+                    - img [ref=e406]
+                    - generic [ref=e408]:
+                      - img [ref=e412]
+                      - generic [ref=e414]: p256
+                - treeitem "p384" [level=1] [ref=e415]:
+                  - generic [ref=e416] [cursor=pointer]:
+                    - img [ref=e418]
+                    - generic [ref=e420]:
+                      - img [ref=e424]
+                      - generic [ref=e426]: p384
+                - treeitem "p521" [level=1] [ref=e427]:
+                  - generic [ref=e428] [cursor=pointer]:
+                    - img [ref=e430]
+                    - generic [ref=e432]:
+                      - img [ref=e436]
+                      - generic [ref=e438]: p521
+                - treeitem "primefield" [level=1] [ref=e439]:
+                  - generic [ref=e440] [cursor=pointer]:
+                    - img [ref=e442]
+                    - generic [ref=e444]:
+                      - img [ref=e448]
+                      - generic [ref=e450]: primefield
+                - treeitem "primeorder" [level=1] [ref=e451]:
+                  - generic [ref=e452] [cursor=pointer]:
+                    - img [ref=e454]
+                    - generic [ref=e456]:
+                      - img [ref=e460]
+                      - generic [ref=e462]: primeorder
+                - treeitem "sm2" [level=1] [ref=e463]:
+                  - generic [ref=e464] [cursor=pointer]:
+                    - img [ref=e466]
+                    - generic [ref=e468]:
+                      - img [ref=e472]
+                      - generic [ref=e474]: sm2
+                - treeitem "x448" [level=1] [ref=e475]:
+                  - generic [ref=e476] [cursor=pointer]:
+                    - img [ref=e478]
+                    - generic [ref=e480]:
+                      - img [ref=e484]
+                      - generic [ref=e486]: x448
+                - treeitem ".gitignore" [level=1] [ref=e487]:
+                  - generic [ref=e489] [cursor=pointer]:
+                    - img [ref=e492]
+                    - generic [ref=e494]: .gitignore
+                - treeitem ".typos.toml" [level=1] [ref=e495]:
+                  - generic [ref=e497] [cursor=pointer]:
+                    - img [ref=e500]
+                    - generic [ref=e502]: .typos.toml
+                - treeitem "Cargo.lock" [level=1] [ref=e503]:
+                  - generic [ref=e505] [cursor=pointer]:
+                    - img [ref=e508]
+                    - generic [ref=e510]: Cargo.lock
+                - treeitem "Cargo.toml" [level=1] [ref=e511]:
+                  - generic [ref=e513] [cursor=pointer]:
+                    - img [ref=e516]
+                    - generic [ref=e518]: Cargo.toml
+                - treeitem "README.md" [level=1] [ref=e519]:
+                  - generic [ref=e521] [cursor=pointer]:
+                    - img [ref=e524]
+                    - generic [ref=e526]: README.md
+                - treeitem "SECURITY.md" [level=1] [ref=e527]:
+                  - generic [ref=e529] [cursor=pointer]:
+                    - img [ref=e532]
+                    - generic [ref=e534]: SECURITY.md
+                - treeitem "clippy.toml" [level=1] [ref=e535]:
+                  - generic [ref=e537] [cursor=pointer]:
+                    - img [ref=e540]
+                    - generic [ref=e542]: clippy.toml
+                - treeitem "codecov.yml" [level=1] [ref=e543]:
+                  - generic [ref=e545] [cursor=pointer]:
+                    - img [ref=e548]
+                    - generic [ref=e550]: codecov.yml
+          - slider "Draggable pane splitter" [ref=e552]
+        - generic [ref=e555]:
+          - generic [ref=e559]:
+            - generic [ref=e561]:
+              - navigation "Breadcrumbs" [ref=e562]:
+                - heading "Breadcrumbs" [level=2] [ref=e563]
+                - list [ref=e564]:
+                  - listitem [ref=e565]:
+                    - link "elliptic-curves" [ref=e566] [cursor=pointer]:
+                      - /url: /RustCrypto/elliptic-curves/tree/master
+                  - listitem [ref=e567]:
+                    - text: /
+                    - link "k256" [ref=e568] [cursor=pointer]:
+                      - /url: /RustCrypto/elliptic-curves/tree/master/k256
+              - generic [ref=e569]:
+                - text: /
+                - heading "CHANGELOG.md" [level=1] [ref=e570]
+              - button "Copy path" [ref=e571] [cursor=pointer]:
+                - img [ref=e572]
+            - button "More file actions" [ref=e578] [cursor=pointer]:
+              - img [ref=e579]
+          - generic [ref=e581]:
+            - generic [ref=e583]:
+              - heading "Latest commit" [level=2] [ref=e584]
+              - generic [ref=e587]:
+                - heading "History" [level=2] [ref=e588]
+                - link "History" [ref=e589] [cursor=pointer]:
+                  - /url: /RustCrypto/elliptic-curves/commits/master/k256/CHANGELOG.md
+                  - generic [ref=e590]:
+                    - generic:
+                      - img
+                    - generic [ref=e591]: History
+            - generic [ref=e593]:
+              - generic [ref=e595]:
+                - heading "File metadata and controls" [level=2] [ref=e596]
+                - list "File view" [ref=e598]:
+                  - listitem [ref=e599]:
+                    - button "Preview" [ref=e600] [cursor=pointer]:
+                      - generic [ref=e602]: Preview
+                  - listitem [ref=e603]:
+                    - button "Code" [ref=e604] [cursor=pointer]:
+                      - generic [ref=e606]: Code
+                  - listitem [ref=e607]:
+                    - button "Blame" [ref=e608] [cursor=pointer]:
+                      - generic [ref=e610]: Blame
+                - generic [ref=e611]:
+                  - generic [ref=e612]:
+                    - generic [ref=e613]:
+                      - link "Raw" [ref=e615] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/raw/refs/heads/master/k256/CHANGELOG.md
+                        - generic [ref=e617]: Raw
+                      - button "Copy raw file" [ref=e619] [cursor=pointer]:
+                        - img [ref=e620]
+                      - button "Download raw file" [ref=e624] [cursor=pointer]:
+                        - img [ref=e625]
+                    - generic [ref=e628]:
+                      - button "You must be signed in to make or propose changes" [disabled] [ref=e630]:
+                        - img [ref=e631]
+                      - button "More edit options" [ref=e634] [cursor=pointer]:
+                        - img [ref=e635]
+                  - button "Outline" [ref=e637] [cursor=pointer]:
+                    - img [ref=e638]
+              - region "CHANGELOG.md" [ref=e641]:
+                - article [ref=e643]:
+                  - generic [ref=e644]:
+                    - heading "Changelog" [level=1] [ref=e645]
+                    - 'link "Permalink: Changelog" [ref=e646] [cursor=pointer]':
+                      - /url: "#changelog"
+                      - img [ref=e647]
+                  - paragraph [ref=e649]: All notable changes to this project will be documented in this file.
+                  - paragraph [ref=e650]:
+                    - text: The format is based on
+                    - link "Keep a Changelog" [ref=e651] [cursor=pointer]:
+                      - /url: https://keepachangelog.com/en/1.0.0/
+                    - text: ", and this project adheres to"
+                    - link "Semantic Versioning" [ref=e652] [cursor=pointer]:
+                      - /url: https://semver.org/spec/v2.0.0.html
+                    - text: .
+                  - generic [ref=e653]:
+                    - heading "0.14.0 (UNRELEASED)" [level=2] [ref=e654]
+                    - 'link "Permalink: 0.14.0 (UNRELEASED)" [ref=e655] [cursor=pointer]':
+                      - /url: "#0140-unreleased"
+                      - img [ref=e656]
+                  - generic [ref=e658]:
+                    - heading "Added" [level=3] [ref=e659]
+                    - 'link "Permalink: Added" [ref=e660] [cursor=pointer]':
+                      - /url: "#added"
+                      - img [ref=e661]
+                  - list [ref=e663]:
+                    - listitem [ref=e664]:
+                      - text: Support for non-32-byte BIP340 signatures (
+                      - link "#1041" [ref=e665] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/1041
+                      - text: )
+                  - generic [ref=e666]:
+                    - heading "Fixed" [level=3] [ref=e667]
+                    - 'link "Permalink: Fixed" [ref=e668] [cursor=pointer]':
+                      - /url: "#fixed"
+                      - img [ref=e669]
+                  - list [ref=e671]:
+                    - listitem [ref=e672]:
+                      - text: Batch Normalization
+                      - code [ref=e673]: normalizes_to_zero()
+                      - text: bug fix (
+                      - link "#1029" [ref=e674] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/1029
+                      - text: )
+                    - listitem [ref=e675]:
+                      - text: Prevent panic when creating a Schnorr from slice (
+                      - link "#1056" [ref=e676] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/1056
+                      - text: )
+                  - generic [ref=e677]:
+                    - heading "Removed" [level=3] [ref=e678]
+                    - 'link "Permalink: Removed" [ref=e679] [cursor=pointer]':
+                      - /url: "#removed"
+                      - img [ref=e680]
+                  - list [ref=e682]:
+                    - listitem [ref=e683]:
+                      - text: Implementation of
+                      - code [ref=e684]: signature::PrehashSignature
+                      - text: "on"
+                      - code [ref=e685]: schnorr::Signature
+                      - text: ([#1275])
+                  - generic [ref=e686]:
+                    - heading "Changed" [level=2] [ref=e687]
+                    - 'link "Permalink: Changed" [ref=e688] [cursor=pointer]':
+                      - /url: "#changed"
+                      - img [ref=e689]
+                  - list [ref=e691]:
+                    - listitem [ref=e692]:
+                      - text: Update to
+                      - code [ref=e693]: elliptic-curve
+                      - text: v0.14 (
+                      - link "#1011" [ref=e694] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/1011
+                      - text: )
+                    - listitem [ref=e695]:
+                      - text: Update to
+                      - code [ref=e696]: ecdsa
+                      - text: v0.17 (
+                      - link "#1011" [ref=e697] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/1011
+                      - text: )
+                    - listitem [ref=e698]:
+                      - text: Update to
+                      - code [ref=e699]: secdect
+                      - text: v0.3 (
+                      - link "#1084" [ref=e700] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/1084
+                      - text: )
+                    - listitem [ref=e701]:
+                      - text: Update to
+                      - code [ref=e702]: rand_core
+                      - text: v0.9 (
+                      - link "#1125" [ref=e703] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/1125
+                      - text: )
+                    - listitem [ref=e704]:
+                      - text: Update to
+                      - code [ref=e705]: hybrid-array
+                      - text: v0.3 (
+                      - link "#1125" [ref=e706] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/1125
+                      - text: )
+                    - listitem [ref=e707]:
+                      - text: Edition changed to 2024 and MSRV bumped to 1.85 (
+                      - link "#1125" [ref=e708] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/1125
+                      - text: )
+                    - listitem [ref=e709]: Relax MSRV policy and allow MSRV bumps in patch releases
+                  - generic [ref=e710]:
+                    - heading "0.13.3 (2024-01-08)" [level=2] [ref=e711]
+                    - 'link "Permalink: 0.13.3 (2024-01-08)" [ref=e712] [cursor=pointer]':
+                      - /url: "#0133-2024-01-08"
+                      - img [ref=e713]
+                  - generic [ref=e715]:
+                    - heading "Added" [level=3] [ref=e716]
+                    - 'link "Permalink: Added" [ref=e717] [cursor=pointer]':
+                      - /url: "#added-1"
+                      - img [ref=e718]
+                  - list [ref=e720]:
+                    - listitem [ref=e721]:
+                      - text: More inlines for better efficiency (
+                      - link "#999" [ref=e722] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/999
+                      - text: )
+                  - generic [ref=e723]:
+                    - heading "0.13.2 (2023-11-15)" [level=2] [ref=e724]
+                    - 'link "Permalink: 0.13.2 (2023-11-15)" [ref=e725] [cursor=pointer]':
+                      - /url: "#0132-2023-11-15"
+                      - img [ref=e726]
+                  - generic [ref=e728]:
+                    - heading "Added" [level=3] [ref=e729]
+                    - 'link "Permalink: Added" [ref=e730] [cursor=pointer]':
+                      - /url: "#added-2"
+                      - img [ref=e731]
+                  - list [ref=e733]:
+                    - listitem [ref=e734]:
+                      - code [ref=e735]: "#[inline]"
+                      - text: annotations on
+                      - code [ref=e736]: conditional_select
+                      - text: (
+                      - link "#942" [ref=e737] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/942
+                      - text: )
+                    - listitem [ref=e738]:
+                      - code [ref=e739]: BatchInvert
+                      - text: and
+                      - code [ref=e740]: BatchNormalize
+                      - text: impls (
+                      - link "#971" [ref=e741] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/971
+                      - text: )
+                    - listitem [ref=e742]:
+                      - text: Optimized implementation of
+                      - code [ref=e743]: LinearCombinationExt
+                      - text: trait (
+                      - link "#974" [ref=e744] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/974
+                      - text: )
+                  - generic [ref=e745]:
+                    - heading "Changed" [level=3] [ref=e746]
+                    - 'link "Permalink: Changed" [ref=e747] [cursor=pointer]':
+                      - /url: "#changed-1"
+                      - img [ref=e748]
+                  - list [ref=e750]:
+                    - listitem [ref=e751]:
+                      - text: Use generic signing implementation from
+                      - code [ref=e752]: ecdsa
+                      - text: crate (
+                      - link "#911" [ref=e753] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/911
+                      - text: )
+                    - listitem [ref=e754]:
+                      - text: Simplify internal helper functions in the scalar arithmetic (
+                      - link "#917" [ref=e755] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/917
+                      - text: )
+                    - listitem [ref=e756]:
+                      - text: Bump
+                      - code [ref=e757]: elliptic-curve
+                      - text: to v0.13.7 (
+                      - link "#979" [ref=e758] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/979
+                      - text: )
+                  - generic [ref=e759]:
+                    - heading "Fixed" [level=3] [ref=e760]
+                    - 'link "Permalink: Fixed" [ref=e761] [cursor=pointer]':
+                      - /url: "#fixed-1"
+                      - img [ref=e762]
+                  - list [ref=e764]:
+                    - listitem [ref=e765]:
+                      - text: Reject signatures which aren't low-
+                      - code [ref=e766]: S
+                      - text: normalized (
+                      - link "#914" [ref=e767] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/914
+                      - text: )
+                    - listitem [ref=e768]:
+                      - text: Check for
+                      - code [ref=e769]: R
+                      - text: being the identity point on Schnorr verification (
+                      - link "#916" [ref=e770] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/916
+                      - text: )
+                  - generic [ref=e771]:
+                    - heading "0.13.1 (2023-04-09)" [level=2] [ref=e772]
+                    - 'link "Permalink: 0.13.1 (2023-04-09)" [ref=e773] [cursor=pointer]':
+                      - /url: "#0131-2023-04-09"
+                      - img [ref=e774]
+                  - generic [ref=e776]:
+                    - heading "Fixed" [level=3] [ref=e777]
+                    - 'link "Permalink: Fixed" [ref=e778] [cursor=pointer]':
+                      - /url: "#fixed-2"
+                      - img [ref=e779]
+                  - list [ref=e781]:
+                    - listitem [ref=e782]:
+                      - text: Correct product definition for empty iterators (
+                      - link "#802" [ref=e783] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/802
+                      - text: )
+                  - generic [ref=e784]:
+                    - heading "0.13.0 (2023-03-02)" [level=2] [ref=e785]
+                    - 'link "Permalink: 0.13.0 (2023-03-02)" [ref=e786] [cursor=pointer]':
+                      - /url: "#0130-2023-03-02"
+                      - img [ref=e787]
+                  - generic [ref=e789]:
+                    - heading "Added" [level=3] [ref=e790]
+                    - 'link "Permalink: Added" [ref=e791] [cursor=pointer]':
+                      - /url: "#added-3"
+                      - img [ref=e792]
+                  - list [ref=e794]:
+                    - listitem [ref=e795]:
+                      - code [ref=e796]: FieldBytesEncoding
+                      - text: trait impls (
+                      - link "#732" [ref=e797] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/732
+                      - text: )
+                    - listitem [ref=e798]:
+                      - text: Fast
+                      - code [ref=e799]: invert_vartime
+                      - text: using Stein's algorithm (
+                      - link "#743" [ref=e800] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/743
+                      - text: )
+                    - listitem [ref=e801]:
+                      - code [ref=e802]: serde
+                      - text: support for
+                      - code [ref=e803]: schnorr
+                      - text: types (
+                      - link "#748" [ref=e804] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/748
+                      - text: )
+                  - generic [ref=e805]:
+                    - heading "Changed" [level=3] [ref=e806]
+                    - 'link "Permalink: Changed" [ref=e807] [cursor=pointer]':
+                      - /url: "#changed-2"
+                      - img [ref=e808]
+                  - list [ref=e810]:
+                    - listitem [ref=e811]:
+                      - code [ref=e812]: AffineCoordinates
+                      - text: trait (
+                      - link "#734" [ref=e813] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/734
+                      - text: )
+                    - listitem [ref=e814]:
+                      - text: Bump
+                      - code [ref=e815]: elliptic-curve
+                      - text: dependency to v0.13 (
+                      - link "#770" [ref=e816] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/770
+                      - text: )
+                    - listitem [ref=e817]:
+                      - text: Bump
+                      - code [ref=e818]: ecdsa
+                      - text: to v0.16 (
+                      - link "#770" [ref=e819] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/770
+                      - text: )
+                  - generic [ref=e820]:
+                    - heading "0.12.0 (2023-01-16)" [level=2] [ref=e821]
+                    - 'link "Permalink: 0.12.0 (2023-01-16)" [ref=e822] [cursor=pointer]':
+                      - /url: "#0120-2023-01-16"
+                      - img [ref=e823]
+                  - generic [ref=e825]:
+                    - heading "Added" [level=3] [ref=e826]
+                    - 'link "Permalink: Added" [ref=e827] [cursor=pointer]':
+                      - /url: "#added-4"
+                      - img [ref=e828]
+                  - list [ref=e830]:
+                    - listitem [ref=e831]:
+                      - code [ref=e832]: alloc
+                      - text: feature (
+                      - link "#670" [ref=e833] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/670
+                      - text: )
+                    - listitem [ref=e834]:
+                      - text: Impl
+                      - code [ref=e835]: FromOkm
+                      - text: for
+                      - code [ref=e836]: Scalar
+                      - text: (
+                      - link "#673" [ref=e837] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/673
+                      - text: )
+                    - listitem [ref=e838]:
+                      - text: Impl
+                      - code [ref=e839]: Prehash*
+                      - text: and
+                      - code [ref=e840]: KeypairRef
+                      - text: for Schnorr keys (
+                      - link "#689" [ref=e841] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/689
+                      - text: )
+                    - listitem [ref=e842]:
+                      - code [ref=e843]: schnorr::SigningKey::as_nonzero_scalar
+                      - text: (
+                      - link "#690" [ref=e844] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/690
+                      - text: )
+                    - listitem [ref=e845]:
+                      - text: Impl
+                      - code [ref=e846]: From<NonZeroScalar>
+                      - text: for
+                      - code [ref=e847]: schnorr::SigningKey
+                      - text: (
+                      - link "#703" [ref=e848] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/703
+                      - text: )
+                    - listitem [ref=e849]:
+                      - text: Impl
+                      - code [ref=e850]: From<SecretKey>
+                      - text: for
+                      - code [ref=e851]: schnorr::SigningKey
+                      - text: (
+                      - link "#704" [ref=e852] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/704
+                      - text: )
+                    - listitem [ref=e853]:
+                      - code [ref=e854]: precomputed-tables
+                      - text: feature (
+                      - link "#697" [ref=e855] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/697
+                      - text: ","
+                      - link "#705" [ref=e856] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/705
+                      - text: ","
+                      - link "#707" [ref=e857] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/707
+                      - text: )
+                    - listitem [ref=e858]:
+                      - text: Constructors for
+                      - code [ref=e859]: Scalar
+                      - text: from
+                      - code [ref=e860]: u128
+                      - text: (
+                      - link "#709" [ref=e861] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/709
+                      - text: )
+                  - generic [ref=e862]:
+                    - heading "Changed" [level=3] [ref=e863]
+                    - 'link "Permalink: Changed" [ref=e864] [cursor=pointer]':
+                      - /url: "#changed-3"
+                      - img [ref=e865]
+                  - list [ref=e867]:
+                    - listitem [ref=e868]:
+                      - text: Use weak feature activation; MSRV 1.60 (
+                      - link "#701" [ref=e869] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/701
+                      - text: )
+                    - listitem [ref=e870]:
+                      - text: Bump
+                      - code [ref=e871]: ecdsa
+                      - text: dependency to v0.15 (
+                      - link "#713" [ref=e872] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/713
+                      - text: )
+                  - generic [ref=e873]:
+                    - heading "Removed" [level=3] [ref=e874]
+                    - 'link "Permalink: Removed" [ref=e875] [cursor=pointer]':
+                      - /url: "#removed-1"
+                      - img [ref=e876]
+                  - list [ref=e878]:
+                    - listitem [ref=e879]:
+                      - code [ref=e880]: ecdsa::recoverable
+                      - text: module; see documentation for replacements (
+                      - link "#675" [ref=e881] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/675
+                      - text: )
+                  - generic [ref=e882]:
+                    - heading "0.11.6 (2022-09-27)" [level=2] [ref=e883]
+                    - 'link "Permalink: 0.11.6 (2022-09-27)" [ref=e884] [cursor=pointer]':
+                      - /url: "#0116-2022-09-27"
+                      - img [ref=e885]
+                  - generic [ref=e887]:
+                    - heading "Added" [level=3] [ref=e888]
+                    - 'link "Permalink: Added" [ref=e889] [cursor=pointer]':
+                      - /url: "#added-5"
+                      - img [ref=e890]
+                  - list [ref=e892]:
+                    - listitem [ref=e893]:
+                      - code [ref=e894]: ecdsa::recoverable::Signature::from_digest_bytes_trial_recovery
+                      - text: (
+                      - link "#660" [ref=e895] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/660
+                      - text: )
+                  - generic [ref=e896]:
+                    - heading "Changed" [level=3] [ref=e897]
+                    - 'link "Permalink: Changed" [ref=e898] [cursor=pointer]':
+                      - /url: "#changed-4"
+                      - img [ref=e899]
+                  - list [ref=e901]:
+                    - listitem [ref=e902]:
+                      - text: Make
+                      - code [ref=e903]: ProjectivePoint
+                      - text: equality and
+                      - code [ref=e904]: is_identity
+                      - text: faster (
+                      - link "#650" [ref=e905] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/650
+                      - text: )
+                  - generic [ref=e906]:
+                    - heading "0.11.5 (2022-09-14)" [level=2] [ref=e907]
+                    - 'link "Permalink: 0.11.5 (2022-09-14)" [ref=e908] [cursor=pointer]':
+                      - /url: "#0115-2022-09-14"
+                      - img [ref=e909]
+                  - generic [ref=e911]:
+                    - heading "Added" [level=3] [ref=e912]
+                    - 'link "Permalink: Added" [ref=e913] [cursor=pointer]':
+                      - /url: "#added-6"
+                      - img [ref=e914]
+                  - list [ref=e916]:
+                    - listitem [ref=e917]:
+                      - text: Impl
+                      - code [ref=e918]: PrehashSigner
+                      - text: and
+                      - code [ref=e919]: PrehashVerifier
+                      - text: traits for ECDSA keys (
+                      - link "#653" [ref=e920] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/653
+                      - text: )
+                    - listitem [ref=e921]:
+                      - text: Impl
+                      - code [ref=e922]: Keypair
+                      - text: for
+                      - code [ref=e923]: SigningKey
+                      - text: (
+                      - link "#654" [ref=e924] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/654
+                      - text: )
+                  - generic [ref=e925]:
+                    - heading "0.11.4 (2022-08-13)" [level=2] [ref=e926]
+                    - 'link "Permalink: 0.11.4 (2022-08-13)" [ref=e927] [cursor=pointer]':
+                      - /url: "#0114-2022-08-13"
+                      - img [ref=e928]
+                  - generic [ref=e930]:
+                    - heading "Added" [level=3] [ref=e931]
+                    - 'link "Permalink: Added" [ref=e932] [cursor=pointer]':
+                      - /url: "#added-7"
+                      - img [ref=e933]
+                  - list [ref=e935]:
+                    - listitem [ref=e936]:
+                      - text: Impl
+                      - code [ref=e937]: ZeroizeOnDrop
+                      - text: for
+                      - code [ref=e938]: ecdsa::SigningKey
+                      - text: and
+                      - code [ref=e939]: schnorr::SigningKey
+                      - text: (
+                      - link "#630" [ref=e940] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/630
+                      - text: )
+                  - generic [ref=e941]:
+                    - heading "Changed" [level=3] [ref=e942]
+                    - 'link "Permalink: Changed" [ref=e943] [cursor=pointer]':
+                      - /url: "#changed-5"
+                      - img [ref=e944]
+                  - list [ref=e946]:
+                    - listitem [ref=e947]:
+                      - text: Get rid of eager computation in
+                      - code [ref=e948]: mul_shift_vartime()
+                      - text: (
+                      - link "#638" [ref=e949] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/638
+                      - text: )
+                    - listitem [ref=e950]:
+                      - text: Bump the precision of precomputed division for the scalar decomposition (
+                      - link "#639" [ref=e951] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/639
+                      - text: )
+                  - generic [ref=e952]:
+                    - heading "0.11.3 (2022-07-02)" [level=2] [ref=e953]
+                    - 'link "Permalink: 0.11.3 (2022-07-02)" [ref=e954] [cursor=pointer]':
+                      - /url: "#0113-2022-07-02"
+                      - img [ref=e955]
+                  - generic [ref=e957]:
+                    - heading "Changed" [level=3] [ref=e958]
+                    - 'link "Permalink: Changed" [ref=e959] [cursor=pointer]':
+                      - /url: "#changed-6"
+                      - img [ref=e960]
+                  - list [ref=e962]:
+                    - listitem [ref=e963]:
+                      - text: Relax
+                      - code [ref=e964]: DigestSigner
+                      - text: trait bounds (
+                      - link "#613" [ref=e965] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/613
+                      - text: )
+                    - listitem [ref=e966]:
+                      - text: Bump
+                      - code [ref=e967]: elliptic-curve
+                      - text: to v0.12.2 (
+                      - link "#616" [ref=e968] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/616
+                      - text: )
+                  - generic [ref=e969]:
+                    - heading "0.11.2 (2022-05-24)" [level=2] [ref=e970]
+                    - 'link "Permalink: 0.11.2 (2022-05-24)" [ref=e971] [cursor=pointer]':
+                      - /url: "#0112-2022-05-24"
+                      - img [ref=e972]
+                  - generic [ref=e974]:
+                    - heading "Changed" [level=3] [ref=e975]
+                    - 'link "Permalink: Changed" [ref=e976] [cursor=pointer]':
+                      - /url: "#changed-7"
+                      - img [ref=e977]
+                  - list [ref=e979]:
+                    - listitem [ref=e980]:
+                      - text: Enable
+                      - code [ref=e981]: schnorr
+                      - text: feature by default (
+                      - link "#561" [ref=e982] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/561
+                      - text: )
+                  - generic [ref=e983]:
+                    - heading "0.11.1 (2022-05-24)" [level=2] [ref=e984]
+                    - 'link "Permalink: 0.11.1 (2022-05-24)" [ref=e985] [cursor=pointer]':
+                      - /url: "#0111-2022-05-24"
+                      - img [ref=e986]
+                  - generic [ref=e988]:
+                    - heading "Added" [level=3] [ref=e989]
+                    - 'link "Permalink: Added" [ref=e990] [cursor=pointer]':
+                      - /url: "#added-8"
+                      - img [ref=e991]
+                  - list [ref=e993]:
+                    - listitem [ref=e994]:
+                      - text: Taproot Schnorr as defined in BIP 340 (
+                      - link "#554" [ref=e995] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/554
+                      - text: ","
+                      - link "#557" [ref=e996] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/557
+                      - text: ","
+                      - link "#558" [ref=e997] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/558
+                      - text: )
+                    - listitem [ref=e998]:
+                      - text: Re-export low-level
+                      - code [ref=e999]: diffie_hellman
+                      - text: function (
+                      - link "#556" [ref=e1000] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/556
+                      - text: )
+                  - generic [ref=e1001]:
+                    - heading "Changed" [level=3] [ref=e1002]
+                    - 'link "Permalink: Changed" [ref=e1003] [cursor=pointer]':
+                      - /url: "#changed-8"
+                      - img [ref=e1004]
+                  - list [ref=e1006]:
+                    - listitem [ref=e1007]:
+                      - text: Use SHA-256 for computing RFC6979 for
+                      - code [ref=e1008]: recoverable::Signature
+                      - text: (
+                      - link "#552" [ref=e1009] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/552
+                      - text: )
+                  - generic [ref=e1010]:
+                    - heading "0.11.0 (2022-05-09)" [level=2] [ref=e1011]
+                    - 'link "Permalink: 0.11.0 (2022-05-09)" [ref=e1012] [cursor=pointer]':
+                      - /url: "#0110-2022-05-09"
+                      - img [ref=e1013]
+                  - generic [ref=e1015]:
+                    - heading "Changed" [level=3] [ref=e1016]
+                    - 'link "Permalink: Changed" [ref=e1017] [cursor=pointer]':
+                      - /url: "#changed-9"
+                      - img [ref=e1018]
+                  - list [ref=e1020]:
+                    - listitem [ref=e1021]:
+                      - text: Bump
+                      - code [ref=e1022]: digest
+                      - text: to v0.10 (
+                      - link "#515" [ref=e1023] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/515
+                      - text: )
+                    - listitem [ref=e1024]:
+                      - text: Make
+                      - code [ref=e1025]: AffinePoint
+                      - text: to
+                      - code [ref=e1026]: VerifyingKey
+                      - text: conversion fallible (
+                      - link "#535" [ref=e1027] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/535
+                      - text: )
+                    - listitem [ref=e1028]:
+                      - text: Rename
+                      - code [ref=e1029]: recover_verify_key
+                      - text: =>
+                      - code [ref=e1030]: recover_verifying_key
+                      - text: (
+                      - link "#537" [ref=e1031] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/537
+                      - text: )
+                    - listitem [ref=e1032]:
+                      - text: Rename
+                      - code [ref=e1033]: recover_verify_key_from_digest
+                      - text: =>
+                      - code [ref=e1034]: recover_verifying_key_from_digest
+                      - text: (
+                      - link "#537" [ref=e1035] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/537
+                      - text: )
+                    - listitem [ref=e1036]:
+                      - text: Have
+                      - code [ref=e1037]: pkcs8
+                      - text: feature activate
+                      - code [ref=e1038]: ecdsa/pkcs8
+                      - text: (
+                      - link "#538" [ref=e1039] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/538
+                      - text: )
+                    - listitem [ref=e1040]:
+                      - text: Bump
+                      - code [ref=e1041]: elliptic-curve
+                      - text: to v0.12 (
+                      - link "#544" [ref=e1042] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/544
+                      - text: )
+                    - listitem [ref=e1043]:
+                      - text: Bump
+                      - code [ref=e1044]: ecdsa
+                      - text: to v0.14 (
+                      - link "#544" [ref=e1045] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/544
+                      - text: )
+                  - generic [ref=e1046]:
+                    - heading "Fixed" [level=3] [ref=e1047]
+                    - 'link "Permalink: Fixed" [ref=e1048] [cursor=pointer]':
+                      - /url: "#fixed-3"
+                      - img [ref=e1049]
+                  - list [ref=e1051]:
+                    - listitem [ref=e1052]:
+                      - code [ref=e1053]: hash2curve
+                      - text: crate feature (
+                      - link "#519" [ref=e1054] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/519
+                      - text: )
+                  - generic [ref=e1055]:
+                    - heading "0.10.4 (2022-03-15)" [level=2] [ref=e1056]
+                    - 'link "Permalink: 0.10.4 (2022-03-15)" [ref=e1057] [cursor=pointer]':
+                      - /url: "#0104-2022-03-15"
+                      - img [ref=e1058]
+                  - generic [ref=e1060]:
+                    - heading "Fixed" [level=3] [ref=e1061]
+                    - 'link "Permalink: Fixed" [ref=e1062] [cursor=pointer]':
+                      - /url: "#fixed-4"
+                      - img [ref=e1063]
+                  - list [ref=e1065]:
+                    - listitem [ref=e1066]:
+                      - text: Normalize before calling
+                      - code [ref=e1067]: is_odd()
+                      - text: in
+                      - code [ref=e1068]: sng0()
+                      - text: (
+                      - link "#533" [ref=e1069] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/533
+                      - text: )
+                  - generic [ref=e1070]:
+                    - heading "0.10.3 (2022-03-14)" [level=2] [ref=e1071]
+                    - 'link "Permalink: 0.10.3 (2022-03-14)" [ref=e1072] [cursor=pointer]':
+                      - /url: "#0103-2022-03-14"
+                      - img [ref=e1073]
+                  - generic [ref=e1075]:
+                    - heading "Fixed" [level=3] [ref=e1076]
+                    - 'link "Permalink: Fixed" [ref=e1077] [cursor=pointer]':
+                      - /url: "#fixed-5"
+                      - img [ref=e1078]
+                  - list [ref=e1080]:
+                    - listitem [ref=e1081]:
+                      - text: Do not normalize the argument in
+                      - code [ref=e1082]: FieldElementImpl::is_odd()
+                      - text: (
+                      - link "#530" [ref=e1083] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/530
+                      - text: )
+                  - generic [ref=e1084]:
+                    - heading "0.10.2 (2022-01-17)" [level=2] [ref=e1085]
+                    - 'link "Permalink: 0.10.2 (2022-01-17)" [ref=e1086] [cursor=pointer]':
+                      - /url: "#0102-2022-01-17"
+                      - img [ref=e1087]
+                  - generic [ref=e1089]:
+                    - heading "Added" [level=3] [ref=e1090]
+                    - 'link "Permalink: Added" [ref=e1091] [cursor=pointer]':
+                      - /url: "#added-9"
+                      - img [ref=e1092]
+                  - list [ref=e1094]:
+                    - listitem [ref=e1095]:
+                      - text: "hash2curve support: impl"
+                      - code [ref=e1096]: GroupDigest
+                      - text: for
+                      - code [ref=e1097]: Secp256k1
+                      - text: (
+                      - link "#503" [ref=e1098] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/503
+                      - text: )
+                    - listitem [ref=e1099]:
+                      - code [ref=e1100]: IDENTITY
+                      - text: and
+                      - code [ref=e1101]: GENERATOR
+                      - text: point constants (
+                      - link "#511" [ref=e1102] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/511
+                      - text: )
+                  - generic [ref=e1103]:
+                    - heading "0.10.1 (2022-01-04)" [level=2] [ref=e1104]
+                    - 'link "Permalink: 0.10.1 (2022-01-04)" [ref=e1105] [cursor=pointer]':
+                      - /url: "#0101-2022-01-04"
+                      - img [ref=e1106]
+                  - generic [ref=e1108]:
+                    - heading "Added" [level=3] [ref=e1109]
+                    - 'link "Permalink: Added" [ref=e1110] [cursor=pointer]':
+                      - /url: "#added-10"
+                      - img [ref=e1111]
+                  - list [ref=e1113]:
+                    - listitem [ref=e1114]:
+                      - text: Impl
+                      - code [ref=e1115]: ff::Field
+                      - text: trait for
+                      - code [ref=e1116]: FieldElement
+                      - text: (
+                      - link "#498" [ref=e1117] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/498
+                      - text: )
+                    - listitem [ref=e1118]:
+                      - text: Impl
+                      - code [ref=e1119]: ReduceNonZero<U256>
+                      - text: for
+                      - code [ref=e1120]: Scalar
+                      - text: (
+                      - link "#501" [ref=e1121] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/501
+                      - text: )
+                  - generic [ref=e1122]:
+                    - heading "0.10.0 (2021-12-14)" [level=2] [ref=e1123]
+                    - 'link "Permalink: 0.10.0 (2021-12-14)" [ref=e1124] [cursor=pointer]':
+                      - /url: "#0100-2021-12-14"
+                      - img [ref=e1125]
+                  - generic [ref=e1127]:
+                    - heading "Added" [level=3] [ref=e1128]
+                    - 'link "Permalink: Added" [ref=e1129] [cursor=pointer]':
+                      - /url: "#added-11"
+                      - img [ref=e1130]
+                  - list [ref=e1132]:
+                    - listitem [ref=e1133]:
+                      - text: Implement
+                      - code [ref=e1134]: Scalar::sqrt
+                      - text: (
+                      - link "#400" [ref=e1135] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/400
+                      - text: )
+                    - listitem [ref=e1136]:
+                      - text: Impl
+                      - code [ref=e1137]: PrimeCurveArithmetic
+                      - text: (
+                      - link "#415" [ref=e1138] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/415
+                      - text: )
+                    - listitem [ref=e1139]:
+                      - text: Impl
+                      - code [ref=e1140]: Reduce<U256>
+                      - text: for
+                      - code [ref=e1141]: Scalar
+                      - text: (
+                      - link "#436" [ref=e1142] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/436
+                      - text: )
+                    - listitem [ref=e1143]:
+                      - text: Impl
+                      - code [ref=e1144]: Drop
+                      - text: for
+                      - code [ref=e1145]: ecdsa::SigningKey
+                      - text: (
+                      - link "#449" [ref=e1146] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/449
+                      - text: )
+                    - listitem [ref=e1147]:
+                      - code [ref=e1148]: serde
+                      - text: feature (
+                      - link "#463" [ref=e1149] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/463
+                      - text: ","
+                      - link "#464" [ref=e1150] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/464
+                      - text: )
+                    - listitem [ref=e1151]:
+                      - text: Impl
+                      - code [ref=e1152]: Reduce<U512>
+                      - text: for
+                      - code [ref=e1153]: Scalar
+                      - text: (
+                      - link "#472" [ref=e1154] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/472
+                      - text: )
+                    - listitem [ref=e1155]:
+                      - text: Impl
+                      - code [ref=e1156]: ReduceNonZero<U512>
+                      - text: for
+                      - code [ref=e1157]: Scalar
+                      - text: (
+                      - link "#474" [ref=e1158] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/474
+                      - text: )
+                    - listitem [ref=e1159]:
+                      - text: Impl
+                      - code [ref=e1160]: LinearCombination
+                      - text: trait (
+                      - link "#476" [ref=e1161] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/476
+                      - text: )
+                  - generic [ref=e1162]:
+                    - heading "Changed" [level=3] [ref=e1163]
+                    - 'link "Permalink: Changed" [ref=e1164] [cursor=pointer]':
+                      - /url: "#changed-10"
+                      - img [ref=e1165]
+                  - list [ref=e1167]:
+                    - listitem [ref=e1168]:
+                      - text: Make
+                      - code [ref=e1169]: ecdsa::Signature::normalize_s
+                      - text: non-mutating (
+                      - link "#405" [ref=e1170] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/405
+                      - text: )
+                    - listitem [ref=e1171]:
+                      - text: Use
+                      - code [ref=e1172]: PrimeCurve
+                      - text: trait (
+                      - link "#413" [ref=e1173] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/413
+                      - text: )
+                    - listitem [ref=e1174]:
+                      - text: Use
+                      - code [ref=e1175]: sec1
+                      - text: crate for
+                      - code [ref=e1176]: EncodedPoint
+                      - text: type (
+                      - link "#435" [ref=e1177] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/435
+                      - text: )
+                    - listitem [ref=e1178]:
+                      - text: Replace
+                      - code [ref=e1179]: ecdsa::hazmat::FromDigest
+                      - text: with
+                      - code [ref=e1180]: Reduce
+                      - text: (
+                      - link "#438" [ref=e1181] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/438
+                      - text: )
+                    - listitem [ref=e1182]:
+                      - text: Make
+                      - code [ref=e1183]: FromEncodedPoint
+                      - text: return a
+                      - code [ref=e1184]: CtOption
+                      - text: (
+                      - link "#445" [ref=e1185] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/445
+                      - text: )
+                    - listitem [ref=e1186]:
+                      - text: Rust 2021 edition upgrade; MSRV 1.56+ (
+                      - link "#453" [ref=e1187] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/453
+                      - text: )
+                    - listitem [ref=e1188]:
+                      - text: Bump
+                      - code [ref=e1189]: elliptic-curve
+                      - text: crate dependency to v0.11 (
+                      - link "#466" [ref=e1190] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/466
+                      - text: )
+                    - listitem [ref=e1191]:
+                      - text: Bump
+                      - code [ref=e1192]: ecdsa
+                      - text: crate dependency to v0.13 (
+                      - link "#467" [ref=e1193] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/467
+                      - text: )
+                  - generic [ref=e1194]:
+                    - heading "Fixed" [level=3] [ref=e1195]
+                    - 'link "Permalink: Fixed" [ref=e1196] [cursor=pointer]':
+                      - /url: "#fixed-6"
+                      - img [ref=e1197]
+                  - list [ref=e1199]:
+                    - listitem [ref=e1200]:
+                      - text: Handle identity point in
+                      - code [ref=e1201]: GroupEncoding
+                      - text: (
+                      - link "#446" [ref=e1202] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/446
+                      - text: )
+                  - generic [ref=e1203]:
+                    - heading "Removed" [level=3] [ref=e1204]
+                    - 'link "Permalink: Removed" [ref=e1205] [cursor=pointer]':
+                      - /url: "#removed-2"
+                      - img [ref=e1206]
+                  - list [ref=e1208]:
+                    - listitem [ref=e1209]:
+                      - code [ref=e1210]: force-32-bit
+                      - text: feature (
+                      - link "#399" [ref=e1211] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/399
+                      - text: )
+                    - listitem [ref=e1212]:
+                      - code [ref=e1213]: field-montgomery
+                      - text: feature (
+                      - link "#404" [ref=e1214] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/404
+                      - text: )
+                    - listitem [ref=e1215]:
+                      - code [ref=e1216]: Scalar::conditional_add_bit
+                      - text: (
+                      - link "#431" [ref=e1217] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/431
+                      - text: )
+                    - listitem [ref=e1218]:
+                      - text: Deprecated
+                      - code [ref=e1219]: SigningKey::verify_key
+                      - text: method (
+                      - link "#461" [ref=e1220] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/461
+                      - text: )
+                  - generic [ref=e1221]:
+                    - heading "0.9.6 (2021-07-22)" [level=2] [ref=e1222]
+                    - 'link "Permalink: 0.9.6 (2021-07-22)" [ref=e1223] [cursor=pointer]':
+                      - /url: "#096-2021-07-22"
+                      - img [ref=e1224]
+                  - generic [ref=e1226]:
+                    - heading "Added" [level=3] [ref=e1227]
+                    - 'link "Permalink: Added" [ref=e1228] [cursor=pointer]':
+                      - /url: "#added-12"
+                      - img [ref=e1229]
+                  - list [ref=e1231]:
+                    - listitem [ref=e1232]:
+                      - text: Wycheproof test vectors (
+                      - link "#384" [ref=e1233] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/384
+                      - text: )
+                  - generic [ref=e1234]:
+                    - heading "Fixed" [level=3] [ref=e1235]
+                    - 'link "Permalink: Fixed" [ref=e1236] [cursor=pointer]':
+                      - /url: "#fixed-7"
+                      - img [ref=e1237]
+                  - list [ref=e1239]:
+                    - listitem [ref=e1240]:
+                      - text: Edge case in
+                      - code [ref=e1241]: Scalar::is_high
+                      - text: (
+                      - link "#385" [ref=e1242] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/385
+                      - text: )
+                    - listitem [ref=e1243]:
+                      - text: Bug in overflow check during 32-bit multiplication (
+                      - link "#388" [ref=e1244] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/388
+                      - text: )
+                  - generic [ref=e1245]:
+                    - heading "0.9.5 (2021-07-18)" [level=2] [ref=e1246]
+                    - 'link "Permalink: 0.9.5 (2021-07-18)" [ref=e1247] [cursor=pointer]':
+                      - /url: "#095-2021-07-18"
+                      - img [ref=e1248]
+                  - generic [ref=e1250]:
+                    - heading "Changed" [level=3] [ref=e1251]
+                    - 'link "Permalink: Changed" [ref=e1252] [cursor=pointer]':
+                      - /url: "#changed-11"
+                      - img [ref=e1253]
+                  - list [ref=e1255]:
+                    - listitem [ref=e1256]:
+                      - text: Optimize ECDSA using linear combination of points (
+                      - link "#380" [ref=e1257] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/380
+                      - text: )
+                  - generic [ref=e1258]:
+                    - heading "0.9.4 (2021-06-23)" [level=2] [ref=e1259]
+                    - 'link "Permalink: 0.9.4 (2021-06-23)" [ref=e1260] [cursor=pointer]':
+                      - /url: "#094-2021-06-23"
+                      - img [ref=e1261]
+                  - generic [ref=e1263]:
+                    - heading "Added" [level=3] [ref=e1264]
+                    - 'link "Permalink: Added" [ref=e1265] [cursor=pointer]':
+                      - /url: "#added-13"
+                      - img [ref=e1266]
+                  - list [ref=e1268]:
+                    - listitem [ref=e1269]:
+                      - text: Derive
+                      - code [ref=e1270]: Clone
+                      - text: for
+                      - code [ref=e1271]: ecdsa::SigningKey
+                      - text: (
+                      - link "#374" [ref=e1272] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/374
+                      - text: )
+                  - generic [ref=e1273]:
+                    - heading "0.9.3 (2021-06-21)" [level=2] [ref=e1274]
+                    - 'link "Permalink: 0.9.3 (2021-06-21)" [ref=e1275] [cursor=pointer]':
+                      - /url: "#093-2021-06-21"
+                      - img [ref=e1276]
+                  - generic [ref=e1278]:
+                    - heading "Added" [level=3] [ref=e1279]
+                    - 'link "Permalink: Added" [ref=e1280] [cursor=pointer]':
+                      - /url: "#added-14"
+                      - img [ref=e1281]
+                  - list [ref=e1283]:
+                    - listitem [ref=e1284]:
+                      - code [ref=e1285]: ecdsa::SigningKey::verifying_key()
+                      - text: method (
+                      - link "#363" [ref=e1286] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/363
+                      - text: )
+                  - generic [ref=e1287]:
+                    - heading "Changed" [level=3] [ref=e1288]
+                    - 'link "Permalink: Changed" [ref=e1289] [cursor=pointer]':
+                      - /url: "#changed-12"
+                      - img [ref=e1290]
+                  - list [ref=e1292]:
+                    - listitem [ref=e1293]:
+                      - text: Deprecate
+                      - code [ref=e1294]: SigningKey::verify_key()
+                      - text: "- use"
+                      - code [ref=e1295]: verifying_key
+                      - text: instead (
+                      - link "#363" [ref=e1296] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/363
+                      - text: )
+                    - listitem [ref=e1297]:
+                      - text: Bump
+                      - code [ref=e1298]: elliptic-curve
+                      - text: dependency to v0.10.3 (
+                      - link "#371" [ref=e1299] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/371
+                      - text: )
+                  - generic [ref=e1300]:
+                    - heading "0.9.2 (2021-06-14) [YANKED]" [level=2] [ref=e1301]
+                    - 'link "Permalink: 0.9.2 (2021-06-14) [YANKED]" [ref=e1302] [cursor=pointer]':
+                      - /url: "#092-2021-06-14-yanked"
+                      - img [ref=e1303]
+                  - generic [ref=e1305]:
+                    - heading "Added" [level=3] [ref=e1306]
+                    - 'link "Permalink: Added" [ref=e1307] [cursor=pointer]':
+                      - /url: "#added-15"
+                      - img [ref=e1308]
+                  - list [ref=e1310]:
+                    - listitem [ref=e1311]:
+                      - code [ref=e1312]: Debug
+                      - text: impl for
+                      - code [ref=e1313]: ecdsa::SigningKey
+                      - text: (
+                      - link "#358" [ref=e1314] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/358
+                      - text: )
+                    - listitem [ref=e1315]:
+                      - code [ref=e1316]: ConstantTimeEq
+                      - text: /
+                      - code [ref=e1317]: Eq
+                      - text: /
+                      - code [ref=e1318]: PartialEq
+                      - text: impls for
+                      - code [ref=e1319]: ecdsa::SigningKey
+                      - text: (
+                      - link "#359" [ref=e1320] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/359
+                      - text: )
+                  - generic [ref=e1321]:
+                    - heading "0.9.1 (2021-06-09) [YANKED]" [level=2] [ref=e1322]
+                    - 'link "Permalink: 0.9.1 (2021-06-09) [YANKED]" [ref=e1323] [cursor=pointer]':
+                      - /url: "#091-2021-06-09-yanked"
+                      - img [ref=e1324]
+                  - generic [ref=e1326]:
+                    - heading "Added" [level=3] [ref=e1327]
+                    - 'link "Permalink: Added" [ref=e1328] [cursor=pointer]':
+                      - /url: "#added-16"
+                      - img [ref=e1329]
+                  - list [ref=e1331]:
+                    - listitem [ref=e1332]:
+                      - code [ref=e1333]: Copy
+                      - text: impl for
+                      - code [ref=e1334]: ecdsa::VerifyingKey
+                      - text: (
+                      - link "#355" [ref=e1335] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/355
+                      - text: )
+                  - generic [ref=e1336]:
+                    - heading "0.9.0 (2021-06-08) [YANKED]" [level=2] [ref=e1337]
+                    - 'link "Permalink: 0.9.0 (2021-06-08) [YANKED]" [ref=e1338] [cursor=pointer]':
+                      - /url: "#090-2021-06-08-yanked"
+                      - img [ref=e1339]
+                  - generic [ref=e1341]:
+                    - heading "Added" [level=3] [ref=e1342]
+                    - 'link "Permalink: Added" [ref=e1343] [cursor=pointer]':
+                      - /url: "#added-17"
+                      - img [ref=e1344]
+                  - list [ref=e1346]:
+                    - listitem [ref=e1347]:
+                      - text: Derive
+                      - code [ref=e1348]: Ord
+                      - text: "on"
+                      - code [ref=e1349]: ecdsa::VerifyingKey
+                      - text: (
+                      - link "#343" [ref=e1350] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/343
+                      - text: )
+                    - listitem [ref=e1351]:
+                      - code [ref=e1352]: AffineArithmetic
+                      - text: trait impl (
+                      - link "#347" [ref=e1353] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/347
+                      - text: )
+                    - listitem [ref=e1354]:
+                      - code [ref=e1355]: PrimeCurve
+                      - text: trait impls (
+                      - link "#350" [ref=e1356] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/350
+                      - text: )
+                  - generic [ref=e1357]:
+                    - heading "Changed" [level=3] [ref=e1358]
+                    - 'link "Permalink: Changed" [ref=e1359] [cursor=pointer]':
+                      - /url: "#changed-13"
+                      - img [ref=e1360]
+                  - list [ref=e1362]:
+                    - listitem [ref=e1363]:
+                      - text: Bump
+                      - code [ref=e1364]: elliptic-curve
+                      - text: to v0.10; MSRV 1.51+ (
+                      - link "#349" [ref=e1365] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/349
+                      - text: )
+                    - listitem [ref=e1366]:
+                      - text: Bump
+                      - code [ref=e1367]: ecdsa
+                      - text: to v0.12 (
+                      - link "#349" [ref=e1368] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/349
+                      - text: )
+                  - generic [ref=e1369]:
+                    - heading "0.8.1 (2021-05-10)" [level=2] [ref=e1370]
+                    - 'link "Permalink: 0.8.1 (2021-05-10)" [ref=e1371] [cursor=pointer]':
+                      - /url: "#081-2021-05-10"
+                      - img [ref=e1372]
+                  - generic [ref=e1374]:
+                    - heading "Fixed" [level=3] [ref=e1375]
+                    - 'link "Permalink: Fixed" [ref=e1376] [cursor=pointer]':
+                      - /url: "#fixed-8"
+                      - img [ref=e1377]
+                  - list [ref=e1379]:
+                    - listitem [ref=e1380]:
+                      - text: Mixed coordinate addition with the point at infinity (
+                      - link "#337" [ref=e1381] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/337
+                      - text: )
+                  - generic [ref=e1382]:
+                    - heading "0.8.0 (2021-04-29)" [level=2] [ref=e1383]
+                    - 'link "Permalink: 0.8.0 (2021-04-29)" [ref=e1384] [cursor=pointer]':
+                      - /url: "#080-2021-04-29"
+                      - img [ref=e1385]
+                  - generic [ref=e1387]:
+                    - heading "Added" [level=3] [ref=e1388]
+                    - 'link "Permalink: Added" [ref=e1389] [cursor=pointer]':
+                      - /url: "#added-18"
+                      - img [ref=e1390]
+                  - list [ref=e1392]:
+                    - listitem [ref=e1393]:
+                      - code [ref=e1394]: jwk
+                      - text: feature (
+                      - link "#295" [ref=e1395] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/295
+                      - text: )
+                    - listitem [ref=e1396]:
+                      - code [ref=e1397]: Order
+                      - text: constant (
+                      - link "#328" [ref=e1398] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/328
+                      - text: )
+                  - generic [ref=e1399]:
+                    - heading "Changed" [level=3] [ref=e1400]
+                    - 'link "Permalink: Changed" [ref=e1401] [cursor=pointer]':
+                      - /url: "#changed-14"
+                      - img [ref=e1402]
+                  - list [ref=e1404]:
+                    - listitem [ref=e1405]:
+                      - text: Rename
+                      - code [ref=e1406]: ecdsa::Asn1Signature
+                      - text: to
+                      - code [ref=e1407]: ::DerSignature
+                      - text: (
+                      - link "#288" [ref=e1408] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/288
+                      - text: )
+                    - listitem [ref=e1409]:
+                      - text: Migrate to
+                      - code [ref=e1410]: FromDigest
+                      - text: trait from
+                      - code [ref=e1411]: ecdsa
+                      - text: crate (
+                      - link "#292" [ref=e1412] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/292
+                      - text: )
+                    - listitem [ref=e1413]:
+                      - text: Bump
+                      - code [ref=e1414]: elliptic-curve
+                      - text: to v0.9.2 (
+                      - link "#296" [ref=e1415] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/296
+                      - text: )
+                    - listitem [ref=e1416]:
+                      - text: Bump
+                      - code [ref=e1417]: pkcs8
+                      - text: to v0.6 (
+                      - link "#319" [ref=e1418] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/319
+                      - text: )
+                    - listitem [ref=e1419]:
+                      - text: Bump
+                      - code [ref=e1420]: ecdsa
+                      - text: crate dependency to v0.11 (
+                      - link "#330" [ref=e1421] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/330
+                      - text: )
+                  - generic [ref=e1422]:
+                    - heading "Fixed" [level=3] [ref=e1423]
+                    - 'link "Permalink: Fixed" [ref=e1424] [cursor=pointer]':
+                      - /url: "#fixed-9"
+                      - img [ref=e1425]
+                  - list [ref=e1427]:
+                    - listitem [ref=e1428]:
+                      - code [ref=e1429]: DigestPrimitive
+                      - text: feature gating (
+                      - link "#324" [ref=e1430] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/324
+                      - text: )
+                  - generic [ref=e1431]:
+                    - heading "0.7.3 (2021-04-16)" [level=2] [ref=e1432]
+                    - 'link "Permalink: 0.7.3 (2021-04-16)" [ref=e1433] [cursor=pointer]':
+                      - /url: "#073-2021-04-16"
+                      - img [ref=e1434]
+                  - generic [ref=e1436]:
+                    - heading "Changed" [level=3] [ref=e1437]
+                    - 'link "Permalink: Changed" [ref=e1438] [cursor=pointer]':
+                      - /url: "#changed-15"
+                      - img [ref=e1439]
+                  - list [ref=e1441]:
+                    - listitem [ref=e1442]:
+                      - text: Make
+                      - code [ref=e1443]: ecdsa
+                      - text: a default feature (
+                      - link "#325" [ref=e1444] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/325
+                      - text: )
+                  - generic [ref=e1445]:
+                    - heading "0.7.2 (2021-01-13)" [level=2] [ref=e1446]
+                    - 'link "Permalink: 0.7.2 (2021-01-13)" [ref=e1447] [cursor=pointer]':
+                      - /url: "#072-2021-01-13"
+                      - img [ref=e1448]
+                  - generic [ref=e1450]:
+                    - heading "Changed" [level=3] [ref=e1451]
+                    - 'link "Permalink: Changed" [ref=e1452] [cursor=pointer]':
+                      - /url: "#changed-16"
+                      - img [ref=e1453]
+                  - list [ref=e1455]:
+                    - listitem [ref=e1456]:
+                      - text: Have
+                      - code [ref=e1457]: std
+                      - text: feature activate
+                      - code [ref=e1458]: ecdsa-core/std
+                      - text: (
+                      - link "#273" [ref=e1459] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/273
+                      - text: )
+                  - generic [ref=e1460]:
+                    - heading "0.7.1 (2020-12-16)" [level=2] [ref=e1461]
+                    - 'link "Permalink: 0.7.1 (2020-12-16)" [ref=e1462] [cursor=pointer]':
+                      - /url: "#071-2020-12-16"
+                      - img [ref=e1463]
+                  - generic [ref=e1465]:
+                    - heading "Fixed" [level=3] [ref=e1466]
+                    - 'link "Permalink: Fixed" [ref=e1467] [cursor=pointer]':
+                      - /url: "#fixed-10"
+                      - img [ref=e1468]
+                  - list [ref=e1470]:
+                    - listitem [ref=e1471]:
+                      - text: Trigger docs.rs rebuild with nightly bugfix (
+                      - link "RustCrypto/traits#412" [ref=e1472] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/traits/pull/412
+                      - text: )
+                  - generic [ref=e1473]:
+                    - heading "0.7.0 (2020-12-16)" [level=2] [ref=e1474]
+                    - 'link "Permalink: 0.7.0 (2020-12-16)" [ref=e1475] [cursor=pointer]':
+                      - /url: "#070-2020-12-16"
+                      - img [ref=e1476]
+                  - generic [ref=e1478]:
+                    - heading "Changed" [level=3] [ref=e1479]
+                    - 'link "Permalink: Changed" [ref=e1480] [cursor=pointer]':
+                      - /url: "#changed-17"
+                      - img [ref=e1481]
+                  - list [ref=e1483]:
+                    - listitem [ref=e1484]:
+                      - text: Bump
+                      - code [ref=e1485]: elliptic-curve
+                      - text: dependency to v0.8 (
+                      - link "#260" [ref=e1486] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/260
+                      - text: )
+                    - listitem [ref=e1487]:
+                      - text: Bump
+                      - code [ref=e1488]: ecdsa
+                      - text: to v0.10 (
+                      - link "#260" [ref=e1489] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/260
+                      - text: )
+                  - generic [ref=e1490]:
+                    - heading "0.6.0 (2020-12-06)" [level=2] [ref=e1491]
+                    - 'link "Permalink: 0.6.0 (2020-12-06)" [ref=e1492] [cursor=pointer]':
+                      - /url: "#060-2020-12-06"
+                      - img [ref=e1493]
+                  - generic [ref=e1495]:
+                    - heading "Added" [level=3] [ref=e1496]
+                    - 'link "Permalink: Added" [ref=e1497] [cursor=pointer]':
+                      - /url: "#added-19"
+                      - img [ref=e1498]
+                  - list [ref=e1500]:
+                    - listitem [ref=e1501]:
+                      - text: PKCS#8 support (
+                      - link "#243" [ref=e1502] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/243
+                      - text: ","
+                      - link "#244" [ref=e1503] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/244
+                      - text: ","
+                      - link "#251" [ref=e1504] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/251
+                      - text: )
+                    - listitem [ref=e1505]:
+                      - code [ref=e1506]: PublicKey
+                      - text: type (
+                      - link "#239" [ref=e1507] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/239
+                      - text: )
+                  - generic [ref=e1508]:
+                    - heading "Changed" [level=3] [ref=e1509]
+                    - 'link "Permalink: Changed" [ref=e1510] [cursor=pointer]':
+                      - /url: "#changed-18"
+                      - img [ref=e1511]
+                  - list [ref=e1513]:
+                    - listitem [ref=e1514]:
+                      - text: Bump
+                      - code [ref=e1515]: elliptic-curve
+                      - text: crate dependency to v0.7; MSRV 1.46+ (
+                      - link "#247" [ref=e1516] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/247
+                      - text: )
+                    - listitem [ref=e1517]:
+                      - text: Bump
+                      - code [ref=e1518]: ecdsa
+                      - text: crate dependency to v0.9 (
+                      - link "#247" [ref=e1519] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/247
+                      - text: )
+                    - listitem [ref=e1520]:
+                      - text: Make
+                      - code [ref=e1521]: SigningKey
+                      - text: a newtype of
+                      - code [ref=e1522]: elliptic_curve::SecretKey
+                      - text: (
+                      - link "#242" [ref=e1523] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/242
+                      - text: )
+                  - generic [ref=e1524]:
+                    - heading "0.5.10 (2020-10-25)" [level=2] [ref=e1525]
+                    - 'link "Permalink: 0.5.10 (2020-10-25)" [ref=e1526] [cursor=pointer]':
+                      - /url: "#0510-2020-10-25"
+                      - img [ref=e1527]
+                  - generic [ref=e1529]:
+                    - heading "Changed" [level=3] [ref=e1530]
+                    - 'link "Permalink: Changed" [ref=e1531] [cursor=pointer]':
+                      - /url: "#changed-19"
+                      - img [ref=e1532]
+                  - list [ref=e1534]:
+                    - listitem [ref=e1535]:
+                      - text: Expand README.md (
+                      - link "#233" [ref=e1536] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/233
+                      - text: )
+                  - generic [ref=e1537]:
+                    - heading "0.5.9 (2020-10-08)" [level=2] [ref=e1538]
+                    - 'link "Permalink: 0.5.9 (2020-10-08)" [ref=e1539] [cursor=pointer]':
+                      - /url: "#059-2020-10-08"
+                      - img [ref=e1540]
+                  - generic [ref=e1542]:
+                    - heading "Changed" [level=3] [ref=e1543]
+                    - 'link "Permalink: Changed" [ref=e1544] [cursor=pointer]':
+                      - /url: "#changed-20"
+                      - img [ref=e1545]
+                  - list [ref=e1547]:
+                    - listitem [ref=e1548]:
+                      - text: Bump
+                      - code [ref=e1549]: cfg-if
+                      - text: from 0.1.10 to 1.0.0 (
+                      - link "#220" [ref=e1550] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/220
+                      - text: )
+                  - generic [ref=e1551]:
+                    - heading "0.5.8 (2020-10-08)" [level=2] [ref=e1552]
+                    - 'link "Permalink: 0.5.8 (2020-10-08)" [ref=e1553] [cursor=pointer]':
+                      - /url: "#058-2020-10-08"
+                      - img [ref=e1554]
+                  - generic [ref=e1556]:
+                    - heading "Fixed" [level=3] [ref=e1557]
+                    - 'link "Permalink: Fixed" [ref=e1558] [cursor=pointer]':
+                      - /url: "#fixed-11"
+                      - img [ref=e1559]
+                  - list [ref=e1561]:
+                    - listitem [ref=e1562]:
+                      - text: Regenerate
+                      - code [ref=e1563]: rustdoc
+                      - text: "on"
+                      - link "https://docs.rs" [ref=e1564] [cursor=pointer]:
+                        - /url: https://docs.rs
+                      - text: after nightly breakage
+                  - generic [ref=e1565]:
+                    - heading "0.5.7 (2020-10-08)" [level=2] [ref=e1566]
+                    - 'link "Permalink: 0.5.7 (2020-10-08)" [ref=e1567] [cursor=pointer]':
+                      - /url: "#057-2020-10-08"
+                      - img [ref=e1568]
+                  - generic [ref=e1570]:
+                    - heading "Added" [level=3] [ref=e1571]
+                    - 'link "Permalink: Added" [ref=e1572] [cursor=pointer]':
+                      - /url: "#added-20"
+                      - img [ref=e1573]
+                  - list [ref=e1575]:
+                    - listitem [ref=e1576]:
+                      - code [ref=e1577]: SecretValue
+                      - text: impl when
+                      - code [ref=e1578]: arithmetic
+                      - text: feature is disabled (
+                      - link "#222" [ref=e1579] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/222
+                      - text: )
+                  - generic [ref=e1580]:
+                    - heading "0.5.6 (2020-09-28)" [level=2] [ref=e1581]
+                    - 'link "Permalink: 0.5.6 (2020-09-28)" [ref=e1582] [cursor=pointer]':
+                      - /url: "#056-2020-09-28"
+                      - img [ref=e1583]
+                  - generic [ref=e1585]:
+                    - heading "Added" [level=3] [ref=e1586]
+                    - 'link "Permalink: Added" [ref=e1587] [cursor=pointer]':
+                      - /url: "#added-21"
+                      - img [ref=e1588]
+                  - list [ref=e1590]:
+                    - listitem [ref=e1591]:
+                      - text: Enable
+                      - code [ref=e1592]: endomorphism-mul
+                      - text: optimizations by default (
+                      - link "#213" [ref=e1593] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/213
+                      - text: )
+                  - generic [ref=e1594]:
+                    - heading "0.5.5 (2020-09-27)" [level=2] [ref=e1595]
+                    - 'link "Permalink: 0.5.5 (2020-09-27)" [ref=e1596] [cursor=pointer]':
+                      - /url: "#055-2020-09-27"
+                      - img [ref=e1597]
+                  - generic [ref=e1599]:
+                    - heading "Added" [level=3] [ref=e1600]
+                    - 'link "Permalink: Added" [ref=e1601] [cursor=pointer]':
+                      - /url: "#added-22"
+                      - img [ref=e1602]
+                  - list [ref=e1604]:
+                    - listitem [ref=e1605]:
+                      - text: Impl
+                      - code [ref=e1606]: FromEncodedPoint
+                      - text: for
+                      - code [ref=e1607]: ProjectivePoint
+                      - text: (
+                      - link "#210" [ref=e1608] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/210
+                      - text: )
+                    - listitem [ref=e1609]:
+                      - text: Impl
+                      - code [ref=e1610]: ToEncodedPoint
+                      - text: for
+                      - code [ref=e1611]: ecdsa::VerifyKey
+                      - text: (
+                      - link "#209" [ref=e1612] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/209
+                      - text: )
+                  - generic [ref=e1613]:
+                    - heading "0.5.4 (2020-09-27)" [level=2] [ref=e1614]
+                    - 'link "Permalink: 0.5.4 (2020-09-27)" [ref=e1615] [cursor=pointer]':
+                      - /url: "#054-2020-09-27"
+                      - img [ref=e1616]
+                  - generic [ref=e1618]:
+                    - heading "Added" [level=3] [ref=e1619]
+                    - 'link "Permalink: Added" [ref=e1620] [cursor=pointer]':
+                      - /url: "#added-23"
+                      - img [ref=e1621]
+                  - list [ref=e1623]:
+                    - listitem [ref=e1624]:
+                      - text: Impl
+                      - code [ref=e1625]: RecoverableSignPrimitive
+                      - text: "on"
+                      - code [ref=e1626]: Scalar
+                      - text: (
+                      - link "#206" [ref=e1627] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/206
+                      - text: )
+                    - listitem [ref=e1628]:
+                      - code [ref=e1629]: recoverable::Signature::recover_verify_key_from_digest_bytes
+                      - text: (
+                      - link "#205" [ref=e1630] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/205
+                      - text: )
+                  - generic [ref=e1631]:
+                    - heading "0.5.3 (2020-09-23)" [level=2] [ref=e1632]
+                    - 'link "Permalink: 0.5.3 (2020-09-23)" [ref=e1633] [cursor=pointer]':
+                      - /url: "#053-2020-09-23"
+                      - img [ref=e1634]
+                  - generic [ref=e1636]:
+                    - heading "Added" [level=3] [ref=e1637]
+                    - 'link "Permalink: Added" [ref=e1638] [cursor=pointer]':
+                      - /url: "#added-24"
+                      - img [ref=e1639]
+                  - list [ref=e1641]:
+                    - listitem [ref=e1642]:
+                      - text: Derive
+                      - code [ref=e1643]: Copy
+                      - text: "on"
+                      - code [ref=e1644]: VerifyKey
+                      - text: (
+                      - link "#202" [ref=e1645] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/202
+                      - text: )
+                  - generic [ref=e1646]:
+                    - heading "0.5.2 (2020-09-22)" [level=2] [ref=e1647]
+                    - 'link "Permalink: 0.5.2 (2020-09-22)" [ref=e1648] [cursor=pointer]':
+                      - /url: "#052-2020-09-22"
+                      - img [ref=e1649]
+                  - generic [ref=e1651]:
+                    - heading "Fixed" [level=3] [ref=e1652]
+                    - 'link "Permalink: Fixed" [ref=e1653] [cursor=pointer]':
+                      - /url: "#fixed-12"
+                      - img [ref=e1654]
+                  - list [ref=e1656]:
+                    - listitem [ref=e1657]:
+                      - text: Corrected imports when using
+                      - code [ref=e1658]: ecdsa
+                      - text: +
+                      - code [ref=e1659]: keccak256
+                      - text: features (
+                      - link "#199" [ref=e1660] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/199
+                      - text: )
+                  - generic [ref=e1661]:
+                    - heading "0.5.1 (2020-09-21)" [level=2] [ref=e1662]
+                    - 'link "Permalink: 0.5.1 (2020-09-21)" [ref=e1663] [cursor=pointer]':
+                      - /url: "#051-2020-09-21"
+                      - img [ref=e1664]
+                  - generic [ref=e1666]:
+                    - heading "Added" [level=3] [ref=e1667]
+                    - 'link "Permalink: Added" [ref=e1668] [cursor=pointer]':
+                      - /url: "#added-25"
+                      - img [ref=e1669]
+                  - list [ref=e1671]:
+                    - listitem [ref=e1672]:
+                      - text: Documentation for
+                      - code [ref=e1673]: sha256
+                      - text: feature (
+                      - link "#197" [ref=e1674] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/197
+                      - text: )
+                    - listitem [ref=e1675]:
+                      - code [ref=e1676]: sec1::EncodedPoint::decompress
+                      - text: test (
+                      - link "#194" [ref=e1677] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/194
+                      - text: )
+                    - listitem [ref=e1678]:
+                      - text: Impl
+                      - code [ref=e1679]: RandomizedSigner
+                      - text: "on"
+                      - code [ref=e1680]: SigningKey
+                      - text: (
+                      - link "#193" [ref=e1681] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/193
+                      - text: )
+                  - generic [ref=e1682]:
+                    - heading "Changed" [level=3] [ref=e1683]
+                    - 'link "Permalink: Changed" [ref=e1684] [cursor=pointer]':
+                      - /url: "#changed-21"
+                      - img [ref=e1685]
+                  - list [ref=e1687]:
+                    - listitem [ref=e1688]:
+                      - text: "Gate ecdsa::{Signer, Verifier} impls on"
+                      - code [ref=e1689]: sha256
+                      - text: feature (
+                      - link "#192" [ref=e1690] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/192
+                      - text: )
+                  - generic [ref=e1691]:
+                    - heading "0.5.0 (2020-09-17)" [level=2] [ref=e1692]
+                    - 'link "Permalink: 0.5.0 (2020-09-17)" [ref=e1693] [cursor=pointer]':
+                      - /url: "#050-2020-09-17"
+                      - img [ref=e1694]
+                  - generic [ref=e1696]:
+                    - heading "Added" [level=3] [ref=e1697]
+                    - 'link "Permalink: Added" [ref=e1698] [cursor=pointer]':
+                      - /url: "#added-26"
+                      - img [ref=e1699]
+                  - list [ref=e1701]:
+                    - listitem [ref=e1702]:
+                      - code [ref=e1703]: ecdsa::Asn1Signature
+                      - text: type alias (
+                      - link "#186" [ref=e1704] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/186
+                      - text: )
+                    - listitem [ref=e1705]:
+                      - code [ref=e1706]: ff
+                      - text: and
+                      - code [ref=e1707]: group
+                      - text: crate dependencies; MSRV 1.44+ (
+                      - link "#164" [ref=e1708] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/164
+                      - text: ","
+                      - link "#174" [ref=e1709] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/174
+                      - text: )
+                    - listitem [ref=e1710]:
+                      - code [ref=e1711]: AffinePoint::identity()
+                      - text: and
+                      - code [ref=e1712]: ::is_identity()
+                      - text: (
+                      - link "#165" [ref=e1713] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/165
+                      - text: )
+                    - listitem [ref=e1714]:
+                      - code [ref=e1715]: expose-field
+                      - text: feature (
+                      - link "#161" [ref=e1716] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/161
+                      - text: )
+                    - listitem [ref=e1717]:
+                      - code [ref=e1718]: keccak256
+                      - text: feature (
+                      - link "#142" [ref=e1719] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/142
+                      - text: )
+                  - generic [ref=e1720]:
+                    - heading "Changed" [level=3] [ref=e1721]
+                    - 'link "Permalink: Changed" [ref=e1722] [cursor=pointer]':
+                      - /url: "#changed-22"
+                      - img [ref=e1723]
+                  - list [ref=e1725]:
+                    - listitem [ref=e1726]:
+                      - text: Bump
+                      - code [ref=e1727]: elliptic-curve
+                      - text: crate to v0.6;
+                      - code [ref=e1728]: ecdsa
+                      - text: to v0.8 (
+                      - link "#180" [ref=e1729] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/180
+                      - text: )
+                    - listitem [ref=e1730]:
+                      - text: Refactor ProjectiveArithmetic trait (
+                      - link "#179" [ref=e1731] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/179
+                      - text: )
+                    - listitem [ref=e1732]:
+                      - text: Support generic inner type for
+                      - code [ref=e1733]: elliptic_curve::SecretKey<C>
+                      - text: (
+                      - link "#177" [ref=e1734] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/177
+                      - text: )
+                    - listitem [ref=e1735]:
+                      - text: Rename
+                      - code [ref=e1736]: ElementBytes
+                      - text: =>
+                      - code [ref=e1737]: FieldBytes
+                      - text: (
+                      - link "#176" [ref=e1738] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/176
+                      - text: )
+                    - listitem [ref=e1739]:
+                      - text: Factor out a
+                      - code [ref=e1740]: from_digest_trial_recovery
+                      - text: method (
+                      - link "#168" [ref=e1741] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/168
+                      - text: )
+                    - listitem [ref=e1742]:
+                      - text: Rename
+                      - code [ref=e1743]: "ecdsa::{Signer, Verifier}"
+                      - text: =>
+                      - code [ref=e1744]: "::{SigningKey, VerifyKey}"
+                      - text: (
+                      - link "#153" [ref=e1745] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/153
+                      - text: )
+                    - listitem [ref=e1746]:
+                      - text: Rename
+                      - code [ref=e1747]: Curve::ElementSize
+                      - text: =>
+                      - code [ref=e1748]: FieldSize
+                      - text: (
+                      - link "#150" [ref=e1749] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/150
+                      - text: )
+                    - listitem [ref=e1750]:
+                      - text: Implement RFC6979 deterministic ECDSA (
+                      - link "#146" [ref=e1751] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/146
+                      - text: )
+                    - listitem [ref=e1752]:
+                      - text: Use
+                      - code [ref=e1753]: NonZeroScalar
+                      - text: for ECDSA signature components (
+                      - link "#144" [ref=e1754] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/144
+                      - text: )
+                    - listitem [ref=e1755]:
+                      - text: Eagerly verify ECDSA scalars are in range (
+                      - link "#143" [ref=e1756] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/143
+                      - text: )
+                    - listitem [ref=e1757]:
+                      - text: Rename
+                      - code [ref=e1758]: PublicKey
+                      - text: to
+                      - code [ref=e1759]: EncodedPoint
+                      - text: (
+                      - link "#141" [ref=e1760] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/141
+                      - text: )
+                  - generic [ref=e1761]:
+                    - heading "Removed" [level=3] [ref=e1762]
+                    - 'link "Permalink: Removed" [ref=e1763] [cursor=pointer]':
+                      - /url: "#removed-3"
+                      - img [ref=e1764]
+                  - list [ref=e1766]:
+                    - listitem [ref=e1767]:
+                      - code [ref=e1768]: rand
+                      - text: feature (
+                      - link "#162" [ref=e1769] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/162
+                      - text: )
+                  - generic [ref=e1770]:
+                    - heading "0.4.2 (2020-08-11)" [level=2] [ref=e1771]
+                    - 'link "Permalink: 0.4.2 (2020-08-11)" [ref=e1772] [cursor=pointer]':
+                      - /url: "#042-2020-08-11"
+                      - img [ref=e1773]
+                  - generic [ref=e1775]:
+                    - heading "Fixed" [level=3] [ref=e1776]
+                    - 'link "Permalink: Fixed" [ref=e1777] [cursor=pointer]':
+                      - /url: "#fixed-13"
+                      - img [ref=e1778]
+                  - list [ref=e1780]:
+                    - listitem [ref=e1781]:
+                      - text: Builds with either
+                      - code [ref=e1782]: ecdsa-core
+                      - text: or
+                      - code [ref=e1783]: sha256
+                      - text: in isolation (
+                      - link "#133" [ref=e1784] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/133
+                      - text: )
+                  - generic [ref=e1785]:
+                    - heading "0.4.1 (2020-08-10)" [level=2] [ref=e1786]
+                    - 'link "Permalink: 0.4.1 (2020-08-10)" [ref=e1787] [cursor=pointer]':
+                      - /url: "#041-2020-08-10"
+                      - img [ref=e1788]
+                  - generic [ref=e1790]:
+                    - heading "Fixed" [level=3] [ref=e1791]
+                    - 'link "Permalink: Fixed" [ref=e1792] [cursor=pointer]':
+                      - /url: "#fixed-14"
+                      - img [ref=e1793]
+                  - list [ref=e1795]:
+                    - listitem [ref=e1796]:
+                      - text: secp256k1 rustdoc link (
+                      - link "#131" [ref=e1797] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/131
+                      - text: )
+                  - generic [ref=e1798]:
+                    - heading "0.4.0 (2020-08-10)" [level=2] [ref=e1799]
+                    - 'link "Permalink: 0.4.0 (2020-08-10)" [ref=e1800] [cursor=pointer]':
+                      - /url: "#040-2020-08-10"
+                      - img [ref=e1801]
+                  - generic [ref=e1803]:
+                    - heading "Added" [level=3] [ref=e1804]
+                    - 'link "Permalink: Added" [ref=e1805] [cursor=pointer]':
+                      - /url: "#added-27"
+                      - img [ref=e1806]
+                  - list [ref=e1808]:
+                    - listitem [ref=e1809]:
+                      - text: ECDSA support (
+                      - link "#73" [ref=e1810] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/73
+                      - text: ","
+                      - link "#101" [ref=e1811] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/101
+                      - text: ","
+                      - link "#104" [ref=e1812] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/104
+                      - text: ","
+                      - link "#105" [ref=e1813] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/105
+                      - text: )
+                    - listitem [ref=e1814]:
+                      - text: ECDSA public key recovery support (
+                      - link "#110" [ref=e1815] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/110
+                      - text: )
+                    - listitem [ref=e1816]:
+                      - text: OID support (
+                      - link "#103" [ref=e1817] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/103
+                      - text: ","
+                      - link "#113" [ref=e1818] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/113
+                      - text: )
+                    - listitem [ref=e1819]:
+                      - text: Elliptic Curve Diffie-Hellman (
+                      - link "#120" [ref=e1820] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/120
+                      - text: )
+                    - listitem [ref=e1821]:
+                      - code [ref=e1822]: Zeroize
+                      - text: impl for
+                      - code [ref=e1823]: AffinePoint
+                      - text: and
+                      - code [ref=e1824]: FieldElement
+                      - text: types (
+                      - link "#124" [ref=e1825] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/124
+                      - text: )
+                  - generic [ref=e1826]:
+                    - heading "Changed" [level=3] [ref=e1827]
+                    - 'link "Permalink: Changed" [ref=e1828] [cursor=pointer]':
+                      - /url: "#changed-23"
+                      - img [ref=e1829]
+                  - list [ref=e1831]:
+                    - listitem [ref=e1832]:
+                      - text: Optimized field arithmetic with 32-bit and 64-bit backends (
+                      - link "#59" [ref=e1833] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/59
+                      - text: ","
+                      - link "#82" [ref=e1834] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/82
+                      - text: )
+                    - listitem [ref=e1835]:
+                      - text: Bump
+                      - code [ref=e1836]: elliptic-curve
+                      - text: crate dependency to v0.5 (
+                      - link "#126" [ref=e1837] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/126
+                      - text: )
+                  - generic [ref=e1838]:
+                    - heading "0.3.0 (2020-06-08)" [level=2] [ref=e1839]
+                    - 'link "Permalink: 0.3.0 (2020-06-08)" [ref=e1840] [cursor=pointer]':
+                      - /url: "#030-2020-06-08"
+                      - img [ref=e1841]
+                  - generic [ref=e1843]:
+                    - heading "Changed" [level=3] [ref=e1844]
+                    - 'link "Permalink: Changed" [ref=e1845] [cursor=pointer]':
+                      - /url: "#changed-24"
+                      - img [ref=e1846]
+                  - list [ref=e1848]:
+                    - listitem [ref=e1849]:
+                      - text: Bump
+                      - code [ref=e1850]: elliptic-curve
+                      - text: crate dependency to v0.4 (
+                      - link "#39" [ref=e1851] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/39
+                      - text: )
+                  - generic [ref=e1852]:
+                    - heading "0.2.0 (2020-04-30)" [level=2] [ref=e1853]
+                    - 'link "Permalink: 0.2.0 (2020-04-30)" [ref=e1854] [cursor=pointer]':
+                      - /url: "#020-2020-04-30"
+                      - img [ref=e1855]
+                  - generic [ref=e1857]:
+                    - heading "Added" [level=3] [ref=e1858]
+                    - 'link "Permalink: Added" [ref=e1859] [cursor=pointer]':
+                      - /url: "#added-28"
+                      - img [ref=e1860]
+                  - list [ref=e1862]:
+                    - listitem [ref=e1863]:
+                      - text: Field arithmetic, point addition/doubling, and scalar multiplication (
+                      - link "#19" [ref=e1864] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/19
+                      - text: )
+                  - generic [ref=e1865]:
+                    - heading "0.1.1 (2020-04-20)" [level=2] [ref=e1866]
+                    - 'link "Permalink: 0.1.1 (2020-04-20)" [ref=e1867] [cursor=pointer]':
+                      - /url: "#011-2020-04-20"
+                      - img [ref=e1868]
+                  - generic [ref=e1870]:
+                    - heading "Fixed" [level=3] [ref=e1871]
+                    - 'link "Permalink: Fixed" [ref=e1872] [cursor=pointer]':
+                      - /url: "#fixed-15"
+                      - img [ref=e1873]
+                  - list [ref=e1875]:
+                    - listitem [ref=e1876]:
+                      - text: "README.md: fix typo in crate name ("
+                      - link "#16" [ref=e1877] [cursor=pointer]:
+                        - /url: https://github.com/RustCrypto/elliptic-curves/pull/16
+                      - text: )
+                  - generic [ref=e1878]:
+                    - heading "0.1.0 (2020-01-15)" [level=2] [ref=e1879]
+                    - 'link "Permalink: 0.1.0 (2020-01-15)" [ref=e1880] [cursor=pointer]':
+                      - /url: "#010-2020-01-15"
+                      - img [ref=e1881]
+                  - list [ref=e1883]:
+                    - listitem [ref=e1884]: Initial release
+  - alert [ref=e1888]

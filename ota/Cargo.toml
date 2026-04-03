@@ -1,0 +1,12 @@
+[package]
+name = "heartwood-ota"
+version = "0.1.0"
+edition = "2021"
+description = "Pi-side OTA firmware update tool for heartwood-esp32"
+
+[dependencies]
+heartwood-common = { path = "../common", default-features = false, features = ["k256-backend"] }
+clap = { version = "4", features = ["derive"] }
+serialport = "4"
+sha2 = "0.10"
+indicatif = "0.17"

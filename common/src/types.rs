@@ -23,6 +23,16 @@ pub const NACK: u8 = 0x15;
 /// Total provisioning frame length: 2 magic + 32 secret + 4 CRC32.
 pub const PROVISION_FRAME_LEN: usize = 38;
 
+// --- Frame protocol (Phase 3) ---
+pub const FRAME_TYPE_PROVISION: u8 = 0x01;
+pub const FRAME_TYPE_NIP46_REQUEST: u8 = 0x02;
+pub const FRAME_TYPE_NIP46_RESPONSE: u8 = 0x03;
+pub const FRAME_TYPE_ACK: u8 = 0x06;
+pub const FRAME_TYPE_NACK: u8 = 0x15;
+pub const MAX_PAYLOAD_SIZE: usize = 4096;
+pub const FRAME_HEADER_SIZE: usize = 5; // 2 magic + 1 type + 2 length
+pub const FRAME_OVERHEAD: usize = FRAME_HEADER_SIZE + 4; // header + CRC32
+
 /// Master tree root. Owns the secret; zeroised automatically when dropped
 /// via the `Zeroizing` wrapper. Call `destroy()` for explicit early cleanup.
 pub struct TreeRoot {

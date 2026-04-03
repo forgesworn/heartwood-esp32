@@ -121,20 +121,26 @@ Verified against Heltec factory test code, Meshtastic firmware, and ESPHome conf
 ## Structure
 
 ```
-common/                     Shared crypto (derivation, encoding, types)
+common/                     Shared crypto, frame protocol, NIP-46 types
   src/
-    lib.rs, derive.rs, encoding.rs, types.rs, hex.rs
-firmware/                   ESP32 firmware
+    lib.rs, derive.rs, encoding.rs, types.rs, hex.rs, frame.rs, nip46.rs
+firmware/                   ESP32 firmware (NIP-46 signing bunker)
   src/
-    main.rs               Boot flow: NVS check → provision or display
+    main.rs               Boot flow → frame dispatch loop
     sign.rs               BIP-340 Schnorr signing/verification
     nvs.rs                NVS read/write for root secret
-    provision.rs          Serial provisioning protocol (ESP32 side)
+    provision.rs          Provisioning handler (type 0x01)
+    protocol.rs           Serial frame reader/writer
+    nip46_handler.rs      NIP-46 dispatch (sign_event, get_public_key)
+    button.rs             PRG button (GPIO 0) — long hold approve, short deny
     oled.rs               OLED display helpers
   build.rs, sdkconfig.defaults, rust-toolchain.toml, .cargo/config.toml
 provision/                  Host CLI tool
   src/
     main.rs               Mnemonic → secret → serial push
+sign-test/                  Signing test harness
+  src/
+    main.rs               Send NIP-46 requests over serial, display responses
 ```
 
 ## Roadmap
@@ -157,11 +163,14 @@ provision/                  Host CLI tool
 
 ### Phase 3 — USB signing oracle
 
-- [ ] Serial protocol: Pi sends signing requests, ESP32 responds with signatures
-- [ ] OLED shows what you're signing (event kind, content preview, target pubkey)
-- [ ] Physical button to approve/deny each request
+- [x] NIP-46 JSON-RPC over serial (ESP32 is the bunker, Pi is a transport bridge)
+- [x] Unified frame protocol: `[magic][type][length][payload][crc32]`
+- [x] OLED shows what you're signing (identity, event kind, content preview, countdown)
+- [x] Physical button: long hold (>=2s) to approve, short press to deny, 30s timeout
+- [x] Per-request child key derivation with Heartwood extension field
+- [x] Test harness CLI (`sign-test/`) for end-to-end validation
+- [ ] Flash and verify end-to-end signing flow on hardware
 - [ ] Integration with heartwood-device on the Pi (new serial transport for NIP-46)
-- [ ] Timeout: unsigned requests expire after N seconds
 
 ### Phase 4 — Hardening (HSM mode)
 

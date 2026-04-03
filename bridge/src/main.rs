@@ -52,6 +52,12 @@ struct Cli {
     #[arg(short, long, default_value = "wss://relay.damus.io,wss://nos.lol")]
     relays: String,
 
+    /// Data directory for the heartwood-device instance (e.g. /var/lib/heartwood/hsm).
+    /// When set, the bridge writes bunker-uri.txt here so the web UI can serve it
+    /// to Bark during pairing.
+    #[arg(long)]
+    data_dir: Option<String>,
+
     /// Bridge authentication secret (hex, 64 chars). Must match the ESP32's NVS bridge secret.
     /// If provided, uses encrypted passthrough mode. If omitted, falls back to legacy mode.
     #[arg(long)]
@@ -344,6 +350,27 @@ async fn main() -> Result<()> {
         if passthrough { "passthrough (encrypted)" } else { "legacy (bridge decrypts)" }
     );
 
+    // Write bunker-uri.txt so the heartwood-device web UI can serve it to Bark.
+    if let Some(ref dir) = cli.data_dir {
+        let relay_params: String = cli
+            .relays
+            .split(',')
+            .filter(|r| !r.trim().is_empty())
+            .map(|r| format!("relay={}", urlencoding::encode(r.trim())))
+            .collect::<Vec<_>>()
+            .join("&");
+        let bunker_uri = format!(
+            "bunker://{}?{}",
+            bunker_pubkey.to_hex(),
+            relay_params,
+        );
+        let path = std::path::Path::new(dir).join("bunker-uri.txt");
+        match std::fs::write(&path, &bunker_uri) {
+            Ok(()) => log::info!("Wrote bunker URI to {}", path.display()),
+            Err(e) => log::error!("Failed to write bunker-uri.txt: {e}"),
+        }
+    }
+
     // Open serial port (wrapped in Mutex for shared access from async closure)
     let port: Box<dyn serialport::SerialPort> = serialport::new(&cli.port, cli.baud)
         .timeout(Duration::from_secs(60))
@@ -383,6 +410,12 @@ async fn main() -> Result<()> {
         }
     }
     client.connect().await;
+
+    // Wait for at least one relay to actually connect before subscribing.
+    // client.connect() starts connections in the background — subscribing
+    // before any WebSocket is open silently drops the REQ.
+    log::info!("Waiting for relay connections...");
+    tokio::time::sleep(Duration::from_secs(3)).await;
     log::info!("Connected to relays");
 
     // Subscribe to NIP-46 requests addressed to our bunker pubkey

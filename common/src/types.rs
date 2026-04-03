@@ -59,7 +59,7 @@ pub const OTA_STATUS_ERR_SIZE: u8 = 0x11;
 pub const OTA_STATUS_ERR_WRITE: u8 = 0x12;
 pub const OTA_STATUS_ERR_NOT_STARTED: u8 = 0x13;
 
-pub const MAX_PAYLOAD_SIZE: usize = 4096;
+pub const MAX_PAYLOAD_SIZE: usize = 32768;
 pub const FRAME_HEADER_SIZE: usize = 5; // 2 magic + 1 type + 2 length
 pub const FRAME_OVERHEAD: usize = FRAME_HEADER_SIZE + 4; // header + CRC32
 

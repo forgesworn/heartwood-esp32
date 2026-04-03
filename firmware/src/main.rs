@@ -18,6 +18,7 @@ mod masters;
 mod nip46_handler;
 mod nvs;
 mod oled;
+mod ota;
 mod policy;
 mod protocol;
 mod provision;
@@ -44,9 +45,10 @@ const IDLE_POLL_MS: u32 = 50;
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::types::{
     FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
-    FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_POLICY_PUSH,
-    FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
-    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET,
+    FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
+    FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_POLICY_PUSH, FRAME_TYPE_PROVISION,
+    FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_SESSION_AUTH,
+    FRAME_TYPE_SET_BRIDGE_SECRET,
 };
 use secp256k1::Secp256k1;
 
@@ -167,6 +169,22 @@ fn main() {
 
     // --- Policy engine (load persisted TOFU policies from NVS) ---
     let mut policy_engine = policy::PolicyEngine::load_from_nvs(&nvs, loaded_masters.len() as u8);
+
+    // --- OTA rollback guard ---
+    // If this boot was triggered by an OTA update, mark the firmware as valid
+    // so the rollback safety net is cancelled.  If this is a normal (non-OTA)
+    // boot the call is a no-op and the error code is ignored.
+    unsafe {
+        let err = esp_idf_svc::sys::esp_ota_mark_app_valid_cancel_rollback();
+        if err == esp_idf_svc::sys::ESP_OK {
+            log::info!("OTA: firmware marked as valid (rollback cancelled)");
+        } else {
+            log::info!("OTA: not an OTA boot or already confirmed ({})", err);
+        }
+    }
+
+    // --- OTA session state ---
+    let mut ota_session: Option<ota::OtaSession> = None;
 
     // --- Display power management ---
     // Track the timestamp of the last activity (frame received or button press).
@@ -365,6 +383,36 @@ fn main() {
                     &mut nvs,
                     &mut display,
                     &button_pin,
+                );
+            }
+
+            // 0x30 — OTA begin (sends size + expected SHA-256, triggers approval)
+            FRAME_TYPE_OTA_BEGIN => {
+                ota::handle_ota_begin(
+                    &mut usb,
+                    &frame.payload,
+                    &mut display,
+                    &button_pin,
+                    &mut ota_session,
+                );
+            }
+
+            // 0x31 — OTA chunk (offset + data)
+            FRAME_TYPE_OTA_CHUNK => {
+                ota::handle_ota_chunk(
+                    &mut usb,
+                    &frame.payload,
+                    &mut display,
+                    &mut ota_session,
+                );
+            }
+
+            // 0x32 — OTA finish (verify hash, reboot)
+            FRAME_TYPE_OTA_FINISH => {
+                ota::handle_ota_finish(
+                    &mut usb,
+                    &mut display,
+                    &mut ota_session,
                 );
             }
 

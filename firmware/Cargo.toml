@@ -9,6 +9,7 @@ heartwood-common = { path = "../common", default-features = false, features = ["
 
 # Crypto — libsecp256k1 C FFI (alignment-safe on Xtensa, unlike k256)
 secp256k1 = { version = "0.29" }
+sha2 = "0.10"
 zeroize = { version = "1", default-features = false, features = ["derive"] }
 
 # Serial protocol

@@ -23,7 +23,8 @@ pub const NACK: u8 = 0x15;
 /// Total provisioning frame length: 2 magic + 32 secret + 4 CRC32.
 pub const PROVISION_FRAME_LEN: usize = 38;
 
-/// Master tree root. Owns the secret; zeroes on drop.
+/// Master tree root. Owns the secret; zeroised automatically when dropped
+/// via the `Zeroizing` wrapper. Call `destroy()` for explicit early cleanup.
 pub struct TreeRoot {
     secret: zeroize::Zeroizing<[u8; 32]>,
     pub master_npub: String,

@@ -14,6 +14,9 @@ use crate::types::{Identity, TreeRoot, DOMAIN_PREFIX};
 type HmacSha256 = Hmac<Sha256>;
 
 /// Create a TreeRoot directly from a 32-byte secret (no HMAC intermediate).
+///
+/// The secret goes straight to SigningKey — this is the raw-secret path,
+/// NOT the nsec import path (which applies an extra HMAC).
 pub fn create_tree_root(secret: &[u8; 32]) -> Result<TreeRoot, &'static str> {
     let signing_key =
         SigningKey::from_bytes(secret).map_err(|_| "invalid secret key")?;
@@ -24,6 +27,8 @@ pub fn create_tree_root(secret: &[u8; 32]) -> Result<TreeRoot, &'static str> {
 }
 
 /// Build the HMAC context message for child key derivation.
+///
+/// Format: `b"nsec-tree\0" || purpose_utf8 || 0x00 || index_u32_big_endian`
 fn build_context(purpose: &str, index: u32) -> Vec<u8> {
     let purpose_bytes = purpose.as_bytes();
     let mut msg = Vec::with_capacity(DOMAIN_PREFIX.len() + purpose_bytes.len() + 1 + 4);

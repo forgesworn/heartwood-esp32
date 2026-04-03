@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use esp_idf_hal::gpio::{AnyInputPin, Input, PinDriver};
+use esp_idf_hal::gpio::{Input, PinDriver};
 
 /// Result of a button interaction.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,7 +37,7 @@ const POLL_INTERVAL_MS: u32 = 20;
 /// * `pin`    — borrowed input driver for GPIO 0 (active-low, pull-up)
 /// * `timeout` — maximum time to wait for the press to begin
 pub fn wait_for_press(
-    pin: &PinDriver<'_, AnyInputPin, Input>,
+    pin: &PinDriver<'_, Input>,
     timeout: Duration,
 ) -> Option<ButtonResult> {
     let deadline = Instant::now() + timeout;

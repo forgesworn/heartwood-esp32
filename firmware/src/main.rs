@@ -61,7 +61,7 @@ fn main() {
     log::info!("OLED init complete");
 
     // --- Button pin (GPIO 0, active low, internal pull-up) ---
-    let button_pin = PinDriver::input(peripherals.pins.gpio0.into()).expect("button pin");
+    let button_pin = PinDriver::input(peripherals.pins.gpio0, esp_idf_hal::gpio::Pull::Up).expect("button pin");
 
     // --- USB serial driver — created early, stays alive for the dispatch loop ---
     let mut usb = UsbSerialDriver::new(

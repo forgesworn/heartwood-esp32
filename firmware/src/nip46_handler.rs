@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use esp_idf_hal::gpio::{AnyInputPin, Input, PinDriver};
+use esp_idf_hal::gpio::{Input, PinDriver};
 use esp_idf_hal::usb_serial::UsbSerialDriver;
 
 use heartwood_common::derive;
@@ -44,7 +44,7 @@ pub fn handle_request(
     frame: &Frame,
     master_secret: &[u8; 32],
     display: &mut Display<'_>,
-    button_pin: &PinDriver<'_, AnyInputPin, Input>,
+    button_pin: &PinDriver<'_, Input>,
 ) {
     // Parse the JSON payload into a Nip46Request.
     let request = match nip46::parse_request(&frame.payload) {
@@ -76,7 +76,7 @@ fn handle_sign_event(
     usb: &mut UsbSerialDriver<'_>,
     master_secret: &[u8; 32],
     display: &mut Display<'_>,
-    button_pin: &PinDriver<'_, AnyInputPin, Input>,
+    button_pin: &PinDriver<'_, Input>,
     request: &nip46::Nip46Request,
 ) {
     // Parse the unsigned event from params.

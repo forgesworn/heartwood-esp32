@@ -62,7 +62,9 @@ The nsec-tree derivation MUST match heartwood-core byte-for-byte. The test vecto
 |----------|------|----------|
 | OLED SDA | 17 | Yes — Heltec factory test, Meshtastic |
 | OLED SCL | 18 | Yes — Heltec factory test, Meshtastic |
-| OLED RST | 21 | Yes — Heltec factory test, Meshtastic |
+| OLED RST | 21 | Yes — must stay HIGH after init or display blanks |
+| Vext (OLED power) | 36 | Yes — active LOW, must be set before I2C init |
+| White LED | 35 | Yes — active HIGH |
 | GNSS TX | 34 | Not yet used |
 | GNSS RX | 33 | Not yet used |
 | LoRa NSS | 8 | Not yet used |
@@ -70,6 +72,24 @@ The nsec-tree derivation MUST match heartwood-core byte-for-byte. The test vecto
 | LoRa DIO1 | 14 | Not yet used |
 
 **PSRAM uses GPIO 26–32.** Never drive those pins.
+
+## Known issues
+
+### k256 LoadStoreAlignment crash on Xtensa (stored-identity boot path)
+
+`create_tree_root` (which calls `k256::schnorr::SigningKey::from_bytes`) crashes with `EXCCAUSE: 0x00000005` (LoadStoreAlignment) on the stored-identity boot path. The same function works during the provisioning boot path (where UsbSerialDriver has been created and dropped before the call). The crash is a CPU exception, not a Rust error — it bypasses error handling.
+
+**What works:** provisioning flow (mnemonic → secret → NVS → ACK), OLED display, LED, NVS read/write.
+**What doesn't:** displaying the npub after reading the secret from NVS on reboot.
+
+**Likely cause:** k256 does unaligned memory access internally (pointer casts that assume x86-style alignment). Xtensa LX7 doesn't allow unaligned loads/stores.
+
+**Potential fixes to investigate:**
+- Enable `CONFIG_ESP32S3_ALLOW_RTC_FAST_MEM_AS_HEAP` or similar alignment config
+- Try k256 with `default-features = true` (enables std which may change code paths)
+- Try running the derivation in a separate thread with controlled stack alignment
+- Use a different secp256k1 crate that's Xtensa-compatible
+- Check if newer k256 versions fix the alignment issue
 
 ## Dependencies
 

@@ -56,6 +56,12 @@ struct Cli {
     /// If provided, uses encrypted passthrough mode. If omitted, falls back to legacy mode.
     #[arg(long)]
     bridge_secret: Option<String>,
+
+    /// Boot PIN (4–8 ASCII digits). When provided, the bridge sends a PIN_UNLOCK (0x26) frame
+    /// immediately after opening the serial port, before SESSION_AUTH. If the device has no
+    /// PIN set (or is already unlocked) omit this argument entirely.
+    #[arg(long)]
+    pin: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +130,61 @@ fn authenticate_bridge(
                                     f.payload.first().unwrap_or(&0xFF)
                                 ));
                             }
+                        }
+                        Err(frame::FrameError::TooShort) => continue,
+                        _ => continue,
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("serial read error: {e}")),
+        }
+    }
+}
+
+/// Send a PIN_UNLOCK (0x26) frame and wait for ACK (0x06) or NACK (0x15).
+///
+/// The PIN is sent as raw ASCII bytes (e.g. "1234" → [0x31, 0x32, 0x33, 0x34]).
+/// On NACK the bridge exits immediately — retrying wastes attempts and risks wiping
+/// the device after 5 failures.
+fn unlock_pin(
+    port: &mut Box<dyn serialport::SerialPort>,
+    pin: &str,
+) -> Result<(), String> {
+    let frame_bytes = frame::build_frame(FRAME_TYPE_PIN_UNLOCK, pin.as_bytes())
+        .map_err(|e| format!("frame build failed: {:?}", e))?;
+
+    std::io::Write::write_all(port.as_mut(), &frame_bytes)
+        .map_err(|e| format!("serial write failed: {e}"))?;
+    std::io::Write::flush(port.as_mut())
+        .map_err(|e| format!("serial flush failed: {e}"))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
+    let mut pos = 0;
+
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err("timeout waiting for PIN unlock response".into());
+        }
+
+        let mut byte = [0u8; 1];
+        match port.read(&mut byte) {
+            Ok(1) => {
+                if pos < buf.len() {
+                    buf[pos] = byte[0];
+                    pos += 1;
+                }
+
+                if pos >= FRAME_OVERHEAD {
+                    match frame::parse_frame(&buf[..pos]) {
+                        Ok(f) if f.frame_type == FRAME_TYPE_ACK => {
+                            log::info!("PIN unlock accepted");
+                            return Ok(());
+                        }
+                        Ok(f) if f.frame_type == FRAME_TYPE_NACK => {
+                            return Err("PIN unlock rejected (NACK) — wrong PIN".into());
                         }
                         Err(frame::FrameError::TooShort) => continue,
                         _ => continue,
@@ -295,6 +356,14 @@ async fn main() -> Result<()> {
     port.write_request_to_send(false).ok();
 
     log::info!("Serial port {} open", cli.port);
+
+    // If a boot PIN was provided, unlock the device before doing anything else.
+    // The ESP32 only accepts PIN_UNLOCK (0x26) and PROVISION_LIST (0x05) while locked.
+    if let Some(pin) = &cli.pin {
+        if let Err(e) = unlock_pin(&mut port, pin) {
+            panic!("PIN unlock failed: {e}");
+        }
+    }
 
     // Authenticate with the ESP32 if running in passthrough mode
     if let Some(secret) = &bridge_secret {

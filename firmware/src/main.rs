@@ -34,8 +34,8 @@ use std::sync::Arc;
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::types::{
     FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST,
-    FRAME_TYPE_POLICY_PUSH, FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST,
-    FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_SESSION_AUTH,
+    FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_POLICY_PUSH, FRAME_TYPE_PROVISION,
+    FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_SESSION_AUTH,
 };
 use secp256k1::Secp256k1;
 
@@ -176,7 +176,7 @@ fn main() {
                 } else {
                     // Use the first loaded master for plaintext requests.
                     let master = &loaded_masters[0];
-                    nip46_handler::handle_request(
+                    if let Some(response_json) = nip46_handler::handle_request(
                         &mut usb,
                         &frame,
                         &master.secret,
@@ -187,7 +187,14 @@ fn main() {
                         &mut display,
                         &button_pin,
                         &mut policy_engine,
-                    );
+                    ) {
+                        protocol::write_frame(
+                            &mut usb,
+                            FRAME_TYPE_NIP46_RESPONSE,
+                            response_json.as_bytes(),
+                        );
+                    }
+                    // None means sign_event already wrote its own frame.
                     oled::show_boot(&mut display, loaded_masters.len() as u8);
                 }
             }

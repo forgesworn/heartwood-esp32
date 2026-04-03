@@ -5,10 +5,16 @@
 // Handles the following methods:
 //   sign_event      — shows event on OLED, waits for button approval, signs
 //   get_public_key  — returns the hex public key immediately (no approval needed)
-//   connect         — TODO: build_connect_response
-//   ping            — TODO: build_ping_response
+//   connect         — returns ACK to complete the handshake
+//   ping            — returns pong
 //   nip44_encrypt / nip44_decrypt / nip04_encrypt / nip04_decrypt — not yet implemented
 //   heartwood_*     — tree-mode only; not yet implemented
+//
+// Return convention:
+//   Some(json) — caller writes the response frame (plaintext 0x03 or encrypted 0x11)
+//   None       — handler already wrote the response (sign_event only, which has the
+//                interactive button loop and must write before returning to avoid
+//                long silent gaps on the USB line)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +46,13 @@ const APPROVAL_TIMEOUT_SECS: u64 = 30;
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// Dispatch a NIP-46 request frame.
+///
+/// Returns `Some(json)` for all methods that can produce a response without
+/// blocking — the caller is responsible for framing and sending the JSON.
+///
+/// Returns `None` for `sign_event`, which runs the interactive button loop
+/// and writes its own response frame directly to USB before returning.
 pub fn handle_request(
     usb: &mut UsbSerialDriver<'_>,
     frame: &Frame,
@@ -51,13 +64,13 @@ pub fn handle_request(
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
     policy_engine: &mut PolicyEngine,
-) {
+) -> Option<String> {
     let request = match nip46::parse_request(&frame.payload) {
         Ok(r) => r,
         Err(e) => {
             log::warn!("Failed to parse NIP-46 request: {e}");
             write_frame(usb, FRAME_TYPE_NACK, &[]);
-            return;
+            return None;
         }
     };
 
@@ -68,24 +81,29 @@ pub fn handle_request(
         master_slot,
     );
 
+    // Suppress unused-variable warnings for params used only in future branches.
+    let _ = master_label;
+    let _ = policy_engine;
+
     match request.method.as_str() {
         "sign_event" => {
-            handle_sign_event(usb, master_secret, secp, display, button_pin, &request)
-        }
-        "get_public_key" => handle_get_public_key(usb, master_secret, secp, &request),
-
-        "connect" => {
-            // TODO: build_connect_response (Task 12)
-            send_error(usb, &request.id, -6, "not yet implemented");
+            // sign_event has an interactive button loop and writes its own frame.
+            handle_sign_event(usb, master_secret, secp, display, button_pin, &request);
+            None
         }
 
-        "ping" => {
-            // TODO: build_ping_response (Task 12)
-            send_error(usb, &request.id, -6, "not yet implemented");
-        }
+        "get_public_key" => Some(handle_get_public_key(master_secret, secp, &request)),
+
+        "connect" => Some(
+            nip46::build_connect_response(&request.id).unwrap_or_default(),
+        ),
+
+        "ping" => Some(
+            nip46::build_ping_response(&request.id).unwrap_or_default(),
+        ),
 
         "nip44_encrypt" | "nip44_decrypt" | "nip04_encrypt" | "nip04_decrypt" => {
-            send_error(usb, &request.id, -6, "not yet implemented");
+            Some(build_error_json(&request.id, -6, "not yet implemented"))
         }
 
         "heartwood_derive"
@@ -96,21 +114,17 @@ pub fn handle_request(
         | "heartwood_create_proof"
         | "heartwood_verify_proof" => {
             if !master_mode.is_tree() {
-                send_error(usb, &request.id, -5, "not available in bunker mode");
+                Some(build_error_json(&request.id, -5, "not available in bunker mode"))
             } else {
-                send_error(usb, &request.id, -6, "not yet implemented");
+                Some(build_error_json(&request.id, -6, "not yet implemented"))
             }
         }
 
         other => {
             log::warn!("Unknown NIP-46 method: {other}");
-            send_error(usb, &request.id, -2, "unknown method");
+            Some(build_error_json(&request.id, -2, "unknown method"))
         }
     }
-
-    // Suppress unused-variable warnings for params used only in future branches.
-    let _ = master_label;
-    let _ = policy_engine;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,12 +293,12 @@ fn do_sign(
 // get_public_key
 // ---------------------------------------------------------------------------
 
+/// Returns a NIP-46 JSON response string (or an error JSON on failure).
 fn handle_get_public_key(
-    usb: &mut UsbSerialDriver<'_>,
     master_secret: &[u8; 32],
     secp: &Arc<Secp256k1<SignOnly>>,
     request: &nip46::Nip46Request,
-) {
+) -> String {
     let pubkey_result = match &request.heartwood {
         Some(ctx) => {
             derive::create_tree_root(master_secret)
@@ -308,17 +322,17 @@ fn handle_get_public_key(
     match pubkey_result {
         Ok(hex_pubkey) => match nip46::build_pubkey_response(&request.id, &hex_pubkey) {
             Ok(json) => {
-                write_frame(usb, FRAME_TYPE_NIP46_RESPONSE, json.as_bytes());
-                log::info!("get_public_key: sent pubkey {hex_pubkey}");
+                log::info!("get_public_key: built pubkey response for {hex_pubkey}");
+                json
             }
             Err(e) => {
                 log::error!("Failed to build pubkey response: {e}");
-                send_error(usb, &request.id, -4, "failed to build response");
+                build_error_json(&request.id, -4, "failed to build response")
             }
         },
         Err(e) => {
             log::error!("get_public_key failed: {e}");
-            send_error(usb, &request.id, -4, "signing/derivation failure");
+            build_error_json(&request.id, -4, "signing/derivation failure")
         }
     }
 }
@@ -327,6 +341,14 @@ fn handle_get_public_key(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Build a NIP-46 error response JSON string.
+/// Falls back to an empty string on serialisation failure (should never occur).
+fn build_error_json(request_id: &str, code: i32, message: &str) -> String {
+    nip46::build_error_response(request_id, code, message).unwrap_or_default()
+}
+
+/// Write a NIP-46 error response directly to USB.
+/// Used only inside `handle_sign_event`, which owns the USB write path.
 fn send_error(usb: &mut UsbSerialDriver<'_>, request_id: &str, code: i32, message: &str) {
     match nip46::build_error_response(request_id, code, message) {
         Ok(json) => {

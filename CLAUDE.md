@@ -26,17 +26,19 @@ portable = []   # BLE GATT, battery management, child key only
 
 ## Current state
 
-Phase 2 (provisioning) complete. Three independent crates: `common/` (shared crypto), `firmware/` (ESP32), `provision/` (host CLI). The firmware has not been flashed yet — needs ESP toolchain installed.
+Phase 3 (signing oracle) implemented. Four crates: `common/` (shared crypto + frame protocol + NIP-46 types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness). The ESP32 is a NIP-46 bunker — receives signing requests over serial, shows what's being signed on OLED, requires physical button approval (long hold to approve, short press to deny). k256 alignment workaround still in place (dedicated thread for all k256 operations).
 
-Next: install ESP toolchain, flash, and test the provisioning flow end-to-end.
+Next: flash firmware, test end-to-end with sign-test CLI, then integrate with heartwood-device on the Pi.
 
 ## Build & flash
 
-Three independent crates — build each from its own directory:
+Four crates — build each from its own directory:
 
 ```bash
 cd common && cargo test                    # shared crypto tests
+cd common && cargo test --features nip46   # NIP-46 + event ID tests
 cd provision && cargo build                # host CLI tool
+cd sign-test && cargo build                # signing test harness
 cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain)
 cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
 ```
@@ -75,21 +77,22 @@ The nsec-tree derivation MUST match heartwood-core byte-for-byte. The test vecto
 
 ## Known issues
 
-### k256 LoadStoreAlignment crash on Xtensa (stored-identity boot path)
+### k256 LoadStoreAlignment on Xtensa (WORKAROUND IN PLACE)
 
-`create_tree_root` (which calls `k256::schnorr::SigningKey::from_bytes`) crashes with `EXCCAUSE: 0x00000005` (LoadStoreAlignment) on the stored-identity boot path. The same function works during the provisioning boot path (where UsbSerialDriver has been created and dropped before the call). The crash is a CPU exception, not a Rust error — it bypasses error handling.
+k256's field arithmetic does unaligned memory accesses that crash on Xtensa LX7
+(`EXCCAUSE: 0x00000005`). The root cause is `once_cell::sync::Lazy` in k256's
+`precomputed-tables` feature (or internal scalar arithmetic) producing misaligned
+pointer casts. Fixed upstream in k256 0.14.0 (PR #1135), but 0.14.0 stable is
+not yet released.
 
-**What works:** provisioning flow (mnemonic → secret → NVS → ACK), OLED display, LED, NVS read/write.
-**What doesn't:** displaying the npub after reading the secret from NVS on reboot.
+**Current workaround:** `create_tree_root` runs in a dedicated thread with a
+32KB aligned stack and `#[repr(align(16))]` input buffer (see `firmware/src/main.rs`).
+The fresh thread stack sidesteps the main task's heap/stack layout that triggers
+the misalignment.
 
-**Likely cause:** k256 does unaligned memory access internally (pointer casts that assume x86-style alignment). Xtensa LX7 doesn't allow unaligned loads/stores.
-
-**Potential fixes to investigate:**
-- Enable `CONFIG_ESP32S3_ALLOW_RTC_FAST_MEM_AS_HEAP` or similar alignment config
-- Try k256 with `default-features = true` (enables std which may change code paths)
-- Try running the derivation in a separate thread with controlled stack alignment
-- Use a different secp256k1 crate that's Xtensa-compatible
-- Check if newer k256 versions fix the alignment issue
+**When to remove:** upgrade to k256 ≥0.14.0 stable and move derivation back to
+the main thread. Run `cargo tree -f "{p} {f}" | grep k256` to verify
+`precomputed-tables` is not sneaking in via feature unification.
 
 ## Dependencies
 

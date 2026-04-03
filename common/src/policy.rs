@@ -24,6 +24,16 @@ pub struct ClientPolicy {
     pub auto_approve: bool,
 }
 
+/// Methods auto-approved after first TOFU approval.
+pub const TOFU_SAFE_METHODS: &[&str] = &[
+    "sign_event",
+    "nip44_encrypt",
+    "nip44_decrypt",
+    "nip04_encrypt",
+    "nip04_decrypt",
+    "get_public_key",
+];
+
 /// Approval decision for a specific request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalTier {

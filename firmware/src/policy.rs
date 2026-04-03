@@ -1,10 +1,11 @@
 // firmware/src/policy.rs
 //
-// Client approval policy engine. Policies are held in RAM only —
-// pushed from the bridge at session start and cleared on disconnect.
+// Client approval policy engine. Policies are pushed from the bridge
+// and persisted to NVS. TOFU auto-approval adds policies on first use.
 
 use std::time::Instant;
 
+use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{ApprovalTier, ClientPolicy};
 
@@ -189,5 +190,54 @@ impl PolicyEngine {
         self.master_policies.clear();
         self.sessions.clear();
         self.bridge_authenticated = false;
+    }
+
+    /// Add a TOFU-generated policy for a client.
+    pub fn add_tofu_policy(&mut self, master_slot: u8, policy: ClientPolicy) {
+        match self.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
+            Some(mp) => mp.policies.push(policy),
+            None => {
+                self.master_policies.push(MasterPolicies {
+                    master_slot,
+                    policies: vec![policy],
+                });
+            }
+        }
+    }
+
+    /// Persist all policies for a master slot to NVS.
+    pub fn persist_policies(&self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) {
+        let policies = self.master_policies.iter().find(|mp| mp.master_slot == master_slot);
+        let key = format!("policy_{master_slot}");
+        match policies {
+            Some(mp) => {
+                match serde_json::to_string(&mp.policies) {
+                    Ok(json) => {
+                        if let Err(e) = nvs.set_blob(&key, json.as_bytes()) {
+                            log::error!("Failed to persist policies for slot {master_slot}: {e:?}");
+                        }
+                    }
+                    Err(e) => log::error!("Failed to serialise policies: {e}"),
+                }
+            }
+            None => { let _ = nvs.remove(&key); }
+        }
+    }
+
+    /// Load persisted policies from NVS for all master slots.
+    pub fn load_from_nvs(nvs: &EspNvs<NvsDefault>, master_count: u8) -> Self {
+        let mut engine = Self::new();
+        for slot in 0..master_count {
+            let key = format!("policy_{slot}");
+            let mut buf = [0u8; 4096];
+            if let Ok(Some(data)) = nvs.get_blob(&key, &mut buf) {
+                if let Ok(policies) = serde_json::from_slice::<Vec<ClientPolicy>>(data) {
+                    let count = policies.len();
+                    engine.master_policies.push(MasterPolicies { master_slot: slot, policies });
+                    log::info!("Loaded {count} persisted policies for slot {slot}");
+                }
+            }
+        }
+        engine
     }
 }

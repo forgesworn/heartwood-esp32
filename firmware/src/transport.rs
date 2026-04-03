@@ -9,6 +9,7 @@
 
 use esp_idf_hal::gpio::{Input, PinDriver};
 use esp_idf_hal::usb_serial::UsbSerialDriver;
+use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use secp256k1::{Secp256k1, SignOnly};
 use std::sync::Arc;
 
@@ -40,6 +41,7 @@ pub fn handle_encrypted_request(
     button_pin: &PinDriver<'_, Input>,
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
+    nvs: &mut EspNvs<NvsDefault>,
 ) {
     if frame.payload.len() < 65 {
         log::warn!("Encrypted request too short ({} bytes)", frame.payload.len());
@@ -112,7 +114,11 @@ pub fn handle_encrypted_request(
         button_pin,
         policy_engine,
         identity_caches,
+        Some(&client_pubkey),
     );
+
+    // Persist policies if TOFU may have added one.
+    policy_engine.persist_policies(nvs, master.slot);
 
     // Re-encrypt the response and send as a 0x11 frame.
     let nonce = random_nonce_24();

@@ -165,8 +165,8 @@ fn main() {
         oled::show_boot(&mut display, loaded_masters.len() as u8);
     }
 
-    // --- Policy engine (empty; populated when bridge authenticates) ---
-    let mut policy_engine = policy::PolicyEngine::new();
+    // --- Policy engine (load persisted TOFU policies from NVS) ---
+    let mut policy_engine = policy::PolicyEngine::load_from_nvs(&nvs, loaded_masters.len() as u8);
 
     // --- Display power management ---
     // Track the timestamp of the last activity (frame received or button press).
@@ -274,12 +274,17 @@ fn main() {
                         &button_pin,
                         &mut policy_engine,
                         &mut identity_caches,
+                        None,
                     );
                     protocol::write_frame(
                         &mut usb,
                         FRAME_TYPE_NIP46_RESPONSE,
                         response_json.as_bytes(),
                     );
+                    // Persist policies if TOFU may have added one.
+                    if !loaded_masters.is_empty() {
+                        policy_engine.persist_policies(&mut nvs, loaded_masters[0].slot);
+                    }
                     oled::show_boot(&mut display, loaded_masters.len() as u8);
                 }
             }
@@ -315,6 +320,7 @@ fn main() {
                         &button_pin,
                         &mut policy_engine,
                         &mut identity_caches,
+                        &mut nvs,
                     );
                 }
             }
@@ -326,6 +332,7 @@ fn main() {
                     &frame.payload,
                     &loaded_masters,
                     &mut policy_engine,
+                    &mut nvs,
                 );
             }
 

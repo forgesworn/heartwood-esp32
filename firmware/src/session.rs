@@ -88,6 +88,7 @@ pub fn handle_policy_push(
     payload: &[u8],
     masters: &[LoadedMaster],
     policy_engine: &mut PolicyEngine,
+    nvs: &mut EspNvs<NvsDefault>,
 ) {
     if !policy_engine.bridge_authenticated {
         log::warn!("Policy push rejected — bridge not authenticated");
@@ -127,6 +128,7 @@ pub fn handle_policy_push(
     let slot = masters[master_idx].slot;
     let count = policies.len();
     policy_engine.set_policies(slot, policies);
+    policy_engine.persist_policies(nvs, slot);
     log::info!("Loaded {count} client policies for master slot {slot}");
     protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
 }

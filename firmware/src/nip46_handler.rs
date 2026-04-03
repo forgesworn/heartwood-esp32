@@ -63,6 +63,7 @@ pub fn handle_request(
     button_pin: &PinDriver<'_, Input>,
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
+    client_pubkey: Option<&[u8; 32]>,
 ) -> String {
     let request = match nip46::parse_request(&frame.payload) {
         Ok(r) => r,
@@ -80,12 +81,49 @@ pub fn handle_request(
         master_slot,
     );
 
-    // Suppress unused-variable warnings for params not yet used in all branches.
-    let _ = policy_engine;
+    let method = nip46::Nip46Method::from_str(&request.method);
+    let event_kind = if matches!(method, nip46::Nip46Method::SignEvent) {
+        nip46::parse_unsigned_event(&request.params).ok().map(|e| e.kind)
+    } else {
+        None
+    };
+
+    let client_hex = client_pubkey
+        .map(|pk| heartwood_common::hex::hex_encode(pk))
+        .unwrap_or_default();
+    let tier = if client_pubkey.is_some() {
+        policy_engine.check(master_slot, &client_hex, &method, event_kind)
+    } else {
+        heartwood_common::policy::ApprovalTier::ButtonRequired
+    };
 
     match request.method.as_str() {
         "sign_event" => {
-            handle_sign_event(master_secret, secp, display, button_pin, &request)
+            match tier {
+                heartwood_common::policy::ApprovalTier::AutoApprove => {
+                    log::info!("sign_event: auto-approved by policy");
+                    match handle_auto_sign(master_secret, secp, &request) {
+                        Ok(json) => json,
+                        Err(e) => build_error_json(&request.id, -4, &e),
+                    }
+                }
+                heartwood_common::policy::ApprovalTier::OledNotify => {
+                    crate::oled::show_auto_approved(display, master_label, "sign_event");
+                    esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+                    match handle_auto_sign(master_secret, secp, &request) {
+                        Ok(json) => json,
+                        Err(e) => build_error_json(&request.id, -4, &e),
+                    }
+                }
+                heartwood_common::policy::ApprovalTier::ButtonRequired => {
+                    let result = handle_sign_event(master_secret, secp, display, button_pin, &request);
+                    // TOFU: if approved and we have a client pubkey, remember this client.
+                    if client_pubkey.is_some() && !result.contains("\"error\"") {
+                        tofu_approve(policy_engine, master_slot, &client_hex);
+                    }
+                    result
+                }
+            }
         }
 
         "get_public_key" => handle_get_public_key(master_secret, secp, &request),
@@ -287,7 +325,50 @@ pub fn handle_request(
 }
 
 // ---------------------------------------------------------------------------
-// sign_event
+// Auto-sign (policy-approved, no button required)
+// ---------------------------------------------------------------------------
+
+fn handle_auto_sign(
+    master_secret: &[u8; 32],
+    secp: &Arc<Secp256k1<SignOnly>>,
+    request: &nip46::Nip46Request,
+) -> Result<String, String> {
+    let event = nip46::parse_unsigned_event(&request.params)
+        .map_err(|e| format!("bad event format: {e}"))?;
+    let signed = do_sign(&event, master_secret, secp, request.heartwood.as_ref())?;
+    nip46::build_sign_response(&request.id, &signed)
+}
+
+// ---------------------------------------------------------------------------
+// TOFU approval
+// ---------------------------------------------------------------------------
+
+fn tofu_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &str) {
+    use heartwood_common::policy::{ClientPolicy, TOFU_SAFE_METHODS};
+
+    let existing = policy_engine.master_policies
+        .iter()
+        .any(|mp| mp.master_slot == master_slot
+            && mp.policies.iter().any(|p| p.client_pubkey == client_hex));
+
+    if existing {
+        return;
+    }
+
+    let policy = ClientPolicy {
+        client_pubkey: client_hex.to_string(),
+        label: String::new(),
+        allowed_methods: TOFU_SAFE_METHODS.iter().map(|s| s.to_string()).collect(),
+        allowed_kinds: vec![],
+        auto_approve: true,
+    };
+
+    policy_engine.add_tofu_policy(master_slot, policy);
+    log::info!("TOFU: auto-approved client {}", &client_hex[..16.min(client_hex.len())]);
+}
+
+// ---------------------------------------------------------------------------
+// sign_event (interactive, button-required)
 // ---------------------------------------------------------------------------
 
 fn handle_sign_event(

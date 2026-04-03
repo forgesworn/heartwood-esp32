@@ -26,24 +26,22 @@ portable = []   # BLE GATT, battery management, child key only
 
 ## Current state
 
-Phase 1 spike. The firmware compiles and runs the crypto (derivation + bech32) but **has not been flashed to hardware yet**. The immediate task is:
+Phase 2 (provisioning) complete. Three independent crates: `common/` (shared crypto), `firmware/` (ESP32), `provision/` (host CLI). The firmware has not been flashed yet — needs ESP toolchain installed.
 
-1. Install ESP Rust toolchain (`espup install`)
-2. `cargo build` — verify it compiles for xtensa-esp32s3-espidf
-3. Plug in the Heltec V4 via USB-C
-4. `espflash flash --monitor` — flash and watch serial output
-5. Confirm the OLED displays the npub and serial shows "Protocol vector verified"
-
-If the build fails, the most likely cause is missing ESP-IDF toolchain components. Run `source ~/export-esp.sh` (or wherever espup put the export script) to set up the environment.
+Next: install ESP toolchain, flash, and test the provisioning flow end-to-end.
 
 ## Build & flash
 
+Three independent crates — build each from its own directory:
+
 ```bash
-cargo build                                                          # debug build
-espflash flash --monitor target/xtensa-esp32s3-espidf/debug/heartwood-esp32  # flash + serial
+cd common && cargo test                    # shared crypto tests
+cd provision && cargo build                # host CLI tool
+cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain)
+cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
 ```
 
-Requires the ESP Rust toolchain: `espup install`, then `source ~/export-esp.sh`.
+Requires the ESP Rust toolchain for firmware: `espup install`, then `source ~/export-esp.sh`.
 
 ## Conventions
 
@@ -56,7 +54,7 @@ Requires the ESP Rust toolchain: `espup install`, then `source ~/export-esp.sh`.
 
 ## Frozen protocol
 
-The nsec-tree derivation MUST match heartwood-core byte-for-byte. The test vector in `main.rs` asserts this at runtime. If derivation logic changes, update both repos.
+The nsec-tree derivation MUST match heartwood-core byte-for-byte. The test vector in `common/src/derive.rs` asserts this. The mnemonic derivation path (`m/44'/1237'/727'/0'/0'`) is tested in `provision/src/main.rs`. If derivation logic changes, update both repos.
 
 ## GPIO pin assignments (Heltec V4)
 
@@ -83,5 +81,7 @@ All crypto crates are no_std-compatible but we use the ESP-IDF std framework:
 | hmac + sha2 | HMAC-SHA256 child key derivation |
 | zeroize | Deterministic secret cleanup |
 | bech32 | npub encoding |
-| esp-idf-svc + esp-idf-hal | ESP-IDF std framework (I2C, GPIO, logging) |
+| bip39 + bip32 | Mnemonic derivation (provision CLI only) |
+| crc32fast | Serial protocol integrity |
+| esp-idf-svc + esp-idf-hal | ESP-IDF std framework (I2C, GPIO, NVS, logging) |
 | ssd1306 + embedded-graphics | OLED driver and text rendering |

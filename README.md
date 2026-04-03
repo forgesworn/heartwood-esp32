@@ -67,26 +67,29 @@ source ~/export-esp.sh
 
 ## Build
 
-```bash
-cargo build
-```
-
-## Flash & monitor
+Three independent crates — build each from its own directory:
 
 ```bash
-espflash flash --monitor target/xtensa-esp32s3-espidf/debug/heartwood-esp32
+cd common && cargo test                    # shared crypto tests
+cd provision && cargo build                # host CLI tool
+cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain)
 ```
 
-Serial output will show:
+## Flash & provision
+
+```bash
+cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
 ```
-Heartwood ESP32 — nsec-tree signing token spike
-Root npub: npub1sjlh2c3x9w7kjsqg2ay080n2lff2uvt325vpan33ke34rn8l5jcqawh57m
-Child npub: npub1rx8u4wk9ytu8aak4f9wcaqdgk0lj4rjhdu4j9n7dj2mg68l9cdqs2fjf2t
-Protocol vector verified — npub matches heartwood-core
-Signed dummy hash — sig: <128 hex chars>
-Signature verified
-npub and signature displayed on OLED
+
+Wait for OLED to show "Awaiting secret...", then:
+
+```bash
+cd provision && cargo run -- --port /dev/cu.usbserial-*
 ```
+
+Enter mnemonic and passphrase when prompted. After ACK, the device reboots with the stored identity.
+
+Subsequent boots display the master npub immediately (no provisioning needed).
 
 ## Test vector
 
@@ -118,17 +121,20 @@ Verified against Heltec factory test code, Meshtastic firmware, and ESPHome conf
 ## Structure
 
 ```
-Cargo.toml              ESP-IDF std project
-build.rs                embuild sysenv
-sdkconfig.defaults      ESP32-S3, PSRAM, 16KB stack
-rust-toolchain.toml     esp channel
-.cargo/config.toml      xtensa-esp32s3-espidf target
-src/
-  main.rs               Entry point: derive, sign, display on OLED
-  derive.rs             HMAC-SHA256 child derivation (matches heartwood-core)
-  encoding.rs           bech32 npub encoding
-  sign.rs               BIP-340 Schnorr signing and verification
-  types.rs              TreeRoot, Identity structs
+common/                     Shared crypto (derivation, encoding, types)
+  src/
+    lib.rs, derive.rs, encoding.rs, types.rs, hex.rs
+firmware/                   ESP32 firmware
+  src/
+    main.rs               Boot flow: NVS check → provision or display
+    sign.rs               BIP-340 Schnorr signing/verification
+    nvs.rs                NVS read/write for root secret
+    provision.rs          Serial provisioning protocol (ESP32 side)
+    oled.rs               OLED display helpers
+  build.rs, sdkconfig.defaults, rust-toolchain.toml, .cargo/config.toml
+provision/                  Host CLI tool
+  src/
+    main.rs               Mnemonic → secret → serial push
 ```
 
 ## Roadmap
@@ -143,11 +149,11 @@ src/
 
 ### Phase 2 — Provisioning
 
-- [ ] CLI tool to derive 32-byte root secret from mnemonic + passphrase (offline PC)
-- [ ] NVS storage for root secret (encrypted flash partition)
-- [ ] First-boot provisioning mode: accept root secret over USB serial
-- [ ] Subsequent boots read from NVS, skip provisioning
-- [ ] Show master npub on OLED after boot
+- [x] CLI tool to derive 32-byte root secret from mnemonic + passphrase (offline PC)
+- [x] NVS storage for root secret (plaintext — encryption deferred, see excluded)
+- [x] First-boot provisioning mode: accept root secret over USB serial
+- [x] Subsequent boots read from NVS, skip provisioning
+- [x] Show master npub on OLED after boot
 
 ### Phase 3 — USB signing oracle
 

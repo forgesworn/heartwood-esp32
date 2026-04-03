@@ -11,6 +11,7 @@
 //   6. Create PolicyEngine (empty until bridge authenticates)
 //   7. Enter frame dispatch loop
 
+mod approval;
 mod button;
 mod identity_cache;
 mod masters;
@@ -45,6 +46,7 @@ use heartwood_common::types::{
     FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST,
     FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_POLICY_PUSH, FRAME_TYPE_PROVISION,
     FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_SESSION_AUTH,
+    FRAME_TYPE_SET_BRIDGE_SECRET,
 };
 use secp256k1::Secp256k1;
 
@@ -337,6 +339,18 @@ fn main() {
                     &frame.payload,
                     &nvs,
                     &mut policy_engine,
+                );
+            }
+
+            // 0x23 — set bridge secret
+            FRAME_TYPE_SET_BRIDGE_SECRET => {
+                session::handle_set_bridge_secret(
+                    &mut usb,
+                    &frame.payload,
+                    &mut nvs,
+                    &policy_engine,
+                    &mut display,
+                    &button_pin,
                 );
             }
 

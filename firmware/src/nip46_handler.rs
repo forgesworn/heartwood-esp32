@@ -2,9 +2,13 @@
 //
 // NIP-46 request dispatcher for the Heartwood HSM.
 //
-// Handles two methods:
+// Handles the following methods:
 //   sign_event      — shows event on OLED, waits for button approval, signs
 //   get_public_key  — returns the hex public key immediately (no approval needed)
+//   connect         — TODO: build_connect_response
+//   ping            — TODO: build_ping_response
+//   nip44_encrypt / nip44_decrypt / nip04_encrypt / nip04_decrypt — not yet implemented
+//   heartwood_*     — tree-mode only; not yet implemented
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,12 +22,15 @@ use heartwood_common::hex::hex_encode;
 use heartwood_common::nip46::{
     self, HeartwoodContext, SignedEvent, UnsignedEvent,
 };
-use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_NIP46_RESPONSE};
+use heartwood_common::types::{
+    FRAME_TYPE_NACK, FRAME_TYPE_NIP46_RESPONSE, MasterMode,
+};
 use secp256k1::{Secp256k1, SignOnly};
 use zeroize::Zeroize;
 
 use crate::button::ButtonResult;
 use crate::oled::Display;
+use crate::policy::PolicyEngine;
 use crate::protocol::write_frame;
 
 /// Timeout in seconds shown on the OLED countdown bar.
@@ -37,9 +44,13 @@ pub fn handle_request(
     usb: &mut UsbSerialDriver<'_>,
     frame: &Frame,
     master_secret: &[u8; 32],
+    master_label: &str,
+    master_mode: MasterMode,
+    master_slot: u8,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
+    policy_engine: &mut PolicyEngine,
 ) {
     let request = match nip46::parse_request(&frame.payload) {
         Ok(r) => r,
@@ -50,16 +61,56 @@ pub fn handle_request(
         }
     };
 
-    log::info!("NIP-46 request: method={} id={}", request.method, request.id);
+    log::info!(
+        "NIP-46 request: method={} id={} master_slot={}",
+        request.method,
+        request.id,
+        master_slot,
+    );
 
     match request.method.as_str() {
-        "sign_event" => handle_sign_event(usb, master_secret, secp, display, button_pin, &request),
+        "sign_event" => {
+            handle_sign_event(usb, master_secret, secp, display, button_pin, &request)
+        }
         "get_public_key" => handle_get_public_key(usb, master_secret, secp, &request),
+
+        "connect" => {
+            // TODO: build_connect_response (Task 12)
+            send_error(usb, &request.id, -6, "not yet implemented");
+        }
+
+        "ping" => {
+            // TODO: build_ping_response (Task 12)
+            send_error(usb, &request.id, -6, "not yet implemented");
+        }
+
+        "nip44_encrypt" | "nip44_decrypt" | "nip04_encrypt" | "nip04_decrypt" => {
+            send_error(usb, &request.id, -6, "not yet implemented");
+        }
+
+        "heartwood_derive"
+        | "heartwood_derive_persona"
+        | "heartwood_switch"
+        | "heartwood_list_identities"
+        | "heartwood_recover"
+        | "heartwood_create_proof"
+        | "heartwood_verify_proof" => {
+            if !master_mode.is_tree() {
+                send_error(usb, &request.id, -5, "not available in bunker mode");
+            } else {
+                send_error(usb, &request.id, -6, "not yet implemented");
+            }
+        }
+
         other => {
             log::warn!("Unknown NIP-46 method: {other}");
             send_error(usb, &request.id, -2, "unknown method");
         }
     }
+
+    // Suppress unused-variable warnings for params used only in future branches.
+    let _ = master_label;
+    let _ = policy_engine;
 }
 
 // ---------------------------------------------------------------------------

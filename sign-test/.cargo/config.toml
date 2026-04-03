@@ -1,0 +1,10 @@
+# sign-test/.cargo/config.toml
+#
+# Override any parent .cargo/config.toml that might target xtensa-esp32s3-espidf.
+# The sign-test crate runs on the host PC, not the ESP32.
+
+[build]
+target = "x86_64-apple-darwin"
+
+[unstable]
+build-std = []

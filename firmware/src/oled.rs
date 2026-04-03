@@ -27,6 +27,8 @@ pub type Display<'a> = Ssd1306<
 >;
 
 /// Initialise the OLED: reset pin toggle, I2C setup, display init.
+/// The reset PinDriver is deliberately leaked — GPIO 21 must stay HIGH
+/// or the SSD1306 is held in reset and the display goes blank.
 pub fn init<'a>(
     i2c: I2cDriver<'a>,
     rst_pin: AnyOutputPin,
@@ -39,6 +41,8 @@ pub fn init<'a>(
     FreeRtos::delay_ms(50);
     rst.set_high().ok();
     FreeRtos::delay_ms(100);
+    // Keep rst pin HIGH — dropping it would float the pin and reset the display
+    std::mem::forget(rst);
 
     let interface = I2CDisplayInterface::new_custom_address(i2c, 0x3C);
     let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)

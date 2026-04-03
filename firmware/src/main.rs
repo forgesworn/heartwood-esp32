@@ -17,6 +17,7 @@ use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
+use zeroize::Zeroize;
 use heartwood_common::derive;
 
 fn main() {
@@ -27,21 +28,17 @@ fn main() {
 
     let peripherals = Peripherals::take().expect("failed to take peripherals");
 
-    // Turn on white LED (GPIO 35) so we know the device is alive
-    // Try both polarities — Heltec V4 LED may be active low
+    // Turn on white LED (GPIO 35)
     let mut led = PinDriver::output(peripherals.pins.gpio35).expect("LED pin");
     led.set_high().ok();
 
-    // --- USB Serial JTAG driver (for provisioning protocol) ---
-    let mut usb = UsbSerialDriver::new(
-        peripherals.usb_serial,
-        peripherals.pins.gpio19,  // D-
-        peripherals.pins.gpio20,  // D+
-        &UsbSerialConfig::new().rx_buffer_size(512),
-    )
-    .expect("USB serial driver init failed");
+    // Enable Vext (GPIO 36, active low) — powers the OLED
+    let mut vext = PinDriver::output(peripherals.pins.gpio36).expect("Vext pin");
+    vext.set_low().ok();
+    esp_idf_hal::delay::FreeRtos::delay_ms(50);
 
     // --- OLED init ---
+    log::info!("Initialising OLED...");
     let i2c_config = I2cConfig::new().baudrate(400.kHz().into());
     let i2c = I2cDriver::new(
         peripherals.i2c0,
@@ -50,8 +47,10 @@ fn main() {
         &i2c_config,
     )
     .expect("I2C init failed");
+    log::info!("I2C driver created");
 
     let mut display = oled::init(i2c, peripherals.pins.gpio21.into());
+    log::info!("OLED init complete");
 
     // --- NVS: check for stored secret ---
     let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
@@ -67,6 +66,15 @@ fn main() {
             log::info!("No stored secret — entering provisioning mode");
             oled::show_awaiting(&mut display);
 
+            // Only install USB serial driver when we need it for provisioning.
+            let mut usb = UsbSerialDriver::new(
+                peripherals.usb_serial,
+                peripherals.pins.gpio19,
+                peripherals.pins.gpio20,
+                &UsbSerialConfig::new().rx_buffer_size(512),
+            )
+            .expect("USB serial driver init failed");
+
             let secret = provision::wait_for_secret(&mut usb);
 
             // Store in NVS
@@ -81,17 +89,21 @@ fn main() {
                 }
             }
 
+            // Drop the USB serial driver to restore console logging
+            drop(usb);
+
             secret
         }
     };
 
-    // --- Derive and display master npub ---
-    let root = derive::create_tree_root(&root_secret).expect("root creation failed");
-    log::info!("Master npub: {}", root.master_npub);
+    // --- Display identity ---
+    // TODO: k256 create_tree_root crashes with LoadStoreAlignment on Xtensa
+    // on the stored-identity boot path. Works during provisioning boot.
+    // Needs investigation — likely k256 unaligned access on Xtensa LX7.
+    // For now, show confirmation that the identity is stored.
+    oled::show_error(&mut display, "Identity stored");
 
-    oled::show_npub(&mut display, &root.master_npub);
-
-    root.destroy();
+    log::info!("Idle — display on");
 
     // Idle loop — display stays on
     loop {

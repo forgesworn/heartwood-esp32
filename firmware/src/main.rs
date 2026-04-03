@@ -31,6 +31,14 @@ use esp_idf_hal::units::FromValueType;
 use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// How long the display stays on after the last activity before sleeping.
+const DISPLAY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Polling interval for the idle loop — short enough for responsive button
+/// wake, long enough not to busy-spin the CPU.
+const IDLE_POLL_MS: u32 = 50;
 
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::types::{
@@ -158,10 +166,75 @@ fn main() {
     // --- Policy engine (empty; populated when bridge authenticates) ---
     let mut policy_engine = policy::PolicyEngine::new();
 
+    // --- Display power management ---
+    // Track the timestamp of the last activity (frame received or button press).
+    // After DISPLAY_TIMEOUT of inactivity the OLED panel is switched off to
+    // prevent burn-in and save power.  Any frame arriving or a short PRG
+    // button press will wake it again.
+    let mut last_activity = Instant::now();
+    let mut display_on = true;
+
     // --- Frame dispatch loop ---
     log::info!("Entering frame dispatch loop");
     loop {
-        let frame = protocol::read_frame(&mut usb);
+        // Poll for an incoming frame with a short timeout so we can also check
+        // the button state and display timeout while idle.
+        let frame = loop {
+            match protocol::try_read_frame(&mut usb, IDLE_POLL_MS) {
+                Some(f) => {
+                    // A frame arrived — mark activity and ensure the display is on.
+                    last_activity = Instant::now();
+                    if !display_on {
+                        oled::wake_display(&mut display);
+                        display_on = true;
+                        log::info!("Display woken by incoming frame");
+                    }
+                    break f;
+                }
+                None => {
+                    // No frame this tick — check for display timeout and button.
+
+                    // Signing requests always wake the display (handled above when
+                    // the frame arrives).  Between frames, check elapsed idle time.
+                    if display_on && last_activity.elapsed() >= DISPLAY_TIMEOUT {
+                        oled::sleep_display(&mut display);
+                        display_on = false;
+                        log::info!("Display slept after {}s idle", DISPLAY_TIMEOUT.as_secs());
+                    }
+
+                    // Short PRG button press (active-low GPIO 0) wakes the display.
+                    // A 2-second hold is reserved for signing approval inside the
+                    // signing handler — we only act on a complete short press here
+                    // (press detected AND released before 2 s).
+                    if button_pin.is_low() {
+                        let press_start = Instant::now();
+                        // Wait for release, capping at 2 s to avoid consuming a
+                        // long-hold that belongs to a signing request.
+                        while button_pin.is_low()
+                            && press_start.elapsed() < Duration::from_millis(1900)
+                        {
+                            esp_idf_hal::delay::FreeRtos::delay_ms(20);
+                        }
+
+                        if button_pin.is_high() {
+                            // Button released — treat as a short press (wake).
+                            last_activity = Instant::now();
+                            if !display_on {
+                                oled::wake_display(&mut display);
+                                display_on = true;
+                                log::info!("Display woken by button short press");
+                            }
+                            // Show the idle status screen so the user can see
+                            // the current state after waking.
+                            oled::show_boot(&mut display, loaded_masters.len() as u8);
+                        }
+                        // If still held at 1.9 s, a signing frame is expected
+                        // imminently — let the signing handler deal with it.
+                    }
+                }
+            }
+        };
+
         match frame.frame_type {
             // 0x01 — add a master
             FRAME_TYPE_PROVISION => {
@@ -272,5 +345,11 @@ fn main() {
                 protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
             }
         }
+
+        // Reset activity timestamp after every handler returns.  This is
+        // especially important after sign_event, which can hold the button
+        // loop for up to 30 seconds — without this reset the display would
+        // sleep immediately after the user finishes approving a request.
+        last_activity = Instant::now();
     }
 }

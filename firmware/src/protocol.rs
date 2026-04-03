@@ -23,6 +23,18 @@ fn read_byte(usb: &mut UsbSerialDriver<'_>) -> u8 {
     }
 }
 
+/// Attempt to read a single byte within `timeout_ms` milliseconds.
+///
+/// Returns `Some(byte)` if a byte arrived in time, `None` if the read timed
+/// out without receiving data.
+fn try_read_byte(usb: &mut UsbSerialDriver<'_>, timeout_ms: u32) -> Option<u8> {
+    let mut buf = [0u8; 1];
+    match usb.read(&mut buf, timeout_ms) {
+        Ok(n) if n > 0 => Some(buf[0]),
+        _ => None,
+    }
+}
+
 /// Read exactly `buf.len()` bytes from the USB serial driver, blocking until
 /// all bytes have been received.
 fn read_exact(usb: &mut UsbSerialDriver<'_>, buf: &mut [u8]) {
@@ -101,6 +113,71 @@ pub fn read_frame(usb: &mut UsbSerialDriver<'_>) -> Frame {
             Err(e) => {
                 log::warn!("Frame validation failed ({:?}) — resuming hunt", e);
             }
+        }
+    }
+}
+
+/// Attempt to read a complete frame within `idle_timeout_ms` milliseconds.
+///
+/// The timeout applies to the wait for the *first byte* of the magic header
+/// only — once a frame has started arriving, remaining bytes are read with
+/// the blocking [`read_byte`] / [`read_exact`] helpers as normal.  This is
+/// safe because the bridge always sends complete frames atomically.
+///
+/// Returns `Some(Frame)` on success, `None` if no data arrived within the
+/// timeout window.
+pub fn try_read_frame(usb: &mut UsbSerialDriver<'_>, idle_timeout_ms: u32) -> Option<Frame> {
+    // Hunt for the first magic byte within the caller's timeout window.
+    let b = try_read_byte(usb, idle_timeout_ms)?;
+    if b != MAGIC_BYTES[0] {
+        return None;
+    }
+
+    // Confirm second magic byte (blocking — frame is already in flight).
+    let b = read_byte(usb);
+    if b != MAGIC_BYTES[1] {
+        // Handle the edge case where the second byte is itself a start byte.
+        if b == MAGIC_BYTES[0] {
+            let next = read_byte(usb);
+            if next != MAGIC_BYTES[1] {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    // Read header (type + 16-bit length).
+    let mut header = [0u8; 3];
+    read_exact(usb, &mut header);
+    let frame_type = header[0];
+    let length = u16::from_be_bytes([header[1], header[2]]) as usize;
+
+    if length > MAX_PAYLOAD_SIZE {
+        log::warn!(
+            "try_read_frame: payload length {} exceeds MAX_PAYLOAD_SIZE {} — discarding",
+            length,
+            MAX_PAYLOAD_SIZE,
+        );
+        return None;
+    }
+
+    // Read payload + 4-byte CRC.
+    let mut body = vec![0u8; length + 4];
+    read_exact(usb, &mut body);
+
+    // Reassemble and validate.
+    let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + length + 4);
+    buf.extend_from_slice(&MAGIC_BYTES);
+    buf.push(frame_type);
+    buf.extend_from_slice(&(length as u16).to_be_bytes());
+    buf.extend_from_slice(&body);
+
+    match frame::parse_frame(&buf) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            log::warn!("try_read_frame: validation failed ({:?}) — discarding", e);
+            None
         }
     }
 }

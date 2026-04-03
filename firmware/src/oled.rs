@@ -360,6 +360,27 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
     }
 }
 
+// ---------------------------------------------------------------------------
+// Display power management
+// ---------------------------------------------------------------------------
+
+/// Turn the SSD1306 display panel off to prevent burn-in and save power.
+///
+/// The display RAM is preserved — calling [`wake_display`] and flushing
+/// will restore the last frame without needing a full re-init.
+pub fn sleep_display(display: &mut Display<'_>) {
+    if let Err(e) = display.set_display_on(false) {
+        log::warn!("OLED sleep failed: {:?}", e);
+    }
+}
+
+/// Turn the SSD1306 display panel back on after a sleep.
+pub fn wake_display(display: &mut Display<'_>) {
+    if let Err(e) = display.set_display_on(true) {
+        log::warn!("OLED wake failed: {:?}", e);
+    }
+}
+
 /// Display an identity switch notification (shown for ~2 seconds).
 pub fn show_identity_switch(
     display: &mut Display<'_>,

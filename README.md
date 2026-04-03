@@ -83,7 +83,9 @@ Heartwood ESP32 — nsec-tree signing token spike
 Root npub: npub1sjlh2c3x9w7kjsqg2ay080n2lff2uvt325vpan33ke34rn8l5jcqawh57m
 Child npub: npub1rx8u4wk9ytu8aak4f9wcaqdgk0lj4rjhdu4j9n7dj2mg68l9cdqs2fjf2t
 Protocol vector verified — npub matches heartwood-core
-npub displayed on OLED
+Signed dummy hash — sig: <128 hex chars>
+Signature verified
+npub and signature displayed on OLED
 ```
 
 ## Test vector
@@ -122,9 +124,10 @@ sdkconfig.defaults      ESP32-S3, PSRAM, 16KB stack
 rust-toolchain.toml     esp channel
 .cargo/config.toml      xtensa-esp32s3-espidf target
 src/
-  main.rs               Entry point: init OLED, derive, display
+  main.rs               Entry point: derive, sign, display on OLED
   derive.rs             HMAC-SHA256 child derivation (matches heartwood-core)
   encoding.rs           bech32 npub encoding
+  sign.rs               BIP-340 Schnorr signing and verification
   types.rs              TreeRoot, Identity structs
 ```
 
@@ -136,7 +139,7 @@ src/
 - [x] bech32 npub encoding
 - [x] Runtime assertion against heartwood-core test vectors
 - [x] Display npub on OLED
-- [ ] Sign a dummy 32-byte hash and display the signature
+- [x] Sign a dummy 32-byte hash and display the signature
 
 ### Phase 2 — Provisioning
 
@@ -157,11 +160,10 @@ src/
 ### Phase 4 — Hardening (HSM mode)
 
 - [ ] Disable all wireless radios in firmware (WiFi, BLE, LoRa)
-- [ ] Disable JTAG debugging
 - [ ] Rate limiting (max signs per minute)
 - [ ] Audit log on OLED (last N signing events)
-- [ ] Tamper detection (voltage glitch monitoring if feasible)
 - [ ] Zeroize on repeated failed auth attempts
+- [ ] `cargo deny` setup — licence checking, security advisories, crate bans
 
 ### Phase 5 — Portable signer
 
@@ -184,3 +186,4 @@ src/
 - **WiFi signing** — full TCP/IP stack is a liability on any key-holding device. WiFi is never enabled in either mode.
 - **Master secret on portable device** — only child keys leave the home HSM. If the portable device is lost, the damage is one branch.
 - **LoRa signing** — signing is a response to a request, and the requester needs internet anyway. LoRa solves a problem that doesn't exist for this use case. The SX1262 is never initialised (safe without antenna).
+- **Flash encryption / eFuse burning** — permanently locks the chip to one firmware, prevents reuse (e.g. Meshtastic), and risks bricking if anything goes wrong. Physical security is the protection model instead. May revisit on a dedicated production unit.

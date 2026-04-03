@@ -11,7 +11,8 @@ mod provision;
 mod sign;
 
 use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
-use esp_idf_hal::prelude::*;
+use esp_idf_hal::units::FromValueType;
+use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
 use heartwood_common::derive;

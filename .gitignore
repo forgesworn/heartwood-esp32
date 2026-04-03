@@ -1,2 +1,4 @@
 /target
 /.embuild
+firmware/.embuild/
+firmware/target/

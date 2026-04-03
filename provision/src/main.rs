@@ -9,7 +9,8 @@ use clap::Parser;
 use zeroize::Zeroize;
 
 use heartwood_common::derive::create_tree_root;
-use heartwood_common::types::{MAGIC_BYTES, MNEMONIC_PATH, ACK, NACK, PROVISION_FRAME_LEN};
+use heartwood_common::frame;
+use heartwood_common::types::{MNEMONIC_PATH, FRAME_TYPE_ACK, FRAME_TYPE_NACK, FRAME_TYPE_PROVISION};
 
 #[derive(Parser)]
 #[command(name = "heartwood-provision")]
@@ -54,14 +55,12 @@ fn derive_root_secret(mnemonic: &str, passphrase: &str) -> Result<[u8; 32], Stri
     Ok(result)
 }
 
-/// Build the 38-byte provisioning frame: [magic][secret][crc32].
-fn build_frame(secret: &[u8; 32]) -> [u8; PROVISION_FRAME_LEN] {
-    let crc = crc32fast::hash(secret);
-    let mut frame = [0u8; PROVISION_FRAME_LEN];
-    frame[0..2].copy_from_slice(&MAGIC_BYTES);
-    frame[2..34].copy_from_slice(secret);
-    frame[34..38].copy_from_slice(&crc.to_be_bytes());
-    frame
+/// Build the provisioning frame using the unified frame protocol.
+///
+/// Format: [0x48 0x57][0x01][0x00 0x20][secret_32][crc_4] = 41 bytes.
+fn build_provision_frame(secret: &[u8; 32]) -> Vec<u8> {
+    frame::build_frame(FRAME_TYPE_PROVISION, secret)
+        .expect("provision frame should never exceed max payload")
 }
 
 fn main() {
@@ -96,7 +95,7 @@ fn main() {
     }
 
     // Build frame and send
-    let frame = build_frame(&root_secret);
+    let frame = build_provision_frame(&root_secret);
     root_secret.zeroize();
 
     println!("Opening {}...", cli.port);
@@ -108,8 +107,13 @@ fn main() {
             std::process::exit(1);
         });
 
-    // Wait a moment for device to be ready
-    std::thread::sleep(Duration::from_secs(2));
+    // Disable DTR/RTS — toggling these resets the ESP32-S3 USB-Serial-JTAG
+    port.write_data_terminal_ready(false).ok();
+    port.write_request_to_send(false).ok();
+
+    // Wait for device to be ready (may have just rebooted from port open)
+    println!("Waiting for device...");
+    std::thread::sleep(Duration::from_secs(4));
 
     println!("Sending...");
     port.write_all(&frame).expect("failed to write to serial port");
@@ -128,11 +132,11 @@ fn main() {
         }
         match port.read(&mut byte) {
             Ok(1) => match byte[0] {
-                ACK => {
+                FRAME_TYPE_ACK => {
                     println!("ACK received. Root secret provisioned.");
                     break;
                 }
-                NACK => {
+                FRAME_TYPE_NACK => {
                     eprintln!("NACK received — device rejected the secret (CRC error or NVS write failure).");
                     std::process::exit(1);
                 }
@@ -186,19 +190,16 @@ mod tests {
         assert_ne!(without, with_pass, "passphrase must change the derived secret");
     }
 
-    /// Frame structure: [0x48, 0x57] + 32 bytes + CRC32 big-endian = 38 bytes.
+    /// Frame structure: 2 magic + 1 type + 2 length + 32 payload + 4 CRC = 41 bytes.
     #[test]
-    fn test_build_frame() {
+    fn test_build_provision_frame() {
         let secret = [0xaa; 32];
-        let frame = build_frame(&secret);
+        let frame_bytes = build_provision_frame(&secret);
 
-        assert_eq!(frame.len(), PROVISION_FRAME_LEN);
-        assert_eq!(&frame[0..2], &MAGIC_BYTES);
-        assert_eq!(&frame[2..34], &secret);
-
-        // CRC32 of the secret must match
-        let expected_crc = crc32fast::hash(&secret);
-        let frame_crc = u32::from_be_bytes([frame[34], frame[35], frame[36], frame[37]]);
-        assert_eq!(frame_crc, expected_crc);
+        // New format: 2 magic + 1 type + 2 length + 32 payload + 4 CRC = 41
+        assert_eq!(frame_bytes.len(), 41);
+        let parsed = frame::parse_frame(&frame_bytes).unwrap();
+        assert_eq!(parsed.frame_type, FRAME_TYPE_PROVISION);
+        assert_eq!(parsed.payload, secret);
     }
 }

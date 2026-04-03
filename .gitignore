@@ -6,4 +6,5 @@ common/target/
 provision/target/
 sign-test/target/
 bridge/target/
+ota/target/
 .playwright-mcp/

@@ -21,16 +21,102 @@
 // The ESP32 is the brain — it holds the keys and makes all signing decisions.
 // This bridge is a dumb pipe that provides network access.
 
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser;
+use nix::sys::termios;
 use nostr::nips::nip44;
 use nostr_sdk::prelude::*;
 
 use heartwood_common::frame;
 use heartwood_common::types::*;
+
+// ---------------------------------------------------------------------------
+// Raw POSIX serial wrapper
+// ---------------------------------------------------------------------------
+
+/// Thin wrapper around a raw file descriptor for serial I/O.
+/// Uses POSIX termios instead of the `serialport` crate to avoid
+/// DTR toggling on open (which reboots the ESP32-S3 via USB-CDC).
+struct RawSerial {
+    file: File,
+}
+
+impl RawSerial {
+    /// Open a serial port with raw POSIX I/O.
+    ///
+    /// Sets CLOCAL (ignore modem control lines) so DTR is never asserted,
+    /// configures raw mode at the given baud rate, and explicitly clears
+    /// DTR/RTS via ioctl.
+    fn open(path: &str, baud: u32) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        let raw_fd = file.as_raw_fd();
+        let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+        let mut cfg = termios::tcgetattr(fd)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        termios::cfmakeraw(&mut cfg);
+
+        // Map baud rate
+        let baud_rate = match baud {
+            9600 => termios::BaudRate::B9600,
+            19200 => termios::BaudRate::B19200,
+            38400 => termios::BaudRate::B38400,
+            57600 => termios::BaudRate::B57600,
+            115200 => termios::BaudRate::B115200,
+            230400 => termios::BaudRate::B230400,
+            _ => termios::BaudRate::B115200,
+        };
+        termios::cfsetspeed(&mut cfg, baud_rate)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        // Disable hardware flow control
+        cfg.control_flags.remove(termios::ControlFlags::CRTSCTS);
+        // Enable receiver, local mode (ignore modem control = no DTR)
+        cfg.control_flags.insert(termios::ControlFlags::CREAD);
+        cfg.control_flags.insert(termios::ControlFlags::CLOCAL);
+        // Disable HUPCL (don't drop DTR on close)
+        cfg.control_flags.remove(termios::ControlFlags::HUPCL);
+
+        // VMIN=0, VTIME=1 → 100ms read timeout (non-blocking with short poll)
+        cfg.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 0;
+        cfg.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 1;
+
+        termios::tcsetattr(fd, termios::SetArg::TCSANOW, &cfg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        // Clear DTR and RTS explicitly via ioctl
+        unsafe {
+            let mut bits: libc::c_int = libc::TIOCM_DTR | libc::TIOCM_RTS;
+            libc::ioctl(raw_fd, libc::TIOCMBIC as _, &mut bits);
+        }
+
+        Ok(Self { file })
+    }
+}
+
+impl Read for RawSerial {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Write for RawSerial {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "heartwood-bridge")]
@@ -76,37 +162,16 @@ struct Cli {
 
 /// Send a NIP-46 JSON-RPC request to the ESP32 over serial and read the response.
 /// Legacy mode only — forwards plaintext, expects a NIP46_RESPONSE (0x03) frame back.
-/// Read exactly `buf.len()` bytes from the serial port, respecting a deadline.
-fn read_exact_timeout(
-    port: &mut Box<dyn serialport::SerialPort>,
-    buf: &mut [u8],
-    deadline: std::time::Instant,
-) -> Result<(), String> {
-    let mut pos = 0;
-    while pos < buf.len() {
-        if std::time::Instant::now() > deadline {
-            return Err("timeout reading from serial".into());
-        }
-        match port.read(&mut buf[pos..]) {
-            Ok(n) if n > 0 => pos += n,
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(format!("serial read failed: {e}")),
-        }
-    }
-    Ok(())
-}
-
 fn forward_to_esp32(
-    port: &mut Box<dyn serialport::SerialPort>,
+    port: &mut RawSerial,
     request_json: &str,
 ) -> Result<String, String> {
     let frame_bytes = frame::build_frame(FRAME_TYPE_NIP46_REQUEST, request_json.as_bytes())
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
-    std::io::Write::write_all(port.as_mut(), &frame_bytes)
+    port.write_all(&frame_bytes)
         .map_err(|e| format!("serial write failed: {e}"))?;
-    std::io::Write::flush(port.as_mut())
+    port.flush()
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
     read_any_response(port)
@@ -117,20 +182,20 @@ fn forward_to_esp32(
 /// Sends a SESSION_AUTH (0x21) frame containing the 32-byte bridge secret and
 /// waits for a SESSION_ACK (0x22) frame with status byte 0x00.
 fn authenticate_bridge(
-    port: &mut Box<dyn serialport::SerialPort>,
+    port: &mut RawSerial,
     bridge_secret: &[u8; 32],
 ) -> Result<(), String> {
     let frame_bytes = frame::build_frame(FRAME_TYPE_SESSION_AUTH, bridge_secret)
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
-    std::io::Write::write_all(port.as_mut(), &frame_bytes)
+    port.write_all(&frame_bytes)
         .map_err(|e| format!("serial write failed: {e}"))?;
-    std::io::Write::flush(port.as_mut())
+    port.flush()
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
-    // Read response — hunt for magic bytes [0x48, 0x57] since ESP-IDF log
-    // output pollutes the USB-CDC stream alongside frame data.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
+    let mut pos = 0;
 
     loop {
         if std::time::Instant::now() > deadline {
@@ -140,40 +205,26 @@ fn authenticate_bridge(
         let mut byte = [0u8; 1];
         match port.read(&mut byte) {
             Ok(1) => {
-                // Hunt for first magic byte.
-                if byte[0] != 0x48 {
-                    continue;
+                if pos < buf.len() {
+                    buf[pos] = byte[0];
+                    pos += 1;
                 }
-                // Confirm second magic byte.
-                match port.read(&mut byte) {
-                    Ok(1) if byte[0] == 0x57 => {}
-                    _ => continue,
-                }
-                // Read header: type + length (3 bytes).
-                let mut header = [0u8; 3];
-                read_exact_timeout(port, &mut header, deadline)?;
-                let frame_type = header[0];
-                let length = u16::from_be_bytes([header[1], header[2]]) as usize;
-                // Read payload + CRC.
-                let mut body = vec![0u8; length + 4];
-                read_exact_timeout(port, &mut body, deadline)?;
-                // Reassemble and parse.
-                let mut buf = Vec::with_capacity(5 + length + 4);
-                buf.extend_from_slice(&[0x48, 0x57]);
-                buf.push(frame_type);
-                buf.extend_from_slice(&header[1..3]);
-                buf.extend_from_slice(&body);
-                if let Ok(f) = frame::parse_frame(&buf) {
-                    if f.frame_type == FRAME_TYPE_SESSION_ACK {
-                        if f.payload.first() == Some(&0x00) {
-                            log::info!("Bridge session authenticated");
-                            return Ok(());
-                        } else {
-                            return Err(format!(
-                                "bridge auth failed: status 0x{:02x}",
-                                f.payload.first().unwrap_or(&0xFF)
-                            ));
+
+                if pos >= FRAME_OVERHEAD {
+                    match frame::parse_frame(&buf[..pos]) {
+                        Ok(f) if f.frame_type == FRAME_TYPE_SESSION_ACK => {
+                            if f.payload.first() == Some(&0x00) {
+                                log::info!("Bridge session authenticated");
+                                return Ok(());
+                            } else {
+                                return Err(format!(
+                                    "bridge auth failed: status 0x{:02x}",
+                                    f.payload.first().unwrap_or(&0xFF)
+                                ));
+                            }
                         }
+                        Err(frame::FrameError::TooShort) => continue,
+                        _ => continue,
                     }
                 }
             }
@@ -190,15 +241,15 @@ fn authenticate_bridge(
 /// On NACK the bridge exits immediately — retrying wastes attempts and risks wiping
 /// the device after 5 failures.
 fn unlock_pin(
-    port: &mut Box<dyn serialport::SerialPort>,
+    port: &mut RawSerial,
     pin: &str,
 ) -> Result<(), String> {
     let frame_bytes = frame::build_frame(FRAME_TYPE_PIN_UNLOCK, pin.as_bytes())
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
-    std::io::Write::write_all(port.as_mut(), &frame_bytes)
+    port.write_all(&frame_bytes)
         .map_err(|e| format!("serial write failed: {e}"))?;
-    std::io::Write::flush(port.as_mut())
+    port.flush()
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -245,7 +296,7 @@ fn unlock_pin(
 ///
 /// The ESP32 decrypts, processes, re-encrypts, and returns the response.
 fn forward_encrypted(
-    port: &mut Box<dyn serialport::SerialPort>,
+    port: &mut RawSerial,
     master_pubkey: &[u8; 32],
     client_pubkey: &[u8; 32],
     ciphertext: &str,
@@ -258,9 +309,9 @@ fn forward_encrypted(
     let frame_bytes = frame::build_frame(FRAME_TYPE_ENCRYPTED_REQUEST, &payload)
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
-    std::io::Write::write_all(port.as_mut(), &frame_bytes)
+    port.write_all(&frame_bytes)
         .map_err(|e| format!("serial write failed: {e}"))?;
-    std::io::Write::flush(port.as_mut())
+    port.flush()
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
     read_any_response(port)
@@ -269,11 +320,10 @@ fn forward_encrypted(
 /// Read a response frame from the ESP32, accepting both NIP46_RESPONSE (0x03, plaintext)
 /// and ENCRYPTED_RESPONSE (0x11, ciphertext) frame types.
 ///
-/// Hunts for magic bytes `[0x48, 0x57]` in the stream to skip ESP-IDF log
-/// output that pollutes the USB-CDC channel.
-///
 /// Returns the payload as a UTF-8 string (either raw JSON or NIP-44 ciphertext).
-fn read_any_response(port: &mut Box<dyn serialport::SerialPort>) -> Result<String, String> {
+fn read_any_response(port: &mut RawSerial) -> Result<String, String> {
+    let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
+    let mut pos = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
 
     loop {
@@ -284,42 +334,42 @@ fn read_any_response(port: &mut Box<dyn serialport::SerialPort>) -> Result<Strin
         let mut byte = [0u8; 1];
         match port.read(&mut byte) {
             Ok(1) => {
-                // Hunt for first magic byte.
-                if byte[0] != 0x48 {
-                    continue;
+                if pos < buf.len() {
+                    buf[pos] = byte[0];
+                    pos += 1;
                 }
-                // Confirm second magic byte.
-                match port.read(&mut byte) {
-                    Ok(1) if byte[0] == 0x57 => {}
-                    _ => continue,
-                }
-                // Read header: type + length (3 bytes).
-                let mut header = [0u8; 3];
-                read_exact_timeout(port, &mut header, deadline)?;
-                let resp_type = header[0];
-                let length = u16::from_be_bytes([header[1], header[2]]) as usize;
-                // Read payload + CRC.
-                let mut body = vec![0u8; length + 4];
-                read_exact_timeout(port, &mut body, deadline)?;
-                // Reassemble and parse.
-                let mut buf = Vec::with_capacity(5 + length + 4);
-                buf.extend_from_slice(&MAGIC_BYTES);
-                buf.push(resp_type);
-                buf.extend_from_slice(&header[1..3]);
-                buf.extend_from_slice(&body);
-                match frame::parse_frame(&buf) {
-                    Ok(response_frame) => {
-                        if response_frame.frame_type == FRAME_TYPE_NIP46_RESPONSE
-                            || response_frame.frame_type == FRAME_TYPE_ENCRYPTED_RESPONSE
-                        {
-                            return String::from_utf8(response_frame.payload)
-                                .map_err(|e| format!("invalid UTF-8 in response: {e}"));
-                        } else if response_frame.frame_type == FRAME_TYPE_NACK {
-                            return Err("ESP32 sent NACK".into());
+
+                if pos >= FRAME_OVERHEAD {
+                    match frame::parse_frame(&buf[..pos]) {
+                        Ok(response_frame) => {
+                            if response_frame.frame_type == FRAME_TYPE_NIP46_RESPONSE
+                                || response_frame.frame_type == FRAME_TYPE_ENCRYPTED_RESPONSE
+                            {
+                                return String::from_utf8(response_frame.payload)
+                                    .map_err(|e| format!("invalid UTF-8 in response: {e}"));
+                            } else if response_frame.frame_type == FRAME_TYPE_NACK {
+                                return Err("ESP32 sent NACK".into());
+                            } else {
+                                return Err(format!(
+                                    "unexpected frame type: 0x{:02x}",
+                                    response_frame.frame_type
+                                ));
+                            }
                         }
-                        // Other frame type — skip and keep hunting.
+                        Err(frame::FrameError::TooShort) => continue,
+                        Err(_) => {
+                            // Bad frame — try to find the next magic byte sequence
+                            if let Some(magic_pos) =
+                                buf[1..pos].windows(2).position(|w| w == &MAGIC_BYTES)
+                            {
+                                let new_start = magic_pos + 1;
+                                buf.copy_within(new_start..pos, 0);
+                                pos -= new_start;
+                            } else {
+                                pos = 0;
+                            }
+                        }
                     }
-                    Err(_) => continue, // Bad CRC — skip and keep hunting.
                 }
             }
             Ok(_) => {}
@@ -407,24 +457,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Open serial port (wrapped in Mutex for shared access from async closure)
-    let port: Box<dyn serialport::SerialPort> = serialport::new(&cli.port, cli.baud)
-        .timeout(Duration::from_secs(60))
-        .open()
+    // Open serial port using raw POSIX I/O — no DTR toggling, no ESP32 reboot.
+    // The serialport crate's open() asserts DTR before the caller can disable it,
+    // which resets the ESP32-S3 via USB-CDC. Using termios with CLOCAL avoids this.
+    let mut port = RawSerial::open(&cli.port, cli.baud)
         .expect("failed to open serial port");
 
-    // Disable DTR/RTS — toggling these resets the ESP32
-    let mut port = port;
-    port.write_data_terminal_ready(false).ok();
-    port.write_request_to_send(false).ok();
-
-    // Drain any stale bytes in the serial buffer before starting.
-    port.set_timeout(Duration::from_millis(100)).ok();
-    let mut drain = [0u8; 1024];
-    while port.read(&mut drain).unwrap_or(0) > 0 {}
-    port.set_timeout(Duration::from_secs(10)).ok();
-
-    log::info!("Serial port {} open", cli.port);
+    log::info!("Serial port {} open (no DTR — ESP32 not reset)", cli.port);
 
     // If a boot PIN was provided, unlock the device before doing anything else.
     // The ESP32 only accepts PIN_UNLOCK (0x26) and PROVISION_LIST (0x05) while locked.
@@ -542,16 +581,6 @@ async fn main() -> Result<()> {
                             log::error!("NIP-44 decrypt failed: {e}");
                             return Ok(false);
                         }
-                    };
-
-                    // Inject the client pubkey into the request so the ESP32
-                    // can identify the client for TOFU policy in legacy mode.
-                    let plaintext = match serde_json::from_str::<serde_json::Value>(&plaintext) {
-                        Ok(mut v) => {
-                            v["_client_pubkey"] = serde_json::json!(client_pubkey.to_hex());
-                            v.to_string()
-                        }
-                        Err(_) => plaintext,
                     };
 
                     log::info!(

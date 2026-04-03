@@ -42,6 +42,21 @@ pub const FRAME_TYPE_SESSION_ACK: u8 = 0x22;
 pub const FRAME_TYPE_SET_BRIDGE_SECRET: u8 = 0x23;
 pub const FRAME_TYPE_FACTORY_RESET: u8 = 0x24;
 
+// --- OTA frame types ---
+pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;
+pub const FRAME_TYPE_OTA_CHUNK: u8 = 0x31;
+pub const FRAME_TYPE_OTA_FINISH: u8 = 0x32;
+pub const FRAME_TYPE_OTA_STATUS: u8 = 0x33;
+
+// OTA status codes (payload byte 0 of OTA_STATUS frame)
+pub const OTA_STATUS_READY: u8 = 0x00;
+pub const OTA_STATUS_CHUNK_OK: u8 = 0x01;
+pub const OTA_STATUS_VERIFIED: u8 = 0x02;
+pub const OTA_STATUS_ERR_HASH: u8 = 0x10;
+pub const OTA_STATUS_ERR_SIZE: u8 = 0x11;
+pub const OTA_STATUS_ERR_WRITE: u8 = 0x12;
+pub const OTA_STATUS_ERR_NOT_STARTED: u8 = 0x13;
+
 pub const MAX_PAYLOAD_SIZE: usize = 4096;
 pub const FRAME_HEADER_SIZE: usize = 5; // 2 magic + 1 type + 2 length
 pub const FRAME_OVERHEAD: usize = FRAME_HEADER_SIZE + 4; // header + CRC32

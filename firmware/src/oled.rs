@@ -265,3 +265,176 @@ pub fn show_result(display: &mut Display<'_>, message: &str) {
 
     FreeRtos::delay_ms(2000);
 }
+
+/// Display the multi-master boot screen.
+pub fn show_boot(display: &mut Display<'_>, master_count: u8) {
+    display.clear_buffer();
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("Heartwood HSM", Point::new(0, 10), text_style)
+        .draw(display)
+        .ok();
+
+    let count_str = format!("{} masters loaded", master_count);
+    Text::new(&count_str, Point::new(0, 30), text_style)
+        .draw(display)
+        .ok();
+
+    Text::new("Awaiting bridge...", Point::new(0, 50), text_style)
+        .draw(display)
+        .ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Display bridge connected status.
+pub fn show_bridge_connected(
+    display: &mut Display<'_>,
+    master_count: u8,
+    client_count: usize,
+) {
+    display.clear_buffer();
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("Bridge connected", Point::new(0, 10), text_style)
+        .draw(display)
+        .ok();
+
+    let masters_str = format!("{} masters active", master_count);
+    Text::new(&masters_str, Point::new(0, 30), text_style)
+        .draw(display)
+        .ok();
+
+    let clients_str = format!("{} clients", client_count);
+    Text::new(&clients_str, Point::new(0, 50), text_style)
+        .draw(display)
+        .ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Display a signing request with master label, method, kind, content, and countdown.
+pub fn show_master_sign_request(
+    display: &mut Display<'_>,
+    master_label: &str,
+    method: &str,
+    kind: Option<u64>,
+    content_preview: &str,
+    seconds_remaining: u32,
+) {
+    display.clear_buffer();
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Line 1: master label.
+    let label = &master_label[..master_label.len().min(CHARS_PER_LINE)];
+    Text::new(label, Point::new(0, 10), text_style)
+        .draw(display)
+        .ok();
+
+    // Line 2: method + kind.
+    let method_str = match kind {
+        Some(k) => format!("{} kind:{}", method, k),
+        None => method.to_string(),
+    };
+    let method_str = &method_str[..method_str.len().min(CHARS_PER_LINE)];
+    Text::new(method_str, Point::new(0, 22), text_style)
+        .draw(display)
+        .ok();
+
+    // Lines 3-4: content preview (truncated to 2 lines).
+    let preview = &content_preview[..content_preview.len().min(CHARS_PER_LINE * 2)];
+    if preview.len() <= CHARS_PER_LINE {
+        Text::new(preview, Point::new(0, 34), text_style)
+            .draw(display)
+            .ok();
+    } else {
+        let (line1, line2) = preview.split_at(CHARS_PER_LINE.min(preview.len()));
+        Text::new(line1, Point::new(0, 34), text_style)
+            .draw(display)
+            .ok();
+        let line2 = &line2[..line2.len().min(CHARS_PER_LINE)];
+        Text::new(line2, Point::new(0, 46), text_style)
+            .draw(display)
+            .ok();
+    }
+
+    // Line 5: countdown bar.
+    show_countdown_bar(display, seconds_remaining, 30, text_style);
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Display an auto-approved request flash (shown for ~1 second).
+pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method: &str) {
+    display.clear_buffer();
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Use a simple checkmark since the OLED font may not have Unicode tick.
+    let header = format!("{} OK", &master_label[..master_label.len().min(CHARS_PER_LINE - 3)]);
+    Text::new(&header, Point::new(0, 22), text_style)
+        .draw(display)
+        .ok();
+
+    let method_str = &method[..method.len().min(CHARS_PER_LINE)];
+    Text::new(method_str, Point::new(0, 40), text_style)
+        .draw(display)
+        .ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Display an identity switch notification (shown for ~2 seconds).
+pub fn show_identity_switch(
+    display: &mut Display<'_>,
+    master_label: &str,
+    purpose: &str,
+    npub: &str,
+) {
+    display.clear_buffer();
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    let label = &master_label[..master_label.len().min(CHARS_PER_LINE)];
+    Text::new(label, Point::new(0, 10), text_style)
+        .draw(display)
+        .ok();
+
+    let purpose_line = format!("-> {}", purpose);
+    let purpose_line = &purpose_line[..purpose_line.len().min(CHARS_PER_LINE)];
+    Text::new(purpose_line, Point::new(0, 30), text_style)
+        .draw(display)
+        .ok();
+
+    let npub_short = &npub[..npub.len().min(CHARS_PER_LINE)];
+    Text::new(npub_short, Point::new(0, 50), text_style)
+        .draw(display)
+        .ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+
+    FreeRtos::delay_ms(2000);
+}

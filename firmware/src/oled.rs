@@ -31,18 +31,29 @@ pub fn init<'a>(
     i2c: I2cDriver<'a>,
     rst_pin: AnyOutputPin,
 ) -> Display<'a> {
-    // Toggle reset pin
+    // Toggle reset pin — hold low for 50ms, then high with 100ms settle time
     let mut rst = PinDriver::output(rst_pin).expect("RST pin");
-    rst.set_low().ok();
-    FreeRtos::delay_ms(10);
     rst.set_high().ok();
-    FreeRtos::delay_ms(10);
+    FreeRtos::delay_ms(1);
+    rst.set_low().ok();
+    FreeRtos::delay_ms(50);
+    rst.set_high().ok();
+    FreeRtos::delay_ms(100);
 
-    let interface = I2CDisplayInterface::new(i2c);
+    let interface = I2CDisplayInterface::new_custom_address(i2c, 0x3C);
     let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
-    display.init().expect("OLED init failed");
-    display.clear_buffer();
+    match display.init() {
+        Ok(()) => {
+            display.clear_buffer();
+            if let Err(e) = display.flush() {
+                log::warn!("OLED flush failed during init: {:?} — display may not work", e);
+            }
+        }
+        Err(e) => {
+            log::warn!("OLED init failed: {:?} — continuing without display", e);
+        }
+    }
     display
 }
 
@@ -66,7 +77,9 @@ pub fn show_npub(display: &mut Display<'_>, npub: &str) {
         pos = end;
     }
 
-    display.flush().expect("OLED flush failed");
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
 }
 
 /// Display "Awaiting secret..." on the OLED.
@@ -81,7 +94,9 @@ pub fn show_awaiting(display: &mut Display<'_>) {
         .draw(display)
         .ok();
 
-    display.flush().expect("OLED flush failed");
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
 }
 
 /// Display an error message on the OLED.
@@ -96,5 +111,7 @@ pub fn show_error(display: &mut Display<'_>, msg: &str) {
         .draw(display)
         .ok();
 
-    display.flush().expect("OLED flush failed");
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
 }

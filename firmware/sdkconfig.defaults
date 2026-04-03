@@ -1,9 +1,11 @@
 # Heltec WiFi LoRa 32 V4 — ESP32-S3
 CONFIG_IDF_TARGET="esp32s3"
 
-# 2MB PSRAM (octal)
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
+# PSRAM disabled — not needed for signing, avoids mode mismatch
+# (Heltec V4 has quad-SPI PSRAM but we don't use external RAM)
 
 # Enough stack for crypto operations
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Disable task watchdog — provisioning blocks on stdin indefinitely
+CONFIG_ESP_TASK_WDT_INIT=n

@@ -10,9 +10,11 @@ mod oled;
 mod provision;
 mod sign;
 
+use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_hal::units::FromValueType;
 use esp_idf_hal::peripherals::Peripherals;
+use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 
 use heartwood_common::derive;
@@ -24,6 +26,20 @@ fn main() {
     log::info!("Heartwood ESP32 — Phase 2 (provisioning)");
 
     let peripherals = Peripherals::take().expect("failed to take peripherals");
+
+    // Turn on white LED (GPIO 35) so we know the device is alive
+    // Try both polarities — Heltec V4 LED may be active low
+    let mut led = PinDriver::output(peripherals.pins.gpio35).expect("LED pin");
+    led.set_high().ok();
+
+    // --- USB Serial JTAG driver (for provisioning protocol) ---
+    let mut usb = UsbSerialDriver::new(
+        peripherals.usb_serial,
+        peripherals.pins.gpio19,  // D-
+        peripherals.pins.gpio20,  // D+
+        &UsbSerialConfig::new().rx_buffer_size(512),
+    )
+    .expect("USB serial driver init failed");
 
     // --- OLED init ---
     let i2c_config = I2cConfig::new().baudrate(400.kHz().into());
@@ -51,9 +67,7 @@ fn main() {
             log::info!("No stored secret — entering provisioning mode");
             oled::show_awaiting(&mut display);
 
-            // Read from stdin — ESP-IDF maps this to USB-Serial-JTAG on the Heltec V4.
-            // No UART driver or GPIO pins needed.
-            let secret = provision::wait_for_secret();
+            let secret = provision::wait_for_secret(&mut usb);
 
             // Store in NVS
             match nvs::write_root_secret(&mut nvs, &secret) {

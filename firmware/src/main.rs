@@ -6,7 +6,7 @@
 //   1. Initialise peripherals (LED, Vext, OLED, button, USB serial, NVS)
 //   2. Check NVS for a stored root secret
 //   3. If none: show "Awaiting secret...", wait for a valid provision frame
-//   4. Derive master npub and display it (k256 in aligned thread)
+//   4. Derive master npub and display it (libsecp256k1)
 //   5. Enter frame dispatch loop — route by frame type indefinitely
 
 mod button;
@@ -23,9 +23,12 @@ use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::units::FromValueType;
 use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use std::sync::Arc;
+
 use heartwood_common::types::{
     FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_PROVISION,
 };
+use secp256k1::Secp256k1;
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -77,7 +80,7 @@ fn main() {
                 peripherals.usb_serial,
                 peripherals.pins.gpio19,
                 peripherals.pins.gpio20,
-                &UsbSerialConfig::new().rx_buffer_size(512),
+                &UsbSerialConfig::new().rx_buffer_size(512).tx_buffer_size(1024),
             )
             .expect("USB serial driver init failed");
             (secret, usb)
@@ -92,7 +95,7 @@ fn main() {
                 peripherals.usb_serial,
                 peripherals.pins.gpio19,
                 peripherals.pins.gpio20,
-                &UsbSerialConfig::new().rx_buffer_size(512),
+                &UsbSerialConfig::new().rx_buffer_size(512).tx_buffer_size(1024),
             )
             .expect("USB serial driver init failed");
 
@@ -118,10 +121,18 @@ fn main() {
         }
     };
 
-    // Skip npub derivation at boot — k256 alignment on Xtensa is too fragile
-    // to call reliably at boot time (depends on exact binary layout). Instead
-    // show a ready message and derive on-demand when signing requests arrive.
-    oled::show_error(&mut display, "Heartwood ready");
+    // Create the secp256k1 context once — ~130KB. Shared via Arc with
+    // signing threads to avoid repeated heap allocations on ESP32.
+    let secp = Arc::new(Secp256k1::signing_only());
+
+    // Derive master npub at boot and show it on the OLED.
+    let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &root_secret)
+        .expect("stored secret is invalid");
+    let (xonly, _) = keypair.x_only_public_key();
+    let master_npub = heartwood_common::encoding::encode_npub(&xonly.serialize());
+    log::info!("Master npub: {master_npub}");
+    oled::show_npub(&mut display, &master_npub);
+
     log::info!("Identity loaded — ready for signing requests");
 
     // --- Frame dispatch loop ---
@@ -134,6 +145,7 @@ fn main() {
                     &mut usb,
                     &frame,
                     &root_secret,
+                    &secp,
                     &mut display,
                     &button_pin,
                 );

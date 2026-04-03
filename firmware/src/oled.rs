@@ -2,7 +2,7 @@
 //
 // OLED display helpers for the Heltec V4 built-in SSD1306 (128x64).
 
-use embedded_graphics::mono_font::ascii::FONT_5X8;
+use embedded_graphics::mono_font::ascii::FONT_6X10;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::BinaryColor;
@@ -18,8 +18,8 @@ use ssd1306::size::DisplaySize128x64;
 use ssd1306::I2CDisplayInterface;
 use ssd1306::Ssd1306;
 
-/// 128px / 5px per char = 25 chars per line.
-const CHARS_PER_LINE: usize = 25;
+/// 128px / 6px per char = 21 chars per line.
+const CHARS_PER_LINE: usize = 21;
 
 pub type Display<'a> = Ssd1306<
     ssd1306::prelude::I2CInterface<I2cDriver<'a>>,
@@ -66,11 +66,11 @@ pub fn init<'a>(
 pub fn show_npub(display: &mut Display<'_>, npub: &str) {
     display.clear_buffer();
     let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
 
-    let mut y = 8i32;
+    let mut y = 10i32;
     let mut pos = 0;
     while pos < npub.len() {
         let end = core::cmp::min(pos + CHARS_PER_LINE, npub.len());
@@ -78,7 +78,7 @@ pub fn show_npub(display: &mut Display<'_>, npub: &str) {
         Text::new(line, Point::new(0, y), text_style)
             .draw(display)
             .ok();
-        y += 10;
+        y += 12;
         pos = end;
     }
 
@@ -91,7 +91,7 @@ pub fn show_npub(display: &mut Display<'_>, npub: &str) {
 pub fn show_awaiting(display: &mut Display<'_>) {
     display.clear_buffer();
     let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
 
@@ -108,7 +108,7 @@ pub fn show_awaiting(display: &mut Display<'_>) {
 pub fn show_error(display: &mut Display<'_>, msg: &str) {
     display.clear_buffer();
     let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
 
@@ -123,12 +123,12 @@ pub fn show_error(display: &mut Display<'_>, msg: &str) {
 
 /// Display a signing request with purpose, kind, content preview, and countdown.
 ///
-/// Layout (128×64 SSD1306, FONT_5X8):
-///   Line 1 (y=8):  "Sign as <purpose>?"
-///   Line 2 (y=18): "Kind <number>"
-///   Line 3 (y=28): "<content line 1>
-///   Line 4 (y=38):  <content line 2>"
-///   Line 5 (y=56): "[====------] 18s"
+/// Layout (128×64 SSD1306, FONT_6X10):
+///   Line 1 (y=10):  "Sign as <purpose>?"
+///   Line 2 (y=22): "Kind <number>"
+///   Line 3 (y=34): "<content line 1>
+///   Line 4 (y=46):  <content line 2>"
+///   Line 5 (y=58): "[====------] 18s"
 pub fn show_sign_request(
     display: &mut Display<'_>,
     purpose: &str,
@@ -138,7 +138,7 @@ pub fn show_sign_request(
 ) {
     display.clear_buffer();
     let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
 
@@ -150,14 +150,14 @@ pub fn show_sign_request(
     };
     let heading = format!("Sign as {}?", label);
     let heading = &heading[..heading.len().min(CHARS_PER_LINE)];
-    Text::new(heading, Point::new(0, 8), text_style)
+    Text::new(heading, Point::new(0, 10), text_style)
         .draw(display)
         .ok();
 
     // Line 2: "Kind <number>"
     let kind_str = format!("Kind {}", kind);
     let kind_str = &kind_str[..kind_str.len().min(CHARS_PER_LINE)];
-    Text::new(kind_str, Point::new(0, 18), text_style)
+    Text::new(kind_str, Point::new(0, 22), text_style)
         .draw(display)
         .ok();
 
@@ -178,14 +178,14 @@ pub fn show_sign_request(
         let suffix = if truncated { "...\"" } else { "\"" };
         let line3 = format!("\"{}{}",  capped, suffix);
         let line3 = &line3[..line3.len().min(CHARS_PER_LINE + 4)]; // suffix may push slightly over
-        Text::new(line3, Point::new(0, 28), text_style)
+        Text::new(line3, Point::new(0, 34), text_style)
             .draw(display)
             .ok();
     } else {
         // Split: first CHARS_PER_LINE-1 chars on line 3, remainder on line 4.
         let (part1, part2_raw) = capped.split_at(first_cap);
         let line3 = format!("\"{}",  part1);
-        Text::new(&line3[..line3.len().min(CHARS_PER_LINE)], Point::new(0, 28), text_style)
+        Text::new(&line3[..line3.len().min(CHARS_PER_LINE)], Point::new(0, 34), text_style)
             .draw(display)
             .ok();
 
@@ -197,7 +197,7 @@ pub fn show_sign_request(
         };
         let suffix = if truncated { "...\"" } else { "\"" };
         let line4 = format!("{}{}", part2, suffix);
-        Text::new(&line4[..line4.len().min(CHARS_PER_LINE)], Point::new(0, 38), text_style)
+        Text::new(&line4[..line4.len().min(CHARS_PER_LINE)], Point::new(0, 46), text_style)
             .draw(display)
             .ok();
     }
@@ -210,15 +210,15 @@ pub fn show_sign_request(
     }
 }
 
-/// Draw a countdown bar at y=56: "[====------] 18s"
-/// Bar width is 16 characters; filled proportion equals remaining/total.
+/// Draw a countdown bar at y=58: "[====------] 18s"
+/// Bar width is 12 characters; filled proportion equals remaining/total.
 fn show_countdown_bar(
     display: &mut Display<'_>,
     remaining: u32,
     total: u32,
     text_style: MonoTextStyle<'_, BinaryColor>,
 ) {
-    const BAR_WIDTH: usize = 16;
+    const BAR_WIDTH: usize = 12;
 
     let filled = if total == 0 {
         0
@@ -234,12 +234,12 @@ fn show_countdown_bar(
         *b = b'=';
     }
     // Safety: bar contains only ASCII '=' and '-'.
-    let bar_str = core::str::from_utf8(&bar).unwrap_or("----------------");
+    let bar_str = core::str::from_utf8(&bar).unwrap_or("------------");
 
     // Format the full line — "18s" suffix, right-aligned after the closing bracket.
     let line = format!("[{}] {}s", bar_str, remaining);
     let line = &line[..line.len().min(CHARS_PER_LINE + 4)];
-    Text::new(line, Point::new(0, 56), text_style)
+    Text::new(line, Point::new(0, 58), text_style)
         .draw(display)
         .ok();
 
@@ -251,7 +251,7 @@ fn show_countdown_bar(
 pub fn show_result(display: &mut Display<'_>, message: &str) {
     display.clear_buffer();
     let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
 

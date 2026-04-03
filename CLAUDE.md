@@ -26,9 +26,9 @@ portable = []   # BLE GATT, battery management, child key only
 
 ## Current state
 
-Phase 3 (signing oracle) implemented. Five crates: `common/` (shared crypto + frame protocol + NIP-46 types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness), `bridge/` (Pi-side relay bridge). The ESP32 is a NIP-46 bunker — receives signing requests over serial, shows what's being signed on OLED, requires physical button approval (long hold to approve, short press to deny). k256 alignment workaround still in place (dedicated thread for all k256 operations).
+Phase 3 (signing oracle) complete and **verified end-to-end on hardware** (2026-04-03). Five crates: `common/` (shared crypto + frame protocol + NIP-46 types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness), `bridge/` (Pi-side relay bridge). The ESP32 is a NIP-46 bunker — receives signing requests over serial, shows what's being signed on OLED, requires physical button approval (long hold to approve, short press to deny). Firmware uses libsecp256k1 (C FFI) for all signing — k256 replaced due to Xtensa alignment hangs. Schnorr signing takes ~4 seconds on the ESP32-S3 at 160MHz.
 
-Next: flash firmware, test end-to-end with sign-test CLI, then integrate with heartwood-device on the Pi.
+Next: integrate with heartwood-device (Pi-side bridge daemon). Test child key derivation (heartwood context with purpose/index). Then production hardening (JTAG disable, error recovery, watchdog).
 
 ## Build & flash
 
@@ -78,23 +78,17 @@ The nsec-tree derivation MUST match heartwood-core byte-for-byte. The test vecto
 
 ## Known issues
 
-### k256 LoadStoreAlignment on Xtensa (WORKAROUND IN PLACE)
+### k256 LoadStoreAlignment on Xtensa (RESOLVED)
 
-k256's field arithmetic does unaligned memory accesses that crash on Xtensa LX7
-(`EXCCAUSE: 0x00000005`). The root cause is `once_cell::sync::Lazy` in k256's
-`precomputed-tables` feature (or internal scalar arithmetic) producing misaligned
-pointer casts. Fixed upstream in k256 0.14.0 (PR #1135), but 0.14.0 stable is
-not yet released.
+k256's field arithmetic does unaligned memory accesses that hang on Xtensa LX7.
+No amount of thread/alignment tricks fixes it reliably — `SigningKey::from_bytes()`
+hangs deterministically, with one-off successes depending on exact binary layout.
 
-**Current workaround (verified on hardware):** All k256 operations run in a
-dedicated thread with 64KB stack, a 4KB heap bump (`vec![0u8; 4096]` +
-`black_box` + `drop`) at the start of the closure, and `#[repr(align(32))]`
-input buffers. All three elements are required — removing any one causes a
-hang or crash. See `firmware/src/main.rs` and `firmware/src/nip46_handler.rs`.
-
-**When to remove:** upgrade to k256 ≥0.14.0 stable and move derivation back to
-the main thread. Run `cargo tree -f "{p} {f}" | grep k256` to verify
-`precomputed-tables` is not sneaking in via feature unification.
+**Resolution:** Firmware now uses the `secp256k1` crate (C FFI wrapping Bitcoin
+Core's libsecp256k1) which is alignment-safe on all architectures. The `common`
+crate has a feature flag: `k256-backend` (default, for host tools/tests) and
+`secp256k1-backend` (for firmware). Both backends produce identical outputs —
+verified by the frozen test vector in `common/src/derive.rs`.
 
 ## Dependencies
 
@@ -102,7 +96,8 @@ All crypto crates are no_std-compatible but we use the ESP-IDF std framework:
 
 | Crate | Why |
 |-------|-----|
-| k256 | secp256k1 (BIP-340 Schnorr) |
+| secp256k1 | libsecp256k1 C FFI — BIP-340 Schnorr (firmware) |
+| k256 | secp256k1 pure Rust — BIP-340 Schnorr (host tools/tests) |
 | hmac + sha2 | HMAC-SHA256 child key derivation |
 | zeroize | Deterministic secret cleanup |
 | bech32 | npub encoding |

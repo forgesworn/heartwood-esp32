@@ -5,11 +5,8 @@
 // Handles two methods:
 //   sign_event      — shows event on OLED, waits for button approval, signs
 //   get_public_key  — returns the hex public key immediately (no approval needed)
-//
-// All k256 operations run in a dedicated thread with a 64 KiB stack, 4 KiB
-// heap bump, and #[repr(align(32))] buffers to work around k256's unaligned
-// memory access on Xtensa LX7. See CLAUDE.md "Known issues" for details.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use esp_idf_hal::gpio::{Input, PinDriver};
@@ -22,9 +19,10 @@ use heartwood_common::nip46::{
     self, HeartwoodContext, SignedEvent, UnsignedEvent,
 };
 use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_NIP46_RESPONSE};
+use secp256k1::{Secp256k1, SignOnly};
 use zeroize::Zeroize;
 
-use crate::button::{wait_for_press, ButtonResult};
+use crate::button::ButtonResult;
 use crate::oled::Display;
 use crate::protocol::write_frame;
 
@@ -35,19 +33,14 @@ const APPROVAL_TIMEOUT_SECS: u64 = 30;
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Dispatch an incoming NIP-46 frame to the appropriate handler.
-///
-/// If the payload cannot be parsed as a NIP-46 JSON-RPC request a NACK is
-/// sent and the function returns immediately. Unknown methods receive an error
-/// response.
 pub fn handle_request(
     usb: &mut UsbSerialDriver<'_>,
     frame: &Frame,
     master_secret: &[u8; 32],
+    secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
 ) {
-    // Parse the JSON payload into a Nip46Request.
     let request = match nip46::parse_request(&frame.payload) {
         Ok(r) => r,
         Err(e) => {
@@ -60,8 +53,8 @@ pub fn handle_request(
     log::info!("NIP-46 request: method={} id={}", request.method, request.id);
 
     match request.method.as_str() {
-        "sign_event" => handle_sign_event(usb, master_secret, display, button_pin, &request),
-        "get_public_key" => handle_get_public_key(usb, master_secret, &request),
+        "sign_event" => handle_sign_event(usb, master_secret, secp, display, button_pin, &request),
+        "get_public_key" => handle_get_public_key(usb, master_secret, secp, &request),
         other => {
             log::warn!("Unknown NIP-46 method: {other}");
             send_error(usb, &request.id, -2, "unknown method");
@@ -76,11 +69,11 @@ pub fn handle_request(
 fn handle_sign_event(
     usb: &mut UsbSerialDriver<'_>,
     master_secret: &[u8; 32],
+    secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
     request: &nip46::Nip46Request,
 ) {
-    // Parse the unsigned event from params.
     let event = match nip46::parse_unsigned_event(&request.params) {
         Ok(e) => e,
         Err(e) => {
@@ -90,45 +83,54 @@ fn handle_sign_event(
         }
     };
 
-    // Extract a brief summary for the OLED.
     let (kind, content_preview) = nip46::event_display_summary(&event, 50);
 
-    // Determine the signing context label shown on the display.
     let purpose = request
         .heartwood
         .as_ref()
         .map(|h| h.purpose.as_str())
         .unwrap_or("master");
 
-    // DEBUG: inline button test — bypass wait_for_press entirely
-    crate::oled::show_error(display, &format!("K{} {}", kind, &content_preview[..content_preview.len().min(15)]));
-    esp_idf_hal::delay::FreeRtos::delay_ms(1000);
-
-    crate::oled::show_error(display, "Hold PRG 2s...");
-    let deadline = std::time::Instant::now() + Duration::from_secs(APPROVAL_TIMEOUT_SECS);
+    // Show the signing request on the OLED and wait for button approval.
+    // The countdown bar updates every second; button press feedback is shown
+    // as "Hold 2s..." while the button is held down.
+    let start = std::time::Instant::now();
+    let deadline = start + Duration::from_secs(APPROVAL_TIMEOUT_SECS);
+    let mut last_remaining = APPROVAL_TIMEOUT_SECS as u32 + 1;
     let mut pressed = false;
     let mut press_start = std::time::Instant::now();
+
     let button_result = loop {
-        if std::time::Instant::now() >= deadline {
+        let now = std::time::Instant::now();
+        if now >= deadline {
             break None;
         }
+
+        let remaining = (deadline - now).as_secs() as u32;
+
+        if remaining != last_remaining && !pressed {
+            crate::oled::show_sign_request(display, purpose, kind, &content_preview, remaining);
+            last_remaining = remaining;
+        }
+
         let low = button_pin.is_low();
         if low && !pressed {
             pressed = true;
-            press_start = std::time::Instant::now();
-            crate::oled::show_error(display, "PRESSED!");
+            press_start = now;
+            crate::oled::show_error(display, "Hold 2s...");
+        }
+        if low && pressed {
+            let held = now - press_start;
+            if held >= Duration::from_millis(2000) {
+                crate::oled::show_error(display, "Approved!");
+                esp_idf_hal::delay::FreeRtos::delay_ms(300);
+                break Some(ButtonResult::Approve);
+            }
         }
         if !low && pressed {
-            let held = std::time::Instant::now() - press_start;
-            if held >= Duration::from_millis(2000) {
-                crate::oled::show_error(display, "APPROVED!");
-                esp_idf_hal::delay::FreeRtos::delay_ms(500);
-                break Some(ButtonResult::Approve);
-            } else {
-                crate::oled::show_error(display, "DENIED (short)");
-                esp_idf_hal::delay::FreeRtos::delay_ms(500);
-                break Some(ButtonResult::Deny);
-            }
+            crate::oled::show_error(display, "Denied (short)");
+            esp_idf_hal::delay::FreeRtos::delay_ms(500);
+            break Some(ButtonResult::Deny);
         }
         esp_idf_hal::delay::FreeRtos::delay_ms(20);
     };
@@ -137,7 +139,7 @@ fn handle_sign_event(
         Some(ButtonResult::Approve) => {
             log::info!("sign_event: approved");
             crate::oled::show_error(display, "Signing...");
-            match do_sign(&event, master_secret, request.heartwood.as_ref()) {
+            match do_sign(&event, master_secret, secp, request.heartwood.as_ref()) {
                 Ok(signed) => {
                     match nip46::build_sign_response(&request.id, &signed) {
                         Ok(json) => {
@@ -173,85 +175,41 @@ fn handle_sign_event(
 }
 
 // ---------------------------------------------------------------------------
-// do_sign — runs k256 in an aligned thread to avoid Xtensa crash
+// do_sign — runs inline on the main thread
 // ---------------------------------------------------------------------------
 
 fn do_sign(
     event: &UnsignedEvent,
     master_secret: &[u8; 32],
+    secp: &Arc<Secp256k1<SignOnly>>,
     heartwood: Option<&HeartwoodContext>,
 ) -> Result<SignedEvent, String> {
-    // Step 1: compute event ID using sha2 only — safe on the main thread.
     let event_id_bytes = nip46::compute_event_id(event);
 
-    // Step 2: derive signing key in an aligned thread.
-    // The thread returns (private_key_bytes, hex_pubkey_string).
-    let secret_copy = *master_secret;
-    let heartwood_owned = heartwood.cloned();
+    let (mut signing_secret, hex_pubkey) = match heartwood {
+        Some(ctx) => {
+            let root = derive::create_tree_root(master_secret)
+                .map_err(|e| format!("create_tree_root: {e}"))?;
+            let identity = derive::derive(&root, &ctx.purpose, ctx.index)
+                .map_err(|e| format!("derive: {e}"))?;
+            let pubkey_hex = hex_encode(&identity.public_key);
+            let private_bytes = *identity.private_key;
+            (private_bytes, pubkey_hex)
+        }
+        None => {
+            let keypair = secp256k1::Keypair::from_seckey_slice(secp, master_secret)
+                .map_err(|_| "invalid master secret".to_string())?;
+            let (xonly, _) = keypair.x_only_public_key();
+            let pubkey_hex = hex_encode(&xonly.serialize());
+            (*master_secret, pubkey_hex)
+        }
+    };
 
-    let (mut signing_secret, hex_pubkey) = std::thread::Builder::new()
-        .name("derive".into())
-        .stack_size(65536)
-        .spawn(move || -> Result<([u8; 32], String), String> {
-            let _bump = vec![0u8; 4096];
-            std::hint::black_box(&_bump);
-            drop(_bump);
-            #[repr(align(32))]
-            struct Aligned([u8; 32]);
-            let aligned = Aligned(secret_copy);
+    let sig_bytes = crate::sign::sign_hash(secp, &signing_secret, &event_id_bytes)
+        .map_err(|e| e.to_string())?;
 
-            match heartwood_owned {
-                Some(ctx) => {
-                    // Derive a child key using nsec-tree.
-                    let root = derive::create_tree_root(&aligned.0)
-                        .map_err(|e| format!("create_tree_root: {e}"))?;
-                    let identity = derive::derive(&root, &ctx.purpose, ctx.index)
-                        .map_err(|e| format!("derive: {e}"))?;
-                    let pubkey_hex = hex_encode(&identity.public_key);
-                    let private_bytes = *identity.private_key;
-                    Ok((private_bytes, pubkey_hex))
-                }
-                None => {
-                    // Use master key directly.
-                    use k256::schnorr::SigningKey;
-                    let signing_key = SigningKey::from_bytes(&aligned.0)
-                        .map_err(|_| "invalid master secret".to_string())?;
-                    let pubkey_bytes: [u8; 32] =
-                        signing_key.verifying_key().to_bytes().into();
-                    let pubkey_hex = hex_encode(&pubkey_bytes);
-                    Ok((aligned.0, pubkey_hex))
-                }
-            }
-        })
-        .map_err(|e| format!("thread spawn failed: {e}"))?
-        .join()
-        .map_err(|_| "derivation thread panicked".to_string())??;
-
-    // Step 3: sign the event ID hash in another aligned thread.
-    let sig_bytes: [u8; 64] = std::thread::Builder::new()
-        .name("sign".into())
-        .stack_size(65536)
-        .spawn(move || -> Result<[u8; 64], String> {
-            let _bump = vec![0u8; 4096];
-            std::hint::black_box(&_bump);
-            drop(_bump);
-            #[repr(align(32))]
-            struct AlignedKey([u8; 32]);
-            #[repr(align(32))]
-            struct AlignedHash([u8; 32]);
-            let aligned_key = AlignedKey(signing_secret);
-            let aligned_hash = AlignedHash(event_id_bytes);
-            crate::sign::sign_hash(&aligned_key.0, &aligned_hash.0)
-                .map_err(|e| e.to_string())
-        })
-        .map_err(|e| format!("thread spawn failed: {e}"))?
-        .join()
-        .map_err(|_| "signing thread panicked".to_string())??;
-
-    // Step 4: zeroize the signing secret.
     signing_secret.zeroize();
 
-    // Step 5: assemble the signed event.
     let event_id_hex = hex_encode(&event_id_bytes);
     let sig_hex = hex_encode(&sig_bytes);
 
@@ -273,43 +231,28 @@ fn do_sign(
 fn handle_get_public_key(
     usb: &mut UsbSerialDriver<'_>,
     master_secret: &[u8; 32],
+    secp: &Arc<Secp256k1<SignOnly>>,
     request: &nip46::Nip46Request,
 ) {
-    let secret_copy = *master_secret;
-    let heartwood_owned = request.heartwood.clone();
-
-    let pubkey_result = std::thread::Builder::new()
-        .name("pubkey".into())
-        .stack_size(65536)
-        .spawn(move || -> Result<String, String> {
-            let _bump = vec![0u8; 4096];
-            std::hint::black_box(&_bump);
-            drop(_bump);
-            #[repr(align(32))]
-            struct Aligned([u8; 32]);
-            let aligned = Aligned(secret_copy);
-
-            match heartwood_owned {
-                Some(ctx) => {
-                    let root = derive::create_tree_root(&aligned.0)
-                        .map_err(|e| format!("create_tree_root: {e}"))?;
-                    let identity = derive::derive(&root, &ctx.purpose, ctx.index)
-                        .map_err(|e| format!("derive: {e}"))?;
-                    Ok(hex_encode(&identity.public_key))
-                }
-                None => {
-                    use k256::schnorr::SigningKey;
-                    let signing_key = SigningKey::from_bytes(&aligned.0)
-                        .map_err(|_| "invalid master secret".to_string())?;
-                    let pubkey_bytes: [u8; 32] =
-                        signing_key.verifying_key().to_bytes().into();
-                    Ok(hex_encode(&pubkey_bytes))
-                }
-            }
-        })
-        .map_err(|e| format!("thread spawn failed: {e}"))
-        .and_then(|h| h.join().map_err(|_| "pubkey thread panicked".to_string()))
-        .and_then(|r| r);
+    let pubkey_result = match &request.heartwood {
+        Some(ctx) => {
+            derive::create_tree_root(master_secret)
+                .map_err(|e| format!("create_tree_root: {e}"))
+                .and_then(|root| {
+                    derive::derive(&root, &ctx.purpose, ctx.index)
+                        .map_err(|e| format!("derive: {e}"))
+                })
+                .map(|identity| hex_encode(&identity.public_key))
+        }
+        None => {
+            secp256k1::Keypair::from_seckey_slice(secp, master_secret)
+                .map(|keypair| {
+                    let (xonly, _) = keypair.x_only_public_key();
+                    hex_encode(&xonly.serialize())
+                })
+                .map_err(|_| "invalid master secret".to_string())
+        }
+    };
 
     match pubkey_result {
         Ok(hex_pubkey) => match nip46::build_pubkey_response(&request.id, &hex_pubkey) {
@@ -333,10 +276,6 @@ fn handle_get_public_key(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build and send a NIP-46 error response over USB serial.
-///
-/// If serialisation itself fails the error is logged and a NACK is sent
-/// as a last-resort fallback.
 fn send_error(usb: &mut UsbSerialDriver<'_>, request_id: &str, code: i32, message: &str) {
     match nip46::build_error_response(request_id, code, message) {
         Ok(json) => {

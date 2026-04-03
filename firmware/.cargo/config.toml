@@ -12,3 +12,5 @@ build-std = ["std", "panic_abort"]
 MCU = "esp32s3"
 # esp-idf version
 ESP_IDF_VERSION = "v5.3.2"
+# Cross-compiler for C FFI crates (secp256k1-sys) — cc crate needs this
+CC_xtensa_esp32s3_espidf = "xtensa-esp32s3-elf-gcc"

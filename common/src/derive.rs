@@ -2,9 +2,11 @@
 //
 // nsec-tree child key derivation via HMAC-SHA256.
 // Matches heartwood-core byte-for-byte.
+//
+// Two backends: k256 (default, for host/tests) and secp256k1 (C FFI, for
+// Xtensa firmware where k256's field arithmetic hangs).
 
 use hmac::{Hmac, Mac};
-use k256::schnorr::SigningKey;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
@@ -13,15 +15,48 @@ use crate::types::{Identity, TreeRoot, DOMAIN_PREFIX};
 
 type HmacSha256 = Hmac<Sha256>;
 
+// ---------------------------------------------------------------------------
+// Backend: secret → (valid secp256k1 scalar?, x-only pubkey bytes)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "k256-backend")]
+mod backend {
+    use k256::schnorr::SigningKey;
+
+    /// Validate a 32-byte secret as a secp256k1 scalar and return the x-only
+    /// public key bytes, or None if the scalar is invalid (zero / ≥ order).
+    pub fn pubkey_from_secret(secret: &[u8; 32]) -> Result<[u8; 32], &'static str> {
+        let sk = SigningKey::from_bytes(secret).map_err(|_| "invalid secret key")?;
+        Ok(sk.verifying_key().to_bytes().into())
+    }
+}
+
+#[cfg(feature = "secp256k1-backend")]
+mod backend {
+    use secp256k1::{Keypair, Secp256k1};
+
+    pub fn pubkey_from_secret(secret: &[u8; 32]) -> Result<[u8; 32], &'static str> {
+        let secp = Secp256k1::signing_only();
+        let keypair = Keypair::from_seckey_slice(&secp, secret)
+            .map_err(|_| "invalid secret key")?;
+        let (xonly, _) = keypair.x_only_public_key();
+        Ok(xonly.serialize())
+    }
+}
+
+#[cfg(not(any(feature = "k256-backend", feature = "secp256k1-backend")))]
+compile_error!("heartwood-common requires either `k256-backend` or `secp256k1-backend` feature");
+
+// ---------------------------------------------------------------------------
+// Public API (backend-agnostic)
+// ---------------------------------------------------------------------------
+
 /// Create a TreeRoot directly from a 32-byte secret (no HMAC intermediate).
 ///
-/// The secret goes straight to SigningKey — this is the raw-secret path,
-/// NOT the nsec import path (which applies an extra HMAC).
+/// The secret goes straight to the signing backend — this is the raw-secret
+/// path, NOT the nsec import path (which applies an extra HMAC).
 pub fn create_tree_root(secret: &[u8; 32]) -> Result<TreeRoot, &'static str> {
-    let signing_key =
-        SigningKey::from_bytes(secret).map_err(|_| "invalid secret key")?;
-    let verifying_key = signing_key.verifying_key();
-    let pubkey_bytes: [u8; 32] = verifying_key.to_bytes().into();
+    let pubkey_bytes = backend::pubkey_from_secret(secret)?;
     let npub = encode_npub(&pubkey_bytes);
     Ok(TreeRoot::new(zeroize::Zeroizing::new(*secret), npub))
 }
@@ -57,11 +92,8 @@ pub fn derive(root: &TreeRoot, purpose: &str, index: u32) -> Result<Identity, &'
         let result = mac.finalize();
         let mut derived: [u8; 32] = result.into_bytes().into();
 
-        match SigningKey::from_bytes(&derived) {
-            Ok(signing_key) => {
-                let verifying_key = signing_key.verifying_key();
-                let public_key: [u8; 32] = verifying_key.to_bytes().into();
-
+        match backend::pubkey_from_secret(&derived) {
+            Ok(public_key) => {
                 return Ok(Identity {
                     npub: encode_npub(&public_key),
                     private_key: zeroize::Zeroizing::new(derived),

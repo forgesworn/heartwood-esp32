@@ -262,8 +262,7 @@ fn main() {
                 } else {
                     // Use the first loaded master for plaintext requests.
                     let master = &loaded_masters[0];
-                    if let Some(response_json) = nip46_handler::handle_request(
-                        &mut usb,
+                    let response_json = nip46_handler::handle_request(
                         &frame,
                         &master.secret,
                         &master.label,
@@ -275,14 +274,12 @@ fn main() {
                         &button_pin,
                         &mut policy_engine,
                         &mut identity_caches,
-                    ) {
-                        protocol::write_frame(
-                            &mut usb,
-                            FRAME_TYPE_NIP46_RESPONSE,
-                            response_json.as_bytes(),
-                        );
-                    }
-                    // None means sign_event already wrote its own frame.
+                    );
+                    protocol::write_frame(
+                        &mut usb,
+                        FRAME_TYPE_NIP46_RESPONSE,
+                        response_json.as_bytes(),
+                    );
                     oled::show_boot(&mut display, loaded_masters.len() as u8);
                 }
             }

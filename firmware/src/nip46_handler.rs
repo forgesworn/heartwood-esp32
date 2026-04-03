@@ -13,16 +13,14 @@
 //   heartwood_create_proof / heartwood_verify_proof              — stubs (not yet implemented)
 //
 // Return convention:
-//   Some(json) — caller writes the response frame (plaintext 0x03 or encrypted 0x11)
-//   None       — handler already wrote the response (sign_event only, which has the
-//                interactive button loop and must write before returning to avoid
-//                long silent gaps on the USB line)
+//   Every method returns a JSON response string. The caller is responsible for
+//   framing and sending it — plaintext 0x03 or encrypted 0x11 as appropriate.
+//   sign_event now runs the interactive approval loop and returns a JSON string
+//   for all outcomes (approved, denied, timed out) rather than writing directly.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use esp_idf_hal::gpio::{Input, PinDriver};
-use esp_idf_hal::usb_serial::UsbSerialDriver;
 
 use heartwood_common::derive;
 use heartwood_common::frame::Frame;
@@ -32,16 +30,13 @@ use heartwood_common::nip44;
 use heartwood_common::nip46::{
     self, HeartwoodContext, SignedEvent, UnsignedEvent,
 };
-use heartwood_common::types::{
-    FRAME_TYPE_NACK, FRAME_TYPE_NIP46_RESPONSE, MasterMode,
-};
+use heartwood_common::types::MasterMode;
 use secp256k1::{Secp256k1, SignOnly};
 use zeroize::Zeroize;
 
-use crate::button::ButtonResult;
+use crate::approval::ApprovalResult;
 use crate::oled::Display;
 use crate::policy::PolicyEngine;
-use crate::protocol::write_frame;
 
 /// Timeout in seconds shown on the OLED countdown bar.
 const APPROVAL_TIMEOUT_SECS: u64 = 30;
@@ -52,13 +47,11 @@ const APPROVAL_TIMEOUT_SECS: u64 = 30;
 
 /// Dispatch a NIP-46 request frame.
 ///
-/// Returns `Some(json)` for all methods that can produce a response without
-/// blocking — the caller is responsible for framing and sending the JSON.
-///
-/// Returns `None` for `sign_event`, which runs the interactive button loop
-/// and writes its own response frame directly to USB before returning.
+/// Returns a JSON response string for all methods. The caller is responsible
+/// for framing and sending it — as a plaintext 0x03 frame or encrypted 0x11
+/// frame depending on the transport. sign_event runs the interactive approval
+/// loop and returns a JSON string for all outcomes (approved, denied, timed out).
 pub fn handle_request(
-    usb: &mut UsbSerialDriver<'_>,
     frame: &Frame,
     master_secret: &[u8; 32],
     master_label: &str,
@@ -70,13 +63,13 @@ pub fn handle_request(
     button_pin: &PinDriver<'_, Input>,
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
-) -> Option<String> {
+) -> String {
     let request = match nip46::parse_request(&frame.payload) {
         Ok(r) => r,
         Err(e) => {
             log::warn!("Failed to parse NIP-46 request: {e}");
-            write_frame(usb, FRAME_TYPE_NACK, &[]);
-            return None;
+            return nip46::build_error_response("unknown", -3, "invalid JSON-RPC request")
+                .unwrap_or_default();
         }
     };
 
@@ -92,12 +85,10 @@ pub fn handle_request(
 
     match request.method.as_str() {
         "sign_event" => {
-            // sign_event has an interactive button loop and writes its own frame.
-            handle_sign_event(usb, master_secret, secp, display, button_pin, &request);
-            None
+            handle_sign_event(master_secret, secp, display, button_pin, &request)
         }
 
-        "get_public_key" => Some(handle_get_public_key(master_secret, secp, &request)),
+        "get_public_key" => handle_get_public_key(master_secret, secp, &request),
 
         "connect" => {
             // params[0] is the client pubkey; params[1] is the optional secret
@@ -110,38 +101,36 @@ pub fn handle_request(
                 None => false,
             };
             if authorised {
-                Some(nip46::build_connect_response_with_secret(&request.id, &stored_secret_hex).unwrap_or_default())
+                nip46::build_connect_response_with_secret(&request.id, &stored_secret_hex).unwrap_or_default()
             } else {
                 log::warn!("connect rejected — missing or incorrect secret (master_slot={})", master_slot);
-                Some(build_error_json(&request.id, -1, "unauthorised"))
+                build_error_json(&request.id, -1, "unauthorised")
             }
         }
 
-        "ping" => Some(
-            nip46::build_ping_response(&request.id).unwrap_or_default(),
-        ),
+        "ping" => nip46::build_ping_response(&request.id).unwrap_or_default(),
 
-        "nip44_encrypt" => Some(handle_nip44_encrypt(master_secret, &request)),
+        "nip44_encrypt" => handle_nip44_encrypt(master_secret, &request),
 
-        "nip44_decrypt" => Some(handle_nip44_decrypt(master_secret, &request)),
+        "nip44_decrypt" => handle_nip44_decrypt(master_secret, &request),
 
-        "nip04_encrypt" => Some(handle_nip04_encrypt(master_secret, &request)),
+        "nip04_encrypt" => handle_nip04_encrypt(master_secret, &request),
 
-        "nip04_decrypt" => Some(handle_nip04_decrypt(master_secret, &request)),
+        "nip04_decrypt" => handle_nip04_decrypt(master_secret, &request),
 
         "heartwood_derive" => {
             if !master_mode.is_tree() {
-                return Some(build_error_json(&request.id, -5, "not available in bunker mode"));
+                return build_error_json(&request.id, -5, "not available in bunker mode");
             }
             let purpose = match request.params.first().and_then(|v| v.as_str()) {
                 Some(p) => p,
-                None => return Some(build_error_json(&request.id, -3, "requires [purpose, index?]")),
+                None => return build_error_json(&request.id, -3, "requires [purpose, index?]"),
             };
             let index = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
             let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
                 Some(c) => c,
-                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
             };
 
             match cache.derive_and_cache(master_secret, purpose, index, None) {
@@ -152,26 +141,26 @@ pub fn handle_request(
                         "purpose": id.purpose,
                         "index": id.index,
                     });
-                    Some(nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default())
+                    nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
                 }
-                Err(e) => Some(build_error_json(&request.id, -4, e)),
+                Err(e) => build_error_json(&request.id, -4, e),
             }
         }
 
         "heartwood_derive_persona" => {
             if !master_mode.is_tree() {
-                return Some(build_error_json(&request.id, -5, "not available in bunker mode"));
+                return build_error_json(&request.id, -5, "not available in bunker mode");
             }
             let name = match request.params.first().and_then(|v| v.as_str()) {
                 Some(n) => n,
-                None => return Some(build_error_json(&request.id, -3, "requires [name, index?]")),
+                None => return build_error_json(&request.id, -3, "requires [name, index?]"),
             };
             let index = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let purpose = format!("persona/{name}");
 
             let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
                 Some(c) => c,
-                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
             };
 
             match cache.derive_and_cache(master_secret, &purpose, index, Some(name.to_string())) {
@@ -183,19 +172,19 @@ pub fn handle_request(
                         "index": id.index,
                         "personaName": name,
                     });
-                    Some(nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default())
+                    nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
                 }
-                Err(e) => Some(build_error_json(&request.id, -4, e)),
+                Err(e) => build_error_json(&request.id, -4, e),
             }
         }
 
         "heartwood_switch" => {
             if !master_mode.is_tree() {
-                return Some(build_error_json(&request.id, -5, "not available in bunker mode"));
+                return build_error_json(&request.id, -5, "not available in bunker mode");
             }
             let target = match request.params.first().and_then(|v| v.as_str()) {
                 Some(t) => t,
-                None => return Some(build_error_json(&request.id, -3, "requires [target, index_hint?]")),
+                None => return build_error_json(&request.id, -3, "requires [target, index_hint?]"),
             };
 
             // "master" resets to the master identity — return its npub.
@@ -210,15 +199,15 @@ pub fn handle_request(
                 return match pubkey_result {
                     Ok(npub) => {
                         let result = serde_json::json!({ "npub": npub, "purpose": "master", "index": 0 });
-                        Some(nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default())
+                        nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
                     }
-                    Err(e) => Some(build_error_json(&request.id, -4, &e)),
+                    Err(e) => build_error_json(&request.id, -4, &e),
                 };
             }
 
             let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
                 Some(c) => c,
-                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
             };
 
             // Search by npub, then persona name, then purpose+index.
@@ -239,60 +228,60 @@ pub fn handle_request(
                     if let Some(name) = &id.persona_name {
                         result["personaName"] = serde_json::json!(name);
                     }
-                    Some(nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default())
+                    nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
                 }
-                None => Some(build_error_json(&request.id, -4, "identity not found in cache")),
+                None => build_error_json(&request.id, -4, "identity not found in cache"),
             }
         }
 
         "heartwood_list_identities" => {
             if !master_mode.is_tree() {
                 // Bunker mode — no derived identities, return empty array.
-                return Some(nip46::build_result_response(&request.id, "[]").unwrap_or_default());
+                return nip46::build_result_response(&request.id, "[]").unwrap_or_default();
             }
 
             let cache = match identity_caches.iter().find(|c| c.master_slot == master_slot) {
                 Some(c) => c,
-                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
             };
 
-            Some(nip46::build_result_response(&request.id, &cache.list_json()).unwrap_or_default())
+            nip46::build_result_response(&request.id, &cache.list_json()).unwrap_or_default()
         }
 
         "heartwood_recover" => {
             if !master_mode.is_tree() {
-                return Some(build_error_json(&request.id, -5, "not available in bunker mode"));
+                return build_error_json(&request.id, -5, "not available in bunker mode");
             }
             let lookahead = request.params.first().and_then(|v| v.as_u64()).unwrap_or(20) as u32;
 
             let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
                 Some(c) => c,
-                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
             };
 
             match cache.recover(master_secret, lookahead) {
                 Ok(count) => {
                     let identities_json = cache.list_json();
                     let result = format!(r#"{{"recovered":{count},"identities":{identities_json}}}"#);
-                    Some(nip46::build_result_response(&request.id, &result).unwrap_or_default())
+                    nip46::build_result_response(&request.id, &result).unwrap_or_default()
                 }
-                Err(e) => Some(build_error_json(&request.id, -4, e)),
+                Err(e) => build_error_json(&request.id, -4, e),
             }
         }
 
         "heartwood_create_proof" => {
             // Proof generation not yet implemented.
-            Some(build_error_json(&request.id, -6, "not yet implemented"))
+            build_error_json(&request.id, -6, "not yet implemented")
         }
 
         "heartwood_verify_proof" => {
             // Proof verification not yet implemented.
-            Some(build_error_json(&request.id, -6, "not yet implemented"))
+            build_error_json(&request.id, -6, "not yet implemented")
         }
 
         other => {
             log::warn!("Unknown NIP-46 method: {other}");
-            Some(build_error_json(&request.id, -2, "unknown method"))
+            build_error_json(&request.id, -2, "unknown method")
         }
     }
 }
@@ -302,19 +291,17 @@ pub fn handle_request(
 // ---------------------------------------------------------------------------
 
 fn handle_sign_event(
-    usb: &mut UsbSerialDriver<'_>,
     master_secret: &[u8; 32],
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
     request: &nip46::Nip46Request,
-) {
+) -> String {
     let event = match nip46::parse_unsigned_event(&request.params) {
         Ok(e) => e,
         Err(e) => {
             log::warn!("sign_event: bad event format: {e}");
-            send_error(usb, &request.id, -3, "bad event format");
-            return;
+            return build_error_json(&request.id, -3, "bad event format");
         }
     };
 
@@ -327,84 +314,53 @@ fn handle_sign_event(
         .unwrap_or("master");
 
     // Show the signing request on the OLED and wait for button approval.
-    // The countdown bar updates every second; button press feedback is shown
-    // as "Hold 2s..." while the button is held down.
-    let start = std::time::Instant::now();
-    let deadline = start + Duration::from_secs(APPROVAL_TIMEOUT_SECS);
-    let mut last_remaining = APPROVAL_TIMEOUT_SECS as u32 + 1;
-    let mut pressed = false;
-    let mut press_start = std::time::Instant::now();
+    // The countdown bar updates every second; the approval module handles
+    // "Hold 2s..." feedback while the button is held down.
+    let result = crate::approval::run_approval_loop(
+        display,
+        button_pin,
+        APPROVAL_TIMEOUT_SECS,
+        |d, remaining| {
+            crate::oled::show_sign_request(d, purpose, kind, &content_preview, remaining);
+        },
+    );
 
-    let button_result = loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            break None;
-        }
-
-        let remaining = (deadline - now).as_secs() as u32;
-
-        if remaining != last_remaining && !pressed {
-            crate::oled::show_sign_request(display, purpose, kind, &content_preview, remaining);
-            last_remaining = remaining;
-        }
-
-        let low = button_pin.is_low();
-        if low && !pressed {
-            pressed = true;
-            press_start = now;
-            crate::oled::show_error(display, "Hold 2s...");
-        }
-        if low && pressed {
-            let held = now - press_start;
-            if held >= Duration::from_millis(2000) {
-                crate::oled::show_error(display, "Approved!");
-                esp_idf_hal::delay::FreeRtos::delay_ms(300);
-                break Some(ButtonResult::Approve);
-            }
-        }
-        if !low && pressed {
-            crate::oled::show_error(display, "Denied (short)");
-            esp_idf_hal::delay::FreeRtos::delay_ms(500);
-            break Some(ButtonResult::Deny);
-        }
-        esp_idf_hal::delay::FreeRtos::delay_ms(20);
-    };
-
-    match button_result {
-        Some(ButtonResult::Approve) => {
+    match result {
+        ApprovalResult::Approved => {
             log::info!("sign_event: approved");
             crate::oled::show_error(display, "Signing...");
             match do_sign(&event, master_secret, secp, request.heartwood.as_ref()) {
                 Ok(signed) => {
                     match nip46::build_sign_response(&request.id, &signed) {
                         Ok(json) => {
-                            write_frame(usb, FRAME_TYPE_NIP46_RESPONSE, json.as_bytes());
+                            crate::oled::show_result(display, "Signed!");
+                            json
                         }
                         Err(e) => {
                             log::error!("Failed to build sign response: {e}");
-                            send_error(usb, &request.id, -4, "signing failed");
+                            crate::oled::show_result(display, "Sign error");
+                            build_error_json(&request.id, -4, "signing failed")
                         }
                     }
-                    crate::oled::show_result(display, "Signed!");
                 }
                 Err(ref e) => {
                     log::error!("Signing failed: {e}");
                     crate::oled::show_error(display, &format!("ERR:{}", &e[..e.len().min(18)]));
                     esp_idf_hal::delay::FreeRtos::delay_ms(3000);
-                    send_error(usb, &request.id, -4, "signing/derivation failure");
                     crate::oled::show_result(display, "Sign error");
+                    build_error_json(&request.id, -4, "signing/derivation failure")
                 }
             }
         }
-        Some(ButtonResult::Deny) => {
+        ApprovalResult::Denied => {
             log::info!("sign_event: denied by user");
-            send_error(usb, &request.id, -1, "user denied");
             crate::oled::show_result(display, "Denied");
+            build_error_json(&request.id, -1, "user denied")
         }
-        None => {
+        ApprovalResult::TimedOut => {
             log::info!("sign_event: timed out");
-            send_error(usb, &request.id, -1, "timeout");
             crate::oled::show_result(display, "Timed out");
+            build_error_json(&request.id, -1, "timeout")
         }
     }
 }
@@ -803,16 +759,3 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Write a NIP-46 error response directly to USB.
-/// Used only inside `handle_sign_event`, which owns the USB write path.
-fn send_error(usb: &mut UsbSerialDriver<'_>, request_id: &str, code: i32, message: &str) {
-    match nip46::build_error_response(request_id, code, message) {
-        Ok(json) => {
-            write_frame(usb, FRAME_TYPE_NIP46_RESPONSE, json.as_bytes());
-        }
-        Err(e) => {
-            log::error!("Failed to serialise error response: {e}");
-            write_frame(usb, FRAME_TYPE_NACK, &[]);
-        }
-    }
-}

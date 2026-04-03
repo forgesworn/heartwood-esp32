@@ -3,11 +3,9 @@
 // On-device NIP-44 transport encryption/decryption.
 //
 // Decrypts inbound 0x10 frames, routes to the NIP-46 handler, then
-// re-encrypts the response as a 0x11 frame.
-//
-// sign_event is the exception: it has an interactive button loop and
-// writes its own plaintext 0x03 frame before returning None — the
-// bridge handles both 0x03 and 0x11 frames.
+// re-encrypts the response as a 0x11 frame. Every method — including
+// sign_event — now returns a JSON string, so the response is always
+// encrypted before leaving the device.
 
 use esp_idf_hal::gpio::{Input, PinDriver};
 use esp_idf_hal::usb_serial::UsbSerialDriver;
@@ -31,11 +29,8 @@ use crate::protocol;
 ///
 /// Decrypts the NIP-44 ciphertext using the target master's secret,
 /// dispatches to the NIP-46 handler, then re-encrypts the response
-/// and sends it as a 0x11 frame.
-///
-/// If the handler returns `None` (sign_event — interactive button loop),
-/// the handler already wrote a plaintext 0x03 frame directly to USB;
-/// no further action is taken here.
+/// (including sign_event outcomes) and sends it as a 0x11 frame.
+/// The Pi never sees plaintext — all responses are encrypted.
 pub fn handle_encrypted_request(
     usb: &mut UsbSerialDriver<'_>,
     frame: &Frame,
@@ -104,11 +99,8 @@ pub fn handle_encrypted_request(
         payload: plaintext_json.as_bytes().to_vec(),
     };
 
-    // Dispatch to the handler.
-    // Some(json) — re-encrypt and send as 0x11.
-    // None        — sign_event already wrote a plaintext 0x03 frame.
-    if let Some(response_json) = crate::nip46_handler::handle_request(
-        usb,
+    // Dispatch to the handler — always returns a JSON response string.
+    let response_json = crate::nip46_handler::handle_request(
         &inner_frame,
         &master.secret,
         &master.label,
@@ -120,21 +112,22 @@ pub fn handle_encrypted_request(
         button_pin,
         policy_engine,
         identity_caches,
-    ) {
-        let nonce = random_nonce_24();
-        match nip44::encrypt(&conversation_key, &response_json, &nonce) {
-            Ok(ciphertext_b64) => {
-                // Response payload: [client_pubkey_32][ciphertext_b64...]
-                let mut response_payload =
-                    Vec::with_capacity(32 + ciphertext_b64.len());
-                response_payload.extend_from_slice(&client_pubkey);
-                response_payload.extend_from_slice(ciphertext_b64.as_bytes());
-                protocol::write_frame(usb, FRAME_TYPE_ENCRYPTED_RESPONSE, &response_payload);
-            }
-            Err(e) => {
-                log::error!("NIP-44 encrypt response failed: {e}");
-                protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-            }
+    );
+
+    // Re-encrypt the response and send as a 0x11 frame.
+    let nonce = random_nonce_24();
+    match nip44::encrypt(&conversation_key, &response_json, &nonce) {
+        Ok(ciphertext_b64) => {
+            // Response payload: [client_pubkey_32][ciphertext_b64...]
+            let mut response_payload =
+                Vec::with_capacity(32 + ciphertext_b64.len());
+            response_payload.extend_from_slice(&client_pubkey);
+            response_payload.extend_from_slice(ciphertext_b64.as_bytes());
+            protocol::write_frame(usb, FRAME_TYPE_ENCRYPTED_RESPONSE, &response_payload);
+        }
+        Err(e) => {
+            log::error!("NIP-44 encrypt response failed: {e}");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
         }
     }
 }

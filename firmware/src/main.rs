@@ -10,6 +10,7 @@
 //   5. Enter frame dispatch loop — route by frame type indefinitely
 
 mod button;
+mod masters;
 mod nip46_handler;
 mod nvs;
 mod oled;

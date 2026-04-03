@@ -1,18 +1,42 @@
 # Heartwood ESP32
 
-A hardware signing module (HSM) for Nostr, built on the **Heltec WiFi LoRa 32 V4** (ESP32-S3R2). Holds an nsec-tree master secret, derives child identities, and signs on request — private keys never leave the chip.
+A hardware signing device for Nostr, built on the **Heltec WiFi LoRa 32 V4** (ESP32-S3R2). Holds nsec-tree key material, derives child identities, and signs on request — private keys never leave the chip. OLED shows what you're signing, physical button to approve.
 
-Designed to be **USB-attached to a Raspberry Pi** running [heartwood-device](https://github.com/forgesworn/heartwood). The Pi handles all networking (Tor, NIP-46 WebSocket, relay connections). The ESP32 handles all cryptography (key storage, derivation, signing). Communication between them is serial over USB — no wireless attack surface.
+Two deployment modes from the same codebase:
+
+### Home HSM — USB-attached to a Raspberry Pi
 
 ```
-Internet ← Tor ← Pi (networking) ← USB serial → ESP32 (keys + signing)
+Internet ← Tor ← Pi (networking) ← USB serial → ESP32 (master secret + signing)
                                                     ├── OLED (show request)
                                                     └── Button (approve/deny)
 ```
 
-**Security model:** even if the Pi is fully compromised, an attacker cannot extract keys (they live on the ESP32) or sign without a physical button press on the device. This is the same architecture as Ledger/Trezor but for Nostr identities.
+Holds the **master secret** (mnemonic root). All radios disabled. The Pi running [heartwood-device](https://github.com/forgesworn/heartwood) handles networking (Tor, NIP-46, relays). The ESP32 handles cryptography. Even if the Pi is fully compromised, an attacker cannot extract keys or sign without physical button access. Same architecture as Ledger/Trezor but for Nostr.
 
-All wireless radios (WiFi, BLE, LoRa) are **disabled in firmware**. The board has them, but a signing device should be deaf.
+### Portable signer — battery-powered, BLE to phone
+
+```
+Phone app ← BLE GATT → ESP32 (child key + signing)
+                          ├── OLED (show request)
+                          └── Button (approve/deny)
+```
+
+Holds a **child key** derived by the home HSM (`purpose="device/mobile"`). Only BLE enabled — short range, requires physical proximity. If lost or compromised, burn that branch on the HSM and derive a new one at the next index. The master secret and all other branches are untouched.
+
+### Key hierarchy
+
+```
+Master secret (home HSM)
+├── persona/social       — public Nostr identity
+├── persona/forgesworn   — project identity
+├── client/bray          — NIP-46 client key
+├── device/mobile-0      — portable signer #0 ← child key lives here
+├── device/mobile-1      — replacement if #0 is compromised
+└── ...
+```
+
+The nsec-tree hierarchy means each device gets its own branch. Compromise of a child never threatens the root or siblings.
 
 ## Hardware
 
@@ -23,11 +47,12 @@ All wireless radios (WiFi, BLE, LoRa) are **disabled in firmware**. The board ha
 | PSRAM | 2MB quad-SPI |
 | Flash | 16MB |
 | OLED | 128x64 SSD1306 (I2C: SDA=GPIO17, SCL=GPIO18, RST=GPIO21, addr 0x3C) |
-| GNSS | L76K (disabled — not used for signing) |
-| LoRa | SX1262 (disabled — attack surface) |
-| WiFi | ESP32-S3 built-in (disabled — attack surface) |
-| BLE | ESP32-S3 built-in (disabled — attack surface) |
-| USB | USB-C (power + serial communication with Pi) |
+| GNSS | L76K (available for portable mode) |
+| LoRa | SX1262 (reserved for future use) |
+| WiFi | ESP32-S3 built-in (disabled in both modes) |
+| BLE | ESP32-S3 built-in (portable mode only) |
+| USB | USB-C (power + serial to Pi in HSM mode) |
+| Battery | JST PH 2.0 connector + charging circuit (portable mode) |
 | Button | PRG button (signing approval) |
 
 ## Setup
@@ -129,7 +154,7 @@ src/
 - [ ] Integration with heartwood-device on the Pi (new serial transport for NIP-46)
 - [ ] Timeout: unsigned requests expire after N seconds
 
-### Phase 4 — Hardening
+### Phase 4 — Hardening (HSM mode)
 
 - [ ] Disable all wireless radios in firmware (WiFi, BLE, LoRa)
 - [ ] Disable JTAG debugging
@@ -138,11 +163,24 @@ src/
 - [ ] Tamper detection (voltage glitch monitoring if feasible)
 - [ ] Zeroize on repeated failed auth attempts
 
-### Not planned (attack surface)
+### Phase 5 — Portable signer
 
-These are deliberately excluded. The board has the hardware, but a signing device should be deaf:
+- [ ] Cargo feature flags: `hsm` (default, USB-only) vs `portable` (BLE, battery)
+- [ ] HSM provisions a child key onto the portable device (`device/mobile-N`)
+- [ ] BLE GATT service: NIP-46 request/response profile
+- [ ] Phone pairs to device over BLE
+- [ ] OLED shows signing request details, button to approve/deny
+- [ ] Battery management: deep sleep between requests, wake on BLE connect
+- [ ] Child key revocation: HSM increments index, re-provisions replacement device
 
-- ~~BLE signing~~ — BLE stack has had CVEs, unnecessary attack surface
-- ~~WiFi signing~~ — full TCP/IP stack is a liability for a key-holding device
-- ~~LoRa signing~~ — any radio reception is a fuzzing target
-- ~~GPS attestations~~ — interesting concept but not worth the attack surface on an HSM
+### Phase 6 — Portable extras (stretch)
+
+- [ ] GPS location stamp on signed events (opt-in, portable mode only)
+- [ ] QR code display of npub on OLED
+- [ ] LoRa relay: phone has no signal, ESP32 reaches a home relay node via SX1262
+- [ ] Multi-identity: carry several child keys, select on OLED before signing
+
+### Deliberately excluded
+
+- **WiFi signing** — full TCP/IP stack is a liability on any key-holding device. WiFi is never enabled in either mode.
+- **Master secret on portable device** — only child keys leave the home HSM. If the portable device is lost, the damage is one branch.

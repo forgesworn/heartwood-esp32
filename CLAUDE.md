@@ -1,13 +1,28 @@
 # Heartwood ESP32
 
-Hardware signing module (HSM) for Nostr on a Heltec WiFi LoRa 32 V4 (ESP32-S3). USB-attached to a Raspberry Pi running heartwood-device. The Pi handles networking, the ESP32 handles cryptography. Private keys never leave the chip.
+Hardware signing device for Nostr on a Heltec WiFi LoRa 32 V4 (ESP32-S3). Two modes from the same codebase:
+
+- **HSM mode** (default) — USB-attached to Pi, holds master secret, all radios disabled
+- **Portable mode** — battery-powered, holds child key, BLE enabled for phone signing
 
 ## Security model
 
-- **All wireless radios disabled** — WiFi, BLE, LoRa are attack surfaces. The device communicates only over USB serial.
 - **Physical approval required** — OLED shows the request, button press to sign. No silent signing.
-- **Pi compromise is survivable** — keys live on the ESP32, not in Pi memory. An attacker with root on the Pi still cannot extract keys or sign without physical button access.
+- **HSM mode:** all radios disabled, USB serial only. Pi compromise is survivable — keys live on the ESP32.
+- **Portable mode:** only BLE enabled (short range). Holds a child key, never the master. If compromised, burn that branch and re-provision.
+- **WiFi is never enabled** in either mode — TCP/IP stack is too large an attack surface for a key-holding device.
 - **JTAG disabled** in production firmware to prevent debug-port key extraction.
+
+## Feature flags
+
+The two modes will be cargo features (not yet implemented):
+
+```toml
+[features]
+default = ["hsm"]
+hsm = []        # USB serial, all radios off, master secret
+portable = []   # BLE GATT, battery management, child key only
+```
 
 ## Build & flash
 

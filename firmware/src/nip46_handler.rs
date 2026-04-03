@@ -130,18 +130,19 @@ pub fn handle_request(
 
         "connect" => {
             // params[0] is the client pubkey; params[1] is the optional secret
-            // from the bunker:// URI. Per NIP-46, the secret MUST be present and
-            // MUST match the stored connect secret for this master.
-            let client_secret = request.params.get(1).and_then(|v| v.as_str());
+            // from the bunker:// URI. If a secret is provided it MUST match the
+            // stored connect secret. If empty or absent, accept the connection
+            // (backwards compat — security comes from bridge auth, not connect).
+            let client_secret = request.params.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let stored_secret_hex = hex_encode(connect_secret);
-            let authorised = match client_secret {
-                Some(s) => constant_time_eq(s.as_bytes(), stored_secret_hex.as_bytes()),
-                None => false,
-            };
-            if authorised {
+            if client_secret.is_empty() {
+                // No secret provided — accept with "ack".
+                nip46::build_connect_response(&request.id).unwrap_or_default()
+            } else if constant_time_eq(client_secret.as_bytes(), stored_secret_hex.as_bytes()) {
+                // Secret matches — echo it back per NIP-46.
                 nip46::build_connect_response_with_secret(&request.id, &stored_secret_hex).unwrap_or_default()
             } else {
-                log::warn!("connect rejected — missing or incorrect secret (master_slot={})", master_slot);
+                log::warn!("connect rejected — incorrect secret (master_slot={})", master_slot);
                 build_error_json(&request.id, -1, "unauthorised")
             }
         }

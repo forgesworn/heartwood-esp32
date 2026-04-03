@@ -1,8 +1,18 @@
 # Heartwood ESP32
 
-nsec-tree signing token spike for the **Heltec WiFi LoRa 32 V4** (ESP32-S3R2, 2MB PSRAM, 16MB flash, built-in SSD1306 OLED, L76K GNSS).
+A hardware signing module (HSM) for Nostr, built on the **Heltec WiFi LoRa 32 V4** (ESP32-S3R2). Holds an nsec-tree master secret, derives child identities, and signs on request — private keys never leave the chip.
 
-Derives a child identity from a hardcoded test seed using HMAC-SHA256 (the nsec-tree protocol) and displays the npub on the built-in OLED. The derived npub is asserted against heartwood-core output at runtime — if the protocol doesn't match, it panics before touching the display.
+Designed to be **USB-attached to a Raspberry Pi** running [heartwood-device](https://github.com/forgesworn/heartwood). The Pi handles all networking (Tor, NIP-46 WebSocket, relay connections). The ESP32 handles all cryptography (key storage, derivation, signing). Communication between them is serial over USB — no wireless attack surface.
+
+```
+Internet ← Tor ← Pi (networking) ← USB serial → ESP32 (keys + signing)
+                                                    ├── OLED (show request)
+                                                    └── Button (approve/deny)
+```
+
+**Security model:** even if the Pi is fully compromised, an attacker cannot extract keys (they live on the ESP32) or sign without a physical button press on the device. This is the same architecture as Ledger/Trezor but for Nostr identities.
+
+All wireless radios (WiFi, BLE, LoRa) are **disabled in firmware**. The board has them, but a signing device should be deaf.
 
 ## Hardware
 
@@ -13,8 +23,12 @@ Derives a child identity from a hardcoded test seed using HMAC-SHA256 (the nsec-
 | PSRAM | 2MB quad-SPI |
 | Flash | 16MB |
 | OLED | 128x64 SSD1306 (I2C: SDA=GPIO17, SCL=GPIO18, RST=GPIO21, addr 0x3C) |
-| GNSS | L76K (not used in this spike) |
-| LoRa | SX1262 (not used in this spike) |
+| GNSS | L76K (disabled — not used for signing) |
+| LoRa | SX1262 (disabled — attack surface) |
+| WiFi | ESP32-S3 built-in (disabled — attack surface) |
+| BLE | ESP32-S3 built-in (disabled — attack surface) |
+| USB | USB-C (power + serial communication with Pi) |
+| Button | PRG button (signing approval) |
 
 ## Setup
 
@@ -89,10 +103,46 @@ src/
   types.rs              TreeRoot, Identity structs
 ```
 
-## Stretch goals
+## Roadmap
 
+### Phase 1 — Prove the crypto (current spike)
+
+- [x] nsec-tree HMAC-SHA256 derivation on ESP32-S3
+- [x] bech32 npub encoding
+- [x] Runtime assertion against heartwood-core test vectors
+- [x] Display npub on OLED
 - [ ] Sign a dummy 32-byte hash and display the signature
-- [ ] Accept a signing request over BLE
-- [ ] Show a QR code of the npub on the OLED
-- [ ] LoRa ping (prove the radio works alongside the crypto)
-- [ ] Read GPS coordinates from L76K GNSS module
+
+### Phase 2 — Provisioning
+
+- [ ] CLI tool to derive 32-byte root secret from mnemonic + passphrase (offline PC)
+- [ ] NVS storage for root secret (encrypted flash partition)
+- [ ] First-boot provisioning mode: accept root secret over USB serial
+- [ ] Subsequent boots read from NVS, skip provisioning
+- [ ] Show master npub on OLED after boot
+
+### Phase 3 — USB signing oracle
+
+- [ ] Serial protocol: Pi sends signing requests, ESP32 responds with signatures
+- [ ] OLED shows what you're signing (event kind, content preview, target pubkey)
+- [ ] Physical button to approve/deny each request
+- [ ] Integration with heartwood-device on the Pi (new serial transport for NIP-46)
+- [ ] Timeout: unsigned requests expire after N seconds
+
+### Phase 4 — Hardening
+
+- [ ] Disable all wireless radios in firmware (WiFi, BLE, LoRa)
+- [ ] Disable JTAG debugging
+- [ ] Rate limiting (max signs per minute)
+- [ ] Audit log on OLED (last N signing events)
+- [ ] Tamper detection (voltage glitch monitoring if feasible)
+- [ ] Zeroize on repeated failed auth attempts
+
+### Not planned (attack surface)
+
+These are deliberately excluded. The board has the hardware, but a signing device should be deaf:
+
+- ~~BLE signing~~ — BLE stack has had CVEs, unnecessary attack surface
+- ~~WiFi signing~~ — full TCP/IP stack is a liability for a key-holding device
+- ~~LoRa signing~~ — any radio reception is a fuzzing target
+- ~~GPS attestations~~ — interesting concept but not worth the attack surface on an HSM

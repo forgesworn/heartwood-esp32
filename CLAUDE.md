@@ -1,6 +1,13 @@
 # Heartwood ESP32
 
-ESP32-S3 signing token spike — nsec-tree key derivation on a Heltec WiFi LoRa 32 V4.
+Hardware signing module (HSM) for Nostr on a Heltec WiFi LoRa 32 V4 (ESP32-S3). USB-attached to a Raspberry Pi running heartwood-device. The Pi handles networking, the ESP32 handles cryptography. Private keys never leave the chip.
+
+## Security model
+
+- **All wireless radios disabled** — WiFi, BLE, LoRa are attack surfaces. The device communicates only over USB serial.
+- **Physical approval required** — OLED shows the request, button press to sign. No silent signing.
+- **Pi compromise is survivable** — keys live on the ESP32, not in Pi memory. An attacker with root on the Pi still cannot extract keys or sign without physical button access.
+- **JTAG disabled** in production firmware to prevent debug-port key extraction.
 
 ## Build & flash
 

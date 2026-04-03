@@ -33,6 +33,46 @@ struct Cli {
     mode: String,
 }
 
+/// Decode an nsec1... bech32 string to 32 raw secret bytes.
+fn decode_nsec(nsec: &str) -> Result<[u8; 32], String> {
+    use bech32::primitives::decode::CheckedHrpstring;
+    use bech32::Bech32;
+
+    let parsed = CheckedHrpstring::new::<Bech32>(nsec)
+        .map_err(|e| format!("invalid nsec bech32: {e}"))?;
+
+    let hrp = parsed.hrp();
+    if hrp.as_str() != "nsec" {
+        return Err(format!("expected nsec prefix, got {}", hrp));
+    }
+
+    let data: Vec<u8> = parsed.byte_iter().collect();
+    if data.len() != 32 {
+        return Err(format!("nsec decoded to {} bytes, expected 32", data.len()));
+    }
+
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&data);
+    Ok(secret)
+}
+
+/// Derive an nsec-tree root from a raw nsec via HMAC-SHA256.
+/// Matches heartwood-core's from_nsec() — the nsec bytes are HMACed
+/// with the nsec-tree domain prefix to produce a new root.
+fn nsec_to_tree_root(nsec_bytes: &[u8; 32]) -> Result<[u8; 32], String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(b"nsec-tree\0")
+        .map_err(|_| "HMAC init failed".to_string())?;
+    mac.update(nsec_bytes);
+    let result = mac.finalize();
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&result.into_bytes());
+    Ok(root)
+}
+
 /// Derive 32-byte root secret from a BIP-39 mnemonic + optional passphrase.
 ///
 /// Path: mnemonic → BIP-39 seed (PBKDF2) → BIP-32 at m/44'/1237'/727'/0'/0' → 32 bytes.
@@ -97,21 +137,43 @@ fn build_provision_frame(secret: &[u8; 32], label: &str, mode: &str) -> Vec<u8> 
 fn main() {
     let cli = Cli::parse();
 
-    // Read mnemonic (hidden input)
-    let mnemonic = rpassword::prompt_password("Enter mnemonic: ")
-        .expect("failed to read mnemonic");
+    // Derive the 32-byte secret based on provisioning mode.
+    let mut root_secret = match cli.mode.as_str() {
+        "bunker" => {
+            // Raw nsec — stored as-is, no tree derivation.
+            let nsec = rpassword::prompt_password("Enter nsec (nsec1...): ")
+                .expect("failed to read nsec");
+            let secret = decode_nsec(nsec.trim()).expect("invalid nsec");
+            println!("\nMode: bunker (raw nsec, no tree derivation)");
+            secret
+        }
+        "tree-nsec" => {
+            // Existing nsec → HMAC → tree root.
+            let nsec = rpassword::prompt_password("Enter nsec (nsec1...): ")
+                .expect("failed to read nsec");
+            let nsec_bytes = decode_nsec(nsec.trim()).expect("invalid nsec");
+            let secret = nsec_to_tree_root(&nsec_bytes).expect("tree-nsec derivation failed");
+            println!("\nMode: tree-nsec (nsec → HMAC → tree root)");
+            secret
+        }
+        "tree-mnemonic" | _ => {
+            // BIP-39 mnemonic → BIP-32 derivation → root secret.
+            let mnemonic = rpassword::prompt_password("Enter mnemonic: ")
+                .expect("failed to read mnemonic");
+            let passphrase = rpassword::prompt_password("Enter passphrase (empty for none): ")
+                .expect("failed to read passphrase");
+            let secret = derive_root_secret(&mnemonic, &passphrase)
+                .expect("derivation failed");
+            println!("\nMode: tree-mnemonic (BIP-39 → BIP-32 → tree root)");
+            secret
+        }
+    };
 
-    // Read passphrase (hidden input, optional)
-    let passphrase = rpassword::prompt_password("Enter passphrase (empty for none): ")
-        .expect("failed to read passphrase");
-
-    // Derive root secret
-    let mut root_secret = derive_root_secret(&mnemonic, &passphrase)
-        .expect("derivation failed");
-
-    // Show master npub for confirmation
+    // Show the pubkey for confirmation.
+    // For bunker mode, this is the npub of the raw nsec.
+    // For tree modes, this is the master npub of the tree root.
     let root = create_tree_root(&root_secret).expect("invalid root secret");
-    println!("\nDerived master npub: {}", root.master_npub);
+    println!("Pubkey: {}", root.master_npub);
     root.destroy();
 
     // Confirm

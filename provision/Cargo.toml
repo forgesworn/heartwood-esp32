@@ -10,6 +10,9 @@ bip39 = "2"
 bip32 = "0.5"
 serialport = "4"
 crc32fast = "1"
+bech32 = "0.11"
+hmac = "0.12"
+sha2 = "0.10"
 rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }

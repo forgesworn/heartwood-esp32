@@ -76,6 +76,27 @@ struct Cli {
 
 /// Send a NIP-46 JSON-RPC request to the ESP32 over serial and read the response.
 /// Legacy mode only — forwards plaintext, expects a NIP46_RESPONSE (0x03) frame back.
+/// Read exactly `buf.len()` bytes from the serial port, respecting a deadline.
+fn read_exact_timeout(
+    port: &mut Box<dyn serialport::SerialPort>,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let mut pos = 0;
+    while pos < buf.len() {
+        if std::time::Instant::now() > deadline {
+            return Err("timeout reading from serial".into());
+        }
+        match port.read(&mut buf[pos..]) {
+            Ok(n) if n > 0 => pos += n,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("serial read failed: {e}")),
+        }
+    }
+    Ok(())
+}
+
 fn forward_to_esp32(
     port: &mut Box<dyn serialport::SerialPort>,
     request_json: &str,
@@ -107,9 +128,9 @@ fn authenticate_bridge(
     std::io::Write::flush(port.as_mut())
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
+    // Read response — hunt for magic bytes [0x48, 0x57] since ESP-IDF log
+    // output pollutes the USB-CDC stream alongside frame data.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
-    let mut pos = 0;
 
     loop {
         if std::time::Instant::now() > deadline {
@@ -119,26 +140,40 @@ fn authenticate_bridge(
         let mut byte = [0u8; 1];
         match port.read(&mut byte) {
             Ok(1) => {
-                if pos < buf.len() {
-                    buf[pos] = byte[0];
-                    pos += 1;
+                // Hunt for first magic byte.
+                if byte[0] != 0x48 {
+                    continue;
                 }
-
-                if pos >= FRAME_OVERHEAD {
-                    match frame::parse_frame(&buf[..pos]) {
-                        Ok(f) if f.frame_type == FRAME_TYPE_SESSION_ACK => {
-                            if f.payload.first() == Some(&0x00) {
-                                log::info!("Bridge session authenticated");
-                                return Ok(());
-                            } else {
-                                return Err(format!(
-                                    "bridge auth failed: status 0x{:02x}",
-                                    f.payload.first().unwrap_or(&0xFF)
-                                ));
-                            }
+                // Confirm second magic byte.
+                match port.read(&mut byte) {
+                    Ok(1) if byte[0] == 0x57 => {}
+                    _ => continue,
+                }
+                // Read header: type + length (3 bytes).
+                let mut header = [0u8; 3];
+                read_exact_timeout(port, &mut header, deadline)?;
+                let frame_type = header[0];
+                let length = u16::from_be_bytes([header[1], header[2]]) as usize;
+                // Read payload + CRC.
+                let mut body = vec![0u8; length + 4];
+                read_exact_timeout(port, &mut body, deadline)?;
+                // Reassemble and parse.
+                let mut buf = Vec::with_capacity(5 + length + 4);
+                buf.extend_from_slice(&[0x48, 0x57]);
+                buf.push(frame_type);
+                buf.extend_from_slice(&header[1..3]);
+                buf.extend_from_slice(&body);
+                if let Ok(f) = frame::parse_frame(&buf) {
+                    if f.frame_type == FRAME_TYPE_SESSION_ACK {
+                        if f.payload.first() == Some(&0x00) {
+                            log::info!("Bridge session authenticated");
+                            return Ok(());
+                        } else {
+                            return Err(format!(
+                                "bridge auth failed: status 0x{:02x}",
+                                f.payload.first().unwrap_or(&0xFF)
+                            ));
                         }
-                        Err(frame::FrameError::TooShort) => continue,
-                        _ => continue,
                     }
                 }
             }
@@ -381,6 +416,12 @@ async fn main() -> Result<()> {
     let mut port = port;
     port.write_data_terminal_ready(false).ok();
     port.write_request_to_send(false).ok();
+
+    // Drain any stale bytes in the serial buffer before starting.
+    port.set_timeout(Duration::from_millis(100)).ok();
+    let mut drain = [0u8; 1024];
+    while port.read(&mut drain).unwrap_or(0) > 0 {}
+    port.set_timeout(Duration::from_secs(10)).ok();
 
     log::info!("Serial port {} open", cli.port);
 

@@ -49,18 +49,9 @@ pub struct Nip46Response {
     /// Successful result payload (present when no error).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    /// Error details (present when the request failed).
+    /// Error string (present when the request failed). NIP-46 requires a plain string, not an object.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<Nip46Error>,
-}
-
-/// A structured error within a NIP-46 response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Nip46Error {
-    /// Numeric error code (application-defined).
-    pub code: i32,
-    /// Human-readable error description.
-    pub message: String,
+    pub error: Option<String>,
 }
 
 /// All supported NIP-46 methods (standard + heartwood extensions).
@@ -322,13 +313,11 @@ pub fn build_pubkey_response(request_id: &str, hex_pubkey: &str) -> Result<Strin
 
 /// Build an error response for any failed NIP-46 request.
 pub fn build_error_response(request_id: &str, code: i32, message: &str) -> Result<String, String> {
+    let _ = code; // code is retained in the signature for internal logging but not sent on the wire per NIP-46
     let response = Nip46Response {
         id: request_id.to_string(),
         result: None,
-        error: Some(Nip46Error {
-            code,
-            message: message.to_string(),
-        }),
+        error: Some(message.to_string()),
     };
 
     serde_json::to_string(&response)
@@ -479,8 +468,7 @@ mod tests {
         let json = build_error_response("req99", -32600, "invalid request").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], "req99");
-        assert_eq!(parsed["error"]["code"], -32600);
-        assert_eq!(parsed["error"]["message"], "invalid request");
+        assert_eq!(parsed["error"], "invalid request");
         assert!(parsed["result"].is_null());
     }
 

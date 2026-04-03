@@ -86,10 +86,11 @@ k256's field arithmetic does unaligned memory accesses that crash on Xtensa LX7
 pointer casts. Fixed upstream in k256 0.14.0 (PR #1135), but 0.14.0 stable is
 not yet released.
 
-**Current workaround:** `create_tree_root` runs in a dedicated thread with a
-32KB aligned stack and `#[repr(align(16))]` input buffer (see `firmware/src/main.rs`).
-The fresh thread stack sidesteps the main task's heap/stack layout that triggers
-the misalignment.
+**Current workaround (verified on hardware):** All k256 operations run in a
+dedicated thread with 64KB stack, a 4KB heap bump (`vec![0u8; 4096]` +
+`black_box` + `drop`) at the start of the closure, and `#[repr(align(32))]`
+input buffers. All three elements are required — removing any one causes a
+hang or crash. See `firmware/src/main.rs` and `firmware/src/nip46_handler.rs`.
 
 **When to remove:** upgrade to k256 ≥0.14.0 stable and move derivation back to
 the main thread. Run `cargo tree -f "{p} {f}" | grep k256` to verify

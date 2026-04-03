@@ -26,9 +26,9 @@ portable = []   # BLE GATT, battery management, child key only
 
 ## Current state
 
-Phase 3 (signing oracle) complete and **verified end-to-end on hardware** (2026-04-03). Five crates: `common/` (shared crypto + frame protocol + NIP-46 types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness), `bridge/` (Pi-side relay bridge). The ESP32 is a NIP-46 bunker — receives signing requests over serial, shows what's being signed on OLED, requires physical button approval (long hold to approve, short press to deny). Firmware uses libsecp256k1 (C FFI) for all signing — k256 replaced due to Xtensa alignment hangs. Schnorr signing takes ~4 seconds on the ESP32-S3 at 160MHz.
+Phase 4 (full NIP-46 HSM) infrastructure complete (2026-04-03). Five crates: `common/` (shared crypto + frame protocol + NIP-46 types + NIP-44/NIP-04 encryption + policy types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness), `bridge/` (Pi-side relay bridge). Multi-master NVS storage (up to 8 masters, three provisioning modes: bunker/tree-mnemonic/tree-nsec). On-device NIP-44 transport encryption — the Pi is zero-trust, only sees ciphertext. Bridge session authentication and client approval policies (RAM-only, pushed from bridge). Full NIP-46 method set stubbed (15 methods: 8 standard + 7 heartwood extensions). Firmware uses libsecp256k1 (C FFI) for all signing.
 
-Next: integrate with heartwood-device (Pi-side bridge daemon). Test child key derivation (heartwood context with purpose/index). Then production hardening (JTAG disable, error recovery, watchdog).
+Next: implement NIP-46 method bodies (nip44_encrypt/decrypt, nip04_encrypt/decrypt, heartwood_derive/switch/list/recover/create_proof/verify_proof). Then refactor nip46_handler to return JSON so transport can encrypt responses (full 0x11 encrypted response flow). Then production hardening (JTAG disable, error recovery, watchdog).
 
 ## Build & flash
 

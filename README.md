@@ -172,18 +172,37 @@ bridge/                     Pi-side relay bridge
 - [x] Physical button: long hold (>=2s) to approve, short press to deny, 30s timeout
 - [x] Per-request child key derivation with Heartwood extension field
 - [x] Test harness CLI (`sign-test/`) for end-to-end validation
-- [ ] Flash and verify end-to-end signing flow on hardware
+- [x] Flash and verify end-to-end signing flow on hardware (2026-04-03)
 - [x] Pi-side relay bridge (`bridge/`) — NIP-46 over Nostr relays ←→ NIP-44 ←→ serial ←→ ESP32
 
-### Phase 4 — Hardening (HSM mode)
+### Phase 4 — Full NIP-46 HSM
+
+- [x] Multi-master NVS storage (up to 8 masters, three modes: bunker/tree-mnemonic/tree-nsec)
+- [x] Extended provisioning protocol (add/remove/list masters with mode + label)
+- [x] NIP-44 v2 on-device (conversation key derivation + XChaCha20 + HMAC-SHA256)
+- [x] NIP-04 legacy on-device (AES-256-CBC)
+- [x] Zero-trust Pi transport (ESP32 decrypts inbound 0x10 frames, Pi only sees ciphertext)
+- [x] Bridge session authentication (shared secret, constant-time comparison)
+- [x] Client approval policies (per-master, per-client, RAM-only, pushed from bridge)
+- [x] Policy engine (auto-approve / OLED-notify / button-required tiers, rate limiting)
+- [x] Full NIP-46 method set (15 methods: 8 standard + 7 heartwood extensions — stubs)
+- [x] Multi-master OLED UX (boot screen, bridge status, master labels, auto-approve flash)
+- [x] Bridge passthrough mode (0x10/0x11 encrypted frames, fallback to legacy)
+- [ ] Implement NIP-46 method bodies (nip44_encrypt/decrypt, nip04_encrypt/decrypt, heartwood_*)
+- [ ] Encrypted response flow (refactor handler to return JSON, transport encrypts 0x11)
+- [ ] `connect` method with per-master connect secret validation
+
+### Phase 5 — Hardening
 
 - [ ] Disable all wireless radios in firmware (WiFi, BLE, LoRa)
-- [ ] Rate limiting (max signs per minute)
+- [ ] Rate limiting enforcement in dispatch loop
 - [ ] Audit log on OLED (last N signing events)
 - [ ] Zeroize on repeated failed auth attempts
 - [ ] `cargo deny` setup — licence checking, security advisories, crate bans
 
-### Phase 5 — Portable signer
+### Phase 7 — Portable signer
+
+### Phase 7 — Portable signer
 
 - [ ] Cargo feature flags: `hsm` (default, USB-only) vs `portable` (BLE, battery)
 - [ ] HSM provisions a child key onto the portable device (`device/mobile-N`)
@@ -193,7 +212,7 @@ bridge/                     Pi-side relay bridge
 - [ ] Battery management: deep sleep between requests, wake on BLE connect
 - [ ] Child key revocation: HSM increments index, re-provisions replacement device
 
-### Phase 6 — Portable extras (stretch)
+### Phase 8 — Portable extras (stretch)
 
 - [ ] GPS location stamp on signed events (opt-in, portable mode only)
 - [ ] QR code display of npub on OLED

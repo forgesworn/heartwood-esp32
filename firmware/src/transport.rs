@@ -44,6 +44,7 @@ pub fn handle_encrypted_request(
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
     policy_engine: &mut PolicyEngine,
+    identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
 ) {
     if frame.payload.len() < 65 {
         log::warn!("Encrypted request too short ({} bytes)", frame.payload.len());
@@ -117,6 +118,7 @@ pub fn handle_encrypted_request(
         display,
         button_pin,
         policy_engine,
+        identity_caches,
     ) {
         let nonce = random_nonce_24();
         match nip44::encrypt(&conversation_key, &response_json, &nonce) {

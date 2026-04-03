@@ -143,9 +143,6 @@ fn main() {
         .map(|m| identity_cache::IdentityCache::new(m.slot))
         .collect();
 
-    // Suppress unused-variable warning until the caches are wired in.
-    let _ = &mut identity_caches;
-
     // --- Boot screen ---
     // Single master: show its npub. Multiple masters: show the count.
     if loaded_masters.len() == 1 {
@@ -201,6 +198,7 @@ fn main() {
                         &mut display,
                         &button_pin,
                         &mut policy_engine,
+                        &mut identity_caches,
                     ) {
                         protocol::write_frame(
                             &mut usb,
@@ -243,6 +241,7 @@ fn main() {
                         &mut display,
                         &button_pin,
                         &mut policy_engine,
+                        &mut identity_caches,
                     );
                 }
             }

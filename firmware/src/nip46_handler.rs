@@ -7,8 +7,10 @@
 //   get_public_key  — returns the hex public key immediately (no approval needed)
 //   connect         — returns ACK to complete the handshake
 //   ping            — returns pong
-//   nip44_encrypt / nip44_decrypt / nip04_encrypt / nip04_decrypt — not yet implemented
-//   heartwood_*     — tree-mode only; not yet implemented
+//   nip44_encrypt / nip44_decrypt / nip04_encrypt / nip04_decrypt — delegated to NIP-44/NIP-04 helpers
+//   heartwood_derive / heartwood_derive_persona / heartwood_switch — tree-mode key derivation
+//   heartwood_list_identities / heartwood_recover               — identity cache management
+//   heartwood_create_proof / heartwood_verify_proof              — stubs (not yet implemented)
 //
 // Return convention:
 //   Some(json) — caller writes the response frame (plaintext 0x03 or encrypted 0x11)
@@ -66,6 +68,7 @@ pub fn handle_request(
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
     policy_engine: &mut PolicyEngine,
+    identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
 ) -> Option<String> {
     let request = match nip46::parse_request(&frame.payload) {
         Ok(r) => r,
@@ -83,7 +86,7 @@ pub fn handle_request(
         master_slot,
     );
 
-    // Suppress unused-variable warnings for params used only in future branches.
+    // Suppress unused-variable warnings for params not yet used in all branches.
     let _ = master_label;
     let _ = policy_engine;
 
@@ -112,18 +115,165 @@ pub fn handle_request(
 
         "nip04_decrypt" => Some(handle_nip04_decrypt(master_secret, &request)),
 
-        "heartwood_derive"
-        | "heartwood_derive_persona"
-        | "heartwood_switch"
-        | "heartwood_list_identities"
-        | "heartwood_recover"
-        | "heartwood_create_proof"
-        | "heartwood_verify_proof" => {
+        "heartwood_derive" => {
             if !master_mode.is_tree() {
-                Some(build_error_json(&request.id, -5, "not available in bunker mode"))
-            } else {
-                Some(build_error_json(&request.id, -6, "not yet implemented"))
+                return Some(build_error_json(&request.id, -5, "not available in bunker mode"));
             }
+            let purpose = match request.params.first().and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return Some(build_error_json(&request.id, -3, "requires [purpose, index?]")),
+            };
+            let index = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+            let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
+                Some(c) => c,
+                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+            };
+
+            match cache.derive_and_cache(master_secret, purpose, index, None) {
+                Ok(idx) => {
+                    let id = &cache.identities[idx];
+                    let result = serde_json::json!({
+                        "npub": id.npub,
+                        "purpose": id.purpose,
+                        "index": id.index,
+                    });
+                    Some(nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default())
+                }
+                Err(e) => Some(build_error_json(&request.id, -4, e)),
+            }
+        }
+
+        "heartwood_derive_persona" => {
+            if !master_mode.is_tree() {
+                return Some(build_error_json(&request.id, -5, "not available in bunker mode"));
+            }
+            let name = match request.params.first().and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return Some(build_error_json(&request.id, -3, "requires [name, index?]")),
+            };
+            let index = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let purpose = format!("persona/{name}");
+
+            let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
+                Some(c) => c,
+                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+            };
+
+            match cache.derive_and_cache(master_secret, &purpose, index, Some(name.to_string())) {
+                Ok(idx) => {
+                    let id = &cache.identities[idx];
+                    let result = serde_json::json!({
+                        "npub": id.npub,
+                        "purpose": id.purpose,
+                        "index": id.index,
+                        "personaName": name,
+                    });
+                    Some(nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default())
+                }
+                Err(e) => Some(build_error_json(&request.id, -4, e)),
+            }
+        }
+
+        "heartwood_switch" => {
+            if !master_mode.is_tree() {
+                return Some(build_error_json(&request.id, -5, "not available in bunker mode"));
+            }
+            let target = match request.params.first().and_then(|v| v.as_str()) {
+                Some(t) => t,
+                None => return Some(build_error_json(&request.id, -3, "requires [target, index_hint?]")),
+            };
+
+            // "master" resets to the master identity — return its npub.
+            if target == "master" {
+                use heartwood_common::encoding::encode_npub;
+                let pubkey_result = secp256k1::Keypair::from_seckey_slice(secp, master_secret)
+                    .map(|kp| {
+                        let (xonly, _) = kp.x_only_public_key();
+                        encode_npub(&xonly.serialize())
+                    })
+                    .map_err(|_| "invalid master secret".to_string());
+                return match pubkey_result {
+                    Ok(npub) => {
+                        let result = serde_json::json!({ "npub": npub, "purpose": "master", "index": 0 });
+                        Some(nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default())
+                    }
+                    Err(e) => Some(build_error_json(&request.id, -4, &e)),
+                };
+            }
+
+            let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
+                Some(c) => c,
+                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+            };
+
+            // Search by npub, then persona name, then purpose+index.
+            let index_hint = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let found = cache
+                .find_by_npub(target)
+                .or_else(|| cache.find_by_persona(target))
+                .or_else(|| cache.find(target, index_hint));
+
+            match found {
+                Some(idx) => {
+                    let id = &cache.identities[idx];
+                    let mut result = serde_json::json!({
+                        "npub": id.npub,
+                        "purpose": id.purpose,
+                        "index": id.index,
+                    });
+                    if let Some(name) = &id.persona_name {
+                        result["personaName"] = serde_json::json!(name);
+                    }
+                    Some(nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default())
+                }
+                None => Some(build_error_json(&request.id, -4, "identity not found in cache")),
+            }
+        }
+
+        "heartwood_list_identities" => {
+            if !master_mode.is_tree() {
+                // Bunker mode — no derived identities, return empty array.
+                return Some(nip46::build_result_response(&request.id, "[]").unwrap_or_default());
+            }
+
+            let cache = match identity_caches.iter().find(|c| c.master_slot == master_slot) {
+                Some(c) => c,
+                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+            };
+
+            Some(nip46::build_result_response(&request.id, &cache.list_json()).unwrap_or_default())
+        }
+
+        "heartwood_recover" => {
+            if !master_mode.is_tree() {
+                return Some(build_error_json(&request.id, -5, "not available in bunker mode"));
+            }
+            let lookahead = request.params.first().and_then(|v| v.as_u64()).unwrap_or(20) as u32;
+
+            let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
+                Some(c) => c,
+                None => return Some(build_error_json(&request.id, -4, "no identity cache for this master")),
+            };
+
+            match cache.recover(master_secret, lookahead) {
+                Ok(count) => {
+                    let identities_json = cache.list_json();
+                    let result = format!(r#"{{"recovered":{count},"identities":{identities_json}}}"#);
+                    Some(nip46::build_result_response(&request.id, &result).unwrap_or_default())
+                }
+                Err(e) => Some(build_error_json(&request.id, -4, e)),
+            }
+        }
+
+        "heartwood_create_proof" => {
+            // Proof generation not yet implemented.
+            Some(build_error_json(&request.id, -6, "not yet implemented"))
+        }
+
+        "heartwood_verify_proof" => {
+            // Proof verification not yet implemented.
+            Some(build_error_json(&request.id, -6, "not yet implemented"))
         }
 
         other => {

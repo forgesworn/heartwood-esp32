@@ -19,6 +19,7 @@ mod nip46_handler;
 mod nvs;
 mod oled;
 mod ota;
+mod pin;
 mod policy;
 mod protocol;
 mod provision;
@@ -46,9 +47,9 @@ use heartwood_common::encoding::encode_npub;
 use heartwood_common::types::{
     FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
-    FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_POLICY_PUSH, FRAME_TYPE_PROVISION,
-    FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_SESSION_AUTH,
-    FRAME_TYPE_SET_BRIDGE_SECRET,
+    FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_POLICY_PUSH,
+    FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
+    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
 };
 use secp256k1::Secp256k1;
 
@@ -134,6 +135,42 @@ fn main() {
                         "Expected provision frame, got type 0x{:02x}",
                         frame.frame_type
                     );
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                }
+            }
+        }
+    }
+
+    // --- PIN lock ---
+    // If a PIN is set, the device stays locked until the correct PIN is
+    // provided via a PIN_UNLOCK frame. All other frames are rejected,
+    // except PROVISION_LIST which is safe (no secret material exposed).
+    if pin::has_pin(&nvs) {
+        log::info!("PIN protection active — waiting for unlock");
+        oled::show_error(&mut display, "PIN locked\nAwait unlock...");
+
+        let mut failed_attempts: u8 = 0;
+        loop {
+            let frame = protocol::read_frame(&mut usb);
+            match frame.frame_type {
+                FRAME_TYPE_PIN_UNLOCK => {
+                    if pin::handle_pin_unlock(
+                        &mut usb,
+                        &frame.payload,
+                        &nvs,
+                        &mut failed_attempts,
+                        &mut display,
+                    ) {
+                        break; // Unlocked — continue boot.
+                    }
+                }
+                FRAME_TYPE_PROVISION_LIST => {
+                    // Allow listing masters even when locked — no secrets exposed,
+                    // only public npubs, which is acceptable.
+                    provision::handle_list(&mut usb, &loaded_masters);
+                }
+                _ => {
+                    log::warn!("Device locked — rejecting frame type 0x{:02x}", frame.frame_type);
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
                 }
             }
@@ -379,6 +416,17 @@ fn main() {
             FRAME_TYPE_FACTORY_RESET => {
                 provision::handle_factory_reset(
                     &mut usb,
+                    &mut nvs,
+                    &mut display,
+                    &button_pin,
+                );
+            }
+
+            // 0x25 — set/change/clear boot PIN
+            FRAME_TYPE_SET_PIN => {
+                pin::handle_set_pin(
+                    &mut usb,
+                    &frame.payload,
                     &mut nvs,
                     &mut display,
                     &button_pin,

@@ -90,26 +90,15 @@ pub fn handle_request(
 
     // Determine the client pubkey for policy lookups.
     // In encrypted mode (passthrough), it comes from the frame header.
-    // In legacy mode (plaintext), extract it from connect params[0] — the
-    // NIP-46 connect method sends the client's pubkey as the first param.
-    // Once a client has connected, their pubkey is cached in the policy
-    // engine's session list for subsequent requests.
+    // In legacy mode, the bridge injects `_client_pubkey` into the JSON.
     let client_hex = if let Some(pk) = client_pubkey {
         heartwood_common::hex::hex_encode(pk)
     } else {
-        // Legacy mode — check if this is a connect request with a client pubkey.
-        if request.method == "connect" {
-            request.params.first()
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        } else {
-            // For non-connect requests in legacy mode, look up the last
-            // connected client from the policy engine's session list.
-            policy_engine.sessions.last()
-                .map(|s| heartwood_common::hex::hex_encode(&s.client_pubkey))
-                .unwrap_or_default()
-        }
+        // Legacy mode — bridge injects the relay event author as _client_pubkey.
+        serde_json::from_slice::<serde_json::Value>(&frame.payload)
+            .ok()
+            .and_then(|v| v["_client_pubkey"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default()
     };
     let has_client = !client_hex.is_empty() && client_hex.len() == 64;
     let tier = if has_client {

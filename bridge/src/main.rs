@@ -544,6 +544,16 @@ async fn main() -> Result<()> {
                         }
                     };
 
+                    // Inject the client pubkey into the request so the ESP32
+                    // can identify the client for TOFU policy in legacy mode.
+                    let plaintext = match serde_json::from_str::<serde_json::Value>(&plaintext) {
+                        Ok(mut v) => {
+                            v["_client_pubkey"] = serde_json::json!(client_pubkey.to_hex());
+                            v.to_string()
+                        }
+                        Err(_) => plaintext,
+                    };
+
                     log::info!(
                         "Decrypted request: {}",
                         &plaintext[..plaintext.len().min(100)]

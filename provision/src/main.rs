@@ -23,6 +23,14 @@ struct Cli {
     /// Baud rate (default 115200)
     #[arg(short, long, default_value_t = 115200)]
     baud: u32,
+
+    /// Label for this master (e.g. "primary", "ForgeSworn")
+    #[arg(short, long, default_value = "default")]
+    label: String,
+
+    /// Provisioning mode: tree-mnemonic (default), tree-nsec, bunker
+    #[arg(short, long, default_value = "tree-mnemonic")]
+    mode: String,
 }
 
 /// Derive 32-byte root secret from a BIP-39 mnemonic + optional passphrase.
@@ -57,10 +65,33 @@ fn derive_root_secret(mnemonic: &str, passphrase: &str) -> Result<[u8; 32], Stri
 
 /// Build the provisioning frame using the unified frame protocol.
 ///
-/// Format: [0x48 0x57][0x01][0x00 0x20][secret_32][crc_4] = 41 bytes.
-fn build_provision_frame(secret: &[u8; 32]) -> Vec<u8> {
-    frame::build_frame(FRAME_TYPE_PROVISION, secret)
-        .expect("provision frame should never exceed max payload")
+/// Extended format: [mode_u8][label_len_u8][label...][secret_32]
+/// Legacy format (label="default", mode=tree-mnemonic): just [secret_32]
+fn build_provision_frame(secret: &[u8; 32], label: &str, mode: &str) -> Vec<u8> {
+    let mode_byte: u8 = match mode {
+        "bunker" => 0,
+        "tree-mnemonic" => 1,
+        "tree-nsec" => 2,
+        _ => 1, // default to tree-mnemonic
+    };
+
+    // Use extended format if label is not "default" or mode is not tree-mnemonic.
+    if label == "default" && mode_byte == 1 {
+        // Legacy format — bare 32-byte secret.
+        frame::build_frame(FRAME_TYPE_PROVISION, secret)
+            .expect("provision frame should never exceed max payload")
+    } else {
+        // Extended format: [mode][label_len][label...][secret]
+        let label_bytes = label.as_bytes();
+        let label_len = label_bytes.len().min(32) as u8;
+        let mut payload = Vec::with_capacity(2 + label_len as usize + 32);
+        payload.push(mode_byte);
+        payload.push(label_len);
+        payload.extend_from_slice(&label_bytes[..label_len as usize]);
+        payload.extend_from_slice(secret);
+        frame::build_frame(FRAME_TYPE_PROVISION, &payload)
+            .expect("provision frame should never exceed max payload")
+    }
 }
 
 fn main() {
@@ -95,7 +126,7 @@ fn main() {
     }
 
     // Build frame and send
-    let frame = build_provision_frame(&root_secret);
+    let frame = build_provision_frame(&root_secret, &cli.label, &cli.mode);
     root_secret.zeroize();
 
     println!("Opening {}...", cli.port);
@@ -119,34 +150,51 @@ fn main() {
     port.write_all(&frame).expect("failed to write to serial port");
     port.flush().expect("failed to flush serial port");
 
-    // Scan for ACK/NACK byte.
-    // ESP-IDF log output shares the same USB-Serial-JTAG channel, so we may
-    // see log text before the response byte. Read byte-by-byte and look for
-    // our protocol bytes.
-    let mut byte = [0u8; 1];
+    // Read the framed ACK/NACK response.
+    // The firmware sends a full frame (magic + type + length + CRC).
+    // ESP-IDF log output shares the same USB-Serial-JTAG channel, so we
+    // accumulate bytes and try to parse a frame.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut read_chunk = [0u8; 256];
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         if std::time::Instant::now() > deadline {
             eprintln!("Timeout waiting for response from device.");
             std::process::exit(1);
         }
-        match port.read(&mut byte) {
-            Ok(1) => match byte[0] {
-                FRAME_TYPE_ACK => {
-                    println!("ACK received. Root secret provisioned.");
-                    break;
-                }
-                FRAME_TYPE_NACK => {
-                    eprintln!("NACK received — device rejected the secret (CRC error or NVS write failure).");
-                    std::process::exit(1);
-                }
-                _ => {} // skip log output bytes
-            },
+        match port.read(&mut read_chunk) {
+            Ok(n) if n > 0 => buf.extend_from_slice(&read_chunk[..n]),
             Ok(_) => {}
             Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {}
             Err(e) => {
                 eprintln!("Serial read error: {e}");
                 std::process::exit(1);
+            }
+        }
+        // Try to parse a frame from accumulated bytes.
+        match frame::parse_frame(&buf) {
+            Ok(f) if f.frame_type == FRAME_TYPE_ACK => {
+                println!("ACK received. Master '{}' provisioned.", cli.label);
+                break;
+            }
+            Ok(f) if f.frame_type == FRAME_TYPE_NACK => {
+                eprintln!("NACK received — device rejected the provision (CRC error or NVS write failure).");
+                std::process::exit(1);
+            }
+            Ok(f) => {
+                eprintln!("Unexpected frame type: 0x{:02x}", f.frame_type);
+                std::process::exit(1);
+            }
+            Err(frame::FrameError::TooShort) => {} // keep reading
+            Err(_) => {
+                // Bad frame — skip to next magic bytes.
+                if let Some(pos) = buf.windows(2).position(|w| w == &[0x48, 0x57]) {
+                    if pos > 0 {
+                        buf.drain(..pos);
+                    }
+                } else {
+                    buf.clear();
+                }
             }
         }
     }
@@ -194,7 +242,7 @@ mod tests {
     #[test]
     fn test_build_provision_frame() {
         let secret = [0xaa; 32];
-        let frame_bytes = build_provision_frame(&secret);
+        let frame_bytes = build_provision_frame(&secret, "default", "tree-mnemonic");
 
         // New format: 2 magic + 1 type + 2 length + 32 payload + 4 CRC = 41
         assert_eq!(frame_bytes.len(), 41);

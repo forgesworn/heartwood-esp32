@@ -26,19 +26,20 @@ portable = []   # BLE GATT, battery management, child key only
 
 ## Current state
 
-Phase 3 (signing oracle) implemented. Four crates: `common/` (shared crypto + frame protocol + NIP-46 types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness). The ESP32 is a NIP-46 bunker — receives signing requests over serial, shows what's being signed on OLED, requires physical button approval (long hold to approve, short press to deny). k256 alignment workaround still in place (dedicated thread for all k256 operations).
+Phase 3 (signing oracle) implemented. Five crates: `common/` (shared crypto + frame protocol + NIP-46 types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness), `bridge/` (Pi-side relay bridge). The ESP32 is a NIP-46 bunker — receives signing requests over serial, shows what's being signed on OLED, requires physical button approval (long hold to approve, short press to deny). k256 alignment workaround still in place (dedicated thread for all k256 operations).
 
 Next: flash firmware, test end-to-end with sign-test CLI, then integrate with heartwood-device on the Pi.
 
 ## Build & flash
 
-Four crates — build each from its own directory:
+Five crates — build each from its own directory:
 
 ```bash
 cd common && cargo test                    # shared crypto tests
 cd common && cargo test --features nip46   # NIP-46 + event ID tests
 cd provision && cargo build                # host CLI tool
 cd sign-test && cargo build                # signing test harness
+cd bridge && cargo build                   # Pi-side relay bridge
 cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain)
 cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
 ```

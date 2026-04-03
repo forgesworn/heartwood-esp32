@@ -141,6 +141,9 @@ provision/                  Host CLI tool
 sign-test/                  Signing test harness
   src/
     main.rs               Send NIP-46 requests over serial, display responses
+bridge/                     Pi-side relay bridge
+  src/
+    main.rs               Nostr relay ←→ NIP-44 ←→ serial ←→ ESP32
 ```
 
 ## Roadmap
@@ -170,7 +173,7 @@ sign-test/                  Signing test harness
 - [x] Per-request child key derivation with Heartwood extension field
 - [x] Test harness CLI (`sign-test/`) for end-to-end validation
 - [ ] Flash and verify end-to-end signing flow on hardware
-- [ ] Integration with heartwood-device on the Pi (new serial transport for NIP-46)
+- [x] Pi-side relay bridge (`bridge/`) — NIP-46 over Nostr relays ←→ NIP-44 ←→ serial ←→ ESP32
 
 ### Phase 4 — Hardening (HSM mode)
 

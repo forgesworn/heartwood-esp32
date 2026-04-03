@@ -92,7 +92,7 @@ fn load_one(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<LoadedMaster> {
     }
 
     let mut connect_secret = [0u8; 32];
-    let connect_key = format!("{prefix}_connect");
+    let connect_key = format!("{prefix}_conn");
     match nvs.get_blob(&connect_key, &mut connect_secret) {
         Ok(Some(b)) if b.len() == 32 => {}
         _ => {
@@ -135,7 +135,7 @@ pub fn add_master(
         .map_err(|_| "failed to write mode")?;
     nvs.set_blob(&format!("{prefix}_pubkey"), pubkey)
         .map_err(|_| "failed to write pubkey")?;
-    nvs.set_blob(&format!("{prefix}_connect"), connect_secret)
+    nvs.set_blob(&format!("{prefix}_conn"), connect_secret)
         .map_err(|_| "failed to write connect secret")?;
 
     write_master_count(nvs, count + 1)?;
@@ -156,7 +156,7 @@ pub fn remove_master(nvs: &mut EspNvs<NvsDefault>, slot: u8) -> Result<(), &'sta
         let src = format!("master_{}", i + 1);
         let dst = format!("master_{i}");
 
-        for suffix in &["_secret", "_label", "_mode", "_pubkey", "_connect"] {
+        for suffix in &["_secret", "_label", "_mode", "_pubkey", "_conn"] {
             let mut buf = [0u8; 64];
             let src_key = format!("{src}{suffix}");
             let dst_key = format!("{dst}{suffix}");
@@ -169,7 +169,7 @@ pub fn remove_master(nvs: &mut EspNvs<NvsDefault>, slot: u8) -> Result<(), &'sta
 
     // Clear the last slot.
     let last = format!("master_{}", count - 1);
-    for suffix in &["_secret", "_label", "_mode", "_pubkey", "_connect"] {
+    for suffix in &["_secret", "_label", "_mode", "_pubkey", "_conn"] {
         let key = format!("{last}{suffix}");
         let _ = nvs.remove(&key);
     }

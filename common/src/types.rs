@@ -40,6 +40,7 @@ pub const FRAME_TYPE_POLICY_PUSH: u8 = 0x20;
 pub const FRAME_TYPE_SESSION_AUTH: u8 = 0x21;
 pub const FRAME_TYPE_SESSION_ACK: u8 = 0x22;
 pub const FRAME_TYPE_SET_BRIDGE_SECRET: u8 = 0x23;
+pub const FRAME_TYPE_FACTORY_RESET: u8 = 0x24;
 
 pub const MAX_PAYLOAD_SIZE: usize = 4096;
 pub const FRAME_HEADER_SIZE: usize = 5; // 2 magic + 1 type + 2 length

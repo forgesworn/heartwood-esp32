@@ -169,3 +169,59 @@ pub fn handle_list(usb: &mut UsbSerialDriver<'_>, loaded: &[LoadedMaster]) {
     let json = serde_json::to_string(&infos).unwrap_or_else(|_| "[]".to_string());
     protocol::write_frame(usb, FRAME_TYPE_PROVISION_LIST_RESPONSE, json.as_bytes());
 }
+
+/// Handle a FACTORY_RESET frame (0x24).
+///
+/// Erases all NVS keys in the `heartwood` namespace and reboots the device.
+/// Requires physical button approval (2-second hold) — this is irreversible.
+pub fn handle_factory_reset(
+    usb: &mut UsbSerialDriver<'_>,
+    nvs: &mut EspNvs<NvsDefault>,
+    display: &mut Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) {
+    let result = crate::approval::run_approval_loop(
+        display,
+        button_pin,
+        30,
+        |d, remaining| {
+            crate::oled::show_sign_request(d, "FACTORY", 0, "ERASE ALL DATA?", remaining);
+        },
+    );
+
+    match result {
+        crate::approval::ApprovalResult::Approved => {
+            log::warn!("Factory reset approved — erasing NVS");
+            crate::oled::show_error(display, "Erasing...");
+
+            // Erase all master keys by removing slot 0 repeatedly (they shift down).
+            let count = masters::read_master_count(nvs);
+            for _ in 0..count {
+                let _ = masters::remove_master(nvs, 0);
+            }
+
+            // Erase bridge secret and policy keys.
+            let _ = nvs.remove("bridge_secret");
+            for i in 0..8u8 {
+                let key = format!("policy_{i}");
+                let _ = nvs.remove(&key);
+            }
+
+            crate::oled::show_error(display, "Reset complete\nRebooting...");
+            protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+
+            unsafe { esp_idf_svc::sys::esp_restart(); }
+        }
+        crate::approval::ApprovalResult::Denied => {
+            log::info!("Factory reset denied");
+            crate::oled::show_result(display, "Reset cancelled");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        }
+        crate::approval::ApprovalResult::TimedOut => {
+            log::info!("Factory reset timed out");
+            crate::oled::show_result(display, "Timed out");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        }
+    }
+}

@@ -43,10 +43,10 @@ const IDLE_POLL_MS: u32 = 50;
 
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::types::{
-    FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST,
-    FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_POLICY_PUSH, FRAME_TYPE_PROVISION,
-    FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_SESSION_AUTH,
-    FRAME_TYPE_SET_BRIDGE_SECRET,
+    FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
+    FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_POLICY_PUSH,
+    FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
+    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET,
 };
 use secp256k1::Secp256k1;
 
@@ -346,6 +346,16 @@ fn main() {
                     &frame.payload,
                     &mut nvs,
                     &policy_engine,
+                    &mut display,
+                    &button_pin,
+                );
+            }
+
+            // 0x24 — factory reset
+            FRAME_TYPE_FACTORY_RESET => {
+                provision::handle_factory_reset(
+                    &mut usb,
+                    &mut nvs,
                     &mut display,
                     &button_pin,
                 );

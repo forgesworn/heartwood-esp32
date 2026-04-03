@@ -26,9 +26,9 @@ portable = []   # BLE GATT, battery management, child key only
 
 ## Current state
 
-Phase 4 (full NIP-46 HSM) infrastructure complete (2026-04-03). Five crates: `common/` (shared crypto + frame protocol + NIP-46 types + NIP-44/NIP-04 encryption + policy types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness), `bridge/` (Pi-side relay bridge). Multi-master NVS storage (up to 8 masters, three provisioning modes: bunker/tree-mnemonic/tree-nsec). On-device NIP-44 transport encryption — the Pi is zero-trust, only sees ciphertext. Bridge session authentication and client approval policies (RAM-only, pushed from bridge). Full NIP-46 method set stubbed (15 methods: 8 standard + 7 heartwood extensions). Firmware uses libsecp256k1 (C FFI) for all signing.
+Phase 5 (flash-once production) complete (2026-04-03). Six crates: `common/` (shared crypto + frame protocol + NIP-46 types + NIP-44/NIP-04 encryption + policy types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness), `bridge/` (Pi-side relay bridge), `ota/` (Pi-side serial OTA tool). Multi-master NVS storage (up to 8 masters, three provisioning modes: bunker/tree-mnemonic/tree-nsec). On-device NIP-44 transport encryption — the Pi is zero-trust, only sees ciphertext (including sign_event responses). Bridge session authentication and client approval policies (NVS-persisted, TOFU auto-approval). Full NIP-46 method set (15 methods: 8 standard + 7 heartwood extensions; proof methods stubbed). Connect secret validation per NIP-46 spec. Serial OTA with SHA-256 verification and automatic rollback. Factory reset with button confirmation. Firmware uses libsecp256k1 (C FFI) for all signing.
 
-Next: implement NIP-46 method bodies (nip44_encrypt/decrypt, nip04_encrypt/decrypt, heartwood_derive/switch/list/recover/create_proof/verify_proof). Then refactor nip46_handler to return JSON so transport can encrypt responses (full 0x11 encrypted response flow). Then production hardening (JTAG disable, error recovery, watchdog).
+Next: implement heartwood_create_proof/verify_proof (via OTA). Production hardening (JTAG disable, watchdog). Bridge management API for heartwood-device Pi web UI.
 
 ## Build & flash
 
@@ -40,6 +40,7 @@ cd common && cargo test --features nip46   # NIP-46 + event ID tests
 cd provision && cargo build                # host CLI tool
 cd sign-test && cargo build                # signing test harness
 cd bridge && cargo build                   # Pi-side relay bridge
+cd ota && cargo build                      # Pi-side serial OTA tool
 cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain)
 cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
 ```

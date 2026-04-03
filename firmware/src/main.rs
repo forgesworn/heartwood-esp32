@@ -146,10 +146,9 @@ fn main() {
     let secp = Arc::new(Secp256k1::signing_only());
 
     // --- Per-master identity caches ---
-    // Created here, populated on demand by heartwood extension methods
+    // Populated on demand by heartwood extension methods
     // (heartwood_derive, heartwood_switch, heartwood_list_identities,
-    // heartwood_recover). Not yet wired into the handler — that happens in
-    // Task 5 when the heartwood methods are implemented.
+    // heartwood_recover).
     let mut identity_caches: Vec<identity_cache::IdentityCache> = loaded_masters
         .iter()
         .map(|m| identity_cache::IdentityCache::new(m.slot))

@@ -17,6 +17,7 @@ mod oled;
 mod policy;
 mod protocol;
 mod provision;
+mod session;
 mod sign;
 
 use esp_idf_hal::gpio::PinDriver;

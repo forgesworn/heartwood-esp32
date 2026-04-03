@@ -14,6 +14,7 @@ mod masters;
 mod nip46_handler;
 mod nvs;
 mod oled;
+mod policy;
 mod protocol;
 mod provision;
 mod sign;

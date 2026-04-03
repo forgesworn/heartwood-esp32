@@ -269,10 +269,11 @@ fn forward_encrypted(
 /// Read a response frame from the ESP32, accepting both NIP46_RESPONSE (0x03, plaintext)
 /// and ENCRYPTED_RESPONSE (0x11, ciphertext) frame types.
 ///
+/// Hunts for magic bytes `[0x48, 0x57]` in the stream to skip ESP-IDF log
+/// output that pollutes the USB-CDC channel.
+///
 /// Returns the payload as a UTF-8 string (either raw JSON or NIP-44 ciphertext).
 fn read_any_response(port: &mut Box<dyn serialport::SerialPort>) -> Result<String, String> {
-    let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
-    let mut pos = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
 
     loop {
@@ -283,42 +284,42 @@ fn read_any_response(port: &mut Box<dyn serialport::SerialPort>) -> Result<Strin
         let mut byte = [0u8; 1];
         match port.read(&mut byte) {
             Ok(1) => {
-                if pos < buf.len() {
-                    buf[pos] = byte[0];
-                    pos += 1;
+                // Hunt for first magic byte.
+                if byte[0] != 0x48 {
+                    continue;
                 }
-
-                if pos >= FRAME_OVERHEAD {
-                    match frame::parse_frame(&buf[..pos]) {
-                        Ok(response_frame) => {
-                            if response_frame.frame_type == FRAME_TYPE_NIP46_RESPONSE
-                                || response_frame.frame_type == FRAME_TYPE_ENCRYPTED_RESPONSE
-                            {
-                                return String::from_utf8(response_frame.payload)
-                                    .map_err(|e| format!("invalid UTF-8 in response: {e}"));
-                            } else if response_frame.frame_type == FRAME_TYPE_NACK {
-                                return Err("ESP32 sent NACK".into());
-                            } else {
-                                return Err(format!(
-                                    "unexpected frame type: 0x{:02x}",
-                                    response_frame.frame_type
-                                ));
-                            }
+                // Confirm second magic byte.
+                match port.read(&mut byte) {
+                    Ok(1) if byte[0] == 0x57 => {}
+                    _ => continue,
+                }
+                // Read header: type + length (3 bytes).
+                let mut header = [0u8; 3];
+                read_exact_timeout(port, &mut header, deadline)?;
+                let resp_type = header[0];
+                let length = u16::from_be_bytes([header[1], header[2]]) as usize;
+                // Read payload + CRC.
+                let mut body = vec![0u8; length + 4];
+                read_exact_timeout(port, &mut body, deadline)?;
+                // Reassemble and parse.
+                let mut buf = Vec::with_capacity(5 + length + 4);
+                buf.extend_from_slice(&MAGIC_BYTES);
+                buf.push(resp_type);
+                buf.extend_from_slice(&header[1..3]);
+                buf.extend_from_slice(&body);
+                match frame::parse_frame(&buf) {
+                    Ok(response_frame) => {
+                        if response_frame.frame_type == FRAME_TYPE_NIP46_RESPONSE
+                            || response_frame.frame_type == FRAME_TYPE_ENCRYPTED_RESPONSE
+                        {
+                            return String::from_utf8(response_frame.payload)
+                                .map_err(|e| format!("invalid UTF-8 in response: {e}"));
+                        } else if response_frame.frame_type == FRAME_TYPE_NACK {
+                            return Err("ESP32 sent NACK".into());
                         }
-                        Err(frame::FrameError::TooShort) => continue,
-                        Err(_) => {
-                            // Bad frame — try to find the next magic byte sequence
-                            if let Some(magic_pos) =
-                                buf[1..pos].windows(2).position(|w| w == &MAGIC_BYTES)
-                            {
-                                let new_start = magic_pos + 1;
-                                buf.copy_within(new_start..pos, 0);
-                                pos -= new_start;
-                            } else {
-                                pos = 0;
-                            }
-                        }
+                        // Other frame type — skip and keep hunting.
                     }
+                    Err(_) => continue, // Bad CRC — skip and keep hunting.
                 }
             }
             Ok(_) => {}

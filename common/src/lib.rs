@@ -6,3 +6,6 @@ pub mod types;
 
 #[cfg(feature = "nip46")]
 pub mod nip46;
+
+#[cfg(feature = "nip46")]
+pub mod policy;

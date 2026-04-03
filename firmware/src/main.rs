@@ -12,6 +12,7 @@
 //   7. Enter frame dispatch loop
 
 mod button;
+mod identity_cache;
 mod masters;
 mod nip46_handler;
 mod nvs;
@@ -131,6 +132,19 @@ fn main() {
     // ~130 KB on the heap. Shared with signing threads to avoid repeated
     // allocations on the ESP32's constrained heap.
     let secp = Arc::new(Secp256k1::signing_only());
+
+    // --- Per-master identity caches ---
+    // Created here, populated on demand by heartwood extension methods
+    // (heartwood_derive, heartwood_switch, heartwood_list_identities,
+    // heartwood_recover). Not yet wired into the handler — that happens in
+    // Task 5 when the heartwood methods are implemented.
+    let mut identity_caches: Vec<identity_cache::IdentityCache> = loaded_masters
+        .iter()
+        .map(|m| identity_cache::IdentityCache::new(m.slot))
+        .collect();
+
+    // Suppress unused-variable warning until the caches are wired in.
+    let _ = &mut identity_caches;
 
     // --- Boot screen ---
     // Single master: show its npub. Multiple masters: show the count.

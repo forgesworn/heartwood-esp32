@@ -6,3 +6,4 @@ common/target/
 provision/target/
 sign-test/target/
 bridge/target/
+.playwright-mcp/

@@ -88,10 +88,31 @@ pub fn handle_request(
         None
     };
 
-    let client_hex = client_pubkey
-        .map(|pk| heartwood_common::hex::hex_encode(pk))
-        .unwrap_or_default();
-    let tier = if client_pubkey.is_some() {
+    // Determine the client pubkey for policy lookups.
+    // In encrypted mode (passthrough), it comes from the frame header.
+    // In legacy mode (plaintext), extract it from connect params[0] — the
+    // NIP-46 connect method sends the client's pubkey as the first param.
+    // Once a client has connected, their pubkey is cached in the policy
+    // engine's session list for subsequent requests.
+    let client_hex = if let Some(pk) = client_pubkey {
+        heartwood_common::hex::hex_encode(pk)
+    } else {
+        // Legacy mode — check if this is a connect request with a client pubkey.
+        if request.method == "connect" {
+            request.params.first()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            // For non-connect requests in legacy mode, look up the last
+            // connected client from the policy engine's session list.
+            policy_engine.sessions.last()
+                .map(|s| heartwood_common::hex::hex_encode(&s.client_pubkey))
+                .unwrap_or_default()
+        }
+    };
+    let has_client = !client_hex.is_empty() && client_hex.len() == 64;
+    let tier = if has_client {
         policy_engine.check(master_slot, &client_hex, &method, event_kind)
     } else {
         heartwood_common::policy::ApprovalTier::ButtonRequired
@@ -129,14 +150,17 @@ pub fn handle_request(
         "get_public_key" => handle_get_public_key(master_secret, secp, &request),
 
         "connect" => {
-            // params[0] is the client pubkey; params[1] is the optional secret
-            // from the bunker:// URI. If a secret is provided it MUST match the
-            // stored connect secret. If empty or absent, accept the connection
-            // (backwards compat — security comes from bridge auth, not connect).
+            // params[0] is the client pubkey; params[1] is the optional secret.
+            // Register the client in a session so TOFU works for subsequent requests.
+            if has_client {
+                if let Ok(pk_bytes) = hex_decode_32_safe(&client_hex) {
+                    policy_engine.get_or_create_session(pk_bytes, master_slot);
+                }
+            }
+
             let client_secret = request.params.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let stored_secret_hex = hex_encode(connect_secret);
             if client_secret.is_empty() {
-                // No secret provided — accept with "ack".
                 nip46::build_connect_response(&request.id).unwrap_or_default()
             } else if constant_time_eq(client_secret.as_bytes(), stored_secret_hex.as_bytes()) {
                 // Secret matches — echo it back per NIP-46.
@@ -775,6 +799,11 @@ fn resolve_signing_secret(
         }
         None => Ok(*master_secret),
     }
+}
+
+/// Decode a 64-character hex string into 32 bytes (Result version).
+fn hex_decode_32_safe(hex: &str) -> Result<[u8; 32], ()> {
+    hex_decode_32(hex).ok_or(())
 }
 
 /// Decode a 64-character hex string into 32 bytes.

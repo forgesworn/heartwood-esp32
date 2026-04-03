@@ -48,7 +48,7 @@ The nsec-tree hierarchy means each device gets its own branch. Compromise of a c
 | Flash | 16MB |
 | OLED | 128x64 SSD1306 (I2C: SDA=GPIO17, SCL=GPIO18, RST=GPIO21, addr 0x3C) |
 | GNSS | L76K (available for portable mode) |
-| LoRa | SX1262 (reserved for future use) |
+| LoRa | SX1262 (never initialised — no use case for signing) |
 | WiFi | ESP32-S3 built-in (disabled in both modes) |
 | BLE | ESP32-S3 built-in (portable mode only) |
 | USB | USB-C (power + serial to Pi in HSM mode) |
@@ -177,10 +177,10 @@ src/
 
 - [ ] GPS location stamp on signed events (opt-in, portable mode only)
 - [ ] QR code display of npub on OLED
-- [ ] LoRa relay: phone has no signal, ESP32 reaches a home relay node via SX1262
 - [ ] Multi-identity: carry several child keys, select on OLED before signing
 
 ### Deliberately excluded
 
 - **WiFi signing** — full TCP/IP stack is a liability on any key-holding device. WiFi is never enabled in either mode.
 - **Master secret on portable device** — only child keys leave the home HSM. If the portable device is lost, the damage is one branch.
+- **LoRa signing** — signing is a response to a request, and the requester needs internet anyway. LoRa solves a problem that doesn't exist for this use case. The SX1262 is never initialised (safe without antenna).

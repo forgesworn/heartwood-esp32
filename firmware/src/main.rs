@@ -21,6 +21,7 @@ mod protocol;
 mod provision;
 mod session;
 mod sign;
+mod transport;
 
 use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
@@ -207,10 +208,22 @@ fn main() {
                 provision::handle_list(&mut usb, &loaded_masters);
             }
 
-            // 0x10 — encrypted request (transport layer — Task 12)
+            // 0x10 — encrypted NIP-46 request (NIP-44 transport layer)
             FRAME_TYPE_ENCRYPTED_REQUEST => {
-                log::warn!("Encrypted request not yet implemented (Task 12)");
-                protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                if !policy_engine.bridge_authenticated {
+                    log::warn!("Encrypted request rejected — bridge not authenticated");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                } else {
+                    transport::handle_encrypted_request(
+                        &mut usb,
+                        &frame,
+                        &loaded_masters,
+                        &secp,
+                        &mut display,
+                        &button_pin,
+                        &mut policy_engine,
+                    );
+                }
             }
 
             // 0x20 — push client policies

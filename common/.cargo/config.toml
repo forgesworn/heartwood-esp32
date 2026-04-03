@@ -1,0 +1,7 @@
+# common/.cargo/config.toml
+#
+# Override the root .cargo/config.toml which targets xtensa-esp32s3-espidf.
+# The common crate compiles on host for `cargo test` — explicitly set the
+# host target so the parent config's xtensa target does not propagate here.
+[build]
+target = "x86_64-apple-darwin"

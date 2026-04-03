@@ -1,0 +1,14 @@
+[package]
+name = "heartwood-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared crypto for heartwood-esp32 — derivation, encoding, types"
+
+[dependencies]
+k256 = { version = "0.13", default-features = false, features = ["schnorr", "arithmetic"] }
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["derive"] }
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]

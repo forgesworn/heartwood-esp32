@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use heartwood_common::types::{
     FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_PROVISION,
+    FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
 };
 use secp256k1::Secp256k1;
 
@@ -70,6 +71,10 @@ fn main() {
     let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
     let (mut nvs, stored_secret) = nvs::read_root_secret(nvs_partition).expect("NVS read failed");
 
+    // Create the secp256k1 context once — ~130KB. Shared via Arc with
+    // signing threads to avoid repeated heap allocations on ESP32.
+    let secp = Arc::new(Secp256k1::signing_only());
+
     // Obtain the root secret — either from NVS or by waiting for a provision frame.
     // The USB serial driver is created inside each branch because:
     // - For provisioning: the host must connect BEFORE we take over USB-Serial-JTAG
@@ -104,12 +109,12 @@ fn main() {
             let secret = loop {
                 let frame = protocol::read_frame(&mut usb);
                 if frame.frame_type == FRAME_TYPE_PROVISION {
-                    if let Some(secret) =
-                        provision::handle_provision(&mut usb, &frame, &mut nvs, &mut display)
+                    if let Some(master) =
+                        provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display)
                     {
-                        break secret;
+                        break master.secret;
                     }
-                    // handle_provision sent a NACK; loop back and wait again.
+                    // handle_add sent a NACK; loop back and wait again.
                 } else {
                     log::warn!(
                         "Expected provision frame, got type 0x{:02x}",
@@ -122,10 +127,6 @@ fn main() {
         }
     };
 
-    // Create the secp256k1 context once — ~130KB. Shared via Arc with
-    // signing threads to avoid repeated heap allocations on ESP32.
-    let secp = Arc::new(Secp256k1::signing_only());
-
     // Derive master npub at boot and show it on the OLED.
     let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &root_secret)
         .expect("stored secret is invalid");
@@ -133,6 +134,10 @@ fn main() {
     let master_npub = heartwood_common::encoding::encode_npub(&xonly.serialize());
     log::info!("Master npub: {master_npub}");
     oled::show_npub(&mut display, &master_npub);
+
+    // Load all provisioned masters from NVS into memory.
+    let mut loaded_masters = masters::load_all(&nvs);
+    log::info!("Loaded {} master(s) from NVS", loaded_masters.len());
 
     log::info!("Identity loaded — ready for signing requests");
 
@@ -153,8 +158,27 @@ fn main() {
                 oled::show_error(&mut display, "Heartwood ready");
             }
             FRAME_TYPE_PROVISION => {
-                log::warn!("Already provisioned — ignoring provision frame");
-                protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                if let Some(master) = provision::handle_add(
+                    &mut usb,
+                    &frame,
+                    &mut nvs,
+                    &secp,
+                    &mut display,
+                ) {
+                    loaded_masters.push(master);
+                }
+            }
+            FRAME_TYPE_PROVISION_REMOVE => {
+                provision::handle_remove(
+                    &mut usb,
+                    &frame,
+                    &mut nvs,
+                    &mut loaded_masters,
+                    &mut display,
+                );
+            }
+            FRAME_TYPE_PROVISION_LIST => {
+                provision::handle_list(&mut usb, &loaded_masters);
             }
             _ => {
                 log::warn!("Unknown frame type: 0x{:02x}", frame.frame_type);

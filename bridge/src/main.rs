@@ -583,6 +583,18 @@ async fn main() -> Result<()> {
                         }
                     };
 
+                    // Inject the client pubkey so the ESP32 can identify
+                    // the client for TOFU policy in legacy mode.
+                    let plaintext = if plaintext.starts_with('{') {
+                        format!(
+                            "{{\"_client_pubkey\":\"{}\",{}",
+                            client_pubkey.to_hex(),
+                            &plaintext[1..],
+                        )
+                    } else {
+                        plaintext
+                    };
+
                     log::info!(
                         "Decrypted request: {}",
                         &plaintext[..plaintext.len().min(100)]

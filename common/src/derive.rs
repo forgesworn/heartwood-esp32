@@ -20,7 +20,7 @@ type HmacSha256 = Hmac<Sha256>;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "k256-backend")]
-mod backend {
+pub(crate) mod backend {
     use k256::schnorr::SigningKey;
 
     /// Validate a 32-byte secret as a secp256k1 scalar and return the x-only
@@ -32,7 +32,7 @@ mod backend {
 }
 
 #[cfg(feature = "secp256k1-backend")]
-mod backend {
+pub(crate) mod backend {
     use secp256k1::{Keypair, Secp256k1};
 
     pub fn pubkey_from_secret(secret: &[u8; 32]) -> Result<[u8; 32], &'static str> {

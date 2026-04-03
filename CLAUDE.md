@@ -24,6 +24,18 @@ hsm = []        # USB serial, all radios off, master secret
 portable = []   # BLE GATT, battery management, child key only
 ```
 
+## Current state
+
+Phase 1 spike. The firmware compiles and runs the crypto (derivation + bech32) but **has not been flashed to hardware yet**. The immediate task is:
+
+1. Install ESP Rust toolchain (`espup install`)
+2. `cargo build` — verify it compiles for xtensa-esp32s3-espidf
+3. Plug in the Heltec V4 via USB-C
+4. `espflash flash --monitor` — flash and watch serial output
+5. Confirm the OLED displays the npub and serial shows "Protocol vector verified"
+
+If the build fails, the most likely cause is missing ESP-IDF toolchain components. Run `source ~/export-esp.sh` (or wherever espup put the export script) to set up the environment.
+
 ## Build & flash
 
 ```bash

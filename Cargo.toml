@@ -1,0 +1,24 @@
+[package]
+name = "heartwood-esp32"
+version = "0.1.0"
+edition = "2021"
+description = "nsec-tree signing token spike for Heltec WiFi LoRa 32 V4"
+
+[dependencies]
+# Crypto — all no_std compatible
+k256 = { version = "0.13", default-features = false, features = ["schnorr", "arithmetic"] }
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["derive"] }
+bech32 = { version = "0.11", default-features = false }
+
+# ESP-IDF std framework
+esp-idf-svc = { version = "0.49", features = ["binstart"] }
+esp-idf-hal = "0.44"
+
+# OLED display
+ssd1306 = "0.9"
+embedded-graphics = "0.8"
+
+[build-dependencies]
+embuild = "0.32"

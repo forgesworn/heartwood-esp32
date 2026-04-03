@@ -1,0 +1,9 @@
+# Heltec WiFi LoRa 32 V4 — ESP32-S3
+CONFIG_IDF_TARGET="esp32s3"
+
+# 2MB PSRAM (octal)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+
+# Enough stack for crypto operations
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384

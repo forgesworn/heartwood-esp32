@@ -63,6 +63,114 @@ pub struct Nip46Error {
     pub message: String,
 }
 
+/// All supported NIP-46 methods (standard + heartwood extensions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Nip46Method {
+    // Standard NIP-46
+    Connect,
+    Ping,
+    GetPublicKey,
+    SignEvent,
+    Nip44Encrypt,
+    Nip44Decrypt,
+    Nip04Encrypt,
+    Nip04Decrypt,
+    // Heartwood extensions
+    HeartwoodDerive,
+    HeartwoodDerivePersona,
+    HeartwoodSwitch,
+    HeartwoodListIdentities,
+    HeartwoodRecover,
+    HeartwoodCreateProof,
+    HeartwoodVerifyProof,
+    // Unknown method
+    Unknown(String),
+}
+
+impl Nip46Method {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "connect" => Self::Connect,
+            "ping" => Self::Ping,
+            "get_public_key" => Self::GetPublicKey,
+            "sign_event" => Self::SignEvent,
+            "nip44_encrypt" => Self::Nip44Encrypt,
+            "nip44_decrypt" => Self::Nip44Decrypt,
+            "nip04_encrypt" => Self::Nip04Encrypt,
+            "nip04_decrypt" => Self::Nip04Decrypt,
+            "heartwood_derive" => Self::HeartwoodDerive,
+            "heartwood_derive_persona" => Self::HeartwoodDerivePersona,
+            "heartwood_switch" => Self::HeartwoodSwitch,
+            "heartwood_list_identities" => Self::HeartwoodListIdentities,
+            "heartwood_recover" => Self::HeartwoodRecover,
+            "heartwood_create_proof" => Self::HeartwoodCreateProof,
+            "heartwood_verify_proof" => Self::HeartwoodVerifyProof,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Connect => "connect",
+            Self::Ping => "ping",
+            Self::GetPublicKey => "get_public_key",
+            Self::SignEvent => "sign_event",
+            Self::Nip44Encrypt => "nip44_encrypt",
+            Self::Nip44Decrypt => "nip44_decrypt",
+            Self::Nip04Encrypt => "nip04_encrypt",
+            Self::Nip04Decrypt => "nip04_decrypt",
+            Self::HeartwoodDerive => "heartwood_derive",
+            Self::HeartwoodDerivePersona => "heartwood_derive_persona",
+            Self::HeartwoodSwitch => "heartwood_switch",
+            Self::HeartwoodListIdentities => "heartwood_list_identities",
+            Self::HeartwoodRecover => "heartwood_recover",
+            Self::HeartwoodCreateProof => "heartwood_create_proof",
+            Self::HeartwoodVerifyProof => "heartwood_verify_proof",
+            Self::Unknown(s) => s.as_str(),
+        }
+    }
+
+    /// Whether this method requires button approval regardless of policy.
+    pub fn always_requires_button(&self) -> bool {
+        matches!(
+            self,
+            Self::HeartwoodDerive
+                | Self::HeartwoodDerivePersona
+                | Self::HeartwoodRecover
+                | Self::HeartwoodCreateProof
+        )
+    }
+
+    /// Whether this method is always auto-approved (no policy check needed).
+    pub fn always_auto_approve(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect
+                | Self::Ping
+                | Self::GetPublicKey
+                | Self::HeartwoodListIdentities
+                | Self::HeartwoodVerifyProof
+        )
+    }
+
+    /// Whether this method is an OLED-notify method (auto but shown on display).
+    pub fn is_oled_notify(&self) -> bool {
+        matches!(self, Self::HeartwoodSwitch)
+    }
+
+    /// Whether this method requires tree mode (returns error in bunker mode).
+    pub fn requires_tree_mode(&self) -> bool {
+        matches!(
+            self,
+            Self::HeartwoodDerive
+                | Self::HeartwoodDerivePersona
+                | Self::HeartwoodSwitch
+                | Self::HeartwoodRecover
+                | Self::HeartwoodCreateProof
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Nostr event types
 // ---------------------------------------------------------------------------
@@ -227,6 +335,39 @@ pub fn build_error_response(request_id: &str, code: i32, message: &str) -> Resul
         .map_err(|e| format!("failed to serialise error response: {e}"))
 }
 
+/// Build a `connect` success response (result = "ack").
+pub fn build_connect_response(request_id: &str) -> Result<String, String> {
+    let response = Nip46Response {
+        id: request_id.to_string(),
+        result: Some("ack".to_string()),
+        error: None,
+    };
+    serde_json::to_string(&response)
+        .map_err(|e| format!("failed to serialise connect response: {e}"))
+}
+
+/// Build a `ping` response (result = "pong").
+pub fn build_ping_response(request_id: &str) -> Result<String, String> {
+    let response = Nip46Response {
+        id: request_id.to_string(),
+        result: Some("pong".to_string()),
+        error: None,
+    };
+    serde_json::to_string(&response)
+        .map_err(|e| format!("failed to serialise ping response: {e}"))
+}
+
+/// Build a generic string result response.
+pub fn build_result_response(request_id: &str, result: &str) -> Result<String, String> {
+    let response = Nip46Response {
+        id: request_id.to_string(),
+        result: Some(result.to_string()),
+        error: None,
+    };
+    serde_json::to_string(&response)
+        .map_err(|e| format!("failed to serialise response: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -385,6 +526,46 @@ mod tests {
 
         // error field must be absent (not null) when there is no error.
         assert!(parsed.get("error").is_none(), "error key should be absent");
+    }
+
+    #[test]
+    fn test_nip46_method_from_str() {
+        assert_eq!(Nip46Method::from_str("sign_event"), Nip46Method::SignEvent);
+        assert_eq!(Nip46Method::from_str("heartwood_derive"), Nip46Method::HeartwoodDerive);
+        assert_eq!(Nip46Method::from_str("ping"), Nip46Method::Ping);
+        assert!(matches!(Nip46Method::from_str("unknown_method"), Nip46Method::Unknown(_)));
+    }
+
+    #[test]
+    fn test_nip46_method_approval_tiers() {
+        assert!(Nip46Method::Ping.always_auto_approve());
+        assert!(Nip46Method::GetPublicKey.always_auto_approve());
+        assert!(!Nip46Method::SignEvent.always_auto_approve());
+
+        assert!(Nip46Method::HeartwoodDerive.always_requires_button());
+        assert!(!Nip46Method::SignEvent.always_requires_button());
+
+        assert!(Nip46Method::HeartwoodSwitch.is_oled_notify());
+        assert!(!Nip46Method::SignEvent.is_oled_notify());
+
+        assert!(Nip46Method::HeartwoodDerive.requires_tree_mode());
+        assert!(!Nip46Method::SignEvent.requires_tree_mode());
+    }
+
+    #[test]
+    fn test_build_connect_response() {
+        let json = build_connect_response("conn-1").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["id"], "conn-1");
+        assert_eq!(parsed["result"], "ack");
+    }
+
+    #[test]
+    fn test_build_ping_response() {
+        let json = build_ping_response("ping-1").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["id"], "ping-1");
+        assert_eq!(parsed["result"], "pong");
     }
 
     #[test]

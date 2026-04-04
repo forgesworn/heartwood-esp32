@@ -331,6 +331,106 @@ async fn bridge_restart() -> Response {
     Json(OkResponse { ok: true }).into_response()
 }
 
+// OTA status codes (matches firmware/common)
+const OTA_STATUS_READY: u8 = 0x00;
+const OTA_STATUS_CHUNK_OK: u8 = 0x01;
+const OTA_STATUS_VERIFIED: u8 = 0x02;
+
+const OTA_CHUNK_SIZE: usize = 4096;
+
+async fn ota_upload(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let firmware = body.to_vec();
+    if firmware.is_empty() {
+        return api_err(StatusCode::BAD_REQUEST, "empty firmware binary");
+    }
+
+    tokio::task::spawn_blocking(move || -> Response {
+        let mut port = match state.serial.try_lock() {
+            Ok(p) => p,
+            Err(_) => return busy(),
+        };
+
+        // Compute SHA-256 hash.
+        let hash = {
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(&firmware);
+            let result = hasher.finalize();
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&result);
+            h
+        };
+
+        // OTA_BEGIN: [size_u32_be] [sha256_32]
+        let size = firmware.len() as u32;
+        let mut begin_payload = Vec::with_capacity(36);
+        begin_payload.extend_from_slice(&size.to_be_bytes());
+        begin_payload.extend_from_slice(&hash);
+
+        let begin_frame = match frame::build_frame(FRAME_TYPE_OTA_BEGIN, &begin_payload) {
+            Ok(f) => f,
+            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "frame build failed"),
+        };
+
+        // 60s timeout for button approval.
+        match send_and_receive(&mut port, &begin_frame, &[FRAME_TYPE_OTA_STATUS], 60) {
+            Ok(resp) if !resp.payload.is_empty() && resp.payload[0] == OTA_STATUS_READY => {}
+            Ok(resp) => {
+                let code = resp.payload.first().copied().unwrap_or(0xff);
+                return api_err(StatusCode::BAD_GATEWAY, format!("OTA begin rejected (status 0x{code:02x})"));
+            }
+            Err(e) => return e,
+        }
+
+        // Stream chunks.
+        let mut offset: usize = 0;
+        while offset < firmware.len() {
+            let end = (offset + OTA_CHUNK_SIZE).min(firmware.len());
+            let chunk = &firmware[offset..end];
+
+            let mut chunk_payload = Vec::with_capacity(4 + chunk.len());
+            chunk_payload.extend_from_slice(&(offset as u32).to_be_bytes());
+            chunk_payload.extend_from_slice(chunk);
+
+            let chunk_frame = match frame::build_frame(FRAME_TYPE_OTA_CHUNK, &chunk_payload) {
+                Ok(f) => f,
+                Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "chunk frame build failed"),
+            };
+
+            match send_and_receive(&mut port, &chunk_frame, &[FRAME_TYPE_OTA_STATUS], 10) {
+                Ok(resp) if !resp.payload.is_empty() && resp.payload[0] == OTA_STATUS_CHUNK_OK => {}
+                Ok(resp) => {
+                    let code = resp.payload.first().copied().unwrap_or(0xff);
+                    return api_err(StatusCode::BAD_GATEWAY, format!("chunk at offset {offset} rejected (0x{code:02x})"));
+                }
+                Err(e) => return e,
+            }
+
+            offset = end;
+        }
+
+        // OTA_FINISH
+        let finish_frame = match frame::build_frame(FRAME_TYPE_OTA_FINISH, &[]) {
+            Ok(f) => f,
+            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "finish frame build failed"),
+        };
+
+        match send_and_receive(&mut port, &finish_frame, &[FRAME_TYPE_OTA_STATUS], 30) {
+            Ok(resp) if !resp.payload.is_empty() && resp.payload[0] == OTA_STATUS_VERIFIED => {
+                Json(OkResponse { ok: true }).into_response()
+            }
+            Ok(resp) => {
+                let code = resp.payload.first().copied().unwrap_or(0xff);
+                api_err(StatusCode::BAD_GATEWAY, format!("verification failed (0x{code:02x}). Automatic rollback."))
+            }
+            Err(e) => e,
+        }
+    }).await.unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -341,6 +441,7 @@ pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> 
         .route("/api/clients/{slot}", get(get_clients).put(put_client))
         .route("/api/clients/{slot}/{pubkey}", delete(delete_client))
         .route("/api/device/factory-reset", post(factory_reset))
+        .route("/api/device/ota", post(ota_upload))
         .route("/api/bridge/info", get(bridge_info))
         .route("/api/bridge/restart", post(bridge_restart))
         .with_state(state);

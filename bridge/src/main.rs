@@ -586,7 +586,8 @@ async fn main() -> Result<()> {
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty())
         .collect();
-    // Request the complete bunker URI (with connect secret) from the ESP32.
+    // Request the connect secret from the ESP32, then build the bunker URI
+    // using the bridge's pubkey (in bridge-decrypts mode, clients talk to the bridge).
     let bunker_uri = {
         let relay_json = serde_json::to_vec(&relay_list).unwrap_or_default();
         let mut payload = Vec::with_capacity(1 + relay_json.len());
@@ -597,20 +598,13 @@ async fn main() -> Result<()> {
         let mut port_guard = port.lock().unwrap();
         port_guard.write_all(&frame_bytes).expect("serial write failed");
         port_guard.flush().expect("serial flush failed");
-        drop(port_guard);
 
-        // Read response -- reuse the existing response reader pattern.
-        let mut port_guard = port.lock().unwrap();
+        // Read the full URI from ESP32 and extract just the secret.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut uri = String::new();
+        let mut connect_secret = String::new();
         'hunt: loop {
             if std::time::Instant::now() > deadline {
-                log::warn!("Timeout waiting for bunker URI from ESP32 -- using fallback");
-                let relay_params: String = relay_list.iter()
-                    .map(|r| format!("relay={}", urlencoding::encode(r)))
-                    .collect::<Vec<_>>()
-                    .join("&");
-                uri = format!("bunker://{}?{}", bunker_pubkey.to_hex(), relay_params);
+                log::warn!("Timeout waiting for bunker URI from ESP32");
                 break;
             }
             let mut byte = [0u8; 1];
@@ -619,11 +613,11 @@ async fn main() -> Result<()> {
                     match port_guard.read(&mut byte) {
                         Ok(1) if byte[0] == 0x57 => {
                             let mut header = [0u8; 3];
-                            let _ = read_exact_serial(&mut *port_guard, &mut header);
+                            read_exact_serial(&mut *port_guard, &mut header);
                             let resp_type = header[0];
                             let length = u16::from_be_bytes([header[1], header[2]]) as usize;
                             let mut body = vec![0u8; length + 4];
-                            let _ = read_exact_serial(&mut *port_guard, &mut body);
+                            read_exact_serial(&mut *port_guard, &mut body);
                             let mut buf = Vec::with_capacity(5 + length + 4);
                             buf.extend_from_slice(&[0x48, 0x57]);
                             buf.push(resp_type);
@@ -631,7 +625,15 @@ async fn main() -> Result<()> {
                             buf.extend_from_slice(&body);
                             if let Ok(f) = frame::parse_frame(&buf) {
                                 if f.frame_type == FRAME_TYPE_BUNKER_URI_RESPONSE {
-                                    uri = String::from_utf8_lossy(&f.payload).to_string();
+                                    // Extract the secret= parameter from the ESP32's URI.
+                                    let esp_uri = String::from_utf8_lossy(&f.payload);
+                                    if let Some(pos) = esp_uri.find("secret=") {
+                                        connect_secret = esp_uri[pos + 7..].to_string();
+                                        // Trim any trailing params.
+                                        if let Some(amp) = connect_secret.find('&') {
+                                            connect_secret.truncate(amp);
+                                        }
+                                    }
                                     break 'hunt;
                                 }
                             }
@@ -643,7 +645,18 @@ async fn main() -> Result<()> {
             }
         }
         drop(port_guard);
-        log::info!("Bunker URI: {}", &uri[..uri.len().min(60)]);
+
+        // Build the URI with the BRIDGE's pubkey (clients talk to the bridge in bridge-decrypts mode).
+        let relay_params: String = relay_list.iter()
+            .map(|r| format!("relay={}", urlencoding::encode(r)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let uri = if connect_secret.is_empty() {
+            format!("bunker://{}?{}", bunker_pubkey.to_hex(), relay_params)
+        } else {
+            format!("bunker://{}?{}&secret={}", bunker_pubkey.to_hex(), relay_params, connect_secret)
+        };
+        log::info!("Bunker URI: {}", &uri[..uri.len().min(80)]);
         uri
     };
 

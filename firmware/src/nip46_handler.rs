@@ -170,12 +170,12 @@ pub fn handle_request(
                 nip46::build_connect_response(&request.id).unwrap_or_default()
             } else if constant_time_eq(client_secret.as_bytes(), stored_secret_hex.as_bytes()) {
                 // Secret matches -- client proved it has the bunker URI.
-                // TOFU: auto-approve this client for all safe methods so
-                // sign_event works immediately without button approval.
-                // Policy persistence happens in the main loop after we return.
+                // Grant connect-safe methods only (encrypt/decrypt/get_public_key).
+                // sign_event requires a physical button press first -- the TOFU
+                // upgrade to full signing happens in the ButtonRequired branch above.
                 if has_client {
-                    tofu_approve(policy_engine, master_slot, &client_hex, &app_label);
-                    log::info!("TOFU: approved client on connect (secret verified)");
+                    tofu_connect_approve(policy_engine, master_slot, &client_hex, &app_label);
+                    log::info!("TOFU: connect-approved client (secret verified, signing requires button)");
                 }
                 nip46::build_connect_response_with_secret(&request.id, &stored_secret_hex).unwrap_or_default()
             } else {
@@ -387,8 +387,10 @@ fn handle_auto_sign(
 // TOFU approval
 // ---------------------------------------------------------------------------
 
-fn tofu_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &str, label: &str) {
-    use heartwood_common::policy::{ClientPolicy, TOFU_SAFE_METHODS};
+/// Connect-time TOFU: grant non-signing methods only (encrypt/decrypt/get_public_key).
+/// Called when a client connects with a valid secret. Does NOT grant sign_event.
+fn tofu_connect_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &str, label: &str) {
+    use heartwood_common::policy::{ClientPolicy, CONNECT_SAFE_METHODS};
 
     let existing = policy_engine.master_policies
         .iter()
@@ -396,7 +398,7 @@ fn tofu_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &
             && mp.policies.iter().any(|p| p.client_pubkey == client_hex));
 
     if existing {
-        // Update the label if we now have one and the existing policy doesn't.
+        // Already has a policy (possibly upgraded to full TOFU). Don't downgrade.
         if !label.is_empty() {
             if let Some(mp) = policy_engine.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
                 if let Some(p) = mp.policies.iter_mut().find(|p| p.client_pubkey == client_hex) {
@@ -411,6 +413,54 @@ fn tofu_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &
         return;
     }
 
+    let policy = ClientPolicy {
+        client_pubkey: client_hex.to_string(),
+        label: label.to_string(),
+        allowed_methods: CONNECT_SAFE_METHODS.iter().map(|s| s.to_string()).collect(),
+        allowed_kinds: vec![],
+        auto_approve: true,
+    };
+
+    policy_engine.add_tofu_policy(master_slot, policy);
+    if label.is_empty() {
+        log::info!("TOFU: connect-approved client {}", &client_hex[..16.min(client_hex.len())]);
+    } else {
+        log::info!("TOFU: connect-approved client {} ({})", &client_hex[..16.min(client_hex.len())], label);
+    }
+}
+
+/// Full TOFU: grant all safe methods including sign_event.
+/// Called after the user physically approves a signing request via button press.
+/// If the client already has a connect-only policy, this upgrades it.
+fn tofu_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &str, label: &str) {
+    use heartwood_common::policy::{ClientPolicy, TOFU_SAFE_METHODS};
+
+    // Check if the client already has a policy for this master.
+    let existing = policy_engine.master_policies
+        .iter()
+        .find(|mp| mp.master_slot == master_slot)
+        .and_then(|mp| mp.policies.iter().find(|p| p.client_pubkey == client_hex));
+
+    if let Some(existing) = existing {
+        // If the existing policy already includes sign_event, nothing to do.
+        if existing.allowed_methods.iter().any(|m| m == "sign_event") {
+            return;
+        }
+        // Upgrade: connect-only policy -> full TOFU (add sign_event).
+        if let Some(mp) = policy_engine.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
+            if let Some(p) = mp.policies.iter_mut().find(|p| p.client_pubkey == client_hex) {
+                p.allowed_methods = TOFU_SAFE_METHODS.iter().map(|s| s.to_string()).collect();
+                if !label.is_empty() && p.label.is_empty() {
+                    p.label = label.to_string();
+                }
+                policy_engine.policies_dirty = true;
+                log::info!("TOFU: upgraded client {} to full signing", &client_hex[..16.min(client_hex.len())]);
+            }
+        }
+        return;
+    }
+
+    // No existing policy -- create a full TOFU policy (button was pressed).
     let policy = ClientPolicy {
         client_pubkey: client_hex.to_string(),
         label: label.to_string(),

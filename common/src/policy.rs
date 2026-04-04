@@ -24,7 +24,18 @@ pub struct ClientPolicy {
     pub auto_approve: bool,
 }
 
-/// Methods auto-approved after first TOFU approval.
+/// Methods auto-approved on connect when the client provides a valid secret.
+/// These are non-signing operations -- safe to grant without physical approval.
+pub const CONNECT_SAFE_METHODS: &[&str] = &[
+    "nip44_encrypt",
+    "nip44_decrypt",
+    "nip04_encrypt",
+    "nip04_decrypt",
+    "get_public_key",
+];
+
+/// Methods auto-approved after first physical button approval.
+/// Includes signing -- only granted after the user explicitly approves once.
 pub const TOFU_SAFE_METHODS: &[&str] = &[
     "sign_event",
     "nip44_encrypt",
@@ -49,7 +60,19 @@ pub enum ApprovalTier {
 // Pure policy helpers (testable on host, used by firmware PolicyEngine)
 // ---------------------------------------------------------------------------
 
-/// Create a default TOFU policy for a client after first button approval.
+/// Create a connect-time TOFU policy (no signing -- only granted on valid secret).
+pub fn make_connect_policy(client_pubkey: &str) -> ClientPolicy {
+    ClientPolicy {
+        client_pubkey: client_pubkey.to_string(),
+        label: String::new(),
+        allowed_methods: CONNECT_SAFE_METHODS.iter().map(|s| s.to_string()).collect(),
+        allowed_kinds: vec![],
+        auto_approve: true,
+    }
+}
+
+/// Create a full TOFU policy for a client after first physical button approval.
+/// Includes sign_event -- only call this after the user has pressed the button.
 pub fn make_tofu_policy(client_pubkey: &str) -> ClientPolicy {
     ClientPolicy {
         client_pubkey: client_pubkey.to_string(),
@@ -154,6 +177,43 @@ mod tests {
         assert!(TOFU_SAFE_METHODS.contains(&"nip44_encrypt"));
         assert!(TOFU_SAFE_METHODS.contains(&"nip44_decrypt"));
         assert!(TOFU_SAFE_METHODS.contains(&"get_public_key"));
+    }
+
+    // --- Connect-safe methods ---
+
+    #[test]
+    fn connect_safe_methods_excludes_signing() {
+        assert!(!CONNECT_SAFE_METHODS.contains(&"sign_event"));
+    }
+
+    #[test]
+    fn connect_safe_methods_includes_crypto() {
+        assert!(CONNECT_SAFE_METHODS.contains(&"nip44_encrypt"));
+        assert!(CONNECT_SAFE_METHODS.contains(&"nip44_decrypt"));
+        assert!(CONNECT_SAFE_METHODS.contains(&"nip04_encrypt"));
+        assert!(CONNECT_SAFE_METHODS.contains(&"nip04_decrypt"));
+        assert!(CONNECT_SAFE_METHODS.contains(&"get_public_key"));
+    }
+
+    #[test]
+    fn connect_safe_is_subset_of_tofu_safe() {
+        for method in CONNECT_SAFE_METHODS {
+            assert!(TOFU_SAFE_METHODS.contains(method),
+                "{} is in CONNECT_SAFE but not TOFU_SAFE", method);
+        }
+    }
+
+    #[test]
+    fn connect_policy_has_correct_defaults() {
+        let policy = make_connect_policy(&sample_pubkey('x'));
+        assert!(policy.auto_approve);
+        assert!(policy.label.is_empty());
+        assert!(policy.allowed_kinds.is_empty());
+        assert_eq!(policy.allowed_methods.len(), CONNECT_SAFE_METHODS.len());
+        assert!(!policy.allowed_methods.contains(&"sign_event".to_string()));
+        for method in CONNECT_SAFE_METHODS {
+            assert!(policy.allowed_methods.contains(&method.to_string()));
+        }
     }
 
     // --- Find ---

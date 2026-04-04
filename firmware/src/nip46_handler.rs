@@ -129,7 +129,14 @@ pub fn handle_request(
                     // TOFU: if approved and we have a client pubkey, remember this client.
                     // Use has_client (populated from _client_pubkey JSON in legacy mode)
                     // rather than client_pubkey.is_some() (only set in passthrough mode).
-                    if has_client && !result.contains("\"error\"") {
+                    //
+                    // Parse the JSON-RPC response to check for a top-level "error" key rather
+                    // than using a substring search — a signed event whose content contains the
+                    // word "error" must not block the TOFU save.
+                    let is_success = serde_json::from_str::<serde_json::Value>(&result)
+                        .map(|v| v.get("error").is_none())
+                        .unwrap_or(false);
+                    if has_client && is_success {
                         tofu_approve(policy_engine, master_slot, &client_hex, "");
                     }
                     result
@@ -620,7 +627,7 @@ fn handle_nip44_encrypt(
         None => return build_error_json(&request.id, -3, "plaintext param must be a string"),
     };
 
-    let signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
+    let mut signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("nip44_encrypt: key derivation failed: {e}");
@@ -630,16 +637,21 @@ fn handle_nip44_encrypt(
 
     let peer_bytes = match hex_decode_32(peer_hex) {
         Some(b) => b,
-        None => return build_error_json(&request.id, -3, "peer pubkey must be 64-char hex"),
+        None => {
+            signing_secret.zeroize();
+            return build_error_json(&request.id, -3, "peer pubkey must be 64-char hex");
+        }
     };
 
     let conv_key = match nip44::get_conversation_key(&signing_secret, &peer_bytes) {
         Ok(k) => k,
         Err(e) => {
+            signing_secret.zeroize();
             log::error!("nip44_encrypt: conversation key failed: {e}");
             return build_error_json(&request.id, -4, "conversation key derivation failed");
         }
     };
+    signing_secret.zeroize();
 
     let nonce = random_nonce_24();
     match nip44::encrypt(&conv_key, plaintext, &nonce) {
@@ -673,7 +685,7 @@ fn handle_nip44_decrypt(
         None => return build_error_json(&request.id, -3, "ciphertext param must be a string"),
     };
 
-    let signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
+    let mut signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("nip44_decrypt: key derivation failed: {e}");
@@ -683,16 +695,21 @@ fn handle_nip44_decrypt(
 
     let peer_bytes = match hex_decode_32(peer_hex) {
         Some(b) => b,
-        None => return build_error_json(&request.id, -3, "peer pubkey must be 64-char hex"),
+        None => {
+            signing_secret.zeroize();
+            return build_error_json(&request.id, -3, "peer pubkey must be 64-char hex");
+        }
     };
 
     let conv_key = match nip44::get_conversation_key(&signing_secret, &peer_bytes) {
         Ok(k) => k,
         Err(e) => {
+            signing_secret.zeroize();
             log::error!("nip44_decrypt: conversation key failed: {e}");
             return build_error_json(&request.id, -4, "conversation key derivation failed");
         }
     };
+    signing_secret.zeroize();
 
     match nip44::decrypt(&conv_key, ciphertext_b64) {
         Ok(plaintext) => {
@@ -725,7 +742,7 @@ fn handle_nip04_encrypt(
         None => return build_error_json(&request.id, -3, "plaintext param must be a string"),
     };
 
-    let signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
+    let mut signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("nip04_encrypt: key derivation failed: {e}");
@@ -735,16 +752,21 @@ fn handle_nip04_encrypt(
 
     let peer_bytes = match hex_decode_32(peer_hex) {
         Some(b) => b,
-        None => return build_error_json(&request.id, -3, "peer pubkey must be 64-char hex"),
+        None => {
+            signing_secret.zeroize();
+            return build_error_json(&request.id, -3, "peer pubkey must be 64-char hex");
+        }
     };
 
     let shared_secret = match nip04::get_shared_secret(&signing_secret, &peer_bytes) {
         Ok(s) => s,
         Err(e) => {
+            signing_secret.zeroize();
             log::error!("nip04_encrypt: shared secret failed: {e}");
             return build_error_json(&request.id, -4, "shared secret derivation failed");
         }
     };
+    signing_secret.zeroize();
 
     let iv = random_iv_16();
     match nip04::encrypt(&shared_secret, plaintext, &iv) {
@@ -778,7 +800,7 @@ fn handle_nip04_decrypt(
         None => return build_error_json(&request.id, -3, "ciphertext param must be a string"),
     };
 
-    let signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
+    let mut signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("nip04_decrypt: key derivation failed: {e}");
@@ -788,16 +810,21 @@ fn handle_nip04_decrypt(
 
     let peer_bytes = match hex_decode_32(peer_hex) {
         Some(b) => b,
-        None => return build_error_json(&request.id, -3, "peer pubkey must be 64-char hex"),
+        None => {
+            signing_secret.zeroize();
+            return build_error_json(&request.id, -3, "peer pubkey must be 64-char hex");
+        }
     };
 
     let shared_secret = match nip04::get_shared_secret(&signing_secret, &peer_bytes) {
         Ok(s) => s,
         Err(e) => {
+            signing_secret.zeroize();
             log::error!("nip04_decrypt: shared secret failed: {e}");
             return build_error_json(&request.id, -4, "shared secret derivation failed");
         }
     };
+    signing_secret.zeroize();
 
     match nip04::decrypt(&shared_secret, ciphertext) {
         Ok(plaintext) => {

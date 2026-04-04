@@ -155,7 +155,12 @@ fn main() {
         log::info!("PIN protection active — waiting for unlock");
         oled::show_error(&mut display, "PIN locked\nAwait unlock...");
 
-        let mut failed_attempts: u8 = 0;
+        // Load the persisted failed-attempt counter so the wipe threshold
+        // survives power cycles (attacker cannot reset by rebooting).
+        let mut failed_attempts: u8 = pin::read_failed_attempts(&nvs);
+        if failed_attempts > 0 {
+            log::warn!("PIN: {} failed attempt(s) carried over from previous boot", failed_attempts);
+        }
         loop {
             let frame = protocol::read_frame(&mut usb);
             match frame.frame_type {
@@ -163,7 +168,7 @@ fn main() {
                     if pin::handle_pin_unlock(
                         &mut usb,
                         &frame.payload,
-                        &nvs,
+                        &mut nvs,
                         &mut failed_attempts,
                         &mut display,
                     ) {
@@ -461,8 +466,14 @@ fn main() {
 
             // 0x29 — revoke a TOFU-approved client
             FRAME_TYPE_POLICY_REVOKE => {
+                // Requires bridge authentication — prevents USB attacker silently
+                // revoking approved clients and forcing re-TOFU with a hostile key.
+                if !policy_engine.bridge_authenticated {
+                    log::warn!("POLICY_REVOKE rejected — bridge not authenticated");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                }
                 // Payload: master_slot (1 byte) + client_pubkey_hex (64 bytes ASCII)
-                if frame.payload.len() < 65 {
+                else if frame.payload.len() < 65 {
                     log::warn!("POLICY_REVOKE payload too short ({} bytes)", frame.payload.len());
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
                 } else {
@@ -488,8 +499,15 @@ fn main() {
 
             // 0x2A — update/add a client policy
             FRAME_TYPE_POLICY_UPDATE => {
+                // Requires bridge authentication — prevents USB attacker injecting
+                // an auto-approve policy for a malicious client pubkey without
+                // physical consent.
+                if !policy_engine.bridge_authenticated {
+                    log::warn!("POLICY_UPDATE rejected — bridge not authenticated");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                }
                 // Payload: master_slot (1 byte) + JSON ClientPolicy
-                if frame.payload.len() < 2 {
+                else if frame.payload.len() < 2 {
                     log::warn!("POLICY_UPDATE payload too short");
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
                 } else {
@@ -511,7 +529,13 @@ fn main() {
 
             // 0x2B -- bunker URI request (bridge asks for the full URI with secret)
             FRAME_TYPE_BUNKER_URI_REQUEST => {
-                if frame.payload.is_empty() {
+                // Requires bridge authentication — the bunker URI contains the
+                // connect_secret in plaintext. Only an authenticated bridge that
+                // already knows the bridge_secret may retrieve it.
+                if !policy_engine.bridge_authenticated {
+                    log::warn!("BUNKER_URI_REQUEST rejected — bridge not authenticated");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                } else if frame.payload.is_empty() {
                     log::warn!("BUNKER_URI_REQUEST missing master_slot byte");
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
                 } else {

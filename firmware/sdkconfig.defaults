@@ -8,9 +8,25 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 
 # Disable task watchdog — provisioning blocks on stdin indefinitely
+# SECURITY NOTE: In production (post-provisioning), watchdog should be enabled
+# to recover from hung signing operations. Tracked as a known hardening item.
 CONFIG_ESP_TASK_WDT_INIT=n
 
 # OTA support
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# SECURITY NOTE: NVS flash encryption is NOT enabled in this configuration.
+# Master private keys are stored in plaintext NVS — a physical flash dump
+# (JTAG in pre-fuse state or USB ROM mode) will expose key material.
+#
+# Production hardening (TODO):
+#   - Enable flash encryption: CONFIG_FLASH_ENCRYPTION_ENABLED=y
+#   - Enable NVS encryption: CONFIG_NVS_ENCRYPTION=y
+#   - Disable JTAG after provisioning (via eFuse or CONFIG_ESP_SYSTEM_JTAG_DISABLE)
+#   - Enable secure boot v2: CONFIG_SECURE_BOOT=y
+#
+# These are deferred because they require one-time eFuse burning that bricks
+# the device if done incorrectly. They must be done in a controlled production
+# flash step, not during development iteration.

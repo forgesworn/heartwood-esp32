@@ -5,6 +5,11 @@
 //
 // Two backends: k256 (default, for host/tests) and secp256k1 (C FFI, for
 // Xtensa firmware where k256's field arithmetic hangs).
+//
+// Only one backend may be active at a time. Activating both is a compile error.
+
+#[cfg(all(feature = "k256-backend", feature = "secp256k1-backend"))]
+compile_error!("heartwood-common: `k256-backend` and `secp256k1-backend` are mutually exclusive — enable exactly one");
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;

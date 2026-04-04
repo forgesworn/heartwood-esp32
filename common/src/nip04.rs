@@ -72,7 +72,10 @@ pub fn get_shared_secret(
 ) -> Result<[u8; 32], &'static str> {
     use secp256k1::{ecdh::shared_secret_point, PublicKey, Secp256k1, SecretKey};
 
-    let secp = Secp256k1::new();
+    // Use signing_only context (no expensive precomputed verification tables).
+    // On ESP32 a fresh Secp256k1::new() allocates ~130KB on the heap —
+    // signing_only is smaller and sufficient for ECDH.
+    let secp = Secp256k1::signing_only();
     let sk = SecretKey::from_slice(our_secret).map_err(|_| "invalid secret key")?;
 
     let mut full_pk_bytes = [0u8; 33];

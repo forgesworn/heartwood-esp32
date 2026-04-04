@@ -31,3 +31,5 @@ secp256k1-backend = ["dep:secp256k1"]
 nip46 = ["dep:serde", "dep:serde_json"]
 nip44 = ["dep:chacha20", "dep:hkdf", "dep:base64"]
 nip04 = ["dep:aes", "dep:cbc", "dep:base64"]
+# Convenience alias for secp256k1 backend with full feature set (used by firmware)
+firmware = ["secp256k1-backend", "nip46", "nip44", "nip04"]

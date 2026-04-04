@@ -13,6 +13,7 @@ use heartwood_common::types::{FRAME_TYPE_ACK, FRAME_TYPE_NACK};
 use crate::protocol;
 
 const NVS_PIN_HASH_KEY: &str = "pin_hash";
+const NVS_PIN_ATTEMPTS_KEY: &str = "pin_attempts";
 const MAX_FAILED_ATTEMPTS: u8 = 5;
 
 /// Check whether a PIN hash is stored in NVS.
@@ -52,14 +53,37 @@ fn hash_pin(pin: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Read the persisted failed-attempt counter from NVS.
+/// Returns 0 if not set or unreadable.
+pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> u8 {
+    let mut buf = [0u8; 1];
+    match nvs.get_blob(NVS_PIN_ATTEMPTS_KEY, &mut buf) {
+        Ok(Some(b)) if b.len() == 1 => buf[0],
+        _ => 0,
+    }
+}
+
+/// Persist the failed-attempt counter to NVS so it survives power cycles.
+fn write_failed_attempts(nvs: &mut EspNvs<NvsDefault>, count: u8) {
+    let _ = nvs.set_blob(NVS_PIN_ATTEMPTS_KEY, &[count]);
+}
+
+/// Clear the persisted failed-attempt counter (called on successful unlock).
+fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
+    let _ = nvs.remove(NVS_PIN_ATTEMPTS_KEY);
+}
+
 /// Handle a PIN_UNLOCK frame (0x26).
 ///
 /// Payload: ASCII PIN digits (4–8 bytes).
 /// Returns true if the device is now unlocked.
+///
+/// The failed-attempt counter is persisted to NVS so it survives power
+/// cycles — an attacker cannot bypass the wipe threshold by rebooting.
 pub fn handle_pin_unlock(
     usb: &mut UsbSerialDriver<'_>,
     payload: &[u8],
-    nvs: &EspNvs<NvsDefault>,
+    nvs: &mut EspNvs<NvsDefault>,
     failed_attempts: &mut u8,
     display: &mut crate::oled::Display<'_>,
 ) -> bool {
@@ -72,12 +96,14 @@ pub fn handle_pin_unlock(
     if verify_pin(nvs, payload) {
         log::info!("PIN verified — device unlocked");
         *failed_attempts = 0;
+        clear_failed_attempts(nvs);
         crate::oled::show_error(display, "Unlocked!");
         esp_idf_hal::delay::FreeRtos::delay_ms(500);
         protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
         true
     } else {
         *failed_attempts += 1;
+        write_failed_attempts(nvs, *failed_attempts);
         log::warn!("PIN incorrect — attempt {}/{}", failed_attempts, MAX_FAILED_ATTEMPTS);
 
         if *failed_attempts >= MAX_FAILED_ATTEMPTS {

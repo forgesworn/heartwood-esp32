@@ -380,26 +380,46 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
 
     // Cat sprite: 12 columns x 7 rows. Faces right, tail curves up on left.
     // Bit 11 = leftmost (col 0), bit 0 = rightmost (col 11).
-    const CAT_W: usize = 12;
+    // 4 walk frames for smooth animation.
     const CAT_H: usize = 7;
 
-    const CAT_A: [u16; CAT_H] = [
-        0x800, // #...........  tail tip
-        0x406, // .#.......##.  tail + ears
-        0x20E, // ..#.....###.  tail slope + head
-        0x1FE, // ...########.  body
-        0x1FE, // ...########.  body
-        0x0CC, // ....##..##..  legs (A)
-        0x124, // ...#..#..#..  paws (A)
-    ];
-    const CAT_B: [u16; CAT_H] = [
-        0x800, // #...........  tail tip
-        0x406, // .#.......##.  tail + ears
-        0x20E, // ..#.....###.  tail slope + head
-        0x1FE, // ...########.  body
-        0x1FE, // ...########.  body
-        0x186, // ...##....##.  legs (B)
-        0x204, // ..#......#..  paws (B)
+    const CAT: [[u16; CAT_H]; 4] = [
+        [ // Frame 0: right legs forward
+            0x800, // #...........  tail tip
+            0x406, // .#.......##.  tail + ears
+            0x20E, // ..#.....###.  tail slope + head
+            0x1FE, // ...########.  body
+            0x1FE, // ...########.  body
+            0x0CC, // ....##..##..  legs
+            0x124, // ...#..#..#..  paws
+        ],
+        [ // Frame 1: legs passing
+            0x800, // #...........
+            0x406, // .#.......##.
+            0x20E, // ..#.....###.
+            0x1FE, // ...########.
+            0x1FE, // ...########.
+            0x088, // ....#...#...  legs together
+            0x088, // ....#...#...  paws together
+        ],
+        [ // Frame 2: left legs forward
+            0x800, // #...........
+            0x406, // .#.......##.
+            0x20E, // ..#.....###.
+            0x1FE, // ...########.
+            0x1FE, // ...########.
+            0x186, // ...##....##.  legs wide
+            0x204, // ..#......#..  paws wide
+        ],
+        [ // Frame 3: legs passing (other way)
+            0x800, // #...........
+            0x406, // .#.......##.
+            0x20E, // ..#.....###.
+            0x1FE, // ...########.
+            0x1FE, // ...########.
+            0x088, // ....#...#...  legs together
+            0x088, // ....#...#...  paws together
+        ],
     ];
 
     let tiny = MonoTextStyleBuilder::new()
@@ -407,41 +427,57 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         .text_color(BinaryColor::On)
         .build();
 
-    // Screen grid: 25 cols x 8 rows in FONT_5X8.
-    const SCREEN_COLS: i32 = 25;
-    const SCREEN_ROWS: i32 = 8;
-
-    // Cat walks from left to right-of-centre.
-    // Position is in character cells (not pixels).
+    // Cat walks from off-screen left to off-screen right.
+    // Position in character cells. 2 cells per frame = fast walk.
+    // Screen is 25 cols wide. Cat is 12 wide. Total travel: -12 to 26 = 38 cells.
+    // At 2 cells/frame = 19 frames. Plus glitch frames.
     let mut cat_col: i32 = -12;
+    let cat_row: i32 = 1; // vertically centred on 8-row screen
+    let mut frame: u32 = 0;
+    let glitch_col: i32 = 8; // where the deja vu happens
 
-    for frame in 0u32..24 {
+    while cat_col < 26 {
         display.clear_buffer();
 
-        let sprite = if frame % 4 < 2 { &CAT_A } else { &CAT_B };
+        let sprite = &CAT[(frame as usize) % 4];
 
-        // Fill entire screen: 0 for background, 1 where the cat is.
-        for row in 0..SCREEN_ROWS {
-            for col in 0..SCREEN_COLS {
-                let is_cat = is_in_cat(sprite, col - cat_col, row - 1);
-                // Deja vu: second cat 8 cells behind, frames 12-15.
-                let is_ghost = frame >= 12 && frame <= 15
-                    && is_in_cat(sprite, col - (cat_col - 8), row - 1);
+        // Draw cat as 1s on black background (no 0s).
+        for row in 0..7i32 {
+            for col in 0..12i32 {
+                if is_in_cat(sprite, col, row) {
+                    let sx = (cat_col + col) * 5;
+                    let sy = (cat_row + row) * 8 + 7;
+                    if sx >= 0 && sx < 128 && sy >= 0 && sy < 64 {
+                        Text::new("1", Point::new(sx, sy), tiny)
+                            .draw(display).ok();
+                    }
+                }
+            }
+        }
 
-                let ch = if is_cat || is_ghost { b'1' } else { b'0' };
-                let buf = [ch];
-                let s = core::str::from_utf8(&buf).unwrap_or("0");
-                Text::new(s, Point::new(col * 5, row * 8 + 7), tiny)
-                    .draw(display).ok();
+        // Deja vu: when cat passes the glitch point, freeze for 3 frames
+        // with a ghost cat appearing behind.
+        if cat_col >= glitch_col && cat_col <= glitch_col + 2 {
+            let ghost_sprite = &CAT[((frame + 2) as usize) % 4];
+            for row in 0..7i32 {
+                for col in 0..12i32 {
+                    if is_in_cat(ghost_sprite, col, row) {
+                        let sx = (cat_col - 10 + col) * 5;
+                        let sy = (cat_row + row) * 8 + 7;
+                        if sx >= 0 && sx < 128 && sy >= 0 && sy < 64 {
+                            Text::new("1", Point::new(sx, sy), tiny)
+                                .draw(display).ok();
+                        }
+                    }
+                }
             }
         }
 
         display.flush().ok();
-        cat_col += 1;
-        FreeRtos::delay_ms(60);
+        frame += 1;
+        cat_col += 2; // fast walk
+        FreeRtos::delay_ms(50);
     }
-
-    FreeRtos::delay_ms(100);
 
     // Phase 2: HEARTWOOD decrypt reveal.
     const TITLE: &[u8] = b"HEARTWOOD";

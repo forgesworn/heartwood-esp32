@@ -119,7 +119,6 @@ pub fn handle_request(
                 }
                 heartwood_common::policy::ApprovalTier::OledNotify => {
                     crate::oled::show_auto_approved(display, master_label, "sign_event");
-                    esp_idf_hal::delay::FreeRtos::delay_ms(1000);
                     match handle_auto_sign(master_secret, secp, &request) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),

@@ -108,9 +108,8 @@ fn ecdh_shared_x(
     our_secret: &[u8; 32],
     peer_pubkey: &[u8; 32],
 ) -> Result<[u8; 32], &'static str> {
-    use secp256k1::{ecdh::shared_secret_point, PublicKey, Secp256k1, SecretKey};
+    use secp256k1::{ecdh::shared_secret_point, PublicKey, SecretKey};
 
-    let secp = Secp256k1::new();
     let sk = SecretKey::from_slice(our_secret).map_err(|_| "invalid secret key")?;
 
     let mut full_pk_bytes = [0u8; 33];

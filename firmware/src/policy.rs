@@ -68,6 +68,8 @@ pub struct PolicyEngine {
     pub sessions: Vec<ClientSession>,
     /// Whether a bridge session is authenticated.
     pub bridge_authenticated: bool,
+    /// Dirty flag: policies changed since last NVS write.
+    pub policies_dirty: bool,
 }
 
 impl PolicyEngine {
@@ -76,6 +78,7 @@ impl PolicyEngine {
             master_policies: Vec::new(),
             sessions: Vec::new(),
             bridge_authenticated: false,
+            policies_dirty: false,
         }
     }
 
@@ -86,6 +89,7 @@ impl PolicyEngine {
             master_slot,
             policies,
         });
+        self.policies_dirty = true;
     }
 
     /// Determine the approval tier for a request.
@@ -201,10 +205,14 @@ impl PolicyEngine {
                 });
             }
         }
+        self.policies_dirty = true;
     }
 
-    /// Persist all policies for a master slot to NVS.
-    pub fn persist_policies(&self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) {
+    /// Persist all policies for a master slot to NVS if changed since last write.
+    pub fn persist_policies(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) {
+        if !self.policies_dirty {
+            return;
+        }
         let policies = self.master_policies.iter().find(|mp| mp.master_slot == master_slot);
         let key = format!("policy_{master_slot}");
         match policies {
@@ -220,6 +228,7 @@ impl PolicyEngine {
             }
             None => { let _ = nvs.remove(&key); }
         }
+        self.policies_dirty = false;
     }
 
     /// Load persisted policies from NVS for all master slots.

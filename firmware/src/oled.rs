@@ -2,7 +2,7 @@
 //
 // OLED display helpers for the Heltec V4 built-in SSD1306 (128x64).
 
-use embedded_graphics::mono_font::ascii::FONT_7X14;
+use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_7X14, FONT_10X20};
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::BinaryColor;
@@ -358,6 +358,78 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Boot animation
+// ---------------------------------------------------------------------------
+
+/// Matrix-style boot animation.
+///
+/// Phase 1 (~2 s): random ASCII characters rain down all 21 columns in
+/// FONT_6X10 (128/6 = 21 cols, 64/10 = 6 rows), 20 frames at 100 ms each.
+/// Phase 2 (1 s): clear screen, show "HEARTWOOD" centred in FONT_10X20
+/// with "v0.5.0" below in FONT_6X10.
+pub fn show_boot_animation(display: &mut Display<'_>) {
+    // Simple Galois LFSR for cheap pseudo-random bytes with no heap use.
+    // Seed must be non-zero.
+    let mut lfsr: u16 = 0xACE1;
+    let mut next_byte = |lfsr: &mut u16| -> u8 {
+        let bit = *lfsr & 1;
+        *lfsr >>= 1;
+        if bit != 0 { *lfsr ^= 0xB400; }
+        (*lfsr & 0xFF) as u8
+    };
+
+    // Printable ASCII range: 0x21 ('!') to 0x7E ('~'), 94 characters.
+    const COLS: usize = 21;   // floor(128 / 6)
+    const ROWS: usize = 6;    // floor(64 / 10)
+    const FRAMES: u32 = 20;   // 20 * 100 ms = 2 s
+
+    let matrix_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    for _ in 0..FRAMES {
+        display.clear_buffer();
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                let ch = 0x21u8 + (next_byte(&mut lfsr) % 94);
+                let buf = [ch];
+                // Safety: ch is always in 0x21..=0x7E (printable ASCII).
+                let s = core::str::from_utf8(&buf).unwrap_or("?");
+                let x = (col * 6) as i32;
+                let y = ((row + 1) * 10) as i32;
+                Text::new(s, Point::new(x, y), matrix_style).draw(display).ok();
+            }
+        }
+        display.flush().ok();
+        FreeRtos::delay_ms(100);
+    }
+
+    // Phase 2: reveal screen.
+    display.clear_buffer();
+
+    let title_style = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    let sub_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // "HEARTWOOD": 9 chars * 10 px = 90 px wide, centred on 128 px display.
+    Text::new("HEARTWOOD", Point::new(19, 22), title_style).draw(display).ok();
+
+    // Version: 6 chars * 6 px = 36 px wide, centred.
+    let version = concat!("v", env!("CARGO_PKG_VERSION"));
+    let version_x = ((128 - version.len() as i32 * 6) / 2).max(0);
+    Text::new(version, Point::new(version_x, 50), sub_style).draw(display).ok();
+
+    display.flush().ok();
+    FreeRtos::delay_ms(1000);
 }
 
 // ---------------------------------------------------------------------------

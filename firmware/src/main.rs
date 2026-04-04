@@ -87,6 +87,9 @@ fn main() {
     let mut display = oled::init(i2c, peripherals.pins.gpio21.into());
     log::info!("OLED init complete");
 
+    // --- Boot animation ---
+    oled::show_boot_animation(&mut display);
+
     // --- Button pin (GPIO 0, active low, internal pull-up) ---
     let button_pin =
         PinDriver::input(peripherals.pins.gpio0, esp_idf_hal::gpio::Pull::Up).expect("button pin");

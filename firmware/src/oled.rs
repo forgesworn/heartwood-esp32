@@ -378,28 +378,28 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         (*lfsr & 0xFF) as u8
     };
 
-    // Cat sprite: 10 columns x 6 rows of character cells.
-    // Each u16 row is a bitmask; bit 0 = rightmost (head side).
-    // Cat faces right. Tail extends left.
-    // Two frames for walk cycle.
-    const CAT_W: usize = 10;
-    const CAT_H: usize = 6;
+    // Cat sprite: 12 columns x 7 rows. Faces right, tail curves up on left.
+    // Bit 11 = leftmost (col 0), bit 0 = rightmost (col 11).
+    const CAT_W: usize = 12;
+    const CAT_H: usize = 7;
 
     const CAT_A: [u16; CAT_H] = [
-        0b0000000101, // ......#.#.  ears
-        0b0000001111, // .....####.  head
-        0b0000001001, // .....#..#.  eyes
-        0b1111111111, // ##########  body + tail
-        0b0000110010, // ...##..#..  legs (A)
-        0b0001000010, // ..#....#..  paws (A)
+        0x800, // #...........  tail tip
+        0x406, // .#.......##.  tail + ears
+        0x20E, // ..#.....###.  tail slope + head
+        0x1FE, // ...########.  body
+        0x1FE, // ...########.  body
+        0x0CC, // ....##..##..  legs (A)
+        0x124, // ...#..#..#..  paws (A)
     ];
     const CAT_B: [u16; CAT_H] = [
-        0b0000000101, // ......#.#.  ears
-        0b0000001111, // .....####.  head
-        0b0000001001, // .....#..#.  eyes
-        0b1111111111, // ##########  body + tail
-        0b0000010011, // ....#..##.  legs (B)
-        0b0000100010, // ...#...#..  paws (B)
+        0x800, // #...........  tail tip
+        0x406, // .#.......##.  tail + ears
+        0x20E, // ..#.....###.  tail slope + head
+        0x1FE, // ...########.  body
+        0x1FE, // ...########.  body
+        0x186, // ...##....##.  legs (B)
+        0x204, // ..#......#..  paws (B)
     ];
 
     let tiny = MonoTextStyleBuilder::new()
@@ -407,31 +407,41 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         .text_color(BinaryColor::On)
         .build();
 
-    // Cat walks from left (-50) to right-of-centre (70), 4 px per frame.
-    // Total: ~30 frames * 50ms = 1.5s
-    let mut cat_x: i32 = -50;
-    let cat_y: i32 = 16; // vertically centred
+    // Screen grid: 25 cols x 8 rows in FONT_5X8.
+    const SCREEN_COLS: i32 = 25;
+    const SCREEN_ROWS: i32 = 8;
 
-    for frame in 0u32..30 {
+    // Cat walks from left to right-of-centre.
+    // Position is in character cells (not pixels).
+    let mut cat_col: i32 = -12;
+
+    for frame in 0u32..24 {
         display.clear_buffer();
 
         let sprite = if frame % 4 < 2 { &CAT_A } else { &CAT_B };
 
-        // Draw the cat.
-        draw_binary_cat(display, sprite, cat_x, cat_y, &tiny, &mut lfsr, &mut next_byte);
+        // Fill entire screen: 0 for background, 1 where the cat is.
+        for row in 0..SCREEN_ROWS {
+            for col in 0..SCREEN_COLS {
+                let is_cat = is_in_cat(sprite, col - cat_col, row - 1);
+                // Deja vu: second cat 8 cells behind, frames 12-15.
+                let is_ghost = frame >= 12 && frame <= 15
+                    && is_in_cat(sprite, col - (cat_col - 8), row - 1);
 
-        // Deja vu glitch: briefly show a second cat 20px behind.
-        if frame >= 14 && frame <= 17 {
-            draw_binary_cat(display, sprite, cat_x - 25, cat_y, &tiny, &mut lfsr, &mut next_byte);
+                let ch = if is_cat || is_ghost { b'1' } else { b'0' };
+                let buf = [ch];
+                let s = core::str::from_utf8(&buf).unwrap_or("0");
+                Text::new(s, Point::new(col * 5, row * 8 + 7), tiny)
+                    .draw(display).ok();
+            }
         }
 
         display.flush().ok();
-        cat_x += 4;
-        FreeRtos::delay_ms(50);
+        cat_col += 1;
+        FreeRtos::delay_ms(60);
     }
 
-    // Brief pause after cat exits.
-    FreeRtos::delay_ms(150);
+    FreeRtos::delay_ms(100);
 
     // Phase 2: HEARTWOOD decrypt reveal.
     const TITLE: &[u8] = b"HEARTWOOD";
@@ -480,41 +490,19 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         FreeRtos::delay_ms(60);
     }
 
-    // (draw_binary_cat is defined below)
 }
 
-/// Draw a cat sprite made of 0s and 1s at the given position.
-fn draw_binary_cat(
-    display: &mut Display<'_>,
-    sprite: &[u16; 6],
-    x: i32,
-    y: i32,
-    style: &embedded_graphics::mono_font::MonoTextStyle<'_, BinaryColor>,
-    lfsr: &mut u16,
-    next_byte: &mut dyn FnMut(&mut u16) -> u8,
-) {
-    for row in 0..6 {
-        for col in 0..10 {
-            // Bit 0 is rightmost. Column 0 is leftmost on screen.
-            // So we read bit (9 - col) for column col.
-            let bit = (sprite[row] >> (9 - col)) & 1;
-            if bit == 1 {
-                let ch = if next_byte(lfsr) & 1 == 0 { b'0' } else { b'1' };
-                let buf = [ch];
-                let s = core::str::from_utf8(&buf).unwrap_or("0");
-                let px = x + (col as i32 * 5);
-                let py = y + (row as i32 * 8);
-                // Only draw if on screen.
-                if px >= -5 && px < 128 && py >= 0 && py < 64 {
-                    Text::new(s, Point::new(px, py), *style).draw(display).ok();
-                }
-            }
-        }
+/// Check if a character cell (col, row) falls within the cat sprite.
+fn is_in_cat(sprite: &[u16; 7], col: i32, row: i32) -> bool {
+    if col < 0 || col >= 12 || row < 0 || row >= 7 {
+        return false;
     }
+    // Bit 11 = leftmost (col 0), bit 0 = rightmost (col 11).
+    (sprite[row as usize] >> (11 - col)) & 1 == 1
 }
 
 #[allow(dead_code)]
-fn _boot_phase2(display: &mut Display<'_>) {
+fn _unused(display: &mut Display<'_>) {
     // Phase 2: reveal.
     display.clear_buffer();
 

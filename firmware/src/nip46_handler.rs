@@ -130,7 +130,7 @@ pub fn handle_request(
                     // Use has_client (populated from _client_pubkey JSON in legacy mode)
                     // rather than client_pubkey.is_some() (only set in passthrough mode).
                     if has_client && !result.contains("\"error\"") {
-                        tofu_approve(policy_engine, master_slot, &client_hex);
+                        tofu_approve(policy_engine, master_slot, &client_hex, "");
                     }
                     result
                 }
@@ -141,6 +141,7 @@ pub fn handle_request(
 
         "connect" => {
             // params[0] is the client pubkey; params[1] is the optional secret.
+            // params[2] is optional JSON metadata: {"name":"nostrudel.ninja","url":"https://..."}
             // Register the client in a session so TOFU works for subsequent requests.
             if has_client {
                 if let Ok(pk_bytes) = hex_decode_32_safe(&client_hex) {
@@ -148,23 +149,30 @@ pub fn handle_request(
                 }
             }
 
+            // Extract app label from the optional third parameter (Bark sends this).
+            let app_label = request.params.get(2)
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+
             let client_secret = request.params.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let stored_secret_hex = hex_encode(connect_secret);
             if client_secret.is_empty() {
-                // No secret provided — accept but don't TOFU-approve.
+                // No secret provided -- accept but don't TOFU-approve.
                 nip46::build_connect_response(&request.id).unwrap_or_default()
             } else if constant_time_eq(client_secret.as_bytes(), stored_secret_hex.as_bytes()) {
-                // Secret matches — client proved it has the bunker URI.
+                // Secret matches -- client proved it has the bunker URI.
                 // TOFU: auto-approve this client for all safe methods so
                 // sign_event works immediately without button approval.
                 // Policy persistence happens in the main loop after we return.
                 if has_client {
-                    tofu_approve(policy_engine, master_slot, &client_hex);
+                    tofu_approve(policy_engine, master_slot, &client_hex, &app_label);
                     log::info!("TOFU: approved client on connect (secret verified)");
                 }
                 nip46::build_connect_response_with_secret(&request.id, &stored_secret_hex).unwrap_or_default()
             } else {
-                log::warn!("connect rejected — incorrect secret (master_slot={})", master_slot);
+                log::warn!("connect rejected -- incorrect secret (master_slot={})", master_slot);
                 build_error_json(&request.id, -1, "unauthorised")
             }
         }
@@ -372,7 +380,7 @@ fn handle_auto_sign(
 // TOFU approval
 // ---------------------------------------------------------------------------
 
-fn tofu_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &str) {
+fn tofu_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &str, label: &str) {
     use heartwood_common::policy::{ClientPolicy, TOFU_SAFE_METHODS};
 
     let existing = policy_engine.master_policies
@@ -381,19 +389,35 @@ fn tofu_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &
             && mp.policies.iter().any(|p| p.client_pubkey == client_hex));
 
     if existing {
+        // Update the label if we now have one and the existing policy doesn't.
+        if !label.is_empty() {
+            if let Some(mp) = policy_engine.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
+                if let Some(p) = mp.policies.iter_mut().find(|p| p.client_pubkey == client_hex) {
+                    if p.label.is_empty() {
+                        p.label = label.to_string();
+                        policy_engine.policies_dirty = true;
+                        log::info!("TOFU: updated label for {} -> {}", &client_hex[..16.min(client_hex.len())], label);
+                    }
+                }
+            }
+        }
         return;
     }
 
     let policy = ClientPolicy {
         client_pubkey: client_hex.to_string(),
-        label: String::new(),
+        label: label.to_string(),
         allowed_methods: TOFU_SAFE_METHODS.iter().map(|s| s.to_string()).collect(),
         allowed_kinds: vec![],
         auto_approve: true,
     };
 
     policy_engine.add_tofu_policy(master_slot, policy);
-    log::info!("TOFU: auto-approved client {}", &client_hex[..16.min(client_hex.len())]);
+    if label.is_empty() {
+        log::info!("TOFU: auto-approved client {}", &client_hex[..16.min(client_hex.len())]);
+    } else {
+        log::info!("TOFU: auto-approved client {} ({})", &client_hex[..16.min(client_hex.len())], label);
+    }
 }
 
 // ---------------------------------------------------------------------------

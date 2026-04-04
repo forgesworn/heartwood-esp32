@@ -378,47 +378,70 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         (*lfsr & 0xFF) as u8
     };
 
-    // Cat sprite: 12 columns x 7 rows. Faces right, tail curves up on left.
-    // Bit 11 = leftmost (col 0), bit 0 = rightmost (col 11).
-    // 4 walk frames for smooth animation.
+    // Cat sprite: 14 columns x 7 rows. Faces right, tail curves up on left.
+    // Bit 13 = col 0 (leftmost/tail), bit 0 = col 13 (rightmost/head).
+    // 6 walk frames: 2 tail positions x 3 leg positions.
     const CAT_H: usize = 7;
 
-    const CAT: [[u16; CAT_H]; 4] = [
-        [ // Frame 0: right legs forward
-            0x800, // #...........  tail tip
-            0x406, // .#.......##.  tail + ears
-            0x20E, // ..#.....###.  tail slope + head
-            0x1FE, // ...########.  body
-            0x1FE, // ...########.  body
-            0x0CC, // ....##..##..  legs
-            0x124, // ...#..#..#..  paws
+    // Common body rows:
+    // Row 2: ..#.....#####.  head with ear detail  = 0x083E
+    // Row 3: ...#########..  body upper             = 0x07FC
+    // Row 4: ...#########..  body lower             = 0x07FC
+
+    const CAT: [[u16; CAT_H]; 6] = [
+        [ // Frame 0: tail UP, legs stride right
+            0x2000, // #.............  tail tip high
+            0x1014, // .#.......#.#..  tail + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0318, // ....##...##...  legs stride
+            0x0408, // ...#......#...  paws wide
         ],
-        [ // Frame 1: legs passing
-            0x800, // #...........
-            0x406, // .#.......##.
-            0x20E, // ..#.....###.
-            0x1FE, // ...########.
-            0x1FE, // ...########.
-            0x088, // ....#...#...  legs together
-            0x088, // ....#...#...  paws together
+        [ // Frame 1: tail UP, legs passing
+            0x2000, // #.............  tail tip high
+            0x1014, // .#.......#.#..  tail + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0190, // .....##..#....  legs passing
+            0x0110, // .....#...#....  paws together
         ],
-        [ // Frame 2: left legs forward
-            0x800, // #...........
-            0x406, // .#.......##.
-            0x20E, // ..#.....###.
-            0x1FE, // ...########.
-            0x1FE, // ...########.
-            0x186, // ...##....##.  legs wide
-            0x204, // ..#......#..  paws wide
+        [ // Frame 2: tail UP, legs stride left
+            0x2000, // #.............  tail tip high
+            0x1014, // .#.......#.#..  tail + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0098, // ......#..##...  legs stride other
+            0x0108, // .....#....#...  paws
         ],
-        [ // Frame 3: legs passing (other way)
-            0x800, // #...........
-            0x406, // .#.......##.
-            0x20E, // ..#.....###.
-            0x1FE, // ...########.
-            0x1FE, // ...########.
-            0x088, // ....#...#...  legs together
-            0x088, // ....#...#...  paws together
+        [ // Frame 3: tail DOWN, legs stride right
+            0x0000, // ..............  no tip
+            0x3014, // ##.......#.#..  tail low + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0318, // ....##...##...  legs stride
+            0x0408, // ...#......#...  paws wide
+        ],
+        [ // Frame 4: tail DOWN, legs passing
+            0x0000, // ..............  no tip
+            0x3014, // ##.......#.#..  tail low + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0190, // .....##..#....  legs passing
+            0x0110, // .....#...#....  paws together
+        ],
+        [ // Frame 5: tail DOWN, legs stride left
+            0x0000, // ..............  no tip
+            0x3014, // ##.......#.#..  tail low + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0098, // ......#..##...  legs stride other
+            0x0108, // .....#....#...  paws
         ],
     ];
 
@@ -427,55 +450,59 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         .text_color(BinaryColor::On)
         .build();
 
-    // Cat walks from off-screen left to off-screen right.
-    // Position in character cells. 2 cells per frame = fast walk.
-    // Screen is 25 cols wide. Cat is 12 wide. Total travel: -12 to 26 = 38 cells.
-    // At 2 cells/frame = 19 frames. Plus glitch frames.
-    let mut cat_col: i32 = -12;
-    let cat_row: i32 = 1; // vertically centred on 8-row screen
-    let mut frame: u32 = 0;
-    let glitch_col: i32 = 8; // where the deja vu happens
+    const SPRITE_W: i32 = 14;
+    const SCREEN_COLS: i32 = 26; // 128/5 rounded up
 
-    while cat_col < 26 {
+    let cat_row: i32 = 0; // top of screen
+    let glitch_col: i32 = 7;
+
+    // Lead-in: 2 empty frames.
+    for _ in 0..2 {
+        display.clear_buffer();
+        display.flush().ok();
+        FreeRtos::delay_ms(50);
+    }
+
+    let mut cat_col: i32 = -SPRITE_W;
+    let mut frame: u32 = 0;
+
+    while cat_col < SCREEN_COLS {
         display.clear_buffer();
 
-        let sprite = &CAT[(frame as usize) % 4];
+        let sprite = &CAT[(frame as usize) % 6];
 
-        // Draw cat as 1s on black background (no 0s).
-        for row in 0..7i32 {
-            for col in 0..12i32 {
-                if is_in_cat(sprite, col, row) {
-                    let sx = (cat_col + col) * 5;
-                    let sy = (cat_row + row) * 8 + 7;
-                    if sx >= 0 && sx < 128 && sy >= 0 && sy < 64 {
-                        Text::new("1", Point::new(sx, sy), tiny)
-                            .draw(display).ok();
-                    }
-                }
-            }
+        // Draw the cat as 1s.
+        draw_sprite(display, sprite, cat_col, cat_row, &tiny);
+
+        // Deja vu glitch: ghost cat appears behind for 3 frames.
+        if cat_col >= glitch_col && cat_col <= glitch_col + 4 {
+            let ghost = &CAT[((frame + 3) as usize) % 6];
+            draw_sprite(display, ghost, cat_col - 12, cat_row, &tiny);
         }
 
-        // Deja vu: when cat passes the glitch point, freeze for 3 frames
-        // with a ghost cat appearing behind.
-        if cat_col >= glitch_col && cat_col <= glitch_col + 2 {
-            let ghost_sprite = &CAT[((frame + 2) as usize) % 4];
-            for row in 0..7i32 {
-                for col in 0..12i32 {
-                    if is_in_cat(ghost_sprite, col, row) {
-                        let sx = (cat_col - 10 + col) * 5;
-                        let sy = (cat_row + row) * 8 + 7;
-                        if sx >= 0 && sx < 128 && sy >= 0 && sy < 64 {
-                            Text::new("1", Point::new(sx, sy), tiny)
-                                .draw(display).ok();
-                        }
-                    }
-                }
+        // Moving ground: a scrolling line of dots at the bottom.
+        let ground_y = 63;
+        let ground_offset = (frame as i32 * 3) % 6;
+        for px in (0..128).step_by(6) {
+            let gx = px - ground_offset;
+            if gx >= 0 && gx < 128 {
+                use embedded_graphics::primitives::{Line, PrimitiveStyle};
+                Line::new(Point::new(gx, ground_y), Point::new(gx + 2, ground_y))
+                    .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+                    .draw(display).ok();
             }
         }
 
         display.flush().ok();
         frame += 1;
-        cat_col += 2; // fast walk
+        cat_col += 2;
+        FreeRtos::delay_ms(45);
+    }
+
+    // Lead-out: 2 empty frames.
+    for _ in 0..2 {
+        display.clear_buffer();
+        display.flush().ok();
         FreeRtos::delay_ms(50);
     }
 
@@ -528,13 +555,27 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
 
 }
 
-/// Check if a character cell (col, row) falls within the cat sprite.
-fn is_in_cat(sprite: &[u16; 7], col: i32, row: i32) -> bool {
-    if col < 0 || col >= 12 || row < 0 || row >= 7 {
-        return false;
+/// Draw a cat sprite as '1' characters at the given cell position.
+fn draw_sprite(
+    display: &mut Display<'_>,
+    sprite: &[u16; 7],
+    col_offset: i32,
+    row_offset: i32,
+    style: &embedded_graphics::mono_font::MonoTextStyle<'_, BinaryColor>,
+) {
+    for row in 0..7i32 {
+        for col in 0..14i32 {
+            // Bit 13 = col 0 (leftmost), bit 0 = col 13 (rightmost).
+            if (sprite[row as usize] >> (13 - col)) & 1 == 1 {
+                let sx = (col_offset + col) * 5;
+                let sy = (row_offset + row) * 8 + 7;
+                if sx >= 0 && sx < 128 && sy >= 0 && sy < 64 {
+                    Text::new("1", Point::new(sx, sy), *style)
+                        .draw(display).ok();
+                }
+            }
+        }
     }
-    // Bit 11 = leftmost (col 0), bit 0 = rightmost (col 11).
-    (sprite[row as usize] >> (11 - col)) & 1 == 1
 }
 
 #[allow(dead_code)]

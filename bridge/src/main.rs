@@ -21,10 +21,12 @@
 // The ESP32 is the brain — it holds the keys and makes all signing decisions.
 // This bridge is a dumb pipe that provides network access.
 
+mod api;
+
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
@@ -42,8 +44,8 @@ use heartwood_common::types::*;
 /// Thin wrapper around a raw file descriptor for serial I/O.
 /// Uses POSIX termios instead of the `serialport` crate to avoid
 /// DTR toggling on open (which reboots the ESP32-S3 via USB-CDC).
-struct RawSerial {
-    file: File,
+pub struct RawSerial {
+    pub file: File,
 }
 
 impl RawSerial {
@@ -149,11 +151,23 @@ struct Cli {
     #[arg(long)]
     bridge_secret: Option<String>,
 
-    /// Boot PIN (4–8 ASCII digits). When provided, the bridge sends a PIN_UNLOCK (0x26) frame
+    /// Boot PIN (4-8 ASCII digits). When provided, the bridge sends a PIN_UNLOCK (0x26) frame
     /// immediately after opening the serial port, before SESSION_AUTH. If the device has no
     /// PIN set (or is already unlocked) omit this argument entirely.
     #[arg(long)]
     pin: Option<String>,
+
+    /// Port for the management API (default 3100)
+    #[arg(long, default_value_t = 3100)]
+    api_port: u16,
+
+    /// Directory containing Sapwood dist/ files to serve. If omitted, only the API is available.
+    #[arg(long)]
+    sapwood_dir: Option<String>,
+
+    /// Enable CORS headers on API responses (auto-enabled when --sapwood-dir is not set)
+    #[arg(long)]
+    cors: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +564,43 @@ async fn main() -> Result<()> {
         }
     }
 
-    let port = Mutex::new(port);
+    let port = Arc::new(Mutex::new(port));
+
+    // Build the bunker URI for the API info endpoint.
+    let relay_list: Vec<String> = cli.relays.split(',')
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    let relay_params: String = relay_list.iter()
+        .map(|r| format!("relay={}", urlencoding::encode(r)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let bunker_uri = format!("bunker://{}?{}", bunker_pubkey.to_hex(), relay_params);
+
+    // Spawn the management API server.
+    let app_state = api::AppState {
+        serial: Arc::clone(&port),
+        bridge_info: Arc::new(api::BridgeInfo {
+            mode: if passthrough { "device-decrypts".into() } else { "bridge-decrypts".into() },
+            relays: relay_list.clone(),
+            bunker_uri: bunker_uri.clone(),
+            start_time: std::time::Instant::now(),
+        }),
+    };
+
+    let enable_cors = cli.cors || cli.sapwood_dir.is_none();
+    let api_router = api::router(app_state, cli.sapwood_dir.as_deref(), enable_cors);
+    let api_port = cli.api_port;
+
+    tokio::spawn(async move {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], api_port));
+        let listener = tokio::net::TcpListener::bind(addr).await
+            .expect("failed to bind API port");
+        log::info!("Management API listening on http://0.0.0.0:{api_port}");
+        if let Err(e) = axum::serve(listener, api_router).await {
+            log::error!("API server error: {e}");
+        }
+    });
 
     // Connect to relays
     let client = Client::new(bunker_keys.clone());

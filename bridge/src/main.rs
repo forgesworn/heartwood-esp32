@@ -7,13 +7,13 @@
 //
 // Two operating modes:
 //
-//   Passthrough mode (--bridge-secret provided):
+//   Device-decrypts mode (--bridge-secret provided):
 //     Authenticates with the ESP32 at startup via a SESSION_AUTH (0x21) frame.
 //     Forwards raw NIP-44 ciphertext to the ESP32 via ENCRYPTED_REQUEST (0x10)
 //     frames. The ESP32 decrypts, signs, re-encrypts and returns ENCRYPTED_RESPONSE
 //     (0x11). The bridge publishes the ciphertext verbatim — no crypto happens here.
 //
-//   Legacy mode (no --bridge-secret):
+//   Bridge-decrypts mode (no --bridge-secret):
 //     Bridge NIP-44 decrypts the request, forwards the plaintext NIP-46 JSON-RPC
 //     to the ESP32 via NIP46_REQUEST (0x02) frames, receives the plaintext response,
 //     NIP-44 encrypts it and publishes to the relay.
@@ -130,7 +130,7 @@ struct Cli {
     #[arg(short, long, default_value_t = 115200)]
     baud: u32,
 
-    /// Bunker secret key (nsec or hex) — used for relay auth and, in legacy mode, NIP-44 crypto
+    /// Bunker secret key (nsec or hex) — used for relay auth and, in bridge-decrypts mode, NIP-44 crypto
     #[arg(long)]
     bunker_secret: String,
 
@@ -145,7 +145,7 @@ struct Cli {
     data_dir: Option<String>,
 
     /// Bridge authentication secret (hex, 64 chars). Must match the ESP32's NVS bridge secret.
-    /// If provided, uses encrypted passthrough mode. If omitted, falls back to legacy mode.
+    /// If provided, uses device-decrypts mode. If omitted, falls back to bridge-decrypts mode.
     #[arg(long)]
     bridge_secret: Option<String>,
 
@@ -161,7 +161,7 @@ struct Cli {
 // ---------------------------------------------------------------------------
 
 /// Send a NIP-46 JSON-RPC request to the ESP32 over serial and read the response.
-/// Legacy mode only — forwards plaintext, expects a NIP46_RESPONSE (0x03) frame back.
+/// Bridge-decrypts mode only — forwards plaintext, expects a NIP46_RESPONSE (0x03) frame back.
 fn forward_to_esp32(
     port: &mut RawSerial,
     request_json: &str,
@@ -459,7 +459,7 @@ async fn main() -> Result<()> {
     log::info!("Bunker pubkey: {}", bunker_pubkey.to_bech32()?);
     log::info!(
         "Mode: {}",
-        if passthrough { "passthrough (encrypted)" } else { "legacy (bridge decrypts)" }
+        if passthrough { "device-decrypts (encrypted)" } else { "bridge-decrypts (plaintext)" }
     );
 
     // Write bunker-uri.txt so the heartwood-device web UI can serve it to Bark.
@@ -499,7 +499,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Authenticate with the ESP32 if running in passthrough mode
+    // Authenticate with the ESP32 if running in device-decrypts mode
     if let Some(secret) = &bridge_secret {
         if let Err(e) = authenticate_bridge(&mut port, secret) {
             panic!("Session authentication failed: {e}");
@@ -534,7 +534,7 @@ async fn main() -> Result<()> {
     client.subscribe(filter, None).await?;
     log::info!("Subscribed to NIP-46 events — waiting for requests...");
 
-    // Pre-compute the bunker pubkey bytes once (used in passthrough mode)
+    // Pre-compute the bunker pubkey bytes once (used in device-decrypts mode)
     let master_pubkey_bytes: [u8; 32] = bunker_pubkey.to_bytes();
 
     // Event loop — process incoming NIP-46 requests
@@ -560,7 +560,7 @@ async fn main() -> Result<()> {
 
                 if passthrough {
                     // -------------------------------------------------------
-                    // Passthrough mode — forward raw ciphertext to ESP32
+                    // Device-decrypts mode — forward raw ciphertext to ESP32
                     // -------------------------------------------------------
                     let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
@@ -595,7 +595,7 @@ async fn main() -> Result<()> {
                     }
                 } else {
                     // -------------------------------------------------------
-                    // Legacy mode — bridge does NIP-44 decrypt/encrypt
+                    // Bridge-decrypts mode — bridge does NIP-44 decrypt/encrypt
                     // -------------------------------------------------------
                     let plaintext = match nip44::decrypt(
                         bunker_keys.secret_key(),
@@ -610,7 +610,7 @@ async fn main() -> Result<()> {
                     };
 
                     // Inject the client pubkey so the ESP32 can identify
-                    // the client for TOFU policy in legacy mode.
+                    // the client for TOFU policy in bridge-decrypts mode.
                     let plaintext = if plaintext.starts_with('{') {
                         format!(
                             "{{\"_client_pubkey\":\"{}\",{}",

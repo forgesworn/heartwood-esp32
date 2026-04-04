@@ -364,15 +364,12 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
 // Boot animation
 // ---------------------------------------------------------------------------
 
-/// Matrix-style boot animation.
+/// Matrix-style boot animation -- characters drip from the top.
 ///
-/// Phase 1 (~2 s): random ASCII characters rain down all 21 columns in
-/// FONT_6X10 (128/6 = 21 cols, 64/10 = 6 rows), 20 frames at 100 ms each.
-/// Phase 2 (1 s): clear screen, show "HEARTWOOD" centred in FONT_10X20
-/// with "v0.5.0" below in FONT_6X10.
+/// Phase 1 (~1 s): columns of characters fall from top to bottom at
+/// different speeds, leaving trails. Like The Matrix, not an arcade self-test.
+/// Phase 2 (1 s): clear, show "HEARTWOOD" centred with version.
 pub fn show_boot_animation(display: &mut Display<'_>) {
-    // Simple Galois LFSR for cheap pseudo-random bytes with no heap use.
-    // Seed must be non-zero.
     let mut lfsr: u16 = 0xACE1;
     let mut next_byte = |lfsr: &mut u16| -> u8 {
         let bit = *lfsr & 1;
@@ -381,34 +378,48 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         (*lfsr & 0xFF) as u8
     };
 
-    // Printable ASCII range: 0x21 ('!') to 0x7E ('~'), 94 characters.
     const COLS: usize = 21;   // floor(128 / 6)
     const ROWS: usize = 6;    // floor(64 / 10)
-    const FRAMES: u32 = 20;   // 20 * 100 ms = 2 s
+    const FRAMES: u32 = 12;   // 12 * 80 ms ~ 1 second
 
     let matrix_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
 
-    for _ in 0..FRAMES {
+    // Each column has a "head" position that falls downward at its own speed.
+    // Speed is 1-3 rows per frame. Columns behind the head show random chars.
+    let mut head: [i32; COLS] = [0; COLS];   // current row of the falling head
+    let mut speed: [i32; COLS] = [0; COLS];  // rows per frame
+    let mut delay: [i32; COLS] = [0; COLS];  // frames before this column starts
+
+    for col in 0..COLS {
+        speed[col] = 1 + (next_byte(&mut lfsr) % 3) as i32;
+        delay[col] = (next_byte(&mut lfsr) % 6) as i32; // stagger start
+        head[col] = -(delay[col] * speed[col]); // start above screen
+    }
+
+    for _frame in 0..FRAMES {
         display.clear_buffer();
-        for row in 0..ROWS {
-            for col in 0..COLS {
+        for col in 0..COLS {
+            // Draw characters from row 0 down to the head position.
+            let max_row = (head[col] as usize).min(ROWS);
+            for row in 0..max_row {
                 let ch = 0x21u8 + (next_byte(&mut lfsr) % 94);
                 let buf = [ch];
-                // Safety: ch is always in 0x21..=0x7E (printable ASCII).
                 let s = core::str::from_utf8(&buf).unwrap_or("?");
                 let x = (col * 6) as i32;
                 let y = ((row + 1) * 10) as i32;
                 Text::new(s, Point::new(x, y), matrix_style).draw(display).ok();
             }
+            // Advance the head.
+            head[col] += speed[col];
         }
         display.flush().ok();
-        FreeRtos::delay_ms(100);
+        FreeRtos::delay_ms(80);
     }
 
-    // Phase 2: reveal screen.
+    // Phase 2: reveal.
     display.clear_buffer();
 
     let title_style = MonoTextStyleBuilder::new()
@@ -420,10 +431,8 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         .text_color(BinaryColor::On)
         .build();
 
-    // "HEARTWOOD": 9 chars * 10 px = 90 px wide, centred on 128 px display.
     Text::new("HEARTWOOD", Point::new(19, 22), title_style).draw(display).ok();
 
-    // Version: 6 chars * 6 px = 36 px wide, centred.
     let version = concat!("v", env!("CARGO_PKG_VERSION"));
     let version_x = ((128 - version.len() as i32 * 6) / 2).max(0);
     Text::new(version, Point::new(version_x, 50), sub_style).draw(display).ok();

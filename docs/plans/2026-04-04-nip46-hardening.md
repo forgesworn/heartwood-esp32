@@ -151,12 +151,40 @@ Tasks 1 and 3 are independent and quick -- parallelise them.
 Task 2 is the meatiest -- do after 1 and 3.
 Task 4 is investigative -- do last or in parallel with Task 2.
 
-## New roadmap items discovered this session
+## Session log: 2026-04-04
 
+### Shipped (heartwood-esp32)
+- Task 1: switch_relays handler for Coracle (firmware)
+- Task 2: Full TOFU policy management -- 4 frame types (0x27-0x2A), 3 PolicyEngine methods, provision CLI restructured with subcommands (40 tests across common + provision)
+- Task 3: nostur-com/nostur-ios-public#58 filed
+- Task 4: Serial latency -- 2s OLED delay fixed, bridge timing instrumentation added
+- Bridge management API -- axum HTTP server on :3100 with 8 endpoints (status, clients CRUD, factory reset, OTA, bridge info/restart). Serial contention via try_lock (423 on busy). CORS + static file serving.
+- NVS buffer increased from 4096 to 8192 bytes
+
+### Shipped (sapwood -- new public repo)
+- forgesworn/sapwood created, live at forgesworn.github.io/sapwood
+- Brand identity: Sapwood, "Shape your signer", sapwood.dev domain
+- Svelte 5 SPA: 7 tabs (Masters, Clients, Provision, Firmware, Logs, Settings, Danger)
+- TypeScript frame protocol (byte-compatible with Rust, 19 tests)
+- Web Serial transport (magic hunting, log separation)
+- HTTP transport (bridge API, dual-mode with Web Serial)
+- Browser-based provisioning (BIP-39/BIP-32 derivation, 10 tests, matches Rust vectors)
+- PIN management, bridge secret provisioning (USB only)
+- OTA firmware updates (USB + HTTP)
+- Factory reset, bridge restart
+- AI discoverability: README, llms.txt, MIT licence, 8 GitHub topics
+- 29 tests total, 55KB gzipped
+
+### Next session priorities
+- Test with real hardware -- plug in, connect, verify all features end-to-end
+- Apply serial latency fix (reduce VTIME from 100ms, test 230400 baud)
+- WebSocket log streaming (bridge needs background serial reader refactor)
+- Social preview image for sapwood repo
+- Add Heartwood + Sapwood to awesome-nostr
+- Register sapwood.dev domain
+- BLE connectivity for portable mode (deferred until firmware BLE lands)
+
+### Roadmap items discovered
 - Bark should appear as a remote signer on nostrapps.com
 - NWC wallet integration for hardware-signed zaps (bray's NWC stack + ESP32 sign_event kind 9734)
-- Sapwood management daemon on Pi -- always-running systemd service that controls the bridge (start/stop/restart), proxies management frames when bridge has the port, exposes HTTP API for Sapwood. Enables Sapwood to work in both modes: direct Web Serial (bridge off) or HTTP proxy (bridge on).
-- Sapwood social preview image
-- Add Heartwood + Sapwood to awesome-nostr
-- Register sapwood.dev domain, point to GitHub Pages
-- Sapwood BLE connectivity for portable mode (requires: management frame rate limiting in firmware, BLE pairing button press, CSP headers)
+- esptool-js integration for first-time browser flashing (like Meshtastic web flasher)

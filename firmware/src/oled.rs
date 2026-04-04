@@ -364,11 +364,11 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
 // Boot animation
 // ---------------------------------------------------------------------------
 
-/// Matrix-style boot animation -- sparse character drips from top.
+/// Boot animation: decrypt reveal.
 ///
-/// Phase 1 (~1.2 s): a few columns at a time, each with a single character
-/// that drips downward leaving a trail of itself. Sparse, not filling the screen.
-/// Phase 2 (1 s): clear, show "HEARTWOOD" centred with version.
+/// "HEARTWOOD" starts as scrambled characters, then each letter resolves
+/// left to right like a computer cracking a code. Unresolved letters
+/// cycle randomly each frame. Fast, clean, impressive.
 pub fn show_boot_animation(display: &mut Display<'_>) {
     let mut lfsr: u16 = 0xACE1;
     let mut next_byte = |lfsr: &mut u16| -> u8 {
@@ -378,73 +378,49 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         (*lfsr & 0xFF) as u8
     };
 
-    const COLS: usize = 21;   // floor(128 / 6)
-    const ROWS: usize = 6;    // floor(64 / 10)
-    const FRAMES: u32 = 15;   // 15 * 80 ms ~ 1.2 seconds
+    const TITLE: &[u8] = b"HEARTWOOD";
+    const LEN: usize = 9;
+    // FONT_10X20: 9 chars * 10 px = 90 px. Centred on 128 px: x = 19.
+    const START_X: i32 = 19;
+    const Y: i32 = 35; // vertically centred-ish on 64 px
 
-    let matrix_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+    let big_style = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
         .text_color(BinaryColor::On)
         .build();
 
-    // Each column: head position, the character it drips, whether active.
-    let mut head: [i32; COLS] = [0; COLS];
-    let mut ch: [u8; COLS] = [0; COLS];
-    let mut active: [bool; COLS] = [false; COLS];
-    // Persistent trail buffer: what character is in each cell.
-    let mut grid: [[u8; ROWS]; COLS] = [[0; ROWS]; COLS];
+    // Phase 1: 3 frames of pure scramble (builds tension).
+    // Phase 2: resolve one letter every 2 frames (9 letters * 2 = 18 frames).
+    // Phase 3: hold the resolved title for a beat.
+    // Total: 3 + 18 + 4 = 25 frames * 60ms = 1.5 seconds.
 
-    // Start ~6 columns with staggered delays.
-    for col in 0..COLS {
-        if next_byte(&mut lfsr) % 3 == 0 {
-            active[col] = true;
-            ch[col] = 0x21 + (next_byte(&mut lfsr) % 94);
-            head[col] = -((next_byte(&mut lfsr) % 8) as i32); // stagger
-        }
-    }
+    let mut resolved: usize = 0; // how many chars resolved so far
 
-    for frame in 0..FRAMES {
+    for frame in 0u32..25 {
         display.clear_buffer();
 
-        // Advance active columns.
-        for col in 0..COLS {
-            if active[col] {
-                head[col] += 1;
-                let row = head[col];
-                if row >= 0 && (row as usize) < ROWS {
-                    grid[col][row as usize] = ch[col];
-                }
-                if row >= ROWS as i32 {
-                    active[col] = false;
-                }
-            }
+        // Resolve one more letter every 2 frames after the initial scramble.
+        if frame >= 3 && frame % 2 == 1 && resolved < LEN {
+            resolved += 1;
         }
 
-        // Activate a new column occasionally for ongoing drip effect.
-        if frame % 3 == 0 {
-            let col = (next_byte(&mut lfsr) as usize) % COLS;
-            if !active[col] {
-                active[col] = true;
-                ch[col] = 0x21 + (next_byte(&mut lfsr) % 94);
-                head[col] = 0;
-            }
-        }
-
-        // Draw the persistent trail.
-        for col in 0..COLS {
-            for row in 0..ROWS {
-                if grid[col][row] != 0 {
-                    let buf = [grid[col][row]];
-                    let s = core::str::from_utf8(&buf).unwrap_or("?");
-                    let x = (col * 6) as i32;
-                    let y = ((row + 1) * 10) as i32;
-                    Text::new(s, Point::new(x, y), matrix_style).draw(display).ok();
-                }
-            }
+        // Draw each character position.
+        for i in 0..LEN {
+            let ch = if i < resolved {
+                // Resolved: show the real letter.
+                TITLE[i]
+            } else {
+                // Unresolved: show a cycling random character.
+                0x21 + (next_byte(&mut lfsr) % 94)
+            };
+            let buf = [ch];
+            let s = core::str::from_utf8(&buf).unwrap_or("?");
+            let x = START_X + (i as i32 * 10);
+            Text::new(s, Point::new(x, Y), big_style).draw(display).ok();
         }
 
         display.flush().ok();
-        FreeRtos::delay_ms(80);
+        FreeRtos::delay_ms(60);
     }
 
     // Phase 2: reveal.

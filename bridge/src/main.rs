@@ -318,12 +318,21 @@ fn forward_encrypted(
     let frame_bytes = frame::build_frame(FRAME_TYPE_ENCRYPTED_REQUEST, &payload)
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
+    let t_send = std::time::Instant::now();
+
     port.write_all(&frame_bytes)
         .map_err(|e| format!("serial write failed: {e}"))?;
     port.flush()
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
-    read_any_response(port)
+    log::debug!("serial: request sent ({} bytes, flush took {}ms)",
+        frame_bytes.len(), t_send.elapsed().as_millis());
+
+    let result = read_any_response(port);
+
+    log::info!("serial: total round-trip {}ms", t_send.elapsed().as_millis());
+
+    result
 }
 
 /// Read a response frame from the ESP32, accepting both NIP46_RESPONSE (0x03, plaintext)
@@ -332,22 +341,31 @@ fn forward_encrypted(
 /// Returns the payload as a UTF-8 string (either raw JSON or NIP-44 ciphertext).
 fn read_any_response(port: &mut RawSerial) -> Result<String, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let t_start = std::time::Instant::now();
+    let mut skipped_bytes: usize = 0;
 
     loop {
         if std::time::Instant::now() > deadline {
             return Err("timeout waiting for ESP32 response".into());
         }
 
-        // Hunt for magic bytes — skip ESP-IDF log output that pollutes USB-CDC.
+        // Hunt for magic bytes -- skip ESP-IDF log output that pollutes USB-CDC.
         let mut byte = [0u8; 1];
         match port.read(&mut byte) {
             Ok(1) => {
-                if byte[0] != 0x48 { continue; }
+                if byte[0] != 0x48 {
+                    skipped_bytes += 1;
+                    continue;
+                }
                 match port.read(&mut byte) {
                     Ok(1) if byte[0] == 0x57 => {}
-                    _ => continue,
+                    _ => { skipped_bytes += 1; continue; }
                 }
-                // Got magic — read header (type + length).
+
+                let t_magic = t_start.elapsed().as_millis();
+                log::debug!("serial: magic found after {}ms (skipped {} bytes)", t_magic, skipped_bytes);
+
+                // Got magic -- read header (type + length).
                 let mut header = [0u8; 3];
                 read_exact_deadline(port, &mut header, deadline)?;
                 let resp_type = header[0];
@@ -355,6 +373,11 @@ fn read_any_response(port: &mut RawSerial) -> Result<String, String> {
                 // Read payload + CRC.
                 let mut body = vec![0u8; length + 4];
                 read_exact_deadline(port, &mut body, deadline)?;
+
+                let t_read = t_start.elapsed().as_millis();
+                log::debug!("serial: frame read complete after {}ms (type=0x{:02x}, {} payload bytes)",
+                    t_read, resp_type, length);
+
                 // Reassemble and parse.
                 let mut buf = Vec::with_capacity(5 + length + 4);
                 buf.extend_from_slice(&MAGIC_BYTES);
@@ -367,14 +390,16 @@ fn read_any_response(port: &mut RawSerial) -> Result<String, String> {
                             || f.frame_type == FRAME_TYPE_ENCRYPTED_RESPONSE
                             || f.frame_type == FRAME_TYPE_PROVISION_LIST_RESPONSE
                         {
+                            log::debug!("serial: response parsed after {}ms total", t_start.elapsed().as_millis());
                             return String::from_utf8(f.payload)
                                 .map_err(|e| format!("invalid UTF-8 in response: {e}"));
                         } else if f.frame_type == FRAME_TYPE_NACK {
                             return Err("ESP32 sent NACK".into());
                         }
-                        // Other frame type — skip and keep hunting.
+                        // Other frame type -- skip and keep hunting.
+                        skipped_bytes = 0;
                     }
-                    Err(_) => continue,
+                    Err(_) => { skipped_bytes = 0; continue; }
                 }
             }
             Ok(_) => {}

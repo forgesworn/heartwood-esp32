@@ -340,6 +340,12 @@ pub fn handle_request(
             build_error_json(&request.id, -6, "not yet implemented")
         }
 
+        "switch_relays" => {
+            // Non-standard method sent by some clients (e.g. Coracle).
+            // Return success to avoid blocking the handshake.
+            nip46::build_result_response(&request.id, "{}").unwrap_or_default()
+        }
+
         other => {
             log::warn!("Unknown NIP-46 method: {other}");
             build_error_json(&request.id, -2, "unknown method")
@@ -437,7 +443,10 @@ fn handle_sign_event(
                 Ok(signed) => {
                     match nip46::build_sign_response(&request.id, &signed) {
                         Ok(json) => {
-                            crate::oled::show_result(display, "Signed!");
+                            // Use show_error (no delay) instead of show_result (2s delay)
+                            // to avoid blocking the response. The display gets overwritten
+                            // by show_boot after the frame is sent.
+                            crate::oled::show_error(display, "Signed!");
                             json
                         }
                         Err(e) => {
@@ -868,3 +877,60 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use heartwood_common::nip46;
+
+    /// switch_relays is a non-standard method sent by Coracle during its
+    /// NIP-46 handshake. The handler must return a success response (not an
+    /// error) so the handshake can complete normally.
+    #[test]
+    fn switch_relays_returns_success() {
+        let request_id = "test-switch-relays-1";
+
+        // Simulate what the handler does for the switch_relays arm.
+        let response_json = nip46::build_result_response(request_id, "{}").unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&response_json)
+            .expect("response should be valid JSON");
+
+        // The id must be echoed back.
+        assert_eq!(parsed["id"], request_id, "response id must match request id");
+
+        // result must be present and must not be an error.
+        assert!(
+            parsed.get("error").is_none(),
+            "switch_relays must not return an error field"
+        );
+        assert_eq!(
+            parsed["result"], "{}",
+            "switch_relays result should be an empty JSON object string"
+        );
+    }
+
+    /// Verify that the constant-time equality helper works correctly for the
+    /// connect secret validation path.
+    #[test]
+    fn constant_time_eq_equal_slices() {
+        let a = [0xabu8; 32];
+        let b = [0xabu8; 32];
+        assert!(super::constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn constant_time_eq_different_slices() {
+        let a = [0x00u8; 32];
+        let mut b = [0x00u8; 32];
+        b[31] = 0x01;
+        assert!(!super::constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!super::constant_time_eq(&[0u8; 32], &[0u8; 16]));
+    }
+}

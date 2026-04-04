@@ -92,6 +92,19 @@ fn busy() -> Response {
     api_err(StatusCode::LOCKED, "Device busy -- signing in progress")
 }
 
+/// Try to acquire the serial port with a few retries.
+/// The log poller holds the lock briefly (up to 100ms); retry a few times
+/// before giving up and returning 423.
+fn acquire_serial(state: &AppState) -> Result<std::sync::MutexGuard<'_, RawSerial>, Response> {
+    for _ in 0..10 {
+        if let Ok(guard) = state.serial.try_lock() {
+            return Ok(guard);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Err(busy())
+}
+
 // ---------------------------------------------------------------------------
 // Serial helpers
 // ---------------------------------------------------------------------------
@@ -186,7 +199,7 @@ async fn get_status(State(state): State<AppState>) -> Response {
     let result = tokio::task::spawn_blocking({
         let state = state.clone();
         move || -> Result<serde_json::Value, Response> {
-            let mut port = state.serial.try_lock().map_err(|_| busy())?;
+            let mut port = acquire_serial(&state)?;
             let frame_bytes = frame::build_frame(FRAME_TYPE_PROVISION_LIST, &[])
                 .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "frame build failed"))?;
             let resp = send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_PROVISION_LIST_RESPONSE], 10)?;
@@ -215,9 +228,9 @@ async fn get_status(State(state): State<AppState>) -> Response {
 
 async fn get_clients(State(state): State<AppState>, Path(slot): Path<u8>) -> Response {
     tokio::task::spawn_blocking(move || -> Response {
-        let mut port = match state.serial.try_lock() {
+        let mut port = match acquire_serial(&state) {
             Ok(p) => p,
-            Err(_) => return busy(),
+            Err(e) => return e,
         };
         let frame_bytes = match frame::build_frame(FRAME_TYPE_POLICY_LIST_REQUEST, &[slot]) {
             Ok(f) => f,
@@ -242,9 +255,9 @@ async fn delete_client(
         return api_err(StatusCode::BAD_REQUEST, "pubkey must be 64 hex chars");
     }
     tokio::task::spawn_blocking(move || -> Response {
-        let mut port = match state.serial.try_lock() {
+        let mut port = match acquire_serial(&state) {
             Ok(p) => p,
-            Err(_) => return busy(),
+            Err(e) => return e,
         };
         let mut payload = Vec::with_capacity(65);
         payload.push(slot);
@@ -269,9 +282,9 @@ async fn put_client(
     Json(body): Json<ClientPolicyBody>,
 ) -> Response {
     tokio::task::spawn_blocking(move || -> Response {
-        let mut port = match state.serial.try_lock() {
+        let mut port = match acquire_serial(&state) {
             Ok(p) => p,
-            Err(_) => return busy(),
+            Err(e) => return e,
         };
         let json = match serde_json::to_vec(&body) {
             Ok(j) => j,
@@ -296,9 +309,9 @@ async fn put_client(
 
 async fn factory_reset(State(state): State<AppState>) -> Response {
     tokio::task::spawn_blocking(move || -> Response {
-        let mut port = match state.serial.try_lock() {
+        let mut port = match acquire_serial(&state) {
             Ok(p) => p,
-            Err(_) => return busy(),
+            Err(e) => return e,
         };
         let frame_bytes = match frame::build_frame(FRAME_TYPE_FACTORY_RESET, &[]) {
             Ok(f) => f,
@@ -356,38 +369,40 @@ async fn handle_ws_logs(mut socket: WebSocket, mut rx: broadcast::Receiver<Strin
 
 /// Background task: poll the serial port for log output when the mutex is free.
 /// Reads non-frame bytes (ESP-IDF log lines) and broadcasts them.
+///
+/// Uses spawn_blocking for the serial read to avoid blocking tokio workers.
+/// With VMIN=0/VTIME=1, each read returns within 100ms even if no data arrives.
 pub async fn log_poller(serial: Arc<Mutex<RawSerial>>, tx: broadcast::Sender<String>) {
     let mut line_buf = String::new();
 
     loop {
-        // Try to grab the serial port briefly. If the relay loop or an API
-        // handler has it, skip this tick -- we only read logs when idle.
-        {
-            if let Ok(mut port) = serial.try_lock() {
-                let mut buf = [0u8; 256];
-                match port.file.read(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        // Decode bytes, split on newlines, broadcast complete lines.
-                        let text = String::from_utf8_lossy(&buf[..n]);
-                        line_buf.push_str(&text);
+        let serial = Arc::clone(&serial);
+        let read_result = tokio::task::spawn_blocking(move || {
+            let mut port = match serial.try_lock() {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
+            let mut buf = [0u8; 256];
+            match port.file.read(&mut buf) {
+                Ok(n) if n > 0 => Some(buf[..n].to_vec()),
+                _ => None,
+            }
+        }).await.unwrap_or(None);
 
-                        while let Some(pos) = line_buf.find('\n') {
-                            let line = line_buf[..pos].trim().to_string();
-                            line_buf = line_buf[pos + 1..].to_string();
-                            if !line.is_empty() {
-                                // Ignore send errors (no subscribers).
-                                let _ = tx.send(line);
-                            }
-                        }
-                    }
-                    _ => {}
+        if let Some(bytes) = read_result {
+            let text = String::from_utf8_lossy(&bytes);
+            line_buf.push_str(&text);
+
+            while let Some(pos) = line_buf.find('\n') {
+                let line = line_buf[..pos].trim().to_string();
+                line_buf = line_buf[pos + 1..].to_string();
+                if !line.is_empty() {
+                    let _ = tx.send(line);
                 }
             }
         }
 
-        // Short sleep to avoid busy-spinning. 50ms is responsive enough
-        // for log viewing without wasting CPU.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -408,9 +423,9 @@ async fn ota_upload(
     }
 
     tokio::task::spawn_blocking(move || -> Response {
-        let mut port = match state.serial.try_lock() {
+        let mut port = match acquire_serial(&state) {
             Ok(p) => p,
-            Err(_) => return busy(),
+            Err(e) => return e,
         };
 
         // Compute SHA-256 hash.

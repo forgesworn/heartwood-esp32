@@ -88,13 +88,12 @@ impl RawSerial {
         // Disable HUPCL (don't drop DTR on close)
         cfg.control_flags.remove(termios::ControlFlags::HUPCL);
 
-        // VMIN=1, VTIME=0 -- block until at least 1 byte arrives.
-        // Previous setting (VMIN=0, VTIME=1) added 100ms latency per read
-        // because VTIME=1 means "wait up to 100ms even if data is available."
-        // With VMIN=1/VTIME=0 the read returns as soon as any byte arrives,
-        // cutting serial round-trip from ~6s to <200ms for typical responses.
-        cfg.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 1;
-        cfg.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
+        // VMIN=0, VTIME=1 -- 100ms read timeout (non-blocking with short poll).
+        // VMIN=1/VTIME=0 would block until data arrives but breaks the serial
+        // drain at startup and the log poller. The 100ms poll is acceptable --
+        // the real latency fix was removing the 2s OLED delay in the firmware.
+        cfg.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 0;
+        cfg.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 1;
 
         termios::tcsetattr(fd, termios::SetArg::TCSANOW, &cfg)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -603,13 +602,20 @@ async fn main() -> Result<()> {
     let api_router = api::router(app_state, cli.sapwood_dir.as_deref(), enable_cors);
     let api_port = cli.api_port;
 
+    log::info!("Spawning management API on port {api_port}...");
     tokio::spawn(async move {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], api_port));
-        let listener = tokio::net::TcpListener::bind(addr).await
-            .expect("failed to bind API port");
-        log::info!("Management API listening on http://0.0.0.0:{api_port}");
-        if let Err(e) = axum::serve(listener, api_router).await {
-            log::error!("API server error: {e}");
+        log::info!("Binding API to {addr}...");
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                log::info!("Management API listening on http://0.0.0.0:{api_port}");
+                if let Err(e) = axum::serve(listener, api_router).await {
+                    log::error!("API server error: {e}");
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to bind API port {api_port}: {e}");
+            }
         }
     });
 

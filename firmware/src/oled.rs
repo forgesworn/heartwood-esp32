@@ -364,10 +364,10 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
 // Boot animation
 // ---------------------------------------------------------------------------
 
-/// Matrix-style boot animation -- characters drip from the top.
+/// Matrix-style boot animation -- sparse character drips from top.
 ///
-/// Phase 1 (~1 s): columns of characters fall from top to bottom at
-/// different speeds, leaving trails. Like The Matrix, not an arcade self-test.
+/// Phase 1 (~1.2 s): a few columns at a time, each with a single character
+/// that drips downward leaving a trail of itself. Sparse, not filling the screen.
 /// Phase 2 (1 s): clear, show "HEARTWOOD" centred with version.
 pub fn show_boot_animation(display: &mut Display<'_>) {
     let mut lfsr: u16 = 0xACE1;
@@ -380,41 +380,69 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
 
     const COLS: usize = 21;   // floor(128 / 6)
     const ROWS: usize = 6;    // floor(64 / 10)
-    const FRAMES: u32 = 12;   // 12 * 80 ms ~ 1 second
+    const FRAMES: u32 = 15;   // 15 * 80 ms ~ 1.2 seconds
 
     let matrix_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
 
-    // Each column has a "head" position that falls downward at its own speed.
-    // Speed is 1-3 rows per frame. Columns behind the head show random chars.
-    let mut head: [i32; COLS] = [0; COLS];   // current row of the falling head
-    let mut speed: [i32; COLS] = [0; COLS];  // rows per frame
-    let mut delay: [i32; COLS] = [0; COLS];  // frames before this column starts
+    // Each column: head position, the character it drips, whether active.
+    let mut head: [i32; COLS] = [0; COLS];
+    let mut ch: [u8; COLS] = [0; COLS];
+    let mut active: [bool; COLS] = [false; COLS];
+    // Persistent trail buffer: what character is in each cell.
+    let mut grid: [[u8; ROWS]; COLS] = [[0; ROWS]; COLS];
 
+    // Start ~6 columns with staggered delays.
     for col in 0..COLS {
-        speed[col] = 1 + (next_byte(&mut lfsr) % 3) as i32;
-        delay[col] = (next_byte(&mut lfsr) % 6) as i32; // stagger start
-        head[col] = -(delay[col] * speed[col]); // start above screen
+        if next_byte(&mut lfsr) % 3 == 0 {
+            active[col] = true;
+            ch[col] = 0x21 + (next_byte(&mut lfsr) % 94);
+            head[col] = -((next_byte(&mut lfsr) % 8) as i32); // stagger
+        }
     }
 
-    for _frame in 0..FRAMES {
+    for frame in 0..FRAMES {
         display.clear_buffer();
+
+        // Advance active columns.
         for col in 0..COLS {
-            // Draw characters from row 0 down to the head position.
-            let max_row = (head[col] as usize).min(ROWS);
-            for row in 0..max_row {
-                let ch = 0x21u8 + (next_byte(&mut lfsr) % 94);
-                let buf = [ch];
-                let s = core::str::from_utf8(&buf).unwrap_or("?");
-                let x = (col * 6) as i32;
-                let y = ((row + 1) * 10) as i32;
-                Text::new(s, Point::new(x, y), matrix_style).draw(display).ok();
+            if active[col] {
+                head[col] += 1;
+                let row = head[col];
+                if row >= 0 && (row as usize) < ROWS {
+                    grid[col][row as usize] = ch[col];
+                }
+                if row >= ROWS as i32 {
+                    active[col] = false;
+                }
             }
-            // Advance the head.
-            head[col] += speed[col];
         }
+
+        // Activate a new column occasionally for ongoing drip effect.
+        if frame % 3 == 0 {
+            let col = (next_byte(&mut lfsr) as usize) % COLS;
+            if !active[col] {
+                active[col] = true;
+                ch[col] = 0x21 + (next_byte(&mut lfsr) % 94);
+                head[col] = 0;
+            }
+        }
+
+        // Draw the persistent trail.
+        for col in 0..COLS {
+            for row in 0..ROWS {
+                if grid[col][row] != 0 {
+                    let buf = [grid[col][row]];
+                    let s = core::str::from_utf8(&buf).unwrap_or("?");
+                    let x = (col * 6) as i32;
+                    let y = ((row + 1) * 10) as i32;
+                    Text::new(s, Point::new(x, y), matrix_style).draw(display).ok();
+                }
+            }
+        }
+
         display.flush().ok();
         FreeRtos::delay_ms(80);
     }

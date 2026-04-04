@@ -8,11 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::extract::{Path, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 use heartwood_common::frame;
 use heartwood_common::types::*;
@@ -27,6 +29,7 @@ use crate::RawSerial;
 pub struct AppState {
     pub serial: Arc<Mutex<RawSerial>>,
     pub bridge_info: Arc<BridgeInfo>,
+    pub log_tx: broadcast::Sender<String>,
 }
 
 pub struct BridgeInfo {
@@ -331,6 +334,63 @@ async fn bridge_restart() -> Response {
     Json(OkResponse { ok: true }).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket log streaming
+// ---------------------------------------------------------------------------
+
+async fn ws_logs(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    let rx = state.log_tx.subscribe();
+    ws.on_upgrade(move |socket| handle_ws_logs(socket, rx))
+}
+
+async fn handle_ws_logs(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
+    while let Ok(line) = rx.recv().await {
+        if socket.send(Message::Text(line.into())).await.is_err() {
+            break; // Client disconnected.
+        }
+    }
+}
+
+/// Background task: poll the serial port for log output when the mutex is free.
+/// Reads non-frame bytes (ESP-IDF log lines) and broadcasts them.
+pub async fn log_poller(serial: Arc<Mutex<RawSerial>>, tx: broadcast::Sender<String>) {
+    let mut line_buf = String::new();
+
+    loop {
+        // Try to grab the serial port briefly. If the relay loop or an API
+        // handler has it, skip this tick -- we only read logs when idle.
+        {
+            if let Ok(mut port) = serial.try_lock() {
+                let mut buf = [0u8; 256];
+                match port.file.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        // Decode bytes, split on newlines, broadcast complete lines.
+                        let text = String::from_utf8_lossy(&buf[..n]);
+                        line_buf.push_str(&text);
+
+                        while let Some(pos) = line_buf.find('\n') {
+                            let line = line_buf[..pos].trim().to_string();
+                            line_buf = line_buf[pos + 1..].to_string();
+                            if !line.is_empty() {
+                                // Ignore send errors (no subscribers).
+                                let _ = tx.send(line);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Short sleep to avoid busy-spinning. 50ms is responsive enough
+        // for log viewing without wasting CPU.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 // OTA status codes (matches firmware/common)
 const OTA_STATUS_READY: u8 = 0x00;
 const OTA_STATUS_CHUNK_OK: u8 = 0x01;
@@ -444,6 +504,7 @@ pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> 
         .route("/api/device/ota", post(ota_upload))
         .route("/api/bridge/info", get(bridge_info))
         .route("/api/bridge/restart", post(bridge_restart))
+        .route("/api/logs", get(ws_logs))
         .with_state(state);
 
     if enable_cors {

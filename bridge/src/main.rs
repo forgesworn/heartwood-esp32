@@ -581,6 +581,9 @@ async fn main() -> Result<()> {
         .join("&");
     let bunker_uri = format!("bunker://{}?{}", bunker_pubkey.to_hex(), relay_params);
 
+    // Broadcast channel for log lines (WebSocket streaming).
+    let (log_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+
     // Spawn the management API server.
     let app_state = api::AppState {
         serial: Arc::clone(&port),
@@ -590,7 +593,11 @@ async fn main() -> Result<()> {
             bunker_uri: bunker_uri.clone(),
             start_time: std::time::Instant::now(),
         }),
+        log_tx: log_tx.clone(),
     };
+
+    // Spawn the background log poller (reads serial when idle, broadcasts to WebSocket clients).
+    tokio::spawn(api::log_poller(Arc::clone(&port), log_tx));
 
     let enable_cors = cli.cors || cli.sapwood_dir.is_none();
     let api_router = api::router(app_state, cli.sapwood_dir.as_deref(), enable_cors);

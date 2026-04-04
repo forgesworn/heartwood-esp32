@@ -194,8 +194,6 @@ fn authenticate_bridge(
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
-    let mut pos = 0;
 
     loop {
         if std::time::Instant::now() > deadline {
@@ -205,26 +203,33 @@ fn authenticate_bridge(
         let mut byte = [0u8; 1];
         match port.read(&mut byte) {
             Ok(1) => {
-                if pos < buf.len() {
-                    buf[pos] = byte[0];
-                    pos += 1;
+                if byte[0] != 0x48 { continue; }
+                match port.read(&mut byte) {
+                    Ok(1) if byte[0] == 0x57 => {}
+                    _ => continue,
                 }
-
-                if pos >= FRAME_OVERHEAD {
-                    match frame::parse_frame(&buf[..pos]) {
-                        Ok(f) if f.frame_type == FRAME_TYPE_SESSION_ACK => {
-                            if f.payload.first() == Some(&0x00) {
-                                log::info!("Bridge session authenticated");
-                                return Ok(());
-                            } else {
-                                return Err(format!(
-                                    "bridge auth failed: status 0x{:02x}",
-                                    f.payload.first().unwrap_or(&0xFF)
-                                ));
-                            }
+                let mut header = [0u8; 3];
+                read_exact_deadline(port, &mut header, deadline)?;
+                let resp_type = header[0];
+                let length = u16::from_be_bytes([header[1], header[2]]) as usize;
+                let mut body = vec![0u8; length + 4];
+                read_exact_deadline(port, &mut body, deadline)?;
+                let mut buf = Vec::with_capacity(5 + length + 4);
+                buf.extend_from_slice(&MAGIC_BYTES);
+                buf.push(resp_type);
+                buf.extend_from_slice(&header[1..3]);
+                buf.extend_from_slice(&body);
+                if let Ok(f) = frame::parse_frame(&buf) {
+                    if f.frame_type == FRAME_TYPE_SESSION_ACK {
+                        if f.payload.first() == Some(&0x00) {
+                            log::info!("Bridge session authenticated");
+                            return Ok(());
+                        } else {
+                            return Err(format!(
+                                "bridge auth failed: status 0x{:02x}",
+                                f.payload.first().unwrap_or(&0xFF)
+                            ));
                         }
-                        Err(frame::FrameError::TooShort) => continue,
-                        _ => continue,
                     }
                 }
             }
@@ -253,8 +258,6 @@ fn unlock_pin(
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
-    let mut pos = 0;
 
     loop {
         if std::time::Instant::now() > deadline {
@@ -264,22 +267,28 @@ fn unlock_pin(
         let mut byte = [0u8; 1];
         match port.read(&mut byte) {
             Ok(1) => {
-                if pos < buf.len() {
-                    buf[pos] = byte[0];
-                    pos += 1;
+                if byte[0] != 0x48 { continue; }
+                match port.read(&mut byte) {
+                    Ok(1) if byte[0] == 0x57 => {}
+                    _ => continue,
                 }
-
-                if pos >= FRAME_OVERHEAD {
-                    match frame::parse_frame(&buf[..pos]) {
-                        Ok(f) if f.frame_type == FRAME_TYPE_ACK => {
-                            log::info!("PIN unlock accepted");
-                            return Ok(());
-                        }
-                        Ok(f) if f.frame_type == FRAME_TYPE_NACK => {
-                            return Err("PIN unlock rejected (NACK) — wrong PIN".into());
-                        }
-                        Err(frame::FrameError::TooShort) => continue,
-                        _ => continue,
+                let mut header = [0u8; 3];
+                read_exact_deadline(port, &mut header, deadline)?;
+                let resp_type = header[0];
+                let length = u16::from_be_bytes([header[1], header[2]]) as usize;
+                let mut body = vec![0u8; length + 4];
+                read_exact_deadline(port, &mut body, deadline)?;
+                let mut buf = Vec::with_capacity(5 + length + 4);
+                buf.extend_from_slice(&MAGIC_BYTES);
+                buf.push(resp_type);
+                buf.extend_from_slice(&header[1..3]);
+                buf.extend_from_slice(&body);
+                if let Ok(f) = frame::parse_frame(&buf) {
+                    if f.frame_type == FRAME_TYPE_ACK {
+                        log::info!("PIN unlock accepted");
+                        return Ok(());
+                    } else if f.frame_type == FRAME_TYPE_NACK {
+                        return Err("PIN unlock rejected (NACK) — wrong PIN".into());
                     }
                 }
             }
@@ -322,8 +331,6 @@ fn forward_encrypted(
 ///
 /// Returns the payload as a UTF-8 string (either raw JSON or NIP-44 ciphertext).
 fn read_any_response(port: &mut RawSerial) -> Result<String, String> {
-    let mut buf = vec![0u8; MAX_PAYLOAD_SIZE + FRAME_OVERHEAD];
-    let mut pos = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
 
     loop {
@@ -331,45 +338,43 @@ fn read_any_response(port: &mut RawSerial) -> Result<String, String> {
             return Err("timeout waiting for ESP32 response".into());
         }
 
+        // Hunt for magic bytes — skip ESP-IDF log output that pollutes USB-CDC.
         let mut byte = [0u8; 1];
         match port.read(&mut byte) {
             Ok(1) => {
-                if pos < buf.len() {
-                    buf[pos] = byte[0];
-                    pos += 1;
+                if byte[0] != 0x48 { continue; }
+                match port.read(&mut byte) {
+                    Ok(1) if byte[0] == 0x57 => {}
+                    _ => continue,
                 }
-
-                if pos >= FRAME_OVERHEAD {
-                    match frame::parse_frame(&buf[..pos]) {
-                        Ok(response_frame) => {
-                            if response_frame.frame_type == FRAME_TYPE_NIP46_RESPONSE
-                                || response_frame.frame_type == FRAME_TYPE_ENCRYPTED_RESPONSE
-                            {
-                                return String::from_utf8(response_frame.payload)
-                                    .map_err(|e| format!("invalid UTF-8 in response: {e}"));
-                            } else if response_frame.frame_type == FRAME_TYPE_NACK {
-                                return Err("ESP32 sent NACK".into());
-                            } else {
-                                return Err(format!(
-                                    "unexpected frame type: 0x{:02x}",
-                                    response_frame.frame_type
-                                ));
-                            }
+                // Got magic — read header (type + length).
+                let mut header = [0u8; 3];
+                read_exact_deadline(port, &mut header, deadline)?;
+                let resp_type = header[0];
+                let length = u16::from_be_bytes([header[1], header[2]]) as usize;
+                // Read payload + CRC.
+                let mut body = vec![0u8; length + 4];
+                read_exact_deadline(port, &mut body, deadline)?;
+                // Reassemble and parse.
+                let mut buf = Vec::with_capacity(5 + length + 4);
+                buf.extend_from_slice(&MAGIC_BYTES);
+                buf.push(resp_type);
+                buf.extend_from_slice(&header[1..3]);
+                buf.extend_from_slice(&body);
+                match frame::parse_frame(&buf) {
+                    Ok(f) => {
+                        if f.frame_type == FRAME_TYPE_NIP46_RESPONSE
+                            || f.frame_type == FRAME_TYPE_ENCRYPTED_RESPONSE
+                            || f.frame_type == FRAME_TYPE_PROVISION_LIST_RESPONSE
+                        {
+                            return String::from_utf8(f.payload)
+                                .map_err(|e| format!("invalid UTF-8 in response: {e}"));
+                        } else if f.frame_type == FRAME_TYPE_NACK {
+                            return Err("ESP32 sent NACK".into());
                         }
-                        Err(frame::FrameError::TooShort) => continue,
-                        Err(_) => {
-                            // Bad frame — try to find the next magic byte sequence
-                            if let Some(magic_pos) =
-                                buf[1..pos].windows(2).position(|w| w == &MAGIC_BYTES)
-                            {
-                                let new_start = magic_pos + 1;
-                                buf.copy_within(new_start..pos, 0);
-                                pos -= new_start;
-                            } else {
-                                pos = 0;
-                            }
-                        }
+                        // Other frame type — skip and keep hunting.
                     }
+                    Err(_) => continue,
                 }
             }
             Ok(_) => {}
@@ -377,6 +382,27 @@ fn read_any_response(port: &mut RawSerial) -> Result<String, String> {
             Err(e) => return Err(format!("serial read error: {e}")),
         }
     }
+}
+
+/// Read exactly `buf.len()` bytes, respecting a deadline.
+fn read_exact_deadline(
+    port: &mut RawSerial,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let mut pos = 0;
+    while pos < buf.len() {
+        if std::time::Instant::now() > deadline {
+            return Err("timeout reading from serial".into());
+        }
+        match port.read(&mut buf[pos..]) {
+            Ok(n) if n > 0 => pos += n,
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("serial read failed: {e}")),
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

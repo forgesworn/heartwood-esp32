@@ -2,7 +2,7 @@
 //
 // OLED display helpers for the Heltec V4 built-in SSD1306 (128x64).
 
-use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_7X14, FONT_10X20};
+use embedded_graphics::mono_font::ascii::{FONT_5X8, FONT_6X10, FONT_7X14, FONT_10X20};
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::BinaryColor;
@@ -364,11 +364,11 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
 // Boot animation
 // ---------------------------------------------------------------------------
 
-/// Boot animation: decrypt reveal.
+/// Boot animation: binary cat + decrypt reveal.
 ///
-/// "HEARTWOOD" starts as scrambled characters, then each letter resolves
-/// left to right like a computer cracking a code. Unresolved letters
-/// cycle randomly each frame. Fast, clean, impressive.
+/// Phase 1: A cat made of 0s and 1s walks across the screen. At the centre
+/// it "glitches" (deja vu -- briefly appears twice). Like The Matrix.
+/// Phase 2: Screen clears, HEARTWOOD decrypts letter by letter.
 pub fn show_boot_animation(display: &mut Display<'_>) {
     let mut lfsr: u16 = 0xACE1;
     let mut next_byte = |lfsr: &mut u16| -> u8 {
@@ -378,39 +378,89 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         (*lfsr & 0xFF) as u8
     };
 
+    // Cat sprite: 10 columns x 6 rows of character cells.
+    // Each u16 row is a bitmask; bit 0 = rightmost (head side).
+    // Cat faces right. Tail extends left.
+    // Two frames for walk cycle.
+    const CAT_W: usize = 10;
+    const CAT_H: usize = 6;
+
+    const CAT_A: [u16; CAT_H] = [
+        0b0000000101, // ......#.#.  ears
+        0b0000001111, // .....####.  head
+        0b0000001001, // .....#..#.  eyes
+        0b1111111111, // ##########  body + tail
+        0b0000110010, // ...##..#..  legs (A)
+        0b0001000010, // ..#....#..  paws (A)
+    ];
+    const CAT_B: [u16; CAT_H] = [
+        0b0000000101, // ......#.#.  ears
+        0b0000001111, // .....####.  head
+        0b0000001001, // .....#..#.  eyes
+        0b1111111111, // ##########  body + tail
+        0b0000010011, // ....#..##.  legs (B)
+        0b0000100010, // ...#...#..  paws (B)
+    ];
+
+    let tiny = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Cat walks from left (-50) to right-of-centre (70), 4 px per frame.
+    // Total: ~30 frames * 50ms = 1.5s
+    let mut cat_x: i32 = -50;
+    let cat_y: i32 = 16; // vertically centred
+
+    for frame in 0u32..30 {
+        display.clear_buffer();
+
+        let sprite = if frame % 4 < 2 { &CAT_A } else { &CAT_B };
+
+        // Draw the cat.
+        draw_binary_cat(display, sprite, cat_x, cat_y, &tiny, &mut lfsr, &mut next_byte);
+
+        // Deja vu glitch: briefly show a second cat 20px behind.
+        if frame >= 14 && frame <= 17 {
+            draw_binary_cat(display, sprite, cat_x - 25, cat_y, &tiny, &mut lfsr, &mut next_byte);
+        }
+
+        display.flush().ok();
+        cat_x += 4;
+        FreeRtos::delay_ms(50);
+    }
+
+    // Brief pause after cat exits.
+    FreeRtos::delay_ms(150);
+
+    // Phase 2: HEARTWOOD decrypt reveal.
     const TITLE: &[u8] = b"HEARTWOOD";
     const LEN: usize = 9;
-    // FONT_10X20: 9 chars * 10 px = 90 px. Centred on 128 px: x = 19.
     const START_X: i32 = 19;
-    const Y: i32 = 35; // vertically centred-ish on 64 px
+    const Y: i32 = 35;
 
     let big_style = MonoTextStyleBuilder::new()
         .font(&FONT_10X20)
         .text_color(BinaryColor::On)
         .build();
+    let sub_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
 
-    // Phase 1: 3 frames of pure scramble (builds tension).
-    // Phase 2: resolve one letter every 2 frames (9 letters * 2 = 18 frames).
-    // Phase 3: hold the resolved title for a beat.
-    // Total: 3 + 18 + 4 = 25 frames * 60ms = 1.5 seconds.
-
-    let mut resolved: usize = 0; // how many chars resolved so far
+    let mut resolved: usize = 0;
 
     for frame in 0u32..25 {
         display.clear_buffer();
 
-        // Resolve one more letter every 2 frames after the initial scramble.
         if frame >= 3 && frame % 2 == 1 && resolved < LEN {
             resolved += 1;
         }
 
-        // Draw each character position.
         for i in 0..LEN {
             let ch = if i < resolved {
-                // Resolved: show the real letter.
                 TITLE[i]
             } else {
-                // Unresolved: show a cycling random character.
                 0x21 + (next_byte(&mut lfsr) % 94)
             };
             let buf = [ch];
@@ -419,10 +469,52 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
             Text::new(s, Point::new(x, Y), big_style).draw(display).ok();
         }
 
+        // Show version once title is fully resolved.
+        if resolved >= LEN {
+            let version = concat!("v", env!("CARGO_PKG_VERSION"));
+            let vx = ((128 - version.len() as i32 * 6) / 2).max(0);
+            Text::new(version, Point::new(vx, 56), sub_style).draw(display).ok();
+        }
+
         display.flush().ok();
         FreeRtos::delay_ms(60);
     }
 
+    // (draw_binary_cat is defined below)
+}
+
+/// Draw a cat sprite made of 0s and 1s at the given position.
+fn draw_binary_cat(
+    display: &mut Display<'_>,
+    sprite: &[u16; 6],
+    x: i32,
+    y: i32,
+    style: &embedded_graphics::mono_font::MonoTextStyle<'_, BinaryColor>,
+    lfsr: &mut u16,
+    next_byte: &mut dyn FnMut(&mut u16) -> u8,
+) {
+    for row in 0..6 {
+        for col in 0..10 {
+            // Bit 0 is rightmost. Column 0 is leftmost on screen.
+            // So we read bit (9 - col) for column col.
+            let bit = (sprite[row] >> (9 - col)) & 1;
+            if bit == 1 {
+                let ch = if next_byte(lfsr) & 1 == 0 { b'0' } else { b'1' };
+                let buf = [ch];
+                let s = core::str::from_utf8(&buf).unwrap_or("0");
+                let px = x + (col as i32 * 5);
+                let py = y + (row as i32 * 8);
+                // Only draw if on screen.
+                if px >= -5 && px < 128 && py >= 0 && py < 64 {
+                    Text::new(s, Point::new(px, py), *style).draw(display).ok();
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn _boot_phase2(display: &mut Display<'_>) {
     // Phase 2: reveal.
     display.clear_buffer();
 

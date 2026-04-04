@@ -491,6 +491,25 @@ async fn main() -> Result<()> {
 
     log::info!("Serial port {} open (no DTR — ESP32 not reset)", cli.port);
 
+    // Drain any stale data in the serial buffer from a previous bridge session.
+    // Without this, old response frames pollute the request/response pairing and
+    // every response is shifted by one, causing clients to ignore all replies.
+    {
+        let mut drain_buf = [0u8; 1024];
+        let mut total = 0;
+        loop {
+            match port.read(&mut drain_buf) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+                Err(_) => break,
+            }
+        }
+        if total > 0 {
+            log::info!("Drained {} stale bytes from serial buffer", total);
+        }
+    }
+
     // If a boot PIN was provided, unlock the device before doing anything else.
     // The ESP32 only accepts PIN_UNLOCK (0x26) and PROVISION_LIST (0x05) while locked.
     if let Some(pin) = &cli.pin {
@@ -623,7 +642,7 @@ async fn main() -> Result<()> {
 
                     log::info!(
                         "Decrypted request: {}",
-                        &plaintext[..plaintext.len().min(100)]
+                        &plaintext[..plaintext.len().min(300)]
                     );
 
                     let response_json = {

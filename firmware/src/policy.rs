@@ -194,6 +194,50 @@ impl PolicyEngine {
         self.bridge_authenticated = false;
     }
 
+    /// List all policies for a master slot.
+    pub fn list_policies(&self, master_slot: u8) -> &[ClientPolicy] {
+        self.master_policies
+            .iter()
+            .find(|mp| mp.master_slot == master_slot)
+            .map(|mp| mp.policies.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Remove a client policy by hex pubkey. Returns true if found and removed.
+    pub fn revoke_policy(&mut self, master_slot: u8, client_pubkey: &str) -> bool {
+        if let Some(mp) = self.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
+            let before = mp.policies.len();
+            mp.policies.retain(|p| p.client_pubkey != client_pubkey);
+            let removed = mp.policies.len() < before;
+            if removed {
+                self.policies_dirty = true;
+            }
+            removed
+        } else {
+            false
+        }
+    }
+
+    /// Upsert a client policy. Replaces if client_pubkey matches, otherwise adds.
+    pub fn upsert_policy(&mut self, master_slot: u8, policy: ClientPolicy) {
+        match self.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
+            Some(mp) => {
+                if let Some(existing) = mp.policies.iter_mut().find(|p| p.client_pubkey == policy.client_pubkey) {
+                    *existing = policy;
+                } else {
+                    mp.policies.push(policy);
+                }
+            }
+            None => {
+                self.master_policies.push(MasterPolicies {
+                    master_slot,
+                    policies: vec![policy],
+                });
+            }
+        }
+        self.policies_dirty = true;
+    }
+
     /// Add a TOFU-generated policy for a client.
     pub fn add_tofu_policy(&mut self, master_slot: u8, policy: ClientPolicy) {
         match self.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
@@ -236,7 +280,7 @@ impl PolicyEngine {
         let mut engine = Self::new();
         for slot in 0..master_count {
             let key = format!("policy_{slot}");
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 8192];
             if let Ok(Some(data)) = nvs.get_blob(&key, &mut buf) {
                 if let Ok(policies) = serde_json::from_slice::<Vec<ClientPolicy>>(data) {
                     let count = policies.len();

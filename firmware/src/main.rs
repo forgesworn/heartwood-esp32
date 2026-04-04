@@ -45,9 +45,11 @@ const IDLE_POLL_MS: u32 = 50;
 
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::types::{
-    FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
+    FRAME_TYPE_ACK, FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
-    FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_POLICY_PUSH,
+    FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
+    FRAME_TYPE_POLICY_LIST_REQUEST, FRAME_TYPE_POLICY_LIST_RESPONSE,
+    FRAME_TYPE_POLICY_PUSH, FRAME_TYPE_POLICY_REVOKE, FRAME_TYPE_POLICY_UPDATE,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
 };
@@ -431,6 +433,76 @@ fn main() {
                     &mut display,
                     &button_pin,
                 );
+            }
+
+            // 0x27 — list TOFU-approved clients for a master slot
+            FRAME_TYPE_POLICY_LIST_REQUEST => {
+                if frame.payload.is_empty() {
+                    log::warn!("POLICY_LIST_REQUEST missing master_slot byte");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                } else {
+                    let slot = frame.payload[0];
+                    let policies = policy_engine.list_policies(slot);
+                    match serde_json::to_vec(policies) {
+                        Ok(json) => {
+                            protocol::write_frame(&mut usb, FRAME_TYPE_POLICY_LIST_RESPONSE, &json);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to serialise policy list: {e}");
+                            protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                        }
+                    }
+                }
+            }
+
+            // 0x29 — revoke a TOFU-approved client
+            FRAME_TYPE_POLICY_REVOKE => {
+                // Payload: master_slot (1 byte) + client_pubkey_hex (64 bytes ASCII)
+                if frame.payload.len() < 65 {
+                    log::warn!("POLICY_REVOKE payload too short ({} bytes)", frame.payload.len());
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                } else {
+                    let slot = frame.payload[0];
+                    let pubkey_hex = match std::str::from_utf8(&frame.payload[1..65]) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            log::warn!("POLICY_REVOKE invalid UTF-8 in client pubkey");
+                            protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                            continue;
+                        }
+                    };
+                    if policy_engine.revoke_policy(slot, pubkey_hex) {
+                        policy_engine.persist_policies(&mut nvs, slot);
+                        log::info!("Revoked client policy for {}", &pubkey_hex[..8]);
+                        protocol::write_frame(&mut usb, FRAME_TYPE_ACK, &[]);
+                    } else {
+                        log::warn!("POLICY_REVOKE: no policy found for client");
+                        protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                    }
+                }
+            }
+
+            // 0x2A — update/add a client policy
+            FRAME_TYPE_POLICY_UPDATE => {
+                // Payload: master_slot (1 byte) + JSON ClientPolicy
+                if frame.payload.len() < 2 {
+                    log::warn!("POLICY_UPDATE payload too short");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                } else {
+                    let slot = frame.payload[0];
+                    match serde_json::from_slice::<heartwood_common::policy::ClientPolicy>(&frame.payload[1..]) {
+                        Ok(policy) => {
+                            log::info!("Upserted client policy for {}", &policy.client_pubkey[..policy.client_pubkey.len().min(8)]);
+                            policy_engine.upsert_policy(slot, policy);
+                            policy_engine.persist_policies(&mut nvs, slot);
+                            protocol::write_frame(&mut usb, FRAME_TYPE_ACK, &[]);
+                        }
+                        Err(e) => {
+                            log::warn!("POLICY_UPDATE: invalid JSON: {e}");
+                            protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                        }
+                    }
+                }
             }
 
             // 0x30 — OTA begin (sends size + expected SHA-256, triggers approval)

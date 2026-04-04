@@ -44,6 +44,12 @@ pub const FRAME_TYPE_FACTORY_RESET: u8 = 0x24;
 pub const FRAME_TYPE_SET_PIN: u8 = 0x25;
 pub const FRAME_TYPE_PIN_UNLOCK: u8 = 0x26;
 
+// --- Phase 5: policy management ---
+pub const FRAME_TYPE_POLICY_LIST_REQUEST: u8 = 0x27;  // host -> device: payload = master_slot (1 byte)
+pub const FRAME_TYPE_POLICY_LIST_RESPONSE: u8 = 0x28; // device -> host: payload = JSON Vec<ClientPolicy>
+pub const FRAME_TYPE_POLICY_REVOKE: u8 = 0x29;        // host -> device: payload = master_slot (1) + client_pubkey_hex (64 bytes ASCII)
+pub const FRAME_TYPE_POLICY_UPDATE: u8 = 0x2A;        // host -> device: payload = master_slot (1) + JSON ClientPolicy
+
 // --- OTA frame types ---
 pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;
 pub const FRAME_TYPE_OTA_CHUNK: u8 = 0x31;

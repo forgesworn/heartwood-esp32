@@ -109,7 +109,8 @@ mod tests {
     use super::*;
     use crate::types::{
         FRAME_TYPE_PROVISION, FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE,
-        FRAME_TYPE_ACK, MAX_PAYLOAD_SIZE,
+        FRAME_TYPE_ACK, FRAME_TYPE_POLICY_LIST_REQUEST, FRAME_TYPE_POLICY_LIST_RESPONSE,
+        FRAME_TYPE_POLICY_REVOKE, FRAME_TYPE_POLICY_UPDATE, MAX_PAYLOAD_SIZE,
     };
 
     #[test]
@@ -190,5 +191,49 @@ mod tests {
         assert_eq!(frame.frame_type, FRAME_TYPE_PROVISION);
         assert_eq!(frame.payload.len(), MAX_PAYLOAD_SIZE);
         assert_eq!(frame.payload, payload);
+    }
+
+    // --- Policy management frame roundtrips ---
+
+    #[test]
+    fn roundtrip_policy_list_request() {
+        let payload = vec![0x02]; // master_slot = 2
+        let bytes = build_frame(FRAME_TYPE_POLICY_LIST_REQUEST, &payload).unwrap();
+        let frame = parse_frame(&bytes).unwrap();
+        assert_eq!(frame.frame_type, FRAME_TYPE_POLICY_LIST_REQUEST);
+        assert_eq!(frame.payload, vec![0x02]);
+    }
+
+    #[test]
+    fn roundtrip_policy_list_response() {
+        // Simulated JSON payload.
+        let payload = br#"[{"client_pubkey":"aa","label":"test","auto_approve":true}]"#.to_vec();
+        let bytes = build_frame(FRAME_TYPE_POLICY_LIST_RESPONSE, &payload).unwrap();
+        let frame = parse_frame(&bytes).unwrap();
+        assert_eq!(frame.frame_type, FRAME_TYPE_POLICY_LIST_RESPONSE);
+        assert_eq!(frame.payload, payload);
+    }
+
+    #[test]
+    fn roundtrip_policy_revoke() {
+        // 1 byte slot + 64 bytes ASCII hex pubkey.
+        let mut payload = vec![0x00]; // slot 0
+        payload.extend_from_slice(&[b'a'; 64]);
+        let bytes = build_frame(FRAME_TYPE_POLICY_REVOKE, &payload).unwrap();
+        let frame = parse_frame(&bytes).unwrap();
+        assert_eq!(frame.frame_type, FRAME_TYPE_POLICY_REVOKE);
+        assert_eq!(frame.payload.len(), 65);
+        assert_eq!(frame.payload[0], 0);
+    }
+
+    #[test]
+    fn roundtrip_policy_update() {
+        // 1 byte slot + JSON payload.
+        let mut payload = vec![0x01]; // slot 1
+        payload.extend_from_slice(br#"{"client_pubkey":"bb","auto_approve":false}"#);
+        let bytes = build_frame(FRAME_TYPE_POLICY_UPDATE, &payload).unwrap();
+        let frame = parse_frame(&bytes).unwrap();
+        assert_eq!(frame.frame_type, FRAME_TYPE_POLICY_UPDATE);
+        assert_eq!(frame.payload[0], 1);
     }
 }

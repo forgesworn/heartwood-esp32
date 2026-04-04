@@ -96,17 +96,12 @@ impl PolicyEngine {
         method: &Nip46Method,
         event_kind: Option<u64>,
     ) -> ApprovalTier {
-        // If no bridge is authenticated, everything requires button.
-        if !self.bridge_authenticated {
-            return ApprovalTier::ButtonRequired;
-        }
-
-        // Methods that always auto-approve.
+        // Methods that always auto-approve (ping, connect, get_public_key).
         if method.always_auto_approve() {
             return ApprovalTier::AutoApprove;
         }
 
-        // Methods that always require button.
+        // Methods that always require button (heartwood_derive).
         if method.always_requires_button() {
             return ApprovalTier::ButtonRequired;
         }
@@ -117,6 +112,9 @@ impl PolicyEngine {
         }
 
         // Look up client policy for this master.
+        // Policies are consulted regardless of bridge authentication mode —
+        // TOFU policies created after physical button approval are valid in
+        // both legacy and passthrough modes.
         let policies = self
             .master_policies
             .iter()

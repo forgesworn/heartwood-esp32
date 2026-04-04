@@ -128,7 +128,9 @@ pub fn handle_request(
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
                     let result = handle_sign_event(master_secret, secp, display, button_pin, &request);
                     // TOFU: if approved and we have a client pubkey, remember this client.
-                    if client_pubkey.is_some() && !result.contains("\"error\"") {
+                    // Use has_client (populated from _client_pubkey JSON in legacy mode)
+                    // rather than client_pubkey.is_some() (only set in passthrough mode).
+                    if has_client && !result.contains("\"error\"") {
                         tofu_approve(policy_engine, master_slot, &client_hex);
                     }
                     result

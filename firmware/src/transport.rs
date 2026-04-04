@@ -121,7 +121,7 @@ pub fn handle_encrypted_request(
     policy_engine.persist_policies(nvs, master.slot);
 
     // Re-encrypt the response and send as a 0x11 frame.
-    let nonce = random_nonce_24();
+    let nonce = random_nonce_32();
     match nip44::encrypt(&conversation_key, &response_json, &nonce) {
         Ok(ciphertext_b64) => {
             // Response payload: [client_pubkey_32][ciphertext_b64...]
@@ -138,14 +138,14 @@ pub fn handle_encrypted_request(
     }
 }
 
-/// Fill a 24-byte buffer with cryptographically random bytes from the ESP-IDF
-/// hardware RNG. Used as the NIP-44 message nonce.
-fn random_nonce_24() -> [u8; 24] {
-    let mut nonce = [0u8; 24];
+/// Fill a 32-byte buffer with cryptographically random bytes from the ESP-IDF
+/// hardware RNG. Used as the NIP-44 per-message nonce.
+fn random_nonce_32() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
     unsafe {
         esp_idf_svc::sys::esp_fill_random(
             nonce.as_mut_ptr() as *mut core::ffi::c_void,
-            24,
+            32,
         );
     }
     nonce

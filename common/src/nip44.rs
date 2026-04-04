@@ -4,14 +4,14 @@
 //
 // Protocol:
 //   1. Derive a conversation key via ECDH + HKDF-SHA256.
-//   2. For each message, derive per-message keys from the conversation key
-//      and a 24-byte random nonce (HKDF-SHA256 → 88 bytes).
-//   3. Encrypt with XChaCha20 (stream cipher, not AEAD).
+//   2. For each message, derive per-message keys via HKDF-expand with the
+//      conversation key as PRK and a 32-byte random nonce as info (→ 76 bytes).
+//   3. Encrypt with ChaCha20 (12-byte nonce from HKDF output).
 //   4. Authenticate with HMAC-SHA256.
 //   5. Base64-encode the output.
 //
 // Wire format (before base64):
-//   version(1) || nonce(24) || ciphertext(N) || hmac(32)
+//   version(1) || nonce(32) || ciphertext(N) || hmac(32)
 //
 // where version = 0x02 for NIP-44 v2.
 //
@@ -21,7 +21,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chacha20::{
     cipher::{KeyIvInit, StreamCipher},
-    XChaCha20,
+    ChaCha20,
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -35,9 +35,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// NIP-44 v2 version byte.
 const VERSION: u8 = 0x02;
-
-/// Minimum padded plaintext length (bytes, includes 2-byte length prefix).
-const PAD_MIN: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Conversation key
@@ -56,13 +53,15 @@ pub fn get_conversation_key(
     conversation_key_from_shared_x(&shared_x)
 }
 
-/// Internal: HKDF step that takes a shared x-coordinate → conversation key.
+/// Internal: HKDF-extract that takes a shared x-coordinate → conversation key.
+///
+/// Per NIP-44 v2: `hkdf_extract(sha256, shared_x, "nip44-v2")`.
+/// This is extract only — no expand step.
 fn conversation_key_from_shared_x(shared_x: &[u8; 32]) -> Result<[u8; 32], &'static str> {
-    let hk = Hkdf::<Sha256>::new(Some(b"nip44-v2"), shared_x);
-    let mut okm = [0u8; 32];
-    hk.expand(&[], &mut okm)
-        .map_err(|_| "HKDF expand failed")?;
-    Ok(okm)
+    let (prk, _) = Hkdf::<Sha256>::extract(Some(b"nip44-v2"), shared_x);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&prk);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -127,28 +126,48 @@ fn ecdh_shared_x(
 // Padding
 // ---------------------------------------------------------------------------
 
-/// Pad plaintext for encryption.
+/// Pad plaintext for encryption per NIP-44 v2.
 ///
-/// Format: 2-byte big-endian length || plaintext || zero bytes to next power
-/// of two (minimum 32 bytes total).
+/// Format: 2-byte big-endian length || plaintext || zero bytes.
+/// Total length = 2 + calc_padded_len(msg_len).
+/// The 2-byte length prefix is outside the padded message block.
 fn pad(plaintext: &str) -> Result<Vec<u8>, &'static str> {
     let msg = plaintext.as_bytes();
     let msg_len = msg.len();
+    if msg_len == 0 {
+        return Err("plaintext must not be empty");
+    }
     if msg_len > 65535 {
         return Err("plaintext too long (max 65535 bytes)");
     }
 
-    // Calculate padded capacity: must be at least PAD_MIN and a power of two,
-    // large enough to hold 2 (length prefix) + message.
-    let content_len = 2 + msg_len;
-    let padded_len = next_power_of_two_min(content_len, PAD_MIN);
+    let padded_msg_len = calc_padded_len(msg_len);
+    let total_len = 2 + padded_msg_len;
 
-    let mut buf = vec![0u8; padded_len];
+    let mut buf = vec![0u8; total_len];
     buf[0] = ((msg_len >> 8) & 0xff) as u8;
     buf[1] = (msg_len & 0xff) as u8;
     buf[2..2 + msg_len].copy_from_slice(msg);
     // remaining bytes are zero (already zeroed)
     Ok(buf)
+}
+
+/// Calculate padded message length per NIP-44 v2.
+///
+/// For messages ≤ 32 bytes, pads to 32.
+/// For longer messages, rounds up to the next boundary that leaks minimal
+/// length information (based on powers of two with chunking).
+fn calc_padded_len(msg_len: usize) -> usize {
+    if msg_len <= 32 {
+        return 32;
+    }
+    // chunk = floor(log2(msg_len - 1)) - 4
+    let bits = usize::BITS - (msg_len - 1).leading_zeros();
+    let chunk = (bits as usize) - 1 - 4;
+    let chunk_size = 1usize << chunk;
+    // s = floor((msg_len - 1) / chunk_size) + 1
+    let s = (msg_len - 1) / chunk_size + 1;
+    s * chunk_size
 }
 
 /// Remove NIP-44 padding and return the original plaintext string.
@@ -163,39 +182,33 @@ fn unpad(data: &[u8]) -> Result<&str, &'static str> {
     core::str::from_utf8(&data[2..2 + msg_len]).map_err(|_| "invalid UTF-8 in plaintext")
 }
 
-/// Return the smallest value ≥ `n` and ≥ `min` that is a power of two.
-fn next_power_of_two_min(n: usize, min: usize) -> usize {
-    let mut v = n.max(min);
-    if v.count_ones() != 1 {
-        // round up to next power of two
-        v = 1usize << (usize::BITS - v.leading_zeros());
-    }
-    v
-}
 
 // ---------------------------------------------------------------------------
 // Message key derivation
 // ---------------------------------------------------------------------------
 
-/// Derive per-message keys from the conversation key and a 24-byte nonce.
+/// Derive per-message keys from the conversation key and a 32-byte nonce.
 ///
-/// Returns (chacha_key[32], chacha_nonce[24], hmac_key[32]).
+/// Uses HKDF-expand only (conversation key is already the PRK from the
+/// extract step during conversation key derivation). The nonce is the info
+/// parameter, producing 76 bytes: chacha_key(32) + chacha_nonce(12) + hmac_key(32).
 fn derive_message_keys(
     conversation_key: &[u8; 32],
-    nonce: &[u8; 24],
-) -> Result<([u8; 32], [u8; 24], [u8; 32]), &'static str> {
-    let hk = Hkdf::<Sha256>::new(Some(nonce.as_slice()), conversation_key);
-    let mut okm = [0u8; 88];
-    hk.expand(b"nip44-v2", &mut okm)
+    nonce: &[u8; 32],
+) -> Result<([u8; 32], [u8; 12], [u8; 32]), &'static str> {
+    let hk = Hkdf::<Sha256>::from_prk(conversation_key)
+        .map_err(|_| "HKDF from_prk failed")?;
+    let mut okm = [0u8; 76];
+    hk.expand(nonce.as_slice(), &mut okm)
         .map_err(|_| "HKDF expand (message keys) failed")?;
 
     let mut chacha_key = [0u8; 32];
-    let mut chacha_nonce = [0u8; 24];
+    let mut chacha_nonce = [0u8; 12];
     let mut hmac_key = [0u8; 32];
 
     chacha_key.copy_from_slice(&okm[..32]);
-    chacha_nonce.copy_from_slice(&okm[32..56]);
-    hmac_key.copy_from_slice(&okm[56..88]);
+    chacha_nonce.copy_from_slice(&okm[32..44]);
+    hmac_key.copy_from_slice(&okm[44..76]);
 
     Ok((chacha_key, chacha_nonce, hmac_key))
 }
@@ -206,7 +219,7 @@ fn derive_message_keys(
 
 /// Encrypt `plaintext` under `conversation_key` using the supplied `nonce`.
 ///
-/// The caller is responsible for providing a cryptographically random 24-byte
+/// The caller is responsible for providing a cryptographically random 32-byte
 /// nonce for each message.  Nonce reuse under the same conversation key is
 /// catastrophic — it fully reveals both plaintexts.
 ///
@@ -214,30 +227,31 @@ fn derive_message_keys(
 pub fn encrypt(
     conversation_key: &[u8; 32],
     plaintext: &str,
-    nonce: &[u8; 24],
+    nonce: &[u8; 32],
 ) -> Result<String, &'static str> {
     let padded = pad(plaintext)?;
     let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(conversation_key, nonce)?;
 
-    // Encrypt padded plaintext in-place with XChaCha20.
+    // Encrypt padded plaintext in-place with ChaCha20.
     let mut ciphertext = padded;
-    let mut cipher = XChaCha20::new(
+    let mut cipher = ChaCha20::new(
         chacha_key.as_slice().into(),
         chacha_nonce.as_slice().into(),
     );
     cipher.apply_keystream(&mut ciphertext);
 
-    // Build: version(1) || nonce(24) || ciphertext(N)
-    let mut payload = Vec::with_capacity(1 + 24 + ciphertext.len() + 32);
+    // HMAC-SHA256 over nonce || ciphertext (version byte excluded per NIP-44).
+    let mut mac = HmacSha256::new_from_slice(&hmac_key)
+        .map_err(|_| "HMAC init failed")?;
+    mac.update(nonce);
+    mac.update(&ciphertext);
+    let tag = mac.finalize().into_bytes();
+
+    // Build wire format: version(1) || nonce(32) || ciphertext(N) || hmac(32)
+    let mut payload = Vec::with_capacity(1 + 32 + ciphertext.len() + 32);
     payload.push(VERSION);
     payload.extend_from_slice(nonce);
     payload.extend_from_slice(&ciphertext);
-
-    // HMAC-SHA256 over the payload so far.
-    let mut mac = HmacSha256::new_from_slice(&hmac_key)
-        .map_err(|_| "HMAC init failed")?;
-    mac.update(&payload);
-    let tag = mac.finalize().into_bytes();
     payload.extend_from_slice(&tag);
 
     Ok(BASE64.encode(&payload))
@@ -259,8 +273,8 @@ pub fn decrypt(
         .decode(ciphertext_b64.trim())
         .map_err(|_| "invalid base64")?;
 
-    // Minimum: version(1) + nonce(24) + padded_content(32) + hmac(32) = 89
-    if payload.len() < 89 {
+    // Minimum: version(1) + nonce(32) + padded_content(32) + hmac(32) = 97
+    if payload.len() < 97 {
         return Err("ciphertext too short");
     }
 
@@ -269,26 +283,26 @@ pub fn decrypt(
         return Err("unsupported NIP-44 version");
     }
 
-    // Split payload: version(1) || nonce(24) || ciphertext(N) || hmac(32)
-    let nonce_bytes: &[u8; 24] = payload[1..25]
+    // Split payload: version(1) || nonce(32) || ciphertext(N) || hmac(32)
+    let nonce_bytes: &[u8; 32] = payload[1..33]
         .try_into()
         .map_err(|_| "nonce extraction failed")?;
     let hmac_offset = payload.len() - 32;
-    let encrypted = &payload[25..hmac_offset];
+    let encrypted = &payload[33..hmac_offset];
     let received_tag = &payload[hmac_offset..];
 
     let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(conversation_key, nonce_bytes)?;
 
-    // Verify MAC (constant-time via the hmac crate's verify_slice).
+    // Verify MAC over nonce || ciphertext (version byte excluded per NIP-44).
     let mut mac = HmacSha256::new_from_slice(&hmac_key)
         .map_err(|_| "HMAC init failed")?;
-    mac.update(&payload[..hmac_offset]); // version || nonce || ciphertext
+    mac.update(&payload[1..hmac_offset]); // nonce || ciphertext (skip version byte)
     mac.verify_slice(received_tag)
         .map_err(|_| "HMAC verification failed")?;
 
     // Decrypt in-place.
     let mut plaintext_padded = encrypted.to_vec();
-    let mut cipher = XChaCha20::new(
+    let mut cipher = ChaCha20::new(
         chacha_key.as_slice().into(),
         chacha_nonce.as_slice().into(),
     );
@@ -332,11 +346,12 @@ mod tests {
         crate::derive::backend::pubkey_from_secret(secret).expect("test secret should be valid")
     }
 
-    fn fixed_nonce() -> [u8; 24] {
+    fn fixed_nonce() -> [u8; 32] {
         [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
             0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
         ]
     }
 
@@ -351,35 +366,25 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_length_minimum_32() {
-        // Short messages (even empty) must pad to at least 32 bytes.
+    fn test_pad_length_minimum() {
+        // Short messages must pad to 2 (length prefix) + 32 (min padded len) = 34.
         let padded = pad("hi").unwrap();
-        assert!(
-            padded.len() >= PAD_MIN,
-            "padded length {} should be >= {}",
-            padded.len(),
-            PAD_MIN
-        );
-        assert_eq!(padded.len().count_ones(), 1, "padded length should be a power of two");
+        assert_eq!(padded.len(), 34, "padded length should be 2 + 32");
     }
 
     #[test]
-    fn test_pad_is_power_of_two() {
-        for &len in &[0, 1, 15, 16, 30, 31, 32, 63, 64, 127, 128] {
-            let msg = "x".repeat(len);
-            let padded = pad(&msg).unwrap();
-            assert!(
-                padded.len() >= PAD_MIN,
-                "len {len}: padded length {} < MIN {}",
-                padded.len(),
-                PAD_MIN
-            );
-            assert_eq!(
-                padded.len().count_ones(), 1,
-                "len {len}: padded length {} is not a power of two",
-                padded.len()
-            );
-        }
+    fn test_pad_empty_rejected() {
+        // NIP-44 does not allow empty plaintext.
+        assert!(pad("").is_err(), "empty plaintext must be rejected");
+    }
+
+    #[test]
+    fn test_calc_padded_len() {
+        assert_eq!(calc_padded_len(1), 32);
+        assert_eq!(calc_padded_len(32), 32);
+        assert_eq!(calc_padded_len(33), 34);
+        assert_eq!(calc_padded_len(64), 64);
+        assert_eq!(calc_padded_len(65), 68);
     }
 
     #[test]
@@ -430,15 +435,13 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_decrypt_empty_string() {
+    fn test_encrypt_empty_string_rejected() {
         let alice_sk = alice_secret();
         let bob_pk = pubkey_for(&bob_secret());
         let conv_key = get_conversation_key(&alice_sk, &bob_pk).unwrap();
         let nonce = fixed_nonce();
 
-        let encrypted = encrypt(&conv_key, "", &nonce).unwrap();
-        let decrypted = decrypt(&conv_key, &encrypted).unwrap();
-        assert_eq!(decrypted, "");
+        assert!(encrypt(&conv_key, "", &nonce).is_err(), "empty plaintext must be rejected");
     }
 
     #[test]
@@ -482,7 +485,7 @@ mod tests {
     #[test]
     fn test_decrypt_too_short_fails() {
         let conv_key = [0u8; 32];
-        // Base64 of only 10 bytes — well below the 89-byte minimum.
+        // Base64 of only 10 bytes — well below the 97-byte minimum.
         let short = BASE64.encode(&[0u8; 10]);
         let result = decrypt(&conv_key, &short);
         assert!(result.is_err(), "too-short ciphertext must return an error");
@@ -502,5 +505,81 @@ mod tests {
 
         let result = decrypt(&conv_key, &tampered);
         assert!(result.is_err(), "wrong version byte must return an error");
+    }
+
+    // ------------------------------------------------------------------
+    // Official NIP-44 test vectors from paulmillr/nip44
+    // https://github.com/paulmillr/nip44/blob/main/nip44.vectors.json
+    // ------------------------------------------------------------------
+
+    fn hex_to_32(hex: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn test_official_conversation_key_vector_0() {
+        // Vector 0 from v2.valid.get_conversation_key
+        let sec1 = hex_to_32("315e59ff51cb9209768cf7da80791ddcaae56ac9775eb25b6dee1234bc5d2268");
+        let pub2 = hex_to_32("c2f9d9948dc8c7c38321e4b85c8558872eafa0641cd269db76848a6073e69133");
+        let expected = hex_to_32("3dfef0ce2a4d80a25e7a328accf73448ef67096f65f79588e358d9a0eb9013f1");
+
+        let result = get_conversation_key(&sec1, &pub2).unwrap();
+        assert_eq!(result, expected, "conversation key must match official vector 0");
+    }
+
+    #[test]
+    fn test_official_conversation_key_vector_1() {
+        // Vector 1 from v2.valid.get_conversation_key
+        let sec1 = hex_to_32("a1e37752c9fdc1273be53f68c5f74be7c8905728e8de75800b94262f9497c86e");
+        let pub2 = hex_to_32("03bb7947065dde12ba991ea045132581d0954f042c84e06d8c00066e23c1a800");
+        let expected = hex_to_32("4d14f36e81b8452128da64fe6f1eae873baae2f444b02c950b90e43553f2178b");
+
+        let result = get_conversation_key(&sec1, &pub2).unwrap();
+        assert_eq!(result, expected, "conversation key must match official vector 1");
+    }
+
+    #[test]
+    fn test_official_conversation_key_vector_2() {
+        // Vector 2 from v2.valid.get_conversation_key
+        let sec1 = hex_to_32("98a5902fd67518a0c900f0fb62158f278f94a21d6f9d33d30cd3091195500311");
+        let pub2 = hex_to_32("aae65c15f98e5e677b5050de82e3aba47a6fe49b3dab7863cf35d9478ba9f7d1");
+        let expected = hex_to_32("9c00b769d5f54d02bf175b7284a1cbd28b6911b06cda6666b2243561ac96bad7");
+
+        let result = get_conversation_key(&sec1, &pub2).unwrap();
+        assert_eq!(result, expected, "conversation key must match official vector 2");
+    }
+
+    #[test]
+    fn test_official_encrypt_decrypt_vector_0() {
+        // Vector 0 from v2.valid.encrypt_decrypt
+        let conv_key = hex_to_32("c41c775356fd92eadc63ff5a0dc1da211b268cbea22316767095b2871ea1412d");
+        let nonce = hex_to_32("0000000000000000000000000000000000000000000000000000000000000001");
+        let plaintext = "a";
+        let expected_payload = "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABee0G5VSK0/9YypIObAtDKfYEAjD35uVkHyB0F4DwrcNaCXlCWZKaArsGrY6M9wnuTMxWfp1RTN9Xga8no+kF5Vsb";
+
+        let encrypted = encrypt(&conv_key, plaintext, &nonce).unwrap();
+        assert_eq!(encrypted, expected_payload, "encrypted payload must match official vector 0");
+
+        let decrypted = decrypt(&conv_key, expected_payload).unwrap();
+        assert_eq!(decrypted, plaintext, "decrypted plaintext must match official vector 0");
+    }
+
+    #[test]
+    fn test_official_encrypt_decrypt_vector_1() {
+        // Vector 1 from v2.valid.encrypt_decrypt (Unicode content)
+        let conv_key = hex_to_32("c41c775356fd92eadc63ff5a0dc1da211b268cbea22316767095b2871ea1412d");
+        let nonce = hex_to_32("f00000000000000000000000000000f00000000000000000000000000000000f");
+        let plaintext = "🍕🫃";
+        let expected_payload = "AvAAAAAAAAAAAAAAAAAAAPAAAAAAAAAAAAAAAAAAAAAPSKSK6is9ngkX2+cSq85Th16oRTISAOfhStnixqZziKMDvB0QQzgFZdjLTPicCJaV8nDITO+QfaQ61+KbWQIOO2Yj";
+
+        let encrypted = encrypt(&conv_key, plaintext, &nonce).unwrap();
+        assert_eq!(encrypted, expected_payload, "encrypted payload must match official vector 1");
+
+        let decrypted = decrypt(&conv_key, expected_payload).unwrap();
+        assert_eq!(decrypted, plaintext, "decrypted plaintext must match official vector 1");
     }
 }

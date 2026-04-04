@@ -7,6 +7,10 @@ use secp256k1::{Keypair, Message, Secp256k1, SignOnly, XOnlyPublicKey};
 
 /// Sign a 32-byte hash with a BIP-340 Schnorr key. Returns a 64-byte signature.
 ///
+/// Uses auxiliary randomness from the ESP32 hardware TRNG per BIP-340
+/// recommendation, providing defence-in-depth against fault attacks that
+/// could leak the private key via deterministic nonce reuse.
+///
 /// Accepts a shared `Secp256k1<SignOnly>` context to avoid repeated ~130KB
 /// heap allocations on ESP32.
 pub fn sign_hash(
@@ -17,8 +21,21 @@ pub fn sign_hash(
     let keypair = Keypair::from_seckey_slice(secp, private_key)
         .map_err(|_| "invalid signing key")?;
     let msg = Message::from_digest(*hash);
-    let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+    let aux_rand = random_aux_rand();
+    let sig = secp.sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
     Ok(*sig.as_ref())
+}
+
+/// Generate 32 bytes of auxiliary randomness from the ESP32 hardware TRNG.
+fn random_aux_rand() -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    unsafe {
+        esp_idf_svc::sys::esp_fill_random(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            buf.len(),
+        );
+    }
+    buf
 }
 
 /// Verify a BIP-340 Schnorr signature against a public key and hash.

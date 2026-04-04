@@ -1,0 +1,65 @@
+# Heartwood ESP32
+
+> Nostr private keys stored on computers are one browser exploit away from theft. Heartwood ESP32 is a hardware signing device that keeps your nsec permanently air-gapped on an ESP32-S3 microcontroller — private keys never leave the chip, and every signing request requires physical button approval.
+
+Heartwood ESP32 targets Nostr developers and self-hosters who want hardware-grade key custody without the limitations of existing options. Unlike the LNbits NSD (single identity, Arduino-based, web serial only) or Amber (phone-based, key leaves the secure enclave for signing), Heartwood ESP32 uses the nsec-tree hierarchical derivation scheme to manage multiple Nostr identities from a single master secret, with per-identity child keys derivable on demand. The Pi relay bridge means the signing device is never network-connected — the network-facing Pi is zero-trust and sees only ciphertext.
+
+Two deployment modes ship from the same firmware codebase:
+
+- **Home HSM** — USB-attached to a Raspberry Pi, all radios disabled, holds the master secret. Even full Pi compromise cannot extract keys or forge signatures without physical button access. Same threat model as Ledger/Trezor but for Nostr.
+- **Portable signer** — battery-powered, BLE to phone, holds a child key derived by the HSM. If lost or compromised, burn that branch and derive a replacement — the master and all other branches are untouched.
+
+## Getting Started
+
+Requires the ESP Rust toolchain and a Heltec WiFi LoRa 32 V4 board.
+
+```bash
+# Install ESP Rust toolchain (one-time)
+cargo install espup ldproxy espflash
+espup install
+source ~/export-esp.sh
+
+# Build and flash firmware
+cd firmware && cargo build
+espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
+
+# Wait for OLED to show "Awaiting secret...", then provision:
+cd provision && cargo run -- --port /dev/cu.usbserial-*
+# Enter BIP-39 mnemonic and optional passphrase when prompted
+```
+
+After provisioning, the device reboots and displays the master npub. Subsequent boots skip provisioning.
+
+## Key Concepts
+
+- **nsec-tree derivation** — HMAC-SHA256 keyed derivation scheme that produces deterministic child keys from a master secret using a `purpose/label` path (e.g. `persona/social`, `device/mobile-0`). Compromise of a child never threatens the root.
+- **Zero-trust Pi** — The Raspberry Pi handles networking (Tor, Nostr relays, NIP-46) but never holds secret material. All serial traffic is NIP-44 ciphertext. The ESP32 decrypts inbound, signs, re-encrypts outbound.
+- **Policy engine** — Per-master, per-client approval tiers: auto-approve (known clients, low-risk methods), OLED-notify (show on screen, no button needed), button-required (physically approve). Rate limiting enforced.
+- **Multi-master NVS** — Up to 8 master identities in flash. Three provisioning modes: `bunker` (raw nsec), `tree-mnemonic` (BIP-39), `tree-nsec` (raw secret + tree derivation).
+- **Frame protocol** — Binary serial protocol: `[magic][type][length][payload][crc32]`. Types: provisioning (0x01), NIP-46 signing (0x10/0x11 encrypted), control (policy push, session auth, OTA).
+
+## API Surface
+
+Six crates — use independently or together:
+
+| Crate | Purpose |
+|-------|---------|
+| `common` | Shared crypto: nsec-tree derivation, NIP-44/NIP-04 encryption, NIP-46 types, frame protocol, policy types |
+| `firmware` | ESP32 firmware — flash this to the device |
+| `provision` | Host CLI — push mnemonic/nsec to a freshly-flashed device over USB serial |
+| `bridge` | Pi-side relay bridge — connects Nostr relays to the ESP32 over the frame protocol |
+| `sign-test` | End-to-end test harness — sends NIP-46 requests over serial, displays responses |
+| `ota` | Pi-side OTA tool — push firmware updates over USB serial with SHA-256 verification |
+
+The `common` crate has two signing backends selectable via Cargo features:
+- `k256-backend` (default) — pure Rust, for host tools and tests
+- `secp256k1-backend` — C FFI, alignment-safe on Xtensa LX7 (required for firmware)
+
+## Optional
+
+- Full design spec: `docs/specs/2026-04-03-hsm-design.md`
+- Provisioning protocol: `docs/specs/2026-04-03-provisioning-design.md`
+- Signing oracle design: `docs/specs/2026-04-03-signing-oracle-design.md`
+- NIP-46 hardening plan: `docs/plans/2026-04-04-nip46-hardening.md`
+- AI coding instructions: `CLAUDE.md`
+- Test vector: README.md § Test vector (frozen — must match heartwood-core)

@@ -653,7 +653,7 @@ fn handle_nip44_encrypt(
     };
     signing_secret.zeroize();
 
-    let nonce = random_nonce_24();
+    let nonce = random_nonce_32();
     match nip44::encrypt(&conv_key, plaintext, &nonce) {
         Ok(ciphertext) => {
             nip46::build_result_response(&request.id, &ciphertext).unwrap_or_default()
@@ -877,14 +877,14 @@ fn hex_decode_32(hex: &str) -> Option<[u8; 32]> {
     Some(bytes)
 }
 
-/// Generate a random 24-byte nonce using the ESP32 hardware RNG.
-/// Used as the per-message nonce for NIP-44 encryption.
-fn random_nonce_24() -> [u8; 24] {
-    let mut nonce = [0u8; 24];
+/// Generate a random 32-byte nonce using the ESP32 hardware RNG.
+/// Used as the NIP-44 per-message nonce.
+fn random_nonce_32() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
     unsafe {
         esp_idf_svc::sys::esp_fill_random(
             nonce.as_mut_ptr() as *mut core::ffi::c_void,
-            24,
+            32,
         );
     }
     nonce

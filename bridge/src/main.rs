@@ -35,7 +35,19 @@ use nostr::nips::nip44;
 use nostr_sdk::prelude::*;
 
 use heartwood_common::frame;
+use heartwood_common::hex::hex_encode;
 use heartwood_common::types::*;
+
+/// Read exactly `buf.len()` bytes from a serial port.
+fn read_exact_serial(port: &mut RawSerial, buf: &mut [u8]) {
+    let mut pos = 0;
+    while pos < buf.len() {
+        match port.read(&mut buf[pos..]) {
+            Ok(n) if n > 0 => pos += n,
+            _ => {}
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Raw POSIX serial wrapper
@@ -574,11 +586,66 @@ async fn main() -> Result<()> {
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty())
         .collect();
-    let relay_params: String = relay_list.iter()
-        .map(|r| format!("relay={}", urlencoding::encode(r)))
-        .collect::<Vec<_>>()
-        .join("&");
-    let bunker_uri = format!("bunker://{}?{}", bunker_pubkey.to_hex(), relay_params);
+    // Request the complete bunker URI (with connect secret) from the ESP32.
+    let bunker_uri = {
+        let relay_json = serde_json::to_vec(&relay_list).unwrap_or_default();
+        let mut payload = Vec::with_capacity(1 + relay_json.len());
+        payload.push(0); // master slot 0
+        payload.extend_from_slice(&relay_json);
+        let frame_bytes = frame::build_frame(FRAME_TYPE_BUNKER_URI_REQUEST, &payload)
+            .expect("bunker URI request frame");
+        let mut port_guard = port.lock().unwrap();
+        port_guard.write_all(&frame_bytes).expect("serial write failed");
+        port_guard.flush().expect("serial flush failed");
+        drop(port_guard);
+
+        // Read response -- reuse the existing response reader pattern.
+        let mut port_guard = port.lock().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut uri = String::new();
+        'hunt: loop {
+            if std::time::Instant::now() > deadline {
+                log::warn!("Timeout waiting for bunker URI from ESP32 -- using fallback");
+                let relay_params: String = relay_list.iter()
+                    .map(|r| format!("relay={}", urlencoding::encode(r)))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                uri = format!("bunker://{}?{}", bunker_pubkey.to_hex(), relay_params);
+                break;
+            }
+            let mut byte = [0u8; 1];
+            match port_guard.read(&mut byte) {
+                Ok(1) if byte[0] == 0x48 => {
+                    match port_guard.read(&mut byte) {
+                        Ok(1) if byte[0] == 0x57 => {
+                            let mut header = [0u8; 3];
+                            let _ = read_exact_serial(&mut *port_guard, &mut header);
+                            let resp_type = header[0];
+                            let length = u16::from_be_bytes([header[1], header[2]]) as usize;
+                            let mut body = vec![0u8; length + 4];
+                            let _ = read_exact_serial(&mut *port_guard, &mut body);
+                            let mut buf = Vec::with_capacity(5 + length + 4);
+                            buf.extend_from_slice(&[0x48, 0x57]);
+                            buf.push(resp_type);
+                            buf.extend_from_slice(&header[1..3]);
+                            buf.extend_from_slice(&body);
+                            if let Ok(f) = frame::parse_frame(&buf) {
+                                if f.frame_type == FRAME_TYPE_BUNKER_URI_RESPONSE {
+                                    uri = String::from_utf8_lossy(&f.payload).to_string();
+                                    break 'hunt;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        drop(port_guard);
+        log::info!("Bunker URI: {}", &uri[..uri.len().min(60)]);
+        uri
+    };
 
     // Broadcast channel for log lines (WebSocket streaming).
     let (log_tx, _) = tokio::sync::broadcast::channel::<String>(256);

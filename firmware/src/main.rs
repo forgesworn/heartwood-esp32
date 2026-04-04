@@ -48,6 +48,7 @@ use heartwood_common::types::{
     FRAME_TYPE_ACK, FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
+    FRAME_TYPE_BUNKER_URI_REQUEST, FRAME_TYPE_BUNKER_URI_RESPONSE,
     FRAME_TYPE_POLICY_LIST_REQUEST, FRAME_TYPE_POLICY_LIST_RESPONSE,
     FRAME_TYPE_POLICY_PUSH, FRAME_TYPE_POLICY_REVOKE, FRAME_TYPE_POLICY_UPDATE,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
@@ -508,7 +509,47 @@ fn main() {
                 }
             }
 
-            // 0x30 — OTA begin (sends size + expected SHA-256, triggers approval)
+            // 0x2B -- bunker URI request (bridge asks for the full URI with secret)
+            FRAME_TYPE_BUNKER_URI_REQUEST => {
+                if frame.payload.is_empty() {
+                    log::warn!("BUNKER_URI_REQUEST missing master_slot byte");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                } else {
+                    let slot = frame.payload[0] as usize;
+                    if slot >= loaded_masters.len() {
+                        log::warn!("BUNKER_URI_REQUEST invalid slot {slot}");
+                        protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                    } else {
+                        let master = &loaded_masters[slot];
+                        let npub_hex = heartwood_common::hex::hex_encode(&master.pubkey);
+                        let secret_hex = heartwood_common::hex::hex_encode(&master.connect_secret);
+
+                        // Parse relay URLs from the rest of the payload (JSON string array).
+                        let relay_params = if frame.payload.len() > 1 {
+                            if let Ok(relays) = serde_json::from_slice::<Vec<String>>(&frame.payload[1..]) {
+                                relays.iter()
+                                    .map(|r| format!("relay={}", r))
+                                    .collect::<Vec<_>>()
+                                    .join("&")
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        let uri = if relay_params.is_empty() {
+                            format!("bunker://{}?secret={}", npub_hex, secret_hex)
+                        } else {
+                            format!("bunker://{}?{}&secret={}", npub_hex, relay_params, secret_hex)
+                        };
+
+                        protocol::write_frame(&mut usb, FRAME_TYPE_BUNKER_URI_RESPONSE, uri.as_bytes());
+                    }
+                }
+            }
+
+            // 0x30 -- OTA begin (sends size + expected SHA-256, triggers approval)
             FRAME_TYPE_OTA_BEGIN => {
                 ota::handle_ota_begin(
                     &mut usb,

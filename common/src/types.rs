@@ -49,6 +49,8 @@ pub const FRAME_TYPE_POLICY_LIST_REQUEST: u8 = 0x27;  // host -> device: payload
 pub const FRAME_TYPE_POLICY_LIST_RESPONSE: u8 = 0x28; // device -> host: payload = JSON Vec<ClientPolicy>
 pub const FRAME_TYPE_POLICY_REVOKE: u8 = 0x29;        // host -> device: payload = master_slot (1) + client_pubkey_hex (64 bytes ASCII)
 pub const FRAME_TYPE_POLICY_UPDATE: u8 = 0x2A;        // host -> device: payload = master_slot (1) + JSON ClientPolicy
+pub const FRAME_TYPE_BUNKER_URI_REQUEST: u8 = 0x2B;   // host -> device: payload = master_slot (1) + relay_urls (JSON string array)
+pub const FRAME_TYPE_BUNKER_URI_RESPONSE: u8 = 0x2C;  // device -> host: payload = complete bunker:// URI with secret
 
 // --- OTA frame types ---
 pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;

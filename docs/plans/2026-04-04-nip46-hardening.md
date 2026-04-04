@@ -1,7 +1,7 @@
 # NIP-46 Client Compatibility Hardening
 
 **Date:** 2026-04-04
-**Status:** Ready to execute
+**Status:** Complete (2026-04-04)
 **Context:** First real-world testing of Heartwood bunker with Nostr clients (Nostur, Coracle, Nostrudel) revealed several issues. Crash bugs fixed in fc60c4e1. Remaining work below.
 
 ## Background
@@ -155,3 +155,8 @@ Task 4 is investigative -- do last or in parallel with Task 2.
 
 - Bark should appear as a remote signer on nostrapps.com
 - NWC wallet integration for hardware-signed zaps (bray's NWC stack + ESP32 sign_event kind 9734)
+- Sapwood management daemon on Pi -- always-running systemd service that controls the bridge (start/stop/restart), proxies management frames when bridge has the port, exposes HTTP API for Sapwood. Enables Sapwood to work in both modes: direct Web Serial (bridge off) or HTTP proxy (bridge on).
+- Sapwood social preview image
+- Add Heartwood + Sapwood to awesome-nostr
+- Register sapwood.dev domain, point to GitHub Pages
+- Sapwood BLE connectivity for portable mode (requires: management frame rate limiting in firmware, BLE pairing button press, CSP headers)

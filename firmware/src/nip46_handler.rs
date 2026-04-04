@@ -152,9 +152,17 @@ pub fn handle_request(
             let client_secret = request.params.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let stored_secret_hex = hex_encode(connect_secret);
             if client_secret.is_empty() {
+                // No secret provided — accept but don't TOFU-approve.
                 nip46::build_connect_response(&request.id).unwrap_or_default()
             } else if constant_time_eq(client_secret.as_bytes(), stored_secret_hex.as_bytes()) {
-                // Secret matches — echo it back per NIP-46.
+                // Secret matches — client proved it has the bunker URI.
+                // TOFU: auto-approve this client for all safe methods so
+                // sign_event works immediately without button approval.
+                // Policy persistence happens in the main loop after we return.
+                if has_client {
+                    tofu_approve(policy_engine, master_slot, &client_hex);
+                    log::info!("TOFU: approved client on connect (secret verified)");
+                }
                 nip46::build_connect_response_with_secret(&request.id, &stored_secret_hex).unwrap_or_default()
             } else {
                 log::warn!("connect rejected — incorrect secret (master_slot={})", master_slot);

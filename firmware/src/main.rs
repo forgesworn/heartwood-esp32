@@ -98,7 +98,7 @@ fn main() {
         peripherals.usb_serial,
         peripherals.pins.gpio19,
         peripherals.pins.gpio20,
-        &UsbSerialConfig::new().rx_buffer_size(512).tx_buffer_size(1024),
+        &UsbSerialConfig::new().rx_buffer_size(4096).tx_buffer_size(4096),
     )
     .expect("USB serial driver init failed");
 

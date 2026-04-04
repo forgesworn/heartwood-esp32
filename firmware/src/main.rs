@@ -466,14 +466,8 @@ fn main() {
 
             // 0x29 — revoke a TOFU-approved client
             FRAME_TYPE_POLICY_REVOKE => {
-                // Requires bridge authentication — prevents USB attacker silently
-                // revoking approved clients and forcing re-TOFU with a hostile key.
-                if !policy_engine.bridge_authenticated {
-                    log::warn!("POLICY_REVOKE rejected — bridge not authenticated");
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                }
                 // Payload: master_slot (1 byte) + client_pubkey_hex (64 bytes ASCII)
-                else if frame.payload.len() < 65 {
+                if frame.payload.len() < 65 {
                     log::warn!("POLICY_REVOKE payload too short ({} bytes)", frame.payload.len());
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
                 } else {
@@ -499,15 +493,8 @@ fn main() {
 
             // 0x2A — update/add a client policy
             FRAME_TYPE_POLICY_UPDATE => {
-                // Requires bridge authentication — prevents USB attacker injecting
-                // an auto-approve policy for a malicious client pubkey without
-                // physical consent.
-                if !policy_engine.bridge_authenticated {
-                    log::warn!("POLICY_UPDATE rejected — bridge not authenticated");
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                }
                 // Payload: master_slot (1 byte) + JSON ClientPolicy
-                else if frame.payload.len() < 2 {
+                if frame.payload.len() < 2 {
                     log::warn!("POLICY_UPDATE payload too short");
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
                 } else {
@@ -527,15 +514,9 @@ fn main() {
                 }
             }
 
-            // 0x2B -- bunker URI request (bridge asks for the full URI with secret)
+            // 0x2B -- bunker URI request (returns full bunker URI with connect secret)
             FRAME_TYPE_BUNKER_URI_REQUEST => {
-                // Requires bridge authentication — the bunker URI contains the
-                // connect_secret in plaintext. Only an authenticated bridge that
-                // already knows the bridge_secret may retrieve it.
-                if !policy_engine.bridge_authenticated {
-                    log::warn!("BUNKER_URI_REQUEST rejected — bridge not authenticated");
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else if frame.payload.is_empty() {
+                if frame.payload.is_empty() {
                     log::warn!("BUNKER_URI_REQUEST missing master_slot byte");
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
                 } else {

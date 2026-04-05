@@ -5,13 +5,22 @@ Heartwood HSM setup — provision the ESP32, set bridge secret, and start the br
 Run on the Pi with the ESP32 connected via USB serial.
 
 Usage:
+    HEARTWOOD_BRIDGE_SECRET=<64-hex> \
+    HEARTWOOD_BUNKER_SECRET=<64-hex> \
     python3 setup-hsm.py
 
-You will be prompted for your nsec (input is hidden).
+Secrets MUST be supplied via environment variables -- never commit them to
+source. You will additionally be prompted for the master nsec at runtime
+(input hidden, never persisted).
+
+Generate fresh secrets with:
+
+    python3 -c 'import secrets; print(secrets.token_hex(32))'
 """
 
 import binascii
 import getpass
+import os
 import struct
 import subprocess
 import sys
@@ -20,12 +29,33 @@ import zlib
 
 
 # --- Config ---
-SERIAL_PORT = "/dev/heartwood-hsm"
-BAUD = 115200
-BRIDGE_SECRET = "6db9d0876c4f390b589810fecdcc23e7cc82ae1ebf56cdb483355dc8ffd65d69"
-BUNKER_SECRET = "3bd5c8427095d4a2b7bc292905962dbe257eedfa86223045caa300d6976d99a9"
-RELAYS = "wss://relay.damus.io,wss://nos.lol,wss://relay.trotters.cc"
-LABEL = "primary"
+SERIAL_PORT = os.environ.get("HEARTWOOD_SERIAL_PORT", "/dev/heartwood-hsm")
+BAUD = int(os.environ.get("HEARTWOOD_BAUD", "115200"))
+RELAYS = os.environ.get(
+    "HEARTWOOD_RELAYS",
+    "wss://relay.damus.io,wss://nos.lol,wss://relay.trotters.cc",
+)
+LABEL = os.environ.get("HEARTWOOD_LABEL", "Heartwood")
+
+
+def _require_hex_env(name: str) -> str:
+    value = os.environ.get(name, "")
+    if len(value) != 64:
+        sys.stderr.write(
+            f"ERROR: environment variable {name} must be 64 hex characters "
+            f"(got {len(value)}). See the usage block at the top of this script.\n"
+        )
+        sys.exit(2)
+    try:
+        binascii.unhexlify(value)
+    except binascii.Error:
+        sys.stderr.write(f"ERROR: {name} is not valid hex.\n")
+        sys.exit(2)
+    return value
+
+
+BRIDGE_SECRET = _require_hex_env("HEARTWOOD_BRIDGE_SECRET")
+BUNKER_SECRET = _require_hex_env("HEARTWOOD_BUNKER_SECRET")
 
 
 def build_frame(frame_type, payload):

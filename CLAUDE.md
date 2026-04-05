@@ -30,6 +30,17 @@ Phase 5 (flash-once production) complete (2026-04-03). Six crates: `common/` (sh
 
 Next: implement heartwood_create_proof/verify_proof (via OTA). Production hardening (JTAG disable, watchdog). Bridge management API for heartwood-device Pi web UI.
 
+## Session memory
+
+Cross-session design thinking, grant reservations, and feedback lessons are in `docs/memory/` (mirrored from each machine's `~/.claude/projects/.../memory/` auto-memory store). **At the start of any session on this repo, read `docs/memory/MEMORY.md` and the files it references.** These capture context that isn't in the code or git history, including:
+
+- **Heartwood tier ladder** (Soft/Hard/Portable/Pocket): product reframe and naming decisions
+- **Coercion-resistance stack**: canary + spoken-token + ring-sig + button composition, **as post-grant roadmap, NOT current work**
+- **Grant milestone reservations**: explicit do-not-build list for work reserved under G01 NLnet CANARY, G12 NLnet Privacy, G23 OpenSats Heartwood, and Heartwood Phase 2
+- **Grant-safe design feedback**: rule to check existing libraries and `prometheus/grants/TRACKER.md` before designing cross-repo crypto integration
+
+On machines where Claude Code's auto-memory should also load them, sync or symlink `~/.claude/projects/-Users-darren-WebstormProjects-heartwood-esp32/memory/` with `docs/memory/`. The repo copy is the portable canonical; auto-memory on each machine is a local working copy.
+
 ## Build & flash
 
 Five crates — build each from its own directory:

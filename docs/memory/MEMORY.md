@@ -1,0 +1,13 @@
+- [Hardware safety](feedback_hardware_safety.md) -- never brick the Heltec V4, verify before flashing
+- [No eFuse burning](feedback_no_efuse.md) -- never burn eFuses, flash encryption, or secure boot on the Heltec
+- [Bigger OLED font](feedback_oled_font.md) -- FONT_7X14 minimum, FONT_6X10 still too small
+- [OLED diagnostics](feedback_oled_diagnostics.md) -- use OLED step labels to debug when serial port is occupied
+- [No em dashes](feedback_no_em_dashes.md) -- use plain ASCII in commits, comments, prose (no Unicode arrows)
+- [Phase 4 in progress](project_phase2_status.md) -- full NIP-46 HSM infrastructure built (2026-04-03)
+- [Sapwood](project_web_ui.md) -- Meshtastic-style management interface for ESP32 (forgesworn/sapwood, live)
+- [Signet demo](project_signet_demo.md) -- mysignet.app + canary demo at meetup, Wednesday 2026-04-09
+- [Heartwood tiers](project_heartwood_tiers.md) -- Soft/Hard/Portable/Pocket ladder; drop "bridge" from vocabulary
+- [Coercion stack roadmap](project_coercion_stack_roadmap.md) -- canary+spoken+ring+button composition; POST-GRANT roadmap, not current work
+- [Heartwood grant timing](project_heartwood_grant_timing.md) -- which work is reserved for G01/G12/G23/Phase 2; do-not-build list
+- [Grant-safe design](feedback_grant_safe_design.md) -- check existing libs + TRACKER.md before cross-repo crypto integration
+- [Grant honesty](feedback_grant_honesty.md) -- applications only claim what is shipped and verifiable; aspirational goes in Future Direction

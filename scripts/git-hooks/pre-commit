@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+Pre-commit hook -- block suspected secrets from being committed.
+
+Scans the additions in staged changes (`git diff --cached -U0`) for:
+  - 64-hex literals (secp256k1 private keys, bridge secrets, bunker secrets)
+  - nsec1 bech32 strings (typed Nostr private keys)
+  - Environment-variable assignments of the form SECRET=<hex>
+
+Allows:
+  - Known test vectors listed in ALLOW_HEX
+  - Files under path prefixes listed in ALLOW_PATHS (nip44/nip46 test files,
+    frozen derivation vectors, this hook itself)
+  - Lines containing the marker string `# pragma: allow-secret` (escape hatch
+    for the very rare case where a hex literal is both load-bearing and safe)
+
+Run manually to preview:
+    python3 scripts/git-hooks/pre-commit --dry-run
+
+Install:
+    bash scripts/install-hooks.sh
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+
+# Known-safe hex constants (test vectors, mathematical constants, frozen
+# pubkeys). These are public by definition.
+ALLOW_HEX = {
+    # secp256k1 generator point G.x -- mathematical constant
+    "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    # Frozen mnemonic derivation test pubkey -- asserted against in provision/
+    "cc92d213b5eccd19eb85c12c2cf6fd168f27c2cc347c51a7c4c62ac67795fc65",
+    # NIP-44 official test vectors (public halves)
+    "315e59ff51cb9209768cf7da80791ddcaae56ac9775eb25b6dee1234bc5d2268",
+    "c2f9d9948dc8c7c38321e4b85c8558872eafa0641cd269db76848a6073e69133",
+    "a1e37752c9fdc1273be53f68c5f74be7c8905728e8de75800b94262f9497c86e",
+    "03bb7947065dde12ba991ea045132581d0954f042c84e06d8c00066e23c1a800",
+    "98a5902fd67518a0c900f0fb62158f278f94a21d6f9d33d30cd3091195500311",
+    "aae65c15f98e5e677b5050de82e3aba47a6fe49b3dab7863cf35d9478ba9f7d1",
+    "c41c775356fd92eadc63ff5a0dc1da211b268cbea22316767095b2871ea1412d",
+    "0000000000000000000000000000000000000000000000000000000000000001",
+    "f00000000000000000000000000000f00000000000000000000000000000000f",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+}
+
+# Path prefixes that are allowed to contain hex literals (test files, this
+# hook itself, documentation of known-good vectors).
+ALLOW_PATHS = (
+    "common/src/nip44.rs",
+    "common/src/nip46.rs",
+    "common/src/derive.rs",
+    "provision/src/main.rs",
+    "sign-test/src/main.rs",
+    "docs/plans/",
+    "docs/memory/",
+    "scripts/git-hooks/",
+    # Grant drafts and planning docs often reference public pubkeys / test vectors.
+    "grants/drafts/",
+    "grants/plans/",
+)
+
+# Basenames that are allowed anywhere in the tree (dependency checksums, etc).
+ALLOW_BASENAMES = (
+    "Cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+)
+
+HEX_64_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-f]{64})(?![0-9a-fA-F])")
+NSEC_RE = re.compile(r"nsec1[02-9ac-hj-np-z]{58}")
+NPUB_RE = re.compile(r"npub1[02-9ac-hj-np-z]{58}")
+# Field markers that identify a hex literal as a public key (safe to skip).
+# Matches `pubkey:`, `pubkey =`, `"pubkey":`, `pub_key:`, `public_key:`, etc.
+PUBKEY_FIELD_RE = re.compile(r"\b(pubkey|pub_key|public_key|npub)\s*[:=]", re.IGNORECASE)
+ASSIGN_RE = re.compile(
+    r"(BRIDGE_SECRET|BUNKER_SECRET|API_TOKEN|NSEC|PRIVATE_KEY)\s*[:=]\s*['\"]?([0-9a-f]{64})",
+    re.IGNORECASE,
+)
+MARKER = "pragma: allow-secret"
+
+
+def staged_additions():
+    """Yield (path, lineno_hint, line) tuples for every added line in staged changes."""
+    result = subprocess.run(
+        ["git", "diff", "--cached", "-U0", "--no-color", "--diff-filter=AM"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    current_path = None
+    current_lineno = 0
+    for raw in result.stdout.splitlines():
+        if raw.startswith("+++ b/"):
+            current_path = raw[6:]
+            current_lineno = 0
+            continue
+        if raw.startswith("@@"):
+            # @@ -old,n +new,m @@
+            m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+            if m:
+                current_lineno = int(m.group(1)) - 1
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            current_lineno += 1
+            if current_path is not None:
+                yield (current_path, current_lineno, raw[1:])
+        elif not raw.startswith("-"):
+            current_lineno += 1
+
+
+def path_allowed(path: str) -> bool:
+    if any(path.startswith(prefix) for prefix in ALLOW_PATHS):
+        return True
+    basename = path.rsplit("/", 1)[-1]
+    if basename in ALLOW_BASENAMES:
+        return True
+    return False
+
+
+def check():
+    findings = []
+    for path, lineno, line in staged_additions():
+        if path_allowed(path):
+            continue
+        if MARKER in line:
+            continue
+
+        # 1. nsec1 bech32 strings -- always a hard fail, no exceptions.
+        for m in NSEC_RE.finditer(line):
+            findings.append(
+                (path, lineno, "nsec1 bech32 private key", m.group(0)[:16] + "...")
+            )
+
+        # 2. Explicit secret assignments -- even if the value is in ALLOW_HEX
+        #    (which shouldn't happen for these names), flag it.
+        for m in ASSIGN_RE.finditer(line):
+            findings.append(
+                (
+                    path,
+                    lineno,
+                    f"{m.group(1).upper()} assignment with inline hex",
+                    m.group(2)[:8] + "...",
+                )
+            )
+
+        # 3. Generic 64-hex literals -- skip known test vectors and known
+        #    public-key contexts. A hex on a line with either:
+        #      - an npub1 bech32 (same identity, documented in two forms), or
+        #      - a `pubkey:` / `public_key:` / `npub:` field marker
+        #    is treated as a public key reference and allowed. nsec1 is caught
+        #    separately and is never whitelisted by these heuristics.
+        line_has_npub = bool(NPUB_RE.search(line))
+        line_has_pubkey_field = bool(PUBKEY_FIELD_RE.search(line))
+        is_public_context = line_has_npub or line_has_pubkey_field
+        for m in HEX_64_RE.finditer(line):
+            hex_value = m.group(1).lower()
+            if hex_value in ALLOW_HEX:
+                continue
+            if is_public_context:
+                continue
+            findings.append(
+                (path, lineno, "64-char hex literal (possible secret)", hex_value[:8] + "...")
+            )
+
+    return findings
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    findings = check()
+    if not findings:
+        if dry_run:
+            print("pre-commit: no suspected secrets in staged changes")
+        return 0
+
+    print("pre-commit: BLOCKED -- suspected secrets in staged changes:\n", file=sys.stderr)
+    for path, lineno, kind, preview in findings:
+        print(f"  {path}:{lineno}  {kind}  -> {preview}", file=sys.stderr)
+    print(
+        "\nIf any of these are false positives (public test vectors, etc), either:\n"
+        "  - add the specific hex to ALLOW_HEX in scripts/git-hooks/pre-commit\n"
+        "  - add the path prefix to ALLOW_PATHS\n"
+        "  - append `# pragma: allow-secret` to the specific line as an escape hatch\n"
+        "\nTo bypass this check entirely (use with extreme care, and only if you know\n"
+        "what you are doing): git commit --no-verify",
+        file=sys.stderr,
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

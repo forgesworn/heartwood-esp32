@@ -187,6 +187,15 @@ struct Cli {
     /// Enable CORS headers on API responses (auto-enabled when --sapwood-dir is not set)
     #[arg(long)]
     cors: bool,
+
+    /// Bearer token required on management API calls. When set, every /api/* route except
+    /// /api/bridge/info (public bunker URI) and the static Sapwood serve requires an
+    /// `Authorization: Bearer <token>` header. When unset, the API is open (development mode).
+    /// The token is injected into Sapwood's index.html via a __HEARTWOOD_API_TOKEN__ placeholder
+    /// so same-origin Sapwood loads work without manual entry.
+    /// Prefer HEARTWOOD_API_TOKEN env var -- see the note on --bunker-secret.
+    #[arg(long, env = "HEARTWOOD_API_TOKEN", hide_env_values = true)]
+    api_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +677,12 @@ async fn main() -> Result<()> {
     let (log_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
     // Spawn the management API server.
+    let api_token = cli.api_token.clone().map(Arc::new);
+    if api_token.is_some() {
+        log::info!("API token auth ENABLED -- /api/* routes (except /api/bridge/info) require Bearer token");
+    } else {
+        log::warn!("API token auth DISABLED -- any LAN client can hit /api/device/factory-reset. Set HEARTWOOD_API_TOKEN to enable.");
+    }
     let app_state = api::AppState {
         serial: Arc::clone(&port),
         bridge_info: Arc::new(api::BridgeInfo {
@@ -677,6 +692,7 @@ async fn main() -> Result<()> {
             start_time: std::time::Instant::now(),
         }),
         log_tx: log_tx.clone(),
+        api_token: api_token.clone(),
     };
 
     // Spawn the background log poller (reads serial when idle, broadcasts to WebSocket clients).

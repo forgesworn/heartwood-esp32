@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use axum::extract::{Path, State};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -30,6 +31,9 @@ pub struct AppState {
     pub serial: Arc<Mutex<RawSerial>>,
     pub bridge_info: Arc<BridgeInfo>,
     pub log_tx: broadcast::Sender<String>,
+    /// Optional bearer token. When Some, protected /api/* routes require
+    /// `Authorization: Bearer <token>`. When None, the API is open.
+    pub api_token: Option<Arc<String>>,
 }
 
 pub struct BridgeInfo {
@@ -510,32 +514,129 @@ async fn ota_upload(
 // Router
 // ---------------------------------------------------------------------------
 
+/// Bearer token auth middleware. Skipped when `state.api_token` is None
+/// (dev mode). The only protected routes are those mounted under
+/// `protected_routes()` below -- public routes (bridge info, static files)
+/// do not go through this middleware.
+async fn require_bearer(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let Some(expected) = state.api_token.as_ref() else {
+        // Auth disabled -- pass through.
+        return Ok(next.run(req).await);
+    };
+
+    let header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let presented = header.strip_prefix("Bearer ").unwrap_or("");
+
+    // Constant-time comparison to avoid leaking token length / bytes.
+    let expected_bytes = expected.as_bytes();
+    let presented_bytes = presented.as_bytes();
+    if expected_bytes.len() != presented_bytes.len() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let mut diff = 0u8;
+    for (a, b) in expected_bytes.iter().zip(presented_bytes.iter()) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(req).await)
+}
+
+/// Serve Sapwood's index.html with the API token substituted into the
+/// `__HEARTWOOD_API_TOKEN__` placeholder. Same-origin Sapwood loads pick
+/// this up via a <meta name="heartwood-api-token"> tag and use it on all
+/// subsequent /api/* calls -- so the LAN admin never has to type a token.
+async fn serve_index(
+    State(state): State<AppState>,
+    sapwood_dir: String,
+) -> impl IntoResponse {
+    let path = std::path::Path::new(&sapwood_dir).join("index.html");
+    let Ok(html) = std::fs::read_to_string(&path) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "index.html not readable").into_response();
+    };
+    let token_value = state.api_token.as_deref().map(|s| s.as_str()).unwrap_or("");
+    let rendered = html.replace("__HEARTWOOD_API_TOKEN__", token_value);
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        rendered,
+    )
+        .into_response()
+}
+
 pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> Router {
-    let mut app = Router::new()
+    // Protected routes -- require Bearer token when state.api_token is Some.
+    let protected: Router<AppState> = Router::new()
         .route("/api/status", get(get_status))
         .route("/api/clients/{slot}", get(get_clients).put(put_client))
         .route("/api/clients/{slot}/{pubkey}", delete(delete_client))
         .route("/api/device/factory-reset", post(factory_reset))
         .route("/api/device/ota", post(ota_upload))
-        .route("/api/bridge/info", get(bridge_info))
         .route("/api/bridge/restart", post(bridge_restart))
-        .route("/api/logs", get(ws_logs))
-        .with_state(state);
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_bearer));
+
+    // Public routes:
+    //   /api/bridge/info -- bunker URI, public by definition (shareable pairing data).
+    //   /api/logs -- read-only WebSocket stream of ESP-IDF log lines. Browsers can
+    //     not send custom headers on WebSocket upgrades, and the log content does
+    //     not contain secrets (it is the same text the Pi journal shows), so this
+    //     is intentionally unauthenticated even when api_token is set. Worst case
+    //     a LAN observer sees public device activity, which is already visible on
+    //     Nostr relays.
+    let public: Router<AppState> = Router::new()
+        .route("/api/bridge/info", get(bridge_info))
+        .route("/api/logs", get(ws_logs));
+
+    let mut app: Router<AppState> = Router::new().merge(protected).merge(public);
+
+    // Sapwood index.html serve with token templating. Must be added before
+    // .with_state() because the handler uses the State<AppState> extractor.
+    if let Some(dir) = sapwood_dir {
+        let dir_for_root = dir.to_string();
+        let dir_for_index = dir.to_string();
+        app = app
+            .route(
+                "/",
+                get(move |s: State<AppState>| {
+                    let dir = dir_for_root.clone();
+                    async move { serve_index(s, dir).await }
+                }),
+            )
+            .route(
+                "/index.html",
+                get(move |s: State<AppState>| {
+                    let dir = dir_for_index.clone();
+                    async move { serve_index(s, dir).await }
+                }),
+            );
+    }
+
+    // Finalise state; from here on the router is Router<()> and can take
+    // layers and fallback services that do not use AppState.
+    let mut app = app.with_state(state);
 
     if enable_cors {
         use tower_http::cors::{Any, CorsLayer};
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
-            .allow_headers(Any);
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
         app = app.layer(cors);
     }
 
     if let Some(dir) = sapwood_dir {
-        let serve = tower_http::services::ServeDir::new(dir)
-            .fallback(tower_http::services::ServeFile::new(
-                std::path::Path::new(dir).join("index.html"),
-            ));
+        // Everything else under sapwood_dir (assets, favicon, etc) is served as-is.
+        let serve = tower_http::services::ServeDir::new(dir);
         app = app.fallback_service(serve);
     }
 

@@ -147,8 +147,11 @@ struct Cli {
     #[arg(short, long, default_value_t = 115200)]
     baud: u32,
 
-    /// Bunker secret key (nsec or hex) — used for relay auth and, in bridge-decrypts mode, NIP-44 crypto
-    #[arg(long)]
+    /// Bunker secret key (nsec or hex) -- used for relay auth and, in bridge-decrypts mode, NIP-44 crypto.
+    /// Prefer HEARTWOOD_BUNKER_SECRET env var over passing this as a CLI arg: systemd expands env
+    /// into ExecStart at service start, so anything in --flags is visible in /proc/<pid>/cmdline to
+    /// every local user. The env form is read via clap's `env = ...` and never enters argv.
+    #[arg(long, env = "HEARTWOOD_BUNKER_SECRET", hide_env_values = true)]
     bunker_secret: String,
 
     /// Relay URLs (comma-separated)
@@ -163,7 +166,8 @@ struct Cli {
 
     /// Bridge authentication secret (hex, 64 chars). Must match the ESP32's NVS bridge secret.
     /// If provided, uses device-decrypts mode. If omitted, falls back to bridge-decrypts mode.
-    #[arg(long)]
+    /// Prefer HEARTWOOD_BRIDGE_SECRET env var -- see the equivalent note on --bunker-secret.
+    #[arg(long, env = "HEARTWOOD_BRIDGE_SECRET", hide_env_values = true)]
     bridge_secret: Option<String>,
 
     /// Boot PIN (4-8 ASCII digits). When provided, the bridge sends a PIN_UNLOCK (0x26) frame

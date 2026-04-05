@@ -154,20 +154,37 @@ fn pad(plaintext: &str) -> Result<Vec<u8>, &'static str> {
 
 /// Calculate padded message length per NIP-44 v2.
 ///
-/// For messages ≤ 32 bytes, pads to 32.
-/// For longer messages, rounds up to the next boundary that leaks minimal
-/// length information (based on powers of two with chunking).
+/// Spec (https://github.com/nostr-protocol/nips/blob/master/44.md):
+///
+/// ```python
+/// def calc_padded_len(unpadded_len):
+///     next_power = 1 << (math.floor(math.log2(unpadded_len - 1)) + 1)
+///     chunk = 32 if next_power <= 256 else next_power / 8
+///     return 32 if unpadded_len <= 32 else chunk * ((unpadded_len - 1) // chunk + 1)
+/// ```
+///
+/// The previous implementation of this function computed the chunk size as
+/// `1 << (floor(log2(msg_len - 1)) - 4)`, which is correct ONLY when the
+/// next power of two exceeds 256. For every message between 33 and 256 bytes
+/// of plaintext the chunk size needs to be 32, not the smaller value the old
+/// formula produced. The net effect was that our NIP-44 v2 ciphertexts were
+/// padded to a different length than any spec-compliant decrypter expects,
+/// so nostr-tools, applesauce, and any other strict NIP-44 v2 implementation
+/// would throw "invalid padding" on every response from the device that was
+/// larger than 32 bytes of plaintext -- which is essentially every NIP-46
+/// response, including `connect` ack, `get_public_key`, and `sign_event`.
+/// Clients silently dropped these events, leaving callers to hang forever
+/// waiting for a reply they had already received but could not read.
 fn calc_padded_len(msg_len: usize) -> usize {
     if msg_len <= 32 {
         return 32;
     }
-    // chunk = floor(log2(msg_len - 1)) - 4
-    let bits = usize::BITS - (msg_len - 1).leading_zeros();
-    let chunk = (bits as usize) - 1 - 4;
-    let chunk_size = 1usize << chunk;
-    // s = floor((msg_len - 1) / chunk_size) + 1
-    let s = (msg_len - 1) / chunk_size + 1;
-    s * chunk_size
+    // next_power = 1 << (floor(log2(msg_len - 1)) + 1)
+    // = the smallest power of two strictly greater than msg_len - 1
+    // = 1 << (total_bits - leading_zeros((msg_len - 1) as usize))
+    let next_power: usize = 1usize << (usize::BITS - (msg_len - 1).leading_zeros()) as usize;
+    let chunk: usize = if next_power <= 256 { 32 } else { next_power / 8 };
+    chunk * ((msg_len - 1) / chunk + 1)
 }
 
 /// Remove NIP-44 padding and return the original plaintext string.
@@ -380,11 +397,38 @@ mod tests {
 
     #[test]
     fn test_calc_padded_len() {
+        // Test vectors computed from the NIP-44 v2 reference formula:
+        //   next_power = 1 << (floor(log2(len-1)) + 1)
+        //   chunk = 32 if next_power <= 256 else next_power / 8
+        //   result = chunk * ((len-1) // chunk + 1)  (with the <=32 short-circuit)
+        //
+        // Cross-verified against nostr-tools' calcPaddedLen() in
+        // nostr-tools/lib/esm/nip44.js. An earlier version of this file
+        // asserted `calc_padded_len(33) == 34` and `calc_padded_len(65) == 68`
+        // -- both wrong. That bug shipped in firmware and silently broke
+        // NIP-46 responses >32 bytes for every compliant NIP-44 v2 client,
+        // including nostr-tools, bark, bray, and nostrudel (discovered
+        // 2026-04-05 during end-to-end testing).
         assert_eq!(calc_padded_len(1), 32);
+        assert_eq!(calc_padded_len(16), 32);
         assert_eq!(calc_padded_len(32), 32);
-        assert_eq!(calc_padded_len(33), 34);
+        assert_eq!(calc_padded_len(33), 64);
         assert_eq!(calc_padded_len(64), 64);
-        assert_eq!(calc_padded_len(65), 68);
+        assert_eq!(calc_padded_len(65), 96);
+        assert_eq!(calc_padded_len(96), 96);
+        assert_eq!(calc_padded_len(97), 128);
+        assert_eq!(calc_padded_len(100), 128);
+        assert_eq!(calc_padded_len(128), 128);
+        assert_eq!(calc_padded_len(129), 160);
+        assert_eq!(calc_padded_len(256), 256);
+        assert_eq!(calc_padded_len(257), 320);
+        assert_eq!(calc_padded_len(320), 320);
+        assert_eq!(calc_padded_len(512), 512);
+        assert_eq!(calc_padded_len(513), 640);
+        assert_eq!(calc_padded_len(600), 640);
+        assert_eq!(calc_padded_len(1000), 1024);
+        assert_eq!(calc_padded_len(1024), 1024);
+        assert_eq!(calc_padded_len(1025), 1280);
     }
 
     #[test]

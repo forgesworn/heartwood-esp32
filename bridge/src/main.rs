@@ -207,6 +207,7 @@ struct Cli {
 fn forward_to_esp32(
     port: &mut RawSerial,
     request_json: &str,
+    log_tx: Option<&tokio::sync::broadcast::Sender<String>>,
 ) -> Result<String, String> {
     let frame_bytes = frame::build_frame(FRAME_TYPE_NIP46_REQUEST, request_json.as_bytes())
         .map_err(|e| format!("frame build failed: {:?}", e))?;
@@ -216,7 +217,7 @@ fn forward_to_esp32(
     port.flush()
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
-    read_any_response(port)
+    read_any_response(port, log_tx)
 }
 
 /// Authenticate the bridge session with the ESP32.
@@ -348,7 +349,10 @@ fn unlock_pin(
 /// The ESP32 decrypts, processes, re-encrypts, and returns the response.
 /// Query the ESP32 for its loaded masters via PROVISION_LIST (0x05).
 /// Returns the parsed list of masters (slot, label, npub, mode).
-fn query_master_list(port: &mut RawSerial) -> Result<Vec<serde_json::Value>, String> {
+fn query_master_list(
+    port: &mut RawSerial,
+    log_tx: Option<&tokio::sync::broadcast::Sender<String>>,
+) -> Result<Vec<serde_json::Value>, String> {
     let frame_bytes = frame::build_frame(FRAME_TYPE_PROVISION_LIST, &[])
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
@@ -357,7 +361,7 @@ fn query_master_list(port: &mut RawSerial) -> Result<Vec<serde_json::Value>, Str
     port.flush()
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
-    let json = read_any_response(port)?;
+    let json = read_any_response(port, log_tx)?;
     let parsed: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| format!("provision list JSON parse failed: {e}"))?;
     match parsed {
@@ -378,6 +382,7 @@ fn forward_sign_envelope(
     client_pubkey: &[u8; 32],
     created_at: u64,
     ciphertext: &str,
+    log_tx: Option<&tokio::sync::broadcast::Sender<String>>,
 ) -> Result<String, String> {
     let mut payload = Vec::with_capacity(72 + ciphertext.len());
     payload.extend_from_slice(master_pubkey);
@@ -393,7 +398,7 @@ fn forward_sign_envelope(
     port.flush()
         .map_err(|e| format!("serial flush failed: {e}"))?;
 
-    read_any_response(port)
+    read_any_response(port, log_tx)
 }
 
 fn forward_encrypted(
@@ -401,6 +406,7 @@ fn forward_encrypted(
     master_pubkey: &[u8; 32],
     client_pubkey: &[u8; 32],
     ciphertext: &str,
+    log_tx: Option<&tokio::sync::broadcast::Sender<String>>,
 ) -> Result<String, String> {
     let mut payload = Vec::with_capacity(64 + ciphertext.len());
     payload.extend_from_slice(master_pubkey);
@@ -420,7 +426,7 @@ fn forward_encrypted(
     log::debug!("serial: request sent ({} bytes, flush took {}ms)",
         frame_bytes.len(), t_send.elapsed().as_millis());
 
-    let result = read_any_response(port);
+    let result = read_any_response(port, log_tx);
 
     log::info!("serial: total round-trip {}ms", t_send.elapsed().as_millis());
 
@@ -430,29 +436,74 @@ fn forward_encrypted(
 /// Read a response frame from the ESP32, accepting both NIP46_RESPONSE (0x03, plaintext)
 /// and ENCRYPTED_RESPONSE (0x11, ciphertext) frame types.
 ///
+/// Non-frame bytes (ESP-IDF log output that the device prints between frames)
+/// are forwarded line-by-line to `log_tx` if provided, so Sapwood's /api/logs
+/// WebSocket can surface device-side log output even during long-running frame
+/// exchanges (e.g. a sign_event waiting on a button press). Without this,
+/// the log_poller background task never gets a chance to read the serial port
+/// while the mutex is held, and all device logs during a sign flow are lost.
+///
 /// Returns the payload as a UTF-8 string (either raw JSON or NIP-44 ciphertext).
-fn read_any_response(port: &mut RawSerial) -> Result<String, String> {
+fn read_any_response(
+    port: &mut RawSerial,
+    log_tx: Option<&tokio::sync::broadcast::Sender<String>>,
+) -> Result<String, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let t_start = std::time::Instant::now();
     let mut skipped_bytes: usize = 0;
+    // Accumulator for device log lines discovered between frames. Flushed on
+    // newline or when we give up and hit a frame boundary.
+    let mut log_line_buf: Vec<u8> = Vec::with_capacity(256);
+
+    let flush_log_line = |buf: &mut Vec<u8>, tx: Option<&tokio::sync::broadcast::Sender<String>>| {
+        if buf.is_empty() { return; }
+        if let Ok(s) = std::str::from_utf8(buf) {
+            let trimmed = s.trim_end_matches(|c: char| c == '\r' || c == '\n');
+            if !trimmed.is_empty() {
+                if let Some(sender) = tx {
+                    let _ = sender.send(trimmed.to_string());
+                }
+            }
+        }
+        buf.clear();
+    };
 
     loop {
         if std::time::Instant::now() > deadline {
+            flush_log_line(&mut log_line_buf, log_tx);
             return Err("timeout waiting for ESP32 response".into());
         }
 
         // Hunt for magic bytes -- skip ESP-IDF log output that pollutes USB-CDC.
+        // Non-magic bytes are forwarded to log_tx line-by-line so Sapwood can
+        // surface them in the log panel.
         let mut byte = [0u8; 1];
         match port.read(&mut byte) {
             Ok(1) => {
                 if byte[0] != 0x48 {
                     skipped_bytes += 1;
+                    // Accumulate for line-based log forwarding.
+                    log_line_buf.push(byte[0]);
+                    if byte[0] == b'\n' || log_line_buf.len() > 512 {
+                        flush_log_line(&mut log_line_buf, log_tx);
+                    }
                     continue;
                 }
                 match port.read(&mut byte) {
                     Ok(1) if byte[0] == 0x57 => {}
-                    _ => { skipped_bytes += 1; continue; }
+                    _ => {
+                        // The 0x48 we saw wasn't followed by 0x57 -- treat as
+                        // log noise and roll it into the line buffer.
+                        log_line_buf.push(0x48);
+                        if let Ok(1) = Ok::<usize, std::io::Error>(1) {
+                            log_line_buf.push(byte[0]);
+                        }
+                        skipped_bytes += 1;
+                        continue;
+                    }
                 }
+                // Found a real frame boundary. Flush any partial log line.
+                flush_log_line(&mut log_line_buf, log_tx);
 
                 let t_magic = t_start.elapsed().as_millis();
                 log::debug!("serial: magic found after {}ms (skipped {} bytes)", t_magic, skipped_bytes);
@@ -576,6 +627,14 @@ async fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
+    // Broadcast channel for device log lines (WebSocket streaming to Sapwood).
+    // Created early so it can be threaded into every serial helper that reads
+    // frame responses -- they opportunistically forward non-frame bytes from
+    // the device as log lines, which is the only way Sapwood sees device logs
+    // during long-running frame exchanges (the background log_poller task is
+    // starved while a sign_event holds the serial mutex waiting on a button).
+    let (log_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+
     // Parse bridge secret early so we fail fast on bad input
     let bridge_secret: Option<[u8; 32]> = match &cli.bridge_secret {
         Some(hex_str) => Some(decode_hex_32(hex_str).expect("invalid --bridge-secret")),
@@ -651,7 +710,7 @@ async fn main() -> Result<()> {
     // --signing-master <slot|npub> flag for multi-master deployments; for
     // now the bridge is scoped to one active signing identity at a time.
     let (signing_master_slot, signing_master_pubkey, signing_master_label) = if passthrough {
-        let masters = query_master_list(&mut port)
+        let masters = query_master_list(&mut port, Some(&log_tx))
             .expect("failed to query master list from ESP32 -- is the device provisioned?");
         if masters.is_empty() {
             panic!("ESP32 has no masters provisioned -- run setup-hsm.py first");
@@ -803,8 +862,8 @@ async fn main() -> Result<()> {
         uri
     };
 
-    // Broadcast channel for log lines (WebSocket streaming).
-    let (log_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+    // log_tx is created at the top of main() so it can be threaded into
+    // startup-time serial helpers (query_master_list etc).
 
     // Spawn the management API server.
     let api_token = cli.api_token.clone().map(Arc::new);
@@ -826,7 +885,7 @@ async fn main() -> Result<()> {
     };
 
     // Spawn the background log poller (reads serial when idle, broadcasts to WebSocket clients).
-    tokio::spawn(api::log_poller(Arc::clone(&port), log_tx));
+    tokio::spawn(api::log_poller(Arc::clone(&port), log_tx.clone()));
 
     let enable_cors = cli.cors || cli.sapwood_dir.is_none();
     let api_router = api::router(app_state, cli.sapwood_dir.as_deref(), enable_cors);
@@ -891,6 +950,7 @@ async fn main() -> Result<()> {
             let bunker_keys = bunker_keys.clone();
             let client_clone = client.clone();
             let port = &port;
+            let log_tx = log_tx.clone();
 
             async move {
                 let event = match notification {
@@ -923,6 +983,7 @@ async fn main() -> Result<()> {
                             &master_pubkey_bytes,
                             &client_pubkey_bytes,
                             &event.content,
+                            Some(&log_tx),
                         ) {
                             Ok(resp) => resp,
                             Err(e) => {
@@ -948,6 +1009,7 @@ async fn main() -> Result<()> {
                             &client_pubkey_bytes,
                             created_at,
                             &response_ciphertext,
+                            Some(&log_tx),
                         ) {
                             Ok(json) => json,
                             Err(e) => {
@@ -1004,7 +1066,7 @@ async fn main() -> Result<()> {
 
                     let response_json = {
                         let mut port = port.lock().unwrap();
-                        match forward_to_esp32(&mut port, &plaintext) {
+                        match forward_to_esp32(&mut port, &plaintext, Some(&log_tx)) {
                             Ok(resp) => resp,
                             Err(e) => {
                                 log::error!("ESP32 forward failed: {e}");

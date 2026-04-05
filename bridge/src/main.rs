@@ -346,6 +346,56 @@ fn unlock_pin(
 /// Frame payload layout: `[master_pubkey_32][client_pubkey_32][ciphertext_bytes...]`
 ///
 /// The ESP32 decrypts, processes, re-encrypts, and returns the response.
+/// Query the ESP32 for its loaded masters via PROVISION_LIST (0x05).
+/// Returns the parsed list of masters (slot, label, npub, mode).
+fn query_master_list(port: &mut RawSerial) -> Result<Vec<serde_json::Value>, String> {
+    let frame_bytes = frame::build_frame(FRAME_TYPE_PROVISION_LIST, &[])
+        .map_err(|e| format!("frame build failed: {:?}", e))?;
+
+    port.write_all(&frame_bytes)
+        .map_err(|e| format!("serial write failed: {e}"))?;
+    port.flush()
+        .map_err(|e| format!("serial flush failed: {e}"))?;
+
+    let json = read_any_response(port)?;
+    let parsed: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| format!("provision list JSON parse failed: {e}"))?;
+    match parsed {
+        serde_json::Value::Array(arr) => Ok(arr),
+        _ => Err("provision list response was not a JSON array".into()),
+    }
+}
+
+/// Ask the ESP32 to build and sign a NIP-46 kind:24133 envelope event
+/// wrapping the given ciphertext. Returns the fully serialised signed event
+/// ready to publish to relays verbatim.
+///
+/// Payload layout matches FRAME_TYPE_SIGN_ENVELOPE (0x34):
+///   [master_pubkey_32][client_pubkey_32][created_at_u64_be_8][ciphertext_bytes...]
+fn forward_sign_envelope(
+    port: &mut RawSerial,
+    master_pubkey: &[u8; 32],
+    client_pubkey: &[u8; 32],
+    created_at: u64,
+    ciphertext: &str,
+) -> Result<String, String> {
+    let mut payload = Vec::with_capacity(72 + ciphertext.len());
+    payload.extend_from_slice(master_pubkey);
+    payload.extend_from_slice(client_pubkey);
+    payload.extend_from_slice(&created_at.to_be_bytes());
+    payload.extend_from_slice(ciphertext.as_bytes());
+
+    let frame_bytes = frame::build_frame(FRAME_TYPE_SIGN_ENVELOPE, &payload)
+        .map_err(|e| format!("frame build failed: {:?}", e))?;
+
+    port.write_all(&frame_bytes)
+        .map_err(|e| format!("serial write failed: {e}"))?;
+    port.flush()
+        .map_err(|e| format!("serial flush failed: {e}"))?;
+
+    read_any_response(port)
+}
+
 fn forward_encrypted(
     port: &mut RawSerial,
     master_pubkey: &[u8; 32],
@@ -428,18 +478,33 @@ fn read_any_response(port: &mut RawSerial) -> Result<String, String> {
                 buf.extend_from_slice(&body);
                 match frame::parse_frame(&buf) {
                     Ok(f) => {
-                        if f.frame_type == FRAME_TYPE_NIP46_RESPONSE
-                            || f.frame_type == FRAME_TYPE_ENCRYPTED_RESPONSE
-                            || f.frame_type == FRAME_TYPE_PROVISION_LIST_RESPONSE
-                        {
-                            log::debug!("serial: response parsed after {}ms total", t_start.elapsed().as_millis());
-                            return String::from_utf8(f.payload)
-                                .map_err(|e| format!("invalid UTF-8 in response: {e}"));
-                        } else if f.frame_type == FRAME_TYPE_NACK {
-                            return Err("ESP32 sent NACK".into());
+                        log::debug!("serial: response parsed after {}ms total (type=0x{:02x})",
+                            t_start.elapsed().as_millis(), f.frame_type);
+                        match f.frame_type {
+                            FRAME_TYPE_NIP46_RESPONSE
+                            | FRAME_TYPE_PROVISION_LIST_RESPONSE
+                            | FRAME_TYPE_SIGN_ENVELOPE_RESPONSE => {
+                                // Pure UTF-8 JSON payloads.
+                                return String::from_utf8(f.payload)
+                                    .map_err(|e| format!("invalid UTF-8 in response: {e}"));
+                            }
+                            FRAME_TYPE_ENCRYPTED_RESPONSE => {
+                                // Payload layout: [client_pubkey_32][ciphertext_b64_ascii...]
+                                // Strip the raw pubkey prefix -- the caller only needs
+                                // the base64 ciphertext, and the prefix bytes are not
+                                // valid UTF-8 on their own.
+                                if f.payload.len() < 32 {
+                                    return Err("encrypted response too short".into());
+                                }
+                                return String::from_utf8(f.payload[32..].to_vec())
+                                    .map_err(|e| format!("invalid UTF-8 in encrypted response: {e}"));
+                            }
+                            FRAME_TYPE_NACK => return Err("ESP32 sent NACK".into()),
+                            _ => {
+                                // Other frame type -- skip and keep hunting.
+                                skipped_bytes = 0;
+                            }
                         }
-                        // Other frame type -- skip and keep hunting.
-                        skipped_bytes = 0;
                     }
                     Err(_) => { skipped_bytes = 0; continue; }
                 }
@@ -529,26 +594,9 @@ async fn main() -> Result<()> {
         if passthrough { "device-decrypts (encrypted)" } else { "bridge-decrypts (plaintext)" }
     );
 
-    // Write bunker-uri.txt so the heartwood-device web UI can serve it to Bark.
-    if let Some(ref dir) = cli.data_dir {
-        let relay_params: String = cli
-            .relays
-            .split(',')
-            .filter(|r| !r.trim().is_empty())
-            .map(|r| format!("relay={}", urlencoding::encode(r.trim())))
-            .collect::<Vec<_>>()
-            .join("&");
-        let bunker_uri = format!(
-            "bunker://{}?{}",
-            bunker_pubkey.to_hex(),
-            relay_params,
-        );
-        let path = std::path::Path::new(dir).join("bunker-uri.txt");
-        match std::fs::write(&path, &bunker_uri) {
-            Ok(()) => log::info!("Wrote bunker URI to {}", path.display()),
-            Err(e) => log::error!("Failed to write bunker-uri.txt: {e}"),
-        }
-    }
+    // NOTE: bunker-uri.txt for the data_dir path is written AFTER we query the
+    // device master list below, so it reflects the real signing master pubkey
+    // rather than the Pi-side ephemeral bunker key.
 
     // Open serial port using raw POSIX I/O — no DTR toggling, no ESP32 reboot.
     // The serialport crate's open() asserts DTR before the caller can disable it,
@@ -589,6 +637,77 @@ async fn main() -> Result<()> {
     if let Some(secret) = &bridge_secret {
         if let Err(e) = authenticate_bridge(&mut port, secret) {
             panic!("Session authentication failed: {e}");
+        }
+    }
+
+    // Query the ESP32 for its loaded masters so we can route NIP-46 traffic
+    // to a real on-device identity rather than to a Pi-side bunker key. This
+    // is the correctness fix for device-decrypts mode: Bark encrypts to the
+    // master pubkey, the device decrypts with the matching master secret,
+    // and the device signs the outer envelope event via SIGN_ENVELOPE so no
+    // master secret ever touches the Pi.
+    //
+    // Master selection: slot 0 by default. A future release will accept a
+    // --signing-master <slot|npub> flag for multi-master deployments; for
+    // now the bridge is scoped to one active signing identity at a time.
+    let (signing_master_slot, signing_master_pubkey, signing_master_label) = if passthrough {
+        let masters = query_master_list(&mut port)
+            .expect("failed to query master list from ESP32 -- is the device provisioned?");
+        if masters.is_empty() {
+            panic!("ESP32 has no masters provisioned -- run setup-hsm.py first");
+        }
+
+        for m in &masters {
+            log::info!(
+                "Device master: slot={} label={} mode={} npub={}",
+                m.get("slot").and_then(|v| v.as_u64()).unwrap_or(0),
+                m.get("label").and_then(|v| v.as_str()).unwrap_or(""),
+                m.get("mode").and_then(|v| v.as_u64()).unwrap_or(0),
+                m.get("npub").and_then(|v| v.as_str()).unwrap_or(""),
+            );
+        }
+
+        let first = &masters[0];
+        let slot = first.get("slot").and_then(|v| v.as_u64())
+            .expect("master slot missing") as u8;
+        let label = first.get("label").and_then(|v| v.as_str())
+            .unwrap_or("").to_string();
+        let npub = first.get("npub").and_then(|v| v.as_str())
+            .expect("master npub missing");
+        let pk = PublicKey::parse(npub)
+            .expect("failed to decode master npub");
+        let pk_bytes: [u8; 32] = pk.to_bytes();
+        log::info!("Routing NIP-46 traffic to master slot {} ({}), pubkey {}",
+            slot, label, hex_encode(&pk_bytes));
+        (slot, pk_bytes, label)
+    } else {
+        // Legacy bridge-decrypts mode -- no on-device routing, the Pi does all
+        // NIP-44 crypto with bunker_keys and forwards plaintext NIP-46 to the
+        // device. In this mode the "master" concept does not apply and we keep
+        // the historical behaviour (bunker_pubkey is used throughout).
+        log::warn!("Running in bridge-decrypts (legacy) mode -- master signing happens on host");
+        (0u8, bunker_pubkey.to_bytes(), "legacy".to_string())
+    };
+
+    // Now that we know the signing master, write bunker-uri.txt with the
+    // real URI for the heartwood-device web UI / Bark pairing.
+    if let Some(ref dir) = cli.data_dir {
+        let relay_params: String = cli
+            .relays
+            .split(',')
+            .filter(|r| !r.trim().is_empty())
+            .map(|r| format!("relay={}", urlencoding::encode(r.trim())))
+            .collect::<Vec<_>>()
+            .join("&");
+        let bunker_uri_file = format!(
+            "bunker://{}?{}",
+            hex_encode(&signing_master_pubkey),
+            relay_params,
+        );
+        let path = std::path::Path::new(dir).join("bunker-uri.txt");
+        match std::fs::write(&path, &bunker_uri_file) {
+            Ok(()) => log::info!("Wrote bunker URI to {}", path.display()),
+            Err(e) => log::error!("Failed to write bunker-uri.txt: {e}"),
         }
     }
 
@@ -659,17 +778,28 @@ async fn main() -> Result<()> {
         }
         drop(port_guard);
 
-        // Build the URI with the BRIDGE's pubkey (clients talk to the bridge in bridge-decrypts mode).
+        // Build the URI advertising the SIGNING MASTER's pubkey. Clients (Bark etc)
+        // encrypt NIP-46 requests to this pubkey via NIP-44 ECDH; the device
+        // decrypts with the matching master secret. The Pi-side `bunker_keys`
+        // is now only used as an ephemeral relay-layer transport identity
+        // and does not appear in the URI at all.
+        //
+        // In legacy bridge-decrypts mode `signing_master_pubkey` is set to
+        // `bunker_pubkey.to_bytes()` earlier so this URI format is unchanged
+        // from pre-refactor behaviour for that mode.
+        let uri_pubkey_hex = hex_encode(&signing_master_pubkey);
         let relay_params: String = relay_list.iter()
             .map(|r| format!("relay={}", urlencoding::encode(r)))
             .collect::<Vec<_>>()
             .join("&");
         let uri = if connect_secret.is_empty() {
-            format!("bunker://{}?{}", bunker_pubkey.to_hex(), relay_params)
+            format!("bunker://{}?{}", uri_pubkey_hex, relay_params)
         } else {
-            format!("bunker://{}?{}&secret={}", bunker_pubkey.to_hex(), relay_params, connect_secret)
+            format!("bunker://{}?{}&secret={}", uri_pubkey_hex, relay_params, connect_secret)
         };
         log::info!("Bunker URI: {}", &uri[..uri.len().min(80)]);
+        log::info!("Paired clients will sign as: {} (slot {})",
+            signing_master_label, signing_master_slot);
         uri
     };
 
@@ -736,17 +866,24 @@ async fn main() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(3)).await;
     log::info!("Connected to relays");
 
-    // Subscribe to NIP-46 requests addressed to our bunker pubkey
+    // Subscribe to NIP-46 requests p-tagged with the signing master pubkey.
+    // In device-decrypts mode this is the on-device master we resolved above;
+    // in legacy mode it falls back to bunker_pubkey. The Pi-side bunker_keys
+    // is used only by the Client for relay-layer signing (NIP-42 auth etc),
+    // not for the NIP-46 application layer.
+    let signing_master_nostr_pubkey = PublicKey::from_slice(&signing_master_pubkey)
+        .expect("signing master pubkey is valid secp256k1 x-only");
     let filter = Filter::new()
         .kind(Kind::NostrConnect)
-        .pubkey(bunker_pubkey)
+        .pubkey(signing_master_nostr_pubkey)
         .since(Timestamp::now());
 
     client.subscribe(filter, None).await?;
     log::info!("Subscribed to NIP-46 events — waiting for requests...");
 
-    // Pre-compute the bunker pubkey bytes once (used in device-decrypts mode)
-    let master_pubkey_bytes: [u8; 32] = bunker_pubkey.to_bytes();
+    // Pre-compute the master pubkey bytes once (used in both the ENCRYPTED_REQUEST
+    // routing and the SIGN_ENVELOPE envelope-signing round-trip).
+    let master_pubkey_bytes: [u8; 32] = signing_master_pubkey;
 
     // Event loop — process incoming NIP-46 requests
     client
@@ -771,11 +908,15 @@ async fn main() -> Result<()> {
 
                 if passthrough {
                     // -------------------------------------------------------
-                    // Device-decrypts mode — forward raw ciphertext to ESP32
+                    // Device-decrypts mode — forward raw ciphertext to ESP32,
+                    // then ask the ESP32 to sign the outer envelope event so
+                    // the master secret never leaves the device.
                     // -------------------------------------------------------
                     let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-                    let response_content = {
+                    // Step 1: forward the encrypted request to the device and
+                    // receive the encrypted response ciphertext (base64 ASCII).
+                    let response_ciphertext = {
                         let mut port = port.lock().unwrap();
                         match forward_encrypted(
                             &mut port,
@@ -790,17 +931,41 @@ async fn main() -> Result<()> {
                             }
                         }
                     };
-
                     log::info!(
-                        "ESP32 response ({} bytes)",
-                        response_content.len()
+                        "ESP32 encrypted response ({} bytes)",
+                        response_ciphertext.len()
                     );
 
-                    // Publish the response verbatim — the ESP32 has already encrypted it
-                    let response_event = EventBuilder::new(Kind::NostrConnect, response_content)
-                        .tag(Tag::public_key(client_pubkey));
+                    // Step 2: ask the device to build and sign the outer
+                    // kind:24133 envelope event with the master secret. The
+                    // host never holds a signing-capable key for this path.
+                    let created_at: u64 = Timestamp::now().as_secs();
+                    let signed_event_json = {
+                        let mut port = port.lock().unwrap();
+                        match forward_sign_envelope(
+                            &mut port,
+                            &master_pubkey_bytes,
+                            &client_pubkey_bytes,
+                            created_at,
+                            &response_ciphertext,
+                        ) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                log::error!("ESP32 envelope sign failed: {e}");
+                                return Ok(false);
+                            }
+                        }
+                    };
 
-                    match client_clone.send_event_builder(response_event).await {
+                    // Step 3: parse and publish the pre-signed event verbatim.
+                    let signed_event = match Event::from_json(&signed_event_json) {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            log::error!("Failed to parse signed envelope from device: {e}");
+                            return Ok(false);
+                        }
+                    };
+                    match client_clone.send_event(&signed_event).await {
                         Ok(output) => log::info!("Response published: {}", output.id()),
                         Err(e) => log::error!("Failed to publish response: {e}"),
                     }

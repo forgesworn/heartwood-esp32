@@ -58,6 +58,29 @@ pub const FRAME_TYPE_OTA_CHUNK: u8 = 0x31;
 pub const FRAME_TYPE_OTA_FINISH: u8 = 0x32;
 pub const FRAME_TYPE_OTA_STATUS: u8 = 0x33;
 
+// --- Envelope signing (NIP-46 outer event signed on-device) ---
+//
+// host -> device:
+//   FRAME_TYPE_SIGN_ENVELOPE (0x34) payload layout:
+//     [master_pubkey_32][client_pubkey_32][created_at_u64_be_8][ciphertext_bytes...]
+//
+//   The device finds the master by pubkey, builds a canonical NIP-46
+//   kind:24133 envelope event (pubkey = master_pubkey, p-tag = client_pubkey,
+//   content = ciphertext as-is), computes the event id, signs with the
+//   matching master secret, and returns a fully serialised signed event.
+//
+//   Requires bridge session authentication (same as ENCRYPTED_REQUEST).
+//   The device restricts this frame to kind:24133 and uses its own copy
+//   of the master pubkey so the host cannot coerce the device into signing
+//   an arbitrary event; the host-provided master_pubkey is only used as a
+//   lookup key, not written into the event.
+//
+// device -> host:
+//   FRAME_TYPE_SIGN_ENVELOPE_RESPONSE (0x35) payload: UTF-8 JSON of the
+//   serialised signed event, ready to publish to relays verbatim.
+pub const FRAME_TYPE_SIGN_ENVELOPE: u8 = 0x34;
+pub const FRAME_TYPE_SIGN_ENVELOPE_RESPONSE: u8 = 0x35;
+
 // OTA status codes (payload byte 0 of OTA_STATUS frame)
 pub const OTA_STATUS_READY: u8 = 0x00;
 pub const OTA_STATUS_CHUNK_OK: u8 = 0x01;

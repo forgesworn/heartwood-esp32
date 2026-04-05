@@ -15,6 +15,11 @@ CONFIG_ESP_TASK_WDT_INIT=n
 # OTA support
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
+# NOTE: esp-idf-sys generates its CMake project in target/.../out/ which is
+# where relative paths resolve from; see build.rs for the copy-on-build
+# mechanism that puts partitions.csv where the generated CMake project can
+# find it. If your build fails with "partitions.csv missing and no known
+# rule to make it", run `cargo clean` first to force the copy to re-run.
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # SECURITY NOTE: NVS flash encryption is NOT enabled in this configuration.

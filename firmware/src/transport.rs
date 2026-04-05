@@ -14,9 +14,12 @@ use secp256k1::{Secp256k1, SignOnly};
 use std::sync::Arc;
 
 use heartwood_common::frame::Frame;
+use heartwood_common::hex::hex_encode;
 use heartwood_common::nip44;
+use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
 use heartwood_common::types::{
     FRAME_TYPE_ENCRYPTED_RESPONSE, FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST,
+    FRAME_TYPE_SIGN_ENVELOPE_RESPONSE,
 };
 
 use crate::masters::LoadedMaster;
@@ -149,4 +152,136 @@ fn random_nonce_32() -> [u8; 32] {
         );
     }
     nonce
+}
+
+/// Kind number for NIP-46 envelope events. Hardcoded here (not read from
+/// the frame) so the host cannot coerce the device into signing a kind other
+/// than an NIP-46 envelope via this frame type. Arbitrary event signing
+/// still goes through the NIP-46 sign_event path with button approval.
+const NIP46_ENVELOPE_KIND: u64 = 24133;
+
+/// Handle a SIGN_ENVELOPE frame (0x34).
+///
+/// Builds a NIP-46 kind:24133 envelope event on-device, signs it with the
+/// matching master's secret, and returns the fully serialised signed event.
+/// The host provides the target master pubkey as a lookup hint, the client
+/// pubkey to p-tag, the `created_at` timestamp, and the NIP-44 ciphertext
+/// that should go in the event content.
+///
+/// Security notes:
+/// - The host provides ONLY the lookup key, the p-tag target, the timestamp,
+///   and the content ciphertext. The device builds the rest of the event
+///   structure itself: kind is hardcoded to 24133, the author pubkey is
+///   recomputed from the master's actual secret (not taken from the frame),
+///   and tags contain exactly one `p` tag with the client pubkey. A malicious
+///   bridge cannot ask the device to sign an arbitrary event via this path.
+/// - No button approval is required. NIP-46 envelope events are signed many
+///   times per user operation (once per response) and button-gating each
+///   would make the user experience unusable. Security for user-visible
+///   event signing remains with the NIP-46 sign_event method, which IS
+///   button-gated and operates on the inner NIP-46 `sign_event` request.
+/// - The frame is accepted only when `bridge_authenticated` is true (the
+///   caller in main.rs enforces this, same as ENCRYPTED_REQUEST).
+///
+/// Payload layout:
+///   [master_pubkey_32][client_pubkey_32][created_at_u64_be_8][ciphertext_bytes...]
+///
+/// The ciphertext is copied into the event content as a UTF-8 string (it is
+/// base64-encoded NIP-44 v2 payload emitted by `handle_encrypted_request`'s
+/// re-encryption step or an equivalent bridge-side encryption, so it is
+/// already ASCII).
+pub fn handle_sign_envelope(
+    usb: &mut UsbSerialDriver<'_>,
+    frame: &Frame,
+    masters: &[LoadedMaster],
+    secp: &Arc<Secp256k1<SignOnly>>,
+) {
+    // 32 (master pub) + 32 (client pub) + 8 (created_at) = 72 minimum header
+    if frame.payload.len() < 72 {
+        log::warn!("SIGN_ENVELOPE payload too short ({} bytes, need >= 72)", frame.payload.len());
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return;
+    }
+
+    let master_pubkey: [u8; 32] = frame.payload[..32].try_into().unwrap();
+    let client_pubkey: [u8; 32] = frame.payload[32..64].try_into().unwrap();
+    let created_at = u64::from_be_bytes(frame.payload[64..72].try_into().unwrap());
+    let ciphertext_bytes = &frame.payload[72..];
+
+    let master_idx = match crate::masters::find_by_pubkey(masters, &master_pubkey) {
+        Some(idx) => idx,
+        None => {
+            log::warn!("SIGN_ENVELOPE for unknown master pubkey");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return;
+        }
+    };
+    let master = &masters[master_idx];
+
+    let ciphertext_str = match std::str::from_utf8(ciphertext_bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            log::error!("SIGN_ENVELOPE ciphertext is not valid UTF-8");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return;
+        }
+    };
+
+    // Recompute the author pubkey from the master secret directly. We do NOT
+    // trust the `master_pubkey` bytes from the frame for this; they were only
+    // used as a lookup hint above. This prevents a malicious host from
+    // passing a lookup-matching pubkey and then having the device emit an
+    // event whose `pubkey` field differs.
+    let keypair = match secp256k1::Keypair::from_seckey_slice(secp, &master.secret) {
+        Ok(kp) => kp,
+        Err(_) => {
+            log::error!("SIGN_ENVELOPE: invalid master secret in slot");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return;
+        }
+    };
+    let (xonly, _) = keypair.x_only_public_key();
+    let author_pubkey_hex = hex_encode(&xonly.serialize());
+
+    let client_pubkey_hex = hex_encode(&client_pubkey);
+
+    let unsigned = UnsignedEvent {
+        pubkey: author_pubkey_hex,
+        created_at,
+        kind: NIP46_ENVELOPE_KIND,
+        tags: vec![vec!["p".to_string(), client_pubkey_hex]],
+        content: ciphertext_str,
+    };
+
+    let event_id_bytes = nip46::compute_event_id(&unsigned);
+    let sig_bytes = match crate::sign::sign_hash(secp, &master.secret, &event_id_bytes) {
+        Ok(sig) => sig,
+        Err(e) => {
+            log::error!("SIGN_ENVELOPE: sign_hash failed: {e}");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return;
+        }
+    };
+
+    let signed = SignedEvent {
+        id: hex_encode(&event_id_bytes),
+        pubkey: unsigned.pubkey,
+        created_at: unsigned.created_at,
+        kind: unsigned.kind,
+        tags: unsigned.tags,
+        content: unsigned.content,
+        sig: hex_encode(&sig_bytes),
+    };
+
+    let event_json = match serde_json::to_string(&signed) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("SIGN_ENVELOPE: JSON serialise failed: {e}");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return;
+        }
+    };
+
+    log::info!("SIGN_ENVELOPE: built and signed {} byte event", event_json.len());
+    protocol::write_frame(usb, FRAME_TYPE_SIGN_ENVELOPE_RESPONSE, event_json.as_bytes());
 }

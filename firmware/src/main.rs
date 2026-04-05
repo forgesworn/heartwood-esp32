@@ -46,6 +46,7 @@ const IDLE_POLL_MS: u32 = 50;
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::types::{
     FRAME_TYPE_ACK, FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
+    FRAME_TYPE_SIGN_ENVELOPE,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
     FRAME_TYPE_BUNKER_URI_REQUEST, FRAME_TYPE_BUNKER_URI_RESPONSE,
@@ -386,6 +387,27 @@ fn main() {
                         &mut policy_engine,
                         &mut identity_caches,
                         &mut nvs,
+                    );
+                }
+            }
+
+            // 0x34 — sign a NIP-46 kind:24133 envelope event on-device
+            //
+            // Lets the bridge produce signed NIP-46 responses without ever
+            // holding master signing material. The device hardcodes the
+            // event kind and recomputes the author pubkey from its own
+            // master secret, so the host cannot coerce this path into
+            // signing an arbitrary event. Requires bridge session auth.
+            FRAME_TYPE_SIGN_ENVELOPE => {
+                if !policy_engine.bridge_authenticated {
+                    log::warn!("SIGN_ENVELOPE rejected — bridge not authenticated");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                } else {
+                    transport::handle_sign_envelope(
+                        &mut usb,
+                        &frame,
+                        &loaded_masters,
+                        &secp,
                     );
                 }
             }

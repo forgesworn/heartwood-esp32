@@ -5,7 +5,7 @@ edition = "2021"
 description = "Heartwood daemon -- Nostr signing service for Pi (Soft mode) and ESP32 (Hard mode)"
 
 [dependencies]
-heartwood-common = { path = "../common", features = ["nip46"] }
+heartwood-common = { path = "../common", features = ["nip46", "nip44"] }
 nostr-connect = "0.44"
 nostr = { version = "0.44", features = ["std", "nip44", "nip46"] }
 nostr-sdk = "0.44"

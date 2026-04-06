@@ -57,7 +57,6 @@ pub fn handle_request(
     master_label: &str,
     master_mode: MasterMode,
     master_slot: u8,
-    connect_secret: &[u8; 32],
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
@@ -126,18 +125,15 @@ pub fn handle_request(
                 }
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
                     let result = handle_sign_event(master_secret, secp, display, button_pin, &request);
-                    // TOFU: if approved and we have a client pubkey, remember this client.
-                    // Use has_client (populated from _client_pubkey JSON in legacy mode)
-                    // rather than client_pubkey.is_some() (only set in passthrough mode).
-                    //
-                    // Parse the JSON-RPC response to check for a top-level "error" key rather
-                    // than using a substring search — a signed event whose content contains the
-                    // word "error" must not block the TOFU save.
                     let is_success = serde_json::from_str::<serde_json::Value>(&result)
                         .map(|v| v.get("error").is_none())
                         .unwrap_or(false);
                     if has_client && is_success {
-                        tofu_approve(policy_engine, master_slot, &client_hex, "");
+                        // Upgrade the slot to full signing if not already.
+                        if let Some(slot) = policy_engine.find_slot_by_pubkey(master_slot, &client_hex) {
+                            let idx = slot.slot_index;
+                            policy_engine.upgrade_to_signing(master_slot, idx);
+                        }
                     }
                     result
                 }
@@ -149,14 +145,12 @@ pub fn handle_request(
         "connect" => {
             // params[0] is the client pubkey; params[1] is the optional secret.
             // params[2] is optional JSON metadata: {"name":"nostrudel.ninja","url":"https://..."}
-            // Register the client in a session so TOFU works for subsequent requests.
             if has_client {
                 if let Ok(pk_bytes) = hex_decode_32_safe(&client_hex) {
                     policy_engine.get_or_create_session(pk_bytes, master_slot);
                 }
             }
 
-            // Extract app label from the optional third parameter (Bark sends this).
             let app_label = request.params.get(2)
                 .and_then(|v| v.as_str())
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
@@ -164,23 +158,57 @@ pub fn handle_request(
                 .unwrap_or_default();
 
             let client_secret = request.params.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let stored_secret_hex = hex_encode(connect_secret);
             if client_secret.is_empty() {
-                // No secret provided -- accept but don't TOFU-approve.
+                // No secret -- accept but no slot assigned. Stranger path.
                 nip46::build_connect_response(&request.id).unwrap_or_default()
-            } else if constant_time_eq(client_secret.as_bytes(), stored_secret_hex.as_bytes()) {
-                // Secret matches -- client proved it has the bunker URI.
-                // Grant connect-safe methods only (encrypt/decrypt/get_public_key).
-                // sign_event requires a physical button press first -- the TOFU
-                // upgrade to full signing happens in the ButtonRequired branch above.
-                if has_client {
-                    tofu_connect_approve(policy_engine, master_slot, &client_hex, &app_label);
-                    log::info!("TOFU: connect-approved client (secret verified, signing requires button)");
-                }
-                nip46::build_connect_response_with_secret(&request.id, &stored_secret_hex).unwrap_or_default()
+            } else if !has_client {
+                build_error_json(&request.id, -1, "missing client pubkey")
             } else {
-                log::warn!("connect rejected -- incorrect secret (master_slot={})", master_slot);
-                build_error_json(&request.id, -1, "unauthorised")
+                // Look up slot by secret.
+                match policy_engine.find_slot_by_secret(master_slot, client_secret) {
+                    None => {
+                        log::warn!("connect: secret mismatch from {}", &client_hex[..16.min(client_hex.len())]);
+                        build_error_json(&request.id, -1, "unauthorised")
+                    }
+                    Some(slot) => {
+                        let slot_index = slot.slot_index;
+                        let slot_label = slot.label.clone();
+                        let was_signing = slot.signing_approved;
+                        let old_pubkey = slot.current_pubkey.clone();
+
+                        match &old_pubkey {
+                            None => {
+                                // First use -- assign pubkey.
+                                policy_engine.assign_pubkey_to_slot(master_slot, slot_index, client_hex.clone());
+                                // Update label from app metadata if slot is still "default".
+                                if !app_label.is_empty() {
+                                    let slots = policy_engine.slots_mut(master_slot);
+                                    if let Some(s) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
+                                        if s.label == "default" {
+                                            s.label = app_label.clone();
+                                        }
+                                    }
+                                }
+                                log::info!("Slot {} ({}) assigned to {}", slot_index, slot_label, &client_hex[..16.min(client_hex.len())]);
+                            }
+                            Some(existing) if existing == &client_hex => {
+                                // Same pubkey reconnecting -- no-op.
+                                log::info!("Slot {} ({}) reconnected (same pubkey)", slot_index, slot_label);
+                            }
+                            Some(_old) => {
+                                // New ephemeral key for existing slot.
+                                if was_signing {
+                                    // OLED flash for signing-approved slots.
+                                    crate::oled::show_auto_approved(display, &slot_label, "reconnected");
+                                }
+                                policy_engine.assign_pubkey_to_slot(master_slot, slot_index, client_hex.clone());
+                                log::info!("Slot {} ({}) pubkey swapped", slot_index, slot_label);
+                            }
+                        }
+
+                        nip46::build_connect_response(&request.id).unwrap_or_default()
+                    }
+                }
             }
         }
 
@@ -381,100 +409,6 @@ fn handle_auto_sign(
         .map_err(|e| format!("bad event format: {e}"))?;
     let signed = do_sign(&mut event, master_secret, secp, request.heartwood.as_ref())?;
     nip46::build_sign_response(&request.id, &signed)
-}
-
-// ---------------------------------------------------------------------------
-// TOFU approval
-// ---------------------------------------------------------------------------
-
-/// Connect-time TOFU: grant non-signing methods only (encrypt/decrypt/get_public_key).
-/// Called when a client connects with a valid secret. Does NOT grant sign_event.
-fn tofu_connect_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &str, label: &str) {
-    use heartwood_common::policy::{ClientPolicy, CONNECT_SAFE_METHODS};
-
-    let existing = policy_engine.master_policies
-        .iter()
-        .any(|mp| mp.master_slot == master_slot
-            && mp.policies.iter().any(|p| p.client_pubkey == client_hex));
-
-    if existing {
-        // Already has a policy (possibly upgraded to full TOFU). Don't downgrade.
-        if !label.is_empty() {
-            if let Some(mp) = policy_engine.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
-                if let Some(p) = mp.policies.iter_mut().find(|p| p.client_pubkey == client_hex) {
-                    if p.label.is_empty() {
-                        p.label = label.to_string();
-                        policy_engine.policies_dirty = true;
-                        log::info!("TOFU: updated label for {} -> {}", &client_hex[..16.min(client_hex.len())], label);
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    let policy = ClientPolicy {
-        client_pubkey: client_hex.to_string(),
-        label: label.to_string(),
-        allowed_methods: CONNECT_SAFE_METHODS.iter().map(|s| s.to_string()).collect(),
-        allowed_kinds: vec![],
-        auto_approve: true,
-    };
-
-    policy_engine.add_tofu_policy(master_slot, policy);
-    if label.is_empty() {
-        log::info!("TOFU: connect-approved client {}", &client_hex[..16.min(client_hex.len())]);
-    } else {
-        log::info!("TOFU: connect-approved client {} ({})", &client_hex[..16.min(client_hex.len())], label);
-    }
-}
-
-/// Full TOFU: grant all safe methods including sign_event.
-/// Called after the user physically approves a signing request via button press.
-/// If the client already has a connect-only policy, this upgrades it.
-fn tofu_approve(policy_engine: &mut PolicyEngine, master_slot: u8, client_hex: &str, label: &str) {
-    use heartwood_common::policy::{ClientPolicy, TOFU_SAFE_METHODS};
-
-    // Check if the client already has a policy for this master.
-    let existing = policy_engine.master_policies
-        .iter()
-        .find(|mp| mp.master_slot == master_slot)
-        .and_then(|mp| mp.policies.iter().find(|p| p.client_pubkey == client_hex));
-
-    if let Some(existing) = existing {
-        // If the existing policy already includes sign_event, nothing to do.
-        if existing.allowed_methods.iter().any(|m| m == "sign_event") {
-            return;
-        }
-        // Upgrade: connect-only policy -> full TOFU (add sign_event).
-        if let Some(mp) = policy_engine.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
-            if let Some(p) = mp.policies.iter_mut().find(|p| p.client_pubkey == client_hex) {
-                p.allowed_methods = TOFU_SAFE_METHODS.iter().map(|s| s.to_string()).collect();
-                if !label.is_empty() && p.label.is_empty() {
-                    p.label = label.to_string();
-                }
-                policy_engine.policies_dirty = true;
-                log::info!("TOFU: upgraded client {} to full signing", &client_hex[..16.min(client_hex.len())]);
-            }
-        }
-        return;
-    }
-
-    // No existing policy -- create a full TOFU policy (button was pressed).
-    let policy = ClientPolicy {
-        client_pubkey: client_hex.to_string(),
-        label: label.to_string(),
-        allowed_methods: TOFU_SAFE_METHODS.iter().map(|s| s.to_string()).collect(),
-        allowed_kinds: vec![],
-        auto_approve: true,
-    };
-
-    policy_engine.add_tofu_policy(master_slot, policy);
-    if label.is_empty() {
-        log::info!("TOFU: auto-approved client {}", &client_hex[..16.min(client_hex.len())]);
-    } else {
-        log::info!("TOFU: auto-approved client {} ({})", &client_hex[..16.min(client_hex.len())], label);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -970,21 +904,6 @@ fn build_error_json(request_id: &str, code: i32, message: &str) -> String {
     nip46::build_error_response(request_id, code, message).unwrap_or_default()
 }
 
-/// Compare two byte slices in constant time to prevent timing-based attacks
-/// when validating connect secrets.
-///
-/// Returns `true` only when both slices are identical in both length and content.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1020,25 +939,4 @@ mod tests {
         );
     }
 
-    /// Verify that the constant-time equality helper works correctly for the
-    /// connect secret validation path.
-    #[test]
-    fn constant_time_eq_equal_slices() {
-        let a = [0xabu8; 32];
-        let b = [0xabu8; 32];
-        assert!(super::constant_time_eq(&a, &b));
-    }
-
-    #[test]
-    fn constant_time_eq_different_slices() {
-        let a = [0x00u8; 32];
-        let mut b = [0x00u8; 32];
-        b[31] = 0x01;
-        assert!(!super::constant_time_eq(&a, &b));
-    }
-
-    #[test]
-    fn constant_time_eq_different_lengths() {
-        assert!(!super::constant_time_eq(&[0u8; 32], &[0u8; 16]));
-    }
 }

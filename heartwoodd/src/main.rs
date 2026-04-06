@@ -18,6 +18,7 @@
 
 mod api;
 mod backend;
+mod relay;
 mod serial;
 
 use std::io::{Read, Write};
@@ -25,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
-use nostr::nips::nip44;
 use nostr_sdk::prelude::*;
 
 use heartwood_common::frame;
@@ -694,8 +694,12 @@ async fn main() -> Result<()> {
     let serial_backend = backend::serial::SerialBackend::new(Arc::clone(&port), log_tx.clone());
     let serial_arc = serial_backend.serial().clone();
 
+    // Wrap the backend in Arc so it can be shared between the management API
+    // and the relay event loop without cloning key material.
+    let backend_arc: Arc<dyn backend::SigningBackend> = Arc::new(serial_backend);
+
     let app_state = api::AppState {
-        backend: Arc::new(serial_backend),
+        backend: Arc::clone(&backend_arc),
         daemon_info: Arc::new(api::DaemonInfo {
             tier: backend::Tier::Hard,
             relays: relay_list.clone(),
@@ -746,187 +750,10 @@ async fn main() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(3)).await;
     log::info!("Connected to relays");
 
-    // Subscribe to NIP-46 requests p-tagged with the signing master pubkey.
-    // In device-decrypts mode this is the on-device master we resolved above;
-    // in legacy mode it falls back to bunker_pubkey. The Pi-side bunker_keys
-    // is used only by the Client for relay-layer signing (NIP-42 auth etc),
-    // not for the NIP-46 application layer.
-    let signing_master_nostr_pubkey = PublicKey::from_slice(&signing_master_pubkey)
-        .expect("signing master pubkey is valid secp256k1 x-only");
-    let filter = Filter::new()
-        .kind(Kind::NostrConnect)
-        .pubkey(signing_master_nostr_pubkey)
-        .since(Timestamp::now());
-
-    client.subscribe(filter, None).await?;
-    log::info!("Subscribed to NIP-46 events — waiting for requests...");
-
-    // Pre-compute the master pubkey bytes once (used in both the ENCRYPTED_REQUEST
-    // routing and the SIGN_ENVELOPE envelope-signing round-trip).
-    let master_pubkey_bytes: [u8; 32] = signing_master_pubkey;
-
-    // Event loop — process incoming NIP-46 requests
-    client
-        .handle_notifications(|notification| {
-            let bunker_keys = bunker_keys.clone();
-            let client_clone = client.clone();
-            let port = &port;
-            let log_tx = log_tx.clone();
-
-            async move {
-                let event = match notification {
-                    RelayPoolNotification::Event { event, .. } => event,
-                    _ => return Ok(false),
-                };
-
-                // Only process NIP-46 events
-                if event.kind != Kind::NostrConnect {
-                    return Ok(false);
-                }
-
-                let client_pubkey = event.pubkey;
-                log::info!("NIP-46 request from {}", client_pubkey);
-
-                if passthrough {
-                    // -------------------------------------------------------
-                    // Device-decrypts mode — forward raw ciphertext to ESP32,
-                    // then ask the ESP32 to sign the outer envelope event so
-                    // the master secret never leaves the device.
-                    // -------------------------------------------------------
-                    let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
-
-                    // Step 1: forward the encrypted request to the device and
-                    // receive the encrypted response ciphertext (base64 ASCII).
-                    let response_ciphertext = {
-                        let mut port = port.lock().unwrap();
-                        match forward_encrypted(
-                            &mut port,
-                            &master_pubkey_bytes,
-                            &client_pubkey_bytes,
-                            &event.content,
-                            Some(&log_tx),
-                        ) {
-                            Ok(resp) => resp,
-                            Err(e) => {
-                                log::error!("ESP32 forward (encrypted) failed: {e}");
-                                return Ok(false);
-                            }
-                        }
-                    };
-                    log::info!(
-                        "ESP32 encrypted response ({} bytes)",
-                        response_ciphertext.len()
-                    );
-
-                    // Step 2: ask the device to build and sign the outer
-                    // kind:24133 envelope event with the master secret. The
-                    // host never holds a signing-capable key for this path.
-                    let created_at: u64 = Timestamp::now().as_secs();
-                    let signed_event_json = {
-                        let mut port = port.lock().unwrap();
-                        match forward_sign_envelope(
-                            &mut port,
-                            &master_pubkey_bytes,
-                            &client_pubkey_bytes,
-                            created_at,
-                            &response_ciphertext,
-                            Some(&log_tx),
-                        ) {
-                            Ok(json) => json,
-                            Err(e) => {
-                                log::error!("ESP32 envelope sign failed: {e}");
-                                return Ok(false);
-                            }
-                        }
-                    };
-
-                    // Step 3: parse and publish the pre-signed event verbatim.
-                    let signed_event = match Event::from_json(&signed_event_json) {
-                        Ok(ev) => ev,
-                        Err(e) => {
-                            log::error!("Failed to parse signed envelope from device: {e}");
-                            return Ok(false);
-                        }
-                    };
-                    match client_clone.send_event(&signed_event).await {
-                        Ok(output) => log::info!("Response published: {}", output.id()),
-                        Err(e) => log::error!("Failed to publish response: {e}"),
-                    }
-                } else {
-                    // -------------------------------------------------------
-                    // Bridge-decrypts mode — bridge does NIP-44 decrypt/encrypt
-                    // -------------------------------------------------------
-                    let plaintext = match nip44::decrypt(
-                        bunker_keys.secret_key(),
-                        &client_pubkey,
-                        &event.content,
-                    ) {
-                        Ok(pt) => pt,
-                        Err(e) => {
-                            log::error!("NIP-44 decrypt failed: {e}");
-                            return Ok(false);
-                        }
-                    };
-
-                    // Inject the client pubkey so the ESP32 can identify
-                    // the client for TOFU policy in bridge-decrypts mode.
-                    let plaintext = if plaintext.starts_with('{') {
-                        format!(
-                            "{{\"_client_pubkey\":\"{}\",{}",
-                            client_pubkey.to_hex(),
-                            &plaintext[1..],
-                        )
-                    } else {
-                        plaintext
-                    };
-
-                    log::info!(
-                        "Decrypted request: {}",
-                        &plaintext[..plaintext.len().min(300)]
-                    );
-
-                    let response_json = {
-                        let mut port = port.lock().unwrap();
-                        match forward_to_esp32(&mut port, &plaintext, Some(&log_tx)) {
-                            Ok(resp) => resp,
-                            Err(e) => {
-                                log::error!("ESP32 forward failed: {e}");
-                                return Ok(false);
-                            }
-                        }
-                    };
-
-                    log::info!(
-                        "ESP32 response: {}",
-                        &response_json[..response_json.len().min(100)]
-                    );
-
-                    let ciphertext = match nip44::encrypt(
-                        bunker_keys.secret_key(),
-                        &client_pubkey,
-                        &response_json,
-                        nip44::Version::default(),
-                    ) {
-                        Ok(ct) => ct,
-                        Err(e) => {
-                            log::error!("NIP-44 encrypt failed: {e}");
-                            return Ok(false);
-                        }
-                    };
-
-                    let response_event = EventBuilder::new(Kind::NostrConnect, ciphertext)
-                        .tag(Tag::public_key(client_pubkey));
-
-                    match client_clone.send_event_builder(response_event).await {
-                        Ok(output) => log::info!("Response published: {}", output.id()),
-                        Err(e) => log::error!("Failed to publish response: {e}"),
-                    }
-                }
-
-                Ok(false) // keep listening
-            }
-        })
-        .await?;
+    // Hand off to the relay event loop. The backend trait abstracts the mode
+    // difference: Hard mode forwards frames to the ESP32 over serial; Soft mode
+    // signs locally. main() only needs to orchestrate startup.
+    relay::run_event_loop(&client, &backend_arc, &signing_master_pubkey).await?;
 
     Ok(())
 }

@@ -264,22 +264,11 @@ async fn create_slot(
             Ok(p) => p,
             Err(e) => return e,
         };
-        // Build relay URL list from bridge config for inclusion in the bunker URI.
-        let relays = state.bridge_info.relays.clone();
-        let relay_json = match serde_json::to_vec(&relays) {
-            Ok(j) => j,
-            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "relay serialisation failed"),
-        };
-        let label_json = match serde_json::to_vec(&body.label) {
-            Ok(j) => j,
-            Err(_) => return api_err(StatusCode::BAD_REQUEST, "invalid label"),
-        };
-        // Payload: master_slot (1) + label_json + 0x00 separator + relay_json
-        let mut payload = Vec::with_capacity(2 + label_json.len() + relay_json.len());
+        // Payload: master_slot (1) + label (plain UTF-8 string).
+        // Relay URLs are not needed here -- they're for CONNSLOT_URI.
+        let mut payload = Vec::with_capacity(1 + body.label.len());
         payload.push(master);
-        payload.extend_from_slice(&label_json);
-        payload.push(0x00);
-        payload.extend_from_slice(&relay_json);
+        payload.extend_from_slice(body.label.as_bytes());
         let frame_bytes = match frame::build_frame(FRAME_TYPE_CONNSLOT_CREATE, &payload) {
             Ok(f) => f,
             Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "frame build failed"),

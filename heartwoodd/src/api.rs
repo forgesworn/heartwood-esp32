@@ -20,7 +20,7 @@ use tokio::sync::broadcast;
 use heartwood_common::frame;
 use heartwood_common::types::*;
 
-use crate::RawSerial;
+use crate::serial::RawSerial;
 
 // ---------------------------------------------------------------------------
 // Shared state

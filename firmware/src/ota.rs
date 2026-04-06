@@ -92,16 +92,17 @@ pub fn handle_ota_begin(
 
     match approval_result {
         crate::approval::ApprovalResult::Approved => {
-            log::info!("OTA_BEGIN: approved — opening update partition");
+            // Log AFTER the status frame, not before -- VFS log output
+            // interleaves with framed data on the shared USB serial port.
         }
         crate::approval::ApprovalResult::Denied => {
-            log::info!("OTA_BEGIN: denied by user");
             send_ota_status(usb, OTA_STATUS_ERR_NOT_STARTED, "Denied");
+            log::info!("OTA_BEGIN: denied by user");
             return;
         }
         crate::approval::ApprovalResult::TimedOut => {
-            log::info!("OTA_BEGIN: timed out waiting for approval");
             send_ota_status(usb, OTA_STATUS_ERR_NOT_STARTED, "Timed out");
+            log::info!("OTA_BEGIN: timed out waiting for approval");
             return;
         }
     }
@@ -136,8 +137,8 @@ pub fn handle_ota_begin(
         partition,
     });
 
-    log::info!("OTA_BEGIN: session created, ready for chunks");
     send_ota_status(usb, OTA_STATUS_READY, "Ready");
+    log::info!("OTA_BEGIN: session created, ready for chunks");
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +324,12 @@ pub fn handle_ota_finish(
 ///
 /// Payload layout: `[status_code: u8][message: ASCII...]`
 pub fn send_ota_status(usb: &mut UsbSerialDriver<'_>, code: u8, message: &str) {
+    // Flush any pending VFS log output before writing the frame.
+    // ESP-IDF log lines share the USB serial port and can interleave with
+    // framed data, causing the host OTA tool to miss status responses.
+    unsafe { esp_idf_svc::sys::fsync(1); }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
     let msg_bytes = message.as_bytes();
     let msg_len = msg_bytes.len().min(63);
     let mut payload = Vec::with_capacity(1 + msg_len);

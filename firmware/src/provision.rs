@@ -79,17 +79,8 @@ pub fn handle_add(
     let (xonly, _) = keypair.x_only_public_key();
     let pubkey = xonly.serialize();
 
-    // Generate a random connect secret using the ESP32 hardware RNG.
-    let mut connect_secret = [0u8; 32];
-    unsafe {
-        esp_idf_svc::sys::esp_fill_random(
-            connect_secret.as_mut_ptr() as *mut core::ffi::c_void,
-            32,
-        );
-    }
-
-    // Persist to NVS.
-    match masters::add_master(nvs, &secret, &label, mode, &pubkey, &connect_secret) {
+    // Persist to NVS. Connection slots are created later via Sapwood.
+    match masters::add_master(nvs, &secret, &label, mode, &pubkey) {
         Ok(slot) => {
             let npub = encode_npub(&pubkey);
             log::info!("Provisioned slot {slot}: {label} ({npub})");
@@ -102,7 +93,6 @@ pub fn handle_add(
                 label,
                 mode,
                 pubkey,
-                connect_secret,
             })
         }
         Err(e) => {

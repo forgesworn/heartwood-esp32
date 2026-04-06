@@ -52,6 +52,18 @@ pub const FRAME_TYPE_POLICY_UPDATE: u8 = 0x2A;        // host -> device: payload
 pub const FRAME_TYPE_BUNKER_URI_REQUEST: u8 = 0x2B;   // host -> device: payload = master_slot (1) + relay_urls (JSON string array)
 pub const FRAME_TYPE_BUNKER_URI_RESPONSE: u8 = 0x2C;  // device -> host: payload = complete bunker:// URI with secret
 
+// --- Phase 6: per-client connection slots ---
+pub const FRAME_TYPE_CONNSLOT_CREATE: u8 = 0x40;           // host -> device: master_slot (1) + label (JSON string)
+pub const FRAME_TYPE_CONNSLOT_CREATE_RESP: u8 = 0x41;      // device -> host: slot_index (1) + JSON { secret_hex, bunker_uri }
+pub const FRAME_TYPE_CONNSLOT_LIST: u8 = 0x42;             // host -> device: master_slot (1)
+pub const FRAME_TYPE_CONNSLOT_LIST_RESP: u8 = 0x43;        // device -> host: JSON Vec<ConnectSlot> (secrets redacted)
+pub const FRAME_TYPE_CONNSLOT_UPDATE: u8 = 0x44;           // host -> device: master_slot (1) + JSON ConnectSlot (partial)
+pub const FRAME_TYPE_CONNSLOT_UPDATE_RESP: u8 = 0x45;      // device -> host: ok/err JSON
+pub const FRAME_TYPE_CONNSLOT_REVOKE: u8 = 0x46;           // host -> device: master_slot (1) + slot_index (1)
+pub const FRAME_TYPE_CONNSLOT_REVOKE_RESP: u8 = 0x47;      // device -> host: ok/err JSON
+pub const FRAME_TYPE_CONNSLOT_URI: u8 = 0x48;              // host -> device: master_slot (1) + slot_index (1) + relay_urls (JSON)
+pub const FRAME_TYPE_CONNSLOT_URI_RESP: u8 = 0x49;         // device -> host: complete bunker:// URI with secret
+
 // --- OTA frame types ---
 pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;
 pub const FRAME_TYPE_OTA_CHUNK: u8 = 0x31;

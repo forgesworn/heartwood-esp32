@@ -6,12 +6,10 @@
 use esp_idf_hal::usb_serial::UsbSerialDriver;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
-use heartwood_common::policy::ClientPolicy;
 use heartwood_common::types::{
     FRAME_TYPE_ACK, FRAME_TYPE_NACK, FRAME_TYPE_SESSION_ACK,
 };
 
-use crate::masters::LoadedMaster;
 use crate::policy::PolicyEngine;
 use crate::protocol;
 
@@ -77,60 +75,6 @@ pub fn handle_auth(
     log::info!("Bridge authenticated successfully");
     policy_engine.bridge_authenticated = true;
     protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x00]); // 0x00 = success
-}
-
-/// Handle a POLICY_PUSH frame (0x20).
-///
-/// Payload layout: 32 bytes master pubkey | JSON-encoded `Vec<ClientPolicy>`.
-/// The bridge must be authenticated before policies are accepted.
-pub fn handle_policy_push(
-    usb: &mut UsbSerialDriver<'_>,
-    payload: &[u8],
-    masters: &[LoadedMaster],
-    policy_engine: &mut PolicyEngine,
-    nvs: &mut EspNvs<NvsDefault>,
-) {
-    if !policy_engine.bridge_authenticated {
-        log::warn!("Policy push rejected — bridge not authenticated");
-        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
-    }
-
-    if payload.len() < 32 {
-        log::warn!("Policy push payload too short");
-        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
-    }
-
-    let master_pubkey: [u8; 32] = payload[..32].try_into().unwrap();
-    let policy_json = &payload[32..];
-
-    // Locate the provisioned master that corresponds to this pubkey.
-    let master_idx = match crate::masters::find_by_pubkey(masters, &master_pubkey) {
-        Some(idx) => idx,
-        None => {
-            log::warn!("Policy push for unknown master pubkey");
-            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-            return;
-        }
-    };
-
-    // Parse the JSON-encoded policy list.
-    let policies: Vec<ClientPolicy> = match serde_json::from_slice(policy_json) {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("Failed to parse policies: {e}");
-            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-            return;
-        }
-    };
-
-    let slot = masters[master_idx].slot;
-    let count = policies.len();
-    policy_engine.set_policies(slot, policies);
-    policy_engine.persist_policies(nvs, slot);
-    log::info!("Loaded {count} client policies for master slot {slot}");
-    protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
 }
 
 /// Handle a SET_BRIDGE_SECRET frame (0x23).

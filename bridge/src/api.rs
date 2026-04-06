@@ -12,7 +12,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -39,7 +39,6 @@ pub struct AppState {
 pub struct BridgeInfo {
     pub mode: String,
     pub relays: Vec<String>,
-    pub bunker_uri: String,
     pub start_time: Instant,
 }
 
@@ -57,7 +56,6 @@ struct StatusResponse {
 struct BridgeInfoResponse {
     mode: String,
     relays: Vec<String>,
-    bunker_uri: String,
     uptime_secs: u64,
 }
 
@@ -71,17 +69,21 @@ struct ErrorResponse {
     error: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ClientPolicyBody {
-    client_pubkey: String,
-    #[serde(default)]
+#[derive(Debug, Deserialize)]
+struct CreateSlotBody {
     label: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UpdateSlotBody {
     #[serde(default)]
-    allowed_methods: Vec<String>,
+    label: Option<String>,
     #[serde(default)]
-    allowed_kinds: Vec<u64>,
+    allowed_methods: Option<Vec<String>>,
     #[serde(default)]
-    auto_approve: bool,
+    allowed_kinds: Option<Vec<u64>>,
+    #[serde(default)]
+    auto_approve: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +223,6 @@ async fn get_status(State(state): State<AppState>) -> Response {
                 bridge: BridgeInfoResponse {
                     mode: info.mode.clone(),
                     relays: info.relays.clone(),
-                    bunker_uri: info.bunker_uri.clone(),
                     uptime_secs: info.start_time.elapsed().as_secs(),
                 },
             }).into_response()
@@ -230,17 +231,18 @@ async fn get_status(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn get_clients(State(state): State<AppState>, Path(slot): Path<u8>) -> Response {
+/// List all connection slots for a master.
+async fn get_slots(State(state): State<AppState>, Path(master): Path<u8>) -> Response {
     tokio::task::spawn_blocking(move || -> Response {
         let mut port = match acquire_serial(&state) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let frame_bytes = match frame::build_frame(FRAME_TYPE_POLICY_LIST_REQUEST, &[slot]) {
+        let frame_bytes = match frame::build_frame(FRAME_TYPE_CONNSLOT_LIST, &[master]) {
             Ok(f) => f,
             Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "frame build failed"),
         };
-        match send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_POLICY_LIST_RESPONSE], 10) {
+        match send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_CONNSLOT_LIST_RESP], 10) {
             Ok(resp) => {
                 // Return raw JSON payload from the device.
                 (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -251,39 +253,52 @@ async fn get_clients(State(state): State<AppState>, Path(slot): Path<u8>) -> Res
     }).await.unwrap()
 }
 
-async fn delete_client(
+/// Create a new connection slot for a master. Returns slot info including the bunker URI.
+async fn create_slot(
     State(state): State<AppState>,
-    Path((slot, pubkey)): Path<(u8, String)>,
+    Path(master): Path<u8>,
+    Json(body): Json<CreateSlotBody>,
 ) -> Response {
-    if pubkey.len() != 64 {
-        return api_err(StatusCode::BAD_REQUEST, "pubkey must be 64 hex chars");
-    }
     tokio::task::spawn_blocking(move || -> Response {
         let mut port = match acquire_serial(&state) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let mut payload = Vec::with_capacity(65);
-        payload.push(slot);
-        payload.extend_from_slice(pubkey.as_bytes());
-        let frame_bytes = match frame::build_frame(FRAME_TYPE_POLICY_REVOKE, &payload) {
+        // Build relay URL list from bridge config for inclusion in the bunker URI.
+        let relays = state.bridge_info.relays.clone();
+        let relay_json = match serde_json::to_vec(&relays) {
+            Ok(j) => j,
+            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "relay serialisation failed"),
+        };
+        let label_json = match serde_json::to_vec(&body.label) {
+            Ok(j) => j,
+            Err(_) => return api_err(StatusCode::BAD_REQUEST, "invalid label"),
+        };
+        // Payload: master_slot (1) + label_json + 0x00 separator + relay_json
+        let mut payload = Vec::with_capacity(2 + label_json.len() + relay_json.len());
+        payload.push(master);
+        payload.extend_from_slice(&label_json);
+        payload.push(0x00);
+        payload.extend_from_slice(&relay_json);
+        let frame_bytes = match frame::build_frame(FRAME_TYPE_CONNSLOT_CREATE, &payload) {
             Ok(f) => f,
             Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "frame build failed"),
         };
-        match send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_ACK, FRAME_TYPE_NACK], 10) {
-            Ok(resp) if resp.frame_type == FRAME_TYPE_NACK => {
-                api_err(StatusCode::CONFLICT, "client not found")
+        match send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_CONNSLOT_CREATE_RESP], 10) {
+            Ok(resp) => {
+                (StatusCode::CREATED, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    resp.payload.to_vec()).into_response()
             }
-            Ok(_) => Json(OkResponse { ok: true }).into_response(),
             Err(e) => e,
         }
     }).await.unwrap()
 }
 
-async fn put_client(
+/// Update label and/or policy fields of an existing connection slot.
+async fn update_slot(
     State(state): State<AppState>,
-    Path(slot): Path<u8>,
-    Json(body): Json<ClientPolicyBody>,
+    Path((master, index)): Path<(u8, u8)>,
+    Json(body): Json<UpdateSlotBody>,
 ) -> Response {
     tokio::task::spawn_blocking(move || -> Response {
         let mut port = match acquire_serial(&state) {
@@ -294,18 +309,83 @@ async fn put_client(
             Ok(j) => j,
             Err(_) => return api_err(StatusCode::BAD_REQUEST, "invalid JSON"),
         };
-        let mut payload = Vec::with_capacity(1 + json.len());
-        payload.push(slot);
+        // Payload: master_slot (1) + slot_index (1) + JSON patch
+        let mut payload = Vec::with_capacity(2 + json.len());
+        payload.push(master);
+        payload.push(index);
         payload.extend_from_slice(&json);
-        let frame_bytes = match frame::build_frame(FRAME_TYPE_POLICY_UPDATE, &payload) {
+        let frame_bytes = match frame::build_frame(FRAME_TYPE_CONNSLOT_UPDATE, &payload) {
             Ok(f) => f,
             Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "frame build failed"),
         };
-        match send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_ACK, FRAME_TYPE_NACK], 10) {
-            Ok(resp) if resp.frame_type == FRAME_TYPE_NACK => {
-                api_err(StatusCode::BAD_GATEWAY, "device rejected update")
+        match send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_CONNSLOT_UPDATE_RESP], 10) {
+            Ok(resp) => {
+                (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    resp.payload.to_vec()).into_response()
             }
-            Ok(_) => Json(OkResponse { ok: true }).into_response(),
+            Err(e) => e,
+        }
+    }).await.unwrap()
+}
+
+/// Revoke (delete) a connection slot.
+async fn delete_slot(
+    State(state): State<AppState>,
+    Path((master, index)): Path<(u8, u8)>,
+) -> Response {
+    tokio::task::spawn_blocking(move || -> Response {
+        let mut port = match acquire_serial(&state) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let payload = [master, index];
+        let frame_bytes = match frame::build_frame(FRAME_TYPE_CONNSLOT_REVOKE, &payload) {
+            Ok(f) => f,
+            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "frame build failed"),
+        };
+        match send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_CONNSLOT_REVOKE_RESP], 10) {
+            Ok(resp) => {
+                (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    resp.payload.to_vec()).into_response()
+            }
+            Err(e) => e,
+        }
+    }).await.unwrap()
+}
+
+/// Return the full bunker URI for a specific connection slot (including secret).
+/// Relay URLs come from the bridge's config so the client always has up-to-date relay info.
+async fn get_slot_uri(
+    State(state): State<AppState>,
+    Path((master, index)): Path<(u8, u8)>,
+) -> Response {
+    tokio::task::spawn_blocking(move || -> Response {
+        let mut port = match acquire_serial(&state) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let relays = state.bridge_info.relays.clone();
+        let relay_json = match serde_json::to_vec(&relays) {
+            Ok(j) => j,
+            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "relay serialisation failed"),
+        };
+        // Payload: master_slot (1) + slot_index (1) + relay_urls (JSON)
+        let mut payload = Vec::with_capacity(2 + relay_json.len());
+        payload.push(master);
+        payload.push(index);
+        payload.extend_from_slice(&relay_json);
+        let frame_bytes = match frame::build_frame(FRAME_TYPE_CONNSLOT_URI, &payload) {
+            Ok(f) => f,
+            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "frame build failed"),
+        };
+        match send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_CONNSLOT_URI_RESP], 10) {
+            Ok(resp) => {
+                // Response payload is the raw bunker:// URI as UTF-8.
+                match String::from_utf8(resp.payload) {
+                    Ok(uri) => Json(serde_json::json!({ "bunker_uri": uri })).into_response(),
+                    Err(_) => api_err(StatusCode::BAD_GATEWAY, "invalid UTF-8 in URI response"),
+                }
+            }
             Err(e) => e,
         }
     }).await.unwrap()
@@ -337,7 +417,6 @@ async fn bridge_info(State(state): State<AppState>) -> Response {
     Json(BridgeInfoResponse {
         mode: info.mode.clone(),
         relays: info.relays.clone(),
-        bunker_uri: info.bunker_uri.clone(),
         uptime_secs: info.start_time.elapsed().as_secs(),
     }).into_response()
 }
@@ -578,8 +657,9 @@ pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> 
     // Protected routes -- require Bearer token when state.api_token is Some.
     let protected: Router<AppState> = Router::new()
         .route("/api/status", get(get_status))
-        .route("/api/clients/{slot}", get(get_clients).put(put_client))
-        .route("/api/clients/{slot}/{pubkey}", delete(delete_client))
+        .route("/api/slots/{master}", get(get_slots).post(create_slot))
+        .route("/api/slots/{master}/{index}", put(update_slot).delete(delete_slot))
+        .route("/api/slots/{master}/{index}/uri", get(get_slot_uri))
         .route("/api/device/factory-reset", post(factory_reset))
         .route("/api/device/ota", post(ota_upload))
         .route("/api/bridge/restart", post(bridge_restart))

@@ -667,8 +667,12 @@ fn main() {
 
         // Reset activity timestamp after every handler returns.  This is
         // especially important after sign_event, which can hold the button
-        // loop for up to 30 seconds — without this reset the display would
+        // loop for up to 30 seconds -- without this reset the display would
         // sleep immediately after the user finishes approving a request.
         last_activity = Instant::now();
+
+        // Return to the idle screen after each request so the OLED doesn't
+        // stay stuck on "SIGNED" or other transient confirmation screens.
+        oled::show_awaiting(&mut display);
     }
 }

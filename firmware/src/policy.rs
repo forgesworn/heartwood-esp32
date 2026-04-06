@@ -251,9 +251,26 @@ impl PolicyEngine {
                 slot.label = l;
             }
             if let Some(methods) = allowed_methods {
+                // Explicit management action: if sign_event is being granted,
+                // upgrade the slot to signing-approved. This is different from
+                // TOFU -- the user is intentionally configuring permissions
+                // through Sapwood, which is equivalent to a physical approval.
+                if methods.iter().any(|m| m == "sign_event") {
+                    slot.signing_approved = true;
+                }
                 slot.allowed_methods = methods;
             }
             if let Some(kinds) = allowed_kinds {
+                // Setting allowed_kinds implies the user wants to control signing.
+                // Upgrade to signing-approved and ensure sign_event is permitted.
+                if !slot.signing_approved {
+                    slot.signing_approved = true;
+                    if !slot.allowed_methods.iter().any(|m| m == "sign_event") {
+                        slot.allowed_methods = TOFU_SAFE_METHODS
+                            .iter().map(|s| s.to_string()).collect();
+                    }
+                    log::info!("Slot {} upgraded to signing via management API", slot_index);
+                }
                 slot.allowed_kinds = kinds;
             }
             if let Some(approve) = auto_approve {

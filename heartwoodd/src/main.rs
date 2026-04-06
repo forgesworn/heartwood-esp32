@@ -686,14 +686,18 @@ async fn main() -> Result<()> {
     // Spawn the management API server.
     let api_token = cli.api_token.clone().map(Arc::new);
     if api_token.is_some() {
-        log::info!("API token auth ENABLED -- /api/* routes (except /api/bridge/info) require Bearer token");
+        log::info!("API token auth ENABLED -- /api/* routes (except /api/info) require Bearer token");
     } else {
         log::warn!("API token auth DISABLED -- any LAN client can hit /api/device/factory-reset. Set HEARTWOOD_API_TOKEN to enable.");
     }
+
+    let serial_backend = backend::serial::SerialBackend::new(Arc::clone(&port), log_tx.clone());
+    let serial_arc = serial_backend.serial().clone();
+
     let app_state = api::AppState {
-        serial: Arc::clone(&port),
-        bridge_info: Arc::new(api::BridgeInfo {
-            mode: if passthrough { "device-decrypts".into() } else { "bridge-decrypts".into() },
+        backend: Arc::new(serial_backend),
+        daemon_info: Arc::new(api::DaemonInfo {
+            tier: backend::Tier::Hard,
             relays: relay_list.clone(),
             start_time: std::time::Instant::now(),
         }),
@@ -702,7 +706,7 @@ async fn main() -> Result<()> {
     };
 
     // Spawn the background log poller (reads serial when idle, broadcasts to WebSocket clients).
-    tokio::spawn(api::log_poller(Arc::clone(&port), log_tx.clone()));
+    tokio::spawn(api::log_poller(serial_arc, log_tx.clone()));
 
     let enable_cors = cli.cors || cli.sapwood_dir.is_none();
     let api_router = api::router(app_state, cli.sapwood_dir.as_deref(), enable_cors);

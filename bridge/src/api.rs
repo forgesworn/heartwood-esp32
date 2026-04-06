@@ -294,14 +294,16 @@ async fn update_slot(
             Ok(p) => p,
             Err(e) => return e,
         };
-        let json = match serde_json::to_vec(&body) {
+        // Inject slot_index into the JSON body -- the firmware reads it from there.
+        let mut patch = serde_json::to_value(&body).unwrap_or(serde_json::Value::Object(Default::default()));
+        patch["slot_index"] = serde_json::Value::Number(index.into());
+        let json = match serde_json::to_vec(&patch) {
             Ok(j) => j,
             Err(_) => return api_err(StatusCode::BAD_REQUEST, "invalid JSON"),
         };
-        // Payload: master_slot (1) + slot_index (1) + JSON patch
-        let mut payload = Vec::with_capacity(2 + json.len());
+        // Payload: master_slot (1) + JSON (includes slot_index)
+        let mut payload = Vec::with_capacity(1 + json.len());
         payload.push(master);
-        payload.push(index);
         payload.extend_from_slice(&json);
         let frame_bytes = match frame::build_frame(FRAME_TYPE_CONNSLOT_UPDATE, &payload) {
             Ok(f) => f,

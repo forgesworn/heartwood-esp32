@@ -314,28 +314,40 @@ pub fn show_boot(display: &mut Display<'_>, master_count: u8) {
         .font(&FONT_10X20)
         .text_color(BinaryColor::On)
         .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(&FONT_7X14)
+        .text_color(BinaryColor::On)
+        .build();
     let small = MonoTextStyleBuilder::new()
         .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("HEARTWOOD HSM", Point::new(4, 10), header).draw(display).ok();
-
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    // Top bar
+    Rectangle::new(Point::new(0, 0), Size::new(128, 1))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    // Large master count
+    Text::new("HEARTWOOD HSM", Point::new(4, 12), header).draw(display).ok();
+
+    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    // Master count: large number + "MASTERS" label below
     let count_str = format!("{}", master_count);
-    Text::new(&count_str, Point::new(2, 38), large).draw(display).ok();
-    Text::new("masters loaded", Point::new(22, 36), small).draw(display).ok();
+    let count_x = ((128 - count_str.len() as i32 * 10) / 2).max(0);
+    Text::new(&count_str, Point::new(count_x, 38), large).draw(display).ok();
 
-    // Bottom status
-    Rectangle::new(Point::new(0, 48), Size::new(128, 1))
+    let label_x = ((128 - 7 * 7) / 2).max(0); // "MASTERS" = 7 chars * 7px
+    Text::new("MASTERS", Point::new(label_x, 48), body).draw(display).ok();
+
+    // Bottom status area
+    Rectangle::new(Point::new(0, 52), Size::new(128, 1))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("Awaiting bridge...", Point::new(2, 60), small).draw(display).ok();
+    Text::new("awaiting bridge...", Point::new(14, 63), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

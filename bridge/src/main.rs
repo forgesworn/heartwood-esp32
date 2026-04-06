@@ -38,17 +38,6 @@ use heartwood_common::frame;
 use heartwood_common::hex::hex_encode;
 use heartwood_common::types::*;
 
-/// Read exactly `buf.len()` bytes from a serial port.
-fn read_exact_serial(port: &mut RawSerial, buf: &mut [u8]) {
-    let mut pos = 0;
-    while pos < buf.len() {
-        match port.read(&mut buf[pos..]) {
-            Ok(n) if n > 0 => pos += n,
-            _ => {}
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Raw POSIX serial wrapper
 // ---------------------------------------------------------------------------
@@ -772,95 +761,14 @@ async fn main() -> Result<()> {
 
     let port = Arc::new(Mutex::new(port));
 
-    // Build the bunker URI for the API info endpoint.
+    // Build relay URL list for BridgeInfo (used by /api/slots/:master/:index/uri).
     let relay_list: Vec<String> = cli.relays.split(',')
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty())
         .collect();
-    // Request the connect secret from the ESP32, then build the bunker URI
-    // using the bridge's pubkey (in bridge-decrypts mode, clients talk to the bridge).
-    let bunker_uri = {
-        let relay_json = serde_json::to_vec(&relay_list).unwrap_or_default();
-        let mut payload = Vec::with_capacity(1 + relay_json.len());
-        payload.push(0); // master slot 0
-        payload.extend_from_slice(&relay_json);
-        let frame_bytes = frame::build_frame(FRAME_TYPE_BUNKER_URI_REQUEST, &payload)
-            .expect("bunker URI request frame");
-        let mut port_guard = port.lock().unwrap();
-        port_guard.write_all(&frame_bytes).expect("serial write failed");
-        port_guard.flush().expect("serial flush failed");
 
-        // Read the full URI from ESP32 and extract just the secret.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut connect_secret = String::new();
-        'hunt: loop {
-            if std::time::Instant::now() > deadline {
-                log::warn!("Timeout waiting for bunker URI from ESP32");
-                break;
-            }
-            let mut byte = [0u8; 1];
-            match port_guard.read(&mut byte) {
-                Ok(1) if byte[0] == 0x48 => {
-                    match port_guard.read(&mut byte) {
-                        Ok(1) if byte[0] == 0x57 => {
-                            let mut header = [0u8; 3];
-                            read_exact_serial(&mut *port_guard, &mut header);
-                            let resp_type = header[0];
-                            let length = u16::from_be_bytes([header[1], header[2]]) as usize;
-                            let mut body = vec![0u8; length + 4];
-                            read_exact_serial(&mut *port_guard, &mut body);
-                            let mut buf = Vec::with_capacity(5 + length + 4);
-                            buf.extend_from_slice(&[0x48, 0x57]);
-                            buf.push(resp_type);
-                            buf.extend_from_slice(&header[1..3]);
-                            buf.extend_from_slice(&body);
-                            if let Ok(f) = frame::parse_frame(&buf) {
-                                if f.frame_type == FRAME_TYPE_BUNKER_URI_RESPONSE {
-                                    // Extract the secret= parameter from the ESP32's URI.
-                                    let esp_uri = String::from_utf8_lossy(&f.payload);
-                                    if let Some(pos) = esp_uri.find("secret=") {
-                                        connect_secret = esp_uri[pos + 7..].to_string();
-                                        // Trim any trailing params.
-                                        if let Some(amp) = connect_secret.find('&') {
-                                            connect_secret.truncate(amp);
-                                        }
-                                    }
-                                    break 'hunt;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-        }
-        drop(port_guard);
-
-        // Build the URI advertising the SIGNING MASTER's pubkey. Clients (Bark etc)
-        // encrypt NIP-46 requests to this pubkey via NIP-44 ECDH; the device
-        // decrypts with the matching master secret. The Pi-side `bunker_keys`
-        // is now only used as an ephemeral relay-layer transport identity
-        // and does not appear in the URI at all.
-        //
-        // In legacy bridge-decrypts mode `signing_master_pubkey` is set to
-        // `bunker_pubkey.to_bytes()` earlier so this URI format is unchanged
-        // from pre-refactor behaviour for that mode.
-        let uri_pubkey_hex = hex_encode(&signing_master_pubkey);
-        let relay_params: String = relay_list.iter()
-            .map(|r| format!("relay={}", urlencoding::encode(r)))
-            .collect::<Vec<_>>()
-            .join("&");
-        let uri = if connect_secret.is_empty() {
-            format!("bunker://{}?{}", uri_pubkey_hex, relay_params)
-        } else {
-            format!("bunker://{}?{}&secret={}", uri_pubkey_hex, relay_params, connect_secret)
-        };
-        log::info!("Bunker URI: {}", &uri[..uri.len().min(80)]);
-        log::info!("Paired clients will sign as: {} (slot {})",
-            signing_master_label, signing_master_slot);
-        uri
-    };
+    log::info!("Paired clients will sign as: {} (slot {})",
+        signing_master_label, signing_master_slot);
 
     // log_tx is created at the top of main() so it can be threaded into
     // startup-time serial helpers (query_master_list etc).
@@ -877,7 +785,6 @@ async fn main() -> Result<()> {
         bridge_info: Arc::new(api::BridgeInfo {
             mode: if passthrough { "device-decrypts".into() } else { "bridge-decrypts".into() },
             relays: relay_list.clone(),
-            bunker_uri: bunker_uri.clone(),
             start_time: std::time::Instant::now(),
         }),
         log_tx: log_tx.clone(),

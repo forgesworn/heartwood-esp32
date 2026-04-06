@@ -314,41 +314,28 @@ pub fn show_boot(display: &mut Display<'_>, master_count: u8) {
         .font(&FONT_10X20)
         .text_color(BinaryColor::On)
         .build();
-    let body = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
-        .text_color(BinaryColor::On)
-        .build();
     let small = MonoTextStyleBuilder::new()
         .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
 
-    // Top bar
-    Rectangle::new(Point::new(0, 0), Size::new(128, 1))
+    Text::new("HEARTWOOD HSM", Point::new(4, 10), header).draw(display).ok();
+
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    // "HEARTWOOD HSM" = 13 chars * 6px = 78px; centre = (128-78)/2 = 25
-    Text::new("HEARTWOOD HSM", Point::new(25, 12), header).draw(display).ok();
-
-    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-        .draw(display).ok();
-
-    // Master count centred (large) with label well below
+    // Large master count
     let count_str = format!("{}", master_count);
-    let count_x = ((128 - count_str.len() as i32 * 10) / 2).max(0);
-    Text::new(&count_str, Point::new(count_x, 36), large).draw(display).ok();
+    Text::new(&count_str, Point::new(2, 38), large).draw(display).ok();
+    Text::new("masters loaded", Point::new(22, 36), small).draw(display).ok();
 
-    // "masters" in small font, well separated from the large number
-    Text::new("masters", Point::new(46, 46), small).draw(display).ok();
-
-    // Bottom status area
-    Rectangle::new(Point::new(0, 52), Size::new(128, 1))
+    // Bottom status
+    Rectangle::new(Point::new(0, 48), Size::new(128, 1))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("awaiting bridge...", Point::new(14, 63), small).draw(display).ok();
+    Text::new("Awaiting bridge...", Point::new(2, 60), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -697,214 +684,132 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         (*lfsr & 0xFF) as u8
     };
 
-    // Elegant cat silhouette: 20 cols x 18 rows, drawn at 3x3 pixel scale.
-    // On-screen size: 60 x 54 pixels -- big, fills most of the 128x64 display.
-    // Solid black silhouette with white eye dot, matching reference pixel art.
-    // Tail curves gracefully, ears are two distinct points, legs stride cleanly.
-    //
-    // Bit 19 = col 0 (leftmost/tail), bit 0 = col 19 (rightmost/head).
-    // Use `cols = 20` with draw_sprite_hd at cell size 3.
-    const CAT_COLS: usize = 20;
-    const CELL: u32 = 3;
+    // Cat sprite: 14 columns x 7 rows. Faces right, tail curves up on left.
+    // Bit 13 = col 0 (leftmost/tail), bit 0 = col 13 (rightmost/head).
+    // 6 walk frames: 2 tail positions x 3 leg positions.
+    const CAT_H: usize = 7;
 
-    // Column reference for the 20-bit field:
-    //   col: 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19
-    //   bit:19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+    // Common body rows:
+    // Row 2: ..#.....#####.  head with ear detail  = 0x083E
+    // Row 3: ...#########..  body upper             = 0x07FC
+    // Row 4: ...#########..  body lower             = 0x07FC
 
-    // Tail curled up (rows 0-6)
-    #[rustfmt::skip]
-    const TAIL_UP: [u32; 7] = [
-        0x10000, // r0: ...#................  col 3: tip curled
-        0x08000, // r1: ....#...............  col 4
-        0x04000, // r2: .....#..............  col 5: descends smoothly
-        0x04000, // r3: .....#..............  col 5
-        0x06000, // r4: .....##.............  cols 5-6: thickens
-        0x07000, // r5: .....###............  cols 5-7: widens
-        0x0F800, // r6: .....#####..........  cols 5-9: meets body
+    const CAT: [[u16; CAT_H]; 6] = [
+        [ // Frame 0: tail UP, legs stride right
+            0x2000, // #.............  tail tip high
+            0x1014, // .#.......#.#..  tail + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0318, // ....##...##...  legs stride
+            0x0408, // ...#......#...  paws wide
+        ],
+        [ // Frame 1: tail UP, legs passing
+            0x2000, // #.............  tail tip high
+            0x1014, // .#.......#.#..  tail + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0190, // .....##..#....  legs passing
+            0x0110, // .....#...#....  paws together
+        ],
+        [ // Frame 2: tail UP, legs stride left
+            0x2000, // #.............  tail tip high
+            0x1014, // .#.......#.#..  tail + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0098, // ......#..##...  legs stride other
+            0x0108, // .....#....#...  paws
+        ],
+        [ // Frame 3: tail DOWN, legs stride right
+            0x0000, // ..............  no tip
+            0x3014, // ##.......#.#..  tail low + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0318, // ....##...##...  legs stride
+            0x0408, // ...#......#...  paws wide
+        ],
+        [ // Frame 4: tail DOWN, legs passing
+            0x0000, // ..............  no tip
+            0x3014, // ##.......#.#..  tail low + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0190, // .....##..#....  legs passing
+            0x0110, // .....#...#....  paws together
+        ],
+        [ // Frame 5: tail DOWN, legs stride left
+            0x0000, // ..............  no tip
+            0x3014, // ##.......#.#..  tail low + ears
+            0x083E, // ..#.....#####.  head
+            0x07FC, // ...#########..  body
+            0x07FC, // ...#########..  body
+            0x0098, // ......#..##...  legs stride other
+            0x0108, // .....#....#...  paws
+        ],
     ];
 
-    // Tail relaxed/down (rows 0-6)
-    #[rustfmt::skip]
-    const TAIL_DN: [u32; 7] = [
-        0x00000, // r0: ....................
-        0x20000, // r1: ..#.................  col 2: tip droops
-        0x10000, // r2: ...#................  col 3
-        0x08000, // r3: ....#...............  col 4
-        0x06000, // r4: .....##.............  cols 5-6
-        0x07000, // r5: .....###............  cols 5-7
-        0x0F800, // r6: .....#####..........  cols 5-9
-    ];
+    let tiny = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
 
-    // Body + head (rows 7-12, shared across all frames)
-    // Eye = gap at col 15 in row 9
-    #[rustfmt::skip]
-    const BODY: [u32; 6] = [
-        0x0FC18, // r7:  .....######...##....  cols 5-10 + 14-15 (ears)
-        0x0FF3C, // r8:  .....##########.####  cols 5-13 + 15-18 (head dome, gap 14=between)
-        //              Actually let me recalculate these properly.
-        // r7: cols 5,6,7,8,9,10 + cols 14,15 = ears
-        //     bits: 14,13,12,11,10,9 + 5,4 = 0x7C00 + 0x30 = 0x7C30
-        // WAIT. That's wrong. Let me recalculate.
-        //
-        // col 5 = bit 14  = 0x4000
-        // col 6 = bit 13  = 0x2000
-        // col 7 = bit 12  = 0x1000
-        // col 8 = bit 11  = 0x0800
-        // col 9 = bit 10  = 0x0400
-        // col 10 = bit 9  = 0x0200
-        // cols 5-10 = 0x7E00
-        // col 14 = bit 5  = 0x0020
-        // col 15 = bit 4  = 0x0010
-        // cols 14-15 = 0x0030
-        // Total r7 = 0x7E30 ... but that doesn't match my hex above. Let me redo ALL rows.
-        0, 0, 0, 0, // placeholders, will be replaced below
-    ];
-    // I'll compute these inline instead to avoid mistakes.
+    const SPRITE_W: i32 = 14;
+    const SCREEN_COLS: i32 = 26; // 128/5 rounded up
 
-    // Leg poses (rows 13-17, 4 walk phases)
-    // Will also compute inline.
+    let cat_row: i32 = 0; // top of screen
+    let glitch_col: i32 = 7;
 
-    // --- Corrected sprite data using explicit bit-setting ---
-
-    // Helper: set bits for columns a..=b (inclusive)
-    // col C -> bit (19 - C)
-    // range [a,b] -> bits (19-a) down to (19-b)
-    // mask = ((1 << (b - a + 1)) - 1) << (19 - b)
-    const fn cols(a: u32, b: u32) -> u32 {
-        let width = b - a + 1;
-        let shift = 19 - b;
-        ((1 << width) - 1) << shift
-    }
-    const fn col(c: u32) -> u32 {
-        1 << (19 - c)
-    }
-
-    // Tail curled up (rows 0-6)
-    let tail_up: [u32; 7] = [
-        col(3),                                     // r0: tip curled
-        col(4),                                     // r1: descends
-        col(5),                                     // r2
-        col(5),                                     // r3
-        cols(5,6),                                  // r4: thickens
-        cols(5,7),                                  // r5: widens
-        cols(4,9),                                  // r6: meets body
-    ];
-
-    // Tail relaxed down (rows 0-6)
-    let tail_dn: [u32; 7] = [
-        0,                                          // r0: nothing high
-        col(2),                                     // r1: tip out left
-        col(3),                                     // r2
-        col(4),                                     // r3
-        cols(5,6),                                  // r4: thickens
-        cols(5,7),                                  // r5: widens
-        cols(4,9),                                  // r6: meets body
-    ];
-
-    // Body + head (rows 7-12)
-    let body: [u32; 6] = [
-        cols(4,9)  | col(14) | col(16),             // r7:  body + ear tips (two points)
-        cols(4,11) | cols(13,17),                    // r8:  body + head dome
-        cols(4,13) | col(15) | cols(17,18),          // r9:  body + head, EYE gap at col 14 & 16
-        cols(4,13) | cols(14,18),                    // r10: body + lower head (filled)
-        cols(3,18),                                  // r11: full body continuous
-        cols(3,18),                                  // r12: body
-    ];
-
-    // Leg poses (rows 13-17)
-    let legs_a: [u32; 5] = [  // stride right
-        cols(3,6)  | cols(8,11) | cols(14,17),      // r13: legs split
-        cols(3,5)  | cols(8,11) | cols(15,17),      // r14: upper legs
-        cols(2,4)  | cols(8,10) | cols(16,17),      // r15: mid
-        cols(2,3)  | cols(9,10) | col(17),           // r16: lower
-        col(1)     | col(9)     | col(18),           // r17: paws wide stride
-    ];
-    let legs_b: [u32; 5] = [  // legs passing
-        cols(3,18),                                  // r13: body base still solid
-        cols(4,6)  | cols(9,12) | cols(15,17),      // r14: legs close
-        cols(4,5)  | cols(9,11) | cols(16,17),      // r15: mid
-        col(5)     | cols(9,10) | col(16),           // r16: lower
-        col(5)     | col(10)    | col(16),           // r17: paws close
-    ];
-    let legs_c: [u32; 5] = [  // stride left
-        cols(3,6)  | cols(9,12) | cols(14,17),      // r13: legs split other
-        cols(4,6)  | cols(9,12) | cols(15,17),      // r14
-        cols(4,5)  | cols(10,12)| cols(16,17),      // r15
-        col(4)     | cols(10,11)| col(17),           // r16
-        col(3)     | col(11)    | col(18),           // r17: paws wide other
-    ];
-    let legs_d: [u32; 5] = [  // legs crossing
-        cols(3,18),                                  // r13: body base still solid
-        cols(5,7)  | cols(10,12)| cols(14,16),      // r14: legs close other
-        cols(5,6)  | cols(10,11)| cols(15,16),      // r15
-        col(6)     | cols(10,11)| col(15),           // r16
-        col(6)     | col(11)    | col(15),           // r17: paws together
-    ];
-    let all_legs: [[u32; 5]; 4] = [legs_a, legs_b, legs_c, legs_d];
-
-    // Assemble an 18-row frame from tail (7) + body (6) + legs (5).
-    let make_frame = |tail: &[u32; 7], legs: &[u32; 5]| -> [u32; 18] {
-        let mut f = [0u32; 18];
-        f[..7].copy_from_slice(tail);
-        f[7..13].copy_from_slice(&body);
-        f[13..18].copy_from_slice(legs);
-        f
-    };
-
-    let cat_y: i32 = 3; // near top -- cat is 54px tall, screen is 64
-    let cat_w_px: i32 = CAT_COLS as i32 * CELL as i32; // 60px
-    let glitch_px: i32 = 35;
-
-    // Lead-in: 3 empty frames.
-    for _ in 0..3 {
+    // Lead-in: 2 empty frames.
+    for _ in 0..2 {
         display.clear_buffer();
         display.flush().ok();
-        FreeRtos::delay_ms(40);
+        FreeRtos::delay_ms(50);
     }
 
-    let mut cat_x: i32 = -cat_w_px;
-    let mut anim_frame: u32 = 0;
+    let mut cat_col: i32 = -SPRITE_W;
+    let mut frame: u32 = 0;
 
-    while cat_x < 132 {
+    while cat_col < SCREEN_COLS {
         display.clear_buffer();
 
-        let tail = if (anim_frame / 5) % 2 == 0 { &tail_up } else { &tail_dn };
-        let legs = &all_legs[(anim_frame as usize) % 4];
-        let sprite = make_frame(tail, legs);
+        let sprite = &CAT[(frame as usize) % 6];
 
-        draw_sprite_hd(display, &sprite, cat_x, cat_y, CAT_COLS, CELL);
+        // Draw the cat as 1s.
+        draw_sprite(display, sprite, cat_col, cat_row, &tiny);
 
-        // Deja vu glitch: ghost cat behind for 6 frames.
-        if cat_x >= glitch_px && cat_x <= glitch_px + 18 {
-            let ghost_tail = if ((anim_frame + 3) / 5) % 2 == 0 { &tail_up } else { &tail_dn };
-            let ghost_legs = &all_legs[((anim_frame + 2) as usize) % 4];
-            let ghost = make_frame(ghost_tail, ghost_legs);
-            draw_sprite_hd(display, &ghost, cat_x - cat_w_px - 6, cat_y, CAT_COLS, CELL);
+        // Deja vu glitch: ghost cat appears behind for 3 frames.
+        if cat_col >= glitch_col && cat_col <= glitch_col + 4 {
+            let ghost = &CAT[((frame + 3) as usize) % 6];
+            draw_sprite(display, ghost, cat_col - 12, cat_row, &tiny);
         }
 
-        // Moving ground: scrolling dashes beneath the cat.
-        let ground_y = cat_y + 18 * CELL as i32 + 2; // just below paws
-        let ground_offset = (anim_frame as i32 * 2) % 8;
-        for px in (0..128).step_by(8) {
+        // Moving ground: a scrolling line of dots at the bottom.
+        let ground_y = 63;
+        let ground_offset = (frame as i32 * 3) % 6;
+        for px in (0..128).step_by(6) {
             let gx = px - ground_offset;
             if gx >= 0 && gx < 128 {
-                Rectangle::new(Point::new(gx, ground_y), Size::new(4, 1))
-                    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                use embedded_graphics::primitives::{Line, PrimitiveStyle};
+                Line::new(Point::new(gx, ground_y), Point::new(gx + 2, ground_y))
+                    .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
                     .draw(display).ok();
             }
         }
 
         display.flush().ok();
-        anim_frame += 1;
-        cat_x += 3;
-        FreeRtos::delay_ms(35);
+        frame += 1;
+        cat_col += 2;
+        FreeRtos::delay_ms(45);
     }
 
-    // Lead-out: 3 empty frames.
-    for _ in 0..3 {
+    // Lead-out: 2 empty frames.
+    for _ in 0..2 {
         display.clear_buffer();
         display.flush().ok();
-        FreeRtos::delay_ms(40);
+        FreeRtos::delay_ms(50);
     }
 
     // Phase 2: HEARTWOOD decrypt reveal.
@@ -956,28 +861,22 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
 
 }
 
-/// Draw an HD sprite as NxN pixel blocks.
-///
-/// `sprite` is a slice of u32 rows (bit `cols-1` = leftmost pixel).
-/// `cols` is the number of columns in the sprite data.
-/// `cell` is the pixel size of each sprite cell (2 = 2x2 blocks).
-fn draw_sprite_hd(
+/// Draw a cat sprite as '1' characters at the given cell position.
+fn draw_sprite(
     display: &mut Display<'_>,
-    sprite: &[u32],
-    x_px: i32,
-    y_px: i32,
-    cols: usize,
-    cell: u32,
+    sprite: &[u16; 7],
+    col_offset: i32,
+    row_offset: i32,
+    style: &embedded_graphics::mono_font::MonoTextStyle<'_, BinaryColor>,
 ) {
-    let c = cell as i32;
-    for (row_idx, &row_bits) in sprite.iter().enumerate() {
-        for col in 0..cols as i32 {
-            if (row_bits >> (cols as i32 - 1 - col)) & 1 == 1 {
-                let px = x_px + col * c;
-                let py = y_px + row_idx as i32 * c;
-                if px > -c && px < 128 && py >= 0 && (py + c) <= 64 {
-                    Rectangle::new(Point::new(px, py), Size::new(cell, cell))
-                        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+    for row in 0..7i32 {
+        for col in 0..14i32 {
+            // Bit 13 = col 0 (leftmost), bit 0 = col 13 (rightmost).
+            if (sprite[row as usize] >> (13 - col)) & 1 == 1 {
+                let sx = (col_offset + col) * 5;
+                let sy = (row_offset + row) * 8 + 7;
+                if sx >= 0 && sx < 128 && sy >= 0 && sy < 64 {
+                    Text::new("1", Point::new(sx, sy), *style)
                         .draw(display).ok();
                 }
             }

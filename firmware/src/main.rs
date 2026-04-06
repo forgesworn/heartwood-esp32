@@ -17,6 +17,7 @@ mod identity_cache;
 mod masters;
 mod nip46_handler;
 mod nvs;
+mod cat_sprites;
 mod oled;
 mod ota;
 mod pin;

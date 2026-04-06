@@ -7,6 +7,7 @@ use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
+use embedded_graphics::Pixel;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 use esp_idf_hal::delay::FreeRtos;
@@ -670,10 +671,10 @@ pub fn show_signing(display: &mut Display<'_>) {
 // Boot animation
 // ---------------------------------------------------------------------------
 
-/// Boot animation: binary cat + decrypt reveal.
+/// Boot animation: HD pixel-art cat + decrypt reveal.
 ///
-/// Phase 1: A cat made of 0s and 1s walks across the screen. At the centre
-/// it "glitches" (deja vu -- briefly appears twice). Like The Matrix.
+/// Phase 1: A cat silhouette walks across the screen at 1:1 pixel scale.
+/// At centre screen it "glitches" (deja vu -- ghost cat behind). Like The Matrix.
 /// Phase 2: Screen clears, HEARTWOOD decrypts letter by letter.
 pub fn show_boot_animation(display: &mut Display<'_>) {
     let mut lfsr: u16 = 0xACE1;
@@ -684,83 +685,10 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         (*lfsr & 0xFF) as u8
     };
 
-    // Cat sprite: 14 columns x 7 rows. Faces right, tail curves up on left.
-    // Bit 13 = col 0 (leftmost/tail), bit 0 = col 13 (rightmost/head).
-    // 6 walk frames: 2 tail positions x 3 leg positions.
-    const CAT_H: usize = 7;
+    use crate::cat_sprites::{FRAMES, FRAME_COUNT, FRAME_COLS};
 
-    // Common body rows:
-    // Row 2: ..#.....#####.  head with ear detail  = 0x083E
-    // Row 3: ...#########..  body upper             = 0x07FC
-    // Row 4: ...#########..  body lower             = 0x07FC
-
-    const CAT: [[u16; CAT_H]; 6] = [
-        [ // Frame 0: tail UP, legs stride right
-            0x2000, // #.............  tail tip high
-            0x1014, // .#.......#.#..  tail + ears
-            0x083E, // ..#.....#####.  head
-            0x07FC, // ...#########..  body
-            0x07FC, // ...#########..  body
-            0x0318, // ....##...##...  legs stride
-            0x0408, // ...#......#...  paws wide
-        ],
-        [ // Frame 1: tail UP, legs passing
-            0x2000, // #.............  tail tip high
-            0x1014, // .#.......#.#..  tail + ears
-            0x083E, // ..#.....#####.  head
-            0x07FC, // ...#########..  body
-            0x07FC, // ...#########..  body
-            0x0190, // .....##..#....  legs passing
-            0x0110, // .....#...#....  paws together
-        ],
-        [ // Frame 2: tail UP, legs stride left
-            0x2000, // #.............  tail tip high
-            0x1014, // .#.......#.#..  tail + ears
-            0x083E, // ..#.....#####.  head
-            0x07FC, // ...#########..  body
-            0x07FC, // ...#########..  body
-            0x0098, // ......#..##...  legs stride other
-            0x0108, // .....#....#...  paws
-        ],
-        [ // Frame 3: tail DOWN, legs stride right
-            0x0000, // ..............  no tip
-            0x3014, // ##.......#.#..  tail low + ears
-            0x083E, // ..#.....#####.  head
-            0x07FC, // ...#########..  body
-            0x07FC, // ...#########..  body
-            0x0318, // ....##...##...  legs stride
-            0x0408, // ...#......#...  paws wide
-        ],
-        [ // Frame 4: tail DOWN, legs passing
-            0x0000, // ..............  no tip
-            0x3014, // ##.......#.#..  tail low + ears
-            0x083E, // ..#.....#####.  head
-            0x07FC, // ...#########..  body
-            0x07FC, // ...#########..  body
-            0x0190, // .....##..#....  legs passing
-            0x0110, // .....#...#....  paws together
-        ],
-        [ // Frame 5: tail DOWN, legs stride left
-            0x0000, // ..............  no tip
-            0x3014, // ##.......#.#..  tail low + ears
-            0x083E, // ..#.....#####.  head
-            0x07FC, // ...#########..  body
-            0x07FC, // ...#########..  body
-            0x0098, // ......#..##...  legs stride other
-            0x0108, // .....#....#...  paws
-        ],
-    ];
-
-    let tiny = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
-        .text_color(BinaryColor::On)
-        .build();
-
-    const SPRITE_W: i32 = 14;
-    const SCREEN_COLS: i32 = 26; // 128/5 rounded up
-
-    let cat_row: i32 = 0; // top of screen
-    let glitch_col: i32 = 7;
+    // Deja vu triggers when the cat's midpoint reaches screen centre (px 64).
+    let glitch_x: i32 = 64 - (FRAME_COLS as i32 / 2); // ~36
 
     // Lead-in: 2 empty frames.
     for _ in 0..2 {
@@ -769,26 +697,24 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         FreeRtos::delay_ms(50);
     }
 
-    let mut cat_col: i32 = -SPRITE_W;
-    let mut frame: u32 = 0;
+    let mut x: i32 = -(FRAME_COLS as i32);
+    let mut step: u32 = 0;
 
-    while cat_col < SCREEN_COLS {
+    while x < 128 {
         display.clear_buffer();
 
-        let sprite = &CAT[(frame as usize) % 6];
+        let frame_idx = (step as usize) % FRAME_COUNT;
+        draw_sprite_hd(display, &FRAMES[frame_idx], x, 0);
 
-        // Draw the cat as 1s.
-        draw_sprite(display, sprite, cat_col, cat_row, &tiny);
-
-        // Deja vu glitch: ghost cat appears behind for 3 frames.
-        if cat_col >= glitch_col && cat_col <= glitch_col + 4 {
-            let ghost = &CAT[((frame + 3) as usize) % 6];
-            draw_sprite(display, ghost, cat_col - 12, cat_row, &tiny);
+        // Deja vu glitch: ghost cat appears 40px behind for 3 frames.
+        if x >= glitch_x && x <= glitch_x + 6 {
+            let ghost_idx = ((step as usize) + 4) % FRAME_COUNT;
+            draw_sprite_hd(display, &FRAMES[ghost_idx], x - 40, 0);
         }
 
-        // Moving ground: a scrolling line of dots at the bottom.
+        // Moving ground: scrolling dashes at the bottom.
         let ground_y = 63;
-        let ground_offset = (frame as i32 * 3) % 6;
+        let ground_offset = (step as i32 * 3) % 6;
         for px in (0..128).step_by(6) {
             let gx = px - ground_offset;
             if gx >= 0 && gx < 128 {
@@ -800,8 +726,8 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         }
 
         display.flush().ok();
-        frame += 1;
-        cat_col += 2;
+        step += 1;
+        x += 2;
         FreeRtos::delay_ms(45);
     }
 
@@ -812,7 +738,7 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         FreeRtos::delay_ms(50);
     }
 
-    // Phase 2: HEARTWOOD decrypt reveal.
+    // Phase 2: HEARTWOOD decrypt reveal (unchanged).
     const TITLE: &[u8] = b"HEARTWOOD";
     const LEN: usize = 9;
     const START_X: i32 = 19;
@@ -848,7 +774,6 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
             Text::new(s, Point::new(x, Y), big_style).draw(display).ok();
         }
 
-        // Show version once title is fully resolved.
         if resolved >= LEN {
             let version = concat!("v", env!("CARGO_PKG_VERSION"));
             let vx = ((128 - version.len() as i32 * 6) / 2).max(0);
@@ -858,54 +783,31 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         display.flush().ok();
         FreeRtos::delay_ms(60);
     }
-
 }
 
-/// Draw a cat sprite as '1' characters at the given cell position.
-fn draw_sprite(
+/// Draw a 56x56 pixel sprite at the given pixel offset.
+/// Bits are packed as u64 per row: bit 55 = leftmost column, bit 0 = rightmost.
+fn draw_sprite_hd(
     display: &mut Display<'_>,
-    sprite: &[u16; 7],
-    col_offset: i32,
-    row_offset: i32,
-    style: &embedded_graphics::mono_font::MonoTextStyle<'_, BinaryColor>,
+    frame: &[u64; 56],
+    x_offset: i32,
+    y_offset: i32,
 ) {
-    for row in 0..7i32 {
-        for col in 0..14i32 {
-            // Bit 13 = col 0 (leftmost), bit 0 = col 13 (rightmost).
-            if (sprite[row as usize] >> (13 - col)) & 1 == 1 {
-                let sx = (col_offset + col) * 5;
-                let sy = (row_offset + row) * 8 + 7;
-                if sx >= 0 && sx < 128 && sy >= 0 && sy < 64 {
-                    Text::new("1", Point::new(sx, sy), *style)
+    for row in 0..56i32 {
+        let bits = frame[row as usize];
+        if bits == 0 { continue; }
+        let py = y_offset + row;
+        if py < 0 || py >= 64 { continue; }
+        for col in 0..56i32 {
+            if (bits >> (55 - col)) & 1 == 1 {
+                let px = x_offset + col;
+                if px >= 0 && px < 128 {
+                    Pixel(Point::new(px, py), BinaryColor::On)
                         .draw(display).ok();
                 }
             }
         }
     }
-}
-
-#[allow(dead_code)]
-fn _unused(display: &mut Display<'_>) {
-    // Phase 2: reveal.
-    display.clear_buffer();
-
-    let title_style = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
-        .text_color(BinaryColor::On)
-        .build();
-    let sub_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
-
-    Text::new("HEARTWOOD", Point::new(19, 22), title_style).draw(display).ok();
-
-    let version = concat!("v", env!("CARGO_PKG_VERSION"));
-    let version_x = ((128 - version.len() as i32 * 6) / 2).max(0);
-    Text::new(version, Point::new(version_x, 50), sub_style).draw(display).ok();
-
-    display.flush().ok();
-    FreeRtos::delay_ms(1000);
 }
 
 // ---------------------------------------------------------------------------

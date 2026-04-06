@@ -687,6 +687,9 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
 
     use crate::cat_sprites::{FRAMES, FRAME_COUNT, FRAME_COLS};
 
+    // 16 procedural frames: each has unique tail + legs computed from gait cycle.
+    // Vertical bob: 1px up on odd frames for weight feel.
+
     // Deja vu triggers when the cat's midpoint reaches screen centre (px 64).
     let glitch_x: i32 = 64 - (FRAME_COLS as i32 / 2); // ~36
 
@@ -704,12 +707,16 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         display.clear_buffer();
 
         let frame_idx = (step as usize) % FRAME_COUNT;
-        draw_sprite_hd(display, &FRAMES[frame_idx], x, 0);
+        // Vertical bob (1px) + horizontal sway (1px, slower period).
+        let y = if step % 2 == 0 { 6 } else { 5 };
+        let sway: i32 = if (step / 4) % 2 == 0 { 0 } else { 1 };
+        draw_sprite_hd(display, &FRAMES[frame_idx], x + sway, y);
 
         // Deja vu glitch: ghost cat appears 40px behind for 3 frames.
         if x >= glitch_x && x <= glitch_x + 6 {
-            let ghost_idx = ((step as usize) + 4) % FRAME_COUNT;
-            draw_sprite_hd(display, &FRAMES[ghost_idx], x - 40, 0);
+            let ghost_idx = ((step as usize) + FRAME_COUNT / 2) % FRAME_COUNT;
+            let ghost_y = if (step + 1) % 2 == 0 { 6 } else { 5 };
+            draw_sprite_hd(display, &FRAMES[ghost_idx], x - 40, ghost_y);
         }
 
         // Moving ground: scrolling dashes at the bottom.

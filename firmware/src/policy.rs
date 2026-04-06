@@ -251,26 +251,24 @@ impl PolicyEngine {
                 slot.label = l;
             }
             if let Some(methods) = allowed_methods {
-                // Explicit management action: if sign_event is being granted,
-                // upgrade the slot to signing-approved. This is different from
-                // TOFU -- the user is intentionally configuring permissions
-                // through Sapwood, which is equivalent to a physical approval.
-                if methods.iter().any(|m| m == "sign_event") {
-                    slot.signing_approved = true;
+                // Security: the management API cannot grant sign_event.
+                // Only the physical button can do that (via upgrade_to_signing).
+                // Filter out sign_event if the slot hasn't been button-approved.
+                if !slot.signing_approved {
+                    let filtered: Vec<String> = methods.into_iter()
+                        .filter(|m| m != "sign_event")
+                        .collect();
+                    slot.allowed_methods = filtered;
+                } else {
+                    slot.allowed_methods = methods;
                 }
-                slot.allowed_methods = methods;
             }
             if let Some(kinds) = allowed_kinds {
-                // Setting allowed_kinds implies the user wants to control signing.
-                // Upgrade to signing-approved and ensure sign_event is permitted.
-                if !slot.signing_approved {
-                    slot.signing_approved = true;
-                    if !slot.allowed_methods.iter().any(|m| m == "sign_event") {
-                        slot.allowed_methods = TOFU_SAFE_METHODS
-                            .iter().map(|s| s.to_string()).collect();
-                    }
-                    log::info!("Slot {} upgraded to signing via management API", slot_index);
-                }
+                // Kind restrictions are stored regardless of signing_approved.
+                // They take effect once the user physically approves the first
+                // sign_event (which upgrades the slot and adds sign_event to
+                // allowed_methods). Pre-configuring kinds before approval is
+                // fine -- it just means the second sign onwards uses these rules.
                 slot.allowed_kinds = kinds;
             }
             if let Some(approve) = auto_approve {

@@ -26,9 +26,11 @@ portable = []   # BLE GATT, battery management, child key only
 
 ## Current state
 
-Phase 5 (flash-once production) complete (2026-04-03). Six crates: `common/` (shared crypto + frame protocol + NIP-46 types + NIP-44/NIP-04 encryption + policy types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness), `bridge/` (Pi-side relay bridge), `ota/` (Pi-side serial OTA tool). Multi-master NVS storage (up to 8 masters, three provisioning modes: bunker/tree-mnemonic/tree-nsec). On-device NIP-44 transport encryption — the Pi is zero-trust, only sees ciphertext (including sign_event responses). Bridge session authentication and client approval policies (NVS-persisted, TOFU auto-approval). Full NIP-46 method set (15 methods: 8 standard + 7 heartwood extensions; proof methods stubbed). Connect secret validation per NIP-46 spec. Serial OTA with SHA-256 verification and automatic rollback. Factory reset with button confirmation. Firmware uses libsecp256k1 (C FFI) for all signing.
+Phase 5 (flash-once production) complete (2026-04-03). Seven crates: `common/` (shared crypto + frame protocol + NIP-46 types + NIP-44/NIP-04 encryption + policy types), `firmware/` (ESP32), `provision/` (host CLI), `sign-test/` (signing test harness), `heartwoodd/` (Pi-side daemon -- Soft and Hard modes), `ota/` (Pi-side serial OTA tool), `sapwood/` (web management UI, separate repo). Multi-master NVS storage (up to 8 masters, three provisioning modes: bunker/tree-mnemonic/tree-nsec). On-device NIP-44 transport encryption -- the Pi is zero-trust in Hard mode, only sees ciphertext (including sign_event responses). Connection slot policies (NVS-persisted on ESP32, Argon2id keyfile on Pi). Full NIP-46 method set (15 methods: 8 standard + 7 heartwood extensions; proof methods stubbed). Connect secret validation per NIP-46 spec. Serial OTA with SHA-256 verification and automatic rollback. Factory reset with button confirmation. Firmware uses libsecp256k1 (C FFI) for all signing.
 
-Next: implement heartwood_create_proof/verify_proof (via OTA). Production hardening (JTAG disable, watchdog). Bridge management API for heartwood-device Pi web UI.
+Heartwood Soft mode: `heartwoodd` runs standalone on a Pi with no ESP32. Keys encrypted at rest with Argon2id + XChaCha20-Poly1305, unlocked via Sapwood. Policy-based auto-approve with Sapwood approval queue for out-of-policy requests. Same management API, same Sapwood UI, same NIP-46 signing -- just software-backed instead of hardware-backed.
+
+Next: end-to-end Soft mode testing (unlock, create master, pair Bark, sign). Production hardening (JTAG disable, watchdog). Sapwood UI for tier badge, unlock form, approval queue.
 
 ## Session memory
 
@@ -50,7 +52,7 @@ cd common && cargo test                    # shared crypto tests
 cd common && cargo test --features nip46   # NIP-46 + event ID tests
 cd provision && cargo build                # host CLI tool
 cd sign-test && cargo build                # signing test harness
-cd bridge && cargo build                   # Pi-side relay bridge
+cd heartwoodd && cargo build               # Pi-side daemon (Soft or Hard mode)
 cd ota && cargo build                      # Pi-side serial OTA tool
 cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain)
 cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32

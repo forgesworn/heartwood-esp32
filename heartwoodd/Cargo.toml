@@ -1,11 +1,11 @@
 [package]
-name = "heartwood-bridge"
-version = "0.1.0"
+name = "heartwoodd"
+version = "0.2.0"
 edition = "2021"
-description = "Pi-side relay bridge — forwards NIP-46 between Nostr relays and the ESP32 over serial"
+description = "Heartwood daemon -- Nostr signing service for Pi (Soft mode) and ESP32 (Hard mode)"
 
 [dependencies]
-heartwood-common = { path = "../common", features = ["nip46"] }
+heartwood-common = { path = "../common", features = ["nip46", "nip44"] }
 nostr-connect = "0.44"
 nostr = { version = "0.44", features = ["std", "nip44", "nip46"] }
 nostr-sdk = "0.44"
@@ -21,3 +21,13 @@ urlencoding = "2"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 sha2 = "0.10"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+getrandom = "0.2"
+base64 = "0.22"
+zeroize = "1"
+k256 = { version = "0.13", features = ["ecdsa", "schnorr"] }
+
+[dev-dependencies]
+tempfile = "3"

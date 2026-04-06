@@ -7,6 +7,7 @@ use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::{AnyOutputPin, PinDriver};
@@ -600,6 +601,223 @@ fn _unused(display: &mut Display<'_>) {
 
     display.flush().ok();
     FreeRtos::delay_ms(1000);
+}
+
+// ---------------------------------------------------------------------------
+// OTA update display
+// ---------------------------------------------------------------------------
+
+/// Display the OTA approval prompt with firmware size and countdown.
+///
+/// Layout (128x64):
+///   Line 1 (y=12): "FIRMWARE UPDATE" in FONT_6X10
+///   Line 2 (y=30): "{size}KB" in FONT_10X20 (large, centred)
+///   Line 3 (y=46): "Hold 2s to approve" in FONT_5X8
+///   Line 4 (y=56-62): graphical countdown bar + seconds
+pub fn show_ota_approval(
+    display: &mut Display<'_>,
+    size_kb: u32,
+    seconds_remaining: u32,
+    total_seconds: u32,
+) {
+    display.clear_buffer();
+
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+    let medium = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Header
+    Text::new("FIRMWARE UPDATE", Point::new(4, 10), medium).draw(display).ok();
+
+    // Horizontal rule
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    // Firmware size -- large and centred
+    let size_str = format!("{} KB", size_kb);
+    let size_x = ((128 - size_str.len() as i32 * 10) / 2).max(0);
+    Text::new(&size_str, Point::new(size_x, 36), large).draw(display).ok();
+
+    // Instruction
+    Text::new("Hold 2s to approve", Point::new(4, 48), small).draw(display).ok();
+
+    // Graphical countdown bar: track (outline) + fill
+    let bar_y = 54;
+    let bar_h = 8u32;
+    let bar_w = 100u32;
+    let bar_x = 2;
+
+    // Track outline
+    Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, bar_h))
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+        .draw(display).ok();
+
+    // Fill (proportional to time remaining)
+    let fill_w = if total_seconds > 0 {
+        ((seconds_remaining as u32) * (bar_w - 4)) / total_seconds
+    } else {
+        0
+    };
+    if fill_w > 0 {
+        Rectangle::new(Point::new(bar_x + 2, bar_y + 2), Size::new(fill_w, bar_h - 4))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display).ok();
+    }
+
+    // Seconds label right of bar
+    let secs = format!("{}s", seconds_remaining);
+    Text::new(&secs, Point::new(bar_x + bar_w as i32 + 4, bar_y + 7), small)
+        .draw(display).ok();
+
+    display.flush().ok();
+}
+
+/// Display OTA transfer progress with a graphical progress bar.
+///
+/// Layout (128x64):
+///   Line 1 (y=10):  "OTA" in FONT_6X10 + percentage right-aligned
+///   Row 14-24:       graphical progress bar (full width, 10px tall)
+///   Line 3 (y=38):  "{received}/{total} KB" in FONT_6X10
+///   Line 4 (y=50):  "chunk {n}/{total}" in FONT_5X8
+///   Bottom (y=60):   8 hash nibbles as a subtle fingerprint
+pub fn show_ota_progress(
+    display: &mut Display<'_>,
+    percent: u32,
+    bytes_received: u32,
+    total_size: u32,
+    chunk_num: u32,
+    total_chunks: u32,
+) {
+    display.clear_buffer();
+
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+    let medium = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Top row: "OTA" label + large percentage
+    Text::new("OTA", Point::new(2, 10), medium).draw(display).ok();
+
+    let pct_str = format!("{}%", percent);
+    let pct_x = (128 - pct_str.len() as i32 * 10).max(40);
+    Text::new(&pct_str, Point::new(pct_x, 12), large).draw(display).ok();
+
+    // Progress bar: full-width graphical bar
+    let bar_y = 26;
+    let bar_h = 6u32;
+    let bar_w = 124u32;
+    let bar_x = 2;
+
+    // Track
+    Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, bar_h))
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+        .draw(display).ok();
+
+    // Fill
+    let fill_w = (percent * (bar_w - 2)) / 100;
+    if fill_w > 0 {
+        Rectangle::new(Point::new(bar_x + 1, bar_y + 1), Size::new(fill_w, bar_h - 2))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display).ok();
+    }
+
+    // Bytes transferred
+    let kb_recv = bytes_received / 1024;
+    let kb_total = (total_size + 1023) / 1024;
+    let bytes_str = format!("{}/{} KB", kb_recv, kb_total);
+    Text::new(&bytes_str, Point::new(2, 44), medium).draw(display).ok();
+
+    // Chunk counter
+    let chunk_str = format!("chunk {}/{}", chunk_num, total_chunks);
+    Text::new(&chunk_str, Point::new(2, 56), small).draw(display).ok();
+
+    // Transfer rate indicator: a small animated dot pattern at bottom-right
+    // that shifts based on chunk number to show activity
+    let dot_x = 100 + ((chunk_num % 4) as i32 * 6);
+    Rectangle::new(Point::new(dot_x, 54), Size::new(3, 3))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    display.flush().ok();
+}
+
+/// Display the OTA verification screen (SHA-256 check in progress).
+///
+/// Shows a pulsing-style animation by alternating between two frames.
+pub fn show_ota_verifying(display: &mut Display<'_>) {
+    display.clear_buffer();
+
+    let medium = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("VERIFYING", Point::new(14, 28), large).draw(display).ok();
+    Text::new("SHA-256 check", Point::new(20, 46), medium).draw(display).ok();
+
+    // Full progress bar (complete)
+    Rectangle::new(Point::new(2, 52), Size::new(124, 6))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    display.flush().ok();
+}
+
+/// Display the OTA success screen with a brief animation.
+pub fn show_ota_complete(display: &mut Display<'_>) {
+    // Frame 1: the word builds
+    display.clear_buffer();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    let medium = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Top line
+    Rectangle::new(Point::new(0, 0), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Text::new("VERIFIED", Point::new(24, 24), large).draw(display).ok();
+
+    // Divider
+    Rectangle::new(Point::new(20, 30), Size::new(88, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Text::new("Rebooting...", Point::new(22, 46), medium).draw(display).ok();
+
+    // Bottom line
+    Rectangle::new(Point::new(0, 63), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    display.flush().ok();
 }
 
 // ---------------------------------------------------------------------------

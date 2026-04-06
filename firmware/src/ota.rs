@@ -25,6 +25,9 @@ use heartwood_common::types::{
     OTA_STATUS_ERR_SIZE, OTA_STATUS_ERR_WRITE, OTA_STATUS_READY, OTA_STATUS_VERIFIED,
 };
 
+/// Expected chunk data size for progress display (host OTA tool default).
+const CHUNK_DATA_MAX: usize = 4088;
+
 /// Active OTA session state, held in `Option` in the dispatch loop.
 ///
 /// Created by `handle_ota_begin`, consumed by `handle_ota_finish`.
@@ -84,8 +87,7 @@ pub fn handle_ota_begin(
     let size_kb = (total_size + 1023) / 1024;
     let approval_result =
         crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
-            let msg = format!("OTA update\n{}KB\nHold 2s ({remaining}s)", size_kb);
-            crate::oled::show_error(d, &msg);
+            crate::oled::show_ota_approval(d, size_kb, remaining, 30);
         });
 
     match approval_result {
@@ -210,8 +212,16 @@ pub fn handle_ota_chunk(
     } else {
         0
     };
-    let progress_msg = format!("OTA {percent}%\n{}/{}B", s.bytes_received, s.total_size);
-    crate::oled::show_error(display, &progress_msg);
+    let chunk_num = (s.bytes_received + CHUNK_DATA_MAX as u32 - 1) / CHUNK_DATA_MAX as u32;
+    let total_chunks = (s.total_size + CHUNK_DATA_MAX as u32 - 1) / CHUNK_DATA_MAX as u32;
+    crate::oled::show_ota_progress(
+        display,
+        percent,
+        s.bytes_received,
+        s.total_size,
+        chunk_num,
+        total_chunks,
+    );
 
     // NOTE: no log::info! here -- ESP-IDF VFS logging and UsbSerialDriver
     // both write to the USB-Serial-JTAG peripheral via different APIs.
@@ -274,8 +284,9 @@ pub fn handle_ota_finish(
         return;
     }
 
-    log::info!("OTA_FINISH: SHA-256 verified — finalising update");
-    crate::oled::show_error(display, "OTA verified\nRebooting...");
+    log::info!("OTA_FINISH: SHA-256 verified -- finalising update");
+    crate::oled::show_ota_verifying(display);
+    esp_idf_hal::delay::FreeRtos::delay_ms(300);
 
     // Finalise the OTA write and set the new boot partition.
     let err = unsafe { esp_idf_svc::sys::esp_ota_end(s.ota_handle) };
@@ -294,7 +305,8 @@ pub fn handle_ota_finish(
 
     // Notify the host before rebooting.
     send_ota_status(usb, OTA_STATUS_VERIFIED, "Verified");
-    esp_idf_hal::delay::FreeRtos::delay_ms(200);
+    crate::oled::show_ota_complete(display);
+    esp_idf_hal::delay::FreeRtos::delay_ms(1500);
 
     log::info!("OTA_FINISH: rebooting into new firmware");
     unsafe {

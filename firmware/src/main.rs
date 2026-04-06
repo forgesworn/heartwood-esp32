@@ -217,7 +217,7 @@ fn main() {
     }
 
     // --- Policy engine (load persisted TOFU policies from NVS) ---
-    let mut policy_engine = policy::PolicyEngine::load_from_nvs(&nvs, loaded_masters.len() as u8);
+    let mut policy_engine = policy::PolicyEngine::load_from_nvs(&mut nvs, loaded_masters.len() as u8);
 
     // --- OTA rollback guard ---
     // If this boot was triggered by an OTA update, mark the firmware as valid

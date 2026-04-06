@@ -50,10 +50,10 @@ struct Cli {
 const CHUNK_DATA_SIZE: usize = 4088;
 
 /// Timeout waiting for OTA_STATUS_READY after OTA_BEGIN.
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
+const READY_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Timeout waiting for OTA_STATUS_CHUNK_OK after each OTA_CHUNK.
-const CHUNK_TIMEOUT: Duration = Duration::from_secs(15);
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout waiting for OTA_STATUS_VERIFIED after OTA_FINISH.
 /// The device runs SHA-256 over the whole image before responding.
@@ -256,7 +256,18 @@ fn main() {
     // ------------------------------------------------------------------
     println!("Waiting for device ready...");
     match read_ota_status(&mut port, READY_TIMEOUT) {
-        Ok(OTA_STATUS_READY) => println!("Device ready — beginning transfer"),
+        Ok(OTA_STATUS_READY) => {
+            println!("Device ready — beginning transfer");
+            // Drain any buffered log output from the device before starting
+            // the chunk loop. ESP-IDF log lines share the serial port and can
+            // contain bytes that the frame parser misidentifies as a status
+            // response.
+            std::thread::sleep(Duration::from_millis(200));
+            let mut drain = [0u8; 4096];
+            while let Ok(n) = port.read(&mut drain) {
+                if n == 0 { break; }
+            }
+        }
         Ok(other) => {
             eprintln!("error: expected OTA_STATUS_READY (0x00), got 0x{other:02x}");
             std::process::exit(1);
@@ -290,21 +301,27 @@ fn main() {
         chunk_payload.extend_from_slice(chunk_data);
 
         send_frame(&mut port, FRAME_TYPE_OTA_CHUNK, &chunk_payload).unwrap_or_else(|e| {
-            bar.abandon_with_message(format!("write error at chunk {i}: {e}"));
+            let msg = format!("write error at chunk {i}: {e}");
+            bar.abandon_with_message(msg.clone());
+            eprintln!("error: {msg}");
             std::process::exit(1);
         });
 
         match read_ota_status(&mut port, CHUNK_TIMEOUT) {
             Ok(OTA_STATUS_CHUNK_OK) => {}
             Ok(other) => {
-                bar.abandon_with_message(format!(
+                let msg = format!(
                     "unexpected status 0x{other:02x} after chunk {}/{chunk_count}",
                     i + 1
-                ));
+                );
+                bar.abandon_with_message(msg.clone());
+                eprintln!("error: {msg}");
                 std::process::exit(1);
             }
             Err(e) => {
-                bar.abandon_with_message(format!("chunk {}/{chunk_count}: {e}", i + 1));
+                let msg = format!("chunk {}/{chunk_count}: {e}", i + 1);
+                bar.abandon_with_message(msg.clone());
+                eprintln!("error: {msg}");
                 std::process::exit(1);
             }
         }

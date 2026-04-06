@@ -377,9 +377,9 @@ fn handle_auto_sign(
     secp: &Arc<Secp256k1<SignOnly>>,
     request: &nip46::Nip46Request,
 ) -> Result<String, String> {
-    let event = nip46::parse_unsigned_event(&request.params)
+    let mut event = nip46::parse_unsigned_event(&request.params)
         .map_err(|e| format!("bad event format: {e}"))?;
-    let signed = do_sign(&event, master_secret, secp, request.heartwood.as_ref())?;
+    let signed = do_sign(&mut event, master_secret, secp, request.heartwood.as_ref())?;
     nip46::build_sign_response(&request.id, &signed)
 }
 
@@ -488,7 +488,7 @@ fn handle_sign_event(
     button_pin: &PinDriver<'_, Input>,
     request: &nip46::Nip46Request,
 ) -> String {
-    let event = match nip46::parse_unsigned_event(&request.params) {
+    let mut event = match nip46::parse_unsigned_event(&request.params) {
         Ok(e) => e,
         Err(e) => {
             log::warn!("sign_event: bad event format: {e}");
@@ -520,7 +520,7 @@ fn handle_sign_event(
         ApprovalResult::Approved => {
             log::info!("sign_event: approved");
             crate::oled::show_error(display, "Signing...");
-            match do_sign(&event, master_secret, secp, request.heartwood.as_ref()) {
+            match do_sign(&mut event, master_secret, secp, request.heartwood.as_ref()) {
                 Ok(signed) => {
                     match nip46::build_sign_response(&request.id, &signed) {
                         Ok(json) => {
@@ -564,13 +564,12 @@ fn handle_sign_event(
 // ---------------------------------------------------------------------------
 
 fn do_sign(
-    event: &UnsignedEvent,
+    event: &mut UnsignedEvent,
     master_secret: &[u8; 32],
     secp: &Arc<Secp256k1<SignOnly>>,
     heartwood: Option<&HeartwoodContext>,
 ) -> Result<SignedEvent, String> {
-    let event_id_bytes = nip46::compute_event_id(event);
-
+    // Derive the signing identity first -- we may need the pubkey to fill the template.
     let (mut signing_secret, hex_pubkey) = match heartwood {
         Some(ctx) => {
             let root = derive::create_tree_root(master_secret)
@@ -589,6 +588,14 @@ fn do_sign(
             (*master_secret, pubkey_hex)
         }
     };
+
+    // NIP-46 spec: the signer owns the identity. Fill pubkey when the client
+    // omits it from the template (which is the correct convention).
+    if event.pubkey.is_empty() {
+        event.pubkey = hex_pubkey.clone();
+    }
+
+    let event_id_bytes = nip46::compute_event_id(event);
 
     let sig_bytes = crate::sign::sign_hash(secp, &signing_secret, &event_id_bytes)
         .map_err(|e| e.to_string())?;

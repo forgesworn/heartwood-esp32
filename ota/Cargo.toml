@@ -7,6 +7,6 @@ description = "Pi-side OTA firmware update tool for heartwood-esp32"
 [dependencies]
 heartwood-common = { path = "../common", default-features = false, features = ["k256-backend"] }
 clap = { version = "4", features = ["derive"] }
-serialport = "4"
+serialport = { version = "4", default-features = false }
 sha2 = "0.10"
 indicatif = "0.17"

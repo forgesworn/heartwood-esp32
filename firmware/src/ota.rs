@@ -213,14 +213,10 @@ pub fn handle_ota_chunk(
     let progress_msg = format!("OTA {percent}%\n{}/{}B", s.bytes_received, s.total_size);
     crate::oled::show_error(display, &progress_msg);
 
-    log::info!(
-        "OTA_CHUNK: offset={} len={} total={}/{} ({}%)",
-        offset,
-        data.len(),
-        s.bytes_received,
-        s.total_size,
-        percent,
-    );
+    // NOTE: no log::info! here -- ESP-IDF VFS logging and UsbSerialDriver
+    // both write to the USB-Serial-JTAG peripheral via different APIs.
+    // Interleaving log output with frame data corrupts the frame protocol
+    // after ~245 chunks. The OLED shows progress; serial logging is not needed.
 
     send_ota_status(usb, OTA_STATUS_CHUNK_OK, "OK");
 }

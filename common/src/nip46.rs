@@ -170,6 +170,8 @@ impl Nip46Method {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnsignedEvent {
     /// Hex-encoded public key of the event author.
+    /// Optional per NIP-46: the signer fills this from its own identity when absent.
+    #[serde(default)]
     pub pubkey: String,
     /// Unix timestamp (seconds since epoch).
     pub created_at: u64,
@@ -475,6 +477,31 @@ mod tests {
         assert_eq!(event.kind, 1);
         assert_eq!(event.tags, vec![vec!["e".to_string(), "abc123".to_string()]]);
         assert_eq!(event.content, "test");
+    }
+
+    #[test]
+    fn test_parse_unsigned_event_without_pubkey_string() {
+        let event_json = r#"{"created_at":1234,"kind":1,"tags":[],"content":"no pubkey"}"#;
+        let params: Vec<Value> = vec![Value::String(event_json.to_string())];
+        let event = parse_unsigned_event(&params).unwrap();
+        assert_eq!(event.pubkey, "");
+        assert_eq!(event.kind, 1);
+        assert_eq!(event.content, "no pubkey");
+    }
+
+    #[test]
+    fn test_parse_unsigned_event_without_pubkey_object() {
+        let event_obj = serde_json::json!({
+            "created_at": 1234,
+            "kind": 10002,
+            "tags": [["r", "wss://relay.example.com"]],
+            "content": ""
+        });
+        let params: Vec<Value> = vec![event_obj];
+        let event = parse_unsigned_event(&params).unwrap();
+        assert_eq!(event.pubkey, "");
+        assert_eq!(event.kind, 10002);
+        assert_eq!(event.tags, vec![vec!["r".to_string(), "wss://relay.example.com".to_string()]]);
     }
 
     #[test]

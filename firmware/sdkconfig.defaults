@@ -1,5 +1,9 @@
-# Heltec WiFi LoRa 32 V4 — ESP32-S3
+# Heltec WiFi LoRa 32 V4 -- ESP32-S3
 CONFIG_IDF_TARGET="esp32s3"
+
+# Flash size -- Heltec V4 has 8MB flash (some boards ship 16MB).
+# Partition table with dual 1.5MB OTA slots needs at least 4MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 
 # PSRAM disabled — not needed for signing, avoids mode mismatch
 # (Heltec V4 has quad-SPI PSRAM but we don't use external RAM)
@@ -15,12 +19,13 @@ CONFIG_ESP_TASK_WDT_INIT=n
 # OTA support
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
-# NOTE: esp-idf-sys generates its CMake project in target/.../out/ which is
-# where relative paths resolve from; see build.rs for the copy-on-build
-# mechanism that puts partitions.csv where the generated CMake project can
-# find it. If your build fails with "partitions.csv missing and no known
-# rule to make it", run `cargo clean` first to force the copy to re-run.
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# esp-idf-sys generates its CMake project at target/<triple>/<profile>/build/
+# esp-idf-sys-<hash>/out/. ESP-IDF resolves custom partition filenames
+# relative to that directory (not the firmware root). The relative path below
+# walks back up 6 levels from out/ to firmware/ where partitions.csv lives.
+# This avoids the build-order race where build.rs can't copy the file before
+# esp-idf-sys needs it.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../../../../partitions.csv"
 
 # SECURITY NOTE: NVS flash encryption is NOT enabled in this configuration.
 # Master private keys are stored in plaintext NVS — a physical flash dump

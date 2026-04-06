@@ -1,7 +1,7 @@
 // firmware/src/masters.rs
 //
-// Multi-master NVS storage. Each master occupies a numbered slot (0–7)
-// with a secret, label, mode, cached pubkey, and connect secret.
+// Multi-master NVS storage. Each master occupies a numbered slot (0-7)
+// with a secret, label, mode, and cached pubkey.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::types::MasterMode;
@@ -17,13 +17,11 @@ pub struct LoadedMaster {
     pub label: String,
     pub mode: MasterMode,
     pub pubkey: [u8; 32],
-    pub connect_secret: [u8; 32],
 }
 
 impl Drop for LoadedMaster {
     fn drop(&mut self) {
         self.secret.zeroize();
-        self.connect_secret.zeroize();
     }
 }
 
@@ -91,22 +89,12 @@ fn load_one(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<LoadedMaster> {
         _ => return None,
     }
 
-    let mut connect_secret = [0u8; 32];
-    let connect_key = format!("{prefix}_conn");
-    match nvs.get_blob(&connect_key, &mut connect_secret) {
-        Ok(Some(b)) if b.len() == 32 => {}
-        _ => {
-            log::warn!("No connect secret for slot {slot} — using zeroes");
-        }
-    }
-
     Some(LoadedMaster {
         slot,
         secret,
         label,
         mode,
         pubkey,
-        connect_secret,
     })
 }
 
@@ -117,7 +105,6 @@ pub fn add_master(
     label: &str,
     mode: MasterMode,
     pubkey: &[u8; 32],
-    connect_secret: &[u8; 32],
 ) -> Result<u8, &'static str> {
     let count = read_master_count(nvs);
     if count >= MAX_MASTERS {
@@ -135,8 +122,6 @@ pub fn add_master(
         .map_err(|_| "failed to write mode")?;
     nvs.set_blob(&format!("{prefix}_pubkey"), pubkey)
         .map_err(|_| "failed to write pubkey")?;
-    nvs.set_blob(&format!("{prefix}_conn"), connect_secret)
-        .map_err(|_| "failed to write connect secret")?;
 
     write_master_count(nvs, count + 1)?;
 

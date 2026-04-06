@@ -63,23 +63,40 @@ pub fn init<'a>(
     display
 }
 
-/// Display an npub on the OLED, split across lines.
+/// Display an npub on the OLED with header and structured layout.
+///
+/// Layout:
+///   Header:   "IDENTITY" (FONT_6X10, tracked)
+///   Rule:     1px horizontal line
+///   Body:     npub split across lines (FONT_5X8 for density)
 pub fn show_npub(display: &mut Display<'_>, npub: &str) {
     display.clear_buffer();
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let mono = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
 
-    let mut y = 14i32;
+    Text::new("IDENTITY", Point::new(2, 10), header).draw(display).ok();
+
+    // Rule
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    // npub in small font: 128/5 = 25 chars per line, fits npub1... in ~3 lines
+    let chars_small = 25usize;
+    let mut y = 26i32;
     let mut pos = 0;
-    while pos < npub.len() {
-        let end = core::cmp::min(pos + CHARS_PER_LINE, npub.len());
+    while pos < npub.len() && y < 64 {
+        let end = core::cmp::min(pos + chars_small, npub.len());
         let line = &npub[pos..end];
-        Text::new(line, Point::new(0, y), text_style)
-            .draw(display)
-            .ok();
-        y += 16;
+        Text::new(line, Point::new(2, y), mono).draw(display).ok();
+        y += 10;
         pos = end;
     }
 
@@ -88,17 +105,37 @@ pub fn show_npub(display: &mut Display<'_>, npub: &str) {
     }
 }
 
-/// Display "Awaiting secret..." on the OLED.
+/// Display "Awaiting secret..." with a structured idle screen.
+///
+/// Layout:
+///   Header:  "HEARTWOOD HSM" (FONT_6X10)
+///   Rule:    1px line
+///   Centre:  "Awaiting" (FONT_10X20)
+///   Label:   "connect secret" (FONT_5X8)
 pub fn show_awaiting(display: &mut Display<'_>) {
     display.clear_buffer();
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("Awaiting secret...", Point::new(0, 30), text_style)
-        .draw(display)
-        .ok();
+    Text::new("HEARTWOOD HSM", Point::new(4, 10), header).draw(display).ok();
+
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Text::new("Awaiting", Point::new(14, 38), large).draw(display).ok();
+    Text::new("connect secret", Point::new(24, 52), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -124,11 +161,12 @@ pub fn show_error(display: &mut Display<'_>, msg: &str) {
 
 /// Display a signing request with purpose, kind, content preview, and countdown.
 ///
-/// Layout (128x64 SSD1306, FONT_7X14, 18 chars/line, 4 lines):
-///   Line 1 (y=14): "Sign as <purpose>?"
-///   Line 2 (y=30): "Kind <number>"
-///   Line 3 (y=46): content preview (truncated)
-///   Line 4 (y=62): "[========--] 18s"
+/// Layout:
+///   Header:  "SIGN AS {purpose}?" (FONT_6X10, tracked)
+///   Rule:    1px line
+///   Kind:    "Kind {n}" (FONT_7X14)
+///   Content: preview (FONT_5X8)
+///   Bar:     graphical countdown + seconds
 pub fn show_sign_request(
     display: &mut Display<'_>,
     purpose: &str,
@@ -137,92 +175,119 @@ pub fn show_sign_request(
     seconds_remaining: u32,
 ) {
     display.clear_buffer();
-    let text_style = MonoTextStyleBuilder::new()
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let body = MonoTextStyleBuilder::new()
         .font(&FONT_7X14)
         .text_color(BinaryColor::On)
         .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
 
-    // Line 1: "Sign as <purpose>?"
+    // Header
     let label = if purpose.is_empty() || purpose == "master" { "master" } else { purpose };
-    let heading = format!("Sign as {}?", label);
-    let heading = &heading[..heading.len().min(CHARS_PER_LINE)];
-    Text::new(heading, Point::new(0, 14), text_style)
-        .draw(display)
-        .ok();
+    let heading = format!("SIGN AS {}?", &label[..label.len().min(12)]);
+    Text::new(&heading, Point::new(2, 10), header).draw(display).ok();
 
-    // Line 2: "Kind <number>"
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    // Kind (large)
     let kind_str = format!("Kind {}", kind);
-    let kind_str = &kind_str[..kind_str.len().min(CHARS_PER_LINE)];
-    Text::new(kind_str, Point::new(0, 30), text_style)
-        .draw(display)
-        .ok();
+    Text::new(&kind_str, Point::new(2, 30), body).draw(display).ok();
 
-    // Line 3: content preview (single line, truncated)
-    let content = if content_preview.len() > CHARS_PER_LINE {
-        format!("{}...", &content_preview[..CHARS_PER_LINE - 3])
+    // Content preview (small font for more text)
+    let max_preview = 25usize; // FONT_5X8: 128/5 = 25
+    let content = if content_preview.len() > max_preview {
+        format!("{}...", &content_preview[..max_preview - 3])
     } else {
         content_preview.to_string()
     };
-    Text::new(&content, Point::new(0, 46), text_style)
-        .draw(display)
-        .ok();
+    Text::new(&content, Point::new(2, 42), small).draw(display).ok();
 
-    // Line 4: countdown bar
-    show_countdown_bar(display, seconds_remaining, 30, text_style);
+    // Graphical countdown bar
+    draw_countdown_bar(display, seconds_remaining, 30);
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
     }
 }
 
-/// Draw a countdown bar at y=58: "[====------] 18s"
-/// Bar width is 12 characters; filled proportion equals remaining/total.
-fn show_countdown_bar(
+/// Draw a graphical countdown bar at the bottom of the screen.
+///
+/// Outline rectangle with filled portion proportional to remaining/total,
+/// plus seconds label to the right.
+fn draw_countdown_bar(
     display: &mut Display<'_>,
     remaining: u32,
     total: u32,
-    text_style: MonoTextStyle<'_, BinaryColor>,
 ) {
-    const BAR_WIDTH: usize = 12;
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
 
-    let filled = if total == 0 {
-        0
+    let bar_x = 2i32;
+    let bar_y = 52i32;
+    let bar_w = 100u32;
+    let bar_h = 8u32;
+
+    // Track
+    Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, bar_h))
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+        .draw(display).ok();
+
+    // Fill
+    let fill_w = if total > 0 {
+        (remaining * (bar_w - 4)) / total
     } else {
-        ((remaining as usize) * BAR_WIDTH) / (total as usize)
+        0
     };
-    let filled = filled.min(BAR_WIDTH);
-    let empty = BAR_WIDTH - filled;
-
-    // Build "[====------]" manually into a fixed-size buffer (no heap alloc needed).
-    let mut bar = [b'-'; BAR_WIDTH];
-    for b in bar.iter_mut().take(filled) {
-        *b = b'=';
+    if fill_w > 0 {
+        Rectangle::new(Point::new(bar_x + 2, bar_y + 2), Size::new(fill_w, bar_h - 4))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display).ok();
     }
-    // Safety: bar contains only ASCII '=' and '-'.
-    let bar_str = core::str::from_utf8(&bar).unwrap_or("------------");
 
-    // Format the full line — "18s" suffix, right-aligned after the closing bracket.
-    let line = format!("[{}] {}s", bar_str, remaining);
-    let line = &line[..line.len().min(CHARS_PER_LINE + 4)];
-    Text::new(line, Point::new(0, 62), text_style)
-        .draw(display)
-        .ok();
-
-    // Suppress unused-variable warning for `empty` in no_std contexts.
-    let _ = empty;
+    // Seconds
+    let secs = format!("{}s", remaining);
+    Text::new(&secs, Point::new(bar_x + bar_w as i32 + 4, bar_y + 7), small)
+        .draw(display).ok();
 }
 
-/// Display a result message centred on the OLED, then pause for 2 seconds.
+/// Display a result message with decorative framing, then pause for 2 seconds.
+///
+/// Layout:
+///   Top rule + bottom rule framing the message
+///   Message centred in FONT_7X14
 pub fn show_result(display: &mut Display<'_>, message: &str) {
     display.clear_buffer();
-    let text_style = MonoTextStyleBuilder::new()
+
+    let body = MonoTextStyleBuilder::new()
         .font(&FONT_7X14)
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new(message, Point::new(0, 30), text_style)
-        .draw(display)
-        .ok();
+    // Top rule
+    Rectangle::new(Point::new(0, 18), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    // Centred message
+    let msg_w = message.len() as i32 * 7;
+    let x = ((128 - msg_w) / 2).max(0);
+    Text::new(message, Point::new(x, 38), body).draw(display).ok();
+
+    // Bottom rule
+    Rectangle::new(Point::new(0, 44), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -231,57 +296,102 @@ pub fn show_result(display: &mut Display<'_>, message: &str) {
     FreeRtos::delay_ms(2000);
 }
 
-/// Display the multi-master boot screen.
+/// Display the multi-master boot screen after the animation.
+///
+/// Layout:
+///   Header:  "HEARTWOOD HSM" (FONT_6X10)
+///   Rule:    1px line
+///   Count:   "{n}" large + "masters" label
+///   Status:  "Awaiting bridge..." (FONT_5X8)
 pub fn show_boot(display: &mut Display<'_>, master_count: u8) {
     display.clear_buffer();
-    let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("Heartwood HSM", Point::new(0, 14), text_style)
-        .draw(display)
-        .ok();
+    Text::new("HEARTWOOD HSM", Point::new(4, 10), header).draw(display).ok();
 
-    let count_str = format!("{} masters loaded", master_count);
-    Text::new(&count_str, Point::new(0, 34), text_style)
-        .draw(display)
-        .ok();
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
 
-    Text::new("Awaiting bridge...", Point::new(0, 54), text_style)
-        .draw(display)
-        .ok();
+    // Large master count
+    let count_str = format!("{}", master_count);
+    Text::new(&count_str, Point::new(2, 38), large).draw(display).ok();
+    Text::new("masters loaded", Point::new(22, 36), small).draw(display).ok();
+
+    // Bottom status
+    Rectangle::new(Point::new(0, 48), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Text::new("Awaiting bridge...", Point::new(2, 60), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
     }
 }
 
-/// Display bridge connected status.
+/// Display bridge connected status with structured layout.
+///
+/// Layout:
+///   Header:  "BRIDGE CONNECTED" (FONT_6X10)
+///   Rule:    1px line
+///   Stats:   master count (large) + client count
 pub fn show_bridge_connected(
     display: &mut Display<'_>,
     master_count: u8,
     client_count: usize,
 ) {
     display.clear_buffer();
-    let text_style = MonoTextStyleBuilder::new()
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    let body = MonoTextStyleBuilder::new()
         .font(&FONT_7X14)
         .text_color(BinaryColor::On)
         .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
 
-    Text::new("Bridge connected", Point::new(0, 14), text_style)
-        .draw(display)
-        .ok();
+    Text::new("BRIDGE CONNECTED", Point::new(2, 10), header).draw(display).ok();
 
-    let masters_str = format!("{} masters active", master_count);
-    Text::new(&masters_str, Point::new(0, 34), text_style)
-        .draw(display)
-        .ok();
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
 
-    let clients_str = format!("{} clients", client_count);
-    Text::new(&clients_str, Point::new(0, 54), text_style)
-        .draw(display)
-        .ok();
+    // Master count large on left
+    let m_str = format!("{}", master_count);
+    Text::new(&m_str, Point::new(2, 38), large).draw(display).ok();
+    Text::new("masters", Point::new(22, 36), small).draw(display).ok();
+
+    // Client count on right side
+    let c_str = format!("{}", client_count);
+    Text::new(&c_str, Point::new(72, 38), body).draw(display).ok();
+    Text::new("clients", Point::new(88, 36), small).draw(display).ok();
+
+    // Status indicator: solid bar at bottom
+    Rectangle::new(Point::new(0, 58), Size::new(128, 6))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -289,6 +399,13 @@ pub fn show_bridge_connected(
 }
 
 /// Display a signing request with master label, method, kind, content, and countdown.
+///
+/// Layout:
+///   Header:  master label (FONT_6X10, tracked)
+///   Rule:    1px line
+///   Method:  method + kind (FONT_7X14)
+///   Content: preview (FONT_5X8)
+///   Bar:     graphical countdown
 pub fn show_master_sign_request(
     display: &mut Display<'_>,
     master_label: &str,
@@ -298,63 +415,93 @@ pub fn show_master_sign_request(
     seconds_remaining: u32,
 ) {
     display.clear_buffer();
-    let text_style = MonoTextStyleBuilder::new()
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let body = MonoTextStyleBuilder::new()
         .font(&FONT_7X14)
         .text_color(BinaryColor::On)
         .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
 
-    // Line 1: master label.
-    let label = &master_label[..master_label.len().min(CHARS_PER_LINE)];
-    Text::new(label, Point::new(0, 14), text_style)
-        .draw(display)
-        .ok();
+    // Header: master label
+    let label = &master_label[..master_label.len().min(21)]; // FONT_6X10: 128/6 = 21
+    Text::new(label, Point::new(2, 10), header).draw(display).ok();
 
-    // Line 2: method + kind.
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    // Method + kind
     let method_str = match kind {
-        Some(k) => format!("{} kind:{}", method, k),
+        Some(k) => format!("{} k:{}", method, k),
         None => method.to_string(),
     };
     let method_str = &method_str[..method_str.len().min(CHARS_PER_LINE)];
-    Text::new(method_str, Point::new(0, 30), text_style)
-        .draw(display)
-        .ok();
+    Text::new(method_str, Point::new(2, 30), body).draw(display).ok();
 
-    // Line 3: content preview (single line, truncated).
-    let preview = if content_preview.len() > CHARS_PER_LINE {
-        format!("{}...", &content_preview[..CHARS_PER_LINE - 3])
+    // Content preview (small font)
+    let max_preview = 25usize;
+    let preview = if content_preview.len() > max_preview {
+        format!("{}...", &content_preview[..max_preview - 3])
     } else {
         content_preview.to_string()
     };
-    Text::new(&preview, Point::new(0, 46), text_style)
-        .draw(display)
-        .ok();
+    Text::new(&preview, Point::new(2, 42), small).draw(display).ok();
 
-    // Line 4: countdown bar.
-    show_countdown_bar(display, seconds_remaining, 30, text_style);
+    // Graphical countdown bar
+    draw_countdown_bar(display, seconds_remaining, 30);
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
     }
 }
 
-/// Display an auto-approved request flash (shown for ~1 second).
+/// Display an auto-approved request flash with structured layout.
+///
+/// Layout:
+///   Header:  "AUTO-APPROVED" (FONT_6X10)
+///   Rule:    1px line
+///   Label:   master label (FONT_7X14)
+///   Method:  method name (FONT_5X8)
+///   Bar:     solid confirmation bar at bottom
 pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method: &str) {
     display.clear_buffer();
-    let text_style = MonoTextStyleBuilder::new()
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let body = MonoTextStyleBuilder::new()
         .font(&FONT_7X14)
         .text_color(BinaryColor::On)
         .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
 
-    // Use a simple checkmark since the OLED font may not have Unicode tick.
-    let header = format!("{} OK", &master_label[..master_label.len().min(CHARS_PER_LINE - 3)]);
-    Text::new(&header, Point::new(0, 24), text_style)
-        .draw(display)
-        .ok();
+    Text::new("AUTO-APPROVED", Point::new(4, 10), header).draw(display).ok();
 
-    let method_str = &method[..method.len().min(CHARS_PER_LINE)];
-    Text::new(method_str, Point::new(0, 44), text_style)
-        .draw(display)
-        .ok();
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    let label = &master_label[..master_label.len().min(CHARS_PER_LINE)];
+    Text::new(label, Point::new(2, 32), body).draw(display).ok();
+
+    let method_str = &method[..method.len().min(25)];
+    Text::new(method_str, Point::new(2, 46), small).draw(display).ok();
+
+    // Confirmation bar
+    Rectangle::new(Point::new(0, 56), Size::new(128, 4))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -842,6 +989,14 @@ pub fn wake_display(display: &mut Display<'_>) {
 }
 
 /// Display an identity switch notification (shown for ~2 seconds).
+/// Display an identity switch notification with structured layout.
+///
+/// Layout:
+///   Header:  "IDENTITY SWITCH" (FONT_6X10)
+///   Rule:    1px line
+///   Label:   master label (FONT_7X14)
+///   Purpose: "-> purpose" (FONT_7X14)
+///   npub:    truncated (FONT_5X8)
 pub fn show_identity_switch(
     display: &mut Display<'_>,
     master_label: &str,
@@ -849,26 +1004,36 @@ pub fn show_identity_switch(
     npub: &str,
 ) {
     display.clear_buffer();
-    let text_style = MonoTextStyleBuilder::new()
+
+    let header_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let body = MonoTextStyleBuilder::new()
         .font(&FONT_7X14)
         .text_color(BinaryColor::On)
         .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("IDENTITY SWITCH", Point::new(2, 10), header_style).draw(display).ok();
+
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
 
     let label = &master_label[..master_label.len().min(CHARS_PER_LINE)];
-    Text::new(label, Point::new(0, 14), text_style)
-        .draw(display)
-        .ok();
+    Text::new(label, Point::new(2, 30), body).draw(display).ok();
 
     let purpose_line = format!("-> {}", purpose);
     let purpose_line = &purpose_line[..purpose_line.len().min(CHARS_PER_LINE)];
-    Text::new(purpose_line, Point::new(0, 34), text_style)
-        .draw(display)
-        .ok();
+    Text::new(&purpose_line, Point::new(2, 46), body).draw(display).ok();
 
-    let npub_short = &npub[..npub.len().min(CHARS_PER_LINE)];
-    Text::new(npub_short, Point::new(0, 54), text_style)
-        .draw(display)
-        .ok();
+    // npub in small font for more characters
+    let npub_short = &npub[..npub.len().min(25)];
+    Text::new(npub_short, Point::new(2, 58), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

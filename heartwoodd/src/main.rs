@@ -17,6 +17,7 @@
 // or overridden with --mode <soft|hard|auto>.
 
 mod api;
+mod backend;
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};

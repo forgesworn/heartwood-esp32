@@ -509,6 +509,164 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
 }
 
 // ---------------------------------------------------------------------------
+// Approval feedback screens
+// ---------------------------------------------------------------------------
+
+/// Display "hold to confirm" with a graphical progress bar filling over time.
+///
+/// `hold_pct` is 0-100 representing how far through the 2-second hold.
+pub fn show_hold_progress(display: &mut Display<'_>, hold_pct: u32) {
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("CONFIRMING", Point::new(14, 10), header).draw(display).ok();
+
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    // Large percentage
+    let pct_str = format!("{}%", hold_pct.min(100));
+    let pct_x = ((128 - pct_str.len() as i32 * 10) / 2).max(0);
+    Text::new(&pct_str, Point::new(pct_x, 38), large).draw(display).ok();
+
+    // Progress bar
+    let bar_y = 48;
+    let bar_w = 124u32;
+    let bar_x = 2;
+
+    Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, 8))
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+        .draw(display).ok();
+
+    let fill_w = (hold_pct.min(100) * (bar_w - 2)) / 100;
+    if fill_w > 0 {
+        Rectangle::new(Point::new(bar_x + 1, bar_y + 1), Size::new(fill_w, 6))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display).ok();
+    }
+
+    display.flush().ok();
+}
+
+/// Display the "Approved" confirmation screen.
+pub fn show_approved(display: &mut Display<'_>) {
+    display.clear_buffer();
+
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Top rule
+    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Text::new("APPROVED", Point::new(24, 38), large).draw(display).ok();
+
+    // Bottom rule
+    Rectangle::new(Point::new(0, 44), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    // Solid confirmation bar
+    Rectangle::new(Point::new(0, 58), Size::new(128, 6))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    display.flush().ok();
+}
+
+/// Display the "Denied" screen.
+pub fn show_denied(display: &mut Display<'_>) {
+    display.clear_buffer();
+
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Top rule
+    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Text::new("DENIED", Point::new(34, 38), large).draw(display).ok();
+
+    // Bottom rule
+    Rectangle::new(Point::new(0, 44), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Text::new("released too early", Point::new(14, 58), small).draw(display).ok();
+
+    display.flush().ok();
+}
+
+/// Display a "Signed!" confirmation screen.
+pub fn show_signed(display: &mut Display<'_>) {
+    display.clear_buffer();
+
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Text::new("SIGNED", Point::new(34, 38), large).draw(display).ok();
+
+    Rectangle::new(Point::new(0, 44), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Rectangle::new(Point::new(0, 58), Size::new(128, 6))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    display.flush().ok();
+}
+
+/// Display a "Signing..." in-progress screen.
+pub fn show_signing(display: &mut Display<'_>) {
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("PROCESSING", Point::new(14, 10), header).draw(display).ok();
+
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display).ok();
+
+    Text::new("Signing", Point::new(19, 40), large).draw(display).ok();
+
+    display.flush().ok();
+}
+
+// ---------------------------------------------------------------------------
 // Boot animation
 // ---------------------------------------------------------------------------
 

@@ -519,7 +519,7 @@ fn handle_sign_event(
     match result {
         ApprovalResult::Approved => {
             log::info!("sign_event: approved");
-            crate::oled::show_error(display, "Signing...");
+            crate::oled::show_signing(display);
             match do_sign(&mut event, master_secret, secp, request.heartwood.as_ref()) {
                 Ok(signed) => {
                     match nip46::build_sign_response(&request.id, &signed) {
@@ -527,7 +527,7 @@ fn handle_sign_event(
                             // Use show_error (no delay) instead of show_result (2s delay)
                             // to avoid blocking the response. The display gets overwritten
                             // by show_boot after the frame is sent.
-                            crate::oled::show_error(display, "Signed!");
+                            crate::oled::show_signed(display);
                             json
                         }
                         Err(e) => {

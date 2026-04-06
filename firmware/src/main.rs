@@ -671,8 +671,14 @@ fn main() {
         // sleep immediately after the user finishes approving a request.
         last_activity = Instant::now();
 
-        // Return to the idle screen after each request so the OLED doesn't
+        // Return to the idle screen after non-OTA requests so the OLED doesn't
         // stay stuck on "SIGNED" or other transient confirmation screens.
-        oled::show_awaiting(&mut display);
+        // Skip for OTA frames -- the OTA handler manages its own progress display,
+        // and redrawing between chunks slows the transfer and generates log noise.
+        if !matches!(frame.frame_type,
+            FRAME_TYPE_OTA_BEGIN | FRAME_TYPE_OTA_CHUNK | FRAME_TYPE_OTA_FINISH
+        ) {
+            oled::show_awaiting(&mut display);
+        }
     }
 }

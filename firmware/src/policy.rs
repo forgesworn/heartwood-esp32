@@ -1,13 +1,16 @@
 // firmware/src/policy.rs
 //
-// Client approval policy engine. Policies are pushed from the bridge
-// and persisted to NVS. TOFU auto-approval adds policies on first use.
+// Client approval policy engine. Connection slots are persisted to NVS.
+// The slot -- not the ephemeral client pubkey -- is the stable identity.
 
 use std::time::Instant;
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
-use heartwood_common::policy::{ApprovalTier, ClientPolicy};
+use heartwood_common::policy::{
+    ApprovalTier, ConnectSlot, CONNECT_SAFE_METHODS, TOFU_SAFE_METHODS,
+    find_slot_by_pubkey, find_slot_by_secret, next_slot_index,
+};
 
 /// Maximum concurrent client sessions.
 pub const MAX_SESSIONS: usize = 32;
@@ -18,10 +21,10 @@ const RATE_LIMIT_MAX: u32 = 60;
 /// Rate limit window in seconds.
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
-/// Per-master policy store.
-pub struct MasterPolicies {
+/// Per-master connection slot store.
+pub struct MasterSlots {
     pub master_slot: u8,
-    pub policies: Vec<ClientPolicy>,
+    pub slots: Vec<ConnectSlot>,
 }
 
 /// Per-client session state (rate limiting + active identity).
@@ -62,34 +65,24 @@ impl ClientSession {
 
 /// The full policy state for the device.
 pub struct PolicyEngine {
-    /// Per-master policies (pushed from bridge).
-    pub master_policies: Vec<MasterPolicies>,
+    /// Per-master connection slot stores.
+    pub master_slots: Vec<MasterSlots>,
     /// Active client sessions.
     pub sessions: Vec<ClientSession>,
     /// Whether a bridge session is authenticated.
     pub bridge_authenticated: bool,
-    /// Dirty flag: policies changed since last NVS write.
-    pub policies_dirty: bool,
+    /// Dirty flag: slots changed since last NVS write.
+    pub slots_dirty: bool,
 }
 
 impl PolicyEngine {
     pub fn new() -> Self {
         Self {
-            master_policies: Vec::new(),
+            master_slots: Vec::new(),
             sessions: Vec::new(),
             bridge_authenticated: false,
-            policies_dirty: false,
+            slots_dirty: false,
         }
-    }
-
-    /// Set policies for a master, replacing any existing ones.
-    pub fn set_policies(&mut self, master_slot: u8, policies: Vec<ClientPolicy>) {
-        self.master_policies.retain(|mp| mp.master_slot != master_slot);
-        self.master_policies.push(MasterPolicies {
-            master_slot,
-            policies,
-        });
-        self.policies_dirty = true;
     }
 
     /// Determine the approval tier for a request.
@@ -115,37 +108,35 @@ impl PolicyEngine {
             return ApprovalTier::OledNotify;
         }
 
-        // Look up client policy for this master.
-        // Policies are consulted regardless of bridge authentication mode —
-        // TOFU policies created after physical button approval are valid in
+        // Look up slot for this client pubkey.
+        // Slots are consulted regardless of bridge authentication mode --
+        // slots created after physical button approval are valid in
         // both legacy and passthrough modes.
-        let policies = self
-            .master_policies
+        let slots = self
+            .master_slots
             .iter()
-            .find(|mp| mp.master_slot == master_slot);
+            .find(|ms| ms.master_slot == master_slot);
 
-        let policies = match policies {
-            Some(mp) => &mp.policies,
+        let slots = match slots {
+            Some(ms) => &ms.slots,
             None => return ApprovalTier::ButtonRequired,
         };
 
-        let policy = policies
-            .iter()
-            .find(|p| p.client_pubkey == client_pubkey);
+        let slot = find_slot_by_pubkey(slots, client_pubkey);
 
-        let policy = match policy {
-            Some(p) => p,
+        let slot = match slot {
+            Some(s) => s,
             None => return ApprovalTier::ButtonRequired,
         };
 
-        if !policy.auto_approve {
+        if !slot.auto_approve {
             return ApprovalTier::ButtonRequired;
         }
 
         // Check method is in allowed list.
         let method_str = method.as_str();
-        if !policy.allowed_methods.is_empty()
-            && !policy.allowed_methods.iter().any(|m| m == method_str)
+        if !slot.allowed_methods.is_empty()
+            && !slot.allowed_methods.iter().any(|m| m == method_str)
         {
             return ApprovalTier::ButtonRequired;
         }
@@ -153,8 +144,8 @@ impl PolicyEngine {
         // For sign_event, check kind is in allowed list.
         if matches!(method, Nip46Method::SignEvent) {
             if let Some(kind) = event_kind {
-                if !policy.allowed_kinds.is_empty()
-                    && !policy.allowed_kinds.contains(&kind)
+                if !slot.allowed_kinds.is_empty()
+                    && !slot.allowed_kinds.contains(&kind)
                 {
                     return ApprovalTier::ButtonRequired;
                 }
@@ -179,7 +170,7 @@ impl PolicyEngine {
         }
 
         if self.sessions.len() >= MAX_SESSIONS {
-            log::warn!("Max sessions reached — rejecting new client");
+            log::warn!("Max sessions reached -- rejecting new client");
             return None;
         }
 
@@ -189,105 +180,249 @@ impl PolicyEngine {
 
     /// Clear all state (bridge disconnected).
     pub fn clear(&mut self) {
-        self.master_policies.clear();
+        self.master_slots.clear();
         self.sessions.clear();
         self.bridge_authenticated = false;
     }
 
-    /// List all policies for a master slot.
-    pub fn list_policies(&self, master_slot: u8) -> &[ClientPolicy] {
-        self.master_policies
+    // -------------------------------------------------------------------------
+    // Slot CRUD
+    // -------------------------------------------------------------------------
+
+    /// List all slots for a master slot.
+    pub fn list_slots(&self, master_slot: u8) -> &[ConnectSlot] {
+        self.master_slots
             .iter()
-            .find(|mp| mp.master_slot == master_slot)
-            .map(|mp| mp.policies.as_slice())
+            .find(|ms| ms.master_slot == master_slot)
+            .map(|ms| ms.slots.as_slice())
             .unwrap_or(&[])
     }
 
-    /// Remove a client policy by hex pubkey. Returns true if found and removed.
-    pub fn revoke_policy(&mut self, master_slot: u8, client_pubkey: &str) -> bool {
-        if let Some(mp) = self.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
-            let before = mp.policies.len();
-            mp.policies.retain(|p| p.client_pubkey != client_pubkey);
-            let removed = mp.policies.len() < before;
-            if removed {
-                self.policies_dirty = true;
+    /// Mutable access to the slot vec for a master slot, creating the entry if absent.
+    pub(crate) fn slots_mut(&mut self, master_slot: u8) -> &mut Vec<ConnectSlot> {
+        if !self.master_slots.iter().any(|ms| ms.master_slot == master_slot) {
+            self.master_slots.push(MasterSlots { master_slot, slots: Vec::new() });
+        }
+        // Safe: we just ensured the entry exists.
+        self.master_slots
+            .iter_mut()
+            .find(|ms| ms.master_slot == master_slot)
+            .map(|ms| &mut ms.slots)
+            .unwrap()
+    }
+
+    /// Create a new connection slot with the given label and secret.
+    /// Returns the new slot index, or None if all 16 slots are occupied.
+    /// New slots are granted CONNECT_SAFE_METHODS with auto_approve=true,
+    /// signing_approved=false.
+    pub fn create_slot(&mut self, master_slot: u8, label: String, secret: String) -> Option<u8> {
+        let slot_index = {
+            let slots = self.list_slots(master_slot);
+            next_slot_index(slots)?
+        };
+        let new_slot = ConnectSlot {
+            slot_index,
+            label,
+            secret,
+            current_pubkey: None,
+            allowed_methods: CONNECT_SAFE_METHODS.iter().map(|s| s.to_string()).collect(),
+            allowed_kinds: vec![],
+            auto_approve: true,
+            signing_approved: false,
+        };
+        self.slots_mut(master_slot).push(new_slot);
+        self.slots_dirty = true;
+        Some(slot_index)
+    }
+
+    /// Update fields on an existing slot. Returns true if the slot was found.
+    pub fn update_slot(
+        &mut self,
+        master_slot: u8,
+        slot_index: u8,
+        label: Option<String>,
+        allowed_methods: Option<Vec<String>>,
+        allowed_kinds: Option<Vec<u64>>,
+        auto_approve: Option<bool>,
+    ) -> bool {
+        let slots = self.slots_mut(master_slot);
+        if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
+            if let Some(l) = label {
+                slot.label = l;
             }
-            removed
+            if let Some(methods) = allowed_methods {
+                slot.allowed_methods = methods;
+            }
+            if let Some(kinds) = allowed_kinds {
+                slot.allowed_kinds = kinds;
+            }
+            if let Some(approve) = auto_approve {
+                slot.auto_approve = approve;
+            }
+            self.slots_dirty = true;
+            true
         } else {
             false
         }
     }
 
-    /// Upsert a client policy. Replaces if client_pubkey matches, otherwise adds.
-    pub fn upsert_policy(&mut self, master_slot: u8, policy: ClientPolicy) {
-        match self.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
-            Some(mp) => {
-                if let Some(existing) = mp.policies.iter_mut().find(|p| p.client_pubkey == policy.client_pubkey) {
-                    *existing = policy;
-                } else {
-                    mp.policies.push(policy);
-                }
-            }
-            None => {
-                self.master_policies.push(MasterPolicies {
-                    master_slot,
-                    policies: vec![policy],
-                });
-            }
+    /// Remove a slot by index. Returns true if found and removed.
+    pub fn revoke_slot(&mut self, master_slot: u8, slot_index: u8) -> bool {
+        let slots = self.slots_mut(master_slot);
+        let before = slots.len();
+        slots.retain(|s| s.slot_index != slot_index);
+        let removed = slots.len() < before;
+        if removed {
+            self.slots_dirty = true;
         }
-        self.policies_dirty = true;
+        removed
     }
 
-    /// Add a TOFU-generated policy for a client.
-    pub fn add_tofu_policy(&mut self, master_slot: u8, policy: ClientPolicy) {
-        match self.master_policies.iter_mut().find(|mp| mp.master_slot == master_slot) {
-            Some(mp) => mp.policies.push(policy),
-            None => {
-                self.master_policies.push(MasterPolicies {
-                    master_slot,
-                    policies: vec![policy],
-                });
-            }
-        }
-        self.policies_dirty = true;
+    /// Find a slot by the current client pubkey (immutable).
+    pub fn find_slot_by_pubkey(&self, master_slot: u8, pubkey: &str) -> Option<&ConnectSlot> {
+        find_slot_by_pubkey(self.list_slots(master_slot), pubkey)
     }
 
-    /// Persist all policies for a master slot to NVS if changed since last write.
-    pub fn persist_policies(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) {
-        if !self.policies_dirty {
+    /// Find a slot by its secret (constant-time comparison).
+    pub fn find_slot_by_secret(&self, master_slot: u8, secret: &str) -> Option<&ConnectSlot> {
+        find_slot_by_secret(self.list_slots(master_slot), secret)
+    }
+
+    /// Assign a client pubkey to a slot (called on connect with valid secret).
+    /// Returns true if the slot was found.
+    pub fn assign_pubkey_to_slot(
+        &mut self,
+        master_slot: u8,
+        slot_index: u8,
+        pubkey: String,
+    ) -> bool {
+        let slots = self.slots_mut(master_slot);
+        if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
+            slot.current_pubkey = Some(pubkey);
+            self.slots_dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Upgrade a slot to signing tier after first physical button approval.
+    /// Sets signing_approved=true and expands allowed_methods to TOFU_SAFE_METHODS.
+    /// Returns true if the slot was found.
+    pub fn upgrade_to_signing(&mut self, master_slot: u8, slot_index: u8) -> bool {
+        let slots = self.slots_mut(master_slot);
+        if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
+            slot.signing_approved = true;
+            slot.allowed_methods = TOFU_SAFE_METHODS.iter().map(|s| s.to_string()).collect();
+            self.slots_dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // NVS persistence
+    // -------------------------------------------------------------------------
+
+    /// Persist all slots for a master slot to NVS if changed since last write.
+    pub fn persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) {
+        if !self.slots_dirty {
             return;
         }
-        let policies = self.master_policies.iter().find(|mp| mp.master_slot == master_slot);
-        let key = format!("policy_{master_slot}");
-        match policies {
-            Some(mp) => {
-                match serde_json::to_string(&mp.policies) {
+        let key = format!("connslots_{master_slot}");
+        let ms = self.master_slots.iter().find(|ms| ms.master_slot == master_slot);
+        match ms {
+            Some(ms) => {
+                match serde_json::to_string(&ms.slots) {
                     Ok(json) => {
                         if let Err(e) = nvs.set_blob(&key, json.as_bytes()) {
-                            log::error!("Failed to persist policies for slot {master_slot}: {e:?}");
+                            log::error!("Failed to persist slots for slot {master_slot}: {e:?}");
                         }
                     }
-                    Err(e) => log::error!("Failed to serialise policies: {e}"),
+                    Err(e) => log::error!("Failed to serialise slots: {e}"),
                 }
             }
-            None => { let _ = nvs.remove(&key); }
+            None => {
+                let _ = nvs.remove(&key);
+            }
         }
-        self.policies_dirty = false;
+        self.slots_dirty = false;
     }
 
-    /// Load persisted policies from NVS for all master slots.
-    pub fn load_from_nvs(nvs: &EspNvs<NvsDefault>, master_count: u8) -> Self {
+    /// Load persisted slots from NVS for all master slots.
+    ///
+    /// Migration: if the new `connslots_{slot}` key is absent but the old
+    /// `policy_{slot}` key exists alongside `master_{slot}_conn`, a single
+    /// default slot (index 0, label "default") is synthesised from the old
+    /// secret. The old `policy_{slot}` key is deleted; `master_{slot}_conn`
+    /// is left for Task 5 to clean up.
+    pub fn load_from_nvs(nvs: &mut EspNvs<NvsDefault>, master_count: u8) -> Self {
         let mut engine = Self::new();
+        let mut needs_persist = false;
+
         for slot in 0..master_count {
-            let key = format!("policy_{slot}");
+            let new_key = format!("connslots_{slot}");
             let mut buf = [0u8; 8192];
-            if let Ok(Some(data)) = nvs.get_blob(&key, &mut buf) {
-                if let Ok(policies) = serde_json::from_slice::<Vec<ClientPolicy>>(data) {
-                    let count = policies.len();
-                    engine.master_policies.push(MasterPolicies { master_slot: slot, policies });
-                    log::info!("Loaded {count} persisted policies for slot {slot}");
+
+            // --- Try new format first ---
+            if let Ok(Some(data)) = nvs.get_blob(&new_key, &mut buf) {
+                if let Ok(slots) = serde_json::from_slice::<Vec<ConnectSlot>>(data) {
+                    let count = slots.len();
+                    engine.master_slots.push(MasterSlots { master_slot: slot, slots });
+                    log::info!("Loaded {count} persisted slots for master slot {slot}");
+                    continue;
                 }
             }
+
+            // --- Migration: check old format ---
+            let old_policy_key = format!("policy_{slot}");
+            let old_secret_key = format!("master_{slot}_conn");
+            let mut secret_buf = [0u8; 128];
+
+            let has_old_secret = nvs
+                .get_blob(&old_secret_key, &mut secret_buf)
+                .ok()
+                .flatten()
+                .is_some();
+
+            if has_old_secret {
+                // Retrieve the raw secret bytes and hex-encode them.
+                let secret_bytes = nvs
+                    .get_blob(&old_secret_key, &mut secret_buf)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let secret_hex = heartwood_common::hex::hex_encode(secret_bytes);
+
+                let migrated_slot = ConnectSlot {
+                    slot_index: 0,
+                    label: "default".to_string(),
+                    secret: secret_hex,
+                    current_pubkey: None,
+                    allowed_methods: CONNECT_SAFE_METHODS.iter().map(|s| s.to_string()).collect(),
+                    allowed_kinds: vec![],
+                    auto_approve: true,
+                    signing_approved: false,
+                };
+
+                log::info!(
+                    "Migrated legacy policy for master slot {slot} to connslots format"
+                );
+
+                // Remove old policy key; master_{slot}_conn is cleaned up in Task 5.
+                let _ = nvs.remove(&old_policy_key);
+
+                engine.master_slots.push(MasterSlots {
+                    master_slot: slot,
+                    slots: vec![migrated_slot],
+                });
+                needs_persist = true;
+            }
+        }
+
+        if needs_persist {
+            engine.slots_dirty = true;
         }
         engine
     }

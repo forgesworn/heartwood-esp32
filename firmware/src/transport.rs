@@ -119,8 +119,8 @@ pub fn handle_encrypted_request(
         Some(&client_pubkey),
     );
 
-    // Persist policies if TOFU may have added one.
-    policy_engine.persist_policies(nvs, master.slot);
+    // Persist slots if a connect or sign_event may have modified one.
+    policy_engine.persist_slots(nvs, master.slot);
 
     // Re-encrypt the response and send as a 0x11 frame.
     let nonce = random_nonce_32();

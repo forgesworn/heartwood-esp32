@@ -1,4 +1,4 @@
-// bridge/src/api.rs
+// heartwoodd/src/api.rs
 //
 // HTTP management API for Sapwood. Runs alongside the relay event loop.
 // All serial operations use try_lock() -- returns 423 if signing is in progress.

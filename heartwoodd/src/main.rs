@@ -1,25 +1,20 @@
-// bridge/src/main.rs
+// heartwoodd/src/main.rs
 //
-// Pi-side relay bridge for the Heartwood ESP32 signing bunker.
+// Heartwood daemon -- Nostr signing service.
 //
-// Connects to Nostr relays, subscribes to NIP-46 request events addressed to
-// the bunker pubkey, and forwards them to the ESP32 over serial.
+// Two operating modes from the same binary:
 //
-// Two operating modes:
+//   Hard mode (ESP32 attached via USB serial):
+//     Delegates all signing to the ESP32. Pi is zero-trust plumbing.
+//     ESP32 holds keys, makes all signing decisions, button press required.
 //
-//   Device-decrypts mode (--bridge-secret provided):
-//     Authenticates with the ESP32 at startup via a SESSION_AUTH (0x21) frame.
-//     Forwards raw NIP-44 ciphertext to the ESP32 via ENCRYPTED_REQUEST (0x10)
-//     frames. The ESP32 decrypts, signs, re-encrypts and returns ENCRYPTED_RESPONSE
-//     (0x11). The bridge publishes the ciphertext verbatim — no crypto happens here.
+//   Soft mode (Pi alone, no ESP32):
+//     Signs locally with keys encrypted at rest (Argon2id + XChaCha20-Poly1305).
+//     Unlocked via Sapwood web UI. Policy-based auto-approve with Sapwood
+//     approval queue for out-of-policy requests.
 //
-//   Bridge-decrypts mode (no --bridge-secret):
-//     Bridge NIP-44 decrypts the request, forwards the plaintext NIP-46 JSON-RPC
-//     to the ESP32 via NIP46_REQUEST (0x02) frames, receives the plaintext response,
-//     NIP-44 encrypts it and publishes to the relay.
-//
-// The ESP32 is the brain — it holds the keys and makes all signing decisions.
-// This bridge is a dumb pipe that provides network access.
+// Mode is auto-detected at startup (probe for ESP32, fall back to Soft)
+// or overridden with --mode <soft|hard|auto>.
 
 mod api;
 

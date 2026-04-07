@@ -534,7 +534,7 @@ fn main() {
                 }
             }
 
-            // 0x44 -- update a connection slot
+            // 0x44 -- update a connection slot (requires button confirmation)
             FRAME_TYPE_CONNSLOT_UPDATE => {
                 if !policy_engine.bridge_authenticated {
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
@@ -545,20 +545,62 @@ fn main() {
                     match serde_json::from_slice::<serde_json::Value>(&frame.payload[1..]) {
                         Ok(v) => {
                             let idx = v["slot_index"].as_u64().unwrap_or(255) as u8;
-                            let label = v["label"].as_str().map(|s| s.to_string());
-                            let methods = v["allowed_methods"].as_array().map(|arr|
-                                arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
-                            );
-                            let kinds = v["allowed_kinds"].as_array().map(|arr|
-                                arr.iter().filter_map(|v| v.as_u64()).collect()
-                            );
-                            let auto = v["auto_approve"].as_bool();
 
-                            if policy_engine.update_slot(ms, idx, label, methods, kinds, auto) {
-                                policy_engine.persist_slots(&mut nvs, ms);
-                                protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"ok");
+                            // Resolve the slot label for the OLED prompt.
+                            let slot_label = policy_engine.list_slots(ms)
+                                .iter()
+                                .find(|s| s.slot_index == idx)
+                                .map(|s| s.label.clone())
+                                .unwrap_or_else(|| format!("slot {idx}"));
+
+                            // Build a short description of what's changing.
+                            let mut changes = String::new();
+                            if v.get("allowed_kinds").is_some() {
+                                changes.push_str("kinds");
+                            }
+                            if v.get("auto_approve").is_some() {
+                                if !changes.is_empty() { changes.push_str(", "); }
+                                changes.push_str("auto");
+                            }
+                            if v.get("label").is_some() {
+                                if !changes.is_empty() { changes.push_str(", "); }
+                                changes.push_str("label");
+                            }
+                            if changes.is_empty() { changes.push_str("policy"); }
+
+                            // Truncate label for OLED (max ~12 chars per line)
+                            let short_label: String = slot_label.chars().take(12).collect();
+
+                            let result = crate::approval::run_approval_loop(
+                                &mut display,
+                                &button_pin,
+                                30,
+                                |d, remaining| {
+                                    let msg = format!("Update {}?\n{}\n{}s", short_label, changes, remaining);
+                                    crate::oled::show_error(d, &msg);
+                                },
+                            );
+
+                            if !matches!(result, crate::approval::ApprovalResult::Approved) {
+                                log::info!("CONNSLOT_UPDATE denied by user for {}", slot_label);
+                                protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
                             } else {
-                                protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"not found");
+                                let label = v["label"].as_str().map(|s| s.to_string());
+                                let methods = v["allowed_methods"].as_array().map(|arr|
+                                    arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                                );
+                                let kinds = v["allowed_kinds"].as_array().map(|arr|
+                                    arr.iter().filter_map(|v| v.as_u64()).collect()
+                                );
+                                let auto = v["auto_approve"].as_bool();
+
+                                if policy_engine.update_slot(ms, idx, label, methods, kinds, auto) {
+                                    policy_engine.persist_slots(&mut nvs, ms);
+                                    log::info!("Updated slot {} ({}) — approved by button", idx, slot_label);
+                                    protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"ok");
+                                } else {
+                                    protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"not found");
+                                }
                             }
                         }
                         Err(e) => {

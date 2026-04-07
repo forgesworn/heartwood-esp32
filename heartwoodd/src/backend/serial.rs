@@ -446,12 +446,17 @@ impl SigningBackend for SerialBackend {
             .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
 
         let mut port = self.acquire()?;
+        // 35-second timeout — firmware now requires button confirmation for policy changes.
         let resp = self.send_and_receive(
             &mut port,
             &frame_bytes,
-            &[FRAME_TYPE_CONNSLOT_UPDATE_RESP],
-            10,
+            &[FRAME_TYPE_CONNSLOT_UPDATE_RESP, FRAME_TYPE_NACK],
+            35,
         )?;
+
+        if resp.frame_type == FRAME_TYPE_NACK {
+            return Err(BackendError::Denied);
+        }
 
         // Firmware responds with "ok" or "not found" as plain text.
         let text = String::from_utf8_lossy(&resp.payload);

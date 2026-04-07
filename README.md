@@ -84,11 +84,58 @@ cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain
 
 ## Flash & provision
 
+### Direct flash (USB cable to build machine)
+
 ```bash
-cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
+cd firmware && cargo build --release
+espflash flash target/xtensa-esp32s3-espidf/release/heartwood-esp32
 ```
 
-Wait for OLED to show "Awaiting secret...", then:
+**Always use `--release`** -- debug builds (~2.2MB) exceed the 1.5MB OTA partition.
+
+### Remote flash via esptool (ESP32 attached to a Pi)
+
+Build the app binary locally, transfer it, and flash with esptool on the Pi:
+
+```bash
+# Build and convert to app binary (0xE9 format, not raw ELF)
+cd firmware && cargo build --release
+espflash save-image --chip esp32s3 target/xtensa-esp32s3-espidf/release/heartwood-esp32 /tmp/heartwood-esp32.bin
+
+# Transfer to the Pi
+scp /tmp/heartwood-esp32.bin pi-host:/tmp/
+
+# On the Pi: stop any process holding the serial port, then flash
+sudo systemctl stop <heartwood-services>
+sudo fuser -k /dev/ttyACM0
+python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --before default-reset \
+  write-flash 0x10000 /tmp/heartwood-esp32.bin
+
+# Erase otadata to force boot from ota_0
+python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --before default-reset \
+  erase-region 0xd000 0x2000
+```
+
+**Important:** if any daemon holds `/dev/ttyACM0`, the flash will fail mid-write. Use `systemctl mask` (not just `stop`) if services auto-restart, and stop `ModemManager` which probes new serial devices on USB re-enumeration.
+
+### OTA update (over serial, device already running)
+
+```bash
+# Stop the daemon holding the serial port
+sudo systemctl stop <heartwood-service>
+
+# Flash via OTA (requires button approval on the device -- hold 2s)
+heartwood-ota --port /dev/ttyACM0 --firmware /tmp/heartwood-esp32.bin
+
+# Restart the daemon
+sudo systemctl start <heartwood-service>
+```
+
+The OTA tool is built from the `ota/` crate. The firmware binary must be an app binary (use `espflash save-image`), not the raw ELF from `cargo build`.
+
+### Provision
+
+After first flash, wait for OLED to show "Awaiting secret...", then:
 
 ```bash
 cd provision && cargo run -- --port /dev/cu.usbserial-*

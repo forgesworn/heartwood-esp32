@@ -458,9 +458,6 @@ fn handle_sign_event(
                 Ok(signed) => {
                     match nip46::build_sign_response(&request.id, &signed) {
                         Ok(json) => {
-                            // Use show_error (no delay) instead of show_result (2s delay)
-                            // to avoid blocking the response. The display gets overwritten
-                            // by show_boot after the frame is sent.
                             crate::oled::show_signed(display);
                             json
                         }

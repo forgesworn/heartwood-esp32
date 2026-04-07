@@ -641,6 +641,10 @@ pub fn show_signed(display: &mut Display<'_>) {
         .draw(display).ok();
 
     display.flush().ok();
+
+    // Hold the confirmation screen for 3 seconds so the user can verify
+    // what was signed before the display returns to the idle screen.
+    FreeRtos::delay_ms(3000);
 }
 
 /// Display a "Signing..." in-progress screen.

@@ -119,26 +119,37 @@ pub fn read_frame(usb: &mut UsbSerialDriver<'_>) -> Frame {
 
 /// Attempt to read a complete frame within `idle_timeout_ms` milliseconds.
 ///
-/// The timeout applies to the wait for the *first byte* of the magic header
-/// only — once a frame has started arriving, remaining bytes are read with
-/// the blocking [`read_byte`] / [`read_exact`] helpers as normal.  This is
-/// safe because the bridge always sends complete frames atomically.
+/// The timeout applies to the wait for the *first byte* of the magic header.
+/// Subsequent bytes (second magic byte, header, payload) use a short timeout
+/// rather than blocking forever -- this prevents a stray byte matching
+/// MAGIC[0] from locking up the idle loop and starving the display timeout.
 ///
 /// Returns `Some(Frame)` on success, `None` if no data arrived within the
-/// timeout window.
+/// timeout window or if a partial/invalid frame was received.
 pub fn try_read_frame(usb: &mut UsbSerialDriver<'_>, idle_timeout_ms: u32) -> Option<Frame> {
+    /// Once the first magic byte matches, allow this long for each subsequent
+    /// byte before giving up. The bridge sends frames atomically so inter-byte
+    /// gaps are negligible; 200 ms is generous enough to absorb scheduling jitter
+    /// while still returning promptly on noise.
+    const CONTINUATION_TIMEOUT_MS: u32 = 200;
+
     // Hunt for the first magic byte within the caller's timeout window.
     let b = try_read_byte(usb, idle_timeout_ms)?;
     if b != MAGIC_BYTES[0] {
         return None;
     }
 
-    // Confirm second magic byte (blocking — frame is already in flight).
-    let b = read_byte(usb);
+    // Confirm second magic byte with a bounded timeout.
+    let b = match try_read_byte(usb, CONTINUATION_TIMEOUT_MS) {
+        Some(b) => b,
+        None => return None,
+    };
     if b != MAGIC_BYTES[1] {
-        // Handle the edge case where the second byte is itself a start byte.
         if b == MAGIC_BYTES[0] {
-            let next = read_byte(usb);
+            let next = match try_read_byte(usb, CONTINUATION_TIMEOUT_MS) {
+                Some(b) => b,
+                None => return None,
+            };
             if next != MAGIC_BYTES[1] {
                 return None;
             }
@@ -147,7 +158,8 @@ pub fn try_read_frame(usb: &mut UsbSerialDriver<'_>, idle_timeout_ms: u32) -> Op
         }
     }
 
-    // Read header (type + 16-bit length).
+    // Read header (type + 16-bit length).  Still use blocking reads here --
+    // once we have confirmed magic bytes a real frame is in flight.
     let mut header = [0u8; 3];
     read_exact(usb, &mut header);
     let frame_type = header[0];

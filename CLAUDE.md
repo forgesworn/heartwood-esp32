@@ -41,7 +41,7 @@ Cross-session design thinking, grant reservations, and feedback lessons are in `
 - **Grant milestone reservations**: explicit do-not-build list for work reserved under G01 NLnet CANARY, G12 NLnet Privacy, G23 OpenSats Heartwood, and Heartwood Phase 2
 - **Grant-safe design feedback**: rule to check existing libraries and `prometheus/grants/TRACKER.md` before designing cross-repo crypto integration
 
-On machines where Claude Code's auto-memory should also load them, sync or symlink `~/.claude/projects/-Users-darren-WebstormProjects-heartwood-esp32/memory/` with `docs/memory/`. The repo copy is the portable canonical; auto-memory on each machine is a local working copy.
+On machines where Claude Code's auto-memory should also load them, sync or symlink the project's auto-memory directory with `docs/memory/`. The repo copy is the portable canonical; auto-memory on each machine is a local working copy.
 
 ## Build & flash
 

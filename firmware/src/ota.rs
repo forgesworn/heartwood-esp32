@@ -90,20 +90,25 @@ pub fn handle_ota_begin(
         });
 
     match approval_result {
-        crate::approval::ApprovalResult::Approved => {
-            // Log AFTER the status frame, not before -- VFS log output
-            // interleaves with framed data on the shared USB serial port.
-        }
+        crate::approval::ApprovalResult::Approved => {}
         crate::approval::ApprovalResult::Denied => {
             send_ota_status(usb, OTA_STATUS_ERR_NOT_STARTED, "Denied");
-            log::info!("OTA_BEGIN: denied by user");
             return;
         }
         crate::approval::ApprovalResult::TimedOut => {
             send_ota_status(usb, OTA_STATUS_ERR_NOT_STARTED, "Timed out");
-            log::info!("OTA_BEGIN: timed out waiting for approval");
             return;
         }
+    }
+
+    // Suppress ALL logging (including ESP-IDF internal) during partition
+    // setup and status frame send.  esp_ota_begin erases flash and emits
+    // log lines through VFS which share the USB serial with framed data.
+    unsafe {
+        esp_idf_svc::sys::esp_log_level_set(
+            b"*\0".as_ptr() as *const core::ffi::c_char,
+            esp_idf_svc::sys::esp_log_level_t_ESP_LOG_NONE,
+        );
     }
 
     // Locate the inactive OTA partition and begin the update.
@@ -111,7 +116,7 @@ pub fn handle_ota_begin(
         let partition =
             esp_idf_svc::sys::esp_ota_get_next_update_partition(core::ptr::null());
         if partition.is_null() {
-            log::error!("OTA_BEGIN: no update partition found");
+            restore_logging();
             send_ota_status(usb, OTA_STATUS_ERR_WRITE, "No OTA partition");
             return;
         }
@@ -119,7 +124,7 @@ pub fn handle_ota_begin(
         let mut handle: esp_idf_svc::sys::esp_ota_handle_t = 0;
         let err = esp_idf_svc::sys::esp_ota_begin(partition, total_size as usize, &mut handle);
         if err != esp_idf_svc::sys::ESP_OK {
-            log::error!("OTA_BEGIN: esp_ota_begin failed ({})", err);
+            restore_logging();
             send_ota_status(usb, OTA_STATUS_ERR_WRITE, "esp_ota_begin failed");
             return;
         }
@@ -137,8 +142,7 @@ pub fn handle_ota_begin(
     });
 
     send_ota_status(usb, OTA_STATUS_READY, "Ready");
-    // NOTE: no log here -- VFS output after a status frame corrupts
-    // the next frame exchange with the host OTA tool.
+    restore_logging();
 }
 
 // ---------------------------------------------------------------------------
@@ -325,8 +329,6 @@ pub fn handle_ota_finish(
 /// Payload layout: `[status_code: u8][message: ASCII...]`
 pub fn send_ota_status(usb: &mut UsbSerialDriver<'_>, code: u8, message: &str) {
     // Flush any pending VFS log output before writing the frame.
-    // ESP-IDF log lines share the USB serial port and can interleave with
-    // framed data, causing the host OTA tool to miss status responses.
     unsafe { esp_idf_svc::sys::fsync(1); }
     std::thread::sleep(std::time::Duration::from_millis(50));
 
@@ -336,4 +338,14 @@ pub fn send_ota_status(usb: &mut UsbSerialDriver<'_>, code: u8, message: &str) {
     payload.push(code);
     payload.extend_from_slice(&msg_bytes[..msg_len]);
     crate::protocol::write_frame(usb, FRAME_TYPE_OTA_STATUS, &payload);
+}
+
+/// Restore ESP-IDF logging to INFO level after OTA operations.
+fn restore_logging() {
+    unsafe {
+        esp_idf_svc::sys::esp_log_level_set(
+            b"*\0".as_ptr() as *const core::ffi::c_char,
+            esp_idf_svc::sys::esp_log_level_t_ESP_LOG_INFO,
+        );
+    }
 }

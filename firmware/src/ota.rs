@@ -78,10 +78,9 @@ pub fn handle_ota_begin(
     let mut expected_hash = [0u8; 32];
     expected_hash.copy_from_slice(&payload[4..36]);
 
-    log::info!(
-        "OTA_BEGIN: firmware size {} bytes, awaiting approval",
-        total_size
-    );
+    // NOTE: no log::info! here -- VFS logging interleaves with framed
+    // serial data and corrupts OTA_STATUS responses on the host side.
+    // The OLED shows the firmware size instead.
 
     // Show firmware size and run the approval loop (30 s, 2 s hold).
     let size_kb = (total_size + 1023) / 1024;
@@ -138,7 +137,8 @@ pub fn handle_ota_begin(
     });
 
     send_ota_status(usb, OTA_STATUS_READY, "Ready");
-    log::info!("OTA_BEGIN: session created, ready for chunks");
+    // NOTE: no log here -- VFS output after a status frame corrupts
+    // the next frame exchange with the host OTA tool.
 }
 
 // ---------------------------------------------------------------------------

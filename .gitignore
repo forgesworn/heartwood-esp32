@@ -9,3 +9,12 @@ bridge/target/
 heartwoodd/target/
 ota/target/
 .playwright-mcp/
+
+# Local AI agent settings
+.claude/
+
+# MCP config (may contain private keys)
+.mcp.json
+
+# Playwright MCP artifacts
+.playwright-mcp/

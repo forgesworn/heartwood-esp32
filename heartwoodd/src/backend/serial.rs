@@ -453,8 +453,12 @@ impl SigningBackend for SerialBackend {
             10,
         )?;
 
-        serde_json::from_slice(&resp.payload)
-            .map_err(|e| BackendError::Internal(format!("JSON parse failed: {e}")))
+        // Firmware responds with "ok" or "not found" as plain text.
+        let text = String::from_utf8_lossy(&resp.payload);
+        if text == "not found" {
+            return Err(BackendError::Internal("slot not found".into()));
+        }
+        Ok(serde_json::json!({"ok": true}))
     }
 
     fn revoke_slot(&self, master: u8, index: u8) -> Result<Value, BackendError> {
@@ -470,8 +474,12 @@ impl SigningBackend for SerialBackend {
             10,
         )?;
 
-        serde_json::from_slice(&resp.payload)
-            .map_err(|e| BackendError::Internal(format!("JSON parse failed: {e}")))
+        // Firmware responds with "ok" or "not found" as plain text.
+        let text = String::from_utf8_lossy(&resp.payload);
+        if text == "not found" {
+            return Err(BackendError::Internal("slot not found".into()));
+        }
+        Ok(serde_json::json!({"ok": true}))
     }
 
     fn get_slot_uri(&self, master: u8, index: u8, relays: &[String]) -> Result<String, BackendError> {

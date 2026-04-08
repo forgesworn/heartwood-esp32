@@ -16,9 +16,9 @@ use crate::backend::{BackendError, SigningBackend};
 /// Creates a filter for kind:24133 events p-tagged with `signing_pubkey`, subscribes,
 /// then enters the notification loop. For each request:
 ///
-///   1. Calls `backend.handle_encrypted_request` to decrypt and process the payload.
-///   2. Calls `backend.sign_envelope` to build and sign the Nostr response event.
-///   3. Publishes the signed event to connected relays.
+///   1. Calls `backend.handle_encrypted_request` to decrypt, process, re-encrypt,
+///      and sign the kind:24133 envelope event (all in one call).
+///   2. Publishes the signed event to connected relays.
 ///
 /// Returns when the notification loop ends (relay disconnection, or an internal error).
 pub async fn run_event_loop(
@@ -62,40 +62,27 @@ pub async fn run_event_loop(
 
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
-                // Step 1: decrypt and process the encrypted request, returning
-                // an encrypted response ciphertext.
-                let response_ciphertext = match backend.handle_encrypted_request(
+                // Handle the NIP-46 request: decrypt, process, re-encrypt,
+                // build and sign the kind:24133 envelope — all in one call.
+                let created_at: u64 = Timestamp::now().as_secs();
+                let signed_event_json = match backend.handle_encrypted_request(
                     &master_pubkey_bytes,
                     &client_pubkey_bytes,
+                    created_at,
                     &event.content,
                 ) {
-                    Ok(ct) => ct,
+                    Ok(json) => json,
                     Err(BackendError::PendingApproval(id)) => {
                         log::info!("Request queued for approval: {id}");
                         return Ok(false);
                     }
                     Err(e) => {
-                        log::error!("Backend error handling request: {e}");
+                        log::error!("Backend error: {e}");
                         return Ok(false);
                     }
                 };
 
-                // Step 2: build and sign the outer kind:24133 envelope event.
-                let created_at: u64 = Timestamp::now().as_secs();
-                let signed_event_json = match backend.sign_envelope(
-                    &master_pubkey_bytes,
-                    &client_pubkey_bytes,
-                    created_at,
-                    &response_ciphertext,
-                ) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        log::error!("Envelope sign error: {e}");
-                        return Ok(false);
-                    }
-                };
-
-                // Step 3: parse the pre-signed event and publish it verbatim.
+                // Parse the pre-signed event and publish it verbatim.
                 let signed_event = match Event::from_json(&signed_event_json) {
                     Ok(ev) => ev,
                     Err(e) => {

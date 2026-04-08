@@ -326,11 +326,14 @@ impl SigningBackend for SerialBackend {
         &self,
         master_pubkey: &[u8; 32],
         client_pubkey: &[u8; 32],
+        created_at: u64,
         ciphertext: &str,
     ) -> Result<String, BackendError> {
-        let mut payload = Vec::with_capacity(64 + ciphertext.len());
+        // Payload: [master_pub_32][client_pub_32][created_at_u64_be_8][ciphertext...]
+        let mut payload = Vec::with_capacity(72 + ciphertext.len());
         payload.extend_from_slice(master_pubkey);
         payload.extend_from_slice(client_pubkey);
+        payload.extend_from_slice(&created_at.to_be_bytes());
         payload.extend_from_slice(ciphertext.as_bytes());
 
         let frame_bytes = frame::build_frame(FRAME_TYPE_ENCRYPTED_REQUEST, &payload)
@@ -342,31 +345,8 @@ impl SigningBackend for SerialBackend {
         port.flush()
             .map_err(|e| BackendError::Internal(format!("serial flush failed: {e}")))?;
 
-        self.read_any_response(&mut port)
-    }
-
-    fn sign_envelope(
-        &self,
-        master_pubkey: &[u8; 32],
-        client_pubkey: &[u8; 32],
-        created_at: u64,
-        ciphertext: &str,
-    ) -> Result<String, BackendError> {
-        let mut payload = Vec::with_capacity(72 + ciphertext.len());
-        payload.extend_from_slice(master_pubkey);
-        payload.extend_from_slice(client_pubkey);
-        payload.extend_from_slice(&created_at.to_be_bytes());
-        payload.extend_from_slice(ciphertext.as_bytes());
-
-        let frame_bytes = frame::build_frame(FRAME_TYPE_SIGN_ENVELOPE, &payload)
-            .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
-
-        let mut port = self.acquire()?;
-        port.write_all(&frame_bytes)
-            .map_err(|e| BackendError::Internal(format!("serial write failed: {e}")))?;
-        port.flush()
-            .map_err(|e| BackendError::Internal(format!("serial flush failed: {e}")))?;
-
+        // The firmware signs the envelope inline and returns
+        // SIGN_ENVELOPE_RESPONSE with the signed event JSON.
         self.read_any_response(&mut port)
     }
 

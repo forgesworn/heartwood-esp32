@@ -289,6 +289,59 @@ impl SoftBackend {
         }
         None
     }
+
+    /// Build and sign a kind:24133 envelope event wrapping the given NIP-44
+    /// ciphertext. Used by handle_encrypted_request to return a signed event
+    /// instead of raw ciphertext.
+    fn wrap_in_envelope(
+        &self,
+        master_pubkey: &[u8; 32],
+        client_pubkey: &[u8; 32],
+        created_at: u64,
+        ciphertext: &str,
+    ) -> Result<String, BackendError> {
+        let guard = self.state.read().expect("state lock poisoned");
+        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+
+        let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
+            .ok_or_else(|| BackendError::Internal("master not found".into()))?;
+
+        let secret_bytes = hex_to_32(&master.secret_key)
+            .map_err(|e| BackendError::Internal(format!("master secret: {e}")))?;
+
+        let master_pubkey_hex = derive_pubkey_hex(&secret_bytes)
+            .map_err(|e| BackendError::Internal(format!("derive pubkey: {e}")))?;
+        let client_pubkey_hex = hex_encode(client_pubkey);
+
+        let unsigned = UnsignedEvent {
+            pubkey: master_pubkey_hex.clone(),
+            created_at,
+            kind: 24133,
+            tags: vec![vec!["p".to_string(), client_pubkey_hex]],
+            content: ciphertext.to_string(),
+        };
+
+        let event_id = compute_event_id(&unsigned);
+        let event_id_hex = hex_encode(&event_id);
+
+        let signing_key = k256::schnorr::SigningKey::from_bytes(&secret_bytes)
+            .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
+        let sig: k256::schnorr::Signature = signing_key.sign(&event_id);
+        let sig_hex = hex_encode(&sig.to_bytes());
+
+        let signed = SignedEvent {
+            id: event_id_hex,
+            pubkey: master_pubkey_hex,
+            created_at,
+            kind: 24133,
+            tags: unsigned.tags,
+            content: unsigned.content,
+            sig: sig_hex,
+        };
+
+        serde_json::to_string(&signed)
+            .map_err(|e| BackendError::Internal(format!("serialise signed envelope: {e}")))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +432,7 @@ impl SigningBackend for SoftBackend {
         &self,
         master_pubkey: &[u8; 32],
         client_pubkey: &[u8; 32],
+        created_at: u64,
         ciphertext: &str,
     ) -> Result<String, BackendError> {
         // Take a read lock to fetch what we need, then release before any
@@ -452,7 +506,7 @@ impl SigningBackend for SoftBackend {
                         .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
                     let ct = nip44::encrypt(&conv_key, &error_json, &nonce)
                         .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt: {e}")))?;
-                    return Ok(ct);
+                    return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &ct);
                 }
             }
 
@@ -472,7 +526,7 @@ impl SigningBackend for SoftBackend {
                 .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
             let response_ct = nip44::encrypt(&conv_key, &response_json, &nonce)
                 .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt response: {e}")))?;
-            return Ok(response_ct);
+            return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &response_ct);
         }
 
         // Always-auto-approve methods (ping, get_public_key, heartwood_list_identities, etc.).
@@ -487,7 +541,7 @@ impl SigningBackend for SoftBackend {
                 .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
             let response_ct = nip44::encrypt(&conv_key, &response_json, &nonce)
                 .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt response: {e}")))?;
-            return Ok(response_ct);
+            return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &response_ct);
         }
 
         // For sign_event and other methods, check the slot policy.
@@ -597,7 +651,7 @@ impl SigningBackend for SoftBackend {
         let response_ct = nip44::encrypt(&conv_key, &response_json, &nonce)
             .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt response: {e}")))?;
 
-        Ok(response_ct)
+        self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &response_ct)
     }
 
     fn sign_envelope(
@@ -949,9 +1003,14 @@ impl SigningBackend for SoftBackend {
         };
 
         // Re-process the original request now that it has been approved.
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let result = self.handle_encrypted_request(
             &approval.master_pubkey,
             &approval.client_pubkey,
+            created_at,
             &approval.ciphertext,
         );
 

@@ -393,25 +393,12 @@ fn main() {
                 }
             }
 
-            // 0x34 — sign a NIP-46 kind:24133 envelope event on-device
-            //
-            // Lets the bridge produce signed NIP-46 responses without ever
-            // holding master signing material. The device hardcodes the
-            // event kind and recomputes the author pubkey from its own
-            // master secret, so the host cannot coerce this path into
-            // signing an arbitrary event. Requires bridge session auth.
+            // 0x34 — SIGN_ENVELOPE (deprecated: envelope signing now happens
+            // inline during handle_encrypted_request). Kept as a NACK handler
+            // so stale daemon versions get an explicit rejection.
             FRAME_TYPE_SIGN_ENVELOPE => {
-                if !policy_engine.bridge_authenticated {
-                    log::warn!("SIGN_ENVELOPE rejected — bridge not authenticated");
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else {
-                    transport::handle_sign_envelope(
-                        &mut usb,
-                        &frame,
-                        &loaded_masters,
-                        &secp,
-                    );
-                }
+                log::warn!("SIGN_ENVELOPE is deprecated — envelope signing is now inline");
+                protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
             }
 
             // 0x21 — bridge authentication

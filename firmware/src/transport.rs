@@ -1,11 +1,13 @@
 // firmware/src/transport.rs
 //
-// On-device NIP-44 transport encryption/decryption.
+// On-device NIP-44 transport encryption/decryption with inline envelope signing.
 //
 // Decrypts inbound 0x10 frames, routes to the NIP-46 handler, then
-// re-encrypts the response as a 0x11 frame. Every method — including
-// sign_event — now returns a JSON string, so the response is always
-// encrypted before leaving the device.
+// re-encrypts the response, builds a signed kind:24133 envelope event,
+// and returns it as a 0x35 frame. The daemon publishes the event as-is,
+// eliminating the SIGN_ENVELOPE round-trip that previously caused silent
+// ESP32 reboots on large sign_event responses (~7KB exceeding the 4KB
+// USB-Serial-JTAG buffers).
 
 use esp_idf_hal::gpio::{Input, PinDriver};
 use esp_idf_hal::usb_serial::UsbSerialDriver;
@@ -18,8 +20,7 @@ use heartwood_common::hex::hex_encode;
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
 use heartwood_common::types::{
-    FRAME_TYPE_ENCRYPTED_RESPONSE, FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST,
-    FRAME_TYPE_SIGN_ENVELOPE_RESPONSE,
+    FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_SIGN_ENVELOPE_RESPONSE,
 };
 
 use crate::masters::LoadedMaster;
@@ -29,12 +30,13 @@ use crate::protocol;
 
 /// Handle an encrypted NIP-46 request frame (0x10).
 ///
-/// Payload layout: [master_pubkey_32][client_pubkey_32][ciphertext_b64...]
+/// Payload layout: [master_pubkey_32][client_pubkey_32][created_at_u64_be_8][ciphertext_b64...]
 ///
 /// Decrypts the NIP-44 ciphertext using the target master's secret,
-/// dispatches to the NIP-46 handler, then re-encrypts the response
-/// (including sign_event outcomes) and sends it as a 0x11 frame.
-/// The Pi never sees plaintext — all responses are encrypted.
+/// dispatches to the NIP-46 handler, re-encrypts the response, then
+/// builds and signs a kind:24133 envelope event inline. The signed
+/// event JSON is returned as a 0x35 (SIGN_ENVELOPE_RESPONSE) frame.
+/// The daemon publishes it directly — no SIGN_ENVELOPE round-trip.
 pub fn handle_encrypted_request(
     usb: &mut UsbSerialDriver<'_>,
     frame: &Frame,
@@ -46,7 +48,7 @@ pub fn handle_encrypted_request(
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     nvs: &mut EspNvs<NvsDefault>,
 ) {
-    if frame.payload.len() < 65 {
+    if frame.payload.len() < 73 {
         log::warn!("Encrypted request too short ({} bytes)", frame.payload.len());
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
         return;
@@ -54,7 +56,8 @@ pub fn handle_encrypted_request(
 
     let master_pubkey: [u8; 32] = frame.payload[..32].try_into().unwrap();
     let client_pubkey: [u8; 32] = frame.payload[32..64].try_into().unwrap();
-    let ciphertext_bytes = &frame.payload[64..];
+    let created_at = u64::from_be_bytes(frame.payload[64..72].try_into().unwrap());
+    let ciphertext_bytes = &frame.payload[72..];
 
     // Find the master.
     let master_idx = match crate::masters::find_by_pubkey(masters, &master_pubkey) {
@@ -126,19 +129,71 @@ pub fn handle_encrypted_request(
     drop(inner_frame);
     drop(plaintext_json);
 
-    // Re-encrypt the response and send as a 0x11 frame.
-    // IMPORTANT: no log::info! calls between write_frame and function return.
-    // Log writes go over the same USB-Serial-JTAG and can interfere with the
-    // daemon's subsequent SIGN_ENVELOPE frame arriving on the RX side.
+    // Re-encrypt the response, then build and sign the kind:24133 envelope
+    // event inline. This eliminates the SIGN_ENVELOPE round-trip that
+    // previously required the daemon to send the ~7KB ciphertext back to the
+    // device for signing — a pattern that caused silent ESP32 reboots.
     let nonce = random_nonce_32();
     match nip44::encrypt(&conversation_key, &response_json, &nonce) {
         Ok(ciphertext_b64) => {
             drop(response_json);
-            let mut response_payload =
-                Vec::with_capacity(32 + ciphertext_b64.len());
-            response_payload.extend_from_slice(&client_pubkey);
-            response_payload.extend_from_slice(ciphertext_b64.as_bytes());
-            protocol::write_frame(usb, FRAME_TYPE_ENCRYPTED_RESPONSE, &response_payload);
+
+            // Derive the author pubkey from the master secret (never trust
+            // the lookup pubkey from the frame for the event's pubkey field).
+            let keypair = match secp256k1::Keypair::from_seckey_slice(secp, &master.secret) {
+                Ok(kp) => kp,
+                Err(_) => {
+                    log::error!("Inline envelope: invalid master secret");
+                    protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                    return;
+                }
+            };
+            let (xonly, _) = keypair.x_only_public_key();
+            let author_pubkey_hex = hex_encode(&xonly.serialize());
+            let client_pubkey_hex = hex_encode(&client_pubkey);
+
+            let unsigned = UnsignedEvent {
+                pubkey: author_pubkey_hex,
+                created_at,
+                kind: NIP46_ENVELOPE_KIND,
+                tags: vec![vec!["p".to_string(), client_pubkey_hex]],
+                content: ciphertext_b64,
+            };
+
+            let event_id_bytes = nip46::compute_event_id(&unsigned);
+            let sig_bytes = match crate::sign::sign_hash(secp, &master.secret, &event_id_bytes) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    log::error!("Inline envelope: sign failed: {e}");
+                    protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                    return;
+                }
+            };
+
+            let signed = SignedEvent {
+                id: hex_encode(&event_id_bytes),
+                pubkey: unsigned.pubkey,
+                created_at: unsigned.created_at,
+                kind: unsigned.kind,
+                tags: unsigned.tags,
+                content: unsigned.content,
+                sig: hex_encode(&sig_bytes),
+            };
+
+            match serde_json::to_string(&signed) {
+                Ok(event_json) => {
+                    log::info!("Inline envelope: signed {} byte event", event_json.len());
+                    protocol::write_frame(
+                        usb,
+                        FRAME_TYPE_SIGN_ENVELOPE_RESPONSE,
+                        event_json.as_bytes(),
+                    );
+                }
+                Err(e) => {
+                    log::error!("Inline envelope: JSON serialise failed: {e}");
+                    protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                }
+            }
         }
         Err(e) => {
             log::error!("NIP-44 encrypt response failed: {e}");

@@ -101,25 +101,30 @@ pub trait SigningBackend: Send + Sync {
 
     // -- NIP-46 signing -----------------------------------------------------
 
-    /// Decrypt and handle a NIP-46 request envelope, returning an encrypted
-    /// NIP-46 response string. Used by the relay loop for normal signing.
+    /// Handle a NIP-46 request: decrypt, process, re-encrypt the response,
+    /// then build and sign a kind:24133 envelope event. Returns the signed
+    /// event JSON ready for relay publication. The `created_at` timestamp
+    /// is embedded in the envelope event.
     fn handle_encrypted_request(
-        &self,
-        master_pubkey: &[u8; 32],
-        client_pubkey: &[u8; 32],
-        ciphertext: &str,
-    ) -> Result<String, BackendError>;
-
-    /// Wrap a pre-built response ciphertext in a signed Nostr event and
-    /// return the serialised event JSON. Used by the relay loop after the
-    /// response is ready.
-    fn sign_envelope(
         &self,
         master_pubkey: &[u8; 32],
         client_pubkey: &[u8; 32],
         created_at: u64,
         ciphertext: &str,
     ) -> Result<String, BackendError>;
+
+    /// Deprecated: envelope signing is now inline in handle_encrypted_request.
+    /// Kept for backward compatibility with the approval flow.
+    fn sign_envelope(
+        &self,
+        master_pubkey: &[u8; 32],
+        client_pubkey: &[u8; 32],
+        created_at: u64,
+        ciphertext: &str,
+    ) -> Result<String, BackendError> {
+        let _ = (master_pubkey, client_pubkey, created_at, ciphertext);
+        Err(BackendError::NotSupported)
+    }
 
     // -- Master management --------------------------------------------------
 
@@ -213,15 +218,6 @@ mod tests {
         }
 
         fn handle_encrypted_request(
-            &self,
-            _master_pubkey: &[u8; 32],
-            _client_pubkey: &[u8; 32],
-            _ciphertext: &str,
-        ) -> Result<String, BackendError> {
-            Err(BackendError::NotSupported)
-        }
-
-        fn sign_envelope(
             &self,
             _master_pubkey: &[u8; 32],
             _client_pubkey: &[u8; 32],

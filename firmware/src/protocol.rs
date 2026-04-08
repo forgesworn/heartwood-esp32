@@ -37,10 +37,17 @@ fn try_read_byte(usb: &mut UsbSerialDriver<'_>, timeout_ms: u32) -> Option<u8> {
 
 /// Read exactly `buf.len()` bytes from the USB serial driver, blocking until
 /// all bytes have been received.
+///
+/// Reads are chunked to the same limit as writes to avoid crashing the
+/// USB-Serial-JTAG driver with large buffer operations.
 fn read_exact(usb: &mut UsbSerialDriver<'_>, buf: &mut [u8]) {
+    /// Maximum bytes per `usb.read()` call — mirrors the write chunk limit.
+    const MAX_CHUNK: usize = 512;
+
     let mut pos = 0;
     while pos < buf.len() {
-        match usb.read(&mut buf[pos..], delay::BLOCK) {
+        let end = (pos + MAX_CHUNK).min(buf.len());
+        match usb.read(&mut buf[pos..end], delay::BLOCK) {
             Ok(n) if n > 0 => pos += n,
             _ => {}
         }

@@ -102,6 +102,7 @@ impl IdentityCache {
             .map(|id| {
                 let mut obj = serde_json::json!({
                     "npub": id.npub,
+                    "pubkey": heartwood_common::hex::hex_encode(&id.public_key),
                     "purpose": id.purpose,
                     "index": id.index,
                 });

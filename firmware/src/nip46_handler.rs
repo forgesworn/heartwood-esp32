@@ -143,7 +143,12 @@ pub fn handle_request(
                     }
                 }
                 heartwood_common::policy::ApprovalTier::OledNotify => {
-                    crate::oled::show_auto_approved(display, master_label, "sign_event");
+                    let purpose_label = request
+                        .heartwood
+                        .as_ref()
+                        .map(|h| h.purpose.as_str())
+                        .unwrap_or("master");
+                    crate::oled::show_auto_approved(display, master_label, purpose_label);
                     match handle_auto_sign(master_secret, secp, &request) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),
@@ -334,6 +339,7 @@ pub fn handle_request(
                     .map_err(|_| "invalid master secret".to_string());
                 return match pubkey_result {
                     Ok(npub) => {
+                        crate::oled::show_identity_switch(display, master_label, "master", &npub);
                         let result = serde_json::json!({ "npub": npub, "purpose": "master", "index": 0 });
                         nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
                     }
@@ -363,6 +369,8 @@ pub fn handle_request(
                         }
                     }
                     let id = &cache.identities[idx];
+                    // Show the switch on the OLED (OledNotify tier).
+                    crate::oled::show_identity_switch(display, master_label, &id.purpose, &id.npub);
                     let mut result = serde_json::json!({
                         "npub": id.npub,
                         "purpose": id.purpose,

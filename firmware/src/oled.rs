@@ -642,9 +642,11 @@ pub fn show_signed(display: &mut Display<'_>) {
 
     display.flush().ok();
 
-    // Hold the confirmation screen for 3 seconds so the user can verify
-    // what was signed before the display returns to the idle screen.
-    FreeRtos::delay_ms(3000);
+    // Flash the confirmation briefly. The response must be returned to the
+    // transport layer promptly so the NIP-44 re-encryption and serial write
+    // complete before the daemon's 60-second timeout expires. The idle
+    // screen is redrawn by main.rs after the handler returns.
+    FreeRtos::delay_ms(500);
 }
 
 /// Display a "Signing..." in-progress screen.

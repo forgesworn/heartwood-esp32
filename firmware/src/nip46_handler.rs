@@ -452,15 +452,12 @@ fn handle_sign_event(
 
     match result {
         ApprovalResult::Approved => {
-            let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
-            log::info!("sign_event: approved (free heap: {} bytes)", free_heap);
+            log::info!("sign_event: approved");
             crate::oled::show_signing(display);
             match do_sign(&mut event, master_secret, secp, request.heartwood.as_ref()) {
                 Ok(signed) => {
-                    log::info!("sign_event: do_sign completed, building response");
                     match nip46::build_sign_response(&request.id, &signed) {
                         Ok(json) => {
-                            log::info!("sign_event: response built ({} bytes)", json.len());
                             crate::oled::show_signed(display);
                             json
                         }

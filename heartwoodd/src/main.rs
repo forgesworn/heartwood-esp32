@@ -62,6 +62,10 @@ struct Cli {
     #[arg(short, long, default_value = "wss://relay.damus.io,wss://nos.lol")]
     relays: String,
 
+    /// Master slot index to use (default: 0)
+    #[arg(long, default_value_t = 0)]
+    slot: u8,
+
     /// Management API port
     #[arg(long, default_value_t = 3100)]
     api_port: u16,
@@ -415,12 +419,20 @@ async fn main() -> Result<()> {
                 );
             }
 
-            let first = &masters[0];
-            let slot = first.get("slot").and_then(|v| v.as_u64())
-                .expect("master slot missing") as u8;
-            let label = first.get("label").and_then(|v| v.as_str())
+            let target_slot = cli.slot;
+            let selected = masters.iter()
+                .find(|m| m.get("slot").and_then(|v| v.as_u64()) == Some(target_slot as u64))
+                .unwrap_or_else(|| panic!(
+                    "No master in slot {} -- available slots: {}",
+                    target_slot,
+                    masters.iter()
+                        .filter_map(|m| m.get("slot").and_then(|v| v.as_u64()).map(|s| s.to_string()))
+                        .collect::<Vec<_>>().join(", ")
+                ));
+            let slot = target_slot;
+            let label = selected.get("label").and_then(|v| v.as_str())
                 .unwrap_or("").to_string();
-            let npub = first.get("npub").and_then(|v| v.as_str())
+            let npub = selected.get("npub").and_then(|v| v.as_str())
                 .expect("master npub missing");
             let pk = PublicKey::parse(npub)
                 .expect("failed to decode master npub");

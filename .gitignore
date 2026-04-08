@@ -8,8 +8,6 @@ sign-test/target/
 bridge/target/
 heartwoodd/target/
 ota/target/
-.playwright-mcp/
-
 # Local AI agent settings
 .claude/
 

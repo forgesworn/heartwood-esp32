@@ -64,7 +64,7 @@ pub fn handle_request(
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     client_pubkey: Option<&[u8; 32]>,
 ) -> String {
-    let request = match nip46::parse_request(&frame.payload) {
+    let mut request = match nip46::parse_request(&frame.payload) {
         Ok(r) => r,
         Err(e) => {
             log::warn!("Failed to parse NIP-46 request: {e}");
@@ -79,6 +79,32 @@ pub fn handle_request(
         request.id,
         master_slot,
     );
+
+    // If no heartwood context in the request, resolve from the session's
+    // active identity (set by a prior heartwood_switch call).
+    if request.heartwood.is_none() {
+        if let Some(cpk) = client_pubkey {
+            if let Some(session) = policy_engine.sessions.iter().find(|s| {
+                s.client_pubkey == *cpk && s.master_slot == master_slot
+            }) {
+                if let Some(identity_idx) = session.active_identity {
+                    if let Some(cache) = identity_caches.iter().find(|c| c.master_slot == master_slot) {
+                        if let Some(identity) = cache.identities.get(identity_idx) {
+                            log::info!(
+                                "Resolving active identity: purpose={} index={}",
+                                identity.purpose,
+                                identity.index,
+                            );
+                            request.heartwood = Some(HeartwoodContext {
+                                purpose: identity.purpose.clone(),
+                                index: identity.index,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let method = nip46::Nip46Method::from_str(&request.method);
     let event_kind = if matches!(method, nip46::Nip46Method::SignEvent) {
@@ -293,6 +319,12 @@ pub fn handle_request(
 
             // "master" resets to the master identity — return its npub.
             if target == "master" {
+                // Clear active identity on the session.
+                if let Some(cpk) = client_pubkey {
+                    if let Some(session) = policy_engine.get_or_create_session(*cpk, master_slot) {
+                        session.active_identity = None;
+                    }
+                }
                 use heartwood_common::encoding::encode_npub;
                 let pubkey_result = secp256k1::Keypair::from_seckey_slice(secp, master_secret)
                     .map(|kp| {
@@ -323,6 +355,13 @@ pub fn handle_request(
 
             match found {
                 Some(idx) => {
+                    // Set active identity on the client session.
+                    if let Some(cpk) = client_pubkey {
+                        if let Some(session) = policy_engine.get_or_create_session(*cpk, master_slot) {
+                            session.active_identity = Some(idx);
+                            log::info!("Set active identity to index {idx}");
+                        }
+                    }
                     let id = &cache.identities[idx];
                     let mut result = serde_json::json!({
                         "npub": id.npub,

@@ -197,16 +197,26 @@ pub fn try_read_frame(usb: &mut UsbSerialDriver<'_>, idle_timeout_ms: u32) -> Op
 /// Build a frame from `frame_type` and `payload` and write it to the serial
 /// link. Logs a warning if the payload exceeds `MAX_PAYLOAD_SIZE` or the
 /// underlying write fails.
+///
+/// Writes are chunked to avoid crashing the USB-Serial-JTAG driver with
+/// large slices. The ESP-IDF driver's internal ring buffer is small; passing
+/// an 11KB+ slice in a single `write()` call causes a hard fault on ESP32-S3.
 pub fn write_frame(usb: &mut UsbSerialDriver<'_>, frame_type: u8, payload: &[u8]) {
+    /// Maximum bytes per `usb.write()` call. The USB-Serial-JTAG TX FIFO is
+    /// 64 bytes and the ESP-IDF ring buffer is typically 256 bytes, but we
+    /// use a larger chunk to keep throughput reasonable while staying safe.
+    const MAX_CHUNK: usize = 512;
+
     match frame::build_frame(frame_type, payload) {
         Ok(bytes) => {
             let mut pos = 0;
             while pos < bytes.len() {
-                match usb.write(&bytes[pos..], delay::BLOCK) {
+                let end = (pos + MAX_CHUNK).min(bytes.len());
+                match usb.write(&bytes[pos..end], delay::BLOCK) {
                     Ok(n) if n > 0 => pos += n,
                     Ok(_) => {}
                     Err(e) => {
-                        log::warn!("Serial write error at byte {}: {:?}", pos, e);
+                        log::warn!("Serial write error at byte {}/{}: {:?}", pos, bytes.len(), e);
                         return;
                     }
                 }

@@ -122,16 +122,37 @@ pub fn handle_encrypted_request(
     // Persist slots if a connect or sign_event may have modified one.
     policy_engine.persist_slots(nvs, master.slot);
 
+    let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    log::info!(
+        "NIP-46 response ready: {} bytes, free heap: {} bytes",
+        response_json.len(),
+        free_heap,
+    );
+
+    // Drop the decrypted request data before encrypting the response to
+    // free heap — the plaintext_json and inner_frame are no longer needed.
+    drop(inner_frame);
+    drop(plaintext_json);
+
+    let free_after_drop = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    log::info!("After dropping request buffers: free heap {} bytes", free_after_drop);
+
     // Re-encrypt the response and send as a 0x11 frame.
     let nonce = random_nonce_32();
+    log::info!("Encrypting {} byte response...", response_json.len());
     match nip44::encrypt(&conversation_key, &response_json, &nonce) {
         Ok(ciphertext_b64) => {
+            log::info!("Encrypted: {} bytes base64", ciphertext_b64.len());
+            // Drop the plaintext response now that we have the ciphertext.
+            drop(response_json);
             // Response payload: [client_pubkey_32][ciphertext_b64...]
             let mut response_payload =
                 Vec::with_capacity(32 + ciphertext_b64.len());
             response_payload.extend_from_slice(&client_pubkey);
             response_payload.extend_from_slice(ciphertext_b64.as_bytes());
+            log::info!("Writing {} byte encrypted response frame", response_payload.len());
             protocol::write_frame(usb, FRAME_TYPE_ENCRYPTED_RESPONSE, &response_payload);
+            log::info!("Encrypted response frame sent");
         }
         Err(e) => {
             log::error!("NIP-44 encrypt response failed: {e}");

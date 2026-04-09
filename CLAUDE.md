@@ -32,17 +32,6 @@ Heartwood Soft mode: `heartwoodd` runs standalone on a Pi with no ESP32. Keys en
 
 Next: end-to-end Soft mode testing (unlock, create master, pair Bark, sign). Production hardening (JTAG disable, watchdog). Sapwood UI for tier badge, unlock form, approval queue.
 
-## Session memory
-
-Cross-session design thinking, grant reservations, and feedback lessons are in `docs/memory/` (mirrored from each machine's `~/.claude/projects/.../memory/` auto-memory store). **At the start of any session on this repo, read `docs/memory/MEMORY.md` and the files it references.** These capture context that isn't in the code or git history, including:
-
-- **Heartwood tier ladder** (Soft/Hard/Portable/Pocket): product reframe and naming decisions
-- **Coercion-resistance stack**: canary + spoken-token + ring-sig + button composition, **as post-grant roadmap, NOT current work**
-- **Grant milestone reservations**: explicit do-not-build list for work reserved under G01 NLnet CANARY, G12 NLnet Privacy, G23 OpenSats Heartwood, and Heartwood Phase 2
-- **Grant-safe design feedback**: rule to check existing libraries and `prometheus/grants/TRACKER.md` before designing cross-repo crypto integration
-
-On machines where Claude Code's auto-memory should also load them, sync or symlink the project's auto-memory directory with `docs/memory/`. The repo copy is the portable canonical; auto-memory on each machine is a local working copy.
-
 ## Build & flash
 
 Five crates — build each from its own directory:
@@ -67,7 +56,7 @@ Requires the ESP Rust toolchain for firmware: `espup install`, then `source ~/ex
 - Zeroize all private key material after use
 - Git commits: `type: description` (feat:, fix:, docs:, refactor:, test:, chore:)
 - No `Co-Authored-By` lines in commits
-- This is a PRIVATE repo — docs and plans can live here
+- Private docs (plans, session memory) live in gitignored directories
 
 ## Frozen protocol
 

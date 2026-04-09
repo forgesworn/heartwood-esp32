@@ -23,7 +23,7 @@ flowchart LR
     end
 
     subgraph HSM["Sealed hardware — Heltec V4"]
-        Firmware["Heartwood firmware<br/>holds master nsecs<br/>(primary, ForgeSworn)"]
+        Firmware["Heartwood firmware<br/>holds master nsecs<br/>(multiple identities)"]
         OLED["OLED + button"]
     end
 
@@ -49,8 +49,8 @@ Trust boundaries, from inside out:
 
 | Material | Bark | Bridge (Pi) | HSM firmware | Relays |
 |---|---|---|---|---|
-| Master nsec (primary) | ✗ | ✗ | ✓ (NVS) | ✗ |
-| Master nsec (ForgeSworn) | ✗ | ✗ | ✓ (NVS) | ✗ |
+| Master nsec (identity A) | ✗ | ✗ | ✓ (NVS) | ✗ |
+| Master nsec (identity B) | ✗ | ✗ | ✓ (NVS) | ✗ |
 | Connect secret (per master) | ✗ | transiently, forwarded from device | ✓ (NVS) | ✗ |
 | Bridge session secret | ✗ | ✓ (`bunker.env`, root 0600) | ✓ (NVS) | ✗ |
 | Pi bunker/relay secret | ✗ | ✓ (`bunker.env`, root 0600) | ✗ | ✗ |
@@ -72,7 +72,7 @@ sequenceDiagram
     participant Bridge as Bridge (mypi)
     participant HSM as HSM (Heltec V4)
 
-    User->>Bark: "Publish note as primary"
+    User->>Bark: "Publish note as my-identity"
     Note over Bark: Ephemeral client_priv already<br/>generated at pair time
     Bark->>Bark: ECDH(client_priv, master_pub)<br/>= shared_key
     Bark->>Bark: NIP-44 encrypt(shared_key,<br/>{"method":"sign_event", params:[event]})
@@ -202,7 +202,7 @@ Destructive actions (`factory-reset`, `ota`, `clients/*` DELETE) are protected b
 | Physical possession of HSM | Read npubs via `PROVISION_LIST`. Attempt PIN unlock (if set). | Sign without pressing button. Extract master nsecs without physical flash dump (no flash encryption = one further line of defence you could enable if this matters in your threat model). |
 | Physical possession of HSM + user compelled to press button | Sign whatever is on the OLED. | Sign events the user cannot see (OLED shows the exact event being signed). Sign many events without repeated presses (each signature = one press). |
 
-The coercion-resistance stack (canary + spoken-token + ring-signature + button composition) that mitigates the "user compelled to press button" row is deliberately **out of scope** for this repo and reserved for dedicated grant work. See `docs/memory/project_coercion_stack_roadmap.md` for that roadmap.
+The coercion-resistance stack (canary + spoken-token + ring-signature + button composition) that mitigates the "user compelled to press button" row is deliberately **out of scope** for this repo and reserved for dedicated grant work.
 
 ## Build and flash
 
@@ -236,6 +236,5 @@ Secrets live in `/etc/heartwood-esp32-bridge/bunker.env` on mypi (chmod 600, roo
 ## Further reading
 
 - [`docs/plans/2026-04-05-true-zero-trust-bridge.md`](plans/2026-04-05-true-zero-trust-bridge.md) — design note for the future dedicated-transport-key architecture, the Hard tier grant scope.
-- [`docs/memory/`](memory/) — session memory for grant reservations, tier ladder, and feedback rules.
 - [`docs/specs/`](specs/) — protocol specs.
 - [`CLAUDE.md`](../CLAUDE.md) — working context, conventions, frozen test vectors.

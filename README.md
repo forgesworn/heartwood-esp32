@@ -220,7 +220,6 @@ docs/
   architecture.md       System architecture with mermaid diagrams
   plans/                Design notes, including the zero-trust bridge refactor plan
   specs/                Protocol specs
-  memory/               Session memory (grant reservations, feedback rules)
 ```
 
 ## Roadmap
@@ -291,8 +290,8 @@ docs/
 - [x] Pi-side `bunker_keys` demoted to ephemeral relay-layer transport identity with no signing authority
 - [x] `EventBuilder::sign_with_keys` replaced with device round-trip in the response path
 - [x] 1.5 MB OTA partition slots (up from 896 KB) — accommodates current firmware size with 50% headroom
-- [ ] Dedicated on-device transport key distinct from user masters *(reserved for Heartwood Hard tier grant — see [`docs/plans/2026-04-05-true-zero-trust-bridge.md`](docs/plans/2026-04-05-true-zero-trust-bridge.md))*
-- [ ] NIP-46 transport architecture spec contribution *(reserved for G23 M1)*
+- [ ] Dedicated on-device transport key distinct from user masters
+- [ ] NIP-46 transport architecture spec contribution
 
 ### Phase 7 — Portable signer
 

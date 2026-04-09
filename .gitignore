@@ -8,10 +8,12 @@ sign-test/target/
 bridge/target/
 heartwoodd/target/
 ota/target/
-# Private docs (plans, session memory, superpowers)
+# Private docs (plans, session memory, superpowers, specs)
 docs/plans/
 docs/memory/
 docs/superpowers/
+docs/specs/
+docs/next-session-prompt.md
 
 # Local AI agent settings
 .claude/

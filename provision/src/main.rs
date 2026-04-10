@@ -200,14 +200,25 @@ fn decode_nsec(nsec: &str) -> Result<[u8; 32], String> {
 }
 
 /// Derive an nsec-tree root from a raw nsec via HMAC-SHA256.
+///
+/// Matches PROTOCOL.md §1.2 and the reference implementations in
+/// `nsec-tree/src/root-nsec.ts` and `heartwood-core/src/root.rs`:
+///
+///   tree_root = HMAC-SHA256(key = nsec_bytes, msg = utf8("nsec-tree-root"))
+///
+/// A previous version of this function used the DOMAIN_PREFIX
+/// (`b"nsec-tree\0"`) as the HMAC key and the nsec as the message, producing
+/// a byte-for-byte divergent tree root from every other nsec-tree
+/// implementation. Devices provisioned via `tree-nsec` mode with that broken
+/// version must be re-provisioned to match the reference implementations.
 fn nsec_to_tree_root(nsec_bytes: &[u8; 32]) -> Result<[u8; 32], String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(b"nsec-tree\0")
+    let mut mac = HmacSha256::new_from_slice(nsec_bytes)
         .map_err(|_| "HMAC init failed".to_string())?;
-    mac.update(nsec_bytes);
+    mac.update(b"nsec-tree-root");
     let result = mac.finalize();
     let mut root = [0u8; 32];
     root.copy_from_slice(&result.into_bytes());
@@ -565,6 +576,34 @@ mod tests {
             "derived secret does not match expected hex"
         );
 
+        root.destroy();
+    }
+
+    /// Frozen nsec-tree vector (PROTOCOL.md §6.1 Vector 1): nsec_bytes = 0x01 × 32.
+    ///
+    /// The derived tree_root and its x-only master pubkey MUST match the
+    /// frozen values in the canonical TypeScript implementation
+    /// (`nsec-tree/test/vectors.test.ts`) and the Rust port
+    /// (`heartwood-core/tests/full_vectors_test.rs`). If this test fails,
+    /// provisioning a device via `tree-nsec` mode will produce keys that
+    /// are incompatible with every other nsec-tree implementation.
+    #[test]
+    fn test_nsec_to_tree_root_matches_frozen_vector() {
+        let nsec_bytes = [0x01u8; 32];
+        let root_secret = nsec_to_tree_root(&nsec_bytes).expect("nsec_to_tree_root must succeed");
+
+        assert_eq!(
+            hex_encode(&root_secret),
+            "8d2db9ce9548534e7ae924d05e311355e3a12744214c88e65b39fa2bf2df6d6f",
+            "tree_root does not match PROTOCOL.md §6.1 Vector 1"
+        );
+
+        let root = create_tree_root(&root_secret).expect("invalid root secret");
+        assert_eq!(
+            root.master_npub,
+            "npub13sp7q3awvrqpa9p2svm7w8ghudghlnrraekwl7qh8w7j8747vjwskvzy2u",
+            "master npub does not match PROTOCOL.md §6.1 Vector 1"
+        );
         root.destroy();
     }
 

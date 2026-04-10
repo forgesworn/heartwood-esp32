@@ -3,6 +3,7 @@ pub mod encoding;
 pub mod frame;
 pub mod hex;
 pub mod types;
+pub mod validate;
 
 #[cfg(feature = "nip46")]
 pub mod nip46;

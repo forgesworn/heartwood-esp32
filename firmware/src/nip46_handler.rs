@@ -27,6 +27,7 @@ use heartwood_common::frame::Frame;
 use heartwood_common::hex::hex_encode;
 use heartwood_common::nip04;
 use heartwood_common::nip44;
+use heartwood_common::validate::validate_persona_name;
 use heartwood_common::nip46::{
     self, HeartwoodContext, SignedEvent, UnsignedEvent,
 };
@@ -290,6 +291,9 @@ pub fn handle_request(
                 Some(n) => n,
                 None => return build_error_json(&request.id, -3, "requires [name, index?]"),
             };
+            if let Err(e) = validate_persona_name(name) {
+                return build_error_json(&request.id, -3, e);
+            }
             let index = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let purpose = format!("persona/{name}");
 

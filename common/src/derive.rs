@@ -17,6 +17,7 @@ use zeroize::Zeroize;
 
 use crate::encoding::encode_npub;
 use crate::types::{Identity, TreeRoot, DOMAIN_PREFIX};
+use crate::validate::validate_purpose;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -84,7 +85,16 @@ fn build_context(purpose: &str, index: u32) -> Vec<u8> {
 /// Uses HMAC-SHA256 with the root secret as key and a context message
 /// containing the domain prefix, purpose, and index. Skips indices that
 /// produce invalid secp256k1 scalars.
+///
+/// The purpose string is validated against PROTOCOL.md §3 rules (non-empty,
+/// ≤255 bytes, no null bytes, not whitespace-only, no `|`) before derivation.
+/// Previously this function hashed any caller-supplied `&str` without
+/// checking, which meant a null byte in purpose would silently corrupt the
+/// derivation message framing — an attacker who could inject bytes into a
+/// NIP-46 RPC parameter could collide derivations between purposes.
 pub fn derive(root: &TreeRoot, purpose: &str, index: u32) -> Result<Identity, &'static str> {
+    validate_purpose(purpose)?;
+
     let secret = root.secret();
     let mut current_index = index;
 

@@ -1,15 +1,35 @@
 // firmware/src/main.rs
 //
-// Heartwood ESP32 — Phase 4 boot flow (multi-master).
+// Heartwood ESP32 -- Phase 4 boot flow (multi-master).
 //
 // Boot sequence:
-//   1. Initialise peripherals (LED, Vext, OLED, button, USB serial, NVS)
+//   1. Initialise peripherals (LED, Vext, OLED, button, serial port, NVS)
 //   2. Load all masters from NVS via masters::load_all
-//   3. If no masters: show "No masters — provision me", wait for provision frame
+//   3. If no masters: show "No masters -- provision me", wait for provision frame
 //   4. Create secp256k1 context (shared Arc)
-//   5. Show boot screen (single master → npub, multiple → count)
+//   5. Show boot screen (single master -> npub, multiple -> count)
 //   6. Create PolicyEngine (empty until bridge authenticates)
 //   7. Enter frame dispatch loop
+//
+// Board selection: exactly one of the `heltec-v3` or `heltec-v4` cargo
+// features must be active. The Heltec V4 routes USB-C to the ESP32-S3 native
+// USB pins (GPIO19/20) and we use the USB-Serial-JTAG peripheral. The Heltec
+// V3 routes USB-C through a CP2102 bridge chip to UART0 (GPIO43 TX /
+// GPIO44 RX). Both boards expose the same frame protocol through the
+// `serial::SerialPort` wrapper.
+
+#[cfg(not(any(feature = "heltec-v3", feature = "heltec-v4")))]
+compile_error!(
+    "heartwood-esp32 requires exactly one of the `heltec-v3` or `heltec-v4` \
+     cargo features. Did you build with `--no-default-features` and forget \
+     to pick a board?"
+);
+
+#[cfg(all(feature = "heltec-v3", feature = "heltec-v4"))]
+compile_error!(
+    "cargo features `heltec-v3` and `heltec-v4` are mutually exclusive -- \
+     enable exactly one."
+);
 
 mod approval;
 mod button;
@@ -24,6 +44,7 @@ mod pin;
 mod policy;
 mod protocol;
 mod provision;
+mod serial;
 mod session;
 mod sign;
 mod transport;
@@ -32,10 +53,11 @@ use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::units::FromValueType;
-use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use serial::SerialPort;
 
 /// How long the display stays on after the last activity before sleeping.
 const DISPLAY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -103,14 +125,43 @@ fn main() {
     let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
     let mut nvs = EspNvs::new(nvs_partition, "heartwood", true).expect("NVS namespace init failed");
 
-    // --- USB serial (unconditional — created before the provision wait loop) ---
-    let mut usb = UsbSerialDriver::new(
-        peripherals.usb_serial,
-        peripherals.pins.gpio19,
-        peripherals.pins.gpio20,
-        &UsbSerialConfig::new().rx_buffer_size(4096).tx_buffer_size(4096),
-    )
-    .expect("USB serial driver init failed");
+    // --- Serial port to the host (unconditional -- created before the provision wait loop) ---
+    //
+    // Heltec V4 uses the ESP32-S3 native USB-Serial-JTAG peripheral on
+    // GPIO19/20 (the pins are physically wired to the USB-C connector).
+    // Heltec V3 has a CP2102 USB-to-UART bridge between the USB-C port and
+    // UART0 (GPIO43 TX / GPIO44 RX), so we drive UART0 instead. The frame
+    // protocol is identical in both cases -- the `SerialPort` wrapper
+    // normalises the read/write API.
+    #[cfg(feature = "heltec-v4")]
+    let mut usb = {
+        use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
+        let driver = UsbSerialDriver::new(
+            peripherals.usb_serial,
+            peripherals.pins.gpio19,
+            peripherals.pins.gpio20,
+            &UsbSerialConfig::new().rx_buffer_size(4096).tx_buffer_size(4096),
+        )
+        .expect("USB serial driver init failed");
+        SerialPort::from_usb(driver)
+    };
+
+    #[cfg(feature = "heltec-v3")]
+    let mut usb = {
+        use esp_idf_hal::gpio::AnyIOPin;
+        use esp_idf_hal::uart::{config::Config as UartConfig, UartDriver};
+        use esp_idf_hal::units::Hertz;
+        let driver = UartDriver::new(
+            peripherals.uart0,
+            peripherals.pins.gpio43, // CP2102 RX (ESP32 TX)
+            peripherals.pins.gpio44, // CP2102 TX (ESP32 RX)
+            None::<AnyIOPin>,        // CTS -- unused
+            None::<AnyIOPin>,        // RTS -- unused
+            &UartConfig::new().baudrate(Hertz(115_200)),
+        )
+        .expect("UART0 driver init failed");
+        SerialPort::from_uart(driver)
+    };
 
     // --- Load masters ---
     let mut loaded_masters = masters::load_all(&nvs);

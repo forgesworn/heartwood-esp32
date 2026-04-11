@@ -7,7 +7,7 @@
 // Frame 0x04 (PROVISION_REMOVE): [slot_u8]
 // Frame 0x05 (PROVISION_LIST): (empty) → responds with 0x07 (PROVISION_LIST_RESPONSE)
 
-use esp_idf_hal::usb_serial::UsbSerialDriver;
+use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use secp256k1::Secp256k1;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use crate::protocol;
 
 /// Handle a PROVISION_ADD frame (0x01). Returns the new `LoadedMaster` on success.
 pub fn handle_add(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     frame: &Frame,
     nvs: &mut EspNvs<NvsDefault>,
     secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
@@ -107,7 +107,7 @@ pub fn handle_add(
 /// Handle a PROVISION_REMOVE frame (0x04). Removes the named slot and
 /// re-numbers the in-memory list to stay consistent with NVS.
 pub fn handle_remove(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     frame: &Frame,
     nvs: &mut EspNvs<NvsDefault>,
     loaded: &mut Vec<LoadedMaster>,
@@ -143,7 +143,7 @@ pub fn handle_remove(
 
 /// Handle a PROVISION_LIST frame (0x05). Responds with frame 0x07 containing
 /// a JSON array of `{slot, label, mode, npub}` objects.
-pub fn handle_list(usb: &mut UsbSerialDriver<'_>, loaded: &[LoadedMaster]) {
+pub fn handle_list(usb: &mut SerialPort<'_>, loaded: &[LoadedMaster]) {
     let infos: Vec<serde_json::Value> = loaded
         .iter()
         .map(|m| {
@@ -165,7 +165,7 @@ pub fn handle_list(usb: &mut UsbSerialDriver<'_>, loaded: &[LoadedMaster]) {
 /// Erases all NVS keys in the `heartwood` namespace and reboots the device.
 /// Requires physical button approval (2-second hold) — this is irreversible.
 pub fn handle_factory_reset(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     nvs: &mut EspNvs<NvsDefault>,
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,

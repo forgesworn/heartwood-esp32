@@ -5,7 +5,7 @@
 // provided via a PIN_UNLOCK frame. After 5 failed attempts the device
 // performs a factory reset (erases all NVS keys and reboots).
 
-use esp_idf_hal::usb_serial::UsbSerialDriver;
+use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use sha2::{Digest, Sha256};
 
@@ -81,7 +81,7 @@ fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
 /// The failed-attempt counter is persisted to NVS so it survives power
 /// cycles — an attacker cannot bypass the wipe threshold by rebooting.
 pub fn handle_pin_unlock(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     payload: &[u8],
     nvs: &mut EspNvs<NvsDefault>,
     failed_attempts: &mut u8,
@@ -129,7 +129,7 @@ pub fn handle_pin_unlock(
 /// Payload: ASCII PIN digits (4–8 bytes). Empty payload clears the PIN.
 /// Requires physical button confirmation before the change takes effect.
 pub fn handle_set_pin(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     payload: &[u8],
     nvs: &mut EspNvs<NvsDefault>,
     display: &mut crate::oled::Display<'_>,

@@ -12,5 +12,17 @@ build-std = ["std", "panic_abort"]
 MCU = "esp32s3"
 # esp-idf version
 ESP_IDF_VERSION = "v5.3.2"
-# Cross-compiler for C FFI crates (secp256k1-sys) — cc crate needs this
+# Cross-compiler for C FFI crates (secp256k1-sys) -- cc crate needs this
 CC_xtensa_esp32s3_espidf = "xtensa-esp32s3-elf-gcc"
+# Board-specific sdkconfig fragment selection. This is the default for the
+# `heltec-v4` feature (the cargo default). For a V3 build, override this
+# variable at invocation time before `cargo build`, e.g.:
+#
+#   ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heltec-v3" \
+#     cargo build --no-default-features --features heltec-v3
+#
+# Or use scripts/build-firmware.sh v3. The `force = false` default on
+# [env] entries means the shell value wins when both are set, so the
+# override is just "export before cargo". Layering: later files override
+# earlier ones, per esp-idf-sys BUILD-OPTIONS.md.
+ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults;sdkconfig.defaults.heltec-v4"

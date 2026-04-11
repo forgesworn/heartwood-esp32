@@ -11,7 +11,7 @@ Two deployment modes ship from the same firmware codebase:
 
 ## Getting Started
 
-Requires the ESP Rust toolchain and a Heltec WiFi LoRa 32 V4 board.
+Requires the ESP Rust toolchain and a Heltec WiFi LoRa 32 V3 or V4 board. The board is selected at build time via the `heltec-v3` or `heltec-v4` cargo feature (default `heltec-v4`). The V3 wires USB-C through a CP2102 UART bridge to UART0; the V4 uses the ESP32-S3's native USB-Serial-JTAG peripheral. The `scripts/build-firmware.sh` wrapper picks the matching cargo feature and sdkconfig fragment.
 
 ```bash
 # Install ESP Rust toolchain (one-time)
@@ -19,9 +19,13 @@ cargo install espup ldproxy espflash
 espup install
 source ~/export-esp.sh
 
-# Build and flash firmware
-cd firmware && cargo build
-espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
+# Build and flash firmware (V4 is the default)
+./scripts/build-firmware.sh v4
+espflash flash firmware/target/xtensa-esp32s3-espidf/debug/heartwood-esp32
+
+# Or for a V3
+./scripts/build-firmware.sh v3
+espflash flash firmware/target/xtensa-esp32s3-espidf/debug/heartwood-esp32
 
 # Wait for OLED to show "Awaiting secret...", then provision:
 cd provision && cargo run -- --port /dev/cu.usbserial-*

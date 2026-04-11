@@ -22,7 +22,7 @@ flowchart LR
         Sapwood["Sapwood management UI<br/>served on :3100"]
     end
 
-    subgraph HSM["Sealed hardware — Heltec V4"]
+    subgraph HSM["Sealed hardware -- Heltec V3 or V4"]
         Firmware["Heartwood firmware<br/>holds master nsecs<br/>(multiple identities)"]
         OLED["OLED + button"]
     end
@@ -70,7 +70,7 @@ sequenceDiagram
     participant Bark
     participant Relay
     participant Bridge as Bridge (mypi)
-    participant HSM as HSM (Heltec V4)
+    participant HSM as HSM (Heltec V3/V4)
 
     User->>Bark: "Publish note as my-identity"
     Note over Bark: Ephemeral client_priv already<br/>generated at pair time
@@ -216,7 +216,7 @@ flowchart LR
     end
 
     subgraph Target["Deployment targets"]
-        HSM2["Heltec V4 HSM"]
+        HSM2["Heltec V3/V4 HSM"]
         Pi2["mypi (Pi)"]
     end
 
@@ -227,7 +227,7 @@ flowchart LR
     style Pi2 fill:#0f1419,stroke:#3b82f6,color:#e8f4f8
 ```
 
-- **Firmware** (`firmware/`) cross-compiles via the ESP Rust toolchain (`espup install --toolchain-version 1.87.0.0`) to `xtensa-esp32s3-espidf`. The `build.rs` copies `partitions.csv` into the esp-idf-sys generated CMake project directory to work around an upstream path-resolution quirk. Flashing is via `espflash` over USB to the Heltec V4.
+- **Firmware** (`firmware/`) cross-compiles via the ESP Rust toolchain (`espup install --toolchain-version 1.87.0.0`) to `xtensa-esp32s3-espidf`. The `build.rs` copies `partitions.csv` into the esp-idf-sys generated CMake project directory to work around an upstream path-resolution quirk. Board selection is compile-time: the `heltec-v3` or `heltec-v4` cargo feature picks the right host-transport driver (UART0 + CP2102 on V3, native USB-Serial-JTAG on V4) and a matching `sdkconfig.defaults.<board>` fragment configures ESP-IDF's logging console. Use `scripts/build-firmware.sh {v3|v4}` so both move together. Flashing is via `espflash` over USB.
 - **Bridge** (`bridge/`) cross-compiles to `aarch64-unknown-linux-gnu` via the `cross` crate (Docker-based cross build from macOS). The binary gets scp'd to mypi and installed to `/usr/local/bin/heartwood-bridge`.
 - **Sapwood** (separate repo, `sapwood/`) builds as a Vite static site and gets rsync'd to `/opt/sapwood/dist` on mypi. The bridge's `--sapwood-dir` flag serves it from `/`.
 

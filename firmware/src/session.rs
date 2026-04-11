@@ -3,7 +3,7 @@
 // Bridge session management. The bridge authenticates with a shared secret
 // (stored in NVS at provision time), then pushes client policies.
 
-use esp_idf_hal::usb_serial::UsbSerialDriver;
+use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
 use heartwood_common::types::{
@@ -39,7 +39,7 @@ pub fn write_bridge_secret(
 /// against the value stored in NVS. On success we mark the policy engine as
 /// authenticated and reply with a SESSION_ACK (0x00 = success).
 pub fn handle_auth(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     payload: &[u8],
     nvs: &EspNvs<NvsDefault>,
     policy_engine: &mut PolicyEngine,
@@ -85,7 +85,7 @@ pub fn handle_auth(
 /// Requires a 2-second button hold to confirm — shown as a 30-second
 /// countdown on the OLED.
 pub fn handle_set_bridge_secret(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     payload: &[u8],
     nvs: &mut EspNvs<NvsDefault>,
     policy_engine: &PolicyEngine,

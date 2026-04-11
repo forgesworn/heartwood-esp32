@@ -1,6 +1,6 @@
 # Heartwood ESP32
 
-Hardware signing device for Nostr on a Heltec WiFi LoRa 32 V4 (ESP32-S3). Two modes from the same codebase:
+Hardware signing device for Nostr on a Heltec WiFi LoRa 32 (ESP32-S3). Both the V3 (CP2102 UART bridge) and V4 (native USB-Serial-JTAG) boards are supported from the same codebase via the `heltec-v3` / `heltec-v4` cargo features. See `firmware/src/serial.rs` for the transport abstraction. Two operating modes from the same codebase:
 
 - **HSM mode** (default) — USB-attached to Pi, holds master secret, all radios disabled
 - **Portable mode** — battery-powered, holds child key, BLE enabled for phone signing
@@ -62,22 +62,37 @@ Requires the ESP Rust toolchain for firmware: `espup install`, then `source ~/ex
 
 The nsec-tree derivation MUST match heartwood-core byte-for-byte. The test vector in `common/src/derive.rs` asserts this. The mnemonic derivation path (`m/44'/1237'/727'/0'/0'`) is tested in `provision/src/main.rs`. If derivation logic changes, update both repos.
 
-## GPIO pin assignments (Heltec V4)
+## GPIO pin assignments (Heltec V3 and V4)
+
+Common to both boards:
 
 | Function | GPIO | Verified |
 |----------|------|----------|
-| OLED SDA | 17 | Yes — Heltec factory test, Meshtastic |
-| OLED SCL | 18 | Yes — Heltec factory test, Meshtastic |
-| OLED RST | 21 | Yes — must stay HIGH after init or display blanks |
-| Vext (OLED power) | 36 | Yes — active LOW, must be set before I2C init |
-| White LED | 35 | Yes — active HIGH |
-| GNSS TX | 34 | Not yet used |
-| GNSS RX | 33 | Not yet used |
+| OLED SDA | 17 | Yes -- Heltec factory test, Meshtastic |
+| OLED SCL | 18 | Yes -- Heltec factory test, Meshtastic |
+| OLED RST | 21 | Yes -- must stay HIGH after init or display blanks |
+| Vext (OLED power) | 36 | Yes -- active LOW, must be set before I2C init |
+| White LED | 35 | Yes -- active HIGH |
+| PRG button | 0 | Active LOW, internal pull-up |
 | LoRa NSS | 8 | Not yet used |
 | LoRa RST | 12 | Not yet used |
 | LoRa DIO1 | 14 | Not yet used |
 
-**PSRAM uses GPIO 26–32.** Never drive those pins.
+Board-specific (host transport):
+
+| Board | Mechanism | GPIO |
+|-------|-----------|------|
+| V4 | Native USB-Serial-JTAG | 19 (D-), 20 (D+) |
+| V3 | UART0 via CP2102 bridge | 43 (TX), 44 (RX) |
+
+V4-only (not present on V3):
+
+| Function | GPIO | Verified |
+|----------|------|----------|
+| GNSS TX | 34 | Not yet used |
+| GNSS RX | 33 | Not yet used |
+
+**PSRAM uses GPIO 26-32 on the V4 (S3R2).** V3 (S3FN8) has no PSRAM. Never drive those pins on V4.
 
 ## Known issues
 

@@ -16,7 +16,7 @@
 // On any error the device sends OTA_STATUS(ERR_*) and the session is aborted.
 
 use esp_idf_hal::gpio::{Input, PinDriver};
-use esp_idf_hal::usb_serial::UsbSerialDriver;
+use crate::serial::SerialPort;
 use sha2::{Digest, Sha256};
 
 use crate::oled::Display;
@@ -58,7 +58,7 @@ unsafe impl Send for OtaSession {}
 /// partition and initialises an `OtaSession`.  Sends `OTA_STATUS(READY)` on
 /// success or an appropriate error code on failure.
 pub fn handle_ota_begin(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     payload: &[u8],
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
@@ -157,7 +157,7 @@ pub fn handle_ota_begin(
 /// writes the data to the inactive partition, feeds the SHA-256 hasher, and
 /// updates the OLED progress bar.  Sends `OTA_STATUS(CHUNK_OK)` on success.
 pub fn handle_ota_chunk(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     payload: &[u8],
     display: &mut Display<'_>,
     session: &mut Option<OtaSession>,
@@ -250,7 +250,7 @@ pub fn handle_ota_chunk(
 ///
 /// On hash mismatch: calls `esp_ota_abort` and sends `OTA_STATUS(ERR_HASH)`.
 pub fn handle_ota_finish(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     display: &mut Display<'_>,
     session: &mut Option<OtaSession>,
 ) {
@@ -327,7 +327,7 @@ pub fn handle_ota_finish(
 /// optional ASCII message (truncated to 63 bytes to fit within the frame).
 ///
 /// Payload layout: `[status_code: u8][message: ASCII...]`
-pub fn send_ota_status(usb: &mut UsbSerialDriver<'_>, code: u8, message: &str) {
+pub fn send_ota_status(usb: &mut SerialPort<'_>, code: u8, message: &str) {
     // Flush any pending VFS log output before writing the frame.
     unsafe { esp_idf_svc::sys::fsync(1); }
     std::thread::sleep(std::time::Duration::from_millis(50));

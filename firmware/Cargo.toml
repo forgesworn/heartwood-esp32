@@ -2,7 +2,16 @@
 name = "heartwood-esp32"
 version = "0.1.0"
 edition = "2021"
-description = "nsec-tree signing device firmware for Heltec WiFi LoRa 32 V4"
+description = "nsec-tree signing device firmware for Heltec WiFi LoRa 32 (V3 and V4)"
+
+[features]
+# Default build targets the Heltec V4 (native USB-Serial-JTAG on GPIO19/20).
+default = ["heltec-v4"]
+# Heltec WiFi LoRa 32 V4 -- USB-C wired to ESP32-S3 native USB pins.
+heltec-v4 = []
+# Heltec WiFi LoRa 32 V3 -- USB-C wired through a CP2102 bridge to UART0
+# (GPIO43 TX / GPIO44 RX). Mutually exclusive with heltec-v4.
+heltec-v3 = []
 
 [dependencies]
 heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend"] }

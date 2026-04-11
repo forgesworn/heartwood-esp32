@@ -1,0 +1,21 @@
+# Heltec WiFi LoRa 32 V3 board-specific sdkconfig overrides.
+#
+# USB-C is wired through a CP2102 USB-to-UART bridge chip to the ESP32-S3's
+# UART0 (GPIO43 TX / GPIO44 RX). The native USB pins (GPIO19/20) are NOT
+# connected to the USB-C port on this board. We drive UART0 via UartDriver.
+#
+# Console routing: the ESP-IDF console would normally go to UART0 (the
+# bootloader UART), but UART0 is the same peripheral that carries our frame
+# protocol. Allowing log lines to interleave with binary frames would force
+# every reader to constantly hunt for magic bytes and would corrupt OTA
+# transfers outright.
+#
+# We silence the console entirely on V3. The firmware continues to call
+# log::info!/warn!/error!, but ESP-IDF's backend drops the output instead of
+# writing to UART0. Bring logs back on a dev build by temporarily flipping
+# CONFIG_ESP_CONSOLE_UART_DEFAULT=y and wiring a separate UART1/UART2 to a
+# USB-UART probe on unused GPIOs.
+CONFIG_ESP_CONSOLE_NONE=y
+
+# Flash -- the V3 uses the ESP32-S3FN8 with 8MB in-package flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y

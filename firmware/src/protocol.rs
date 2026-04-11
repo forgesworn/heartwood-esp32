@@ -1,19 +1,20 @@
 // firmware/src/protocol.rs
 //
-// Serial frame reader/writer. Reads bytes from USB-Serial-JTAG,
-// assembles frames, and validates them using common::frame.
+// Serial frame reader/writer. Reads bytes from the board's host transport
+// (USB-Serial-JTAG on V4, UART0 via CP2102 on V3, abstracted behind
+// `SerialPort`), assembles frames, and validates them using common::frame.
 //
 // Frame format (defined in heartwood-common):
 //   [0x48 0x57] [type_u8] [length_u16_be] [payload...] [crc32_4]
 
 use esp_idf_hal::delay;
-use esp_idf_hal::usb_serial::UsbSerialDriver;
+use crate::serial::SerialPort;
 
 use heartwood_common::frame::{self, Frame};
 use heartwood_common::types::{MAGIC_BYTES, MAX_PAYLOAD_SIZE, FRAME_HEADER_SIZE};
 
 /// Read a single byte from the USB serial driver, blocking until available.
-fn read_byte(usb: &mut UsbSerialDriver<'_>) -> u8 {
+fn read_byte(usb: &mut SerialPort<'_>) -> u8 {
     let mut buf = [0u8; 1];
     loop {
         match usb.read(&mut buf, delay::BLOCK) {
@@ -27,7 +28,7 @@ fn read_byte(usb: &mut UsbSerialDriver<'_>) -> u8 {
 ///
 /// Returns `Some(byte)` if a byte arrived in time, `None` if the read timed
 /// out without receiving data.
-fn try_read_byte(usb: &mut UsbSerialDriver<'_>, timeout_ms: u32) -> Option<u8> {
+fn try_read_byte(usb: &mut SerialPort<'_>, timeout_ms: u32) -> Option<u8> {
     let mut buf = [0u8; 1];
     match usb.read(&mut buf, timeout_ms) {
         Ok(n) if n > 0 => Some(buf[0]),
@@ -40,7 +41,7 @@ fn try_read_byte(usb: &mut UsbSerialDriver<'_>, timeout_ms: u32) -> Option<u8> {
 ///
 /// Reads are chunked to the same limit as writes to avoid crashing the
 /// USB-Serial-JTAG driver with large buffer operations.
-fn read_exact(usb: &mut UsbSerialDriver<'_>, buf: &mut [u8]) {
+fn read_exact(usb: &mut SerialPort<'_>, buf: &mut [u8]) {
     /// Maximum bytes per `usb.read()` call — mirrors the write chunk limit.
     const MAX_CHUNK: usize = 512;
 
@@ -60,7 +61,7 @@ fn read_exact(usb: &mut UsbSerialDriver<'_>, buf: &mut [u8]) {
 /// (type + 16-bit big-endian length), reads the payload and CRC, then
 /// validates via [`frame::parse_frame`]. On any error the function logs a
 /// warning and resumes hunting from the current byte stream position.
-pub fn read_frame(usb: &mut UsbSerialDriver<'_>) -> Frame {
+pub fn read_frame(usb: &mut SerialPort<'_>) -> Frame {
     loop {
         // Step 1 — hunt for the first magic byte.
         let b = read_byte(usb);
@@ -133,7 +134,7 @@ pub fn read_frame(usb: &mut UsbSerialDriver<'_>) -> Frame {
 ///
 /// Returns `Some(Frame)` on success, `None` if no data arrived within the
 /// timeout window or if a partial/invalid frame was received.
-pub fn try_read_frame(usb: &mut UsbSerialDriver<'_>, idle_timeout_ms: u32) -> Option<Frame> {
+pub fn try_read_frame(usb: &mut SerialPort<'_>, idle_timeout_ms: u32) -> Option<Frame> {
     /// Once the first magic byte matches, allow this long for each subsequent
     /// byte before giving up. The bridge sends frames atomically so inter-byte
     /// gaps are negligible; 200 ms is generous enough to absorb scheduling jitter
@@ -205,10 +206,12 @@ pub fn try_read_frame(usb: &mut UsbSerialDriver<'_>, idle_timeout_ms: u32) -> Op
 /// link. Logs a warning if the payload exceeds `MAX_PAYLOAD_SIZE` or the
 /// underlying write fails.
 ///
-/// Writes are chunked to avoid crashing the USB-Serial-JTAG driver with
-/// large slices. The ESP-IDF driver's internal ring buffer is small; passing
-/// an 11KB+ slice in a single `write()` call causes a hard fault on ESP32-S3.
-pub fn write_frame(usb: &mut UsbSerialDriver<'_>, frame_type: u8, payload: &[u8]) {
+/// Writes are chunked to avoid crashing the underlying driver with large
+/// slices. On the V4 the USB-Serial-JTAG ring buffer is small; passing an
+/// 11KB+ slice in a single `write()` call has been observed to hard-fault on
+/// ESP32-S3. On the V3 the CP2102 UART path is more forgiving but we keep
+/// the same chunk size for consistency.
+pub fn write_frame(usb: &mut SerialPort<'_>, frame_type: u8, payload: &[u8]) {
     /// Maximum bytes per `usb.write()` call. The USB-Serial-JTAG TX FIFO is
     /// 64 bytes and the ESP-IDF ring buffer is typically 256 bytes, but we
     /// use a larger chunk to keep throughput reasonable while staying safe.
@@ -219,7 +222,7 @@ pub fn write_frame(usb: &mut UsbSerialDriver<'_>, frame_type: u8, payload: &[u8]
             let mut pos = 0;
             while pos < bytes.len() {
                 let end = (pos + MAX_CHUNK).min(bytes.len());
-                match usb.write(&bytes[pos..end], delay::BLOCK) {
+                match usb.write(&bytes[pos..end]) {
                     Ok(n) if n > 0 => pos += n,
                     Ok(_) => {}
                     Err(e) => {

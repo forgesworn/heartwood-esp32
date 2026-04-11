@@ -1,22 +1,33 @@
-# Heltec WiFi LoRa 32 V4 -- ESP32-S3
+# Shared sdkconfig defaults for the Heartwood ESP32 firmware.
+#
+# This file is the common base applied to every build. Board-specific
+# settings (console routing, flash size) live in the per-board fragments:
+#
+#   sdkconfig.defaults.heltec-v3  -- CP2102 UART bridge on UART0
+#   sdkconfig.defaults.heltec-v4  -- native USB-Serial-JTAG on GPIO19/20
+#
+# The active fragment is selected via the ESP_IDF_SDKCONFIG_DEFAULTS env
+# var, which is set either by .cargo/config.toml (default = heltec-v4) or
+# by the scripts/build-firmware.sh wrapper for a V3 build. Later files in
+# the semicolon-separated list override earlier ones -- see esp-idf-sys
+# BUILD-OPTIONS.md.
+
+# Chip target -- both Heltec V3 and V4 use the ESP32-S3.
 CONFIG_IDF_TARGET="esp32s3"
 
-# Flash size -- Heltec V4 has 8MB flash (some boards ship 16MB).
-# Partition table with dual 1.5MB OTA slots needs at least 4MB.
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# PSRAM disabled -- not needed for signing, avoids mode mismatch.
+# The V4 has 2MB quad-SPI PSRAM, the V3 has none. We never allocate into
+# PSRAM so leaving it off keeps one build profile valid for both boards.
 
-# PSRAM disabled — not needed for signing, avoids mode mismatch
-# (Heltec V4 has quad-SPI PSRAM but we don't use external RAM)
-
-# Large stack for k256 elliptic curve operations on Xtensa
+# Large stack for elliptic curve operations on Xtensa.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 
-# Disable task watchdog — provisioning blocks on stdin indefinitely
+# Disable task watchdog -- provisioning blocks on stdin indefinitely.
 # SECURITY NOTE: In production (post-provisioning), watchdog should be enabled
 # to recover from hung signing operations. Tracked as a known hardening item.
 CONFIG_ESP_TASK_WDT_INIT=n
 
-# OTA support
+# OTA support.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 # esp-idf-sys generates its CMake project at target/<triple>/<profile>/build/
@@ -28,7 +39,7 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../../../../partitions.csv"
 
 # SECURITY NOTE: NVS flash encryption is NOT enabled in this configuration.
-# Master private keys are stored in plaintext NVS — a physical flash dump
+# Master private keys are stored in plaintext NVS -- a physical flash dump
 # (JTAG in pre-fuse state or USB ROM mode) will expose key material.
 #
 # Production hardening (TODO):

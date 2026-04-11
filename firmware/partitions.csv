@@ -1,8 +1,9 @@
 # Name,    Type, SubType, Offset,   Size,   Flags
-# Heltec WiFi LoRa 32 V4 has 16MB flash; enlarged OTA slots give headroom
-# for firmware growth (SIGN_ENVELOPE, future NIP extensions, larger crypto
-# libraries). 1.5MB per OTA slot fits comfortably with the ~1MB current
-# firmware size and leaves room for ~50% expansion.
+# Partition layout shared between Heltec V3 (8MB flash, S3FN8) and V4 (8MB
+# or 16MB depending on variant, S3R2). Total partition usage is ~3.1MB so
+# both boards fit comfortably. 1.5MB per OTA slot gives headroom for
+# firmware growth (SIGN_ENVELOPE, future NIP extensions, larger crypto
+# libraries) over the ~1MB current firmware size, with ~50% expansion room.
 nvs,       data, nvs,     ,         0x4000,
 otadata,   data, ota,     ,         0x2000,
 phy_init,  data, phy,     ,         0x1000,

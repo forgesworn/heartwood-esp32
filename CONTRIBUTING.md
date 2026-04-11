@@ -9,7 +9,7 @@
   espup install
   source ~/export-esp.sh
   ```
-- Heltec WiFi LoRa 32 V4 board (for firmware development)
+- Heltec WiFi LoRa 32 V3 or V4 board (for firmware development)
 
 ## Setup
 
@@ -46,9 +46,25 @@ The frozen test vector in `common/src/derive.rs` MUST pass. Do not change expect
 
 ### Flashing for manual testing
 
+The firmware requires a board feature flag (`heltec-v3` or `heltec-v4`,
+default `heltec-v4`) plus a matching sdkconfig fragment. Use the wrapper
+script so both stay in sync:
+
+```bash
+./scripts/build-firmware.sh v4          # Heltec V4 (default)
+./scripts/build-firmware.sh v3          # Heltec V3
+espflash flash firmware/target/xtensa-esp32s3-espidf/debug/heartwood-esp32
+```
+
+Or the manual form if you need to pass additional cargo arguments:
+
 ```bash
 cd firmware
+# V4 (default feature)
 cargo build
+# V3 (must override ESP_IDF_SDKCONFIG_DEFAULTS and disable defaults)
+ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heltec-v3" \
+    cargo build --no-default-features --features heltec-v3
 espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
 ```
 
@@ -89,7 +105,7 @@ The nsec-tree derivation context string and the mnemonic derivation path (`m/44'
 
 ```
 common/       Shared crypto — derivation, NIP-44/04, NIP-46 types, frame protocol, policy types
-firmware/     ESP32 firmware — flash to the Heltec V4 device
+firmware/     ESP32 firmware -- flash to the Heltec V3 or V4 device (cargo feature selects board)
 provision/    Host CLI — push mnemonic or nsec to a freshly-flashed device
 sign-test/    End-to-end test harness — send NIP-46 requests over serial
 bridge/       Pi-side relay bridge — Nostr relays ↔ NIP-44 ↔ serial ↔ ESP32

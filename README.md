@@ -1,6 +1,6 @@
 # Heartwood ESP32
 
-A hardware signing device for Nostr, built on the **Heltec WiFi LoRa 32 V4** (ESP32-S3R2). Holds multi-master nsec material, signs on request, master private keys never leave the chip. OLED shows what you're signing, physical button to approve.
+A hardware signing device for Nostr, built on the **Heltec WiFi LoRa 32** (ESP32-S3). Both the V3 (ESP32-S3FN8, CP2102 UART bridge) and V4 (ESP32-S3R2, native USB-Serial-JTAG) boards are supported from the same codebase -- pick your board with a cargo feature at build time. Holds multi-master nsec material, signs on request, master private keys never leave the chip. OLED shows what you're signing, physical button to approve.
 
 For the full architecture walkthrough with sequence diagrams and trust-boundary analysis, see [**docs/architecture.md**](docs/architecture.md).
 
@@ -49,18 +49,17 @@ The nsec-tree hierarchy means each device gets its own branch. Compromise of a c
 
 | Component | Detail |
 |-----------|--------|
-| Board | Heltec WiFi LoRa 32 V4 |
-| Chip | ESP32-S3R2 (Xtensa LX7 dual-core, 240 MHz) |
-| PSRAM | 2MB quad-SPI |
-| Flash | 16MB |
+| Boards | Heltec WiFi LoRa 32 V3 and V4 (choose via cargo feature) |
+| Chip | ESP32-S3 -- V3 is S3FN8 (8MB flash, no PSRAM), V4 is S3R2 (2MB PSRAM, external flash) |
 | OLED | 128x64 SSD1306 (I2C: SDA=GPIO17, SCL=GPIO18, RST=GPIO21, addr 0x3C) |
-| GNSS | L76K (available for portable mode) |
-| LoRa | SX1262 (never initialised — no use case for signing) |
+| GNSS | L76K on V4 only (available for portable mode) |
+| LoRa | SX1262 (never initialised -- no use case for signing) |
 | WiFi | ESP32-S3 built-in (disabled in both modes) |
 | BLE | ESP32-S3 built-in (portable mode only) |
-| USB | USB-C (power + serial to Pi in HSM mode) |
+| USB-C (V4) | Wired direct to native USB-Serial-JTAG on GPIO19/20 |
+| USB-C (V3) | Wired through CP2102 bridge to UART0 on GPIO43/44 |
 | Battery | JST PH 2.0 connector + charging circuit (portable mode) |
-| Button | PRG button (signing approval) |
+| Button | PRG button on GPIO 0 (signing approval) |
 
 ## Setup
 
@@ -74,49 +73,85 @@ source ~/export-esp.sh
 
 ## Build
 
-Three independent crates — build each from its own directory:
+Three independent crates -- build each from its own directory:
 
 ```bash
 cd common && cargo test                    # shared crypto tests
 cd provision && cargo build                # host CLI tool
-cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain)
+cd firmware && cargo build                 # ESP32 firmware (V4 default)
 ```
+
+The firmware crate selects its board at compile time via the `heltec-v3` or
+`heltec-v4` cargo feature. The default is `heltec-v4`. To build for a V3,
+use the wrapper script so the matching sdkconfig fragment is picked up:
+
+```bash
+./scripts/build-firmware.sh v3 --release
+./scripts/build-firmware.sh v4 --release
+```
+
+Or the manual form:
+
+```bash
+cd firmware
+# V4 (default)
+cargo build --release
+# V3
+ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heltec-v3" \
+    cargo build --release --no-default-features --features heltec-v3
+```
+
+The wrapper script also writes a board-tagged ELF copy to
+`target/heartwood-v3.elf` or `target/heartwood-v4.elf` so you cannot
+accidentally flash the wrong binary onto the wrong hardware.
 
 ## Flash & provision
 
 ### Direct flash (USB cable to build machine)
 
 ```bash
-cd firmware && cargo build --release
-espflash flash target/xtensa-esp32s3-espidf/release/heartwood-esp32
+# Heltec V4 (default, native USB CDC, enumerates as /dev/ttyACM*)
+./scripts/build-firmware.sh v4 --release
+espflash flash firmware/target/xtensa-esp32s3-espidf/release/heartwood-esp32
+
+# Heltec V3 (CP2102 bridge, typically enumerates as /dev/ttyUSB* or /dev/cu.usbserial-*)
+./scripts/build-firmware.sh v3 --release
+espflash flash firmware/target/xtensa-esp32s3-espidf/release/heartwood-esp32
 ```
 
 **Always use `--release`** -- debug builds (~2.2MB) exceed the 1.5MB OTA partition.
 
 ### Remote flash via esptool (ESP32 attached to a Pi)
 
-Build the app binary locally, transfer it, and flash with esptool on the Pi:
+Build the app binary locally, transfer it, and flash with esptool on the Pi.
+
+**Serial port naming depends on the board.** V4 enumerates as USB CDC
+(`/dev/ttyACM0` on Linux) because it uses the ESP32-S3's native USB. V3
+goes through a CP2102 UART bridge and enumerates as `/dev/ttyUSB0`.
+Substitute the right path in the commands below.
 
 ```bash
 # Build and convert to app binary (0xE9 format, not raw ELF)
-cd firmware && cargo build --release
-espflash save-image --chip esp32s3 target/xtensa-esp32s3-espidf/release/heartwood-esp32 /tmp/heartwood-esp32.bin
+./scripts/build-firmware.sh v4 --release      # or: v3
+espflash save-image --chip esp32s3 firmware/target/xtensa-esp32s3-espidf/release/heartwood-esp32 /tmp/heartwood-esp32.bin
 
 # Transfer to the Pi
 scp /tmp/heartwood-esp32.bin pi-host:/tmp/
 
-# On the Pi: stop any process holding the serial port, then flash
+# On the Pi: stop any process holding the serial port, then flash.
+# PORT=/dev/ttyACM0 for V4, PORT=/dev/ttyUSB0 for V3.
+PORT=/dev/ttyACM0
 sudo systemctl stop <heartwood-services>
-sudo fuser -k /dev/ttyACM0
-python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --before default-reset \
+sudo fuser -k "$PORT"
+python3 -m esptool --chip esp32s3 --port "$PORT" --before default-reset \
   write-flash 0x10000 /tmp/heartwood-esp32.bin
 
 # Erase otadata to force boot from ota_0
-python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --before default-reset \
+python3 -m esptool --chip esp32s3 --port "$PORT" --before default-reset \
   erase-region 0xd000 0x2000
 ```
 
-**Important:** if any daemon holds `/dev/ttyACM0`, the flash will fail mid-write. Use `systemctl mask` (not just `stop`) if services auto-restart, and stop `ModemManager` which probes new serial devices on USB re-enumeration.
+**Important:** if any daemon holds the serial port, the flash will fail mid-write. Use `systemctl mask` (not just `stop`) if services auto-restart, and stop `ModemManager` which probes new serial devices on USB re-enumeration.
 
 ### OTA update (over serial, device already running)
 
@@ -124,7 +159,8 @@ python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --before default-reset \
 # Stop the daemon holding the serial port
 sudo systemctl stop <heartwood-service>
 
-# Flash via OTA (requires button approval on the device -- hold 2s)
+# Flash via OTA (requires button approval on the device -- hold 2s).
+# PORT=/dev/ttyACM0 for V4, PORT=/dev/ttyUSB0 for V3.
 heartwood-ota --port /dev/ttyACM0 --firmware /tmp/heartwood-esp32.bin
 
 # Restart the daemon
@@ -168,9 +204,11 @@ npub = bech32_encode("npub", child_pubkey)
 
 Verified against Heltec factory test code, Meshtastic firmware, and ESPHome configs:
 
-- **GPIO 17, 18, 21** — confirmed correct for the V4 OLED. No conflict with PSRAM/flash.
-- **PSRAM pins** on ESP32-S3R2 are GPIO 26–32 (quad-SPI). Nowhere near our I2C pins.
-- **GPIO 33–37** are free on this board (only reserved on octal PSRAM variants like S3R8).
+- **GPIO 17, 18, 21** -- OLED I2C, shared wiring on both V3 and V4.
+- **GPIO 19, 20** -- native USB D-/D+ on V4. Not wired to USB-C on V3, so `UsbSerialDriver` will never enumerate on V3; the V3 code path uses UART0 instead.
+- **GPIO 43, 44** -- UART0 TX/RX on both boards, but only V3 has them wired through to the USB-C port via the CP2102 bridge.
+- **PSRAM pins** on ESP32-S3R2 (V4 only) are GPIO 26-32 (quad-SPI). Nowhere near our I2C pins. The V3 has no PSRAM.
+- **GPIO 33-37** are free on both boards (only reserved on octal PSRAM variants like S3R8).
 
 ## Structure
 

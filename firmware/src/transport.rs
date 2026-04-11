@@ -10,7 +10,7 @@
 // USB-Serial-JTAG buffers).
 
 use esp_idf_hal::gpio::{Input, PinDriver};
-use esp_idf_hal::usb_serial::UsbSerialDriver;
+use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use secp256k1::{Secp256k1, SignOnly};
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use crate::protocol;
 /// event JSON is returned as a 0x35 (SIGN_ENVELOPE_RESPONSE) frame.
 /// The daemon publishes it directly — no SIGN_ENVELOPE round-trip.
 pub fn handle_encrypted_request(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     frame: &Frame,
     masters: &[LoadedMaster],
     secp: &Arc<Secp256k1<SignOnly>>,
@@ -252,7 +252,7 @@ const NIP46_ENVELOPE_KIND: u64 = 24133;
 /// re-encryption step or an equivalent bridge-side encryption, so it is
 /// already ASCII).
 pub fn handle_sign_envelope(
-    usb: &mut UsbSerialDriver<'_>,
+    usb: &mut SerialPort<'_>,
     frame: &Frame,
     masters: &[LoadedMaster],
     secp: &Arc<Secp256k1<SignOnly>>,

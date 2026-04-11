@@ -1,0 +1,18 @@
+# Heltec WiFi LoRa 32 V4 board-specific sdkconfig overrides.
+#
+# USB-C is wired directly to the ESP32-S3 native USB pins (GPIO19 D-,
+# GPIO20 D+). We drive the chip's USB-Serial-JTAG peripheral via
+# UsbSerialDriver. Logging goes to the same peripheral by default, which is
+# fine: the frame reader hunts for magic bytes so interleaved log lines are
+# parsed as noise and skipped. The OTA path explicitly silences logging to
+# avoid corrupting chunk transfer.
+#
+# Flash -- Heltec V4 typically ships with 16MB external flash (ESP32-S3R2),
+# but 8MB is a safe floor and matches the partition table. Leaving the flash
+# size at 8MB means a V4 with a 16MB variant simply under-uses the remaining
+# space.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# Route ESP-IDF's console to USB-Serial-JTAG (the default on S3 when
+# available). This is the same peripheral UsbSerialDriver talks to.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

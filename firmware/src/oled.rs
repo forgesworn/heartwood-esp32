@@ -1,6 +1,9 @@
 // firmware/src/oled.rs
 //
-// OLED display helpers for the Heltec V4 built-in SSD1306 (128x64).
+// OLED display helpers for the Heltec V3/V4 built-in SSD1306 (128x64).
+// Both boards wire the display to I2C on GPIO17 (SDA) / GPIO18 (SCL) with
+// reset on GPIO21 and Vext power on GPIO36 (active low), so this module is
+// hardware-identical between boards.
 
 use embedded_graphics::mono_font::ascii::{FONT_5X8, FONT_6X10, FONT_7X14, FONT_10X20};
 use embedded_graphics::mono_font::MonoTextStyle;

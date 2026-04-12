@@ -64,6 +64,12 @@ pub const FRAME_TYPE_CONNSLOT_REVOKE_RESP: u8 = 0x47;      // device -> host: ok
 pub const FRAME_TYPE_CONNSLOT_URI: u8 = 0x48;              // host -> device: master_slot (1) + slot_index (1) + relay_urls (JSON)
 pub const FRAME_TYPE_CONNSLOT_URI_RESP: u8 = 0x49;         // device -> host: complete bunker:// URI with secret
 
+// --- Phase 7: backup/restore ---
+pub const FRAME_TYPE_BACKUP_EXPORT_REQUEST: u8 = 0x50;   // host -> device: empty payload
+pub const FRAME_TYPE_BACKUP_EXPORT_RESPONSE: u8 = 0x51;  // device -> host: JSON BackupPayload
+pub const FRAME_TYPE_BACKUP_IMPORT_REQUEST: u8 = 0x52;   // host -> device: JSON BackupPayload (matched masters only)
+pub const FRAME_TYPE_BACKUP_IMPORT_RESPONSE: u8 = 0x53;  // device -> host: 0x01 success / 0x00 failure
+
 // --- OTA frame types ---
 pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;
 pub const FRAME_TYPE_OTA_CHUNK: u8 = 0x31;

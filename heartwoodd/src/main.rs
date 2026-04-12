@@ -17,6 +17,7 @@
 // or overridden with --mode <soft|hard|auto>.
 
 mod api;
+mod backup;
 mod backend;
 mod relay;
 mod serial;

@@ -21,6 +21,7 @@ urlencoding = "2"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 sha2 = "0.10"
+hmac = "0.12"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 uuid = { version = "1", features = ["v4"] }

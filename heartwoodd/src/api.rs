@@ -234,12 +234,14 @@ async fn create_slot(
     Path(master): Path<u8>,
     Json(body): Json<CreateSlotBody>,
 ) -> Response {
+    let snapshot_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         state.backend.create_slot(master, &body.label)
     }).await.unwrap();
 
     match result {
         Ok(slot) => {
+            trigger_auto_snapshot(snapshot_state);
             (StatusCode::CREATED, [(header::CONTENT_TYPE, "application/json")],
                 serde_json::to_vec(&slot).unwrap_or_default()).into_response()
         }
@@ -253,6 +255,7 @@ async fn update_slot(
     Path((master, index)): Path<(u8, u8)>,
     Json(body): Json<UpdateSlotBody>,
 ) -> Response {
+    let snapshot_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let patch = serde_json::to_value(&body).unwrap_or(serde_json::Value::Object(Default::default()));
         state.backend.update_slot(master, index, patch)
@@ -260,6 +263,7 @@ async fn update_slot(
 
     match result {
         Ok(slot) => {
+            trigger_auto_snapshot(snapshot_state);
             (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
                 serde_json::to_vec(&slot).unwrap_or_default()).into_response()
         }
@@ -272,12 +276,14 @@ async fn delete_slot(
     State(state): State<AppState>,
     Path((master, index)): Path<(u8, u8)>,
 ) -> Response {
+    let snapshot_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         state.backend.revoke_slot(master, index)
     }).await.unwrap();
 
     match result {
         Ok(slot) => {
+            trigger_auto_snapshot(snapshot_state);
             (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
                 serde_json::to_vec(&slot).unwrap_or_default()).into_response()
         }
@@ -522,6 +528,39 @@ async fn put_backup_passphrase(
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(e) => backend_to_http(e),
     }
+}
+
+/// Fire-and-forget: export a fresh backup after a slot-modifying operation.
+/// Runs in a background tokio task. Errors are logged, not propagated.
+fn trigger_auto_snapshot(state: AppState) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut payload = state.backend.backup_export()?;
+            payload.created_at = crate::backup::unix_now();
+
+            let token = state.api_token.as_deref().map(|s| s.as_str()).unwrap_or("");
+            let passphrase = crate::backup::read_passphrase(&state.passphrase_path, token)
+                .map_err(|e| BackendError::Internal(format!("read passphrase: {e}")))?;
+
+            let envelope = crate::backup::encrypt_backup(
+                &payload,
+                &passphrase,
+                crate::backup::DEFAULT_M_COST,
+                crate::backup::DEFAULT_T_COST,
+                crate::backup::DEFAULT_P_COST,
+            ).map_err(|e| BackendError::Internal(format!("encrypt: {e}")))?;
+
+            crate::backup::write_backup(&state.backup_path, &envelope)
+                .map_err(|e| BackendError::Internal(format!("write: {e}")))?;
+
+            Ok::<_, BackendError>(())
+        }).await.unwrap();
+
+        match result {
+            Ok(()) => log::info!("Auto-snapshot: backup saved"),
+            Err(e) => log::warn!("Auto-snapshot failed: {e}"),
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

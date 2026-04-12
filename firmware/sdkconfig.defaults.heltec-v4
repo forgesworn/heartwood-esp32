@@ -2,17 +2,18 @@
 #
 # USB-C is wired directly to the ESP32-S3 native USB pins (GPIO19 D-,
 # GPIO20 D+). We drive the chip's USB-Serial-JTAG peripheral via
-# UsbSerialDriver. Logging goes to the same peripheral by default, which is
-# fine: the frame reader hunts for magic bytes so interleaved log lines are
-# parsed as noise and skipped. The OTA path explicitly silences logging to
-# avoid corrupting chunk transfer.
+# UsbSerialDriver for the binary frame protocol.
+#
+# IMPORTANT: Console must NOT be routed to USB-Serial-JTAG. The VFS console
+# driver and UsbSerialDriver both write to the same hardware TX FIFO and
+# their bytes interleave, corrupting frame data. The ESP-IDF default for S3
+# is UART0 (GPIO43/44), which is not connected to USB-C on the V4 -- log
+# output simply goes nowhere, keeping the USB-Serial-JTAG channel clean for
+# frame data. This is the correct behaviour for a device that uses the USB
+# link exclusively for a binary protocol.
 #
 # Flash -- Heltec V4 typically ships with 16MB external flash (ESP32-S3R2),
 # but 8MB is a safe floor and matches the partition table. Leaving the flash
 # size at 8MB means a V4 with a 16MB variant simply under-uses the remaining
 # space.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
-
-# Route ESP-IDF's console to USB-Serial-JTAG (the default on S3 when
-# available). This is the same peripheral UsbSerialDriver talks to.
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

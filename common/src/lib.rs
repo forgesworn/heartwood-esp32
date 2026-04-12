@@ -6,6 +6,9 @@ pub mod types;
 pub mod validate;
 
 #[cfg(feature = "nip46")]
+pub mod backup;
+
+#[cfg(feature = "nip46")]
 pub mod nip46;
 
 #[cfg(feature = "nip44")]

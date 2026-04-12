@@ -507,6 +507,8 @@ async fn main() -> Result<()> {
         }),
         log_tx: log_tx.clone(),
         api_token: cli.api_token.clone().map(Arc::new),
+        backup_path: std::path::PathBuf::from(&cli.data_dir).join("backup.json"),
+        passphrase_path: std::path::PathBuf::from(&cli.data_dir).join("backup-passphrase.json"),
     };
 
     let enable_cors = cli.cors || cli.sapwood_dir.is_none();

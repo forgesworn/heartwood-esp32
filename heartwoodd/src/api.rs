@@ -33,6 +33,10 @@ pub struct AppState {
     /// Optional bearer token. When Some, protected /api/* routes require
     /// `Authorization: Bearer <token>`. When None, the API is open.
     pub api_token: Option<Arc<String>>,
+    /// Path to the backup file (e.g. /var/lib/heartwood/backup.json).
+    pub backup_path: std::path::PathBuf,
+    /// Path to the passphrase file (e.g. /var/lib/heartwood/backup-passphrase.json).
+    pub passphrase_path: std::path::PathBuf,
 }
 
 pub struct DaemonInfo {
@@ -98,6 +102,12 @@ struct CreateMasterBody {
 #[derive(Deserialize)]
 struct ApprovalAction {
     action: String,
+}
+
+#[derive(Deserialize)]
+struct ChangePassphraseBody {
+    old_passphrase: String,
+    new_passphrase: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +366,164 @@ async fn daemon_restart() -> Response {
     Json(OkResponse { ok: true }).into_response()
 }
 
+/// Protected: download the latest auto-snapshot backup file.
+async fn get_backup(State(state): State<AppState>) -> Response {
+    if !state.backup_path.exists() {
+        return api_err(StatusCode::NOT_FOUND, "no backup exists yet");
+    }
+    match std::fs::read(&state.backup_path) {
+        Ok(data) => {
+            (StatusCode::OK,
+             [(header::CONTENT_TYPE, "application/json"),
+              (header::CONTENT_DISPOSITION, "attachment; filename=\"heartwood-backup.json\"")],
+             data).into_response()
+        }
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("read backup: {e}")),
+    }
+}
+
+/// Protected: trigger a fresh export, encrypt with the stored passphrase, save to disk, and return.
+async fn post_backup_export(State(state): State<AppState>) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut payload = state.backend.backup_export()?;
+        payload.created_at = crate::backup::unix_now();
+
+        let token = state.api_token.as_deref().map(|s| s.as_str()).unwrap_or("");
+        let passphrase = crate::backup::read_passphrase(&state.passphrase_path, token)
+            .map_err(|e| BackendError::Internal(format!("read passphrase: {e}")))?;
+
+        let envelope = crate::backup::encrypt_backup(
+            &payload,
+            &passphrase,
+            crate::backup::DEFAULT_M_COST,
+            crate::backup::DEFAULT_T_COST,
+            crate::backup::DEFAULT_P_COST,
+        ).map_err(|e| BackendError::Internal(format!("encrypt backup: {e}")))?;
+
+        crate::backup::write_backup(&state.backup_path, &envelope)
+            .map_err(|e| BackendError::Internal(format!("write backup: {e}")))?;
+
+        let json = serde_json::to_vec(&envelope)
+            .map_err(|e| BackendError::Internal(format!("serialise envelope: {e}")))?;
+        Ok::<_, BackendError>(json)
+    }).await.unwrap();
+
+    match result {
+        Ok(data) => {
+            (StatusCode::OK,
+             [(header::CONTENT_TYPE, "application/json"),
+              (header::CONTENT_DISPOSITION, "attachment; filename=\"heartwood-backup.json\"")],
+             data).into_response()
+        }
+        Err(e) => backend_to_http(e),
+    }
+}
+
+/// Protected: upload an encrypted backup, decrypt it, and import matching masters into the device.
+async fn post_backup_import(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let data = body.to_vec();
+    let result = tokio::task::spawn_blocking(move || {
+        let envelope: crate::backup::BackupEnvelope = serde_json::from_slice(&data)
+            .map_err(|e| BackendError::Internal(format!("parse backup: {e}")))?;
+
+        let token = state.api_token.as_deref().map(|s| s.as_str()).unwrap_or("");
+        let passphrase = crate::backup::read_passphrase(&state.passphrase_path, token)
+            .map_err(|e| BackendError::Internal(format!("read passphrase: {e}")))?;
+
+        let payload = crate::backup::decrypt_backup(&envelope, &passphrase)
+            .map_err(|e| BackendError::Internal(e))?;
+
+        // Match backup masters against device masters.
+        let device_masters = state.backend.list_masters()?;
+        let mut matched_payload = payload.clone();
+        let mut match_report = Vec::new();
+
+        matched_payload.masters.retain(|bm| {
+            let matched = device_masters.iter().any(|dm| {
+                dm.get("pubkey").and_then(|v| v.as_str()) == Some(&bm.pubkey)
+            });
+            match_report.push(serde_json::json!({
+                "slot": bm.slot,
+                "label": bm.label,
+                "matched": matched,
+                "slot_count": bm.connection_slots.len(),
+            }));
+            matched
+        });
+
+        state.backend.backup_import(&matched_payload)?;
+
+        Ok::<_, BackendError>(serde_json::json!({
+            "ok": true,
+            "masters": match_report,
+        }))
+    }).await.unwrap();
+
+    match result {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => backend_to_http(e),
+    }
+}
+
+/// Protected: return backup metadata without decrypting the envelope.
+async fn get_backup_status(State(state): State<AppState>) -> Response {
+    match crate::backup::backup_status(&state.backup_path) {
+        Some(status) => Json(serde_json::json!({
+            "version": status.version,
+            "last_modified": status.last_modified,
+        })).into_response(),
+        None => api_err(StatusCode::NOT_FOUND, "no backup exists yet"),
+    }
+}
+
+/// Protected: change the backup passphrase, re-encrypting the existing backup if present.
+async fn put_backup_passphrase(
+    State(state): State<AppState>,
+    Json(body): Json<ChangePassphraseBody>,
+) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        let token = state.api_token.as_deref().map(|s| s.as_str()).unwrap_or("");
+
+        // Verify old passphrase.
+        let stored = crate::backup::read_passphrase(&state.passphrase_path, token)
+            .map_err(|e| BackendError::Internal(format!("read passphrase: {e}")))?;
+        if stored != body.old_passphrase {
+            return Err(BackendError::Internal("old passphrase does not match".to_string()));
+        }
+
+        // Re-encrypt existing backup with new passphrase if one exists.
+        if state.backup_path.exists() {
+            let envelope = crate::backup::read_backup(&state.backup_path)
+                .map_err(|e| BackendError::Internal(e))?;
+            let payload = crate::backup::decrypt_backup(&envelope, &stored)
+                .map_err(|e| BackendError::Internal(e))?;
+            let new_envelope = crate::backup::encrypt_backup(
+                &payload,
+                &body.new_passphrase,
+                crate::backup::DEFAULT_M_COST,
+                crate::backup::DEFAULT_T_COST,
+                crate::backup::DEFAULT_P_COST,
+            ).map_err(|e| BackendError::Internal(e))?;
+            crate::backup::write_backup(&state.backup_path, &new_envelope)
+                .map_err(|e| BackendError::Internal(e))?;
+        }
+
+        // Store new passphrase.
+        crate::backup::write_passphrase(&state.passphrase_path, &body.new_passphrase, token)
+            .map_err(|e| BackendError::Internal(e))?;
+
+        Ok::<_, BackendError>(())
+    }).await.unwrap();
+
+    match result {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => backend_to_http(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket log streaming
 // ---------------------------------------------------------------------------
@@ -495,6 +663,11 @@ pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> 
         .route("/api/lock", post(post_lock))
         .route("/api/approvals", get(get_approvals))
         .route("/api/approvals/{id}", post(post_approval))
+        .route("/api/backup", get(get_backup))
+        .route("/api/backup/export", post(post_backup_export))
+        .route("/api/backup/import", post(post_backup_import))
+        .route("/api/backup/status", get(get_backup_status))
+        .route("/api/backup/passphrase", put(put_backup_passphrase))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_bearer));
 
     // Public routes:

@@ -76,3 +76,119 @@ pub fn handle_export(
         }
     }
 }
+
+/// Handle BACKUP_IMPORT_REQUEST (0x52).
+///
+/// Receives a BackupPayload JSON with pre-matched masters (heartwoodd
+/// already filtered to only include masters whose pubkeys match the
+/// device's current provisioned masters). Shows a summary on the OLED,
+/// waits for physical button confirmation, then writes to NVS.
+pub fn handle_import(
+    usb: &mut SerialPort<'_>,
+    payload_bytes: &[u8],
+    loaded_masters: &[LoadedMaster],
+    policy_engine: &mut PolicyEngine,
+    nvs: &mut EspNvs<NvsDefault>,
+    display: &mut crate::oled::Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) {
+    // Parse the backup payload.
+    let backup: BackupPayload = match serde_json::from_slice(payload_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("Backup import: invalid JSON: {e}");
+            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+            return;
+        }
+    };
+
+    // Count total slots to restore.
+    let total_slots: usize = backup.masters.iter()
+        .map(|m| m.connection_slots.len())
+        .sum();
+
+    if total_slots == 0 && backup.bridge_secret.is_empty() {
+        log::warn!("Backup import: nothing to restore");
+        protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+        return;
+    }
+
+    // Check if any existing slots will be overwritten.
+    let has_existing: bool = backup.masters.iter().any(|bm| {
+        !policy_engine.list_slots(bm.slot).is_empty()
+    });
+
+    // Show summary on OLED and wait for button confirmation.
+    let prompt = if has_existing {
+        format!("Restore {} slots?\n(overwrites)", total_slots)
+    } else {
+        format!("Restore {} slots?", total_slots)
+    };
+
+    let result = crate::approval::run_approval_loop(
+        display,
+        button_pin,
+        30,
+        |d, remaining| {
+            let msg = format!("{}\n{}s", prompt, remaining);
+            crate::oled::show_error(d, &msg);
+        },
+    );
+
+    if !matches!(result, crate::approval::ApprovalResult::Approved) {
+        log::info!("Backup import denied by user");
+        protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+        return;
+    }
+
+    // Write connection slots to the policy engine and persist to NVS.
+    for backup_master in &backup.masters {
+        // Verify this master is actually provisioned on the device.
+        let device_master = loaded_masters.iter().find(|m| {
+            let device_pubkey_hex = hex_encode(&m.pubkey);
+            device_pubkey_hex == backup_master.pubkey
+        });
+
+        if device_master.is_none() {
+            log::warn!(
+                "Backup import: skipping master slot {} -- not provisioned on device",
+                backup_master.slot
+            );
+            continue;
+        }
+
+        let device_slot = device_master.unwrap().slot;
+
+        // Replace all slots for this master with the backup data.
+        let slots = policy_engine.slots_mut(device_slot);
+        slots.clear();
+        slots.extend(backup_master.connection_slots.clone());
+        policy_engine.slots_dirty = true;
+        policy_engine.persist_slots(nvs, device_slot);
+
+        log::info!(
+            "Backup import: restored {} slots for master slot {}",
+            backup_master.connection_slots.len(),
+            device_slot
+        );
+    }
+
+    // Restore bridge secret if present.
+    if backup.bridge_secret.len() == 64 {
+        if let Ok(secret_bytes) = heartwood_common::hex::hex_decode(&backup.bridge_secret) {
+            if secret_bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&secret_bytes);
+                match session::write_bridge_secret(nvs, &arr) {
+                    Ok(()) => log::info!("Backup import: bridge secret restored"),
+                    Err(e) => log::error!("Backup import: failed to write bridge secret: {e}"),
+                }
+            }
+        }
+    }
+
+    log::info!("Backup import complete");
+    crate::oled::show_error(display, "Restore\ncomplete!");
+    esp_idf_hal::delay::FreeRtos::delay_ms(1500);
+    protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x01]);
+}

@@ -720,6 +720,19 @@ fn main() {
                 );
             }
 
+            // 0x52 -- backup import (restore slots + bridge secret)
+            FRAME_TYPE_BACKUP_IMPORT_REQUEST => {
+                backup::handle_import(
+                    &mut usb,
+                    &frame.payload,
+                    &loaded_masters,
+                    &mut policy_engine,
+                    &mut nvs,
+                    &mut display,
+                    &button_pin,
+                );
+            }
+
             // 0x30 -- OTA begin (sends size + expected SHA-256, triggers approval)
             FRAME_TYPE_OTA_BEGIN => {
                 ota::handle_ota_begin(

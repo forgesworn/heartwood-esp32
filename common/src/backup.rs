@@ -22,14 +22,19 @@ pub struct BackupMaster {
 }
 
 /// The complete backup payload (plaintext, before encryption).
+///
+/// SECURITY: this struct contains the bridge secret in plaintext.
+/// It must only exist in memory or inside an encrypted backup envelope.
+/// Never serialise to disk, logs, or the wire without encrypting first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupPayload {
     /// Unix timestamp (seconds) when the backup was created.
     pub created_at: u64,
-    /// SHA-256(bridge_secret) hex -- non-secret device fingerprint.
+    /// Hex-encoded SHA-256 of the bridge secret -- non-secret device fingerprint.
     pub device_id: String,
     pub masters: Vec<BackupMaster>,
-    /// Hex-encoded bridge secret (64 chars).
+    /// Hex-encoded bridge secret (64 chars). Included so the Pi-ESP32 link
+    /// can be restored without re-pairing. Encrypted at rest in the backup envelope.
     pub bridge_secret: String,
 }
 

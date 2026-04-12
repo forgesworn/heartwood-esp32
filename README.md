@@ -1,5 +1,7 @@
 # Heartwood ESP32
 
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/TheCryptoDonkey?logo=githubsponsors&color=ea4aaa&label=Sponsor)](https://github.com/sponsors/TheCryptoDonkey)
+
 A hardware signing device for Nostr, built on the **Heltec WiFi LoRa 32** (ESP32-S3). Both the V3 (ESP32-S3FN8, CP2102 UART bridge) and V4 (ESP32-S3R2, native USB-Serial-JTAG) boards are supported from the same codebase -- pick your board with a cargo feature at build time. Holds multi-master nsec material, signs on request, master private keys never leave the chip. OLED shows what you're signing, physical button to approve.
 
 For the full architecture walkthrough with sequence diagrams and trust-boundary analysis, see [**docs/architecture.md**](docs/architecture.md).

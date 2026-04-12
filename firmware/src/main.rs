@@ -32,6 +32,7 @@ compile_error!(
 );
 
 mod approval;
+mod backup;
 mod button;
 mod identity_cache;
 mod masters;
@@ -79,6 +80,7 @@ use heartwood_common::types::{
     FRAME_TYPE_CONNSLOT_UPDATE, FRAME_TYPE_CONNSLOT_UPDATE_RESP,
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_REVOKE_RESP,
     FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_CONNSLOT_URI_RESP,
+    FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
 };
 use secp256k1::Secp256k1;
 
@@ -706,6 +708,16 @@ fn main() {
                         }
                     }
                 }
+            }
+
+            // 0x50 -- backup export (dump all slots + bridge secret)
+            FRAME_TYPE_BACKUP_EXPORT_REQUEST => {
+                backup::handle_export(
+                    &mut usb,
+                    &loaded_masters,
+                    &policy_engine,
+                    &nvs,
+                );
             }
 
             // 0x30 -- OTA begin (sends size + expected SHA-256, triggers approval)

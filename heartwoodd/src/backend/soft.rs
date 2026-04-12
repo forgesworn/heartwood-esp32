@@ -1051,6 +1051,70 @@ impl SigningBackend for SoftBackend {
     fn ota_upload(&self, _firmware: &[u8]) -> Result<(), BackendError> {
         Err(BackendError::NotSupported)
     }
+
+    // -- Backup/restore -------------------------------------------------------
+
+    fn backup_export(&self) -> Result<heartwood_common::backup::BackupPayload, BackendError> {
+        use heartwood_common::backup::{BackupMaster, BackupPayload};
+
+        let guard = self.state.read().expect("state lock poisoned");
+        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+
+        let mut masters = Vec::new();
+        for m in &state.keystore.masters {
+            let secret = hex_to_32(&m.secret_key)
+                .map_err(|e| BackendError::Internal(format!("master secret: {e}")))?;
+            let pubkey_bytes = derive_x_only_bytes(&secret)
+                .map_err(|e| BackendError::Internal(format!("derive pubkey: {e}")))?;
+            let pubkey_hex = hex_encode(&pubkey_bytes);
+
+            masters.push(BackupMaster {
+                slot: m.slot,
+                label: m.label.clone(),
+                // Soft mode always uses mode=0 (Bunker equivalent) as the provisioning mode.
+                mode: 0,
+                pubkey: pubkey_hex,
+                connection_slots: m.connection_slots.clone(),
+            });
+        }
+
+        Ok(BackupPayload {
+            created_at: 0,
+            device_id: String::new(),
+            bridge_secret: String::new(),
+            masters,
+        })
+    }
+
+    fn backup_import(
+        &self,
+        payload: &heartwood_common::backup::BackupPayload,
+    ) -> Result<(), BackendError> {
+        let path = self.keyfile_path();
+        let mut guard = self.state.write().expect("state lock poisoned");
+        let state = guard.as_mut().ok_or(BackendError::Locked)?;
+
+        for backup_master in &payload.masters {
+            // Find the matching device master by derived pubkey.
+            let matched = state.keystore.masters.iter_mut().find(|m| {
+                let secret = match hex_to_32(&m.secret_key) {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                let pk = match derive_x_only_bytes(&secret) {
+                    Ok(p) => p,
+                    Err(_) => return false,
+                };
+                hex_encode(&pk) == backup_master.pubkey
+            });
+
+            if let Some(device_master) = matched {
+                device_master.connection_slots = backup_master.connection_slots.clone();
+            }
+        }
+
+        Self::persist(state, &path)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -188,6 +188,19 @@ pub trait SigningBackend: Send + Sync {
     /// Upload new firmware bytes. Applies via serial OTA (Hard mode) or is
     /// not supported (Soft mode).
     fn ota_upload(&self, firmware: &[u8]) -> Result<(), BackendError>;
+
+    // -- Backup/restore -------------------------------------------------------
+
+    /// Export all connection slots, master metadata, and bridge secret
+    /// as a BackupPayload. Used by the backup service.
+    fn backup_export(&self) -> Result<heartwood_common::backup::BackupPayload, BackendError>;
+
+    /// Import a BackupPayload, writing slots and bridge secret to the
+    /// device. In Hard mode, requires physical button confirmation.
+    fn backup_import(
+        &self,
+        payload: &heartwood_common::backup::BackupPayload,
+    ) -> Result<(), BackendError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +269,14 @@ mod tests {
         }
 
         fn ota_upload(&self, _firmware: &[u8]) -> Result<(), BackendError> {
+            Err(BackendError::NotSupported)
+        }
+
+        fn backup_export(&self) -> Result<heartwood_common::backup::BackupPayload, BackendError> {
+            Err(BackendError::NotSupported)
+        }
+
+        fn backup_import(&self, _payload: &heartwood_common::backup::BackupPayload) -> Result<(), BackendError> {
             Err(BackendError::NotSupported)
         }
     }

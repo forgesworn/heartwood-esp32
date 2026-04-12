@@ -513,6 +513,50 @@ impl SigningBackend for SerialBackend {
         Ok(())
     }
 
+    // -- Backup/restore -------------------------------------------------------
+
+    fn backup_export(&self) -> Result<heartwood_common::backup::BackupPayload, BackendError> {
+        let frame_bytes = frame::build_frame(FRAME_TYPE_BACKUP_EXPORT_REQUEST, &[])
+            .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
+
+        let mut port = self.acquire()?;
+        let resp = self.send_and_receive(
+            &mut port,
+            &frame_bytes,
+            &[FRAME_TYPE_BACKUP_EXPORT_RESPONSE],
+            10,
+        )?;
+
+        serde_json::from_slice(&resp.payload)
+            .map_err(|e| BackendError::Internal(format!("backup export JSON parse failed: {e}")))
+    }
+
+    fn backup_import(
+        &self,
+        payload: &heartwood_common::backup::BackupPayload,
+    ) -> Result<(), BackendError> {
+        let json = serde_json::to_vec(payload)
+            .map_err(|e| BackendError::Internal(format!("backup import serialise failed: {e}")))?;
+
+        let frame_bytes = frame::build_frame(FRAME_TYPE_BACKUP_IMPORT_REQUEST, &json)
+            .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
+
+        let mut port = self.acquire()?;
+        // 60-second timeout -- user must press the physical button.
+        let resp = self.send_and_receive(
+            &mut port,
+            &frame_bytes,
+            &[FRAME_TYPE_BACKUP_IMPORT_RESPONSE],
+            60,
+        )?;
+
+        if resp.payload.first().copied() == Some(0x01) {
+            Ok(())
+        } else {
+            Err(BackendError::Denied)
+        }
+    }
+
     fn ota_upload(&self, firmware: &[u8]) -> Result<(), BackendError> {
         if firmware.is_empty() {
             return Err(BackendError::Internal("empty firmware binary".into()));

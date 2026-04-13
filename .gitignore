@@ -8,6 +8,7 @@ sign-test/target/
 bridge/target/
 heartwoodd/target/
 ota/target/
+sprite-gen/target/
 # Private docs (plans, session memory, superpowers, specs)
 docs/plans/
 docs/memory/

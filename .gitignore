@@ -9,6 +9,7 @@ bridge/target/
 heartwoodd/target/
 ota/target/
 sprite-gen/target/
+*.bin
 # Private docs (plans, session memory, superpowers, specs)
 docs/plans/
 docs/memory/

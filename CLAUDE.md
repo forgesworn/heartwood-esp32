@@ -30,7 +30,9 @@ Phase 5 (flash-once production) complete (2026-04-03). Seven crates: `common/` (
 
 Heartwood Soft mode: `heartwoodd` runs standalone on a Pi with no ESP32. Keys encrypted at rest with Argon2id + XChaCha20-Poly1305, unlocked via Sapwood. Policy-based auto-approve with Sapwood approval queue for out-of-policy requests. Same management API, same Sapwood UI, same NIP-46 signing -- just software-backed instead of hardware-backed.
 
-Next: end-to-end Soft mode testing (unlock, create master, pair Bark, sign). Production hardening (JTAG disable, watchdog). Sapwood UI for tier badge, unlock form, approval queue.
+Encrypted backup/restore of connection slots and policies via Sapwood -- auto-snapshots after slot changes, manual export/import, Argon2id + XChaCha20-Poly1305 encrypted backup file, physical button confirmation on restore. Dedicated backup passphrase (default "heartwood", changeable via Sapwood). Works in both Hard and Soft modes.
+
+Next: end-to-end Soft mode testing (unlock, create master, pair Bark, sign). Production hardening (JTAG disable, watchdog). Sapwood UI for tier badge, unlock form, approval queue, backup export/import.
 
 ## Build & flash
 

@@ -42,6 +42,23 @@ use crate::policy::PolicyEngine;
 /// Timeout in seconds shown on the OLED countdown bar.
 const APPROVAL_TIMEOUT_SECS: u64 = 30;
 
+/// Return the 32-byte secret to use for nsec-tree derivation.
+///
+/// In tree modes (TreeMnemonic, TreeNsec) the stored master secret is already
+/// the tree root — use it directly. In Bunker mode the stored secret is a raw
+/// nsec, so apply the intermediate HMAC to produce the tree root on demand.
+/// The returned bytes are wrapped in `Zeroizing` for automatic cleanup.
+fn derivation_secret(
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, &'static str> {
+    if master_mode.is_tree() {
+        Ok(zeroize::Zeroizing::new(*master_secret))
+    } else {
+        derive::nsec_to_tree_root(master_secret)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -138,7 +155,13 @@ pub fn handle_request(
             match tier {
                 heartwood_common::policy::ApprovalTier::AutoApprove => {
                     log::info!("sign_event: auto-approved by policy");
-                    match handle_auto_sign(master_secret, secp, &request) {
+                    let purpose_label = request
+                        .heartwood
+                        .as_ref()
+                        .map(|h| h.purpose.as_str())
+                        .unwrap_or("master");
+                    crate::oled::show_auto_approved(display, master_label, purpose_label);
+                    match handle_auto_sign(master_secret, master_mode, secp, &request) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),
                     }
@@ -150,13 +173,13 @@ pub fn handle_request(
                         .map(|h| h.purpose.as_str())
                         .unwrap_or("master");
                     crate::oled::show_auto_approved(display, master_label, purpose_label);
-                    match handle_auto_sign(master_secret, secp, &request) {
+                    match handle_auto_sign(master_secret, master_mode, secp, &request) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),
                     }
                 }
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
-                    let result = handle_sign_event(master_secret, secp, display, button_pin, &request);
+                    let result = handle_sign_event(master_secret, master_mode, secp, display, button_pin, &request);
                     let is_success = serde_json::from_str::<serde_json::Value>(&result)
                         .map(|v| v.get("error").is_none())
                         .unwrap_or(false);
@@ -172,7 +195,7 @@ pub fn handle_request(
             }
         }
 
-        "get_public_key" => handle_get_public_key(master_secret, secp, &request),
+        "get_public_key" => handle_get_public_key(master_secret, master_mode, secp, &request),
 
         "connect" => {
             // params[0] is the client pubkey; params[1] is the optional secret.
@@ -246,18 +269,19 @@ pub fn handle_request(
 
         "ping" => nip46::build_ping_response(&request.id).unwrap_or_default(),
 
-        "nip44_encrypt" => handle_nip44_encrypt(master_secret, &request),
+        "nip44_encrypt" => handle_nip44_encrypt(master_secret, master_mode, &request),
 
-        "nip44_decrypt" => handle_nip44_decrypt(master_secret, &request),
+        "nip44_decrypt" => handle_nip44_decrypt(master_secret, master_mode, &request),
 
-        "nip04_encrypt" => handle_nip04_encrypt(master_secret, &request),
+        "nip04_encrypt" => handle_nip04_encrypt(master_secret, master_mode, &request),
 
-        "nip04_decrypt" => handle_nip04_decrypt(master_secret, &request),
+        "nip04_decrypt" => handle_nip04_decrypt(master_secret, master_mode, &request),
 
         "heartwood_derive" => {
-            if !master_mode.is_tree() {
-                return build_error_json(&request.id, -5, "not available in bunker mode");
-            }
+            let derive_secret = match derivation_secret(master_secret, master_mode) {
+                Ok(s) => s,
+                Err(e) => return build_error_json(&request.id, -4, e),
+            };
             let purpose = match request.params.first().and_then(|v| v.as_str()) {
                 Some(p) => p,
                 None => return build_error_json(&request.id, -3, "requires [purpose, index?]"),
@@ -269,7 +293,7 @@ pub fn handle_request(
                 None => return build_error_json(&request.id, -4, "no identity cache for this master"),
             };
 
-            match cache.derive_and_cache(master_secret, purpose, index, None) {
+            match cache.derive_and_cache(&derive_secret, purpose, index, None) {
                 Ok(idx) => {
                     let id = &cache.identities[idx];
                     let result = serde_json::json!({
@@ -284,9 +308,10 @@ pub fn handle_request(
         }
 
         "heartwood_derive_persona" => {
-            if !master_mode.is_tree() {
-                return build_error_json(&request.id, -5, "not available in bunker mode");
-            }
+            let derive_secret = match derivation_secret(master_secret, master_mode) {
+                Ok(s) => s,
+                Err(e) => return build_error_json(&request.id, -4, e),
+            };
             let name = match request.params.first().and_then(|v| v.as_str()) {
                 Some(n) => n,
                 None => return build_error_json(&request.id, -3, "requires [name, index?]"),
@@ -302,7 +327,7 @@ pub fn handle_request(
                 None => return build_error_json(&request.id, -4, "no identity cache for this master"),
             };
 
-            match cache.derive_and_cache(master_secret, &purpose, index, Some(name.to_string())) {
+            match cache.derive_and_cache(&derive_secret, &purpose, index, Some(name.to_string())) {
                 Ok(idx) => {
                     let id = &cache.identities[idx];
                     let result = serde_json::json!({
@@ -318,9 +343,6 @@ pub fn handle_request(
         }
 
         "heartwood_switch" => {
-            if !master_mode.is_tree() {
-                return build_error_json(&request.id, -5, "not available in bunker mode");
-            }
             let target = match request.params.first().and_then(|v| v.as_str()) {
                 Some(t) => t,
                 None => return build_error_json(&request.id, -3, "requires [target, index_hint?]"),
@@ -390,11 +412,6 @@ pub fn handle_request(
         }
 
         "heartwood_list_identities" => {
-            if !master_mode.is_tree() {
-                // Bunker mode — no derived identities, return empty array.
-                return nip46::build_result_response(&request.id, "[]").unwrap_or_default();
-            }
-
             let cache = match identity_caches.iter().find(|c| c.master_slot == master_slot) {
                 Some(c) => c,
                 None => return build_error_json(&request.id, -4, "no identity cache for this master"),
@@ -404,9 +421,10 @@ pub fn handle_request(
         }
 
         "heartwood_recover" => {
-            if !master_mode.is_tree() {
-                return build_error_json(&request.id, -5, "not available in bunker mode");
-            }
+            let derive_secret = match derivation_secret(master_secret, master_mode) {
+                Ok(s) => s,
+                Err(e) => return build_error_json(&request.id, -4, e),
+            };
             let lookahead = request.params.first().and_then(|v| v.as_u64()).unwrap_or(20) as u32;
 
             let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
@@ -414,7 +432,7 @@ pub fn handle_request(
                 None => return build_error_json(&request.id, -4, "no identity cache for this master"),
             };
 
-            match cache.recover(master_secret, lookahead) {
+            match cache.recover(&derive_secret, lookahead) {
                 Ok(count) => {
                     let identities_json = cache.list_json();
                     let result = format!(r#"{{"recovered":{count},"identities":{identities_json}}}"#);
@@ -453,12 +471,13 @@ pub fn handle_request(
 
 fn handle_auto_sign(
     master_secret: &[u8; 32],
+    master_mode: MasterMode,
     secp: &Arc<Secp256k1<SignOnly>>,
     request: &nip46::Nip46Request,
 ) -> Result<String, String> {
     let mut event = nip46::parse_unsigned_event(&request.params)
         .map_err(|e| format!("bad event format: {e}"))?;
-    let signed = do_sign(&mut event, master_secret, secp, request.heartwood.as_ref())?;
+    let signed = do_sign(&mut event, master_secret, master_mode, secp, request.heartwood.as_ref())?;
     nip46::build_sign_response(&request.id, &signed)
 }
 
@@ -468,6 +487,7 @@ fn handle_auto_sign(
 
 fn handle_sign_event(
     master_secret: &[u8; 32],
+    master_mode: MasterMode,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
@@ -505,7 +525,7 @@ fn handle_sign_event(
         ApprovalResult::Approved => {
             log::info!("sign_event: approved");
             crate::oled::show_signing(display);
-            match do_sign(&mut event, master_secret, secp, request.heartwood.as_ref()) {
+            match do_sign(&mut event, master_secret, master_mode, secp, request.heartwood.as_ref()) {
                 Ok(signed) => {
                     match nip46::build_sign_response(&request.id, &signed) {
                         Ok(json) => {
@@ -548,13 +568,16 @@ fn handle_sign_event(
 fn do_sign(
     event: &mut UnsignedEvent,
     master_secret: &[u8; 32],
+    master_mode: MasterMode,
     secp: &Arc<Secp256k1<SignOnly>>,
     heartwood: Option<&HeartwoodContext>,
 ) -> Result<SignedEvent, String> {
     // Derive the signing identity first -- we may need the pubkey to fill the template.
     let (mut signing_secret, hex_pubkey) = match heartwood {
         Some(ctx) => {
-            let root = derive::create_tree_root(master_secret)
+            let derive_secret = derivation_secret(master_secret, master_mode)
+                .map_err(|e| format!("derivation_secret: {e}"))?;
+            let root = derive::create_tree_root(&derive_secret)
                 .map_err(|e| format!("create_tree_root: {e}"))?;
             let identity = derive::derive(&root, &ctx.purpose, ctx.index)
                 .map_err(|e| format!("derive: {e}"))?;
@@ -605,13 +628,16 @@ fn do_sign(
 /// Returns a NIP-46 JSON response string (or an error JSON on failure).
 fn handle_get_public_key(
     master_secret: &[u8; 32],
+    master_mode: MasterMode,
     secp: &Arc<Secp256k1<SignOnly>>,
     request: &nip46::Nip46Request,
 ) -> String {
     let pubkey_result = match &request.heartwood {
         Some(ctx) => {
-            derive::create_tree_root(master_secret)
-                .map_err(|e| format!("create_tree_root: {e}"))
+            derivation_secret(master_secret, master_mode)
+                .map_err(|e| format!("derivation_secret: {e}"))
+                .and_then(|ds| derive::create_tree_root(&ds)
+                    .map_err(|e| format!("create_tree_root: {e}")))
                 .and_then(|root| {
                     derive::derive(&root, &ctx.purpose, ctx.index)
                         .map_err(|e| format!("derive: {e}"))
@@ -652,6 +678,7 @@ fn handle_get_public_key(
 
 fn handle_nip44_encrypt(
     master_secret: &[u8; 32],
+    master_mode: MasterMode,
     request: &nip46::Nip46Request,
 ) -> String {
     if request.params.len() < 2 {
@@ -666,7 +693,7 @@ fn handle_nip44_encrypt(
         None => return build_error_json(&request.id, -3, "plaintext param must be a string"),
     };
 
-    let mut signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
+    let mut signing_secret = match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("nip44_encrypt: key derivation failed: {e}");
@@ -710,6 +737,7 @@ fn handle_nip44_encrypt(
 
 fn handle_nip44_decrypt(
     master_secret: &[u8; 32],
+    master_mode: MasterMode,
     request: &nip46::Nip46Request,
 ) -> String {
     if request.params.len() < 2 {
@@ -724,7 +752,7 @@ fn handle_nip44_decrypt(
         None => return build_error_json(&request.id, -3, "ciphertext param must be a string"),
     };
 
-    let mut signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
+    let mut signing_secret = match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("nip44_decrypt: key derivation failed: {e}");
@@ -767,6 +795,7 @@ fn handle_nip44_decrypt(
 
 fn handle_nip04_encrypt(
     master_secret: &[u8; 32],
+    master_mode: MasterMode,
     request: &nip46::Nip46Request,
 ) -> String {
     if request.params.len() < 2 {
@@ -781,7 +810,7 @@ fn handle_nip04_encrypt(
         None => return build_error_json(&request.id, -3, "plaintext param must be a string"),
     };
 
-    let mut signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
+    let mut signing_secret = match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("nip04_encrypt: key derivation failed: {e}");
@@ -825,6 +854,7 @@ fn handle_nip04_encrypt(
 
 fn handle_nip04_decrypt(
     master_secret: &[u8; 32],
+    master_mode: MasterMode,
     request: &nip46::Nip46Request,
 ) -> String {
     if request.params.len() < 2 {
@@ -839,7 +869,7 @@ fn handle_nip04_decrypt(
         None => return build_error_json(&request.id, -3, "ciphertext param must be a string"),
     };
 
-    let mut signing_secret = match resolve_signing_secret(master_secret, request.heartwood.as_ref()) {
+    let mut signing_secret = match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("nip04_decrypt: key derivation failed: {e}");
@@ -884,11 +914,14 @@ fn handle_nip04_decrypt(
 /// heartwood context.
 fn resolve_signing_secret(
     master_secret: &[u8; 32],
+    master_mode: MasterMode,
     heartwood: Option<&HeartwoodContext>,
 ) -> Result<[u8; 32], String> {
     match heartwood {
         Some(ctx) => {
-            let root = derive::create_tree_root(master_secret)
+            let derive_secret = derivation_secret(master_secret, master_mode)
+                .map_err(|e| format!("derivation_secret: {e}"))?;
+            let root = derive::create_tree_root(&derive_secret)
                 .map_err(|e| format!("create_tree_root: {e}"))?;
             let identity = derive::derive(&root, &ctx.purpose, ctx.index)
                 .map_err(|e| format!("derive: {e}"))?;

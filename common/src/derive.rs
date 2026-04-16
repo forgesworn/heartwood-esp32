@@ -57,6 +57,26 @@ compile_error!("heartwood-common requires either `k256-backend` or `secp256k1-ba
 // Public API (backend-agnostic)
 // ---------------------------------------------------------------------------
 
+/// Derive a tree root secret from a raw nsec via HMAC-SHA256.
+///
+/// Matches PROTOCOL.md §1.2 and the reference implementations in
+/// `nsec-tree/src/root-nsec.ts` and `heartwood-core/src/root.rs`:
+///
+///   tree_root = HMAC-SHA256(key = nsec_bytes, msg = utf8("nsec-tree-root"))
+///
+/// The returned 32-byte secret can be passed to `create_tree_root` to get a
+/// fully usable `TreeRoot` for child derivation. This is the on-demand path
+/// used by Bunker mode, where the stored master secret is a raw nsec.
+pub fn nsec_to_tree_root(nsec: &[u8; 32]) -> Result<zeroize::Zeroizing<[u8; 32]>, &'static str> {
+    let mut mac = HmacSha256::new_from_slice(nsec)
+        .map_err(|_| "HMAC init failed")?;
+    mac.update(b"nsec-tree-root");
+    let result = mac.finalize();
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&result.into_bytes());
+    Ok(zeroize::Zeroizing::new(root))
+}
+
 /// Create a TreeRoot directly from a 32-byte secret (no HMAC intermediate).
 ///
 /// The secret goes straight to the signing backend — this is the raw-secret
@@ -150,5 +170,27 @@ mod tests {
             "npub1rx8u4wk9ytu8aak4f9wcaqdgk0lj4rjhdu4j9n7dj2mg68l9cdqs2fjf2t",
             "derived npub does not match heartwood-core"
         );
+    }
+
+    /// nsec-to-tree-root HMAC vector — must match PROTOCOL.md §6.1 Vector 1
+    /// and the reference implementations in nsec-tree and heartwood-core.
+    #[test]
+    fn test_nsec_to_tree_root_matches_frozen_vector() {
+        let nsec_bytes = [0x01u8; 32];
+        let root_secret = nsec_to_tree_root(&nsec_bytes).expect("nsec_to_tree_root must succeed");
+
+        assert_eq!(
+            crate::hex::hex_encode(&*root_secret),
+            "8d2db9ce9548534e7ae924d05e311355e3a12744214c88e65b39fa2bf2df6d6f",
+            "tree_root does not match PROTOCOL.md §6.1 Vector 1"
+        );
+
+        let root = create_tree_root(&root_secret).expect("invalid root secret");
+        assert_eq!(
+            root.master_npub,
+            "npub13sp7q3awvrqpa9p2svm7w8ghudghlnrraekwl7qh8w7j8747vjwskvzy2u",
+            "master npub does not match PROTOCOL.md §6.1 Vector 1"
+        );
+        root.destroy();
     }
 }

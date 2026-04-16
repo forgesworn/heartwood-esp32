@@ -528,21 +528,34 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Connect to relays and wait for connections to establish before subscribing.
-    let client = Client::new(bunker_keys.clone());
-    for url in &relay_list {
-        client.add_relay(url.as_str()).await?;
+    // Relay event loop with automatic reconnection. If the relay drops the
+    // connection (e.g. idle timeout during a demo pause), we reconnect with
+    // backoff rather than exiting the daemon.
+    let mut backoff_secs = 5u64;
+    loop {
+        let client = Client::new(bunker_keys.clone());
+        for url in &relay_list {
+            client.add_relay(url.as_str()).await?;
+        }
+        client.connect().await;
+
+        log::info!("Waiting for relay connections...");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        log::info!("Connected to relays");
+
+        match relay::run_event_loop(&client, &backend_arc, &signing_master_pubkey).await {
+            Ok(()) => {
+                log::warn!("Relay event loop ended -- reconnecting in {backoff_secs}s");
+            }
+            Err(e) => {
+                log::error!("Relay event loop error: {e} -- reconnecting in {backoff_secs}s");
+            }
+        }
+
+        // Disconnect cleanly before reconnecting.
+        client.disconnect().await;
+
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(60);
     }
-    client.connect().await;
-
-    log::info!("Waiting for relay connections...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    log::info!("Connected to relays");
-
-    // Hand off to the relay event loop. The backend trait abstracts the mode
-    // difference: Hard mode forwards frames to the ESP32 over serial; Soft mode
-    // signs locally. main() only orchestrates startup.
-    relay::run_event_loop(&client, &backend_arc, &signing_master_pubkey).await?;
-
-    Ok(())
 }

@@ -135,6 +135,9 @@ fn backend_to_http(err: BackendError) -> Response {
         BackendError::Denied => {
             api_err(StatusCode::FORBIDDEN, "request denied")
         }
+        BackendError::UserCancelled => {
+            api_err(StatusCode::CONFLICT, "user did not confirm the operation")
+        }
         BackendError::PendingApproval(id) => {
             (StatusCode::ACCEPTED, Json(serde_json::json!({"pending_approval": id}))).into_response()
         }
@@ -493,10 +496,21 @@ async fn put_backup_passphrase(
     let result = tokio::task::spawn_blocking(move || {
         let token = state.api_token.as_deref().map(|s| s.as_str()).unwrap_or("");
 
-        // Verify old passphrase.
+        // Verify old passphrase (constant-time to avoid timing leaks).
         let stored = crate::backup::read_passphrase(&state.passphrase_path, token)
             .map_err(|e| BackendError::Internal(format!("read passphrase: {e}")))?;
-        if stored != body.old_passphrase {
+        let stored_bytes = stored.as_bytes();
+        let provided_bytes = body.old_passphrase.as_bytes();
+        let mismatch = if stored_bytes.len() != provided_bytes.len() {
+            true
+        } else {
+            let mut diff = 0u8;
+            for (a, b) in stored_bytes.iter().zip(provided_bytes.iter()) {
+                diff |= a ^ b;
+            }
+            diff != 0
+        };
+        if mismatch {
             return Err(BackendError::Internal("old passphrase does not match".to_string()));
         }
 
@@ -533,6 +547,9 @@ async fn put_backup_passphrase(
 /// Fire-and-forget: export a fresh backup after a slot-modifying operation.
 /// Runs in a background tokio task. Errors are logged, not propagated.
 fn trigger_auto_snapshot(state: AppState) {
+    if state.backend.is_locked() {
+        return;
+    }
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut payload = state.backend.backup_export()?;

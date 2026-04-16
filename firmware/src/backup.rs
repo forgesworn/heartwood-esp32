@@ -44,18 +44,19 @@ pub fn handle_export(
 
     // Read bridge secret for the device_id fingerprint and backup payload.
     let bridge_secret = session::read_bridge_secret(nvs);
+
+    // device_id = SHA-256(bridge_secret) -- non-secret fingerprint.
+    let device_id = match &bridge_secret {
+        Some(secret) => {
+            use sha2::{Digest, Sha256};
+            hex_encode(&Sha256::digest(secret))
+        }
+        None => String::new(),
+    };
+
     let bridge_hex = bridge_secret
         .map(|s| hex_encode(&s))
         .unwrap_or_default();
-
-    // device_id = SHA-256(bridge_secret) -- non-secret fingerprint.
-    let device_id = if let Some(ref secret) = bridge_secret {
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(secret);
-        hex_encode(&hash)
-    } else {
-        String::new()
-    };
 
     // created_at = 0; heartwoodd sets the real timestamp on the Pi side.
     let payload = BackupPayload {

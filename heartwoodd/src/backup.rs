@@ -184,9 +184,9 @@ pub fn decrypt_backup(
     let nonce_arr: [u8; NONCE_LEN] = nonce_bytes.try_into().unwrap();
 
     let cipher = XChaCha20Poly1305::new(key.as_ref().into());
-    let plaintext = cipher
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(cipher
         .decrypt(nonce_arr.as_ref().into(), ciphertext.as_slice())
-        .map_err(|_| "wrong passphrase or corrupted ciphertext".to_string())?;
+        .map_err(|_| "wrong passphrase or corrupted ciphertext".to_string())?);
 
     let payload: BackupPayload = serde_json::from_slice(&plaintext)
         .map_err(|e| format!("deserialise backup payload: {e}"))?;
@@ -202,14 +202,14 @@ pub fn decrypt_backup(
 ///
 /// Uses HMAC-SHA256(api_token, "backup-passphrase") so the passphrase file
 /// is bound to the API token and cannot be decrypted without it.
-fn passphrase_wrapping_key(api_token: &str) -> [u8; 32] {
+fn passphrase_wrapping_key(api_token: &str) -> Zeroizing<[u8; 32]> {
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = <HmacSha256 as Mac>::new_from_slice(api_token.as_bytes())
         .expect("HMAC accepts any key length");
     mac.update(b"backup-passphrase");
     let result = mac.finalize();
     let bytes = result.into_bytes();
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&bytes);
     key
 }
@@ -247,7 +247,7 @@ pub fn read_passphrase(path: &Path, api_token: &str) -> Result<String, String> {
     let nonce_arr: [u8; NONCE_LEN] = nonce_bytes.try_into().unwrap();
 
     let wrapping_key = passphrase_wrapping_key(api_token);
-    let cipher = XChaCha20Poly1305::new((&wrapping_key).into());
+    let cipher = XChaCha20Poly1305::new(wrapping_key.as_ref().into());
     let plaintext = cipher
         .decrypt(nonce_arr.as_ref().into(), ciphertext.as_slice())
         .map_err(|_| "wrong api token or corrupted passphrase file".to_string())?;
@@ -261,7 +261,7 @@ pub fn write_passphrase(path: &Path, passphrase: &str, api_token: &str) -> Resul
     getrandom::getrandom(&mut nonce).map_err(|e| format!("getrandom passphrase nonce: {e}"))?;
 
     let wrapping_key = passphrase_wrapping_key(api_token);
-    let cipher = XChaCha20Poly1305::new((&wrapping_key).into());
+    let cipher = XChaCha20Poly1305::new(wrapping_key.as_ref().into());
     let ciphertext = cipher
         .encrypt(nonce.as_ref().into(), passphrase.as_bytes())
         .map_err(|_| "passphrase encryption failed".to_string())?;

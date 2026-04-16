@@ -553,7 +553,7 @@ impl SigningBackend for SerialBackend {
         if resp.payload.first().copied() == Some(0x01) {
             Ok(())
         } else {
-            Err(BackendError::Denied)
+            Err(BackendError::UserCancelled)
         }
     }
 

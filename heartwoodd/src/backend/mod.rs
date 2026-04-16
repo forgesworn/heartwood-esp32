@@ -53,6 +53,8 @@ pub enum BackendError {
     DeviceTimeout,
     /// The physical button was not pressed; the request was denied.
     Denied,
+    /// The user did not confirm the operation (button not pressed or timed out).
+    UserCancelled,
     /// The request has been queued for manual approval. The string is the
     /// approval ID that the caller can poll or display.
     PendingApproval(String),
@@ -68,6 +70,7 @@ impl fmt::Display for BackendError {
             BackendError::DeviceBusy      => write!(f, "device is busy"),
             BackendError::DeviceTimeout   => write!(f, "device timed out"),
             BackendError::Denied          => write!(f, "request denied"),
+            BackendError::UserCancelled   => write!(f, "user did not confirm"),
             BackendError::PendingApproval(id) => write!(f, "pending approval: {id}"),
             BackendError::Internal(msg)   => write!(f, "internal error: {msg}"),
         }

@@ -63,7 +63,8 @@ struct Cli {
     #[arg(short, long, default_value = "wss://relay.damus.io,wss://nos.lol")]
     relays: String,
 
-    /// Master slot index to use (default: 0)
+    /// Master slot whose bunker URI is written to bunker-uri.txt (default: 0).
+    /// NIP-46 routing accepts requests for every provisioned master regardless of this flag.
     #[arg(long, default_value_t = 0)]
     slot: u8,
 
@@ -359,7 +360,7 @@ async fn main() -> Result<()> {
         .collect();
 
     // Detect mode and construct backend + bunker keys.
-    let (backend_arc, bunker_keys, signing_master_pubkey) = match detect_mode(&cli) {
+    let (backend_arc, bunker_keys, signing_master_pubkeys) = match detect_mode(&cli) {
 
         // ----------------------------------------------------------------
         // Hard mode -- ESP32 attached via USB serial
@@ -410,60 +411,81 @@ async fn main() -> Result<()> {
                 panic!("ESP32 has no masters provisioned -- run setup-hsm.py first");
             }
 
-            for m in &masters {
-                log::info!(
-                    "Device master: slot={} label={} mode={} npub={}",
-                    m.get("slot").and_then(|v| v.as_u64()).unwrap_or(0),
-                    m.get("label").and_then(|v| v.as_str()).unwrap_or(""),
-                    m.get("mode").and_then(|v| v.as_u64()).unwrap_or(0),
-                    m.get("npub").and_then(|v| v.as_str()).unwrap_or(""),
-                );
-            }
-
-            let target_slot = cli.slot;
-            let selected = masters.iter()
-                .find(|m| m.get("slot").and_then(|v| v.as_u64()) == Some(target_slot as u64))
-                .unwrap_or_else(|| panic!(
-                    "No master in slot {} -- available slots: {}",
-                    target_slot,
-                    masters.iter()
-                        .filter_map(|m| m.get("slot").and_then(|v| v.as_u64()).map(|s| s.to_string()))
-                        .collect::<Vec<_>>().join(", ")
-                ));
-            let slot = target_slot;
-            let label = selected.get("label").and_then(|v| v.as_str())
-                .unwrap_or("").to_string();
-            let npub = selected.get("npub").and_then(|v| v.as_str())
-                .expect("master npub missing");
-            let pk = PublicKey::parse(npub)
-                .expect("failed to decode master npub");
-            let signing_master_pubkey: [u8; 32] = pk.to_bytes();
-            log::info!("Routing NIP-46 traffic to master slot {} ({}), pubkey {}",
-                slot, label, hex_encode(&signing_master_pubkey));
-
-            // Write bunker-uri.txt so the Sapwood web UI can serve it for pairing.
+            // Parse every master's pubkey. NIP-46 routing accepts p-tags for
+            // any of them; --slot only selects which URI gets written to
+            // bunker-uri.txt for backward-compatible single-master tooling.
             let relay_params: String = cli.relays.split(',')
                 .filter(|r| !r.trim().is_empty())
                 .map(|r| format!("relay={}", urlencoding::encode(r.trim())))
                 .collect::<Vec<_>>()
                 .join("&");
-            let bunker_uri = format!(
-                "bunker://{}?{}",
-                hex_encode(&signing_master_pubkey),
-                relay_params,
+
+            let target_slot = cli.slot;
+            let mut signing_master_pubkeys: Vec<[u8; 32]> = Vec::with_capacity(masters.len());
+            let mut default_bunker_uri: Option<(u8, String, String)> = None;
+
+            for m in &masters {
+                let slot = m.get("slot").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let label = m.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let mode = m.get("mode").and_then(|v| v.as_u64()).unwrap_or(0);
+                let npub = m.get("npub").and_then(|v| v.as_str())
+                    .expect("master npub missing");
+                let pk = PublicKey::parse(npub)
+                    .expect("failed to decode master npub");
+                let pubkey_bytes: [u8; 32] = pk.to_bytes();
+                let bunker_uri = format!(
+                    "bunker://{}?{}",
+                    hex_encode(&pubkey_bytes),
+                    relay_params,
+                );
+
+                log::info!(
+                    "Device master: slot={slot} label={label} mode={mode} npub={npub}"
+                );
+                log::info!("  bunker URI: {bunker_uri}");
+
+                signing_master_pubkeys.push(pubkey_bytes);
+
+                if slot == target_slot {
+                    default_bunker_uri = Some((slot, label.clone(), bunker_uri));
+                }
+            }
+
+            log::info!(
+                "Routing NIP-46 traffic for {} master(s) simultaneously",
+                signing_master_pubkeys.len()
             );
+
+            // Write bunker-uri.txt for the --slot master so the Sapwood web UI
+            // and existing tooling can serve it for pairing.
             let data_dir = std::path::PathBuf::from(&cli.data_dir);
             std::fs::create_dir_all(&data_dir).ok();
             let uri_path = data_dir.join("bunker-uri.txt");
-            match std::fs::write(&uri_path, &bunker_uri) {
-                Ok(()) => log::info!("Wrote bunker URI to {}", uri_path.display()),
-                Err(e) => log::error!("Failed to write bunker-uri.txt: {e}"),
+            match &default_bunker_uri {
+                Some((slot, label, bunker_uri)) => {
+                    match std::fs::write(&uri_path, bunker_uri) {
+                        Ok(()) => log::info!(
+                            "Wrote default bunker URI (slot {slot}, {label}) to {}",
+                            uri_path.display()
+                        ),
+                        Err(e) => log::error!("Failed to write bunker-uri.txt: {e}"),
+                    }
+                }
+                None => {
+                    let available: Vec<String> = masters.iter()
+                        .filter_map(|m| m.get("slot").and_then(|v| v.as_u64()).map(|s| s.to_string()))
+                        .collect();
+                    log::warn!(
+                        "No master in --slot {target_slot} -- bunker-uri.txt not written (available slots: {})",
+                        available.join(", ")
+                    );
+                }
             }
 
             // Spawn background log poller (Hard mode only -- reads serial when idle).
             tokio::spawn(api::log_poller(serial_arc, log_tx.clone()));
 
-            (backend_arc, bunker_keys, signing_master_pubkey)
+            (backend_arc, bunker_keys, signing_master_pubkeys)
         }
 
         // ----------------------------------------------------------------
@@ -486,7 +508,7 @@ async fn main() -> Result<()> {
             // Use the bunker pubkey as placeholder until unlock reveals the real master.
             let placeholder: [u8; 32] = bunker_keys.public_key().to_bytes();
 
-            (backend_arc, bunker_keys, placeholder)
+            (backend_arc, bunker_keys, vec![placeholder])
         }
     };
 
@@ -546,7 +568,7 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
         log::info!("Connected to relays");
 
-        match relay::run_event_loop(&client, &backend_arc, &signing_master_pubkey).await {
+        match relay::run_event_loop(&client, &backend_arc, &signing_master_pubkeys).await {
             Ok(()) => {
                 log::warn!("Relay event loop ended -- reconnecting in {backoff_secs}s");
             }

@@ -1,10 +1,12 @@
 // heartwoodd/src/relay.rs
 //
 // NIP-46 relay event loop. Subscribes to kind:24133 events p-tagged
-// with the signing master pubkey and dispatches them to the backend.
+// with any of the configured master pubkeys and dispatches each event
+// to the backend along with the master identified by its p-tag.
 // Both Hard and Soft modes use the same loop -- the SigningBackend
 // trait abstracts the signing implementation.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
@@ -13,38 +15,51 @@ use crate::backend::{BackendError, SigningBackend};
 
 /// Subscribe to NIP-46 events and dispatch them to the given backend indefinitely.
 ///
-/// Creates a filter for kind:24133 events p-tagged with `signing_pubkey`, subscribes,
-/// then enters the notification loop. For each request:
+/// Creates a filter for kind:24133 events p-tagged with any of `signing_pubkeys`,
+/// subscribes, then enters the notification loop. For each request:
 ///
-///   1. Calls `backend.handle_encrypted_request` to decrypt, process, re-encrypt,
+///   1. Extracts the addressed master pubkey from the event's p-tag and
+///      verifies it is one of the configured masters.
+///   2. Calls `backend.handle_encrypted_request` to decrypt, process, re-encrypt,
 ///      and sign the kind:24133 envelope event (all in one call).
-///   2. Publishes the signed event to connected relays.
+///   3. Publishes the signed event to connected relays.
 ///
 /// Returns when the notification loop ends (relay disconnection, or an internal error).
 pub async fn run_event_loop(
     client: &Client,
     backend: &Arc<dyn SigningBackend>,
-    signing_pubkey: &[u8; 32],
+    signing_pubkeys: &[[u8; 32]],
 ) -> Result<()> {
-    let signing_nostr_pubkey = PublicKey::from_slice(signing_pubkey)
-        .expect("signing pubkey is a valid secp256k1 x-only key");
+    let nostr_pubkeys: Vec<PublicKey> = signing_pubkeys
+        .iter()
+        .map(|bytes| {
+            PublicKey::from_slice(bytes)
+                .expect("signing pubkey is a valid secp256k1 x-only key")
+        })
+        .collect();
+
+    let accepted: Arc<HashSet<[u8; 32]>> =
+        Arc::new(signing_pubkeys.iter().copied().collect());
 
     let filter = Filter::new()
         .kind(Kind::NostrConnect)
-        .pubkey(signing_nostr_pubkey)
+        .pubkeys(nostr_pubkeys)
         .since(Timestamp::now());
 
     client.subscribe(filter, None).await?;
-    log::info!("Subscribed to NIP-46 events -- waiting for requests...");
+    log::info!(
+        "Subscribed to NIP-46 events for {} master(s) -- waiting for requests...",
+        signing_pubkeys.len()
+    );
 
     let backend = Arc::clone(backend);
-    let master_pubkey_bytes: [u8; 32] = *signing_pubkey;
     let client_clone = client.clone();
 
     client
         .handle_notifications(|notification| {
             let backend = Arc::clone(&backend);
             let client_clone = client_clone.clone();
+            let accepted = Arc::clone(&accepted);
 
             async move {
                 let event = match notification {
@@ -57,8 +72,37 @@ pub async fn run_event_loop(
                     return Ok(false);
                 }
 
+                // Identify the addressed master from the event's p-tag.
+                let master_pubkey_bytes: [u8; 32] = match event
+                    .tags
+                    .public_keys()
+                    .next()
+                    .map(|pk| pk.to_bytes())
+                {
+                    Some(bytes) if accepted.contains(&bytes) => bytes,
+                    Some(bytes) => {
+                        log::warn!(
+                            "NIP-46 request addressed to unknown master {} -- ignoring",
+                            PublicKey::from_slice(&bytes)
+                                .map(|pk| pk.to_string())
+                                .unwrap_or_else(|_| "<invalid>".to_string())
+                        );
+                        return Ok(false);
+                    }
+                    None => {
+                        log::warn!("NIP-46 request missing p-tag -- ignoring");
+                        return Ok(false);
+                    }
+                };
+
                 let client_pubkey = event.pubkey;
-                log::info!("NIP-46 request from {}", client_pubkey);
+                log::info!(
+                    "NIP-46 request from {} to master {}",
+                    client_pubkey,
+                    PublicKey::from_slice(&master_pubkey_bytes)
+                        .map(|pk| pk.to_string())
+                        .unwrap_or_else(|_| "<invalid>".to_string())
+                );
 
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 

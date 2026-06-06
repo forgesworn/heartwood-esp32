@@ -53,6 +53,7 @@ mod tests {
             allowed_kinds: vec![1, 7],
             auto_approve: true,
             signing_approved: true,
+            authorized_pubkeys: vec![],
         }
     }
 

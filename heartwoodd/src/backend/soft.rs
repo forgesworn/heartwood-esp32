@@ -494,7 +494,7 @@ impl SigningBackend for SoftBackend {
                     &provided_secret,
                 );
                 if let Some(slot) = matched {
-                    slot.current_pubkey = Some(client_pubkey_hex.clone());
+                    policy::authorize_pubkey_on_slot(slot, &client_pubkey_hex);
                     let path = self.keyfile_path();
                     Self::persist(state, &path)?;
                 } else {
@@ -849,6 +849,7 @@ impl SigningBackend for SoftBackend {
                 allowed_kinds: vec![],
                 auto_approve: true,
                 signing_approved: false,
+                authorized_pubkeys: vec![],
             };
             m.connection_slots.push(slot.clone());
             Self::persist(state, &path)?;

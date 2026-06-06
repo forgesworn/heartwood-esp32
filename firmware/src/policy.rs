@@ -9,7 +9,7 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{
     ApprovalTier, ConnectSlot, CONNECT_SAFE_METHODS, TOFU_SAFE_METHODS,
-    find_slot_by_pubkey, find_slot_by_secret, next_slot_index,
+    authorize_pubkey_on_slot, find_slot_by_pubkey, find_slot_by_secret, next_slot_index,
 };
 
 /// Maximum concurrent client sessions.
@@ -229,6 +229,7 @@ impl PolicyEngine {
             allowed_kinds: vec![],
             auto_approve: true,
             signing_approved: false,
+            authorized_pubkeys: vec![],
         };
         self.slots_mut(master_slot).push(new_slot);
         self.slots_dirty = true;
@@ -303,8 +304,10 @@ impl PolicyEngine {
         find_slot_by_secret(self.list_slots(master_slot), secret)
     }
 
-    /// Assign a client pubkey to a slot (called on connect with valid secret).
-    /// Returns true if the slot was found.
+    /// Authorise a client pubkey on a slot (called on connect with valid secret).
+    /// Adds it to the slot's authorised set and makes it the current binding,
+    /// preserving any previously-bound client so earlier devices stay
+    /// auto-approved. Returns true if the slot was found.
     pub fn assign_pubkey_to_slot(
         &mut self,
         master_slot: u8,
@@ -313,7 +316,7 @@ impl PolicyEngine {
     ) -> bool {
         let slots = self.slots_mut(master_slot);
         if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
-            slot.current_pubkey = Some(pubkey);
+            authorize_pubkey_on_slot(slot, &pubkey);
             self.slots_dirty = true;
             true
         } else {
@@ -419,6 +422,7 @@ impl PolicyEngine {
                     allowed_kinds: vec![],
                     auto_approve: true,
                     signing_approved: false,
+                    authorized_pubkeys: vec![],
                 };
 
                 log::info!(

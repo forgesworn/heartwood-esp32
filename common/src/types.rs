@@ -70,6 +70,9 @@ pub const FRAME_TYPE_BACKUP_EXPORT_RESPONSE: u8 = 0x51;  // device -> host: JSON
 pub const FRAME_TYPE_BACKUP_IMPORT_REQUEST: u8 = 0x52;   // host -> device: JSON BackupPayload (matched masters only)
 pub const FRAME_TYPE_BACKUP_IMPORT_RESPONSE: u8 = 0x53;  // device -> host: 0x01 success / 0x00 failure
 
+// Network / connectivity (WiFi-standalone mode)
+pub const FRAME_TYPE_SET_NET_CONFIG: u8 = 0x54;  // host -> device: JSON NetConfig {ssid,password,relays,mode}; reply ACK/NACK
+
 // --- OTA frame types ---
 pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;
 pub const FRAME_TYPE_OTA_CHUNK: u8 = 0x31;

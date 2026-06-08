@@ -111,6 +111,7 @@ mod tests {
         FRAME_TYPE_PROVISION, FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE,
         FRAME_TYPE_ACK, FRAME_TYPE_POLICY_LIST_REQUEST, FRAME_TYPE_POLICY_LIST_RESPONSE,
         FRAME_TYPE_POLICY_REVOKE, FRAME_TYPE_POLICY_UPDATE, MAX_PAYLOAD_SIZE,
+        FRAME_TYPE_SET_NET_CONFIG,
     };
 
     #[test]
@@ -235,5 +236,14 @@ mod tests {
         let frame = parse_frame(&bytes).unwrap();
         assert_eq!(frame.frame_type, FRAME_TYPE_POLICY_UPDATE);
         assert_eq!(frame.payload[0], 1);
+    }
+
+    #[test]
+    fn roundtrip_set_net_config_frame() {
+        let payload = br#"{"ssid":"h","password":"p","relays":["wss://r"],"mode":"wifi"}"#.to_vec();
+        let bytes = build_frame(FRAME_TYPE_SET_NET_CONFIG, &payload).unwrap();
+        let frame = parse_frame(&bytes).unwrap();
+        assert_eq!(frame.frame_type, FRAME_TYPE_SET_NET_CONFIG);
+        assert_eq!(frame.payload, payload);
     }
 }

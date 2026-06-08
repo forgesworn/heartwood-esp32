@@ -10,18 +10,26 @@ use heartwood_common::types::{FRAME_TYPE_ACK, FRAME_TYPE_NACK};
 use crate::protocol;
 use crate::serial::SerialPort;
 
-const NET_CONFIG_KEY: &str = "net_config";
+const NVS_NET_CONFIG_KEY: &str = "net_config";
+
+/// Maximum stored config size. The read buffer is fixed at this size, so the
+/// write must reject anything larger — otherwise the blob writes but every
+/// subsequent boot read returns None (ESP_ERR_NVS_INVALID_LENGTH swallowed).
+const NET_CONFIG_MAX_LEN: usize = 512;
 
 /// Write the network config blob to NVS.
 pub fn write_net_config(nvs: &mut EspNvs<NvsDefault>, json: &[u8]) -> Result<(), &'static str> {
-    nvs.set_blob(NET_CONFIG_KEY, json)
+    if json.len() > NET_CONFIG_MAX_LEN {
+        return Err("net config too large");
+    }
+    nvs.set_blob(NVS_NET_CONFIG_KEY, json)
         .map_err(|_| "nvs write failed")
 }
 
 /// Read the network config blob from NVS. Returns None if not provisioned.
 pub fn read_net_config(nvs: &EspNvs<NvsDefault>) -> Option<Vec<u8>> {
-    let mut buf = [0u8; 512];
-    match nvs.get_blob(NET_CONFIG_KEY, &mut buf) {
+    let mut buf = [0u8; NET_CONFIG_MAX_LEN];
+    match nvs.get_blob(NVS_NET_CONFIG_KEY, &mut buf) {
         Ok(Some(b)) => Some(b.to_vec()),
         _ => None,
     }
@@ -60,7 +68,7 @@ pub fn handle_set_net_config(
             match write_net_config(nvs, payload) {
                 Ok(()) => {
                     log::info!("Network config written to NVS");
-                    crate::oled::show_error(display, "Network config\nset!");
+                    crate::oled::show_result(display, "Network config\nset");
                     esp_idf_hal::delay::FreeRtos::delay_ms(1500);
                     protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
                 }

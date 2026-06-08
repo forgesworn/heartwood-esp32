@@ -70,6 +70,13 @@ mod tests {
     }
 
     #[test]
+    fn wifi_without_ssid_is_invalid() {
+        let json = br#"{"ssid":"","password":"x","relays":["wss://r"],"mode":"wifi"}"#;
+        let cfg = parse_net_config(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn usb_mode_defaults_ok() {
         let json = br#"{"ssid":"","password":"","relays":[],"mode":"usb"}"#;
         let cfg = parse_net_config(json).unwrap();

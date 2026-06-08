@@ -46,6 +46,7 @@ mod policy;
 mod protocol;
 mod provision;
 mod serial;
+mod net_config_store;
 mod session;
 mod sign;
 mod transport;
@@ -81,6 +82,7 @@ use heartwood_common::types::{
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_REVOKE_RESP,
     FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_CONNSLOT_URI_RESP,
     FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
+    FRAME_TYPE_SET_NET_CONFIG,
 };
 use secp256k1::Secp256k1;
 
@@ -168,6 +170,18 @@ fn main() {
     // --- Load masters ---
     let mut loaded_masters = masters::load_all(&nvs);
     log::info!("Loaded {} master(s) from NVS", loaded_masters.len());
+
+    // --- Boot-time network config read ---
+    if let Some(raw) = net_config_store::read_net_config(&nvs) {
+        if let Ok(cfg) = heartwood_common::net_config::parse_net_config(&raw) {
+            log::info!(
+                "net config present: mode={:?}, {} relay(s)",
+                cfg.device_mode(),
+                cfg.relays.len()
+            );
+            // Plan 2: if cfg.device_mode() == DeviceMode::Wifi { spawn relay task with cfg }
+        }
+    }
 
     // If no masters are provisioned, wait for a provision frame before continuing.
     if loaded_masters.is_empty() {
@@ -471,6 +485,17 @@ fn main() {
                     &frame.payload,
                     &mut nvs,
                     &policy_engine,
+                    &mut display,
+                    &button_pin,
+                );
+            }
+
+            // 0x54 — set WiFi-standalone network config
+            FRAME_TYPE_SET_NET_CONFIG => {
+                net_config_store::handle_set_net_config(
+                    &mut usb,
+                    &frame.payload,
+                    &mut nvs,
                     &mut display,
                     &button_pin,
                 );

@@ -12,6 +12,9 @@ heltec-v4 = []
 # Heltec WiFi LoRa 32 V3 -- USB-C wired through a CP2102 bridge to UART0
 # (GPIO43 TX / GPIO44 RX). Mutually exclusive with heltec-v4.
 heltec-v3 = []
+# THROWAWAY feasibility spike (branch spike/wifi-heap): links WiFi + TLS to
+# measure the flash-size delta and on-hardware free-heap cost. DO NOT MERGE.
+wifi-spike = []
 
 [dependencies]
 heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend"] }

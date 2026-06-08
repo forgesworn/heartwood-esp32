@@ -14,6 +14,12 @@ MCU = "esp32s3"
 ESP_IDF_VERSION = "v5.3.2"
 # Cross-compiler for C FFI crates (secp256k1-sys) -- cc crate needs this
 CC_xtensa_esp32s3_espidf = "xtensa-esp32s3-elf-gcc"
+# secp256k1-sys must be compiled with -mlongcalls. Without it, once the binary
+# grows (e.g. WiFi/TLS added), secp256k1's internal call8 instructions go out
+# of range and the link fails with "dangerous relocation: call8 ... out of
+# range". ESP-IDF's own C already uses -mlongcalls; this extends it to the
+# cc-built C FFI crates. (Surfaced by the WiFi heap/size spike, 8 Jun.)
+CFLAGS_xtensa_esp32s3_espidf = "-mlongcalls"
 # Board-specific sdkconfig fragment selection. This is the default for the
 # `heltec-v4` feature (the cargo default). For a V3 build, override this
 # variable at invocation time before `cargo build`, e.g.:

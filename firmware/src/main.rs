@@ -47,6 +47,8 @@ mod protocol;
 mod provision;
 mod serial;
 mod net_config_store;
+#[cfg(feature = "wifi-spike")]
+mod wifi_spike;
 mod session;
 mod sign;
 mod transport;
@@ -93,6 +95,12 @@ fn main() {
     log::info!("Heartwood ESP32 — Phase 4 (multi-master)");
 
     let peripherals = Peripherals::take().expect("failed to take peripherals");
+
+    // THROWAWAY feasibility spike (feature `wifi-spike`): consumes the modem to
+    // link WiFi + TLS and log free-heap. Runs at boot, then normal firmware
+    // continues. Never enabled in a real build. DO NOT MERGE.
+    #[cfg(feature = "wifi-spike")]
+    wifi_spike::run_spike(peripherals.modem);
 
     // Turn on white LED (GPIO 35, active high).
     let mut led = PinDriver::output(peripherals.pins.gpio35).expect("LED pin");

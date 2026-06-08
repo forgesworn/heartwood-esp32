@@ -1,11 +1,12 @@
 # Name,    Type, SubType, Offset,   Size,   Flags
 # Partition layout shared between Heltec V3 (8MB flash, S3FN8) and V4 (8MB
-# or 16MB depending on variant, S3R2). Total partition usage is ~3.1MB so
-# both boards fit comfortably. 1.5MB per OTA slot gives headroom for
-# firmware growth (SIGN_ENVELOPE, future NIP extensions, larger crypto
-# libraries) over the ~1MB current firmware size, with ~50% expansion room.
+# or 16MB depending on variant, S3R2). OTA slots bumped to 2MB to hold the
+# WiFi-standalone binary (mbedTLS + lwIP + websocket ~+0.6MB over the ~1MB
+# USB-only firmware). Total usage ~4.05MB of 8MB; ~3.95MB spare.
+# NOTE: changing OTA slot size is a flash-layout change — devices must be
+# freshly flashed, not OTA-updated, across this boundary.
 nvs,       data, nvs,     ,         0x4000,
 otadata,   data, ota,     ,         0x2000,
 phy_init,  data, phy,     ,         0x1000,
-ota_0,     app,  ota_0,   ,         0x180000,
-ota_1,     app,  ota_1,   ,         0x180000,
+ota_0,     app,  ota_0,   ,         0x200000,
+ota_1,     app,  ota_1,   ,         0x200000,

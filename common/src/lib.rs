@@ -19,3 +19,5 @@ pub mod nip04;
 
 #[cfg(feature = "nip46")]
 pub mod policy;
+
+pub mod net_config;

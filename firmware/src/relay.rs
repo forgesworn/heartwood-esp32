@@ -665,10 +665,60 @@ fn dispatch_mgmt(
                         "auto_approve": s.auto_approve,
                         "signing_approved": s.signing_approved,
                         "current_pubkey": s.current_pubkey,
+                        "allowed_kinds": s.allowed_kinds,
+                        "allowed_methods": s.allowed_methods,
                     })
                 })
                 .collect();
             Ok(serde_json::json!({ "clients": clients }))
+        }
+
+        // Revoke a client slot (operator-authorised — same authority as create).
+        "revoke_client" => {
+            let slot_index = req
+                .pointer("/params/slot_index")
+                .and_then(|v| v.as_u64())
+                .ok_or("revoke_client requires params.slot_index")? as u8;
+            if ctx.policy_engine.revoke_slot(master_slot, slot_index) {
+                ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+                log::info!("[relay] mgmt: revoked client slot {slot_index} (operator)");
+                Ok(serde_json::json!({ "slot_index": slot_index, "revoked": true }))
+            } else {
+                Err(format!("no such slot: {slot_index}"))
+            }
+        }
+
+        // Update a client slot's label / kind restrictions / auto-approve.
+        // update_slot enforces the sign_event security filter internally, so the
+        // operator cannot grant signing this way (only the button / approve_signing).
+        "update_client" => {
+            let slot_index = req
+                .pointer("/params/slot_index")
+                .and_then(|v| v.as_u64())
+                .ok_or("update_client requires params.slot_index")? as u8;
+            let label = req
+                .pointer("/params/label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let methods = req
+                .pointer("/params/allowed_methods")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+            let kinds = req
+                .pointer("/params/allowed_kinds")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_u64()).collect());
+            let auto = req.pointer("/params/auto_approve").and_then(|v| v.as_bool());
+            if ctx
+                .policy_engine
+                .update_slot(master_slot, slot_index, label, methods, kinds, auto)
+            {
+                ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+                log::info!("[relay] mgmt: updated client slot {slot_index} (operator)");
+                Ok(serde_json::json!({ "slot_index": slot_index, "updated": true }))
+            } else {
+                Err(format!("no such slot: {slot_index}"))
+            }
         }
 
         "get_status" => Ok(serde_json::json!({

@@ -47,6 +47,9 @@ mod protocol;
 mod provision;
 mod serial;
 mod net_config_store;
+mod boot_config;
+#[cfg(not(feature = "wifi-spike"))]
+mod relay;
 #[cfg(feature = "wifi-spike")]
 mod wifi_spike;
 mod session;
@@ -95,12 +98,6 @@ fn main() {
     log::info!("Heartwood ESP32 — Phase 4 (multi-master)");
 
     let peripherals = Peripherals::take().expect("failed to take peripherals");
-
-    // THROWAWAY feasibility spike (feature `wifi-spike`): consumes the modem to
-    // link WiFi + TLS and log free-heap. Runs at boot, then normal firmware
-    // continues. Never enabled in a real build. DO NOT MERGE.
-    #[cfg(feature = "wifi-spike")]
-    wifi_spike::run_spike(peripherals.modem);
 
     // Turn on white LED (GPIO 35, active high).
     let mut led = PinDriver::output(peripherals.pins.gpio35).expect("LED pin");
@@ -179,17 +176,46 @@ fn main() {
     let mut loaded_masters = masters::load_all(&nvs);
     log::info!("Loaded {} master(s) from NVS", loaded_masters.len());
 
-    // --- Boot-time network config read ---
-    if let Some(raw) = net_config_store::read_net_config(&nvs) {
-        if let Ok(cfg) = heartwood_common::net_config::parse_net_config(&raw) {
-            log::info!(
-                "net config present: mode={:?}, {} relay(s)",
-                cfg.device_mode(),
-                cfg.relays.len()
-            );
-            // Plan 2: if cfg.device_mode() == DeviceMode::Wifi { spawn relay task with cfg }
+    // --- Flash-time config seed (web flasher — Raspberry Pi Imager model) ---
+    // Seed NVS from the `config` partition whenever the flashed blob differs from
+    // what we last seeded (CRC changed) — so re-flashing is authoritative (e.g.
+    // adding an operator key). USB `SET_NET_CONFIG` changes NVS but not the
+    // partition, so its CRC is unchanged and those edits persist across reboots.
+    // Missing/blank/invalid partition → no-op.
+    if let Some((json, crc)) = boot_config::read_flash_config() {
+        if net_config_store::read_seeded_crc(&nvs) != Some(crc) {
+            if heartwood_common::net_config::parse_net_config(&json).is_ok() {
+                match net_config_store::write_net_config(&mut nvs, &json) {
+                    Ok(()) => {
+                        net_config_store::write_seeded_crc(&mut nvs, crc);
+                        log::info!("Seeded net config from `config` partition (crc {crc:08x})");
+                    }
+                    Err(e) => log::warn!("Flash-config seed failed: {e}"),
+                }
+            } else {
+                log::warn!("Flash-time config partition holds invalid NetConfig JSON — ignoring");
+            }
         }
     }
+
+    // --- Boot-time network config read ---
+    let net_cfg = net_config_store::read_net_config(&nvs)
+        .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok());
+    if let Some(cfg) = &net_cfg {
+        log::info!(
+            "net config present: mode={:?}, {} relay(s)",
+            cfg.device_mode(),
+            cfg.relays.len()
+        );
+    }
+
+    // WiFi-standalone heap probe (feature `wifi-spike`, DO NOT MERGE): brings up
+    // WiFi from the admin-page-provisioned NVS config (or compile-time env creds
+    // as a fallback) and logs the concurrent peak heap. This is the throwaway
+    // measurement that gates real Plan 2 — where the production build would, if
+    // mode == Wifi, spawn the relay/signing task from `net_cfg` here instead.
+    #[cfg(feature = "wifi-spike")]
+    wifi_spike::run_spike(peripherals.modem, net_cfg.as_ref());
 
     // If no masters are provisioned, wait for a provision frame before continuing.
     if loaded_masters.is_empty() {
@@ -306,6 +332,75 @@ fn main() {
             log::info!("OTA: firmware marked as valid (rollback cancelled)");
         } else {
             log::info!("OTA: not an OTA boot or already confirmed ({})", err);
+        }
+    }
+
+    // --- USB escape hatch ---
+    // wifi-standalone is otherwise a one-way door: NVS holds mode=wifi and the
+    // relay loop has no USB listener, so the device can't be re-managed over USB
+    // (e.g. to create a client) without wiping NVS, which would destroy the
+    // master. Holding PRG during a short post-boot window forces USB mode for
+    // this boot only. GPIO0 can't be held through reset (that enters the ROM
+    // download mode), so we sample AFTER boot, prompting on the OLED.
+    #[cfg(not(feature = "wifi-spike"))]
+    let force_usb_mode = {
+        let wifi_armed = net_cfg
+            .as_ref()
+            .map(|c| c.device_mode() == heartwood_common::net_config::DeviceMode::Wifi)
+            .unwrap_or(false)
+            && !loaded_masters.is_empty();
+        let mut forced = false;
+        if wifi_armed {
+            log::info!("Hold PRG within 3s to force USB mode (skip wifi)…");
+            oled::show_result(&mut display, "Hold PRG = USB");
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(3000) {
+                if button_pin.is_low() {
+                    forced = true;
+                    log::info!("PRG held — forcing USB mode for this boot");
+                    oled::show_result(&mut display, "USB mode (forced)");
+                    break;
+                }
+                esp_idf_hal::delay::FreeRtos::delay_ms(50);
+            }
+            if !forced {
+                // Restore the boot screen the prompt overwrote.
+                if loaded_masters.len() == 1 {
+                    oled::show_npub(&mut display, &encode_npub(&loaded_masters[0].pubkey));
+                } else {
+                    oled::show_boot(&mut display, loaded_masters.len() as u8);
+                }
+            }
+        }
+        forced
+    };
+
+    // --- WiFi-standalone (Plan 2): relay signing loop ---
+    // In wifi mode the device handles NIP-46 over its own outbound relay
+    // connection — no USB bridge, no inbound listener. usb mode (or a forced
+    // escape hatch) falls through to the frame dispatch loop below. Never
+    // returns once entered.
+    #[cfg(not(feature = "wifi-spike"))]
+    if !force_usb_mode {
+        if let Some(cfg) = &net_cfg {
+            if cfg.device_mode() == heartwood_common::net_config::DeviceMode::Wifi
+                && !loaded_masters.is_empty()
+            {
+                log::info!("WiFi-standalone mode — entering relay loop");
+                let op_mgmt = cfg.op_mgmt_pubkey();
+                relay::run_wifi_standalone(
+                    peripherals.modem,
+                    cfg,
+                    &loaded_masters,
+                    &secp,
+                    &mut display,
+                    &button_pin,
+                    &mut policy_engine,
+                    &mut identity_caches,
+                    &mut nvs,
+                    op_mgmt,
+                );
+            }
         }
     }
 

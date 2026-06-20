@@ -237,6 +237,27 @@ fn main() {
                     ) {
                         loaded_masters.push(master);
                         log::info!("First master provisioned — continuing boot");
+                        // A wifi-configured device leaves the USB path the moment
+                        // it has a master and runs the relay loop instead. Reboot
+                        // cleanly so the wifi/relay stack initialises from a fresh
+                        // boot rather than a half-set-up transition — this removes
+                        // the manual reset the operator otherwise had to do, and
+                        // the "USB stopped responding" confusion. The provision
+                        // ACK was already sent by handle_add; delay briefly so it
+                        // flushes to the host before we restart.
+                        let wifi_armed = net_cfg
+                            .as_ref()
+                            .map(|c| {
+                                c.device_mode()
+                                    == heartwood_common::net_config::DeviceMode::Wifi
+                            })
+                            .unwrap_or(false);
+                        if wifi_armed {
+                            log::info!("Wifi-standalone configured — rebooting into signer mode");
+                            oled::show_result(&mut display, "Provisioned!\nStarting wifi...");
+                            esp_idf_hal::delay::FreeRtos::delay_ms(800);
+                            unsafe { esp_idf_svc::sys::esp_restart() };
+                        }
                         break;
                     }
                     // handle_add sent a NACK; wait for the next frame.

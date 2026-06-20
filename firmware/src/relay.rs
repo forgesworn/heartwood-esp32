@@ -78,6 +78,11 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(50);
 /// WS connection alive, so the connection never looks dead — periodic re-REQ
 /// (same sub id, idempotent overwrite) re-establishes delivery either way.
 const RESUB_INTERVAL: Duration = Duration::from_secs(40);
+/// Blank the OLED after this much inactivity to prevent burn-in on a 24/7 shelf
+/// device. The wifi-standalone relay loop otherwise leaves a static npub on the
+/// panel forever. Mirrors the USB frame loop's DISPLAY_TIMEOUT. A request or a
+/// PRG press wakes it again.
+const DISPLAY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Signing context borrowed from `main` for the lifetime of the relay loop.
 /// `masters`/`secp`/`button_pin` are shared refs; the rest are exclusive.
@@ -97,6 +102,10 @@ struct SignCtx<'a, 'd, 'b> {
     relay_url: String,
     /// Bounded replay seen-set of recent management request ids.
     seen: Vec<String>,
+    /// OLED power state — false once blanked for burn-in protection.
+    display_on: bool,
+    /// Last time a real request touched the screen (drives the blank timeout).
+    last_activity: Instant,
 }
 
 /// Host out of a `wss://`/`ws://` relay URL (scheme, port and path stripped).
@@ -166,6 +175,8 @@ pub fn run_wifi_standalone<'d, 'b>(
         op_mgmt,
         relay_url: relay_url.clone(),
         seen: Vec::new(),
+        display_on: true,
+        last_activity: Instant::now(),
     };
 
     loop {
@@ -293,6 +304,16 @@ fn serve_relay(host: &str, ctx: &mut SignCtx) -> Result<(), String> {
             if now.duration_since(last_rx) >= SILENCE_LIMIT {
                 return Err("relay silent (no data/pong); reconnecting".into());
             }
+            // Burn-in protection: blank the OLED after inactivity; a PRG press
+            // wakes it (a request also wakes it, via process_event).
+            if ctx.display_on && now.duration_since(ctx.last_activity) >= DISPLAY_TIMEOUT {
+                crate::oled::sleep_display(ctx.display);
+                ctx.display_on = false;
+            } else if !ctx.display_on && ctx.button_pin.is_low() {
+                crate::oled::wake_display(ctx.display);
+                ctx.display_on = true;
+                ctx.last_activity = now;
+            }
         }
     }
 }
@@ -341,6 +362,14 @@ fn process_event(tls: &mut Tls, ev: &SignedEvent, ctx: &mut SignCtx) -> Result<(
     if ev.kind != NIP46_KIND && ev.kind != MGMT_KIND {
         return Ok(());
     }
+    // A real request is about to draw to the OLED — wake it and mark activity so
+    // the burn-in blank timer restarts. (Relay control traffic does NOT count,
+    // or the periodic re-REQ would keep the static screen lit forever.)
+    if !ctx.display_on {
+        crate::oled::wake_display(ctx.display);
+        ctx.display_on = true;
+    }
+    ctx.last_activity = Instant::now();
 
     // Which of our masters is this addressed to? (`p` tag → master pubkey).
     let master_idx = ev

@@ -11,6 +11,10 @@ use crate::protocol;
 use crate::serial::SerialPort;
 
 const NVS_NET_CONFIG_KEY: &str = "net_config";
+/// CRC32 of the config-partition blob last seeded into NVS. Lets `main`
+/// re-seed on a genuine re-flash (CRC changed) while leaving USB
+/// `SET_NET_CONFIG` changes (which don't touch the partition) untouched.
+const NVS_SEEDED_CRC_KEY: &str = "ncfg_crc";
 
 /// Maximum stored config size. The read buffer is fixed at this size, so the
 /// write must reject anything larger — otherwise the blob writes but every
@@ -32,6 +36,18 @@ pub fn read_net_config(nvs: &EspNvs<NvsDefault>) -> Option<Vec<u8>> {
     match nvs.get_blob(NVS_NET_CONFIG_KEY, &mut buf) {
         Ok(Some(b)) => Some(b.to_vec()),
         _ => None,
+    }
+}
+
+/// CRC of the config-partition blob last seeded into NVS (`None` if never).
+pub fn read_seeded_crc(nvs: &EspNvs<NvsDefault>) -> Option<u32> {
+    nvs.get_u32(NVS_SEEDED_CRC_KEY).ok().flatten()
+}
+
+/// Record the CRC of the config-partition blob just seeded into NVS.
+pub fn write_seeded_crc(nvs: &mut EspNvs<NvsDefault>, crc: u32) {
+    if nvs.set_u32(NVS_SEEDED_CRC_KEY, crc).is_err() {
+        log::warn!("Failed to persist seeded config CRC");
     }
 }
 

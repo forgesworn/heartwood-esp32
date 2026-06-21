@@ -41,6 +41,7 @@ use secp256k1::{Keypair, Secp256k1, SignOnly};
 
 use heartwood_common::frame::Frame;
 use heartwood_common::hex::{hex_decode, hex_encode};
+use heartwood_common::mgmt;
 use heartwood_common::net_config::NetConfig;
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
@@ -62,6 +63,9 @@ const NIP46_KIND: u64 = 24133;
 const MGMT_KIND: u64 = 24134;
 /// Bound on the management replay seen-set (recent request ids).
 const SEEN_MAX: usize = 64;
+/// NVS key the management replay seen-set is persisted under, so a captured
+/// command cannot be replayed after the device reboots.
+const MGMT_SEEN_KEY: &str = "mgmt_seen";
 /// Initial capacity of the inbound byte-accumulation buffer.
 const READ_BUF: usize = 8192;
 /// Largest single inbound WS frame we'll accept; bigger ⇒ drop + reconnect.
@@ -164,6 +168,13 @@ pub fn run_wifi_standalone<'d, 'b>(
     let relay_url = cfg.relays.first().cloned().unwrap_or_default();
     let host = relay_host(&relay_url).to_string();
 
+    // Restore the replay seen-set from NVS so a command captured off the relay
+    // cannot be replayed across a reboot (within the SEEN_MAX window).
+    let seen = load_mgmt_seen(nvs);
+    if !seen.is_empty() {
+        log::info!("[relay] restored {} management replay id(s) from NVS", seen.len());
+    }
+
     let mut ctx = SignCtx {
         masters,
         secp,
@@ -174,7 +185,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         nvs,
         op_mgmt,
         relay_url: relay_url.clone(),
-        seen: Vec::new(),
+        seen,
         display_on: true,
         last_activity: Instant::now(),
     };
@@ -473,6 +484,31 @@ fn handle_nip46_event(
     )
 }
 
+/// Load the persisted management replay seen-set from NVS. Absent/corrupt ⇒
+/// empty (fail open to an empty set — replay protection rebuilds as commands
+/// arrive; it never blocks a legitimate fresh command).
+fn load_mgmt_seen(nvs: &mut EspNvs<NvsDefault>) -> Vec<String> {
+    let mut buf = [0u8; 8192];
+    match nvs.get_blob(MGMT_SEEN_KEY, &mut buf) {
+        Ok(Some(data)) => serde_json::from_slice::<Vec<String>>(data).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Persist the management replay seen-set to NVS after accepting a command.
+/// Management is rare (config changes), so the write rate is far below any NVS
+/// wear concern — unlike per-signing state, this is safe to write each time.
+fn persist_mgmt_seen(nvs: &mut EspNvs<NvsDefault>, seen: &[String]) {
+    match serde_json::to_string(seen) {
+        Ok(json) => {
+            if let Err(e) = nvs.set_blob(MGMT_SEEN_KEY, json.as_bytes()) {
+                log::error!("[relay] persist mgmt seen-set: {e:?}");
+            }
+        }
+        Err(e) => log::error!("[relay] serialise mgmt seen-set: {e}"),
+    }
+}
+
 /// Relay-management path (kind 24134): authenticate the author against the
 /// baked operator key, decrypt, replay-guard, dispatch, then sign + publish.
 fn handle_mgmt_event(
@@ -489,12 +525,16 @@ fn handle_mgmt_event(
         }
     };
 
-    // SECURITY CRUX: the command runs only if signed by the baked operator key.
+    // SECURITY CRUX: the command runs only if it comes from the baked operator
+    // key. NIP-44 (below) already makes forgery impossible — a third party can't
+    // encrypt under the device⇄operator conversation key without the operator
+    // secret — and this author gate is the explicit authority check on top.
+    // The rule itself is `mgmt::is_operator`, unit-tested on the host.
     let author: [u8; 32] = match hex_decode(&ev.pubkey).ok().and_then(|v| v.try_into().ok()) {
         Some(a) => a,
         None => return Ok(()),
     };
-    if author != op_mgmt {
+    if !mgmt::is_operator(&author, &op_mgmt) {
         log::warn!(
             "[relay] mgmt from non-operator {}…; rejecting",
             &ev.pubkey[..ev.pubkey.len().min(16)]
@@ -532,16 +572,25 @@ fn handle_mgmt_event(
     let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    // Replay guard: reject empty/duplicate ids (bounded in-memory seen-set).
-    // (Full freshness via created_at window / NIP-40 awaits on-device time.)
-    if id.is_empty() || ctx.seen.iter().any(|s| s == &id) {
-        log::warn!("[relay] mgmt replay or empty id ({id}); ignoring");
-        return Ok(());
+    // Replay guard. The id checked here is the *inner* request id — it lives
+    // inside the NIP-44 ciphertext, so it cannot be forged or altered without
+    // the operator secret. The seen-set is bounded and persisted to NVS, so a
+    // command captured off the relay can't be replayed after a reboot either.
+    // (No created_at/NIP-40 window: the device has no trusted wall-clock, and
+    // the persisted inner-id set already closes the replay path.)
+    match mgmt::classify_replay(&id, &ctx.seen) {
+        mgmt::Replay::Fresh => {}
+        mgmt::Replay::Empty => {
+            log::warn!("[relay] mgmt request with empty id; ignoring");
+            return Ok(());
+        }
+        mgmt::Replay::Seen => {
+            log::warn!("[relay] mgmt replay (id {id}); ignoring");
+            return Ok(());
+        }
     }
-    ctx.seen.push(id.clone());
-    if ctx.seen.len() > SEEN_MAX {
-        ctx.seen.remove(0);
-    }
+    mgmt::remember(&id, &mut ctx.seen, SEEN_MAX);
+    persist_mgmt_seen(ctx.nvs, &ctx.seen);
     log::info!("[relay] mgmt request: method={method} id={id} (operator authenticated)");
 
     let response_json = match dispatch_mgmt(&method, &req, ctx, master_idx) {

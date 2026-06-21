@@ -21,3 +21,5 @@ pub mod nip04;
 pub mod policy;
 
 pub mod net_config;
+
+pub mod mgmt;

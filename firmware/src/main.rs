@@ -48,10 +48,7 @@ mod provision;
 mod serial;
 mod net_config_store;
 mod boot_config;
-#[cfg(not(feature = "wifi-spike"))]
 mod relay;
-#[cfg(feature = "wifi-spike")]
-mod wifi_spike;
 mod session;
 mod sign;
 mod transport;
@@ -209,14 +206,6 @@ fn main() {
         );
     }
 
-    // WiFi-standalone heap probe (feature `wifi-spike`, DO NOT MERGE): brings up
-    // WiFi from the admin-page-provisioned NVS config (or compile-time env creds
-    // as a fallback) and logs the concurrent peak heap. This is the throwaway
-    // measurement that gates real Plan 2 — where the production build would, if
-    // mode == Wifi, spawn the relay/signing task from `net_cfg` here instead.
-    #[cfg(feature = "wifi-spike")]
-    wifi_spike::run_spike(peripherals.modem, net_cfg.as_ref());
-
     // If no masters are provisioned, wait for a provision frame before continuing.
     if loaded_masters.is_empty() {
         log::info!("No masters provisioned — entering provision-wait mode");
@@ -363,7 +352,6 @@ fn main() {
     // master. Holding PRG during a short post-boot window forces USB mode for
     // this boot only. GPIO0 can't be held through reset (that enters the ROM
     // download mode), so we sample AFTER boot, prompting on the OLED.
-    #[cfg(not(feature = "wifi-spike"))]
     let force_usb_mode = {
         let wifi_armed = net_cfg
             .as_ref()
@@ -401,7 +389,6 @@ fn main() {
     // connection — no USB bridge, no inbound listener. usb mode (or a forced
     // escape hatch) falls through to the frame dispatch loop below. Never
     // returns once entered.
-    #[cfg(not(feature = "wifi-spike"))]
     if !force_usb_mode {
         if let Some(cfg) = &net_cfg {
             if cfg.device_mode() == heartwood_common::net_config::DeviceMode::Wifi

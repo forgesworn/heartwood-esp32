@@ -23,3 +23,6 @@ pub mod policy;
 pub mod net_config;
 
 pub mod mgmt;
+
+#[cfg(feature = "mnemonic-gen")]
+pub mod mnemonic;

@@ -14,7 +14,7 @@ heltec-v4 = []
 heltec-v3 = []
 
 [dependencies]
-heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend"] }
+heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen"] }
 
 # Crypto — libsecp256k1 C FFI (alignment-safe on Xtensa, unlike k256)
 secp256k1 = { version = "0.29" }

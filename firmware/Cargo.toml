@@ -39,3 +39,11 @@ log = "0.4"
 
 [build-dependencies]
 embuild = "0.33"
+
+# Size-optimise the release binary. The WiFi-standalone + on-device-generation
+# firmware must fit the 2 MB ota_0 slot; default release (opt-level=3) overflowed
+# it. opt-level="z" + a single codegen unit claws it back. (LTO is NOT used —
+# it breaks the secp256k1-sys C build under the xtensa -mlongcalls toolchain.)
+[profile.release]
+opt-level = "z"
+codegen-units = 1

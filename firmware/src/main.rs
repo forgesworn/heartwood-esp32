@@ -34,6 +34,7 @@ compile_error!(
 mod approval;
 mod backup;
 mod button;
+mod connslot;
 mod identity_cache;
 mod masters;
 mod nip46_handler;
@@ -72,18 +73,15 @@ const IDLE_POLL_MS: u32 = 50;
 
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::types::{
-    FRAME_TYPE_ACK, FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
+    FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
     FRAME_TYPE_SIGN_ENVELOPE,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
     FRAME_TYPE_GENERATE_IDENTITY,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
-    FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_CREATE_RESP,
-    FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_LIST_RESP,
-    FRAME_TYPE_CONNSLOT_UPDATE, FRAME_TYPE_CONNSLOT_UPDATE_RESP,
-    FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_REVOKE_RESP,
-    FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_CONNSLOT_URI_RESP,
+    FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_UPDATE,
+    FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
     FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
     FRAME_TYPE_SET_NET_CONFIG,
 };
@@ -432,6 +430,7 @@ fn main() {
                     &mut identity_caches,
                     &mut nvs,
                     op_mgmt,
+                    &mut usb,
                 );
             }
         }
@@ -659,211 +658,27 @@ fn main() {
 
             // 0x40 -- create a connection slot
             FRAME_TYPE_CONNSLOT_CREATE => {
-                if !policy_engine.bridge_authenticated {
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else if frame.payload.is_empty() {
-                    log::warn!("CONNSLOT_CREATE missing master_slot");
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else {
-                    let ms = frame.payload[0];
-                    let label = if frame.payload.len() > 1 {
-                        String::from_utf8_lossy(&frame.payload[1..]).to_string()
-                    } else {
-                        "unnamed".to_string()
-                    };
-
-                    // Generate secret via hardware RNG, with a guaranteed
-                    // entropy source (the radio may be off in USB mode).
-                    let mut secret_bytes = [0u8; 32];
-                    fill_random_strong(&mut secret_bytes);
-                    let secret_hex = heartwood_common::hex::hex_encode(&secret_bytes);
-                    secret_bytes.iter_mut().for_each(|b| *b = 0); // zeroize raw bytes
-
-                    match policy_engine.create_slot(ms, label.clone(), secret_hex.clone()) {
-                        Some(index) => {
-                            policy_engine.persist_slots(&mut nvs, ms);
-
-                            // Build response with slot info and master pubkey.
-                            let npub_hex = loaded_masters.iter()
-                                .find(|m| m.slot == ms)
-                                .map(|m| heartwood_common::hex::hex_encode(&m.pubkey))
-                                .unwrap_or_default();
-
-                            let resp = serde_json::json!({
-                                "slot_index": index,
-                                "secret": secret_hex,
-                                "label": label,
-                                "npub": npub_hex,
-                            });
-                            protocol::write_frame(
-                                &mut usb,
-                                FRAME_TYPE_CONNSLOT_CREATE_RESP,
-                                resp.to_string().as_bytes(),
-                            );
-                            log::info!("Created connection slot {} ({}) for master {}", index, label, ms);
-                        }
-                        None => {
-                            log::warn!("No free connection slots for master {ms}");
-                            protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"slots full");
-                        }
-                    }
-                }
+                connslot::handle_create(&mut usb, &frame, &mut policy_engine, &loaded_masters, &mut nvs);
             }
 
             // 0x42 -- list connection slots (secrets redacted)
             FRAME_TYPE_CONNSLOT_LIST => {
-                if frame.payload.is_empty() {
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else {
-                    let ms = frame.payload[0];
-                    let slots = policy_engine.list_slots(ms);
-                    let redacted: Vec<_> = slots.iter()
-                        .map(heartwood_common::policy::redact_slot)
-                        .collect();
-                    match serde_json::to_vec(&redacted) {
-                        Ok(json) => protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_LIST_RESP, &json),
-                        Err(e) => {
-                            log::error!("Failed to serialise slot list: {e}");
-                            protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                        }
-                    }
-                }
+                connslot::handle_list(&mut usb, &frame, &mut policy_engine);
             }
 
             // 0x44 -- update a connection slot (requires button confirmation)
             FRAME_TYPE_CONNSLOT_UPDATE => {
-                if !policy_engine.bridge_authenticated {
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else if frame.payload.len() < 2 {
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else {
-                    let ms = frame.payload[0];
-                    match serde_json::from_slice::<serde_json::Value>(&frame.payload[1..]) {
-                        Ok(v) => {
-                            let idx = v["slot_index"].as_u64().unwrap_or(255) as u8;
-
-                            // Resolve the slot label for the OLED prompt.
-                            let slot_label = policy_engine.list_slots(ms)
-                                .iter()
-                                .find(|s| s.slot_index == idx)
-                                .map(|s| s.label.clone())
-                                .unwrap_or_else(|| format!("slot {idx}"));
-
-                            // Build a short description of what's changing.
-                            let mut changes = String::new();
-                            if v.get("allowed_kinds").is_some() {
-                                changes.push_str("kinds");
-                            }
-                            if v.get("auto_approve").is_some() {
-                                if !changes.is_empty() { changes.push_str(", "); }
-                                changes.push_str("auto");
-                            }
-                            if v.get("label").is_some() {
-                                if !changes.is_empty() { changes.push_str(", "); }
-                                changes.push_str("label");
-                            }
-                            if changes.is_empty() { changes.push_str("policy"); }
-
-                            // Truncate label for OLED (max ~12 chars per line)
-                            let short_label: String = slot_label.chars().take(12).collect();
-
-                            let result = crate::approval::run_approval_loop(
-                                &mut display,
-                                &button_pin,
-                                30,
-                                |d, remaining| {
-                                    let msg = format!("Update {}?\n{}\n{}s", short_label, changes, remaining);
-                                    crate::oled::show_error(d, &msg);
-                                },
-                            );
-
-                            if !matches!(result, crate::approval::ApprovalResult::Approved) {
-                                log::info!("CONNSLOT_UPDATE denied by user for {}", slot_label);
-                                protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                            } else {
-                                let label = v["label"].as_str().map(|s| s.to_string());
-                                let methods = v["allowed_methods"].as_array().map(|arr|
-                                    arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
-                                );
-                                let kinds = v["allowed_kinds"].as_array().map(|arr|
-                                    arr.iter().filter_map(|v| v.as_u64()).collect()
-                                );
-                                let auto = v["auto_approve"].as_bool();
-
-                                if policy_engine.update_slot(ms, idx, label, methods, kinds, auto) {
-                                    policy_engine.persist_slots(&mut nvs, ms);
-                                    log::info!("Updated slot {} ({}) — approved by button", idx, slot_label);
-                                    protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"ok");
-                                } else {
-                                    protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"not found");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("CONNSLOT_UPDATE bad JSON: {e}");
-                            protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                        }
-                    }
-                }
+                connslot::handle_update(&mut usb, &frame, &mut policy_engine, &mut nvs, &mut display, &button_pin);
             }
 
             // 0x46 -- revoke a connection slot
             FRAME_TYPE_CONNSLOT_REVOKE => {
-                if !policy_engine.bridge_authenticated {
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else if frame.payload.len() < 2 {
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else {
-                    let ms = frame.payload[0];
-                    let idx = frame.payload[1];
-                    if policy_engine.revoke_slot(ms, idx) {
-                        policy_engine.persist_slots(&mut nvs, ms);
-                        protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"ok");
-                        log::info!("Revoked connection slot {} for master {}", idx, ms);
-                    } else {
-                        protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"not found");
-                    }
-                }
+                connslot::handle_revoke(&mut usb, &frame, &mut policy_engine, &mut nvs);
             }
 
             // 0x48 -- get bunker URI for a connection slot
             FRAME_TYPE_CONNSLOT_URI => {
-                if !policy_engine.bridge_authenticated {
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else if frame.payload.len() < 2 {
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
-                } else {
-                    let ms = frame.payload[0];
-                    let idx = frame.payload[1];
-                    let relay_json = if frame.payload.len() > 2 {
-                        String::from_utf8_lossy(&frame.payload[2..]).to_string()
-                    } else {
-                        "[]".to_string()
-                    };
-
-                    let slot = policy_engine.list_slots(ms).iter().find(|s| s.slot_index == idx);
-                    let master = loaded_masters.iter().find(|m| m.slot == ms);
-
-                    match (slot, master) {
-                        (Some(slot), Some(master)) => {
-                            let npub_hex = heartwood_common::hex::hex_encode(&master.pubkey);
-                            let relays: Vec<String> = serde_json::from_str(&relay_json).unwrap_or_default();
-                            let relay_params = relays.iter()
-                                .map(|r| format!("relay={}", r))
-                                .collect::<Vec<_>>()
-                                .join("&");
-                            let uri = if relay_params.is_empty() {
-                                format!("bunker://{}?secret={}", npub_hex, slot.secret)
-                            } else {
-                                format!("bunker://{}?{}&secret={}", npub_hex, relay_params, slot.secret)
-                            };
-                            protocol::write_frame(&mut usb, FRAME_TYPE_CONNSLOT_URI_RESP, uri.as_bytes());
-                        }
-                        _ => {
-                            protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"not found");
-                        }
-                    }
-                }
+                connslot::handle_uri(&mut usb, &frame, &mut policy_engine, &loaded_masters);
             }
 
             // 0x50 -- backup export (dump all slots + bridge secret)

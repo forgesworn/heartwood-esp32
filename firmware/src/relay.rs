@@ -45,12 +45,18 @@ use heartwood_common::mgmt;
 use heartwood_common::net_config::NetConfig;
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
-use heartwood_common::types::FRAME_TYPE_NIP46_REQUEST;
+use heartwood_common::types::{
+    FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_REVOKE,
+    FRAME_TYPE_CONNSLOT_UPDATE, FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_NACK,
+    FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_SESSION_AUTH,
+    FRAME_TYPE_SET_BRIDGE_SECRET,
+};
 
 use crate::identity_cache::IdentityCache;
 use crate::masters::{self, LoadedMaster};
 use crate::oled::Display;
 use crate::policy::PolicyEngine;
+use crate::serial::SerialPort;
 use crate::sign;
 
 type Tls = EspTls<InternalSocket>;
@@ -132,6 +138,7 @@ pub fn run_wifi_standalone<'d, 'b>(
     identity_caches: &mut Vec<IdentityCache>,
     nvs: &mut EspNvs<NvsDefault>,
     op_mgmt: Option<[u8; 32]>,
+    usb: &mut SerialPort<'_>,
 ) -> ! {
     log::info!(
         "[relay] WiFi-standalone: SSID={:?}, {} relay(s), {} master(s), mgmt={}",
@@ -204,7 +211,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             continue;
         }
 
-        match serve_relay(&host, &mut ctx) {
+        match serve_relay(&host, &mut ctx, usb) {
             Ok(()) => log::info!("[relay] connection closed; reconnecting"),
             Err(e) => log::error!("[relay] {e}; reconnecting in 3s"),
         }
@@ -213,7 +220,7 @@ pub fn run_wifi_standalone<'d, 'b>(
 }
 
 /// One relay session: TLS → WS handshake → subscribe → read/dispatch loop.
-fn serve_relay(host: &str, ctx: &mut SignCtx) -> Result<(), String> {
+fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Result<(), String> {
     let mut tls = EspTls::new().map_err(|e| format!("tls init: {e:?}"))?;
     let mut tls_cfg = TlsConfig::new();
     tls_cfg.common_name = Some(host);
@@ -325,6 +332,61 @@ fn serve_relay(host: &str, ctx: &mut SignCtx) -> Result<(), String> {
                 ctx.display_on = true;
                 ctx.last_activity = now;
             }
+        }
+
+        // Also serve USB management while in wifi mode, so the device can be
+        // managed over the cable as well as its relay. Non-blocking: a quiet
+        // poll returns immediately and never delays the relay/signing path.
+        poll_usb_mgmt(usb, ctx);
+    }
+}
+
+/// Serve one USB management frame while the relay loop runs, so a
+/// wifi-standalone signer can be managed over the cable too. Non-blocking — a
+/// quiet poll returns at once. Only the management subset is accepted: anything
+/// that changes the master set (which the live relay subscription is built
+/// from) or streams firmware is rejected with a hint to use USB-only mode.
+fn poll_usb_mgmt(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
+    let frame = match crate::protocol::try_read_frame(usb, 0) {
+        Some(f) => f,
+        None => return,
+    };
+
+    // USB activity wakes the panel, same as a relay request.
+    if !ctx.display_on {
+        crate::oled::wake_display(ctx.display);
+        ctx.display_on = true;
+    }
+    ctx.last_activity = Instant::now();
+
+    match frame.frame_type {
+        FRAME_TYPE_PROVISION_LIST => crate::provision::handle_list(usb, ctx.masters),
+        FRAME_TYPE_SESSION_AUTH => {
+            crate::session::handle_auth(usb, &frame.payload, ctx.nvs, ctx.policy_engine)
+        }
+        FRAME_TYPE_SET_BRIDGE_SECRET => crate::session::handle_set_bridge_secret(
+            usb, &frame.payload, ctx.nvs, ctx.policy_engine, ctx.display, ctx.button_pin,
+        ),
+        FRAME_TYPE_CONNSLOT_CREATE => {
+            crate::connslot::handle_create(usb, &frame, ctx.policy_engine, ctx.masters, ctx.nvs)
+        }
+        FRAME_TYPE_CONNSLOT_LIST => crate::connslot::handle_list(usb, &frame, ctx.policy_engine),
+        FRAME_TYPE_CONNSLOT_UPDATE => crate::connslot::handle_update(
+            usb, &frame, ctx.policy_engine, ctx.nvs, ctx.display, ctx.button_pin,
+        ),
+        FRAME_TYPE_CONNSLOT_REVOKE => {
+            crate::connslot::handle_revoke(usb, &frame, ctx.policy_engine, ctx.nvs)
+        }
+        FRAME_TYPE_CONNSLOT_URI => {
+            crate::connslot::handle_uri(usb, &frame, ctx.policy_engine, ctx.masters)
+        }
+        other => {
+            log::warn!("[relay] USB frame 0x{other:02x} unsupported in wifi mode");
+            crate::protocol::write_frame(
+                usb,
+                FRAME_TYPE_NACK,
+                b"wifi mode: hold PRG at boot for USB-only operations",
+            );
         }
     }
 }

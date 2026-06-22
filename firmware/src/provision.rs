@@ -127,11 +127,11 @@ pub fn handle_generate(
         String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string()
     };
 
-    // Entropy from the hardware RNG — 128 bits → a 12-word phrase.
+    // Entropy from the hardware RNG — 128 bits → a 12-word phrase. Drawn with a
+    // guaranteed entropy source: provisioning runs before the Wi-Fi radio is up,
+    // so esp_random alone would be only pseudo-random here.
     let mut entropy = [0u8; 16];
-    unsafe {
-        esp_idf_svc::sys::esp_fill_random(entropy.as_mut_ptr() as *mut core::ffi::c_void, 16);
-    }
+    crate::fill_random_strong(&mut entropy);
 
     let (phrase, root) = match heartwood_common::mnemonic::generate(&entropy) {
         Ok(pair) => pair,

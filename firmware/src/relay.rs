@@ -47,7 +47,8 @@ use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
 use heartwood_common::types::{
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_REVOKE,
-    FRAME_TYPE_CONNSLOT_UPDATE, FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_NACK,
+    FRAME_TYPE_CONNSLOT_UPDATE, FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_FIRMWARE_INFO,
+    FRAME_TYPE_FIRMWARE_INFO_RESPONSE, FRAME_TYPE_NACK,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_SESSION_AUTH,
     FRAME_TYPE_SET_BRIDGE_SECRET,
 };
@@ -361,6 +362,11 @@ fn poll_usb_mgmt(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
 
     match frame.frame_type {
         FRAME_TYPE_PROVISION_LIST => crate::provision::handle_list(usb, ctx.masters),
+        FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
+            usb,
+            FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
+            crate::firmware_info_json().as_bytes(),
+        ),
         FRAME_TYPE_SESSION_AUTH => {
             crate::session::handle_auth(usb, &frame.payload, ctx.nvs, ctx.policy_engine)
         }

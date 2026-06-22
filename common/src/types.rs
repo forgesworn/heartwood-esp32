@@ -76,6 +76,8 @@ pub const FRAME_TYPE_WIFI_SCAN_REQUEST: u8 = 0x55;   // host -> device: empty pa
 pub const FRAME_TYPE_WIFI_SCAN_RESPONSE: u8 = 0x56;  // device -> host: JSON [{ssid,rssi,auth}] for the admin-page SSID dropdown
 pub const FRAME_TYPE_GENERATE_IDENTITY: u8 = 0x57;   // host -> device: optional [label_len][label]; device self-generates a seed, shows the 12-word phrase on its OLED, stores it, replies ACK (npub via PROVISION_LIST). The phrase is NEVER sent to the host.
 pub const FRAME_TYPE_RESTORE_IDENTITY: u8 = 0x58;    // host -> device: optional [label_len][label]; device drives an on-screen one-button picker for the owner to re-enter an existing 12-word phrase, validates the checksum, stores it, replies ACK (npub) or NACK (cancel/invalid). The phrase is entered ON the device and is NEVER sent from the host.
+pub const FRAME_TYPE_FIRMWARE_INFO: u8 = 0x59;       // host -> device: empty; read-only version query. Safe (no secrets) so it is also served in WiFi mode.
+pub const FRAME_TYPE_FIRMWARE_INFO_RESPONSE: u8 = 0x5A; // device -> host: JSON { version, board }
 
 // --- OTA frame types ---
 pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;

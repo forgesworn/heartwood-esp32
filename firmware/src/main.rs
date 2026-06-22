@@ -79,6 +79,7 @@ use heartwood_common::types::{
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_RESTORE_IDENTITY,
+    FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_UPDATE,
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
@@ -86,6 +87,23 @@ use heartwood_common::types::{
     FRAME_TYPE_SET_NET_CONFIG,
 };
 use secp256k1::Secp256k1;
+
+/// Board identifier, from the build feature — reported in FIRMWARE_INFO so the
+/// manager can match the right firmware asset and version.
+#[cfg(feature = "heltec-v4")]
+pub const BOARD: &str = "heltec-v4";
+#[cfg(feature = "heltec-v3")]
+pub const BOARD: &str = "heltec-v3";
+
+/// JSON for a FIRMWARE_INFO_RESPONSE — the running firmware version and board.
+/// Read-only and secret-free, so it is answered over USB in any mode.
+pub fn firmware_info_json() -> String {
+    format!(
+        "{{\"version\":\"{}\",\"board\":\"{}\"}}",
+        env!("CARGO_PKG_VERSION"),
+        BOARD
+    )
+}
 
 /// Fill `buf` with hardware-RNG bytes, guaranteeing a true entropy source for
 /// the draw.
@@ -528,6 +546,15 @@ fn main() {
                 if let Some(master) = provisioned {
                     loaded_masters.push(master);
                 }
+            }
+
+            // 0x59 — firmware version query (read-only, no secrets)
+            FRAME_TYPE_FIRMWARE_INFO => {
+                protocol::write_frame(
+                    &mut usb,
+                    FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
+                    firmware_info_json().as_bytes(),
+                );
             }
 
             // 0x02 — plaintext NIP-46 request (only if bridge NOT authenticated)

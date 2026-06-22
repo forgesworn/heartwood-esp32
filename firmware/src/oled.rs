@@ -109,13 +109,17 @@ pub fn show_npub(display: &mut Display<'_>, npub: &str) {
     }
 }
 
-/// Show a 12-word BIP-39 recovery phrase for the owner to write down.
+/// Show a 12-word BIP-39 recovery phrase for the owner to write down, with a
+/// footer prompt / hold feedback line.
 ///
 /// This is the ONLY place the phrase ever appears: it is generated on-device
 /// (hardware RNG) and never sent to the host. Two columns of six numbered words
-/// on the 128x64 panel. The owner reads it off the screen; it blanks on the
-/// usual idle timeout.
-pub fn show_mnemonic(display: &mut Display<'_>, phrase: &str) {
+/// on the 128x64 panel, with `footer` along the bottom (the caller uses it to
+/// instruct the owner and reflect the confirm-hold state). The provision
+/// handler holds this screen up — and blocks the caller from redrawing or
+/// rebooting — until the owner confirms with a button hold, so the phrase
+/// cannot vanish before it is copied down.
+pub fn show_mnemonic(display: &mut Display<'_>, phrase: &str, footer: &str) {
     display.clear_buffer();
 
     let style = MonoTextStyleBuilder::new()
@@ -123,20 +127,28 @@ pub fn show_mnemonic(display: &mut Display<'_>, phrase: &str) {
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("WRITE DOWN — RECOVERY", Point::new(2, 7), style).draw(display).ok();
+    Text::new("RECOVERY - WRITE DOWN", Point::new(2, 7), style).draw(display).ok();
     Rectangle::new(Point::new(0, 10), Size::new(128, 1))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
-    // Words 1–6 in the left column, 7–12 in the right; six rows from y=20.
+    // Words 1–6 in the left column, 7–12 in the right; six rows from y=18 so a
+    // footer prompt fits along the bottom edge.
     let words: Vec<&str> = phrase.split_whitespace().collect();
     for (i, word) in words.iter().enumerate().take(12) {
         let x = if i < 6 { 2 } else { 66 };
-        let y = 20 + (i % 6) as i32 * 7;
+        let y = 18 + (i % 6) as i32 * 7; // 18,25,32,39,46,53
         let line = format!("{:>2} {}", i + 1, word);
         Text::new(&line, Point::new(x, y), style).draw(display).ok();
     }
+
+    // Footer: separator rule + instruction / hold-state line.
+    Rectangle::new(Point::new(0, 55), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display)
+        .ok();
+    Text::new(footer, Point::new(2, 63), style).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

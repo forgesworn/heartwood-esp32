@@ -220,7 +220,7 @@ fn main() {
                     // provision/generate handler to validate/derive the key.
                     let secp = Arc::new(Secp256k1::signing_only());
                     let provisioned = if frame.frame_type == FRAME_TYPE_GENERATE_IDENTITY {
-                        provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display)
+                        provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
                     } else {
                         provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display)
                     };
@@ -489,7 +489,7 @@ fn main() {
             // 0x01 — add a master (host-derived) / 0x57 — self-generate on-device
             FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY => {
                 let provisioned = if frame.frame_type == FRAME_TYPE_GENERATE_IDENTITY {
-                    provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display)
+                    provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
                 } else {
                     provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display)
                 };

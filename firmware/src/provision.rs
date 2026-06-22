@@ -113,6 +113,7 @@ pub fn handle_generate(
     nvs: &mut EspNvs<NvsDefault>,
     secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
     display: &mut Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> Option<LoadedMaster> {
     let label = if frame.payload.is_empty() {
         "default".to_string()
@@ -152,12 +153,19 @@ pub fn handle_generate(
             let npub = encode_npub(&master.pubkey);
             log::info!("Self-generated identity slot {}: {} ({npub})", master.slot, master.label);
             // Show the phrase on the device's own screen — the one place it ever
-            // appears. Then drop the string.
-            oled::show_mnemonic(display, &phrase);
-            drop(phrase);
+            // appears.
+            oled::show_mnemonic(display, &phrase, "Hold button when saved");
             // ACK carries the public npub (only the public key leaves the device)
             // so the host can address it over the relay without a separate fetch.
+            // Sent now so the host advances to its "write it down" step while the
+            // owner copies the words.
             protocol::write_frame(usb, FRAME_TYPE_ACK, npub.as_bytes());
+            // Hold the phrase up until the owner confirms with a button hold. The
+            // caller redraws (or, for a wifi device, reboots) the instant we
+            // return, so without this the phrase would flash and vanish — exactly
+            // the "no words shown" failure this guards against.
+            wait_for_writedown_ack(display, button_pin, &phrase);
+            drop(phrase);
             Some(master)
         }
         Err(e) => {
@@ -167,6 +175,55 @@ pub fn handle_generate(
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             None
         }
+    }
+}
+
+/// Keep the freshly-generated recovery phrase on screen until the owner
+/// confirms they've written it down with a deliberate 2-second button hold.
+///
+/// This is the only moment the phrase is ever visible, and a wifi-standalone
+/// device reboots within a second of provisioning, so we must NOT return (and
+/// let the caller redraw or reboot) until the owner acknowledges. There is no
+/// timeout: an unacknowledged phrase staying on screen is the safe failure
+/// mode — dismissing it early would lose the key for good. The footer line
+/// reflects the hold state, and we wait for release before returning so the
+/// confirm hold isn't re-read by the post-reboot "hold PRG = USB" prompt.
+fn wait_for_writedown_ack(
+    display: &mut Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    phrase: &str,
+) {
+    use esp_idf_hal::delay::FreeRtos;
+    use std::time::Instant;
+
+    const HOLD_MS: u128 = 2000;
+    const POLL_MS: u32 = 20;
+
+    let mut pressed = false;
+    let mut press_start = Instant::now();
+
+    loop {
+        let low = button_pin.is_low();
+        if low && !pressed {
+            pressed = true;
+            press_start = Instant::now();
+            oled::show_mnemonic(display, phrase, "Keep holding...");
+        } else if low && pressed {
+            if press_start.elapsed().as_millis() >= HOLD_MS {
+                oled::show_mnemonic(display, phrase, "Saved - release");
+                // Wait for release so the held button isn't immediately re-read
+                // by the post-reboot USB-mode escape hatch.
+                while button_pin.is_low() {
+                    FreeRtos::delay_ms(POLL_MS);
+                }
+                return;
+            }
+        } else if !low && pressed {
+            // Released before the hold completed — reset and keep the phrase up.
+            pressed = false;
+            oled::show_mnemonic(display, phrase, "Hold button when saved");
+        }
+        FreeRtos::delay_ms(POLL_MS);
     }
 }
 

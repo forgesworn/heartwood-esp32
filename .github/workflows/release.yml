@@ -1,9 +1,10 @@
 name: Release firmware
 
-# On a version tag, build every supported board, then publish each board's
-# OTA-able app image plus a version.json describing them all as release assets.
-# Sapwood's `npm run sync:firmware` pulls these so flashing and OTA always ship
-# the current firmware — no more hand-copied, drifting binaries.
+# On a version tag, build every supported board and publish a complete set of
+# flash images — the OTA-able app, the board's bootloader, and the (shared)
+# partition table — plus a version.json describing them. Sapwood's
+# `npm run sync:firmware` pulls these so both OTA *and* fresh-flash always ship
+# the current, CI-built firmware — no more hand-copied, drifting binaries.
 on:
   push:
     tags: ['v*']
@@ -13,7 +14,7 @@ permissions:
 
 jobs:
   # One isolated build per board (own runner, own target dir — no feature/sdkconfig
-  # cross-contamination). Each emits its app image + a manifest fragment.
+  # cross-contamination). Each emits its app + bootloader + partition table.
   build:
     strategy:
       fail-fast: true
@@ -40,28 +41,46 @@ jobs:
           ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.${{ matrix.board }}"
         run: cargo build --release --no-default-features --features ${{ matrix.board }}
 
-      - name: Save the OTA app image + describe it
+      - name: Collect flash images + describe them
         working-directory: firmware
         run: |
           set -eu
-          out="app-${{ matrix.board }}.bin"
-          espflash save-image --chip esp32s3 \
-            target/xtensa-esp32s3-espidf/release/heartwood-esp32 "$out"
-          size=$(stat -c%s "$out")
+          board="${{ matrix.board }}"
+          elf=target/xtensa-esp32s3-espidf/release/heartwood-esp32
+
+          # App image (what OTA streams + what lands in ota_0).
+          espflash save-image --chip esp32s3 "$elf" "app-$board.bin"
+          size=$(stat -c%s "app-$board.bin")
           limit=2097152
           if [ "$size" -gt "$limit" ]; then
-            echo "::error::${{ matrix.board }} app image ($size B) exceeds the 2 MB ota_0 slot ($limit B)"
+            echo "::error::$board app image ($size B) exceeds the 2 MB ota_0 slot ($limit B)"
             exit 1
           fi
-          sha=$(sha256sum "$out" | cut -d' ' -f1)
-          jq -n --arg b "${{ matrix.board }}" --arg a "$out" --arg s "$sha" --argjson n "$size" \
-            '{($b): {asset: $a, sha256: $s, bytes: $n}}' > "frag-${{ matrix.board }}.json"
+
+          # Bootloader (board-specific: console wiring differs) and partition
+          # table (board-independent; generated from partitions.csv by the
+          # esp-idf build — the reliable path, no espflash 0x40-subtype panic).
+          bl="$(find target -path '*/build/bootloader/bootloader.bin' | head -1)"
+          pt="$(find target -path '*/build/partition_table/partition-table.bin' | head -1)"
+          [ -n "$bl" ] && [ -n "$pt" ] || { echo "::error::bootloader/partition-table not found in build output"; exit 1; }
+          cp "$bl" "bootloader-$board.bin"
+          cp "$pt" "partition-table.bin"
+
+          appsha=$(sha256sum "app-$board.bin" | cut -d' ' -f1)
+          blsha=$(sha256sum "bootloader-$board.bin" | cut -d' ' -f1)
+          jq -n --arg b "$board" \
+            --arg a "app-$board.bin" --arg as "$appsha" --argjson an "$size" \
+            --arg bl "bootloader-$board.bin" --arg bs "$blsha" \
+            '{($b): {app: $a, sha256: $as, bytes: $an, bootloader: $bl, bootloaderSha256: $bs}}' \
+            > "frag-$board.json"
 
       - uses: actions/upload-artifact@v4
         with:
           name: fw-${{ matrix.board }}
           path: |
             firmware/app-${{ matrix.board }}.bin
+            firmware/bootloader-${{ matrix.board }}.bin
+            firmware/partition-table.bin
             firmware/frag-${{ matrix.board }}.json
 
   # Aggregate the per-board outputs into one release.
@@ -90,12 +109,26 @@ jobs:
           set -eu
           mkdir -p out
           find dist -name 'app-*.bin' -exec cp {} out/ \;
+          find dist -name 'bootloader-*.bin' -exec cp {} out/ \;
+
+          # The partition table is board-independent — assert every board built
+          # an identical one, then keep a single copy.
+          mapfile -t pts < <(find dist -name 'partition-table.bin')
+          ref_sha="$(sha256sum "${pts[0]}" | cut -d' ' -f1)"
+          for p in "${pts[@]}"; do
+            [ "$(sha256sum "$p" | cut -d' ' -f1)" = "$ref_sha" ] || { echo "::error::partition tables differ across boards"; exit 1; }
+          done
+          cp "${pts[0]}" out/partition-table.bin
+          pt_bytes=$(stat -c%s out/partition-table.bin)
+
           boards="$(jq -s 'add' $(find dist -name 'frag-*.json'))"
           jq -n \
             --arg v "${GITHUB_REF_NAME#v}" \
             --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pt "partition-table.bin" --arg ps "$ref_sha" --argjson pn "$pt_bytes" \
             --argjson boards "$boards" \
-            '{version: $v, builtAt: $at, boards: $boards}' > out/version.json
+            '{version: $v, builtAt: $at, partitionTable: {asset: $pt, sha256: $ps, bytes: $pn}, boards: $boards}' \
+            > out/version.json
           cat out/version.json
 
       - name: Publish release with the firmware assets
@@ -105,5 +138,5 @@ jobs:
           set -eu
           gh release create "$GITHUB_REF_NAME" \
             --title "Firmware $GITHUB_REF_NAME" \
-            --notes "Heltec firmware ${GITHUB_REF_NAME}. Per-board \`app-<board>.bin\` images; \`version.json\` describes them. Pull into Sapwood with \`npm run sync:firmware\`." \
-            out/app-*.bin out/version.json
+            --notes "Heltec firmware ${GITHUB_REF_NAME}. Per-board \`app-<board>.bin\` + \`bootloader-<board>.bin\`, shared \`partition-table.bin\`; \`version.json\` describes them. Pull into Sapwood with \`npm run sync:firmware\`." \
+            out/app-*.bin out/bootloader-*.bin out/partition-table.bin out/version.json

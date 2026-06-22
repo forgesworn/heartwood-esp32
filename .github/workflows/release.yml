@@ -1,9 +1,9 @@
 name: Release firmware
 
-# On a version tag, build the Heltec V4 firmware and publish the OTA-able
-# app image plus a version.json describing it as release assets. Sapwood's
-# `npm run sync:firmware` pulls these so flashing and OTA always ship the
-# current firmware — no more hand-copied, drifting binaries.
+# On a version tag, build every supported board, then publish each board's
+# OTA-able app image plus a version.json describing them all as release assets.
+# Sapwood's `npm run sync:firmware` pulls these so flashing and OTA always ship
+# the current firmware — no more hand-copied, drifting binaries.
 on:
   push:
     tags: ['v*']
@@ -12,25 +12,16 @@ permissions:
   contents: write # create the release + upload assets via the built-in token
 
 jobs:
-  release:
+  # One isolated build per board (own runner, own target dir — no feature/sdkconfig
+  # cross-contamination). Each emits its app image + a manifest fragment.
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        board: [heltec-v4, heltec-v3]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # The tag (vX.Y.Z) is the source of truth; it must match the firmware's
-      # own Cargo version so the boot screen and FIRMWARE_INFO agree with it.
-      - name: Resolve + verify version
-        id: ver
-        run: |
-          set -eu
-          version="${GITHUB_REF_NAME#v}"
-          cargo_version="$(grep -m1 '^version' firmware/Cargo.toml | cut -d'"' -f2)"
-          if [ "$version" != "$cargo_version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME ($version) != firmware/Cargo.toml ($cargo_version)"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
       - uses: esp-rs/xtensa-toolchain@v1.5
         with:
           default: true
@@ -43,33 +34,69 @@ jobs:
         with:
           tool: espflash
 
-      - name: Build firmware (Heltec V4, release)
+      - name: Build ${{ matrix.board }} (release)
         working-directory: firmware
         env:
-          ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.heltec-v4"
-        run: cargo build --release --no-default-features --features heltec-v4
+          ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.${{ matrix.board }}"
+        run: cargo build --release --no-default-features --features ${{ matrix.board }}
 
       - name: Save the OTA app image + describe it
         working-directory: firmware
         run: |
           set -eu
+          out="app-${{ matrix.board }}.bin"
           espflash save-image --chip esp32s3 \
-            target/xtensa-esp32s3-espidf/release/heartwood-esp32 app.bin
-          size=$(stat -c%s app.bin)
+            target/xtensa-esp32s3-espidf/release/heartwood-esp32 "$out"
+          size=$(stat -c%s "$out")
           limit=2097152
           if [ "$size" -gt "$limit" ]; then
-            echo "::error::app image ($size B) exceeds the 2 MB ota_0 slot ($limit B)"
+            echo "::error::${{ matrix.board }} app image ($size B) exceeds the 2 MB ota_0 slot ($limit B)"
             exit 1
           fi
-          sha=$(sha256sum app.bin | cut -d' ' -f1)
+          sha=$(sha256sum "$out" | cut -d' ' -f1)
+          jq -n --arg b "${{ matrix.board }}" --arg a "$out" --arg s "$sha" --argjson n "$size" \
+            '{($b): {asset: $a, sha256: $s, bytes: $n}}' > "frag-${{ matrix.board }}.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fw-${{ matrix.board }}
+          path: |
+            firmware/app-${{ matrix.board }}.bin
+            firmware/frag-${{ matrix.board }}.json
+
+  # Aggregate the per-board outputs into one release.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the tag matches firmware/Cargo.toml
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version' firmware/Cargo.toml | cut -d'"' -f2)"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME ($version) != firmware/Cargo.toml ($cargo_version)"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Assemble version.json + gather images
+        run: |
+          set -eu
+          mkdir -p out
+          find dist -name 'app-*.bin' -exec cp {} out/ \;
+          boards="$(jq -s 'add' $(find dist -name 'frag-*.json'))"
           jq -n \
-            --arg v "${{ steps.ver.outputs.version }}" \
-            --arg sha "$sha" \
-            --argjson bytes "$size" \
+            --arg v "${GITHUB_REF_NAME#v}" \
             --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{version: $v, builtAt: $at, boards: {"heltec-v4": {app: "app.bin", sha256: $sha, bytes: $bytes}}}' \
-            > version.json
-          cat version.json
+            --argjson boards "$boards" \
+            '{version: $v, builtAt: $at, boards: $boards}' > out/version.json
+          cat out/version.json
 
       - name: Publish release with the firmware assets
         env:
@@ -78,5 +105,5 @@ jobs:
           set -eu
           gh release create "$GITHUB_REF_NAME" \
             --title "Firmware $GITHUB_REF_NAME" \
-            --notes "Heltec V4 firmware ${GITHUB_REF_NAME}. \`app.bin\` is the OTA-able image; \`version.json\` describes it. Pull into Sapwood with \`npm run sync:firmware\`." \
-            firmware/app.bin firmware/version.json
+            --notes "Heltec firmware ${GITHUB_REF_NAME}. Per-board \`app-<board>.bin\` images; \`version.json\` describes them. Pull into Sapwood with \`npm run sync:firmware\`." \
+            out/app-*.bin out/version.json

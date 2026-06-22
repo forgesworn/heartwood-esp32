@@ -172,6 +172,29 @@ mod tests {
         );
     }
 
+    /// PROTOCOL.md §3.1 + Vector 6 — a persona is the child at purpose
+    /// `nostr:persona:<name>`. The signer's `heartwood_derive_persona` builds
+    /// exactly this purpose, so a persona reproduces byte-for-byte across the
+    /// library, signet, and the nsec-tree CLI. If this drifts, a persona
+    /// derived on the device stops matching the same persona elsewhere.
+    #[test]
+    fn persona_purpose_matches_protocol_vector_6() {
+        // tree_root for the abandon…about mnemonic (PROTOCOL Vector 4/6).
+        let tree_root: [u8; 32] = [
+            0xcc, 0x92, 0xd2, 0x13, 0xb5, 0xec, 0xcd, 0x19,
+            0xeb, 0x85, 0xc1, 0x2c, 0x2c, 0xf6, 0xfd, 0x16,
+            0x8f, 0x27, 0xc2, 0xcc, 0x34, 0x7c, 0x51, 0xa7,
+            0xc4, 0xc6, 0x2a, 0xc6, 0x77, 0x95, 0xfc, 0x65,
+        ];
+        let root = create_tree_root(&tree_root).unwrap();
+        let id = derive(&root, "nostr:persona:social", 0).unwrap();
+        assert_eq!(
+            id.npub,
+            "npub1qdztfxg9z46k8qg4707n747y9rt7kl3f954lju2pneesmc3ypf2q83gm0e",
+            "persona derivation drifted from PROTOCOL v1.1 Vector 6"
+        );
+    }
+
     /// nsec-to-tree-root HMAC vector — must match PROTOCOL.md §6.1 Vector 1
     /// and the reference implementations in nsec-tree and heartwood-core.
     #[test]

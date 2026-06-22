@@ -320,7 +320,10 @@ pub fn handle_request(
                 return build_error_json(&request.id, -3, e);
             }
             let index = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let purpose = format!("persona/{name}");
+            // Reserved persona namespace (PROTOCOL v1.1 §3.1) — the same purpose
+            // signet, the library, and the CLI's `derive persona` use, so a
+            // persona reproduces byte-for-byte across all of them.
+            let purpose = format!("nostr:persona:{name}");
 
             let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
                 Some(c) => c,

@@ -80,10 +80,10 @@ pub fn validate_persona_name(name: &str) -> Result<(), &'static str> {
     if contains_control_char(name) {
         return Err("persona name must not contain control characters");
     }
-    // "persona/" prefix is 8 bytes, so the persona name itself cannot exceed
-    // MAX_PURPOSE_BYTES - 8 = 247 bytes. Be conservative and cap at 128 — far
-    // larger than any reasonable human name but well inside the limit after
-    // any future prefix changes.
+    // The "nostr:persona:" prefix (PROTOCOL v1.1 §3.1) is 14 bytes, so the
+    // persona name itself cannot exceed MAX_PURPOSE_BYTES - 14 = 241 bytes. Be
+    // conservative and cap at 128 — far larger than any reasonable human name
+    // but well inside the limit after any future prefix changes.
     if name.len() > 128 {
         return Err("persona name exceeds 128 bytes");
     }

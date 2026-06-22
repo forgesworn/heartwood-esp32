@@ -235,6 +235,11 @@ fn main() {
             let frame = protocol::read_frame(&mut usb);
             match frame.frame_type {
                 FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY => {
+                    // Show the "working" screen before the (one-time, slowish)
+                    // secp context build so generation feedback covers it too.
+                    if frame.frame_type == FRAME_TYPE_GENERATE_IDENTITY {
+                        oled::show_generating(&mut display);
+                    }
                     // secp context not yet created — build a temporary one for the
                     // provision/generate handler to validate/derive the key.
                     let secp = Arc::new(Secp256k1::signing_only());

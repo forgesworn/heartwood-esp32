@@ -155,6 +155,40 @@ pub fn show_recovery_word(display: &mut Display<'_>, index: usize, total: usize,
     }
 }
 
+/// "Working" screen shown the moment a new identity starts generating. Drawing
+/// the random entropy, the PBKDF2 seed stretch, the key derivation and the NVS
+/// write together take a few seconds, during which the OLED would otherwise sit
+/// on the previous screen with no sign anything is happening.
+pub fn show_generating(display: &mut Display<'_>) {
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let large = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("NEW IDENTITY", Point::new(4, 10), header).draw(display).ok();
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display)
+        .ok();
+
+    Text::new("Working", Point::new(29, 40), large).draw(display).ok();
+    Text::new("creating your keys...", Point::new(2, 58), small).draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
 /// Final confirm screen after stepping through every recovery word: a long PRG
 /// hold saves, a short tap restarts the walkthrough so the owner can re-check.
 pub fn show_recovery_done(display: &mut Display<'_>) {

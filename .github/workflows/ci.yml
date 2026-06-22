@@ -1,0 +1,91 @@
+name: CI
+
+# Gate every PR (and main) on: the banned-identity rule, the host-testable
+# `common` logic, and a real firmware build that must still fit the 2 MB
+# ota_0 slot. The firmware previously had NO automated safety net — a compile
+# break or a size overflow was only ever caught by building locally.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # Server-side enforcement of the check-in identity rule (the local pre-commit
+  # hook can be bypassed with --no-verify; this gate cannot). The banned string
+  # is assembled at runtime so this file stays clean and never trips its own check.
+  identity-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Forbid the banned commit identity
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          banned="$(printf 'd%s' 'bowles')"
+          fail=0
+          if git grep -nIi "$banned" -- . ':(exclude).githooks/'; then
+            echo "::error::tracked content contains the banned identity"
+            fail=1
+          fi
+          if [ -n "${BASE:-}" ] && [ -n "${HEAD:-}" ]; then
+            range="$BASE..$HEAD"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          if git log --format='%an <%ae>%n%cn <%ce>' "$range" | grep -i "$banned"; then
+            echo "::error::a commit in $range is authored/committed by the banned identity"
+            fail=1
+          fi
+          [ "$fail" -eq 0 ] && echo "OK: banned identity absent ($range)"
+          exit "$fail"
+
+  # Pure host-testable logic (auth/replay decisions, BIP-39 generation, policy,
+  # validation). Fast — no Xtensa toolchain. `+stable` overrides the repo's
+  # rust-toolchain.toml (channel = "esp") which would otherwise force the
+  # cross-compiler the host crate doesn't need.
+  common-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen
+
+  # Real firmware build for the Heltec V4, plus the 2 MB ota_0 fit check that
+  # has bitten us before (heavy crypto crates / opt level overflow the slot).
+  firmware-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: espflash
+      - name: Build firmware (Heltec V4, release)
+        working-directory: firmware
+        env:
+          ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.heltec-v4"
+        run: cargo build --release --no-default-features --features heltec-v4
+      - name: App image must fit the 2 MB ota_0 slot
+        working-directory: firmware
+        run: |
+          set -eu
+          espflash save-image --chip esp32s3 \
+            target/xtensa-esp32s3-espidf/release/heartwood-esp32 /tmp/app.bin
+          size=$(stat -c%s /tmp/app.bin)
+          limit=2097152
+          echo "app image: $size / $limit bytes ($((size * 100 / limit))%)"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::app image ($size B) exceeds the 2 MB ota_0 slot ($limit B)"
+            exit 1
+          fi

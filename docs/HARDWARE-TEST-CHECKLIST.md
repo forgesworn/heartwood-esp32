@@ -22,33 +22,46 @@ Where a step says "approve on the device", that's a 2-second hold of **PRG**.
 Pick a **known test phrase** with a known npub (e.g. the all-zero vector
 `abandon …× 11 … about`). Do **not** use a real key for the first run.
 
+Gestures (firmware v0.8.1+): **tap = next choice, hold = pick.** There is no
+double-tap.
+
 - [ ] Setup → **Restore from my 12 words** → name → **Restore on my device**.
-- [ ] OLED shows the intro (tap / double-tap / hold) then **WORD 1/12**.
+- [ ] OLED shows the intro (tap = next / hold = pick) then **WORD 1/12**.
 - [ ] Entering a word:
-  - [ ] **Tap** cycles the highlighted choice; the candidate count (top-right) shrinks.
-  - [ ] After a few letters the choice becomes a whole word (underlined); **double-tap** accepts it.
-  - [ ] Typing `a` `b` `a` then accepting offers **abandon** within ≤4 letters.
-- [ ] **Hold** mid-word deletes the last letter; **hold** on an empty word steps back
-      to the previous word.
-- [ ] After 12 words, OLED shows **THIS ACCOUNT?** with the derived npub.
+  - [ ] **Tap** cycles the highlighted choice: valid next letters, then the whole
+        word (underlined) once it resolves, then a **DELETE** item.
+  - [ ] **Hold** picks the highlight — a letter extends the prefix; the underlined
+        word accepts it. Typing `a` `b` `a` offers **abandon** within ≤4 letters.
+  - [ ] Highlight **DELETE** and hold to remove a letter; on an empty word, DELETE
+        steps back to the previous word.
+- [ ] After word 12, OLED shows the **REVIEW** screen:
+  - [ ] **Tap** pages through all 12 words (one big word each), then **SAVE**, then **CANCEL**.
+  - [ ] **Hold** on a word re-enters *just that word* in place, returning to review.
+  - [ ] **Hold** on **SAVE** validates the phrase.
+- [ ] Valid phrase → **THIS ACCOUNT?** with the derived npub:
   - [ ] The npub matches the expected one for the test phrase.
-  - [ ] A **tap** ("no") returns to fix the last word; a 2-second **hold** saves (**RESTORED**).
+  - [ ] A **tap** returns to review; a 2-second **hold** saves (**RESTORED**).
 - [ ] Sapwood shows the same npub and completes.
 
 ### Restore edge cases
 
-- [ ] **Bad checksum:** enter 12 valid words whose checksum is wrong → OLED shows
-      **PHRASE INVALID**; tap returns to fix the last word, hold cancels (Sapwood
-      reports "cancelled / didn't check out").
-- [ ] **Cancel:** at WORD 1/12, hold on the empty prefix → restore cancels cleanly,
-      device returns to its normal screen, no master stored.
+- [ ] **Wrong word recovery (the headline fix):** deliberately accept a wrong word,
+      finish the 12, hit SAVE → on the REVIEW screen, page to the wrong word, hold to
+      re-enter it correctly, SAVE again → succeeds.
+- [ ] **Bad checksum:** 12 valid words with a wrong checksum → SAVE returns to
+      **REVIEW** with a **"! phrase invalid - fix a word"** banner (not a dead-end);
+      fixing the bad word and SAVE then succeeds.
+- [ ] **Cancel:** REVIEW → **CANCEL** (hold), or during entry hold **DELETE** back
+      past word 1 → restore cancels cleanly, device returns to normal, no master stored
+      (Sapwood reports "cancelled / didn't check out").
 - [ ] **Real phrase round-trip:** restore a phrase generated in step 1 on a
       factory-reset board → the npub matches the original identity.
 
 ## 3. OTA over USB (fresh / USB device)
 
-- [ ] Advanced → Update firmware. Choose a newer `app.bin`.
-- [ ] **Update over USB** → OLED shows **FIRMWARE UPDATE** + size + countdown.
+- [ ] Update firmware shows **"On your signer vX / Bundled vY"** and an **Update to vY**
+      button (hand-picking a `.bin` is under **Advanced**).
+- [ ] **Update to vY** → OLED shows **FIRMWARE UPDATE** + size + countdown.
 - [ ] Approve on the device (2-second hold) → Sapwood streams (progress to 100%).
 - [ ] OLED shows **VERIFYING** then **VERIFIED / Rebooting**; device boots the new
       version (check the boot-screen version string).

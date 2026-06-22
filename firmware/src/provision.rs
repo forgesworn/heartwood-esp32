@@ -152,19 +152,15 @@ pub fn handle_generate(
         Ok(master) => {
             let npub = encode_npub(&master.pubkey);
             log::info!("Self-generated identity slot {}: {} ({npub})", master.slot, master.label);
-            // Show the phrase on the device's own screen — the one place it ever
-            // appears.
-            oled::show_mnemonic(display, &phrase, "Hold button when saved");
             // ACK carries the public npub (only the public key leaves the device)
             // so the host can address it over the relay without a separate fetch.
             // Sent now so the host advances to its "write it down" step while the
-            // owner copies the words.
+            // owner steps through the words on the device.
             protocol::write_frame(usb, FRAME_TYPE_ACK, npub.as_bytes());
-            // Hold the phrase up until the owner confirms with a button hold. The
-            // caller redraws (or, for a wifi device, reboots) the instant we
-            // return, so without this the phrase would flash and vanish — exactly
-            // the "no words shown" failure this guards against.
-            wait_for_writedown_ack(display, button_pin, &phrase);
+            // Walk the owner through the phrase one big word at a time and block
+            // the caller from redrawing (or, for a wifi device, rebooting) until
+            // they confirm with a hold. The phrase only ever appears here.
+            walk_recovery_phrase(display, button_pin, &phrase);
             drop(phrase);
             Some(master)
         }
@@ -178,52 +174,54 @@ pub fn handle_generate(
     }
 }
 
-/// Keep the freshly-generated recovery phrase on screen until the owner
-/// confirms they've written it down with a deliberate 2-second button hold.
+/// Walk the owner through the freshly-generated recovery phrase one large word
+/// at a time, advancing on a PRG tap, then gate completion behind a deliberate
+/// hold on a final confirm screen.
 ///
 /// This is the only moment the phrase is ever visible, and a wifi-standalone
 /// device reboots within a second of provisioning, so we must NOT return (and
-/// let the caller redraw or reboot) until the owner acknowledges. There is no
-/// timeout: an unacknowledged phrase staying on screen is the safe failure
-/// mode — dismissing it early would lose the key for good. The footer line
-/// reflects the hold state, and we wait for release before returning so the
-/// confirm hold isn't re-read by the post-reboot "hold PRG = USB" prompt.
-fn wait_for_writedown_ack(
+/// let the caller redraw or reboot) until the owner confirms. There is no
+/// timeout: an unconfirmed phrase staying on screen is the safe failure mode —
+/// dismissing it early would lose the key for good. A short tap on the confirm
+/// screen restarts the walkthrough so the owner can re-check; only a hold
+/// (which `wait_for_press` returns once the button is released) ends it, so the
+/// confirm hold can't be re-read by the post-reboot "hold PRG = USB" prompt.
+fn walk_recovery_phrase(
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
     phrase: &str,
 ) {
-    use esp_idf_hal::delay::FreeRtos;
-    use std::time::Instant;
+    use crate::button::ButtonResult;
 
-    const HOLD_MS: u128 = 2000;
-    const POLL_MS: u32 = 20;
-
-    let mut pressed = false;
-    let mut press_start = Instant::now();
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    let total = words.len();
 
     loop {
-        let low = button_pin.is_low();
-        if low && !pressed {
-            pressed = true;
-            press_start = Instant::now();
-            oled::show_mnemonic(display, phrase, "Keep holding...");
-        } else if low && pressed {
-            if press_start.elapsed().as_millis() >= HOLD_MS {
-                oled::show_mnemonic(display, phrase, "Saved - release");
-                // Wait for release so the held button isn't immediately re-read
-                // by the post-reboot USB-mode escape hatch.
-                while button_pin.is_low() {
-                    FreeRtos::delay_ms(POLL_MS);
-                }
-                return;
-            }
-        } else if !low && pressed {
-            // Released before the hold completed — reset and keep the phrase up.
-            pressed = false;
-            oled::show_mnemonic(display, phrase, "Hold button when saved");
+        // Step through every word; any press advances to the next.
+        for (i, word) in words.iter().enumerate() {
+            oled::show_recovery_word(display, i + 1, total, word);
+            let _ = press_blocking(button_pin);
         }
-        FreeRtos::delay_ms(POLL_MS);
+
+        // Confirm: hold saves, tap restarts the review.
+        oled::show_recovery_done(display);
+        match press_blocking(button_pin) {
+            ButtonResult::Approve => return, // held → saved (released before return)
+            ButtonResult::Deny => continue,  // tapped → show the words again
+        }
+    }
+}
+
+/// Block until the PRG button is pressed and released, reporting whether it was
+/// a long hold (`Approve`) or a short tap (`Deny`). Re-arms on the (deliberately
+/// long) timeout so it never returns on its own.
+fn press_blocking(
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> crate::button::ButtonResult {
+    loop {
+        if let Some(r) = crate::button::wait_for_press(button_pin, std::time::Duration::from_secs(3600)) {
+            return r;
+        }
     }
 }
 

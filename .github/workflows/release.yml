@@ -24,6 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: esp-rs/xtensa-toolchain@v1.5
+        # Authenticate the action's GitHub API lookup so concurrent matrix jobs
+        # don't trip the 60/hr unauthenticated rate limit (a transient 403 here
+        # cancelled a release before this was added).
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           default: true
           buildtargets: esp32s3

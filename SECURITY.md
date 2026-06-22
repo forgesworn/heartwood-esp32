@@ -1,5 +1,12 @@
 # Security policy
 
+## Security model
+
+For what the device protects, against which threats, and where the current
+limits are (notably: physical-access resistance requires secure boot + flash
+encryption, which are not yet enabled), see
+[`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md).
+
 ## Reporting a vulnerability
 
 Security issues should be reported via

@@ -109,46 +109,78 @@ pub fn show_npub(display: &mut Display<'_>, npub: &str) {
     }
 }
 
-/// Show a 12-word BIP-39 recovery phrase for the owner to write down, with a
-/// footer prompt / hold feedback line.
+/// Show ONE recovery-phrase word at a time, large and numbered, for the owner
+/// to step through with the PRG button.
 ///
-/// This is the ONLY place the phrase ever appears: it is generated on-device
-/// (hardware RNG) and never sent to the host. Two columns of six numbered words
-/// on the 128x64 panel, with `footer` along the bottom (the caller uses it to
-/// instruct the owner and reflect the confirm-hold state). The provision
-/// handler holds this screen up — and blocks the caller from redrawing or
-/// rebooting — until the owner confirms with a button hold, so the phrase
-/// cannot vanish before it is copied down.
-pub fn show_mnemonic(display: &mut Display<'_>, phrase: &str, footer: &str) {
+/// The recovery phrase is generated on-device (hardware RNG) and never sent to
+/// the host — this screen is the only place it ever appears. Twelve tiny words
+/// crammed onto the 128x64 panel proved illegible, so the provision handler
+/// walks through them one big word per screen (FONT_10X20), each tagged
+/// "WORD n OF 12", advancing on a button tap. It holds the walkthrough — and
+/// blocks the caller from redrawing or rebooting — until the owner confirms, so
+/// nothing can vanish before it is copied down.
+pub fn show_recovery_word(display: &mut Display<'_>, index: usize, total: usize, word: &str) {
     display.clear_buffer();
 
-    let style = MonoTextStyleBuilder::new()
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let big = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
         .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("RECOVERY - WRITE DOWN", Point::new(2, 7), style).draw(display).ok();
-    Rectangle::new(Point::new(0, 10), Size::new(128, 1))
+    let head = format!("WORD {} OF {}", index, total);
+    Text::new(&head, Point::new(2, 10), header).draw(display).ok();
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
-    // Words 1–6 in the left column, 7–12 in the right; six rows from y=18 so a
-    // footer prompt fits along the bottom edge.
-    let words: Vec<&str> = phrase.split_whitespace().collect();
-    for (i, word) in words.iter().enumerate().take(12) {
-        let x = if i < 6 { 2 } else { 66 };
-        let y = 18 + (i % 6) as i32 * 7; // 18,25,32,39,46,53
-        let line = format!("{:>2} {}", i + 1, word);
-        Text::new(&line, Point::new(x, y), style).draw(display).ok();
+    // The word, large and centred (FONT_10X20 is 10px per glyph).
+    let glyphs = word.chars().count().min(12) as i32;
+    let x = ((128 - glyphs * 10) / 2).max(0);
+    Text::new(word, Point::new(x, 44), big).draw(display).ok();
+
+    let footer = if index >= total { "tap PRG to finish" } else { "tap PRG for next" };
+    Text::new(footer, Point::new(2, 62), small).draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
     }
+}
 
-    // Footer: separator rule + instruction / hold-state line.
-    Rectangle::new(Point::new(0, 55), Size::new(128, 1))
+/// Final confirm screen after stepping through every recovery word: a long PRG
+/// hold saves, a short tap restarts the walkthrough so the owner can re-check.
+pub fn show_recovery_done(display: &mut Display<'_>) {
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(&FONT_7X14)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("ALL 12 SHOWN", Point::new(2, 12), header).draw(display).ok();
+    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
-    Text::new(footer, Point::new(2, 63), style).draw(display).ok();
+
+    Text::new("Hold PRG = save", Point::new(4, 38), body).draw(display).ok();
+    Text::new("tap = show them again", Point::new(4, 56), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

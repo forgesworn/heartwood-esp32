@@ -14,7 +14,7 @@ heltec-v4 = []
 heltec-v3 = []
 
 [dependencies]
-heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend"] }
+heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen"] }
 
 # Crypto — libsecp256k1 C FFI (alignment-safe on Xtensa, unlike k256)
 secp256k1 = { version = "0.29" }
@@ -39,3 +39,11 @@ log = "0.4"
 
 [build-dependencies]
 embuild = "0.33"
+
+# Size-optimise the release binary. The WiFi-standalone + on-device-generation
+# firmware must fit the 2 MB ota_0 slot; default release (opt-level=3) overflowed
+# it. opt-level="z" + a single codegen unit claws it back. (LTO is NOT used —
+# it breaks the secp256k1-sys C build under the xtensa -mlongcalls toolchain.)
+[profile.release]
+opt-level = "z"
+codegen-units = 1

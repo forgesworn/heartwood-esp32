@@ -55,7 +55,8 @@ cd "$FIRMWARE_DIR"
 
 export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.${FEATURE}"
 
-echo "==> Building heartwood-esp32 for Heltec ${BOARD^^}"
+BOARD_UPPER="$(printf '%s' "$BOARD" | tr '[:lower:]' '[:upper:]')"
+echo "==> Building heartwood-esp32 for Heltec ${BOARD_UPPER}"
 echo "    feature                    = ${FEATURE}"
 echo "    ESP_IDF_SDKCONFIG_DEFAULTS = ${ESP_IDF_SDKCONFIG_DEFAULTS}"
 

@@ -77,6 +77,7 @@ use heartwood_common::types::{
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
+    FRAME_TYPE_GENERATE_IDENTITY,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_CREATE_RESP,
     FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_LIST_RESP,
@@ -214,16 +215,16 @@ fn main() {
         loop {
             let frame = protocol::read_frame(&mut usb);
             match frame.frame_type {
-                FRAME_TYPE_PROVISION => {
-                    if let Some(master) = provision::handle_add(
-                        &mut usb,
-                        &frame,
-                        &mut nvs,
-                        // secp context not yet created — build a temporary one for
-                        // the provision handler to validate the key.
-                        &Arc::new(Secp256k1::signing_only()),
-                        &mut display,
-                    ) {
+                FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY => {
+                    // secp context not yet created — build a temporary one for the
+                    // provision/generate handler to validate/derive the key.
+                    let secp = Arc::new(Secp256k1::signing_only());
+                    let provisioned = if frame.frame_type == FRAME_TYPE_GENERATE_IDENTITY {
+                        provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display)
+                    } else {
+                        provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display)
+                    };
+                    if let Some(master) = provisioned {
                         loaded_masters.push(master);
                         log::info!("First master provisioned — continuing boot");
                         // A wifi-configured device leaves the USB path the moment
@@ -485,15 +486,14 @@ fn main() {
         };
 
         match frame.frame_type {
-            // 0x01 — add a master
-            FRAME_TYPE_PROVISION => {
-                if let Some(master) = provision::handle_add(
-                    &mut usb,
-                    &frame,
-                    &mut nvs,
-                    &secp,
-                    &mut display,
-                ) {
+            // 0x01 — add a master (host-derived) / 0x57 — self-generate on-device
+            FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY => {
+                let provisioned = if frame.frame_type == FRAME_TYPE_GENERATE_IDENTITY {
+                    provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display)
+                } else {
+                    provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display)
+                };
+                if let Some(master) = provisioned {
                     loaded_masters.push(master);
                 }
             }

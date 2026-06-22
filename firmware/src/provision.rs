@@ -67,37 +67,103 @@ pub fn handle_add(
         return None;
     };
 
-    // Derive the x-only public key from the secret.
-    let keypair = match secp256k1::Keypair::from_seckey_slice(secp, &secret) {
-        Ok(kp) => kp,
-        Err(_) => {
-            log::error!("Invalid secret key in provision payload");
-            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-            return None;
-        }
-    };
-    let (xonly, _) = keypair.x_only_public_key();
-    let pubkey = xonly.serialize();
-
-    // Persist to NVS. Connection slots are created later via Sapwood.
-    match masters::add_master(nvs, &secret, &label, mode, &pubkey) {
-        Ok(slot) => {
-            let npub = encode_npub(&pubkey);
-            log::info!("Provisioned slot {slot}: {label} ({npub})");
+    match store_master(nvs, secret, label, mode, secp) {
+        Ok(master) => {
+            let npub = encode_npub(&master.pubkey);
+            log::info!("Provisioned slot {}: {} ({npub})", master.slot, master.label);
             oled::show_npub(display, &npub);
             protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
-
-            Some(LoadedMaster {
-                slot,
-                secret,
-                label,
-                mode,
-                pubkey,
-            })
+            Some(master)
         }
         Err(e) => {
             log::error!("Provision add failed: {e}");
             oled::show_error(display, "Provision failed");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            None
+        }
+    }
+}
+
+/// Derive the x-only pubkey from a 32-byte root secret and persist the master to
+/// NVS. No display, no ACK — the caller decides what to show (the npub for an
+/// import, the recovery phrase for a self-generated identity).
+fn store_master(
+    nvs: &mut EspNvs<NvsDefault>,
+    secret: [u8; 32],
+    label: String,
+    mode: MasterMode,
+    secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
+) -> Result<LoadedMaster, String> {
+    let keypair = secp256k1::Keypair::from_seckey_slice(secp, &secret)
+        .map_err(|_| "invalid secret key".to_string())?;
+    let (xonly, _) = keypair.x_only_public_key();
+    let pubkey = xonly.serialize();
+    let slot = masters::add_master(nvs, &secret, &label, mode, &pubkey)?;
+    Ok(LoadedMaster { slot, secret, label, mode, pubkey })
+}
+
+/// Handle a GENERATE_IDENTITY frame (0x57). The device generates its OWN seed
+/// from the hardware RNG, derives the tree root, stores it, and shows the
+/// 12-word recovery phrase on its OLED for the owner to write down. The phrase
+/// is NEVER sent to the host — only the public npub is discoverable (via
+/// PROVISION_LIST). Payload is optional `[label_len][label]`; empty ⇒ "default".
+pub fn handle_generate(
+    usb: &mut SerialPort<'_>,
+    frame: &Frame,
+    nvs: &mut EspNvs<NvsDefault>,
+    secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
+    display: &mut Display<'_>,
+) -> Option<LoadedMaster> {
+    let label = if frame.payload.is_empty() {
+        "default".to_string()
+    } else {
+        let label_len = frame.payload[0] as usize;
+        if frame.payload.len() < 1 + label_len {
+            log::warn!("GENERATE_IDENTITY label length overruns payload");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return None;
+        }
+        String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string()
+    };
+
+    // Entropy from the hardware RNG — 128 bits → a 12-word phrase.
+    let mut entropy = [0u8; 16];
+    unsafe {
+        esp_idf_svc::sys::esp_fill_random(entropy.as_mut_ptr() as *mut core::ffi::c_void, 16);
+    }
+
+    let (phrase, root) = match heartwood_common::mnemonic::generate(&entropy) {
+        Ok(pair) => pair,
+        Err(e) => {
+            entropy.iter_mut().for_each(|b| *b = 0);
+            log::error!("on-device generate failed: {e}");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return None;
+        }
+    };
+    entropy.iter_mut().for_each(|b| *b = 0);
+
+    let mut root = root; // own it so we can zeroize after storing
+    let result = store_master(nvs, root, label, MasterMode::TreeMnemonic, secp);
+    root.iter_mut().for_each(|b| *b = 0);
+
+    match result {
+        Ok(master) => {
+            let npub = encode_npub(&master.pubkey);
+            log::info!("Self-generated identity slot {}: {} ({npub})", master.slot, master.label);
+            // Show the phrase on the device's own screen — the one place it ever
+            // appears. Then drop the string.
+            oled::show_mnemonic(display, &phrase);
+            drop(phrase);
+            // ACK carries the public npub (only the public key leaves the device)
+            // so the host can address it over the relay without a separate fetch.
+            protocol::write_frame(usb, FRAME_TYPE_ACK, npub.as_bytes());
+            Some(master)
+        }
+        Err(e) => {
+            drop(phrase);
+            log::error!("Generate-identity store failed: {e}");
+            oled::show_error(display, "Generate failed");
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             None
         }

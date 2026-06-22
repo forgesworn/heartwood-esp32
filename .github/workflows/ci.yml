@@ -54,13 +54,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen
 
-  # Real firmware build for the Heltec V4, plus the 2 MB ota_0 fit check that
-  # has bitten us before (heavy crypto crates / opt level overflow the slot).
+  # Real firmware build for every shipped board, plus the 2 MB ota_0 fit check
+  # that has bitten us before (heavy crypto crates / opt level overflow the
+  # slot). Building both boards here catches a board-specific break at PR time
+  # rather than only when the release runs.
   firmware-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [heltec-v4, heltec-v3]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: esp-rs/xtensa-toolchain@v1.5
+        # Authenticate the action's "latest Xtensa Rust" GitHub API lookup so it
+        # uses the 5000/hr limit, not the 60/hr unauthenticated one that has
+        # 403'd under concurrent matrix jobs.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           default: true
           buildtargets: esp32s3
@@ -71,11 +82,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: espflash
-      - name: Build firmware (Heltec V4, release)
+      - name: Build firmware (${{ matrix.board }}, release)
         working-directory: firmware
         env:
-          ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.heltec-v4"
-        run: cargo build --release --no-default-features --features heltec-v4
+          ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.${{ matrix.board }}"
+        run: cargo build --release --no-default-features --features ${{ matrix.board }}
       - name: App image must fit the 2 MB ota_0 slot
         working-directory: firmware
         run: |
@@ -84,8 +95,8 @@ jobs:
             target/xtensa-esp32s3-espidf/release/heartwood-esp32 /tmp/app.bin
           size=$(stat -c%s /tmp/app.bin)
           limit=2097152
-          echo "app image: $size / $limit bytes ($((size * 100 / limit))%)"
+          echo "${{ matrix.board }} app image: $size / $limit bytes ($((size * 100 / limit))%)"
           if [ "$size" -gt "$limit" ]; then
-            echo "::error::app image ($size B) exceeds the 2 MB ota_0 slot ($limit B)"
+            echo "::error::${{ matrix.board }} app image ($size B) exceeds the 2 MB ota_0 slot ($limit B)"
             exit 1
           fi

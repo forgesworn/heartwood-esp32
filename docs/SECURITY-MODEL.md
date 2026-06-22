@@ -104,21 +104,25 @@ compromise of every key on it.** For a shelf/server signer behind physical
 security this may be acceptable; for a device that travels, it is the gap between
 "a neat signer" and "a hardware wallet."
 
-### Roadmap to physical-access resistance
+### Decision: eFuse-based hardening is out of scope
 
-The ESP32-S3 supports the fix, and it is the single highest-value security
-investment:
+The ESP32-S3 *can* close this gap cryptographically with
+`CONFIG_SECURE_BOOT=y` (Secure Boot v2) and
+`CONFIG_FLASH_ENCRYPTION_ENABLED=y` + `CONFIG_NVS_ENCRYPTION=y` (seed encrypted at
+rest with a per-device eFuse key). **We have deliberately decided not to do
+this.** Burning those eFuses is **irreversible**, carries a real brick risk, and
+would complicate the flash / OTA / recovery workflow this project depends on. The
+physical-access gap is therefore an **accepted limitation**, mitigated
+operationally (keep the device in your possession; treat a lost device as a
+compromised key and rotate by re-flashing a new identity).
 
-- `CONFIG_SECURE_BOOT=y` (Secure Boot v2) — the device only runs firmware signed
-  by a key you hold; closes the malicious-firmware path cryptographically.
-- `CONFIG_FLASH_ENCRYPTION_ENABLED=y` + `CONFIG_NVS_ENCRYPTION=y` — the seed is
-  encrypted at rest with a per-device eFuse key; a flash dump yields ciphertext.
-
-**Trade-offs (why it is a deliberate decision, not a flag flip):** burning the
-eFuses is **irreversible**; it complicates the flash/OTA/recovery workflow;
-release signing keys must be managed; and a mistake can brick a device. It should
-be rolled out carefully on a sacrificial unit first, with the flasher and OTA
-paths updated to match.
+The only hardening lever that does **not** touch eFuses is **PIN/passphrase-derived
+seed encryption** — derive a key from the boot PIN (e.g. scrypt) and store the
+seed as ciphertext, so a raw flash dump alone is insufficient. This is not built
+today; it trades unattended reboot (a WiFi signer must boot without a human) for
+at-rest protection, so it would suit a "carried, manually unlocked" device rather
+than an always-on relay signer. Captured here as the future option should the
+threat calculus change.
 
 ## What the design already gets right
 

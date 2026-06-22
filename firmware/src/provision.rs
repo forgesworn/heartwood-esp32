@@ -127,6 +127,10 @@ pub fn handle_generate(
         String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string()
     };
 
+    // Feedback while the (multi-second) entropy draw + PBKDF2 + derivation +
+    // NVS write run, so the device isn't silently stuck on the previous screen.
+    oled::show_generating(display);
+
     // Entropy from the hardware RNG — 128 bits → a 12-word phrase. Drawn with a
     // guaranteed entropy source: provisioning runs before the Wi-Fi radio is up,
     // so esp_random alone would be only pseudo-random here.
@@ -191,8 +195,6 @@ fn walk_recovery_phrase(
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
     phrase: &str,
 ) {
-    use crate::button::ButtonResult;
-
     let words: Vec<&str> = phrase.split_whitespace().collect();
     let total = words.len();
 
@@ -203,12 +205,59 @@ fn walk_recovery_phrase(
             let _ = press_blocking(button_pin);
         }
 
-        // Confirm: hold saves, tap restarts the review.
-        oled::show_recovery_done(display);
-        match press_blocking(button_pin) {
-            ButtonResult::Approve => return, // held → saved (released before return)
-            ButtonResult::Deny => continue,  // tapped → show the words again
+        // Confirm with the same 0–100% hold bar used for signing: a full hold
+        // saves, a short tap restarts the review.
+        if confirm_recovery_save(display, button_pin) {
+            oled::show_result(display, "SAVED");
+            return;
         }
+    }
+}
+
+/// Final save gate for the recovery walkthrough. Mirrors the signing approval:
+/// a press fills a 0–100% bar over two seconds (the shared `show_hold_progress`
+/// screen), completing the save; releasing early restarts the review. Waits for
+/// release before returning so the confirm hold isn't re-read by the post-reboot
+/// "hold PRG = USB" prompt. Returns true to save, false to show the words again.
+fn confirm_recovery_save(
+    display: &mut Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> bool {
+    use esp_idf_hal::delay::FreeRtos;
+    use std::time::Instant;
+
+    const HOLD_MS: u32 = 2000;
+    const POLL_MS: u32 = 20;
+
+    oled::show_recovery_done(display);
+    let mut pressed = false;
+    let mut press_start = Instant::now();
+    let mut last_pct = 101u32; // force first bar draw
+
+    loop {
+        let low = button_pin.is_low();
+        if low && !pressed {
+            pressed = true;
+            press_start = Instant::now();
+            last_pct = 101;
+        } else if low && pressed {
+            let held = press_start.elapsed().as_millis() as u32;
+            if held >= HOLD_MS {
+                oled::show_hold_progress(display, 100);
+                while button_pin.is_low() {
+                    FreeRtos::delay_ms(POLL_MS);
+                }
+                return true;
+            }
+            let pct = (held * 100 / HOLD_MS).min(100);
+            if pct / 5 != last_pct / 5 {
+                oled::show_hold_progress(display, pct);
+                last_pct = pct;
+            }
+        } else if !low && pressed {
+            return false; // released before the hold completed → review again
+        }
+        FreeRtos::delay_ms(POLL_MS);
     }
 }
 

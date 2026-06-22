@@ -89,6 +89,25 @@ use heartwood_common::types::{
 };
 use secp256k1::Secp256k1;
 
+/// Fill `buf` with hardware-RNG bytes, guaranteeing a true entropy source for
+/// the draw.
+///
+/// `esp_random()`/`esp_fill_random()` are only a true RNG while a hardware
+/// entropy source is live — the RF radio (Wi-Fi/BT) or the SAR-ADC noise
+/// source. Key material is generated at provision time, *before* the Wi-Fi
+/// stack starts, so the radio is still off; without this the master seed and
+/// connection-slot secrets would come from output ESP-IDF classifies as merely
+/// pseudo-random. `bootloader_random_enable()` switches the ADC noise source on
+/// for the draw; we disable it again so it can't clash with a later ADC/Wi-Fi
+/// user. Safe here because nothing else touches the SAR ADC during provisioning.
+pub fn fill_random_strong(buf: &mut [u8]) {
+    unsafe {
+        esp_idf_svc::sys::bootloader_random_enable();
+        esp_idf_svc::sys::esp_fill_random(buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len());
+        esp_idf_svc::sys::bootloader_random_disable();
+    }
+}
+
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -648,14 +667,10 @@ fn main() {
                         "unnamed".to_string()
                     };
 
-                    // Generate secret via hardware RNG.
+                    // Generate secret via hardware RNG, with a guaranteed
+                    // entropy source (the radio may be off in USB mode).
                     let mut secret_bytes = [0u8; 32];
-                    unsafe {
-                        esp_idf_svc::sys::esp_fill_random(
-                            secret_bytes.as_mut_ptr() as *mut core::ffi::c_void,
-                            32,
-                        );
-                    }
+                    fill_random_strong(&mut secret_bytes);
                     let secret_hex = heartwood_common::hex::hex_encode(&secret_bytes);
                     secret_bytes.iter_mut().for_each(|b| *b = 0); // zeroize raw bytes
 

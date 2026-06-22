@@ -78,7 +78,7 @@ use heartwood_common::types::{
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
-    FRAME_TYPE_GENERATE_IDENTITY,
+    FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_UPDATE,
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
@@ -232,19 +232,23 @@ fn main() {
         loop {
             let frame = protocol::read_frame(&mut usb);
             match frame.frame_type {
-                FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY => {
+                FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
                     // Show the "working" screen before the (one-time, slowish)
                     // secp context build so generation feedback covers it too.
                     if frame.frame_type == FRAME_TYPE_GENERATE_IDENTITY {
                         oled::show_generating(&mut display);
                     }
                     // secp context not yet created — build a temporary one for the
-                    // provision/generate handler to validate/derive the key.
+                    // provision/generate/restore handler to validate/derive the key.
                     let secp = Arc::new(Secp256k1::signing_only());
-                    let provisioned = if frame.frame_type == FRAME_TYPE_GENERATE_IDENTITY {
-                        provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
-                    } else {
-                        provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display)
+                    let provisioned = match frame.frame_type {
+                        FRAME_TYPE_GENERATE_IDENTITY => {
+                            provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
+                        }
+                        FRAME_TYPE_RESTORE_IDENTITY => {
+                            provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
+                        }
+                        _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display),
                     };
                     if let Some(master) = provisioned {
                         loaded_masters.push(master);
@@ -510,11 +514,16 @@ fn main() {
 
         match frame.frame_type {
             // 0x01 — add a master (host-derived) / 0x57 — self-generate on-device
-            FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY => {
-                let provisioned = if frame.frame_type == FRAME_TYPE_GENERATE_IDENTITY {
-                    provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
-                } else {
-                    provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display)
+            // / 0x58 — restore an existing 12-word phrase via the on-device picker
+            FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
+                let provisioned = match frame.frame_type {
+                    FRAME_TYPE_GENERATE_IDENTITY => {
+                        provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
+                    }
+                    FRAME_TYPE_RESTORE_IDENTITY => {
+                        provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
+                    }
+                    _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display),
                 };
                 if let Some(master) = provisioned {
                     loaded_masters.push(master);

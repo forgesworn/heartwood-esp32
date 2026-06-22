@@ -18,9 +18,11 @@ use heartwood_common::types::{
     MasterMode, FRAME_TYPE_ACK, FRAME_TYPE_NACK, FRAME_TYPE_PROVISION_LIST_RESPONSE,
 };
 
+use crate::button::Gesture;
 use crate::masters::{self, LoadedMaster};
 use crate::oled::{self, Display};
 use crate::protocol;
+use heartwood_common::restore::{restore_root, Choice, WordEntry};
 
 /// Handle a PROVISION_ADD frame (0x01). Returns the new `LoadedMaster` on success.
 pub fn handle_add(
@@ -223,13 +225,25 @@ fn confirm_recovery_save(
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> bool {
+    oled::show_recovery_done(display);
+    hold_to_confirm(display, button_pin)
+}
+
+/// Run a 0–100% hold-to-confirm over the shared `show_hold_progress` bar,
+/// returning true once a full two-second hold completes (draining to release so
+/// the hold can't be re-read), or false if the button is released early. The
+/// caller must have already drawn the prompt screen this overlays — used by
+/// both the recovery-save and restore-save confirmations.
+fn hold_to_confirm(
+    display: &mut Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> bool {
     use esp_idf_hal::delay::FreeRtos;
     use std::time::Instant;
 
     const HOLD_MS: u32 = 2000;
     const POLL_MS: u32 = 20;
 
-    oled::show_recovery_done(display);
     let mut pressed = false;
     let mut press_start = Instant::now();
     let mut last_pct = 101u32; // force first bar draw
@@ -255,7 +269,7 @@ fn confirm_recovery_save(
                 last_pct = pct;
             }
         } else if !low && pressed {
-            return false; // released before the hold completed → review again
+            return false; // released before the hold completed
         }
         FreeRtos::delay_ms(POLL_MS);
     }
@@ -272,6 +286,200 @@ fn press_blocking(
             return r;
         }
     }
+}
+
+/// Handle a RESTORE_IDENTITY frame (0x58). The owner re-enters an EXISTING
+/// 12-word recovery phrase on the device itself via the single PRG button — the
+/// phrase is never typed into or sent from the host (the host only triggers the
+/// flow and learns the resulting public npub). The device drives an on-screen
+/// one-button picker (tap = next, double-tap = choose, hold = delete),
+/// validates the BIP-39 checksum, shows the derived npub for the owner to
+/// confirm it is the right account, then stores it as a `TreeMnemonic` master.
+/// Payload is optional `[label_len][label]`; empty ⇒ "default".
+pub fn handle_restore(
+    usb: &mut SerialPort<'_>,
+    frame: &Frame,
+    nvs: &mut EspNvs<NvsDefault>,
+    secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
+    display: &mut Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> Option<LoadedMaster> {
+    let label = if frame.payload.is_empty() {
+        "default".to_string()
+    } else {
+        let label_len = frame.payload[0] as usize;
+        if frame.payload.len() < 1 + label_len {
+            log::warn!("RESTORE_IDENTITY label length overruns payload");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return None;
+        }
+        String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string()
+    };
+
+    oled::show_restore_intro(display);
+    esp_idf_hal::delay::FreeRtos::delay_ms(2200);
+
+    // Words accepted so far. Survives across validation attempts so a checksum
+    // failure can drop just the last word and resume entry rather than restart.
+    let mut words: Vec<&'static str> = Vec::with_capacity(12);
+
+    loop {
+        if !enter_words(display, button_pin, &mut words) {
+            log::info!("restore cancelled by operator");
+            oled::show_result(display, "Cancelled");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return None;
+        }
+
+        let phrase = words.join(" ");
+        match restore_root(&phrase) {
+            Ok(mut root) => {
+                let npub = match npub_from_secret(&root, secp) {
+                    Some(n) => n,
+                    None => {
+                        root.iter_mut().for_each(|b| *b = 0);
+                        log::error!("restore: derived secret rejected by secp");
+                        oled::show_error(display, "Restore failed");
+                        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                        return None;
+                    }
+                };
+
+                // Show the resulting npub and gate the save behind a hold so the
+                // owner can verify it is the account they meant to restore.
+                oled::show_restore_confirm(display, &npub);
+                if !hold_to_confirm(display, button_pin) {
+                    // "Not this account" — let them fix the last word.
+                    root.iter_mut().for_each(|b| *b = 0);
+                    words.pop();
+                    continue;
+                }
+
+                let result = store_master(nvs, root, label, MasterMode::TreeMnemonic, secp);
+                root.iter_mut().for_each(|b| *b = 0);
+                return match result {
+                    Ok(master) => {
+                        log::info!("Restored identity slot {}: {} ({npub})", master.slot, master.label);
+                        protocol::write_frame(usb, FRAME_TYPE_ACK, npub.as_bytes());
+                        oled::show_result(display, "RESTORED");
+                        Some(master)
+                    }
+                    Err(e) => {
+                        log::error!("Restore store failed: {e}");
+                        oled::show_error(display, "Restore failed");
+                        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                        None
+                    }
+                };
+            }
+            Err(_) => {
+                // Valid words but a failed checksum — a mistyped word. Offer to
+                // fix the last word (tap) or abandon the restore (hold).
+                oled::show_restore_invalid(display);
+                match gesture_blocking(button_pin) {
+                    Gesture::Long => {
+                        log::info!("restore abandoned after invalid phrase");
+                        oled::show_result(display, "Cancelled");
+                        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                        return None;
+                    }
+                    _ => {
+                        words.pop();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Drive the one-button picker to fill `words` to twelve. Each word is entered
+/// letter by letter, the wordlist autocompleting as the prefix narrows: a tap
+/// cycles the highlighted choice, a double-tap commits it (a letter, or a whole
+/// word once it is uniquely determined), and a hold backspaces — stepping back
+/// to the previous word when the current one is empty. Returns false if the
+/// owner holds past the very first word (cancelling the whole restore).
+fn enter_words(
+    display: &mut Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    words: &mut Vec<&'static str>,
+) -> bool {
+    const TOTAL: usize = 12;
+
+    while words.len() < TOTAL {
+        let word_index = words.len() + 1;
+        let mut entry = WordEntry::new();
+        let mut sel = 0usize;
+
+        loop {
+            let choices = entry.choices();
+            if choices.is_empty() {
+                // Defensive: a prefix that matches nothing cannot arise from the
+                // picker (it only commits offered letters), but never wedge.
+                entry = WordEntry::new();
+                sel = 0;
+                continue;
+            }
+            if sel >= choices.len() {
+                sel = 0;
+            }
+
+            let (text, is_word) = match choices[sel] {
+                Choice::Letter(c) => {
+                    let mut t = entry.prefix().to_string();
+                    t.push(c);
+                    (t, false)
+                }
+                Choice::Word(w) => (w.to_string(), true),
+            };
+            oled::show_word_entry(display, word_index, TOTAL, &text, is_word, entry.candidate_count());
+
+            match gesture_blocking(button_pin) {
+                Gesture::Single => sel = (sel + 1) % choices.len(),
+                Gesture::Double => match choices[sel] {
+                    Choice::Letter(c) => {
+                        entry.push(c);
+                        sel = 0;
+                    }
+                    Choice::Word(w) => {
+                        words.push(w);
+                        break; // on to the next word
+                    }
+                },
+                Gesture::Long => {
+                    if !entry.backspace() {
+                        // Empty prefix: step back a word, or cancel at word one.
+                        if words.pop().is_none() {
+                            return false;
+                        }
+                        break; // re-enter the previous slot from scratch
+                    }
+                    sel = 0;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Block until one classified button gesture is read, re-arming on the long
+/// idle timeout so it never returns on its own (mirrors `press_blocking`).
+fn gesture_blocking(
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> Gesture {
+    loop {
+        if let Some(g) = crate::button::read_gesture(button_pin, std::time::Duration::from_secs(3600)) {
+            return g;
+        }
+    }
+}
+
+/// Derive the npub for a root secret without storing it, so the owner can
+/// confirm the restored identity before it is persisted. Returns None only if
+/// the secret is not a valid secp256k1 key (a derived BIP-32 root always is).
+fn npub_from_secret(secret: &[u8; 32], secp: &Arc<Secp256k1<secp256k1::SignOnly>>) -> Option<String> {
+    let keypair = secp256k1::Keypair::from_seckey_slice(secp, secret).ok()?;
+    let (xonly, _) = keypair.x_only_public_key();
+    Some(encode_npub(&xonly.serialize()))
 }
 
 /// Handle a PROVISION_REMOVE frame (0x04). Removes the named slot and

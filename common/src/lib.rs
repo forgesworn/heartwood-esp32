@@ -26,3 +26,6 @@ pub mod mgmt;
 
 #[cfg(feature = "mnemonic-gen")]
 pub mod mnemonic;
+
+#[cfg(feature = "mnemonic-gen")]
+pub mod restore;

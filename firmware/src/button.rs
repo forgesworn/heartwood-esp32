@@ -80,3 +80,89 @@ pub fn wait_for_press(
         Some(ButtonResult::Deny)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Gesture detection (single / double / long) — for one-button text entry
+// ---------------------------------------------------------------------------
+
+/// A classified button gesture, the vocabulary the on-device recovery-phrase
+/// picker is driven by. Distinct from [`ButtonResult`], which is the two-state
+/// approve/deny used by signing — text entry needs a third action (backspace).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gesture {
+    /// A single short tap — advance the highlight to the next choice.
+    Single,
+    /// Two quick taps — commit the highlighted choice.
+    Double,
+    /// A deliberate hold — backspace (delete the last letter / step back).
+    Long,
+}
+
+/// Hold duration that counts as a [`Gesture::Long`]. Shorter than the 2 s
+/// signing-approval hold: backspace fires the instant this is crossed so the
+/// owner gets immediate feedback while typing, rather than waiting for release.
+const GESTURE_LONG_MS: u128 = 600;
+
+/// Window after a tap in which a second tap is read as a [`Gesture::Double`].
+/// Kept tight so single-tap cycling (the frequent action) stays responsive.
+const DOUBLE_GAP_MS: u128 = 250;
+
+/// Wait for one classified gesture on the PRG button.
+///
+/// Returns `None` if `idle_timeout` elapses before any press begins, letting
+/// the caller keep its screen alive / re-arm without blocking forever. A long
+/// hold is reported the moment it crosses [`GESTURE_LONG_MS`] (then the button
+/// is drained to its release); a short tap is held for up to [`DOUBLE_GAP_MS`]
+/// to see whether a second tap turns it into a double.
+pub fn read_gesture(pin: &PinDriver<'_, Input>, idle_timeout: Duration) -> Option<Gesture> {
+    let idle_deadline = Instant::now() + idle_timeout;
+
+    // Wait for the first press to begin.
+    loop {
+        if Instant::now() >= idle_deadline {
+            return None;
+        }
+        if pin.is_low() {
+            break;
+        }
+        esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
+    }
+    esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+
+    // Measure the first press. A hold past the threshold is a Long (backspace),
+    // reported immediately, then we drain the rest of the hold.
+    let press_start = Instant::now();
+    loop {
+        if pin.is_high() {
+            break; // released — it was a tap
+        }
+        if press_start.elapsed().as_millis() >= GESTURE_LONG_MS {
+            drain_release(pin);
+            return Some(Gesture::Long);
+        }
+        esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
+    }
+    esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+
+    // Tap completed. Watch for a second tap within the double-click window.
+    let gap_deadline = Instant::now() + Duration::from_millis(DOUBLE_GAP_MS as u64);
+    loop {
+        if Instant::now() >= gap_deadline {
+            return Some(Gesture::Single);
+        }
+        if pin.is_low() {
+            esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+            drain_release(pin);
+            return Some(Gesture::Double);
+        }
+        esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
+    }
+}
+
+/// Block until the button is released, with a debounce on the rising edge.
+fn drain_release(pin: &PinDriver<'_, Input>) {
+    while pin.is_low() {
+        esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
+    }
+    esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+}

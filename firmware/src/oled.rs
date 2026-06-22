@@ -221,6 +221,174 @@ pub fn show_recovery_done(display: &mut Display<'_>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Recovery-phrase RESTORE (on-device one-button word entry)
+// ---------------------------------------------------------------------------
+
+/// One-time intro shown when on-device restore begins, teaching the three
+/// button gestures in full words before the terse picker takes over. The
+/// 12-word phrase is entered here, on the device — never in the browser.
+pub fn show_restore_intro(display: &mut Display<'_>) {
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("ENTER YOUR PHRASE", Point::new(2, 10), header).draw(display).ok();
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display)
+        .ok();
+
+    Text::new("tap = next letter", Point::new(4, 28), small).draw(display).ok();
+    Text::new("double-tap = choose", Point::new(4, 42), small).draw(display).ok();
+    Text::new("hold = delete", Point::new(4, 56), small).draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// One step of the one-button word picker: the word being entered, the choice
+/// currently highlighted (a forming `prefix+letter`, or a complete word), and a
+/// terse gesture reminder. `is_word` marks the highlight as a complete-word
+/// accept (underlined and prompting "use this word"); otherwise it is a letter
+/// and `candidate_count` shows how many words still match.
+pub fn show_word_entry(
+    display: &mut Display<'_>,
+    word_index: usize,
+    total: usize,
+    text: &str,
+    is_word: bool,
+    candidate_count: usize,
+) {
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let big = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+
+    // Header: "WORD n/12" left, candidate count right.
+    let head = format!("WORD {}/{}", word_index, total);
+    Text::new(&head, Point::new(2, 10), header).draw(display).ok();
+    let count = format!("{}", candidate_count);
+    let count_x = (128 - count.len() as i32 * 5 - 2).max(0);
+    Text::new(&count, Point::new(count_x, 9), small).draw(display).ok();
+
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display)
+        .ok();
+
+    // The highlighted choice, large and centred.
+    let glyphs = text.chars().count().min(12) as i32;
+    let x = ((128 - glyphs * 10) / 2).max(0);
+    Text::new(text, Point::new(x, 40), big).draw(display).ok();
+    if is_word {
+        // Underline to signal "this is a complete word, not a letter".
+        Rectangle::new(Point::new(x, 43), Size::new((glyphs * 10) as u32, 1))
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(display)
+            .ok();
+    }
+
+    // Contextual prompt + fixed reminder.
+    let line1 = if is_word { "2tap = use this word" } else { "tap:next  2tap:choose" };
+    Text::new(line1, Point::new(2, 54), small).draw(display).ok();
+    Text::new("hold = delete", Point::new(2, 63), small).draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Shown after all 12 words are entered and the phrase derives to an identity:
+/// the resulting npub for the owner to verify it is the account they expected,
+/// gated behind a save hold (a short tap cancels). Verifying the npub here is
+/// the safety net that catches a mistyped word that still passed the checksum.
+pub fn show_restore_confirm(display: &mut Display<'_>, npub: &str) {
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("THIS ACCOUNT?", Point::new(2, 10), header).draw(display).ok();
+    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display)
+        .ok();
+
+    // npub in small font: 25 chars per line.
+    let chars_small = 25usize;
+    let mut y = 26i32;
+    let mut pos = 0;
+    while pos < npub.len() && y < 50 {
+        let end = core::cmp::min(pos + chars_small, npub.len());
+        Text::new(&npub[pos..end], Point::new(2, y), small).draw(display).ok();
+        y += 9;
+        pos = end;
+    }
+
+    Text::new("Hold = save   tap = no", Point::new(2, 62), small).draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Shown when the 12 entered words fail the BIP-39 checksum — a mistyped word.
+/// The owner taps to jump back and fix the last word, or holds to cancel.
+pub fn show_restore_invalid(display: &mut Display<'_>) {
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(&FONT_7X14)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+
+    Text::new("PHRASE INVALID", Point::new(2, 12), header).draw(display).ok();
+    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display)
+        .ok();
+
+    Text::new("Check words", Point::new(4, 38), body).draw(display).ok();
+    Text::new("tap=fix last  hold=quit", Point::new(2, 56), small).draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
 /// Display "Awaiting secret..." with a structured idle screen.
 ///
 /// Layout:

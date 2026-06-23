@@ -22,23 +22,26 @@ Where a step says "approve on the device", that's a 2-second hold of **PRG**.
 Pick a **known test phrase** with a known npub (e.g. the all-zero vector
 `abandon …× 11 … about`). Do **not** use a real key for the first run.
 
-Gestures (firmware v0.9.3+): **single tap = next choice, double-tap = pick,
-hold = delete.** (Long ~600 ms = delete; the only *other* hold is the deliberate
-2-second save at the very end.) This restores the original three-gesture scheme.
-Once a word fully resolves (the sole choice), a **single tap accepts it**.
+Gestures (firmware v0.9.4+): **single tap = next, double-tap = pick, hold = go
+back.** (Hold steps the highlight back one choice; the only *other* hold is the
+deliberate 2-second save at the very end.) Once a word fully resolves (the sole
+choice), a **single tap accepts it**.
 
 - [ ] Setup → **Restore from my 12 words** → name → **Restore on my device**.
-- [ ] OLED shows the intro (1 tap = next / 2 taps = pick / hold = delete) then **WORD 1/12**.
+- [ ] OLED shows the intro (1 tap = next / 2 taps = pick / hold = go back) then **WORD 1/12**.
 - [ ] Entering a word:
-  - [ ] A **single tap** cycles the highlighted choice: valid next letters, then the
-        whole word (underlined) once it resolves. (No DELETE item — delete is a hold.)
+  - [ ] A **single tap** moves forward through the choices: valid next letters, then the
+        whole word (underlined) once it resolves.
+  - [ ] **Hold = back (the headline fix):** overshoot a letter (tap a→b), then **hold**
+        — the highlight steps back (b→a) in one gesture, NOT a full lap and NOT a jump
+        to the previous word.
   - [ ] A **double-tap** picks the highlight — a letter extends the prefix; the
         underlined word accepts it. Typing `a` `b` `a` offers **abandon** within ≤4 letters.
   - [ ] **Single-tap accept:** once the prefix resolves to one word (shown alone,
         underlined, legend reads **tap=pick**), a **single tap** accepts it directly —
         no double-tap needed. (A double-tap still works too.)
-  - [ ] A **hold** deletes the last letter; holding on an empty word steps back to
-        the previous word.
+  - [ ] **Delete a letter:** with the highlight on the first choice, a **hold** removes
+        the last committed letter; on an empty word it steps back to the previous word.
 - [ ] After word 12, OLED shows the **REVIEW** screen:
   - [ ] A **single tap** pages forward through all 12 words, then **SAVE**, then **CANCEL**;
         a **hold** pages back one item.

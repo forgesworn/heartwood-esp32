@@ -258,7 +258,7 @@ pub fn show_restore_intro(display: &mut Display<'_>) {
 
     Text::new("1 tap  = next choice", Point::new(4, 28), small).draw(display).ok();
     Text::new("2 taps = pick it", Point::new(4, 42), small).draw(display).ok();
-    Text::new("(DELETE is a choice too)", Point::new(4, 56), small).draw(display).ok();
+    Text::new("hold   = delete", Point::new(4, 56), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -267,7 +267,7 @@ pub fn show_restore_intro(display: &mut Display<'_>) {
 
 /// One step of the one-button picker: the currently highlighted ring item shown
 /// large, a contextual subtitle, and the fixed tap / double-tap legend. The caller
-/// composes `big_text` (prefix+letter, the whole word, or "DELETE") and picks
+/// composes `big_text` (prefix+letter, or the whole word once it resolves) and picks
 /// the [`Highlight`] kind; `subtitle` carries context (match count, "use this
 /// word", what delete will do).
 pub fn show_word_entry(
@@ -313,7 +313,7 @@ pub fn show_word_entry(
     }
 
     Text::new(subtitle, Point::new(2, 54), small).draw(display).ok();
-    Text::new("tap=next  2tap=pick", Point::new(2, 63), small).draw(display).ok();
+    Text::new("tap=next   hold=delete", Point::new(2, 63), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

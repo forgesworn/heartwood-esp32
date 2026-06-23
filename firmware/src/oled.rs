@@ -256,8 +256,8 @@ pub fn show_restore_intro(display: &mut Display<'_>) {
         .draw(display)
         .ok();
 
-    Text::new("tap  = next choice", Point::new(4, 28), small).draw(display).ok();
-    Text::new("hold = pick it", Point::new(4, 42), small).draw(display).ok();
+    Text::new("1 tap  = next choice", Point::new(4, 28), small).draw(display).ok();
+    Text::new("2 taps = pick it", Point::new(4, 42), small).draw(display).ok();
     Text::new("(DELETE is a choice too)", Point::new(4, 56), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
@@ -266,7 +266,7 @@ pub fn show_restore_intro(display: &mut Display<'_>) {
 }
 
 /// One step of the one-button picker: the currently highlighted ring item shown
-/// large, a contextual subtitle, and the fixed tap/hold legend. The caller
+/// large, a contextual subtitle, and the fixed tap / double-tap legend. The caller
 /// composes `big_text` (prefix+letter, the whole word, or "DELETE") and picks
 /// the [`Highlight`] kind; `subtitle` carries context (match count, "use this
 /// word", what delete will do).
@@ -313,15 +313,15 @@ pub fn show_word_entry(
     }
 
     Text::new(subtitle, Point::new(2, 54), small).draw(display).ok();
-    Text::new("tap=next  hold=pick", Point::new(2, 63), small).draw(display).ok();
+    Text::new("tap=next  2tap=pick", Point::new(2, 63), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
     }
 }
 
-/// Review screen for one entered word: tap pages to the next item, hold edits
-/// this word. `invalid` flags that the 12 words failed the BIP-39 checksum, so
+/// Review screen for one entered word: tap pages to the next item, double-tap
+/// edits this word. `invalid` flags that the 12 words failed the BIP-39 checksum, so
 /// a wrong word is somewhere in the list and needs finding.
 pub fn show_review_word(
     display: &mut Display<'_>,
@@ -359,7 +359,7 @@ pub fn show_review_word(
     if invalid {
         Text::new("! phrase invalid - fix a word", Point::new(2, 54), small).draw(display).ok();
     }
-    Text::new("tap=next  hold=edit", Point::new(2, 63), small).draw(display).ok();
+    Text::new("tap=next  2tap=edit", Point::new(2, 63), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -367,7 +367,7 @@ pub fn show_review_word(
 }
 
 /// Review screen for an action item (SAVE / CANCEL): a big label, a hint, and
-/// the tap/hold legend.
+/// the tap / double-tap legend.
 pub fn show_review_action(display: &mut Display<'_>, label: &str, hint: &str) {
     display.clear_buffer();
 
@@ -395,7 +395,7 @@ pub fn show_review_action(display: &mut Display<'_>, label: &str, hint: &str) {
     Text::new(label, Point::new(x, 40), big).draw(display).ok();
 
     Text::new(hint, Point::new(2, 54), small).draw(display).ok();
-    Text::new("tap=next  hold=select", Point::new(2, 63), small).draw(display).ok();
+    Text::new("tap=next  2tap=pick", Point::new(2, 63), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

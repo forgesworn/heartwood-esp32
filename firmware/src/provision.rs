@@ -416,6 +416,10 @@ enum WordResult {
 /// highlight, a **double-tap** selects it, and a **hold** deletes. Selecting a
 /// letter extends the prefix; selecting the word accepts it; a hold removes the
 /// last letter, or — on an empty prefix — returns [`WordResult::Back`].
+///
+/// Once the prefix resolves to a single word (the sole choice), a **single tap**
+/// accepts it directly — there's nothing else to cycle to, so the obvious answer
+/// shouldn't need a double-tap.
 fn enter_one_word(
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
@@ -430,21 +434,33 @@ fn enter_one_word(
         if choices.is_empty() || sel >= choices.len() {
             sel = 0;
         }
+        // When the prefix has resolved to exactly one word, that word is the
+        // sole choice — a single tap accepts it (no need to double-tap the
+        // obvious answer, and there is nothing else to cycle to).
+        let sole_word = choices.len() == 1 && matches!(choices[0], Choice::Word(_));
 
         match choices[sel] {
             Choice::Letter(c) => {
                 let mut text = entry.prefix().to_string();
                 text.push(c);
                 let sub = format!("{} left   2tap=pick", entry.candidate_count());
-                oled::show_word_entry(display, index, total, &text, oled::Highlight::Letter, &sub);
+                oled::show_word_entry(display, index, total, &text, oled::Highlight::Letter, &sub, false);
             }
             Choice::Word(w) => {
-                oled::show_word_entry(display, index, total, w, oled::Highlight::Word, "2tap = use this word");
+                let sub = if sole_word { "tap = use this word" } else { "2tap = use this word" };
+                oled::show_word_entry(display, index, total, w, oled::Highlight::Word, sub, sole_word);
             }
         }
 
         match next_gesture(button_pin) {
-            Gesture::Single => sel = (sel + 1) % choices.len(),
+            Gesture::Single => {
+                if sole_word {
+                    if let Choice::Word(w) = choices[0] {
+                        return WordResult::Accepted(w);
+                    }
+                }
+                sel = (sel + 1) % choices.len();
+            }
             Gesture::Double => match choices[sel] {
                 Choice::Letter(c) => {
                     entry.push(c);

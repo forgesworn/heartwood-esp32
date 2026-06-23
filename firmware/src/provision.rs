@@ -18,7 +18,7 @@ use heartwood_common::types::{
     MasterMode, FRAME_TYPE_ACK, FRAME_TYPE_NACK, FRAME_TYPE_PROVISION_LIST_RESPONSE,
 };
 
-use crate::button::Press;
+use crate::button::Gesture;
 use crate::masters::{self, LoadedMaster};
 use crate::oled::{self, Display};
 use crate::protocol;
@@ -292,8 +292,8 @@ fn press_blocking(
 /// 12-word recovery phrase on the device itself via the single PRG button — the
 /// phrase is never typed into or sent from the host (the host only triggers the
 /// flow and learns the resulting public npub). The device drives an on-screen
-/// one-button picker (tap = next choice, hold = pick — including an on-screen
-/// DELETE), lets the owner review and edit all 12 words, validates the BIP-39
+/// one-button picker (tap = next choice, double-tap = pick, hold = delete),
+/// lets the owner review and edit all 12 words, validates the BIP-39
 /// checksum, shows the derived npub to confirm the account, then stores it as a
 /// `TreeMnemonic` master. Payload is optional `[label_len][label]`; empty ⇒ "default".
 pub fn handle_restore(
@@ -322,8 +322,8 @@ pub fn handle_restore(
     const TOTAL: usize = 12;
     let mut words: Vec<&'static str> = Vec::with_capacity(TOTAL);
 
-    // Sequential entry of all 12 words. A DELETE on an empty word steps back to
-    // the previous one; stepping back past word 1 cancels the whole restore.
+    // Sequential entry of all 12 words. A hold (delete) on an empty word steps
+    // back to the previous one; stepping back past word 1 cancels the whole restore.
     while words.len() < TOTAL {
         let idx = words.len() + 1;
         match enter_one_word(display, button_pin, idx, TOTAL) {
@@ -406,16 +406,16 @@ fn cancel_restore(usb: &mut SerialPort<'_>, display: &mut Display<'_>) -> Option
 enum WordResult {
     /// A BIP-39 word was accepted.
     Accepted(&'static str),
-    /// DELETE on an empty prefix — the caller decides what "back" means
+    /// A hold (delete) on an empty prefix — the caller decides what "back" means
     /// (step to the previous word, or abandon an edit keeping the old word).
     Back,
 }
 
 /// One-button entry of a single word. The choice ring is the valid next letters
-/// (plus a whole-word accept once it resolves) followed by a DELETE control:
-/// **tap** moves the highlight, **hold** picks it. Picking a letter extends the
-/// prefix; picking the word accepts it; picking DELETE removes the last letter,
-/// or — on an empty prefix — returns [`WordResult::Back`].
+/// (plus a whole-word accept once it resolves): a **single tap** moves the
+/// highlight, a **double-tap** selects it, and a **hold** deletes. Selecting a
+/// letter extends the prefix; selecting the word accepts it; a hold removes the
+/// last letter, or — on an empty prefix — returns [`WordResult::Back`].
 fn enter_one_word(
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
@@ -427,45 +427,37 @@ fn enter_one_word(
 
     loop {
         let choices = entry.choices();
-        // Ring = the letter/word choices, then a trailing DELETE item.
-        let ring_len = choices.len() + 1;
-        if sel >= ring_len {
+        if choices.is_empty() || sel >= choices.len() {
             sel = 0;
         }
 
-        if sel < choices.len() {
-            match choices[sel] {
-                Choice::Letter(c) => {
-                    let mut text = entry.prefix().to_string();
-                    text.push(c);
-                    let sub = format!("{} words match", entry.candidate_count());
-                    oled::show_word_entry(display, index, total, &text, oled::Highlight::Letter, &sub);
-                }
-                Choice::Word(w) => {
-                    oled::show_word_entry(display, index, total, w, oled::Highlight::Word, "pick = use this word");
-                }
+        match choices[sel] {
+            Choice::Letter(c) => {
+                let mut text = entry.prefix().to_string();
+                text.push(c);
+                let sub = format!("{} left   2tap=pick", entry.candidate_count());
+                oled::show_word_entry(display, index, total, &text, oled::Highlight::Letter, &sub);
             }
-        } else {
-            let sub = if entry.prefix().is_empty() { "pick = go back" } else { "pick = remove a letter" };
-            oled::show_word_entry(display, index, total, "DELETE", oled::Highlight::Delete, sub);
+            Choice::Word(w) => {
+                oled::show_word_entry(display, index, total, w, oled::Highlight::Word, "2tap = use this word");
+            }
         }
 
-        match next_press(button_pin) {
-            Press::Tap => sel = (sel + 1) % ring_len,
-            Press::Double => {
-                if sel < choices.len() {
-                    match choices[sel] {
-                        Choice::Letter(c) => {
-                            entry.push(c);
-                            sel = 0;
-                        }
-                        Choice::Word(w) => return WordResult::Accepted(w),
-                    }
-                } else if !entry.backspace() {
-                    return WordResult::Back; // empty prefix → back out
-                } else {
+        match next_gesture(button_pin) {
+            Gesture::Single => sel = (sel + 1) % choices.len(),
+            Gesture::Double => match choices[sel] {
+                Choice::Letter(c) => {
+                    entry.push(c);
                     sel = 0;
                 }
+                Choice::Word(w) => return WordResult::Accepted(w),
+            },
+            Gesture::Long => {
+                // Hold deletes the last letter; on an empty prefix it steps back.
+                if !entry.backspace() {
+                    return WordResult::Back;
+                }
+                sel = 0;
             }
         }
     }
@@ -478,9 +470,10 @@ enum ReviewOutcome {
 }
 
 /// Page through the 12 entered words (plus SAVE / CANCEL items): **tap** moves
-/// to the next item, **double-tap** acts on it — editing a word re-enters that
-/// one slot in place. `invalid` shows a banner when the phrase last failed its
-/// checksum, so the owner knows a wrong word is still hiding in the list.
+/// to the next item, **hold** moves back one, and **double-tap** acts on it —
+/// editing a word re-enters that one slot in place. `invalid` shows a banner
+/// when the phrase last failed its checksum, so the owner knows a wrong word is
+/// still hiding in the list.
 fn review_phrase(
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
@@ -495,14 +488,15 @@ fn review_phrase(
         if sel < n {
             oled::show_review_word(display, sel + 1, n, words[sel], invalid);
         } else if sel == n {
-            oled::show_review_action(display, "SAVE", "2 taps to save");
+            oled::show_review_action(display, "SAVE", "2tap = save");
         } else {
-            oled::show_review_action(display, "CANCEL", "2 taps to discard");
+            oled::show_review_action(display, "CANCEL", "2tap = discard");
         }
 
-        match next_press(button_pin) {
-            Press::Tap => sel = (sel + 1) % total_items,
-            Press::Double => {
+        match next_gesture(button_pin) {
+            Gesture::Single => sel = (sel + 1) % total_items,
+            Gesture::Long => sel = (sel + total_items - 1) % total_items,
+            Gesture::Double => {
                 if sel < n {
                     // Re-enter this slot; a Back keeps the existing word.
                     if let WordResult::Accepted(w) = enter_one_word(display, button_pin, sel + 1, n) {
@@ -518,16 +512,15 @@ fn review_phrase(
     }
 }
 
-/// Block until one tap/double-tap press is read, re-arming on the (deliberately
-/// long) idle timeout so it never returns on its own. (Distinct from
-/// `press_blocking`, which reports the approve/deny `ButtonResult` used by the
-/// generate walkthrough.)
-fn next_press(
+/// Block until one gesture is read, re-arming on the (deliberately long) idle
+/// timeout so it never returns on its own. (Distinct from `press_blocking`,
+/// which reports the approve/deny `ButtonResult` used by the generate walkthrough.)
+fn next_gesture(
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
-) -> Press {
+) -> Gesture {
     loop {
-        if let Some(p) = crate::button::read_press(button_pin, std::time::Duration::from_secs(3600)) {
-            return p;
+        if let Some(g) = crate::button::read_gesture(button_pin, std::time::Duration::from_secs(3600)) {
+            return g;
         }
     }
 }

@@ -22,9 +22,10 @@ Where a step says "approve on the device", that's a 2-second hold of **PRG**.
 Pick a **known test phrase** with a known npub (e.g. the all-zero vector
 `abandon …× 11 … about`). Do **not** use a real key for the first run.
 
-Gestures (firmware v0.9.2+): **single tap = next choice, double-tap = pick,
+Gestures (firmware v0.9.3+): **single tap = next choice, double-tap = pick,
 hold = delete.** (Long ~600 ms = delete; the only *other* hold is the deliberate
 2-second save at the very end.) This restores the original three-gesture scheme.
+Once a word fully resolves (the sole choice), a **single tap accepts it**.
 
 - [ ] Setup → **Restore from my 12 words** → name → **Restore on my device**.
 - [ ] OLED shows the intro (1 tap = next / 2 taps = pick / hold = delete) then **WORD 1/12**.
@@ -33,6 +34,9 @@ hold = delete.** (Long ~600 ms = delete; the only *other* hold is the deliberate
         whole word (underlined) once it resolves. (No DELETE item — delete is a hold.)
   - [ ] A **double-tap** picks the highlight — a letter extends the prefix; the
         underlined word accepts it. Typing `a` `b` `a` offers **abandon** within ≤4 letters.
+  - [ ] **Single-tap accept:** once the prefix resolves to one word (shown alone,
+        underlined, legend reads **tap=pick**), a **single tap** accepts it directly —
+        no double-tap needed. (A double-tap still works too.)
   - [ ] A **hold** deletes the last letter; holding on an empty word steps back to
         the previous word.
 - [ ] After word 12, OLED shows the **REVIEW** screen:

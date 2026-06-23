@@ -266,10 +266,11 @@ pub fn show_restore_intro(display: &mut Display<'_>) {
 }
 
 /// One step of the one-button picker: the currently highlighted ring item shown
-/// large, a contextual subtitle, and the fixed tap / double-tap legend. The caller
-/// composes `big_text` (prefix+letter, or the whole word once it resolves) and picks
-/// the [`Highlight`] kind; `subtitle` carries context (match count, "use this
-/// word", what delete will do).
+/// large, a contextual subtitle, and the tap / hold legend. The caller composes
+/// `big_text` (prefix+letter, or the whole word once it resolves) and picks the
+/// [`Highlight`] kind; `subtitle` carries context (match count, "use this word").
+/// `tap_accepts` is set when the word is the sole choice, so the legend reads
+/// "tap=pick" (a single tap accepts) rather than "tap=next".
 pub fn show_word_entry(
     display: &mut Display<'_>,
     word_index: usize,
@@ -277,6 +278,7 @@ pub fn show_word_entry(
     big_text: &str,
     hl: Highlight,
     subtitle: &str,
+    tap_accepts: bool,
 ) {
     display.clear_buffer();
 
@@ -313,7 +315,10 @@ pub fn show_word_entry(
     }
 
     Text::new(subtitle, Point::new(2, 54), small).draw(display).ok();
-    Text::new("tap=next   hold=delete", Point::new(2, 63), small).draw(display).ok();
+    // Once the word is the sole choice, a single tap accepts it; otherwise a tap
+    // cycles to the next choice and a double-tap picks.
+    let legend = if tap_accepts { "tap=pick   hold=delete" } else { "tap=next   hold=delete" };
+    Text::new(legend, Point::new(2, 63), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

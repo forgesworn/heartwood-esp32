@@ -452,7 +452,7 @@ fn enter_one_word(
 
         match next_press(button_pin) {
             Press::Tap => sel = (sel + 1) % ring_len,
-            Press::Hold => {
+            Press::Double => {
                 if sel < choices.len() {
                     match choices[sel] {
                         Choice::Letter(c) => {
@@ -478,8 +478,8 @@ enum ReviewOutcome {
 }
 
 /// Page through the 12 entered words (plus SAVE / CANCEL items): **tap** moves
-/// to the next item, **hold** acts on it — editing a word re-enters that one
-/// slot in place. `invalid` shows a banner when the phrase last failed its
+/// to the next item, **double-tap** acts on it — editing a word re-enters that
+/// one slot in place. `invalid` shows a banner when the phrase last failed its
 /// checksum, so the owner knows a wrong word is still hiding in the list.
 fn review_phrase(
     display: &mut Display<'_>,
@@ -495,14 +495,14 @@ fn review_phrase(
         if sel < n {
             oled::show_review_word(display, sel + 1, n, words[sel], invalid);
         } else if sel == n {
-            oled::show_review_action(display, "SAVE", "hold to finish");
+            oled::show_review_action(display, "SAVE", "2 taps to save");
         } else {
-            oled::show_review_action(display, "CANCEL", "hold to discard");
+            oled::show_review_action(display, "CANCEL", "2 taps to discard");
         }
 
         match next_press(button_pin) {
             Press::Tap => sel = (sel + 1) % total_items,
-            Press::Hold => {
+            Press::Double => {
                 if sel < n {
                     // Re-enter this slot; a Back keeps the existing word.
                     if let WordResult::Accepted(w) = enter_one_word(display, button_pin, sel + 1, n) {
@@ -518,9 +518,10 @@ fn review_phrase(
     }
 }
 
-/// Block until one tap/hold press is read, re-arming on the (deliberately long)
-/// idle timeout so it never returns on its own. (Distinct from `press_blocking`,
-/// which reports the approve/deny `ButtonResult` used by the generate walkthrough.)
+/// Block until one tap/double-tap press is read, re-arming on the (deliberately
+/// long) idle timeout so it never returns on its own. (Distinct from
+/// `press_blocking`, which reports the approve/deny `ButtonResult` used by the
+/// generate walkthrough.)
 fn next_press(
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> Press {

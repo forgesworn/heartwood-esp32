@@ -22,22 +22,26 @@ Where a step says "approve on the device", that's a 2-second hold of **PRG**.
 Pick a **known test phrase** with a known npub (e.g. the all-zero vector
 `abandon …× 11 … about`). Do **not** use a real key for the first run.
 
-Gestures (firmware v0.8.1+): **tap = next choice, hold = pick.** There is no
-double-tap.
+Gestures (firmware v0.9.1+): **single tap = next choice, double-tap = pick.** A
+single press of *any* length counts as one tap, so lingering on the button can
+never select by accident — and there is no hold-to-pick to time. (The only hold
+is the deliberate 2-second save at the very end.)
 
 - [ ] Setup → **Restore from my 12 words** → name → **Restore on my device**.
-- [ ] OLED shows the intro (tap = next / hold = pick) then **WORD 1/12**.
+- [ ] OLED shows the intro (1 tap = next / 2 taps = pick) then **WORD 1/12**.
 - [ ] Entering a word:
-  - [ ] **Tap** cycles the highlighted choice: valid next letters, then the whole
-        word (underlined) once it resolves, then a **DELETE** item.
-  - [ ] **Hold** picks the highlight — a letter extends the prefix; the underlined
-        word accepts it. Typing `a` `b` `a` offers **abandon** within ≤4 letters.
-  - [ ] Highlight **DELETE** and hold to remove a letter; on an empty word, DELETE
-        steps back to the previous word.
+  - [ ] A **single tap** cycles the highlighted choice: valid next letters, then the
+        whole word (underlined) once it resolves, then a **DELETE** item.
+  - [ ] A **double-tap** picks the highlight — a letter extends the prefix; the
+        underlined word accepts it. Typing `a` `b` `a` offers **abandon** within ≤4 letters.
+  - [ ] **Lingering check:** press and hold a letter for a second, then release —
+        it should just advance (one tap), NOT select. No accidental picks.
+  - [ ] Cycle to **DELETE** and double-tap to remove a letter; on an empty word,
+        DELETE steps back to the previous word.
 - [ ] After word 12, OLED shows the **REVIEW** screen:
-  - [ ] **Tap** pages through all 12 words (one big word each), then **SAVE**, then **CANCEL**.
-  - [ ] **Hold** on a word re-enters *just that word* in place, returning to review.
-  - [ ] **Hold** on **SAVE** validates the phrase.
+  - [ ] A **single tap** pages through all 12 words (one big word each), then **SAVE**, then **CANCEL**.
+  - [ ] A **double-tap** on a word re-enters *just that word* in place, returning to review.
+  - [ ] A **double-tap** on **SAVE** validates the phrase.
 - [ ] Valid phrase → **THIS ACCOUNT?** with the derived npub:
   - [ ] The npub matches the expected one for the test phrase.
   - [ ] A **tap** returns to review; a 2-second **hold** saves (**RESTORED**).
@@ -46,13 +50,13 @@ double-tap.
 ### Restore edge cases
 
 - [ ] **Wrong word recovery (the headline fix):** deliberately accept a wrong word,
-      finish the 12, hit SAVE → on the REVIEW screen, page to the wrong word, hold to
-      re-enter it correctly, SAVE again → succeeds.
+      finish the 12, hit SAVE → on the REVIEW screen, page to the wrong word, double-tap
+      to re-enter it correctly, SAVE again → succeeds.
 - [ ] **Bad checksum:** 12 valid words with a wrong checksum → SAVE returns to
       **REVIEW** with a **"! phrase invalid - fix a word"** banner (not a dead-end);
       fixing the bad word and SAVE then succeeds.
-- [ ] **Cancel:** REVIEW → **CANCEL** (hold), or during entry hold **DELETE** back
-      past word 1 → restore cancels cleanly, device returns to normal, no master stored
+- [ ] **Cancel:** REVIEW → **CANCEL** (double-tap), or during entry double-tap **DELETE**
+      back past word 1 → restore cancels cleanly, device returns to normal, no master stored
       (Sapwood reports "cancelled / didn't check out").
 - [ ] **Real phrase round-trip:** restore a phrase generated in step 1 on a
       factory-reset board → the npub matches the original identity.

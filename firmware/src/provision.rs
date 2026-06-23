@@ -292,7 +292,7 @@ fn press_blocking(
 /// 12-word recovery phrase on the device itself via the single PRG button — the
 /// phrase is never typed into or sent from the host (the host only triggers the
 /// flow and learns the resulting public npub). The device drives an on-screen
-/// one-button picker (tap = next choice, double-tap = pick, hold = delete),
+/// one-button picker (tap = next choice, double-tap = pick, hold = go back),
 /// lets the owner review and edit all 12 words, validates the BIP-39
 /// checksum, shows the derived npub to confirm the account, then stores it as a
 /// `TreeMnemonic` master. Payload is optional `[label_len][label]`; empty ⇒ "default".
@@ -322,8 +322,8 @@ pub fn handle_restore(
     const TOTAL: usize = 12;
     let mut words: Vec<&'static str> = Vec::with_capacity(TOTAL);
 
-    // Sequential entry of all 12 words. A hold (delete) on an empty word steps
-    // back to the previous one; stepping back past word 1 cancels the whole restore.
+    // Sequential entry of all 12 words. Holding "back" past the start of an empty
+    // word steps to the previous one; stepping back past word 1 cancels the restore.
     while words.len() < TOTAL {
         let idx = words.len() + 1;
         match enter_one_word(display, button_pin, idx, TOTAL) {
@@ -406,16 +406,18 @@ fn cancel_restore(usb: &mut SerialPort<'_>, display: &mut Display<'_>) -> Option
 enum WordResult {
     /// A BIP-39 word was accepted.
     Accepted(&'static str),
-    /// A hold (delete) on an empty prefix — the caller decides what "back" means
-    /// (step to the previous word, or abandon an edit keeping the old word).
+    /// Hold "back" past the first choice on an empty prefix — the caller decides
+    /// what "back" means (step to the previous word, or abandon an edit keeping
+    /// the old word).
     Back,
 }
 
 /// One-button entry of a single word. The choice ring is the valid next letters
 /// (plus a whole-word accept once it resolves): a **single tap** moves the
-/// highlight, a **double-tap** selects it, and a **hold** deletes. Selecting a
-/// letter extends the prefix; selecting the word accepts it; a hold removes the
-/// last letter, or — on an empty prefix — returns [`WordResult::Back`].
+/// highlight forward, a **double-tap** selects it, and a **hold** goes back.
+/// Selecting a letter extends the prefix; selecting the word accepts it. Hold
+/// steps the highlight back one choice; from the first choice it instead removes
+/// the last committed letter, or — on an empty prefix — returns [`WordResult::Back`].
 ///
 /// Once the prefix resolves to a single word (the sole choice), a **single tap**
 /// accepts it directly — there's nothing else to cycle to, so the obvious answer
@@ -469,11 +471,18 @@ fn enter_one_word(
                 Choice::Word(w) => return WordResult::Accepted(w),
             },
             Gesture::Long => {
-                // Hold deletes the last letter; on an empty prefix it steps back.
-                if !entry.backspace() {
+                // Hold goes back one step. If the highlight isn't on the first
+                // choice, step it back (so overshooting a letter is one hold to
+                // undo, not a full lap of the ring). Only once you're already at
+                // the first choice does "back" undo the last committed letter —
+                // and on an empty prefix that steps back to the previous word.
+                if sel > 0 {
+                    sel -= 1;
+                } else if !entry.backspace() {
                     return WordResult::Back;
+                } else {
+                    sel = 0;
                 }
-                sel = 0;
             }
         }
     }

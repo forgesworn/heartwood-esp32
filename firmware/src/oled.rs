@@ -258,7 +258,7 @@ pub fn show_restore_intro(display: &mut Display<'_>) {
 
     Text::new("1 tap  = next choice", Point::new(4, 28), small).draw(display).ok();
     Text::new("2 taps = pick it", Point::new(4, 42), small).draw(display).ok();
-    Text::new("hold   = delete", Point::new(4, 56), small).draw(display).ok();
+    Text::new("hold   = go back", Point::new(4, 56), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -315,9 +315,9 @@ pub fn show_word_entry(
     }
 
     Text::new(subtitle, Point::new(2, 54), small).draw(display).ok();
-    // Once the word is the sole choice, a single tap accepts it; otherwise a tap
-    // cycles to the next choice and a double-tap picks.
-    let legend = if tap_accepts { "tap=pick   hold=delete" } else { "tap=next   hold=delete" };
+    // Once the word is the sole choice a single tap accepts it; otherwise a tap
+    // cycles forward and a double-tap picks. A hold always goes back one step.
+    let legend = if tap_accepts { "tap=pick   hold=back" } else { "tap=next   hold=back" };
     Text::new(legend, Point::new(2, 63), small).draw(display).ok();
 
     if let Err(e) = display.flush() {

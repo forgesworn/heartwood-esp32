@@ -32,8 +32,15 @@ arithmetic+ecdh compiles at opt-z (SIGSEGV only at opt-3); common's deps forced
   timeout) before signing; the OLED then shows `signed`/`denied`. So the hold confirms a
   *seen* event. Still to come: a richer policy view (full tags/recipient) and a gate on
   provisioning too.
-- The **NIP-44 nonce RNG** reads the lx106 RNG register but it's only well-seeded with RF
-  active; a radio-off signer needs an entropy review (nonce reuse is catastrophic).
+- **RNG entropy — RESOLVED (no hardware RNG in the security path).** The lx106's
+  `WDEV_RAND` is only well-seeded with RF active, so a radio-off signer can't trust it.
+  Both nonce sources are now deterministic: BIP-340 signing uses `aux_rand = 0`
+  (`crypto::sign`), and the NIP-44 nonce is synthesised as `HMAC-SHA256(seed; tag ||
+  client_pk || plaintext)` (`sign_path::synthetic_nonce`) — unpredictable + unique per
+  (peer, message), no RNG. The review also **caught + fixed a correctness bug**: `crypto::sign`
+  used `try_sign`, which SHA-256s the message again, so it signed `sha256(event_id)` and every
+  signature would have failed Nostr verification; now `sign_prehash_with_aux_rand` signs the id
+  directly. Host-verified against real k256.
 - The **k256 Xtensa-unaligned-access** risk (the original Phase-0 question) is still only
   verifiable by flashing a real ESP8266.
 
@@ -56,8 +63,9 @@ firmware placeholder); the device's npub (from the placeholder seed) is the sign
 identity, discovered via `PROVISION_LIST`. Flash with `esptool.py --chip esp8266 elf2image`
 + `write_flash`.
 
-Still hardware-only: the k256 unaligned-access fault risk, the patched exception-vector
-correctness, and the NIP-44 nonce RNG entropy (radio off).
+Still hardware-only: the k256 unaligned-access fault risk and the patched exception-vector
+correctness. (The NIP-44 nonce RNG entropy concern is resolved — nonces are now synthetic,
+see the KNOWN GAPS above.)
 
 ### What was solved
 - **Right runtime.** `esp8266-hal 0.5.1` uses the maintained **`xtensa-lx-rt 0.12` +

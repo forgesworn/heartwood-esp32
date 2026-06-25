@@ -31,6 +31,12 @@ crc32fast = { version = "1", default-features = false }
 # BIP-340 Schnorr (pubkey derivation + signing). no_std, no-alloc — the exact
 # crate the esp8266-spike proved compiles for xtensa-lx106.
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+# HMAC-SHA256 for the synthetic NIP-44 nonce (sign_path::synthetic_nonce): derive
+# it deterministically from the master secret so the security-critical path never
+# depends on the ESP8266's poorly-seeded radio-off hardware RNG. Versions match
+# heartwood-common's.
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 # Shared NIP-44 / NIP-46 / envelope logic (converted to no_std), k256 backend —
 # reuse the exact data-plane crypto the ESP32 firmware uses. (Pulls k256's
 # arithmetic + ecdh features for NIP-44 ECDH.)

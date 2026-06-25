@@ -44,6 +44,12 @@ embedded-alloc = "0.6"
 # xtensa interrupt enable/disable primitives.
 critical-section = { version = "1", features = ["restore-state-u32"] }
 xtensa-lx = { version = "0.7", features = ["esp8266"] }
+# OLED (SSD1306, 128x64) over bit-banged I2C — the ESP8266 has no hardware I2C.
+# Pinned to the embedded-hal 0.2 generation esp8266-hal targets (ssd1306 0.10
+# needs embedded-hal 1.0). embedded-graphics renders the npub + the sign prompt.
+embedded-hal = "0.2"
+ssd1306 = "0.7"
+embedded-graphics = "0.7"
 
 [profile.release]
 opt-level = "z"

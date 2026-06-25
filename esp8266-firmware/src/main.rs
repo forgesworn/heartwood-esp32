@@ -29,6 +29,7 @@ mod button;
 mod crypto;
 mod frame;
 mod heap;
+mod oled;
 mod sign_path;
 mod storage;
 
@@ -66,6 +67,25 @@ fn main() -> ! {
     // Load the master seed + bridge secret from flash (None = unprovisioned).
     let mut flash = dp.SPI0.flash();
     let mut keys = storage::load(&mut flash);
+
+    // OLED on GPIO14 (SDA) / GPIO12 (SCL): show the device identity on boot, so
+    // the operator can read the npub without the daemon.
+    // Box it: the SSD1306 buffered mode holds a 1 KB framebuffer, too big to keep
+    // in main's frame for the whole program on the lx106's small stack.
+    let mut oled = alloc::boxed::Box::new(oled::Oled::new(
+        pins.gpio14.into_open_drain_output(),
+        pins.gpio12.into_open_drain_output(),
+    ));
+    match keys.as_ref().and_then(|k| crypto::pubkey(&k.master_seed)) {
+        Some(pk) => {
+            let mut npub = [0u8; 63];
+            match bech32::encode(b"npub", &pk, &mut npub) {
+                Some(n) => oled.show_npub(core::str::from_utf8(&npub[..n]).unwrap_or("")),
+                None => oled.show_lines(&["Heartwood signer", "", "(npub error)"]),
+            }
+        }
+        None => oled.show_lines(&["Heartwood signer", "", "unprovisioned", "run provision.py"]),
+    }
 
     // Box the frame buffers onto the heap — MAX_FRAME (~4 KB each) is too large
     // for the lx106's small stack.

@@ -19,6 +19,11 @@ const NIP46_KIND: u64 = 24133;
 /// `[master_pk 32][client_pk 32][created_at u64-be 8][nip44_ciphertext_b64]`.
 /// Returns the fully-signed kind:24133 event JSON (the `0x35` body), or `None`
 /// to NACK (decrypt failure, bad request, sign failure).
+///
+/// `#[inline(never)]`: keep this large body out of the frame dispatcher — the
+/// lx106 LLVM backend fails register allocation ("Cannot scavenge register") on
+/// over-large merged functions when everything is inlined under LTO.
+#[inline(never)]
 pub fn handle(seed: &[u8; 32], payload: &[u8]) -> Option<String> {
     if payload.len() < 72 {
         return None;

@@ -6,6 +6,8 @@
 //! ESP32 firmware's serial path.
 //!
 //! Implemented (compiles + links; untested on hardware):
+//!   - `PROVISION` (0x01) / `SET_BRIDGE_SECRET` (0x23) → `ACK`: write the master
+//!     seed / bridge secret to a reserved flash sector (`storage`).
 //!   - `SESSION_AUTH` (0x21) → `SESSION_ACK` (0x22): authenticate the bridge.
 //!   - `FIRMWARE_INFO` (0x59) → `0x5A`: version/board.
 //!   - `PROVISION_LIST` (0x05) → `0x07`: report the k256 npub identity.
@@ -13,9 +15,9 @@
 //!     NIP-44 decrypt → NIP-46 dispatch → re-encrypt → sign-kind:24133 path,
 //!     reusing `heartwood-common`. Unknown frames → `NACK` (0x15).
 //!
-//! Placeholders / known gaps: the master seed + bridge secret are hardcoded
-//! (flash storage TODO), no button approval (auto-approve), and the NIP-44 nonce
-//! RNG needs an entropy review (see `sign_path::random_nonce`).
+//! Known gaps: provisioning has no physical-confirmation gate yet (auto-accept;
+//! the ESP32 requires a button hold) and the NIP-44 nonce RNG needs an entropy
+//! review (see `sign_path::random_nonce`).
 
 #![no_std]
 #![no_main]
@@ -27,20 +29,14 @@ mod crypto;
 mod frame;
 mod heap;
 mod sign_path;
+mod storage;
 
+use esp8266_hal::flash::ESPFlash;
 use esp8266_hal::prelude::*;
 use esp8266_hal::target::Peripherals;
 use panic_halt as _;
 
-/// Bridge-session secret. Placeholder until it's read from a reserved flash
-/// sector (the ESP32 stores it in NVS; the lx106 has no NVS). Matches the
-/// daemon's expectation that the host presents a 32-byte shared secret.
-const BRIDGE_SECRET: [u8; 32] = [0x42; 32];
-
-/// Master signing secret. Placeholder until read from a reserved flash sector
-/// (the ESP32 stores it in NVS; the lx106 has none). Any valid secp256k1 scalar
-/// works for the scaffold — the device derives its npub identity from this.
-const MASTER_SEED: [u8; 32] = [0x11; 32];
+use storage::Keys;
 
 #[entry]
 fn main() -> ! {
@@ -49,8 +45,7 @@ fn main() -> ! {
     let dp = Peripherals::take().unwrap();
 
     // Disable the watchdog: the signer blocks on `serial.read()` while idle and
-    // runs multi-second EC math during a sign — an active WDT would reset it
-    // mid-operation. (esp8266-hal's WatchdogExt; `disable` via embedded_hal.)
+    // runs multi-second EC math during a sign — an active WDT would reset it.
     dp.WDT.watchdog().disable();
 
     let pins = dp.GPIO.split();
@@ -67,6 +62,10 @@ fn main() -> ! {
     let (mut timer1, _) = dp.TIMER.timers();
     timer1.delay_ms(50);
 
+    // Load the master seed + bridge secret from flash (None = unprovisioned).
+    let mut flash = dp.SPI0.flash();
+    let mut keys = storage::load(&mut flash);
+
     // Box the frame buffers onto the heap — MAX_FRAME (~4 KB each) is too large
     // for the lx106's small stack.
     let mut reader = alloc::boxed::Box::new(frame::Reader::new());
@@ -79,7 +78,15 @@ fn main() -> ! {
             Err(_) => continue,
         };
         if let Some(frame_type) = reader.push(byte) {
-            if let Some(len) = handle(frame_type, reader.payload(), &mut authenticated, &mut out) {
+            let resp = handle(
+                frame_type,
+                reader.payload(),
+                &mut keys,
+                &mut authenticated,
+                &mut flash,
+                &mut out,
+            );
+            if let Some(len) = resp {
                 for &b in &out[..len] {
                     let _ = nb::block!(serial.write(b));
                 }
@@ -90,17 +97,59 @@ fn main() -> ! {
 
 /// Dispatch one received frame. Returns `Some(len)` of a response frame written
 /// into `out`, or `None` if there is nothing to reply.
-fn handle(frame_type: u8, payload: &[u8], authenticated: &mut bool, out: &mut [u8]) -> Option<usize> {
+fn handle(
+    frame_type: u8,
+    payload: &[u8],
+    keys: &mut Option<Keys>,
+    authenticated: &mut bool,
+    flash: &mut ESPFlash,
+    out: &mut [u8],
+) -> Option<usize> {
     match frame_type {
-        // Bridge-session authentication: constant-time compare the 32-byte
-        // secret, reply SESSION_ACK with 0x00 = ok / 0x01 = wrong secret.
+        // Provision the master seed: write it (plus the existing bridge secret)
+        // to flash. Payload is the raw 32-byte seed, or the ESP32 form
+        // [mode][label_len][label][secret_32] — we take the trailing 32 bytes.
+        // (No physical-confirmation gate yet — see the module note.)
+        frame::PROVISION => {
+            if payload.len() < 32 {
+                return frame::build(out, frame::NACK, &[]);
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&payload[payload.len() - 32..]);
+            let bridge_secret = keys.as_ref().map_or([0u8; 32], |k| k.bridge_secret);
+            let new = Keys { master_seed: seed, bridge_secret };
+            storage::store(flash, &new);
+            *keys = Some(new);
+            frame::build(out, frame::ACK, &[])
+        }
+
+        // Provision the 32-byte bridge-session secret (alongside the seed).
+        frame::SET_BRIDGE_SECRET => {
+            if payload.len() != 32 {
+                return frame::build(out, frame::NACK, &[]);
+            }
+            let mut bridge_secret = [0u8; 32];
+            bridge_secret.copy_from_slice(payload);
+            let master_seed = keys.as_ref().map_or([0u8; 32], |k| k.master_seed);
+            let new = Keys { master_seed, bridge_secret };
+            storage::store(flash, &new);
+            *keys = Some(new);
+            frame::build(out, frame::ACK, &[])
+        }
+
+        // Bridge-session authentication: constant-time compare the 32-byte secret
+        // against the provisioned one. 0x00 = ok / 0x01 = wrong / 0x02 = none.
         frame::SESSION_AUTH => {
-            let status = if payload.len() == 32 && ct_eq(payload, &BRIDGE_SECRET) {
-                *authenticated = true;
-                0x00u8
-            } else {
-                *authenticated = false;
-                0x01u8
+            let status = match keys.as_ref() {
+                None => 0x02u8,
+                Some(k) if payload.len() == 32 && ct_eq(payload, &k.bridge_secret) => {
+                    *authenticated = true;
+                    0x00
+                }
+                Some(_) => {
+                    *authenticated = false;
+                    0x01
+                }
             };
             frame::build(out, frame::SESSION_ACK, &[status])
         }
@@ -112,39 +161,40 @@ fn handle(frame_type: u8, payload: &[u8], authenticated: &mut bool, out: &mut [u
             br#"{"version":"0.0.1","board":"esp8266"}"#,
         ),
 
-        // Report the signing identity: derive the x-only pubkey from the master
-        // seed, bech32-encode it as an npub, return the JSON the daemon parses:
-        // [{slot,label,mode,npub}].
-        frame::PROVISION_LIST => {
-            let pk = crypto::pubkey(&MASTER_SEED)?;
-            let mut npub = [0u8; 63];
-            let n = bech32::encode(b"npub", &pk, &mut npub)?;
-            let mut json = [0u8; 160];
-            let mut j = 0;
-            let pre = br#"[{"slot":0,"label":"default","mode":1,"npub":""#;
-            json[j..j + pre.len()].copy_from_slice(pre);
-            j += pre.len();
-            json[j..j + n].copy_from_slice(&npub[..n]);
-            j += n;
-            let post = br#""}]"#;
-            json[j..j + post.len()].copy_from_slice(post);
-            j += post.len();
-            frame::build(out, frame::PROVISION_LIST_RESPONSE, &json[..j])
-        }
+        // Report the signing identity: derive the npub from the provisioned seed.
+        // Unprovisioned (or invalid seed) → empty list.
+        frame::PROVISION_LIST => match keys.as_ref().and_then(|k| crypto::pubkey(&k.master_seed)) {
+            Some(pk) => {
+                let mut npub = [0u8; 63];
+                let n = bech32::encode(b"npub", &pk, &mut npub)?;
+                let mut json = [0u8; 160];
+                let mut j = 0;
+                let pre = br#"[{"slot":0,"label":"default","mode":1,"npub":""#;
+                json[j..j + pre.len()].copy_from_slice(pre);
+                j += pre.len();
+                json[j..j + n].copy_from_slice(&npub[..n]);
+                j += n;
+                let post = br#""}]"#;
+                json[j..j + post.len()].copy_from_slice(post);
+                j += post.len();
+                frame::build(out, frame::PROVISION_LIST_RESPONSE, &json[..j])
+            }
+            None => frame::build(out, frame::PROVISION_LIST_RESPONSE, b"[]"),
+        },
 
-        // The inline sign path: NIP-44 decrypt → NIP-46 dispatch → re-encrypt →
-        // sign the kind:24133 envelope (heartwood-common does the crypto).
-        // Gated on a successful SESSION_AUTH, like the ESP32.
+        // The inline sign path. Gated on a successful SESSION_AUTH + a seed.
         frame::ENCRYPTED_REQUEST => {
             if !*authenticated {
-                frame::build(out, frame::NACK, &[])
-            } else {
-                match sign_path::handle(&MASTER_SEED, payload) {
-                    Some(event_json) => {
-                        frame::build(out, frame::SIGN_ENVELOPE_RESPONSE, event_json.as_bytes())
-                    }
-                    None => frame::build(out, frame::NACK, &[]),
+                return frame::build(out, frame::NACK, &[]);
+            }
+            match keys
+                .as_ref()
+                .and_then(|k| sign_path::handle(&k.master_seed, payload))
+            {
+                Some(event_json) => {
+                    frame::build(out, frame::SIGN_ENVELOPE_RESPONSE, event_json.as_bytes())
                 }
+                None => frame::build(out, frame::NACK, &[]),
             }
         }
 

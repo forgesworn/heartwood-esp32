@@ -18,12 +18,15 @@ pub const MAX_PAYLOAD: usize = 4096;
 pub const MAX_FRAME: usize = OVERHEAD + MAX_PAYLOAD;
 
 // Frame types (subset of common/src/types.rs that the device serves).
+pub const PROVISION: u8 = 0x01;
+pub const ACK: u8 = 0x06;
 pub const NACK: u8 = 0x15;
 pub const PROVISION_LIST: u8 = 0x05;
 pub const PROVISION_LIST_RESPONSE: u8 = 0x07;
 pub const ENCRYPTED_REQUEST: u8 = 0x10;
 pub const SESSION_AUTH: u8 = 0x21;
 pub const SESSION_ACK: u8 = 0x22;
+pub const SET_BRIDGE_SECRET: u8 = 0x23;
 pub const SIGN_ENVELOPE_RESPONSE: u8 = 0x35;
 pub const FIRMWARE_INFO: u8 = 0x59;
 pub const FIRMWARE_INFO_RESPONSE: u8 = 0x5A;

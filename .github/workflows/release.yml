@@ -1,10 +1,19 @@
 name: Release firmware
 
-# On a version tag, build every supported board and publish a complete set of
-# flash images — the OTA-able app, the board's bootloader, and the (shared)
-# partition table — plus a version.json describing them. Sapwood's
-# `npm run sync:firmware` pulls these so both OTA *and* fresh-flash always ship
-# the current, CI-built firmware — no more hand-copied, drifting binaries.
+# On a version tag, build EVERY supported board and publish a complete set of
+# flash images — the app, the board's bootloader, and the board's partition
+# table — plus a version.json describing them. Sapwood's `npm run sync:firmware`
+# pulls these so both OTA *and* fresh-flash always ship the current, CI-built
+# firmware — no more hand-copied, drifting binaries.
+#
+# Boards span three toolchains, so there are three build jobs (mirroring ci.yml):
+#   * `build`         — the Xtensa esp-idf boards (heltec-v3/v4 S3, tdisplay esp32)
+#   * `build-c6`      — the RISC-V esp-idf board (ESP32-C6)
+#   * `build-esp8266` — the bare-metal lx106 signer (separate crate, single image)
+# A board's partition table is NO LONGER assumed shared: heltec is a 2 MB A/B OTA
+# layout, the 4 MB boards are a single factory slot (re-flash only), so each board
+# describes its OWN table and carries an `ota` capability flag. The esp8266 has no
+# bootloader/partition tuple at all — it ships one elf2image flashable image.
 on:
   push:
     tags: ['v*']
@@ -13,13 +22,17 @@ permissions:
   contents: write # create the release + upload assets via the built-in token
 
 jobs:
-  # One isolated build per board (own runner, own target dir — no feature/sdkconfig
+  # The Xtensa esp-idf boards. One isolated build per board (own runner, own
+  # target dir, own per-board cache key — no feature/sdkconfig/sticky-sdkconfig
   # cross-contamination). Each emits its app + bootloader + partition table.
   build:
     strategy:
-      fail-fast: true
+      fail-fast: true # a release is all-or-nothing — never publish a partial set
       matrix:
-        board: [heltec-v4, heltec-v3]
+        include:
+          - { board: heltec-v4, target: xtensa-esp32s3-espidf, chip: esp32s3, limit: 2097152, ota: true }
+          - { board: heltec-v3, target: xtensa-esp32s3-espidf, chip: esp32s3, limit: 2097152, ota: true }
+          - { board: tdisplay, target: xtensa-esp32-espidf, chip: esp32, limit: 3145728, ota: false }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,11 +44,15 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           default: true
-          buildtargets: esp32s3
+          buildtargets: ${{ matrix.chip }}
           ldproxy: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: firmware
+          # Per-board cache: the boards span esp32s3 and esp32, and esp-idf-sys
+          # keeps a STICKY generated sdkconfig keyed to the chip — a shared cache
+          # would let one board's sdkconfig bleed into another board's build.
+          key: ${{ matrix.board }}
       - uses: taiki-e/install-action@v2
         with:
           tool: espflash
@@ -43,41 +60,53 @@ jobs:
       - name: Build ${{ matrix.board }} (release)
         working-directory: firmware
         env:
+          # MCU drives esp-idf-sys's chip selection; it must match the board's
+          # target (the config.toml default is esp32s3 — right for heltec, wrong
+          # for the T-Display's classic esp32).
+          MCU: ${{ matrix.chip }}
           ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.${{ matrix.board }}"
-        run: cargo build --release --no-default-features --features ${{ matrix.board }}
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features ${{ matrix.board }}
 
       - name: Collect flash images + describe them
         working-directory: firmware
+        env:
+          BOARD: ${{ matrix.board }}
+          CHIP: ${{ matrix.chip }}
+          TARGET: ${{ matrix.target }}
+          LIMIT: ${{ matrix.limit }}
+          OTA: ${{ matrix.ota }}
         run: |
           set -eu
-          board="${{ matrix.board }}"
-          elf=target/xtensa-esp32s3-espidf/release/heartwood-esp32
+          elf="target/$TARGET/release/heartwood-esp32"
 
-          # App image (what OTA streams + what lands in ota_0).
-          espflash save-image --chip esp32s3 "$elf" "app-$board.bin"
-          size=$(stat -c%s "app-$board.bin")
-          limit=2097152
-          if [ "$size" -gt "$limit" ]; then
-            echo "::error::$board app image ($size B) exceeds the 2 MB ota_0 slot ($limit B)"
+          # App image (what OTA streams + what lands in the app slot).
+          espflash save-image --chip "$CHIP" "$elf" "app-$BOARD.bin"
+          size=$(stat -c%s "app-$BOARD.bin")
+          if [ "$size" -gt "$LIMIT" ]; then
+            echo "::error::$BOARD app image ($size B) exceeds its app slot ($LIMIT B)"
             exit 1
           fi
 
           # Bootloader (board-specific: console wiring differs) and partition
-          # table (board-independent; generated from partitions.csv by the
-          # esp-idf build — the reliable path, no espflash 0x40-subtype panic).
+          # table (now PER-BOARD: heltec is 2 MB A/B OTA, the 4 MB boards are a
+          # single factory slot). Both generated by the esp-idf build — the
+          # reliable path, no espflash 0x40-subtype panic.
           bl="$(find target -path '*/build/bootloader/bootloader.bin' | head -1)"
           pt="$(find target -path '*/build/partition_table/partition-table.bin' | head -1)"
           [ -n "$bl" ] && [ -n "$pt" ] || { echo "::error::bootloader/partition-table not found in build output"; exit 1; }
-          cp "$bl" "bootloader-$board.bin"
-          cp "$pt" "partition-table.bin"
+          cp "$bl" "bootloader-$BOARD.bin"
+          cp "$pt" "partition-table-$BOARD.bin"
 
-          appsha=$(sha256sum "app-$board.bin" | cut -d' ' -f1)
-          blsha=$(sha256sum "bootloader-$board.bin" | cut -d' ' -f1)
-          jq -n --arg b "$board" \
-            --arg a "app-$board.bin" --arg as "$appsha" --argjson an "$size" \
-            --arg bl "bootloader-$board.bin" --arg bs "$blsha" \
-            '{($b): {app: $a, sha256: $as, bytes: $an, bootloader: $bl, bootloaderSha256: $bs}}' \
-            > "frag-$board.json"
+          appsha=$(sha256sum "app-$BOARD.bin" | cut -d' ' -f1)
+          blsha=$(sha256sum "bootloader-$BOARD.bin" | cut -d' ' -f1)
+          ptsha=$(sha256sum "partition-table-$BOARD.bin" | cut -d' ' -f1)
+          jq -n --arg b "$BOARD" \
+            --arg a "app-$BOARD.bin" --arg as "$appsha" --argjson an "$size" \
+            --arg bl "bootloader-$BOARD.bin" --arg bs "$blsha" \
+            --arg pt "partition-table-$BOARD.bin" --arg ps "$ptsha" \
+            --argjson ota "$OTA" \
+            '{($b): {app: $a, sha256: $as, bytes: $an, ota: $ota, bootloader: $bl, bootloaderSha256: $bs, partitionTable: $pt, partitionTableSha256: $ps}}' \
+            > "frag-$BOARD.json"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -85,12 +114,170 @@ jobs:
           path: |
             firmware/app-${{ matrix.board }}.bin
             firmware/bootloader-${{ matrix.board }}.bin
-            firmware/partition-table.bin
+            firmware/partition-table-${{ matrix.board }}.bin
             firmware/frag-${{ matrix.board }}.json
 
-  # Aggregate the per-board outputs into one release.
+  # ESP32-C6 (RISC-V rv32imac). The Xtensa toolchain action can't install a
+  # RISC-V toolchain, so this mirrors ci.yml's firmware-build-c6: espup for the
+  # esp Rust channel + the matching riscv32-esp-elf GCC for the C FFI. 4 MB
+  # single-OTA layout (3 MB factory, re-flash only — ota: false).
+  build-c6:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the esp Rust toolchain (espup — nightly Rust + LLVM)
+        run: |
+          set -eu
+          curl -fL -o espup \
+            https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu
+          chmod +x espup
+          # The xtensa chip (esp32) pulls the NIGHTLY-based "esp" Rust toolchain that
+          # firmware/rust-toolchain.toml pins — build-std (-Zbuild-std) is nightly-only,
+          # riscv-on-stable can't build `core` — plus the esp LLVM (libclang for bindgen).
+          ./espup install --targets esp32 --export-file "$HOME/export-esp.sh"
+      - name: Install the riscv32-esp-elf gcc (the C FFI cross-compiler)
+        run: |
+          set -eu
+          # esp-idf v5.3.2's RISC-V cross-compiler (gcc 13.2.0). espup never installs
+          # the riscv gcc (it only logs "Installing GCC (xtensa-esp-elf)"), so fetch it
+          # directly and add it to PATH for the build (mirrors the esp8266 lx106 step).
+          curl -fL -o /tmp/riscv-gcc.tar.xz \
+            https://github.com/espressif/crosstool-NG/releases/download/esp-13.2.0_20240530/riscv32-esp-elf-13.2.0_20240530-x86_64-linux-gnu.tar.xz
+          mkdir -p "$HOME/.local"
+          tar -xJf /tmp/riscv-gcc.tar.xz -C "$HOME/.local"
+          echo "$HOME/.local/riscv32-esp-elf/bin" >> "$GITHUB_PATH"
+      - name: Install ldproxy (esp-idf linker shim)
+        run: cargo install ldproxy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware
+          key: c6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: espflash
+
+      - name: Build c6 (release)
+        working-directory: firmware
+        env:
+          MCU: esp32c6
+          ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.c6"
+        run: |
+          set -euo pipefail
+          . "$HOME/export-esp.sh"
+          # The riscv gcc is on PATH from the install step above (via $GITHUB_PATH);
+          # confirm it before building so a PATH problem fails here, not deep in cc-rs.
+          riscv32-esp-elf-gcc --version | head -1
+          cargo build --release --target riscv32imac-esp-espidf --no-default-features --features c6
+
+      - name: Collect flash images + describe them
+        working-directory: firmware
+        run: |
+          . "$HOME/export-esp.sh"
+          set -eu
+          elf="target/riscv32imac-esp-espidf/release/heartwood-esp32"
+
+          espflash save-image --chip esp32c6 "$elf" "app-c6.bin"
+          size=$(stat -c%s "app-c6.bin")
+          limit=3145728
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::c6 app image ($size B) exceeds its 3 MB app slot ($limit B)"
+            exit 1
+          fi
+
+          bl="$(find target -path '*/build/bootloader/bootloader.bin' | head -1)"
+          pt="$(find target -path '*/build/partition_table/partition-table.bin' | head -1)"
+          [ -n "$bl" ] && [ -n "$pt" ] || { echo "::error::bootloader/partition-table not found in build output"; exit 1; }
+          cp "$bl" "bootloader-c6.bin"
+          cp "$pt" "partition-table-c6.bin"
+
+          appsha=$(sha256sum "app-c6.bin" | cut -d' ' -f1)
+          blsha=$(sha256sum "bootloader-c6.bin" | cut -d' ' -f1)
+          ptsha=$(sha256sum "partition-table-c6.bin" | cut -d' ' -f1)
+          jq -n \
+            --arg a "app-c6.bin" --arg as "$appsha" --argjson an "$size" \
+            --arg bl "bootloader-c6.bin" --arg bs "$blsha" \
+            --arg pt "partition-table-c6.bin" --arg ps "$ptsha" \
+            '{c6: {app: $a, sha256: $as, bytes: $an, ota: false, bootloader: $bl, bootloaderSha256: $bs, partitionTable: $pt, partitionTableSha256: $ps}}' \
+            > "frag-c6.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fw-c6
+          path: |
+            firmware/app-c6.bin
+            firmware/bootloader-c6.bin
+            firmware/partition-table-c6.bin
+            firmware/frag-c6.json
+
+  # ESP8266 tethered signer — a SEPARATE crate (esp8266-firmware/), a no_std lx106
+  # binary. Unlike the esp-idf boards it has NO bootloader/partition tuple: esptool
+  # `elf2image` produces a single, valid-checksum image flashed at 0x0 (no OTA —
+  # ota: false). Mirrors ci.yml's esp8266-build for the toolchain.
+  build-esp8266:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          default: true
+          ldproxy: false
+          # Pin to the esp toolchain the firmware is known to build on (the latest
+          # esp Rust dropped the compiler-builtins-no-f16-f128 build-std feature the
+          # lx106 build needs). See ci.yml's esp8266-build for the full reasoning.
+          version: "1.87.0.0"
+      - name: Install the xtensa-lx106-elf GNU toolchain (the lx106 linker)
+        run: |
+          set -eu
+          curl -fL -o /tmp/lx106.tar.gz \
+            https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz
+          mkdir -p "$HOME/.local"
+          tar -xzf /tmp/lx106.tar.gz -C "$HOME/.local"
+          echo "$HOME/.local/xtensa-lx106-elf/bin" >> "$GITHUB_PATH"
+      - name: Install esptool (elf2image — the lx106 has no espflash support)
+        run: pipx install esptool
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: esp8266-firmware
+          key: esp8266
+
+      - name: Build esp8266 firmware (release)
+        working-directory: esp8266-firmware
+        run: cargo build --release
+
+      - name: Make the flashable image + describe it
+        working-directory: esp8266-firmware
+        run: |
+          set -eu
+          elf="target/xtensa-esp8266-none-elf/release/heartwood-esp8266"
+          # `--version 2` packs everything into ONE image that flashes at 0x0; the
+          # dio/40m settings are the universally-safe ESP-12F defaults (see FLASHING.md).
+          esptool.py --chip esp8266 elf2image \
+            --version 2 --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            -o app-esp8266.bin "$elf"
+          size=$(stat -c%s app-esp8266.bin)
+          # The image must sit below the firmware's flash key-store sector (0x3F0000).
+          limit=$((0x3F0000))
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::esp8266 image ($size B) exceeds the usable flash below the key store ($limit B)"
+            exit 1
+          fi
+          appsha=$(sha256sum app-esp8266.bin | cut -d' ' -f1)
+          jq -n --arg a "app-esp8266.bin" --arg as "$appsha" --argjson an "$size" \
+            '{esp8266: {app: $a, sha256: $as, bytes: $an, ota: false}}' \
+            > frag-esp8266.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fw-esp8266
+          path: |
+            esp8266-firmware/app-esp8266.bin
+            esp8266-firmware/frag-esp8266.json
+
+  # Aggregate every board's outputs into one release.
   release:
-    needs: build
+    needs: [build, build-c6, build-esp8266]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -115,24 +302,17 @@ jobs:
           mkdir -p out
           find dist -name 'app-*.bin' -exec cp {} out/ \;
           find dist -name 'bootloader-*.bin' -exec cp {} out/ \;
+          find dist -name 'partition-table-*.bin' -exec cp {} out/ \;
 
-          # The partition table is board-independent — assert every board built
-          # an identical one, then keep a single copy.
-          mapfile -t pts < <(find dist -name 'partition-table.bin')
-          ref_sha="$(sha256sum "${pts[0]}" | cut -d' ' -f1)"
-          for p in "${pts[@]}"; do
-            [ "$(sha256sum "$p" | cut -d' ' -f1)" = "$ref_sha" ] || { echo "::error::partition tables differ across boards"; exit 1; }
-          done
-          cp "${pts[0]}" out/partition-table.bin
-          pt_bytes=$(stat -c%s out/partition-table.bin)
-
+          # Each board describes its OWN images now (per-board partition table +
+          # an ota flag), so the manifest is just the merge of the per-board frags —
+          # no cross-board "tables must be identical" assert (they no longer are).
           boards="$(jq -s 'add' $(find dist -name 'frag-*.json'))"
           jq -n \
             --arg v "${GITHUB_REF_NAME#v}" \
             --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg pt "partition-table.bin" --arg ps "$ref_sha" --argjson pn "$pt_bytes" \
             --argjson boards "$boards" \
-            '{version: $v, builtAt: $at, partitionTable: {asset: $pt, sha256: $ps, bytes: $pn}, boards: $boards}' \
+            '{version: $v, builtAt: $at, boards: $boards}' \
             > out/version.json
           cat out/version.json
 
@@ -143,5 +323,5 @@ jobs:
           set -eu
           gh release create "$GITHUB_REF_NAME" \
             --title "Firmware $GITHUB_REF_NAME" \
-            --notes "Heltec firmware ${GITHUB_REF_NAME}. Per-board \`app-<board>.bin\` + \`bootloader-<board>.bin\`, shared \`partition-table.bin\`; \`version.json\` describes them. Pull into Sapwood with \`npm run sync:firmware\`." \
-            out/app-*.bin out/bootloader-*.bin out/partition-table.bin out/version.json
+            --notes "Firmware ${GITHUB_REF_NAME} for every supported board. Each esp-idf board ships \`app-<board>.bin\` + \`bootloader-<board>.bin\` + \`partition-table-<board>.bin\`; the esp8266 ships a single \`app-esp8266.bin\` (flash at 0x0). \`version.json\` describes them, including a per-board \`ota\` flag — heltec-v3/v4 are OTA-updatable (2 MB A/B), the T-Display/C6 are 4 MB factory (USB re-flash), the esp8266 has no OTA. Pull into Sapwood with \`npm run sync:firmware\`." \
+            out/app-*.bin out/bootloader-*.bin out/partition-table-*.bin out/version.json

@@ -4,12 +4,16 @@ Goal: turn the `esp8266-spike/` staticlib (proves the crypto compiles) into a re
 `no_main` binary that **compiles and links** for `xtensa-esp8266-none-elf` on the
 current `esp` toolchain — groundwork before on-hardware bring-up.
 
-## Status: COMPILES. Runtime port done. Only the final link needs a toolchain install.
+## Status: COMPILES AND LINKS into a flashable image. ✅
 
-`cargo build --release` now compiles **everything** — `core`, `compiler_builtins`,
-`xtensa-lx 0.7`, the (patched) `xtensa-lx-rt 0.12`, `esp8266-hal 0.5.1`, and this crate.
-The build reaches the link step; the only remaining error is the missing **ESP8266 GNU
-linker**, not a code problem.
+`cargo build --release` produces a valid `ELF 32-bit LSB executable, Tensilica Xtensa`
+(entry `0x40100450`, `.vectors` at `0x40100000`, `.text` in IROM, `.bss` in DRAM) — the
+whole stack (`core`, `compiler_builtins`, `xtensa-lx 0.7`, the patched `xtensa-lx-rt 0.12`,
+`esp8266-hal 0.5.1`, this crate) compiles, and it links with the lx106 GNU toolchain.
+
+**Still untested on hardware** — compiling+linking ≠ correct. The patched exception asm
+and the original `k256` Xtensa-unaligned-access question are only verifiable by flashing a
+real ESP8266.
 
 ### What was solved
 - **Right runtime.** `esp8266-hal 0.5.1` uses the maintained **`xtensa-lx-rt 0.12` +
@@ -27,23 +31,27 @@ linker**, not a code problem.
      the first-assembled body defines them once, the rest skip, shared scope makes them
      visible — order-independent (the original failure was an emission-order race).
 
-### The one remaining step: the linker
-The link needs **`xtensa-lx106-elf-gcc`** (Espressif ESP8266 GNU toolchain) — espup does
-NOT install it and there's no Homebrew formula. `rust-lld` (no install) gets most of the
-way but can't process the GNU-ld-style vector script (`exception.x`: "unable to move
-location counter backward … .vectors exceeds available address space"). So:
-- **To produce a flashable ELF:** install `xtensa-lx106-elf-gcc`, then switch
-  `.cargo/config.toml` back to the gcc driver (`-nostartfiles`, `-Wl,-Tlink.x`).
-- Or fix the linker scripts for lld (fiddler; `exception.x` / `memory.x` region maths).
+### The linker (solved)
+The link needs **`xtensa-lx106-elf-gcc`** (the ESP8266 GNU toolchain). espup does NOT
+install it, there's no Homebrew formula, the esp32 `xtensa-esp-elf` binutils refuse the
+lx106 objects (different baked-in xtensa core config — "cross-endian/merge target data"),
+and `rust-lld` can't process the GNU-ld vector script (`exception.x` location counter). So
+the answer is the real toolchain. Installed Espressif's prebuilt:
 
-**Note:** compiling ≠ correct. The exception-handler asm and the whole image are still
-**runtime-untestable without a physical ESP8266** (a wrong edit compiles but hard-faults).
-The Xtensa-unaligned-access question for `k256` (the original Phase-0 risk) is also still
-open and on-hardware-only.
+```
+curl -L https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-macos.tar.gz \
+  | tar -xz -C ~/.local
+export PATH="$HOME/.local/xtensa-lx106-elf/bin:$PATH"
+```
+
+macOS builds are x86_64 → runs via Rosetta on Apple Silicon (confirmed: `ld` 2.31.1,
+`gcc` 8.4.0). `.cargo/config.toml` now drives the link through `xtensa-lx106-elf-gcc`.
 
 ## Build
 1. `source ~/export-esp.sh`
-2. `cargo build --release` from this dir → compiles; link fails only on the missing gcc.
+2. `export PATH="$HOME/.local/xtensa-lx106-elf/bin:$PATH"`  (the lx106 linker)
+3. `cargo build --release` from this dir → links `target/xtensa-esp8266-none-elf/release/heartwood-esp8266`.
+4. To flash: `esptool.py --chip esp8266 elf2image <elf>` then `write_flash`.
 
 ## Recommendation
 The ESP8266 toolchain story is now fully mapped and the hard part (resurrecting the

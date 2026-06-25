@@ -1,15 +1,22 @@
-# All Rust compiles for xtensa-esp8266; the final link needs a linker that
-# targets the lx106. esp8266-hal's own config drives the link through
-# `xtensa-lx106-elf-gcc` (the Espressif ESP8266 GCC), which espup does NOT
-# install. We use the bundled `rust-lld` instead, so no extra toolchain is
-# needed. (If lld can't handle the linker script, install xtensa-lx106-elf-gcc
-# and switch back to: link-arg=-nostartfiles, link-arg=-Wl,-Tlink.x.)
+# All Rust compiles for xtensa-esp8266; the final link needs the ESP8266 GNU
+# toolchain, `xtensa-lx106-elf-gcc`. espup does NOT install it (and the esp32
+# `xtensa-esp-elf` binutils refuse the lx106 objects — different baked-in xtensa
+# core config). Install Espressif's prebuilt and put its bin/ on PATH:
+#
+#   curl -L https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-macos.tar.gz \
+#     | tar -xz -C ~/.local
+#   export PATH="$HOME/.local/xtensa-lx106-elf/bin:$PATH"
+#
+# (macOS builds are x86_64 — runs via Rosetta on Apple Silicon. Linux/arm64
+# builds: earlephilhower/esp-quick-toolchain releases.)
 [build]
 target = "xtensa-esp8266-none-elf"
+
+[target.xtensa-esp8266-none-elf]
+linker = "xtensa-lx106-elf-gcc"
 rustflags = [
-  "-C", "linker=rust-lld",
-  "-C", "linker-flavor=ld.lld",
-  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-nostartfiles",
+  "-C", "link-arg=-Wl,-Tlink.x",
 ]
 
 [unstable]

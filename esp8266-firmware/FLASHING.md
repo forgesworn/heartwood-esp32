@@ -97,13 +97,27 @@ then switches UART0 to 115200 and waits for the daemon.
 
 ## 6. Point the daemon at it
 
-On the host running `heartwood-bridge`, configure an **HSM‑mode** instance
-(`HEARTWOOD_DATA_DIR`, e.g. `/var/lib/heartwood/esp8266`):
+**First, provision the device.** A freshly‑flashed board has **no keys** (they
+live in flash now, not hardcoded), so write the master seed + bridge secret into
+its flash store. This is the local, key‑touching step — the relay‑courier daemon
+never does it:
+```sh
+pip install pyserial
+python3 provision.py --port /dev/cu.wchusbserial1420 --gen \
+  --bridge-secret "$(printf '42%.0s' {1..32})"   # demo secret = 32 bytes of 0x42
+# → prints the generated seed and the device npub. Keep both safe.
+```
+(`provision.py` sends `PROVISION` + `SET_BRIDGE_SECRET`, then reads back the npub
+to confirm. Until you do this, `SESSION_AUTH` returns "no secret" and
+`PROVISION_LIST` is empty.)
+
+**Then point the daemon at it** — an **HSM‑mode** `heartwood-bridge` instance
+under `HEARTWOOD_DATA_DIR` (e.g. `/var/lib/heartwood/esp8266`):
 
 | File | Contents |
 |------|----------|
 | `master.payload` | `hsm:/dev/cu.wchusbserial1420` (the port from step 3) |
-| `bridge.secret` | 32 bytes of `0x42` — matches the firmware placeholder: `printf '\x42%.0s' {1..32} > bridge.secret` |
+| `bridge.secret` | the **same 32 bytes** you passed to `--bridge-secret` above |
 | `config.json` | `{"relays":["wss://relay.damus.io","wss://nos.lol"]}` |
 
 Then run the bridge (`heartwood-bridge`, `RUST_LOG=info`). Staged check — each step

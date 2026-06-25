@@ -23,7 +23,10 @@ arithmetic+ecdh compiles at opt-z (SIGSEGV only at opt-3); common's deps forced
 `default-features=false`.
 
 **KNOWN GAPS — untested on hardware** (compiling+linking ≠ correct):
-- Master seed + bridge secret are **hardcoded** placeholders (flash key storage TODO).
+- Keys live in a **flash key store** now (`storage.rs`, sector at 0x3F0000) — provision the
+  seed + bridge secret with `provision.py` (`PROVISION` 0x01 / `SET_BRIDGE_SECRET` 0x23).
+  Remaining: provisioning has **no physical-confirmation gate** (the ESP32 needs a button
+  hold), and the seed is host-supplied (no on-device GENERATE_IDENTITY without an OLED).
 - **Auto-approve** — no button/OLED confirmation tier yet.
 - The **NIP-44 nonce RNG** reads the lx106 RNG register but it's only well-seeded with RF
   active; a radio-off signer needs an entropy review (nonce reuse is catastrophic).

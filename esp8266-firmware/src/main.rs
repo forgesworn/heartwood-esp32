@@ -232,8 +232,12 @@ fn handle(
                 .as_ref()
                 .and_then(|k| sign_path::handle(&k.master_seed, payload, oled))
             {
+                // If the signed envelope is larger than a frame can carry (a big
+                // event on this RAM-limited device), NACK rather than silently
+                // sending nothing — so the daemon fails loudly, not by timeout.
                 Some(event_json) => {
                     frame::build(out, frame::SIGN_ENVELOPE_RESPONSE, event_json.as_bytes())
+                        .or_else(|| frame::build(out, frame::NACK, &[]))
                 }
                 None => frame::build(out, frame::NACK, &[]),
             }

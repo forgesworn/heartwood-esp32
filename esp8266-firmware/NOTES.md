@@ -1,19 +1,34 @@
-# ESP8266 firmware scaffold — status & findings (2026-06-25)
+# ESP8266 tethered-signer firmware — status & findings (2026-06-25)
 
-Goal: turn the `esp8266-spike/` staticlib (proves the crypto compiles) into a real
-`no_main` binary that **compiles and links** for `xtensa-esp8266-none-elf` on the
-current `esp` toolchain — groundwork before on-hardware bring-up.
+A complete bare-metal USB-tethered Nostr signer for the ESP8266 (xtensa-lx106): the device
+half of the daemon-mediated path. It speaks the HW serial frame protocol to the
+`heartwood-bridge` daemon, which couriers NIP-46 over the relays.
 
-## Status: COMPILES AND LINKS into a flashable image. ✅
+## Status: a COMPLETE signer that COMPILES + LINKS into a flashable image. ✅
 
-`cargo build --release` produces a valid `ELF 32-bit LSB executable, Tensilica Xtensa`
-(entry `0x40100450`, `.vectors` at `0x40100000`, `.text` in IROM, `.bss` in DRAM) — the
-whole stack (`core`, `compiler_builtins`, `xtensa-lx 0.7`, the patched `xtensa-lx-rt 0.12`,
-`esp8266-hal 0.5.1`, this crate) compiles, and it links with the lx106 GNU toolchain.
+`cargo build --release` produces a valid `ELF 32-bit Tensilica Xtensa` executable
+(text ~172 KB in IROM, 24 KB heap in DRAM — fits the chip). Implemented:
+- `SESSION_AUTH (0x21)` → `SESSION_ACK (0x22)` — constant-time 32-byte secret.
+- `FIRMWARE_INFO (0x59)` → `0x5A` — version/board.
+- `PROVISION_LIST (0x05)` → `0x07` — k256-derived npub identity (bech32, verified vector).
+- `ENCRYPTED_REQUEST (0x10)` → `SIGN_ENVELOPE_RESPONSE (0x35)` — the inline sign path:
+  NIP-44 decrypt → NIP-46 dispatch (get_public_key / sign_event / connect / ping) →
+  re-encrypt → build & sign the kind:24133 envelope, all on-device, reusing
+  `heartwood-common` (converted to no_std). The daemon never sees plaintext or keys.
 
-**Still untested on hardware** — compiling+linking ≠ correct. The patched exception asm
-and the original `k256` Xtensa-unaligned-access question are only verifiable by flashing a
-real ESP8266.
+Toolchain wins along the way: the right runtime is `xtensa-lx-rt 0.12` (patched
+`naked_asm!` + `.ifndef` guard, vendored via `[patch]`); release-only (opt-0 fails register
+alloc); link via Espressif's `xtensa-lx106-elf` (x86_64/Rosetta, at `~/.local`); k256
+arithmetic+ecdh compiles at opt-z (SIGSEGV only at opt-3); common's deps forced
+`default-features=false`.
+
+**KNOWN GAPS — untested on hardware** (compiling+linking ≠ correct):
+- Master seed + bridge secret are **hardcoded** placeholders (flash key storage TODO).
+- **Auto-approve** — no button/OLED confirmation tier yet.
+- The **NIP-44 nonce RNG** reads the lx106 RNG register but it's only well-seeded with RF
+  active; a radio-off signer needs an entropy review (nonce reuse is catastrophic).
+- The **k256 Xtensa-unaligned-access** risk (the original Phase-0 question) is still only
+  verifiable by flashing a real ESP8266.
 
 ### What was solved
 - **Right runtime.** `esp8266-hal 0.5.1` uses the maintained **`xtensa-lx-rt 0.12` +

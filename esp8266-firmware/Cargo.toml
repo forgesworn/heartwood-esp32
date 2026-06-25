@@ -31,6 +31,13 @@ crc32fast = { version = "1", default-features = false }
 # BIP-340 Schnorr (pubkey derivation + signing). no_std, no-alloc — the exact
 # crate the esp8266-spike proved compiles for xtensa-lx106.
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+# Heap allocator for the data plane (NIP-44 buffers, JSON). The lx106 has no
+# `alloc` without one; the inline 0x10 sign path needs it.
+embedded-alloc = "0.6"
+# critical-section backs the allocator's locking; we provide the impl over the
+# xtensa interrupt enable/disable primitives.
+critical-section = { version = "1", features = ["restore-state-u32"] }
+xtensa-lx = { version = "0.7", features = ["esp8266"] }
 
 [profile.release]
 opt-level = "z"

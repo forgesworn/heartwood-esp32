@@ -17,9 +17,12 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod bech32;
 mod crypto;
 mod frame;
+mod heap;
 
 use esp8266_hal::prelude::*;
 use esp8266_hal::target::Peripherals;
@@ -37,6 +40,14 @@ const MASTER_SEED: [u8; 32] = [0x11; 32];
 
 #[entry]
 fn main() -> ! {
+    heap::init();
+    {
+        // Allocator smoke — the NIP-44 / JSON data plane will exercise it for real.
+        let mut probe = alloc::vec::Vec::<u8>::new();
+        probe.push(frame::MAGIC[0]);
+        core::hint::black_box(probe.as_ptr());
+    }
+
     let dp = Peripherals::take().unwrap();
     let pins = dp.GPIO.split();
     // UART0: GPIO1 = TX, GPIO3 = RX — the pins wired to the USB-UART bridge.

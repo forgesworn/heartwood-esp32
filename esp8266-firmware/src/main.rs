@@ -25,6 +25,7 @@
 extern crate alloc;
 
 mod bech32;
+mod button;
 mod crypto;
 mod frame;
 mod heap;

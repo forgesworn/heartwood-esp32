@@ -68,8 +68,8 @@ pub fn handle(seed: &[u8; 32], payload: &[u8]) -> Option<String> {
 }
 
 /// Minimal NIP-46 dispatch: `get_public_key`, `sign_event`, `connect`, `ping`.
-/// No policy engine or button approvals yet (auto-approve) — those arrive with
-/// the OLED/button tier.
+/// `sign_event` requires a physical button hold (`button::await_approval`); a
+/// richer policy engine and the OLED prompt are still to come.
 fn dispatch(request_json: &str, seed: &[u8; 32], our_pubkey_hex: &str) -> Option<String> {
     let req = nip46::parse_request(request_json.as_bytes()).ok()?;
     let resp = match req.method.as_str() {
@@ -78,22 +78,28 @@ fn dispatch(request_json: &str, seed: &[u8; 32], our_pubkey_hex: &str) -> Option
         "ping" => nip46::build_ping_response(&req.id),
         "sign_event" => match nip46::parse_unsigned_event(&req.params) {
             Ok(mut ev) => {
-                ev.pubkey = our_pubkey_hex.to_string();
-                let id = nip46::compute_event_id(&ev);
-                match crypto::sign(seed, &id) {
-                    Some(sig) => {
-                        let signed = SignedEvent {
-                            id: hex_lower(&id),
-                            pubkey: ev.pubkey,
-                            created_at: ev.created_at,
-                            kind: ev.kind,
-                            tags: ev.tags,
-                            content: ev.content,
-                            sig: hex_lower(&sig),
-                        };
-                        nip46::build_sign_response(&req.id, &signed)
+                // Physical-approval gate: the daemon can deliver a sign request
+                // but cannot approve it — require an on-device button hold.
+                if !crate::button::await_approval() {
+                    nip46::build_error_response(&req.id, -32000, "denied at device")
+                } else {
+                    ev.pubkey = our_pubkey_hex.to_string();
+                    let id = nip46::compute_event_id(&ev);
+                    match crypto::sign(seed, &id) {
+                        Some(sig) => {
+                            let signed = SignedEvent {
+                                id: hex_lower(&id),
+                                pubkey: ev.pubkey,
+                                created_at: ev.created_at,
+                                kind: ev.kind,
+                                tags: ev.tags,
+                                content: ev.content,
+                                sig: hex_lower(&sig),
+                            };
+                            nip46::build_sign_response(&req.id, &signed)
+                        }
+                        None => nip46::build_error_response(&req.id, -32603, "sign failed"),
                     }
-                    None => nip46::build_error_response(&req.id, -32603, "sign failed"),
                 }
             }
             Err(e) => nip46::build_error_response(&req.id, -32602, &e),

@@ -26,6 +26,8 @@ esp8266-hal = "0.5"
 panic-halt = "0.2"
 # Non-blocking I/O helper for the UART read/write loop.
 nb = "1"
+# CRC32 for the HW serial frame protocol (no_std software impl).
+crc32fast = { version = "1", default-features = false }
 
 [profile.release]
 opt-level = "z"

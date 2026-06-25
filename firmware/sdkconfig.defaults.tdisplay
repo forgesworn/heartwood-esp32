@@ -1,0 +1,26 @@
+# LilyGO / TENSTAR T-Display board-specific sdkconfig overrides.
+#
+# Classic ESP32-D0WD (Xtensa LX6, not the S3), ST7789 240x135 colour TFT over
+# SPI, and a CH9102 USB-to-UART bridge wired to UART0 (TX0 GPIO1 / RX0 GPIO3).
+#
+# This fragment is layered AFTER the shared sdkconfig.defaults, so it overrides
+# the chip target and partition table the Heltec (ESP32-S3) builds use.
+
+# Chip target -- classic ESP32 (overrides the shared "esp32s3").
+CONFIG_IDF_TARGET="esp32"
+
+# Flash -- the T-Display ships with 4MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Console routing: like the Heltec V3, the USB bridge shares UART0 with the
+# binary frame protocol, so the ESP-IDF console must be silenced or its log
+# lines would interleave with (and corrupt) frame data.
+CONFIG_ESP_CONSOLE_NONE=y
+
+# 4MB single-OTA partition layout (see partitions-4mb.csv). Overrides the
+# shared 8MB dual-OTA table.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../../../../partitions-4mb.csv"
+
+# No second OTA slot in the 4MB single-app layout, so the bootloader rollback
+# feature (which needs otadata + ota_0/ota_1) is not applicable here.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n

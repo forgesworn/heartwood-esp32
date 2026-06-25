@@ -1,0 +1,9 @@
+[build]
+target = "xtensa-esp8266-none-elf"
+
+[unstable]
+build-std = ["core"]
+# The xtensa-lx106 LLVM backend cannot register-allocate the f16/f128 soft-float
+# intrinsics (rustc 1.87) — "Cannot scavenge register" in compiler_builtins.
+# Omit them; firmware never uses 128-bit floats. `mem` keeps memcpy/memset.
+build-std-features = ["compiler-builtins-no-f16-f128", "compiler-builtins-mem"]

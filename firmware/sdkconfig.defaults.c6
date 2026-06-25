@@ -1,0 +1,30 @@
+# Waveshare ESP32-C6-LCD-1.47 board-specific sdkconfig overrides.
+#
+# ESP32-C6 (RISC-V rv32imac), ST7789 172x320 portrait colour TFT over SPI, and
+# the chip's native USB-Serial-JTAG (GPIO12 D- / GPIO13 D+) carrying the binary
+# frame protocol.
+#
+# Layered AFTER the shared sdkconfig.defaults, so it overrides the chip target,
+# console routing and partition table the Heltec (ESP32-S3) builds use.
+
+# Chip target -- ESP32-C6 (overrides the shared "esp32s3").
+CONFIG_IDF_TARGET="esp32c6"
+
+# Flash -- the Waveshare C6-LCD-1.47 ships with 4MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Console routing: UNLIKE the ESP32-S3 (whose default console is UART0, harmless
+# because it is not wired to USB-C), the C6's default *secondary* console is the
+# USB-Serial-JTAG peripheral -- the very channel we use for the frame protocol.
+# Left enabled, ESP-IDF log lines would interleave with and corrupt frame data,
+# so the console is silenced entirely (as on the UART0-sharing T-Display). For
+# bench debugging, route logs to UART0 instead of disabling them here.
+CONFIG_ESP_CONSOLE_NONE=y
+
+# 4MB single-OTA partition layout (see partitions-4mb.csv). Overrides the shared
+# 8MB dual-OTA table.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../../../../partitions-4mb.csv"
+
+# No second OTA slot in the 4MB single-app layout, so the bootloader rollback
+# feature (which needs otadata + ota_0/ota_1) is not applicable here.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n

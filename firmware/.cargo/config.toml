@@ -5,6 +5,20 @@ target = "xtensa-esp32s3-espidf"
 linker = "ldproxy"
 runner = "espflash flash --monitor"
 
+# Classic ESP32 (Xtensa LX6) target -- the T-Display board. Selected via
+# `--target xtensa-esp32-espidf` by scripts/build-firmware.sh, which also
+# exports MCU=esp32 and the T-Display sdkconfig fragment.
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+
+# ESP32-C6 (RISC-V rv32imac) target -- the Waveshare ESP32-C6-LCD-1.47 board.
+# Selected via `--target riscv32imac-esp-espidf` by scripts/build-firmware.sh,
+# which also exports MCU=esp32c6 and the C6 sdkconfig fragment.
+[target.riscv32imac-esp-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+
 [unstable]
 build-std = ["std", "panic_abort"]
 
@@ -20,6 +34,14 @@ CC_xtensa_esp32s3_espidf = "xtensa-esp32s3-elf-gcc"
 # range". ESP-IDF's own C already uses -mlongcalls; this extends it to the
 # cc-built C FFI crates. (Surfaced by the WiFi heap/size spike, 8 Jun.)
 CFLAGS_xtensa_esp32s3_espidf = "-mlongcalls"
+# Classic ESP32 (T-Display) C FFI cross-compiler + the same -mlongcalls flag
+# (the unified xtensa-esp-elf-gcc handles esp32 and esp32s3 alike). MCU=esp32
+# is exported by the build script, not here, so the default build stays S3.
+CC_xtensa_esp32_espidf = "xtensa-esp32-elf-gcc"
+CFLAGS_xtensa_esp32_espidf = "-mlongcalls"
+# ESP32-C6 (RISC-V) C FFI cross-compiler. RISC-V has no Xtensa call8/call4 range
+# limit, so -mlongcalls (an Xtensa-only flag) is neither needed nor valid here.
+CC_riscv32imac_esp_espidf = "riscv32-esp-elf-gcc"
 # Board-specific sdkconfig fragment selection. This is the default for the
 # `heltec-v4` feature (the cargo default). For a V3 build, override this
 # variable at invocation time before `cargo build`, e.g.:

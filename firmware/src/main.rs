@@ -18,24 +18,33 @@
 // GPIO44 RX). Both boards expose the same frame protocol through the
 // `serial::SerialPort` wrapper.
 
-#[cfg(not(any(feature = "heltec-v3", feature = "heltec-v4")))]
+#[cfg(not(any(feature = "heltec-v3", feature = "heltec-v4", feature = "tdisplay", feature = "c6")))]
 compile_error!(
-    "heartwood-esp32 requires exactly one of the `heltec-v3` or `heltec-v4` \
-     cargo features. Did you build with `--no-default-features` and forget \
-     to pick a board?"
+    "heartwood-esp32 requires exactly one board feature: `heltec-v3`, \
+     `heltec-v4`, `tdisplay`, or `c6`. Did you build with `--no-default-features` \
+     and forget to pick a board?"
 );
 
-#[cfg(all(feature = "heltec-v3", feature = "heltec-v4"))]
+#[cfg(any(
+    all(feature = "heltec-v3", feature = "heltec-v4"),
+    all(feature = "heltec-v3", feature = "tdisplay"),
+    all(feature = "heltec-v3", feature = "c6"),
+    all(feature = "heltec-v4", feature = "tdisplay"),
+    all(feature = "heltec-v4", feature = "c6"),
+    all(feature = "tdisplay", feature = "c6"),
+))]
 compile_error!(
-    "cargo features `heltec-v3` and `heltec-v4` are mutually exclusive -- \
-     enable exactly one."
+    "board features `heltec-v3`, `heltec-v4`, `tdisplay` and `c6` are mutually \
+     exclusive -- enable exactly one."
 );
 
 mod approval;
 mod backup;
+mod board;
 mod button;
 mod connslot;
 mod identity_cache;
+mod layout;
 mod masters;
 mod nip46_handler;
 mod nvs;
@@ -49,20 +58,17 @@ mod provision;
 mod serial;
 mod net_config_store;
 mod boot_config;
+#[cfg(feature = "st7789")]
+mod st7789;
 mod relay;
 mod session;
 mod sign;
 mod transport;
 
-use esp_idf_hal::gpio::PinDriver;
-use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_hal::units::FromValueType;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use serial::SerialPort;
 
 /// How long the display stays on after the last activity before sleeping.
 const DISPLAY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,20 +94,13 @@ use heartwood_common::types::{
 };
 use secp256k1::Secp256k1;
 
-/// Board identifier, from the build feature — reported in FIRMWARE_INFO so the
-/// manager can match the right firmware asset and version.
-#[cfg(feature = "heltec-v4")]
-pub const BOARD: &str = "heltec-v4";
-#[cfg(feature = "heltec-v3")]
-pub const BOARD: &str = "heltec-v3";
-
 /// JSON for a FIRMWARE_INFO_RESPONSE — the running firmware version and board.
 /// Read-only and secret-free, so it is answered over USB in any mode.
 pub fn firmware_info_json() -> String {
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\"}}",
         env!("CARGO_PKG_VERSION"),
-        BOARD
+        board::BOARD
     )
 }
 
@@ -132,78 +131,26 @@ fn main() {
 
     let peripherals = Peripherals::take().expect("failed to take peripherals");
 
-    // Turn on white LED (GPIO 35, active high).
-    let mut led = PinDriver::output(peripherals.pins.gpio35).expect("LED pin");
-    led.set_high().ok();
-
-    // Enable Vext (GPIO 36, active low) — powers the OLED.
-    let mut vext = PinDriver::output(peripherals.pins.gpio36).expect("Vext pin");
-    vext.set_low().ok();
-    esp_idf_hal::delay::FreeRtos::delay_ms(50);
-
-    // --- OLED init ---
-    log::info!("Initialising OLED...");
-    let i2c_config = I2cConfig::new().baudrate(400.kHz().into());
-    let i2c = I2cDriver::new(
-        peripherals.i2c0,
-        peripherals.pins.gpio17, // SDA
-        peripherals.pins.gpio18, // SCL
-        &i2c_config,
-    )
-    .expect("I2C init failed");
-    log::info!("I2C driver created");
-
-    let mut display = oled::init(i2c, peripherals.pins.gpio21.into());
-    log::info!("OLED init complete");
+    // --- Board hardware bring-up ---
+    // All board-specific pin/peripheral wiring (LED, display power, display,
+    // host transport, button(s)) lives in `board::bringup`; everything below
+    // is board-agnostic. Housekeeping pins (LED, OLED power) are kept driven
+    // inside `bringup`, so only handles the firmware actively uses come back.
+    let board::Hw {
+        mut display,
+        serial: mut usb,
+        button_a: button_pin,
+        button_b: _button_b,
+        modem,
+    } = board::bringup(peripherals);
+    log::info!("Board bring-up complete ({})", board::BOARD);
 
     // --- Boot animation ---
     oled::show_boot_animation(&mut display);
 
-    // --- Button pin (GPIO 0, active low, internal pull-up) ---
-    let button_pin =
-        PinDriver::input(peripherals.pins.gpio0, esp_idf_hal::gpio::Pull::Up).expect("button pin");
-
     // --- NVS init ---
     let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
     let mut nvs = EspNvs::new(nvs_partition, "heartwood", true).expect("NVS namespace init failed");
-
-    // --- Serial port to the host (unconditional -- created before the provision wait loop) ---
-    //
-    // Heltec V4 uses the ESP32-S3 native USB-Serial-JTAG peripheral on
-    // GPIO19/20 (the pins are physically wired to the USB-C connector).
-    // Heltec V3 has a CP2102 USB-to-UART bridge between the USB-C port and
-    // UART0 (GPIO43 TX / GPIO44 RX), so we drive UART0 instead. The frame
-    // protocol is identical in both cases -- the `SerialPort` wrapper
-    // normalises the read/write API.
-    #[cfg(feature = "heltec-v4")]
-    let mut usb = {
-        use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
-        let driver = UsbSerialDriver::new(
-            peripherals.usb_serial,
-            peripherals.pins.gpio19,
-            peripherals.pins.gpio20,
-            &UsbSerialConfig::new().rx_buffer_size(4096).tx_buffer_size(4096),
-        )
-        .expect("USB serial driver init failed");
-        SerialPort::from_usb(driver)
-    };
-
-    #[cfg(feature = "heltec-v3")]
-    let mut usb = {
-        use esp_idf_hal::gpio::AnyIOPin;
-        use esp_idf_hal::uart::{config::Config as UartConfig, UartDriver};
-        use esp_idf_hal::units::Hertz;
-        let driver = UartDriver::new(
-            peripherals.uart0,
-            peripherals.pins.gpio43, // CP2102 RX (ESP32 TX)
-            peripherals.pins.gpio44, // CP2102 TX (ESP32 RX)
-            None::<AnyIOPin>,        // CTS -- unused
-            None::<AnyIOPin>,        // RTS -- unused
-            &UartConfig::new().baudrate(Hertz(115_200)),
-        )
-        .expect("UART0 driver init failed");
-        SerialPort::from_uart(driver)
-    };
 
     // --- Load masters ---
     let mut loaded_masters = masters::load_all(&nvs);
@@ -442,7 +389,7 @@ fn main() {
                 log::info!("WiFi-standalone mode — entering relay loop");
                 let op_mgmt = cfg.op_mgmt_pubkey();
                 relay::run_wifi_standalone(
-                    peripherals.modem,
+                    modem,
                     cfg,
                     &loaded_masters,
                     &secp,

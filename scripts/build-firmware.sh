@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
 #
-# Build the Heartwood ESP32 firmware for a specific Heltec board variant.
+# Build the Heartwood ESP32 firmware for a specific board variant.
 #
-# Usage: scripts/build-firmware.sh {v3|v4} [cargo args...]
+# Usage: scripts/build-firmware.sh {v3|v4|tdisplay|c6} [cargo args...]
 #
-# The two Heltec boards wire USB-C differently:
+# Boards differ in chip, display, host transport and flash:
 #
-#   V4 -- USB-C goes to the ESP32-S3 native USB pins (GPIO19/20), driving
-#         the chip's USB-Serial-JTAG peripheral.
+#   v3       -- Heltec WiFi LoRa 32 V3: ESP32-S3, SSD1306 OLED, CP2102 UART0.
+#   v4       -- Heltec WiFi LoRa 32 V4: ESP32-S3, SSD1306 OLED, native USB-JTAG.
+#   tdisplay -- LilyGO / TENSTAR T-Display: classic ESP32, ST7789 colour TFT,
+#               CH9102 UART0. Built for the xtensa-esp32-espidf target.
+#   c6       -- Waveshare ESP32-C6-LCD-1.47: ESP32-C6 (RISC-V), ST7789 172x320
+#               portrait TFT, native USB-JTAG. Built for riscv32imac-esp-espidf.
 #
-#   V3 -- USB-C goes through a CP2102 USB-to-UART bridge to the ESP32-S3's
-#         UART0 (GPIO43 TX / GPIO44 RX).
+# Compile-time board selection is via mutually-exclusive cargo features plus a
+# matching sdkconfig fragment, target triple and MCU -- all set here together
+# so they cannot drift apart.
 #
-# Compile-time selection is via mutually-exclusive cargo features
-# (heltec-v3, heltec-v4) and a matching sdkconfig fragment pointed to by
-# ESP_IDF_SDKCONFIG_DEFAULTS. This script sets both in one go so they cannot
-# drift apart.
-#
-# Artifacts are copied to target/heartwood-v3.bin or target/heartwood-v4.bin
-# so you can distribute them alongside the right hardware and never flash
-# the wrong binary.
+# Artifacts are copied to target/heartwood-<board>.elf so you can distribute
+# them alongside the right hardware and never flash the wrong binary.
 #
 # Examples:
 #
 #   scripts/build-firmware.sh v4
 #   scripts/build-firmware.sh v3 --release
-#   scripts/build-firmware.sh v4 --release -- --features some-extra
+#   scripts/build-firmware.sh tdisplay --release
+#   scripts/build-firmware.sh c6 --release
 
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "usage: $0 {v3|v4} [cargo args...]" >&2
+    echo "usage: $0 {v3|v4|tdisplay|c6} [cargo args...]" >&2
     exit 2
 fi
 
@@ -39,13 +39,19 @@ shift
 
 case "$BOARD" in
     v3|V3|heltec-v3)
-        FEATURE="heltec-v3"
+        FEATURE="heltec-v3"; TARGET="xtensa-esp32s3-espidf"; MCU="esp32s3"
         ;;
     v4|V4|heltec-v4)
-        FEATURE="heltec-v4"
+        FEATURE="heltec-v4"; TARGET="xtensa-esp32s3-espidf"; MCU="esp32s3"
+        ;;
+    tdisplay|TDISPLAY|t-display)
+        FEATURE="tdisplay"; TARGET="xtensa-esp32-espidf"; MCU="esp32"
+        ;;
+    c6|C6|esp32c6)
+        FEATURE="c6"; TARGET="riscv32imac-esp-espidf"; MCU="esp32c6"
         ;;
     *)
-        echo "error: unknown board '$BOARD' (expected v3 or v4)" >&2
+        echo "error: unknown board '$BOARD' (expected v3, v4, tdisplay, or c6)" >&2
         exit 2
         ;;
 esac
@@ -53,18 +59,22 @@ esac
 FIRMWARE_DIR="$(cd "$(dirname "$0")/../firmware" && pwd)"
 cd "$FIRMWARE_DIR"
 
+# `force = false` on the [env] entries in .cargo/config.toml means these shell
+# exports win, so MCU/sdkconfig follow the chosen board rather than the S3
+# default baked into the config file.
 export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.${FEATURE}"
+export MCU
 
-BOARD_UPPER="$(printf '%s' "$BOARD" | tr '[:lower:]' '[:upper:]')"
-echo "==> Building heartwood-esp32 for Heltec ${BOARD_UPPER}"
-echo "    feature                    = ${FEATURE}"
+echo "==> Building heartwood-esp32 for ${FEATURE}"
+echo "    target                     = ${TARGET}"
+echo "    MCU                        = ${MCU}"
 echo "    ESP_IDF_SDKCONFIG_DEFAULTS = ${ESP_IDF_SDKCONFIG_DEFAULTS}"
 
-cargo build --no-default-features --features "$FEATURE" "$@"
+cargo build --target "$TARGET" --no-default-features --features "$FEATURE" "$@"
 
 # Copy the compiled ELF next to a board-tagged name so the operator cannot
-# accidentally espflash a V3 binary onto a V4 or vice versa. The ELF path
-# depends on whether --release was passed; inspect the args.
+# accidentally flash one board's binary onto another. The ELF path depends on
+# whether --release was passed; inspect the args.
 PROFILE="debug"
 for arg in "$@"; do
     if [[ "$arg" == "--release" ]]; then
@@ -72,7 +82,7 @@ for arg in "$@"; do
     fi
 done
 
-SRC="target/xtensa-esp32s3-espidf/${PROFILE}/heartwood-esp32"
+SRC="target/${TARGET}/${PROFILE}/heartwood-esp32"
 DST="target/heartwood-${BOARD}.elf"
 
 if [[ -f "$SRC" ]]; then

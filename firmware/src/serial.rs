@@ -24,10 +24,10 @@
 
 use esp_idf_svc::sys::EspError;
 
-#[cfg(feature = "heltec-v4")]
+#[cfg(any(feature = "heltec-v4", feature = "c6"))]
 use esp_idf_hal::usb_serial::UsbSerialDriver;
 
-#[cfg(feature = "heltec-v3")]
+#[cfg(any(feature = "heltec-v3", feature = "tdisplay"))]
 use esp_idf_hal::uart::UartDriver;
 
 /// Board-specific serial transport to the host.
@@ -36,21 +36,21 @@ use esp_idf_hal::uart::UartDriver;
 /// on-board CP2102 bridge (V3). Which backend is compiled in is determined by
 /// the active cargo feature.
 pub struct SerialPort<'a> {
-    #[cfg(feature = "heltec-v4")]
+    #[cfg(any(feature = "heltec-v4", feature = "c6"))]
     inner: UsbSerialDriver<'a>,
-    #[cfg(feature = "heltec-v3")]
+    #[cfg(any(feature = "heltec-v3", feature = "tdisplay"))]
     inner: UartDriver<'a>,
 }
 
 impl<'a> SerialPort<'a> {
     /// Wrap a native `UsbSerialDriver` (Heltec V4).
-    #[cfg(feature = "heltec-v4")]
+    #[cfg(any(feature = "heltec-v4", feature = "c6"))]
     pub fn from_usb(inner: UsbSerialDriver<'a>) -> Self {
         Self { inner }
     }
 
     /// Wrap a native `UartDriver` on UART0 (Heltec V3, CP2102 bridge).
-    #[cfg(feature = "heltec-v3")]
+    #[cfg(any(feature = "heltec-v3", feature = "tdisplay"))]
     pub fn from_uart(inner: UartDriver<'a>) -> Self {
         Self { inner }
     }
@@ -78,11 +78,11 @@ impl<'a> SerialPort<'a> {
     /// takes only `(buf)` and blocks until the TX FIFO has room. The wrapper
     /// normalises these to a single `write(buf)` call.
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, EspError> {
-        #[cfg(feature = "heltec-v4")]
+        #[cfg(any(feature = "heltec-v4", feature = "c6"))]
         {
             self.inner.write(buf, esp_idf_hal::delay::BLOCK)
         }
-        #[cfg(feature = "heltec-v3")]
+        #[cfg(any(feature = "heltec-v3", feature = "tdisplay"))]
         {
             self.inner.write(buf)
         }

@@ -133,20 +133,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install the Espressif Rust toolchain (espup — esp32 + esp32c6)
+      - name: Install the esp Rust toolchain (espup — nightly Rust + LLVM)
         run: |
           set -eu
           curl -fL -o espup \
             https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu
           chmod +x espup
-          # espup ties each piece to a chip, and the C6 build needs two pieces from two
-          # chips: the xtensa chip (esp32) pulls the NIGHTLY-based "esp" Rust toolchain
-          # that firmware/rust-toolchain.toml pins — build-std (-Zbuild-std) is nightly-
-          # only, riscv-on-stable can't build `core` — while the riscv chip (esp32c6)
-          # pulls the riscv32-esp-elf gcc for the secp256k1-sys C FFI. A plain
-          # `espup install` installs only the xtensa gcc (confirmed from CI logs);
-          # `--targets esp32c6` alone skips the esp toolchain. Hence both chips.
-          ./espup install --targets esp32,esp32c6 --export-file "$HOME/export-esp.sh"
+          # The xtensa chip (esp32) pulls the NIGHTLY-based "esp" Rust toolchain that
+          # firmware/rust-toolchain.toml pins — build-std (-Zbuild-std) is nightly-only,
+          # riscv-on-stable can't build `core` — plus the esp LLVM (libclang for bindgen).
+          # espup does NOT install the riscv gcc (every CI run logged only "Installing
+          # GCC (xtensa-esp-elf)"), so the C FFI cross-compiler is fetched in the next step.
+          ./espup install --targets esp32 --export-file "$HOME/export-esp.sh"
+      - name: Install the riscv32-esp-elf gcc (the C FFI cross-compiler)
+        run: |
+          set -eu
+          # esp-idf v5.3.2's RISC-V cross-compiler (gcc 13.2.0). secp256k1-sys's cc build
+          # needs `riscv32-esp-elf-gcc` on PATH; the Xtensa boards get theirs from the
+          # toolchain action, but espup never installs the riscv one — fetch it directly
+          # and add it to PATH for the build (mirrors the esp8266 lx106-gcc step).
+          curl -fL -o /tmp/riscv-gcc.tar.xz \
+            https://github.com/espressif/crosstool-NG/releases/download/esp-13.2.0_20240530/riscv32-esp-elf-13.2.0_20240530-x86_64-linux-gnu.tar.xz
+          mkdir -p "$HOME/.local"
+          tar -xJf /tmp/riscv-gcc.tar.xz -C "$HOME/.local"
+          echo "$HOME/.local/riscv32-esp-elf/bin" >> "$GITHUB_PATH"
       - name: Install ldproxy (esp-idf linker shim)
         run: cargo install ldproxy
       - uses: Swatinem/rust-cache@v2
@@ -164,14 +174,8 @@ jobs:
         run: |
           set -euo pipefail
           . "$HOME/export-esp.sh"
-          # espup installs the riscv32-esp-elf gcc but its generated export-esp.sh does
-          # not put it on PATH on the CI runner (only LIBCLANG_PATH). secp256k1-sys's cc
-          # build needs it (CC_riscv32imac_esp_espidf=riscv32-esp-elf-gcc) — locate the
-          # one espup installed under the esp toolchain dir and add its bin explicitly.
-          # (Check the gcc file path BEFORE dirname: `dirname ""` is ".", not empty.)
-          gcc_path="$(find "$HOME/.rustup" -name riscv32-esp-elf-gcc -type f 2>/dev/null | head -1)"
-          [ -n "$gcc_path" ] || { echo "::error::riscv32-esp-elf-gcc not found after espup install"; exit 1; }
-          export PATH="$(dirname "$gcc_path"):$PATH"
+          # The riscv gcc is on PATH from the install step above (via $GITHUB_PATH);
+          # confirm it before building so a PATH problem fails here, not deep in cc-rs.
           riscv32-esp-elf-gcc --version | head -1
           cargo build --release --target riscv32imac-esp-espidf --no-default-features --features c6
       - name: App image must fit the C6 3 MB app slot

@@ -1,0 +1,28 @@
+[package]
+name = "esp8266-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# staticlib: produces a self-contained .a with no final link step, so we do NOT
+# need the (dead) xtensa-lx106-rt runtime, a linker script, or xtensa-lx106-gcc.
+# This isolates the real question: does a BIP-340 Schnorr signer COMPILE to
+# xtensa-lx106 machine code under no_std?
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# Pure-Rust secp256k1. default-features=false => no_std, no std, no alloc unless
+# a feature pulls it. `schnorr` gives BIP-340 (x-only, tagged hashes).
+k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+
+# Child-key derivation (HMAC-SHA256), the same primitive heartwood-common::derive
+# uses. Both no_std, no alloc.
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+
+[profile.release]
+opt-level = "z"   # firmware target: smallest code
+panic = "abort"   # no unwinder on bare metal
+codegen-units = 1
+lto = true        # cross-crate DCE → realistic reachable-code size (pure Rust, no C-FFI LTO hazard)

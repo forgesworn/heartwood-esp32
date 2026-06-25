@@ -207,25 +207,29 @@ Effort is small *after* T-Display, because the display layer, layout module, boa
 
 ---
 
-## 6. ESP8266 — time-boxed feasibility spike (separate, not a port)
+## 6. ESP8266 — feasibility spike (RESOLVED 2026-06-25: GO for a tethered signer, with caveats)
 
-The ESP8266 **cannot** run this firmware: it has no ESP-IDF-v5 std support (it uses the frozen RTOS/NONOS SDK), Rust support is `no_std`-only pinned to the **esp-rs fork v1.80** (dropped after Rust 1.81), `esp8266-hal` is in "minimal maintenance", and `espup` explicitly refuses it. So this is a **separate minimal `no_std` crate**, not a feature of the firmware.
+The ESP8266 cannot run this firmware (no ESP-IDF-v5 std; frozen RTOS/NONOS SDK). It is a **separate minimal `no_std` crate**, not a firmware feature — see [`esp8266-spike/`](../esp8266-spike/), which compiles and sizes the full signer for `xtensa-esp8266-none-elf`.
 
-**The make-or-break is RAM.** The signing context is the whole game:
+**The spike ran, and it flips this section's original assumption.** The make-or-break was thought to be RAM (a feared ~130 KB signing context). It is not: a *sign-only* secp256k1 context never allocates the large `ecmult` verify table — Schnorr signing touches only the small generator (`ecmult_gen`) table, which precomputation places in flash. Measured, pure-Rust `k256` building the full *seed → HMAC-SHA256 child → BIP-340 sign* chain:
 
-| | Size | Fits ~40–70 KB usable DRAM? |
-|---|---|---|
-| secp256k1 sign ctx, default | ~130 KB | **No** |
-| secp256k1 sign ctx, `USE_ECMULT_STATIC_PRECOMPUTATION` + `ECMULT_WINDOW_SIZE=4` (table in flash) | ~1–5 KB runtime | **Yes** |
-| SHA-256/HMAC + 32-byte seed + 1 KB OLED buffer + ~4–8 KB stack | ~15–25 KB total | Yes |
+| Metric | Result |
+|---|---|
+| Compiles (rustc 1.87 esp fork, `no_std`) | ✅ |
+| Allocator | none (built `build-std=["core"]`) |
+| Flash, reachable code (LTO) | **~145 KB** (fits 4 MB with vast margin) |
+| Static RAM (`data`+`bss`) | **0 bytes** |
+| Runtime RAM, one sign | **<5 KB stack** |
 
-There is **no alignment-safe pure-Rust fallback** — the documented k256 Xtensa hang is expected to hit LX106 at least as hard (no unaligned-access option). Everything rides on cross-compiling `libsecp256k1` (C) for `xtensa-lx106-elf` with static precomputation and getting `secp256k1-sys`'s `cc` build to emit it.
+The one snag was the toolchain, not the crypto: `-Zbuild-std` choked on the rustc-1.87 f16/f128 soft-float intrinsics in `compiler_builtins` (the weakly-maintained LX106 backend "cannot scavenge register"), fixed with `build-std-features = ["compiler-builtins-no-f16-f128", "compiler-builtins-mem"]`.
 
-**Spike goal (smallest proof):** a `no_std` ESP8266 binary that loads a fixed 32-byte seed, derives one child key (HMAC-SHA256, byte-compatible with `heartwood-common::derive`), produces a valid BIP-340 signature over a fixed event hash, and shows the npub on the OLED.
+**Residual gates — platform, not crypto; need hardware to close:**
+1. **Runtime alignment.** Xtensa traps unaligned access and `k256`/`crypto-bigint` have historically faulted on it; compiling ≠ running, so confirm on-device or QEMU. The C `libsecp256k1` path avoids this but needs `xtensa-lx106-gcc`.
+2. **Side channels.** `k256` is variable-time-multiplication-sensitive; the LX106 gives no constant-time guarantee. Weigh before production for a key-holding signer.
+3. **Unmaintained glue.** `esp8266-hal` / `xtensa-lx106-rt` archived (embedded-hal 0.2); `espflash` 3.x dropped the 8266 (use `esptool.py`). The crypto is fine; the bare-metal platform is the cost.
+4. **No Wi-Fi, ever.** Closed ROM blob, no `esp-wifi`. Fine for a USB-tethered signer; it can never join the WiFi-standalone relay path.
 
-**Go/no-go gate (day 1–2, before any integration):** a C-only probe returns `secp256k1_context_preallocated_size(SIGN) ≤ ~8 KB` with static precomputation on LX106, **and** `cargo check` passes on `secp256k1` + `sha2` + `hmac` with the pinned 1.80 toolchain. If either fails, **the ESP8266 is out** and the ESP32 family stays the floor (this matches the wider ecosystem — LNbits' signing device is ESP32-only).
-
-**Effort:** ~3–5 days, isolated. Top risks: (1) context won't fit even with static precomp (~40%); (2) no pure-Rust fallback if the C path fails (~75% that k256 also hangs); (3) toolchain frozen at 1.80 blocks a dependency (~35%, fixable by pinning).
+**Verdict:** feasible for a **USB-tethered signer**, on a frozen platform. The pragmatic substitute is the **ESP32-C3** — pin-compatible with the ESP8266, same price, fully-supported *stable* Rust, RISC-V (no Xtensa alignment risk), embedded-hal 1.0 — which clears gates 1–3 and reuses the §5 RISC-V / `board.rs` work. Open call for the user: pursue the tethered ESP8266 as-is, pivot the "cheap third board" to the ESP32-C3, or stop at the ESP32-S3 / ESP32 / C6 set already supported.
 
 ---
 

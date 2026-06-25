@@ -5,35 +5,66 @@
 // reset on GPIO21 and Vext power on GPIO36 (active low), so this module is
 // hardware-identical between boards.
 
-use embedded_graphics::mono_font::ascii::{FONT_5X8, FONT_6X10, FONT_7X14, FONT_10X20};
+// FONT_6X10 / FONT_10X20 are still used directly by the boot animation; the
+// screen functions select fonts via `Layout::font_*` instead.
+use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::Pixel;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
+
+use crate::layout::Layout;
 use esp_idf_hal::delay::FreeRtos;
+
+// SSD1306 / I2C backend imports — used only by the mono-OLED `Display` alias
+// and `init` below. Colour-TFT boards select the ST7789 backend and never pull
+// these in, so they are gated to the mono boards to keep colour builds clean.
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 use esp_idf_hal::gpio::{AnyOutputPin, PinDriver};
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 use esp_idf_hal::i2c::I2cDriver;
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 use ssd1306::mode::BufferedGraphicsMode;
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 use ssd1306::prelude::*;
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 use ssd1306::rotation::DisplayRotation;
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 use ssd1306::size::DisplaySize128x64;
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 use ssd1306::I2CDisplayInterface;
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 use ssd1306::Ssd1306;
 
-/// 128px / 7px per char = 18 chars per line.
-const CHARS_PER_LINE: usize = 18;
 
+/// The active display backend, selected by board.
+///
+/// Mono SSD1306 (I2C) on the Heltec OLED boards; the colour ST7789 wrapper
+/// (SPI) on the TFT boards. Both expose the *same* surface to the screen
+/// functions below — `clear_buffer` / `flush` / `set_display_on` plus an
+/// embedded-graphics `DrawTarget<Color = BinaryColor>` — so no screen code
+/// changes between backends (the ST7789 wrapper maps On→white, Off→black).
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 pub type Display<'a> = Ssd1306<
     ssd1306::prelude::I2CInterface<I2cDriver<'a>>,
     DisplaySize128x64,
     BufferedGraphicsMode<DisplaySize128x64>,
 >;
 
+/// Colour-TFT boards (no Heltec mono OLED feature active) use the ST7789
+/// wrapper as the display backend.
+#[cfg(not(any(feature = "heltec-v3", feature = "heltec-v4")))]
+pub type Display<'a> = crate::st7789::St7789Display<'a>;
+
 /// Initialise the OLED: reset pin toggle, I2C setup, display init.
 /// The reset PinDriver is deliberately leaked — GPIO 21 must stay HIGH
 /// or the SSD1306 is held in reset and the display goes blank.
+///
+/// SSD1306/I2C-specific; colour-TFT boards construct their display via
+/// `st7789::St7789Display::new` from `board::bringup` instead.
+#[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
 pub fn init<'a>(
     i2c: I2cDriver<'a>,
     rst_pin: AnyOutputPin,
@@ -66,39 +97,49 @@ pub fn init<'a>(
     display
 }
 
+/// Build the [`Layout`] for the active display from its reported size, so each
+/// screen positions itself responsively. On the 128x64 mono OLED this is the
+/// identity (the Heltec rendering is unchanged); on a colour TFT it fills the
+/// panel and steps fonts up.
+fn layout(display: &Display<'_>) -> Layout {
+    let size = display.bounding_box().size;
+    Layout::new(size.width as i32, size.height as i32)
+}
+
 /// Display an npub on the OLED with header and structured layout.
 ///
 /// Layout:
-///   Header:   "IDENTITY" (FONT_6X10, tracked)
+///   Header:   "IDENTITY" (header font, tracked)
 ///   Rule:     1px horizontal line
-///   Body:     npub split across lines (FONT_5X8 for density)
+///   Body:     npub split across lines (small font for density)
 pub fn show_npub(display: &mut Display<'_>, npub: &str) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let mono = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("IDENTITY", Point::new(2, 10), header).draw(display).ok();
+    Text::new("IDENTITY", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     // Rule
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    // npub in small font: 128/5 = 25 chars per line, fits npub1... in ~3 lines
-    let chars_small = 25usize;
+    // npub in small font, wrapped to the panel width across as many lines as fit.
+    let chars_small = l.chars_per_line(l.font_small());
     let mut y = 26i32;
     let mut pos = 0;
-    while pos < npub.len() && y < 64 {
+    while pos < npub.len() && l.sy(y) < l.h {
         let end = core::cmp::min(pos + chars_small, npub.len());
         let line = &npub[pos..end];
-        Text::new(line, Point::new(2, y), mono).draw(display).ok();
+        Text::new(line, Point::new(l.sx(2), l.sy(y)), mono).draw(display).ok();
         y += 10;
         pos = end;
     }
@@ -119,35 +160,36 @@ pub fn show_npub(display: &mut Display<'_>, npub: &str) {
 /// blocks the caller from redrawing or rebooting — until the owner confirms, so
 /// nothing can vanish before it is copied down.
 pub fn show_recovery_word(display: &mut Display<'_>, index: usize, total: usize, word: &str) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let big = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
     let head = format!("WORD {} OF {}", index, total);
-    Text::new(&head, Point::new(2, 10), header).draw(display).ok();
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Text::new(&head, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
     // The word, large and centred (FONT_10X20 is 10px per glyph).
     let glyphs = word.chars().count().min(12) as i32;
-    let x = ((128 - glyphs * 10) / 2).max(0);
-    Text::new(word, Point::new(x, 44), big).draw(display).ok();
+    let x = l.center_x(glyphs * Layout::glyph_w(l.font_large()));
+    Text::new(word, Point::new(x, l.sy(44)), big).draw(display).ok();
 
     let footer = if index >= total { "tap PRG to finish" } else { "tap PRG for next" };
-    Text::new(footer, Point::new(2, 62), small).draw(display).ok();
+    Text::new(footer, Point::new(l.sx(2), l.sy(62)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -159,29 +201,30 @@ pub fn show_recovery_word(display: &mut Display<'_>, index: usize, total: usize,
 /// write together take a few seconds, during which the OLED would otherwise sit
 /// on the previous screen with no sign anything is happening.
 pub fn show_generating(display: &mut Display<'_>) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("NEW IDENTITY", Point::new(4, 10), header).draw(display).ok();
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Text::new("NEW IDENTITY", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
-    Text::new("Working", Point::new(29, 40), large).draw(display).ok();
-    Text::new("creating your keys...", Point::new(2, 58), small).draw(display).ok();
+    Text::new("Working", Point::new(l.sx(29), l.sy(40)), large).draw(display).ok();
+    Text::new("creating your keys...", Point::new(l.sx(2), l.sy(58)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -191,29 +234,30 @@ pub fn show_generating(display: &mut Display<'_>) {
 /// Final confirm screen after stepping through every recovery word: a long PRG
 /// hold saves, a short tap restarts the walkthrough so the owner can re-check.
 pub fn show_recovery_done(display: &mut Display<'_>) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let body = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+        .font(l.font_body())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("ALL 12 SHOWN", Point::new(2, 12), header).draw(display).ok();
-    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
+    Text::new("ALL 12 SHOWN", Point::new(l.sx(2), l.sy(12)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(16)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
-    Text::new("Hold PRG = save", Point::new(4, 38), body).draw(display).ok();
-    Text::new("tap = show them again", Point::new(4, 56), small).draw(display).ok();
+    Text::new("Hold PRG = save", Point::new(l.sx(4), l.sy(38)), body).draw(display).ok();
+    Text::new("tap = show them again", Point::new(l.sx(4), l.sy(56)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -239,26 +283,27 @@ pub enum Highlight {
 /// vocabulary before the terse picker takes over. The 12-word phrase is entered
 /// here, on the device — never in the browser.
 pub fn show_restore_intro(display: &mut Display<'_>) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("ENTER YOUR PHRASE", Point::new(2, 10), header).draw(display).ok();
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Text::new("ENTER YOUR PHRASE", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
-    Text::new("1 tap  = next choice", Point::new(4, 28), small).draw(display).ok();
-    Text::new("2 taps = pick it", Point::new(4, 42), small).draw(display).ok();
-    Text::new("hold   = go back", Point::new(4, 56), small).draw(display).ok();
+    Text::new("1 tap  = next choice", Point::new(l.sx(4), l.sy(28)), small).draw(display).ok();
+    Text::new("2 taps = pick it", Point::new(l.sx(4), l.sy(42)), small).draw(display).ok();
+    Text::new("hold   = go back", Point::new(l.sx(4), l.sy(56)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -280,45 +325,46 @@ pub fn show_word_entry(
     subtitle: &str,
     tap_accepts: bool,
 ) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let big = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
     let head = format!("WORD {}/{}", word_index, total);
-    Text::new(&head, Point::new(2, 10), header).draw(display).ok();
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Text::new(&head, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
     // The highlighted ring item, large and centred.
     let glyphs = big_text.chars().count().min(12) as i32;
-    let x = ((128 - glyphs * 10) / 2).max(0);
-    Text::new(big_text, Point::new(x, 40), big).draw(display).ok();
+    let x = l.center_x(glyphs * Layout::glyph_w(l.font_large()));
+    Text::new(big_text, Point::new(x, l.sy(40)), big).draw(display).ok();
     if hl == Highlight::Word {
         // Underline: this is a complete word, not a letter.
-        Rectangle::new(Point::new(x, 43), Size::new((glyphs * 10) as u32, 1))
+        Rectangle::new(Point::new(x, l.sy(43)), Size::new((glyphs * Layout::glyph_w(l.font_large())) as u32, l.s(1) as u32))
             .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
             .draw(display)
             .ok();
     }
 
-    Text::new(subtitle, Point::new(2, 54), small).draw(display).ok();
+    Text::new(subtitle, Point::new(l.sx(2), l.sy(54)), small).draw(display).ok();
     // Once the word is the sole choice a single tap accepts it; otherwise a tap
     // cycles forward and a double-tap picks. A hold always goes back one step.
     let legend = if tap_accepts { "tap=pick   hold=back" } else { "tap=next   hold=back" };
-    Text::new(legend, Point::new(2, 63), small).draw(display).ok();
+    Text::new(legend, Point::new(l.sx(2), l.sy(63)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -335,36 +381,37 @@ pub fn show_review_word(
     word: &str,
     invalid: bool,
 ) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let big = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
     let head = format!("REVIEW {}/{}", index, total);
-    Text::new(&head, Point::new(2, 10), header).draw(display).ok();
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Text::new(&head, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
     let glyphs = word.chars().count().min(12) as i32;
-    let x = ((128 - glyphs * 10) / 2).max(0);
-    Text::new(word, Point::new(x, 40), big).draw(display).ok();
+    let x = l.center_x(glyphs * Layout::glyph_w(l.font_large()));
+    Text::new(word, Point::new(x, l.sy(40)), big).draw(display).ok();
 
     if invalid {
-        Text::new("! phrase invalid - fix a word", Point::new(2, 54), small).draw(display).ok();
+        Text::new("! phrase invalid - fix a word", Point::new(l.sx(2), l.sy(54)), small).draw(display).ok();
     }
-    Text::new("tap=next  2tap=edit", Point::new(2, 63), small).draw(display).ok();
+    Text::new("tap=next  2tap=edit", Point::new(l.sx(2), l.sy(63)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -374,33 +421,34 @@ pub fn show_review_word(
 /// Review screen for an action item (SAVE / CANCEL): a big label, a hint, and
 /// the tap / double-tap legend.
 pub fn show_review_action(display: &mut Display<'_>, label: &str, hint: &str) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let big = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("REVIEW", Point::new(2, 10), header).draw(display).ok();
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Text::new("REVIEW", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
     let glyphs = label.chars().count().min(12) as i32;
-    let x = ((128 - glyphs * 10) / 2).max(0);
-    Text::new(label, Point::new(x, 40), big).draw(display).ok();
+    let x = l.center_x(glyphs * Layout::glyph_w(l.font_large()));
+    Text::new(label, Point::new(x, l.sy(40)), big).draw(display).ok();
 
-    Text::new(hint, Point::new(2, 54), small).draw(display).ok();
-    Text::new("tap=next  2tap=pick", Point::new(2, 63), small).draw(display).ok();
+    Text::new(hint, Point::new(l.sx(2), l.sy(54)), small).draw(display).ok();
+    Text::new("tap=next  2tap=pick", Point::new(l.sx(2), l.sy(63)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -411,35 +459,36 @@ pub fn show_review_action(display: &mut Display<'_>, label: &str, hint: &str) {
 /// verify it is the account they expected, gated behind a save hold (a tap goes
 /// back to review). Verifying the npub catches a wrong-but-valid phrase.
 pub fn show_restore_confirm(display: &mut Display<'_>, npub: &str) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("THIS ACCOUNT?", Point::new(2, 10), header).draw(display).ok();
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Text::new("THIS ACCOUNT?", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display)
         .ok();
 
-    // npub in small font: 25 chars per line.
-    let chars_small = 25usize;
+    // npub in small font: chars per line for this panel.
+    let chars_small = l.chars_per_line(l.font_small());
     let mut y = 26i32;
     let mut pos = 0;
-    while pos < npub.len() && y < 50 {
+    while pos < npub.len() && l.sy(y) < l.sy(50) {
         let end = core::cmp::min(pos + chars_small, npub.len());
-        Text::new(&npub[pos..end], Point::new(2, y), small).draw(display).ok();
+        Text::new(&npub[pos..end], Point::new(l.sx(2), l.sy(y)), small).draw(display).ok();
         y += 9;
         pos = end;
     }
 
-    Text::new("hold = save   tap = back", Point::new(2, 62), small).draw(display).ok();
+    Text::new("hold = save   tap = back", Point::new(l.sx(2), l.sy(62)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -454,29 +503,30 @@ pub fn show_restore_confirm(display: &mut Display<'_>, npub: &str) {
 ///   Centre:  "Awaiting" (FONT_10X20)
 ///   Label:   "connect secret" (FONT_5X8)
 pub fn show_awaiting(display: &mut Display<'_>) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("HEARTWOOD HSM", Point::new(4, 10), header).draw(display).ok();
+    Text::new("HEARTWOOD HSM", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("Awaiting", Point::new(14, 38), large).draw(display).ok();
-    Text::new("connect secret", Point::new(24, 52), small).draw(display).ok();
+    Text::new("Awaiting", Point::new(l.sx(14), l.sy(38)), large).draw(display).ok();
+    Text::new("connect secret", Point::new(l.sx(24), l.sy(52)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -485,13 +535,14 @@ pub fn show_awaiting(display: &mut Display<'_>) {
 
 /// Display an error message on the OLED.
 pub fn show_error(display: &mut Display<'_>, msg: &str) {
+    let l = layout(display);
     display.clear_buffer();
     let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+        .font(l.font_body())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new(msg, Point::new(0, 30), text_style)
+    Text::new(msg, Point::new(l.sx(0), l.sy(30)), text_style)
         .draw(display)
         .ok();
 
@@ -515,42 +566,43 @@ pub fn show_sign_request(
     content_preview: &str,
     seconds_remaining: u32,
 ) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let body = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+        .font(l.font_body())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
     // Header
     let label = if purpose.is_empty() || purpose == "master" { "master" } else { purpose };
     let heading = format!("SIGN AS {}?", &label[..label.len().min(12)]);
-    Text::new(&heading, Point::new(2, 10), header).draw(display).ok();
+    Text::new(&heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
     // Kind (large)
     let kind_str = format!("Kind {}", kind);
-    Text::new(&kind_str, Point::new(2, 30), body).draw(display).ok();
+    Text::new(&kind_str, Point::new(l.sx(2), l.sy(30)), body).draw(display).ok();
 
     // Content preview (small font for more text)
-    let max_preview = 25usize; // FONT_5X8: 128/5 = 25
+    let max_preview = l.chars_per_line(l.font_small());
     let content = if content_preview.len() > max_preview {
         format!("{}...", &content_preview[..max_preview - 3])
     } else {
         content_preview.to_string()
     };
-    Text::new(&content, Point::new(2, 42), small).draw(display).ok();
+    Text::new(&content, Point::new(l.sx(2), l.sy(42)), small).draw(display).ok();
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);
@@ -569,36 +621,37 @@ fn draw_countdown_bar(
     remaining: u32,
     total: u32,
 ) {
+    let l = layout(display);
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    let bar_x = 2i32;
-    let bar_y = 52i32;
-    let bar_w = 100u32;
-    let bar_h = 8u32;
+    let bar_x = l.sx(2);
+    let bar_y = l.sy(52);
+    let bar_w = l.s(100) as u32;
+    let bar_h = l.s(8) as u32;
 
     // Track
     Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, bar_h))
-        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, l.s(1) as u32))
         .draw(display).ok();
 
     // Fill
     let fill_w = if total > 0 {
-        (remaining * (bar_w - 4)) / total
+        (remaining * (bar_w - l.s(4) as u32)) / total
     } else {
         0
     };
     if fill_w > 0 {
-        Rectangle::new(Point::new(bar_x + 2, bar_y + 2), Size::new(fill_w, bar_h - 4))
+        Rectangle::new(Point::new(bar_x + l.s(2), bar_y + l.s(2)), Size::new(fill_w, bar_h - l.s(4) as u32))
             .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
             .draw(display).ok();
     }
 
     // Seconds
     let secs = format!("{}s", remaining);
-    Text::new(&secs, Point::new(bar_x + bar_w as i32 + 4, bar_y + 7), small)
+    Text::new(&secs, Point::new(bar_x + bar_w as i32 + l.s(4), bar_y + l.s(7)), small)
         .draw(display).ok();
 }
 
@@ -608,25 +661,26 @@ fn draw_countdown_bar(
 ///   Top rule + bottom rule framing the message
 ///   Message centred in FONT_7X14
 pub fn show_result(display: &mut Display<'_>, message: &str) {
+    let l = layout(display);
     display.clear_buffer();
 
     let body = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+        .font(l.font_body())
         .text_color(BinaryColor::On)
         .build();
 
     // Top rule
-    Rectangle::new(Point::new(0, 18), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(18)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
     // Centred message
-    let msg_w = message.len() as i32 * 7;
-    let x = ((128 - msg_w) / 2).max(0);
-    Text::new(message, Point::new(x, 38), body).draw(display).ok();
+    let msg_w = message.len() as i32 * Layout::glyph_w(l.font_body());
+    let x = l.center_x(msg_w);
+    Text::new(message, Point::new(x, l.sy(38)), body).draw(display).ok();
 
     // Bottom rule
-    Rectangle::new(Point::new(0, 44), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(44)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
@@ -645,38 +699,39 @@ pub fn show_result(display: &mut Display<'_>, message: &str) {
 ///   Count:   "{n}" large + "masters" label
 ///   Status:  "Awaiting bridge..." (FONT_5X8)
 pub fn show_boot(display: &mut Display<'_>, master_count: u8) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("HEARTWOOD HSM", Point::new(4, 10), header).draw(display).ok();
+    Text::new("HEARTWOOD HSM", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
     // Large master count
     let count_str = format!("{}", master_count);
-    Text::new(&count_str, Point::new(2, 38), large).draw(display).ok();
-    Text::new("masters loaded", Point::new(22, 36), small).draw(display).ok();
+    Text::new(&count_str, Point::new(l.sx(2), l.sy(38)), large).draw(display).ok();
+    Text::new("masters loaded", Point::new(l.sx(22), l.sy(36)), small).draw(display).ok();
 
     // Bottom status
-    Rectangle::new(Point::new(0, 48), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(48)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("Awaiting bridge...", Point::new(2, 60), small).draw(display).ok();
+    Text::new("Awaiting bridge...", Point::new(l.sx(2), l.sy(60)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -694,43 +749,44 @@ pub fn show_bridge_connected(
     master_count: u8,
     client_count: usize,
 ) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let body = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+        .font(l.font_body())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("BRIDGE CONNECTED", Point::new(2, 10), header).draw(display).ok();
+    Text::new("BRIDGE CONNECTED", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
     // Master count large on left
     let m_str = format!("{}", master_count);
-    Text::new(&m_str, Point::new(2, 38), large).draw(display).ok();
-    Text::new("masters", Point::new(22, 36), small).draw(display).ok();
+    Text::new(&m_str, Point::new(l.sx(2), l.sy(38)), large).draw(display).ok();
+    Text::new("masters", Point::new(l.sx(22), l.sy(36)), small).draw(display).ok();
 
     // Client count on right side
     let c_str = format!("{}", client_count);
-    Text::new(&c_str, Point::new(72, 38), body).draw(display).ok();
-    Text::new("clients", Point::new(88, 36), small).draw(display).ok();
+    Text::new(&c_str, Point::new(l.sx(72), l.sy(38)), body).draw(display).ok();
+    Text::new("clients", Point::new(l.sx(88), l.sy(36)), small).draw(display).ok();
 
     // Status indicator: solid bar at bottom
-    Rectangle::new(Point::new(0, 58), Size::new(128, 6))
+    Rectangle::new(Point::new(l.sx(0), l.sy(58)), Size::new(l.w as u32, l.s(6) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
@@ -755,26 +811,27 @@ pub fn show_master_sign_request(
     content_preview: &str,
     seconds_remaining: u32,
 ) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let body = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+        .font(l.font_body())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
     // Header: master label
-    let label = &master_label[..master_label.len().min(21)]; // FONT_6X10: 128/6 = 21
-    Text::new(label, Point::new(2, 10), header).draw(display).ok();
+    let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_header()))];
+    Text::new(label, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
@@ -783,17 +840,17 @@ pub fn show_master_sign_request(
         Some(k) => format!("{} k:{}", method, k),
         None => method.to_string(),
     };
-    let method_str = &method_str[..method_str.len().min(CHARS_PER_LINE)];
-    Text::new(method_str, Point::new(2, 30), body).draw(display).ok();
+    let method_str = &method_str[..method_str.len().min(l.chars_per_line(l.font_body()))];
+    Text::new(method_str, Point::new(l.sx(2), l.sy(30)), body).draw(display).ok();
 
     // Content preview (small font)
-    let max_preview = 25usize;
+    let max_preview = l.chars_per_line(l.font_small());
     let preview = if content_preview.len() > max_preview {
         format!("{}...", &content_preview[..max_preview - 3])
     } else {
         content_preview.to_string()
     };
-    Text::new(&preview, Point::new(2, 42), small).draw(display).ok();
+    Text::new(&preview, Point::new(l.sx(2), l.sy(42)), small).draw(display).ok();
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);
@@ -812,35 +869,36 @@ pub fn show_master_sign_request(
 ///   Method:  method name (FONT_5X8)
 ///   Bar:     solid confirmation bar at bottom
 pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method: &str) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let body = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+        .font(l.font_body())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("AUTO-APPROVED", Point::new(4, 10), header).draw(display).ok();
+    Text::new("AUTO-APPROVED", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    let label = &master_label[..master_label.len().min(CHARS_PER_LINE)];
-    Text::new(label, Point::new(2, 32), body).draw(display).ok();
+    let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_body()))];
+    Text::new(label, Point::new(l.sx(2), l.sy(32)), body).draw(display).ok();
 
-    let method_str = &method[..method.len().min(25)];
-    Text::new(method_str, Point::new(2, 46), small).draw(display).ok();
+    let method_str = &method[..method.len().min(l.chars_per_line(l.font_small()))];
+    Text::new(method_str, Point::new(l.sx(2), l.sy(46)), small).draw(display).ok();
 
     // Confirmation bar
-    Rectangle::new(Point::new(0, 56), Size::new(128, 4))
+    Rectangle::new(Point::new(l.sx(0), l.sy(56)), Size::new(l.w as u32, l.s(4) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
@@ -857,40 +915,41 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
 ///
 /// `hold_pct` is 0-100 representing how far through the 2-second hold.
 pub fn show_hold_progress(display: &mut Display<'_>, hold_pct: u32) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("CONFIRMING", Point::new(14, 10), header).draw(display).ok();
+    Text::new("CONFIRMING", Point::new(l.sx(14), l.sy(10)), header).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
     // Large percentage
     let pct_str = format!("{}%", hold_pct.min(100));
-    let pct_x = ((128 - pct_str.len() as i32 * 10) / 2).max(0);
-    Text::new(&pct_str, Point::new(pct_x, 38), large).draw(display).ok();
+    let pct_x = l.center_x(pct_str.len() as i32 * Layout::glyph_w(l.font_large()));
+    Text::new(&pct_str, Point::new(pct_x, l.sy(38)), large).draw(display).ok();
 
     // Progress bar
-    let bar_y = 48;
-    let bar_w = 124u32;
-    let bar_x = 2;
+    let bar_y = l.sy(48);
+    let bar_w = l.s(124) as u32;
+    let bar_x = l.sx(2);
 
-    Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, 8))
-        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+    Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, l.s(8) as u32))
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, l.s(1) as u32))
         .draw(display).ok();
 
-    let fill_w = (hold_pct.min(100) * (bar_w - 2)) / 100;
+    let fill_w = (hold_pct.min(100) * (bar_w - l.s(2) as u32)) / 100;
     if fill_w > 0 {
-        Rectangle::new(Point::new(bar_x + 1, bar_y + 1), Size::new(fill_w, 6))
+        Rectangle::new(Point::new(bar_x + l.s(1), bar_y + l.s(1)), Size::new(fill_w, l.s(6) as u32))
             .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
             .draw(display).ok();
     }
@@ -900,27 +959,28 @@ pub fn show_hold_progress(display: &mut Display<'_>, hold_pct: u32) {
 
 /// Display the "Approved" confirmation screen.
 pub fn show_approved(display: &mut Display<'_>) {
+    let l = layout(display);
     display.clear_buffer();
 
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
 
     // Top rule
-    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(16)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("APPROVED", Point::new(24, 38), large).draw(display).ok();
+    Text::new("APPROVED", Point::new(l.sx(24), l.sy(38)), large).draw(display).ok();
 
     // Bottom rule
-    Rectangle::new(Point::new(0, 44), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(44)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
     // Solid confirmation bar
-    Rectangle::new(Point::new(0, 58), Size::new(128, 6))
+    Rectangle::new(Point::new(l.sx(0), l.sy(58)), Size::new(l.w as u32, l.s(6) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
@@ -929,54 +989,56 @@ pub fn show_approved(display: &mut Display<'_>) {
 
 /// Display the "Denied" screen.
 pub fn show_denied(display: &mut Display<'_>) {
+    let l = layout(display);
     display.clear_buffer();
 
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
     // Top rule
-    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(16)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("DENIED", Point::new(34, 38), large).draw(display).ok();
+    Text::new("DENIED", Point::new(l.sx(34), l.sy(38)), large).draw(display).ok();
 
     // Bottom rule
-    Rectangle::new(Point::new(0, 44), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(44)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("released too early", Point::new(14, 58), small).draw(display).ok();
+    Text::new("released too early", Point::new(l.sx(14), l.sy(58)), small).draw(display).ok();
 
     display.flush().ok();
 }
 
 /// Display a "Signed!" confirmation screen.
 pub fn show_signed(display: &mut Display<'_>) {
+    let l = layout(display);
     display.clear_buffer();
 
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
 
-    Rectangle::new(Point::new(0, 16), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(16)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("SIGNED", Point::new(34, 38), large).draw(display).ok();
+    Text::new("SIGNED", Point::new(l.sx(34), l.sy(38)), large).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 44), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(44)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Rectangle::new(Point::new(0, 58), Size::new(128, 6))
+    Rectangle::new(Point::new(l.sx(0), l.sy(58)), Size::new(l.w as u32, l.s(6) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
@@ -991,24 +1053,25 @@ pub fn show_signed(display: &mut Display<'_>) {
 
 /// Display a "Signing..." in-progress screen.
 pub fn show_signing(display: &mut Display<'_>) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("PROCESSING", Point::new(14, 10), header).draw(display).ok();
+    Text::new("PROCESSING", Point::new(l.sx(14), l.sy(10)), header).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("Signing", Point::new(19, 40), large).draw(display).ok();
+    Text::new("Signing", Point::new(l.sx(19), l.sy(40)), large).draw(display).ok();
 
     display.flush().ok();
 }
@@ -1180,63 +1243,64 @@ pub fn show_ota_approval(
     seconds_remaining: u32,
     total_seconds: u32,
 ) {
+    let l = layout(display);
     display.clear_buffer();
 
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
     let medium = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
 
     // Header
-    Text::new("FIRMWARE UPDATE", Point::new(4, 10), medium).draw(display).ok();
+    Text::new("FIRMWARE UPDATE", Point::new(l.sx(4), l.sy(10)), medium).draw(display).ok();
 
     // Horizontal rule
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
     // Firmware size -- large and centred
     let size_str = format!("{} KB", size_kb);
-    let size_x = ((128 - size_str.len() as i32 * 10) / 2).max(0);
-    Text::new(&size_str, Point::new(size_x, 36), large).draw(display).ok();
+    let size_x = l.center_x(size_str.len() as i32 * Layout::glyph_w(l.font_large()));
+    Text::new(&size_str, Point::new(size_x, l.sy(36)), large).draw(display).ok();
 
     // Instruction
-    Text::new("Hold 2s to approve", Point::new(4, 48), small).draw(display).ok();
+    Text::new("Hold 2s to approve", Point::new(l.sx(4), l.sy(48)), small).draw(display).ok();
 
     // Graphical countdown bar: track (outline) + fill
-    let bar_y = 54;
-    let bar_h = 8u32;
-    let bar_w = 100u32;
-    let bar_x = 2;
+    let bar_y = l.sy(54);
+    let bar_h = l.s(8) as u32;
+    let bar_w = l.s(100) as u32;
+    let bar_x = l.sx(2);
 
     // Track outline
     Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, bar_h))
-        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, l.s(1) as u32))
         .draw(display).ok();
 
     // Fill (proportional to time remaining)
     let fill_w = if total_seconds > 0 {
-        ((seconds_remaining as u32) * (bar_w - 4)) / total_seconds
+        ((seconds_remaining as u32) * (bar_w - l.s(4) as u32)) / total_seconds
     } else {
         0
     };
     if fill_w > 0 {
-        Rectangle::new(Point::new(bar_x + 2, bar_y + 2), Size::new(fill_w, bar_h - 4))
+        Rectangle::new(Point::new(bar_x + l.s(2), bar_y + l.s(2)), Size::new(fill_w, bar_h - l.s(4) as u32))
             .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
             .draw(display).ok();
     }
 
     // Seconds label right of bar
     let secs = format!("{}s", seconds_remaining);
-    Text::new(&secs, Point::new(bar_x + bar_w as i32 + 4, bar_y + 7), small)
+    Text::new(&secs, Point::new(bar_x + bar_w as i32 + l.s(4), bar_y + l.s(7)), small)
         .draw(display).ok();
 
     display.flush().ok();
@@ -1258,43 +1322,44 @@ pub fn show_ota_progress(
     chunk_num: u32,
     total_chunks: u32,
 ) {
+    let l = layout(display);
     display.clear_buffer();
 
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
     let medium = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
 
     // Top row: "OTA" label + large percentage
-    Text::new("OTA", Point::new(2, 10), medium).draw(display).ok();
+    Text::new("OTA", Point::new(l.sx(2), l.sy(10)), medium).draw(display).ok();
 
     let pct_str = format!("{}%", percent);
-    let pct_x = (128 - pct_str.len() as i32 * 10).max(40);
-    Text::new(&pct_str, Point::new(pct_x, 12), large).draw(display).ok();
+    let pct_x = (l.w - pct_str.len() as i32 * Layout::glyph_w(l.font_large())).max(l.sx(40));
+    Text::new(&pct_str, Point::new(pct_x, l.sy(12)), large).draw(display).ok();
 
     // Progress bar: full-width graphical bar
-    let bar_y = 26;
-    let bar_h = 6u32;
-    let bar_w = 124u32;
-    let bar_x = 2;
+    let bar_y = l.sy(26);
+    let bar_h = l.s(6) as u32;
+    let bar_w = l.s(124) as u32;
+    let bar_x = l.sx(2);
 
     // Track
     Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, bar_h))
-        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, l.s(1) as u32))
         .draw(display).ok();
 
     // Fill
-    let fill_w = (percent * (bar_w - 2)) / 100;
+    let fill_w = (percent * (bar_w - l.s(2) as u32)) / 100;
     if fill_w > 0 {
-        Rectangle::new(Point::new(bar_x + 1, bar_y + 1), Size::new(fill_w, bar_h - 2))
+        Rectangle::new(Point::new(bar_x + l.s(1), bar_y + l.s(1)), Size::new(fill_w, bar_h - l.s(2) as u32))
             .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
             .draw(display).ok();
     }
@@ -1303,16 +1368,16 @@ pub fn show_ota_progress(
     let kb_recv = bytes_received / 1024;
     let kb_total = (total_size + 1023) / 1024;
     let bytes_str = format!("{}/{} KB", kb_recv, kb_total);
-    Text::new(&bytes_str, Point::new(2, 44), medium).draw(display).ok();
+    Text::new(&bytes_str, Point::new(l.sx(2), l.sy(44)), medium).draw(display).ok();
 
     // Chunk counter
     let chunk_str = format!("chunk {}/{}", chunk_num, total_chunks);
-    Text::new(&chunk_str, Point::new(2, 56), small).draw(display).ok();
+    Text::new(&chunk_str, Point::new(l.sx(2), l.sy(56)), small).draw(display).ok();
 
     // Transfer rate indicator: a small animated dot pattern at bottom-right
     // that shifts based on chunk number to show activity
-    let dot_x = 100 + ((chunk_num % 4) as i32 * 6);
-    Rectangle::new(Point::new(dot_x, 54), Size::new(3, 3))
+    let dot_x = l.sx(100) + ((chunk_num % 4) as i32 * l.s(6));
+    Rectangle::new(Point::new(dot_x, l.sy(54)), Size::new(l.s(3) as u32, l.s(3) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
@@ -1323,22 +1388,23 @@ pub fn show_ota_progress(
 ///
 /// Shows a pulsing-style animation by alternating between two frames.
 pub fn show_ota_verifying(display: &mut Display<'_>) {
+    let l = layout(display);
     display.clear_buffer();
 
     let medium = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("VERIFYING", Point::new(14, 28), large).draw(display).ok();
-    Text::new("SHA-256 check", Point::new(20, 46), medium).draw(display).ok();
+    Text::new("VERIFYING", Point::new(l.sx(14), l.sy(28)), large).draw(display).ok();
+    Text::new("SHA-256 check", Point::new(l.sx(20), l.sy(46)), medium).draw(display).ok();
 
     // Full progress bar (complete)
-    Rectangle::new(Point::new(2, 52), Size::new(124, 6))
+    Rectangle::new(Point::new(l.sx(2), l.sy(52)), Size::new(l.s(124) as u32, l.s(6) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
@@ -1347,33 +1413,34 @@ pub fn show_ota_verifying(display: &mut Display<'_>) {
 
 /// Display the OTA success screen with a brief animation.
 pub fn show_ota_complete(display: &mut Display<'_>) {
+    let l = layout(display);
     // Frame 1: the word builds
     display.clear_buffer();
     let large = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(l.font_large())
         .text_color(BinaryColor::On)
         .build();
     let medium = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
 
     // Top line
-    Rectangle::new(Point::new(0, 0), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(0)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("VERIFIED", Point::new(24, 24), large).draw(display).ok();
+    Text::new("VERIFIED", Point::new(l.sx(24), l.sy(24)), large).draw(display).ok();
 
     // Divider
-    Rectangle::new(Point::new(20, 30), Size::new(88, 1))
+    Rectangle::new(Point::new(l.sx(20), l.sy(30)), Size::new(l.s(88) as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    Text::new("Rebooting...", Point::new(22, 46), medium).draw(display).ok();
+    Text::new("Rebooting...", Point::new(l.sx(22), l.sy(46)), medium).draw(display).ok();
 
     // Bottom line
-    Rectangle::new(Point::new(0, 63), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(63)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
@@ -1416,37 +1483,38 @@ pub fn show_identity_switch(
     purpose: &str,
     npub: &str,
 ) {
+    let l = layout(display);
     display.clear_buffer();
 
     let header_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(l.font_header())
         .text_color(BinaryColor::On)
         .build();
     let body = MonoTextStyleBuilder::new()
-        .font(&FONT_7X14)
+        .font(l.font_body())
         .text_color(BinaryColor::On)
         .build();
     let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(l.font_small())
         .text_color(BinaryColor::On)
         .build();
 
-    Text::new("IDENTITY SWITCH", Point::new(2, 10), header_style).draw(display).ok();
+    Text::new("IDENTITY SWITCH", Point::new(l.sx(2), l.sy(10)), header_style).draw(display).ok();
 
-    Rectangle::new(Point::new(0, 14), Size::new(128, 1))
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
         .draw(display).ok();
 
-    let label = &master_label[..master_label.len().min(CHARS_PER_LINE)];
-    Text::new(label, Point::new(2, 30), body).draw(display).ok();
+    let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_body()))];
+    Text::new(label, Point::new(l.sx(2), l.sy(30)), body).draw(display).ok();
 
     let purpose_line = format!("-> {}", purpose);
-    let purpose_line = &purpose_line[..purpose_line.len().min(CHARS_PER_LINE)];
-    Text::new(&purpose_line, Point::new(2, 46), body).draw(display).ok();
+    let purpose_line = &purpose_line[..purpose_line.len().min(l.chars_per_line(l.font_body()))];
+    Text::new(&purpose_line, Point::new(l.sx(2), l.sy(46)), body).draw(display).ok();
 
     // npub in small font for more characters
-    let npub_short = &npub[..npub.len().min(25)];
-    Text::new(npub_short, Point::new(2, 58), small).draw(display).ok();
+    let npub_short = &npub[..npub.len().min(l.chars_per_line(l.font_small()))];
+    Text::new(npub_short, Point::new(l.sx(2), l.sy(58)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

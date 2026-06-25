@@ -1,0 +1,12 @@
+[package]
+name = "ui-preview"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Host-side renderer for the Heartwood device screens — emits PNGs at each board's panel size so layouts can be checked without hardware. Shares firmware/src/layout.rs verbatim."
+
+[dependencies]
+embedded-graphics = "0.8"
+# default-features = false drops the SDL2 window backend (we only render to PNG,
+# no native window / no libsdl2 needed).
+embedded-graphics-simulator = { version = "0.7", default-features = false }

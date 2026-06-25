@@ -12,6 +12,15 @@ heltec-v4 = []
 # Heltec WiFi LoRa 32 V3 -- USB-C wired through a CP2102 bridge to UART0
 # (GPIO43 TX / GPIO44 RX). Mutually exclusive with heltec-v4.
 heltec-v3 = []
+# Colour ST7789 TFT display backend (T-Display, ESP32-C6). Colour-panel boards
+# enable this; it pulls in the mipidsi driver. Mono-OLED boards (Heltec) leave
+# it off and keep the ssd1306 backend. `st7789-check` compiles the backend
+# module on a mono board for CI/type-checking without swapping the display.
+st7789 = ["dep:mipidsi"]
+st7789-check = ["st7789"]
+# LilyGO / TENSTAR T-Display: classic ESP32-D0WD + ST7789 240x135 colour TFT.
+# Built for the xtensa-esp32-espidf target (see scripts/build-firmware.sh).
+tdisplay = ["st7789"]
 
 [dependencies]
 heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen"] }
@@ -33,6 +42,10 @@ esp-idf-hal = "0.46"
 # OLED display
 ssd1306 = "0.9"
 embedded-graphics = "0.8"
+
+# ST7789 colour TFT driver -- only compiled in for the `st7789` feature
+# (colour-panel boards). Mono-OLED Heltec builds never pull it in.
+mipidsi = { version = "0.10", optional = true }
 
 # Logging
 log = "0.4"

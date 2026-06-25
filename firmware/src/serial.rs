@@ -27,7 +27,7 @@ use esp_idf_svc::sys::EspError;
 #[cfg(feature = "heltec-v4")]
 use esp_idf_hal::usb_serial::UsbSerialDriver;
 
-#[cfg(feature = "heltec-v3")]
+#[cfg(any(feature = "heltec-v3", feature = "tdisplay"))]
 use esp_idf_hal::uart::UartDriver;
 
 /// Board-specific serial transport to the host.
@@ -38,7 +38,7 @@ use esp_idf_hal::uart::UartDriver;
 pub struct SerialPort<'a> {
     #[cfg(feature = "heltec-v4")]
     inner: UsbSerialDriver<'a>,
-    #[cfg(feature = "heltec-v3")]
+    #[cfg(any(feature = "heltec-v3", feature = "tdisplay"))]
     inner: UartDriver<'a>,
 }
 
@@ -50,7 +50,7 @@ impl<'a> SerialPort<'a> {
     }
 
     /// Wrap a native `UartDriver` on UART0 (Heltec V3, CP2102 bridge).
-    #[cfg(feature = "heltec-v3")]
+    #[cfg(any(feature = "heltec-v3", feature = "tdisplay"))]
     pub fn from_uart(inner: UartDriver<'a>) -> Self {
         Self { inner }
     }
@@ -82,7 +82,7 @@ impl<'a> SerialPort<'a> {
         {
             self.inner.write(buf, esp_idf_hal::delay::BLOCK)
         }
-        #[cfg(feature = "heltec-v3")]
+        #[cfg(any(feature = "heltec-v3", feature = "tdisplay"))]
         {
             self.inner.write(buf)
         }

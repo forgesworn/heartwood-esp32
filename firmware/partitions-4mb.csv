@@ -1,0 +1,14 @@
+# 4MB single-OTA partition layout for the T-Display (and other 4MB boards).
+#
+# One ~3MB factory app slot. This trades away A/B OTA rollback (a bad image
+# needs a USB re-flash) for the headroom to fit any build -- including the
+# larger WiFi-standalone firmware -- on a 4MB part. Revisit if field OTA is
+# needed: a dual-OTA 4MB table would cap each slot at ~1.7MB.
+#
+# Keeps the `nvs` namespace (master keys, policies, slots) and the `config`
+# data partition the firmware seeds its network config from at boot.
+# Name,      Type, SubType,  Offset,    Size,     Flags
+nvs,         data, nvs,      0x9000,    0x6000,
+phy_init,    data, phy,      0xf000,    0x1000,
+factory,     app,  factory,  0x10000,   0x300000,
+config,      data, 0x40,     0x310000,  0x4000,

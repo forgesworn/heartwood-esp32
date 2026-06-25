@@ -18,20 +18,23 @@
 // GPIO44 RX). Both boards expose the same frame protocol through the
 // `serial::SerialPort` wrapper.
 
-#[cfg(not(any(feature = "heltec-v3", feature = "heltec-v4", feature = "tdisplay")))]
+#[cfg(not(any(feature = "heltec-v3", feature = "heltec-v4", feature = "tdisplay", feature = "c6")))]
 compile_error!(
     "heartwood-esp32 requires exactly one board feature: `heltec-v3`, \
-     `heltec-v4`, or `tdisplay`. Did you build with `--no-default-features` \
+     `heltec-v4`, `tdisplay`, or `c6`. Did you build with `--no-default-features` \
      and forget to pick a board?"
 );
 
 #[cfg(any(
     all(feature = "heltec-v3", feature = "heltec-v4"),
     all(feature = "heltec-v3", feature = "tdisplay"),
+    all(feature = "heltec-v3", feature = "c6"),
     all(feature = "heltec-v4", feature = "tdisplay"),
+    all(feature = "heltec-v4", feature = "c6"),
+    all(feature = "tdisplay", feature = "c6"),
 ))]
 compile_error!(
-    "board features `heltec-v3`, `heltec-v4` and `tdisplay` are mutually \
+    "board features `heltec-v3`, `heltec-v4`, `tdisplay` and `c6` are mutually \
      exclusive -- enable exactly one."
 );
 

@@ -2,7 +2,7 @@
 #
 # Build the Heartwood ESP32 firmware for a specific board variant.
 #
-# Usage: scripts/build-firmware.sh {v3|v4|tdisplay} [cargo args...]
+# Usage: scripts/build-firmware.sh {v3|v4|tdisplay|c6} [cargo args...]
 #
 # Boards differ in chip, display, host transport and flash:
 #
@@ -10,6 +10,8 @@
 #   v4       -- Heltec WiFi LoRa 32 V4: ESP32-S3, SSD1306 OLED, native USB-JTAG.
 #   tdisplay -- LilyGO / TENSTAR T-Display: classic ESP32, ST7789 colour TFT,
 #               CH9102 UART0. Built for the xtensa-esp32-espidf target.
+#   c6       -- Waveshare ESP32-C6-LCD-1.47: ESP32-C6 (RISC-V), ST7789 172x320
+#               portrait TFT, native USB-JTAG. Built for riscv32imac-esp-espidf.
 #
 # Compile-time board selection is via mutually-exclusive cargo features plus a
 # matching sdkconfig fragment, target triple and MCU -- all set here together
@@ -23,11 +25,12 @@
 #   scripts/build-firmware.sh v4
 #   scripts/build-firmware.sh v3 --release
 #   scripts/build-firmware.sh tdisplay --release
+#   scripts/build-firmware.sh c6 --release
 
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "usage: $0 {v3|v4|tdisplay} [cargo args...]" >&2
+    echo "usage: $0 {v3|v4|tdisplay|c6} [cargo args...]" >&2
     exit 2
 fi
 
@@ -44,8 +47,11 @@ case "$BOARD" in
     tdisplay|TDISPLAY|t-display)
         FEATURE="tdisplay"; TARGET="xtensa-esp32-espidf"; MCU="esp32"
         ;;
+    c6|C6|esp32c6)
+        FEATURE="c6"; TARGET="riscv32imac-esp-espidf"; MCU="esp32c6"
+        ;;
     *)
-        echo "error: unknown board '$BOARD' (expected v3, v4, or tdisplay)" >&2
+        echo "error: unknown board '$BOARD' (expected v3, v4, tdisplay, or c6)" >&2
         exit 2
         ;;
 esac

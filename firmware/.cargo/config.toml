@@ -12,6 +12,13 @@ runner = "espflash flash --monitor"
 linker = "ldproxy"
 runner = "espflash flash --monitor"
 
+# ESP32-C6 (RISC-V rv32imac) target -- the Waveshare ESP32-C6-LCD-1.47 board.
+# Selected via `--target riscv32imac-esp-espidf` by scripts/build-firmware.sh,
+# which also exports MCU=esp32c6 and the C6 sdkconfig fragment.
+[target.riscv32imac-esp-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+
 [unstable]
 build-std = ["std", "panic_abort"]
 
@@ -32,6 +39,9 @@ CFLAGS_xtensa_esp32s3_espidf = "-mlongcalls"
 # is exported by the build script, not here, so the default build stays S3.
 CC_xtensa_esp32_espidf = "xtensa-esp32-elf-gcc"
 CFLAGS_xtensa_esp32_espidf = "-mlongcalls"
+# ESP32-C6 (RISC-V) C FFI cross-compiler. RISC-V has no Xtensa call8/call4 range
+# limit, so -mlongcalls (an Xtensa-only flag) is neither needed nor valid here.
+CC_riscv32imac_esp_espidf = "riscv32-esp-elf-gcc"
 # Board-specific sdkconfig fragment selection. This is the default for the
 # `heltec-v4` feature (the cargo default). For a V3 build, override this
 # variable at invocation time before `cargo build`, e.g.:

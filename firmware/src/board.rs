@@ -31,6 +31,8 @@ pub const BOARD: &str = "heltec-v4";
 pub const BOARD: &str = "heltec-v3";
 #[cfg(feature = "tdisplay")]
 pub const BOARD: &str = "tdisplay";
+#[cfg(feature = "c6")]
+pub const BOARD: &str = "esp32c6";
 
 /// Initialised, board-agnostic hardware handles.
 ///
@@ -222,6 +224,85 @@ pub fn bringup(p: Peripherals) -> Hw {
         serial,
         button_a,
         button_b: Some(button_b),
+        modem: p.modem,
+    }
+}
+
+/// Bring up the Waveshare ESP32-C6-LCD-1.47: ESP32-C6 (RISC-V), an ST7789
+/// 172x320 portrait colour TFT over SPI, a single BOOT button, and the chip's
+/// native USB-Serial-JTAG for the host frame protocol (no UART bridge).
+#[cfg(feature = "c6")]
+pub fn bringup(p: Peripherals) -> Hw {
+    use esp_idf_hal::gpio::{AnyIOPin, Pull};
+    use esp_idf_hal::spi::config::{Config as SpiConfig, DriverConfig as SpiDriverConfig};
+    use esp_idf_hal::spi::SpiDeviceDriver;
+    use esp_idf_hal::units::FromValueType;
+    use mipidsi::options::Rotation;
+
+    // --- ST7789 colour TFT on SPI2 ---
+    // SCLK=7, MOSI(SDA)=6, CS=14, DC=15, RST=21, backlight=22. The panel is
+    // write-only, so there is no MISO.
+    let spi = SpiDeviceDriver::new_single(
+        p.spi2,
+        p.pins.gpio7,        // SCLK
+        p.pins.gpio6,        // MOSI / SDA
+        None::<AnyIOPin>,    // MISO unused
+        Some(p.pins.gpio14), // CS
+        &SpiDriverConfig::new(),
+        &SpiConfig::new().baudrate(40.MHz().into()),
+    )
+    .expect("ST7789 SPI init failed");
+    let dc = PinDriver::output(p.pins.gpio15).expect("DC pin");
+    let rst = PinDriver::output(p.pins.gpio21).expect("RST pin");
+    let backlight = PinDriver::output(p.pins.gpio22).expect("backlight pin");
+
+    // mipidsi's SPI scratch buffer must outlive the display; leak it (a one-off,
+    // device-lifetime allocation, same rationale as on the T-Display).
+    let spi_buffer: &'static mut [u8] = Box::leak(vec![0u8; 512].into_boxed_slice());
+
+    // The 172x320 panel is a window into the ST7789's 240x320 controller,
+    // centred horizontally (x offset 34 = (240 - 172) / 2). Native portrait, no
+    // rotation -- the responsive layout fills the tall panel directly. The
+    // offsets/inversion are the canonical Waveshare 1.47" values; verify on the
+    // actual board.
+    let display = crate::st7789::St7789Display::new(
+        spi,
+        dc,
+        rst,
+        backlight,
+        spi_buffer,
+        172, // native portrait width
+        320, // native portrait height
+        34,  // x offset
+        0,   // y offset
+        Rotation::Deg0,
+    );
+
+    // --- Host transport: ESP32-C6 native USB-Serial-JTAG (GPIO12 D- / GPIO13 D+) ---
+    // Same peripheral and frame API as the Heltec V4; no UART bridge.
+    let serial = {
+        use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
+        let driver = UsbSerialDriver::new(
+            p.usb_serial,
+            p.pins.gpio12, // D-
+            p.pins.gpio13, // D+
+            &UsbSerialConfig::new().rx_buffer_size(4096).tx_buffer_size(4096),
+        )
+        .expect("USB serial driver init failed");
+        SerialPort::from_usb(driver)
+    };
+
+    // --- Button ---
+    // The single user button is BOOT (GPIO9, active-low, internal pull-up). The
+    // WS2812 RGB LED on GPIO8 is left undriven for now (a Phase-B approved/denied
+    // colour cue).
+    let button_a = PinDriver::input(p.pins.gpio9, Pull::Up).expect("button A");
+
+    Hw {
+        display,
+        serial,
+        button_a,
+        button_b: None,
         modem: p.modem,
     }
 }

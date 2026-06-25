@@ -21,6 +21,9 @@ st7789-check = ["st7789"]
 # LilyGO / TENSTAR T-Display: classic ESP32-D0WD + ST7789 240x135 colour TFT.
 # Built for the xtensa-esp32-espidf target (see scripts/build-firmware.sh).
 tdisplay = ["st7789"]
+# Waveshare ESP32-C6-LCD-1.47: ESP32-C6 (RISC-V rv32imac) + ST7789 172x320
+# portrait colour TFT. Built for the riscv32imac-esp-espidf target.
+c6 = ["st7789"]
 
 [dependencies]
 heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen"] }

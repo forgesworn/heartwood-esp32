@@ -205,6 +205,27 @@ Reuses everything from §4 except the chip layer. What differs:
 
 Effort is small *after* T-Display, because the display layer, layout module, board abstraction and partition work are already done — C6 is "new `board.rs` block + RISC-V build profile + portrait layout pass".
 
+### Status (2026-06-25): code-complete, blocked on one RISC-V linker assert
+
+The full C6 profile is implemented and **the firmware compiles**: `board.rs` bring-up (ST7789 172×320 portrait on SPI2 — MOSI6/SCLK7/CS14/DC15/RST21/BL22; native USB-Serial-JTAG on GPIO12/13; BOOT button GPIO9), the `riscv32imac-esp-espidf` target + the `riscv32-esp-elf` GCC (installed via `espup install -r -t esp32c6`; `~/export-esp.sh` now carries both Xtensa and RISC-V), `sdkconfig.defaults.c6`, the 4 MB partition table, and the `c6` build profile. Build: `scripts/build-firmware.sh c6 --release`.
+
+**The one blocker is the final link, not the firmware:**
+
+```
+ld: The gap between .flash.rodata and .eh_frame_hdr must not exist to produce the final bin image.
+```
+
+esp-idf's `esp_system/ld/esp32c6/sections.ld` asserts `.flash.rodata → .eh_frame_hdr → .eh_frame` are contiguous (`ASSERT_SECTIONS_GAP`). The stray `.eh_frame` is the **RISC-V `libgcc`** (24 objects — the 64-bit-math / soft-float helpers the crypto pulls in; Rust, `core`/`std` and `secp256k1-sys` are all verified clean via `llvm-objdump`). The Xtensa boards have no such assert, so they link.
+
+Fixes attempted and ruled out, with evidence:
+- `-C force-unwind-tables=no` (Rust) + `-fno-*-unwind-tables` (C) — keep Rust/secp256k1 out of `.eh_frame` (verified clean objects), but libgcc's remains.
+- `CONFIG_ESP_SYSTEM_USE_EH_FRAME=y` (force-applied via `cargo clean -p esp-idf-sys`) — collects `.eh_frame` into a placed section, but the assert still fails (a forward-`ALIGNOF` gap in esp-idf's own script).
+- A `/DISCARD/ : { *(.eh_frame) *(.eh_frame_hdr) }` fragment via `-C link-arg=-Wl,-T,…` — correct in concept, but **`ldproxy` (esp-idf's linker wrapper) does not forward the extra `-T` to `ld`**, so it never applies. Confirmed: the arg reaches the rustc→ldproxy command but the gap persists with `USE_EH_FRAME` off and no competing `KEEP`.
+
+Remaining paths (deferred — both must reach past `ldproxy`): patch esp-idf's `sections.ld.in` to relax/remove the `.eh_frame` asserts, or add a custom esp-idf component carrying a `linker.lf` discard fragment. The board also needs hardware to finish regardless — the panel offsets (34,0), colour inversion and SPI clock are bench-guesses, as on the T-Display.
+
+> **Gotcha for the next session:** esp-idf-sys keeps a *sticky* generated `sdkconfig` — editing `sdkconfig.defaults.c6` does **not** regenerate it; force it with `cargo clean -p esp-idf-sys --release --target riscv32imac-esp-espidf`.
+
 ---
 
 ## 6. ESP8266 — feasibility spike (RESOLVED 2026-06-25: GO for a tethered signer, with caveats)

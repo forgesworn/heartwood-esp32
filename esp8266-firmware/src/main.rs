@@ -47,11 +47,21 @@ fn main() -> ! {
     heap::init();
 
     let dp = Peripherals::take().unwrap();
+
+    // Disable the watchdog: the signer blocks on `serial.read()` while idle and
+    // runs multi-second EC math during a sign — an active WDT would reset it
+    // mid-operation. (esp8266-hal's WatchdogExt; `disable` via embedded_hal.)
+    dp.WDT.watchdog().disable();
+
     let pins = dp.GPIO.split();
     // UART0: GPIO1 = TX, GPIO3 = RX — the pins wired to the USB-UART bridge.
     let mut serial = dp
         .UART0
         .serial(pins.gpio1.into_uart(), pins.gpio3.into_uart());
+
+    // esp8266-hal's serial() leaves UART0 at the boot ROM's baud (~74880); the
+    // daemon talks 115200. Set the divisor directly — the HAL has no baud API.
+    set_uart0_baud_115200();
 
     // Brief settle before we start talking to the host.
     let (mut timer1, _) = dp.TIMER.timers();
@@ -152,4 +162,15 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Set UART0 to 115200 baud by writing the clock-divisor register directly.
+/// esp8266-hal 0.5 exposes no baud API, so `serial()` leaves UART0 at the boot
+/// ROM's ~74880 baud — mismatched with the daemon's 115200. `UART0_CLKDIV`
+/// (0x6000_0014) = APB clock / baud; the board runs at 80 MHz (esp8266-hal's
+/// assumed clock), so 80_000_000 / 115_200 = 694.
+fn set_uart0_baud_115200() {
+    const UART0_CLKDIV: *mut u32 = 0x6000_0014 as *mut u32;
+    const DIVISOR: u32 = 80_000_000 / 115_200;
+    unsafe { core::ptr::write_volatile(UART0_CLKDIV, DIVISOR) };
 }

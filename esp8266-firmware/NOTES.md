@@ -30,6 +30,28 @@ arithmetic+ecdh compiles at opt-z (SIGSEGV only at opt-3); common's deps forced
 - The **k256 Xtensa-unaligned-access** risk (the original Phase-0 question) is still only
   verifiable by flashing a real ESP8266.
 
+### Board bring-up (NodeMCU ESP8266 + 0.96" OLED, CH340G, ESP-12F, 4 MB / 64 KB)
+Fixed by analysis for this board (still hardware-untested):
+- **Baud (FIXED).** esp8266-hal's `serial()` sets no baud → UART0 stayed at the boot ROM's
+  ~74880 while the daemon talks 115200 (they'd exchange garbage). `main` now writes
+  `UART0_CLKDIV` (0x6000_0014) = 80 MHz / 115200 = 694 directly (the HAL has no baud API).
+- **Watchdog (FIXED).** The signer blocks on `serial.read()` while idle and runs ~1 s of
+  EC math per sign; an active WDT would reset it. `main` disables it
+  (`dp.WDT.watchdog().disable()`).
+- **CH340G** wires USB↔UART0 (GPIO1/GPIO3) — matches the firmware. The daemon takes a
+  manual serial-port path (no Espressif-VID filter), so a CH340G port works fine.
+- **OLED** (SSD1306, I²C GPIO12/14) is unused — no pin conflict; no on-device approval or
+  display UI yet.
+- **4 MB flash** fits the ~172 KB image; **64 KB SRAM** holds the 24 KB heap + stack.
+
+First-flash setup: set the daemon's `bridge.secret` to 32 bytes of `0x42` (matches the
+firmware placeholder); the device's npub (from the placeholder seed) is the signer
+identity, discovered via `PROVISION_LIST`. Flash with `esptool.py --chip esp8266 elf2image`
++ `write_flash`.
+
+Still hardware-only: the k256 unaligned-access fault risk, the patched exception-vector
+correctness, and the NIP-44 nonce RNG entropy (radio off).
+
 ### What was solved
 - **Right runtime.** `esp8266-hal 0.5.1` uses the maintained **`xtensa-lx-rt 0.12` +
   `xtensa-lx 0.7`** (esp8266 feature) — NOT the dead `xtensa-lx106-rt 0.1.2` (removed

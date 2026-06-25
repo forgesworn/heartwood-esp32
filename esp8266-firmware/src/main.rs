@@ -106,6 +106,7 @@ fn main() -> ! {
                 &mut authenticated,
                 &mut flash,
                 &mut out,
+                oled.as_mut(),
             );
             if let Some(len) = resp {
                 for &b in &out[..len] {
@@ -125,6 +126,7 @@ fn handle(
     authenticated: &mut bool,
     flash: &mut ESPFlash,
     out: &mut [u8],
+    oled: &mut oled::Oled,
 ) -> Option<usize> {
     match frame_type {
         // Provision the master seed: write it (plus the existing bridge secret)
@@ -210,7 +212,7 @@ fn handle(
             }
             match keys
                 .as_ref()
-                .and_then(|k| sign_path::handle(&k.master_seed, payload))
+                .and_then(|k| sign_path::handle(&k.master_seed, payload, oled))
             {
                 Some(event_json) => {
                     frame::build(out, frame::SIGN_ENVELOPE_RESPONSE, event_json.as_bytes())

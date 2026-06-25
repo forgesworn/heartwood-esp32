@@ -153,4 +153,16 @@ impl Oled {
             slice(42, 63),
         ]);
     }
+
+    /// Prompt to approve a sign request: show what's being signed and the hint.
+    pub fn show_sign_prompt(&mut self, kind: u64, content: &str) {
+        let kind_line = alloc::format!("kind {}", kind);
+        let preview: alloc::string::String = content.chars().take(21).collect();
+        self.show_lines(&["SIGN REQUEST?", &kind_line, &preview, "", "hold FLASH = approve"]);
+    }
+
+    /// A brief one-line status under the banner (e.g. after a sign).
+    pub fn show_status(&mut self, msg: &str) {
+        self.show_lines(&["Heartwood signer", "", msg]);
+    }
 }

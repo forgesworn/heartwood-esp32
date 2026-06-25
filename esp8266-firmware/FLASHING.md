@@ -128,8 +128,10 @@ exercises more of the device:
 2. **`device masters: npub1…`** → `PROVISION_LIST` worked, which means **k256
    pubkey derivation ran on the lx106** — the big alignment question is answered.
 3. Point a NIP‑46 client (Amber, nostr‑tools, Bark) at that npub and ask it to
-   sign → the bridge couriers `0x10`→`0x35`, the device does the full NIP‑44 +
-   sign, and a signed event hits the relays. **End‑to‑end.**
+   sign → the bridge couriers `0x10`→`0x35`. The **OLED shows the request** (kind +
+   preview); **hold the FLASH button ~1.5 s to approve** (or it denies after ~20 s).
+   On approval the device does the full NIP‑44 + sign and the signed event hits the
+   relays. **End‑to‑end, with on‑device confirmation.**
 
 ---
 

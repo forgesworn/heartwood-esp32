@@ -27,9 +27,10 @@ arithmetic+ecdh compiles at opt-z (SIGSEGV only at opt-3); common's deps forced
   seed + bridge secret with `provision.py` (`PROVISION` 0x01 / `SET_BRIDGE_SECRET` 0x23).
   Remaining: provisioning has **no physical-confirmation gate** (the ESP32 needs a button
   hold), and the seed is host-supplied (no on-device GENERATE_IDENTITY without an OLED).
-- **Sign approval** — `sign_event` now requires a physical button hold (`button.rs`:
-  GPIO0/FLASH, ~1.5 s, ~20 s timeout). Still to come: the **OLED prompt** showing *what*
-  is being signed (a blind hold is weaker than a seen-and-confirmed one), and a gate on
+- **Sign approval** — `sign_event` shows the request on the **OLED** (kind + content
+  preview) and requires a physical button hold (`button.rs`: GPIO0/FLASH, ~1.5 s, ~20 s
+  timeout) before signing; the OLED then shows `signed`/`denied`. So the hold confirms a
+  *seen* event. Still to come: a richer policy view (full tags/recipient) and a gate on
   provisioning too.
 - The **NIP-44 nonce RNG** reads the lx106 RNG register but it's only well-seeded with RF
   active; a radio-off signer needs an entropy review (nonce reuse is catastrophic).

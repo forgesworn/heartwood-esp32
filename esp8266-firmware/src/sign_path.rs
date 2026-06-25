@@ -24,7 +24,7 @@ const NIP46_KIND: u64 = 24133;
 /// lx106 LLVM backend fails register allocation ("Cannot scavenge register") on
 /// over-large merged functions when everything is inlined under LTO.
 #[inline(never)]
-pub fn handle(seed: &[u8; 32], payload: &[u8]) -> Option<String> {
+pub fn handle(seed: &[u8; 32], payload: &[u8], oled: &mut crate::oled::Oled) -> Option<String> {
     if payload.len() < 72 {
         return None;
     }
@@ -39,7 +39,7 @@ pub fn handle(seed: &[u8; 32], payload: &[u8]) -> Option<String> {
     // 2. Dispatch the NIP-46 method → response JSON.
     let our_pubkey = crypto::pubkey(seed)?;
     let our_pubkey_hex = hex_lower(&our_pubkey);
-    let response_json = dispatch(&request_json, seed, &our_pubkey_hex)?;
+    let response_json = dispatch(&request_json, seed, &our_pubkey_hex, oled)?;
 
     // 3. Re-encrypt the response under the same conversation key.
     let nonce = random_nonce();
@@ -68,9 +68,14 @@ pub fn handle(seed: &[u8; 32], payload: &[u8]) -> Option<String> {
 }
 
 /// Minimal NIP-46 dispatch: `get_public_key`, `sign_event`, `connect`, `ping`.
-/// `sign_event` requires a physical button hold (`button::await_approval`); a
-/// richer policy engine and the OLED prompt are still to come.
-fn dispatch(request_json: &str, seed: &[u8; 32], our_pubkey_hex: &str) -> Option<String> {
+/// `sign_event` shows the request on the OLED and requires a physical button hold
+/// (`button::await_approval`) before signing; a richer policy engine is still to come.
+fn dispatch(
+    request_json: &str,
+    seed: &[u8; 32],
+    our_pubkey_hex: &str,
+    oled: &mut crate::oled::Oled,
+) -> Option<String> {
     let req = nip46::parse_request(request_json.as_bytes()).ok()?;
     let resp = match req.method.as_str() {
         "get_public_key" => nip46::build_pubkey_response(&req.id, our_pubkey_hex),
@@ -79,8 +84,11 @@ fn dispatch(request_json: &str, seed: &[u8; 32], our_pubkey_hex: &str) -> Option
         "sign_event" => match nip46::parse_unsigned_event(&req.params) {
             Ok(mut ev) => {
                 // Physical-approval gate: the daemon can deliver a sign request
-                // but cannot approve it — require an on-device button hold.
+                // but cannot approve it — show what's being signed and require an
+                // on-device button hold.
+                oled.show_sign_prompt(ev.kind, &ev.content);
                 if !crate::button::await_approval() {
+                    oled.show_status("denied");
                     nip46::build_error_response(&req.id, -32000, "denied at device")
                 } else {
                     ev.pubkey = our_pubkey_hex.to_string();
@@ -96,6 +104,7 @@ fn dispatch(request_json: &str, seed: &[u8; 32], our_pubkey_hex: &str) -> Option
                                 content: ev.content,
                                 sig: hex_lower(&sig),
                             };
+                            oled.show_status("signed");
                             nip46::build_sign_response(&req.id, &signed)
                         }
                         None => nip46::build_error_response(&req.id, -32603, "sign failed"),

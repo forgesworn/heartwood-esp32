@@ -50,7 +50,7 @@ def build_frame(ftype: int, payload: bytes) -> bytes:
     return header + payload + struct.pack(">I", crc)
 
 
-def read_frame(ser, timeout=15):
+def read_frame(ser, timeout=30):  # long enough for the on-device button-hold approval
     deadline = time.time() + timeout
     buf = bytearray()
     while time.time() < deadline:
@@ -107,7 +107,7 @@ def main():
     time.sleep(1.5)  # let the device boot and switch UART0 to 115200
     ser.reset_input_buffer()
 
-    print("PROVISION (master seed) …")
+    print("PROVISION (master seed) … HOLD the FLASH button on the device to approve.")
     t, _ = txn(ser, PROVISION, seed)
     if t != ACK:
         sys.exit(f"seed rejected (got frame 0x{t:02x})")

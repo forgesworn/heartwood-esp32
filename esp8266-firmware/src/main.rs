@@ -143,9 +143,15 @@ fn handle(
         // Provision the master seed: write it (plus the existing bridge secret)
         // to flash. Payload is the raw 32-byte seed, or the ESP32 form
         // [mode][label_len][label][secret_32] — we take the trailing 32 bytes.
-        // (No physical-confirmation gate yet — see the module note.)
+        // Gated on a physical button hold: a compromised host must not be able to
+        // silently overwrite the signing key.
         frame::PROVISION => {
             if payload.len() < 32 {
+                return frame::build(out, frame::NACK, &[]);
+            }
+            oled.show_lines(&["PROVISION SEED?", "", "writes a new key", "", "hold FLASH = approve"]);
+            if !button::await_approval() {
+                oled.show_status("denied");
                 return frame::build(out, frame::NACK, &[]);
             }
             let mut seed = [0u8; 32];
@@ -154,6 +160,7 @@ fn handle(
             let new = Keys { master_seed: seed, bridge_secret };
             storage::store(flash, &new);
             *keys = Some(new);
+            oled.show_status("provisioned");
             frame::build(out, frame::ACK, &[])
         }
 

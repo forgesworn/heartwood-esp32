@@ -29,13 +29,13 @@ arithmetic+ecdh compiles at opt-z (SIGSEGV only at opt-3); common's deps forced
 **KNOWN GAPS — untested on hardware** (compiling+linking ≠ correct):
 - Keys live in a **flash key store** now (`storage.rs`, sector at 0x3F0000) — provision the
   seed + bridge secret with `provision.py` (`PROVISION` 0x01 / `SET_BRIDGE_SECRET` 0x23).
-  Remaining: provisioning has **no physical-confirmation gate** (the ESP32 needs a button
-  hold), and the seed is host-supplied (no on-device GENERATE_IDENTITY without an OLED).
+  `PROVISION` (the seed write) is **gated on a button hold** too, so a compromised host can't
+  silently overwrite the key. Remaining: the seed is host-supplied (no on-device
+  GENERATE_IDENTITY without an OLED to show the phrase).
 - **Sign approval** — `sign_event` shows the request on the **OLED** (kind + content
   preview) and requires a physical button hold (`button.rs`: GPIO0/FLASH, ~1.5 s, ~20 s
   timeout) before signing; the OLED then shows `signed`/`denied`. So the hold confirms a
-  *seen* event. Still to come: a richer policy view (full tags/recipient) and a gate on
-  provisioning too.
+  *seen* event. Still to come: a richer policy view (full tags/recipient).
 - **RNG entropy — RESOLVED (no hardware RNG in the security path).** The lx106's
   `WDEV_RAND` is only well-seeded with RF active, so a radio-off signer can't trust it.
   Both nonce sources are now deterministic: BIP-340 signing uses `aux_rand = 0`

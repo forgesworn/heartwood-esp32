@@ -118,9 +118,11 @@ python3 provision.py --port /dev/cu.wchusbserial1420 --gen \
   --bridge-secret "$(printf '42%.0s' {1..32})"   # demo secret = 32 bytes of 0x42
 # → prints the generated seed and the device npub. Keep both safe.
 ```
-(`provision.py` sends `PROVISION` + `SET_BRIDGE_SECRET`, then reads back the npub
-to confirm. Until you do this, `SESSION_AUTH` returns "no secret" and
-`PROVISION_LIST` is empty.)
+When the OLED shows `PROVISION SEED? hold FLASH = approve`, **hold the FLASH
+button ~1.5 s** — writing the signing key requires physical confirmation, so a
+compromised host can't silently overwrite it. (`provision.py` sends `PROVISION` +
+`SET_BRIDGE_SECRET`, then reads back the npub to confirm. Until you do this,
+`SESSION_AUTH` returns "no secret" and `PROVISION_LIST` is empty.)
 
 **Then point the daemon at it** — an **HSM‑mode** `heartwood-bridge` instance
 under `HEARTWOOD_DATA_DIR` (e.g. `/var/lib/heartwood/esp8266`):

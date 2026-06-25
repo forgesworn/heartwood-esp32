@@ -162,7 +162,16 @@ jobs:
           MCU: esp32c6
           ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.c6"
         run: |
+          set -eu
           . "$HOME/export-esp.sh"
+          # espup installs the riscv32-esp-elf gcc but its generated export-esp.sh does
+          # not put it on PATH on the CI runner (only LIBCLANG_PATH). secp256k1-sys's cc
+          # build needs it (CC_riscv32imac_esp_espidf=riscv32-esp-elf-gcc) — locate the
+          # one espup installed under the esp toolchain dir and add it explicitly.
+          gcc_bin="$(dirname "$(find "$HOME/.rustup" "$HOME/.espressif" -name riscv32-esp-elf-gcc -type f 2>/dev/null | head -1)")"
+          [ -n "$gcc_bin" ] || { echo "::error::riscv32-esp-elf-gcc not found after espup install"; exit 1; }
+          export PATH="$gcc_bin:$PATH"
+          riscv32-esp-elf-gcc --version | head -1
           cargo build --release --target riscv32imac-esp-espidf --no-default-features --features c6
       - name: App image must fit the C6 3 MB app slot
         working-directory: firmware

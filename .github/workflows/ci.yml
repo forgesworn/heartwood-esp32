@@ -54,15 +54,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen
 
-  # Real firmware build for every shipped board, plus the 2 MB ota_0 fit check
-  # that has bitten us before (heavy crypto crates / opt level overflow the
-  # slot). Building both boards here catches a board-specific break at PR time
-  # rather than only when the release runs.
+  # Real firmware build for every Xtensa esp-idf board, plus the app-slot fit
+  # check that has bitten us before (heavy crypto crates / opt level overflow the
+  # slot). heltec-v3/v4 are ESP32-S3 (2 MB ota_0); the T-Display is the classic
+  # ESP32 with a 4 MB single-OTA layout (3 MB factory slot). Building all of them
+  # here catches a board-specific break at PR time, not only when the release
+  # runs. The C6 (RISC-V) and ESP8266 (lx106) firmwares need different toolchains
+  # and so have their own jobs below.
   firmware-build:
     strategy:
       fail-fast: false
       matrix:
-        board: [heltec-v4, heltec-v3]
+        include:
+          - board: heltec-v4
+            target: xtensa-esp32s3-espidf
+            chip: esp32s3
+            limit: 2097152
+          - board: heltec-v3
+            target: xtensa-esp32s3-espidf
+            chip: esp32s3
+            limit: 2097152
+          - board: tdisplay
+            target: xtensa-esp32-espidf
+            chip: esp32
+            limit: 3145728
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,29 +89,145 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           default: true
-          buildtargets: esp32s3
+          buildtargets: ${{ matrix.chip }}
           ldproxy: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: firmware
+          # Per-board cache: the boards now span esp32s3 and esp32, and esp-idf-sys
+          # keeps a STICKY generated sdkconfig keyed to the chip — a shared cache
+          # would let one board's sdkconfig bleed into another board's build.
+          key: ${{ matrix.board }}
       - uses: taiki-e/install-action@v2
         with:
           tool: espflash
       - name: Build firmware (${{ matrix.board }}, release)
         working-directory: firmware
         env:
+          # MCU drives esp-idf-sys's chip selection; it must match the board's
+          # target (the config.toml default is esp32s3, fine for heltec but wrong
+          # for the T-Display's classic esp32).
+          MCU: ${{ matrix.chip }}
           ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.${{ matrix.board }}"
-        run: cargo build --release --no-default-features --features ${{ matrix.board }}
-      - name: App image must fit the 2 MB ota_0 slot
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features ${{ matrix.board }}
+      - name: App image must fit the ${{ matrix.board }} app slot
         working-directory: firmware
         run: |
           set -eu
-          espflash save-image --chip esp32s3 \
-            target/xtensa-esp32s3-espidf/release/heartwood-esp32 /tmp/app.bin
+          espflash save-image --chip ${{ matrix.chip }} \
+            target/${{ matrix.target }}/release/heartwood-esp32 /tmp/app.bin
           size=$(stat -c%s /tmp/app.bin)
-          limit=2097152
+          limit=${{ matrix.limit }}
           echo "${{ matrix.board }} app image: $size / $limit bytes ($((size * 100 / limit))%)"
           if [ "$size" -gt "$limit" ]; then
-            echo "::error::${{ matrix.board }} app image ($size B) exceeds the 2 MB ota_0 slot ($limit B)"
+            echo "::error::${{ matrix.board }} app image ($size B) exceeds its app slot ($limit B)"
             exit 1
           fi
+
+  # ESP32-C6 (RISC-V rv32imac) firmware. The Xtensa toolchain action above cannot
+  # install a RISC-V toolchain, so this job uses espup to install the Espressif
+  # Rust channel (which ships the riscv32imac-esp-espidf target) plus the matching
+  # riscv32-esp-elf GCC for the C FFI (secp256k1-sys, esp-idf). The -fno-pic CFLAGS
+  # fix lives in firmware/.cargo/config.toml. 4 MB single-OTA layout, 3 MB factory.
+  firmware-build-c6:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the esp Rust toolchain (espup — nightly Rust + LLVM)
+        run: |
+          set -eu
+          curl -fL -o espup \
+            https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu
+          chmod +x espup
+          # The xtensa chip (esp32) pulls the NIGHTLY-based "esp" Rust toolchain that
+          # firmware/rust-toolchain.toml pins — build-std (-Zbuild-std) is nightly-only,
+          # riscv-on-stable can't build `core` — plus the esp LLVM (libclang for bindgen).
+          # espup does NOT install the riscv gcc (every CI run logged only "Installing
+          # GCC (xtensa-esp-elf)"), so the C FFI cross-compiler is fetched in the next step.
+          ./espup install --targets esp32 --export-file "$HOME/export-esp.sh"
+      - name: Install the riscv32-esp-elf gcc (the C FFI cross-compiler)
+        run: |
+          set -eu
+          # esp-idf v5.3.2's RISC-V cross-compiler (gcc 13.2.0). secp256k1-sys's cc build
+          # needs `riscv32-esp-elf-gcc` on PATH; the Xtensa boards get theirs from the
+          # toolchain action, but espup never installs the riscv one — fetch it directly
+          # and add it to PATH for the build (mirrors the esp8266 lx106-gcc step).
+          curl -fL -o /tmp/riscv-gcc.tar.xz \
+            https://github.com/espressif/crosstool-NG/releases/download/esp-13.2.0_20240530/riscv32-esp-elf-13.2.0_20240530-x86_64-linux-gnu.tar.xz
+          mkdir -p "$HOME/.local"
+          tar -xJf /tmp/riscv-gcc.tar.xz -C "$HOME/.local"
+          echo "$HOME/.local/riscv32-esp-elf/bin" >> "$GITHUB_PATH"
+      - name: Install ldproxy (esp-idf linker shim)
+        run: cargo install ldproxy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware
+          key: c6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: espflash
+      - name: Build firmware (c6, release)
+        working-directory: firmware
+        env:
+          MCU: esp32c6
+          ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.c6"
+        run: |
+          set -euo pipefail
+          . "$HOME/export-esp.sh"
+          # The riscv gcc is on PATH from the install step above (via $GITHUB_PATH);
+          # confirm it before building so a PATH problem fails here, not deep in cc-rs.
+          riscv32-esp-elf-gcc --version | head -1
+          cargo build --release --target riscv32imac-esp-espidf --no-default-features --features c6
+      - name: App image must fit the C6 3 MB app slot
+        working-directory: firmware
+        run: |
+          . "$HOME/export-esp.sh"
+          set -eu
+          espflash save-image --chip esp32c6 \
+            target/riscv32imac-esp-espidf/release/heartwood-esp32 /tmp/app.bin
+          size=$(stat -c%s /tmp/app.bin)
+          limit=3145728
+          echo "c6 app image: $size / $limit bytes ($((size * 100 / limit))%)"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::c6 app image ($size B) exceeds its 3 MB app slot ($limit B)"
+            exit 1
+          fi
+
+  # ESP8266 tethered-signer firmware — a SEPARATE crate (esp8266-firmware/), a
+  # no_std lx106 binary with its own target, toolchain and linker. It shares the
+  # `esp` Rust channel (which ships xtensa-esp8266-none-elf) but the final link
+  # needs Espressif's prebuilt xtensa-lx106-elf-gcc, which no toolchain action
+  # provides. This job proves the firmware still COMPILES AND LINKS into a
+  # flashable ELF; the runtime (does k256 fault on lx106's unaligned access?) is
+  # a separate on-hardware step the boot self-test reports on first flash.
+  esp8266-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          default: true
+          ldproxy: false
+          # Pin to the esp toolchain the firmware is known to build on. The latest
+          # esp Rust (1.95.0.0) dropped the `compiler-builtins-no-f16-f128` build-std
+          # feature that esp8266-firmware/.cargo/config.toml needs to stop the lx106
+          # backend choking on f16/f128 builtins ("cannot scavenge register"). 1.87.0.0
+          # is nightly-based, so it also accepts the vendored rt's #![feature(naked_functions)].
+          version: "1.87.0.0"
+      - name: Install the xtensa-lx106-elf GNU toolchain (the lx106 linker)
+        run: |
+          set -eu
+          curl -fL -o /tmp/lx106.tar.gz \
+            https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz
+          mkdir -p "$HOME/.local"
+          tar -xzf /tmp/lx106.tar.gz -C "$HOME/.local"
+          echo "$HOME/.local/xtensa-lx106-elf/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: esp8266-firmware
+          key: esp8266
+      - name: Build esp8266 firmware (release — compile + link)
+        working-directory: esp8266-firmware
+        run: cargo build --release

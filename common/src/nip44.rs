@@ -17,6 +17,9 @@
 //
 // Both k256 and secp256k1 backends are supported (same cfg pattern as
 // derive.rs).  Tests run against the k256 backend.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chacha20::{

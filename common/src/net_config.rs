@@ -1,5 +1,8 @@
 //! Network configuration for WiFi-standalone mode.
 //! Pure, host-testable. Stored as a JSON blob in NVS by the firmware.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 #[cfg(feature = "nip46")]
 use serde::{Deserialize, Serialize};

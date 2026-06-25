@@ -6,6 +6,9 @@
 //   [0x48 0x57] [type_u8] [length_u16_be] [payload...] [crc32_4]
 //
 // CRC32 covers: type byte + length bytes + payload (NOT the magic bytes).
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 use crate::types::{FRAME_OVERHEAD, FRAME_HEADER_SIZE, MAGIC_BYTES, MAX_PAYLOAD_SIZE};
 

@@ -12,6 +12,9 @@
 //! BIP-39 (wordlist + PBKDF2 seed) comes from the `bip39` crate; the BIP-32
 //! step is hand-rolled on the firmware's existing `secp256k1` so we don't pull
 //! `k256` + a second `secp256k1` (which overflowed the 2 MB OTA slot).
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 use hmac::{Hmac, Mac};
 use secp256k1::{Scalar, SecretKey};

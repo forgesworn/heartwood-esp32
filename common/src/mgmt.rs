@@ -32,6 +32,9 @@
 //! a client slot, approve signing, read status) — nothing that touches the seed
 //! or the trust root, which stay physical (USB) by design. The eviction test
 //! below documents this limit explicitly.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 /// Whether an event author is the authorised operator.
 ///

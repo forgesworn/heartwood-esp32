@@ -1,6 +1,9 @@
 // common/src/policy.rs
 //
 // Client approval policy types shared between firmware and bridge.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 use serde::{Deserialize, Serialize};
 

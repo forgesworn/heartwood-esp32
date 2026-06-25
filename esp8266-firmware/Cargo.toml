@@ -31,6 +31,10 @@ crc32fast = { version = "1", default-features = false }
 # BIP-340 Schnorr (pubkey derivation + signing). no_std, no-alloc — the exact
 # crate the esp8266-spike proved compiles for xtensa-lx106.
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+# Shared NIP-44 / NIP-46 / envelope logic (converted to no_std), k256 backend —
+# reuse the exact data-plane crypto the ESP32 firmware uses. (Pulls k256's
+# arithmetic + ecdh features for NIP-44 ECDH.)
+heartwood-common = { path = "../common", default-features = false, features = ["k256-backend", "nip44", "nip46"] }
 # Heap allocator for the data plane (NIP-44 buffers, JSON). The lx106 has no
 # `alloc` without one; the inline 0x10 sign path needs it.
 embedded-alloc = "0.6"

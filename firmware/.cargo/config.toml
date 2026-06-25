@@ -42,6 +42,16 @@ CFLAGS_xtensa_esp32_espidf = "-mlongcalls"
 # ESP32-C6 (RISC-V) C FFI cross-compiler. RISC-V has no Xtensa call8/call4 range
 # limit, so -mlongcalls (an Xtensa-only flag) is neither needed nor valid here.
 CC_riscv32imac_esp_espidf = "riscv32-esp-elf-gcc"
+# Build the cc-crate C FFI (secp256k1-sys) without a GOT. By default GCC takes the
+# address of cross-translation-unit externs via the GOT (R_RISCV_GOT_HI20). esp-idf's
+# static sections.ld never places a `.got` (its pure-C builds don't make one), so GNU
+# ld orphans the GOT right after `.flash.rodata`, opening a gap that trips esp-idf's
+# assert "The gap between .flash.rodata and .eh_frame_hdr must not exist". `-fno-pic`
+# makes those accesses PC-relative (AUIPC) instead, so no `.got` is emitted at all —
+# the orphan and the gap vanish and the link passes esp-idf's real asserts. This is
+# correct for esp-idf firmware, which runs from a fixed flash address (never PIC).
+# Verified: no `.got` section, rodata/.eh_frame_hdr contiguous, espflash image valid.
+CFLAGS_riscv32imac_esp_espidf = "-fno-pic"
 # Board-specific sdkconfig fragment selection. This is the default for the
 # `heltec-v4` feature (the cargo default). For a V3 build, override this
 # variable at invocation time before `cargo build`, e.g.:

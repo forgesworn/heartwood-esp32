@@ -28,6 +28,9 @@ panic-halt = "0.2"
 nb = "1"
 # CRC32 for the HW serial frame protocol (no_std software impl).
 crc32fast = { version = "1", default-features = false }
+# BIP-340 Schnorr (pubkey derivation + signing). no_std, no-alloc — the exact
+# crate the esp8266-spike proved compiles for xtensa-lx106.
+k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 
 [profile.release]
 opt-level = "z"

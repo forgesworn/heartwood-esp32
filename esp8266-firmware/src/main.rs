@@ -17,6 +17,8 @@
 #![no_std]
 #![no_main]
 
+mod bech32;
+mod crypto;
 mod frame;
 
 use esp8266_hal::prelude::*;
@@ -27,6 +29,11 @@ use panic_halt as _;
 /// sector (the ESP32 stores it in NVS; the lx106 has no NVS). Matches the
 /// daemon's expectation that the host presents a 32-byte shared secret.
 const BRIDGE_SECRET: [u8; 32] = [0x42; 32];
+
+/// Master signing secret. Placeholder until read from a reserved flash sector
+/// (the ESP32 stores it in NVS; the lx106 has none). Any valid secp256k1 scalar
+/// works for the scaffold — the device derives its npub identity from this.
+const MASTER_SEED: [u8; 32] = [0x11; 32];
 
 #[entry]
 fn main() -> ! {
@@ -84,8 +91,28 @@ fn handle(frame_type: u8, payload: &[u8], authenticated: &mut bool, out: &mut [u
             br#"{"version":"0.0.1","board":"esp8266"}"#,
         ),
 
-        // PROVISION_LIST / ENCRYPTED_REQUEST need key storage + the crypto
-        // stack — not yet implemented; NACK so the daemon fails cleanly.
+        // Report the signing identity: derive the x-only pubkey from the master
+        // seed, bech32-encode it as an npub, return the JSON the daemon parses:
+        // [{slot,label,mode,npub}].
+        frame::PROVISION_LIST => {
+            let pk = crypto::pubkey(&MASTER_SEED)?;
+            let mut npub = [0u8; 63];
+            let n = bech32::encode(b"npub", &pk, &mut npub)?;
+            let mut json = [0u8; 160];
+            let mut j = 0;
+            let pre = br#"[{"slot":0,"label":"default","mode":1,"npub":""#;
+            json[j..j + pre.len()].copy_from_slice(pre);
+            j += pre.len();
+            json[j..j + n].copy_from_slice(&npub[..n]);
+            j += n;
+            let post = br#""}]"#;
+            json[j..j + post.len()].copy_from_slice(post);
+            j += post.len();
+            frame::build(out, frame::PROVISION_LIST_RESPONSE, &json[..j])
+        }
+
+        // ENCRYPTED_REQUEST (the 0x10 sign path) needs NIP-44 + NIP-46 + an
+        // allocator — not yet implemented; NACK so the daemon fails cleanly.
         _ => frame::build(out, frame::NACK, &[]),
     }
 }

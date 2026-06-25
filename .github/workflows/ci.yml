@@ -131,15 +131,25 @@ jobs:
   # fix lives in firmware/.cargo/config.toml. 4 MB single-OTA layout, 3 MB factory.
   firmware-build-c6:
     runs-on: ubuntu-latest
+    # The C6 is RISC-V, which builds on STABLE Rust — the Espressif Xtensa fork is
+    # only needed for Xtensa chips. espup installs the riscv targets + esp LLVM
+    # (libclang) onto stable, NOT as an "esp" toolchain, but firmware/rust-
+    # toolchain.toml pins channel="esp". Force stable so rust-cache and cargo use
+    # it rather than demanding the (uninstalled, unneeded) esp fork.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
-      - name: Install the Espressif Rust toolchain for RISC-V (ESP32-C6)
+      - name: Install the Espressif RISC-V toolchain (espup — riscv targets + LLVM)
         run: |
           set -eu
           curl -fL -o espup \
             https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu
           chmod +x espup
           ./espup install --targets esp32c6 --export-file "$HOME/export-esp.sh"
+          # build-std (firmware/.cargo/config.toml) compiles std from source for the
+          # Tier-3 riscv32imac-esp-espidf target, so stable needs the rust-src component.
+          rustup component add rust-src --toolchain stable
       - name: Install ldproxy (esp-idf linker shim)
         run: cargo install ldproxy
       - uses: Swatinem/rust-cache@v2
@@ -189,6 +199,12 @@ jobs:
         with:
           default: true
           ldproxy: false
+          # Pin to the esp toolchain the firmware is known to build on. The latest
+          # esp Rust (1.95.0.0) dropped the `compiler-builtins-no-f16-f128` build-std
+          # feature that esp8266-firmware/.cargo/config.toml needs to stop the lx106
+          # backend choking on f16/f128 builtins ("cannot scavenge register"). 1.87.0.0
+          # is nightly-based, so it also accepts the vendored rt's #![feature(naked_functions)].
+          version: "1.87.0.0"
       - name: Install the xtensa-lx106-elf GNU toolchain (the lx106 linker)
         run: |
           set -eu

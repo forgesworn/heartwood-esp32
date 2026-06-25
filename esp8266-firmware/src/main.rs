@@ -29,6 +29,7 @@ mod button;
 mod crypto;
 mod frame;
 mod heap;
+mod identity;
 mod oled;
 mod selftest;
 mod sign_path;
@@ -103,6 +104,10 @@ fn main() -> ! {
     let mut reader = alloc::boxed::Box::new(frame::Reader::new());
     let mut out = alloc::vec![0u8; frame::MAX_FRAME];
     let mut authenticated = false;
+    // nsec-tree state: cached derived personas + per-client active-identity
+    // sessions. RAM-only; both empty until a heartwood_* request populates them.
+    let mut cache = identity::IdentityCache::new();
+    let mut sessions = identity::Sessions::new();
 
     loop {
         let byte = match nb::block!(serial.read()) {
@@ -115,6 +120,8 @@ fn main() -> ! {
                 reader.payload(),
                 &mut keys,
                 &mut authenticated,
+                &mut cache,
+                &mut sessions,
                 &mut flash,
                 &mut out,
                 oled.as_mut(),
@@ -130,11 +137,14 @@ fn main() -> ! {
 
 /// Dispatch one received frame. Returns `Some(len)` of a response frame written
 /// into `out`, or `None` if there is nothing to reply.
+#[allow(clippy::too_many_arguments)]
 fn handle(
     frame_type: u8,
     payload: &[u8],
     keys: &mut Option<Keys>,
     authenticated: &mut bool,
+    cache: &mut identity::IdentityCache,
+    sessions: &mut identity::Sessions,
     flash: &mut ESPFlash,
     out: &mut [u8],
     oled: &mut oled::Oled,
@@ -156,8 +166,16 @@ fn handle(
             }
             let mut seed = [0u8; 32];
             seed.copy_from_slice(&payload[payload.len() - 32..]);
+            // The ESP32 form is [mode][label_len][label][secret_32]; the raw
+            // 32-byte form carries no mode. Take the leading mode byte when it is
+            // a valid MasterMode (0..=2), else default (treat the seed as a tree root).
+            let mode = if payload.len() > 32 && payload[0] <= 2 {
+                payload[0]
+            } else {
+                storage::DEFAULT_MODE
+            };
             let bridge_secret = keys.as_ref().map_or([0u8; 32], |k| k.bridge_secret);
-            let new = Keys { master_seed: seed, bridge_secret };
+            let new = Keys { master_seed: seed, bridge_secret, mode };
             storage::store(flash, &new);
             *keys = Some(new);
             oled.show_status("provisioned");
@@ -171,8 +189,10 @@ fn handle(
             }
             let mut bridge_secret = [0u8; 32];
             bridge_secret.copy_from_slice(payload);
-            let master_seed = keys.as_ref().map_or([0u8; 32], |k| k.master_seed);
-            let new = Keys { master_seed, bridge_secret };
+            let (master_seed, mode) = keys
+                .as_ref()
+                .map_or(([0u8; 32], storage::DEFAULT_MODE), |k| (k.master_seed, k.mode));
+            let new = Keys { master_seed, bridge_secret, mode };
             storage::store(flash, &new);
             *keys = Some(new);
             frame::build(out, frame::ACK, &[])
@@ -204,24 +224,34 @@ fn handle(
 
         // Report the signing identity: derive the npub from the provisioned seed.
         // Unprovisioned (or invalid seed) → empty list.
-        frame::PROVISION_LIST => match keys.as_ref().and_then(|k| crypto::pubkey(&k.master_seed)) {
-            Some(pk) => {
-                let mut npub = [0u8; 63];
-                let n = bech32::encode(b"npub", &pk, &mut npub)?;
-                let mut json = [0u8; 160];
-                let mut j = 0;
-                let pre = br#"[{"slot":0,"label":"default","mode":1,"npub":""#;
-                json[j..j + pre.len()].copy_from_slice(pre);
-                j += pre.len();
-                json[j..j + n].copy_from_slice(&npub[..n]);
-                j += n;
-                let post = br#""}]"#;
-                json[j..j + post.len()].copy_from_slice(post);
-                j += post.len();
-                frame::build(out, frame::PROVISION_LIST_RESPONSE, &json[..j])
+        frame::PROVISION_LIST => {
+            let info = keys
+                .as_ref()
+                .and_then(|k| crypto::pubkey(&k.master_seed).map(|pk| (pk, k.mode)));
+            match info {
+                Some((pk, mode)) => {
+                    let mut npub = [0u8; 63];
+                    let n = bech32::encode(b"npub", &pk, &mut npub)?;
+                    let mut json = [0u8; 160];
+                    let mut j = 0;
+                    let pre = br#"[{"slot":0,"label":"default","mode":"#;
+                    json[j..j + pre.len()].copy_from_slice(pre);
+                    j += pre.len();
+                    json[j] = b'0' + mode.min(9); // the MasterMode digit (0..=2)
+                    j += 1;
+                    let mid = br#","npub":""#;
+                    json[j..j + mid.len()].copy_from_slice(mid);
+                    j += mid.len();
+                    json[j..j + n].copy_from_slice(&npub[..n]);
+                    j += n;
+                    let post = br#""}]"#;
+                    json[j..j + post.len()].copy_from_slice(post);
+                    j += post.len();
+                    frame::build(out, frame::PROVISION_LIST_RESPONSE, &json[..j])
+                }
+                None => frame::build(out, frame::PROVISION_LIST_RESPONSE, b"[]"),
             }
-            None => frame::build(out, frame::PROVISION_LIST_RESPONSE, b"[]"),
-        },
+        }
 
         // The inline sign path. Gated on a successful SESSION_AUTH + a seed.
         frame::ENCRYPTED_REQUEST => {
@@ -230,7 +260,7 @@ fn handle(
             }
             match keys
                 .as_ref()
-                .and_then(|k| sign_path::handle(&k.master_seed, payload, oled))
+                .and_then(|k| sign_path::handle(&k.master_seed, k.mode, payload, cache, sessions, oled))
             {
                 // If the signed envelope is larger than a frame can carry (a big
                 // event on this RAM-limited device), NACK rather than silently

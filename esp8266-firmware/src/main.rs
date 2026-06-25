@@ -30,6 +30,7 @@ mod crypto;
 mod frame;
 mod heap;
 mod oled;
+mod selftest;
 mod sign_path;
 mod storage;
 
@@ -76,6 +77,16 @@ fn main() -> ! {
         pins.gpio14.into_open_drain_output(),
         pins.gpio12.into_open_drain_output(),
     ));
+
+    // Power-on self-test: validate the crypto against known-answer vectors on the
+    // real silicon before trusting it with a key. Refuse to operate if it fails —
+    // a signer with corrupt crypto is worse than a dead one.
+    oled.show_status("self-test...");
+    if let Err(which) = selftest::run() {
+        oled.show_lines(&["SELF-TEST FAILED", "", which, "", "do not use"]);
+        loop {}
+    }
+
     match keys.as_ref().and_then(|k| crypto::pubkey(&k.master_seed)) {
         Some(pk) => {
             let mut npub = [0u8; 63];

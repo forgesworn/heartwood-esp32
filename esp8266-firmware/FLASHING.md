@@ -83,17 +83,28 @@ esptool.py --chip esp8266 --port "$PORT" --baud 460800 \
 The NodeMCU auto‑resets into the bootloader via DTR/RTS, so no buttons needed. If
 esptool can't sync, hold **FLASH** (GPIO0) while tapping **RST**, then retry.
 
-## 5. Verify the chip boots
+## 5. Verify the chip boots — and that the crypto works
 
-The firmware itself prints **nothing** human‑readable — it only speaks the binary
-frame protocol. But the **boot ROM** logs at 74880 baud, which confirms the flash
-is good:
+**Watch the OLED.** At boot the firmware runs a **power‑on self‑test (POST)** that
+checks k256 pubkey derivation, BIP‑340 signing, and a NIP‑44 round‑trip against
+known‑answer vectors. So the OLED tells you, in the first second, whether the
+crypto actually runs on this silicon:
+
+| OLED shows | Meaning |
+|---|---|
+| `self-test...` then the **npub** (or `unprovisioned`) | ✅ **POST passed — k256 runs correctly on the lx106.** This answers the big unaligned‑access question at boot, before any daemon/relay. |
+| `SELF-TEST FAILED` + a check name (`pubkey/sign/nip44…`) | ❌ k256 produced wrong bytes on this chip (silent corruption). The device halts and refuses to sign. |
+| nothing / a reset loop | A hard fault (likely k256 unaligned access) or a bad flash — see below. |
+
+No OLED attached? The firmware itself prints **nothing** human‑readable (binary
+frames only), but the **boot ROM** logs at 74880 baud, which confirms the flash is
+good and whether it boot‑loops:
 ```sh
-esptool.py --chip esp8266 --port "$PORT" --baud 74880 read_flash 0x0 0x10 /dev/null  # or:
 python3 -m serial.tools.miniterm "$PORT" 74880   # watch the ROM boot banner, then Ctrl-]
 ```
-A clean boot banner (no rst‑cause loop) = the image loads and runs. The firmware
-then switches UART0 to 115200 and waits for the daemon.
+A clean banner (no rst‑cause loop) + the device going on to answer the daemon's
+`SESSION_AUTH` ⇒ the POST passed (it halts on failure, so it would never reach
+auth). The firmware switches UART0 to 115200 after the POST.
 
 ## 6. Point the daemon at it
 

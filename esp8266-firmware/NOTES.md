@@ -15,6 +15,10 @@ half of the daemon-mediated path. It speaks the HW serial frame protocol to the
   NIP-44 decrypt → NIP-46 dispatch (get_public_key / sign_event / connect / ping) →
   re-encrypt → build & sign the kind:24133 envelope, all on-device, reusing
   `heartwood-common` (converted to no_std). The daemon never sees plaintext or keys.
+- **Boot self-test (POST)** — validates k256 pubkey derivation, BIP-340 signing, and a
+  NIP-44 round-trip against host-computed known-answer vectors before operating; halts and
+  shows the failing check on the OLED if the lx106 silently corrupts a result. Plus the OLED
+  npub display and the FLASH-button sign-approval gate.
 
 Toolchain wins along the way: the right runtime is `xtensa-lx-rt 0.12` (patched
 `naked_asm!` + `.ifndef` guard, vendored via `[patch]`); release-only (opt-0 fails register

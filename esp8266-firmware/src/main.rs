@@ -5,14 +5,17 @@
 //! traffic to/from the Nostr relays. This is the bare-metal counterpart of the
 //! ESP32 firmware's serial path.
 //!
-//! Control plane implemented so far (no allocator needed):
+//! Implemented (compiles + links; untested on hardware):
 //!   - `SESSION_AUTH` (0x21) → `SESSION_ACK` (0x22): authenticate the bridge.
 //!   - `FIRMWARE_INFO` (0x59) → `0x5A`: version/board.
-//!   - unknown frames → `NACK` (0x15).
+//!   - `PROVISION_LIST` (0x05) → `0x07`: report the k256 npub identity.
+//!   - `ENCRYPTED_REQUEST` (0x10) → `SIGN_ENVELOPE_RESPONSE` (0x35): the inline
+//!     NIP-44 decrypt → NIP-46 dispatch → re-encrypt → sign-kind:24133 path,
+//!     reusing `heartwood-common`. Unknown frames → `NACK` (0x15).
 //!
-//! Still to come (needs flash key storage + the crypto stack, likely an
-//! allocator): `PROVISION_LIST` (0x05) and the inline `ENCRYPTED_REQUEST`
-//! (0x10) → `SIGN_ENVELOPE_RESPONSE` (0x35) signing path.
+//! Placeholders / known gaps: the master seed + bridge secret are hardcoded
+//! (flash storage TODO), no button approval (auto-approve), and the NIP-44 nonce
+//! RNG needs an entropy review (see `sign_path::random_nonce`).
 
 #![no_std]
 #![no_main]
@@ -23,6 +26,7 @@ mod bech32;
 mod crypto;
 mod frame;
 mod heap;
+mod sign_path;
 
 use esp8266_hal::prelude::*;
 use esp8266_hal::target::Peripherals;
@@ -41,12 +45,6 @@ const MASTER_SEED: [u8; 32] = [0x11; 32];
 #[entry]
 fn main() -> ! {
     heap::init();
-    {
-        // Allocator smoke — the NIP-44 / JSON data plane will exercise it for real.
-        let mut probe = alloc::vec::Vec::<u8>::new();
-        probe.push(frame::MAGIC[0]);
-        core::hint::black_box(probe.as_ptr());
-    }
 
     let dp = Peripherals::take().unwrap();
     let pins = dp.GPIO.split();
@@ -59,8 +57,10 @@ fn main() -> ! {
     let (mut timer1, _) = dp.TIMER.timers();
     timer1.delay_ms(50);
 
-    let mut reader = frame::Reader::new();
-    let mut out = [0u8; frame::MAX_FRAME];
+    // Box the frame buffers onto the heap — MAX_FRAME (~4 KB each) is too large
+    // for the lx106's small stack.
+    let mut reader = alloc::boxed::Box::new(frame::Reader::new());
+    let mut out = alloc::vec![0u8; frame::MAX_FRAME];
     let mut authenticated = false;
 
     loop {
@@ -122,8 +122,22 @@ fn handle(frame_type: u8, payload: &[u8], authenticated: &mut bool, out: &mut [u
             frame::build(out, frame::PROVISION_LIST_RESPONSE, &json[..j])
         }
 
-        // ENCRYPTED_REQUEST (the 0x10 sign path) needs NIP-44 + NIP-46 + an
-        // allocator — not yet implemented; NACK so the daemon fails cleanly.
+        // The inline sign path: NIP-44 decrypt → NIP-46 dispatch → re-encrypt →
+        // sign the kind:24133 envelope (heartwood-common does the crypto).
+        // Gated on a successful SESSION_AUTH, like the ESP32.
+        frame::ENCRYPTED_REQUEST => {
+            if !*authenticated {
+                frame::build(out, frame::NACK, &[])
+            } else {
+                match sign_path::handle(&MASTER_SEED, payload) {
+                    Some(event_json) => {
+                        frame::build(out, frame::SIGN_ENVELOPE_RESPONSE, event_json.as_bytes())
+                    }
+                    None => frame::build(out, frame::NACK, &[]),
+                }
+            }
+        }
+
         _ => frame::build(out, frame::NACK, &[]),
     }
 }

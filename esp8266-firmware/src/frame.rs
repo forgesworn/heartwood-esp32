@@ -14,7 +14,7 @@
 pub const MAGIC: [u8; 2] = [0x48, 0x57]; // "HW"
 pub const HEADER_LEN: usize = 5; // magic(2) + type(1) + len(2)
 pub const OVERHEAD: usize = HEADER_LEN + 4; // + crc(4)
-pub const MAX_PAYLOAD: usize = 512;
+pub const MAX_PAYLOAD: usize = 4096;
 pub const MAX_FRAME: usize = OVERHEAD + MAX_PAYLOAD;
 
 // Frame types (subset of common/src/types.rs that the device serves).

@@ -35,6 +35,8 @@ k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 # reuse the exact data-plane crypto the ESP32 firmware uses. (Pulls k256's
 # arithmetic + ecdh features for NIP-44 ECDH.)
 heartwood-common = { path = "../common", default-features = false, features = ["k256-backend", "nip44", "nip46"] }
+# Serialise the signed kind:24133 envelope event (no_std + alloc).
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 # Heap allocator for the data plane (NIP-44 buffers, JSON). The lx106 has no
 # `alloc` without one; the inline 0x10 sign path needs it.
 embedded-alloc = "0.6"

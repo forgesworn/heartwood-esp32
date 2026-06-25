@@ -382,6 +382,7 @@ dependencies = [
  "k256",
  "nb 1.1.0",
  "panic-halt",
+ "serde_json",
  "xtensa-lx",
 ]
 

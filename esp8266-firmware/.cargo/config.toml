@@ -1,0 +1,17 @@
+# All Rust compiles for xtensa-esp8266; the final link needs a linker that
+# targets the lx106. esp8266-hal's own config drives the link through
+# `xtensa-lx106-elf-gcc` (the Espressif ESP8266 GCC), which espup does NOT
+# install. We use the bundled `rust-lld` instead, so no extra toolchain is
+# needed. (If lld can't handle the linker script, install xtensa-lx106-elf-gcc
+# and switch back to: link-arg=-nostartfiles, link-arg=-Wl,-Tlink.x.)
+[build]
+target = "xtensa-esp8266-none-elf"
+rustflags = [
+  "-C", "linker=rust-lld",
+  "-C", "linker-flavor=ld.lld",
+  "-C", "link-arg=-Tlink.x",
+]
+
+[unstable]
+build-std = ["core"]
+build-std-features = ["compiler-builtins-no-f16-f128", "compiler-builtins-mem"]

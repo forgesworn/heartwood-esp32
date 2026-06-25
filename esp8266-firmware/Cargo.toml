@@ -1,0 +1,44 @@
+# Heartwood ESP8266 tethered-signer firmware (compile-only scaffold).
+#
+# Unlike esp8266-spike/ (a staticlib that only proves the crypto COMPILES), this
+# is a real `no_main` binary: reset vector + entry via xtensa-lx106-rt, a global
+# allocator, raw UART0, and the HW serial frame protocol. The goal of this
+# stage is that it COMPILES AND LINKS into a flashable image — the runtime
+# (does k256 fault on lx106's unaligned access?) is a separate on-hardware step.
+[package]
+name = "heartwood-esp8266"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "heartwood-esp8266"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# ESP8266 HAL — bundles the runtime (xtensa-lx-rt 0.12, the maintained shared
+# xtensa runtime, NOT the dead xtensa-lx106-rt 0.1.2), the linker scripts, and
+# the UART/GPIO/timer peripherals. Archived but builds on the `esp` channel.
+esp8266-hal = "0.5"
+# Panic handler for bare metal (halt-on-panic).
+panic-halt = "0.2"
+# Non-blocking I/O helper for the UART read/write loop.
+nb = "1"
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[profile.dev]
+panic = "abort"
+
+# xtensa-lx-rt 0.12.0's esp8266 exception vectors use the old naked-function form
+# `asm!(..., options(noreturn))`, which the modern esp toolchain rejects (E0787 —
+# naked bodies must use `naked_asm!`). The vendored copy applies that one-line-per-
+# site conversion (13 sites, esp8266 only); nothing else is changed.
+[patch.crates-io]
+xtensa-lx-rt = { path = "vendor/xtensa-lx-rt" }

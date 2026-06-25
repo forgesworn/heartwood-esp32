@@ -18,6 +18,9 @@
 //! This module is pure logic — no button, no display, no I/O — so the whole
 //! state machine is unit-tested on the host; the firmware layers the gesture
 //! detector and the OLED on top.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 use bip39::Language;
 

@@ -4,6 +4,9 @@
 // implementations in `nsec-tree/src/validate.ts` and
 // `heartwood-core/src/validate.rs`. Uses `&'static str` errors to stay
 // compatible with the firmware's no-alloc error-reporting style.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 /// Maximum purpose string length in UTF-8 bytes (PROTOCOL.md §3 rule 2).
 const MAX_PURPOSE_BYTES: usize = 255;

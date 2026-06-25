@@ -7,6 +7,9 @@
 // Xtensa firmware where k256's field arithmetic hangs).
 //
 // Only one backend may be active at a time. Activating both is a compile error.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 #[cfg(all(feature = "k256-backend", feature = "secp256k1-backend"))]
 compile_error!("heartwood-common: `k256-backend` and `secp256k1-backend` are mutually exclusive — enable exactly one");

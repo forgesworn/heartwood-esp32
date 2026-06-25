@@ -5,6 +5,9 @@
 // This module is only compiled when the `nip46` feature is enabled.
 // All types derive Serialize/Deserialize directly since serde is guaranteed
 // available when this module is compiled.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

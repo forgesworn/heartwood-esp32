@@ -1,6 +1,9 @@
 // common/src/encoding.rs
 //
 // bech32 npub encoding. Matches heartwood-core byte-for-byte.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 use bech32::{Bech32, Hrp};
 

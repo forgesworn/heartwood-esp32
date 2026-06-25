@@ -1,6 +1,9 @@
 // common/src/types.rs
 //
 // Shared types and constants for heartwood-esp32.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 use zeroize::Zeroize;
 

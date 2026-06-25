@@ -1,6 +1,9 @@
 // common/src/hex.rs
 //
 // Hex encoding utility.
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 const HEX_CHARS: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7',

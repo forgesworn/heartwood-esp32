@@ -14,6 +14,9 @@
 //   - CBC mode without authentication is malleable — no integrity guarantee.
 //   - Both k256 and secp256k1 backends are supported via cfg (same pattern as
 //     nip44.rs and derive.rs).
+#[allow(unused_imports)]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 
 use aes::Aes256;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};

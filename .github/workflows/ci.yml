@@ -133,20 +133,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install the full Espressif Rust toolchain (espup)
+      - name: Install the Espressif Rust toolchain (espup — esp32 + esp32c6)
         run: |
           set -eu
           curl -fL -o espup \
             https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu
           chmod +x espup
-          # Full install (NO --targets): the C6 build needs the nightly-based "esp" Rust
-          # channel that firmware/rust-toolchain.toml pins, because build-std (-Zbuild-std
-          # in firmware/.cargo/config.toml) is nightly-only — riscv-on-stable can't build
-          # `core` from source ("can't find crate for `core`"). `--targets esp32c6` makes
-          # espup skip the esp toolchain (riscv doesn't strictly need the fork); the full
-          # install brings esp nightly Rust + rust-src + the esp LLVM (libclang for bindgen).
-          # esp-idf-sys then fetches esp-idf v5.3.2 + the riscv32-esp-elf gcc at build time.
-          ./espup install --export-file "$HOME/export-esp.sh"
+          # espup ties each piece to a chip, and the C6 build needs two pieces from two
+          # chips: the xtensa chip (esp32) pulls the NIGHTLY-based "esp" Rust toolchain
+          # that firmware/rust-toolchain.toml pins — build-std (-Zbuild-std) is nightly-
+          # only, riscv-on-stable can't build `core` — while the riscv chip (esp32c6)
+          # pulls the riscv32-esp-elf gcc for the secp256k1-sys C FFI. A plain
+          # `espup install` installs only the xtensa gcc (confirmed from CI logs);
+          # `--targets esp32c6` alone skips the esp toolchain. Hence both chips.
+          ./espup install --targets esp32,esp32c6 --export-file "$HOME/export-esp.sh"
       - name: Install ldproxy (esp-idf linker shim)
         run: cargo install ldproxy
       - uses: Swatinem/rust-cache@v2
@@ -162,15 +162,16 @@ jobs:
           MCU: esp32c6
           ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.c6"
         run: |
-          set -eu
+          set -euo pipefail
           . "$HOME/export-esp.sh"
           # espup installs the riscv32-esp-elf gcc but its generated export-esp.sh does
           # not put it on PATH on the CI runner (only LIBCLANG_PATH). secp256k1-sys's cc
           # build needs it (CC_riscv32imac_esp_espidf=riscv32-esp-elf-gcc) — locate the
-          # one espup installed under the esp toolchain dir and add it explicitly.
-          gcc_bin="$(dirname "$(find "$HOME/.rustup" "$HOME/.espressif" -name riscv32-esp-elf-gcc -type f 2>/dev/null | head -1)")"
-          [ -n "$gcc_bin" ] || { echo "::error::riscv32-esp-elf-gcc not found after espup install"; exit 1; }
-          export PATH="$gcc_bin:$PATH"
+          # one espup installed under the esp toolchain dir and add its bin explicitly.
+          # (Check the gcc file path BEFORE dirname: `dirname ""` is ".", not empty.)
+          gcc_path="$(find "$HOME/.rustup" -name riscv32-esp-elf-gcc -type f 2>/dev/null | head -1)"
+          [ -n "$gcc_path" ] || { echo "::error::riscv32-esp-elf-gcc not found after espup install"; exit 1; }
+          export PATH="$(dirname "$gcc_path"):$PATH"
           riscv32-esp-elf-gcc --version | head -1
           cargo build --release --target riscv32imac-esp-espidf --no-default-features --features c6
       - name: App image must fit the C6 3 MB app slot

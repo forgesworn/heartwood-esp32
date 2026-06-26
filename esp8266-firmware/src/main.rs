@@ -6,8 +6,10 @@
 //! ESP32 firmware's serial path.
 //!
 //! Implemented (compiles + links; untested on hardware):
-//!   - `PROVISION` (0x01) / `SET_BRIDGE_SECRET` (0x23) → `ACK`: write the master
-//!     seed / bridge secret to a reserved flash sector (`storage`).
+//!   - `PROVISION` (0x01) → `ACK`: button-gated write of the master seed to a
+//!     reserved flash sector (`storage`) — a compromised host cannot silently
+//!     overwrite the key. `SET_BRIDGE_SECRET` (0x23) → `ACK` pairs the
+//!     bridge-session secret.
 //!   - `SESSION_AUTH` (0x21) → `SESSION_ACK` (0x22): authenticate the bridge.
 //!   - `FIRMWARE_INFO` (0x59) → `0x5A`: version/board.
 //!   - `PROVISION_LIST` (0x05) → `0x07`: report the k256 npub identity.
@@ -15,9 +17,8 @@
 //!     NIP-44 decrypt → NIP-46 dispatch → re-encrypt → sign-kind:24133 path,
 //!     reusing `heartwood-common`. Unknown frames → `NACK` (0x15).
 //!
-//! Known gaps: provisioning has no physical-confirmation gate yet (auto-accept;
-//! the ESP32 requires a button hold) and the NIP-44 nonce RNG needs an entropy
-//! review (see `sign_path::random_nonce`).
+//! Known gaps: the NIP-44 nonce RNG needs an entropy review (see
+//! `sign_path::random_nonce`).
 
 #![no_std]
 #![no_main]
@@ -96,7 +97,7 @@ fn main() -> ! {
                 None => oled.show_lines(&["Heartwood signer", "", "(npub error)"]),
             }
         }
-        None => oled.show_lines(&["Heartwood signer", "", "unprovisioned", "run provision.py"]),
+        None => oled.show_lines(&["Heartwood signer", "", "unprovisioned", "provision over USB"]),
     }
 
     // Box the frame buffers onto the heap — MAX_FRAME (~4 KB each) is too large

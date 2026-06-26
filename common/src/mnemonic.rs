@@ -17,7 +17,6 @@ use alloc::{format, string::{String, ToString}, vec, vec::Vec};
 
 
 use hmac::{Hmac, Mac};
-use secp256k1::{Scalar, SecretKey};
 use sha2::Sha512;
 use zeroize::Zeroizing;
 
@@ -38,8 +37,13 @@ fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
 /// Derive the 32-byte nsec-tree root secret from a BIP-39 mnemonic (+ optional
 /// passphrase) via BIP-39 seed and an all-hardened BIP-32 path.
 pub fn derive_root_secret(mnemonic: &str, passphrase: &str) -> Result<[u8; 32], String> {
-    let parsed: bip39::Mnemonic = mnemonic.parse().map_err(|_| "invalid mnemonic".to_string())?;
-    let seed = Zeroizing::new(parsed.to_seed(passphrase)); // PBKDF2-HMAC-SHA512, 64 bytes
+    // The `_normalized` variants skip bip39's NFKD path — and the huge
+    // unicode-normalization tables it would pull in (they overflow the lx106's
+    // DRAM by ~118 KB). BIP-39 English words are ASCII and heartwood always uses
+    // an empty passphrase, so NFKD is a no-op and the derived key is byte-identical
+    // (verified by the frozen vector test below, under both curve backends).
+    let parsed = bip39::Mnemonic::parse_normalized(mnemonic).map_err(|_| "invalid mnemonic".to_string())?;
+    let seed = Zeroizing::new(parsed.to_seed_normalized(passphrase)); // PBKDF2-HMAC-SHA512, 64 bytes
 
     // BIP-32 master: HMAC-SHA512("Bitcoin seed", seed) → key || chain code.
     let i = Zeroizing::new(hmac_sha512(b"Bitcoin seed", seed.as_ref()));
@@ -56,12 +60,9 @@ pub fn derive_root_secret(mnemonic: &str, passphrase: &str) -> Result<[u8; 32], 
         let i = Zeroizing::new(hmac_sha512(&chain, &data));
 
         let il: [u8; 32] = i[0..32].try_into().unwrap();
-        let parent = SecretKey::from_slice(&key).map_err(|e| format!("BIP-32 parent key: {e}"))?;
-        let tweak = Scalar::from_be_bytes(il).map_err(|_| "BIP-32 I_L out of range".to_string())?;
-        let child = parent
-            .add_tweak(&tweak)
-            .map_err(|e| format!("BIP-32 child key: {e}"))?;
-        key = child.secret_bytes();
+        // (parse256(I_L) + key) mod n, via whichever curve backend is active —
+        // byte-identical to the secp256k1 path the WiFi firmware uses.
+        key = crate::derive::backend::tweak_add(&key, &il).map_err(|e| e.to_string())?;
         chain.copy_from_slice(&i[32..64]);
     }
 

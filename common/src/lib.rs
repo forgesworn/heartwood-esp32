@@ -31,8 +31,8 @@ pub mod net_config;
 
 pub mod mgmt;
 
-#[cfg(feature = "mnemonic-gen")]
+#[cfg(feature = "mnemonic")]
 pub mod mnemonic;
 
-#[cfg(feature = "mnemonic-gen")]
+#[cfg(feature = "mnemonic")]
 pub mod restore;

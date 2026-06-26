@@ -54,6 +54,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen
 
+  # The host-side provisioning CLI (provision/) — the offline, air-gapped key
+  # tool (restore from phrase/nsec, generate, pair the bridge secret). Build +
+  # test it on the host so this security-critical path can't silently break.
+  # `+stable` (not the repo's `esp` channel); serialport needs libudev on Linux.
+  provision-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - run: cargo +stable test --manifest-path provision/Cargo.toml
+
   # Real firmware build for every Xtensa esp-idf board, plus the app-slot fit
   # check that has bitten us before (heavy crypto crates / opt level overflow the
   # slot). heltec-v3/v4 are ESP32-S3 (2 MB ota_0); the T-Display is the classic

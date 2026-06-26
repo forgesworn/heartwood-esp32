@@ -134,6 +134,8 @@ fn dispatch(
         "connect" => nip46::build_connect_response(&req.id).ok(),
         "ping" => nip46::build_ping_response(&req.id).ok(),
         "sign_event" => sign_event(&req, seed, mode, master_pubkey_hex, &ctx, oled),
+        "nip44_encrypt" => nip44_encrypt(&req, seed, mode, &ctx),
+        "nip44_decrypt" => nip44_decrypt(&req, seed, mode, &ctx),
         "heartwood_derive_persona" => derive_persona(&req, seed, mode, cache),
         "heartwood_derive" => derive_purpose(&req, seed, mode, cache),
         "heartwood_switch" => switch(&req, master_pk, cache, sessions, client_pk),
@@ -210,6 +212,95 @@ fn sign_event(
     };
     oled.show_status("signed");
     nip46::build_sign_response(&req.id, &signed).ok()
+}
+
+/// Resolve `(signing secret, peer x-only pubkey)` for a NIP-44 encrypt/decrypt.
+/// The secret is the *active* identity's (master, or the switched-to / explicit
+/// persona) — exactly like `sign_event` — so a DM uses whichever identity the
+/// client is acting as. `params[0]` is the 64-hex peer pubkey.
+fn resolve_secret_and_peer(
+    req: &Nip46Request,
+    seed: &[u8; 32],
+    mode: u8,
+    ctx: &Option<(String, u32)>,
+) -> Result<([u8; 32], [u8; 32]), &'static str> {
+    let peer_hex = req
+        .params
+        .first()
+        .and_then(|v| v.as_str())
+        .ok_or("requires [peer_pubkey, payload]")?;
+    let peer_bytes =
+        heartwood_common::hex::hex_decode(peer_hex).map_err(|_| "peer pubkey must be hex")?;
+    if peer_bytes.len() != 32 {
+        return Err("peer pubkey must be 32 bytes");
+    }
+    let mut peer = [0u8; 32];
+    peer.copy_from_slice(&peer_bytes);
+
+    let secret = match ctx {
+        None => *seed,
+        Some((purpose, index)) => {
+            identity::derive_signing(seed, mode, purpose, *index).ok_or("derivation failed")?.0
+        }
+    };
+    Ok((secret, peer))
+}
+
+/// `nip44_encrypt` — `[peer_pubkey, plaintext]` → NIP-44 ciphertext to the peer,
+/// under the active identity. The per-message nonce is the deterministic
+/// `synthetic_nonce` (no hardware RNG), so encrypting the same plaintext to the
+/// same peer is repeatable — the documented trade-off for a radio-off signer.
+#[inline(never)]
+fn nip44_encrypt(
+    req: &Nip46Request,
+    seed: &[u8; 32],
+    mode: u8,
+    ctx: &Option<(String, u32)>,
+) -> Option<String> {
+    let (secret, peer) = match resolve_secret_and_peer(req, seed, mode, ctx) {
+        Ok(v) => v,
+        Err(e) => return nip46::build_error_response(&req.id, -3, e).ok(),
+    };
+    let plaintext = match req.params.get(1).and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return nip46::build_error_response(&req.id, -3, "requires [peer_pubkey, plaintext]").ok(),
+    };
+    let ck = match nip44::get_conversation_key(&secret, &peer) {
+        Ok(k) => k,
+        Err(_) => return nip46::build_error_response(&req.id, -4, "conversation key failed").ok(),
+    };
+    let nonce = synthetic_nonce(&secret, &peer, plaintext);
+    match nip44::encrypt(&ck, plaintext, &nonce) {
+        Ok(ct) => nip46::build_result_response(&req.id, &ct).ok(),
+        Err(_) => nip46::build_error_response(&req.id, -4, "encryption failed").ok(),
+    }
+}
+
+/// `nip44_decrypt` — `[peer_pubkey, ciphertext]` → plaintext, under the active
+/// identity. No nonce needed (it travels in the NIP-44 payload).
+#[inline(never)]
+fn nip44_decrypt(
+    req: &Nip46Request,
+    seed: &[u8; 32],
+    mode: u8,
+    ctx: &Option<(String, u32)>,
+) -> Option<String> {
+    let (secret, peer) = match resolve_secret_and_peer(req, seed, mode, ctx) {
+        Ok(v) => v,
+        Err(e) => return nip46::build_error_response(&req.id, -3, e).ok(),
+    };
+    let ciphertext = match req.params.get(1).and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return nip46::build_error_response(&req.id, -3, "requires [peer_pubkey, ciphertext]").ok(),
+    };
+    let ck = match nip44::get_conversation_key(&secret, &peer) {
+        Ok(k) => k,
+        Err(_) => return nip46::build_error_response(&req.id, -4, "conversation key failed").ok(),
+    };
+    match nip44::decrypt(&ck, ciphertext) {
+        Ok(pt) => nip46::build_result_response(&req.id, &pt).ok(),
+        Err(_) => nip46::build_error_response(&req.id, -4, "decryption failed").ok(),
+    }
 }
 
 /// `heartwood_derive_persona` — derive (and cache) the child at the reserved
@@ -329,24 +420,27 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// A deterministic 32-byte NIP-44 nonce, derived from the master secret instead
-/// of the hardware RNG.
+/// A deterministic 32-byte NIP-44 nonce, derived from the signing secret instead
+/// of the hardware RNG. Used both for the response envelope and for
+/// `nip44_encrypt` (keyed by whichever identity is active).
 ///
 /// The ESP8266's `WDEV_RAND` register (0x3FF20E44) is only well-seeded when the
 /// RF/Wi-Fi hardware is active; a USB-tethered (radio-off) signer cannot rely on
-/// it, and a repeated NIP-44 nonce is catastrophic. So we synthesise the nonce as
-/// `HMAC-SHA256(seed; tag || client_pk || plaintext)`:
-/// - keyed by the secret seed → unpredictable to anyone without the key;
-/// - bound to the conversation (`client_pk`) and the message (`plaintext`) → a
-///   fresh nonce whenever either differs. An identical (peer, plaintext) re-encrypts
-///   to the same ciphertext, which leaks nothing new (it is the same plaintext).
+/// it, and a repeated NIP-44 nonce under the same conversation key is
+/// catastrophic. So we synthesise the nonce as
+/// `HMAC-SHA256(secret; tag || peer_pk || plaintext)`:
+/// - keyed by the signing secret → unpredictable to anyone without the key;
+/// - bound to the peer (`peer_pk`) and the message (`plaintext`) → a fresh nonce
+///   whenever either differs, so two *different* plaintexts never share a nonce.
+///   An identical (peer, plaintext) re-encrypts to the same ciphertext, which
+///   leaks nothing new (it is the same plaintext).
 ///
 /// Signing needs no RNG either — see `crypto::sign` (`aux_rand = 0`). So no part
 /// of the security-critical path depends on the unreliable hardware RNG.
-fn synthetic_nonce(seed: &[u8; 32], client_pk: &[u8; 32], plaintext: &str) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256>>::new_from_slice(seed).expect("HMAC accepts any key length");
+fn synthetic_nonce(secret: &[u8; 32], peer_pk: &[u8; 32], plaintext: &str) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(b"heartwood-nip44-nonce-v1");
-    mac.update(client_pk);
+    mac.update(peer_pk);
     mac.update(plaintext.as_bytes());
     let mut nonce = [0u8; 32];
     nonce.copy_from_slice(&mac.finalize().into_bytes());

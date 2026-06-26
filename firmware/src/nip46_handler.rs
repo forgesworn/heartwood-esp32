@@ -597,11 +597,15 @@ fn do_sign(
         }
     };
 
-    // NIP-46 spec: the signer owns the identity. Fill pubkey when the client
-    // omits it from the template (which is the correct convention).
-    if event.pubkey.is_empty() {
-        event.pubkey = hex_pubkey.clone();
-    }
+    // NIP-46 spec: the signer owns the identity, so ALWAYS stamp the resolved
+    // signer's pubkey onto the template before hashing — never trust a
+    // client-supplied value. A pubkey that disagreed with the signer (reachable
+    // now that personas exist: the client sends the master while we resolve a
+    // persona) would otherwise be hashed into the event id while the returned
+    // event reports `hex_pubkey`, yielding an id that fails NIP-01 verification.
+    // Overwriting guarantees id, pubkey and sig all agree. Matches the esp8266
+    // signer, which already overwrites unconditionally (sign_path.rs).
+    event.pubkey = hex_pubkey.clone();
 
     let event_id_bytes = nip46::compute_event_id(event);
 

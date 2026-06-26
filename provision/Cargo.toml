@@ -17,3 +17,5 @@ sha2 = "0.10"
 rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
+# OS entropy for the `generate` subcommand (fresh BIP-39 words on an offline host).
+getrandom = "0.2"

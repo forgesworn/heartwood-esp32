@@ -16,11 +16,13 @@ use zeroize::Zeroize;
 
 use heartwood_common::derive::create_tree_root;
 use heartwood_common::frame;
+use heartwood_common::hex::hex_encode;
 use heartwood_common::policy::ClientPolicy;
 use heartwood_common::types::{
     FRAME_TYPE_ACK, FRAME_TYPE_NACK, FRAME_TYPE_POLICY_LIST_REQUEST,
     FRAME_TYPE_POLICY_LIST_RESPONSE, FRAME_TYPE_POLICY_REVOKE, FRAME_TYPE_POLICY_UPDATE,
-    FRAME_TYPE_PROVISION, MNEMONIC_PATH,
+    FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_LIST_RESPONSE,
+    FRAME_TYPE_SET_BRIDGE_SECRET, MNEMONIC_PATH,
 };
 
 #[derive(Parser)]
@@ -41,7 +43,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Provision a master secret onto the device
+    /// Provision an EXISTING master secret onto the device (restore from a
+    /// recovery phrase or nsec). RUN OFFLINE — the key must never touch a
+    /// networked machine. The secret is read interactively, never from argv.
     Provision {
         /// Label for this master (e.g. "primary")
         #[arg(short, long, default_value = "default")]
@@ -50,6 +54,36 @@ enum Command {
         /// Provisioning mode: tree-mnemonic (default), tree-nsec, bunker
         #[arg(short, long, default_value = "tree-mnemonic")]
         mode: String,
+
+        /// Also pair this 32-byte bridge secret (64 hex) with the device.
+        #[arg(long)]
+        bridge_secret: Option<String>,
+
+        /// Generate a fresh bridge secret, set it on the device, and print it
+        /// (put the printed value in the bridge daemon's bridge.secret file).
+        #[arg(long)]
+        gen_bridge_secret: bool,
+    },
+
+    /// Generate a FRESH key on this (offline) host, show the recovery phrase to
+    /// write down, then provision it. The phrase is shown once and never written
+    /// to disk. RUN OFFLINE.
+    Generate {
+        /// Label for this master (e.g. "primary")
+        #[arg(short, long, default_value = "default")]
+        label: String,
+
+        /// Recovery phrase length: 12 (128-bit) or 24 (256-bit).
+        #[arg(long, default_value_t = 12)]
+        words: u8,
+
+        /// Also pair this 32-byte bridge secret (64 hex) with the device.
+        #[arg(long)]
+        bridge_secret: Option<String>,
+
+        /// Generate a fresh bridge secret, set it on the device, and print it.
+        #[arg(long)]
+        gen_bridge_secret: bool,
     },
 
     /// List TOFU-approved clients for a master slot
@@ -284,6 +318,18 @@ fn build_provision_frame(secret: &[u8; 32], label: &str, mode: &str) -> Vec<u8> 
     }
 }
 
+/// Build a SET_BRIDGE_SECRET frame (payload = the 32-byte secret).
+fn build_set_bridge_secret_frame(secret: &[u8; 32]) -> Vec<u8> {
+    frame::build_frame(FRAME_TYPE_SET_BRIDGE_SECRET, secret)
+        .expect("bridge-secret frame should never exceed max payload")
+}
+
+/// Build a PROVISION_LIST frame (empty payload) — asks the device for its identity.
+fn build_provision_list_frame() -> Vec<u8> {
+    frame::build_frame(FRAME_TYPE_PROVISION_LIST, &[])
+        .expect("provision-list frame should never exceed max payload")
+}
+
 /// Build a POLICY_LIST_REQUEST frame.
 fn build_policy_list_frame(master_slot: u8) -> Vec<u8> {
     frame::build_frame(FRAME_TYPE_POLICY_LIST_REQUEST, &[master_slot])
@@ -313,7 +359,111 @@ fn build_policy_update_frame(master_slot: u8, policy: &ClientPolicy) -> Vec<u8> 
 // Subcommand handlers
 // ---------------------------------------------------------------------------
 
-fn handle_provision(port_name: &str, baud: u32, label: &str, mode: &str) {
+/// Decode a 64-char hex string into 32 bytes.
+fn decode_hex32(hex: &str) -> Result<[u8; 32], String> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return Err(format!("expected 64 hex chars, got {}", hex.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "invalid hex".to_string())?;
+    }
+    Ok(out)
+}
+
+/// Resolve the bridge secret from the CLI flags: an explicit `--bridge-secret`
+/// hex, or a freshly generated one (`--gen-bridge-secret`, printed so the
+/// operator can copy it into the bridge daemon's `bridge.secret` file), or none.
+fn resolve_bridge_secret(bridge_secret: &Option<String>, gen: bool) -> Option<[u8; 32]> {
+    if bridge_secret.is_some() && gen {
+        eprintln!("Pass only one of --bridge-secret / --gen-bridge-secret.");
+        std::process::exit(1);
+    }
+    if let Some(hex) = bridge_secret {
+        Some(decode_hex32(hex).unwrap_or_else(|e| {
+            eprintln!("invalid --bridge-secret: {e}");
+            std::process::exit(1);
+        }))
+    } else if gen {
+        let mut s = [0u8; 32];
+        getrandom::getrandom(&mut s).expect("OS entropy for bridge secret");
+        println!("\nGenerated bridge secret — put this in the bridge daemon's bridge.secret file:");
+        println!("  {}\n", hex_encode(&s));
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// Send the derived root to the device, optionally pair a bridge secret, and
+/// read the npub back to confirm. Zeroises `root_secret` before opening the port.
+fn finish_provisioning(
+    port_name: &str,
+    baud: u32,
+    root_secret: &mut [u8; 32],
+    label: &str,
+    mode: &str,
+    bridge_secret: Option<[u8; 32]>,
+    expected_npub: &str,
+) {
+    let frame_bytes = build_provision_frame(root_secret, label, mode);
+    root_secret.zeroize();
+
+    println!("\n⚠  Run this on an OFFLINE computer — the key must never touch a networked machine.");
+    println!("Opening {port_name}...");
+    let mut port = open_serial(port_name, baud);
+
+    println!("Waiting for device...");
+    std::thread::sleep(Duration::from_secs(4));
+
+    println!("Hold the device's button to approve the new key when it prompts...");
+    let response = send_and_receive(&mut *port, &frame_bytes, FRAME_TYPE_ACK);
+    if response.frame_type != FRAME_TYPE_ACK {
+        eprintln!("Device rejected the seed (NACK, or the button was not held in time).");
+        std::process::exit(1);
+    }
+    println!("✓ Seed provisioned (master '{label}').");
+
+    if let Some(mut bs) = bridge_secret {
+        let bs_frame = build_set_bridge_secret_frame(&bs);
+        bs.zeroize();
+        println!("Pairing the bridge secret...");
+        let r = send_and_receive(&mut *port, &bs_frame, FRAME_TYPE_ACK);
+        if r.frame_type != FRAME_TYPE_ACK {
+            eprintln!("Device rejected the bridge secret.");
+            std::process::exit(1);
+        }
+        println!("✓ Bridge secret paired.");
+    }
+
+    // Read the device's identity back to confirm it matches what we derived.
+    let r = send_and_receive(
+        &mut *port,
+        &build_provision_list_frame(),
+        FRAME_TYPE_PROVISION_LIST_RESPONSE,
+    );
+    if r.frame_type == FRAME_TYPE_PROVISION_LIST_RESPONSE {
+        let npub = serde_json::from_slice::<serde_json::Value>(&r.payload).ok().and_then(|v| {
+            v.get(0).and_then(|m| m.get("npub")).and_then(|n| n.as_str()).map(String::from)
+        });
+        match npub.as_deref() {
+            Some(n) if n == expected_npub => println!("✓ Device confirms identity: {n}"),
+            Some(n) => eprintln!("⚠ Device reports {n}, but we derived {expected_npub} — mismatch!"),
+            None => eprintln!("⚠ Could not read the device's identity back to confirm."),
+        }
+    }
+}
+
+fn handle_provision(
+    port_name: &str,
+    baud: u32,
+    label: &str,
+    mode: &str,
+    bridge_secret: &Option<String>,
+    gen_bridge_secret: bool,
+) {
     let mut root_secret = match mode {
         "bunker" => {
             let nsec = rpassword::prompt_password("Enter nsec (nsec1...): ")
@@ -343,7 +493,8 @@ fn handle_provision(port_name: &str, baud: u32, label: &str, mode: &str) {
     };
 
     let root = create_tree_root(&root_secret).expect("invalid root secret");
-    println!("Pubkey: {}", root.master_npub);
+    let npub = root.master_npub.clone();
+    println!("Pubkey: {npub}");
     root.destroy();
 
     print!("Send to device? [y/N]: ");
@@ -356,29 +507,57 @@ fn handle_provision(port_name: &str, baud: u32, label: &str, mode: &str) {
         return;
     }
 
-    let frame_bytes = build_provision_frame(&root_secret, label, mode);
-    root_secret.zeroize();
+    let bridge = resolve_bridge_secret(bridge_secret, gen_bridge_secret);
+    finish_provisioning(port_name, baud, &mut root_secret, label, mode, bridge, &npub);
+}
 
-    println!("Opening {}...", port_name);
-    let mut port = open_serial(port_name, baud);
-
-    println!("Waiting for device...");
-    std::thread::sleep(Duration::from_secs(4));
-
-    println!("Sending...");
-    let response = send_and_receive(&mut *port, &frame_bytes, FRAME_TYPE_ACK);
-
-    match response.frame_type {
-        FRAME_TYPE_ACK => println!("ACK received. Master '{}' provisioned.", label),
-        FRAME_TYPE_NACK => {
-            eprintln!("NACK received -- device rejected the provision (CRC error or NVS write failure).");
+fn handle_generate(
+    port_name: &str,
+    baud: u32,
+    label: &str,
+    words: u8,
+    bridge_secret: &Option<String>,
+    gen_bridge_secret: bool,
+) {
+    let entropy_len = match words {
+        12 => 16,
+        24 => 32,
+        n => {
+            eprintln!("--words must be 12 or 24, got {n}");
             std::process::exit(1);
         }
-        other => {
-            eprintln!("Unexpected frame type: 0x{:02x}", other);
-            std::process::exit(1);
-        }
+    };
+    let mut entropy = vec![0u8; entropy_len];
+    getrandom::getrandom(&mut entropy).expect("OS entropy for key generation");
+    let mnemonic = bip39::Mnemonic::from_entropy(&entropy).expect("entropy -> mnemonic");
+    entropy.zeroize();
+    let phrase = mnemonic.to_string();
+
+    println!("\n========================================================");
+    println!("  WRITE THESE {words} WORDS DOWN — they are the ONLY backup of");
+    println!("  this key. Do NOT photograph them or store them on any");
+    println!("  networked computer. Anyone with them controls the signer.");
+    println!("========================================================\n");
+    for (i, w) in phrase.split_whitespace().enumerate() {
+        println!("  {:>2}. {w}", i + 1);
     }
+    print!("\nType 'yes' once you have written them down: ");
+    io::stdout().flush().unwrap();
+    let mut confirm = String::new();
+    io::stdin().read_line(&mut confirm).unwrap();
+    if confirm.trim().to_lowercase() != "yes" {
+        println!("Aborted — nothing was provisioned.");
+        return;
+    }
+
+    let mut root_secret = derive_root_secret(&phrase, "").expect("derivation failed");
+    let root = create_tree_root(&root_secret).expect("invalid root secret");
+    let npub = root.master_npub.clone();
+    println!("\nPubkey: {npub}");
+    root.destroy();
+
+    let bridge = resolve_bridge_secret(bridge_secret, gen_bridge_secret);
+    finish_provisioning(port_name, baud, &mut root_secret, label, "tree-mnemonic", bridge, &npub);
 }
 
 fn handle_list_clients(port_name: &str, baud: u32, master_slot: u8) {
@@ -520,8 +699,11 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Command::Provision { label, mode } => {
-            handle_provision(&cli.port, cli.baud, label, mode);
+        Command::Provision { label, mode, bridge_secret, gen_bridge_secret } => {
+            handle_provision(&cli.port, cli.baud, label, mode, bridge_secret, *gen_bridge_secret);
+        }
+        Command::Generate { label, words, bridge_secret, gen_bridge_secret } => {
+            handle_generate(&cli.port, cli.baud, label, *words, bridge_secret, *gen_bridge_secret);
         }
         Command::ListClients { master_slot } => {
             handle_list_clients(&cli.port, cli.baud, *master_slot);

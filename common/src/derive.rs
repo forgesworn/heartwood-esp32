@@ -231,6 +231,74 @@ mod tests {
         );
     }
 
+    /// Persona derivation as the signers actually build it: a persona is the
+    /// child at `format!("nostr:persona:{name}")`. Anchors "social"/0 to the
+    /// frozen Vector 6 npub, then proves distinct names derive distinct keys —
+    /// guarding against a derivation change that stopped binding the persona
+    /// name into the HMAC context (which would collide every persona).
+    #[test]
+    fn persona_names_derive_distinct_anchored_keys() {
+        let tree_root: [u8; 32] = [
+            0xcc, 0x92, 0xd2, 0x13, 0xb5, 0xec, 0xcd, 0x19,
+            0xeb, 0x85, 0xc1, 0x2c, 0x2c, 0xf6, 0xfd, 0x16,
+            0x8f, 0x27, 0xc2, 0xcc, 0x34, 0x7c, 0x51, 0xa7,
+            0xc4, 0xc6, 0x2a, 0xc6, 0x77, 0x95, 0xfc, 0x65,
+        ];
+        let root = create_tree_root(&tree_root).unwrap();
+        let persona = |name: &str, index: u32| {
+            derive(&root, &format!("nostr:persona:{name}"), index).unwrap().npub
+        };
+
+        assert_eq!(
+            persona("social", 0),
+            "npub1qdztfxg9z46k8qg4707n747y9rt7kl3f954lju2pneesmc3ypf2q83gm0e",
+            "the device's persona purpose format drifted from Vector 6",
+        );
+
+        let names = ["social", "work", "private", "dev"];
+        let mut npubs: Vec<String> = names.iter().map(|n| persona(n, 0)).collect();
+        npubs.sort();
+        npubs.dedup();
+        assert_eq!(npubs.len(), names.len(), "persona names must derive distinct keys");
+    }
+
+    /// The index is bound into derivation: the same persona at different indices
+    /// must differ, and re-deriving a given (purpose, index) is deterministic.
+    /// Guards against `build_context` dropping the index.
+    #[test]
+    fn persona_index_is_bound_and_deterministic() {
+        let root = create_tree_root(&[0x42u8; 32]).unwrap();
+        let at = |i: u32| derive(&root, "nostr:persona:social", i).unwrap().npub;
+        assert_ne!(at(0), at(1), "index must change the derived key");
+        assert_ne!(at(1), at(2));
+        assert_eq!(at(0), derive(&root, "nostr:persona:social", 0).unwrap().npub);
+    }
+
+    /// Bunker (tree-nsec) mode: the device stores a raw nsec and HMACs it to a
+    /// tree root on demand (`nsec_to_tree_root`), then derives personas from THAT
+    /// root. A persona via this path must be stable across re-derivation and
+    /// bound to the master — the same persona name from a different root is a
+    /// different key.
+    #[test]
+    fn tree_nsec_persona_path_is_stable_and_master_bound() {
+        let nsec = [0x01u8; 32];
+        let root = create_tree_root(&nsec_to_tree_root(&nsec).unwrap()).unwrap();
+        let a = derive(&root, "nostr:persona:social", 0).unwrap().npub;
+
+        // Stable: the same nsec → the same persona npub.
+        let root2 = create_tree_root(&nsec_to_tree_root(&nsec).unwrap()).unwrap();
+        assert_eq!(a, derive(&root2, "nostr:persona:social", 0).unwrap().npub);
+
+        // Master-bound: the same persona name from the mnemonic-vector root differs.
+        let other = create_tree_root(&[
+            0xcc, 0x92, 0xd2, 0x13, 0xb5, 0xec, 0xcd, 0x19,
+            0xeb, 0x85, 0xc1, 0x2c, 0x2c, 0xf6, 0xfd, 0x16,
+            0x8f, 0x27, 0xc2, 0xcc, 0x34, 0x7c, 0x51, 0xa7,
+            0xc4, 0xc6, 0x2a, 0xc6, 0x77, 0x95, 0xfc, 0x65,
+        ]).unwrap();
+        assert_ne!(a, derive(&other, "nostr:persona:social", 0).unwrap().npub);
+    }
+
     /// nsec-to-tree-root HMAC vector — must match PROTOCOL.md §6.1 Vector 1
     /// and the reference implementations in nsec-tree and heartwood-core.
     #[test]

@@ -18,9 +18,6 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, Nip46Request, SignedEvent, UnsignedEvent};
 use heartwood_common::validate::validate_persona_name;
@@ -78,7 +75,7 @@ pub fn handle(
 
     // 3. Re-encrypt the response under the same conversation key, with a
     //    synthetic (deterministic) nonce — no reliance on the hardware RNG.
-    let nonce = synthetic_nonce(seed, &client_pk, &response_json);
+    let nonce = nip44::synthetic_nonce(seed, &client_pk, &response_json);
     let response_ct = nip44::encrypt(&ck, &response_json, &nonce).ok()?;
 
     // 4. Build & sign the kind:24133 envelope (author = master, p-tag = client).
@@ -269,7 +266,7 @@ fn nip44_encrypt(
         Ok(k) => k,
         Err(_) => return nip46::build_error_response(&req.id, -4, "conversation key failed").ok(),
     };
-    let nonce = synthetic_nonce(&secret, &peer, plaintext);
+    let nonce = nip44::synthetic_nonce(&secret, &peer, plaintext);
     match nip44::encrypt(&ck, plaintext, &nonce) {
         Ok(ct) => nip46::build_result_response(&req.id, &ct).ok(),
         Err(_) => nip46::build_error_response(&req.id, -4, "encryption failed").ok(),
@@ -418,31 +415,4 @@ fn hex_lower(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
-}
-
-/// A deterministic 32-byte NIP-44 nonce, derived from the signing secret instead
-/// of the hardware RNG. Used both for the response envelope and for
-/// `nip44_encrypt` (keyed by whichever identity is active).
-///
-/// The ESP8266's `WDEV_RAND` register (0x3FF20E44) is only well-seeded when the
-/// RF/Wi-Fi hardware is active; a USB-tethered (radio-off) signer cannot rely on
-/// it, and a repeated NIP-44 nonce under the same conversation key is
-/// catastrophic. So we synthesise the nonce as
-/// `HMAC-SHA256(secret; tag || peer_pk || plaintext)`:
-/// - keyed by the signing secret → unpredictable to anyone without the key;
-/// - bound to the peer (`peer_pk`) and the message (`plaintext`) → a fresh nonce
-///   whenever either differs, so two *different* plaintexts never share a nonce.
-///   An identical (peer, plaintext) re-encrypts to the same ciphertext, which
-///   leaks nothing new (it is the same plaintext).
-///
-/// Signing needs no RNG either — see `crypto::sign` (`aux_rand = 0`). So no part
-/// of the security-critical path depends on the unreliable hardware RNG.
-fn synthetic_nonce(secret: &[u8; 32], peer_pk: &[u8; 32], plaintext: &str) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256>>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(b"heartwood-nip44-nonce-v1");
-    mac.update(peer_pk);
-    mac.update(plaintext.as_bytes());
-    let mut nonce = [0u8; 32];
-    nonce.copy_from_slice(&mac.finalize().into_bytes());
-    nonce
 }

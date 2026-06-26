@@ -52,7 +52,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Pass 1 — secp256k1 backend (the firmware's curve) + BIP-39 mnemonic/derive.
       - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen
+      # Pass 2 — k256 backend with the full data-plane crypto. Without this the
+      # nip44/nip46/nip04/backup modules stay feature-gated OFF, so their tests
+      # (the official NIP-44 vectors, NIP-04 round-trips, the synthetic nonce)
+      # never run anywhere in CI.
+      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04
 
   # The host-side provisioning CLI (provision/) — the offline, air-gapped key
   # tool (restore from phrase/nsec, generate, pair the bridge secret). Build +

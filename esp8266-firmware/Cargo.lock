@@ -464,12 +464,10 @@ dependencies = [
  "embedded-hal",
  "esp8266-hal",
  "heartwood-common",
- "hmac",
  "k256",
  "nb 1.1.0",
  "panic-halt",
  "serde_json",
- "sha2",
  "ssd1306",
  "xtensa-lx",
 ]

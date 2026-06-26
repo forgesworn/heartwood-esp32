@@ -334,6 +334,43 @@ pub fn decrypt(
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic (synthetic) nonce
+// ---------------------------------------------------------------------------
+
+/// A deterministic 32-byte NIP-44 nonce, derived from the signing secret instead
+/// of a hardware RNG:
+///
+/// ```text
+/// synthetic_nonce = HMAC-SHA256(secret; "heartwood-nip44-nonce-v1" || peer_pk || plaintext)
+/// ```
+///
+/// This exists for radio-off signers that have no trustworthy entropy source —
+/// e.g. the ESP8266, whose `WDEV_RAND` register (0x3FF20E44) is only well-seeded
+/// while the RF/Wi-Fi hardware is active. A repeated NIP-44 nonce under the same
+/// conversation key is catastrophic, so the nonce is synthesised to be:
+///
+/// - **keyed by the signing secret** → unpredictable to anyone without the key;
+/// - **bound to the peer and the message** → the nonce changes whenever either
+///   `peer_pk` or `plaintext` differs, so two *different* messages never share a
+///   nonce. An identical `(peer_pk, plaintext)` re-encrypts to the same
+///   ciphertext, which leaks nothing new (it is the same plaintext).
+///
+/// Schnorr signing needs no RNG either (BIP-340 with `aux_rand = 0`), so no part
+/// of the security-critical path depends on an unreliable hardware RNG.
+///
+/// `peer_pk` is treated as opaque bytes — this function does no curve validation
+/// (the caller pairs it with [`get_conversation_key`], which does).
+pub fn synthetic_nonce(secret: &[u8; 32], peer_pk: &[u8; 32], plaintext: &str) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(b"heartwood-nip44-nonce-v1");
+    mac.update(peer_pk);
+    mac.update(plaintext.as_bytes());
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&mac.finalize().into_bytes());
+    nonce
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -373,6 +410,87 @@ mod tests {
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
             0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
         ]
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // ---- synthetic_nonce: deterministic NIP-44 nonce for radio-off signers ----
+
+    #[test]
+    fn synthetic_nonce_is_deterministic() {
+        let secret = alice_secret();
+        let peer = [0x22u8; 32];
+        assert_eq!(
+            synthetic_nonce(&secret, &peer, "gm"),
+            synthetic_nonce(&secret, &peer, "gm"),
+            "same (secret, peer, plaintext) must yield the same nonce",
+        );
+    }
+
+    #[test]
+    fn synthetic_nonce_binds_all_three_inputs() {
+        // peer_pk is opaque to the function, so raw byte arrays suffice here.
+        let secret = alice_secret();
+        let peer = [0x22u8; 32];
+        let base = synthetic_nonce(&secret, &peer, "gm");
+
+        assert_ne!(
+            base,
+            synthetic_nonce(&bob_secret(), &peer, "gm"),
+            "nonce must change when the signing secret changes",
+        );
+        assert_ne!(
+            base,
+            synthetic_nonce(&secret, &[0x33u8; 32], "gm"),
+            "nonce must change when the peer changes",
+        );
+        assert_ne!(
+            base,
+            synthetic_nonce(&secret, &peer, "gn"),
+            "nonce must change when the plaintext changes",
+        );
+    }
+
+    #[test]
+    fn synthetic_nonce_distinct_plaintexts_never_collide() {
+        // THE security property: distinct messages to the same peer, under the
+        // same key, must never share a nonce — NIP-44 nonce reuse is catastrophic.
+        let secret = alice_secret();
+        let peer = [0x22u8; 32];
+        let messages = ["a", "b", "gm", "gm ", " gm", "hello world", "héllo"];
+        let mut seen: Vec<[u8; 32]> = Vec::new();
+        for m in messages {
+            let n = synthetic_nonce(&secret, &peer, m);
+            assert!(!seen.contains(&n), "nonce collision across distinct plaintexts at {m:?}");
+            seen.push(n);
+        }
+    }
+
+    #[test]
+    fn synthetic_nonce_round_trips_through_nip44() {
+        // End-to-end: a ciphertext sealed with the synthetic nonce decrypts back.
+        let alice_sk = alice_secret();
+        let bob_pk = pubkey_for(&bob_secret());
+        let ck = get_conversation_key(&alice_sk, &bob_pk).unwrap();
+        let plaintext = "the quick brown fox";
+        let nonce = synthetic_nonce(&alice_sk, &bob_pk, plaintext);
+        let ciphertext = encrypt(&ck, plaintext, &nonce).unwrap();
+        assert_eq!(decrypt(&ck, &ciphertext).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn synthetic_nonce_known_answer() {
+        // Frozen vector — fixed inputs (no key derivation, backend-independent) so
+        // a refactor that alters the tag string or field order is caught here.
+        // secret = alice_secret(), peer = [0x11; 32], plaintext = "gm".
+        let nonce = synthetic_nonce(&alice_secret(), &[0x11u8; 32], "gm");
+        assert_eq!(
+            hex(&nonce),
+            "c94912708371ed7f7d1fe5245e31626f5659cd1a2eb99ae8d0b721834b5b812e",
+            "synthetic_nonce construction changed — update only if intentional",
+        );
     }
 
     // ------------------------------------------------------------------

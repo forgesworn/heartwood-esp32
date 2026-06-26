@@ -7,6 +7,9 @@ the firmware builds and fits; this covers everything CI can't reach.
 Use a Heltec WiFi LoRa 32 V4. Have Sapwood open (Chrome/Edge for Web Serial).
 Where a step says "approve on the device", that's a 2-second hold of **PRG**.
 
+Sections 1–5 are the WiFi signer (Heltec V4); **§6 is the USB-tethered ESP8266**
+(NodeMCU+OLED) — a different device and flow, with its own board and gestures.
+
 ## 1. Flash + first identity (generate)
 
 - [ ] Flash from Sapwood (Flash tab). Board reboots into the boot animation.
@@ -92,6 +95,72 @@ choice), a **single tap accepts it**.
 - [ ] The **operator phrase** (shown in Sapwood at flash time) and the **device
       recovery phrase** (shown on the device's screen) are different 12-word sets.
       Confirm the Flash screen calls this out so they aren't conflated.
+
+## 6. ESP8266 tethered signer (first-flash bench pass)
+
+A different device and flow from §1–5: the ESP8266 has no WiFi and no on-device
+key generation. It is flashed with public firmware, provisioned **offline** over
+USB (`heartwood-provision`, or the Sapwood tethered wizard), and reaches Nostr
+only through a `heartwood-bridge` daemon. Use the NodeMCU+OLED (CH340) board.
+
+The boot **POST is the critical gate** — it recomputes a frozen pubkey/sig/persona
+vector on the real lx106 and refuses to run if k256 is byte-wrong. If §6.2 passes,
+the bare-metal crypto is proven and everything after is plumbing.
+
+### 6.1 Flash (online OK — public firmware)
+
+- [ ] Sapwood `/flash` → **USB-tethered ESP8266** → Flash (pick the CH340 port;
+      install the CH340 driver if no port appears). Progress to 100%, then RESET.
+
+### 6.2 Boot POST — the critical gate
+
+- [ ] Press RESET. The OLED flickers **self-test...** then settles.
+- [ ] **PASS:** `Heartwood signer / unprovisioned / provision over USB` (no key yet).
+- [ ] **FAIL = the k256-on-lx106 risk is real — stop and capture the exact text:**
+  - `SELF-TEST FAILED / pubkey mismatch` or `sign mismatch` → k256 returns wrong
+    bytes (unaligned-access corruption).
+  - Stuck on `self-test...` forever → k256 hard-faulted.
+  - `nip44 roundtrip` / `persona mismatch` → a narrower AEAD/derivation drift.
+- [ ] (Blank/garbled OLED → check SDA=GPIO14/D6, SCL=GPIO12/D5. Garbled serial →
+      the 80 MHz→115200 divisor assumption is wrong for this board.)
+
+### 6.3 Provision offline (the key)
+
+Take the host offline (Wi-Fi off, cable out), device plugged in:
+
+- [ ] `heartwood-provision --port <PORT> generate --gen-bridge-secret` — writes 12
+      words (write them on paper), type `yes`; prints `Pubkey: npub1…` and a bridge
+      secret hex (keep it for §6.4).
+- [ ] OLED: `PROVISION SEED? / hold FLASH = approve` → **hold the FLASH button (GPIO0)**.
+- [ ] CLI: `✓ Seed provisioned` → `✓ Bridge secret paired` → `✓ Device confirms
+      identity: npub1…` — the readback npub matches `Pubkey` above.
+- [ ] (Restore instead: `provision --mode tree-mnemonic` / `--mode tree-nsec`; for the
+      `abandon …× 11 … about` vector the master npub is
+      `npub186c5ke7vjsk98z8qx4ctdrggsl2qlu627g6xvg6yumrj5c5c6etqcfaclx`.)
+- [ ] Reboot → the OLED now shows the **npub**, not "unprovisioned".
+
+### 6.4 Bridge bring-up (online host)
+
+- [ ] Move the board to the always-on host; find its port there.
+- [ ] In `HEARTWOOD_DATA_DIR`: `master.payload` = `hsm:<port>`, `bridge.secret` = the
+      hex, `config.json` = `{"relays":["wss://…"]}` (Sapwood's bridge step renders these).
+- [ ] `HEARTWOOD_DATA_DIR=<dir> heartwood-bridge` → it `SESSION_AUTH`s and advertises a
+      `bunker://` URI.
+
+### 6.5 Sign once (end-to-end)
+
+- [ ] Point a NIP-46 client (Nostrudel / nak) at the `bunker://` URI → `get_public_key`
+      returns the npub; `sign_event` (kind 1) returns a signed event the client posts.
+- [ ] (A `heartwood_*` persona request derives a child identity — the boot POST already
+      proved that path with the social vector
+      `npub1qdztfxg9z46k8qg4707n747y9rt7kl3f954lju2pneesmc3ypf2q83gm0e`.)
+
+### Known risks to watch
+
+- [ ] **k256 unaligned access on lx106** (§6.2) — the headline Phase-0 risk; the POST is the canary.
+- [ ] **UART 115200 divisor** assumes an 80 MHz CPU — garbled serial means the clock/divisor is off.
+- [ ] **NIP-44 nonce entropy** on bare-metal (`sign_path::random_nonce`) — flagged for review;
+      affects signing safety, not the POST.
 
 ## Notes
 

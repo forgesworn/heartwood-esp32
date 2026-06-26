@@ -38,6 +38,28 @@ pub(crate) mod backend {
         let sk = SigningKey::from_bytes(secret).map_err(|_| "invalid secret key")?;
         Ok(sk.verifying_key().to_bytes().into())
     }
+
+    /// BIP-32 hardened-child scalar step: `(tweak + key) mod n`, used by
+    /// `mnemonic::derive_root_secret`. Errors if `tweak` (I_L) is ≥ the curve
+    /// order or the sum is zero — both invalid per BIP-32. The backend-agnostic
+    /// counterpart of the secp256k1 version, so the mnemonic path derives the
+    /// same key on whichever curve backend is active.
+    #[cfg(feature = "mnemonic")]
+    pub fn tweak_add(key: &[u8; 32], tweak: &[u8; 32]) -> Result<[u8; 32], &'static str> {
+        use k256::elliptic_curve::ff::PrimeField;
+        let parse = |b: &[u8; 32]| -> Option<k256::Scalar> {
+            Option::from(k256::Scalar::from_repr(k256::FieldBytes::from(*b)))
+        };
+        let k = parse(key).ok_or("BIP-32 parent key out of range")?;
+        let t = parse(tweak).ok_or("BIP-32 I_L out of range")?;
+        let child = k + t;
+        if bool::from(child.is_zero()) {
+            return Err("BIP-32 derived a zero key");
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(child.to_repr().as_ref());
+        Ok(out)
+    }
 }
 
 #[cfg(feature = "secp256k1-backend")]
@@ -50,6 +72,17 @@ pub(crate) mod backend {
             .map_err(|_| "invalid secret key")?;
         let (xonly, _) = keypair.x_only_public_key();
         Ok(xonly.serialize())
+    }
+
+    /// BIP-32 hardened-child scalar step: `(tweak + key) mod n` via secp256k1's
+    /// scalar arithmetic. See the k256 backend's `tweak_add` for the contract.
+    #[cfg(feature = "mnemonic")]
+    pub fn tweak_add(key: &[u8; 32], tweak: &[u8; 32]) -> Result<[u8; 32], &'static str> {
+        use secp256k1::{Scalar, SecretKey};
+        let parent = SecretKey::from_slice(key).map_err(|_| "BIP-32 parent key out of range")?;
+        let t = Scalar::from_be_bytes(*tweak).map_err(|_| "BIP-32 I_L out of range")?;
+        let child = parent.add_tweak(&t).map_err(|_| "BIP-32 derived a zero key")?;
+        Ok(child.secret_bytes())
     }
 }
 

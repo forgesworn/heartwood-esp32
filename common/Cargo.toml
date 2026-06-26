@@ -19,10 +19,12 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"], opt
 chacha20 = { version = "0.9", default-features = false, optional = true }
 aes = { version = "0.8", default-features = false, optional = true }
 cbc = { version = "0.1", default-features = false, features = ["alloc", "block-padding"], optional = true }
-# On-device mnemonic generation. Only bip39 (wordlist + PBKDF2 seed) — the BIP-32
-# derivation is hand-rolled on top of the existing secp256k1 to avoid pulling
-# k256 + a second secp256k1 (bip32's deps), which overflowed the 2 MB OTA slot.
-bip39 = { version = "2", optional = true }
+# BIP-39 wordlist + PBKDF2 seed for on-device phrase entry/generation. The BIP-32
+# step is hand-rolled (derive::backend::tweak_add) to avoid the bip32 crate's
+# second curve impl (overflowed the 2 MB OTA slot). default-features=false so it is
+# no_std for the lx106; the `alloc` feature (pulled by `mnemonic`) gives
+# to_seed/from_entropy without std.
+bip39 = { version = "2", optional = true, default-features = false }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -35,8 +37,13 @@ secp256k1-backend = ["dep:secp256k1"]
 nip46 = ["dep:serde", "dep:serde_json"]
 nip44 = ["dep:chacha20", "dep:hkdf", "dep:base64"]
 nip04 = ["dep:aes", "dep:cbc", "dep:base64"]
-# On-device recovery-phrase generation (entropy -> BIP-39 mnemonic -> tree root).
-# Needs secp256k1 for the hand-rolled BIP-32 scalar arithmetic.
-mnemonic-gen = ["dep:bip39", "secp256k1-backend"]
+# On-device recovery-phrase entry/derivation (BIP-39 mnemonic -> BIP-32 tree root).
+# Backend-agnostic: the BIP-32 scalar step goes through derive::backend::tweak_add,
+# so it derives the same key on either curve backend. bip39 is used with ZERO of
+# its features (mnemonic.rs uses the `_normalized` APIs) — that keeps the giant
+# unicode-normalization tables out, which the bare-metal lx106's DRAM can't hold.
+mnemonic = ["dep:bip39"]
+# Back-compat alias: BIP-39 on the secp256k1 backend (the WiFi firmware + CI path).
+mnemonic-gen = ["mnemonic", "secp256k1-backend"]
 # Convenience alias for secp256k1 backend with full feature set (used by firmware)
 firmware = ["secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen"]

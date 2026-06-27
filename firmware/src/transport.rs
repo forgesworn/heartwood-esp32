@@ -20,8 +20,9 @@ use heartwood_common::hex::hex_encode;
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
 use heartwood_common::types::{
-    FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_SIGN_ENVELOPE_RESPONSE,
+    FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_SIGN_ENVELOPE_RESPONSE, MasterMode,
 };
+use zeroize::Zeroizing;
 
 use crate::masters::LoadedMaster;
 use crate::oled::Display;
@@ -41,6 +42,7 @@ pub fn handle_encrypted_request(
     usb: &mut SerialPort<'_>,
     frame: &Frame,
     masters: &[LoadedMaster],
+    personas: &mut Vec<crate::personas::LoadedPersona>,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
@@ -59,19 +61,56 @@ pub fn handle_encrypted_request(
     let created_at = u64::from_be_bytes(frame.payload[64..72].try_into().unwrap());
     let ciphertext_bytes = &frame.payload[72..];
 
-    // Find the master.
-    let master_idx = match crate::masters::find_by_pubkey(masters, &master_pubkey) {
-        Some(idx) => idx,
-        None => {
-            log::warn!("Encrypted request for unknown master pubkey");
-            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-            return;
+    // Resolve the target pubkey to the identity it addresses: a provisioned
+    // master, or a derived persona of one. Each identity's own key does both the
+    // NIP-44 transport and the envelope signing, so one connection == one
+    // identity (mirrors the software sidecar's #p routing). A persona's signing
+    // key is re-derived from its owning master; a master uses its secret directly.
+    let (signing_secret, owning_slot, owning_label, owning_mode, is_persona): (
+        Zeroizing<[u8; 32]>,
+        u8,
+        String,
+        MasterMode,
+        bool,
+    ) = if let Some(idx) = crate::masters::find_by_pubkey(masters, &master_pubkey) {
+        let m = &masters[idx];
+        (Zeroizing::new(m.secret), m.slot, m.label.clone(), m.mode, false)
+    } else if let Some(pidx) = crate::personas::find_by_pubkey(personas, &master_pubkey) {
+        let p = &personas[pidx];
+        let owning = match masters.iter().find(|m| m.slot == p.master_slot) {
+            Some(m) => m,
+            None => {
+                log::warn!("Persona's owning master slot {} not loaded", p.master_slot);
+                protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                return;
+            }
+        };
+        match crate::nip46_handler::derive_identity(&owning.secret, owning.mode, &p.purpose, p.index)
+        {
+            Ok((secret, _pubkey)) => (secret, owning.slot, owning.label.clone(), owning.mode, true),
+            Err(e) => {
+                log::error!("Persona key derivation failed: {e}");
+                protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                return;
+            }
         }
+    } else {
+        log::warn!("Encrypted request for unknown identity");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return;
     };
-    let master = &masters[master_idx];
+
+    // A persona connection must operate as the persona for every inner method,
+    // so clear any session active-identity (set by a legacy heartwood_switch)
+    // that would otherwise double-derive on top of the persona secret.
+    if is_persona {
+        if let Some(session) = policy_engine.get_or_create_session(client_pubkey, owning_slot) {
+            session.active_identity = None;
+        }
+    }
 
     // Derive conversation key.
-    let conversation_key = match nip44::get_conversation_key(&master.secret, &client_pubkey) {
+    let conversation_key = match nip44::get_conversation_key(&signing_secret, &client_pubkey) {
         Ok(ck) => ck,
         Err(e) => {
             log::error!("Conversation key derivation failed: {e}");
@@ -110,10 +149,10 @@ pub fn handle_encrypted_request(
     // Dispatch to the handler — always returns a JSON response string.
     let response_json = crate::nip46_handler::handle_request(
         &inner_frame,
-        &master.secret,
-        &master.label,
-        master.mode,
-        master.slot,
+        &signing_secret,
+        &owning_label,
+        owning_mode,
+        owning_slot,
         secp,
         display,
         button_pin,
@@ -123,7 +162,33 @@ pub fn handle_encrypted_request(
     );
 
     // Persist slots if a connect or sign_event may have modified one.
-    policy_engine.persist_slots(nvs, master.slot);
+    policy_engine.persist_slots(nvs, owning_slot);
+
+    // Persist any identities derived during this request (e.g. via
+    // heartwood_derive_persona) to the persona registry, so they survive reboot
+    // and become addressable by their own bunker URI. The bridge picks them up
+    // on its next discovery.
+    if let Some(cache) = identity_caches.iter().find(|c| c.master_slot == owning_slot) {
+        let fresh: Vec<(String, u32, Option<String>, [u8; 32])> = cache
+            .identities
+            .iter()
+            .filter(|id| !crate::personas::contains_pubkey(personas, &id.public_key))
+            .map(|id| (id.purpose.clone(), id.index, id.persona_name.clone(), id.public_key))
+            .collect();
+        for (purpose, index, name, pubkey) in fresh {
+            if crate::personas::add(nvs, owning_slot, &purpose, index, name.as_deref(), &pubkey)
+                .is_ok()
+            {
+                personas.push(crate::personas::LoadedPersona {
+                    master_slot: owning_slot,
+                    purpose,
+                    index,
+                    name,
+                    pubkey,
+                });
+            }
+        }
+    }
 
     // Free request buffers before encrypting the response.
     drop(inner_frame);
@@ -140,7 +205,7 @@ pub fn handle_encrypted_request(
 
             // Derive the author pubkey from the master secret (never trust
             // the lookup pubkey from the frame for the event's pubkey field).
-            let keypair = match secp256k1::Keypair::from_seckey_slice(secp, &master.secret) {
+            let keypair = match secp256k1::Keypair::from_seckey_slice(secp, &signing_secret[..]) {
                 Ok(kp) => kp,
                 Err(_) => {
                     log::error!("Inline envelope: invalid master secret");
@@ -161,7 +226,7 @@ pub fn handle_encrypted_request(
             };
 
             let event_id_bytes = nip46::compute_event_id(&unsigned);
-            let sig_bytes = match crate::sign::sign_hash(secp, &master.secret, &event_id_bytes) {
+            let sig_bytes = match crate::sign::sign_hash(secp, &signing_secret, &event_id_bytes) {
                 Ok(sig) => sig,
                 Err(e) => {
                     log::error!("Inline envelope: sign failed: {e}");

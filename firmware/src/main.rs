@@ -47,6 +47,7 @@ mod identity_cache;
 mod layout;
 mod masters;
 mod nip46_handler;
+mod personas;
 mod nvs;
 mod cat_sprites;
 mod oled;
@@ -155,6 +156,10 @@ fn main() {
     // --- Load masters ---
     let mut loaded_masters = masters::load_all(&nvs);
     log::info!("Loaded {} master(s) from NVS", loaded_masters.len());
+
+    // --- Load personas (per-identity registry; signing keys re-derived on use) ---
+    let mut loaded_personas = personas::load_all(&nvs);
+    log::info!("Loaded {} persona(s) from NVS", loaded_personas.len());
 
     // --- Flash-time config seed (web flasher — Raspberry Pi Imager model) ---
     // Seed NVS from the `config` partition whenever the flashed blob differs from
@@ -285,7 +290,7 @@ fn main() {
                 FRAME_TYPE_PROVISION_LIST => {
                     // Allow listing masters even when locked — no secrets exposed,
                     // only public npubs, which is acceptable.
-                    provision::handle_list(&mut usb, &loaded_masters);
+                    provision::handle_list(&mut usb, &loaded_masters, &loaded_personas);
                 }
                 _ => {
                     log::warn!("Device locked — rejecting frame type 0x{:02x}", frame.frame_type);
@@ -552,9 +557,9 @@ fn main() {
                 );
             }
 
-            // 0x05 — list masters
+            // 0x05 — list masters (and personas)
             FRAME_TYPE_PROVISION_LIST => {
-                provision::handle_list(&mut usb, &loaded_masters);
+                provision::handle_list(&mut usb, &loaded_masters, &loaded_personas);
             }
 
             // 0x10 — encrypted NIP-46 request (NIP-44 transport layer)
@@ -567,6 +572,7 @@ fn main() {
                         &mut usb,
                         &frame,
                         &loaded_masters,
+                        &mut loaded_personas,
                         &secp,
                         &mut display,
                         &button_pin,

@@ -361,7 +361,9 @@ fn poll_usb_mgmt(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
     ctx.last_activity = Instant::now();
 
     match frame.frame_type {
-        FRAME_TYPE_PROVISION_LIST => crate::provision::handle_list(usb, ctx.masters),
+        // Relay-mediated management lists masters only for now; per-identity
+        // persona discovery over the relay transport is a follow-up.
+        FRAME_TYPE_PROVISION_LIST => crate::provision::handle_list(usb, ctx.masters, &[]),
         FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
             usb,
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,

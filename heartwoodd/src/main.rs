@@ -339,6 +339,82 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Request-logging label maps
+// ---------------------------------------------------------------------------
+
+/// Build a map of master x-only pubkey -> human label, for request logging.
+/// Returns an empty map if the backend is locked or has no masters.
+fn build_master_labels(
+    backend: &Arc<dyn backend::SigningBackend>,
+) -> std::collections::HashMap<[u8; 32], String> {
+    let mut map = std::collections::HashMap::new();
+    let masters = match backend.list_masters() {
+        Ok(m) => m,
+        Err(_) => return map,
+    };
+    for master in &masters {
+        let label = master.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(npub) = master.get("npub").and_then(|v| v.as_str()) {
+            if let Ok(pk) = PublicKey::parse(npub) {
+                map.insert(pk.to_bytes(), label.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Build a map of bound client x-only pubkey -> connection-slot label.
+///
+/// Best-effort: reads `current_pubkey` and `authorized_pubkeys` from each
+/// slot returned by `list_slots`. Clients bound after startup (new `connect`)
+/// will not appear until the daemon restarts; unknown clients simply log as
+/// bare hex. Never fails -- errors yield an empty map.
+fn build_client_labels(
+    backend: &Arc<dyn backend::SigningBackend>,
+) -> std::collections::HashMap<[u8; 32], String> {
+    let mut map = std::collections::HashMap::new();
+    let masters = match backend.list_masters() {
+        Ok(m) => m,
+        Err(_) => return map,
+    };
+    for master in &masters {
+        let slot = master.get("slot").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        let slots = match backend.list_slots(slot) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let arr = match slots.as_array() {
+            Some(a) => a,
+            None => continue,
+        };
+        for s in arr {
+            let label = s
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mut pubkeys: Vec<String> = Vec::new();
+            if let Some(cp) = s.get("current_pubkey").and_then(|v| v.as_str()) {
+                pubkeys.push(cp.to_string());
+            }
+            if let Some(authorized) = s.get("authorized_pubkeys").and_then(|v| v.as_array()) {
+                for p in authorized {
+                    if let Some(ps) = p.as_str() {
+                        pubkeys.push(ps.to_string());
+                    }
+                }
+            }
+            for p in pubkeys {
+                if let Ok(bytes) = decode_hex_32(&p) {
+                    map.insert(bytes, label.clone());
+                }
+            }
+        }
+    }
+    map
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -553,6 +629,19 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Best-effort label maps for relay-side request logging. Built once from
+    // the backend's master + connection-slot metadata so each NIP-46 request
+    // logs as `"bark" (<hex>)` instead of an opaque pubkey. Empty when the
+    // backend is locked (Soft mode before unlock) or when the device omits
+    // bound pubkeys -- in which case logging falls back to bare hex.
+    let master_labels = build_master_labels(&backend_arc);
+    let client_labels = build_client_labels(&backend_arc);
+    log::info!(
+        "Request logging: {} master label(s), {} client label(s)",
+        master_labels.len(),
+        client_labels.len(),
+    );
+
     // Relay event loop with automatic reconnection. If the relay drops the
     // connection (e.g. idle timeout during a demo pause), we reconnect with
     // backoff rather than exiting the daemon.
@@ -568,7 +657,15 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
         log::info!("Connected to relays");
 
-        match relay::run_event_loop(&client, &backend_arc, &signing_master_pubkeys).await {
+        match relay::run_event_loop(
+            &client,
+            &backend_arc,
+            &signing_master_pubkeys,
+            &master_labels,
+            &client_labels,
+        )
+        .await
+        {
             Ok(()) => {
                 log::warn!("Relay event loop ended -- reconnecting in {backoff_secs}s");
             }

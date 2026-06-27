@@ -6,7 +6,7 @@
 // Both Hard and Soft modes use the same loop -- the SigningBackend
 // trait abstracts the signing implementation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
@@ -29,6 +29,8 @@ pub async fn run_event_loop(
     client: &Client,
     backend: &Arc<dyn SigningBackend>,
     signing_pubkeys: &[[u8; 32]],
+    master_labels: &HashMap<[u8; 32], String>,
+    client_labels: &HashMap<[u8; 32], String>,
 ) -> Result<()> {
     let nostr_pubkeys: Vec<PublicKey> = signing_pubkeys
         .iter()
@@ -54,12 +56,16 @@ pub async fn run_event_loop(
 
     let backend = Arc::clone(backend);
     let client_clone = client.clone();
+    let master_labels = Arc::new(master_labels.clone());
+    let client_labels = Arc::new(client_labels.clone());
 
     client
         .handle_notifications(|notification| {
             let backend = Arc::clone(&backend);
             let client_clone = client_clone.clone();
             let accepted = Arc::clone(&accepted);
+            let master_labels = Arc::clone(&master_labels);
+            let client_labels = Arc::clone(&client_labels);
 
             async move {
                 let event = match notification {
@@ -96,15 +102,15 @@ pub async fn run_event_loop(
                 };
 
                 let client_pubkey = event.pubkey;
+                let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
+                let master_hex = PublicKey::from_slice(&master_pubkey_bytes)
+                    .map(|pk| pk.to_string())
+                    .unwrap_or_else(|_| "<invalid>".to_string());
                 log::info!(
                     "NIP-46 request from {} to master {}",
-                    client_pubkey,
-                    PublicKey::from_slice(&master_pubkey_bytes)
-                        .map(|pk| pk.to_string())
-                        .unwrap_or_else(|_| "<invalid>".to_string())
+                    describe_pubkey(&client_labels, &client_pubkey_bytes, &client_pubkey.to_string()),
+                    describe_pubkey(&master_labels, &master_pubkey_bytes, &master_hex),
                 );
-
-                let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
 
                 // Handle the NIP-46 request: decrypt, process, re-encrypt,
                 // build and sign the kind:24133 envelope — all in one call.
@@ -146,4 +152,15 @@ pub async fn run_event_loop(
         .await?;
 
     Ok(())
+}
+
+/// Format a pubkey for logging, prefixing a known slot/master label.
+///
+/// Falls back to the bare hex pubkey when the key is not in the label map,
+/// so requests stay greppable by full pubkey regardless of label coverage.
+fn describe_pubkey(labels: &HashMap<[u8; 32], String>, pk: &[u8; 32], hex: &str) -> String {
+    match labels.get(pk) {
+        Some(label) if !label.is_empty() => format!("\"{label}\" ({hex})"),
+        _ => hex.to_string(),
+    }
 }

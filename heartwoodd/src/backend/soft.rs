@@ -469,6 +469,34 @@ impl SigningBackend for SoftBackend {
         // Policy check.
         let client_pubkey_hex = hex_encode(client_pubkey);
 
+        // -- Visibility logging (no behaviour change) -------------------------
+        // Record method, kind (for sign_event), and the matched slot label so
+        // each request is attributable in the journal without decryption hacks.
+        let client_short: String = client_pubkey_hex.chars().take(12).collect();
+        let slot_label = slot_info.as_ref().map(|s| s.label.clone()).unwrap_or_default();
+        let slot_suffix = if slot_label.is_empty() {
+            String::new()
+        } else {
+            format!(" [slot \"{slot_label}\"]")
+        };
+        if method == Nip46Method::SignEvent {
+            let kind = req
+                .params
+                .first()
+                .and_then(|v| match v {
+                    Value::String(s) => serde_json::from_str::<UnsignedEvent>(s).ok(),
+                    Value::Object(_) => serde_json::from_value::<UnsignedEvent>(v.clone()).ok(),
+                    _ => None,
+                })
+                .map(|e| e.kind);
+            match kind {
+                Some(k) => log::info!("soft: sign_event kind {k} from {client_short}…{slot_suffix}"),
+                None => log::info!("soft: sign_event (unparsed kind) from {client_short}…{slot_suffix}"),
+            }
+        } else {
+            log::info!("soft: {} from {client_short}…{slot_suffix}", req.method);
+        }
+
         // For connect: validate secret and bind the slot.
         if method == Nip46Method::Connect {
             let provided_secret = req
@@ -546,6 +574,10 @@ impl SigningBackend for SoftBackend {
 
         // For sign_event and other methods, check the slot policy.
         let slot = slot_info.ok_or_else(|| {
+            log::warn!(
+                "soft: {} from {client_short}… QUEUED — no connection slot bound to this client",
+                req.method
+            );
             // No slot for this client -- queue for approval.
             let approval_id = Uuid::new_v4().to_string();
             let approval = PendingApproval {
@@ -568,6 +600,11 @@ impl SigningBackend for SoftBackend {
         // Check if this method is allowed by slot policy.
         let method_allowed = slot.allowed_methods.contains(&req.method);
         if !method_allowed {
+            log::warn!(
+                "soft: {} from {client_short}… QUEUED — method not in slot \"{}\" policy",
+                req.method,
+                slot.label
+            );
             let approval_id = Uuid::new_v4().to_string();
             let approval = PendingApproval {
                 id: approval_id.clone(),
@@ -602,6 +639,12 @@ impl SigningBackend for SoftBackend {
                 || event_kind.map_or(true, |k| slot.allowed_kinds.contains(&k));
 
             if !kind_allowed || !slot.auto_approve {
+                log::warn!(
+                    "soft: sign_event kind {:?} from {client_short}… QUEUED — {} (slot \"{}\")",
+                    event_kind,
+                    if !kind_allowed { "kind not in slot policy" } else { "auto-approve disabled" },
+                    slot.label
+                );
                 let approval_id = Uuid::new_v4().to_string();
                 let approval = PendingApproval {
                     id: approval_id.clone(),
@@ -620,6 +663,11 @@ impl SigningBackend for SoftBackend {
                 return Err(BackendError::PendingApproval(approval_id));
             }
         } else if !slot.auto_approve {
+            log::warn!(
+                "soft: {} from {client_short}… QUEUED — auto-approve disabled (slot \"{}\")",
+                req.method,
+                slot.label
+            );
             let approval_id = Uuid::new_v4().to_string();
             let approval = PendingApproval {
                 id: approval_id.clone(),
@@ -644,6 +692,11 @@ impl SigningBackend for SoftBackend {
         let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
             .ok_or_else(|| BackendError::Internal("master not found".into()))?;
         let response_json = Self::dispatch_method(master, &req, &client_pubkey_hex)?;
+        log::info!(
+            "soft: {} from {client_short}… APPROVED (slot \"{}\")",
+            req.method,
+            slot.label
+        );
 
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce)

@@ -59,6 +59,24 @@ fn derivation_secret(
     }
 }
 
+/// Derive a child identity's signing key and x-only pubkey from its owning
+/// master. Mirrors the derivation chain in `do_sign` / `handle_get_public_key`
+/// (mode → tree root → derive(purpose, index)). Used by the transport layer to
+/// resolve a persona that a request was addressed to by its own pubkey.
+pub(crate) fn derive_identity(
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    purpose: &str,
+    index: u32,
+) -> Result<(zeroize::Zeroizing<[u8; 32]>, [u8; 32]), String> {
+    let derive_secret =
+        derivation_secret(master_secret, master_mode).map_err(|e| format!("derivation_secret: {e}"))?;
+    let root =
+        derive::create_tree_root(&derive_secret).map_err(|e| format!("create_tree_root: {e}"))?;
+    let identity = derive::derive(&root, purpose, index).map_err(|e| format!("derive: {e}"))?;
+    Ok((identity.private_key, identity.public_key))
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------

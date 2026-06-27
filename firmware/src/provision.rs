@@ -598,8 +598,12 @@ pub fn handle_remove(
 
 /// Handle a PROVISION_LIST frame (0x05). Responds with frame 0x07 containing
 /// a JSON array of `{slot, label, mode, npub}` objects.
-pub fn handle_list(usb: &mut SerialPort<'_>, loaded: &[LoadedMaster]) {
-    let infos: Vec<serde_json::Value> = loaded
+pub fn handle_list(
+    usb: &mut SerialPort<'_>,
+    loaded: &[LoadedMaster],
+    personas: &[crate::personas::LoadedPersona],
+) {
+    let mut infos: Vec<serde_json::Value> = loaded
         .iter()
         .map(|m| {
             serde_json::json!({
@@ -610,6 +614,18 @@ pub fn handle_list(usb: &mut SerialPort<'_>, loaded: &[LoadedMaster]) {
             })
         })
         .collect();
+
+    // Derived personas are each addressable by their own bunker URI. The bridge
+    // subscribes to every npub reported here, so listing them makes persona
+    // connections reachable (and they survive reboot via the NVS registry).
+    for p in personas {
+        infos.push(serde_json::json!({
+            "slot": p.master_slot,
+            "label": p.name.clone().unwrap_or_else(|| p.purpose.clone()),
+            "npub": encode_npub(&p.pubkey),
+            "persona": true,
+        }));
+    }
 
     let json = serde_json::to_string(&infos).unwrap_or_else(|_| "[]".to_string());
     protocol::write_frame(usb, FRAME_TYPE_PROVISION_LIST_RESPONSE, json.as_bytes());

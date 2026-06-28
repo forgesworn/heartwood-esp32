@@ -162,6 +162,12 @@ pub fn bringup(p: Peripherals) -> Hw {
     // --- ST7789 colour TFT on SPI2 ---
     // SCLK=18, MOSI(SDA)=19, CS=5, DC=16, RST=23, backlight=4. The panel is
     // write-only, so there is no MISO.
+    //
+    // GPIO18/19/5 are the VSPI (SPI3) IO_MUX pins, not the SPI2 (HSPI) defaults,
+    // so all three route through the GPIO matrix. ESP-IDF's SPI master rejects
+    // full-duplex operation above 26.7 MHz (80 MHz ÷ 3) on matrix-routed pins.
+    // 26 MHz rounds down to 80/3 = 26.67 MHz — the fastest the matrix allows —
+    // and is still very fast for a write-only 240×135 panel.
     let spi = SpiDeviceDriver::new_single(
         p.spi2,
         p.pins.gpio18,      // SCLK
@@ -169,7 +175,7 @@ pub fn bringup(p: Peripherals) -> Hw {
         None::<AnyIOPin>,   // MISO unused
         Some(p.pins.gpio5), // CS
         &SpiDriverConfig::new(),
-        &SpiConfig::new().baudrate(40.MHz().into()),
+        &SpiConfig::new().baudrate(26.MHz().into()),
     )
     .expect("ST7789 SPI init failed");
     let dc = PinDriver::output(p.pins.gpio16).expect("DC pin");

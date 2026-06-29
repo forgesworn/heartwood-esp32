@@ -57,7 +57,7 @@ pub type Display<'a> = Ssd1306<
 #[cfg(feature = "tdisplay")]
 pub type Display<'a> = crate::st7789::St7789Display<'a>;
 
-/// Waveshare ESP32-C6 (172×320 JD9853 IPS panel) uses the JD9853 wrapper.
+/// Waveshare ESP32-C6 (320×172 landscape JD9853 IPS panel) uses the JD9853 wrapper.
 #[cfg(feature = "c6")]
 pub type Display<'a> = crate::jd9853::Jd9853Display<'a>;
 

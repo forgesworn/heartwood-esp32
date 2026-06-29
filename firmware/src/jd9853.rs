@@ -1,7 +1,7 @@
 // firmware/src/jd9853.rs
 //
 // Raw SPI driver for the Jadard JD9853 display controller used on the
-// Waveshare ESP32-C6-Touch-LCD-1.47 (172×320 IPS panel).
+// Waveshare ESP32-C6-Touch-LCD-1.47 (320×172 landscape IPS panel).
 //
 // The JD9853 is not supported by mipidsi, so this driver sends the vendor
 // init sequence directly and then uses standard MIPI DCS commands (CASET /
@@ -18,11 +18,16 @@ use esp_idf_hal::gpio::{Output, PinDriver};
 use esp_idf_hal::ledc::LedcDriver;
 use esp_idf_hal::spi::{SpiDeviceDriver, SpiDriver};
 
-// Panel dimensions (visible window into the 240×320 controller).
-const W: u16 = 172;
-const H: u16 = 320;
-const X_OFFSET: u16 = 34; // (240 - 172) / 2
-const Y_OFFSET: u16 = 0;
+// Panel dimensions in landscape orientation (MADCTL 0x60: MX=1, MV=1).
+//
+// The JD9853 controller address space is 240 columns × 320 rows.  After
+// the MADCTL row/column exchange (MV=1) the 320-row axis becomes columns
+// (W=320, full width, X_OFFSET=0) and the 240-column axis becomes rows
+// (H=172 visible, centred: Y_OFFSET = (240-172)/2 = 34).
+const W: u16 = 320;
+const H: u16 = 172;
+const X_OFFSET: u16 = 0;
+const Y_OFFSET: u16 = 34; // (240 - 172) / 2
 
 type Spi<'a> = SpiDeviceDriver<'a, SpiDriver<'a>>;
 
@@ -140,12 +145,17 @@ impl<'a> Jd9853Display<'a> {
         // Back to page 0.
         self.cd(0xDE, &[0x00]);
 
+        // Landscape: MX=1 (reverse column order), MV=1 (exchange row/column).
+        // The 320-row axis becomes the 320-wide column axis; the 172-visible-
+        // pixel slice of the 240-column axis becomes the 172-tall row axis.
+        self.cd(0x36, &[0x60]);
         self.cd(0x35, &[0x00]);             // Tearing effect line on
         self.cd(0x3A, &[0x05]);             // Interface pixel format: RGB565
-        // Column address set: 34–205 (172 px wide).
+        // Column address set: 0–319 (full 320 px wide).
         self.cd(0x2A, &[0x00, X_OFFSET as u8,
-                         0x00, (X_OFFSET + W - 1) as u8]);
-        // Row address set: 0–319.
+                         ((X_OFFSET + W - 1) >> 8) as u8,
+                         ((X_OFFSET + W - 1) & 0xFF) as u8]);
+        // Row address set: 34–205 (172 px tall, centred in 240-row space).
         self.cd(0x2B, &[0x00, Y_OFFSET as u8,
                          ((Y_OFFSET + H - 1) >> 8) as u8,
                          ((Y_OFFSET + H - 1) & 0xFF) as u8]);
@@ -169,10 +179,11 @@ impl<'a> Jd9853Display<'a> {
 
     /// Blit the back-buffer to the panel.
     pub fn flush(&mut self) -> Result<(), Jd9853Error> {
-        // Set column window.
+        // Set column window (0–319 in landscape).
         self.cd(0x2A, &[0x00, X_OFFSET as u8,
-                         0x00, (X_OFFSET + W - 1) as u8]);
-        // Set row window.
+                         ((X_OFFSET + W - 1) >> 8) as u8,
+                         ((X_OFFSET + W - 1) & 0xFF) as u8]);
+        // Set row window (34–205 in landscape).
         self.cd(0x2B, &[0x00, Y_OFFSET as u8,
                          ((Y_OFFSET + H - 1) >> 8) as u8,
                          ((Y_OFFSET + H - 1) & 0xFF) as u8]);

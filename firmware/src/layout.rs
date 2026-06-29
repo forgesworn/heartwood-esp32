@@ -168,14 +168,12 @@ mod tests {
     }
 
     #[test]
-    fn c6_portrait_fills_height_no_stretch() {
-        let l = Layout::new(172, 320);
-        // x scales 134%, y scales 500%: rows spread down the full height
-        // instead of letterboxing, while glyphs scale by the smaller (134%)
-        // factor so text is never stretched.
-        assert_eq!(l.sx(128), 171, "~fills the 172 width");
-        assert_eq!(l.sy(64), 320, "fills the full 320 height");
-        assert_eq!(l.sy(10), 50, "header sits near the top, not crammed");
-        assert!(l.large_tier(), "portrait still steps fonts up (134% >= 130%)");
+    fn c6_landscape_fills_both_axes() {
+        let l = Layout::new(320, 172);
+        // x scales 250%, y scales 268%: well-balanced landscape fill.
+        // Glyphs scale by min(250, 268) = 250% — large font tier throughout.
+        assert_eq!(l.sx(128), 320, "maps to the 320-wide edge (clipped by DrawTarget)");
+        assert_eq!(l.sy(64), 171, "~fills the 172 height");
+        assert!(l.large_tier(), "landscape steps fonts up (250% >= 130%)");
     }
 }

@@ -5,9 +5,6 @@
 // reset on GPIO21 and Vext power on GPIO36 (active low), so this module is
 // hardware-identical between boards.
 
-// FONT_6X10 / FONT_10X20 are still used directly by the boot animation; the
-// screen functions select fonts via `Layout::font_*` instead.
-use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
@@ -1085,9 +1082,10 @@ pub fn show_signing(display: &mut Display<'_>) {
 
 /// Boot animation: HD pixel-art cat + decrypt reveal.
 ///
-/// Phase 1: A cat silhouette walks across the screen at 1:1 pixel scale.
-/// At centre screen it "glitches" (deja vu -- ghost cat behind). Like The Matrix.
-/// Phase 2: Screen clears, HEARTWOOD decrypts letter by letter.
+/// Phase 1: A cat silhouette walks across the screen.  At centre it "glitches"
+/// (deja vu -- ghost cat behind).  Phase 2: screen clears, HEARTWOOD decrypts
+/// letter by letter.  All coordinates scale via Layout so the animation fills
+/// any panel (128×64 mono OLED or 320×172 colour C6) without modification.
 pub fn show_boot_animation(display: &mut Display<'_>) {
     let mut lfsr: u16 = 0xACE1;
     let mut next_byte = |lfsr: &mut u16| -> u8 {
@@ -1099,11 +1097,19 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
 
     use crate::cat_sprites::{FRAMES, FRAME_COUNT, FRAME_COLS};
 
-    // 16 procedural frames: each has unique tail + legs computed from gait cycle.
-    // Vertical bob: 1px up on odd frames for weight feel.
+    let l = layout(display);
+    // Sprite scale: 1px per bit at the 128×64 baseline; 2px on larger panels.
+    let sc = l.s(1).max(1);
+    let sprite_w = FRAME_COLS as i32 * sc;
+    let sprite_h = 56i32 * sc;
 
-    // Deja vu triggers when the cat's midpoint reaches screen centre (px 64).
-    let glitch_x: i32 = 64 - (FRAME_COLS as i32 / 2); // ~36
+    // Vertically centre the cat, leaving sc pixels of headroom above for the bob.
+    let cat_y_base = (((l.h - sprite_h) / 2) - sc).max(0);
+    let ground_y = (cat_y_base + sprite_h + sc).min(l.h - 1);
+
+    // Deja vu triggers when the cat's midpoint reaches screen centre.
+    let glitch_x = l.w / 2 - sprite_w / 2;
+    let ghost_off = l.sx(40);
 
     // Lead-in: 2 empty frames.
     for _ in 0..2 {
@@ -1112,41 +1118,46 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         FreeRtos::delay_ms(50);
     }
 
-    let mut x: i32 = -(FRAME_COLS as i32);
+    let mut x: i32 = -sprite_w;
     let mut step: u32 = 0;
 
-    while x < 128 {
+    while x < l.w {
         display.clear_buffer();
 
         let frame_idx = (step as usize) % FRAME_COUNT;
-        // Vertical bob (1px) + horizontal sway (1px, slower period).
-        let y = if step % 2 == 0 { 6 } else { 5 };
-        let sway: i32 = if (step / 4) % 2 == 0 { 0 } else { 1 };
-        draw_sprite_hd(display, &FRAMES[frame_idx], x + sway, y);
+        // Bob: sc pixels down on even frames (weight feel).
+        let y_pos = cat_y_base + if step % 2 == 0 { sc } else { 0 };
+        let sway: i32 = if (step / 4) % 2 == 0 { 0 } else { sc };
+        draw_sprite_hd(display, &FRAMES[frame_idx], x + sway, y_pos, sc, l.w, l.h);
 
-        // Deja vu glitch: ghost cat appears 40px behind for 3 frames.
-        if x >= glitch_x && x <= glitch_x + 6 {
+        // Deja vu glitch: ghost cat behind for a few frames.
+        if x >= glitch_x && x <= glitch_x + 6 * sc {
             let ghost_idx = ((step as usize) + FRAME_COUNT / 2) % FRAME_COUNT;
-            let ghost_y = if (step + 1) % 2 == 0 { 6 } else { 5 };
-            draw_sprite_hd(display, &FRAMES[ghost_idx], x - 40, ghost_y);
+            let ghost_y = cat_y_base + if (step + 1) % 2 == 0 { sc } else { 0 };
+            draw_sprite_hd(display, &FRAMES[ghost_idx], x - ghost_off, ghost_y, sc, l.w, l.h);
         }
 
-        // Moving ground: scrolling dashes at the bottom.
-        let ground_y = 63;
-        let ground_offset = (step as i32 * 3) % 6;
-        for px in (0..128).step_by(6) {
-            let gx = px - ground_offset;
-            if gx >= 0 && gx < 128 {
-                use embedded_graphics::primitives::{Line, PrimitiveStyle};
-                Line::new(Point::new(gx, ground_y), Point::new(gx + 2, ground_y))
-                    .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
-                    .draw(display).ok();
+        // Moving ground: scrolling dashes just below the cat's feet.
+        let dash_gap = (6 * sc).max(1);
+        let dash_scroll = (step as i32 * 3 * sc) % dash_gap;
+        let mut gx: i32 = -dash_scroll;
+        while gx < l.w {
+            if gx + 2 * sc > 0 {
+                let x1 = gx.max(0);
+                let x2 = (gx + 2 * sc - 1).min(l.w - 1);
+                if x1 <= x2 {
+                    use embedded_graphics::primitives::{Line, PrimitiveStyle};
+                    Line::new(Point::new(x1, ground_y), Point::new(x2, ground_y))
+                        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+                        .draw(display).ok();
+                }
             }
+            gx += dash_gap;
         }
 
         display.flush().ok();
         step += 1;
-        x += 2;
+        x += 2 * sc;
         FreeRtos::delay_ms(45);
     }
 
@@ -1157,18 +1168,22 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
         FreeRtos::delay_ms(50);
     }
 
-    // Phase 2: HEARTWOOD decrypt reveal (unchanged).
+    // Phase 2: HEARTWOOD decrypt reveal.
     const TITLE: &[u8] = b"HEARTWOOD";
     const LEN: usize = 9;
-    const START_X: i32 = 19;
-    const Y: i32 = 35;
+
+    let big_font = l.font_large();
+    let sub_font = l.font_header();
+    let glyph_w = Layout::glyph_w(big_font);
+    let start_x = l.center_x(LEN as i32 * glyph_w);
+    let title_y = l.sy(35);
 
     let big_style = MonoTextStyleBuilder::new()
-        .font(&FONT_10X20)
+        .font(big_font)
         .text_color(BinaryColor::On)
         .build();
     let sub_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(sub_font)
         .text_color(BinaryColor::On)
         .build();
 
@@ -1189,14 +1204,14 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
             };
             let buf = [ch];
             let s = core::str::from_utf8(&buf).unwrap_or("?");
-            let x = START_X + (i as i32 * 10);
-            Text::new(s, Point::new(x, Y), big_style).draw(display).ok();
+            let x = start_x + (i as i32 * glyph_w);
+            Text::new(s, Point::new(x, title_y), big_style).draw(display).ok();
         }
 
         if resolved >= LEN {
             let version = concat!("v", env!("CARGO_PKG_VERSION"));
-            let vx = ((128 - version.len() as i32 * 6) / 2).max(0);
-            Text::new(version, Point::new(vx, 56), sub_style).draw(display).ok();
+            let vx = l.center_x(version.len() as i32 * Layout::glyph_w(sub_font));
+            Text::new(version, Point::new(vx, l.sy(56)), sub_style).draw(display).ok();
         }
 
         display.flush().ok();
@@ -1204,25 +1219,37 @@ pub fn show_boot_animation(display: &mut Display<'_>) {
     }
 }
 
-/// Draw a 56x56 pixel sprite at the given pixel offset.
+/// Draw a 56×56 sprite at the given pixel offset with pixel scaling.
+/// Each set bit is rendered as an `sc × sc` filled block.
 /// Bits are packed as u64 per row: bit 55 = leftmost column, bit 0 = rightmost.
 fn draw_sprite_hd(
     display: &mut Display<'_>,
     frame: &[u64; 56],
     x_offset: i32,
     y_offset: i32,
+    sc: i32,
+    display_w: i32,
+    display_h: i32,
 ) {
     for row in 0..56i32 {
         let bits = frame[row as usize];
         if bits == 0 { continue; }
-        let py = y_offset + row;
-        if py < 0 || py >= 64 { continue; }
+        let py_base = y_offset + row * sc;
+        if py_base >= display_h || py_base + sc <= 0 { continue; }
         for col in 0..56i32 {
             if (bits >> (55 - col)) & 1 == 1 {
-                let px = x_offset + col;
-                if px >= 0 && px < 128 {
-                    Pixel(Point::new(px, py), BinaryColor::On)
-                        .draw(display).ok();
+                let px_base = x_offset + col * sc;
+                if px_base >= display_w || px_base + sc <= 0 { continue; }
+                for dy in 0..sc {
+                    let py = py_base + dy;
+                    if py < 0 || py >= display_h { continue; }
+                    for dx in 0..sc {
+                        let px = px_base + dx;
+                        if px >= 0 && px < display_w {
+                            Pixel(Point::new(px, py), BinaryColor::On)
+                                .draw(display).ok();
+                        }
+                    }
                 }
             }
         }

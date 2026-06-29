@@ -53,10 +53,13 @@ pub type Display<'a> = Ssd1306<
     BufferedGraphicsMode<DisplaySize128x64>,
 >;
 
-/// Colour-TFT boards (no Heltec mono OLED feature active) use the ST7789
-/// wrapper as the display backend.
-#[cfg(not(any(feature = "heltec-v3", feature = "heltec-v4")))]
+/// T-Display (classic ESP32 + ST7789 240×135) uses the ST7789 wrapper.
+#[cfg(feature = "tdisplay")]
 pub type Display<'a> = crate::st7789::St7789Display<'a>;
+
+/// Waveshare ESP32-C6 (172×320 JD9853 IPS panel) uses the JD9853 wrapper.
+#[cfg(feature = "c6")]
+pub type Display<'a> = crate::jd9853::Jd9853Display<'a>;
 
 /// Initialise the OLED: reset pin toggle, I2C setup, display init.
 /// The reset PinDriver is deliberately leaked — GPIO 21 must stay HIGH

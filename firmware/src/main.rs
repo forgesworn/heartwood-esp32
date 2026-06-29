@@ -61,6 +61,8 @@ mod net_config_store;
 mod boot_config;
 #[cfg(feature = "st7789")]
 mod st7789;
+#[cfg(feature = "c6")]
+mod jd9853;
 mod relay;
 mod session;
 mod sign;
@@ -202,6 +204,13 @@ fn main() {
         loop {
             let frame = protocol::read_frame(&mut usb);
             match frame.frame_type {
+                FRAME_TYPE_FIRMWARE_INFO => {
+                    protocol::write_frame(
+                        &mut usb,
+                        FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
+                        firmware_info_json().as_bytes(),
+                    );
+                }
                 FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
                     // Show the "working" screen before the (one-time, slowish)
                     // secp context build so generation feedback covers it too.
@@ -291,6 +300,13 @@ fn main() {
                     // Allow listing masters even when locked — no secrets exposed,
                     // only public npubs, which is acceptable.
                     provision::handle_list(&mut usb, &loaded_masters, &loaded_personas);
+                }
+                FRAME_TYPE_FIRMWARE_INFO => {
+                    protocol::write_frame(
+                        &mut usb,
+                        FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
+                        firmware_info_json().as_bytes(),
+                    );
                 }
                 _ => {
                     log::warn!("Device locked — rejecting frame type 0x{:02x}", frame.frame_type);

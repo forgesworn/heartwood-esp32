@@ -157,7 +157,7 @@ pub fn bringup(p: Peripherals) -> Hw {
     use esp_idf_hal::spi::SpiDeviceDriver;
     use esp_idf_hal::uart::{config::Config as UartConfig, UartDriver};
     use esp_idf_hal::units::{FromValueType, Hertz};
-    use mipidsi::options::Rotation;
+    use mipidsi::options::{ColorInversion, Rotation};
 
     // --- ST7789 colour TFT on SPI2 ---
     // SCLK=18, MOSI(SDA)=19, CS=5, DC=16, RST=23, backlight=4. The panel is
@@ -201,6 +201,8 @@ pub fn bringup(p: Peripherals) -> Hw {
         52,  // x offset
         40,  // y offset
         Rotation::Deg90,
+        false,                    // T-Display backlight: active-high (direct drive)
+        ColorInversion::Inverted, // T-Display panel ships with inverted colours
     );
 
     // --- Host transport: CH9102 USB-UART bridge on classic-ESP32 UART0 ---
@@ -234,58 +236,51 @@ pub fn bringup(p: Peripherals) -> Hw {
     }
 }
 
-/// Bring up the Waveshare ESP32-C6-LCD-1.47: ESP32-C6 (RISC-V), an ST7789
-/// 172x320 portrait colour TFT over SPI, a single BOOT button, and the chip's
-/// native USB-Serial-JTAG for the host frame protocol (no UART bridge).
+/// Bring up the Waveshare ESP32-C6-LCD-1.47 (also sold as ESP32-C6-Touch-LCD-1.47):
+/// ESP32-C6 (RISC-V rv32imac), a JD9853 172×320 portrait IPS panel over SPI, a
+/// single BOOT button, and the chip's native USB-Serial-JTAG host transport.
+///
+/// Confirmed pin assignments (waveshare schematic + two independent community drivers):
+///   SCLK=GPIO1, MOSI=GPIO2, CS=GPIO14, DC=GPIO15, RST=GPIO22, BL=GPIO23 (LEDC PWM)
+///
+/// The backlight IC requires LEDC PWM (5 kHz); plain GPIO HIGH does not enable it.
+/// The display controller is JD9853 — NOT ST7789. See jd9853.rs for the init sequence.
 #[cfg(feature = "c6")]
 pub fn bringup(p: Peripherals) -> Hw {
     use esp_idf_hal::gpio::{AnyIOPin, Pull};
+    use esp_idf_hal::ledc::{config::TimerConfig, LedcDriver, LedcTimerDriver};
     use esp_idf_hal::spi::config::{Config as SpiConfig, DriverConfig as SpiDriverConfig};
     use esp_idf_hal::spi::SpiDeviceDriver;
     use esp_idf_hal::units::FromValueType;
-    use mipidsi::options::Rotation;
 
-    // --- ST7789 colour TFT on SPI2 ---
-    // SCLK=7, MOSI(SDA)=6, CS=14, DC=15, RST=21, backlight=22. The panel is
-    // write-only, so there is no MISO.
+    // --- JD9853 IPS panel on SPI2 ---
+    // GPIO1 (SCLK) and GPIO2 (MOSI) route through the GPIO matrix; 10 MHz is
+    // a safe cap for matrix-routed pins during initial bring-up.
     let spi = SpiDeviceDriver::new_single(
         p.spi2,
-        p.pins.gpio7,        // SCLK
-        p.pins.gpio6,        // MOSI / SDA
-        None::<AnyIOPin>,    // MISO unused
+        p.pins.gpio1,        // SCLK (LCD_CLK)
+        p.pins.gpio2,        // MOSI (LCD_DIN)
+        None::<AnyIOPin>,    // MISO unused (write-only panel)
         Some(p.pins.gpio14), // CS
         &SpiDriverConfig::new(),
-        &SpiConfig::new().baudrate(40.MHz().into()),
+        &SpiConfig::new().baudrate(10.MHz().into()),
     )
-    .expect("ST7789 SPI init failed");
-    let dc = PinDriver::output(p.pins.gpio15).expect("DC pin");
-    let rst = PinDriver::output(p.pins.gpio21).expect("RST pin");
-    let backlight = PinDriver::output(p.pins.gpio22).expect("backlight pin");
+    .expect("JD9853 SPI init failed");
+    let dc  = PinDriver::output(p.pins.gpio15).expect("DC pin");
+    let rst = PinDriver::output(p.pins.gpio22).expect("RST pin");
 
-    // mipidsi's SPI scratch buffer must outlive the display; leak it (a one-off,
-    // device-lifetime allocation, same rationale as on the T-Display).
-    let spi_buffer: &'static mut [u8] = Box::leak(vec![0u8; 512].into_boxed_slice());
+    // Backlight on GPIO23 via LEDC PWM at 5 kHz.
+    // Plain GPIO HIGH does not enable the backlight driver IC on this board.
+    let timer = LedcTimerDriver::new(
+        p.ledc.timer0,
+        &TimerConfig::default().frequency(5_000.Hz().into()),
+    ).expect("LEDC timer init");
+    let bl = LedcDriver::new(p.ledc.channel0, timer, p.pins.gpio23)
+        .expect("LEDC backlight init");
 
-    // The 172x320 panel is a window into the ST7789's 240x320 controller,
-    // centred horizontally (x offset 34 = (240 - 172) / 2). Native portrait, no
-    // rotation -- the responsive layout fills the tall panel directly. The
-    // offsets/inversion are the canonical Waveshare 1.47" values; verify on the
-    // actual board.
-    let display = crate::st7789::St7789Display::new(
-        spi,
-        dc,
-        rst,
-        backlight,
-        spi_buffer,
-        172, // native portrait width
-        320, // native portrait height
-        34,  // x offset
-        0,   // y offset
-        Rotation::Deg0,
-    );
+    let display = crate::jd9853::Jd9853Display::new(spi, dc, rst, bl);
 
     // --- Host transport: ESP32-C6 native USB-Serial-JTAG (GPIO12 D- / GPIO13 D+) ---
-    // Same peripheral and frame API as the Heltec V4; no UART bridge.
     let serial = {
         use esp_idf_hal::usb_serial::{UsbSerialConfig, UsbSerialDriver};
         let driver = UsbSerialDriver::new(
@@ -298,10 +293,7 @@ pub fn bringup(p: Peripherals) -> Hw {
         SerialPort::from_usb(driver)
     };
 
-    // --- Button ---
-    // The single user button is BOOT (GPIO9, active-low, internal pull-up). The
-    // WS2812 RGB LED on GPIO8 is left undriven for now (a Phase-B approved/denied
-    // colour cue).
+    // GPIO9 is the BOOT strapping pin and the user PRG button on this board.
     let button_a = PinDriver::input(p.pins.gpio9, Pull::Up).expect("button A");
 
     Hw {

@@ -59,8 +59,11 @@ pub struct St7789Error;
 /// framebuffer. Drop-in for the SSD1306 `oled::Display` alias.
 pub struct St7789Display<'a> {
     panel: Panel<'a>,
-    /// Backlight pin (active high). Toggled for sleep/wake.
+    /// Backlight pin. Polarity is board-specific (see `backlight_active_low`).
     backlight: PinDriver<'a, Output>,
+    /// When true, the backlight is ON when the pin is LOW (P-MOSFET driver).
+    /// When false, the backlight is ON when the pin is HIGH (direct or NPN).
+    backlight_active_low: bool,
     /// In-RAM frame, `w * h` pixels, blitted on `flush`.
     framebuffer: Vec<Rgb565>,
     width: i32,
@@ -91,22 +94,30 @@ impl<'a> St7789Display<'a> {
         x_offset: u16,
         y_offset: u16,
         rotation: Rotation,
+        backlight_active_low: bool,
+        color_inversion: ColorInversion,
     ) -> Self {
         let di = SpiInterface::new(spi, dc, buffer);
         let mut delay = Ets;
-        let panel = mipidsi::Builder::new(ST7789, di)
+        let mut panel = mipidsi::Builder::new(ST7789, di)
             .reset_pin(rst)
             .display_size(native_width, native_height)
             .display_offset(x_offset, y_offset)
             .orientation(Orientation::new().rotate(rotation))
-            // Most ST7789 panels (the T-Display included) ship with inverted
-            // colours; without this whites read as blacks.
-            .invert_colors(ColorInversion::Inverted)
+            .invert_colors(color_inversion)
             .init(&mut delay)
             .expect("ST7789 panel init failed");
 
         // Backlight on once the panel is initialised (avoids a flash of noise).
-        backlight.set_high().ok();
+        if backlight_active_low {
+            backlight.set_low().ok();
+        } else {
+            backlight.set_high().ok();
+        }
+
+        // Diagnostic: fill screen red so we can tell if SPI reaches the panel.
+        // If the display shows red, SPI works. Remove once display is confirmed.
+        panel.clear(Rgb565::RED).ok();
 
         let size = panel.size();
         let (width, height) = (size.width as i32, size.height as i32);
@@ -115,6 +126,7 @@ impl<'a> St7789Display<'a> {
         Self {
             panel,
             backlight,
+            backlight_active_low,
             framebuffer,
             width,
             height,
@@ -143,7 +155,8 @@ impl<'a> St7789Display<'a> {
     /// the idle display-sleep path (cutting the backlight saves more power than
     /// the SSD1306 panel-off command and is instant).
     pub fn set_display_on(&mut self, on: bool) -> Result<(), St7789Error> {
-        let r = if on {
+        let drive_high = on ^ self.backlight_active_low;
+        let r = if drive_high {
             self.backlight.set_high()
         } else {
             self.backlight.set_low()

@@ -90,6 +90,12 @@ impl Layout {
         self.fs >= 130
     }
 
+    /// True on the colour TFTs (large font tier), false on the mono OLED. Lets
+    /// screens choose a bigger font where the panel has room for it.
+    pub fn is_large(&self) -> bool {
+        self.large_tier()
+    }
+
     /// Footer / fine-print font (baseline FONT_5X8).
     pub fn font_small(&self) -> &'static MonoFont<'static> {
         if self.large_tier() {

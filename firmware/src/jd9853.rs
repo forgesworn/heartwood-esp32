@@ -10,7 +10,7 @@
 
 use core::convert::Infallible;
 
-use embedded_graphics::pixelcolor::BinaryColor;
+use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::prelude::*;
 
 use esp_idf_hal::delay::FreeRtos;
@@ -71,13 +71,6 @@ impl<'a> Jd9853Display<'a> {
         // Backlight on at full brightness via LEDC PWM (GPIO23).
         let max = disp.backlight.get_max_duty();
         disp.backlight.set_duty(max).ok();
-
-        // Diagnostic: fill red — shows as cyan with INVON active.
-        disp.framebuffer.chunks_exact_mut(2).for_each(|b| {
-            b[0] = 0xF8;
-            b[1] = 0x00;
-        });
-        disp.flush().ok();
 
         disp
     }
@@ -219,7 +212,7 @@ impl OriginDimensions for Jd9853Display<'_> {
 }
 
 impl DrawTarget for Jd9853Display<'_> {
-    type Color = BinaryColor;
+    type Color = Rgb565;
     type Error = Infallible;
 
     fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
@@ -230,13 +223,12 @@ impl DrawTarget for Jd9853Display<'_> {
         for Pixel(p, colour) in pixels {
             if p.x >= 0 && p.y >= 0 && p.x < w && p.y < h {
                 let idx = (p.y * w + p.x) as usize * 2;
-                // BinaryColor::On → white (0xFFFF), Off → black (0x0000).
-                let (hi, lo) = match colour {
-                    BinaryColor::On => (0xFF, 0xFF),
-                    BinaryColor::Off => (0x00, 0x00),
-                };
-                self.framebuffer[idx] = hi;
-                self.framebuffer[idx + 1] = lo;
+                // Pack Rgb565 (5/6/5) into a big-endian u16 for the panel RAM.
+                let raw = ((colour.r() as u16) << 11)
+                    | ((colour.g() as u16) << 5)
+                    | (colour.b() as u16);
+                self.framebuffer[idx] = (raw >> 8) as u8;
+                self.framebuffer[idx + 1] = (raw & 0xFF) as u8;
             }
         }
         Ok(())

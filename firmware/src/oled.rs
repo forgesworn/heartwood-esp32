@@ -204,7 +204,11 @@ pub fn show_npub(display: &mut Display<'_>, npub: &str) {
 
     // Wrap the npub across as many lines as fit, then centre the block in the
     // space below the rule so it fills the panel instead of floating at the top.
-    let cpl = l.chars_per_line(npub_font);
+    // Reserve the same left margin we draw at (sx(2)) on the right as well, or
+    // the last glyph of each line clips off the panel edge (chars_per_line uses
+    // the full width and ignores the draw offset).
+    let margin = l.sx(2);
+    let cpl = (((l.w - 2 * margin) / Layout::glyph_w(npub_font)).max(1)) as usize;
     let glyph_h = npub_font.character_size.height as i32;
     let line_h = glyph_h + l.s(2);
     let n_lines = ((npub.len() + cpl - 1) / cpl) as i32;
@@ -606,6 +610,69 @@ pub fn show_awaiting(display: &mut Display<'_>) {
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
     }
+}
+
+/// Friendly "no identity yet" screen shown while a fresh device waits for its
+/// first master to be provisioned over USB. Deliberately NOT the red error
+/// screen: a new device with no key is a normal starting state, not a fault. A
+/// brand-green header and centred call to action, so it reads as "set me up".
+pub fn show_provision_wait(display: &mut Display<'_>) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new().font(l.font_header()).text_color(ACCENT).build();
+    let large = MonoTextStyleBuilder::new().font(l.font_large()).text_color(FG).build();
+    let small = MonoTextStyleBuilder::new().font(l.font_small()).text_color(MUTED).build();
+
+    let hdr = "HEARTWOOD";
+    Text::new(hdr, Point::new(l.center_x(hdr.len() as i32 * Layout::glyph_w(l.font_header())), l.sy(10)), header)
+        .draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT)).draw(display).ok();
+
+    let title = "Set me up";
+    Text::new(title, Point::new(l.center_x(title.len() as i32 * Layout::glyph_w(l.font_large())), l.sy(38)), large)
+        .draw(display).ok();
+    let hint = "Connect to Sapwood";
+    Text::new(hint, Point::new(l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(52)), small)
+        .draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Success screen shown once the first master is provisioned, just before the
+/// device reboots into signer mode. Green framing (a good outcome) with each
+/// line centred on its own width. Replaces the generic result screen here,
+/// whose full-width white rules read as a display glitch and whose centring is
+/// wrong for a two-line message. Lingers, then the caller reboots.
+pub fn show_provisioned(display: &mut Display<'_>) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new().font(l.font_header()).text_color(ACCENT).build();
+    let large = MonoTextStyleBuilder::new().font(l.font_large()).text_color(OK).build();
+    let small = MonoTextStyleBuilder::new().font(l.font_small()).text_color(MUTED).build();
+
+    let hdr = "HEARTWOOD";
+    Text::new(hdr, Point::new(l.center_x(hdr.len() as i32 * Layout::glyph_w(l.font_header())), l.sy(10)), header)
+        .draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT)).draw(display).ok();
+
+    let title = "Provisioned";
+    Text::new(title, Point::new(l.center_x(title.len() as i32 * Layout::glyph_w(l.font_large())), l.sy(38)), large)
+        .draw(display).ok();
+    let hint = "Starting wifi...";
+    Text::new(hint, Point::new(l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(52)), small)
+        .draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+
+    FreeRtos::delay_ms(2000);
 }
 
 /// Display an error message on the OLED.

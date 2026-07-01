@@ -200,7 +200,7 @@ fn main() {
     // If no masters are provisioned, wait for a provision frame before continuing.
     if loaded_masters.is_empty() {
         log::info!("No masters provisioned — entering provision-wait mode");
-        oled::show_error(&mut display, "No masters --\nprovision me");
+        oled::show_provision_wait(&mut display);
 
         loop {
             let frame = protocol::read_frame(&mut usb);
@@ -250,7 +250,7 @@ fn main() {
                             .unwrap_or(false);
                         if wifi_armed {
                             log::info!("Wifi-standalone configured — rebooting into signer mode");
-                            oled::show_result(&mut display, "Provisioned!\nStarting wifi...");
+                            oled::show_provisioned(&mut display);
                             esp_idf_hal::delay::FreeRtos::delay_ms(800);
                             unsafe { esp_idf_svc::sys::esp_restart() };
                         }

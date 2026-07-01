@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "heartwood-esp32"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "crc32fast",
  "embedded-graphics",

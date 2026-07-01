@@ -6,6 +6,7 @@
 // hardware-identical between boards.
 
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
+use embedded_graphics::pixelcolor::raw::RawU16;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
@@ -179,7 +180,12 @@ fn layout(display: &Display<'_>) -> Layout {
 ///   Header:   "IDENTITY" (header font, tracked)
 ///   Rule:     1px horizontal line
 ///   Body:     npub split across lines (small font for density)
-pub fn show_npub(display: &mut Display<'_>, name: Option<&str>, npub: &str) {
+pub fn show_npub(
+    display: &mut Display<'_>,
+    name: Option<&str>,
+    npub: &str,
+    avatar: Option<(u8, u8, &[u8])>,
+) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -219,24 +225,48 @@ pub fn show_npub(display: &mut Display<'_>, name: Option<&str>, npub: &str) {
             Some(n) => {
                 let area_top = l.sy(14);
                 let area_h = l.h - area_top;
-                let r = area_h * 36 / 100;
                 let cy = area_top + area_h / 2;
+                // Avatar/disc radius: half the provisioned avatar if present, else
+                // a default disc sized to the panel.
+                let r = match avatar {
+                    Some((w, _, _)) => (w as i32) / 2,
+                    None => (area_h * 36 / 100).min(40),
+                };
                 let cx = l.sx(5) + r;
-                // Placeholder avatar disc with the initial, until the device can
-                // fetch + decode the real picture.
-                Circle::new(Point::new(cx - r, cy - r), (r * 2) as u32)
-                    .into_styled(PrimitiveStyle::with_fill(NOSTR))
-                    .draw(display)
-                    .ok();
-                let init = n.chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('?').to_string();
-                let lf = l.font_large();
-                let init_style = MonoTextStyleBuilder::new().font(lf).text_color(FG).build();
-                let iw = Layout::glyph_w(lf);
-                let ih = lf.character_size.height as i32;
-                Text::new(&init, Point::new(cx - iw / 2, cy + ih / 3), init_style).draw(display).ok();
-                // Name: right-aligned, vertically centred, shrunk if it won't fit.
-                // Generous right margin: this panel's visible edge falls short of
-                // the nominal width, so hugging the edge clips the last glyphs.
+                match avatar {
+                    // Blit the pre-resized Rgb565 avatar (Sapwood circular-cropped
+                    // it on black, so it reads as a disc on the black background).
+                    Some((w, h, bytes)) if bytes.len() == (w as usize) * (h as usize) * 2 => {
+                        let (aw, ah) = (w as i32, h as i32);
+                        let area = Rectangle::new(
+                            Point::new(cx - aw / 2, cy - ah / 2),
+                            Size::new(aw as u32, ah as u32),
+                        );
+                        let px = bytes
+                            .chunks_exact(2)
+                            .map(|c| Rgb565::from(RawU16::new(u16::from_be_bytes([c[0], c[1]]))));
+                        display.fill_contiguous(&area, px).ok();
+                    }
+                    // No (valid) avatar yet: placeholder disc with the initial.
+                    _ => {
+                        Circle::new(Point::new(cx - r, cy - r), (r * 2) as u32)
+                            .into_styled(PrimitiveStyle::with_fill(NOSTR))
+                            .draw(display)
+                            .ok();
+                        let init =
+                            n.chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('?').to_string();
+                        let lf = l.font_large();
+                        let init_style = MonoTextStyleBuilder::new().font(lf).text_color(FG).build();
+                        let iw = Layout::glyph_w(lf);
+                        let ih = lf.character_size.height as i32;
+                        Text::new(&init, Point::new(cx - iw / 2, cy + ih / 3), init_style)
+                            .draw(display)
+                            .ok();
+                    }
+                }
+                // Right block: name above the short npub, both right-aligned, the
+                // pair vertically centred beside the avatar. Name shrinks if it
+                // won't fit; generous right margin for this panel's short edge.
                 let right = l.w - l.sx(14);
                 let avail = right - (cx + r) - l.sx(4);
                 let nf = if (n.len() as i32 * Layout::glyph_w(l.font_body())) <= avail {
@@ -244,10 +274,19 @@ pub fn show_npub(display: &mut Display<'_>, name: Option<&str>, npub: &str) {
                 } else {
                     l.font_small()
                 };
+                let sf = l.font_small();
+                let nh = nf.character_size.height as i32;
+                let sh = sf.character_size.height as i32;
+                let gap = l.s(3);
+                let block_top = cy - (nh + gap + sh) / 2;
                 let name_style = MonoTextStyleBuilder::new().font(nf).text_color(FG).build();
                 let nw = n.len() as i32 * Layout::glyph_w(nf);
-                let nh = nf.character_size.height as i32;
-                Text::new(n, Point::new(right - nw, cy + nh / 3), name_style).draw(display).ok();
+                Text::new(n, Point::new(right - nw, block_top + nh), name_style).draw(display).ok();
+                let sub_style = MonoTextStyleBuilder::new().font(sf).text_color(MUTED).build();
+                let sw = short.len() as i32 * Layout::glyph_w(sf);
+                Text::new(&short, Point::new(right - sw, block_top + nh + gap + sh), sub_style)
+                    .draw(display)
+                    .ok();
             }
             // No profile yet: just the short npub, centred.
             None => {

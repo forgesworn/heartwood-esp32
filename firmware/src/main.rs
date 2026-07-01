@@ -44,6 +44,7 @@ mod board;
 mod button;
 mod connslot;
 mod identity_cache;
+mod identity_meta;
 mod layout;
 mod palette;
 mod masters;
@@ -83,7 +84,7 @@ const IDLE_POLL_MS: u32 = 50;
 
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::types::{
-    FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
+    FRAME_TYPE_ACK, FRAME_TYPE_ENCRYPTED_REQUEST, FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_NACK,
     FRAME_TYPE_SIGN_ENVELOPE,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
@@ -94,7 +95,7 @@ use heartwood_common::types::{
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_UPDATE,
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
     FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
-    FRAME_TYPE_SET_NET_CONFIG,
+    FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_IDENTITY_META,
 };
 use secp256k1::Secp256k1;
 
@@ -337,7 +338,12 @@ fn main() {
         let master = &loaded_masters[0];
         let npub = encode_npub(&master.pubkey);
         log::info!("Boot with master[0]: label={} npub={}", master.label, npub);
-        oled::show_npub(&mut display, None, &npub);
+        let meta = identity_meta::load(&nvs, master.slot);
+        let (name, avatar) = match &meta {
+            Some(m) => (Some(m.name.as_str()), Some((m.w, m.h, m.avatar.as_slice()))),
+            None => (None, None),
+        };
+        oled::show_npub(&mut display, name, &npub, avatar);
     } else {
         log::info!("Boot with {} masters", loaded_masters.len());
         oled::show_boot(&mut display, loaded_masters.len() as u8);
@@ -487,6 +493,24 @@ fn main() {
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
                     firmware_info_json().as_bytes(),
                 );
+            }
+
+            // 0x5B — Sapwood-provisioned display metadata (name + avatar). Stored
+            // in NVS; the signer never fetches/decodes images itself.
+            FRAME_TYPE_SET_IDENTITY_META => {
+                let ok = identity_meta::handle_frame(&frame.payload, &loaded_masters, &mut nvs);
+                protocol::write_frame(&mut usb, if ok { FRAME_TYPE_ACK } else { FRAME_TYPE_NACK }, &[]);
+                // Refresh the single-master identity card with the new avatar.
+                if ok && loaded_masters.len() == 1 {
+                    let m = &loaded_masters[0];
+                    let npub = encode_npub(&m.pubkey);
+                    let meta = identity_meta::load(&nvs, m.slot);
+                    let (name, avatar) = match &meta {
+                        Some(im) => (Some(im.name.as_str()), Some((im.w, im.h, im.avatar.as_slice()))),
+                        None => (None, None),
+                    };
+                    oled::show_npub(&mut display, name, &npub, avatar);
+                }
             }
 
             // 0x02 — plaintext NIP-46 request (only if bridge NOT authenticated)

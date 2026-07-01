@@ -81,6 +81,7 @@ pub const FRAME_TYPE_GENERATE_IDENTITY: u8 = 0x57;   // host -> device: optional
 pub const FRAME_TYPE_RESTORE_IDENTITY: u8 = 0x58;    // host -> device: optional [label_len][label]; device drives an on-screen one-button picker for the owner to re-enter an existing 12-word phrase, validates the checksum, stores it, replies ACK (npub) or NACK (cancel/invalid). The phrase is entered ON the device and is NEVER sent from the host.
 pub const FRAME_TYPE_FIRMWARE_INFO: u8 = 0x59;       // host -> device: empty; read-only version query. Safe (no secrets) so it is also served in WiFi mode.
 pub const FRAME_TYPE_FIRMWARE_INFO_RESPONSE: u8 = 0x5A; // device -> host: JSON { version, board }
+pub const FRAME_TYPE_SET_IDENTITY_META: u8 = 0x5B;   // host -> device: pre-resized display metadata for one identity, so the signer never fetches/decodes images itself. Payload: [pubkey 32][w 1][h 1][name_len 1][name UTF-8][avatar w*h*2 Rgb565 big-endian]. Reply ACK/NACK.
 
 // --- OTA frame types ---
 pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;

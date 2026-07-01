@@ -90,7 +90,9 @@ fn draw_idle<D: DrawTarget<Color = Rgb565>>(d: &mut D, name: Option<&str>, npub:
                 let iw = lf.character_size.width as i32;
                 let ih = lf.character_size.height as i32;
                 Text::new(&init, Point::new(cx - iw / 2, cy + ih / 3), style(lf, FG)).draw(d).ok();
-                // Name: right-aligned, vertically centred, shrunk if it won't fit.
+                // Right block: name above the short npub, both right-aligned,
+                // the pair vertically centred beside the avatar. Name shrinks if
+                // it won't fit; generous right margin for this panel's short edge.
                 let right = l.w - l.sx(14);
                 let avail = right - (cx + r) - l.sx(4);
                 let nf = if (n.len() as i32 * l.font_body().character_size.width as i32) <= avail {
@@ -98,9 +100,17 @@ fn draw_idle<D: DrawTarget<Color = Rgb565>>(d: &mut D, name: Option<&str>, npub:
                 } else {
                     l.font_small()
                 };
-                let nw = n.len() as i32 * nf.character_size.width as i32;
+                let sf = l.font_small();
                 let nh = nf.character_size.height as i32;
-                Text::new(n, Point::new(right - nw, cy + nh / 3), style(nf, FG)).draw(d).ok();
+                let sh = sf.character_size.height as i32;
+                let gap = l.s(3);
+                let block_top = cy - (nh + gap + sh) / 2;
+                let nw = n.len() as i32 * nf.character_size.width as i32;
+                Text::new(n, Point::new(right - nw, block_top + nh), style(nf, FG)).draw(d).ok();
+                let sw = short.len() as i32 * sf.character_size.width as i32;
+                Text::new(&short, Point::new(right - sw, block_top + nh + gap + sh), style(sf, MUTED))
+                    .draw(d)
+                    .ok();
             }
             // No profile yet: just the short npub, centred.
             None => {

@@ -254,7 +254,7 @@ pub fn show_recovery_word(display: &mut Display<'_>, index: usize, total: usize,
     let head = format!("WORD {} OF {}", index, total);
     Text::new(&head, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display)
         .ok();
 
@@ -294,7 +294,7 @@ pub fn show_generating(display: &mut Display<'_>) {
 
     Text::new("NEW IDENTITY", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display)
         .ok();
 
@@ -372,7 +372,7 @@ pub fn show_restore_intro(display: &mut Display<'_>) {
 
     Text::new("ENTER YOUR PHRASE", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display)
         .ok();
 
@@ -419,7 +419,7 @@ pub fn show_word_entry(
     let head = format!("WORD {}/{}", word_index, total);
     Text::new(&head, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display)
         .ok();
 
@@ -475,7 +475,7 @@ pub fn show_review_word(
     let head = format!("REVIEW {}/{}", index, total);
     Text::new(&head, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display)
         .ok();
 
@@ -514,7 +514,7 @@ pub fn show_review_action(display: &mut Display<'_>, label: &str, hint: &str) {
 
     Text::new("REVIEW", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display)
         .ok();
 
@@ -548,7 +548,7 @@ pub fn show_restore_confirm(display: &mut Display<'_>, npub: &str) {
 
     Text::new("THIS ACCOUNT?", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display)
         .ok();
 
@@ -597,7 +597,7 @@ pub fn show_awaiting(display: &mut Display<'_>) {
     Text::new("HEARTWOOD HSM", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
     Text::new("Awaiting", Point::new(l.sx(14), l.sy(38)), large).draw(display).ok();
@@ -663,7 +663,7 @@ pub fn show_sign_request(
     Text::new(&heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
     // Kind (large)
@@ -802,7 +802,7 @@ pub fn show_boot(display: &mut Display<'_>, master_count: u8) {
     Text::new("HEARTWOOD HSM", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
     // Large master count
@@ -856,7 +856,7 @@ pub fn show_bridge_connected(
     Text::new("BRIDGE CONNECTED", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
     // Master count large on left
@@ -916,7 +916,7 @@ pub fn show_master_sign_request(
     Text::new(label, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
     // Method + kind
@@ -972,7 +972,7 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
     Text::new("AUTO-APPROVED", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
     let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_body()))];
@@ -1152,7 +1152,7 @@ pub fn show_signing(display: &mut Display<'_>) {
     Text::new("PROCESSING", Point::new(l.sx(14), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
     Text::new("Signing", Point::new(l.sx(19), l.sy(40)), large).draw(display).ok();
@@ -1430,7 +1430,7 @@ pub fn show_ota_approval(
 
     // Horizontal rule
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
     // Firmware size -- large and centred
@@ -1668,7 +1668,7 @@ pub fn show_identity_switch(
     Text::new("IDENTITY SWITCH", Point::new(l.sx(2), l.sy(10)), header_style).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(FG))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
     let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_body()))];

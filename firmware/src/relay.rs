@@ -959,7 +959,9 @@ fn handle_mgmt_event(
 
 /// Execute one authenticated management method. Maps onto the same
 /// connslot/policy operations as the USB path. `create_client` mirrors
-/// `CONNSLOT_CREATE`; trust-root/seed changes are deliberately NOT exposed.
+/// `CONNSLOT_CREATE`; `list_identities` enumerates the served identities
+/// (master + personas) with their bunker URIs for discovery; trust-root/seed
+/// changes are deliberately NOT exposed.
 fn dispatch_mgmt(
     method: &str,
     req: &serde_json::Value,
@@ -1003,17 +1005,7 @@ fn dispatch_mgmt(
                         ctx.policy_engine.upgrade_to_signing(master_slot, index);
                     }
                     ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
-                    let relay_params = ctx
-                        .relays
-                        .iter()
-                        .map(|r| format!("relay={r}"))
-                        .collect::<Vec<_>>()
-                        .join("&");
-                    let bunker_uri = if relay_params.is_empty() {
-                        format!("bunker://{master_hex}?secret={secret_hex}")
-                    } else {
-                        format!("bunker://{master_hex}?{relay_params}&secret={secret_hex}")
-                    };
+                    let bunker_uri = mgmt::bunker_uri(&master_hex, &ctx.relays, Some(&secret_hex));
                     log::info!(
                         "[relay] mgmt: created client slot {index} ({label}){}",
                         if auto_sign { " [signing pre-approved]" } else { "" }
@@ -1075,6 +1067,47 @@ fn dispatch_mgmt(
                 })
                 .collect();
             Ok(serde_json::json!({ "clients": clients }))
+        }
+
+        // Enumerate every identity this master serves (itself + its personas)
+        // with a ready-to-paste bunker URI — the wifi-standalone analogue of the
+        // sidecar's `bunker-uris.json` manifest. Closes the discovery gap: the
+        // operator no longer has to hand-build a persona URI from a known npub.
+        //
+        // Discovery only — the URIs carry NO secret. Authorisation is orthogonal:
+        // the `#p` pubkey selects the signing identity, while a client is bound to
+        // a policy slot by the per-client secret from `create_client`. (One secret
+        // shared across identities would make distinct client keys collide on a
+        // single slot.) Until a client is bound to a signing-approved slot the
+        // first sign_event needs a physical PRG press; safe methods auto-approve.
+        "list_identities" => {
+            let master_label = ctx.masters[master_idx].label.clone();
+            let master_uri = mgmt::bunker_uri(&master_hex, &ctx.relays, None);
+            let mut identities = vec![serde_json::json!({
+                "label": master_label,
+                "kind": "master",
+                "npub_hex": master_hex,
+                "bunker_uri": master_uri,
+            })];
+            for p in ctx.personas.iter().filter(|p| p.master_slot == master_slot) {
+                let pk_hex = hex_encode(&p.pubkey);
+                let label = p.name.clone().unwrap_or_else(|| p.purpose.clone());
+                let uri = mgmt::bunker_uri(&pk_hex, &ctx.relays, None);
+                identities.push(serde_json::json!({
+                    "label": label,
+                    "kind": "persona",
+                    "purpose": p.purpose.clone(),
+                    "index": p.index,
+                    "npub_hex": pk_hex,
+                    "bunker_uri": uri,
+                }));
+            }
+            let persona_count = identities.len() - 1;
+            log::info!("[relay] mgmt: list_identities → 1 master + {persona_count} persona(s)");
+            Ok(serde_json::json!({
+                "identities": identities,
+                "note": "discovery only — URIs carry no secret; for unattended signing bind a client with create_client (use its secret) or approve the first sign_event with a physical PRG press",
+            }))
         }
 
         // Revoke a client slot (operator-authorised — same authority as create).

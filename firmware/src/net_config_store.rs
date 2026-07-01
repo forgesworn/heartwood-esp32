@@ -84,9 +84,29 @@ pub fn handle_set_net_config(
             match write_net_config(nvs, payload) {
                 Ok(()) => {
                     log::info!("Network config written to NVS");
-                    crate::oled::show_result(display, "Network config\nset");
+                    // WiFi-standalone is entered at boot from this config, so a
+                    // wifi save applies by rebooting straight into the relay loop
+                    // — no manual power-cycle. USB (radio-off) saves just persist
+                    // and take effect immediately in the running dispatch loop.
+                    let wifi = cfg.device_mode()
+                        == heartwood_common::net_config::DeviceMode::Wifi;
+                    crate::oled::show_result(
+                        display,
+                        if wifi {
+                            "Network config set\nStarting wifi..."
+                        } else {
+                            "Network config\nset"
+                        },
+                    );
                     esp_idf_hal::delay::FreeRtos::delay_ms(1500);
                     protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+                    if wifi {
+                        // Brief delay so the ACK flushes to the host before the
+                        // USB CDC drops on restart.
+                        esp_idf_hal::delay::FreeRtos::delay_ms(300);
+                        log::info!("WiFi config saved — rebooting into signer mode");
+                        unsafe { esp_idf_svc::sys::esp_restart() };
+                    }
                 }
                 Err(e) => {
                     log::error!("Failed to write network config: {e}");

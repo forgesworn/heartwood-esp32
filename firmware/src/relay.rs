@@ -46,11 +46,15 @@ use heartwood_common::net_config::NetConfig;
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
 use heartwood_common::types::{
+    FRAME_TYPE_ACK, FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_REVOKE,
-    FRAME_TYPE_CONNSLOT_UPDATE, FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_FIRMWARE_INFO,
-    FRAME_TYPE_FIRMWARE_INFO_RESPONSE, FRAME_TYPE_NACK,
-    FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_SESSION_AUTH,
-    FRAME_TYPE_SET_BRIDGE_SECRET,
+    FRAME_TYPE_CONNSLOT_UPDATE, FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_ENCRYPTED_REQUEST,
+    FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
+    FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST,
+    FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN, FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH,
+    FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
+    FRAME_TYPE_RESTORE_IDENTITY, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET,
+    FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_PIN, FRAME_TYPE_SIGN_ENVELOPE,
 };
 
 use crate::identity_cache::IdentityCache;
@@ -107,6 +111,13 @@ struct SignCtx<'a, 'd, 'b> {
     policy_engine: &'a mut PolicyEngine,
     identity_caches: &'a mut Vec<IdentityCache>,
     nvs: &'a mut EspNvs<NvsDefault>,
+    /// Persona registry, needed by the encrypted (bridge) USB signing path so
+    /// the cable stays fully usable in wifi mode. Not touched by the relay
+    /// signing path, so it does not affect the `masters` borrow discipline.
+    personas: &'a mut Vec<crate::personas::LoadedPersona>,
+    /// In-flight OTA transfer, when a firmware update is being streamed over USB
+    /// while in wifi mode. `None` when idle.
+    ota_session: Option<crate::ota::OtaSession>,
     /// Operator pubkey authorised for kind-24134 management (`None` disables it).
     op_mgmt: Option<[u8; 32]>,
     /// The relay currently being served (one of `relays`).
@@ -135,6 +146,7 @@ pub fn run_wifi_standalone<'d, 'b>(
     modem: Modem,
     cfg: &NetConfig,
     masters: &[LoadedMaster],
+    personas: &mut Vec<crate::personas::LoadedPersona>,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'d>,
     button_pin: &PinDriver<'b, Input>,
@@ -199,6 +211,8 @@ pub fn run_wifi_standalone<'d, 'b>(
         policy_engine,
         identity_caches,
         nvs,
+        personas,
+        ota_session: None,
         op_mgmt,
         relay_url: relays.first().cloned().unwrap_or_default(),
         relays: relays.clone(),
@@ -209,8 +223,15 @@ pub fn run_wifi_standalone<'d, 'b>(
 
     loop {
         if let Err(e) = wifi.connect().and_then(|_| wifi.wait_netif_up()) {
-            log::error!("[relay] wifi connect failed: {e:?}; retry in 3s");
-            FreeRtos::delay_ms(3000);
+            // Keep serving USB while wifi is unreachable, so a bad SSID/password
+            // (or relay) can always be fixed over the cable — this is why the
+            // old "hold PRG at boot for USB" escape hatch is no longer needed.
+            log::error!("[relay] wifi connect failed: {e:?}; serving USB, retry in 3s");
+            let until = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < until {
+                poll_usb(usb, &mut ctx);
+                FreeRtos::delay_ms(20);
+            }
             continue;
         }
         log::info!("[relay] wifi up");
@@ -357,19 +378,30 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
             }
         }
 
-        // Also serve USB management while in wifi mode, so the device can be
-        // managed over the cable as well as its relay. Non-blocking: a quiet
+        // Also serve the FULL USB command set while in wifi mode, so the cable
+        // stays completely usable alongside the relay. Non-blocking: a quiet
         // poll returns immediately and never delays the relay/signing path.
-        poll_usb_mgmt(usb, ctx);
+        poll_usb(usb, ctx);
     }
 }
 
-/// Serve one USB management frame while the relay loop runs, so a
-/// wifi-standalone signer can be managed over the cable too. Non-blocking — a
-/// quiet poll returns at once. Only the management subset is accepted: anything
-/// that changes the master set (which the live relay subscription is built
-/// from) or streams firmware is rejected with a hint to use USB-only mode.
-fn poll_usb_mgmt(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
+/// Reboot after a command changed persisted state the live relay subscription
+/// depends on (the master set). The subscription is built from the masters at
+/// boot, so re-deriving from fresh NVS on the next boot is the simplest correct
+/// way to pick up an add/remove — cheaper to reason about than live re-subscribe.
+fn reboot_after_state_change(reason: &str) {
+    log::info!("[relay] {reason} — rebooting to re-derive signer state");
+    // Let the ACK flush to the host before the USB CDC drops on restart.
+    FreeRtos::delay_ms(400);
+    unsafe { esp_idf_svc::sys::esp_restart() };
+}
+
+/// Serve one USB frame while the relay loop runs — the FULL command set, so the
+/// cable stays completely usable in wifi mode (signing + management + OTA), not
+/// a restricted subset. Non-blocking: a quiet poll returns at once. Commands
+/// that change the master set reboot afterwards so the relay subscription
+/// re-derives from fresh NVS. Mirrors the USB-only dispatch loop in `main`.
+fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
     let frame = match crate::protocol::try_read_frame(usb, 0) {
         Some(f) => f,
         None => return,
@@ -383,20 +415,84 @@ fn poll_usb_mgmt(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
     ctx.last_activity = Instant::now();
 
     match frame.frame_type {
-        // Relay-mediated management lists masters only for now; per-identity
-        // persona discovery over the relay transport is a follow-up.
-        FRAME_TYPE_PROVISION_LIST => crate::provision::handle_list(usb, ctx.masters, &[]),
         FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
             usb,
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
             crate::firmware_info_json().as_bytes(),
         ),
+
+        FRAME_TYPE_PROVISION_LIST => {
+            crate::provision::handle_list(usb, ctx.masters, ctx.personas)
+        }
+
+        // Plaintext NIP-46 — only when the bridge is not authenticated (mirrors
+        // the USB-only loop). Uses the first master, like the tethered path.
+        FRAME_TYPE_NIP46_REQUEST => {
+            if ctx.policy_engine.bridge_authenticated || ctx.masters.is_empty() {
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            } else {
+                let master_secret = ctx.masters[0].secret;
+                let master_label = ctx.masters[0].label.clone();
+                let master_mode = ctx.masters[0].mode;
+                let master_slot = ctx.masters[0].slot;
+                let response_json = crate::nip46_handler::handle_request(
+                    &frame,
+                    &master_secret,
+                    &master_label,
+                    master_mode,
+                    master_slot,
+                    ctx.secp,
+                    ctx.display,
+                    ctx.button_pin,
+                    ctx.policy_engine,
+                    ctx.identity_caches,
+                    None,
+                );
+                crate::protocol::write_frame(usb, FRAME_TYPE_NIP46_RESPONSE, response_json.as_bytes());
+                ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+            }
+        }
+
+        // Encrypted NIP-46 (bridge transport) — requires an authenticated bridge.
+        FRAME_TYPE_ENCRYPTED_REQUEST => {
+            if !ctx.policy_engine.bridge_authenticated {
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            } else {
+                crate::transport::handle_encrypted_request(
+                    usb,
+                    &frame,
+                    ctx.masters,
+                    ctx.personas,
+                    ctx.secp,
+                    ctx.display,
+                    ctx.button_pin,
+                    ctx.policy_engine,
+                    ctx.identity_caches,
+                    ctx.nvs,
+                );
+            }
+        }
+
+        // Deprecated inline-envelope signing — explicit reject like the USB loop.
+        FRAME_TYPE_SIGN_ENVELOPE => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]),
+
         FRAME_TYPE_SESSION_AUTH => {
             crate::session::handle_auth(usb, &frame.payload, ctx.nvs, ctx.policy_engine)
         }
         FRAME_TYPE_SET_BRIDGE_SECRET => crate::session::handle_set_bridge_secret(
             usb, &frame.payload, ctx.nvs, ctx.policy_engine, ctx.display, ctx.button_pin,
         ),
+
+        // Network reconfig — the handler reboots into the new mode itself on a
+        // wifi save (and simply persists a radio-off save).
+        FRAME_TYPE_SET_NET_CONFIG => crate::net_config_store::handle_set_net_config(
+            usb, &frame.payload, ctx.nvs, ctx.display, ctx.button_pin,
+        ),
+
+        FRAME_TYPE_SET_PIN => {
+            crate::pin::handle_set_pin(usb, &frame.payload, ctx.nvs, ctx.display, ctx.button_pin)
+        }
+
         FRAME_TYPE_CONNSLOT_CREATE => {
             crate::connslot::handle_create(usb, &frame, ctx.policy_engine, ctx.masters, ctx.nvs)
         }
@@ -410,13 +506,78 @@ fn poll_usb_mgmt(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
         FRAME_TYPE_CONNSLOT_URI => {
             crate::connslot::handle_uri(usb, &frame, ctx.policy_engine, ctx.masters)
         }
+
+        FRAME_TYPE_BACKUP_EXPORT_REQUEST => {
+            crate::backup::handle_export(usb, ctx.masters, ctx.policy_engine, ctx.nvs)
+        }
+        FRAME_TYPE_BACKUP_IMPORT_REQUEST => crate::backup::handle_import(
+            usb,
+            &frame.payload,
+            ctx.masters,
+            ctx.policy_engine,
+            ctx.nvs,
+            ctx.display,
+            ctx.button_pin,
+        ),
+
+        // OTA — the finish handler verifies the image and reboots into it.
+        FRAME_TYPE_OTA_BEGIN => crate::ota::handle_ota_begin(
+            usb,
+            &frame.payload,
+            ctx.display,
+            ctx.button_pin,
+            &mut ctx.ota_session,
+        ),
+        FRAME_TYPE_OTA_CHUNK => {
+            crate::ota::handle_ota_chunk(usb, &frame.payload, ctx.display, &mut ctx.ota_session)
+        }
+        FRAME_TYPE_OTA_FINISH => {
+            crate::ota::handle_ota_finish(usb, ctx.display, &mut ctx.ota_session)
+        }
+
+        // Master-set changes: perform, then reboot so the relay re-subscribes
+        // from the fresh master set. `masters` here is a shared slice, so the
+        // add handlers persist to NVS and we reboot rather than mutate in place.
+        FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
+            let provisioned = match frame.frame_type {
+                FRAME_TYPE_GENERATE_IDENTITY => crate::provision::handle_generate(
+                    usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.button_pin,
+                ),
+                FRAME_TYPE_RESTORE_IDENTITY => crate::provision::handle_restore(
+                    usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.button_pin,
+                ),
+                _ => crate::provision::handle_add(usb, &frame, ctx.nvs, ctx.secp, ctx.display),
+            };
+            if provisioned.is_some() {
+                reboot_after_state_change("master added");
+            }
+        }
+        FRAME_TYPE_PROVISION_REMOVE => {
+            if frame.payload.len() == 1 {
+                let slot = frame.payload[0];
+                match crate::masters::remove_master(ctx.nvs, slot) {
+                    Ok(()) => {
+                        crate::oled::show_error(ctx.display, &format!("Removed slot {slot}"));
+                        crate::protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+                        reboot_after_state_change("master removed");
+                    }
+                    Err(e) => {
+                        log::error!("[relay] remove master slot {slot} failed: {e}");
+                        crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                    }
+                }
+            } else {
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            }
+        }
+        // Factory reset wipes NVS and reboots inside the handler.
+        FRAME_TYPE_FACTORY_RESET => {
+            crate::provision::handle_factory_reset(usb, ctx.nvs, ctx.display, ctx.button_pin)
+        }
+
         other => {
-            log::warn!("[relay] USB frame 0x{other:02x} unsupported in wifi mode");
-            crate::protocol::write_frame(
-                usb,
-                FRAME_TYPE_NACK,
-                b"wifi mode: hold PRG at boot for USB-only operations",
-            );
+            log::warn!("[relay] USB frame 0x{other:02x} not recognised");
+            crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"unknown frame");
         }
     }
 }

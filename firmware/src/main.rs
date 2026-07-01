@@ -359,71 +359,34 @@ fn main() {
         }
     }
 
-    // --- USB escape hatch ---
-    // wifi-standalone is otherwise a one-way door: NVS holds mode=wifi and the
-    // relay loop has no USB listener, so the device can't be re-managed over USB
-    // (e.g. to create a client) without wiping NVS, which would destroy the
-    // master. Holding PRG during a short post-boot window forces USB mode for
-    // this boot only. GPIO0 can't be held through reset (that enters the ROM
-    // download mode), so we sample AFTER boot, prompting on the OLED.
-    let force_usb_mode = {
-        let wifi_armed = net_cfg
-            .as_ref()
-            .map(|c| c.device_mode() == heartwood_common::net_config::DeviceMode::Wifi)
-            .unwrap_or(false)
-            && !loaded_masters.is_empty();
-        let mut forced = false;
-        if wifi_armed {
-            log::info!("Hold PRG within 3s to force USB mode (skip wifi)…");
-            oled::show_result(&mut display, "Hold PRG = USB");
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_millis(3000) {
-                if button_pin.is_low() {
-                    forced = true;
-                    log::info!("PRG held — forcing USB mode for this boot");
-                    oled::show_result(&mut display, "USB mode (forced)");
-                    break;
-                }
-                esp_idf_hal::delay::FreeRtos::delay_ms(50);
-            }
-            if !forced {
-                // Restore the boot screen the prompt overwrote.
-                if loaded_masters.len() == 1 {
-                    oled::show_npub(&mut display, &encode_npub(&loaded_masters[0].pubkey));
-                } else {
-                    oled::show_boot(&mut display, loaded_masters.len() as u8);
-                }
-            }
-        }
-        forced
-    };
-
     // --- WiFi-standalone (Plan 2): relay signing loop ---
     // In wifi mode the device handles NIP-46 over its own outbound relay
-    // connection — no USB bridge, no inbound listener. usb mode (or a forced
-    // escape hatch) falls through to the frame dispatch loop below. Never
-    // returns once entered.
-    if !force_usb_mode {
-        if let Some(cfg) = &net_cfg {
-            if cfg.device_mode() == heartwood_common::net_config::DeviceMode::Wifi
-                && !loaded_masters.is_empty()
-            {
-                log::info!("WiFi-standalone mode — entering relay loop");
-                let op_mgmt = cfg.op_mgmt_pubkey();
-                relay::run_wifi_standalone(
-                    modem,
-                    cfg,
-                    &loaded_masters,
-                    &secp,
-                    &mut display,
-                    &button_pin,
-                    &mut policy_engine,
-                    &mut identity_caches,
-                    &mut nvs,
-                    op_mgmt,
-                    &mut usb,
-                );
-            }
+    // connection AND serves the full USB command set over the cable (see
+    // relay::poll_usb) — so the cable stays completely usable without any mode
+    // switch. The old "hold PRG at boot to force USB" escape hatch is therefore
+    // gone: USB is always live, even while wifi is down (a bad SSID/relay can be
+    // fixed over the cable). `mode=usb` remains the explicit radio-off tier and
+    // falls through to the dispatch loop below. Never returns once entered.
+    if let Some(cfg) = &net_cfg {
+        if cfg.device_mode() == heartwood_common::net_config::DeviceMode::Wifi
+            && !loaded_masters.is_empty()
+        {
+            log::info!("WiFi-standalone mode — entering relay loop");
+            let op_mgmt = cfg.op_mgmt_pubkey();
+            relay::run_wifi_standalone(
+                modem,
+                cfg,
+                &loaded_masters,
+                &mut loaded_personas,
+                &secp,
+                &mut display,
+                &button_pin,
+                &mut policy_engine,
+                &mut identity_caches,
+                &mut nvs,
+                op_mgmt,
+                &mut usb,
+            );
         }
     }
 

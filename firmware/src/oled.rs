@@ -8,7 +8,7 @@
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Baseline, Text};
 
 // The mono SSD1306 adapter thresholds colours to on/off; only that (mono-only)
@@ -179,7 +179,7 @@ fn layout(display: &Display<'_>) -> Layout {
 ///   Header:   "IDENTITY" (header font, tracked)
 ///   Rule:     1px horizontal line
 ///   Body:     npub split across lines (small font for density)
-pub fn show_npub(display: &mut Display<'_>, npub: &str) {
+pub fn show_npub(display: &mut Display<'_>, name: Option<&str>, npub: &str) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -195,32 +195,85 @@ pub fn show_npub(display: &mut Display<'_>, npub: &str) {
         .text_color(FG)
         .build();
 
-    Text::new("IDENTITY", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Text::new("MASTER", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     // Rule (brand accent)
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    // Wrap the npub across as many lines as fit, then centre the block in the
-    // space below the rule so it fills the panel instead of floating at the top.
-    // Reserve the same left margin we draw at (sx(2)) on the right as well, or
-    // the last glyph of each line clips off the panel edge (chars_per_line uses
-    // the full width and ignores the draw offset).
-    let margin = l.sx(2);
-    let cpl = (((l.w - 2 * margin) / Layout::glyph_w(npub_font)).max(1)) as usize;
-    let glyph_h = npub_font.character_size.height as i32;
-    let line_h = glyph_h + l.s(2);
-    let n_lines = ((npub.len() + cpl - 1) / cpl) as i32;
-    let top = l.sy(16);
-    let block_h = n_lines * line_h;
-    let mut y = top + ((l.h - top - block_h) / 2).max(0) + glyph_h;
-    let mut pos = 0;
-    while pos < npub.len() {
-        let end = core::cmp::min(pos + cpl, npub.len());
-        Text::new(&npub[pos..end], Point::new(l.sx(2), y), body).draw(display).ok();
-        y += line_h;
-        pos = end;
+    let gw = Layout::glyph_w(npub_font);
+    if l.is_large() {
+        // Colour panels: a short, centred npub (head...tail). The full 63-char
+        // key in the big font runs edge to edge and clips on any panel offset;
+        // the shortened form is what clients show. The full key belongs on the
+        // QR page.
+        let short = if npub.len() > 24 {
+            format!("{}...{}", &npub[..10], &npub[npub.len() - 6..])
+        } else {
+            npub.to_string()
+        };
+        match name {
+            // Kind 0 known: a contact card — avatar disc on the left, name
+            // right-aligned, no npub (it belongs on the QR page).
+            Some(n) => {
+                let area_top = l.sy(14);
+                let area_h = l.h - area_top;
+                let r = area_h * 36 / 100;
+                let cy = area_top + area_h / 2;
+                let cx = l.sx(5) + r;
+                // Placeholder avatar disc with the initial, until the device can
+                // fetch + decode the real picture.
+                Circle::new(Point::new(cx - r, cy - r), (r * 2) as u32)
+                    .into_styled(PrimitiveStyle::with_fill(NOSTR))
+                    .draw(display)
+                    .ok();
+                let init = n.chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('?').to_string();
+                let lf = l.font_large();
+                let init_style = MonoTextStyleBuilder::new().font(lf).text_color(FG).build();
+                let iw = Layout::glyph_w(lf);
+                let ih = lf.character_size.height as i32;
+                Text::new(&init, Point::new(cx - iw / 2, cy + ih / 3), init_style).draw(display).ok();
+                // Name: right-aligned, vertically centred, shrunk if it won't fit.
+                // Generous right margin: this panel's visible edge falls short of
+                // the nominal width, so hugging the edge clips the last glyphs.
+                let right = l.w - l.sx(14);
+                let avail = right - (cx + r) - l.sx(4);
+                let nf = if (n.len() as i32 * Layout::glyph_w(l.font_body())) <= avail {
+                    l.font_body()
+                } else {
+                    l.font_small()
+                };
+                let name_style = MonoTextStyleBuilder::new().font(nf).text_color(FG).build();
+                let nw = n.len() as i32 * Layout::glyph_w(nf);
+                let nh = nf.character_size.height as i32;
+                Text::new(n, Point::new(right - nw, cy + nh / 3), name_style).draw(display).ok();
+            }
+            // No profile yet: just the short npub, centred.
+            None => {
+                let x = l.center_x(short.len() as i32 * gw);
+                Text::new(&short, Point::new(x, l.sy(40)), body).draw(display).ok();
+            }
+        }
+    } else {
+        // Mono OLED: the small font fits the full npub wrapped across lines.
+        // Reserve the draw margin (sx(2)) on both sides so the last glyph of each
+        // line never clips off the panel edge.
+        let margin = l.sx(2);
+        let cpl = (((l.w - 2 * margin) / gw).max(1)) as usize;
+        let glyph_h = npub_font.character_size.height as i32;
+        let line_h = glyph_h + l.s(2);
+        let n_lines = ((npub.len() + cpl - 1) / cpl) as i32;
+        let top = l.sy(16);
+        let block_h = n_lines * line_h;
+        let mut y = top + ((l.h - top - block_h) / 2).max(0) + glyph_h;
+        let mut pos = 0;
+        while pos < npub.len() {
+            let end = core::cmp::min(pos + cpl, npub.len());
+            Text::new(&npub[pos..end], Point::new(l.sx(2), y), body).draw(display).ok();
+            y += line_h;
+            pos = end;
+        }
     }
 
     if let Err(e) = display.flush() {

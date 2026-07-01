@@ -109,8 +109,11 @@ struct SignCtx<'a, 'd, 'b> {
     nvs: &'a mut EspNvs<NvsDefault>,
     /// Operator pubkey authorised for kind-24134 management (`None` disables it).
     op_mgmt: Option<[u8; 32]>,
-    /// Full relay URL (e.g. `wss://relay.trotters.cc`) — used to build bunker URIs.
+    /// The relay currently being served (one of `relays`).
     relay_url: String,
+    /// All configured relays — advertised in bunker URIs so clients publish to
+    /// every relay, and cycled through on reconnect for failover.
+    relays: Vec<String>,
     /// Bounded replay seen-set of recent management request ids.
     seen: Vec<String>,
     /// OLED power state — false once blanked for burn-in protection.
@@ -173,8 +176,13 @@ pub fn run_wifi_standalone<'d, 'b>(
     .expect("relay: wifi config");
     wifi.start().expect("relay: wifi start");
 
-    let relay_url = cfg.relays.first().cloned().unwrap_or_default();
-    let host = relay_host(&relay_url).to_string();
+    // All configured relays. The signer listens on one at a time and fails over
+    // to the next on any disconnect, so a single dead or quiet relay never takes
+    // it offline. Bunker URIs advertise every relay, so clients publish to all of
+    // them and still meet the device on whichever one it is currently serving.
+    let relays: Vec<String> =
+        cfg.relays.iter().map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect();
+    let mut relay_idx = 0usize;
 
     // Restore the replay seen-set from NVS so a command captured off the relay
     // cannot be replayed across a reboot (within the SEEN_MAX window).
@@ -192,7 +200,8 @@ pub fn run_wifi_standalone<'d, 'b>(
         identity_caches,
         nvs,
         op_mgmt,
-        relay_url: relay_url.clone(),
+        relay_url: relays.first().cloned().unwrap_or_default(),
+        relays: relays.clone(),
         seen,
         display_on: true,
         last_activity: Instant::now(),
@@ -206,16 +215,29 @@ pub fn run_wifi_standalone<'d, 'b>(
         }
         log::info!("[relay] wifi up");
 
-        if host.is_empty() {
+        if relays.is_empty() {
             log::error!("[relay] no relay configured");
             FreeRtos::delay_ms(10_000);
             continue;
         }
 
-        match serve_relay(&host, &mut ctx, usb) {
-            Ok(()) => log::info!("[relay] connection closed; reconnecting"),
-            Err(e) => log::error!("[relay] {e}; reconnecting in 3s"),
+        let relay_url = relays[relay_idx % relays.len()].clone();
+        let host = relay_host(&relay_url).to_string();
+        ctx.relay_url = relay_url;
+        if relays.len() > 1 {
+            log::info!(
+                "[relay] serving via {host} (relay {} of {})",
+                relay_idx % relays.len() + 1,
+                relays.len()
+            );
         }
+
+        match serve_relay(&host, &mut ctx, usb) {
+            Ok(()) => log::info!("[relay] connection closed; failing over"),
+            Err(e) => log::error!("[relay] {e}; failing over in 3s"),
+        }
+        // Advance to the next relay so a dead/quiet one is not retried forever.
+        relay_idx = relay_idx.wrapping_add(1);
         FreeRtos::delay_ms(3000);
     }
 }
@@ -727,8 +749,17 @@ fn dispatch_mgmt(
                         ctx.policy_engine.upgrade_to_signing(master_slot, index);
                     }
                     ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
-                    let bunker_uri =
-                        format!("bunker://{master_hex}?relay={}&secret={secret_hex}", ctx.relay_url);
+                    let relay_params = ctx
+                        .relays
+                        .iter()
+                        .map(|r| format!("relay={r}"))
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    let bunker_uri = if relay_params.is_empty() {
+                        format!("bunker://{master_hex}?secret={secret_hex}")
+                    } else {
+                        format!("bunker://{master_hex}?{relay_params}&secret={secret_hex}")
+                    };
                     log::info!(
                         "[relay] mgmt: created client slot {index} ({label}){}",
                         if auto_sign { " [signing pre-approved]" } else { "" }

@@ -13,8 +13,17 @@
 //! does the parts the Pi bridge used to do: it subscribes, parses the inbound
 //! EVENT, and publishes the response itself.
 //!
+//! Per-identity routing (parity with the USB path): the NIP-46 subscription is
+//! `#p`-tagged to every served identity — each master AND every derived persona —
+//! and an inbound request is routed by its `p` tag to the addressed identity. A
+//! persona re-derives its signing key from the owning master and uses that key
+//! for BOTH the NIP-44 transport and the envelope signature, so one connection ==
+//! one identity, exactly as the software sidecar's `#p` routing does. Management
+//! (kind 24134) stays master-only — the master pubkey is the v1 management
+//! address; personas are signing-only.
+//!
 //! Increments 1–3 (done): wifi up → TLS → RFC-6455 handshake → subscribe by
-//! master pubkey → on EVENT, decrypt/sign/publish → answer pings.
+//! served identity (master + personas) → on EVENT, decrypt/sign/publish → answer pings.
 //!
 //! Connection hardening: the read loop must never block forever on a silently
 //! dead socket (else published requests are lost while we sit in `read`). Three
@@ -300,26 +309,32 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
         }
     };
 
-    // Subscribe for NIP-46 (24133) — and management (24134) when an operator is
-    // configured — p-tagged to any of our master pubkeys (the master pubkey is
-    // both the bunker address and the v1 management address). limit:0 → no
-    // stored replay, live stream only.
-    let p_list = ctx
-        .masters
-        .iter()
-        .map(|m| format!("\"{}\"", hex_encode(&m.pubkey)))
-        .collect::<Vec<_>>()
-        .join(",");
-    let kinds = if ctx.op_mgmt.is_some() {
-        format!("{NIP46_KIND},{MGMT_KIND}")
+    // Subscribe. NIP-46 (24133) is addressable to any served identity — each
+    // master AND every derived persona — so a persona's bunker URI reaches the
+    // device exactly as it does on the USB path. Management (24134), when an
+    // operator is configured, stays master-only: the master pubkey is the v1
+    // management address; personas are signing-only. Two filters keep that
+    // boundary explicit. limit:0 → no stored replay, live stream only.
+    let quoted = |pk: &[u8; 32]| format!("\"{}\"", hex_encode(pk));
+    let master_p = ctx.masters.iter().map(|m| quoted(&m.pubkey)).collect::<Vec<_>>();
+    let mut nip46_p = master_p.clone();
+    nip46_p.extend(ctx.personas.iter().map(|p| quoted(&p.pubkey)));
+    let nip46_p_list = nip46_p.join(",");
+
+    let req = if ctx.op_mgmt.is_some() {
+        let mgmt_p_list = master_p.join(",");
+        format!(
+            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{{"kinds":[{MGMT_KIND}],"#p":[{mgmt_p_list}],"limit":0}}]"##
+        )
     } else {
-        format!("{NIP46_KIND}")
+        format!(r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}}]"##)
     };
-    let req = format!(r##"["REQ","hw",{{"kinds":[{kinds}],"#p":[{p_list}],"limit":0}}]"##);
     ws_send(&mut tls, OP_TEXT, req.as_bytes())?;
     log::info!(
-        "[relay] subscribed: kinds=[{kinds}] for {} master pubkey(s)",
-        ctx.masters.len()
+        "[relay] subscribed: {} master(s) + {} persona(s), mgmt={}",
+        ctx.masters.len(),
+        ctx.personas.len(),
+        if ctx.op_mgmt.is_some() { "on" } else { "off" }
     );
 
     let mut rx: Vec<u8> = Vec::with_capacity(READ_BUF);
@@ -635,41 +650,83 @@ fn process_event(tls: &mut Tls, ev: &SignedEvent, ctx: &mut SignCtx) -> Result<(
     }
     ctx.last_activity = Instant::now();
 
-    // Which of our masters is this addressed to? (`p` tag → master pubkey).
-    let master_idx = ev
+    // The identity this request addresses — its `p` tag. NIP-46 (24133) can
+    // target any served identity (a master or one of its personas); management
+    // (24134) is master-only. There is exactly one `p` tag on a NIP-46 request,
+    // so the first valid one is the target.
+    let target_pk: [u8; 32] = match ev
         .tags
         .iter()
         .filter(|t| t.len() >= 2 && t[0] == "p")
-        .find_map(|t| {
-            let pk: [u8; 32] = hex_decode(&t[1]).ok()?.try_into().ok()?;
-            masters::find_by_pubkey(ctx.masters, &pk)
-        });
-    let master_idx = match master_idx {
-        Some(i) => i,
+        .find_map(|t| hex_decode(&t[1]).ok().and_then(|v| v.try_into().ok()))
+    {
+        Some(pk) => pk,
         None => {
-            log::warn!("[relay] EVENT not addressed to a known master; ignoring");
+            log::warn!("[relay] EVENT has no valid p tag; ignoring");
             return Ok(());
         }
     };
 
     if ev.kind == MGMT_KIND {
-        handle_mgmt_event(tls, ev, ctx, master_idx)
+        match masters::find_by_pubkey(ctx.masters, &target_pk) {
+            Some(master_idx) => handle_mgmt_event(tls, ev, ctx, master_idx),
+            None => {
+                log::warn!("[relay] mgmt EVENT not addressed to a known master; ignoring");
+                Ok(())
+            }
+        }
     } else {
-        handle_nip46_event(tls, ev, ctx, master_idx)
+        handle_nip46_event(tls, ev, ctx, &target_pk)
     }
 }
 
-/// NIP-46 signing path (kind 24133): decrypt → `handle_request` → re-encrypt →
-/// sign + publish. Mirrors the USB `transport::handle_encrypted_request`.
+/// NIP-46 signing path (kind 24133): resolve the addressed identity → decrypt →
+/// `handle_request` → re-encrypt → sign + publish. Mirrors the USB
+/// `transport::handle_encrypted_request`, including per-persona routing.
 fn handle_nip46_event(
     tls: &mut Tls,
     ev: &SignedEvent,
     ctx: &mut SignCtx,
-    master_idx: usize,
+    target_pk: &[u8; 32],
 ) -> Result<(), String> {
-    // `masters` is a shared ref (Copy), so `master` is independent of the
-    // exclusive borrows of the other ctx fields used below.
-    let master = &ctx.masters[master_idx];
+    // Resolve the addressed identity to its signing key. A master signs with its
+    // own secret; a persona re-derives its key from the owning master and uses
+    // that key for BOTH the NIP-44 transport and the envelope signature — so one
+    // connection == one identity, exactly as the USB path does. `label`/`mode`/
+    // `slot` are the owning master's (personas share the master's policy slot).
+    // All resolved values are owned, so no `ctx` borrow is held past this block.
+    let (signing_secret, label, mode, slot, is_persona) =
+        if let Some(midx) = masters::find_by_pubkey(ctx.masters, target_pk) {
+            let m = &ctx.masters[midx];
+            (zeroize::Zeroizing::new(m.secret), m.label.clone(), m.mode, m.slot, false)
+        } else if let Some(pidx) = crate::personas::find_by_pubkey(ctx.personas, target_pk) {
+            let p = &ctx.personas[pidx];
+            let owning = match ctx.masters.iter().find(|m| m.slot == p.master_slot) {
+                Some(m) => m,
+                None => {
+                    log::warn!(
+                        "[relay] persona's owning master slot {} not loaded; ignoring",
+                        p.master_slot
+                    );
+                    return Ok(());
+                }
+            };
+            match crate::nip46_handler::derive_identity(
+                &owning.secret,
+                owning.mode,
+                &p.purpose,
+                p.index,
+            ) {
+                Ok((secret, _pk)) => (secret, owning.label.clone(), owning.mode, owning.slot, true),
+                Err(e) => {
+                    log::error!("[relay] persona key derivation failed: {e}");
+                    return Ok(());
+                }
+            }
+        } else {
+            log::warn!("[relay] EVENT not addressed to a known identity; ignoring");
+            return Ok(());
+        };
 
     // The event author is the remote client.
     let client_pubkey: [u8; 32] = match hex_decode(&ev.pubkey).ok().and_then(|v| v.try_into().ok()) {
@@ -680,7 +737,17 @@ fn handle_nip46_event(
         }
     };
 
-    let conversation_key = match nip44::get_conversation_key(&master.secret, &client_pubkey) {
+    // A persona connection must act AS the persona for every inner method, so
+    // clear any session active-identity (set by a legacy heartwood_switch) that
+    // would otherwise double-derive on top of the persona secret. Mirrors
+    // transport::handle_encrypted_request.
+    if is_persona {
+        if let Some(session) = ctx.policy_engine.get_or_create_session(client_pubkey, slot) {
+            session.active_identity = None;
+        }
+    }
+
+    let conversation_key = match nip44::get_conversation_key(&signing_secret, &client_pubkey) {
         Ok(ck) => ck,
         Err(e) => {
             log::error!("[relay] conversation key: {e}");
@@ -696,10 +763,11 @@ fn handle_nip46_event(
         }
     };
     log::info!(
-        "[relay] decrypted request ({} bytes) from {}… for {}",
+        "[relay] decrypted request ({} bytes) from {}… for {}{}",
         plaintext.len(),
         &ev.pubkey[..ev.pubkey.len().min(8)],
-        master.label
+        label,
+        if is_persona { " (persona)" } else { "" }
     );
 
     let inner = Frame {
@@ -712,10 +780,10 @@ fn handle_nip46_event(
     // safe methods and post-upgrade signing.
     let response_json = crate::nip46_handler::handle_request(
         &inner,
-        &master.secret,
-        &master.label,
-        master.mode,
-        master.slot,
+        &signing_secret,
+        &label,
+        mode,
+        slot,
         ctx.secp,
         ctx.display,
         ctx.button_pin,
@@ -723,12 +791,37 @@ fn handle_nip46_event(
         ctx.identity_caches,
         Some(&client_pubkey),
     );
-    ctx.policy_engine.persist_slots(ctx.nvs, master.slot);
+    ctx.policy_engine.persist_slots(ctx.nvs, slot);
+
+    // Persist any identities derived during this request (e.g. via
+    // heartwood_derive_persona) to the registry, so they survive reboot and
+    // become addressable by their own bunker URI — picked up by the `#p`
+    // subscription on the next (re)connect. Mirrors the USB path.
+    if let Some(cache) = ctx.identity_caches.iter().find(|c| c.master_slot == slot) {
+        let fresh: Vec<(String, u32, Option<String>, [u8; 32])> = cache
+            .identities
+            .iter()
+            .filter(|id| !crate::personas::contains_pubkey(ctx.personas, &id.public_key))
+            .map(|id| (id.purpose.clone(), id.index, id.persona_name.clone(), id.public_key))
+            .collect();
+        for (purpose, index, name, pubkey) in fresh {
+            if crate::personas::add(ctx.nvs, slot, &purpose, index, name.as_deref(), &pubkey).is_ok()
+            {
+                ctx.personas.push(crate::personas::LoadedPersona {
+                    master_slot: slot,
+                    purpose,
+                    index,
+                    name,
+                    pubkey,
+                });
+            }
+        }
+    }
 
     sign_and_publish(
         tls,
         ctx.secp,
-        master,
+        &signing_secret,
         &conversation_key,
         &ev.pubkey,
         NIP46_KIND,
@@ -855,7 +948,7 @@ fn handle_mgmt_event(
     sign_and_publish(
         tls,
         ctx.secp,
-        master,
+        &master.secret,
         &conversation_key,
         &ev.pubkey,
         MGMT_KIND,
@@ -1045,13 +1138,15 @@ fn dispatch_mgmt(
 }
 
 /// Re-encrypt `response_json` to `recipient_hex`, build + sign a `kind` envelope
-/// authored by the master, and publish it. The author pubkey is recomputed from
-/// the secret (never trusted from input). A transport failure propagates.
+/// authored by the resolved identity (master or persona), and publish it. The
+/// author pubkey is recomputed from `signing_secret` (never trusted from input),
+/// so the envelope is authored by the addressed identity itself. A transport
+/// failure propagates.
 #[allow(clippy::too_many_arguments)]
 fn sign_and_publish(
     tls: &mut Tls,
     secp: &Arc<Secp256k1<SignOnly>>,
-    master: &LoadedMaster,
+    signing_secret: &[u8; 32],
     conversation_key: &[u8; 32],
     recipient_hex: &str,
     kind: u64,
@@ -1062,8 +1157,8 @@ fn sign_and_publish(
     let ciphertext = nip44::encrypt(conversation_key, response_json, &nonce)
         .map_err(|e| format!("encrypt: {e}"))?;
 
-    let keypair = Keypair::from_seckey_slice(secp, &master.secret)
-        .map_err(|_| "invalid master secret".to_string())?;
+    let keypair = Keypair::from_seckey_slice(secp, signing_secret)
+        .map_err(|_| "invalid signing secret".to_string())?;
     let (xonly, _) = keypair.x_only_public_key();
 
     let unsigned = UnsignedEvent {
@@ -1074,7 +1169,7 @@ fn sign_and_publish(
         content: ciphertext,
     };
     let event_id = nip46::compute_event_id(&unsigned);
-    let sig = sign::sign_hash(secp, &master.secret, &event_id).map_err(|e| format!("sign: {e}"))?;
+    let sig = sign::sign_hash(secp, signing_secret, &event_id).map_err(|e| format!("sign: {e}"))?;
 
     let signed = SignedEvent {
         id: hex_encode(&event_id),

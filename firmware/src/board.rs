@@ -118,13 +118,17 @@ pub fn bringup(p: Peripherals) -> Hw {
         use esp_idf_hal::gpio::AnyIOPin;
         use esp_idf_hal::uart::{config::Config as UartConfig, UartDriver};
         use esp_idf_hal::units::Hertz;
+        let uart_config = UartConfig::new()
+            .baudrate(Hertz(115_200))
+            .rx_fifo_size(4096)
+            .tx_fifo_size(4096);
         let driver = UartDriver::new(
             p.uart0,
             p.pins.gpio43, // CP2102 RX (ESP32 TX)
             p.pins.gpio44, // CP2102 TX (ESP32 RX)
             None::<AnyIOPin>, // CTS -- unused
             None::<AnyIOPin>, // RTS -- unused
-            &UartConfig::new().baudrate(Hertz(115_200)),
+            &uart_config,
         )
         .expect("UART0 driver init failed");
         SerialPort::from_uart(driver)
@@ -212,13 +216,17 @@ pub fn bringup(p: Peripherals) -> Hw {
     // --- Host transport: CH9102 USB-UART bridge on classic-ESP32 UART0 ---
     // (TX0 = GPIO1, RX0 = GPIO3).
     let serial = {
+        let uart_config = UartConfig::new()
+            .baudrate(Hertz(115_200))
+            .rx_fifo_size(4096)
+            .tx_fifo_size(4096);
         let driver = UartDriver::new(
             p.uart0,
             p.pins.gpio1,     // TX0
             p.pins.gpio3,     // RX0
             None::<AnyIOPin>, // CTS unused
             None::<AnyIOPin>, // RTS unused
-            &UartConfig::new().baudrate(Hertz(115_200)),
+            &uart_config,
         )
         .expect("UART0 driver init failed");
         SerialPort::from_uart(driver)

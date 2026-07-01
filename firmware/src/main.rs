@@ -652,11 +652,18 @@ fn main() {
 
             // 0x50 -- backup export (dump all slots + bridge secret)
             FRAME_TYPE_BACKUP_EXPORT_REQUEST => {
+                if !policy_engine.bridge_authenticated {
+                    log::warn!("Backup export rejected -- bridge not authenticated");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                    continue;
+                }
                 backup::handle_export(
                     &mut usb,
                     &loaded_masters,
                     &policy_engine,
                     &nvs,
+                    &mut display,
+                    &button_pin,
                 );
             }
 

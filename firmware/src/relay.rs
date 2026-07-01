@@ -523,7 +523,19 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
         }
 
         FRAME_TYPE_BACKUP_EXPORT_REQUEST => {
-            crate::backup::handle_export(usb, ctx.masters, ctx.policy_engine, ctx.nvs)
+            if !ctx.policy_engine.bridge_authenticated {
+                log::warn!("[relay] Backup export rejected -- bridge not authenticated");
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            } else {
+                crate::backup::handle_export(
+                    usb,
+                    ctx.masters,
+                    ctx.policy_engine,
+                    ctx.nvs,
+                    ctx.display,
+                    ctx.button_pin,
+                );
+            }
         }
         FRAME_TYPE_BACKUP_IMPORT_REQUEST => crate::backup::handle_import(
             usb,

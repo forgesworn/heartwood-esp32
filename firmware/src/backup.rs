@@ -26,7 +26,35 @@ pub fn handle_export(
     loaded_masters: &[LoadedMaster],
     policy_engine: &PolicyEngine,
     nvs: &EspNvs<NvsDefault>,
+    display: &mut crate::oled::Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) {
+    let total_slots: usize = loaded_masters
+        .iter()
+        .map(|m| policy_engine.list_slots(m.slot).len())
+        .sum();
+
+    let result = crate::approval::run_approval_loop(
+        display,
+        button_pin,
+        30,
+        |d, remaining| {
+            let msg = format!(
+                "Export backup?\n{} masters/{} slots\n{}s",
+                loaded_masters.len(),
+                total_slots,
+                remaining,
+            );
+            crate::oled::show_error(d, &msg);
+        },
+    );
+
+    if !matches!(result, crate::approval::ApprovalResult::Approved) {
+        log::info!("Backup export denied by user");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return;
+    }
+
     // Collect master metadata + unredacted slots.
     let mut masters = Vec::new();
     for m in loaded_masters {

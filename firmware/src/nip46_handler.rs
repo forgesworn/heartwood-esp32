@@ -33,6 +33,7 @@ use heartwood_common::nip46::{
 };
 use heartwood_common::types::MasterMode;
 use secp256k1::{Secp256k1, SignOnly};
+use serde_json::Value;
 use zeroize::Zeroize;
 
 use crate::approval::ApprovalResult;
@@ -41,6 +42,31 @@ use crate::policy::PolicyEngine;
 
 /// Timeout in seconds shown on the OLED countdown bar.
 const APPROVAL_TIMEOUT_SECS: u64 = 30;
+
+fn metadata_name(value: &Value) -> Option<String> {
+    let metadata = match value {
+        Value::String(s) => serde_json::from_str::<Value>(s).ok()?,
+        Value::Object(_) => value.clone(),
+        _ => return None,
+    };
+
+    metadata
+        .get("name")
+        .and_then(|name| name.as_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string())
+}
+
+fn connect_app_label(params: &[Value]) -> String {
+    // Standard NIP-46 connect params are:
+    // [remote_pubkey, secret, permissions, metadata].
+    // Older Heartwood clients placed metadata at params[2], so keep a fallback.
+    params
+        .get(3)
+        .and_then(metadata_name)
+        .or_else(|| params.get(2).and_then(metadata_name))
+        .unwrap_or_default()
+}
 
 /// Return the 32-byte secret to use for nsec-tree derivation.
 ///
@@ -216,19 +242,15 @@ pub fn handle_request(
         "get_public_key" => handle_get_public_key(master_secret, master_mode, secp, &request),
 
         "connect" => {
-            // params[0] is the client pubkey; params[1] is the optional secret.
-            // params[2] is optional JSON metadata: {"name":"nostrudel.ninja","url":"https://..."}
+            // params[0] is the client pubkey; params[1] is the optional secret;
+            // params[2] is permissions; params[3] is optional JSON metadata.
             if has_client {
                 if let Ok(pk_bytes) = hex_decode_32_safe(&client_hex) {
                     policy_engine.get_or_create_session(pk_bytes, master_slot);
                 }
             }
 
-            let app_label = request.params.get(2)
-                .and_then(|v| v.as_str())
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                .unwrap_or_default();
+            let app_label = connect_app_label(&request.params);
 
             let client_secret = request.params.get(1).and_then(|v| v.as_str()).unwrap_or("");
             if client_secret.is_empty() {

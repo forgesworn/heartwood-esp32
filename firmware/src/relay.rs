@@ -63,7 +63,8 @@ use heartwood_common::types::{
     FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN, FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
     FRAME_TYPE_RESTORE_IDENTITY, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET,
-    FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_PIN, FRAME_TYPE_SIGN_ENVELOPE,
+    FRAME_TYPE_SET_IDENTITY_META, FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_PIN,
+    FRAME_TYPE_SIGN_ENVELOPE,
 };
 
 use crate::identity_cache::IdentityCache;
@@ -463,6 +464,27 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
             crate::firmware_info_json().as_bytes(),
         ),
 
+        // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
+        // NVS. The signer never fetches/decodes images itself.
+        FRAME_TYPE_SET_IDENTITY_META => {
+            let ok = crate::identity_meta::handle_frame(&frame.payload, ctx.masters, ctx.nvs);
+            crate::protocol::write_frame(
+                usb,
+                if ok { FRAME_TYPE_ACK } else { FRAME_TYPE_NACK },
+                &[],
+            );
+            if ok && ctx.masters.len() == 1 && ctx.display_on {
+                let slot = ctx.masters[0].slot;
+                let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
+                let meta = crate::identity_meta::load(ctx.nvs, slot);
+                let (name, avatar) = match &meta {
+                    Some(m) => (Some(m.name.as_str()), Some((m.w, m.h, m.avatar.as_slice()))),
+                    None => (None, None),
+                };
+                crate::oled::show_npub(ctx.display, name, &npub, avatar);
+            }
+        }
+
         FRAME_TYPE_PROVISION_LIST => {
             crate::provision::handle_list(usb, ctx.masters, ctx.personas)
         }
@@ -701,9 +723,17 @@ fn handle_profile_event(ev: &SignedEvent, ctx: &mut SignCtx) {
     );
 
     if changed && ctx.display_on && ctx.masters.len() == 1 {
+        let slot = ctx.masters[0].slot;
         let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
-        let name = ctx.identity_name.clone();
-        crate::oled::show_npub(ctx.display, name.as_deref(), &npub);
+        // Sapwood-provisioned metadata (name + avatar) wins; the kind-0 name is
+        // only the fallback when nothing has been provisioned.
+        let meta = crate::identity_meta::load(ctx.nvs, slot);
+        let fallback = ctx.identity_name.clone();
+        let (name, avatar) = match &meta {
+            Some(m) => (Some(m.name.as_str()), Some((m.w, m.h, m.avatar.as_slice()))),
+            None => (fallback.as_deref(), None),
+        };
+        crate::oled::show_npub(ctx.display, name, &npub, avatar);
     }
 }
 

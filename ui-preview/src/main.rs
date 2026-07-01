@@ -1,28 +1,33 @@
 // ui-preview: render representative device screens to PNG at each board's panel
-// size, so the responsive layout can be checked without hardware.
+// size, so the responsive layout AND colour can be checked without hardware.
 //
-// Shares firmware/src/layout.rs verbatim (via #[path]) so the preview cannot
-// drift from the firmware's geometry. The draw functions below mirror the
-// corresponding firmware screens in oled.rs, expressed through `Layout` — i.e.
-// this is the design those screens are being converted to.
+// Shares firmware/src/layout.rs and firmware/src/palette.rs verbatim (via
+// #[path]) so the preview cannot drift from the firmware's geometry or colours.
+// The draw functions below mirror the corresponding firmware screens in
+// oled.rs, expressed through `Layout` + the semantic palette — i.e. this is the
+// design those screens are being converted to.
 
 #[path = "../../firmware/src/layout.rs"]
 mod layout;
+#[path = "../../firmware/src/palette.rs"]
+mod palette;
 
 use embedded_graphics::{
     mono_font::{MonoFont, MonoTextStyle, MonoTextStyleBuilder},
-    pixelcolor::BinaryColor,
+    pixelcolor::Rgb565,
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle},
     text::Text,
 };
 use embedded_graphics_simulator::{OutputSettingsBuilder, SimulatorDisplay};
 use layout::Layout;
+use palette::*;
 
-fn style(font: &'static MonoFont<'static>) -> MonoTextStyle<'static, BinaryColor> {
+/// A text style in `font` drawn in `colour`.
+fn style(font: &'static MonoFont<'static>, colour: Rgb565) -> MonoTextStyle<'static, Rgb565> {
     MonoTextStyleBuilder::new()
         .font(font)
-        .text_color(BinaryColor::On)
+        .text_color(colour)
         .build()
 }
 
@@ -31,42 +36,48 @@ fn layout_of<D: Dimensions>(d: &D) -> Layout {
     Layout::new(s.width as i32, s.height as i32)
 }
 
-/// Header text + 1px rule beneath it, the scaffold most screens share.
-fn header<D: DrawTarget<Color = BinaryColor>>(d: &mut D, l: &Layout, title: &str) {
-    Text::new(title, Point::new(l.sx(2), l.sy(10)), style(l.font_header()))
+/// Header text (accent) + 1px accent rule beneath it — the brand scaffold most
+/// screens share.
+fn header<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, title: &str) {
+    Text::new(title, Point::new(l.sx(2), l.sy(10)), style(l.font_header(), ACCENT))
         .draw(d)
         .ok();
     Rectangle::new(
         Point::new(l.sx(0), l.sy(14)),
         Size::new(l.w as u32, l.s(1) as u32),
     )
-    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+    .into_styled(PrimitiveStyle::with_fill(ACCENT))
     .draw(d)
     .ok();
 }
 
 /// Idle identity screen: header, rule, npub wrapped across lines (mirrors
 /// `oled::show_npub`).
-fn draw_idle<D: DrawTarget<Color = BinaryColor>>(d: &mut D, npub: &str) {
+fn draw_idle<D: DrawTarget<Color = Rgb565>>(d: &mut D, npub: &str) {
     let l = layout_of(d);
     header(d, &l, "IDENTITY");
-    let small = style(l.font_small());
-    let cpl = l.chars_per_line(l.font_small());
-    let mut y = 26;
+    let npub_font = if l.is_large() { l.font_body() } else { l.font_small() };
+    let body = style(npub_font, FG);
+    let cpl = l.chars_per_line(npub_font);
+    let glyph_h = npub_font.character_size.height as i32;
+    let line_h = glyph_h + l.s(2);
+    let n_lines = ((npub.len() + cpl - 1) / cpl) as i32;
+    let top = l.sy(16);
+    let block_h = n_lines * line_h;
+    let mut y = top + ((l.h - top - block_h) / 2).max(0) + glyph_h;
     let mut pos = 0;
-    while pos < npub.len() && l.sy(y) < l.h {
+    while pos < npub.len() {
         let end = (pos + cpl).min(npub.len());
-        Text::new(&npub[pos..end], Point::new(l.sx(2), l.sy(y)), small)
-            .draw(d)
-            .ok();
-        y += 10;
+        Text::new(&npub[pos..end], Point::new(l.sx(2), y), body).draw(d).ok();
+        y += line_h;
         pos = end;
     }
 }
 
 /// Signing request: header label, rule, method+kind, content preview, and a
-/// graphical countdown bar (mirrors `oled::show_master_sign_request`).
-fn draw_sign<D: DrawTarget<Color = BinaryColor>>(
+/// countdown bar whose fill colour shifts green→amber→red as time runs out
+/// (mirrors `oled::show_master_sign_request`).
+fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     d: &mut D,
     label: &str,
     method: &str,
@@ -78,8 +89,9 @@ fn draw_sign<D: DrawTarget<Color = BinaryColor>>(
     let l = layout_of(d);
     header(d, &l, label);
 
-    let body = style(l.font_body());
-    let small = style(l.font_small());
+    let body = style(l.font_body(), FG);
+    let preview_style = style(l.font_small(), MUTED);
+    let small = style(l.font_small(), FG);
     let m = format!("{} k:{}", method, kind);
     Text::new(&m, Point::new(l.sx(2), l.sy(30)), body).draw(d).ok();
 
@@ -89,19 +101,27 @@ fn draw_sign<D: DrawTarget<Color = BinaryColor>>(
     } else {
         content.to_string()
     };
-    Text::new(&preview, Point::new(l.sx(2), l.sy(42)), small)
+    Text::new(&preview, Point::new(l.sx(2), l.sy(42)), preview_style)
         .draw(d)
         .ok();
 
-    // Countdown bar: outlined track + proportional fill.
+    // Countdown bar: muted track + proportional fill coloured by urgency.
     let bx = l.sx(2);
     let by = l.sy(52);
     let bw = l.s(100);
     let bh = l.s(8);
     Rectangle::new(Point::new(bx, by), Size::new(bw as u32, bh as u32))
-        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_stroke(MUTED, l.s(1) as u32))
         .draw(d)
         .ok();
+    let pct_left = if total > 0 { secs * 100 / total } else { 0 };
+    let urgency = if pct_left > 50 {
+        OK
+    } else if pct_left > 20 {
+        WARN
+    } else {
+        DANGER
+    };
     let fill = if total > 0 {
         (secs * (bw as u32 - l.s(4) as u32)) / total
     } else {
@@ -112,7 +132,7 @@ fn draw_sign<D: DrawTarget<Color = BinaryColor>>(
             Point::new(bx + l.s(2), by + l.s(2)),
             Size::new(fill, (bh - l.s(4)).max(1) as u32),
         )
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .into_styled(PrimitiveStyle::with_fill(urgency))
         .draw(d)
         .ok();
     }
@@ -125,12 +145,12 @@ fn draw_sign<D: DrawTarget<Color = BinaryColor>>(
     .ok();
 }
 
-/// Hold-to-confirm screen: header, big percentage, progress bar (mirrors
-/// `oled::show_hold_progress`).
-fn draw_confirm<D: DrawTarget<Color = BinaryColor>>(d: &mut D, pct: u32) {
+/// Hold-to-confirm screen: header, big percentage + progress bar in success
+/// green (mirrors `oled::show_hold_progress`).
+fn draw_confirm<D: DrawTarget<Color = Rgb565>>(d: &mut D, pct: u32) {
     let l = layout_of(d);
     header(d, &l, "CONFIRMING");
-    let large = style(l.font_large());
+    let large = style(l.font_large(), OK);
     let txt = format!("{}%", pct.min(100));
     let tw = txt.len() as i32 * Layout::glyph_w(l.font_large());
     Text::new(&txt, Point::new(l.center_x(tw), l.sy(38)), large)
@@ -141,7 +161,7 @@ fn draw_confirm<D: DrawTarget<Color = BinaryColor>>(d: &mut D, pct: u32) {
     let bw = l.s(124);
     let bh = l.s(8);
     Rectangle::new(Point::new(bx, by), Size::new(bw as u32, bh as u32))
-        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_stroke(MUTED, l.s(1) as u32))
         .draw(d)
         .ok();
     let fill = (pct.min(100) * (bw as u32 - l.s(2) as u32)) / 100;
@@ -150,14 +170,34 @@ fn draw_confirm<D: DrawTarget<Color = BinaryColor>>(d: &mut D, pct: u32) {
             Point::new(bx + l.s(1), by + l.s(1)),
             Size::new(fill, (bh - l.s(2)).max(1) as u32),
         )
-        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .into_styled(PrimitiveStyle::with_fill(OK))
         .draw(d)
         .ok();
     }
 }
 
-fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<BinaryColor>)) {
-    let mut d = SimulatorDisplay::<BinaryColor>::new(Size::new(w, h));
+/// A full-screen result banner: one big centred word in `colour` (mirrors
+/// `oled::show_approved` / `show_denied` / `show_signed`).
+fn draw_result<D: DrawTarget<Color = Rgb565>>(d: &mut D, word: &str, colour: Rgb565) {
+    let l = layout_of(d);
+    let large = style(l.font_large(), colour);
+    let tw = word.len() as i32 * Layout::glyph_w(l.font_large());
+    Text::new(word, Point::new(l.center_x(tw), l.sy(36)), large)
+        .draw(d)
+        .ok();
+    // A colour rule under the word ties the banner to the semantic state.
+    Rectangle::new(
+        Point::new(l.sx(0), l.sy(44)),
+        Size::new(l.w as u32, l.s(1) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(colour))
+    .draw(d)
+    .ok();
+}
+
+fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565>)) {
+    let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
+    d.clear(BG).ok();
     draw(&mut d);
     let out = d.to_rgb_output_image(&OutputSettingsBuilder::new().scale(3).build());
     let path = format!("out/{name}.png");
@@ -175,6 +215,11 @@ fn main() {
         render(&format!("sign-{b}"), w, h, |d| {
             draw_sign(d, "personal", "sign_event", 1, "gm nostr, building today", 18, 30)
         });
+        render(&format!("sign-urgent-{b}"), w, h, |d| {
+            draw_sign(d, "personal", "sign_event", 1, "gm nostr, building today", 4, 30)
+        });
         render(&format!("confirm-{b}"), w, h, |d| draw_confirm(d, 60));
+        render(&format!("approved-{b}"), w, h, |d| draw_result(d, "APPROVED", OK));
+        render(&format!("denied-{b}"), w, h, |d| draw_result(d, "DENIED", DANGER));
     }
 }

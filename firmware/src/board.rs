@@ -154,7 +154,7 @@ pub fn bringup(p: Peripherals) -> Hw {
 pub fn bringup(p: Peripherals) -> Hw {
     use esp_idf_hal::gpio::{AnyIOPin, Pull};
     use esp_idf_hal::spi::config::{Config as SpiConfig, DriverConfig as SpiDriverConfig};
-    use esp_idf_hal::spi::SpiDeviceDriver;
+    use esp_idf_hal::spi::{Dma, SpiDeviceDriver};
     use esp_idf_hal::uart::{config::Config as UartConfig, UartDriver};
     use esp_idf_hal::units::{FromValueType, Hertz};
     use mipidsi::options::{ColorInversion, Rotation};
@@ -168,13 +168,17 @@ pub fn bringup(p: Peripherals) -> Hw {
     // full-duplex operation above 26.7 MHz (80 MHz ÷ 3) on matrix-routed pins.
     // 26 MHz rounds down to 80/3 = 26.67 MHz — the fastest the matrix allows —
     // and is still very fast for a write-only 240×135 panel.
+    // DMA offloads the full-frame blit (240×135×2 = 64.8 KB) from the CPU, which
+    // otherwise hand-feeds the 64-byte SPI FIFO for every flush — the dominant
+    // redraw cost. `Auto` picks a free DMA channel; the max transfer matches the
+    // enlarged mipidsi scratch buffer below.
     let spi = SpiDeviceDriver::new_single(
         p.spi2,
         p.pins.gpio18,      // SCLK
         p.pins.gpio19,      // MOSI / SDA
         None::<AnyIOPin>,   // MISO unused
         Some(p.pins.gpio5), // CS
-        &SpiDriverConfig::new(),
+        &SpiDriverConfig::new().dma(Dma::Auto(4096)),
         &SpiConfig::new().baudrate(26.MHz().into()),
     )
     .expect("ST7789 SPI init failed");
@@ -184,7 +188,7 @@ pub fn bringup(p: Peripherals) -> Hw {
 
     // mipidsi's SPI scratch buffer must outlive the display; leak it (a one-off,
     // device-lifetime allocation, same rationale as the LED/Vext pins above).
-    let spi_buffer: &'static mut [u8] = Box::leak(vec![0u8; 512].into_boxed_slice());
+    let spi_buffer: &'static mut [u8] = Box::leak(vec![0u8; 4096].into_boxed_slice());
 
     // The ST7789 controller addresses 240x320; the T-Display panel is a 135x240
     // window into it (offsets 52,40) rotated 90 degrees to a 240x135 landscape

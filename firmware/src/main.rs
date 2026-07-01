@@ -45,6 +45,7 @@ mod button;
 mod connslot;
 mod identity_cache;
 mod layout;
+mod palette;
 mod masters;
 mod nip46_handler;
 mod personas;

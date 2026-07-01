@@ -24,7 +24,7 @@
 
 use core::convert::Infallible;
 
-use embedded_graphics::pixelcolor::{BinaryColor, Rgb565, RgbColor};
+use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::prelude::*;
 
 use esp_idf_hal::delay::Ets;
@@ -99,7 +99,7 @@ impl<'a> St7789Display<'a> {
     ) -> Self {
         let di = SpiInterface::new(spi, dc, buffer);
         let mut delay = Ets;
-        let mut panel = mipidsi::Builder::new(ST7789, di)
+        let panel = mipidsi::Builder::new(ST7789, di)
             .reset_pin(rst)
             .display_size(native_width, native_height)
             .display_offset(x_offset, y_offset)
@@ -114,10 +114,6 @@ impl<'a> St7789Display<'a> {
         } else {
             backlight.set_high().ok();
         }
-
-        // Diagnostic: fill screen red so we can tell if SPI reaches the panel.
-        // If the display shows red, SPI works. Remove once display is confirmed.
-        panel.clear(Rgb565::RED).ok();
 
         let size = panel.size();
         let (width, height) = (size.width as i32, size.height as i32);
@@ -172,7 +168,7 @@ impl OriginDimensions for St7789Display<'_> {
 }
 
 impl DrawTarget for St7789Display<'_> {
-    type Color = BinaryColor;
+    type Color = Rgb565;
     type Error = Infallible;
 
     fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
@@ -184,10 +180,7 @@ impl DrawTarget for St7789Display<'_> {
             // the `DrawTarget` contract requires.
             if p.x >= 0 && p.y >= 0 && p.x < self.width && p.y < self.height {
                 let idx = (p.y * self.width + p.x) as usize;
-                self.framebuffer[idx] = match colour {
-                    BinaryColor::On => Rgb565::WHITE,
-                    BinaryColor::Off => Rgb565::BLACK,
-                };
+                self.framebuffer[idx] = colour;
             }
         }
         Ok(())

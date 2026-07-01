@@ -73,7 +73,7 @@ pub fn handle_add(
         Ok(master) => {
             let npub = encode_npub(&master.pubkey);
             log::info!("Provisioned slot {}: {} ({npub})", master.slot, master.label);
-            oled::show_npub(display, &npub);
+            oled::show_npub(display, None, &npub);
             protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
             Some(master)
         }

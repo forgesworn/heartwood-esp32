@@ -16,7 +16,7 @@ use embedded_graphics::{
     mono_font::{MonoFont, MonoTextStyle, MonoTextStyleBuilder},
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::{Circle, PrimitiveStyle, Rectangle},
     text::Text,
 };
 use embedded_graphics_simulator::{OutputSettingsBuilder, SimulatorDisplay};
@@ -53,12 +53,68 @@ fn header<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, title: &str) {
 
 /// Idle identity screen: header, rule, npub wrapped across lines (mirrors
 /// `oled::show_npub`).
-fn draw_idle<D: DrawTarget<Color = Rgb565>>(d: &mut D, npub: &str) {
+fn draw_idle<D: DrawTarget<Color = Rgb565>>(d: &mut D, name: Option<&str>, npub: &str) {
     let l = layout_of(d);
-    header(d, &l, "IDENTITY");
+    header(d, &l, "MASTER");
     let npub_font = if l.is_large() { l.font_body() } else { l.font_small() };
     let body = style(npub_font, FG);
-    let cpl = l.chars_per_line(npub_font);
+    let gw = npub_font.character_size.width as i32;
+
+    // Short, centred npub (head...tail). The full 63-char key in the big font
+    // runs edge to edge (24 chars/line) and clips on any panel offset; the
+    // shortened form is what clients show. The full key lives on the QR page.
+    let short = if npub.len() > 24 {
+        format!("{}...{}", &npub[..10], &npub[npub.len() - 6..])
+    } else {
+        npub.to_string()
+    };
+
+    if l.is_large() {
+        match name {
+            // Kind 0 known: a contact card — avatar disc on the left, name
+            // right-aligned, no npub (it lives on the QR page).
+            Some(n) => {
+                let area_top = l.sy(14);
+                let area_h = l.h - area_top;
+                let r = area_h * 36 / 100;
+                let cy = area_top + area_h / 2;
+                let cx = l.sx(5) + r;
+                // Placeholder avatar disc with the initial, until the device can
+                // fetch + decode the real picture.
+                Circle::new(Point::new(cx - r, cy - r), (r * 2) as u32)
+                    .into_styled(PrimitiveStyle::with_fill(NOSTR))
+                    .draw(d)
+                    .ok();
+                let init = n.chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('?').to_string();
+                let lf = l.font_large();
+                let iw = lf.character_size.width as i32;
+                let ih = lf.character_size.height as i32;
+                Text::new(&init, Point::new(cx - iw / 2, cy + ih / 3), style(lf, FG)).draw(d).ok();
+                // Name: right-aligned, vertically centred, shrunk if it won't fit.
+                let right = l.w - l.sx(14);
+                let avail = right - (cx + r) - l.sx(4);
+                let nf = if (n.len() as i32 * l.font_body().character_size.width as i32) <= avail {
+                    l.font_body()
+                } else {
+                    l.font_small()
+                };
+                let nw = n.len() as i32 * nf.character_size.width as i32;
+                let nh = nf.character_size.height as i32;
+                Text::new(n, Point::new(right - nw, cy + nh / 3), style(nf, FG)).draw(d).ok();
+            }
+            // No profile yet: just the short npub, centred.
+            None => {
+                let x = l.center_x(short.len() as i32 * gw);
+                Text::new(&short, Point::new(x, l.sy(40)), body).draw(d).ok();
+            }
+        }
+        return;
+    }
+
+    // Mono OLED: the small font fits the full npub wrapped across lines. Reserve
+    // the draw margin on both sides so the last glyph never clips.
+    let margin = l.sx(2);
+    let cpl = (((l.w - 2 * margin) / gw).max(1)) as usize;
     let glyph_h = npub_font.character_size.height as i32;
     let line_h = glyph_h + l.s(2);
     let n_lines = ((npub.len() + cpl - 1) / cpl) as i32;
@@ -207,11 +263,12 @@ fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565
 
 fn main() {
     std::fs::create_dir_all("out").unwrap();
-    let npub = "npub1qqqsyqcyq5rqwzqfpg9scrgwpugpzysn8tt8cg";
+    let npub = "npub1sg6plzptd64u62a878hep2kev88swjh3tw00gjsfl8f237lmu63q0uf63m";
     let boards = [("heltec", 128u32, 64u32), ("tdisplay", 240, 135), ("c6", 172, 320)];
 
     for (b, w, h) in boards {
-        render(&format!("idle-{b}"), w, h, |d| draw_idle(d, npub));
+        render(&format!("idle-{b}"), w, h, |d| draw_idle(d, None, npub));
+        render(&format!("idle-named-{b}"), w, h, |d| draw_idle(d, Some("TheCryptoDonkey"), npub));
         render(&format!("sign-{b}"), w, h, |d| {
             draw_sign(d, "personal", "sign_event", 1, "gm nostr, building today", 18, 30)
         });

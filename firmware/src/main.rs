@@ -337,7 +337,7 @@ fn main() {
         let master = &loaded_masters[0];
         let npub = encode_npub(&master.pubkey);
         log::info!("Boot with master[0]: label={} npub={}", master.label, npub);
-        oled::show_npub(&mut display, &npub);
+        oled::show_npub(&mut display, None, &npub);
     } else {
         log::info!("Boot with {} masters", loaded_masters.len());
         oled::show_boot(&mut display, loaded_masters.len() as u8);

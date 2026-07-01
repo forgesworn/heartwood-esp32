@@ -140,6 +140,12 @@ struct SignCtx<'a, 'd, 'b> {
     display_on: bool,
     /// Last time a real request touched the screen (drives the blank timeout).
     last_activity: Instant,
+    /// Cached display name from the primary master's own kind-0 profile, shown on
+    /// the idle identity screen once fetched. `None` until a profile arrives (the
+    /// screen falls back to the short npub). `identity_name_ts` is the source
+    /// event's `created_at`, so only a newer replaceable event overwrites it.
+    identity_name: Option<String>,
+    identity_name_ts: u64,
 }
 
 /// Host out of a `wss://`/`ws://` relay URL (scheme, port and path stripped).
@@ -228,6 +234,8 @@ pub fn run_wifi_standalone<'d, 'b>(
         seen,
         display_on: true,
         last_activity: Instant::now(),
+        identity_name: None,
+        identity_name_ts: 0,
     };
 
     loop {
@@ -317,17 +325,25 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
     // boundary explicit. limit:0 → no stored replay, live stream only.
     let quoted = |pk: &[u8; 32]| format!("\"{}\"", hex_encode(pk));
     let master_p = ctx.masters.iter().map(|m| quoted(&m.pubkey)).collect::<Vec<_>>();
+    let master_p_list = master_p.join(",");
     let mut nip46_p = master_p.clone();
     nip46_p.extend(ctx.personas.iter().map(|p| quoted(&p.pubkey)));
     let nip46_p_list = nip46_p.join(",");
 
+    // A third filter fetches our own masters' kind-0 profiles (by author, not #p)
+    // so the idle screen can show a human name. limit:1 pulls the stored
+    // (replaceable) profile, not just live updates like the request filters.
+    let profile_filter =
+        format!(r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":1}}"##);
+
     let req = if ctx.op_mgmt.is_some() {
-        let mgmt_p_list = master_p.join(",");
         format!(
-            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{{"kinds":[{MGMT_KIND}],"#p":[{mgmt_p_list}],"limit":0}}]"##
+            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{{"kinds":[{MGMT_KIND}],"#p":[{master_p_list}],"limit":0}},{profile_filter}]"##
         )
     } else {
-        format!(r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}}]"##)
+        format!(
+            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{profile_filter}]"##
+        )
     };
     ws_send(&mut tls, OP_TEXT, req.as_bytes())?;
     log::info!(
@@ -342,6 +358,17 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
     let mut last_ping = Instant::now();
     let mut last_resub = Instant::now();
     loop {
+        // Wake the panel promptly on a BOOT-button press, regardless of relay
+        // traffic. The idle-tick wake further down only runs between reads, so a
+        // burst of frames (or the frame-drain `continue`) could starve it and
+        // leave a blanked screen stuck dark. This top-of-loop check runs every
+        // iteration and refreshes last_activity so the panel stays on in use.
+        if !ctx.display_on && ctx.button_pin.is_low() {
+            crate::oled::wake_display(ctx.display);
+            ctx.display_on = true;
+            ctx.last_activity = Instant::now();
+        }
+
         // Drain every complete frame already buffered before reading more.
         if let Some(msg) = try_parse(&mut rx)? {
             match msg {
@@ -646,10 +673,65 @@ fn handle_relay_msg(tls: &mut Tls, raw: &[u8], ctx: &mut SignCtx) -> Result<(), 
     Ok(())
 }
 
+/// Cache the primary master's own kind-0 profile name and refresh the idle
+/// identity screen with it. Ignores profiles not authored by one of our masters,
+/// keeps only the newest replaceable event, and redraws only a live (non-blanked)
+/// single-master screen — a multi-master device shows a count, not one identity.
+fn handle_profile_event(ev: &SignedEvent, ctx: &mut SignCtx) {
+    let author: [u8; 32] = match hex_decode(&ev.pubkey).ok().and_then(|v| v.try_into().ok()) {
+        Some(a) => a,
+        None => return,
+    };
+    if !ctx.masters.iter().any(|m| m.pubkey == author) {
+        return; // not ours — ignore
+    }
+    if ev.created_at < ctx.identity_name_ts {
+        return; // older than what we already have
+    }
+    let name = match profile_name(&ev.content) {
+        Some(n) => n,
+        None => return, // profile with no usable name
+    };
+    ctx.identity_name_ts = ev.created_at;
+    let changed = ctx.identity_name.as_deref() != Some(name.as_str());
+    ctx.identity_name = Some(name);
+    log::info!(
+        "[relay] profile name: {}",
+        ctx.identity_name.as_deref().unwrap_or("")
+    );
+
+    if changed && ctx.display_on && ctx.masters.len() == 1 {
+        let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
+        let name = ctx.identity_name.clone();
+        crate::oled::show_npub(ctx.display, name.as_deref(), &npub);
+    }
+}
+
+/// Extract a display name from a kind-0 profile's JSON content: prefer
+/// `display_name`, then `name`, then `nip05`. `None` if none are usable.
+fn profile_name(content: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    for key in ["display_name", "name", "nip05"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Route an inbound EVENT by kind. Errors specific to one request are logged
 /// and swallowed (return `Ok`) so a single bad request never drops the session;
 /// only transport errors propagate to trigger a reconnect.
 fn process_event(tls: &mut Tls, ev: &SignedEvent, ctx: &mut SignCtx) -> Result<(), String> {
+    // Our own kind-0 profile: cache the name and refresh the idle identity
+    // screen. This is not a user request, so it must never wake a blanked panel.
+    if ev.kind == 0 {
+        handle_profile_event(ev, ctx);
+        return Ok(());
+    }
     if ev.kind != NIP46_KIND && ev.kind != MGMT_KIND {
         return Ok(());
     }

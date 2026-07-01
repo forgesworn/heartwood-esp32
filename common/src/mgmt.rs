@@ -80,6 +80,28 @@ pub fn remember(inner_id: &str, seen: &mut Vec<String>, max: usize) {
     }
 }
 
+/// Build a NIP-46 `bunker://` connection URI addressed to one identity.
+///
+/// Shared by `create_client` (which passes `Some(secret)` to bind the connecting
+/// client key to a policy slot) and `list_identities` (which passes `None` —
+/// pure discovery). Discovery and authorisation are deliberately orthogonal: the
+/// `#p` pubkey selects *which identity signs*, while a secret binds a *client
+/// key* to a slot's policy. That is why discovery URIs carry no secret — one
+/// secret shared across identities would make distinct client keys collide on a
+/// single slot. `relays` are advertised so the client knows where to publish; an
+/// empty list yields a bare `bunker://<pubkey>`.
+pub fn bunker_uri(pubkey_hex: &str, relays: &[String], secret: Option<&str>) -> String {
+    let mut params: Vec<String> = relays.iter().map(|r| format!("relay={r}")).collect();
+    if let Some(s) = secret {
+        params.push(format!("secret={s}"));
+    }
+    if params.is_empty() {
+        format!("bunker://{pubkey_hex}")
+    } else {
+        format!("bunker://{pubkey_hex}?{}", params.join("&"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +123,32 @@ mod tests {
     fn non_operator_is_rejected() {
         // The core security claim: an event from anyone but op_mgmt fails the gate.
         assert!(!is_operator(&other_key(), &OP));
+    }
+
+    #[test]
+    fn bunker_uri_discovery_carries_no_secret() {
+        // list_identities shape: relays advertised, no secret appended.
+        let relays = vec!["wss://a.example".to_string(), "wss://b.example".to_string()];
+        assert_eq!(
+            bunker_uri("abcd", &relays, None),
+            "bunker://abcd?relay=wss://a.example&relay=wss://b.example"
+        );
+    }
+
+    #[test]
+    fn bunker_uri_with_secret_appends_it_after_relays() {
+        // create_client shape: secret last, so the addressed pubkey stays first.
+        let relays = vec!["wss://a.example".to_string()];
+        assert_eq!(
+            bunker_uri("abcd", &relays, Some("s3cr3t")),
+            "bunker://abcd?relay=wss://a.example&secret=s3cr3t"
+        );
+    }
+
+    #[test]
+    fn bunker_uri_without_relays_is_bare() {
+        assert_eq!(bunker_uri("abcd", &[], None), "bunker://abcd");
+        assert_eq!(bunker_uri("abcd", &[], Some("x")), "bunker://abcd?secret=x");
     }
 
     #[test]

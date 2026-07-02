@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "heartwood-esp32"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "base64",
  "crc32fast",

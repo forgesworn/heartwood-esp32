@@ -194,6 +194,24 @@ pub fn handle_request(
         heartwood_common::policy::ApprovalTier::ButtonRequired
     };
 
+    // State-mutating identity methods (heartwood_derive / derive_persona /
+    // recover / create_proof — all `always_requires_button`) must not be
+    // served to an unbound REMOTE client. The relay path calls this for any
+    // event author, so without this gate an unbound peer could drive persona
+    // derivation and force NVS writes (flash wear, MAX_PERSONAS exhaustion) —
+    // no key leaks, but unapproved on-device state mutation. A slot-bound
+    // client, or the physically-present direct-USB path (no remote client),
+    // proceeds as before. Mirrors the encrypt/decrypt gate above.
+    if method.always_requires_button()
+        && has_client
+        && policy_engine
+            .find_slot_by_pubkey(master_slot, &client_hex)
+            .is_none()
+    {
+        log::warn!("{}: refused — unbound client", request.method);
+        return build_error_json(&request.id, -1, "unauthorised");
+    }
+
     match request.method.as_str() {
         "sign_event" => {
             match tier {

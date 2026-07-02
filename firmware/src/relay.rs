@@ -90,7 +90,10 @@ const MGMT_SEEN_KEY: &str = "mgmt_seen";
 /// Initial capacity of the inbound byte-accumulation buffer.
 const READ_BUF: usize = 8192;
 /// Largest single inbound WS frame we'll accept; bigger ⇒ drop + reconnect.
-const MAX_WS_FRAME: usize = 16384;
+/// Sized for the biggest legitimate message: a `set_identity_meta` mgmt event
+/// carrying a 64x64 Rgb565 avatar (8KB raw → ~11KB base64 inside the NIP-44
+/// ciphertext → ~17KB event JSON), with headroom.
+const MAX_WS_FRAME: usize = 32768;
 /// `SO_RCVTIMEO` for the read loop — how long a `read` blocks before returning
 /// "no data yet" so the loop can ping / check the silence deadline.
 const RECV_TIMEOUT_MS: i64 = 1000;
@@ -1297,6 +1300,47 @@ fn dispatch_mgmt(
             } else {
                 Err(format!("no such slot: {slot_index}"))
             }
+        }
+
+        // The cable-free twin of the USB SET_IDENTITY_META (0x5b) frame:
+        // Sapwood resolves the kind-0 and shrinks the picture in-browser,
+        // then hands over ready Rgb565 bytes (base64 inside the NIP-44
+        // ciphertext). The signer still never fetches or decodes images.
+        "set_identity_meta" => {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            let name = req
+                .pointer("/params/name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if name.is_empty() || name.len() > 255 {
+                return Err("name must be 1-255 bytes".into());
+            }
+            let w = req.pointer("/params/w").and_then(|v| v.as_u64()).unwrap_or(0);
+            let h = req.pointer("/params/h").and_then(|v| v.as_u64()).unwrap_or(0);
+            if !(1..=255).contains(&w) || !(1..=255).contains(&h) {
+                return Err("avatar dimensions must be 1-255".into());
+            }
+            let avatar = B64
+                .decode(req.pointer("/params/avatar_b64").and_then(|v| v.as_str()).unwrap_or(""))
+                .map_err(|e| format!("avatar_b64: {e}"))?;
+            if avatar.len() != (w as usize) * (h as usize) * 2 {
+                return Err(format!("avatar length {} != w*h*2", avatar.len()));
+            }
+            crate::identity_meta::save(ctx.nvs, master_slot, name, w as u8, h as u8, &avatar)?;
+            log::info!("[relay] mgmt: identity meta stored for slot {master_slot}: '{name}' {w}x{h}");
+            // Refresh the single-master identity card, as the USB path does.
+            // Never wakes a blanked panel — operator config, not a user request.
+            if ctx.masters.len() == 1 && ctx.display_on {
+                let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
+                let meta = crate::identity_meta::load(ctx.nvs, master_slot);
+                let (nm, av) = match &meta {
+                    Some(m) => (Some(m.name.as_str()), Some((m.w, m.h, m.avatar.as_slice()))),
+                    None => (None, None),
+                };
+                crate::oled::show_npub(ctx.display, nm, &npub, av);
+            }
+            Ok(serde_json::json!({ "ok": true, "name": name, "w": w, "h": h }))
         }
 
         "get_status" => Ok(serde_json::json!({

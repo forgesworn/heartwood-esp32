@@ -1,6 +1,6 @@
 [package]
 name = "heartwood-esp32"
-version = "0.9.11"
+version = "0.9.12"
 edition = "2021"
 description = "nsec-tree signing device firmware for Heltec WiFi LoRa 32 (V3 and V4)"
 
@@ -39,6 +39,8 @@ zeroize = { version = "1", default-features = false, features = ["derive"] }
 crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Relay management: avatar bytes travel base64-encoded inside NIP-44 requests.
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 # ESP-IDF std framework
 esp-idf-svc = { version = "0.52", features = ["binstart"] }

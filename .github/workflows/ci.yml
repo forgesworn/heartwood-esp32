@@ -61,6 +61,31 @@ jobs:
       # scheme (the on-device verifier and the CI signer share this module).
       - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign
 
+  # Supply-chain gate over the host-buildable crates: RUSTSEC advisories,
+  # licence allow-list and source registries, enforced against the shared
+  # deny.toml. There is no workspace root here (each crate is standalone), so
+  # cargo-deny is pointed at each manifest with an explicit --config. The
+  # firmware crate cross-compiles for Xtensa/RISC-V and is covered by the
+  # per-board builds; its dependency surface is shared with `common`, which is
+  # scanned. serialport (provision/heartwoodd) needs libudev to resolve.
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny (host crates)
+        run: |
+          set -eu
+          for crate in common heartwoodd provision ota ota-sign; do
+            echo "::group::cargo-deny $crate"
+            cargo deny --manifest-path "$crate/Cargo.toml" \
+              check --config deny.toml advisories licenses sources bans
+            echo "::endgroup::"
+          done
+
   # The host-side provisioning CLI (provision/) — the offline, air-gapped key
   # tool (restore from phrase/nsec, generate, pair the bridge secret). Build +
   # test it on the host so this security-critical path can't silently break.

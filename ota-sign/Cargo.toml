@@ -3,6 +3,7 @@ name = "heartwood-ota-sign"
 version = "0.1.0"
 edition = "2021"
 description = "OTA release signing tool for heartwood-esp32 — keygen, sign, verify"
+license = "MIT"
 
 [dependencies]
 heartwood-common = { path = "../common", default-features = false, features = ["k256-backend", "ota-sign"] }

@@ -3,6 +3,7 @@ name = "heartwood-provision"
 version = "0.1.0"
 edition = "2021"
 description = "Provisioning CLI for heartwood-esp32 — derives root secret from mnemonic"
+license = "MIT"
 
 [dependencies]
 heartwood-common = { path = "../common", features = ["nip46"] }

@@ -3,6 +3,7 @@ name = "heartwood-esp32"
 version = "0.10.0"
 edition = "2021"
 description = "nsec-tree signing device firmware for Heltec WiFi LoRa 32 (V3 and V4)"
+license = "MIT"
 
 [features]
 # Default build targets the Heltec V4 (native USB-Serial-JTAG on GPIO19/20).

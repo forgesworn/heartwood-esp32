@@ -3,6 +3,7 @@ name = "heartwood-ota"
 version = "0.1.0"
 edition = "2021"
 description = "Pi-side OTA firmware update tool for heartwood-esp32"
+license = "MIT"
 
 [dependencies]
 heartwood-common = { path = "../common", default-features = false, features = ["k256-backend"] }

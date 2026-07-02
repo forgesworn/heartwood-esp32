@@ -1,0 +1,49 @@
+# cargo-deny config for the host-buildable crates (common, ota, ota-sign,
+# provision, heartwoodd). The firmware crate cross-compiles for Xtensa/RISC-V
+# and is covered by the per-board firmware builds, not this gate.
+#
+# Run locally:  cargo deny --manifest-path <crate>/Cargo.toml check
+
+[advisories]
+# A real *vulnerability* advisory must fail CI (that is the point of this
+# gate). The entries below are *unmaintained* notices on cosmetic, non-crypto
+# transitive deps with no upgrade path — justified, and to be removed the
+# moment an upstream release drops them.
+ignore = [
+    # number_prefix (byte-size formatting) pulled by indicatif's progress bar
+    # in the `ota` CLI. Host-only, no attack surface. indicatif still depends
+    # on it at its latest release.
+    "RUSTSEC-2025-0119",
+    # instant (wasm time shim) pulled transitively into heartwoodd. Host-only
+    # timekeeping, no security surface; superseded upstream by web-time.
+    "RUSTSEC-2024-0384",
+]
+
+[licenses]
+# Permissive licences only. Extend deliberately, never to silence a copyleft.
+# First-party crates each declare `license = "MIT"` (matching the top-level
+# LICENCE), so they satisfy the allow-list directly.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Zlib",
+    # webpki-roots ships the Mozilla CA root store under CDLA-Permissive-2.0 —
+    # a permissive data licence, no copyleft obligation.
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

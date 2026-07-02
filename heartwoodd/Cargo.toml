@@ -3,6 +3,7 @@ name = "heartwoodd"
 version = "0.2.0"
 edition = "2021"
 description = "Heartwood daemon -- Nostr signing service for Pi (Soft mode) and ESP32 (Hard mode)"
+license = "MIT"
 
 [dependencies]
 heartwood-common = { path = "../common", features = ["nip46", "nip44"] }

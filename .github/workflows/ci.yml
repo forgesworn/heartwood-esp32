@@ -59,7 +59,7 @@ jobs:
       # (the official NIP-44 vectors, NIP-04 round-trips, the synthetic nonce)
       # never run anywhere in CI. ota-sign covers the OTA release-signature
       # scheme (the on-device verifier and the CI signer share this module).
-      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign
+      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,seed-encrypt
 
   # Supply-chain gate over the host-buildable crates: RUSTSEC advisories,
   # licence allow-list and source registries, enforced against the shared

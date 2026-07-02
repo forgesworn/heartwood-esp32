@@ -128,13 +128,32 @@ physical-access gap is therefore an **accepted limitation**, mitigated
 operationally (keep the device in your possession; treat a lost device as a
 compromised key and rotate by re-flashing a new identity).
 
-The only hardening lever that does **not** touch eFuses is **PIN/passphrase-derived
-seed encryption** — derive a key from the boot PIN (e.g. scrypt) and store the
-seed as ciphertext, so a raw flash dump alone is insufficient. This is not built
-today; it trades unattended reboot (a WiFi signer must boot without a human) for
-at-rest protection, so it would suit a "carried, manually unlocked" device rather
-than an always-on relay signer. Captured here as the future option should the
-threat calculus change.
+### PIN-derived seed encryption — the eFuse-free at-rest mitigation (P5, BUILT)
+
+The one hardening lever that does **not** touch eFuses is **PIN-derived seed
+encryption**, and it is now built (opt-in). When a PIN is set, each master seed
+is stored as ciphertext — `PBKDF2-HMAC-SHA256(pin, salt)` derives the key,
+ChaCha20 + HMAC-SHA256 encrypt-then-MAC it (`common/src/seed_cipher.rs`), and
+the plaintext is removed. A raw `esptool read_flash` now yields ciphertext, not
+the seed. On boot the device is locked until a PIN decrypts the seeds into RAM;
+5 wrong attempts wipe the NVS. There is **no stored PIN hash** — a fast hash
+would let a flash-dump attacker brute-force the PIN cheaply and skip the slow
+KDF, so the AEAD tag is the sole PIN check and every guess pays the PBKDF2 cost.
+
+**Honest limitation:** with no secure element and no eFuses, the key is derived
+**entirely from the PIN**. An attacker who owns the flash can brute-force the
+PIN offline; the slow KDF raises the per-guess cost but a short PIN is an
+enumerable space. So this is a real uplift — a stolen device is no longer
+instant game-over — but it is **not** hardware-wallet-grade at-rest security.
+
+Trade-offs: it costs unattended reboot (a PIN-protected signer needs the PIN
+entered to boot — over USB today; on-device button entry is a planned
+follow-on), so it suits a "carried, manually unlocked" device more than an
+always-on relay signer. Losing the PIN means the on-device seed is
+unrecoverable **by design** — the escape hatch is re-restoring the 12-word
+phrase on a wiped device, so a verified phrase backup is the prerequisite for
+enabling it. Full design + build notes:
+`docs/2026-07-02-pin-seed-encryption-design.md`.
 
 ## What the design already gets right
 

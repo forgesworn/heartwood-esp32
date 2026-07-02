@@ -279,8 +279,8 @@ fn main() {
     // If a PIN is set, the device stays locked until the correct PIN is
     // provided via a PIN_UNLOCK frame. All other frames are rejected,
     // except PROVISION_LIST which is safe (no secret material exposed).
-    if pin::has_pin(&nvs) {
-        log::info!("PIN protection active — waiting for unlock");
+    if pin::is_locked(&loaded_masters) {
+        log::info!("PIN protection active — seeds encrypted, waiting for unlock");
         oled::show_error(&mut display, "PIN locked\nAwait unlock...");
 
         // Load the persisted failed-attempt counter so the wipe threshold
@@ -297,10 +297,11 @@ fn main() {
                         &mut usb,
                         &frame.payload,
                         &mut nvs,
+                        &mut loaded_masters,
                         &mut failed_attempts,
                         &mut display,
                     ) {
-                        break; // Unlocked — continue boot.
+                        break; // Unlocked — seeds now in RAM, continue boot.
                     }
                 }
                 FRAME_TYPE_PROVISION_LIST => {
@@ -643,12 +644,13 @@ fn main() {
                 );
             }
 
-            // 0x25 — set/change/clear boot PIN
+            // 0x25 — set/change/clear boot PIN (encrypts/decrypts the seeds)
             FRAME_TYPE_SET_PIN => {
                 pin::handle_set_pin(
                     &mut usb,
                     &frame.payload,
                     &mut nvs,
+                    &loaded_masters,
                     &mut display,
                     &button_pin,
                 );

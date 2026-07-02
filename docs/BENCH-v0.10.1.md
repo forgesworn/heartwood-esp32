@@ -68,6 +68,28 @@ never ran `connect` with a slot secret):
       §6. It recomputes the frozen crypto vectors on the real lx106 in the first
       second. If POST passes, the tethered signer tier is just plumbing.
 
+## 4b. PIN-derived seed encryption (P5, opt-in — set only on a bench device)
+
+**Have the 12-word phrase to hand first** — a forgotten PIN means wipe +
+re-restore. On a device with a master already provisioned + unlocked:
+
+- [ ] Set a PIN (SET_PIN frame / Sapwood PIN UI); approve with the button.
+      Device reports "PIN set!".
+- [ ] `esptool read_flash` the NVS region (or dump flash) and confirm the seed
+      is NOT present in the clear — you should see the 92-byte encrypted blob
+      (`master_0_secret_enc`), not the 32-byte plaintext seed.
+- [ ] Power-cycle. Device boots to "PIN locked — await unlock" and refuses
+      signing.
+- [ ] Wrong PIN → "Wrong PIN, N left"; the counter persists across a reboot
+      (power-cycle mid-attempts and confirm it doesn't reset). 5 wrong → wipe.
+- [ ] Correct PIN → "Unlocked!", seeds decrypt into RAM, signing works, and the
+      derived npub is unchanged (same account as before the PIN).
+- [ ] Remove the PIN (empty SET_PIN, button-approved) → seed stored plaintext
+      again, boots without a lock. (Confirms the opt-out path.)
+- [ ] Note the availability trade-off: a PIN-protected Wi-Fi signer needs the
+      PIN entered over USB to boot — it won't auto-rejoin relays after a power
+      cut until unlocked (on-device PIN entry is the planned follow-on).
+
 ## 5. heartwood-bridge on a Pi/Linux box + USB signer
 
 The `heartwood` repo retired the soft signer; the bridge is now the keyless

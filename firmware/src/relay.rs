@@ -580,7 +580,7 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
         ),
 
         FRAME_TYPE_SET_PIN => {
-            crate::pin::handle_set_pin(usb, &frame.payload, ctx.nvs, ctx.display, ctx.button_pin)
+            crate::pin::handle_set_pin(usb, &frame.payload, ctx.nvs, ctx.masters, ctx.display, ctx.button_pin)
         }
 
         FRAME_TYPE_CONNSLOT_CREATE => {

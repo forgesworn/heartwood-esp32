@@ -1345,15 +1345,18 @@ fn dispatch_mgmt(
             crate::identity_meta::save(ctx.nvs, master_slot, name, w as u8, h as u8, &avatar)?;
             log::info!("[relay] mgmt: identity meta stored for slot {master_slot}: '{name}' {w}x{h}");
             // Refresh the single-master identity card, as the USB path does.
+            // Redraw straight from the values in hand — reloading from NVS here
+            // allocated a fresh avatar buffer at the request's peak heap use,
+            // which is exactly when a fragmented mid-TLS heap says no.
             // Never wakes a blanked panel — operator config, not a user request.
             if ctx.masters.len() == 1 && ctx.display_on {
                 let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
-                let meta = crate::identity_meta::load(ctx.nvs, master_slot);
-                let (nm, av) = match &meta {
-                    Some(m) => (Some(m.name.as_str()), Some((m.w, m.h, m.avatar.as_slice()))),
-                    None => (None, None),
-                };
-                crate::oled::show_npub(ctx.display, nm, &npub, av);
+                crate::oled::show_npub(
+                    ctx.display,
+                    Some(name),
+                    &npub,
+                    Some((w as u8, h as u8, avatar.as_slice())),
+                );
             }
             Ok(serde_json::json!({ "ok": true, "name": name, "w": w, "h": h }))
         }

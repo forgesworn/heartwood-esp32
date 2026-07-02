@@ -50,9 +50,17 @@ pub fn load(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<IdentityMeta> {
         Ok(Some(b)) => String::from_utf8_lossy(b).into_owned(),
         _ => return None,
     };
-    // Heap buffer: a 64x64 avatar is ~8KB, far too big for the task stack.
-    let mut avatar_buf = vec![0u8; 24 * 1024];
-    let (w, h, avatar) = match nvs.get_blob(&format!("imav{slot}"), &mut avatar_buf) {
+    // Heap buffer sized to the stored blob (a 64x64 avatar is ~8KB — too big
+    // for the task stack). Asking NVS for the exact length matters: a fixed
+    // 24KB buffer needed a contiguous block a fragmented mid-TLS heap could
+    // not supply, and OOM-aborted the relay loop (rst:0xc on the T-Display).
+    let avatar_key = format!("imav{slot}");
+    let blob_len = match nvs.blob_len(&avatar_key) {
+        Ok(Some(n)) if n >= 2 => n,
+        _ => return None,
+    };
+    let mut avatar_buf = vec![0u8; blob_len];
+    let (w, h, avatar) = match nvs.get_blob(&avatar_key, &mut avatar_buf) {
         Ok(Some(b)) if b.len() >= 2 => (b[0], b[1], b[2..].to_vec()),
         _ => return None,
     };

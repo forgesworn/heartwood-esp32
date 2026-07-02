@@ -107,3 +107,54 @@ guarantee.
 
 Tell me your calls on the five decisions (or just "your leans are fine") and I'll
 build it.
+
+---
+
+## Status: crypto core BUILT (2026-07-02, `6ca1c71`)
+
+`common/src/seed_cipher.rs` (feature `seed-encrypt`) is done and host-tested (7
+tests): `encrypt_seed`/`decrypt_seed` = `salt||nonce||ct||tag`, PBKDF2-HMAC-SHA256
+KDF + ChaCha20 + HMAC-SHA256 encrypt-then-MAC, wrong-PIN/tamper fail the
+constant-time MAC. `PBKDF2_ITERATIONS = 100_000` is a bench-tune knob. Decisions
+taken as the leans above (6-digit, opt-in, PBKDF2, lost-PIN=phrase-restore,
+5-attempt wipe).
+
+## Firmware integration — concrete plan (NOT yet built; lockout-critical)
+
+The seed is loaded plaintext at `main.rs:166` (`masters::load_all`) BEFORE the
+PIN gate (`main.rs:282`). Today's PIN is auth-only. P5 restructures the
+boot secret-load, so it must be built carefully and **bench-tested before use**
+(a bug here locks the owner out of their own keys — recoverable only by wipe +
+phrase re-restore, which is the intended escape hatch, but still).
+
+Steps:
+
+1. **Storage** (`masters.rs`): add `master_<slot>_secret_enc` (the 92-byte blob)
+   alongside/instead of `_secret`. `load_all` returns the metadata
+   (pubkey/label/mode) always, but leaves `LoadedMaster.secret` EMPTY when the
+   slot is encrypted — the secret is filled only after unlock. So `LoadedMaster`
+   needs a "locked/unlocked" notion (e.g. `secret: Option<[u8;32]>` or a
+   separate post-unlock fill step).
+2. **SET_PIN** (`pin.rs`): on set (with masters loaded + unlocked), for each
+   master: draw a fresh salt+nonce from the TRNG (`fill_random_strong`), encrypt
+   its seed, write `_secret_enc`, and **remove the plaintext `_secret`**. The
+   AEAD tag is the PIN check, so the separate `pin_hash` can go (or stay for a
+   fast "is this PIN even plausible" pre-check — but the real gate is decrypt).
+   Clearing the PIN re-encrypts back to plaintext (opt-out).
+3. **PIN_UNLOCK** (`pin.rs`): decrypt each `_secret_enc` with the PIN into the
+   in-RAM `LoadedMaster.secret`. Failure → wrong-PIN path (existing 5-attempt →
+   wipe). Success → boot continues with seeds in RAM only.
+4. **Boot** (`main.rs`): if any slot is encrypted, stay in the locked loop until
+   UNLOCK fills the secrets, THEN build `identity_caches` / policy engine (they
+   need the secret). Reorder so nothing touches `.secret` before unlock.
+5. **On-device PIN entry** (follow-on, threat refinement): today the PIN arrives
+   over USB (Sapwood). For full theft resistance the PIN should be entered
+   ON-DEVICE at boot with the button picker (the two-button digit picker is a
+   natural reuse). USB entry still gives at-rest encryption (flash dump =
+   ciphertext); on-device entry additionally removes host-trust.
+6. **Docs + bench**: SECURITY-MODEL uplift + limitation; bench = set PIN,
+   power-cycle, wrong PIN fails, right PIN unlocks, `esptool read_flash` shows
+   ciphertext not the seed.
+
+Each step compiles independently; the risky reorder is step 4. Build behind the
+opt-in SET_PIN so a default device is never affected until the owner sets a PIN.

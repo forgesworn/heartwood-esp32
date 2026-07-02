@@ -25,6 +25,8 @@ Today the firmware runs on exactly one board family: the **Heltec WiFi LoRa 32 V
 
 Two things change at once for the two viable boards (#1, #2): the **display** (mono OLED → colour TFT) and the **chip/board** (new pins, new transport, and for the C6 a new CPU architecture). #3 is a different story (see §7).
 
+Vendor reference captures for #2: [T-Display pin diagram](t-display-pin-diagram.png) (IPS ST7789V pinout — MOSI 19, SCLK 18, CS 5, DC 16, RST 23, BL 4) and [power/WiFi specifications](t-display-power-wifi-specs.png).
+
 ---
 
 ## 2. The gap — three seams that hard-code "Heltec S3 + SSD1306"

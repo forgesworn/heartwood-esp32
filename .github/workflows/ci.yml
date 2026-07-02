@@ -57,8 +57,9 @@ jobs:
       # Pass 2 — k256 backend with the full data-plane crypto. Without this the
       # nip44/nip46/nip04/backup modules stay feature-gated OFF, so their tests
       # (the official NIP-44 vectors, NIP-04 round-trips, the synthetic nonce)
-      # never run anywhere in CI.
-      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04
+      # never run anywhere in CI. ota-sign covers the OTA release-signature
+      # scheme (the on-device verifier and the CI signer share this module).
+      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign
 
   # The host-side provisioning CLI (provision/) — the offline, air-gapped key
   # tool (restore from phrase/nsec, generate, pair the bridge secret). Build +
@@ -71,6 +72,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - run: cargo +stable test --manifest-path provision/Cargo.toml
+
+  # The OTA release signing tool (ota-sign/) — keygen/sign/verify for the
+  # ed25519 release signatures the firmware enforces. Kept green here so the
+  # release pipeline's signing step can't be the first place it compiles.
+  ota-sign-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo +stable test --manifest-path ota-sign/Cargo.toml
 
   # Real firmware build for every Xtensa esp-idf board, plus the app-slot fit
   # check that has bitten us before (heavy crypto crates / opt level overflow the

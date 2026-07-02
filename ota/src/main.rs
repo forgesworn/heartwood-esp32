@@ -3,12 +3,16 @@
 // Pi-side OTA firmware update tool for heartwood-esp32.
 //
 // Sends a firmware binary to the ESP32 over serial using the heartwood frame
-// protocol. The ESP32 verifies the SHA-256 hash after all chunks arrive and
-// reboots into the new firmware on success.
+// protocol. The ESP32 verifies the SHA-256 hash and the ed25519 release
+// signature after all chunks arrive and reboots into the new firmware on
+// success.
 //
 // Usage:
-//   heartwood-ota --port /dev/ttyUSB0 --firmware heartwood-esp32.bin
-//   heartwood-ota --port /dev/ttyUSB0 --firmware heartwood-esp32.bin --baud 115200
+//   heartwood-ota --port /dev/ttyUSB0 --firmware app-heltec-v4.bin
+//     (release signature read from app-heltec-v4.bin.sig alongside the image;
+//      point --sig elsewhere to override)
+//   heartwood-ota --port /dev/ttyUSB0 --firmware app.bin --legacy-unsigned
+//     (pre-signature firmware only — sends the old 36-byte OTA_BEGIN)
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -36,9 +40,42 @@ struct Cli {
     #[arg(short, long)]
     firmware: String,
 
+    /// Release signature file (128 hex chars). Defaults to `<firmware>.sig`
+    /// next to the image — every release ships one per app image.
+    #[arg(short, long, conflicts_with = "legacy_unsigned")]
+    sig: Option<String>,
+
+    /// Send the old unsigned OTA_BEGIN. Only pre-signature firmware accepts
+    /// this; signature-enforcing firmware will refuse the update.
+    #[arg(long)]
+    legacy_unsigned: bool,
+
     /// Baud rate (default 115200)
     #[arg(short, long, default_value_t = 115200)]
     baud: u32,
+}
+
+/// Read a 64-byte signature from a hex file (whitespace/comment tolerant).
+fn read_signature(path: &str) -> Result<[u8; 64], String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read signature file '{path}': {e}"))?;
+    let hex: String = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    if hex.len() != 128 {
+        return Err(format!(
+            "signature in '{path}' must be 128 hex chars, got {}",
+            hex.len()
+        ));
+    }
+    let mut sig = [0u8; 64];
+    for (i, byte) in sig.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("signature in '{path}' contains non-hex characters"))?;
+    }
+    Ok(sig)
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +180,11 @@ fn read_ota_status(
                                         "device received chunk before OTA session started (0x13)".into(),
                                     )
                                 }
+                                OTA_STATUS_ERR_SIG => {
+                                    return Err(
+                                        "device rejected firmware: release signature invalid or missing (0x14) — pass the release's .sig file, or --legacy-unsigned for pre-signature firmware".into(),
+                                    )
+                                }
                                 other => {
                                     return Err(format!(
                                         "unknown OTA status code: 0x{other:02x}"
@@ -213,11 +255,31 @@ fn main() {
 
     let total_size = firmware.len() as u32;
 
+    // Release signature: explicit --sig path, else `<firmware>.sig` next to
+    // the image, unless the caller explicitly opted into the legacy flow.
+    let signature: Option<[u8; 64]> = if cli.legacy_unsigned {
+        None
+    } else {
+        let sig_path = cli.sig.clone().unwrap_or_else(|| format!("{}.sig", cli.firmware));
+        match read_signature(&sig_path) {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                eprintln!("error: {e}");
+                eprintln!(
+                    "hint: every release ships app-<board>.bin.sig; pass --sig <file>, or \
+                     --legacy-unsigned for firmware older than the signature check"
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+
     println!(
-        "Firmware: {} ({} bytes, SHA-256: {})",
+        "Firmware: {} ({} bytes, SHA-256: {}, {})",
         cli.firmware,
         total_size,
-        hex_encode(&digest)
+        hex_encode(&digest),
+        if signature.is_some() { "signed" } else { "UNSIGNED legacy" }
     );
 
     // ------------------------------------------------------------------
@@ -239,10 +301,14 @@ fn main() {
 
     // ------------------------------------------------------------------
     // Step 3: send OTA_BEGIN — payload = [total_size_u32_be][sha256_32]
+    // [signature_64], or the legacy 36-byte form without the signature.
     // ------------------------------------------------------------------
-    let mut begin_payload = Vec::with_capacity(36);
+    let mut begin_payload = Vec::with_capacity(100);
     begin_payload.extend_from_slice(&total_size.to_be_bytes());
     begin_payload.extend_from_slice(&digest);
+    if let Some(sig) = &signature {
+        begin_payload.extend_from_slice(sig);
+    }
 
     println!("Sending OTA_BEGIN ({} byte image)...", total_size);
 

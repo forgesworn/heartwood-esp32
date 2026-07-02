@@ -1102,7 +1102,7 @@ impl SigningBackend for SoftBackend {
         Ok(())
     }
 
-    fn ota_upload(&self, _firmware: &[u8]) -> Result<(), BackendError> {
+    fn ota_upload(&self, _firmware: &[u8], _signature: Option<&[u8; 64]>) -> Result<(), BackendError> {
         Err(BackendError::NotSupported)
     }
 
@@ -1394,7 +1394,7 @@ mod tests {
     fn ota_returns_not_supported() {
         let dir = TempDir::new().unwrap();
         let backend = SoftBackend::new(dir.path().to_path_buf());
-        let result = backend.ota_upload(&[0u8; 64]);
+        let result = backend.ota_upload(&[0u8; 64], None);
         assert!(matches!(result, Err(BackendError::NotSupported)));
     }
 

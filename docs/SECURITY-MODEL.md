@@ -73,19 +73,31 @@ third-party origins — see `sapwood/vite.config.ts`), which closes the usual XS
 exfiltration routes. Sapwood renders no user-supplied HTML (the one `{@html}` is
 a locally-generated QR SVG, not reflected input).
 
-## Threat: malicious firmware (OTA or the web flasher) — **physical / trust-on-first-use**
+## Threat: malicious firmware (OTA or the web flasher) — **signed OTA; flasher is trust-on-first-use**
 
-OTA verifies a **SHA-256 of the image against a hash supplied by the host** —
-this is *integrity* (the image arrived intact), not *authenticity* (the image is
-from a trusted author). OTA is **USB-only** and gated by a **physical 2-second
-button hold**. So a remote attacker cannot push firmware; a local one needs the
-cable and the button.
+OTA verifies **two things**: a SHA-256 of the image (*integrity* — the image
+arrived intact) and an **ed25519 release signature** over that digest
+(*authenticity* — the image was signed by our release key). The public key is
+baked into the firmware at build time (`firmware/ota-release-pubkey.hex` →
+`release_key.rs`); the signature is made in CI by `release.yml` and checked
+on-device twice — at `OTA_BEGIN` over the claimed digest (an unsigned image is
+refused before the owner is even asked to approve) and at `OTA_FINISH` over
+the digest recomputed from the bytes actually written to flash. The signed
+message is domain-separated by **board id** (see `common/src/ota_sign.rs`), so
+one board's image cannot be replayed onto another. Older releases remain
+verifiable deliberately: with no update health-check, an owner must be able to
+roll back a bad release. OTA also stays **USB-only** and gated by a **physical
+2-second button hold** — so a remote attacker cannot push firmware, a local one
+needs the cable, the button *and* the release key. No eFuses involved; the
+scheme is plain software and fully reversible. Key custody and rotation:
+`docs/ota-signing.md`.
 
-The real exposure is trust in the **firmware source**: a user who flashes from a
-compromised origin and approves the update installs whatever they're given — the
-approval screen shows only the size, not provenance. Today this is mitigated by
-operationally (HTTPS + CSP on the flasher, committed bins) rather than
-cryptographically. See the secure-boot roadmap below.
+The remaining exposure is the **first flash**: the web flasher writes to a
+blank (or ROM-bootloader-accessible) device, where no baked-in key exists yet
+to check against — trust-on-first-use, mitigated operationally (HTTPS + CSP on
+the flasher, CI-built committed bins with SHA-256 verification at sync and
+fetch time). Cryptographically closing *that* would require secure boot, which
+is out of scope (below).
 
 ## Threat: physical access (device lost / seized) — **NOT resisted (current gap)**
 

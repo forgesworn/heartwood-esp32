@@ -1,0 +1,6 @@
+# The ed25519 public key OTA firmware images must be signed with.
+#
+# The private half is the OTA_SIGNING_SEED GitHub Actions secret (set
+# 2026-07-02). Key custody, rotation and bench-key overrides:
+# docs/ota-signing.md
+3cdfa635d0a058119b412999f061870e7e0a6d41df5deffadb0c1ff4a9d339b7

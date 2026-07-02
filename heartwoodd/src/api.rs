@@ -346,8 +346,14 @@ async fn factory_reset(State(state): State<AppState>) -> Response {
 }
 
 /// Protected: upload new firmware bytes (Hard mode only; Soft mode returns 404).
+///
+/// An `X-Firmware-Signature` header (128 hex chars — the release's
+/// `app-<board>.bin.sig`) is forwarded to the device in OTA_BEGIN;
+/// signature-enforcing firmware refuses the update without it. Absent header
+/// falls back to the legacy unsigned OTA_BEGIN for pre-signature firmware.
 async fn ota_upload(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let firmware = body.to_vec();
@@ -355,8 +361,33 @@ async fn ota_upload(
         return api_err(StatusCode::BAD_REQUEST, "empty firmware binary");
     }
 
+    let signature: Option<[u8; 64]> = match headers.get("x-firmware-signature") {
+        None => None,
+        Some(value) => {
+            let hex = match value.to_str() {
+                Ok(s) => s.trim(),
+                Err(_) => return api_err(StatusCode::BAD_REQUEST, "x-firmware-signature is not ASCII"),
+            };
+            if hex.len() != 128 {
+                return api_err(StatusCode::BAD_REQUEST, "x-firmware-signature must be 128 hex chars");
+            }
+            let mut sig = [0u8; 64];
+            let mut bad = false;
+            for (i, byte) in sig.iter_mut().enumerate() {
+                match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+                    Ok(b) => *byte = b,
+                    Err(_) => { bad = true; break; }
+                }
+            }
+            if bad {
+                return api_err(StatusCode::BAD_REQUEST, "x-firmware-signature is not hex");
+            }
+            Some(sig)
+        }
+    };
+
     let result = tokio::task::spawn_blocking(move || {
-        state.backend.ota_upload(&firmware)
+        state.backend.ota_upload(&firmware, signature.as_ref())
     }).await.unwrap();
 
     match result {

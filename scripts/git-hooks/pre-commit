@@ -45,6 +45,11 @@ ALLOW_HEX = {
     "0000000000000000000000000000000000000000000000000000000000000001",
     "f00000000000000000000000000000f00000000000000000000000000000000f",
     "0000000000000000000000000000000000000000000000000000000000000000",
+    # OTA release signing PUBLIC key (ed25519 verify half; the seed lives in
+    # the OTA_SIGNING_SEED GitHub secret). Deliberately pinned by value, not
+    # by path — a seed accidentally pasted into ota-release-pubkey.hex must
+    # still trip this guard. Update on key rotation (docs/ota-signing.md).
+    "3cdfa635d0a058119b412999f061870e7e0a6d41df5deffadb0c1ff4a9d339b7",
 }
 
 # Path prefixes that are allowed to contain hex literals (test files, this

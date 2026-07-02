@@ -8,8 +8,11 @@ sign-test/target/
 bridge/target/
 heartwoodd/target/
 ota/target/
+ota-sign/target/
 sprite-gen/target/
 *.bin
+# OTA release signing seed (the private key) — must never be committed.
+*.seed
 # Private docs (plans, session memory, superpowers, specs)
 docs/plans/
 docs/memory/

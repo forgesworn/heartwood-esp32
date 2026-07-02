@@ -34,5 +34,8 @@ pub mod mgmt;
 #[cfg(feature = "mnemonic")]
 pub mod mnemonic;
 
+#[cfg(feature = "ota-sign")]
+pub mod ota_sign;
+
 #[cfg(feature = "mnemonic")]
 pub mod restore;

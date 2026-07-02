@@ -1,6 +1,6 @@
 [package]
 name = "heartwood-esp32"
-version = "0.9.14"
+version = "0.10.0"
 edition = "2021"
 description = "nsec-tree signing device firmware for Heltec WiFi LoRa 32 (V3 and V4)"
 
@@ -28,7 +28,7 @@ tdisplay = ["st7789"]
 c6 = []
 
 [dependencies]
-heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen"] }
+heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen", "ota-sign"] }
 
 # Crypto — libsecp256k1 C FFI (alignment-safe on Xtensa, unlike k256)
 secp256k1 = { version = "0.29" }

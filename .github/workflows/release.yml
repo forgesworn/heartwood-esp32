@@ -281,6 +281,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Verify the tag matches firmware/Cargo.toml
         run: |
@@ -296,7 +297,7 @@ jobs:
         with:
           path: dist
 
-      - name: Assemble version.json + gather images
+      - name: Gather images
         run: |
           set -eu
           mkdir -p out
@@ -304,15 +305,55 @@ jobs:
           find dist -name 'bootloader-*.bin' -exec cp {} out/ \;
           find dist -name 'partition-table-*.bin' -exec cp {} out/ \;
 
+      # Sign every app image with the release key, then verify each signature
+      # against the COMMITTED public key. The verify half is the guard rail: a
+      # rotated secret whose public half never landed in
+      # firmware/ota-release-pubkey.hex would otherwise ship an update that
+      # every device rejects.
+      - name: Sign the firmware images
+        env:
+          OTA_SIGNING_SEED: ${{ secrets.OTA_SIGNING_SEED }}
+        run: |
+          set -eu
+          if [ -z "${OTA_SIGNING_SEED:-}" ]; then
+            echo "::error::OTA_SIGNING_SEED secret is not set — generate the release key first (docs/ota-signing.md)"
+            exit 1
+          fi
+          cargo +stable build --release --manifest-path ota-sign/Cargo.toml
+          tool="ota-sign/target/release/heartwood-ota-sign"
+          for app in out/app-*.bin; do
+            board="$(basename "$app" .bin)"; board="${board#app-}"
+            # The signed message carries the board id THE DEVICE reports
+            # (board::BOARD): the C6 firmware calls itself "esp32c6" while the
+            # release assets are named "c6".
+            sign_board="$board"; [ "$board" = "c6" ] && sign_board="esp32c6"
+            "$tool" sign --seed-env OTA_SIGNING_SEED --board "$sign_board" --image "$app" --out "$app.sig"
+            "$tool" verify --pubkey firmware/ota-release-pubkey.hex --board "$sign_board" --image "$app" --sig "$app.sig"
+          done
+
+      - name: Assemble version.json
+        run: |
+          set -eu
           # Each board describes its OWN images now (per-board partition table +
           # an ota flag), so the manifest is just the merge of the per-board frags —
           # no cross-board "tables must be identical" assert (they no longer are).
           boards="$(jq -s 'add' $(find dist -name 'frag-*.json'))"
+
+          # Attach each board's release signature (hex ed25519 over the
+          # domain-separated board+sha256 message — see common/src/ota_sign.rs).
+          for sig in out/app-*.bin.sig; do
+            app="${sig%.sig}"
+            board="$(basename "$app" .bin)"; board="${board#app-}"
+            boards="$(jq --arg b "$board" --arg s "$(tr -d '\n' < "$sig")" '.[$b].signature = $s' <<< "$boards")"
+          done
+
+          pubkey="$(grep -v '^#' firmware/ota-release-pubkey.hex | tr -d '[:space:]')"
           jq -n \
             --arg v "${GITHUB_REF_NAME#v}" \
             --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pk "$pubkey" \
             --argjson boards "$boards" \
-            '{version: $v, builtAt: $at, boards: $boards}' \
+            '{version: $v, builtAt: $at, signingPubKey: $pk, boards: $boards}' \
             > out/version.json
           cat out/version.json
 
@@ -323,5 +364,5 @@ jobs:
           set -eu
           gh release create "$GITHUB_REF_NAME" \
             --title "Firmware $GITHUB_REF_NAME" \
-            --notes "Firmware ${GITHUB_REF_NAME} for every supported board. Each esp-idf board ships \`app-<board>.bin\` + \`bootloader-<board>.bin\` + \`partition-table-<board>.bin\`; the esp8266 ships a single \`app-esp8266.bin\` (flash at 0x0). \`version.json\` describes them, including a per-board \`ota\` flag — heltec-v3/v4 are OTA-updatable (2 MB A/B), the T-Display/C6 are 4 MB factory (USB re-flash), the esp8266 has no OTA. Pull into Sapwood with \`npm run sync:firmware\`." \
-            out/app-*.bin out/bootloader-*.bin out/partition-table-*.bin out/version.json
+            --notes "Firmware ${GITHUB_REF_NAME} for every supported board. Each esp-idf board ships \`app-<board>.bin\` + \`bootloader-<board>.bin\` + \`partition-table-<board>.bin\`; the esp8266 ships a single \`app-esp8266.bin\` (flash at 0x0). Every app image carries an ed25519 release signature (\`app-<board>.bin.sig\`, also embedded in \`version.json\`) that signature-enforcing firmware verifies before installing an OTA. \`version.json\` describes them, including a per-board \`ota\` flag — heltec-v3/v4 are OTA-updatable (2 MB A/B), the T-Display/C6 are 4 MB factory (USB re-flash), the esp8266 has no OTA. Pull into Sapwood with \`npm run sync:firmware\`." \
+            out/app-*.bin out/app-*.bin.sig out/bootloader-*.bin out/partition-table-*.bin out/version.json

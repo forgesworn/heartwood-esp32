@@ -25,6 +25,10 @@ cbc = { version = "0.1", default-features = false, features = ["alloc", "block-p
 # no_std for the lx106; the `alloc` feature (pulled by `mnemonic`) gives
 # to_seed/from_entropy without std.
 bip39 = { version = "2", optional = true, default-features = false }
+# OTA release-signature scheme (ed25519 over the image digest). Pure Rust and
+# no_std; `opt_size` trades verify speed for code size — the Heltec app must
+# still fit its 2 MB OTA slot.
+ed25519-compact = { version = "2", optional = true, default-features = false, features = ["opt_size"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -45,5 +49,8 @@ nip04 = ["dep:aes", "dep:cbc", "dep:base64"]
 mnemonic = ["dep:bip39"]
 # Back-compat alias: BIP-39 on the secp256k1 backend (the WiFi firmware + CI path).
 mnemonic-gen = ["mnemonic", "secp256k1-backend"]
+# OTA release signatures: sign (CI tool) + verify (device) share one module so
+# the message format can never drift between signer and verifier.
+ota-sign = ["dep:ed25519-compact"]
 # Convenience alias for secp256k1 backend with full feature set (used by firmware)
-firmware = ["secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen"]
+firmware = ["secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen", "ota-sign"]

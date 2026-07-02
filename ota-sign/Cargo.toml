@@ -1,0 +1,12 @@
+[package]
+name = "heartwood-ota-sign"
+version = "0.1.0"
+edition = "2021"
+description = "OTA release signing tool for heartwood-esp32 — keygen, sign, verify"
+
+[dependencies]
+heartwood-common = { path = "../common", default-features = false, features = ["k256-backend", "ota-sign"] }
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+getrandom = "0.2"
+zeroize = "1"

@@ -120,6 +120,9 @@ pub const OTA_STATUS_ERR_HASH: u8 = 0x10;
 pub const OTA_STATUS_ERR_SIZE: u8 = 0x11;
 pub const OTA_STATUS_ERR_WRITE: u8 = 0x12;
 pub const OTA_STATUS_ERR_NOT_STARTED: u8 = 0x13;
+// The image is not signed by the release key (or the host sent the legacy
+// unsigned OTA_BEGIN to signature-enforcing firmware).
+pub const OTA_STATUS_ERR_SIG: u8 = 0x14;
 
 pub const MAX_PAYLOAD_SIZE: usize = 32768;
 pub const FRAME_HEADER_SIZE: usize = 5; // 2 magic + 1 type + 2 length

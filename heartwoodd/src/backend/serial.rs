@@ -557,7 +557,7 @@ impl SigningBackend for SerialBackend {
         }
     }
 
-    fn ota_upload(&self, firmware: &[u8]) -> Result<(), BackendError> {
+    fn ota_upload(&self, firmware: &[u8], signature: Option<&[u8; 64]>) -> Result<(), BackendError> {
         if firmware.is_empty() {
             return Err(BackendError::Internal("empty firmware binary".into()));
         }
@@ -573,11 +573,15 @@ impl SigningBackend for SerialBackend {
             h
         };
 
-        // OTA_BEGIN: [size_u32_be (4)][sha256 (32)]
+        // OTA_BEGIN: [size_u32_be (4)][sha256 (32)][signature (64)] — or the
+        // legacy 36-byte unsigned form for pre-signature firmware.
         let size = firmware.len() as u32;
-        let mut begin_payload = Vec::with_capacity(36);
+        let mut begin_payload = Vec::with_capacity(100);
         begin_payload.extend_from_slice(&size.to_be_bytes());
         begin_payload.extend_from_slice(&hash);
+        if let Some(sig) = signature {
+            begin_payload.extend_from_slice(sig);
+        }
 
         let begin_frame = frame::build_frame(FRAME_TYPE_OTA_BEGIN, &begin_payload)
             .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
@@ -588,6 +592,11 @@ impl SigningBackend for SerialBackend {
         let begin_resp = self.send_and_receive(&mut port, &begin_frame, &[FRAME_TYPE_OTA_STATUS], 60)?;
         if begin_resp.payload.first().copied() != Some(OTA_STATUS_READY) {
             let code = begin_resp.payload.first().copied().unwrap_or(0xff);
+            if code == OTA_STATUS_ERR_SIG {
+                return Err(BackendError::Internal(
+                    "device requires a signed firmware image (release signature invalid or missing)".into(),
+                ));
+            }
             return Err(BackendError::Internal(
                 format!("OTA begin rejected (status 0x{code:02x})")
             ));

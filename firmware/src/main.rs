@@ -58,6 +58,7 @@ mod pin;
 mod policy;
 mod protocol;
 mod provision;
+mod release_key;
 mod serial;
 mod net_config_store;
 mod boot_config;

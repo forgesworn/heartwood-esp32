@@ -3,15 +3,25 @@
 // OTA firmware update handler.
 //
 // Receives firmware chunks over serial, writes them to the inactive OTA
-// partition, verifies SHA-256, and reboots into the new firmware.
+// partition, verifies SHA-256 integrity AND an ed25519 release signature
+// (authenticity), and reboots into the new firmware.
 //
 // Frame flow:
-//   Host → OTA_BEGIN  [total_size_u32_be][sha256_32]
+//   Host → OTA_BEGIN  [total_size_u32_be][sha256_32][signature_64]
 //   Device → OTA_STATUS(READY)
 //   Host → OTA_CHUNK  [offset_u32_be][data...]  (repeated)
 //   Device → OTA_STATUS(CHUNK_OK)  (after each chunk)
 //   Host → OTA_FINISH
 //   Device → OTA_STATUS(VERIFIED) + reboot
+//
+// The signature is ed25519 over the domain-separated (board, sha256) message —
+// see common/src/ota_sign.rs — made with the release key whose public half is
+// baked in at build time (release_key.rs). It is checked twice: at OTA_BEGIN
+// over the claimed digest, so an unsigned image is refused before the owner is
+// asked to approve or a single byte is transferred; and again at OTA_FINISH
+// over the digest computed from the bytes actually written to flash, which is
+// the check that carries the security guarantee. The legacy 36-byte unsigned
+// OTA_BEGIN is refused with ERR_SIG.
 //
 // On any error the device sends OTA_STATUS(ERR_*) and the session is aborted.
 
@@ -20,9 +30,11 @@ use crate::serial::SerialPort;
 use sha2::{Digest, Sha256};
 
 use crate::oled::Display;
+use heartwood_common::ota_sign::verify_ota_signature;
 use heartwood_common::types::{
     FRAME_TYPE_OTA_STATUS, OTA_STATUS_CHUNK_OK, OTA_STATUS_ERR_HASH, OTA_STATUS_ERR_NOT_STARTED,
-    OTA_STATUS_ERR_SIZE, OTA_STATUS_ERR_WRITE, OTA_STATUS_READY, OTA_STATUS_VERIFIED,
+    OTA_STATUS_ERR_SIG, OTA_STATUS_ERR_SIZE, OTA_STATUS_ERR_WRITE, OTA_STATUS_READY,
+    OTA_STATUS_VERIFIED,
 };
 
 /// Expected chunk data size for progress display (host OTA tool default).
@@ -34,6 +46,7 @@ const CHUNK_DATA_MAX: usize = 4088;
 pub struct OtaSession {
     pub total_size: u32,
     pub expected_hash: [u8; 32],
+    pub signature: [u8; 64],
     pub bytes_received: u32,
     pub hasher: Sha256,
     pub ota_handle: esp_idf_svc::sys::esp_ota_handle_t,
@@ -51,9 +64,13 @@ unsafe impl Send for OtaSession {}
 
 /// Handle an `OTA_BEGIN` frame.
 ///
-/// Payload: `[total_size: u32 BE][sha256: 32 bytes]` — 36 bytes total.
+/// Payload: `[total_size: u32 BE][sha256: 32 bytes][signature: 64 bytes]` —
+/// 100 bytes total. The legacy unsigned 36-byte form is refused with
+/// `ERR_SIG` (hosts fall back to it only for pre-signature firmware).
 ///
-/// Shows the firmware size on the OLED and runs the 30-second approval loop
+/// Verifies the release signature over the claimed digest first — a bad or
+/// missing signature is refused before the owner is asked to approve.  Then
+/// shows the firmware size on the OLED and runs the 30-second approval loop
 /// (hold button 2 seconds to confirm).  On approval, opens the inactive OTA
 /// partition and initialises an `OtaSession`.  Sends `OTA_STATUS(READY)` on
 /// success or an appropriate error code on failure.
@@ -64,10 +81,17 @@ pub fn handle_ota_begin(
     button_pin: &PinDriver<'_, Input>,
     session: &mut Option<OtaSession>,
 ) {
-    // Validate payload length: 4 bytes size + 32 bytes hash.
-    if payload.len() != 36 {
+    // Validate payload length: 4 bytes size + 32 bytes hash + 64 bytes
+    // signature. The old 36-byte unsigned form gets a distinct error so hosts
+    // can tell "update your tooling" apart from a malformed frame.
+    if payload.len() == 36 {
+        log::warn!("OTA_BEGIN: unsigned legacy payload — signature required");
+        send_ota_status(usb, OTA_STATUS_ERR_SIG, "Signature required");
+        return;
+    }
+    if payload.len() != 100 {
         log::warn!(
-            "OTA_BEGIN: invalid payload length {} (expected 36)",
+            "OTA_BEGIN: invalid payload length {} (expected 100)",
             payload.len()
         );
         send_ota_status(usb, OTA_STATUS_ERR_SIZE, "Bad payload length");
@@ -77,6 +101,23 @@ pub fn handle_ota_begin(
     let total_size = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let mut expected_hash = [0u8; 32];
     expected_hash.copy_from_slice(&payload[4..36]);
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&payload[36..100]);
+
+    // Refuse an image that is not signed by the release key before bothering
+    // the owner. This checks the CLAIMED digest — OTA_FINISH re-checks the
+    // signature over the digest computed from the written bytes, which is the
+    // verification that actually counts.
+    if !verify_ota_signature(
+        &crate::release_key::OTA_RELEASE_PUBKEY,
+        crate::board::BOARD,
+        &expected_hash,
+        &signature,
+    ) {
+        log::warn!("OTA_BEGIN: release signature verification failed");
+        send_ota_status(usb, OTA_STATUS_ERR_SIG, "Bad signature");
+        return;
+    }
 
     // NOTE: no log::info! here -- VFS logging interleaves with framed
     // serial data and corrupts OTA_STATUS responses on the host side.
@@ -135,6 +176,7 @@ pub fn handle_ota_begin(
     *session = Some(OtaSession {
         total_size,
         expected_hash,
+        signature,
         bytes_received: 0,
         hasher: Sha256::new(),
         ota_handle,
@@ -243,12 +285,15 @@ pub fn handle_ota_chunk(
 /// Handle an `OTA_FINISH` frame.
 ///
 /// Verifies that all bytes have been received, finalises the SHA-256 digest,
-/// and compares it against the expected hash supplied in `OTA_BEGIN`.
+/// compares it against the expected hash supplied in `OTA_BEGIN`, and checks
+/// the release signature over the COMPUTED digest — the authenticity check
+/// that covers the bytes actually written to flash.
 ///
 /// On success: calls `esp_ota_end`, sets the boot partition, sends
 /// `OTA_STATUS(VERIFIED)`, and reboots.
 ///
 /// On hash mismatch: calls `esp_ota_abort` and sends `OTA_STATUS(ERR_HASH)`.
+/// On signature failure: calls `esp_ota_abort` and sends `OTA_STATUS(ERR_SIG)`.
 pub fn handle_ota_finish(
     usb: &mut SerialPort<'_>,
     display: &mut Display<'_>,
@@ -289,7 +334,24 @@ pub fn handle_ota_finish(
         return;
     }
 
-    log::info!("OTA_FINISH: SHA-256 verified -- finalising update");
+    // Authenticity: the release signature must verify over the digest of the
+    // bytes that were actually written. The OTA_BEGIN check covered only the
+    // claimed digest; this one is what stops a tampered image from booting.
+    if !verify_ota_signature(
+        &crate::release_key::OTA_RELEASE_PUBKEY,
+        crate::board::BOARD,
+        &actual_hash,
+        &s.signature,
+    ) {
+        log::error!("OTA_FINISH: release signature verification failed — firmware rejected");
+        unsafe {
+            esp_idf_svc::sys::esp_ota_abort(s.ota_handle);
+        }
+        send_ota_status(usb, OTA_STATUS_ERR_SIG, "Bad signature");
+        return;
+    }
+
+    log::info!("OTA_FINISH: SHA-256 + release signature verified -- finalising update");
     crate::oled::show_ota_verifying(display);
     esp_idf_hal::delay::FreeRtos::delay_ms(300);
 

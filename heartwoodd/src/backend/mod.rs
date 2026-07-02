@@ -189,8 +189,11 @@ pub trait SigningBackend: Send + Sync {
     fn factory_reset(&self) -> Result<(), BackendError>;
 
     /// Upload new firmware bytes. Applies via serial OTA (Hard mode) or is
-    /// not supported (Soft mode).
-    fn ota_upload(&self, firmware: &[u8]) -> Result<(), BackendError>;
+    /// not supported (Soft mode). `signature` is the ed25519 release
+    /// signature (see heartwood-common's ota_sign) — required by
+    /// signature-enforcing firmware; `None` falls back to the legacy unsigned
+    /// OTA_BEGIN that only pre-signature firmware accepts.
+    fn ota_upload(&self, firmware: &[u8], signature: Option<&[u8; 64]>) -> Result<(), BackendError>;
 
     // -- Backup/restore -------------------------------------------------------
 
@@ -271,7 +274,7 @@ mod tests {
             Err(BackendError::NotSupported)
         }
 
-        fn ota_upload(&self, _firmware: &[u8]) -> Result<(), BackendError> {
+        fn ota_upload(&self, _firmware: &[u8], _signature: Option<&[u8; 64]>) -> Result<(), BackendError> {
             Err(BackendError::NotSupported)
         }
 

@@ -55,6 +55,29 @@ fn read_exact(usb: &mut SerialPort<'_>, buf: &mut [u8]) {
     }
 }
 
+/// Like [`read_exact`], but gives up if the stream stalls: any read window
+/// that makes no progress within `stall_timeout` aborts with `false`, and the
+/// caller discards the partial frame and resyncs on the next magic hunt.
+///
+/// This exists for the wifi relay loop's non-blocking USB poll. A frame whose
+/// tail was lost to a UART ring overflow used to park the whole loop inside a
+/// `delay::BLOCK` read — the signer stopped serving its relay AND ate every
+/// later USB byte as phantom payload until enough arrived. Senders pace real
+/// frames continuously, so a stalled stream only ever means truncation.
+fn read_exact_bounded(usb: &mut SerialPort<'_>, buf: &mut [u8], stall_timeout: u32) -> bool {
+    const MAX_CHUNK: usize = 512;
+
+    let mut pos = 0;
+    while pos < buf.len() {
+        let end = (pos + MAX_CHUNK).min(buf.len());
+        match usb.read(&mut buf[pos..end], stall_timeout) {
+            Ok(n) if n > 0 => pos += n,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Read and return the next valid frame from the serial link.
 ///
 /// Hunts for the two-byte magic sequence `[0x48, 0x57]`, reads the header
@@ -166,10 +189,14 @@ pub fn try_read_frame(usb: &mut SerialPort<'_>, idle_timeout_ms: u32) -> Option<
         }
     }
 
-    // Read header (type + 16-bit length).  Still use blocking reads here --
-    // once we have confirmed magic bytes a real frame is in flight.
+    // Read header (type + 16-bit length). Bounded: a frame truncated by a
+    // ring overflow must never wedge the caller (the wifi relay loop).
+    const BODY_STALL_TIMEOUT_MS: u32 = 500;
     let mut header = [0u8; 3];
-    read_exact(usb, &mut header);
+    if !read_exact_bounded(usb, &mut header, BODY_STALL_TIMEOUT_MS) {
+        log::warn!("try_read_frame: header stalled — discarding partial frame");
+        return None;
+    }
     let frame_type = header[0];
     let length = u16::from_be_bytes([header[1], header[2]]) as usize;
 
@@ -182,9 +209,14 @@ pub fn try_read_frame(usb: &mut SerialPort<'_>, idle_timeout_ms: u32) -> Option<
         return None;
     }
 
-    // Read payload + 4-byte CRC.
+    // Read payload + 4-byte CRC, also bounded against truncation.
     let mut body = vec![0u8; length + 4];
-    read_exact(usb, &mut body);
+    if !read_exact_bounded(usb, &mut body, BODY_STALL_TIMEOUT_MS) {
+        log::warn!(
+            "try_read_frame: body stalled at type 0x{frame_type:02x} len {length} — discarding partial frame"
+        );
+        return None;
+    }
 
     // Reassemble and validate.
     let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + length + 4);

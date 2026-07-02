@@ -309,6 +309,27 @@ pub fn handle_request(
 
         "ping" => nip46::build_ping_response(&request.id).unwrap_or_default(),
 
+        // Encrypt/decrypt as the master's identity are safe ONLY for a client
+        // bound to a connect slot (which lifts `tier` to AutoApprove/OledNotify)
+        // or for the physically-present direct-USB path (no remote client at
+        // all — `has_client` is false there). A *remote* client that is not
+        // slot-bound lands on ButtonRequired; we refuse rather than act as an
+        // encryption/decryption oracle for keys addressed to the master.
+        //
+        // This is the fix for the relay-path oracle: `handle_nip46_event`
+        // dispatches for ANY event author, so without this gate an unbound
+        // relay peer could send `nip44_decrypt([alice, C])` and get back the
+        // plaintext of any NIP-44 message Alice sent to the master (the ECDH
+        // key is master_secret × alice, so the MAC verifies regardless of who
+        // asks). `has_client` keeps the local USB user (client = None)
+        // unaffected — physical possession is its own authorisation.
+        "nip44_encrypt" | "nip44_decrypt" | "nip04_encrypt" | "nip04_decrypt"
+            if has_client && tier == heartwood_common::policy::ApprovalTier::ButtonRequired =>
+        {
+            log::warn!("{}: refused — unbound client", request.method);
+            build_error_json(&request.id, -1, "unauthorised")
+        }
+
         "nip44_encrypt" => handle_nip44_encrypt(master_secret, master_mode, &request),
 
         "nip44_decrypt" => handle_nip44_decrypt(master_secret, master_mode, &request),

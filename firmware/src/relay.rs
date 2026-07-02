@@ -646,7 +646,11 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
                     usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.button_pin,
                 ),
                 FRAME_TYPE_RESTORE_IDENTITY => crate::provision::handle_restore(
-                    usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.button_pin,
+                    // `None`: restore over USB while already in Wi-Fi relay mode
+                    // keeps the single-button gesture picker (the relay context
+                    // doesn't carry the second button). The primary restore
+                    // paths in main.rs get the T-Display two-button picker.
+                    usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.button_pin, None,
                 ),
                 _ => crate::provision::handle_add(usb, &frame, ctx.nvs, ctx.secp, ctx.display),
             };

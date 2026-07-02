@@ -166,3 +166,37 @@ fn drain_release(pin: &PinDriver<'_, Input>) {
     }
     esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
 }
+
+// ---------------------------------------------------------------------------
+// Two-button text entry — for boards with a second button (e.g. the T-Display)
+// ---------------------------------------------------------------------------
+
+/// Which button a two-button picker step read. No timing is involved: a plain
+/// press of either button is one action, so the picker needs no double-tap or
+/// hold — the win over the single-button [`Gesture`] vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwoButton {
+    /// Button A — move the highlight to the next choice.
+    Advance,
+    /// Button B — select / act on the highlighted choice.
+    Select,
+}
+
+/// Block until either button is pressed and released, returning which. Both
+/// buttons are active-low. Debounced, and drained to release so one physical
+/// press yields exactly one event (and can't be re-read by the next step).
+pub fn read_two_button(a: &PinDriver<'_, Input>, b: &PinDriver<'_, Input>) -> TwoButton {
+    loop {
+        if a.is_low() {
+            esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+            drain_release(a);
+            return TwoButton::Advance;
+        }
+        if b.is_low() {
+            esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+            drain_release(b);
+            return TwoButton::Select;
+        }
+        esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
+    }
+}

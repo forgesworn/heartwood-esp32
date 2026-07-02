@@ -146,7 +146,11 @@ fn main() {
         mut display,
         serial: mut usb,
         button_a: button_pin,
-        button_b: _button_b,
+        // Second button on boards that have one (the T-Display). Threaded into
+        // the on-device restore so word entry can use the two-button picker;
+        // `None` on single-button boards (Heltec, C6), which keep the gesture
+        // picker.
+        button_b,
         modem,
     } = board::bringup(peripherals);
     log::info!("Board bring-up complete ({})", board::BOARD);
@@ -228,7 +232,7 @@ fn main() {
                             provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
                         }
                         FRAME_TYPE_RESTORE_IDENTITY => {
-                            provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
+                            provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin, button_b.as_ref())
                         }
                         _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display),
                     };
@@ -478,7 +482,7 @@ fn main() {
                         provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
                     }
                     FRAME_TYPE_RESTORE_IDENTITY => {
-                        provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
+                        provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin, button_b.as_ref())
                     }
                     _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display),
                 };

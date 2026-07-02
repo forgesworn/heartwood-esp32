@@ -275,6 +275,20 @@ fn hold_to_confirm(
     }
 }
 
+/// Two-button save confirm: **B** saves (returns `true`), **A** returns to
+/// review (`false`). The confirm screen (the derived npub) is already drawn by
+/// the caller; this only reads the choice. No hold, so nothing can be re-read
+/// by a later prompt.
+fn confirm_two_button(
+    button_a: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    button_b: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> bool {
+    matches!(
+        crate::button::read_two_button(button_a, button_b),
+        crate::button::TwoButton::Select
+    )
+}
+
 /// Block until the PRG button is pressed and released, reporting whether it was
 /// a long hold (`Approve`) or a short tap (`Deny`). Re-arms on the (deliberately
 /// long) timeout so it never returns on its own.
@@ -303,6 +317,10 @@ pub fn handle_restore(
     secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    // Second button, present on boards that have one (the T-Display). When set,
+    // word entry runs the two-button picker (A = move, B = pick, no timing);
+    // single-button boards (Heltec, C6) pass `None` and keep the gesture picker.
+    button_b: Option<&esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>>,
 ) -> Option<LoadedMaster> {
     let label = if frame.payload.is_empty() {
         "default".to_string()
@@ -316,7 +334,7 @@ pub fn handle_restore(
         String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string()
     };
 
-    oled::show_restore_intro(display);
+    oled::show_restore_intro(display, button_b.is_some());
     esp_idf_hal::delay::FreeRtos::delay_ms(2200);
 
     const TOTAL: usize = 12;
@@ -326,7 +344,7 @@ pub fn handle_restore(
     // word steps to the previous one; stepping back past word 1 cancels the restore.
     while words.len() < TOTAL {
         let idx = words.len() + 1;
-        match enter_one_word(display, button_pin, idx, TOTAL) {
+        match enter_one_word(display, button_pin, button_b, idx, TOTAL) {
             WordResult::Accepted(w) => words.push(w),
             WordResult::Back => {
                 if words.pop().is_none() {
@@ -341,7 +359,7 @@ pub fn handle_restore(
     // list so they can hunt the wrong word) and then confirms the derived npub.
     let mut invalid = false;
     loop {
-        match review_phrase(display, button_pin, &mut words, invalid) {
+        match review_phrase(display, button_pin, button_b, &mut words, invalid) {
             ReviewOutcome::Cancel => return cancel_restore(usb, display),
             ReviewOutcome::Save => {
                 let phrase = words.join(" ");
@@ -365,10 +383,16 @@ pub fn handle_restore(
                     }
                 };
 
-                // Verify the account, gated behind a deliberate save hold; a tap
-                // returns to review (e.g. right checksum, wrong account).
-                oled::show_restore_confirm(display, &npub);
-                if !hold_to_confirm(display, button_pin) {
+                // Verify the account before committing; a "back" returns to
+                // review (e.g. right checksum, wrong account). Two-button boards
+                // confirm with B (A = back); single-button boards use the
+                // deliberate 2-second save hold.
+                oled::show_restore_confirm(display, &npub, button_b.is_some());
+                let confirmed = match button_b {
+                    Some(b) => confirm_two_button(button_pin, b),
+                    None => hold_to_confirm(display, button_pin),
+                };
+                if !confirmed {
                     root.iter_mut().for_each(|b| *b = 0);
                     continue;
                 }
@@ -412,46 +436,90 @@ enum WordResult {
     Back,
 }
 
-/// One-button entry of a single word. The choice ring is the valid next letters
-/// (plus a whole-word accept once it resolves): a **single tap** moves the
-/// highlight forward, a **double-tap** selects it, and a **hold** goes back.
-/// Selecting a letter extends the prefix; selecting the word accepts it. Hold
-/// steps the highlight back one choice; from the first choice it instead removes
-/// the last committed letter, or — on an empty prefix — returns [`WordResult::Back`].
+/// Entry of a single word. Two input styles share one draw loop:
 ///
-/// Once the prefix resolves to a single word (the sole choice), a **single tap**
-/// accepts it directly — there's nothing else to cycle to, so the obvious answer
-/// shouldn't need a double-tap.
+/// * **Two-button** (T-Display, `button_b = Some`): the ring is the valid next
+///   letters, the whole word once it resolves, and a trailing **⌫ back** item.
+///   Button A moves the highlight, button B picks it. No timing — no
+///   double-taps, no holds. Picking a letter extends the prefix, the word
+///   accepts, ⌫ removes the last letter (or, on an empty prefix, returns
+///   [`WordResult::Back`]).
+/// * **One-button** (`button_b = None`): a single tap moves, a double-tap
+///   picks, and a hold goes back one step (from the first choice it deletes the
+///   last letter, or on an empty prefix returns [`WordResult::Back`]). Once the
+///   prefix resolves to the sole word, a single tap accepts it.
 fn enter_one_word(
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    button_b: Option<&esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>>,
     index: usize,
     total: usize,
 ) -> WordResult {
+    let two = button_b.is_some();
     let mut entry = WordEntry::new();
     let mut sel = 0usize;
 
     loop {
         let choices = entry.choices();
-        if choices.is_empty() || sel >= choices.len() {
+        let n = choices.len();
+        // Two-button boards get a trailing ⌫ back slot in the ring; one-button
+        // boards reach "back" through a hold instead.
+        let ring = if two { n + 1 } else { n };
+        if ring == 0 || sel >= ring {
             sel = 0;
         }
-        // When the prefix has resolved to exactly one word, that word is the
-        // sole choice — a single tap accepts it (no need to double-tap the
-        // obvious answer, and there is nothing else to cycle to).
-        let sole_word = choices.len() == 1 && matches!(choices[0], Choice::Word(_));
+        let back_slot = two && sel == n;
+        // One-button only: the sole resolved word accepts on a single tap.
+        let sole_word = !two && n == 1 && matches!(choices[0], Choice::Word(_));
 
-        match choices[sel] {
-            Choice::Letter(c) => {
-                let mut text = entry.prefix().to_string();
-                text.push(c);
-                let sub = format!("{} left   2tap=pick", entry.candidate_count());
-                oled::show_word_entry(display, index, total, &text, oled::Highlight::Letter, &sub, false);
+        if back_slot {
+            oled::show_word_entry(display, index, total, "back", oled::Highlight::Delete, "delete a letter", false, true);
+        } else {
+            match choices[sel] {
+                Choice::Letter(c) => {
+                    let mut text = entry.prefix().to_string();
+                    text.push(c);
+                    let sub = if two {
+                        format!("{} left", entry.candidate_count())
+                    } else {
+                        format!("{} left   2tap=pick", entry.candidate_count())
+                    };
+                    oled::show_word_entry(display, index, total, &text, oled::Highlight::Letter, &sub, false, two);
+                }
+                Choice::Word(w) => {
+                    let sub = if two {
+                        "B = use this word"
+                    } else if sole_word {
+                        "tap = use this word"
+                    } else {
+                        "2tap = use this word"
+                    };
+                    oled::show_word_entry(display, index, total, w, oled::Highlight::Word, sub, sole_word, two);
+                }
             }
-            Choice::Word(w) => {
-                let sub = if sole_word { "tap = use this word" } else { "2tap = use this word" };
-                oled::show_word_entry(display, index, total, w, oled::Highlight::Word, sub, sole_word);
+        }
+
+        if let Some(b) = button_b {
+            match crate::button::read_two_button(button_pin, b) {
+                crate::button::TwoButton::Advance => sel = (sel + 1) % ring,
+                crate::button::TwoButton::Select => {
+                    if back_slot {
+                        if !entry.backspace() {
+                            return WordResult::Back;
+                        }
+                        sel = 0;
+                    } else {
+                        match choices[sel] {
+                            Choice::Letter(c) => {
+                                entry.push(c);
+                                sel = 0;
+                            }
+                            Choice::Word(w) => return WordResult::Accepted(w),
+                        }
+                    }
+                }
             }
+            continue;
         }
 
         match next_gesture(button_pin) {
@@ -461,7 +529,7 @@ fn enter_one_word(
                         return WordResult::Accepted(w);
                     }
                 }
-                sel = (sel + 1) % choices.len();
+                sel = (sel + 1) % n;
             }
             Gesture::Double => match choices[sel] {
                 Choice::Letter(c) => {
@@ -471,11 +539,6 @@ fn enter_one_word(
                 Choice::Word(w) => return WordResult::Accepted(w),
             },
             Gesture::Long => {
-                // Hold goes back one step. If the highlight isn't on the first
-                // choice, step it back (so overshooting a letter is one hold to
-                // undo, not a full lap of the ring). Only once you're already at
-                // the first choice does "back" undo the last committed letter —
-                // and on an empty prefix that steps back to the previous word.
                 if sel > 0 {
                     sel -= 1;
                 } else if !entry.backspace() {
@@ -494,17 +557,19 @@ enum ReviewOutcome {
     Cancel,
 }
 
-/// Page through the 12 entered words (plus SAVE / CANCEL items): **tap** moves
-/// to the next item, **hold** moves back one, and **double-tap** acts on it —
-/// editing a word re-enters that one slot in place. `invalid` shows a banner
-/// when the phrase last failed its checksum, so the owner knows a wrong word is
-/// still hiding in the list.
+/// Page through the 12 entered words (plus SAVE / CANCEL items) and act on one.
+/// Two-button boards move with A and act with B; one-button boards tap to move,
+/// hold to move back, and double-tap to act. Acting on a word re-enters that one
+/// slot in place. `invalid` shows a banner when the phrase last failed its
+/// checksum, so the owner knows a wrong word is still hiding in the list.
 fn review_phrase(
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    button_b: Option<&esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>>,
     words: &mut [&'static str],
     invalid: bool,
 ) -> ReviewOutcome {
+    let two = button_b.is_some();
     let n = words.len();
     let total_items = n + 2; // words + SAVE + CANCEL
     let mut sel = 0usize;
@@ -513,25 +578,45 @@ fn review_phrase(
         if sel < n {
             oled::show_review_word(display, sel + 1, n, words[sel], invalid);
         } else if sel == n {
-            oled::show_review_action(display, "SAVE", "2tap = save");
+            oled::show_review_action(display, "SAVE", if two { "B = save" } else { "2tap = save" });
         } else {
-            oled::show_review_action(display, "CANCEL", "2tap = discard");
+            oled::show_review_action(display, "CANCEL", if two { "B = discard" } else { "2tap = discard" });
         }
 
-        match next_gesture(button_pin) {
-            Gesture::Single => sel = (sel + 1) % total_items,
-            Gesture::Long => sel = (sel + total_items - 1) % total_items,
-            Gesture::Double => {
-                if sel < n {
-                    // Re-enter this slot; a Back keeps the existing word.
-                    if let WordResult::Accepted(w) = enter_one_word(display, button_pin, sel + 1, n) {
-                        words[sel] = w;
-                    }
-                } else if sel == n {
-                    return ReviewOutcome::Save;
-                } else {
-                    return ReviewOutcome::Cancel;
+        // `act` is set when the highlighted item should be actioned (B, or a
+        // double-tap). Movement is handled inline.
+        let act = if let Some(b) = button_b {
+            match crate::button::read_two_button(button_pin, b) {
+                crate::button::TwoButton::Advance => {
+                    sel = (sel + 1) % total_items;
+                    false
                 }
+                crate::button::TwoButton::Select => true,
+            }
+        } else {
+            match next_gesture(button_pin) {
+                Gesture::Single => {
+                    sel = (sel + 1) % total_items;
+                    false
+                }
+                Gesture::Long => {
+                    sel = (sel + total_items - 1) % total_items;
+                    false
+                }
+                Gesture::Double => true,
+            }
+        };
+
+        if act {
+            if sel < n {
+                // Re-enter this slot; a Back keeps the existing word.
+                if let WordResult::Accepted(w) = enter_one_word(display, button_pin, button_b, sel + 1, n) {
+                    words[sel] = w;
+                }
+            } else if sel == n {
+                return ReviewOutcome::Save;
+            } else {
+                return ReviewOutcome::Cancel;
             }
         }
     }

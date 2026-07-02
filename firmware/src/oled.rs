@@ -453,7 +453,7 @@ pub enum Highlight {
 /// One-time intro shown when on-device restore begins, teaching the two-gesture
 /// vocabulary before the terse picker takes over. The 12-word phrase is entered
 /// here, on the device — never in the browser.
-pub fn show_restore_intro(display: &mut Display<'_>) {
+pub fn show_restore_intro(display: &mut Display<'_>, two_button: bool) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -472,9 +472,14 @@ pub fn show_restore_intro(display: &mut Display<'_>) {
         .draw(display)
         .ok();
 
-    Text::new("1 tap  = next choice", Point::new(l.sx(4), l.sy(28)), small).draw(display).ok();
-    Text::new("2 taps = pick it", Point::new(l.sx(4), l.sy(42)), small).draw(display).ok();
-    Text::new("hold   = go back", Point::new(l.sx(4), l.sy(56)), small).draw(display).ok();
+    let (a, b, c) = if two_button {
+        ("A = next choice", "B = pick it", "pick < to delete")
+    } else {
+        ("1 tap  = next choice", "2 taps = pick it", "hold   = go back")
+    };
+    Text::new(a, Point::new(l.sx(4), l.sy(28)), small).draw(display).ok();
+    Text::new(b, Point::new(l.sx(4), l.sy(42)), small).draw(display).ok();
+    Text::new(c, Point::new(l.sx(4), l.sy(56)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -495,6 +500,7 @@ pub fn show_word_entry(
     hl: Highlight,
     subtitle: &str,
     tap_accepts: bool,
+    two_button: bool,
 ) {
     let l = layout(display);
     display.clear_buffer();
@@ -532,9 +538,16 @@ pub fn show_word_entry(
     }
 
     Text::new(subtitle, Point::new(l.sx(2), l.sy(54)), small).draw(display).ok();
-    // Once the word is the sole choice a single tap accepts it; otherwise a tap
-    // cycles forward and a double-tap picks. A hold always goes back one step.
-    let legend = if tap_accepts { "tap=pick   hold=back" } else { "tap=next   hold=back" };
+    // Two-button boards move with A and pick with B — no timing, so the legend
+    // is fixed. One-button boards cycle on a tap (or accept the sole word) and
+    // go back on a hold.
+    let legend = if two_button {
+        "A = next    B = pick"
+    } else if tap_accepts {
+        "tap=pick   hold=back"
+    } else {
+        "tap=next   hold=back"
+    };
     Text::new(legend, Point::new(l.sx(2), l.sy(63)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
@@ -629,7 +642,7 @@ pub fn show_review_action(display: &mut Display<'_>, label: &str, hint: &str) {
 /// Shown after the words pass the checksum: the resulting npub for the owner to
 /// verify it is the account they expected, gated behind a save hold (a tap goes
 /// back to review). Verifying the npub catches a wrong-but-valid phrase.
-pub fn show_restore_confirm(display: &mut Display<'_>, npub: &str) {
+pub fn show_restore_confirm(display: &mut Display<'_>, npub: &str, two_button: bool) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -659,7 +672,8 @@ pub fn show_restore_confirm(display: &mut Display<'_>, npub: &str) {
         pos = end;
     }
 
-    Text::new("hold = save   tap = back", Point::new(l.sx(2), l.sy(62)), small).draw(display).ok();
+    let hint = if two_button { "B = save    A = back" } else { "hold = save   tap = back" };
+    Text::new(hint, Point::new(l.sx(2), l.sy(62)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

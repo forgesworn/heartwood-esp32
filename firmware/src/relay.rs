@@ -256,7 +256,13 @@ pub fn run_wifi_standalone<'d, 'b>(
 
         if relays.is_empty() {
             log::error!("[relay] no relay configured");
-            FreeRtos::delay_ms(10_000);
+            // Keep the cable fully served while stuck — this state is only
+            // fixable over USB.
+            let until = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < until {
+                poll_usb(usb, &mut ctx);
+                FreeRtos::delay_ms(20);
+            }
             continue;
         }
 
@@ -276,8 +282,15 @@ pub fn run_wifi_standalone<'d, 'b>(
             Err(e) => log::error!("[relay] {e}; failing over in 3s"),
         }
         // Advance to the next relay so a dead/quiet one is not retried forever.
+        // Keep draining USB during the back-off: these gaps used to be dead
+        // air on the cable, and a frame arriving then was lost to ring
+        // overflow before the next session's first poll.
         relay_idx = relay_idx.wrapping_add(1);
-        FreeRtos::delay_ms(3000);
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until {
+            poll_usb(usb, &mut ctx);
+            FreeRtos::delay_ms(20);
+        }
     }
 }
 
@@ -370,6 +383,14 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
             ctx.last_activity = Instant::now();
         }
 
+        // Serve USB every iteration, BEFORE the frame-drain/pump `continue`s
+        // below. It used to sit at the bottom of the loop, reached only when
+        // the relay went quiet for a full RECV_TIMEOUT_MS — so relay traffic
+        // starved the cable, and the head of a large USB frame could sit
+        // undrained long enough to overflow the 4KB UART ring. Non-blocking:
+        // a quiet poll returns immediately.
+        poll_usb(usb, ctx);
+
         // Drain every complete frame already buffered before reading more.
         if let Some(msg) = try_parse(&mut rx)? {
             match msg {
@@ -421,10 +442,6 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
             }
         }
 
-        // Also serve the FULL USB command set while in wifi mode, so the cable
-        // stays completely usable alongside the relay. Non-blocking: a quiet
-        // poll returns immediately and never delays the relay/signing path.
-        poll_usb(usb, ctx);
     }
 }
 

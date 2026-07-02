@@ -171,32 +171,63 @@ fn drain_release(pin: &PinDriver<'_, Input>) {
 // Two-button text entry — for boards with a second button (e.g. the T-Display)
 // ---------------------------------------------------------------------------
 
-/// Which button a two-button picker step read. No timing is involved: a plain
-/// press of either button is one action, so the picker needs no double-tap or
-/// hold — the win over the single-button [`Gesture`] vocabulary.
+/// One action from the two-button picker. Two buttons × (tap / hold) give four
+/// distinct actions, so every action has its own press — no double-taps, and
+/// backspace is always one hold away:
+///
+///   A tap  → Prev     B tap  → Next
+///   A hold → Back     B hold → Select
+///
+/// The same vocabulary is used on every restore screen: tap to move, **hold B**
+/// for the affirmative (pick / save), **hold A** for back / delete / cancel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TwoButton {
-    /// Button A — move the highlight to the next choice.
-    Advance,
-    /// Button B — select / act on the highlighted choice.
+pub enum TwoBtn {
+    /// A tap — move the highlight to the previous choice.
+    Prev,
+    /// B tap — move the highlight to the next choice.
+    Next,
+    /// B hold — select / confirm the highlighted item.
     Select,
+    /// A hold — back / delete the last letter / cancel.
+    Back,
 }
 
-/// Block until either button is pressed and released, returning which. Both
-/// buttons are active-low. Debounced, and drained to release so one physical
-/// press yields exactly one event (and can't be re-read by the next step).
-pub fn read_two_button(a: &PinDriver<'_, Input>, b: &PinDriver<'_, Input>) -> TwoButton {
-    loop {
+/// Block until one action is read from either button. Both are active-low. A
+/// hold past [`GESTURE_LONG_MS`] fires immediately (then drains to release); a
+/// shorter press fires as a tap on release. Debounced, and drained so one
+/// physical press yields exactly one action.
+pub fn read_two_button_gesture(a: &PinDriver<'_, Input>, b: &PinDriver<'_, Input>) -> TwoBtn {
+    // Wait for the first press on either button.
+    let is_a = loop {
         if a.is_low() {
-            esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
-            drain_release(a);
-            return TwoButton::Advance;
+            break true;
         }
         if b.is_low() {
-            esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
-            drain_release(b);
-            return TwoButton::Select;
+            break false;
         }
         esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
+    };
+    let pin = if is_a { a } else { b };
+    esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+
+    // Measure the hold: a long press is reported the moment it crosses the
+    // threshold; otherwise it's a tap once released.
+    let press_start = Instant::now();
+    let long = loop {
+        if pin.is_high() {
+            break false; // released before the threshold — a tap
+        }
+        if press_start.elapsed().as_millis() >= GESTURE_LONG_MS {
+            break true;
+        }
+        esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
+    };
+    drain_release(pin);
+
+    match (is_a, long) {
+        (true, false) => TwoBtn::Prev,   // A tap
+        (false, false) => TwoBtn::Next,  // B tap
+        (false, true) => TwoBtn::Select, // B hold
+        (true, true) => TwoBtn::Back,    // A hold
     }
 }

@@ -473,7 +473,7 @@ pub fn show_restore_intro(display: &mut Display<'_>, two_button: bool) {
         .ok();
 
     let (a, b, c) = if two_button {
-        ("A = next choice", "B = pick it", "pick < to delete")
+        ("A / B  = move", "hold B = pick", "hold A = delete")
     } else {
         ("1 tap  = next choice", "2 taps = pick it", "hold   = go back")
     };
@@ -542,7 +542,7 @@ pub fn show_word_entry(
     // is fixed. One-button boards cycle on a tap (or accept the sole word) and
     // go back on a hold.
     let legend = if two_button {
-        "A = next    B = pick"
+        "A/B move  holdB pick  holdA back"
     } else if tap_accepts {
         "tap=pick   hold=back"
     } else {
@@ -672,7 +672,7 @@ pub fn show_restore_confirm(display: &mut Display<'_>, npub: &str, two_button: b
         pos = end;
     }
 
-    let hint = if two_button { "B = save    A = back" } else { "hold = save   tap = back" };
+    let hint = if two_button { "hold B = save   hold A = back" } else { "hold = save   tap = back" };
     Text::new(hint, Point::new(l.sx(2), l.sy(62)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {

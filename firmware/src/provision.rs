@@ -275,18 +275,21 @@ fn hold_to_confirm(
     }
 }
 
-/// Two-button save confirm: **B** saves (returns `true`), **A** returns to
-/// review (`false`). The confirm screen (the derived npub) is already drawn by
-/// the caller; this only reads the choice. No hold, so nothing can be re-read
-/// by a later prompt.
+/// Two-button save confirm: **hold B** saves (returns `true`), **hold A**
+/// returns to review (`false`). Taps are ignored so a stray nudge can't save
+/// the wrong account. The confirm screen (the derived npub) is already drawn by
+/// the caller; this only reads the deliberate choice.
 fn confirm_two_button(
     button_a: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
     button_b: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> bool {
-    matches!(
-        crate::button::read_two_button(button_a, button_b),
-        crate::button::TwoButton::Select
-    )
+    loop {
+        match crate::button::read_two_button_gesture(button_a, button_b) {
+            crate::button::TwoBtn::Select => return true, // hold B = save
+            crate::button::TwoBtn::Back => return false,  // hold A = back
+            _ => {} // taps ignored on the irreversible save screen
+        }
+    }
 }
 
 /// Block until the PRG button is pressed and released, reporting whether it was
@@ -462,61 +465,53 @@ fn enter_one_word(
     loop {
         let choices = entry.choices();
         let n = choices.len();
-        // Two-button boards get a trailing ⌫ back slot in the ring; one-button
-        // boards reach "back" through a hold instead.
-        let ring = if two { n + 1 } else { n };
-        if ring == 0 || sel >= ring {
+        if n == 0 || sel >= n {
             sel = 0;
         }
-        let back_slot = two && sel == n;
         // One-button only: the sole resolved word accepts on a single tap.
         let sole_word = !two && n == 1 && matches!(choices[0], Choice::Word(_));
 
-        if back_slot {
-            oled::show_word_entry(display, index, total, "back", oled::Highlight::Delete, "delete a letter", false, true);
-        } else {
-            match choices[sel] {
-                Choice::Letter(c) => {
-                    let mut text = entry.prefix().to_string();
-                    text.push(c);
-                    let sub = if two {
-                        format!("{} left", entry.candidate_count())
-                    } else {
-                        format!("{} left   2tap=pick", entry.candidate_count())
-                    };
-                    oled::show_word_entry(display, index, total, &text, oled::Highlight::Letter, &sub, false, two);
-                }
-                Choice::Word(w) => {
-                    let sub = if two {
-                        "B = use this word"
-                    } else if sole_word {
-                        "tap = use this word"
-                    } else {
-                        "2tap = use this word"
-                    };
-                    oled::show_word_entry(display, index, total, w, oled::Highlight::Word, sub, sole_word, two);
-                }
+        match choices[sel] {
+            Choice::Letter(c) => {
+                let mut text = entry.prefix().to_string();
+                text.push(c);
+                let sub = if two {
+                    format!("{} left", entry.candidate_count())
+                } else {
+                    format!("{} left   2tap=pick", entry.candidate_count())
+                };
+                oled::show_word_entry(display, index, total, &text, oled::Highlight::Letter, &sub, false, two);
+            }
+            Choice::Word(w) => {
+                let sub = if two {
+                    "hold B = use this word"
+                } else if sole_word {
+                    "tap = use this word"
+                } else {
+                    "2tap = use this word"
+                };
+                oled::show_word_entry(display, index, total, w, oled::Highlight::Word, sub, sole_word, two);
             }
         }
 
         if let Some(b) = button_b {
-            match crate::button::read_two_button(button_pin, b) {
-                crate::button::TwoButton::Advance => sel = (sel + 1) % ring,
-                crate::button::TwoButton::Select => {
-                    if back_slot {
-                        if !entry.backspace() {
-                            return WordResult::Back;
-                        }
+            // A tap = prev, B tap = next, hold B = pick, hold A = backspace
+            // (delete a letter, or on an empty prefix step to the previous word).
+            match crate::button::read_two_button_gesture(button_pin, b) {
+                crate::button::TwoBtn::Prev => sel = (sel + n - 1) % n,
+                crate::button::TwoBtn::Next => sel = (sel + 1) % n,
+                crate::button::TwoBtn::Select => match choices[sel] {
+                    Choice::Letter(c) => {
+                        entry.push(c);
                         sel = 0;
-                    } else {
-                        match choices[sel] {
-                            Choice::Letter(c) => {
-                                entry.push(c);
-                                sel = 0;
-                            }
-                            Choice::Word(w) => return WordResult::Accepted(w),
-                        }
                     }
+                    Choice::Word(w) => return WordResult::Accepted(w),
+                },
+                crate::button::TwoBtn::Back => {
+                    if !entry.backspace() {
+                        return WordResult::Back;
+                    }
+                    sel = 0;
                 }
             }
             continue;
@@ -578,20 +573,29 @@ fn review_phrase(
         if sel < n {
             oled::show_review_word(display, sel + 1, n, words[sel], invalid);
         } else if sel == n {
-            oled::show_review_action(display, "SAVE", if two { "B = save" } else { "2tap = save" });
+            oled::show_review_action(display, "SAVE", if two { "hold B = save" } else { "2tap = save" });
         } else {
-            oled::show_review_action(display, "CANCEL", if two { "B = discard" } else { "2tap = discard" });
+            oled::show_review_action(display, "CANCEL", if two { "hold B = discard" } else { "2tap = discard" });
         }
 
-        // `act` is set when the highlighted item should be actioned (B, or a
-        // double-tap). Movement is handled inline.
+        // `act` is set when the highlighted item should be actioned (hold B, or
+        // a double-tap). Movement is handled inline.
         let act = if let Some(b) = button_b {
-            match crate::button::read_two_button(button_pin, b) {
-                crate::button::TwoButton::Advance => {
+            // A tap = prev, B tap = next, hold B = act, hold A = jump to CANCEL.
+            match crate::button::read_two_button_gesture(button_pin, b) {
+                crate::button::TwoBtn::Prev => {
+                    sel = (sel + total_items - 1) % total_items;
+                    false
+                }
+                crate::button::TwoBtn::Next => {
                     sel = (sel + 1) % total_items;
                     false
                 }
-                crate::button::TwoButton::Select => true,
+                crate::button::TwoBtn::Select => true,
+                crate::button::TwoBtn::Back => {
+                    sel = total_items - 1; // CANCEL
+                    false
+                }
             }
         } else {
             match next_gesture(button_pin) {

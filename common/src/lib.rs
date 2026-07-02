@@ -37,5 +37,8 @@ pub mod mnemonic;
 #[cfg(feature = "ota-sign")]
 pub mod ota_sign;
 
+#[cfg(feature = "seed-encrypt")]
+pub mod seed_cipher;
+
 #[cfg(feature = "mnemonic")]
 pub mod restore;

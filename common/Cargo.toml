@@ -30,6 +30,10 @@ bip39 = { version = "2", optional = true, default-features = false }
 # no_std; `opt_size` trades verify speed for code size — the Heltec app must
 # still fit its 2 MB OTA slot.
 ed25519-compact = { version = "2", optional = true, default-features = false, features = ["opt_size"] }
+# PIN-derived seed encryption (P5). PBKDF2-HMAC-SHA256 for the slow KDF; the
+# AEAD itself reuses the chacha20 + hmac + sha2 already present (encrypt-then-MAC,
+# same construction as NIP-44), so no new cipher dep. no_std.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -53,5 +57,7 @@ mnemonic-gen = ["mnemonic", "secp256k1-backend"]
 # OTA release signatures: sign (CI tool) + verify (device) share one module so
 # the message format can never drift between signer and verifier.
 ota-sign = ["dep:ed25519-compact"]
+# PIN-derived seed encryption at rest (P5). Pulls PBKDF2 + reuses chacha20.
+seed-encrypt = ["dep:pbkdf2", "dep:chacha20"]
 # Convenience alias for secp256k1 backend with full feature set (used by firmware)
 firmware = ["secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen", "ota-sign"]

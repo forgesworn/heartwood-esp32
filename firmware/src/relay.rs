@@ -402,6 +402,12 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
                 WsMsg::Close => return Ok(()),
                 WsMsg::Pong | WsMsg::Other => {}
             }
+            // A large frame (avatar event ~17KB) grows rx and Vec never gives
+            // capacity back on its own — reclaim it so one big message doesn't
+            // permanently shrink the heap for the rest of the session.
+            if rx.capacity() > READ_BUF * 2 {
+                rx.shrink_to(READ_BUF);
+            }
             // Handling a sign_event can block ~30s on the button; treat that as
             // activity so the silence deadline doesn't trip right after.
             last_rx = Instant::now();
@@ -680,33 +686,39 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
 
 /// Parse one inbound relay message (`["EVENT",sub,ev]` / `EOSE` / `OK` / …).
 fn handle_relay_msg(tls: &mut Tls, raw: &[u8], ctx: &mut SignCtx) -> Result<(), String> {
-    let v: serde_json::Value = match serde_json::from_slice(raw) {
+    let mut v: serde_json::Value = match serde_json::from_slice(raw) {
         Ok(v) => v,
         Err(_) => {
             log::warn!("[relay] non-JSON frame ({} bytes)", raw.len());
             return Ok(());
         }
     };
-    let arr = match v.as_array() {
-        Some(a) => a,
-        None => return Ok(()),
-    };
-    match arr.first().and_then(|x| x.as_str()) {
-        Some("EVENT") => {
-            if let Some(ev_val) = arr.get(2) {
-                match serde_json::from_value::<SignedEvent>(ev_val.clone()) {
+    if !v.is_array() {
+        return Ok(());
+    }
+    let tag = v.get(0).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    match tag.as_str() {
+        "EVENT" => {
+            if let Some(ev_val) = v.get_mut(2) {
+                // `take` instead of `clone`: a set_identity_meta event is ~17KB
+                // of JSON, and cloning its parsed Value briefly doubled that on
+                // a heap already carrying the TLS session — enough to OOM-abort
+                // a classic ESP32 (observed as rst:0xc on the T-Display).
+                let ev_val = ev_val.take();
+                drop(v); // free the (now-gutted) envelope before the deep parse
+                match serde_json::from_value::<SignedEvent>(ev_val) {
                     Ok(ev) => process_event(tls, &ev, ctx)?,
                     Err(e) => log::warn!("[relay] bad EVENT json: {e}"),
                 }
             }
         }
-        Some("EOSE") => log::info!("[relay] EOSE — live, waiting for requests"),
-        Some("OK") => log::info!("[relay] OK: {}", snippet(raw, 120)),
-        Some("NOTICE") => log::warn!("[relay] NOTICE: {}", snippet(raw, 160)),
+        "EOSE" => log::info!("[relay] EOSE — live, waiting for requests"),
+        "OK" => log::info!("[relay] OK: {}", snippet(raw, 120)),
+        "NOTICE" => log::warn!("[relay] NOTICE: {}", snippet(raw, 160)),
         // The relay closed our subscription (limit, error, policy). The WS stays
         // open so silence-detection won't fire — propagate so we reconnect and
         // re-subscribe cleanly rather than sit with a dead subscription.
-        Some("CLOSED") => {
+        "CLOSED" => {
             log::warn!("[relay] CLOSED: {}; reconnecting", snippet(raw, 160));
             return Err("relay closed our subscription".into());
         }
@@ -1059,6 +1071,9 @@ fn handle_mgmt_event(
             return Ok(());
         }
     };
+    // An avatar-carrying request is ~11KB of plaintext; free it before dispatch
+    // rather than hold it through the NVS write on an already-tight heap.
+    drop(plaintext);
     let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
 

@@ -571,11 +571,11 @@ fn review_phrase(
 
     loop {
         if sel < n {
-            oled::show_review_word(display, sel + 1, n, words[sel], invalid);
+            oled::show_review_word(display, sel + 1, n, words[sel], invalid, two);
         } else if sel == n {
-            oled::show_review_action(display, "SAVE", if two { "hold B = save" } else { "2tap = save" });
+            oled::show_review_action(display, "SAVE", if two { "hold B = save" } else { "2tap = save" }, two);
         } else {
-            oled::show_review_action(display, "CANCEL", if two { "hold B = discard" } else { "2tap = discard" });
+            oled::show_review_action(display, "CANCEL", if two { "hold B = discard" } else { "2tap = discard" }, two);
         }
 
         // `act` is set when the highlighted item should be actioned (hold B, or

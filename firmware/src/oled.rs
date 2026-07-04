@@ -555,15 +555,17 @@ pub fn show_word_entry(
     }
 }
 
-/// Review screen for one entered word: tap pages to the next item, double-tap
-/// edits this word. `invalid` flags that the 12 words failed the BIP-39 checksum, so
-/// a wrong word is somewhere in the list and needs finding.
+/// Review screen for one entered word: one-button boards tap to page and
+/// double-tap to edit; two-button boards move with A/B and hold B to edit.
+/// `invalid` flags that the 12 words failed the BIP-39 checksum, so a wrong
+/// word is somewhere in the list and needs finding.
 pub fn show_review_word(
     display: &mut Display<'_>,
     index: usize,
     total: usize,
     word: &str,
     invalid: bool,
+    two_button: bool,
 ) {
     let l = layout(display);
     display.clear_buffer();
@@ -595,7 +597,8 @@ pub fn show_review_word(
     if invalid {
         Text::new("! phrase invalid - fix a word", Point::new(l.sx(2), l.sy(54)), small).draw(display).ok();
     }
-    Text::new("tap=next  2tap=edit", Point::new(l.sx(2), l.sy(63)), small).draw(display).ok();
+    let legend = if two_button { "A/B move  holdB edit  holdA back" } else { "tap=next  2tap=edit" };
+    Text::new(legend, Point::new(l.sx(2), l.sy(63)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -603,8 +606,9 @@ pub fn show_review_word(
 }
 
 /// Review screen for an action item (SAVE / CANCEL): a big label, a hint, and
-/// the tap / double-tap legend.
-pub fn show_review_action(display: &mut Display<'_>, label: &str, hint: &str) {
+/// the movement legend (tap / double-tap on one-button boards, A/B move plus
+/// hold-A-back on two-button boards).
+pub fn show_review_action(display: &mut Display<'_>, label: &str, hint: &str, two_button: bool) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -632,7 +636,8 @@ pub fn show_review_action(display: &mut Display<'_>, label: &str, hint: &str) {
     Text::new(label, Point::new(x, l.sy(40)), big).draw(display).ok();
 
     Text::new(hint, Point::new(l.sx(2), l.sy(54)), small).draw(display).ok();
-    Text::new("tap=next  2tap=pick", Point::new(l.sx(2), l.sy(63)), small).draw(display).ok();
+    let legend = if two_button { "A/B = move   holdA = back" } else { "tap=next  2tap=pick" };
+    Text::new(legend, Point::new(l.sx(2), l.sy(63)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

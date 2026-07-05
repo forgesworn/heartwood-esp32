@@ -153,13 +153,13 @@ fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     total: u32,
 ) {
     let l = layout_of(d);
-    header(d, &l, label);
+    header(d, &l, &format!("SIGN AS {}?", label));
 
     let body = style(l.font_body(), FG);
     let preview_style = style(l.font_small(), MUTED);
     let small = style(l.font_small(), FG);
     let m = format!("{} k:{}", method, kind);
-    Text::new(&m, Point::new(l.sx(2), l.sy(30)), body).draw(d).ok();
+    Text::new(&m, Point::new(l.sx(2), l.sy(25)), body).draw(d).ok();
 
     let max = l.chars_per_line(l.font_small());
     let preview: String = if content.len() > max {
@@ -167,9 +167,15 @@ fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     } else {
         content.to_string()
     };
-    Text::new(&preview, Point::new(l.sx(2), l.sy(42)), preview_style)
+    Text::new(&preview, Point::new(l.sx(2), l.sy(35)), preview_style)
         .draw(d)
         .ok();
+
+    // How to approve: a 2-second HOLD, not a tap. Mirrors show_sign_request.
+    let hint = style(l.font_small(), ACCENT);
+    let hold = "Hold the button to sign";
+    let hold = &hold[..hold.len().min(l.chars_per_line(l.font_small()))];
+    Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(d).ok();
 
     // Countdown bar: muted track + proportional fill coloured by urgency.
     let bx = l.sx(2);

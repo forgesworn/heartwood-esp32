@@ -64,7 +64,7 @@ use heartwood_common::types::{
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
     FRAME_TYPE_RESTORE_IDENTITY, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET,
     FRAME_TYPE_SET_IDENTITY_META, FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_PIN,
-    FRAME_TYPE_SIGN_ENVELOPE,
+    FRAME_TYPE_SIGN_ENVELOPE, FRAME_TYPE_WIFI_SCAN_REQUEST,
 };
 
 use crate::identity_cache::IdentityCache;
@@ -250,7 +250,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             log::error!("[relay] wifi connect failed: {e:?}; serving USB, retry in 3s");
             let until = Instant::now() + Duration::from_secs(3);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx);
+                poll_usb(usb, &mut ctx, Some(&mut wifi));
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -263,7 +263,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             // fixable over USB.
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx);
+                poll_usb(usb, &mut ctx, Some(&mut wifi));
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -291,7 +291,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         relay_idx = relay_idx.wrapping_add(1);
         let until = Instant::now() + Duration::from_secs(3);
         while Instant::now() < until {
-            poll_usb(usb, &mut ctx);
+            poll_usb(usb, &mut ctx, Some(&mut wifi));
             FreeRtos::delay_ms(20);
         }
     }
@@ -391,8 +391,10 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
         // the relay went quiet for a full RECV_TIMEOUT_MS — so relay traffic
         // starved the cable, and the head of a large USB frame could sit
         // undrained long enough to overflow the 4KB UART ring. Non-blocking:
-        // a quiet poll returns immediately.
-        poll_usb(usb, ctx);
+        // a quiet poll returns immediately. `None`: no WiFi driver is lent while
+        // a relay connection is live — a scan here would knock the link off its
+        // channel, so a 0x55 mid-connection is declined rather than served.
+        poll_usb(usb, ctx, None);
 
         // Drain every complete frame already buffered before reading more.
         if let Some(msg) = try_parse(&mut rx)? {
@@ -470,7 +472,11 @@ fn reboot_after_state_change(reason: &str) {
 /// a restricted subset. Non-blocking: a quiet poll returns at once. Commands
 /// that change the master set reboot afterwards so the relay subscription
 /// re-derives from fresh NVS. Mirrors the USB-only dispatch loop in `main`.
-fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
+/// `wifi` is the live driver when the caller can lend it (WiFi up but idle in the
+/// connect loop), letting a 0x55 scan reuse the already-started radio; it is
+/// `None` while a relay connection is being served, where scanning would knock
+/// the link off its channel — that case declines rather than disrupt signing.
+fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx, wifi: Option<&mut BlockingWifi<EspWifi<'_>>>) {
     let frame = match crate::protocol::try_read_frame(usb, 0) {
         Some(f) => f,
         None => return,
@@ -680,6 +686,14 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx) {
         FRAME_TYPE_FACTORY_RESET => {
             crate::provision::handle_factory_reset(usb, ctx.nvs, ctx.display, ctx.button_pin)
         }
+
+        // 0x55 — scan nearby WiFi APs. Reuses the relay's own started driver when
+        // it is lent (WiFi up but idle); mid-connection the caller passes `None`
+        // and we decline, so a diagnostic scan never bumps a live signing link.
+        FRAME_TYPE_WIFI_SCAN_REQUEST => match wifi {
+            Some(w) => crate::wifi_scan::respond(usb, w),
+            None => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]),
+        },
 
         other => {
             log::warn!("[relay] USB frame 0x{other:02x} not recognised");

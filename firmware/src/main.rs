@@ -70,6 +70,7 @@ mod relay;
 mod session;
 mod sign;
 mod transport;
+mod wifi_scan;
 
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
@@ -97,7 +98,9 @@ use heartwood_common::types::{
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
     FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
     FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_IDENTITY_META,
+    FRAME_TYPE_WIFI_SCAN_REQUEST,
 };
+use esp_idf_svc::eventloop::EspSystemEventLoop;
 use secp256k1::Secp256k1;
 
 /// JSON for a FIRMWARE_INFO_RESPONSE — the running firmware version and board.
@@ -404,6 +407,13 @@ fn main() {
 
     // --- OTA session state ---
     let mut ota_session: Option<ota::OtaSession> = None;
+
+    // --- WiFi-scan event loop (radio-off tier) ---
+    // Taken lazily on the first scan request and cached: `EspSystemEventLoop`
+    // can only be taken once, and a device that never scans should not take it
+    // at all. In USB-only mode nothing else has taken it (the relay path, which
+    // does, diverges before this loop), so the first take here always succeeds.
+    let mut scan_sysloop: Option<EspSystemEventLoop> = None;
 
     // --- Display power management ---
     // Track the timestamp of the last activity (frame received or button press).
@@ -739,6 +749,23 @@ fn main() {
                     &mut display,
                     &mut ota_session,
                 );
+            }
+
+            // 0x55 — scan nearby WiFi APs (setup aid). Radio-off tier: the radio
+            // is brought up only for this scan and powered straight back down, no
+            // connection is made, and nothing inbound is served — remote attack
+            // surface stays zero. A physical, cabled request only.
+            FRAME_TYPE_WIFI_SCAN_REQUEST => {
+                if scan_sysloop.is_none() {
+                    scan_sysloop = EspSystemEventLoop::take().ok();
+                }
+                match &scan_sysloop {
+                    Some(sl) => wifi_scan::respond_on_demand(&mut usb, sl),
+                    None => {
+                        log::error!("wifi scan: system event loop unavailable");
+                        protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                    }
+                }
             }
 
             // Unknown frame — NACK

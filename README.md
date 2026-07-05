@@ -23,11 +23,17 @@ flowchart LR
 
 The entire chain between "user clicks sign" and "Nostr event published" is cryptographic shuffling. The only operation that authorises a signature is a human pressing the physical button on the HSM with the event body shown on the 128x64 OLED. The Pi-side bridge holds an ephemeral relay identity, a session auth secret, and an API token for Sapwood — none of which can sign for any user identity.
 
-Two deployment modes from the same codebase:
+Deployment modes, selected at runtime from the NVS network config:
 
 ### Home HSM — USB-attached to a Raspberry Pi *(shipped)*
 
-Holds the **master secrets** (up to 8 masters across bunker / tree-mnemonic / tree-nsec modes). All radios disabled. The Pi running `heartwood-bridge` handles networking (Nostr relays, NIP-46 transport). The ESP32 handles all cryptography — decryption, signing, envelope construction. Even if the Pi is fully compromised, an attacker cannot extract keys or sign without physical button access on the device. Management UI via [Sapwood](https://github.com/forgesworn/sapwood) served by the bridge.
+Holds the **master secrets** (up to 8 masters across bunker / tree-mnemonic / tree-nsec modes). All radios disabled in this mode. The Pi running `heartwood-bridge` handles networking (Nostr relays, NIP-46 transport). The ESP32 handles all cryptography — decryption, signing, envelope construction. Even if the Pi is fully compromised, an attacker cannot extract keys or sign without physical button access on the device. Management UI via [Sapwood](https://github.com/forgesworn/sapwood) served by the bridge.
+
+### WiFi-standalone — on-chip relay client, no Pi *(shipped, opt-in)*
+
+The ESP32 joins WiFi and connects to Nostr relays directly, running the full NIP-46 signing loop on-chip (`firmware/src/relay.rs`) — no Raspberry Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated on the OLED. Enabled only when the device is provisioned with an SSID + relay list (`mode="wifi"` in the NVS net config); the USB cable stays fully usable in parallel, so a bad SSID or relay is always recoverable over the cable. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected.
+
+This is the convenience tier — it accepts a larger attack surface (a live TCP/IP stack on a key-holding device) in exchange for dropping the Pi. The USB-attached mode above remains the high-assurance default; leave the radios off where that matters.
 
 ### Portable signer — battery-powered, BLE to phone *(roadmap)*
 
@@ -56,8 +62,8 @@ The nsec-tree hierarchy means each device gets its own branch. Compromise of a c
 | OLED | 128x64 SSD1306 (I2C: SDA=GPIO17, SCL=GPIO18, RST=GPIO21, addr 0x3C) |
 | GNSS | L76K on V4 only (available for portable mode) |
 | LoRa | SX1262 (never initialised -- no use case for signing) |
-| WiFi | ESP32-S3 built-in (disabled in both modes) |
-| BLE | ESP32-S3 built-in (portable mode only) |
+| WiFi | ESP32-S3 built-in (off in USB-bridged mode; enabled in WiFi-standalone mode) |
+| BLE | ESP32-S3 built-in (reserved for future portable mode; not built) |
 | USB-C (V4) | Wired direct to native USB-Serial-JTAG on GPIO19/20 |
 | USB-C (V3) | Wired through CP2102 bridge to UART0 on GPIO43/44 |
 | Battery | JST PH 2.0 connector + charging circuit (portable mode) |
@@ -300,7 +306,7 @@ docs/
 - [x] Zero-trust Pi transport (ESP32 decrypts inbound 0x10 frames, Pi only sees ciphertext)
 - [x] Bridge session authentication (shared secret, constant-time comparison)
 - [x] Client approval policies (per-master, per-client, RAM-only, pushed from bridge)
-- [x] Policy engine (auto-approve / OLED-notify / button-required tiers, rate limiting)
+- [x] Policy engine (auto-approve / OLED-notify / button-required tiers)
 - [x] Full NIP-46 method set (15 methods: 8 standard + 7 heartwood extensions)
 - [x] Multi-master OLED UX (boot screen, bridge status, master labels, auto-approve flash)
 - [x] Bridge passthrough mode (0x10/0x11 encrypted frames, fallback to legacy)
@@ -313,11 +319,11 @@ docs/
 - [x] Serial OTA with SHA-256 verification and automatic rollback
 - [x] Factory reset with button confirmation
 - [x] PIN lock with NVS-persisted failed-attempt counter
-- [x] Rate limiting in policy engine
+- [ ] Rate limiting in policy engine (per-client counter exists in `ClientSession` but is not yet wired into the request dispatch path)
 - [x] Mutual-exclusivity guard between device-decrypts and legacy modes
 - [x] Bearer token auth on bridge management API
 - [x] Bridge secrets read from env vars via `clap env = ...`, never enter argv or `/proc/cmdline`
-- [ ] Disable all wireless radios in firmware (WiFi, BLE, LoRa)
+- [x] Radios off in USB-bridged mode — LoRa/BLE never initialised; WiFi initialised only in the opt-in WiFi-standalone mode
 - [ ] JTAG disable in production build
 - [ ] Watchdog enablement (post-provisioning)
 - [ ] `cargo deny` setup — licence checking, security advisories, crate bans
@@ -332,8 +338,6 @@ docs/
 - [x] 1.5 MB OTA partition slots (up from 896 KB) — accommodates current firmware size with 50% headroom
 - [ ] Dedicated on-device transport key distinct from user masters
 - [ ] NIP-46 transport architecture spec contribution
-
-### Phase 7 — Portable signer
 
 ### Phase 7 — Portable signer
 
@@ -353,7 +357,7 @@ docs/
 
 ### Deliberately excluded
 
-- **WiFi signing** — full TCP/IP stack is a liability on any key-holding device. WiFi is never enabled in either mode.
+- **WiFi signing as the default** — the high-assurance default keeps all radios off and networks via the USB-attached Pi; a live TCP/IP stack is a real liability on a key-holding device. WiFi is off unless you explicitly opt into WiFi-standalone mode (see above), which trades that surface for dropping the Pi.
 - **Master secret on portable device** — only child keys leave the home HSM. If the portable device is lost, the damage is one branch.
 - **LoRa signing** — signing is a response to a request, and the requester needs internet anyway. LoRa solves a problem that doesn't exist for this use case. The SX1262 is never initialised (safe without antenna).
 - **Flash encryption / eFuse burning** — permanently locks the chip to one firmware, prevents reuse (e.g. Meshtastic), and risks bricking if anything goes wrong. Physical security is the protection model instead. May revisit on a dedicated production unit.

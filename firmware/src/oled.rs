@@ -844,9 +844,14 @@ pub fn show_sign_request(
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    // Kind
-    let kind_str = format!("Kind {}", kind);
-    Text::new(&kind_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
+    // Kind — a friendly name when we know it ("App Data"), else "Kind {n}", so
+    // the person holding the button can tell what the app is asking to sign.
+    let kind_str = match heartwood_common::kinds::kind_label(kind) {
+        Some(name) => name.to_string(),
+        None => format!("Kind {}", kind),
+    };
+    let kind_str = &kind_str[..kind_str.len().min(l.chars_per_line(l.font_body()))];
+    Text::new(kind_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
     // Content preview (small font for more text)
     let max_preview = l.chars_per_line(l.font_small());
@@ -1109,9 +1114,12 @@ pub fn show_master_sign_request(
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    // Method + kind
+    // Method + kind (friendly kind name when known)
     let method_str = match kind {
-        Some(k) => format!("{} k:{}", method, k),
+        Some(k) => match heartwood_common::kinds::kind_label(k) {
+            Some(name) => format!("{method} · {name}"),
+            None => format!("{} k:{}", method, k),
+        },
         None => method.to_string(),
     };
     let method_str = &method_str[..method_str.len().min(l.chars_per_line(l.font_body()))];

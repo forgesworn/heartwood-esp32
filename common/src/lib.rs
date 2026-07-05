@@ -9,6 +9,7 @@ pub mod derive;
 pub mod encoding;
 pub mod frame;
 pub mod hex;
+pub mod kinds;
 pub mod types;
 pub mod validate;
 

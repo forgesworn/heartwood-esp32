@@ -844,9 +844,9 @@ pub fn show_sign_request(
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    // Kind (large)
+    // Kind
     let kind_str = format!("Kind {}", kind);
-    Text::new(&kind_str, Point::new(l.sx(2), l.sy(30)), body).draw(display).ok();
+    Text::new(&kind_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
     // Content preview (small font for more text)
     let max_preview = l.chars_per_line(l.font_small());
@@ -855,7 +855,17 @@ pub fn show_sign_request(
     } else {
         content_preview.to_string()
     };
-    Text::new(&content, Point::new(l.sx(2), l.sy(42)), small).draw(display).ok();
+    Text::new(&content, Point::new(l.sx(2), l.sy(35)), small).draw(display).ok();
+
+    // How to approve: a 2-second HOLD, not a tap. This is the one thing people
+    // miss — a quick press just releases early and lands on the DENIED screen.
+    let hint = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(ACCENT)
+        .build();
+    let hold = "Hold the button to sign";
+    let hold = &hold[..hold.len().min(l.chars_per_line(l.font_small()))];
+    Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(display).ok();
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);
@@ -1089,9 +1099,11 @@ pub fn show_master_sign_request(
         .text_color(FG)
         .build();
 
-    // Header: master label
-    let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_header()))];
-    Text::new(label, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    // Header: SIGN AS {label}? — frame it as the question it is, like the
+    // per-app screen, so it doesn't read as a bare label.
+    let label = &master_label[..master_label.len().min(12)];
+    let heading = format!("SIGN AS {}?", label);
+    Text::new(&heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
@@ -1103,7 +1115,7 @@ pub fn show_master_sign_request(
         None => method.to_string(),
     };
     let method_str = &method_str[..method_str.len().min(l.chars_per_line(l.font_body()))];
-    Text::new(method_str, Point::new(l.sx(2), l.sy(30)), body).draw(display).ok();
+    Text::new(method_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
     // Content preview (small font)
     let max_preview = l.chars_per_line(l.font_small());
@@ -1112,7 +1124,16 @@ pub fn show_master_sign_request(
     } else {
         content_preview.to_string()
     };
-    Text::new(&preview, Point::new(l.sx(2), l.sy(42)), small).draw(display).ok();
+    Text::new(&preview, Point::new(l.sx(2), l.sy(35)), small).draw(display).ok();
+
+    // How to approve: a 2-second HOLD, not a tap.
+    let hint = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(ACCENT)
+        .build();
+    let hold = "Hold the button to sign";
+    let hold = &hold[..hold.len().min(l.chars_per_line(l.font_small()))];
+    Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(display).ok();
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);

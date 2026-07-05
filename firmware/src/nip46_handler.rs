@@ -637,7 +637,8 @@ fn handle_sign_event(
         }
         ApprovalResult::TimedOut => {
             log::info!("sign_event: timed out");
-            crate::oled::show_result(display, "Timed out");
+            // Not a failure to shout about: the prompt just expired unanswered.
+            crate::oled::show_result(display, "Not signed");
             build_error_json(&request.id, -1, "timeout")
         }
     }

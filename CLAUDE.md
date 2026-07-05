@@ -1,28 +1,22 @@
 # Heartwood ESP32
 
-Hardware signing device for Nostr on a Heltec WiFi LoRa 32 (ESP32-S3). Both the V3 (CP2102 UART bridge) and V4 (native USB-Serial-JTAG) boards are supported from the same codebase via the `heltec-v3` / `heltec-v4` cargo features. See `firmware/src/serial.rs` for the transport abstraction. Two operating modes from the same codebase:
+Hardware signing device for Nostr on a Heltec WiFi LoRa 32 (ESP32-S3). Both the V3 (CP2102 UART bridge) and V4 (native USB-Serial-JTAG) boards are supported from the same codebase via the `heltec-v3` / `heltec-v4` cargo features. See `firmware/src/serial.rs` for the transport abstraction. The operating mode is selected at runtime from the NVS network config (`NetConfig.mode`), not a build flag:
 
-- **HSM mode** (default) — USB-attached to Pi, holds master secret, all radios disabled
-- **Portable mode** — battery-powered, holds child key, BLE enabled for phone signing
+- **USB-bridged mode** (default) — USB-attached to a Pi, holds master secrets, all radios disabled; the Pi handles networking.
+- **WiFi-standalone mode** (opt-in) — the ESP32 joins WiFi and talks to Nostr relays directly, running the full NIP-46 signing loop on-chip with no Pi. Enabled only when provisioned with an SSID + relay list; the USB cable stays fully live in parallel. See `firmware/src/relay.rs`.
+- **Portable mode** (roadmap, not built) — battery-powered, holds a child key, BLE for phone signing.
 
 ## Security model
 
-- **Physical approval required** — OLED shows the request, button press to sign. No silent signing.
-- **HSM mode:** all radios disabled, USB serial only. Pi compromise is survivable — keys live on the ESP32.
-- **Portable mode:** only BLE enabled (short range). Holds a child key, never the master. If compromised, burn that branch and re-provision.
-- **WiFi is never enabled** in either mode — TCP/IP stack is too large an attack surface for a key-holding device.
+- **Physical approval required** — OLED shows the request, button press to sign. No silent signing. Applies in every mode, including WiFi-standalone.
+- **USB-bridged mode (high-assurance default):** all radios disabled, USB serial only. Pi compromise is survivable — keys live on the ESP32, and in device-decrypts mode the Pi only ever sees ciphertext.
+- **WiFi-standalone mode (opt-in convenience tier):** WiFi *is* enabled and the device reaches relays directly — a deliberately larger attack surface, accepted in exchange for dropping the Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected. Don't enable this tier where the USB high-assurance model is required.
+- **Portable mode** (roadmap, not built) — would enable only BLE (short range) and hold a child key, never the master.
 - **JTAG disabled** in production firmware to prevent debug-port key extraction.
 
-## Feature flags
+## Feature flags & mode selection
 
-The two modes will be cargo features (not yet implemented):
-
-```toml
-[features]
-default = ["hsm"]
-hsm = []        # USB serial, all radios off, master secret
-portable = []   # BLE GATT, battery management, child key only
-```
+Operating mode (USB-bridged vs WiFi-standalone) is selected **at runtime** from `NetConfig.mode` in NVS (`common/src/net_config.rs`: `"usb"` default, `"wifi"` opt-in) — it is **not** a cargo feature. Cargo features select the board (`heltec-v3` / `heltec-v4`) and the crypto backend (`k256-backend` for host tools/tests, `secp256k1-backend` for firmware — see Known issues below). The future `portable` (BLE) tier is not built.
 
 ## Current state
 

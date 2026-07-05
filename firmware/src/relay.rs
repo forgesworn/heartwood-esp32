@@ -1102,7 +1102,7 @@ fn handle_mgmt_event(
     persist_mgmt_seen(ctx.nvs, &ctx.seen);
     log::info!("[relay] mgmt request: method={method} id={id} (operator authenticated)");
 
-    let response_json = match dispatch_mgmt(&method, &req, ctx, master_idx) {
+    let response_json = match dispatch_mgmt(&method, &req, tls, ctx, master_idx) {
         Ok(result) => serde_json::json!({ "id": id, "result": result }).to_string(),
         Err(e) => serde_json::json!({ "id": id, "error": e }).to_string(),
     };
@@ -1128,6 +1128,8 @@ fn handle_mgmt_event(
 fn dispatch_mgmt(
     method: &str,
     req: &serde_json::Value,
+    // The live relay socket — `nostrconnect` publishes the connect ACK on it.
+    tls: &mut Tls,
     ctx: &mut SignCtx,
     master_idx: usize,
 ) -> Result<serde_json::Value, String> {
@@ -1190,6 +1192,100 @@ fn dispatch_mgmt(
                 }
                 None => Err("create_slot failed (slot table full?)".into()),
             }
+        }
+
+        // Client-initiated pairing (nostrconnect://): the app already told us its
+        // pubkey, relay and a one-time secret, so we bind a slot to that pubkey
+        // and publish the connect ACK — a NIP-46 response whose result echoes the
+        // secret — on the relay we serve. The app must be listening on this relay
+        // (the SPA checks that); a WiFi signer can't dial the app's own relay.
+        // The device has no wall-clock, so the operator (SPA) supplies created_at.
+        "nostrconnect" => {
+            let client_hex = req
+                .pointer("/params/client_pubkey")
+                .and_then(|v| v.as_str())
+                .ok_or("nostrconnect requires params.client_pubkey")?;
+            let client_bytes: [u8; 32] = hex_decode(client_hex)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .ok_or("client_pubkey must be 32-byte hex")?;
+            let secret = req
+                .pointer("/params/secret")
+                .and_then(|v| v.as_str())
+                .ok_or("nostrconnect requires params.secret")?
+                .to_string();
+            let created_at = req
+                .pointer("/params/created_at")
+                .and_then(|v| v.as_u64())
+                .ok_or("nostrconnect requires params.created_at")?;
+            let label = req
+                .pointer("/params/label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("nostrconnect app")
+                .to_string();
+            let auto_sign = req
+                .pointer("/params/approve_signing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let allowed_kinds: Vec<u64> = req
+                .pointer("/params/allowed_kinds")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|k| k.as_u64()).collect())
+                .unwrap_or_default();
+
+            // Copy the master secret up front (it is Copy) so publishing the ACK
+            // below needs no live borrow of ctx while the slot table is mutated.
+            let master_secret = ctx.masters[master_idx].secret;
+
+            // A slot secret is still minted (bunker parity), even though this slot
+            // is bound by pubkey rather than by a secret handshake.
+            let mut secret_bytes = [0u8; 32];
+            unsafe {
+                esp_idf_svc::sys::esp_fill_random(
+                    secret_bytes.as_mut_ptr() as *mut core::ffi::c_void,
+                    32,
+                );
+            }
+            let slot_secret = hex_encode(&secret_bytes);
+            secret_bytes.iter_mut().for_each(|b| *b = 0);
+
+            let index = ctx
+                .policy_engine
+                .create_slot(master_slot, label.clone(), slot_secret)
+                .ok_or("create_slot failed (slot table full?)")?;
+            ctx.policy_engine.assign_pubkey_to_slot(master_slot, index, client_hex.to_string());
+            if !allowed_kinds.is_empty() {
+                ctx.policy_engine.update_slot(master_slot, index, None, None, Some(allowed_kinds), None);
+            }
+            if auto_sign {
+                ctx.policy_engine.upgrade_to_signing(master_slot, index);
+            }
+            ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+
+            // Publish the connect ACK to the app, authored by this master.
+            let ck = nip44::get_conversation_key(&master_secret, &client_bytes)
+                .map_err(|e| format!("conversation key: {e}"))?;
+            let mut id_bytes = [0u8; 8];
+            unsafe {
+                esp_idf_svc::sys::esp_fill_random(
+                    id_bytes.as_mut_ptr() as *mut core::ffi::c_void,
+                    8,
+                );
+            }
+            let ack = serde_json::json!({ "id": hex_encode(&id_bytes), "result": secret }).to_string();
+            sign_and_publish(tls, ctx.secp, &master_secret, &ck, client_hex, NIP46_KIND, created_at, &ack)?;
+
+            log::info!(
+                "[relay] nostrconnect: bound slot {index} to client {}…, ACK published{}",
+                &client_hex[..client_hex.len().min(16)],
+                if auto_sign { " [signing pre-approved]" } else { "" }
+            );
+            Ok(serde_json::json!({
+                "slot_index": index,
+                "client_pubkey": client_hex,
+                "signing_approved": auto_sign,
+                "note": "connect ACK published; the app is paired on this relay",
+            }))
         }
 
         "approve_signing" => {

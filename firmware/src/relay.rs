@@ -111,24 +111,27 @@ const RESUB_INTERVAL: Duration = Duration::from_secs(40);
 /// panel forever. Mirrors the USB frame loop's DISPLAY_TIMEOUT. A request or a
 /// PRG press wakes it again.
 const DISPLAY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Recent sign_event activity exposed to Sapwood over authenticated management.
-/// Entries are summaries only: no secrets, no encrypted payloads.
+/// Recent NIP-46 activity exposed to Sapwood over authenticated management.
+/// Entries are summaries only: no secrets, no encrypted payloads or plaintexts.
 const SIGN_AUDIT_MAX: usize = 32;
 
 struct SignAuditEntry {
     seq: u64,
+    method: String,
     label: String,
     client: String,
-    kind: u64,
+    kind: Option<u64>,
     preview: String,
     outcome: String,
 }
 
 struct SignAuditDraft {
+    method: String,
     label: String,
     client: String,
-    kind: u64,
+    kind: Option<u64>,
     preview: String,
+    success_outcome: String,
 }
 
 /// Signing context borrowed from `main` for the lifetime of the relay loop.
@@ -887,30 +890,52 @@ fn client_label(ctx: &SignCtx, master_slot: u8, client_hex: &str) -> String {
 
 fn sign_audit_draft(plaintext: &str, label: String, client_hex: &str) -> Option<SignAuditDraft> {
     let req = nip46::parse_request(plaintext.as_bytes()).ok()?;
-    if req.method != "sign_event" {
-        return None;
+    let method = req.method.clone();
+    match method.as_str() {
+        "sign_event" => {
+            let event = nip46::parse_unsigned_event(&req.params).ok()?;
+            let (kind, preview) = nip46::event_display_summary(&event, 80);
+            Some(SignAuditDraft {
+                method,
+                label,
+                client: client_hex.to_string(),
+                kind: Some(kind),
+                preview,
+                success_outcome: "signed".to_string(),
+            })
+        }
+        "nip04_encrypt" | "nip04_decrypt" | "nip44_encrypt" | "nip44_decrypt" => {
+            let peer = req.params
+                .first()
+                .and_then(|v| v.as_str())
+                .filter(|s| s.len() >= 8)
+                .map(|s| &s[..8])
+                .unwrap_or("unknown");
+            Some(SignAuditDraft {
+                method,
+                label,
+                client: client_hex.to_string(),
+                kind: None,
+                preview: format!("peer {peer} - content redacted"),
+                success_outcome: "ok".to_string(),
+            })
+        }
+        _ => None,
     }
-    let event = nip46::parse_unsigned_event(&req.params).ok()?;
-    let (kind, preview) = nip46::event_display_summary(&event, 80);
-    Some(SignAuditDraft {
-        label,
-        client: client_hex.to_string(),
-        kind,
-        preview,
-    })
 }
 
 fn push_sign_audit(ctx: &mut SignCtx, draft: SignAuditDraft, response_json: &str) {
     let outcome = serde_json::from_str::<serde_json::Value>(response_json)
         .ok()
         .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|e| format!("error: {e}")))
-        .unwrap_or_else(|| "signed".to_string());
+        .unwrap_or_else(|| draft.success_outcome.clone());
     ctx.sign_audit_seq = ctx.sign_audit_seq.wrapping_add(1);
     if ctx.sign_audit.len() >= SIGN_AUDIT_MAX {
         ctx.sign_audit.remove(0);
     }
     ctx.sign_audit.push(SignAuditEntry {
         seq: ctx.sign_audit_seq,
+        method: draft.method,
         label: draft.label,
         client: draft.client,
         kind: draft.kind,
@@ -925,7 +950,7 @@ fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
         .map(|a| {
             serde_json::json!({
                 "seq": a.seq,
-                "method": "sign_event",
+                "method": a.method,
                 "label": a.label,
                 "client": a.client,
                 "kind": a.kind,
@@ -1420,6 +1445,7 @@ fn dispatch_mgmt(
                         "auto_approve": s.auto_approve,
                         "signing_approved": s.signing_approved,
                         "current_pubkey": s.current_pubkey,
+                        "authorized_pubkeys": s.authorized_pubkeys,
                         "allowed_kinds": s.allowed_kinds,
                         "allowed_methods": s.allowed_methods,
                     })
@@ -1439,9 +1465,6 @@ fn dispatch_mgmt(
                 .iter()
                 .find(|s| s.slot_index == slot_index)
                 .ok_or_else(|| format!("no such slot: {slot_index}"))?;
-            if slot.current_pubkey.is_some() {
-                return Err("this app has already connected; the pairing link is spent".into());
-            }
             Ok(serde_json::json!({
                 "slot_index": slot_index,
                 "bunker_uri": mgmt::bunker_uri(&master_hex, &ctx.relays, Some(&slot.secret)),

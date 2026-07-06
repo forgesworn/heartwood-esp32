@@ -217,24 +217,24 @@ pub fn handle_request(
             match tier {
                 heartwood_common::policy::ApprovalTier::AutoApprove => {
                     log::info!("sign_event: auto-approved by policy");
-                    let purpose_label = request
-                        .heartwood
-                        .as_ref()
-                        .map(|h| h.purpose.as_str())
-                        .unwrap_or("master");
-                    crate::oled::show_auto_approved(display, master_label, purpose_label);
+                    if let Ok(event) = nip46::parse_unsigned_event(&request.params) {
+                        let (kind, content_preview) = nip46::event_display_summary(&event, 50);
+                        crate::oled::show_auto_signed(display, master_label, kind, &content_preview);
+                    } else {
+                        crate::oled::show_auto_approved(display, master_label, "sign_event");
+                    }
                     match handle_auto_sign(master_secret, master_mode, secp, &request) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),
                     }
                 }
                 heartwood_common::policy::ApprovalTier::OledNotify => {
-                    let purpose_label = request
-                        .heartwood
-                        .as_ref()
-                        .map(|h| h.purpose.as_str())
-                        .unwrap_or("master");
-                    crate::oled::show_auto_approved(display, master_label, purpose_label);
+                    if let Ok(event) = nip46::parse_unsigned_event(&request.params) {
+                        let (kind, content_preview) = nip46::event_display_summary(&event, 50);
+                        crate::oled::show_auto_signed(display, master_label, kind, &content_preview);
+                    } else {
+                        crate::oled::show_auto_approved(display, master_label, "sign_event");
+                    }
                     match handle_auto_sign(master_secret, master_mode, secp, &request) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),

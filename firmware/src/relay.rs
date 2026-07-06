@@ -111,6 +111,25 @@ const RESUB_INTERVAL: Duration = Duration::from_secs(40);
 /// panel forever. Mirrors the USB frame loop's DISPLAY_TIMEOUT. A request or a
 /// PRG press wakes it again.
 const DISPLAY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Recent sign_event activity exposed to Sapwood over authenticated management.
+/// Entries are summaries only: no secrets, no encrypted payloads.
+const SIGN_AUDIT_MAX: usize = 32;
+
+struct SignAuditEntry {
+    seq: u64,
+    label: String,
+    client: String,
+    kind: u64,
+    preview: String,
+    outcome: String,
+}
+
+struct SignAuditDraft {
+    label: String,
+    client: String,
+    kind: u64,
+    preview: String,
+}
 
 /// Signing context borrowed from `main` for the lifetime of the relay loop.
 /// `masters`/`secp`/`button_pin` are shared refs; the rest are exclusive.
@@ -150,6 +169,8 @@ struct SignCtx<'a, 'd, 'b> {
     /// event's `created_at`, so only a newer replaceable event overwrites it.
     identity_name: Option<String>,
     identity_name_ts: u64,
+    sign_audit: Vec<SignAuditEntry>,
+    sign_audit_seq: u64,
 }
 
 /// Host out of a `wss://`/`ws://` relay URL (scheme, port and path stripped).
@@ -240,6 +261,8 @@ pub fn run_wifi_standalone<'d, 'b>(
         last_activity: Instant::now(),
         identity_name: None,
         identity_name_ts: 0,
+        sign_audit: Vec::new(),
+        sign_audit_seq: 0,
     };
 
     loop {
@@ -854,6 +877,65 @@ fn process_event(tls: &mut Tls, ev: &SignedEvent, ctx: &mut SignCtx) -> Result<(
     }
 }
 
+fn client_label(ctx: &SignCtx, master_slot: u8, client_hex: &str) -> String {
+    ctx.policy_engine
+        .find_slot_by_pubkey(master_slot, client_hex)
+        .map(|s| s.label.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("client {}", &client_hex[..client_hex.len().min(8)]))
+}
+
+fn sign_audit_draft(plaintext: &str, label: String, client_hex: &str) -> Option<SignAuditDraft> {
+    let req = nip46::parse_request(plaintext.as_bytes()).ok()?;
+    if req.method != "sign_event" {
+        return None;
+    }
+    let event = nip46::parse_unsigned_event(&req.params).ok()?;
+    let (kind, preview) = nip46::event_display_summary(&event, 80);
+    Some(SignAuditDraft {
+        label,
+        client: client_hex.to_string(),
+        kind,
+        preview,
+    })
+}
+
+fn push_sign_audit(ctx: &mut SignCtx, draft: SignAuditDraft, response_json: &str) {
+    let outcome = serde_json::from_str::<serde_json::Value>(response_json)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|e| format!("error: {e}")))
+        .unwrap_or_else(|| "signed".to_string());
+    ctx.sign_audit_seq = ctx.sign_audit_seq.wrapping_add(1);
+    if ctx.sign_audit.len() >= SIGN_AUDIT_MAX {
+        ctx.sign_audit.remove(0);
+    }
+    ctx.sign_audit.push(SignAuditEntry {
+        seq: ctx.sign_audit_seq,
+        label: draft.label,
+        client: draft.client,
+        kind: draft.kind,
+        preview: draft.preview,
+        outcome,
+    });
+}
+
+fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
+    ctx.sign_audit
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "seq": a.seq,
+                "method": "sign_event",
+                "label": a.label,
+                "client": a.client,
+                "kind": a.kind,
+                "preview": a.preview,
+                "outcome": a.outcome,
+            })
+        })
+        .collect()
+}
+
 /// NIP-46 signing path (kind 24133): resolve the addressed identity → decrypt →
 /// `handle_request` → re-encrypt → sign + publish. Mirrors the USB
 /// `transport::handle_encrypted_request`, including per-persona routing.
@@ -943,6 +1025,7 @@ fn handle_nip46_event(
         label,
         if is_persona { " (persona)" } else { "" }
     );
+    let audit = sign_audit_draft(&plaintext, client_label(ctx, slot, &ev.pubkey), &ev.pubkey);
 
     let inner = Frame {
         frame_type: FRAME_TYPE_NIP46_REQUEST,
@@ -965,6 +1048,9 @@ fn handle_nip46_event(
         ctx.identity_caches,
         Some(&client_pubkey),
     );
+    if let Some(audit) = audit {
+        push_sign_audit(ctx, audit, &response_json);
+    }
     ctx.policy_engine.persist_slots(ctx.nvs, slot);
 
     // Persist any identities derived during this request (e.g. via
@@ -1342,6 +1428,26 @@ fn dispatch_mgmt(
             Ok(serde_json::json!({ "clients": clients }))
         }
 
+        "client_uri" => {
+            let slot_index = req
+                .pointer("/params/slot_index")
+                .and_then(|v| v.as_u64())
+                .ok_or("client_uri requires params.slot_index")? as u8;
+            let slot = ctx
+                .policy_engine
+                .list_slots(master_slot)
+                .iter()
+                .find(|s| s.slot_index == slot_index)
+                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            if slot.current_pubkey.is_some() {
+                return Err("this app has already connected; the pairing link is spent".into());
+            }
+            Ok(serde_json::json!({
+                "slot_index": slot_index,
+                "bunker_uri": mgmt::bunker_uri(&master_hex, &ctx.relays, Some(&slot.secret)),
+            }))
+        }
+
         // Enumerate every identity this master serves (itself + its personas)
         // with a ready-to-paste bunker URI — the wifi-standalone analogue of the
         // sidecar's `bunker-uris.json` manifest. Closes the discovery gap: the
@@ -1481,6 +1587,7 @@ fn dispatch_mgmt(
             "mode": "wifi-standalone",
             "relay": ctx.relay_url,
             "slots": ctx.policy_engine.list_slots(master_slot).len(),
+            "audit": sign_audit_json(ctx),
         })),
 
         other => Err(format!("unknown method: {other}")),

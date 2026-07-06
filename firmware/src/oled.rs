@@ -1198,6 +1198,62 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
     }
 }
 
+/// Display an automatic sign_event with enough context to audit what happened.
+pub fn show_auto_signed(
+    display: &mut Display<'_>,
+    master_label: &str,
+    kind: u64,
+    content_preview: &str,
+) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(l.font_body())
+        .text_color(FG)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(FG)
+        .build();
+
+    Text::new("AUTO-SIGNED", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
+
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display).ok();
+
+    let kind_str = match heartwood_common::kinds::kind_label(kind) {
+        Some(name) => name.to_string(),
+        None => format!("Kind {}", kind),
+    };
+    let kind_str = &kind_str[..kind_str.len().min(l.chars_per_line(l.font_body()))];
+    Text::new(kind_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
+
+    let max_preview = l.chars_per_line(l.font_small());
+    let content = if content_preview.len() > max_preview {
+        format!("{}...", &content_preview[..max_preview - 3])
+    } else {
+        content_preview.to_string()
+    };
+    Text::new(&content, Point::new(l.sx(2), l.sy(37)), small).draw(display).ok();
+
+    let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_small()))];
+    Text::new(label, Point::new(l.sx(2), l.sy(49)), small).draw(display).ok();
+
+    Rectangle::new(Point::new(l.sx(0), l.sy(56)), Size::new(l.w as u32, l.s(4) as u32))
+        .into_styled(PrimitiveStyle::with_fill(FG))
+        .draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Approval feedback screens
 // ---------------------------------------------------------------------------

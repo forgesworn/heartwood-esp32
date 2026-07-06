@@ -804,17 +804,17 @@ pub fn show_error(display: &mut Display<'_>, msg: &str) {
     }
 }
 
-/// Display a signing request with purpose, kind, content preview, and countdown.
+/// Display a signing request with requester, kind, content preview, and countdown.
 ///
 /// Layout:
-///   Header:  "SIGN AS {purpose}?" (FONT_6X10, tracked)
+///   Header:  "SIGN FOR {requester}?" (FONT_6X10, tracked)
 ///   Rule:    1px line
 ///   Kind:    "Kind {n}" (FONT_7X14)
 ///   Content: preview (FONT_5X8)
 ///   Bar:     graphical countdown + seconds
 pub fn show_sign_request(
     display: &mut Display<'_>,
-    purpose: &str,
+    requester: &str,
     kind: u64,
     content_preview: &str,
     seconds_remaining: u32,
@@ -836,8 +836,8 @@ pub fn show_sign_request(
         .build();
 
     // Header
-    let label = if purpose.is_empty() || purpose == "master" { "master" } else { purpose };
-    let heading = format!("SIGN AS {}?", &label[..label.len().min(12)]);
+    let label = if requester.trim().is_empty() { "app" } else { requester.trim() };
+    let heading = format!("SIGN FOR {}?", &label[..label.len().min(11)]);
     Text::new(&heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))

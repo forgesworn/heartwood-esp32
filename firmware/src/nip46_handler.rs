@@ -188,6 +188,11 @@ pub fn handle_request(
             .unwrap_or_default()
     };
     let has_client = !client_hex.is_empty() && client_hex.len() == 64;
+    let requester_label = if has_client {
+        signing_requester_label(policy_engine, master_slot, &client_hex)
+    } else {
+        "direct app".to_string()
+    };
     let tier = if has_client {
         policy_engine.check(master_slot, &client_hex, &method, event_kind)
     } else {
@@ -219,9 +224,9 @@ pub fn handle_request(
                     log::info!("sign_event: auto-approved by policy");
                     if let Ok(event) = nip46::parse_unsigned_event(&request.params) {
                         let (kind, content_preview) = nip46::event_display_summary(&event, 50);
-                        crate::oled::show_auto_signed(display, master_label, kind, &content_preview);
+                        crate::oled::show_auto_signed(display, &requester_label, kind, &content_preview);
                     } else {
-                        crate::oled::show_auto_approved(display, master_label, "sign_event");
+                        crate::oled::show_auto_approved(display, &requester_label, "sign_event");
                     }
                     match handle_auto_sign(master_secret, master_mode, secp, &request) {
                         Ok(json) => json,
@@ -231,9 +236,9 @@ pub fn handle_request(
                 heartwood_common::policy::ApprovalTier::OledNotify => {
                     if let Ok(event) = nip46::parse_unsigned_event(&request.params) {
                         let (kind, content_preview) = nip46::event_display_summary(&event, 50);
-                        crate::oled::show_auto_signed(display, master_label, kind, &content_preview);
+                        crate::oled::show_auto_signed(display, &requester_label, kind, &content_preview);
                     } else {
-                        crate::oled::show_auto_approved(display, master_label, "sign_event");
+                        crate::oled::show_auto_approved(display, &requester_label, "sign_event");
                     }
                     match handle_auto_sign(master_secret, master_mode, secp, &request) {
                         Ok(json) => json,
@@ -241,7 +246,7 @@ pub fn handle_request(
                     }
                 }
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
-                    let result = handle_sign_event(master_secret, master_mode, secp, display, button_pin, &request);
+                    let result = handle_sign_event(master_secret, master_mode, secp, display, button_pin, &request, &requester_label);
                     let is_success = serde_json::from_str::<serde_json::Value>(&result)
                         .map(|v| v.get("error").is_none())
                         .unwrap_or(false);
@@ -547,6 +552,19 @@ pub fn handle_request(
     }
 }
 
+fn signing_requester_label(
+    policy_engine: &PolicyEngine,
+    master_slot: u8,
+    client_hex: &str,
+) -> String {
+    policy_engine
+        .find_slot_by_pubkey(master_slot, client_hex)
+        .map(|slot| slot.label.trim())
+        .filter(|label| !label.is_empty())
+        .map(|label| label.to_string())
+        .unwrap_or_else(|| format!("client {}", &client_hex[..client_hex.len().min(8)]))
+}
+
 // ---------------------------------------------------------------------------
 // Auto-sign (policy-approved, no button required)
 // ---------------------------------------------------------------------------
@@ -574,6 +592,7 @@ fn handle_sign_event(
     display: &mut Display<'_>,
     button_pin: &PinDriver<'_, Input>,
     request: &nip46::Nip46Request,
+    requester_label: &str,
 ) -> String {
     let mut event = match nip46::parse_unsigned_event(&request.params) {
         Ok(e) => e,
@@ -585,12 +604,6 @@ fn handle_sign_event(
 
     let (kind, content_preview) = nip46::event_display_summary(&event, 50);
 
-    let purpose = request
-        .heartwood
-        .as_ref()
-        .map(|h| h.purpose.as_str())
-        .unwrap_or("master");
-
     // Show the signing request on the OLED and wait for button approval.
     // The countdown bar updates every second; the approval module handles
     // "Hold 2s..." feedback while the button is held down.
@@ -599,7 +612,7 @@ fn handle_sign_event(
         button_pin,
         APPROVAL_TIMEOUT_SECS,
         |d, remaining| {
-            crate::oled::show_sign_request(d, purpose, kind, &content_preview, remaining);
+            crate::oled::show_sign_request(d, requester_label, kind, &content_preview, remaining);
         },
     );
 

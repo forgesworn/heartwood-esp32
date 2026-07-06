@@ -17,8 +17,10 @@
 # matching sdkconfig fragment, target triple and MCU -- all set here together
 # so they cannot drift apart.
 #
-# Artifacts are copied to target/heartwood-<board>.elf so you can distribute
-# them alongside the right hardware and never flash the wrong binary.
+# Release artifacts are copied to target/heartwood-<board>.elf so you can
+# distribute them alongside the right hardware and never flash the wrong binary.
+# Debug artifacts use target/heartwood-<board>-debug.elf so an unoptimised
+# developer build cannot accidentally replace the normal flash target.
 #
 # Examples:
 #
@@ -83,9 +85,16 @@ for arg in "$@"; do
 done
 
 SRC="target/${TARGET}/${PROFILE}/heartwood-esp32"
-DST="target/heartwood-${BOARD}.elf"
+if [[ "$PROFILE" == "release" ]]; then
+    DST="target/heartwood-${BOARD}.elf"
+else
+    DST="target/heartwood-${BOARD}-debug.elf"
+fi
 
 if [[ -f "$SRC" ]]; then
     cp "$SRC" "$DST"
     echo "==> Copied ${SRC} -> ${DST}"
+    if [[ "$PROFILE" != "release" ]]; then
+        echo "==> Debug build: not updating target/heartwood-${BOARD}.elf; use --release for production flashing."
+    fi
 fi

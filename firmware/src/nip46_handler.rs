@@ -223,8 +223,7 @@ pub fn handle_request(
                 heartwood_common::policy::ApprovalTier::AutoApprove => {
                     log::info!("sign_event: auto-approved by policy");
                     if let Ok(event) = nip46::parse_unsigned_event(&request.params) {
-                        let (kind, content_preview) = nip46::event_display_summary(&event, 50);
-                        crate::oled::show_auto_signed(display, &requester_label, kind, &content_preview);
+                        crate::oled::show_auto_signed(display, &requester_label, event.kind);
                     } else {
                         crate::oled::show_auto_approved(display, &requester_label, "sign_event");
                     }
@@ -235,8 +234,7 @@ pub fn handle_request(
                 }
                 heartwood_common::policy::ApprovalTier::OledNotify => {
                     if let Ok(event) = nip46::parse_unsigned_event(&request.params) {
-                        let (kind, content_preview) = nip46::event_display_summary(&event, 50);
-                        crate::oled::show_auto_signed(display, &requester_label, kind, &content_preview);
+                        crate::oled::show_auto_signed(display, &requester_label, event.kind);
                     } else {
                         crate::oled::show_auto_approved(display, &requester_label, "sign_event");
                     }

@@ -804,6 +804,13 @@ pub fn show_error(display: &mut Display<'_>, msg: &str) {
     }
 }
 
+fn kind_line(kind: u64) -> String {
+    match heartwood_common::kinds::kind_label(kind) {
+        Some(name) => format!("{name} ({kind})"),
+        None => format!("Kind {kind}"),
+    }
+}
+
 /// Display a signing request with requester, kind, content preview, and countdown.
 ///
 /// Layout:
@@ -846,10 +853,7 @@ pub fn show_sign_request(
 
     // Kind — a friendly name when we know it ("App Data"), else "Kind {n}", so
     // the person holding the button can tell what the app is asking to sign.
-    let kind_str = match heartwood_common::kinds::kind_label(kind) {
-        Some(name) => name.to_string(),
-        None => format!("Kind {}", kind),
-    };
+    let kind_str = kind_line(kind);
     let kind_str = &kind_str[..kind_str.len().min(l.chars_per_line(l.font_body()))];
     Text::new(kind_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
@@ -1201,9 +1205,8 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
 /// Display an automatic sign_event with enough context to audit what happened.
 pub fn show_auto_signed(
     display: &mut Display<'_>,
-    master_label: &str,
+    requester_label: &str,
     kind: u64,
-    content_preview: &str,
 ) {
     let l = layout(display);
     display.clear_buffer();
@@ -1227,23 +1230,18 @@ pub fn show_auto_signed(
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    let kind_str = match heartwood_common::kinds::kind_label(kind) {
-        Some(name) => name.to_string(),
-        None => format!("Kind {}", kind),
-    };
+    let requester = requester_label.trim();
+    let requester = if requester.is_empty() { "app" } else { requester };
+    let requester = &requester[..requester.len().min(l.chars_per_line(l.font_body()))];
+    Text::new(requester, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
+
+    let kind_str = kind_line(kind);
     let kind_str = &kind_str[..kind_str.len().min(l.chars_per_line(l.font_body()))];
-    Text::new(kind_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
+    Text::new(kind_str, Point::new(l.sx(2), l.sy(38)), body).draw(display).ok();
 
-    let max_preview = l.chars_per_line(l.font_small());
-    let content = if content_preview.len() > max_preview {
-        format!("{}...", &content_preview[..max_preview - 3])
-    } else {
-        content_preview.to_string()
-    };
-    Text::new(&content, Point::new(l.sx(2), l.sy(37)), small).draw(display).ok();
-
-    let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_small()))];
-    Text::new(label, Point::new(l.sx(2), l.sy(49)), small).draw(display).ok();
+    let kind_number = format!("Nostr kind {kind}");
+    let kind_number = &kind_number[..kind_number.len().min(l.chars_per_line(l.font_small()))];
+    Text::new(kind_number, Point::new(l.sx(2), l.sy(50)), small).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(56)), Size::new(l.w as u32, l.s(4) as u32))
         .into_styled(PrimitiveStyle::with_fill(FG))

@@ -51,6 +51,44 @@ fn header<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, title: &str) {
     .ok();
 }
 
+fn display_app_label(label: &str) -> String {
+    let label = label.trim();
+    let label = if label.is_empty() { "app" } else { label };
+    let mut chars = label.chars();
+    let Some(first) = chars.next() else {
+        return "App".to_string();
+    };
+
+    let mut out = String::new();
+    out.extend(first.to_uppercase());
+    out.extend(chars);
+    out
+}
+
+fn kind_name(kind: u64) -> &'static str {
+    match kind {
+        0 => "Profile",
+        1 => "Note",
+        3 => "Contacts",
+        4 => "DM (NIP-04)",
+        30078 => "App Data",
+        _ => "Unknown Kind",
+    }
+}
+
+fn ellipsize_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+
+    let mut out: String = value.chars().take(max_chars - 3).collect();
+    out.push_str("...");
+    out
+}
+
 /// Normal ready screen shown while the signer is idle.
 fn draw_ready<D: DrawTarget<Color = Rgb565>>(d: &mut D) {
     let l = layout_of(d);
@@ -162,42 +200,30 @@ fn draw_idle<D: DrawTarget<Color = Rgb565>>(d: &mut D, name: Option<&str>, npub:
     }
 }
 
-/// Signing request: header label, rule, method+kind, content preview, and a
-/// countdown bar whose fill colour shifts green→amber→red as time runs out
-/// (mirrors `oled::show_master_sign_request`).
+/// Signing request: hold-to-sign header, app label, friendly kind label, kind
+/// number, and countdown bar (mirrors `oled::show_sign_request`).
 fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     d: &mut D,
     label: &str,
-    method: &str,
+    _method: &str,
     kind: u64,
-    content: &str,
+    _content: &str,
     secs: u32,
     total: u32,
 ) {
     let l = layout_of(d);
-    header(d, &l, &format!("SIGN AS {}?", label));
+    header(d, &l, "HOLD TO SIGN");
 
     let body = style(l.font_body(), FG);
-    let preview_style = style(l.font_small(), MUTED);
     let small = style(l.font_small(), FG);
-    let m = format!("{} k:{}", method, kind);
-    Text::new(&m, Point::new(l.sx(2), l.sy(25)), body).draw(d).ok();
+    let app = ellipsize_chars(&display_app_label(label), l.chars_per_line(l.font_body()));
+    Text::new(&app, Point::new(l.sx(2), l.sy(25)), body).draw(d).ok();
 
-    let max = l.chars_per_line(l.font_small());
-    let preview: String = if content.len() > max {
-        format!("{}...", &content[..max.saturating_sub(3)])
-    } else {
-        content.to_string()
-    };
-    Text::new(&preview, Point::new(l.sx(2), l.sy(35)), preview_style)
-        .draw(d)
-        .ok();
+    let kind_label = ellipsize_chars(kind_name(kind), l.chars_per_line(l.font_small()));
+    Text::new(&kind_label, Point::new(l.sx(2), l.sy(39)), small).draw(d).ok();
 
-    // How to approve: a 2-second HOLD signs, while a tap denies.
-    let hint = style(l.font_small(), ACCENT);
-    let hold = "Hold=sign tap=no";
-    let hold = &hold[..hold.len().min(l.chars_per_line(l.font_small()))];
-    Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(d).ok();
+    let kind_number = ellipsize_chars(&format!("kind {kind}"), l.chars_per_line(l.font_small()));
+    Text::new(&kind_number, Point::new(l.sx(2), l.sy(48)), small).draw(d).ok();
 
     // Countdown bar: muted track + proportional fill coloured by urgency.
     let bx = l.sx(2);
@@ -309,10 +335,10 @@ fn main() {
         render(&format!("idle-{b}"), w, h, |d| draw_idle(d, None, npub));
         render(&format!("idle-named-{b}"), w, h, |d| draw_idle(d, Some("TheCryptoDonkey"), npub));
         render(&format!("sign-{b}"), w, h, |d| {
-            draw_sign(d, "personal", "sign_event", 1, "gm nostr, building today", 18, 30)
+            draw_sign(d, "primal", "sign_event", 30078, "Sync app settings", 18, 30)
         });
         render(&format!("sign-urgent-{b}"), w, h, |d| {
-            draw_sign(d, "personal", "sign_event", 1, "gm nostr, building today", 4, 30)
+            draw_sign(d, "primal", "sign_event", 30078, "Sync app settings", 4, 30)
         });
         render(&format!("confirm-{b}"), w, h, |d| draw_confirm(d, 60));
         render(&format!("approved-{b}"), w, h, |d| draw_result(d, "APPROVED", OK));

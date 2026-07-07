@@ -811,26 +811,57 @@ pub fn show_error(display: &mut Display<'_>, msg: &str) {
     }
 }
 
-fn kind_line(kind: u64) -> String {
-    match heartwood_common::kinds::kind_label(kind) {
-        Some(name) => format!("{name} ({kind})"),
-        None => format!("Kind {kind}"),
+fn kind_name_line(kind: u64) -> String {
+    heartwood_common::kinds::kind_label(kind)
+        .unwrap_or("Unknown Kind")
+        .to_string()
+}
+
+fn display_app_label(label: &str) -> String {
+    let label = label.trim();
+    let label = if label.is_empty() { "app" } else { label };
+    let mut chars = label.chars();
+    let Some(first) = chars.next() else {
+        return "App".to_string();
+    };
+
+    let mut out = String::new();
+    out.extend(first.to_uppercase());
+    out.extend(chars);
+    out
+}
+
+fn take_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn ellipsize_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
     }
+    if max_chars <= 3 {
+        return take_chars(value, max_chars);
+    }
+
+    let mut out = take_chars(value, max_chars - 3);
+    out.push_str("...");
+    out
 }
 
 /// Display a signing request with requester, kind, content preview, and countdown.
 ///
 /// Layout:
-///   Header:  "SIGN FOR {requester}?" (FONT_6X10, tracked)
+///   Header:  "HOLD TO SIGN" (FONT_6X10, tracked)
 ///   Rule:    1px line
-///   Kind:    "Kind {n}" (FONT_7X14)
-///   Content: preview (FONT_5X8)
+///   App:     requester label (FONT_7X14)
+///   Kind:    friendly Nostr kind label (FONT_5X8)
+///   Number:  "kind {n}" (FONT_5X8)
 ///   Bar:     graphical countdown + seconds
 pub fn show_sign_request(
     display: &mut Display<'_>,
     requester: &str,
     kind: u64,
-    content_preview: &str,
+    _content_preview: &str,
     seconds_remaining: u32,
 ) {
     let l = layout(display);
@@ -850,37 +881,25 @@ pub fn show_sign_request(
         .build();
 
     // Header
-    let label = if requester.trim().is_empty() { "app" } else { requester.trim() };
-    let heading = format!("SIGN FOR {}?", &label[..label.len().min(11)]);
-    Text::new(&heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Text::new("HOLD TO SIGN", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    // Kind — a friendly name when we know it ("App Data"), else "Kind {n}", so
-    // the person holding the button can tell what the app is asking to sign.
-    let kind_str = kind_line(kind);
-    let kind_str = &kind_str[..kind_str.len().min(l.chars_per_line(l.font_body()))];
-    Text::new(kind_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
+    // Lead with who is asking, then the Nostr kind, so app-data JSON never
+    // becomes the first thing the owner sees.
+    let app = display_app_label(requester);
+    let app = ellipsize_chars(&app, l.chars_per_line(l.font_body()));
+    Text::new(&app, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
-    // Content preview (small font for more text)
-    let max_preview = l.chars_per_line(l.font_small());
-    let content = if content_preview.len() > max_preview {
-        format!("{}...", &content_preview[..max_preview - 3])
-    } else {
-        content_preview.to_string()
-    };
-    Text::new(&content, Point::new(l.sx(2), l.sy(35)), small).draw(display).ok();
+    let kind_name = kind_name_line(kind);
+    let kind_name = ellipsize_chars(&kind_name, l.chars_per_line(l.font_small()));
+    Text::new(&kind_name, Point::new(l.sx(2), l.sy(39)), small).draw(display).ok();
 
-    // How to approve: a 2-second HOLD signs, while a tap denies.
-    let hint = MonoTextStyleBuilder::new()
-        .font(l.font_small())
-        .text_color(ACCENT)
-        .build();
-    let hold = "Hold=sign tap=no";
-    let hold = &hold[..hold.len().min(l.chars_per_line(l.font_small()))];
-    Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(display).ok();
+    let kind_number = format!("kind {kind}");
+    let kind_number = ellipsize_chars(&kind_number, l.chars_per_line(l.font_small()));
+    Text::new(&kind_number, Point::new(l.sx(2), l.sy(48)), small).draw(display).ok();
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);
@@ -1236,18 +1255,17 @@ pub fn show_auto_signed(
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    let requester = requester_label.trim();
-    let requester = if requester.is_empty() { "app" } else { requester };
-    let requester = &requester[..requester.len().min(l.chars_per_line(l.font_body()))];
-    Text::new(requester, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
+    let requester = display_app_label(requester_label);
+    let requester = ellipsize_chars(&requester, l.chars_per_line(l.font_body()));
+    Text::new(&requester, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
-    let kind_str = kind_line(kind);
-    let kind_str = &kind_str[..kind_str.len().min(l.chars_per_line(l.font_body()))];
-    Text::new(kind_str, Point::new(l.sx(2), l.sy(38)), body).draw(display).ok();
+    let kind_str = kind_name_line(kind);
+    let kind_str = ellipsize_chars(&kind_str, l.chars_per_line(l.font_body()));
+    Text::new(&kind_str, Point::new(l.sx(2), l.sy(38)), body).draw(display).ok();
 
-    let kind_number = format!("Nostr kind {kind}");
-    let kind_number = &kind_number[..kind_number.len().min(l.chars_per_line(l.font_small()))];
-    Text::new(kind_number, Point::new(l.sx(2), l.sy(50)), small).draw(display).ok();
+    let kind_number = format!("kind {kind}");
+    let kind_number = ellipsize_chars(&kind_number, l.chars_per_line(l.font_small()));
+    Text::new(&kind_number, Point::new(l.sx(2), l.sy(50)), small).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(56)), Size::new(l.w as u32, l.s(4) as u32))
         .into_styled(PrimitiveStyle::with_fill(FG))

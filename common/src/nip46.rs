@@ -239,18 +239,72 @@ pub fn compute_event_id_hex(event: &UnsignedEvent) -> String {
     hex_encode(&compute_event_id(event))
 }
 
+fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars();
+
+    for _ in 0..max_chars {
+        match chars.next() {
+            Some(ch) => out.push(ch),
+            None => return value.to_string(),
+        }
+    }
+
+    if chars.next().is_some() {
+        out.push_str("...");
+        out
+    } else {
+        value.to_string()
+    }
+}
+
+fn json_string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+}
+
+fn content_display_preview(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return trimmed.to_string();
+    };
+
+    if let Some(description) = json_string_field(&value, "description")
+        .or_else(|| json_string_field(&value, "desription"))
+    {
+        return description.to_string();
+    }
+
+    if let Some(subkey) = json_string_field(&value, "subkey") {
+        return format!("subkey: {subkey}");
+    }
+
+    for key in ["title", "name", "display_name"] {
+        if let Some(label) = json_string_field(&value, key) {
+            return label.to_string();
+        }
+    }
+
+    match value {
+        Value::String(s) => s.trim().to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
 /// Return a brief summary of an unsigned event suitable for display on the OLED.
 ///
-/// Returns `(kind, truncated_content)`. Content longer than `max_chars` is
-/// truncated and suffixed with `"..."`.
+/// Returns `(kind, preview)`. JSON app-data content is collapsed to its useful
+/// human label when clients provide one; otherwise the raw content is truncated.
 pub fn event_display_summary(event: &UnsignedEvent, max_chars: usize) -> (u64, String) {
-    let content = if event.content.len() > max_chars {
-        let truncated = &event.content[..max_chars];
-        format!("{truncated}...")
-    } else {
-        event.content.clone()
-    };
-    (event.kind, content)
+    let preview = content_display_preview(&event.content);
+    (event.kind, truncate_with_ellipsis(&preview, max_chars))
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +500,42 @@ mod tests {
         assert_eq!(kind, 1);
         assert_eq!(summary, "Hello, Nostr!");
         assert!(!summary.ends_with("..."));
+    }
+
+    #[test]
+    fn test_event_display_summary_uses_json_description() {
+        let mut event = sample_event();
+        event.kind = 30078;
+        event.content = r#"{ "description": "Sync app settings" }"#.to_string();
+        let (kind, summary) = event_display_summary(&event, 50);
+        assert_eq!(kind, 30078);
+        assert_eq!(summary, "Sync app settings");
+    }
+
+    #[test]
+    fn test_event_display_summary_accepts_primal_description_typo() {
+        let mut event = sample_event();
+        event.kind = 30078;
+        event.content = r#"{"desription":"Get Primal memebeship status"}"#.to_string();
+        let (_, summary) = event_display_summary(&event, 50);
+        assert_eq!(summary, "Get Primal memebeship status");
+    }
+
+    #[test]
+    fn test_event_display_summary_uses_json_subkey() {
+        let mut event = sample_event();
+        event.kind = 30078;
+        event.content = r#"{"subkey":"user-home-feeds"}"#.to_string();
+        let (_, summary) = event_display_summary(&event, 50);
+        assert_eq!(summary, "subkey: user-home-feeds");
+    }
+
+    #[test]
+    fn test_event_display_summary_truncates_utf8_safely() {
+        let mut event = sample_event();
+        event.content = "ééééé".to_string();
+        let (_, summary) = event_display_summary(&event, 3);
+        assert_eq!(summary, "ééé...");
     }
 
     #[test]

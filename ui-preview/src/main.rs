@@ -51,6 +51,28 @@ fn header<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, title: &str) {
     .ok();
 }
 
+/// Normal ready screen shown while the signer is idle.
+fn draw_ready<D: DrawTarget<Color = Rgb565>>(d: &mut D) {
+    let l = layout_of(d);
+    header(d, &l, "SIGNER READY");
+
+    let large = style(l.font_large(), FG);
+    let small = style(l.font_small(), FG);
+
+    let title = "Sapwood";
+    Text::new(title, Point::new(l.center_x(title.len() as i32 * Layout::glyph_w(l.font_large())), l.sy(34)), large)
+        .draw(d)
+        .ok();
+    let manage = "USB/WiFi setup";
+    Text::new(manage, Point::new(l.center_x(manage.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(48)), small)
+        .draw(d)
+        .ok();
+    let apps = "apps: bunker";
+    Text::new(apps, Point::new(l.center_x(apps.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(58)), small)
+        .draw(d)
+        .ok();
+}
+
 /// Idle identity screen: header, rule, npub wrapped across lines (mirrors
 /// `oled::show_npub`).
 fn draw_idle<D: DrawTarget<Color = Rgb565>>(d: &mut D, name: Option<&str>, npub: &str) {
@@ -171,9 +193,9 @@ fn draw_sign<D: DrawTarget<Color = Rgb565>>(
         .draw(d)
         .ok();
 
-    // How to approve: a 2-second HOLD, not a tap. Mirrors show_sign_request.
+    // How to approve: a 2-second HOLD signs, while a tap denies.
     let hint = style(l.font_small(), ACCENT);
-    let hold = "Hold the button to sign";
+    let hold = "Hold=sign tap=no";
     let hold = &hold[..hold.len().min(l.chars_per_line(l.font_small()))];
     Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(d).ok();
 
@@ -283,6 +305,7 @@ fn main() {
     let boards = [("heltec", 128u32, 64u32), ("tdisplay", 240, 135), ("c6", 172, 320)];
 
     for (b, w, h) in boards {
+        render(&format!("ready-{b}"), w, h, |d| draw_ready(d));
         render(&format!("idle-{b}"), w, h, |d| draw_idle(d, None, npub));
         render(&format!("idle-named-{b}"), w, h, |d| draw_idle(d, Some("TheCryptoDonkey"), npub));
         render(&format!("sign-{b}"), w, h, |d| {

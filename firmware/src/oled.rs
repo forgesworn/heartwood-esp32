@@ -685,13 +685,13 @@ pub fn show_restore_confirm(display: &mut Display<'_>, npub: &str, two_button: b
     }
 }
 
-/// Display "Awaiting secret..." with a structured idle screen.
+/// Display the normal ready/idle signer screen.
 ///
 /// Layout:
-///   Header:  "HEARTWOOD HSM" (FONT_6X10)
+///   Header:  "SIGNER READY" (FONT_6X10)
 ///   Rule:    1px line
-///   Centre:  "Awaiting" (FONT_10X20)
-///   Label:   "connect secret" (FONT_5X8)
+///   Centre:  "Sapwood" (FONT_10X20)
+///   Help:    management/signing hints (FONT_5X8)
 pub fn show_awaiting(display: &mut Display<'_>) {
     let l = layout(display);
     display.clear_buffer();
@@ -709,14 +709,21 @@ pub fn show_awaiting(display: &mut Display<'_>) {
         .text_color(FG)
         .build();
 
-    Text::new("HEARTWOOD HSM", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
+    Text::new("SIGNER READY", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    Text::new("Awaiting", Point::new(l.sx(14), l.sy(38)), large).draw(display).ok();
-    Text::new("connect secret", Point::new(l.sx(24), l.sy(52)), small).draw(display).ok();
+    let title = "Sapwood";
+    Text::new(title, Point::new(l.center_x(title.len() as i32 * Layout::glyph_w(l.font_large())), l.sy(34)), large)
+        .draw(display).ok();
+    let manage = "USB/WiFi setup";
+    Text::new(manage, Point::new(l.center_x(manage.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(48)), small)
+        .draw(display).ok();
+    let apps = "apps: bunker";
+    Text::new(apps, Point::new(l.center_x(apps.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(58)), small)
+        .draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -866,13 +873,12 @@ pub fn show_sign_request(
     };
     Text::new(&content, Point::new(l.sx(2), l.sy(35)), small).draw(display).ok();
 
-    // How to approve: a 2-second HOLD, not a tap. This is the one thing people
-    // miss — a quick press just releases early and lands on the DENIED screen.
+    // How to approve: a 2-second HOLD signs, while a tap denies.
     let hint = MonoTextStyleBuilder::new()
         .font(l.font_small())
         .text_color(ACCENT)
         .build();
-    let hold = "Hold the button to sign";
+    let hold = "Hold=sign tap=no";
     let hold = &hold[..hold.len().min(l.chars_per_line(l.font_small()))];
     Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(display).ok();
 
@@ -996,7 +1002,7 @@ pub fn show_boot(display: &mut Display<'_>, master_count: u8) {
         .text_color(FG)
         .build();
 
-    Text::new("HEARTWOOD HSM", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
+    Text::new("HEARTWOOD SIGNER", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
@@ -1012,7 +1018,7 @@ pub fn show_boot(display: &mut Display<'_>, master_count: u8) {
         .into_styled(PrimitiveStyle::with_fill(FG))
         .draw(display).ok();
 
-    Text::new("Awaiting bridge...", Point::new(l.sx(2), l.sy(60)), small).draw(display).ok();
+    Text::new("Sapwood USB ready", Point::new(l.sx(2), l.sy(60)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -1022,7 +1028,7 @@ pub fn show_boot(display: &mut Display<'_>, master_count: u8) {
 /// Display bridge connected status with structured layout.
 ///
 /// Layout:
-///   Header:  "BRIDGE CONNECTED" (FONT_6X10)
+///   Header:  "SAPWOOD ONLINE" (FONT_6X10)
 ///   Rule:    1px line
 ///   Stats:   master count (large) + client count
 pub fn show_bridge_connected(
@@ -1050,7 +1056,7 @@ pub fn show_bridge_connected(
         .text_color(FG)
         .build();
 
-    Text::new("BRIDGE CONNECTED", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Text::new("SAPWOOD ONLINE", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
@@ -1064,7 +1070,7 @@ pub fn show_bridge_connected(
     // Client count on right side
     let c_str = format!("{}", client_count);
     Text::new(&c_str, Point::new(l.sx(72), l.sy(38)), body).draw(display).ok();
-    Text::new("clients", Point::new(l.sx(88), l.sy(36)), small).draw(display).ok();
+    Text::new("apps", Point::new(l.sx(88), l.sy(36)), small).draw(display).ok();
 
     // Status indicator: solid bar at bottom
     Rectangle::new(Point::new(l.sx(0), l.sy(58)), Size::new(l.w as u32, l.s(6) as u32))
@@ -1138,12 +1144,12 @@ pub fn show_master_sign_request(
     };
     Text::new(&preview, Point::new(l.sx(2), l.sy(35)), small).draw(display).ok();
 
-    // How to approve: a 2-second HOLD, not a tap.
+    // How to approve: a 2-second HOLD signs, while a tap denies.
     let hint = MonoTextStyleBuilder::new()
         .font(l.font_small())
         .text_color(ACCENT)
         .build();
-    let hold = "Hold the button to sign";
+    let hold = "Hold=sign tap=no";
     let hold = &hold[..hold.len().min(l.chars_per_line(l.font_small()))];
     Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(display).ok();
 

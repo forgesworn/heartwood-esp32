@@ -425,7 +425,15 @@ pub fn run_wifi_standalone<'d, 'b>(
             ctx.display_on = true;
             ctx.last_activity = Instant::now();
         }
-        poll_usb(usb, &mut ctx, None);
+        // The WiFi driver is lent to USB only while no relay session is live —
+        // a scan mid-connection would knock the link off its channel, so a
+        // 0x55 during live service is declined (matches the old per-session
+        // loop, which lent the driver only in the between-sessions gaps).
+        if sessions.is_empty() {
+            poll_usb(usb, &mut ctx, Some(&mut wifi));
+        } else {
+            poll_usb(usb, &mut ctx, None);
+        }
 
         // Ensure the primary session (rotates over the configured set).
         if !sessions.iter().any(|s| !s.pinned) && Instant::now() >= primary_next {

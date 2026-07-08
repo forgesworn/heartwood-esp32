@@ -186,6 +186,12 @@ struct SignCtx<'a, 'd, 'b> {
     identity_name_ts: u64,
     sign_audit: Vec<SignAuditEntry>,
     sign_audit_seq: u64,
+    /// Recently-processed NIP-46 event ids. With more than one live relay
+    /// session, a client that publishes one request event to several relays
+    /// would otherwise be dispatched once per session — a double button
+    /// prompt, or a double execution of a non-idempotent method. Bounded ring;
+    /// management (24134) has its own persisted inner-id replay guard.
+    nip46_seen: Vec<String>,
 }
 
 /// Host out of a `wss://`/`ws://` relay URL (scheme, port and path stripped).
@@ -366,6 +372,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         identity_name_ts: 0,
         sign_audit: Vec::new(),
         sign_audit_seq: 0,
+        nip46_seen: Vec::new(),
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -1111,6 +1118,16 @@ fn process_event(
             }
         }
     } else {
+        // Dedupe across sessions: one request published to several relays must
+        // dispatch once, not once per session (see SignCtx::nip46_seen).
+        if ctx.nip46_seen.iter().any(|id| id == &ev.id) {
+            log::debug!("[relay] duplicate NIP-46 event {}…; ignoring", &ev.id[..ev.id.len().min(12)]);
+            return Ok(());
+        }
+        if ctx.nip46_seen.len() >= SEEN_MAX {
+            ctx.nip46_seen.remove(0);
+        }
+        ctx.nip46_seen.push(ev.id.clone());
         handle_nip46_event(&mut s.tls, ev, ctx, &target_pk)
     }
 }

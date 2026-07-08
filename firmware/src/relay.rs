@@ -196,6 +196,10 @@ struct SignCtx<'a, 'd, 'b> {
     /// prompt, or a double execution of a non-idempotent method. Bounded ring;
     /// management (24134) has its own persisted inner-id replay guard.
     nip46_seen: Vec<String>,
+    /// Last failed nostrconnect dial (url, when): throttles operator-driven
+    /// re-dials of a dead relay, which the pinned backoff cannot cover (no
+    /// PinnedRelay exists until a dial succeeds).
+    dial_cooldown: Option<(String, Instant)>,
 }
 
 /// Host out of a `wss://`/`ws://` relay URL (scheme, port and path stripped).
@@ -380,6 +384,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         sign_audit: Vec::new(),
         sign_audit_seq: 0,
         nip46_seen: Vec::new(),
+        dial_cooldown: None,
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -1669,7 +1674,21 @@ fn dispatch_mgmt(
                     return Err("relay_capacity: signer already serves its maximum relays".into());
                 }
                 if pool.pinned.len() >= MAX_SESSIONS - 1 {
+                    // NOTE: with MAX_SESSIONS == 2 this also guarantees a dial
+                    // only ever happens with an EMPTY pinned list — which is
+                    // what makes rebind-plus-dial unable to create a second
+                    // PinnedRelay for the same slot. If MAX_SESSIONS grows,
+                    // dedupe pool.pinned by (ms, si) here.
                     return Err("relay_capacity: a pinned relay is already configured".into());
+                }
+                // Operator-driven retries against a dead relay would otherwise
+                // re-run the ~10s blocking dial back to back: the exponential
+                // backoff only throttles the automatic reconnect loop, which
+                // has no state until a pin actually lands.
+                if let Some((u, t)) = &ctx.dial_cooldown {
+                    if same_relay(u, url) && t.elapsed() < PINNED_BACKOFF {
+                        return Err("relay_dial_failed: a dial to this relay just failed; retry shortly".into());
+                    }
                 }
                 // A session without a recv timeout blocks the loop on quiet
                 // reads; a second socket would multiply that stall, so refuse
@@ -1686,6 +1705,17 @@ fn dispatch_mgmt(
                 .policy_engine
                 .find_slot_by_pubkey(master_slot, client_hex)
                 .map(|slot| slot.slot_index);
+
+            // Snapshot the pre-rebind slot state: an ACK failure must restore
+            // it, or a failed re-pair would silently keep this attempt's
+            // label, kind and signing changes on a live pairing.
+            let prior = existing_index.and_then(|i| {
+                ctx.policy_engine
+                    .list_slots(master_slot)
+                    .iter()
+                    .find(|sl| sl.slot_index == i)
+                    .map(|sl| (sl.label.clone(), sl.allowed_kinds.clone(), sl.signing_approved))
+            });
 
             // Capacity check BEFORE the expensive dial, so a full table cannot
             // waste a complete TLS + WS handshake.
@@ -1720,7 +1750,16 @@ fn dispatch_mgmt(
             if let AckTarget::Dial(url) = &ack_target {
                 let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
                 log::info!("[relay] nostrconnect: dialling client relay {url} (free heap {heap})");
-                dialled = Some(connect_relay(url, true, ctx)?);
+                dialled = Some(match connect_relay(url, true, ctx) {
+                    Ok(ns) => {
+                        ctx.dial_cooldown = None;
+                        ns
+                    }
+                    Err(e) => {
+                        ctx.dial_cooldown = Some((url.clone(), Instant::now()));
+                        return Err(e);
+                    }
+                });
                 let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
                 log::info!("[relay] nostrconnect: dial ok (free heap {heap})");
             }
@@ -1775,12 +1814,28 @@ fn dispatch_mgmt(
             };
             if let Err(e) = sign_and_publish(ack_tls, ctx.secp, &master_secret, &ck, client_hex, NIP46_KIND, created_at, &ack) {
                 // The client never saw its secret, so pairing failed from its
-                // side. Roll back a newly minted slot; a rebind of a
-                // pre-existing slot stands (that pairing was already live).
+                // side. Roll back this attempt's mutations: revoke a newly
+                // minted slot, or restore a rebound slot's prior label, kinds
+                // and signing approval (the slot itself stays — that pairing
+                // was already live before this attempt touched it).
                 if created {
                     ctx.policy_engine.revoke_slot(master_slot, index);
-                    ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+                } else if let Some((label0, kinds0, signing0)) = prior {
+                    // update_slot cannot lower signing_approved (by design),
+                    // so restore the fields directly and mark dirty.
+                    if let Some(sl) = ctx
+                        .policy_engine
+                        .slots_mut(master_slot)
+                        .iter_mut()
+                        .find(|sl| sl.slot_index == index)
+                    {
+                        sl.label = label0;
+                        sl.allowed_kinds = kinds0;
+                        sl.signing_approved = signing0;
+                    }
+                    ctx.policy_engine.slots_dirty = true;
                 }
+                ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
                 return Err(e);
             }
 

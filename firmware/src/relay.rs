@@ -121,9 +121,13 @@ const SIGN_AUDIT_MAX: usize = 32;
 const MAX_SESSIONS: usize = 2;
 /// Backoff between reconnect attempts for the primary session (as before).
 const PRIMARY_BACKOFF: Duration = Duration::from_secs(3);
-/// Backoff for pinned relays — slower: a dead client relay must never steal
-/// meaningful airtime from the primary.
+/// Base backoff for pinned relays — slower than the primary, and doubling per
+/// consecutive failure up to PINNED_BACKOFF_MAX: each failed dial blocks the
+/// loop for up to the 10s TLS timeout, so a dead client relay must decay to a
+/// rare probe rather than a 40% duty-cycle drain.
 const PINNED_BACKOFF: Duration = Duration::from_secs(15);
+/// Ceiling for the pinned-relay exponential backoff (10 minutes).
+const PINNED_BACKOFF_MAX: Duration = Duration::from_secs(600);
 /// NVS key the pinned-relay list is persisted under (JSON array).
 const PINNED_NVS_KEY: &str = "pinned_rly";
 
@@ -237,6 +241,9 @@ struct PinnedRelay {
     /// Not persisted: next reconnect attempt.
     #[serde(skip, default = "Instant::now")]
     next_attempt: Instant,
+    /// Not persisted: consecutive dial failures, drives the exponential backoff.
+    #[serde(skip)]
+    fails: u32,
 }
 
 /// The relay sessions OTHER than the one currently being pumped, plus the
@@ -468,9 +475,12 @@ pub fn run_wifi_standalone<'d, 'b>(
         }
 
         // Ensure pinned sessions, capacity and backoff permitting. A pinned
-        // dial failing never advances the primary rotation.
+        // dial failing never advances the primary rotation, and no pinned dial
+        // happens while any live session runs degraded (a blocking-read
+        // session already stalls the loop; more sockets multiply the stall).
+        let any_degraded = sessions.iter().any(|se| !se.recv_timeout_on);
         for p in pinned.iter_mut() {
-            if sessions.len() >= MAX_SESSIONS {
+            if sessions.len() >= MAX_SESSIONS || any_degraded {
                 break;
             }
             if sessions.iter().any(|s| same_relay(&s.url, &p.url)) || Instant::now() < p.next_attempt
@@ -480,12 +490,16 @@ pub fn run_wifi_standalone<'d, 'b>(
             match connect_relay(&p.url, true, &mut ctx) {
                 Ok(s) => {
                     log::info!("[relay] pinned relay joined: {}", p.url);
+                    p.fails = 0;
                     sessions.push(s);
                     retune_recv_timeouts(&mut sessions);
                 }
                 Err(e) => {
-                    log::warn!("[relay] pinned {}: {e}; retry in {}s", p.url, PINNED_BACKOFF.as_secs());
-                    p.next_attempt = Instant::now() + PINNED_BACKOFF;
+                    p.fails = p.fails.saturating_add(1);
+                    let delay =
+                        (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
+                    log::warn!("[relay] pinned {}: {e}; retry in {}s", p.url, delay.as_secs());
+                    p.next_attempt = Instant::now() + delay;
                 }
             }
         }
@@ -514,7 +528,12 @@ pub fn run_wifi_standalone<'d, 'b>(
                     if s.pinned {
                         log::warn!("[relay] pinned {} dropped: {e}", s.url);
                         if let Some(p) = pinned.iter_mut().find(|p| same_relay(&p.url, &s.url)) {
-                            p.next_attempt = Instant::now() + PINNED_BACKOFF;
+                            // A connect succeeded (fails reset then), so this
+                            // counts one failure: flaky relays settle at ~30s.
+                            p.fails = p.fails.saturating_add(1);
+                            let delay =
+                                (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
+                            p.next_attempt = Instant::now() + delay;
                         }
                     } else {
                         log::error!("[relay] {e}; failing over in 3s");
@@ -1652,6 +1671,29 @@ fn dispatch_mgmt(
                 if pool.pinned.len() >= MAX_SESSIONS - 1 {
                     return Err("relay_capacity: a pinned relay is already configured".into());
                 }
+                // A session without a recv timeout blocks the loop on quiet
+                // reads; a second socket would multiply that stall, so refuse
+                // to grow the pool while any live session runs degraded.
+                if !s.recv_timeout_on || pool.others.iter().any(|o| !o.recv_timeout_on) {
+                    return Err("relay_dial_failed: signer relay link is degraded (no recv timeout)".into());
+                }
+            }
+
+            // Re-pairing dedupe: a client retrying with the same keypair (or
+            // pairing again after a reinstall) rebinds its existing slot rather
+            // than minting a duplicate — retries must not fill the slot table.
+            let existing_index = ctx
+                .policy_engine
+                .find_slot_by_pubkey(master_slot, client_hex)
+                .map(|slot| slot.slot_index);
+
+            // Capacity check BEFORE the expensive dial, so a full table cannot
+            // waste a complete TLS + WS handshake.
+            if existing_index.is_none()
+                && ctx.policy_engine.list_slots(master_slot).len()
+                    >= heartwood_common::policy::MAX_CONNECT_SLOTS as usize
+            {
+                return Err("create_slot failed (slot table full)".into());
             }
 
             // Copy the master secret up front (it is Copy) so publishing the ACK
@@ -1671,21 +1713,44 @@ fn dispatch_mgmt(
             secret_bytes.iter_mut().for_each(|b| *b = 0);
 
             // Dial the app's relay first (when needed): the expensive, fallible
-            // step. Only a successful dial mutates any state.
+            // step. Only a successful dial mutates any state. Free-heap logging
+            // brackets the dial while the two-session model beds in on the
+            // no-PSRAM boards.
             let mut dialled: Option<RelaySession> = None;
             if let AckTarget::Dial(url) = &ack_target {
-                log::info!("[relay] nostrconnect: dialling client relay {url}");
+                let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+                log::info!("[relay] nostrconnect: dialling client relay {url} (free heap {heap})");
                 dialled = Some(connect_relay(url, true, ctx)?);
+                let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+                log::info!("[relay] nostrconnect: dial ok (free heap {heap})");
             }
 
-            let index = ctx
-                .policy_engine
-                .create_slot(master_slot, label.clone(), slot_secret)
-                .ok_or("create_slot failed (slot table full?)")?;
-            ctx.policy_engine.assign_pubkey_to_slot(master_slot, index, client_hex.to_string());
-            if !allowed_kinds.is_empty() {
-                ctx.policy_engine.update_slot(master_slot, index, None, None, Some(allowed_kinds), None);
-            }
+            let (index, created) = match existing_index {
+                Some(i) => {
+                    // Rebind: refresh the label and kind limits in place.
+                    ctx.policy_engine.update_slot(
+                        master_slot,
+                        i,
+                        Some(label.clone()),
+                        None,
+                        if allowed_kinds.is_empty() { None } else { Some(allowed_kinds) },
+                        None,
+                    );
+                    log::info!("[relay] nostrconnect: rebinding existing slot {i}");
+                    (i, false)
+                }
+                None => {
+                    let i = ctx
+                        .policy_engine
+                        .create_slot(master_slot, label.clone(), slot_secret)
+                        .ok_or("create_slot failed (slot table full?)")?;
+                    ctx.policy_engine.assign_pubkey_to_slot(master_slot, i, client_hex.to_string());
+                    if !allowed_kinds.is_empty() {
+                        ctx.policy_engine.update_slot(master_slot, i, None, None, Some(allowed_kinds), None);
+                    }
+                    (i, true)
+                }
+            };
             if auto_sign {
                 ctx.policy_engine.upgrade_to_signing(master_slot, index);
             }
@@ -1708,19 +1773,41 @@ fn dispatch_mgmt(
                 (_, Some(ns)) => &mut ns.tls,
                 _ => &mut s.tls,
             };
-            sign_and_publish(ack_tls, ctx.secp, &master_secret, &ck, client_hex, NIP46_KIND, created_at, &ack)?;
+            if let Err(e) = sign_and_publish(ack_tls, ctx.secp, &master_secret, &ck, client_hex, NIP46_KIND, created_at, &ack) {
+                // The client never saw its secret, so pairing failed from its
+                // side. Roll back a newly minted slot; a rebind of a
+                // pre-existing slot stands (that pairing was already live).
+                if created {
+                    ctx.policy_engine.revoke_slot(master_slot, index);
+                    ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+                }
+                return Err(e);
+            }
 
             // Adopt the dialled session and persist the pin only after the ACK
-            // made it out — a dead dial is fully rolled back by the `?` above.
+            // made it out — a dead dial is fully rolled back above.
             if let Some(ns) = dialled {
                 pool.pinned.push(PinnedRelay {
                     url: ns.url.clone(),
                     ms: master_slot,
                     si: index,
                     next_attempt: Instant::now(),
+                    fails: 0,
                 });
                 save_pinned(ctx.nvs, pool.pinned);
                 pool.others.push(ns);
+                // Split the recv timeout across the grown session set. The
+                // arriving session is not in `others`, hence the +1 and the
+                // separate call on `s`.
+                let n = (pool.others.len() + 1) as i64;
+                for o in pool.others.iter_mut() {
+                    if o.recv_timeout_on {
+                        let _ = set_recv_timeout(&mut o.tls, RECV_TIMEOUT_MS / n);
+                    }
+                }
+                if s.recv_timeout_on {
+                    let _ = set_recv_timeout(&mut s.tls, RECV_TIMEOUT_MS / n);
+                }
             }
 
             log::info!(

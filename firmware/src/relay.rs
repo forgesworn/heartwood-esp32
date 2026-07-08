@@ -114,6 +114,18 @@ const DISPLAY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Recent NIP-46 activity exposed to Sapwood over authenticated management.
 /// Entries are summaries only: no secrets, no encrypted payloads or plaintexts.
 const SIGN_AUDIT_MAX: usize = 32;
+/// Ceiling on simultaneous relay sessions: the primary (rotating over the
+/// configured set) plus pinned relays joined at nostrconnect pairing. Each
+/// mbedTLS session costs ~40-50KB of heap; PSRAM is off and one build profile
+/// must hold on the weakest board, so two is the safe ceiling.
+const MAX_SESSIONS: usize = 2;
+/// Backoff between reconnect attempts for the primary session (as before).
+const PRIMARY_BACKOFF: Duration = Duration::from_secs(3);
+/// Backoff for pinned relays — slower: a dead client relay must never steal
+/// meaningful airtime from the primary.
+const PINNED_BACKOFF: Duration = Duration::from_secs(15);
+/// NVS key the pinned-relay list is persisted under (JSON array).
+const PINNED_NVS_KEY: &str = "pinned_rly";
 
 struct SignAuditEntry {
     seq: u64,
@@ -181,6 +193,94 @@ fn relay_host(url: &str) -> &str {
     let h = url.trim_start_matches("wss://").trim_start_matches("ws://");
     let h = h.split('/').next().unwrap_or(h);
     h.split(':').next().unwrap_or(h)
+}
+
+/// Two relay URLs naming the same endpoint, ignoring scheme case and a
+/// trailing slash. Used to decide whether a client's relay is already served.
+fn same_relay(a: &str, b: &str) -> bool {
+    let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
+    norm(a) == norm(b)
+}
+
+/// One live relay connection: TLS + WS + subscription plus its keepalive
+/// bookkeeping. The primary session rotates over the configured relay set on
+/// failure; a pinned session is bound to one URL joined at nostrconnect
+/// pairing and reconnects only to that URL.
+struct RelaySession {
+    tls: Tls,
+    url: String,
+    rx: Vec<u8>,
+    last_rx: Instant,
+    last_ping: Instant,
+    last_resub: Instant,
+    recv_timeout_on: bool,
+    /// The subscription REQ sent at connect, re-sent periodically to self-heal.
+    sub_req: String,
+    pinned: bool,
+}
+
+/// A relay joined at nostrconnect pairing because the client dictated it.
+/// Persisted to NVS so the pairing survives reboot; pruned when the slot that
+/// created it is revoked.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PinnedRelay {
+    url: String,
+    /// Master slot and client slot the pairing created, for revoke-time pruning.
+    ms: u8,
+    si: u8,
+    /// Not persisted: next reconnect attempt.
+    #[serde(skip, default = "Instant::now")]
+    next_attempt: Instant,
+}
+
+/// The relay sessions OTHER than the one currently being pumped, plus the
+/// pinned-relay bookkeeping. The main loop split-borrows: it takes the active
+/// session out of the vec, so a management command (nostrconnect dial-out)
+/// can add or address sessions without aliasing the one it arrived on.
+struct RelayPool<'p> {
+    others: &'p mut Vec<RelaySession>,
+    pinned: &'p mut Vec<PinnedRelay>,
+}
+
+/// Load the persisted pinned-relay list. Absent/corrupt ⇒ empty.
+fn load_pinned(nvs: &mut EspNvs<NvsDefault>) -> Vec<PinnedRelay> {
+    let mut buf = [0u8; 512];
+    match nvs.get_blob(PINNED_NVS_KEY, &mut buf) {
+        Ok(Some(data)) => serde_json::from_slice(data).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Persist the pinned-relay list (bounded by MAX_SESSIONS - 1 in practice).
+fn save_pinned(nvs: &mut EspNvs<NvsDefault>, pinned: &[PinnedRelay]) {
+    match serde_json::to_vec(pinned) {
+        Ok(json) => {
+            if let Err(e) = nvs.set_blob(PINNED_NVS_KEY, &json) {
+                log::error!("[relay] persist pinned relays: {e:?}");
+            }
+        }
+        Err(e) => log::error!("[relay] serialise pinned relays: {e}"),
+    }
+}
+
+/// Drop pinned relays whose creating slot no longer exists (revoked), and any
+/// duplicates of a configured relay (nothing to pin if the primary set covers
+/// it). Returns true when the list changed.
+fn prune_pinned(
+    pinned: &mut Vec<PinnedRelay>,
+    policy_engine: &PolicyEngine,
+    cfg_relays: &[String],
+) -> bool {
+    let before = pinned.len();
+    pinned.retain(|p| {
+        let slot_alive = policy_engine
+            .list_slots(p.ms)
+            .iter()
+            .any(|s| s.slot_index == p.si);
+        let already_configured = cfg_relays.iter().any(|r| same_relay(r, &p.url));
+        slot_alive && !already_configured
+    });
+    pinned.len() != before
 }
 
 /// Bring up wifi and serve the relay forever. Never returns.
@@ -268,20 +368,43 @@ pub fn run_wifi_standalone<'d, 'b>(
         sign_audit_seq: 0,
     };
 
+    // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
+    // entries whose creating slot has since been revoked over USB.
+    let mut pinned = load_pinned(ctx.nvs);
+    if prune_pinned(&mut pinned, ctx.policy_engine, &relays) {
+        save_pinned(ctx.nvs, &pinned);
+    }
+    if !pinned.is_empty() {
+        log::info!("[relay] restored {} pinned relay(s) from NVS", pinned.len());
+    }
+
+    // Live sessions: at most MAX_SESSIONS — one primary rotating over the
+    // configured set, the rest pinned. The vec is split-borrowed each pump so
+    // management commands can dial new sessions (see RelayPool).
+    let mut sessions: Vec<RelaySession> = Vec::new();
+    let mut primary_next = Instant::now();
+
     loop {
-        if let Err(e) = wifi.connect().and_then(|_| wifi.wait_netif_up()) {
-            // Keep serving USB while wifi is unreachable, so a bad SSID/password
-            // (or relay) can always be fixed over the cable — this is why the
-            // old "hold PRG at boot for USB" escape hatch is no longer needed.
-            log::error!("[relay] wifi connect failed: {e:?}; serving USB, retry in 3s");
-            let until = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < until {
-                poll_usb(usb, &mut ctx, Some(&mut wifi));
-                FreeRtos::delay_ms(20);
+        // WiFi first: every session rides on it. `is_up` is cheap; a down link
+        // drops all sessions (their sockets are dead anyway) and reconnects.
+        if !wifi.is_up().unwrap_or(false) {
+            if !sessions.is_empty() {
+                log::warn!("[relay] wifi down; dropping {} live session(s)", sessions.len());
+                sessions.clear();
             }
-            continue;
+            if let Err(e) = wifi.connect().and_then(|_| wifi.wait_netif_up()) {
+                // Keep serving USB while wifi is unreachable, so a bad SSID or
+                // password can always be fixed over the cable.
+                log::error!("[relay] wifi connect failed: {e:?}; serving USB, retry in 3s");
+                let until = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < until {
+                    poll_usb(usb, &mut ctx, Some(&mut wifi));
+                    FreeRtos::delay_ms(20);
+                }
+                continue;
+            }
+            log::info!("[relay] wifi up");
         }
-        log::info!("[relay] wifi up");
 
         if relays.is_empty() {
             log::error!("[relay] no relay configured");
@@ -295,39 +418,172 @@ pub fn run_wifi_standalone<'d, 'b>(
             continue;
         }
 
-        let relay_url = relays[relay_idx % relays.len()].clone();
-        let host = relay_host(&relay_url).to_string();
-        ctx.relay_url = relay_url;
-        if relays.len() > 1 {
-            log::info!(
-                "[relay] serving via {host} (relay {} of {})",
-                relay_idx % relays.len() + 1,
-                relays.len()
-            );
+        // Wake the panel promptly on a BOOT-button press, and serve USB, once
+        // per pass regardless of how many sessions are live or connecting.
+        if !ctx.display_on && ctx.button_pin.is_low() {
+            crate::oled::wake_display(ctx.display);
+            ctx.display_on = true;
+            ctx.last_activity = Instant::now();
+        }
+        poll_usb(usb, &mut ctx, None);
+
+        // Ensure the primary session (rotates over the configured set).
+        if !sessions.iter().any(|s| !s.pinned) && Instant::now() >= primary_next {
+            let url = relays[relay_idx % relays.len()].clone();
+            let host = relay_host(&url).to_string();
+            if relays.len() > 1 {
+                log::info!(
+                    "[relay] serving via {host} (relay {} of {})",
+                    relay_idx % relays.len() + 1,
+                    relays.len()
+                );
+            }
+            match connect_relay(&url, false, &mut ctx) {
+                Ok(s) => {
+                    ctx.relay_url = url;
+                    sessions.push(s);
+                    retune_recv_timeouts(&mut sessions);
+                }
+                Err(e) => {
+                    log::error!("[relay] {e}; failing over in 3s");
+                    relay_idx = relay_idx.wrapping_add(1);
+                    primary_next = Instant::now() + PRIMARY_BACKOFF;
+                }
+            }
         }
 
-        match serve_relay(&host, &mut ctx, usb) {
-            Ok(()) => log::info!("[relay] connection closed; failing over"),
-            Err(e) => log::error!("[relay] {e}; failing over in 3s"),
+        // Ensure pinned sessions, capacity and backoff permitting. A pinned
+        // dial failing never advances the primary rotation.
+        for p in pinned.iter_mut() {
+            if sessions.len() >= MAX_SESSIONS {
+                break;
+            }
+            if sessions.iter().any(|s| same_relay(&s.url, &p.url)) || Instant::now() < p.next_attempt
+            {
+                continue;
+            }
+            match connect_relay(&p.url, true, &mut ctx) {
+                Ok(s) => {
+                    log::info!("[relay] pinned relay joined: {}", p.url);
+                    sessions.push(s);
+                    retune_recv_timeouts(&mut sessions);
+                }
+                Err(e) => {
+                    log::warn!("[relay] pinned {}: {e}; retry in {}s", p.url, PINNED_BACKOFF.as_secs());
+                    p.next_attempt = Instant::now() + PINNED_BACKOFF;
+                }
+            }
         }
-        // Advance to the next relay so a dead/quiet one is not retried forever.
-        // Keep draining USB during the back-off: these gaps used to be dead
-        // air on the cable, and a frame arriving then was lost to ring
-        // overflow before the next session's first poll.
-        relay_idx = relay_idx.wrapping_add(1);
-        let until = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < until {
-            poll_usb(usb, &mut ctx, Some(&mut wifi));
+
+        if sessions.is_empty() {
+            // Nothing live and nothing dialled this pass — don't busy-spin.
             FreeRtos::delay_ms(20);
+            continue;
+        }
+
+        // Pump each session: split-borrow the active one out so management
+        // commands arriving on it can dial/address the others.
+        let mut i = 0;
+        while i < sessions.len() {
+            let mut s = sessions.swap_remove(i);
+            let step = {
+                let mut pool = RelayPool { others: &mut sessions, pinned: &mut pinned };
+                session_step(&mut s, &mut ctx, &mut pool)
+            };
+            match step {
+                Ok(()) => {
+                    sessions.insert(i.min(sessions.len()), s);
+                    i += 1;
+                }
+                Err(e) => {
+                    if s.pinned {
+                        log::warn!("[relay] pinned {} dropped: {e}", s.url);
+                        if let Some(p) = pinned.iter_mut().find(|p| same_relay(&p.url, &s.url)) {
+                            p.next_attempt = Instant::now() + PINNED_BACKOFF;
+                        }
+                    } else {
+                        log::error!("[relay] {e}; failing over in 3s");
+                        relay_idx = relay_idx.wrapping_add(1);
+                        primary_next = Instant::now() + PRIMARY_BACKOFF;
+                    }
+                    retune_recv_timeouts(&mut sessions);
+                    // `s` dropped here; do not advance `i` — swap_remove moved
+                    // a new candidate into this position.
+                }
+            }
+        }
+
+        // A revoke (relay or USB) may have orphaned a pinned relay: prune the
+        // list when its creating slot is gone, and close any session whose pin
+        // was dropped. Cheap (slots × pinned, pinned ≤ 1) so it runs each pass.
+        if prune_pinned(&mut pinned, ctx.policy_engine, &relays) {
+            save_pinned(ctx.nvs, &pinned);
+        }
+        let before = sessions.len();
+        sessions.retain(|se| !se.pinned || pinned.iter().any(|p| same_relay(&p.url, &se.url)));
+        if sessions.len() != before {
+            log::info!("[relay] closed pinned session(s) after revoke");
+            retune_recv_timeouts(&mut sessions);
+        }
+
+        // Burn-in protection is global, not per-session: blank the OLED after
+        // inactivity; a PRG press (top of loop) or a request wakes it.
+        let now = Instant::now();
+        if ctx.display_on && now.duration_since(ctx.last_activity) >= DISPLAY_TIMEOUT {
+            crate::oled::sleep_display(ctx.display);
+            ctx.display_on = false;
         }
     }
 }
 
-/// One relay session: TLS → WS handshake → subscribe → read/dispatch loop.
-fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Result<(), String> {
+/// Split `RECV_TIMEOUT_MS` across live sessions so one pass of the pump loop
+/// still wakes about once a second for USB and keepalive work, no matter how
+/// many sockets are quiet.
+fn retune_recv_timeouts(sessions: &mut [RelaySession]) {
+    let n = sessions.len().max(1) as i64;
+    for s in sessions.iter_mut() {
+        if s.recv_timeout_on {
+            if let Err(e) = set_recv_timeout(&mut s.tls, RECV_TIMEOUT_MS / n) {
+                log::warn!("[relay] recv-timeout retune failed on {}: {e}", s.url);
+            }
+        }
+    }
+}
+
+/// The subscription REQ for one session. NIP-46 (24133) is addressable to any
+/// served identity — each master AND every derived persona — so a persona's
+/// bunker URI reaches the device exactly as it does on the USB path.
+/// Management (24134), when an operator is configured, stays master-only: the
+/// master pubkey is the v1 management address; personas are signing-only. Two
+/// filters keep that boundary explicit. limit:0 → no stored replay, live
+/// stream only. A third filter fetches our own masters' kind-0 profiles (by
+/// author, limit:1 → the stored replaceable event) for the idle screen name.
+fn build_sub_req(ctx: &SignCtx) -> String {
+    let quoted = |pk: &[u8; 32]| format!("\"{}\"", hex_encode(pk));
+    let master_p = ctx.masters.iter().map(|m| quoted(&m.pubkey)).collect::<Vec<_>>();
+    let master_p_list = master_p.join(",");
+    let mut nip46_p = master_p.clone();
+    nip46_p.extend(ctx.personas.iter().map(|p| quoted(&p.pubkey)));
+    let nip46_p_list = nip46_p.join(",");
+    let profile_filter =
+        format!(r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":1}}"##);
+    if ctx.op_mgmt.is_some() {
+        format!(
+            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{{"kinds":[{MGMT_KIND}],"#p":[{master_p_list}],"limit":0}},{profile_filter}]"##
+        )
+    } else {
+        format!(
+            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{profile_filter}]"##
+        )
+    }
+}
+
+/// Open one relay session: TLS → WS handshake → recv timeout → subscribe.
+fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySession, String> {
+    let host = relay_host(url).to_string();
     let mut tls = EspTls::new().map_err(|e| format!("tls init: {e:?}"))?;
     let mut tls_cfg = TlsConfig::new();
-    tls_cfg.common_name = Some(host);
+    tls_cfg.common_name = Some(&host);
     tls_cfg.timeout_ms = 10_000;
     // TCP keepalive: probe an idle link so a dead peer/NAT mapping tears the
     // socket down (~25s) instead of blocking `read` forever. Probe ACKs are
@@ -340,18 +596,20 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
         count: 3,
     });
     // Config::new() defaults use_crt_bundle_attach = true → Mozilla CA bundle.
-    tls.connect(host, TLS_PORT, &tls_cfg)
+    tls.connect(&host, TLS_PORT, &tls_cfg)
         .map_err(|e| format!("tls connect {host}: {e:?}"))?;
     log::info!("[relay] TLS connected to {host}:{TLS_PORT}");
 
-    ws_handshake(&mut tls, host)?;
-    log::info!("[relay] websocket open");
+    ws_handshake(&mut tls, &host)?;
+    log::info!("[relay] websocket open ({url})");
 
     // From here on, reads are paced by a recv timeout (handshake above was
-    // blocking) so the loop wakes every RECV_TIMEOUT_MS to ping / check silence.
-    // If this fails we degrade to blocking reads (still functional for single
+    // blocking) so the pump wakes periodically to ping / check silence. If
+    // this fails we degrade to blocking reads (still functional for single
     // round-trips, just without the WS-ping/silence layer) rather than tearing
     // the session down — TCP keepalive still guards against a dead socket.
+    // Note: a session without the timeout would starve its peers, so a pinned
+    // dial refuses to run degraded (checked at the dial site).
     let recv_timeout_on = match set_recv_timeout(&mut tls, RECV_TIMEOUT_MS) {
         Ok(()) => true,
         Err(e) => {
@@ -359,127 +617,86 @@ fn serve_relay(host: &str, ctx: &mut SignCtx, usb: &mut SerialPort<'_>) -> Resul
             false
         }
     };
+    if pinned && !recv_timeout_on {
+        return Err("pinned relay needs a recv timeout (would starve the primary)".into());
+    }
 
-    // Subscribe. NIP-46 (24133) is addressable to any served identity — each
-    // master AND every derived persona — so a persona's bunker URI reaches the
-    // device exactly as it does on the USB path. Management (24134), when an
-    // operator is configured, stays master-only: the master pubkey is the v1
-    // management address; personas are signing-only. Two filters keep that
-    // boundary explicit. limit:0 → no stored replay, live stream only.
-    let quoted = |pk: &[u8; 32]| format!("\"{}\"", hex_encode(pk));
-    let master_p = ctx.masters.iter().map(|m| quoted(&m.pubkey)).collect::<Vec<_>>();
-    let master_p_list = master_p.join(",");
-    let mut nip46_p = master_p.clone();
-    nip46_p.extend(ctx.personas.iter().map(|p| quoted(&p.pubkey)));
-    let nip46_p_list = nip46_p.join(",");
-
-    // A third filter fetches our own masters' kind-0 profiles (by author, not #p)
-    // so the idle screen can show a human name. limit:1 pulls the stored
-    // (replaceable) profile, not just live updates like the request filters.
-    let profile_filter =
-        format!(r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":1}}"##);
-
-    let req = if ctx.op_mgmt.is_some() {
-        format!(
-            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{{"kinds":[{MGMT_KIND}],"#p":[{master_p_list}],"limit":0}},{profile_filter}]"##
-        )
-    } else {
-        format!(
-            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{profile_filter}]"##
-        )
-    };
-    ws_send(&mut tls, OP_TEXT, req.as_bytes())?;
+    let sub_req = build_sub_req(ctx);
+    ws_send(&mut tls, OP_TEXT, sub_req.as_bytes())?;
     log::info!(
-        "[relay] subscribed: {} master(s) + {} persona(s), mgmt={}",
+        "[relay] subscribed on {url}: {} master(s) + {} persona(s), mgmt={}",
         ctx.masters.len(),
         ctx.personas.len(),
         if ctx.op_mgmt.is_some() { "on" } else { "off" }
     );
 
-    let mut rx: Vec<u8> = Vec::with_capacity(READ_BUF);
-    let mut last_rx = Instant::now();
-    let mut last_ping = Instant::now();
-    let mut last_resub = Instant::now();
-    loop {
-        // Wake the panel promptly on a BOOT-button press, regardless of relay
-        // traffic. The idle-tick wake further down only runs between reads, so a
-        // burst of frames (or the frame-drain `continue`) could starve it and
-        // leave a blanked screen stuck dark. This top-of-loop check runs every
-        // iteration and refreshes last_activity so the panel stays on in use.
-        if !ctx.display_on && ctx.button_pin.is_low() {
-            crate::oled::wake_display(ctx.display);
-            ctx.display_on = true;
-            ctx.last_activity = Instant::now();
+    let now = Instant::now();
+    Ok(RelaySession {
+        tls,
+        url: url.to_string(),
+        rx: Vec::with_capacity(READ_BUF),
+        last_rx: now,
+        last_ping: now,
+        last_resub: now,
+        recv_timeout_on,
+        sub_req,
+        pinned,
+    })
+}
+
+/// One pump pass over a session: drain buffered frames, one read, idle tick.
+/// An `Err` means the session is dead and should be dropped; per-request
+/// errors are handled (and swallowed) further down the dispatch chain.
+fn session_step(s: &mut RelaySession, ctx: &mut SignCtx, pool: &mut RelayPool) -> Result<(), String> {
+    // Process at most ONE buffered frame per step, so the outer loop serves
+    // USB between frames — same cadence the single-session loop kept (a burst
+    // of frames must never starve the cable).
+    if let Some(msg) = try_parse(&mut s.rx)? {
+        match msg {
+            WsMsg::Text(p) => handle_relay_msg(s, &p, ctx, pool)?,
+            WsMsg::Ping(p) => ws_send(&mut s.tls, OP_PONG, &p)?,
+            WsMsg::Close => return Err("relay sent close".into()),
+            WsMsg::Pong | WsMsg::Other => {}
         }
-
-        // Serve USB every iteration, BEFORE the frame-drain/pump `continue`s
-        // below. It used to sit at the bottom of the loop, reached only when
-        // the relay went quiet for a full RECV_TIMEOUT_MS — so relay traffic
-        // starved the cable, and the head of a large USB frame could sit
-        // undrained long enough to overflow the 4KB UART ring. Non-blocking:
-        // a quiet poll returns immediately. `None`: no WiFi driver is lent while
-        // a relay connection is live — a scan here would knock the link off its
-        // channel, so a 0x55 mid-connection is declined rather than served.
-        poll_usb(usb, ctx, None);
-
-        // Drain every complete frame already buffered before reading more.
-        if let Some(msg) = try_parse(&mut rx)? {
-            match msg {
-                WsMsg::Text(p) => handle_relay_msg(&mut tls, &p, ctx)?,
-                WsMsg::Ping(p) => ws_send(&mut tls, OP_PONG, &p)?,
-                WsMsg::Close => return Ok(()),
-                WsMsg::Pong | WsMsg::Other => {}
-            }
-            // A large frame (avatar event ~17KB) grows rx and Vec never gives
-            // capacity back on its own — reclaim it so one big message doesn't
-            // permanently shrink the heap for the rest of the session.
-            if rx.capacity() > READ_BUF * 2 {
-                rx.shrink_to(READ_BUF);
-            }
-            // Handling a sign_event can block ~30s on the button; treat that as
-            // activity so the silence deadline doesn't trip right after.
-            last_rx = Instant::now();
-            continue;
+        // A large frame (avatar event ~17KB) grows rx and Vec never gives
+        // capacity back on its own — reclaim it so one big message doesn't
+        // permanently shrink the heap for the rest of the session.
+        if s.rx.capacity() > READ_BUF * 2 {
+            s.rx.shrink_to(READ_BUF);
         }
-
-        // No full frame — one read. With the recv timeout this returns 0 after
-        // RECV_TIMEOUT_MS of quiet; without it (degraded) it blocks until data.
-        if pump(&mut tls, &mut rx)? > 0 {
-            last_rx = Instant::now();
-            continue;
-        }
-
-        // Idle tick (only reachable when the recv timeout is active): keep the
-        // relay link warm, refresh the subscription, and bail if it's gone quiet.
-        if recv_timeout_on {
-            let now = Instant::now();
-            if now.duration_since(last_ping) >= PING_INTERVAL {
-                ws_send(&mut tls, OP_PING, b"hw")?;
-                last_ping = now;
-            }
-            // Periodic re-REQ: self-heals a subscription the relay dropped
-            // silently (connection still alive, so silence never trips).
-            if now.duration_since(last_resub) >= RESUB_INTERVAL {
-                ws_send(&mut tls, OP_TEXT, req.as_bytes())?;
-                last_resub = now;
-                log::debug!("[relay] re-subscribed (keepalive)");
-            }
-            if now.duration_since(last_rx) >= SILENCE_LIMIT {
-                return Err("relay silent (no data/pong); reconnecting".into());
-            }
-            // Burn-in protection: blank the OLED after inactivity; a PRG press
-            // wakes it (a request also wakes it, via process_event).
-            if ctx.display_on && now.duration_since(ctx.last_activity) >= DISPLAY_TIMEOUT {
-                crate::oled::sleep_display(ctx.display);
-                ctx.display_on = false;
-            } else if !ctx.display_on && ctx.button_pin.is_low() {
-                crate::oled::wake_display(ctx.display);
-                ctx.display_on = true;
-                ctx.last_activity = now;
-            }
-        }
-
+        // Handling a sign_event can block ~30s on the button; treat that as
+        // activity so the silence deadline doesn't trip right after.
+        s.last_rx = Instant::now();
+        return Ok(());
     }
+
+    // No full frame — one read. With the recv timeout this returns 0 after the
+    // tuned quiet period; without it (degraded, primary only) it blocks.
+    if pump(&mut s.tls, &mut s.rx)? > 0 {
+        s.last_rx = Instant::now();
+        return Ok(());
+    }
+
+    // Idle tick (only meaningful when the recv timeout is active): keep the
+    // relay link warm, refresh the subscription, and bail if it's gone quiet.
+    if s.recv_timeout_on {
+        let now = Instant::now();
+        if now.duration_since(s.last_ping) >= PING_INTERVAL {
+            ws_send(&mut s.tls, OP_PING, b"hw")?;
+            s.last_ping = now;
+        }
+        // Periodic re-REQ: self-heals a subscription the relay dropped
+        // silently (connection still alive, so silence never trips).
+        if now.duration_since(s.last_resub) >= RESUB_INTERVAL {
+            ws_send(&mut s.tls, OP_TEXT, s.sub_req.as_bytes())?;
+            s.last_resub = now;
+            log::debug!("[relay] re-subscribed on {} (keepalive)", s.url);
+        }
+        if now.duration_since(s.last_rx) >= SILENCE_LIMIT {
+            return Err(format!("relay {} silent (no data/pong); reconnecting", s.url));
+        }
+    }
+    Ok(())
 }
 
 /// Reboot after a command changed persisted state the live relay subscription
@@ -729,7 +946,12 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx, wifi: Option<&mut Block
 }
 
 /// Parse one inbound relay message (`["EVENT",sub,ev]` / `EOSE` / `OK` / …).
-fn handle_relay_msg(tls: &mut Tls, raw: &[u8], ctx: &mut SignCtx) -> Result<(), String> {
+fn handle_relay_msg(
+    s: &mut RelaySession,
+    raw: &[u8],
+    ctx: &mut SignCtx,
+    pool: &mut RelayPool,
+) -> Result<(), String> {
     let mut v: serde_json::Value = match serde_json::from_slice(raw) {
         Ok(v) => v,
         Err(_) => {
@@ -751,7 +973,7 @@ fn handle_relay_msg(tls: &mut Tls, raw: &[u8], ctx: &mut SignCtx) -> Result<(), 
                 let ev_val = ev_val.take();
                 drop(v); // free the (now-gutted) envelope before the deep parse
                 match serde_json::from_value::<SignedEvent>(ev_val) {
-                    Ok(ev) => process_event(tls, &ev, ctx)?,
+                    Ok(ev) => process_event(s, &ev, ctx, pool)?,
                     Err(e) => log::warn!("[relay] bad EVENT json: {e}"),
                 }
             }
@@ -831,7 +1053,12 @@ fn profile_name(content: &str) -> Option<String> {
 /// Route an inbound EVENT by kind. Errors specific to one request are logged
 /// and swallowed (return `Ok`) so a single bad request never drops the session;
 /// only transport errors propagate to trigger a reconnect.
-fn process_event(tls: &mut Tls, ev: &SignedEvent, ctx: &mut SignCtx) -> Result<(), String> {
+fn process_event(
+    s: &mut RelaySession,
+    ev: &SignedEvent,
+    ctx: &mut SignCtx,
+    pool: &mut RelayPool,
+) -> Result<(), String> {
     // Our own kind-0 profile: cache the name and refresh the idle identity
     // screen. This is not a user request, so it must never wake a blanked panel.
     if ev.kind == 0 {
@@ -869,14 +1096,14 @@ fn process_event(tls: &mut Tls, ev: &SignedEvent, ctx: &mut SignCtx) -> Result<(
 
     if ev.kind == MGMT_KIND {
         match masters::find_by_pubkey(ctx.masters, &target_pk) {
-            Some(master_idx) => handle_mgmt_event(tls, ev, ctx, master_idx),
+            Some(master_idx) => handle_mgmt_event(s, ev, ctx, master_idx, pool),
             None => {
                 log::warn!("[relay] mgmt EVENT not addressed to a known master; ignoring");
                 Ok(())
             }
         }
     } else {
-        handle_nip46_event(tls, ev, ctx, &target_pk)
+        handle_nip46_event(&mut s.tls, ev, ctx, &target_pk)
     }
 }
 
@@ -1143,10 +1370,11 @@ fn persist_mgmt_seen(nvs: &mut EspNvs<NvsDefault>, seen: &[String]) {
 /// Relay-management path (kind 24134): authenticate the author against the
 /// baked operator key, decrypt, replay-guard, dispatch, then sign + publish.
 fn handle_mgmt_event(
-    tls: &mut Tls,
+    s: &mut RelaySession,
     ev: &SignedEvent,
     ctx: &mut SignCtx,
     master_idx: usize,
+    pool: &mut RelayPool,
 ) -> Result<(), String> {
     let op_mgmt = match ctx.op_mgmt {
         Some(k) => k,
@@ -1227,14 +1455,14 @@ fn handle_mgmt_event(
     persist_mgmt_seen(ctx.nvs, &ctx.seen);
     log::info!("[relay] mgmt request: method={method} id={id} (operator authenticated)");
 
-    let response_json = match dispatch_mgmt(&method, &req, tls, ctx, master_idx) {
+    let response_json = match dispatch_mgmt(&method, &req, s, ctx, master_idx, pool) {
         Ok(result) => serde_json::json!({ "id": id, "result": result }).to_string(),
         Err(e) => serde_json::json!({ "id": id, "error": e }).to_string(),
     };
 
     let master = &ctx.masters[master_idx];
     sign_and_publish(
-        tls,
+        &mut s.tls,
         ctx.secp,
         &master.secret,
         &conversation_key,
@@ -1253,10 +1481,13 @@ fn handle_mgmt_event(
 fn dispatch_mgmt(
     method: &str,
     req: &serde_json::Value,
-    // The live relay socket — `nostrconnect` publishes the connect ACK on it.
-    tls: &mut Tls,
+    // The session the command arrived on — `nostrconnect` publishes the connect
+    // ACK on it when the client's relay is already served.
+    s: &mut RelaySession,
     ctx: &mut SignCtx,
     master_idx: usize,
+    // The other live sessions + pinned bookkeeping, for nostrconnect dial-out.
+    pool: &mut RelayPool,
 ) -> Result<serde_json::Value, String> {
     // Extract owned master facts before borrowing policy_engine mutably.
     let master_slot = ctx.masters[master_idx].slot;
@@ -1322,8 +1553,10 @@ fn dispatch_mgmt(
         // Client-initiated pairing (nostrconnect://): the app already told us its
         // pubkey, relay and a one-time secret, so we bind a slot to that pubkey
         // and publish the connect ACK — a NIP-46 response whose result echoes the
-        // secret — on the relay we serve. The app must be listening on this relay
-        // (the SPA checks that); a WiFi signer can't dial the app's own relay.
+        // secret. The ACK goes out on the relay the app listens on: a served
+        // relay when they overlap, otherwise the signer DIALS the app's relay as
+        // a pinned session (params.relay, capacity permitting) and keeps serving
+        // it so the pairing outlives the handshake.
         // The device has no wall-clock, so the operator (SPA) supplies created_at.
         "nostrconnect" => {
             let client_hex = req
@@ -1357,6 +1590,44 @@ fn dispatch_mgmt(
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|k| k.as_u64()).collect())
                 .unwrap_or_default();
+            // The app's relay from its nostrconnect URI. Optional: absent means
+            // the SPA established overlap and the arriving session carries it.
+            let client_relay = req
+                .pointer("/params/relay")
+                .and_then(|v| v.as_str())
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty());
+
+            // Where will the ACK go? Resolve BEFORE creating the slot so a
+            // failed dial leaves no half-paired state behind.
+            enum AckTarget {
+                Arriving,
+                Other(usize),
+                Dial(String),
+            }
+            let ack_target = match &client_relay {
+                None => AckTarget::Arriving,
+                Some(r) if same_relay(r, &s.url) || ctx.relays.iter().any(|c| same_relay(c, r)) => {
+                    // Served by the primary rotation: clients publish to every
+                    // configured relay, so the arriving session reaches them.
+                    AckTarget::Arriving
+                }
+                Some(r) => match pool.others.iter().position(|o| same_relay(&o.url, r)) {
+                    Some(i) => AckTarget::Other(i),
+                    None => AckTarget::Dial(r.clone()),
+                },
+            };
+            if let AckTarget::Dial(url) = &ack_target {
+                if !url.starts_with("wss://") {
+                    return Err("relay must be wss://".into());
+                }
+                if 1 + pool.others.len() >= MAX_SESSIONS {
+                    return Err("relay_capacity: signer already serves its maximum relays".into());
+                }
+                if pool.pinned.len() >= MAX_SESSIONS - 1 {
+                    return Err("relay_capacity: a pinned relay is already configured".into());
+                }
+            }
 
             // Copy the master secret up front (it is Copy) so publishing the ACK
             // below needs no live borrow of ctx while the slot table is mutated.
@@ -1373,6 +1644,14 @@ fn dispatch_mgmt(
             }
             let slot_secret = hex_encode(&secret_bytes);
             secret_bytes.iter_mut().for_each(|b| *b = 0);
+
+            // Dial the app's relay first (when needed): the expensive, fallible
+            // step. Only a successful dial mutates any state.
+            let mut dialled: Option<RelaySession> = None;
+            if let AckTarget::Dial(url) = &ack_target {
+                log::info!("[relay] nostrconnect: dialling client relay {url}");
+                dialled = Some(connect_relay(url, true, ctx)?);
+            }
 
             let index = ctx
                 .policy_engine
@@ -1398,18 +1677,43 @@ fn dispatch_mgmt(
                 );
             }
             let ack = serde_json::json!({ "id": hex_encode(&id_bytes), "result": secret }).to_string();
-            sign_and_publish(tls, ctx.secp, &master_secret, &ck, client_hex, NIP46_KIND, created_at, &ack)?;
+            let joined_relay = dialled.is_some();
+            let ack_tls = match (&ack_target, dialled.as_mut()) {
+                (AckTarget::Other(i), _) => &mut pool.others[*i].tls,
+                (_, Some(ns)) => &mut ns.tls,
+                _ => &mut s.tls,
+            };
+            sign_and_publish(ack_tls, ctx.secp, &master_secret, &ck, client_hex, NIP46_KIND, created_at, &ack)?;
+
+            // Adopt the dialled session and persist the pin only after the ACK
+            // made it out — a dead dial is fully rolled back by the `?` above.
+            if let Some(ns) = dialled {
+                pool.pinned.push(PinnedRelay {
+                    url: ns.url.clone(),
+                    ms: master_slot,
+                    si: index,
+                    next_attempt: Instant::now(),
+                });
+                save_pinned(ctx.nvs, pool.pinned);
+                pool.others.push(ns);
+            }
 
             log::info!(
-                "[relay] nostrconnect: bound slot {index} to client {}…, ACK published{}",
+                "[relay] nostrconnect: bound slot {index} to client {}…, ACK published{}{}",
                 &client_hex[..client_hex.len().min(16)],
+                if joined_relay { " [joined client relay]" } else { "" },
                 if auto_sign { " [signing pre-approved]" } else { "" }
             );
             Ok(serde_json::json!({
                 "slot_index": index,
                 "client_pubkey": client_hex,
                 "signing_approved": auto_sign,
-                "note": "connect ACK published; the app is paired on this relay",
+                "joined_relay": joined_relay,
+                "note": if joined_relay {
+                    "connect ACK published; the signer joined the app's relay and will keep serving it"
+                } else {
+                    "connect ACK published; the app is paired on this relay"
+                },
             }))
         }
 
@@ -1604,14 +1908,20 @@ fn dispatch_mgmt(
             Ok(serde_json::json!({ "ok": true, "name": name, "w": w, "h": h }))
         }
 
-        "get_status" => Ok(serde_json::json!({
-            "master_count": ctx.masters.len(),
-            "master_npub_hex": master_hex,
-            "mode": "wifi-standalone",
-            "relay": ctx.relay_url,
-            "slots": ctx.policy_engine.list_slots(master_slot).len(),
-            "audit": sign_audit_json(ctx),
-        })),
+        "get_status" => {
+            let mut relays_live = vec![s.url.clone()];
+            relays_live.extend(pool.others.iter().map(|o| o.url.clone()));
+            Ok(serde_json::json!({
+                "master_count": ctx.masters.len(),
+                "master_npub_hex": master_hex,
+                "mode": "wifi-standalone",
+                "relay": ctx.relay_url,
+                "relays_live": relays_live,
+                "relays_pinned": pool.pinned.iter().map(|p| p.url.clone()).collect::<Vec<_>>(),
+                "slots": ctx.policy_engine.list_slots(master_slot).len(),
+                "audit": sign_audit_json(ctx),
+            }))
+        }
 
         other => Err(format!("unknown method: {other}")),
     }

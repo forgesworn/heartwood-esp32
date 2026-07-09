@@ -128,6 +128,15 @@ const PRIMARY_BACKOFF: Duration = Duration::from_secs(3);
 const PINNED_BACKOFF: Duration = Duration::from_secs(15);
 /// Ceiling for the pinned-relay exponential backoff (10 minutes).
 const PINNED_BACKOFF_MAX: Duration = Duration::from_secs(600);
+/// Minimum free heap before dialling a second relay session. A fresh mbedTLS
+/// session costs ~40-50KB and an allocation failure deep inside the TLS or
+/// WiFi stack can abort the chip rather than error — observed as a reset on
+/// the no-PSRAM T-Display when pairing dialled mid-session (2026-07-08).
+const DIAL_MIN_FREE_HEAP: u32 = 70_000;
+/// Minimum largest contiguous free block before dialling: mbedTLS wants a
+/// 16KB record buffer in one piece, so total-free alone is not enough on a
+/// fragmented heap.
+const DIAL_MIN_LARGEST_BLOCK: usize = 24_000;
 /// NVS key the pinned-relay list is persisted under (JSON array).
 const PINNED_NVS_KEY: &str = "pinned_rly";
 
@@ -490,6 +499,24 @@ pub fn run_wifi_standalone<'d, 'b>(
             }
             if sessions.iter().any(|s| same_relay(&s.url, &p.url)) || Instant::now() < p.next_attempt
             {
+                continue;
+            }
+            // Same heap guard as the pairing-time dial: never let an automatic
+            // reconnect abort the chip on a tight heap. Counts as a failure so
+            // the backoff still decays a persistently tight board to rare probes.
+            let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            let largest = unsafe {
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
+            };
+            if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
+                p.fails = p.fails.saturating_add(1);
+                let delay = (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
+                log::warn!(
+                    "[relay] pinned {}: heap too tight for a second session (free {free} B, largest {largest} B); retry in {}s",
+                    p.url,
+                    delay.as_secs()
+                );
+                p.next_attempt = Instant::now() + delay;
                 continue;
             }
             match connect_relay(&p.url, true, &mut ctx) {
@@ -1673,12 +1700,14 @@ fn dispatch_mgmt(
                 if 1 + pool.others.len() >= MAX_SESSIONS {
                     return Err("relay_capacity: signer already serves its maximum relays".into());
                 }
-                if pool.pinned.len() >= MAX_SESSIONS - 1 {
-                    // NOTE: with MAX_SESSIONS == 2 this also guarantees a dial
-                    // only ever happens with an EMPTY pinned list — which is
-                    // what makes rebind-plus-dial unable to create a second
-                    // PinnedRelay for the same slot. If MAX_SESSIONS grows,
-                    // dedupe pool.pinned by (ms, si) here.
+                // A dial for a relay that is ALREADY pinned (session currently
+                // down — a re-pair while the pinned link is between retries)
+                // reuses that pin rather than counting as a new one; only a
+                // dial for a different relay is capacity-checked. The adoption
+                // block below updates the matching entry in place, so a slot
+                // never gains a second PinnedRelay.
+                let reusing_pin = pool.pinned.iter().any(|p| same_relay(&p.url, url));
+                if !reusing_pin && pool.pinned.len() >= MAX_SESSIONS - 1 {
                     return Err("relay_capacity: a pinned relay is already configured".into());
                 }
                 // Operator-driven retries against a dead relay would otherwise
@@ -1695,6 +1724,21 @@ fn dispatch_mgmt(
                 // to grow the pool while any live session runs degraded.
                 if !s.recv_timeout_on || pool.others.iter().any(|o| !o.recv_timeout_on) {
                     return Err("relay_dial_failed: signer relay link is degraded (no recv timeout)".into());
+                }
+                // Heap guard: a second mbedTLS session needs ~40-50KB of often
+                // fragmented heap, and an allocation failure deep inside the
+                // TLS stack can abort the chip (observed as a reset on the
+                // no-PSRAM T-Display, 2026-07-08). Refuse gracefully instead.
+                let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+                let largest = unsafe {
+                    esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                        esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                    )
+                };
+                if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
+                    return Err(format!(
+                        "relay_dial_failed: not enough free memory for a second relay session (free {free} B, largest block {largest} B); pair on a shared relay instead"
+                    ));
                 }
             }
 
@@ -1840,15 +1884,25 @@ fn dispatch_mgmt(
             }
 
             // Adopt the dialled session and persist the pin only after the ACK
-            // made it out — a dead dial is fully rolled back above.
+            // made it out — a dead dial is fully rolled back above. An existing
+            // pin for the same relay (re-pair while its session was down) is
+            // updated in place, so one relay never carries two pins.
             if let Some(ns) = dialled {
-                pool.pinned.push(PinnedRelay {
-                    url: ns.url.clone(),
-                    ms: master_slot,
-                    si: index,
-                    next_attempt: Instant::now(),
-                    fails: 0,
-                });
+                match pool.pinned.iter_mut().find(|p| same_relay(&p.url, &ns.url)) {
+                    Some(p) => {
+                        p.ms = master_slot;
+                        p.si = index;
+                        p.next_attempt = Instant::now();
+                        p.fails = 0;
+                    }
+                    None => pool.pinned.push(PinnedRelay {
+                        url: ns.url.clone(),
+                        ms: master_slot,
+                        si: index,
+                        next_attempt: Instant::now(),
+                        fails: 0,
+                    }),
+                }
                 save_pinned(ctx.nvs, pool.pinned);
                 pool.others.push(ns);
                 // Split the recv timeout across the grown session set. The

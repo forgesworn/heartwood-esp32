@@ -14,6 +14,12 @@ use alloc::{format, string::{String, ToString}, vec, vec::Vec};
 #[cfg(all(feature = "k256-backend", feature = "secp256k1-backend"))]
 compile_error!("heartwood-common: `k256-backend` and `secp256k1-backend` are mutually exclusive — enable exactly one");
 
+#[cfg(all(feature = "ledger-backend", any(feature = "k256-backend", feature = "secp256k1-backend")))]
+compile_error!("heartwood-common: `ledger-backend` is mutually exclusive with the other curve backends — enable exactly one");
+
+#[cfg(all(feature = "ledger-backend", feature = "mnemonic"))]
+compile_error!("heartwood-common: `mnemonic` is unsupported with `ledger-backend` — on a Ledger the BIP-32 walk happens in the OS (os_perso_derive_node_bip32), never in-app");
+
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use zeroize::Zeroize;
@@ -86,8 +92,201 @@ pub(crate) mod backend {
     }
 }
 
-#[cfg(not(any(feature = "k256-backend", feature = "secp256k1-backend")))]
-compile_error!("heartwood-common requires either `k256-backend` or `secp256k1-backend` feature");
+#[cfg(feature = "ledger-backend")]
+pub(crate) mod backend {
+    //! Curve ops through the Ledger OS (BOLOS cx syscalls): every
+    //! secret-dependent operation — public-key derivation, ECDH — runs in the
+    //! secure element's hardened implementation, never in app RAM. Verified
+    //! end-to-end by heartwood-ledger's Speculos proof, which checks results
+    //! against host-side k256.
+
+    use core::mem::MaybeUninit;
+
+    use ledger_secure_sdk_sys::{
+        cx_ecdh_no_throw, cx_ecfp_generate_pair_no_throw, cx_ecfp_init_private_key_no_throw,
+        cx_ecfp_private_key_t, cx_ecfp_public_key_t, cx_math_addm_no_throw,
+        cx_math_multm_no_throw, cx_math_powm_no_throw, cx_math_subm_no_throw,
+        CX_CURVE_SECP256K1, CX_ECDH_X, CX_OK, CX_RND_PROVIDED, CX_SHA256,
+    };
+    use zeroize::Zeroize;
+
+    // Re-exported so a Ledger app signs through the same backend that derives
+    // (one place holds every syscall touching key material).
+    pub use signing::sign_bip340;
+
+    /// secp256k1 field prime `p`.
+    const P: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+        0xff, 0xff, 0xfc, 0x2f,
+    ];
+    /// `(p + 1) / 4` — the square-root exponent (valid because p ≡ 3 mod 4).
+    const SQRT_EXP: [u8; 32] = [
+        0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xbf, 0xff, 0xff, 0x0c,
+    ];
+    const SEVEN: [u8; 32] = {
+        let mut b = [0u8; 32];
+        b[31] = 7;
+        b
+    };
+    const ZERO: [u8; 32] = [0u8; 32];
+
+    fn init_private_key(secret: &[u8; 32]) -> Result<cx_ecfp_private_key_t, &'static str> {
+        let mut pvkey = MaybeUninit::<cx_ecfp_private_key_t>::uninit();
+        unsafe {
+            if cx_ecfp_init_private_key_no_throw(
+                CX_CURVE_SECP256K1,
+                secret.as_ptr(),
+                secret.len(),
+                pvkey.as_mut_ptr(),
+            ) != CX_OK
+            {
+                return Err("invalid secret key");
+            }
+            Ok(pvkey.assume_init())
+        }
+    }
+
+    /// Validate a 32-byte secret as a secp256k1 scalar and return the x-only
+    /// public key bytes, or an error if the scalar is invalid.
+    pub fn pubkey_from_secret(secret: &[u8; 32]) -> Result<[u8; 32], &'static str> {
+        let mut pvkey = init_private_key(secret)?;
+        let mut pubkey = MaybeUninit::<cx_ecfp_public_key_t>::uninit();
+        let rc = unsafe {
+            cx_ecfp_generate_pair_no_throw(
+                CX_CURVE_SECP256K1,
+                pubkey.as_mut_ptr(),
+                &mut pvkey,
+                true, // keep the provided private key
+            )
+        };
+        pvkey.d.zeroize();
+        if rc != CX_OK {
+            return Err("invalid secret key");
+        }
+        let pubkey = unsafe { pubkey.assume_init() };
+        if pubkey.W_len != 65 {
+            return Err("unexpected public key encoding");
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&pubkey.W[1..33]);
+        Ok(out)
+    }
+
+    /// BIP-340 `lift_x`: decompress an x-only key to the uncompressed SEC1
+    /// point with even y. Pure public-data maths (the peer's key), via the OS
+    /// modular-arithmetic syscalls: y = (x³+7)^((p+1)/4) mod p, negated if odd,
+    /// and rejected (not on the curve) unless y² ≡ x³+7.
+    fn lift_x_even(x: &[u8; 32]) -> Result<[u8; 65], &'static str> {
+        if *x >= P {
+            return Err("peer pubkey x out of field range");
+        }
+        let mut y2 = [0u8; 32];
+        let mut y = [0u8; 32];
+        let mut check = [0u8; 32];
+        unsafe {
+            // y2 = x*x*x + 7 mod p
+            if cx_math_multm_no_throw(y2.as_mut_ptr(), x.as_ptr(), x.as_ptr(), P.as_ptr(), 32)
+                != CX_OK
+                || cx_math_multm_no_throw(y2.as_mut_ptr(), y2.as_ptr(), x.as_ptr(), P.as_ptr(), 32)
+                    != CX_OK
+                || cx_math_addm_no_throw(y2.as_mut_ptr(), y2.as_ptr(), SEVEN.as_ptr(), P.as_ptr(), 32)
+                    != CX_OK
+                // y = y2 ^ ((p+1)/4) mod p
+                || cx_math_powm_no_throw(y.as_mut_ptr(), y2.as_ptr(), SQRT_EXP.as_ptr(), 32, P.as_ptr(), 32)
+                    != CX_OK
+                // on-curve check: y*y mod p must reproduce y2
+                || cx_math_multm_no_throw(check.as_mut_ptr(), y.as_ptr(), y.as_ptr(), P.as_ptr(), 32)
+                    != CX_OK
+            {
+                return Err("field arithmetic failed");
+            }
+            if check != y2 {
+                return Err("peer pubkey is not on the curve");
+            }
+            if y[31] & 1 == 1 {
+                // odd y → take p - y (the even root)
+                let mut neg = [0u8; 32];
+                if cx_math_subm_no_throw(neg.as_mut_ptr(), ZERO.as_ptr(), y.as_ptr(), P.as_ptr(), 32)
+                    != CX_OK
+                {
+                    return Err("field arithmetic failed");
+                }
+                y = neg;
+            }
+        }
+        let mut point = [0u8; 65];
+        point[0] = 0x04;
+        point[1..33].copy_from_slice(x);
+        point[33..].copy_from_slice(&y);
+        Ok(point)
+    }
+
+    /// x-coordinate of the ECDH shared point with an x-only peer key (lifted
+    /// with even y, the NIP-44 convention).
+    pub fn ecdh_x(our_secret: &[u8; 32], peer_x_only: &[u8; 32]) -> Result<[u8; 32], &'static str> {
+        let point = lift_x_even(peer_x_only)?;
+        let mut pvkey = init_private_key(our_secret)?;
+        let mut out = [0u8; 32];
+        let rc = unsafe {
+            cx_ecdh_no_throw(&pvkey, CX_ECDH_X, point.as_ptr(), point.len(), out.as_mut_ptr(), 32)
+        };
+        pvkey.d.zeroize();
+        if rc != CX_OK {
+            return Err("ecdh failed");
+        }
+        Ok(out)
+    }
+
+    mod signing {
+        use super::*;
+
+        /// BIP-340 Schnorr sign a 32-byte message on the secure element.
+        /// `CX_RND_PROVIDED` reads the aux data from the signature buffer on
+        /// entry; it is zeroed, so nonces are deterministic (key + message)
+        /// and signing needs no RNG — matching the radio-off ESP signers.
+        pub fn sign_bip340(secret: &[u8; 32], message: &[u8; 32]) -> Result<[u8; 64], &'static str> {
+            use ledger_secure_sdk_sys::cx_ecschnorr_sign_no_throw;
+            const CX_ECSCHNORR_BIP0340: u32 = 0;
+
+            let mut pvkey = super::init_private_key(secret)?;
+            let mut sig = [0u8; 64];
+            let mut sig_len: usize = sig.len();
+            let rc = unsafe {
+                cx_ecschnorr_sign_no_throw(
+                    &pvkey,
+                    CX_ECSCHNORR_BIP0340 | CX_RND_PROVIDED,
+                    CX_SHA256,
+                    message.as_ptr(),
+                    message.len(),
+                    sig.as_mut_ptr(),
+                    &mut sig_len,
+                )
+            };
+            pvkey.d.zeroize();
+            if rc != CX_OK || sig_len != sig.len() {
+                return Err("signing failed");
+            }
+            Ok(sig)
+        }
+    }
+}
+
+#[cfg(not(any(
+    feature = "k256-backend",
+    feature = "secp256k1-backend",
+    feature = "ledger-backend"
+)))]
+compile_error!("heartwood-common requires exactly one curve backend feature: `k256-backend`, `secp256k1-backend` or `ledger-backend`");
+
+// A Ledger app's own signing/pubkey path goes through the same secure-element
+// seam the derivation uses — public re-exports, since `backend` is crate-only.
+#[cfg(feature = "ledger-backend")]
+pub use backend::{
+    pubkey_from_secret as ledger_pubkey_from_secret, sign_bip340 as ledger_sign_bip340,
+};
 
 // ---------------------------------------------------------------------------
 // Public API (backend-agnostic)

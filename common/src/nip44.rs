@@ -125,6 +125,17 @@ fn ecdh_shared_x(
     Ok(out)
 }
 
+/// On the Ledger backend the multiplication runs on the secure element
+/// (`cx_ecdh`, x-coordinate mode); the even-y lift of the peer key happens in
+/// `derive::backend::lift_x_even` via the OS modular-arithmetic syscalls.
+#[cfg(feature = "ledger-backend")]
+fn ecdh_shared_x(
+    our_secret: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+) -> Result<[u8; 32], &'static str> {
+    crate::derive::backend::ecdh_x(our_secret, peer_pubkey)
+}
+
 // ---------------------------------------------------------------------------
 // Padding
 // ---------------------------------------------------------------------------

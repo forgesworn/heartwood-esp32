@@ -34,6 +34,10 @@ ed25519-compact = { version = "2", optional = true, default-features = false, fe
 # AEAD itself reuses the chacha20 + hmac + sha2 already present (encrypt-then-MAC,
 # same construction as NIP-44), so no new cipher dep. no_std.
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+# Ledger secure-element backend (the heartwood-ledger app): curve ops through
+# the BOLOS cx syscalls. Only compiles inside a Ledger app build — the
+# syscalls exist nowhere else — so it is never part of a host or ESP set.
+ledger_secure_sdk_sys = { version = "1.16", optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -43,6 +47,11 @@ serde_json = "1"
 default = ["k256-backend"]
 k256-backend = ["dep:k256"]
 secp256k1-backend = ["dep:secp256k1"]
+# Curve ops on the Ledger secure element — the heartwood-ledger app's backend.
+# Mutually exclusive with the other two backends, like they are with each
+# other; `mnemonic` is unsupported here (on a Ledger the BIP-32 walk happens
+# in the OS via os_perso_derive_node_bip32, never in-app).
+ledger-backend = ["dep:ledger_secure_sdk_sys"]
 nip46 = ["dep:serde", "dep:serde_json"]
 nip44 = ["dep:chacha20", "dep:hkdf", "dep:base64"]
 nip04 = ["dep:aes", "dep:cbc", "dep:base64"]

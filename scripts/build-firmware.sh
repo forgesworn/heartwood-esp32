@@ -61,6 +61,17 @@ esac
 FIRMWARE_DIR="$(cd "$(dirname "$0")/../firmware" && pwd)"
 cd "$FIRMWARE_DIR"
 
+# ESP-IDF otherwise derives its application descriptor from `git describe`,
+# which can advertise the previous tag while a release is being prepared in a
+# dirty worktree. Fail early unless its explicit descriptor version matches the
+# Rust package version shown by the device UI and USB API.
+CARGO_VERSION="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+IDF_VERSION="$(sed -n 's/^CONFIG_APP_PROJECT_VER="\([^"]*\)"/\1/p' sdkconfig.defaults | head -n 1)"
+if [[ -z "$CARGO_VERSION" || "$IDF_VERSION" != "$CARGO_VERSION" ]]; then
+    echo "error: Cargo package version '${CARGO_VERSION:-missing}' does not match ESP-IDF app version '${IDF_VERSION:-missing}'" >&2
+    exit 2
+fi
+
 # `force = false` on the [env] entries in .cargo/config.toml means these shell
 # exports win, so MCU/sdkconfig follow the chosen board rather than the S3
 # default baked into the config file.

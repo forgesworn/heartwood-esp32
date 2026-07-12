@@ -2,7 +2,7 @@
 
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/TheCryptoDonkey?logo=githubsponsors&color=ea4aaa&label=Sponsor)](https://github.com/sponsors/TheCryptoDonkey)
 
-A hardware signing device for Nostr, built on the **Heltec WiFi LoRa 32** (ESP32-S3). Both the V3 (ESP32-S3FN8, CP2102 UART bridge) and V4 (ESP32-S3R2, native USB-Serial-JTAG) boards are supported from the same codebase -- pick your board with a cargo feature at build time. Holds multi-master nsec material, signs on request, master private keys never leave the chip. OLED shows what you're signing, physical button to approve.
+A hardware signing device for Nostr on supported ESP32 boards: **Heltec WiFi LoRa 32 V3/V4**, **LilyGO/TENSTAR T-Display**, and **Waveshare ESP32-C6-LCD-1.47**. Pick the target with the board-aware build script. Heartwood holds multi-master nsec material and signs on request; master private keys never leave the chip. Signing is policy-gated: requests outside automatic authority need the physical button and are shown on the display, while an authenticated operator can install an exact per-client method/event-kind policy for unattended signing.
 
 For the full architecture walkthrough with sequence diagrams and trust-boundary analysis, see [**docs/architecture.md**](docs/architecture.md).
 
@@ -13,7 +13,7 @@ flowchart LR
     Bark["Bark<br/>(NIP-07 browser ext)"]
     Relays[("Nostr relays")]
     Bridge["heartwood-bridge<br/>on Pi<br/>(pure transport,<br/>holds no signing keys)"]
-    HSM["Heartwood HSM<br/>(master nsecs,<br/>button-gated signing)"]
+    HSM["Heartwood HSM<br/>(master nsecs,<br/>button / exact-policy signing)"]
 
     Bark <-->|"NIP-44<br/>ciphertext"| Relays
     Relays <-->|"wss"| Bridge
@@ -23,17 +23,17 @@ flowchart LR
     style Bridge fill:#0f1419,stroke:#3b82f6,stroke-width:2px,color:#e8f4f8
 ```
 
-The entire chain between "user clicks sign" and "Nostr event published" is cryptographic shuffling. The only operation that authorises a signature is a human pressing the physical button on the HSM with the event body shown on the 128x64 OLED. The Pi-side bridge holds an ephemeral relay identity, a session auth secret, and an API token for Sapwood — none of which can sign for any user identity.
+The device is always the component that produces the signature. Authority comes from either a physical button approval or a previously installed slot policy. New remotely managed v2 slots are exact and fail closed: methods and event kinds outside their ceiling are denied, while matching requests can run unattended only when `auto_approve=true`. The Pi-side bridge holds no master key and cannot expand that authority. The separate Sapwood operator key is more powerful: it can create/revoke clients and install a signing policy, so compromise of that key must be treated as compromise of the configured remote-management authority.
 
 Deployment modes, selected at runtime from the NVS network config:
 
 ### Home HSM — USB-attached to a Raspberry Pi *(shipped)*
 
-Holds the **master secrets** (up to 8 masters across bunker / tree-mnemonic / tree-nsec modes). All radios disabled in this mode. The Pi running `heartwood-bridge` handles networking (Nostr relays, NIP-46 transport). The ESP32 handles all cryptography — decryption, signing, envelope construction. Even if the Pi is fully compromised, an attacker cannot extract keys or sign without physical button access on the device. Management UI via [Sapwood](https://github.com/forgesworn/sapwood) served by the bridge.
+Holds the **master secrets** (up to 8 masters across bunker / tree-mnemonic / tree-nsec modes). All radios are disabled in this mode. The Pi running `heartwood-bridge` handles networking (Nostr relays, NIP-46 transport). The ESP32 handles all cryptography — decryption, signing, envelope construction. A compromised Pi cannot extract a master key or broaden a slot policy; an already-authorised client can still receive whatever signatures its current policy permits. Management UI via [Sapwood](https://github.com/forgesworn/sapwood) is served by the bridge.
 
 ### WiFi-standalone — on-chip relay client, no Pi *(shipped, opt-in)*
 
-The ESP32 joins WiFi and connects to Nostr relays directly, running the full NIP-46 signing loop on-chip (`firmware/src/relay.rs`) — no Raspberry Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated on the OLED. Enabled only when the device is provisioned with an SSID + relay list (`mode="wifi"` in the NVS net config); the USB cable stays fully usable in parallel, so a bad SSID or relay is always recoverable over the cable. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected.
+The ESP32 joins WiFi and connects to Nostr relays directly, running the full NIP-46 signing loop on-chip (`firmware/src/relay.rs`) — no Raspberry Pi. Keys still never leave the chip and NIP-44 is still decrypted on-device. Exact v2 client policies can permit unattended signing for a bounded method/event-kind set; other requests are denied or require the OLED/button according to their legacy policy. An unbound relay peer cannot enter the 30-second button loop: remote physical approval is available only after the client has been provisioned and slot-bound, so strangers cannot keep a shelf signer busy with prompts. Enabled only when the device is provisioned with an SSID + relay list (`mode="wifi"` in the NVS net config); the USB cable stays fully usable in parallel, so a bad SSID or relay is recoverable over the cable. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey, uses a durable one-time mutation challenge, and can manage clients and staged WiFi changes remotely. USB can read password-redacted network/operator state, patch network fields with keep/set/clear password semantics, and replace the operator only through a separate stale-revision-checked physical confirmation. Seed replacement, PIN changes, factory reset, and OTA remain local/USB operations.
 
 This is the convenience tier — it accepts a larger attack surface (a live TCP/IP stack on a key-holding device) in exchange for dropping the Pi. The USB-attached mode above remains the high-assurance default; leave the radios off where that matters.
 
@@ -59,17 +59,17 @@ The nsec-tree hierarchy means each device gets its own branch. Compromise of a c
 
 | Component | Detail |
 |-----------|--------|
-| Boards | Heltec WiFi LoRa 32 V3 and V4 (choose via cargo feature) |
-| Chip | ESP32-S3 -- V3 is S3FN8 (8MB flash, no PSRAM), V4 is S3R2 (2MB PSRAM, external flash) |
-| OLED | 128x64 SSD1306 (I2C: SDA=GPIO17, SCL=GPIO18, RST=GPIO21, addr 0x3C) |
+| Boards | Heltec WiFi LoRa 32 V3/V4; LilyGO/TENSTAR T-Display; Waveshare ESP32-C6-LCD-1.47 |
+| Chip | ESP32-S3 (Heltec), classic ESP32 (T-Display), or ESP32-C6 (Waveshare) |
+| Display | 128x64 SSD1306 OLED (Heltec), ST7789 TFT (T-Display), or JD9853 TFT (Waveshare C6) |
 | GNSS | L76K on V4 only (available for portable mode) |
 | LoRa | SX1262 (never initialised -- no use case for signing) |
-| WiFi | ESP32-S3 built-in (off in USB-bridged mode; enabled in WiFi-standalone mode) |
-| BLE | ESP32-S3 built-in (reserved for future portable mode; not built) |
+| WiFi | Built in (off in USB-bridged mode; enabled in WiFi-standalone mode) |
+| BLE | Built in (reserved for future portable mode; not built) |
 | USB-C (V4) | Wired direct to native USB-Serial-JTAG on GPIO19/20 |
 | USB-C (V3) | Wired through CP2102 bridge to UART0 on GPIO43/44 |
 | Battery | JST PH 2.0 connector + charging circuit (portable mode) |
-| Button | PRG button on GPIO 0 (signing approval) |
+| Buttons | Board-specific local confirmation controls; T-Display provides two buttons |
 
 ## Setup
 
@@ -91,13 +91,15 @@ cd provision && cargo build                # host CLI tool
 cd firmware && cargo build                 # ESP32 firmware (V4 default)
 ```
 
-The firmware crate selects its board at compile time via the `heltec-v3` or
-`heltec-v4` cargo feature. The default is `heltec-v4`. To build for a V3,
-use the wrapper script so the matching sdkconfig fragment is picked up:
+The firmware crate selects its board at compile time. The default cargo feature
+is `heltec-v4`, but production builds should use the wrapper so the cargo
+feature, target triple, MCU, and sdkconfig fragment cannot drift apart:
 
 ```bash
 ./scripts/build-firmware.sh v3 --release
 ./scripts/build-firmware.sh v4 --release
+./scripts/build-firmware.sh tdisplay --release
+./scripts/build-firmware.sh c6 --release
 ```
 
 Or the manual form:
@@ -112,8 +114,8 @@ ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heltec-v3" \
 ```
 
 The wrapper script also writes a board-tagged ELF copy to
-`target/heartwood-v3.elf` or `target/heartwood-v4.elf` so you cannot
-accidentally flash the wrong binary onto the wrong hardware.
+`target/heartwood-<board>.elf` so you cannot accidentally flash the wrong
+binary onto the wrong hardware.
 
 ## Flash & provision
 
@@ -309,7 +311,7 @@ docs/
 - [x] Bridge session authentication (shared secret, constant-time comparison)
 - [x] Client approval policies (per-master, per-client, RAM-only, pushed from bridge)
 - [x] Policy engine (auto-approve / OLED-notify / button-required tiers)
-- [x] Full NIP-46 method set (15 methods: 8 standard + 7 heartwood extensions)
+- [x] NIP-46 core methods plus Heartwood extension dispatch (proof generation/verification currently return explicit `not yet implemented` errors)
 - [x] Multi-master OLED UX (boot screen, bridge status, master labels, auto-approve flash)
 - [x] Bridge passthrough mode (0x10/0x11 encrypted frames, fallback to legacy)
 - [x] `connect` method with per-master connect secret validation + two-tier TOFU

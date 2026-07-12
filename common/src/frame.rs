@@ -115,6 +115,8 @@ mod tests {
         FRAME_TYPE_ACK, FRAME_TYPE_POLICY_LIST_REQUEST, FRAME_TYPE_POLICY_LIST_RESPONSE,
         FRAME_TYPE_POLICY_REVOKE, FRAME_TYPE_POLICY_UPDATE, MAX_PAYLOAD_SIZE,
         FRAME_TYPE_SET_NET_CONFIG,
+        FRAME_TYPE_GET_NET_CONFIG, FRAME_TYPE_GET_NET_CONFIG_RESPONSE,
+        FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_SET_OPERATOR,
     };
 
     #[test]
@@ -248,5 +250,22 @@ mod tests {
         let frame = parse_frame(&bytes).unwrap();
         assert_eq!(frame.frame_type, FRAME_TYPE_SET_NET_CONFIG);
         assert_eq!(frame.payload, payload);
+    }
+
+    #[test]
+    fn usb_network_and_operator_frame_numbers_are_fixed_and_roundtrip() {
+        assert_eq!(FRAME_TYPE_GET_NET_CONFIG, 0x5c);
+        assert_eq!(FRAME_TYPE_GET_NET_CONFIG_RESPONSE, 0x5d);
+        assert_eq!(FRAME_TYPE_PATCH_NET_CONFIG, 0x5e);
+        assert_eq!(FRAME_TYPE_SET_OPERATOR, 0x5f);
+
+        let get = parse_frame(&build_frame(FRAME_TYPE_GET_NET_CONFIG, &[]).unwrap()).unwrap();
+        assert!(get.payload.is_empty());
+        let operator_payload = [0xabu8; 36];
+        let set = parse_frame(
+            &build_frame(FRAME_TYPE_SET_OPERATOR, &operator_payload).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(set.payload, operator_payload);
     }
 }

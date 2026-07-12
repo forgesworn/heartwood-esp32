@@ -53,7 +53,8 @@ guarantee.
    already pullable via the `nip44`/`nip04` feature deps). AEAD so a wrong PIN
    fails the tag check cleanly (no ambiguous "is this the right seed?").
 3. **NVS layout** — replace the plaintext `master_<slot>_secret` with
-   `master_<slot>_secret_enc` = `salt || nonce || ciphertext || tag`. Migration:
+   `m<slot>_seed_enc` = `salt || nonce || ciphertext || tag`. The compact name
+   is required by ESP-IDF's 15-character NVS key limit. Migration:
    an existing plaintext seed is re-encrypted on first PIN set (or left as-is if
    the user never sets a PIN — see the opt-in decision).
 4. **Boot flow** — on boot, if an encrypted seed exists, prompt for the PIN
@@ -129,7 +130,7 @@ phrase re-restore, which is the intended escape hatch, but still).
 
 Steps:
 
-1. **Storage** (`masters.rs`): add `master_<slot>_secret_enc` (the 92-byte blob)
+1. **Storage** (`masters.rs`): add `m<slot>_seed_enc` (the 92-byte blob)
    alongside/instead of `_secret`. `load_all` returns the metadata
    (pubkey/label/mode) always, but leaves `LoadedMaster.secret` EMPTY when the
    slot is encrypted — the secret is filled only after unlock. So `LoadedMaster`
@@ -137,11 +138,11 @@ Steps:
    separate post-unlock fill step).
 2. **SET_PIN** (`pin.rs`): on set (with masters loaded + unlocked), for each
    master: draw a fresh salt+nonce from the TRNG (`fill_random_strong`), encrypt
-   its seed, write `_secret_enc`, and **remove the plaintext `_secret`**. The
+   its seed, write `m<slot>_seed_enc`, and **remove the plaintext `_secret`**. The
    AEAD tag is the PIN check, so the separate `pin_hash` can go (or stay for a
    fast "is this PIN even plausible" pre-check — but the real gate is decrypt).
    Clearing the PIN re-encrypts back to plaintext (opt-out).
-3. **PIN_UNLOCK** (`pin.rs`): decrypt each `_secret_enc` with the PIN into the
+3. **PIN_UNLOCK** (`pin.rs`): decrypt each `m<slot>_seed_enc` with the PIN into the
    in-RAM `LoadedMaster.secret`. Failure → wrong-PIN path (existing 5-attempt →
    wipe). Success → boot continues with seeds in RAM only.
 4. **Boot** (`main.rs`): if any slot is encrypted, stay in the locked loop until

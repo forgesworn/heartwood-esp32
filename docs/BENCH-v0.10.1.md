@@ -77,7 +77,7 @@ re-restore. On a device with a master already provisioned + unlocked:
       Device reports "PIN set!".
 - [ ] `esptool read_flash` the NVS region (or dump flash) and confirm the seed
       is NOT present in the clear — you should see the 92-byte encrypted blob
-      (`master_0_secret_enc`), not the 32-byte plaintext seed.
+      (`m0_seed_enc`), not the 32-byte plaintext seed.
 - [ ] Power-cycle. Device boots to "PIN locked — await unlock" and refuses
       signing.
 - [ ] Wrong PIN → "Wrong PIN, N left"; the counter persists across a reboot

@@ -3,8 +3,12 @@
 // Backup payload types shared between firmware and heartwoodd.
 // The backup JSON is the plaintext inside the encrypted envelope.
 #[allow(unused_imports)]
-use alloc::{format, string::{String, ToString}, vec, vec::Vec};
-
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +60,7 @@ mod tests {
             allowed_kinds: vec![1, 7],
             auto_approve: true,
             signing_approved: true,
+            strict_permissions: false,
             authorized_pubkeys: vec![],
         }
     }

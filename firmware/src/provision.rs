@@ -648,22 +648,25 @@ fn npub_from_secret(secret: &[u8; 32], secp: &Arc<Secp256k1<secp256k1::SignOnly>
     Some(encode_npub(&xonly.serialize()))
 }
 
-/// Handle a PROVISION_REMOVE frame (0x04). Removes the named slot and
-/// re-numbers the in-memory list to stay consistent with NVS.
+/// Handle a PROVISION_REMOVE frame (0x04).
+///
+/// The removal is journalled across every slot-indexed authority record. The
+/// caller must reboot after `true` so all in-memory caches reload from the
+/// completed transaction.
 pub fn handle_remove(
     usb: &mut SerialPort<'_>,
     frame: &Frame,
     nvs: &mut EspNvs<NvsDefault>,
     loaded: &mut Vec<LoadedMaster>,
     display: &mut Display<'_>,
-) {
+) -> bool {
     if frame.payload.len() != 1 {
         log::warn!(
             "PROVISION_REMOVE payload is {} bytes, expected 1",
             frame.payload.len()
         );
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
 
     let slot = frame.payload[0];
@@ -677,10 +680,19 @@ pub fn handle_remove(
             let msg = format!("Removed slot {slot}");
             oled::show_error(display, &msg);
             protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+            true
         }
         Err(e) => {
             log::error!("Remove master slot {slot} failed: {e}");
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            if masters::removal_pending(nvs) {
+                // Never resume signing against a partial transaction. Boot
+                // recovery retries the persisted journal before state loads.
+                oled::show_error(display, "REMOVE FAILED\nRebooting...");
+                esp_idf_hal::delay::FreeRtos::delay_ms(400);
+                unsafe { esp_idf_svc::sys::esp_restart() }
+            }
+            false
         }
     }
 }
@@ -722,11 +734,12 @@ pub fn handle_list(
 
 /// Handle a FACTORY_RESET frame (0x24).
 ///
-/// Erases all NVS keys in the `heartwood` namespace and reboots the device.
-/// Requires physical button approval (2-second hold) — this is irreversible.
+/// Erases the flash-time `config` partition and the complete NVS partition,
+/// then reboots the device. Requires physical button approval (2-second hold)
+/// — this is irreversible.
 pub fn handle_factory_reset(
     usb: &mut SerialPort<'_>,
-    nvs: &mut EspNvs<NvsDefault>,
+    _nvs: &mut EspNvs<NvsDefault>,
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) {
@@ -741,27 +754,9 @@ pub fn handle_factory_reset(
 
     match result {
         crate::approval::ApprovalResult::Approved => {
-            log::warn!("Factory reset approved — erasing NVS");
+            log::warn!("Factory reset approved — erasing all persistent state");
             crate::oled::show_error(display, "Erasing...");
-
-            // Erase all master keys by removing slot 0 repeatedly (they shift down).
-            let count = masters::read_master_count(nvs);
-            for _ in 0..count {
-                let _ = masters::remove_master(nvs, 0);
-            }
-
-            // Erase bridge secret and policy keys.
-            let _ = nvs.remove("bridge_secret");
-            for i in 0..8u8 {
-                let key = format!("policy_{i}");
-                let _ = nvs.remove(&key);
-            }
-
-            crate::oled::show_error(display, "Reset complete\nRebooting...");
-            protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
-            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
-
-            unsafe { esp_idf_svc::sys::esp_restart(); }
+            erase_all_and_reboot(usb, display);
         }
         crate::approval::ApprovalResult::Denied => {
             log::info!("Factory reset denied");
@@ -772,6 +767,32 @@ pub fn handle_factory_reset(
             log::info!("Factory reset timed out");
             crate::oled::show_result(display, "Timed out");
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        }
+    }
+}
+
+/// Once a destructive erase begins, never return to a signing loop with
+/// partially-erased state. A transient flash failure is reported with NACK and
+/// retried in-place; a permanent failure remains fail-closed for USB recovery.
+fn erase_all_and_reboot(usb: &mut SerialPort<'_>, display: &mut Display<'_>) -> ! {
+    let mut failure_reported = false;
+    loop {
+        match crate::persistent_wipe::erase_all() {
+            Ok(()) => {
+                crate::oled::show_error(display, "Reset complete\nRebooting...");
+                protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+                esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+                unsafe { esp_idf_svc::sys::esp_restart() }
+            }
+            Err(e) => {
+                log::error!("Factory reset erase failed: {e}");
+                crate::oled::show_error(display, "ERASE FAILED\nRetrying...");
+                if !failure_reported {
+                    protocol::write_frame(usb, FRAME_TYPE_NACK, b"erase_failed");
+                    failure_reported = true;
+                }
+                esp_idf_hal::delay::FreeRtos::delay_ms(2000);
+            }
         }
     }
 }

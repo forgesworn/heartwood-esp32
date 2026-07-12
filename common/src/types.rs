@@ -82,6 +82,10 @@ pub const FRAME_TYPE_RESTORE_IDENTITY: u8 = 0x58;    // host -> device: optional
 pub const FRAME_TYPE_FIRMWARE_INFO: u8 = 0x59;       // host -> device: empty; read-only version query. Safe (no secrets) so it is also served in WiFi mode.
 pub const FRAME_TYPE_FIRMWARE_INFO_RESPONSE: u8 = 0x5A; // device -> host: JSON { version, board }
 pub const FRAME_TYPE_SET_IDENTITY_META: u8 = 0x5B;   // host -> device: pre-resized display metadata for one identity, so the signer never fetches/decodes images itself. Payload: [pubkey 32][w 1][h 1][name_len 1][name UTF-8][avatar w*h*2 Rgb565 big-endian]. Reply ACK/NACK.
+pub const FRAME_TYPE_GET_NET_CONFIG: u8 = 0x5C;      // host -> device: empty; local read-only redacted network/operator state
+pub const FRAME_TYPE_GET_NET_CONFIG_RESPONSE: u8 = 0x5D; // device -> host: JSON {revision,mode,ssid,relays,password_set,op_mgmt}
+pub const FRAME_TYPE_PATCH_NET_CONFIG: u8 = 0x5E;    // host -> device: JSON LocalNetConfigPatch; physical confirmation; reply ACK/NACK
+pub const FRAME_TYPE_SET_OPERATOR: u8 = 0x5F;        // host -> device: base_revision u32 BE + x-only pubkey 32; physical confirmation; reply ACK/NACK, then reboot
 
 // --- OTA frame types ---
 pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;

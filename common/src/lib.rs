@@ -32,6 +32,8 @@ pub mod net_config;
 
 pub mod mgmt;
 
+pub mod persistent_state;
+
 #[cfg(feature = "mnemonic")]
 pub mod mnemonic;
 

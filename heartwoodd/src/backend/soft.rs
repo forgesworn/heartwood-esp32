@@ -517,12 +517,17 @@ impl SigningBackend for SoftBackend {
                     .find(|m| m.slot == master_slot_index)
                     .ok_or_else(|| BackendError::Internal("master not found on write".into()))?;
 
-                let matched = policy::find_slot_by_secret_mut(
-                    &mut master_mut.connection_slots,
+                let matched = policy::find_slot_by_secret(
+                    &master_mut.connection_slots,
                     &provided_secret,
-                );
-                if let Some(slot) = matched {
-                    policy::authorize_pubkey_on_slot(slot, &client_pubkey_hex);
+                )
+                .map(|slot| slot.slot_index);
+                if let Some(slot_index) = matched {
+                    policy::authorize_pubkey_on_unique_slot(
+                        &mut master_mut.connection_slots,
+                        slot_index,
+                        &client_pubkey_hex,
+                    );
                     let path = self.keyfile_path();
                     Self::persist(state, &path)?;
                 } else {
@@ -902,6 +907,7 @@ impl SigningBackend for SoftBackend {
                 allowed_kinds: vec![],
                 auto_approve: true,
                 signing_approved: false,
+                strict_permissions: false,
                 authorized_pubkeys: vec![],
             };
             m.connection_slots.push(slot.clone());

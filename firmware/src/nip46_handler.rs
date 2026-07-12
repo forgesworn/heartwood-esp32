@@ -27,11 +27,9 @@ use heartwood_common::frame::Frame;
 use heartwood_common::hex::hex_encode;
 use heartwood_common::nip04;
 use heartwood_common::nip44;
-use heartwood_common::validate::validate_persona_name;
-use heartwood_common::nip46::{
-    self, HeartwoodContext, SignedEvent, UnsignedEvent,
-};
+use heartwood_common::nip46::{self, HeartwoodContext, SignedEvent, UnsignedEvent};
 use heartwood_common::types::MasterMode;
+use heartwood_common::validate::validate_persona_name;
 use secp256k1::{Secp256k1, SignOnly};
 use serde_json::Value;
 use zeroize::Zeroize;
@@ -42,6 +40,119 @@ use crate::policy::PolicyEngine;
 
 /// Timeout in seconds shown on the OLED countdown bar.
 const APPROVAL_TIMEOUT_SECS: u64 = 30;
+
+/// A strict slot's `Denied` decision is a dispatch-wide ceiling, not a hint for
+/// individual method arms. Keep the remote-client condition explicit so the
+/// direct USB path retains its physical-possession semantics.
+fn denied_before_dispatch(
+    has_client: bool,
+    tier: heartwood_common::policy::ApprovalTier,
+) -> bool {
+    has_client && tier == heartwood_common::policy::ApprovalTier::Denied
+}
+
+/// A public relay is not an approval queue. Only a client already bound to a
+/// slot may make the device wait for a physical decision; otherwise strangers
+/// can serialize fresh keys/ids into an endless series of 30-second prompts.
+fn unbound_remote_request_denied(
+    has_client: bool,
+    client_is_bound: bool,
+    method: &nip46::Nip46Method,
+) -> bool {
+    has_client
+        && !client_is_bound
+        && (matches!(method, nip46::Nip46Method::SignEvent)
+            || method.always_requires_button())
+}
+
+/// Exact v2 authority is installed for the relay-addressed identity. An
+/// explicit Heartwood context can redirect the same approved method to an
+/// arbitrary derived child, which that policy did not name, so strict slots
+/// reject it independent of method. Legacy slots retain their historical
+/// context behavior; an internally-resolved active identity is not explicit.
+fn strict_slot_denies_explicit_context(
+    has_client: bool,
+    strict_slot: bool,
+    explicit_heartwood_context: bool,
+) -> bool {
+    has_client && strict_slot && explicit_heartwood_context
+}
+
+/// Remote Heartwood extensions that mutate identity state must cross one
+/// physical-approval boundary before their match arm can run. `sign_event` owns
+/// its richer event-specific prompt, while direct USB (`has_client == false`)
+/// retains physical-possession semantics. Standard crypto methods are not
+/// included here: an unbound remote crypto request remains refused below.
+fn remote_extension_requires_approval(
+    has_client: bool,
+    method: &nip46::Nip46Method,
+    tier: heartwood_common::policy::ApprovalTier,
+) -> bool {
+    has_client
+        && !matches!(method, nip46::Nip46Method::SignEvent)
+        && method.always_requires_button()
+        && tier == heartwood_common::policy::ApprovalTier::ButtonRequired
+}
+
+/// `None` is the only outcome that permits dispatch. Denial and timeout become
+/// normal NIP-46 errors before any extension state can be touched.
+fn extension_approval_failure(request_id: &str, result: ApprovalResult) -> Option<String> {
+    match result {
+        ApprovalResult::Approved => None,
+        ApprovalResult::Denied => Some(build_error_json(request_id, -1, "user denied")),
+        ApprovalResult::TimedOut => Some(build_error_json(request_id, -1, "timeout")),
+    }
+}
+
+/// Keep the approval preview ASCII and bounded because the OLED renderer uses
+/// byte-oriented truncation. Include both requester and first parameter (the
+/// derive purpose, persona target, or recovery lookahead) when available.
+fn extension_approval_preview(requester: &str, params: &[Value]) -> String {
+    let sanitise = |raw: &str| {
+        raw.chars()
+            .map(|ch| if ch.is_ascii_graphic() || ch == ' ' { ch } else { '?' })
+            .take(18)
+            .collect::<String>()
+    };
+    let requester = sanitise(requester);
+    let target = params.first().map(|value| match value {
+        Value::String(value) => sanitise(value),
+        other => sanitise(&other.to_string()),
+    });
+    match target.filter(|value| !value.is_empty()) {
+        Some(target) => format!("{requester}: {target}"),
+        None => requester,
+    }
+}
+
+/// Whether a remote request can change durable slot authority when approved.
+/// Callers use this before dispatch to take a rollback snapshot without cloning
+/// the slot table for every routine auto-sign request.
+pub(crate) fn request_may_mutate_slot_state(
+    request: &nip46::Nip46Request,
+    tier: heartwood_common::policy::ApprovalTier,
+) -> bool {
+    match nip46::Nip46Method::from_str(&request.method) {
+        nip46::Nip46Method::Connect => request
+            .params
+            .get(1)
+            .and_then(|value| value.as_str())
+            .map(|secret| !secret.is_empty())
+            .unwrap_or(false),
+        nip46::Nip46Method::SignEvent => {
+            tier == heartwood_common::policy::ApprovalTier::ButtonRequired
+        }
+        _ => false,
+    }
+}
+
+fn connect_success_response(request_id: &str, client_secret: &str) -> String {
+    if client_secret.is_empty() {
+        nip46::build_connect_response(request_id).unwrap_or_default()
+    } else {
+        nip46::build_connect_response_with_secret(request_id, client_secret).unwrap_or_default()
+    }
+}
 
 fn metadata_name(value: &Value) -> Option<String> {
     let metadata = match value {
@@ -95,8 +206,8 @@ pub(crate) fn derive_identity(
     purpose: &str,
     index: u32,
 ) -> Result<(zeroize::Zeroizing<[u8; 32]>, [u8; 32]), String> {
-    let derive_secret =
-        derivation_secret(master_secret, master_mode).map_err(|e| format!("derivation_secret: {e}"))?;
+    let derive_secret = derivation_secret(master_secret, master_mode)
+        .map_err(|e| format!("derivation_secret: {e}"))?;
     let root =
         derive::create_tree_root(&derive_secret).map_err(|e| format!("create_tree_root: {e}"))?;
     let identity = derive::derive(&root, purpose, index).map_err(|e| format!("derive: {e}"))?;
@@ -134,6 +245,10 @@ pub fn handle_request(
                 .unwrap_or_default();
         }
     };
+    // Capture caller intent before a legacy session's active identity may be
+    // resolved into this field below. Only a caller-supplied context is a
+    // strict-policy redirection attempt.
+    let explicit_heartwood_context = request.heartwood.is_some();
 
     log::info!(
         "NIP-46 request: method={} id={} master_slot={}",
@@ -146,11 +261,16 @@ pub fn handle_request(
     // active identity (set by a prior heartwood_switch call).
     if request.heartwood.is_none() {
         if let Some(cpk) = client_pubkey {
-            if let Some(session) = policy_engine.sessions.iter().find(|s| {
-                s.client_pubkey == *cpk && s.master_slot == master_slot
-            }) {
+            if let Some(session) = policy_engine
+                .sessions
+                .iter()
+                .find(|s| s.client_pubkey == *cpk && s.master_slot == master_slot)
+            {
                 if let Some(identity_idx) = session.active_identity {
-                    if let Some(cache) = identity_caches.iter().find(|c| c.master_slot == master_slot) {
+                    if let Some(cache) = identity_caches
+                        .iter()
+                        .find(|c| c.master_slot == master_slot)
+                    {
                         if let Some(identity) = cache.identities.get(identity_idx) {
                             log::info!(
                                 "Resolving active identity: purpose={} index={}",
@@ -170,7 +290,9 @@ pub fn handle_request(
 
     let method = nip46::Nip46Method::from_str(&request.method);
     let event_kind = if matches!(method, nip46::Nip46Method::SignEvent) {
-        nip46::parse_unsigned_event(&request.params).ok().map(|e| e.kind)
+        nip46::parse_unsigned_event(&request.params)
+            .ok()
+            .map(|e| e.kind)
     } else {
         None
     };
@@ -188,6 +310,14 @@ pub fn handle_request(
             .unwrap_or_default()
     };
     let has_client = !client_hex.is_empty() && client_hex.len() == 64;
+    let (client_is_bound, strict_slot) = if has_client {
+        policy_engine
+            .find_slot_by_pubkey(master_slot, &client_hex)
+            .map(|slot| (true, slot.strict_permissions))
+            .unwrap_or((false, false))
+    } else {
+        (false, false)
+    };
     let requester_label = if has_client {
         signing_requester_label(policy_engine, master_slot, &client_hex)
     } else {
@@ -199,22 +329,67 @@ pub fn handle_request(
         heartwood_common::policy::ApprovalTier::ButtonRequired
     };
 
-    // State-mutating identity methods (heartwood_derive / derive_persona /
-    // recover / create_proof — all `always_requires_button`) must not be
-    // served to an unbound REMOTE client. The relay path calls this for any
-    // event author, so without this gate an unbound peer could drive persona
-    // derivation and force NVS writes (flash wear, MAX_PERSONAS exhaustion) —
-    // no key leaks, but unapproved on-device state mutation. A slot-bound
-    // client, or the physically-present direct-USB path (no remote client),
-    // proceeds as before. Mirrors the encrypt/decrypt gate above.
-    if method.always_requires_button()
-        && has_client
-        && policy_engine
-            .find_slot_by_pubkey(master_slot, &client_hex)
-            .is_none()
-    {
+    // Requests that can enter the physical approval loop are served remotely
+    // only to a slot-bound client. Besides blocking unapproved identity-state
+    // mutation, this protects the single-threaded shelf signer from strangers
+    // keeping it permanently inside repeated 30-second sign prompts. Direct
+    // USB retains its physical-possession semantics.
+    if unbound_remote_request_denied(has_client, client_is_bound, &method) {
         log::warn!("{}: refused — unbound client", request.method);
         return build_error_json(&request.id, -1, "unauthorised");
+    }
+
+    // A strict slot names methods and event kinds for the identity selected by
+    // relay routing. It grants no authority to redirect those same operations
+    // to a caller-chosen derived child via top-level `heartwood` context.
+    if strict_slot_denies_explicit_context(
+        has_client,
+        strict_slot,
+        explicit_heartwood_context,
+    ) {
+        log::warn!(
+            "{}: refused — explicit Heartwood identity context is outside exact slot policy",
+            request.method
+        );
+        return build_error_json(&request.id, -1, "unauthorised");
+    }
+
+    // SECURITY BOUNDARY: exact v2 slots deny every method outside their
+    // operator-installed ceiling. Enforce that once before dispatch so a new or
+    // Heartwood-specific method cannot accidentally bypass the policy merely
+    // because its individual match arm does not inspect `tier`.
+    if denied_before_dispatch(has_client, tier) {
+        log::warn!("{}: refused — outside exact slot policy", request.method);
+        return build_error_json(&request.id, -1, "unauthorised");
+    }
+
+    // A ButtonRequired tier is meaningful only if the handler actually stops
+    // for the button. Keep this single gate before dispatch so a new extension
+    // cannot accidentally mutate state merely by omitting approval code from
+    // its individual match arm. Strict v2 denials returned above never prompt.
+    if remote_extension_requires_approval(has_client, &method, tier) {
+        let preview = extension_approval_preview(&requester_label, &request.params);
+        let approval = crate::approval::run_approval_loop(
+            display,
+            button_pin,
+            APPROVAL_TIMEOUT_SECS,
+            |d, remaining| {
+                crate::oled::show_master_sign_request(
+                    d,
+                    master_label,
+                    &request.method,
+                    None,
+                    &preview,
+                    remaining,
+                );
+            },
+        );
+        if let Some(response) = extension_approval_failure(&request.id, approval) {
+            log::info!("{}: physical approval denied or timed out", request.method);
+            crate::oled::show_result(display, "Not approved");
+            return response;
+        }
+        log::info!("{}: physically approved", request.method);
     }
 
     match request.method.as_str() {
@@ -244,18 +419,32 @@ pub fn handle_request(
                     }
                 }
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
-                    let result = handle_sign_event(master_secret, master_mode, secp, display, button_pin, &request, &requester_label);
+                    let result = handle_sign_event(
+                        master_secret,
+                        master_mode,
+                        secp,
+                        display,
+                        button_pin,
+                        &request,
+                        &requester_label,
+                    );
                     let is_success = serde_json::from_str::<serde_json::Value>(&result)
                         .map(|v| v.get("error").is_none())
                         .unwrap_or(false);
                     if has_client && is_success {
                         // Upgrade the slot to full signing if not already.
-                        if let Some(slot) = policy_engine.find_slot_by_pubkey(master_slot, &client_hex) {
+                        if let Some(slot) =
+                            policy_engine.find_slot_by_pubkey(master_slot, &client_hex)
+                        {
                             let idx = slot.slot_index;
                             policy_engine.upgrade_to_signing(master_slot, idx);
                         }
                     }
                     result
+                }
+                heartwood_common::policy::ApprovalTier::Denied => {
+                    log::warn!("sign_event: refused — outside exact slot policy");
+                    build_error_json(&request.id, -1, "unauthorised")
                 }
             }
         }
@@ -276,14 +465,17 @@ pub fn handle_request(
             let client_secret = request.params.get(1).and_then(|v| v.as_str()).unwrap_or("");
             if client_secret.is_empty() {
                 // No secret -- accept but no slot assigned. Stranger path.
-                nip46::build_connect_response(&request.id).unwrap_or_default()
+                connect_success_response(&request.id, client_secret)
             } else if !has_client {
                 build_error_json(&request.id, -1, "missing client pubkey")
             } else {
                 // Look up slot by secret.
                 match policy_engine.find_slot_by_secret(master_slot, client_secret) {
                     None => {
-                        log::warn!("connect: secret mismatch from {}", &client_hex[..16.min(client_hex.len())]);
+                        log::warn!(
+                            "connect: secret mismatch from {}",
+                            &client_hex[..16.min(client_hex.len())]
+                        );
                         build_error_json(&request.id, -1, "unauthorised")
                     }
                     Some(slot) => {
@@ -295,34 +487,57 @@ pub fn handle_request(
                         match &old_pubkey {
                             None => {
                                 // First use -- assign pubkey.
-                                policy_engine.assign_pubkey_to_slot(master_slot, slot_index, client_hex.clone());
+                                policy_engine.assign_pubkey_to_slot(
+                                    master_slot,
+                                    slot_index,
+                                    client_hex.clone(),
+                                );
                                 // Update label from app metadata if slot is still "default".
                                 if !app_label.is_empty() {
                                     let slots = policy_engine.slots_mut(master_slot);
-                                    if let Some(s) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
+                                    if let Some(s) =
+                                        slots.iter_mut().find(|s| s.slot_index == slot_index)
+                                    {
                                         if s.label == "default" {
                                             s.label = app_label.clone();
                                         }
                                     }
                                 }
-                                log::info!("Slot {} ({}) assigned to {}", slot_index, slot_label, &client_hex[..16.min(client_hex.len())]);
+                                log::info!(
+                                    "Slot {} ({}) assigned to {}",
+                                    slot_index,
+                                    slot_label,
+                                    &client_hex[..16.min(client_hex.len())]
+                                );
                             }
                             Some(existing) if existing == &client_hex => {
                                 // Same pubkey reconnecting -- no-op.
-                                log::info!("Slot {} ({}) reconnected (same pubkey)", slot_index, slot_label);
+                                log::info!(
+                                    "Slot {} ({}) reconnected (same pubkey)",
+                                    slot_index,
+                                    slot_label
+                                );
                             }
                             Some(_old) => {
                                 // New ephemeral key for existing slot.
                                 if was_signing {
                                     // OLED flash for signing-approved slots.
-                                    crate::oled::show_auto_approved(display, &slot_label, "reconnected");
+                                    crate::oled::show_auto_approved(
+                                        display,
+                                        &slot_label,
+                                        "reconnected",
+                                    );
                                 }
-                                policy_engine.assign_pubkey_to_slot(master_slot, slot_index, client_hex.clone());
+                                policy_engine.assign_pubkey_to_slot(
+                                    master_slot,
+                                    slot_index,
+                                    client_hex.clone(),
+                                );
                                 log::info!("Slot {} ({}) pubkey swapped", slot_index, slot_label);
                             }
                         }
 
-                        nip46::build_connect_response(&request.id).unwrap_or_default()
+                        connect_success_response(&request.id, client_secret)
                     }
                 }
             }
@@ -345,7 +560,12 @@ pub fn handle_request(
         // asks). `has_client` keeps the local USB user (client = None)
         // unaffected — physical possession is its own authorisation.
         "nip44_encrypt" | "nip44_decrypt" | "nip04_encrypt" | "nip04_decrypt"
-            if has_client && tier == heartwood_common::policy::ApprovalTier::ButtonRequired =>
+            if has_client
+                && matches!(
+                    tier,
+                    heartwood_common::policy::ApprovalTier::ButtonRequired
+                        | heartwood_common::policy::ApprovalTier::Denied
+                ) =>
         {
             log::warn!("{}: refused — unbound client", request.method);
             build_error_json(&request.id, -1, "unauthorised")
@@ -370,9 +590,14 @@ pub fn handle_request(
             };
             let index = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-            let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
+            let cache = match identity_caches
+                .iter_mut()
+                .find(|c| c.master_slot == master_slot)
+            {
                 Some(c) => c,
-                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
+                None => {
+                    return build_error_json(&request.id, -4, "no identity cache for this master")
+                }
             };
 
             match cache.derive_and_cache(&derive_secret, purpose, index, None) {
@@ -383,7 +608,8 @@ pub fn handle_request(
                         "purpose": id.purpose,
                         "index": id.index,
                     });
-                    nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
+                    nip46::build_result_response(&request.id, &result.to_string())
+                        .unwrap_or_default()
                 }
                 Err(e) => build_error_json(&request.id, -4, e),
             }
@@ -407,9 +633,14 @@ pub fn handle_request(
             // persona reproduces byte-for-byte across all of them.
             let purpose = format!("nostr:persona:{name}");
 
-            let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
+            let cache = match identity_caches
+                .iter_mut()
+                .find(|c| c.master_slot == master_slot)
+            {
                 Some(c) => c,
-                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
+                None => {
+                    return build_error_json(&request.id, -4, "no identity cache for this master")
+                }
             };
 
             match cache.derive_and_cache(&derive_secret, &purpose, index, Some(name.to_string())) {
@@ -421,7 +652,8 @@ pub fn handle_request(
                         "index": id.index,
                         "personaName": name,
                     });
-                    nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
+                    nip46::build_result_response(&request.id, &result.to_string())
+                        .unwrap_or_default()
                 }
                 Err(e) => build_error_json(&request.id, -4, e),
             }
@@ -451,16 +683,23 @@ pub fn handle_request(
                 return match pubkey_result {
                     Ok(npub) => {
                         crate::oled::show_identity_switch(display, master_label, "master", &npub);
-                        let result = serde_json::json!({ "npub": npub, "purpose": "master", "index": 0 });
-                        nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
+                        let result =
+                            serde_json::json!({ "npub": npub, "purpose": "master", "index": 0 });
+                        nip46::build_result_response(&request.id, &result.to_string())
+                            .unwrap_or_default()
                     }
                     Err(e) => build_error_json(&request.id, -4, &e),
                 };
             }
 
-            let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
+            let cache = match identity_caches
+                .iter_mut()
+                .find(|c| c.master_slot == master_slot)
+            {
                 Some(c) => c,
-                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
+                None => {
+                    return build_error_json(&request.id, -4, "no identity cache for this master")
+                }
             };
 
             // Search by npub, then persona name, then purpose+index.
@@ -474,13 +713,16 @@ pub fn handle_request(
                 Some(idx) => {
                     // Set active identity on the client session.
                     if let Some(cpk) = client_pubkey {
-                        if let Some(session) = policy_engine.get_or_create_session(*cpk, master_slot) {
+                        if let Some(session) =
+                            policy_engine.get_or_create_session(*cpk, master_slot)
+                        {
                             session.active_identity = Some(idx);
                             log::info!("Set active identity to index {idx}");
                         }
                     }
                     let id = &cache.identities[idx];
-                    // Show the switch on the OLED (OledNotify tier).
+                    // Show the completed switch after the pre-dispatch button
+                    // approval, so the owner sees both the request and result.
                     crate::oled::show_identity_switch(display, master_label, &id.purpose, &id.npub);
                     let mut result = serde_json::json!({
                         "npub": id.npub,
@@ -490,16 +732,22 @@ pub fn handle_request(
                     if let Some(name) = &id.persona_name {
                         result["personaName"] = serde_json::json!(name);
                     }
-                    nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
+                    nip46::build_result_response(&request.id, &result.to_string())
+                        .unwrap_or_default()
                 }
                 None => build_error_json(&request.id, -4, "identity not found in cache"),
             }
         }
 
         "heartwood_list_identities" => {
-            let cache = match identity_caches.iter().find(|c| c.master_slot == master_slot) {
+            let cache = match identity_caches
+                .iter()
+                .find(|c| c.master_slot == master_slot)
+            {
                 Some(c) => c,
-                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
+                None => {
+                    return build_error_json(&request.id, -4, "no identity cache for this master")
+                }
             };
 
             nip46::build_result_response(&request.id, &cache.list_json()).unwrap_or_default()
@@ -510,17 +758,27 @@ pub fn handle_request(
                 Ok(s) => s,
                 Err(e) => return build_error_json(&request.id, -4, e),
             };
-            let lookahead = request.params.first().and_then(|v| v.as_u64()).unwrap_or(20) as u32;
+            let lookahead = request
+                .params
+                .first()
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20) as u32;
 
-            let cache = match identity_caches.iter_mut().find(|c| c.master_slot == master_slot) {
+            let cache = match identity_caches
+                .iter_mut()
+                .find(|c| c.master_slot == master_slot)
+            {
                 Some(c) => c,
-                None => return build_error_json(&request.id, -4, "no identity cache for this master"),
+                None => {
+                    return build_error_json(&request.id, -4, "no identity cache for this master")
+                }
             };
 
             match cache.recover(&derive_secret, lookahead) {
                 Ok(count) => {
                     let identities_json = cache.list_json();
-                    let result = format!(r#"{{"recovered":{count},"identities":{identities_json}}}"#);
+                    let result =
+                        format!(r#"{{"recovered":{count},"identities":{identities_json}}}"#);
                     nip46::build_result_response(&request.id, &result).unwrap_or_default()
                 }
                 Err(e) => build_error_json(&request.id, -4, e),
@@ -584,7 +842,13 @@ fn handle_auto_sign(
 ) -> Result<String, String> {
     let mut event = nip46::parse_unsigned_event(&request.params)
         .map_err(|e| format!("bad event format: {e}"))?;
-    let signed = do_sign(&mut event, master_secret, master_mode, secp, request.heartwood.as_ref())?;
+    let signed = do_sign(
+        &mut event,
+        master_secret,
+        master_mode,
+        secp,
+        request.heartwood.as_ref(),
+    )?;
     nip46::build_sign_response(&request.id, &signed)
 }
 
@@ -627,20 +891,24 @@ fn handle_sign_event(
         ApprovalResult::Approved => {
             log::info!("sign_event: approved");
             crate::oled::show_signing(display);
-            match do_sign(&mut event, master_secret, master_mode, secp, request.heartwood.as_ref()) {
-                Ok(signed) => {
-                    match nip46::build_sign_response(&request.id, &signed) {
-                        Ok(json) => {
-                            crate::oled::show_signed(display);
-                            json
-                        }
-                        Err(e) => {
-                            log::error!("Failed to build sign response: {e}");
-                            crate::oled::show_result(display, "Sign error");
-                            build_error_json(&request.id, -4, "signing failed")
-                        }
+            match do_sign(
+                &mut event,
+                master_secret,
+                master_mode,
+                secp,
+                request.heartwood.as_ref(),
+            ) {
+                Ok(signed) => match nip46::build_sign_response(&request.id, &signed) {
+                    Ok(json) => {
+                        crate::oled::show_signed(display);
+                        json
                     }
-                }
+                    Err(e) => {
+                        log::error!("Failed to build sign response: {e}");
+                        crate::oled::show_result(display, "Sign error");
+                        build_error_json(&request.id, -4, "signing failed")
+                    }
+                },
                 Err(ref e) => {
                     log::error!("Signing failed: {e}");
                     crate::oled::show_error(display, &format!("ERR:{}", &e[..e.len().min(18)]));
@@ -740,25 +1008,21 @@ fn handle_get_public_key(
     request: &nip46::Nip46Request,
 ) -> String {
     let pubkey_result = match &request.heartwood {
-        Some(ctx) => {
-            derivation_secret(master_secret, master_mode)
-                .map_err(|e| format!("derivation_secret: {e}"))
-                .and_then(|ds| derive::create_tree_root(&ds)
-                    .map_err(|e| format!("create_tree_root: {e}")))
-                .and_then(|root| {
-                    derive::derive(&root, &ctx.purpose, ctx.index)
-                        .map_err(|e| format!("derive: {e}"))
-                })
-                .map(|identity| hex_encode(&identity.public_key))
-        }
-        None => {
-            secp256k1::Keypair::from_seckey_slice(secp, master_secret)
-                .map(|keypair| {
-                    let (xonly, _) = keypair.x_only_public_key();
-                    hex_encode(&xonly.serialize())
-                })
-                .map_err(|_| "invalid master secret".to_string())
-        }
+        Some(ctx) => derivation_secret(master_secret, master_mode)
+            .map_err(|e| format!("derivation_secret: {e}"))
+            .and_then(|ds| {
+                derive::create_tree_root(&ds).map_err(|e| format!("create_tree_root: {e}"))
+            })
+            .and_then(|root| {
+                derive::derive(&root, &ctx.purpose, ctx.index).map_err(|e| format!("derive: {e}"))
+            })
+            .map(|identity| hex_encode(&identity.public_key)),
+        None => secp256k1::Keypair::from_seckey_slice(secp, master_secret)
+            .map(|keypair| {
+                let (xonly, _) = keypair.x_only_public_key();
+                hex_encode(&xonly.serialize())
+            })
+            .map_err(|_| "invalid master secret".to_string()),
     };
 
     match pubkey_result {
@@ -800,13 +1064,14 @@ fn handle_nip44_encrypt(
         None => return build_error_json(&request.id, -3, "plaintext param must be a string"),
     };
 
-    let mut signing_secret = match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("nip44_encrypt: key derivation failed: {e}");
-            return build_error_json(&request.id, -4, "key derivation failure");
-        }
-    };
+    let mut signing_secret =
+        match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("nip44_encrypt: key derivation failed: {e}");
+                return build_error_json(&request.id, -4, "key derivation failure");
+            }
+        };
 
     let peer_bytes = match hex_decode_32(peer_hex) {
         Some(b) => b,
@@ -859,13 +1124,14 @@ fn handle_nip44_decrypt(
         None => return build_error_json(&request.id, -3, "ciphertext param must be a string"),
     };
 
-    let mut signing_secret = match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("nip44_decrypt: key derivation failed: {e}");
-            return build_error_json(&request.id, -4, "key derivation failure");
-        }
-    };
+    let mut signing_secret =
+        match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("nip44_decrypt: key derivation failed: {e}");
+                return build_error_json(&request.id, -4, "key derivation failure");
+            }
+        };
 
     let peer_bytes = match hex_decode_32(peer_hex) {
         Some(b) => b,
@@ -886,9 +1152,7 @@ fn handle_nip44_decrypt(
     signing_secret.zeroize();
 
     match nip44::decrypt(&conv_key, ciphertext_b64) {
-        Ok(plaintext) => {
-            nip46::build_result_response(&request.id, &plaintext).unwrap_or_default()
-        }
+        Ok(plaintext) => nip46::build_result_response(&request.id, &plaintext).unwrap_or_default(),
         Err(e) => {
             log::error!("nip44_decrypt: decrypt failed: {e}");
             build_error_json(&request.id, -4, "decryption failed")
@@ -917,13 +1181,14 @@ fn handle_nip04_encrypt(
         None => return build_error_json(&request.id, -3, "plaintext param must be a string"),
     };
 
-    let mut signing_secret = match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("nip04_encrypt: key derivation failed: {e}");
-            return build_error_json(&request.id, -4, "key derivation failure");
-        }
-    };
+    let mut signing_secret =
+        match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("nip04_encrypt: key derivation failed: {e}");
+                return build_error_json(&request.id, -4, "key derivation failure");
+            }
+        };
 
     let peer_bytes = match hex_decode_32(peer_hex) {
         Some(b) => b,
@@ -976,13 +1241,14 @@ fn handle_nip04_decrypt(
         None => return build_error_json(&request.id, -3, "ciphertext param must be a string"),
     };
 
-    let mut signing_secret = match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("nip04_decrypt: key derivation failed: {e}");
-            return build_error_json(&request.id, -4, "key derivation failure");
-        }
-    };
+    let mut signing_secret =
+        match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("nip04_decrypt: key derivation failed: {e}");
+                return build_error_json(&request.id, -4, "key derivation failure");
+            }
+        };
 
     let peer_bytes = match hex_decode_32(peer_hex) {
         Some(b) => b,
@@ -1003,9 +1269,7 @@ fn handle_nip04_decrypt(
     signing_secret.zeroize();
 
     match nip04::decrypt(&shared_secret, ciphertext) {
-        Ok(plaintext) => {
-            nip46::build_result_response(&request.id, &plaintext).unwrap_or_default()
-        }
+        Ok(plaintext) => nip46::build_result_response(&request.id, &plaintext).unwrap_or_default(),
         Err(e) => {
             log::error!("nip04_decrypt: decrypt failed: {e}");
             build_error_json(&request.id, -4, "decryption failed")
@@ -1061,10 +1325,7 @@ fn hex_decode_32(hex: &str) -> Option<[u8; 32]> {
 fn random_nonce_32() -> [u8; 32] {
     let mut nonce = [0u8; 32];
     unsafe {
-        esp_idf_svc::sys::esp_fill_random(
-            nonce.as_mut_ptr() as *mut core::ffi::c_void,
-            32,
-        );
+        esp_idf_svc::sys::esp_fill_random(nonce.as_mut_ptr() as *mut core::ffi::c_void, 32);
     }
     nonce
 }
@@ -1074,10 +1335,7 @@ fn random_nonce_32() -> [u8; 32] {
 fn random_iv_16() -> [u8; 16] {
     let mut iv = [0u8; 16];
     unsafe {
-        esp_idf_svc::sys::esp_fill_random(
-            iv.as_mut_ptr() as *mut core::ffi::c_void,
-            16,
-        );
+        esp_idf_svc::sys::esp_fill_random(iv.as_mut_ptr() as *mut core::ffi::c_void, 16);
     }
     iv
 }
@@ -1099,6 +1357,263 @@ fn build_error_json(request_id: &str, code: i32, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use heartwood_common::nip46;
+    use heartwood_common::policy::{ApprovalTier, ConnectSlot};
+
+    use super::{
+        connect_success_response, denied_before_dispatch, extension_approval_failure,
+        remote_extension_requires_approval, request_may_mutate_slot_state,
+        strict_slot_denies_explicit_context, unbound_remote_request_denied,
+    };
+    use crate::approval::ApprovalResult;
+    use crate::policy::PolicyEngine;
+
+    const CLIENT_HEX: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111"; // pragma: allow-secret — fixed test vector
+
+    fn engine_with_slot(strict: bool, allowed_methods: &[&str]) -> PolicyEngine {
+        let mut engine = PolicyEngine::new();
+        engine.slots_mut(0).push(ConnectSlot {
+            slot_index: 0,
+            label: "handler regression".into(),
+            secret: "22".repeat(32),
+            current_pubkey: Some(CLIENT_HEX.into()),
+            allowed_methods: allowed_methods.iter().map(|method| (*method).into()).collect(),
+            allowed_kinds: vec![],
+            auto_approve: true,
+            signing_approved: allowed_methods.contains(&"sign_event"),
+            strict_permissions: strict,
+            authorized_pubkeys: vec![],
+        });
+        engine
+    }
+
+    #[test]
+    fn strict_denial_blocks_every_extension_before_handler_dispatch() {
+        let engine = engine_with_slot(true, &["get_public_key", "sign_event"]);
+
+        for method_name in [
+            "heartwood_derive",
+            "heartwood_derive_persona",
+            "heartwood_switch",
+            "heartwood_list_identities",
+            "heartwood_recover",
+            "heartwood_create_proof",
+            "heartwood_verify_proof",
+            "future_unknown_method",
+        ] {
+            let method = nip46::Nip46Method::from_str(method_name);
+            let tier = engine.check(0, CLIENT_HEX, &method, None);
+            assert_eq!(
+                tier,
+                ApprovalTier::Denied,
+                "{method_name} must be outside the strict slot ceiling",
+            );
+            assert!(
+                denied_before_dispatch(true, tier),
+                "{method_name} escaped the handler's pre-dispatch denial",
+            );
+        }
+    }
+
+    #[test]
+    fn pre_dispatch_gate_preserves_allowed_and_legacy_control_paths() {
+        let strict = engine_with_slot(true, &["nip44_encrypt"]);
+        let allowed = nip46::Nip46Method::from_str("nip44_encrypt");
+        let allowed_tier = strict.check(0, CLIENT_HEX, &allowed, None);
+        assert_eq!(allowed_tier, ApprovalTier::AutoApprove);
+        assert!(!denied_before_dispatch(true, allowed_tier));
+
+        // Protocol plumbing remains global even when omitted from a strict
+        // slot's explicit automatic-authority list.
+        for method_name in ["connect", "ping", "get_public_key", "switch_relays"] {
+            let method = nip46::Nip46Method::from_str(method_name);
+            let tier = strict.check(0, CLIENT_HEX, &method, None);
+            assert_eq!(
+                tier,
+                ApprovalTier::AutoApprove,
+                "{method_name} must remain global protocol plumbing",
+            );
+            assert!(!denied_before_dispatch(true, tier));
+        }
+
+        // Legacy slots retain their historical physical-button fallback rather
+        // than being converted into hard denials by the handler gate.
+        let legacy = engine_with_slot(false, &[]);
+        for method_name in ["heartwood_derive", "heartwood_switch"] {
+            let method = nip46::Nip46Method::from_str(method_name);
+            let tier = legacy.check(0, CLIENT_HEX, &method, None);
+            assert_eq!(tier, ApprovalTier::ButtonRequired);
+            assert!(!denied_before_dispatch(true, tier));
+            assert!(remote_extension_requires_approval(true, &method, tier));
+        }
+
+        // No remote client means the direct USB path remains outside this gate.
+        assert!(!denied_before_dispatch(false, ApprovalTier::Denied));
+    }
+
+    #[test]
+    fn unbound_remote_clients_cannot_enter_physical_approval_loops() {
+        for method_name in ["sign_event", "heartwood_derive", "heartwood_switch"] {
+            let method = nip46::Nip46Method::from_str(method_name);
+            assert!(
+                unbound_remote_request_denied(true, false, &method),
+                "{method_name} would let a stranger occupy the relay loop",
+            );
+            assert!(
+                !unbound_remote_request_denied(true, true, &method),
+                "a slot-bound client must retain physical approval fallback",
+            );
+            assert!(
+                !unbound_remote_request_denied(false, false, &method),
+                "direct USB retains physical-possession approval",
+            );
+        }
+
+        for method_name in ["connect", "ping", "get_public_key"] {
+            let method = nip46::Nip46Method::from_str(method_name);
+            assert!(!unbound_remote_request_denied(true, false, &method));
+        }
+    }
+
+    #[test]
+    fn exact_slots_reject_caller_selected_derived_identity_context() {
+        // The gate is deliberately method-independent: get_public_key,
+        // sign_event and every standard crypto method could otherwise resolve
+        // the same caller-selected child secret.
+        for method_name in [
+            "get_public_key",
+            "sign_event",
+            "nip44_encrypt",
+            "nip44_decrypt",
+            "nip04_encrypt",
+            "nip04_decrypt",
+        ] {
+            let _method = nip46::Nip46Method::from_str(method_name);
+            assert!(
+                strict_slot_denies_explicit_context(true, true, true),
+                "{method_name} escaped strict identity scoping",
+            );
+        }
+
+        assert!(!strict_slot_denies_explicit_context(true, false, true));
+        assert!(!strict_slot_denies_explicit_context(true, true, false));
+        assert!(!strict_slot_denies_explicit_context(false, true, true));
+    }
+
+    #[test]
+    fn remote_mutating_extensions_dispatch_only_after_approval() {
+        for method_name in [
+            "heartwood_derive",
+            "heartwood_derive_persona",
+            "heartwood_recover",
+            "heartwood_switch",
+        ] {
+            let method = nip46::Nip46Method::from_str(method_name);
+            assert!(
+                remote_extension_requires_approval(
+                    true,
+                    &method,
+                    ApprovalTier::ButtonRequired,
+                ),
+                "{method_name} escaped the central remote approval gate",
+            );
+        }
+
+        assert!(extension_approval_failure("approved", ApprovalResult::Approved).is_none());
+
+        let denied = extension_approval_failure("denied", ApprovalResult::Denied)
+            .expect("denial must stop dispatch");
+        let denied: serde_json::Value = serde_json::from_str(&denied).unwrap();
+        assert_eq!(denied["id"], "denied");
+        assert_eq!(denied["error"], "user denied");
+
+        let timed_out = extension_approval_failure("timed-out", ApprovalResult::TimedOut)
+            .expect("timeout must stop dispatch");
+        let timed_out: serde_json::Value = serde_json::from_str(&timed_out).unwrap();
+        assert_eq!(timed_out["id"], "timed-out");
+        assert_eq!(timed_out["error"], "timeout");
+    }
+
+    #[test]
+    fn central_extension_gate_excludes_usb_sign_event_and_remote_crypto() {
+        let derive = nip46::Nip46Method::HeartwoodDerive;
+        assert!(!remote_extension_requires_approval(
+            false,
+            &derive,
+            ApprovalTier::ButtonRequired,
+        ));
+        assert!(!remote_extension_requires_approval(
+            true,
+            &nip46::Nip46Method::SignEvent,
+            ApprovalTier::ButtonRequired,
+        ));
+        assert!(!remote_extension_requires_approval(
+            true,
+            &nip46::Nip46Method::Nip44Decrypt,
+            ApprovalTier::ButtonRequired,
+        ));
+    }
+
+    #[test]
+    fn slot_mutation_snapshot_is_needed_only_for_connect_binding_or_first_sign() {
+        let connect: nip46::Nip46Request = serde_json::from_value(serde_json::json!({
+            "id": "connect",
+            "method": "connect",
+            "params": [CLIENT_HEX, "22".repeat(32)]
+        }))
+        .unwrap();
+        assert!(request_may_mutate_slot_state(
+            &connect,
+            ApprovalTier::AutoApprove,
+        ));
+
+        let reconnect_without_secret: nip46::Nip46Request =
+            serde_json::from_value(serde_json::json!({
+                "id": "connect",
+                "method": "connect",
+                "params": [CLIENT_HEX]
+            }))
+            .unwrap();
+        assert!(!request_may_mutate_slot_state(
+            &reconnect_without_secret,
+            ApprovalTier::AutoApprove,
+        ));
+
+        let sign: nip46::Nip46Request = serde_json::from_value(serde_json::json!({
+            "id": "sign",
+            "method": "sign_event",
+            "params": [{}]
+        }))
+        .unwrap();
+        assert!(request_may_mutate_slot_state(
+            &sign,
+            ApprovalTier::ButtonRequired,
+        ));
+        assert!(!request_may_mutate_slot_state(
+            &sign,
+            ApprovalTier::AutoApprove,
+        ));
+    }
+
+    #[test]
+    fn connect_response_echoes_a_supplied_secret_but_keeps_stranger_ack() {
+        let stranger: serde_json::Value = serde_json::from_str(&connect_success_response(
+            "connect-without-secret",
+            "",
+        ))
+        .expect("secretless connect response should be valid JSON");
+        assert_eq!(stranger["id"], "connect-without-secret");
+        assert_eq!(stranger["result"], "ack");
+
+        let secret = "aabbccdd".repeat(8);
+        let paired: serde_json::Value = serde_json::from_str(&connect_success_response(
+            "connect-with-secret",
+            &secret,
+        ))
+        .expect("secret-bearing connect response should be valid JSON");
+        assert_eq!(paired["id"], "connect-with-secret");
+        assert_eq!(paired["result"], secret);
+    }
 
     /// switch_relays is a non-standard method sent by Coracle during its
     /// NIP-46 handshake. The handler must return a success response (not an
@@ -1110,11 +1625,14 @@ mod tests {
         // Simulate what the handler does for the switch_relays arm.
         let response_json = nip46::build_result_response(request_id, "{}").unwrap();
 
-        let parsed: serde_json::Value = serde_json::from_str(&response_json)
-            .expect("response should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response_json).expect("response should be valid JSON");
 
         // The id must be echoed back.
-        assert_eq!(parsed["id"], request_id, "response id must match request id");
+        assert_eq!(
+            parsed["id"], request_id,
+            "response id must match request id"
+        );
 
         // result must be present and must not be an error.
         assert!(
@@ -1126,5 +1644,4 @@ mod tests {
             "switch_relays result should be an empty JSON object string"
         );
     }
-
 }

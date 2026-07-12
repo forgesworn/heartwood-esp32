@@ -5,7 +5,9 @@ Hard tier refactor see [`docs/plans/2026-04-05-true-zero-trust-bridge.md`](plans
 
 ## System overview
 
-Three independent components, two trust boundaries, one physical button.
+Three independent components and two trust boundaries. The physical button is
+the local approval path; exact operator-installed policies are the unattended
+path.
 
 ```mermaid
 flowchart LR
@@ -22,7 +24,7 @@ flowchart LR
         Sapwood["Sapwood management UI<br/>served on :3100"]
     end
 
-    subgraph HSM["Sealed hardware -- Heltec V3 or V4"]
+    subgraph HSM["Sealed hardware -- supported ESP32 board"]
         Firmware["Heartwood firmware<br/>holds master nsecs<br/>(multiple identities)"]
         OLED["OLED + button"]
     end
@@ -39,11 +41,16 @@ flowchart LR
     style Anywhere fill:#0c0a09,stroke:#737373,color:#e8f4f8
 ```
 
+The diagram shows USB-bridge mode. In WiFi-standalone mode the firmware itself
+holds the outbound relay connection, and a phone running Sapwood reaches its
+separate kind-24134 management address through those relays; no inbound port or
+Pi is required.
+
 Trust boundaries, from inside out:
 
-1. **HSM** (green). The only place a master nsec exists. Every signing operation happens here, always behind a physical button press with the event shown on the OLED. Flash encryption is deliberately disabled so the device can be reused, but physical custody is the root of security.
-2. **Pi** (blue). Holds only ephemeral keys: a relay-layer transport identity, a bridge-to-device session auth secret, and an API token for Sapwood. Compromise exposes ciphertext in flight and metadata, but cannot forge a signature for any user identity.
-3. **Relays and clients** (grey). See only ciphertext and public metadata.
+1. **HSM** (green). The only place a master nsec exists and the only component that creates master signatures. A request needs either a physical button approval or authority already granted by its exact client-slot policy. Flash encryption is deliberately disabled so the device can be reused; see the separate PIN trade-off in `SECURITY-MODEL.md`.
+2. **Pi** (blue, USB mode only). Holds transport/session material but no master signing key. Compromise exposes ciphertext in flight and metadata; it cannot extract a master key or expand an on-device slot policy.
+3. **Relays and clients** (grey). Relays see ciphertext and public metadata. A paired client can exercise the exact automatic authority of its slot; it cannot expand that policy.
 
 ## What lives where
 
@@ -51,7 +58,7 @@ Trust boundaries, from inside out:
 |---|---|---|---|---|
 | Master nsec (identity A) | ✗ | ✗ | ✓ (NVS) | ✗ |
 | Master nsec (identity B) | ✗ | ✗ | ✓ (NVS) | ✗ |
-| Connect secret (per master) | ✗ | transiently, forwarded from device | ✓ (NVS) | ✗ |
+| Connect secret (per client slot) | delivered to that client | transiently, if bridged | ✓ (NVS) | encrypted only |
 | Bridge session secret | ✗ | ✓ (`bunker.env`, root 0600) | ✓ (NVS) | ✗ |
 | Pi bunker/relay secret | ✗ | ✓ (`bunker.env`, root 0600) | ✗ | ✗ |
 | API token for Sapwood | ✗ | ✓ (`bunker.env`, root 0600) | ✗ | ✗ |
@@ -61,7 +68,14 @@ Trust boundaries, from inside out:
 
 Key property: **every row that contains a master nsec has only one tick, and it is in the HSM column.**
 
-## Signing flow — `sign_event` end to end
+## Signing flow — button-required `sign_event` end to end
+
+This sequence is the physical-approval branch: a direct-USB request, a
+slot-bound legacy first sign, or a slot configured to ask. An unbound relay
+peer is rejected before the button loop. For an exact v2 slot with matching method/kind authority and
+`auto_approve=true`, steps 9–10 are replaced by the policy check and the device
+signs unattended. Requests outside a strict v2 ceiling are denied, not offered
+to the button.
 
 ```mermaid
 sequenceDiagram
@@ -70,7 +84,7 @@ sequenceDiagram
     participant Bark
     participant Relay
     participant Bridge as Bridge (mypi)
-    participant HSM as HSM (Heltec V3/V4)
+    participant HSM as HSM (supported ESP32 board)
 
     User->>Bark: "Publish note as my-identity"
     Note over Bark: Ephemeral client_priv already<br/>generated at pair time
@@ -109,7 +123,12 @@ sequenceDiagram
     Bark->>User: Show signed note, publish to relays
 ```
 
-The critical line is step 10 **Press button for 2s**. Everything between "Publish note" and "Press button" is cryptographic shuffling. The only authority that makes the actual signature happen is a human standing at the device with eyes on the OLED. That is the root of trust, and it cannot be bypassed by any amount of compromise elsewhere in the stack.
+For this branch, step 10 **Press button for 2s** is the authority. The other
+legitimate authority source is an exact policy installed by the authenticated
+Sapwood operator for a particular client, method set, and optional event-kind
+set. Compromise of a paired client is therefore bounded by its slot; compromise
+of the operator key is broader because the operator can install or replace such
+policies. Neither path exports the master secret.
 
 ## Why the bridge holds no signing key
 
@@ -156,7 +175,7 @@ Three components:
 
 1. **Master pubkey** — the x-only pubkey of the HSM master you want clients to sign through. Clients NIP-44 encrypt their requests to this pubkey; only the HSM can decrypt.
 2. **Relays** — the public mailboxes where Bark publishes requests and the bridge publishes responses. Both sides subscribe and read asynchronously; neither needs direct network reachability.
-3. **Connect secret** — 32 random bytes generated on-device at provisioning time, stored in NVS alongside the master. Clients echo it back on first `connect`. Successful match TOFU-approves the client for crypto methods; failed match is rejected as `unauthorised`. **It is not a signing key, not a password, and not an encryption key — it is a proof of possession of the URI.**
+3. **Connect secret** — 32 random bytes generated on-device for one client slot and stored with that slot in NVS. Clients echo it back on first `connect`. Successful match binds the client key to that slot and its policy; failed match is rejected as `unauthorised`. **It is not a signing key or encryption key — it is a bearer credential proving possession of that slot URI.**
 
 The bridge queries the device for this URI at startup via the `BUNKER_URI_REQUEST` frame and serves it on `GET /api/bridge/info`. The bridge does not generate any part of the URI itself; it is a pure transcriber from the HSM's NVS-stored values.
 
@@ -186,21 +205,32 @@ Two delivery paths for Sapwood:
 
 - **Served from the bridge** (what you get at `http://mypi.local:3100/`). Same-origin, zero friction. The bridge templates the API token into a `<meta name="heartwood-api-token">` tag in `index.html` at serve time, and Sapwood's `http.ts` reads it and sends it on every protected request. No manual token entry.
 - **Served from GitHub Pages** (`forgesworn.github.io/sapwood`, no bridge in the picture). Used for the initial-setup Web Serial flow where the browser talks to the HSM directly over USB. The meta tag placeholder stays literal, `http.ts` detects that and sends no auth header.
+- **Connected to a WiFi signer by address** (including from a phone in another country). Sapwood signs encrypted kind-24134 requests with the provisioned operator key and exchanges them through the signer's configured relays. Client policy and staged network mutations are remote; seed/PIN/trust-root changes, factory reset, and OTA are not.
 
-Destructive actions (`factory-reset`, `ota`, `clients/*` DELETE) are protected by **two** factors:
+Factory reset, seed/PIN changes, and OTA remain USB/local and physically
+confirmed where applicable. Client create/approve/update/revoke and staged WiFi
+changes are deliberately available to the authenticated relay operator without
+a local button; every mutation consumes a durable one-time challenge before it
+is applied. The operator key must therefore be backed up and protected as a real
+management authority, not treated as a read-only dashboard token.
 
-1. Bearer token (keeps casual LAN attackers out).
-2. Physical button press on the HSM (firmware-enforced — even a bearer-token holder cannot brick the device without being in the room).
+Numeric client-slot indices are reusable, so every approve/update/revoke or
+credential-returning `client_uri` request also names the non-secret SHA-256
+fingerprint returned by `list_clients`. A stale phone view therefore cannot act
+on, or retrieve the bearer URI for, a different client that later inherited the
+same index. Slot writes are read back exactly before success; on failure the
+complete prior authority snapshot is restored and written back before a normal
+error is returned.
 
 ## Threat model in one table
 
 | Attacker capability | What they can do | What they cannot do |
 |---|---|---|
 | Read relay events | See metadata (who talks to whom, when). See ciphertext. | Decrypt requests or responses. |
-| Compromise Bark on user's machine | Request signatures. See decrypted responses. | Sign without HSM button press. Forge events without user consent. |
-| Root on mypi (Pi) | Read ciphertext in flight. Read the ephemeral bunker key, bridge secret, API token. DoS the bridge. Impersonate the bridge on relays for the transport layer only. | Sign as any master. Read NIP-44 payload plaintext (device-decrypts mode). |
-| Physical possession of HSM | Read npubs via `PROVISION_LIST`. Attempt PIN unlock (if set). | Sign without pressing button. Extract master nsecs without physical flash dump (no flash encryption = one further line of defence you could enable if this matters in your threat model). |
-| Physical possession of HSM + user compelled to press button | Sign whatever is on the OLED. | Sign events the user cannot see (OLED shows the exact event being signed). Sign many events without repeated presses (each signature = one press). |
+| Compromise a paired client | Read its decrypted responses and obtain automatic signatures inside its exact slot method/kind ceiling; legacy requests may still prompt locally. | Extract the master seed or expand/rewrite its own strict policy. |
+| Compromise the Sapwood operator key | Create/revoke clients, install bounded signing policies, and stage rollback-safe WiFi changes. | Export/replace the seed, rotate its own trust root, change the PIN, factory-reset, or push firmware remotely. |
+| Root on mypi (Pi) | Read/deny ciphertext in flight and use whatever local bridge-management material is configured. | Extract a master seed; bypass the device's policy/approval decision merely by forging a relay envelope. |
+| Physical possession of HSM | Read npubs and, without PIN-derived seed encryption, dump plaintext NVS through the ROM bootloader. | Remotely erase the limitations of secure boot/flash encryption; those are explicitly out of scope. |
 
 The coercion-resistance stack (canary + spoken-token + ring-signature + button composition) that mitigates the "user compelled to press button" row is deliberately **out of scope** for this repo and reserved for dedicated grant work.
 
@@ -210,24 +240,24 @@ The coercion-resistance stack (canary + spoken-token + ring-signature + button c
 flowchart LR
     subgraph Dev["Developer laptop (macOS)"]
         Src["common/ bridge/ firmware/"]
-        Xtensa["cargo build --release<br/>(xtensa-esp32s3-espidf)"]
+        FirmwareBuild["build-firmware.sh &lt;board&gt; --release<br/>(board-specific target)"]
         Cross["cross build --release<br/>(aarch64-unknown-linux-gnu)"]
         Espflash["espflash flash<br/>USB -> HSM"]
     end
 
     subgraph Target["Deployment targets"]
-        HSM2["Heltec V3/V4 HSM"]
+        HSM2["Supported ESP32 HSM"]
         Pi2["mypi (Pi)"]
     end
 
-    Src --> Xtensa --> Espflash --> HSM2
+    Src --> FirmwareBuild --> Espflash --> HSM2
     Src --> Cross -.scp.-> Pi2
 
     style HSM2 fill:#1a1a2e,stroke:#16a34a,color:#e8f4f8
     style Pi2 fill:#0f1419,stroke:#3b82f6,color:#e8f4f8
 ```
 
-- **Firmware** (`firmware/`) cross-compiles via the ESP Rust toolchain (`espup install --toolchain-version 1.87.0.0`) to `xtensa-esp32s3-espidf`. The `build.rs` copies `partitions.csv` into the esp-idf-sys generated CMake project directory to work around an upstream path-resolution quirk. Board selection is compile-time: the `heltec-v3` or `heltec-v4` cargo feature picks the right host-transport driver (UART0 + CP2102 on V3, native USB-Serial-JTAG on V4) and a matching `sdkconfig.defaults.<board>` fragment configures ESP-IDF's logging console. Use `scripts/build-firmware.sh {v3|v4}` so both move together. Flashing is via `espflash` over USB.
+- **Firmware** (`firmware/`) cross-compiles via the ESP Rust toolchain (`espup install --toolchain-version 1.87.0.0`). Board selection is compile-time: Heltec V3/V4 target ESP32-S3, T-Display targets classic ESP32, and Waveshare C6 targets ESP32-C6. Each feature selects the matching display and host transport. Use `scripts/build-firmware.sh {v3|v4|tdisplay|c6}` so the feature, target triple, MCU, and `sdkconfig.defaults.<board>` fragment move together. Flashing is via `espflash` over USB.
 - **Bridge** (`bridge/`) cross-compiles to `aarch64-unknown-linux-gnu` via the `cross` crate (Docker-based cross build from macOS). The binary gets scp'd to mypi and installed to `/usr/local/bin/heartwood-bridge`.
 - **Sapwood** (separate repo, `sapwood/`) builds as a Vite static site and gets rsync'd to `/opt/sapwood/dist` on mypi. The bridge's `--sapwood-dir` flag serves it from `/`.
 

@@ -283,13 +283,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify the tag matches firmware/Cargo.toml
+      - name: Verify the tag and embedded app version agree
         run: |
           set -eu
           version="${GITHUB_REF_NAME#v}"
           cargo_version="$(grep -m1 '^version' firmware/Cargo.toml | cut -d'"' -f2)"
+          esp8266_version="$(grep -m1 '^version' esp8266-firmware/Cargo.toml | cut -d'"' -f2)"
+          idf_version="$(sed -n 's/^CONFIG_APP_PROJECT_VER="\([^"]*\)"/\1/p' firmware/sdkconfig.defaults | head -n 1)"
           if [ "$version" != "$cargo_version" ]; then
             echo "::error::tag $GITHUB_REF_NAME ($version) != firmware/Cargo.toml ($cargo_version)"
+            exit 1
+          fi
+          if [ "$version" != "$idf_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME ($version) != ESP-IDF app descriptor ($idf_version)"
+            exit 1
+          fi
+          if [ "$version" != "$esp8266_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME ($version) != esp8266-firmware/Cargo.toml ($esp8266_version)"
             exit 1
           fi
 

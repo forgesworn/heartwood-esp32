@@ -2,9 +2,10 @@
 //
 // PIN-derived seed encryption at rest (P5) — the eFuse-free device-theft
 // mitigation. When a PIN is set, each master seed is stored ENCRYPTED
-// (`master_<slot>_secret_enc`, see heartwood_common::seed_cipher) and the
+// (`m<slot>_seed_enc`, see heartwood_common::seed_cipher) and the
 // plaintext is removed. On boot the device is locked until a PIN_UNLOCK frame
-// decrypts the seeds into RAM. After 5 failed attempts the NVS is wiped.
+// decrypts the seeds into RAM. After 5 failed attempts both the flash-time
+// config source and the complete NVS partition are wiped.
 //
 // There is deliberately NO stored hash of the PIN. A fast hash would let an
 // attacker who owns the flash brute-force the PIN against it (instant),
@@ -24,7 +25,7 @@ use heartwood_common::seed_cipher::{decrypt_seed, encrypt_seed, NONCE_LEN, SALT_
 use heartwood_common::types::{FRAME_TYPE_ACK, FRAME_TYPE_NACK};
 
 const NVS_PIN_ATTEMPTS_KEY: &str = "pin_attempts";
-const MAX_FAILED_ATTEMPTS: u8 = 5;
+pub const MAX_FAILED_ATTEMPTS: u8 = 5;
 
 /// True if any loaded master's seed is encrypted and not yet decrypted — i.e.
 /// the device is PIN-locked and must be unlocked before its seeds are usable.
@@ -42,17 +43,29 @@ fn fill_random(buf: &mut [u8]) {
     }
 }
 
-/// Read the persisted failed-attempt counter from NVS (0 if unset).
-pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> u8 {
+/// Read the persisted failed-attempt counter from NVS. Malformed/unreadable
+/// state stays distinct from absence so boot can fail closed into a wipe.
+pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str> {
     let mut buf = [0u8; 1];
     match nvs.get_blob(NVS_PIN_ATTEMPTS_KEY, &mut buf) {
-        Ok(Some(b)) if b.len() == 1 => buf[0],
-        _ => 0,
+        Ok(Some(b)) if b.len() == 1 => Ok(buf[0]),
+        Ok(Some(_)) => Err("malformed PIN-attempt state"),
+        Ok(None) => Ok(0),
+        Err(_) => Err("could not read PIN-attempt state"),
     }
 }
 
-fn write_failed_attempts(nvs: &mut EspNvs<NvsDefault>, count: u8) {
-    let _ = nvs.set_blob(NVS_PIN_ATTEMPTS_KEY, &[count]);
+fn write_failed_attempts(
+    nvs: &mut EspNvs<NvsDefault>,
+    count: u8,
+) -> Result<(), &'static str> {
+    nvs.set_blob(NVS_PIN_ATTEMPTS_KEY, &[count])
+        .map_err(|_| "could not persist PIN-attempt state")?;
+    if read_failed_attempts(nvs)? == count {
+        Ok(())
+    } else {
+        Err("PIN-attempt state verification failed")
+    }
 }
 
 fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
@@ -141,6 +154,14 @@ pub fn handle_pin_unlock(
     failed_attempts: &mut u8,
     display: &mut crate::oled::Display<'_>,
 ) -> bool {
+    // A power cycle after the threshold must not offer a sixth guess, even if
+    // the previous erase attempt failed. Retry the complete wipe first.
+    if *failed_attempts >= MAX_FAILED_ATTEMPTS {
+        log::error!("PIN wipe threshold already reached — retrying persistent wipe");
+        crate::oled::show_error(display, "PIN LOCKED\nWIPING...");
+        wipe_and_reboot(usb, display);
+    }
+
     if payload.is_empty() || payload.len() > 8 {
         log::warn!("PIN_UNLOCK: invalid PIN length {}", payload.len());
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
@@ -156,15 +177,22 @@ pub fn handle_pin_unlock(
         protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
         true
     } else {
-        *failed_attempts += 1;
-        write_failed_attempts(nvs, *failed_attempts);
+        *failed_attempts = failed_attempts.saturating_add(1);
+        if let Err(e) = write_failed_attempts(nvs, *failed_attempts) {
+            // If the durable counter cannot be trusted, do not grant further
+            // guesses that a reboot could reset.
+            log::error!("PIN attempt persistence failed ({e}) — wiping fail-closed");
+            crate::oled::show_error(display, "PIN STATE ERROR\nWIPING...");
+            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+            wipe_and_reboot(usb, display);
+        }
         log::warn!("PIN incorrect — attempt {}/{}", failed_attempts, MAX_FAILED_ATTEMPTS);
 
         if *failed_attempts >= MAX_FAILED_ATTEMPTS {
             log::error!("Too many failed PIN attempts — factory reset!");
             crate::oled::show_error(display, "PIN LOCKED\nWIPING...");
             esp_idf_hal::delay::FreeRtos::delay_ms(2000);
-            wipe_and_reboot();
+            wipe_and_reboot(usb, display);
         }
 
         let remaining = MAX_FAILED_ATTEMPTS - *failed_attempts;
@@ -249,19 +277,31 @@ pub fn handle_set_pin(
     }
 }
 
-/// Erase the entire NVS partition and reboot — the automatic security wipe
-/// after too many failed PIN attempts. No button confirmation: reaching the
-/// threshold is already a hostile event.
-fn wipe_and_reboot() -> ! {
-    unsafe {
-        let part = esp_idf_svc::sys::esp_partition_find_first(
-            esp_idf_svc::sys::esp_partition_type_t_ESP_PARTITION_TYPE_DATA,
-            esp_idf_svc::sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_DATA_NVS,
-            std::ptr::null(),
-        );
-        if !part.is_null() {
-            esp_idf_svc::sys::esp_partition_erase_range(part, 0, (*part).size as usize);
+/// Erase both persistent state sources and reboot — the automatic security
+/// wipe after too many failed PIN attempts. No button confirmation: reaching
+/// the threshold is already a hostile event. Any erase/verification failure is
+/// reported and retried without returning to unlock or signing.
+pub fn wipe_and_reboot(
+    usb: &mut SerialPort<'_>,
+    display: &mut crate::oled::Display<'_>,
+) -> ! {
+    let mut failure_reported = false;
+    loop {
+        match crate::persistent_wipe::erase_all() {
+            Ok(()) => {
+                crate::oled::show_error(display, "Wipe complete\nRebooting...");
+                esp_idf_hal::delay::FreeRtos::delay_ms(500);
+                unsafe { esp_idf_svc::sys::esp_restart() }
+            }
+            Err(e) => {
+                log::error!("PIN-threshold persistent wipe failed: {e}");
+                crate::oled::show_error(display, "ERASE FAILED\nRetrying...");
+                if !failure_reported {
+                    protocol::write_frame(usb, FRAME_TYPE_NACK, b"erase_failed");
+                    failure_reported = true;
+                }
+                esp_idf_hal::delay::FreeRtos::delay_ms(2000);
+            }
         }
-        esp_idf_svc::sys::esp_restart();
     }
 }

@@ -8,8 +8,10 @@ use std::time::Instant;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{
-    ApprovalTier, ConnectSlot, CONNECT_SAFE_METHODS, TOFU_SAFE_METHODS,
-    authorize_pubkey_on_slot, find_slot_by_pubkey, find_slot_by_secret, next_slot_index,
+    authorize_pubkey_on_unique_slot, evaluate_slot_policy, find_slot_by_pubkey,
+    find_slot_by_secret, grant_slot_signing, next_slot_index, remove_ambiguous_pubkeys,
+    strict_slot_denies_method, validate_exact_slot_policy, ApprovalTier, ConnectSlot,
+    ExactSlotPolicy, CONNECT_SAFE_METHODS,
 };
 
 /// Maximum concurrent client sessions.
@@ -25,6 +27,16 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub struct MasterSlots {
     pub master_slot: u8,
     pub slots: Vec<ConnectSlot>,
+}
+
+/// In-memory rollback point around a request that may change slot authority.
+/// Callers persist after dispatch; if that write fails, restoring this snapshot
+/// prevents a success response from leaving volatile authority active in RAM.
+#[derive(Clone)]
+pub struct SlotStateSnapshot {
+    master_slot: u8,
+    slots: Option<Vec<ConnectSlot>>,
+    slots_dirty: bool,
 }
 
 /// Per-client session state (rate limiting + active identity).
@@ -93,19 +105,15 @@ impl PolicyEngine {
         method: &Nip46Method,
         event_kind: Option<u64>,
     ) -> ApprovalTier {
-        // Methods that always auto-approve (ping, connect, get_public_key).
-        if method.always_auto_approve() {
+        // Protocol plumbing remains global even for an exact v2 slot.
+        if matches!(
+            method,
+            Nip46Method::Connect
+                | Nip46Method::Ping
+                | Nip46Method::GetPublicKey
+                | Nip46Method::SwitchRelays
+        ) {
             return ApprovalTier::AutoApprove;
-        }
-
-        // Methods that always require button (heartwood_derive).
-        if method.always_requires_button() {
-            return ApprovalTier::ButtonRequired;
-        }
-
-        // OLED-notify methods.
-        if method.is_oled_notify() {
-            return ApprovalTier::OledNotify;
         }
 
         // Look up slot for this client pubkey.
@@ -117,42 +125,35 @@ impl PolicyEngine {
             .iter()
             .find(|ms| ms.master_slot == master_slot);
 
-        let slots = match slots {
-            Some(ms) => &ms.slots,
-            None => return ApprovalTier::ButtonRequired,
-        };
+        let slot = slots.and_then(|ms| find_slot_by_pubkey(&ms.slots, client_pubkey));
 
-        let slot = find_slot_by_pubkey(slots, client_pubkey);
+        // Exact v2 policy is a hard method ceiling, including Heartwood
+        // extensions that legacy clients may button-approve or auto-run. Check
+        // it before those legacy invariants so an omitted extension is denied,
+        // not merely downgraded to a physical prompt.
+        if let Some(slot) = slot {
+            if strict_slot_denies_method(slot, method.as_str()) {
+                return ApprovalTier::Denied;
+            }
+        }
+
+        // Legacy Heartwood extension invariants remain unchanged.
+        if method.always_requires_button() {
+            return ApprovalTier::ButtonRequired;
+        }
+        if method.is_oled_notify() {
+            return ApprovalTier::OledNotify;
+        }
+        if method.always_auto_approve() {
+            return ApprovalTier::AutoApprove;
+        }
 
         let slot = match slot {
             Some(s) => s,
             None => return ApprovalTier::ButtonRequired,
         };
 
-        if !slot.auto_approve {
-            return ApprovalTier::ButtonRequired;
-        }
-
-        // Check method is in allowed list.
-        let method_str = method.as_str();
-        if !slot.allowed_methods.is_empty()
-            && !slot.allowed_methods.iter().any(|m| m == method_str)
-        {
-            return ApprovalTier::ButtonRequired;
-        }
-
-        // For sign_event, check kind is in allowed list.
-        if matches!(method, Nip46Method::SignEvent) {
-            if let Some(kind) = event_kind {
-                if !slot.allowed_kinds.is_empty()
-                    && !slot.allowed_kinds.contains(&kind)
-                {
-                    return ApprovalTier::ButtonRequired;
-                }
-            }
-        }
-
-        ApprovalTier::AutoApprove
+        evaluate_slot_policy(slot, method.as_str(), event_kind)
     }
 
     /// Find or create a client session. Returns mutable reference.
@@ -161,9 +162,10 @@ impl PolicyEngine {
         client_pubkey: [u8; 32],
         master_slot: u8,
     ) -> Option<&mut ClientSession> {
-        let existing = self.sessions.iter().position(|s| {
-            s.client_pubkey == client_pubkey && s.master_slot == master_slot
-        });
+        let existing = self
+            .sessions
+            .iter()
+            .position(|s| s.client_pubkey == client_pubkey && s.master_slot == master_slot);
 
         if let Some(idx) = existing {
             return Some(&mut self.sessions[idx]);
@@ -174,7 +176,8 @@ impl PolicyEngine {
             return None;
         }
 
-        self.sessions.push(ClientSession::new(client_pubkey, master_slot));
+        self.sessions
+            .push(ClientSession::new(client_pubkey, master_slot));
         self.sessions.last_mut()
     }
 
@@ -200,8 +203,15 @@ impl PolicyEngine {
 
     /// Mutable access to the slot vec for a master slot, creating the entry if absent.
     pub(crate) fn slots_mut(&mut self, master_slot: u8) -> &mut Vec<ConnectSlot> {
-        if !self.master_slots.iter().any(|ms| ms.master_slot == master_slot) {
-            self.master_slots.push(MasterSlots { master_slot, slots: Vec::new() });
+        if !self
+            .master_slots
+            .iter()
+            .any(|ms| ms.master_slot == master_slot)
+        {
+            self.master_slots.push(MasterSlots {
+                master_slot,
+                slots: Vec::new(),
+            });
         }
         // Safe: we just ensured the entry exists.
         self.master_slots
@@ -209,6 +219,60 @@ impl PolicyEngine {
             .find(|ms| ms.master_slot == master_slot)
             .map(|ms| &mut ms.slots)
             .unwrap()
+    }
+
+    /// Capture the complete slot state for one master before request dispatch.
+    pub fn snapshot_slot_state(&self, master_slot: u8) -> SlotStateSnapshot {
+        SlotStateSnapshot {
+            master_slot,
+            slots: self
+                .master_slots
+                .iter()
+                .find(|entry| entry.master_slot == master_slot)
+                .map(|entry| entry.slots.clone()),
+            slots_dirty: self.slots_dirty,
+        }
+    }
+
+    /// Restore a request's slot state after its durable write failed.
+    pub fn restore_slot_state(&mut self, snapshot: SlotStateSnapshot) {
+        match snapshot.slots {
+            Some(slots) => match self
+                .master_slots
+                .iter_mut()
+                .find(|entry| entry.master_slot == snapshot.master_slot)
+            {
+                Some(entry) => entry.slots = slots,
+                None => self.master_slots.push(MasterSlots {
+                    master_slot: snapshot.master_slot,
+                    slots,
+                }),
+            },
+            None => self
+                .master_slots
+                .retain(|entry| entry.master_slot != snapshot.master_slot),
+        }
+        self.slots_dirty = snapshot.slots_dirty;
+    }
+
+    /// Restore the prior in-memory authority and make that compensation
+    /// durable. A failed write/read-back is ambiguous: the new blob may have
+    /// landed even though it could not be verified, so RAM-only rollback is
+    /// insufficient. RAM is restored first (fail closed for this boot), then
+    /// the old snapshot is written and read back through the same authority
+    /// boundary. A failed compensation leaves `slots_dirty` set for recovery.
+    pub fn restore_slot_state_durably(
+        &mut self,
+        nvs: &mut EspNvs<NvsDefault>,
+        snapshot: SlotStateSnapshot,
+    ) -> bool {
+        let master_slot = snapshot.master_slot;
+        let prior_dirty = snapshot.slots_dirty;
+        self.restore_slot_state(snapshot);
+        self.slots_dirty = true;
+        let restored = self.persist_slots(nvs, master_slot);
+        self.slots_dirty = if restored { prior_dirty } else { true };
+        restored
     }
 
     /// Create a new connection slot with the given label and secret.
@@ -229,11 +293,69 @@ impl PolicyEngine {
             allowed_kinds: vec![],
             auto_approve: true,
             signing_approved: false,
+            strict_permissions: false,
             authorized_pubkeys: vec![],
         };
         self.slots_mut(master_slot).push(new_slot);
         self.slots_dirty = true;
         Some(slot_index)
+    }
+
+    /// Create a slot with an exact policy supplied by the authenticated remote
+    /// operator. Validation happens before mutation, and signing authority is
+    /// derived from the explicit `sign_event` method instead of a second flag.
+    pub fn create_slot_with_exact_policy(
+        &mut self,
+        master_slot: u8,
+        label: String,
+        secret: String,
+        policy: ExactSlotPolicy,
+    ) -> Option<u8> {
+        let slot_index = {
+            let slots = self.list_slots(master_slot);
+            next_slot_index(slots)?
+        };
+        self.slots_mut(master_slot).push(ConnectSlot {
+            slot_index,
+            label,
+            secret,
+            current_pubkey: None,
+            allowed_methods: policy.allowed_methods,
+            allowed_kinds: policy.allowed_kinds,
+            auto_approve: policy.auto_approve,
+            signing_approved: policy.signing_approved,
+            strict_permissions: true,
+            authorized_pubkeys: vec![],
+        });
+        self.slots_dirty = true;
+        Some(slot_index)
+    }
+
+    /// Replace a slot's automatic authority as one validated unit. This is used
+    /// only by the authenticated v2 management protocol; legacy USB/button
+    /// flows retain their existing physical-approval rules.
+    pub fn set_exact_slot_policy(
+        &mut self,
+        master_slot: u8,
+        slot_index: u8,
+        allowed_methods: Vec<String>,
+        allowed_kinds: Vec<u64>,
+        auto_approve: bool,
+    ) -> Result<(), String> {
+        let policy = validate_exact_slot_policy(allowed_methods, allowed_kinds, auto_approve)
+            .map_err(str::to_string)?;
+        let slot = self
+            .slots_mut(master_slot)
+            .iter_mut()
+            .find(|slot| slot.slot_index == slot_index)
+            .ok_or_else(|| "slot not found".to_string())?;
+        slot.allowed_methods = policy.allowed_methods;
+        slot.allowed_kinds = policy.allowed_kinds;
+        slot.auto_approve = policy.auto_approve;
+        slot.signing_approved = policy.signing_approved;
+        slot.strict_permissions = true;
+        self.slots_dirty = true;
+        Ok(())
     }
 
     /// Update fields on an existing slot. Returns true if the slot was found.
@@ -256,9 +378,8 @@ impl PolicyEngine {
                 // Only the physical button can do that (via upgrade_to_signing).
                 // Filter out sign_event if the slot hasn't been button-approved.
                 if !slot.signing_approved {
-                    let filtered: Vec<String> = methods.into_iter()
-                        .filter(|m| m != "sign_event")
-                        .collect();
+                    let filtered: Vec<String> =
+                        methods.into_iter().filter(|m| m != "sign_event").collect();
                     slot.allowed_methods = filtered;
                 } else {
                     slot.allowed_methods = methods;
@@ -306,32 +427,43 @@ impl PolicyEngine {
 
     /// Authorise a client pubkey on a slot (called on connect with valid secret).
     /// Adds it to the slot's authorised set and makes it the current binding,
-    /// preserving any previously-bound client so earlier devices stay
-    /// auto-approved. Returns true if the slot was found.
+    /// preserving any previously-bound client on that same shared-secret slot.
+    /// The pubkey is removed from every other slot for this master first, so one
+    /// client can never inherit an older slot's policy by vector ordering.
+    /// Returns true if the target slot was found.
     pub fn assign_pubkey_to_slot(
         &mut self,
         master_slot: u8,
         slot_index: u8,
         pubkey: String,
     ) -> bool {
-        let slots = self.slots_mut(master_slot);
-        if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
-            authorize_pubkey_on_slot(slot, &pubkey);
+        let assigned = authorize_pubkey_on_unique_slot(
+            self.slots_mut(master_slot),
+            slot_index,
+            &pubkey,
+        );
+        if assigned {
             self.slots_dirty = true;
-            true
-        } else {
-            false
         }
+        assigned
     }
 
     /// Upgrade a slot to signing tier after first physical button approval.
-    /// Sets signing_approved=true and expands allowed_methods to TOFU_SAFE_METHODS.
+    /// Adds only sign_event, preserving any method/kind ceiling the operator
+    /// configured before the first signature. A default connect slot already
+    /// contains every CONNECT_SAFE_METHOD, so its historical result is still
+    /// the complete TOFU set.
     /// Returns true if the slot was found.
     pub fn upgrade_to_signing(&mut self, master_slot: u8, slot_index: u8) -> bool {
         let slots = self.slots_mut(master_slot);
         if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
-            slot.signing_approved = true;
-            slot.allowed_methods = TOFU_SAFE_METHODS.iter().map(|s| s.to_string()).collect();
+            // Exact v2 authority is installed only as one validated unit. A
+            // later legacy "approve" must never insert sign_event (with empty
+            // kinds meaning all kinds) into a crypto-only strict slot.
+            if slot.strict_permissions {
+                return false;
+            }
+            grant_slot_signing(slot);
             self.slots_dirty = true;
             true
         } else {
@@ -344,28 +476,87 @@ impl PolicyEngine {
     // -------------------------------------------------------------------------
 
     /// Persist all slots for a master slot to NVS if changed since last write.
-    pub fn persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) {
+    /// Transaction recovery relies on ESP-IDF NVS's single-key atomicity: a
+    /// `connslots_N` blob is assumed to be wholly old or wholly new, never a
+    /// torn mixture. Exact immediate read-back proves which desired value is
+    /// present; callers compensate with their prior snapshot when it does not.
+    pub fn persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
         if !self.slots_dirty {
-            return;
+            return true;
         }
         let key = format!("connslots_{master_slot}");
-        let ms = self.master_slots.iter().find(|ms| ms.master_slot == master_slot);
-        match ms {
-            Some(ms) => {
-                match serde_json::to_string(&ms.slots) {
-                    Ok(json) => {
-                        if let Err(e) = nvs.set_blob(&key, json.as_bytes()) {
-                            log::error!("Failed to persist slots for slot {master_slot}: {e:?}");
+        let ms = self
+            .master_slots
+            .iter()
+            .find(|ms| ms.master_slot == master_slot);
+        let persisted = match ms {
+            Some(ms) => match serde_json::to_string(&ms.slots) {
+                Ok(json) => {
+                    if let Err(e) = nvs.set_blob(&key, json.as_bytes()) {
+                        log::error!("Failed to persist slots for slot {master_slot}: {e:?}");
+                    }
+                    // A success return from set_blob is not the authority
+                    // boundary. Read the exact bytes back before a caller may
+                    // ACK a new client or signing grant.
+                    match nvs.blob_len(&key) {
+                        Ok(Some(len)) if len == json.len() => {
+                            let mut verify = vec![0u8; len];
+                            matches!(
+                                nvs.get_blob(&key, &mut verify),
+                                Ok(Some(stored)) if stored == json.as_bytes()
+                            )
+                        }
+                        Ok(Some(len)) => {
+                            log::error!(
+                                "Slot persistence read-back length mismatch for slot {master_slot}: {len} != {}",
+                                json.len()
+                            );
+                            false
+                        }
+                        Ok(None) => {
+                            log::error!(
+                                "Slot persistence read-back missing for slot {master_slot}"
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Slot persistence read-back failed for slot {master_slot}: {e:?}"
+                            );
+                            false
                         }
                     }
-                    Err(e) => log::error!("Failed to serialise slots: {e}"),
+                }
+                Err(e) => {
+                    log::error!("Failed to serialise slots: {e}");
+                    false
+                }
+            },
+            None => {
+                if let Err(e) = nvs.remove(&key) {
+                    log::error!("Failed to remove persisted slots for slot {master_slot}: {e:?}");
+                }
+                match nvs.blob_len(&key) {
+                    Ok(None) => true,
+                    Ok(Some(_)) => {
+                        log::error!(
+                            "Persisted slots still present after remove for slot {master_slot}"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Could not verify persisted slot removal for slot {master_slot}: {e:?}"
+                        );
+                        false
+                    }
                 }
             }
-            None => {
-                let _ = nvs.remove(&key);
-            }
+        };
+        if persisted {
+            self.slots_dirty = false;
         }
-        self.slots_dirty = false;
+        persisted
     }
 
     /// Load persisted slots from NVS for all master slots.
@@ -377,7 +568,7 @@ impl PolicyEngine {
     /// is left for Task 5 to clean up.
     pub fn load_from_nvs(nvs: &mut EspNvs<NvsDefault>, master_count: u8) -> Self {
         let mut engine = Self::new();
-        let mut needs_persist = false;
+        let mut persist_migrations: Vec<u8> = Vec::new();
 
         for slot in 0..master_count {
             let new_key = format!("connslots_{slot}");
@@ -385,9 +576,18 @@ impl PolicyEngine {
 
             // --- Try new format first ---
             if let Ok(Some(data)) = nvs.get_blob(&new_key, &mut buf) {
-                if let Ok(slots) = serde_json::from_slice::<Vec<ConnectSlot>>(data) {
+                if let Ok(mut slots) = serde_json::from_slice::<Vec<ConnectSlot>>(data) {
+                    if remove_ambiguous_pubkeys(&mut slots) {
+                        log::warn!(
+                            "Removed client pubkey shared by multiple slots for master slot {slot}; re-pair required"
+                        );
+                        persist_migrations.push(slot);
+                    }
                     let count = slots.len();
-                    engine.master_slots.push(MasterSlots { master_slot: slot, slots });
+                    engine.master_slots.push(MasterSlots {
+                        master_slot: slot,
+                        slots,
+                    });
                     log::info!("Loaded {count} persisted slots for master slot {slot}");
                     continue;
                 }
@@ -422,12 +622,11 @@ impl PolicyEngine {
                     allowed_kinds: vec![],
                     auto_approve: true,
                     signing_approved: false,
+                    strict_permissions: false,
                     authorized_pubkeys: vec![],
                 };
 
-                log::info!(
-                    "Migrated legacy policy for master slot {slot} to connslots format"
-                );
+                log::info!("Migrated legacy policy for master slot {slot} to connslots format");
 
                 // Remove old policy key; master_{slot}_conn is cleaned up in Task 5.
                 let _ = nvs.remove(&old_policy_key);
@@ -436,13 +635,84 @@ impl PolicyEngine {
                     master_slot: slot,
                     slots: vec![migrated_slot],
                 });
-                needs_persist = true;
+                persist_migrations.push(slot);
             }
         }
 
-        if needs_persist {
+        // Make each repaired master durable before normal request handling. If
+        // NVS is unavailable, RAM remains fail-closed for this boot and the
+        // dirty flag asks a later request to retry persistence.
+        let mut persist_failed = false;
+        for master_slot in persist_migrations {
             engine.slots_dirty = true;
+            if !engine.persist_slots(nvs, master_slot) {
+                persist_failed = true;
+            }
         }
+        engine.slots_dirty = persist_failed;
         engine
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PolicyEngine;
+    use heartwood_common::policy::validate_exact_slot_policy;
+
+    #[test]
+    fn slot_snapshot_restores_authority_and_prior_dirty_state() {
+        let mut engine = PolicyEngine::new();
+        let first = engine
+            .create_slot(0, "first".into(), "11".repeat(32))
+            .unwrap();
+        let second = engine
+            .create_slot(0, "second".into(), "22".repeat(32))
+            .unwrap();
+        assert!(engine.assign_pubkey_to_slot(0, first, "aa".repeat(32)));
+        engine.slots_dirty = false;
+
+        let snapshot = engine.snapshot_slot_state(0);
+        assert!(engine.assign_pubkey_to_slot(0, second, "aa".repeat(32)));
+        assert_eq!(
+            engine.find_slot_by_pubkey(0, &"aa".repeat(32)).map(|slot| slot.slot_index),
+            Some(second),
+        );
+
+        engine.restore_slot_state(snapshot);
+        assert_eq!(
+            engine.find_slot_by_pubkey(0, &"aa".repeat(32)).map(|slot| slot.slot_index),
+            Some(first),
+        );
+        assert!(!engine.slots_dirty);
+    }
+
+    #[test]
+    fn slot_snapshot_removes_entry_created_by_failed_request() {
+        let mut engine = PolicyEngine::new();
+        let snapshot = engine.snapshot_slot_state(3);
+        assert!(engine
+            .create_slot(3, "volatile".into(), "33".repeat(32))
+            .is_some());
+        engine.restore_slot_state(snapshot);
+        assert!(engine.list_slots(3).is_empty());
+        assert!(!engine.slots_dirty);
+    }
+
+    #[test]
+    fn legacy_signing_upgrade_cannot_broaden_a_strict_crypto_slot() {
+        let mut engine = PolicyEngine::new();
+        let exact = validate_exact_slot_policy(vec!["nip44_encrypt".into()], vec![], true)
+            .unwrap();
+        let index = engine
+            .create_slot_with_exact_policy(0, "crypto only".into(), "44".repeat(32), exact)
+            .unwrap();
+        engine.slots_dirty = false;
+
+        assert!(!engine.upgrade_to_signing(0, index));
+        let slot = &engine.list_slots(0)[0];
+        assert!(slot.strict_permissions);
+        assert!(!slot.signing_approved);
+        assert!(!slot.allowed_methods.iter().any(|method| method == "sign_event"));
+        assert!(!engine.slots_dirty);
     }
 }

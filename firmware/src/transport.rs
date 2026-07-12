@@ -146,8 +146,28 @@ pub fn handle_encrypted_request(
         payload: plaintext_json.as_bytes().to_vec(),
     };
 
+    let client_pubkey_hex = hex_encode(&client_pubkey);
+    let parsed_request = nip46::parse_request(&inner_frame.payload).ok();
+    let request_id = parsed_request
+        .as_ref()
+        .map(|request| request.id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let slot_snapshot = parsed_request.as_ref().and_then(|request| {
+        let method = nip46::Nip46Method::from_str(&request.method);
+        let event_kind = if matches!(method, nip46::Nip46Method::SignEvent) {
+            nip46::parse_unsigned_event(&request.params)
+                .ok()
+                .map(|event| event.kind)
+        } else {
+            None
+        };
+        let tier = policy_engine.check(owning_slot, &client_pubkey_hex, &method, event_kind);
+        crate::nip46_handler::request_may_mutate_slot_state(request, tier)
+            .then(|| policy_engine.snapshot_slot_state(owning_slot))
+    });
+
     // Dispatch to the handler — always returns a JSON response string.
-    let response_json = crate::nip46_handler::handle_request(
+    let mut response_json = crate::nip46_handler::handle_request(
         &inner_frame,
         &signing_secret,
         &owning_label,
@@ -161,8 +181,32 @@ pub fn handle_encrypted_request(
         Some(&client_pubkey),
     );
 
-    // Persist slots if a connect or sign_event may have modified one.
-    policy_engine.persist_slots(nvs, owning_slot);
+    // A connect response or first-sign success must never advertise authority
+    // that exists only in RAM. Roll the whole master slot table back and return
+    // an encrypted error when its NVS write fails.
+    if !policy_engine.persist_slots(nvs, owning_slot) {
+        if let Some(snapshot) = slot_snapshot {
+            let rollback_durable =
+                policy_engine.restore_slot_state_durably(nvs, snapshot);
+            let error = if rollback_durable {
+                log::error!(
+                    "Slot authority for NIP-46 request {request_id} was not durable; prior authority restored durably"
+                );
+                "client policy could not be saved; request was not applied"
+            } else {
+                log::error!(
+                    "FATAL: slot authority for NIP-46 request {request_id} was not durable and prior authority could not be restored durably"
+                );
+                "fatal storage error: prior client policy could not be restored; take the device offline for USB recovery"
+            };
+            response_json = nip46::build_error_response(
+                &request_id,
+                -4,
+                error,
+            )
+            .unwrap_or_default();
+        }
+    }
 
     // Persist any identities derived during this request (e.g. via
     // heartwood_derive_persona) to the persona registry, so they survive reboot
@@ -215,8 +259,6 @@ pub fn handle_encrypted_request(
             };
             let (xonly, _) = keypair.x_only_public_key();
             let author_pubkey_hex = hex_encode(&xonly.serialize());
-            let client_pubkey_hex = hex_encode(&client_pubkey);
-
             let unsigned = UnsignedEvent {
                 pubkey: author_pubkey_hex,
                 created_at,

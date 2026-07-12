@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::hex::hex_encode;
+use crate::hex::{hex_decode, hex_encode};
 
 // ---------------------------------------------------------------------------
 // NIP-46 request / response types
@@ -69,6 +69,9 @@ pub enum Nip46Method {
     Nip44Decrypt,
     Nip04Encrypt,
     Nip04Decrypt,
+    /// Harmless compatibility no-op used by clients such as Coracle during
+    /// connection setup. Heartwood does not mutate its relay configuration.
+    SwitchRelays,
     // Heartwood extensions
     HeartwoodDerive,
     HeartwoodDerivePersona,
@@ -92,6 +95,7 @@ impl Nip46Method {
             "nip44_decrypt" => Self::Nip44Decrypt,
             "nip04_encrypt" => Self::Nip04Encrypt,
             "nip04_decrypt" => Self::Nip04Decrypt,
+            "switch_relays" => Self::SwitchRelays,
             "heartwood_derive" => Self::HeartwoodDerive,
             "heartwood_derive_persona" => Self::HeartwoodDerivePersona,
             "heartwood_switch" => Self::HeartwoodSwitch,
@@ -113,6 +117,7 @@ impl Nip46Method {
             Self::Nip44Decrypt => "nip44_decrypt",
             Self::Nip04Encrypt => "nip04_encrypt",
             Self::Nip04Decrypt => "nip04_decrypt",
+            Self::SwitchRelays => "switch_relays",
             Self::HeartwoodDerive => "heartwood_derive",
             Self::HeartwoodDerivePersona => "heartwood_derive_persona",
             Self::HeartwoodSwitch => "heartwood_switch",
@@ -130,6 +135,7 @@ impl Nip46Method {
             self,
             Self::HeartwoodDerive
                 | Self::HeartwoodDerivePersona
+                | Self::HeartwoodSwitch
                 | Self::HeartwoodRecover
                 | Self::HeartwoodCreateProof
         )
@@ -142,14 +148,18 @@ impl Nip46Method {
             Self::Connect
                 | Self::Ping
                 | Self::GetPublicKey
+                | Self::SwitchRelays
                 | Self::HeartwoodListIdentities
                 | Self::HeartwoodVerifyProof
         )
     }
 
     /// Whether this method is an OLED-notify method (auto but shown on display).
+    ///
+    /// Identity switching used to live in this tier, but it mutates ambient
+    /// per-client signing state and therefore now requires a physical button.
     pub fn is_oled_notify(&self) -> bool {
-        matches!(self, Self::HeartwoodSwitch)
+        false
     }
 
     /// Whether this method requires tree mode (returns error in bunker mode).
@@ -205,6 +215,59 @@ pub struct SignedEvent {
     pub sig: String,
 }
 
+fn decode_event_hex<const N: usize>(
+    value: &str,
+    malformed: &'static str,
+) -> Result<[u8; N], &'static str> {
+    if value.len() != N * 2 {
+        return Err(malformed);
+    }
+    hex_decode(value)
+        .map_err(|_| malformed)?
+        .try_into()
+        .map_err(|_| malformed)
+}
+
+#[cfg(all(feature = "k256-backend", not(feature = "secp256k1-backend")))]
+fn verify_event_signature(
+    public_key: &[u8; 32],
+    event_id: &[u8; 32],
+    signature: &[u8; 64],
+) -> Result<(), &'static str> {
+    let verifying_key = k256::schnorr::VerifyingKey::from_bytes(public_key)
+        .map_err(|_| "invalid event public key")?;
+    let signature = k256::schnorr::Signature::try_from(signature.as_slice())
+        .map_err(|_| "invalid event signature")?;
+    verifying_key
+        .verify_raw(event_id, &signature)
+        .map_err(|_| "event signature verification failed")
+}
+
+#[cfg(all(feature = "secp256k1-backend", not(feature = "k256-backend")))]
+fn verify_event_signature(
+    public_key: &[u8; 32],
+    event_id: &[u8; 32],
+    signature: &[u8; 64],
+) -> Result<(), &'static str> {
+    let verifying_key = secp256k1::XOnlyPublicKey::from_slice(public_key)
+        .map_err(|_| "invalid event public key")?;
+    let signature = secp256k1::schnorr::Signature::from_slice(signature)
+        .map_err(|_| "invalid event signature")?;
+    let message = secp256k1::Message::from_digest(*event_id);
+    secp256k1::Secp256k1::verification_only()
+        .verify_schnorr(&signature, &message, &verifying_key)
+        .map_err(|_| "event signature verification failed")
+}
+
+#[cfg(not(any(feature = "k256-backend", feature = "secp256k1-backend")))]
+fn verify_event_signature(
+    _public_key: &[u8; 32],
+    _event_id: &[u8; 32],
+    _signature: &[u8; 64],
+) -> Result<(), &'static str> {
+    Err("event signature verification backend unavailable")
+}
+
 // ---------------------------------------------------------------------------
 // Event ID computation (NIP-01)
 // ---------------------------------------------------------------------------
@@ -213,25 +276,136 @@ pub struct SignedEvent {
 ///
 /// The commitment is the SHA-256 hash of the canonical JSON serialisation:
 /// `[0, pubkey, created_at, kind, tags, content]`
-pub fn compute_event_id(event: &UnsignedEvent) -> [u8; 32] {
-    // Build the NIP-01 commitment array as canonical JSON.
-    let commitment = serde_json::json!([
-        0,
-        event.pubkey,
-        event.created_at,
-        event.kind,
-        event.tags,
-        event.content,
-    ]);
-    let serialised = commitment.to_string();
-
+fn compute_event_id_fields(
+    pubkey: &str,
+    created_at: u64,
+    kind: u64,
+    tags: &[Vec<String>],
+    content: &str,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(serialised.as_bytes());
+    // Stream NIP-01's canonical JSON directly into SHA-256. Inbound management
+    // events can carry a large encrypted avatar, so allocating another complete
+    // JSON string here would recreate the firmware's peak-heap failure mode.
+    hasher.update(b"[0,");
+    hash_json_string(&mut hasher, pubkey);
+    hasher.update(b",");
+    hash_u64(&mut hasher, created_at);
+    hasher.update(b",");
+    hash_u64(&mut hasher, kind);
+    hasher.update(b",");
+    hash_tags(&mut hasher, tags);
+    hasher.update(b",");
+    hash_json_string(&mut hasher, content);
+    hasher.update(b"]");
     let result = hasher.finalize();
 
     let mut id = [0u8; 32];
     id.copy_from_slice(&result);
     id
+}
+
+fn hash_u64(hasher: &mut Sha256, mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    hasher.update(&digits[start..]);
+}
+
+fn hash_tags(hasher: &mut Sha256, tags: &[Vec<String>]) {
+    hasher.update(b"[");
+    for (tag_index, tag) in tags.iter().enumerate() {
+        if tag_index > 0 {
+            hasher.update(b",");
+        }
+        hasher.update(b"[");
+        for (value_index, value) in tag.iter().enumerate() {
+            if value_index > 0 {
+                hasher.update(b",");
+            }
+            hash_json_string(hasher, value);
+        }
+        hasher.update(b"]");
+    }
+    hasher.update(b"]");
+}
+
+fn hash_json_string(hasher: &mut Sha256, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    hasher.update(b"\"");
+    let bytes = value.as_bytes();
+    let mut run_start = 0;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let escaped: Option<&[u8]> = match byte {
+            b'\"' => Some(b"\\\""),
+            b'\\' => Some(b"\\\\"),
+            0x08 => Some(b"\\b"),
+            0x09 => Some(b"\\t"),
+            0x0a => Some(b"\\n"),
+            0x0c => Some(b"\\f"),
+            0x0d => Some(b"\\r"),
+            0x00..=0x1f => None,
+            _ => continue,
+        };
+        if run_start < index {
+            hasher.update(&bytes[run_start..index]);
+        }
+        if let Some(escaped) = escaped {
+            hasher.update(escaped);
+        } else {
+            hasher.update(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[(byte >> 4) as usize],
+                HEX[(byte & 0x0f) as usize],
+            ]);
+        }
+        run_start = index + 1;
+    }
+    if run_start < bytes.len() {
+        hasher.update(&bytes[run_start..]);
+    }
+    hasher.update(b"\"");
+}
+
+pub fn compute_event_id(event: &UnsignedEvent) -> [u8; 32] {
+    compute_event_id_fields(
+        &event.pubkey,
+        event.created_at,
+        event.kind,
+        &event.tags,
+        &event.content,
+    )
+}
+
+/// Verify an inbound Nostr event before any relay-side routing or decryption.
+/// The relay is an untrusted transport: both the canonical id and its BIP-340
+/// signature must bind the author, target tags, kind, timestamp, and ciphertext.
+pub fn verify_signed_event(event: &SignedEvent) -> Result<(), &'static str> {
+    let claimed_id = decode_event_hex::<32>(&event.id, "invalid event id")?;
+    let computed_id = compute_event_id_fields(
+        &event.pubkey,
+        event.created_at,
+        event.kind,
+        &event.tags,
+        &event.content,
+    );
+    if claimed_id != computed_id {
+        return Err("event id does not match canonical content");
+    }
+
+    let public_key = decode_event_hex::<32>(&event.pubkey, "invalid event public key")?;
+    let signature = decode_event_hex::<64>(&event.sig, "invalid event signature")?;
+    verify_event_signature(&public_key, &computed_id, &signature)
 }
 
 /// Compute the NIP-01 event ID as a lowercase hex string.
@@ -449,6 +623,50 @@ mod tests {
         }
     }
 
+    fn frozen_signed_event() -> SignedEvent {
+        SignedEvent {
+            id: "c8e7c46f50cb296ac79dc9fadffa14631cf5fd5190bb4d1b35230a8ff00df03c"
+                .to_string(),
+            pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .to_string(),
+            created_at: 1_700_000_000,
+            kind: 24_134,
+            tags: vec![vec!["p".to_string(), "22".repeat(32)]],
+            content: "test ciphertext".to_string(),
+            sig: "eb501d4b1cff7d76c50ed1f03a6d3e93327db7f7cf625680c57d7f8872e3c9e6ce64837c5ab566f192122bced7b75a2db4e51451356af164b860193353466a75"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn verifies_frozen_nostr_event_vector() {
+        assert_eq!(verify_signed_event(&frozen_signed_event()), Ok(()));
+    }
+
+    #[test]
+    fn rejects_frozen_event_id_content_and_signature_mutations() {
+        let mut wrong_id = frozen_signed_event();
+        wrong_id.id.replace_range(..1, "d");
+        assert_eq!(
+            verify_signed_event(&wrong_id),
+            Err("event id does not match canonical content"),
+        );
+
+        let mut changed_content = frozen_signed_event();
+        changed_content.content.push('!');
+        assert_eq!(
+            verify_signed_event(&changed_content),
+            Err("event id does not match canonical content"),
+        );
+
+        let mut wrong_signature = frozen_signed_event();
+        wrong_signature.sig.replace_range(..1, "f");
+        assert_eq!(
+            verify_signed_event(&wrong_signature),
+            Err("event signature verification failed"),
+        );
+    }
+
     #[test]
     fn test_compute_event_id_deterministic() {
         let event = sample_event();
@@ -655,6 +873,7 @@ mod tests {
         assert_eq!(Nip46Method::from_str("sign_event"), Nip46Method::SignEvent);
         assert_eq!(Nip46Method::from_str("heartwood_derive"), Nip46Method::HeartwoodDerive);
         assert_eq!(Nip46Method::from_str("ping"), Nip46Method::Ping);
+        assert_eq!(Nip46Method::from_str("switch_relays"), Nip46Method::SwitchRelays);
         assert!(matches!(Nip46Method::from_str("unknown_method"), Nip46Method::Unknown(_)));
     }
 
@@ -662,12 +881,14 @@ mod tests {
     fn test_nip46_method_approval_tiers() {
         assert!(Nip46Method::Ping.always_auto_approve());
         assert!(Nip46Method::GetPublicKey.always_auto_approve());
+        assert!(Nip46Method::SwitchRelays.always_auto_approve());
         assert!(!Nip46Method::SignEvent.always_auto_approve());
 
         assert!(Nip46Method::HeartwoodDerive.always_requires_button());
+        assert!(Nip46Method::HeartwoodSwitch.always_requires_button());
         assert!(!Nip46Method::SignEvent.always_requires_button());
 
-        assert!(Nip46Method::HeartwoodSwitch.is_oled_notify());
+        assert!(!Nip46Method::HeartwoodSwitch.is_oled_notify());
         assert!(!Nip46Method::SignEvent.is_oled_notify());
 
         assert!(Nip46Method::HeartwoodDerive.requires_tree_mode());

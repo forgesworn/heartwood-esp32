@@ -43,6 +43,12 @@ use panic_halt as _;
 
 use storage::Keys;
 
+const FIRMWARE_INFO_JSON: &str = concat!(
+    "{\"version\":\"",
+    env!("CARGO_PKG_VERSION"),
+    "\",\"board\":\"esp8266\"}"
+);
+
 #[entry]
 fn main() -> ! {
     heap::init();
@@ -220,7 +226,7 @@ fn handle(
         frame::FIRMWARE_INFO => frame::build(
             out,
             frame::FIRMWARE_INFO_RESPONSE,
-            br#"{"version":"0.0.1","board":"esp8266"}"#,
+            FIRMWARE_INFO_JSON.as_bytes(),
         ),
 
         // Report the signing identity: derive the npub from the provisioned seed.

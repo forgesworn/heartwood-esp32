@@ -2,8 +2,12 @@
 //
 // Client approval policy types shared between firmware and bridge.
 #[allow(unused_imports)]
-use alloc::{format, string::{String, ToString}, vec, vec::Vec};
-
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +41,7 @@ pub struct ConnectSlot {
     #[serde(default)]
     pub current_pubkey: Option<String>,
     /// Which NIP-46 methods are auto-approved for this slot.
+    /// Empty means no policy-controlled method is auto-approved.
     #[serde(default)]
     pub allowed_methods: Vec<String>,
     /// Which event kinds are auto-approved for sign_event.
@@ -48,6 +53,11 @@ pub struct ConnectSlot {
     /// True once the user has physically approved a sign_event via button press.
     #[serde(default)]
     pub signing_approved: bool,
+    /// When true, methods and event kinds outside this slot's policy are denied
+    /// instead of falling back to a physical button prompt. New remotely-managed
+    /// v2 slots set this; legacy slots default false to preserve first-sign TOFU.
+    #[serde(default)]
+    pub strict_permissions: bool,
     /// Every client pubkey that has paired with this slot's secret. All are
     /// auto-approvable (subject to the slot's other gates). Capped at
     /// `MAX_AUTHORIZED_PUBKEYS`. Old NVS blobs without this field deserialise
@@ -66,6 +76,7 @@ pub struct ClientPolicy {
     #[serde(default)]
     pub label: String,
     /// Which NIP-46 methods are auto-approved.
+    /// Empty means no policy-controlled method is auto-approved.
     #[serde(default)]
     pub allowed_methods: Vec<String>,
     /// Which event kinds are auto-approved for sign_event.
@@ -98,6 +109,126 @@ pub const TOFU_SAFE_METHODS: &[&str] = &[
     "get_public_key",
 ];
 
+/// Bound exact remotely-managed policies so an authenticated but buggy manager
+/// cannot grow the persisted NVS blob without limit.
+pub const MAX_ALLOWED_KINDS: usize = 64;
+
+/// A validated, exact auto-approval policy supplied by the authenticated
+/// operator. `signing_approved` is deliberately not supplied independently: it
+/// is derived from whether `sign_event` is present, so the two gates cannot
+/// drift into an accidentally broader state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactSlotPolicy {
+    pub allowed_methods: Vec<String>,
+    pub allowed_kinds: Vec<u64>,
+    pub auto_approve: bool,
+    pub signing_approved: bool,
+}
+
+/// Validate and canonicalise an exact operator policy before any slot state is
+/// mutated. Only methods implemented by Heartwood's standard NIP-46 handler are
+/// accepted. Event kinds are meaningful only when `sign_event` is present.
+pub fn validate_exact_slot_policy(
+    allowed_methods: Vec<String>,
+    allowed_kinds: Vec<u64>,
+    auto_approve: bool,
+) -> Result<ExactSlotPolicy, &'static str> {
+    let mut methods = Vec::new();
+    for method in allowed_methods {
+        if !TOFU_SAFE_METHODS.contains(&method.as_str()) {
+            return Err("policy contains an unsupported method");
+        }
+        if !methods.iter().any(|existing| existing == &method) {
+            methods.push(method);
+        }
+    }
+
+    if allowed_kinds.len() > MAX_ALLOWED_KINDS {
+        return Err("policy contains too many event kinds");
+    }
+    let mut kinds = allowed_kinds;
+    kinds.sort_unstable();
+    kinds.dedup();
+
+    let signing_approved = methods.iter().any(|method| method == "sign_event");
+    if !signing_approved && !kinds.is_empty() {
+        return Err("event kinds require sign_event permission");
+    }
+
+    Ok(ExactSlotPolicy {
+        allowed_methods: methods,
+        allowed_kinds: kinds,
+        auto_approve,
+        signing_approved,
+    })
+}
+
+/// Evaluate the policy-controlled part of a slot request. Protocol-wide
+/// invariants such as ping/get_public_key are handled by the caller first; this
+/// helper is deliberately pure so the firmware's exact deny boundary runs in
+/// host CI as well as on the ESP.
+pub fn evaluate_slot_policy(
+    slot: &ConnectSlot,
+    method: &str,
+    event_kind: Option<u64>,
+) -> ApprovalTier {
+    if !slot.allowed_methods.iter().any(|allowed| allowed == method) {
+        return if strict_slot_denies_method(slot, method) {
+            ApprovalTier::Denied
+        } else {
+            ApprovalTier::ButtonRequired
+        };
+    }
+
+    if method == "sign_event" {
+        if !slot.signing_approved {
+            return if slot.strict_permissions {
+                ApprovalTier::Denied
+            } else {
+                ApprovalTier::ButtonRequired
+            };
+        }
+        if let Some(kind) = event_kind {
+            if !slot.allowed_kinds.is_empty() && !slot.allowed_kinds.contains(&kind) {
+                return if slot.strict_permissions {
+                    ApprovalTier::Denied
+                } else {
+                    ApprovalTier::ButtonRequired
+                };
+            }
+        }
+    }
+
+    if slot.auto_approve {
+        ApprovalTier::AutoApprove
+    } else {
+        ApprovalTier::ButtonRequired
+    }
+}
+
+/// Exact v2 slots impose a hard method ceiling before legacy Heartwood method
+/// invariants (button, OLED notify, or always-auto) are considered.
+pub fn strict_slot_denies_method(slot: &ConnectSlot, method: &str) -> bool {
+    slot.strict_permissions
+        && !slot
+            .allowed_methods
+            .iter()
+            .any(|allowed| allowed == method)
+}
+
+/// Grant sign_event after an explicit button/operator approval without
+/// broadening any previously configured encryption or event-kind ceiling.
+pub fn grant_slot_signing(slot: &mut ConnectSlot) {
+    slot.signing_approved = true;
+    if !slot
+        .allowed_methods
+        .iter()
+        .any(|method| method == "sign_event")
+    {
+        slot.allowed_methods.insert(0, "sign_event".to_string());
+    }
+}
+
 /// Approval decision for a specific request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalTier {
@@ -107,6 +238,8 @@ pub enum ApprovalTier {
     OledNotify,
     /// Full OLED display with countdown bar, wait for button approval.
     ButtonRequired,
+    /// The request is outside the operator-approved policy ceiling.
+    Denied,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +270,10 @@ pub fn make_tofu_policy(client_pubkey: &str) -> ClientPolicy {
 }
 
 /// Find a policy by client pubkey.
-pub fn find_policy<'a>(policies: &'a [ClientPolicy], client_pubkey: &str) -> Option<&'a ClientPolicy> {
+pub fn find_policy<'a>(
+    policies: &'a [ClientPolicy],
+    client_pubkey: &str,
+) -> Option<&'a ClientPolicy> {
     policies.iter().find(|p| p.client_pubkey == client_pubkey)
 }
 
@@ -150,7 +286,10 @@ pub fn revoke_policy(policies: &mut Vec<ClientPolicy>, client_pubkey: &str) -> b
 
 /// Upsert a client policy. Replaces if client_pubkey matches, otherwise adds.
 pub fn upsert_policy(policies: &mut Vec<ClientPolicy>, policy: ClientPolicy) {
-    if let Some(existing) = policies.iter_mut().find(|p| p.client_pubkey == policy.client_pubkey) {
+    if let Some(existing) = policies
+        .iter_mut()
+        .find(|p| p.client_pubkey == policy.client_pubkey)
+    {
         *existing = policy;
     } else {
         policies.push(policy);
@@ -182,6 +321,87 @@ pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) {
     slot.current_pubkey = Some(pubkey.to_string());
 }
 
+/// Move `pubkey` onto exactly one slot within a master, then authorise it there.
+///
+/// A client key must never inherit whichever policy happens to appear first in
+/// the slot vector. Before binding the target, remove that key from every other
+/// slot's current and retained-authority fields. Other clients sharing those
+/// slots are preserved. Returns false without mutation when `slot_index` does
+/// not exist.
+pub fn authorize_pubkey_on_unique_slot(
+    slots: &mut [ConnectSlot],
+    slot_index: u8,
+    pubkey: &str,
+) -> bool {
+    let Some(target_pos) = slots.iter().position(|slot| slot.slot_index == slot_index) else {
+        return false;
+    };
+
+    for (position, slot) in slots.iter_mut().enumerate() {
+        if position == target_pos {
+            continue;
+        }
+        if slot.current_pubkey.as_deref() == Some(pubkey) {
+            slot.current_pubkey = None;
+        }
+        slot.authorized_pubkeys.retain(|candidate| candidate != pubkey);
+    }
+
+    authorize_pubkey_on_slot(&mut slots[target_pos], pubkey);
+    true
+}
+
+/// Remove every client pubkey that is authorised by more than one slot.
+///
+/// This is the fail-closed boot migration for state written before unique slot
+/// ownership was enforced. Picking the first or last slot could silently retain
+/// the broader policy; removing an ambiguous key from all slots forces the app
+/// to prove possession of exactly one slot secret on its next connect. Returns
+/// true when any authority field changed.
+pub fn remove_ambiguous_pubkeys(slots: &mut [ConnectSlot]) -> bool {
+    let mut owners: Vec<(String, usize)> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+
+    for (position, slot) in slots.iter().enumerate() {
+        for pubkey in slot
+            .current_pubkey
+            .iter()
+            .chain(slot.authorized_pubkeys.iter())
+        {
+            if ambiguous.iter().any(|candidate| candidate == pubkey) {
+                continue;
+            }
+            match owners.iter().find(|(candidate, _)| candidate == pubkey) {
+                Some((_, owner)) if *owner != position => ambiguous.push(pubkey.clone()),
+                Some(_) => {}
+                None => owners.push((pubkey.clone(), position)),
+            }
+        }
+    }
+
+    if ambiguous.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    for slot in slots.iter_mut() {
+        if slot
+            .current_pubkey
+            .as_ref()
+            .map(|pubkey| ambiguous.iter().any(|candidate| candidate == pubkey))
+            .unwrap_or(false)
+        {
+            slot.current_pubkey = None;
+            changed = true;
+        }
+        let before = slot.authorized_pubkeys.len();
+        slot.authorized_pubkeys
+            .retain(|pubkey| !ambiguous.iter().any(|candidate| candidate == pubkey));
+        changed |= slot.authorized_pubkeys.len() != before;
+    }
+    changed
+}
+
 /// Add a pubkey to a slot's authorised set (de-duplicated, FIFO-capped).
 fn push_authorized(slot: &mut ConnectSlot, pubkey: String) {
     if slot.authorized_pubkeys.iter().any(|p| *p == pubkey) {
@@ -199,7 +419,10 @@ pub fn find_slot_by_pubkey<'a>(slots: &'a [ConnectSlot], pubkey: &str) -> Option
 }
 
 /// Find a mutable slot that authorises this client pubkey (current binding or set).
-pub fn find_slot_by_pubkey_mut<'a>(slots: &'a mut [ConnectSlot], pubkey: &str) -> Option<&'a mut ConnectSlot> {
+pub fn find_slot_by_pubkey_mut<'a>(
+    slots: &'a mut [ConnectSlot],
+    pubkey: &str,
+) -> Option<&'a mut ConnectSlot> {
     slots.iter_mut().find(|s| slot_authorizes(s, pubkey))
 }
 
@@ -219,7 +442,10 @@ pub fn find_slot_by_secret<'a>(slots: &'a [ConnectSlot], secret: &str) -> Option
 /// Find a mutable slot by its secret using constant-time comparison.
 /// Always iterates all slots to prevent timing-based slot identification.
 /// Returns the first matching slot (lowest index).
-pub fn find_slot_by_secret_mut<'a>(slots: &'a mut [ConnectSlot], secret: &str) -> Option<&'a mut ConnectSlot> {
+pub fn find_slot_by_secret_mut<'a>(
+    slots: &'a mut [ConnectSlot],
+    secret: &str,
+) -> Option<&'a mut ConnectSlot> {
     let mut matched: Option<usize> = None;
     for (i, slot) in slots.iter().enumerate() {
         if constant_time_eq_str(&slot.secret, secret) && matched.is_none() {
@@ -355,8 +581,11 @@ mod tests {
     #[test]
     fn connect_safe_is_subset_of_tofu_safe() {
         for method in CONNECT_SAFE_METHODS {
-            assert!(TOFU_SAFE_METHODS.contains(method),
-                "{} is in CONNECT_SAFE but not TOFU_SAFE", method);
+            assert!(
+                TOFU_SAFE_METHODS.contains(method),
+                "{} is in CONNECT_SAFE but not TOFU_SAFE",
+                method
+            );
         }
     }
 
@@ -371,6 +600,61 @@ mod tests {
         for method in CONNECT_SAFE_METHODS {
             assert!(policy.allowed_methods.contains(&method.to_string()));
         }
+    }
+
+    // --- Exact remotely-managed slot policies ---
+
+    #[test]
+    fn exact_policy_is_canonical_and_derives_signing_gate() {
+        let policy = validate_exact_slot_policy(
+            vec![
+                "get_public_key".into(),
+                "sign_event".into(),
+                "sign_event".into(),
+            ],
+            vec![1059, 13, 13],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(policy.allowed_methods, vec!["get_public_key", "sign_event"]);
+        assert_eq!(policy.allowed_kinds, vec![13, 1059]);
+        assert!(policy.auto_approve);
+        assert!(policy.signing_approved);
+    }
+
+    #[test]
+    fn exact_policy_can_grant_crypto_without_signing() {
+        let policy = validate_exact_slot_policy(
+            vec!["get_public_key".into(), "nip44_decrypt".into()],
+            vec![],
+            true,
+        )
+        .unwrap();
+
+        assert!(!policy.signing_approved);
+        assert!(!policy.allowed_methods.contains(&"sign_event".to_string()));
+    }
+
+    #[test]
+    fn exact_policy_rejects_unknown_methods_and_orphan_kinds() {
+        assert_eq!(
+            validate_exact_slot_policy(vec!["delete_everything".into()], vec![], true),
+            Err("policy contains an unsupported method"),
+        );
+        assert_eq!(
+            validate_exact_slot_policy(vec!["get_public_key".into()], vec![1], true),
+            Err("event kinds require sign_event permission"),
+        );
+    }
+
+    #[test]
+    fn exact_policy_bounds_kind_count() {
+        let kinds = (0..=MAX_ALLOWED_KINDS as u64).collect();
+        assert_eq!(
+            validate_exact_slot_policy(vec!["sign_event".into()], kinds, true),
+            Err("policy contains too many event kinds"),
+        );
     }
 
     // --- Find ---
@@ -428,7 +712,10 @@ mod tests {
         let mut policies = vec![sample_policy('a')];
         upsert_policy(&mut policies, sample_policy('b'));
         assert_eq!(policies.len(), 2);
-        assert_eq!(find_policy(&policies, &sample_pubkey('b')).unwrap().label, "Client b");
+        assert_eq!(
+            find_policy(&policies, &sample_pubkey('b')).unwrap().label,
+            "Client b"
+        );
     }
 
     #[test]
@@ -457,6 +744,7 @@ mod tests {
     fn approval_tier_values_are_distinct() {
         assert_ne!(ApprovalTier::AutoApprove, ApprovalTier::ButtonRequired);
         assert_ne!(ApprovalTier::AutoApprove, ApprovalTier::OledNotify);
+        assert_ne!(ApprovalTier::AutoApprove, ApprovalTier::Denied);
         assert_ne!(ApprovalTier::OledNotify, ApprovalTier::ButtonRequired);
     }
 
@@ -472,8 +760,93 @@ mod tests {
             allowed_kinds: vec![],
             auto_approve: true,
             signing_approved: false,
+            strict_permissions: false,
             authorized_pubkeys: vec![],
         }
+    }
+
+    #[test]
+    fn strict_slot_denies_methods_and_kinds_outside_the_ceiling() {
+        let mut slot = sample_slot(0, "strict");
+        slot.strict_permissions = true;
+        slot.allowed_methods = vec!["get_public_key".into(), "sign_event".into()];
+        slot.allowed_kinds = vec![1, 7];
+        slot.signing_approved = true;
+
+        assert_eq!(
+            evaluate_slot_policy(&slot, "sign_event", Some(1)),
+            ApprovalTier::AutoApprove,
+        );
+        assert_eq!(
+            evaluate_slot_policy(&slot, "sign_event", Some(0)),
+            ApprovalTier::Denied,
+        );
+        assert_eq!(
+            evaluate_slot_policy(&slot, "nip44_decrypt", None),
+            ApprovalTier::Denied,
+        );
+    }
+
+    #[test]
+    fn strict_slot_requires_explicit_signing_approval() {
+        let mut slot = sample_slot(0, "strict");
+        slot.strict_permissions = true;
+        slot.allowed_methods = vec!["sign_event".into()];
+        slot.signing_approved = false;
+        assert_eq!(
+            evaluate_slot_policy(&slot, "sign_event", Some(1)),
+            ApprovalTier::Denied,
+        );
+    }
+
+    #[test]
+    fn strict_slot_denies_unlisted_heartwood_extensions() {
+        let mut slot = sample_slot(0, "strict-posting");
+        slot.strict_permissions = true;
+        slot.allowed_methods = vec!["get_public_key".into(), "sign_event".into()];
+        slot.signing_approved = true;
+
+        for extension in [
+            "heartwood_derive",
+            "heartwood_switch",
+            "heartwood_list_identities",
+            "heartwood_verify_proof",
+        ] {
+            assert!(strict_slot_denies_method(&slot, extension));
+            assert_eq!(
+                evaluate_slot_policy(&slot, extension, None),
+                ApprovalTier::Denied,
+                "{extension} escaped the strict method ceiling",
+            );
+        }
+
+        slot.strict_permissions = false;
+        assert!(!strict_slot_denies_method(&slot, "heartwood_derive"));
+    }
+
+    #[test]
+    fn legacy_slot_retains_button_fallback_but_empty_methods_never_auto_approve() {
+        let mut slot = sample_slot(0, "legacy");
+        slot.allowed_methods.clear();
+        assert_eq!(
+            evaluate_slot_policy(&slot, "sign_event", Some(1)),
+            ApprovalTier::ButtonRequired,
+        );
+    }
+
+    #[test]
+    fn signing_upgrade_preserves_existing_method_and_kind_ceiling() {
+        let mut slot = sample_slot(0, "posting");
+        slot.allowed_methods = vec!["get_public_key".into()];
+        slot.allowed_kinds = vec![1, 7];
+
+        grant_slot_signing(&mut slot);
+        assert!(slot.signing_approved);
+        assert_eq!(slot.allowed_methods, vec!["sign_event", "get_public_key"]);
+        assert_eq!(slot.allowed_kinds, vec![1, 7]);
+
+        grant_slot_signing(&mut slot);
+        assert_eq!(slot.allowed_methods, vec!["sign_event", "get_public_key"]);
     }
 
     #[test]
@@ -521,6 +894,7 @@ mod tests {
         assert!(slot.allowed_kinds.is_empty());
         assert!(!slot.auto_approve);
         assert!(!slot.signing_approved);
+        assert!(!slot.strict_permissions);
         // Old NVS blobs (no field) deserialise to an empty authorised set.
         assert!(slot.authorized_pubkeys.is_empty());
     }
@@ -570,6 +944,73 @@ mod tests {
     }
 
     #[test]
+    fn unique_assignment_moves_client_out_of_every_other_slot() {
+        let client = sample_pubkey('a');
+        let retained = sample_pubkey('b');
+        let mut first = sample_slot(0, "older broad policy");
+        authorize_pubkey_on_slot(&mut first, &retained);
+        authorize_pubkey_on_slot(&mut first, &client);
+        let mut target = sample_slot(1, "new strict policy");
+        let mut third = sample_slot(2, "stale duplicate");
+        third.current_pubkey = Some(client.clone());
+        let mut slots = vec![first, target.clone(), third];
+
+        assert!(authorize_pubkey_on_unique_slot(&mut slots, 1, &client));
+
+        assert!(!slot_authorizes(&slots[0], &client));
+        assert!(slot_authorizes(&slots[0], &retained));
+        assert!(slot_authorizes(&slots[1], &client));
+        assert_eq!(slots[1].current_pubkey.as_deref(), Some(client.as_str()));
+        assert!(!slot_authorizes(&slots[2], &client));
+        assert!(slots[2].current_pubkey.is_none());
+
+        // Keep the fixture honest: assignment changed only authority fields on
+        // the target; its policy/secret identity remains the requested slot.
+        target.current_pubkey = Some(client.clone());
+        target.authorized_pubkeys.push(client);
+        assert_eq!(slots[1].slot_index, target.slot_index);
+        assert_eq!(slots[1].secret, target.secret);
+        assert_eq!(slots[1].allowed_methods, target.allowed_methods);
+    }
+
+    #[test]
+    fn unique_assignment_missing_target_is_an_atomic_noop() {
+        let client = sample_pubkey('a');
+        let mut slot = sample_slot(0, "existing");
+        authorize_pubkey_on_slot(&mut slot, &client);
+        let before = serde_json::to_string(&slot).unwrap();
+        let mut slots = vec![slot];
+
+        assert!(!authorize_pubkey_on_unique_slot(&mut slots, 9, &client));
+        assert_eq!(serde_json::to_string(&slots[0]).unwrap(), before);
+    }
+
+    #[test]
+    fn boot_migration_removes_ambiguous_client_from_broad_and_strict_slots() {
+        let duplicate = sample_pubkey('a');
+        let unique = sample_pubkey('b');
+        let mut broad = sample_slot(0, "old broad");
+        broad.allowed_methods.push("sign_event".into());
+        broad.signing_approved = true;
+        authorize_pubkey_on_slot(&mut broad, &unique);
+        authorize_pubkey_on_slot(&mut broad, &duplicate);
+
+        let mut strict = sample_slot(1, "new strict");
+        strict.strict_permissions = true;
+        strict.allowed_methods = vec!["get_public_key".into()];
+        strict.current_pubkey = Some(duplicate.clone());
+        strict.authorized_pubkeys = vec![duplicate.clone()];
+        let mut slots = vec![broad, strict];
+
+        assert!(remove_ambiguous_pubkeys(&mut slots));
+        assert!(!slot_authorizes(&slots[0], &duplicate));
+        assert!(!slot_authorizes(&slots[1], &duplicate));
+        assert!(slot_authorizes(&slots[0], &unique));
+        assert!(find_slot_by_pubkey(&slots, &duplicate).is_none());
+        assert!(!remove_ambiguous_pubkeys(&mut slots));
+    }
+
+    #[test]
     fn authorize_caps_at_max_fifo() {
         let mut slot = sample_slot(0, "Signet");
         // Authorise MAX + 2 distinct clients.
@@ -610,10 +1051,7 @@ mod tests {
 
     #[test]
     fn find_slot_by_secret_found() {
-        let slots = vec![
-            sample_slot(0, "first"),
-            sample_slot(1, "second"),
-        ];
+        let slots = vec![sample_slot(0, "first"), sample_slot(1, "second")];
         // sample_slot uses "ab".repeat(32) for secret
         let found = find_slot_by_secret(&slots, &"ab".repeat(32));
         assert!(found.is_some());

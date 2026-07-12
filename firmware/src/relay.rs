@@ -51,9 +51,14 @@ use secp256k1::{Keypair, Secp256k1, SignOnly};
 use heartwood_common::frame::Frame;
 use heartwood_common::hex::{hex_decode, hex_encode};
 use heartwood_common::mgmt;
-use heartwood_common::net_config::NetConfig;
+use heartwood_common::net_config::{
+    apply_remote_net_config_patch, network_activation_source_allowed,
+    network_commit_source_allowed, NetConfig, NetworkConfigTransactionParams, NetworkTrialPhase,
+    StageNetworkConfigParams,
+};
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
+use heartwood_common::policy::{validate_exact_slot_policy, ExactSlotPolicy};
 use heartwood_common::types::{
     FRAME_TYPE_ACK, FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_REVOKE,
@@ -63,8 +68,9 @@ use heartwood_common::types::{
     FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN, FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
     FRAME_TYPE_RESTORE_IDENTITY, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET,
-    FRAME_TYPE_SET_IDENTITY_META, FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_PIN,
-    FRAME_TYPE_SIGN_ENVELOPE, FRAME_TYPE_WIFI_SCAN_REQUEST,
+    FRAME_TYPE_GET_NET_CONFIG, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_SET_IDENTITY_META,
+    FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN, FRAME_TYPE_SIGN_ENVELOPE,
+    FRAME_TYPE_WIFI_SCAN_REQUEST,
 };
 
 use crate::identity_cache::IdentityCache;
@@ -82,11 +88,11 @@ const NIP46_KIND: u64 = 24133;
 /// Relay-management event kind (distinct permission boundary from NIP-46).
 /// Requests are authenticated to the baked operator key (`op_mgmt`).
 const MGMT_KIND: u64 = 24134;
-/// Bound on the management replay seen-set (recent request ids).
+/// Bound on the RAM-only management duplicate-delivery set.
 const SEEN_MAX: usize = 64;
-/// NVS key the management replay seen-set is persisted under, so a captured
-/// command cannot be replayed after the device reboots.
-const MGMT_SEEN_KEY: &str = "mgmt_seen";
+/// NVS-persisted device challenge consumed by every relay-management mutation.
+/// Rotation is persisted before dispatch, so an old captured ciphertext can
+/// never become current again after request-id eviction or reboot.
 /// Initial capacity of the inbound byte-accumulation buffer.
 const READ_BUF: usize = 8192;
 /// Largest single inbound WS frame we'll accept; bigger ⇒ drop + reconnect.
@@ -139,6 +145,11 @@ const DIAL_MIN_FREE_HEAP: u32 = 70_000;
 const DIAL_MIN_LARGEST_BLOCK: usize = 24_000;
 /// NVS key the pinned-relay list is persisted under (JSON array).
 const PINNED_NVS_KEY: &str = "pinned_rly";
+/// A candidate that reconnects but is never committed rolls back automatically.
+const NETWORK_TRIAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Management responses are published synchronously; retain a little extra
+/// flush time before an activated/aborted trial restarts the device.
+const NETWORK_RESTART_DELAY: Duration = Duration::from_secs(2);
 
 struct SignAuditEntry {
     seq: u64,
@@ -185,7 +196,8 @@ struct SignCtx<'a, 'd, 'b> {
     /// All configured relays — advertised in bunker URIs so clients publish to
     /// every relay, and cycled through on reconnect for failover.
     relays: Vec<String>,
-    /// Bounded replay seen-set of recent management request ids.
+    /// RAM-only bounded set suppressing duplicate delivery across live relays.
+    /// Durable mutation replay safety comes from `MGMT_CHALLENGE_KEY`, not this.
     seen: Vec<String>,
     /// OLED power state — false once blanked for burn-in protection.
     display_on: bool,
@@ -209,6 +221,12 @@ struct SignCtx<'a, 'd, 'b> {
     /// re-dials of a dead relay, which the pinned backoff cannot cover (no
     /// PinnedRelay exists until a dial succeeds).
     dial_cooldown: Option<(String, Instant)>,
+    /// Present only while this boot is serving a TRYING network candidate.
+    network_trial_id: Option<String>,
+    network_trial_deadline: Option<Instant>,
+    /// Set by a management method, acted on only after its encrypted response
+    /// has returned through `sign_and_publish` and control reaches the loop.
+    network_restart_at: Option<Instant>,
 }
 
 /// Host out of a `wss://`/`ws://` relay URL (scheme, port and path stripped).
@@ -245,7 +263,7 @@ struct RelaySession {
 /// A relay joined at nostrconnect pairing because the client dictated it.
 /// Persisted to NVS so the pairing survives reboot; pruned when the slot that
 /// created it is revoked.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PinnedRelay {
     url: String,
     /// Master slot and client slot the pairing created, for revoke-time pruning.
@@ -277,15 +295,43 @@ fn load_pinned(nvs: &mut EspNvs<NvsDefault>) -> Vec<PinnedRelay> {
     }
 }
 
-/// Persist the pinned-relay list (bounded by MAX_SESSIONS - 1 in practice).
-fn save_pinned(nvs: &mut EspNvs<NvsDefault>, pinned: &[PinnedRelay]) {
+/// Persist the pinned-relay list (bounded by MAX_SESSIONS - 1 in practice) and
+/// verify the exact bytes before a pairing reports durable reachability.
+fn save_pinned(nvs: &mut EspNvs<NvsDefault>, pinned: &[PinnedRelay]) -> bool {
     match serde_json::to_vec(pinned) {
         Ok(json) => {
             if let Err(e) = nvs.set_blob(PINNED_NVS_KEY, &json) {
                 log::error!("[relay] persist pinned relays: {e:?}");
             }
+            match nvs.blob_len(PINNED_NVS_KEY) {
+                Ok(Some(len)) if len == json.len() => {
+                    let mut verify = vec![0u8; len];
+                    matches!(
+                        nvs.get_blob(PINNED_NVS_KEY, &mut verify),
+                        Ok(Some(stored)) if stored == json.as_slice()
+                    )
+                }
+                Ok(Some(len)) => {
+                    log::error!(
+                        "[relay] pinned relay read-back length mismatch: {len} != {}",
+                        json.len()
+                    );
+                    false
+                }
+                Ok(None) => {
+                    log::error!("[relay] pinned relay read-back missing");
+                    false
+                }
+                Err(e) => {
+                    log::error!("[relay] pinned relay read-back failed: {e:?}");
+                    false
+                }
+            }
         }
-        Err(e) => log::error!("[relay] serialise pinned relays: {e}"),
+        Err(e) => {
+            log::error!("[relay] serialise pinned relays: {e}");
+            false
+        }
     }
 }
 
@@ -323,6 +369,7 @@ pub fn run_wifi_standalone<'d, 'b>(
     identity_caches: &mut Vec<IdentityCache>,
     nvs: &mut EspNvs<NvsDefault>,
     op_mgmt: Option<[u8; 32]>,
+    network_trial_id: Option<String>,
     usb: &mut SerialPort<'_>,
 ) -> ! {
     log::info!(
@@ -350,7 +397,11 @@ pub fn run_wifi_standalone<'d, 'b>(
     };
     wifi.set_configuration(&WifiConfig::Client(ClientConfiguration {
         ssid: cfg.ssid.as_str().try_into().expect("relay: ssid too long"),
-        password: cfg.password.as_str().try_into().expect("relay: pass too long"),
+        password: cfg
+            .password
+            .as_str()
+            .try_into()
+            .expect("relay: pass too long"),
         auth_method: auth,
         ..Default::default()
     }))
@@ -361,17 +412,17 @@ pub fn run_wifi_standalone<'d, 'b>(
     // to the next on any disconnect, so a single dead or quiet relay never takes
     // it offline. Bunker URIs advertise every relay, so clients publish to all of
     // them and still meet the device on whichever one it is currently serving.
-    let relays: Vec<String> =
-        cfg.relays.iter().map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect();
+    let relays: Vec<String> = cfg
+        .relays
+        .iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
     let mut relay_idx = 0usize;
 
-    // Restore the replay seen-set from NVS so a command captured off the relay
-    // cannot be replayed across a reboot (within the SEEN_MAX window).
-    let seen = load_mgmt_seen(nvs);
-    if !seen.is_empty() {
-        log::info!("[relay] restored {} management replay id(s) from NVS", seen.len());
-    }
-
+    let network_trial_deadline = network_trial_id
+        .as_ref()
+        .map(|_| Instant::now() + NETWORK_TRIAL_TIMEOUT);
     let mut ctx = SignCtx {
         masters,
         secp,
@@ -385,7 +436,10 @@ pub fn run_wifi_standalone<'d, 'b>(
         op_mgmt,
         relay_url: relays.first().cloned().unwrap_or_default(),
         relays: relays.clone(),
-        seen,
+        // Do not persist read request ids: Sapwood polls every four seconds and
+        // would otherwise cause tens of thousands of needless NVS writes/day.
+        // The old `mgmt_seen` blob from earlier firmware is intentionally ignored.
+        seen: Vec::new(),
         display_on: true,
         last_activity: Instant::now(),
         identity_name: None,
@@ -394,13 +448,16 @@ pub fn run_wifi_standalone<'d, 'b>(
         sign_audit_seq: 0,
         nip46_seen: Vec::new(),
         dial_cooldown: None,
+        network_trial_id,
+        network_trial_deadline,
+        network_restart_at: None,
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
     // entries whose creating slot has since been revoked over USB.
     let mut pinned = load_pinned(ctx.nvs);
     if prune_pinned(&mut pinned, ctx.policy_engine, &relays) {
-        save_pinned(ctx.nvs, &pinned);
+        let _ = save_pinned(ctx.nvs, &pinned);
     }
     if !pinned.is_empty() {
         log::info!("[relay] restored {} pinned relay(s) from NVS", pinned.len());
@@ -412,12 +469,36 @@ pub fn run_wifi_standalone<'d, 'b>(
     let mut sessions: Vec<RelaySession> = Vec::new();
     let mut primary_next = Instant::now();
 
+    // Opening a USB-UART adapter commonly resets the classic ESP32. Sapwood
+    // sends its first read-only probe as soon as the port opens, so service the
+    // bytes already waiting in UART before the first blocking WiFi/TLS dial.
+    // Without this grace window a healthy T-Display can look absent for tens of
+    // seconds while networking starts, precisely when USB is needed for local
+    // recovery. This does not hold the radio off: WiFi is already started and
+    // the normal relay loop begins immediately afterwards.
+    let usb_startup_grace = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < usb_startup_grace {
+        poll_usb(usb, &mut ctx, Some(&mut wifi));
+        FreeRtos::delay_ms(20);
+    }
+
     loop {
+        network_state_tick(&mut ctx);
+        if ctx.network_restart_at.is_some() {
+            // A management response already scheduled a restart. Do not enter
+            // any socket read (including another session's degraded blocking
+            // read) before the deadline is serviced at the top of the loop.
+            FreeRtos::delay_ms(20);
+            continue;
+        }
         // WiFi first: every session rides on it. `is_up` is cheap; a down link
         // drops all sessions (their sockets are dead anyway) and reconnects.
         if !wifi.is_up().unwrap_or(false) {
             if !sessions.is_empty() {
-                log::warn!("[relay] wifi down; dropping {} live session(s)", sessions.len());
+                log::warn!(
+                    "[relay] wifi down; dropping {} live session(s)",
+                    sessions.len()
+                );
                 sessions.clear();
             }
             if let Err(e) = wifi.connect().and_then(|_| wifi.wait_netif_up()) {
@@ -497,7 +578,8 @@ pub fn run_wifi_standalone<'d, 'b>(
             if sessions.len() >= MAX_SESSIONS || any_degraded {
                 break;
             }
-            if sessions.iter().any(|s| same_relay(&s.url, &p.url)) || Instant::now() < p.next_attempt
+            if sessions.iter().any(|s| same_relay(&s.url, &p.url))
+                || Instant::now() < p.next_attempt
             {
                 continue;
             }
@@ -506,7 +588,9 @@ pub fn run_wifi_standalone<'d, 'b>(
             // the backoff still decays a persistently tight board to rare probes.
             let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
             let largest = unsafe {
-                esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                    esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                )
             };
             if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
                 p.fails = p.fails.saturating_add(1);
@@ -528,9 +612,12 @@ pub fn run_wifi_standalone<'d, 'b>(
                 }
                 Err(e) => {
                     p.fails = p.fails.saturating_add(1);
-                    let delay =
-                        (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
-                    log::warn!("[relay] pinned {}: {e}; retry in {}s", p.url, delay.as_secs());
+                    let delay = (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
+                    log::warn!(
+                        "[relay] pinned {}: {e}; retry in {}s",
+                        p.url,
+                        delay.as_secs()
+                    );
                     p.next_attempt = Instant::now() + delay;
                 }
             }
@@ -548,7 +635,10 @@ pub fn run_wifi_standalone<'d, 'b>(
         while i < sessions.len() {
             let mut s = sessions.swap_remove(i);
             let step = {
-                let mut pool = RelayPool { others: &mut sessions, pinned: &mut pinned };
+                let mut pool = RelayPool {
+                    others: &mut sessions,
+                    pinned: &mut pinned,
+                };
                 session_step(&mut s, &mut ctx, &mut pool)
             };
             match step {
@@ -583,7 +673,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         // list when its creating slot is gone, and close any session whose pin
         // was dropped. Cheap (slots × pinned, pinned ≤ 1) so it runs each pass.
         if prune_pinned(&mut pinned, ctx.policy_engine, &relays) {
-            save_pinned(ctx.nvs, &pinned);
+            let _ = save_pinned(ctx.nvs, &pinned);
         }
         let before = sessions.len();
         sessions.retain(|se| !se.pinned || pinned.iter().any(|p| same_relay(&p.url, &se.url)));
@@ -599,6 +689,60 @@ pub fn run_wifi_standalone<'d, 'b>(
             crate::oled::sleep_display(ctx.display);
             ctx.display_on = false;
         }
+    }
+}
+
+/// Apply delayed network restarts only from the outer relay loop, after the
+/// management handler has returned and its encrypted response has been sent.
+/// A live candidate that is never committed is aborted and rebooted back to A.
+fn network_state_tick(ctx: &mut SignCtx) {
+    let now = Instant::now();
+    if ctx
+        .network_restart_at
+        .map(|deadline| now >= deadline)
+        .unwrap_or(false)
+    {
+        log::info!("[relay] applying scheduled network restart");
+        FreeRtos::delay_ms(100);
+        unsafe { esp_idf_svc::sys::esp_restart() };
+    }
+
+    if ctx
+        .network_trial_deadline
+        .map(|deadline| now >= deadline)
+        .unwrap_or(false)
+    {
+        let transaction_id = ctx.network_trial_id.clone().unwrap_or_default();
+        log::warn!(
+            "[relay] network trial {} timed out before commit — rolling back",
+            transaction_id
+        );
+        match crate::net_config_store::rollback_trial(ctx.nvs, &transaction_id) {
+            Ok(true) => {
+                // Commit crossed the authoritative active=B write before its
+                // ACK/cleanup failed. Finalisation won; never reboot/rollback B.
+                log::info!("[relay] timed trial reconciled as already committed");
+                ctx.network_trial_id = None;
+                ctx.network_trial_deadline = None;
+                return;
+            }
+            Ok(false) => {}
+            Err(_) => {
+                if crate::net_config_store::read_trial(ctx.nvs).is_some() {
+                    // NVS may be transiently unable to write the terminal
+                    // marker. Preserve the last valid trial proof and retry;
+                    // never erase/reboot a possibly committed transaction.
+                    log::error!("[relay] network trial finalisation failed; retaining proof for retry");
+                    ctx.network_trial_deadline = Some(Instant::now() + Duration::from_secs(10));
+                    return;
+                }
+                // Only genuinely unreadable/corrupt trial state is safe to
+                // clear before returning to untouched active A.
+                let _ = crate::net_config_store::clear_trial(ctx.nvs);
+            }
+        }
+        FreeRtos::delay_ms(100);
+        unsafe { esp_idf_svc::sys::esp_restart() };
     }
 }
 
@@ -626,13 +770,16 @@ fn retune_recv_timeouts(sessions: &mut [RelaySession]) {
 /// author, limit:1 → the stored replaceable event) for the idle screen name.
 fn build_sub_req(ctx: &SignCtx) -> String {
     let quoted = |pk: &[u8; 32]| format!("\"{}\"", hex_encode(pk));
-    let master_p = ctx.masters.iter().map(|m| quoted(&m.pubkey)).collect::<Vec<_>>();
+    let master_p = ctx
+        .masters
+        .iter()
+        .map(|m| quoted(&m.pubkey))
+        .collect::<Vec<_>>();
     let master_p_list = master_p.join(",");
     let mut nip46_p = master_p.clone();
     nip46_p.extend(ctx.personas.iter().map(|p| quoted(&p.pubkey)));
     let nip46_p_list = nip46_p.join(",");
-    let profile_filter =
-        format!(r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":1}}"##);
+    let profile_filter = format!(r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":1}}"##);
     if ctx.op_mgmt.is_some() {
         format!(
             r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{{"kinds":[{MGMT_KIND}],"#p":[{master_p_list}],"limit":0}},{profile_filter}]"##
@@ -679,12 +826,18 @@ fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySess
     let recv_timeout_on = match set_recv_timeout(&mut tls, RECV_TIMEOUT_MS) {
         Ok(()) => true,
         Err(e) => {
-            log::warn!("[relay] recv-timeout unavailable ({e}); blocking reads, TCP-keepalive only");
+            log::warn!(
+                "[relay] recv-timeout unavailable ({e}); blocking reads, TCP-keepalive only"
+            );
             false
         }
     };
-    if pinned && !recv_timeout_on {
-        return Err("pinned relay needs a recv timeout (would starve the primary)".into());
+    if !recv_timeout_on && (pinned || ctx.network_trial_id.is_some()) {
+        return Err(if pinned {
+            "pinned relay needs a recv timeout (would starve the primary)".into()
+        } else {
+            "network trial needs a recv timeout (rollback deadline must remain live)".into()
+        });
     }
 
     let sub_req = build_sub_req(ctx);
@@ -713,7 +866,11 @@ fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySess
 /// One pump pass over a session: drain buffered frames, one read, idle tick.
 /// An `Err` means the session is dead and should be dropped; per-request
 /// errors are handled (and swallowed) further down the dispatch chain.
-fn session_step(s: &mut RelaySession, ctx: &mut SignCtx, pool: &mut RelayPool) -> Result<(), String> {
+fn session_step(
+    s: &mut RelaySession,
+    ctx: &mut SignCtx,
+    pool: &mut RelayPool,
+) -> Result<(), String> {
     // Process at most ONE buffered frame per step, so the outer loop serves
     // USB between frames — same cadence the single-session loop kept (a burst
     // of frames must never starve the cable).
@@ -759,7 +916,10 @@ fn session_step(s: &mut RelaySession, ctx: &mut SignCtx, pool: &mut RelayPool) -
             log::debug!("[relay] re-subscribed on {} (keepalive)", s.url);
         }
         if now.duration_since(s.last_rx) >= SILENCE_LIMIT {
-            return Err(format!("relay {} silent (no data/pong); reconnecting", s.url));
+            return Err(format!(
+                "relay {} silent (no data/pong); reconnecting",
+                s.url
+            ));
         }
     }
     Ok(())
@@ -785,7 +945,11 @@ fn reboot_after_state_change(reason: &str) {
 /// connect loop), letting a 0x55 scan reuse the already-started radio; it is
 /// `None` while a relay connection is being served, where scanning would knock
 /// the link off its channel — that case declines rather than disrupt signing.
-fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx, wifi: Option<&mut BlockingWifi<EspWifi<'_>>>) {
+fn poll_usb(
+    usb: &mut SerialPort<'_>,
+    ctx: &mut SignCtx,
+    wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
+) {
     let frame = match crate::protocol::try_read_frame(usb, 0) {
         Some(f) => f,
         None => return,
@@ -826,9 +990,7 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx, wifi: Option<&mut Block
             }
         }
 
-        FRAME_TYPE_PROVISION_LIST => {
-            crate::provision::handle_list(usb, ctx.masters, ctx.personas)
-        }
+        FRAME_TYPE_PROVISION_LIST => crate::provision::handle_list(usb, ctx.masters, ctx.personas),
 
         // Plaintext NIP-46 — only when the bridge is not authenticated (mirrors
         // the USB-only loop). Uses the first master, like the tethered path.
@@ -853,7 +1015,11 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx, wifi: Option<&mut Block
                     ctx.identity_caches,
                     None,
                 );
-                crate::protocol::write_frame(usb, FRAME_TYPE_NIP46_RESPONSE, response_json.as_bytes());
+                crate::protocol::write_frame(
+                    usb,
+                    FRAME_TYPE_NIP46_RESPONSE,
+                    response_json.as_bytes(),
+                );
                 ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
             }
         }
@@ -885,25 +1051,65 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx, wifi: Option<&mut Block
             crate::session::handle_auth(usb, &frame.payload, ctx.nvs, ctx.policy_engine)
         }
         FRAME_TYPE_SET_BRIDGE_SECRET => crate::session::handle_set_bridge_secret(
-            usb, &frame.payload, ctx.nvs, ctx.policy_engine, ctx.display, ctx.button_pin,
+            usb,
+            &frame.payload,
+            ctx.nvs,
+            ctx.policy_engine,
+            ctx.display,
+            ctx.button_pin,
         ),
 
         // Network reconfig — the handler reboots into the new mode itself on a
         // wifi save (and simply persists a radio-off save).
         FRAME_TYPE_SET_NET_CONFIG => crate::net_config_store::handle_set_net_config(
-            usb, &frame.payload, ctx.nvs, ctx.display, ctx.button_pin,
+            usb,
+            &frame.payload,
+            ctx.nvs,
+            ctx.display,
+            ctx.button_pin,
         ),
 
-        FRAME_TYPE_SET_PIN => {
-            crate::pin::handle_set_pin(usb, &frame.payload, ctx.nvs, ctx.masters, ctx.display, ctx.button_pin)
+        FRAME_TYPE_GET_NET_CONFIG => {
+            crate::net_config_store::handle_get_net_config(usb, ctx.nvs)
         }
+
+        FRAME_TYPE_PATCH_NET_CONFIG => crate::net_config_store::handle_patch_net_config(
+            usb,
+            &frame.payload,
+            ctx.nvs,
+            ctx.display,
+            ctx.button_pin,
+        ),
+
+        FRAME_TYPE_SET_OPERATOR => crate::net_config_store::handle_set_operator(
+            usb,
+            &frame.payload,
+            ctx.nvs,
+            ctx.display,
+            ctx.button_pin,
+            true,
+        ),
+
+        FRAME_TYPE_SET_PIN => crate::pin::handle_set_pin(
+            usb,
+            &frame.payload,
+            ctx.nvs,
+            ctx.masters,
+            ctx.display,
+            ctx.button_pin,
+        ),
 
         FRAME_TYPE_CONNSLOT_CREATE => {
             crate::connslot::handle_create(usb, &frame, ctx.policy_engine, ctx.masters, ctx.nvs)
         }
         FRAME_TYPE_CONNSLOT_LIST => crate::connslot::handle_list(usb, &frame, ctx.policy_engine),
         FRAME_TYPE_CONNSLOT_UPDATE => crate::connslot::handle_update(
-            usb, &frame, ctx.policy_engine, ctx.nvs, ctx.display, ctx.button_pin,
+            usb,
+            &frame,
+            ctx.policy_engine,
+            ctx.nvs,
+            ctx.display,
+            ctx.button_pin,
         ),
         FRAME_TYPE_CONNSLOT_REVOKE => {
             crate::connslot::handle_revoke(usb, &frame, ctx.policy_engine, ctx.nvs)
@@ -958,14 +1164,25 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx, wifi: Option<&mut Block
         FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
             let provisioned = match frame.frame_type {
                 FRAME_TYPE_GENERATE_IDENTITY => crate::provision::handle_generate(
-                    usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.button_pin,
+                    usb,
+                    &frame,
+                    ctx.nvs,
+                    ctx.secp,
+                    ctx.display,
+                    ctx.button_pin,
                 ),
                 FRAME_TYPE_RESTORE_IDENTITY => crate::provision::handle_restore(
                     // `None`: restore over USB while already in Wi-Fi relay mode
                     // keeps the single-button gesture picker (the relay context
                     // doesn't carry the second button). The primary restore
                     // paths in main.rs get the T-Display two-button picker.
-                    usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.button_pin, None,
+                    usb,
+                    &frame,
+                    ctx.nvs,
+                    ctx.secp,
+                    ctx.display,
+                    ctx.button_pin,
+                    None,
                 ),
                 _ => crate::provision::handle_add(usb, &frame, ctx.nvs, ctx.secp, ctx.display),
             };
@@ -985,6 +1202,9 @@ fn poll_usb(usb: &mut SerialPort<'_>, ctx: &mut SignCtx, wifi: Option<&mut Block
                     Err(e) => {
                         log::error!("[relay] remove master slot {slot} failed: {e}");
                         crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                        if crate::masters::removal_pending(ctx.nvs) {
+                            reboot_after_state_change("master removal recovery pending");
+                        }
                     }
                 }
             } else {
@@ -1125,6 +1345,11 @@ fn process_event(
     ctx: &mut SignCtx,
     pool: &mut RelayPool,
 ) -> Result<(), String> {
+    if let Err(e) = nip46::verify_signed_event(ev) {
+        log::warn!("[relay] invalid Nostr EVENT ({e}); ignoring");
+        return Ok(());
+    }
+
     // Our own kind-0 profile: cache the name and refresh the idle identity
     // screen. This is not a user request, so it must never wake a blanked panel.
     if ev.kind == 0 {
@@ -1172,7 +1397,10 @@ fn process_event(
         // Dedupe across sessions: one request published to several relays must
         // dispatch once, not once per session (see SignCtx::nip46_seen).
         if ctx.nip46_seen.iter().any(|id| id == &ev.id) {
-            log::debug!("[relay] duplicate NIP-46 event {}…; ignoring", &ev.id[..ev.id.len().min(12)]);
+            log::debug!(
+                "[relay] duplicate NIP-46 event {}…; ignoring",
+                &ev.id[..ev.id.len().min(12)]
+            );
             return Ok(());
         }
         if ctx.nip46_seen.len() >= SEEN_MAX {
@@ -1208,7 +1436,8 @@ fn sign_audit_draft(plaintext: &str, label: String, client_hex: &str) -> Option<
             })
         }
         "nip04_encrypt" | "nip04_decrypt" | "nip44_encrypt" | "nip44_decrypt" => {
-            let peer = req.params
+            let peer = req
+                .params
                 .first()
                 .and_then(|v| v.as_str())
                 .filter(|s| s.len() >= 8)
@@ -1230,7 +1459,11 @@ fn sign_audit_draft(plaintext: &str, label: String, client_hex: &str) -> Option<
 fn push_sign_audit(ctx: &mut SignCtx, draft: SignAuditDraft, response_json: &str) {
     let outcome = serde_json::from_str::<serde_json::Value>(response_json)
         .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|e| format!("error: {e}")))
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(|e| format!("error: {e}"))
+        })
         .unwrap_or_else(|| draft.success_outcome.clone());
     ctx.sign_audit_seq = ctx.sign_audit_seq.wrapping_add(1);
     if ctx.sign_audit.len() >= SIGN_AUDIT_MAX {
@@ -1282,7 +1515,13 @@ fn handle_nip46_event(
     let (signing_secret, label, mode, slot, is_persona) =
         if let Some(midx) = masters::find_by_pubkey(ctx.masters, target_pk) {
             let m = &ctx.masters[midx];
-            (zeroize::Zeroizing::new(m.secret), m.label.clone(), m.mode, m.slot, false)
+            (
+                zeroize::Zeroizing::new(m.secret),
+                m.label.clone(),
+                m.mode,
+                m.slot,
+                false,
+            )
         } else if let Some(pidx) = crate::personas::find_by_pubkey(ctx.personas, target_pk) {
             let p = &ctx.personas[pidx];
             let owning = match ctx.masters.iter().find(|m| m.slot == p.master_slot) {
@@ -1313,7 +1552,8 @@ fn handle_nip46_event(
         };
 
     // The event author is the remote client.
-    let client_pubkey: [u8; 32] = match hex_decode(&ev.pubkey).ok().and_then(|v| v.try_into().ok()) {
+    let client_pubkey: [u8; 32] = match hex_decode(&ev.pubkey).ok().and_then(|v| v.try_into().ok())
+    {
         Some(pk) => pk,
         None => {
             log::warn!("[relay] EVENT has invalid author pubkey; ignoring");
@@ -1360,10 +1600,35 @@ fn handle_nip46_event(
         payload: plaintext.into_bytes(),
     };
 
+    // Only connect binding and first-sign TOFU can change durable slot
+    // authority. Snapshot those uncommon requests before dispatch so an NVS
+    // failure can roll RAM back without cloning the slot table on every
+    // unattended auto-sign.
+    let parsed_request = nip46::parse_request(&inner.payload).ok();
+    let request_id = parsed_request
+        .as_ref()
+        .map(|request| request.id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let slot_snapshot = parsed_request.as_ref().and_then(|request| {
+        let method = nip46::Nip46Method::from_str(&request.method);
+        let event_kind = if matches!(method, nip46::Nip46Method::SignEvent) {
+            nip46::parse_unsigned_event(&request.params)
+                .ok()
+                .map(|event| event.kind)
+        } else {
+            None
+        };
+        let tier = ctx
+            .policy_engine
+            .check(slot, &ev.pubkey, &method, event_kind);
+        crate::nip46_handler::request_may_mutate_slot_state(request, tier)
+            .then(|| ctx.policy_engine.snapshot_slot_state(slot))
+    });
+
     // Dispatch — same handler as the USB path. sign_event is ButtonRequired
     // until the slot is physically button-upgraded; auto-approve covers the
     // safe methods and post-upgrade signing.
-    let response_json = crate::nip46_handler::handle_request(
+    let mut response_json = crate::nip46_handler::handle_request(
         &inner,
         &signing_secret,
         &label,
@@ -1376,10 +1641,33 @@ fn handle_nip46_event(
         ctx.identity_caches,
         Some(&client_pubkey),
     );
+    if !ctx.policy_engine.persist_slots(ctx.nvs, slot) {
+        if let Some(snapshot) = slot_snapshot {
+            let rollback_durable = ctx
+                .policy_engine
+                .restore_slot_state_durably(ctx.nvs, snapshot);
+            let error = if rollback_durable {
+                log::error!(
+                    "[relay] slot authority for NIP-46 request {request_id} was not durable; prior authority restored durably"
+                );
+                "client policy could not be saved; request was not applied"
+            } else {
+                log::error!(
+                    "[relay] FATAL: slot authority for NIP-46 request {request_id} was not durable and prior authority could not be restored durably"
+                );
+                "fatal storage error: prior client policy could not be restored; take the device offline for USB recovery"
+            };
+            response_json = nip46::build_error_response(
+                &request_id,
+                -4,
+                error,
+            )
+            .unwrap_or_default();
+        }
+    }
     if let Some(audit) = audit {
         push_sign_audit(ctx, audit, &response_json);
     }
-    ctx.policy_engine.persist_slots(ctx.nvs, slot);
 
     // Persist any identities derived during this request (e.g. via
     // heartwood_derive_persona) to the registry, so they survive reboot and
@@ -1390,10 +1678,18 @@ fn handle_nip46_event(
             .identities
             .iter()
             .filter(|id| !crate::personas::contains_pubkey(ctx.personas, &id.public_key))
-            .map(|id| (id.purpose.clone(), id.index, id.persona_name.clone(), id.public_key))
+            .map(|id| {
+                (
+                    id.purpose.clone(),
+                    id.index,
+                    id.persona_name.clone(),
+                    id.public_key,
+                )
+            })
             .collect();
         for (purpose, index, name, pubkey) in fresh {
-            if crate::personas::add(ctx.nvs, slot, &purpose, index, name.as_deref(), &pubkey).is_ok()
+            if crate::personas::add(ctx.nvs, slot, &purpose, index, name.as_deref(), &pubkey)
+                .is_ok()
             {
                 ctx.personas.push(crate::personas::LoadedPersona {
                     master_slot: slot,
@@ -1416,31 +1712,6 @@ fn handle_nip46_event(
         ev.created_at,
         &response_json,
     )
-}
-
-/// Load the persisted management replay seen-set from NVS. Absent/corrupt ⇒
-/// empty (fail open to an empty set — replay protection rebuilds as commands
-/// arrive; it never blocks a legitimate fresh command).
-fn load_mgmt_seen(nvs: &mut EspNvs<NvsDefault>) -> Vec<String> {
-    let mut buf = [0u8; 8192];
-    match nvs.get_blob(MGMT_SEEN_KEY, &mut buf) {
-        Ok(Some(data)) => serde_json::from_slice::<Vec<String>>(data).unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-/// Persist the management replay seen-set to NVS after accepting a command.
-/// Management is rare (config changes), so the write rate is far below any NVS
-/// wear concern — unlike per-signing state, this is safe to write each time.
-fn persist_mgmt_seen(nvs: &mut EspNvs<NvsDefault>, seen: &[String]) {
-    match serde_json::to_string(seen) {
-        Ok(json) => {
-            if let Err(e) = nvs.set_blob(MGMT_SEEN_KEY, json.as_bytes()) {
-                log::error!("[relay] persist mgmt seen-set: {e:?}");
-            }
-        }
-        Err(e) => log::error!("[relay] serialise mgmt seen-set: {e}"),
-    }
 }
 
 /// Relay-management path (kind 24134): authenticate the author against the
@@ -1507,15 +1778,52 @@ fn handle_mgmt_event(
     // An avatar-carrying request is ~11KB of plaintext; free it before dispatch
     // rather than hold it through the NVS write on an already-tight heap.
     drop(plaintext);
-    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let id = req
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let method = req
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-    // Replay guard. The id checked here is the *inner* request id — it lives
-    // inside the NIP-44 ciphertext, so it cannot be forged or altered without
-    // the operator secret. The seen-set is bounded and persisted to NVS, so a
-    // command captured off the relay can't be replayed after a reboot either.
-    // (No created_at/NIP-40 window: the device has no trusted wall-clock, and
-    // the persisted inner-id set already closes the replay path.)
+    // The same encrypted management event may be delivered by both the
+    // configured primary and an unrelated client-pinned relay. A pinned copy
+    // must not enter the replay seen-set first and poison the later valid
+    // primary delivery. Silently pre-gate it (and any non-candidate source)
+    // before remembering the inner request id.
+    if method == "commit_network_config" {
+        if s.pinned {
+            log::warn!(
+                "[relay] ignoring network commit delivered by pinned relay {}",
+                s.url
+            );
+            return Ok(());
+        }
+        if let Some(trial) = crate::net_config_store::read_trial(ctx.nvs) {
+            if trial.phase == NetworkTrialPhase::Staged
+                || (trial.phase == NetworkTrialPhase::Trying && trial.attempts == 0)
+            {
+                log::warn!("[relay] ignoring network commit before candidate boot");
+                return Ok(());
+            }
+            if !network_commit_source_allowed(false, &s.url, &trial.candidate.relays) {
+                log::warn!(
+                    "[relay] ignoring network commit from non-candidate relay {}",
+                    s.url
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    // Duplicate-delivery guard. The id checked here is the *inner* request id —
+    // it lives inside the NIP-44 ciphertext, so it cannot be forged or altered
+    // without the operator secret. The persisted set is deliberately bounded;
+    // the one-time mutation challenge below is the durable replay boundary once
+    // an old id has been evicted. No wall-clock is needed.
     match mgmt::classify_replay(&id, &ctx.seen) {
         mgmt::Replay::Fresh => {}
         mgmt::Replay::Empty => {
@@ -1528,10 +1836,49 @@ fn handle_mgmt_event(
         }
     }
     mgmt::remember(&id, &mut ctx.seen, SEEN_MAX);
-    persist_mgmt_seen(ctx.nvs, &ctx.seen);
     log::info!("[relay] mgmt request: method={method} id={id} (operator authenticated)");
 
-    let response_json = match dispatch_mgmt(&method, &req, s, ctx, master_idx, pool) {
+    let dispatch_result = (|| {
+        if mgmt::requires_mutation_challenge(&method) {
+            let current = crate::management_challenge::current(
+                ctx.nvs,
+                crate::management_challenge::EntropySource::RadioActive,
+            )
+            .map_err(|e| {
+                log::error!("[relay] {e}");
+                "management challenge unavailable; mutation was not applied".to_string()
+            })?;
+            let current_hex = hex_encode(&current);
+            let supplied = req.get("mutation_challenge").and_then(|value| value.as_str());
+            match mgmt::classify_mutation_challenge(&method, supplied, &current_hex) {
+                mgmt::MutationChallenge::Current => {
+                    crate::management_challenge::rotate(
+                        ctx.nvs,
+                        &current,
+                        crate::management_challenge::EntropySource::RadioActive,
+                    )
+                    .map_err(|e| {
+                        log::error!("[relay] {e}");
+                        "management challenge could not be rotated; mutation was not applied"
+                            .to_string()
+                    })?;
+                }
+                mgmt::MutationChallenge::Missing => {
+                    return Err("replay_safe_mutation_required: request get_management_challenge before changing the device".into());
+                }
+                mgmt::MutationChallenge::Malformed => {
+                    return Err("invalid_management_challenge: expected 64 hex characters".into());
+                }
+                mgmt::MutationChallenge::Stale => {
+                    return Err("stale_management_challenge: another manager changed the device; refresh state and retry".into());
+                }
+                mgmt::MutationChallenge::NotRequired => unreachable!(),
+            }
+        }
+        dispatch_mgmt(&method, &req, s, ctx, master_idx, pool)
+    })();
+
+    let response_json = match dispatch_result {
         Ok(result) => serde_json::json!({ "id": id, "result": result }).to_string(),
         Err(e) => serde_json::json!({ "id": id, "error": e }).to_string(),
     };
@@ -1547,6 +1894,102 @@ fn handle_mgmt_event(
         ev.created_at,
         &response_json,
     )
+}
+
+/// Parse the v2 exact-policy envelope strictly. The versioned method name is
+/// intentional: old firmware rejects it before mutation instead of silently
+/// ignoring fields it does not understand and creating a broad signing slot.
+fn exact_policy_from_request(req: &serde_json::Value) -> Result<ExactSlotPolicy, String> {
+    let raw_methods = req
+        .pointer("/params/policy/allowed_methods")
+        .and_then(|value| value.as_array())
+        .ok_or("v2 policy requires params.policy.allowed_methods")?;
+    let mut methods = Vec::with_capacity(raw_methods.len());
+    for value in raw_methods {
+        methods.push(
+            value
+                .as_str()
+                .ok_or("v2 policy allowed_methods must contain only strings")?
+                .to_string(),
+        );
+    }
+
+    let raw_kinds = req
+        .pointer("/params/policy/allowed_kinds")
+        .and_then(|value| value.as_array())
+        .ok_or("v2 policy requires params.policy.allowed_kinds")?;
+    let mut kinds = Vec::with_capacity(raw_kinds.len());
+    for value in raw_kinds {
+        kinds.push(
+            value
+                .as_u64()
+                .ok_or("v2 policy allowed_kinds must contain only unsigned integers")?,
+        );
+    }
+
+    let auto_approve = req
+        .pointer("/params/policy/auto_approve")
+        .and_then(|value| value.as_bool())
+        .ok_or("v2 policy requires params.policy.auto_approve")?;
+
+    validate_exact_slot_policy(methods, kinds, auto_approve).map_err(str::to_string)
+}
+
+/// Make a slot-authority mutation durable before its management response may
+/// report success. The complete per-master snapshot closes partial rollback
+/// gaps (including client keys moved out of another slot by uniqueness rules).
+fn persist_slot_mutation_or_rollback(
+    ctx: &mut SignCtx,
+    master_slot: u8,
+    snapshot: crate::policy::SlotStateSnapshot,
+    action: &str,
+) -> Result<(), String> {
+    if ctx.policy_engine.persist_slots(ctx.nvs, master_slot) {
+        return Ok(());
+    }
+    if ctx
+        .policy_engine
+        .restore_slot_state_durably(ctx.nvs, snapshot)
+    {
+        log::error!("[relay] {action} was not durable; prior slot authority restored durably");
+        Err(format!(
+            "could not persist {action}; request was not applied"
+        ))
+    } else {
+        log::error!(
+            "[relay] FATAL: {action} failed and prior slot authority could not be restored durably"
+        );
+        Err(format!(
+            "fatal storage error: could not restore prior client policy after {action}; take the device offline for USB recovery"
+        ))
+    }
+}
+
+/// Bind a numeric-slot management action to the credential the operator last
+/// observed. Slot indices are reused after revocation, so the index alone is
+/// not a stable identity: a delayed/stale UI action could otherwise target a
+/// newly-created client that inherited the same index.
+fn require_expected_slot_fingerprint(
+    req: &serde_json::Value,
+    slot: &heartwood_common::policy::ConnectSlot,
+) -> Result<String, String> {
+    let actual = mgmt::credential_fingerprint(&slot.secret);
+    match mgmt::classify_credential_fingerprint(
+        req.pointer("/params/expected_secret_fingerprint")
+            .and_then(|value| value.as_str()),
+        &actual,
+    ) {
+        mgmt::CredentialFingerprintMatch::Match => Ok(actual),
+        mgmt::CredentialFingerprintMatch::Missing => {
+            Err("expected_secret_fingerprint is required".into())
+        }
+        mgmt::CredentialFingerprintMatch::Malformed => Err(
+            "invalid expected_secret_fingerprint: expected 64 lowercase hex characters".into(),
+        ),
+        mgmt::CredentialFingerprintMatch::Mismatch => {
+            Err("stale_client_slot: slot credential changed; refresh clients and try again".into())
+        }
+    }
 }
 
 /// Execute one authenticated management method. Maps onto the same
@@ -1570,7 +2013,372 @@ fn dispatch_mgmt(
     let master_hex = hex_encode(&ctx.masters[master_idx].pubkey);
 
     match method {
-        "create_client" => {
+        "get_management_challenge" => {
+            let challenge = crate::management_challenge::current(
+                ctx.nvs,
+                crate::management_challenge::EntropySource::RadioActive,
+            )
+            .map_err(|e| {
+                log::error!("[relay] {e}");
+                "management challenge unavailable".to_string()
+            })?;
+            Ok(serde_json::json!({
+                "version": 1,
+                "challenge": hex_encode(&challenge),
+            }))
+        }
+
+        "get_network_config" => {
+            // Capture the atomic marker before best-effort cleanup. Once this
+            // exists, B and a committed outcome are authoritative even when
+            // active/terminal NVS writes are temporarily unavailable.
+            let committed_marker = crate::net_config_store::read_trial(ctx.nvs)
+                .filter(|trial| trial.phase == NetworkTrialPhase::Committed);
+            let _ = crate::net_config_store::reconcile_terminal_state(ctx.nvs);
+            let persisted_terminal = crate::net_config_store::read_terminal(ctx.nvs);
+            let terminal = match committed_marker.as_ref() {
+                Some(marker) => persisted_terminal
+                    .filter(|last| {
+                        last.transaction_id == marker.transaction_id
+                            && last.revision == marker.accepted_revision
+                            && last.outcome
+                                == heartwood_common::net_config::NetworkTerminalOutcome::Committed
+                    })
+                    .or_else(|| {
+                        Some(heartwood_common::net_config::NetworkTerminalRecord {
+                            version: 1,
+                            transaction_id: marker.transaction_id.clone(),
+                            revision: marker.accepted_revision,
+                            outcome:
+                                heartwood_common::net_config::NetworkTerminalOutcome::Committed,
+                        })
+                    }),
+                None => persisted_terminal,
+            };
+            if terminal.as_ref().map(|last| {
+                last.outcome == heartwood_common::net_config::NetworkTerminalOutcome::Committed
+                    && ctx.network_trial_id.as_deref() == Some(last.transaction_id.as_str())
+            }) == Some(true)
+            {
+                ctx.network_trial_id = None;
+                ctx.network_trial_deadline = None;
+            }
+            let active = committed_marker
+                .as_ref()
+                .map(|trial| trial.candidate.clone())
+                .or_else(|| {
+                    crate::net_config_store::read_net_config(ctx.nvs).and_then(|raw| {
+                        heartwood_common::net_config::parse_net_config(&raw).ok()
+                    })
+                })
+                .ok_or("active network config unavailable")?;
+            let active_json = serde_json::json!({
+                "mode": active.mode,
+                "ssid": active.ssid,
+                "relays": active.relays,
+                "password_set": !active.password.is_empty(),
+            });
+            let terminal_transaction = terminal
+                .as_ref()
+                .map(|last| (last.transaction_id.as_str(), last.revision));
+            let trial_json = crate::net_config_store::read_trial(ctx.nvs)
+                .filter(|trial| {
+                    trial.phase != NetworkTrialPhase::Committed
+                        && terminal_transaction
+                            != Some((trial.transaction_id.as_str(), trial.accepted_revision))
+                })
+                .map(|trial| {
+                    serde_json::json!({
+                        "transaction_id": trial.transaction_id,
+                        "revision": trial.accepted_revision,
+                        "phase": trial.phase,
+                        "mode": trial.candidate.mode,
+                        "ssid": trial.candidate.ssid,
+                        "relays": trial.candidate.relays,
+                        "password_set": !trial.candidate.password.is_empty(),
+                        "attempted": trial.attempts > 0,
+                    })
+                });
+            let last_result = terminal.map(|last| {
+                serde_json::json!({
+                    "transaction_id": last.transaction_id,
+                    "revision": last.revision,
+                    "outcome": last.outcome,
+                })
+            });
+            let revision = crate::net_config_store::reconcile_network_revision(ctx.nvs);
+            Ok(serde_json::json!({
+                "revision": revision,
+                "active": active_json,
+                "trial": trial_json,
+                "last_result": last_result,
+            }))
+        }
+
+        "stage_network_config" => {
+            let params: StageNetworkConfigParams = serde_json::from_value(
+                req.get("params")
+                    .cloned()
+                    .ok_or("stage_network_config requires params")?,
+            )
+            .map_err(|e| format!("invalid stage_network_config params: {e}"))?;
+            let committed_marker = crate::net_config_store::read_trial(ctx.nvs)
+                .filter(|trial| trial.phase == NetworkTrialPhase::Committed);
+            let _ = crate::net_config_store::reconcile_terminal_state(ctx.nvs);
+            let active = committed_marker
+                .map(|trial| trial.candidate)
+                .or_else(|| {
+                    crate::net_config_store::read_net_config(ctx.nvs).and_then(|raw| {
+                        heartwood_common::net_config::parse_net_config(&raw).ok()
+                    })
+                })
+                .ok_or("active network config unavailable")?;
+            let candidate =
+                apply_remote_net_config_patch(&active, &params.patch).map_err(str::to_string)?;
+            let revision = crate::net_config_store::stage_trial(
+                ctx.nvs,
+                params.base_revision,
+                &params.transaction_id,
+                &candidate,
+            )?;
+            log::info!(
+                "[relay] staged network trial {} at revision {}",
+                params.transaction_id,
+                revision
+            );
+            Ok(serde_json::json!({
+                "transaction_id": params.transaction_id,
+                "revision": revision,
+                "phase": "staged",
+                "staged": true,
+            }))
+        }
+
+        "activate_network_config" => {
+            if !network_activation_source_allowed(s.recv_timeout_on) {
+                return Err(
+                    "activate_network_config requires a relay session with bounded reads".into(),
+                );
+            }
+            match masters::pin_unlock_required_after_reboot(ctx.nvs, ctx.masters) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(
+                        "activate_network_config unavailable: reboot requires local PIN unlock"
+                            .into(),
+                    );
+                }
+                Err(_) => {
+                    return Err(
+                        "activate_network_config unavailable: could not verify PIN reboot safety"
+                            .into(),
+                    );
+                }
+            }
+            let params: NetworkConfigTransactionParams = serde_json::from_value(
+                req.get("params")
+                    .cloned()
+                    .ok_or("activate_network_config requires params")?,
+            )
+            .map_err(|e| format!("invalid activate_network_config params: {e}"))?;
+            crate::net_config_store::activate_trial(
+                ctx.nvs,
+                &params.transaction_id,
+                params.revision,
+            )?;
+            let trial = crate::net_config_store::read_trial(ctx.nvs)
+                .ok_or("network trial disappeared after activation")?;
+            ctx.network_restart_at = Some(Instant::now() + NETWORK_RESTART_DELAY);
+            log::info!(
+                "[relay] activated network trial {} at revision {}; restart scheduled",
+                params.transaction_id,
+                trial.accepted_revision
+            );
+            Ok(serde_json::json!({
+                "transaction_id": params.transaction_id,
+                "revision": trial.accepted_revision,
+                "phase": "trying",
+                "rebooting": true,
+            }))
+        }
+
+        "commit_network_config" => {
+            let params: NetworkConfigTransactionParams = serde_json::from_value(
+                req.get("params")
+                    .cloned()
+                    .ok_or("commit_network_config requires params")?,
+            )
+            .map_err(|e| format!("invalid commit_network_config params: {e}"))?;
+            if let Some(marker) = crate::net_config_store::read_trial(ctx.nvs)
+                .filter(|trial| trial.phase == NetworkTrialPhase::Committed)
+            {
+                if marker.transaction_id != params.transaction_id {
+                    return Err("network transaction id mismatch".into());
+                }
+                if marker.accepted_revision != params.revision {
+                    return Err("network transaction revision mismatch".into());
+                }
+                let _ = crate::net_config_store::reconcile_terminal_state(ctx.nvs);
+                ctx.network_trial_id = None;
+                ctx.network_trial_deadline = None;
+                return Ok(serde_json::json!({
+                    "transaction_id": params.transaction_id,
+                    "revision": params.revision,
+                    "phase": "committed",
+                    "committed": true,
+                }));
+            }
+            let _ = crate::net_config_store::reconcile_terminal_state(ctx.nvs)?;
+            let trial = match crate::net_config_store::read_trial(ctx.nvs) {
+                Some(trial) => trial,
+                None => {
+                    if let Some(last) = crate::net_config_store::read_terminal(ctx.nvs) {
+                        if last.transaction_id == params.transaction_id
+                            && last.revision == params.revision
+                            && last.outcome
+                                == heartwood_common::net_config::NetworkTerminalOutcome::Committed
+                        {
+                            ctx.network_trial_id = None;
+                            ctx.network_trial_deadline = None;
+                            return Ok(serde_json::json!({
+                                "transaction_id": params.transaction_id,
+                                "revision": params.revision,
+                                "phase": "committed",
+                                "committed": true,
+                            }));
+                        }
+                    }
+                    return Err("no network trial pending".into());
+                }
+            };
+            if trial.transaction_id != params.transaction_id {
+                return Err("network transaction id mismatch".into());
+            }
+            if trial.accepted_revision != params.revision {
+                return Err("network transaction revision mismatch".into());
+            }
+            if ctx.network_trial_id.as_deref() != Some(params.transaction_id.as_str())
+                || trial.phase != NetworkTrialPhase::Trying
+                || trial.attempts != 1
+            {
+                return Err("network trial is not active on this boot".into());
+            }
+            if !network_commit_source_allowed(s.pinned, &s.url, &trial.candidate.relays) {
+                return Err("network commit must arrive through a candidate primary relay".into());
+            }
+            let revision = trial.accepted_revision;
+            crate::net_config_store::commit_trial(
+                ctx.nvs,
+                &params.transaction_id,
+                params.revision,
+            )?;
+            ctx.network_trial_id = None;
+            ctx.network_trial_deadline = None;
+            log::info!(
+                "[relay] committed network trial {} at revision {}",
+                params.transaction_id,
+                revision
+            );
+            Ok(serde_json::json!({
+                "transaction_id": params.transaction_id,
+                "revision": revision,
+                "phase": "committed",
+                "committed": true,
+            }))
+        }
+
+        "abort_network_config" => {
+            let params: NetworkConfigTransactionParams = serde_json::from_value(
+                req.get("params")
+                    .cloned()
+                    .ok_or("abort_network_config requires params")?,
+            )
+            .map_err(|e| format!("invalid abort_network_config params: {e}"))?;
+            if let Some(marker) = crate::net_config_store::read_trial(ctx.nvs)
+                .filter(|trial| trial.phase == NetworkTrialPhase::Committed)
+            {
+                if marker.transaction_id != params.transaction_id {
+                    return Err("network transaction id mismatch".into());
+                }
+                if marker.accepted_revision != params.revision {
+                    return Err("network transaction revision mismatch".into());
+                }
+                let _ = crate::net_config_store::reconcile_terminal_state(ctx.nvs);
+                ctx.network_trial_id = None;
+                ctx.network_trial_deadline = None;
+                return Err("network transaction is already committed".into());
+            }
+            let _ = crate::net_config_store::reconcile_terminal_state(ctx.nvs)?;
+            let trial = match crate::net_config_store::read_trial(ctx.nvs) {
+                Some(trial) => trial,
+                None => {
+                    if let Some(last) = crate::net_config_store::read_terminal(ctx.nvs) {
+                        if last.transaction_id == params.transaction_id
+                            && last.revision == params.revision
+                            && last.outcome
+                                == heartwood_common::net_config::NetworkTerminalOutcome::Aborted
+                        {
+                            return Ok(serde_json::json!({
+                                "transaction_id": params.transaction_id,
+                                "revision": params.revision,
+                                "phase": "aborted",
+                                "aborted": true,
+                                "rebooting": false,
+                            }));
+                        }
+                        if last.transaction_id == params.transaction_id
+                            && last.revision == params.revision
+                            && last.outcome
+                                == heartwood_common::net_config::NetworkTerminalOutcome::Committed
+                        {
+                            ctx.network_trial_id = None;
+                            ctx.network_trial_deadline = None;
+                            return Err("network transaction is already committed".into());
+                        }
+                    }
+                    return Err("no network trial pending".into());
+                }
+            };
+            if trial.transaction_id != params.transaction_id {
+                return Err("network transaction id mismatch".into());
+            }
+            if trial.accepted_revision != params.revision {
+                return Err("network transaction revision mismatch".into());
+            }
+            let revision = trial.accepted_revision;
+            let live_candidate =
+                ctx.network_trial_id.as_deref() == Some(params.transaction_id.as_str());
+            crate::net_config_store::abort_trial(
+                ctx.nvs,
+                &params.transaction_id,
+                params.revision,
+            )?;
+            ctx.network_trial_id = None;
+            ctx.network_trial_deadline = None;
+            // Cancels a not-yet-fired activation restart. Only a device
+            // currently running B needs to reboot back to A after abort.
+            ctx.network_restart_at = live_candidate.then(|| Instant::now() + NETWORK_RESTART_DELAY);
+            log::info!(
+                "[relay] aborted network trial {} at revision {}",
+                params.transaction_id,
+                revision
+            );
+            Ok(serde_json::json!({
+                "transaction_id": params.transaction_id,
+                "revision": revision,
+                "phase": "aborted",
+                "aborted": true,
+                "rebooting": live_candidate,
+            }))
+        }
+
+        "create_client" | "create_client_v2" => {
+            let is_v2 = method == "create_client_v2";
+            let exact_policy = if is_v2 {
+                Some(exact_policy_from_request(req)?)
+            } else {
+                None
+            };
             let label = req
                 .pointer("/params/label")
                 .and_then(|v| v.as_str())
@@ -1591,34 +2399,71 @@ fn dispatch_mgmt(
             // Optional: grant signing authority in the same call so the operator
             // can provision a ready-to-sign shelf client in one round-trip. This
             // is the op_mgmt-authority-for-physical-button substitution.
-            let auto_sign = req
-                .pointer("/params/approve_signing")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let auto_sign = exact_policy
+                .as_ref()
+                .map(|policy| policy.signing_approved)
+                .unwrap_or_else(|| {
+                    req.pointer("/params/approve_signing")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                });
 
-            match ctx.policy_engine.create_slot(master_slot, label.clone(), secret_hex.clone()) {
+            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
+            let created = match exact_policy {
+                Some(policy) => ctx.policy_engine.create_slot_with_exact_policy(
+                    master_slot,
+                    label.clone(),
+                    secret_hex.clone(),
+                    policy,
+                ),
+                None => {
+                    ctx.policy_engine
+                        .create_slot(master_slot, label.clone(), secret_hex.clone())
+                }
+            };
+            match created {
                 Some(index) => {
-                    if auto_sign {
+                    if auto_sign && !is_v2 {
                         ctx.policy_engine.upgrade_to_signing(master_slot, index);
                     }
-                    ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+                    persist_slot_mutation_or_rollback(
+                        ctx,
+                        master_slot,
+                        slot_snapshot,
+                        "client creation",
+                    )?;
                     let bunker_uri = mgmt::bunker_uri(&master_hex, &ctx.relays, Some(&secret_hex));
                     log::info!(
                         "[relay] mgmt: created client slot {index} ({label}){}",
-                        if auto_sign { " [signing pre-approved]" } else { "" }
+                        if auto_sign {
+                            " [signing pre-approved]"
+                        } else {
+                            ""
+                        }
                     );
                     let note = if auto_sign {
                         "signing pre-approved by operator — client auto-signs once it connects with the secret"
                     } else {
                         "first sign_event needs approval — call approve_signing or one physical PRG press"
                     };
+                    let applied = ctx
+                        .policy_engine
+                        .list_slots(master_slot)
+                        .iter()
+                        .find(|slot| slot.slot_index == index);
+                    let secret_fingerprint = mgmt::credential_fingerprint(&secret_hex);
                     Ok(serde_json::json!({
                         "slot_index": index,
                         "label": label,
                         "secret": secret_hex,
+                        "secret_fingerprint": secret_fingerprint,
                         "npub_hex": master_hex,
                         "bunker_uri": bunker_uri,
                         "signing_approved": auto_sign,
+                        "policy_version": if is_v2 { Some(2u8) } else { None },
+                        "allowed_methods": applied.map(|slot| slot.allowed_methods.clone()).unwrap_or_default(),
+                        "allowed_kinds": applied.map(|slot| slot.allowed_kinds.clone()).unwrap_or_default(),
+                        "auto_approve": applied.map(|slot| slot.auto_approve).unwrap_or(false),
                         "note": note,
                     }))
                 }
@@ -1634,7 +2479,13 @@ fn dispatch_mgmt(
         // a pinned session (params.relay, capacity permitting) and keeps serving
         // it so the pairing outlives the handshake.
         // The device has no wall-clock, so the operator (SPA) supplies created_at.
-        "nostrconnect" => {
+        "nostrconnect" | "nostrconnect_v2" => {
+            let is_v2 = method == "nostrconnect_v2";
+            let exact_policy = if is_v2 {
+                Some(exact_policy_from_request(req)?)
+            } else {
+                None
+            };
             let client_hex = req
                 .pointer("/params/client_pubkey")
                 .and_then(|v| v.as_str())
@@ -1657,15 +2508,22 @@ fn dispatch_mgmt(
                 .and_then(|v| v.as_str())
                 .unwrap_or("nostrconnect app")
                 .to_string();
-            let auto_sign = req
-                .pointer("/params/approve_signing")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let allowed_kinds: Vec<u64> = req
-                .pointer("/params/allowed_kinds")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|k| k.as_u64()).collect())
-                .unwrap_or_default();
+            let auto_sign = exact_policy
+                .as_ref()
+                .map(|policy| policy.signing_approved)
+                .unwrap_or_else(|| {
+                    req.pointer("/params/approve_signing")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                });
+            let allowed_kinds: Vec<u64> = if let Some(policy) = &exact_policy {
+                policy.allowed_kinds.clone()
+            } else {
+                req.pointer("/params/allowed_kinds")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|k| k.as_u64()).collect())
+                    .unwrap_or_default()
+            };
             // The app's relay from its nostrconnect URI. Optional: absent means
             // the SPA established overlap and the arriving session carries it.
             let client_relay = req
@@ -1716,14 +2574,19 @@ fn dispatch_mgmt(
                 // has no state until a pin actually lands.
                 if let Some((u, t)) = &ctx.dial_cooldown {
                     if same_relay(u, url) && t.elapsed() < PINNED_BACKOFF {
-                        return Err("relay_dial_failed: a dial to this relay just failed; retry shortly".into());
+                        return Err(
+                            "relay_dial_failed: a dial to this relay just failed; retry shortly"
+                                .into(),
+                        );
                     }
                 }
                 // A session without a recv timeout blocks the loop on quiet
                 // reads; a second socket would multiply that stall, so refuse
                 // to grow the pool while any live session runs degraded.
                 if !s.recv_timeout_on || pool.others.iter().any(|o| !o.recv_timeout_on) {
-                    return Err("relay_dial_failed: signer relay link is degraded (no recv timeout)".into());
+                    return Err(
+                        "relay_dial_failed: signer relay link is degraded (no recv timeout)".into(),
+                    );
                 }
                 // Heap guard: a second mbedTLS session needs ~40-50KB of often
                 // fragmented heap, and an allocation failure deep inside the
@@ -1749,17 +2612,10 @@ fn dispatch_mgmt(
                 .policy_engine
                 .find_slot_by_pubkey(master_slot, client_hex)
                 .map(|slot| slot.slot_index);
-
-            // Snapshot the pre-rebind slot state: an ACK failure must restore
-            // it, or a failed re-pair would silently keep this attempt's
-            // label, kind and signing changes on a live pairing.
-            let prior = existing_index.and_then(|i| {
-                ctx.policy_engine
-                    .list_slots(master_slot)
-                    .iter()
-                    .find(|sl| sl.slot_index == i)
-                    .map(|sl| (sl.label.clone(), sl.allowed_kinds.clone(), sl.signing_approved))
-            });
+            // Capture the complete master table, not just the target. Pubkey
+            // uniqueness can move this client out of another slot, so every
+            // failed pairing path must restore the whole authority state.
+            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
 
             // Capacity check BEFORE the expensive dial, so a full table cannot
             // waste a complete TLS + WS handshake.
@@ -1773,6 +2629,11 @@ fn dispatch_mgmt(
             // Copy the master secret up front (it is Copy) so publishing the ACK
             // below needs no live borrow of ctx while the slot table is mutated.
             let master_secret = ctx.masters[master_idx].secret;
+            // Hex shape is not enough: validate/lift the x-only key and derive
+            // the ACK conversation key before dialling or touching slot RAM.
+            // No fallible key operation may strand an orphan authority change.
+            let ck = nip44::get_conversation_key(&master_secret, &client_bytes)
+                .map_err(|e| format!("conversation key: {e}"))?;
 
             // A slot secret is still minted (bunker parity), even though this slot
             // is bound by pubkey rather than by a secret handshake.
@@ -1808,40 +2669,79 @@ fn dispatch_mgmt(
                 log::info!("[relay] nostrconnect: dial ok (free heap {heap})");
             }
 
-            let (index, created) = match existing_index {
+            let index = match existing_index {
                 Some(i) => {
-                    // Rebind: refresh the label and kind limits in place.
-                    ctx.policy_engine.update_slot(
-                        master_slot,
-                        i,
-                        Some(label.clone()),
-                        None,
-                        if allowed_kinds.is_empty() { None } else { Some(allowed_kinds) },
-                        None,
-                    );
+                    // Rebind: v2 replaces the complete policy as one validated
+                    // unit; legacy keeps its historical partial-kind behavior.
+                    if let Some(policy) = &exact_policy {
+                        ctx.policy_engine.update_slot(
+                            master_slot,
+                            i,
+                            Some(label.clone()),
+                            None,
+                            None,
+                            None,
+                        );
+                        if let Err(error) = ctx.policy_engine.set_exact_slot_policy(
+                            master_slot,
+                            i,
+                            policy.allowed_methods.clone(),
+                            policy.allowed_kinds.clone(),
+                            policy.auto_approve,
+                        ) {
+                            ctx.policy_engine.restore_slot_state(slot_snapshot);
+                            return Err(error);
+                        }
+                    } else {
+                        ctx.policy_engine.update_slot(
+                            master_slot,
+                            i,
+                            Some(label.clone()),
+                            None,
+                            if allowed_kinds.is_empty() {
+                                None
+                            } else {
+                                Some(allowed_kinds.clone())
+                            },
+                            None,
+                        );
+                    }
                     log::info!("[relay] nostrconnect: rebinding existing slot {i}");
-                    (i, false)
+                    i
                 }
                 None => {
-                    let i = ctx
-                        .policy_engine
-                        .create_slot(master_slot, label.clone(), slot_secret)
-                        .ok_or("create_slot failed (slot table full?)")?;
-                    ctx.policy_engine.assign_pubkey_to_slot(master_slot, i, client_hex.to_string());
-                    if !allowed_kinds.is_empty() {
-                        ctx.policy_engine.update_slot(master_slot, i, None, None, Some(allowed_kinds), None);
+                    let i = if let Some(policy) = &exact_policy {
+                        ctx.policy_engine.create_slot_with_exact_policy(
+                            master_slot,
+                            label.clone(),
+                            slot_secret,
+                            policy.clone(),
+                        )
+                    } else {
+                        ctx.policy_engine
+                            .create_slot(master_slot, label.clone(), slot_secret)
                     }
-                    (i, true)
+                    .ok_or("create_slot failed (slot table full?)")?;
+                    ctx.policy_engine
+                        .assign_pubkey_to_slot(master_slot, i, client_hex.to_string());
+                    if !is_v2 && !allowed_kinds.is_empty() {
+                        ctx.policy_engine.update_slot(
+                            master_slot,
+                            i,
+                            None,
+                            None,
+                            Some(allowed_kinds.clone()),
+                            None,
+                        );
+                    }
+                    i
                 }
             };
-            if auto_sign {
+            if auto_sign && !is_v2 {
                 ctx.policy_engine.upgrade_to_signing(master_slot, index);
             }
-            ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
 
             // Publish the connect ACK to the app, authored by this master.
-            let ck = nip44::get_conversation_key(&master_secret, &client_bytes)
-                .map_err(|e| format!("conversation key: {e}"))?;
             let mut id_bytes = [0u8; 8];
             unsafe {
                 esp_idf_svc::sys::esp_fill_random(
@@ -1849,45 +2749,36 @@ fn dispatch_mgmt(
                     8,
                 );
             }
-            let ack = serde_json::json!({ "id": hex_encode(&id_bytes), "result": secret }).to_string();
+            let ack =
+                serde_json::json!({ "id": hex_encode(&id_bytes), "result": secret }).to_string();
             let joined_relay = dialled.is_some();
             let ack_tls = match (&ack_target, dialled.as_mut()) {
                 (AckTarget::Other(i), _) => &mut pool.others[*i].tls,
                 (_, Some(ns)) => &mut ns.tls,
                 _ => &mut s.tls,
             };
-            if let Err(e) = sign_and_publish(ack_tls, ctx.secp, &master_secret, &ck, client_hex, NIP46_KIND, created_at, &ack) {
-                // The client never saw its secret, so pairing failed from its
-                // side. Roll back this attempt's mutations: revoke a newly
-                // minted slot, or restore a rebound slot's prior label, kinds
-                // and signing approval (the slot itself stays — that pairing
-                // was already live before this attempt touched it).
-                if created {
-                    ctx.policy_engine.revoke_slot(master_slot, index);
-                } else if let Some((label0, kinds0, signing0)) = prior {
-                    // update_slot cannot lower signing_approved (by design),
-                    // so restore the fields directly and mark dirty.
-                    if let Some(sl) = ctx
-                        .policy_engine
-                        .slots_mut(master_slot)
-                        .iter_mut()
-                        .find(|sl| sl.slot_index == index)
-                    {
-                        sl.label = label0;
-                        sl.allowed_kinds = kinds0;
-                        sl.signing_approved = signing0;
-                    }
-                    ctx.policy_engine.slots_dirty = true;
-                }
-                ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+            if let Err(e) = sign_and_publish(
+                ack_tls,
+                ctx.secp,
+                &master_secret,
+                &ck,
+                client_hex,
+                NIP46_KIND,
+                created_at,
+                &ack,
+            ) {
+                // The client never saw its secret and no slot write was
+                // attempted, so restoring the complete RAM snapshot is enough.
+                ctx.policy_engine.restore_slot_state(slot_snapshot);
                 return Err(e);
             }
 
-            // Adopt the dialled session and persist the pin only after the ACK
-            // made it out — a dead dial is fully rolled back above. An existing
-            // pin for the same relay (re-pair while its session was down) is
-            // updated in place, so one relay never carries two pins.
-            if let Some(ns) = dialled {
+            // Persist a newly joined route before the slot authority that needs
+            // it. If this write fails, NVS still contains the prior slot table,
+            // so rolling RAM back is enough to keep the ACK from granting a
+            // volatile/reboot-fragile pairing.
+            let pinned_before = dialled.as_ref().map(|_| pool.pinned.clone());
+            if let Some(ns) = dialled.as_ref() {
                 match pool.pinned.iter_mut().find(|p| same_relay(&p.url, &ns.url)) {
                     Some(p) => {
                         p.ms = master_slot;
@@ -1903,7 +2794,45 @@ fn dispatch_mgmt(
                         fails: 0,
                     }),
                 }
-                save_pinned(ctx.nvs, pool.pinned);
+                if !save_pinned(ctx.nvs, pool.pinned) {
+                    ctx.policy_engine.restore_slot_state(slot_snapshot);
+                    let pin_rollback_durable = if let Some(before) = pinned_before.as_ref() {
+                        *pool.pinned = before.clone();
+                        save_pinned(ctx.nvs, pool.pinned)
+                    } else {
+                        true
+                    };
+                    return if pin_rollback_durable {
+                        Err("could not persist the app relay; pairing was not applied".into())
+                    } else {
+                        Err("fatal storage error: could not restore the prior app relay configuration; take the device offline for USB recovery".into())
+                    };
+                }
+            }
+
+            // The app has received its ACK, but management does not report
+            // success until the complete policy is durable. If NVS rejects the
+            // write, restore RAM and the prior pin; boot-time pruning is an
+            // additional fail-closed guard if pin rollback itself cannot write.
+            if !ctx.policy_engine.persist_slots(ctx.nvs, master_slot) {
+                let slot_rollback_durable = ctx
+                    .policy_engine
+                    .restore_slot_state_durably(ctx.nvs, slot_snapshot);
+                let pin_rollback_durable = if let Some(before) = pinned_before.as_ref() {
+                    *pool.pinned = before.clone();
+                    save_pinned(ctx.nvs, pool.pinned)
+                } else {
+                    true
+                };
+                return if slot_rollback_durable && pin_rollback_durable {
+                    Err("could not persist nostrconnect policy; pairing was not applied".into())
+                } else {
+                    Err("fatal storage error: could not restore prior pairing state; take the device offline for USB recovery".into())
+                };
+            }
+
+            // Both pin and policy are durable; only now adopt the live socket.
+            if let Some(ns) = dialled {
                 pool.others.push(ns);
                 // Split the recv timeout across the grown session set. The
                 // arriving session is not in `others`, hence the +1 and the
@@ -1922,14 +2851,32 @@ fn dispatch_mgmt(
             log::info!(
                 "[relay] nostrconnect: bound slot {index} to client {}…, ACK published{}{}",
                 &client_hex[..client_hex.len().min(16)],
-                if joined_relay { " [joined client relay]" } else { "" },
-                if auto_sign { " [signing pre-approved]" } else { "" }
+                if joined_relay {
+                    " [joined client relay]"
+                } else {
+                    ""
+                },
+                if auto_sign {
+                    " [signing pre-approved]"
+                } else {
+                    ""
+                }
             );
+            let applied = ctx
+                .policy_engine
+                .find_slot_by_pubkey(master_slot, client_hex);
             Ok(serde_json::json!({
                 "slot_index": index,
                 "client_pubkey": client_hex,
+                "secret_fingerprint": applied
+                    .map(|slot| mgmt::credential_fingerprint(&slot.secret))
+                    .unwrap_or_default(),
                 "signing_approved": auto_sign,
                 "joined_relay": joined_relay,
+                "policy_version": if is_v2 { Some(2u8) } else { None },
+                "allowed_methods": applied.map(|slot| slot.allowed_methods.clone()).unwrap_or_default(),
+                "allowed_kinds": applied.map(|slot| slot.allowed_kinds.clone()).unwrap_or_default(),
+                "auto_approve": applied.map(|slot| slot.auto_approve).unwrap_or(false),
                 "note": if joined_relay {
                     "connect ACK published; the signer joined the app's relay and will keep serving it"
                 } else {
@@ -1942,15 +2889,37 @@ fn dispatch_mgmt(
             // Operator grants a slot signing authority — substitutes op_mgmt's
             // cryptographic authority for the physical button on the wifi tier
             // (see relay-mediated-management design). Destructive ops stay USB.
-            let slot_index = req
-                .pointer("/params/slot_index")
-                .and_then(|v| v.as_u64())
-                .ok_or("approve_signing requires params.slot_index")? as u8;
-            if ctx.policy_engine.upgrade_to_signing(master_slot, slot_index) {
-                ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+            let slot_index =
+                req.pointer("/params/slot_index")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("approve_signing requires params.slot_index")? as u8;
+            let target = ctx
+                .policy_engine
+                .list_slots(master_slot)
+                .iter()
+                .find(|slot| slot.slot_index == slot_index)
+                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
+            if target.strict_permissions {
+                return Err(
+                    "approve_signing is legacy-only; replace the exact v2 policy instead".into(),
+                );
+            }
+            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
+            if ctx
+                .policy_engine
+                .upgrade_to_signing(master_slot, slot_index)
+            {
+                persist_slot_mutation_or_rollback(
+                    ctx,
+                    master_slot,
+                    slot_snapshot,
+                    "signing approval",
+                )?;
                 log::info!("[relay] mgmt: slot {slot_index} upgraded to signing (operator)");
                 Ok(serde_json::json!({
                     "slot_index": slot_index,
+                    "secret_fingerprint": secret_fingerprint,
                     "signing_approved": true,
                 }))
             } else {
@@ -1963,18 +2932,7 @@ fn dispatch_mgmt(
                 .policy_engine
                 .list_slots(master_slot)
                 .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "slot_index": s.slot_index,
-                        "label": s.label,
-                        "auto_approve": s.auto_approve,
-                        "signing_approved": s.signing_approved,
-                        "current_pubkey": s.current_pubkey,
-                        "authorized_pubkeys": s.authorized_pubkeys,
-                        "allowed_kinds": s.allowed_kinds,
-                        "allowed_methods": s.allowed_methods,
-                    })
-                })
+                .map(mgmt::client_summary)
                 .collect();
             Ok(serde_json::json!({ "clients": clients }))
         }
@@ -1990,8 +2948,10 @@ fn dispatch_mgmt(
                 .iter()
                 .find(|s| s.slot_index == slot_index)
                 .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            let secret_fingerprint = require_expected_slot_fingerprint(req, slot)?;
             Ok(serde_json::json!({
                 "slot_index": slot_index,
+                "secret_fingerprint": secret_fingerprint,
                 "bunker_uri": mgmt::bunker_uri(&master_hex, &ctx.relays, Some(&slot.secret)),
             }))
         }
@@ -2039,47 +2999,149 @@ fn dispatch_mgmt(
 
         // Revoke a client slot (operator-authorised — same authority as create).
         "revoke_client" => {
-            let slot_index = req
-                .pointer("/params/slot_index")
-                .and_then(|v| v.as_u64())
-                .ok_or("revoke_client requires params.slot_index")? as u8;
+            let slot_index =
+                req.pointer("/params/slot_index")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("revoke_client requires params.slot_index")? as u8;
+            let target = ctx
+                .policy_engine
+                .list_slots(master_slot)
+                .iter()
+                .find(|slot| slot.slot_index == slot_index)
+                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
+            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             if ctx.policy_engine.revoke_slot(master_slot, slot_index) {
-                ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+                persist_slot_mutation_or_rollback(
+                    ctx,
+                    master_slot,
+                    slot_snapshot,
+                    "client revocation",
+                )?;
                 log::info!("[relay] mgmt: revoked client slot {slot_index} (operator)");
-                Ok(serde_json::json!({ "slot_index": slot_index, "revoked": true }))
+                Ok(serde_json::json!({
+                    "slot_index": slot_index,
+                    "secret_fingerprint": secret_fingerprint,
+                    "revoked": true,
+                }))
             } else {
                 Err(format!("no such slot: {slot_index}"))
             }
         }
 
-        // Update a client slot's label / kind restrictions / auto-approve.
-        // update_slot enforces the sign_event security filter internally, so the
-        // operator cannot grant signing this way (only the button / approve_signing).
+        // Update a client slot's label / policy. Legacy slots retain the
+        // historical partial-update/sign_event filter. Strict slots merge
+        // omitted fields with their current ceiling, then replace the complete
+        // exact policy through the same validator used at v2 creation.
         "update_client" => {
-            let slot_index = req
-                .pointer("/params/slot_index")
-                .and_then(|v| v.as_u64())
-                .ok_or("update_client requires params.slot_index")? as u8;
+            let slot_index =
+                req.pointer("/params/slot_index")
+                    .and_then(|v| v.as_u64())
+                    .ok_or("update_client requires params.slot_index")? as u8;
+            let target = ctx
+                .policy_engine
+                .list_slots(master_slot)
+                .iter()
+                .find(|slot| slot.slot_index == slot_index)
+                .cloned()
+                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            let secret_fingerprint = require_expected_slot_fingerprint(req, &target)?;
             let label = req
                 .pointer("/params/label")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let methods = req
-                .pointer("/params/allowed_methods")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
-            let kinds = req
-                .pointer("/params/allowed_kinds")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_u64()).collect());
-            let auto = req.pointer("/params/auto_approve").and_then(|v| v.as_bool());
-            if ctx
-                .policy_engine
-                .update_slot(master_slot, slot_index, label, methods, kinds, auto)
-            {
-                ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+            let methods = if target.strict_permissions {
+                match req.pointer("/params/allowed_methods") {
+                    None => None,
+                    Some(value) => {
+                        let values = value
+                            .as_array()
+                            .ok_or("allowed_methods must be an array")?;
+                        let mut parsed = Vec::with_capacity(values.len());
+                        for value in values {
+                            parsed.push(
+                                value
+                                    .as_str()
+                                    .ok_or("allowed_methods must contain only strings")?
+                                    .to_string(),
+                            );
+                        }
+                        Some(parsed)
+                    }
+                }
+            } else {
+                req.pointer("/params/allowed_methods")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+            };
+            let kinds = if target.strict_permissions {
+                match req.pointer("/params/allowed_kinds") {
+                    None => None,
+                    Some(value) => {
+                        let values = value
+                            .as_array()
+                            .ok_or("allowed_kinds must be an array")?;
+                        let mut parsed = Vec::with_capacity(values.len());
+                        for value in values {
+                            parsed.push(
+                                value
+                                    .as_u64()
+                                    .ok_or("allowed_kinds must contain only unsigned integers")?,
+                            );
+                        }
+                        Some(parsed)
+                    }
+                }
+            } else {
+                req.pointer("/params/allowed_kinds")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
+            };
+            let auto = if target.strict_permissions {
+                match req.pointer("/params/auto_approve") {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .as_bool()
+                            .ok_or("auto_approve must be a boolean")?,
+                    ),
+                }
+            } else {
+                req.pointer("/params/auto_approve")
+                    .and_then(|v| v.as_bool())
+            };
+            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
+            let updated = if target.strict_permissions {
+                ctx.policy_engine.set_exact_slot_policy(
+                    master_slot,
+                    slot_index,
+                    methods.unwrap_or(target.allowed_methods),
+                    kinds.unwrap_or(target.allowed_kinds),
+                    auto.unwrap_or(target.auto_approve),
+                )?;
+                ctx.policy_engine
+                    .update_slot(master_slot, slot_index, label, None, None, None)
+            } else {
+                ctx.policy_engine
+                    .update_slot(master_slot, slot_index, label, methods, kinds, auto)
+            };
+            if updated {
+                persist_slot_mutation_or_rollback(
+                    ctx,
+                    master_slot,
+                    slot_snapshot,
+                    "client update",
+                )?;
                 log::info!("[relay] mgmt: updated client slot {slot_index} (operator)");
-                Ok(serde_json::json!({ "slot_index": slot_index, "updated": true }))
+                Ok(serde_json::json!({
+                    "slot_index": slot_index,
+                    "secret_fingerprint": secret_fingerprint,
+                    "updated": true,
+                }))
             } else {
                 Err(format!("no such slot: {slot_index}"))
             }
@@ -2099,19 +3161,31 @@ fn dispatch_mgmt(
             if name.is_empty() || name.len() > 255 {
                 return Err("name must be 1-255 bytes".into());
             }
-            let w = req.pointer("/params/w").and_then(|v| v.as_u64()).unwrap_or(0);
-            let h = req.pointer("/params/h").and_then(|v| v.as_u64()).unwrap_or(0);
+            let w = req
+                .pointer("/params/w")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let h = req
+                .pointer("/params/h")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             if !(1..=255).contains(&w) || !(1..=255).contains(&h) {
                 return Err("avatar dimensions must be 1-255".into());
             }
             let avatar = B64
-                .decode(req.pointer("/params/avatar_b64").and_then(|v| v.as_str()).unwrap_or(""))
+                .decode(
+                    req.pointer("/params/avatar_b64")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                )
                 .map_err(|e| format!("avatar_b64: {e}"))?;
             if avatar.len() != (w as usize) * (h as usize) * 2 {
                 return Err(format!("avatar length {} != w*h*2", avatar.len()));
             }
             crate::identity_meta::save(ctx.nvs, master_slot, name, w as u8, h as u8, &avatar)?;
-            log::info!("[relay] mgmt: identity meta stored for slot {master_slot}: '{name}' {w}x{h}");
+            log::info!(
+                "[relay] mgmt: identity meta stored for slot {master_slot}: '{name}' {w}x{h}"
+            );
             // Refresh the single-master identity card, as the USB path does.
             // Redraw straight from the values in hand — reloading from NVS here
             // allocated a fresh avatar buffer at the request's peak heap use,
@@ -2137,6 +3211,12 @@ fn dispatch_mgmt(
                 "master_npub_hex": master_hex,
                 "mode": "wifi-standalone",
                 "relay": ctx.relay_url,
+                "capabilities": [
+                    "client_policy_v2",
+                    "atomic_nostrconnect_policy_v2",
+                    "staged_network_config_v1",
+                    "mutation_challenge_v1"
+                ],
                 "relays_live": relays_live,
                 "relays_pinned": pool.pinned.iter().map(|p| p.url.clone()).collect::<Vec<_>>(),
                 "slots": ctx.policy_engine.list_slots(master_slot).len(),
@@ -2193,8 +3273,15 @@ fn sign_and_publish(
     };
     let event_json = serde_json::to_string(&signed).map_err(|e| format!("serialise: {e}"))?;
 
-    ws_send(tls, OP_TEXT, format!(r#"["EVENT",{event_json}]"#).as_bytes())?;
-    log::info!("[relay] published kind:{kind} response ({} bytes)", event_json.len());
+    ws_send(
+        tls,
+        OP_TEXT,
+        format!(r#"["EVENT",{event_json}]"#).as_bytes(),
+    )?;
+    log::info!(
+        "[relay] published kind:{kind} response ({} bytes)",
+        event_json.len()
+    );
     Ok(())
 }
 
@@ -2257,7 +3344,10 @@ fn ws_handshake(tls: &mut Tls, host: &str) -> Result<(), String> {
     }
     let resp = core::str::from_utf8(&buf[..n]).unwrap_or("");
     if !resp.contains(" 101 ") {
-        return Err(format!("ws handshake not 101: {}", &resp[..resp.len().min(64)]));
+        return Err(format!(
+            "ws handshake not 101: {}",
+            &resp[..resp.len().min(64)]
+        ));
     }
     Ok(())
 }

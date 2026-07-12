@@ -730,6 +730,14 @@ mod tests {
     }
 
     #[test]
+    fn conversation_key_rejects_an_invalid_x_only_peer() {
+        // 2^256-1 is outside secp256k1's field, so it cannot be lifted to a
+        // curve point. Management pairing validates this before mutating a
+        // slot or dialling an app relay.
+        assert!(get_conversation_key(&alice_secret(), &[0xff; 32]).is_err());
+    }
+
+    #[test]
     fn test_official_encrypt_decrypt_vector_0() {
         // Vector 0 from v2.valid.encrypt_decrypt
         let conv_key = hex_to_32("c41c775356fd92eadc63ff5a0dc1da211b268cbea22316767095b2871ea1412d");

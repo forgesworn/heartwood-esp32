@@ -46,6 +46,7 @@ mod connslot;
 mod identity_cache;
 mod identity_meta;
 mod layout;
+mod management_challenge;
 mod palette;
 mod masters;
 mod nip46_handler;
@@ -55,6 +56,7 @@ mod cat_sprites;
 mod oled;
 mod ota;
 mod pin;
+mod persistent_wipe;
 mod policy;
 mod protocol;
 mod provision;
@@ -98,6 +100,7 @@ use heartwood_common::types::{
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
     FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
     FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_IDENTITY_META,
+    FRAME_TYPE_GET_NET_CONFIG, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_SET_OPERATOR,
     FRAME_TYPE_WIFI_SCAN_REQUEST,
 };
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -129,6 +132,37 @@ pub fn fill_random_strong(buf: &mut [u8]) {
         esp_idf_svc::sys::bootloader_random_enable();
         esp_idf_svc::sys::esp_fill_random(buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len());
         esp_idf_svc::sys::bootloader_random_disable();
+    }
+}
+
+/// A malformed/unrecoverable removal journal blocks every signing path, but it
+/// must not make the device permanently unserviceable. Offer a deliberate
+/// physical hold-to-wipe escape; never erase automatically on recovery error.
+fn offer_removal_recovery_wipe(
+    display: &mut oled::Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) {
+    let approval = approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
+        oled::show_sign_request(d, "RECOVERY", 0, "WIPE ALL DATA?", remaining);
+    });
+    if !matches!(approval, approval::ApprovalResult::Approved) {
+        return;
+    }
+
+    oled::show_error(display, "Erasing...");
+    loop {
+        match persistent_wipe::erase_all() {
+            Ok(()) => {
+                oled::show_error(display, "Reset complete\nRebooting...");
+                esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+                unsafe { esp_idf_svc::sys::esp_restart() }
+            }
+            Err(e) => {
+                log::error!("Physical removal-recovery wipe failed: {e}");
+                oled::show_error(display, "ERASE FAILED\nRetrying...");
+                esp_idf_hal::delay::FreeRtos::delay_ms(2000);
+            }
+        }
     }
 }
 
@@ -165,6 +199,22 @@ fn main() {
     let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
     let mut nvs = EspNvs::new(nvs_partition, "heartwood", true).expect("NVS namespace init failed");
 
+    // A master removal spans several NVS keys. Resume its durable journal
+    // before loading any seed, persona, policy, or display metadata so a power
+    // cut can never expose a half-shifted authority map to a signing path.
+    loop {
+        match masters::resume_pending_removal(&mut nvs) {
+            Ok(()) => break,
+            Err(e) => {
+                log::error!("Master-removal recovery failed: {e}");
+                // No seed/policy/persona has loaded yet. Remain fail-closed,
+                // retry recovery, and give the owner a physical 2-second PRG
+                // hold escape to the same complete factory wipe.
+                offer_removal_recovery_wipe(&mut display, &button_pin);
+            }
+        }
+    }
+
     // --- Load masters ---
     let mut loaded_masters = masters::load_all(&nvs);
     log::info!("Loaded {} master(s) from NVS", loaded_masters.len());
@@ -182,7 +232,10 @@ fn main() {
     if let Some((json, crc)) = boot_config::read_flash_config() {
         if net_config_store::read_seeded_crc(&nvs) != Some(crc) {
             if heartwood_common::net_config::parse_net_config(&json).is_ok() {
-                match net_config_store::write_net_config(&mut nvs, &json) {
+                match net_config_store::bump_network_revision(&mut nvs)
+                    .and_then(|_| net_config_store::cancel_trial(&mut nvs))
+                    .and_then(|_| net_config_store::write_net_config(&mut nvs, &json))
+                {
                     Ok(()) => {
                         net_config_store::write_seeded_crc(&mut nvs, crc);
                         log::info!("Seeded net config from `config` partition (crc {crc:08x})");
@@ -196,8 +249,9 @@ fn main() {
     }
 
     // --- Boot-time network config read ---
-    let net_cfg = net_config_store::read_net_config(&nvs)
-        .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok());
+    let boot_net_cfg = net_config_store::prepare_boot_net_config(&mut nvs);
+    let trial_transaction_id = boot_net_cfg.trial_transaction_id;
+    let net_cfg = boot_net_cfg.config;
     if let Some(cfg) = &net_cfg {
         log::info!(
             "net config present: mode={:?}, {} relay(s)",
@@ -288,7 +342,19 @@ fn main() {
 
         // Load the persisted failed-attempt counter so the wipe threshold
         // survives power cycles (attacker cannot reset by rebooting).
-        let mut failed_attempts: u8 = pin::read_failed_attempts(&nvs);
+        let mut failed_attempts: u8 = match pin::read_failed_attempts(&nvs) {
+            Ok(count) => count,
+            Err(e) => {
+                log::error!("PIN-attempt state invalid ({e}) — wiping fail-closed");
+                oled::show_error(&mut display, "PIN STATE ERROR\nWIPING...");
+                pin::wipe_and_reboot(&mut usb, &mut display);
+            }
+        };
+        if failed_attempts >= pin::MAX_FAILED_ATTEMPTS {
+            log::error!("PIN wipe threshold persisted across reboot — completing wipe");
+            oled::show_error(&mut display, "PIN LOCKED\nWIPING...");
+            pin::wipe_and_reboot(&mut usb, &mut display);
+        }
         if failed_attempts > 0 {
             log::warn!("PIN: {} failed attempt(s) carried over from previous boot", failed_attempts);
         }
@@ -400,6 +466,7 @@ fn main() {
                 &mut identity_caches,
                 &mut nvs,
                 op_mgmt,
+                trial_transaction_id,
                 &mut usb,
             );
         }
@@ -568,13 +635,19 @@ fn main() {
 
             // 0x04 — remove a master
             FRAME_TYPE_PROVISION_REMOVE => {
-                provision::handle_remove(
+                if provision::handle_remove(
                     &mut usb,
                     &frame,
                     &mut nvs,
                     &mut loaded_masters,
                     &mut display,
-                );
+                ) {
+                    // Policies, personas, identity metadata, and identity
+                    // caches are all slot-indexed. Reload them from the
+                    // completed journal transaction before signing again.
+                    esp_idf_hal::delay::FreeRtos::delay_ms(400);
+                    unsafe { esp_idf_svc::sys::esp_restart() }
+                }
             }
 
             // 0x05 — list masters (and personas)
@@ -641,6 +714,31 @@ fn main() {
                     &mut nvs,
                     &mut display,
                     &button_pin,
+                );
+            }
+
+            FRAME_TYPE_GET_NET_CONFIG => {
+                net_config_store::handle_get_net_config(&mut usb, &mut nvs);
+            }
+
+            FRAME_TYPE_PATCH_NET_CONFIG => {
+                net_config_store::handle_patch_net_config(
+                    &mut usb,
+                    &frame.payload,
+                    &mut nvs,
+                    &mut display,
+                    &button_pin,
+                );
+            }
+
+            FRAME_TYPE_SET_OPERATOR => {
+                net_config_store::handle_set_operator(
+                    &mut usb,
+                    &frame.payload,
+                    &mut nvs,
+                    &mut display,
+                    &button_pin,
+                    false,
                 );
             }
 

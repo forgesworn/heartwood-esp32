@@ -560,6 +560,15 @@ fn signing_requester_label(
         .map(|slot| slot.label.trim())
         .filter(|label| !label.is_empty())
         .map(|label| label.to_string())
+        .unwrap_or_else(|| anonymous_client_label(client_hex))
+}
+
+/// Label for a client with no slot label: truncated npub, or the legacy hex
+/// prefix if the pubkey string is malformed. Identification UX only —
+/// approval policy does not depend on the label.
+fn anonymous_client_label(client_hex: &str) -> String {
+    hex_decode_32(client_hex)
+        .map(|pk| heartwood_common::encoding::client_fallback_label(&pk))
         .unwrap_or_else(|| format!("client {}", &client_hex[..client_hex.len().min(8)]))
 }
 

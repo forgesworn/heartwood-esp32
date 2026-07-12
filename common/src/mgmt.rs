@@ -35,6 +35,7 @@ use alloc::{format, string::{String, ToString}, vec, vec::Vec};
 use sha2::{Digest, Sha256};
 
 use crate::hex::{hex_decode, hex_encode};
+#[cfg(feature = "nip46")]
 use crate::policy::ConnectSlot;
 
 
@@ -93,6 +94,7 @@ pub fn classify_credential_fingerprint(
 /// Public management representation of a client slot. The bearer secret is
 /// deliberately absent; callers get only its stable non-secret fingerprint so
 /// later numeric-index actions can bind to the exact credential they observed.
+#[cfg(feature = "nip46")]
 pub fn client_summary(slot: &ConnectSlot) -> serde_json::Value {
     serde_json::json!({
         "slot_index": slot.slot_index,
@@ -480,6 +482,7 @@ mod tests {
         assert_ne!(fingerprint, credential_fingerprint(&second));
     }
 
+    #[cfg(feature = "nip46")]
     #[test]
     fn client_summary_exposes_strictness_and_fingerprint_but_never_secret() {
         let slot = ConnectSlot {

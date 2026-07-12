@@ -6,6 +6,8 @@ A hardware signing device for Nostr, built on the **Heltec WiFi LoRa 32** (ESP32
 
 For the full architecture walkthrough with sequence diagrams and trust-boundary analysis, see [**docs/architecture.md**](docs/architecture.md).
 
+The shared `common` crate (derivation, NIP-44/46, policy — `no_std`, host-tested) also powers [heartwood-ledger](https://github.com/forgesworn/heartwood-ledger), the same signer as a Ledger embedded app: same seed phrase, same npub, same personas, with curve operations on the secure element via the `ledger-backend` feature.
+
 ```mermaid
 flowchart LR
     Bark["Bark<br/>(NIP-07 browser ext)"]

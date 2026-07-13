@@ -32,7 +32,11 @@ c6 = []
 heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen", "ota-sign", "seed-encrypt"] }
 
 # Crypto — libsecp256k1 C FFI (alignment-safe on Xtensa, unlike k256)
-secp256k1 = { version = "0.29" }
+# BIP-340 verification otherwise links libsecp256k1's ~1.1 MB default
+# precomputation tables. Embedded signers prefer the upstream low-memory table
+# geometry: identical verification semantics, slightly slower operations, and
+# enough flash headroom for the Heltec A/B OTA slots.
+secp256k1 = { version = "0.29", features = ["lowmemory"] }
 sha2 = "0.10"
 zeroize = { version = "1", default-features = false, features = ["derive"] }
 

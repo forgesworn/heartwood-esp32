@@ -44,8 +44,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Provision an EXISTING master secret onto the device (restore from a
-    /// recovery phrase or nsec). RUN OFFLINE — the key must never touch a
-    /// networked machine. The secret is read interactively, never from argv.
+    /// recovery phrase, an nsec, or a 24-word key backup made by Sapwood).
+    /// RUN OFFLINE — the key must never touch a networked machine. The secret
+    /// is read interactively, never from argv.
     Provision {
         /// Label for this master (e.g. "primary")
         #[arg(short, long, default_value = "default")]
@@ -230,6 +231,37 @@ fn decode_nsec(nsec: &str) -> Result<[u8; 32], String> {
 
     let mut secret = [0u8; 32];
     secret.copy_from_slice(&data);
+    Ok(secret)
+}
+
+/// Decode a pasted key: an nsec1... string, or the 24 backup words Sapwood
+/// writes out at import. The words are the key's own 32 bytes used as BIP-39
+/// entropy — NOT a seed to derive from — so decoding restores the identical
+/// key and npub. A 12-word phrase carries only 128 bits and can never hold an
+/// existing key; those are seeds and belong in tree-mnemonic mode.
+fn decode_key_input(input: &str) -> Result<[u8; 32], String> {
+    let input = input.trim();
+    if !input.contains(char::is_whitespace) {
+        return decode_nsec(input);
+    }
+
+    let words: Vec<&str> = input.split_whitespace().collect();
+    if words.len() != 24 {
+        return Err(format!(
+            "a key backup is exactly 24 words (got {}); a 12-word phrase is a seed, use tree-mnemonic mode",
+            words.len()
+        ));
+    }
+    let mut phrase = words.join(" ").to_lowercase();
+    let parsed: bip39::Mnemonic = phrase
+        .parse()
+        .map_err(|_| "not a valid 24-word key backup (unknown word or bad checksum)".to_string())?;
+    phrase.zeroize();
+
+    let mut entropy = parsed.to_entropy();
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&entropy);
+    entropy.zeroize();
     Ok(secret)
 }
 
@@ -466,17 +498,18 @@ fn handle_provision(
 ) {
     let mut root_secret = match mode {
         "bunker" => {
-            let nsec = rpassword::prompt_password("Enter nsec (nsec1...): ")
-                .expect("failed to read nsec");
-            let secret = decode_nsec(nsec.trim()).expect("invalid nsec");
-            println!("\nMode: bunker (raw nsec, no tree derivation)");
+            let key = rpassword::prompt_password("Enter nsec (nsec1...) or 24-word key backup: ")
+                .expect("failed to read key");
+            let secret = decode_key_input(&key).expect("invalid key");
+            println!("\nMode: bunker (raw key, no tree derivation)");
             secret
         }
         "tree-nsec" => {
-            let nsec = rpassword::prompt_password("Enter nsec (nsec1...): ")
-                .expect("failed to read nsec");
-            let nsec_bytes = decode_nsec(nsec.trim()).expect("invalid nsec");
+            let key = rpassword::prompt_password("Enter nsec (nsec1...) or 24-word key backup: ")
+                .expect("failed to read key");
+            let mut nsec_bytes = decode_key_input(&key).expect("invalid key");
             let secret = nsec_to_tree_root(&nsec_bytes).expect("tree-nsec derivation failed");
+            nsec_bytes.zeroize();
             println!("\nMode: tree-nsec (nsec -> HMAC -> tree root)");
             secret
         }
@@ -787,6 +820,56 @@ mod tests {
             "master npub does not match PROTOCOL.md §6.1 Vector 1"
         );
         root.destroy();
+    }
+
+    /// Frozen cross-implementation vector for the 24-word key backup: the words
+    /// are the key's own bytes as BIP-39 entropy, so secret = scalar 1 encodes
+    /// as 23 "abandon"s and a checksum word. MUST match sapwood's
+    /// `keyToWords`/`wordsToKey` (`src/lib/restore.test.ts`) or a backup written
+    /// down in the browser will not restore through this CLI.
+    #[test]
+    fn test_key_backup_words_match_frozen_vector() {
+        let words = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                     abandon abandon abandon abandon abandon abandon abandon abandon \
+                     abandon abandon abandon abandon abandon abandon abandon diesel";
+        let mut expected = [0u8; 32];
+        expected[31] = 1;
+        assert_eq!(decode_key_input(words).unwrap(), expected);
+    }
+
+    /// The same key as an nsec decodes identically through the shared entry point.
+    #[test]
+    fn test_key_input_accepts_nsec() {
+        let nsec = "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsmhltgl";
+        let mut expected = [0u8; 32];
+        expected[31] = 1;
+        assert_eq!(decode_key_input(nsec).unwrap(), expected);
+    }
+
+    /// Pasted words survive messy case and whitespace.
+    #[test]
+    fn test_key_backup_normalises_case_and_whitespace() {
+        let words = "  ABANDON abandon abandon abandon abandon abandon abandon abandon \
+                     abandon abandon abandon abandon abandon abandon abandon abandon \
+                     abandon abandon abandon abandon abandon abandon\n abandon  DIESEL ";
+        let mut expected = [0u8; 32];
+        expected[31] = 1;
+        assert_eq!(decode_key_input(words).unwrap(), expected);
+    }
+
+    /// A 12-word phrase is a seed, not a key: it must be refused here so it
+    /// cannot be silently misread as key material.
+    #[test]
+    fn test_key_backup_rejects_12_words() {
+        let twelve = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        assert!(decode_key_input(twelve).is_err());
+    }
+
+    /// 24 words with a bad checksum are refused.
+    #[test]
+    fn test_key_backup_rejects_bad_checksum() {
+        let junk = "abandon ".repeat(24);
+        assert!(decode_key_input(junk.trim()).is_err());
     }
 
     /// Passphrase changes the derived secret.

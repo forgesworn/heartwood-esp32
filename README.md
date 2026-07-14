@@ -191,6 +191,15 @@ cd provision && cargo run -- --port /dev/cu.usbserial-*
 
 Enter mnemonic and passphrase when prompted. After ACK, the device reboots with the stored identity.
 
+To restore an existing key rather than a phrase, pick a mode: `--mode bunker`
+(the device signs as that exact key, same npub) or `--mode tree-nsec` (a fresh
+tree root is derived from it, new npub). Both prompt for the key and accept
+either an `nsec1...` or the 24-word key backup Sapwood writes out at import --
+the key's own bytes as BIP-39 entropy, so the identical npub comes back. A
+12-word phrase is a seed, not a key, and belongs in the default tree-mnemonic
+mode. Format and instructions:
+[sapwood/docs/key-backup.md](https://github.com/forgesworn/sapwood/blob/main/docs/key-backup.md).
+
 Subsequent boots display the master npub immediately (no provisioning needed).
 
 ## Test vector

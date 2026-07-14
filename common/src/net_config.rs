@@ -17,6 +17,80 @@ pub enum DeviceMode {
     Wifi,
 }
 
+/// Coarse, privacy-safe progress through the device's outbound network path.
+///
+/// This is intentionally operational rather than identifying: it never carries
+/// an IP address, MAC address, SSID, relay URL, public key, or raw error text.
+/// Firmware may expose it alongside the existing redacted USB network config so
+/// a locally attached owner can distinguish "saved" from "actually online".
+#[cfg(feature = "nip46")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkRuntimeStage {
+    RadioOff,
+    Starting,
+    WifiConnecting,
+    WifiReady,
+    RelayConnecting,
+    SubscriptionSent,
+    Online,
+    ConfigError,
+}
+
+/// Sanitized failure class for local connectivity diagnostics.
+///
+/// The classes are deliberately broad. In particular, WiFi authentication,
+/// range, and DHCP failures are not separated because ESP-IDF cannot reliably
+/// distinguish a wrong password from a lost handshake, and raw driver/TLS
+/// errors can reveal more network detail than this diagnostic needs.
+#[cfg(feature = "nip46")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkRuntimeError {
+    None,
+    WifiUnavailable,
+    RelayTransport,
+    WebsocketUpgrade,
+    RelayProtocol,
+    RelayClosed,
+    RelaySilent,
+    InvalidConfig,
+}
+
+/// Additive runtime portion of `GET_NET_CONFIG`.
+///
+/// All fields are booleans or closed enums so future callers cannot
+/// accidentally surface a network identifier through this type.
+#[cfg(feature = "nip46")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkRuntimeStatus {
+    pub stage: NetworkRuntimeStage,
+    pub wifi_connected: bool,
+    pub relay_connected: bool,
+    pub last_error_class: NetworkRuntimeError,
+}
+
+#[cfg(feature = "nip46")]
+impl NetworkRuntimeStatus {
+    pub const fn radio_off() -> Self {
+        Self {
+            stage: NetworkRuntimeStage::RadioOff,
+            wifi_connected: false,
+            relay_connected: false,
+            last_error_class: NetworkRuntimeError::None,
+        }
+    }
+
+    pub const fn starting() -> Self {
+        Self {
+            stage: NetworkRuntimeStage::Starting,
+            wifi_connected: false,
+            relay_connected: false,
+            last_error_class: NetworkRuntimeError::None,
+        }
+    }
+}
+
 #[cfg(feature = "nip46")]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetConfig {
@@ -576,6 +650,41 @@ mod tests {
         assert_eq!(cfg.device_mode(), DeviceMode::Wifi);
         assert_eq!(cfg.relays, vec!["wss://relay.example".to_string()]);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn runtime_status_serialization_is_closed_and_identifier_free() {
+        let status = NetworkRuntimeStatus {
+            stage: NetworkRuntimeStage::RelayConnecting,
+            wifi_connected: true,
+            relay_connected: false,
+            last_error_class: NetworkRuntimeError::WebsocketUpgrade,
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "stage": "relay_connecting",
+                "wifi_connected": true,
+                "relay_connected": false,
+                "last_error_class": "websocket_upgrade",
+            })
+        );
+        let keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "last_error_class",
+                "relay_connected",
+                "stage",
+                "wifi_connected"
+            ]
+        );
     }
 
     #[test]

@@ -9,14 +9,16 @@ use heartwood_common::net_config::{
     activate_network_trial_record, apply_local_net_config_patch, commit_network_trial_record,
     effective_network_revision, mark_network_trial_attempt, network_revision_matches,
     network_trial_boot_action, new_network_trial_record, valid_network_transaction_id,
-    validate_remote_net_config, LocalNetConfigPatchParams, NetConfig, NetworkTerminalOutcome,
-    NetworkTerminalRecord, NetworkTrialBootAction, NetworkTrialPhase, NetworkTrialRecord,
+    validate_remote_net_config, LocalNetConfigPatchParams, NetConfig, NetworkRuntimeStatus,
+    NetworkTerminalOutcome, NetworkTerminalRecord, NetworkTrialBootAction, NetworkTrialPhase,
+    NetworkTrialRecord,
 };
 use heartwood_common::types::{
     FRAME_TYPE_ACK, FRAME_TYPE_GET_NET_CONFIG_RESPONSE, FRAME_TYPE_NACK,
 };
 use secp256k1::XOnlyPublicKey;
 
+use crate::oled::NetworkDisplayState;
 use crate::protocol;
 use crate::serial::SerialPort;
 
@@ -486,7 +488,10 @@ pub fn write_seeded_crc(nvs: &mut EspNvs<NvsDefault>, crc: u32) {
     }
 }
 
-fn redacted_state(nvs: &mut EspNvs<NvsDefault>) -> serde_json::Value {
+fn redacted_state(
+    nvs: &mut EspNvs<NvsDefault>,
+    runtime: NetworkRuntimeStatus,
+) -> serde_json::Value {
     // Completing an already-durable committed marker is idempotent recovery,
     // not a new management mutation. It ensures USB reports B once commit made
     // B authoritative, even if power failed during cleanup.
@@ -527,6 +532,7 @@ fn redacted_state(nvs: &mut EspNvs<NvsDefault>) -> serde_json::Value {
             "trial": trial,
             "last_result": last_result,
             "recovery_ok": recovery_error.is_none(),
+            "runtime": runtime,
         }),
         None => serde_json::json!({
             "version": 1,
@@ -535,13 +541,20 @@ fn redacted_state(nvs: &mut EspNvs<NvsDefault>) -> serde_json::Value {
             "trial": trial,
             "last_result": last_result,
             "recovery_ok": recovery_error.is_none(),
+            "runtime": runtime,
         }),
     }
 }
 
 /// Read-only, password-redacted USB network/operator state (0x5C → 0x5D).
-pub fn handle_get_net_config(usb: &mut SerialPort<'_>, nvs: &mut EspNvs<NvsDefault>) {
-    let json = redacted_state(nvs).to_string();
+/// `runtime` is deliberately a closed, identifier-free status object; the
+/// response remains backward-compatible because it is an additive JSON field.
+pub fn handle_get_net_config(
+    usb: &mut SerialPort<'_>,
+    nvs: &mut EspNvs<NvsDefault>,
+    runtime: NetworkRuntimeStatus,
+) {
+    let json = redacted_state(nvs, runtime).to_string();
     protocol::write_frame(usb, FRAME_TYPE_GET_NET_CONFIG_RESPONSE, json.as_bytes());
 }
 
@@ -576,14 +589,34 @@ fn approved(
 ) -> bool {
     matches!(
         crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
-            let msg = format!("{title}\nHold to confirm\n{remaining}s");
-            crate::oled::show_error(d, &msg);
+            crate::oled::show_change_approval(d, title, remaining);
         }),
         crate::approval::ApprovalResult::Approved
     )
 }
 
-fn ack_and_reboot(usb: &mut SerialPort<'_>, display: &mut crate::oled::Display<'_>, result: &str) -> ! {
+fn ack_and_reboot_network(
+    usb: &mut SerialPort<'_>,
+    display: &mut crate::oled::Display<'_>,
+    next_mode: heartwood_common::net_config::DeviceMode,
+) -> ! {
+    crate::oled::show_network_status(
+        display,
+        match next_mode {
+            heartwood_common::net_config::DeviceMode::Wifi => NetworkDisplayState::JoiningWifi,
+            heartwood_common::net_config::DeviceMode::Usb => NetworkDisplayState::RadioOff,
+        },
+    );
+    protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+    esp_idf_hal::delay::FreeRtos::delay_ms(500);
+    unsafe { esp_idf_svc::sys::esp_restart() }
+}
+
+fn ack_and_reboot_change(
+    usb: &mut SerialPort<'_>,
+    display: &mut crate::oled::Display<'_>,
+    result: &str,
+) -> ! {
     crate::oled::show_result(display, result);
     protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
     esp_idf_hal::delay::FreeRtos::delay_ms(500);
@@ -632,13 +665,18 @@ pub fn handle_patch_net_config(
             return;
         }
     };
+    let next_mode = replacement.device_mode();
     if !approved(display, button_pin, "Change network?") {
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"denied");
         return;
     }
+    crate::oled::show_network_status(display, NetworkDisplayState::Saving);
     match persist_local_replacement(nvs, &previous_raw, &replacement_raw) {
-        Ok(_) => ack_and_reboot(usb, display, "Network changed\nRebooting..."),
-        Err(error) => protocol::write_frame(usb, FRAME_TYPE_NACK, error.as_bytes()),
+        Ok(_) => ack_and_reboot_network(usb, display, next_mode),
+        Err(error) => {
+            crate::oled::show_network_status(display, NetworkDisplayState::SaveFailed);
+            protocol::write_frame(usb, FRAME_TYPE_NACK, error.as_bytes());
+        }
     }
 }
 
@@ -702,7 +740,7 @@ pub fn handle_set_operator(
         }
     };
     match persist_local_replacement(nvs, &previous_raw, &replacement_raw) {
-        Ok(_) => ack_and_reboot(usb, display, "Operator changed\nRebooting..."),
+        Ok(_) => ack_and_reboot_change(usb, display, "Operator changed\nRebooting..."),
         Err(error) => {
             log::error!("Operator rotation storage failed: {error}");
             protocol::write_frame(usb, FRAME_TYPE_NACK, error.as_bytes());
@@ -726,8 +764,7 @@ pub fn handle_set_net_config(
         Ok(cfg) if cfg.validate().is_ok() => {
             let result =
                 crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
-                    let msg = format!("Set network\nconfig? {}s", remaining);
-                    crate::oled::show_error(d, &msg);
+                    crate::oled::show_change_approval(d, "Set network config?", remaining);
                 });
 
             if !matches!(result, crate::approval::ApprovalResult::Approved) {
@@ -736,6 +773,7 @@ pub fn handle_set_net_config(
                 return;
             }
 
+            crate::oled::show_network_status(display, NetworkDisplayState::Saving);
             match bump_network_revision(nvs)
                 .and_then(|_| cancel_trial(nvs))
                 .and_then(|_| write_net_config(nvs, payload))
@@ -747,12 +785,12 @@ pub fn handle_set_net_config(
                     // — no manual power-cycle. USB (radio-off) saves just persist
                     // and take effect immediately in the running dispatch loop.
                     let wifi = cfg.device_mode() == heartwood_common::net_config::DeviceMode::Wifi;
-                    crate::oled::show_result(
+                    crate::oled::show_network_status(
                         display,
                         if wifi {
-                            "Network config set\nStarting wifi..."
+                            NetworkDisplayState::JoiningWifi
                         } else {
-                            "Network config\nset"
+                            NetworkDisplayState::Saved
                         },
                     );
                     esp_idf_hal::delay::FreeRtos::delay_ms(1500);
@@ -767,6 +805,7 @@ pub fn handle_set_net_config(
                 }
                 Err(e) => {
                     log::error!("Failed to write network config: {e}");
+                    crate::oled::show_network_status(display, NetworkDisplayState::SaveFailed);
                     protocol::write_frame(usb, FRAME_TYPE_NACK, b"nvs");
                 }
             }

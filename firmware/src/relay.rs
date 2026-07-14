@@ -45,16 +45,20 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp_idf_svc::tls::{Config as TlsConfig, EspTls, InternalSocket, KeepAliveConfig};
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfig, EspWifi,
+    PmfConfiguration,
 };
 use secp256k1::{Keypair, Secp256k1, SignOnly};
 
+use heartwood_common::deadline::{
+    deadline_io_action, retryable_tls_io_code, DeadlineIoAction, NonblockingIoEvent,
+};
 use heartwood_common::frame::Frame;
 use heartwood_common::hex::{hex_decode, hex_encode};
 use heartwood_common::mgmt;
 use heartwood_common::net_config::{
     apply_remote_net_config_patch, network_activation_source_allowed,
-    network_commit_source_allowed, NetConfig, NetworkConfigTransactionParams, NetworkTrialPhase,
-    StageNetworkConfigParams,
+    network_commit_source_allowed, NetConfig, NetworkConfigTransactionParams, NetworkRuntimeError,
+    NetworkRuntimeStage, NetworkRuntimeStatus, NetworkTrialPhase, StageNetworkConfigParams,
 };
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
@@ -64,18 +68,18 @@ use heartwood_common::types::{
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_REVOKE,
     FRAME_TYPE_CONNSLOT_UPDATE, FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_ENCRYPTED_REQUEST,
     FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-    FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST,
-    FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN, FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH,
-    FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
-    FRAME_TYPE_RESTORE_IDENTITY, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET,
-    FRAME_TYPE_GET_NET_CONFIG, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_SET_IDENTITY_META,
-    FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN, FRAME_TYPE_SIGN_ENVELOPE,
-    FRAME_TYPE_WIFI_SCAN_REQUEST,
+    FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_GET_NET_CONFIG, FRAME_TYPE_NACK,
+    FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
+    FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_PROVISION,
+    FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_RESTORE_IDENTITY,
+    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
+    FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN,
+    FRAME_TYPE_SIGN_ENVELOPE, FRAME_TYPE_WIFI_SCAN_REQUEST,
 };
 
 use crate::identity_cache::IdentityCache;
 use crate::masters::{self, LoadedMaster};
-use crate::oled::Display;
+use crate::oled::{Display, NetworkDisplayState};
 use crate::policy::PolicyEngine;
 use crate::serial::SerialPort;
 use crate::sign;
@@ -83,6 +87,10 @@ use crate::sign;
 type Tls = EspTls<InternalSocket>;
 
 const TLS_PORT: u16 = 443;
+/// One wall-clock budget for the complete HTTP Upgrade request and response.
+/// `TlsConfig::timeout_ms` covers `connect`; this separate deadline prevents a
+/// peer from extending the upgrade forever with partial writes or trickled reads.
+const WS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 /// NIP-46 request/response event kind (also the inline envelope kind).
 const NIP46_KIND: u64 = 24133;
 /// Relay-management event kind (distinct permission boundary from NIP-46).
@@ -227,6 +235,116 @@ struct SignCtx<'a, 'd, 'b> {
     /// Set by a management method, acted on only after its encrypted response
     /// has returned through `sign_and_publish` and control reaches the loop.
     network_restart_at: Option<Instant>,
+    /// Identifier-free runtime connectivity state exposed only on local USB.
+    network_runtime: NetworkRuntimeStatus,
+    /// A short-lived network status card restores to the idle identity screen
+    /// at this deadline. Progress/failure cards leave this unset and remain
+    /// visible until the next transition or normal burn-in blanking.
+    network_display_restore_at: Option<Instant>,
+}
+
+fn show_idle_identity(ctx: &mut SignCtx<'_, '_, '_>) {
+    if !ctx.display_on {
+        return;
+    }
+    if ctx.masters.len() == 1 {
+        let slot = ctx.masters[0].slot;
+        let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
+        let meta = crate::identity_meta::load(ctx.nvs, slot);
+        let fallback = ctx.identity_name.clone();
+        let (name, avatar) = match &meta {
+            Some(m) => (Some(m.name.as_str()), Some((m.w, m.h, m.avatar.as_slice()))),
+            None => (fallback.as_deref(), None),
+        };
+        crate::oled::show_npub(ctx.display, name, &npub, avatar);
+    } else {
+        crate::oled::show_boot(ctx.display, ctx.masters.len() as u8);
+    }
+}
+
+fn show_network_feedback(
+    ctx: &mut SignCtx<'_, '_, '_>,
+    state: NetworkDisplayState,
+    wake: bool,
+    restore_after: Option<Duration>,
+) {
+    if wake && !ctx.display_on {
+        crate::oled::wake_display(ctx.display);
+        ctx.display_on = true;
+    }
+    if !ctx.display_on {
+        return;
+    }
+    crate::oled::show_network_status(ctx.display, state);
+    ctx.last_activity = Instant::now();
+    ctx.network_display_restore_at = restore_after.map(|delay| Instant::now() + delay);
+}
+
+fn set_network_runtime(
+    ctx: &mut SignCtx<'_, '_, '_>,
+    stage: NetworkRuntimeStage,
+    wifi_connected: bool,
+    relay_connected: bool,
+    last_error_class: NetworkRuntimeError,
+) {
+    let next = NetworkRuntimeStatus {
+        stage,
+        wifi_connected,
+        relay_connected,
+        last_error_class,
+    };
+    if ctx.network_runtime == next {
+        return;
+    }
+    ctx.network_runtime = next;
+
+    let feedback = match stage {
+        NetworkRuntimeStage::RadioOff => None,
+        NetworkRuntimeStage::Starting | NetworkRuntimeStage::WifiConnecting => Some(
+            if last_error_class == NetworkRuntimeError::WifiUnavailable {
+                NetworkDisplayState::WifiFailed
+            } else {
+                NetworkDisplayState::JoiningWifi
+            },
+        ),
+        NetworkRuntimeStage::WifiReady
+        | NetworkRuntimeStage::RelayConnecting
+        | NetworkRuntimeStage::SubscriptionSent => {
+            Some(if last_error_class == NetworkRuntimeError::None {
+                NetworkDisplayState::OpeningRelay
+            } else {
+                NetworkDisplayState::RelayFailed
+            })
+        }
+        NetworkRuntimeStage::Online => Some(NetworkDisplayState::Online),
+        NetworkRuntimeStage::ConfigError => Some(NetworkDisplayState::InvalidConfig),
+    };
+    if let Some(feedback) = feedback {
+        let restore = (stage == NetworkRuntimeStage::Online).then_some(Duration::from_secs(2));
+        // Automatic connectivity churn does not wake a panel already blanked
+        // for burn-in protection. Explicit management transitions do.
+        show_network_feedback(ctx, feedback, false, restore);
+    }
+}
+
+/// Collapse detailed internal transport errors into the closed diagnostic
+/// vocabulary exposed over USB. Raw messages stay in local logs only.
+fn runtime_error_class(error: &str) -> NetworkRuntimeError {
+    if error.contains("silent") {
+        NetworkRuntimeError::RelaySilent
+    } else if error.starts_with("ws handshake")
+        || error.starts_with("ws upgrade")
+        || error.starts_with("ws req")
+        || error.starts_with("ws resp")
+    {
+        NetworkRuntimeError::WebsocketUpgrade
+    } else if error.contains("closed") || error.contains("eof") {
+        NetworkRuntimeError::RelayClosed
+    } else if error.contains("frame") || error.contains("protocol") {
+        NetworkRuntimeError::RelayProtocol
+    } else {
+        NetworkRuntimeError::RelayTransport
+    }
 }
 
 /// Host out of a `wss://`/`ws://` relay URL (scheme, port and path stripped).
@@ -390,10 +508,18 @@ pub fn run_wifi_standalone<'d, 'b>(
     )
     .expect("relay: blocking wrap");
 
-    let auth = if cfg.password.is_empty() {
-        AuthMethod::None
+    let (auth, pmf_cfg) = if cfg.password.is_empty() {
+        (AuthMethod::None, PmfConfiguration::NotCapable)
     } else {
-        AuthMethod::WPA2Personal
+        // ESP-IDF treats auth_method as a minimum-strength scan threshold.
+        // WPA2 therefore admits WPA2 and stronger WPA3 APs, while the nominal
+        // WPA2/WPA3 mixed value collapses to a WPA3 minimum and rejects pure
+        // WPA2. PMF optional supplies the WPA3 requirement without excluding a
+        // WPA2 AP that does not advertise PMF.
+        (
+            AuthMethod::WPA2Personal,
+            PmfConfiguration::Capable { required: false },
+        )
     };
     wifi.set_configuration(&WifiConfig::Client(ClientConfiguration {
         ssid: cfg.ssid.as_str().try_into().expect("relay: ssid too long"),
@@ -403,6 +529,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             .try_into()
             .expect("relay: pass too long"),
         auth_method: auth,
+        pmf_cfg,
         ..Default::default()
     }))
     .expect("relay: wifi config");
@@ -451,6 +578,8 @@ pub fn run_wifi_standalone<'d, 'b>(
         network_trial_id,
         network_trial_deadline,
         network_restart_at: None,
+        network_runtime: NetworkRuntimeStatus::starting(),
+        network_display_restore_at: None,
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -491,9 +620,17 @@ pub fn run_wifi_standalone<'d, 'b>(
             FreeRtos::delay_ms(20);
             continue;
         }
-        // WiFi first: every session rides on it. `is_up` is cheap; a down link
-        // drops all sessions (their sockets are dead anyway) and reconnects.
+        // Every relay session depends on the station link; restore it before
+        // attempting any relay dial.
         if !wifi.is_up().unwrap_or(false) {
+            let previous_error = ctx.network_runtime.last_error_class;
+            set_network_runtime(
+                &mut ctx,
+                NetworkRuntimeStage::WifiConnecting,
+                false,
+                false,
+                previous_error,
+            );
             if !sessions.is_empty() {
                 log::warn!(
                     "[relay] wifi down; dropping {} live session(s)",
@@ -505,6 +642,13 @@ pub fn run_wifi_standalone<'d, 'b>(
                 // Keep serving USB while wifi is unreachable, so a bad SSID or
                 // password can always be fixed over the cable.
                 log::error!("[relay] wifi connect failed: {e:?}; serving USB, retry in 3s");
+                set_network_runtime(
+                    &mut ctx,
+                    NetworkRuntimeStage::WifiConnecting,
+                    false,
+                    false,
+                    NetworkRuntimeError::WifiUnavailable,
+                );
                 let until = Instant::now() + Duration::from_secs(3);
                 while Instant::now() < until {
                     poll_usb(usb, &mut ctx, Some(&mut wifi));
@@ -513,10 +657,24 @@ pub fn run_wifi_standalone<'d, 'b>(
                 continue;
             }
             log::info!("[relay] wifi up");
+            set_network_runtime(
+                &mut ctx,
+                NetworkRuntimeStage::WifiReady,
+                true,
+                false,
+                NetworkRuntimeError::None,
+            );
         }
 
         if relays.is_empty() {
             log::error!("[relay] no relay configured");
+            set_network_runtime(
+                &mut ctx,
+                NetworkRuntimeStage::ConfigError,
+                true,
+                false,
+                NetworkRuntimeError::InvalidConfig,
+            );
             // Keep the cable fully served while stuck — this state is only
             // fixable over USB.
             let until = Instant::now() + Duration::from_secs(10);
@@ -546,6 +704,14 @@ pub fn run_wifi_standalone<'d, 'b>(
 
         // Ensure the primary session (rotates over the configured set).
         if !sessions.iter().any(|s| !s.pinned) && Instant::now() >= primary_next {
+            let previous_error = ctx.network_runtime.last_error_class;
+            set_network_runtime(
+                &mut ctx,
+                NetworkRuntimeStage::RelayConnecting,
+                true,
+                false,
+                previous_error,
+            );
             let url = relays[relay_idx % relays.len()].clone();
             let host = relay_host(&url).to_string();
             if relays.len() > 1 {
@@ -560,9 +726,24 @@ pub fn run_wifi_standalone<'d, 'b>(
                     ctx.relay_url = url;
                     sessions.push(s);
                     retune_recv_timeouts(&mut sessions);
+                    set_network_runtime(
+                        &mut ctx,
+                        NetworkRuntimeStage::SubscriptionSent,
+                        true,
+                        true,
+                        NetworkRuntimeError::None,
+                    );
                 }
                 Err(e) => {
                     log::error!("[relay] {e}; failing over in 3s");
+                    let error_class = runtime_error_class(&e);
+                    set_network_runtime(
+                        &mut ctx,
+                        NetworkRuntimeStage::RelayConnecting,
+                        true,
+                        false,
+                        error_class,
+                    );
                     relay_idx = relay_idx.wrapping_add(1);
                     primary_next = Instant::now() + PRIMARY_BACKOFF;
                 }
@@ -659,6 +840,14 @@ pub fn run_wifi_standalone<'d, 'b>(
                         }
                     } else {
                         log::error!("[relay] {e}; failing over in 3s");
+                        let error_class = runtime_error_class(&e);
+                        set_network_runtime(
+                            &mut ctx,
+                            NetworkRuntimeStage::RelayConnecting,
+                            true,
+                            false,
+                            error_class,
+                        );
                         relay_idx = relay_idx.wrapping_add(1);
                         primary_next = Instant::now() + PRIMARY_BACKOFF;
                     }
@@ -698,6 +887,15 @@ pub fn run_wifi_standalone<'d, 'b>(
 fn network_state_tick(ctx: &mut SignCtx) {
     let now = Instant::now();
     if ctx
+        .network_display_restore_at
+        .map(|deadline| now >= deadline)
+        .unwrap_or(false)
+    {
+        ctx.network_display_restore_at = None;
+        show_idle_identity(ctx);
+    }
+
+    if ctx
         .network_restart_at
         .map(|deadline| now >= deadline)
         .unwrap_or(false)
@@ -732,7 +930,9 @@ fn network_state_tick(ctx: &mut SignCtx) {
                     // NVS may be transiently unable to write the terminal
                     // marker. Preserve the last valid trial proof and retry;
                     // never erase/reboot a possibly committed transaction.
-                    log::error!("[relay] network trial finalisation failed; retaining proof for retry");
+                    log::error!(
+                        "[relay] network trial finalisation failed; retaining proof for retry"
+                    );
                     ctx.network_trial_deadline = Some(Instant::now() + Duration::from_secs(10));
                     return;
                 }
@@ -741,7 +941,10 @@ fn network_state_tick(ctx: &mut SignCtx) {
                 let _ = crate::net_config_store::clear_trial(ctx.nvs);
             }
         }
-        FreeRtos::delay_ms(100);
+        show_network_feedback(ctx, NetworkDisplayState::UpdateFailed, true, None);
+        FreeRtos::delay_ms(800);
+        show_network_feedback(ctx, NetworkDisplayState::RollingBack, true, None);
+        FreeRtos::delay_ms(800);
         unsafe { esp_idf_svc::sys::esp_restart() };
     }
 }
@@ -813,12 +1016,17 @@ fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySess
         .map_err(|e| format!("tls connect {host}: {e:?}"))?;
     log::info!("[relay] TLS connected to {host}:{TLS_PORT}");
 
-    ws_handshake(&mut tls, &host)?;
+    // The TLS timeout above ends with `connect`. The HTTP Upgrade temporarily
+    // makes the underlying socket nonblocking and drives EspTls itself against
+    // one absolute deadline, so a partial TLS record cannot restart a blocking
+    // socket timeout. The original fd flags are restored before this returns.
+    let upgrade_started = Instant::now();
+    ws_handshake(&mut tls, &host, upgrade_started)?;
     log::info!("[relay] websocket open ({url})");
 
-    // From here on, reads are paced by a recv timeout (handshake above was
-    // blocking) so the pump wakes periodically to ping / check silence. If
-    // this fails we degrade to blocking reads (still functional for single
+    // From here on, reads are paced by a shorter recv timeout so the pump wakes
+    // periodically to ping / check silence. If this fails we degrade to
+    // blocking reads (still functional for single
     // round-trips, just without the WS-ping/silence layer) rather than tearing
     // the session down — TCP keepalive still guards against a dead socket.
     // Note: a session without the timeout would starve its peers, so a pinned
@@ -1070,7 +1278,7 @@ fn poll_usb(
         ),
 
         FRAME_TYPE_GET_NET_CONFIG => {
-            crate::net_config_store::handle_get_net_config(usb, ctx.nvs)
+            crate::net_config_store::handle_get_net_config(usb, ctx.nvs, ctx.network_runtime)
         }
 
         FRAME_TYPE_PATCH_NET_CONFIG => crate::net_config_store::handle_patch_net_config(
@@ -1251,6 +1459,13 @@ fn handle_relay_msg(
     let tag = v.get(0).and_then(|x| x.as_str()).unwrap_or("").to_string();
     match tag.as_str() {
         "EVENT" => {
+            set_network_runtime(
+                ctx,
+                NetworkRuntimeStage::Online,
+                true,
+                true,
+                NetworkRuntimeError::None,
+            );
             if let Some(ev_val) = v.get_mut(2) {
                 // `take` instead of `clone`: a set_identity_meta event is ~17KB
                 // of JSON, and cloning its parsed Value briefly doubled that on
@@ -1264,8 +1479,26 @@ fn handle_relay_msg(
                 }
             }
         }
-        "EOSE" => log::info!("[relay] EOSE — live, waiting for requests"),
-        "OK" => log::info!("[relay] OK: {}", snippet(raw, 120)),
+        "EOSE" => {
+            set_network_runtime(
+                ctx,
+                NetworkRuntimeStage::Online,
+                true,
+                true,
+                NetworkRuntimeError::None,
+            );
+            log::info!("[relay] EOSE — live, waiting for requests");
+        }
+        "OK" => {
+            set_network_runtime(
+                ctx,
+                NetworkRuntimeStage::Online,
+                true,
+                true,
+                NetworkRuntimeError::None,
+            );
+            log::info!("[relay] OK: {}", snippet(raw, 120));
+        }
         "NOTICE" => log::warn!("[relay] NOTICE: {}", snippet(raw, 160)),
         // The relay closed our subscription (limit, error, policy). The WS stays
         // open so silence-detection won't fire — propagate so we reconnect and
@@ -2146,6 +2379,12 @@ fn dispatch_mgmt(
                 params.transaction_id,
                 revision
             );
+            show_network_feedback(
+                ctx,
+                NetworkDisplayState::Saving,
+                true,
+                Some(Duration::from_secs(2)),
+            );
             Ok(serde_json::json!({
                 "transaction_id": params.transaction_id,
                 "revision": revision,
@@ -2194,6 +2433,7 @@ fn dispatch_mgmt(
                 params.transaction_id,
                 trial.accepted_revision
             );
+            show_network_feedback(ctx, NetworkDisplayState::JoiningWifi, true, None);
             Ok(serde_json::json!({
                 "transaction_id": params.transaction_id,
                 "revision": trial.accepted_revision,
@@ -2221,6 +2461,12 @@ fn dispatch_mgmt(
                 let _ = crate::net_config_store::reconcile_terminal_state(ctx.nvs);
                 ctx.network_trial_id = None;
                 ctx.network_trial_deadline = None;
+                show_network_feedback(
+                    ctx,
+                    NetworkDisplayState::Online,
+                    true,
+                    Some(Duration::from_secs(2)),
+                );
                 return Ok(serde_json::json!({
                     "transaction_id": params.transaction_id,
                     "revision": params.revision,
@@ -2240,6 +2486,12 @@ fn dispatch_mgmt(
                         {
                             ctx.network_trial_id = None;
                             ctx.network_trial_deadline = None;
+                            show_network_feedback(
+                                ctx,
+                                NetworkDisplayState::Online,
+                                true,
+                                Some(Duration::from_secs(2)),
+                            );
                             return Ok(serde_json::json!({
                                 "transaction_id": params.transaction_id,
                                 "revision": params.revision,
@@ -2278,6 +2530,12 @@ fn dispatch_mgmt(
                 "[relay] committed network trial {} at revision {}",
                 params.transaction_id,
                 revision
+            );
+            show_network_feedback(
+                ctx,
+                NetworkDisplayState::Online,
+                true,
+                Some(Duration::from_secs(2)),
             );
             Ok(serde_json::json!({
                 "transaction_id": params.transaction_id,
@@ -2318,6 +2576,12 @@ fn dispatch_mgmt(
                             && last.outcome
                                 == heartwood_common::net_config::NetworkTerminalOutcome::Aborted
                         {
+                            show_network_feedback(
+                                ctx,
+                                NetworkDisplayState::Cancelled,
+                                true,
+                                Some(Duration::from_secs(2)),
+                            );
                             return Ok(serde_json::json!({
                                 "transaction_id": params.transaction_id,
                                 "revision": params.revision,
@@ -2348,11 +2612,7 @@ fn dispatch_mgmt(
             let revision = trial.accepted_revision;
             let live_candidate =
                 ctx.network_trial_id.as_deref() == Some(params.transaction_id.as_str());
-            crate::net_config_store::abort_trial(
-                ctx.nvs,
-                &params.transaction_id,
-                params.revision,
-            )?;
+            crate::net_config_store::abort_trial(ctx.nvs, &params.transaction_id, params.revision)?;
             ctx.network_trial_id = None;
             ctx.network_trial_deadline = None;
             // Cancels a not-yet-fired activation restart. Only a device
@@ -2362,6 +2622,16 @@ fn dispatch_mgmt(
                 "[relay] aborted network trial {} at revision {}",
                 params.transaction_id,
                 revision
+            );
+            show_network_feedback(
+                ctx,
+                if live_candidate {
+                    NetworkDisplayState::RollingBack
+                } else {
+                    NetworkDisplayState::Cancelled
+                },
+                true,
+                (!live_candidate).then_some(Duration::from_secs(2)),
             );
             Ok(serde_json::json!({
                 "transaction_id": params.transaction_id,
@@ -3315,25 +3585,72 @@ enum WsMsg {
     Other,
 }
 
-fn ws_handshake(tls: &mut Tls, host: &str) -> Result<(), String> {
+fn ws_handshake(tls: &mut Tls, host: &str, started: Instant) -> Result<(), String> {
+    let mut socket_mode = NonblockingSocketGuard::enter(tls)
+        .map_err(|e| format!("ws upgrade nonblocking setup: {e}"))?;
+    let result = ws_handshake_nonblocking(tls, host, started);
+    let restored = socket_mode
+        .restore()
+        .map_err(|e| format!("ws upgrade socket flags restore: {e}"));
+    match (result, restored) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(restore_error)) => Err(format!("{error}; {restore_error}")),
+    }
+}
+
+fn ws_handshake_nonblocking(tls: &mut Tls, host: &str, started: Instant) -> Result<(), String> {
     // A fixed Sec-WebSocket-Key is fine for a client that doesn't verify the
     // Accept header — security is TLS + NIP-44, not the WS nonce. (RFC example.)
     let req = format!(
         "GET / HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
-    tls.write_all(req.as_bytes())
-        .map_err(|e| format!("ws req: {e:?}"))?;
+    let mut unwritten = req.as_bytes();
+    while !unwritten.is_empty() {
+        ensure_upgrade_deadline(started)?;
+        let result = tls.write(unwritten);
+        match upgrade_io_action(started, &result) {
+            DeadlineIoAction::Progress(written) => unwritten = &unwritten[written..],
+            DeadlineIoAction::Retry => FreeRtos::delay_ms(5),
+            DeadlineIoAction::Closed => return Err("ws req: zero-length write".into()),
+            DeadlineIoAction::Failed => {
+                let detail = result
+                    .err()
+                    .map(|error| format!("{error:?}"))
+                    .unwrap_or_else(|| "unknown nonblocking write failure".into());
+                return Err(format!("ws req: {detail}"));
+            }
+            DeadlineIoAction::DeadlineExceeded => {
+                return Err("ws upgrade deadline exceeded".into());
+            }
+        }
+    }
 
     let mut buf = [0u8; 1024];
     let mut n = 0usize;
     loop {
-        let r = tls
-            .read(&mut buf[n..])
-            .map_err(|e| format!("ws resp: {e:?}"))?;
-        if r == 0 {
-            return Err("ws handshake: eof".into());
-        }
+        ensure_upgrade_deadline(started)?;
+        let result = tls.read(&mut buf[n..]);
+        let r = match upgrade_io_action(started, &result) {
+            DeadlineIoAction::Progress(read) => read,
+            DeadlineIoAction::Retry => {
+                FreeRtos::delay_ms(5);
+                continue;
+            }
+            DeadlineIoAction::Closed => return Err("ws handshake: eof".into()),
+            DeadlineIoAction::Failed => {
+                let detail = result
+                    .err()
+                    .map(|error| format!("{error:?}"))
+                    .unwrap_or_else(|| "unknown nonblocking read failure".into());
+                return Err(format!("ws resp: {detail}"));
+            }
+            DeadlineIoAction::DeadlineExceeded => {
+                return Err("ws upgrade deadline exceeded".into());
+            }
+        };
         n += r;
         if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
             break;
@@ -3349,7 +3666,44 @@ fn ws_handshake(tls: &mut Tls, host: &str) -> Result<(), String> {
             &resp[..resp.len().min(64)]
         ));
     }
+    ensure_upgrade_deadline(started)?;
     Ok(())
+}
+
+fn ensure_upgrade_deadline(started: Instant) -> Result<(), String> {
+    if heartwood_common::deadline::remaining_timeout_ms(WS_UPGRADE_TIMEOUT, started.elapsed())
+        .is_none()
+    {
+        Err("ws upgrade deadline exceeded".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn upgrade_io_action(
+    started: Instant,
+    result: &Result<usize, esp_idf_svc::sys::EspError>,
+) -> DeadlineIoAction {
+    let event = match result {
+        Ok(transferred) => NonblockingIoEvent::Progress(*transferred),
+        Err(error) if retryable_tls_io_error(&error) => NonblockingIoEvent::WouldBlock,
+        Err(_) => NonblockingIoEvent::Failed,
+    };
+    deadline_io_action(WS_UPGRADE_TIMEOUT, started.elapsed(), event)
+}
+
+/// EspTls forwards negative raw ESP-IDF/mbedTLS read/write results unchanged.
+/// WANT_READ/WANT_WRITE are already negative; errno constants are positive and
+/// therefore match only in their negated form. Positive EWOULDBLOCK belongs to
+/// EspTls's separate async-connect API and is not a read/write retry here.
+fn retryable_tls_io_error(error: &esp_idf_svc::sys::EspError) -> bool {
+    retryable_tls_io_code(
+        error.code(),
+        esp_idf_svc::sys::ESP_TLS_ERR_SSL_WANT_READ,
+        esp_idf_svc::sys::ESP_TLS_ERR_SSL_WANT_WRITE,
+        esp_idf_svc::sys::EAGAIN as i32,
+        esp_idf_svc::sys::EWOULDBLOCK as i32,
+    )
 }
 
 /// Send a masked client frame (RFC 6455 §5.3 mandates client→server masking).
@@ -3457,16 +3811,83 @@ fn try_parse(rx: &mut Vec<u8>) -> Result<Option<WsMsg>, String> {
     }))
 }
 
-/// Apply a receive timeout (`SO_RCVTIMEO`) to the live TLS socket so the read
-/// loop wakes periodically without busy-spinning. Affects recv only — writes
-/// stay blocking, so `ws_send`/`write_all` are unchanged.
-fn set_recv_timeout(tls: &mut Tls, ms: i64) -> Result<(), String> {
+fn tls_socket_fd(tls: &Tls) -> Result<core::ffi::c_int, String> {
     use esp_idf_svc::sys;
     let mut fd: core::ffi::c_int = -1;
-    let r = unsafe { sys::esp_tls_get_conn_sockfd(tls.context_handle() as *mut _, &mut fd) };
-    if r != sys::ESP_OK || fd < 0 {
-        return Err(format!("get sockfd failed (err {r}, fd {fd})"));
+    let result = unsafe { sys::esp_tls_get_conn_sockfd(tls.context_handle() as *mut _, &mut fd) };
+    if result != sys::ESP_OK || fd < 0 {
+        Err(format!("get sockfd failed (err {result}, fd {fd})"))
+    } else {
+        Ok(fd)
     }
+}
+
+/// Scoped nonblocking mode for the HTTP Upgrade only. `lwip_fcntl(F_GETFL)`
+/// gives us the socket's exact original flags; every exit explicitly restores
+/// them, with Drop as a second best-effort guard if restoration itself fails.
+struct NonblockingSocketGuard {
+    fd: core::ffi::c_int,
+    original_flags: core::ffi::c_int,
+    restored: bool,
+}
+
+impl NonblockingSocketGuard {
+    fn enter(tls: &Tls) -> Result<Self, String> {
+        use esp_idf_svc::sys;
+        let fd = tls_socket_fd(tls)?;
+        let original_flags = unsafe { sys::lwip_fcntl(fd, sys::F_GETFL as i32, 0) };
+        if original_flags < 0 {
+            return Err(format!("fcntl F_GETFL failed (rc {original_flags})"));
+        }
+        let nonblocking_flags = original_flags | sys::O_NONBLOCK as i32;
+        let result = unsafe { sys::lwip_fcntl(fd, sys::F_SETFL as i32, nonblocking_flags) };
+        if result != 0 {
+            return Err(format!("fcntl F_SETFL O_NONBLOCK failed (rc {result})"));
+        }
+        Ok(Self {
+            fd,
+            original_flags,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), String> {
+        if self.restored {
+            return Ok(());
+        }
+        let result = unsafe {
+            esp_idf_svc::sys::lwip_fcntl(
+                self.fd,
+                esp_idf_svc::sys::F_SETFL as i32,
+                self.original_flags,
+            )
+        };
+        if result != 0 {
+            return Err(format!("fcntl F_SETFL restore failed (rc {result})"));
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for NonblockingSocketGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            log::error!("[relay] TLS socket flag restore failed: {error}");
+        }
+    }
+}
+
+/// Apply a receive timeout to the live TLS socket so the steady-state relay
+/// pump periodically returns to its ping, silence, trial, and USB work.
+fn set_socket_timeout(
+    tls: &mut Tls,
+    option: i32,
+    option_name: &str,
+    ms: i64,
+) -> Result<(), String> {
+    use esp_idf_svc::sys;
+    let fd = tls_socket_fd(tls)?;
     let tv = sys::timeval {
         tv_sec: (ms / 1000) as _,
         tv_usec: ((ms % 1000) * 1000) as _,
@@ -3475,15 +3896,19 @@ fn set_recv_timeout(tls: &mut Tls, ms: i64) -> Result<(), String> {
         sys::lwip_setsockopt(
             fd,
             sys::SOL_SOCKET as i32,
-            sys::SO_RCVTIMEO as i32,
+            option,
             &tv as *const _ as *const core::ffi::c_void,
             core::mem::size_of::<sys::timeval>() as sys::socklen_t,
         )
     };
     if rc != 0 {
-        return Err(format!("setsockopt SO_RCVTIMEO failed (rc {rc})"));
+        return Err(format!("setsockopt {option_name} failed (rc {rc})"));
     }
     Ok(())
+}
+
+fn set_recv_timeout(tls: &mut Tls, ms: i64) -> Result<(), String> {
+    set_socket_timeout(tls, esp_idf_svc::sys::SO_RCVTIMEO as i32, "SO_RCVTIMEO", ms)
 }
 
 fn esp_random() -> u32 {

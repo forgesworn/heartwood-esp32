@@ -718,7 +718,11 @@ fn main() {
             }
 
             FRAME_TYPE_GET_NET_CONFIG => {
-                net_config_store::handle_get_net_config(&mut usb, &mut nvs);
+                net_config_store::handle_get_net_config(
+                    &mut usb,
+                    &mut nvs,
+                    heartwood_common::net_config::NetworkRuntimeStatus::radio_off(),
+                );
             }
 
             FRAME_TYPE_PATCH_NET_CONFIG => {

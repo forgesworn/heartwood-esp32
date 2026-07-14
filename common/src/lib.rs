@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+pub mod deadline;
 pub mod derive;
 pub mod encoding;
 pub mod frame;

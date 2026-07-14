@@ -793,6 +793,212 @@ pub fn show_provisioned(display: &mut Display<'_>) {
     FreeRtos::delay_ms(2000);
 }
 
+/// Network lifecycle states use a dedicated status card instead of the generic
+/// result/error screens. Every state redraws and flushes the complete frame, so
+/// a transition cannot leave rules or text from the previous screen behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkDisplayState {
+    Saving,
+    JoiningWifi,
+    OpeningRelay,
+    Online,
+    WifiFailed,
+    RelayFailed,
+    InvalidConfig,
+    UpdateFailed,
+    RollingBack,
+    Saved,
+    RadioOff,
+    SaveFailed,
+    Cancelled,
+}
+
+fn show_status_card(
+    display: &mut Display<'_>,
+    header_text: &str,
+    title: &str,
+    hint: &str,
+    colour: Rgb565,
+) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let available = l.w - l.sx(4);
+    let title_font = if title.len() as i32 * Layout::glyph_w(l.font_large()) <= available {
+        l.font_large()
+    } else if title.len() as i32 * Layout::glyph_w(l.font_body()) <= available {
+        l.font_body()
+    } else {
+        l.font_small()
+    };
+    let title_style = MonoTextStyleBuilder::new()
+        .font(title_font)
+        .text_color(colour)
+        .build();
+    let hint_style = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+
+    Text::new(
+        header_text,
+        Point::new(
+            l.center_x(header_text.len() as i32 * Layout::glyph_w(l.font_header())),
+            l.sy(10),
+        ),
+        header,
+    )
+    .draw(display)
+    .ok();
+    Rectangle::new(
+        Point::new(l.sx(0), l.sy(14)),
+        Size::new(l.w as u32, l.s(1) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(ACCENT))
+    .draw(display)
+    .ok();
+
+    Text::new(
+        title,
+        Point::new(
+            l.center_x(title.len() as i32 * Layout::glyph_w(title_font)),
+            l.sy(38),
+        ),
+        title_style,
+    )
+    .draw(display)
+    .ok();
+    Text::new(
+        hint,
+        Point::new(
+            l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())),
+            l.sy(53),
+        ),
+        hint_style,
+    )
+    .draw(display)
+    .ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Neutral, amber confirmation screen for a normal settings change. A network
+/// or operator update is not an error, so it must not use the red fault screen.
+pub fn show_change_approval(display: &mut Display<'_>, title: &str, remaining: u32) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+
+    let header_text = "CONFIRM CHANGE";
+    Text::new(
+        header_text,
+        Point::new(
+            l.center_x(header_text.len() as i32 * Layout::glyph_w(l.font_header())),
+            l.sy(10),
+        ),
+        header,
+    )
+    .draw(display)
+    .ok();
+    Rectangle::new(
+        Point::new(l.sx(0), l.sy(14)),
+        Size::new(l.w as u32, l.s(1) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(ACCENT))
+    .draw(display)
+    .ok();
+
+    let mut lines = title.lines();
+    let first = lines.next().unwrap_or("Change settings?");
+    let second = lines.next();
+    let first_y = if second.is_some() { 29 } else { 36 };
+    let first_font = if first.len() as i32 * Layout::glyph_w(l.font_body()) <= l.w - l.sx(4) {
+        l.font_body()
+    } else {
+        l.font_small()
+    };
+    let first_style = MonoTextStyleBuilder::new()
+        .font(first_font)
+        .text_color(WARN)
+        .build();
+    Text::new(
+        first,
+        Point::new(
+            l.center_x(first.len() as i32 * Layout::glyph_w(first_font)),
+            l.sy(first_y),
+        ),
+        first_style,
+    )
+    .draw(display)
+    .ok();
+    if let Some(second) = second {
+        Text::new(
+            second,
+            Point::new(
+                l.center_x(second.len() as i32 * Layout::glyph_w(l.font_small())),
+                l.sy(43),
+            ),
+            small,
+        )
+        .draw(display)
+        .ok();
+    }
+    let hint = format!("Hold button - {remaining}s");
+    Text::new(
+        &hint,
+        Point::new(
+            l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())),
+            l.sy(57),
+        ),
+        small,
+    )
+    .draw(display)
+    .ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Show one explicit network transition. The status card has one accent rule,
+/// never the generic result screen's two white rules.
+pub fn show_network_status(display: &mut Display<'_>, state: NetworkDisplayState) {
+    let (title, hint, colour) = match state {
+        NetworkDisplayState::Saving => ("Saving", "Storing network settings", WARN),
+        NetworkDisplayState::JoiningWifi => ("Joining WiFi", "Please wait", WARN),
+        NetworkDisplayState::OpeningRelay => ("Opening relay", "Connecting securely", WARN),
+        NetworkDisplayState::Online => ("Online", "Remote signing ready", OK),
+        NetworkDisplayState::WifiFailed => ("WiFi unavailable", "Check network settings", DANGER),
+        NetworkDisplayState::RelayFailed => ("Relay unavailable", "Trying another relay", DANGER),
+        NetworkDisplayState::InvalidConfig => {
+            ("Setup incomplete", "Check network settings", DANGER)
+        }
+        NetworkDisplayState::UpdateFailed => {
+            ("Update not confirmed", "Safety timeout reached", DANGER)
+        }
+        NetworkDisplayState::RollingBack => ("Rolling back", "Restoring last network", WARN),
+        NetworkDisplayState::Saved => ("Saved", "Network settings updated", OK),
+        NetworkDisplayState::RadioOff => ("Saved", "Rebooting - radio off", OK),
+        NetworkDisplayState::SaveFailed => ("Save failed", "Settings unchanged", DANGER),
+        NetworkDisplayState::Cancelled => ("Cancelled", "Current network kept", WARN),
+    };
+    show_status_card(display, "NETWORK", title, hint, colour);
+}
+
 /// Display an error message on the OLED.
 pub fn show_error(display: &mut Display<'_>, msg: &str) {
     let l = layout(display);

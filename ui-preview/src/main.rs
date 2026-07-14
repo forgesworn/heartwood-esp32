@@ -315,6 +315,147 @@ fn draw_result<D: DrawTarget<Color = Rgb565>>(d: &mut D, word: &str, colour: Rgb
     .ok();
 }
 
+/// Network status card (mirrors `oled::show_status_card`). It deliberately
+/// clears the whole frame first so a preceding legacy result screen cannot
+/// leave either of its white rules behind.
+fn draw_network_status<D>(d: &mut D, title: &str, hint: &str, colour: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565> + Dimensions,
+{
+    let l = layout_of(d);
+    d.clear(BG).ok();
+
+    let header_text = "NETWORK";
+    Text::new(
+        header_text,
+        Point::new(
+            l.center_x(header_text.len() as i32 * Layout::glyph_w(l.font_header())),
+            l.sy(10),
+        ),
+        style(l.font_header(), ACCENT),
+    )
+    .draw(d)
+    .ok();
+    Rectangle::new(
+        Point::new(l.sx(0), l.sy(14)),
+        Size::new(l.w as u32, l.s(1) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(ACCENT))
+    .draw(d)
+    .ok();
+
+    let available = l.w - l.sx(4);
+    let title_font = if title.len() as i32 * Layout::glyph_w(l.font_large()) <= available {
+        l.font_large()
+    } else if title.len() as i32 * Layout::glyph_w(l.font_body()) <= available {
+        l.font_body()
+    } else {
+        l.font_small()
+    };
+    Text::new(
+        title,
+        Point::new(
+            l.center_x(title.len() as i32 * Layout::glyph_w(title_font)),
+            l.sy(38),
+        ),
+        style(title_font, colour),
+    )
+    .draw(d)
+    .ok();
+    Text::new(
+        hint,
+        Point::new(
+            l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())),
+            l.sy(53),
+        ),
+        style(l.font_small(), MUTED),
+    )
+    .draw(d)
+    .ok();
+}
+
+fn draw_change_approval<D>(d: &mut D, remaining: u32)
+where
+    D: DrawTarget<Color = Rgb565> + Dimensions,
+{
+    let l = layout_of(d);
+    d.clear(BG).ok();
+    let header_text = "CONFIRM CHANGE";
+    Text::new(
+        header_text,
+        Point::new(
+            l.center_x(header_text.len() as i32 * Layout::glyph_w(l.font_header())),
+            l.sy(10),
+        ),
+        style(l.font_header(), ACCENT),
+    )
+    .draw(d)
+    .ok();
+    Rectangle::new(
+        Point::new(l.sx(0), l.sy(14)),
+        Size::new(l.w as u32, l.s(1) as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(ACCENT))
+    .draw(d)
+    .ok();
+    let title = "Set network config?";
+    let title_font = if title.len() as i32 * Layout::glyph_w(l.font_body()) <= l.w - l.sx(4) {
+        l.font_body()
+    } else {
+        l.font_small()
+    };
+    Text::new(
+        title,
+        Point::new(
+            l.center_x(title.len() as i32 * Layout::glyph_w(title_font)),
+            l.sy(36),
+        ),
+        style(title_font, WARN),
+    )
+    .draw(d)
+    .ok();
+    let hint = format!("Hold button - {remaining}s");
+    Text::new(
+        &hint,
+        Point::new(
+            l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())),
+            l.sy(57),
+        ),
+        style(l.font_small(), MUTED),
+    )
+    .draw(d)
+    .ok();
+}
+
+fn draw_legacy_result_rules<D>(d: &mut D)
+where
+    D: DrawTarget<Color = Rgb565> + Dimensions,
+{
+    let l = layout_of(d);
+    for y in [18, 44] {
+        Rectangle::new(
+            Point::new(l.sx(0), l.sy(y)),
+            Size::new(l.w as u32, l.s(1) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(FG))
+        .draw(d)
+        .ok();
+    }
+}
+
+fn assert_no_legacy_white_rules(d: &SimulatorDisplay<Rgb565>) {
+    let l = layout_of(d);
+    for y in [l.sy(18), l.sy(44)] {
+        let white = (0..l.w)
+            .filter(|x| d.get_pixel(Point::new(*x, y)) == FG)
+            .count();
+        assert!(
+            white < l.w as usize / 2,
+            "stale full-width white rule remained at y={y}"
+        );
+    }
+}
+
 fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565>)) {
     let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
     d.clear(BG).ok();
@@ -344,4 +485,34 @@ fn main() {
         render(&format!("approved-{b}"), w, h, |d| draw_result(d, "APPROVED", OK));
         render(&format!("denied-{b}"), w, h, |d| draw_result(d, "DENIED", DANGER));
     }
+
+    // Focused T-Display network-operation gallery. The transition case first
+    // draws the old two-white-rule result frame, then the new status card; the
+    // pixel assertion proves the full-frame clear removed both stale rules.
+    render("network-approval-tdisplay", 240, 135, |d| {
+        draw_change_approval(d, 24)
+    });
+    render("network-saving-tdisplay", 240, 135, |d| {
+        draw_network_status(d, "Saving", "Storing network settings", WARN)
+    });
+    render("network-joining-tdisplay", 240, 135, |d| {
+        draw_network_status(d, "Joining WiFi", "Please wait", WARN)
+    });
+    render("network-opening-relay-tdisplay", 240, 135, |d| {
+        draw_network_status(d, "Opening relay", "Connecting securely", WARN)
+    });
+    render("network-online-tdisplay", 240, 135, |d| {
+        draw_network_status(d, "Online", "Remote signing ready", OK)
+    });
+    render("network-radio-off-tdisplay", 240, 135, |d| {
+        draw_network_status(d, "Saved", "Rebooting - radio off", OK)
+    });
+    render("network-update-failed-tdisplay", 240, 135, |d| {
+        draw_network_status(d, "Update not confirmed", "Safety timeout reached", DANGER)
+    });
+    render("network-rollback-tdisplay", 240, 135, |d| {
+        draw_legacy_result_rules(d);
+        draw_network_status(d, "Rolling back", "Restoring last network", WARN);
+        assert_no_legacy_white_rules(d);
+    });
 }

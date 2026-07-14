@@ -5,6 +5,9 @@ name: CI
 # ota_0 slot. The firmware previously had NO automated safety net — a compile
 # break or a size overflow was only ever caught by building locally.
 on:
+  # Manual dispatch is the clean retry path when GitHub marks a push run as a
+  # runner startup failure before any job exists.
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]

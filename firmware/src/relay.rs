@@ -71,6 +71,7 @@ use heartwood_common::types::{
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_GET_NET_CONFIG, FRAME_TYPE_NACK,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_PROVISION,
+    FRAME_TYPE_DERIVE_IDENTITY,
     FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
     FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN,
@@ -1396,6 +1397,17 @@ fn poll_usb(
             };
             if provisioned.is_some() {
                 reboot_after_state_change("master added");
+            }
+        }
+
+        // Derive a named child on-device and store it as a new master. A
+        // master-set change like PROVISION, so reboot to re-subscribe; an
+        // idempotent re-derive (existing slot) returns None and needs none.
+        FRAME_TYPE_DERIVE_IDENTITY => {
+            if crate::provision::handle_derive(usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.masters)
+                .is_some()
+            {
+                reboot_after_state_change("identity derived");
             }
         }
         FRAME_TYPE_PROVISION_REMOVE => {

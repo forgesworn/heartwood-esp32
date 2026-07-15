@@ -3692,6 +3692,10 @@ fn dispatch_mgmt(
                 "uptime_s": crate::uptime_s(),
                 "last_reset": crate::reset_reason_str(),
                 "log_quiet": crate::log_quiet::read(ctx.nvs),
+                // Running firmware, so managers can show version state over
+                // WiFi too — the FIRMWARE_INFO frame only answers over USB.
+                "version": env!("CARGO_PKG_VERSION"),
+                "board": crate::board::BOARD,
             }))
         }
 

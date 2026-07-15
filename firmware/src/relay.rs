@@ -2730,6 +2730,68 @@ fn dispatch_mgmt(
             }))
         }
 
+        // Provision a new master over the relay: the counterpart of the USB
+        // PROVISION frame for operators managing a shelf signer remotely. The
+        // secret arrives inside the NIP-44 envelope encrypted end-to-end under
+        // the operator⇄master conversation key — the relay and every network
+        // hop carry only ciphertext. Mutation-challenge protected; idempotent
+        // by pubkey; a successful store schedules the deferred restart so the
+        // relay re-subscribes with the fresh master set.
+        "provision_identity" => {
+            let mode_byte = req
+                .pointer("/params/mode")
+                .and_then(|v| v.as_u64())
+                .ok_or("provision_identity requires params.mode (0 bunker, 1 tree-mnemonic, 2 tree-nsec)")? as u8;
+            let mode = heartwood_common::types::MasterMode::from_u8(mode_byte)
+                .ok_or("unknown provision mode byte")?;
+            let label = req
+                .pointer("/params/label")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .ok_or("provision_identity requires params.label")?
+                .to_string();
+            let secret_hex = req
+                .pointer("/params/secret_hex")
+                .and_then(|v| v.as_str())
+                .ok_or("provision_identity requires params.secret_hex")?;
+            let mut secret: [u8; 32] = hex_decode(secret_hex)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .ok_or("secret_hex must be 64 hex characters")?;
+
+            let keypair = secp256k1::Keypair::from_seckey_slice(ctx.secp, &secret)
+                .map_err(|_| "invalid secret key".to_string())?;
+            let (xonly, _) = keypair.x_only_public_key();
+            let pubkey = xonly.serialize();
+
+            if let Some(existing) = ctx.masters.iter().find(|m| m.pubkey == pubkey) {
+                secret.iter_mut().for_each(|b| *b = 0);
+                log::info!("[relay] mgmt: provision_identity already in slot {}", existing.slot);
+                return Ok(serde_json::json!({
+                    "slot": existing.slot,
+                    "label": existing.label,
+                    "npub_hex": hex_encode(&existing.pubkey),
+                    "existing": true,
+                }));
+            }
+
+            let stored = crate::provision::store_master(ctx.nvs, secret, label, mode, ctx.secp)?;
+            log::info!(
+                "[relay] mgmt: provisioned '{}' into slot {} (mode {mode_byte})",
+                stored.label,
+                stored.slot
+            );
+            ctx.network_restart_at = Some(Instant::now() + NETWORK_RESTART_DELAY);
+            Ok(serde_json::json!({
+                "slot": stored.slot,
+                "label": stored.label,
+                "npub_hex": hex_encode(&stored.pubkey),
+                "existing": false,
+                "note": "signer restarts shortly to serve the new identity",
+            }))
+        }
+
         "create_client" | "create_client_v2" => {
             let is_v2 = method == "create_client_v2";
             let exact_policy = if is_v2 {

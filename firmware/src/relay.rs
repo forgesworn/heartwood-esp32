@@ -112,6 +112,16 @@ const MAX_WS_FRAME: usize = 32768;
 /// `SO_RCVTIMEO` for the read loop — how long a `read` blocks before returning
 /// "no data yet" so the loop can ping / check the silence deadline.
 const RECV_TIMEOUT_MS: i64 = 1000;
+/// `SO_SNDTIMEO` for session sockets. A peer that stops ACKing (stalled relay,
+/// dead NAT path) leaves data queued unACKed, so TCP keepalive never fires and
+/// `write_all` blocks inside lwIP's retransmission backoff — for MINUTES — the
+/// moment anything publishes. That froze the whole single-threaded loop: every
+/// client saw timeouts, the log showed nothing (the loop was inside `send`),
+/// and replies flushed in a late burst when the peer recovered. With a send
+/// timeout the write errors instead, the one session is dropped mid-record
+/// (mandatory after a partial TLS write) and the primary re-dials ~3s later,
+/// so a stalled relay costs ~11s on one socket instead of a global freeze.
+const SEND_TIMEOUT_MS: i64 = 8_000;
 /// Send a WebSocket ping after this much inactivity (relay-level keepalive).
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// Reconnect if nothing at all (data or pong) arrives for this long.
@@ -1047,6 +1057,14 @@ fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySess
         } else {
             "network trial needs a recv timeout (rollback deadline must remain live)".into()
         });
+    }
+
+    // A send timeout bounds how long a publish to a stalled peer can hold the
+    // loop (see SEND_TIMEOUT_MS). Failure degrades to blocking sends — same
+    // posture as the recv timeout above — but on lwIP both use one setsockopt
+    // path, so if the recv timeout landed this one will too.
+    if let Err(e) = set_send_timeout(&mut tls, SEND_TIMEOUT_MS) {
+        log::warn!("[relay] send-timeout unavailable ({e}); blocking sends");
     }
 
     let sub_req = build_sub_req(ctx);
@@ -3993,6 +4011,10 @@ fn set_socket_timeout(
 
 fn set_recv_timeout(tls: &mut Tls, ms: i64) -> Result<(), String> {
     set_socket_timeout(tls, esp_idf_svc::sys::SO_RCVTIMEO as i32, "SO_RCVTIMEO", ms)
+}
+
+fn set_send_timeout(tls: &mut Tls, ms: i64) -> Result<(), String> {
+    set_socket_timeout(tls, esp_idf_svc::sys::SO_SNDTIMEO as i32, "SO_SNDTIMEO", ms)
 }
 
 fn esp_random() -> u32 {

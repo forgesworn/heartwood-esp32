@@ -90,8 +90,9 @@ pub fn handle_add(
 
 /// Derive the x-only pubkey from a 32-byte root secret and persist the master to
 /// NVS. No display, no ACK — the caller decides what to show (the npub for an
-/// import, the recovery phrase for a self-generated identity).
-fn store_master(
+/// import, the recovery phrase for a self-generated identity). Crate-visible so
+/// the relay's `derive_identity` management method stores through the same path.
+pub(crate) fn store_master(
     nvs: &mut EspNvs<NvsDefault>,
     secret: [u8; 32],
     label: String,

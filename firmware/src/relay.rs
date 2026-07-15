@@ -2654,6 +2654,64 @@ fn dispatch_mgmt(
             }))
         }
 
+        // Derive a named child identity from the ADDRESSED master's tree root
+        // and store it as a new master. No key material crosses the wire — the
+        // device already holds the root, the operator only names the branch —
+        // so this is safe over WiFi where key IMPORT (provision) is not.
+        // Mutation-challenge protected like every other mutation. A successful
+        // store schedules the standard deferred restart so the relay
+        // re-subscribes with the fresh master set after the response publishes.
+        "derive_identity" => {
+            let name = req
+                .pointer("/params/name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .ok_or("derive_identity requires params.name")?;
+            heartwood_common::validate::validate_purpose(name)?;
+
+            let parent = &ctx.masters[master_idx];
+            if parent.locked {
+                return Err("parent identity is PIN-locked".into());
+            }
+            let (child_secret, child_pubkey) =
+                crate::nip46_handler::derive_identity(&parent.secret, parent.mode, name, 0)?;
+
+            // Idempotent: the same name from the same root is the same key.
+            if let Some(existing) = ctx.masters.iter().find(|m| m.pubkey == child_pubkey) {
+                log::info!("[relay] mgmt: derive_identity '{name}' already in slot {}", existing.slot);
+                return Ok(serde_json::json!({
+                    "slot": existing.slot,
+                    "label": existing.label,
+                    "npub_hex": hex_encode(&existing.pubkey),
+                    "parent_slot": master_slot,
+                    "purpose": name,
+                    "existing": true,
+                }));
+            }
+
+            let stored = crate::provision::store_master(
+                ctx.nvs,
+                *child_secret,
+                name.to_string(),
+                heartwood_common::types::MasterMode::Bunker,
+                ctx.secp,
+            )?;
+            log::info!(
+                "[relay] mgmt: derived identity '{name}' from slot {master_slot} into slot {}",
+                stored.slot
+            );
+            ctx.network_restart_at = Some(Instant::now() + NETWORK_RESTART_DELAY);
+            Ok(serde_json::json!({
+                "slot": stored.slot,
+                "label": stored.label,
+                "npub_hex": hex_encode(&stored.pubkey),
+                "parent_slot": master_slot,
+                "purpose": name,
+                "existing": false,
+                "note": "signer restarts shortly to serve the new identity",
+            }))
+        }
+
         "create_client" | "create_client_v2" => {
             let is_v2 = method == "create_client_v2";
             let exact_policy = if is_v2 {
@@ -3250,29 +3308,43 @@ fn dispatch_mgmt(
         // single slot.) Until a client is bound to a signing-approved slot the
         // first sign_event needs a physical PRG press; safe methods auto-approve.
         "list_identities" => {
-            let master_label = ctx.masters[master_idx].label.clone();
-            let master_uri = mgmt::bunker_uri(&master_hex, &ctx.relays, None);
-            let mut identities = vec![serde_json::json!({
-                "label": master_label,
-                "kind": "master",
-                "npub_hex": master_hex,
-                "bunker_uri": master_uri,
-            })];
-            for p in ctx.personas.iter().filter(|p| p.master_slot == master_slot) {
+            // EVERY identity the signer serves — all masters plus all derived
+            // personas — not just the addressed one. The signer answers NIP-46
+            // for all of them, so the operator's inventory should match; each
+            // master is itself a management target (address it by its pubkey).
+            let mut identities: Vec<serde_json::Value> = ctx
+                .masters
+                .iter()
+                .map(|m| {
+                    let pk_hex = hex_encode(&m.pubkey);
+                    let uri = mgmt::bunker_uri(&pk_hex, &ctx.relays, None);
+                    serde_json::json!({
+                        "label": m.label,
+                        "kind": "master",
+                        "slot": m.slot,
+                        "npub_hex": pk_hex,
+                        "bunker_uri": uri,
+                        "addressed": m.slot == master_slot,
+                    })
+                })
+                .collect();
+            let master_count = identities.len();
+            for p in ctx.personas.iter() {
                 let pk_hex = hex_encode(&p.pubkey);
                 let label = p.name.clone().unwrap_or_else(|| p.purpose.clone());
                 let uri = mgmt::bunker_uri(&pk_hex, &ctx.relays, None);
                 identities.push(serde_json::json!({
                     "label": label,
                     "kind": "persona",
+                    "slot": p.master_slot,
                     "purpose": p.purpose.clone(),
                     "index": p.index,
                     "npub_hex": pk_hex,
                     "bunker_uri": uri,
                 }));
             }
-            let persona_count = identities.len() - 1;
-            log::info!("[relay] mgmt: list_identities → 1 master + {persona_count} persona(s)");
+            let persona_count = identities.len() - master_count;
+            log::info!("[relay] mgmt: list_identities → {master_count} master(s) + {persona_count} persona(s)");
             Ok(serde_json::json!({
                 "identities": identities,
                 "note": "discovery only — URIs carry no secret; for unattended signing bind a client with create_client (use its secret) or approve the first sign_event with a physical PRG press",

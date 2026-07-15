@@ -3649,6 +3649,25 @@ fn dispatch_mgmt(
             Ok(serde_json::json!({ "ok": true, "name": name, "w": w, "h": h }))
         }
 
+        // Runtime log verbosity. Quiet drops logging to warnings — on boards
+        // whose activity LED is wired to the log UART (the T-Display's blue
+        // light), this is the "turn the flashing light off" control. Persisted
+        // and applied immediately; the confirmation logs at WARN so it is
+        // visible either way.
+        "set_log_level" => {
+            let quiet = req
+                .pointer("/params/quiet")
+                .and_then(|v| v.as_bool())
+                .ok_or("set_log_level requires params.quiet (bool)")?;
+            crate::log_quiet::write(ctx.nvs, quiet)?;
+            crate::log_quiet::apply(quiet);
+            log::warn!(
+                "[relay] logging set to {}",
+                if quiet { "quiet (warnings only)" } else { "normal (info)" }
+            );
+            Ok(serde_json::json!({ "quiet": quiet }))
+        }
+
         "get_status" => {
             let mut relays_live = vec![s.url.clone()];
             relays_live.extend(pool.others.iter().map(|o| o.url.clone()));
@@ -3672,6 +3691,7 @@ fn dispatch_mgmt(
                 // wiping the RAM audit and looking like relay flakiness.
                 "uptime_s": crate::uptime_s(),
                 "last_reset": crate::reset_reason_str(),
+                "log_quiet": crate::log_quiet::read(ctx.nvs),
             }))
         }
 

@@ -46,6 +46,7 @@ mod connslot;
 mod identity_cache;
 mod identity_meta;
 mod layout;
+mod log_quiet;
 mod management_challenge;
 mod palette;
 mod masters;
@@ -229,6 +230,10 @@ fn main() {
     // --- NVS init ---
     let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
     let mut nvs = EspNvs::new(nvs_partition, "heartwood", true).expect("NVS namespace init failed");
+
+    // Apply the persisted log verbosity before the chatty phases start. Quiet
+    // mode calms boards whose activity LED is wired to the log UART.
+    log_quiet::apply(log_quiet::read(&nvs));
 
     // A master removal spans several NVS keys. Resume its durable journal
     // before loading any seed, persona, policy, or display metadata so a power

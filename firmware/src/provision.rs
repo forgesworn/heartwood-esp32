@@ -799,21 +799,30 @@ pub fn handle_remove(
 }
 
 /// Handle a PROVISION_LIST frame (0x05). Responds with frame 0x07 containing
-/// a JSON array of `{slot, label, mode, npub}` objects.
+/// a JSON array of `{slot, label, mode, npub, apps}` objects.
 pub fn handle_list(
     usb: &mut SerialPort<'_>,
     loaded: &[LoadedMaster],
     personas: &[crate::personas::LoadedPersona],
+    // None in the PIN-locked boot loop, where the policy engine is not built
+    // yet — the row then simply omits the count.
+    policy_engine: Option<&crate::policy::PolicyEngine>,
 ) {
     let mut infos: Vec<serde_json::Value> = loaded
         .iter()
         .map(|m| {
-            serde_json::json!({
+            let mut row = serde_json::json!({
                 "slot": m.slot,
                 "label": m.label,
                 "mode": m.mode as u8,
                 "npub": encode_npub(&m.pubkey),
-            })
+            });
+            // Per-identity app count, so managers can show a true total
+            // instead of only the selected identity's table.
+            if let Some(pe) = policy_engine {
+                row["apps"] = pe.list_slots(m.slot).len().into();
+            }
+            row
         })
         .collect();
 

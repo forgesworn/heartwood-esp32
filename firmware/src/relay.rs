@@ -1217,7 +1217,7 @@ fn poll_usb(
             }
         }
 
-        FRAME_TYPE_PROVISION_LIST => crate::provision::handle_list(usb, ctx.masters, ctx.personas),
+        FRAME_TYPE_PROVISION_LIST => crate::provision::handle_list(usb, ctx.masters, ctx.personas, Some(ctx.policy_engine)),
 
         // Plaintext NIP-46 — only when the bridge is not authenticated (mirrors
         // the USB-only loop). Uses the first master, like the tethered path.
@@ -3392,10 +3392,18 @@ fn dispatch_mgmt(
             // personas — not just the addressed one. The signer answers NIP-46
             // for all of them, so the operator's inventory should match; each
             // master is itself a management target (address it by its pubkey).
+            // Precomputed to keep the policy-engine borrow out of the masters
+            // iterator below.
+            let app_counts: Vec<usize> = ctx
+                .masters
+                .iter()
+                .map(|m| ctx.policy_engine.list_slots(m.slot).len())
+                .collect();
             let mut identities: Vec<serde_json::Value> = ctx
                 .masters
                 .iter()
-                .map(|m| {
+                .zip(app_counts)
+                .map(|(m, apps)| {
                     let pk_hex = hex_encode(&m.pubkey);
                     let uri = mgmt::bunker_uri(&pk_hex, &ctx.relays, None);
                     serde_json::json!({
@@ -3405,6 +3413,7 @@ fn dispatch_mgmt(
                         "npub_hex": pk_hex,
                         "bunker_uri": uri,
                         "addressed": m.slot == master_slot,
+                        "apps": apps,
                     })
                 })
                 .collect();

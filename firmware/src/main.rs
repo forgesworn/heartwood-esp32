@@ -376,8 +376,9 @@ fn main() {
                 }
                 FRAME_TYPE_PROVISION_LIST => {
                     // Allow listing masters even when locked — no secrets exposed,
-                    // only public npubs, which is acceptable.
-                    provision::handle_list(&mut usb, &loaded_masters, &loaded_personas);
+                    // only public npubs, which is acceptable. The policy engine
+                    // is not built yet, so app counts are omitted here.
+                    provision::handle_list(&mut usb, &loaded_masters, &loaded_personas, None);
                 }
                 FRAME_TYPE_FIRMWARE_INFO => {
                     protocol::write_frame(
@@ -668,7 +669,7 @@ fn main() {
 
             // 0x05 — list masters (and personas)
             FRAME_TYPE_PROVISION_LIST => {
-                provision::handle_list(&mut usb, &loaded_masters, &loaded_personas);
+                provision::handle_list(&mut usb, &loaded_masters, &loaded_personas, Some(&policy_engine));
             }
 
             // 0x10 — encrypted NIP-46 request (NIP-44 transport layer)

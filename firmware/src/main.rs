@@ -107,14 +107,43 @@ use heartwood_common::types::{
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use secp256k1::Secp256k1;
 
-/// JSON for a FIRMWARE_INFO_RESPONSE — the running firmware version and board.
-/// Read-only and secret-free, so it is answered over USB in any mode.
+/// JSON for a FIRMWARE_INFO_RESPONSE — the running firmware version, board,
+/// uptime, and why the chip last reset. Read-only and secret-free, so it is
+/// answered over USB in any mode. The reset reason lets a manager (and an
+/// alpha tester) tell a deliberate restart from a crash.
 pub fn firmware_info_json() -> String {
     format!(
-        "{{\"version\":\"{}\",\"board\":\"{}\"}}",
+        "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\"}}",
         env!("CARGO_PKG_VERSION"),
-        board::BOARD
+        board::BOARD,
+        uptime_s(),
+        reset_reason_str(),
     )
+}
+
+/// Seconds since boot (esp_timer starts at reset).
+pub fn uptime_s() -> u64 {
+    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u64
+}
+
+/// Human-attributable cause of the last chip reset. "software-restart" covers
+/// the deliberate reboots (identity changes, network activation, removals);
+/// panic/watchdog/brownout are the crashes worth investigating.
+pub fn reset_reason_str() -> &'static str {
+    use esp_idf_svc::sys::*;
+    let reason = unsafe { esp_reset_reason() };
+    match reason {
+        r if r == esp_reset_reason_t_ESP_RST_POWERON => "power-on",
+        r if r == esp_reset_reason_t_ESP_RST_EXT => "external-reset",
+        r if r == esp_reset_reason_t_ESP_RST_SW => "software-restart",
+        r if r == esp_reset_reason_t_ESP_RST_PANIC => "panic",
+        r if r == esp_reset_reason_t_ESP_RST_INT_WDT => "interrupt-watchdog",
+        r if r == esp_reset_reason_t_ESP_RST_TASK_WDT => "task-watchdog",
+        r if r == esp_reset_reason_t_ESP_RST_WDT => "watchdog",
+        r if r == esp_reset_reason_t_ESP_RST_DEEPSLEEP => "deep-sleep-wake",
+        r if r == esp_reset_reason_t_ESP_RST_BROWNOUT => "brownout",
+        _ => "unknown",
+    }
 }
 
 /// Fill `buf` with hardware-RNG bytes, guaranteeing a true entropy source for
@@ -172,6 +201,7 @@ fn main() {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     log::info!("Heartwood ESP32 — Phase 4 (multi-master)");
+    log::info!("Last reset: {}", reset_reason_str());
 
     let peripherals = Peripherals::take().expect("failed to take peripherals");
 

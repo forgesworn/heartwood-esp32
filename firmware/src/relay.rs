@@ -3667,6 +3667,11 @@ fn dispatch_mgmt(
                 "relays_pinned": pool.pinned.iter().map(|p| p.url.clone()).collect::<Vec<_>>(),
                 "slots": ctx.policy_engine.list_slots(master_slot).len(),
                 "audit": sign_audit_json(ctx),
+                // Reboot attribution: managers show "up 3h, last restart:
+                // software" so a crash-reboot is visible instead of silently
+                // wiping the RAM audit and looking like relay flakiness.
+                "uptime_s": crate::uptime_s(),
+                "last_reset": crate::reset_reason_str(),
             }))
         }
 

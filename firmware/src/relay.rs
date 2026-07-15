@@ -2959,13 +2959,16 @@ fn dispatch_mgmt(
                 Other(usize),
                 Dial(String),
             }
+            // The named relay is where the APP listens — the ACK must land
+            // there. The arriving session is only the OPERATOR's path to us;
+            // being "in the primary rotation" is not enough, because the
+            // rotation serves one relay at a time and the app may not watch
+            // the one currently connected (seen live: ACK published to the
+            // arriving session while the app listened elsewhere → the pairing
+            // hung at 'verifying approval' despite a saved slot).
             let ack_target = match &client_relay {
                 None => AckTarget::Arriving,
-                Some(r) if same_relay(r, &s.url) || ctx.relays.iter().any(|c| same_relay(c, r)) => {
-                    // Served by the primary rotation: clients publish to every
-                    // configured relay, so the arriving session reaches them.
-                    AckTarget::Arriving
-                }
+                Some(r) if same_relay(r, &s.url) => AckTarget::Arriving,
                 Some(r) => match pool.others.iter().position(|o| same_relay(&o.url, r)) {
                     Some(i) => AckTarget::Other(i),
                     None => AckTarget::Dial(r.clone()),

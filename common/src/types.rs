@@ -86,6 +86,8 @@ pub const FRAME_TYPE_GET_NET_CONFIG: u8 = 0x5C;      // host -> device: empty; l
 pub const FRAME_TYPE_GET_NET_CONFIG_RESPONSE: u8 = 0x5D; // device -> host: JSON {revision,mode,ssid,relays,password_set,op_mgmt}
 pub const FRAME_TYPE_PATCH_NET_CONFIG: u8 = 0x5E;    // host -> device: JSON LocalNetConfigPatch; physical confirmation; reply ACK/NACK
 pub const FRAME_TYPE_SET_OPERATOR: u8 = 0x5F;        // host -> device: base_revision u32 BE + x-only pubkey 32; physical confirmation; reply ACK/NACK, then reboot
+pub const FRAME_TYPE_DERIVE_IDENTITY: u8 = 0x60;     // host -> device: [parent_slot u8][name utf8...]; device derives the nsec-tree child at purpose = name, index 0 from that master's tree root and stores it as a new bunker-mode master labelled with the name. No secret enters or leaves the host. Reply 0x61 or NACK.
+pub const FRAME_TYPE_DERIVE_IDENTITY_RESPONSE: u8 = 0x61; // device -> host: JSON { slot, label, npub, parent_slot, purpose, existing } — existing=true when the same child was already provisioned (idempotent re-derive)
 
 // --- OTA frame types ---
 pub const FRAME_TYPE_OTA_BEGIN: u8 = 0x30;

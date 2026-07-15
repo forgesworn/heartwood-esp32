@@ -6,6 +6,7 @@
 //   - Legacy compat: if payload is exactly 32 bytes, treat as tree-mnemonic with label "default".
 // Frame 0x04 (PROVISION_REMOVE): [slot_u8]
 // Frame 0x05 (PROVISION_LIST): (empty) → responds with 0x07 (PROVISION_LIST_RESPONSE)
+// Frame 0x60 (DERIVE_IDENTITY): [parent_slot_u8][name utf8...] → responds with 0x61
 
 use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
@@ -15,7 +16,8 @@ use std::sync::Arc;
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::frame::Frame;
 use heartwood_common::types::{
-    MasterMode, FRAME_TYPE_ACK, FRAME_TYPE_NACK, FRAME_TYPE_PROVISION_LIST_RESPONSE,
+    MasterMode, FRAME_TYPE_ACK, FRAME_TYPE_DERIVE_IDENTITY_RESPONSE, FRAME_TYPE_NACK,
+    FRAME_TYPE_PROVISION_LIST_RESPONSE,
 };
 
 use crate::button::Gesture;
@@ -102,6 +104,104 @@ fn store_master(
     let pubkey = xonly.serialize();
     let slot = masters::add_master(nvs, &secret, &label, mode, &pubkey)?;
     Ok(LoadedMaster { slot, secret, label, mode, pubkey, locked: false })
+}
+
+/// Handle a DERIVE_IDENTITY frame (0x60): [parent_slot][name utf8...].
+///
+/// Derives the nsec-tree child at purpose = name, index 0 from the parent
+/// master's tree root — the same chain NIP-46 heartwood_derive uses (mode →
+/// tree root → derive) — and stores the child as a new bunker-mode master
+/// labelled with the name. The host never sees any secret: the beauty of the
+/// tree is that the device already holds the root. Responds with 0x61 JSON
+/// { slot, label, npub, parent_slot, purpose, existing }.
+///
+/// Idempotent: deriving a name that already has a master slot (same pubkey)
+/// reports that slot with existing=true instead of duplicating it.
+pub fn handle_derive(
+    usb: &mut SerialPort<'_>,
+    frame: &Frame,
+    nvs: &mut EspNvs<NvsDefault>,
+    secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
+    display: &mut Display<'_>,
+    loaded: &[LoadedMaster],
+) -> Option<LoadedMaster> {
+    if frame.payload.len() < 2 {
+        log::warn!("DERIVE_IDENTITY payload too short");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"payload too short");
+        return None;
+    }
+    let parent_slot = frame.payload[0];
+    let name = match core::str::from_utf8(&frame.payload[1..]) {
+        Ok(n) => n.trim(),
+        Err(_) => {
+            protocol::write_frame(usb, FRAME_TYPE_NACK, b"name is not valid UTF-8");
+            return None;
+        }
+    };
+    if let Err(e) = heartwood_common::validate::validate_purpose(name) {
+        log::warn!("DERIVE_IDENTITY invalid name: {e}");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, e.as_bytes());
+        return None;
+    }
+
+    let Some(parent) = loaded.iter().find(|m| m.slot == parent_slot) else {
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"no such parent slot");
+        return None;
+    };
+    if parent.locked {
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"parent identity is PIN-locked");
+        return None;
+    }
+
+    let (child_secret, child_pubkey) =
+        match crate::nip46_handler::derive_identity(&parent.secret, parent.mode, name, 0) {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::error!("DERIVE_IDENTITY derivation failed: {e}");
+                protocol::write_frame(usb, FRAME_TYPE_NACK, b"derivation failed");
+                return None;
+            }
+        };
+
+    let respond = |usb: &mut SerialPort<'_>, slot: u8, label: &str, npub: &str, existing: bool| {
+        let json = serde_json::json!({
+            "slot": slot,
+            "label": label,
+            "npub": npub,
+            "parent_slot": parent_slot,
+            "purpose": name,
+            "existing": existing,
+        });
+        protocol::write_frame(usb, FRAME_TYPE_DERIVE_IDENTITY_RESPONSE, json.to_string().as_bytes());
+    };
+
+    // Re-deriving the same name from the same root lands on the same key —
+    // report the slot it already lives in rather than burning another one.
+    if let Some(existing) = loaded.iter().find(|m| m.pubkey == child_pubkey) {
+        let npub = encode_npub(&existing.pubkey);
+        log::info!("DERIVE_IDENTITY '{name}' already provisioned in slot {}", existing.slot);
+        respond(usb, existing.slot, &existing.label, &npub, true);
+        return None;
+    }
+
+    match store_master(nvs, *child_secret, name.to_string(), MasterMode::Bunker, secp) {
+        Ok(master) => {
+            let npub = encode_npub(&master.pubkey);
+            log::info!(
+                "Derived identity '{name}' from slot {parent_slot} into slot {}: {npub}",
+                master.slot
+            );
+            oled::show_npub(display, Some(name), &npub, None);
+            respond(usb, master.slot, &master.label, &npub, false);
+            Some(master)
+        }
+        Err(e) => {
+            log::error!("DERIVE_IDENTITY store failed: {e}");
+            oled::show_error(display, "Derive failed");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, e.as_bytes());
+            None
+        }
+    }
 }
 
 /// Handle a GENERATE_IDENTITY frame (0x57). The device generates its OWN seed

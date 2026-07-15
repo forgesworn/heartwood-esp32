@@ -93,6 +93,7 @@ use heartwood_common::types::{
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
+    FRAME_TYPE_DERIVE_IDENTITY,
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
@@ -565,6 +566,21 @@ fn main() {
                     _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display),
                 };
                 if let Some(master) = provisioned {
+                    loaded_masters.push(master);
+                }
+            }
+
+            // 0x60 — derive a named child identity on-device from an existing
+            // master's tree root. No secret enters or leaves the host.
+            FRAME_TYPE_DERIVE_IDENTITY => {
+                if let Some(master) = provision::handle_derive(
+                    &mut usb,
+                    &frame,
+                    &mut nvs,
+                    &secp,
+                    &mut display,
+                    &loaded_masters,
+                ) {
                     loaded_masters.push(master);
                 }
             }

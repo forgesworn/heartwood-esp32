@@ -139,6 +139,14 @@ const DISPLAY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Recent NIP-46 activity exposed to Sapwood over authenticated management.
 /// Entries are summaries only: no secrets, no encrypted payloads or plaintexts.
 const SIGN_AUDIT_MAX: usize = 32;
+/// How many of the stored audit entries the polled get_status response carries.
+/// The full ring is kept in RAM; but a status response that serialised all 32 —
+/// each re-encrypted, padded and base64'd for transport — is the largest, most
+/// allocation-heavy relay response on a no-PSRAM heap, and get_status is polled
+/// every few seconds. Reporting only the most recent window keeps the routine
+/// poll small enough to clear the transport heap guard, so the request log stays
+/// visible under the fragmentation that would otherwise force it dropped whole.
+const SIGN_AUDIT_REPORT_MAX: usize = 16;
 /// Ceiling on simultaneous relay sessions: the primary (rotating over the
 /// configured set) plus pinned relays joined at nostrconnect pairing. Each
 /// mbedTLS session costs ~40-50KB of heap; PSRAM is off and one build profile
@@ -1789,8 +1797,13 @@ fn push_sign_audit(ctx: &mut SignCtx, draft: SignAuditDraft, response_json: &str
 }
 
 fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
+    // Report only the most recent window (chronological order preserved). The
+    // full ring stays in RAM; capping what each poll transports is what keeps
+    // the response under the heap guard on a fragmented no-PSRAM board.
+    let skip = ctx.sign_audit.len().saturating_sub(SIGN_AUDIT_REPORT_MAX);
     ctx.sign_audit
         .iter()
+        .skip(skip)
         .map(|a| {
             serde_json::json!({
                 "seq": a.seq,
@@ -1803,6 +1816,38 @@ fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
             })
         })
         .collect()
+}
+
+/// A get_status response stripped to the essentials: identity counts, uptime,
+/// reset attribution, the crash breadcrumb and live heap health. It omits the
+/// audit ring and relay lists — the large arrays whose re-encrypted, padded and
+/// base64'd transport buffers are what abort the allocator on a fragmented
+/// no-PSRAM heap. get_status is polled every few seconds, so the poll that
+/// reports a starved heap must never itself be the allocation that reboots the
+/// signer. `truncated` tells the manager the request log was omitted this poll.
+fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize) -> String {
+    let master_hex = hex_encode(&ctx.masters[master_idx].pubkey);
+    serde_json::json!({
+        "id": id,
+        "result": {
+            "master_count": ctx.masters.len(),
+            "master_npub_hex": master_hex,
+            "mode": "wifi-standalone",
+            "relay": ctx.relay_url,
+            "uptime_s": crate::uptime_s(),
+            "last_reset": crate::reset_reason_str(),
+            "crashed_during": crate::crash_context(),
+            "free_heap": unsafe { esp_idf_svc::sys::esp_get_free_heap_size() },
+            "largest_free_block": unsafe {
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
+            } as u32,
+            "log_quiet": crate::log_quiet::read(ctx.nvs),
+            "version": env!("CARGO_PKG_VERSION"),
+            "board": crate::board::BOARD,
+            "truncated": true,
+        }
+    })
+    .to_string()
 }
 
 /// NIP-46 signing path (kind 24133): resolve the addressed identity → decrypt →
@@ -2240,6 +2285,35 @@ fn handle_mgmt_event(
     let response_json = match dispatch_result {
         Ok(result) => serde_json::json!({ "id": id, "result": result }).to_string(),
         Err(e) => serde_json::json!({ "id": id, "error": e }).to_string(),
+    };
+
+    // Heap guard on the management publish, mirroring the NIP-46 sign path
+    // above. Publishing re-encrypts, pads, base64-encodes and signs the response
+    // — several transient buffers a few times its size — and on a fragmented
+    // no-PSRAM heap a large one aborts the allocator and reboots the signer.
+    // get_status is the offender: polled every few seconds, it carries the whole
+    // audit ring plus relay lists (field-observed crash breadcrumb: "relay mgmt
+    // get_status"). Rather than crash, degrade. For get_status, resend the vital
+    // status without the heavy arrays, so the crash telemetry itself still
+    // reaches the manager; for any other method, a clean retryable error.
+    let response_json = if response_transportable(response_json.len()) {
+        response_json
+    } else if method == "get_status" {
+        log::warn!(
+            "[relay] get_status response ({} B) too large for free heap; sending minimal status",
+            response_json.len()
+        );
+        minimal_status_json(&id, ctx, master_idx)
+    } else {
+        log::warn!(
+            "[relay] mgmt {method} response ({} B) too large for free heap; returning error instead of risking a crash",
+            response_json.len()
+        );
+        serde_json::json!({
+            "id": id,
+            "error": "device low on memory; state unchanged, retry shortly"
+        })
+        .to_string()
     };
 
     let master = &ctx.masters[master_idx];

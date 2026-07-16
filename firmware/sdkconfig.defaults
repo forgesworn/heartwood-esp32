@@ -45,7 +45,7 @@ CONFIG_ESP_TASK_WDT_INIT=n
 # the Rust package/API version. scripts/build-firmware.sh rejects a drift before
 # compiling, so release images never fall back to a stale `git describe` tag.
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
-CONFIG_APP_PROJECT_VER="0.13.6"
+CONFIG_APP_PROJECT_VER="0.13.7"
 
 # OTA support.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

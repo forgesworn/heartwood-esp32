@@ -1606,7 +1606,14 @@ fn handle_profile_event(ev: &SignedEvent, ctx: &mut SignCtx) {
             Some(m) => (Some(m.name.as_str()), Some((m.w, m.h, m.avatar.as_slice()))),
             None => (fallback.as_deref(), None),
         };
+        // Breadcrumb only the render itself: a kind-0 event echoes back to the
+        // signer when its own profile is edited, and drawing the name/avatar is
+        // a non-request path the NIP-46 breadcrumb does not cover. Scoped tight
+        // and cleared straight after so an unrelated later crash is not
+        // misattributed to it.
+        crate::crash_crumb::set("relay profile render");
         crate::oled::show_npub(ctx.display, name, &npub, avatar);
+        crate::crash_crumb::clear();
     }
 }
 
@@ -2173,6 +2180,11 @@ fn handle_mgmt_event(
     mgmt::remember(&id, &mut ctx.seen, SEEN_MAX);
     log::info!("[relay] mgmt request: method={method} id={id} (operator authenticated)");
 
+    // Breadcrumb the management op so a crash while handling it (e.g. an
+    // identity-card render) is attributable on the next boot, not just the
+    // NIP-46 signing path. Cleared after dispatch returns.
+    crate::crash_crumb::set(&format!("relay mgmt {method}"));
+
     let dispatch_result = (|| {
         if mgmt::requires_mutation_challenge(&method) {
             let current = crate::management_challenge::current(
@@ -2212,6 +2224,9 @@ fn handle_mgmt_event(
         }
         dispatch_mgmt(&method, &req, s, ctx, master_idx, pool)
     })();
+    // Dispatch returned without a crash — retire the breadcrumb. (The response
+    // publish below is heap-guarded separately.)
+    crate::crash_crumb::clear();
 
     let response_json = match dispatch_result {
         Ok(result) => serde_json::json!({ "id": id, "result": result }).to_string(),

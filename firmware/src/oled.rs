@@ -174,6 +174,26 @@ fn layout(display: &Display<'_>) -> Layout {
     Layout::new(size.width as i32, size.height as i32)
 }
 
+/// Truncate `s` to at most `max` bytes WITHOUT splitting a UTF-8 character.
+///
+/// Every on-screen truncation of user or profile text must go through this.
+/// Plain byte slicing (`&s[..n]`) panics when `n` lands mid-codepoint, and
+/// Nostr profile names routinely carry emoji and accented characters — so a
+/// naive `&name[..12]` aborted the whole chip when a profile with an emoji was
+/// rendered (a sign-request preview or identity card), observed in the field as
+/// a panic reset while editing a profile, with plenty of free memory and no
+/// crash breadcrumb (the panic is in rendering, not request handling).
+fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Display an npub on the OLED with header and structured layout.
 ///
 /// Layout:
@@ -1341,7 +1361,7 @@ pub fn show_master_sign_request(
 
     // Header: SIGN AS {label}? — frame it as the question it is, like the
     // per-app screen, so it doesn't read as a bare label.
-    let label = &master_label[..master_label.len().min(12)];
+    let label = truncate_str(master_label, 12);
     let heading = format!("SIGN AS {}?", label);
     Text::new(&heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
@@ -1357,13 +1377,13 @@ pub fn show_master_sign_request(
         },
         None => method.to_string(),
     };
-    let method_str = &method_str[..method_str.len().min(l.chars_per_line(l.font_body()))];
+    let method_str = truncate_str(&method_str, l.chars_per_line(l.font_body()));
     Text::new(method_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
     // Content preview (small font)
     let max_preview = l.chars_per_line(l.font_small());
     let preview = if content_preview.len() > max_preview {
-        format!("{}...", &content_preview[..max_preview - 3])
+        format!("{}...", truncate_str(content_preview, max_preview - 3))
     } else {
         content_preview.to_string()
     };
@@ -1375,7 +1395,7 @@ pub fn show_master_sign_request(
         .text_color(ACCENT)
         .build();
     let hold = "Hold=sign tap=no";
-    let hold = &hold[..hold.len().min(l.chars_per_line(l.font_small()))];
+    let hold = truncate_str(hold, l.chars_per_line(l.font_small()));
     Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(display).ok();
 
     // Graphical countdown bar
@@ -1417,10 +1437,10 @@ pub fn show_auto_approved(display: &mut Display<'_>, master_label: &str, method:
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_body()))];
+    let label = truncate_str(master_label, l.chars_per_line(l.font_body()));
     Text::new(label, Point::new(l.sx(2), l.sy(32)), body).draw(display).ok();
 
-    let method_str = &method[..method.len().min(l.chars_per_line(l.font_small()))];
+    let method_str = truncate_str(method, l.chars_per_line(l.font_small()));
     Text::new(method_str, Point::new(l.sx(2), l.sy(46)), small).draw(display).ok();
 
     // Confirmation bar
@@ -2162,11 +2182,11 @@ pub fn show_identity_switch(
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    let label = &master_label[..master_label.len().min(l.chars_per_line(l.font_body()))];
+    let label = truncate_str(master_label, l.chars_per_line(l.font_body()));
     Text::new(label, Point::new(l.sx(2), l.sy(30)), body).draw(display).ok();
 
     let purpose_line = format!("-> {}", purpose);
-    let purpose_line = &purpose_line[..purpose_line.len().min(l.chars_per_line(l.font_body()))];
+    let purpose_line = truncate_str(&purpose_line, l.chars_per_line(l.font_body()));
     Text::new(&purpose_line, Point::new(l.sx(2), l.sy(46)), body).draw(display).ok();
 
     // npub in small font for more characters

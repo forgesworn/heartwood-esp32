@@ -22,6 +22,20 @@ CONFIG_IDF_TARGET="esp32s3"
 # Large stack for elliptic curve operations on Xtensa.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 
+# --- TLS memory: dynamic buffers (fragmentation fix) ---
+# By default mbedTLS pins a 16 KB RX + 4 KB TX content buffer for the whole
+# life of each TLS session. On a no-PSRAM board that permanent block sits in
+# the middle of the ~180 KB heap and, under the churn of a client bulk-
+# decrypting a whole message history (nostr.com fires dozens of nip44_decrypt
+# in a burst), fragments the heap until an allocation cannot be placed and the
+# allocator aborts -- observed in the field as the signer "restarting itself"
+# while decrypting. Dynamic buffers allocate the RX/TX buffer only while a
+# record is in flight and free it afterwards, so the big block is not pinned
+# and each transfer is right-sized. Compatible here: TLS 1.3 is off (relays use
+# 1.2), and it selects the already-enabled asymmetric content length. An
+# allocation failure now degrades to a TLS error -> clean reconnect, not a crash.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
 # Disable task watchdog -- provisioning blocks on stdin indefinitely.
 # SECURITY NOTE: In production (post-provisioning), watchdog should be enabled
 # to recover from hung signing operations. Tracked as a known hardening item.

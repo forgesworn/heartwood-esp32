@@ -7,7 +7,7 @@
 # (does k256 fault on lx106's unaligned access?) is a separate on-hardware step.
 [package]
 name = "heartwood-esp8266"
-version = "0.13.2"
+version = "0.13.3"
 edition = "2021"
 publish = false
 

@@ -196,13 +196,14 @@ impl SoftBackend {
             }
 
             Nip46Method::Nip44Encrypt => {
-                // params[0] = plaintext, params[1] = recipient x-only pubkey hex
-                let plaintext = req
+                // NIP-46 order: params[0] = recipient x-only pubkey hex,
+                // params[1] = plaintext (matches the firmware handler).
+                let recipient_hex = req
                     .params
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| BackendError::Internal("nip44_encrypt: missing params[0]".into()))?;
-                let recipient_hex = req
+                let plaintext = req
                     .params
                     .get(1)
                     .and_then(|v| v.as_str())
@@ -221,13 +222,14 @@ impl SoftBackend {
             }
 
             Nip46Method::Nip44Decrypt => {
-                // params[0] = ciphertext b64, params[1] = sender x-only pubkey hex
-                let ciphertext = req
+                // NIP-46 order: params[0] = sender x-only pubkey hex,
+                // params[1] = ciphertext (matches the firmware handler).
+                let sender_hex = req
                     .params
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| BackendError::Internal("nip44_decrypt: missing params[0]".into()))?;
-                let sender_hex = req
+                let ciphertext = req
                     .params
                     .get(1)
                     .and_then(|v| v.as_str())
@@ -1394,6 +1396,58 @@ mod tests {
 
         let slots = backend.list_slots(master_slot).unwrap();
         assert!(slots.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nip44_params_use_spec_order_pubkey_then_text() {
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+
+        backend.create_master("nip44-order").unwrap();
+        let master = {
+            let guard = backend.state.read().unwrap();
+            guard.as_ref().unwrap().keystore.masters[0].clone()
+        };
+
+        let peer_secret = [0x11u8; 32];
+        let peer_pubkey = derive_pubkey_hex(&peer_secret).unwrap();
+
+        // NIP-46 order: [third-party pubkey, plaintext] — the same order the
+        // firmware handler and nostr-tools clients (e.g. Bark) use.
+        let encrypt_req = nip46::Nip46Request {
+            id: "enc-1".into(),
+            method: "nip44_encrypt".into(),
+            params: vec![peer_pubkey.clone().into(), "hello bark".into()],
+            heartwood: None,
+        };
+        let encrypt_json = SoftBackend::dispatch_method(&master, &encrypt_req, "client").unwrap();
+        let ciphertext = serde_json::from_str::<Value>(&encrypt_json).unwrap()["result"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!ciphertext.is_empty());
+
+        let decrypt_req = nip46::Nip46Request {
+            id: "dec-1".into(),
+            method: "nip44_decrypt".into(),
+            params: vec![peer_pubkey.clone().into(), ciphertext.clone().into()],
+            heartwood: None,
+        };
+        let decrypt_json = SoftBackend::dispatch_method(&master, &decrypt_req, "client").unwrap();
+        let plaintext = serde_json::from_str::<Value>(&decrypt_json).unwrap()["result"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(plaintext, "hello bark");
+
+        // Reversed order (the old bug) must fail: params[0] is not a pubkey.
+        let reversed = nip46::Nip46Request {
+            id: "enc-2".into(),
+            method: "nip44_encrypt".into(),
+            params: vec!["hello bark".into(), peer_pubkey.into()],
+            heartwood: None,
+        };
+        assert!(SoftBackend::dispatch_method(&master, &reversed, "client").is_err());
     }
 
     #[test]

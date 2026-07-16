@@ -116,6 +116,15 @@ pub trait SigningBackend: Send + Sync {
         ciphertext: &str,
     ) -> Result<String, BackendError>;
 
+    /// Current master signing pubkeys this backend can answer for, beyond
+    /// any passed to the relay loop at startup. Soft mode's set changes at
+    /// runtime (unlock, master creation) and the relay loop polls this to
+    /// keep its subscription current. Backends whose pubkeys are fixed at
+    /// startup can rely on the default empty implementation.
+    fn signing_pubkeys(&self) -> Vec<[u8; 32]> {
+        Vec::new()
+    }
+
     /// Deprecated: envelope signing is now inline in handle_encrypted_request.
     /// Kept for backward compatibility with the approval flow.
     fn sign_envelope(

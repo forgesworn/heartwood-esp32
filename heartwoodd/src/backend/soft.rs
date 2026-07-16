@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::Instant;
 
-use k256::schnorr::signature::Signer;
+use k256::schnorr::signature::hazmat::PrehashSigner;
 use serde_json::Value;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -178,7 +178,10 @@ impl SoftBackend {
                 let signing_key =
                     k256::schnorr::SigningKey::from_bytes(&secret_bytes)
                         .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
-                let sig: k256::schnorr::Signature = signing_key.sign(&event_id);
+                // BIP340 over the 32-byte event id (see sign_envelope).
+                let sig: k256::schnorr::Signature = signing_key
+                    .sign_prehash(&event_id)
+                    .map_err(|e| BackendError::Internal(format!("sign event: {e}")))?;
                 let sig_hex = hex_encode(&sig.to_bytes());
 
                 let signed = SignedEvent {
@@ -328,7 +331,12 @@ impl SoftBackend {
 
         let signing_key = k256::schnorr::SigningKey::from_bytes(&secret_bytes)
             .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
-        let sig: k256::schnorr::Signature = signing_key.sign(&event_id);
+        // BIP340 over the 32-byte event id itself. Signer::sign would prehash
+        // the id with SHA-256 first, producing signatures no Nostr client
+        // (nostr-tools verifyEvent, relays) accepts.
+        let sig: k256::schnorr::Signature = signing_key
+            .sign_prehash(&event_id)
+            .map_err(|e| BackendError::Internal(format!("sign event: {e}")))?;
         let sig_hex = hex_encode(&sig.to_bytes());
 
         let signed = SignedEvent {
@@ -353,6 +361,25 @@ impl SoftBackend {
 impl SigningBackend for SoftBackend {
     fn tier(&self) -> Tier {
         Tier::Soft
+    }
+
+    fn signing_pubkeys(&self) -> Vec<[u8; 32]> {
+        let Ok(guard) = self.state.read() else {
+            return Vec::new();
+        };
+        let Some(state) = guard.as_ref() else {
+            return Vec::new();
+        };
+        state
+            .keystore
+            .masters
+            .iter()
+            .filter_map(|master| {
+                let secret = hex_to_32(&master.secret_key).ok()?;
+                let pubkey_hex = derive_pubkey_hex(&secret).ok()?;
+                hex_to_32(&pubkey_hex).ok()
+            })
+            .collect()
     }
 
     fn is_locked(&self) -> bool {
@@ -747,7 +774,12 @@ impl SigningBackend for SoftBackend {
 
         let signing_key = k256::schnorr::SigningKey::from_bytes(&secret_bytes)
             .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
-        let sig: k256::schnorr::Signature = signing_key.sign(&event_id);
+        // BIP340 over the 32-byte event id itself. Signer::sign would prehash
+        // the id with SHA-256 first, producing signatures no Nostr client
+        // (nostr-tools verifyEvent, relays) accepts.
+        let sig: k256::schnorr::Signature = signing_key
+            .sign_prehash(&event_id)
+            .map_err(|e| BackendError::Internal(format!("sign event: {e}")))?;
         let sig_hex = hex_encode(&sig.to_bytes());
 
         let signed = SignedEvent {
@@ -1448,6 +1480,58 @@ mod tests {
             heartwood: None,
         };
         assert!(SoftBackend::dispatch_method(&master, &reversed, "client").is_err());
+    }
+
+    #[test]
+    fn envelope_and_signed_events_verify_as_bip340_over_event_id() {
+        use k256::schnorr::signature::hazmat::PrehashVerifier;
+
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+        backend.create_master("sig-check").unwrap();
+        let master = {
+            let guard = backend.state.read().unwrap();
+            guard.as_ref().unwrap().keystore.masters[0].clone()
+        };
+        let secret = hex_to_32(&master.secret_key).unwrap();
+        let master_pubkey_hex = derive_pubkey_hex(&secret).unwrap();
+        let master_pubkey = hex_to_32(&master_pubkey_hex).unwrap();
+
+        let verify = |event_json: &str| {
+            let ev: Value = serde_json::from_str(event_json).unwrap();
+            let id = hex_to_32(ev["id"].as_str().unwrap()).unwrap();
+            let sig_hex = ev["sig"].as_str().unwrap();
+            let sig_bytes: Vec<u8> = (0..sig_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&sig_hex[i..i + 2], 16).unwrap())
+                .collect();
+            let sig = k256::schnorr::Signature::try_from(sig_bytes.as_slice()).unwrap();
+            let vk = k256::schnorr::VerifyingKey::from_bytes(&master_pubkey).unwrap();
+            // Nostr clients verify BIP340 over the raw 32-byte event id.
+            vk.verify_prehash(&id, &sig).unwrap();
+        };
+
+        // Relay envelope.
+        let envelope = backend
+            .sign_envelope(&master_pubkey, &[0x22u8; 32], 1_784_000_000, "cipher")
+            .unwrap();
+        verify(&envelope);
+
+        // sign_event response.
+        let req = nip46::Nip46Request {
+            id: "sig-1".into(),
+            method: "sign_event".into(),
+            params: vec![serde_json::json!(
+                "{\"kind\":1,\"created_at\":1784000000,\"tags\":[],\"content\":\"hi\"}"
+            )],
+            heartwood: None,
+        };
+        let response = SoftBackend::dispatch_method(&master, &req, "client").unwrap();
+        let signed_json = serde_json::from_str::<Value>(&response).unwrap()["result"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        verify(&signed_json);
     }
 
     #[test]

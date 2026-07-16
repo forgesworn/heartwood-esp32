@@ -59,7 +59,45 @@ pub async fn run_event_loop(
     let master_labels = Arc::new(master_labels.clone());
     let client_labels = Arc::new(client_labels.clone());
 
-    client
+    // Soft mode grows masters at runtime (unlock, master creation), and the
+    // startup subscription only covers the pubkeys known then. Poll the
+    // backend and subscribe to any new pubkeys so their requests reach us
+    // without restarting the loop.
+    let refresher = {
+        let client = client.clone();
+        let backend = Arc::clone(&backend);
+        let mut known: HashSet<[u8; 32]> = accepted.iter().copied().collect();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let fresh: Vec<[u8; 32]> = backend
+                    .signing_pubkeys()
+                    .into_iter()
+                    .filter(|pk| !known.contains(pk))
+                    .collect();
+                if fresh.is_empty() {
+                    continue;
+                }
+                let pubkeys: Vec<PublicKey> = fresh
+                    .iter()
+                    .filter_map(|bytes| PublicKey::from_slice(bytes).ok())
+                    .collect();
+                let filter = Filter::new()
+                    .kind(Kind::NostrConnect)
+                    .pubkeys(pubkeys)
+                    .since(Timestamp::now());
+                match client.subscribe(filter, None).await {
+                    Ok(_) => {
+                        log::info!("Subscribed to {} new master pubkey(s)", fresh.len());
+                        known.extend(fresh);
+                    }
+                    Err(e) => log::warn!("Subscription refresh failed: {e}"),
+                }
+            }
+        })
+    };
+
+    let notifications = client
         .handle_notifications(|notification| {
             let backend = Arc::clone(&backend);
             let client_clone = client_clone.clone();
@@ -79,13 +117,20 @@ pub async fn run_event_loop(
                 }
 
                 // Identify the addressed master from the event's p-tag.
+                // Masters created after startup are accepted via the
+                // backend's live pubkey list.
                 let master_pubkey_bytes: [u8; 32] = match event
                     .tags
                     .public_keys()
                     .next()
                     .map(|pk| pk.to_bytes())
                 {
-                    Some(bytes) if accepted.contains(&bytes) => bytes,
+                    Some(bytes)
+                        if accepted.contains(&bytes)
+                            || backend.signing_pubkeys().contains(&bytes) =>
+                    {
+                        bytes
+                    }
                     Some(bytes) => {
                         log::warn!(
                             "NIP-46 request addressed to unknown master {} -- ignoring",
@@ -149,7 +194,10 @@ pub async fn run_event_loop(
                 Ok(false) // keep listening
             }
         })
-        .await?;
+        .await;
+
+    refresher.abort();
+    notifications?;
 
     Ok(())
 }

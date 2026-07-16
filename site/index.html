@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Heartwood — the Nostr signer that keeps keys on a chip</title>
+<title>Heartwood: the Nostr signer that keeps keys on a chip</title>
 <meta name="description" content="Heartwood is an open hardware signer for Nostr on ESP32. Keys are generated on the device from hardware entropy and never leave it; a physical button approves what policies don't. Rust, NIP-46, MIT.">
 <link rel="canonical" href="https://heartwood.forgesworn.dev/">
-<meta property="og:title" content="Heartwood — the Nostr signer that keeps keys on a chip">
+<meta property="og:title" content="Heartwood: the Nostr signer that keeps keys on a chip">
 <meta property="og:description" content="An open hardware signer on ESP32. Keys are born on the device and never leave it; a physical button approves what policies don't.">
 <meta property="og:url" content="https://heartwood.forgesworn.dev/">
 <meta property="og:type" content="website">
@@ -50,30 +50,22 @@
     <p class="hero-meta reveal r5">Rust firmware &nbsp;·&nbsp; four boards &nbsp;·&nbsp; NIP&#8209;46 / NIP&#8209;44 &nbsp;·&nbsp; MIT &nbsp;·&nbsp; v0.13.7</p>
   </div>
 
-  <!-- Fig. 1 — the boot cat, pixel-for-pixel from the firmware's sprite sheet -->
+  <!-- Fig. 1: the boot sequence, frame for frame from the firmware -->
   <figure class="plate reveal r3" aria-labelledby="fig1-caption">
-    <div class="oled" role="img" aria-label="Heartwood's OLED boot animation: a pixel-art cat walking along a scrolling ground">
-      <svg viewBox="0 0 128 64" shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg">
-        <g class="cat d1" transform="translate(38,3)">
-          <g transform="scale(0.98)"><g fill="currentColor"><rect x="2" y="0" width="4" height="1"/><rect x="2" y="1" width="4" height="1"/><rect x="2" y="2" width="6" height="1"/><rect x="3" y="3" width="4" height="1"/><rect x="4" y="4" width="5" height="1"/><rect x="4" y="5" width="5" height="1"/><rect x="4" y="6" width="5" height="1"/><rect x="4" y="7" width="5" height="1"/><rect x="4" y="8" width="5" height="1"/><rect x="3" y="9" width="6" height="1"/><rect x="3" y="10" width="4" height="1"/><rect x="3" y="11" width="4" height="1"/><rect x="3" y="12" width="4" height="1"/><rect x="1" y="13" width="5" height="1"/><rect x="1" y="14" width="5" height="1"/><rect x="46" y="14" width="1" height="1"/><rect x="49" y="14" width="2" height="1"/><rect x="1" y="15" width="5" height="1"/><rect x="45" y="15" width="2" height="1"/><rect x="48" y="15" width="2" height="1"/><rect x="1" y="16" width="5" height="1"/><rect x="45" y="16" width="5" height="1"/><rect x="1" y="17" width="5" height="1"/><rect x="43" y="17" width="7" height="1"/><rect x="2" y="18" width="4" height="1"/><rect x="43" y="18" width="8" height="1"/><rect x="2" y="19" width="5" height="1"/><rect x="42" y="19" width="10" height="1"/><rect x="2" y="20" width="5" height="1"/><rect x="41" y="20" width="11" height="1"/><rect x="4" y="21" width="4" height="1"/><rect x="41" y="21" width="12" height="1"/><rect x="4" y="22" width="5" height="1"/><rect x="39" y="22" width="11" height="1"/><rect x="51" y="22" width="2" height="1"/><rect x="4" y="23" width="6" height="1"/><rect x="13" y="23" width="14" height="1"/><rect x="39" y="23" width="11" height="1"/><rect x="51" y="23" width="2" height="1"/><rect x="4" y="24" width="24" height="1"/><rect x="37" y="24" width="18" height="1"/><rect x="6" y="25" width="49" height="1"/><rect x="6" y="26" width="49" height="1"/><rect x="7" y="27" width="47" height="1"/><rect x="7" y="28" width="47" height="1"/><rect x="7" y="29" width="46" height="1"/><rect x="5" y="30" width="42" height="1"/><rect x="5" y="31" width="42" height="1"/><rect x="5" y="32" width="40" height="1"/><rect x="5" y="33" width="40" height="1"/><rect x="5" y="34" width="40" height="1"/><rect x="5" y="35" width="39" height="1"/><rect x="5" y="36" width="38" height="1"/><rect x="5" y="37" width="39" height="1"/><rect x="5" y="38" width="37" height="1"/><rect x="5" y="39" width="37" height="1"/><rect x="4" y="40" width="38" height="1"/><rect x="4" y="41" width="18" height="1"/><rect x="24" y="41" width="18" height="1"/><rect x="3" y="42" width="19" height="1"/><rect x="27" y="42" width="15" height="1"/><rect x="2" y="43" width="11" height="1"/><rect x="14" y="43" width="8" height="1"/><rect x="28" y="43" width="15" height="1"/><rect x="2" y="44" width="10" height="1"/><rect x="14" y="44" width="7" height="1"/><rect x="28" y="44" width="6" height="1"/><rect x="36" y="44" width="7" height="1"/><rect x="0" y="45" width="11" height="1"/><rect x="14" y="45" width="6" height="1"/><rect x="28" y="45" width="6" height="1"/><rect x="37" y="45" width="7" height="1"/><rect x="0" y="46" width="9" height="1"/><rect x="12" y="46" width="8" height="1"/><rect x="28" y="46" width="6" height="1"/><rect x="37" y="46" width="7" height="1"/><rect x="0" y="47" width="6" height="1"/><rect x="13" y="47" width="6" height="1"/><rect x="28" y="47" width="5" height="1"/><rect x="39" y="47" width="6" height="1"/><rect x="0" y="48" width="5" height="1"/><rect x="12" y="48" width="6" height="1"/><rect x="28" y="48" width="5" height="1"/><rect x="39" y="48" width="6" height="1"/><rect x="0" y="49" width="4" height="1"/><rect x="13" y="49" width="5" height="1"/><rect x="28" y="49" width="4" height="1"/><rect x="40" y="49" width="5" height="1"/><rect x="0" y="50" width="4" height="1"/><rect x="14" y="50" width="4" height="1"/><rect x="27" y="50" width="5" height="1"/><rect x="41" y="50" width="5" height="1"/><rect x="0" y="51" width="4" height="1"/><rect x="15" y="51" width="5" height="1"/><rect x="27" y="51" width="5" height="1"/><rect x="41" y="51" width="6" height="1"/><rect x="0" y="52" width="3" height="1"/><rect x="15" y="52" width="5" height="1"/><rect x="27" y="52" width="5" height="1"/><rect x="43" y="52" width="4" height="1"/><rect x="0" y="53" width="4" height="1"/><rect x="16" y="53" width="6" height="1"/><rect x="28" y="53" width="4" height="1"/><rect x="43" y="53" width="6" height="1"/><rect x="0" y="54" width="5" height="1"/><rect x="17" y="54" width="5" height="1"/><rect x="27" y="54" width="6" height="1"/><rect x="44" y="54" width="6" height="1"/><rect x="1" y="55" width="4" height="1"/><rect x="17" y="55" width="5" height="1"/><rect x="28" y="55" width="5" height="1"/><rect x="45" y="55" width="5" height="1"/></g></g>
-        </g>
-        <!-- scrolling ground -->
-        <g class="ground" fill="currentColor">
-          <rect x="2" y="60" width="5" height="1"/><rect x="12" y="60" width="8" height="1"/>
-          <rect x="26" y="60" width="4" height="1"/><rect x="36" y="60" width="10" height="1"/>
-          <rect x="52" y="60" width="6" height="1"/><rect x="64" y="60" width="9" height="1"/>
-          <rect x="79" y="60" width="4" height="1"/><rect x="89" y="60" width="11" height="1"/>
-          <rect x="106" y="60" width="5" height="1"/><rect x="117" y="60" width="8" height="1"/>
-        </g>
-      </svg>
+    <div class="oled">
+      <picture>
+        <source srcset="/boot-still.png" media="(prefers-reduced-motion: reduce)">
+        <img src="/boot.gif" width="128" height="64" alt="Heartwood's OLED boot sequence: a pixel cat walks along a scrolling ground, meets a ghost of itself at centre screen, then HEARTWOOD decrypts letter by letter in rainbow colours with the firmware version beneath">
+      </picture>
     </div>
     <figcaption id="fig1-caption">
-      <span class="fig-no">Fig. 1</span> — The boot animation, pixel for pixel from the
-      firmware's sprite sheet. A cat walks, the ground scrolls, then
+      <span class="fig-no">Fig. 1</span>. The boot sequence, frame for frame from the
+      firmware: the cat walks, suffers a moment of déjà vu, and
       <span class="mono">HEARTWOOD</span> decrypts.
     </figcaption>
   </figure>
 </section>
+
 
 <!-- ======================= 01 · WHY ======================= -->
 <section class="section" id="why">
@@ -84,7 +76,7 @@
   <div class="section-body two-col">
     <p>
       A Nostr key has no password reset. Yet most of them live inside the most
-      attacked software their owners run — a browser profile, a phone app, a
+      attacked software their owners run: a browser profile, a phone app, a
       server's home directory. One phishing page, one malicious update, one bad
       backup, and the identity is someone else's forever.
     </p>
@@ -106,7 +98,7 @@
   </div>
   <div class="section-body">
     <p>
-      One Rust firmware, four boards — from a bare OLED module to a colour display
+      One Rust firmware and four boards, from a bare OLED module to a colour display
       with two buttons. The board is chosen at compile time and every image is
       board-tagged, so the wrong binary simply won't flash.
     </p>
@@ -123,7 +115,7 @@
     </div>
     <div class="spec-row">
       <dt>LilyGO T&#8209;Display</dt>
-      <dd>Classic ESP32 with a colour TFT and two physical buttons — one to
+      <dd>Classic ESP32 with a colour TFT and two physical buttons: one to
       approve, one to deny.</dd>
     </div>
     <div class="spec-row">
@@ -149,13 +141,13 @@
     <div class="spec-row">
       <dt>Born on the device</dt>
       <dd>The seed is drawn from the chip's hardware entropy source, shown once on
-      the display at creation, and never leaves by any code path — not USB, not
+      the display at creation, and never leaves by any code path: not USB, not
       relay, not backup. Up to eight master identities per device.</dd>
     </div>
     <div class="spec-row">
       <dt>Policies that fail closed</dt>
       <dd>Each client gets an exact allowlist of methods and event kinds. Inside
-      the ceiling, signing is unattended; outside it, the request is denied — and
+      the ceiling, signing is unattended; outside it, the request is denied, and
       no button press can escalate it after the fact.</dd>
     </div>
     <div class="spec-row">
@@ -174,13 +166,13 @@
     <div class="spec-row">
       <dt>Sealed at rest</dt>
       <dd>Set a PIN and each seed is stored encrypted, with no PIN hash kept on
-      the device — every guess pays the full key-derivation cost, and five wrong
+      the device. Every guess pays the full key-derivation cost, and five wrong
       attempts wipe the device clean.</dd>
     </div>
   </dl>
   <p class="aside">
     Honest limits: the default build leaves ESP32 flash encryption and secure boot
-    off — burning eFuses is irreversible, so that stays your call. Without a PIN,
+    off, because burning eFuses is irreversible and that stays your call. Without a PIN,
     someone holding the board can read flash. Set the PIN, and treat physical
     custody as part of the model: Heartwood is a signer you own, not a bank vault.
     The full write-up is in
@@ -206,8 +198,8 @@
     <p>
       Plug an ESP32 in and it becomes <em>hard mode</em>: the daemon stops holding
       anything at all and turns into zero-trust plumbing between your relays and
-      the chip. Start soft tonight, move to hardware whenever — your own bunker,
-      no third party, and your apps keep the same connection either way.
+      the chip. Start soft tonight and move to hardware whenever. It stays your
+      own bunker, no third party, and your apps keep the same connection either way.
     </p>
     <p>
       Just need the plumbing? A standalone keyless bridge,
@@ -242,7 +234,7 @@
 
         <rect class="node" x="490" y="60" width="160" height="76" rx="8"/>
         <text class="nlbl" x="570" y="92" text-anchor="middle">PI / SERVER</text>
-        <text class="nsub" x="570" y="113" text-anchor="middle">heartwoodd — keyless</text>
+        <text class="nsub" x="570" y="113" text-anchor="middle">heartwoodd · keyless</text>
 
         <path class="wire" d="M 650 98 L 700 98"/>
         <text class="wlbl" x="675" y="88" text-anchor="middle">USB</text>
@@ -257,7 +249,7 @@
       </g>
     </svg>
     <figcaption id="fig2-caption">
-      <span class="fig-no">Fig. 2</span> — Nothing left of the device ever holds a key.
+      <span class="fig-no">Fig. 2</span>. Nothing left of the device ever holds a key.
       Compromise the browser, the phone, the Pi, or the relay, and you hold the ability
       to <em>ask</em>.
     </figcaption>
@@ -273,14 +265,14 @@
   <ol class="steps">
     <li>
       <span class="step-no">i</span>
-      <p>Pick a board — any of the four above, from the usual suspects for a few
+      <p>Pick a board, any of the four above, from the usual suspects for a few
       pounds. No soldering.</p>
     </li>
     <li>
       <span class="step-no">ii</span>
       <p>Flash and provision from your browser with
-      <a href="https://sapwood.forgesworn.dev">Sapwood</a> (Web Serial — Chromium
-      browsers), or fully offline with the <code>provision</code> CLI for an
+      <a href="https://sapwood.forgesworn.dev">Sapwood</a> (Web Serial, so a Chromium
+      browser), or fully offline with the <code>provision</code> CLI for an
       air-gapped setup.</p>
     </li>
     <li>
@@ -311,7 +303,7 @@ espflash flash target/firmware-v4.elf</code></pre>
     <span class="family-card current">
       <span class="family-ring heart-swatch"></span>
       <h3>Heartwood</h3>
-      <p>The core. Keys on a chip behind a physical button — you are here.</p>
+      <p>The core. Keys on a chip behind a physical button. You are here.</p>
     </span>
     <a class="family-card" href="https://sapwood.forgesworn.dev/about/">
       <span class="family-ring sap-swatch"></span>
@@ -343,7 +335,7 @@ espflash flash target/firmware-v4.elf</code></pre>
   </p>
   <p class="colophon-note">
     MIT licence. This page is static: no scripts, no cookies, no analytics, no
-    third-party requests — the fonts are served from this domain. Like the signer,
+    third-party requests. The fonts are served from this domain. Like the signer,
     it keeps nothing of yours.
   </p>
 </footer>

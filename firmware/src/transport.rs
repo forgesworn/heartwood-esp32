@@ -166,6 +166,20 @@ pub fn handle_encrypted_request(
             .then(|| policy_engine.snapshot_slot_state(owning_slot))
     });
 
+    // Breadcrumb the in-flight request so a crash while handling it is
+    // attributable on the next boot (see crash_crumb). Cleared after publish.
+    if let Some(req) = &parsed_request {
+        let mut crumb = format!("usb {}", req.method);
+        if matches!(nip46::Nip46Method::from_str(&req.method), nip46::Nip46Method::SignEvent) {
+            if let Ok(ev) = nip46::parse_unsigned_event(&req.params) {
+                crumb.push_str(&format!(" kind {}", ev.kind));
+            }
+        }
+        crate::crash_crumb::set(&crumb);
+    } else {
+        crate::crash_crumb::set("usb request (unparsed)");
+    }
+
     // Dispatch to the handler — always returns a JSON response string.
     let mut response_json = crate::nip46_handler::handle_request(
         &inner_frame,
@@ -307,6 +321,9 @@ pub fn handle_encrypted_request(
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
         }
     }
+
+    // Handled without a crash — retire the breadcrumb.
+    crate::crash_crumb::clear();
 }
 
 /// Fill a 32-byte buffer with cryptographically random bytes from the ESP-IDF

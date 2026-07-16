@@ -47,6 +47,7 @@ mod identity_cache;
 mod identity_meta;
 mod layout;
 mod log_quiet;
+mod crash_crumb;
 mod management_challenge;
 mod palette;
 mod masters;
@@ -113,13 +114,36 @@ use secp256k1::Secp256k1;
 /// answered over USB in any mode. The reset reason lets a manager (and an
 /// alpha tester) tell a deliberate restart from a crash.
 pub fn firmware_info_json() -> String {
+    let crash = crash_context()
+        .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
+        .unwrap_or_default();
     format!(
-        "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\"}}",
+        "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\"{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
         reset_reason_str(),
+        crash,
     )
+}
+
+/// Minimal JSON string escaping for the small, non-secret breadcrumb labels.
+pub fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Seconds since boot (esp_timer starts at reset).
@@ -145,6 +169,42 @@ pub fn reset_reason_str() -> &'static str {
         r if r == esp_reset_reason_t_ESP_RST_BROWNOUT => "brownout",
         _ => "unknown",
     }
+}
+
+/// Whether the last reset was a crash (not a planned restart or power event).
+fn reset_was_crash() -> bool {
+    matches!(
+        reset_reason_str(),
+        "panic" | "interrupt-watchdog" | "task-watchdog" | "watchdog" | "brownout"
+    )
+}
+
+use std::sync::OnceLock;
+
+/// The operation in flight when the signer last crashed, resolved once at boot
+/// from the RTC breadcrumb. `Some` only after a crash reset that left a valid
+/// crumb; reported in telemetry so the owner sees "crashed on: <op>".
+static CRASH_CONTEXT: OnceLock<Option<String>> = OnceLock::new();
+
+/// Resolve the crash context once, at boot. If the last reset was a crash and
+/// a breadcrumb survived, keep it; otherwise clear any stale crumb so a later
+/// clean restart never inherits it.
+fn init_crash_context() {
+    let ctx = if reset_was_crash() {
+        crash_crumb::take()
+    } else {
+        crash_crumb::clear();
+        None
+    };
+    if let Some(op) = &ctx {
+        log::error!("Recovered from a crash during: {op}");
+    }
+    let _ = CRASH_CONTEXT.set(ctx);
+}
+
+/// The operation the signer was doing when it last crashed, if known.
+pub fn crash_context() -> Option<&'static str> {
+    CRASH_CONTEXT.get().and_then(|o| o.as_deref())
 }
 
 /// Fill `buf` with hardware-RNG bytes, guaranteeing a true entropy source for
@@ -203,6 +263,7 @@ fn main() {
 
     log::info!("Heartwood ESP32 — Phase 4 (multi-master)");
     log::info!("Last reset: {}", reset_reason_str());
+    init_crash_context();
 
     let peripherals = Peripherals::take().expect("failed to take peripherals");
 

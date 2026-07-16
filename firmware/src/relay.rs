@@ -1888,6 +1888,22 @@ fn handle_nip46_event(
             .then(|| ctx.policy_engine.snapshot_slot_state(slot))
     });
 
+    // Breadcrumb the in-flight request so a crash while handling it is
+    // attributable on the next boot. Cleared right after the handler returns;
+    // it only survives if the chip resets before that (panic/watchdog).
+    if let Some(req) = &parsed_request {
+        let mut crumb = format!("relay {}", req.method);
+        if matches!(nip46::Nip46Method::from_str(&req.method), nip46::Nip46Method::SignEvent) {
+            if let Ok(ev) = nip46::parse_unsigned_event(&req.params) {
+                crumb.push_str(&format!(" kind {}", ev.kind));
+            }
+        }
+        crumb.push_str(&format!(" from {}", &ev.pubkey[..ev.pubkey.len().min(8)]));
+        crate::crash_crumb::set(&crumb);
+    } else {
+        crate::crash_crumb::set("relay request (unparsed)");
+    }
+
     // Dispatch — same handler as the USB path. sign_event is ButtonRequired
     // until the slot is physically button-upgraded; auto-approve covers the
     // safe methods and post-upgrade signing.
@@ -1965,7 +1981,9 @@ fn handle_nip46_event(
         }
     }
 
-    sign_and_publish(
+    // The publish (re-encrypt + inline envelope sign) is the other crash-prone
+    // step on a fragmented no-PSRAM heap, so keep the breadcrumb set across it.
+    let published = sign_and_publish(
         tls,
         ctx.secp,
         &signing_secret,
@@ -1974,7 +1992,10 @@ fn handle_nip46_event(
         NIP46_KIND,
         ev.created_at,
         &response_json,
-    )
+    );
+    // Handled without a crash — retire the breadcrumb.
+    crate::crash_crumb::clear();
+    published
 }
 
 /// Relay-management path (kind 24134): authenticate the author against the
@@ -3691,6 +3712,7 @@ fn dispatch_mgmt(
                 // wiping the RAM audit and looking like relay flakiness.
                 "uptime_s": crate::uptime_s(),
                 "last_reset": crate::reset_reason_str(),
+                "crashed_during": crate::crash_context(),
                 "log_quiet": crate::log_quiet::read(ctx.nvs),
                 // Running firmware, so managers can show version state over
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.

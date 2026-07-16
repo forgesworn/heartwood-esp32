@@ -162,6 +162,32 @@ const DIAL_MIN_FREE_HEAP: u32 = 70_000;
 /// 16KB record buffer in one piece, so total-free alone is not enough on a
 /// fragmented heap.
 const DIAL_MIN_LARGEST_BLOCK: usize = 24_000;
+/// Whether the free heap can safely transport a response of `len` bytes.
+///
+/// Re-encrypting the response pads it (NIP-44, up to ~2x), base64-encodes it
+/// (~1.4x), and builds + signs the envelope — several transient buffers whose
+/// combined peak is a few times the response size. Require the largest single
+/// free block to hold ~3x the response plus a working margin, so a big
+/// response (a large nip44_decrypt plaintext) degrades to a clean error rather
+/// than aborting the allocator and rebooting the signer. Small responses (the
+/// overwhelming majority: signatures, pubkeys, short DMs) always pass.
+pub(crate) fn response_transportable(len: usize) -> bool {
+    // Two ways the publish aborts the allocator, both covered here:
+    //  - a LARGE response (e.g. a big nip44_decrypt plaintext) whose padded +
+    //    base64 + envelope buffers need several times its size, and
+    //  - a SMALL response arriving when the heap is already fragmented low
+    //    (e.g. mid-TLS), where even a modest buffer cannot be placed.
+    // Require the largest single free block to hold ~3x the response, but never
+    // operate below a 16 KB working floor. Legitimate small responses on a
+    // healthy heap (>100 KB free) always pass; only genuine memory pressure
+    // degrades to a clean error instead of a reboot.
+    let need = len.saturating_mul(3).saturating_add(8_192).max(16_384);
+    let largest = unsafe {
+        esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
+    };
+    largest >= need
+}
+
 /// NVS key the pinned-relay list is persisted under (JSON array).
 const PINNED_NVS_KEY: &str = "pinned_rly";
 /// A candidate that reconnects but is never committed rolls back automatically.
@@ -1898,7 +1924,10 @@ fn handle_nip46_event(
                 crumb.push_str(&format!(" kind {}", ev.kind));
             }
         }
-        crumb.push_str(&format!(" from {}", &ev.pubkey[..ev.pubkey.len().min(8)]));
+        // Free heap at request time distinguishes a big-response OOM from a
+        // fragmentation crash on a small request — the field diagnostic.
+        let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+        crumb.push_str(&format!(" from {} (heap {}k)", &ev.pubkey[..ev.pubkey.len().min(8)], free / 1024));
         crate::crash_crumb::set(&crumb);
     } else {
         crate::crash_crumb::set("relay request (unparsed)");
@@ -1979,6 +2008,28 @@ fn handle_nip46_event(
                 });
             }
         }
+    }
+
+    // Heap guard before the response re-encryption. Publishing re-encrypts the
+    // response (NIP-44 pads to the next power of two), base64-encodes it, and
+    // builds + signs the envelope — several transient buffers a few times the
+    // response size. On a no-PSRAM board with a fragmented heap a large
+    // response (e.g. a big nip44_decrypt plaintext, which nostr.com sends after
+    // login) would abort the allocator, rebooting the signer. Rather than
+    // crash, substitute a small error so the app sees a clean failure and the
+    // signer stays up. Verified in the field by the crash breadcrumb naming
+    // "relay nip44_decrypt".
+    if !response_transportable(response_json.len()) {
+        log::warn!(
+            "[relay] response for {request_id} ({} B) too large for free heap; returning error instead of risking a crash",
+            response_json.len()
+        );
+        response_json = nip46::build_error_response(
+            &request_id,
+            -4,
+            "response too large for this signer's memory; the request was not completed",
+        )
+        .unwrap_or_default();
     }
 
     // The publish (re-encrypt + inline envelope sign) is the other crash-prone

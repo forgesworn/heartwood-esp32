@@ -252,6 +252,23 @@ pub fn handle_encrypted_request(
     drop(inner_frame);
     drop(plaintext_json);
 
+    // Heap guard: a large response (e.g. a big nip44_decrypt plaintext) would
+    // need several transient buffers a few times its size to re-encrypt and
+    // frame — enough to abort the allocator on a fragmented no-PSRAM heap.
+    // Substitute a small error rather than crash. See relay::response_transportable.
+    if !crate::relay::response_transportable(response_json.len()) {
+        log::warn!(
+            "response ({} B) too large for free heap; returning error instead of risking a crash",
+            response_json.len()
+        );
+        response_json = nip46::build_error_response(
+            &request_id,
+            -4,
+            "response too large for this signer's memory; the request was not completed",
+        )
+        .unwrap_or_default();
+    }
+
     // Re-encrypt the response, then build and sign the kind:24133 envelope
     // event inline. This eliminates the SIGN_ENVELOPE round-trip that
     // previously required the daemon to send the ~7KB ciphertext back to the

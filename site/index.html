@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heartwood — the Nostr signer that keeps keys on a chip</title>
+<meta name="description" content="Heartwood is an open hardware signer for Nostr on ESP32. Keys are generated on the device from hardware entropy and never leave it; a physical button approves what policies don't. Rust, NIP-46, MIT.">
+<link rel="canonical" href="https://heartwood.forgesworn.dev/">
+<meta property="og:title" content="Heartwood — the Nostr signer that keeps keys on a chip">
+<meta property="og:description" content="An open hardware signer on ESP32. Keys are born on the device and never leave it; a physical button approves what policies don't.">
+<meta property="og:url" content="https://heartwood.forgesworn.dev/">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#0b0806">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/fonts/fraunces-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="wordmark" href="/">HEARTWOOD</a>
+  <nav class="mastnav" aria-label="Sections">
+    <a href="#why">Why</a>
+    <a href="#hardware">Hardware</a>
+    <a href="#security">Security</a>
+    <a href="#daemon">heartwoodd</a>
+    <a href="#start">Get started</a>
+    <a class="ext" href="https://github.com/forgesworn/heartwood-esp32">GitHub</a>
+  </nav>
+</header>
+
+<main>
+
+<!-- ======================= HERO ======================= -->
+<section class="hero">
+  <div class="hero-copy">
+    <p class="kicker reveal r1">An open hardware signer for Nostr</p>
+    <h1 class="reveal r2">Keys on a chip.<br>Approval on a <em>button.</em></h1>
+    <p class="lede reveal r3">
+      Heartwood generates your Nostr identity from hardware entropy on an ESP32 dev
+      board and never lets it leave. Every signature is produced on the device:
+      a policy you installed decides what signs unattended, and a physical button
+      decides everything else. The computer it plugs into only ever sees ciphertext.
+    </p>
+    <div class="cta-row reveal r4">
+      <a class="btn btn-primary" href="#start">Get started</a>
+      <a class="btn btn-ghost" href="https://github.com/forgesworn/heartwood-esp32">Read the source</a>
+    </div>
+    <p class="hero-meta reveal r5">Rust firmware &nbsp;·&nbsp; four boards &nbsp;·&nbsp; NIP&#8209;46 / NIP&#8209;44 &nbsp;·&nbsp; MIT &nbsp;·&nbsp; v0.13.7</p>
+  </div>
+
+  <!-- Fig. 1 — the boot cat, pixel-for-pixel from the firmware's sprite sheet -->
+  <figure class="plate reveal r3" aria-labelledby="fig1-caption">
+    <div class="oled" role="img" aria-label="Heartwood's OLED boot animation: a pixel-art cat walking along a scrolling ground">
+      <svg viewBox="0 0 128 64" shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg">
+        <g class="cat d1" transform="translate(38,3)">
+          <g transform="scale(0.98)"><g fill="currentColor"><rect x="2" y="0" width="4" height="1"/><rect x="2" y="1" width="4" height="1"/><rect x="2" y="2" width="6" height="1"/><rect x="3" y="3" width="4" height="1"/><rect x="4" y="4" width="5" height="1"/><rect x="4" y="5" width="5" height="1"/><rect x="4" y="6" width="5" height="1"/><rect x="4" y="7" width="5" height="1"/><rect x="4" y="8" width="5" height="1"/><rect x="3" y="9" width="6" height="1"/><rect x="3" y="10" width="4" height="1"/><rect x="3" y="11" width="4" height="1"/><rect x="3" y="12" width="4" height="1"/><rect x="1" y="13" width="5" height="1"/><rect x="1" y="14" width="5" height="1"/><rect x="46" y="14" width="1" height="1"/><rect x="49" y="14" width="2" height="1"/><rect x="1" y="15" width="5" height="1"/><rect x="45" y="15" width="2" height="1"/><rect x="48" y="15" width="2" height="1"/><rect x="1" y="16" width="5" height="1"/><rect x="45" y="16" width="5" height="1"/><rect x="1" y="17" width="5" height="1"/><rect x="43" y="17" width="7" height="1"/><rect x="2" y="18" width="4" height="1"/><rect x="43" y="18" width="8" height="1"/><rect x="2" y="19" width="5" height="1"/><rect x="42" y="19" width="10" height="1"/><rect x="2" y="20" width="5" height="1"/><rect x="41" y="20" width="11" height="1"/><rect x="4" y="21" width="4" height="1"/><rect x="41" y="21" width="12" height="1"/><rect x="4" y="22" width="5" height="1"/><rect x="39" y="22" width="11" height="1"/><rect x="51" y="22" width="2" height="1"/><rect x="4" y="23" width="6" height="1"/><rect x="13" y="23" width="14" height="1"/><rect x="39" y="23" width="11" height="1"/><rect x="51" y="23" width="2" height="1"/><rect x="4" y="24" width="24" height="1"/><rect x="37" y="24" width="18" height="1"/><rect x="6" y="25" width="49" height="1"/><rect x="6" y="26" width="49" height="1"/><rect x="7" y="27" width="47" height="1"/><rect x="7" y="28" width="47" height="1"/><rect x="7" y="29" width="46" height="1"/><rect x="5" y="30" width="42" height="1"/><rect x="5" y="31" width="42" height="1"/><rect x="5" y="32" width="40" height="1"/><rect x="5" y="33" width="40" height="1"/><rect x="5" y="34" width="40" height="1"/><rect x="5" y="35" width="39" height="1"/><rect x="5" y="36" width="38" height="1"/><rect x="5" y="37" width="39" height="1"/><rect x="5" y="38" width="37" height="1"/><rect x="5" y="39" width="37" height="1"/><rect x="4" y="40" width="38" height="1"/><rect x="4" y="41" width="18" height="1"/><rect x="24" y="41" width="18" height="1"/><rect x="3" y="42" width="19" height="1"/><rect x="27" y="42" width="15" height="1"/><rect x="2" y="43" width="11" height="1"/><rect x="14" y="43" width="8" height="1"/><rect x="28" y="43" width="15" height="1"/><rect x="2" y="44" width="10" height="1"/><rect x="14" y="44" width="7" height="1"/><rect x="28" y="44" width="6" height="1"/><rect x="36" y="44" width="7" height="1"/><rect x="0" y="45" width="11" height="1"/><rect x="14" y="45" width="6" height="1"/><rect x="28" y="45" width="6" height="1"/><rect x="37" y="45" width="7" height="1"/><rect x="0" y="46" width="9" height="1"/><rect x="12" y="46" width="8" height="1"/><rect x="28" y="46" width="6" height="1"/><rect x="37" y="46" width="7" height="1"/><rect x="0" y="47" width="6" height="1"/><rect x="13" y="47" width="6" height="1"/><rect x="28" y="47" width="5" height="1"/><rect x="39" y="47" width="6" height="1"/><rect x="0" y="48" width="5" height="1"/><rect x="12" y="48" width="6" height="1"/><rect x="28" y="48" width="5" height="1"/><rect x="39" y="48" width="6" height="1"/><rect x="0" y="49" width="4" height="1"/><rect x="13" y="49" width="5" height="1"/><rect x="28" y="49" width="4" height="1"/><rect x="40" y="49" width="5" height="1"/><rect x="0" y="50" width="4" height="1"/><rect x="14" y="50" width="4" height="1"/><rect x="27" y="50" width="5" height="1"/><rect x="41" y="50" width="5" height="1"/><rect x="0" y="51" width="4" height="1"/><rect x="15" y="51" width="5" height="1"/><rect x="27" y="51" width="5" height="1"/><rect x="41" y="51" width="6" height="1"/><rect x="0" y="52" width="3" height="1"/><rect x="15" y="52" width="5" height="1"/><rect x="27" y="52" width="5" height="1"/><rect x="43" y="52" width="4" height="1"/><rect x="0" y="53" width="4" height="1"/><rect x="16" y="53" width="6" height="1"/><rect x="28" y="53" width="4" height="1"/><rect x="43" y="53" width="6" height="1"/><rect x="0" y="54" width="5" height="1"/><rect x="17" y="54" width="5" height="1"/><rect x="27" y="54" width="6" height="1"/><rect x="44" y="54" width="6" height="1"/><rect x="1" y="55" width="4" height="1"/><rect x="17" y="55" width="5" height="1"/><rect x="28" y="55" width="5" height="1"/><rect x="45" y="55" width="5" height="1"/></g></g>
+        </g>
+        <!-- scrolling ground -->
+        <g class="ground" fill="currentColor">
+          <rect x="2" y="60" width="5" height="1"/><rect x="12" y="60" width="8" height="1"/>
+          <rect x="26" y="60" width="4" height="1"/><rect x="36" y="60" width="10" height="1"/>
+          <rect x="52" y="60" width="6" height="1"/><rect x="64" y="60" width="9" height="1"/>
+          <rect x="79" y="60" width="4" height="1"/><rect x="89" y="60" width="11" height="1"/>
+          <rect x="106" y="60" width="5" height="1"/><rect x="117" y="60" width="8" height="1"/>
+        </g>
+      </svg>
+    </div>
+    <figcaption id="fig1-caption">
+      <span class="fig-no">Fig. 1</span> — The boot animation, pixel for pixel from the
+      firmware's sprite sheet. A cat walks, the ground scrolls, then
+      <span class="mono">HEARTWOOD</span> decrypts.
+    </figcaption>
+  </figure>
+</section>
+
+<!-- ======================= 01 · WHY ======================= -->
+<section class="section" id="why">
+  <div class="section-head">
+    <span class="section-no">01</span>
+    <h2>Why the key belongs on a chip</h2>
+  </div>
+  <div class="section-body two-col">
+    <p>
+      A Nostr key has no password reset. Yet most of them live inside the most
+      attacked software their owners run — a browser profile, a phone app, a
+      server's home directory. One phishing page, one malicious update, one bad
+      backup, and the identity is someone else's forever.
+    </p>
+    <p>
+      Heartwood moves the key to a device whose only job is to hold it.
+      NIP&#8209;44 decryption, policy evaluation and the BIP&#8209;340 signature
+      itself all happen on the chip; the seed never crosses the USB port, the
+      relay connection, or any backup path. Whatever the request, the answer is
+      the same: the device signs, or nobody does.
+    </p>
+  </div>
+</section>
+
+<!-- ======================= 02 · HARDWARE ======================= -->
+<section class="section" id="hardware">
+  <div class="section-head">
+    <span class="section-no">02</span>
+    <h2>The hardware</h2>
+  </div>
+  <div class="section-body">
+    <p>
+      One Rust firmware, four boards — from a bare OLED module to a colour display
+      with two buttons. The board is chosen at compile time and every image is
+      board-tagged, so the wrong binary simply won't flash.
+    </p>
+  </div>
+  <dl class="spec-rows">
+    <div class="spec-row">
+      <dt>Heltec WiFi LoRa 32 V3</dt>
+      <dd>ESP32&#8209;S3 with a 128&times;64 OLED. The workhorse: cheap, everywhere,
+      and everything Heartwood needs.</dd>
+    </div>
+    <div class="spec-row">
+      <dt>Heltec WiFi LoRa 32 V4</dt>
+      <dd>ESP32&#8209;S3, native USB, same OLED. The default build target.</dd>
+    </div>
+    <div class="spec-row">
+      <dt>LilyGO T&#8209;Display</dt>
+      <dd>Classic ESP32 with a colour TFT and two physical buttons — one to
+      approve, one to deny.</dd>
+    </div>
+    <div class="spec-row">
+      <dt>Waveshare ESP32&#8209;C6</dt>
+      <dd>RISC&#8209;V core with a 1.47&Prime; colour LCD, for the smallest desk
+      footprint.</dd>
+    </div>
+  </dl>
+  <p class="aside">
+    When a request needs you, the display shows which identity, what kind of event,
+    and a preview of the content, with a countdown. Hold the button two seconds to
+    approve; a short press denies; thirty seconds of silence denies for you.
+  </p>
+</section>
+
+<!-- ======================= 03 · SECURITY ======================= -->
+<section class="section" id="security">
+  <div class="section-head">
+    <span class="section-no">03</span>
+    <h2>Security model</h2>
+  </div>
+  <dl class="spec-rows">
+    <div class="spec-row">
+      <dt>Born on the device</dt>
+      <dd>The seed is drawn from the chip's hardware entropy source, shown once on
+      the display at creation, and never leaves by any code path — not USB, not
+      relay, not backup. Up to eight master identities per device.</dd>
+    </div>
+    <div class="spec-row">
+      <dt>Policies that fail closed</dt>
+      <dd>Each client gets an exact allowlist of methods and event kinds. Inside
+      the ceiling, signing is unattended; outside it, the request is denied — and
+      no button press can escalate it after the fact.</dd>
+    </div>
+    <div class="spec-row">
+      <dt>A bounded operator</dt>
+      <dd>Management commands are accepted only from your operator key, and every
+      mutation must answer a fresh one-time challenge. The operator can shape
+      policies and connectivity; it cannot read or replace a seed, change the
+      PIN, or start a firmware update.</dd>
+    </div>
+    <div class="spec-row">
+      <dt>Updates you can trust</dt>
+      <dd>Every release is signed in CI; the device verifies the signature twice
+      and ties it to its own board id. Flashing happens over USB with a
+      two-second button hold. Remote update is deliberately not implemented.</dd>
+    </div>
+    <div class="spec-row">
+      <dt>Sealed at rest</dt>
+      <dd>Set a PIN and each seed is stored encrypted, with no PIN hash kept on
+      the device — every guess pays the full key-derivation cost, and five wrong
+      attempts wipe the device clean.</dd>
+    </div>
+  </dl>
+  <p class="aside">
+    Honest limits: the default build leaves ESP32 flash encryption and secure boot
+    off — burning eFuses is irreversible, so that stays your call. Without a PIN,
+    someone holding the board can read flash. Set the PIN, and treat physical
+    custody as part of the model: Heartwood is a signer you own, not a bank vault.
+    The full write-up is in
+    <a href="https://github.com/forgesworn/heartwood-esp32/blob/main/docs/SECURITY-MODEL.md">SECURITY&#8209;MODEL.md</a>.
+  </p>
+</section>
+
+<!-- ======================= 04 · HEARTWOODD ======================= -->
+<section class="section" id="daemon">
+  <div class="section-head">
+    <span class="section-no">04</span>
+    <h2>No hardware yet? Run it soft.</h2>
+  </div>
+  <div class="section-body">
+    <p>
+      <strong>heartwoodd</strong> is the same signer as a daemon for a Pi or any
+      Linux box, and it has two modes. In <em>soft mode</em> it signs locally:
+      keys live in a keyfile sealed under Argon2id and XChaCha20&#8209;Poly1305,
+      decrypted only into memory and zeroised on lock, behind the same policy
+      engine and approval queue the hardware uses. You unlock it from
+      <a href="https://sapwood.forgesworn.dev">Sapwood</a> in your browser.
+    </p>
+    <p>
+      Plug an ESP32 in and it becomes <em>hard mode</em>: the daemon stops holding
+      anything at all and turns into zero-trust plumbing between your relays and
+      the chip. Start soft tonight, move to hardware whenever — your own bunker,
+      no third party, and your apps keep the same connection either way.
+    </p>
+    <p>
+      Just need the plumbing? A standalone keyless bridge,
+      <a href="https://github.com/forgesworn/heartwood">heartwood&#8209;bridge</a>,
+      ships from its own repo with a one-line installer, Docker images, and
+      prebuilt binaries for aarch64, x86_64, armv7 and riscv64.
+    </p>
+  </div>
+</section>
+
+<!-- ======================= 05 · THE PATH ======================= -->
+<section class="section" id="path">
+  <div class="section-head">
+    <span class="section-no">05</span>
+    <h2>A signature's journey</h2>
+  </div>
+  <figure class="plate wide" aria-labelledby="fig2-caption">
+    <svg viewBox="0 0 880 240" xmlns="http://www.w3.org/2000/svg" role="img"
+         aria-label="Flow diagram: a Nostr app using Bark or Cambium sends a NIP-46 request through a relay to heartwoodd on a Pi, which pumps ciphertext over USB to the Heartwood device, where policy and the button decide before the signature returns by the same path">
+      <g class="dg">
+        <rect class="node" x="8" y="60" width="196" height="76" rx="8"/>
+        <text class="nlbl" x="106" y="92" text-anchor="middle">YOUR APPS</text>
+        <text class="nsub" x="106" y="113" text-anchor="middle">Bark · Cambium · any client</text>
+
+        <path class="wire" d="M 204 98 L 260 98"/>
+
+        <rect class="node" x="262" y="60" width="170" height="76" rx="8"/>
+        <text class="nlbl" x="347" y="92" text-anchor="middle">RELAYS</text>
+        <text class="nsub" x="347" y="113" text-anchor="middle">kind 24133 · NIP-44</text>
+
+        <path class="wire" d="M 432 98 L 488 98"/>
+
+        <rect class="node" x="490" y="60" width="160" height="76" rx="8"/>
+        <text class="nlbl" x="570" y="92" text-anchor="middle">PI / SERVER</text>
+        <text class="nsub" x="570" y="113" text-anchor="middle">heartwoodd — keyless</text>
+
+        <path class="wire" d="M 650 98 L 700 98"/>
+        <text class="wlbl" x="675" y="88" text-anchor="middle">USB</text>
+
+        <rect class="node heart-node" x="702" y="46" width="172" height="104" rx="8"/>
+        <text class="nlbl heart-lbl" x="788" y="82" text-anchor="middle">HEARTWOOD</text>
+        <text class="nsub" x="788" y="106" text-anchor="middle">policy → button → sign</text>
+        <text class="nsub heart-sub" x="788" y="128" text-anchor="middle">keys never leave</text>
+
+        <path class="wire back" d="M 788 150 L 788 176 L 106 176 L 106 140" fill="none"/>
+        <text class="wlbl" x="447" y="196" text-anchor="middle">the signature returns by the same path</text>
+      </g>
+    </svg>
+    <figcaption id="fig2-caption">
+      <span class="fig-no">Fig. 2</span> — Nothing left of the device ever holds a key.
+      Compromise the browser, the phone, the Pi, or the relay, and you hold the ability
+      to <em>ask</em>.
+    </figcaption>
+  </figure>
+</section>
+
+<!-- ======================= 06 · GET STARTED ======================= -->
+<section class="section" id="start">
+  <div class="section-head">
+    <span class="section-no">06</span>
+    <h2>Get started</h2>
+  </div>
+  <ol class="steps">
+    <li>
+      <span class="step-no">i</span>
+      <p>Pick a board — any of the four above, from the usual suspects for a few
+      pounds. No soldering.</p>
+    </li>
+    <li>
+      <span class="step-no">ii</span>
+      <p>Flash and provision from your browser with
+      <a href="https://sapwood.forgesworn.dev">Sapwood</a> (Web Serial — Chromium
+      browsers), or fully offline with the <code>provision</code> CLI for an
+      air-gapped setup.</p>
+    </li>
+    <li>
+      <span class="step-no">iii</span>
+      <p>Pair your apps: <a href="https://bark.forgesworn.dev">Bark</a> in the
+      browser, <a href="https://cambium.forgesworn.dev">Cambium</a> on Android, or
+      paste the <code>bunker://</code> URI into any NIP&#8209;46 client.</p>
+    </li>
+  </ol>
+  <pre class="code"><code># or build it yourself and check our work
+git clone https://github.com/forgesworn/heartwood-esp32.git
+cd heartwood-esp32
+./scripts/build-firmware.sh v4 --release   # v3 | v4 | tdisplay | c6
+espflash flash target/firmware-v4.elf</code></pre>
+  <p class="aside">
+    Prebuilt per-board images, with checksums and release signatures, are on
+    <a href="https://github.com/forgesworn/heartwood-esp32/releases">GitHub Releases</a>.
+  </p>
+</section>
+
+<!-- ======================= THE TREE ======================= -->
+<section class="section family">
+  <div class="section-head">
+    <span class="section-no">§</span>
+    <h2>The whole tree</h2>
+  </div>
+  <div class="family-row">
+    <span class="family-card current">
+      <span class="family-ring heart-swatch"></span>
+      <h3>Heartwood</h3>
+      <p>The core. Keys on a chip behind a physical button — you are here.</p>
+    </span>
+    <a class="family-card" href="https://sapwood.forgesworn.dev/about/">
+      <span class="family-ring sap-swatch"></span>
+      <h3>Sapwood</h3>
+      <p>The management console. Flash, provision, set policies, approve, back up.</p>
+    </a>
+    <a class="family-card" href="https://cambium.forgesworn.dev">
+      <span class="family-ring cambium-swatch"></span>
+      <h3>Cambium</h3>
+      <p>The living layer on Android. A NIP&#8209;55 signer that holds no keys.</p>
+    </a>
+    <a class="family-card" href="https://bark.forgesworn.dev">
+      <span class="family-ring bark-swatch"></span>
+      <h3>Bark</h3>
+      <p>The protective outer layer. NIP&#8209;07 in your browser, keys nowhere near it.</p>
+    </a>
+  </div>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <p class="colophon-links">
+    <a href="https://github.com/forgesworn/heartwood-esp32">Source</a> ·
+    <a href="https://github.com/forgesworn/heartwood-esp32/releases">Releases</a> ·
+    <a href="https://github.com/forgesworn/heartwood-esp32/blob/main/docs/SECURITY-MODEL.md">Security model</a> ·
+    <a href="https://github.com/sponsors/TheCryptoDonkey">Sponsor</a> ·
+    <a href="https://forgesworn.dev">forgesworn.dev</a>
+  </p>
+  <p class="colophon-note">
+    MIT licence. This page is static: no scripts, no cookies, no analytics, no
+    third-party requests — the fonts are served from this domain. Like the signer,
+    it keeps nothing of yours.
+  </p>
+</footer>
+
+</body>
+</html>

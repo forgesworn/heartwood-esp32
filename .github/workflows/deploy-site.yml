@@ -1,0 +1,35 @@
+# Deploys site/ to heartwood.forgesworn.dev — the shared Hetzner "routing" box,
+# same rsync pattern as cambium's deploy-site. The Caddy vhost
+# (site/deploy/heartwood.Caddyfile) is installed on the box separately and is
+# excluded from the rsync; this workflow only replaces web content.
+#
+# Requires the HETZNER_SSH_KEY repository secret (the deploy@95.217.39.110
+# private key, as used by cambium's deploy-site workflow).
+name: Deploy site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy-site.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Hetzner
+        env:
+          HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$HETZNER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 95.217.39.110 >> ~/.ssh/known_hosts
+          rsync -avz --delete \
+            --exclude "deploy/" \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            site/ deploy@95.217.39.110:/opt/heartwood/

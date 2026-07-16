@@ -1034,6 +1034,9 @@ fn build_sub_req(ctx: &SignCtx) -> String {
 /// Open one relay session: TLS → WS handshake → recv timeout → subscribe.
 fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySession, String> {
     let host = relay_host(url).to_string();
+    // Rolling activity marker over the TLS handshake — the other place a
+    // panic could strike (cert/allocation) with no request in flight.
+    crate::crash_crumb::set(&format!("relay connecting {host}"));
     let mut tls = EspTls::new().map_err(|e| format!("tls init: {e:?}"))?;
     let mut tls_cfg = TlsConfig::new();
     tls_cfg.common_name = Some(&host);
@@ -1529,7 +1532,19 @@ fn handle_relay_msg(
                 // a classic ESP32 (observed as rst:0xc on the T-Display).
                 let ev_val = ev_val.take();
                 drop(v); // free the (now-gutted) envelope before the deep parse
+                // Coarse breadcrumb over the WHOLE inbound-event window: the
+                // deep parse, signature verification, and kind routing all run
+                // before any per-handler breadcrumb, so a crash there (not a
+                // NIP-46 request) previously left nothing. Handlers refine this
+                // with specifics; cleared once the event is fully processed.
+                let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+                crate::crash_crumb::set(&format!("relay inbound event (heap {}k)", free / 1024));
                 match serde_json::from_value::<SignedEvent>(ev_val) {
+                    // No clear here: the breadcrumb is a rolling "last activity"
+                    // marker. The pump's next read overwrites it with "relay
+                    // reading" once the loop goes idle, so a stale request is
+                    // never misattributed, and the reset-reason gate ignores it
+                    // entirely on a clean (non-crash) restart.
                     Ok(ev) => process_event(s, &ev, ctx, pool)?,
                     Err(e) => log::warn!("[relay] bad EVENT json: {e}"),
                 }
@@ -1606,14 +1621,11 @@ fn handle_profile_event(ev: &SignedEvent, ctx: &mut SignCtx) {
             Some(m) => (Some(m.name.as_str()), Some((m.w, m.h, m.avatar.as_slice()))),
             None => (fallback.as_deref(), None),
         };
-        // Breadcrumb only the render itself: a kind-0 event echoes back to the
-        // signer when its own profile is edited, and drawing the name/avatar is
-        // a non-request path the NIP-46 breadcrumb does not cover. Scoped tight
-        // and cleared straight after so an unrelated later crash is not
-        // misattributed to it.
+        // Refine the inbound-event breadcrumb to the render: a kind-0 event
+        // echoes back when the signer's own profile is edited, and drawing the
+        // name/avatar is a non-request path. handle_relay_msg owns the clear.
         crate::crash_crumb::set("relay profile render");
         crate::oled::show_npub(ctx.display, name, &npub, avatar);
-        crate::crash_crumb::clear();
     }
 }
 
@@ -2041,7 +2053,8 @@ fn handle_nip46_event(
 
     // The publish (re-encrypt + inline envelope sign) is the other crash-prone
     // step on a fragmented no-PSRAM heap, so keep the breadcrumb set across it.
-    let published = sign_and_publish(
+    // handle_relay_msg clears the breadcrumb once the whole event is processed.
+    sign_and_publish(
         tls,
         ctx.secp,
         &signing_secret,
@@ -2050,10 +2063,7 @@ fn handle_nip46_event(
         NIP46_KIND,
         ev.created_at,
         &response_json,
-    );
-    // Handled without a crash — retire the breadcrumb.
-    crate::crash_crumb::clear();
-    published
+    )
 }
 
 /// Relay-management path (kind 24134): authenticate the author against the
@@ -2224,9 +2234,8 @@ fn handle_mgmt_event(
         }
         dispatch_mgmt(&method, &req, s, ctx, master_idx, pool)
     })();
-    // Dispatch returned without a crash — retire the breadcrumb. (The response
-    // publish below is heap-guarded separately.)
-    crate::crash_crumb::clear();
+    // The breadcrumb stays set across the response publish below too;
+    // handle_relay_msg clears it once the whole event is processed.
 
     let response_json = match dispatch_result {
         Ok(result) => serde_json::json!({ "id": id, "result": result }).to_string(),
@@ -4033,6 +4042,11 @@ fn ws_send(tls: &mut Tls, opcode: u8, payload: &[u8]) -> Result<(), String> {
 /// which lets the caller ping / check the silence deadline. A real socket error
 /// or EOF propagates and triggers a reconnect.
 fn pump(tls: &mut Tls, rx: &mut Vec<u8>) -> Result<usize, String> {
+    // Rolling activity marker: this is where the loop spends its idle time
+    // (blocked in the TLS read). If a panic strikes inside mbedTLS here — the
+    // suspect for the healthy-memory crashes since dynamic buffers landed —
+    // the next boot reports "relay reading" instead of a blank breadcrumb.
+    crate::crash_crumb::set("relay reading");
     let mut tmp = [0u8; 1024];
     match tls.read(&mut tmp) {
         Ok(0) => Err("relay closed (eof)".into()),

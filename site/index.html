@@ -99,8 +99,9 @@
   <div class="section-body">
     <p>
       One Rust firmware and four boards, from a bare OLED module to a colour display
-      with two buttons. The board is chosen at compile time and every image is
-      board-tagged, so the wrong binary simply won't flash.
+      with two buttons. The board is chosen at compile time and every signed update
+      is tied to a board id, so the device refuses an update built for the wrong
+      board.
     </p>
   </div>
   <dl class="spec-rows">
@@ -115,8 +116,8 @@
     </div>
     <div class="spec-row">
       <dt>LilyGO T&#8209;Display</dt>
-      <dd>Classic ESP32 with a colour TFT and two physical buttons: one to
-      approve, one to deny.</dd>
+      <dd>Classic ESP32 with a colour TFT and a second button, which makes
+      typing a recovery phrase far less of a chore.</dd>
     </div>
     <div class="spec-row">
       <dt>Waveshare ESP32&#8209;C6</dt>
@@ -286,7 +287,7 @@
 git clone https://github.com/forgesworn/heartwood-esp32.git
 cd heartwood-esp32
 ./scripts/build-firmware.sh v4 --release   # v3 | v4 | tdisplay | c6
-espflash flash target/firmware-v4.elf</code></pre>
+espflash flash target/heartwood-v4.elf</code></pre>
   <p class="aside">
     Prebuilt per-board images, with checksums and release signatures, are on
     <a href="https://github.com/forgesworn/heartwood-esp32/releases">GitHub Releases</a>.

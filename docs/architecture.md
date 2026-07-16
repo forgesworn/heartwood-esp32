@@ -20,7 +20,7 @@ flowchart LR
     end
 
     subgraph Home["Home — mypi (Pi)"]
-        Bridge["heartwood-bridge<br/>pure transport,<br/>holds no signing keys"]
+        Bridge["heartwoodd (hard mode)<br/>pure transport,<br/>holds no signing keys"]
         Sapwood["Sapwood management UI<br/>served on :3100"]
     end
 
@@ -46,6 +46,16 @@ holds the outbound relay connection, and a phone running Sapwood reaches its
 separate kind-24134 management address through those relays; no inbound port or
 Pi is required.
 
+**Naming:** the Pi-side daemon in this repo is `heartwoodd/` (formerly
+`bridge/`). It is tier-aware: soft mode signs locally from a keyfile sealed
+under Argon2id and XChaCha20-Poly1305; hard mode holds nothing and is pure
+transport for a tethered device, as diagrammed above. The separate
+[`forgesworn/heartwood`](https://github.com/forgesworn/heartwood) repo ships
+`heartwood-bridge`, a standalone keyless daemon for the same transport role,
+with its own one-line installer, Docker images and prebuilt binaries. Neither
+replaced the other. "Bridge" in the tables and diagrams below names the
+transport role, which either daemon can fill.
+
 Trust boundaries, from inside out:
 
 1. **HSM** (green). The only place a master nsec exists and the only component that creates master signatures. A request needs either a physical button approval or authority already granted by its exact client-slot policy. Flash encryption is deliberately disabled so the device can be reused; see the separate PIN trade-off in `SECURITY-MODEL.md`.
@@ -59,9 +69,9 @@ Trust boundaries, from inside out:
 | Master nsec (identity A) | ✗ | ✗ | ✓ (NVS) | ✗ |
 | Master nsec (identity B) | ✗ | ✗ | ✓ (NVS) | ✗ |
 | Connect secret (per client slot) | delivered to that client | transiently, if bridged | ✓ (NVS) | encrypted only |
-| Bridge session secret | ✗ | ✓ (`bunker.env`, root 0600) | ✓ (NVS) | ✗ |
-| Pi bunker/relay secret | ✗ | ✓ (`bunker.env`, root 0600) | ✗ | ✗ |
-| API token for Sapwood | ✗ | ✓ (`bunker.env`, root 0600) | ✗ | ✗ |
+| Bridge session secret | ✗ | ✓ (env file, root 0600) | ✓ (NVS) | ✗ |
+| Pi bunker/relay secret | ✗ | ✓ (env file, root 0600) | ✗ | ✗ |
+| API token for Sapwood | ✗ | ✓ (env file, root 0600) | ✗ | ✗ |
 | Client ephemeral keys | ✓ (Bark storage) | ✗ | ✗ | ✗ |
 | Signed NIP-46 envelopes | ✗ | ✗ | ✗ | ✓ (public) |
 | NIP-44 encrypted payloads | ✗ | transiently | ✗ (never leaves USB frame) | ✓ (ciphertext) |
@@ -239,7 +249,7 @@ The coercion-resistance stack (canary + spoken-token + ring-signature + button c
 ```mermaid
 flowchart LR
     subgraph Dev["Developer laptop (macOS)"]
-        Src["common/ bridge/ firmware/"]
+        Src["common/ heartwoodd/ firmware/"]
         FirmwareBuild["build-firmware.sh &lt;board&gt; --release<br/>(board-specific target)"]
         Cross["cross build --release<br/>(aarch64-unknown-linux-gnu)"]
         Espflash["espflash flash<br/>USB -> HSM"]
@@ -258,10 +268,10 @@ flowchart LR
 ```
 
 - **Firmware** (`firmware/`) cross-compiles via the ESP Rust toolchain (`espup install --toolchain-version 1.87.0.0`). Board selection is compile-time: Heltec V3/V4 target ESP32-S3, T-Display targets classic ESP32, and Waveshare C6 targets ESP32-C6. Each feature selects the matching display and host transport. Use `scripts/build-firmware.sh {v3|v4|tdisplay|c6}` so the feature, target triple, MCU, and `sdkconfig.defaults.<board>` fragment move together. Flashing is via `espflash` over USB.
-- **Bridge** (`bridge/`) cross-compiles to `aarch64-unknown-linux-gnu` via the `cross` crate (Docker-based cross build from macOS). The binary gets scp'd to mypi and installed to `/usr/local/bin/heartwood-bridge`.
-- **Sapwood** (separate repo, `sapwood/`) builds as a Vite static site and gets rsync'd to `/opt/sapwood/dist` on mypi. The bridge's `--sapwood-dir` flag serves it from `/`.
+- **heartwoodd** (`heartwoodd/`) cross-compiles to `aarch64-unknown-linux-gnu` via the `cross` crate (Docker-based cross build from macOS). The binary gets scp'd to mypi.
+- **Sapwood** (separate repo, `sapwood/`) builds as a Vite static site and gets rsync'd to `/opt/sapwood/dist` on mypi. heartwoodd's `--sapwood-dir` flag serves it from `/`.
 
-Secrets live in `/etc/heartwood-esp32-bridge/bunker.env` on mypi (chmod 600, root only). The bridge reads them via `clap`'s `env =` attribute so they never enter `argv` or `systemctl status` output.
+Secrets reach heartwoodd as environment variables (`HEARTWOOD_API_TOKEN`, `HEARTWOOD_BUNKER_SECRET`, `HEARTWOOD_BRIDGE_SECRET`), read via `clap`'s `env =` attribute from a root-only (chmod 600) environment file on mypi, so they never enter `argv` or `systemctl status` output.
 
 ## Further reading
 

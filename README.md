@@ -263,11 +263,12 @@ provision/               Host CLI tool
 sign-test/               Signing test harness
   src/
     main.rs             Send NIP-46 requests over serial, display responses
-bridge/                  Pi-side relay bridge
+heartwoodd/              Pi-side daemon (formerly bridge/)
   src/
     main.rs             Nostr relay ↔ NIP-44 transport ↔ serial ↔ ESP32
                         Master-routed, calls SIGN_ENVELOPE for outer events
     api.rs              Management HTTP API on :3100, bearer-token auth
+    backend/            Soft mode (sealed keyfile) and hard mode (serial) backends
 ota/                     Pi-side serial OTA tool
   src/
     main.rs             Chunked firmware upload with SHA-256 verification

@@ -452,7 +452,7 @@ code {
 
 .family-row {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 1.2rem;
 }
 .family-card {
@@ -478,6 +478,7 @@ a.family-card:hover h3 { color: var(--heart); }
 .sap-swatch { border: 3px solid var(--sap); }
 .cambium-swatch { border: 3px solid var(--cambium-c); }
 .bark-swatch { border: 3px solid var(--bark-c); }
+.bray-swatch { border: 3px solid #b59a83; }
 .family-card h3 {
   font-weight: 500;
   font-size: 1.15rem;

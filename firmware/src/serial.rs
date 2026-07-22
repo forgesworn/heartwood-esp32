@@ -70,20 +70,25 @@ impl<'a> SerialPort<'a> {
         self.inner.read(buf, timeout_ms)
     }
 
-    /// Write `buf` to the host. Blocks until the driver has accepted the
-    /// bytes into its TX buffer.
+    /// Write `buf`, blocking at most `timeout` (same tick unit as `read`).
+    /// Returns `Ok(0)` when the driver accepted nothing within the window.
     ///
-    /// `UsbSerialDriver::write` takes a `(buf, delay)` pair (blocking until
-    /// the delay expires or the write completes), while `UartDriver::write`
-    /// takes only `(buf)` and blocks until the TX FIFO has room. The wrapper
-    /// normalises these to a single `write(buf)` call.
-    pub fn write(&mut self, buf: &[u8]) -> Result<usize, EspError> {
+    /// Deliberately no unbounded variant: on the native USB-Serial-JTAG
+    /// boards the TX buffer only drains while a host is reading, so a
+    /// suspended or vanished host leaves it full and a `BLOCK` write parks
+    /// the single signing thread forever — with the task watchdog disabled,
+    /// that is a wedge only a power-cycle clears. The UART boards drain at
+    /// baud rate through the CP2102 regardless of the host, so their plain
+    /// blocking write is already bounded in practice (`UartDriver::write`
+    /// takes no delay parameter).
+    pub fn write_bounded(&mut self, buf: &[u8], timeout: u32) -> Result<usize, EspError> {
         #[cfg(any(feature = "heltec-v4", feature = "c6"))]
         {
-            self.inner.write(buf, esp_idf_hal::delay::BLOCK)
+            self.inner.write(buf, timeout)
         }
         #[cfg(any(feature = "heltec-v3", feature = "tdisplay"))]
         {
+            let _ = timeout;
             self.inner.write(buf)
         }
     }

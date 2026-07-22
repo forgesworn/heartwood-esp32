@@ -170,6 +170,27 @@ const DIAL_MIN_FREE_HEAP: u32 = 70_000;
 /// 16KB record buffer in one piece, so total-free alone is not enough on a
 /// fragmented heap.
 const DIAL_MIN_LARGEST_BLOCK: usize = 24_000;
+/// Relay-health watchdog: restart the signer when WiFi is up and relays are
+/// configured, yet no session has been simultaneously live and publishable
+/// for this long. A fragmented no-PSRAM heap can reach a state where every
+/// TLS dial or response publish is refused — the guards here deliberately
+/// degrade instead of crashing, so nothing panics, nothing self-resets, and
+/// the owner sees a signer that answers nothing until power-cycled. A
+/// controlled restart with attribution beats an indefinitely deaf signer.
+/// Longer than any outage the loop rides out itself (relay failover ~13s per
+/// candidate; WiFi-down and no-relay-config states reset the timer so USB
+/// recovery is never interrupted), and equal to NETWORK_TRIAL_TIMEOUT — but
+/// trials are excluded outright: their own deadline owns recovery until the
+/// candidate config commits or rolls back.
+const RELAY_HEALTH_RESTART_AFTER: Duration = Duration::from_secs(5 * 60);
+/// A live session only counts as healthy while the largest contiguous free
+/// block clears response_transportable's floor — below it every reply
+/// degrades to an error, which is deafness with extra steps.
+const RELAY_HEALTH_MIN_BLOCK: usize = 16_384;
+/// Cadence of the heap telemetry line. The decay curve of the largest free
+/// block against sign/mgmt traffic is exactly the evidence needed to pin
+/// field fragmentation reports, and one line a minute costs nothing.
+const RELAY_HEAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Whether the free heap can safely transport a response of `len` bytes.
 ///
 /// Re-encrypting the response pads it (NIP-44, up to ~2x), base64-encodes it
@@ -643,6 +664,10 @@ pub fn run_wifi_standalone<'d, 'b>(
     let mut sessions: Vec<RelaySession> = Vec::new();
     let mut primary_next = Instant::now();
 
+    // Relay-health watchdog + heap telemetry (see RELAY_HEALTH_RESTART_AFTER).
+    let mut last_relay_healthy = Instant::now();
+    let mut next_heap_log = Instant::now();
+
     // Opening a USB-UART adapter commonly resets the classic ESP32. Sapwood
     // sends its first read-only probe as soon as the port opens, so service the
     // bytes already waiting in UART before the first blocking WiFi/TLS dial.
@@ -668,6 +693,11 @@ pub fn run_wifi_standalone<'d, 'b>(
         // Every relay session depends on the station link; restore it before
         // attempting any relay dial.
         if !wifi.is_up().unwrap_or(false) {
+            // Offline is not rot: a restart cannot fix the AP, and USB
+            // service (fixing credentials over the cable) must never be
+            // interrupted. The health watchdog only times unhealthy periods
+            // while the station link is up.
+            last_relay_healthy = Instant::now();
             let previous_error = ctx.network_runtime.last_error_class;
             set_network_runtime(
                 &mut ctx,
@@ -712,6 +742,8 @@ pub fn run_wifi_standalone<'d, 'b>(
         }
 
         if relays.is_empty() {
+            // Config error, fixable only over USB — not the watchdog's case.
+            last_relay_healthy = Instant::now();
             log::error!("[relay] no relay configured");
             set_network_runtime(
                 &mut ctx,
@@ -749,48 +781,66 @@ pub fn run_wifi_standalone<'d, 'b>(
 
         // Ensure the primary session (rotates over the configured set).
         if !sessions.iter().any(|s| !s.pinned) && Instant::now() >= primary_next {
-            let previous_error = ctx.network_runtime.last_error_class;
-            set_network_runtime(
-                &mut ctx,
-                NetworkRuntimeStage::RelayConnecting,
-                true,
-                false,
-                previous_error,
-            );
-            let url = relays[relay_idx % relays.len()].clone();
-            let host = relay_host(&url).to_string();
-            if relays.len() > 1 {
-                log::info!(
-                    "[relay] serving via {host} (relay {} of {})",
-                    relay_idx % relays.len() + 1,
-                    relays.len()
+            // Same heap guard as the pinned dial below: a fresh mbedTLS
+            // session costs ~40-50KB and an allocation failure deep inside
+            // the TLS or WiFi stack can abort the chip rather than error.
+            // Skipping the dial keeps USB served; the relay-health watchdog
+            // bounds how long a heap this tight may keep the signer offline.
+            let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            let largest = unsafe {
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                    esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                )
+            };
+            if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
+                log::warn!(
+                    "[relay] heap too tight to dial (free {free} B, largest {largest} B); retry in 3s"
                 );
-            }
-            match connect_relay(&url, false, &mut ctx) {
-                Ok(s) => {
-                    ctx.relay_url = url;
-                    sessions.push(s);
-                    retune_recv_timeouts(&mut sessions);
-                    set_network_runtime(
-                        &mut ctx,
-                        NetworkRuntimeStage::SubscriptionSent,
-                        true,
-                        true,
-                        NetworkRuntimeError::None,
+                primary_next = Instant::now() + PRIMARY_BACKOFF;
+            } else {
+                let previous_error = ctx.network_runtime.last_error_class;
+                set_network_runtime(
+                    &mut ctx,
+                    NetworkRuntimeStage::RelayConnecting,
+                    true,
+                    false,
+                    previous_error,
+                );
+                let url = relays[relay_idx % relays.len()].clone();
+                let host = relay_host(&url).to_string();
+                if relays.len() > 1 {
+                    log::info!(
+                        "[relay] serving via {host} (relay {} of {})",
+                        relay_idx % relays.len() + 1,
+                        relays.len()
                     );
                 }
-                Err(e) => {
-                    log::error!("[relay] {e}; failing over in 3s");
-                    let error_class = runtime_error_class(&e);
-                    set_network_runtime(
-                        &mut ctx,
-                        NetworkRuntimeStage::RelayConnecting,
-                        true,
-                        false,
-                        error_class,
-                    );
-                    relay_idx = relay_idx.wrapping_add(1);
-                    primary_next = Instant::now() + PRIMARY_BACKOFF;
+                match connect_relay(&url, false, &mut ctx) {
+                    Ok(s) => {
+                        ctx.relay_url = url;
+                        sessions.push(s);
+                        retune_recv_timeouts(&mut sessions);
+                        set_network_runtime(
+                            &mut ctx,
+                            NetworkRuntimeStage::SubscriptionSent,
+                            true,
+                            true,
+                            NetworkRuntimeError::None,
+                        );
+                    }
+                    Err(e) => {
+                        log::error!("[relay] {e}; failing over in 3s");
+                        let error_class = runtime_error_class(&e);
+                        set_network_runtime(
+                            &mut ctx,
+                            NetworkRuntimeStage::RelayConnecting,
+                            true,
+                            false,
+                            error_class,
+                        );
+                        relay_idx = relay_idx.wrapping_add(1);
+                        primary_next = Instant::now() + PRIMARY_BACKOFF;
+                    }
                 }
             }
         }
@@ -847,6 +897,54 @@ pub fn run_wifi_standalone<'d, 'b>(
                     p.next_attempt = Instant::now() + delay;
                 }
             }
+        }
+
+        // Relay-health watchdog: a session that is live while the heap can
+        // still place a response proves the signer useful. Anything else —
+        // every dial refused or failing, or a heap too fragmented to publish
+        // — sustained for RELAY_HEALTH_RESTART_AFTER is rot a reboot alone
+        // clears, so take a controlled one and attribute it: the crumb
+        // survives a software reset and the next boot reports it.
+        let health_now = Instant::now();
+        let heap_log_due = health_now >= next_heap_log;
+        if !sessions.is_empty() || heap_log_due {
+            let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            let largest = unsafe {
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                    esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                )
+            };
+            if !sessions.is_empty() && largest >= RELAY_HEALTH_MIN_BLOCK {
+                last_relay_healthy = health_now;
+            }
+            if heap_log_due {
+                log::info!(
+                    "[relay] heap: free {free} B, largest {largest} B, {} session(s)",
+                    sessions.len()
+                );
+                next_heap_log = health_now + RELAY_HEAP_LOG_INTERVAL;
+            }
+        }
+        if ctx.network_trial_id.is_none()
+            && ctx.ota_session.is_none()
+            && health_now.duration_since(last_relay_healthy) >= RELAY_HEALTH_RESTART_AFTER
+        {
+            let largest = unsafe {
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                    esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                )
+            };
+            log::error!(
+                "[relay] no usable relay session for {}s (largest free block {largest} B); restarting to clear the heap",
+                RELAY_HEALTH_RESTART_AFTER.as_secs()
+            );
+            crate::crash_crumb::set(&format!(
+                "relay watchdog: deaf {}s largest {}k",
+                RELAY_HEALTH_RESTART_AFTER.as_secs(),
+                largest / 1024
+            ));
+            FreeRtos::delay_ms(200);
+            unsafe { esp_idf_svc::sys::esp_restart() };
         }
 
         if sessions.is_empty() {

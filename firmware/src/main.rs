@@ -188,16 +188,25 @@ static CRASH_CONTEXT: OnceLock<Option<String>> = OnceLock::new();
 
 /// Resolve the crash context once, at boot. If the last reset was a crash and
 /// a breadcrumb survived, keep it; otherwise clear any stale crumb so a later
-/// clean restart never inherits it.
+/// clean restart never inherits it. One planned restart is also attributed:
+/// the relay-health watchdog reboots deliberately (deaf signer, heap rot) and
+/// records why — its crumb rides the software reset so get_status can answer
+/// "why did my signer restart" without a serial console.
 fn init_crash_context() {
     let ctx = if reset_was_crash() {
         crash_crumb::take()
+    } else if reset_reason_str() == "software-restart" {
+        crash_crumb::take().filter(|op| op.starts_with("relay watchdog"))
     } else {
         crash_crumb::clear();
         None
     };
     if let Some(op) = &ctx {
-        log::error!("Recovered from a crash during: {op}");
+        if op.starts_with("relay watchdog") {
+            log::warn!("Planned recovery restart: {op}");
+        } else {
+            log::error!("Recovered from a crash during: {op}");
+        }
     }
     let _ = CRASH_CONTEXT.set(ctx);
 }

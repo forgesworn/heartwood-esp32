@@ -46,6 +46,9 @@ pub struct ClientSession {
     pub active_identity: Option<usize>,
     pub request_count: u32,
     pub window_start: Instant,
+    /// Monotonic recency stamp from `PolicyEngine::session_seq` — drives
+    /// least-recently-used eviction when the table is full.
+    pub last_seen: u64,
 }
 
 impl ClientSession {
@@ -56,6 +59,7 @@ impl ClientSession {
             active_identity: None,
             request_count: 0,
             window_start: Instant::now(),
+            last_seen: 0,
         }
     }
 
@@ -85,6 +89,9 @@ pub struct PolicyEngine {
     pub bridge_authenticated: bool,
     /// Dirty flag: slots changed since last NVS write.
     pub slots_dirty: bool,
+    /// Monotonic counter stamped onto sessions on every access — recency
+    /// order for LRU eviction without depending on clock resolution.
+    session_seq: u64,
 }
 
 impl PolicyEngine {
@@ -94,6 +101,7 @@ impl PolicyEngine {
             sessions: Vec::new(),
             bridge_authenticated: false,
             slots_dirty: false,
+            session_seq: 0,
         }
     }
 
@@ -162,22 +170,44 @@ impl PolicyEngine {
         client_pubkey: [u8; 32],
         master_slot: u8,
     ) -> Option<&mut ClientSession> {
+        self.session_seq += 1;
+        let seq = self.session_seq;
+
         let existing = self
             .sessions
             .iter()
             .position(|s| s.client_pubkey == client_pubkey && s.master_slot == master_slot);
 
         if let Some(idx) = existing {
-            return Some(&mut self.sessions[idx]);
+            let session = &mut self.sessions[idx];
+            session.last_seen = seq;
+            return Some(session);
         }
 
         if self.sessions.len() >= MAX_SESSIONS {
-            log::warn!("Max sessions reached -- rejecting new client");
-            return None;
+            // Evict the least-recently-used session instead of rejecting the
+            // new client. Sessions are per-boot request state (rate window,
+            // active identity) that rebuilds transparently on the evicted
+            // client's next request; rejecting here left a full table
+            // silently ignoring every new client until reboot.
+            if let Some(idx) = self
+                .sessions
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.last_seen)
+                .map(|(idx, _)| idx)
+            {
+                let evicted = self.sessions.swap_remove(idx);
+                log::info!(
+                    "Session table full -- evicted least-recent client {}…",
+                    &heartwood_common::hex::hex_encode(&evicted.client_pubkey)[..8]
+                );
+            }
         }
 
-        self.sessions
-            .push(ClientSession::new(client_pubkey, master_slot));
+        let mut session = ClientSession::new(client_pubkey, master_slot);
+        session.last_seen = seq;
+        self.sessions.push(session);
         self.sessions.last_mut()
     }
 
@@ -186,6 +216,7 @@ impl PolicyEngine {
         self.master_slots.clear();
         self.sessions.clear();
         self.bridge_authenticated = false;
+        self.session_seq = 0;
     }
 
     // -------------------------------------------------------------------------
@@ -696,6 +727,31 @@ mod tests {
         engine.restore_slot_state(snapshot);
         assert!(engine.list_slots(3).is_empty());
         assert!(!engine.slots_dirty);
+    }
+
+    #[test]
+    fn session_table_evicts_least_recent_when_full() {
+        let mut engine = PolicyEngine::new();
+        for i in 0..super::MAX_SESSIONS {
+            let mut pk = [0u8; 32];
+            pk[0] = i as u8;
+            assert!(engine.get_or_create_session(pk, 0).is_some());
+        }
+
+        // Touch the first client so it becomes the most recently used.
+        let first = [0u8; 32];
+        assert!(engine.get_or_create_session(first, 0).is_some());
+
+        // A new client is admitted by evicting the least-recent (client 1),
+        // never by rejection.
+        let new_client = [0xFF; 32];
+        assert!(engine.get_or_create_session(new_client, 0).is_some());
+        assert_eq!(engine.sessions.len(), super::MAX_SESSIONS);
+        assert!(engine.sessions.iter().any(|s| s.client_pubkey == new_client));
+        assert!(engine.sessions.iter().any(|s| s.client_pubkey == first));
+        let mut evicted = [0u8; 32];
+        evicted[0] = 1;
+        assert!(!engine.sessions.iter().any(|s| s.client_pubkey == evicted));
     }
 
     #[test]

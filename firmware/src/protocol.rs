@@ -244,19 +244,44 @@ pub fn try_read_frame(usb: &mut SerialPort<'_>, idle_timeout_ms: u32) -> Option<
 /// ESP32-S3. On the V3 the CP2102 UART path is more forgiving but we keep
 /// the same chunk size for consistency.
 pub fn write_frame(usb: &mut SerialPort<'_>, frame_type: u8, payload: &[u8]) {
-    /// Maximum bytes per `usb.write()` call. The USB-Serial-JTAG TX FIFO is
+    /// Maximum bytes per `usb.write_bounded()` call. The USB-Serial-JTAG TX FIFO is
     /// 64 bytes and the ESP-IDF ring buffer is typically 256 bytes, but we
     /// use a larger chunk to keep throughput reasonable while staying safe.
     const MAX_CHUNK: usize = 512;
+    /// Per-call wait for the driver to accept bytes (same tick unit as the
+    /// read path timeouts).
+    const WRITE_CHUNK_TIMEOUT: u32 = 100;
+    /// Cumulative zero-progress budget for one frame before it is dropped.
+    /// The native USB TX buffer only drains while a host reads; a suspended
+    /// laptop (Sapwood over WebSerial, lid closed) used to park the single
+    /// signing thread in a BLOCK write forever — in WiFi mode that froze the
+    /// whole relay loop, a deafness only a power-cycle cleared. Dropping the
+    /// frame is safe: the read side on both ends resynchronises on the magic
+    /// bytes, and a host that is not draining has no use for the bytes anyway.
+    const WRITE_STALL_BUDGET: u32 = 2_000;
 
     match frame::build_frame(frame_type, payload) {
         Ok(bytes) => {
             let mut pos = 0;
+            let mut stalled: u32 = 0;
             while pos < bytes.len() {
                 let end = (pos + MAX_CHUNK).min(bytes.len());
-                match usb.write(&bytes[pos..end]) {
-                    Ok(n) if n > 0 => pos += n,
-                    Ok(_) => {}
+                match usb.write_bounded(&bytes[pos..end], WRITE_CHUNK_TIMEOUT) {
+                    Ok(n) if n > 0 => {
+                        pos += n;
+                        stalled = 0;
+                    }
+                    Ok(_) => {
+                        stalled += WRITE_CHUNK_TIMEOUT;
+                        if stalled >= WRITE_STALL_BUDGET {
+                            log::warn!(
+                                "Serial write stalled at byte {}/{} — host not draining; dropping frame",
+                                pos,
+                                bytes.len()
+                            );
+                            return;
+                        }
+                    }
                     Err(e) => {
                         log::warn!("Serial write error at byte {}/{}: {:?}", pos, bytes.len(), e);
                         return;

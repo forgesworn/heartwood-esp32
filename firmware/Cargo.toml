@@ -1,6 +1,6 @@
 [package]
 name = "heartwood-esp32"
-version = "0.13.7"
+version = "0.13.8"
 edition = "2021"
 description = "nsec-tree signing device firmware for Heltec WiFi LoRa 32 (V3 and V4)"
 license = "MIT"

@@ -100,16 +100,50 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 // Frame I/O helpers
 // ---------------------------------------------------------------------------
 
-/// Write a complete frame to the serial port and flush.
+/// Write a complete frame to the serial port, paced, and flush.
+///
+/// Pacing matches Sapwood's measured cadence (`src/lib/pacing.ts`): a burst
+/// write suits the V3's baud-limited UART, but on native-USB boards (V4, C6)
+/// CDC delivers as fast as the host can push while the device's ring buffer
+/// is tiny and — in WiFi mode — the relay loop may poll USB as rarely as once
+/// a second. The frame HEAD must therefore drip in slowly until the firmware
+/// latches on and blocks draining; the tail can then cruise at the bridge's
+/// proven 64B/6ms. Without this, every OTA chunk overran the ring and the
+/// device never saw a complete frame (observed on a Heltec V4 in WiFi mode).
 fn send_frame(
     port: &mut Box<dyn serialport::SerialPort>,
     frame_type: u8,
     payload: &[u8],
 ) -> Result<(), String> {
+    const PACE_THRESHOLD: usize = 512;
+    const PACE_CHUNK: usize = 64;
+    const PACE_HEAD_BYTES: usize = 3072;
+    const PACE_HEAD_GAP: Duration = Duration::from_millis(24);
+    const PACE_GAP: Duration = Duration::from_millis(6);
+
     let bytes = frame::build_frame(frame_type, payload)
         .map_err(|e| format!("frame build error: {:?}", e))?;
-    port.write_all(&bytes)
-        .map_err(|e| format!("serial write error: {e}"))?;
+    if bytes.len() <= PACE_THRESHOLD {
+        port.write_all(&bytes)
+            .map_err(|e| format!("serial write error: {e}"))?;
+    } else {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = (offset + PACE_CHUNK).min(bytes.len());
+            port.write_all(&bytes[offset..end])
+                .map_err(|e| format!("serial write error: {e}"))?;
+            port.flush()
+                .map_err(|e| format!("serial flush error: {e}"))?;
+            if end < bytes.len() {
+                std::thread::sleep(if offset < PACE_HEAD_BYTES {
+                    PACE_HEAD_GAP
+                } else {
+                    PACE_GAP
+                });
+            }
+            offset = end;
+        }
+    }
     port.flush()
         .map_err(|e| format!("serial flush error: {e}"))?;
     Ok(())

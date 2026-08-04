@@ -658,7 +658,8 @@ fn main() {
             }
         };
 
-        match frame.frame_type {
+        let frame_type = frame.frame_type;
+        match frame_type {
             // 0x01 — add a master (host-derived) / 0x57 — self-generate on-device
             // / 0x58 — restore an existing 12-word phrase via the on-device picker
             FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
@@ -730,7 +731,7 @@ fn main() {
                     // Use the first loaded master for plaintext requests.
                     let master = &loaded_masters[0];
                     let response_json = nip46_handler::handle_request(
-                        &frame,
+                        frame,
                         &master.secret,
                         &master.label,
                         master.mode,
@@ -742,10 +743,10 @@ fn main() {
                         &mut identity_caches,
                         None,
                     );
-                    protocol::write_frame(
+                    protocol::write_owned_frame(
                         &mut usb,
                         FRAME_TYPE_NIP46_RESPONSE,
-                        response_json.as_bytes(),
+                        response_json,
                     );
                     // Persist slots if TOFU may have added one.
                     if !loaded_masters.is_empty() {
@@ -1009,7 +1010,7 @@ fn main() {
         // stay stuck on "SIGNED" or other transient confirmation screens.
         // Skip for OTA frames -- the OTA handler manages its own progress display,
         // and redrawing between chunks slows the transfer and generates log noise.
-        if !matches!(frame.frame_type,
+        if !matches!(frame_type,
             FRAME_TYPE_OTA_BEGIN | FRAME_TYPE_OTA_CHUNK | FRAME_TYPE_OTA_FINISH
         ) {
             oled::show_awaiting(&mut display);

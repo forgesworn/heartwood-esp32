@@ -225,7 +225,7 @@ pub(crate) fn derive_identity(
 /// frame depending on the transport. sign_event runs the interactive approval
 /// loop and returns a JSON string for all outcomes (approved, denied, timed out).
 pub fn handle_request(
-    frame: &Frame,
+    frame: Frame,
     master_secret: &[u8; 32],
     master_label: &str,
     master_mode: MasterMode,
@@ -237,7 +237,7 @@ pub fn handle_request(
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     client_pubkey: Option<&[u8; 32]>,
 ) -> String {
-    let mut request = match nip46::parse_request(&frame.payload) {
+    let request = match nip46::parse_request(&frame.payload) {
         Ok(r) => r,
         Err(e) => {
             log::warn!("Failed to parse NIP-46 request: {e}");
@@ -245,6 +245,41 @@ pub fn handle_request(
                 .unwrap_or_default();
         }
     };
+    drop(frame);
+
+    handle_parsed_request(
+        request,
+        master_secret,
+        master_label,
+        master_mode,
+        master_slot,
+        secp,
+        display,
+        button_pin,
+        policy_engine,
+        identity_caches,
+        client_pubkey,
+    )
+}
+
+/// Dispatch an already-parsed request.
+///
+/// Encrypted transports use this entry point so the decrypted JSON buffer can
+/// be released before signing. The old frame entry point remains for plaintext
+/// USB compatibility and forwards here after one parse.
+pub fn handle_parsed_request(
+    mut request: nip46::Nip46Request,
+    master_secret: &[u8; 32],
+    master_label: &str,
+    master_mode: MasterMode,
+    master_slot: u8,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    display: &mut Display<'_>,
+    button_pin: &PinDriver<'_, Input>,
+    policy_engine: &mut PolicyEngine,
+    identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
+    client_pubkey: Option<&[u8; 32]>,
+) -> String {
     // Capture caller intent before a legacy session's active identity may be
     // resolved into this field below. Only a caller-supplied context is a
     // strict-policy redirection attempt.
@@ -289,13 +324,19 @@ pub fn handle_request(
     }
 
     let method = nip46::Nip46Method::from_str(&request.method);
-    let event_kind = if matches!(method, nip46::Nip46Method::SignEvent) {
-        nip46::parse_unsigned_event(&request.params)
-            .ok()
-            .map(|e| e.kind)
+    let sign_event = if matches!(method, nip46::Nip46Method::SignEvent) {
+        // Parse once, by value, then release the stringified event before any
+        // approval UI, signing or response construction begins.
+        Some(nip46::parse_unsigned_event_owned(std::mem::take(
+            &mut request.params,
+        )))
     } else {
         None
     };
+    let event_kind = sign_event
+        .as_ref()
+        .and_then(|event| event.as_ref().ok())
+        .map(|event| event.kind);
 
     // Determine the client pubkey for policy lookups.
     // In encrypted mode (passthrough), it comes from the frame header.
@@ -304,10 +345,7 @@ pub fn handle_request(
         heartwood_common::hex::hex_encode(pk)
     } else {
         // Legacy mode — bridge injects the relay event author as _client_pubkey.
-        serde_json::from_slice::<serde_json::Value>(&frame.payload)
-            .ok()
-            .and_then(|v| v["_client_pubkey"].as_str().map(|s| s.to_string()))
-            .unwrap_or_default()
+        request.legacy_client_pubkey.take().unwrap_or_default()
     };
     let has_client = !client_hex.is_empty() && client_hex.len() == 64;
     let (client_is_bound, strict_slot) = if has_client {
@@ -394,26 +432,25 @@ pub fn handle_request(
 
     match request.method.as_str() {
         "sign_event" => {
+            let event = match sign_event.expect("sign_event request must prepare an event") {
+                Ok(event) => event,
+                Err(e) => {
+                    log::warn!("sign_event: bad event format: {e}");
+                    return build_error_json(&request.id, -3, "bad event format");
+                }
+            };
             match tier {
                 heartwood_common::policy::ApprovalTier::AutoApprove => {
                     log::info!("sign_event: auto-approved by policy");
-                    if let Ok(event) = nip46::parse_unsigned_event(&request.params) {
-                        crate::oled::show_auto_signed(display, &requester_label, event.kind);
-                    } else {
-                        crate::oled::show_auto_approved(display, &requester_label, "sign_event");
-                    }
-                    match handle_auto_sign(master_secret, master_mode, secp, &request) {
+                    crate::oled::show_auto_signed(display, &requester_label, event.kind);
+                    match handle_auto_sign(master_secret, master_mode, secp, &request, event) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),
                     }
                 }
                 heartwood_common::policy::ApprovalTier::OledNotify => {
-                    if let Ok(event) = nip46::parse_unsigned_event(&request.params) {
-                        crate::oled::show_auto_signed(display, &requester_label, event.kind);
-                    } else {
-                        crate::oled::show_auto_approved(display, &requester_label, "sign_event");
-                    }
-                    match handle_auto_sign(master_secret, master_mode, secp, &request) {
+                    crate::oled::show_auto_signed(display, &requester_label, event.kind);
+                    match handle_auto_sign(master_secret, master_mode, secp, &request, event) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),
                     }
@@ -427,6 +464,7 @@ pub fn handle_request(
                         button_pin,
                         &request,
                         &requester_label,
+                        event,
                     );
                     let is_success = serde_json::from_str::<serde_json::Value>(&result)
                         .map(|v| v.get("error").is_none())
@@ -839,11 +877,10 @@ fn handle_auto_sign(
     master_mode: MasterMode,
     secp: &Arc<Secp256k1<SignOnly>>,
     request: &nip46::Nip46Request,
+    event: UnsignedEvent,
 ) -> Result<String, String> {
-    let mut event = nip46::parse_unsigned_event(&request.params)
-        .map_err(|e| format!("bad event format: {e}"))?;
     let signed = do_sign(
-        &mut event,
+        event,
         master_secret,
         master_mode,
         secp,
@@ -864,15 +901,8 @@ fn handle_sign_event(
     button_pin: &PinDriver<'_, Input>,
     request: &nip46::Nip46Request,
     requester_label: &str,
+    event: UnsignedEvent,
 ) -> String {
-    let mut event = match nip46::parse_unsigned_event(&request.params) {
-        Ok(e) => e,
-        Err(e) => {
-            log::warn!("sign_event: bad event format: {e}");
-            return build_error_json(&request.id, -3, "bad event format");
-        }
-    };
-
     let (kind, content_preview) = nip46::event_display_summary(&event, 50);
 
     // Show the signing request on the OLED and wait for button approval.
@@ -892,7 +922,7 @@ fn handle_sign_event(
             log::info!("sign_event: approved");
             crate::oled::show_signing(display);
             match do_sign(
-                &mut event,
+                event,
                 master_secret,
                 master_mode,
                 secp,
@@ -937,7 +967,7 @@ fn handle_sign_event(
 // ---------------------------------------------------------------------------
 
 fn do_sign(
-    event: &mut UnsignedEvent,
+    mut event: UnsignedEvent,
     master_secret: &[u8; 32],
     master_mode: MasterMode,
     secp: &Arc<Secp256k1<SignOnly>>,
@@ -973,9 +1003,9 @@ fn do_sign(
     // event reports `hex_pubkey`, yielding an id that fails NIP-01 verification.
     // Overwriting guarantees id, pubkey and sig all agree. Matches the esp8266
     // signer, which already overwrites unconditionally (sign_path.rs).
-    event.pubkey = hex_pubkey.clone();
+    event.pubkey = hex_pubkey;
 
-    let event_id_bytes = nip46::compute_event_id(event);
+    let event_id_bytes = nip46::compute_event_id(&event);
 
     let sig_bytes = crate::sign::sign_hash(secp, &signing_secret, &event_id_bytes)
         .map_err(|e| e.to_string())?;
@@ -987,11 +1017,11 @@ fn do_sign(
 
     Ok(SignedEvent {
         id: event_id_hex,
-        pubkey: hex_pubkey,
+        pubkey: event.pubkey,
         created_at: event.created_at,
         kind: event.kind,
-        tags: event.tags.clone(),
-        content: event.content.clone(),
+        tags: event.tags,
+        content: event.content,
         sig: sig_hex,
     })
 }

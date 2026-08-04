@@ -20,7 +20,7 @@ use heartwood_common::hex::hex_encode;
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
 use heartwood_common::types::{
-    FRAME_TYPE_NACK, FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_SIGN_ENVELOPE_RESPONSE, MasterMode,
+    FRAME_TYPE_NACK, FRAME_TYPE_SIGN_ENVELOPE_RESPONSE, MasterMode,
 };
 use zeroize::Zeroizing;
 
@@ -140,49 +140,48 @@ pub fn handle_encrypted_request(
 
     log::info!("Decrypted NIP-46 request ({} bytes)", plaintext_json.len());
 
-    // Build a plaintext frame for the NIP-46 handler.
-    let inner_frame = Frame {
-        frame_type: FRAME_TYPE_NIP46_REQUEST,
-        payload: plaintext_json.as_bytes().to_vec(),
+    let request = match nip46::parse_request(plaintext_json.as_bytes()) {
+        Ok(request) => request,
+        Err(e) => {
+            log::warn!("Failed to parse decrypted NIP-46 request: {e}");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return;
+        }
     };
+    drop(plaintext_json);
 
     let client_pubkey_hex = hex_encode(&client_pubkey);
-    let parsed_request = nip46::parse_request(&inner_frame.payload).ok();
-    let request_id = parsed_request
-        .as_ref()
-        .map(|request| request.id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-    let slot_snapshot = parsed_request.as_ref().and_then(|request| {
+    let request_id = request.id.clone();
+    let slot_snapshot = {
         let method = nip46::Nip46Method::from_str(&request.method);
         let event_kind = if matches!(method, nip46::Nip46Method::SignEvent) {
-            nip46::parse_unsigned_event(&request.params)
-                .ok()
-                .map(|event| event.kind)
+            nip46::unsigned_event_kind(&request.params)
         } else {
             None
         };
         let tier = policy_engine.check(owning_slot, &client_pubkey_hex, &method, event_kind);
-        crate::nip46_handler::request_may_mutate_slot_state(request, tier)
+        crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
             .then(|| policy_engine.snapshot_slot_state(owning_slot))
-    });
+    };
 
     // Breadcrumb the in-flight request so a crash while handling it is
     // attributable on the next boot (see crash_crumb). Cleared after publish.
-    if let Some(req) = &parsed_request {
-        let mut crumb = format!("usb {}", req.method);
-        if matches!(nip46::Nip46Method::from_str(&req.method), nip46::Nip46Method::SignEvent) {
-            if let Ok(ev) = nip46::parse_unsigned_event(&req.params) {
-                crumb.push_str(&format!(" kind {}", ev.kind));
+    {
+        let mut crumb = format!("usb {}", request.method);
+        if matches!(
+            nip46::Nip46Method::from_str(&request.method),
+            nip46::Nip46Method::SignEvent
+        ) {
+            if let Some(kind) = nip46::unsigned_event_kind(&request.params) {
+                crumb.push_str(&format!(" kind {kind}"));
             }
         }
         crate::crash_crumb::set(&crumb);
-    } else {
-        crate::crash_crumb::set("usb request (unparsed)");
     }
 
     // Dispatch to the handler — always returns a JSON response string.
-    let mut response_json = crate::nip46_handler::handle_request(
-        &inner_frame,
+    let mut response_json = crate::nip46_handler::handle_parsed_request(
+        request,
         &signing_secret,
         &owning_label,
         owning_mode,
@@ -248,10 +247,6 @@ pub fn handle_encrypted_request(
         }
     }
 
-    // Free request buffers before encrypting the response.
-    drop(inner_frame);
-    drop(plaintext_json);
-
     // Heap guard: a large response (e.g. a big nip44_decrypt plaintext) would
     // need several transient buffers a few times its size to re-encrypt and
     // frame — enough to abort the allocator on a fragmented no-PSRAM heap.
@@ -274,10 +269,8 @@ pub fn handle_encrypted_request(
     // previously required the daemon to send the ~7KB ciphertext back to the
     // device for signing — a pattern that caused silent ESP32 reboots.
     let nonce = random_nonce_32();
-    match nip44::encrypt(&conversation_key, &response_json, &nonce) {
+    match nip44::encrypt_owned(&conversation_key, response_json, &nonce) {
         Ok(ciphertext_b64) => {
-            drop(response_json);
-
             // Derive the author pubkey from the master secret (never trust
             // the lookup pubkey from the frame for the event's pubkey field).
             let keypair = match secp256k1::Keypair::from_seckey_slice(secp, &signing_secret[..]) {
@@ -318,14 +311,14 @@ pub fn handle_encrypted_request(
                 sig: hex_encode(&sig_bytes),
             };
 
-            match serde_json::to_string(&signed) {
-                Ok(event_json) => {
-                    log::info!("Inline envelope: signed {} byte event", event_json.len());
-                    protocol::write_frame(
-                        usb,
-                        FRAME_TYPE_SIGN_ENVELOPE_RESPONSE,
-                        event_json.as_bytes(),
-                    );
+            match protocol::write_json_frame(
+                usb,
+                FRAME_TYPE_SIGN_ENVELOPE_RESPONSE,
+                &signed,
+                signed.content.len().saturating_add(768),
+            ) {
+                Ok(event_len) => {
+                    log::info!("Inline envelope: signed {event_len} byte event");
                 }
                 Err(e) => {
                     log::error!("Inline envelope: JSON serialise failed: {e}");

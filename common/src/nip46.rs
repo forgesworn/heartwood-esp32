@@ -8,6 +8,7 @@
 #[allow(unused_imports)]
 use alloc::{format, string::{String, ToString}, vec, vec::Vec};
 
+use core::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +43,10 @@ pub struct Nip46Request {
     pub params: Vec<Value>,
     /// Optional Heartwood extension context.
     pub heartwood: Option<HeartwoodContext>,
+    /// Relay author injected by legacy bridges that cannot use the encrypted
+    /// frame header. Modern encrypted transports supply this out of band.
+    #[serde(rename = "_client_pubkey", default, skip_serializing_if = "Option::is_none")]
+    pub legacy_client_pubkey: Option<String>,
 }
 
 /// A NIP-46 JSON-RPC response sent back to the client.
@@ -440,36 +445,43 @@ fn json_string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-fn content_display_preview(content: &str) -> String {
+const STRUCTURED_PREVIEW_MAX_BYTES: usize = 2_048;
+
+fn content_display_preview(content: &str, max_chars: usize) -> String {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return String::new();
     }
 
-    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-        return trimmed.to_string();
+    // Parsing JSON into Value can allocate a second copy of every string in
+    // the content. Large sign_event bodies (documents and terminal art) only
+    // need a short OLED preview, so never materialise their whole body here.
+    // Small app-data JSON still gets the richer label extraction below.
+    let value = if trimmed.len() <= STRUCTURED_PREVIEW_MAX_BYTES {
+        serde_json::from_str::<Value>(trimmed).ok()
+    } else {
+        None
     };
 
-    if let Some(description) = json_string_field(&value, "description")
-        .or_else(|| json_string_field(&value, "desription"))
-    {
-        return description.to_string();
-    }
+    if let Some(value) = value {
+        if let Some(description) = json_string_field(&value, "description")
+            .or_else(|| json_string_field(&value, "desription"))
+        {
+            return truncate_with_ellipsis(description, max_chars);
+        }
 
-    if let Some(subkey) = json_string_field(&value, "subkey") {
-        return format!("subkey: {subkey}");
-    }
+        if let Some(subkey) = json_string_field(&value, "subkey") {
+            return truncate_with_ellipsis(&format!("subkey: {subkey}"), max_chars);
+        }
 
-    for key in ["title", "name", "display_name"] {
-        if let Some(label) = json_string_field(&value, key) {
-            return label.to_string();
+        for key in ["title", "name", "display_name"] {
+            if let Some(label) = json_string_field(&value, key) {
+                return truncate_with_ellipsis(label, max_chars);
+            }
         }
     }
 
-    match value {
-        Value::String(s) => s.trim().to_string(),
-        _ => trimmed.to_string(),
-    }
+    truncate_with_ellipsis(trimmed, max_chars)
 }
 
 /// Return a brief summary of an unsigned event suitable for display on the OLED.
@@ -477,8 +489,7 @@ fn content_display_preview(content: &str) -> String {
 /// Returns `(kind, preview)`. JSON app-data content is collapsed to its useful
 /// human label when clients provide one; otherwise the raw content is truncated.
 pub fn event_display_summary(event: &UnsignedEvent, max_chars: usize) -> (u64, String) {
-    let preview = content_display_preview(&event.content);
-    (event.kind, truncate_with_ellipsis(&preview, max_chars))
+    (event.kind, content_display_preview(&event.content, max_chars))
 }
 
 // ---------------------------------------------------------------------------
@@ -517,19 +528,196 @@ pub fn parse_unsigned_event(params: &[Value]) -> Result<UnsignedEvent, String> {
     Ok(event)
 }
 
+/// Extract only the event kind without materialising its tags or content.
+///
+/// Relay routing, policy checks and crash breadcrumbs need the kind before the
+/// request reaches the signer. Deserialising the complete event at each of
+/// those call sites duplicates large document bodies and can exhaust a
+/// no-PSRAM device before its response-size guard runs.
+pub fn unsigned_event_kind(params: &[Value]) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct KindOnly {
+        kind: u64,
+    }
+
+    match params.first()? {
+        Value::String(raw) => serde_json::from_str::<KindOnly>(raw).ok().map(|event| event.kind),
+        Value::Object(object) => object.get("kind").and_then(Value::as_u64),
+        _ => None,
+    }
+}
+
+/// Consume `sign_event` params while parsing the event.
+///
+/// The by-value form lets firmware drop the stringified request body as soon
+/// as Serde has built the one `UnsignedEvent` that signing actually needs.
+pub fn parse_unsigned_event_owned(params: Vec<Value>) -> Result<UnsignedEvent, String> {
+    let raw = params
+        .into_iter()
+        .next()
+        .ok_or_else(|| "sign_event params is empty".to_string())?;
+
+    match raw {
+        Value::String(raw) => serde_json::from_str(&raw)
+            .map_err(|e| format!("failed to parse event string: {e}")),
+        Value::Object(object) => serde_json::from_value(Value::Object(object))
+            .map_err(|e| format!("failed to parse event object: {e}")),
+        other => Err(format!(
+            "unexpected params[0] type: {}",
+            other.as_str().unwrap_or("unknown")
+        )),
+    }
+}
+
 /// Build a `sign_event` success response containing the signed event JSON.
 pub fn build_sign_response(request_id: &str, signed_event: &SignedEvent) -> Result<String, String> {
-    let event_json = serde_json::to_string(signed_event)
-        .map_err(|e| format!("failed to serialise signed event: {e}"))?;
+    // NIP-46's result is itself a JSON-encoded event string. Building the
+    // inner event with serde_json::to_string and then serialising that String
+    // again briefly holds two full escaped copies. On a no-PSRAM signer that
+    // is enough to abort the allocator for an otherwise relay-safe document.
+    // Write both escaping layers directly into the final response instead.
+    let mut capacity = 256usize.saturating_add(json_string_content_len(request_id));
+    for value in [
+        signed_event.id.as_str(),
+        signed_event.pubkey.as_str(),
+        signed_event.content.as_str(),
+        signed_event.sig.as_str(),
+    ] {
+        capacity = capacity.saturating_add(nested_json_string_len(value));
+    }
+    for tag in &signed_event.tags {
+        capacity = capacity.saturating_add(2);
+        for value in tag {
+            capacity = capacity.saturating_add(nested_json_string_len(value).saturating_add(1));
+        }
+    }
+    let mut response = String::with_capacity(capacity);
+    response.push_str("{\"id\":");
+    push_json_string(&mut response, request_id);
+    response.push_str(",\"result\":\"");
 
-    let response = Nip46Response {
-        id: request_id.to_string(),
-        result: Some(event_json),
-        error: None,
-    };
+    push_outer_json_fragment(&mut response, "{\"id\":");
+    push_nested_json_string(&mut response, &signed_event.id);
+    push_outer_json_fragment(&mut response, ",\"pubkey\":");
+    push_nested_json_string(&mut response, &signed_event.pubkey);
+    push_outer_json_fragment(&mut response, ",\"created_at\":");
+    write!(&mut response, "{}", signed_event.created_at)
+        .map_err(|_| "failed to serialise sign response".to_string())?;
+    push_outer_json_fragment(&mut response, ",\"kind\":");
+    write!(&mut response, "{}", signed_event.kind)
+        .map_err(|_| "failed to serialise sign response".to_string())?;
+    push_outer_json_fragment(&mut response, ",\"tags\":[");
+    for (tag_index, tag) in signed_event.tags.iter().enumerate() {
+        if tag_index > 0 {
+            response.push(',');
+        }
+        response.push('[');
+        for (value_index, value) in tag.iter().enumerate() {
+            if value_index > 0 {
+                response.push(',');
+            }
+            push_nested_json_string(&mut response, value);
+        }
+        response.push(']');
+    }
+    push_outer_json_fragment(&mut response, "],\"content\":");
+    push_nested_json_string(&mut response, &signed_event.content);
+    push_outer_json_fragment(&mut response, ",\"sig\":");
+    push_nested_json_string(&mut response, &signed_event.sig);
+    push_outer_json_fragment(&mut response, "}");
+    response.push_str("\"}");
+    Ok(response)
+}
 
-    serde_json::to_string(&response)
-        .map_err(|e| format!("failed to serialise sign response: {e}"))
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    push_json_string_content(out, value);
+    out.push('"');
+}
+
+fn push_json_string_content(out: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{000c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            control if (control as u32) <= 0x1f => {
+                let byte = control as u8;
+                out.push_str("\\u00");
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            other => out.push(other),
+        }
+    }
+}
+
+fn json_string_content_len(value: &str) -> usize {
+    value
+        .chars()
+        .map(|character| match character {
+            '"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 2,
+            control if (control as u32) <= 0x1f => 6,
+            other => other.len_utf8(),
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+fn nested_json_string_len(value: &str) -> usize {
+    value
+        .chars()
+        .map(|character| match character {
+            '"' | '\\' => 4,
+            '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 3,
+            control if (control as u32) <= 0x1f => 7,
+            other => other.len_utf8(),
+        })
+        .fold(4usize, usize::saturating_add)
+}
+
+/// Append raw inner-JSON syntax while already inside the outer result String.
+fn push_outer_json_fragment(out: &mut String, fragment: &str) {
+    push_json_string_content(out, fragment);
+}
+
+/// Append one inner event string value through both JSON escaping layers.
+fn push_nested_json_string(out: &mut String, value: &str) {
+    push_outer_json_fragment(out, "\"");
+    for character in value.chars() {
+        match character {
+            '"' => push_outer_json_fragment(out, "\\\""),
+            '\\' => push_outer_json_fragment(out, "\\\\"),
+            '\u{0008}' => push_outer_json_fragment(out, "\\b"),
+            '\t' => push_outer_json_fragment(out, "\\t"),
+            '\n' => push_outer_json_fragment(out, "\\n"),
+            '\u{000c}' => push_outer_json_fragment(out, "\\f"),
+            '\r' => push_outer_json_fragment(out, "\\r"),
+            control if (control as u32) <= 0x1f => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let byte = control as u8;
+                let escaped = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[(byte >> 4) as usize],
+                    HEX[(byte & 0x0f) as usize],
+                ];
+                // All bytes are ASCII by construction.
+                push_outer_json_fragment(
+                    out,
+                    core::str::from_utf8(&escaped).unwrap_or("\\u0000"),
+                );
+            }
+            other => out.push(other),
+        }
+    }
+    push_outer_json_fragment(out, "\"");
 }
 
 /// Build a `get_public_key` success response.
@@ -816,6 +1004,34 @@ mod tests {
     }
 
     #[test]
+    fn event_kind_can_be_read_without_parsing_the_content() {
+        let deliberately_invalid_event =
+            r#"{"kind":31436,"content":false,"tags":"not an event"}"#;
+        let params = vec![Value::String(deliberately_invalid_event.to_string())];
+
+        assert_eq!(unsigned_event_kind(&params), Some(31_436));
+        assert!(parse_unsigned_event(&params).is_err());
+    }
+
+    #[test]
+    fn owned_event_parser_accepts_string_and_object_params() {
+        let event_json =
+            r#"{"created_at":1234,"kind":31436,"tags":[["d","/"]],"content":"art"}"#;
+        let from_string = parse_unsigned_event_owned(vec![Value::String(event_json.to_string())])
+            .unwrap();
+        let from_object = parse_unsigned_event_owned(vec![serde_json::from_str(event_json).unwrap()])
+            .unwrap();
+
+        assert_eq!(from_string.kind, 31_436);
+        assert_eq!(from_string.content, "art");
+        assert_eq!(from_string.pubkey, from_object.pubkey);
+        assert_eq!(from_string.created_at, from_object.created_at);
+        assert_eq!(from_string.kind, from_object.kind);
+        assert_eq!(from_string.tags, from_object.tags);
+        assert_eq!(from_string.content, from_object.content);
+    }
+
+    #[test]
     fn test_build_error_response() {
         let json = build_error_response("req99", -32600, "invalid request").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -866,6 +1082,48 @@ mod tests {
 
         // error field must be absent (not null) when there is no error.
         assert!(parsed.get("error").is_none(), "error key should be absent");
+    }
+
+    #[test]
+    fn sign_response_streaming_matches_serde_exactly() {
+        let signed = SignedEvent {
+            id: "id-\"\\\n\u{0001}-雪".to_string(),
+            pubkey: "pubkey".to_string(),
+            created_at: 1_777_777_777,
+            kind: 31_436,
+            tags: vec![
+                vec!["d".to_string(), "path/with \"quotes\"".to_string()],
+                vec!["terminal".to_string(), "ansi\\escape\u{001b}".to_string()],
+            ],
+            content: "line one\nline two\t\\ \" 驴 \u{0008}\u{000c}\r".to_string(),
+            sig: "sig".to_string(),
+        };
+        let event_json = serde_json::to_string(&signed).unwrap();
+        let expected = serde_json::to_string(&Nip46Response {
+            id: "request-\"\\\n雪".to_string(),
+            result: Some(event_json),
+            error: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            build_sign_response("request-\"\\\n雪", &signed).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn large_event_preview_does_not_parse_or_copy_the_whole_json_body() {
+        let mut event = sample_event();
+        event.content = format!(
+            "{{\"description\":\"{}\"}}",
+            "high definition terminal art ".repeat(200)
+        );
+
+        let (_, summary) = event_display_summary(&event, 50);
+        assert_eq!(summary.chars().count(), 53);
+        assert!(summary.ends_with("..."));
+        assert!(summary.starts_with("{\"description\":"));
     }
 
     #[test]

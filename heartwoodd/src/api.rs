@@ -141,6 +141,20 @@ fn backend_to_http(err: BackendError) -> Response {
         BackendError::PendingApproval(id) => {
             (StatusCode::ACCEPTED, Json(serde_json::json!({"pending_approval": id}))).into_response()
         }
+        BackendError::RequestTooLarge { bytes, limit } => {
+            // 413 rather than 500: the daemon and the signer are both fine,
+            // the caller sent something too big. Include both numbers so the
+            // client can say how much to trim rather than guess.
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "error": format!("request is {bytes} bytes; this signer accepts at most {limit}"),
+                    "bytes": bytes,
+                    "limit": limit,
+                })),
+            )
+                .into_response()
+        }
         BackendError::Internal(msg) => {
             api_err(StatusCode::INTERNAL_SERVER_ERROR, msg)
         }

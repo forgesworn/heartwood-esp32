@@ -58,6 +58,15 @@ pub enum BackendError {
     /// The request has been queued for manual approval. The string is the
     /// approval ID that the caller can poll or display.
     PendingApproval(String),
+    /// The request is larger than the signer can carry. Carries the request
+    /// size and the limit, both in bytes.
+    ///
+    /// Distinct from `Internal` on purpose: this is a client mistake with a
+    /// specific remedy (send a smaller event), not a daemon fault, and it is
+    /// the one signing failure a caller can actually act on. Without it an
+    /// oversize request surfaced as a bare frame-build failure or, worse, as a
+    /// silent timeout from the device.
+    RequestTooLarge { bytes: usize, limit: usize },
     /// An internal error with a human-readable description.
     Internal(String),
 }
@@ -72,6 +81,10 @@ impl fmt::Display for BackendError {
             BackendError::Denied          => write!(f, "request denied"),
             BackendError::UserCancelled   => write!(f, "user did not confirm"),
             BackendError::PendingApproval(id) => write!(f, "pending approval: {id}"),
+            BackendError::RequestTooLarge { bytes, limit } => write!(
+                f,
+                "request is {bytes} bytes; this signer accepts at most {limit}"
+            ),
             BackendError::Internal(msg)   => write!(f, "internal error: {msg}"),
         }
     }

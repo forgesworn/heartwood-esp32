@@ -329,8 +329,26 @@ impl SigningBackend for SerialBackend {
         created_at: u64,
         ciphertext: &str,
     ) -> Result<String, BackendError> {
+        // Pre-flight the size before touching the port.
+        //
+        // The bridge relays opaque ciphertext, so it cannot see the event
+        // content and cannot check it against the signer's max_sign_bytes.
+        // What it can check is the frame it is about to build. Letting
+        // build_frame fail instead produced "frame build failed:
+        // PayloadTooLarge", which reaches the caller as an opaque 500, and the
+        // relay path is worse still: the device drops an oversize frame and
+        // reconnects, so the client sees only a timeout. Both hide a request
+        // the caller could simply have made smaller.
+        const ENCRYPTED_REQUEST_HEADER: usize = 72; // 32 master + 32 client + 8 created_at
+        if ENCRYPTED_REQUEST_HEADER + ciphertext.len() > MAX_PAYLOAD_SIZE {
+            return Err(BackendError::RequestTooLarge {
+                bytes: ENCRYPTED_REQUEST_HEADER + ciphertext.len(),
+                limit: MAX_PAYLOAD_SIZE,
+            });
+        }
+
         // Payload: [master_pub_32][client_pub_32][created_at_u64_be_8][ciphertext...]
-        let mut payload = Vec::with_capacity(72 + ciphertext.len());
+        let mut payload = Vec::with_capacity(ENCRYPTED_REQUEST_HEADER + ciphertext.len());
         payload.extend_from_slice(master_pubkey);
         payload.extend_from_slice(client_pubkey);
         payload.extend_from_slice(&created_at.to_be_bytes());

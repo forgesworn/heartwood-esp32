@@ -1130,6 +1130,23 @@ mod tests {
     }
 
     #[test]
+    fn sign_event_compact_is_policed_exactly_as_sign_event() {
+        // Load-bearing invariant, not a formality. `evaluate_slot_policy` is
+        // handed `Nip46Method::as_str()`, and it gates on the literal
+        // "sign_event" for allowed_methods, signing_approved and allowed_kinds.
+        // If the compact spelling ever became its own variant, it would miss
+        // every one of those checks and become a way to sign around the slot's
+        // permissions. Both spellings must collapse to the same method here.
+        let standard = Nip46Method::from_str("sign_event");
+        let compact = Nip46Method::from_str("sign_event_compact");
+        assert_eq!(compact, standard);
+        assert_eq!(compact.as_str(), "sign_event");
+        assert_eq!(compact.always_requires_button(), standard.always_requires_button());
+        assert_eq!(compact.always_auto_approve(), standard.always_auto_approve());
+        assert_eq!(compact.requires_tree_mode(), standard.requires_tree_mode());
+    }
+
+    #[test]
     fn scan_method_reads_the_method_before_parsing() {
         let event = r#"{"kind":1,"created_at":1,"tags":[],"content":"hi"}"#;
         let req = format!(

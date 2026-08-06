@@ -27,10 +27,39 @@ The true threshold is somewhere in 28672..32000; narrowing it further needs
 more attended runs.
 
 That crash is above the advertised `max_sign_bytes` of 20480, so a client that
-respects the advertised limit never reaches it. The guard is correctly
-conservative. The crash is still a real defect: nothing structural stops a
-request of that size arriving over USB, and `MAX_PAYLOAD_SIZE` (32768) permits
-it.
+respects the advertised limit never reached it. But nothing stopped a request
+of that size arriving over USB, and `MAX_PAYLOAD_SIZE` (32768) permitted it.
+
+### Fixed: the advertised ceiling is now enforced
+
+`response_transportable` covers the encrypted path (`transport.rs`) and the
+relay path, but **nothing guarded the plaintext USB path**. It ran straight
+from `handle_request` into signing and response-building, and the panic
+happened inside that window, before any guard could have run.
+
+`handle_request` now rejects a `sign_event` whose serialised event exceeds
+`board::MAX_SIGN_BYTES + SIGN_RESPONSE_OVERHEAD`, immediately after parsing and
+before anything allocates at signing size. Parsing is already proven safe well
+past that bound, so measuring the actual event is both accurate and cheap.
+
+Re-flashed and verified on the same V4:
+
+| Content | Frame | Before | After |
+|---------|-------|--------|-------|
+| 20480 | 20686 | signed | reaches approval prompt |
+| 20992 | 21198 | signed | `event is too large for this signer` |
+| 21504 | 21710 | signed | `event is too large for this signer` |
+| 28672 | 28878 | signed | `event is too large for this signer` |
+| 32000 | 32206 | **panic** | `event is too large for this signer` |
+
+The boundary is exact: the device now accepts precisely what it advertises and
+refuses everything above, with no reboot at any size.
+
+This is deliberately stricter than before. The device previously signed up to
+about 28672 bytes and then fell off a cliff. Refusing predictably at the
+advertised number is worth losing that undocumented headroom, which existed
+only in the run-up to a crash. Raising the number is a separate decision that
+belongs with PSRAM (see the plan).
 
 **Heap does not move with request size.** Free heap sat at 213 KB and the
 largest contiguous block at 148 KB across every size from 575 B to 32 KB, on
@@ -188,11 +217,10 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
 
 ## What is still unmeasured
 
-- **The exact post-approval crash threshold**, known only to lie in
-  28672..32000 bytes of content. Each bisection step costs a button press.
-  Worth pinning down, because a panic is a much worse failure mode than the
-  refusal `response_transportable` is supposed to produce, and it suggests the
-  guard is not covering this path on USB.
+- **The exact point the old firmware panicked**, known only to lie in
+  28672..32000 bytes of content. Now academic: the ceiling is enforced at
+  20480 and the crash is unreachable. Worth pinning down only if
+  `MAX_SIGN_BYTES` is ever raised, since it marks where the real headroom ends.
 - **The relay path**, which is the one the plan's 20480 figure describes and
   the one that binds in the product. It needs a paired auto-signing app so it
   can be swept without a press per step, and it is the path that exercises

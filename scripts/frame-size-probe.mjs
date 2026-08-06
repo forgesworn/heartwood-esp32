@@ -204,9 +204,14 @@ for (const size of SIZES) {
   const frame = buildFrame(NIP46_REQUEST, Buffer.from(body))
 
   process.stdout.write(`frame ${String(frame.length).padStart(6)} B ... `)
+  // Attach the reader BEFORE writing. A refusal (event over max_sign_bytes)
+  // comes back almost instantly, and can land while the paced write is still
+  // running; a listener attached afterwards misses it and the step reads as a
+  // false no_reply.
+  const replyPromise = readFrame(port, [NIP46_RESPONSE, NACK], SIGN ? 45000 : 20000)
   await writePaced(port, frame)
   // Signing has to outwait the 30s on-device approval timeout.
-  const reply = await readFrame(port, [NIP46_RESPONSE, NACK], SIGN ? 45000 : 20000)
+  const reply = await replyPromise
   // Firmware 0.14+ reports heap alongside uptime, so each step records what
   // the allocator looked like straight after handling it. largest_block is the
   // number that actually binds a large response, not free_heap.

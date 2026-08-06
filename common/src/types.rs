@@ -152,16 +152,27 @@ pub const MAX_SIGN_CONTENT_USB: usize = MAX_PAYLOAD_SIZE - SIGN_RESPONSE_OVERHEA
 /// Largest event content that can be signed and returned over the relay
 /// (WiFi-standalone NIP-46) transport.
 ///
-/// Much smaller than the USB figure because the relay response is NIP-44
-/// encrypted and base64'd before it is wrapped in a kind:24133 event and
-/// pushed through a WebSocket frame. Working backwards from the firmware's
-/// 32768-byte inbound WS cap: subtract ~330 bytes of event envelope, undo the
-/// 4/3 base64 expansion and the 67 bytes of NIP-44 nonce/MAC/version, and the
-/// result lands on the NIP-44 v2 padding step of 20480. The next step up
-/// (24576) does not fit.
+/// Much smaller than the USB figure because both directions are NIP-44
+/// encrypted and base64'd before being wrapped in a kind:24133 event and
+/// pushed through a WebSocket frame, against the firmware's 32768-byte
+/// inbound cap.
 ///
-/// Derivation and the full ladder: docs/plans/2026-08-06-message-size-limits.md
-pub const MAX_SIGN_CONTENT_RELAY: usize = 20480;
+/// **This value is measured, not derived.** Deriving it from the response side
+/// alone gave 20480, and that was wrong: the request is the larger of the two,
+/// because NIP-46 carries the event as a JSON *string inside* the params
+/// array, so the event's own quotes are escaped a second time before the whole
+/// request is padded, encrypted and base64'd. Measured on a V4 over a public
+/// relay on 2026-08-06: 16384 bytes of content signs (request 27824 B on the
+/// wire, response 27396 B), while 20480 puts the request at 33288 B, over the
+/// cap, and panicked the signer rather than being refused.
+///
+/// So this is the largest NIP-44 padding step that fits, one below the
+/// derivation's answer. Do not raise it back on the strength of arithmetic
+/// without re-running scripts/relay-size-sweep.mjs.
+///
+/// Ladder and workings: docs/plans/2026-08-06-message-size-limits.md
+/// Measurements: docs/BENCH-2026-08-06-message-sizes.md
+pub const MAX_SIGN_CONTENT_RELAY: usize = 16384;
 
 /// Provisioning mode for a master secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

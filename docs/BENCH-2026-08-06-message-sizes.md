@@ -78,6 +78,51 @@ limit on this board. Uptime rose monotonically across both sweeps
 The post-approval leg is unmeasured because every `sign_event` opens a 30 s
 physical approval prompt and no press was made during the runs.
 
+## The relay transport, measured
+
+Run with `scripts/relay-size-sweep.mjs` as an ordinary NIP-46 client against a
+throwaway connection slot with auto-sign on, so no button press per step.
+
+**The derived ceiling of 20480 was wrong. The measured ceiling is 16384.**
+
+| Content | Request on wire | Response | Outcome |
+|---------|-----------------|----------|---------|
+| 1024 | 2224 | 2140 | signed |
+| 4096 | 7344 | 6916 | signed |
+| 8192 | 14172 | 13744 | signed |
+| 10240 | 16904 | 16476 | signed |
+| **16384** | **27824** | **27396** | **signed** |
+| 20480 | 33288 | -- | **PANIC** |
+| 24576 | 38748 | -- | no reply |
+| 32768 | 55132 | -- | no reply |
+
+Two things the arithmetic missed.
+
+**The request is bigger than the response.** The derivation worked backwards
+from the response, but NIP-46 carries the event as a JSON *string inside* the
+params array, so the event's own quotes are escaped a second time before the
+request is padded, encrypted and base64'd. At 20480 bytes of content the
+request reaches 33288 bytes on the wire, over the firmware's 32768-byte
+`MAX_WS_FRAME`, while the response would have fitted.
+
+**It panics rather than refusing.** 20480 did not produce the clean
+"frame exceeds cap" drop that `relay.rs:4351` implies. The device crashed:
+`last_reset: "panic"`, `crashed_during: "relay inbound event (heap 130k)"`.
+Note the 130 KB of free heap at the time — this is not an out-of-memory
+condition, so a heap threshold was never going to catch it and a size ceiling
+is the reliable defence. Recovery is slow too: after the crash the relay
+session took minutes to become usable again, so each oversize request costs far
+more than the one request.
+
+### Relays differ, and the tighter one binds first
+
+The same sweep against two relays gave different ceilings: one capped content
+at 10240, another allowed 16384. So in the field the effective limit is the
+*minimum* of the signer's ceiling and the tightest relay in the configured set,
+and a signer that works on one relay can fail on another at the same size. Any
+future relay figure must name the relay it was measured against. The 16384
+above is the signer's own ceiling, measured on the more permissive relay.
+
 ## Method
 
 Two probes, both in `scripts/frame-size-probe.mjs`.
@@ -221,11 +266,14 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
   28672..32000 bytes of content. Now academic: the ceiling is enforced at
   20480 and the crash is unreachable. Worth pinning down only if
   `MAX_SIGN_BYTES` is ever raised, since it marks where the real headroom ends.
-- **The relay path**, which is the one the plan's 20480 figure describes and
-  the one that binds in the product. It needs a paired auto-signing app so it
-  can be swept without a press per step, and it is the path that exercises
-  `response_transportable` and NIP-44 base64 expansion. This is the sweep that
-  should actually set `max_sign_bytes`.
+- **Re-verifying the relay path against the fix.** The guard moved to
+  `handle_parsed_request`, the one point every transport funnels through, and
+  `MAX_SIGN_CONTENT_RELAY` dropped to the measured 16384. Confirmed on the USB
+  path (16384 reaches the approval prompt; 20480 and 32000 are refused, no
+  reboot). The relay re-run is outstanding only because the throwaway
+  connection slot binds to the first client pubkey that uses it, and the
+  sweep's key was ephemeral — now fixed by persisting the client identity, but
+  it needs a fresh slot to exercise.
 - **The fragmented-heap condition.** Both sweeps above ran on a device with
   under 15 minutes of uptime and no relay sessions. The plan calls for a second
   run after a client has bulk-decrypted a message history, which is the state

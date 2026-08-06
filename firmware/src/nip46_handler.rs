@@ -247,45 +247,6 @@ pub fn handle_request(
     };
     drop(frame);
 
-    // Enforce the ceiling we advertise in FIRMWARE_INFO, before anything
-    // allocates at signing size.
-    //
-    // This is the plaintext transport, which has no heap guard of its own:
-    // response_transportable covers the encrypted path (transport.rs) and the
-    // relay path, but nothing sat between a plaintext sign_event and the
-    // several allocations that signing and response-building need. A V4
-    // measured on 2026-08-06 signed 28672 bytes of content happily and then
-    // PANICKED on 32000, which MAX_PAYLOAD_SIZE (32768) happily admits. A
-    // panic is a far worse failure than a refusal, and it costs the owner a
-    // button press first.
-    //
-    // Parsing has already been shown safe well past this bound (32 KB frames
-    // parse and dispatch without incident), so measuring the event here rather
-    // than guessing from the raw frame length is both accurate and cheap. The
-    // allowance over MAX_SIGN_BYTES covers the event's own JSON scaffolding —
-    // pubkey, created_at, kind, tags — which wraps the content.
-    if request.method == "sign_event" {
-        let event_bytes = request
-            .params
-            .first()
-            .and_then(|value| value.as_str())
-            .map(str::len)
-            .unwrap_or(0);
-        let limit = crate::board::MAX_SIGN_BYTES
-            + heartwood_common::types::SIGN_RESPONSE_OVERHEAD;
-        if event_bytes > limit {
-            log::warn!(
-                "sign_event event is {event_bytes} B; this board signs at most {limit} B"
-            );
-            return nip46::build_error_response(
-                &request.id,
-                -4,
-                "event is too large for this signer",
-            )
-            .unwrap_or_default();
-        }
-    }
-
     handle_parsed_request(
         request,
         master_secret,
@@ -319,6 +280,47 @@ pub fn handle_parsed_request(
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     client_pubkey: Option<&[u8; 32]>,
 ) -> String {
+    // Enforce the ceiling we advertise in FIRMWARE_INFO, before anything
+    // allocates at signing size.
+    //
+    // Sited here, at the one point every transport funnels through, rather
+    // than on the individual entry paths. USB plaintext, USB encrypted and
+    // relay all reach dispatch by different routes, and only some of them had
+    // any size guard: response_transportable covers the encrypted and relay
+    // RESPONSE, but nothing bounded the request on the way in, on any path.
+    //
+    // Both failures this prevents were measured on a V4 on 2026-08-06. Over
+    // USB it signed 28672 bytes of content and then PANICKED on 32000, which
+    // MAX_PAYLOAD_SIZE (32768) admits without complaint. Over the relay it
+    // signed 16384 and then panicked on 20480, leaving the breadcrumb
+    // "relay inbound event (heap 130k)" — with 130 KB still free, so this is
+    // not a plain out-of-memory, and a size ceiling is the reliable defence
+    // rather than a heap threshold.
+    //
+    // The allowance over MAX_SIGN_BYTES covers the event's own JSON
+    // scaffolding — pubkey, created_at, kind, tags — which wraps the content.
+    if request.method == "sign_event" {
+        let event_bytes = request
+            .params
+            .first()
+            .and_then(|value| value.as_str())
+            .map(str::len)
+            .unwrap_or(0);
+        let limit = crate::board::MAX_SIGN_BYTES
+            + heartwood_common::types::SIGN_RESPONSE_OVERHEAD;
+        if event_bytes > limit {
+            log::warn!(
+                "sign_event event is {event_bytes} B; this board signs at most {limit} B"
+            );
+            return nip46::build_error_response(
+                &request.id,
+                -4,
+                "event is too large for this signer",
+            )
+            .unwrap_or_default();
+        }
+    }
+
     // Capture caller intent before a legacy session's active identity may be
     // resolved into this field below. Only a caller-supplied context is a
     // strict-policy redirection attempt.

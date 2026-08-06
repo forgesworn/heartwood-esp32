@@ -28,3 +28,7 @@ docs/next-session-prompt.md
 
 # Playwright MCP artifacts
 .playwright-mcp/
+
+# Client signing credentials minted by scripts/relay-size-sweep.mjs.
+# One per signer, bound to a connection slot. Never commit.
+scripts/.sweep-clients.json

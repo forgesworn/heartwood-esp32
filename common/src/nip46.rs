@@ -745,6 +745,24 @@ pub fn build_error_response(request_id: &str, code: i32, message: &str) -> Resul
         .map_err(|e| format!("failed to serialise error response: {e}"))
 }
 
+/// Pull `id` out of a `{"id":"...",...}` NIP-46 response without parsing it.
+///
+/// Used when a response turns out to be too large to transport and has to be
+/// replaced by a same-id error. Deserialising it at that point is exactly what
+/// must not happen: the response is oversize by definition, on a device that
+/// is already short of contiguous heap. Scanning for the field allocates only
+/// the id.
+///
+/// Returns `None` if the field is absent or unterminated. An escape inside the
+/// id ends the scan rather than being unescaped, since NIP-46 request ids are
+/// client-generated tokens with no reason to contain one.
+pub fn response_request_id(response_json: &str) -> Option<&str> {
+    let start = response_json.find("\"id\":\"")? + 6;
+    let rest = response_json.get(start..)?;
+    let end = rest.find(['"', '\\'])?;
+    Some(&rest[..end])
+}
+
 /// Build a `connect` success response (result = "ack").
 pub fn build_connect_response(request_id: &str) -> Result<String, String> {
     let response = Nip46Response {
@@ -799,6 +817,69 @@ pub fn build_result_response(request_id: &str, result: &str) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_request_id_reads_the_id_without_parsing() {
+        let signed = build_sign_response(
+            "req-42",
+            &SignedEvent {
+                id: "aa".repeat(32),
+                pubkey: "bb".repeat(32),
+                created_at: 1_700_000_000,
+                kind: 1,
+                tags: vec![],
+                content: "hello".to_string(),
+                sig: "cc".repeat(64),
+            },
+        )
+        .unwrap();
+        // Must agree with the real builder's output, not a hand-written shape.
+        assert_eq!(response_request_id(&signed), Some("req-42"));
+    }
+
+    #[test]
+    fn response_request_id_handles_absent_and_malformed() {
+        assert_eq!(response_request_id("{}"), None);
+        assert_eq!(response_request_id(""), None);
+        // Present but never closed.
+        assert_eq!(response_request_id("{\"id\":\"unterminated"), None);
+        // Empty id is a real (if useless) value, not a failure.
+        assert_eq!(response_request_id("{\"id\":\"\",\"result\":\"x\"}"), Some(""));
+    }
+
+    #[test]
+    fn response_request_id_stops_at_an_escape_rather_than_unescaping() {
+        // Deliberate: the id is echoed straight back into an error response, so
+        // it must never carry a partial escape sequence into fresh JSON.
+        assert_eq!(
+            response_request_id("{\"id\":\"we\\\"ird\",\"result\":\"x\"}"),
+            Some("we")
+        );
+    }
+
+    #[test]
+    fn response_request_id_round_trips_into_an_error_response() {
+        // The whole point of the helper: recover the id from a response we
+        // cannot send, and correlate the substitute error to the same request.
+        let original = build_sign_response(
+            "abc-123",
+            &SignedEvent {
+                id: "11".repeat(32),
+                pubkey: "22".repeat(32),
+                created_at: 1,
+                kind: 1,
+                tags: vec![],
+                content: "x".repeat(64),
+                sig: "33".repeat(64),
+            },
+        )
+        .unwrap();
+        let id = response_request_id(&original).unwrap();
+        let error = build_error_response(id, -4, "response too large").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(parsed["id"], "abc-123");
+        assert_eq!(parsed["error"], "response too large");
+    }
 
     fn sample_event() -> UnsignedEvent {
         UnsignedEvent {

@@ -305,13 +305,13 @@ pub fn write_json_frame<T: Serialize>(
 /// Frame an owned text payload by reusing its allocation. This is primarily
 /// for large NIP-46 responses, where copying the complete JSON into a second
 /// `build_frame` Vec can exhaust contiguous heap after signing succeeds.
-pub fn write_owned_frame(usb: &mut SerialPort<'_>, frame_type: u8, payload: String) {
+pub fn write_owned_frame(usb: &mut SerialPort<'_>, frame_type: u8, payload: String) -> bool {
     let payload_len = payload.len();
     if payload_len > MAX_PAYLOAD_SIZE {
         log::warn!(
             "Failed to build frame (type=0x{frame_type:02X}): payload too large ({payload_len})"
         );
-        return;
+        return false;
     }
 
     let mut bytes = payload.into_bytes();
@@ -327,6 +327,43 @@ pub fn write_owned_frame(usb: &mut SerialPort<'_>, frame_type: u8, payload: Stri
     hasher.update(&bytes[2..crc_offset]);
     bytes[crc_offset..].copy_from_slice(&hasher.finalize().to_be_bytes());
     write_encoded_frame(usb, &bytes);
+    true
+}
+
+/// Write a NIP-46 response, degrading to a same-id error frame when the JSON
+/// does not fit a serial frame.
+///
+/// Without this an oversize response was dropped with only a `log::warn!`,
+/// and that log goes nowhere: the console is `CONSOLE_NONE` on the V3,
+/// T-Display and C6, and routed to unwired UART0 on the V4. So the device
+/// prompted the owner, consumed their physical button press, signed the event
+/// and discarded the signature in total silence, leaving the host to time out
+/// with no idea whether anything had been signed. Answering with an error at
+/// least tells the caller the request was seen and refused.
+///
+/// The id is lifted straight out of the response we were about to send rather
+/// than re-parsed from the request, so it always correlates and costs no
+/// second allocation of the request body.
+pub fn write_nip46_response(usb: &mut SerialPort<'_>, frame_type: u8, response_json: String) {
+    if response_json.len() <= MAX_PAYLOAD_SIZE {
+        write_owned_frame(usb, frame_type, response_json);
+        return;
+    }
+
+    // Build the replacement before dropping the oversize body, then release it.
+    let error = heartwood_common::nip46::build_error_response(
+        heartwood_common::nip46::response_request_id(&response_json).unwrap_or_default(),
+        -4,
+        "response too large for the serial frame; the event was signed but could not be returned",
+    )
+    .unwrap_or_default();
+    log::warn!(
+        "NIP-46 response ({} B) exceeds the {MAX_PAYLOAD_SIZE} B frame limit; \
+         returning an error instead of dropping it",
+        response_json.len()
+    );
+    drop(response_json);
+    write_owned_frame(usb, frame_type, error);
 }
 
 /// Write one already-framed message without allocating again. The native USB

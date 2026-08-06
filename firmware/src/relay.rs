@@ -1376,7 +1376,7 @@ fn poll_usb(
                     ctx.identity_caches,
                     None,
                 );
-                crate::protocol::write_owned_frame(
+                crate::protocol::write_nip46_response(
                     usb,
                     FRAME_TYPE_NIP46_RESPONSE,
                     response_json,

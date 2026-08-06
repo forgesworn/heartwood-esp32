@@ -98,10 +98,29 @@ function connect(url) {
 
 const pending = new Map()   // request id -> {resolve, sentAt}
 
+// A relay that refuses our EVENT and a signer that dies on it look identical
+// from here — both end in silence — and they call for opposite responses. The
+// relay's OK frame distinguishes them, so surface it rather than waiting out
+// the timeout. Relays cap event size at wildly different points: one of the
+// four configured on this signer refused at ~17 KB while another carried
+// 27 KB, so the effective ceiling in the field is the minimum of the signer's
+// and the tightest relay's.
+let lastRejection = null
+
 function attach(ws) {
   ws.onmessage = (ev) => {
     let msg
     try { msg = JSON.parse(ev.data) } catch { return }
+
+    if (msg[0] === 'OK' && msg[2] === false) {
+      lastRejection = msg[3] || 'rejected without a reason'
+      for (const [id, waiter] of pending) {
+        pending.delete(id)
+        waiter.resolve({ rejected: lastRejection })
+      }
+      return
+    }
+
     if (msg[0] !== 'EVENT') return
     const event = msg[2]
     if (event?.kind !== NIP46_KIND) return
@@ -164,7 +183,8 @@ for (const [i, size] of SIZES.entries()) {
   const r = await request(ws, `sweep-${i}`, 'sign_event', [JSON.stringify(event)], 40_000)
 
   let outcome
-  if (!r.body) outcome = 'NO REPLY (frame dropped or signer reset)'
+  if (r.rejected) outcome = `RELAY REFUSED: ${r.rejected}`
+  else if (!r.body) outcome = 'NO REPLY (signer silent: dropped frame, or crashed)'
   else if (r.body.error) outcome = `error: ${r.body.error}`
   else if (r.body.result) {
     try {

@@ -114,14 +114,72 @@ is the reliable defence. Recovery is slow too: after the crash the relay
 session took minutes to become usable again, so each oversize request costs far
 more than the one request.
 
+### Post-fix re-run: 16384 confirmed
+
+Repeated against the fixed firmware (`MAX_SIGN_CONTENT_RELAY` = 16384, guard in
+`handle_parsed_request`) on the permissive relay:
+
+| Content | Request | Response | Outcome |
+|---------|---------|----------|---------|
+| 8192 | 14172 | 13744 | signed |
+| **16384** | **27824** | **27396** | **signed** |
+| 20480 | 33288 | -- | no reply |
+| 32768 | 55132 | -- | no reply |
+
+16384 signs reliably — twice now, before and after the fix. That is the figure
+the constant carries.
+
+20480 no longer needs a guard to be safe: its request reaches 33288 bytes,
+past the 32768 `MAX_WS_FRAME`, so the device drops it at the WebSocket layer
+before it is ever decrypted or dispatched. **The device stayed alive through
+both oversize requests in this run**, where the pre-fix sweep left
+`crashed_during: "relay inbound event (heap 130k)"`.
+
+One caveat, stated plainly: `last_reset` could not be read afterwards to prove
+no panic occurred, because the USB port was held by a browser tab. The evidence
+for "survived" is that the signer answered NIP-46 requests immediately
+afterwards, which a rebooting device does not. Worth re-confirming over USB.
+
+Note also what this implies about the guard. A request at exactly
+`MAX_SIGN_BYTES` produces a ~27.8 KB WebSocket message, and the pre-fix
+firmware handled that same 27824-byte message successfully on one occasion and
+fatally on another. The transient peak in `handle_relay_msg` — raw bytes, plus
+the parsed `Value` tree, plus the `SignedEvent` copy — is therefore marginal at
+the top of the range, and depends on heap state at the moment it lands. A
+smaller ceiling buys margin; it does not remove the sharp edge. Bounding the
+inbound message *before* `serde_json::from_slice` is the durable fix, and is
+not done.
+
+### Relay membership rotates, so "is it reachable" depends on when you ask
+
+`MAX_SESSIONS` is 2, and the signer rotates its primary across the configured
+set. Over one afternoon this device was reachable on one relay, then two
+others, then back — while four were configured throughout. Several sweeps
+that looked like a dead signer were simply aimed at a relay it was not
+subscribed to at that moment.
+
+Any relay measurement therefore has to confirm liveness on the specific relay
+it is about to use, or it will mistake membership for failure. `ping.mjs`-style
+liveness across every configured relay before a sweep is the cheap way to do
+it.
+
 ### Relays differ, and the tighter one binds first
 
-The same sweep against two relays gave different ceilings: one capped content
-at 10240, another allowed 16384. So in the field the effective limit is the
-*minimum* of the signer's ceiling and the tightest relay in the configured set,
-and a signer that works on one relay can fail on another at the same size. Any
-future relay figure must name the relay it was measured against. The 16384
-above is the signer's own ceiling, measured on the more permissive relay.
+The same sweep against two relays gave different ceilings: one carried 16384
+bytes of content, another stopped at 10240. So in the field the effective limit
+is the *minimum* of the signer's ceiling and the tightest relay in the
+configured set, and a signer that works on one relay fails on another at the
+same size. Any future relay figure must name the relay it was measured against.
+The 16384 above is the signer's own ceiling, measured on the more permissive
+one.
+
+The tighter relay's refusal is **silent to the client**. It accepted the
+request (no `OK false`), and it is the signer's *response* — larger than the
+request once re-encrypted — that the relay then would not carry. From the
+client's side that is indistinguishable from a signer that crashed. The sweep
+tool now surfaces `OK false` separately for exactly this reason, but a relay
+that drops the response without complaint cannot be detected from the client at
+all; only the signer's own liveness afterwards distinguishes the two.
 
 ## Heap under a live relay session
 
@@ -298,14 +356,18 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
   28672..32000 bytes of content. Now academic: the ceiling is enforced at
   20480 and the crash is unreachable. Worth pinning down only if
   `MAX_SIGN_BYTES` is ever raised, since it marks where the real headroom ends.
-- **Re-verifying the relay path against the fix.** The guard moved to
-  `handle_parsed_request`, the one point every transport funnels through, and
-  `MAX_SIGN_CONTENT_RELAY` dropped to the measured 16384. Confirmed on the USB
-  path (16384 reaches the approval prompt; 20480 and 32000 are refused, no
-  reboot). The relay re-run is outstanding only because the throwaway
-  connection slot binds to the first client pubkey that uses it, and the
-  sweep's key was ephemeral — now fixed by persisting the client identity, but
-  it needs a fresh slot to exercise.
+- **Bounding the inbound relay message before it is parsed.** The guard added
+  here sits in `handle_parsed_request`, which is after decryption — too late
+  for the relay path, where the transient peak is in `handle_relay_msg`
+  (raw bytes + parsed `Value` + `SignedEvent`). The current ceiling keeps
+  requests below the size that proved marginal, but a size check on
+  `raw.len()` before `serde_json::from_slice` is the durable fix. It must
+  leave room for legitimate large traffic: a `set_identity_meta` management
+  event is ~17 KB.
+- **Confirming no panic post-fix over USB.** The signer answered NIP-46
+  requests immediately after the oversize sizes, which a rebooting device does
+  not, but `last_reset` was not readable at the time because a browser tab held
+  the USB port.
 - **The fragmented-heap condition.** Both sweeps above ran on a device with
   under 15 minutes of uptime and no relay sessions. The plan calls for a second
   run after a client has bulk-decrypted a message history, which is the state

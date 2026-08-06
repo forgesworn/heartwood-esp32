@@ -231,4 +231,27 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
   run after a client has bulk-decrypted a message history, which is the state
   the field crashes were blamed on. That number, not the fresh-boot one, is the
   one that belongs in a header.
-- **Every other board.** `tdisplay`, `esp32c6` and `heltec-v3` are untested.
+- **Every other board, on hardware.** Only the V4 was physically present.
+  `heltec-v3`, `tdisplay` and `esp32c6` are **build-verified but not
+  run-verified**: all four board features compile clean at v0.14.0, across all
+  three architectures (Xtensa S3, classic Xtensa LX6, RISC-V rv32imac). That
+  matters more than it sounds for this change set, because
+  `esp_reset_reason_t_ESP_RST_USB` / `_JTAG` and
+  `heap_caps_get_largest_free_block` are chip-specific bindings, and a build on
+  the S3 alone would not have proven they exist elsewhere. What remains
+  unverified per board is the runtime behaviour: actual heap figures, and
+  therefore whether `MAX_SIGN_BYTES` of 20480 is right for a board with less
+  memory than the V4. The classic-ESP32 T-Display is the one to watch.
+
+  Building the non-S3 boards on a fresh macOS machine hits two snags worth
+  recording. The esp-idf tool installer fails with
+  `CERTIFICATE_VERIFY_FAILED` because the embedded Python has no CA bundle, and
+  once the toolchains do install, `xtensa-esp32-elf-gcc` and
+  `riscv32-esp-elf-gcc` are not on `PATH` for the cc-rs build of
+  `secp256k1-sys`. Both are fixed by exporting, before
+  `scripts/build-firmware.sh`:
+
+      export SSL_CERT_FILE=<idf python env>/site-packages/certifi/cacert.pem
+      export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
+      export PATH="<embuild>/tools/xtensa-esp-elf/<ver>/xtensa-esp-elf/bin:\
+      <embuild>/tools/riscv32-esp-elf/<ver>/riscv32-esp-elf/bin:$PATH"

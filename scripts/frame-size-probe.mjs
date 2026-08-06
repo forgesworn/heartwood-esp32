@@ -133,16 +133,23 @@ function open() {
   })
 }
 
-async function uptime(port) {
+/** Full FIRMWARE_INFO, or null if the device did not answer. */
+async function firmwareInfo(port) {
   await writePaced(port, buildFrame(FIRMWARE_INFO, Buffer.alloc(0)))
   const f = await readFrame(port, [FIRMWARE_INFO_RESPONSE], 5000)
   if (!f) return null
   try {
-    return JSON.parse(f.payload.toString()).uptime_s
+    return JSON.parse(f.payload.toString())
   } catch {
     return null
   }
 }
+
+async function uptime(port) {
+  return (await firmwareInfo(port))?.uptime_s ?? null
+}
+
+const kb = (n) => (typeof n === 'number' ? `${Math.round(n / 1024)}K` : '--')
 
 // --sign switches from get_public_key to a real sign_event.
 //
@@ -200,7 +207,11 @@ for (const size of SIZES) {
   await writePaced(port, frame)
   // Signing has to outwait the 30s on-device approval timeout.
   const reply = await readFrame(port, [NIP46_RESPONSE, NACK], SIGN ? 45000 : 20000)
-  const after = await uptime(port)
+  // Firmware 0.14+ reports heap alongside uptime, so each step records what
+  // the allocator looked like straight after handling it. largest_block is the
+  // number that actually binds a large response, not free_heap.
+  const info = await firmwareInfo(port)
+  const after = info?.uptime_s ?? null
   // Uptime going backwards is a reboot, full stop. Reading it directly beats
   // inferring a crash from a missing reply, which is what made the sign_event
   // sweep ambiguous.
@@ -224,8 +235,18 @@ for (const size of SIZES) {
     else outcome = `error:${JSON.stringify(err ?? 'unknown').slice(0, 60)}`
   } else outcome = 'ok'
 
-  results.push({ payloadBytes: body.length, frameBytes: frame.length, outcome, uptimeAfter: after })
-  console.log(`${outcome}${after !== null ? `  (uptime ${after}s)` : ''}`)
+  results.push({
+    payloadBytes: body.length,
+    frameBytes: frame.length,
+    outcome,
+    uptimeAfter: after,
+    freeHeap: info?.free_heap ?? null,
+    largestBlock: info?.largest_block ?? null,
+  })
+  const heap = info?.free_heap !== undefined
+    ? `  free ${kb(info.free_heap)} largest ${kb(info.largest_block)}`
+    : ''
+  console.log(`${outcome.padEnd(17)}${after !== null ? `uptime ${after}s` : ''}${heap}`)
 
   before = after
   if (rebooted) {

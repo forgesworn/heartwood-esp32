@@ -16,8 +16,30 @@ and no base64, so its only structural limit is `MAX_PAYLOAD_SIZE` (32768).
 | Stage | Ceiling found | Reboots |
 |-------|---------------|---------|
 | Receive + CRC + outer JSON parse | 32063 B frame (32054 B payload) | none |
-| ... through `sign_event` dispatch to the approval prompt | 32206 B frame (32197 B payload) | none |
-| ... post-approval sign, response build, response write | **not measured** | unknown |
+| ... through `sign_event` dispatch to the approval prompt | 31206 B frame, and 32206 in an earlier run | none |
+| ... post-approval sign, response build, response write | **28672 B content signed; 32000 B panics** | one |
+
+**The post-approval leg is the real ceiling, and it panics rather than
+degrading.** Six sizes signed end to end with a button press (content 8192,
+12288, 16384, 20480, 24576, 28672). Content of 32000 bytes crashed the device
+outright: `last_reset: "panic"`, breadcrumb `crashed_during: "relay reading"`.
+The true threshold is somewhere in 28672..32000; narrowing it further needs
+more attended runs.
+
+That crash is above the advertised `max_sign_bytes` of 20480, so a client that
+respects the advertised limit never reaches it. The guard is correctly
+conservative. The crash is still a real defect: nothing structural stops a
+request of that size arriving over USB, and `MAX_PAYLOAD_SIZE` (32768) permits
+it.
+
+**Heap does not move with request size.** Free heap sat at 213 KB and the
+largest contiguous block at 148 KB across every size from 575 B to 32 KB, on
+both the parse sweep and the signing sweep, returning to the same figures after
+each request. So on a freshly booted V4 with no relay sessions, large requests
+neither leak nor fragment: whatever kills it at 32000 bytes is a transient peak
+inside one operation, not accumulated pressure. Note how far these are above
+the `DIAL_MIN_LARGEST_BLOCK = 24_000` the relay guards expect, which is the
+*post-TLS-session* state; the fragmented condition remains untested.
 
 **The plaintext USB path receives, parses and dispatches a ~32 KB signing
 request without crashing.** Neither the USB transfer nor the JSON parse is the
@@ -93,11 +115,41 @@ an unanswered prompt so it cannot record a missing human as a size ceiling.
 
 ## Status of the defects below
 
-All five are fixed in the working tree. Items 1 to 3 are firmware changes and
-are **built but not yet flashed to hardware**, so they are unverified on a real
-device; items 4 and 5 are host-side and are verified (`cargo test` green,
-including four new tests for the id-recovery helper). The re-run of this bench
-against the new firmware is still outstanding.
+All five are fixed, and items 1 to 3 are **flashed and confirmed on hardware**.
+Confirmations from the post-flash device read:
+
+- `max_sign_bytes: 20480`, `free_heap: 218208`, `largest_block: 151552` are
+  reported, so a sweep can now record the heap curve and a client can
+  pre-flight against the ceiling.
+- `last_reset: "usb-peripheral-reset"`, where the same device previously said
+  `"unknown"`. This retroactively settles the first sweep: those reboots were
+  host-triggered USB resets, not firmware crashes.
+
+### Flashing note: the device's partition table is NOT this repo's
+
+`espflash flash --partition-table partitions.csv` panics inside esp-idf-part
+0.6.0 on the `config, data, 0x40` row (numeric subtype). That panic was
+fortunate. Reading the live table back off the device gives the ESP-IDF
+**default** layout, not the repo's:
+
+    nvs,      data, nvs,     0x9000,  0x6000
+    phy_init, data, phy,     0xf000,  0x1000
+    factory,  app,  factory, 0x10000, 0xfa0000
+
+Single `factory` app, no OTA slots, and NVS spanning 0x9000-0xF000. Writing the
+repo's table would have placed `otadata` at 0xD000-0xF000, directly on top of
+live NVS data, and taken the identities with it.
+
+The safe procedure, used here, writes only the app and never the table:
+
+    espflash save-image --chip esp32s3 --flash-size 16mb <elf> app.bin
+    espflash write-bin 0x10000 app.bin
+    espflash reset
+
+Identities, persona and app pairings all survived, as the offsets predict.
+This also means **OTA firmware update cannot work on this device**: the
+bootloader rollback and `esp_ota_*` path need `otadata` plus `ota_0`/`ota_1`,
+and this device has none of them.
 
 ## Defects found
 
@@ -136,9 +188,11 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
 
 ## What is still unmeasured
 
-- **The post-approval leg on USB** (sign, `build_sign_response`,
-  `write_owned_frame`). Needs an attended run. Predicted silent-drop threshold
-  is content of about 32348 B, where the response first exceeds 32768.
+- **The exact post-approval crash threshold**, known only to lie in
+  28672..32000 bytes of content. Each bisection step costs a button press.
+  Worth pinning down, because a panic is a much worse failure mode than the
+  refusal `response_transportable` is supposed to produce, and it suggests the
+  guard is not covering this path on USB.
 - **The relay path**, which is the one the plan's 20480 figure describes and
   the one that binds in the product. It needs a paired auto-signing app so it
   can be swept without a press per step, and it is the path that exercises

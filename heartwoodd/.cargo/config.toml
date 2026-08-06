@@ -1,2 +1,13 @@
-[build]
-target = "x86_64-apple-darwin"
+# heartwoodd/.cargo/config.toml
+#
+# The bridge daemon runs on the host (Linux, macOS, a Pi), never on the ESP32.
+#
+# The target is deliberately NOT pinned: it builds for whatever host it is
+# invoked on. It previously hardcoded x86_64-apple-darwin, which fails on an
+# Apple Silicon Mac with "can't find crate for `core`" and would equally fail
+# on the Linux hosts this daemon is actually deployed to. The xtensa config
+# lives in firmware/.cargo/config.toml, a sibling rather than a parent, so it
+# is never inherited here.
+
+[unstable]
+build-std = []

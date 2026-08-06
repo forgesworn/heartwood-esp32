@@ -1,15 +1,19 @@
 # common/.cargo/config.toml
 #
-# Override the root .cargo/config.toml which targets xtensa-esp32s3-espidf.
 # The common crate has no ESP-IDF dependencies and compiles on the host for
 # `cargo test`.
 #
-# Cargo config files are merged from parent to child; there is no "use host
-# default" escape hatch. We must name the target explicitly. CI should set
-# CARGO_BUILD_TARGET to the appropriate host triple if not x86_64-apple-darwin.
-
-[build]
-target = "x86_64-apple-darwin"
+# The target is deliberately NOT pinned. This previously named
+# x86_64-apple-darwin explicitly, on the reasoning that cargo configs merge
+# parent-to-child with no "use host default" escape hatch. That is true of the
+# merge rules, but there is no .cargo/config.toml at the repo root for this one
+# to override: the xtensa config lives in firmware/.cargo/config.toml, a
+# sibling of this directory rather than a parent, so it is never inherited
+# here. The pin therefore bought nothing, and broke the build outright on any
+# host that is not an Intel Mac ("can't find crate for `core`").
+#
+# The build-std reset below is what actually neutralises an esp-idf-style
+# parent config, and it keeps working if one is ever added above the root.
 
 [unstable]
 build-std = []

@@ -68,7 +68,10 @@ fn main() {
     // Frame the request.
     let frame_bytes = frame::build_frame(FRAME_TYPE_NIP46_REQUEST, request_json.as_bytes())
         .unwrap_or_else(|_| {
-            eprintln!("Request JSON too large to fit in a serial frame (max 4096 bytes).");
+            eprintln!(
+                "Request JSON too large to fit in a serial frame (max {} bytes).",
+                heartwood_common::types::MAX_PAYLOAD_SIZE
+            );
             std::process::exit(1);
         });
 

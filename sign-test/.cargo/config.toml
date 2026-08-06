@@ -2,9 +2,14 @@
 #
 # Override any parent .cargo/config.toml that might target xtensa-esp32s3-espidf.
 # The sign-test crate runs on the host PC, not the ESP32.
-
-[build]
-target = "x86_64-apple-darwin"
+#
+# The target is deliberately NOT pinned: this crate builds for whatever host it
+# is invoked on. It previously hardcoded x86_64-apple-darwin, which failed on an
+# Apple Silicon Mac with "can't find crate for `core`" because the Intel target
+# is not installed. The xtensa config lives in firmware/.cargo/config.toml, a
+# sibling of this directory rather than a parent, so cargo never inherits it
+# here anyway. The build-std reset below is what actually neutralises an
+# esp-idf-style parent config if one is ever added above the repo root.
 
 [unstable]
 build-std = []

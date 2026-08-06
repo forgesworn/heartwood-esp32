@@ -2,9 +2,13 @@
 #
 # Override any parent .cargo/config.toml that might target xtensa-esp32s3-espidf.
 # The provision crate runs on the host PC, not the ESP32.
-
-[build]
-target = "x86_64-apple-darwin"
+#
+# The target is deliberately NOT pinned: this crate builds for whatever host it
+# is invoked on. It previously hardcoded x86_64-apple-darwin, which fails on an
+# Apple Silicon Mac with "can't find crate for `core`". The xtensa config lives
+# in firmware/.cargo/config.toml, a sibling rather than a parent, so it is
+# never inherited here; the build-std reset below is what does the actual
+# neutralising if such a parent is ever added.
 
 [unstable]
 build-std = []

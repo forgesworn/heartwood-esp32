@@ -147,6 +147,14 @@ one full copy of the content. Non-EVENT branches were already working off
 `last_reset: usb-peripheral-reset` — the deliberate reset from flashing, and no
 panic since. The pre-fix firmware panicked on this traffic every time.
 
+**Soak, 12m37s.** Re-run later with `heap-watch.mjs` sampling over USB every
+30 s while the relay was driven with 16384-byte signings and 33288-byte oversize
+requests. Uptime rose monotonically 1228 s → 1985 s, `last_reset` never changed,
+and free heap and largest block sat dead flat at 209 KB / 136 KB (ratio 0.65)
+for all 26 samples. No panic, no leak, no fragmentation drift. This is the soak
+the previous revision listed as outstanding; the intermittent failure it
+replaces did not recur.
+
 One earlier conclusion also falls: 16384 now signs on the **tighter** relay,
 which previously failed there. That failure was attributed to the relay
 refusing to carry the larger response. It was the signer crashing.
@@ -167,15 +175,21 @@ Repeated against the fixed firmware (`MAX_SIGN_CONTENT_RELAY` = 16384, guard in
 the constant carries.
 
 20480 no longer needs a guard to be safe: its request reaches 33288 bytes,
-past the 32768 `MAX_WS_FRAME`, so the device drops it at the WebSocket layer
+past the 32768 `MAX_WS_FRAME`, so the device discards it at the WebSocket layer
 before it is ever decrypted or dispatched. **The device stayed alive through
 both oversize requests in this run**, where the pre-fix sweep left
 `crashed_during: "relay inbound event (heap 130k)"`.
 
-One caveat, stated plainly: `last_reset` could not be read afterwards to prove
-no panic occurred, because the USB port was held by a browser tab. The evidence
-for "survived" is that the signer answered NIP-46 requests immediately
-afterwards, which a rebooting device does not. Worth re-confirming over USB.
+What that discard *cost* is a separate matter, and was not looked at here: at
+this point it also tore down the relay session. See "An oversize frame was a
+remote off-switch" below.
+
+One caveat applied when this was written: `last_reset` could not be read
+afterwards to prove no panic occurred, because the USB port was held by a
+browser tab, so the evidence for "survived" was only that the signer answered
+requests immediately afterwards. That reasoning is exactly what proved wrong
+once before (see the correction above), so it was re-confirmed over USB in the
+12m37s soak — uptime monotonic, `last_reset` unchanged throughout.
 
 Note also what this implies about the guard. A request at exactly
 `MAX_SIGN_BYTES` produces a ~27.8 KB WebSocket message, and the pre-fix
@@ -183,9 +197,73 @@ firmware handled that same 27824-byte message successfully on one occasion and
 fatally on another. The transient peak in `handle_relay_msg` — raw bytes, plus
 the parsed `Value` tree, plus the `SignedEvent` copy — is therefore marginal at
 the top of the range, and depends on heap state at the moment it lands. A
-smaller ceiling buys margin; it does not remove the sharp edge. Bounding the
-inbound message *before* `serde_json::from_slice` is the durable fix, and is
-not done.
+smaller ceiling buys margin; it does not remove the sharp edge.
+
+**Correction (checked 2026-08-06).** This section previously called for bounding
+the inbound message before `serde_json::from_slice`, and listed it as not done.
+It was already done, structurally: `try_parse` refuses any frame declaring more
+than `MAX_WS_FRAME` before a byte of body is handed on, so `raw` reaching
+`handle_relay_msg` is bounded at 32768 by construction. There is no continuation
+reassembly either — opcode 0x0 falls into `_ => WsMsg::Other` and the FIN bit is
+never read on the inbound path — so a message cannot accumulate across frames.
+A second length check would have been dead code. What that cap actually needed
+fixing was its *consequence*, not its absence: see the next section.
+
+### An oversize frame was a remote off-switch
+
+Found while running the longer soak, and the most serious defect in this round.
+
+`try_parse` returned `Err` for any frame over `MAX_WS_FRAME`. `session_step`
+propagates that with `?`, and its contract is "an `Err` means the session is
+dead and should be dropped". So one over-cap frame ended the relay session.
+
+The trigger needs no authentication and no secret. The subscription is
+
+    ["REQ","hw",{"kinds":[24133],"#p":[<our pubkeys>],"limit":0}, …]
+
+and our pubkey is public — it is the host of every bunker URI we hand out. Any
+party could publish an over-cap kind-24133 event p-tagged to us and knock us off
+the relay, before a byte was decrypted or the sender was so much as looked at.
+The kill lands at the WebSocket framing layer, upstream of every policy gate.
+
+The cost is worse than one dropped connection:
+
+- The **primary** session advances `relay_idx` and fails over to a *different*
+  relay. Clients watching the old one just see silence.
+- A **pinned** session takes `fails += 1` and backs off `15s · 2^fails`, to a
+  600 s ceiling.
+- The subscription is `limit:0` with **no `since`**, so requests published
+  during the gap are never replayed. They are lost, not delayed.
+
+Measured on the V4, one sweep on a single session:
+
+| Content | Wire | Before | After |
+|---------|------|--------|-------|
+| 1024 | 2224 | signed | signed |
+| 20480 | 33288 | **session dropped** | skipped, no reply |
+| 1024 | 2224 | **no reply** | **signed** |
+| 16384 | 27824 | **no reply** | **signed** |
+| 20480 | 33288 | -- | skipped, no reply |
+| 8192 | 14172 | **no reply** | **signed** |
+
+Before the fix, everything after the first oversize request went unanswered and
+the signer was found signing on *another* relay — alive the whole time, which is
+why this reads as a crash from the client and is not one. Uptime was monotonic
+across the entire episode.
+
+The fix: an oversize frame is a **message**-level fault, not a
+**connection**-level one. The stream is still correctly framed — the header says
+exactly where the next frame begins — so the frame is now skipped and the
+session kept, which is also what RFC 6455 intends by 1009 Message Too Big. A
+`skip` counter on the session carries the remainder, because an over-cap body
+can span several reads and its tail must not be parsed as a header.
+
+One adjacent bug fixed in the same function: the 64-bit length path did
+`u64 … as usize`, and `usize` is 32 bits on this chip, so a declared length above
+`u32::MAX` truncated — `0x1_0000_0000` would read as a 0-byte frame and desync
+the stream against a body still arriving. That path is reachable by an attacker,
+since any frame over 65535 bytes uses it. A declared length that large now drops
+the connection as a broken peer; merely-over-cap lengths take the skip path.
 
 ### Relay membership rotates, so "is it reachable" depends on when you ask
 
@@ -391,21 +469,13 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
 
 - **The exact point the old firmware panicked**, known only to lie in
   28672..32000 bytes of content. Now academic: the ceiling is enforced at
-  20480 and the crash is unreachable. Worth pinning down only if
+  16384 and the crash is unreachable. Worth pinning down only if
   `MAX_SIGN_BYTES` is ever raised, since it marks where the real headroom ends.
-- **A longer soak.** The no-panic result covers ~8 minutes of deliberate
-  large-request traffic. It is strong evidence, not a soak test, and the
-  failure it replaces was intermittent.
-- **The remaining copy.** Deserialising directly removed the `Value` tree, but
-  the raw bytes and the `SignedEvent` still coexist. Bounding `raw.len()`
-  before `from_slice` would add a cheap belt-and-braces gate; it must leave
-  room for legitimate large traffic, since a `set_identity_meta` management
-  event is ~17 KB.
-- **The fragmented-heap condition.** Both sweeps above ran on a device with
-  under 15 minutes of uptime and no relay sessions. The plan calls for a second
-  run after a client has bulk-decrypted a message history, which is the state
-  the field crashes were blamed on. That number, not the fresh-boot one, is the
-  one that belongs in a header.
+- **The fragmented-heap condition.** Still not reproduced. The 12-minute soak
+  below held a live relay session throughout and the heap did not budge, so it
+  did not generate the state the field crashes were blamed on. The plan calls
+  for a run after a client has bulk-decrypted a message history. That number,
+  not the fresh-boot one, is the one that belongs in a header.
 - **Every other board, on hardware.** Only the V4 was physically present.
   `heltec-v3`, `tdisplay` and `esp32c6` are **build-verified but not
   run-verified**: all four board features compile clean at v0.14.0, across all
@@ -415,7 +485,7 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
   `heap_caps_get_largest_free_block` are chip-specific bindings, and a build on
   the S3 alone would not have proven they exist elsewhere. What remains
   unverified per board is the runtime behaviour: actual heap figures, and
-  therefore whether `MAX_SIGN_BYTES` of 20480 is right for a board with less
+  therefore whether `MAX_SIGN_BYTES` of 16384 is right for a board with less
   memory than the V4. The classic-ESP32 T-Display is the one to watch.
 
   Building the non-S3 boards on a fresh macOS machine hits two snags worth

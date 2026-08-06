@@ -441,6 +441,10 @@ struct RelaySession {
     /// The subscription REQ sent at connect, re-sent periodically to self-heal.
     sub_req: String,
     pinned: bool,
+    /// Bytes still owed from an oversize frame being discarded. See `try_parse`:
+    /// an over-cap frame is skipped rather than killing the session, and it may
+    /// span several reads, so the remainder is carried here between pump passes.
+    skip: usize,
 }
 
 /// A relay joined at nostrconnect pairing because the client dictated it.
@@ -1221,6 +1225,7 @@ fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySess
         recv_timeout_on,
         sub_req,
         pinned,
+        skip: 0,
     })
 }
 
@@ -1235,7 +1240,7 @@ fn session_step(
     // Process at most ONE buffered frame per step, so the outer loop serves
     // USB between frames — same cadence the single-session loop kept (a burst
     // of frames must never starve the cable).
-    if let Some(msg) = try_parse(&mut s.rx)? {
+    if let Some(msg) = try_parse(&mut s.rx, &mut s.skip)? {
         match msg {
             WsMsg::Text(p) => handle_relay_msg(s, &p, ctx, pool)?,
             WsMsg::Ping(p) => ws_send(&mut s.tls, OP_PONG, &p)?,
@@ -4326,9 +4331,23 @@ fn pump(tls: &mut Tls, rx: &mut Vec<u8>) -> Result<usize, String> {
 }
 
 /// Pop one complete WebSocket frame from the front of `rx` if fully buffered.
-/// `Ok(None)` means "need more bytes"; an oversize frame is an error (reconnect).
-/// Server→client frames are unmasked per RFC 6455, but we honour the mask bit.
-fn try_parse(rx: &mut Vec<u8>) -> Result<Option<WsMsg>, String> {
+/// `Ok(None)` means "need more bytes". An oversize frame is SKIPPED, not fatal —
+/// see below. Server→client frames are unmasked per RFC 6455, but we honour the
+/// mask bit.
+///
+/// `skip` carries the bytes still owed from an over-cap frame across calls,
+/// since one can span several reads.
+fn try_parse(rx: &mut Vec<u8>, skip: &mut usize) -> Result<Option<WsMsg>, String> {
+    // Finish discarding an oversize frame before looking for the next header,
+    // otherwise its body would be parsed as one.
+    if *skip > 0 {
+        let n = (*skip).min(rx.len());
+        rx.drain(0..n);
+        *skip -= n;
+        if *skip > 0 {
+            return Ok(None); // more of the doomed frame still to come
+        }
+    }
     if rx.len() < 2 {
         return Ok(None);
     }
@@ -4346,11 +4365,46 @@ fn try_parse(rx: &mut Vec<u8>) -> Result<Option<WsMsg>, String> {
         if rx.len() < 10 {
             return Ok(None);
         }
-        len = u64::from_be_bytes(rx[2..10].try_into().unwrap()) as usize;
+        let declared = u64::from_be_bytes(rx[2..10].try_into().unwrap());
+        // `usize` is 32 bits on this chip, so a declared length above u32 would
+        // TRUNCATE — 0x1_0000_0000 would read as a 0-byte frame and desync the
+        // stream against a body that is still arriving. No relay sends one
+        // legitimately, so treat it as a broken peer rather than trying to
+        // resync. Anything merely over the cap falls through to the skip below,
+        // which is the path a >64KB event addressed to us takes.
+        if declared > u32::MAX as u64 {
+            return Err(format!("ws frame length {declared} is not credible"));
+        }
+        len = declared as usize;
         off = 10;
     }
     if len > MAX_WS_FRAME {
-        return Err(format!("ws frame {len}B exceeds {MAX_WS_FRAME}B cap"));
+        // Drop the frame, KEEP the session.
+        //
+        // This used to return Err, which `session_step` propagates as "the
+        // session is dead". That handed anyone a remote off-switch: the
+        // subscription is `{"kinds":[24133],"#p":[<our pubkeys>]}`, and our
+        // pubkey is public — it is the host of every bunker URI we issue. So
+        // any unauthenticated party could publish an over-cap kind-24133 event
+        // p-tagged to us and knock us off the relay, before a single byte was
+        // decrypted or the sender was even looked at. The primary session then
+        // fails over to a DIFFERENT relay (relay_idx advances) and a pinned one
+        // backs off 15s doubling to 600s; either way the client watching the
+        // old relay sees silence. Worse, the subscription is `limit:0` with no
+        // `since`, so every request published during the gap is lost for good
+        // rather than replayed on reconnect.
+        //
+        // Nothing about the STREAM is broken here, only this one message: the
+        // header tells us exactly where the next frame starts. So skip it. The
+        // body may not have arrived yet, hence `skip` carries the remainder.
+        let total = off + if masked { 4 } else { 0 } + len;
+        let n = total.min(rx.len());
+        rx.drain(0..n);
+        *skip = total - n;
+        log::warn!("[relay] skipping oversize frame ({len}B > {MAX_WS_FRAME}B cap); session kept");
+        // Counts as activity so the silence watchdog doesn't then trip, and
+        // lets session_step reclaim any rx capacity the frame forced.
+        return Ok(Some(WsMsg::Other));
     }
     let mask = if masked {
         if rx.len() < off + 4 {

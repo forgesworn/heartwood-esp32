@@ -34,6 +34,28 @@ pub const BOARD: &str = "tdisplay";
 #[cfg(feature = "c6")]
 pub const BOARD: &str = "esp32c6";
 
+/// Largest event content this board will accept for signing, reported in
+/// `FIRMWARE_INFO` as `max_sign_bytes` so a client can refuse an oversize
+/// request up front instead of watching it time out.
+///
+/// Per-board because the real constraint is heap, and the boards do not have
+/// the same heap. A response of N bytes needs one contiguous block a little
+/// over its base64-expanded size (see `relay::response_transportable`), and on
+/// a no-PSRAM board that competes with two mbedTLS sessions on ~180 KB.
+///
+/// Every board is currently pinned to the relay-transport ceiling, which is
+/// the smaller of the two transports and therefore the safe single number to
+/// advertise. The USB path is structurally capable of `MAX_SIGN_CONTENT_USB`
+/// and measured clean to ~32 KB on the V4 (docs/BENCH-2026-08-06-message-sizes.md),
+/// so a future split could advertise per-transport figures.
+///
+/// The V4 is the board with headroom to raise this: it carries 2 MB of quad-SPI
+/// PSRAM that `sdkconfig.defaults` deliberately leaves disabled. Turning that on
+/// is what would let it reach the NIP-44 protocol ceiling of 65535; doing so
+/// requires splitting the shared V3/V4 build profile and keeping key material
+/// out of PSRAM. Until then it has no more usable heap than the V3.
+pub const MAX_SIGN_BYTES: usize = heartwood_common::types::MAX_SIGN_CONTENT_RELAY;
+
 /// Initialised, board-agnostic hardware handles.
 ///
 /// Every driver is built from the owned (`'static`) peripheral singletons, so

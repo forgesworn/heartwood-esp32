@@ -134,6 +134,35 @@ pub const MAX_PAYLOAD_SIZE: usize = 32768;
 pub const FRAME_HEADER_SIZE: usize = 5; // 2 magic + 1 type + 2 length
 pub const FRAME_OVERHEAD: usize = FRAME_HEADER_SIZE + 4; // header + CRC32
 
+/// Bytes a `sign_event` response adds on top of the event content: the event
+/// id (64 hex), signature (128 hex), pubkey (64 hex), created_at, kind, the
+/// empty tag array, the NIP-46 `{"id":...,"result":"..."}` wrapper, and the
+/// JSON escaping of the inner event string. Rounded up with headroom.
+pub const SIGN_RESPONSE_OVERHEAD: usize = 512;
+
+/// Largest event content that can be signed and returned over the USB frame
+/// transport. Bound by the response frame, which is the larger of the pair
+/// because it carries the id and signature the request did not.
+///
+/// This is a STRUCTURAL limit, not a memory one. A device can still refuse a
+/// smaller event when its heap is fragmented; see `response_transportable` in
+/// the firmware's relay module for the runtime guard.
+pub const MAX_SIGN_CONTENT_USB: usize = MAX_PAYLOAD_SIZE - SIGN_RESPONSE_OVERHEAD;
+
+/// Largest event content that can be signed and returned over the relay
+/// (WiFi-standalone NIP-46) transport.
+///
+/// Much smaller than the USB figure because the relay response is NIP-44
+/// encrypted and base64'd before it is wrapped in a kind:24133 event and
+/// pushed through a WebSocket frame. Working backwards from the firmware's
+/// 32768-byte inbound WS cap: subtract ~330 bytes of event envelope, undo the
+/// 4/3 base64 expansion and the 67 bytes of NIP-44 nonce/MAC/version, and the
+/// result lands on the NIP-44 v2 padding step of 20480. The next step up
+/// (24576) does not fit.
+///
+/// Derivation and the full ladder: docs/plans/2026-08-06-message-size-limits.md
+pub const MAX_SIGN_CONTENT_RELAY: usize = 20480;
+
 /// Provisioning mode for a master secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

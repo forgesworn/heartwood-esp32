@@ -110,19 +110,37 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use secp256k1::Secp256k1;
 
 /// JSON for a FIRMWARE_INFO_RESPONSE — the running firmware version, board,
-/// uptime, and why the chip last reset. Read-only and secret-free, so it is
-/// answered over USB in any mode. The reset reason lets a manager (and an
-/// alpha tester) tell a deliberate restart from a crash.
+/// uptime, why the chip last reset, the signing size ceiling, and live heap.
+/// Read-only and secret-free, so it is answered over USB in any mode. The reset
+/// reason lets a manager (and an alpha tester) tell a deliberate restart from a
+/// crash.
+///
+/// `max_sign_bytes` is the structural ceiling for this board. `free_heap` and
+/// `largest_block` are the runtime half of the same question: a request inside
+/// the structural limit can still be refused when the heap is fragmented, and
+/// `relay::response_transportable` needs one contiguous block a little over the
+/// base64-expanded response size. Exposing both means a size sweep can record
+/// the heap curve instead of only pass/fail, and a manager can show why a
+/// request that worked yesterday is refused today. Neither is a secret: they
+/// are allocator statistics, not contents.
 pub fn firmware_info_json() -> String {
     let crash = crash_context()
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
         .unwrap_or_default();
+    let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let largest_block = unsafe {
+        esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
+    };
     format!(
-        "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\"{}}}",
+        "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
+         \"max_sign_bytes\":{},\"free_heap\":{},\"largest_block\":{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
         reset_reason_str(),
+        board::MAX_SIGN_BYTES,
+        free_heap,
+        largest_block,
         crash,
     )
 }
@@ -167,6 +185,14 @@ pub fn reset_reason_str() -> &'static str {
         r if r == esp_reset_reason_t_ESP_RST_WDT => "watchdog",
         r if r == esp_reset_reason_t_ESP_RST_DEEPSLEEP => "deep-sleep-wake",
         r if r == esp_reset_reason_t_ESP_RST_BROWNOUT => "brownout",
+        // ESP-IDF 5.x added these two. Without them a native-USB board (the V4
+        // and the C6 both drive USB-Serial-JTAG) reports "unknown" for the
+        // single most likely reset it will ever see, which is precisely the
+        // case this field exists to name. Observed on a V4 during the
+        // 2026-08-06 size sweep, where "unknown" left a host-triggered reset
+        // indistinguishable from a firmware crash.
+        r if r == esp_reset_reason_t_ESP_RST_USB => "usb-peripheral-reset",
+        r if r == esp_reset_reason_t_ESP_RST_JTAG => "jtag-reset",
         _ => "unknown",
     }
 }
@@ -743,7 +769,7 @@ fn main() {
                         &mut identity_caches,
                         None,
                     );
-                    protocol::write_owned_frame(
+                    protocol::write_nip46_response(
                         &mut usb,
                         FRAME_TYPE_NIP46_RESPONSE,
                         response_json,

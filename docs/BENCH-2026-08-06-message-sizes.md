@@ -265,6 +265,44 @@ the stream against a body still arriving. That path is reachable by an attacker,
 since any frame over 65535 bytes uses it. A declared length that large now drops
 the connection as a broken peer; merely-over-cap lengths take the skip path.
 
+### 16384 is not reliably signable once a session has been alive
+
+Open, and it undercuts the constant. `MAX_SIGN_CONTENT_RELAY` is documented as
+measured, and it was — on a **freshly booted** device, where 16384 signed twice.
+Re-measured later in the same day, on a signer that had been up and relaying for
+a while:
+
+| Content | Attempts | Signed |
+|---------|----------|--------|
+| 8192 | 2 | 2 |
+| 10240 | 2 | 2 |
+| 12288 | 2 | 2 |
+| **16384** | **3** | **1** |
+
+Everything to 12288 answered in under a second, 6 for 6. 16384 failed two of
+three, and the failures were plain silence, not a refusal.
+
+This is **not** the oversize-frame defect above: these runs contained no
+over-cap frame at all, and the sequence that provokes it — an oversize followed
+by a normal request — now succeeds. It is the marginality this bench already
+described in "Post-fix re-run", at the top of the range and dependent on heap
+state when the request lands. A fresh boot has ~144 KB largest block; a live
+session was measured at 108–116 KB.
+
+Cause not isolated, and two candidates remain:
+
+- **Device-side margin.** The 16384 response is 27396 B and needs a large
+  contiguous block; the signer goes quiet rather than refusing.
+- **Relay-side response drop.** This bench already records that a relay which
+  accepts the request can silently decline to carry the larger *response*, and
+  that this is indistinguishable from a crash at the client.
+
+Distinguishing them needs `last_reset` and `largest_block` read over USB in the
+moment of a failure, which could not be done here: the cable was held by a
+browser tab throughout. Until that is done, treat 16384 as the *measured
+best case* and 12288 as the figure that actually holds under load. Do not raise
+the constant on the strength of the fresh-boot number, and consider lowering it.
+
 ### Relay membership rotates, so "is it reachable" depends on when you ask
 
 `MAX_SESSIONS` is 2, and the signer rotates its primary across the configured
@@ -467,6 +505,11 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
 
 ## What is still unmeasured
 
+- **Whether 16384 is the right constant at all.** It signs on a fresh boot and
+  fails about two thirds of the time on a device that has been relaying for a
+  while, while 12288 and below hold. Needs `last_reset`/`largest_block` sampled
+  over USB at the moment of a failure to say whether that is device margin or
+  the relay declining the response. This is the top open question here.
 - **The exact point the old firmware panicked**, known only to lie in
   28672..32000 bytes of content. Now academic: the ceiling is enforced at
   16384 and the crash is unreachable. Worth pinning down only if

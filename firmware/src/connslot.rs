@@ -23,6 +23,16 @@ use crate::policy::PolicyEngine;
 use crate::protocol;
 use crate::serial::SerialPort;
 
+/// Sent as the NACK payload when connection-slot management is attempted on a
+/// channel that has not completed SESSION_AUTH.
+///
+/// Every one of these operations mints or moves a signing credential, so the
+/// gate itself is right. What was wrong was saying nothing: a plain USB caller
+/// got an empty NACK and reported "the signer refused", which reads as a fault
+/// rather than a missing session.
+const BRIDGE_AUTH_REQUIRED: &[u8] =
+    b"connection-slot management requires an authenticated bridge session";
+
 /// 0x40 — create a connection slot (requires bridge auth). Returns the slot's
 /// secret + bunker npub once; the secret is never shown again.
 pub fn handle_create(
@@ -33,7 +43,11 @@ pub fn handle_create(
     nvs: &mut EspNvs<NvsDefault>,
 ) {
     if !policy_engine.bridge_authenticated {
-        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        // Say WHY. An empty NACK left callers guessing: the sapwood CLI
+        // reported "the signer refused" for what is simply an unauthenticated
+        // channel, with no hint that connection-slot management needs a bridge
+        // session at all.
+        protocol::write_frame(usb, FRAME_TYPE_NACK, BRIDGE_AUTH_REQUIRED);
     } else if frame.payload.is_empty() {
         log::warn!("CONNSLOT_CREATE missing master_slot");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
@@ -112,7 +126,11 @@ pub fn handle_update(
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) {
     if !policy_engine.bridge_authenticated {
-        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        // Say WHY. An empty NACK left callers guessing: the sapwood CLI
+        // reported "the signer refused" for what is simply an unauthenticated
+        // channel, with no hint that connection-slot management needs a bridge
+        // session at all.
+        protocol::write_frame(usb, FRAME_TYPE_NACK, BRIDGE_AUTH_REQUIRED);
     } else if frame.payload.len() < 2 {
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
     } else {
@@ -195,7 +213,11 @@ pub fn handle_revoke(
     nvs: &mut EspNvs<NvsDefault>,
 ) {
     if !policy_engine.bridge_authenticated {
-        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        // Say WHY. An empty NACK left callers guessing: the sapwood CLI
+        // reported "the signer refused" for what is simply an unauthenticated
+        // channel, with no hint that connection-slot management needs a bridge
+        // session at all.
+        protocol::write_frame(usb, FRAME_TYPE_NACK, BRIDGE_AUTH_REQUIRED);
     } else if frame.payload.len() < 2 {
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
     } else {
@@ -219,7 +241,11 @@ pub fn handle_uri(
     masters: &[LoadedMaster],
 ) {
     if !policy_engine.bridge_authenticated {
-        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        // Say WHY. An empty NACK left callers guessing: the sapwood CLI
+        // reported "the signer refused" for what is simply an unauthenticated
+        // channel, with no hint that connection-slot management needs a bridge
+        // session at all.
+        protocol::write_frame(usb, FRAME_TYPE_NACK, BRIDGE_AUTH_REQUIRED);
     } else if frame.payload.len() < 2 {
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
     } else {

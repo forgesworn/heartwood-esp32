@@ -123,6 +123,38 @@ and a signer that works on one relay can fail on another at the same size. Any
 future relay figure must name the relay it was measured against. The 16384
 above is the signer's own ceiling, measured on the more permissive relay.
 
+## Heap under a live relay session
+
+Sampled with `scripts/heap-watch.mjs` while the signer was WiFi-connected with
+a live relay session (`relay_connected: true`), across two runs:
+
+| Uptime | Free | Largest block | Ratio |
+|--------|------|---------------|-------|
+| 303 s | 209 KB | 136 KB | 0.65 |
+| 348 s | 211 KB | 136 KB | 0.64 |
+| 393 s | 211 KB | 136 KB | 0.64 |
+| 438 s | 211 KB | 136 KB | 0.65 |
+| 1570 s | 213 KB | 144 KB | 0.68 |
+
+**Flat, and nowhere near the fragmented regime.** The relay guards are written
+for a heap whose largest block has fallen to `DIAL_MIN_LARGEST_BLOCK` (24000)
+or `RELAY_HEALTH_MIN_BLOCK` (16384); Sapwood's UI flags fragmentation below a
+0.4 ratio. Observed here: 136-144 KB and a ratio of ~0.65, an order of
+magnitude clear of the thresholds, holding steady over ~26 minutes of uptime
+with the radio up and a relay session established.
+
+So the fragmented condition **was not reproduced**, and this is not evidence
+that it cannot happen. These samples cover an idle-with-relay signer. The state
+the field crashes were blamed on is a client bulk-decrypting a message history,
+which fires dozens of `nip44_decrypt` in a burst, and nothing here generated
+that load. Reproducing it needs a client driving sustained decrypt traffic,
+which is the natural next use of `relay-size-sweep.mjs`.
+
+What these figures do settle is that the size ceilings above were measured on a
+healthy heap. The 20480 relay panic happened with 130 KB free, so it was not
+memory pressure, and a smaller ceiling — not a heap threshold — is the right
+defence.
+
 ## Method
 
 Two probes, both in `scripts/frame-size-probe.mjs`.

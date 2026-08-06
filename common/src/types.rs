@@ -161,18 +161,37 @@ pub const MAX_SIGN_CONTENT_USB: usize = MAX_PAYLOAD_SIZE - SIGN_RESPONSE_OVERHEA
 /// alone gave 20480, and that was wrong: the request is the larger of the two,
 /// because NIP-46 carries the event as a JSON *string inside* the params
 /// array, so the event's own quotes are escaped a second time before the whole
-/// request is padded, encrypted and base64'd. Measured on a V4 over a public
-/// relay on 2026-08-06: 16384 bytes of content signs (request 27824 B on the
-/// wire, response 27396 B), while 20480 puts the request at 33288 B, over the
-/// cap, and panicked the signer rather than being refused.
+/// request is padded, encrypted and base64'd.
 ///
-/// So this is the largest NIP-44 padding step that fits, one below the
-/// derivation's answer. Do not raise it back on the strength of arithmetic
-/// without re-running scripts/relay-size-sweep.mjs.
+/// It was then 16384 for a day, on the strength of that size signing twice on a
+/// **freshly booted** device. That was too high, and the failure mode was a
+/// reboot. The binding limit is not the wire at all — it is PARSING. Unescaping
+/// the inner event string grows a Vec by doubling, so a 16503-byte request asks
+/// for 32878 bytes in one contiguous block; when that fails, Rust's alloc-error
+/// path aborts the chip. Free heap looked ample (156 KB) each time, because what
+/// runs out is one large block, not the total.
+///
+/// Measured on a V4 over a relay on 2026-08-06, with the crash confirmed over
+/// USB by `last_reset`/uptime rather than inferred from client silence:
+///
+/// | Content | Attempts | Signed |
+/// |---------|----------|--------|
+/// | 12288   | 6        | 6      |
+/// | 14336   | 4        | 4      |
+/// | 16384   | 3        | 1, aborting the chip on the failures |
+///
+/// 12288 is chosen over the 14336 that also passed, because the failure is
+/// heap-state dependent and 14336 doubles to ~29 KB — close enough to the 32 KB
+/// that demonstrably fails that it buys no margin. Requests above the budget are
+/// now refused before serde_json sees them.
+///
+/// Do not raise it back on the strength of arithmetic, or of a fresh-boot
+/// measurement, without re-running scripts/relay-size-sweep.mjs against a signer
+/// that has been up for a while AND watching `last_reset` over USB.
 ///
 /// Ladder and workings: docs/plans/2026-08-06-message-size-limits.md
 /// Measurements: docs/BENCH-2026-08-06-message-sizes.md
-pub const MAX_SIGN_CONTENT_RELAY: usize = 16384;
+pub const MAX_SIGN_CONTENT_RELAY: usize = 12288;
 
 /// Provisioning mode for a master secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

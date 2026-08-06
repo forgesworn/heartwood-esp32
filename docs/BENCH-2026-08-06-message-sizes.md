@@ -265,6 +265,59 @@ the stream against a body still arriving. That path is reachable by an attacker,
 since any frame over 65535 bytes uses it. A declared length that large now drops
 the connection as a broken peer; merely-over-cap lengths take the skip path.
 
+### Answered: it was the signer aborting, and PARSING is the real limit
+
+The section below left two candidates and said the cable was needed to separate
+them. It was, and it did. Streaming the device log and `FIRMWARE_INFO` on one
+timeline caught a failure in the act:
+
+    21:18:27.030  [relay] decrypted request (16503 bytes) from 87b01e5f… for default
+    21:18:27.033  memory allocation of 32878 bytes failed
+    21:18:27.038  abort() was called at PC 0x420b1d9e on core 0
+    21:18:27.865  Recovered from a crash during: relay inbound event (heap 156k)
+
+So it was the signer aborting, not the relay declining the response. The
+backtrace names the mechanism exactly:
+
+    serde_json::read::parse_escape → Vec::push → RawVec::grow_one
+      → handle_alloc_error → rust_oom → abort
+
+**The binding limit is not the wire, it is parsing.** NIP-46 carries the event
+as a JSON string *inside* params, so its quotes are escaped a second time, and
+unescaping grows a Vec by DOUBLING: a 16503-byte request asks for 32878 bytes in
+one contiguous block. Free heap was 156 KB at the time and `largest_block` read
+96 KB moments before, so this is not exhaustion of total free memory. It is one
+block, and the intermediate buffers alive during a request carve it up.
+
+Three things follow, and all three were wrong before:
+
+1. **The guard in `handle_parsed_request` cannot help.** It measures the event
+   *after* parsing, and parsing is what dies.
+2. **Removing the `Value` tree reduced the frequency but did not fix it.** The
+   breadcrumb is still `relay inbound event`, because this is a different
+   allocation on the same path.
+3. **Client silence was never evidence of a relay problem.** Every "NO REPLY" at
+   16384 was a reboot.
+
+Fixed in two parts. The decrypted request is now bounded *before* serde_json
+sees it, returning a proper NIP-46 error carried on the client's own id (scanned
+out, not parsed, since parsing is the hazard); and `MAX_SIGN_CONTENT_RELAY` drops
+to 12288. Verified on hardware, 0 crashes:
+
+| Content | Wire | Result |
+|---------|------|--------|
+| 12288 | 19632 | signed, 19204 B response |
+| 16384 | 27824 | `error: request is too large for this signer` in 615 ms, 176 B |
+| 20480 | 33288 | skipped at the WS layer, no reply possible |
+| 12288 | 19632 | signed |
+
+20480 stays silent by necessity: at 33288 B it is over `MAX_WS_FRAME` and is
+discarded before decryption, so there is no id to answer on.
+
+Reachability is worth stating: the second crash caught that evening came from a
+**different paired client** on a different slot, sending an 18523-byte request.
+Any app sending a largish event could reboot the signer.
+
 ### 16384 is not reliably signable once a session has been alive
 
 Open, and it undercuts the constant. `MAX_SIGN_CONTENT_RELAY` is documented as
@@ -289,7 +342,7 @@ described in "Post-fix re-run", at the top of the range and dependent on heap
 state when the request lands. A fresh boot has ~144 KB largest block; a live
 session was measured at 108–116 KB.
 
-Cause not isolated, and two candidates remain:
+Cause not isolated at the time, and two candidates remained:
 
 - **Device-side margin.** The 16384 response is 27396 B and needs a large
   contiguous block; the signer goes quiet rather than refusing.
@@ -297,11 +350,10 @@ Cause not isolated, and two candidates remain:
   accepts the request can silently decline to carry the larger *response*, and
   that this is indistinguishable from a crash at the client.
 
-Distinguishing them needs `last_reset` and `largest_block` read over USB in the
-moment of a failure, which could not be done here: the cable was held by a
-browser tab throughout. Until that is done, treat 16384 as the *measured
-best case* and 12288 as the figure that actually holds under load. Do not raise
-the constant on the strength of the fresh-boot number, and consider lowering it.
+**Resolved once the cable was free, and it was neither guess exactly.** The
+device aborts, but on the *request* parse, not the response. See "Answered: it
+was the signer aborting" above. `MAX_SIGN_CONTENT_RELAY` is now 12288 and
+over-budget requests are refused before serde_json sees them.
 
 ### Relay membership rotates, so "is it reachable" depends on when you ask
 
@@ -505,11 +557,15 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
 
 ## What is still unmeasured
 
-- **Whether 16384 is the right constant at all.** It signs on a fresh boot and
-  fails about two thirds of the time on a device that has been relaying for a
-  while, while 12288 and below hold. Needs `last_reset`/`largest_block` sampled
-  over USB at the moment of a failure to say whether that is device margin or
-  the relay declining the response. This is the top open question here.
+- **Whether the ceiling can be raised by changing the encoding**, rather than
+  measured where it happens to fall. The limit is the doubling in
+  `parse_escape`, which exists only because NIP-46 double-encodes the event as
+  a JSON string inside params. Accepting `params[0]` as a JSON *object* removes
+  the unescape pass entirely, and returning `{id, sig}` instead of the whole
+  signed event removes the 27 KB response. Both are backwards compatible if the
+  signer accepts either form. Projected from the allocation sizes, not measured:
+  that should move the ceiling from 12288 toward the wire cap, after which the
+  NIP-44 decrypt buffer binds instead.
 - **The exact point the old firmware panicked**, known only to lie in
   28672..32000 bytes of content. Now academic: the ceiling is enforced at
   16384 and the crash is unreachable. Worth pinning down only if

@@ -352,7 +352,7 @@ pub fn write_nip46_response(usb: &mut SerialPort<'_>, frame_type: u8, response_j
 
     // Build the replacement before dropping the oversize body, then release it.
     let error = heartwood_common::nip46::build_error_response(
-        heartwood_common::nip46::response_request_id(&response_json).unwrap_or_default(),
+        heartwood_common::nip46::scan_rpc_id(&response_json).unwrap_or_default(),
         -4,
         "response too large for the serial frame; the event was signed but could not be returned",
     )

@@ -811,20 +811,30 @@ pub fn relay_message_tag(raw: &[u8]) -> Option<&str> {
     core::str::from_utf8(&raw[start..i]).ok()
 }
 
-/// Pull `id` out of a `{"id":"...",...}` NIP-46 response without parsing it.
+/// Pull `id` out of a `{"id":"...",...}` NIP-46 envelope without parsing it.
 ///
-/// Used when a response turns out to be too large to transport and has to be
-/// replaced by a same-id error. Deserialising it at that point is exactly what
-/// must not happen: the response is oversize by definition, on a device that
-/// is already short of contiguous heap. Scanning for the field allocates only
-/// the id.
+/// Works on a request or a response: both carry the same client-generated
+/// token, and both have a case where parsing is precisely what must not happen.
 ///
-/// Returns `None` if the field is absent or unterminated. An escape inside the
-/// id ends the scan rather than being unescaped, since NIP-46 request ids are
-/// client-generated tokens with no reason to contain one.
-pub fn response_request_id(response_json: &str) -> Option<&str> {
-    let start = response_json.find("\"id\":\"")? + 6;
-    let rest = response_json.get(start..)?;
+/// - A **response** too large to transport must be replaced by a same-id error,
+///   and it is oversize by definition on a device already short of contiguous
+///   heap.
+/// - A **request** over the parse budget must be refused, and parsing it is the
+///   thing that aborts the chip (unescaping the inner event grows a Vec by
+///   doubling). Without the id the refusal reaches the client as silence, which
+///   apps render as a timeout rather than "too large".
+///
+/// Scanning allocates only the id. Returns `None` if the field is absent or
+/// unterminated. An escape inside the id ends the scan rather than being
+/// unescaped, since these ids are client-generated tokens with no reason to
+/// contain one.
+///
+/// Takes the FIRST `"id":"` in the envelope, which is the JSON-RPC id in every
+/// well-formed one. A hostile client could bury an earlier match inside a
+/// param; the only consequence is that its own error comes back mis-correlated.
+pub fn scan_rpc_id(envelope_json: &str) -> Option<&str> {
+    let start = envelope_json.find("\"id\":\"")? + 6;
+    let rest = envelope_json.get(start..)?;
     let end = rest.find(['"', '\\'])?;
     Some(&rest[..end])
 }
@@ -962,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn response_request_id_reads_the_id_without_parsing() {
+    fn scan_rpc_id_reads_the_id_without_parsing() {
         let signed = build_sign_response(
             "req-42",
             &SignedEvent {
@@ -977,31 +987,45 @@ mod tests {
         )
         .unwrap();
         // Must agree with the real builder's output, not a hand-written shape.
-        assert_eq!(response_request_id(&signed), Some("req-42"));
+        assert_eq!(scan_rpc_id(&signed), Some("req-42"));
     }
 
     #[test]
-    fn response_request_id_handles_absent_and_malformed() {
-        assert_eq!(response_request_id("{}"), None);
-        assert_eq!(response_request_id(""), None);
+    fn scan_rpc_id_handles_absent_and_malformed() {
+        assert_eq!(scan_rpc_id("{}"), None);
+        assert_eq!(scan_rpc_id(""), None);
         // Present but never closed.
-        assert_eq!(response_request_id("{\"id\":\"unterminated"), None);
+        assert_eq!(scan_rpc_id("{\"id\":\"unterminated"), None);
         // Empty id is a real (if useless) value, not a failure.
-        assert_eq!(response_request_id("{\"id\":\"\",\"result\":\"x\"}"), Some(""));
+        assert_eq!(scan_rpc_id("{\"id\":\"\",\"result\":\"x\"}"), Some(""));
     }
 
     #[test]
-    fn response_request_id_stops_at_an_escape_rather_than_unescaping() {
+    fn scan_rpc_id_reads_a_request_too_large_to_parse() {
+        // The reason this has to work without parsing: an over-budget request
+        // is refused precisely because parsing it aborts the chip, and the
+        // refusal still has to carry the client's id or it lands as silence.
+        // Shaped like the real thing, with the event double-encoded in params.
+        let event = r#"{"kind":1,"created_at":1700000000,"tags":[],"content":"aaaa"}"#;
+        let request = format!(
+            r#"{{"id":"sweep-3","method":"sign_event","params":[{}]}}"#,
+            serde_json::to_string(event).unwrap()
+        );
+        assert_eq!(scan_rpc_id(&request), Some("sweep-3"));
+    }
+
+    #[test]
+    fn scan_rpc_id_stops_at_an_escape_rather_than_unescaping() {
         // Deliberate: the id is echoed straight back into an error response, so
         // it must never carry a partial escape sequence into fresh JSON.
         assert_eq!(
-            response_request_id("{\"id\":\"we\\\"ird\",\"result\":\"x\"}"),
+            scan_rpc_id("{\"id\":\"we\\\"ird\",\"result\":\"x\"}"),
             Some("we")
         );
     }
 
     #[test]
-    fn response_request_id_round_trips_into_an_error_response() {
+    fn scan_rpc_id_round_trips_into_an_error_response() {
         // The whole point of the helper: recover the id from a response we
         // cannot send, and correlate the substitute error to the same request.
         let original = build_sign_response(
@@ -1017,7 +1041,7 @@ mod tests {
             },
         )
         .unwrap();
-        let id = response_request_id(&original).unwrap();
+        let id = scan_rpc_id(&original).unwrap();
         let error = build_error_response(id, -4, "response too large").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&error).unwrap();
         assert_eq!(parsed["id"], "abc-123");

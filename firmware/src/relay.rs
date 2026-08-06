@@ -2071,6 +2071,55 @@ fn handle_nip46_event(
         label,
         if is_persona { " (persona)" } else { "" }
     );
+    // Refuse an over-budget request BEFORE serde_json sees it.
+    //
+    // The size guard in `handle_parsed_request` is too late to protect this:
+    // parsing is what dies. NIP-46 carries the event as a JSON *string inside*
+    // params, so every quote in it is escaped, and `serde_json::read::parse_escape`
+    // unescapes into a Vec that grows by DOUBLING. A 16503-byte request asked for
+    // 32878 bytes in one block, the allocation failed, and Rust's alloc-error
+    // path aborts the chip — a reboot, not a refusal:
+    //
+    //     [relay] decrypted request (16503 bytes) ...
+    //     memory allocation of 32878 bytes failed
+    //     abort() was called
+    //
+    // It needs roughly 2x the plaintext contiguous, which is why this bites far
+    // below any wire limit and why free heap looked ample (156 KB) at the time.
+    // Observed from two different paired clients, so any app sending a largish
+    // event could reboot the signer.
+    //
+    // Only kind-24133 reaches here; MGMT_KIND branched off earlier, so the ~17 KB
+    // set_identity_meta path is unaffected by this bound.
+    let request_budget =
+        crate::board::MAX_SIGN_BYTES + heartwood_common::types::SIGN_RESPONSE_OVERHEAD;
+    if plaintext.len() > request_budget {
+        log::warn!(
+            "[relay] request of {} bytes exceeds the {} byte parse budget; refusing",
+            plaintext.len(),
+            request_budget
+        );
+        // Scan the id out rather than parsing for it: parsing is the thing that
+        // aborts. Without it the refusal reaches the client as silence, and an
+        // app shows a timeout instead of "too large".
+        let response = nip46::build_error_response(
+            nip46::scan_rpc_id(&plaintext).unwrap_or("unknown"),
+            -3,
+            "request is too large for this signer",
+        )
+        .unwrap_or_default();
+        drop(plaintext);
+        return sign_and_publish(
+            tls,
+            ctx.secp,
+            &signing_secret,
+            &conversation_key,
+            &ev.pubkey,
+            NIP46_KIND,
+            ev.created_at,
+            response,
+        );
+    }
     let request = match nip46::parse_request(plaintext.as_bytes()) {
         Ok(request) => request,
         Err(e) => {

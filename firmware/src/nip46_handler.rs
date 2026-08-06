@@ -146,6 +146,31 @@ pub(crate) fn request_may_mutate_slot_state(
     }
 }
 
+/// The NIP-46 method name a client uses to ask for the compact reply.
+///
+/// Deliberately NOT a separate `Nip46Method`: `from_str` maps it onto
+/// `SignEvent`, so permissions, the approval tier, the OLED prompt and the audit
+/// entry are the same code, and cannot drift into a laxer parallel path. The
+/// only thing this name changes is how the answer is serialised.
+pub(crate) const SIGN_EVENT_COMPACT: &str = "sign_event_compact";
+
+/// Build the reply for a completed signature, compact when the client asked.
+///
+/// The full form echoes the whole signed event back, which costs one contiguous
+/// allocation of about twice the content and is what aborts the chip once the
+/// parse cost is removed. The compact form returns a couple of hundred bytes
+/// whatever the size.
+fn build_sign_reply(
+    request: &nip46::Nip46Request,
+    signed: &SignedEvent,
+) -> Result<String, String> {
+    if request.method == SIGN_EVENT_COMPACT {
+        nip46::build_sign_response_compact(&request.id, signed)
+    } else {
+        nip46::build_sign_response(&request.id, signed)
+    }
+}
+
 fn connect_success_response(request_id: &str, client_secret: &str) -> String {
     if client_secret.is_empty() {
         nip46::build_connect_response(request_id).unwrap_or_default()
@@ -299,15 +324,54 @@ pub fn handle_parsed_request(
     //
     // The allowance over MAX_SIGN_BYTES covers the event's own JSON
     // scaffolding — pubkey, created_at, kind, tags — which wraps the content.
-    if request.method == "sign_event" {
-        let event_bytes = request
-            .params
-            .first()
-            .and_then(|value| value.as_str())
-            .map(str::len)
-            .unwrap_or(0);
-        let limit = crate::board::MAX_SIGN_BYTES
-            + heartwood_common::types::SIGN_RESPONSE_OVERHEAD;
+    //
+    // params[0] arrives in one of two encodings and BOTH must be measured. The
+    // object form used to return None from as_str() and take `unwrap_or(0)`,
+    // which skipped this guard entirely: the only thing standing in front of it
+    // was the pre-parse budget in relay.rs, and nothing at all on the USB path.
+    // Its ceiling is higher because it costs no unescape pass, not because it is
+    // unbounded.
+    if request.method == "sign_event" || request.method == SIGN_EVENT_COMPACT {
+        let (event_bytes, limit) = match request.params.first() {
+            Some(Value::String(s)) => (
+                s.len(),
+                crate::board::MAX_SIGN_BYTES + heartwood_common::types::SIGN_RESPONSE_OVERHEAD,
+            ),
+            Some(Value::Object(object)) => {
+                // Measure the parts that carry size, rather than re-serialising
+                // the event just to length it: that copy is the cost this whole
+                // guard exists to avoid.
+                let content = object
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::len)
+                    .unwrap_or(0);
+                let tags = object
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .map(|tags| {
+                        tags.iter()
+                            .flat_map(|tag| tag.as_array().into_iter().flatten())
+                            .filter_map(Value::as_str)
+                            .map(str::len)
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0);
+                // Same rule as the pre-parse budget in relay.rs, and it must stay
+                // the same: an object that still wants the full event echoed back
+                // pays the reply allocation, so it gets the standard ceiling.
+                let ceiling = if request.method == SIGN_EVENT_COMPACT {
+                    crate::board::MAX_SIGN_BYTES_OBJECT
+                } else {
+                    crate::board::MAX_SIGN_BYTES
+                };
+                (
+                    content.saturating_add(tags),
+                    ceiling + heartwood_common::types::SIGN_RESPONSE_OVERHEAD,
+                )
+            }
+            _ => (0, crate::board::MAX_SIGN_BYTES),
+        };
         if event_bytes > limit {
             log::warn!(
                 "sign_event event is {event_bytes} B; this board signs at most {limit} B"
@@ -472,7 +536,7 @@ pub fn handle_parsed_request(
     }
 
     match request.method.as_str() {
-        "sign_event" => {
+        "sign_event" | SIGN_EVENT_COMPACT => {
             let event = match sign_event.expect("sign_event request must prepare an event") {
                 Ok(event) => event,
                 Err(e) => {
@@ -927,7 +991,7 @@ fn handle_auto_sign(
         secp,
         request.heartwood.as_ref(),
     )?;
-    nip46::build_sign_response(&request.id, &signed)
+    build_sign_reply(request, &signed)
 }
 
 // ---------------------------------------------------------------------------
@@ -969,7 +1033,7 @@ fn handle_sign_event(
                 secp,
                 request.heartwood.as_ref(),
             ) {
-                Ok(signed) => match nip46::build_sign_response(&request.id, &signed) {
+                Ok(signed) => match build_sign_reply(request, &signed) {
                     Ok(json) => {
                         crate::oled::show_signed(display);
                         json

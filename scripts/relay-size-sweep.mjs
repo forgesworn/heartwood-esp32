@@ -171,6 +171,11 @@ console.log(`connect: ${connectReply.body.result ?? connectReply.body.error} (${
 
 // NIP-44 padding steps either side of the derived 20480 ceiling.
 // --sizes 16384,18432 narrows in on a measured cutoff.
+const OBJECT_PARAMS = argv.includes('--object-params')
+const COMPACT = argv.includes('--compact')
+if (OBJECT_PARAMS) console.log('params[0] as a JSON object (no second escaping)')
+if (COMPACT) console.log('sign_event_compact: reply carries {id, sig, pubkey, created_at} only')
+if (OBJECT_PARAMS || COMPACT) console.log('')
 const SIZES_ARG = argv.includes('--sizes') ? argv[argv.indexOf('--sizes') + 1] : null
 const SIZES = SIZES_ARG
   ? SIZES_ARG.split(',').map((s) => Number(s.trim()))
@@ -180,7 +185,19 @@ console.log('content   request    response  ms     outcome')
 const results = []
 for (const [i, size] of SIZES.entries()) {
   const event = { kind: 1, created_at: Math.floor(Date.now() / 1000), tags: [], content: 'a'.repeat(size) }
-  const r = await request(ws, `sweep-${i}`, 'sign_event', [JSON.stringify(event)], 40_000)
+  // --object-params sends params[0] as a JSON OBJECT rather than the stringified
+  // event NIP-46 specifies. The signer accepts both, and the difference is the
+  // whole point: the string form is escaped a second time, and unescaping it
+  // grows a Vec by doubling, which is what aborts the chip. The object form
+  // never takes that path, so this measures how much of the ceiling was the
+  // encoding rather than the hardware.
+  const params = OBJECT_PARAMS ? [event] : [JSON.stringify(event)]
+  // --compact asks for {id, sig, pubkey, created_at} instead of the whole signed
+  // event echoed back. The reply is then a couple of hundred bytes whatever the
+  // content, which is the other half of the ceiling: the full reply needs one
+  // contiguous allocation of about twice the content.
+  const method = COMPACT ? 'sign_event_compact' : 'sign_event'
+  const r = await request(ws, `sweep-${i}`, method, params, 40_000)
 
   let outcome
   if (r.rejected) outcome = `RELAY REFUSED: ${r.rejected}`
@@ -189,10 +206,25 @@ for (const [i, size] of SIZES.entries()) {
   else if (r.body.result) {
     try {
       const signed = JSON.parse(r.body.result)
-      outcome = signed.sig?.length === 128 && signed.content?.length === size
-        ? 'signed'
-        : 'signed but mismatched'
-    } catch { outcome = 'unparseable result' }
+      if (COMPACT) {
+        // The premise of the compact reply is that the client can rebuild the
+        // event from what it already had. So rebuild it and VERIFY, rather than
+        // trusting that bytes came back: this is the assertion that the smaller
+        // reply is actually usable.
+        const rebuilt = {
+          ...event,
+          pubkey: signed.pubkey,
+          created_at: signed.created_at,
+          id: signed.id,
+          sig: signed.sig,
+        }
+        outcome = nt.verifyEvent(rebuilt) ? 'signed (compact, verified)' : 'compact reply failed verification'
+      } else {
+        outcome = signed.sig?.length === 128 && signed.content?.length === size
+          ? 'signed'
+          : 'signed but mismatched'
+      }
+    } catch (e) { outcome = `unparseable result: ${e.message}` }
   } else outcome = 'empty'
 
   results.push({ size, requestBytes: r.requestBytes, responseBytes: r.bytes ?? null, ms: r.ms, outcome })

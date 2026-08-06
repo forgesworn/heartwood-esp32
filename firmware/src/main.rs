@@ -115,7 +115,12 @@ use secp256k1::Secp256k1;
 /// reason lets a manager (and an alpha tester) tell a deliberate restart from a
 /// crash.
 ///
-/// `max_sign_bytes` is the structural ceiling for this board. `free_heap` and
+/// `max_sign_bytes` is the structural ceiling for this board, and
+/// `max_sign_bytes_object` the higher one a client earns by sending `params[0]`
+/// as a JSON object AND asking for `sign_event_compact`. Both are advertised
+/// because the difference is the client's to claim: it is the cost of the two
+/// escape/echo copies, not of the hardware, and a manager that showed only the
+/// first would understate what the signer can do. `free_heap` and
 /// `largest_block` are the runtime half of the same question: a request inside
 /// the structural limit can still be refused when the heap is fragmented, and
 /// `relay::response_transportable` needs one contiguous block a little over the
@@ -133,12 +138,14 @@ pub fn firmware_info_json() -> String {
     };
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
-         \"max_sign_bytes\":{},\"free_heap\":{},\"largest_block\":{}{}}}",
+         \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
+         \"free_heap\":{},\"largest_block\":{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
         reset_reason_str(),
         board::MAX_SIGN_BYTES,
+        board::MAX_SIGN_BYTES_OBJECT,
         free_heap,
         largest_block,
         crash,

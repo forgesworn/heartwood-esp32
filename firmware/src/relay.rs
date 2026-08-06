@@ -2091,13 +2091,35 @@ fn handle_nip46_event(
     //
     // Only kind-24133 reaches here; MGMT_KIND branched off earlier, so the ~17 KB
     // set_identity_meta path is unaffected by this bound.
-    let request_budget =
-        crate::board::MAX_SIGN_BYTES + heartwood_common::types::SIGN_RESPONSE_OVERHEAD;
+    // Which budget applies depends on the encoding, so decide that first and
+    // without parsing. The string form pays an unescape pass that grows a Vec by
+    // doubling; the object form does not, and can therefore be allowed a much
+    // larger event on the same board.
+    // The larger ceiling needs BOTH halves, because there are two allocations of
+    // about twice the content and each is fatal on its own:
+    //
+    //   - the request's unescape pass, avoided only by the object form;
+    //   - the reply, which echoes the whole signed event back unless the client
+    //     asked for the compact one. An 18432-byte event cleared the parse and
+    //     then died on a 37270-byte response allocation.
+    //
+    // So a client gets the headroom only if it sends an object AND accepts the
+    // compact reply. Either alone leaves one of the two costs in place.
+    let object_form = nip46::params_first_is_object(&plaintext);
+    let compact_reply =
+        nip46::scan_method(&plaintext) == Some(crate::nip46_handler::SIGN_EVENT_COMPACT);
+    let ceiling = if object_form && compact_reply {
+        crate::board::MAX_SIGN_BYTES_OBJECT
+    } else {
+        crate::board::MAX_SIGN_BYTES
+    };
+    let request_budget = ceiling + heartwood_common::types::SIGN_RESPONSE_OVERHEAD;
     if plaintext.len() > request_budget {
         log::warn!(
-            "[relay] request of {} bytes exceeds the {} byte parse budget; refusing",
+            "[relay] request of {} bytes exceeds the {} byte {} parse budget; refusing",
             plaintext.len(),
-            request_budget
+            request_budget,
+            if object_form && compact_reply { "object+compact" } else { "standard" }
         );
         // Scan the id out rather than parsing for it: parsing is the thing that
         // aborts. Without it the refusal reaches the client as silence, and an

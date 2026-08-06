@@ -56,6 +56,12 @@ pub const BOARD: &str = "esp32c6";
 /// out of PSRAM. Until then it has no more usable heap than the V3.
 pub const MAX_SIGN_BYTES: usize = heartwood_common::types::MAX_SIGN_CONTENT_RELAY;
 
+/// The same ceiling for a client that sends `params[0]` as a JSON object, which
+/// skips the unescape pass that binds `MAX_SIGN_BYTES`. See
+/// `MAX_SIGN_CONTENT_RELAY_OBJECT`.
+pub const MAX_SIGN_BYTES_OBJECT: usize =
+    heartwood_common::types::MAX_SIGN_CONTENT_RELAY_OBJECT;
+
 /// Initialised, board-agnostic hardware handles.
 ///
 /// Every driver is built from the owned (`'static`) peripheral singletons, so

@@ -193,6 +193,39 @@ pub const MAX_SIGN_CONTENT_USB: usize = MAX_PAYLOAD_SIZE - SIGN_RESPONSE_OVERHEA
 /// Measurements: docs/BENCH-2026-08-06-message-sizes.md
 pub const MAX_SIGN_CONTENT_RELAY: usize = 12288;
 
+/// Largest event content signable over the relay when the client sends
+/// `params[0]` as a JSON **object** instead of the stringified form NIP-46
+/// specifies.
+///
+/// The 12288 above is not a hardware limit, it is an ENCODING limit. Almost all
+/// of it is spent unescaping an event that was escaped a second time purely to
+/// be carried as a string, and that unescape is what doubles a Vec and aborts
+/// the chip. Send the event as an object and the pass does not happen, so the
+/// same board carries considerably more.
+///
+/// `parse_unsigned_event` and `unsigned_event_kind` have always accepted either
+/// form, so this costs a client one change and no negotiation. What the signer
+/// must not do is apply the string-form budget to it, hence the separate value
+/// and `nip46::params_first_is_object` to choose between them before parsing.
+///
+/// Bounded now by TRANSPORT rather than parsing: the request is NIP-44 padded
+/// and base64'd (4/3) inside a kind:24133 event against the 32768-byte inbound
+/// WebSocket cap, and the response carries the signed event back the same way.
+///
+/// Measured on a V4 over a relay on 2026-08-06, 0 crashes: 12288, 14336, 16384
+/// and 18432 all signed, and 18432 went 5 for 5 in about a second each. 16384 is
+/// the size that reliably ABORTED the chip in the string form, which is the
+/// clearest statement of how much of the old ceiling was encoding.
+///
+/// 20480 is deliberately not the value here even though it is the next padding
+/// step: its request reaches 33288 B, past the 32768 cap, so it is discarded at
+/// the WebSocket layer and can never arrive. Advertising it would be a lie.
+/// Raising this further needs the response to shrink, since at 18432 the reply
+/// is already 27396 B against the same cap.
+///
+/// Measurements: docs/BENCH-2026-08-06-message-sizes.md
+pub const MAX_SIGN_CONTENT_RELAY_OBJECT: usize = 18432;
+
 /// Provisioning mode for a master secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

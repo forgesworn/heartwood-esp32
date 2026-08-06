@@ -95,7 +95,12 @@ impl Nip46Method {
             "connect" => Self::Connect,
             "ping" => Self::Ping,
             "get_public_key" => Self::GetPublicKey,
-            "sign_event" => Self::SignEvent,
+            // Both spellings are the same operation and MUST resolve to the
+            // same variant: permissions, approval tier, the OLED prompt and the
+            // audit entry are all keyed off this, and a compact reply is not a
+            // reason to take any of them differently. The name is consulted once
+            // more, only to choose how the answer is serialised.
+            "sign_event" | "sign_event_compact" => Self::SignEvent,
             "nip44_encrypt" => Self::Nip44Encrypt,
             "nip44_decrypt" => Self::Nip44Decrypt,
             "nip04_encrypt" => Self::Nip04Encrypt,
@@ -501,6 +506,88 @@ pub fn parse_request(json: &[u8]) -> Result<Nip46Request, String> {
     serde_json::from_slice(json).map_err(|e| format!("failed to parse NIP-46 request: {e}"))
 }
 
+/// Read the `method` value out of a request WITHOUT parsing it.
+///
+/// Same reason as `scan_rpc_id`: the budget a request is allowed depends on what
+/// it is asking for, and that has to be known before serde_json touches it.
+///
+/// Matches the key with unescaped quotes, so an occurrence inside a stringified
+/// event (where every quote is backslash-escaped) cannot be mistaken for it.
+/// Returns `None` when absent or unterminated, which selects the tighter budget.
+pub fn scan_method(json: &str) -> Option<&str> {
+    const KEY: &str = "\"method\"";
+    let mut from = 0usize;
+    loop {
+        let at = from + json[from..].find(KEY)?;
+        if at > 0 && json.as_bytes()[at - 1] == b'\\' {
+            from = at + KEY.len();
+            continue;
+        }
+        let rest = &json[at + KEY.len()..];
+        let bytes = rest.as_bytes();
+        // Whitespace, colon, whitespace, opening quote. All ASCII, so byte
+        // indexing lands on character boundaries.
+        let mut i = 0usize;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        let value = &rest[i + 1..];
+        let end = value.find(['"', '\\'])?;
+        return Some(&value[..end]);
+    }
+}
+
+/// Whether `params[0]` is a JSON object, decided WITHOUT parsing.
+///
+/// The two encodings cost wildly different amounts to parse, so the size a
+/// request is allowed to be depends on which one it uses, and that has to be
+/// known before serde_json touches it.
+///
+/// NIP-46 specifies `params[0]` as a *stringified* event, so the event's own
+/// quotes are escaped a second time and unescaping them grows a Vec by
+/// doubling: that doubling is what aborts the chip. An object costs no unescape
+/// pass at all. Heartwood accepts either (see `parse_unsigned_event`), so a
+/// client that sends the object form can be allowed a much larger event.
+///
+/// Scans for the `"params":` key with unescaped quotes. Inside a stringified
+/// event every quote is backslash-escaped, so an occurrence in the payload
+/// cannot be mistaken for the real key; the preceding-backslash check makes
+/// that explicit rather than incidental. Returns false when absent or
+/// malformed, which is the conservative answer: it selects the tighter budget.
+pub fn params_first_is_object(json: &str) -> bool {
+    const KEY: &str = "\"params\"";
+    let mut from = 0usize;
+    while let Some(found) = json[from..].find(KEY) {
+        let at = from + found;
+        // A backslash immediately before means this sits inside a JSON string.
+        if at > 0 && json.as_bytes()[at - 1] == b'\\' {
+            from = at + KEY.len();
+            continue;
+        }
+        // Whitespace is legal around each token, so step over it rather than
+        // assuming the compact spelling a particular client happens to emit.
+        let mut chars = json[at + KEY.len()..].chars().skip_while(|c| c.is_whitespace());
+        if chars.next() != Some(':') {
+            return false;
+        }
+        if chars.find(|c| !c.is_whitespace()) != Some('[') {
+            return false;
+        }
+        return chars.find(|c| !c.is_whitespace()) == Some('{');
+    }
+    false
+}
+
 /// Extract an `UnsignedEvent` from NIP-46 `sign_event` params.
 ///
 /// The convention is that `params[0]` is a JSON string whose contents are the
@@ -622,6 +709,48 @@ pub fn build_sign_response(request_id: &str, signed_event: &SignedEvent) -> Resu
     }
     push_outer_json_fragment(&mut response, "],\"content\":");
     push_nested_json_string(&mut response, &signed_event.content);
+    push_outer_json_fragment(&mut response, ",\"sig\":");
+    push_nested_json_string(&mut response, &signed_event.sig);
+    push_outer_json_fragment(&mut response, "}");
+    response.push_str("\"}");
+    Ok(response)
+}
+
+/// Build a `sign_event` response that returns only what the client cannot
+/// compute for itself: the id, the signature, and the two fields the signer may
+/// have filled in.
+///
+/// `build_sign_response` echoes the WHOLE signed event back, so the reply is
+/// larger than the request and needs one contiguous allocation of roughly twice
+/// the content. On a V4 that is what aborts the chip once the parse cost is
+/// removed: an 18432-byte event failed on a 37270-byte response allocation.
+///
+/// The client already has the event, it wrote it. Returning `{id, sig, pubkey,
+/// created_at}` is a couple of hundred bytes whatever the content size, which
+/// takes the response out of the ceiling calculation entirely.
+///
+/// This does NOT weaken anything. The signature is over the id the signer
+/// computed from the event it actually received and displayed, so a client
+/// cannot pair this sig with different content: the id would not match and the
+/// signature would not verify. `pubkey` and `created_at` are returned because
+/// the signer is entitled to set them, and a client that assumed its own values
+/// would compute a different id.
+pub fn build_sign_response_compact(
+    request_id: &str,
+    signed_event: &SignedEvent,
+) -> Result<String, String> {
+    // Bounded and small: four short fields plus the caller's id.
+    let mut response = String::with_capacity(320 + json_string_content_len(request_id));
+    response.push_str("{\"id\":");
+    push_json_string(&mut response, request_id);
+    response.push_str(",\"result\":\"");
+    push_outer_json_fragment(&mut response, "{\"id\":");
+    push_nested_json_string(&mut response, &signed_event.id);
+    push_outer_json_fragment(&mut response, ",\"pubkey\":");
+    push_nested_json_string(&mut response, &signed_event.pubkey);
+    push_outer_json_fragment(&mut response, ",\"created_at\":");
+    write!(&mut response, "{}", signed_event.created_at)
+        .map_err(|_| "failed to serialise sign response".to_string())?;
     push_outer_json_fragment(&mut response, ",\"sig\":");
     push_nested_json_string(&mut response, &signed_event.sig);
     push_outer_json_fragment(&mut response, "}");
@@ -1001,6 +1130,76 @@ mod tests {
     }
 
     #[test]
+    fn scan_method_reads_the_method_before_parsing() {
+        let event = r#"{"kind":1,"created_at":1,"tags":[],"content":"hi"}"#;
+        let req = format!(
+            r#"{{"id":"a","method":"sign_event_compact","params":[{event}]}}"#
+        );
+        assert_eq!(scan_method(&req), Some("sign_event_compact"));
+        // Whitespace around the tokens, and the key appearing after params.
+        assert_eq!(
+            scan_method(r#"{"params":[{"kind":1}], "method" : "sign_event" }"#),
+            Some("sign_event")
+        );
+        assert_eq!(scan_method("{}"), None);
+        assert_eq!(scan_method(r#"{"method":123}"#), None);
+        assert_eq!(scan_method(r#"{"method":"unterminated"#), None);
+    }
+
+    #[test]
+    fn scan_method_is_not_fooled_by_the_payload() {
+        // A stringified event whose content names a method must not be read as
+        // the envelope's own: granting the larger budget on that basis is
+        // exactly the crash this guards.
+        let sneaky = r#"{"kind":1,"created_at":1,"tags":[],"content":"\"method\":\"sign_event_compact\""}"#;
+        let req = format!(
+            r#"{{"id":"a","method":"sign_event","params":[{}]}}"#,
+            serde_json::to_string(sneaky).unwrap()
+        );
+        assert_eq!(scan_method(&req), Some("sign_event"));
+    }
+
+    #[test]
+    fn params_first_is_object_tells_the_two_encodings_apart() {
+        let event = r#"{"kind":1,"created_at":1700000000,"tags":[],"content":"hi"}"#;
+        // The NIP-46 form: params[0] is the event as an escaped string.
+        let stringified = format!(
+            r#"{{"id":"a","method":"sign_event","params":[{}]}}"#,
+            serde_json::to_string(event).unwrap()
+        );
+        assert!(!params_first_is_object(&stringified));
+        // The extension form: params[0] is the event itself.
+        let object = format!(r#"{{"id":"a","method":"sign_event","params":[{event}]}}"#);
+        assert!(params_first_is_object(&object));
+        // Whitespace between the tokens must not change the answer.
+        assert!(params_first_is_object(
+            r#"{"method":"sign_event", "params" : [ {"kind":1} ]}"#
+        ));
+    }
+
+    #[test]
+    fn params_first_is_object_is_not_fooled_by_the_payload() {
+        // An event whose CONTENT contains the key. In the stringified form every
+        // quote is backslash-escaped, so it must not read as the real params.
+        let sneaky = r#"{"kind":1,"created_at":1,"tags":[],"content":"\"params\":[{"}"#;
+        let stringified = format!(
+            r#"{{"id":"a","method":"sign_event","params":[{}]}}"#,
+            serde_json::to_string(sneaky).unwrap()
+        );
+        assert!(!params_first_is_object(&stringified));
+    }
+
+    #[test]
+    fn params_first_is_object_defaults_to_the_tighter_budget() {
+        // Absent, empty and non-object all pick the conservative answer.
+        assert!(!params_first_is_object("{}"));
+        assert!(!params_first_is_object(""));
+        assert!(!params_first_is_object(r#"{"params":[]}"#));
+        assert!(!params_first_is_object(r#"{"params":"nope"}"#));
+        assert!(!params_first_is_object(r#"{"params":[123]}"#));
+    }
+
+    #[test]
     fn scan_rpc_id_reads_a_request_too_large_to_parse() {
         // The reason this has to work without parsing: an over-budget request
         // is refused precisely because parsing it aborts the chip, and the
@@ -1296,6 +1495,54 @@ mod tests {
         assert_eq!(parsed["id"], "req5");
         assert_eq!(parsed["result"], hex_pubkey);
         assert!(parsed["error"].is_null());
+    }
+
+    #[test]
+    fn compact_sign_response_stays_small_however_large_the_event() {
+        // The whole point: the reply must drop out of the size calculation, so
+        // its length must not track the content it signed.
+        let mut event = sample_event();
+        event.content = "a".repeat(18432);
+        let signed = SignedEvent {
+            id: compute_event_id_hex(&event),
+            pubkey: event.pubkey.clone(),
+            created_at: event.created_at,
+            kind: event.kind,
+            tags: event.tags.clone(),
+            content: event.content.clone(),
+            sig: "a".repeat(128),
+        };
+
+        let full = build_sign_response("req42", &signed).unwrap();
+        let compact = build_sign_response_compact("req42", &signed).unwrap();
+        assert!(full.len() > 18432, "full response carries the content back");
+        assert!(
+            compact.len() < 512,
+            "compact response was {} bytes",
+            compact.len()
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        assert_eq!(parsed["id"], "req42");
+        let inner: serde_json::Value =
+            serde_json::from_str(parsed["result"].as_str().unwrap()).unwrap();
+        // Exactly the fields a client cannot derive for itself, and no content.
+        assert_eq!(inner["id"], signed.id.as_str());
+        assert_eq!(inner["sig"], signed.sig.as_str());
+        assert_eq!(inner["pubkey"], signed.pubkey.as_str());
+        assert_eq!(inner["created_at"], signed.created_at);
+        assert!(inner.get("content").is_none());
+    }
+
+    #[test]
+    fn compact_sign_response_id_still_binds_the_content() {
+        // The security argument for returning no content: the id is over the
+        // event the signer saw, so a client cannot pair this sig with different
+        // content without the id ceasing to match.
+        let event = sample_event();
+        let mut tampered = event.clone();
+        tampered.content = "something else entirely".to_string();
+        assert_ne!(compute_event_id_hex(&event), compute_event_id_hex(&tampered));
     }
 
     #[test]

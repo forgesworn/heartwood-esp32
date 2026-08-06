@@ -265,6 +265,65 @@ the stream against a body still arriving. That path is reachable by an attacker,
 since any frame over 65535 bytes uses it. A declared length that large now drops
 the connection as a broken peer; merely-over-cap lengths take the skip path.
 
+### The ceiling was the encoding: 12288 to 18432 on the same board
+
+Two allocations of roughly twice the content stood between this board and a
+larger event, and **neither is the hardware**. Both come from NIP-46 choosing to
+move the event around as a string:
+
+1. **The request.** `params[0]` is a *stringified* event, so its quotes are
+   escaped a second time and unescaping grows a Vec by doubling. This is the
+   abort in the section below.
+2. **The reply.** `sign_event` echoes the whole signed event back, so the
+   response is larger than the request and needs one contiguous allocation of
+   about twice the content.
+
+Removing them:
+
+- **`params[0]` as a JSON object.** Costs nothing to support and required no new
+  code: `parse_unsigned_event` and `unsigned_event_kind` already accepted either
+  form. The client simply never sent it.
+- **`sign_event_compact`**, returning `{id, sig, pubkey, created_at}` instead of
+  the event. The client wrote the event, it does not need it read back. The reply
+  is 604 bytes whatever the content.
+
+Measured on a V4 over a relay, 0 crashes, on a **warmed** device (largest block
+116 KB, not the 176 KB of a fresh boot, which is what made the earlier 16384
+figure look safe):
+
+| Request | Reply | Content | Wire req | Wire reply | Result |
+|---------|-------|---------|----------|------------|--------|
+| string | full | 16384 | 27824 | -- | refused (would abort) |
+| object | full | 18432 | 27824 | -- | refused (would abort) |
+| string | compact | 16384 | 27824 | -- | refused (would abort) |
+| **object** | **compact** | **18432** | **27824** | **604** | **signed 12/12** |
+
+16384 is the size that reliably aborted the chip in the string form. In the new
+form 18432 signs repeatedly, and faster: ~700 ms against ~1000 ms, since there
+is far less to encrypt on the way back.
+
+**The headroom needs both halves**, which is why the guard requires both. Each
+allocation is fatal on its own: an object request that still wants the full event
+echoed back cleared the parse and then died on a 37270-byte response allocation.
+So object-with-full-reply and string-with-compact-reply both keep the standard
+12288 ceiling, and the table above shows them being refused at sizes the full
+package carries.
+
+The signature is unaffected by any of this. It is over the id the signer computed
+from the event it actually received and displayed, so a client cannot pair the
+returned sig with different content: the id would not match. The sweep proves the
+round trip rather than assuming it, rebuilding the event client-side and calling
+`verifyEvent` on the result.
+
+18432 is now bounded by **transport, not memory**: content 20480 puts the request
+at 33288 B, past the 32768-byte inbound WebSocket cap, so it cannot arrive at all.
+Going beyond that needs the request chunked, not the parser improved.
+
+`sign_event_compact` maps onto `Nip46Method::SignEvent` in `from_str`, so
+permissions, approval tier, OLED prompt and audit entry are the same code and
+cannot drift into a laxer parallel path. The name is consulted once more, only to
+choose how the answer is serialised.
+
 ### Answered: it was the signer aborting, and PARSING is the real limit
 
 The section below left two candidates and said the cable was needed to separate
@@ -557,15 +616,17 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
 
 ## What is still unmeasured
 
-- **Whether the ceiling can be raised by changing the encoding**, rather than
-  measured where it happens to fall. The limit is the doubling in
-  `parse_escape`, which exists only because NIP-46 double-encodes the event as
-  a JSON string inside params. Accepting `params[0]` as a JSON *object* removes
-  the unescape pass entirely, and returning `{id, sig}` instead of the whole
-  signed event removes the 27 KB response. Both are backwards compatible if the
-  signer accepts either form. Projected from the allocation sizes, not measured:
-  that should move the ceiling from 12288 toward the wire cap, after which the
-  NIP-44 decrypt buffer binds instead.
+- **Chunking the request**, which is the only route past 18432 now. That figure
+  is a transport limit: content 20480 puts the request at 33288 B against the
+  32768-byte WebSocket cap, so it never arrives. The event id is a SHA-256 over
+  the serialised event and signing needs only those 32 bytes, so a signer could
+  hash chunks as they arrive and never hold the whole event. Kind and tags must
+  come first, so policy still applies and the display can show something real
+  before content streams past.
+- **The same treatment for the USB path.** `MAX_SIGN_CONTENT_USB` is structural
+  (`MAX_PAYLOAD_SIZE` minus overhead) and the USB path measured clean to ~32 KB,
+  but it runs the same parse and the same full-event reply, so it carries both
+  copies too. Untested against the object/compact forms.
 - **The exact point the old firmware panicked**, known only to lie in
   28672..32000 bytes of content. Now academic: the ceiling is enforced at
   16384 and the crash is unreachable. Worth pinning down only if

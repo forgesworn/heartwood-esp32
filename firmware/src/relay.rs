@@ -1610,18 +1610,29 @@ fn handle_relay_msg(
     ctx: &mut SignCtx,
     pool: &mut RelayPool,
 ) -> Result<(), String> {
-    let mut v: serde_json::Value = match serde_json::from_slice(raw) {
-        Ok(v) => v,
-        Err(_) => {
-            log::warn!("[relay] non-JSON frame ({} bytes)", raw.len());
+    // Route on the tag WITHOUT building a Value tree.
+    //
+    // Every inbound message used to be parsed into a serde_json::Value first,
+    // just to read its first element. For an EVENT that tree is a complete
+    // second copy of the message — including the event's whole content string —
+    // held at the same time as the raw bytes, and `from_value` then copied the
+    // content a THIRD time into the SignedEvent. At the top of the signing
+    // range the message is ~28 KB, so the peak was ~84 KB of transient
+    // allocation for a 28 KB message.
+    //
+    // That was fatal in the field: the same 27824-byte message was handled
+    // successfully on one occasion and panicked the device on another, leaving
+    // "relay inbound event". The size guard in nip46_handler cannot help — it
+    // runs after decryption, long past this point. Deserialising the event
+    // directly removes one full copy and the tree.
+    let tag = match heartwood_common::nip46::relay_message_tag(raw) {
+        Some(t) => t,
+        None => {
+            log::warn!("[relay] non-JSON or untagged frame ({} bytes)", raw.len());
             return Ok(());
         }
     };
-    if !v.is_array() {
-        return Ok(());
-    }
-    let tag = v.get(0).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    match tag.as_str() {
+    match tag {
         "EVENT" => {
             set_network_runtime(
                 ctx,
@@ -1630,29 +1641,20 @@ fn handle_relay_msg(
                 true,
                 NetworkRuntimeError::None,
             );
-            if let Some(ev_val) = v.get_mut(2) {
-                // `take` instead of `clone`: a set_identity_meta event is ~17KB
-                // of JSON, and cloning its parsed Value briefly doubled that on
-                // a heap already carrying the TLS session — enough to OOM-abort
-                // a classic ESP32 (observed as rst:0xc on the T-Display).
-                let ev_val = ev_val.take();
-                drop(v); // free the (now-gutted) envelope before the deep parse
-                // Coarse breadcrumb over the WHOLE inbound-event window: the
-                // deep parse, signature verification, and kind routing all run
-                // before any per-handler breadcrumb, so a crash there (not a
-                // NIP-46 request) previously left nothing. Handlers refine this
-                // with specifics; cleared once the event is fully processed.
-                let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
-                crate::crash_crumb::set(&format!("relay inbound event (heap {}k)", free / 1024));
-                match serde_json::from_value::<SignedEvent>(ev_val) {
-                    // No clear here: the breadcrumb is a rolling "last activity"
-                    // marker. The pump's next read overwrites it with "relay
-                    // reading" once the loop goes idle, so a stale request is
-                    // never misattributed, and the reset-reason gate ignores it
-                    // entirely on a clean (non-crash) restart.
-                    Ok(ev) => process_event(s, ev, ctx, pool)?,
-                    Err(e) => log::warn!("[relay] bad EVENT json: {e}"),
-                }
+            // Coarse breadcrumb over the WHOLE inbound-event window: the parse,
+            // signature verification, and kind routing all run before any
+            // per-handler breadcrumb, so a crash there (not a NIP-46 request)
+            // previously left nothing. Handlers refine this with specifics.
+            let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            crate::crash_crumb::set(&format!("relay inbound event (heap {}k)", free / 1024));
+            match serde_json::from_slice::<heartwood_common::nip46::RelayEventMessage>(raw) {
+                // No clear here: the breadcrumb is a rolling "last activity"
+                // marker. The pump's next read overwrites it with "relay
+                // reading" once the loop goes idle, so a stale request is
+                // never misattributed, and the reset-reason gate ignores it
+                // entirely on a clean (non-crash) restart.
+                Ok(msg) => process_event(s, msg.2, ctx, pool)?,
+                Err(e) => log::warn!("[relay] bad EVENT json: {e}"),
             }
         }
         "EOSE" => {

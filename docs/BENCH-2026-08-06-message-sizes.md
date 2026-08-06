@@ -114,6 +114,43 @@ is the reliable defence. Recovery is slow too: after the crash the relay
 session took minutes to become usable again, so each oversize request costs far
 more than the one request.
 
+### The real fix: stop building a Value tree for every inbound event
+
+**Correction to the section below.** It reported that the signer "stayed alive"
+through the oversize sizes on the strength of it answering requests immediately
+afterwards. That was wrong. Reading `last_reset` once the USB port was free
+showed `panic`, `crashed_during: "relay inbound event (heap 131k)"`. It had
+rebooted and come back, which from the relay looks identical to never having
+died. Liveness after the fact does not prove survival; only `last_reset` does.
+
+So the smaller ceiling did **not** fix the crash, and could not have: the guard
+in `handle_parsed_request` runs after decryption, while the failure is upstream
+in `handle_relay_msg`.
+
+The cause was the parse strategy. Every inbound message was deserialised into a
+`serde_json::Value` first, purely to read its first element and route on it.
+For an EVENT that tree is a complete second copy of the message, including the
+event's whole content string, alive at the same time as the raw bytes — and
+`from_value::<SignedEvent>` then copied the content a third time. A NIP-46
+request at the signing ceiling is ~28 KB on the wire, so the peak was roughly
+84 KB of transient allocation to handle a 28 KB message, on a heap already
+carrying a TLS session.
+
+`nip46::relay_message_tag` now reads the leading tag straight out of the raw
+bytes without parsing, and `nip46::RelayEventMessage` deserialises
+`["EVENT", sub, event]` directly into its typed form. That removes the tree and
+one full copy of the content. Non-EVENT branches were already working off
+`raw` via `snippet`, so they were unaffected.
+
+**Verified on hardware.** Across repeated 16384-byte signings and repeated
+20480 and 32768 oversize requests, the signer reached 8m27s of uptime with
+`last_reset: usb-peripheral-reset` — the deliberate reset from flashing, and no
+panic since. The pre-fix firmware panicked on this traffic every time.
+
+One earlier conclusion also falls: 16384 now signs on the **tighter** relay,
+which previously failed there. That failure was attributed to the relay
+refusing to carry the larger response. It was the signer crashing.
+
 ### Post-fix re-run: 16384 confirmed
 
 Repeated against the fixed firmware (`MAX_SIGN_CONTENT_RELAY` = 16384, guard in
@@ -356,18 +393,14 @@ bytes" when `MAX_PAYLOAD_SIZE` has been 32768 for some time.
   28672..32000 bytes of content. Now academic: the ceiling is enforced at
   20480 and the crash is unreachable. Worth pinning down only if
   `MAX_SIGN_BYTES` is ever raised, since it marks where the real headroom ends.
-- **Bounding the inbound relay message before it is parsed.** The guard added
-  here sits in `handle_parsed_request`, which is after decryption — too late
-  for the relay path, where the transient peak is in `handle_relay_msg`
-  (raw bytes + parsed `Value` + `SignedEvent`). The current ceiling keeps
-  requests below the size that proved marginal, but a size check on
-  `raw.len()` before `serde_json::from_slice` is the durable fix. It must
-  leave room for legitimate large traffic: a `set_identity_meta` management
+- **A longer soak.** The no-panic result covers ~8 minutes of deliberate
+  large-request traffic. It is strong evidence, not a soak test, and the
+  failure it replaces was intermittent.
+- **The remaining copy.** Deserialising directly removed the `Value` tree, but
+  the raw bytes and the `SignedEvent` still coexist. Bounding `raw.len()`
+  before `from_slice` would add a cheap belt-and-braces gate; it must leave
+  room for legitimate large traffic, since a `set_identity_meta` management
   event is ~17 KB.
-- **Confirming no panic post-fix over USB.** The signer answered NIP-46
-  requests immediately after the oversize sizes, which a rebooting device does
-  not, but `last_reset` was not readable at the time because a browser tab held
-  the USB port.
 - **The fragmented-heap condition.** Both sweeps above ran on a device with
   under 15 minutes of uptime and no relay sessions. The plan calls for a second
   run after a client has bulk-decrypted a message history, which is the state

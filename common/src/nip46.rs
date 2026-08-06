@@ -745,6 +745,72 @@ pub fn build_error_response(request_id: &str, code: i32, message: &str) -> Resul
         .map_err(|e| format!("failed to serialise error response: {e}"))
 }
 
+/// The `["EVENT", <subscription>, <event>]` message a relay pushes to a
+/// subscriber, deserialised straight into its typed form.
+///
+/// The point is what it avoids. Parsing the raw message into a
+/// `serde_json::Value` first and then converting the third element builds a
+/// complete `Value` tree for the whole message — including a `String` for the
+/// event's content — and then `from_value` copies that content a second time
+/// into the `SignedEvent`. For a NIP-46 request carrying a large signing
+/// payload the message is ~28 KB, so the intermediate tree is ~28 KB of pure
+/// waste held at the same moment as both the raw bytes and the final event.
+///
+/// On a no-PSRAM signer that transient peak is the difference between handling
+/// a large request and aborting the allocator: the same 27824-byte message was
+/// handled successfully on one occasion and fatally on another
+/// (docs/BENCH-2026-08-06-message-sizes.md). Deserialising directly removes one
+/// of the three copies.
+#[derive(Debug, Deserialize)]
+pub struct RelayEventMessage(
+    /// Always "EVENT" — kept so the tuple matches the wire shape.
+    pub String,
+    /// Subscription id the event arrived on.
+    pub String,
+    /// The event itself.
+    pub SignedEvent,
+);
+
+/// Read the leading tag of a relay message (`"EVENT"`, `"EOSE"`, `"OK"`, …)
+/// without parsing the message.
+///
+/// Lets the caller route on the tag and pick a typed parse for the big case,
+/// instead of building a `Value` tree for every message just to look at its
+/// first element. Scans only the first few bytes.
+///
+/// Returns `None` if the input is not a JSON array whose first element is a
+/// string, which is every relay message worth handling.
+pub fn relay_message_tag(raw: &[u8]) -> Option<&str> {
+    let mut i = 0;
+    while i < raw.len() && (raw[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    if raw.get(i)? != &b'[' {
+        return None;
+    }
+    i += 1;
+    while i < raw.len() && (raw[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    if raw.get(i)? != &b'"' {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    // Relay tags are plain uppercase ASCII with no escapes; stop at the closing
+    // quote and refuse anything carrying a backslash rather than unescaping.
+    while i < raw.len() && raw[i] != b'"' {
+        if raw[i] == b'\\' {
+            return None;
+        }
+        i += 1;
+    }
+    if i >= raw.len() {
+        return None;
+    }
+    core::str::from_utf8(&raw[start..i]).ok()
+}
+
 /// Pull `id` out of a `{"id":"...",...}` NIP-46 response without parsing it.
 ///
 /// Used when a response turns out to be too large to transport and has to be
@@ -817,6 +883,83 @@ pub fn build_result_response(request_id: &str, result: &str) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_message_tag_reads_the_leading_tag() {
+        assert_eq!(relay_message_tag(br#"["EVENT","sub",{}]"#), Some("EVENT"));
+        assert_eq!(relay_message_tag(br#"["EOSE","sub"]"#), Some("EOSE"));
+        assert_eq!(relay_message_tag(br#"["OK","id",true,""]"#), Some("OK"));
+        // Relays are free to pad with whitespace.
+        assert_eq!(relay_message_tag(b"  [ \"NOTICE\" , \"hi\"]"), Some("NOTICE"));
+    }
+
+    #[test]
+    fn relay_message_tag_rejects_what_is_not_a_tagged_array() {
+        assert_eq!(relay_message_tag(b""), None);
+        assert_eq!(relay_message_tag(b"{}"), None);
+        assert_eq!(relay_message_tag(br#"[1,2]"#), None);
+        assert_eq!(relay_message_tag(br#"["unterminated"#), None);
+        // An escape in the tag is refused rather than unescaped: no legitimate
+        // relay tag contains one, and returning a half-unescaped tag that then
+        // routed as "EVENT" would be worse than not routing it at all. The
+        // bytes below are a literal backslash inside the tag.
+        assert_eq!(relay_message_tag(br#"["EV\ENT","s",{}]"#), None);
+    }
+
+    #[test]
+    fn relay_event_message_deserialises_without_an_intermediate_value() {
+        let signed = SignedEvent {
+            id: "aa".repeat(32),
+            pubkey: "bb".repeat(32),
+            created_at: 1_700_000_000,
+            kind: 24133,
+            tags: vec![vec!["p".to_string(), "cc".repeat(32)]],
+            content: "ciphertext-goes-here".to_string(),
+            sig: "dd".repeat(64),
+        };
+        let wire = format!(
+            r#"["EVENT","sub-1",{}]"#,
+            serde_json::to_string(&signed).unwrap()
+        );
+
+        let parsed: RelayEventMessage = serde_json::from_slice(wire.as_bytes()).unwrap();
+        assert_eq!(parsed.0, "EVENT");
+        assert_eq!(parsed.1, "sub-1");
+        assert_eq!(parsed.2.id, signed.id);
+        assert_eq!(parsed.2.kind, 24133);
+        assert_eq!(parsed.2.content, "ciphertext-goes-here");
+        assert_eq!(parsed.2.sig, signed.sig);
+        assert_eq!(parsed.2.tags, signed.tags);
+    }
+
+    #[test]
+    fn relay_event_message_carries_a_large_content_intact() {
+        // The whole point of the type is the big case. A NIP-46 request at the
+        // signing ceiling arrives as roughly this much base64 ciphertext.
+        let content = "a".repeat(27_000);
+        let signed = SignedEvent {
+            id: "11".repeat(32),
+            pubkey: "22".repeat(32),
+            created_at: 1,
+            kind: 24133,
+            tags: vec![],
+            content: content.clone(),
+            sig: "33".repeat(64),
+        };
+        let wire = format!(r#"["EVENT","s",{}]"#, serde_json::to_string(&signed).unwrap());
+        let parsed: RelayEventMessage = serde_json::from_slice(wire.as_bytes()).unwrap();
+        assert_eq!(parsed.2.content.len(), 27_000);
+        assert_eq!(parsed.2.content, content);
+    }
+
+    #[test]
+    fn relay_event_message_rejects_a_malformed_event() {
+        // Must fail cleanly rather than panic: this runs on every inbound
+        // message from an untrusted relay.
+        assert!(serde_json::from_slice::<RelayEventMessage>(br#"["EVENT","s",{"id":1}]"#).is_err());
+        assert!(serde_json::from_slice::<RelayEventMessage>(br#"["EVENT","s"]"#).is_err());
+        assert!(serde_json::from_slice::<RelayEventMessage>(br#"["EOSE","s"]"#).is_err());
+    }
 
     #[test]
     fn response_request_id_reads_the_id_without_parsing() {

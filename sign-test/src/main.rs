@@ -53,11 +53,15 @@ fn main() {
     let request_id = "sign-test-1";
     let request_json = build_request(&cli, request_id);
 
-    println!("Request JSON:");
-    // Pretty-print the request before sending.
-    match serde_json::from_str::<serde_json::Value>(&request_json) {
-        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
-        Err(_) => println!("{request_json}"),
+    println!("Request JSON ({} bytes):", request_json.len());
+    // Printing tens of kilobytes of terminal art hides the useful diagnostics.
+    if request_json.len() <= 2_048 {
+        match serde_json::from_str::<serde_json::Value>(&request_json) {
+            Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+            Err(_) => println!("{request_json}"),
+        }
+    } else {
+        println!("[large request body omitted]");
     }
     println!();
 
@@ -88,14 +92,7 @@ fn main() {
 
     // Send the framed request.
     println!("Sending {} request...", cli.method);
-    port.write_all(&frame_bytes).unwrap_or_else(|e| {
-        eprintln!("Failed to write to serial port: {e}");
-        std::process::exit(1);
-    });
-    port.flush().unwrap_or_else(|e| {
-        eprintln!("Failed to flush serial port: {e}");
-        std::process::exit(1);
-    });
+    write_frame_paced(&mut port, &frame_bytes);
 
     // Read response — hunt for a valid NIP-46 response frame in the stream.
     // The serial channel is shared with ESP-IDF log output, so we may receive
@@ -103,10 +100,14 @@ fn main() {
     println!("Waiting for response (60 s timeout)...\n");
     let response_json = read_response_frame(&mut *port, FRAME_TYPE_NIP46_RESPONSE);
 
-    println!("Response JSON:");
+    println!("Response JSON ({} bytes):", response_json.len());
     match serde_json::from_str::<serde_json::Value>(&response_json) {
         Ok(v) => {
-            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            if response_json.len() <= 2_048 {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            } else {
+                print_large_response_summary(&v);
+            }
 
             // If this is a get_public_key response, show the npub too.
             if cli.method == "get_public_key" {
@@ -122,6 +123,80 @@ fn main() {
         }
         Err(_) => println!("{response_json}"),
     }
+}
+
+fn print_large_response_summary(response: &serde_json::Value) {
+    println!("id: {}", response["id"].as_str().unwrap_or("<missing>"));
+
+    if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
+        println!("error: {error}");
+        return;
+    }
+
+    let Some(result) = response.get("result").and_then(|value| value.as_str()) else {
+        println!("result: <missing>");
+        return;
+    };
+
+    println!("result: {} bytes", result.len());
+    match serde_json::from_str::<serde_json::Value>(result) {
+        Ok(event) => {
+            println!("event id: {}", event["id"].as_str().unwrap_or("<missing>"));
+            println!("kind: {}", event["kind"].as_u64().unwrap_or_default());
+            println!(
+                "content: {} bytes",
+                event["content"].as_str().map(str::len).unwrap_or_default()
+            );
+            println!(
+                "signature: {}",
+                if event["sig"].as_str().is_some_and(|sig| sig.len() == 128) {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
+        }
+        Err(error) => println!("signed event parse failed: {error}"),
+    }
+}
+
+/// Pace large native-USB frames so the ESP32-S3 ring buffer can drain while
+/// the WiFi relay loop transitions from polling into its blocking frame read.
+fn write_frame_paced(port: &mut Box<dyn serialport::SerialPort>, bytes: &[u8]) {
+    const PACE_THRESHOLD: usize = 512;
+    const PACE_CHUNK: usize = 64;
+    const PACE_HEAD_BYTES: usize = 3_072;
+    const PACE_HEAD_GAP: Duration = Duration::from_millis(24);
+    const PACE_GAP: Duration = Duration::from_millis(6);
+
+    if bytes.len() <= PACE_THRESHOLD {
+        port.write_all(bytes).unwrap_or_else(|e| {
+            eprintln!("Failed to write to serial port: {e}");
+            std::process::exit(1);
+        });
+    } else {
+        for (index, chunk) in bytes.chunks(PACE_CHUNK).enumerate() {
+            port.write_all(chunk).unwrap_or_else(|e| {
+                eprintln!("Failed to write to serial port: {e}");
+                std::process::exit(1);
+            });
+            port.flush().unwrap_or_else(|e| {
+                eprintln!("Failed to flush serial port: {e}");
+                std::process::exit(1);
+            });
+            if (index + 1) * PACE_CHUNK < bytes.len() {
+                std::thread::sleep(if index * PACE_CHUNK < PACE_HEAD_BYTES {
+                    PACE_HEAD_GAP
+                } else {
+                    PACE_GAP
+                });
+            }
+        }
+    }
+    port.flush().unwrap_or_else(|e| {
+        eprintln!("Failed to flush serial port: {e}");
+        std::process::exit(1);
+    });
 }
 
 /// Build the NIP-46 JSON-RPC request body for the given CLI arguments.

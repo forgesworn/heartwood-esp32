@@ -1451,6 +1451,7 @@ mod tests {
             method: "nip44_encrypt".into(),
             params: vec![peer_pubkey.clone().into(), "hello bark".into()],
             heartwood: None,
+            legacy_client_pubkey: None,
         };
         let encrypt_json = SoftBackend::dispatch_method(&master, &encrypt_req, "client").unwrap();
         let ciphertext = serde_json::from_str::<Value>(&encrypt_json).unwrap()["result"]
@@ -1464,6 +1465,7 @@ mod tests {
             method: "nip44_decrypt".into(),
             params: vec![peer_pubkey.clone().into(), ciphertext.clone().into()],
             heartwood: None,
+            legacy_client_pubkey: None,
         };
         let decrypt_json = SoftBackend::dispatch_method(&master, &decrypt_req, "client").unwrap();
         let plaintext = serde_json::from_str::<Value>(&decrypt_json).unwrap()["result"]
@@ -1478,6 +1480,7 @@ mod tests {
             method: "nip44_encrypt".into(),
             params: vec!["hello bark".into(), peer_pubkey.into()],
             heartwood: None,
+            legacy_client_pubkey: None,
         };
         assert!(SoftBackend::dispatch_method(&master, &reversed, "client").is_err());
     }
@@ -1525,6 +1528,7 @@ mod tests {
                 "{\"kind\":1,\"created_at\":1784000000,\"tags\":[],\"content\":\"hi\"}"
             )],
             heartwood: None,
+            legacy_client_pubkey: None,
         };
         let response = SoftBackend::dispatch_method(&master, &req, "client").unwrap();
         let signed_json = serde_json::from_str::<Value>(&response).unwrap()["result"]

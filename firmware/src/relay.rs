@@ -52,7 +52,6 @@ use secp256k1::{Keypair, Secp256k1, SignOnly};
 use heartwood_common::deadline::{
     deadline_io_action, retryable_tls_io_code, DeadlineIoAction, NonblockingIoEvent,
 };
-use heartwood_common::frame::Frame;
 use heartwood_common::hex::{hex_decode, hex_encode};
 use heartwood_common::mgmt;
 use heartwood_common::net_config::{
@@ -193,28 +192,28 @@ const RELAY_HEALTH_MIN_BLOCK: usize = 16_384;
 const RELAY_HEAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Whether the free heap can safely transport a response of `len` bytes.
 ///
-/// Re-encrypting the response pads it (NIP-44, up to ~2x), base64-encodes it
-/// (~1.4x), and builds + signs the envelope — several transient buffers whose
-/// combined peak is a few times the response size. Require the largest single
-/// free block to hold ~3x the response plus a working margin, so a big
-/// response (a large nip44_decrypt plaintext) degrades to a clean error rather
-/// than aborting the allocator and rebooting the signer. Small responses (the
-/// overwhelming majority: signatures, pubkeys, short DMs) always pass.
+/// The owned encryption and direct WebSocket writers now reuse the plaintext
+/// allocation and keep at most one output-sized allocation beside it. Require
+/// one contiguous block large enough for the exact NIP-44 output plus envelope
+/// overhead, and enough total free heap for that allocation plus runtime
+/// working room. A genuinely starved or fragmented heap still degrades to a
+/// clean error instead of aborting the allocator.
 pub(crate) fn response_transportable(len: usize) -> bool {
-    // Two ways the publish aborts the allocator, both covered here:
-    //  - a LARGE response (e.g. a big nip44_decrypt plaintext) whose padded +
-    //    base64 + envelope buffers need several times its size, and
-    //  - a SMALL response arriving when the heap is already fragmented low
-    //    (e.g. mid-TLS), where even a modest buffer cannot be placed.
-    // Require the largest single free block to hold ~3x the response, but never
-    // operate below a 16 KB working floor. Legitimate small responses on a
-    // healthy heap (>100 KB free) always pass; only genuine memory pressure
-    // degrades to a clean error instead of a reboot.
-    let need = len.saturating_mul(3).saturating_add(8_192).max(16_384);
+    const ENVELOPE_OVERHEAD: usize = 1_024;
+    const WORKING_MARGIN: usize = 16_384;
+
+    let Some(encoded_len) = nip44::encoded_len(len) else {
+        return false;
+    };
+    let largest_need = encoded_len
+        .saturating_add(ENVELOPE_OVERHEAD)
+        .max(16_384);
+    let total_need = encoded_len.saturating_add(WORKING_MARGIN);
+    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() } as usize;
     let largest = unsafe {
         esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
     };
-    largest >= need
+    free >= total_need && largest >= largest_need
 }
 
 /// NVS key the pinned-relay list is persisted under (JSON array).
@@ -1365,7 +1364,7 @@ fn poll_usb(
                 let master_mode = ctx.masters[0].mode;
                 let master_slot = ctx.masters[0].slot;
                 let response_json = crate::nip46_handler::handle_request(
-                    &frame,
+                    frame,
                     &master_secret,
                     &master_label,
                     master_mode,
@@ -1377,10 +1376,10 @@ fn poll_usb(
                     ctx.identity_caches,
                     None,
                 );
-                crate::protocol::write_frame(
+                crate::protocol::write_owned_frame(
                     usb,
                     FRAME_TYPE_NIP46_RESPONSE,
-                    response_json.as_bytes(),
+                    response_json,
                 );
                 ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
             }
@@ -1651,7 +1650,7 @@ fn handle_relay_msg(
                     // reading" once the loop goes idle, so a stale request is
                     // never misattributed, and the reset-reason gate ignores it
                     // entirely on a clean (non-crash) restart.
-                    Ok(ev) => process_event(s, &ev, ctx, pool)?,
+                    Ok(ev) => process_event(s, ev, ctx, pool)?,
                     Err(e) => log::warn!("[relay] bad EVENT json: {e}"),
                 }
             }
@@ -1755,11 +1754,11 @@ fn profile_name(content: &str) -> Option<String> {
 /// only transport errors propagate to trigger a reconnect.
 fn process_event(
     s: &mut RelaySession,
-    ev: &SignedEvent,
+    ev: SignedEvent,
     ctx: &mut SignCtx,
     pool: &mut RelayPool,
 ) -> Result<(), String> {
-    if let Err(e) = nip46::verify_signed_event(ev) {
+    if let Err(e) = nip46::verify_signed_event(&ev) {
         log::warn!("[relay] invalid Nostr EVENT ({e}); ignoring");
         return Ok(());
     }
@@ -1767,7 +1766,7 @@ fn process_event(
     // Our own kind-0 profile: cache the name and refresh the idle identity
     // screen. This is not a user request, so it must never wake a blanked panel.
     if ev.kind == 0 {
-        handle_profile_event(ev, ctx);
+        handle_profile_event(&ev, ctx);
         return Ok(());
     }
     if ev.kind != NIP46_KIND && ev.kind != MGMT_KIND {
@@ -1801,7 +1800,7 @@ fn process_event(
 
     if ev.kind == MGMT_KIND {
         match masters::find_by_pubkey(ctx.masters, &target_pk) {
-            Some(master_idx) => handle_mgmt_event(s, ev, ctx, master_idx, pool),
+            Some(master_idx) => handle_mgmt_event(s, &ev, ctx, master_idx, pool),
             None => {
                 log::warn!("[relay] mgmt EVENT not addressed to a known master; ignoring");
                 Ok(())
@@ -1833,13 +1832,31 @@ fn client_label(ctx: &SignCtx, master_slot: u8, client_hex: &str) -> String {
         .unwrap_or_else(|| format!("client {}", &client_hex[..client_hex.len().min(8)]))
 }
 
-fn sign_audit_draft(plaintext: &str, label: String, client_hex: &str) -> Option<SignAuditDraft> {
-    let req = nip46::parse_request(plaintext.as_bytes()).ok()?;
+fn sign_audit_draft(
+    req: &nip46::Nip46Request,
+    label: String,
+    client_hex: &str,
+) -> Option<SignAuditDraft> {
     let method = req.method.clone();
     match method.as_str() {
         "sign_event" => {
-            let event = nip46::parse_unsigned_event(&req.params).ok()?;
-            let (kind, preview) = nip46::event_display_summary(&event, 80);
+            let kind = nip46::unsigned_event_kind(&req.params)?;
+            let encoded_bytes = req
+                .params
+                .first()
+                .and_then(|value| value.as_str())
+                .map(str::len)
+                .unwrap_or(0);
+            // Preserve descriptive previews for normal notes, but never parse
+            // and allocate a second copy of a large document just for audit UI.
+            let preview = if encoded_bytes <= 2_048 {
+                nip46::parse_unsigned_event(&req.params)
+                    .ok()
+                    .map(|event| nip46::event_display_summary(&event, 80).1)
+                    .unwrap_or_else(|| format!("event content ({encoded_bytes} bytes)"))
+            } else {
+                format!("large event ({encoded_bytes} bytes)")
+            };
             Some(SignAuditDraft {
                 method,
                 label,
@@ -1953,7 +1970,7 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize) -> String {
 /// `transport::handle_encrypted_request`, including per-persona routing.
 fn handle_nip46_event(
     tls: &mut Tls,
-    ev: &SignedEvent,
+    mut ev: SignedEvent,
     ctx: &mut SignCtx,
     target_pk: &[u8; 32],
 ) -> Result<(), String> {
@@ -2037,6 +2054,9 @@ fn handle_nip46_event(
             return Ok(());
         }
     };
+    // Signature verification and decryption are complete; release the large
+    // base64 request envelope before parsing the inner request or signing it.
+    drop(std::mem::take(&mut ev.content));
     log::info!(
         "[relay] decrypted request ({} bytes) from {}… for {}{}",
         plaintext.len(),
@@ -2044,46 +2064,66 @@ fn handle_nip46_event(
         label,
         if is_persona { " (persona)" } else { "" }
     );
-    let audit = sign_audit_draft(&plaintext, client_label(ctx, slot, &ev.pubkey), &ev.pubkey);
-
-    let inner = Frame {
-        frame_type: FRAME_TYPE_NIP46_REQUEST,
-        payload: plaintext.into_bytes(),
+    let request = match nip46::parse_request(plaintext.as_bytes()) {
+        Ok(request) => request,
+        Err(e) => {
+            log::warn!("[relay] failed to parse NIP-46 request: {e}");
+            drop(plaintext);
+            let response = nip46::build_error_response(
+                "unknown",
+                -3,
+                "invalid JSON-RPC request",
+            )
+            .unwrap_or_default();
+            return sign_and_publish(
+                tls,
+                ctx.secp,
+                &signing_secret,
+                &conversation_key,
+                &ev.pubkey,
+                NIP46_KIND,
+                ev.created_at,
+                response,
+            );
+        }
     };
+    drop(plaintext);
+    let audit = sign_audit_draft(
+        &request,
+        client_label(ctx, slot, &ev.pubkey),
+        &ev.pubkey,
+    );
 
     // Only connect binding and first-sign TOFU can change durable slot
     // authority. Snapshot those uncommon requests before dispatch so an NVS
     // failure can roll RAM back without cloning the slot table on every
     // unattended auto-sign.
-    let parsed_request = nip46::parse_request(&inner.payload).ok();
-    let request_id = parsed_request
-        .as_ref()
-        .map(|request| request.id.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-    let slot_snapshot = parsed_request.as_ref().and_then(|request| {
+    let request_id = request.id.clone();
+    let slot_snapshot = {
         let method = nip46::Nip46Method::from_str(&request.method);
         let event_kind = if matches!(method, nip46::Nip46Method::SignEvent) {
-            nip46::parse_unsigned_event(&request.params)
-                .ok()
-                .map(|event| event.kind)
+            nip46::unsigned_event_kind(&request.params)
         } else {
             None
         };
         let tier = ctx
             .policy_engine
             .check(slot, &ev.pubkey, &method, event_kind);
-        crate::nip46_handler::request_may_mutate_slot_state(request, tier)
+        crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
             .then(|| ctx.policy_engine.snapshot_slot_state(slot))
-    });
+    };
 
     // Breadcrumb the in-flight request so a crash while handling it is
     // attributable on the next boot. Cleared right after the handler returns;
     // it only survives if the chip resets before that (panic/watchdog).
-    if let Some(req) = &parsed_request {
-        let mut crumb = format!("relay {}", req.method);
-        if matches!(nip46::Nip46Method::from_str(&req.method), nip46::Nip46Method::SignEvent) {
-            if let Ok(ev) = nip46::parse_unsigned_event(&req.params) {
-                crumb.push_str(&format!(" kind {}", ev.kind));
+    {
+        let mut crumb = format!("relay {}", request.method);
+        if matches!(
+            nip46::Nip46Method::from_str(&request.method),
+            nip46::Nip46Method::SignEvent
+        ) {
+            if let Some(kind) = nip46::unsigned_event_kind(&request.params) {
+                crumb.push_str(&format!(" kind {kind}"));
             }
         }
         // Free heap at request time distinguishes a big-response OOM from a
@@ -2091,15 +2131,13 @@ fn handle_nip46_event(
         let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
         crumb.push_str(&format!(" from {} (heap {}k)", &ev.pubkey[..ev.pubkey.len().min(8)], free / 1024));
         crate::crash_crumb::set(&crumb);
-    } else {
-        crate::crash_crumb::set("relay request (unparsed)");
     }
 
     // Dispatch — same handler as the USB path. sign_event is ButtonRequired
     // until the slot is physically button-upgraded; auto-approve covers the
     // safe methods and post-upgrade signing.
-    let mut response_json = crate::nip46_handler::handle_request(
-        &inner,
+    let mut response_json = crate::nip46_handler::handle_parsed_request(
+        request,
         &signing_secret,
         &label,
         mode,
@@ -2205,7 +2243,7 @@ fn handle_nip46_event(
         &ev.pubkey,
         NIP46_KIND,
         ev.created_at,
-        &response_json,
+        response_json,
     )
 }
 
@@ -2423,7 +2461,7 @@ fn handle_mgmt_event(
         &ev.pubkey,
         MGMT_KIND,
         ev.created_at,
-        &response_json,
+        response_json,
     )
 }
 
@@ -3456,7 +3494,7 @@ fn dispatch_mgmt(
                 client_hex,
                 NIP46_KIND,
                 created_at,
-                &ack,
+                ack,
             ) {
                 // The client never saw its secret and no slot write was
                 // attempted, so restoring the complete RAM snapshot is enough.
@@ -3993,11 +4031,14 @@ fn sign_and_publish(
     recipient_hex: &str,
     kind: u64,
     created_at: u64,
-    response_json: &str,
+    response_json: String,
 ) -> Result<(), String> {
+    let response_len = response_json.len();
+    crate::crash_crumb::set(&format!("relay encrypt kind {kind} {response_len}B"));
     let nonce = random_nonce_32();
-    let ciphertext = nip44::encrypt(conversation_key, response_json, &nonce)
+    let ciphertext = nip44::encrypt_owned(conversation_key, response_json, &nonce)
         .map_err(|e| format!("encrypt: {e}"))?;
+    crate::crash_crumb::set(&format!("relay envelope kind {kind}"));
 
     let keypair = Keypair::from_seckey_slice(secp, signing_secret)
         .map_err(|_| "invalid signing secret".to_string())?;
@@ -4022,18 +4063,59 @@ fn sign_and_publish(
         content: unsigned.content,
         sig: hex_encode(&sig),
     };
-    let event_json = serde_json::to_string(&signed).map_err(|e| format!("serialise: {e}"))?;
-
-    ws_send(
-        tls,
-        OP_TEXT,
-        format!(r#"["EVENT",{event_json}]"#).as_bytes(),
-    )?;
+    let event_len = ws_send_event(tls, &signed)?;
     log::info!(
         "[relay] published kind:{kind} response ({} bytes)",
-        event_json.len()
+        event_len
     );
     Ok(())
+}
+
+/// Serialise and mask an EVENT command in one allocation. The generic
+/// `ws_send` path first builds a JSON String and then copies it into a masked
+/// frame; for a large NIP-46 response that second full copy is avoidable.
+fn ws_send_event(tls: &mut Tls, event: &SignedEvent) -> Result<usize, String> {
+    const MAX_HEADER_LEN: usize = 14;
+    let mut frame = Vec::with_capacity(
+        MAX_HEADER_LEN
+            .saturating_add(event.content.len())
+            .saturating_add(768),
+    );
+    frame.resize(MAX_HEADER_LEN, 0);
+    serde_json::to_writer(&mut frame, &("EVENT", event))
+        .map_err(|e| format!("serialise: {e}"))?;
+
+    let payload_len = frame.len() - MAX_HEADER_LEN;
+    let header_len = if payload_len < 126 {
+        6
+    } else if payload_len < 65_536 {
+        8
+    } else {
+        14
+    };
+    frame.copy_within(MAX_HEADER_LEN.., header_len);
+    frame.truncate(header_len + payload_len);
+
+    frame[0] = 0x80 | OP_TEXT;
+    let mask_offset = header_len - 4;
+    if payload_len < 126 {
+        frame[1] = 0x80 | payload_len as u8;
+    } else if payload_len < 65_536 {
+        frame[1] = 0x80 | 126;
+        frame[2..4].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    } else {
+        frame[1] = 0x80 | 127;
+        frame[2..10].copy_from_slice(&(payload_len as u64).to_be_bytes());
+    }
+    let mask = esp_random().to_le_bytes();
+    frame[mask_offset..header_len].copy_from_slice(&mask);
+    for (index, byte) in frame[header_len..].iter_mut().enumerate() {
+        *byte ^= mask[index & 3];
+    }
+
+    crate::crash_crumb::set(&format!("relay websocket kind {} {}B", event.kind, payload_len));
+    tls.write_all(&frame).map_err(|e| format!("ws send: {e:?}"))?;
+    Ok(payload_len)
 }
 
 fn snippet(raw: &[u8], n: usize) -> String {

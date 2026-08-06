@@ -11,7 +11,14 @@ use esp_idf_hal::delay;
 use crate::serial::SerialPort;
 
 use heartwood_common::frame::{self, Frame};
-use heartwood_common::types::{MAGIC_BYTES, MAX_PAYLOAD_SIZE, FRAME_HEADER_SIZE};
+use heartwood_common::types::{
+    FRAME_HEADER_SIZE, FRAME_OVERHEAD, MAGIC_BYTES, MAX_PAYLOAD_SIZE,
+};
+use serde::Serialize;
+
+const MAX_WRITE_CHUNK: usize = 512;
+const WRITE_CHUNK_TIMEOUT: u32 = 100;
+const WRITE_STALL_BUDGET: u32 = 2_000;
 
 /// Read a single byte from the USB serial driver, blocking until available.
 fn read_byte(usb: &mut SerialPort<'_>) -> u8 {
@@ -126,25 +133,21 @@ pub fn read_frame(usb: &mut SerialPort<'_>) -> Frame {
             continue;
         }
 
-        // Step 5 — read payload + 4-byte CRC.
-        let mut body = vec![0u8; length + 4];
-        read_exact(usb, &mut body);
-
-        // Step 6 — reassemble the complete frame buffer for parse_frame.
-        // Layout: [magic(2)] [type(1)] [length(2)] [payload(length)] [crc(4)]
-        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + length + 4);
-        buf.extend_from_slice(&MAGIC_BYTES);
-        buf.push(frame_type);
-        buf.extend_from_slice(&(length as u16).to_be_bytes());
-        buf.extend_from_slice(&body);
-
-        // Step 7 — validate and return, or log and resume hunting.
-        match frame::parse_frame(&buf) {
-            Ok(f) => return f,
-            Err(e) => {
-                log::warn!("Frame validation failed ({:?}) — resuming hunt", e);
-            }
+        // Read directly into the payload that the returned Frame will own.
+        // The old path read payload+CRC, rebuilt a complete frame Vec, then
+        // parse_frame cloned the payload a third time. Large sign_event bodies
+        // could therefore OOM before the handler set its crash breadcrumb.
+        let mut payload = vec![0u8; length];
+        read_exact(usb, &mut payload);
+        let mut crc_bytes = [0u8; 4];
+        read_exact(usb, &mut crc_bytes);
+        if frame_crc_valid(frame_type, &header[1..], &payload, crc_bytes) {
+            return Frame {
+                frame_type,
+                payload,
+            };
         }
+        log::warn!("Frame validation failed (BadCrc) — resuming hunt");
     }
 }
 
@@ -209,29 +212,43 @@ pub fn try_read_frame(usb: &mut SerialPort<'_>, idle_timeout_ms: u32) -> Option<
         return None;
     }
 
-    // Read payload + 4-byte CRC, also bounded against truncation.
-    let mut body = vec![0u8; length + 4];
-    if !read_exact_bounded(usb, &mut body, BODY_STALL_TIMEOUT_MS) {
+    // Read directly into the one payload allocation retained by the Frame.
+    let mut payload = vec![0u8; length];
+    if !read_exact_bounded(usb, &mut payload, BODY_STALL_TIMEOUT_MS) {
         log::warn!(
             "try_read_frame: body stalled at type 0x{frame_type:02x} len {length} — discarding partial frame"
         );
         return None;
     }
-
-    // Reassemble and validate.
-    let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + length + 4);
-    buf.extend_from_slice(&MAGIC_BYTES);
-    buf.push(frame_type);
-    buf.extend_from_slice(&(length as u16).to_be_bytes());
-    buf.extend_from_slice(&body);
-
-    match frame::parse_frame(&buf) {
-        Ok(f) => Some(f),
-        Err(e) => {
-            log::warn!("try_read_frame: validation failed ({:?}) — discarding", e);
-            None
-        }
+    let mut crc_bytes = [0u8; 4];
+    if !read_exact_bounded(usb, &mut crc_bytes, BODY_STALL_TIMEOUT_MS) {
+        log::warn!(
+            "try_read_frame: CRC stalled at type 0x{frame_type:02x} len {length} — discarding partial frame"
+        );
+        return None;
     }
+    if frame_crc_valid(frame_type, &header[1..], &payload, crc_bytes) {
+        Some(Frame {
+            frame_type,
+            payload,
+        })
+    } else {
+        log::warn!("try_read_frame: validation failed (BadCrc) — discarding");
+        None
+    }
+}
+
+fn frame_crc_valid(
+    frame_type: u8,
+    length_bytes: &[u8],
+    payload: &[u8],
+    received: [u8; 4],
+) -> bool {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&[frame_type]);
+    hasher.update(length_bytes);
+    hasher.update(payload);
+    hasher.finalize() == u32::from_be_bytes(received)
 }
 
 /// Build a frame from `frame_type` and `payload` and write it to the serial
@@ -244,53 +261,102 @@ pub fn try_read_frame(usb: &mut SerialPort<'_>, idle_timeout_ms: u32) -> Option<
 /// ESP32-S3. On the V3 the CP2102 UART path is more forgiving but we keep
 /// the same chunk size for consistency.
 pub fn write_frame(usb: &mut SerialPort<'_>, frame_type: u8, payload: &[u8]) {
-    /// Maximum bytes per `usb.write_bounded()` call. The USB-Serial-JTAG TX FIFO is
-    /// 64 bytes and the ESP-IDF ring buffer is typically 256 bytes, but we
-    /// use a larger chunk to keep throughput reasonable while staying safe.
-    const MAX_CHUNK: usize = 512;
-    /// Per-call wait for the driver to accept bytes (same tick unit as the
-    /// read path timeouts).
-    const WRITE_CHUNK_TIMEOUT: u32 = 100;
-    /// Cumulative zero-progress budget for one frame before it is dropped.
-    /// The native USB TX buffer only drains while a host reads; a suspended
-    /// laptop (Sapwood over WebSerial, lid closed) used to park the single
-    /// signing thread in a BLOCK write forever — in WiFi mode that froze the
-    /// whole relay loop, a deafness only a power-cycle cleared. Dropping the
-    /// frame is safe: the read side on both ends resynchronises on the magic
-    /// bytes, and a host that is not draining has no use for the bytes anyway.
-    const WRITE_STALL_BUDGET: u32 = 2_000;
-
     match frame::build_frame(frame_type, payload) {
-        Ok(bytes) => {
-            let mut pos = 0;
-            let mut stalled: u32 = 0;
-            while pos < bytes.len() {
-                let end = (pos + MAX_CHUNK).min(bytes.len());
-                match usb.write_bounded(&bytes[pos..end], WRITE_CHUNK_TIMEOUT) {
-                    Ok(n) if n > 0 => {
-                        pos += n;
-                        stalled = 0;
-                    }
-                    Ok(_) => {
-                        stalled += WRITE_CHUNK_TIMEOUT;
-                        if stalled >= WRITE_STALL_BUDGET {
-                            log::warn!(
-                                "Serial write stalled at byte {}/{} — host not draining; dropping frame",
-                                pos,
-                                bytes.len()
-                            );
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Serial write error at byte {}/{}: {:?}", pos, bytes.len(), e);
-                        return;
-                    }
-                }
-            }
-        }
+        Ok(bytes) => write_encoded_frame(usb, &bytes),
         Err(e) => {
             log::warn!("Failed to build frame (type=0x{:02X}): {:?}", frame_type, e);
+        }
+    }
+}
+
+/// Serialise a JSON payload directly into its protocol frame allocation.
+/// Large signed envelopes otherwise exist as a JSON String and are then copied
+/// wholesale by `build_frame`, which is unnecessary pressure on the signer.
+pub fn write_json_frame<T: Serialize>(
+    usb: &mut SerialPort<'_>,
+    frame_type: u8,
+    value: &T,
+    capacity_hint: usize,
+) -> Result<usize, String> {
+    let mut bytes = Vec::with_capacity(
+        FRAME_OVERHEAD
+            .saturating_add(capacity_hint)
+            .min(FRAME_OVERHEAD + MAX_PAYLOAD_SIZE),
+    );
+    bytes.extend_from_slice(&MAGIC_BYTES);
+    bytes.push(frame_type);
+    bytes.extend_from_slice(&[0, 0]);
+    serde_json::to_writer(&mut bytes, value).map_err(|e| format!("serialise: {e}"))?;
+
+    let payload_len = bytes.len() - FRAME_HEADER_SIZE;
+    if payload_len > MAX_PAYLOAD_SIZE {
+        return Err(format!("payload too large: {payload_len} bytes"));
+    }
+    let length = (payload_len as u16).to_be_bytes();
+    bytes[3..5].copy_from_slice(&length);
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&bytes[2..]);
+    bytes.extend_from_slice(&hasher.finalize().to_be_bytes());
+    write_encoded_frame(usb, &bytes);
+    Ok(payload_len)
+}
+
+/// Frame an owned text payload by reusing its allocation. This is primarily
+/// for large NIP-46 responses, where copying the complete JSON into a second
+/// `build_frame` Vec can exhaust contiguous heap after signing succeeds.
+pub fn write_owned_frame(usb: &mut SerialPort<'_>, frame_type: u8, payload: String) {
+    let payload_len = payload.len();
+    if payload_len > MAX_PAYLOAD_SIZE {
+        log::warn!(
+            "Failed to build frame (type=0x{frame_type:02X}): payload too large ({payload_len})"
+        );
+        return;
+    }
+
+    let mut bytes = payload.into_bytes();
+    bytes.reserve(FRAME_OVERHEAD);
+    bytes.resize(payload_len + FRAME_OVERHEAD, 0);
+    bytes.copy_within(0..payload_len, FRAME_HEADER_SIZE);
+    bytes[..2].copy_from_slice(&MAGIC_BYTES);
+    bytes[2] = frame_type;
+    bytes[3..5].copy_from_slice(&(payload_len as u16).to_be_bytes());
+
+    let crc_offset = FRAME_HEADER_SIZE + payload_len;
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&bytes[2..crc_offset]);
+    bytes[crc_offset..].copy_from_slice(&hasher.finalize().to_be_bytes());
+    write_encoded_frame(usb, &bytes);
+}
+
+/// Write one already-framed message without allocating again. The native USB
+/// TX buffer only drains while a host reads, so bounded writes also prevent a
+/// suspended host from freezing the relay loop indefinitely.
+fn write_encoded_frame(usb: &mut SerialPort<'_>, bytes: &[u8]) {
+    let mut pos = 0;
+    let mut stalled: u32 = 0;
+    while pos < bytes.len() {
+        let end = (pos + MAX_WRITE_CHUNK).min(bytes.len());
+        match usb.write_bounded(&bytes[pos..end], WRITE_CHUNK_TIMEOUT) {
+            Ok(n) if n > 0 => {
+                pos += n;
+                stalled = 0;
+            }
+            Ok(_) => {
+                stalled += WRITE_CHUNK_TIMEOUT;
+                if stalled >= WRITE_STALL_BUDGET {
+                    log::warn!(
+                        "Serial write stalled at byte {}/{} — host not draining; dropping frame",
+                        pos,
+                        bytes.len()
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                log::warn!("Serial write error at byte {}/{}: {:?}", pos, bytes.len(), e);
+                return;
+            }
         }
     }
 }

@@ -158,11 +158,35 @@ fn pad(plaintext: &str) -> Result<Vec<u8>, &'static str> {
     let padded_msg_len = calc_padded_len(msg_len);
     let total_len = 2 + padded_msg_len;
 
-    let mut buf = vec![0u8; total_len];
+    // Keep room for the wire header and HMAC so encryption can turn this same
+    // allocation into the payload instead of allocating a second full buffer.
+    let mut buf = Vec::with_capacity(total_len.saturating_add(65));
+    buf.resize(total_len, 0);
     buf[0] = ((msg_len >> 8) & 0xff) as u8;
     buf[1] = (msg_len & 0xff) as u8;
     buf[2..2 + msg_len].copy_from_slice(msg);
     // remaining bytes are zero (already zeroed)
+    Ok(buf)
+}
+
+/// Consume an owned plaintext String and turn its allocation into the padded
+/// message buffer. This is the bounded-memory path used by hardware signers.
+fn pad_owned(plaintext: String) -> Result<Vec<u8>, &'static str> {
+    let msg_len = plaintext.len();
+    if msg_len == 0 {
+        return Err("plaintext must not be empty");
+    }
+    if msg_len > 65535 {
+        return Err("plaintext too long (max 65535 bytes)");
+    }
+
+    let total_len = 2 + calc_padded_len(msg_len);
+    let mut buf = plaintext.into_bytes();
+    buf.reserve(total_len.saturating_add(65).saturating_sub(msg_len));
+    buf.resize(total_len, 0);
+    buf.copy_within(0..msg_len, 2);
+    buf[0] = ((msg_len >> 8) & 0xff) as u8;
+    buf[1] = (msg_len & 0xff) as u8;
     Ok(buf)
 }
 
@@ -199,6 +223,20 @@ fn calc_padded_len(msg_len: usize) -> usize {
     let next_power: usize = 1usize << (usize::BITS - (msg_len - 1).leading_zeros()) as usize;
     let chunk: usize = if next_power <= 256 { 32 } else { next_power / 8 };
     chunk * ((msg_len - 1) / chunk + 1)
+}
+
+/// Exact base64 wire length for a NIP-44 v2 plaintext of `msg_len` bytes.
+///
+/// Hardware transports use this before encryption to decide whether the next
+/// single output allocation fits the current heap. The wire bytes are version
+/// (1), nonce (32), padded plaintext with its two-byte length prefix, and HMAC
+/// (32), followed by standard padded base64 encoding.
+pub fn encoded_len(msg_len: usize) -> Option<usize> {
+    if msg_len == 0 || msg_len > 65_535 {
+        return None;
+    }
+    let wire_len = calc_padded_len(msg_len).checked_add(67)?;
+    wire_len.checked_add(2)?.checked_div(3)?.checked_mul(4)
 }
 
 /// Remove NIP-44 padding and return the original plaintext string.
@@ -260,11 +298,28 @@ pub fn encrypt(
     plaintext: &str,
     nonce: &[u8; 32],
 ) -> Result<String, &'static str> {
-    let padded = pad(plaintext)?;
+    encrypt_padded(conversation_key, pad(plaintext)?, nonce)
+}
+
+/// Encrypt an owned plaintext while reusing its allocation for NIP-44
+/// padding. This avoids retaining the response String beside another padded
+/// copy during large NIP-46 response publication.
+pub fn encrypt_owned(
+    conversation_key: &[u8; 32],
+    plaintext: String,
+    nonce: &[u8; 32],
+) -> Result<String, &'static str> {
+    encrypt_padded(conversation_key, pad_owned(plaintext)?, nonce)
+}
+
+fn encrypt_padded(
+    conversation_key: &[u8; 32],
+    mut ciphertext: Vec<u8>,
+    nonce: &[u8; 32],
+) -> Result<String, &'static str> {
     let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(conversation_key, nonce)?;
 
     // Encrypt padded plaintext in-place with ChaCha20.
-    let mut ciphertext = padded;
     let mut cipher = ChaCha20::new(
         chacha_key.as_slice().into(),
         chacha_nonce.as_slice().into(),
@@ -278,14 +333,16 @@ pub fn encrypt(
     mac.update(&ciphertext);
     let tag = mac.finalize().into_bytes();
 
-    // Build wire format: version(1) || nonce(32) || ciphertext(N) || hmac(32)
-    let mut payload = Vec::with_capacity(1 + 32 + ciphertext.len() + 32);
-    payload.push(VERSION);
-    payload.extend_from_slice(nonce);
-    payload.extend_from_slice(&ciphertext);
-    payload.extend_from_slice(&tag);
+    // Turn the padded ciphertext allocation into the wire payload in place:
+    // version(1) || nonce(32) || ciphertext(N) || hmac(32).
+    let ciphertext_len = ciphertext.len();
+    ciphertext.resize(ciphertext_len + 65, 0);
+    ciphertext.copy_within(0..ciphertext_len, 33);
+    ciphertext[0] = VERSION;
+    ciphertext[1..33].copy_from_slice(nonce);
+    ciphertext[33 + ciphertext_len..].copy_from_slice(&tag);
 
-    Ok(BASE64.encode(&payload))
+    Ok(BASE64.encode(&ciphertext))
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +357,7 @@ pub fn decrypt(
     conversation_key: &[u8; 32],
     ciphertext_b64: &str,
 ) -> Result<String, &'static str> {
-    let payload = BASE64
+    let mut payload = BASE64
         .decode(ciphertext_b64.trim())
         .map_err(|_| "invalid base64")?;
 
@@ -315,14 +372,14 @@ pub fn decrypt(
     }
 
     // Split payload: version(1) || nonce(32) || ciphertext(N) || hmac(32)
-    let nonce_bytes: &[u8; 32] = payload[1..33]
+    let nonce_bytes: [u8; 32] = payload[1..33]
         .try_into()
         .map_err(|_| "nonce extraction failed")?;
     let hmac_offset = payload.len() - 32;
-    let encrypted = &payload[33..hmac_offset];
     let received_tag = &payload[hmac_offset..];
 
-    let (chacha_key, chacha_nonce, hmac_key) = derive_message_keys(conversation_key, nonce_bytes)?;
+    let (chacha_key, chacha_nonce, hmac_key) =
+        derive_message_keys(conversation_key, &nonce_bytes)?;
 
     // Verify MAC over nonce || ciphertext (version byte excluded per NIP-44).
     let mut mac = HmacSha256::new_from_slice(&hmac_key)
@@ -331,16 +388,18 @@ pub fn decrypt(
     mac.verify_slice(received_tag)
         .map_err(|_| "HMAC verification failed")?;
 
-    // Decrypt in-place.
-    let mut plaintext_padded = encrypted.to_vec();
+    // Decrypt the ciphertext region of the decoded payload in place. Keeping a
+    // second full padded Vec here used to make inbound large sign_event
+    // requests peak before the signing code even ran.
+    let plaintext_padded = &mut payload[33..hmac_offset];
     let mut cipher = ChaCha20::new(
         chacha_key.as_slice().into(),
         chacha_nonce.as_slice().into(),
     );
-    cipher.apply_keystream(&mut plaintext_padded);
+    cipher.apply_keystream(plaintext_padded);
 
     // Unpad and return.
-    let text = unpad(&plaintext_padded)?;
+    let text = unpad(plaintext_padded)?;
     Ok(text.to_string())
 }
 
@@ -564,6 +623,15 @@ mod tests {
     }
 
     #[test]
+    fn encoded_length_tracks_padding_steps_and_wire_overhead() {
+        assert_eq!(encoded_len(1), Some(132));
+        assert_eq!(encoded_len(20_480), Some(27_396));
+        assert_eq!(encoded_len(20_481), Some(32_860));
+        assert_eq!(encoded_len(0), None);
+        assert_eq!(encoded_len(65_536), None);
+    }
+
+    #[test]
     fn test_conversation_key_deterministic() {
         let alice_sk = alice_secret();
         let bob_pk = pubkey_for(&bob_secret());
@@ -608,6 +676,20 @@ mod tests {
         let decrypted = decrypt(&conv_key_bob, &encrypted).unwrap();
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn owned_encrypt_matches_borrowed_encrypt_for_large_terminal_content() {
+        let alice = alice_secret();
+        let bob = pubkey_for(&bob_secret());
+        let key = get_conversation_key(&alice, &bob).unwrap();
+        let plaintext = format!("\u{001b}[38;5;208mDONKEY\u{001b}[0m\n{}", "art".repeat(5_000));
+        let expected = encrypt(&key, &plaintext, &fixed_nonce()).unwrap();
+
+        assert_eq!(
+            encrypt_owned(&key, plaintext, &fixed_nonce()).unwrap(),
+            expected
+        );
     }
 
     #[test]

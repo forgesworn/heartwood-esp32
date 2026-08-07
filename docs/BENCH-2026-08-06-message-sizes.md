@@ -324,6 +324,35 @@ permissions, approval tier, OLED prompt and audit entry are the same code and
 cannot drift into a laxer parallel path. The name is consulted once more, only to
 choose how the answer is serialised.
 
+### The parse guard belongs on every transport, not just the relay
+
+The first fix bounded the request only in `relay.rs`. That was the transport the
+crash was found on, and it was not the only one carrying the defect: three call
+sites reach `nip46::parse_request`, and the other two had no bound at all.
+
+- `transport.rs` — the **encrypted** path. Decrypts, logs the length, then
+  parses. Reachable over the network wherever a bridge is running, so this was
+  not merely a local-cable concern.
+- `nip46_handler.rs` — the **plaintext USB** frame. `MAX_PAYLOAD_SIZE` admits a
+  32 KB frame, and unescaping the event inside it would then ask for ~64 KB in
+  one contiguous block.
+
+A guard that runs after parsing cannot cover any of them, because parsing is
+what dies. The post-parse guard did refuse these sizes, but only *after* the
+allocation it was meant to prevent had already succeeded, which is luck rather
+than a defence: this bench recorded the USB path parsing cleanly to 32 KB on a
+fresh boot with a 148 KB largest block.
+
+The rule now lives once, in `nip46::request_ceiling`, host-tested, and all three
+sites call it. Verified over USB after the change, uptime monotonic throughout:
+
+| Content | Frame | Outcome |
+|---------|-------|---------|
+| 8192 | 8389 | reaches the approval prompt |
+| 12288 | 12485 | reaches the approval prompt |
+| 16384 | 16590 | `request is too large for this signer` |
+| 20480 | 20686 | `request is too large for this signer` |
+
 ### Answered: it was the signer aborting, and PARSING is the real limit
 
 The section below left two candidates and said the cable was needed to separate

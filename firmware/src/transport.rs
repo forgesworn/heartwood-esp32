@@ -140,6 +140,31 @@ pub fn handle_encrypted_request(
 
     log::info!("Decrypted NIP-46 request ({} bytes)", plaintext_json.len());
 
+    // Bound the request BEFORE serde_json sees it, exactly as the relay does.
+    //
+    // This path had no bound at all, and it runs the same parse: unescaping the
+    // event NIP-46 carries as a string grows a Vec by doubling, so an oversize
+    // request asks for twice the content in one contiguous block and Rust's
+    // alloc-error path aborts the chip. A reboot, not a refusal. The guard in
+    // handle_parsed_request cannot help, because parsing is what dies.
+    //
+    // Reachable over the network wherever a bridge is running, so it is not
+    // merely a local-cable concern.
+    let request_budget = nip46::request_ceiling(
+        &plaintext_json,
+        crate::board::MAX_SIGN_BYTES,
+        crate::board::MAX_SIGN_BYTES_OBJECT,
+    ) + heartwood_common::types::SIGN_RESPONSE_OVERHEAD;
+    if plaintext_json.len() > request_budget {
+        log::warn!(
+            "NIP-46 request of {} bytes exceeds the {} byte parse budget; refusing",
+            plaintext_json.len(),
+            request_budget
+        );
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"request is too large for this signer");
+        return;
+    }
+
     let request = match nip46::parse_request(plaintext_json.as_bytes()) {
         Ok(request) => request,
         Err(e) => {

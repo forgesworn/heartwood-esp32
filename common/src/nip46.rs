@@ -506,6 +506,40 @@ pub fn parse_request(json: &[u8]) -> Result<Nip46Request, String> {
     serde_json::from_slice(json).map_err(|e| format!("failed to parse NIP-46 request: {e}"))
 }
 
+/// The method name a client uses to ask for the compact reply.
+///
+/// `Nip46Method::from_str` maps it onto `SignEvent`, so permissions, approval
+/// tier, display prompt and audit entry are the same code and cannot drift into
+/// a laxer parallel path. The name is consulted only to size the request and to
+/// choose how the answer is serialised.
+pub const SIGN_EVENT_COMPACT_METHOD: &str = "sign_event_compact";
+
+/// The ceiling that applies to a decrypted request, decided WITHOUT parsing it.
+///
+/// Parsing is the hazard, so this has to be answerable from the raw bytes.
+/// Two allocations of roughly twice the content sit on the signing path, and
+/// each is fatal alone on a no-PSRAM board:
+///
+/// - the **request** unescape, which only the object form avoids, since NIP-46
+///   carries the event as a string whose quotes are escaped a second time;
+/// - the **reply**, which echoes the whole signed event back unless the client
+///   asked for the compact one.
+///
+/// So the larger ceiling requires BOTH. Anything else keeps the standard one:
+/// an object request still wanting the full event back cleared the parse and
+/// then died building the reply.
+///
+/// Every transport must apply this, not just the relay. The same parse runs on
+/// the encrypted bridge path and the plaintext USB path, and a guard that runs
+/// after parsing cannot help on any of them.
+pub fn request_ceiling(json: &str, standard: usize, object_compact: usize) -> usize {
+    if scan_method(json) == Some(SIGN_EVENT_COMPACT_METHOD) && params_first_is_object(json) {
+        object_compact
+    } else {
+        standard
+    }
+}
+
 /// Read the `method` value out of a request WITHOUT parsing it.
 ///
 /// Same reason as `scan_rpc_id`: the budget a request is allowed depends on what
@@ -1127,6 +1161,51 @@ mod tests {
         assert_eq!(scan_rpc_id("{\"id\":\"unterminated"), None);
         // Empty id is a real (if useless) value, not a failure.
         assert_eq!(scan_rpc_id("{\"id\":\"\",\"result\":\"x\"}"), Some(""));
+    }
+
+    #[test]
+    fn request_ceiling_needs_both_halves() {
+        let event = r#"{"kind":1,"created_at":1,"tags":[],"content":"hi"}"#;
+        let stringified = serde_json::to_string(event).unwrap();
+        let req = |method: &str, params: &str| {
+            format!(r#"{{"id":"a","method":"{method}","params":[{params}]}}"#)
+        };
+        const STD: usize = 12288;
+        const BIG: usize = 18432;
+
+        // Both halves: the only combination that earns the headroom.
+        assert_eq!(
+            request_ceiling(&req("sign_event_compact", event), STD, BIG),
+            BIG
+        );
+        // Object request, full reply: still pays the reply allocation.
+        assert_eq!(request_ceiling(&req("sign_event", event), STD, BIG), STD);
+        // Compact reply, stringified request: still pays the unescape.
+        assert_eq!(
+            request_ceiling(&req("sign_event_compact", &stringified), STD, BIG),
+            STD
+        );
+        // Neither.
+        assert_eq!(request_ceiling(&req("sign_event", &stringified), STD, BIG), STD);
+        // Unparseable or unrelated takes the conservative answer.
+        assert_eq!(request_ceiling("{}", STD, BIG), STD);
+        assert_eq!(request_ceiling("", STD, BIG), STD);
+    }
+
+    #[test]
+    fn request_ceiling_is_not_fooled_into_the_larger_budget() {
+        // A stringified event whose content spells out the compact method and an
+        // object opener. Granting the larger budget here would hand the parse
+        // exactly the input that aborts the chip.
+        let sneaky = format!(
+            r#"{{"kind":1,"created_at":1,"tags":[],"content":{}}}"#,
+            serde_json::to_string(r#""method":"sign_event_compact","params":[{"#).unwrap()
+        );
+        let req = format!(
+            r#"{{"id":"a","method":"sign_event","params":[{}]}}"#,
+            serde_json::to_string(&sneaky).unwrap()
+        );
+        assert_eq!(request_ceiling(&req, 12288, 18432), 12288);
     }
 
     #[test]

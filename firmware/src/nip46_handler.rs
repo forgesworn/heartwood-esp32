@@ -146,13 +146,8 @@ pub(crate) fn request_may_mutate_slot_state(
     }
 }
 
-/// The NIP-46 method name a client uses to ask for the compact reply.
-///
-/// Deliberately NOT a separate `Nip46Method`: `from_str` maps it onto
-/// `SignEvent`, so permissions, the approval tier, the OLED prompt and the audit
-/// entry are the same code, and cannot drift into a laxer parallel path. The
-/// only thing this name changes is how the answer is serialised.
-pub(crate) const SIGN_EVENT_COMPACT: &str = "sign_event_compact";
+/// Local alias for the compact method name, which lives with the protocol.
+pub(crate) use heartwood_common::nip46::SIGN_EVENT_COMPACT_METHOD as SIGN_EVENT_COMPACT;
 
 /// Build the reply for a completed signature, compact when the client asked.
 ///
@@ -262,6 +257,36 @@ pub fn handle_request(
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     client_pubkey: Option<&[u8; 32]>,
 ) -> String {
+    // Bound the request BEFORE serde_json sees it, as the relay and the
+    // encrypted path both do. MAX_PAYLOAD_SIZE admits a 32 KB frame, and
+    // unescaping the event NIP-46 carries as a string would then ask for ~64 KB
+    // in one contiguous block: the allocator aborts and the chip reboots rather
+    // than refusing. The guard below runs after parsing and cannot help.
+    //
+    // This is the plaintext frame, so the payload IS the request. It is not
+    // valid UTF-8 by construction, hence the lossy check: a non-UTF-8 payload
+    // will fail to parse anyway, and taking the standard ceiling for it is the
+    // conservative answer.
+    if let Ok(json) = core::str::from_utf8(&frame.payload) {
+        let budget = nip46::request_ceiling(
+            json,
+            crate::board::MAX_SIGN_BYTES,
+            crate::board::MAX_SIGN_BYTES_OBJECT,
+        ) + heartwood_common::types::SIGN_RESPONSE_OVERHEAD;
+        if json.len() > budget {
+            log::warn!(
+                "NIP-46 request of {} bytes exceeds the {budget} byte parse budget; refusing",
+                json.len()
+            );
+            return nip46::build_error_response(
+                nip46::scan_rpc_id(json).unwrap_or("unknown"),
+                -3,
+                "request is too large for this signer",
+            )
+            .unwrap_or_default();
+        }
+    }
+
     let request = match nip46::parse_request(&frame.payload) {
         Ok(r) => r,
         Err(e) => {

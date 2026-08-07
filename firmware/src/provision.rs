@@ -230,15 +230,34 @@ pub fn handle_generate(
         String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string()
     };
 
+    // Offer the entropy game: the owner's button timing becomes a second,
+    // independent entropy source, stacked with the hardware RNG draw so
+    // neither alone can bias the key. Optional — hold skips to hardware-only.
+    let game_digest = crate::entropy_game::run(display, button_pin);
+
     // Feedback while the (multi-second) entropy draw + PBKDF2 + derivation +
     // NVS write run, so the device isn't silently stuck on the previous screen.
     oled::show_generating(display);
 
-    // Entropy from the hardware RNG — 128 bits → a 12-word phrase. Drawn with a
-    // guaranteed entropy source: provisioning runs before the Wi-Fi radio is up,
-    // so esp_random alone would be only pseudo-random here.
-    let mut entropy = [0u8; 16];
-    crate::fill_random_strong(&mut entropy);
+    // Stacked entropy — 128 bits → a 12-word phrase. Mixes a fresh SAR-ADC
+    // draw (provisioning runs before the Wi-Fi radio is up, so esp_random
+    // alone would be only pseudo-random here) with the game digest when the
+    // owner played. Hard-refuses if the boot-time RNG self-test failed.
+    let mut entropy = match crate::entropy::stacked_entropy_16(game_digest.as_ref()) {
+        Some(e) => e,
+        None => {
+            if let Some(mut d) = game_digest {
+                d.iter_mut().for_each(|b| *b = 0);
+            }
+            log::error!("on-device generate refused: RNG self-test failed this boot");
+            oled::show_error(display, "RNG self-test failed\nrefusing to generate");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return None;
+        }
+    };
+    if let Some(mut d) = game_digest {
+        d.iter_mut().for_each(|b| *b = 0);
+    }
 
     let (phrase, root) = match heartwood_common::mnemonic::generate(&entropy) {
         Ok(pair) => pair,

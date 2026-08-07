@@ -48,6 +48,11 @@ pub fn handle_create(
         // channel, with no hint that connection-slot management needs a bridge
         // session at all.
         protocol::write_frame(usb, FRAME_TYPE_NACK, BRIDGE_AUTH_REQUIRED);
+    } else if !crate::entropy::rng_ok() {
+        // Fresh secrets need fresh entropy — fail closed if the boot-time
+        // RNG self-test didn't pass.
+        log::error!("CONNSLOT_CREATE refused: RNG self-test failed this boot");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"RNG self-test failed");
     } else if frame.payload.is_empty() {
         log::warn!("CONNSLOT_CREATE missing master_slot");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);

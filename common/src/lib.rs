@@ -8,6 +8,7 @@ extern crate alloc;
 pub mod deadline;
 pub mod derive;
 pub mod encoding;
+pub mod entropy;
 pub mod frame;
 pub mod hex;
 pub mod kinds;

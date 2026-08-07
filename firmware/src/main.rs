@@ -43,6 +43,8 @@ mod backup;
 mod board;
 mod button;
 mod connslot;
+mod entropy;
+mod entropy_game;
 mod identity_cache;
 mod identity_meta;
 mod layout;
@@ -78,6 +80,7 @@ mod wifi_scan;
 
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -268,6 +271,35 @@ pub fn fill_random_strong(buf: &mut [u8]) {
     }
 }
 
+/// Whether the RF entropy source is live. Set once the WiFi driver is
+/// started (wifi-standalone mode); stays false in the radio-off USB tier.
+static RADIO_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mark the RF entropy source live. Called from the relay task right after
+/// `wifi.start()` — from then on `esp_fill_random` is a true RNG.
+pub fn set_radio_active() {
+    RADIO_ACTIVE.store(true, Ordering::Relaxed);
+}
+
+/// Fill `buf` with cryptographically secure random bytes, guaranteeing a true
+/// entropy source in either operating tier.
+///
+/// With the radio up, plain `esp_fill_random` is hardware TRNG output. In the
+/// radio-off USB tier it would degrade to a boot-seeded PRNG, so we route
+/// through `fill_random_strong` to draw from the SAR-ADC noise source instead.
+/// (The ADC bracket is safe there: radios are disabled and nothing else on
+/// the board touches the SAR ADC.) Every security-relevant draw — nonces,
+/// IVs, salts, secrets, aux_rand — should use this, not raw `esp_fill_random`.
+pub fn fill_random(buf: &mut [u8]) {
+    if RADIO_ACTIVE.load(Ordering::Relaxed) {
+        unsafe {
+            esp_idf_svc::sys::esp_fill_random(buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len());
+        }
+    } else {
+        fill_random_strong(buf);
+    }
+}
+
 /// A malformed/unrecoverable removal journal blocks every signing path, but it
 /// must not make the device permanently unserviceable. Offer a deliberate
 /// physical hold-to-wipe escape; never erase automatically on recovery error.
@@ -333,6 +365,13 @@ fn main() {
     // --- NVS init ---
     let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
     let mut nvs = EspNvs::new(nvs_partition, "heartwood", true).expect("NVS namespace init failed");
+
+    // --- RNG self-test ---
+    // Prove the hardware entropy source is actually in the call path (the
+    // Coldcard July 2026 failure mode: correct TRNG code, silently unused).
+    // On failure the device keeps serving existing keys but refuses all fresh
+    // key/secret generation — fail closed where new entropy matters.
+    entropy::boot_self_test(&mut nvs);
 
     // Apply the persisted log verbosity before the chatty phases start. Quiet
     // mode calms boards whose activity LED is wired to the log UART.

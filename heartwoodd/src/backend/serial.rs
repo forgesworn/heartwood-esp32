@@ -429,6 +429,19 @@ impl SigningBackend for SerialBackend {
             })
     }
 
+    /// Remove a master by slot (PROVISION_REMOVE, 0x04). The device shows the
+    /// slot and npub on its OLED and waits for a physical hold before touching
+    /// any state, so the timeout must cover a human reading and deciding. On
+    /// success the device ACKs then reboots to reload its slot-indexed caches.
+    fn remove_master(&self, slot: u8) -> Result<(), BackendError> {
+        let frame_bytes = frame::build_frame(FRAME_TYPE_PROVISION_REMOVE, &[slot])
+            .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
+
+        let mut port = self.acquire()?;
+        self.send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_ACK], 120)?;
+        Ok(())
+    }
+
     // -- Connection slot management ------------------------------------------
 
     fn list_slots(&self, master: u8) -> Result<Value, BackendError> {

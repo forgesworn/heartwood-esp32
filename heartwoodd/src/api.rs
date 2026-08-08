@@ -13,7 +13,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -106,7 +106,9 @@ struct ApprovalAction {
 
 #[derive(Deserialize)]
 struct ChangePassphraseBody {
-    old_passphrase: String,
+    /// Required when changing an existing passphrase; omitted on initial set
+    /// (no passphrase file yet).
+    old_passphrase: Option<String>,
     new_passphrase: String,
 }
 
@@ -226,6 +228,20 @@ async fn create_master(State(state): State<AppState>, Json(body): Json<CreateMas
 
     match result {
         Ok(master) => (StatusCode::CREATED, Json(master)).into_response(),
+        Err(e) => backend_to_http(e),
+    }
+}
+
+/// Protected: remove a master identity by slot. Hard mode requires physical
+/// button confirmation on the device (and the device reboots afterwards);
+/// Soft mode removes it from the encrypted keystore.
+async fn delete_master(State(state): State<AppState>, Path(slot): Path<u8>) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        state.backend.remove_master(slot)
+    }).await.unwrap();
+
+    match result {
+        Ok(()) => Json(OkResponse { ok: true }).into_response(),
         Err(e) => backend_to_http(e),
     }
 }
@@ -533,7 +549,9 @@ async fn get_backup_status(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Protected: change the backup passphrase, re-encrypting the existing backup if present.
+/// Protected: set or change the backup passphrase, re-encrypting the existing
+/// backup if present. Initial set (no passphrase file yet) does not require
+/// the old passphrase; afterwards the old passphrase must be supplied.
 async fn put_backup_passphrase(
     State(state): State<AppState>,
     Json(body): Json<ChangePassphraseBody>,
@@ -541,11 +559,32 @@ async fn put_backup_passphrase(
     let result = tokio::task::spawn_blocking(move || {
         let token = state.api_token.as_deref().map(|s| s.as_str()).unwrap_or("");
 
+        if body.new_passphrase.len() < 8 {
+            return Err(BackendError::Internal(
+                "new passphrase must be at least 8 characters".to_string(),
+            ));
+        }
+
+        let initial_set = !state.passphrase_path.exists();
+
+        if initial_set {
+            // First-time setup: nothing to verify against, and no backup can
+            // exist yet (backups fail closed without a passphrase).
+            crate::backup::write_passphrase(
+                &state.passphrase_path,
+                &body.new_passphrase,
+                token,
+            )
+            .map_err(BackendError::Internal)?;
+            return Ok::<_, BackendError>(());
+        }
+
         // Verify old passphrase (constant-time to avoid timing leaks).
         let stored = crate::backup::read_passphrase(&state.passphrase_path, token)
             .map_err(|e| BackendError::Internal(format!("read passphrase: {e}")))?;
+        let provided = body.old_passphrase.as_deref().unwrap_or("");
         let stored_bytes = stored.as_bytes();
-        let provided_bytes = body.old_passphrase.as_bytes();
+        let provided_bytes = provided.as_bytes();
         let mismatch = if stored_bytes.len() != provided_bytes.len() {
             true
         } else {
@@ -728,32 +767,18 @@ async fn require_bearer(
     Ok(next.run(req).await)
 }
 
-/// Serve Sapwood's index.html with the API token substituted into the
-/// `__HEARTWOOD_API_TOKEN__` placeholder. Same-origin Sapwood loads pick
-/// this up via a <meta name="heartwood-api-token"> tag and use it on all
-/// subsequent /api/* calls -- so the LAN admin never has to type a token.
-async fn serve_index(
-    State(state): State<AppState>,
-    sapwood_dir: String,
-) -> impl IntoResponse {
-    let path = std::path::Path::new(&sapwood_dir).join("index.html");
-    let Ok(html) = std::fs::read_to_string(&path) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "index.html not readable").into_response();
-    };
-    let token_value = state.api_token.as_deref().map(|s| s.as_str()).unwrap_or("");
-    let rendered = html.replace("__HEARTWOOD_API_TOKEN__", token_value);
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        rendered,
-    )
-        .into_response()
-}
-
+// Note: Sapwood's index.html is served statically by the ServeDir fallback
+// below (ServeDir serves index.html for `/`). The API token is deliberately
+// NOT templated into the page: injecting it let any unauthenticated LAN
+// client fetch `/` and extract full API access. Sapwood treats the literal
+// `__HEARTWOOD_API_TOKEN__` placeholder as "no token" and prompts the
+// operator to enter it instead.
 pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> Router {
     // Protected routes -- require Bearer token when state.api_token is Some.
     let protected: Router<AppState> = Router::new()
         .route("/api/status", get(get_status))
         .route("/api/masters", post(create_master))
+        .route("/api/masters/{slot}", delete(delete_master))
         .route("/api/slots/{master}", get(get_slots).post(create_slot))
         .route("/api/slots/{master}/{index}", put(update_slot).delete(delete_slot))
         .route("/api/slots/{master}/{index}/uri", get(get_slot_uri))
@@ -783,29 +808,7 @@ pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> 
         .route("/api/info", get(get_info))
         .route("/api/logs", get(ws_logs));
 
-    let mut app: Router<AppState> = Router::new().merge(protected).merge(public);
-
-    // Sapwood index.html serve with token templating. Must be added before
-    // .with_state() because the handler uses the State<AppState> extractor.
-    if let Some(dir) = sapwood_dir {
-        let dir_for_root = dir.to_string();
-        let dir_for_index = dir.to_string();
-        app = app
-            .route(
-                "/",
-                get(move |s: State<AppState>| {
-                    let dir = dir_for_root.clone();
-                    async move { serve_index(s, dir).await }
-                }),
-            )
-            .route(
-                "/index.html",
-                get(move |s: State<AppState>| {
-                    let dir = dir_for_index.clone();
-                    async move { serve_index(s, dir).await }
-                }),
-            );
-    }
+    let app: Router<AppState> = Router::new().merge(protected).merge(public);
 
     // Finalise state; from here on the router is Router<()> and can take
     // layers and fallback services that do not use AppState.

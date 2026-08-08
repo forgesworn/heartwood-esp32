@@ -166,6 +166,14 @@ pub trait SigningBackend: Send + Sync {
         Err(BackendError::NotSupported)
     }
 
+    /// Remove a master identity by slot. Hard mode requires physical button
+    /// confirmation on the device (the OLED shows slot + npub first) and the
+    /// device reboots afterwards to reload its slot-indexed state.
+    fn remove_master(&self, slot: u8) -> Result<(), BackendError> {
+        let _ = slot;
+        Err(BackendError::NotSupported)
+    }
+
     // -- Connection slot management -----------------------------------------
 
     /// List all connection slots for a master.

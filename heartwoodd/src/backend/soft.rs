@@ -881,6 +881,24 @@ impl SigningBackend for SoftBackend {
         }))
     }
 
+    /// Remove a Soft-mode master from the encrypted keystore. The daemon is
+    /// the key holder here, so there is no physical gate — the API bearer
+    /// token is the authority. The in-memory secret bytes are scrubbed as the
+    /// entry drops out of the keystore.
+    fn remove_master(&self, slot: u8) -> Result<(), BackendError> {
+        let mut guard = self.state.write().expect("state lock poisoned");
+        let state = guard.as_mut().ok_or(BackendError::Locked)?;
+
+        let before = state.keystore.masters.len();
+        state.keystore.masters.retain(|m| m.slot != slot);
+        if state.keystore.masters.len() == before {
+            return Err(BackendError::Internal(format!("master {slot} not found")));
+        }
+
+        let path = self.keyfile_path();
+        Self::persist(state, &path)
+    }
+
     // -- Connection slot management ------------------------------------------
 
     fn list_slots(&self, master: u8) -> Result<Value, BackendError> {

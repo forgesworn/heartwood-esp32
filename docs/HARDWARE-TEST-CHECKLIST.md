@@ -283,8 +283,41 @@ hardware tests ran. Use throwaway identities, WiFi credentials, and relays.
       before mutation/reboot. Do not describe that configuration as capable of
       unattended power-loss recovery.
 
-### 7.5 Destructive persistence and master-removal recovery
+### 7.4b Vault key (host-held encrypted at rest)
 
+- [x] Flash v0.14.0 (vault build) on Heltec V4: boot healthy, FIRMWARE_INFO
+      and PROVISION_LIST respond, `locked:false` present on every master row,
+      SESSION_AUTH with a zero secret rejected (0x01), VAULT_SET without bridge
+      auth NACKs "bridge auth required", VAULT_UNLOCK while unlocked NACKs
+      "already unlocked". (2026-08-08, automated frame harness.)
+- [ ] **Enable over USB**: Sapwood Device > Security > Encrypt at rest (or
+      `heartwoodd --vault-enable` with the bridge secret). OLED shows
+      "Enable vault? (host-held key)"; confirm with the hold. ACK, Sapwood
+      shows the escrow prompt. Reboot: OLED shows "Locked — Await unlock…",
+      PROVISION_LIST rows report `locked:true`, signing frames NACK.
+- [ ] **Auto-unlock (USB-bridged)**: with `vault.key` in heartwoodd's data
+      dir, start the daemon; the device unlocks within seconds of SESSION_AUTH
+      and serves signing normally. `GET /api/vault/status` reports
+      `key_present:true`.
+- [ ] **Wrong vault key**: corrupt a copy of `vault.key` and attempt unlock
+      (Sapwood paste flow). NACK "wrong vault key", NO wipe-counter increment,
+      device stays locked, correct key still unlocks afterwards.
+- [ ] **WiFi-standalone remote unlock**: with a wifi-mode locked signer, open
+      Sapwood from another network; the kind-24135 announcement appears as
+      "Signer is locked" within ~60 s; tap unlock; the device unwraps and the
+      banner clears. A relay capture shows only ephemeral kind-24135/24136
+      events, never a standing ciphertext.
+- [ ] **Escrow restore**: clear the browser's vault store, unlock with the
+      exported hex via the paste flow; Sapwood remembers it afterwards.
+- [ ] **Disable**: Sapwood "Disable encryption" → OLED confirm → reboot boots
+      straight through unlocked and `locked:false` everywhere.
+- [ ] **PIN coexistence**: set a boot PIN while vault-enabled (or vice versa);
+      both unlock paths work; five wrong PINs still wipes (use a test device).
+- [ ] Repeat 7.5's power-cut matrix against a vault-locked device: a power cut
+      mid-VAULT_SET leaves either fully-plaintext or fully-encrypted blobs,
+      never a torn mixture that refuses both keys.
+
+### 7.5 Destructive persistence and master-removal recovery
 - [ ] Put a recognisable SSID/operator key in the raw `config` partition and a
       different runtime config plus identities/clients/personas in NVS. Approve
       physical factory reset; verify `config` is blank before NVS, both regions

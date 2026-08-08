@@ -21,6 +21,7 @@ mod backup;
 mod backend;
 mod relay;
 mod serial;
+mod vault;
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use nostr_sdk::prelude::*;
+use zeroize::Zeroize;
 
 use heartwood_common::frame;
 use heartwood_common::hex::hex_encode;
@@ -104,6 +106,18 @@ struct Cli {
     /// Omit if the device has no PIN set or is already unlocked.
     #[arg(long)]
     pin: Option<String>,
+
+    /// One-shot: enable at-rest vault encryption on the device, then exit.
+    /// Generates <data-dir>/vault.key on first use, sends VAULT_SET over
+    /// serial (requires --bridge-secret and a physical button press).
+    /// For operators without Sapwood.
+    #[arg(long, conflicts_with = "vault_disable")]
+    vault_enable: bool,
+
+    /// One-shot: disable at-rest vault encryption (plaintext seeds), then exit.
+    /// Same serial/auth/button requirements as --vault-enable.
+    #[arg(long)]
+    vault_disable: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +306,145 @@ fn authenticate_bridge(port: &mut RawSerial, bridge_secret: &[u8; 32]) -> Result
     }
 }
 
+/// Send a frame over the startup (not yet shared) serial port and wait for an
+/// ACK or NACK reply, returning the reply frame. Used for one-shot vault
+/// operations and startup vault unlock, where the full SerialBackend does not
+/// exist yet.
+fn send_frame_wait_ack(
+    port: &mut RawSerial,
+    frame_type: u8,
+    payload: &[u8],
+    timeout_secs: u64,
+) -> Result<frame::Frame, String> {
+    let frame_bytes = frame::build_frame(frame_type, payload)
+        .map_err(|e| format!("frame build failed: {:?}", e))?;
+
+    port.write_all(&frame_bytes)
+        .map_err(|e| format!("serial write failed: {e}"))?;
+    port.flush()
+        .map_err(|e| format!("serial flush failed: {e}"))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err("timeout waiting for device reply".into());
+        }
+        let mut byte = [0u8; 1];
+        match port.read(&mut byte) {
+            Ok(1) => {
+                if byte[0] != 0x48 { continue; }
+                match port.read(&mut byte) {
+                    Ok(1) if byte[0] == 0x57 => {}
+                    _ => continue,
+                }
+                let mut header = [0u8; 3];
+                read_exact_deadline(port, &mut header, deadline)?;
+                let resp_type = header[0];
+                let length = u16::from_be_bytes([header[1], header[2]]) as usize;
+                if length > MAX_PAYLOAD_SIZE {
+                    continue;
+                }
+                let mut body = vec![0u8; length + 4];
+                read_exact_deadline(port, &mut body, deadline)?;
+                let mut buf = Vec::with_capacity(5 + length + 4);
+                buf.extend_from_slice(&MAGIC_BYTES);
+                buf.push(resp_type);
+                buf.extend_from_slice(&header[1..3]);
+                buf.extend_from_slice(&body);
+                if let Ok(f) = frame::parse_frame(&buf) {
+                    if f.frame_type == FRAME_TYPE_ACK || f.frame_type == FRAME_TYPE_NACK {
+                        return Ok(f);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("serial read error: {e}")),
+        }
+    }
+}
+
+/// Perform a one-shot vault enable/disable over serial, then return the
+/// process exit code. For operators without Sapwood: opens the port, runs
+/// PIN unlock (if given) and bridge session auth, sends VAULT_SET, and
+/// reports the device reply. The key is zeroized after use.
+fn run_vault_oneshot(cli: &Cli, vault_key_path: &std::path::Path) -> i32 {
+    let mut port = match RawSerial::open(&cli.port, cli.baud) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("Failed to open serial port {}: {e}", cli.port);
+            return 1;
+        }
+    };
+
+    drain_serial(&mut port);
+
+    // PIN unlock must happen before any other frame exchange.
+    if let Some(pin) = &cli.pin {
+        if let Err(e) = unlock_pin(&mut port, pin) {
+            log::error!("PIN unlock failed: {e}");
+            return 1;
+        }
+    }
+
+    // VAULT_SET requires an authenticated bridge session on the device.
+    let Some(hex_str) = &cli.bridge_secret else {
+        log::error!(
+            "--bridge-secret (or HEARTWOOD_BRIDGE_SECRET) is required for vault operations"
+        );
+        return 1;
+    };
+    let secret = match decode_hex_32(hex_str) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("{e}");
+            return 1;
+        }
+    };
+    if let Err(e) = authenticate_bridge(&mut port, &secret) {
+        log::error!("Session authentication failed: {e}");
+        return 1;
+    }
+
+    // The device holds a 30-second physical-approval window; allow margin.
+    let result = if cli.vault_enable {
+        match vault::load_or_generate_vault_key(vault_key_path) {
+            Ok(mut key) => {
+                let r = send_frame_wait_ack(&mut port, FRAME_TYPE_VAULT_SET, &key, 60);
+                key.zeroize();
+                r
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        send_frame_wait_ack(&mut port, FRAME_TYPE_VAULT_SET, &[], 60)
+    };
+
+    match result {
+        Ok(resp) if resp.frame_type == FRAME_TYPE_ACK => {
+            log::info!(
+                "Vault {} confirmed on device (button pressed)",
+                if cli.vault_enable { "enable" } else { "disable" }
+            );
+            0
+        }
+        Ok(resp) => {
+            let reason = String::from_utf8_lossy(&resp.payload);
+            let reason = reason.trim();
+            if reason.is_empty() {
+                log::error!("Vault operation rejected on device (button not pressed or refused)");
+            } else {
+                log::error!("Vault operation rejected on device: {reason}");
+            }
+            1
+        }
+        Err(e) => {
+            log::error!("Vault operation failed: {e}");
+            1
+        }
+    }
+}
+
 /// Read exactly `buf.len()` bytes from the serial port, respecting a deadline.
 fn read_exact_deadline(
     port: &mut RawSerial,
@@ -472,6 +625,14 @@ async fn main() -> Result<()> {
     // during frame reads is the only way device logs appear during signing.
     let (log_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
+    let vault_key_path = vault::vault_key_path(&cli.data_dir);
+
+    // One-shot vault operations run over serial and exit without starting
+    // the daemon (--vault-enable / --vault-disable).
+    if cli.vault_enable || cli.vault_disable {
+        std::process::exit(run_vault_oneshot(&cli, &vault_key_path));
+    }
+
     let relay_list: Vec<String> = cli.relays.split(',')
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty())
@@ -511,6 +672,48 @@ async fn main() -> Result<()> {
             if let Some(ref secret) = bridge_secret {
                 if let Err(e) = authenticate_bridge(&mut port, secret) {
                     panic!("Session authentication failed: {e}");
+                }
+            }
+
+            // At-rest vault unlock: if the host holds a vault key, deliver it
+            // now so the device decrypts its seeds at boot without waiting for
+            // a Sapwood/PIN unlock. Failures never stop the daemon -- the
+            // device can be unlocked later via Sapwood or PIN.
+            match vault::load_vault_key(&vault_key_path) {
+                Ok(Some(mut key)) => {
+                    match send_frame_wait_ack(&mut port, FRAME_TYPE_VAULT_UNLOCK, &key, 10) {
+                        Ok(resp) if resp.frame_type == FRAME_TYPE_ACK => {
+                            log::info!("Vault unlock accepted -- device seeds decrypted");
+                        }
+                        Ok(resp) => {
+                            let reason = String::from_utf8_lossy(&resp.payload);
+                            let reason = reason.trim();
+                            if reason == "already unlocked" {
+                                log::debug!("Vault unlock skipped -- device already unlocked");
+                            } else {
+                                log::error!(
+                                    "VAULT KEY REJECTED{} -- device stays locked; check vault.key",
+                                    if reason.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" ({reason})")
+                                    }
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Vault unlock failed: {e} -- device stays locked; check vault.key"
+                            );
+                        }
+                    }
+                    key.zeroize();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log::error!(
+                        "Could not load vault key: {e} -- device stays locked; check vault.key"
+                    );
                 }
             }
 
@@ -659,6 +862,7 @@ async fn main() -> Result<()> {
         api_token: Some(Arc::new(api_token)),
         backup_path: std::path::PathBuf::from(&cli.data_dir).join("backup.json"),
         passphrase_path: std::path::PathBuf::from(&cli.data_dir).join("backup-passphrase.json"),
+        vault_key_path: vault_key_path.clone(),
     };
 
     // CORS is opt-in only: the API serves bearer-authenticated requests, and

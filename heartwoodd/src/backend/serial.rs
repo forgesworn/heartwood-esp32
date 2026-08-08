@@ -293,6 +293,37 @@ impl SerialBackend {
             }
         }
     }
+
+    /// Send a VAULT_SET frame and wait for ACK/NACK.
+    ///
+    /// `payload` is the 32-byte vault key (enable) or empty (disable). The
+    /// device holds a 30-second physical-approval window, hence the generous
+    /// timeout. A NACK carrying a text reason ("bridge auth required", ...)
+    /// surfaces as Internal so the API can return it verbatim; a bare NACK
+    /// means the button was not pressed (or the device refused) and maps to
+    /// UserCancelled.
+    fn vault_set(&self, payload: &[u8]) -> Result<(), BackendError> {
+        let frame_bytes = frame::build_frame(FRAME_TYPE_VAULT_SET, payload)
+            .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
+
+        let mut port = self.acquire()?;
+        let resp = self.send_and_receive(
+            &mut port,
+            &frame_bytes,
+            &[FRAME_TYPE_ACK, FRAME_TYPE_NACK],
+            60,
+        )?;
+
+        if resp.frame_type == FRAME_TYPE_NACK {
+            let reason = String::from_utf8_lossy(&resp.payload).trim().to_string();
+            return if reason.is_empty() {
+                Err(BackendError::UserCancelled)
+            } else {
+                Err(BackendError::Internal(format!("device rejected vault operation: {reason}")))
+            };
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +618,14 @@ impl SigningBackend for SerialBackend {
             return Err(BackendError::Denied);
         }
         Ok(())
+    }
+
+    fn vault_enable(&self, key: &[u8; 32]) -> Result<(), BackendError> {
+        self.vault_set(key)
+    }
+
+    fn vault_disable(&self) -> Result<(), BackendError> {
+        self.vault_set(&[])
     }
 
     // -- Backup/restore -------------------------------------------------------

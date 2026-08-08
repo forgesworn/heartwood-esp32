@@ -74,11 +74,20 @@ pub(crate) fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
 /// and checked against the original seed BEFORE the plaintext is dropped, so a
 /// bad blob can never lose the seed. The seeds stay usable in RAM this session;
 /// they load locked on the next boot.
+///
+/// Two-phase, because the S3 resets when a host reconnects the USB CDC: the
+/// slow PBKDF2 work happens entirely in phase 1 with storage untouched, and
+/// phase 2 is a fast commit of prepared blobs. A reset during phase 1 leaves
+/// the device fully plaintext; a reset during the (millisecond) phase 2 could
+/// still tear per-slot, but every committed blob decrypts under the same key,
+/// so re-running the operation converges — observed in the field 2026-08-08
+/// (slot 0 sealed, slots 1–2 plaintext after a mid-enable reset).
 fn enable_encryption(
     nvs: &mut EspNvs<NvsDefault>,
     masters: &[LoadedMaster],
     pin: &[u8],
 ) -> Result<(), &'static str> {
+    let mut prepared: Vec<(u8, Vec<u8>)> = Vec::new();
     for m in masters.iter() {
         if m.locked {
             continue; // already encrypted (defensive)
@@ -93,7 +102,10 @@ fn enable_encryption(
             Ok(check) if check == m.secret => {}
             _ => return Err("encrypt self-check failed"),
         }
-        masters::store_secret_enc(nvs, m.slot, &blob)?;
+        prepared.push((m.slot, blob));
+    }
+    for (slot, blob) in prepared {
+        masters::store_secret_enc(nvs, slot, &blob)?;
     }
     Ok(())
 }

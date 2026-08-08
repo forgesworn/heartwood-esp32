@@ -1480,23 +1480,20 @@ fn hex_decode_32(hex: &str) -> Option<[u8; 32]> {
     Some(bytes)
 }
 
-/// Generate a random 32-byte nonce using the ESP32 hardware RNG.
-/// Used as the NIP-44 per-message nonce.
+/// Generate a random 32-byte nonce. Used as the NIP-44 per-message nonce —
+/// routed through `fill_random` so the radio-off USB tier still gets a true
+/// entropy source.
 fn random_nonce_32() -> [u8; 32] {
     let mut nonce = [0u8; 32];
-    unsafe {
-        esp_idf_svc::sys::esp_fill_random(nonce.as_mut_ptr() as *mut core::ffi::c_void, 32);
-    }
+    crate::fill_random(&mut nonce);
     nonce
 }
 
-/// Generate a random 16-byte IV using the ESP32 hardware RNG.
-/// Used as the per-message IV for NIP-04 encryption.
+/// Generate a random 16-byte IV for per-message NIP-04 encryption. Same
+/// entropy-source guarantee as `random_nonce_32`.
 fn random_iv_16() -> [u8; 16] {
     let mut iv = [0u8; 16];
-    unsafe {
-        esp_idf_svc::sys::esp_fill_random(iv.as_mut_ptr() as *mut core::ffi::c_void, 16);
-    }
+    crate::fill_random(&mut iv);
     iv
 }
 

@@ -33,14 +33,11 @@ pub fn is_locked(masters: &[LoadedMaster]) -> bool {
     masters.iter().any(|m| m.locked)
 }
 
-/// Fill a buffer with hardware RNG bytes for a salt/nonce. Plain
-/// `esp_fill_random` (a true RNG while the system runs, RF/SAR-ADC active) —
-/// matches the nonce generation elsewhere; the salt/nonce need uniqueness, not
-/// the pre-Wi-Fi bracket the seed draw uses.
+/// Fill a buffer with hardware RNG bytes for a salt/nonce, via the shared
+/// `fill_random` helper — guaranteed true entropy in both tiers (RF source
+/// when the radio is up, SAR-ADC bracket in the radio-off USB tier).
 fn fill_random(buf: &mut [u8]) {
-    unsafe {
-        esp_idf_svc::sys::esp_fill_random(buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len());
-    }
+    crate::fill_random(buf);
 }
 
 /// Read the persisted failed-attempt counter from NVS. Malformed/unreadable

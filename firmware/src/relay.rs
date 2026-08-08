@@ -603,6 +603,9 @@ pub fn run_wifi_standalone<'d, 'b>(
     }))
     .expect("relay: wifi config");
     wifi.start().expect("relay: wifi start");
+    // RF entropy source is live from here on — plain esp_fill_random (via
+    // crate::fill_random) is a true RNG again.
+    crate::set_radio_active();
 
     // All configured relays. The signer listens on one at a time and fails over
     // to the next on any disconnect, so a single dead or quiet relay never takes
@@ -3188,12 +3191,7 @@ fn dispatch_mgmt(
 
             // Slot secret from the hardware RNG (never leaves except in the URI).
             let mut secret_bytes = [0u8; 32];
-            unsafe {
-                esp_idf_svc::sys::esp_fill_random(
-                    secret_bytes.as_mut_ptr() as *mut core::ffi::c_void,
-                    32,
-                );
-            }
+            crate::fill_random(&mut secret_bytes);
             let secret_hex = hex_encode(&secret_bytes);
             secret_bytes.iter_mut().for_each(|b| *b = 0);
 
@@ -3442,12 +3440,7 @@ fn dispatch_mgmt(
             // A slot secret is still minted (bunker parity), even though this slot
             // is bound by pubkey rather than by a secret handshake.
             let mut secret_bytes = [0u8; 32];
-            unsafe {
-                esp_idf_svc::sys::esp_fill_random(
-                    secret_bytes.as_mut_ptr() as *mut core::ffi::c_void,
-                    32,
-                );
-            }
+            crate::fill_random(&mut secret_bytes);
             let slot_secret = hex_encode(&secret_bytes);
             secret_bytes.iter_mut().for_each(|b| *b = 0);
 
@@ -3547,12 +3540,7 @@ fn dispatch_mgmt(
 
             // Publish the connect ACK to the app, authored by this master.
             let mut id_bytes = [0u8; 8];
-            unsafe {
-                esp_idf_svc::sys::esp_fill_random(
-                    id_bytes.as_mut_ptr() as *mut core::ffi::c_void,
-                    8,
-                );
-            }
+            crate::fill_random(&mut id_bytes);
             let ack =
                 serde_json::json!({ "id": hex_encode(&id_bytes), "result": secret }).to_string();
             let joined_relay = dialled.is_some();
@@ -4197,12 +4185,10 @@ fn snippet(raw: &[u8], n: usize) -> String {
     String::from_utf8_lossy(&raw[..raw.len().min(n)]).into_owned()
 }
 
-/// 32-byte random NIP-44 nonce from the ESP-IDF hardware RNG.
+/// 32-byte random NIP-44 nonce via `fill_random` (true entropy in both tiers).
 fn random_nonce_32() -> [u8; 32] {
     let mut nonce = [0u8; 32];
-    unsafe {
-        esp_idf_svc::sys::esp_fill_random(nonce.as_mut_ptr() as *mut core::ffi::c_void, 32);
-    }
+    crate::fill_random(&mut nonce);
     nonce
 }
 

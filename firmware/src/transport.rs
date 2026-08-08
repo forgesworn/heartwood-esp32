@@ -361,16 +361,12 @@ pub fn handle_encrypted_request(
     crate::crash_crumb::clear();
 }
 
-/// Fill a 32-byte buffer with cryptographically random bytes from the ESP-IDF
-/// hardware RNG. Used as the NIP-44 per-message nonce.
+/// Fill a 32-byte buffer with cryptographically random bytes. Used as the
+/// NIP-44 per-message nonce — routed through `fill_random` so the radio-off
+/// USB tier still gets a true entropy source.
 fn random_nonce_32() -> [u8; 32] {
     let mut nonce = [0u8; 32];
-    unsafe {
-        esp_idf_svc::sys::esp_fill_random(
-            nonce.as_mut_ptr() as *mut core::ffi::c_void,
-            32,
-        );
-    }
+    crate::fill_random(&mut nonce);
     nonce
 }
 

@@ -26,15 +26,13 @@ pub fn sign_hash(
     Ok(*sig.as_ref())
 }
 
-/// Generate 32 bytes of auxiliary randomness from the ESP32 hardware TRNG.
+/// Generate 32 bytes of auxiliary randomness for BIP-340 signing. Routed
+/// through `fill_random` so the radio-off USB tier still gets a true entropy
+/// source. (Even a weak aux draw could not break signing — RFC6979 keeps the
+/// nonce unique per key+message — but we guarantee real entropy anyway.)
 fn random_aux_rand() -> [u8; 32] {
     let mut buf = [0u8; 32];
-    unsafe {
-        esp_idf_svc::sys::esp_fill_random(
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-            buf.len(),
-        );
-    }
+    crate::fill_random(&mut buf);
     buf
 }
 

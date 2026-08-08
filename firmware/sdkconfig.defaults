@@ -15,6 +15,13 @@
 # Chip target -- both Heltec V3 and V4 use the ESP32-S3.
 CONFIG_IDF_TARGET="esp32s3"
 
+# Bootloader entropy: feed the RNG from hardware noise (SAR ADC) from first
+# boot. This is the ESP-IDF v5.x default, but we pin it explicitly: in the
+# radio-off USB tier esp_fill_random() would otherwise degrade to a PRNG
+# seeded only by whatever this option collected at boot, so a future IDF
+# default change must not be able to silently downgrade our nonce/IV draws.
+CONFIG_BOOTLOADER_RANDOM_ENABLE=y
+
 # PSRAM disabled -- not needed for signing, avoids mode mismatch.
 # The V4 has 2MB quad-SPI PSRAM, the V3 has none. We never allocate into
 # PSRAM so leaving it off keeps one build profile valid for both boards.

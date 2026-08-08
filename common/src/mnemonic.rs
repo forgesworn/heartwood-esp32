@@ -74,8 +74,10 @@ pub fn derive_root_secret(mnemonic: &str, passphrase: &str) -> Result<[u8; 32], 
 /// (128 bits → 12 words) or 32 bytes (256 bits → 24 words); any other length
 /// is rejected. The caller supplies stacked entropy (hardware RNG + any user
 /// sources, see `crate::entropy`) and zeroizes the root after storing it; the
-/// phrase is shown on the OLED and never leaves the device.
-pub fn generate(entropy: &[u8]) -> Result<(String, [u8; 32]), String> {
+/// phrase is shown on the OLED and never leaves the device. The phrase is
+/// returned in a `Zeroizing` wrapper: it fully determines the master key, so
+/// it must not linger in freed heap after the walkthrough.
+pub fn generate(entropy: &[u8]) -> Result<(Zeroizing<String>, [u8; 32]), String> {
     if entropy.len() != 16 && entropy.len() != 32 {
         return Err(format!(
             "entropy must be 16 or 32 bytes (12/24 words), got {}",
@@ -84,7 +86,7 @@ pub fn generate(entropy: &[u8]) -> Result<(String, [u8; 32]), String> {
     }
     let m = bip39::Mnemonic::from_entropy(entropy)
         .map_err(|_| "could not build mnemonic from entropy".to_string())?;
-    let phrase = m.to_string();
+    let phrase = Zeroizing::new(m.to_string());
     let root = derive_root_secret(&phrase, "")?;
     Ok((phrase, root))
 }
@@ -109,7 +111,7 @@ mod tests {
     #[test]
     fn generate_from_zero_entropy_matches_vector() {
         let (phrase, root) = generate(&[0u8; 16]).unwrap();
-        assert_eq!(phrase, ZERO_PHRASE);
+        assert_eq!(phrase.as_str(), ZERO_PHRASE);
         assert_eq!(hex_encode(&root), ZERO_ROOT_HEX);
     }
 

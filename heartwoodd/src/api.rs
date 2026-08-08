@@ -17,6 +17,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use zeroize::Zeroize;
 
 use crate::backend::{BackendError, SigningBackend, Tier};
 use crate::serial::RawSerial;
@@ -37,6 +38,8 @@ pub struct AppState {
     pub backup_path: std::path::PathBuf,
     /// Path to the passphrase file (e.g. /var/lib/heartwood/backup-passphrase.json).
     pub passphrase_path: std::path::PathBuf,
+    /// Path to the vault key file (e.g. /var/lib/heartwood/vault.key).
+    pub vault_key_path: std::path::PathBuf,
 }
 
 pub struct DaemonInfo {
@@ -433,6 +436,75 @@ async fn ota_upload(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Vault key (Hard mode at-rest encryption)
+// ---------------------------------------------------------------------------
+
+/// Protected: report whether the host holds a vault key file. Device-side
+/// locked state is not duplicated here -- Sapwood already sees it via the
+/// identities list (PROVISION_LIST rows carry "locked": true).
+async fn get_vault_status(State(state): State<AppState>) -> Response {
+    Json(serde_json::json!({
+        "key_present": state.vault_key_path.exists(),
+    }))
+    .into_response()
+}
+
+/// Protected: enable at-rest vault encryption on the device. Generates the
+/// vault key file lazily on first use, then sends VAULT_SET over serial. The
+/// device gates the change on a physical button press (up to 30s). Enabling
+/// on a device whose seeds are already PIN-encrypted replaces the wrap --
+/// that is intended.
+async fn post_vault_enable(State(state): State<AppState>) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut key = crate::vault::load_or_generate_vault_key(&state.vault_key_path)
+            .map_err(BackendError::Internal)?;
+        let result = state.backend.vault_enable(&key);
+        key.zeroize();
+        result
+    }).await.unwrap();
+
+    match result {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => backend_to_http(e),
+    }
+}
+
+/// Protected: disable at-rest vault encryption (VAULT_SET with empty payload),
+/// restoring plaintext seeds. Also button-gated on the device.
+async fn post_vault_disable(State(state): State<AppState>) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        state.backend.vault_disable()
+    }).await.unwrap();
+
+    match result {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => backend_to_http(e),
+    }
+}
+
+/// Protected: return the hex-encoded vault key so the operator can escrow it
+/// (password manager). Same bearer-token auth as the rest of the management
+/// API -- this endpoint hands out the credential that unlocks the device.
+async fn get_vault_export(State(state): State<AppState>) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut key = crate::vault::load_vault_key(&state.vault_key_path)
+            .map_err(BackendError::Internal)?
+            .ok_or_else(|| BackendError::Internal("no vault key stored".to_string()))?;
+        let hex = heartwood_common::hex::hex_encode(&key);
+        key.zeroize();
+        Ok::<_, BackendError>(hex)
+    }).await.unwrap();
+
+    match result {
+        Ok(hex) => Json(serde_json::json!({ "vault_key_hex": hex })).into_response(),
+        Err(BackendError::Internal(msg)) if msg == "no vault key stored" => {
+            api_err(StatusCode::NOT_FOUND, msg)
+        }
+        Err(e) => backend_to_http(e),
+    }
+}
+
 /// Protected: restart the daemon process (systemd will restart the service).
 async fn daemon_restart() -> Response {
     log::info!("Restart requested via API -- shutting down (systemd will restart)");
@@ -790,6 +862,10 @@ pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> 
         .route("/api/slots/{master}/{index}", put(update_slot).delete(delete_slot))
         .route("/api/slots/{master}/{index}/uri", get(get_slot_uri))
         .route("/api/device/factory-reset", post(factory_reset))
+        .route("/api/vault/status", get(get_vault_status))
+        .route("/api/vault/enable", post(post_vault_enable))
+        .route("/api/vault/disable", post(post_vault_disable))
+        .route("/api/vault/export", get(get_vault_export))
         .route("/api/device/ota", post(ota_upload))
         .route("/api/daemon/restart", post(daemon_restart))
         .route("/api/unlock", post(post_unlock))

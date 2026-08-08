@@ -193,4 +193,21 @@ mod tests {
         assert_eq!(decrypt_seed(PIN, &a).unwrap(), SEED);
         assert_eq!(decrypt_seed(PIN, &b).unwrap(), SEED);
     }
+
+    #[test]
+    fn vault_key_roundtrip() {
+        // The host-held vault key is a 32-byte binary secret fed through the
+        // same KDF/AEAD path as the ASCII PIN — pin length is not special-cased.
+        let vault_key = [0xA5u8; 32];
+        let blob = encrypt_seed(&vault_key, &SEED, &SALT, &NONCE);
+        assert_eq!(decrypt_seed(&vault_key, &blob).unwrap(), SEED);
+
+        // A one-bit-different vault key must fail the AEAD check.
+        let mut wrong = vault_key;
+        wrong[0] ^= 1;
+        assert_eq!(
+            decrypt_seed(&wrong, &blob),
+            Err(SeedCipherError::WrongPinOrTampered)
+        );
+    }
 }

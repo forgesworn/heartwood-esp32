@@ -207,13 +207,16 @@ the flasher, CI-built committed bins with SHA-256 verification at sync and
 fetch time). Cryptographically closing *that* would require secure boot, which
 is out of scope (below).
 
-## Threat: physical access (device lost / seized) — **NOT resisted (current gap)**
+## Threat: physical access (device lost / seized) — **resisted only when sealed at rest**
 
-This is the headline limitation. With flash encryption, NVS encryption and
-secure boot **all disabled** (see `sdkconfig.defaults`):
+This is the headline limitation of the default (unsealed) configuration. With
+flash encryption, NVS encryption and secure boot **all disabled** (see
+`sdkconfig.defaults`):
 
-- The **master seed is stored in plaintext** in NVS. Anyone with the device and
-  a USB cable can `esptool.py read_flash` and recover the 32-byte seed.
+- The **master seed is stored in plaintext** in NVS — unless the PIN or vault
+  key seal below is enabled, in which case flash yields only ciphertext.
+  Anyone with an *unsealed* device and a USB cable can `esptool.py read_flash`
+  and recover the 32-byte seed.
 - The **WiFi password and network transaction candidate are plaintext** in NVS.
   NIP-44 protects remote delivery, not storage on the ESP32.
 - **No secure boot** → arbitrary firmware can be flashed over the ROM bootloader,
@@ -221,10 +224,10 @@ secure boot **all disabled** (see `sdkconfig.defaults`):
 - The **boot PIN gates only the application's frame loop**, not the ROM
   bootloader or a raw flash read — it does not protect the seed at rest.
 
-**So in the current configuration, physical possession of the device equals full
+**So with an unsealed device, physical possession equals full
 compromise of every key on it.** For a shelf/server signer behind physical
-security this may be acceptable; for a device that travels, it is the gap between
-"a neat signer" and "a hardware wallet."
+security this may be acceptable; otherwise enable the PIN or the vault key —
+both below — so possession yields only ciphertext.
 
 ### Decision: eFuse-based hardening is out of scope
 
@@ -271,6 +274,51 @@ unrecoverable **by design** — the escape hatch is re-restoring the 12-word
 phrase on a wiped device, so a verified phrase backup is the prerequisite for
 enabling it. Full design + build notes:
 `docs/2026-07-02-pin-seed-encryption-design.md`.
+
+### Host-held vault key — encrypted at rest WITH unattended reboot (BUILT)
+
+The PIN's availability cost — "the device reboots while I am in another
+country and I cannot type the PIN" — is closed by splitting trust instead of
+deriving from a human secret. A **vault key** (32 random bytes, 256 bits) is
+generated and held by the host side — heartwoodd's data directory, or
+Sapwood's browser storage — and **never stored on the device**. The seeds are
+wrapped with exactly the same AEAD as the PIN path; only the wrapping secret
+changes hands:
+
+- **USB-bridged:** after bridge authentication, heartwoodd (or Sapwood over
+  WebSerial) sends a `VAULT_UNLOCK` frame (0x63) with the vault key. The
+  device unwraps into RAM and runs. A locked device answers `PROVISION_LIST`
+  with `locked: true` so hosts can show the state. Reboots self-serve.
+- **WiFi-standalone:** a locked device generates a **one-time unlock keypair
+  in RAM**, announces it over its relays (ephemeral kind 24135, p-tagged to
+  the operator) every 60 s, and Sapwood pushes the vault key back live
+  (ephemeral kind 24136, NIP-44 operator→unlock pubkey). Ephemeral kinds are
+  never stored by relays, so there is no standing ciphertext to scrape.
+- `VAULT_SET` (0x62) enables/disables the wrapping; it requires bridge
+  authentication **and** physical button confirmation, so a remote party can
+  never change the at-rest posture.
+
+Security properties and honest residuals:
+
+- Flash dump alone: ciphertext under a 256-bit key — unbruteforceable, unlike
+  a short PIN.
+- Pi/browser compromise alone: a vault key that decrypts nothing the host
+  possesses.
+- A wrong vault key is a plain NACK and deliberately does **not** feed the
+  PIN wipe counter (a buggy host must not be able to wipe the device).
+- The relay announcement is **not** device-authenticated (every attesting key
+  is locked). A fake announcement could phish a vault key from an inattentive
+  operator — but exploiting it still requires the physical flash. Sapwood
+  therefore never auto-sends; the operator taps, and only for a signer they
+  know rebooted.
+- Theft of device **and** host together collapses to the host-side store
+  (heartwoodd keyfile passphrase / browser storage) — keep those strong.
+- Escrow: Sapwood offers the vault key for export at setup (password manager,
+  safe), the analogue of writing down the recovery phrase. Losing every copy
+  of the vault key with no PIN set means the seeds are unrecoverable by
+  design — restore from the phrase.
+
+Design spec: `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`.
 
 ## What the design already gets right
 

@@ -303,11 +303,11 @@ pub fn handle_generate(
             // the caller from redrawing (or, for a wifi device, rebooting) until
             // they confirm with a hold. The phrase only ever appears here.
             walk_recovery_phrase(display, button_pin, &phrase);
-            drop(phrase);
+            drop(phrase); // Zeroizing: phrase bytes are wiped on drop
             Some(master)
         }
         Err(e) => {
-            drop(phrase);
+            drop(phrase); // Zeroizing: phrase bytes are wiped on drop
             log::error!("Generate-identity store failed: {e}");
             oled::show_error(display, "Generate failed");
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
@@ -876,6 +876,9 @@ pub fn handle_list(
                 "label": m.label,
                 "mode": m.mode as u8,
                 "npub": encode_npub(&m.pubkey),
+                // True while the seed is still encrypted at rest (pre-unlock).
+                // Hosts use this to show the "awaiting unlock" state.
+                "locked": m.locked,
             });
             // Per-identity app count, so managers can show a true total
             // instead of only the selected identity's table.

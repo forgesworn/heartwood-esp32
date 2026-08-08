@@ -221,6 +221,21 @@ pub trait SigningBackend: Send + Sync {
     /// Perform a factory reset, wiping all key material and NVS storage.
     fn factory_reset(&self) -> Result<(), BackendError>;
 
+    /// Enable at-rest vault encryption on the device: sends VAULT_SET with
+    /// the host-held 32-byte vault key, which re-encrypts every master seed
+    /// under it (replacing any existing PIN wrap). Hard mode only, and the
+    /// device gates the change on physical button confirmation (up to 30s).
+    fn vault_enable(&self, key: &[u8; 32]) -> Result<(), BackendError> {
+        let _ = key;
+        Err(BackendError::NotSupported)
+    }
+
+    /// Disable at-rest vault encryption: sends VAULT_SET with an empty
+    /// payload, restoring plaintext seeds. Also button-gated on the device.
+    fn vault_disable(&self) -> Result<(), BackendError> {
+        Err(BackendError::NotSupported)
+    }
+
     /// Upload new firmware bytes. Applies via serial OTA (Hard mode) or is
     /// not supported (Soft mode). `signature` is the ed25519 release
     /// signature (see heartwood-common's ota_sign) — required by

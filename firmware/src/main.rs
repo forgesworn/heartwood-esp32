@@ -101,7 +101,8 @@ use heartwood_common::types::{
     FRAME_TYPE_DERIVE_IDENTITY,
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
+    FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
+    FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_UPDATE,
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
     FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
@@ -510,13 +511,24 @@ fn main() {
         }
     }
 
-    // --- PIN lock ---
-    // If a PIN is set, the device stays locked until the correct PIN is
-    // provided via a PIN_UNLOCK frame. All other frames are rejected,
-    // except PROVISION_LIST which is safe (no secret material exposed).
-    if pin::is_locked(&loaded_masters) {
-        log::info!("PIN protection active — seeds encrypted, waiting for unlock");
-        oled::show_error(&mut display, "PIN locked\nAwait unlock...");
+    // --- PIN/vault lock ---
+    // If the seeds are encrypted at rest, the device stays locked until the
+    // correct PIN (PIN_UNLOCK) or host-held vault key (VAULT_UNLOCK, over an
+    // authenticated bridge session) is provided. All other frames are
+    // rejected, except PROVISION_LIST / FIRMWARE_INFO which are safe (no
+    // secret material exposed).
+    //
+    // A WiFi-standalone device with an operator configured skips this
+    // USB-only loop entirely: the relay path runs its own locked phase that
+    // serves the remote vault delivery AND the USB unlock frames.
+    let wifi_unlock_path = net_cfg.as_ref().is_some_and(|cfg| {
+        cfg.device_mode() == heartwood_common::net_config::DeviceMode::Wifi
+            && cfg.op_mgmt_pubkey().is_some()
+            && !cfg.relays.is_empty()
+    });
+    if pin::is_locked(&loaded_masters) && !wifi_unlock_path {
+        log::info!("At-rest encryption active — seeds encrypted, waiting for unlock");
+        oled::show_error(&mut display, "Locked\nAwait unlock...");
 
         // Load the persisted failed-attempt counter so the wipe threshold
         // survives power cycles (attacker cannot reset by rebooting).
@@ -536,6 +548,9 @@ fn main() {
         if failed_attempts > 0 {
             log::warn!("PIN: {} failed attempt(s) carried over from previous boot", failed_attempts);
         }
+        // Vault unlock requires bridge authentication, but the policy engine
+        // does not exist yet in the locked loop — track it locally.
+        let mut vault_authed = false;
         loop {
             let frame = protocol::read_frame(&mut usb);
             match frame.frame_type {
@@ -546,6 +561,37 @@ fn main() {
                         &mut nvs,
                         &mut loaded_masters,
                         &mut failed_attempts,
+                        &mut display,
+                    ) {
+                        break; // Unlocked — seeds now in RAM, continue boot.
+                    }
+                }
+                FRAME_TYPE_SESSION_AUTH => {
+                    match session::verify_bridge_secret(&frame.payload, &nvs) {
+                        Some(true) => {
+                            vault_authed = true;
+                            protocol::write_frame(&mut usb, FRAME_TYPE_SESSION_ACK, &[0x00]);
+                        }
+                        Some(false) => {
+                            vault_authed = false;
+                            protocol::write_frame(&mut usb, FRAME_TYPE_SESSION_ACK, &[0x01]);
+                        }
+                        None => {
+                            protocol::write_frame(&mut usb, FRAME_TYPE_SESSION_ACK, &[0x02]);
+                        }
+                    }
+                }
+                FRAME_TYPE_VAULT_UNLOCK => {
+                    if !vault_authed {
+                        log::warn!("VAULT_UNLOCK rejected — bridge not authenticated");
+                        protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"bridge auth required");
+                        continue;
+                    }
+                    if pin::handle_vault_unlock(
+                        &mut usb,
+                        &frame.payload,
+                        &mut nvs,
+                        &mut loaded_masters,
                         &mut display,
                     ) {
                         break; // Unlocked — seeds now in RAM, continue boot.
@@ -636,7 +682,7 @@ fn main() {
             relay::run_wifi_standalone(
                 modem,
                 cfg,
-                &loaded_masters,
+                &mut loaded_masters,
                 &mut loaded_personas,
                 &secp,
                 &mut display,
@@ -962,6 +1008,26 @@ fn main() {
                     &mut display,
                     &button_pin,
                 );
+            }
+
+            // 0x62 — set/clear the host-held vault key (re-wraps the seeds)
+            FRAME_TYPE_VAULT_SET => {
+                pin::handle_vault_set(
+                    &mut usb,
+                    &frame.payload,
+                    &mut nvs,
+                    &loaded_masters,
+                    policy_engine.bridge_authenticated,
+                    &mut display,
+                    &button_pin,
+                );
+            }
+
+            // 0x63 — vault unlock in the main loop is a no-op (the device is
+            // already unlocked to be here); NACK so host bugs are visible.
+            FRAME_TYPE_VAULT_UNLOCK => {
+                log::warn!("VAULT_UNLOCK received while already unlocked");
+                protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"already unlocked");
             }
 
             // 0x40 -- create a connection slot

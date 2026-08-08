@@ -72,8 +72,9 @@ use heartwood_common::types::{
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_PROVISION,
     FRAME_TYPE_DERIVE_IDENTITY,
     FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_RESTORE_IDENTITY,
-    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
+    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
     FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN,
+    FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_VAULT_UNLOCK,
     FRAME_TYPE_SIGN_ENVELOPE, FRAME_TYPE_WIFI_SCAN_REQUEST,
 };
 
@@ -547,7 +548,7 @@ fn prune_pinned(
 pub fn run_wifi_standalone<'d, 'b>(
     modem: Modem,
     cfg: &NetConfig,
-    masters: &[LoadedMaster],
+    masters: &mut [LoadedMaster],
     personas: &mut Vec<crate::personas::LoadedPersona>,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'d>,
@@ -618,6 +619,19 @@ pub fn run_wifi_standalone<'d, 'b>(
         .filter(|r| !r.is_empty())
         .collect();
     let mut relay_idx = 0usize;
+
+    // Locked at rest (PIN/vault encryption)? The full signer cannot run — its
+    // subscription and every decrypt need the seeds. Serve only the vault
+    // delivery channel (plus USB PIN/vault unlock) until they are decrypted,
+    // then fall through to the normal boot below with the radio already up.
+    if crate::pin::is_locked(masters) {
+        if let Some(op) = &op_mgmt {
+            if !relays.is_empty() {
+                log::info!("[relay] seeds locked — entering vault-unlock phase");
+                locked_relay_phase(&relays, op, secp, masters, nvs, usb, display);
+            }
+        }
+    }
 
     let network_trial_deadline = network_trial_id
         .as_ref()
@@ -1145,6 +1159,38 @@ fn build_sub_req(ctx: &SignCtx) -> String {
 
 /// Open one relay session: TLS → WS handshake → recv timeout → subscribe.
 fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySession, String> {
+    let sub_req = build_sub_req(ctx);
+    // A session without the recv timeout would starve its peers, so a pinned
+    // dial (or a network trial, whose rollback deadline must stay live)
+    // refuses to run degraded.
+    let require_recv_timeout = pinned || ctx.network_trial_id.is_some();
+    connect_relay_raw(url, sub_req, pinned, require_recv_timeout).map_err(|e| {
+        if e == RECV_TIMEOUT_REQUIRED && require_recv_timeout {
+            if pinned {
+                "pinned relay needs a recv timeout (would starve the primary)".into()
+            } else {
+                "network trial needs a recv timeout (rollback deadline must remain live)".into()
+            }
+        } else {
+            e
+        }
+    })
+}
+
+/// Sentinel error: the relay socket could not be given a recv timeout and the
+/// caller required one (see [`connect_relay_raw`]).
+const RECV_TIMEOUT_REQUIRED: &str = "recv-timeout required";
+
+/// Open one relay session against a caller-supplied subscription. Split from
+/// [`connect_relay`] so the locked-boot vault phase can subscribe for vault
+/// deliveries without a full SignCtx. When `require_recv_timeout` is set and
+/// the socket refuses one, fails with [`RECV_TIMEOUT_REQUIRED`].
+fn connect_relay_raw(
+    url: &str,
+    sub_req: String,
+    pinned: bool,
+    require_recv_timeout: bool,
+) -> Result<RelaySession, String> {
     let host = relay_host(url).to_string();
     // Rolling activity marker over the TLS handshake — the other place a
     // panic could strike (cert/allocation) with no request in flight.
@@ -1192,12 +1238,8 @@ fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySess
             false
         }
     };
-    if !recv_timeout_on && (pinned || ctx.network_trial_id.is_some()) {
-        return Err(if pinned {
-            "pinned relay needs a recv timeout (would starve the primary)".into()
-        } else {
-            "network trial needs a recv timeout (rollback deadline must remain live)".into()
-        });
+    if !recv_timeout_on && require_recv_timeout {
+        return Err(RECV_TIMEOUT_REQUIRED.into());
     }
 
     // A send timeout bounds how long a publish to a stalled peer can hold the
@@ -1208,14 +1250,8 @@ fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySess
         log::warn!("[relay] send-timeout unavailable ({e}); blocking sends");
     }
 
-    let sub_req = build_sub_req(ctx);
     ws_send(&mut tls, OP_TEXT, sub_req.as_bytes())?;
-    log::info!(
-        "[relay] subscribed on {url}: {} master(s) + {} persona(s), mgmt={}",
-        ctx.masters.len(),
-        ctx.personas.len(),
-        if ctx.op_mgmt.is_some() { "on" } else { "off" }
-    );
+    log::info!("[relay] subscribed on {url}");
 
     let now = Instant::now();
     Ok(RelaySession {
@@ -1230,6 +1266,301 @@ fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySess
         pinned,
         skip: 0,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Locked-boot vault phase (WiFi-standalone)
+// ---------------------------------------------------------------------------
+
+/// Ephemeral kind: locked-signer boot announcement, device → operator. Signed
+/// by the one-time unlock keypair; content is unauthenticated metadata only.
+pub const LOCKED_ANNOUNCE_KIND: u64 = 24135;
+/// Ephemeral kind: vault-key delivery, operator → one-time unlock pubkey.
+/// Content is NIP-44(operator → unlock_pk) of the 64-char hex vault key.
+pub const VAULT_DELIVERY_KIND: u64 = 24136;
+/// How often a locked signer re-announces. Ephemeral events are not stored,
+/// so an operator who opens Sapwood after the boot must still hear it.
+const LOCKED_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Publish the locked-boot announcement: a one-time unlock pubkey the
+/// operator's Sapwood can encrypt the vault key to. See the security notes on
+/// [`locked_relay_phase`].
+fn publish_locked_announce(
+    tls: &mut Tls,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    unlock_sk: &[u8; 32],
+    unlock_pk_hex: &str,
+    op_mgmt: &[u8; 32],
+) -> Result<(), String> {
+    let unsigned = UnsignedEvent {
+        pubkey: unlock_pk_hex.to_string(),
+        // No wall clock on the signer; ephemeral events are never stored, so
+        // relays do not age-filter them. Seconds-since-boot is fine here.
+        created_at: (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u64,
+        kind: LOCKED_ANNOUNCE_KIND,
+        tags: vec![vec!["p".to_string(), hex_encode(op_mgmt)]],
+        content: "{\"status\":\"locked\"}".to_string(),
+    };
+    let event_id = nip46::compute_event_id(&unsigned);
+    let sig = sign::sign_hash(secp, unlock_sk, &event_id).map_err(|e| format!("sign: {e}"))?;
+    let signed = SignedEvent {
+        id: hex_encode(&event_id),
+        pubkey: unsigned.pubkey,
+        created_at: unsigned.created_at,
+        kind: unsigned.kind,
+        tags: unsigned.tags,
+        content: unsigned.content,
+        sig: hex_encode(&sig),
+    };
+    ws_send_event(tls, &signed)?;
+    log::info!("[relay] locked: announced unlock pubkey {}…", &unlock_pk_hex[..16]);
+    Ok(())
+}
+
+/// Serve the relays while the seeds are locked: announce the one-time unlock
+/// pubkey, wait for the operator's vault-key delivery, and keep the USB cable
+/// live for PIN/vault unlock. Returns once the seeds are decrypted in RAM.
+///
+/// Security notes (docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md):
+/// - The unlock keypair is generated fresh each locked boot and lives only in
+///   RAM — a flash dump yields no unlock capability.
+/// - Delivery is a live push to an ephemeral kind addressed to the one-time
+///   pubkey; relays never store it, so there is no standing ciphertext to
+///   scrape.
+/// - The announcement is NOT authenticated (it cannot be — every attesting
+///   key is locked). A fake announcement could phish a vault key out of an
+///   inattentive operator, but exploiting it still requires the physical
+///   flash. Sapwood therefore never auto-sends: the operator taps, and the UI
+///   tells them to unlock only a signer they know rebooted.
+#[allow(clippy::too_many_arguments)]
+fn locked_relay_phase(
+    relays: &[String],
+    op_mgmt: &[u8; 32],
+    secp: &Arc<Secp256k1<SignOnly>>,
+    masters: &mut [LoadedMaster],
+    nvs: &mut EspNvs<NvsDefault>,
+    usb: &mut SerialPort<'_>,
+    display: &mut Display<'_>,
+) {
+    // One-time unlock keypair, RAM only. Loop in the (astronomically
+    // unlikely) case the draw is not a valid scalar.
+    let mut unlock_sk = [0u8; 32];
+    let unlock_pk = loop {
+        crate::fill_random(&mut unlock_sk);
+        if let Ok(kp) = Keypair::from_seckey_slice(secp, &unlock_sk) {
+            break kp.x_only_public_key().0.serialize();
+        }
+    };
+    let unlock_pk_hex = hex_encode(&unlock_pk);
+    crate::oled::show_error(display, "Locked\nAwait unlock...");
+
+    let sub_req = format!(
+        r##"["REQ","locked",{{"kinds":[{VAULT_DELIVERY_KIND}],"#p":["{unlock_pk_hex}"],"limit":0}}]"##
+    );
+
+    // PIN state for the USB path mirrors the main locked loop exactly.
+    let mut failed_attempts: u8 = match crate::pin::read_failed_attempts(nvs) {
+        Ok(count) => count,
+        Err(e) => {
+            log::error!("PIN-attempt state invalid ({e}) — wiping fail-closed");
+            crate::pin::wipe_and_reboot(usb, display);
+        }
+    };
+    if failed_attempts >= crate::pin::MAX_FAILED_ATTEMPTS {
+        log::error!("PIN wipe threshold persisted across reboot — completing wipe");
+        crate::pin::wipe_and_reboot(usb, display);
+    }
+    let mut vault_authed = false;
+
+    let mut relay_idx = 0usize;
+    let mut session: Option<RelaySession> = None;
+    let mut next_announce = Instant::now();
+
+    loop {
+        // (Re)connect round-robin until a relay holds.
+        if session.is_none() {
+            match connect_relay_raw(&relays[relay_idx], sub_req.clone(), false, true) {
+                Ok(s) => {
+                    log::info!("[relay] locked: connected {}", relays[relay_idx]);
+                    session = Some(s);
+                    // Announce immediately on every (re)connect.
+                    next_announce = Instant::now();
+                }
+                Err(e) => {
+                    log::warn!("[relay] locked: connect {} failed: {e}", relays[relay_idx]);
+                    relay_idx = (relay_idx + 1) % relays.len();
+                    FreeRtos::delay_ms(1000);
+                }
+            }
+        }
+
+        if let Some(s) = session.as_mut() {
+            // Periodic boot announcement.
+            if Instant::now() >= next_announce {
+                if let Err(e) =
+                    publish_locked_announce(&mut s.tls, secp, &unlock_sk, &unlock_pk_hex, op_mgmt)
+                {
+                    log::warn!("[relay] locked: announce failed: {e}");
+                    session = None;
+                    continue;
+                }
+                next_announce = Instant::now() + LOCKED_ANNOUNCE_INTERVAL;
+            }
+
+            // Drain one buffered frame, else one read (recv-timeout paced).
+            match try_parse(&mut s.rx, &mut s.skip) {
+                Ok(Some(WsMsg::Text(raw))) => {
+                    s.last_rx = Instant::now();
+                    if nip46::relay_message_tag(&raw) == Some("EVENT") {
+                        if let Ok(msg) =
+                            serde_json::from_slice::<nip46::RelayEventMessage>(&raw)
+                        {
+                            let ev = &msg.2;
+                            if ev.kind == VAULT_DELIVERY_KIND
+                                && handle_vault_delivery(ev, &unlock_sk, op_mgmt, nvs, masters)
+                            {
+                                unlock_sk.iter_mut().for_each(|b| *b = 0);
+                                crate::oled::show_error(display, "Unlocked!");
+                                FreeRtos::delay_ms(500);
+                                return;
+                            }
+                        }
+                    }
+                }
+                Ok(Some(WsMsg::Ping(p))) => {
+                    if ws_send(&mut s.tls, OP_PONG, &p).is_err() {
+                        session = None;
+                        continue;
+                    }
+                }
+                Ok(Some(WsMsg::Close)) => {
+                    session = None;
+                    continue;
+                }
+                Ok(Some(WsMsg::Pong)) | Ok(Some(WsMsg::Other)) => {}
+                Ok(None) => match pump(&mut s.tls, &mut s.rx) {
+                    Ok(n) if n > 0 => s.last_rx = Instant::now(),
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("[relay] locked: read failed: {e}");
+                        session = None;
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    log::warn!("[relay] locked: frame parse failed: {e}");
+                    session = None;
+                    continue;
+                }
+            }
+        }
+
+        // USB stays live while locked over relay: PIN or vault unlock locally.
+        if let Some(frame) = crate::protocol::try_read_frame(usb, 0) {
+            match frame.frame_type {
+                FRAME_TYPE_PIN_UNLOCK => {
+                    if crate::pin::handle_pin_unlock(
+                        usb,
+                        &frame.payload,
+                        nvs,
+                        masters,
+                        &mut failed_attempts,
+                        display,
+                    ) {
+                        unlock_sk.iter_mut().for_each(|b| *b = 0);
+                        return;
+                    }
+                }
+                FRAME_TYPE_SESSION_AUTH => {
+                    match crate::session::verify_bridge_secret(&frame.payload, nvs) {
+                        Some(true) => {
+                            vault_authed = true;
+                            crate::protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x00]);
+                        }
+                        Some(false) => {
+                            vault_authed = false;
+                            crate::protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x01]);
+                        }
+                        None => {
+                            crate::protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x02]);
+                        }
+                    }
+                }
+                FRAME_TYPE_VAULT_UNLOCK => {
+                    if !vault_authed {
+                        crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
+                    } else if crate::pin::handle_vault_unlock(
+                        usb,
+                        &frame.payload,
+                        nvs,
+                        masters,
+                        display,
+                    ) {
+                        unlock_sk.iter_mut().for_each(|b| *b = 0);
+                        return;
+                    }
+                }
+                FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
+                    usb,
+                    FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
+                    crate::firmware_info_json().as_bytes(),
+                ),
+                _ => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]),
+            }
+        }
+
+        FreeRtos::delay_ms(10);
+    }
+}
+
+/// Handle one vault-delivery event. The event must be authored by the
+/// operator and p-tagged to our one-time unlock pubkey (the subscription
+/// already filters the tag; re-check both regardless — relays are not
+/// trusted). Content decrypts with the operator⇄unlock conversation key to
+/// the 64-char hex vault key. Returns true when the seeds unlocked.
+fn handle_vault_delivery(
+    ev: &SignedEvent,
+    unlock_sk: &[u8; 32],
+    op_mgmt: &[u8; 32],
+    nvs: &mut EspNvs<NvsDefault>,
+    masters: &mut [LoadedMaster],
+) -> bool {
+    if hex_decode(&ev.pubkey).ok().and_then(|v| v.try_into().ok())
+        != Some(*op_mgmt)
+    {
+        log::warn!("[relay] vault delivery from non-operator {}; ignoring", &ev.pubkey[..16.min(ev.pubkey.len())]);
+        return false;
+    }
+    let conversation_key = match nip44::get_conversation_key(unlock_sk, op_mgmt) {
+        Ok(ck) => ck,
+        Err(e) => {
+            log::warn!("[relay] vault delivery conversation key failed: {e}");
+            return false;
+        }
+    };
+    let plaintext = match nip44::decrypt(&conversation_key, &ev.content) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("[relay] vault delivery decrypt failed: {e}");
+            return false;
+        }
+    };
+    let mut vault_key: [u8; 32] = match hex_decode(&plaintext).ok().and_then(|v| v.try_into().ok()) {
+        Some(k) => k,
+        None => {
+            log::warn!("[relay] vault delivery payload not 64-char hex");
+            return false;
+        }
+    };
+    let ok = crate::pin::try_unlock(nvs, masters, &vault_key);
+    vault_key.iter_mut().for_each(|b| *b = 0);
+    if ok {
+        log::info!("[relay] vault key accepted — device unlocked");
+        crate::pin::clear_failed_attempts(nvs);
+    } else {
+        log::warn!("[relay] vault key rejected (AEAD check failed)");
+    }
+    ok
 }
 
 /// One pump pass over a session: drain buffered frames, one read, idle tick.
@@ -3189,6 +3520,13 @@ fn dispatch_mgmt(
                 .unwrap_or("relay-client")
                 .to_string();
 
+            // Fresh secrets need fresh entropy — fail closed like the USB
+            // connslot path if the boot-time RNG self-test didn't pass.
+            if !crate::entropy::rng_ok() {
+                log::error!("[relay] mgmt: create_client refused: RNG self-test failed this boot");
+                return Err("RNG self-test failed this boot — refusing to mint secrets".into());
+            }
+
             // Slot secret from the hardware RNG (never leaves except in the URI).
             let mut secret_bytes = [0u8; 32];
             crate::fill_random(&mut secret_bytes);
@@ -3436,6 +3774,13 @@ fn dispatch_mgmt(
             // No fallible key operation may strand an orphan authority change.
             let ck = nip44::get_conversation_key(&master_secret, &client_bytes)
                 .map_err(|e| format!("conversation key: {e}"))?;
+
+            // Fresh secrets need fresh entropy — fail closed like the USB
+            // connslot path if the boot-time RNG self-test didn't pass.
+            if !crate::entropy::rng_ok() {
+                log::error!("[relay] nostrconnect refused: RNG self-test failed this boot");
+                return Err("RNG self-test failed this boot — refusing to mint secrets".into());
+            }
 
             // A slot secret is still minted (bunker parity), even though this slot
             // is bound by pubkey rather than by a secret handshake.

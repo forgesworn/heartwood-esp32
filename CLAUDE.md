@@ -26,6 +26,8 @@ Heartwood Soft mode: `heartwoodd` runs standalone on a Pi with no ESP32. Keys en
 
 Encrypted backup/restore of connection slots and policies via Sapwood -- auto-snapshots after slot changes, manual export/import, Argon2id + XChaCha20-Poly1305 encrypted backup file, physical button confirmation on restore. Dedicated backup passphrase (default "heartwood", changeable via Sapwood). Works in both Hard and Soft modes.
 
+Encrypted at rest on-device (opt-in): either a human PIN (P5, wipes after 5 failures) or a host-held 32-byte vault key (VAULT_SET 0x62 / VAULT_UNLOCK 0x63) that heartwoodd or Sapwood delivers — unattended reboot with ciphertext on flash. WiFi-standalone locked devices announce a per-boot ephemeral unlock pubkey (kind 24135) and receive the vault key live from the operator (kind 24136). Spec: docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md.
+
 Next: end-to-end Soft mode testing (unlock, create master, pair Bark, sign). Production hardening (JTAG disable, watchdog). Sapwood UI for tier badge, unlock form, approval queue, backup export/import.
 
 ## Build & flash

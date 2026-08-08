@@ -40,9 +40,6 @@ pub const DEFAULT_M_COST: u32 = 65_536; // 64 MiB
 pub const DEFAULT_T_COST: u32 = 3;
 pub const DEFAULT_P_COST: u32 = 1;
 
-/// Default backup passphrase used when no passphrase file exists yet.
-const DEFAULT_PASSPHRASE: &str = "heartwood";
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -216,14 +213,17 @@ fn passphrase_wrapping_key(api_token: &str) -> Zeroizing<[u8; 32]> {
 
 /// Read the backup passphrase from `path`.
 ///
-/// If the file does not exist, creates it with `DEFAULT_PASSPHRASE` encrypted
-/// under `api_token` and returns `DEFAULT_PASSPHRASE`. If the file exists,
-/// decrypts and returns the stored passphrase.
+/// Fails closed when no passphrase file exists: backups encrypt the bridge
+/// secret and every connection-slot secret, so we never fall back to a
+/// publicly known default passphrase. The operator must set one explicitly
+/// first (PUT /api/backup/passphrase, no old passphrase required on initial
+/// set). If the file exists, decrypts and returns the stored passphrase.
 pub fn read_passphrase(path: &Path, api_token: &str) -> Result<String, String> {
     if !path.exists() {
-        // First run -- create with default passphrase.
-        write_passphrase(path, DEFAULT_PASSPHRASE, api_token)?;
-        return Ok(DEFAULT_PASSPHRASE.to_string());
+        return Err(
+            "no backup passphrase set — set one via PUT /api/backup/passphrase before creating backups"
+                .to_string(),
+        );
     }
 
     let data = fs::read_to_string(path)
@@ -437,18 +437,21 @@ mod tests {
     }
 
     #[test]
-    fn passphrase_default_on_missing() {
+    fn passphrase_missing_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backup-passphrase.json");
 
         // File does not exist yet.
         assert!(!path.exists());
 
-        let result = read_passphrase(&path, "any-token").unwrap();
+        let err = read_passphrase(&path, "any-token").unwrap_err();
 
-        // Returns the default and creates the file.
-        assert_eq!(result, DEFAULT_PASSPHRASE);
-        assert!(path.exists());
+        // No default passphrase, and no file is created.
+        assert!(
+            err.contains("no backup passphrase set"),
+            "expected 'no backup passphrase set' in error, got: {err}"
+        );
+        assert!(!path.exists());
     }
 
     #[test]

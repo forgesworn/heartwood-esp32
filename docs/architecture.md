@@ -197,15 +197,15 @@ Sapwood is a Svelte SPA the bridge serves at `/` from its own HTTP port 3100, al
 flowchart LR
     Browser["Browser<br/>(any network)"]
     Bridge["Bridge HTTP<br/>:3100"]
-    Static["/ -- index.html<br/>with API token<br/>injected into meta"]
-    API["/api/* -- Bearer token required<br/>(except /api/bridge/info)"]
+    Static["/ -- static Sapwood<br/>(index.html, assets)"]
+    API["/api/* -- Bearer token required<br/>(except /api/info)"]
     HSM["HSM via USB serial"]
 
     Browser --> Bridge
     Bridge --> Static
     Bridge --> API
     API --> HSM
-    Static -.->|"JS reads token<br/>from meta tag"| API
+    Static -.->|"operator enters token once;<br/>stored in localStorage"| API
 
     style Bridge fill:#0f1419,stroke:#3b82f6,color:#e8f4f8
     style HSM fill:#1a1a2e,stroke:#16a34a,color:#e8f4f8
@@ -213,7 +213,7 @@ flowchart LR
 
 Two delivery paths for Sapwood:
 
-- **Served from the bridge** (what you get at `http://mypi.local:3100/`). Same-origin, zero friction. The bridge templates the API token into a `<meta name="heartwood-api-token">` tag in `index.html` at serve time, and Sapwood's `http.ts` reads it and sends it on every protected request. No manual token entry.
+- **Served from the bridge** (what you get at `http://mypi.local:3100/`). Same-origin, so no CORS. Auth is always on: if `HEARTWOOD_API_TOKEN`/`--api-token` is not set, the bridge generates a per-install token at `<data-dir>/api-token` (mode 0600) on first boot. The token is never templated into the served page (that let any unauthenticated LAN client extract it from `/`); Sapwood shows a token-entry prompt on the first 401, the operator pastes the token once, and it persists in localStorage.
 - **Served from GitHub Pages** (`forgesworn.github.io/sapwood`, no bridge in the picture). Used for the initial-setup Web Serial flow where the browser talks to the HSM directly over USB. The meta tag placeholder stays literal, `http.ts` detects that and sends no auth header.
 - **Connected to a WiFi signer by address** (including from a phone in another country). Sapwood signs encrypted kind-24134 requests with the provisioned operator key and exchanges them through the signer's configured relays. Client policy and staged network mutations are remote; seed/PIN/trust-root changes, factory reset, and OTA are not.
 

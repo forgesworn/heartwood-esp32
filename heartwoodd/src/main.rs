@@ -76,7 +76,9 @@ struct Cli {
     #[arg(long)]
     sapwood_dir: Option<String>,
 
-    /// Enable CORS headers on API responses (auto-enabled when --sapwood-dir is not set)
+    /// Enable CORS headers on API responses. Off by default: Sapwood is
+    /// served same-origin via --sapwood-dir, and permissive CORS would let
+    /// any web page a LAN user visits drive the API from their browser.
     #[arg(long)]
     cors: bool,
 
@@ -418,6 +420,46 @@ fn build_client_labels(
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Load the per-install API token from `<data_dir>/api-token`, generating one
+/// (32 random bytes, hex-encoded, file mode 0600) on first boot. This keeps
+/// API auth mandatory even when no --api-token / HEARTWOOD_API_TOKEN is given.
+fn load_or_generate_api_token(data_dir: &str) -> Result<String, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = std::path::Path::new(data_dir).join("api-token");
+
+    if path.exists() {
+        let token = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let token = token.trim().to_string();
+        if token.len() < 32 {
+            return Err(format!(
+                "{}: token too short ({} chars) -- delete the file to regenerate",
+                path.display(),
+                token.len()
+            ));
+        }
+        return Ok(token);
+    }
+
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| format!("getrandom api token: {e}"))?;
+    let token = hex_encode(&bytes);
+
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("create {data_dir}: {e}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    file.write_all(token.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+
+    Ok(token)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -588,11 +630,21 @@ async fn main() -> Result<()> {
         }
     };
 
-    // API token logging.
+    // API token: explicit flag/env wins. Otherwise load the per-install token
+    // from <data_dir>/api-token, generating one on first boot -- auth is never
+    // silently disabled (an open API lets any LAN client factory-reset the
+    // signer or export backups).
+    let api_token = match cli.api_token.clone() {
+        Some(token) => token,
+        None => load_or_generate_api_token(&cli.data_dir)?,
+    };
     if cli.api_token.is_some() {
         log::info!("API token auth ENABLED -- /api/* routes (except /api/info) require Bearer token");
     } else {
-        log::warn!("API token auth DISABLED -- any LAN client can hit /api/device/factory-reset. Set HEARTWOOD_API_TOKEN to enable.");
+        log::info!(
+            "API token auth ENABLED -- generated/stored at {}/api-token (mode 0600); enter it in Sapwood when prompted",
+            cli.data_dir
+        );
     }
 
     // Build AppState and spawn the management API.
@@ -604,12 +656,16 @@ async fn main() -> Result<()> {
             start_time: std::time::Instant::now(),
         }),
         log_tx: log_tx.clone(),
-        api_token: cli.api_token.clone().map(Arc::new),
+        api_token: Some(Arc::new(api_token)),
         backup_path: std::path::PathBuf::from(&cli.data_dir).join("backup.json"),
         passphrase_path: std::path::PathBuf::from(&cli.data_dir).join("backup-passphrase.json"),
     };
 
-    let enable_cors = cli.cors || cli.sapwood_dir.is_none();
+    // CORS is opt-in only: the API serves bearer-authenticated requests, and
+    // allowing any origin would let any web page a LAN user visits drive the
+    // API from their browser. Sapwood is served same-origin via --sapwood-dir,
+    // so it needs no CORS.
+    let enable_cors = cli.cors;
     let api_router = api::router(app_state, cli.sapwood_dir.as_deref(), enable_cors);
     let api_port = cli.api_port;
 

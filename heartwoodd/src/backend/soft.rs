@@ -80,6 +80,9 @@ pub struct SoftBackend {
     data_dir: PathBuf,
     state: RwLock<Option<UnlockedState>>,
     approvals: RwLock<HashMap<String, PendingApproval>>,
+    /// Hands approved-response envelopes (signed kind:24133 JSON) to the relay
+    /// publisher task in main. Set once at startup via `set_response_sender`.
+    response_tx: RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
 }
 
 impl SoftBackend {
@@ -92,7 +95,15 @@ impl SoftBackend {
             data_dir,
             state: RwLock::new(None),
             approvals: RwLock::new(HashMap::new()),
+            response_tx: RwLock::new(None),
         }
+    }
+
+    /// Wire the channel that carries approved-response envelopes to the relay
+    /// publisher. Called once from main before the backend is shared.
+    pub fn set_response_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        let mut guard = self.response_tx.write().expect("response_tx lock poisoned");
+        *guard = Some(tx);
     }
 
     // -- Private helpers -----------------------------------------------------
@@ -464,281 +475,17 @@ impl SigningBackend for SoftBackend {
         created_at: u64,
         ciphertext: &str,
     ) -> Result<String, BackendError> {
-        // Take a read lock to fetch what we need, then release before any
-        // potential write that persist() would need.
-        let (master_secret, slot_info, master_slot_index) = {
-            let guard = self.state.read().expect("state lock poisoned");
-            let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        self.process_request(master_pubkey, client_pubkey, created_at, ciphertext, false)
+    }
 
-            let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
-                .ok_or_else(|| BackendError::Internal("master not found".into()))?;
-
-            let secret = hex_to_32(&master.secret_key)
-                .map_err(|e| BackendError::Internal(format!("master secret: {e}")))?;
-
-            let client_pubkey_hex = hex_encode(client_pubkey);
-            let slot = policy::find_slot_by_pubkey(&master.connection_slots, &client_pubkey_hex)
-                .cloned();
-
-            (secret, slot, master.slot)
-        };
-
-        // Derive NIP-44 conversation key and decrypt the request.
-        let conv_key = nip44::get_conversation_key(&master_secret, client_pubkey)
-            .map_err(|e| BackendError::Internal(format!("conversation key: {e}")))?;
-
-        let plaintext = nip44::decrypt(&conv_key, ciphertext)
-            .map_err(|e| BackendError::Internal(format!("NIP-44 decrypt: {e}")))?;
-
-        let req = nip46::parse_request(plaintext.as_bytes())
-            .map_err(|e| BackendError::Internal(format!("parse NIP-46 request: {e}")))?;
-
-        let method = Nip46Method::from_str(&req.method);
-
-        // Policy check.
-        let client_pubkey_hex = hex_encode(client_pubkey);
-
-        // -- Visibility logging (no behaviour change) -------------------------
-        // Record method, kind (for sign_event), and the matched slot label so
-        // each request is attributable in the journal without decryption hacks.
-        let client_short: String = client_pubkey_hex.chars().take(12).collect();
-        let slot_label = slot_info.as_ref().map(|s| s.label.clone()).unwrap_or_default();
-        let slot_suffix = if slot_label.is_empty() {
-            String::new()
-        } else {
-            format!(" [slot \"{slot_label}\"]")
-        };
-        if method == Nip46Method::SignEvent {
-            let kind = req
-                .params
-                .first()
-                .and_then(|v| match v {
-                    Value::String(s) => serde_json::from_str::<UnsignedEvent>(s).ok(),
-                    Value::Object(_) => serde_json::from_value::<UnsignedEvent>(v.clone()).ok(),
-                    _ => None,
-                })
-                .map(|e| e.kind);
-            match kind {
-                Some(k) => log::info!("soft: sign_event kind {k} from {client_short}…{slot_suffix}"),
-                None => log::info!("soft: sign_event (unparsed kind) from {client_short}…{slot_suffix}"),
-            }
-        } else {
-            log::info!("soft: {} from {client_short}…{slot_suffix}", req.method);
-        }
-
-        // For connect: validate secret and bind the slot.
-        if method == Nip46Method::Connect {
-            let provided_secret = req
-                .params
-                .get(1)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            // Find the slot by secret and bind it to this client pubkey.
-            if !provided_secret.is_empty() {
-                let mut guard = self.state.write().expect("state lock poisoned");
-                let state = guard.as_mut().ok_or(BackendError::Locked)?;
-                let master_mut = state
-                    .keystore
-                    .masters
-                    .iter_mut()
-                    .find(|m| m.slot == master_slot_index)
-                    .ok_or_else(|| BackendError::Internal("master not found on write".into()))?;
-
-                let matched = policy::find_slot_by_secret(
-                    &master_mut.connection_slots,
-                    &provided_secret,
-                )
-                .map(|slot| slot.slot_index);
-                if let Some(slot_index) = matched {
-                    policy::authorize_pubkey_on_unique_slot(
-                        &mut master_mut.connection_slots,
-                        slot_index,
-                        &client_pubkey_hex,
-                    );
-                    let path = self.keyfile_path();
-                    Self::persist(state, &path)?;
-                } else {
-                    // Secret not recognised -- return error.
-                    let error_json = nip46::build_error_response(&req.id, -32600, "invalid secret")
-                        .map_err(|e| BackendError::Internal(format!("build error response: {e}")))?;
-                    let mut nonce = [0u8; 32];
-                    getrandom::getrandom(&mut nonce)
-                        .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
-                    let ct = nip44::encrypt(&conv_key, &error_json, &nonce)
-                        .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt: {e}")))?;
-                    return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &ct);
-                }
-            }
-
-            // Re-read the master after the write to get the updated slot.
-            let guard = self.state.read().expect("state lock poisoned");
-            let state = guard.as_ref().ok_or(BackendError::Locked)?;
-            let master = state
-                .keystore
-                .masters
-                .iter()
-                .find(|m| m.slot == master_slot_index)
-                .ok_or_else(|| BackendError::Internal("master not found".into()))?;
-
-            let response_json = Self::dispatch_method(master, &req, &client_pubkey_hex)?;
-            let mut nonce = [0u8; 32];
-            getrandom::getrandom(&mut nonce)
-                .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
-            let response_ct = nip44::encrypt(&conv_key, &response_json, &nonce)
-                .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt response: {e}")))?;
-            return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &response_ct);
-        }
-
-        // Always-auto-approve methods (ping, get_public_key, heartwood_list_identities, etc.).
-        if method.always_auto_approve() {
-            let guard = self.state.read().expect("state lock poisoned");
-            let state = guard.as_ref().ok_or(BackendError::Locked)?;
-            let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
-                .ok_or_else(|| BackendError::Internal("master not found".into()))?;
-            let response_json = Self::dispatch_method(master, &req, &client_pubkey_hex)?;
-            let mut nonce = [0u8; 32];
-            getrandom::getrandom(&mut nonce)
-                .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
-            let response_ct = nip44::encrypt(&conv_key, &response_json, &nonce)
-                .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt response: {e}")))?;
-            return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &response_ct);
-        }
-
-        // For sign_event and other methods, check the slot policy.
-        let slot = slot_info.ok_or_else(|| {
-            log::warn!(
-                "soft: {} from {client_short}… QUEUED — no connection slot bound to this client",
-                req.method
-            );
-            // No slot for this client -- queue for approval.
-            let approval_id = Uuid::new_v4().to_string();
-            let approval = PendingApproval {
-                id: approval_id.clone(),
-                method: req.method.clone(),
-                event_kind: None,
-                content_preview: String::new(),
-                slot_label: String::new(),
-                master_slot: master_slot_index,
-                created_at: Instant::now(),
-                master_pubkey: *master_pubkey,
-                client_pubkey: *client_pubkey,
-                ciphertext: ciphertext.to_string(),
-            };
-            let mut approvals = self.approvals.write().expect("approvals lock poisoned");
-            approvals.insert(approval_id.clone(), approval);
-            BackendError::PendingApproval(approval_id)
-        })?;
-
-        // Check if this method is allowed by slot policy.
-        let method_allowed = slot.allowed_methods.contains(&req.method);
-        if !method_allowed {
-            log::warn!(
-                "soft: {} from {client_short}… QUEUED — method not in slot \"{}\" policy",
-                req.method,
-                slot.label
-            );
-            let approval_id = Uuid::new_v4().to_string();
-            let approval = PendingApproval {
-                id: approval_id.clone(),
-                method: req.method.clone(),
-                event_kind: None,
-                content_preview: String::new(),
-                slot_label: slot.label.clone(),
-                master_slot: master_slot_index,
-                created_at: Instant::now(),
-                master_pubkey: *master_pubkey,
-                client_pubkey: *client_pubkey,
-                ciphertext: ciphertext.to_string(),
-            };
-            let mut approvals = self.approvals.write().expect("approvals lock poisoned");
-            approvals.insert(approval_id.clone(), approval);
-            return Err(BackendError::PendingApproval(approval_id));
-        }
-
-        // For sign_event, also check allowed_kinds and auto_approve.
-        if method == Nip46Method::SignEvent {
-            let event_kind = req
-                .params
-                .first()
-                .and_then(|v| match v {
-                    Value::String(s) => serde_json::from_str::<UnsignedEvent>(s).ok(),
-                    Value::Object(_) => serde_json::from_value::<UnsignedEvent>(v.clone()).ok(),
-                    _ => None,
-                })
-                .map(|e| e.kind);
-
-            let kind_allowed = slot.allowed_kinds.is_empty()
-                || event_kind.map_or(true, |k| slot.allowed_kinds.contains(&k));
-
-            if !kind_allowed || !slot.auto_approve {
-                log::warn!(
-                    "soft: sign_event kind {:?} from {client_short}… QUEUED — {} (slot \"{}\")",
-                    event_kind,
-                    if !kind_allowed { "kind not in slot policy" } else { "auto-approve disabled" },
-                    slot.label
-                );
-                let approval_id = Uuid::new_v4().to_string();
-                let approval = PendingApproval {
-                    id: approval_id.clone(),
-                    method: req.method.clone(),
-                    event_kind,
-                    content_preview: String::new(),
-                    slot_label: slot.label.clone(),
-                    master_slot: master_slot_index,
-                    created_at: Instant::now(),
-                    master_pubkey: *master_pubkey,
-                    client_pubkey: *client_pubkey,
-                    ciphertext: ciphertext.to_string(),
-                };
-                let mut approvals = self.approvals.write().expect("approvals lock poisoned");
-                approvals.insert(approval_id.clone(), approval);
-                return Err(BackendError::PendingApproval(approval_id));
-            }
-        } else if !slot.auto_approve {
-            log::warn!(
-                "soft: {} from {client_short}… QUEUED — auto-approve disabled (slot \"{}\")",
-                req.method,
-                slot.label
-            );
-            let approval_id = Uuid::new_v4().to_string();
-            let approval = PendingApproval {
-                id: approval_id.clone(),
-                method: req.method.clone(),
-                event_kind: None,
-                content_preview: String::new(),
-                slot_label: slot.label.clone(),
-                master_slot: master_slot_index,
-                created_at: Instant::now(),
-                master_pubkey: *master_pubkey,
-                client_pubkey: *client_pubkey,
-                ciphertext: ciphertext.to_string(),
-            };
-            let mut approvals = self.approvals.write().expect("approvals lock poisoned");
-            approvals.insert(approval_id.clone(), approval);
-            return Err(BackendError::PendingApproval(approval_id));
-        }
-
-        // Policy passed -- process the request.
-        let guard = self.state.read().expect("state lock poisoned");
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
-        let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
-            .ok_or_else(|| BackendError::Internal("master not found".into()))?;
-        let response_json = Self::dispatch_method(master, &req, &client_pubkey_hex)?;
-        log::info!(
-            "soft: {} from {client_short}… APPROVED (slot \"{}\")",
-            req.method,
-            slot.label
-        );
-
-        let mut nonce = [0u8; 32];
-        getrandom::getrandom(&mut nonce)
-            .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
-        let response_ct = nip44::encrypt(&conv_key, &response_json, &nonce)
-            .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt response: {e}")))?;
-
-        self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &response_ct)
+    fn handle_approved_request(
+        &self,
+        master_pubkey: &[u8; 32],
+        client_pubkey: &[u8; 32],
+        created_at: u64,
+        ciphertext: &str,
+    ) -> Result<String, BackendError> {
+        self.process_request(master_pubkey, client_pubkey, created_at, ciphertext, true)
     }
 
     fn sign_envelope(
@@ -1116,28 +863,33 @@ impl SigningBackend for SoftBackend {
                 .ok_or_else(|| BackendError::Internal(format!("approval {id} not found")))?
         };
 
-        // Re-process the original request now that it has been approved.
+        // Re-process the original request with policy bypassed: the operator's
+        // approval is the authorisation. Re-running the policy check here used
+        // to re-queue the very request being approved, and the signed envelope
+        // was then dropped — the client never heard back.
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let result = self.handle_encrypted_request(
+        let signed_event_json = self.process_request(
             &approval.master_pubkey,
             &approval.client_pubkey,
             created_at,
             &approval.ciphertext,
-        );
+            true,
+        )?;
 
-        // The re-processed request may or may not queue again depending on slot
-        // policy. For manual approvals we accept whatever the backend returns.
-        match result {
-            Ok(_) => Ok(()),
-            Err(BackendError::PendingApproval(_)) => {
-                // Still queued (policy changed?) -- that is acceptable.
-                Ok(())
+        // Hand the signed envelope to the relay publisher task.
+        let tx = self.response_tx.read().expect("response_tx lock poisoned").clone();
+        match tx {
+            Some(tx) => {
+                if tx.send(signed_event_json).is_err() {
+                    log::error!("approved response lost: relay publisher is not running");
+                }
             }
-            Err(e) => Err(e),
+            None => log::error!("approved response lost: no relay publisher wired"),
         }
+        Ok(())
     }
 
     fn deny_request(&self, id: &str) -> Result<(), BackendError> {
@@ -1228,6 +980,314 @@ impl SigningBackend for SoftBackend {
         }
 
         Self::persist(state, &path)
+    }
+}
+
+impl SoftBackend {
+    /// Decrypt, policy-check and answer one NIP-46 request, returning the
+    /// signed kind:24133 envelope JSON.
+    ///
+    /// `preapproved` is set only by the manual-approval path (`approve_request`
+    /// via `handle_approved_request`): the operator's approval IS the
+    /// authorisation, so slot-policy checks are skipped — re-evaluating them
+    /// would just re-queue the same request.
+    fn process_request(
+        &self,
+        master_pubkey: &[u8; 32],
+        client_pubkey: &[u8; 32],
+        created_at: u64,
+        ciphertext: &str,
+        preapproved: bool,
+    ) -> Result<String, BackendError> {
+        // Take a read lock to fetch what we need, then release before any
+        // potential write that persist() would need.
+        let (master_secret, slot_info, master_slot_index) = {
+            let guard = self.state.read().expect("state lock poisoned");
+            let state = guard.as_ref().ok_or(BackendError::Locked)?;
+
+            let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
+                .ok_or_else(|| BackendError::Internal("master not found".into()))?;
+
+            let secret = hex_to_32(&master.secret_key)
+                .map_err(|e| BackendError::Internal(format!("master secret: {e}")))?;
+
+            let client_pubkey_hex = hex_encode(client_pubkey);
+            let slot = policy::find_slot_by_pubkey(&master.connection_slots, &client_pubkey_hex)
+                .cloned();
+
+            (secret, slot, master.slot)
+        };
+
+        // Derive NIP-44 conversation key and decrypt the request.
+        let conv_key = nip44::get_conversation_key(&master_secret, client_pubkey)
+            .map_err(|e| BackendError::Internal(format!("conversation key: {e}")))?;
+
+        let plaintext = nip44::decrypt(&conv_key, ciphertext)
+            .map_err(|e| BackendError::Internal(format!("NIP-44 decrypt: {e}")))?;
+
+        let req = nip46::parse_request(plaintext.as_bytes())
+            .map_err(|e| BackendError::Internal(format!("parse NIP-46 request: {e}")))?;
+
+        let method = Nip46Method::from_str(&req.method);
+
+        // Policy check.
+        let client_pubkey_hex = hex_encode(client_pubkey);
+
+        // -- Visibility logging (no behaviour change) -------------------------
+        // Record method, kind (for sign_event), and the matched slot label so
+        // each request is attributable in the journal without decryption hacks.
+        let client_short: String = client_pubkey_hex.chars().take(12).collect();
+        let slot_label = slot_info.as_ref().map(|s| s.label.clone()).unwrap_or_default();
+        let slot_suffix = if slot_label.is_empty() {
+            String::new()
+        } else {
+            format!(" [slot \"{slot_label}\"]")
+        };
+        // For sign_event, keep the parsed kind and a short content preview so
+        // every queue site can show the operator WHAT is being signed.
+        let mut sign_kind: Option<u64> = None;
+        let mut sign_preview = String::new();
+        if method == Nip46Method::SignEvent {
+            let parsed = req
+                .params
+                .first()
+                .and_then(|v| match v {
+                    Value::String(s) => serde_json::from_str::<UnsignedEvent>(s).ok(),
+                    Value::Object(_) => serde_json::from_value::<UnsignedEvent>(v.clone()).ok(),
+                    _ => None,
+                });
+            if let Some(ev) = &parsed {
+                sign_kind = Some(ev.kind);
+                sign_preview = ev.content.chars().take(80).collect();
+            }
+            match sign_kind {
+                Some(k) => log::info!("soft: sign_event kind {k} from {client_short}…{slot_suffix}"),
+                None => log::info!("soft: sign_event (unparsed kind) from {client_short}…{slot_suffix}"),
+            }
+        } else {
+            log::info!("soft: {} from {client_short}…{slot_suffix}", req.method);
+        }
+
+        // For connect: validate secret and bind the slot.
+        if method == Nip46Method::Connect {
+            let provided_secret = req
+                .params
+                .get(1)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Find the slot by secret and bind it to this client pubkey.
+            if !provided_secret.is_empty() {
+                let mut guard = self.state.write().expect("state lock poisoned");
+                let state = guard.as_mut().ok_or(BackendError::Locked)?;
+                let master_mut = state
+                    .keystore
+                    .masters
+                    .iter_mut()
+                    .find(|m| m.slot == master_slot_index)
+                    .ok_or_else(|| BackendError::Internal("master not found on write".into()))?;
+
+                let matched = policy::find_slot_by_secret(
+                    &master_mut.connection_slots,
+                    &provided_secret,
+                )
+                .map(|slot| slot.slot_index);
+                if let Some(slot_index) = matched {
+                    policy::authorize_pubkey_on_unique_slot(
+                        &mut master_mut.connection_slots,
+                        slot_index,
+                        &client_pubkey_hex,
+                    );
+                    let path = self.keyfile_path();
+                    Self::persist(state, &path)?;
+                } else {
+                    // Secret not recognised -- return error.
+                    let error_json = nip46::build_error_response(&req.id, -32600, "invalid secret")
+                        .map_err(|e| BackendError::Internal(format!("build error response: {e}")))?;
+                    let mut nonce = [0u8; 32];
+                    getrandom::getrandom(&mut nonce)
+                        .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
+                    let ct = nip44::encrypt(&conv_key, &error_json, &nonce)
+                        .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt: {e}")))?;
+                    return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &ct);
+                }
+            }
+
+            // Re-read the master after the write to get the updated slot.
+            let guard = self.state.read().expect("state lock poisoned");
+            let state = guard.as_ref().ok_or(BackendError::Locked)?;
+            let master = state
+                .keystore
+                .masters
+                .iter()
+                .find(|m| m.slot == master_slot_index)
+                .ok_or_else(|| BackendError::Internal("master not found".into()))?;
+
+            let response_json = Self::dispatch_method(master, &req, &client_pubkey_hex)?;
+            let mut nonce = [0u8; 32];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
+            let response_ct = nip44::encrypt(&conv_key, &response_json, &nonce)
+                .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt response: {e}")))?;
+            return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &response_ct);
+        }
+
+        // Always-auto-approve methods (ping, get_public_key, heartwood_list_identities, etc.).
+        if method.always_auto_approve() {
+            let guard = self.state.read().expect("state lock poisoned");
+            let state = guard.as_ref().ok_or(BackendError::Locked)?;
+            let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
+                .ok_or_else(|| BackendError::Internal("master not found".into()))?;
+            let response_json = Self::dispatch_method(master, &req, &client_pubkey_hex)?;
+            let mut nonce = [0u8; 32];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
+            let response_ct = nip44::encrypt(&conv_key, &response_json, &nonce)
+                .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt response: {e}")))?;
+            return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &response_ct);
+        }
+
+        // For sign_event and other methods, check the slot policy (unless the
+        // request has already been manually approved by the operator).
+        let slot = match slot_info {
+            Some(s) => Some(s),
+            None if preapproved => None,
+            None => {
+                log::warn!(
+                    "soft: {} from {client_short}… QUEUED — no connection slot bound to this client",
+                    req.method
+                );
+                // No slot for this client -- queue for approval.
+                let approval_id = Uuid::new_v4().to_string();
+                let approval = PendingApproval {
+                    id: approval_id.clone(),
+                    method: req.method.clone(),
+                    event_kind: sign_kind,
+                    content_preview: sign_preview.clone(),
+                    slot_label: String::new(),
+                    master_slot: master_slot_index,
+                    created_at: Instant::now(),
+                    master_pubkey: *master_pubkey,
+                    client_pubkey: *client_pubkey,
+                    ciphertext: ciphertext.to_string(),
+                };
+                let mut approvals = self.approvals.write().expect("approvals lock poisoned");
+                approvals.insert(approval_id.clone(), approval);
+                return Err(BackendError::PendingApproval(approval_id));
+            }
+        };
+
+        // Check if this method is allowed by slot policy.
+        let method_allowed = slot
+            .as_ref()
+            .is_some_and(|s| s.allowed_methods.contains(&req.method));
+        if !preapproved && !method_allowed {
+            log::warn!(
+                "soft: {} from {client_short}… QUEUED — method not in slot \"{slot_label}\" policy",
+                req.method,
+            );
+            let approval_id = Uuid::new_v4().to_string();
+            let approval = PendingApproval {
+                id: approval_id.clone(),
+                method: req.method.clone(),
+                event_kind: sign_kind,
+                content_preview: sign_preview.clone(),
+                slot_label: slot_label.clone(),
+                master_slot: master_slot_index,
+                created_at: Instant::now(),
+                master_pubkey: *master_pubkey,
+                client_pubkey: *client_pubkey,
+                ciphertext: ciphertext.to_string(),
+            };
+            let mut approvals = self.approvals.write().expect("approvals lock poisoned");
+            approvals.insert(approval_id.clone(), approval);
+            return Err(BackendError::PendingApproval(approval_id));
+        }
+
+        // For sign_event, also check allowed_kinds and auto_approve. All of this
+        // is skipped for operator-approved requests — the approval is the
+        // authorisation; re-checking would re-queue the request it just released.
+        if !preapproved {
+            let slot = slot.as_ref().expect("slot is bound when !preapproved");
+            if method == Nip46Method::SignEvent {
+                let kind_allowed = slot.allowed_kinds.is_empty()
+                    || sign_kind.is_none_or(|k| slot.allowed_kinds.contains(&k));
+
+                if !kind_allowed || !slot.auto_approve {
+                    log::warn!(
+                        "soft: sign_event kind {:?} from {client_short}… QUEUED — {} (slot \"{}\")",
+                        sign_kind,
+                        if !kind_allowed { "kind not in slot policy" } else { "auto-approve disabled" },
+                        slot.label
+                    );
+                    let approval_id = Uuid::new_v4().to_string();
+                    let approval = PendingApproval {
+                        id: approval_id.clone(),
+                        method: req.method.clone(),
+                        event_kind: sign_kind,
+                        content_preview: sign_preview.clone(),
+                        slot_label: slot.label.clone(),
+                        master_slot: master_slot_index,
+                        created_at: Instant::now(),
+                        master_pubkey: *master_pubkey,
+                        client_pubkey: *client_pubkey,
+                        ciphertext: ciphertext.to_string(),
+                    };
+                    let mut approvals = self.approvals.write().expect("approvals lock poisoned");
+                    approvals.insert(approval_id.clone(), approval);
+                    return Err(BackendError::PendingApproval(approval_id));
+                }
+            } else if !slot.auto_approve {
+                log::warn!(
+                    "soft: {} from {client_short}… QUEUED — auto-approve disabled (slot \"{}\")",
+                    req.method,
+                    slot.label
+                );
+                let approval_id = Uuid::new_v4().to_string();
+                let approval = PendingApproval {
+                    id: approval_id.clone(),
+                    method: req.method.clone(),
+                    event_kind: sign_kind,
+                    content_preview: sign_preview.clone(),
+                    slot_label: slot.label.clone(),
+                    master_slot: master_slot_index,
+                    created_at: Instant::now(),
+                    master_pubkey: *master_pubkey,
+                    client_pubkey: *client_pubkey,
+                    ciphertext: ciphertext.to_string(),
+                };
+                let mut approvals = self.approvals.write().expect("approvals lock poisoned");
+                approvals.insert(approval_id.clone(), approval);
+                return Err(BackendError::PendingApproval(approval_id));
+            }
+        }
+
+        // Policy passed -- process the request.
+        let guard = self.state.read().expect("state lock poisoned");
+        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
+            .ok_or_else(|| BackendError::Internal("master not found".into()))?;
+        let response_json = Self::dispatch_method(master, &req, &client_pubkey_hex)?;
+        if preapproved {
+            log::info!(
+                "soft: {} from {client_short}… APPROVED BY OPERATOR{slot_suffix}",
+                req.method,
+            );
+        } else {
+            log::info!(
+                "soft: {} from {client_short}… APPROVED (slot \"{slot_label}\")",
+                req.method,
+            );
+        }
+
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
+        let response_ct = nip44::encrypt(&conv_key, &response_json, &nonce)
+            .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt response: {e}")))?;
+
+        self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &response_ct)
     }
 }
 
@@ -1641,5 +1701,74 @@ mod tests {
         let masters = backend.list_masters().unwrap();
         assert_eq!(masters.len(), 1);
         assert!(masters[0]["npub"].as_str().unwrap().starts_with("npub1"));
+    }
+
+    /// Regression: approving a queued request must sign and deliver the
+    /// envelope — not re-queue it and drop the response (the original
+    /// approve_request re-ran the policy check, which re-queued the request
+    /// under a fresh id, and discarded the signed envelope).
+    #[test]
+    fn approved_request_signs_and_delivers_envelope() {
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+        let master_json = backend.create_master("appr", 12).unwrap();
+        let master_pubkey = hex_to_32(master_json["pubkey"].as_str().unwrap()).unwrap();
+
+        let client_secret = [0x42u8; 32];
+        let client_pubkey = {
+            let pk_hex = derive_pubkey_hex(&client_secret).unwrap();
+            hex_to_32(&pk_hex).unwrap()
+        };
+
+        // The client encrypts a sign_event request to the master. No slot is
+        // bound to this client, so policy queues it.
+        let conv_key = nip44::get_conversation_key(&client_secret, &master_pubkey).unwrap();
+        let event = serde_json::json!({
+            "kind": 1,
+            "content": "queued then approved",
+            "tags": [],
+            "created_at": 1_700_000_000u64,
+            "pubkey": master_json["pubkey"].as_str().unwrap(),
+        });
+        let req = serde_json::json!({
+            "id": "r1",
+            "method": "sign_event",
+            "params": [event.to_string()],
+        });
+        let nonce = [7u8; 32];
+        let ct = nip44::encrypt(&conv_key, &req.to_string(), &nonce).unwrap();
+
+        let err = backend
+            .handle_encrypted_request(&master_pubkey, &client_pubkey, 1_700_000_001, &ct)
+            .unwrap_err();
+        let BackendError::PendingApproval(id) = err else {
+            panic!("expected PendingApproval, got {err:?}");
+        };
+
+        // Wire the response channel, then approve.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        backend.set_response_sender(tx);
+        backend.approve_request(&id).unwrap();
+
+        // The signed envelope is delivered to the publisher...
+        let json = rx
+            .try_recv()
+            .expect("approved request must deliver a signed envelope");
+        let ev: SignedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev.kind, 24133);
+        assert_eq!(ev.tags[0][1], derive_pubkey_hex(&client_secret).unwrap());
+
+        // ...and its decrypted content answers the original request id with a
+        // signed event, not an error.
+        let resp = nip44::decrypt(&conv_key, &ev.content).unwrap();
+        let resp_json: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(resp_json["id"].as_str().unwrap(), "r1");
+        assert!(resp_json.get("error").is_none(), "unexpected error: {resp}");
+        let signed: SignedEvent =
+            serde_json::from_str(resp_json["result"].as_str().unwrap()).unwrap();
+        assert_eq!(signed.content, "queued then approved");
+
+        // The queue is empty: approval did not re-queue the request.
+        assert!(backend.list_approvals().is_empty());
     }
 }

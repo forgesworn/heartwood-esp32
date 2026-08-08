@@ -639,6 +639,13 @@ async fn main() -> Result<()> {
         .collect();
 
     // Detect mode and construct backend + bunker keys.
+    // Channel carrying operator-approved response envelopes from the backend
+    // to the relay publisher (spawned per reconnect below). Only Soft mode
+    // produces these — Hard-mode approvals complete on the device and answer
+    // through the normal request path.
+    let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let resp_rx = std::sync::Arc::new(tokio::sync::Mutex::new(resp_rx));
+
     let (backend_arc, bunker_keys, signing_master_pubkeys) = match detect_mode(&cli) {
 
         // ----------------------------------------------------------------
@@ -824,6 +831,7 @@ async fn main() -> Result<()> {
             let data_dir = std::path::PathBuf::from(&cli.data_dir);
             std::fs::create_dir_all(&data_dir).ok();
             let soft_backend = backend::soft::SoftBackend::new(data_dir);
+            soft_backend.set_response_sender(resp_tx);
             let backend_arc: Arc<dyn backend::SigningBackend> = Arc::new(soft_backend);
 
             // Use the bunker pubkey as placeholder until unlock reveals the real master.
@@ -917,6 +925,33 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
         log::info!("Connected to relays");
 
+        // Publish operator-approved responses (Soft mode approval queue).
+        // Respawned each reconnect so it always uses the live client.
+        let publisher = {
+            let client = client.clone();
+            let resp_rx = std::sync::Arc::clone(&resp_rx);
+            tokio::spawn(async move {
+                loop {
+                    let json = {
+                        let mut rx = resp_rx.lock().await;
+                        match rx.recv().await {
+                            Some(json) => json,
+                            None => break, // sender dropped — daemon is exiting
+                        }
+                    };
+                    match nostr_sdk::Event::from_json(&json) {
+                        Ok(ev) => match client.send_event(&ev).await {
+                            Ok(output) => {
+                                log::info!("Approved response published: {}", output.id())
+                            }
+                            Err(e) => log::error!("Approved response publish failed: {e}"),
+                        },
+                        Err(e) => log::error!("Approved response is not a valid event: {e}"),
+                    }
+                }
+            })
+        };
+
         match relay::run_event_loop(
             &client,
             &backend_arc,
@@ -933,6 +968,8 @@ async fn main() -> Result<()> {
                 log::error!("Relay event loop error: {e} -- reconnecting in {backoff_secs}s");
             }
         }
+
+        publisher.abort();
 
         // Disconnect cleanly before reconnecting.
         client.disconnect().await;

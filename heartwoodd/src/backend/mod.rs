@@ -129,6 +129,22 @@ pub trait SigningBackend: Send + Sync {
         ciphertext: &str,
     ) -> Result<String, BackendError>;
 
+    /// Re-process a request the operator has manually approved via the
+    /// approval queue. Semantically identical to `handle_encrypted_request`,
+    /// except backends with slot policy (Soft mode) skip the policy check —
+    /// the approval IS the authorisation, so re-checking would re-queue the
+    /// very request being released. Default: no bypass, for backends without
+    /// a policy layer (Hard mode approves on-device).
+    fn handle_approved_request(
+        &self,
+        master_pubkey: &[u8; 32],
+        client_pubkey: &[u8; 32],
+        created_at: u64,
+        ciphertext: &str,
+    ) -> Result<String, BackendError> {
+        self.handle_encrypted_request(master_pubkey, client_pubkey, created_at, ciphertext)
+    }
+
     /// Current master signing pubkeys this backend can answer for, beyond
     /// any passed to the relay loop at startup. Soft mode's set changes at
     /// runtime (unlock, master creation) and the relay loop polls this to

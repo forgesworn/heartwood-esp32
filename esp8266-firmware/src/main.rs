@@ -17,8 +17,9 @@
 //!     NIP-44 decrypt → NIP-46 dispatch → re-encrypt → sign-kind:24133 path,
 //!     reusing `heartwood-common`. Unknown frames → `NACK` (0x15).
 //!
-//! Known gaps: the NIP-44 nonce RNG needs an entropy review (see
-//! `sign_path::random_nonce`).
+//! The NIP-44 nonce is the deterministic `nip44::synthetic_nonce` — no reliance
+//! on the lx106's poorly-seeded hardware RNG (radio-off signer). Untested on
+//! hardware: compiling + linking is not correctness.
 
 #![no_std]
 #![no_main]

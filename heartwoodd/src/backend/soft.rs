@@ -822,7 +822,9 @@ impl SigningBackend for SoftBackend {
         Ok(result)
     }
 
-    fn create_master(&self, label: &str) -> Result<Value, BackendError> {
+    fn create_master(&self, label: &str, _words: u8) -> Result<Value, BackendError> {
+        // Soft masters are raw 32-byte secrets (phraseless), so the word count
+        // only meaningful to on-device generation is ignored here.
         let mut secret_bytes = [0u8; 32];
         getrandom::getrandom(&mut secret_bytes)
             .map_err(|e| BackendError::Internal(format!("getrandom: {e}")))?;
@@ -1412,7 +1414,7 @@ mod tests {
         let backend = make_cheap_backend(&dir);
 
         // Create a master.
-        let master_json = backend.create_master("test-master").unwrap();
+        let master_json = backend.create_master("test-master", 12).unwrap();
         let master_slot = master_json["index"].as_u64().unwrap() as u8;
 
         // Create a slot.
@@ -1436,7 +1438,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let backend = make_cheap_backend(&dir);
 
-        let master_json = backend.create_master("test").unwrap();
+        let master_json = backend.create_master("test", 12).unwrap();
         let master_slot = master_json["index"].as_u64().unwrap() as u8;
 
         let slot_json = backend.create_slot(master_slot, "bark").unwrap();
@@ -1453,7 +1455,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let backend = make_cheap_backend(&dir);
 
-        backend.create_master("nip44-order").unwrap();
+        backend.create_master("nip44-order", 12).unwrap();
         let master = {
             let guard = backend.state.read().unwrap();
             guard.as_ref().unwrap().keystore.masters[0].clone()
@@ -1509,7 +1511,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let backend = make_cheap_backend(&dir);
-        backend.create_master("sig-check").unwrap();
+        backend.create_master("sig-check", 12).unwrap();
         let master = {
             let guard = backend.state.read().unwrap();
             guard.as_ref().unwrap().keystore.masters[0].clone()
@@ -1603,7 +1605,7 @@ mod tests {
             });
         }
 
-        backend.create_master("persist-test").unwrap();
+        backend.create_master("persist-test", 12).unwrap();
         backend.lock().unwrap();
         assert!(backend.is_locked());
 
@@ -1632,7 +1634,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let backend = make_cheap_backend(&dir);
 
-        let master_json = backend.create_master("npub-test").unwrap();
+        let master_json = backend.create_master("npub-test", 12).unwrap();
         let npub = master_json["npub"].as_str().unwrap();
         assert!(npub.starts_with("npub1"), "npub should start with 'npub1', got: {npub}");
 

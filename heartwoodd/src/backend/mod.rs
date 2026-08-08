@@ -161,8 +161,10 @@ pub trait SigningBackend: Send + Sync {
     /// Soft mode generates the key in the daemon's encrypted keystore; Hard
     /// mode asks the ESP32 to self-generate (GENERATE_IDENTITY), which plays
     /// the on-device entropy game and shows the recovery phrase on the OLED.
-    fn create_master(&self, label: &str) -> Result<Value, BackendError> {
-        let _ = label;
+    /// `words` (12 or 24) selects the phrase length for on-device generation;
+    /// Soft mode ignores it (soft masters are raw secrets, phraseless).
+    fn create_master(&self, label: &str, words: u8) -> Result<Value, BackendError> {
+        let _ = (label, words);
         Err(BackendError::NotSupported)
     }
 

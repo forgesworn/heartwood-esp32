@@ -97,6 +97,9 @@ struct UnlockBody {
 #[derive(Deserialize)]
 struct CreateMasterBody {
     label: String,
+    /// Recovery-phrase length for on-device generation: 12 (default) or 24.
+    /// Ignored in Soft mode (soft masters are raw secrets, phraseless).
+    words: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -222,8 +225,12 @@ async fn post_lock(State(state): State<AppState>) -> Response {
 
 /// Protected: create a new master (Soft mode only).
 async fn create_master(State(state): State<AppState>, Json(body): Json<CreateMasterBody>) -> Response {
+    let words = body.words.unwrap_or(12);
+    if !matches!(words, 12 | 24) {
+        return api_err(StatusCode::BAD_REQUEST, "words must be 12 or 24");
+    }
     let result = tokio::task::spawn_blocking(move || {
-        state.backend.create_master(&body.label)
+        state.backend.create_master(&body.label, words)
     }).await.unwrap();
 
     match result {

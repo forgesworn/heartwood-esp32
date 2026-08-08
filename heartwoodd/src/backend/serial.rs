@@ -398,15 +398,21 @@ impl SigningBackend for SerialBackend {
     /// returns as soon as the key exists; the phrase walkthrough doesn't block
     /// us. The timeout covers the worst case: intro timeout + a full 90 s game
     /// + PBKDF2 + derivation + NVS write.
-    fn create_master(&self, label: &str) -> Result<Value, BackendError> {
+    fn create_master(&self, label: &str, words: u8) -> Result<Value, BackendError> {
         if label.len() > 255 {
             return Err(BackendError::Internal("label too long (max 255 bytes)".into()));
         }
+        if !matches!(words, 12 | 24) {
+            return Err(BackendError::Internal("words must be 12 or 24".into()));
+        }
 
-        // Payload: [label_len_u8][label...] — empty payload means "default".
-        let mut payload = Vec::with_capacity(1 + label.len());
+        // Payload: [label_len_u8][label...][words_u8]. The words byte is always
+        // sent; older firmware (pre-24-word support) ignores trailing bytes and
+        // generates 12 words — the owner sees the actual phrase on the OLED.
+        let mut payload = Vec::with_capacity(1 + label.len() + 1);
         payload.push(label.len() as u8);
         payload.extend_from_slice(label.as_bytes());
+        payload.push(words);
 
         let frame_bytes = frame::build_frame(FRAME_TYPE_GENERATE_IDENTITY, &payload)
             .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;

@@ -628,7 +628,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         if let Some(op) = &op_mgmt {
             if !relays.is_empty() {
                 log::info!("[relay] seeds locked — entering vault-unlock phase");
-                locked_relay_phase(&relays, op, secp, masters, nvs, usb, display);
+                locked_relay_phase(&relays, op, secp, masters, nvs, usb, display, button_pin);
             }
         }
     }
@@ -1341,6 +1341,7 @@ fn locked_relay_phase(
     nvs: &mut EspNvs<NvsDefault>,
     usb: &mut SerialPort<'_>,
     display: &mut Display<'_>,
+    button_pin: &PinDriver<'_, Input>,
 ) {
     // One-time unlock keypair, RAM only. Loop in the (astronomically
     // unlikely) case the draw is not a valid scalar.
@@ -1505,6 +1506,12 @@ fn locked_relay_phase(
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
                     crate::firmware_info_json().as_bytes(),
                 ),
+                FRAME_TYPE_FACTORY_RESET => {
+                    // A locked device MUST stay resettable: with the unlock
+                    // secret lost, the button-gated wipe is the only way back
+                    // to a restorable state. Always physically confirmed.
+                    crate::provision::handle_factory_reset(usb, nvs, display, button_pin);
+                }
                 _ => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]),
             }
         }

@@ -610,6 +610,19 @@ fn main() {
                         firmware_info_json().as_bytes(),
                     );
                 }
+                FRAME_TYPE_FACTORY_RESET => {
+                    // A locked device MUST stay resettable: if the unlock
+                    // secret is lost (vault key orphaned, PIN forgotten), the
+                    // button-gated wipe is the only way back to a restorable
+                    // state. Reset changes no authority — it destroys it — and
+                    // always requires the physical hold.
+                    provision::handle_factory_reset(
+                        &mut usb,
+                        &mut nvs,
+                        &mut display,
+                        &button_pin,
+                    );
+                }
                 _ => {
                     log::warn!("Device locked — rejecting frame type 0x{:02x}", frame.frame_type);
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);

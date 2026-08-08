@@ -65,7 +65,7 @@ fn write_failed_attempts(
     }
 }
 
-fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
+pub(crate) fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
     let _ = nvs.remove(NVS_PIN_ATTEMPTS_KEY);
 }
 
@@ -300,5 +300,125 @@ pub fn wipe_and_reboot(
                 esp_idf_hal::delay::FreeRtos::delay_ms(2000);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vault key (Pi/Sapwood-assisted unlock)
+// ---------------------------------------------------------------------------
+//
+// The vault key is a 32-byte random secret generated and held by the host
+// (heartwoodd's encrypted keyfile, or Sapwood's browser storage) — never on
+// the device. Seeds are wrapped with exactly the same `encrypt_seed` AEAD as
+// the human PIN path; only the caller and payload shape differ. Because the
+// key is a 256-bit bearer credential (not a knowledge factor), VAULT_UNLOCK
+// requires an authenticated bridge session, and a wrong key is a plain NACK —
+// it must NOT feed the PIN wipe counter, or a buggy/malicious host could
+// trick the device into wiping itself.
+//
+// Design: docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md
+
+pub const VAULT_KEY_LEN: usize = 32;
+
+/// Handle a VAULT_SET frame (0x62). Payload: 32-byte binary vault key, or
+/// empty to disable at-rest encryption (back to plaintext). Requires the
+/// device unlocked with a master present, an authenticated bridge session,
+/// and physical button confirmation.
+pub fn handle_vault_set(
+    usb: &mut SerialPort<'_>,
+    payload: &[u8],
+    nvs: &mut EspNvs<NvsDefault>,
+    masters: &[LoadedMaster],
+    bridge_authenticated: bool,
+    display: &mut crate::oled::Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+) {
+    if !bridge_authenticated {
+        log::warn!("VAULT_SET rejected — bridge not authenticated");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
+        return;
+    }
+    if !payload.is_empty() && payload.len() != VAULT_KEY_LEN {
+        log::warn!("VAULT_SET: payload is {} bytes, expected 0 or 32", payload.len());
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return;
+    }
+    if masters.is_empty() {
+        log::warn!("VAULT_SET: no identity to protect");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return;
+    }
+    if is_locked(masters) {
+        log::warn!("VAULT_SET: device is locked — unlock before changing the vault key");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return;
+    }
+
+    let action = if payload.is_empty() {
+        "Disable vault?\n(plaintext at rest)"
+    } else {
+        "Enable vault?\n(host-held key)"
+    };
+    let result = crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
+        crate::oled::show_error(d, &format!("{}\n{}s", action, remaining));
+    });
+    if !matches!(result, crate::approval::ApprovalResult::Approved) {
+        log::info!("VAULT_SET denied by user");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return;
+    }
+
+    let outcome = if payload.is_empty() {
+        disable_encryption(nvs, masters).map(|()| "Vault disabled!")
+    } else {
+        enable_encryption(nvs, masters, payload).map(|()| "Vault enabled!")
+    };
+
+    match outcome {
+        Ok(msg) => {
+            log::info!("VAULT_SET: {msg}");
+            crate::oled::show_error(display, msg);
+            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+            protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+        }
+        Err(e) => {
+            log::error!("VAULT_SET failed: {e}");
+            crate::oled::show_error(display, "Vault change failed");
+            esp_idf_hal::delay::FreeRtos::delay_ms(1500);
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        }
+    }
+}
+
+/// Handle a VAULT_UNLOCK frame (0x63). Payload: 32-byte binary vault key.
+/// Caller must have verified bridge authentication first. Returns true when
+/// the device unlocked. A wrong key is a plain NACK — no wipe counter, no
+/// OLED drama (the host may legitimately retry with a corrected key).
+pub fn handle_vault_unlock(
+    usb: &mut SerialPort<'_>,
+    payload: &[u8],
+    nvs: &mut EspNvs<NvsDefault>,
+    masters: &mut [LoadedMaster],
+    display: &mut crate::oled::Display<'_>,
+) -> bool {
+    if payload.len() != VAULT_KEY_LEN {
+        log::warn!("VAULT_UNLOCK: payload is {} bytes, expected 32", payload.len());
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return false;
+    }
+
+    if try_unlock(nvs, masters, payload) {
+        log::info!("Vault key accepted — seeds decrypted, device unlocked");
+        // A prior PIN-attempt counter is meaningless after a successful
+        // vault unlock — clear it so a later PIN attempt starts fresh.
+        clear_failed_attempts(nvs);
+        crate::oled::show_error(display, "Unlocked!");
+        esp_idf_hal::delay::FreeRtos::delay_ms(500);
+        protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+        true
+    } else {
+        log::warn!("VAULT_UNLOCK: wrong key (AEAD check failed)");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"wrong vault key");
+        false
     }
 }

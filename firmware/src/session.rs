@@ -33,6 +33,23 @@ pub fn write_bridge_secret(
         .map_err(|_| "failed to write bridge secret")
 }
 
+/// Verify a presented 32-byte bridge secret against NVS in constant time,
+/// without touching a PolicyEngine — for the locked boot loop, which runs
+/// before the policy engine exists. Returns `Some(true)` on match,
+/// `Some(false)` on mismatch or malformed payload, `None` when no bridge
+/// secret is configured.
+pub fn verify_bridge_secret(payload: &[u8], nvs: &EspNvs<NvsDefault>) -> Option<bool> {
+    if payload.len() != 32 {
+        return Some(false);
+    }
+    let bridge_secret = read_bridge_secret(nvs)?;
+    let mut diff = 0u8;
+    for (a, b) in payload.iter().zip(bridge_secret.iter()) {
+        diff |= a ^ b;
+    }
+    Some(diff == 0)
+}
+
 /// Handle a SESSION_AUTH frame (0x21).
 ///
 /// The bridge sends its 32-byte shared secret; we compare it in constant time
@@ -44,37 +61,22 @@ pub fn handle_auth(
     nvs: &EspNvs<NvsDefault>,
     policy_engine: &mut PolicyEngine,
 ) {
-    if payload.len() != 32 {
-        log::warn!("SESSION_AUTH payload is {} bytes, expected 32", payload.len());
-        protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x01]); // 0x01 = failed
-        return;
-    }
-
-    let bridge_secret = match read_bridge_secret(nvs) {
-        Some(s) => s,
+    match verify_bridge_secret(payload, nvs) {
+        Some(true) => {
+            log::info!("Bridge authenticated successfully");
+            policy_engine.bridge_authenticated = true;
+            protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x00]); // 0x00 = success
+        }
+        Some(false) => {
+            log::warn!("Bridge authentication failed — wrong secret");
+            policy_engine.bridge_authenticated = false;
+            protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x01]); // 0x01 = failed
+        }
         None => {
             log::warn!("No bridge secret in NVS — cannot authenticate");
             protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x02]); // 0x02 = no secret configured
-            return;
         }
-    };
-
-    // Constant-time comparison to avoid timing side-channels.
-    let mut diff = 0u8;
-    for (a, b) in payload.iter().zip(bridge_secret.iter()) {
-        diff |= a ^ b;
     }
-
-    if diff != 0 {
-        log::warn!("Bridge authentication failed — wrong secret");
-        policy_engine.bridge_authenticated = false;
-        protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x01]); // 0x01 = failed
-        return;
-    }
-
-    log::info!("Bridge authenticated successfully");
-    policy_engine.bridge_authenticated = true;
-    protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x00]); // 0x00 = success
 }
 
 /// Handle a SET_BRIDGE_SECRET frame (0x23).

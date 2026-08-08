@@ -770,6 +770,11 @@ fn npub_from_secret(secret: &[u8; 32], secp: &Arc<Secp256k1<secp256k1::SignOnly>
 
 /// Handle a PROVISION_REMOVE frame (0x04).
 ///
+/// Physical approval is mandatory: without a backup, removal destroys the
+/// identity's key for good, so a bare USB frame must never be enough. The
+/// OLED shows exactly WHICH identity (slot + npub) and the owner holds PRG to
+/// confirm — the same gate as signing and factory reset. Deny/timeout NACKs.
+///
 /// The removal is journalled across every slot-indexed authority record. The
 /// caller must reboot after `true` so all in-memory caches reload from the
 /// completed transaction.
@@ -779,6 +784,7 @@ pub fn handle_remove(
     nvs: &mut EspNvs<NvsDefault>,
     loaded: &mut Vec<LoadedMaster>,
     display: &mut Display<'_>,
+    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> bool {
     if frame.payload.len() != 1 {
         log::warn!(
@@ -790,6 +796,25 @@ pub fn handle_remove(
     }
 
     let slot = frame.payload[0];
+
+    // The identity must exist AND be shown before any state changes. The npub
+    // on screen is what the owner is approving — never a bare slot number.
+    let Some(master) = loaded.iter().find(|m| m.slot == slot) else {
+        log::warn!("PROVISION_REMOVE for unknown slot {slot}");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return false;
+    };
+    let npub = encode_npub(&master.pubkey);
+    let detail = format!("slot {slot} {}…", &npub[..12]);
+    let approval = crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
+        oled::show_sign_request(d, "REMOVE IDENTITY", 0, &detail, remaining);
+    });
+    if !matches!(approval, crate::approval::ApprovalResult::Approved) {
+        log::info!("PROVISION_REMOVE slot {slot} denied or timed out on device");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return false;
+    }
+
     match masters::remove_master(nvs, slot) {
         Ok(()) => {
             // Remove from the in-memory list and re-number to match NVS order.

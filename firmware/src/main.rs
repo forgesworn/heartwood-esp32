@@ -828,7 +828,7 @@ fn main() {
                 }
             }
 
-            // 0x04 — remove a master
+            // 0x04 — remove a master (button-confirmed on the device)
             FRAME_TYPE_PROVISION_REMOVE => {
                 if provision::handle_remove(
                     &mut usb,
@@ -836,6 +836,7 @@ fn main() {
                     &mut nvs,
                     &mut loaded_masters,
                     &mut display,
+                    &button_pin,
                 ) {
                     // Policies, personas, identity metadata, and identity
                     // caches are all slot-indexed. Reload them from the

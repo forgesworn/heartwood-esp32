@@ -44,6 +44,7 @@ pub fn wait_for_press(
 
     // Wait for the button to be pressed (active low — pin goes LOW).
     loop {
+        crate::wdt::feed();
         if Instant::now() >= deadline {
             return None;
         }
@@ -60,6 +61,7 @@ pub fn wait_for_press(
     let press_start = Instant::now();
 
     loop {
+        crate::wdt::feed();
         if Instant::now() >= deadline {
             // Timeout whilst held — treat whatever we have so far as the result.
             break;
@@ -119,6 +121,7 @@ pub fn read_gesture(pin: &PinDriver<'_, Input>, idle_timeout: Duration) -> Optio
 
     // Wait for the first press to begin.
     loop {
+        crate::wdt::feed();
         if Instant::now() >= idle_deadline {
             return None;
         }
@@ -162,6 +165,7 @@ pub fn read_gesture(pin: &PinDriver<'_, Input>, idle_timeout: Duration) -> Optio
 /// Block until the button is released, with a debounce on the rising edge.
 fn drain_release(pin: &PinDriver<'_, Input>) {
     while pin.is_low() {
+        crate::wdt::feed();
         esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
     }
     esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
@@ -199,6 +203,7 @@ pub enum TwoBtn {
 pub fn read_two_button_gesture(a: &PinDriver<'_, Input>, b: &PinDriver<'_, Input>) -> TwoBtn {
     // Wait for the first press on either button.
     let is_a = loop {
+        crate::wdt::feed();
         if a.is_low() {
             break true;
         }

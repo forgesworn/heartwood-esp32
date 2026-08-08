@@ -76,6 +76,7 @@ mod relay;
 mod session;
 mod sign;
 mod transport;
+mod wdt;
 mod wifi_scan;
 
 use esp_idf_hal::peripherals::Peripherals;
@@ -317,6 +318,7 @@ fn offer_removal_recovery_wipe(
 
     oled::show_error(display, "Erasing...");
     loop {
+        crate::wdt::feed();
         match persistent_wipe::erase_all() {
             Ok(()) => {
                 oled::show_error(display, "Reset complete\nRebooting...");
@@ -339,6 +341,7 @@ fn main() {
     log::info!("Heartwood ESP32 — Phase 4 (multi-master)");
     log::info!("Last reset: {}", reset_reason_str());
     init_crash_context();
+    wdt::init();
 
     let peripherals = Peripherals::take().expect("failed to take peripherals");
 
@@ -445,6 +448,7 @@ fn main() {
         oled::show_provision_wait(&mut display);
 
         loop {
+            wdt::feed();
             let frame = protocol::read_frame(&mut usb);
             match frame.frame_type {
                 FRAME_TYPE_FIRMWARE_INFO => {
@@ -552,6 +556,7 @@ fn main() {
         // does not exist yet in the locked loop — track it locally.
         let mut vault_authed = false;
         loop {
+            wdt::feed();
             let frame = protocol::read_frame(&mut usb);
             match frame.frame_type {
                 FRAME_TYPE_PIN_UNLOCK => {
@@ -734,6 +739,7 @@ fn main() {
         // Poll for an incoming frame with a short timeout so we can also check
         // the button state and display timeout while idle.
         let frame = loop {
+            wdt::feed();
             match protocol::try_read_frame(&mut usb, IDLE_POLL_MS) {
                 Some(f) => {
                     // A frame arrived — mark activity and ensure the display is on.

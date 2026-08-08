@@ -950,6 +950,7 @@ pub fn handle_factory_reset(
 fn erase_all_and_reboot(usb: &mut SerialPort<'_>, display: &mut Display<'_>) -> ! {
     let mut failure_reported = false;
     loop {
+        crate::wdt::feed();
         match crate::persistent_wipe::erase_all() {
             Ok(()) => {
                 crate::oled::show_error(display, "Reset complete\nRebooting...");

@@ -702,6 +702,7 @@ pub fn run_wifi_standalone<'d, 'b>(
     }
 
     loop {
+        crate::wdt::feed();
         network_state_tick(&mut ctx);
         if ctx.network_restart_at.is_some() {
             // A management response already scheduled a restart. Do not enter
@@ -1379,6 +1380,7 @@ fn locked_relay_phase(
     let mut next_announce = Instant::now();
 
     loop {
+        crate::wdt::feed();
         // (Re)connect round-robin until a relay holds.
         if session.is_none() {
             match connect_relay_raw(&relays[relay_idx], sub_req.clone(), false, true) {

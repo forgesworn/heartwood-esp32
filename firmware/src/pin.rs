@@ -89,6 +89,9 @@ fn enable_encryption(
 ) -> Result<(), &'static str> {
     let mut prepared: Vec<(u8, Vec<u8>)> = Vec::new();
     for m in masters.iter() {
+        // Each slot pays two 100k-round PBKDF2 runs (encrypt + self-check);
+        // with several masters this phase runs for tens of seconds.
+        crate::wdt::feed();
         if m.locked {
             continue; // already encrypted (defensive)
         }
@@ -133,6 +136,7 @@ pub fn try_unlock(
     // Decrypt all first; only commit to `masters` once every slot succeeds.
     let mut decrypted: Vec<(usize, [u8; 32])> = Vec::new();
     for (i, m) in masters.iter().enumerate() {
+        crate::wdt::feed(); // 100k-round PBKDF2 per locked slot
         if !m.locked {
             continue;
         }
@@ -296,6 +300,7 @@ pub fn wipe_and_reboot(
 ) -> ! {
     let mut failure_reported = false;
     loop {
+        crate::wdt::feed();
         match crate::persistent_wipe::erase_all() {
             Ok(()) => {
                 crate::oled::show_error(display, "Wipe complete\nRebooting...");

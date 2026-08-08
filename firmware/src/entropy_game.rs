@@ -88,6 +88,7 @@ pub fn run(display: &mut Display<'_>, button: &PinDriver<'_, Input>) -> Option<[
     let mut hit_flash_until = 0i64;
 
     loop {
+        crate::wdt::feed();
         let now = now_us();
 
         // --- Input edge capture (busy-poll: timestamp the true edge) ---

@@ -28,7 +28,7 @@ Encrypted backup/restore of connection slots and policies via Sapwood -- auto-sn
 
 Encrypted at rest on-device (opt-in): either a human PIN (P5, wipes after 5 failures) or a host-held 32-byte vault key (VAULT_SET 0x62 / VAULT_UNLOCK 0x63) that heartwoodd or Sapwood delivers — unattended reboot with ciphertext on flash. WiFi-standalone locked devices announce a per-boot ephemeral unlock pubkey (kind 24135) and receive the vault key live from the operator (kind 24136). Spec: docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md.
 
-Next: end-to-end Soft mode testing (unlock, create master, pair Bark, sign). Production hardening (JTAG disable, watchdog). Sapwood UI for tier badge, unlock form, approval queue, backup export/import.
+Next: hardware verification of the encrypted-at-rest flows (docs/HARDWARE-TEST-CHECKLIST.md section 7) and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
 ## Build & flash
 

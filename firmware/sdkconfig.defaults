@@ -43,10 +43,14 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 # allocation failure now degrades to a TLS error -> clean reconnect, not a crash.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 
-# Disable task watchdog -- provisioning blocks on stdin indefinitely.
-# SECURITY NOTE: In production (post-provisioning), watchdog should be enabled
-# to recover from hung signing operations. Tracked as a known hardening item.
-CONFIG_ESP_TASK_WDT_INIT=n
+# Task watchdog on: a hung signer reboots (with a crash crumb) instead of
+# freezing with keys loaded. 60 s timeout (the Kconfig maximum) — the
+# indefinite waits (provision-wait, locked phases, dispatch/relay loops,
+# button gestures, per-slot PBKDF2) all feed it; bounded work is far under it.
+# See firmware/src/wdt.rs.
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+CONFIG_ESP_TASK_WDT_PANIC=y
 
 # Keep the version embedded in the ESP-IDF application descriptor aligned with
 # the Rust package/API version. scripts/build-firmware.sh rejects a drift before

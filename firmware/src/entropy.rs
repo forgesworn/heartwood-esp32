@@ -90,18 +90,19 @@ pub fn boot_self_test(nvs: &mut EspNvs<NvsDefault>) {
     log::info!("RNG self-test passed");
 }
 
-/// Draw 16 bytes of stacked entropy for key generation.
+/// Fill `out` (up to 32 bytes) with stacked entropy for key generation.
 ///
 /// Always includes a fresh `fill_random_strong` draw; when the owner played
 /// the entropy game its timestamp digest is mixed in as a second independent
 /// source. The mix (see `heartwood_common::entropy`) guarantees neither
-/// source alone can bias the output.
+/// source alone can bias the output. 16 bytes → a 12-word phrase, 32 bytes →
+/// 24 words.
 ///
-/// Returns `None` when the boot self-test failed — callers must treat that as
-/// a hard refusal, not a fallback to TRNG-only.
-pub fn stacked_entropy_16(game_digest: Option<&[u8; 32]>) -> Option<[u8; 16]> {
-    if !rng_ok() {
-        return None;
+/// Returns `false` when the boot self-test failed — callers must treat that
+/// as a hard refusal, not a fallback to TRNG-only.
+pub fn stacked_entropy(game_digest: Option<&[u8; 32]>, out: &mut [u8]) -> bool {
+    if !rng_ok() || out.is_empty() || out.len() > 32 {
+        return false;
     }
     let mut hw = [0u8; 32];
     crate::fill_random_strong(&mut hw);
@@ -112,10 +113,9 @@ pub fn stacked_entropy_16(game_digest: Option<&[u8; 32]>) -> Option<[u8; 16]> {
     };
     hw.iter_mut().for_each(|b| *b = 0);
 
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&stacked[..16]);
+    out.copy_from_slice(&stacked[..out.len()]);
     stacked.iter_mut().for_each(|b| *b = 0);
-    Some(out)
+    true
 }
 
 fn all_equal(buf: &[u8; 32]) -> bool {

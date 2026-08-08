@@ -69,11 +69,19 @@ pub fn derive_root_secret(mnemonic: &str, passphrase: &str) -> Result<[u8; 32], 
     Ok(key)
 }
 
-/// Generate a fresh 12-word mnemonic from 16 bytes of entropy (128 bits) and
-/// derive its tree-root secret. Returns `(phrase_to_display, root_secret)`.
-/// The caller supplies entropy from the hardware RNG and zeroizes the root after
-/// storing it; the phrase is shown on the OLED and never leaves the device.
-pub fn generate(entropy: &[u8; 16]) -> Result<(String, [u8; 32]), String> {
+/// Generate a fresh mnemonic from entropy and derive its tree-root secret.
+/// Returns `(phrase_to_display, root_secret)`. `entropy` must be 16 bytes
+/// (128 bits → 12 words) or 32 bytes (256 bits → 24 words); any other length
+/// is rejected. The caller supplies stacked entropy (hardware RNG + any user
+/// sources, see `crate::entropy`) and zeroizes the root after storing it; the
+/// phrase is shown on the OLED and never leaves the device.
+pub fn generate(entropy: &[u8]) -> Result<(String, [u8; 32]), String> {
+    if entropy.len() != 16 && entropy.len() != 32 {
+        return Err(format!(
+            "entropy must be 16 or 32 bytes (12/24 words), got {}",
+            entropy.len()
+        ));
+    }
     let m = bip39::Mnemonic::from_entropy(entropy)
         .map_err(|_| "could not build mnemonic from entropy".to_string())?;
     let phrase = m.to_string();
@@ -116,5 +124,24 @@ mod tests {
         let (_, a) = generate(&[0x01u8; 16]).unwrap();
         let (_, b) = generate(&[0x02u8; 16]).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn generate_24_words_from_32_bytes() {
+        // The canonical all-zero 24-word BIP-39 vector ends in "art".
+        let (phrase, _) = generate(&[0u8; 32]).unwrap();
+        assert_eq!(phrase.split_whitespace().count(), 24);
+        assert!(phrase.ends_with("art"), "zero 32-byte entropy vector ends in 'art'");
+        // And it round-trips: the phrase re-derives the same root.
+        let (again_phrase, root) = generate(&[0x42u8; 32]).unwrap();
+        assert_eq!(again_phrase.split_whitespace().count(), 24);
+        assert_eq!(derive_root_secret(&again_phrase, "").unwrap(), root);
+    }
+
+    #[test]
+    fn generate_rejects_odd_entropy_lengths() {
+        assert!(generate(&[0u8; 8]).is_err());
+        assert!(generate(&[0u8; 20]).is_err());
+        assert!(generate(&[0u8; 64]).is_err());
     }
 }

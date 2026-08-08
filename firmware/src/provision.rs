@@ -206,10 +206,11 @@ pub fn handle_derive(
 }
 
 /// Handle a GENERATE_IDENTITY frame (0x57). The device generates its OWN seed
-/// from the hardware RNG, derives the tree root, stores it, and shows the
-/// 12-word recovery phrase on its OLED for the owner to write down. The phrase
+/// from stacked entropy, derives the tree root, stores it, and shows the
+/// recovery phrase on its OLED for the owner to write down. The phrase
 /// is NEVER sent to the host — only the public npub is discoverable (via
-/// PROVISION_LIST). Payload is optional `[label_len][label]`; empty ⇒ "default".
+/// PROVISION_LIST). Payload is optional `[label_len][label][words?]`: empty ⇒
+/// "default" label, 12 words; the trailing words byte (new hosts) is 12 or 24.
 pub fn handle_generate(
     usb: &mut SerialPort<'_>,
     frame: &Frame,
@@ -218,8 +219,8 @@ pub fn handle_generate(
     display: &mut Display<'_>,
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> Option<LoadedMaster> {
-    let label = if frame.payload.is_empty() {
-        "default".to_string()
+    let (label, words) = if frame.payload.is_empty() {
+        ("default".to_string(), 12u8)
     } else {
         let label_len = frame.payload[0] as usize;
         if frame.payload.len() < 1 + label_len {
@@ -227,8 +228,25 @@ pub fn handle_generate(
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             return None;
         }
-        String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string()
+        // Optional trailing word count. Anything else trailing is a NACK:
+        // silently ignoring unrecognised bytes is how protocol drift starts.
+        let words = match frame.payload.len() - (1 + label_len) {
+            0 => 12,
+            1 if matches!(frame.payload[1 + label_len], 12 | 24) => {
+                frame.payload[1 + label_len]
+            }
+            n => {
+                log::warn!("GENERATE_IDENTITY bad words byte (trailing {n} byte(s))");
+                protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                return None;
+            }
+        };
+        (
+            String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string(),
+            words,
+        )
     };
+    let entropy_len = if words == 24 { 32 } else { 16 };
 
     // Offer the entropy game: the owner's button timing becomes a second,
     // independent entropy source, stacked with the hardware RNG draw so
@@ -239,27 +257,25 @@ pub fn handle_generate(
     // NVS write run, so the device isn't silently stuck on the previous screen.
     oled::show_generating(display);
 
-    // Stacked entropy — 128 bits → a 12-word phrase. Mixes a fresh SAR-ADC
-    // draw (provisioning runs before the Wi-Fi radio is up, so esp_random
-    // alone would be only pseudo-random here) with the game digest when the
-    // owner played. Hard-refuses if the boot-time RNG self-test failed.
-    let mut entropy = match crate::entropy::stacked_entropy_16(game_digest.as_ref()) {
-        Some(e) => e,
-        None => {
-            if let Some(mut d) = game_digest {
-                d.iter_mut().for_each(|b| *b = 0);
-            }
-            log::error!("on-device generate refused: RNG self-test failed this boot");
-            oled::show_error(display, "RNG self-test failed\nrefusing to generate");
-            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-            return None;
+    // Stacked entropy — 128 bits → 12 words, 256 bits → 24 words. Mixes a
+    // fresh SAR-ADC draw (provisioning runs before the Wi-Fi radio is up, so
+    // esp_random alone would be only pseudo-random here) with the game digest
+    // when the owner played. Hard-refuses if the boot RNG self-test failed.
+    let mut entropy = [0u8; 32];
+    if !crate::entropy::stacked_entropy(game_digest.as_ref(), &mut entropy[..entropy_len]) {
+        if let Some(mut d) = game_digest {
+            d.iter_mut().for_each(|b| *b = 0);
         }
-    };
+        log::error!("on-device generate refused: RNG self-test failed this boot");
+        oled::show_error(display, "RNG self-test failed\nrefusing to generate");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return None;
+    }
     if let Some(mut d) = game_digest {
         d.iter_mut().for_each(|b| *b = 0);
     }
 
-    let (phrase, root) = match heartwood_common::mnemonic::generate(&entropy) {
+    let (phrase, root) = match heartwood_common::mnemonic::generate(&entropy[..entropy_len]) {
         Ok(pair) => pair,
         Err(e) => {
             entropy.iter_mut().for_each(|b| *b = 0);

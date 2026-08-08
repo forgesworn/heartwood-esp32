@@ -628,7 +628,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         if let Some(op) = &op_mgmt {
             if !relays.is_empty() {
                 log::info!("[relay] seeds locked — entering vault-unlock phase");
-                locked_relay_phase(&relays, op, secp, masters, nvs, usb, display, button_pin);
+                locked_relay_phase(&relays, op, secp, masters, personas, nvs, usb, display, button_pin);
             }
         }
     }
@@ -1338,6 +1338,7 @@ fn locked_relay_phase(
     op_mgmt: &[u8; 32],
     secp: &Arc<Secp256k1<SignOnly>>,
     masters: &mut [LoadedMaster],
+    personas: &[crate::personas::LoadedPersona],
     nvs: &mut EspNvs<NvsDefault>,
     usb: &mut SerialPort<'_>,
     display: &mut Display<'_>,
@@ -1506,6 +1507,12 @@ fn locked_relay_phase(
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
                     crate::firmware_info_json().as_bytes(),
                 ),
+                FRAME_TYPE_PROVISION_LIST => {
+                    // Safe while locked (npubs only, no secrets) and REQUIRED
+                    // for Sapwood to recognise the signer and show its locked
+                    // banner — without it a locked signer looks brand new.
+                    crate::provision::handle_list(usb, masters, personas, None);
+                }
                 FRAME_TYPE_FACTORY_RESET => {
                     // A locked device MUST stay resettable: with the unlock
                     // secret lost, the button-gated wipe is the only way back

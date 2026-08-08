@@ -390,6 +390,45 @@ impl SigningBackend for SerialBackend {
         }
     }
 
+    /// Create a new master by asking the DEVICE to generate the key itself
+    /// (GENERATE_IDENTITY, 0x57). The ESP32 plays its entropy game with the
+    /// owner, stacks the button-timing digest with the hardware RNG draw,
+    /// derives the tree root, stores it, and ACKs with the npub — all before
+    /// walking the owner through the recovery phrase on the OLED, so this call
+    /// returns as soon as the key exists; the phrase walkthrough doesn't block
+    /// us. The timeout covers the worst case: intro timeout + a full 90 s game
+    /// + PBKDF2 + derivation + NVS write.
+    fn create_master(&self, label: &str) -> Result<Value, BackendError> {
+        if label.len() > 255 {
+            return Err(BackendError::Internal("label too long (max 255 bytes)".into()));
+        }
+
+        // Payload: [label_len_u8][label...] — empty payload means "default".
+        let mut payload = Vec::with_capacity(1 + label.len());
+        payload.push(label.len() as u8);
+        payload.extend_from_slice(label.as_bytes());
+
+        let frame_bytes = frame::build_frame(FRAME_TYPE_GENERATE_IDENTITY, &payload)
+            .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
+
+        let mut port = self.acquire()?;
+        let resp = self.send_and_receive(&mut port, &frame_bytes, &[FRAME_TYPE_ACK], 180)?;
+        drop(port); // release the serial mutex before the follow-up list call
+
+        let npub = String::from_utf8(resp.payload)
+            .map_err(|e| BackendError::Internal(format!("ACK payload not UTF-8: {e}")))?;
+
+        // Return the same row shape Sapwood lists, so the UI can render the
+        // new master identically whether it came from Hard or Soft mode.
+        let masters = self.list_masters()?;
+        masters
+            .into_iter()
+            .find(|m| m.get("npub").and_then(Value::as_str) == Some(npub.as_str()))
+            .ok_or_else(|| {
+                BackendError::Internal("device ACKed but new master not in list".into())
+            })
+    }
+
     // -- Connection slot management ------------------------------------------
 
     fn list_slots(&self, master: u8) -> Result<Value, BackendError> {

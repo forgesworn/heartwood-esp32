@@ -158,8 +158,9 @@ pub trait SigningBackend: Send + Sync {
     fn list_masters(&self) -> Result<Vec<Value>, BackendError>;
 
     /// Create a new master. Returns the new master's JSON representation.
-    /// Default implementation returns NotSupported (only Soft mode supports
-    /// on-device key generation; Hard mode provisions via the ESP32 CLI).
+    /// Soft mode generates the key in the daemon's encrypted keystore; Hard
+    /// mode asks the ESP32 to self-generate (GENERATE_IDENTITY), which plays
+    /// the on-device entropy game and shows the recovery phrase on the OLED.
     fn create_master(&self, label: &str) -> Result<Value, BackendError> {
         let _ = label;
         Err(BackendError::NotSupported)

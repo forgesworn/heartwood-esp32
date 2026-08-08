@@ -166,16 +166,20 @@
     </div>
     <div class="spec-row">
       <dt>Sealed at rest</dt>
-      <dd>Set a PIN and each seed is stored encrypted, with no PIN hash kept on
-      the device. Every guess pays the full key-derivation cost, and five wrong
-      attempts wipe the device clean.</dd>
+      <dd>Two ways to seal the seeds. Set a PIN and each seed is stored encrypted,
+      with no PIN hash kept on the device: every guess pays the full
+      key-derivation cost, and five wrong attempts wipe the device clean. Or hand
+      a 256&#8209;bit vault key to the Pi (or to Sapwood on your phone) and the
+      device unlocks itself on every reboot — no PIN to type from another
+      country. Either way, the flash alone holds only ciphertext.</dd>
     </div>
   </dl>
   <p class="aside">
     Honest limits: the default build leaves ESP32 flash encryption and secure boot
-    off, because burning eFuses is irreversible and that stays your call. Without a PIN,
-    someone holding the board can read flash. Set the PIN, and treat physical
-    custody as part of the model: Heartwood is a signer you own, not a bank vault.
+    off, because burning eFuses is irreversible and that stays your call. Leave the
+    seeds unsealed and someone holding the board can read flash. Set the PIN or the
+    vault key, and treat physical custody as part of the model: Heartwood is a
+    signer you own, not a bank vault.
     The full write-up is in
     <a href="https://github.com/forgesworn/heartwood-esp32/blob/main/docs/SECURITY-MODEL.md">SECURITY&#8209;MODEL.md</a>.
   </p>

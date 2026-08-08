@@ -333,6 +333,7 @@ docs/
 - [x] Serial OTA with SHA-256 verification and automatic rollback
 - [x] Factory reset with button confirmation
 - [x] PIN lock with NVS-persisted failed-attempt counter
+- [x] Host-held vault key — seeds sealed under a 256-bit host-side key with unattended reboot (Pi auto-unlock over USB, or one-tap remote unlock from Sapwood over relays); see `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`
 - [ ] Rate limiting in policy engine (per-client counter exists in `ClientSession` but is not yet wired into the request dispatch path)
 - [x] Mutual-exclusivity guard between device-decrypts and legacy modes
 - [x] Bearer token auth on bridge management API
@@ -374,7 +375,7 @@ docs/
 - **WiFi signing as the default** — the high-assurance default keeps all radios off and networks via the USB-attached Pi; a live TCP/IP stack is a real liability on a key-holding device. WiFi is off unless you explicitly opt into WiFi-standalone mode (see above), which trades that surface for dropping the Pi.
 - **Master secret on portable device** — only child keys leave the home HSM. If the portable device is lost, the damage is one branch.
 - **LoRa signing** — signing is a response to a request, and the requester needs internet anyway. LoRa solves a problem that doesn't exist for this use case. The SX1262 is never initialised (safe without antenna).
-- **Flash encryption / eFuse burning** — permanently locks the chip to one firmware, prevents reuse (e.g. Meshtastic), and risks bricking if anything goes wrong. Physical security is the protection model instead. May revisit on a dedicated production unit.
+- **Flash encryption / eFuse burning** — permanently locks the chip to one firmware, prevents reuse (e.g. Meshtastic), and risks bricking if anything goes wrong. At-rest protection is instead provided by the opt-in PIN or host-held vault key (both seal the seeds without touching eFuses); physical custody remains part of the model. May revisit on a dedicated production unit.
 
 ## Part of the ForgeSworn Toolkit
 

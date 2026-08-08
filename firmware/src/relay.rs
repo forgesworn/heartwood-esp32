@@ -74,7 +74,7 @@ use heartwood_common::types::{
     FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
     FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN,
-    FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_VAULT_UNLOCK,
+    FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK,
     FRAME_TYPE_SIGN_ENVELOPE, FRAME_TYPE_WIFI_SCAN_REQUEST,
 };
 
@@ -1798,6 +1798,23 @@ fn poll_usb(
             ctx.display,
             ctx.button_pin,
         ),
+
+        // Vault management over the cable in wifi mode (mirrors the USB-only
+        // loop). VAULT_UNLOCK is a no-op here — a device serving poll_usb is
+        // already unlocked; the locked wifi path handles it in
+        // locked_relay_phase.
+        FRAME_TYPE_VAULT_SET => crate::pin::handle_vault_set(
+            usb,
+            &frame.payload,
+            ctx.nvs,
+            ctx.masters,
+            ctx.policy_engine.bridge_authenticated,
+            ctx.display,
+            ctx.button_pin,
+        ),
+        FRAME_TYPE_VAULT_UNLOCK => {
+            crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"already unlocked");
+        }
 
         FRAME_TYPE_CONNSLOT_CREATE => {
             crate::connslot::handle_create(usb, &frame, ctx.policy_engine, ctx.masters, ctx.nvs)

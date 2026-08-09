@@ -142,10 +142,10 @@
   <dl class="spec-rows">
     <div class="spec-row">
       <dt>Born on the device</dt>
-      <dd>The seed is drawn from the chip's hardware entropy source — boot-tested
-      and <a href="#entropy">stacked with randomness you supply</a> — shown once
-      on the display at creation, and never leaves by any code path: not USB, not
-      relay, not backup. Up to eight master identities per device.</dd>
+      <dd>The seed is drawn from the chip's hardware entropy source, boot-tested
+      and <a href="#entropy">stacked with randomness you supply</a>. It is shown
+      once on the display at creation and never leaves by any code path: not
+      USB, not relay, not backup. Up to eight master identities per device.</dd>
     </div>
     <div class="spec-row">
       <dt>Policies that fail closed</dt>
@@ -172,7 +172,7 @@
       with no PIN hash kept on the device: every guess pays the full
       key-derivation cost, and five wrong attempts wipe the device clean. Or hand
       a 256&#8209;bit vault key to the Pi (or to Sapwood on your phone) and the
-      device unlocks itself on every reboot — no PIN to type from another
+      device unlocks itself on every reboot; no PIN to type from another
       country. Either way, the flash alone holds only ciphertext.</dd>
     </div>
   </dl>
@@ -195,22 +195,28 @@
   </div>
   <div class="section-body two-col">
     <p>
-      "Generated from hardware entropy" is the claim on every signer's box, and
-      it is precisely the claim an owner cannot check: a broken RNG produces
-      bytes that look exactly like a good one's. The industry relearned this in
-      July 2026, when Coldcard disclosed that five years of seed generation had
-      silently fallen back to a software PRNG. The strong-source code was
-      correct; it just wasn't in the call path. The seeds that survived were
-      the ones mixed with user dice rolls.
+      Every signer's box says the same thing: keys generated from hardware
+      entropy. It is the one claim an owner cannot check, because bytes from a
+      broken RNG look exactly like bytes from a good one. Coldcard proved the
+      point in July 2026. For five years their seed generation had quietly
+      fallen back to a software PRNG. The strong-source code was correct; it
+      simply was never called. The seeds that survived were the ones users had
+      mixed with dice rolls.
     </p>
     <p>
-      So Heartwood treats its RNG as a suspect and you as a witness. At every
-      boot the chip must produce a draw it has never produced before — each
-      draw's hash is stored and compared against the next. Fail, and the device
-      refuses to create new keys, while existing keys keep signing: their
-      entropy is already spent, and fresh entropy is exactly where failure must
-      close. And before a seed is born, you are invited to add randomness the
-      chip cannot fake — by playing a game.
+      The ESP32 sets precisely this trap. Its RNG register is only truly random
+      while an entropy source feeds it: the radio, or the chip's ADC sampling
+      thermal noise. Heartwood generates keys before any radio is up, and in
+      the high-assurance tier the radio never comes up at all, so a naive draw
+      would return what the SDK documents for that state: pseudo-random
+      numbers. The firmware never takes a naive draw. Every draw of key
+      material switches the thermal-noise source on, reads, and switches it
+      off again. Then, at every boot, the chip must prove the source is alive:
+      it draws, hashes, and compares against last boot's stored hash. A stuck
+      or stubbed RNG repeats itself, fails the comparison, and the device
+      refuses to create new keys. Existing keys keep signing; their entropy is
+      already spent. And because Coldcard's code was correct too, the device
+      also asks for randomness no firmware bug can fake. Yours.
     </p>
   </div>
 
@@ -225,40 +231,59 @@
     <figcaption id="fig2-caption">
       <span class="fig-no">Fig. 2</span>. The entropy game, physics per the
       firmware: the chip spawns the blocks, your thumb supplies the timing.
-      Losing a block is fine — every tap's <em>when</em> is banked, never its
-      <em>whether</em>.
+      Losing a block costs nothing. Every tap is banked for <em>when</em> it
+      happened, not whether it scored.
     </figcaption>
   </figure>
 
   <dl class="spec-rows">
     <div class="spec-row">
       <dt>The stimulus is not the harvest</dt>
-      <dd>The blocks are spawned by the hardware RNG, never by your press
-      stream — your own output is not allowed to steer your input. What is
-      recorded is the microsecond timestamp of each press, captured at the
-      true electrical edge.</dd>
+      <dd>The blocks are spawned by the chip's RNG, never by your presses, so
+      your own output cannot steer your input. What is kept is the microsecond
+      timestamp of every tap, read at the true electrical edge rather than a
+      10&nbsp;ms tick.</dd>
     </div>
     <div class="spec-row">
       <dt>Counted like a pessimist</dt>
-      <dd>Human timing under a reaction task is credited at one to two bits of
-      min&#8209;entropy per press — far below the raw microsecond figure — so
-      sixty&#8209;four presses are banked as sixty&#8209;four bits, not
-      boasted as a thousand.</dd>
+      <dd>Human timing under a reaction task is credited at one to two bits
+      per press, far below the raw microsecond figure. Sixty&#8209;four
+      presses are banked as sixty&#8209;four bits, not boasted as a
+      thousand.</dd>
     </div>
     <div class="spec-row">
       <dt>Neither source can spoil the other</dt>
-      <dd>Chip draw and press digest are hashed together, domain-separated and
-      length-prefixed. If either is unpredictable, the seed is. Someone
-      filming your thumb learns nothing unless the TRNG is broken too — and a
-      broken TRNG is caught at boot.</dd>
+      <dd>The chip draw and your timings are hashed together, domain-separated
+      and length-prefixed. If either one is unpredictable, the seed is.
+      Someone filming your thumb learns nothing while the chip source is
+      healthy, and a chip source gone quietly predictable cannot outguess
+      your thumb.</dd>
     </div>
   </dl>
+  <div class="section-body two-col">
+    <p>
+      So the failure ladder reads like this. A dead RNG is caught at boot and
+      the device refuses to mint keys. A weak RNG that slips past the test
+      still meets your sixty-four timings in the hash, and the seed stays
+      unpredictable. What no amount of randomness can save is a seed sitting
+      in readable flash: randomness at birth and encryption at rest are
+      different jobs. One stops guessing, the other stops reading.
+    </p>
+    <p>
+      So if the board might ever leave your desk, <a href="#security">seal
+      it</a>. With a PIN, every guess pays the full key-derivation price and
+      the fifth wrong one wipes the device; with a vault key, the seeds sit in
+      ciphertext until the host you chose hands the key back. An unsealed seed
+      is an open book to anyone holding the hardware, however well it was
+      born.
+    </p>
+  </div>
   <p class="aside">
     The game is optional: hold the button and provisioning falls back to the
-    boot-tested chip source alone. The whole stacking construction is a few
-    dozen lines in
-    <a href="https://github.com/forgesworn/heartwood-esp32/blob/main/common/src/entropy.rs">common/src/entropy.rs</a>
-    — pure, <span class="mono">no_std</span>, testable on any host — and the game is
+    boot-tested chip source alone. The stacking construction is a few dozen
+    lines in
+    <a href="https://github.com/forgesworn/heartwood-esp32/blob/main/common/src/entropy.rs">common/src/entropy.rs</a>,
+    pure and testable on any host, and the game is
     <a href="https://github.com/forgesworn/heartwood-esp32/blob/main/firmware/src/entropy_game.rs">firmware/src/entropy_game.rs</a>.
     Check our work.
   </p>

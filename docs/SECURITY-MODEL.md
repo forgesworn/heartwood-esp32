@@ -369,6 +369,8 @@ Design spec: `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`.
   signatures themselves — the covert channel Blockstream Jade closes with its
   sign-to-contract Anti-Exfil protocol. Closing it needs the host to commit
   randomness into the nonce, which NIP-46 has no method for; today the defence
-  is the signed, CI-built release chain plus deliberate rollback capability. A
-  nonce-commitment extension (heartwood method first, draft NIP after) is
-  future work.
+  is the signed, CI-built release chain plus deliberate rollback capability.
+  The protocol to close it is specified in
+  [`docs/nip-nonce-commitment.md`](nip-nonce-commitment.md) (published as a
+  draft community NIP, kind 30817, identifier `nip-nonce-commitment`);
+  the firmware implementation is future work.

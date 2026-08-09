@@ -204,19 +204,22 @@
       mixed with dice rolls.
     </p>
     <p>
-      The ESP32 sets precisely this trap. Its RNG register is only truly random
-      while an entropy source feeds it: the radio, or the chip's ADC sampling
-      thermal noise. Heartwood generates keys before any radio is up, and in
-      the high-assurance tier the radio never comes up at all, so a naive draw
-      would return what the SDK documents for that state: pseudo-random
-      numbers. The firmware never takes a naive draw. Every draw of key
-      material switches the thermal-noise source on, reads, and switches it
-      off again. Then, at every boot, the chip must prove the source is alive:
-      it draws, hashes, and compares against last boot's stored hash. A stuck
-      or stubbed RNG repeats itself, fails the comparison, and the device
-      refuses to create new keys. Existing keys keep signing; their entropy is
-      already spent. And because Coldcard's code was correct too, the device
-      also asks for randomness no firmware bug can fake. Yours.
+      The ESP32 sets precisely this trap. Its RNG register always answers, but
+      it is only truly random while a hardware noise source feeds it, and the
+      chip has two: RF noise from a running radio, and thermal noise sampled
+      by the ADC. A radio-silent signer obviously cannot lean on the first,
+      and code that never asks for the second gets what the SDK documents for
+      that state: pseudo-random numbers, delivered without complaint. So the
+      firmware asks, every time. Each draw of key material switches the
+      thermal-noise source on, reads, and switches it off again. That is the
+      same source the chip's own boot process trusts to seed itself, and it is
+      live in every tier, radio or no radio. Then, at every boot, the chip
+      must prove the source is alive: it draws, hashes, and compares against
+      last boot's stored hash. A stuck or stubbed RNG repeats itself, fails
+      the comparison, and the device refuses to create new keys. Existing keys
+      keep signing; their entropy is already spent. And because Coldcard's
+      code was correct too, the device also asks for randomness no firmware
+      bug can fake. Yours.
     </p>
   </div>
 

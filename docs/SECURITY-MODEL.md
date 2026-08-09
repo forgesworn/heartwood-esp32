@@ -361,3 +361,14 @@ Design spec: `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`.
 - **`BACKUP_EXPORT` over USB** returns slot + bridge secrets (not the seed) and is
   not separately bridge-auth-gated; this is defence-in-depth only, since USB
   physical access already implies a flash read. Worth gating regardless.
+- **No Anti-Exfil-style nonce commitment.** A *weak or dead* RNG cannot weaken
+  signatures: BIP-340 derives the nonce from the secret key and message, and
+  `aux_rand` (drawn via `fill_random`, `firmware/src/sign.rs`) can only add
+  entropy, never replace it. What synthetic nonces do NOT stop is *malicious
+  signed firmware* grinding its `aux_rand` choice to leak seed bits through the
+  signatures themselves — the covert channel Blockstream Jade closes with its
+  sign-to-contract Anti-Exfil protocol. Closing it needs the host to commit
+  randomness into the nonce, which NIP-46 has no method for; today the defence
+  is the signed, CI-built release chain plus deliberate rollback capability. A
+  nonce-commitment extension (heartwood method first, draft NIP after) is
+  future work.

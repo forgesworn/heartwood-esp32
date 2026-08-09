@@ -181,7 +181,12 @@
     off, because burning eFuses is irreversible and that stays your call. Leave the
     seeds unsealed and someone holding the board can read flash. Set the PIN or the
     vault key, and treat physical custody as part of the model: Heartwood is a
-    signer you own, not a bank vault.
+    signer you own, not a bank vault. One more, stated because few signers do:
+    BIP&#8209;340's nonce construction means even a broken RNG cannot weaken a
+    signature, but a malicious signed firmware could in principle leak key bits
+    through its nonce choices. NIP&#8209;46 has no Anti&#8209;Exfil-style answer
+    yet; until it does, the defence is the signed release chain and the source
+    you can read.
     The full write-up is in
     <a href="https://github.com/forgesworn/heartwood-esp32/blob/main/docs/SECURITY-MODEL.md">SECURITY&#8209;MODEL.md</a>.
   </p>

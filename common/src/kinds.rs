@@ -26,11 +26,16 @@ pub fn kind_label(kind: u64) -> Option<&'static str> {
         23194 => "Wallet Request",
         23195 => "Wallet Response",
         24133 => "NIP-46",
+        // V4V gated content (Pulsewire). Kind numbers provisional until NIP
+        // review; 27117 sets money terms for a release, so the person holding
+        // the button deserves better than "Unknown Kind" for it.
+        27117 => "Gated Deposit Auth",
         27235 => "HTTP Auth",
         30000 => "People List",
         30023 => "Article",
         30078 => "App Data",
         30311 => "Live Event",
+        30808 => "Gated Content",
         _ => return None,
     })
 }
@@ -44,6 +49,12 @@ mod tests {
         assert_eq!(kind_label(0), Some("Profile"));
         assert_eq!(kind_label(30078), Some("App Data"));
         assert_eq!(kind_label(1), Some("Note"));
+    }
+
+    #[test]
+    fn v4v_gated_kinds_are_named_on_the_approval_screen() {
+        assert_eq!(kind_label(27117), Some("Gated Deposit Auth"));
+        assert_eq!(kind_label(30808), Some("Gated Content"));
     }
 
     #[test]

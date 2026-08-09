@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Heartwood: the Nostr signer that keeps keys on a chip</title>
-<meta name="description" content="Heartwood is an open hardware signer for Nostr on ESP32. Keys are generated on the device from hardware entropy and never leave it; a physical button approves what policies don't. Rust, NIP-46, MIT.">
+<meta name="description" content="Heartwood is an open hardware signer for Nostr on ESP32. Keys are generated on the device from boot-tested hardware entropy stacked with your own, and never leave it; a physical button approves what policies don't. Rust, NIP-46, MIT.">
 <link rel="canonical" href="https://heartwood.forgesworn.dev/">
 <meta property="og:title" content="Heartwood: the Nostr signer that keeps keys on a chip">
 <meta property="og:description" content="An open hardware signer on ESP32. Keys are born on the device and never leave it; a physical button approves what policies don't.">
@@ -24,6 +24,7 @@
     <a href="#why">Why</a>
     <a href="#hardware">Hardware</a>
     <a href="#security">Security</a>
+    <a href="#entropy">Entropy</a>
     <a href="#daemon">heartwoodd</a>
     <a href="#start">Get started</a>
     <a class="ext" href="https://github.com/forgesworn/heartwood-esp32">GitHub</a>
@@ -47,7 +48,7 @@
       <a class="btn btn-primary" href="#start">Get started</a>
       <a class="btn btn-ghost" href="https://github.com/forgesworn/heartwood-esp32">Read the source</a>
     </div>
-    <p class="hero-meta reveal r5">Rust firmware &nbsp;·&nbsp; four boards &nbsp;·&nbsp; NIP&#8209;46 / NIP&#8209;44 &nbsp;·&nbsp; MIT &nbsp;·&nbsp; v0.13.7</p>
+    <p class="hero-meta reveal r5">Rust firmware &nbsp;·&nbsp; four boards &nbsp;·&nbsp; NIP&#8209;46 / NIP&#8209;44 &nbsp;·&nbsp; MIT &nbsp;·&nbsp; v0.15.0</p>
   </div>
 
   <!-- Fig. 1: the boot sequence, frame for frame from the firmware -->
@@ -141,8 +142,9 @@
   <dl class="spec-rows">
     <div class="spec-row">
       <dt>Born on the device</dt>
-      <dd>The seed is drawn from the chip's hardware entropy source, shown once on
-      the display at creation, and never leaves by any code path: not USB, not
+      <dd>The seed is drawn from the chip's hardware entropy source — boot-tested
+      and <a href="#entropy">stacked with randomness you supply</a> — shown once
+      on the display at creation, and never leaves by any code path: not USB, not
       relay, not backup. Up to eight master identities per device.</dd>
     </div>
     <div class="spec-row">
@@ -185,10 +187,87 @@
   </p>
 </section>
 
-<!-- ======================= 04 · HEARTWOODD ======================= -->
-<section class="section" id="daemon">
+<!-- ======================= 04 · ENTROPY ======================= -->
+<section class="section" id="entropy">
   <div class="section-head">
     <span class="section-no">04</span>
+    <h2>Where the randomness comes from</h2>
+  </div>
+  <div class="section-body two-col">
+    <p>
+      "Generated from hardware entropy" is the claim on every signer's box, and
+      it is precisely the claim an owner cannot check: a broken RNG produces
+      bytes that look exactly like a good one's. The industry relearned this in
+      July 2026, when Coldcard disclosed that five years of seed generation had
+      silently fallen back to a software PRNG. The strong-source code was
+      correct; it just wasn't in the call path. The seeds that survived were
+      the ones mixed with user dice rolls.
+    </p>
+    <p>
+      So Heartwood treats its RNG as a suspect and you as a witness. At every
+      boot the chip must produce a draw it has never produced before — each
+      draw's hash is stored and compared against the next. Fail, and the device
+      refuses to create new keys, while existing keys keep signing: their
+      entropy is already spent, and fresh entropy is exactly where failure must
+      close. And before a seed is born, you are invited to add randomness the
+      chip cannot fake — by playing a game.
+    </p>
+  </div>
+
+  <!-- Fig. 2: the entropy game, physics per the firmware -->
+  <figure class="plate" aria-labelledby="fig2-caption">
+    <div class="oled">
+      <picture>
+        <source srcset="/entropy-game-still.png" media="(prefers-reduced-motion: reduce)">
+        <img src="/entropy-game.gif" width="128" height="64" alt="The entropy game on the OLED: an intro card reads ADD YOUR RANDOMNESS, tap to jump the blocks, hold to skip; then a small square runner bounces over scrolling blocks while a press counter climbs; one block gets through with a warning flash; a closing card reads ENTROPY BANKED, 64 presses mixed with chip RNG">
+      </picture>
+    </div>
+    <figcaption id="fig2-caption">
+      <span class="fig-no">Fig. 2</span>. The entropy game, physics per the
+      firmware: the chip spawns the blocks, your thumb supplies the timing.
+      Losing a block is fine — every tap's <em>when</em> is banked, never its
+      <em>whether</em>.
+    </figcaption>
+  </figure>
+
+  <dl class="spec-rows">
+    <div class="spec-row">
+      <dt>The stimulus is not the harvest</dt>
+      <dd>The blocks are spawned by the hardware RNG, never by your press
+      stream — your own output is not allowed to steer your input. What is
+      recorded is the microsecond timestamp of each press, captured at the
+      true electrical edge.</dd>
+    </div>
+    <div class="spec-row">
+      <dt>Counted like a pessimist</dt>
+      <dd>Human timing under a reaction task is credited at one to two bits of
+      min&#8209;entropy per press — far below the raw microsecond figure — so
+      sixty&#8209;four presses are banked as sixty&#8209;four bits, not
+      boasted as a thousand.</dd>
+    </div>
+    <div class="spec-row">
+      <dt>Neither source can spoil the other</dt>
+      <dd>Chip draw and press digest are hashed together, domain-separated and
+      length-prefixed. If either is unpredictable, the seed is. Someone
+      filming your thumb learns nothing unless the TRNG is broken too — and a
+      broken TRNG is caught at boot.</dd>
+    </div>
+  </dl>
+  <p class="aside">
+    The game is optional: hold the button and provisioning falls back to the
+    boot-tested chip source alone. The whole stacking construction is a few
+    dozen lines in
+    <a href="https://github.com/forgesworn/heartwood-esp32/blob/main/common/src/entropy.rs">common/src/entropy.rs</a>
+    — pure, <span class="mono">no_std</span>, testable on any host — and the game is
+    <a href="https://github.com/forgesworn/heartwood-esp32/blob/main/firmware/src/entropy_game.rs">firmware/src/entropy_game.rs</a>.
+    Check our work.
+  </p>
+</section>
+
+<!-- ======================= 05 · HEARTWOODD ======================= -->
+<section class="section" id="daemon">
+  <div class="section-head">
+    <span class="section-no">05</span>
     <h2>No hardware yet? Run it soft.</h2>
   </div>
   <div class="section-body">
@@ -215,13 +294,13 @@
   </div>
 </section>
 
-<!-- ======================= 05 · THE PATH ======================= -->
+<!-- ======================= 06 · THE PATH ======================= -->
 <section class="section" id="path">
   <div class="section-head">
-    <span class="section-no">05</span>
+    <span class="section-no">06</span>
     <h2>A signature's journey</h2>
   </div>
-  <figure class="plate wide" aria-labelledby="fig2-caption">
+  <figure class="plate wide" aria-labelledby="fig3-caption">
     <svg viewBox="0 0 880 240" xmlns="http://www.w3.org/2000/svg" role="img"
          aria-label="Flow diagram: a Nostr app using Bark or Cambium sends a NIP-46 request through a relay to heartwoodd on a Pi, which pumps ciphertext over USB to the Heartwood device, where policy and the button decide before the signature returns by the same path">
       <g class="dg">
@@ -253,18 +332,18 @@
         <text class="wlbl" x="447" y="196" text-anchor="middle">the signature returns by the same path</text>
       </g>
     </svg>
-    <figcaption id="fig2-caption">
-      <span class="fig-no">Fig. 2</span>. Nothing left of the device ever holds a key.
+    <figcaption id="fig3-caption">
+      <span class="fig-no">Fig. 3</span>. Nothing left of the device ever holds a key.
       Compromise the browser, the phone, the Pi, or the relay, and you hold the ability
       to <em>ask</em>.
     </figcaption>
   </figure>
 </section>
 
-<!-- ======================= 06 · GET STARTED ======================= -->
+<!-- ======================= 07 · GET STARTED ======================= -->
 <section class="section" id="start">
   <div class="section-head">
-    <span class="section-no">06</span>
+    <span class="section-no">07</span>
     <h2>Get started</h2>
   </div>
   <ol class="steps">

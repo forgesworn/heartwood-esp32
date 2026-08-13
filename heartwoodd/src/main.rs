@@ -623,7 +623,7 @@ fn load_or_generate_api_token(data_dir: &str) -> Result<String, String> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let cli = Cli::parse();
 
@@ -944,7 +944,9 @@ async fn main() -> Result<()> {
     // backoff rather than exiting the daemon.
     let mut backoff_secs = 5u64;
     loop {
-        let client = Client::new(bunker_keys.clone());
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(bunker_keys.clone()))
+            .build();
         for url in &relay_list {
             client.add_relay(url.as_str()).await?;
         }
@@ -968,7 +970,7 @@ async fn main() -> Result<()> {
                             None => break, // sender dropped — daemon is exiting
                         }
                     };
-                    match nostr_sdk::Event::from_json(&json) {
+                    match Event::from_json(&json) {
                         Ok(ev) => match client.send_event(&ev).await {
                             Ok(output) => {
                                 log::info!("Approved response published: {}", output.id())

@@ -7,6 +7,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
+use std::time::Duration;
 
 use nix::sys::termios;
 
@@ -74,6 +75,36 @@ impl RawSerial {
         }
 
         Ok(Self { file })
+    }
+
+    /// Write one complete Heartwood frame using the measured cadence shared
+    /// with Sapwood and sign-test. Native USB and UART-backed boards can lose
+    /// bytes when a frame larger than the firmware's receive ring is burst in
+    /// one host write. Once the first 3 KiB has been drained, the faster tail
+    /// cadence is safe because the firmware is in its blocking frame reader.
+    pub fn write_frame_paced(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        const PACE_THRESHOLD: usize = 512;
+        const PACE_CHUNK: usize = 64;
+        const PACE_HEAD_BYTES: usize = 3_072;
+        const PACE_HEAD_GAP: Duration = Duration::from_millis(24);
+        const PACE_GAP: Duration = Duration::from_millis(6);
+
+        if bytes.len() <= PACE_THRESHOLD {
+            self.file.write_all(bytes)?;
+        } else {
+            for (index, chunk) in bytes.chunks(PACE_CHUNK).enumerate() {
+                self.file.write_all(chunk)?;
+                self.file.flush()?;
+                if (index + 1) * PACE_CHUNK < bytes.len() {
+                    std::thread::sleep(if index * PACE_CHUNK < PACE_HEAD_BYTES {
+                        PACE_HEAD_GAP
+                    } else {
+                        PACE_GAP
+                    });
+                }
+            }
+        }
+        self.file.flush()
     }
 }
 

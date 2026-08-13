@@ -37,6 +37,11 @@ use heartwood_common::types::*;
 
 use serial::RawSerial;
 
+/// Vault encryption deliberately performs a slow key derivation for every
+/// provisioned identity. Keep startup unlock on the same generous budget as
+/// enable/disable so a multi-identity signer is not queried while still busy.
+const VAULT_OPERATION_TIMEOUT_SECS: u64 = 60;
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -146,7 +151,7 @@ fn detect_mode(cli: &Cli) -> DetectedMode {
                 Ok(mut port) => {
                     let probe = frame::build_frame(FRAME_TYPE_PROVISION_LIST, &[]);
                     if let Ok(frame_bytes) = probe {
-                        let _ = port.write_all(&frame_bytes);
+                        let _ = port.write_frame_paced(&frame_bytes);
                         let _ = port.flush();
                         let deadline = std::time::Instant::now() + Duration::from_secs(3);
                         while std::time::Instant::now() < deadline {
@@ -203,10 +208,8 @@ fn unlock_pin(port: &mut RawSerial, pin: &str) -> Result<(), String> {
     let frame_bytes = frame::build_frame(FRAME_TYPE_PIN_UNLOCK, pin.as_bytes())
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
-    port.write_all(&frame_bytes)
+    port.write_frame_paced(&frame_bytes)
         .map_err(|e| format!("serial write failed: {e}"))?;
-    port.flush()
-        .map_err(|e| format!("serial flush failed: {e}"))?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -256,10 +259,8 @@ fn authenticate_bridge(port: &mut RawSerial, bridge_secret: &[u8; 32]) -> Result
     let frame_bytes = frame::build_frame(FRAME_TYPE_SESSION_AUTH, bridge_secret)
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
-    port.write_all(&frame_bytes)
+    port.write_frame_paced(&frame_bytes)
         .map_err(|e| format!("serial write failed: {e}"))?;
-    port.flush()
-        .map_err(|e| format!("serial flush failed: {e}"))?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -319,10 +320,8 @@ fn send_frame_wait_ack(
     let frame_bytes = frame::build_frame(frame_type, payload)
         .map_err(|e| format!("frame build failed: {:?}", e))?;
 
-    port.write_all(&frame_bytes)
+    port.write_frame_paced(&frame_bytes)
         .map_err(|e| format!("serial write failed: {e}"))?;
-    port.flush()
-        .map_err(|e| format!("serial flush failed: {e}"))?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
@@ -410,14 +409,24 @@ fn run_vault_oneshot(cli: &Cli, vault_key_path: &std::path::Path) -> i32 {
     let result = if cli.vault_enable {
         match vault::load_or_generate_vault_key(vault_key_path) {
             Ok(mut key) => {
-                let r = send_frame_wait_ack(&mut port, FRAME_TYPE_VAULT_SET, &key, 60);
+                let r = send_frame_wait_ack(
+                    &mut port,
+                    FRAME_TYPE_VAULT_SET,
+                    &key,
+                    VAULT_OPERATION_TIMEOUT_SECS,
+                );
                 key.zeroize();
                 r
             }
             Err(e) => Err(e),
         }
     } else {
-        send_frame_wait_ack(&mut port, FRAME_TYPE_VAULT_SET, &[], 60)
+        send_frame_wait_ack(
+            &mut port,
+            FRAME_TYPE_VAULT_SET,
+            &[],
+            VAULT_OPERATION_TIMEOUT_SECS,
+        )
     };
 
     match result {
@@ -614,7 +623,7 @@ fn load_or_generate_api_token(data_dir: &str) -> Result<String, String> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let cli = Cli::parse();
 
@@ -686,11 +695,18 @@ async fn main() -> Result<()> {
             // now so the device decrypts its seeds at boot without waiting for
             // a Sapwood/PIN unlock. Failures never stop the daemon -- the
             // device can be unlocked later via Sapwood or PIN.
+            let mut vault_unlocked_at_startup = false;
             match vault::load_vault_key(&vault_key_path) {
                 Ok(Some(mut key)) => {
-                    match send_frame_wait_ack(&mut port, FRAME_TYPE_VAULT_UNLOCK, &key, 10) {
+                    match send_frame_wait_ack(
+                        &mut port,
+                        FRAME_TYPE_VAULT_UNLOCK,
+                        &key,
+                        VAULT_OPERATION_TIMEOUT_SECS,
+                    ) {
                         Ok(resp) if resp.frame_type == FRAME_TYPE_ACK => {
                             log::info!("Vault unlock accepted -- device seeds decrypted");
+                            vault_unlocked_at_startup = true;
                         }
                         Ok(resp) => {
                             let reason = String::from_utf8_lossy(&resp.payload);
@@ -721,6 +737,19 @@ async fn main() -> Result<()> {
                     log::error!(
                         "Could not load vault key: {e} -- device stays locked; check vault.key"
                     );
+                }
+            }
+
+            // The locked boot loop authenticates only the temporary vault
+            // delivery session. After a successful unlock, firmware builds a
+            // fresh policy engine whose bridge session starts unauthenticated.
+            // Authenticate again so the first encrypted signing request is not
+            // rejected even though the vault delivery itself succeeded.
+            if vault_unlocked_at_startup {
+                if let Some(ref secret) = bridge_secret {
+                    if let Err(e) = authenticate_bridge(&mut port, secret) {
+                        panic!("Post-unlock session authentication failed: {e}");
+                    }
                 }
             }
 
@@ -915,7 +944,9 @@ async fn main() -> Result<()> {
     // backoff rather than exiting the daemon.
     let mut backoff_secs = 5u64;
     loop {
-        let client = Client::new(bunker_keys.clone());
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(bunker_keys.clone()))
+            .build();
         for url in &relay_list {
             client.add_relay(url.as_str()).await?;
         }
@@ -939,7 +970,7 @@ async fn main() -> Result<()> {
                             None => break, // sender dropped — daemon is exiting
                         }
                     };
-                    match nostr_sdk::Event::from_json(&json) {
+                    match Event::from_json(&json) {
                         Ok(ev) => match client.send_event(&ev).await {
                             Ok(output) => {
                                 log::info!("Approved response published: {}", output.id())

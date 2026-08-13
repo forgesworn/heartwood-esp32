@@ -295,10 +295,16 @@ hardware tests ran. Use throwaway identities, WiFi credentials, and relays.
       "Enable vault? (host-held key)"; confirm with the hold. ACK, Sapwood
       shows the escrow prompt. Reboot: OLED shows "Locked — Await unlock…",
       PROVISION_LIST rows report `locked:true`, signing frames NACK.
-- [ ] **Auto-unlock (USB-bridged)**: with `vault.key` in heartwoodd's data
-      dir, start the daemon; the device unlocks within seconds of SESSION_AUTH
-      and serves signing normally. `GET /api/vault/status` reports
-      `key_present:true`.
+- [x] **Auto-unlock (USB-bridged)**: with `vault.key` in heartwoodd's data
+      dir, start the daemon; the device unlocks after SESSION_AUTH and serves
+      signing normally. Verified on a three-master Heltec V4 through a local
+      relay and Bark: get public key, relay discovery, event signing, and
+      signature verification all passed after a real locked reboot. The
+      multi-master KDF took about 26 seconds, so startup allows 60 seconds and
+      re-authenticates the normal policy session after leaving the locked boot
+      loop. (2026-08-13.)
+- [ ] **Vault status reporting**: after auto-unlock,
+      `GET /api/vault/status` reports `key_present:true`.
 - [ ] **Wrong vault key**: corrupt a copy of `vault.key` and attempt unlock
       (Sapwood paste flow). NACK "wrong vault key", NO wipe-counter increment,
       device stays locked, correct key still unlocks afterwards.

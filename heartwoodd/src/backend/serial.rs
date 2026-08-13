@@ -11,7 +11,7 @@
 // main.rs / api.rs. That duplication is temporary and will be resolved when
 // those files are refactored (Tasks 7-9) to go through this backend.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -93,10 +93,8 @@ impl SerialBackend {
         expected_types: &[u8],
         timeout_secs: u64,
     ) -> Result<frame::Frame, BackendError> {
-        port.file.write_all(frame_bytes)
+        port.write_frame_paced(frame_bytes)
             .map_err(|e| BackendError::Internal(format!("serial write failed: {e}")))?;
-        port.file.flush()
-            .map_err(|e| BackendError::Internal(format!("serial flush failed: {e}")))?;
 
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
@@ -275,7 +273,14 @@ impl SerialBackend {
                                         ));
                                 }
                                 FRAME_TYPE_NACK => {
-                                    return Err(BackendError::Denied);
+                                    let reason = String::from_utf8_lossy(&f.payload).trim().to_string();
+                                    return if reason.is_empty() {
+                                        Err(BackendError::Denied)
+                                    } else {
+                                        Err(BackendError::Internal(format!(
+                                            "device rejected encrypted request: {reason}"
+                                        )))
+                                    };
                                 }
                                 _ => {
                                     // Unknown frame type -- keep hunting.
@@ -389,10 +394,8 @@ impl SigningBackend for SerialBackend {
             .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
 
         let mut port = self.acquire()?;
-        port.write_all(&frame_bytes)
+        port.write_frame_paced(&frame_bytes)
             .map_err(|e| BackendError::Internal(format!("serial write failed: {e}")))?;
-        port.flush()
-            .map_err(|e| BackendError::Internal(format!("serial flush failed: {e}")))?;
 
         // The firmware signs the envelope inline and returns
         // SIGN_ENVELOPE_RESPONSE with the signed event JSON.

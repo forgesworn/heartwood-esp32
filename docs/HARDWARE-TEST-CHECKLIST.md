@@ -452,7 +452,16 @@ Signing confirmation hold (#60, both boards, USB and WiFi modes):
       auto-approved 1.25 s apart (serial-log timed), two AUTO-SIGNED cards
       queued in order. Both DMs delivered and decrypted back through the
       device (`dm-read` exercises on-device nip44_decrypt of the wraps).
-      The dismiss-tap item still needs an eyes-on tester with a held card.
+
+      Follow-up bench same day (#61/#62 fixes, commits 7f12385 + b1468fc):
+      an expired request's outcome card measured 32.2 s on screen before
+      burn-in blanking (`sign_event: timed out` → `display blanked after
+      inactivity` on the serial tap) — pre-fix it blanked within moments.
+      The dismiss-tap item now self-reports over serial (`confirm: card
+      run dismissed by press`), so closing it needs one short press while
+      a card is held, with the tap running — no OLED observation needed.
+      Note the semantics: a short press is only "dismiss" while a card is
+      held; during an approval prompt it remains deny.
 
 ## Notes
 

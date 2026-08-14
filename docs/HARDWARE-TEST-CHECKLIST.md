@@ -431,6 +431,17 @@ Demo game (spare T-Display):
       button-check labels light while held. A jumps, B ducks, collisions end
       the run, score/best display. It must never expose signer frames on USB.
 
+Signing confirmation hold (#60, both boards, USB and WiFi modes):
+- [ ] Button-approved sign: after the hold, the SIGNED card names the
+      requester and event kind and stays up ~3 s before the idle card
+      returns on its own. The client must receive the response immediately
+      (no heartwoodd timeout — the hold must never delay the response).
+- [ ] NIP-17 DM send (seal + wrap auto-signs back-to-back): two AUTO-SIGNED
+      cards show ~3 s each in order, then the idle card returns. Neither
+      flashes past unread.
+- [ ] A short press during a held card dismisses straight to the idle card;
+      the next press pages the carousel as normal.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

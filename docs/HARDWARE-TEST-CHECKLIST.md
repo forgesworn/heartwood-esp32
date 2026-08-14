@@ -475,10 +475,16 @@ Family-bunker Phase 1 (see signet-plans
 a Heltec (cap 32) AND a T-Display (cap 64); the migration case needs a board
 carrying personas created by pre-packed firmware.
 
-- [ ] **Boot migration.** Flash a board that already holds `p{n}_*` personas.
+- [x] **Boot migration.** Flash a board that already holds `p{n}_*` personas.
       First boot logs "Migrating N persona(s) to the packed registry layout"
       then "migration complete"; PROVISION_LIST shows the same personas with
       the same npubs; a paired app addressed to a persona still signs.
+      (2026-08-14, T-Display 0.13.7 → 0.16.0 app-only reflash: legacy
+      persona `bark-check`, 3 masters and 4 pairings all carried across
+      with identical npubs; packed round-trips on the migrated registry
+      passed 8/8, and slot-0 derives matched the Heltec V4's byte-for-byte
+      — cross-device parity confirmed live. Signing re-check pending the
+      UI click-through.)
 - [ ] **Migration power-cut.** Repeat on a board with several personas, but
       cut power mid-boot (first boot after flashing). Every subsequent boot
       resumes the journal; the registry ends identical to the uncut run.
@@ -547,8 +553,9 @@ sapwood checkout for deps):
   for slot-listed extensions (a listed method + auto_approve now defers to
   `evaluate_slot_policy`; consent is the button-confirmed ceiling install).
   First attempt burned a thumb on ~35 per-request prompts.
-- Still open: migration-with-data + power-cut runs (need a legacy-persona
-  board and a hand on the plug), and a Sapwood-UI click-through for CP1.
+- Still open: the power-cut runs (a hand on the plug mid-migration and
+  mid-removal), and a Sapwood-UI click-through for CP1. Migration-with-data
+  passed same day on the T-Display (see the ticked item above).
 
 ## Notes
 

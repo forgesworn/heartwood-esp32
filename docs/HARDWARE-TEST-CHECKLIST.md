@@ -440,7 +440,7 @@ Signing confirmation hold (#60, both boards, USB and WiFi modes):
       back-to-back; the gift wraps sign client-side with ephemeral keys):
       two AUTO-SIGNED cards show ~5 s each in order, then the idle card
       returns. Neither flashes past unread.
-- [ ] A short press during a held card dismisses straight to the idle card;
+- [x] A short press during a held card dismisses straight to the idle card;
       the next press pages the carousel as normal.
 
       Bench 2026-08-14, Heltec V4, WiFi-standalone, hold tuned 3 s → 5 s:
@@ -462,6 +462,11 @@ Signing confirmation hold (#60, both boards, USB and WiFi modes):
       a card is held, with the tap running — no OLED observation needed.
       Note the semantics: a short press is only "dismiss" while a card is
       held; during an approval prompt it remains deny.
+
+      Dismiss-tap confirmed same day: two held-card runs (relay-path DM
+      auto-signs), two taps, two `dismissed by press` lines 2.9 s and
+      2.4 s after each run's first card — pre-fix the tap usually did
+      nothing in WiFi mode (#61 closed).
 
 ## Notes
 

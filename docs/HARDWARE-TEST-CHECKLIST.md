@@ -562,9 +562,19 @@ sapwood checkout for deps):
   boot. Honest scope: hand-timed pulls sample arbitrary cut points; the
   per-step cut coverage lives in the host models
   (`persona_pack` cut-after-every-step tests), which these runs corroborate.
-- Still open for CP1: a hand-timed cut specifically during a first-boot
-  MIGRATION (needs another legacy-persona board), and the Sapwood-UI
-  click-through. Migration-with-data itself passed (ticked above).
+- Sapwood store-path click-through equivalent, same day: 5/5 on the Heltec
+  via a vitest harness driving the EXACT store functions the Identity/Device
+  panels call (real SerialTransport over node-serialport; only the Web
+  Serial chooser and DOM clicks bypassed): pairing recognition without a
+  fresh ceremony, create, rename, remove with same-key re-derive, and the
+  gauge from live firmware stats. The harness caught a real bug on the way:
+  an existing pairing skipped session auth, refusing the first persona
+  action of any fresh browser session (fixed, sapwood 4a660bc).
+- **CP1: SIGNED OFF.** Every §9 behaviour is hardware-verified on both
+  board classes. The only untested residue: literal DOM clicks/Chrome Web
+  Serial (thin, type-checked), and a hand-timed cut during a first-boot
+  MIGRATION (host cut-models cover it; revisit if another legacy-persona
+  board appears).
 
 ## Notes
 

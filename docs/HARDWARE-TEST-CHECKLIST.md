@@ -432,15 +432,27 @@ Demo game (spare T-Display):
       the run, score/best display. It must never expose signer frames on USB.
 
 Signing confirmation hold (#60, both boards, USB and WiFi modes):
-- [ ] Button-approved sign: after the hold, the SIGNED card names the
-      requester and event kind and stays up ~3 s before the idle card
+- [x] Button-approved sign: after the hold, the SIGNED card names the
+      requester and event kind and stays up ~5 s before the idle card
       returns on its own. The client must receive the response immediately
       (no heartwoodd timeout — the hold must never delay the response).
-- [ ] NIP-17 DM send (seal + wrap auto-signs back-to-back): two AUTO-SIGNED
-      cards show ~3 s each in order, then the idle card returns. Neither
-      flashes past unread.
+- [x] NIP-17 DM send (the recipient seal and the self-copy seal auto-sign
+      back-to-back; the gift wraps sign client-side with ephemeral keys):
+      two AUTO-SIGNED cards show ~5 s each in order, then the idle card
+      returns. Neither flashes past unread.
 - [ ] A short press during a held card dismisses straight to the idle card;
       the next press pages the carousel as normal.
+
+      Bench 2026-08-14, Heltec V4, WiFi-standalone, hold tuned 3 s → 5 s:
+      client was bray in true bunker mode (BUNKER_URI only, no local key)
+      over the relay path. First DM send: seal 1 button-approved mid-window
+      and the signed response was published 0.28 s after the press (hold
+      never delayed it); seal 2 auto-signed 1.2 s later and queued behind
+      the held SIGNED card. Second send on the upgraded slot: both seals
+      auto-approved 1.25 s apart (serial-log timed), two AUTO-SIGNED cards
+      queued in order. Both DMs delivered and decrypted back through the
+      device (`dm-read` exercises on-device nip44_decrypt of the wraps).
+      The dismiss-tap item still needs an eyes-on tester with a held card.
 
 ## Notes
 

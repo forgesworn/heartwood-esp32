@@ -165,6 +165,16 @@ pub fn handle_update(
                     if !changes.is_empty() { changes.push_str(", "); }
                     changes.push_str("label");
                 }
+                // Family-bunker C3 flags travel over the cable too, so the
+                // guardian's own hands can flag a slot without an operator.
+                if v.get("escalate").is_some()
+                    || v.get("petition_on_deny").is_some()
+                    || v.get("audit_child_wrap").is_some()
+                    || v.get("bound_identity").is_some()
+                {
+                    if !changes.is_empty() { changes.push_str(", "); }
+                    changes.push_str("family");
+                }
                 if changes.is_empty() { changes.push_str("policy"); }
 
                 // Truncate label for OLED (max ~12 chars per line)
@@ -194,6 +204,43 @@ pub fn handle_update(
                     let auto = v["auto_approve"].as_bool();
 
                     if policy_engine.update_slot(ms, idx, label, methods, kinds, auto) {
+                        // Family-bunker C3 flags: absent keys keep the slot's
+                        // existing values (same merge rule as the fields
+                        // above). Applied under the same button approval.
+                        if v.get("escalate").is_some()
+                            || v.get("petition_on_deny").is_some()
+                            || v.get("audit_child_wrap").is_some()
+                            || v.get("bound_identity").is_some()
+                        {
+                            let existing = policy_engine
+                                .list_slots(ms)
+                                .iter()
+                                .find(|s| s.slot_index == idx)
+                                .map(|s| {
+                                    (
+                                        s.escalate,
+                                        s.petition_on_deny,
+                                        s.audit_child_wrap,
+                                        s.bound_identity.clone(),
+                                    )
+                                })
+                                .unwrap_or((false, false, false, None));
+                            policy_engine.set_slot_family_flags(
+                                ms,
+                                idx,
+                                v["escalate"].as_bool().unwrap_or(existing.0),
+                                v["petition_on_deny"].as_bool().unwrap_or(existing.1),
+                                v["audit_child_wrap"].as_bool().unwrap_or(existing.2),
+                                v["bound_identity"]
+                                    .as_str()
+                                    .filter(|s| {
+                                        s.len() == 64
+                                            && s.bytes().all(|b| b.is_ascii_hexdigit())
+                                    })
+                                    .map(|s| s.to_ascii_lowercase())
+                                    .or(existing.3),
+                            );
+                        }
                         policy_engine.persist_slots(nvs, ms);
                         log::info!("Updated slot {} ({}) — approved by button", idx, slot_label);
                         protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"ok");

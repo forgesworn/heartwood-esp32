@@ -85,6 +85,8 @@ pub enum Nip46Method {
     HeartwoodRecover,
     HeartwoodCreateProof,
     HeartwoodVerifyProof,
+    /// Extension discovery: which methods this signer actually serves.
+    HeartwoodCapabilities,
     // Unknown method
     Unknown(String),
 }
@@ -113,6 +115,7 @@ impl Nip46Method {
             "heartwood_recover" => Self::HeartwoodRecover,
             "heartwood_create_proof" => Self::HeartwoodCreateProof,
             "heartwood_verify_proof" => Self::HeartwoodVerifyProof,
+            "heartwood_capabilities" => Self::HeartwoodCapabilities,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -135,6 +138,7 @@ impl Nip46Method {
             Self::HeartwoodRecover => "heartwood_recover",
             Self::HeartwoodCreateProof => "heartwood_create_proof",
             Self::HeartwoodVerifyProof => "heartwood_verify_proof",
+            Self::HeartwoodCapabilities => "heartwood_capabilities",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -152,6 +156,10 @@ impl Nip46Method {
     }
 
     /// Whether this method is always auto-approved (no policy check needed).
+    ///
+    /// Capabilities discovery sits here deliberately: like connect/ping it is
+    /// handshake-level plumbing a client needs before any slot binding, and
+    /// the advertised list is the same for every client of this firmware.
     pub fn always_auto_approve(&self) -> bool {
         matches!(
             self,
@@ -161,6 +169,7 @@ impl Nip46Method {
                 | Self::SwitchRelays
                 | Self::HeartwoodListIdentities
                 | Self::HeartwoodVerifyProof
+                | Self::HeartwoodCapabilities
         )
     }
 
@@ -1038,6 +1047,27 @@ pub fn build_ping_response(request_id: &str) -> Result<String, String> {
         .map_err(|e| format!("failed to serialise ping response: {e}"))
 }
 
+/// Version of the Heartwood NIP-46 extension surface advertised by
+/// `heartwood_capabilities`. Bump when extension methods change shape.
+pub const CAPABILITIES_VERSION: u32 = 1;
+
+/// Build a `heartwood_capabilities` response advertising the methods this
+/// signer serves: `{"version":1,"methods":[...]}` as a NIP-46 string result.
+///
+/// Callers pass their own list — the ESP32, ESP8266 and Soft-mode signers
+/// support different subsets — and stubbed methods must be left out: an
+/// advertised method is a promise that it works.
+pub fn build_capabilities_response(
+    request_id: &str,
+    methods: &[&str],
+) -> Result<String, String> {
+    let result = serde_json::json!({
+        "version": CAPABILITIES_VERSION,
+        "methods": methods,
+    });
+    build_result_response(request_id, &result.to_string())
+}
+
 /// Build a generic string result response.
 pub fn build_result_response(request_id: &str, result: &str) -> Result<String, String> {
     let response = Nip46Response {
@@ -1723,6 +1753,10 @@ mod tests {
         assert_eq!(Nip46Method::from_str("heartwood_derive"), Nip46Method::HeartwoodDerive);
         assert_eq!(Nip46Method::from_str("ping"), Nip46Method::Ping);
         assert_eq!(Nip46Method::from_str("switch_relays"), Nip46Method::SwitchRelays);
+        assert_eq!(
+            Nip46Method::from_str("heartwood_capabilities"),
+            Nip46Method::HeartwoodCapabilities
+        );
         assert!(matches!(Nip46Method::from_str("unknown_method"), Nip46Method::Unknown(_)));
     }
 
@@ -1731,6 +1765,8 @@ mod tests {
         assert!(Nip46Method::Ping.always_auto_approve());
         assert!(Nip46Method::GetPublicKey.always_auto_approve());
         assert!(Nip46Method::SwitchRelays.always_auto_approve());
+        assert!(Nip46Method::HeartwoodCapabilities.always_auto_approve());
+        assert!(!Nip46Method::HeartwoodCapabilities.always_requires_button());
         assert!(!Nip46Method::SignEvent.always_auto_approve());
 
         assert!(Nip46Method::HeartwoodDerive.always_requires_button());
@@ -1767,6 +1803,19 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], "ping-1");
         assert_eq!(parsed["result"], "pong");
+    }
+
+    #[test]
+    fn test_build_capabilities_response() {
+        let json = build_capabilities_response("cap-1", &["ping", "heartwood_derive"]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["id"], "cap-1");
+        // NIP-46 results are strings; the payload is JSON inside that string.
+        let result: serde_json::Value =
+            serde_json::from_str(parsed["result"].as_str().unwrap()).unwrap();
+        assert_eq!(result["version"], CAPABILITIES_VERSION);
+        assert_eq!(result["methods"][0], "ping");
+        assert_eq!(result["methods"][1], "heartwood_derive");
     }
 
     #[test]

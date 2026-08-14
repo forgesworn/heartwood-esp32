@@ -982,6 +982,32 @@ pub fn handle_parsed_request(
             nip46::build_result_response(&request.id, "{}").unwrap_or_default()
         }
 
+        "heartwood_capabilities" => {
+            // Extension discovery — handshake-level plumbing, answerable
+            // before any slot binding (auto-approved, like ping). The stubbed
+            // proof methods are deliberately absent: an advertised method is
+            // a promise that it works.
+            const METHODS: &[&str] = &[
+                "connect",
+                "ping",
+                "get_public_key",
+                "sign_event",
+                "sign_event_compact",
+                "nip44_encrypt",
+                "nip44_decrypt",
+                "nip04_encrypt",
+                "nip04_decrypt",
+                "switch_relays",
+                "heartwood_capabilities",
+                "heartwood_derive",
+                "heartwood_derive_persona",
+                "heartwood_switch",
+                "heartwood_list_identities",
+                "heartwood_recover",
+            ];
+            nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
+        }
+
         other => {
             log::warn!("Unknown NIP-46 method: {other}");
             build_error_json(&request.id, -2, "unknown method")
@@ -1602,7 +1628,13 @@ mod tests {
 
         // Protocol plumbing remains global even when omitted from a strict
         // slot's explicit automatic-authority list.
-        for method_name in ["connect", "ping", "get_public_key", "switch_relays"] {
+        for method_name in [
+            "connect",
+            "ping",
+            "get_public_key",
+            "switch_relays",
+            "heartwood_capabilities",
+        ] {
             let method = nip46::Nip46Method::from_str(method_name);
             let tier = strict.check(0, CLIENT_HEX, &method, None);
             assert_eq!(
@@ -1646,7 +1678,7 @@ mod tests {
             );
         }
 
-        for method_name in ["connect", "ping", "get_public_key"] {
+        for method_name in ["connect", "ping", "get_public_key", "heartwood_capabilities"] {
             let method = nip46::Nip46Method::from_str(method_name);
             assert!(!unbound_remote_request_denied(true, false, &method));
         }

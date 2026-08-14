@@ -258,6 +258,24 @@ impl SoftBackend {
                     .map_err(|e| BackendError::Internal(format!("build result response: {e}")))
             }
 
+            Nip46Method::HeartwoodCapabilities => {
+                // Extension discovery — Soft mode serves the vanilla method
+                // set only (no tree extensions on the Pi).
+                nip46::build_capabilities_response(
+                    &req.id,
+                    &[
+                        "connect",
+                        "ping",
+                        "get_public_key",
+                        "sign_event",
+                        "nip44_encrypt",
+                        "nip44_decrypt",
+                        "heartwood_capabilities",
+                    ],
+                )
+                .map_err(|e| BackendError::Internal(format!("build capabilities response: {e}")))
+            }
+
             _ => {
                 let error_json = nip46::build_error_response(&req.id, -32601, "method not supported")
                     .map_err(|e| BackendError::Internal(format!("build error response: {e}")))?;

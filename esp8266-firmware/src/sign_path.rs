@@ -139,6 +139,25 @@ fn dispatch(
         "heartwood_list_identities" => {
             nip46::build_result_response(&req.id, &cache.list_json()).ok()
         }
+        // Extension discovery — only the methods this port actually serves
+        // (no nip04, no compact replies, no recover on the 8266).
+        "heartwood_capabilities" => nip46::build_capabilities_response(
+            &req.id,
+            &[
+                "connect",
+                "ping",
+                "get_public_key",
+                "sign_event",
+                "nip44_encrypt",
+                "nip44_decrypt",
+                "heartwood_capabilities",
+                "heartwood_derive",
+                "heartwood_derive_persona",
+                "heartwood_switch",
+                "heartwood_list_identities",
+            ],
+        )
+        .ok(),
         _ => nip46::build_error_response(&req.id, -32601, "method not supported").ok(),
     }
 }

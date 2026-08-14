@@ -252,6 +252,9 @@ pub fn handle_generate(
     // independent entropy source, stacked with the hardware RNG draw so
     // neither alone can bias the key. Optional — hold skips to hardware-only.
     let game_digest = crate::entropy_game::run(display, &buttons.a);
+    // The game consumed a stream of taps; drop the last latched edge so it
+    // cannot replay as a phantom page once the relay loop resumes.
+    crate::button::clear_press_edge();
 
     // Feedback while the (multi-second) entropy draw + PBKDF2 + derivation +
     // NVS write run, so the device isn't silently stuck on the previous screen.
@@ -397,6 +400,9 @@ fn hold_to_confirm(
                 while buttons.a.is_low() {
                     FreeRtos::delay_ms(POLL_MS);
                 }
+                // Press consumed here — drop the sampler's latched edge so it
+                // cannot replay as a phantom page in the relay loop.
+                crate::button::clear_press_edge();
                 return true;
             }
             let pct = (held * 100 / HOLD_MS).min(100);
@@ -405,6 +411,7 @@ fn hold_to_confirm(
                 last_pct = pct;
             }
         } else if !low && pressed {
+            crate::button::clear_press_edge();
             return false; // released before the hold completed
         }
         FreeRtos::delay_ms(POLL_MS);

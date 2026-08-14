@@ -46,6 +46,9 @@ pub fn wait_for_press(
     loop {
         crate::wdt::feed();
         if Instant::now() >= deadline {
+            // A sub-poll tap may still have latched an edge; a tap aimed at
+            // an expiring prompt must not replay as a carousel page later.
+            clear_press_edge();
             return None;
         }
         if pin.is_low() {
@@ -75,6 +78,10 @@ pub fn wait_for_press(
     }
 
     let held = Instant::now() - press_start;
+
+    // This flow consumed the press off the pin; drop the edge the sampler
+    // latched from it so it cannot act a second time.
+    clear_press_edge();
 
     if held >= LONG_HOLD_THRESHOLD {
         Some(ButtonResult::Approve)
@@ -123,6 +130,7 @@ pub fn read_gesture(pin: &PinDriver<'_, Input>, idle_timeout: Duration) -> Optio
     loop {
         crate::wdt::feed();
         if Instant::now() >= idle_deadline {
+            clear_press_edge();
             return None;
         }
         if pin.is_low() {
@@ -151,6 +159,7 @@ pub fn read_gesture(pin: &PinDriver<'_, Input>, idle_timeout: Duration) -> Optio
     let gap_deadline = Instant::now() + Duration::from_millis(DOUBLE_GAP_MS as u64);
     loop {
         if Instant::now() >= gap_deadline {
+            clear_press_edge();
             return Some(Gesture::Single);
         }
         if pin.is_low() {
@@ -163,12 +172,14 @@ pub fn read_gesture(pin: &PinDriver<'_, Input>, idle_timeout: Duration) -> Optio
 }
 
 /// Block until the button is released, with a debounce on the rising edge.
+/// Also drops any latched press edge — the drained press was consumed here.
 fn drain_release(pin: &PinDriver<'_, Input>) {
     while pin.is_low() {
         crate::wdt::feed();
         esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
     }
     esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+    clear_press_edge();
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +229,7 @@ impl<'d> Buttons<'d> {
             true
         });
         TWO_BUTTON_UI.store(b.is_some(), Ordering::Relaxed);
+        spawn_press_latch(a.pin() as i32);
         Self { a, b }
     }
 
@@ -241,7 +253,77 @@ impl<'d> Buttons<'d> {
             esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
         }
         esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+        // An A tap latched during a B-driven flow was aimed at that flow,
+        // not at the idle carousel — drop it.
+        clear_press_edge();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Press-edge latch — for loops that cannot poll fast enough (#61)
+// ---------------------------------------------------------------------------
+//
+// The WiFi relay loop samples button A roughly once per outer pass (~1 s —
+// socket recv timeouts dominate), so a short tap lands between samples and
+// is silently missed: the dismiss-tap on a held confirmation card usually
+// did nothing. A GPIO interrupt would need `&mut PinDriver` to re-arm after
+// each fire, which the shared `&Buttons` threaded through the handlers
+// cannot provide — so a tiny sampler thread watches the raw GPIO level
+// instead and latches each falling edge into an atomic. Slow loops consume
+// the latch with [`take_press_edge`]; flows that consume a press directly
+// off the pin (approval holds, gesture readers) clear it on exit so one
+// physical press never acts twice.
+
+static PRESS_EDGE: AtomicBool = AtomicBool::new(false);
+static LATCH_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Sampler cadence. Contact bounce (< ~10 ms) is shorter than one interval,
+/// so a bounce dip is rarely sampled at all; [`LATCH_MIN_GAP_MS`] covers the
+/// ones that are.
+const LATCH_POLL_MS: u32 = 15;
+
+/// Minimum spacing between latched edges. Anything faster is bounce, not a
+/// human tapping twice.
+const LATCH_MIN_GAP_MS: u128 = 150;
+
+/// Spawn the sampler for the given GPIO (active-low). Called from
+/// [`Buttons::new`]; a second call is a no-op. Reads the raw level via
+/// `gpio_get_level` so it never contends with the owning `PinDriver`.
+fn spawn_press_latch(gpio: i32) {
+    if LATCH_SPAWNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("btn-latch".into())
+        .stack_size(3072)
+        .spawn(move || {
+            let mut was_low = unsafe { esp_idf_svc::sys::gpio_get_level(gpio) } == 0;
+            let mut last_edge = Instant::now();
+            loop {
+                esp_idf_hal::delay::FreeRtos::delay_ms(LATCH_POLL_MS);
+                let low = unsafe { esp_idf_svc::sys::gpio_get_level(gpio) } == 0;
+                if low && !was_low && last_edge.elapsed().as_millis() >= LATCH_MIN_GAP_MS {
+                    PRESS_EDGE.store(true, Ordering::Relaxed);
+                    last_edge = Instant::now();
+                }
+                was_low = low;
+            }
+        });
+    if let Err(e) = spawned {
+        // Non-fatal: level sampling still works, only sub-poll taps degrade.
+        log::warn!("press-latch thread failed to spawn: {e}");
+    }
+}
+
+/// Consume a latched press edge. True at most once per physical press.
+pub fn take_press_edge() -> bool {
+    PRESS_EDGE.swap(false, Ordering::Relaxed)
+}
+
+/// Drop any pending latched edge. Called by flows that consume a press
+/// directly off the pin, so the latch cannot replay it elsewhere.
+pub fn clear_press_edge() {
+    PRESS_EDGE.store(false, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------

@@ -317,7 +317,11 @@ struct SignCtx<'a, 'd, 'b> {
 /// the USB-serving wait windows, so a wake press keeps working while WiFi is
 /// reconnecting instead of playing dead for the length of the retry.
 fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
-    if !ctx.buttons.a.is_low() {
+    // A latched edge counts even when the finger is already off: this loop's
+    // pass is ~1 s (socket recv timeouts dominate), longer than a human tap,
+    // so sampling the live level alone missed most dismiss-taps (#61).
+    let latched = crate::button::take_press_edge();
+    if !latched && !ctx.buttons.a.is_low() {
         return;
     }
     if !ctx.display_on {
@@ -344,6 +348,11 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
         crate::wdt::feed();
         FreeRtos::delay_ms(20);
     }
+    // The drain consumed the physical press; swallow release bounce and drop
+    // any edge the sampler latched from this same press so it cannot replay
+    // as a phantom carousel page.
+    FreeRtos::delay_ms(30);
+    crate::button::clear_press_edge();
 }
 
 /// One page of the idle info carousel. Page 1 shows the stored SSID with the
@@ -2120,6 +2129,14 @@ fn poll_usb(
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"unknown frame");
         }
     }
+
+    // Approval-gated arms (plaintext and encrypted NIP-46, slot updates,
+    // restores) can block on the button for tens of seconds, so the arrival
+    // refresh above is already spent by the time their outcome card draws —
+    // which then blanked within moments (#62). The interaction that just
+    // finished is user activity: restart the blank clock so the outcome
+    // card gets its full window.
+    ctx.last_activity = Instant::now();
 }
 
 /// Parse one inbound relay message (`["EVENT",sub,ev]` / `EOSE` / `OK` / …).
@@ -2319,7 +2336,7 @@ fn process_event(
         }
     };
 
-    if ev.kind == MGMT_KIND {
+    let result = if ev.kind == MGMT_KIND {
         match masters::find_by_pubkey(ctx.masters, &target_pk) {
             Some(master_idx) => handle_mgmt_event(s, &ev, ctx, master_idx, pool),
             None => {
@@ -2342,7 +2359,13 @@ fn process_event(
         }
         ctx.nip46_seen.push(ev.id.clone());
         handle_nip46_event(&mut s.tls, ev, ctx, &target_pk)
-    }
+    };
+    // A button-gated approval can spend its whole 30 s window inside the
+    // dispatch above, leaving the arrival refresh already expired when the
+    // outcome card draws (#62's USB variant, latent here for slow
+    // approvals). The finished interaction is activity — restart the clock.
+    ctx.last_activity = Instant::now();
+    result
 }
 
 fn client_label(ctx: &SignCtx, master_slot: u8, client_hex: &str) -> String {

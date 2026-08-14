@@ -33,6 +33,24 @@ pub fn run_approval_loop<F>(
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
     timeout_secs: u64,
+    show_fn: F,
+) -> ApprovalResult
+where
+    F: FnMut(&mut Display<'_>, u32),
+{
+    let result = approval_loop_inner(display, buttons, timeout_secs, show_fn);
+    // This loop consumed its presses (and B-cancels) directly off the pins;
+    // drop any edge the sampler latched from them, or the approval hold
+    // replays in `service_button` and instantly dismisses the very card the
+    // approval just presented (#61's latch meeting #60's hold).
+    crate::button::clear_press_edge();
+    result
+}
+
+fn approval_loop_inner<F>(
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    timeout_secs: u64,
     mut show_fn: F,
 ) -> ApprovalResult
 where

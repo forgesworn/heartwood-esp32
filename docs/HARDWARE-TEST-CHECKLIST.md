@@ -507,6 +507,28 @@ carrying personas created by pre-packed firmware.
 - [ ] **Regression sweep.** Section 1–3 basics still pass on the same build:
       provision, pairing, sign, backup export/import, OTA.
 
+`scripts/bench-personas.mjs` semi-automates the non-physical items over the
+cable (round-trip, post-reboot persistence, cap): run its three phases in
+order with an `espflash reset` between round-trip and post-reboot. It drives
+the plaintext NIP-46 path, so a vault-locked signer NACKs it — unlock first.
+
+Bench record — 2026-08-14 Heltec V4 (16 MB variant), packed-registry build:
+
+- Flashed over USB with NVS preserved (3 masters, 6 app pairings carried
+  across). Boot completed cleanly through `migrate_if_needed` on an empty
+  legacy registry (no-op path) into the vault-locked boot loop.
+- FIRMWARE_INFO now reports the storage stats on real hardware:
+  `nvs_used_entries 520 / total 756, free 236, max_personas 32` — the gauge's
+  wire format confirmed end-to-end.
+- PROVISION_LIST serves correctly on the new registry module (3 masters,
+  0 personas, locked flags accurate).
+- Remaining phases (derive/rename/remove round-trips, post-reboot
+  persistence, cap refusal) blocked on this board's vault unlock: slot 0 is
+  encrypted at rest and the plaintext path correctly NACKs while locked.
+  Run the script's three phases after unlocking. Migration-with-data and
+  the power-cut items additionally need a board carrying `p{n}_*` personas
+  from pre-packed firmware.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

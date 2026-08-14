@@ -307,6 +307,45 @@ struct SignCtx<'a, 'd, 'b> {
     /// at this deadline. Progress/failure cards leave this unset and remain
     /// visible until the next transition or normal burn-in blanking.
     network_display_restore_at: Option<Instant>,
+    /// Idle info carousel position: 0 identity, 1 network, 2 device. Short
+    /// presses while the panel is awake advance it; sleep resets it.
+    idle_page: u8,
+}
+
+/// One page of the idle info carousel. Page 1 shows the stored SSID with the
+/// live runtime stage; page 2 the firmware version, board, and uptime.
+fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
+    match ctx.idle_page {
+        1 => {
+            let ssid = crate::net_config_store::read_net_config(ctx.nvs)
+                .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
+                .filter(|cfg| !cfg.ssid.is_empty())
+                .map(|cfg| cfg.ssid);
+            let status = match ctx.network_runtime.stage {
+                NetworkRuntimeStage::Online => "online",
+                NetworkRuntimeStage::SubscriptionSent => "relay connecting",
+                NetworkRuntimeStage::RelayConnecting => "relay connecting",
+                NetworkRuntimeStage::WifiReady => "wifi up",
+                NetworkRuntimeStage::WifiConnecting => "joining wifi",
+                NetworkRuntimeStage::Starting => "starting",
+                NetworkRuntimeStage::ConfigError => "config error",
+                NetworkRuntimeStage::RadioOff => "radio off",
+            };
+            crate::oled::show_info_network(
+                ctx.display,
+                "WiFi standalone",
+                ssid.as_deref(),
+                status,
+            );
+        }
+        2 => crate::oled::show_info_device(
+            ctx.display,
+            env!("CARGO_PKG_VERSION"),
+            crate::board::BOARD,
+            crate::uptime_s(),
+        ),
+        _ => show_idle_identity(ctx),
+    }
 }
 
 fn show_idle_identity(ctx: &mut SignCtx<'_, '_, '_>) {
@@ -561,8 +600,9 @@ pub fn run_wifi_standalone<'d, 'b>(
     usb: &mut SerialPort<'_>,
 ) -> ! {
     log::info!(
-        "[relay] WiFi-standalone: SSID={:?}, {} relay(s), {} master(s), mgmt={}",
+        "[relay] WiFi-standalone: SSID={:?} (+{} fallback(s)), {} relay(s), {} master(s), mgmt={}",
         cfg.ssid,
+        cfg.networks.len(),
         cfg.relays.len(),
         masters.len(),
         if op_mgmt.is_some() { "on" } else { "off" }
@@ -578,31 +618,16 @@ pub fn run_wifi_standalone<'d, 'b>(
     )
     .expect("relay: blocking wrap");
 
-    let (auth, pmf_cfg) = if cfg.password.is_empty() {
-        (AuthMethod::None, PmfConfiguration::NotCapable)
-    } else {
-        // ESP-IDF treats auth_method as a minimum-strength scan threshold.
-        // WPA2 therefore admits WPA2 and stronger WPA3 APs, while the nominal
-        // WPA2/WPA3 mixed value collapses to a WPA3 minimum and rejects pure
-        // WPA2. PMF optional supplies the WPA3 requirement without excluding a
-        // WPA2 AP that does not advertise PMF.
-        (
-            AuthMethod::WPA2Personal,
-            PmfConfiguration::Capable { required: false },
-        )
-    };
-    wifi.set_configuration(&WifiConfig::Client(ClientConfiguration {
-        ssid: cfg.ssid.as_str().try_into().expect("relay: ssid too long"),
-        password: cfg
-            .password
-            .as_str()
-            .try_into()
-            .expect("relay: pass too long"),
-        auth_method: auth,
-        pmf_cfg,
-        ..Default::default()
-    }))
-    .expect("relay: wifi config");
+    // Ordered join candidates: the primary pair first, then the stored
+    // fallback list. Owned copies so the list is free of `cfg` borrows for
+    // the lifetime of the loop below.
+    let wifi_candidates: Vec<(String, String)> = cfg
+        .network_candidates()
+        .into_iter()
+        .map(|(ssid, password)| (ssid.to_string(), password.to_string()))
+        .collect();
+    let mut wifi_candidate_idx = 0usize;
+    select_wifi_candidate(&mut wifi, &wifi_candidates, wifi_candidate_idx);
     wifi.start().expect("relay: wifi start");
     // RF entropy source is live from here on — plain esp_fill_random (via
     // crate::fill_random) is a true RNG again.
@@ -628,7 +653,19 @@ pub fn run_wifi_standalone<'d, 'b>(
         if let Some(op) = &op_mgmt {
             if !relays.is_empty() {
                 log::info!("[relay] seeds locked — entering vault-unlock phase");
-                locked_relay_phase(&relays, op, secp, masters, personas, nvs, usb, display, button_pin);
+                locked_relay_phase(
+                    &mut wifi,
+                    &wifi_candidates,
+                    &relays,
+                    op,
+                    secp,
+                    masters,
+                    personas,
+                    nvs,
+                    usb,
+                    display,
+                    button_pin,
+                );
             }
         }
     }
@@ -666,6 +703,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         network_restart_at: None,
         network_runtime: NetworkRuntimeStatus::starting(),
         network_display_restore_at: None,
+        idle_page: 0,
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -738,6 +776,10 @@ pub fn run_wifi_standalone<'d, 'b>(
                 // Keep serving USB while wifi is unreachable, so a bad SSID or
                 // password can always be fixed over the cable.
                 log::error!("[relay] wifi connect failed: {e:?}; serving USB, retry in 3s");
+                // Rotate to the next stored network for the next attempt. With
+                // a single configured network this re-selects the same one.
+                wifi_candidate_idx = wifi_candidate_idx.wrapping_add(1);
+                select_wifi_candidate(&mut wifi, &wifi_candidates, wifi_candidate_idx);
                 set_network_runtime(
                     &mut ctx,
                     NetworkRuntimeStage::WifiConnecting,
@@ -785,10 +827,30 @@ pub fn run_wifi_standalone<'d, 'b>(
 
         // Wake the panel promptly on a BOOT-button press, and serve USB, once
         // per pass regardless of how many sessions are live or connecting.
-        if !ctx.display_on && ctx.button_pin.is_low() {
-            crate::oled::wake_display(ctx.display);
-            ctx.display_on = true;
+        if ctx.button_pin.is_low() {
+            if !ctx.display_on {
+                crate::oled::wake_display(ctx.display);
+                ctx.display_on = true;
+                ctx.idle_page = 0;
+                // Redraw the idle card rather than re-lighting whatever frame
+                // was in panel RAM — waking into a stale approval countdown
+                // reads as a live prompt that ignores the buttons.
+                show_idle_identity(&mut ctx);
+            } else {
+                // Awake: a short press pages the idle info carousel.
+                ctx.idle_page = (ctx.idle_page + 1) % 3;
+                draw_relay_idle_page(&mut ctx);
+            }
             ctx.last_activity = Instant::now();
+            // Drain the press (bounded) so one physical press moves exactly
+            // one page instead of repeating every loop pass.
+            let drain_start = Instant::now();
+            while ctx.button_pin.is_low()
+                && drain_start.elapsed() < Duration::from_millis(1900)
+            {
+                crate::wdt::feed();
+                FreeRtos::delay_ms(20);
+            }
         }
         // The WiFi driver is lent to USB only while no relay session is live —
         // a scan mid-connection would knock the link off its channel, so a
@@ -1041,6 +1103,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         if ctx.display_on && now.duration_since(ctx.last_activity) >= DISPLAY_TIMEOUT {
             crate::oled::sleep_display(ctx.display);
             ctx.display_on = false;
+            ctx.idle_page = 0;
         }
     }
 }
@@ -1334,7 +1397,54 @@ fn publish_locked_announce(
 ///   flash. Sapwood therefore never auto-sends: the operator taps, and the UI
 ///   tells them to unlock only a signer they know rebooted.
 #[allow(clippy::too_many_arguments)]
+/// Client configuration for one stored network. The auth/PMF pairing keeps
+/// the original single-network behaviour: ESP-IDF treats auth_method as a
+/// minimum-strength scan threshold, so WPA2 admits WPA2 and stronger WPA3
+/// APs, while PMF-capable supplies the WPA3 requirement without excluding a
+/// WPA2 AP that does not advertise PMF. Open networks advertise no PMF.
+fn wifi_client_config(ssid: &str, password: &str) -> WifiConfig {
+    let (auth, pmf_cfg) = if password.is_empty() {
+        (AuthMethod::None, PmfConfiguration::NotCapable)
+    } else {
+        (
+            AuthMethod::WPA2Personal,
+            PmfConfiguration::Capable { required: false },
+        )
+    };
+    WifiConfig::Client(ClientConfiguration {
+        ssid: ssid.try_into().expect("relay: ssid too long"),
+        password: password.try_into().expect("relay: pass too long"),
+        auth_method: auth,
+        pmf_cfg,
+        ..Default::default()
+    })
+}
+
+/// Point the station at candidate `idx` (mod len) of the configured network
+/// list. Config failures are logged, not fatal: the next connect attempt
+/// fails cleanly and the rotation moves on.
+fn select_wifi_candidate(
+    wifi: &mut BlockingWifi<EspWifi<'_>>,
+    candidates: &[(String, String)],
+    idx: usize,
+) {
+    let (ssid, password) = &candidates[idx % candidates.len()];
+    if candidates.len() > 1 {
+        log::info!(
+            "[relay] wifi network {}/{}: {:?}",
+            idx % candidates.len() + 1,
+            candidates.len(),
+            ssid
+        );
+    }
+    if let Err(e) = wifi.set_configuration(&wifi_client_config(ssid, password)) {
+        log::error!("[relay] wifi config for {ssid:?} failed: {e:?}");
+    }
+}
+
 fn locked_relay_phase(
+    wifi: &mut BlockingWifi<EspWifi<'_>>,
+    wifi_candidates: &[(String, String)],
     relays: &[String],
     op_mgmt: &[u8; 32],
     secp: &Arc<Secp256k1<SignOnly>>,
@@ -1378,11 +1488,32 @@ fn locked_relay_phase(
     let mut relay_idx = 0usize;
     let mut session: Option<RelaySession> = None;
     let mut next_announce = Instant::now();
+    let mut wifi_idx = 0usize;
+    let mut next_wifi_attempt = Instant::now();
 
     loop {
         crate::wdt::feed();
+        // This phase runs before the main loop ever connects the station, so
+        // it owns its own join attempts — without this, the unlock announce
+        // could never reach a relay. Rotates through the stored network list,
+        // paced so USB unlock stays served between blocking attempts.
+        if !wifi.is_up().unwrap_or(false) {
+            if session.is_some() {
+                session = None;
+            }
+            if Instant::now() >= next_wifi_attempt {
+                if let Err(e) = wifi.connect().and_then(|_| wifi.wait_netif_up()) {
+                    log::warn!("[relay] locked: wifi connect failed: {e:?}; retry in 3s");
+                    wifi_idx = wifi_idx.wrapping_add(1);
+                    select_wifi_candidate(wifi, wifi_candidates, wifi_idx);
+                    next_wifi_attempt = Instant::now() + Duration::from_secs(3);
+                } else {
+                    log::info!("[relay] locked: wifi up");
+                }
+            }
+        }
         // (Re)connect round-robin until a relay holds.
-        if session.is_none() {
+        if session.is_none() && wifi.is_up().unwrap_or(false) {
             match connect_relay_raw(&relays[relay_idx], sub_req.clone(), false, true) {
                 Ok(s) => {
                     log::info!("[relay] locked: connected {}", relays[relay_idx]);
@@ -3088,6 +3219,7 @@ fn dispatch_mgmt(
                 "ssid": active.ssid,
                 "relays": active.relays,
                 "password_set": !active.password.is_empty(),
+                "networks": crate::net_config_store::redacted_networks(&active),
             });
             let terminal_transaction = terminal
                 .as_ref()
@@ -3107,6 +3239,7 @@ fn dispatch_mgmt(
                         "ssid": trial.candidate.ssid,
                         "relays": trial.candidate.relays,
                         "password_set": !trial.candidate.password.is_empty(),
+                        "networks": crate::net_config_store::redacted_networks(&trial.candidate),
                         "attempted": trial.attempts > 0,
                     })
                 });

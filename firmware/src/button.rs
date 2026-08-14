@@ -172,6 +172,72 @@ fn drain_release(pin: &PinDriver<'_, Input>) {
 }
 
 // ---------------------------------------------------------------------------
+// Second-button (B) registry — the minimal form of the multi-board plan's
+// `Buttons` seam (docs/2026-06-24-multi-board-display-port.md, decision B)
+// ---------------------------------------------------------------------------
+//
+// The approval loop wants B as an explicit cancel on two-button boards, but
+// the single approval pin is threaded through every handler signature. Rather
+// than widen all of them, `board::bringup` registers B's GPIO number here and
+// the approval loop reads its level directly. Read-only: the `PinDriver` in
+// `board::Hw` keeps ownership and pin configuration.
+
+use core::sync::atomic::{AtomicI32, Ordering};
+
+/// GPIO number of the B button, or -1 when the board has none (or B failed
+/// its bringup sanity check).
+static BUTTON_B_GPIO: AtomicI32 = AtomicI32::new(-1);
+
+/// Register the B button's GPIO after `bringup` has configured it as an
+/// input, but only if it idles HIGH. GPIO35 on the classic ESP32 is
+/// input-only with no internal pull, so a clone missing the external pull-up
+/// would float — and a floating-low B would cancel every approval. A pin not
+/// solidly high across the sample window is left unregistered: the board
+/// simply behaves as single-button.
+pub fn register_button_b(gpio: i32) {
+    for _ in 0..5 {
+        if unsafe { esp_idf_svc::sys::gpio_get_level(gpio) } == 0 {
+            log::warn!("Button B (GPIO{gpio}) reads low at boot; leaving it unregistered");
+            return;
+        }
+        esp_idf_hal::delay::FreeRtos::delay_ms(20);
+    }
+    BUTTON_B_GPIO.store(gpio, Ordering::Relaxed);
+}
+
+/// Whether this board has a usable second button.
+pub fn has_button_b() -> bool {
+    BUTTON_B_GPIO.load(Ordering::Relaxed) >= 0
+}
+
+/// Debounced "B is pressed" (active low). False on single-button boards.
+pub fn button_b_pressed() -> bool {
+    let gpio = BUTTON_B_GPIO.load(Ordering::Relaxed);
+    if gpio < 0 || unsafe { esp_idf_svc::sys::gpio_get_level(gpio) } != 0 {
+        return false;
+    }
+    // Confirm the level survives a debounce interval before acting on it.
+    esp_idf_hal::delay::FreeRtos::delay_ms(30);
+    unsafe { esp_idf_svc::sys::gpio_get_level(gpio) == 0 }
+}
+
+/// Block until B is released (bounded), with a debounce on the rising edge.
+pub fn drain_button_b() {
+    let gpio = BUTTON_B_GPIO.load(Ordering::Relaxed);
+    if gpio < 0 {
+        return;
+    }
+    let start = std::time::Instant::now();
+    while unsafe { esp_idf_svc::sys::gpio_get_level(gpio) } == 0
+        && start.elapsed() < Duration::from_secs(10)
+    {
+        crate::wdt::feed();
+        esp_idf_hal::delay::FreeRtos::delay_ms(POLL_INTERVAL_MS);
+    }
+    esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE.as_millis() as u32);
+}
+
+// ---------------------------------------------------------------------------
 // Two-button text entry — for boards with a second button (e.g. the T-Display)
 // ---------------------------------------------------------------------------
 

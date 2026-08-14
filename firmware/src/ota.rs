@@ -70,7 +70,7 @@ unsafe impl Send for OtaSession {}
 ///
 /// Verifies the release signature over the claimed digest first — a bad or
 /// missing signature is refused before the owner is asked to approve.  Then
-/// shows the firmware size on the OLED and runs the 30-second approval loop
+/// shows the firmware size on the OLED and runs the 45-second approval loop
 /// (hold button 2 seconds to confirm).  On approval, opens the inactive OTA
 /// partition and initialises an `OtaSession`.  Sends `OTA_STATUS(READY)` on
 /// success or an appropriate error code on failure.
@@ -123,11 +123,13 @@ pub fn handle_ota_begin(
     // serial data and corrupts OTA_STATUS responses on the host side.
     // The OLED shows the firmware size instead.
 
-    // Show firmware size and run the approval loop (30 s, 2 s hold).
+    // Show firmware size and run the approval loop (45 s, 2 s hold — the
+    // update is driven from a browser or the Pi, so allow for the operator
+    // looking at the wrong screen when the countdown starts).
     let size_kb = (total_size + 1023) / 1024;
     let approval_result =
-        crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
-            crate::oled::show_ota_approval(d, size_kb, remaining, 30);
+        crate::approval::run_approval_loop(display, button_pin, 45, |d, remaining| {
+            crate::oled::show_ota_approval(d, size_kb, remaining, 45);
         });
 
     match approval_result {

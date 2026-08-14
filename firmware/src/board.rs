@@ -266,6 +266,10 @@ pub fn bringup(p: Peripherals) -> Hw {
     // the board's external pull-up; the cancel/back button).
     let button_a = PinDriver::input(p.pins.gpio0, Pull::Up).expect("button A");
     let button_b = PinDriver::input(p.pins.gpio35, Pull::Floating).expect("button B");
+    // Let the approval loop see B as an explicit cancel without threading a
+    // second pin through every handler. Skipped if B does not idle high (a
+    // clone missing the external pull-up on this input-only pin).
+    crate::button::register_button_b(35);
 
     Hw {
         display,

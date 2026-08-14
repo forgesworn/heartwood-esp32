@@ -977,17 +977,57 @@ pub fn show_change_approval(display: &mut Display<'_>, title: &str, remaining: u
         .draw(display)
         .ok();
     }
-    let hint = format!("Hold button - {remaining}s");
-    Text::new(
-        &hint,
-        Point::new(
-            l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())),
-            l.sy(57),
-        ),
-        small,
-    )
-    .draw(display)
-    .ok();
+    // The old "Hold button - Ns" read as a hold-duration counter, and testers
+    // watched the countdown sit at 0 wondering why holding did nothing. Spell
+    // out both halves: what the hold does, and when the request expires. On
+    // two-button boards, also say which button is which (A is the lower-left
+    // button on the T-Display; B above it cancels).
+    let two_btn = crate::button::has_button_b();
+    if second.is_some() {
+        // Two title lines leave room for one hint line only.
+        let hint = if two_btn {
+            format!("hold lower=yes {remaining}s")
+        } else {
+            format!("hold 2s = yes ({remaining}s)")
+        };
+        Text::new(
+            &hint,
+            Point::new(
+                l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())),
+                l.sy(57),
+            ),
+            small,
+        )
+        .draw(display)
+        .ok();
+    } else {
+        let hint1 = if two_btn { "Hold lower 2s = yes" } else { "Hold 2s to approve" };
+        let hint2 = if two_btn {
+            format!("tap upper = no ({remaining}s)")
+        } else {
+            format!("expires in {remaining}s")
+        };
+        Text::new(
+            hint1,
+            Point::new(
+                l.center_x(hint1.len() as i32 * Layout::glyph_w(l.font_small())),
+                l.sy(50),
+            ),
+            small,
+        )
+        .draw(display)
+        .ok();
+        Text::new(
+            &hint2,
+            Point::new(
+                l.center_x(hint2.len() as i32 * Layout::glyph_w(l.font_small())),
+                l.sy(60),
+            ),
+            small,
+        )
+        .draw(display)
+        .ok();
+    }
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -1609,6 +1649,213 @@ pub fn show_denied(display: &mut Display<'_>) {
         .draw(display).ok();
 
     Text::new("released too early", Point::new(l.sx(14), l.sy(58)), small).draw(display).ok();
+
+    display.flush().ok();
+}
+
+/// Bottom-right page marker for the idle info carousel ("2/3").
+fn draw_page_marker(display: &mut Display<'_>, l: &Layout, page: u8, pages: u8) {
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+    let marker = format!("{}/{}", page, pages);
+    Text::new(
+        &marker,
+        Point::new(
+            l.w - l.sx(4) - marker.len() as i32 * Layout::glyph_w(l.font_small()),
+            l.sy(62),
+        ),
+        small,
+    )
+    .draw(display)
+    .ok();
+}
+
+/// Idle info page: network state. `ssid` is shown only when one is stored —
+/// this stays on the local display, which the security model already trusts
+/// with the identity card.
+pub fn show_info_network(
+    display: &mut Display<'_>,
+    mode_line: &str,
+    ssid: Option<&str>,
+    status: &str,
+) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(l.font_body())
+        .text_color(FG)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+
+    Text::new("NETWORK", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display)
+        .ok();
+
+    Text::new(mode_line, Point::new(l.sx(4), l.sy(28)), body).draw(display).ok();
+    if let Some(ssid) = ssid {
+        let ssid_line = format!("WiFi: {}", truncate_str(ssid, 15));
+        Text::new(&ssid_line, Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
+    } else {
+        Text::new("WiFi: not set", Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
+    }
+    let status_line = format!("Status: {status}");
+    Text::new(&status_line, Point::new(l.sx(4), l.sy(52)), small).draw(display).ok();
+
+    draw_page_marker(display, &l, 2, 3);
+    display.flush().ok();
+}
+
+/// Idle info page: firmware version, board, and time since boot.
+pub fn show_info_device(
+    display: &mut Display<'_>,
+    version: &str,
+    board: &str,
+    uptime_secs: u64,
+) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(l.font_body())
+        .text_color(FG)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+
+    Text::new("DEVICE", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display)
+        .ok();
+
+    let version_line = format!("v{version}");
+    Text::new(&version_line, Point::new(l.sx(4), l.sy(28)), body).draw(display).ok();
+    Text::new(board, Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
+
+    let days = uptime_secs / 86_400;
+    let hours = (uptime_secs % 86_400) / 3_600;
+    let minutes = (uptime_secs % 3_600) / 60;
+    let seconds = uptime_secs % 60;
+    let uptime_line = if days > 0 {
+        format!("up {days}d {hours:02}:{minutes:02}")
+    } else {
+        format!("up {hours:02}:{minutes:02}:{seconds:02}")
+    };
+    Text::new(&uptime_line, Point::new(l.sx(4), l.sy(52)), small).draw(display).ok();
+
+    draw_page_marker(display, &l, 3, 3);
+    display.flush().ok();
+}
+
+/// Terminal card left on screen when an approval window expires unanswered.
+/// Replaces the countdown so a stale "0s" prompt can never linger looking
+/// like a live request that ignores the buttons. Non-blocking: the caller
+/// NACKs the host immediately.
+pub fn show_request_expired(display: &mut Display<'_>) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let body = MonoTextStyleBuilder::new()
+        .font(l.font_body())
+        .text_color(FG)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+
+    Rectangle::new(Point::new(l.sx(0), l.sy(18)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(MUTED))
+        .draw(display)
+        .ok();
+
+    let title = "Request expired";
+    Text::new(
+        title,
+        Point::new(l.center_x(title.len() as i32 * Layout::glyph_w(l.font_body())), l.sy(36)),
+        body,
+    )
+    .draw(display)
+    .ok();
+
+    Rectangle::new(Point::new(l.sx(0), l.sy(42)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(MUTED))
+        .draw(display)
+        .ok();
+
+    let hint = "no change made";
+    Text::new(
+        hint,
+        Point::new(l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(56)),
+        small,
+    )
+    .draw(display)
+    .ok();
+
+    display.flush().ok();
+}
+
+/// Display the "Cancelled" screen — the B button declined a request. Distinct
+/// from [`show_denied`], whose "released too early" copy only fits an
+/// abandoned A-hold.
+pub fn show_cancelled(display: &mut Display<'_>) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let large = MonoTextStyleBuilder::new()
+        .font(l.font_large())
+        .text_color(DANGER)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+
+    Rectangle::new(Point::new(l.sx(0), l.sy(16)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(DANGER))
+        .draw(display)
+        .ok();
+
+    let title = "CANCELLED";
+    Text::new(
+        title,
+        Point::new(l.center_x(title.len() as i32 * Layout::glyph_w(l.font_large())), l.sy(38)),
+        large,
+    )
+    .draw(display)
+    .ok();
+
+    Rectangle::new(Point::new(l.sx(0), l.sy(44)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(DANGER))
+        .draw(display)
+        .ok();
+
+    let hint = "no change made";
+    Text::new(
+        hint,
+        Point::new(l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(58)),
+        small,
+    )
+    .draw(display)
+    .ok();
 
     display.flush().ok();
 }

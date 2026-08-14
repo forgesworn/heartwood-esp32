@@ -181,6 +181,36 @@ pub fn uptime_s() -> u64 {
     (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u64
 }
 
+/// One page of the idle info carousel in the USB-bridged loop. Page 0 is the
+/// boot status card; short presses cycle the network and device pages. The
+/// radio is off by definition here — the WiFi tier runs its own loop — so the
+/// network page reports the dormant stored network, not a live link.
+pub fn draw_idle_page(
+    page: u8,
+    display: &mut oled::Display<'_>,
+    master_count: u8,
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+) {
+    match page {
+        1 => {
+            let cfg = net_config_store::read_net_config(nvs)
+                .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok());
+            let ssid = cfg
+                .as_ref()
+                .filter(|c| !c.ssid.is_empty())
+                .map(|c| c.ssid.as_str());
+            oled::show_info_network(display, "USB bridge", ssid, "radio off");
+        }
+        2 => oled::show_info_device(
+            display,
+            env!("CARGO_PKG_VERSION"),
+            board::BOARD,
+            uptime_s(),
+        ),
+        _ => oled::show_boot(display, master_count),
+    }
+}
+
 /// Human-attributable cause of the last chip reset. "software-restart" covers
 /// the deliberate reboots (identity changes, network activation, removals);
 /// panic/watchdog/brownout are the crashes worth investigating.
@@ -732,6 +762,9 @@ fn main() {
     // button press will wake it again.
     let mut last_activity = Instant::now();
     let mut display_on = true;
+    // Idle info carousel: waking shows page 0 (status); further short presses
+    // cycle network and device pages. Sleep resets to page 0.
+    let mut idle_page: u8 = 0;
 
     // --- Frame dispatch loop ---
     log::info!("Entering frame dispatch loop");
@@ -759,37 +792,38 @@ fn main() {
                     if display_on && last_activity.elapsed() >= DISPLAY_TIMEOUT {
                         oled::sleep_display(&mut display);
                         display_on = false;
+                        idle_page = 0;
                         log::info!("Display slept after {}s idle", DISPLAY_TIMEOUT.as_secs());
                     }
 
-                    // Short PRG button press (active-low GPIO 0) wakes the display.
-                    // A 2-second hold is reserved for signing approval inside the
-                    // signing handler — we only act on a complete short press here
-                    // (press detected AND released before 2 s).
+                    // PRG button press (active-low GPIO 0) wakes the display.
+                    // Wake on the press itself, not the release: a CH9102/CP2102
+                    // bridge can pin GPIO 0 low after a web-serial flash until
+                    // the cable is re-plugged, and requiring a release made the
+                    // device look dead in that state. Waking on press also feels
+                    // more immediate on a healthy button.
                     if button_pin.is_low() {
+                        last_activity = Instant::now();
+                        if !display_on {
+                            oled::wake_display(&mut display);
+                            display_on = true;
+                            idle_page = 0;
+                            log::info!("Display woken by button press");
+                        } else {
+                            // Awake: a short press pages through the idle
+                            // info carousel (status / network / device).
+                            idle_page = (idle_page + 1) % 3;
+                        }
+                        draw_idle_page(idle_page, &mut display, loaded_masters.len() as u8, &mut nvs);
                         let press_start = Instant::now();
-                        // Wait for release, capping at 2 s to avoid consuming a
-                        // long-hold that belongs to a signing request.
+                        // Drain the press, capping at 1.9 s so a long-hold that
+                        // belongs to an imminent signing request is not consumed.
                         while button_pin.is_low()
                             && press_start.elapsed() < Duration::from_millis(1900)
                         {
+                            wdt::feed();
                             esp_idf_hal::delay::FreeRtos::delay_ms(20);
                         }
-
-                        if button_pin.is_high() {
-                            // Button released — treat as a short press (wake).
-                            last_activity = Instant::now();
-                            if !display_on {
-                                oled::wake_display(&mut display);
-                                display_on = true;
-                                log::info!("Display woken by button short press");
-                            }
-                            // Show the idle status screen so the user can see
-                            // the current state after waking.
-                            oled::show_boot(&mut display, loaded_masters.len() as u8);
-                        }
-                        // If still held at 1.9 s, a signing frame is expected
-                        // imminently — let the signing handler deal with it.
                     }
                 }
             }

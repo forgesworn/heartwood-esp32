@@ -39,7 +39,10 @@ const NVS_SEEDED_CRC_KEY: &str = "ncfg_crc";
 /// Maximum stored config size. The read buffer is fixed at this size, so the
 /// write must reject anything larger — otherwise the blob writes but every
 /// subsequent boot read returns None (ESP_ERR_NVS_INVALID_LENGTH swallowed).
-const NET_CONFIG_MAX_LEN: usize = 512;
+// Raised from 512 when the fallback-network list landed: eight credential
+// pairs plus relays no longer fit half a kilobyte. Bounded to keep the NVS
+// footprint honest — the active blob and a staged trial candidate can coexist.
+const NET_CONFIG_MAX_LEN: usize = 1024;
 const NET_TRIAL_MAX_LEN: usize = 1024;
 const NET_LAST_MAX_LEN: usize = 192;
 
@@ -488,6 +491,21 @@ pub fn write_seeded_crc(nvs: &mut EspNvs<NvsDefault>, crc: u32) {
     }
 }
 
+/// Password-free view of a config's fallback-network list for USB reporting.
+pub fn redacted_networks(cfg: &heartwood_common::net_config::NetConfig) -> serde_json::Value {
+    serde_json::Value::Array(
+        cfg.networks
+            .iter()
+            .map(|network| {
+                serde_json::json!({
+                    "ssid": network.ssid,
+                    "password_set": !network.password.is_empty(),
+                })
+            })
+            .collect(),
+    )
+}
+
 fn redacted_state(
     nvs: &mut EspNvs<NvsDefault>,
     runtime: NetworkRuntimeStatus,
@@ -508,6 +526,7 @@ fn redacted_state(
             "ssid": pending.candidate.ssid,
             "relays": pending.candidate.relays,
             "password_set": !pending.candidate.password.is_empty(),
+            "networks": redacted_networks(&pending.candidate),
             "attempted": pending.attempts > 0,
         })
     });
@@ -528,6 +547,7 @@ fn redacted_state(
             "ssid": cfg.ssid,
             "relays": cfg.relays,
             "password_set": !cfg.password.is_empty(),
+            "networks": redacted_networks(&cfg),
             "op_mgmt": cfg.op_mgmt,
             "trial": trial,
             "last_result": last_result,
@@ -587,8 +607,12 @@ fn approved(
     button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
     title: &str,
 ) -> bool {
+    // 45 s window: these prompts are driven from a browser (Sapwood), where
+    // the operator is looking at the wrong screen when the countdown starts.
+    // heartwoodd waits 60 s for button approvals, so 45 s stays inside every
+    // host timeout.
     matches!(
-        crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
+        crate::approval::run_approval_loop(display, button_pin, 45, |d, remaining| {
             crate::oled::show_change_approval(d, title, remaining);
         }),
         crate::approval::ApprovalResult::Approved
@@ -763,7 +787,7 @@ pub fn handle_set_net_config(
     match heartwood_common::net_config::parse_net_config(payload) {
         Ok(cfg) if cfg.validate().is_ok() => {
             let result =
-                crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
+                crate::approval::run_approval_loop(display, button_pin, 45, |d, remaining| {
                     crate::oled::show_change_approval(d, "Set network config?", remaining);
                 });
 

@@ -20,7 +20,7 @@ use esp_idf_svc::sys;
 const MAGIC: [u8; 4] = *b"HWCF";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 11; // 4 magic + 1 version + 2 len + 4 crc
-const MAX_JSON: usize = 512; // matches net_config_store::NET_CONFIG_MAX_LEN
+const MAX_JSON: usize = 1024; // matches net_config_store::NET_CONFIG_MAX_LEN
 
 /// Read and validate the flash-time `config` partition. Returns the JSON bytes
 /// and the blob's CRC32 (so `main` can detect a re-flash and re-seed), else

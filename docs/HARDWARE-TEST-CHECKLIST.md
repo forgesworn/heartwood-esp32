@@ -553,9 +553,18 @@ sapwood checkout for deps):
   for slot-listed extensions (a listed method + auto_approve now defers to
   `evaluate_slot_policy`; consent is the button-confirmed ceiling install).
   First attempt burned a thumb on ~35 per-request prompts.
-- Still open: the power-cut runs (a hand on the plug mid-migration and
-  mid-removal), and a Sapwood-UI click-through for CP1. Migration-with-data
-  passed same day on the T-Display (see the ticked item above).
+- Chaos power-cut runs, same day (T-Display, live cable yanks during
+  registry churn — derive/remove bursts at ~5 ops/s): two cuts at distinct
+  points (mid-derive-burst; at the removal boundary), and after each the
+  board booted to a CONSISTENT registry — 3 masters, the migrated persona,
+  no duplicate pubkeys, mid-flight personas landing atomically on one side
+  of the cut. A cut-adjacent removal resumed invisibly from its journal at
+  boot. Honest scope: hand-timed pulls sample arbitrary cut points; the
+  per-step cut coverage lives in the host models
+  (`persona_pack` cut-after-every-step tests), which these runs corroborate.
+- Still open for CP1: a hand-timed cut specifically during a first-boot
+  MIGRATION (needs another legacy-persona board), and the Sapwood-UI
+  click-through. Migration-with-data itself passed (ticked above).
 
 ## Notes
 

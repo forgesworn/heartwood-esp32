@@ -604,7 +604,7 @@ fn persist_local_replacement(
 
 fn approved(
     display: &mut crate::oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
     title: &str,
 ) -> bool {
     // 45 s window: these prompts are driven from a browser (Sapwood), where
@@ -612,7 +612,7 @@ fn approved(
     // heartwoodd waits 60 s for button approvals, so 45 s stays inside every
     // host timeout.
     matches!(
-        crate::approval::run_approval_loop(display, button_pin, 45, |d, remaining| {
+        crate::approval::run_approval_loop(display, buttons, 45, |d, remaining| {
             crate::oled::show_change_approval(d, title, remaining);
         }),
         crate::approval::ApprovalResult::Approved
@@ -655,7 +655,7 @@ pub fn handle_patch_net_config(
     payload: &[u8],
     nvs: &mut EspNvs<NvsDefault>,
     display: &mut crate::oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     let params: LocalNetConfigPatchParams = match serde_json::from_slice(payload) {
         Ok(params) => params,
@@ -690,7 +690,7 @@ pub fn handle_patch_net_config(
         }
     };
     let next_mode = replacement.device_mode();
-    if !approved(display, button_pin, "Change network?") {
+    if !approved(display, buttons, "Change network?") {
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"denied");
         return;
     }
@@ -711,7 +711,7 @@ pub fn handle_set_operator(
     payload: &[u8],
     nvs: &mut EspNvs<NvsDefault>,
     display: &mut crate::oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
     radio_active: bool,
 ) {
     if payload.len() != 36 {
@@ -739,7 +739,7 @@ pub fn handle_set_operator(
     }
     let operator_hex = heartwood_common::hex::hex_encode(&canonical);
     let prompt = format!("Replace operator?\n{}...", &operator_hex[..8]);
-    if !approved(display, button_pin, &prompt) {
+    if !approved(display, buttons, &prompt) {
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"denied");
         return;
     }
@@ -782,12 +782,12 @@ pub fn handle_set_net_config(
     payload: &[u8],
     nvs: &mut EspNvs<NvsDefault>,
     display: &mut crate::oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     match heartwood_common::net_config::parse_net_config(payload) {
         Ok(cfg) if cfg.validate().is_ok() => {
             let result =
-                crate::approval::run_approval_loop(display, button_pin, 45, |d, remaining| {
+                crate::approval::run_approval_loop(display, buttons, 45, |d, remaining| {
                     crate::oled::show_change_approval(d, "Set network config?", remaining);
                 });
 

@@ -128,7 +128,7 @@ pub fn handle_update(
     policy_engine: &mut PolicyEngine,
     nvs: &mut EspNvs<NvsDefault>,
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     if !policy_engine.bridge_authenticated {
         // Say WHY. An empty NACK left callers guessing: the sapwood CLI
@@ -172,7 +172,7 @@ pub fn handle_update(
 
                 let result = crate::approval::run_approval_loop(
                     display,
-                    button_pin,
+                    buttons,
                     30,
                     |d, remaining| {
                         let msg = format!("Update {}?\n{}\n{}s", short_label, changes, remaining);

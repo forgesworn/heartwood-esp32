@@ -217,7 +217,7 @@ pub fn handle_generate(
     nvs: &mut EspNvs<NvsDefault>,
     secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) -> Option<LoadedMaster> {
     let (label, words) = if frame.payload.is_empty() {
         ("default".to_string(), 12u8)
@@ -251,7 +251,7 @@ pub fn handle_generate(
     // Offer the entropy game: the owner's button timing becomes a second,
     // independent entropy source, stacked with the hardware RNG draw so
     // neither alone can bias the key. Optional — hold skips to hardware-only.
-    let game_digest = crate::entropy_game::run(display, button_pin);
+    let game_digest = crate::entropy_game::run(display, &buttons.a);
 
     // Feedback while the (multi-second) entropy draw + PBKDF2 + derivation +
     // NVS write run, so the device isn't silently stuck on the previous screen.
@@ -302,7 +302,7 @@ pub fn handle_generate(
             // Walk the owner through the phrase one big word at a time and block
             // the caller from redrawing (or, for a wifi device, rebooting) until
             // they confirm with a hold. The phrase only ever appears here.
-            walk_recovery_phrase(display, button_pin, &phrase);
+            walk_recovery_phrase(display, buttons, &phrase);
             drop(phrase); // Zeroizing: phrase bytes are wiped on drop
             Some(master)
         }
@@ -330,7 +330,7 @@ pub fn handle_generate(
 /// confirm hold can't be re-read by the post-reboot "hold PRG = USB" prompt.
 fn walk_recovery_phrase(
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
     phrase: &str,
 ) {
     let words: Vec<&str> = phrase.split_whitespace().collect();
@@ -340,12 +340,12 @@ fn walk_recovery_phrase(
         // Step through every word; any press advances to the next.
         for (i, word) in words.iter().enumerate() {
             oled::show_recovery_word(display, i + 1, total, word);
-            let _ = press_blocking(button_pin);
+            let _ = press_blocking(buttons);
         }
 
         // Confirm with the same 0–100% hold bar used for signing: a full hold
         // saves, a short tap restarts the review.
-        if confirm_recovery_save(display, button_pin) {
+        if confirm_recovery_save(display, buttons) {
             oled::show_result(display, "SAVED");
             return;
         }
@@ -359,10 +359,10 @@ fn walk_recovery_phrase(
 /// "hold PRG = USB" prompt. Returns true to save, false to show the words again.
 fn confirm_recovery_save(
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) -> bool {
     oled::show_recovery_done(display);
-    hold_to_confirm(display, button_pin)
+    hold_to_confirm(display, buttons)
 }
 
 /// Run a 0–100% hold-to-confirm over the shared `show_hold_progress` bar,
@@ -372,7 +372,7 @@ fn confirm_recovery_save(
 /// both the recovery-save and restore-save confirmations.
 fn hold_to_confirm(
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) -> bool {
     use esp_idf_hal::delay::FreeRtos;
     use std::time::Instant;
@@ -385,7 +385,7 @@ fn hold_to_confirm(
     let mut last_pct = 101u32; // force first bar draw
 
     loop {
-        let low = button_pin.is_low();
+        let low = buttons.a.is_low();
         if low && !pressed {
             pressed = true;
             press_start = Instant::now();
@@ -394,7 +394,7 @@ fn hold_to_confirm(
             let held = press_start.elapsed().as_millis() as u32;
             if held >= HOLD_MS {
                 oled::show_hold_progress(display, 100);
-                while button_pin.is_low() {
+                while buttons.a.is_low() {
                     FreeRtos::delay_ms(POLL_MS);
                 }
                 return true;
@@ -432,10 +432,10 @@ fn confirm_two_button(
 /// a long hold (`Approve`) or a short tap (`Deny`). Re-arms on the (deliberately
 /// long) timeout so it never returns on its own.
 fn press_blocking(
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) -> crate::button::ButtonResult {
     loop {
-        if let Some(r) = crate::button::wait_for_press(button_pin, std::time::Duration::from_secs(3600)) {
+        if let Some(r) = crate::button::wait_for_press(&buttons.a, std::time::Duration::from_secs(3600)) {
             return r;
         }
     }
@@ -455,12 +455,12 @@ pub fn handle_restore(
     nvs: &mut EspNvs<NvsDefault>,
     secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
-    // Second button, present on boards that have one (the T-Display). When set,
-    // word entry runs the two-button picker (A = move, B = pick, no timing);
-    // single-button boards (Heltec, C6) pass `None` and keep the gesture picker.
-    button_b: Option<&esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>>,
+    buttons: &crate::button::Buttons<'_>,
 ) -> Option<LoadedMaster> {
+    // Second button, present on boards that have one (the T-Display). When
+    // set, word entry runs the two-button picker (A = move, B = pick, no
+    // timing); single-button boards (Heltec, C6) keep the gesture picker.
+    let button_b = buttons.b.as_ref();
     let label = if frame.payload.is_empty() {
         "default".to_string()
     } else {
@@ -483,7 +483,7 @@ pub fn handle_restore(
     // word steps to the previous one; stepping back past word 1 cancels the restore.
     while words.len() < TOTAL {
         let idx = words.len() + 1;
-        match enter_one_word(display, button_pin, button_b, idx, TOTAL) {
+        match enter_one_word(display, buttons, button_b, idx, TOTAL) {
             WordResult::Accepted(w) => words.push(w),
             WordResult::Back => {
                 if words.pop().is_none() {
@@ -498,7 +498,7 @@ pub fn handle_restore(
     // list so they can hunt the wrong word) and then confirms the derived npub.
     let mut invalid = false;
     loop {
-        match review_phrase(display, button_pin, button_b, &mut words, invalid) {
+        match review_phrase(display, buttons, button_b, &mut words, invalid) {
             ReviewOutcome::Cancel => return cancel_restore(usb, display),
             ReviewOutcome::Save => {
                 let phrase = words.join(" ");
@@ -528,8 +528,8 @@ pub fn handle_restore(
                 // deliberate 2-second save hold.
                 oled::show_restore_confirm(display, &npub, button_b.is_some());
                 let confirmed = match button_b {
-                    Some(b) => confirm_two_button(button_pin, b),
-                    None => hold_to_confirm(display, button_pin),
+                    Some(b) => confirm_two_button(&buttons.a, b),
+                    None => hold_to_confirm(display, buttons),
                 };
                 if !confirmed {
                     root.iter_mut().for_each(|b| *b = 0);
@@ -589,7 +589,7 @@ enum WordResult {
 ///   prefix resolves to the sole word, a single tap accepts it.
 fn enter_one_word(
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
     button_b: Option<&esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>>,
     index: usize,
     total: usize,
@@ -633,7 +633,7 @@ fn enter_one_word(
         if let Some(b) = button_b {
             // A tap = prev, B tap = next, hold B = pick, hold A = backspace
             // (delete a letter, or on an empty prefix step to the previous word).
-            match crate::button::read_two_button_gesture(button_pin, b) {
+            match crate::button::read_two_button_gesture(&buttons.a, b) {
                 crate::button::TwoBtn::Prev => sel = (sel + n - 1) % n,
                 crate::button::TwoBtn::Next => sel = (sel + 1) % n,
                 crate::button::TwoBtn::Select => match choices[sel] {
@@ -653,7 +653,7 @@ fn enter_one_word(
             continue;
         }
 
-        match next_gesture(button_pin) {
+        match next_gesture(buttons) {
             Gesture::Single => {
                 if sole_word {
                     if let Choice::Word(w) = choices[0] {
@@ -695,7 +695,7 @@ enum ReviewOutcome {
 /// checksum, so the owner knows a wrong word is still hiding in the list.
 fn review_phrase(
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
     button_b: Option<&esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>>,
     words: &mut [&'static str],
     invalid: bool,
@@ -718,7 +718,7 @@ fn review_phrase(
         // a double-tap). Movement is handled inline.
         let act = if let Some(b) = button_b {
             // A tap = prev, B tap = next, hold B = act, hold A = jump to CANCEL.
-            match crate::button::read_two_button_gesture(button_pin, b) {
+            match crate::button::read_two_button_gesture(&buttons.a, b) {
                 crate::button::TwoBtn::Prev => {
                     sel = (sel + total_items - 1) % total_items;
                     false
@@ -734,7 +734,7 @@ fn review_phrase(
                 }
             }
         } else {
-            match next_gesture(button_pin) {
+            match next_gesture(buttons) {
                 Gesture::Single => {
                     sel = (sel + 1) % total_items;
                     false
@@ -750,7 +750,7 @@ fn review_phrase(
         if act {
             if sel < n {
                 // Re-enter this slot; a Back keeps the existing word.
-                if let WordResult::Accepted(w) = enter_one_word(display, button_pin, button_b, sel + 1, n) {
+                if let WordResult::Accepted(w) = enter_one_word(display, buttons, button_b, sel + 1, n) {
                     words[sel] = w;
                 }
             } else if sel == n {
@@ -766,10 +766,10 @@ fn review_phrase(
 /// timeout so it never returns on its own. (Distinct from `press_blocking`,
 /// which reports the approve/deny `ButtonResult` used by the generate walkthrough.)
 fn next_gesture(
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) -> Gesture {
     loop {
-        if let Some(g) = crate::button::read_gesture(button_pin, std::time::Duration::from_secs(3600)) {
+        if let Some(g) = crate::button::read_gesture(&buttons.a, std::time::Duration::from_secs(3600)) {
             return g;
         }
     }
@@ -800,7 +800,7 @@ pub fn handle_remove(
     nvs: &mut EspNvs<NvsDefault>,
     loaded: &mut Vec<LoadedMaster>,
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) -> bool {
     if frame.payload.len() != 1 {
         log::warn!(
@@ -822,7 +822,7 @@ pub fn handle_remove(
     };
     let npub = encode_npub(&master.pubkey);
     let detail = format!("slot {slot} {}…", &npub[..12]);
-    let approval = crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
+    let approval = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
         oled::show_sign_request(d, "REMOVE IDENTITY", 0, &detail, remaining);
     });
     if !matches!(approval, crate::approval::ApprovalResult::Approved) {
@@ -914,11 +914,11 @@ pub fn handle_factory_reset(
     usb: &mut SerialPort<'_>,
     _nvs: &mut EspNvs<NvsDefault>,
     display: &mut Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     let result = crate::approval::run_approval_loop(
         display,
-        button_pin,
+        buttons,
         30,
         |d, remaining| {
             crate::oled::show_sign_request(d, "FACTORY", 0, "ERASE ALL DATA?", remaining);

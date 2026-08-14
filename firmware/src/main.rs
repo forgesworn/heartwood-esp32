@@ -337,9 +337,9 @@ pub fn fill_random(buf: &mut [u8]) {
 /// physical hold-to-wipe escape; never erase automatically on recovery error.
 fn offer_removal_recovery_wipe(
     display: &mut oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
-    let approval = approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
+    let approval = approval::run_approval_loop(display, buttons, 30, |d, remaining| {
         oled::show_sign_request(d, "RECOVERY", 0, "WIPE ALL DATA?", remaining);
     });
     if !matches!(approval, approval::ApprovalResult::Approved) {
@@ -383,12 +383,9 @@ fn main() {
     let board::Hw {
         mut display,
         serial: mut usb,
-        button_a: button_pin,
-        // Second button on boards that have one (the T-Display). Threaded into
-        // the on-device restore so word entry can use the two-button picker;
-        // `None` on single-button boards (Heltec, C6), which keep the gesture
-        // picker.
-        button_b,
+        // A approves/selects; B (where the board has one, e.g. the T-Display)
+        // cancels/backs and drives the two-button restore picker.
+        buttons,
         modem,
     } = board::bringup(peripherals);
     log::info!("Board bring-up complete ({})", board::BOARD);
@@ -422,7 +419,7 @@ fn main() {
                 // No seed/policy/persona has loaded yet. Remain fail-closed,
                 // retry recovery, and give the owner a physical 2-second PRG
                 // hold escape to the same complete factory wipe.
-                offer_removal_recovery_wipe(&mut display, &button_pin);
+                offer_removal_recovery_wipe(&mut display, &buttons);
             }
         }
     }
@@ -499,10 +496,10 @@ fn main() {
                     let secp = Arc::new(Secp256k1::signing_only());
                     let provisioned = match frame.frame_type {
                         FRAME_TYPE_GENERATE_IDENTITY => {
-                            provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
+                            provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &buttons)
                         }
                         FRAME_TYPE_RESTORE_IDENTITY => {
-                            provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin, button_b.as_ref())
+                            provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &buttons)
                         }
                         _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display),
                     };
@@ -655,7 +652,7 @@ fn main() {
                         &mut usb,
                         &mut nvs,
                         &mut display,
-                        &button_pin,
+                        &buttons,
                     );
                 }
                 _ => {
@@ -734,7 +731,7 @@ fn main() {
                 &mut loaded_personas,
                 &secp,
                 &mut display,
-                &button_pin,
+                &buttons,
                 &mut policy_engine,
                 &mut identity_caches,
                 &mut nvs,
@@ -802,7 +799,7 @@ fn main() {
                     // the cable is re-plugged, and requiring a release made the
                     // device look dead in that state. Waking on press also feels
                     // more immediate on a healthy button.
-                    if button_pin.is_low() {
+                    if buttons.a.is_low() {
                         last_activity = Instant::now();
                         if !display_on {
                             oled::wake_display(&mut display);
@@ -818,7 +815,7 @@ fn main() {
                         let press_start = Instant::now();
                         // Drain the press, capping at 1.9 s so a long-hold that
                         // belongs to an imminent signing request is not consumed.
-                        while button_pin.is_low()
+                        while buttons.a.is_low()
                             && press_start.elapsed() < Duration::from_millis(1900)
                         {
                             wdt::feed();
@@ -836,10 +833,10 @@ fn main() {
             FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
                 let provisioned = match frame.frame_type {
                     FRAME_TYPE_GENERATE_IDENTITY => {
-                        provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin)
+                        provision::handle_generate(&mut usb, &frame, &mut nvs, &secp, &mut display, &buttons)
                     }
                     FRAME_TYPE_RESTORE_IDENTITY => {
-                        provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &button_pin, button_b.as_ref())
+                        provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &buttons)
                     }
                     _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display),
                 };
@@ -909,7 +906,7 @@ fn main() {
                         master.slot,
                         &secp,
                         &mut display,
-                        &button_pin,
+                        &buttons,
                         &mut policy_engine,
                         &mut identity_caches,
                         None,
@@ -935,7 +932,7 @@ fn main() {
                     &mut nvs,
                     &mut loaded_masters,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                 ) {
                     // Policies, personas, identity metadata, and identity
                     // caches are all slot-indexed. Reload them from the
@@ -963,7 +960,7 @@ fn main() {
                         &mut loaded_personas,
                         &secp,
                         &mut display,
-                        &button_pin,
+                        &buttons,
                         &mut policy_engine,
                         &mut identity_caches,
                         &mut nvs,
@@ -997,7 +994,7 @@ fn main() {
                     &mut nvs,
                     &policy_engine,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                 );
             }
 
@@ -1008,7 +1005,7 @@ fn main() {
                     &frame.payload,
                     &mut nvs,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                 );
             }
 
@@ -1026,7 +1023,7 @@ fn main() {
                     &frame.payload,
                     &mut nvs,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                 );
             }
 
@@ -1036,7 +1033,7 @@ fn main() {
                     &frame.payload,
                     &mut nvs,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                     false,
                 );
             }
@@ -1047,7 +1044,7 @@ fn main() {
                     &mut usb,
                     &mut nvs,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                 );
             }
 
@@ -1059,7 +1056,7 @@ fn main() {
                     &mut nvs,
                     &loaded_masters,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                 );
             }
 
@@ -1072,7 +1069,7 @@ fn main() {
                     &loaded_masters,
                     policy_engine.bridge_authenticated,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                 );
             }
 
@@ -1095,7 +1092,7 @@ fn main() {
 
             // 0x44 -- update a connection slot (requires button confirmation)
             FRAME_TYPE_CONNSLOT_UPDATE => {
-                connslot::handle_update(&mut usb, &frame, &mut policy_engine, &mut nvs, &mut display, &button_pin);
+                connslot::handle_update(&mut usb, &frame, &mut policy_engine, &mut nvs, &mut display, &buttons);
             }
 
             // 0x46 -- revoke a connection slot
@@ -1121,7 +1118,7 @@ fn main() {
                     &policy_engine,
                     &nvs,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                 );
             }
 
@@ -1134,7 +1131,7 @@ fn main() {
                     &mut policy_engine,
                     &mut nvs,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                 );
             }
 
@@ -1144,7 +1141,7 @@ fn main() {
                     &mut usb,
                     &frame.payload,
                     &mut display,
-                    &button_pin,
+                    &buttons,
                     &mut ota_session,
                 );
             }

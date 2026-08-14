@@ -4,7 +4,6 @@
 // sign_event, factory reset, and OTA -- any operation needing
 // interactive confirmation.
 
-use esp_idf_hal::gpio::{Input, PinDriver};
 use std::time::{Duration, Instant};
 
 use crate::oled::Display;
@@ -32,7 +31,7 @@ const DEBOUNCE_MS: u32 = 30;
 /// live.
 pub fn run_approval_loop<F>(
     display: &mut Display<'_>,
-    button_pin: &PinDriver<'_, Input>,
+    buttons: &crate::button::Buttons<'_>,
     timeout_secs: u64,
     mut show_fn: F,
 ) -> ApprovalResult
@@ -63,18 +62,18 @@ where
         }
 
         // B button (where present) is an explicit cancel — never an approve.
-        if !pressed && crate::button::button_b_pressed() {
-            crate::button::drain_button_b();
+        if !pressed && buttons.b_pressed() {
+            buttons.drain_b();
             crate::oled::show_cancelled(display);
             esp_idf_hal::delay::FreeRtos::delay_ms(500);
             return ApprovalResult::Denied;
         }
 
-        let mut low = button_pin.is_low();
+        let mut low = buttons.a.is_low();
         if low && !pressed {
             // Debounce the falling edge before starting the hold timer.
             esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE_MS);
-            if button_pin.is_low() {
+            if buttons.a.is_low() {
                 pressed = true;
                 press_start = Instant::now();
                 last_pct = 101; // force redraw
@@ -85,7 +84,7 @@ where
             // Debounce the rising edge — contact bounce mid-hold must not be
             // read as a deliberate early release (an instant deny).
             esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE_MS);
-            low = button_pin.is_low();
+            low = buttons.a.is_low();
         }
         if low && pressed {
             let held_ms = Instant::now().duration_since(press_start).as_millis() as u32;

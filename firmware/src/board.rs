@@ -16,7 +16,7 @@
 // ESP32-C6) means adding one `#[cfg]` block here. `main.rs` never changes:
 // it calls `board::bringup` once and consumes the returned handles.
 
-use esp_idf_hal::gpio::{Input, PinDriver};
+use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::modem::Modem;
 use esp_idf_hal::peripherals::Peripherals;
 
@@ -75,11 +75,9 @@ pub struct Hw {
     pub display: oled::Display<'static>,
     /// Host transport carrying the binary frame protocol.
     pub serial: SerialPort<'static>,
-    /// Primary / approval button (active-low, internal pull-up).
-    pub button_a: PinDriver<'static, Input>,
-    /// Second physical button where the board has one (e.g. the T-Display).
-    /// `None` on single-button boards (Heltec, C6).
-    pub button_b: Option<PinDriver<'static, Input>>,
+    /// The board's buttons: A approves/selects, B (where present, e.g. the
+    /// T-Display) cancels/backs. `Buttons::new` sanity-checks B at bring-up.
+    pub buttons: crate::button::Buttons<'static>,
     /// Radio modem, carried through untouched for the WiFi-standalone relay
     /// path. The radio stays off until a WiFi-configured device deliberately
     /// enters relay mode.
@@ -173,8 +171,7 @@ pub fn bringup(p: Peripherals) -> Hw {
     Hw {
         display,
         serial,
-        button_a,
-        button_b: None,
+        buttons: crate::button::Buttons::new(button_a, None),
         modem: p.modem,
     }
 }
@@ -266,16 +263,14 @@ pub fn bringup(p: Peripherals) -> Hw {
     // the board's external pull-up; the cancel/back button).
     let button_a = PinDriver::input(p.pins.gpio0, Pull::Up).expect("button A");
     let button_b = PinDriver::input(p.pins.gpio35, Pull::Floating).expect("button B");
-    // Let the approval loop see B as an explicit cancel without threading a
-    // second pin through every handler. Skipped if B does not idle high (a
-    // clone missing the external pull-up on this input-only pin).
-    crate::button::register_button_b(35);
 
     Hw {
         display,
         serial,
-        button_a,
-        button_b: Some(button_b),
+        // `Buttons::new` drops B if it does not idle high (a clone missing
+        // the external pull-up on this input-only pin must not self-cancel
+        // approvals).
+        buttons: crate::button::Buttons::new(button_a, Some(button_b)),
         modem: p.modem,
     }
 }
@@ -343,8 +338,7 @@ pub fn bringup(p: Peripherals) -> Hw {
     Hw {
         display,
         serial,
-        button_a,
-        button_b: None,
+        buttons: crate::button::Buttons::new(button_a, None),
         modem: p.modem,
     }
 }

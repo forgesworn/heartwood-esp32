@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use esp_idf_hal::gpio::{Input, PinDriver};
 
 use heartwood_common::derive;
 use heartwood_common::frame::Frame;
@@ -252,7 +251,7 @@ pub fn handle_request(
     master_slot: u8,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
-    button_pin: &PinDriver<'_, Input>,
+    buttons: &crate::button::Buttons<'_>,
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     client_pubkey: Option<&[u8; 32]>,
@@ -305,7 +304,7 @@ pub fn handle_request(
         master_slot,
         secp,
         display,
-        button_pin,
+        buttons,
         policy_engine,
         identity_caches,
         client_pubkey,
@@ -325,7 +324,7 @@ pub fn handle_parsed_request(
     master_slot: u8,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
-    button_pin: &PinDriver<'_, Input>,
+    buttons: &crate::button::Buttons<'_>,
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     client_pubkey: Option<&[u8; 32]>,
@@ -539,7 +538,7 @@ pub fn handle_parsed_request(
         let preview = extension_approval_preview(&requester_label, &request.params);
         let approval = crate::approval::run_approval_loop(
             display,
-            button_pin,
+            buttons,
             APPROVAL_TIMEOUT_SECS,
             |d, remaining| {
                 crate::oled::show_master_sign_request(
@@ -591,7 +590,7 @@ pub fn handle_parsed_request(
                         master_mode,
                         secp,
                         display,
-                        button_pin,
+                        buttons,
                         &request,
                         &requester_label,
                         event,
@@ -1028,7 +1027,7 @@ fn handle_sign_event(
     master_mode: MasterMode,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
-    button_pin: &PinDriver<'_, Input>,
+    buttons: &crate::button::Buttons<'_>,
     request: &nip46::Nip46Request,
     requester_label: &str,
     event: UnsignedEvent,
@@ -1040,7 +1039,7 @@ fn handle_sign_event(
     // "Hold 2s..." feedback while the button is held down.
     let result = crate::approval::run_approval_loop(
         display,
-        button_pin,
+        buttons,
         APPROVAL_TIMEOUT_SECS,
         |d, remaining| {
             crate::oled::show_sign_request(d, requester_label, kind, &content_preview, remaining);

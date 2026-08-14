@@ -38,7 +38,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::gpio::{Input, PinDriver};
 use esp_idf_hal::modem::Modem;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
@@ -245,14 +244,14 @@ struct SignAuditDraft {
 }
 
 /// Signing context borrowed from `main` for the lifetime of the relay loop.
-/// `masters`/`secp`/`button_pin` are shared refs; the rest are exclusive.
+/// `masters`/`secp`/`buttons` are shared refs; the rest are exclusive.
 /// `'d` (display) and `'b` (button) stay independent — like the USB path —
 /// so the `main` call site needn't prove the two peripherals share a lifetime.
 struct SignCtx<'a, 'd, 'b> {
     masters: &'a [LoadedMaster],
     secp: &'a Arc<Secp256k1<SignOnly>>,
     display: &'a mut Display<'d>,
-    button_pin: &'a PinDriver<'b, Input>,
+    buttons: &'a crate::button::Buttons<'b>,
     policy_engine: &'a mut PolicyEngine,
     identity_caches: &'a mut Vec<IdentityCache>,
     nvs: &'a mut EspNvs<NvsDefault>,
@@ -310,6 +309,36 @@ struct SignCtx<'a, 'd, 'b> {
     /// Idle info carousel position: 0 identity, 1 network, 2 device. Short
     /// presses while the panel is awake advance it; sleep resets it.
     idle_page: u8,
+}
+
+/// Wake the panel on a press; while awake, further presses page the idle
+/// info carousel. Drains the press (bounded) so one physical press moves
+/// exactly one page. Called from the top of the relay loop AND from inside
+/// the USB-serving wait windows, so a wake press keeps working while WiFi is
+/// reconnecting instead of playing dead for the length of the retry.
+fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
+    if !ctx.buttons.a.is_low() {
+        return;
+    }
+    if !ctx.display_on {
+        crate::oled::wake_display(ctx.display);
+        ctx.display_on = true;
+        ctx.idle_page = 0;
+        // Redraw the idle card rather than re-lighting whatever frame was in
+        // panel RAM — waking into a stale approval countdown reads as a live
+        // prompt that ignores the buttons.
+        show_idle_identity(ctx);
+    } else {
+        // Awake: a short press pages the idle info carousel.
+        ctx.idle_page = (ctx.idle_page + 1) % 3;
+        draw_relay_idle_page(ctx);
+    }
+    ctx.last_activity = Instant::now();
+    let drain_start = Instant::now();
+    while ctx.buttons.a.is_low() && drain_start.elapsed() < Duration::from_millis(1900) {
+        crate::wdt::feed();
+        FreeRtos::delay_ms(20);
+    }
 }
 
 /// One page of the idle info carousel. Page 1 shows the stored SSID with the
@@ -591,7 +620,7 @@ pub fn run_wifi_standalone<'d, 'b>(
     personas: &mut Vec<crate::personas::LoadedPersona>,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'d>,
-    button_pin: &PinDriver<'b, Input>,
+    buttons: &crate::button::Buttons<'b>,
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<IdentityCache>,
     nvs: &mut EspNvs<NvsDefault>,
@@ -664,7 +693,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                     nvs,
                     usb,
                     display,
-                    button_pin,
+                    buttons,
                 );
             }
         }
@@ -677,7 +706,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         masters,
         secp,
         display,
-        button_pin,
+        buttons,
         policy_engine,
         identity_caches,
         nvs,
@@ -790,6 +819,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 let until = Instant::now() + Duration::from_secs(3);
                 while Instant::now() < until {
                     poll_usb(usb, &mut ctx, Some(&mut wifi));
+                    service_button(&mut ctx);
                     FreeRtos::delay_ms(20);
                 }
                 continue;
@@ -820,6 +850,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
                 poll_usb(usb, &mut ctx, Some(&mut wifi));
+                service_button(&mut ctx);
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -827,31 +858,7 @@ pub fn run_wifi_standalone<'d, 'b>(
 
         // Wake the panel promptly on a BOOT-button press, and serve USB, once
         // per pass regardless of how many sessions are live or connecting.
-        if ctx.button_pin.is_low() {
-            if !ctx.display_on {
-                crate::oled::wake_display(ctx.display);
-                ctx.display_on = true;
-                ctx.idle_page = 0;
-                // Redraw the idle card rather than re-lighting whatever frame
-                // was in panel RAM — waking into a stale approval countdown
-                // reads as a live prompt that ignores the buttons.
-                show_idle_identity(&mut ctx);
-            } else {
-                // Awake: a short press pages the idle info carousel.
-                ctx.idle_page = (ctx.idle_page + 1) % 3;
-                draw_relay_idle_page(&mut ctx);
-            }
-            ctx.last_activity = Instant::now();
-            // Drain the press (bounded) so one physical press moves exactly
-            // one page instead of repeating every loop pass.
-            let drain_start = Instant::now();
-            while ctx.button_pin.is_low()
-                && drain_start.elapsed() < Duration::from_millis(1900)
-            {
-                crate::wdt::feed();
-                FreeRtos::delay_ms(20);
-            }
-        }
+        service_button(&mut ctx);
         // The WiFi driver is lent to USB only while no relay session is live —
         // a scan mid-connection would knock the link off its channel, so a
         // 0x55 during live service is declined (matches the old per-session
@@ -1453,7 +1460,7 @@ fn locked_relay_phase(
     nvs: &mut EspNvs<NvsDefault>,
     usb: &mut SerialPort<'_>,
     display: &mut Display<'_>,
-    button_pin: &PinDriver<'_, Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     // One-time unlock keypair, RAM only. Loop in the (astronomically
     // unlikely) case the draw is not a valid scalar.
@@ -1650,7 +1657,7 @@ fn locked_relay_phase(
                     // A locked device MUST stay resettable: with the unlock
                     // secret lost, the button-gated wipe is the only way back
                     // to a restorable state. Always physically confirmed.
-                    crate::provision::handle_factory_reset(usb, nvs, display, button_pin);
+                    crate::provision::handle_factory_reset(usb, nvs, display, buttons);
                 }
                 _ => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]),
             }
@@ -1857,7 +1864,7 @@ fn poll_usb(
                     master_slot,
                     ctx.secp,
                     ctx.display,
-                    ctx.button_pin,
+                    ctx.buttons,
                     ctx.policy_engine,
                     ctx.identity_caches,
                     None,
@@ -1883,7 +1890,7 @@ fn poll_usb(
                     ctx.personas,
                     ctx.secp,
                     ctx.display,
-                    ctx.button_pin,
+                    ctx.buttons,
                     ctx.policy_engine,
                     ctx.identity_caches,
                     ctx.nvs,
@@ -1903,7 +1910,7 @@ fn poll_usb(
             ctx.nvs,
             ctx.policy_engine,
             ctx.display,
-            ctx.button_pin,
+            ctx.buttons,
         ),
 
         // Network reconfig — the handler reboots into the new mode itself on a
@@ -1913,7 +1920,7 @@ fn poll_usb(
             &frame.payload,
             ctx.nvs,
             ctx.display,
-            ctx.button_pin,
+            ctx.buttons,
         ),
 
         FRAME_TYPE_GET_NET_CONFIG => {
@@ -1925,7 +1932,7 @@ fn poll_usb(
             &frame.payload,
             ctx.nvs,
             ctx.display,
-            ctx.button_pin,
+            ctx.buttons,
         ),
 
         FRAME_TYPE_SET_OPERATOR => crate::net_config_store::handle_set_operator(
@@ -1933,7 +1940,7 @@ fn poll_usb(
             &frame.payload,
             ctx.nvs,
             ctx.display,
-            ctx.button_pin,
+            ctx.buttons,
             true,
         ),
 
@@ -1943,7 +1950,7 @@ fn poll_usb(
             ctx.nvs,
             ctx.masters,
             ctx.display,
-            ctx.button_pin,
+            ctx.buttons,
         ),
 
         // Vault management over the cable in wifi mode (mirrors the USB-only
@@ -1957,7 +1964,7 @@ fn poll_usb(
             ctx.masters,
             ctx.policy_engine.bridge_authenticated,
             ctx.display,
-            ctx.button_pin,
+            ctx.buttons,
         ),
         FRAME_TYPE_VAULT_UNLOCK => {
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"already unlocked");
@@ -1973,7 +1980,7 @@ fn poll_usb(
             ctx.policy_engine,
             ctx.nvs,
             ctx.display,
-            ctx.button_pin,
+            ctx.buttons,
         ),
         FRAME_TYPE_CONNSLOT_REVOKE => {
             crate::connslot::handle_revoke(usb, &frame, ctx.policy_engine, ctx.nvs)
@@ -1993,7 +2000,7 @@ fn poll_usb(
                     ctx.policy_engine,
                     ctx.nvs,
                     ctx.display,
-                    ctx.button_pin,
+                    ctx.buttons,
                 );
             }
         }
@@ -2004,7 +2011,7 @@ fn poll_usb(
             ctx.policy_engine,
             ctx.nvs,
             ctx.display,
-            ctx.button_pin,
+            ctx.buttons,
         ),
 
         // OTA — the finish handler verifies the image and reboots into it.
@@ -2012,7 +2019,7 @@ fn poll_usb(
             usb,
             &frame.payload,
             ctx.display,
-            ctx.button_pin,
+            ctx.buttons,
             &mut ctx.ota_session,
         ),
         FRAME_TYPE_OTA_CHUNK => {
@@ -2033,20 +2040,18 @@ fn poll_usb(
                     ctx.nvs,
                     ctx.secp,
                     ctx.display,
-                    ctx.button_pin,
+                    ctx.buttons,
                 ),
                 FRAME_TYPE_RESTORE_IDENTITY => crate::provision::handle_restore(
-                    // `None`: restore over USB while already in Wi-Fi relay mode
-                    // keeps the single-button gesture picker (the relay context
-                    // doesn't carry the second button). The primary restore
-                    // paths in main.rs get the T-Display two-button picker.
+                    // `Buttons` carries the second button where the board has
+                    // one, so a restore over USB in Wi-Fi relay mode now gets
+                    // the same two-button picker as the main.rs paths.
                     usb,
                     &frame,
                     ctx.nvs,
                     ctx.secp,
                     ctx.display,
-                    ctx.button_pin,
-                    None,
+                    ctx.buttons,
                 ),
                 _ => crate::provision::handle_add(usb, &frame, ctx.nvs, ctx.secp, ctx.display),
             };
@@ -2088,7 +2093,7 @@ fn poll_usb(
         }
         // Factory reset wipes NVS and reboots inside the handler.
         FRAME_TYPE_FACTORY_RESET => {
-            crate::provision::handle_factory_reset(usb, ctx.nvs, ctx.display, ctx.button_pin)
+            crate::provision::handle_factory_reset(usb, ctx.nvs, ctx.display, ctx.buttons)
         }
 
         // 0x55 — scan nearby WiFi APs. Reuses the relay's own started driver when
@@ -2717,7 +2722,7 @@ fn handle_nip46_event(
         slot,
         ctx.secp,
         ctx.display,
-        ctx.button_pin,
+        ctx.buttons,
         ctx.policy_engine,
         ctx.identity_caches,
         Some(&client_pubkey),

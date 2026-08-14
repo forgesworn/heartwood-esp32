@@ -27,7 +27,7 @@ pub fn handle_export(
     policy_engine: &PolicyEngine,
     nvs: &EspNvs<NvsDefault>,
     display: &mut crate::oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     let total_slots: usize = loaded_masters
         .iter()
@@ -36,7 +36,7 @@ pub fn handle_export(
 
     let result = crate::approval::run_approval_loop(
         display,
-        button_pin,
+        buttons,
         30,
         |d, remaining| {
             let msg = format!(
@@ -119,7 +119,7 @@ pub fn handle_import(
     policy_engine: &mut PolicyEngine,
     nvs: &mut EspNvs<NvsDefault>,
     display: &mut crate::oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     // Parse the backup payload.
     let backup: BackupPayload = match serde_json::from_slice(payload_bytes) {
@@ -156,7 +156,7 @@ pub fn handle_import(
 
     let result = crate::approval::run_approval_loop(
         display,
-        button_pin,
+        buttons,
         30,
         |d, remaining| {
             let msg = format!("{}\n{}s", prompt, remaining);

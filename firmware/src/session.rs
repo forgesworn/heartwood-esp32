@@ -92,7 +92,7 @@ pub fn handle_set_bridge_secret(
     nvs: &mut EspNvs<NvsDefault>,
     policy_engine: &PolicyEngine,
     display: &mut crate::oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     if policy_engine.bridge_authenticated {
         log::warn!("SET_BRIDGE_SECRET rejected — bridge is currently authenticated");
@@ -108,7 +108,7 @@ pub fn handle_set_bridge_secret(
 
     let result = crate::approval::run_approval_loop(
         display,
-        button_pin,
+        buttons,
         30,
         |d, remaining| {
             let msg = format!("Set bridge\nsecret? {}s", remaining);

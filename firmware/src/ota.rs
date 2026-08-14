@@ -25,7 +25,6 @@
 //
 // On any error the device sends OTA_STATUS(ERR_*) and the session is aborted.
 
-use esp_idf_hal::gpio::{Input, PinDriver};
 use crate::serial::SerialPort;
 use sha2::{Digest, Sha256};
 
@@ -78,7 +77,7 @@ pub fn handle_ota_begin(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
     display: &mut Display<'_>,
-    button_pin: &PinDriver<'_, Input>,
+    buttons: &crate::button::Buttons<'_>,
     session: &mut Option<OtaSession>,
 ) {
     // Validate payload length: 4 bytes size + 32 bytes hash + 64 bytes
@@ -128,7 +127,7 @@ pub fn handle_ota_begin(
     // looking at the wrong screen when the countdown starts).
     let size_kb = (total_size + 1023) / 1024;
     let approval_result =
-        crate::approval::run_approval_loop(display, button_pin, 45, |d, remaining| {
+        crate::approval::run_approval_loop(display, buttons, 45, |d, remaining| {
             crate::oled::show_ota_approval(d, size_kb, remaining, 45);
         });
 

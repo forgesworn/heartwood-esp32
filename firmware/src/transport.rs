@@ -9,7 +9,6 @@
 // ESP32 reboots on large sign_event responses (~7KB exceeding the 4KB
 // USB-Serial-JTAG buffers).
 
-use esp_idf_hal::gpio::{Input, PinDriver};
 use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use secp256k1::{Secp256k1, SignOnly};
@@ -45,7 +44,7 @@ pub fn handle_encrypted_request(
     personas: &mut Vec<crate::personas::LoadedPersona>,
     secp: &Arc<Secp256k1<SignOnly>>,
     display: &mut Display<'_>,
-    button_pin: &PinDriver<'_, Input>,
+    buttons: &crate::button::Buttons<'_>,
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     nvs: &mut EspNvs<NvsDefault>,
@@ -213,7 +212,7 @@ pub fn handle_encrypted_request(
         owning_slot,
         secp,
         display,
-        button_pin,
+        buttons,
         policy_engine,
         identity_caches,
         Some(&client_pubkey),

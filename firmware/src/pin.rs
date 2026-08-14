@@ -227,7 +227,7 @@ pub fn handle_set_pin(
     nvs: &mut EspNvs<NvsDefault>,
     masters: &[LoadedMaster],
     display: &mut crate::oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     if payload.len() > 8 {
         log::warn!("SET_PIN: PIN too long ({} bytes, max 8)", payload.len());
@@ -259,7 +259,7 @@ pub fn handle_set_pin(
     }
 
     let action = if payload.is_empty() { "Remove PIN?" } else { "Set PIN?" };
-    let result = crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
+    let result = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
         crate::oled::show_error(d, &format!("{}\n{}s", action, remaining));
     });
     if !matches!(result, crate::approval::ApprovalResult::Approved) {
@@ -348,7 +348,7 @@ pub fn handle_vault_set(
     masters: &[LoadedMaster],
     bridge_authenticated: bool,
     display: &mut crate::oled::Display<'_>,
-    button_pin: &esp_idf_hal::gpio::PinDriver<'_, esp_idf_hal::gpio::Input>,
+    buttons: &crate::button::Buttons<'_>,
 ) {
     if !bridge_authenticated {
         log::warn!("VAULT_SET rejected — bridge not authenticated");
@@ -376,7 +376,7 @@ pub fn handle_vault_set(
     } else {
         "Enable vault?\n(host-held key)"
     };
-    let result = crate::approval::run_approval_loop(display, button_pin, 30, |d, remaining| {
+    let result = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
         crate::oled::show_error(d, &format!("{}\n{}s", action, remaining));
     });
     if !matches!(result, crate::approval::ApprovalResult::Approved) {

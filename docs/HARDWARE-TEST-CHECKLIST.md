@@ -618,6 +618,81 @@ vault-encrypted at rest), harness `sapwood/hardware-recovery.test.ts`
   CONNSLOT_UPDATE ceiling confirm) run their timeout without the usual
   countdown graphics.
 
+## 11. C4 escalation + C5 audit rail (v0.17.0; button-free half bench-run 2026-08-15)
+
+Firmware under test: `heartwood-esp32` 0.17.0 (C4 park/notify/resolve,
+C5 gift-wrapped audit rail, countdown bar on every approval window).
+Driver: `sapwood/hardware-escalation.test.ts` (committed), run with
+`npx vitest run --config vitest.hardware.config.ts hardware-escalation.test.ts`.
+
+### 11a. Autonomous half — PASSED 5/5, twice, desk Heltec V4 (2026-08-15, no button presses)
+
+- App-only reflash to 0.17.0 over USB-JTAG (`espflash save-image` +
+  `write-bin 0x10000`; this board carries the single-factory table, so no
+  otadata dance), vault re-unlock, relay loop re-served — FIRMWARE_INFO
+  confirms the running version.
+- Bench-manager pairing (slot 6, CP1) still drives the registry silently:
+  `natural-person` and `dependant-9-np` derived over NIP-46-USB.
+- A fresh `CONNECT_SAFE` slot (bridge-session create, no button) paired
+  over the live relay (`connect` echoes the secret) and a `nip44_encrypt`
+  addressed to the dependant persona auto-approved — the policy-decided
+  outcome the C5 rail exists to record.
+- The C5 kind-1059 wrap arrived on the same relay addressed to the
+  guardian NP, was decrypted BY the signer (NP persona as its own
+  oracle over the same client slot: wrap layer peer = ephemeral author,
+  seal layer NP⇄NP), and matched the ratified §2 shape exactly: rumor
+  kind 31000, author NP, empty content, computed id, no sig; tags
+  `t:audit`, `d:<dep>:<created_at*1000+seq>`, `method:nip44_encrypt`,
+  `outcome:auto-approved`, `p:<peer>`; seal kind 13 SIGNED by the real
+  guardian NP key (verifies), wrap by an ephemeral key (verifies), no
+  expiration on an audit wrap, request-derived stamp, seal/wrap jitter
+  only backwards.
+- Cleanup: slot revoked, bench personas removed, registry byte-identical
+  to the pre-run state.
+- Quirk found (minor, tracked): PROVISION_LIST can serve one stale
+  persona row immediately after `heartwood_remove_persona`; the next
+  list corrects itself. The bench sweeps until stable.
+- Harness gotchas: kind 24133 is ephemeral (forward-only — poll-based
+  fetch impossible); the pinned nostr-tools `subscribeMany` takes ONE
+  filter, not an array (an array becomes a REQ the relay NACKs with
+  "could not parse command"); the bench subscribes with raw WebSocket
+  REQs and publishes via SimplePool.
+
+### 11b. Interactive half — NEEDS A DESK SESSION (button + operator console)
+
+Escalation flags can only be installed by an operator (`create_client_v2`
+/ `update_client` / `resolve_approval` policy writes) or a button-confirmed
+USB `CONNSLOT_UPDATE` (0x17.0 carries `escalate`, `petition_on_deny`,
+`audit_child_wrap`, `bound_identity`), so this half cannot run unattended:
+
+1. **Flag a slot**: CONNSLOT_UPDATE with `{"escalate": true}` on a
+   dependant-bound client slot — button-confirm; check the prompt now
+   draws the countdown bar (the §10 gap this cycle fixed) and says
+   "family" in its change list.
+2. **Fast path**: client sends an interactive request → device parks
+   (no button window, loop stays live), kind-31001 `t:approval` notice
+   arrives at the guardian NP (24 h expiration on the wrap, `park`,
+   `client`, `identity`, `method`, `k`, `park-ttl` tags); operator sends
+   `resolve_approval {park, action: approve-once}` within the client's
+   wait → original request completes, response `{"park":"live",
+   "applied":"completed"}`, C5 records `approved`.
+3. **Slow path**: park again, let the client time out, resolve after →
+   `{"park":"live","applied":"completed"}` still publishes the (ignored)
+   response; the client's RETRY sails through on the transient allow.
+4. **Expired park**: resolve after the 600 s TTL →
+   `{"park":"expired","applied":"window"}`; retry sails through.
+5. **Reboot with parked requests**: power-cycle mid-park; the verdict
+   after reboot resolves cleanly `{"park":"expired","applied":"none"}`.
+6. **approve-remember**: verdict carries `policy` → slot policy replaced
+   durably (verify via `list_clients`: flags echo back), retry silent.
+7. **deny**: parked request NACKed `user denied`; C5 records `denied`.
+8. **Petitions**: strict-deny slot with `petition_on_deny` → repeated
+   asks coalesce (`count` climbs), 7-day expiration, deny stays enforced.
+9. **Child wrap**: slot with `audit_child_wrap` + `bound_identity` set to
+   the dependant → the same rumor arrives wrapped to that slot's client
+   pubkey as well.
+10. Run the pass on the T-Display too before calling CP5.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

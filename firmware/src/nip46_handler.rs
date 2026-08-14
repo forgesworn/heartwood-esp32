@@ -1703,6 +1703,10 @@ mod tests {
             signing_approved: allowed_methods.contains(&"sign_event"),
             strict_permissions: strict,
             authorized_pubkeys: vec![],
+            escalate: false,
+            petition_on_deny: false,
+            audit_child_wrap: false,
+            bound_identity: None,
         });
         engine
     }

@@ -79,6 +79,22 @@ impl ClientSession {
     }
 }
 
+/// C4 approve-once transient allow (schema doc §1.4): a guardian verdict
+/// installs a short-lived silent approval for one (master, client,
+/// method-or-kind) so the child's retry sails through. RAM-only by design —
+/// it never touches NVS, and a reboot clears it.
+pub struct TransientAllow {
+    pub master_slot: u8,
+    pub client_pubkey: String,
+    /// `nip59::method_or_kind_key` of the approved request.
+    pub key: String,
+    pub until: Instant,
+}
+
+/// Concurrent transient allows are capped (schema doc §1.4 suggests 8);
+/// beyond the cap the oldest is dropped.
+pub const MAX_TRANSIENT_ALLOWS: usize = 8;
+
 /// The full policy state for the device.
 pub struct PolicyEngine {
     /// Per-master connection slot stores.
@@ -92,6 +108,9 @@ pub struct PolicyEngine {
     /// Monotonic counter stamped onto sessions on every access — recency
     /// order for LRU eviction without depending on clock resolution.
     session_seq: u64,
+    /// Live C4 approve-once windows. Consulted by `check`; installed only
+    /// by a guardian `resolve_approval` verdict.
+    transient_allows: Vec<TransientAllow>,
 }
 
 impl PolicyEngine {
@@ -102,7 +121,47 @@ impl PolicyEngine {
             bridge_authenticated: false,
             slots_dirty: false,
             session_seq: 0,
+            transient_allows: Vec::new(),
         }
+    }
+
+    /// Install a C4 approve-once window for `(master, client, key)`. A fresh
+    /// verdict for the same tuple replaces the old window; beyond the cap the
+    /// oldest entry is dropped.
+    pub fn install_transient_allow(
+        &mut self,
+        master_slot: u8,
+        client_pubkey: String,
+        key: String,
+        window_secs: u64,
+    ) {
+        let now = Instant::now();
+        self.transient_allows.retain(|allow| {
+            allow.until > now
+                && !(allow.master_slot == master_slot
+                    && allow.client_pubkey == client_pubkey
+                    && allow.key == key)
+        });
+        if self.transient_allows.len() >= MAX_TRANSIENT_ALLOWS {
+            self.transient_allows.remove(0);
+        }
+        self.transient_allows.push(TransientAllow {
+            master_slot,
+            client_pubkey,
+            key,
+            until: now + std::time::Duration::from_secs(window_secs),
+        });
+    }
+
+    /// True while a live approve-once window covers this request tuple.
+    fn transient_allowed(&self, master_slot: u8, client_pubkey: &str, key: &str) -> bool {
+        let now = Instant::now();
+        self.transient_allows.iter().any(|allow| {
+            allow.master_slot == master_slot
+                && allow.client_pubkey == client_pubkey
+                && allow.key == key
+                && allow.until > now
+        })
     }
 
     /// Determine the approval tier for a request.
@@ -142,6 +201,18 @@ impl PolicyEngine {
         if let Some(slot) = slot {
             if strict_slot_denies_method(slot, method.as_str()) {
                 return ApprovalTier::Denied;
+            }
+        }
+
+        // C4 approve-once: a live transient allow lifts this exact
+        // (client, method-or-kind) to silent approval — the guardian just
+        // said yes to precisely this ask. Checked after the strict method
+        // ceiling (a verdict never resurrects an unlisted method) and only
+        // for slot-bound clients.
+        if slot.is_some() {
+            let key = heartwood_common::nip59::method_or_kind_key(method.as_str(), event_kind);
+            if self.transient_allowed(master_slot, client_pubkey, &key) {
+                return ApprovalTier::AutoApprove;
             }
         }
 
@@ -342,6 +413,10 @@ impl PolicyEngine {
             signing_approved: false,
             strict_permissions: false,
             authorized_pubkeys: vec![],
+            escalate: false,
+            petition_on_deny: false,
+            audit_child_wrap: false,
+            bound_identity: None,
         };
         self.slots_mut(master_slot).push(new_slot);
         self.slots_dirty = true;
@@ -373,6 +448,10 @@ impl PolicyEngine {
             signing_approved: policy.signing_approved,
             strict_permissions: true,
             authorized_pubkeys: vec![],
+            escalate: policy.escalate,
+            petition_on_deny: policy.petition_on_deny,
+            audit_child_wrap: policy.audit_child_wrap,
+            bound_identity: policy.bound_identity,
         });
         self.slots_dirty = true;
         Some(slot_index)
@@ -403,6 +482,33 @@ impl PolicyEngine {
         slot.strict_permissions = true;
         self.slots_dirty = true;
         Ok(())
+    }
+
+    /// Apply the family-bunker C3 additive flags (escalate, petition,
+    /// child-wrap + identity binding) to an existing slot. Separate from
+    /// `set_exact_slot_policy` so the exact-policy path and its tests stay
+    /// untouched; callers that parsed the flags from the operator envelope
+    /// apply them here. Returns true when the slot exists.
+    pub fn set_slot_family_flags(
+        &mut self,
+        master_slot: u8,
+        slot_index: u8,
+        escalate: bool,
+        petition_on_deny: bool,
+        audit_child_wrap: bool,
+        bound_identity: Option<String>,
+    ) -> bool {
+        let slots = self.slots_mut(master_slot);
+        if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
+            slot.escalate = escalate;
+            slot.petition_on_deny = petition_on_deny;
+            slot.audit_child_wrap = audit_child_wrap;
+            slot.bound_identity = bound_identity;
+            self.slots_dirty = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Update fields on an existing slot. Returns true if the slot was found.
@@ -671,6 +777,10 @@ impl PolicyEngine {
                     signing_approved: false,
                     strict_permissions: false,
                     authorized_pubkeys: vec![],
+                    escalate: false,
+                    petition_on_deny: false,
+                    audit_child_wrap: false,
+                    bound_identity: None,
                 };
 
                 log::info!("Migrated legacy policy for master slot {slot} to connslots format");

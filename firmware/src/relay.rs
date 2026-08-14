@@ -315,6 +315,19 @@ struct SignCtx<'a, 'd, 'b> {
     /// a freshly derived persona is addressable promptly (D4). A rename never
     /// sets it — pubkeys are unchanged.
     resubscribe_needed: bool,
+    /// C4 parked interactive requests awaiting a guardian verdict (RAM only,
+    /// capped at `PARK_MAX`, expired by `service_parks`).
+    parks: Vec<ParkedRequest>,
+    /// Expired parks' (client, key) so a late approve verdict can still
+    /// install the transient allow (schema §1.4's expired column). RAM only.
+    park_tombstones: Vec<ParkTombstone>,
+    /// C4 petition counters per (client, method-or-kind): asks since the
+    /// last verdict, so repeated nagging coalesces into one notice row.
+    petitions: Vec<PetitionCounter>,
+    /// Session-monotonic floor for C4/C5 rumor timestamps (schema §0.1).
+    audit_last_stamped: u64,
+    /// Uniqueness counter inside the C5 `d` tag's pseudo-millisecond suffix.
+    audit_emit_seq: u64,
 }
 
 /// Wake the panel on a press; while awake, further presses page the idle
@@ -759,6 +772,11 @@ pub fn run_wifi_standalone<'d, 'b>(
         network_display_restore_at: None,
         idle_page: 0,
         resubscribe_needed: false,
+        parks: Vec::new(),
+        park_tombstones: Vec::new(),
+        petitions: Vec::new(),
+        audit_last_stamped: 0,
+        audit_emit_seq: 0,
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -797,6 +815,8 @@ pub fn run_wifi_standalone<'d, 'b>(
     loop {
         crate::wdt::feed();
         network_state_tick(&mut ctx);
+        // Expire overdue C4 parks into tombstones so late verdicts still land.
+        service_parks(&mut ctx);
         // Advance held signing confirmations; restore the idle identity card
         // once the last hold expires.
         if ctx.display_on && crate::confirm::service(ctx.display) {
@@ -2444,6 +2464,578 @@ fn client_label(ctx: &SignCtx, master_slot: u8, client_hex: &str) -> String {
         .unwrap_or_else(|| format!("client {}", &client_hex[..client_hex.len().min(8)]))
 }
 
+// ---------------------------------------------------------------------------
+// C4 escalation + C5 audit rail (family bunker, schema doc 2026-08-14).
+// Pure semantics live in heartwood_common::{escalate, nip59}; this section is
+// the relay-loop state and the gift-wrap emission glue. Every emission is
+// best-effort: a failed publish logs and never fails the signing path.
+// ---------------------------------------------------------------------------
+
+/// Parked interactive requests held in RAM (schema §1.1 `park-ttl`).
+const PARK_MAX: usize = 4;
+/// Expired-park records kept so late verdicts still land (RAM ring).
+const PARK_TOMBSTONE_MAX: usize = 8;
+/// Petition counters kept per (client, key) (RAM ring).
+const PETITION_MAX: usize = 8;
+/// Best-effort child wraps per audit emission (schema §2.1 cap discipline).
+const CHILD_WRAP_MAX: usize = 4;
+
+/// One interactive request parked for a guardian verdict. Holds the parsed
+/// request (its params carry the event to sign) but never a secret — the
+/// signing key is re-derived at completion, exactly as live dispatch does.
+struct ParkedRequest {
+    /// The triggering request event's id hex — the notice's `park` handle.
+    park_id: String,
+    request: nip46::Nip46Request,
+    target_pk: [u8; 32],
+    client_pubkey: [u8; 32],
+    client_hex: String,
+    /// The trigger event's created_at: completion responses echo it, and the
+    /// notice stamps from it (§0.1).
+    created_at: u64,
+    master_slot: u8,
+    method: String,
+    event_kind: Option<u64>,
+    parked_at: Instant,
+}
+
+/// What survives a park's expiry: enough to honour a late approve verdict
+/// by installing the transient allow (schema §1.4's expired column).
+#[derive(Clone)]
+struct ParkTombstone {
+    park_id: String,
+    client_hex: String,
+    key: String,
+    master_slot: u8,
+}
+
+/// Asks since the last verdict for one (client, method-or-kind).
+struct PetitionCounter {
+    client_hex: String,
+    key: String,
+    count: u64,
+}
+
+/// The C5 facts extracted from a request before dispatch consumes its params.
+struct RailDraft {
+    event_kind: Option<u64>,
+    method_tag: Option<String>,
+    counterparty: Option<String>,
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Build the C5 draft for the methods the rail covers: sign_event (compact
+/// included) carries the kind and, for small events, the first `p` tag;
+/// the four transport methods carry the method name and their peer.
+fn audit_rail_draft(req: &nip46::Nip46Request) -> Option<RailDraft> {
+    match req.method.as_str() {
+        "sign_event" | "sign_event_compact" => {
+            let kind = nip46::unsigned_event_kind(&req.params)?;
+            let encoded_bytes = req
+                .params
+                .first()
+                .and_then(|value| value.as_str())
+                .map(str::len)
+                .unwrap_or(0);
+            // Mirror sign_audit_draft's bound: never re-parse a large event
+            // just for a metadata tag.
+            let counterparty = if encoded_bytes <= 2_048 {
+                nip46::parse_unsigned_event(&req.params).ok().and_then(|event| {
+                    event
+                        .tags
+                        .iter()
+                        .find(|t| t.len() >= 2 && t[0] == "p" && is_hex64(&t[1]))
+                        .map(|t| t[1].to_ascii_lowercase())
+                })
+            } else {
+                None
+            };
+            Some(RailDraft { event_kind: Some(kind), method_tag: None, counterparty })
+        }
+        "nip04_encrypt" | "nip04_decrypt" | "nip44_encrypt" | "nip44_decrypt" => {
+            let peer = req
+                .params
+                .first()
+                .and_then(|v| v.as_str())
+                .filter(|s| is_hex64(s))
+                .map(|s| s.to_ascii_lowercase());
+            Some(RailDraft {
+                event_kind: None,
+                method_tag: Some(req.method.clone()),
+                counterparty: peer,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The NIP-46 error string of a response, if it carried one.
+fn response_error_of(response_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(response_json)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Derive the guardian NP identity (secret + x-only pubkey) of the owning
+/// tree — the author and addressee of every C4/C5 rumor (schema §0.2/§0.3).
+/// `natural-person` is a fixed protocol name, so it derives blind whether or
+/// not the persona is in the registry.
+fn guardian_np(
+    masters: &[LoadedMaster],
+    master_slot: u8,
+) -> Result<(zeroize::Zeroizing<[u8; 32]>, [u8; 32]), String> {
+    let master = masters
+        .iter()
+        .find(|m| m.slot == master_slot)
+        .ok_or("owning master not loaded")?;
+    crate::nip46_handler::derive_identity(
+        &master.secret,
+        master.mode,
+        "nostr:persona:natural-person",
+        0,
+    )
+    .map_err(|e| format!("guardian NP derivation: {e}"))
+}
+
+/// Gift-wrap a rumor to `recipient_pk` (sealed by `author_secret`, wrapped by
+/// a fresh ephemeral key) and publish it on the given session. Heap-guarded:
+/// on a fragmented heap the emission is skipped, never crashed.
+fn emit_gift_wrap(
+    tls: &mut Tls,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    rumor: &heartwood_common::nip46::UnsignedEvent,
+    author_secret: &[u8; 32],
+    recipient_pk: &[u8; 32],
+    expiration: Option<u64>,
+) -> Result<(), String> {
+    // Rumors here are small (~600 B of tags); the outermost plaintext is the
+    // serialised seal, roughly 1.5x the rumor after one NIP-44+base64 round.
+    // Budget conservatively at 2x + envelope overhead and skip when tight.
+    let rumor_estimate = rumor.content.len()
+        + rumor.tags.iter().flatten().map(String::len).sum::<usize>()
+        + 512;
+    if !response_transportable(rumor_estimate * 2 + 1_024) {
+        return Err("low heap; emission skipped".into());
+    }
+
+    let mut eph_sk = [0u8; 32];
+    let eph_pk = loop {
+        crate::fill_random(&mut eph_sk);
+        if let Ok(kp) = Keypair::from_seckey_slice(secp, &eph_sk) {
+            break kp.x_only_public_key().0.serialize();
+        }
+    };
+    let mut jitter = [0u8; 8];
+    crate::fill_random(&mut jitter);
+    let seal_jitter = u64::from_be_bytes(jitter);
+    crate::fill_random(&mut jitter);
+    let wrap_jitter = u64::from_be_bytes(jitter);
+    let seal_nonce = random_nonce_32();
+    let wrap_nonce = random_nonce_32();
+
+    let secp_ref = Arc::clone(secp);
+    let sign = move |secret: &[u8; 32], hash: &[u8; 32]| {
+        crate::sign::sign_hash(&secp_ref, secret, hash)
+    };
+    let wrap = heartwood_common::nip59::gift_wrap(
+        rumor,
+        author_secret,
+        recipient_pk,
+        &eph_sk,
+        &eph_pk,
+        heartwood_common::nip59::WrapTimes {
+            seal_created_at: heartwood_common::nip59::jitter_past(rumor.created_at, seal_jitter),
+            wrap_created_at: heartwood_common::nip59::jitter_past(rumor.created_at, wrap_jitter),
+        },
+        expiration,
+        &seal_nonce,
+        &wrap_nonce,
+        &sign,
+    );
+    eph_sk.iter_mut().for_each(|b| *b = 0);
+    let wrap = wrap.map_err(|e| format!("gift wrap: {e}"))?;
+    ws_send_event(tls, &wrap).map(|_| ())
+}
+
+/// Publish the §1.1 approval-needed notice for a park, addressed to the
+/// guardian NP of the owning tree.
+fn emit_approval_notice(
+    tls: &mut Tls,
+    ctx: &mut SignCtx,
+    park: &ParkedRequest,
+) -> Result<(), String> {
+    let (np_secret, np_pk) = guardian_np(ctx.masters, park.master_slot)?;
+    let stamped =
+        heartwood_common::nip59::stamp_monotonic(park.created_at, &mut ctx.audit_last_stamped);
+    let rumor = heartwood_common::nip59::build_approval_notice(
+        &heartwood_common::nip59::ApprovalNotice {
+            guardian_np_hex: &hex_encode(&np_pk),
+            client_hex: &park.client_hex,
+            park_id_hex: &park.park_id,
+            identity_hex: &hex_encode(&park.target_pk),
+            method: &park.method,
+            event_kind: park.event_kind,
+            park_ttl_secs: heartwood_common::escalate::PARK_TTL_SECS,
+            created_at: stamped,
+        },
+    );
+    emit_gift_wrap(
+        tls,
+        ctx.secp,
+        &rumor,
+        &np_secret,
+        &np_pk,
+        Some(stamped + heartwood_common::nip59::APPROVAL_EXPIRY_SECS),
+    )
+}
+
+/// Count a petition ask and publish the §1.2 notice (low priority, 7-day
+/// expiry). The deny already happened; this is purely a message.
+fn petition_and_notify(
+    tls: &mut Tls,
+    ctx: &mut SignCtx,
+    master_slot: u8,
+    client_hex: &str,
+    target_pk: &[u8; 32],
+    method: &str,
+    event_kind: Option<u64>,
+    trigger_created_at: u64,
+) {
+    let key = heartwood_common::nip59::method_or_kind_key(method, event_kind);
+    let count = {
+        if let Some(entry) = ctx
+            .petitions
+            .iter_mut()
+            .find(|p| p.client_hex == client_hex && p.key == key)
+        {
+            entry.count = entry.count.saturating_add(1);
+            entry.count
+        } else {
+            if ctx.petitions.len() >= PETITION_MAX {
+                ctx.petitions.remove(0);
+            }
+            ctx.petitions.push(PetitionCounter {
+                client_hex: client_hex.to_string(),
+                key: key.clone(),
+                count: 1,
+            });
+            1
+        }
+    };
+    let result = (|| -> Result<(), String> {
+        let (np_secret, np_pk) = guardian_np(ctx.masters, master_slot)?;
+        let stamped = heartwood_common::nip59::stamp_monotonic(
+            trigger_created_at,
+            &mut ctx.audit_last_stamped,
+        );
+        let rumor = heartwood_common::nip59::build_petition_notice(
+            &hex_encode(&np_pk),
+            client_hex,
+            &hex_encode(target_pk),
+            method,
+            event_kind,
+            count,
+            stamped,
+        );
+        emit_gift_wrap(
+            tls,
+            ctx.secp,
+            &rumor,
+            &np_secret,
+            &np_pk,
+            Some(stamped + heartwood_common::nip59::PETITION_EXPIRY_SECS),
+        )
+    })();
+    if let Err(e) = result {
+        log::warn!("[relay] petition notice: {e}");
+    }
+}
+
+/// Publish the C5 audit rumor for a policy-decided request on a dependant
+/// persona: guardian wrap always (no expiration — the permanent record),
+/// then best-effort child wraps to every flagged slot bound to the identity.
+#[allow(clippy::too_many_arguments)]
+fn emit_audit_rail(
+    tls: &mut Tls,
+    ctx: &mut SignCtx,
+    master_slot: u8,
+    target_hex: &str,
+    draft: &RailDraft,
+    outcome: &'static str,
+    trigger_created_at: u64,
+) -> Result<(), String> {
+    let (np_secret, np_pk) = guardian_np(ctx.masters, master_slot)?;
+    let stamped =
+        heartwood_common::nip59::stamp_monotonic(trigger_created_at, &mut ctx.audit_last_stamped);
+    ctx.audit_emit_seq = ctx.audit_emit_seq.wrapping_add(1);
+    let rumor = heartwood_common::nip59::build_audit_rumor(&heartwood_common::nip59::AuditRumor {
+        guardian_np_hex: &hex_encode(&np_pk),
+        dependant_hex: target_hex,
+        created_at: stamped,
+        emit_counter: ctx.audit_emit_seq,
+        event_kind: draft.event_kind,
+        method: draft.method_tag.as_deref(),
+        outcome,
+        counterparty_hex: draft.counterparty.as_deref(),
+    });
+    emit_gift_wrap(tls, ctx.secp, &rumor, &np_secret, &np_pk, None)?;
+
+    // §2.1 dual-address: same rumor, sealed by the same NP, wrapped to each
+    // audit-visible child slot bound to this identity. Best effort each.
+    let child_targets: Vec<[u8; 32]> = ctx
+        .policy_engine
+        .list_slots(master_slot)
+        .iter()
+        .filter(|slot| slot.audit_child_wrap && slot.bound_identity.as_deref() == Some(target_hex))
+        .filter_map(|slot| {
+            slot.current_pubkey
+                .as_deref()
+                .and_then(|hex| hex_decode(hex).ok())
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        })
+        .take(CHILD_WRAP_MAX)
+        .collect();
+    for child_pk in child_targets {
+        if let Err(e) = emit_gift_wrap(tls, ctx.secp, &rumor, &np_secret, &child_pk, None) {
+            log::warn!("[relay] audit child wrap: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Record a park's (client, key) so a late verdict still lands after expiry.
+fn tombstone_park(ctx: &mut SignCtx, park: &ParkedRequest) {
+    if ctx.park_tombstones.len() >= PARK_TOMBSTONE_MAX {
+        ctx.park_tombstones.remove(0);
+    }
+    ctx.park_tombstones.push(ParkTombstone {
+        park_id: park.park_id.clone(),
+        client_hex: park.client_hex.clone(),
+        key: heartwood_common::nip59::method_or_kind_key(&park.method, park.event_kind),
+        master_slot: park.master_slot,
+    });
+}
+
+/// Park an interactive request and notify the guardian. No response is
+/// published — the child's client waits (fast verdicts complete the original
+/// request; slow ones land as a transient allow for the retry, §7.1's
+/// timing-honesty rule).
+fn park_and_notify(tls: &mut Tls, ctx: &mut SignCtx, park: ParkedRequest) {
+    if ctx.parks.len() >= PARK_MAX {
+        let dropped = ctx.parks.remove(0);
+        log::warn!("[relay] park queue full; oldest park expired early");
+        tombstone_park(ctx, &dropped);
+    }
+    log::info!(
+        "[relay] parked interactive {} from {}… awaiting guardian verdict",
+        park.method,
+        &park.client_hex[..park.client_hex.len().min(8)]
+    );
+    if let Err(e) = emit_approval_notice(tls, ctx, &park) {
+        log::warn!("[relay] approval notice: {e}");
+    }
+    ctx.parks.push(park);
+}
+
+/// Expire overdue parks into tombstones. Called once per relay-loop pass.
+fn service_parks(ctx: &mut SignCtx) {
+    let ttl = Duration::from_secs(heartwood_common::escalate::PARK_TTL_SECS);
+    let now = Instant::now();
+    let mut index = 0;
+    while index < ctx.parks.len() {
+        if now.duration_since(ctx.parks[index].parked_at) >= ttl {
+            let expired = ctx.parks.remove(index);
+            log::info!("[relay] park for {} expired unresolved", expired.method);
+            tombstone_park(ctx, &expired);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+/// Complete a guardian-approved park: install the transient allow (which is
+/// what makes both this dispatch and the child's own retry silent), re-derive
+/// the signing identity, dispatch through the normal handler, publish the
+/// response with the original request's timestamp, and emit the C5 `approved`
+/// record. Returns true when the response was published.
+fn complete_parked(
+    tls: &mut Tls,
+    ctx: &mut SignCtx,
+    park: ParkedRequest,
+    window_secs: u64,
+) -> bool {
+    let key = heartwood_common::nip59::method_or_kind_key(&park.method, park.event_kind);
+    ctx.policy_engine.install_transient_allow(
+        park.master_slot,
+        park.client_hex.clone(),
+        key,
+        window_secs,
+    );
+
+    // Re-resolve the identity — the served set may have changed while parked.
+    let resolved = if let Some(midx) = masters::find_by_pubkey(ctx.masters, &park.target_pk) {
+        let m = &ctx.masters[midx];
+        Some((zeroize::Zeroizing::new(m.secret), m.label.clone(), m.mode, m.slot, None))
+    } else if let Some(pidx) = crate::personas::find_by_pubkey(ctx.personas, &park.target_pk) {
+        let p = &ctx.personas[pidx];
+        ctx.masters
+            .iter()
+            .find(|m| m.slot == p.master_slot)
+            .and_then(|owning| {
+                crate::nip46_handler::derive_identity(&owning.secret, owning.mode, &p.purpose, p.index)
+                    .ok()
+                    .map(|(secret, _pk)| {
+                        (secret, owning.label.clone(), owning.mode, owning.slot, Some(p.purpose.clone()))
+                    })
+            })
+    } else {
+        None
+    };
+    let Some((signing_secret, label, mode, slot, persona_purpose)) = resolved else {
+        log::warn!("[relay] parked identity no longer served; park dropped");
+        return false;
+    };
+    let Ok(conversation_key) = nip44::get_conversation_key(&signing_secret, &park.client_pubkey)
+    else {
+        log::warn!("[relay] park completion: conversation key failed");
+        return false;
+    };
+
+    let rail = persona_purpose
+        .as_deref()
+        .filter(|purpose| heartwood_common::escalate::is_dependant_purpose(purpose))
+        .and_then(|_| audit_rail_draft(&park.request));
+    let request_id = park.request.id.clone();
+    let target_hex = hex_encode(&park.target_pk);
+    let created_at = park.created_at;
+    let client_hex = park.client_hex;
+    let client_pubkey = park.client_pubkey;
+
+    let mut response_json = crate::nip46_handler::handle_parsed_request(
+        park.request,
+        &signing_secret,
+        &label,
+        mode,
+        slot,
+        ctx.secp,
+        ctx.display,
+        ctx.buttons,
+        ctx.policy_engine,
+        ctx.identity_caches,
+        Some(&client_pubkey),
+        ctx.nvs,
+        ctx.personas,
+    );
+    if !ctx.policy_engine.persist_slots(ctx.nvs, slot) {
+        log::error!("[relay] slot persist failed after park completion");
+    }
+    crate::transport::persist_fresh_identities(ctx.nvs, ctx.identity_caches, ctx.personas, slot);
+
+    if let Some(draft) = rail {
+        let error = response_error_of(&response_json);
+        if let Some(outcome) = heartwood_common::escalate::audit_outcome(
+            heartwood_common::policy::ApprovalTier::AutoApprove,
+            error.as_deref(),
+            true,
+        ) {
+            if let Err(e) =
+                emit_audit_rail(tls, ctx, slot, &target_hex, &draft, outcome, created_at)
+            {
+                log::warn!("[relay] audit rail: {e}");
+            }
+        }
+    }
+
+    if !response_transportable(response_json.len()) {
+        response_json = nip46::build_error_response(
+            &request_id,
+            -4,
+            "response too large for this signer's memory; the request was not completed",
+        )
+        .unwrap_or_default();
+    }
+    match sign_and_publish(
+        tls,
+        ctx.secp,
+        &signing_secret,
+        &conversation_key,
+        &client_hex,
+        NIP46_KIND,
+        created_at,
+        response_json,
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("[relay] park completion publish: {e}");
+            false
+        }
+    }
+}
+
+/// NACK a guardian-denied park to its client and emit the C5 `denied` record.
+fn deny_parked(tls: &mut Tls, ctx: &mut SignCtx, park: ParkedRequest) {
+    let resolved = if let Some(midx) = masters::find_by_pubkey(ctx.masters, &park.target_pk) {
+        let m = &ctx.masters[midx];
+        Some((zeroize::Zeroizing::new(m.secret), None))
+    } else if let Some(pidx) = crate::personas::find_by_pubkey(ctx.personas, &park.target_pk) {
+        let p = &ctx.personas[pidx];
+        ctx.masters
+            .iter()
+            .find(|m| m.slot == p.master_slot)
+            .and_then(|owning| {
+                crate::nip46_handler::derive_identity(&owning.secret, owning.mode, &p.purpose, p.index)
+                    .ok()
+                    .map(|(secret, _pk)| (secret, Some(p.purpose.clone())))
+            })
+    } else {
+        None
+    };
+    let Some((signing_secret, persona_purpose)) = resolved else {
+        return;
+    };
+    if let Some(draft) = persona_purpose
+        .as_deref()
+        .filter(|purpose| heartwood_common::escalate::is_dependant_purpose(purpose))
+        .and_then(|_| audit_rail_draft(&park.request))
+    {
+        let target_hex = hex_encode(&park.target_pk);
+        if let Err(e) = emit_audit_rail(
+            tls,
+            ctx,
+            park.master_slot,
+            &target_hex,
+            &draft,
+            "denied",
+            park.created_at,
+        ) {
+            log::warn!("[relay] audit rail: {e}");
+        }
+    }
+    let Ok(conversation_key) = nip44::get_conversation_key(&signing_secret, &park.client_pubkey)
+    else {
+        return;
+    };
+    let response = nip46::build_error_response(&park.request.id, -1, "user denied")
+        .unwrap_or_default();
+    if let Err(e) = sign_and_publish(
+        tls,
+        ctx.secp,
+        &signing_secret,
+        &conversation_key,
+        &park.client_hex,
+        NIP46_KIND,
+        park.created_at,
+        response,
+    ) {
+        log::warn!("[relay] park deny publish: {e}");
+    }
+}
+
 fn sign_audit_draft(
     req: &nip46::Nip46Request,
     label: String,
@@ -2592,7 +3184,7 @@ fn handle_nip46_event(
     // connection == one identity, exactly as the USB path does. `label`/`mode`/
     // `slot` are the owning master's (personas share the master's policy slot).
     // All resolved values are owned, so no `ctx` borrow is held past this block.
-    let (signing_secret, label, mode, slot, is_persona) =
+    let (signing_secret, label, mode, slot, is_persona, persona_purpose) =
         if let Some(midx) = masters::find_by_pubkey(ctx.masters, target_pk) {
             let m = &ctx.masters[midx];
             (
@@ -2601,6 +3193,7 @@ fn handle_nip46_event(
                 m.mode,
                 m.slot,
                 false,
+                None,
             )
         } else if let Some(pidx) = crate::personas::find_by_pubkey(ctx.personas, target_pk) {
             let p = &ctx.personas[pidx];
@@ -2620,7 +3213,14 @@ fn handle_nip46_event(
                 &p.purpose,
                 p.index,
             ) {
-                Ok((secret, _pk)) => (secret, owning.label.clone(), owning.mode, owning.slot, true),
+                Ok((secret, _pk)) => (
+                    secret,
+                    owning.label.clone(),
+                    owning.mode,
+                    owning.slot,
+                    true,
+                    Some(p.purpose.clone()),
+                ),
                 Err(e) => {
                     log::error!("[relay] persona key derivation failed: {e}");
                     return Ok(());
@@ -2777,21 +3377,75 @@ fn handle_nip46_event(
     // Only connect binding and first-sign TOFU can change durable slot
     // authority. Snapshot those uncommon requests before dispatch so an NVS
     // failure can roll RAM back without cloning the slot table on every
-    // unattended auto-sign.
+    // unattended auto-sign. The tier is also what the C4 escalation gate and
+    // the C5 outcome mapping key off, so compute it once here.
     let request_id = request.id.clone();
-    let slot_snapshot = {
-        let method = nip46::Nip46Method::from_str(&request.method);
-        let event_kind = if matches!(method, nip46::Nip46Method::SignEvent) {
-            nip46::unsigned_event_kind(&request.params)
-        } else {
-            None
-        };
-        let tier = ctx
-            .policy_engine
-            .check(slot, &ev.pubkey, &method, event_kind);
-        crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
-            .then(|| ctx.policy_engine.snapshot_slot_state(slot))
+    let method_enum = nip46::Nip46Method::from_str(&request.method);
+    let event_kind = if matches!(method_enum, nip46::Nip46Method::SignEvent) {
+        nip46::unsigned_event_kind(&request.params)
+    } else {
+        None
     };
+    let tier = ctx
+        .policy_engine
+        .check(slot, &ev.pubkey, &method_enum, event_kind);
+    let slot_snapshot = crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
+        .then(|| ctx.policy_engine.snapshot_slot_state(slot));
+
+    // C4 escalation (schema §1.1): an interactive ask on an escalate-flagged
+    // slot parks and notifies the guardian's phone instead of blocking the
+    // relay loop on the physical button — the loop must stay live so a fast
+    // verdict can complete the request within the client's wait. Non-flagged
+    // slots keep today's button behaviour exactly.
+    if matches!(tier, heartwood_common::policy::ApprovalTier::ButtonRequired)
+        && ctx
+            .policy_engine
+            .find_slot_by_pubkey(slot, &ev.pubkey)
+            .is_some_and(|s| s.escalate)
+    {
+        let park = ParkedRequest {
+            park_id: ev.id.clone(),
+            target_pk: *target_pk,
+            client_pubkey,
+            client_hex: ev.pubkey.clone(),
+            created_at: ev.created_at,
+            master_slot: slot,
+            method: request.method.clone(),
+            event_kind,
+            parked_at: Instant::now(),
+            request,
+        };
+        park_and_notify(tls, ctx, park);
+        return Ok(());
+    }
+
+    // C4 petitions (schema §1.2): a strict deny on a petition-flagged slot
+    // records the ask and notifies, low priority. The deny below stays
+    // enforced — dispatch still answers "unauthorised" as it always did.
+    if matches!(tier, heartwood_common::policy::ApprovalTier::Denied)
+        && ctx
+            .policy_engine
+            .find_slot_by_pubkey(slot, &ev.pubkey)
+            .is_some_and(|s| s.petition_on_deny)
+    {
+        petition_and_notify(
+            tls,
+            ctx,
+            slot,
+            &ev.pubkey,
+            target_pk,
+            &request.method,
+            event_kind,
+            ev.created_at,
+        );
+    }
+
+    // C5 rail draft: extracted before dispatch consumes the params, emitted
+    // after dispatch when the target is a dependant-tagged persona.
+    let rail_draft = persona_purpose
+        .as_deref()
+        .filter(|purpose| heartwood_common::escalate::is_dependant_purpose(purpose))
+        .and_then(|_| audit_rail_draft(&request));
 
     // Breadcrumb the in-flight request so a crash while handling it is
     // attributable on the next boot. Cleared right after the handler returns;
@@ -2857,6 +3511,23 @@ fn handle_nip46_event(
     }
     if let Some(audit) = audit {
         push_sign_audit(ctx, audit, &response_json);
+    }
+
+    // C5 device audit rail: policy-decided outcomes on dependant-tagged
+    // personas emit the gift-wrapped kind-31000 record the app's Activity
+    // page already reads. Best effort — never fails the signing path.
+    if let Some(draft) = rail_draft {
+        let error = response_error_of(&response_json);
+        if let Some(outcome) =
+            heartwood_common::escalate::audit_outcome(tier, error.as_deref(), false)
+        {
+            let target_hex = hex_encode(target_pk);
+            if let Err(e) =
+                emit_audit_rail(tls, ctx, slot, &target_hex, &draft, outcome, ev.created_at)
+            {
+                log::warn!("[relay] audit rail: {e}");
+            }
+        }
     }
 
     // Persist any identities derived during this request (e.g. via
@@ -3157,7 +3828,30 @@ fn exact_policy_from_request(req: &serde_json::Value) -> Result<ExactSlotPolicy,
         .and_then(|value| value.as_bool())
         .ok_or("v2 policy requires params.policy.auto_approve")?;
 
-    validate_exact_slot_policy(methods, kinds, auto_approve).map_err(str::to_string)
+    let mut policy =
+        validate_exact_slot_policy(methods, kinds, auto_approve).map_err(str::to_string)?;
+
+    // Family-bunker C3 additive flags (escalation schema §1.5/§2.1):
+    // optional, default false/absent — older operators that never send them
+    // are byte-for-byte unaffected.
+    policy.escalate = req
+        .pointer("/params/policy/escalate")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    policy.petition_on_deny = req
+        .pointer("/params/policy/petition_on_deny")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    policy.audit_child_wrap = req
+        .pointer("/params/policy/audit_child_wrap")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    policy.bound_identity = req
+        .pointer("/params/policy/bound_identity")
+        .and_then(|value| value.as_str())
+        .filter(|s| is_hex64(s))
+        .map(|s| s.to_ascii_lowercase());
+    Ok(policy)
 }
 
 /// Make a slot-authority mutation durable before its management response may
@@ -4083,6 +4777,14 @@ fn dispatch_mgmt(
                             ctx.policy_engine.restore_slot_state(slot_snapshot);
                             return Err(error);
                         }
+                        ctx.policy_engine.set_slot_family_flags(
+                            master_slot,
+                            i,
+                            policy.escalate,
+                            policy.petition_on_deny,
+                            policy.audit_child_wrap,
+                            policy.bound_identity.clone(),
+                        );
                     } else {
                         ctx.policy_engine.update_slot(
                             master_slot,
@@ -4532,6 +5234,26 @@ fn dispatch_mgmt(
                     kinds.unwrap_or(target.allowed_kinds),
                     auto.unwrap_or(target.auto_approve),
                 )?;
+                // Family-bunker C3 flags: absent params keep the slot's
+                // existing values, matching the per-field merge rule above.
+                ctx.policy_engine.set_slot_family_flags(
+                    master_slot,
+                    slot_index,
+                    req.pointer("/params/escalate")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(target.escalate),
+                    req.pointer("/params/petition_on_deny")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(target.petition_on_deny),
+                    req.pointer("/params/audit_child_wrap")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(target.audit_child_wrap),
+                    req.pointer("/params/bound_identity")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| is_hex64(s))
+                        .map(|s| s.to_ascii_lowercase())
+                        .or(target.bound_identity),
+                );
                 ctx.policy_engine
                     .update_slot(master_slot, slot_index, label, None, None, None)
             } else {
@@ -4643,7 +5365,8 @@ fn dispatch_mgmt(
                     "client_policy_v2",
                     "atomic_nostrconnect_policy_v2",
                     "staged_network_config_v1",
-                    "mutation_challenge_v1"
+                    "mutation_challenge_v1",
+                    "resolve_approval_v1"
                 ],
                 "relays_live": relays_live,
                 "relays_pinned": pool.pinned.iter().map(|p| p.url.clone()).collect::<Vec<_>>(),
@@ -4672,6 +5395,136 @@ fn dispatch_mgmt(
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),
                 "board": crate::board::BOARD,
+            }))
+        }
+
+        // C4 verdict (schema §1.4). Every case resolves cleanly: an unknown
+        // or reboot-cleared park is a no-op with an honest `applied`, never
+        // an error. Single-guardian scope — only this master's parks resolve.
+        "resolve_approval" => {
+            let park_id = req
+                .pointer("/params/park")
+                .and_then(|v| v.as_str())
+                .ok_or("resolve_approval requires params.park")?
+                .to_string();
+            let action_str = req
+                .pointer("/params/action")
+                .and_then(|v| v.as_str())
+                .ok_or("resolve_approval requires params.action")?;
+            let action = heartwood_common::escalate::parse_verdict_action(action_str)
+                .ok_or("params.action must be approve-once, approve-remember or deny")?;
+            let window = heartwood_common::escalate::clamp_window(
+                req.pointer("/params/window").and_then(|v| v.as_u64()),
+            );
+
+            let park_idx = ctx
+                .parks
+                .iter()
+                .position(|p| p.park_id == park_id && p.master_slot == master_slot);
+            let park_live = park_idx.is_some();
+            let tombstone = ctx
+                .park_tombstones
+                .iter()
+                .find(|t| t.park_id == park_id && t.master_slot == master_slot)
+                .cloned();
+
+            let mut completed = false;
+            let mut allow_installed = false;
+            let mut policy_written = false;
+            match action {
+                heartwood_common::escalate::VerdictAction::ApproveOnce => {
+                    if let Some(idx) = park_idx {
+                        let park = ctx.parks.remove(idx);
+                        // complete_parked installs the allow first, so even a
+                        // failed completion leaves the retry window in place.
+                        allow_installed = true;
+                        completed = complete_parked(&mut s.tls, ctx, park, window);
+                    } else if let Some(t) = tombstone {
+                        ctx.policy_engine.install_transient_allow(
+                            master_slot,
+                            t.client_hex,
+                            t.key,
+                            window,
+                        );
+                        allow_installed = true;
+                    }
+                }
+                heartwood_common::escalate::VerdictAction::ApproveRemember => {
+                    let policy = exact_policy_from_request(req)?;
+                    let client_hex = park_idx
+                        .map(|idx| ctx.parks[idx].client_hex.clone())
+                        .or_else(|| tombstone.as_ref().map(|t| t.client_hex.clone()));
+                    if let Some(client_hex) = client_hex {
+                        if let Some(slot_index) = ctx
+                            .policy_engine
+                            .find_slot_by_pubkey(master_slot, &client_hex)
+                            .map(|slot| slot.slot_index)
+                        {
+                            let snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
+                            ctx.policy_engine
+                                .set_exact_slot_policy(
+                                    master_slot,
+                                    slot_index,
+                                    policy.allowed_methods.clone(),
+                                    policy.allowed_kinds.clone(),
+                                    policy.auto_approve,
+                                )
+                                .map_err(|e| format!("policy write: {e}"))?;
+                            ctx.policy_engine.set_slot_family_flags(
+                                master_slot,
+                                slot_index,
+                                policy.escalate,
+                                policy.petition_on_deny,
+                                policy.audit_child_wrap,
+                                policy.bound_identity.clone(),
+                            );
+                            persist_slot_mutation_or_rollback(
+                                ctx,
+                                master_slot,
+                                snapshot,
+                                "resolve_approval policy",
+                            )?;
+                            policy_written = true;
+                        } else {
+                            log::warn!(
+                                "[relay] resolve_approval: client slot no longer exists"
+                            );
+                        }
+                    }
+                    if let Some(idx) = ctx
+                        .parks
+                        .iter()
+                        .position(|p| p.park_id == park_id && p.master_slot == master_slot)
+                    {
+                        let park = ctx.parks.remove(idx);
+                        // A short allow guarantees the completion dispatch is
+                        // silent even where the written policy is narrower
+                        // than this exact ask; the policy is the durable half.
+                        completed = complete_parked(
+                            &mut s.tls,
+                            ctx,
+                            park,
+                            heartwood_common::escalate::WINDOW_DEFAULT_SECS,
+                        );
+                    }
+                }
+                heartwood_common::escalate::VerdictAction::Deny => {
+                    if let Some(idx) = park_idx {
+                        let park = ctx.parks.remove(idx);
+                        deny_parked(&mut s.tls, ctx, park);
+                    }
+                }
+            }
+            ctx.park_tombstones.retain(|t| t.park_id != park_id);
+            let applied = heartwood_common::escalate::applied_value(
+                action,
+                completed,
+                allow_installed,
+                policy_written,
+            );
+            Ok(serde_json::json!({
+                "park": if park_live { "live" } else { "expired" },
+                "applied": applied,
             }))
         }
 

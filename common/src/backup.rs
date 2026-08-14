@@ -62,6 +62,10 @@ mod tests {
             signing_approved: true,
             strict_permissions: false,
             authorized_pubkeys: vec![],
+            escalate: false,
+            petition_on_deny: false,
+            audit_child_wrap: false,
+            bound_identity: None,
         }
     }
 

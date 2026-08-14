@@ -24,6 +24,12 @@ pub mod nip46;
 #[cfg(feature = "nip44")]
 pub mod nip44;
 
+#[cfg(all(feature = "nip46", feature = "nip44"))]
+pub mod nip59;
+
+#[cfg(feature = "nip46")]
+pub mod escalate;
+
 #[cfg(feature = "nip04")]
 pub mod nip04;
 

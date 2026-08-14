@@ -65,6 +65,28 @@ pub struct ConnectSlot {
     /// so an already-bound client keeps working until it next re-pairs.
     #[serde(default)]
     pub authorized_pubkeys: Vec<String>,
+    /// Family-bunker C4 (2026-08-14 escalation schema §1.5): when true, an
+    /// interactive (ButtonRequired) request on this slot is parked and
+    /// escalated to the guardian's phone instead of running the physical
+    /// button window. Default false keeps today's button behaviour.
+    #[serde(default)]
+    pub escalate: bool,
+    /// C4 §1.2: when true, a strict auto-deny on this slot records a
+    /// petition and emits a low-priority guardian notice. The deny stays
+    /// enforced throughout; the petition is purely a message.
+    #[serde(default)]
+    pub petition_on_deny: bool,
+    /// C5 §2.1: when true, device-emitted audit rumors for this slot's
+    /// bound identity are additionally gift-wrapped to this slot's client
+    /// pubkey (the child's own paired device), best effort.
+    #[serde(default)]
+    pub audit_child_wrap: bool,
+    /// The identity (64-char hex pubkey) this pairing is bound to, when the
+    /// operator recorded one. Consulted only by the C5 child-wrap scan this
+    /// cycle: a policy-decided signing as identity X wraps to every slot of
+    /// the owning master with `audit_child_wrap` and `bound_identity == X`.
+    #[serde(default)]
+    pub bound_identity: Option<String>,
 }
 
 /// A client's approval policy for a specific master.
@@ -123,6 +145,14 @@ pub struct ExactSlotPolicy {
     pub allowed_kinds: Vec<u64>,
     pub auto_approve: bool,
     pub signing_approved: bool,
+    /// C4 escalation gate (schema doc §1.5). Additive; defaults false.
+    pub escalate: bool,
+    /// C4 petition gate (schema doc §1.5). Additive; defaults false.
+    pub petition_on_deny: bool,
+    /// C5 dual-address child wrap (schema doc §2.1). Additive; defaults false.
+    pub audit_child_wrap: bool,
+    /// Identity binding for the child-wrap scan (schema doc §2.1).
+    pub bound_identity: Option<String>,
 }
 
 /// Validate and canonicalise an exact operator policy before any slot state is
@@ -160,6 +190,10 @@ pub fn validate_exact_slot_policy(
         allowed_kinds: kinds,
         auto_approve,
         signing_approved,
+        escalate: false,
+        petition_on_deny: false,
+        audit_child_wrap: false,
+        bound_identity: None,
     })
 }
 
@@ -762,6 +796,10 @@ mod tests {
             signing_approved: false,
             strict_permissions: false,
             authorized_pubkeys: vec![],
+            escalate: false,
+            petition_on_deny: false,
+            audit_child_wrap: false,
+            bound_identity: None,
         }
     }
 

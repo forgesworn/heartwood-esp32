@@ -107,6 +107,10 @@ pub fn client_summary(slot: &ConnectSlot) -> serde_json::Value {
         "authorized_pubkeys": slot.authorized_pubkeys.clone(),
         "allowed_kinds": slot.allowed_kinds.clone(),
         "allowed_methods": slot.allowed_methods.clone(),
+        "escalate": slot.escalate,
+        "petition_on_deny": slot.petition_on_deny,
+        "audit_child_wrap": slot.audit_child_wrap,
+        "bound_identity": slot.bound_identity.clone(),
     })
 }
 
@@ -496,6 +500,10 @@ mod tests {
             signing_approved: true,
             strict_permissions: true,
             authorized_pubkeys: vec!["43".repeat(32)],
+            escalate: false,
+            petition_on_deny: false,
+            audit_child_wrap: false,
+            bound_identity: None,
         };
         let summary = client_summary(&slot);
         assert_eq!(summary["slot_index"], 7);

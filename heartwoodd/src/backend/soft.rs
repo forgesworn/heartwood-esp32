@@ -714,6 +714,10 @@ impl SigningBackend for SoftBackend {
                 signing_approved: false,
                 strict_permissions: false,
                 authorized_pubkeys: vec![],
+                escalate: false,
+                petition_on_deny: false,
+                audit_child_wrap: false,
+                bound_identity: None,
             };
             m.connection_slots.push(slot.clone());
             Self::persist(state, &path)?;

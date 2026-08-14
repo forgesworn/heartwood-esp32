@@ -239,7 +239,7 @@ pub fn add_master(
 pub fn remove_master(nvs: &mut EspNvs<NvsDefault>, slot: u8) -> Result<(), &'static str> {
     resume_pending_removal(nvs)?;
     let count = read_master_count_strict(nvs)?;
-    let persona_count = read_persona_count_strict(nvs)?;
+    let persona_count = crate::personas::read_count_strict(nvs)?;
     let journal = RemovalJournal::new(slot, count, persona_count).ok_or("slot out of range")?;
     persist_removal_journal(nvs, &journal)?;
     resume_pending_removal(nvs)
@@ -280,7 +280,7 @@ pub fn resume_pending_removal(nvs: &mut EspNvs<NvsDefault>) -> Result<(), &'stat
             RemovalPhase::RewritePersonas => {
                 if journal.persona_read < journal.original_persona_count {
                     if journal.persona_inflight_master_slot == NO_PERSONA_IN_FLIGHT {
-                        let owner = read_persona_master_slot(nvs, journal.persona_read)?;
+                        let owner = crate::personas::entry_owner(nvs, journal.persona_read)?;
                         if owner >= journal.original_master_count {
                             return Err("persona references invalid master slot");
                         }
@@ -296,7 +296,7 @@ pub fn resume_pending_removal(nvs: &mut EspNvs<NvsDefault>) -> Result<(), &'stat
                         journal.persona_inflight_master_slot,
                         journal.target,
                     ) {
-                        copy_persona_entry(
+                        crate::personas::copy_entry_with_owner(
                             nvs,
                             journal.persona_read,
                             journal.persona_write,
@@ -315,11 +315,11 @@ pub fn resume_pending_removal(nvs: &mut EspNvs<NvsDefault>) -> Result<(), &'stat
             }
             RemovalPhase::ClearPersonaTail => {
                 if journal.persona_clear < journal.original_persona_count {
-                    clear_persona_entry(nvs, journal.persona_clear)?;
+                    crate::personas::clear_entry_tail(nvs, journal.persona_clear)?;
                     journal.persona_clear += 1;
                     persist_removal_journal(nvs, &journal)?;
                 } else {
-                    write_persona_count(nvs, journal.persona_write)?;
+                    crate::personas::write_registry_count(nvs, journal.persona_write)?;
                     journal.phase = RemovalPhase::ClearLastSlot;
                     persist_removal_journal(nvs, &journal)?;
                 }
@@ -369,31 +369,6 @@ fn read_master_count_strict(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str
         Ok(Some(_)) => Err("invalid master_count"),
         Ok(None) => Ok(0),
         Err(_) => Err("failed to read master_count"),
-    }
-}
-
-fn read_persona_count_strict(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str> {
-    let mut buf = [0u8; 1];
-    match nvs.get_blob("persona_count", &mut buf) {
-        Ok(Some(bytes)) if bytes.len() == 1 && bytes[0] <= crate::personas::MAX_PERSONAS => {
-            Ok(bytes[0])
-        }
-        Ok(Some(_)) => Err("invalid persona_count"),
-        Ok(None) => Ok(0),
-        Err(_) => Err("failed to read persona_count"),
-    }
-}
-
-fn write_persona_count(
-    nvs: &mut EspNvs<NvsDefault>,
-    count: u8,
-) -> Result<(), &'static str> {
-    nvs.set_blob("persona_count", &[count])
-        .map_err(|_| "failed to write persona_count")?;
-    if read_persona_count_strict(nvs)? == count {
-        Ok(())
-    } else {
-        Err("persona_count verification failed")
     }
 }
 
@@ -534,67 +509,6 @@ fn clear_slot_bundle(nvs: &mut EspNvs<NvsDefault>, slot: u8) -> Result<(), &'sta
         clear_blob(nvs, &key)?;
     }
     Ok(())
-}
-
-fn persona_key(entry: u8, suffix: &str) -> String {
-    format!("p{entry}_{suffix}")
-}
-
-fn read_persona_master_slot(
-    nvs: &EspNvs<NvsDefault>,
-    entry: u8,
-) -> Result<u8, &'static str> {
-    let mut buf = [0u8; 1];
-    match nvs.get_blob(&persona_key(entry, "ms"), &mut buf) {
-        Ok(Some(bytes)) if bytes.len() == 1 => Ok(bytes[0]),
-        _ => Err("failed to read persona master slot"),
-    }
-}
-
-fn copy_persona_entry(
-    nvs: &mut EspNvs<NvsDefault>,
-    source: u8,
-    destination: u8,
-    mapped_owner: u8,
-) -> Result<(), &'static str> {
-    for suffix in ["ix", "pk", "pp"] {
-        copy_required_blob(
-            nvs,
-            &persona_key(source, suffix),
-            &persona_key(destination, suffix),
-        )?;
-    }
-    copy_optional_blob(
-        nvs,
-        &persona_key(source, "nm"),
-        &persona_key(destination, "nm"),
-    )?;
-
-    let owner_key = persona_key(destination, "ms");
-    nvs.set_blob(&owner_key, &[mapped_owner])
-        .map_err(|_| "failed to write remapped persona owner")?;
-    if read_persona_master_slot(nvs, destination)? != mapped_owner {
-        return Err("remapped persona owner verification failed");
-    }
-    Ok(())
-}
-
-fn clear_persona_entry(nvs: &mut EspNvs<NvsDefault>, entry: u8) -> Result<(), &'static str> {
-    for suffix in ["ms", "ix", "pk", "pp", "nm"] {
-        clear_blob(nvs, &persona_key(entry, suffix))?;
-    }
-    Ok(())
-}
-
-fn copy_required_blob(
-    nvs: &mut EspNvs<NvsDefault>,
-    source: &str,
-    destination: &str,
-) -> Result<(), &'static str> {
-    if read_blob(nvs, source)?.is_none() {
-        return Err("required slot state missing");
-    }
-    copy_optional_blob(nvs, source, destination)
 }
 
 fn copy_optional_blob(

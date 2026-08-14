@@ -468,6 +468,45 @@ Signing confirmation hold (#60, both boards, USB and WiFi modes):
       2.4 s after each run's first card — pre-fix the tap usually did
       nothing in WiFi mode (#61 closed).
 
+## 9. Packed persona registry + storage gauge (added 2026-08-14, not yet bench-run)
+
+Family-bunker Phase 1 (see signet-plans
+`2026-08-14-heartwood-family-bunker-migration-design.md` §11.2/§11.3). Run on
+a Heltec (cap 32) AND a T-Display (cap 64); the migration case needs a board
+carrying personas created by pre-packed firmware.
+
+- [ ] **Boot migration.** Flash a board that already holds `p{n}_*` personas.
+      First boot logs "Migrating N persona(s) to the packed registry layout"
+      then "migration complete"; PROVISION_LIST shows the same personas with
+      the same npubs; a paired app addressed to a persona still signs.
+- [ ] **Migration power-cut.** Repeat on a board with several personas, but
+      cut power mid-boot (first boot after flashing). Every subsequent boot
+      resumes the journal; the registry ends identical to the uncut run.
+- [ ] **Sapwood pairing ceremony.** Identity panel → Add a persona. First use
+      creates the "Sapwood manager" slot: the device shows the policy-update
+      confirm; one press. Persona appears in the identity list with its own
+      npub; reboot; still there.
+- [ ] **Create / rename / remove round-trip.** Create `bench-a`, rename its
+      label, remove it. PROVISION_LIST reflects each step; after remove, a
+      NIP-46 request addressed to `bench-a`'s pubkey is NACKed; re-deriving
+      `bench-a` reproduces the SAME npub as before removal.
+- [ ] **Remove mid-power-cut.** With 3+ personas, remove the middle one and
+      cut power between the OLED activity and the Sapwood confirmation.
+      Boot resumes the removal journal; exactly one persona is gone, the
+      others' npubs are unchanged (compare a pre-cut PROVISION_LIST dump).
+- [ ] **Registry cap.** Script `heartwood_derive_persona` to the board cap
+      (32 Heltec / 64 T-Display). The cap-plus-one derive returns the
+      "identity storage full" error, not a timeout, and the device stays up.
+- [ ] **Storage gauge.** Device panel shows "Identity & app storage" over USB
+      and (WiFi tier) over the relay; the percentage moves as personas are
+      added/removed; warn copy appears past 80%.
+- [ ] **Master removal still clean.** With personas owned by two masters,
+      remove a master (existing §journal flow): its personas disappear, the
+      other master's personas survive with owners remapped, and a cut during
+      the removal still resumes to the same end state.
+- [ ] **Regression sweep.** Section 1–3 basics still pass on the same build:
+      provision, pairing, sign, backup export/import, OTA.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

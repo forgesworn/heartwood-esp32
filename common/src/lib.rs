@@ -36,6 +36,8 @@ pub mod mgmt;
 
 pub mod persistent_state;
 
+pub mod persona_pack;
+
 #[cfg(feature = "mnemonic")]
 pub mod mnemonic;
 

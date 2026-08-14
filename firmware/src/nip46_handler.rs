@@ -255,6 +255,8 @@ pub fn handle_request(
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     client_pubkey: Option<&[u8; 32]>,
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    personas: &mut Vec<crate::personas::LoadedPersona>,
 ) -> String {
     // Bound the request BEFORE serde_json sees it, as the relay and the
     // encrypted path both do. MAX_PAYLOAD_SIZE admits a 32 KB frame, and
@@ -308,6 +310,8 @@ pub fn handle_request(
         policy_engine,
         identity_caches,
         client_pubkey,
+        nvs,
+        personas,
     )
 }
 
@@ -328,6 +332,11 @@ pub fn handle_parsed_request(
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     client_pubkey: Option<&[u8; 32]>,
+    // Registry access for the storage-full refusal on derivation and for the
+    // remove/rename extensions, which mutate the persisted registry directly.
+    // Every path here is behind the pre-dispatch policy gates above the match.
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    personas: &mut Vec<crate::personas::LoadedPersona>,
 ) -> String {
     // Enforce the ceiling we advertise in FIRMWARE_INFO, before anything
     // allocates at signing size.
@@ -781,8 +790,24 @@ pub fn handle_parsed_request(
                 }
             };
 
+            let len_before = cache.identities.len();
             match cache.derive_and_cache(&derive_secret, purpose, index, None) {
                 Ok(idx) => {
+                    // The post-request persistence loop will write any cached
+                    // identity that is not yet in the registry. Refuse cleanly
+                    // here — never mid-write — when the registry cannot take
+                    // it, dropping a just-cached identity so the loop does not
+                    // retry a doomed write on every subsequent request.
+                    let pubkey = cache.identities[idx].public_key;
+                    if !crate::personas::contains_pubkey(personas, &pubkey) {
+                        if let Err(full) = crate::personas::capacity_check(nvs) {
+                            if cache.identities.len() > len_before {
+                                cache.identities.truncate(len_before);
+                            }
+                            log::warn!("heartwood_derive: refused — {full}");
+                            return build_error_json(&request.id, -4, full);
+                        }
+                    }
                     let id = &cache.identities[idx];
                     let result = serde_json::json!({
                         "npub": id.npub,
@@ -824,8 +849,22 @@ pub fn handle_parsed_request(
                 }
             };
 
+            let len_before = cache.identities.len();
             match cache.derive_and_cache(&derive_secret, &purpose, index, Some(name.to_string())) {
                 Ok(idx) => {
+                    // Same clean storage-full refusal as heartwood_derive:
+                    // re-deriving an already-registered persona still succeeds
+                    // (it is a lookup), only a NEW registry entry is refused.
+                    let pubkey = cache.identities[idx].public_key;
+                    if !crate::personas::contains_pubkey(personas, &pubkey) {
+                        if let Err(full) = crate::personas::capacity_check(nvs) {
+                            if cache.identities.len() > len_before {
+                                cache.identities.truncate(len_before);
+                            }
+                            log::warn!("heartwood_derive_persona: refused — {full}");
+                            return build_error_json(&request.id, -4, full);
+                        }
+                    }
                     let id = &cache.identities[idx];
                     let result = serde_json::json!({
                         "npub": id.npub,
@@ -836,6 +875,109 @@ pub fn handle_parsed_request(
                     nip46::build_result_response(&request.id, &result.to_string())
                         .unwrap_or_default()
                 }
+                Err(e) => build_error_json(&request.id, -4, e),
+            }
+        }
+
+        "heartwood_remove_persona" => {
+            // Params: [persona pubkey hex]. Registry-only: the derivation tree
+            // is untouched, so re-deriving the same purpose later reproduces
+            // the identity. Gated like every mutating extension (unbound
+            // remote clients never reach here; ButtonRequired tiers stop for
+            // the physical button above).
+            let pubkey_hex = match request.params.first().and_then(|v| v.as_str()) {
+                Some(hex) if hex.len() == 64 => hex,
+                _ => return build_error_json(&request.id, -3, "params[0] must be a persona pubkey (64-char hex)"),
+            };
+            let pubkey: [u8; 32] = match heartwood_common::hex::hex_decode(pubkey_hex)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+            {
+                Some(pk) => pk,
+                None => return build_error_json(&request.id, -3, "params[0] must be a persona pubkey (64-char hex)"),
+            };
+            match crate::personas::remove_by_pubkey(nvs, &pubkey) {
+                Ok(true) => {
+                    if let Some(idx) = crate::personas::find_by_pubkey(personas, &pubkey) {
+                        personas.remove(idx);
+                    }
+                    // Purge the cache too, or the post-request persistence
+                    // loop re-adds the persona immediately. Sessions hold
+                    // active-identity indices into this cache, so fix them up
+                    // as the removal shifts entries.
+                    if let Some(cache) = identity_caches
+                        .iter_mut()
+                        .find(|c| c.master_slot == master_slot)
+                    {
+                        if let Some(cidx) =
+                            cache.identities.iter().position(|i| i.public_key == pubkey)
+                        {
+                            cache.identities.remove(cidx);
+                            for session in policy_engine
+                                .sessions
+                                .iter_mut()
+                                .filter(|s| s.master_slot == master_slot)
+                            {
+                                match session.active_identity {
+                                    Some(ai) if ai == cidx => session.active_identity = None,
+                                    Some(ai) if ai > cidx => {
+                                        session.active_identity = Some(ai - 1)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    nip46::build_result_response(&request.id, "{\"removed\":true}")
+                        .unwrap_or_default()
+                }
+                Ok(false) => build_error_json(&request.id, -3, "no such persona"),
+                Err(e) => build_error_json(&request.id, -4, e),
+            }
+        }
+
+        "heartwood_rename_persona" => {
+            // Params: [persona pubkey hex, new name or empty to clear]. Label
+            // only — purpose, index and pubkey are untouched.
+            let pubkey_hex = match request.params.first().and_then(|v| v.as_str()) {
+                Some(hex) if hex.len() == 64 => hex,
+                _ => return build_error_json(&request.id, -3, "params[0] must be a persona pubkey (64-char hex)"),
+            };
+            let pubkey: [u8; 32] = match heartwood_common::hex::hex_decode(pubkey_hex)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+            {
+                Some(pk) => pk,
+                None => return build_error_json(&request.id, -3, "params[0] must be a persona pubkey (64-char hex)"),
+            };
+            let raw_name = request
+                .params
+                .get(1)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if raw_name.len() > 64 {
+                return build_error_json(&request.id, -3, "persona name too long (64 bytes max)");
+            }
+            let name = if raw_name.is_empty() { None } else { Some(raw_name) };
+            match crate::personas::rename_by_pubkey(nvs, &pubkey, name) {
+                Ok(true) => {
+                    if let Some(idx) = crate::personas::find_by_pubkey(personas, &pubkey) {
+                        personas[idx].name = name.map(|n| n.to_string());
+                    }
+                    if let Some(cache) = identity_caches
+                        .iter_mut()
+                        .find(|c| c.master_slot == master_slot)
+                    {
+                        if let Some(id) =
+                            cache.identities.iter_mut().find(|i| i.public_key == pubkey)
+                        {
+                            id.persona_name = name.map(|n| n.to_string());
+                        }
+                    }
+                    nip46::build_result_response(&request.id, "{\"renamed\":true}")
+                        .unwrap_or_default()
+                }
+                Ok(false) => build_error_json(&request.id, -3, "no such persona"),
                 Err(e) => build_error_json(&request.id, -4, e),
             }
         }
@@ -998,6 +1140,8 @@ pub fn handle_parsed_request(
                 "heartwood_capabilities",
                 "heartwood_derive",
                 "heartwood_derive_persona",
+                "heartwood_remove_persona",
+                "heartwood_rename_persona",
                 "heartwood_switch",
                 "heartwood_list_identities",
                 "heartwood_recover",

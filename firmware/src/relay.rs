@@ -1896,6 +1896,8 @@ fn poll_usb(
                     ctx.policy_engine,
                     ctx.identity_caches,
                     None,
+                    ctx.nvs,
+                    ctx.personas,
                 );
                 crate::protocol::write_nip46_response(
                     usb,
@@ -2768,6 +2770,8 @@ fn handle_nip46_event(
         ctx.policy_engine,
         ctx.identity_caches,
         Some(&client_pubkey),
+        ctx.nvs,
+        ctx.personas,
     );
     if !ctx.policy_engine.persist_slots(ctx.nvs, slot) {
         if let Some(snapshot) = slot_snapshot {
@@ -4627,6 +4631,11 @@ fn dispatch_mgmt(
                     esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
                 } as u32,
                 "log_quiet": crate::log_quiet::read(ctx.nvs),
+                // Identity & app storage share one NVS entry table; the
+                // manager's storage gauge is driven from this (null when the
+                // stats API fails, so "unknown" is not "empty").
+                "nvs": crate::nvs_stats::as_json(),
+                "max_personas": crate::personas::MAX_PERSONAS,
                 // Running firmware, so managers can show version state over
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),

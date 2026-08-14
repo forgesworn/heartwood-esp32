@@ -80,6 +80,8 @@ pub enum Nip46Method {
     // Heartwood extensions
     HeartwoodDerive,
     HeartwoodDerivePersona,
+    HeartwoodRemovePersona,
+    HeartwoodRenamePersona,
     HeartwoodSwitch,
     HeartwoodListIdentities,
     HeartwoodRecover,
@@ -110,6 +112,8 @@ impl Nip46Method {
             "switch_relays" => Self::SwitchRelays,
             "heartwood_derive" => Self::HeartwoodDerive,
             "heartwood_derive_persona" => Self::HeartwoodDerivePersona,
+            "heartwood_remove_persona" => Self::HeartwoodRemovePersona,
+            "heartwood_rename_persona" => Self::HeartwoodRenamePersona,
             "heartwood_switch" => Self::HeartwoodSwitch,
             "heartwood_list_identities" => Self::HeartwoodListIdentities,
             "heartwood_recover" => Self::HeartwoodRecover,
@@ -133,6 +137,8 @@ impl Nip46Method {
             Self::SwitchRelays => "switch_relays",
             Self::HeartwoodDerive => "heartwood_derive",
             Self::HeartwoodDerivePersona => "heartwood_derive_persona",
+            Self::HeartwoodRemovePersona => "heartwood_remove_persona",
+            Self::HeartwoodRenamePersona => "heartwood_rename_persona",
             Self::HeartwoodSwitch => "heartwood_switch",
             Self::HeartwoodListIdentities => "heartwood_list_identities",
             Self::HeartwoodRecover => "heartwood_recover",
@@ -144,11 +150,16 @@ impl Nip46Method {
     }
 
     /// Whether this method requires button approval regardless of policy.
+    /// Registry mutation (remove/rename) sits in the same class as derivation:
+    /// a slot policy can lift the tier to auto-approve, but an unbound remote
+    /// client can never reach these, and a ButtonRequired tier really stops.
     pub fn always_requires_button(&self) -> bool {
         matches!(
             self,
             Self::HeartwoodDerive
                 | Self::HeartwoodDerivePersona
+                | Self::HeartwoodRemovePersona
+                | Self::HeartwoodRenamePersona
                 | Self::HeartwoodSwitch
                 | Self::HeartwoodRecover
                 | Self::HeartwoodCreateProof

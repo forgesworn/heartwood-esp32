@@ -57,6 +57,7 @@ mod masters;
 mod nip46_handler;
 mod personas;
 mod nvs;
+mod nvs_stats;
 mod cat_sprites;
 mod oled;
 mod ota;
@@ -142,10 +143,25 @@ pub fn firmware_info_json() -> String {
     let largest_block = unsafe {
         esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
     };
+    // Identity & app storage share one NVS entry table; the manager's storage
+    // gauge is driven from these. Omitted (not zeroed) when the API fails so
+    // "unknown" stays distinguishable from "empty".
+    let nvs_stats = crate::nvs_stats::read()
+        .map(|s| {
+            format!(
+                ",\"nvs_used_entries\":{},\"nvs_free_entries\":{},\
+                 \"nvs_total_entries\":{},\"max_personas\":{}",
+                s.used_entries,
+                s.free_entries,
+                s.total_entries,
+                personas::MAX_PERSONAS,
+            )
+        })
+        .unwrap_or_default();
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
-         \"free_heap\":{},\"largest_block\":{}{}}}",
+         \"free_heap\":{},\"largest_block\":{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -155,6 +171,7 @@ pub fn firmware_info_json() -> String {
         free_heap,
         largest_block,
         crash,
+        nvs_stats,
     )
 }
 
@@ -420,6 +437,23 @@ fn main() {
                 // No seed/policy/persona has loaded yet. Remain fail-closed,
                 // retry recovery, and give the owner a physical 2-second PRG
                 // hold escape to the same complete factory wipe.
+                offer_removal_recovery_wipe(&mut display, &buttons);
+            }
+        }
+    }
+
+    // The one-time persona-registry layout migration (five keys per entry →
+    // packed chunks) and any interrupted persona removal resume here, after
+    // the master-removal recovery (whose journal may predate the packed
+    // layout) and before anything loads personas. Same fail-closed retry
+    // model as above.
+    loop {
+        match personas::migrate_if_needed(&mut nvs)
+            .and_then(|()| personas::resume_pending_removal(&mut nvs))
+        {
+            Ok(()) => break,
+            Err(e) => {
+                log::error!("Persona-registry recovery failed: {e}");
                 offer_removal_recovery_wipe(&mut display, &buttons);
             }
         }
@@ -922,6 +956,8 @@ fn main() {
                         &mut policy_engine,
                         &mut identity_caches,
                         None,
+                        &mut nvs,
+                        &mut loaded_personas,
                     );
                     protocol::write_nip46_response(
                         &mut usb,

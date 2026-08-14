@@ -216,6 +216,8 @@ pub fn handle_encrypted_request(
         policy_engine,
         identity_caches,
         Some(&client_pubkey),
+        nvs,
+        personas,
     );
 
     // A connect response or first-sign success must never advertise authority

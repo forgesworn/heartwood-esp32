@@ -765,11 +765,11 @@ pub fn handle_parsed_request(
                 Ok(s) => s,
                 Err(e) => return build_error_json(&request.id, -4, e),
             };
-            let purpose = match request.params.first().and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return build_error_json(&request.id, -3, "requires [purpose, index?]"),
-            };
-            let index = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let nip46::DeriveParams { purpose, index } =
+                match nip46::DeriveParams::from_params(&request.params) {
+                    Ok(p) => p,
+                    Err(e) => return build_error_json(&request.id, -3, e),
+                };
 
             let cache = match identity_caches
                 .iter_mut()
@@ -801,14 +801,14 @@ pub fn handle_parsed_request(
                 Ok(s) => s,
                 Err(e) => return build_error_json(&request.id, -4, e),
             };
-            let name = match request.params.first().and_then(|v| v.as_str()) {
-                Some(n) => n,
-                None => return build_error_json(&request.id, -3, "requires [name, index?]"),
-            };
+            let nip46::PersonaParams { name, index } =
+                match nip46::PersonaParams::from_params(&request.params) {
+                    Ok(p) => p,
+                    Err(e) => return build_error_json(&request.id, -3, e),
+                };
             if let Err(e) = validate_persona_name(name) {
                 return build_error_json(&request.id, -3, e);
             }
-            let index = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             // Reserved persona namespace (PROTOCOL v1.1 §3.1) — the same purpose
             // signet, the library, and the CLI's `derive persona` use, so a
             // persona reproduces byte-for-byte across all of them.
@@ -841,10 +841,11 @@ pub fn handle_parsed_request(
         }
 
         "heartwood_switch" => {
-            let target = match request.params.first().and_then(|v| v.as_str()) {
-                Some(t) => t,
-                None => return build_error_json(&request.id, -3, "requires [target, index_hint?]"),
-            };
+            let nip46::SwitchParams { target, index_hint } =
+                match nip46::SwitchParams::from_params(&request.params) {
+                    Ok(p) => p,
+                    Err(e) => return build_error_json(&request.id, -3, e),
+                };
 
             // "master" resets to the master identity — return its npub.
             if target == "master" {
@@ -884,7 +885,6 @@ pub fn handle_parsed_request(
             };
 
             // Search by npub, then persona name, then purpose+index.
-            let index_hint = request.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let found = cache
                 .find_by_npub(target)
                 .or_else(|| cache.find_by_persona(target))
@@ -939,11 +939,8 @@ pub fn handle_parsed_request(
                 Ok(s) => s,
                 Err(e) => return build_error_json(&request.id, -4, e),
             };
-            let lookahead = request
-                .params
-                .first()
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20) as u32;
+            let nip46::RecoverParams { lookahead } =
+                nip46::RecoverParams::from_params(&request.params);
 
             let cache = match identity_caches
                 .iter_mut()
@@ -1258,17 +1255,11 @@ fn handle_nip44_encrypt(
     master_mode: MasterMode,
     request: &nip46::Nip46Request,
 ) -> String {
-    if request.params.len() < 2 {
-        return build_error_json(&request.id, -3, "nip44_encrypt requires 2 params");
-    }
-    let peer_hex = match request.params[0].as_str() {
-        Some(s) => s,
-        None => return build_error_json(&request.id, -3, "peer pubkey param must be a string"),
-    };
-    let plaintext = match request.params[1].as_str() {
-        Some(s) => s,
-        None => return build_error_json(&request.id, -3, "plaintext param must be a string"),
-    };
+    let nip46::CryptoParams { peer_pubkey: peer_hex, payload: plaintext } =
+        match nip46::CryptoParams::from_params(&request.params) {
+            Ok(p) => p,
+            Err(e) => return build_error_json(&request.id, -3, e),
+        };
 
     let mut signing_secret =
         match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
@@ -1318,17 +1309,11 @@ fn handle_nip44_decrypt(
     master_mode: MasterMode,
     request: &nip46::Nip46Request,
 ) -> String {
-    if request.params.len() < 2 {
-        return build_error_json(&request.id, -3, "nip44_decrypt requires 2 params");
-    }
-    let peer_hex = match request.params[0].as_str() {
-        Some(s) => s,
-        None => return build_error_json(&request.id, -3, "peer pubkey param must be a string"),
-    };
-    let ciphertext_b64 = match request.params[1].as_str() {
-        Some(s) => s,
-        None => return build_error_json(&request.id, -3, "ciphertext param must be a string"),
-    };
+    let nip46::CryptoParams { peer_pubkey: peer_hex, payload: ciphertext_b64 } =
+        match nip46::CryptoParams::from_params(&request.params) {
+            Ok(p) => p,
+            Err(e) => return build_error_json(&request.id, -3, e),
+        };
 
     let mut signing_secret =
         match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
@@ -1375,17 +1360,11 @@ fn handle_nip04_encrypt(
     master_mode: MasterMode,
     request: &nip46::Nip46Request,
 ) -> String {
-    if request.params.len() < 2 {
-        return build_error_json(&request.id, -3, "nip04_encrypt requires 2 params");
-    }
-    let peer_hex = match request.params[0].as_str() {
-        Some(s) => s,
-        None => return build_error_json(&request.id, -3, "peer pubkey param must be a string"),
-    };
-    let plaintext = match request.params[1].as_str() {
-        Some(s) => s,
-        None => return build_error_json(&request.id, -3, "plaintext param must be a string"),
-    };
+    let nip46::CryptoParams { peer_pubkey: peer_hex, payload: plaintext } =
+        match nip46::CryptoParams::from_params(&request.params) {
+            Ok(p) => p,
+            Err(e) => return build_error_json(&request.id, -3, e),
+        };
 
     let mut signing_secret =
         match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {
@@ -1435,17 +1414,11 @@ fn handle_nip04_decrypt(
     master_mode: MasterMode,
     request: &nip46::Nip46Request,
 ) -> String {
-    if request.params.len() < 2 {
-        return build_error_json(&request.id, -3, "nip04_decrypt requires 2 params");
-    }
-    let peer_hex = match request.params[0].as_str() {
-        Some(s) => s,
-        None => return build_error_json(&request.id, -3, "peer pubkey param must be a string"),
-    };
-    let ciphertext = match request.params[1].as_str() {
-        Some(s) => s,
-        None => return build_error_json(&request.id, -3, "ciphertext param must be a string"),
-    };
+    let nip46::CryptoParams { peer_pubkey: peer_hex, payload: ciphertext } =
+        match nip46::CryptoParams::from_params(&request.params) {
+            Ok(p) => p,
+            Err(e) => return build_error_json(&request.id, -3, e),
+        };
 
     let mut signing_secret =
         match resolve_signing_secret(master_secret, master_mode, request.heartwood.as_ref()) {

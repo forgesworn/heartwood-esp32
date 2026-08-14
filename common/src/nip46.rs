@@ -507,11 +507,150 @@ pub fn event_display_summary(event: &UnsignedEvent, max_chars: usize) -> (u64, S
 }
 
 // ---------------------------------------------------------------------------
+// Typed method params
+// ---------------------------------------------------------------------------
+// NIP-46 params are positional JSON arrays, so the wire shape cannot change.
+// These extractors are the validation boundary instead: each method converts
+// its raw array into a typed struct straight after parse, so arity and type
+// errors are uniform across the ESP32, ESP8266 and Soft-mode signers and
+// handlers never index `params` positionally. Index-style params keep the
+// established lenient semantics (absent or non-numeric → default) so a sloppy
+// client behaves identically on every signer.
+
+/// `nip44_encrypt` / `nip44_decrypt` / `nip04_encrypt` / `nip04_decrypt`:
+/// `[peer_pubkey_hex, payload]`. Hex validity stays with the caller — this
+/// boundary owns shape, not semantics.
+pub struct CryptoParams<'a> {
+    pub peer_pubkey: &'a str,
+    pub payload: &'a str,
+}
+
+impl<'a> CryptoParams<'a> {
+    pub fn from_params(params: &'a [Value]) -> Result<Self, &'static str> {
+        const ERR: &str = "requires [peer_pubkey, payload]";
+        Ok(Self {
+            peer_pubkey: params.first().and_then(Value::as_str).ok_or(ERR)?,
+            payload: params.get(1).and_then(Value::as_str).ok_or(ERR)?,
+        })
+    }
+}
+
+/// `heartwood_derive`: `[purpose, index?]`.
+pub struct DeriveParams<'a> {
+    pub purpose: &'a str,
+    pub index: u32,
+}
+
+impl<'a> DeriveParams<'a> {
+    pub fn from_params(params: &'a [Value]) -> Result<Self, &'static str> {
+        Ok(Self {
+            purpose: params
+                .first()
+                .and_then(Value::as_str)
+                .ok_or("requires [purpose, index?]")?,
+            index: params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32,
+        })
+    }
+}
+
+/// `heartwood_derive_persona`: `[name, index?]`.
+pub struct PersonaParams<'a> {
+    pub name: &'a str,
+    pub index: u32,
+}
+
+impl<'a> PersonaParams<'a> {
+    pub fn from_params(params: &'a [Value]) -> Result<Self, &'static str> {
+        Ok(Self {
+            name: params
+                .first()
+                .and_then(Value::as_str)
+                .ok_or("requires [name, index?]")?,
+            index: params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32,
+        })
+    }
+}
+
+/// `heartwood_switch`: `[target, index_hint?]`.
+pub struct SwitchParams<'a> {
+    pub target: &'a str,
+    pub index_hint: u32,
+}
+
+impl<'a> SwitchParams<'a> {
+    pub fn from_params(params: &'a [Value]) -> Result<Self, &'static str> {
+        Ok(Self {
+            target: params
+                .first()
+                .and_then(Value::as_str)
+                .ok_or("requires [target, index_hint?]")?,
+            index_hint: params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32,
+        })
+    }
+}
+
+/// `heartwood_recover`: `[lookahead?]` — never fails, lookahead defaults to 20.
+pub struct RecoverParams {
+    pub lookahead: u32,
+}
+
+impl RecoverParams {
+    pub fn from_params(params: &[Value]) -> Self {
+        Self {
+            lookahead: params.first().and_then(Value::as_u64).unwrap_or(20) as u32,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Serialisation helpers
 // ---------------------------------------------------------------------------
 
+/// Maximum JSON nesting depth accepted from a client, in either the request
+/// envelope or a stringified `sign_event` payload. Real traffic peaks around
+/// six levels (request → params → event → tags → tag → string); serde_json's
+/// own recursion limit of 128 is the only backstop otherwise, and a hostile
+/// client can pack thousands of `[` into a small message.
+pub const MAX_JSON_DEPTH: usize = 16;
+
+/// Cheap pre-parse scan: does bracket nesting stay within `max`? String
+/// contents (and escaped quotes inside them) are skipped, so brackets inside
+/// a stringified event body do not count against the envelope.
+fn json_depth_ok(bytes: &[u8], max: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for &b in bytes {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > max {
+                    return false;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Deserialise a NIP-46 request from raw JSON bytes.
 pub fn parse_request(json: &[u8]) -> Result<Nip46Request, String> {
+    if !json_depth_ok(json, MAX_JSON_DEPTH) {
+        return Err("request nesting too deep".to_string());
+    }
     serde_json::from_slice(json).map_err(|e| format!("failed to parse NIP-46 request: {e}"))
 }
 
@@ -640,9 +779,14 @@ pub fn parse_unsigned_event(params: &[Value]) -> Result<UnsignedEvent, String> {
         .first()
         .ok_or_else(|| "sign_event params is empty".to_string())?;
 
-    // params[0] may be a JSON string (stringified event) or an object.
+    // params[0] may be a JSON string (stringified event) or an object. The
+    // string form is a second parse of client-controlled JSON, so it gets its
+    // own depth guard; the object form already passed the envelope's.
     let event: UnsignedEvent = match raw {
         Value::String(s) => {
+            if !json_depth_ok(s.as_bytes(), MAX_JSON_DEPTH) {
+                return Err("event nesting too deep".to_string());
+            }
             serde_json::from_str(s).map_err(|e| format!("failed to parse event string: {e}"))?
         }
         Value::Object(_) => serde_json::from_value(raw.clone())
@@ -688,8 +832,12 @@ pub fn parse_unsigned_event_owned(params: Vec<Value>) -> Result<UnsignedEvent, S
         .ok_or_else(|| "sign_event params is empty".to_string())?;
 
     match raw {
-        Value::String(raw) => serde_json::from_str(&raw)
-            .map_err(|e| format!("failed to parse event string: {e}")),
+        Value::String(raw) => {
+            if !json_depth_ok(raw.as_bytes(), MAX_JSON_DEPTH) {
+                return Err("event nesting too deep".to_string());
+            }
+            serde_json::from_str(&raw).map_err(|e| format!("failed to parse event string: {e}"))
+        }
         Value::Object(object) => serde_json::from_value(Value::Object(object))
             .map_err(|e| format!("failed to parse event object: {e}")),
         other => Err(format!(
@@ -1816,6 +1964,74 @@ mod tests {
         assert_eq!(result["version"], CAPABILITIES_VERSION);
         assert_eq!(result["methods"][0], "ping");
         assert_eq!(result["methods"][1], "heartwood_derive");
+    }
+
+    #[test]
+    fn test_typed_param_extractors() {
+        let params = vec![serde_json::json!("aabb"), serde_json::json!("hello")];
+        let crypto = CryptoParams::from_params(&params).unwrap();
+        assert_eq!(crypto.peer_pubkey, "aabb");
+        assert_eq!(crypto.payload, "hello");
+        assert!(CryptoParams::from_params(&[serde_json::json!("aabb")]).is_err());
+        assert!(CryptoParams::from_params(&[serde_json::json!(1), serde_json::json!(2)]).is_err());
+
+        let params = vec![serde_json::json!("games"), serde_json::json!(3)];
+        let derive = DeriveParams::from_params(&params).unwrap();
+        assert_eq!(derive.purpose, "games");
+        assert_eq!(derive.index, 3);
+        // Absent or non-numeric index keeps the lenient default.
+        let bare = vec![serde_json::json!("games")];
+        let derive = DeriveParams::from_params(&bare).unwrap();
+        assert_eq!(derive.index, 0);
+        let stringly = vec![serde_json::json!("games"), serde_json::json!("x")];
+        let derive = DeriveParams::from_params(&stringly).unwrap();
+        assert_eq!(derive.index, 0);
+        assert!(DeriveParams::from_params(&[]).is_err());
+
+        let persona_params = vec![serde_json::json!("forge"), serde_json::json!(1)];
+        let persona = PersonaParams::from_params(&persona_params).unwrap();
+        assert_eq!((persona.name, persona.index), ("forge", 1));
+
+        let switch_params = vec![serde_json::json!("master")];
+        let switch = SwitchParams::from_params(&switch_params).unwrap();
+        assert_eq!((switch.target, switch.index_hint), ("master", 0));
+
+        assert_eq!(RecoverParams::from_params(&[]).lookahead, 20);
+        assert_eq!(RecoverParams::from_params(&[serde_json::json!(5)]).lookahead, 5);
+    }
+
+    #[test]
+    fn test_json_depth_guard() {
+        // A hostile envelope: thousands of bytes of pure nesting.
+        let deep = format!(
+            r#"{{"id":"a","method":"ping","params":{}{}}}"#,
+            "[".repeat(50),
+            "]".repeat(50)
+        );
+        let err = parse_request(deep.as_bytes()).unwrap_err();
+        assert!(err.contains("nesting too deep"), "{err}");
+
+        // Sane nesting parses.
+        let ok = br#"{"id":"a","method":"ping","params":[["x"]]}"#;
+        assert!(parse_request(ok).is_ok());
+
+        // Brackets inside a stringified event body must NOT count against the
+        // envelope (they are string content at this layer)...
+        let brackets = "[".repeat(40);
+        let inner = format!(r#"{{"id":"a","method":"sign_event","params":["{brackets}"]}}"#);
+        assert!(parse_request(inner.as_bytes()).is_ok());
+
+        // ...but the second parse of the event string has its own guard.
+        let deep_event = format!("{}{}", "[".repeat(50), "]".repeat(50));
+        let params = vec![serde_json::json!(deep_event)];
+        let err = parse_unsigned_event(&params).unwrap_err();
+        assert!(err.contains("nesting too deep"), "{err}");
+        let err = parse_unsigned_event_owned(params).unwrap_err();
+        assert!(err.contains("nesting too deep"), "{err}");
+
+        // A real event string stays well inside the ceiling.
+        let event = r#"{"pubkey":"ab","created_at":1,"kind":1,"tags":[["e","x"]],"content":"hi"}"#;
+        assert!(parse_unsigned_event(&[serde_json::json!(event)]).is_ok());
     }
 
     #[test]

@@ -212,16 +212,9 @@ impl SoftBackend {
             Nip46Method::Nip44Encrypt => {
                 // NIP-46 order: params[0] = recipient x-only pubkey hex,
                 // params[1] = plaintext (matches the firmware handler).
-                let recipient_hex = req
-                    .params
-                    .first()
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| BackendError::Internal("nip44_encrypt: missing params[0]".into()))?;
-                let plaintext = req
-                    .params
-                    .get(1)
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| BackendError::Internal("nip44_encrypt: missing params[1]".into()))?;
+                let nip46::CryptoParams { peer_pubkey: recipient_hex, payload: plaintext } =
+                    nip46::CryptoParams::from_params(&req.params)
+                        .map_err(|e| BackendError::Internal(format!("nip44_encrypt: {e}")))?;
                 let recipient_bytes = hex_to_32(recipient_hex)
                     .map_err(|e| BackendError::Internal(format!("nip44_encrypt recipient pubkey: {e}")))?;
                 let conv_key = nip44::get_conversation_key(&secret_bytes, &recipient_bytes)
@@ -238,16 +231,9 @@ impl SoftBackend {
             Nip46Method::Nip44Decrypt => {
                 // NIP-46 order: params[0] = sender x-only pubkey hex,
                 // params[1] = ciphertext (matches the firmware handler).
-                let sender_hex = req
-                    .params
-                    .first()
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| BackendError::Internal("nip44_decrypt: missing params[0]".into()))?;
-                let ciphertext = req
-                    .params
-                    .get(1)
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| BackendError::Internal("nip44_decrypt: missing params[1]".into()))?;
+                let nip46::CryptoParams { peer_pubkey: sender_hex, payload: ciphertext } =
+                    nip46::CryptoParams::from_params(&req.params)
+                        .map_err(|e| BackendError::Internal(format!("nip44_decrypt: {e}")))?;
                 let sender_bytes = hex_to_32(sender_hex)
                     .map_err(|e| BackendError::Internal(format!("nip44_decrypt sender pubkey: {e}")))?;
                 let conv_key = nip44::get_conversation_key(&secret_bytes, &sender_bytes)

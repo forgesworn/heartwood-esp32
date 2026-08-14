@@ -235,16 +235,11 @@ fn sign_event(
 /// persona) — exactly like `sign_event` — so a DM uses whichever identity the
 /// client is acting as. `params[0]` is the 64-hex peer pubkey.
 fn resolve_secret_and_peer(
-    req: &Nip46Request,
+    peer_hex: &str,
     seed: &[u8; 32],
     mode: u8,
     ctx: &Option<(String, u32)>,
 ) -> Result<([u8; 32], [u8; 32]), &'static str> {
-    let peer_hex = req
-        .params
-        .first()
-        .and_then(|v| v.as_str())
-        .ok_or("requires [peer_pubkey, payload]")?;
     let peer_bytes =
         heartwood_common::hex::hex_decode(peer_hex).map_err(|_| "peer pubkey must be hex")?;
     if peer_bytes.len() != 32 {
@@ -273,13 +268,14 @@ fn nip44_encrypt(
     mode: u8,
     ctx: &Option<(String, u32)>,
 ) -> Option<String> {
-    let (secret, peer) = match resolve_secret_and_peer(req, seed, mode, ctx) {
+    let nip46::CryptoParams { peer_pubkey, payload: plaintext } =
+        match nip46::CryptoParams::from_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return nip46::build_error_response(&req.id, -3, e).ok(),
+        };
+    let (secret, peer) = match resolve_secret_and_peer(peer_pubkey, seed, mode, ctx) {
         Ok(v) => v,
         Err(e) => return nip46::build_error_response(&req.id, -3, e).ok(),
-    };
-    let plaintext = match req.params.get(1).and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return nip46::build_error_response(&req.id, -3, "requires [peer_pubkey, plaintext]").ok(),
     };
     let ck = match nip44::get_conversation_key(&secret, &peer) {
         Ok(k) => k,
@@ -301,13 +297,14 @@ fn nip44_decrypt(
     mode: u8,
     ctx: &Option<(String, u32)>,
 ) -> Option<String> {
-    let (secret, peer) = match resolve_secret_and_peer(req, seed, mode, ctx) {
+    let nip46::CryptoParams { peer_pubkey, payload: ciphertext } =
+        match nip46::CryptoParams::from_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return nip46::build_error_response(&req.id, -3, e).ok(),
+        };
+    let (secret, peer) = match resolve_secret_and_peer(peer_pubkey, seed, mode, ctx) {
         Ok(v) => v,
         Err(e) => return nip46::build_error_response(&req.id, -3, e).ok(),
-    };
-    let ciphertext = match req.params.get(1).and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return nip46::build_error_response(&req.id, -3, "requires [peer_pubkey, ciphertext]").ok(),
     };
     let ck = match nip44::get_conversation_key(&secret, &peer) {
         Ok(k) => k,
@@ -328,14 +325,14 @@ fn derive_persona(
     mode: u8,
     cache: &mut IdentityCache,
 ) -> Option<String> {
-    let name = match req.params.first().and_then(|v| v.as_str()) {
-        Some(n) => n,
-        None => return nip46::build_error_response(&req.id, -3, "requires [name, index?]").ok(),
+    let nip46::PersonaParams { name, index } = match nip46::PersonaParams::from_params(&req.params)
+    {
+        Ok(p) => p,
+        Err(e) => return nip46::build_error_response(&req.id, -3, e).ok(),
     };
     if let Err(e) = validate_persona_name(name) {
         return nip46::build_error_response(&req.id, -3, e).ok();
     }
-    let index = req.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let purpose = format!("nostr:persona:{name}");
     let idx = match cache.derive_and_cache(seed, mode, &purpose, index, Some(name.to_string())) {
         Ok(i) => i,
@@ -360,11 +357,11 @@ fn derive_purpose(
     mode: u8,
     cache: &mut IdentityCache,
 ) -> Option<String> {
-    let purpose = match req.params.first().and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return nip46::build_error_response(&req.id, -3, "requires [purpose, index?]").ok(),
+    let nip46::DeriveParams { purpose, index } = match nip46::DeriveParams::from_params(&req.params)
+    {
+        Ok(p) => p,
+        Err(e) => return nip46::build_error_response(&req.id, -3, e).ok(),
     };
-    let index = req.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let idx = match cache.derive_and_cache(seed, mode, purpose, index, None) {
         Ok(i) => i,
         Err(e) => return nip46::build_error_response(&req.id, -4, e).ok(),
@@ -388,12 +385,11 @@ fn switch(
     sessions: &mut Sessions,
     client_pk: &[u8; 32],
 ) -> Option<String> {
-    let target = match req.params.first().and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => {
-            return nip46::build_error_response(&req.id, -3, "requires [target, index_hint?]").ok()
-        }
-    };
+    let nip46::SwitchParams { target, index_hint } =
+        match nip46::SwitchParams::from_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return nip46::build_error_response(&req.id, -3, e).ok(),
+        };
 
     if target == "master" {
         sessions.set(client_pk, None);
@@ -402,7 +398,6 @@ fn switch(
         return nip46::build_result_response(&req.id, &result.to_string()).ok();
     }
 
-    let index_hint = req.params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let found = cache
         .find_by_npub(target)
         .or_else(|| cache.find_by_persona(target))

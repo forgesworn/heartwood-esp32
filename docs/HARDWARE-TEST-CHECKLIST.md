@@ -348,6 +348,59 @@ hardware tests ran. Use throwaway identities, WiFi credentials, and relays.
       persistent wipe; it never auto-wipes. Corrupt only `pinned_rly`; removal
       succeeds by discarding that non-authoritative reachability cache.
 
+## 8. Field-test feedback fixes + multi-network (added 2026-08-14, not yet bench-run)
+
+Covers the 2026-08-14 approval/wake fixes and the new features. Run on a
+T-Display (two buttons) and one Heltec (single button).
+
+Approval flow (both boards):
+- [ ] Trigger a network change from Sapwood and let the prompt expire
+      untouched. The screen must show "Request expired / no change made" — not
+      a stale countdown — and after display sleep, waking must show the idle
+      card, never the dead prompt.
+- [ ] T-Display: the prompt names the buttons ("hold lower 2s = yes / tap
+      upper = no"). Holding the lower (GPIO 0) button 2 s approves with the
+      progress bar; tapping the upper (GPIO 35) button shows CANCELLED and
+      Sapwood reports the denial.
+- [ ] T-Display clone check: on a board whose GPIO 35 floats (no external
+      pull-up), boot logs "leaving it unregistered" and approvals behave
+      single-button — B must never self-cancel prompts.
+- [ ] After a Sapwood web flash, without replugging: the display wakes on a
+      button PRESS (not release) and the device never looks dead while the
+      serial bridge holds GPIO 0.
+
+Idle carousel (both boards, USB and WiFi modes):
+- [ ] Short presses cycle identity/status → NETWORK → DEVICE → back. NETWORK
+      shows mode + SSID + live stage (WiFi mode) or "radio off" (USB mode);
+      DEVICE shows version, board, uptime. Sleep resets to the first page.
+- [ ] A short press never triggers or interferes with a signing approval.
+
+Multi-network WiFi (T-Display or Heltec in WiFi mode):
+- [ ] Over USB, add two fallback networks in Sapwood (e.g. phone hotspot +
+      second AP), reorder them, save, and read back: the list survives the
+      reboot and the redacted state shows ssid + password_set only.
+- [ ] Power the primary AP off. The signer rotates to the hotspot within a few
+      retry cycles (~10 s/candidate) and comes online; logs name each
+      candidate as "wifi network N/M".
+- [ ] Promote a fallback to primary in Sapwood using its saved password (no
+      password typed). The device joins it after reboot.
+- [ ] Encrypted-at-rest + WiFi: with the vault locked, the device now joins
+      WiFi during the locked phase (previously the station never associated)
+      and publishes its kind-24135 unlock announcement.
+
+Quick USB update (T-Display / C6):
+- [ ] Sapwood's Firmware section offers "Update to vX over USB" for the
+      factory-layout board; the flow writes app-only, and after reset the
+      device keeps identity, Wi-Fi settings and slots (verify via read-back).
+- [ ] The device panel shows the update banner when the bundle is newer, and
+      after the update + reconnect Sapwood prints the confirmed version line.
+
+Demo game (spare T-Display):
+- [ ] `scripts/build-firmware.sh demo --release`, flash `heartwood-demo.elf`
+      at 0x10000. Title screen brands Heartwood, names the flash URL, and the
+      button-check labels light while held. A jumps, B ducks, collisions end
+      the run, score/best display. It must never expose signer frames on USB.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

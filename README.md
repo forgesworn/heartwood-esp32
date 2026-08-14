@@ -35,6 +35,8 @@ Holds the **master secrets** (up to 8 masters across bunker / tree-mnemonic / tr
 
 The ESP32 joins WiFi and connects to Nostr relays directly, running the full NIP-46 signing loop on-chip (`firmware/src/relay.rs`) — no Raspberry Pi. Keys still never leave the chip and NIP-44 is still decrypted on-device. Exact v2 client policies can permit unattended signing for a bounded method/event-kind set; other requests are denied or require the OLED/button according to their legacy policy. An unbound relay peer cannot enter the 30-second button loop: remote physical approval is available only after the client has been provisioned and slot-bound, so strangers cannot keep a shelf signer busy with prompts. Enabled only when the device is provisioned with an SSID + relay list (`mode="wifi"` in the NVS net config); the USB cable stays fully usable in parallel, so a bad SSID or relay is recoverable over the cable. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey, uses a durable one-time mutation challenge, and can manage clients and staged WiFi changes remotely. USB can read password-redacted network/operator state, patch network fields with keep/set/clear password semantics, and replace the operator only through a separate stale-revision-checked physical confirmation. Seed replacement, PIN changes, factory reset, and OTA remain local/USB operations.
 
+The device stores an ordered list of up to eight WiFi networks (v0.16.0): the join loop walks the list in priority order and rotates on failure — home network first, phone hotspot as fallback, say. Reordering or promoting a stored network never resends its password; per-SSID `keep` semantics resolve secrets on-device. Short button presses while idle page through an info carousel: identity, network (SSID + live connection stage), and device (firmware version, board, uptime).
+
 This is the convenience tier — it accepts a larger attack surface (a live TCP/IP stack on a key-holding device) in exchange for dropping the Pi. The USB-attached mode above remains the high-assurance default; leave the radios off where that matters.
 
 ### Portable signer — battery-powered, BLE to phone *(roadmap)*
@@ -131,7 +133,7 @@ espflash flash firmware/target/xtensa-esp32s3-espidf/release/heartwood-esp32
 espflash flash firmware/target/xtensa-esp32s3-espidf/release/heartwood-esp32
 ```
 
-**Always use `--release`** -- debug builds (~2.2MB) exceed the 1.5MB OTA partition.
+**Always use `--release`** -- debug builds (~2.2MB) exceed the 2 MB OTA partition.
 
 ### Remote flash via esptool (ESP32 attached to a Pi)
 
@@ -353,6 +355,16 @@ docs/
 - [x] 1.5 MB OTA partition slots (up from 896 KB) — accommodates current firmware size with 50% headroom
 - [ ] Dedicated on-device transport key distinct from user masters
 - [ ] NIP-46 transport architecture spec contribution
+
+### Field-test hardening *(shipped 2026-08-14, v0.16.0)*
+
+- [x] Two-button boards: B is an explicit cancel during approvals, with on-screen button hints ("hold lower 2s = yes / tap upper = no"); a floating second button is detected at boot and ignored
+- [x] Approval timeouts paint an explicit "Request expired / no change made" card — a stale countdown can never linger looking live; browser-driven windows widened to 45 s
+- [x] Display wakes on button press (not release) — a serial bridge pinning GPIO 0 after a web flash no longer makes the device look dead
+- [x] Idle info carousel: short presses page identity / network / device screens
+- [x] Multiple prioritised WiFi networks with per-SSID password `keep`, join-loop rotation, and redacted list reporting over USB and relay
+- [x] Locked vault-unlock relay phase associates the WiFi station itself (it previously ran before the only connect call and could never reach a relay)
+- [x] Board-check demo game bin (`scripts/build-firmware.sh demo`) for pre-flashing handed-out boards — branded, two-button jump-and-duck, deliberately not the signer
 
 ### Phase 7 — Portable signer
 

@@ -324,6 +324,11 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
     if !latched && !ctx.buttons.a.is_low() {
         return;
     }
+    if latched && !ctx.buttons.a.is_low() {
+        // The level sample would have missed this tap entirely — the latch
+        // is what caught it. Logged so the fix is verifiable over serial.
+        log::info!("[relay] press consumed from latch (tap ended before sample)");
+    }
     if !ctx.display_on {
         crate::oled::wake_display(ctx.display);
         ctx.display_on = true;
@@ -1131,6 +1136,9 @@ pub fn run_wifi_standalone<'d, 'b>(
             crate::oled::sleep_display(ctx.display);
             ctx.display_on = false;
             ctx.idle_page = 0;
+            // Observable on the serial tap: lets a bench run measure how long
+            // an outcome card actually stayed lit before burn-in blanking.
+            log::info!("[relay] display blanked after inactivity");
         }
     }
 }

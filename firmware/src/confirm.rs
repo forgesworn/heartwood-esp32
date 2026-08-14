@@ -107,6 +107,9 @@ pub fn dismiss() -> bool {
     st.hold_until = None;
     st.queue.clear();
     st.restore_pending = false;
+    // Observable on the serial tap: dismiss draws nothing distinctive on a
+    // bench camera-less rig, so say it happened.
+    log::info!("confirm: card run dismissed by press");
     true
 }
 

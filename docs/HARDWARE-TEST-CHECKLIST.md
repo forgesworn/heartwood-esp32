@@ -348,6 +348,36 @@ hardware tests ran. Use throwaway identities, WiFi credentials, and relays.
       persistent wipe; it never auto-wipes. Corrupt only `pinned_rly`; removal
       succeeds by discarding that non-authoritative reachability cache.
 
+## Bench record — 2026-08-14 Heltec V4 (16 MB variant), v0.16.0
+
+Run on a provisioned V4 (3 identities, 2 app pairings, WiFi mode, encrypted at
+rest with a host-held vault key).
+
+- [x] **Root-caused a fleet-relevant OTA failure**: the device carried an
+      early bring-up partition table (one 16000K `factory` slot, no
+      `otadata`/`ota_0`/`ota_1`), so `esp_ota_get_next_update_partition`
+      returned null and every OTA died at OTA_BEGIN with ERR_WRITE ("couldn't
+      prepare its update slot"). Any other early-flashed V4 will behave the
+      same. Its NVS also used the legacy 24K size — the standard table's 16K
+      nvs would truncate live page 4, so **do not** blind-reflash such units
+      with the fleet layout.
+- [x] Repaired via `firmware/partitions-v4-16mb-legacy-nvs.csv`: keeps the
+      24K NVS at 0x9000, real 2MB A/B slots, config at the standard 0x410000,
+      otadata relocated to 0x414000. Wrote table + signed v0.16.0 app with
+      espflash after taking a raw NVS backup (deleted after verification).
+- [x] v0.16.0 boots from the new table; all 3 identities and both app
+      pairings survived; vault unlock via Sapwood works.
+- [x] Sapwood shows signer v0.16.0 = bundled v0.16.0, no update banner
+      (correct no-op case for the new update check).
+- [x] Idle carousel confirmed in WiFi mode: press wakes to the identity card,
+      further presses page NETWORK (SSID + status) and DEVICE (version,
+      board, uptime).
+- [ ] Known rough edge: a wake press during WiFi (re)association or a
+      degraded relay session waits for the blocking connect/read — poll the
+      button in the retry-wait loops (follow-up).
+- [ ] OTA into ota_1 on this repaired unit (Re-install button) — exercise
+      when the next release lands.
+
 ## 8. Field-test feedback fixes + multi-network (added 2026-08-14, not yet bench-run)
 
 Covers the 2026-08-14 approval/wake fixes and the new features. Run on a

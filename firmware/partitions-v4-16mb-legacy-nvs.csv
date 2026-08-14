@@ -1,0 +1,11 @@
+# One-off Heltec V4 (16MB flash) layout preserving the legacy 24K NVS at
+# 0x9000 (pages 0-4 in use; the standard 16K nvs would truncate page 4).
+# otadata lives after config instead of below 0x10000, where the legacy
+# nvs+phy fill the window completely. App slots match the release layout.
+# Name,    Type, SubType, Offset,   Size,   Flags
+nvs,       data, nvs,     0x9000,   0x6000,
+phy_init,  data, phy,     0xf000,   0x1000,
+ota_0,     app,  ota_0,   0x10000,  0x200000,
+ota_1,     app,  ota_1,   0x210000, 0x200000,
+config,    data, 0x40,    0x410000, 0x4000,
+otadata,   data, ota,     0x414000, 0x2000,

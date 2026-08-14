@@ -19,8 +19,10 @@ use crate::oled::Display;
 
 /// How long each confirmation card stays up before the next queued card (or
 /// the idle screen) may replace it. Enforced by the loop ticks, not by
-/// blocking the signing handler.
-const HOLD: Duration = Duration::from_secs(3);
+/// blocking the signing handler. Bench-tuned: at 3 s the card was gone
+/// before the finger came off the approval hold, so the early-dismiss tap
+/// was unusable (2026-08-14, Heltec V4).
+const HOLD: Duration = Duration::from_secs(5);
 
 /// Cards queued beyond this coalesce by dropping the oldest — the newest
 /// are the ones the user has not yet had a chance to see.

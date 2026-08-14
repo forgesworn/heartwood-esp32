@@ -260,7 +260,7 @@ pub fn handle_set_pin(
 
     let action = if payload.is_empty() { "Remove PIN?" } else { "Set PIN?" };
     let result = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
-        crate::oled::show_error(d, &format!("{}\n{}s", action, remaining));
+        crate::oled::show_change_approval(d, action, remaining, 30);
     });
     if !matches!(result, crate::approval::ApprovalResult::Approved) {
         log::info!("SET_PIN denied by user");
@@ -377,7 +377,7 @@ pub fn handle_vault_set(
         "Enable vault?\n(host-held key)"
     };
     let result = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
-        crate::oled::show_error(d, &format!("{}\n{}s", action, remaining));
+        crate::oled::show_change_approval(d, action, remaining, 30);
     });
     if !matches!(result, crate::approval::ApprovalResult::Approved) {
         log::info!("VAULT_SET denied by user");

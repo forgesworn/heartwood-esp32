@@ -175,8 +175,8 @@ pub fn handle_update(
                     buttons,
                     30,
                     |d, remaining| {
-                        let msg = format!("Update {}?\n{}\n{}s", short_label, changes, remaining);
-                        crate::oled::show_error(d, &msg);
+                        let msg = format!("Update {}?\n{}", short_label, changes);
+                        crate::oled::show_change_approval(d, &msg, remaining, 30);
                     },
                 );
 

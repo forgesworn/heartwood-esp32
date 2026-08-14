@@ -40,12 +40,11 @@ pub fn handle_export(
         30,
         |d, remaining| {
             let msg = format!(
-                "Export backup?\n{} masters/{} slots\n{}s",
+                "Export backup?\n{} masters/{} slots",
                 loaded_masters.len(),
                 total_slots,
-                remaining,
             );
-            crate::oled::show_error(d, &msg);
+            crate::oled::show_change_approval(d, &msg, remaining, 30);
         },
     );
 
@@ -159,8 +158,7 @@ pub fn handle_import(
         buttons,
         30,
         |d, remaining| {
-            let msg = format!("{}\n{}s", prompt, remaining);
-            crate::oled::show_error(d, &msg);
+            crate::oled::show_change_approval(d, &prompt, remaining, 30);
         },
     );
 

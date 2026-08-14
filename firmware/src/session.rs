@@ -111,8 +111,7 @@ pub fn handle_set_bridge_secret(
         buttons,
         30,
         |d, remaining| {
-            let msg = format!("Set bridge\nsecret? {}s", remaining);
-            crate::oled::show_error(d, &msg);
+            crate::oled::show_change_approval(d, "Set bridge secret?", remaining, 30);
         },
     );
 

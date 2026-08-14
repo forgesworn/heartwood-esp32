@@ -910,7 +910,9 @@ fn show_status_card(
 
 /// Neutral, amber confirmation screen for a normal settings change. A network
 /// or operator update is not an error, so it must not use the red fault screen.
-pub fn show_change_approval(display: &mut Display<'_>, title: &str, remaining: u32) {
+/// `total_secs` is the caller's approval-window length, so the countdown bar
+/// starts full and drains to empty exactly as the signing screens do.
+pub fn show_change_approval(display: &mut Display<'_>, title: &str, remaining: u32, total_secs: u32) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -945,7 +947,7 @@ pub fn show_change_approval(display: &mut Display<'_>, title: &str, remaining: u
     let mut lines = title.lines();
     let first = lines.next().unwrap_or("Change settings?");
     let second = lines.next();
-    let first_y = if second.is_some() { 29 } else { 36 };
+    let first_y = if second.is_some() { 27 } else { 32 };
     let first_font = if first.len() as i32 * Layout::glyph_w(l.font_body()) <= l.w - l.sx(4) {
         l.font_body()
     } else {
@@ -970,7 +972,7 @@ pub fn show_change_approval(display: &mut Display<'_>, title: &str, remaining: u
             second,
             Point::new(
                 l.center_x(second.len() as i32 * Layout::glyph_w(l.font_small())),
-                l.sy(43),
+                l.sy(38),
             ),
             small,
         )
@@ -979,55 +981,28 @@ pub fn show_change_approval(display: &mut Display<'_>, title: &str, remaining: u
     }
     // The old "Hold button - Ns" read as a hold-duration counter, and testers
     // watched the countdown sit at 0 wondering why holding did nothing. Spell
-    // out both halves: what the hold does, and when the request expires. On
-    // two-button boards, also say which button is which (A is the lower-left
-    // button on the T-Display; B above it cancels).
-    let two_btn = crate::button::has_button_b();
-    if second.is_some() {
-        // Two title lines leave room for one hint line only.
-        let hint = if two_btn {
-            format!("hold lower=yes {remaining}s")
-        } else {
-            format!("hold 2s = yes ({remaining}s)")
-        };
-        Text::new(
-            &hint,
-            Point::new(
-                l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())),
-                l.sy(57),
-            ),
-            small,
-        )
-        .draw(display)
-        .ok();
+    // out what the hold does here; the expiry lives on the countdown bar
+    // below, the same graphic as the signing screens. On two-button boards,
+    // also say which button is which (A is the lower-left button on the
+    // T-Display; B above it cancels).
+    let hint = if crate::button::has_button_b() {
+        "hold lower=yes up=no"
     } else {
-        let hint1 = if two_btn { "Hold lower 2s = yes" } else { "Hold 2s to approve" };
-        let hint2 = if two_btn {
-            format!("tap upper = no ({remaining}s)")
-        } else {
-            format!("expires in {remaining}s")
-        };
-        Text::new(
-            hint1,
-            Point::new(
-                l.center_x(hint1.len() as i32 * Layout::glyph_w(l.font_small())),
-                l.sy(50),
-            ),
-            small,
-        )
-        .draw(display)
-        .ok();
-        Text::new(
-            &hint2,
-            Point::new(
-                l.center_x(hint2.len() as i32 * Layout::glyph_w(l.font_small())),
-                l.sy(60),
-            ),
-            small,
-        )
-        .draw(display)
-        .ok();
-    }
+        "Hold 2s to approve"
+    };
+    Text::new(
+        hint,
+        Point::new(
+            l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())),
+            l.sy(48),
+        ),
+        small,
+    )
+    .draw(display)
+    .ok();
+
+    // Graphical countdown bar, shared with the signing screens.
+    draw_countdown_bar(display, remaining, total_secs);
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -1210,8 +1185,9 @@ fn draw_countdown_bar(
     } else {
         DANGER
     };
+    // Clamped so a remaining > total mismatch can never spill past the track.
     let fill_w = if total > 0 {
-        (remaining * (bar_w - l.s(4) as u32)) / total
+        ((remaining * (bar_w - l.s(4) as u32)) / total).min(bar_w - l.s(4) as u32)
     } else {
         0
     };

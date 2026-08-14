@@ -613,7 +613,7 @@ fn approved(
     // host timeout.
     matches!(
         crate::approval::run_approval_loop(display, buttons, 45, |d, remaining| {
-            crate::oled::show_change_approval(d, title, remaining);
+            crate::oled::show_change_approval(d, title, remaining, 45);
         }),
         crate::approval::ApprovalResult::Approved
     )
@@ -788,7 +788,7 @@ pub fn handle_set_net_config(
         Ok(cfg) if cfg.validate().is_ok() => {
             let result =
                 crate::approval::run_approval_loop(display, buttons, 45, |d, remaining| {
-                    crate::oled::show_change_approval(d, "Set network config?", remaining);
+                    crate::oled::show_change_approval(d, "Set network config?", remaining, 45);
                 });
 
             if !matches!(result, crate::approval::ApprovalResult::Approved) {

@@ -576,6 +576,48 @@ sapwood checkout for deps):
   MIGRATION (host cut-models cover it; revisit if another legacy-persona
   board appears).
 
+## 10. Path B family recovery — words-only enrolment (bench-run 2026-08-14)
+
+Sapwood-side Phase 2 of the family-bunker plan: rebuild a family onto the
+signer from the guardian's recovery words plus the encrypted roster on the
+sync relay. Zero firmware changes — the run exercises the existing 0x10
+NIP-46 path (`heartwood_derive_persona`, `heartwood_rename_persona`,
+`nip44_decrypt`) behind the Sapwood manager slot policy.
+
+Bench record — 2026-08-14 evening, Heltec V4 v0.16.0 (wifi-standalone,
+vault-encrypted at rest), harness `sapwood/hardware-recovery.test.ts`
+(vitest over node-serialport driving the exact wizard store functions):
+**6/6 PASSED**, one button press total (the manager-pairing ceiling).
+
+- Throwaway guardian: fresh 12 words each run; the host derives the whole
+  family (same maths as My Signet), publishes a real `signet:dependants`
+  kind-30078 roster to the relay, self-encrypted to the natural person, and
+  verifies it by fetch-back before touching the device.
+- Provision rode the wifi-standalone REBOOT semantics (master-set changes
+  reboot the signer to re-subscribe): port reopen, SESSION_AUTH +
+  VAULT_UNLOCK (slow unseal), then a CONNSLOT_LIST poll until the relay
+  loop serves USB again. Same ride after each cleanup removal.
+- Natural-person parity: the on-chip derive matched the host derivation
+  from the words byte-for-byte, then the signer decrypted the fetched
+  roster itself (target = peer = NP; the key never left the chip). The
+  widened manager ceiling (now including `nip44_decrypt`) upgraded and
+  enforced as designed.
+- Enrolment: 7 identities (guardian persona + professional blind, two
+  dependants' np/persona, one extra) all derived on-chip and verified
+  against the roster's expected pubkeys; display-name renames applied and
+  visible in the registry; 1 view-only record correctly reported as
+  unrecoverable. Cleanup removed personas, revoked the pairing, and removed
+  the bench master — board back on its original master set.
+- Bench-infrastructure gotchas (not firmware): sapwood's unit-test
+  `InertWebSocket` stub must be swapped for a real `ws` client in the
+  hardware config (vite's browser resolve condition serves ws's throwing
+  shim unless aliased to `ws/index.js`); nostr-tools `publish` can resolve
+  with a "connection failure:" string, so the roster publish is only
+  trusted after a fetch-back.
+- Noted for a later firmware cycle: some button-approval windows (e.g. the
+  CONNSLOT_UPDATE ceiling confirm) run their timeout without the usual
+  countdown graphics.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

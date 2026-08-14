@@ -407,11 +407,6 @@ pub fn remove_by_pubkey(
     Ok(true)
 }
 
-/// Whether a persona-removal journal exists.
-pub fn removal_pending(nvs: &EspNvs<NvsDefault>) -> bool {
-    !matches!(nvs.blob_len(REMOVAL_JOURNAL_KEY), Ok(None))
-}
-
 /// Resume (or complete) an interrupted persona removal. Runs at boot after
 /// the master-removal resume and the layout migration, and defensively at the
 /// top of every mutating registry call.

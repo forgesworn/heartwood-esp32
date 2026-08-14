@@ -309,6 +309,12 @@ struct SignCtx<'a, 'd, 'b> {
     /// Idle info carousel position: 0 identity, 1 network, 2 device. Short
     /// presses while the panel is awake advance it; sleep resets it.
     idle_page: u8,
+    /// Set when the served persona set changed (a derive over any path, or a
+    /// registry removal): the live "hw" subscriptions re-REQ with fresh
+    /// filters on the next loop pass instead of waiting for a reconnect, so
+    /// a freshly derived persona is addressable promptly (D4). A rename never
+    /// sets it — pubkeys are unchanged.
+    resubscribe_needed: bool,
 }
 
 /// Wake the panel on a press; while awake, further presses page the idle
@@ -752,6 +758,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         network_runtime: NetworkRuntimeStatus::starting(),
         network_display_restore_at: None,
         idle_page: 0,
+        resubscribe_needed: false,
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -1113,6 +1120,31 @@ pub fn run_wifi_standalone<'d, 'b>(
                     // `s` dropped here; do not advance `i` — swap_remove moved
                     // a new candidate into this position.
                 }
+            }
+        }
+
+        // The persona set changed this pass (derive or removal, over any
+        // transport): rebuild the "hw" subscription and re-REQ it on every
+        // live session NOW — the same-id REQ replaces the filters server-side
+        // — instead of waiting for a reconnect or the keepalive re-REQ (which
+        // would resend the stale stored filters). The stored copy is updated
+        // so the keepalive stays truthful. A failed send is left to the
+        // session's own silence/reconnect machinery.
+        if ctx.resubscribe_needed {
+            ctx.resubscribe_needed = false;
+            if !sessions.is_empty() {
+                let sub_req = build_sub_req(&ctx);
+                for s in sessions.iter_mut() {
+                    s.sub_req = sub_req.clone();
+                    s.last_resub = Instant::now();
+                    if let Err(e) = ws_send(&mut s.tls, OP_TEXT, sub_req.as_bytes()) {
+                        log::warn!(
+                            "[relay] persona resubscribe on {} failed: {e}; session will heal on reconnect",
+                            s.url
+                        );
+                    }
+                }
+                log::info!("[relay] re-subscribed with the fresh persona set");
             }
         }
 
@@ -1905,6 +1937,20 @@ fn poll_usb(
                     response_json,
                 );
                 ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+                // Persist identities derived during this request, exactly as
+                // the encrypted and relay paths do — the plaintext cable path
+                // historically cached them RAM-only, silently losing them at
+                // reboot. Registry changes join the live `#p` filters below.
+                let personas_before = ctx.personas.len();
+                crate::transport::persist_fresh_identities(
+                    ctx.nvs,
+                    ctx.identity_caches,
+                    ctx.personas,
+                    master_slot,
+                );
+                if ctx.personas.len() != personas_before {
+                    ctx.resubscribe_needed = true;
+                }
             }
         }
 
@@ -1913,6 +1959,7 @@ fn poll_usb(
             if !ctx.policy_engine.bridge_authenticated {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             } else {
+                let personas_before = ctx.personas.len();
                 crate::transport::handle_encrypted_request(
                     usb,
                     &frame,
@@ -1925,6 +1972,9 @@ fn poll_usb(
                     ctx.identity_caches,
                     ctx.nvs,
                 );
+                if ctx.personas.len() != personas_before {
+                    ctx.resubscribe_needed = true;
+                }
             }
         }
 
@@ -2368,7 +2418,15 @@ fn process_event(
             ctx.nip46_seen.remove(0);
         }
         ctx.nip46_seen.push(ev.id.clone());
-        handle_nip46_event(&mut s.tls, ev, ctx, &target_pk)
+        // Registry mutations inside the dispatch (a fresh persona persisted by
+        // the post-request hook, or heartwood_remove_persona) must reach the
+        // live `#p` filters without waiting for a reconnect.
+        let personas_before = ctx.personas.len();
+        let outcome = handle_nip46_event(&mut s.tls, ev, ctx, &target_pk);
+        if ctx.personas.len() != personas_before {
+            ctx.resubscribe_needed = true;
+        }
+        outcome
     };
     // A button-gated approval can spend its whole 30 s window inside the
     // dispatch above, leaving the arrival refresh already expired when the
@@ -2803,36 +2861,10 @@ fn handle_nip46_event(
 
     // Persist any identities derived during this request (e.g. via
     // heartwood_derive_persona) to the registry, so they survive reboot and
-    // become addressable by their own bunker URI — picked up by the `#p`
-    // subscription on the next (re)connect. Mirrors the USB path.
-    if let Some(cache) = ctx.identity_caches.iter().find(|c| c.master_slot == slot) {
-        let fresh: Vec<(String, u32, Option<String>, [u8; 32])> = cache
-            .identities
-            .iter()
-            .filter(|id| !crate::personas::contains_pubkey(ctx.personas, &id.public_key))
-            .map(|id| {
-                (
-                    id.purpose.clone(),
-                    id.index,
-                    id.persona_name.clone(),
-                    id.public_key,
-                )
-            })
-            .collect();
-        for (purpose, index, name, pubkey) in fresh {
-            if crate::personas::add(ctx.nvs, slot, &purpose, index, name.as_deref(), &pubkey)
-                .is_ok()
-            {
-                ctx.personas.push(crate::personas::LoadedPersona {
-                    master_slot: slot,
-                    purpose,
-                    index,
-                    name,
-                    pubkey,
-                });
-            }
-        }
-    }
+    // become addressable by their own bunker URI. The dispatch site notices
+    // the registry growing and refreshes the live `#p` subscriptions, so the
+    // fresh persona is reachable without a reconnect.
+    crate::transport::persist_fresh_identities(ctx.nvs, ctx.identity_caches, ctx.personas, slot);
 
     // Heap guard before the response re-encryption. Publishing re-encrypts the
     // response (NIP-44 pads to the next power of two), base64-encodes it, and

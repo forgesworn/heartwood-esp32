@@ -967,6 +967,15 @@ fn main() {
                     // Persist slots if TOFU may have added one.
                     if !loaded_masters.is_empty() {
                         policy_engine.persist_slots(&mut nvs, loaded_masters[0].slot);
+                        // And any identities derived during the request, so a
+                        // persona created over the plaintext cable survives
+                        // reboot exactly as the encrypted and relay paths do.
+                        transport::persist_fresh_identities(
+                            &mut nvs,
+                            &identity_caches,
+                            &mut loaded_personas,
+                            loaded_masters[0].slot,
+                        );
                     }
                     // Leave a held signing confirmation readable — the poll
                     // loop restores the idle card when the hold expires.

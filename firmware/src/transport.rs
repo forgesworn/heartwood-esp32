@@ -28,6 +28,40 @@ use crate::oled::Display;
 use crate::policy::PolicyEngine;
 use crate::protocol;
 
+/// Persist cache identities not yet in the registry (the shared post-request
+/// hook of every NIP-46 transport: plaintext USB, encrypted USB, relay). The
+/// handler pre-checks capacity, so a failure here is unexpected and logged
+/// rather than silently skipped — a persona the client was told exists must
+/// not quietly evaporate at reboot.
+pub fn persist_fresh_identities(
+    nvs: &mut EspNvs<NvsDefault>,
+    identity_caches: &[crate::identity_cache::IdentityCache],
+    personas: &mut Vec<crate::personas::LoadedPersona>,
+    owning_slot: u8,
+) {
+    let Some(cache) = identity_caches.iter().find(|c| c.master_slot == owning_slot) else {
+        return;
+    };
+    let fresh: Vec<(String, u32, Option<String>, [u8; 32])> = cache
+        .identities
+        .iter()
+        .filter(|id| !crate::personas::contains_pubkey(personas, &id.public_key))
+        .map(|id| (id.purpose.clone(), id.index, id.persona_name.clone(), id.public_key))
+        .collect();
+    for (purpose, index, name, pubkey) in fresh {
+        match crate::personas::add(nvs, owning_slot, &purpose, index, name.as_deref(), &pubkey) {
+            Ok(()) => personas.push(crate::personas::LoadedPersona {
+                master_slot: owning_slot,
+                purpose,
+                index,
+                name,
+                pubkey,
+            }),
+            Err(e) => log::error!("failed to persist derived persona {purpose}: {e}"),
+        }
+    }
+}
+
 /// Handle an encrypted NIP-46 request frame (0x10).
 ///
 /// Payload layout: [master_pubkey_32][client_pubkey_32][created_at_u64_be_8][ciphertext_b64...]
@@ -251,27 +285,7 @@ pub fn handle_encrypted_request(
     // heartwood_derive_persona) to the persona registry, so they survive reboot
     // and become addressable by their own bunker URI. The bridge picks them up
     // on its next discovery.
-    if let Some(cache) = identity_caches.iter().find(|c| c.master_slot == owning_slot) {
-        let fresh: Vec<(String, u32, Option<String>, [u8; 32])> = cache
-            .identities
-            .iter()
-            .filter(|id| !crate::personas::contains_pubkey(personas, &id.public_key))
-            .map(|id| (id.purpose.clone(), id.index, id.persona_name.clone(), id.public_key))
-            .collect();
-        for (purpose, index, name, pubkey) in fresh {
-            if crate::personas::add(nvs, owning_slot, &purpose, index, name.as_deref(), &pubkey)
-                .is_ok()
-            {
-                personas.push(crate::personas::LoadedPersona {
-                    master_slot: owning_slot,
-                    purpose,
-                    index,
-                    name,
-                    pubkey,
-                });
-            }
-        }
-    }
+    persist_fresh_identities(nvs, identity_caches, personas, owning_slot);
 
     // Heap guard: a large response (e.g. a big nip44_decrypt plaintext) would
     // need several transient buffers a few times its size to re-encrypt and

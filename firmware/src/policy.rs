@@ -145,8 +145,24 @@ impl PolicyEngine {
             }
         }
 
-        // Legacy Heartwood extension invariants remain unchanged.
+        // Heartwood extension invariants: a physical press per request —
+        // UNLESS this client's slot policy explicitly lists the method. That
+        // ceiling was itself physically confirmed (CONNSLOT_UPDATE's button)
+        // or operator-authorised (set_exact_slot_policy), so consent moved to
+        // pairing time; the Sapwood manager pairing and the family-bunker
+        // enrolment/D4 flows depend on exactly this delegation. An unlisted
+        // extension keeps the per-request button, and no pre-existing slot
+        // lists one (they were never settable before persona management).
         if method.always_requires_button() {
+            if let Some(slot) = slot {
+                if slot
+                    .allowed_methods
+                    .iter()
+                    .any(|allowed| allowed == method.as_str())
+                {
+                    return evaluate_slot_policy(slot, method.as_str(), event_kind);
+                }
+            }
             return ApprovalTier::ButtonRequired;
         }
         if method.is_oled_notify() {

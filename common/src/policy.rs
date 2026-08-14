@@ -788,6 +788,47 @@ mod tests {
     }
 
     #[test]
+    fn listed_heartwood_extension_follows_slot_policy() {
+        // The firmware's check() defers an explicitly-listed extension (e.g.
+        // heartwood_derive_persona for the Sapwood manager pairing) to this
+        // evaluation: auto_approve lifts it to silent approval, without
+        // auto_approve it stays a physical prompt. Consent for the lift is
+        // the button-confirmed (or operator-authorised) ceiling install.
+        let mut slot = sample_slot(0, "manager");
+        slot.allowed_methods = vec![
+            "get_public_key".into(),
+            "heartwood_derive_persona".into(),
+            "heartwood_remove_persona".into(),
+            "heartwood_rename_persona".into(),
+        ];
+        slot.auto_approve = true;
+        for method in [
+            "heartwood_derive_persona",
+            "heartwood_remove_persona",
+            "heartwood_rename_persona",
+        ] {
+            assert_eq!(
+                evaluate_slot_policy(&slot, method, None),
+                ApprovalTier::AutoApprove,
+            );
+        }
+        slot.auto_approve = false;
+        assert_eq!(
+            evaluate_slot_policy(&slot, "heartwood_derive_persona", None),
+            ApprovalTier::ButtonRequired,
+        );
+        // Unlisted extensions never reach this evaluation with a lift — the
+        // firmware returns ButtonRequired before consulting it — but the
+        // pure result for an unlisted method stays non-approving regardless.
+        slot.auto_approve = true;
+        slot.allowed_methods = vec!["get_public_key".into()];
+        assert_eq!(
+            evaluate_slot_policy(&slot, "heartwood_derive_persona", None),
+            ApprovalTier::ButtonRequired,
+        );
+    }
+
+    #[test]
     fn strict_slot_requires_explicit_signing_approval() {
         let mut slot = sample_slot(0, "strict");
         slot.strict_permissions = true;

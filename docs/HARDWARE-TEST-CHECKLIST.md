@@ -529,6 +529,27 @@ Bench record — 2026-08-14 Heltec V4 (16 MB variant), packed-registry build:
   the power-cut items additionally need a board carrying `p{n}_*` personas
   from pre-packed firmware.
 
+Bench record — 2026-08-14 (same board, later, encrypted path): full pass
+via `scripts/bench-personas-nip46.mjs` (0x10/0x35 — the transport the
+Sapwood manager pairing uses; vault-unlocks itself, needs a sibling
+sapwood checkout for deps):
+
+- ✔ Pairing ceremony live: CONNSLOT_CREATE, button-confirmed manager
+  ceiling, NIP-46 connect with the slot secret.
+- ✔ Derive / rename / list / idempotent re-derive; packed growth measured
+  at ~5 NVS entries per persona (536 → 546 for two).
+- ✔ Reboot: personas and the rename survive; re-derive returns the same
+  key; removal is registry-only (same npub back on re-derive).
+- ✔ Cap: 32/32 created, the 33rd refused with the "identity storage full"
+  text, device healthy at cap (nvs 609/756), full cleanup to zero.
+- ✔ All of the above SILENT after the pairing press — this run caught and
+  then verified the fix for `policy.rs check()` returning ButtonRequired
+  for slot-listed extensions (a listed method + auto_approve now defers to
+  `evaluate_slot_policy`; consent is the button-confirmed ceiling install).
+  First attempt burned a thumb on ~35 per-request prompts.
+- Still open: migration-with-data + power-cut runs (need a legacy-persona
+  board and a hand on the plug), and a Sapwood-UI click-through for CP1.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

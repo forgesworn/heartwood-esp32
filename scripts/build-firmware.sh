@@ -2,7 +2,7 @@
 #
 # Build the Heartwood ESP32 firmware for a specific board variant.
 #
-# Usage: scripts/build-firmware.sh {v3|v4|tdisplay|c6} [cargo args...]
+# Usage: scripts/build-firmware.sh {v3|v4|tdisplay|c6|demo} [cargo args...]
 #
 # Boards differ in chip, display, host transport and flash:
 #
@@ -12,6 +12,9 @@
 #               CH9102 UART0. Built for the xtensa-esp32-espidf target.
 #   c6       -- Waveshare ESP32-C6-LCD-1.47: ESP32-C6 (RISC-V), ST7789 172x320
 #               portrait TFT, native USB-JTAG. Built for riscv32imac-esp-espidf.
+#   demo     -- Board-check demo game for the T-Display (NOT the signer): the
+#               heartwood-demo bin with the demo-game feature, same target and
+#               sdkconfig as tdisplay. For pre-flashing boards we hand out.
 #
 # Compile-time board selection is via mutually-exclusive cargo features plus a
 # matching sdkconfig fragment, target triple and MCU -- all set here together
@@ -52,11 +55,19 @@ case "$BOARD" in
     c6|C6|esp32c6)
         FEATURE="c6"; TARGET="riscv32imac-esp-espidf"; MCU="esp32c6"
         ;;
+    demo|DEMO|tdisplay-demo)
+        FEATURE="tdisplay"; TARGET="xtensa-esp32-espidf"; MCU="esp32"
+        BIN="heartwood-demo"; EXTRA_FEATURES=",demo-game"
+        ;;
     *)
-        echo "error: unknown board '$BOARD' (expected v3, v4, tdisplay, or c6)" >&2
+        echo "error: unknown board '$BOARD' (expected v3, v4, tdisplay, c6, or demo)" >&2
         exit 2
         ;;
 esac
+
+# Which binary to build: the signer by default; the demo target overrides.
+BIN="${BIN:-heartwood-esp32}"
+EXTRA_FEATURES="${EXTRA_FEATURES:-}"
 
 FIRMWARE_DIR="$(cd "$(dirname "$0")/../firmware" && pwd)"
 cd "$FIRMWARE_DIR"
@@ -83,7 +94,7 @@ echo "    target                     = ${TARGET}"
 echo "    MCU                        = ${MCU}"
 echo "    ESP_IDF_SDKCONFIG_DEFAULTS = ${ESP_IDF_SDKCONFIG_DEFAULTS}"
 
-cargo build --target "$TARGET" --no-default-features --features "$FEATURE" "$@"
+cargo build --target "$TARGET" --no-default-features --features "${FEATURE}${EXTRA_FEATURES}" --bin "$BIN" "$@"
 
 # Copy the compiled ELF next to a board-tagged name so the operator cannot
 # accidentally flash one board's binary onto another. The ELF path depends on
@@ -95,7 +106,7 @@ for arg in "$@"; do
     fi
 done
 
-SRC="target/${TARGET}/${PROFILE}/heartwood-esp32"
+SRC="target/${TARGET}/${PROFILE}/${BIN}"
 if [[ "$PROFILE" == "release" ]]; then
     DST="target/heartwood-${BOARD}.elf"
 else

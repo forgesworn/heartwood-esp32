@@ -27,6 +27,12 @@ tdisplay = ["st7789"]
 # Note: the display controller is JD9853 (NOT ST7789); the jd9853 module sends
 # the vendor init sequence directly over raw SPI without mipidsi.
 c6 = []
+# Branded board-check demo (deliberately NOT the signer): title screen, button
+# check, and a two-button jump-and-duck game. Ships pre-flashed on boards sold
+# untouched-by-vendor-firmware; proves display + both buttons + USB work while
+# making it obvious the real signer still has to be flashed. Opt-in so normal
+# firmware builds never compile or ship it.
+demo-game = []
 
 [dependencies]
 heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen", "ota-sign", "seed-encrypt"] }
@@ -61,6 +67,11 @@ mipidsi = { version = "0.10", optional = true }
 
 # Logging
 log = "0.4"
+
+[[bin]]
+name = "heartwood-demo"
+path = "src/bin/demo.rs"
+required-features = ["tdisplay", "demo-game"]
 
 [build-dependencies]
 embuild = "0.33"

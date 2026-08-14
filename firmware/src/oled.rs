@@ -1860,37 +1860,53 @@ pub fn show_cancelled(display: &mut Display<'_>) {
     display.flush().ok();
 }
 
-/// Display a "Signed!" confirmation screen.
-pub fn show_signed(display: &mut Display<'_>) {
+/// Display a "SIGNED" confirmation card with what was signed and for whom.
+///
+/// Draws and returns immediately — the response must reach the transport
+/// layer promptly, so the readable hold is enforced afterwards by the
+/// `confirm` module, never by blocking here.
+pub fn show_signed(display: &mut Display<'_>, requester_label: &str, kind: u64) {
     let l = layout(display);
     display.clear_buffer();
 
-    let large = MonoTextStyleBuilder::new()
-        .font(l.font_large())
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
         .text_color(OK)
         .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(l.font_body())
+        .text_color(FG)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(FG)
+        .build();
 
-    Rectangle::new(Point::new(l.sx(0), l.sy(16)), Size::new(l.w as u32, l.s(1) as u32))
+    Text::new("SIGNED", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
+
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(OK))
         .draw(display).ok();
 
-    Text::new("SIGNED", Point::new(l.sx(34), l.sy(38)), large).draw(display).ok();
+    let requester = display_app_label(requester_label);
+    let requester = ellipsize_chars(&requester, l.chars_per_line(l.font_body()));
+    Text::new(&requester, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
-    Rectangle::new(Point::new(l.sx(0), l.sy(44)), Size::new(l.w as u32, l.s(1) as u32))
+    let kind_str = kind_name_line(kind);
+    let kind_str = ellipsize_chars(&kind_str, l.chars_per_line(l.font_body()));
+    Text::new(&kind_str, Point::new(l.sx(2), l.sy(38)), body).draw(display).ok();
+
+    let kind_number = format!("kind {kind}");
+    let kind_number = ellipsize_chars(&kind_number, l.chars_per_line(l.font_small()));
+    Text::new(&kind_number, Point::new(l.sx(2), l.sy(50)), small).draw(display).ok();
+
+    Rectangle::new(Point::new(l.sx(0), l.sy(56)), Size::new(l.w as u32, l.s(4) as u32))
         .into_styled(PrimitiveStyle::with_fill(OK))
         .draw(display).ok();
 
-    Rectangle::new(Point::new(l.sx(0), l.sy(58)), Size::new(l.w as u32, l.s(6) as u32))
-        .into_styled(PrimitiveStyle::with_fill(OK))
-        .draw(display).ok();
-
-    display.flush().ok();
-
-    // Flash the confirmation briefly. The response must be returned to the
-    // transport layer promptly so the NIP-44 re-encryption and serial write
-    // complete before the daemon's 60-second timeout expires. The idle
-    // screen is redrawn by main.rs after the handler returns.
-    FreeRtos::delay_ms(500);
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
 }
 
 /// Display a "Signing..." in-progress screen.

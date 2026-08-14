@@ -328,6 +328,11 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
         // panel RAM — waking into a stale approval countdown reads as a live
         // prompt that ignores the buttons.
         show_idle_identity(ctx);
+    } else if crate::confirm::dismiss() {
+        // A press while a signing confirmation is held dismisses the run
+        // early, back to the idle identity card.
+        ctx.idle_page = 0;
+        show_idle_identity(ctx);
     } else {
         // Awake: a short press pages the idle info carousel.
         ctx.idle_page = (ctx.idle_page + 1) % 3;
@@ -771,6 +776,12 @@ pub fn run_wifi_standalone<'d, 'b>(
     loop {
         crate::wdt::feed();
         network_state_tick(&mut ctx);
+        // Advance held signing confirmations; restore the idle identity card
+        // once the last hold expires.
+        if ctx.display_on && crate::confirm::service(ctx.display) {
+            ctx.idle_page = 0;
+            show_idle_identity(&mut ctx);
+        }
         if ctx.network_restart_at.is_some() {
             // A management response already scheduled a restart. Do not enter
             // any socket read (including another session's degraded blocking

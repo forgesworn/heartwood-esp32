@@ -42,6 +42,7 @@ mod approval;
 mod backup;
 mod board;
 mod button;
+mod confirm;
 mod connslot;
 mod entropy;
 mod entropy_game;
@@ -793,6 +794,13 @@ fn main() {
                         log::info!("Display slept after {}s idle", DISPLAY_TIMEOUT.as_secs());
                     }
 
+                    // Advance held signing confirmations; restore the idle
+                    // card once the last hold expires.
+                    if display_on && confirm::service(&mut display) {
+                        idle_page = 0;
+                        draw_idle_page(idle_page, &mut display, loaded_masters.len() as u8, &mut nvs);
+                    }
+
                     // PRG button press (active-low GPIO 0) wakes the display.
                     // Wake on the press itself, not the release: a CH9102/CP2102
                     // bridge can pin GPIO 0 low after a web-serial flash until
@@ -806,6 +814,10 @@ fn main() {
                             display_on = true;
                             idle_page = 0;
                             log::info!("Display woken by button press");
+                        } else if confirm::dismiss() {
+                            // A press while a signing confirmation is held
+                            // dismisses the run early, back to the idle card.
+                            idle_page = 0;
                         } else {
                             // Awake: a short press pages through the idle
                             // info carousel (status / network / device).
@@ -920,7 +932,11 @@ fn main() {
                     if !loaded_masters.is_empty() {
                         policy_engine.persist_slots(&mut nvs, loaded_masters[0].slot);
                     }
-                    oled::show_boot(&mut display, loaded_masters.len() as u8);
+                    // Leave a held signing confirmation readable — the poll
+                    // loop restores the idle card when the hold expires.
+                    if !confirm::active() {
+                        oled::show_boot(&mut display, loaded_masters.len() as u8);
+                    }
                 }
             }
 

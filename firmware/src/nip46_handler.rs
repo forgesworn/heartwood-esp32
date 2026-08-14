@@ -571,14 +571,28 @@ pub fn handle_parsed_request(
             match tier {
                 heartwood_common::policy::ApprovalTier::AutoApprove => {
                     log::info!("sign_event: auto-approved by policy");
-                    crate::oled::show_auto_signed(display, &requester_label, event.kind);
+                    crate::confirm::present(
+                        display,
+                        crate::confirm::Card {
+                            requester: requester_label.clone(),
+                            kind: event.kind,
+                            auto: true,
+                        },
+                    );
                     match handle_auto_sign(master_secret, master_mode, secp, &request, event) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),
                     }
                 }
                 heartwood_common::policy::ApprovalTier::OledNotify => {
-                    crate::oled::show_auto_signed(display, &requester_label, event.kind);
+                    crate::confirm::present(
+                        display,
+                        crate::confirm::Card {
+                            requester: requester_label.clone(),
+                            kind: event.kind,
+                            auto: true,
+                        },
+                    );
                     match handle_auto_sign(master_secret, master_mode, secp, &request, event) {
                         Ok(json) => json,
                         Err(e) => build_error_json(&request.id, -4, &e),
@@ -1059,7 +1073,14 @@ fn handle_sign_event(
             ) {
                 Ok(signed) => match build_sign_reply(request, &signed) {
                     Ok(json) => {
-                        crate::oled::show_signed(display);
+                        crate::confirm::present(
+                            display,
+                            crate::confirm::Card {
+                                requester: requester_label.to_string(),
+                                kind,
+                                auto: false,
+                            },
+                        );
                         json
                     }
                     Err(e) => {

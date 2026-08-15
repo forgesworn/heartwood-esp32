@@ -1034,6 +1034,13 @@ pub fn show_network_status(display: &mut Display<'_>, state: NetworkDisplayState
     show_status_card(display, "NETWORK", title, hint, colour);
 }
 
+/// Green outcome card for a completed settings change — the success twin of
+/// `show_change_approval`, framed like the network status cards. A change
+/// confirmation never rides the red fault screen.
+pub fn show_change_done(display: &mut Display<'_>, title: &str, hint: &str) {
+    show_status_card(display, "DONE", title, hint, OK);
+}
+
 /// Display an error message on the OLED.
 pub fn show_error(display: &mut Display<'_>, msg: &str) {
     let l = layout(display);

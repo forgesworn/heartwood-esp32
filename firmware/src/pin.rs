@@ -185,7 +185,7 @@ pub fn handle_pin_unlock(
         log::info!("PIN verified — seeds decrypted, device unlocked");
         *failed_attempts = 0;
         clear_failed_attempts(nvs);
-        crate::oled::show_error(display, "Unlocked!");
+        crate::oled::show_change_done(display, "Unlocked", "");
         esp_idf_hal::delay::FreeRtos::delay_ms(500);
         protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
         true
@@ -269,15 +269,15 @@ pub fn handle_set_pin(
     }
 
     let outcome = if payload.is_empty() {
-        disable_encryption(nvs, masters).map(|()| "PIN removed!")
+        disable_encryption(nvs, masters).map(|()| "PIN removed")
     } else {
-        enable_encryption(nvs, masters, payload).map(|()| "PIN set!")
+        enable_encryption(nvs, masters, payload).map(|()| "PIN set")
     };
 
     match outcome {
         Ok(msg) => {
             log::info!("SET_PIN: {msg}");
-            crate::oled::show_error(display, msg);
+            crate::oled::show_change_done(display, msg, "");
             esp_idf_hal::delay::FreeRtos::delay_ms(1000);
             protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
         }
@@ -386,15 +386,15 @@ pub fn handle_vault_set(
     }
 
     let outcome = if payload.is_empty() {
-        disable_encryption(nvs, masters).map(|()| "Vault disabled!")
+        disable_encryption(nvs, masters).map(|()| "Vault disabled")
     } else {
-        enable_encryption(nvs, masters, payload).map(|()| "Vault enabled!")
+        enable_encryption(nvs, masters, payload).map(|()| "Vault enabled")
     };
 
     match outcome {
         Ok(msg) => {
             log::info!("VAULT_SET: {msg}");
-            crate::oled::show_error(display, msg);
+            crate::oled::show_change_done(display, msg, "");
             esp_idf_hal::delay::FreeRtos::delay_ms(1000);
             protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
         }
@@ -429,7 +429,7 @@ pub fn handle_vault_unlock(
         // A prior PIN-attempt counter is meaningless after a successful
         // vault unlock — clear it so a later PIN attempt starts fresh.
         clear_failed_attempts(nvs);
-        crate::oled::show_error(display, "Unlocked!");
+        crate::oled::show_change_done(display, "Unlocked", "");
         esp_idf_hal::delay::FreeRtos::delay_ms(500);
         protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
         true

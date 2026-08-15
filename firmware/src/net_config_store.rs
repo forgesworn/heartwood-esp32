@@ -641,7 +641,10 @@ fn ack_and_reboot_change(
     display: &mut crate::oled::Display<'_>,
     result: &str,
 ) -> ! {
-    crate::oled::show_result(display, result);
+    // show_result blocked for two seconds; the styled card does not, so
+    // keep the same on-screen dwell before the reboot wipes it.
+    crate::oled::show_change_done(display, result, "Rebooting");
+    esp_idf_hal::delay::FreeRtos::delay_ms(2000);
     protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
     esp_idf_hal::delay::FreeRtos::delay_ms(500);
     unsafe { esp_idf_svc::sys::esp_restart() }
@@ -764,7 +767,7 @@ pub fn handle_set_operator(
         }
     };
     match persist_local_replacement(nvs, &previous_raw, &replacement_raw) {
-        Ok(_) => ack_and_reboot_change(usb, display, "Operator changed\nRebooting..."),
+        Ok(_) => ack_and_reboot_change(usb, display, "Operator changed"),
         Err(error) => {
             log::error!("Operator rotation storage failed: {error}");
             protocol::write_frame(usb, FRAME_TYPE_NACK, error.as_bytes());

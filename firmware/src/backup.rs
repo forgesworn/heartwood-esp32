@@ -215,7 +215,7 @@ pub fn handle_import(
     }
 
     log::info!("Backup import complete");
-    crate::oled::show_error(display, "Restore\ncomplete!");
+    crate::oled::show_change_done(display, "Restore complete", "App pairings imported");
     esp_idf_hal::delay::FreeRtos::delay_ms(1500);
     protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x01]);
 }

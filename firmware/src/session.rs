@@ -125,7 +125,7 @@ pub fn handle_set_bridge_secret(
     match write_bridge_secret(nvs, &secret) {
         Ok(()) => {
             log::info!("Bridge secret written to NVS");
-            crate::oled::show_error(display, "Bridge secret\nset!");
+            crate::oled::show_change_done(display, "Bridge secret set", "Bridge can authenticate");
             esp_idf_hal::delay::FreeRtos::delay_ms(1500);
             protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
         }

@@ -657,6 +657,19 @@ Driver: `sapwood/hardware-escalation.test.ts` (committed), run with
   filter, not an array (an array becomes a REQ the relay NACKs with
   "could not parse command"); the bench subscribes with raw WebSocket
   REQs and publishes via SimplePool.
+- **Countdown bar visually confirmed 2026-08-15 on the T-Display**
+  (0.17.0, two-button board): the SET_BRIDGE_SECRET approval drew the
+  draining bar with the `hold lower=yes up=no` hint, and the hold
+  progress ran to an approve. Same pass surfaced the next polish item —
+  change SUCCESS messages were rendered on the red `show_error` fault
+  screen ("Bridge secret set!", "PIN set!", "Unlocked!" etc.); all now
+  use the styled green `show_change_done` card (DONE header + title +
+  hint, network-card framing), verified live on the T-Display.
+  Bench access note: the T-Display's bridge secret was re-keyed under
+  physical approval to `~/heartwood-bench/tdisplay-bridge.secret`, so
+  future benches can open a session on this board. The desk Heltec still
+  runs the pre-success-card 0.17.0 build — reflash it at the §11b
+  session.
 
 ### 11b. Interactive half — NEEDS A DESK SESSION (button + operator console)
 

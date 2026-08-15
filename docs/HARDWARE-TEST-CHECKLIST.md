@@ -618,6 +618,26 @@ vault-encrypted at rest), harness `sapwood/hardware-recovery.test.ts`
   CONNSLOT_UPDATE ceiling confirm) run their timeout without the usual
   countdown graphics.
 
+### CP2: SIGNED OFF (joint gate closed 2026-08-15)
+
+Both halves of the spec §12 CP2 checkpoint have now run on real hardware:
+
+- **Path B (words-only, this repo's half):** 6/6 above (2026-08-14).
+- **Path A (live phone, app side):** passed 2026-08-15 on the orange
+  T-Display (0.16.0, last-green c064029) — full family enrolled 6/6 with
+  the one-way strip, every derived npub matching the manifest, venue-entry
+  NP signing on-device, persona kind-0 publish/retract on the persona
+  slot, and a child app re-paired straight to the device via a
+  persona-addressed bunker URI and signing (five child-authored events
+  verified on the relay, no guardian phone in the loop). Full record: the
+  CP2 sign-off note in the signet-app branch doc.
+
+Firmware findings from the Path A run tracked as #64 (approval window
+blocks the transports; unapproved sign_events serialise), #65
+(unprovisioned board watchdog reboot on idle serial) and #66 (first-boot
+setup screen rejects SET_NET_CONFIG). The persona-addressed pairing mint
+(D2) is recorded in the signet-plans design doc.
+
 ## 11. C4 escalation + C5 audit rail (v0.17.0; button-free half bench-run 2026-08-15)
 
 Firmware under test: `heartwood-esp32` 0.17.0 (C4 park/notify/resolve,

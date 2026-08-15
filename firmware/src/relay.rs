@@ -2616,10 +2616,16 @@ fn emit_gift_wrap(
     // Rumors here are small (~600 B of tags); the outermost plaintext is the
     // serialised seal, roughly 1.5x the rumor after one NIP-44+base64 round.
     // Budget conservatively at 2x + envelope overhead and skip when tight.
+    //
+    // black_box stops LLVM folding the two constants into `2*len + 2048`:
+    // 2048 is one past xtensa's signed 12-bit `movi` range and hits an
+    // instruction-selection hole in the esp 1.94/1.95 toolchains — the
+    // release build dies with `rustc-LLVM ERROR: Cannot select: i32 =
+    // Constant<2048>` (#63). Semantics are identical.
     let rumor_estimate = rumor.content.len()
         + rumor.tags.iter().flatten().map(String::len).sum::<usize>()
         + 512;
-    if !response_transportable(rumor_estimate * 2 + 1_024) {
+    if !response_transportable(rumor_estimate * 2 + core::hint::black_box(1_024)) {
         return Err("low heap; emission skipped".into());
     }
 

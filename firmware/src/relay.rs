@@ -5369,6 +5369,12 @@ fn dispatch_mgmt(
                 "relay": ctx.relay_url,
                 "capabilities": [
                     "client_policy_v2",
+                    // Schema addendum §1.5 family flags (escalate,
+                    // petition_on_deny, audit_child_wrap, bound_identity)
+                    // accepted on create_client_v2 / nostrconnect_v2 /
+                    // update_client — the C3 compiler push feature-detects
+                    // on this entry.
+                    "client_policy_flags_v1",
                     "atomic_nostrconnect_policy_v2",
                     "staged_network_config_v1",
                     "mutation_challenge_v1",

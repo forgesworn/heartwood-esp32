@@ -271,6 +271,37 @@ function run(script, args, timeoutMs) {
 let slotIndex = null
 let slotFingerprint = null
 let client = null
+/** Extra slots minted mid-run (e.g. the second client), revoked at the end. */
+const extraSlots = []
+
+/** Mint a TOFU slot and bind a fresh client to it.
+ *
+ * A client that has NOT done this is refused outright as an unknown client,
+ * so it never reaches an approval card — which made the queue check pass
+ * against both firmwares while testing nothing. Anything that has to wait
+ * its turn for the button must be properly bound first.
+ */
+async function mintBoundClient(name) {
+  const created = await mgmtMutate('create_client', {
+    label: `card-bench-${name}-${randomBytes(2).toString('hex')}`,
+  })
+  if (created.signing_approved !== false) {
+    throw new Error('minted slot is already signing-approved')
+  }
+  const target = created.npub_hex ?? MASTER
+  const c = new Client(name, target)
+  await c.open()
+  const connected = await within(c.send('connect', [target, created.secret ?? '']).answered, 20000)
+  if (!connected || connected.error) {
+    throw new Error(`connect failed for ${name}: ${connected?.error ?? 'timeout'}`)
+  }
+  return {
+    client: c,
+    target,
+    slotIndex: created.slot_index,
+    fingerprint: created.secret_fingerprint,
+  }
+}
 
 /** Mint a slot that needs the button: in-ceiling kind, auto_approve false. */
 async function setup() {
@@ -484,8 +515,13 @@ function phaseStamp(ask, answer) {
 
 async function phaseBatch() {
   const asks = [raiseCard(), raiseCard(), raiseCard()]
+  // Long enough for the FAILING shape as well as the passing one: collapsed
+  // onto one card these answer together in a single window, but serialised —
+  // which is what the fix removes — they take one window each. Waiting only
+  // for the passing shape reports "not all answered", which says nothing
+  // about how far apart they were.
   const answers = await Promise.all(
-    asks.map((a) => within(a.answered, (WINDOW + 25) * 1000)),
+    asks.map((a) => within(a.answered, (WINDOW * asks.length + 30) * 1000)),
   )
   const all = answers.every(Boolean)
   const spread = all ? Math.max(...answers.map((a) => a.at)) - Math.min(...answers.map((a) => a.at)) : null
@@ -506,26 +542,33 @@ async function phaseBatch() {
   )
 }
 
-async function phaseQueue(targetHex) {
+async function phaseQueue() {
+  // B needs a slot of its own, or it is refused as an unknown client and
+  // never reaches a card at all.
+  const b = await mintBoundClient('B')
+  extraSlots.push({ slotIndex: b.slotIndex, fingerprint: b.fingerprint })
+
   const a = raiseCard()
   await sleep(2000)
-  const b = new Client('B', targetHex)
-  await b.open()
-  const bAsk = b.send('sign_event', [noteTemplate('second client')])
+  const bAsk = b.client.send('sign_event', [noteTemplate('second client')])
   const [aAnswer, bAnswer] = await Promise.all([
-    within(a.answered, (WINDOW * 2 + 30) * 1000),
-    within(bAsk.answered, (WINDOW * 2 + 30) * 1000),
+    within(a.answered, (WINDOW * 3 + 30) * 1000),
+    within(bAsk.answered, (WINDOW * 3 + 30) * 1000),
   ])
-  const ok = aAnswer && bAnswer && bAnswer.at > aAnswer.at
+  const gap = aAnswer && bAnswer ? Math.round((bAnswer.at - aAnswer.at) / 1000) : null
+  // B must not be answered while A's card is still up — that would mean its
+  // decision was taken without ever being shown — and must then get a window
+  // of its own rather than being swept up in A's.
+  const ok = Boolean(aAnswer && bAnswer && bAnswer.at > aAnswer.at)
   record(
     10,
     'a second client waits its turn',
-    Boolean(ok),
+    ok,
     aAnswer && bAnswer
-      ? `B answered ${Math.round((bAnswer.at - aAnswer.at) / 1000)} s after A`
+      ? `A "${aAnswer.error ?? 'ok'}", then B "${bAnswer.error ?? 'ok'}" ${gap} s later`
       : 'one of them never answered',
   )
-  b.close()
+  b.client.close()
 }
 
 async function phaseBusy() {
@@ -543,19 +586,64 @@ async function phaseBusy() {
   await Promise.all(asks.map((a) => within(a.answered, (WINDOW + 20) * 1000)))
 }
 
+/** Revoke one slot, retrying while the signer is busy with a card. */
+async function revokeSlot(index, fingerprint) {
+  for (const attempt of [1, 2, 3]) {
+    try {
+      await mgmtMutate('revoke_client', {
+        slot_index: index,
+        expected_secret_fingerprint: fingerprint,
+      })
+      note(`slot ${index} revoked`)
+      return
+    } catch (e) {
+      if (attempt === 3) {
+        note(
+          `could not revoke slot ${index} after ${attempt} attempts (${e.message}). ` +
+            `Revoke it by hand: scripts/mgmt-request.mjs --method revoke_client ` +
+            `--challenge --params '{"slot_index":${index},` +
+            `"expected_secret_fingerprint":"${fingerprint}"}'`,
+        )
+        return
+      }
+      note(`revoke attempt ${attempt} failed (${e.message}); waiting for the signer`)
+      await sleep((WINDOW + 5) * 1000)
+    }
+  }
+}
+
 async function cleanup() {
+  for (const extra of extraSlots.splice(0)) {
+    if (!KEEP_SLOT) await revokeSlot(extra.slotIndex, extra.fingerprint)
+  }
   if (slotIndex === null || KEEP_SLOT) {
     if (KEEP_SLOT) note(`slot ${slotIndex} kept (--keep-slot)`)
     return
   }
-  try {
-    await mgmtMutate('revoke_client', {
-      slot_index: slotIndex,
-      expected_secret_fingerprint: slotFingerprint,
-    })
-    note(`slot ${slotIndex} revoked`)
-  } catch (e) {
-    note(`could not revoke slot ${slotIndex}: ${e.message}`)
+  // The operator channel goes unanswered while a card owns a blocked signer,
+  // so a cleanup straight after a phase can time out and strand the slot.
+  // Retry with room for a whole window to drain first.
+  for (const attempt of [1, 2, 3]) {
+    try {
+      await mgmtMutate('revoke_client', {
+        slot_index: slotIndex,
+        expected_secret_fingerprint: slotFingerprint,
+      })
+      note(`slot ${slotIndex} revoked`)
+      return
+    } catch (e) {
+      if (attempt === 3) {
+        note(
+          `could not revoke slot ${slotIndex} after ${attempt} attempts (${e.message}). ` +
+            `Revoke it by hand: scripts/mgmt-request.mjs --method revoke_client ` +
+            `--challenge --params '{"slot_index":${slotIndex},` +
+            `"expected_secret_fingerprint":"${slotFingerprint}"}'`,
+        )
+        return
+      }
+      note(`revoke attempt ${attempt} failed (${e.message}); waiting for the signer`)
+      await sleep((WINDOW + 5) * 1000)
+    }
   }
 }
 
@@ -592,7 +680,7 @@ try {
     if (wanted('stamp')) phaseStamp(ask, answer)
   }
   if (wanted('batch')) await phaseBatch()
-  if (wanted('queue')) await phaseQueue(targetHex)
+  if (wanted('queue')) await phaseQueue()
   if (wanted('busy')) await phaseBusy()
 
   await cleanup()

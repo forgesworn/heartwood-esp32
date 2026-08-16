@@ -582,8 +582,18 @@ async function phaseBusy() {
     busy.length > 0,
     `${busy.length} of 10 answered busy promptly`,
   )
-  // Let whatever is still on screen expire before the next phase.
-  await Promise.all(asks.map((a) => within(a.answered, (WINDOW + 20) * 1000)))
+  // Drain before handing back. On a signer that queues these instead of
+  // refusing them — which is the whole point of the check, and what pre-#64
+  // firmware does — they run a window EACH, so this is minutes, not one
+  // window. Leaving early only moves the problem: the operator channel is
+  // unanswered while the signer works through them, so cleanup then fails
+  // and strands the slot (seen on the bench 2026-08-16).
+  const drain = (WINDOW * asks.length + 60) * 1000
+  const outstanding = asks.filter((a) => !a.settled).length
+  if (outstanding) {
+    note(`waiting out ${outstanding} unanswered ask(s) before cleanup`)
+  }
+  await Promise.all(asks.map((a) => within(a.answered, drain)))
 }
 
 /** Revoke one slot, retrying while the signer is busy with a card. */

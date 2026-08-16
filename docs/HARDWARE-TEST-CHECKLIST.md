@@ -844,9 +844,19 @@ thing. All three of the issue's bullets reproduced:
 | 1 cable under a card | FAIL | 4 probes, worst 10090 ms (want < 6000) |
 | 2 relay under a card | FAIL | 2 probes, neither answered within 12 s |
 | 6 card expires | PASS | `timeout` after ~32 s — the control |
+| 8 batch shares a card | FAIL | three same-kind asks answered **64 s apart** — a window each |
+| 9 one expiry answers all | FAIL | three separate `timeout`s, not one decision |
+| 10 second client waits | PASS | A answered, then B 32 s later — ordering already holds |
+| 11 caps refuse | FAIL | 0 of 10 answered busy; all ten queued and ran a window each |
 | 14 late reply stamp | FAIL | reply `created_at` 0 s after a request answered 32 s later |
 
-These four must flip to PASS on the fixed firmware (step 6 staying green).
+Step 8's 64 s is issue #64's second bullet on hardware: two full serialised
+windows for what the operator sees as one decision. Every FAIL above must
+flip on the fixed firmware, with 6 and 10 staying green.
+
+Step 11 is slow to run against pre-#64 firmware for the same reason — ten
+queued asks take a window each, so the phase spends five minutes draining
+before it can clean up. That is expected, not a hang.
 
 ### Bench note — run the machine-driven phases unattended
 

@@ -691,7 +691,7 @@ Driver: `sapwood/hardware-escalation.test.ts` (committed), run with
   runs the pre-success-card 0.17.0 build — reflash it at the §11b
   session.
 
-### 11b. Interactive half — NEEDS A DESK SESSION (button + operator console)
+### 11b. Interactive half — PASSED 2026-08-16 (steps 2–9 + 11, machine-driven; T-Display pass owed for CP5)
 
 Escalation flags can only be installed by an operator (`create_client_v2`
 / `update_client` / `resolve_approval` policy writes) or a button-confirmed
@@ -735,6 +735,75 @@ USB `CONNSLOT_UPDATE` (0x17.0 carries `escalate`, `petition_on_deny`,
     persona (the app pins the persona as its signer). A persona of a
     different master, or junk hex, is rejected without touching the slot
     table. Gate on `pairing_identity_v1` in `get_status.capabilities`.
+
+### Bench record — 2026-08-16, desk Heltec V4, machine-driven over the operator channel
+
+One button press total (SET_OPERATOR install of a fresh bench operator key —
+`scripts/set-operator.mjs`, key files in the bench folder). Everything else ran
+headless over kind 24134 (`~/heartwood-bench/mgmt-request.mjs`) plus a bench
+NIP-46 relay client (`nip46-client.mjs`), with the serial tap as the
+machine-verifiable witness. Steps 2–9 and 11 PASSED:
+
+- **Step 1 (flags install)**: via operator `create_client_v2`/`update_client`
+  rather than the button-confirmed CONNSLOT_UPDATE (that variant and its
+  countdown bar were already confirmed on the T-Display, §11a). Semantics
+  pinned on hardware: a strict slot's out-of-ceiling kind is a strict DENY
+  (petition territory), the parking tier is an in-ceiling kind with
+  `auto_approve: false`; the exact envelope accepts only TOFU-safe methods,
+  so a manager slot (heartwood_* extensions) is minted v1 + legacy
+  `update_client` widen.
+- **Step 2 (fast path)**: parked (serial: "parked interactive sign_event …
+  awaiting guardian verdict"), loop stayed live (operator `get_status`
+  answered mid-park), notice published; verdict `approve-once` at ~8 s →
+  client received the persona-signed event at 13.6 s, well inside its wait.
+  Notice unwrapped via the NP oracle: rumor kind 31001, unsigned, tags
+  exactly `t:approval / d:<client>:<seq> / park / client / identity /
+  method / k / park-ttl:600`; wrap expiration 24 h.
+- **Step 3 (slow path)**: client timed out at 110 s, late verdict →
+  `{"park":"live","applied":"completed"}`, retry sailed through silently
+  (881 ms) on the transient allow. Measured semantics: the approve-once
+  allow is 600 s per (client, kind) — a second same-kind ask inside the
+  window auto-signs rather than re-parking.
+- **Step 4 (expired park)**: park left unresolved; sweep logged "park for
+  sign_event expired unresolved" at TTL; verdict after →
+  `{"park":"expired","applied":"window"}`; retry sailed (1.1 s).
+- **Step 5 (reboot mid-park)**: app-only reflash as the power-cycle; park
+  cleared; post-reboot verdict → `{"park":"expired","applied":"none"}`.
+- **Step 6 (approve-remember)**: verdict carried a full v2 policy → parked
+  client completed at 13.3 s, policy replaced durably (list_clients echoes
+  kinds/auto/escalate/petition/bound_identity exactly), follow-up sign
+  silent at 828 ms.
+- **Step 7 (deny)**: parked client received "user denied" at 11.2 s;
+  verdict answered `{"park":"live","applied":"none"}`.
+- **Step 8 (petitions)**: three out-of-ceiling asks → three `unauthorised`
+  (~1.1 s each, deny enforced), three petition notices coalescing on one
+  replaceable `d` (`<client>:<kind>`) with `count` climbing 1 → 2 → 3;
+  wrap expiration ~7 days.
+- **Step 9 (child wrap)**: `audit_child_wrap` + `bound_identity` → one
+  silent in-policy sign fanned the same rumor to BOTH the guardian NP and
+  the child slot's client pubkey. The child copy was decrypted host-side
+  (client key held): seal kind 13 signed by the real NP (verifies), rumor
+  kind 31000, unsigned, `t:audit / d:<dep>:<stamp> / k:30078 /
+  outcome:auto-approved`.
+- **Step 11 (D2 mint)**: all assertions above ran verbatim — mint addressed
+  to the persona, `bound_identity` defaulted, `get_public_key` = persona
+  over the minted pairing, junk hex / cross-master persona / v1-with-identity
+  all rejected cleanly.
+- Step 10 (T-Display pass) still owed before CP5.
+
+**Findings:** (a) #67 — a dependant persona whose registry chunk write
+failed at derive time was served all session then evaporated at reboot
+(the derive had answered success); the free-entry count looked healthy, so
+suspect blob-page pressure on this board's legacy 24K NVS. (b) Fixed on
+main same day: a persona persisted by the management path's retry hook
+(park completion) never joined the live `#p` filters until reboot — the
+NP oracle was unreachable mid-session because of it. (c) Creating an 11th
+connection slot failed cleanly at NVS persist ("could not persist client
+creation; request was not applied") with a held rollback — the practical
+slot ceiling on the legacy table sits below MAX_CONNECT_SLOTS. Cleanup:
+bench slots revoked (NVS 548/756 used, better than found);
+`natural-person` deliberately left registered — C4 notices wrap to it, so
+the guardian NP should stay addressable.
 
 ## Notes
 

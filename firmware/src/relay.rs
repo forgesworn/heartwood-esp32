@@ -2418,7 +2418,20 @@ fn process_event(
 
     let result = if ev.kind == MGMT_KIND {
         match masters::find_by_pubkey(ctx.masters, &target_pk) {
-            Some(master_idx) => handle_mgmt_event(s, &ev, ctx, master_idx, pool),
+            Some(master_idx) => {
+                // The mgmt dispatch can also grow the persona registry — a
+                // park completion's persist hook retries cache entries whose
+                // first write failed (bench-observed: the NP auto-derived for
+                // a notice under NVS pressure). Mirror the 24133 path's
+                // growth check or the fresh persona never joins the live
+                // `#p` filters until reboot.
+                let personas_before = ctx.personas.len();
+                let outcome = handle_mgmt_event(s, &ev, ctx, master_idx, pool);
+                if ctx.personas.len() != personas_before {
+                    ctx.resubscribe_needed = true;
+                }
+                outcome
+            }
             None => {
                 log::warn!("[relay] mgmt EVENT not addressed to a known master; ignoring");
                 Ok(())

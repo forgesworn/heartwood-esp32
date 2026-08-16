@@ -793,11 +793,12 @@ pub fn handle_parsed_request(
             let len_before = cache.identities.len();
             match cache.derive_and_cache(&derive_secret, purpose, index, None) {
                 Ok(idx) => {
-                    // The post-request persistence loop will write any cached
-                    // identity that is not yet in the registry. Refuse cleanly
-                    // here — never mid-write — when the registry cannot take
-                    // it, dropping a just-cached identity so the loop does not
-                    // retry a doomed write on every subsequent request.
+                    // Persist a NEW registry entry before answering, and fail
+                    // the request when the write fails: the capacity pre-check
+                    // counts entries, but a chunk write can still fail under
+                    // blob-page pressure, and a success answer for an
+                    // unpersisted identity evaporates at reboot (#67). The
+                    // post-request sweep remains as a retry for strays only.
                     let pubkey = cache.identities[idx].public_key;
                     if !crate::personas::contains_pubkey(personas, &pubkey) {
                         if let Err(full) = crate::personas::capacity_check(nvs) {
@@ -807,6 +808,31 @@ pub fn handle_parsed_request(
                             log::warn!("heartwood_derive: refused — {full}");
                             return build_error_json(&request.id, -4, full);
                         }
+                        let (purpose, index, name) = {
+                            let id = &cache.identities[idx];
+                            (id.purpose.clone(), id.index, id.persona_name.clone())
+                        };
+                        if let Err(e) = crate::personas::add(
+                            nvs,
+                            master_slot,
+                            &purpose,
+                            index,
+                            name.as_deref(),
+                            &pubkey,
+                        ) {
+                            if cache.identities.len() > len_before {
+                                cache.identities.truncate(len_before);
+                            }
+                            log::warn!("heartwood_derive: registry write failed — {e}");
+                            return build_error_json(&request.id, -4, e);
+                        }
+                        personas.push(crate::personas::LoadedPersona {
+                            master_slot,
+                            purpose,
+                            index,
+                            name,
+                            pubkey,
+                        });
                     }
                     let id = &cache.identities[idx];
                     let result = serde_json::json!({
@@ -855,6 +881,9 @@ pub fn handle_parsed_request(
                     // Same clean storage-full refusal as heartwood_derive:
                     // re-deriving an already-registered persona still succeeds
                     // (it is a lookup), only a NEW registry entry is refused.
+                    // A new entry is persisted before answering and the
+                    // request fails when the write fails (#67) — a success
+                    // answer must mean the persona survives reboot.
                     let pubkey = cache.identities[idx].public_key;
                     if !crate::personas::contains_pubkey(personas, &pubkey) {
                         if let Err(full) = crate::personas::capacity_check(nvs) {
@@ -864,6 +893,31 @@ pub fn handle_parsed_request(
                             log::warn!("heartwood_derive_persona: refused — {full}");
                             return build_error_json(&request.id, -4, full);
                         }
+                        let (reg_purpose, reg_index, reg_name) = {
+                            let id = &cache.identities[idx];
+                            (id.purpose.clone(), id.index, id.persona_name.clone())
+                        };
+                        if let Err(e) = crate::personas::add(
+                            nvs,
+                            master_slot,
+                            &reg_purpose,
+                            reg_index,
+                            reg_name.as_deref(),
+                            &pubkey,
+                        ) {
+                            if cache.identities.len() > len_before {
+                                cache.identities.truncate(len_before);
+                            }
+                            log::warn!("heartwood_derive_persona: registry write failed — {e}");
+                            return build_error_json(&request.id, -4, e);
+                        }
+                        personas.push(crate::personas::LoadedPersona {
+                            master_slot,
+                            purpose: reg_purpose,
+                            index: reg_index,
+                            name: reg_name,
+                            pubkey,
+                        });
                     }
                     let id = &cache.identities[idx];
                     let result = serde_json::json!({

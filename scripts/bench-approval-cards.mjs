@@ -318,6 +318,35 @@ function raiseCard(c = client) {
   return c.send('sign_event', [noteTemplate('approval card bench')])
 }
 
+/** Refuse to run at all if the device approves without anyone pressing.
+ *
+ * A PRG button held down — something resting on it, a stuck switch, a host
+ * pinning GPIO 0 — reads as a completed 2-second hold to the approval loop,
+ * so every card self-approves within a couple of seconds. Nothing else here
+ * can tell that apart from a working signer: the cards resolve, the batch
+ * answers together, and the whole run reports green while the device is
+ * signing unattended. Caught on the bench 2026-08-16, after several
+ * requests were signed with nobody at the desk.
+ */
+async function assertNobodyIsHoldingTheButton() {
+  const ask = raiseCard()
+  const answer = await within(ask.answered, 12000)
+  if (answer && !answer.error) {
+    throw new Error(
+      'the device SIGNED a button-required request with no press — the PRG ' +
+        'button is being held down (check the desk), so no approval test here ' +
+        'means anything until that is cleared',
+    )
+  }
+  if (answer?.error) {
+    note(`pre-flight ask answered "${answer.error}" — no card was raised`)
+    return
+  }
+  note('pre-flight: card is up and unapproved, as it should be')
+  // Let it expire so the phases start from a clear screen.
+  await within(ask.answered, (WINDOW + 20) * 1000)
+}
+
 /** Refuse to judge a "while a card is up" step when no card is up. Without
  *  this an ask that was answered outright — auto-approved, or refused before
  *  it ever reached the button — makes every liveness probe pass trivially,
@@ -394,6 +423,11 @@ async function phaseRelay(targetHex, ask) {
   return ask
 }
 
+// Relies on the device being unlocked, which getting this far already proves:
+// the relay only answers an unlocked signer. That matters because nip46-sign
+// authenticates the bridge when it finds a locked device, and the plaintext
+// USB path NACKs while bridge-authenticated — which would look exactly like
+// the refusal being tested here.
 async function phaseRefuse(ask) {
   if (!cardUp(16, 'USB signing is refused, not painted over the card', ask)) return ask
   const probe = await run(
@@ -528,6 +562,7 @@ const wanted = (name) => !ONLY || ONLY === name
 try {
   await openMgmt()
   const targetHex = await setup()
+  await assertNobodyIsHoldingTheButton()
 
   // A card each: the liveness probes run for as long as their card is up, so
   // they cannot share one. Each phase leaves its card expired behind it.

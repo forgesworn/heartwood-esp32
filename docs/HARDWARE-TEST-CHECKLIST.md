@@ -848,6 +848,35 @@ thing. All three of the issue's bullets reproduced:
 
 These four must flip to PASS on the fixed firmware (step 6 staying green).
 
+### Bench finding — a held PRG button silently approves everything
+
+Part-way through the same session the desk V4 began **signing button-required
+requests with nobody at the desk**, ~5 s after each arrived. The serial tap
+settles what happened:
+
+```
+15:54:12.985 NIP-46 request: method=sign_event id=2bb067e3 master_slot=0
+15:54:18.492 sign_event: approved
+```
+
+`sign_event: approved` is only reachable when the approval loop sees GPIO 0
+low continuously for two seconds. There were no press, wake or carousel lines
+anywhere in the log, which fits a pin that has been low the whole time rather
+than one being pressed: the #61 latch fires on a falling *edge*, so a
+already-low pin produces no edge, while `is_low()` is true immediately.
+
+Cause is on the desk, not in the firmware — a stuck switch, something resting
+on the board, or a host pinning the pin (the failure mode the wake-on-press
+fix in section 8 was written for). **Clear it before running any approval
+test**, and treat a run that predates clearing it as void: a held button makes
+every card self-approve, so cards resolve, batches answer together, and the
+whole section reports green while the device signs unattended.
+
+`bench-approval-cards.mjs` now refuses to start when it sees this — it raises
+one card at the beginning and aborts if the device signs it. Anything with a
+physical-approval step (sections 7, 8, 11b, 12) should be considered suspect
+until the pre-flight passes.
+
 The point of every step is that **the rest of the device keeps working while
 the card is up** — that is the whole fix, and it cannot be seen from the card
 itself.

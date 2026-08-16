@@ -180,7 +180,11 @@ if (!reply) {
   process.exit(1)
 }
 if (reply.type === NACK) {
-  console.error(`NACK after ${elapsed}s.`)
+  // The firmware puts its reason in the NACK payload (e.g. "approval on
+  // screen" when a relay card owns the display). Printing only "NACK" threw
+  // that away and left the operator guessing.
+  const reason = reply.payload.length ? `: ${reply.payload.toString()}` : ''
+  console.error(`NACK after ${elapsed}s${reason}`)
   process.exit(1)
 }
 const json = JSON.parse(reply.payload.toString())

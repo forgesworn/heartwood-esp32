@@ -510,8 +510,16 @@ fn main() {
         oled::show_provision_wait(&mut display);
 
         loop {
-            wdt::feed();
-            let frame = protocol::read_frame(&mut usb);
+            // A fully blocking read starves the task watchdog on an idle
+            // serial line — an untouched unprovisioned board rebooted every
+            // watchdog period and wiped whatever card was on screen (#65).
+            // Poll with a bounded wait and feed between windows instead.
+            let frame = loop {
+                wdt::feed();
+                if let Some(frame) = protocol::try_read_frame(&mut usb, 1000) {
+                    break frame;
+                }
+            };
             match frame.frame_type {
                 FRAME_TYPE_FIRMWARE_INFO => {
                     protocol::write_frame(
@@ -618,8 +626,15 @@ fn main() {
         // does not exist yet in the locked loop — track it locally.
         let mut vault_authed = false;
         loop {
-            wdt::feed();
-            let frame = protocol::read_frame(&mut usb);
+            // Same idle-line watchdog starvation as the provision wait (#65):
+            // a locked USB-bridged board left alone must sit on the locked
+            // screen indefinitely, not watchdog-cycle every period.
+            let frame = loop {
+                wdt::feed();
+                if let Some(frame) = protocol::try_read_frame(&mut usb, 1000) {
+                    break frame;
+                }
+            };
             match frame.frame_type {
                 FRAME_TYPE_PIN_UNLOCK => {
                     if pin::handle_pin_unlock(

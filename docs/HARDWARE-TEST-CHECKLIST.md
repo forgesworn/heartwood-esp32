@@ -811,8 +811,42 @@ Firmware under test: the WiFi-standalone signer after #64 — an interactive
 ask no longer blocks the relay loop. The card is held and serviced from the
 loop, the hold is measured by the button sampler thread, and same-client asks
 for the same identity collapse onto one card. Bench this on the desk V4 in
-WiFi-standalone mode, vault unlocked, with `~/heartwood-bench/nip46-client.mjs`
-driving the requests and a second terminal on `scripts/device-status.mjs`.
+WiFi-standalone mode, vault unlocked.
+
+**Most of this is machine-driven.** `scripts/bench-approval-cards.mjs` runs
+steps 1, 2, 6, 8, 9, 10, 11, 14 and 16 over the operator channel with no
+button presses at all — it mints a disposable TOFU slot, raises cards, probes
+the cable and the relay while they are up, and revokes the slot afterwards:
+
+```bash
+node scripts/bench-approval-cards.mjs --master <npub>          # everything
+node scripts/bench-approval-cards.mjs --master <npub> --only usb
+```
+
+Note it mints with legacy `create_client`, deliberately. Naming `sign_event`
+in an operator-installed v2 exact policy IS the operator approving it, so a v2
+slot answers "signing pre-approved by operator" and auto-signs — no card ever
+appears, and every liveness probe would pass against a signer that never
+stopped. The script asserts `signing_approved: false` at mint for that reason.
+
+Only the button steps (3-5, 7, 12, 13) and the T-Display pass (15) need a
+person at the desk. The individual tools are `scripts/nip46-client.mjs`,
+`scripts/mgmt-request.mjs`, `scripts/fetch-events.mjs` and
+`scripts/device-status.mjs` if a step needs driving by hand.
+
+### Baseline before the fix — 2026-08-16, desk Heltec V4 on 0.17.0
+
+Run against the pre-#64 firmware to prove the harness measures the right
+thing. All three of the issue's bullets reproduced:
+
+| Step | Result | Measured |
+|------|--------|----------|
+| 1 cable under a card | FAIL | 4 probes, worst 10090 ms (want < 6000) |
+| 2 relay under a card | FAIL | 2 probes, neither answered within 12 s |
+| 6 card expires | PASS | `timeout` after ~32 s — the control |
+| 14 late reply stamp | FAIL | reply `created_at` 0 s after a request answered 32 s later |
+
+These four must flip to PASS on the fixed firmware (step 6 staying green).
 
 The point of every step is that **the rest of the device keeps working while
 the card is up** — that is the whole fix, and it cannot be seen from the card

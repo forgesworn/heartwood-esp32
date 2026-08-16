@@ -315,13 +315,150 @@ pub fn handle_request(
     )
 }
 
-/// Dispatch an already-parsed request.
+/// How the physical approval for a request is being obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    /// Put the card up and block here until the operator answers. The USB
+    /// paths use this: the host is synchronously waiting on the reply frame,
+    /// so deferring would buy nothing.
+    Interactive,
+    /// Never block. Return [`Dispatch::NeedsApproval`] at the point the card
+    /// would have gone up, so a caller with a loop to keep alive can hold the
+    /// ask on screen itself and re-enter once the button is done (#64).
+    Deferred,
+    /// The operator has already completed the hold for this exact request.
+    /// Skip the card and dispatch as approved.
+    ButtonApproved,
+}
+
+/// What the operator is being asked to approve, enough to draw the card.
+pub enum AskCard {
+    Sign { requester: String, kind: u64 },
+    Extension {
+        master_label: String,
+        method: String,
+        preview: String,
+    },
+}
+
+/// An ask handed back to a deferring caller, and handed in again once the
+/// hold completes. It carries the request itself so nothing is re-parsed,
+/// including `sign_event`'s already-extracted event (its `params` were taken
+/// on the way in, so the request alone would no longer be dispatchable).
+pub struct DeferredAsk {
+    pub card: AskCard,
+    pub request: nip46::Nip46Request,
+    pub event: Option<UnsignedEvent>,
+}
+
+/// Outcome of a dispatch attempt.
+pub enum Dispatch {
+    /// A response to send, whatever it says.
+    Answered(String),
+    /// Nothing was done: this request needs a physical approval the caller
+    /// asked to obtain for itself. Re-enter [`dispatch`] with the same ask
+    /// and [`ApprovalDecision::ButtonApproved`] once the hold completes.
+    NeedsApproval(Box<DeferredAsk>),
+}
+
+/// Dispatch an already-parsed request, blocking for any approval it needs.
 ///
 /// Encrypted transports use this entry point so the decrypted JSON buffer can
 /// be released before signing. The old frame entry point remains for plaintext
 /// USB compatibility and forwards here after one parse.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_parsed_request(
+    request: nip46::Nip46Request,
+    master_secret: &[u8; 32],
+    master_label: &str,
+    master_mode: MasterMode,
+    master_slot: u8,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    policy_engine: &mut PolicyEngine,
+    identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
+    client_pubkey: Option<&[u8; 32]>,
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    personas: &mut Vec<crate::personas::LoadedPersona>,
+) -> String {
+    match dispatch(
+        request,
+        None,
+        master_secret,
+        master_label,
+        master_mode,
+        master_slot,
+        secp,
+        display,
+        buttons,
+        policy_engine,
+        identity_caches,
+        client_pubkey,
+        nvs,
+        personas,
+        ApprovalDecision::Interactive,
+    ) {
+        Dispatch::Answered(json) => json,
+        // Unreachable: only a Deferred caller is ever handed an ask back.
+        Dispatch::NeedsApproval(ask) => {
+            log::error!("interactive dispatch deferred an approval; refusing");
+            build_error_json(&ask.request.id, -4, "internal approval error")
+        }
+    }
+}
+
+/// Dispatch an already-parsed request under an explicit approval decision.
+///
+/// `prepared_event` re-supplies `sign_event`'s event when resuming a deferred
+/// ask; pass `None` for a fresh request.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch(
+    request: nip46::Nip46Request,
+    prepared_event: Option<UnsignedEvent>,
+    master_secret: &[u8; 32],
+    master_label: &str,
+    master_mode: MasterMode,
+    master_slot: u8,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    policy_engine: &mut PolicyEngine,
+    identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
+    client_pubkey: Option<&[u8; 32]>,
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    personas: &mut Vec<crate::personas::LoadedPersona>,
+    approval: ApprovalDecision,
+) -> Dispatch {
+    let mut deferred: Option<Box<DeferredAsk>> = None;
+    let json = dispatch_inner(
+        request,
+        prepared_event,
+        master_secret,
+        master_label,
+        master_mode,
+        master_slot,
+        secp,
+        display,
+        buttons,
+        policy_engine,
+        identity_caches,
+        client_pubkey,
+        nvs,
+        personas,
+        approval,
+        &mut deferred,
+    );
+    match deferred {
+        Some(ask) => Dispatch::NeedsApproval(ask),
+        None => Dispatch::Answered(json),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_inner(
     mut request: nip46::Nip46Request,
+    prepared_event: Option<UnsignedEvent>,
     master_secret: &[u8; 32],
     master_label: &str,
     master_mode: MasterMode,
@@ -337,6 +474,11 @@ pub fn handle_parsed_request(
     // Every path here is behind the pre-dispatch policy gates above the match.
     nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
     personas: &mut Vec<crate::personas::LoadedPersona>,
+    approval: ApprovalDecision,
+    // Set instead of answering when `approval` is `Deferred` and the request
+    // reaches a point that would have put a card up. The returned String is
+    // ignored in that case.
+    deferred: &mut Option<Box<DeferredAsk>>,
 ) -> String {
     // Enforce the ceiling we advertise in FIRMWARE_INFO, before anything
     // allocates at signing size.
@@ -462,7 +604,12 @@ pub fn handle_parsed_request(
     }
 
     let method = nip46::Nip46Method::from_str(&request.method);
-    let sign_event = if matches!(method, nip46::Nip46Method::SignEvent) {
+    let sign_event = if let Some(event) = prepared_event {
+        // Resuming a deferred ask: `params` was emptied when the event was
+        // parsed on the first pass, so the event comes back in with the ask
+        // rather than being parsed a second time.
+        Some(Ok(event))
+    } else if matches!(method, nip46::Nip46Method::SignEvent) {
         // Parse once, by value, then release the stringified event before any
         // approval UI, signing or response construction begins.
         Some(nip46::parse_unsigned_event_owned(std::mem::take(
@@ -545,27 +692,46 @@ pub fn handle_parsed_request(
     // its individual match arm. Strict v2 denials returned above never prompt.
     if remote_extension_requires_approval(has_client, &method, tier) {
         let preview = extension_approval_preview(&requester_label, &request.params);
-        let approval = crate::approval::run_approval_loop(
-            display,
-            buttons,
-            APPROVAL_TIMEOUT_SECS,
-            |d, remaining| {
-                crate::oled::show_master_sign_request(
-                    d,
-                    master_label,
-                    &request.method,
-                    None,
-                    &preview,
-                    remaining,
+        match approval {
+            ApprovalDecision::Deferred => {
+                *deferred = Some(Box::new(DeferredAsk {
+                    card: AskCard::Extension {
+                        master_label: master_label.to_string(),
+                        method: request.method.clone(),
+                        preview,
+                    },
+                    request,
+                    event: None,
+                }));
+                return String::new();
+            }
+            ApprovalDecision::ButtonApproved => {
+                log::info!("{}: dispatching on a hold already completed", request.method);
+            }
+            ApprovalDecision::Interactive => {
+                let result = crate::approval::run_approval_loop(
+                    display,
+                    buttons,
+                    APPROVAL_TIMEOUT_SECS,
+                    |d, remaining| {
+                        crate::oled::show_master_sign_request(
+                            d,
+                            master_label,
+                            &request.method,
+                            None,
+                            &preview,
+                            remaining,
+                        );
+                    },
                 );
-            },
-        );
-        if let Some(response) = extension_approval_failure(&request.id, approval) {
-            log::info!("{}: physical approval denied or timed out", request.method);
-            crate::oled::show_result(display, "Not approved");
-            return response;
+                if let Some(response) = extension_approval_failure(&request.id, result) {
+                    log::info!("{}: physical approval denied or timed out", request.method);
+                    crate::oled::show_result(display, "Not approved");
+                    return response;
+                }
+                log::info!("{}: physically approved", request.method);
+            }
         }
-        log::info!("{}: physically approved", request.method);
     }
 
     match request.method.as_str() {
@@ -608,16 +774,39 @@ pub fn handle_parsed_request(
                     }
                 }
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
-                    let result = handle_sign_event(
-                        master_secret,
-                        master_mode,
-                        secp,
-                        display,
-                        buttons,
-                        &request,
-                        &requester_label,
-                        event,
-                    );
+                    if matches!(approval, ApprovalDecision::Deferred) {
+                        *deferred = Some(Box::new(DeferredAsk {
+                            card: AskCard::Sign {
+                                requester: requester_label.clone(),
+                                kind: event.kind,
+                            },
+                            request,
+                            event: Some(event),
+                        }));
+                        return String::new();
+                    }
+                    let result = if matches!(approval, ApprovalDecision::ButtonApproved) {
+                        sign_approved_event(
+                            master_secret,
+                            master_mode,
+                            secp,
+                            display,
+                            &request,
+                            &requester_label,
+                            event,
+                        )
+                    } else {
+                        handle_sign_event(
+                            master_secret,
+                            master_mode,
+                            secp,
+                            display,
+                            buttons,
+                            &request,
+                            &requester_label,
+                            event,
+                        )
+                    };
                     let is_success = serde_json::from_str::<serde_json::Value>(&result)
                         .map(|v| v.get("error").is_none())
                         .unwrap_or(false);
@@ -1282,43 +1471,15 @@ fn handle_sign_event(
     );
 
     match result {
-        ApprovalResult::Approved => {
-            log::info!("sign_event: approved");
-            crate::oled::show_signing(display);
-            match do_sign(
-                event,
-                master_secret,
-                master_mode,
-                secp,
-                request.heartwood.as_ref(),
-            ) {
-                Ok(signed) => match build_sign_reply(request, &signed) {
-                    Ok(json) => {
-                        crate::confirm::present(
-                            display,
-                            crate::confirm::Card {
-                                requester: requester_label.to_string(),
-                                kind,
-                                auto: false,
-                            },
-                        );
-                        json
-                    }
-                    Err(e) => {
-                        log::error!("Failed to build sign response: {e}");
-                        crate::oled::show_result(display, "Sign error");
-                        build_error_json(&request.id, -4, "signing failed")
-                    }
-                },
-                Err(ref e) => {
-                    log::error!("Signing failed: {e}");
-                    crate::oled::show_error(display, &format!("ERR:{}", &e[..e.len().min(18)]));
-                    esp_idf_hal::delay::FreeRtos::delay_ms(3000);
-                    crate::oled::show_result(display, "Sign error");
-                    build_error_json(&request.id, -4, "signing/derivation failure")
-                }
-            }
-        }
+        ApprovalResult::Approved => sign_approved_event(
+            master_secret,
+            master_mode,
+            secp,
+            display,
+            request,
+            requester_label,
+            event,
+        ),
         ApprovalResult::Denied => {
             log::info!("sign_event: denied by user");
             crate::oled::show_result(display, "Denied");
@@ -1329,6 +1490,59 @@ fn handle_sign_event(
             // Not a failure to shout about: the prompt just expired unanswered.
             crate::oled::show_result(display, "Not signed");
             build_error_json(&request.id, -1, "timeout")
+        }
+    }
+}
+
+/// Sign an event whose physical approval is already in hand.
+///
+/// This is the tail the blocking loop runs once the operator completes the
+/// hold, and the same tail the non-blocking card runs when its own hold
+/// completes (#64) — one signing path, so the two approval styles cannot
+/// drift apart in what they do after the button.
+fn sign_approved_event(
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    display: &mut Display<'_>,
+    request: &nip46::Nip46Request,
+    requester_label: &str,
+    event: UnsignedEvent,
+) -> String {
+    let (kind, _) = nip46::event_display_summary(&event, 50);
+    log::info!("sign_event: approved");
+    crate::oled::show_signing(display);
+    match do_sign(
+        event,
+        master_secret,
+        master_mode,
+        secp,
+        request.heartwood.as_ref(),
+    ) {
+        Ok(signed) => match build_sign_reply(request, &signed) {
+            Ok(json) => {
+                crate::confirm::present(
+                    display,
+                    crate::confirm::Card {
+                        requester: requester_label.to_string(),
+                        kind,
+                        auto: false,
+                    },
+                );
+                json
+            }
+            Err(e) => {
+                log::error!("Failed to build sign response: {e}");
+                crate::oled::show_result(display, "Sign error");
+                build_error_json(&request.id, -4, "signing failed")
+            }
+        },
+        Err(ref e) => {
+            log::error!("Signing failed: {e}");
+            crate::oled::show_error(display, &format!("ERR:{}", &e[..e.len().min(18)]));
+            esp_idf_hal::delay::FreeRtos::delay_ms(3000);
+            crate::oled::show_result(display, "Sign error");
+            build_error_json(&request.id, -4, "signing/derivation failure")
         }
     }
 }

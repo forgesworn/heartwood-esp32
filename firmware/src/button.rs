@@ -191,7 +191,7 @@ fn drain_release(pin: &PinDriver<'_, Input>) {
 // behaviour is type-visible. A = approve/select, B (where present) =
 // cancel/back.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Whether the running board has a usable second button — read by screen
 /// code (which never sees `Buttons`) to pick two-button hint copy.
@@ -277,10 +277,25 @@ impl<'d> Buttons<'d> {
 static PRESS_EDGE: AtomicBool = AtomicBool::new(false);
 static LATCH_SPAWNED: AtomicBool = AtomicBool::new(false);
 
+/// Milliseconds the button has been held down continuously right now, or 0
+/// when it is up. Written only by the sampler thread.
+static HOLD_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Length of the last completed press, in milliseconds, waiting to be read.
+/// 0 means "nothing new since the last read". Set on the release edge and
+/// consumed by [`take_release`].
+static RELEASE_MS: AtomicU32 = AtomicU32::new(0);
+
 /// Sampler cadence. Contact bounce (< ~10 ms) is shorter than one interval,
 /// so a bounce dip is rarely sampled at all; [`LATCH_MIN_GAP_MS`] covers the
 /// ones that are.
 const LATCH_POLL_MS: u32 = 15;
+
+/// Consecutive same-level samples before the sampler believes a level change.
+/// Two intervals is 30 ms, matching the debounce the blocking approval loop
+/// applies on both edges — a bounce must neither start a hold nor be read as
+/// a deliberate early release.
+const LATCH_DEBOUNCE_SAMPLES: u32 = 2;
 
 /// Minimum spacing between latched edges. Anything faster is bounce, not a
 /// human tapping twice.
@@ -297,16 +312,45 @@ fn spawn_press_latch(gpio: i32) {
         .name("btn-latch".into())
         .stack_size(3072)
         .spawn(move || {
-            let mut was_low = unsafe { esp_idf_svc::sys::gpio_get_level(gpio) } == 0;
+            let mut raw_low = unsafe { esp_idf_svc::sys::gpio_get_level(gpio) } == 0;
+            let mut stable_low = raw_low;
+            let mut same_samples: u32 = 0;
+            let mut low_since = Instant::now();
             let mut last_edge = Instant::now();
             loop {
                 esp_idf_hal::delay::FreeRtos::delay_ms(LATCH_POLL_MS);
                 let low = unsafe { esp_idf_svc::sys::gpio_get_level(gpio) } == 0;
-                if low && !was_low && last_edge.elapsed().as_millis() >= LATCH_MIN_GAP_MS {
-                    PRESS_EDGE.store(true, Ordering::Relaxed);
-                    last_edge = Instant::now();
+                same_samples = if low == raw_low {
+                    same_samples.saturating_add(1)
+                } else {
+                    0
+                };
+                raw_low = low;
+
+                if same_samples >= LATCH_DEBOUNCE_SAMPLES && low != stable_low {
+                    stable_low = low;
+                    if low {
+                        low_since = Instant::now();
+                        if last_edge.elapsed().as_millis() >= LATCH_MIN_GAP_MS {
+                            PRESS_EDGE.store(true, Ordering::Relaxed);
+                            last_edge = Instant::now();
+                        }
+                    } else {
+                        // Release: publish how long it was held, so a loop too
+                        // slow to see the hold itself can still tell an early
+                        // release (a deny) from a completed hold.
+                        let held = low_since.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        HOLD_MS.store(0, Ordering::Relaxed);
+                        RELEASE_MS.store(held.max(1), Ordering::Relaxed);
+                    }
                 }
-                was_low = low;
+
+                if stable_low {
+                    HOLD_MS.store(
+                        low_since.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                        Ordering::Relaxed,
+                    );
+                }
             }
         });
     if let Err(e) = spawned {
@@ -324,6 +368,26 @@ pub fn take_press_edge() -> bool {
 /// directly off the pin, so the latch cannot replay it elsewhere.
 pub fn clear_press_edge() {
     PRESS_EDGE.store(false, Ordering::Relaxed);
+    RELEASE_MS.store(0, Ordering::Relaxed);
+}
+
+/// How long the button has been held down right now, in milliseconds; 0 when
+/// it is up. Non-blocking, safe to call from a loop that runs once a second.
+pub fn hold_ms() -> u32 {
+    HOLD_MS.load(Ordering::Relaxed)
+}
+
+/// Consume the length of the last completed press, in milliseconds.
+///
+/// `None` when nothing has been released since the last call. This is what
+/// lets a slow loop judge a hold it never saw in progress: the sampler runs
+/// at 15 ms whatever the loop is doing, so a press that started and ended
+/// entirely between two loop passes is still reported exactly once.
+pub fn take_release() -> Option<u32> {
+    match RELEASE_MS.swap(0, Ordering::Relaxed) {
+        0 => None,
+        ms => Some(ms),
+    }
 }
 
 // ---------------------------------------------------------------------------

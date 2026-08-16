@@ -805,6 +805,70 @@ bench slots revoked (NVS 548/756 used, better than found);
 `natural-person` deliberately left registered — C4 notices wrap to it, so
 the guardian NP should stay addressable.
 
+## 12. Non-blocking approval cards (#64; added 2026-08-16, not yet bench-run)
+
+Firmware under test: the WiFi-standalone signer after #64 — an interactive
+ask no longer blocks the relay loop. The card is held and serviced from the
+loop, the hold is measured by the button sampler thread, and same-client asks
+for the same identity collapse onto one card. Bench this on the desk V4 in
+WiFi-standalone mode, vault unlocked, with `~/heartwood-bench/nip46-client.mjs`
+driving the requests and a second terminal on `scripts/device-status.mjs`.
+
+The point of every step is that **the rest of the device keeps working while
+the card is up** — that is the whole fix, and it cannot be seen from the card
+itself.
+
+1. **Cable stays live under a card.** Send a `sign_event` on a slot that needs
+   the button. While the card is on screen, run `device-status.mjs` over USB:
+   it must answer within a second or two. Before #64 it answered nothing until
+   the card resolved.
+2. **Relay stays live under a card.** With the card still up, watch the relay
+   with `fetch-events.mjs --live`: the signer must keep answering other
+   traffic (a `get_public_key` from a second, auto-approved client returns
+   while the card waits).
+3. **Approve.** Hold the button 2 s. Card shows the fill bar, then APPROVED,
+   then the SIGNED confirmation card; the response publishes and the event
+   verifies on the relay.
+4. **Deny by early release.** New ask, press and release inside 2 s: answers
+   `user denied` promptly.
+5. **Deny by B (two-button boards).** New ask, press B: answers `user denied`.
+6. **Expiry.** New ask, touch nothing for 30 s: the terminal "request expired"
+   card appears and the client gets `timeout`.
+7. **Fast hold between passes.** Press and hold for ~2.5 s in one motion,
+   releasing quickly. The relay loop only samples once a second, so this is
+   the case the sampler thread exists for: it must approve, not be missed.
+8. **Batch collapse.** Fire 3 `sign_event`s of the **same kind** back to back
+   from one client on a slot that needs the button. One card appears, showing
+   the count (`app x3`) and that kind; one hold answers all three, and three
+   signed responses publish. Then repeat with **mixed kinds**: those must NOT
+   collapse — each kind gets its own card, because the card can only name one.
+9. **Batch fast-deny.** Repeat step 8 and deny once: all three answer
+   `user denied` — not three separate windows.
+10. **Second client queues.** With a card up from client A, have client B ask.
+    B waits; when A's card resolves, B's card appears with a full window.
+11. **Busy refusal.** Push past the caps (9+ asks from one client, or more
+    than 4 other clients waiting): the extra asks answer "signer is busy with
+    another approval; retry shortly" rather than the device growing RAM.
+12. **Press during a card is not a carousel page.** With a card up, a short
+    press must not page the idle carousel — it belongs to the decision (and,
+    being under 2 s, denies).
+13. **Card wins the screen.** With a SIGNED confirmation card still held from
+    an earlier sign, a new ask must take the screen immediately.
+14. **Reply timestamps.** After a 25-second-held approval, check the response
+    event's `created_at` on the relay: it must be within a second or two of
+    when the button was pressed, not of when the request arrived.
+15. **T-Display pass** of steps 3-7 before CP5 (B-button path is board-specific).
+
+16. **USB signing does not steal the screen.** With a relay card up, send a
+    NIP-46 sign request over the cable: it must be refused with
+    `approval on screen` rather than painting over the card. The card then
+    resolves normally, and the same USB request succeeds once it is gone.
+
+Regression watch, all still on the USB-bridged tier, which deliberately keeps
+the blocking loop (the host is waiting on the reply frame): a USB `sign_event`
+approval, a `SET_NET_CONFIG` confirmation and a factory-reset confirmation must
+behave exactly as before.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

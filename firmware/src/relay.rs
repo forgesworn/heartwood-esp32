@@ -332,6 +332,10 @@ struct SignCtx<'a, 'd, 'b> {
     /// clock of its own, so this is what lets a reply held behind an approval
     /// window be stamped for when it is sent rather than when it arrived (#64).
     reply_clock: heartwood_common::reply_clock::ReplyClock,
+    /// Interactive asks waiting on the device button. Index 0 is the card on
+    /// screen; the rest wait their turn. RAM only, capped by the counts in
+    /// `approval_queue` and by `CARD_BYTE_BUDGET`.
+    button_cards: Vec<ButtonCard>,
 }
 
 /// Timestamp for a reply to a request that arrived `held` ago.
@@ -794,6 +798,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         audit_last_stamped: 0,
         audit_emit_seq: 0,
         reply_clock: heartwood_common::reply_clock::ReplyClock::new(),
+        button_cards: Vec::new(),
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -835,8 +840,9 @@ pub fn run_wifi_standalone<'d, 'b>(
         // Expire overdue C4 parks into tombstones so late verdicts still land.
         service_parks(&mut ctx);
         // Advance held signing confirmations; restore the idle identity card
-        // once the last hold expires.
-        if ctx.display_on && crate::confirm::service(ctx.display) {
+        // once the last hold expires. An approval card outranks them: it owns
+        // the screen until the operator answers it.
+        if ctx.display_on && !approval_card_open(&ctx) && crate::confirm::service(ctx.display) {
             ctx.idle_page = 0;
             show_idle_identity(&mut ctx);
         }
@@ -927,7 +933,11 @@ pub fn run_wifi_standalone<'d, 'b>(
 
         // Wake the panel promptly on a BOOT-button press, and serve USB, once
         // per pass regardless of how many sessions are live or connecting.
-        service_button(&mut ctx);
+        // While an approval card is up the button belongs to that decision,
+        // so the idle carousel does not get to consume the press.
+        if !approval_card_open(&ctx) {
+            service_button(&mut ctx);
+        }
         // The WiFi driver is lent to USB only while no relay session is live —
         // a scan mid-connection would knock the link off its channel, so a
         // 0x55 during live service is declined (matches the old per-session
@@ -937,6 +947,12 @@ pub fn run_wifi_standalone<'d, 'b>(
         } else {
             poll_usb(usb, &mut ctx, None);
         }
+
+        // Advance any approval card. This is the whole point of holding the
+        // ask rather than blocking inside the dispatch: the cable was served
+        // immediately above, and the sessions are pumped immediately below,
+        // both of them while the card is still on screen (#64).
+        service_button_cards(&mut ctx, &mut sessions);
 
         // Ensure the primary session (rotates over the configured set).
         if !sessions.iter().any(|s| !s.pinned) && Instant::now() >= primary_next {
@@ -1946,7 +1962,12 @@ fn poll_usb(
         // Plaintext NIP-46 — only when the bridge is not authenticated (mirrors
         // the USB-only loop). Uses the first master, like the tethered path.
         FRAME_TYPE_NIP46_REQUEST => {
-            if ctx.policy_engine.bridge_authenticated || ctx.masters.is_empty() {
+            if approval_card_open(ctx) {
+                // The USB paths still put their own card up and block on it,
+                // which would paint over the relay card already on screen and
+                // silently let it expire. One screen, one decision: say so.
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+            } else if ctx.policy_engine.bridge_authenticated || ctx.masters.is_empty() {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             } else {
                 let master_secret = ctx.masters[0].secret;
@@ -1993,7 +2014,9 @@ fn poll_usb(
 
         // Encrypted NIP-46 (bridge transport) — requires an authenticated bridge.
         FRAME_TYPE_ENCRYPTED_REQUEST => {
-            if !ctx.policy_engine.bridge_authenticated {
+            if approval_card_open(ctx) {
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+            } else if !ctx.policy_engine.bridge_authenticated {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             } else {
                 let personas_before = ctx.personas.len();
@@ -2612,6 +2635,30 @@ fn audit_rail_draft(req: &nip46::Nip46Request) -> Option<RailDraft> {
     }
 }
 
+/// The same C5 draft, built from an event dispatch has already parsed out of
+/// `params`.
+///
+/// A deferred ask (#64) carries the parsed event and an emptied `params`, so
+/// the builder above would see nothing there and silently drop the record for
+/// every button-approved sign on a dependant persona.
+fn audit_rail_draft_from_event(event: &UnsignedEvent) -> RailDraft {
+    // Same bound as above: never walk a large event just for a metadata tag.
+    let counterparty = if event.content.len() <= 2_048 {
+        event
+            .tags
+            .iter()
+            .find(|t| t.len() >= 2 && t[0] == "p" && is_hex64(&t[1]))
+            .map(|t| t[1].to_ascii_lowercase())
+    } else {
+        None
+    };
+    RailDraft {
+        event_kind: Some(event.kind),
+        method_tag: None,
+        counterparty,
+    }
+}
+
 /// The NIP-46 error string of a response, if it carried one.
 fn response_error_of(response_json: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(response_json)
@@ -2924,25 +2971,9 @@ fn complete_parked(
     );
 
     // Re-resolve the identity — the served set may have changed while parked.
-    let resolved = if let Some(midx) = masters::find_by_pubkey(ctx.masters, &park.target_pk) {
-        let m = &ctx.masters[midx];
-        Some((zeroize::Zeroizing::new(m.secret), m.label.clone(), m.mode, m.slot, None))
-    } else if let Some(pidx) = crate::personas::find_by_pubkey(ctx.personas, &park.target_pk) {
-        let p = &ctx.personas[pidx];
-        ctx.masters
-            .iter()
-            .find(|m| m.slot == p.master_slot)
-            .and_then(|owning| {
-                crate::nip46_handler::derive_identity(&owning.secret, owning.mode, &p.purpose, p.index)
-                    .ok()
-                    .map(|(secret, _pk)| {
-                        (secret, owning.label.clone(), owning.mode, owning.slot, Some(p.purpose.clone()))
-                    })
-            })
-    } else {
-        None
-    };
-    let Some((signing_secret, label, mode, slot, persona_purpose)) = resolved else {
+    let Some((signing_secret, label, mode, slot, persona_purpose)) =
+        resolve_served_identity(ctx, &park.target_pk)
+    else {
         log::warn!("[relay] parked identity no longer served; park dropped");
         return false;
     };
@@ -3081,6 +3112,559 @@ fn deny_parked(tls: &mut Tls, ctx: &mut SignCtx, park: ParkedRequest) {
     ) {
         log::warn!("[relay] park deny publish: {e}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive approvals that do not stop the loop (#64)
+// ---------------------------------------------------------------------------
+//
+// The button approval used to run inside the dispatch call: one main task owns
+// the display, the buttons, the websocket and the USB cable, so a card on
+// screen stopped all four for the length of its window. A status probe over
+// the cable went unanswered, and a burst of unapproved sign_events ran their
+// windows one after another — minutes of a wedged signer for what the operator
+// sees as one decision.
+//
+// So a card is held here instead, the way a C4 park is held: the ask is
+// remembered, the dispatch returns immediately, and the loop carries on
+// serving everything else while the card is up. The hold itself is measured by
+// the sampler thread that already watches the pin (#61), which is what lets a
+// loop running at roughly one pass a second judge a two-second hold — or one
+// that started and finished entirely between two passes.
+//
+// What has NOT changed: the request is still dispatched only after a physical
+// 2-second hold on the same GPIO, by the same signing path, and a denial or an
+// expiry still answers with an error. The identity is re-resolved at answer
+// time exactly as a park's is, so a registry change while the card was up
+// cannot sign with a stale key.
+
+/// How long a card stays up before it expires unanswered. Matches the blocking
+/// loop's window, so what the operator sees is unchanged.
+const CARD_WINDOW: Duration = Duration::from_secs(30);
+
+/// Hold that approves, matching `approval::run_approval_loop`.
+const CARD_HOLD_MS: u32 = 2000;
+
+/// Total bytes all waiting asks may hold. Cards keep whole parsed requests
+/// alive, and a signing request can be tens of kilobytes on a board with no
+/// PSRAM, so the count caps in `approval_queue` are not enough on their own.
+const CARD_BYTE_BUDGET: usize = 8 * 1024;
+
+/// How long an ask may wait for a screen it has not yet reached. With one
+/// operator and one button the queue is inherently serial, so an ask behind
+/// several full windows outlives its client's patience — answer it rather
+/// than hold a request whose caller stopped listening.
+const CARD_QUEUE_TTL_SECS: u64 = 90;
+
+/// One request inside a card's batch.
+struct ButtonAsk {
+    ask: crate::nip46_handler::DeferredAsk,
+    created_at: u64,
+    received_uptime: u64,
+    /// Roughly what this ask is holding, for [`CARD_BYTE_BUDGET`].
+    weight: usize,
+    /// Drawn before dispatch, while the request still had its params, and
+    /// pushed to the activity ring once the card is answered — otherwise a
+    /// button-approved sign would go missing from the ring the moment the
+    /// approval stopped happening inside the dispatch call.
+    audit: Option<SignAuditDraft>,
+}
+
+/// An interactive ask waiting on the device button.
+struct ButtonCard {
+    key: heartwood_common::approval_queue::AskKey,
+    target_pk: [u8; 32],
+    client_pubkey: [u8; 32],
+    /// Asks this one decision answers. More than one only when the same client
+    /// asked again for the same identity while the card was already up.
+    asks: Vec<ButtonAsk>,
+    /// Set when the card reaches the screen. The window runs from then, not
+    /// from when the ask arrived, so a queued ask still gets a full window.
+    opened_at: Option<Instant>,
+    /// A press already under way when the card appeared must not answer it,
+    /// and neither must that press's release: the card arms only once the
+    /// button has been seen up.
+    armed: bool,
+    last_remaining: u32,
+    last_pct: u32,
+}
+
+/// What one card tick concluded.
+enum CardTick {
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+}
+
+/// Re-resolve a served identity to its signing key and owning master.
+///
+/// Both deferred paths answer long after the ask arrived, by which time the
+/// served set may have changed — so the key is derived again at answer time
+/// rather than held in RAM for the wait.
+fn resolve_served_identity(
+    ctx: &SignCtx,
+    target_pk: &[u8; 32],
+) -> Option<(
+    zeroize::Zeroizing<[u8; 32]>,
+    String,
+    heartwood_common::types::MasterMode,
+    u8,
+    Option<String>,
+)> {
+    if let Some(midx) = masters::find_by_pubkey(ctx.masters, target_pk) {
+        let m = &ctx.masters[midx];
+        return Some((
+            zeroize::Zeroizing::new(m.secret),
+            m.label.clone(),
+            m.mode,
+            m.slot,
+            None,
+        ));
+    }
+    let pidx = crate::personas::find_by_pubkey(ctx.personas, target_pk)?;
+    let p = &ctx.personas[pidx];
+    let owning = ctx.masters.iter().find(|m| m.slot == p.master_slot)?;
+    crate::nip46_handler::derive_identity(&owning.secret, owning.mode, &p.purpose, p.index)
+        .ok()
+        .map(|(secret, _pk)| {
+            (
+                secret,
+                owning.label.clone(),
+                owning.mode,
+                owning.slot,
+                Some(p.purpose.clone()),
+            )
+        })
+}
+
+/// Take an interactive ask off the dispatch path and put it on the button.
+///
+/// Publishes nothing when the ask is accepted — the client waits, exactly as
+/// it does for a C4 park — and answers busy rather than growing without bound.
+#[allow(clippy::too_many_arguments)]
+fn queue_button_ask(
+    tls: &mut Tls,
+    ctx: &mut SignCtx,
+    ask: crate::nip46_handler::DeferredAsk,
+    slot: u8,
+    target_pk: &[u8; 32],
+    client_pubkey: &[u8; 32],
+    client_hex: &str,
+    conversation_key: &[u8; 32],
+    signing_secret: &[u8; 32],
+    created_at: u64,
+    received_uptime: u64,
+    audit: Option<SignAuditDraft>,
+) -> Result<(), String> {
+    use heartwood_common::approval_queue::{admit, Admission, AskKey};
+
+    let key = AskKey::new(
+        slot,
+        client_hex.to_string(),
+        hex_encode(target_pk),
+        heartwood_common::nip59::method_or_kind_key(
+            &ask.request.method,
+            ask.event.as_ref().map(|event| event.kind),
+        ),
+    );
+    let weight = ask
+        .event
+        .as_ref()
+        .map(|event| event.content.len() + 256)
+        .unwrap_or(256);
+    let held_bytes: usize = ctx
+        .button_cards
+        .iter()
+        .flat_map(|card| card.asks.iter())
+        .map(|ask| ask.weight)
+        .sum();
+
+    let open = ctx.button_cards.first();
+    let admission = if held_bytes.saturating_add(weight) > CARD_BYTE_BUDGET {
+        Admission::Busy
+    } else {
+        admit(
+            open.map(|card| &card.key),
+            open.map(|card| card.asks.len()).unwrap_or(0),
+            ctx.button_cards.len().saturating_sub(1),
+            &key,
+        )
+    };
+
+    let request_id = ask.request.id.clone();
+    match admission {
+        Admission::Busy => {
+            log::warn!("[relay] approval queue full; answering busy for {request_id}");
+            let response = nip46::build_error_response(
+                &request_id,
+                -1,
+                "signer is busy with another approval; retry shortly",
+            )
+            .unwrap_or_default();
+            sign_and_publish(
+                tls,
+                ctx.secp,
+                signing_secret,
+                conversation_key,
+                client_hex,
+                NIP46_KIND,
+                reply_stamp(
+                    ctx,
+                    created_at,
+                    Duration::from_secs(crate::uptime_s().saturating_sub(received_uptime)),
+                ),
+                response,
+            )
+        }
+        Admission::Collapse => {
+            if let Some(card) = ctx.button_cards.first_mut() {
+                card.asks.push(ButtonAsk {
+                    ask,
+                    created_at,
+                    received_uptime,
+                    weight,
+                    audit,
+                });
+                // Redraw: the card now speaks for more than it did.
+                card.last_remaining = u32::MAX;
+                log::info!(
+                    "[relay] {request_id} joins the open approval card ({} asks)",
+                    card.asks.len()
+                );
+            }
+            Ok(())
+        }
+        Admission::Open | Admission::Wait => {
+            log::info!("[relay] {request_id} waiting on the button");
+            ctx.button_cards.push(ButtonCard {
+                key,
+                target_pk: *target_pk,
+                client_pubkey: *client_pubkey,
+                asks: vec![ButtonAsk {
+                    ask,
+                    created_at,
+                    received_uptime,
+                    weight,
+                    audit,
+                }],
+                opened_at: None,
+                armed: false,
+                last_remaining: u32::MAX,
+                last_pct: u32::MAX,
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Draw the front card, when what it shows has changed.
+fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
+    if !ctx.display_on {
+        crate::oled::wake_display(ctx.display);
+        ctx.display_on = true;
+    }
+    // A live card is activity: the panel must not blank mid-decision.
+    ctx.last_activity = Instant::now();
+
+    if hold_ms > 0 {
+        let pct = (hold_ms * 100 / CARD_HOLD_MS).min(100);
+        if pct / 5 != ctx.button_cards[0].last_pct / 5 {
+            ctx.button_cards[0].last_pct = pct;
+            crate::oled::show_hold_progress(ctx.display, pct);
+        }
+        return;
+    }
+
+    if remaining == ctx.button_cards[0].last_remaining {
+        return;
+    }
+    ctx.button_cards[0].last_remaining = remaining;
+    ctx.button_cards[0].last_pct = u32::MAX;
+
+    let batch = ctx.button_cards[0].asks.len();
+    let card = match &ctx.button_cards[0].asks[0].ask.card {
+        crate::nip46_handler::AskCard::Sign { requester, kind } => {
+            // The count belongs on screen: one hold answers all of them, and
+            // the operator must never be shown "sign this" for a batch.
+            let label = if batch > 1 {
+                format!("{requester} x{batch}")
+            } else {
+                requester.clone()
+            };
+            Ok((label, *kind))
+        }
+        crate::nip46_handler::AskCard::Extension {
+            master_label,
+            method,
+            preview,
+        } => Err((master_label.clone(), method.clone(), preview.clone())),
+    };
+    match card {
+        Ok((label, kind)) => {
+            crate::oled::show_sign_request(ctx.display, &label, kind, "", remaining)
+        }
+        Err((master_label, method, preview)) => crate::oled::show_master_sign_request(
+            ctx.display,
+            &master_label,
+            &method,
+            None,
+            &preview,
+            remaining,
+        ),
+    }
+}
+
+/// Advance the front card by one loop pass.
+fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
+    if ctx.button_cards.is_empty() {
+        return CardTick::Pending;
+    }
+    let now = Instant::now();
+    if ctx.button_cards[0].opened_at.is_none() {
+        // Anything the sampler latched before the card went up belongs to
+        // whatever the operator was doing then, not to this decision.
+        crate::button::clear_press_edge();
+        ctx.button_cards[0].opened_at = Some(now);
+    }
+
+    let opened_at = ctx.button_cards[0].opened_at.unwrap_or(now);
+    let elapsed = now.duration_since(opened_at);
+    if elapsed >= CARD_WINDOW {
+        return CardTick::Expired;
+    }
+    let remaining = (CARD_WINDOW - elapsed).as_secs() as u32;
+
+    let hold_ms = crate::button::hold_ms();
+    let released = crate::button::take_release();
+
+    if !ctx.button_cards[0].armed {
+        if hold_ms == 0 {
+            ctx.button_cards[0].armed = true;
+        }
+        // Both the in-progress hold and its release are discarded until the
+        // card is armed, so a press aimed at the idle carousel cannot answer
+        // a card that appeared underneath it.
+        draw_button_card(ctx, remaining, 0);
+        return CardTick::Pending;
+    }
+
+    // B, where the board has one, is an explicit cancel and never an approve.
+    if ctx.buttons.b_pressed() {
+        ctx.buttons.drain_b();
+        return CardTick::Denied;
+    }
+
+    if hold_ms >= CARD_HOLD_MS {
+        return CardTick::Approved;
+    }
+    if let Some(ms) = released {
+        // A hold that began and ended between two passes still counts: the
+        // sampler measured it even though the loop never saw it in progress.
+        return if ms >= CARD_HOLD_MS {
+            CardTick::Approved
+        } else {
+            CardTick::Denied
+        };
+    }
+
+    draw_button_card(ctx, remaining, hold_ms);
+    CardTick::Pending
+}
+
+/// Answer every ask on one card with a single decision, and publish.
+///
+/// `index` is 0 for the card on screen; a later index is a card that timed
+/// out in the queue without ever reaching it, which draws nothing.
+fn resolve_button_card(
+    ctx: &mut SignCtx,
+    sessions: &mut [RelaySession],
+    index: usize,
+    outcome: &CardTick,
+) {
+    if index >= ctx.button_cards.len() {
+        return;
+    }
+    let card = ctx.button_cards.remove(index);
+    if index == 0 {
+        match outcome {
+            CardTick::Approved => crate::oled::show_approved(ctx.display),
+            CardTick::Denied => crate::oled::show_denied(ctx.display),
+            _ => crate::oled::show_request_expired(ctx.display),
+        }
+    }
+
+    let Some(session) = sessions.first_mut() else {
+        log::warn!(
+            "[relay] approval decided with no live relay session; {} ask(s) unanswered",
+            card.asks.len()
+        );
+        return;
+    };
+
+    let Some((signing_secret, label, mode, slot, persona_purpose)) =
+        resolve_served_identity(ctx, &card.target_pk)
+    else {
+        log::warn!("[relay] approved identity no longer served; card dropped");
+        return;
+    };
+    let Ok(conversation_key) = nip44::get_conversation_key(&signing_secret, &card.client_pubkey)
+    else {
+        log::warn!("[relay] approval completion: conversation key failed");
+        return;
+    };
+    let target_hex = hex_encode(&card.target_pk);
+    let dependant = persona_purpose
+        .as_deref()
+        .is_some_and(heartwood_common::escalate::is_dependant_purpose);
+
+    for ask in card.asks {
+        let request_id = ask.ask.request.id.clone();
+        let rail = if !dependant {
+            None
+        } else if let Some(event) = ask.ask.event.as_ref() {
+            Some(audit_rail_draft_from_event(event))
+        } else {
+            audit_rail_draft(&ask.ask.request)
+        };
+
+        let mut response_json = match outcome {
+            CardTick::Approved => {
+                match crate::nip46_handler::dispatch(
+                    ask.ask.request,
+                    ask.ask.event,
+                    &signing_secret,
+                    &label,
+                    mode,
+                    slot,
+                    ctx.secp,
+                    ctx.display,
+                    ctx.buttons,
+                    ctx.policy_engine,
+                    ctx.identity_caches,
+                    Some(&card.client_pubkey),
+                    ctx.nvs,
+                    ctx.personas,
+                    crate::nip46_handler::ApprovalDecision::ButtonApproved,
+                ) {
+                    crate::nip46_handler::Dispatch::Answered(json) => json,
+                    // Unreachable: the hold is in hand, so nothing defers.
+                    crate::nip46_handler::Dispatch::NeedsApproval(pending) => {
+                        log::error!("[relay] approved dispatch asked to defer again; refusing");
+                        nip46::build_error_response(
+                            &pending.request.id,
+                            -4,
+                            "internal approval error",
+                        )
+                        .unwrap_or_default()
+                    }
+                }
+            }
+            CardTick::Denied => nip46::build_error_response(&request_id, -1, "user denied")
+                .unwrap_or_default(),
+            _ => nip46::build_error_response(&request_id, -1, "timeout").unwrap_or_default(),
+        };
+
+        if matches!(outcome, CardTick::Approved) {
+            if !ctx.policy_engine.persist_slots(ctx.nvs, slot) {
+                log::error!("[relay] slot persist failed after an approved card");
+            }
+            crate::transport::persist_fresh_identities(
+                ctx.nvs,
+                ctx.identity_caches,
+                ctx.personas,
+                slot,
+            );
+        }
+        if let Some(draft) = ask.audit {
+            push_sign_audit(ctx, draft, &response_json);
+        }
+
+        if let Some(draft) = rail {
+            let error = response_error_of(&response_json);
+            if let Some(rail_outcome) = heartwood_common::escalate::audit_outcome(
+                heartwood_common::policy::ApprovalTier::ButtonRequired,
+                error.as_deref(),
+                false,
+            ) {
+                if let Err(e) = emit_audit_rail(
+                    &mut session.tls,
+                    ctx,
+                    slot,
+                    &target_hex,
+                    &draft,
+                    rail_outcome,
+                    ask.created_at,
+                ) {
+                    log::warn!("[relay] audit rail: {e}");
+                }
+            }
+        }
+
+        if !response_transportable(response_json.len()) {
+            log::warn!("[relay] approved response for {request_id} too large for free heap");
+            response_json = nip46::build_error_response(
+                &request_id,
+                -4,
+                "response too large for this signer's memory; the request was not completed",
+            )
+            .unwrap_or_default();
+        }
+
+        let held = Duration::from_secs(crate::uptime_s().saturating_sub(ask.received_uptime));
+        if let Err(e) = sign_and_publish(
+            &mut session.tls,
+            ctx.secp,
+            &signing_secret,
+            &conversation_key,
+            &card.key.client_hex,
+            NIP46_KIND,
+            reply_stamp(ctx, ask.created_at, held),
+            response_json,
+        ) {
+            log::warn!("[relay] approval publish for {request_id}: {e}");
+        }
+    }
+}
+
+/// Service the interactive approval cards: one tick of the front card, and the
+/// whole batch answered when it resolves. Called once per relay loop pass, so
+/// the websocket, the USB cable and the other clients keep running underneath.
+fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
+    if ctx.button_cards.is_empty() {
+        return;
+    }
+
+    // Anything that has waited past the queue TTL without reaching the screen
+    // is answered where it stands, one per pass.
+    let now = crate::uptime_s();
+    let stale = ctx
+        .button_cards
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, card)| {
+            card.asks
+                .first()
+                .is_some_and(|ask| now.saturating_sub(ask.received_uptime) >= CARD_QUEUE_TTL_SECS)
+        })
+        .map(|(index, _)| index);
+    if let Some(index) = stale {
+        log::info!("[relay] approval ask timed out waiting for the screen");
+        resolve_button_card(ctx, sessions, index, &CardTick::Expired);
+        return;
+    }
+
+    let outcome = tick_button_card(ctx);
+    if matches!(outcome, CardTick::Pending) {
+        return;
+    }
+    resolve_button_card(ctx, sessions, 0, &outcome);
+}
+
+/// True while an approval card owns the screen and the button.
+fn approval_card_open(ctx: &SignCtx) -> bool {
+    !ctx.button_cards.is_empty()
 }
 
 fn sign_audit_draft(
@@ -3524,8 +4108,15 @@ fn handle_nip46_event(
     // Dispatch — same handler as the USB path. sign_event is ButtonRequired
     // until the slot is physically button-upgraded; auto-approve covers the
     // safe methods and post-upgrade signing.
-    let mut response_json = crate::nip46_handler::handle_parsed_request(
+    //
+    // Deferred, unlike the USB paths: an ask that needs the button comes back
+    // here undispatched instead of holding this call — and the whole loop —
+    // for the length of a window (#64). The card goes up, the loop carries on,
+    // and the request is dispatched by `resolve_button_card` once the hold is
+    // in hand.
+    let mut response_json = match crate::nip46_handler::dispatch(
         request,
+        None,
         &signing_secret,
         &label,
         mode,
@@ -3538,7 +4129,26 @@ fn handle_nip46_event(
         Some(&client_pubkey),
         ctx.nvs,
         ctx.personas,
-    );
+        crate::nip46_handler::ApprovalDecision::Deferred,
+    ) {
+        crate::nip46_handler::Dispatch::Answered(json) => json,
+        crate::nip46_handler::Dispatch::NeedsApproval(ask) => {
+            return queue_button_ask(
+                tls,
+                ctx,
+                *ask,
+                slot,
+                target_pk,
+                &client_pubkey,
+                &ev.pubkey,
+                &conversation_key,
+                &signing_secret,
+                ev.created_at,
+                received_uptime,
+                audit,
+            );
+        }
+    };
     if !ctx.policy_engine.persist_slots(ctx.nvs, slot) {
         if let Some(snapshot) = slot_snapshot {
             let rollback_durable = ctx

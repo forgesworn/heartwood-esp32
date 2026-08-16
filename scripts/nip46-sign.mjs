@@ -16,6 +16,7 @@
 
 import { argv, env } from 'node:process'
 import { readFileSync } from 'node:fs'
+import { promptForPress } from './press-prompt.mjs'
 
 const { SerialPort } = await (async () => {
   const candidates = [
@@ -167,7 +168,7 @@ const request = {
     content: CONTENT,
   })],
 }
-console.log(`Sending sign_event kind ${KIND} — approve on the device (2 s hold)...`)
+promptForPress(`the sign_event (kind ${KIND})`)
 const sent = Date.now()
 port.write(buildFrame(NIP46_REQUEST, Buffer.from(JSON.stringify(request))))
 

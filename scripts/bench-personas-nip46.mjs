@@ -25,6 +25,7 @@ const { getConversationKey, encrypt, decrypt } = await loadDep('nostr-tools/nip4
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { homedir } from 'node:os'
+import { promptForPress } from './press-prompt.mjs'
 
 const PORT = '/dev/cu.usbmodem3401'
 const BENCH = `${homedir()}/heartwood-bench`
@@ -150,7 +151,7 @@ async function pair() {
   const { slot_index, secret } = JSON.parse(create.payload.toString())
   console.log('\n*** Get ready at the signer: the approval prompt appears in 15 seconds. ***')
   for (let s = 15; s > 0; s -= 5) { console.log(`   ${s}...`); await new Promise((r) => setTimeout(r, 5000)) }
-  console.log('*** PRESS THE BUTTON NOW to approve the "Bench manager" policy (30 s window) ***\n')
+  promptForPress('the "Bench manager" policy', { hold: '2 s, 30 s window' })
   const policy = { slot_index, allowed_methods: ['get_public_key', 'heartwood_derive_persona', 'heartwood_remove_persona', 'heartwood_rename_persona'], allowed_kinds: [], auto_approve: true }
   const upd = await transact(buildFrame(FT.CS_UPDATE, Buffer.concat([Buffer.from([0]), Buffer.from(JSON.stringify(policy))])), [FT.CS_UPDATE_RESP, FT.NACK], 40000)
   if (upd.type === FT.NACK) throw new Error('CONNSLOT_UPDATE denied or timed out')

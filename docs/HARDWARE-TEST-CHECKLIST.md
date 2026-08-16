@@ -848,34 +848,40 @@ thing. All three of the issue's bullets reproduced:
 
 These four must flip to PASS on the fixed firmware (step 6 staying green).
 
-### Bench finding — a held PRG button silently approves everything
+### Bench note — run the machine-driven phases unattended
 
-Part-way through the same session the desk V4 began **signing button-required
-requests with nobody at the desk**, ~5 s after each arrived. The serial tap
-settles what happened:
+Part-way through the same session the desk V4 began answering button-required
+requests ~5 s after each arrived, where earlier ones had sat out their full
+window. The serial tap:
 
 ```
 15:54:12.985 NIP-46 request: method=sign_event id=2bb067e3 master_slot=0
 15:54:18.492 sign_event: approved
 ```
 
-`sign_event: approved` is only reachable when the approval loop sees GPIO 0
-low continuously for two seconds. There were no press, wake or carousel lines
-anywhere in the log, which fits a pin that has been low the whole time rather
-than one being pressed: the #61 latch fires on a falling *edge*, so a
-already-low pin produces no edge, while `is_low()` is true immediately.
+**It was the operator pressing the button.** They were at the desk and
+approved each card as it appeared — the device was working exactly as
+designed. The first reading of this log was that GPIO 0 must be stuck low,
+because `sign_event: approved` needs two continuous seconds of it and no
+press, wake or carousel line appears nearby. That reasoning was wrong: a
+person pressing the button produces the same log, and the absent lines only
+mean the panel was already awake. The same mistake was made earlier in the
+session over SET_OPERATOR ("timeouts NACK as denied"), and it has the same
+root — inferring a fault from timing when the real variable is whether
+somebody is standing there.
 
-Cause is on the desk, not in the firmware — a stuck switch, something resting
-on the board, or a host pinning the pin (the failure mode the wake-on-press
-fix in section 8 was written for). **Clear it before running any approval
-test**, and treat a run that predates clearing it as void: a held button makes
-every card self-approve, so cards resolve, batches answer together, and the
-whole section reports green while the device signs unattended.
+The lesson that survives is about the harness, not the hardware:
 
-`bench-approval-cards.mjs` now refuses to start when it sees this — it raises
-one card at the beginning and aborts if the device signs it. Anything with a
-physical-approval step (sections 7, 8, 11b, 12) should be considered suspect
-until the pre-flight passes.
+- **Run the machine-driven phases unattended.** Every one of them measures
+  what the signer does with a card *nobody answers*. A helpful press turns a
+  batch-collapse check green whatever the firmware does.
+- On pre-#64 firmware a press is doubly misleading: the first approved
+  `sign_event` upgrades the slot to signing (TOFU), so the rest of a burst
+  auto-signs and lands together — which looks exactly like the batch collapse
+  being tested. Only an unpressed run tells collapse from that upgrade.
+- `bench-approval-cards.mjs` raises one card at the start and aborts if
+  anything answers it, naming both possible causes. If that fires because you
+  pressed, just let the next run alone.
 
 The point of every step is that **the rest of the device keeps working while
 the card is up** — that is the whole fix, and it cannot be seen from the card

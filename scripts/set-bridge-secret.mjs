@@ -13,6 +13,7 @@
 
 import { argv, env } from 'node:process'
 import { readFileSync } from 'node:fs'
+import { promptForPress } from './press-prompt.mjs'
 
 const { SerialPort } = await (async () => {
   const candidates = [
@@ -116,7 +117,7 @@ await new Promise((resolve, reject) => {
   port.once('error', reject)
 })
 
-console.log('Sending SET_BRIDGE_SECRET — confirm on the device (2 s button hold)...')
+promptForPress('the SET_BRIDGE_SECRET change')
 port.write(buildFrame(SET_BRIDGE_SECRET, secret))
 
 const reply = await readFrame(port, [ACK, NACK], 90_000)

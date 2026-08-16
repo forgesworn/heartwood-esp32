@@ -15,6 +15,7 @@
 
 import { argv, env } from 'node:process'
 import { readFileSync } from 'node:fs'
+import { promptForPress } from './press-prompt.mjs'
 
 const { SerialPort } = await (async () => {
   const candidates = [
@@ -138,7 +139,7 @@ const payload = Buffer.alloc(36)
 payload.writeUInt32BE(revision >>> 0, 0)
 pubkey.copy(payload, 4)
 
-console.log(`Sending SET_OPERATOR (revision ${revision}, pub ${hex.slice(0, 8)}…) — confirm on the device (button hold)...`)
+promptForPress(`the SET_OPERATOR change (revision ${revision}, pub ${hex.slice(0, 8)}…)`)
 port.write(buildFrame(SET_OPERATOR, payload))
 
 const reply = await readFrame(port, [ACK, NACK], 90_000)

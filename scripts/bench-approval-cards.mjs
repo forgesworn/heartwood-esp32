@@ -318,31 +318,35 @@ function raiseCard(c = client) {
   return c.send('sign_event', [noteTemplate('approval card bench')])
 }
 
-/** Refuse to run at all if the device approves without anyone pressing.
+/** Refuse to run if anything answers a card these phases need left alone.
  *
- * A PRG button held down — something resting on it, a stuck switch, a host
- * pinning GPIO 0 — reads as a completed 2-second hold to the approval loop,
- * so every card self-approves within a couple of seconds. Nothing else here
- * can tell that apart from a working signer: the cards resolve, the batch
- * answers together, and the whole run reports green while the device is
- * signing unattended. Caught on the bench 2026-08-16, after several
- * requests were signed with nobody at the desk.
+ * Every machine-driven phase below measures what the signer does with a card
+ * NOBODY answers, so one approval makes the run meaningless — and green.
+ * Worse on pre-#64 firmware, where the first approved sign_event upgrades the
+ * slot (TOFU) and the rest of a burst then auto-signs and lands together,
+ * which is exactly what the batch-collapse check looks for.
+ *
+ * Two things answer a card: a helpful operator watching the desk, and a
+ * button held down (a stuck switch, or a host pinning GPIO 0). Both look
+ * identical from here, so this names both rather than guessing — guessing
+ * wrong cost this bench a false hardware finding on 2026-08-16.
  */
-async function assertNobodyIsHoldingTheButton() {
+async function assertNothingAnswersCards() {
   const ask = raiseCard()
   const answer = await within(ask.answered, 12000)
   if (answer && !answer.error) {
     throw new Error(
-      'the device SIGNED a button-required request with no press — the PRG ' +
-        'button is being held down (check the desk), so no approval test here ' +
-        'means anything until that is cleared',
+      'a card was APPROVED during the pre-flight. If that was you at the ' +
+        'desk, leave this run alone — every phase here needs cards nobody ' +
+        'answers. If nobody touched it, the button is being held down ' +
+        '(stuck switch, or something resting on the board).',
     )
   }
   if (answer?.error) {
     note(`pre-flight ask answered "${answer.error}" — no card was raised`)
     return
   }
-  note('pre-flight: card is up and unapproved, as it should be')
+  note('pre-flight: card is up and unanswered, as these phases need')
   // Let it expire so the phases start from a clear screen.
   await within(ask.answered, (WINDOW + 20) * 1000)
 }
@@ -562,7 +566,7 @@ const wanted = (name) => !ONLY || ONLY === name
 try {
   await openMgmt()
   const targetHex = await setup()
-  await assertNobodyIsHoldingTheButton()
+  await assertNothingAnswersCards()
 
   // A card each: the liveness probes run for as long as their card is up, so
   // they cannot share one. Each phase leaves its card expired behind it.

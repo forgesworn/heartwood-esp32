@@ -23,6 +23,7 @@
 import { execFileSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { argv } from 'node:process'
+import { promptForPress } from './press-prompt.mjs'
 
 function arg(name, fallback = null) {
   const i = argv.indexOf(name)
@@ -94,7 +95,7 @@ function parse(stdout) {
 const results = []
 console.log(`port ${PORT}`)
 console.log(`sizes ${SIZES.join(', ')}`)
-console.log('press the device button to approve each request\n')
+promptForPress('each request in this sweep')
 
 for (const size of SIZES) {
   process.stdout.write(`content ${String(size).padStart(6)} B ... `)

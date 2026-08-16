@@ -725,6 +725,16 @@ USB `CONNSLOT_UPDATE` (0x17.0 carries `escalate`, `petition_on_deny`,
    the dependant → the same rumor arrives wrapped to that slot's client
    pubkey as well.
 10. Run the pass on the T-Display too before calling CP5.
+11. **D2 persona-addressed mint** (operator channel, no button):
+    `create_client_v2` with `params.identity` = a dependant persona →
+    returned `bunker_uri`/`npub_hex` addressed to the persona and
+    `bound_identity` defaulted to it; a client pairing on that URI gets
+    `get_public_key` = the persona. `client_uri` with `params.identity`
+    re-issues an existing slot's URI persona-addressed. `nostrconnect_v2`
+    with `params.identity` publishes its connect ACK authored BY the
+    persona (the app pins the persona as its signer). A persona of a
+    different master, or junk hex, is rejected without touching the slot
+    table. Gate on `pairing_identity_v1` in `get_status.capabilities`.
 
 ## Notes
 

@@ -3798,6 +3798,54 @@ fn handle_mgmt_event(
     )
 }
 
+/// The identity a pairing mint is addressed to (D2 persona-addressed
+/// pairing). Resolved from an optional `params.identity`; absent means the
+/// master, exactly the pre-D2 behaviour.
+enum AddressedIdentity {
+    Master,
+    Persona {
+        hex: String,
+        purpose: String,
+        index: u32,
+    },
+}
+
+/// Resolve an optional `params.identity` (x-only hex) against the identities
+/// THIS master serves — itself or one of its registry personas. An operator
+/// can therefore never mint a URI pointing at a key the signer will not
+/// answer for, and a persona of a *different* master is rejected rather than
+/// silently cross-wired.
+fn identity_param(
+    req: &serde_json::Value,
+    masters: &[crate::masters::LoadedMaster],
+    personas: &[crate::personas::LoadedPersona],
+    master_idx: usize,
+) -> Result<AddressedIdentity, String> {
+    let raw = match req.pointer("/params/identity").and_then(|v| v.as_str()) {
+        None => return Ok(AddressedIdentity::Master),
+        Some(s) => s,
+    };
+    let bytes: [u8; 32] = hex_decode(raw)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("identity must be 32-byte hex")?;
+    let master = &masters[master_idx];
+    if bytes == master.pubkey {
+        return Ok(AddressedIdentity::Master);
+    }
+    match crate::personas::find_by_pubkey(personas, &bytes) {
+        Some(pidx) if personas[pidx].master_slot == master.slot => {
+            let p = &personas[pidx];
+            Ok(AddressedIdentity::Persona {
+                hex: hex_encode(&bytes),
+                purpose: p.purpose.clone(),
+                index: p.index,
+            })
+        }
+        _ => Err("identity not served by this master".into()),
+    }
+}
+
 /// Parse the v2 exact-policy envelope strictly. The versioned method name is
 /// intentional: old firmware rejects it before mutation instead of silently
 /// ignoring fields it does not understand and creating a broad signing slot.
@@ -4458,11 +4506,31 @@ fn dispatch_mgmt(
 
         "create_client" | "create_client_v2" => {
             let is_v2 = method == "create_client_v2";
-            let exact_policy = if is_v2 {
+            let mut exact_policy = if is_v2 {
                 Some(exact_policy_from_request(req)?)
             } else {
                 None
             };
+            // D2 persona-addressed mint: v2-only, so a legacy create_client
+            // errors rather than silently minting a master-addressed slot
+            // when the operator asked for a persona endpoint.
+            if !is_v2 && req.pointer("/params/identity").is_some() {
+                return Err("params.identity requires create_client_v2".into());
+            }
+            let addressed = identity_param(req, ctx.masters, ctx.personas, master_idx)?;
+            let endpoint_hex = match &addressed {
+                AddressedIdentity::Master => master_hex.clone(),
+                AddressedIdentity::Persona { hex, .. } => hex.clone(),
+            };
+            // A persona-addressed slot defaults its child-wrap binding to the
+            // addressed persona unless the operator bound something explicitly.
+            if let (Some(policy), AddressedIdentity::Persona { hex, .. }) =
+                (exact_policy.as_mut(), &addressed)
+            {
+                if policy.bound_identity.is_none() {
+                    policy.bound_identity = Some(hex.clone());
+                }
+            }
             let label = req
                 .pointer("/params/label")
                 .and_then(|v| v.as_str())
@@ -4518,7 +4586,8 @@ fn dispatch_mgmt(
                         slot_snapshot,
                         "client creation",
                     )?;
-                    let bunker_uri = mgmt::bunker_uri(&master_hex, &ctx.relays, Some(&secret_hex));
+                    let bunker_uri =
+                        mgmt::bunker_uri(&endpoint_hex, &ctx.relays, Some(&secret_hex));
                     log::info!(
                         "[relay] mgmt: created client slot {index} ({label}){}",
                         if auto_sign {
@@ -4543,7 +4612,7 @@ fn dispatch_mgmt(
                         "label": label,
                         "secret": secret_hex,
                         "secret_fingerprint": secret_fingerprint,
-                        "npub_hex": master_hex,
+                        "npub_hex": endpoint_hex,
                         "bunker_uri": bunker_uri,
                         "signing_approved": auto_sign,
                         "policy_version": if is_v2 { Some(2u8) } else { None },
@@ -4567,11 +4636,28 @@ fn dispatch_mgmt(
         // The device has no wall-clock, so the operator (SPA) supplies created_at.
         "nostrconnect" | "nostrconnect_v2" => {
             let is_v2 = method == "nostrconnect_v2";
-            let exact_policy = if is_v2 {
+            let mut exact_policy = if is_v2 {
                 Some(exact_policy_from_request(req)?)
             } else {
                 None
             };
+            // D2 persona-addressed pairing: v2-only, same fail-closed rule as
+            // create_client.
+            if !is_v2 && req.pointer("/params/identity").is_some() {
+                return Err("params.identity requires nostrconnect_v2".into());
+            }
+            let addressed = identity_param(req, ctx.masters, ctx.personas, master_idx)?;
+            let endpoint_hex = match &addressed {
+                AddressedIdentity::Master => master_hex.clone(),
+                AddressedIdentity::Persona { hex, .. } => hex.clone(),
+            };
+            if let (Some(policy), AddressedIdentity::Persona { hex, .. }) =
+                (exact_policy.as_mut(), &addressed)
+            {
+                if policy.bound_identity.is_none() {
+                    policy.bound_identity = Some(hex.clone());
+                }
+            }
             let client_hex = req
                 .pointer("/params/client_pubkey")
                 .and_then(|v| v.as_str())
@@ -4715,13 +4801,31 @@ fn dispatch_mgmt(
                 return Err("create_slot failed (slot table full)".into());
             }
 
-            // Copy the master secret up front (it is Copy) so publishing the ACK
-            // below needs no live borrow of ctx while the slot table is mutated.
-            let master_secret = ctx.masters[master_idx].secret;
+            // Own the ACK authoring secret up front so publishing below needs
+            // no live borrow of ctx while the slot table is mutated. The app
+            // pins its signer from the ACK's author, so a persona-addressed
+            // pairing must author as that persona — re-derived here; a master
+            // pairing authors as the master exactly as before.
+            let ack_secret: zeroize::Zeroizing<[u8; 32]> = match &addressed {
+                AddressedIdentity::Master => {
+                    zeroize::Zeroizing::new(ctx.masters[master_idx].secret)
+                }
+                AddressedIdentity::Persona { purpose, index, .. } => {
+                    let owning = &ctx.masters[master_idx];
+                    crate::nip46_handler::derive_identity(
+                        &owning.secret,
+                        owning.mode,
+                        purpose,
+                        *index,
+                    )
+                    .map_err(|e| format!("identity key derivation: {e}"))?
+                    .0
+                }
+            };
             // Hex shape is not enough: validate/lift the x-only key and derive
             // the ACK conversation key before dialling or touching slot RAM.
             // No fallible key operation may strand an orphan authority change.
-            let ck = nip44::get_conversation_key(&master_secret, &client_bytes)
+            let ck = nip44::get_conversation_key(&ack_secret, &client_bytes)
                 .map_err(|e| format!("conversation key: {e}"))?;
 
             // Fresh secrets need fresh entropy — fail closed like the USB
@@ -4840,7 +4944,8 @@ fn dispatch_mgmt(
                 ctx.policy_engine.upgrade_to_signing(master_slot, index);
             }
 
-            // Publish the connect ACK to the app, authored by this master.
+            // Publish the connect ACK to the app, authored by the addressed
+            // identity.
             let mut id_bytes = [0u8; 8];
             crate::fill_random(&mut id_bytes);
             let ack =
@@ -4854,7 +4959,7 @@ fn dispatch_mgmt(
             if let Err(e) = sign_and_publish(
                 ack_tls,
                 ctx.secp,
-                &master_secret,
+                &ack_secret,
                 &ck,
                 client_hex,
                 NIP46_KIND,
@@ -4962,6 +5067,7 @@ fn dispatch_mgmt(
             Ok(serde_json::json!({
                 "slot_index": index,
                 "client_pubkey": client_hex,
+                "identity": endpoint_hex,
                 "secret_fingerprint": applied
                     .map(|slot| mgmt::credential_fingerprint(&slot.secret))
                     .unwrap_or_default(),
@@ -5043,10 +5149,20 @@ fn dispatch_mgmt(
                 .find(|s| s.slot_index == slot_index)
                 .ok_or_else(|| format!("no such slot: {slot_index}"))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, slot)?;
+            // D2: optional persona-addressed URI for an existing slot. The
+            // method name is unversioned, so older firmware ignores the
+            // param — operators must gate on the `pairing_identity_v1`
+            // capability before relying on it.
+            let addressed = identity_param(req, ctx.masters, ctx.personas, master_idx)?;
+            let endpoint_hex = match &addressed {
+                AddressedIdentity::Master => master_hex.clone(),
+                AddressedIdentity::Persona { hex, .. } => hex.clone(),
+            };
             Ok(serde_json::json!({
                 "slot_index": slot_index,
                 "secret_fingerprint": secret_fingerprint,
-                "bunker_uri": mgmt::bunker_uri(&master_hex, &ctx.relays, Some(&slot.secret)),
+                "identity": endpoint_hex,
+                "bunker_uri": mgmt::bunker_uri(&endpoint_hex, &ctx.relays, Some(&slot.secret)),
             }))
         }
 
@@ -5375,6 +5491,12 @@ fn dispatch_mgmt(
                     // update_client — the C3 compiler push feature-detects
                     // on this entry.
                     "client_policy_flags_v1",
+                    // D2 persona-addressed pairing: create_client_v2 /
+                    // nostrconnect_v2 / client_uri accept params.identity
+                    // (an identity this master serves) and mint the pairing
+                    // addressed to it, defaulting bound_identity to a persona
+                    // endpoint.
+                    "pairing_identity_v1",
                     "atomic_nostrconnect_policy_v2",
                     "staged_network_config_v1",
                     "mutation_challenge_v1",

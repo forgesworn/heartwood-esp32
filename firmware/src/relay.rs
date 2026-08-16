@@ -328,6 +328,22 @@ struct SignCtx<'a, 'd, 'b> {
     audit_last_stamped: u64,
     /// Uniqueness counter inside the C5 `d` tag's pseudo-millisecond suffix.
     audit_emit_seq: u64,
+    /// Freshest wall-clock reading seen from the relays. The chip has no
+    /// clock of its own, so this is what lets a reply held behind an approval
+    /// window be stamped for when it is sent rather than when it arrived (#64).
+    reply_clock: heartwood_common::reply_clock::ReplyClock,
+}
+
+/// Timestamp for a reply to a request that arrived `held` ago.
+///
+/// A park can sit on the shelf for the whole ten-minute TTL and an approval
+/// card for its whole window, so echoing the trigger's own `created_at` — as
+/// every reply used to — backdates the answer by the entire wait (#64). See
+/// [`heartwood_common::reply_clock`] for how the two estimates combine.
+fn reply_stamp(ctx: &SignCtx, request_created_at: u64, held: Duration) -> u64 {
+    let now = crate::uptime_s();
+    ctx.reply_clock
+        .stamp(request_created_at, now.saturating_sub(held.as_secs()), now)
 }
 
 /// Wake the panel on a press; while awake, further presses page the idle
@@ -777,6 +793,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         petitions: Vec::new(),
         audit_last_stamped: 0,
         audit_emit_seq: 0,
+        reply_clock: heartwood_common::reply_clock::ReplyClock::new(),
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -2384,6 +2401,13 @@ fn process_event(
         return Ok(());
     }
 
+    // Every authentic event carries someone's idea of the wall clock, which is
+    // the only such reading this chip ever gets. Feed it to the reply clock
+    // before any routing decision, so even traffic we go on to ignore keeps
+    // our sense of "now" fresh. Backdated events (a NIP-59 seal jitters into
+    // the past) cannot drag it backwards.
+    ctx.reply_clock.observe(ev.created_at, crate::uptime_s());
+
     // Our own kind-0 profile: cache the name and refresh the idle identity
     // screen. This is not a user request, so it must never wake a blanked panel.
     if ev.kind == 0 {
@@ -2935,6 +2959,7 @@ fn complete_parked(
     let request_id = park.request.id.clone();
     let target_hex = hex_encode(&park.target_pk);
     let created_at = park.created_at;
+    let held = park.parked_at.elapsed();
     let client_hex = park.client_hex;
     let client_pubkey = park.client_pubkey;
 
@@ -2988,7 +3013,7 @@ fn complete_parked(
         &conversation_key,
         &client_hex,
         NIP46_KIND,
-        created_at,
+        reply_stamp(ctx, created_at, held),
         response_json,
     ) {
         Ok(()) => true,
@@ -3051,7 +3076,7 @@ fn deny_parked(tls: &mut Tls, ctx: &mut SignCtx, park: ParkedRequest) {
         &conversation_key,
         &park.client_hex,
         NIP46_KIND,
-        park.created_at,
+        reply_stamp(ctx, park.created_at, park.parked_at.elapsed()),
         response,
     ) {
         log::warn!("[relay] park deny publish: {e}");
@@ -3200,6 +3225,11 @@ fn handle_nip46_event(
     ctx: &mut SignCtx,
     target_pk: &[u8; 32],
 ) -> Result<(), String> {
+    // When this request reached us, on the only monotonic counter the chip
+    // has. Everything published below is stamped from it rather than from the
+    // request's own `created_at`, so a reply held behind an approval window is
+    // not backdated to the moment the ask arrived (#64).
+    let received_uptime = crate::uptime_s();
     // Resolve the addressed identity to its signing key. A master signs with its
     // own secret; a persona re-derives its key from the owning master and uses
     // that key for BOTH the NIP-44 transport and the envelope signature — so one
@@ -3362,7 +3392,8 @@ fn handle_nip46_event(
             &conversation_key,
             &ev.pubkey,
             NIP46_KIND,
-            ev.created_at,
+            ctx.reply_clock
+                .stamp(ev.created_at, received_uptime, crate::uptime_s()),
             response,
         );
     }
@@ -3384,7 +3415,8 @@ fn handle_nip46_event(
                 &conversation_key,
                 &ev.pubkey,
                 NIP46_KIND,
-                ev.created_at,
+                ctx.reply_clock
+                    .stamp(ev.created_at, received_uptime, crate::uptime_s()),
                 response,
             );
         }
@@ -3591,7 +3623,8 @@ fn handle_nip46_event(
         &conversation_key,
         &ev.pubkey,
         NIP46_KIND,
-        ev.created_at,
+        ctx.reply_clock
+            .stamp(ev.created_at, received_uptime, crate::uptime_s()),
         response_json,
     )
 }
@@ -3605,6 +3638,9 @@ fn handle_mgmt_event(
     master_idx: usize,
     pool: &mut RelayPool,
 ) -> Result<(), String> {
+    // Receipt time on the monotonic counter, so an ack for a command that
+    // stopped for the button (or completed a park) is not backdated (#64).
+    let received_uptime = crate::uptime_s();
     let op_mgmt = match ctx.op_mgmt {
         Some(k) => k,
         None => {
@@ -3801,6 +3837,9 @@ fn handle_mgmt_event(
         .to_string()
     };
 
+    let stamped = ctx
+        .reply_clock
+        .stamp(ev.created_at, received_uptime, crate::uptime_s());
     let master = &ctx.masters[master_idx];
     sign_and_publish(
         &mut s.tls,
@@ -3809,7 +3848,7 @@ fn handle_mgmt_event(
         &conversation_key,
         &ev.pubkey,
         MGMT_KIND,
-        ev.created_at,
+        stamped,
         response_json,
     )
 }

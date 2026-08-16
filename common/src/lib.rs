@@ -44,6 +44,8 @@ pub mod persistent_state;
 
 pub mod persona_pack;
 
+pub mod reply_clock;
+
 #[cfg(feature = "mnemonic")]
 pub mod mnemonic;
 

@@ -495,7 +495,7 @@ fn main() {
     // --- Boot-time network config read ---
     let boot_net_cfg = net_config_store::prepare_boot_net_config(&mut nvs);
     let trial_transaction_id = boot_net_cfg.trial_transaction_id;
-    let net_cfg = boot_net_cfg.config;
+    let mut net_cfg = boot_net_cfg.config;
     if let Some(cfg) = &net_cfg {
         log::info!(
             "net config present: mode={:?}, {} relay(s)",
@@ -574,12 +574,40 @@ fn main() {
                     }
                     // handle_add sent a NACK; wait for the next frame.
                 }
+                // Staged network config before the first identity (#66):
+                // words-first ordering is not required — a provisioning flow
+                // can push WiFi + relays up front. Still button-confirmed;
+                // no reboot (an unprovisioned board would only boot back to
+                // this screen). The wifi_armed check on provision picks the
+                // staged config up and reboots into signer mode then.
+                FRAME_TYPE_SET_NET_CONFIG => {
+                    if let Some(cfg) = net_config_store::handle_set_net_config(
+                        &mut usb,
+                        &frame.payload,
+                        &mut nvs,
+                        &mut display,
+                        &buttons,
+                        false,
+                    ) {
+                        net_cfg = Some(cfg);
+                    }
+                    oled::show_provision_wait(&mut display);
+                }
+                // Read-only state probe, so setup tooling can sequence itself
+                // (revision for later patches, mode, relay count).
+                FRAME_TYPE_GET_NET_CONFIG => {
+                    net_config_store::handle_get_net_config(
+                        &mut usb,
+                        &mut nvs,
+                        heartwood_common::net_config::NetworkRuntimeStatus::radio_off(),
+                    );
+                }
                 _ => {
                     log::warn!(
                         "Expected provision frame, got type 0x{:02x}",
                         frame.frame_type
                     );
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"no identity: provision first");
                 }
             }
         }
@@ -1082,6 +1110,7 @@ fn main() {
                     &mut nvs,
                     &mut display,
                     &buttons,
+                    true,
                 );
             }
 

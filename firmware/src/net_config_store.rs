@@ -780,13 +780,20 @@ pub fn handle_set_operator(
 /// Parses and validates the JSON payload, requires a 30-second button-hold
 /// confirmation on the OLED, then persists the config to NVS.
 /// Mirrors handle_set_bridge_secret in session.rs exactly.
+///
+/// A wifi save normally applies by rebooting straight into the relay loop.
+/// `reboot_into_wifi: false` suppresses that for provision-wait (#66), where
+/// an unprovisioned board would only boot back to the setup screen — the
+/// staged config is returned instead so the caller can pick it up when the
+/// first identity lands.
 pub fn handle_set_net_config(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
     nvs: &mut EspNvs<NvsDefault>,
     display: &mut crate::oled::Display<'_>,
     buttons: &crate::button::Buttons<'_>,
-) {
+    reboot_into_wifi: bool,
+) -> Option<heartwood_common::net_config::NetConfig> {
     match heartwood_common::net_config::parse_net_config(payload) {
         Ok(cfg) if cfg.validate().is_ok() => {
             let result =
@@ -797,7 +804,7 @@ pub fn handle_set_net_config(
             if !matches!(result, crate::approval::ApprovalResult::Approved) {
                 log::info!("SET_NET_CONFIG denied by user");
                 protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-                return;
+                return None;
             }
 
             crate::oled::show_network_status(display, NetworkDisplayState::Saving);
@@ -814,7 +821,7 @@ pub fn handle_set_net_config(
                     let wifi = cfg.device_mode() == heartwood_common::net_config::DeviceMode::Wifi;
                     crate::oled::show_network_status(
                         display,
-                        if wifi {
+                        if wifi && reboot_into_wifi {
                             NetworkDisplayState::JoiningWifi
                         } else {
                             NetworkDisplayState::Saved
@@ -822,24 +829,27 @@ pub fn handle_set_net_config(
                     );
                     esp_idf_hal::delay::FreeRtos::delay_ms(1500);
                     protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
-                    if wifi {
+                    if wifi && reboot_into_wifi {
                         // Brief delay so the ACK flushes to the host before the
                         // USB CDC drops on restart.
                         esp_idf_hal::delay::FreeRtos::delay_ms(300);
                         log::info!("WiFi config saved — rebooting into signer mode");
                         unsafe { esp_idf_svc::sys::esp_restart() };
                     }
+                    Some(cfg)
                 }
                 Err(e) => {
                     log::error!("Failed to write network config: {e}");
                     crate::oled::show_network_status(display, NetworkDisplayState::SaveFailed);
                     protocol::write_frame(usb, FRAME_TYPE_NACK, b"nvs");
+                    None
                 }
             }
         }
         _ => {
             log::warn!("SET_NET_CONFIG rejected — invalid payload");
             protocol::write_frame(usb, FRAME_TYPE_NACK, b"invalid config");
+            None
         }
     }
 }

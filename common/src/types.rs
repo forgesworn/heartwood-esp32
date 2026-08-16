@@ -74,7 +74,7 @@ pub const FRAME_TYPE_BACKUP_IMPORT_REQUEST: u8 = 0x52;   // host -> device: JSON
 pub const FRAME_TYPE_BACKUP_IMPORT_RESPONSE: u8 = 0x53;  // device -> host: 0x01 success / 0x00 failure
 
 // Network / connectivity (WiFi-standalone mode)
-pub const FRAME_TYPE_SET_NET_CONFIG: u8 = 0x54;  // host -> device: JSON NetConfig {ssid,password,relays,mode}; reply ACK/NACK
+pub const FRAME_TYPE_SET_NET_CONFIG: u8 = 0x54;  // host -> device: JSON NetConfig {ssid,password,relays,mode}; reply ACK/NACK. Accepted before the first identity exists too (provision-wait, #66) — a staged wifi config takes effect when the first identity lands.
 pub const FRAME_TYPE_WIFI_SCAN_REQUEST: u8 = 0x55;   // host -> device: empty payload; device scans nearby 2.4 GHz APs (reply 0x56, or NACK if it cannot scan)
 pub const FRAME_TYPE_WIFI_SCAN_RESPONSE: u8 = 0x56;  // device -> host: JSON [{ssid,rssi,channel,auth,band24}] (strongest first, one per SSID) for the SSID picker
 pub const FRAME_TYPE_GENERATE_IDENTITY: u8 = 0x57;   // host -> device: optional [label_len][label][words?] — words is 12 (default when absent) or 24; device plays the entropy game, self-generates from stacked entropy, shows the phrase on its OLED, stores it, replies ACK (npub via PROVISION_LIST). The phrase is NEVER sent to the host.

@@ -2015,13 +2015,16 @@ fn poll_usb(
 
         // Network reconfig — the handler reboots into the new mode itself on a
         // wifi save (and simply persists a radio-off save).
-        FRAME_TYPE_SET_NET_CONFIG => crate::net_config_store::handle_set_net_config(
-            usb,
-            &frame.payload,
-            ctx.nvs,
-            ctx.display,
-            ctx.buttons,
-        ),
+        FRAME_TYPE_SET_NET_CONFIG => {
+            crate::net_config_store::handle_set_net_config(
+                usb,
+                &frame.payload,
+                ctx.nvs,
+                ctx.display,
+                ctx.buttons,
+                true,
+            );
+        }
 
         FRAME_TYPE_GET_NET_CONFIG => {
             crate::net_config_store::handle_get_net_config(usb, ctx.nvs, ctx.network_runtime)

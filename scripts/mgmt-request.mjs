@@ -25,18 +25,18 @@ import { argv, env, exit } from 'node:process'
 import { readFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import {
-  WebSocket,
   finalizeEvent,
   getPublicKey,
   nip44,
   arg,
   toHex,
-  DEFAULT_RELAY,
+  relayList,
+  RelayFanout,
 } from './relay-deps.mjs'
 
 const has = (name) => argv.includes(name)
 
-const RELAY = arg(argv, '--relay', DEFAULT_RELAY)
+const RELAYS = relayList(argv)
 const KEY_FILE = arg(argv, '--key-file', `${env.HOME}/heartwood-bench/operator.key`)
 const METHOD = arg(argv, '--method')
 const PARAMS = JSON.parse(arg(argv, '--params', '{}'))
@@ -63,9 +63,11 @@ const sk = Uint8Array.from(Buffer.from(skHex, 'hex'))
 const opPub = getPublicKey(sk)
 const ck = nip44.v2.utils.getConversationKey(sk, master)
 
-const ws = new WebSocket(RELAY)
+const ws = new RelayFanout(RELAYS)
 const deadline = setTimeout(() => {
-  console.error(`timeout: no response within ${TIMEOUT} ms`)
+  console.error(
+    `timeout: no response within ${TIMEOUT} ms (tried ${RELAYS.join(', ')})`,
+  )
   ws.close()
   exit(1)
 }, TIMEOUT)
@@ -84,6 +86,7 @@ function roundTrip(method, params, extra = {}) {
       },
       sk,
     )
+    let off = () => {}
     const onMessage = (data) => {
       let msg
       try {
@@ -101,25 +104,23 @@ function roundTrip(method, params, extra = {}) {
         return
       }
       if (inner.id !== id) return
-      ws.removeListener('message', onMessage)
+      off()
       if (inner.error !== undefined) reject(new Error(inner.error))
       else resolve(inner.result)
     }
-    ws.on('message', onMessage)
-    ws.send(JSON.stringify(['EVENT', ev]))
+    off = ws.on(onMessage)
+    ws.send(['EVENT', ev])
   })
 }
 
-ws.on('open', async () => {
+try {
+  const live = await ws.open()
   // Ephemeral kind: the forward-only subscription must be up before publishing.
-  ws.send(
-    JSON.stringify([
-      'REQ',
-      'mgmt',
-      { kinds: [24134], authors: [master], '#p': [opPub], limit: 0 },
-    ]),
-  )
-  try {
+  ws.req('mgmt', { kinds: [24134], authors: [master], '#p': [opPub], limit: 0 })
+  if (live.length < RELAYS.length) {
+    console.error(`(connected to ${live.length}/${RELAYS.length} relays)`)
+  }
+  {
     let extra = {}
     if (has('--challenge')) {
       const { challenge } = await roundTrip('get_management_challenge', {})
@@ -130,14 +131,10 @@ ws.on('open', async () => {
     clearTimeout(deadline)
     ws.close()
     exit(0)
-  } catch (e) {
-    console.error(`error: ${e.message}`)
-    clearTimeout(deadline)
-    ws.close()
-    exit(1)
   }
-})
-ws.on('error', (e) => {
-  console.error(`relay error: ${e.message}`)
+} catch (e) {
+  console.error(`error: ${e.message}`)
+  clearTimeout(deadline)
+  ws.close()
   exit(1)
-})
+}

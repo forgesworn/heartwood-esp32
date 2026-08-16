@@ -60,3 +60,108 @@ export function toHex(value, what = 'value') {
 
 /** The bench relay these tools default to; override with --relay. */
 export const DEFAULT_RELAY = env.HEARTWOOD_RELAY ?? 'wss://relay.trotters.cc'
+
+/** The device's configured set. Its primary session ROTATES over these, so a
+ *  tool pinned to one of them goes silent whenever the device is on another —
+ *  which reads exactly like a wedged signer. Fan out instead. */
+export const DEFAULT_RELAYS = (env.HEARTWOOD_RELAYS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .concat(
+    env.HEARTWOOD_RELAYS
+      ? []
+      : [
+          'wss://relay.trotters.cc',
+          'wss://nos.lol',
+          'wss://relay.damus.io',
+          'wss://relay.primal.net',
+        ],
+  )
+
+/** Collect repeated `--relay` flags; falls back to the configured set. */
+export function relayList(argv) {
+  const picked = []
+  argv.forEach((a, i) => {
+    if (a === '--relay' && argv[i + 1]) picked.push(argv[i + 1])
+  })
+  return picked.length ? picked : DEFAULT_RELAYS
+}
+
+/**
+ * One logical connection across several relays.
+ *
+ * Publishes every event to all of them and delivers every inbound EVENT to
+ * the registered handlers, so it does not matter which relay the device
+ * happens to be on. Relays that refuse a connection are skipped rather than
+ * failing the run — one 503 must not take the bench down.
+ */
+export class RelayFanout {
+  constructor(urls) {
+    this.urls = urls
+    this.sockets = []
+    this.handlers = new Set()
+  }
+
+  async open() {
+    await Promise.all(
+      this.urls.map(
+        (url) =>
+          new Promise((resolve) => {
+            let ws
+            try {
+              ws = new WebSocket(url)
+            } catch {
+              resolve()
+              return
+            }
+            const done = () => resolve()
+            ws.on('error', done)
+            ws.on('message', (data) => {
+              for (const handler of this.handlers) handler(data, url)
+            })
+            ws.on('open', () => {
+              this.sockets.push({ ws, url })
+              done()
+            })
+          }),
+      ),
+    )
+    if (!this.sockets.length) {
+      throw new Error(`no relay accepted a connection (tried ${this.urls.join(', ')})`)
+    }
+    return this.sockets.map((s) => s.url)
+  }
+
+  /** Subscribe on every live relay. */
+  req(subId, filter) {
+    this.send(['REQ', subId, filter])
+  }
+
+  send(message) {
+    const payload = JSON.stringify(message)
+    for (const { ws } of this.sockets) {
+      try {
+        ws.send(payload)
+      } catch {
+        /* a dead socket must not stop the others */
+      }
+    }
+  }
+
+  on(handler) {
+    this.handlers.add(handler)
+    return () => this.handlers.delete(handler)
+  }
+
+  close() {
+    for (const { ws } of this.sockets) {
+      try {
+        ws.close()
+      } catch {
+        /* already gone */
+      }
+    }
+    this.sockets = []
+  }
+}

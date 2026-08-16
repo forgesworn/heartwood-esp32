@@ -35,16 +35,16 @@ import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  WebSocket,
   finalizeEvent,
   getPublicKey,
   nip44,
   arg,
   toHex,
-  DEFAULT_RELAY,
+  relayList,
+  RelayFanout,
 } from './relay-deps.mjs'
 
-const RELAY = arg(argv, '--relay', DEFAULT_RELAY)
+const RELAYS = relayList(argv)
 const KEY_FILE = arg(argv, '--key-file', `${env.HOME}/heartwood-bench/operator.key`)
 const PORT = arg(argv, '--port', '/dev/cu.usbmodem3401')
 const MASTER_ARG = arg(argv, '--master', env.HEARTWOOD_MASTER)
@@ -78,21 +78,11 @@ const opPub = getPublicKey(opSk)
 const opCk = nip44.v2.utils.getConversationKey(opSk, MASTER)
 
 let mgmtWs
-function openMgmt() {
-  return new Promise((resolve, reject) => {
-    mgmtWs = new WebSocket(RELAY)
-    mgmtWs.on('error', reject)
-    mgmtWs.on('open', () => {
-      mgmtWs.send(
-        JSON.stringify([
-          'REQ',
-          'mgmt',
-          { kinds: [24134], authors: [MASTER], '#p': [opPub], limit: 0 },
-        ]),
-      )
-      resolve()
-    })
-  })
+async function openMgmt() {
+  mgmtWs = new RelayFanout(RELAYS)
+  const live = await mgmtWs.open()
+  mgmtWs.req('mgmt', { kinds: [24134], authors: [MASTER], '#p': [opPub], limit: 0 })
+  note(`operator channel on ${live.length}/${RELAYS.length} relays`)
 }
 
 function mgmt(method, params = {}, extra = {}, timeoutMs = 30000) {
@@ -107,8 +97,9 @@ function mgmt(method, params = {}, extra = {}, timeoutMs = 30000) {
       },
       opSk,
     )
+    let off = () => {}
     const timer = setTimeout(() => {
-      mgmtWs.removeListener('message', onMessage)
+      off()
       reject(new Error(`mgmt ${method}: timeout`))
     }, timeoutMs)
     const onMessage = (data) => {
@@ -129,12 +120,12 @@ function mgmt(method, params = {}, extra = {}, timeoutMs = 30000) {
       }
       if (inner.id !== id) return
       clearTimeout(timer)
-      mgmtWs.removeListener('message', onMessage)
+      off()
       if (inner.error !== undefined) reject(new Error(inner.error))
       else resolve(inner.result)
     }
-    mgmtWs.on('message', onMessage)
-    mgmtWs.send(JSON.stringify(['EVENT', ev]))
+    off = mgmtWs.on(onMessage)
+    mgmtWs.send(['EVENT', ev])
   })
 }
 
@@ -148,7 +139,7 @@ async function mgmtMutate(method, params) {
 // NIP-46 clients (kind 24133)
 // ---------------------------------------------------------------------------
 
-/** A bench client with its own key and its own relay socket. */
+/** A bench client with its own key, fanned out across the relays. */
 class Client {
   constructor(name, targetHex) {
     this.name = name
@@ -159,40 +150,34 @@ class Client {
     this.pending = new Map()
   }
 
-  open() {
-    return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(RELAY)
-      this.ws.on('error', reject)
-      this.ws.on('message', (data) => {
-        let msg
-        try {
-          msg = JSON.parse(data.toString())
-        } catch {
-          return
-        }
-        if (msg[0] !== 'EVENT' || msg[1] !== 'c') return
-        const e = msg[2]
-        let inner
-        try {
-          inner = JSON.parse(nip44.v2.decrypt(e.content, this.ck))
-        } catch {
-          return
-        }
-        const waiter = this.pending.get(inner.id)
-        if (!waiter) return
-        this.pending.delete(inner.id)
-        waiter({ ...inner, at: Date.now(), created_at: e.created_at })
-      })
-      this.ws.on('open', () => {
-        this.ws.send(
-          JSON.stringify([
-            'REQ',
-            'c',
-            { kinds: [24133], authors: [this.target], '#p': [this.pub], limit: 0 },
-          ]),
-        )
-        resolve()
-      })
+  async open() {
+    this.ws = new RelayFanout(RELAYS)
+    await this.ws.open()
+    this.ws.on((data) => {
+      let msg
+      try {
+        msg = JSON.parse(data.toString())
+      } catch {
+        return
+      }
+      if (msg[0] !== 'EVENT' || msg[1] !== 'c') return
+      const e = msg[2]
+      let inner
+      try {
+        inner = JSON.parse(nip44.v2.decrypt(e.content, this.ck))
+      } catch {
+        return
+      }
+      const waiter = this.pending.get(inner.id)
+      if (!waiter) return
+      this.pending.delete(inner.id)
+      waiter({ ...inner, at: Date.now(), created_at: e.created_at })
+    })
+    this.ws.req('c', {
+      kinds: [24133],
+      authors: [this.target],
+      '#p': [this.pub],
+      limit: 0,
     })
   }
 
@@ -219,7 +204,7 @@ class Client {
         resolve(answer)
       }),
     )
-    this.ws.send(JSON.stringify(['EVENT', ev]))
+    this.ws.send(['EVENT', ev])
     return ask
   }
 

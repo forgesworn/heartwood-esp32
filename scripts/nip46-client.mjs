@@ -21,15 +21,16 @@ import { argv, exit } from 'node:process'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import {
-  WebSocket,
   finalizeEvent,
   getPublicKey,
   nip44,
   arg,
-  DEFAULT_RELAY,
+  relayList,
+  RelayFanout,
 } from './relay-deps.mjs'
+import { startPressPrompt } from './press-prompt.mjs'
 
-const RELAY = arg(argv, '--relay', DEFAULT_RELAY)
+const RELAYS = relayList(argv)
 const TARGET = arg(argv, '--target')
 const METHOD = arg(argv, '--method')
 const TIMEOUT = Number(arg(argv, '--timeout', '30000'))
@@ -54,22 +55,28 @@ const sk = Uint8Array.from(Buffer.from(readFileSync(KEY_FILE, 'utf8').trim(), 'h
 const clientPub = getPublicKey(sk)
 const ck = nip44.v2.utils.getConversationKey(sk, TARGET)
 
-const ws = new WebSocket(RELAY)
+// Methods the signer may stop and ask about. For these the prompt keeps
+// sounding until the answer lands, so the operator is not relying on
+// happening to glance at the OLED inside the window.
+const MAY_NEED_APPROVAL =
+  METHOD === 'sign_event' || METHOD === 'sign_event_compact' || METHOD.startsWith('heartwood_')
+let stopPrompt = () => {}
+
+const ws = new RelayFanout(RELAYS)
 const started = Date.now()
 setTimeout(() => {
-  console.error(`timeout: no response within ${TIMEOUT} ms`)
+  stopPrompt()
+  console.error(`timeout: no response within ${TIMEOUT} ms (tried ${RELAYS.join(', ')})`)
   ws.close()
   exit(3)
 }, TIMEOUT)
 
-ws.on('open', () => {
-  ws.send(
-    JSON.stringify([
-      'REQ',
-      'c',
-      { kinds: [24133], authors: [TARGET], '#p': [clientPub], limit: 0 },
-    ]),
-  )
+{
+  const live = await ws.open()
+  if (live.length < RELAYS.length) {
+    console.error(`(connected to ${live.length}/${RELAYS.length} relays)`)
+  }
+  ws.req('c', { kinds: [24133], authors: [TARGET], '#p': [clientPub], limit: 0 })
   const id = randomBytes(8).toString('hex')
   const ev = finalizeEvent(
     {
@@ -80,7 +87,7 @@ ws.on('open', () => {
     },
     sk,
   )
-  ws.on('message', (data) => {
+  ws.on((data) => {
     let msg
     try {
       msg = JSON.parse(data.toString())
@@ -96,6 +103,8 @@ ws.on('open', () => {
       return
     }
     if (inner.id !== id) return
+    // However it was answered — approved, denied or expired — stop asking.
+    stopPrompt()
     const out = {
       elapsed_ms: Date.now() - started,
       client_pubkey: clientPub,
@@ -108,9 +117,8 @@ ws.on('open', () => {
   })
   // The request event id doubles as the C4 park id — surface it for benches.
   console.error(`request event id: ${ev.id}`)
-  ws.send(JSON.stringify(['EVENT', ev]))
-})
-ws.on('error', (e) => {
-  console.error(`relay error: ${e.message}`)
-  exit(1)
-})
+  ws.send(['EVENT', ev])
+  if (MAY_NEED_APPROVAL) {
+    stopPrompt = startPressPrompt(`the ${METHOD} request`)
+  }
+}

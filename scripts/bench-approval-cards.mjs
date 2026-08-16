@@ -228,6 +228,11 @@ class Client {
   }
 }
 
+/** The firmware's per-card batch cap (common/src/approval_queue.rs). Kept
+ *  here as a constant rather than read from the device: get_status does not
+ *  report it, and the phase only needs to push a little past it. */
+const heartwoodMaxBatch = () => 8
+
 /** A note template the disposable slot's policy admits. */
 const noteTemplate = (text) =>
   JSON.stringify({
@@ -573,15 +578,33 @@ async function phaseQueue() {
 
 async function phaseBusy() {
   // Past the batch cap (8) the next ask must be refused rather than queued.
-  const asks = Array.from({ length: 10 }, () => raiseCard())
-  const answers = await Promise.all(asks.map((a) => within(a.answered, 20000)))
-  const busy = answers.filter((a) => a?.error && /busy/i.test(a.error))
-  record(
-    11,
-    'past the caps an ask is refused, not held',
-    busy.length > 0,
-    `${busy.length} of 10 answered busy promptly`,
-  )
+  //
+  // Probe with a small wave first. A signer that queues rather than refuses
+  // gives every one of these a window of its own, so sending the full ten at
+  // a device without the fix locks it up for five minutes and takes the
+  // cleanup down with it. Three is enough to tell the two apart.
+  const asks = Array.from({ length: 3 }, () => raiseCard())
+  const probe = await Promise.all(asks.map((a) => within(a.answered, 20000)))
+  if (!probe.some(Boolean)) {
+    record(
+      11,
+      'past the caps an ask is refused, not held',
+      false,
+      'the first three asks were all queued, none answered — this signer ' +
+        'holds them rather than refusing, so the caps were not reached',
+    )
+  } else {
+    // Something is answering promptly, so it is safe to push to the cap.
+    while (asks.length < heartwoodMaxBatch() + 2) asks.push(raiseCard())
+    const answers = await Promise.all(asks.map((a) => within(a.answered, 20000)))
+    const busy = answers.filter((a) => a?.error && /busy/i.test(a.error))
+    record(
+      11,
+      'past the caps an ask is refused, not held',
+      busy.length > 0,
+      `${busy.length} of ${asks.length} answered busy promptly`,
+    )
+  }
   // Drain before handing back. On a signer that queues these instead of
   // refusing them — which is the whole point of the check, and what pre-#64
   // firmware does — they run a window EACH, so this is minutes, not one

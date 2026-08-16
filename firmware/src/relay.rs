@@ -3145,6 +3145,16 @@ const CARD_WINDOW: Duration = Duration::from_secs(30);
 /// Hold that approves, matching `approval::run_approval_loop`.
 const CARD_HOLD_MS: u32 = 2000;
 
+/// How long the tick may sample closely while the button is actually down,
+/// and how often. The loop's own cadence is roughly a second — far too coarse
+/// to fill a two-second bar, which would jump in two or three steps and then
+/// leave the operator holding a finished hold. Polling tightly for half a
+/// second while their finger is on the button is not the stall this change
+/// exists to remove: it happens only during a hold, and only for as long as
+/// the hold lasts.
+const CARD_HOLD_BURST: Duration = Duration::from_millis(600);
+const CARD_HOLD_POLL_MS: u32 = 40;
+
 /// Total bytes all waiting asks may hold. Cards keep whole parsed requests
 /// alive, and a signing request can be tens of kilobytes on a board with no
 /// PSRAM, so the count caps in `approval_queue` are not enough on their own.
@@ -3466,6 +3476,35 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         } else {
             CardTick::Denied
         };
+    }
+
+    if hold_ms > 0 {
+        // The button is down: follow it closely for a short burst so the bar
+        // fills smoothly and the approval lands when the hold completes,
+        // rather than up to a whole loop pass later.
+        let burst_until = Instant::now() + CARD_HOLD_BURST;
+        loop {
+            crate::wdt::feed();
+            let held = crate::button::hold_ms();
+            if held >= CARD_HOLD_MS {
+                return CardTick::Approved;
+            }
+            if held == 0 {
+                // Released mid-burst: the sampler has the length.
+                return match crate::button::take_release() {
+                    Some(ms) if ms >= CARD_HOLD_MS => CardTick::Approved,
+                    Some(_) => CardTick::Denied,
+                    // No release recorded: treat it as nothing having
+                    // happened and let the next pass decide.
+                    None => CardTick::Pending,
+                };
+            }
+            draw_button_card(ctx, remaining, held);
+            if Instant::now() >= burst_until {
+                return CardTick::Pending;
+            }
+            FreeRtos::delay_ms(CARD_HOLD_POLL_MS);
+        }
     }
 
     draw_button_card(ctx, remaining, hold_ms);

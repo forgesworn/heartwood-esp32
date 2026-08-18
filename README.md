@@ -1,3 +1,5 @@
+![Heartwood — oak grain, tree rings, and circuit traces](docs/assets/heartwood-banner.jpg)
+
 # Heartwood ESP32
 
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/TheCryptoDonkey?logo=githubsponsors&color=ea4aaa&label=Sponsor)](https://github.com/sponsors/TheCryptoDonkey)

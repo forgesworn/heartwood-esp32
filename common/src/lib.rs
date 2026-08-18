@@ -48,6 +48,11 @@ pub mod reply_clock;
 
 pub mod approval_queue;
 
+pub mod note_store;
+
+#[cfg(feature = "nip46")]
+pub mod note_cmd;
+
 #[cfg(feature = "mnemonic")]
 pub mod mnemonic;
 

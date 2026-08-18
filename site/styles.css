@@ -21,6 +21,16 @@
   font-display: swap;
 }
 @font-face {
+  /* Text face. Fraunces is a display serif with high stroke contrast, and on a
+     near-black ground its hairlines get eaten at reading sizes. Inter holds the
+     long technical passages; Fraunces keeps the headings and the asides. */
+  font-family: "Inter";
+  src: url("/fonts/inter-latin.woff2") format("woff2");
+  font-weight: 400 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
   font-family: "JetBrains Mono";
   src: url("/fonts/jetbrains-mono-latin.woff2") format("woff2");
   font-weight: 400 700;
@@ -39,7 +49,7 @@
 
   --ink: #ece4d3;
   --ink-dim: #b3a488;
-  --ink-mute: #7d6f56;
+  --ink-mute: #938565;
 
   --heart: #e8a838;
   --heart-dim: #a8862e;
@@ -48,7 +58,14 @@
   --cambium-c: #bcd781;
 
   --serif: "Fraunces", "Iowan Old Style", Georgia, serif;
+  --sans: "Inter", ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* Three text sizes, because everything under the h2 used to sit at one.
+     Lede introduces, text argues, detail supports. */
+  --text-lede: clamp(1.18rem, 1.5vw, 1.34rem);
+  --text: 1.0625rem;
+  --text-detail: 0.98rem;
 
   --measure: 66ch;
   --gutter: clamp(1.25rem, 4vw, 3rem);
@@ -66,10 +83,11 @@ html {
 body {
   background: var(--bg);
   color: var(--ink);
-  font-family: var(--serif);
+  font-family: var(--sans);
   font-optical-sizing: auto;
-  font-size: 1.0625rem;
-  line-height: 1.72;
+  font-size: var(--text);
+  line-height: 1.7;
+  letter-spacing: -0.003em;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   position: relative;
@@ -196,6 +214,8 @@ code {
 }
 
 .lede {
+  font-size: var(--text-lede);
+  line-height: 1.52;
   max-width: 54ch;
   color: var(--ink-dim);
   margin-bottom: 2.2rem;
@@ -335,6 +355,71 @@ code {
   .reveal { animation: none; }
 }
 
+/* ---------- the display face, deliberately ----------
+   Body copy is now Inter. These are the places Fraunces still speaks: the
+   headings, the hero lede, the marginalia and the figure captions. Everything
+   else is argument, and argument wants a text face. */
+
+h1, h2, h3,
+.lede,
+.aside,
+.spec-row dt,
+.plate figcaption,
+.colophon-note {
+  font-family: var(--serif);
+}
+
+/* Emphasis. Exactly four words in the body copy are emphasised, so rather
+   than ship a second Inter file for them (and render a synthesised oblique
+   in the meantime), the display face carries it. Fraunces runs a smaller
+   x-height than Inter, so it needs a nudge to sit level on the line. */
+
+.section-body em,
+.two-col em,
+.spec-row dd em,
+.steps p em {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1.06em;
+  color: var(--ink);
+}
+
+/* ---------- the scene ----------
+   The one full-bleed moment on the page. Every section is otherwise capped at
+   1080px and follows the same head → body → rows rhythm; this breaks out past
+   the gutter so the page draws breath between "why the key belongs on a chip"
+   and the boards it actually runs on. */
+
+.scene {
+  margin: clamp(3.5rem, 9vh, 6.5rem) 0 0;
+  position: relative;
+}
+.scene img {
+  display: block;
+  width: 100%;
+  height: auto;
+  /* Tall on a phone would swallow the screen; crop rather than shrink. */
+  aspect-ratio: 3 / 2;
+  object-fit: cover;
+  /* Sink the photograph into the page ground so it reads as part of the page
+     rather than a rectangle pasted onto it. */
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 12%, #000 88%, transparent);
+          mask-image: linear-gradient(to bottom, transparent, #000 12%, #000 88%, transparent);
+}
+.scene figcaption {
+  max-width: 1080px;
+  margin: 1rem auto 0;
+  padding: 0 var(--gutter);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: var(--text-detail);
+  color: var(--ink-mute);
+}
+
+@media (max-width: 640px) {
+  .scene img { aspect-ratio: 4 / 3; }
+}
+
 /* ---------- sections ---------- */
 
 .section {
@@ -369,13 +454,22 @@ code {
 .section-body p a, .two-col p a, .aside a { color: var(--ink); }
 .section-body strong { color: var(--ink); font-weight: 600; }
 
+/* Continuous prose in two columns rather than one paragraph per cell. A grid
+   pairs them by index, so a short paragraph beside a long one leaves half the
+   row empty; columns balance the text across both regardless of how the
+   paragraphs happen to divide. */
 .two-col {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: clamp(1.5rem, 4vw, 3rem);
+  column-count: 2;
+  column-gap: clamp(1.5rem, 4vw, 3rem);
 }
-.two-col p { color: var(--ink-dim); }
-.two-col p + p { margin-top: 0; }
+.two-col p { color: var(--ink-dim); max-width: none; }
+.two-col p + p { margin-top: 1rem; }
+/* Never strand a single line at the foot or head of a column. */
+.two-col p { orphans: 3; widows: 3; }
+
+@media (max-width: 820px) {
+  .two-col { column-count: 1; }
+}
 
 /* ---------- spec rows ---------- */
 
@@ -394,7 +488,7 @@ code {
   font-size: 1.18rem;
   color: var(--heart);
 }
-.spec-row dd { color: var(--ink-dim); max-width: var(--measure); }
+.spec-row dd { color: var(--ink-dim); max-width: var(--measure); font-size: var(--text-detail); }
 .spec-row dd a { color: var(--ink); }
 
 /* ---------- steps ---------- */
@@ -419,6 +513,8 @@ code {
 
 .aside {
   font-style: italic;
+  font-size: var(--text-detail);
+  line-height: 1.68;
   color: var(--ink-mute);
   max-width: var(--measure);
   margin-top: 2rem;

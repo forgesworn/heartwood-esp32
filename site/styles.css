@@ -535,3 +535,59 @@ a.family-card:hover h3 { color: var(--heart); }
   .dg .nsub { font-size: 19px; }
   .dg .wlbl { font-size: 17px; }
 }
+
+/* ---------- scroll-driven entrance (still no scripts) ---------- */
+/*
+ * The hero animates on load, above. Everything below it had no entrance
+ * motion at all, so the page went flat the moment you started scrolling.
+ * These rules reveal each block as it arrives, using the browser's own
+ * scroll-driven animation rather than a library, which keeps the promise
+ * in the colophon: nothing to execute, nothing to block, nothing to audit.
+ *
+ * No stagger is declared anywhere. Each row of a grid crosses the viewport
+ * edge at its own scroll position, so the cascade falls out of the geometry.
+ * The family row is the one exception, handled at the bottom.
+ *
+ * Browsers without scroll-driven animations fail the @supports guard and
+ * render every block in place, exactly as this page behaved before this
+ * section existed. Nothing is hidden without a working timeline to bring
+ * it back.
+ */
+
+@media (prefers-reduced-motion: no-preference) {
+  @supports (animation-timeline: view()) {
+
+    .section-head,
+    .section-body > *,
+    .section > .aside,
+    .section > .code,
+    .section > .oled,
+    .spec-row,
+    .feature-grid > li,
+    .steps > li,
+    .family-card {
+      /* Longhand on purpose. animation-timeline is a reset-only part of the
+         `animation` shorthand, so anyone later adding a shorthand above this
+         would silently wipe the timeline out and hide the block for good. */
+      animation-name: rise;
+      animation-duration: 1s;
+      animation-timing-function: cubic-bezier(0.2, 0.6, 0.2, 1);
+      animation-fill-mode: both;
+      animation-timeline: view();
+      /* A fixed distance rather than a share of the element's own height, so
+         a tall paragraph and a short card fade up at the same rate. */
+      animation-range: cover 0% cover 340px;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) and (min-width: 641px) {
+  @supports (animation-timeline: view()) {
+    /* Side by side in one row, so the geometry gives these nothing to
+       cascade from. Walk each card a little further into the scroll. */
+    .family-row > :nth-child(2) { animation-range: cover 40px cover 380px; }
+    .family-row > :nth-child(3) { animation-range: cover 80px cover 420px; }
+    .family-row > :nth-child(4) { animation-range: cover 120px cover 460px; }
+    .family-row > :nth-child(5) { animation-range: cover 160px cover 500px; }
+  }
+}

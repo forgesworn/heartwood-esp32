@@ -15,11 +15,23 @@ manager.
 | **Operator key** | kind-24134 management authority (Sapwood) | Can manage clients, scoped signing policy, and WiFi configuration (see below) |
 | **Bridge secret** | USB management session auth | Can manage clients over USB |
 | **Slot secrets** | per-client bunker connection credentials | Can connect as that client (subject to its policy) |
+| **Bearer notes** | LUD-25 (LNURLcash) note secrets held by the note locker | Spendable cash — whoever reads the secrets can redeem the notes first |
 
-The master seed is the crown jewel. **It is generated on-device from hardware
-entropy and is never transmitted off the device by any code path** — not over
-USB, not over the relay, not in a backup. The only place it is ever displayed is
-the OLED, once, at creation.
+The master seed is the crown jewel. For an identity **generated on-device**
+(frame 0x57), the seed comes from hardware entropy and **is never transmitted
+off the device by any code path** — not over USB, not over the relay, not in a
+backup; the only place it is ever displayed is the OLED, once, at creation.
+Restored or imported identities are the exception: a mnemonic or nsec pushed
+over USB provisioning, or a seed derived browser-side in a Sapwood restore
+flow, necessarily transits the host, which must then be trusted with it. Where
+the threat model requires that no host ever sees the seed, prefer on-device
+generation.
+
+Bearer notes ride the seeds' at-rest posture: **plaintext in NVS when no PIN
+or vault key is set** — the same physical-custody model — and they are
+deliberately **excluded from backups**: a note restored onto two boards is a
+double-spend, so bearer value is unrecoverable by design (see
+`docs/plans/2026-08-18-note-locker-goal.md`).
 
 ## Components and trust boundaries
 
@@ -49,6 +61,14 @@ it is not the device trust root:
 
 There is deliberately **no remote OTA implementation**. Firmware updates remain
 USB-only, release-signed, and physically approved.
+
+**Board caveat: the physical-approval anchor is only as strong as the USB
+wiring.** On the UART-transport boards (Heltec V3, T-Display) the approval
+button is GPIO0, which sits behind the CP2102/CH9102 auto-download circuit — a
+host with serial control can hold that line low and satisfy a button hold
+remotely, collapsing the "USB + physical approval" tier into plain "USB". The
+native-USB boards (V4, C6) have no such bridge and are unaffected; prefer them
+for high-value keys.
 
 ## Threat: remote / network attacker — **resisted**
 
@@ -361,6 +381,10 @@ Design spec: `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`.
 - **`BACKUP_EXPORT` over USB** returns slot + bridge secrets (not the seed) and is
   not separately bridge-auth-gated; this is defence-in-depth only, since USB
   physical access already implies a flash read. Worth gating regardless.
+- **Legacy NIP-04 is a decryption oracle for weak crypto.** Permitting the
+  legacy `nip04_decrypt` method in a slot policy makes the device a decryption
+  oracle for AES-256-CBC — unauthenticated legacy encryption — so prefer the
+  NIP-44 methods in policies wherever the client supports them.
 - **No Anti-Exfil-style nonce commitment.** A *weak or dead* RNG cannot weaken
   signatures: BIP-340 derives the nonce from the secret key and message, and
   `aux_rand` (drawn via `fill_random`, `firmware/src/sign.rs`) can only add

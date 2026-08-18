@@ -344,8 +344,8 @@ docs/
 - [x] Bridge secrets read from env vars via `clap env = ...`, never enter argv or `/proc/cmdline`
 - [x] Radios off in USB-bridged mode — LoRa/BLE never initialised; WiFi initialised only in the opt-in WiFi-standalone mode
 - [ ] JTAG disable in production build
-- [ ] Watchdog enablement (post-provisioning)
-- [ ] `cargo deny` setup — licence checking, security advisories, crate bans
+- [x] Task watchdog enablement (60 s, panic → crash crumb, fed by every blocking loop — landed 2026-08-08)
+- [x] `cargo deny` setup — licence checking, security advisories, crate bans (enforced in CI per crate; no workspace root)
 
 ### Phase 6 — Zero-trust bridge *(shipped 2026-04-05)*
 

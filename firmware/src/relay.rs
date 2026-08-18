@@ -2088,28 +2088,53 @@ fn poll_usb(
             true,
         ),
 
-        FRAME_TYPE_SET_PIN => crate::pin::handle_set_pin(
-            usb,
-            &frame.payload,
-            ctx.nvs,
-            ctx.masters,
-            ctx.display,
-            ctx.buttons,
-        ),
+        // At-rest changes are refused while notes are held: the locker's
+        // seal-sync machinery (notes::sync_sealed) only runs on the USB-mode
+        // path, and changing the secret under sealed notes here would strand
+        // them. Notes cannot be created in wifi mode, so the boot-time flag
+        // never goes stale in this loop.
+        FRAME_TYPE_SET_PIN => {
+            if crate::notes::any_notes_held() {
+                crate::protocol::write_frame(
+                    usb,
+                    FRAME_TYPE_NACK,
+                    b"at-rest changes need USB mode while notes are held",
+                );
+            } else {
+                let _ = crate::pin::handle_set_pin(
+                    usb,
+                    &frame.payload,
+                    ctx.nvs,
+                    ctx.masters,
+                    ctx.display,
+                    ctx.buttons,
+                );
+            }
+        }
 
         // Vault management over the cable in wifi mode (mirrors the USB-only
         // loop). VAULT_UNLOCK is a no-op here — a device serving poll_usb is
         // already unlocked; the locked wifi path handles it in
         // locked_relay_phase.
-        FRAME_TYPE_VAULT_SET => crate::pin::handle_vault_set(
-            usb,
-            &frame.payload,
-            ctx.nvs,
-            ctx.masters,
-            ctx.policy_engine.bridge_authenticated,
-            ctx.display,
-            ctx.buttons,
-        ),
+        FRAME_TYPE_VAULT_SET => {
+            if crate::notes::any_notes_held() {
+                crate::protocol::write_frame(
+                    usb,
+                    FRAME_TYPE_NACK,
+                    b"at-rest changes need USB mode while notes are held",
+                );
+            } else {
+                let _ = crate::pin::handle_vault_set(
+                    usb,
+                    &frame.payload,
+                    ctx.nvs,
+                    ctx.masters,
+                    ctx.policy_engine.bridge_authenticated,
+                    ctx.display,
+                    ctx.buttons,
+                );
+            }
+        }
         FRAME_TYPE_VAULT_UNLOCK => {
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"already unlocked");
         }

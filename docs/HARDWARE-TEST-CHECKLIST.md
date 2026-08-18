@@ -948,6 +948,74 @@ the blocking loop (the host is waiting on the reply frame): a USB `sign_event`
 approval, a `SET_NET_CONFIG` confirmation and a factory-reset confirmation must
 behave exactly as before.
 
+## 13. Bearer-note locker (added 2026-08-18, NOT YET BENCH-RUN)
+
+Firmware under test: the note locker — LUD-25 bearer-note custody over the
+`FRAME_TYPE_NOTE_CMD` (0x70) USB frame, lnurl-vault JSON command set, notes
+sealed at rest under a note key wrapped by the same PIN/vault secret as the
+seeds. Design and decisions: docs/plans/2026-08-18-note-locker-goal.md.
+Drive every step with `scripts/note-cmd.mjs` (node-serialport, no
+reset-on-open); gated commands wait on a 30 s approval card.
+
+All items NOT YET BENCH-RUN.
+
+USB tier, unlocked, no at-rest:
+
+1. `get_info` answers version/board/storage/counts; `new_secret` then
+   `confirm` then `list_notes` shows one CONFIRMED note. NOT YET BENCH-RUN.
+2. `export_secret` raises "Release note? N sats @ host" — hold approves and
+   returns 64-hex `k1`; short press denies (`user_declined`); unattended
+   card times out (`timeout`) with the note untouched. NOT YET BENCH-RUN.
+3. Destructive gating: `mark_spent` / `discard` / `rename` / `delete` each
+   raise a card; wrong-state commands answer `invalid_state` with NO card
+   (watch the OLED — the serial answer alone does not prove it). NOT YET
+   BENCH-RUN.
+4. Full spend shape: `import_secret` (mint preimage) → `new_secret` rotate →
+   confirm → mark_spent → `new_secret_pair` split → confirm both →
+   mark_spent → delete housekeeping; counts and states correct throughout.
+   NOT YET BENCH-RUN.
+5. Cap refusal at 16 notes (`storage_full`), and a re-import of a held
+   secret returning the existing id with nothing restated. NOT YET
+   BENCH-RUN.
+6. Backup exclusion: BACKUP_EXPORT with notes held, restore onto the same
+   board after a wipe — pairings return, notes do NOT, and nothing in the
+   backup file contains a note secret. NOT YET BENCH-RUN.
+
+Sealing (enable at-rest with notes held):
+
+7. SET_PIN (or VAULT_SET) with notes held seals them: power-cycle, dump the
+   `hw_notes` namespace — every note blob starts `HWNS`, an `nk` blob
+   exists, no plaintext `HWNB` remains. NOT YET BENCH-RUN.
+8. Locked boot: `get_info` answers with `note_count` including sealed notes;
+   every other note command NACKs with reason `locked`. After PIN_UNLOCK /
+   VAULT_UNLOCK (expect one extra PBKDF2 run in the unlock time), the same
+   notes list and export correctly — the seal round-tripped real money.
+   NOT YET BENCH-RUN.
+9. PIN change with sealed notes: notes remain readable after unlock with the
+   NEW pin (the note key was re-wrapped, not regenerated). NOT YET
+   BENCH-RUN.
+10. Disable at-rest: notes return to plaintext `HWNB`, `nk` removed,
+    everything still spends. NOT YET BENCH-RUN.
+11. Torn-enable self-heal: cut power between the seed-seal and note-seal
+    passes (or flash a state with sealed seeds + plaintext notes + no
+    `nk`); the next unlock seals the stragglers without losing any. NOT
+    YET BENCH-RUN.
+12. Power-cut during a split (between `new_secret_pair` and `confirm`):
+    reboot, unlock — the PENDING pair is still there, never auto-discarded,
+    and the wallet-side confirm/discard converges. NOT YET BENCH-RUN.
+
+WiFi-standalone tier (deliberate v1 cuts — verify the refusals):
+
+13. Every 0x70 frame NACKs with reason `note locker is USB-mode only`.
+    NOT YET BENCH-RUN.
+14. With notes held, SET_PIN and VAULT_SET over the cable NACK with reason
+    `at-rest changes need USB mode while notes are held`; with no notes
+    they behave as before. NOT YET BENCH-RUN.
+
+Regression watch: a USB `sign_event` approval and a factory reset must behave
+exactly as before; FIRMWARE_INFO's nvs entry stats now include the
+`hw_notes` namespace's usage.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

@@ -12,19 +12,29 @@
 //! slot keys it always has; nothing to exclude, but the rule is recorded
 //! here where the data lives).
 //!
-//! At-rest sealing status: v1 stores note blobs as the seeds are stored
-//! without a PIN — plaintext, physical-possession model. The sealing pass
-//! (notes ride the PIN/vault key like the seeds do) is the remaining half of
-//! phase 2 and needs the retained-key design decided; the `NoteStorage`
-//! boundary here is where that seal wraps when it lands.
+//! At-rest sealing: note blobs ride the PIN/vault secret exactly like the
+//! seeds do. A random 32-byte **note key** is wrapped by
+//! `seed_cipher::encrypt_seed` into this namespace's `nk` blob under the
+//! same secret, unwrapped once at unlock (one extra PBKDF2 run), and
+//! retained in RAM for the boot; each record blob is sealed under it via
+//! `note_seal` at the `NoteStorage` boundary, verify-after-seal before every
+//! write. `sync_sealed` makes the sealed state converge with the seeds'
+//! at-rest state from any torn intermediate (enable, disable, PIN change,
+//! or pre-locker firmware), and NOTHING here ever deletes a blob it cannot
+//! read. At-rest changes are refused in WiFi-standalone mode while notes
+//! are held (`any_held`), because this sync machinery only runs on the USB
+//! path.
 
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 
 use heartwood_common::note_cmd::{self, Approval, GatedCmd, NoteCmdContext};
+use heartwood_common::note_seal;
 use heartwood_common::note_store::{
     NoteMeta, NoteStorage, NoteStore, StorageError, ID_LEN, MAX_NOTES,
 };
+use heartwood_common::seed_cipher;
 use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_NOTE_RESP};
+use zeroize::Zeroize;
 
 use crate::protocol;
 use crate::serial::SerialPort;
@@ -34,6 +44,8 @@ use crate::serial::SerialPort;
 /// excludable from anything that walks the `heartwood` namespace.
 const NAMESPACE: &str = "hw_notes";
 const INDEX_KEY: &str = "idx";
+/// The wrapped note key: `seed_cipher::encrypt_seed(secret, note_key)`.
+const NK_KEY: &str = "nk";
 
 /// A note blob is ~120 B for typical hosts/labels; the encoded ceiling with
 /// every field maxed is under 600. One page of index is 16 ids × 8 bytes.
@@ -51,6 +63,15 @@ pub struct NoteNvs {
     /// "at cap, delete something" from "storage is failing, deleting cannot
     /// help".
     failed: bool,
+    /// The unwrapped note key, retained in RAM for the boot. `Some` exactly
+    /// when at-rest is on and this boot has unlocked (or enabled it): saves
+    /// seal, loads open. `None`: records pass through plaintext, and sealed
+    /// blobs are held aside in `sealed_pending` rather than decoded.
+    key: Option<[u8; note_seal::KEY_LEN]>,
+    /// Ids whose blobs are sealed and unreadable this boot (no key yet).
+    /// The notes behind them are intact; they are counted, never deleted,
+    /// and re-loaded after `sync_sealed` supplies the key.
+    sealed_pending: alloc_vec::Vec<String>,
 }
 
 impl NoteStorage for NoteNvs {
@@ -95,9 +116,30 @@ impl NoteStorage for NoteNvs {
     }
 
     fn load_note(&mut self, id: &str) -> Result<Option<alloc_vec::Vec<u8>>, StorageError> {
-        let mut buf = [0u8; NOTE_BUF];
+        // A sealed blob can be larger than the plaintext record by the seal
+        // overhead; size the stack buffer for both.
+        let mut buf = [0u8; NOTE_BUF + note_seal::OVERHEAD];
         let result = match self.nvs.get_blob(id, &mut buf) {
             Ok(None) => Ok(None),
+            Ok(Some(bytes)) if note_seal::is_sealed(bytes) => match &self.key {
+                Some(key) => match note_seal::open(key, bytes) {
+                    Ok(plain) => Ok(Some(plain)),
+                    Err(_) => {
+                        // Wrong key or tampered — refuse the record; the
+                        // bytes stay on flash untouched.
+                        log::error!("[notes] {id}: sealed blob did not open under this boot's key");
+                        Err(StorageError)
+                    }
+                },
+                None => {
+                    // Intact but unreadable until unlock. Held aside, not
+                    // reported as damage.
+                    if !self.sealed_pending.iter().any(|s| s == id) {
+                        self.sealed_pending.push(id.to_string());
+                    }
+                    Err(StorageError)
+                }
+            },
             Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
             Err(e) => {
                 log::error!("[notes] read {id} failed: {e}");
@@ -105,13 +147,33 @@ impl NoteStorage for NoteNvs {
             }
         };
         // The raw blob embeds the secret; scrub the stack copy.
-        use zeroize::Zeroize;
         buf.zeroize();
         result
     }
 
     fn save_note(&mut self, id: &str, blob: &[u8]) -> Result<(), StorageError> {
-        self.nvs.set_blob(id, blob).map_err(|e| {
+        let stored: alloc_vec::Vec<u8>;
+        let to_write: &[u8] = match &self.key {
+            Some(key) => {
+                let mut nonce = [0u8; note_seal::NONCE_LEN];
+                crate::fill_random(&mut nonce);
+                stored = note_seal::seal(key, blob, &nonce);
+                // VERIFY-AFTER-SEAL before anything touches flash: a blob
+                // that cannot decrypt back to the record must never replace
+                // one that could (the seed path's rule, applied to money).
+                match note_seal::open(key, &stored) {
+                    Ok(mut back) if back == blob => back.zeroize(),
+                    _ => {
+                        log::error!("[notes] {id}: seal verification failed — refusing to write");
+                        self.failed = true;
+                        return Err(StorageError);
+                    }
+                }
+                &stored
+            }
+            None => blob,
+        };
+        self.nvs.set_blob(id, to_write).map_err(|e| {
             log::error!("[notes] write {id} failed: {e}");
             self.failed = true;
             StorageError
@@ -245,26 +307,211 @@ pub fn init(partition: EspNvsPartition<NvsDefault>) -> Notes {
             };
         }
     };
-    let mut storage = NoteNvs { nvs, failed: false };
+    let mut storage = NoteNvs {
+        nvs,
+        failed: false,
+        key: None,
+        sealed_pending: alloc_vec::Vec::new(),
+    };
     let outcome = NoteStore::load(&mut storage, MAX_NOTES);
     let boot_state = if !outcome.store.index_known() {
         log::error!("[notes] index unreadable this boot — refusing note creation");
         "index_unreadable"
     } else {
-        if !outcome.skipped.is_empty() {
-            // The blobs stay on flash; counts are not statements about how
-            // many notes exist. Loud, because this is someone's money.
-            log::error!(
-                "[notes] {} note blob(s) unreadable: {:?}",
-                outcome.skipped.len(),
-                outcome.skipped
-            );
+        let sealed = storage.sealed_pending.len();
+        if sealed > 0 {
+            log::info!("[notes] {sealed} sealed note(s) awaiting unlock");
+        }
+        // `skipped` includes the sealed-pending ids (they refused to load);
+        // anything beyond those is genuine damage. The blobs stay on flash
+        // either way; counts are not statements about how many notes exist.
+        // Loud, because this is someone's money.
+        let damaged = outcome
+            .skipped
+            .iter()
+            .filter(|id| !storage.sealed_pending.contains(id))
+            .count();
+        if damaged > 0 {
+            log::error!("[notes] {damaged} note blob(s) unreadable (not merely sealed) — left on flash");
         }
         let (count, pending) = outcome.store.counts();
         log::info!("[notes] loaded {count} note(s), {pending} pending");
         "ok"
     };
-    Notes { store: outcome.store, storage: Storage::Nvs(storage), boot_state }
+    let notes = Notes { store: outcome.store, storage: Storage::Nvs(storage), boot_state };
+    NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
+    notes
+}
+
+/// Whether the device holds any notes (loaded or sealed), for code with no
+/// locker in scope — the WiFi-standalone tier consults this before allowing
+/// an at-rest change it could not sync notes through. Set at init; notes
+/// cannot be created in WiFi mode, so the boot-time value never goes stale
+/// there.
+static NOTES_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn any_notes_held() -> bool {
+    NOTES_HELD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+impl Notes {
+    fn any_held(&self) -> bool {
+        let (count, _) = self.store.counts();
+        count > 0 || self.sealed_count() > 0
+    }
+
+    /// Sealed records awaiting a key this boot. Included in `get_info`'s
+    /// counts — they are held value, not damage.
+    pub fn sealed_count(&self) -> usize {
+        match &self.storage {
+            Storage::Nvs(nvs) => nvs.sealed_pending.len(),
+            Storage::Null(_) => 0,
+        }
+    }
+}
+
+/// Make the locker's sealed state converge with the seeds' at-rest state,
+/// given the freshly proven unlock secret (PIN digits or 32-byte vault key
+/// — the same bytes the seed path used). Called after a successful unlock
+/// on a locked boot, and after an at-rest enable or PIN/vault-key change on
+/// an unlocked one. Converges from every torn intermediate:
+///
+///  - `nk` present, key not yet in RAM: unwrap it (one PBKDF2 run), reload
+///    the store so sealed records decode, then re-seal any plaintext
+///    stragglers a torn enable left behind.
+///  - `nk` present, key already in RAM (PIN/vault-key change): re-wrap the
+///    SAME note key under the new secret — the sealed records stay valid.
+///  - `nk` absent: first enable, self-heal after a torn one, or an at-rest
+///    state inherited from pre-locker firmware: mint a note key, wrap it,
+///    verify the wrap decrypts, then seal every plaintext record.
+///
+/// An `nk` that will not decrypt under this secret is reported loudly and
+/// left alone — the sealed notes behind it stay on flash for the secret
+/// that can open them. Never deletes anything it cannot read.
+pub fn sync_sealed(notes: &mut Notes, secret: &[u8]) {
+    {
+        let Storage::Nvs(nvs) = &mut notes.storage else {
+            return; // unavailable locker: nothing to seal, nothing to lose
+        };
+
+        // 1. Establish the note key in RAM.
+        if nvs.key.is_none() {
+            let mut buf = [0u8; seed_cipher::BLOB_LEN];
+            let nk = nvs.nvs.get_blob(NK_KEY, &mut buf);
+            match nk {
+                Ok(Some(blob)) => match seed_cipher::decrypt_seed(secret, blob) {
+                    Ok(key) => nvs.key = Some(key),
+                    Err(_) => {
+                        log::error!(
+                            "[notes] nk does not decrypt under this secret — {} sealed note(s) stay sealed",
+                            nvs.sealed_pending.len()
+                        );
+                        return;
+                    }
+                },
+                Ok(None) => {
+                    // First enable or self-heal: mint and wrap a fresh key.
+                    let mut key = [0u8; note_seal::KEY_LEN];
+                    crate::fill_random(&mut key);
+                    let mut salt = [0u8; seed_cipher::SALT_LEN];
+                    let mut nonce = [0u8; seed_cipher::NONCE_LEN];
+                    crate::fill_random(&mut salt);
+                    crate::fill_random(&mut nonce);
+                    let blob = seed_cipher::encrypt_seed(secret, &key, &salt, &nonce);
+                    // VERIFY-AFTER-ENCRYPT: the wrap must decrypt back before
+                    // it is trusted as the key's only persistence.
+                    if seed_cipher::decrypt_seed(secret, &blob) != Ok(key) {
+                        log::error!("[notes] nk wrap failed verification — notes stay plaintext");
+                        key.zeroize();
+                        return;
+                    }
+                    if let Err(e) = nvs.nvs.set_blob(NK_KEY, &blob) {
+                        log::error!("[notes] nk write failed: {e} — notes stay plaintext");
+                        key.zeroize();
+                        return;
+                    }
+                    nvs.key = Some(key);
+                }
+                Err(e) => {
+                    log::error!("[notes] nk read failed: {e} — leaving sealed state untouched");
+                    return;
+                }
+            }
+        } else {
+            // Key already in RAM: the secret changed — re-wrap the same key
+            // so every sealed record stays valid under the new secret.
+            let key = nvs.key.expect("checked is_some");
+            let mut salt = [0u8; seed_cipher::SALT_LEN];
+            let mut nonce = [0u8; seed_cipher::NONCE_LEN];
+            crate::fill_random(&mut salt);
+            crate::fill_random(&mut nonce);
+            let blob = seed_cipher::encrypt_seed(secret, &key, &salt, &nonce);
+            if seed_cipher::decrypt_seed(secret, &blob) != Ok(key) {
+                log::error!("[notes] nk re-wrap failed verification — old wrap kept");
+                return;
+            }
+            if let Err(e) = nvs.nvs.set_blob(NK_KEY, &blob) {
+                log::error!("[notes] nk re-wrap write failed: {e} — old wrap kept");
+                return;
+            }
+        }
+    }
+
+    // 2. Reload so previously sealed records decode under the key.
+    let had_sealed = notes.sealed_count() > 0;
+    if had_sealed {
+        if let Storage::Nvs(nvs) = &mut notes.storage {
+            nvs.sealed_pending.clear();
+        }
+        let outcome = NoteStore::load(&mut notes.storage, MAX_NOTES);
+        if !outcome.skipped.is_empty() {
+            log::error!(
+                "[notes] {} note blob(s) still unreadable after unlock",
+                outcome.skipped.len()
+            );
+        }
+        notes.store = outcome.store;
+    }
+
+    // 3. Seal any plaintext stragglers (first enable, or a torn earlier one).
+    if let Err(e) = notes.store.rewrite_all(&mut notes.storage) {
+        log::error!("[notes] sealing pass incomplete ({e:?}) — will converge next sync");
+    }
+    let (count, _) = notes.store.counts();
+    NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
+    log::info!("[notes] sealed state in sync ({count} note(s) under the note key)");
+}
+
+/// Turn at-rest off for the locker: rewrite every record plaintext, then
+/// drop `nk` and the in-RAM key. Refusal, not destruction, when sealed
+/// records exist with no key. Order matters: records go plaintext BEFORE
+/// `nk` is removed, so a reset between the two leaves an orphan `nk`
+/// (harmless — overwritten by the next enable) rather than sealed records
+/// with no wrap.
+pub fn disable_sealing(notes: &mut Notes) {
+    if notes.sealed_count() > 0 {
+        log::error!("[notes] at-rest disabled while sealed notes have no key — they stay sealed on flash");
+        return;
+    }
+    {
+        let Storage::Nvs(nvs) = &mut notes.storage else { return };
+        if nvs.key.is_none() {
+            return; // never sealed — nothing to do
+        }
+        if let Some(mut k) = nvs.key.take() {
+            k.zeroize();
+        }
+    }
+    if let Err(e) = notes.store.rewrite_all(&mut notes.storage) {
+        log::error!("[notes] plaintext rewrite incomplete ({e:?}) — rerun by toggling at-rest");
+        return;
+    }
+    if let Storage::Nvs(nvs) = &mut notes.storage {
+        if let Err(e) = nvs.nvs.remove(NK_KEY) {
+            log::error!("[notes] nk remove failed: {e} (orphan wrap, harmless)");
+        }
+    }
+    log::info!("[notes] notes now plaintext at rest");
 }
 
 /// Seconds since boot — informational timestamps only, never authoritative
@@ -341,8 +588,8 @@ pub fn handle_note_cmd_frame(
     protocol::write_frame(usb, FRAME_TYPE_NOTE_RESP, &bytes);
     // An export response carries a plaintext k1; scrub the buffer we own.
     // (The serde Value's own strings are beyond reach — noted, not hidden.)
-    use zeroize::Zeroize;
     bytes.zeroize();
+    NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
 }
 
 /// The locked-boot subset: `get_info` answers truthfully (counts and storage
@@ -363,13 +610,16 @@ pub fn handle_note_cmd_frame_locked(
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"locked");
         return;
     }
+    // Sealed records are held value awaiting the key, not damage: counted.
+    // (pending_count only covers decodable records — a sealed note's state
+    // is inside the ciphertext, and a locked boot cannot know it.)
     let (note_count, pending_count) = notes.store.counts();
     let response = serde_json::json!({
         "ok": true,
         "fw_version": env!("CARGO_PKG_VERSION"),
         "board": crate::board::BOARD,
         "storage": notes.storage_state(),
-        "note_count": note_count,
+        "note_count": note_count + notes.sealed_count(),
         "pending_count": pending_count,
     });
     let bytes = serde_json::to_vec(&response)

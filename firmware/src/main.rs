@@ -679,6 +679,10 @@ fn main() {
                         &mut failed_attempts,
                         &mut display,
                     ) {
+                        // Same proven secret unwraps the note key (and
+                        // self-heals any torn sealed state) — one extra
+                        // PBKDF2 run.
+                        notes::sync_sealed(&mut note_locker, &frame.payload);
                         break; // Unlocked — seeds now in RAM, continue boot.
                     }
                 }
@@ -710,6 +714,10 @@ fn main() {
                         &mut loaded_masters,
                         &mut display,
                     ) {
+                        // Same proven secret unwraps the note key (and
+                        // self-heals any torn sealed state) — one extra
+                        // PBKDF2 run.
+                        notes::sync_sealed(&mut note_locker, &frame.payload);
                         break; // Unlocked — seeds now in RAM, continue boot.
                     }
                 }
@@ -1168,7 +1176,7 @@ fn main() {
 
             // 0x25 — set/change/clear boot PIN (encrypts/decrypts the seeds)
             FRAME_TYPE_SET_PIN => {
-                pin::handle_set_pin(
+                let changed = pin::handle_set_pin(
                     &mut usb,
                     &frame.payload,
                     &mut nvs,
@@ -1176,11 +1184,18 @@ fn main() {
                     &mut display,
                     &buttons,
                 );
+                if changed {
+                    if frame.payload.is_empty() {
+                        notes::disable_sealing(&mut note_locker);
+                    } else {
+                        notes::sync_sealed(&mut note_locker, &frame.payload);
+                    }
+                }
             }
 
             // 0x62 — set/clear the host-held vault key (re-wraps the seeds)
             FRAME_TYPE_VAULT_SET => {
-                pin::handle_vault_set(
+                let changed = pin::handle_vault_set(
                     &mut usb,
                     &frame.payload,
                     &mut nvs,
@@ -1189,6 +1204,13 @@ fn main() {
                     &mut display,
                     &buttons,
                 );
+                if changed {
+                    if frame.payload.is_empty() {
+                        notes::disable_sealing(&mut note_locker);
+                    } else {
+                        notes::sync_sealed(&mut note_locker, &frame.payload);
+                    }
+                }
             }
 
             // 0x63 — vault unlock in the main loop is a no-op (the device is

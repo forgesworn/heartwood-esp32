@@ -228,21 +228,21 @@ pub fn handle_set_pin(
     masters: &[LoadedMaster],
     display: &mut crate::oled::Display<'_>,
     buttons: &crate::button::Buttons<'_>,
-) {
+) -> bool {
     if payload.len() > 8 {
         log::warn!("SET_PIN: PIN too long ({} bytes, max 8)", payload.len());
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
     if !payload.is_empty() && !payload.iter().all(|b| b.is_ascii_digit()) {
         log::warn!("SET_PIN: PIN contains non-digit characters");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
     if !payload.is_empty() && payload.len() < 4 {
         log::warn!("SET_PIN: PIN too short ({} digits, min 4)", payload.len());
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
 
     // There must be a seed in RAM to encrypt/decrypt: refuse if no master, or
@@ -250,12 +250,12 @@ pub fn handle_set_pin(
     if masters.is_empty() {
         log::warn!("SET_PIN: no identity to protect");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
     if is_locked(masters) {
         log::warn!("SET_PIN: device is locked — unlock before changing the PIN");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
 
     let action = if payload.is_empty() { "Remove PIN?" } else { "Set PIN?" };
@@ -265,7 +265,7 @@ pub fn handle_set_pin(
     if !matches!(result, crate::approval::ApprovalResult::Approved) {
         log::info!("SET_PIN denied by user");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
 
     let outcome = if payload.is_empty() {
@@ -280,12 +280,14 @@ pub fn handle_set_pin(
             crate::oled::show_change_done(display, msg, "");
             esp_idf_hal::delay::FreeRtos::delay_ms(1000);
             protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+            true
         }
         Err(e) => {
             log::error!("SET_PIN failed: {e}");
             crate::oled::show_error(display, "PIN change failed");
             esp_idf_hal::delay::FreeRtos::delay_ms(1500);
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            false
         }
     }
 }
@@ -349,26 +351,26 @@ pub fn handle_vault_set(
     bridge_authenticated: bool,
     display: &mut crate::oled::Display<'_>,
     buttons: &crate::button::Buttons<'_>,
-) {
+) -> bool {
     if !bridge_authenticated {
         log::warn!("VAULT_SET rejected — bridge not authenticated");
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
-        return;
+        return false;
     }
     if !payload.is_empty() && payload.len() != VAULT_KEY_LEN {
         log::warn!("VAULT_SET: payload is {} bytes, expected 0 or 32", payload.len());
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
     if masters.is_empty() {
         log::warn!("VAULT_SET: no identity to protect");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
     if is_locked(masters) {
         log::warn!("VAULT_SET: device is locked — unlock before changing the vault key");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
 
     let action = if payload.is_empty() {
@@ -382,7 +384,7 @@ pub fn handle_vault_set(
     if !matches!(result, crate::approval::ApprovalResult::Approved) {
         log::info!("VAULT_SET denied by user");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-        return;
+        return false;
     }
 
     let outcome = if payload.is_empty() {
@@ -397,12 +399,14 @@ pub fn handle_vault_set(
             crate::oled::show_change_done(display, msg, "");
             esp_idf_hal::delay::FreeRtos::delay_ms(1000);
             protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+            true
         }
         Err(e) => {
             log::error!("VAULT_SET failed: {e}");
             crate::oled::show_error(display, "Vault change failed");
             esp_idf_hal::delay::FreeRtos::delay_ms(1500);
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            false
         }
     }
 }

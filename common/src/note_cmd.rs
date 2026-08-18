@@ -340,6 +340,51 @@ fn gated_by_id(
     }
 }
 
+// ---- relay-path mapping (heartwood_note_* NIP-46 extensions) ----
+
+/// The note methods served over the relay path, in the order the
+/// capabilities advert lists them. Rename/delete are deliberately absent:
+/// housekeeping stays a USB-cable operation.
+pub const NOTE_METHODS: [&str; 8] = [
+    "heartwood_note_list",
+    "heartwood_note_new",
+    "heartwood_note_new_pair",
+    "heartwood_note_confirm",
+    "heartwood_note_discard",
+    "heartwood_note_export",
+    "heartwood_note_import",
+    "heartwood_note_spent",
+];
+
+/// Map a `heartwood_note_*` NIP-46 request onto the wire command object the
+/// dispatcher above already handles — `params[0]` is an optional object of
+/// the command's own fields, exactly the USB JSON minus the `cmd` key. Pure
+/// so the translation is host-tested; `Err` is the NIP-46 error string.
+/// Unknown methods and non-object params are refused here, so the firmware
+/// arm stays a straight pipe.
+pub fn note_cmd_for_method(method: &str, params: &[Value]) -> Result<Value, &'static str> {
+    let cmd = match method {
+        "heartwood_note_list" => "list_notes",
+        "heartwood_note_new" => "new_secret",
+        "heartwood_note_new_pair" => "new_secret_pair",
+        "heartwood_note_confirm" => "confirm",
+        "heartwood_note_discard" => "discard",
+        "heartwood_note_export" => "export_secret",
+        "heartwood_note_import" => "import_secret",
+        "heartwood_note_spent" => "mark_spent",
+        _ => return Err("unknown note method"),
+    };
+    let mut fields = match params.first() {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(map)) => map.clone(),
+        Some(_) => return Err("params[0] must be an object"),
+    };
+    // The wire command name is this layer's to set — a caller-supplied `cmd`
+    // must not be able to redirect a gated method onto an ungated command.
+    fields.insert("cmd".into(), Value::String(cmd.into()));
+    Ok(Value::Object(fields))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +688,66 @@ mod tests {
             .map(|n| n["id"].as_str().unwrap())
             .collect();
         assert_eq!(confirmed, vec![chg.as_str()]);
+    }
+
+    #[test]
+    fn note_methods_map_onto_the_wire_commands() {
+        let cmd = note_cmd_for_method(
+            "heartwood_note_confirm",
+            &[serde_json::json!({"id":"a1b2c3d4","amount_msat":21000,"host":"mint.example"})]
+        )
+        .unwrap();
+        assert_eq!(cmd["cmd"], "confirm");
+        assert_eq!(cmd["amount_msat"], 21000);
+        // No params at all is a valid empty command (list with defaults).
+        let cmd = note_cmd_for_method("heartwood_note_list", &[]).unwrap();
+        assert_eq!(cmd["cmd"], "list_notes");
+        // Every advertised method maps, and maps onto a command the
+        // dispatcher knows (an unknown one would answer bad_request).
+        for method in NOTE_METHODS {
+            let cmd = note_cmd_for_method(method, &[]).unwrap();
+            assert!(cmd["cmd"].is_string(), "{method}");
+        }
+    }
+
+    #[test]
+    fn note_method_mapping_refuses_cmd_smuggling() {
+        // A caller must not redirect a gated method onto an ungated command.
+        let cmd = note_cmd_for_method(
+            "heartwood_note_export",
+            &[serde_json::json!({"cmd":"list_notes","id":"a1b2c3d4"})]
+        )
+        .unwrap();
+        assert_eq!(cmd["cmd"], "export_secret");
+        assert_eq!(
+            note_cmd_for_method("heartwood_note_frobnicate", &[]),
+            Err("unknown note method")
+        );
+        assert_eq!(
+            note_cmd_for_method("heartwood_note_list", &[serde_json::json!(7)]),
+            Err("params[0] must be an object")
+        );
+    }
+
+    #[test]
+    fn gated_note_methods_are_pinned_always_button() {
+        use crate::nip46::Nip46Method;
+        for (method, gated) in [
+            ("heartwood_note_export", true),
+            ("heartwood_note_spent", true),
+            ("heartwood_note_discard", true),
+            ("heartwood_note_list", false),
+            ("heartwood_note_new", false),
+            ("heartwood_note_new_pair", false),
+            ("heartwood_note_confirm", false),
+            ("heartwood_note_import", false),
+        ] {
+            assert_eq!(
+                Nip46Method::from_str(method).always_requires_button(),
+                gated,
+                "{method}"
+            );
+        }
     }
 
     #[test]

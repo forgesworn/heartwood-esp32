@@ -92,7 +92,7 @@ pub const FRAME_TYPE_VAULT_SET: u8 = 0x62;      // host -> device: 32-byte binar
 pub const FRAME_TYPE_VAULT_UNLOCK: u8 = 0x63;   // host -> device: 32-byte binary vault key. Requires bridge session authentication. Unlocks a locked device (decrypts seeds into RAM). NACK on wrong key — deliberately NOT tied into the PIN wipe counter.
 
 // --- Bearer-note locker (LUD-25 note custody; see note_store / note_cmd and docs/plans/2026-08-18-note-locker-goal.md) ---
-pub const FRAME_TYPE_NOTE_CMD: u8 = 0x70;  // host -> device: one lnurl-vault-protocol JSON command object (note_cmd::handle_note_cmd). Locked device answers get_info only and NACKs the rest with reason "locked". WiFi-standalone tier NACKs all of these ("note locker is USB-mode only") until the relay path routes gated commands through the deferred-approval machinery (phase 5).
+pub const FRAME_TYPE_NOTE_CMD: u8 = 0x70;  // host -> device: one lnurl-vault-protocol JSON command object (note_cmd::handle_note_cmd). Locked device answers get_info only and NACKs the rest with reason "locked". WiFi-standalone tier NACKs this frame ("use heartwood_note_* over the relay") — there the locker is served as NIP-46 extensions whose gated methods ride the deferred-approval machinery.
 pub const FRAME_TYPE_NOTE_RESP: u8 = 0x71; // device -> host: the matching JSON response object; always answered, never silent — the client's only long timeout is the physical-confirm one.
 
 // --- OTA frame types ---

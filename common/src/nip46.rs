@@ -89,6 +89,16 @@ pub enum Nip46Method {
     HeartwoodVerifyProof,
     /// Extension discovery: which methods this signer actually serves.
     HeartwoodCapabilities,
+    // Bearer-note locker (relay path; see note_cmd.rs and the note-locker
+    // goal doc). Export/spent/discard are pinned always-button.
+    HeartwoodNoteList,
+    HeartwoodNoteNew,
+    HeartwoodNoteNewPair,
+    HeartwoodNoteConfirm,
+    HeartwoodNoteDiscard,
+    HeartwoodNoteExport,
+    HeartwoodNoteImport,
+    HeartwoodNoteSpent,
     // Unknown method
     Unknown(String),
 }
@@ -120,6 +130,14 @@ impl Nip46Method {
             "heartwood_create_proof" => Self::HeartwoodCreateProof,
             "heartwood_verify_proof" => Self::HeartwoodVerifyProof,
             "heartwood_capabilities" => Self::HeartwoodCapabilities,
+            "heartwood_note_list" => Self::HeartwoodNoteList,
+            "heartwood_note_new" => Self::HeartwoodNoteNew,
+            "heartwood_note_new_pair" => Self::HeartwoodNoteNewPair,
+            "heartwood_note_confirm" => Self::HeartwoodNoteConfirm,
+            "heartwood_note_discard" => Self::HeartwoodNoteDiscard,
+            "heartwood_note_export" => Self::HeartwoodNoteExport,
+            "heartwood_note_import" => Self::HeartwoodNoteImport,
+            "heartwood_note_spent" => Self::HeartwoodNoteSpent,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -145,6 +163,14 @@ impl Nip46Method {
             Self::HeartwoodCreateProof => "heartwood_create_proof",
             Self::HeartwoodVerifyProof => "heartwood_verify_proof",
             Self::HeartwoodCapabilities => "heartwood_capabilities",
+            Self::HeartwoodNoteList => "heartwood_note_list",
+            Self::HeartwoodNoteNew => "heartwood_note_new",
+            Self::HeartwoodNoteNewPair => "heartwood_note_new_pair",
+            Self::HeartwoodNoteConfirm => "heartwood_note_confirm",
+            Self::HeartwoodNoteDiscard => "heartwood_note_discard",
+            Self::HeartwoodNoteExport => "heartwood_note_export",
+            Self::HeartwoodNoteImport => "heartwood_note_import",
+            Self::HeartwoodNoteSpent => "heartwood_note_spent",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -163,6 +189,9 @@ impl Nip46Method {
                 | Self::HeartwoodSwitch
                 | Self::HeartwoodRecover
                 | Self::HeartwoodCreateProof
+                | Self::HeartwoodNoteExport
+                | Self::HeartwoodNoteSpent
+                | Self::HeartwoodNoteDiscard
         )
     }
 

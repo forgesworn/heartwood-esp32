@@ -34,7 +34,29 @@ Family-bunker Phase 1 landed 2026-08-14 (signet-plans design doc §11.2): the pe
 
 CP2's Path A findings are closed on our side: #65 (idle watchdog reboot on an unprovisioned board) and #67 (derive answering success while the registry write failed) landed 2026-08-16, as did #66 (the first-boot setup screen now accepts a staged `SET_NET_CONFIG` before the first identity, and NACKs everything else with a reason). #64 followed the same day: in WiFi-standalone mode an interactive ask no longer blocks the relay loop. `nip46_handler::dispatch` takes an `ApprovalDecision` and hands a `Deferred` caller the ask back instead of putting the card up itself; relay.rs holds it the way a C4 park is held, the button sampler thread measures the hold so a loop running at ~1 Hz can judge one, and same-client asks for the same identity collapse onto one card whose single hold answers the batch (caps and admission rule host-tested in `common/src/approval_queue.rs`). Replies are stamped via `common/src/reply_clock.rs` for when they are sent rather than when the ask arrived. The USB tier deliberately keeps the blocking loop — the host is waiting on the reply frame. None of it is bench-run: checklist section 12.
 
-Next: remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
+Bearer-note locker landed 2026-08-18 (all five phases device-side; design and
+per-phase record in docs/plans/2026-08-18-note-locker-goal.md): heartwood
+custodies LUD-25 (LNURLcash) bearer notes as a sidecar to signing — the
+browser wallet (a dni/lnurl-wallet fork, branch heartwood-transport) does all
+mint HTTP, the device generates replacement secrets and discloses only their
+SHA-256 until the mint confirms, and every plaintext export needs the button.
+Lifecycle model + wire protocol host-tested in common/src/{note_store,
+note_cmd}.rs (power-cut torture pins persist-before-disclose); USB surface is
+one frame pair (NOTE_CMD 0x70 / NOTE_RESP 0x71, lnurl-vault's JSON command
+set verbatim, bench driver scripts/note-cmd.mjs); notes are sealed at rest
+under a random note key wrapped by the same PIN/vault secret as the seeds
+(common/src/note_seal.rs, nk blob in the hw_notes namespace, one extra PBKDF2
+at unlock, notes::sync_sealed converges every torn state and never deletes
+what it cannot read). Relay path: heartwood_note_* NIP-46 extensions
+(advertised note_locker_v1), gated methods pinned ButtonRequired ahead of the
+generic extension gate so no slot policy can silence a disclosure, riding the
+#64 deferred machinery. Notes are deliberately NOT in backups (restore onto
+two boards = double-spend); destructive commands (mark_spent/discard/rename/
+delete) are button-gated like lnurl-vault gates them. WiFi tier NACKs the USB
+note frames (use the relay methods) and refuses at-rest changes while notes
+are held. Nothing bench-run: checklist section 13.
+
+Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
 ## Build & flash
 

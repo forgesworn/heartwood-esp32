@@ -48,6 +48,23 @@ pub fn is_operator(author: &[u8; 32], op_mgmt: &[u8; 32]) -> bool {
     author == op_mgmt
 }
 
+/// Authorise a management author against a per-identity operator scope.
+///
+/// Each master may carry its own operator (`identity_op`); the device also has
+/// a fallback operator (`device_op`). A command for a given master is
+/// authorised if its author matches EITHER — so a delegated operator manages
+/// only the one identity it was set on, while the device operator (the owner)
+/// still manages every identity. A master with no per-identity operator falls
+/// back to the device operator alone (the historical behaviour). With neither
+/// set, nothing is authorised.
+pub fn is_authorised_operator(
+    author: &[u8; 32],
+    identity_op: Option<&[u8; 32]>,
+    device_op: Option<&[u8; 32]>,
+) -> bool {
+    identity_op == Some(author) || device_op == Some(author)
+}
+
 /// Non-secret stable identity for a client slot credential. Management callers
 /// bind numeric slot operations to this value so a stale UI cannot act on a
 /// different app after revoke + index reuse. Valid slot secrets hash their raw
@@ -236,6 +253,27 @@ pub fn bunker_uri(pubkey_hex: &str, relays: &[String], secret: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_operator_manages_only_its_identity() {
+        let owner = [1u8; 32];      // device operator
+        let delegate = [2u8; 32];   // per-identity operator (e.g. a partner)
+        let stranger = [3u8; 32];
+
+        // An identity delegated to `delegate`: both the delegate and the
+        // device owner are authorised; a stranger is not.
+        assert!(is_authorised_operator(&delegate, Some(&delegate), Some(&owner)));
+        assert!(is_authorised_operator(&owner, Some(&delegate), Some(&owner)));
+        assert!(!is_authorised_operator(&stranger, Some(&delegate), Some(&owner)));
+
+        // A non-delegated identity: only the device owner. The delegate has no
+        // reach here — this is the whole point of scoping.
+        assert!(is_authorised_operator(&owner, None, Some(&owner)));
+        assert!(!is_authorised_operator(&delegate, None, Some(&owner)));
+
+        // No operator configured anywhere: nothing is authorised.
+        assert!(!is_authorised_operator(&owner, None, None));
+    }
 
     const OP: [u8; 32] = [0x11; 32];
 

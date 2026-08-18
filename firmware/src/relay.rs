@@ -4336,36 +4336,37 @@ fn handle_mgmt_event(
     // Receipt time on the monotonic counter, so an ack for a command that
     // stopped for the button (or completed a park) is not backdated (#64).
     let received_uptime = crate::uptime_s();
-    let op_mgmt = match ctx.op_mgmt {
-        Some(k) => k,
-        None => {
-            log::warn!("[relay] kind 24134 but no operator configured; ignoring");
-            return Ok(());
-        }
-    };
-
-    // SECURITY CRUX: the command runs only if it comes from the baked operator
-    // key. NIP-44 (below) already makes forgery impossible — a third party can't
-    // encrypt under the device⇄operator conversation key without the operator
-    // secret — and this author gate is the explicit authority check on top.
-    // The rule itself is `mgmt::is_operator`, unit-tested on the host.
+    // SECURITY CRUX: the command runs only if it comes from an operator
+    // authorised for THIS identity — either the device-wide operator or the
+    // per-identity operator this master was delegated to. NIP-44 (below) already
+    // makes forgery impossible (a third party can't encrypt under the
+    // master⇄operator conversation key without the operator secret); this author
+    // gate is the explicit authority check on top. The rule itself,
+    // `mgmt::is_authorised_operator`, is unit-tested on the host.
     let author: [u8; 32] = match hex_decode(&ev.pubkey).ok().and_then(|v| v.try_into().ok()) {
         Some(a) => a,
         None => return Ok(()),
     };
-    if !mgmt::is_operator(&author, &op_mgmt) {
+    let device_op = ctx.op_mgmt;
+    let identity_op = ctx.masters[master_idx].operator;
+    if !mgmt::is_authorised_operator(&author, identity_op.as_ref(), device_op.as_ref()) {
         log::warn!(
-            "[relay] mgmt from non-operator {}…; rejecting",
+            "[relay] mgmt from unauthorised {}…; rejecting",
             &ev.pubkey[..ev.pubkey.len().min(16)]
         );
         return Ok(());
     }
+    // Device-level actions (adding identities, delegating operators) stay with
+    // the device operator; a delegated per-identity operator is confined to
+    // managing the one identity it was granted.
+    let is_device_op = device_op == Some(author);
 
-    // Conversation key is master ⇄ op_mgmt. Scope the borrow so `ctx` is free
-    // for the mutable dispatch below.
+    // Conversation key is master ⇄ the authenticated operator (device or the
+    // per-identity delegate), so the response seals back to whoever sent the
+    // command. Scope the borrow so `ctx` is free for the mutable dispatch below.
     let conversation_key = {
         let master = &ctx.masters[master_idx];
-        match nip44::get_conversation_key(&master.secret, &op_mgmt) {
+        match nip44::get_conversation_key(&master.secret, &author) {
             Ok(ck) => ck,
             Err(e) => {
                 log::error!("[relay] mgmt conversation key: {e}");
@@ -4493,7 +4494,7 @@ fn handle_mgmt_event(
                 mgmt::MutationChallenge::NotRequired => unreachable!(),
             }
         }
-        dispatch_mgmt(&method, &req, s, ctx, master_idx, pool)
+        dispatch_mgmt(&method, &req, s, ctx, master_idx, pool, is_device_op)
     })();
     // The breadcrumb stays set across the response publish below too;
     // handle_relay_msg clears it once the whole event is processed.
@@ -4730,6 +4731,9 @@ fn dispatch_mgmt(
     master_idx: usize,
     // The other live sessions + pinned bookkeeping, for nostrconnect dial-out.
     pool: &mut RelayPool,
+    // True when the authenticated author is the device-wide operator (not a
+    // per-identity delegate). Gates identity-adding and delegation methods.
+    is_device_op: bool,
 ) -> Result<serde_json::Value, String> {
     // Extract owned master facts before borrowing policy_engine mutably.
     let master_slot = ctx.masters[master_idx].slot;
@@ -5142,6 +5146,9 @@ fn dispatch_mgmt(
         // store schedules the standard deferred restart so the relay
         // re-subscribes with the fresh master set after the response publishes.
         "derive_identity" => {
+            if !is_device_op {
+                return Err("derive_identity adds an identity and requires the device operator".into());
+            }
             let name = req
                 .pointer("/params/name")
                 .and_then(|v| v.as_str())
@@ -5200,6 +5207,9 @@ fn dispatch_mgmt(
         // by pubkey; a successful store schedules the deferred restart so the
         // relay re-subscribes with the fresh master set.
         "provision_identity" => {
+            if !is_device_op {
+                return Err("provision_identity adds an identity and requires the device operator".into());
+            }
             let mode_byte = req
                 .pointer("/params/mode")
                 .and_then(|v| v.as_u64())
@@ -5934,14 +5944,18 @@ fn dispatch_mgmt(
             // master is itself a management target (address it by its pubkey).
             // Precomputed to keep the policy-engine borrow out of the masters
             // iterator below.
+            // A delegated per-identity operator sees only the identity it was
+            // granted; the device operator sees the whole inventory.
             let app_counts: Vec<usize> = ctx
                 .masters
                 .iter()
+                .filter(|m| is_device_op || m.slot == master_slot)
                 .map(|m| ctx.policy_engine.list_slots(m.slot).len())
                 .collect();
             let mut identities: Vec<serde_json::Value> = ctx
                 .masters
                 .iter()
+                .filter(|m| is_device_op || m.slot == master_slot)
                 .zip(app_counts)
                 .map(|(m, apps)| {
                     let pk_hex = hex_encode(&m.pubkey);
@@ -5954,11 +5968,15 @@ fn dispatch_mgmt(
                         "bunker_uri": uri,
                         "addressed": m.slot == master_slot,
                         "apps": apps,
+                        "operator": m.operator.map(|op| hex_encode(&op)),
                     })
                 })
                 .collect();
             let master_count = identities.len();
             for p in ctx.personas.iter() {
+                if !(is_device_op || p.master_slot == master_slot) {
+                    continue;
+                }
                 let pk_hex = hex_encode(&p.pubkey);
                 let label = p.name.clone().unwrap_or_else(|| p.purpose.clone());
                 let uri = mgmt::bunker_uri(&pk_hex, &ctx.relays, None);
@@ -6150,6 +6168,50 @@ fn dispatch_mgmt(
             }
         }
 
+        // Delegate (or un-delegate) management of THIS identity to a
+        // per-identity operator. Device-operator only: sharing an operator for
+        // one identity must never let that delegate re-delegate or reach the
+        // owner's other identities. Absent/empty operator clears the delegation,
+        // returning the identity to device-operator-only management.
+        "set_identity_operator" => {
+            if !is_device_op {
+                return Err(
+                    "set_identity_operator requires the device operator".into(),
+                );
+            }
+            let raw = req
+                .pointer("/params/operator")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let new_op: Option<[u8; 32]> = match raw {
+                None => None,
+                Some(hex) => Some(
+                    hex_decode(hex)
+                        .ok()
+                        .and_then(|v| v.try_into().ok())
+                        .ok_or("operator must be 32-byte hex")?,
+                ),
+            };
+            match &new_op {
+                Some(op) => crate::masters::set_master_operator(ctx.nvs, master_slot, op)?,
+                None => crate::masters::clear_master_operator(ctx.nvs, master_slot)?,
+            }
+            // The in-memory master list is immutable here; the delegation is
+            // read at boot, so schedule the same restart that provisioning a
+            // master uses to reload the roster with the new operator.
+            ctx.network_restart_at = Some(Instant::now() + NETWORK_RESTART_DELAY);
+            log::info!(
+                "[relay] mgmt: identity slot {master_slot} operator {}",
+                if new_op.is_some() { "delegated" } else { "cleared" }
+            );
+            Ok(serde_json::json!({
+                "slot": master_slot,
+                "delegated": new_op.is_some(),
+                "note": "signer restarts shortly to apply the operator change",
+            }))
+        }
+
         // The cable-free twin of the USB SET_IDENTITY_META (0x5b) frame:
         // Sapwood resolves the kind-0 and shrinks the picture in-browser,
         // then hands over ready Rgb565 bytes (base64 inside the NIP-44
@@ -6251,6 +6313,10 @@ fn dispatch_mgmt(
                     "staged_network_config_v1",
                     "mutation_challenge_v1",
                     "resolve_approval_v1",
+                    // Per-identity operator delegation: set_identity_operator
+                    // scopes a shared operator key to a single identity; the
+                    // device operator still manages every identity.
+                    "per_identity_operator_v1",
                     // Bearer-note locker served over heartwood_note_*
                     // extensions (gated methods pinned always-button, held
                     // through the deferred-approval machinery).

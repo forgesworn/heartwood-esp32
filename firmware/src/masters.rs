@@ -41,6 +41,12 @@ pub struct LoadedMaster {
     pub pubkey: [u8; 32],
     /// True when the seed is encrypted at rest and not yet decrypted.
     pub locked: bool,
+    /// Optional per-identity management operator. When set, this identity is
+    /// managed by this operator IN ADDITION to the device-wide operator — used
+    /// to delegate one identity to a partner without granting reach over the
+    /// others. `None` = managed by the device operator alone (the historical
+    /// behaviour).
+    pub operator: Option<[u8; 32]>,
 }
 
 impl Drop for LoadedMaster {
@@ -191,6 +197,14 @@ fn load_one(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<LoadedMaster> {
         _ => return None,
     }
 
+    // Optional per-identity operator (absent on identities that were never
+    // delegated — they fall back to the device operator).
+    let mut op_buf = [0u8; 32];
+    let operator = match nvs.get_blob(&format!("{prefix}_op"), &mut op_buf) {
+        Ok(Some(b)) if b.len() == 32 => Some(op_buf),
+        _ => None,
+    };
+
     Some(LoadedMaster {
         slot,
         secret,
@@ -198,7 +212,27 @@ fn load_one(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<LoadedMaster> {
         mode,
         pubkey,
         locked,
+        operator,
     })
+}
+
+/// Set (or replace) the per-identity management operator for a master slot.
+/// Delegates management of exactly this identity to `operator` without
+/// widening its reach over any other identity on the device.
+pub fn set_master_operator(
+    nvs: &mut EspNvs<NvsDefault>,
+    slot: u8,
+    operator: &[u8; 32],
+) -> Result<(), String> {
+    nvs.set_blob(&format!("master_{slot}_op"), operator)
+        .map_err(|e| format!("persist identity operator: {e}"))
+}
+
+/// Remove any per-identity operator, returning the identity to device-operator
+/// management only.
+pub fn clear_master_operator(nvs: &mut EspNvs<NvsDefault>, slot: u8) -> Result<(), String> {
+    let _ = nvs.remove(&format!("master_{slot}_op"));
+    Ok(())
 }
 
 /// Add a new master to NVS. Returns the assigned slot number.

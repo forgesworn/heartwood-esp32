@@ -104,7 +104,7 @@ pub(crate) fn store_master(
     let (xonly, _) = keypair.x_only_public_key();
     let pubkey = xonly.serialize();
     let slot = masters::add_master(nvs, &secret, &label, mode, &pubkey)?;
-    Ok(LoadedMaster { slot, secret, label, mode, pubkey, locked: false })
+    Ok(LoadedMaster { slot, secret, label, mode, pubkey, locked: false, operator: None })
 }
 
 /// Handle a DERIVE_IDENTITY frame (0x60): [parent_slot][name utf8...].

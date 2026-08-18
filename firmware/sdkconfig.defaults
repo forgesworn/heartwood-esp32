@@ -82,3 +82,19 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../../../../partitions.csv"
 # These are deferred because they require one-time eFuse burning that bricks
 # the device if done incorrectly. They must be done in a controlled production
 # flash step, not during development iteration.
+
+# --- Size diet (2026-08-18) ---
+# The release app crossed the 2 MB ota_0 ceiling (2,105 KB vs 2,097 KB;
+# v0.16.0 shipped at 1,953 KB), which blocks OTA fleet-wide. These three
+# trims are behaviour-safe for THIS device and won back the slot:
+#
+# Certificate bundle: the "common" subset (~40 CAs) instead of the full
+# Mozilla store. Covers ISRG/Let's Encrypt, DigiCert, GTS, GlobalSign,
+# Sectigo — every CA a public Nostr relay realistically fronts with. A
+# relay behind an exotic CA would fail TLS handshake; that trade is
+# documented here deliberately.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+# Station-only device: it dials relays out and never runs an access point.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+# Outbound IPv4 client only; relays resolve and dial over A records.
+CONFIG_LWIP_IPV6=n

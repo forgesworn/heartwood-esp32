@@ -61,7 +61,26 @@ fn unbound_remote_request_denied(
     has_client
         && !client_is_bound
         && (matches!(method, nip46::Nip46Method::SignEvent)
-            || method.always_requires_button())
+            || method.always_requires_button()
+            || is_note_method(method))
+}
+
+/// The bearer-note locker's relay methods. All of them require a bound
+/// slot (see `unbound_remote_request_denied`), and the disclosure and
+/// destructive ones are additionally pinned ButtonRequired whatever the
+/// slot's tier says (see the pin in dispatch_inner).
+fn is_note_method(method: &nip46::Nip46Method) -> bool {
+    matches!(
+        method,
+        nip46::Nip46Method::HeartwoodNoteList
+            | nip46::Nip46Method::HeartwoodNoteNew
+            | nip46::Nip46Method::HeartwoodNoteNewPair
+            | nip46::Nip46Method::HeartwoodNoteConfirm
+            | nip46::Nip46Method::HeartwoodNoteDiscard
+            | nip46::Nip46Method::HeartwoodNoteExport
+            | nip46::Nip46Method::HeartwoodNoteImport
+            | nip46::Nip46Method::HeartwoodNoteSpent
+    )
 }
 
 /// Exact v2 authority is installed for the relay-addressed identity. An
@@ -650,6 +669,16 @@ fn dispatch_inner(
         policy_engine.check(master_slot, &client_hex, &method, event_kind)
     } else {
         heartwood_common::policy::ApprovalTier::ButtonRequired
+    };
+    // Bearer-note disclosure and destruction are pinned always-ask: naming
+    // them in a slot policy must never silence the button (the note-locker
+    // goal doc's recorded decision — cheap to relax later, impossible to
+    // un-leak). The pin runs the SAME pre-dispatch gate below, so Deferred
+    // callers hold the card exactly like any other extension ask.
+    let tier = if method.always_requires_button() && is_note_method(&method) {
+        heartwood_common::policy::ApprovalTier::ButtonRequired
+    } else {
+        tier
     };
 
     // Requests that can enter the physical approval loop are served remotely
@@ -1388,8 +1417,45 @@ fn dispatch_inner(
                 "heartwood_switch",
                 "heartwood_list_identities",
                 "heartwood_recover",
+                "heartwood_note_list",
+                "heartwood_note_new",
+                "heartwood_note_new_pair",
+                "heartwood_note_confirm",
+                "heartwood_note_discard",
+                "heartwood_note_export",
+                "heartwood_note_import",
+                "heartwood_note_spent",
             ];
             nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
+        }
+
+        m if m.starts_with("heartwood_note_") => {
+            // Direct USB NIP-46 (no client) has its own surface for the
+            // locker — the NOTE_CMD frame, where the blocking approval
+            // belongs. The relay methods exist for bound clients only.
+            if !has_client {
+                log::warn!("{m}: refused — note methods serve bound clients (USB uses NOTE_CMD frames)");
+                return build_error_json(&request.id, -1, "unauthorised");
+            }
+            match heartwood_common::note_cmd::note_cmd_for_method(m, &request.params) {
+                Err(e) => build_error_json(&request.id, -3, e),
+                Ok(cmd) => {
+                    // Approval for the gated methods happened in the
+                    // pre-dispatch gate above (pinned ButtonRequired);
+                    // lifecycle rules still apply inside.
+                    let response = crate::notes::run_note_cmd_approved(&cmd.to_string());
+                    if response.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                        nip46::build_result_response(&request.id, &response.to_string())
+                            .unwrap_or_default()
+                    } else {
+                        let code = response
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("bad_request");
+                        build_error_json(&request.id, -1, code)
+                    }
+                }
+            }
         }
 
         other => {

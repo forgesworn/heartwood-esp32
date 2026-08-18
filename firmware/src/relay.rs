@@ -2273,13 +2273,14 @@ fn poll_usb(
             None => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]),
         },
 
-        // 0x70 — the note locker is USB-tier only in v1: its gated commands
-        // run a blocking 30 s approval, which must not stall this loop (the
-        // exact problem #64's Deferred machinery solved for NIP-46). Serving
-        // it here means routing through that machinery — phase 5 work. NACK
-        // with a reason so the wallet reports "wrong mode", not "broken".
+        // 0x70 — the USB note-frame surface is USB-mode only: its gated
+        // commands run a blocking 30 s approval, which must not stall this
+        // loop (the exact problem #64's Deferred machinery solved). In this
+        // mode the locker is served as `heartwood_note_*` NIP-46 extensions
+        // instead, whose gated methods ride that machinery. NACK with a
+        // reason so the wallet reports "wrong surface", not "broken".
         FRAME_TYPE_NOTE_CMD => {
-            crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"note locker is USB-mode only");
+            crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"use heartwood_note_* over the relay");
         }
 
         other => {
@@ -6239,7 +6240,11 @@ fn dispatch_mgmt(
                     "atomic_nostrconnect_policy_v2",
                     "staged_network_config_v1",
                     "mutation_challenge_v1",
-                    "resolve_approval_v1"
+                    "resolve_approval_v1",
+                    // Bearer-note locker served over heartwood_note_*
+                    // extensions (gated methods pinned always-button, held
+                    // through the deferred-approval machinery).
+                    "note_locker_v1"
                 ],
                 "relays_live": relays_live,
                 "relays_pinned": pool.pinned.iter().map(|p| p.url.clone()).collect::<Vec<_>>(),

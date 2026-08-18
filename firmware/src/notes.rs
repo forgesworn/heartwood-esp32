@@ -260,8 +260,24 @@ impl NoteStorage for Storage {
     }
 }
 
-/// The locker as main.rs owns it: store + storage + the boot-time diagnosis
-/// `storage_state()` folds runtime failures into.
+/// The one shared locker instance. Two surfaces reach it — the USB frame
+/// handler on the main loop and the `heartwood_note_*` NIP-46 arms on the
+/// relay loop — the exact two-consumers problem lnurl-vault solves with
+/// `vault_lock.c`; here the Mutex is the arbitration. Only one surface is
+/// ever live per boot (USB mode has no relay loop; WiFi mode NACKs the USB
+/// note frames), so contention is structural belt-and-braces, not a hot
+/// path.
+static LOCKER: std::sync::Mutex<Option<Notes>> = std::sync::Mutex::new(None);
+
+/// Run `f` with the locker. Panics if `init` has not run — it is called
+/// unconditionally at boot, before either serving surface exists.
+pub fn with_locker<R>(f: impl FnOnce(&mut Notes) -> R) -> R {
+    let mut guard = LOCKER.lock().expect("note locker poisoned");
+    f(guard.as_mut().expect("note locker used before init"))
+}
+
+/// The locker: store + storage + the boot-time diagnosis `storage_state()`
+/// folds runtime failures into.
 pub struct Notes {
     pub store: NoteStore,
     storage: Storage,
@@ -290,10 +306,17 @@ impl Notes {
     }
 }
 
-/// Bring the locker up. Never erases anything on any failure — a boot that
-/// cannot read its notes reports that and refuses creation (the model fails
-/// closed), and recovery is a reboot, never a wipe.
-pub fn init(partition: EspNvsPartition<NvsDefault>) -> Notes {
+/// Bring the locker up and install it as THE locker. Never erases anything
+/// on any failure — a boot that cannot read its notes reports that and
+/// refuses creation (the model fails closed), and recovery is a reboot,
+/// never a wipe.
+pub fn init(partition: EspNvsPartition<NvsDefault>) {
+    let notes = build(partition);
+    NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
+    *LOCKER.lock().expect("note locker poisoned") = Some(notes);
+}
+
+fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
     let nvs = match EspNvs::new(partition, NAMESPACE, true) {
         Ok(nvs) => nvs,
         Err(e) => {
@@ -338,9 +361,7 @@ pub fn init(partition: EspNvsPartition<NvsDefault>) -> Notes {
         log::info!("[notes] loaded {count} note(s), {pending} pending");
         "ok"
     };
-    let notes = Notes { store: outcome.store, storage: Storage::Nvs(storage), boot_state };
-    NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
-    notes
+    Notes { store: outcome.store, storage: Storage::Nvs(storage), boot_state }
 }
 
 /// Whether the device holds any notes (loaded or sealed), for code with no
@@ -388,7 +409,11 @@ impl Notes {
 /// An `nk` that will not decrypt under this secret is reported loudly and
 /// left alone — the sealed notes behind it stay on flash for the secret
 /// that can open them. Never deletes anything it cannot read.
-pub fn sync_sealed(notes: &mut Notes, secret: &[u8]) {
+pub fn sync_sealed(secret: &[u8]) {
+    with_locker(|notes| sync_sealed_inner(notes, secret))
+}
+
+fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
     {
         let Storage::Nvs(nvs) = &mut notes.storage else {
             return; // unavailable locker: nothing to seal, nothing to lose
@@ -488,7 +513,11 @@ pub fn sync_sealed(notes: &mut Notes, secret: &[u8]) {
 /// `nk` is removed, so a reset between the two leaves an orphan `nk`
 /// (harmless — overwritten by the next enable) rather than sealed records
 /// with no wrap.
-pub fn disable_sealing(notes: &mut Notes) {
+pub fn disable_sealing() {
+    with_locker(disable_sealing_inner)
+}
+
+fn disable_sealing_inner(notes: &mut Notes) {
     if notes.sealed_count() > 0 {
         log::error!("[notes] at-rest disabled while sealed notes have no key — they stay sealed on flash");
         return;
@@ -546,6 +575,15 @@ fn card_title(kind: GatedCmd, meta: &NoteMeta) -> String {
 pub fn handle_note_cmd_frame(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
+    display: &mut crate::oled::Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+) {
+    with_locker(|notes| handle_note_cmd_frame_inner(usb, payload, notes, display, buttons))
+}
+
+fn handle_note_cmd_frame_inner(
+    usb: &mut SerialPort<'_>,
+    payload: &[u8],
     notes: &mut Notes,
     display: &mut crate::oled::Display<'_>,
     buttons: &crate::button::Buttons<'_>,
@@ -596,7 +634,11 @@ pub fn handle_note_cmd_frame(
 /// state expose no secret and let the wallet say "locked device" instead of
 /// "broken device"); every other command NACKs with a reason. This is the
 /// exception the frame-type comment in types.rs documents.
-pub fn handle_note_cmd_frame_locked(
+pub fn handle_note_cmd_frame_locked(usb: &mut SerialPort<'_>, payload: &[u8]) {
+    with_locker(|notes| handle_note_cmd_frame_locked_inner(usb, payload, notes))
+}
+
+fn handle_note_cmd_frame_locked_inner(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
     notes: &mut Notes,
@@ -625,4 +667,31 @@ pub fn handle_note_cmd_frame_locked(
     let bytes = serde_json::to_vec(&response)
         .unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"bad_request\"}".to_vec());
     protocol::write_frame(usb, FRAME_TYPE_NOTE_RESP, &bytes);
+}
+
+/// Run one already-approved note command for the NIP-46 relay path and
+/// return the raw response object. The physical approval for gated methods
+/// happens in nip46_handler's pre-dispatch gate (pinned ButtonRequired, so
+/// no slot policy can silence it) BEFORE this runs — by the time we are
+/// here, either the method needs no button or the hold has completed. The
+/// lifecycle rules still apply: approval never overrides them.
+pub fn run_note_cmd_approved(msg: &str) -> serde_json::Value {
+    with_locker(|notes| {
+        let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
+        let mut approve = |_kind: GatedCmd, _meta: &NoteMeta| Approval::Approved;
+        let storage_state = notes.storage_state();
+        let mut ctx = NoteCmdContext {
+            store: &mut notes.store,
+            storage: &mut notes.storage,
+            rng: &mut rng,
+            approve: &mut approve,
+            now: now_secs(),
+            fw_version: env!("CARGO_PKG_VERSION"),
+            board: crate::board::BOARD,
+            storage_state,
+        };
+        let response = note_cmd::handle_note_cmd(&mut ctx, msg);
+        NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
+        response
+    })
 }

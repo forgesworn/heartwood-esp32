@@ -1004,13 +1004,32 @@ Sealing (enable at-rest with notes held):
     reboot, unlock — the PENDING pair is still there, never auto-discarded,
     and the wallet-side confirm/discard converges. NOT YET BENCH-RUN.
 
-WiFi-standalone tier (deliberate v1 cuts — verify the refusals):
+WiFi-standalone tier:
 
-13. Every 0x70 frame NACKs with reason `note locker is USB-mode only`.
-    NOT YET BENCH-RUN.
+13. Every 0x70 frame NACKs with reason `use heartwood_note_* over the
+    relay` (the frame surface is USB-mode; the locker itself is served as
+    NIP-46 extensions there — items 15–17). NOT YET BENCH-RUN.
 14. With notes held, SET_PIN and VAULT_SET over the cable NACK with reason
     `at-rest changes need USB mode while notes are held`; with no notes
     they behave as before. NOT YET BENCH-RUN.
+
+Relay path (`heartwood_note_*`, advertised as `note_locker_v1` in
+get_status and in heartwood_capabilities; drive with the
+scripts/nip46-client.mjs conventions):
+
+15. From a bound slot: `heartwood_note_list` / `_new` / `_confirm` /
+    `_import` round-trip over the relay with no button; an unbound client
+    gets `unauthorised` for every note method. NOT YET BENCH-RUN.
+16. `heartwood_note_export` raises a card and waits (deferred — the relay
+    loop stays live underneath, same as a #64 sign ask); hold approves and
+    the result carries `k1`; deny and timeout answer as errors. CRITICAL:
+    repeat on a slot whose policy names the method with auto-approve — the
+    card MUST still appear (pinned always-ask; a silent export here is a
+    security regression, stop and file). NOT YET BENCH-RUN.
+17. Same-method batch collapse: several `heartwood_note_export` asks from
+    the same client collapse onto one card whose single hold answers the
+    batch; a concurrent `sign_event` ask gets its OWN card — one hold must
+    never cover both a signature and a disclosure. NOT YET BENCH-RUN.
 
 Regression watch: a USB `sign_event` approval and a factory reset must behave
 exactly as before; FIRMWARE_INFO's nvs entry stats now include the

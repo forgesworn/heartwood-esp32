@@ -419,7 +419,7 @@ fn main() {
 
     // Bearer-note locker (own namespace; never fatal — a broken locker must
     // not take the signer down, it just reports unavailable and refuses).
-    let mut note_locker = notes::init(nvs_partition);
+    notes::init(nvs_partition);
 
     // --- RNG self-test ---
     // Prove the hardware entropy source is actually in the call path (the
@@ -682,7 +682,7 @@ fn main() {
                         // Same proven secret unwraps the note key (and
                         // self-heals any torn sealed state) — one extra
                         // PBKDF2 run.
-                        notes::sync_sealed(&mut note_locker, &frame.payload);
+                        notes::sync_sealed(&frame.payload);
                         break; // Unlocked — seeds now in RAM, continue boot.
                     }
                 }
@@ -717,7 +717,7 @@ fn main() {
                         // Same proven secret unwraps the note key (and
                         // self-heals any torn sealed state) — one extra
                         // PBKDF2 run.
-                        notes::sync_sealed(&mut note_locker, &frame.payload);
+                        notes::sync_sealed(&frame.payload);
                         break; // Unlocked — seeds now in RAM, continue boot.
                     }
                 }
@@ -752,7 +752,7 @@ fn main() {
                     // state, no secrets) so the wallet can say "locked
                     // device" rather than "broken device". Everything else
                     // NACKs with a reason.
-                    notes::handle_note_cmd_frame_locked(&mut usb, &frame.payload, &mut note_locker);
+                    notes::handle_note_cmd_frame_locked(&mut usb, &frame.payload);
                 }
                 _ => {
                     log::warn!("Device locked — rejecting frame type 0x{:02x}", frame.frame_type);
@@ -1186,9 +1186,9 @@ fn main() {
                 );
                 if changed {
                     if frame.payload.is_empty() {
-                        notes::disable_sealing(&mut note_locker);
+                        notes::disable_sealing();
                     } else {
-                        notes::sync_sealed(&mut note_locker, &frame.payload);
+                        notes::sync_sealed(&frame.payload);
                     }
                 }
             }
@@ -1206,9 +1206,9 @@ fn main() {
                 );
                 if changed {
                     if frame.payload.is_empty() {
-                        notes::disable_sealing(&mut note_locker);
+                        notes::disable_sealing();
                     } else {
-                        notes::sync_sealed(&mut note_locker, &frame.payload);
+                        notes::sync_sealed(&frame.payload);
                     }
                 }
             }
@@ -1225,13 +1225,7 @@ fn main() {
             // loop never reaches here, so a locked device NACKs these
             // frames — fail closed, per the goal doc.
             FRAME_TYPE_NOTE_CMD => {
-                notes::handle_note_cmd_frame(
-                    &mut usb,
-                    &frame.payload,
-                    &mut note_locker,
-                    &mut display,
-                    &buttons,
-                );
+                notes::handle_note_cmd_frame(&mut usb, &frame.payload, &mut display, &buttons);
             }
 
             // 0x40 -- create a connection slot

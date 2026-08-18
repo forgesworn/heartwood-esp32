@@ -66,6 +66,7 @@ use heartwood_common::types::{
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_REVOKE,
     FRAME_TYPE_CONNSLOT_UPDATE, FRAME_TYPE_CONNSLOT_URI, FRAME_TYPE_ENCRYPTED_REQUEST,
     FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
+    FRAME_TYPE_NOTE_CMD,
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_GET_NET_CONFIG, FRAME_TYPE_NACK,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_PROVISION,
@@ -2246,6 +2247,15 @@ fn poll_usb(
             Some(w) => crate::wifi_scan::respond(usb, w),
             None => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]),
         },
+
+        // 0x70 — the note locker is USB-tier only in v1: its gated commands
+        // run a blocking 30 s approval, which must not stall this loop (the
+        // exact problem #64's Deferred machinery solved for NIP-46). Serving
+        // it here means routing through that machinery — phase 5 work. NACK
+        // with a reason so the wallet reports "wrong mode", not "broken".
+        FRAME_TYPE_NOTE_CMD => {
+            crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"note locker is USB-mode only");
+        }
 
         other => {
             log::warn!("[relay] USB frame 0x{other:02x} not recognised");

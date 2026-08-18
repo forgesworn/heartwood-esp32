@@ -55,6 +55,7 @@ mod management_challenge;
 mod palette;
 mod masters;
 mod nip46_handler;
+mod notes;
 mod personas;
 mod nvs;
 mod nvs_stats;
@@ -105,7 +106,7 @@ use heartwood_common::types::{
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
     FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
-    FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK,
+    FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK, FRAME_TYPE_NOTE_CMD,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_UPDATE,
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
     FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
@@ -413,7 +414,12 @@ fn main() {
 
     // --- NVS init ---
     let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
-    let mut nvs = EspNvs::new(nvs_partition, "heartwood", true).expect("NVS namespace init failed");
+    let mut nvs =
+        EspNvs::new(nvs_partition.clone(), "heartwood", true).expect("NVS namespace init failed");
+
+    // Bearer-note locker (own namespace; never fatal — a broken locker must
+    // not take the signer down, it just reports unavailable and refuses).
+    let mut note_locker = notes::init(nvs_partition);
 
     // --- RNG self-test ---
     // Prove the hardware entropy source is actually in the call path (the
@@ -732,6 +738,13 @@ fn main() {
                         &mut display,
                         &buttons,
                     );
+                }
+                FRAME_TYPE_NOTE_CMD => {
+                    // Locked exception: get_info only (counts and storage
+                    // state, no secrets) so the wallet can say "locked
+                    // device" rather than "broken device". Everything else
+                    // NACKs with a reason.
+                    notes::handle_note_cmd_frame_locked(&mut usb, &frame.payload, &mut note_locker);
                 }
                 _ => {
                     log::warn!("Device locked — rejecting frame type 0x{:02x}", frame.frame_type);
@@ -1183,6 +1196,20 @@ fn main() {
             FRAME_TYPE_VAULT_UNLOCK => {
                 log::warn!("VAULT_UNLOCK received while already unlocked");
                 protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"already unlocked");
+            }
+
+            // 0x70 — bearer-note locker command (lnurl-vault JSON protocol;
+            // gated commands run the shared approval loop). The locked USB
+            // loop never reaches here, so a locked device NACKs these
+            // frames — fail closed, per the goal doc.
+            FRAME_TYPE_NOTE_CMD => {
+                notes::handle_note_cmd_frame(
+                    &mut usb,
+                    &frame.payload,
+                    &mut note_locker,
+                    &mut display,
+                    &buttons,
+                );
             }
 
             // 0x40 -- create a connection slot

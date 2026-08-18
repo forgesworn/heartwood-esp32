@@ -948,7 +948,52 @@ the blocking loop (the host is waiting on the reply frame): a USB `sign_event`
 approval, a `SET_NET_CONFIG` confirmation and a factory-reset confirmation must
 behave exactly as before.
 
-## 13. Bearer-note locker (added 2026-08-18, NOT YET BENCH-RUN)
+## 13. Bearer-note locker (added 2026-08-18; relay-path half bench-run same day)
+
+**Bench record — 2026-08-18, Heltec V4 (16 MB, bench unit), firmware
+0.17.0+note-locker (main + IDLE0-yield fix), app-only flash into the new
+`partitions-v4-16mb-legacy-nvs-bigapp.csv` layout (4 MB single app slot —
+the release app outgrew the 2 MB OTA slot, see that CSV's header; table +
+otadata-erase + app written 0x8000/0x414000/0x10000, all live NVS/config
+preserved, verified by masters and pairings surviving).**
+
+Bench-found bug, fixed and verified in-session: the nk mint's PBKDF2 runs
+starved the IDLE0 task watchdog (two task-wdt reboots, backtrace into
+`seed_cipher::derive_km ← sync_sealed`); `wdt::feed` alone was insufficient
+— the fix yields (`FreeRtos::delay_ms(20)`) beside every KDF feed in
+`notes::sync_sealed` and `pin.rs`'s per-slot loop. After the fix: unlock →
+`[notes] sealed state in sync` → relay subscribed, no watchdog. The nk blob
+persisted (NVS 550 → 555 entries). Neither crash tore any state — verify-
+before-write held both times. Also observed (pre-existing, not ours):
+"Persona chunk 0 short (1 of 2 entries)" on this board's registry.
+
+- [x] Item 13 PASS: 0x70 in wifi mode → NACK `use heartwood_note_* over
+      the relay` (exact string).
+- [x] Item 14 PASS (notes-held half): SET_PIN → NACK `at-rest changes need
+      USB mode while notes are held`, no card, no state change. No-notes
+      half not run.
+- [x] Item 15 PASS: bound client (fresh legacy slot) round-tripped
+      heartwood_note_new (701 ms, hash-only), _confirm, _list (one
+      CONFIRMED note, no secrets in any response), _export; an unbound
+      fresh client got `unauthorised` for _list. Not exercised: _import,
+      _new_pair, _spent, _discard.
+- [x] Item 16 PASS, both halves: unattended export card timed out (~30 s)
+      with `timeout` and the note untouched — twice; a measured ~5 s hold
+      released `k1` — twice (serial log: card raised, "dispatching on a
+      hold already completed"). EXTRA, worth keeping: the approve-once
+      transient window from a completed export hold did NOT silently
+      release a repeat export — the next ask raised its own card. The
+      CRITICAL auto-approve-slot variant is NOT yet run (needs an
+      operator-installed exact policy naming the method).
+- [x] Item 17 PASS: two parallel exports collapsed onto one card ("joins
+      the open approval card (2 asks)" in the log); a single hold answered
+      both; an unanswered collapsed pair timed out as one card.
+- Item 7 PARTIAL: nk minted, wrapped, verified and persisted on real
+  flash; the note created after key-set is sealed-on-write, but the
+  flash-dump HWNS/no-plaintext check is not yet run.
+- Items 1–6, 8–12 and the no-notes half of 14: NOT YET BENCH-RUN (USB-mode
+  items need the board switched to usb mode; sealing round-trip items need
+  a reboot/unlock cycle with notes held).
 
 Firmware under test: the note locker — LUD-25 bearer-note custody over the
 `FRAME_TYPE_NOTE_CMD` (0x70) USB frame, lnurl-vault JSON command set, notes

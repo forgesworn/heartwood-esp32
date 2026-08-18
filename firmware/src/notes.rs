@@ -366,9 +366,9 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
 
 /// Whether the device holds any notes (loaded or sealed), for code with no
 /// locker in scope — the WiFi-standalone tier consults this before allowing
-/// an at-rest change it could not sync notes through. Set at init; notes
-/// cannot be created in WiFi mode, so the boot-time value never goes stale
-/// there.
+/// an at-rest change it could not sync notes through. Set at init and
+/// re-stored after every note command (USB frame or relay method), so it
+/// stays fresh in both modes.
 static NOTES_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn any_notes_held() -> bool {
@@ -419,12 +419,23 @@ fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
             return; // unavailable locker: nothing to seal, nothing to lose
         };
 
-        // 1. Establish the note key in RAM.
+        // 1. Establish the note key in RAM. Every seed_cipher call below is
+        // a 100k-round PBKDF2 (~26 s on the S3 at opt-z) — feed the task
+        // watchdog before each one, exactly as pin.rs does per locked slot,
+        // or the 60 s watchdog fires mid-derivation (bench-caught 2026-08-18:
+        // two task-wdt reboots inside the verify decrypt).
         if nvs.key.is_none() {
             let mut buf = [0u8; seed_cipher::BLOB_LEN];
             let nk = nvs.nvs.get_blob(NK_KEY, &mut buf);
             match nk {
-                Ok(Some(blob)) => match seed_cipher::decrypt_seed(secret, blob) {
+                Ok(Some(blob)) => match {
+                    // Yield so IDLE0 runs between KDF stretches (its
+                    // watchdog aborts after 60 s of unbroken compute —
+                    // bench-caught 2026-08-18), then feed our own.
+                    esp_idf_hal::delay::FreeRtos::delay_ms(20);
+                    crate::wdt::feed(); // PBKDF2: nk unwrap
+                    seed_cipher::decrypt_seed(secret, blob)
+                } {
                     Ok(key) => nvs.key = Some(key),
                     Err(_) => {
                         log::error!(
@@ -442,9 +453,13 @@ fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
                     let mut nonce = [0u8; seed_cipher::NONCE_LEN];
                     crate::fill_random(&mut salt);
                     crate::fill_random(&mut nonce);
+                    esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
+                    crate::wdt::feed(); // PBKDF2: nk wrap
                     let blob = seed_cipher::encrypt_seed(secret, &key, &salt, &nonce);
                     // VERIFY-AFTER-ENCRYPT: the wrap must decrypt back before
                     // it is trusted as the key's only persistence.
+                    esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
+                    crate::wdt::feed(); // PBKDF2: wrap verification
                     if seed_cipher::decrypt_seed(secret, &blob) != Ok(key) {
                         log::error!("[notes] nk wrap failed verification — notes stay plaintext");
                         key.zeroize();
@@ -470,7 +485,11 @@ fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
             let mut nonce = [0u8; seed_cipher::NONCE_LEN];
             crate::fill_random(&mut salt);
             crate::fill_random(&mut nonce);
+            esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
+            crate::wdt::feed(); // PBKDF2: nk re-wrap
             let blob = seed_cipher::encrypt_seed(secret, &key, &salt, &nonce);
+            esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
+            crate::wdt::feed(); // PBKDF2: re-wrap verification
             if seed_cipher::decrypt_seed(secret, &blob) != Ok(key) {
                 log::error!("[notes] nk re-wrap failed verification — old wrap kept");
                 return;

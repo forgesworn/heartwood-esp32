@@ -136,6 +136,9 @@ pub fn try_unlock(
     // Decrypt all first; only commit to `masters` once every slot succeeds.
     let mut decrypted: Vec<(usize, [u8; 32])> = Vec::new();
     for (i, m) in masters.iter().enumerate() {
+        // Yield so IDLE0 runs between per-slot KDF stretches (its watchdog
+        // aborts after 60 s of unbroken compute), then feed our own.
+        esp_idf_hal::delay::FreeRtos::delay_ms(20);
         crate::wdt::feed(); // 100k-round PBKDF2 per locked slot
         if !m.locked {
             continue;

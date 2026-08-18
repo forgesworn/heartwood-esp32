@@ -1723,6 +1723,10 @@ fn locked_relay_phase(
                         &mut failed_attempts,
                         display,
                     ) {
+                        // Same proven secret unwraps the note key (and
+                        // self-heals torn sealed state) — relay-created
+                        // notes must not sit plaintext under sealed seeds.
+                        crate::notes::sync_sealed(&frame.payload);
                         unlock_sk.iter_mut().for_each(|b| *b = 0);
                         return;
                     }
@@ -1752,6 +1756,9 @@ fn locked_relay_phase(
                         masters,
                         display,
                     ) {
+                        // See PIN_UNLOCK above: the note key rides the same
+                        // secret.
+                        crate::notes::sync_sealed(&frame.payload);
                         unlock_sk.iter_mut().for_each(|b| *b = 0);
                         return;
                     }
@@ -1821,13 +1828,16 @@ fn handle_vault_delivery(
         }
     };
     let ok = crate::pin::try_unlock(nvs, masters, &vault_key);
-    vault_key.iter_mut().for_each(|b| *b = 0);
     if ok {
         log::info!("[relay] vault key accepted — device unlocked");
         crate::pin::clear_failed_attempts(nvs);
+        // The note key rides the same secret (see the locked-phase USB
+        // unlock arms) — sync before the key is scrubbed.
+        crate::notes::sync_sealed(&vault_key);
     } else {
         log::warn!("[relay] vault key rejected (AEAD check failed)");
     }
+    vault_key.iter_mut().for_each(|b| *b = 0);
     ok
 }
 
@@ -2088,11 +2098,11 @@ fn poll_usb(
             true,
         ),
 
-        // At-rest changes are refused while notes are held: the locker's
-        // seal-sync machinery (notes::sync_sealed) only runs on the USB-mode
-        // path, and changing the secret under sealed notes here would strand
-        // them. Notes cannot be created in wifi mode, so the boot-time flag
-        // never goes stale in this loop.
+        // At-rest changes are refused while notes are held: the at-rest
+        // enable/disable note-sync only runs on the USB-mode path, and
+        // changing the secret under sealed notes here would strand them.
+        // The flag stays fresh — every note command (USB frame or relay
+        // method) re-stores it.
         FRAME_TYPE_SET_PIN => {
             if crate::notes::any_notes_held() {
                 crate::protocol::write_frame(

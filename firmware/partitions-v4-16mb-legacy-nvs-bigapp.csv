@@ -1,0 +1,19 @@
+# Second one-off layout for the bench Heltec V4 (16MB, legacy 24K NVS) —
+# supersedes partitions-v4-16mb-legacy-nvs.csv on that unit as of 2026-08-18.
+#
+# Why: main's release app outgrew the 2 MB ota_0 slot (2,105,296 B vs
+# 2,097,152 at the note-locker landing; v0.16.0 shipped at 1,952,640, so the
+# fleet-wide 2 MB OTA ceiling is now a live release blocker tracked in the
+# roadmap). This unit is 16 MB and updates by app-only USB flash anyway, so
+# its ota_0 grows to 4 MB in place. Every live partition keeps its exact
+# offset: the legacy 24K nvs at 0x9000, phy_init, the config partition at
+# 0x410000, otadata at 0x414000. ota_1 is dropped — the OTA-into-ota_1
+# follow-up dies on this unit (it was already a one-off; fleet OTA testing
+# belongs to a standard-table board). Flash the table at 0x8000 and ERASE
+# otadata (0x414000, 0x2000 of 0xFF) so the bootloader falls back to ota_0.
+# Name,    Type, SubType, Offset,   Size,   Flags
+nvs,       data, nvs,     0x9000,   0x6000,
+phy_init,  data, phy,     0xf000,   0x1000,
+ota_0,     app,  ota_0,   0x10000,  0x400000,
+config,    data, 0x40,    0x410000, 0x4000,
+otadata,   data, ota,     0x414000, 0x2000,

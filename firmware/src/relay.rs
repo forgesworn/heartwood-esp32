@@ -4756,6 +4756,9 @@ fn dispatch_mgmt(
         }
 
         "get_network_config" => {
+            if !is_device_op {
+                return Err("reading the device network configuration is a device-level operation and requires the device operator".into());
+            }
             // Capture the atomic marker before best-effort cleanup. Once this
             // exists, B and a committed outcome are authoritative even when
             // active/terminal NVS writes are temporarily unavailable.
@@ -4845,6 +4848,9 @@ fn dispatch_mgmt(
         }
 
         "stage_network_config" => {
+            if !is_device_op {
+                return Err("network configuration is a device-level operation and requires the device operator".into());
+            }
             let params: StageNetworkConfigParams = serde_json::from_value(
                 req.get("params")
                     .cloned()
@@ -4890,6 +4896,9 @@ fn dispatch_mgmt(
         }
 
         "activate_network_config" => {
+            if !is_device_op {
+                return Err("network configuration is a device-level operation and requires the device operator".into());
+            }
             if !network_activation_source_allowed(s.recv_timeout_on) {
                 return Err(
                     "activate_network_config requires a relay session with bounded reads".into(),
@@ -4939,6 +4948,9 @@ fn dispatch_mgmt(
         }
 
         "commit_network_config" => {
+            if !is_device_op {
+                return Err("network configuration is a device-level operation and requires the device operator".into());
+            }
             let params: NetworkConfigTransactionParams = serde_json::from_value(
                 req.get("params")
                     .cloned()
@@ -5042,6 +5054,9 @@ fn dispatch_mgmt(
         }
 
         "abort_network_config" => {
+            if !is_device_op {
+                return Err("network configuration is a device-level operation and requires the device operator".into());
+            }
             let params: NetworkConfigTransactionParams = serde_json::from_value(
                 req.get("params")
                     .cloned()
@@ -6274,6 +6289,9 @@ fn dispatch_mgmt(
         // and applied immediately; the confirmation logs at WARN so it is
         // visible either way.
         "set_log_level" => {
+            if !is_device_op {
+                return Err("changing the device log level is a device-level operation and requires the device operator".into());
+            }
             let quiet = req
                 .pointer("/params/quiet")
                 .and_then(|v| v.as_bool())
@@ -6288,14 +6306,7 @@ fn dispatch_mgmt(
         }
 
         "get_status" => {
-            let mut relays_live = vec![s.url.clone()];
-            relays_live.extend(pool.others.iter().map(|o| o.url.clone()));
-            Ok(serde_json::json!({
-                "master_count": ctx.masters.len(),
-                "master_npub_hex": master_hex,
-                "mode": "wifi-standalone",
-                "relay": ctx.relay_url,
-                "capabilities": [
+            let capabilities = serde_json::json!([
                     "client_policy_v2",
                     // Schema addendum §1.5 family flags (escalate,
                     // petition_on_deny, audit_child_wrap, bound_identity)
@@ -6321,7 +6332,29 @@ fn dispatch_mgmt(
                     // extensions (gated methods pinned always-button, held
                     // through the deferred-approval machinery).
                     "note_locker_v1"
-                ],
+            ]);
+            // A delegate (per-identity operator) sees only what it needs to
+            // feature-detect and manage its own identity — never the
+            // device-wide audit ring, relay topology, storage inventory, or an
+            // enumeration of the owner's other identities.
+            if !is_device_op {
+                return Ok(serde_json::json!({
+                    "master_npub_hex": master_hex,
+                    "mode": "wifi-standalone",
+                    "capabilities": capabilities,
+                    "slots": ctx.policy_engine.list_slots(master_slot).len(),
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "board": crate::board::BOARD,
+                }));
+            }
+            let mut relays_live = vec![s.url.clone()];
+            relays_live.extend(pool.others.iter().map(|o| o.url.clone()));
+            Ok(serde_json::json!({
+                "master_count": ctx.masters.len(),
+                "master_npub_hex": master_hex,
+                "mode": "wifi-standalone",
+                "relay": ctx.relay_url,
+                "capabilities": capabilities,
                 "relays_live": relays_live,
                 "relays_pinned": pool.pinned.iter().map(|p| p.url.clone()).collect::<Vec<_>>(),
                 "slots": ctx.policy_engine.list_slots(master_slot).len(),

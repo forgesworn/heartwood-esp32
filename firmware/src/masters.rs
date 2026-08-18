@@ -251,6 +251,10 @@ pub fn add_master(
     let slot = count;
     let prefix = format!("master_{slot}");
 
+    // Defensive: a fresh identity must never inherit a stale per-identity
+    // operator left in this slot index (belt-and-braces with slot_keys()).
+    let _ = nvs.remove(&format!("{prefix}_op"));
+
     nvs.set_blob(&format!("{prefix}_secret"), secret)
         .map_err(|_| "failed to write secret")?;
     nvs.set_blob(&format!("{prefix}_label"), label.as_bytes())
@@ -509,7 +513,7 @@ fn rewrite_pinned_relays_from_shadow(
     }
 }
 
-fn slot_keys(slot: u8) -> [String; 10] {
+fn slot_keys(slot: u8) -> [String; 11] {
     let master = format!("master_{slot}");
     [
         format!("{master}_secret"),
@@ -522,6 +526,10 @@ fn slot_keys(slot: u8) -> [String; 10] {
         format!("policy_{slot}"),
         format!("iman{slot}"),
         format!("imav{slot}"),
+        // Per-identity operator MUST travel/clear with the bundle: otherwise a
+        // slot shift or reuse leaves a stale delegate bound to whichever
+        // identity later occupies the slot — a cross-identity escape.
+        format!("{master}_op"),
     ]
 }
 

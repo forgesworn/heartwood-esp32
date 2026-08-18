@@ -1,11 +1,12 @@
 # Second one-off layout for the bench Heltec V4 (16MB, legacy 24K NVS) —
 # supersedes partitions-v4-16mb-legacy-nvs.csv on that unit as of 2026-08-18.
 #
-# Why: main's release app outgrew the 2 MB ota_0 slot (2,105,296 B vs
-# 2,097,152 at the note-locker landing; v0.16.0 shipped at 1,952,640, so the
-# fleet-wide 2 MB OTA ceiling is now a live release blocker tracked in the
-# roadmap). This unit is 16 MB and updates by app-only USB flash anyway, so
-# its ota_0 grows to 4 MB in place. Every live partition keeps its exact
+# Why: main's release app briefly outgrew the 2 MB ota_0 slot (2,105,296 B
+# vs 2,097,152 at the note-locker landing). RESOLVED the same evening by the
+# sdkconfig size diet (common cert bundle, no SoftAP, no IPv6 — see
+# sdkconfig.defaults): the app is back to 1,989,664 B and fleet OTA fits
+# again. This unit keeps the wide slot as headroom; it is 16 MB and updates
+# by app-only USB flash anyway, so its ota_0 grows to 4 MB in place. Every live partition keeps its exact
 # offset: the legacy 24K nvs at 0x9000, phy_init, the config partition at
 # 0x410000, otadata at 0x414000. ota_1 is dropped — the OTA-into-ota_1
 # follow-up dies on this unit (it was already a one-off; fleet OTA testing

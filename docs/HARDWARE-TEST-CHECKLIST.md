@@ -991,6 +991,16 @@ before-write held both times. Also observed (pre-existing, not ours):
 - Item 7 PARTIAL: nk minted, wrapped, verified and persisted on real
   flash; the note created after key-set is sealed-on-write, but the
   flash-dump HWNS/no-plaintext check is not yet run.
+- Item 8 second half PASS (incidental, same evening): after a reflash +
+  power cycle the sealed note survived, the unlock unwrapped the nk and
+  `[notes] sealed state in sync (1 note(s) under the note key)` reported
+  it; heartwood_note_list over the relay then returned it intact. Locked
+  get_info / NACK-"locked" checks still not run.
+- Size diet verified on this board same evening: common cert bundle +
+  no-SoftAP + no-IPv6 (sdkconfig.defaults) took the release app from
+  2,105 KB to 1,990 KB — back inside the 2 MB OTA slot with ~107 KB
+  headroom. "Certificate validated" + TLS + subscribe + a relay note_list
+  all confirmed on the trimmed bundle against relay.trotters.cc.
 - Items 1–6, 8–12 and the no-notes half of 14: NOT YET BENCH-RUN (USB-mode
   items need the board switched to usb mode; sealing round-trip items need
   a reboot/unlock cycle with notes held).

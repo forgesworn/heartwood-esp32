@@ -647,6 +647,22 @@ impl NoteStore {
         self.persist_remove(storage, idx)
     }
 
+    /// Re-persist every held note's blob unchanged — the re-seal/unseal pass
+    /// behind an at-rest enable or disable, where the storage layer's
+    /// wrapping has changed but the records have not. Blob rewrites only,
+    /// never the index. Stops at the first failure (RAM still matches what
+    /// each successful write left on flash, because nothing in RAM changed);
+    /// re-running after the storage recovers converges.
+    pub fn rewrite_all(&mut self, storage: &mut dyn NoteStorage) -> Result<(), NoteError> {
+        for note in &self.notes {
+            let mut blob = encode_note(note).map_err(|_| NoteError::BadRequest)?;
+            let saved = storage.save_note(&note.id, &blob);
+            blob.zeroize(); // the encoded record embeds the raw secret
+            saved.map_err(|_| NoteError::StorageFull)?;
+        }
+        Ok(())
+    }
+
     // ---- internals ----
 
     fn find(&self, id: &str) -> Result<usize, NoteError> {
@@ -1395,6 +1411,26 @@ mod tests {
                 .err(),
             Some(NoteError::BadRequest)
         );
+    }
+
+    #[test]
+    fn rewrite_all_repersists_every_note_and_converges_after_failure() {
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let (a, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        let (b, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        store.confirm(&mut storage, &a, 1_000, "mint.example", None, 1).unwrap();
+
+        // Fail after the first of the two blob writes.
+        storage.budget = Some(1);
+        assert_eq!(store.rewrite_all(&mut storage), Err(NoteError::StorageFull));
+        storage.budget = None;
+        // Nothing in RAM changed and a rerun completes.
+        store.rewrite_all(&mut storage).unwrap();
+        let reloaded = fresh_store(&mut storage);
+        assert_eq!(reloaded.get_meta(&a).unwrap().state, NoteState::Confirmed);
+        assert!(reloaded.get_meta(&b).is_some());
     }
 
     #[test]

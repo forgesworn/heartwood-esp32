@@ -2,7 +2,7 @@
 //
 // NIP-04 — legacy direct messages (AES-256-CBC + PKCS7).
 //
-// NIP-04 is deprecated in favour of NIP-44 (XChaCha20 + HMAC).  It is
+// NIP-04 is deprecated in favour of NIP-44 v2 (ChaCha20 + HMAC).  It is
 // included here solely for backwards compatibility with older clients.
 //
 // Wire format produced by encrypt():
@@ -11,6 +11,10 @@
 // Security notes:
 //   - The shared secret is the raw ECDH x-coordinate with no key derivation.
 //     This is cryptographically weak; prefer NIP-44 for new code.
+//   - `get_shared_secret` returns that secret as a plain `[u8; 32]`: the
+//     signature is frozen by the firmware, host-tool and Ledger consumers, so
+//     it cannot be wrapped in `Zeroizing` here. Callers own the copy and
+//     should zeroize it once the encrypt/decrypt call is done.
 //   - CBC mode without authentication is malleable — no integrity guarantee.
 //   - Both k256 and secp256k1 backends are supported via cfg (same pattern as
 //     nip44.rs and derive.rs).
@@ -159,6 +163,13 @@ pub fn encrypt(
 /// Decrypt a NIP-04 ciphertext string (`"<ct_b64>?iv=<iv_b64>"`).
 ///
 /// Returns the plaintext string on success, or a descriptive error.
+///
+/// The descriptive errors are for LOCAL diagnostics and must stay off the
+/// wire: distinguishable failure reasons, together with the non-constant-time
+/// padding check in `pkcs7_unpad`, are padding-oracle ingredients. Callers
+/// answering remote clients must collapse every failure to one generic
+/// "decryption failed" — the firmware NIP-46 handler already does this; any
+/// future caller must too.
 pub fn decrypt(
     shared_secret: &[u8; 32],
     ciphertext: &str,

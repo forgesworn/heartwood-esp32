@@ -29,6 +29,7 @@ use chacha20::{
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -38,6 +39,14 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// NIP-44 v2 version byte.
 const VERSION: u8 = 0x02;
+
+/// Longest legitimate NIP-44 v2 payload, in base64 characters. The spec caps
+/// plaintext at 65535 bytes, which pads to 65536 and wraps to a 65603-byte
+/// wire payload (version 1 + nonce 32 + length prefix 2 + padded message +
+/// HMAC 32), or 87472 base64 chars — the value `encoded_len(65_535)` returns.
+/// `decrypt` refuses anything longer BEFORE decoding, so an oversized input
+/// never reaches an allocation.
+const MAX_CIPHERTEXT_B64_LEN: usize = 87_472;
 
 // ---------------------------------------------------------------------------
 // Conversation key
@@ -240,6 +249,13 @@ pub fn encoded_len(msg_len: usize) -> Option<usize> {
 }
 
 /// Remove NIP-44 padding and return the original plaintext string.
+///
+/// Deliberately more lenient than the strict spec reading: a zero `msg_len`
+/// is accepted and the trailing padding length is not re-verified against
+/// `calc_padded_len`. Both are craftable only by the conversation-key holder
+/// (the HMAC has already verified by the time this runs), who can encrypt
+/// anything anyway — so this is an interop/robustness choice against
+/// misbehaving but authenticated peers, not a security boundary.
 fn unpad(data: &[u8]) -> Result<&str, &'static str> {
     if data.len() < 2 {
         return Err("padded data too short");
@@ -261,19 +277,25 @@ fn unpad(data: &[u8]) -> Result<&str, &'static str> {
 /// Uses HKDF-expand only (conversation key is already the PRK from the
 /// extract step during conversation key derivation). The nonce is the info
 /// parameter, producing 76 bytes: chacha_key(32) + chacha_nonce(12) + hmac_key(32).
+///
+/// The HKDF output and the derived keys are `Zeroizing`: they are full message
+/// keys and must not linger in freed stack/heap after the encrypt/decrypt call
+/// that produced them.
 fn derive_message_keys(
     conversation_key: &[u8; 32],
     nonce: &[u8; 32],
-) -> Result<([u8; 32], [u8; 12], [u8; 32]), &'static str> {
+) -> Result<(Zeroizing<[u8; 32]>, [u8; 12], Zeroizing<[u8; 32]>), &'static str> {
     let hk = Hkdf::<Sha256>::from_prk(conversation_key)
         .map_err(|_| "HKDF from_prk failed")?;
-    let mut okm = [0u8; 76];
-    hk.expand(nonce.as_slice(), &mut okm)
+    let mut okm = Zeroizing::new([0u8; 76]);
+    hk.expand(nonce.as_slice(), okm.as_mut_slice())
         .map_err(|_| "HKDF expand (message keys) failed")?;
 
-    let mut chacha_key = [0u8; 32];
+    let mut chacha_key = Zeroizing::new([0u8; 32]);
+    // The ChaCha nonce is not key material (it is safe to transmit), so it
+    // stays a plain array; the two keys are wrapped.
     let mut chacha_nonce = [0u8; 12];
-    let mut hmac_key = [0u8; 32];
+    let mut hmac_key = Zeroizing::new([0u8; 32]);
 
     chacha_key.copy_from_slice(&okm[..32]);
     chacha_nonce.copy_from_slice(&okm[32..44]);
@@ -327,7 +349,7 @@ fn encrypt_padded(
     cipher.apply_keystream(&mut ciphertext);
 
     // HMAC-SHA256 over nonce || ciphertext (version byte excluded per NIP-44).
-    let mut mac = HmacSha256::new_from_slice(&hmac_key)
+    let mut mac = HmacSha256::new_from_slice(hmac_key.as_slice())
         .map_err(|_| "HMAC init failed")?;
     mac.update(nonce);
     mac.update(&ciphertext);
@@ -357,11 +379,22 @@ pub fn decrypt(
     conversation_key: &[u8; 32],
     ciphertext_b64: &str,
 ) -> Result<String, &'static str> {
+    // Refuse over-length input before the decode allocates for it: anything
+    // past the spec maximum can never be a valid payload, and both transports
+    // already cap at 32 KB, so this is defence in depth.
+    if ciphertext_b64.len() > MAX_CIPHERTEXT_B64_LEN {
+        return Err("ciphertext too long");
+    }
+
     let mut payload = BASE64
         .decode(ciphertext_b64.trim())
         .map_err(|_| "invalid base64")?;
 
-    // Minimum: version(1) + nonce(32) + padded_content(32) + hmac(32) = 97
+    // Minimum: version(1) + nonce(32) + padded_content(32) + hmac(32) = 97.
+    // The strict spec minimum is 99 (a 1-byte message pads to 34 content
+    // bytes); accepting 97-98 is deliberate leniency towards authenticated
+    // peers, as with `unpad` — only the conversation-key holder can produce
+    // such a payload, and it fails safely at unpad rather than at a boundary.
     if payload.len() < 97 {
         return Err("ciphertext too short");
     }
@@ -382,7 +415,7 @@ pub fn decrypt(
         derive_message_keys(conversation_key, &nonce_bytes)?;
 
     // Verify MAC over nonce || ciphertext (version byte excluded per NIP-44).
-    let mut mac = HmacSha256::new_from_slice(&hmac_key)
+    let mut mac = HmacSha256::new_from_slice(hmac_key.as_slice())
         .map_err(|_| "HMAC init failed")?;
     mac.update(&payload[1..hmac_offset]); // nonce || ciphertext (skip version byte)
     mac.verify_slice(received_tag)
@@ -747,6 +780,22 @@ mod tests {
         let short = BASE64.encode(&[0u8; 10]);
         let result = decrypt(&conv_key, &short);
         assert!(result.is_err(), "too-short ciphertext must return an error");
+    }
+
+    #[test]
+    fn test_decrypt_overlong_ciphertext_rejected_before_decoding() {
+        let conv_key = [0u8; 32];
+        // One character past the spec maximum (plaintext 65535 → wire 65603 →
+        // 87472 base64 chars) must be refused by the length gate, not decoded.
+        let overlong = "A".repeat(MAX_CIPHERTEXT_B64_LEN + 1);
+        assert_eq!(decrypt(&conv_key, &overlong), Err("ciphertext too long"));
+        // The maximum itself passes the length gate and fails later (this one
+        // is not a real payload, so the version byte rejects it).
+        let at_max = "A".repeat(MAX_CIPHERTEXT_B64_LEN);
+        let err = decrypt(&conv_key, &at_max).unwrap_err();
+        assert_ne!(err, "ciphertext too long", "max-length payload must reach the decoder");
+        // The gate constant must agree with the encoder's own arithmetic.
+        assert_eq!(encoded_len(65_535), Some(MAX_CIPHERTEXT_B64_LEN));
     }
 
     #[test]

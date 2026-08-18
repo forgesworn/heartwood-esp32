@@ -139,7 +139,7 @@ pub fn handle_derive(
             return None;
         }
     };
-    if let Err(e) = heartwood_common::validate::validate_purpose(name) {
+    if let Err(e) = heartwood_common::validate::validate_raw_derive_purpose(name) {
         log::warn!("DERIVE_IDENTITY invalid name: {e}");
         protocol::write_frame(usb, FRAME_TYPE_NACK, e.as_bytes());
         return None;

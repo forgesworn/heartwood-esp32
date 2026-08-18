@@ -5147,7 +5147,7 @@ fn dispatch_mgmt(
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .ok_or("derive_identity requires params.name")?;
-            heartwood_common::validate::validate_purpose(name)?;
+            heartwood_common::validate::validate_raw_derive_purpose(name)?;
 
             let parent = &ctx.masters[master_idx];
             if parent.locked {

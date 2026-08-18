@@ -45,6 +45,22 @@ pub fn validate_purpose(purpose: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Validate a purpose supplied verbatim by an operator or host tool
+/// (`derive_identity` over the management channel, the USB DERIVE_IDENTITY
+/// frame). Extends `validate_purpose` with refusal of the reserved `nostr:`
+/// namespace: a raw derive there produces a key the persona registry never
+/// sees, so the result looks like a dependant but is invisible to the
+/// roster and rejected by persona-addressed mints (issue #69). The persona
+/// paths themselves derive `nostr:persona:{name}` internally and do not
+/// route through this helper.
+pub fn validate_raw_derive_purpose(purpose: &str) -> Result<(), &'static str> {
+    validate_purpose(purpose)?;
+    if purpose.starts_with("nostr:") {
+        return Err("'nostr:' names are reserved — create dependants and personas with heartwood_derive_persona");
+    }
+    Ok(())
+}
+
 /// Validate a purpose string for embedding in a linkage-proof attestation.
 ///
 /// Extends `validate_purpose` with rejection of C0 and DEL control
@@ -138,6 +154,19 @@ mod tests {
     fn rejects_whitespace_only() {
         assert!(validate_purpose("   ").is_err());
         assert!(validate_purpose("\t\n").is_err());
+    }
+
+    #[test]
+    fn raw_derive_purpose_refuses_the_reserved_namespace() {
+        assert!(validate_raw_derive_purpose("gopherkind").is_ok());
+        assert!(validate_raw_derive_purpose("persona").is_ok());
+        // The whole scheme is reserved, not only nostr:persona:.
+        assert!(validate_raw_derive_purpose("nostr:persona:ada").is_err());
+        assert!(validate_raw_derive_purpose("nostr:persona:natural-person").is_err());
+        assert!(validate_raw_derive_purpose("nostr:anything").is_err());
+        // Base rules still apply.
+        assert!(validate_raw_derive_purpose("").is_err());
+        assert!(validate_raw_derive_purpose("evil|9999").is_err());
     }
 
     #[test]

@@ -230,6 +230,46 @@ fn read_entry(nvs: &EspNvs<NvsDefault>, entry: u8) -> Result<PackedPersona, &'st
         .ok_or("persona entry missing")
 }
 
+/// Shrink the stored count to the entries that actually persisted, returning
+/// the reconciled value.
+///
+/// #74: when NVS fills, `pcnt` can end up claiming more entries than the
+/// chunks hold. Every scan then dies on the first index the chunks cannot
+/// satisfy — including `remove_by_pubkey`, which is precisely the call an
+/// operator would use to free the space that caused it, so the registry
+/// deadlocks against the condition removal exists to relieve. On 2026-08-19
+/// that chain reached the boot-time hold-to-wipe escape and cost a bench board
+/// every master and connection slot it had.
+///
+/// The chunks are the authority, not the count: `write_chunk` and
+/// `write_packed_count` both verify by read-back and the chunk is written
+/// first, so a claimed entry that cannot be read never reached flash and
+/// dropping it loses nothing that was ever durable.
+///
+/// Callers must have confirmed the packed layout (and resumed any pending
+/// removal) first — reconciling underneath a live journal would invalidate the
+/// `original_count` it shifts against.
+pub(crate) fn reconcile_count(nvs: &mut EspNvs<NvsDefault>) -> Result<u8, &'static str> {
+    if !packed_format(nvs)? {
+        // Legacy layout: entries are per-key, not chunked, so there is no
+        // chunk/count divergence to repair and `read_entry` would not apply.
+        return read_count_strict(nvs);
+    }
+    let claimed = read_count_strict(nvs)?;
+    let mut actual = 0u8;
+    while actual < claimed && read_entry(nvs, actual).is_ok() {
+        actual += 1;
+    }
+    if actual != claimed {
+        log::warn!(
+            "persona registry: count {claimed} exceeds {actual} readable entries — \
+             reconciling to {actual} so the registry stays mutable"
+        );
+        write_packed_count(nvs, actual)?;
+    }
+    Ok(actual)
+}
+
 /// Write one entry in place via a chunk read-modify-write.
 fn write_entry(
     nvs: &mut EspNvs<NvsDefault>,
@@ -362,9 +402,19 @@ pub fn rename_by_pubkey(
     if !packed_format(nvs)? {
         return Err("persona registry migration has not run");
     }
-    let count = read_count_key(nvs, COUNT_KEY);
+    let count = reconcile_count(nvs)?;
     for entry in 0..count {
-        let current = read_entry(nvs, entry)?;
+        // Same tolerance as removal (#74): a short registry must not make
+        // every rename fail on the first unreadable index.
+        let current = match read_entry(nvs, entry) {
+            Ok(current) => current,
+            Err(e) => {
+                log::warn!(
+                    "persona registry: entry {entry} of {count} unreadable ({e}); skipping"
+                );
+                continue;
+            }
+        };
         if &current.pubkey == pubkey {
             let mut updated = current;
             updated.name = name.map(|n| clamp_label(n).to_string());
@@ -390,12 +440,21 @@ pub fn remove_by_pubkey(
     if !packed_format(nvs)? {
         return Err("persona registry migration has not run");
     }
-    let count = read_count_strict(nvs)?;
+    let count = reconcile_count(nvs)?;
     let mut target = None;
     for entry in 0..count {
-        if &read_entry(nvs, entry)?.pubkey == pubkey {
-            target = Some(entry);
-            break;
+        // Defence in depth behind the reconcile: an entry that still will not
+        // read cannot be the one being removed, so skip it rather than abort
+        // the scan. Aborting is what made a short registry unfixable (#74).
+        match read_entry(nvs, entry) {
+            Ok(found) if &found.pubkey == pubkey => {
+                target = Some(entry);
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!(
+                "persona registry: entry {entry} of {count} unreadable ({e}); skipping"
+            ),
         }
     }
     let Some(target) = target else {

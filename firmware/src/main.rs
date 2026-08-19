@@ -463,6 +463,11 @@ fn main() {
     loop {
         match personas::migrate_if_needed(&mut nvs)
             .and_then(|()| personas::resume_pending_removal(&mut nvs))
+            // #74: reconcile a count that outran its chunks (what a full NVS
+            // leaves behind) AFTER any journal has been resumed, so a short
+            // registry self-heals here instead of failing every later scan and
+            // sending an operator to the hold-to-wipe escape below.
+            .and_then(|()| personas::reconcile_count(&mut nvs).map(|_| ()))
         {
             Ok(()) => break,
             Err(e) => {

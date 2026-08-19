@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 description = "Host-side renderer for the Heartwood device screens — emits PNGs at each board's panel size so layouts can be checked without hardware. Shares firmware/src/layout.rs verbatim."
+license = "MIT"
 
 [dependencies]
 embedded-graphics = "0.8"

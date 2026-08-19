@@ -5,7 +5,7 @@
 // Atomic writes (write-to-tmp, fsync, rename) prevent partial-write
 // corruption on power loss.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 
@@ -16,7 +16,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305,
 };
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use heartwood_common::policy::ConnectSlot;
 
@@ -63,11 +63,18 @@ pub struct Keystore {
 pub struct SoftMaster {
     pub slot: u8,
     pub label: String,
-    /// 64 hex chars (32-byte secret key).
+    /// 64 hex chars (32-byte secret key). Scrubbed on drop (see below) so
+    /// locking the backend actually removes master secrets from the heap.
     pub secret_key: String,
     /// Always "soft" for this backend.
     pub mode: String,
     pub connection_slots: Vec<ConnectSlot>,
+}
+
+impl Drop for SoftMaster {
+    fn drop(&mut self) {
+        self.secret_key.zeroize();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,8 +121,10 @@ pub fn encrypt_keystore(
 
     let key = derive_key(passphrase.as_bytes(), &salt, m_cost, t_cost, p_cost)?;
 
-    let plaintext =
-        serde_json::to_vec(keystore).map_err(|e| format!("serialise keystore: {e}"))?;
+    // The plaintext holds every master secret -- scrub it after use.
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(keystore).map_err(|e| format!("serialise keystore: {e}"))?,
+    );
 
     let cipher = XChaCha20Poly1305::new(key.as_ref().into());
     let ciphertext = cipher
@@ -171,9 +180,12 @@ pub fn decrypt_keystore(
     let nonce_arr: [u8; NONCE_LEN] = nonce_bytes.try_into().unwrap();
 
     let cipher = XChaCha20Poly1305::new(key.as_ref().into());
-    let plaintext = cipher
-        .decrypt(nonce_arr.as_ref().into(), ciphertext.as_slice())
-        .map_err(|_| "wrong passphrase or corrupted ciphertext".to_string())?;
+    // The plaintext holds every master secret -- scrub it after use.
+    let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(
+        cipher
+            .decrypt(nonce_arr.as_ref().into(), ciphertext.as_slice())
+            .map_err(|_| "wrong passphrase or corrupted ciphertext".to_string())?,
+    );
 
     let keystore: Keystore = serde_json::from_slice(&plaintext)
         .map_err(|e| format!("deserialise keystore: {e}"))?;
@@ -197,8 +209,10 @@ pub fn reencrypt_keystore(
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(|e| format!("getrandom nonce: {e}"))?;
 
-    let plaintext =
-        serde_json::to_vec(keystore).map_err(|e| format!("serialise keystore: {e}"))?;
+    // The plaintext holds every master secret -- scrub it after use.
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(keystore).map_err(|e| format!("serialise keystore: {e}"))?,
+    );
 
     let cipher = XChaCha20Poly1305::new(key.into());
     let ciphertext = cipher
@@ -224,16 +238,26 @@ pub fn reencrypt_keystore(
 /// Write a `KeystoreEnvelope` to `path` atomically.
 ///
 /// Writes to `path.tmp`, fsyncs, then renames over `path`. This prevents
-/// a partial write from leaving a corrupted keyfile after power loss.
+/// a partial write from leaving a corrupted keyfile after power loss. The
+/// tmp file is created with mode 0600 (matching api-token/vault.key): the
+/// contents are encrypted, but the ciphertext and KDF parameters are
+/// offline-crackable material and should not be world-readable (HD-L6).
 pub fn write_envelope(path: &Path, envelope: &KeystoreEnvelope) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let json =
         serde_json::to_string_pretty(envelope).map_err(|e| format!("serialise envelope: {e}"))?;
 
     let tmp_path = path.with_extension("tmp");
 
     {
-        let mut file =
-            File::create(&tmp_path).map_err(|e| format!("create tmp file: {e}"))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("create tmp file: {e}"))?;
         file.write_all(json.as_bytes())
             .map_err(|e| format!("write tmp file: {e}"))?;
         file.flush().map_err(|e| format!("flush tmp file: {e}"))?;
@@ -353,6 +377,21 @@ mod tests {
         let env2 = read_envelope(&path).unwrap();
         let (ks2, _) = decrypt_keystore(&env2, "pass").unwrap();
         assert_eq!(ks2.masters[0].label, "personal");
+    }
+
+    #[test]
+    fn written_keyfile_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keystore.json");
+
+        let ks = test_keystore();
+        let env = encrypt_keystore(&ks, "pass", M, T, P).unwrap();
+        write_envelope(&path, &env).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

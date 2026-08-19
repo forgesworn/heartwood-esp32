@@ -27,12 +27,18 @@ use crate::protocol;
 use heartwood_common::restore::{restore_root, Choice, WordEntry};
 
 /// Handle a PROVISION_ADD frame (0x01). Returns the new `LoadedMaster` on success.
+///
+/// The host pushes the seed, so a physical hold gates the write (FW-M3) —
+/// the same authority bar as removal: a bare USB frame must not be able to
+/// fill identity slots on an unattended signer. The OLED names the label
+/// being added; deny/timeout NACKs.
 pub fn handle_add(
     usb: &mut SerialPort<'_>,
     frame: &Frame,
     nvs: &mut EspNvs<NvsDefault>,
     secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
     display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
 ) -> Option<LoadedMaster> {
     // Legacy format: exactly 32 bytes = tree-mnemonic with label "default".
     let (mode, label, secret) = if frame.payload.len() == 32 {
@@ -71,6 +77,21 @@ pub fn handle_add(
         return None;
     };
 
+    // Physical approval before the host-pushed seed is written. The label is
+    // what the owner is admitting — show it, truncated for the small panel.
+    // 30 s window, matching removal and the other USB prompts, so existing
+    // host tools' response timeouts still cover the hold.
+    let short_label: String = label.chars().take(18).collect();
+    let prompt = format!("Add identity?\n'{short_label}'");
+    let approval = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
+        oled::show_change_approval(d, &prompt, remaining, 30);
+    });
+    if !matches!(approval, crate::approval::ApprovalResult::Approved) {
+        log::info!("PROVISION_ADD denied or timed out on device");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"denied");
+        return None;
+    }
+
     match store_master(nvs, secret, label, mode, secp) {
         Ok(master) => {
             let npub = encode_npub(&master.pubkey);
@@ -82,7 +103,7 @@ pub fn handle_add(
         Err(e) => {
             log::error!("Provision add failed: {e}");
             oled::show_error(display, "Provision failed");
-            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            protocol::write_frame(usb, FRAME_TYPE_NACK, e.as_bytes());
             None
         }
     }
@@ -92,6 +113,13 @@ pub fn handle_add(
 /// NVS. No display, no ACK — the caller decides what to show (the npub for an
 /// import, the recovery phrase for a self-generated identity). Crate-visible so
 /// the relay's `derive_identity` management method stores through the same path.
+///
+/// At-rest encryption (FW-M5): when any slot already carries an encrypted seed
+/// blob, a new plaintext secret must NOT be written next to them — but the
+/// unlock secret that could wrap it is deliberately zeroized at unlock and
+/// never session-held, so there is nothing safe to wrap under this session.
+/// Refuse with guidance rather than silently break the encrypted-at-rest
+/// contract (`pin.rs`): one plaintext slot would survive a flash dump.
 pub(crate) fn store_master(
     nvs: &mut EspNvs<NvsDefault>,
     secret: [u8; 32],
@@ -99,6 +127,12 @@ pub(crate) fn store_master(
     mode: MasterMode,
     secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
 ) -> Result<LoadedMaster, String> {
+    if masters::encryption_at_rest_active(nvs) {
+        return Err(
+            "at-rest encryption active: clear the PIN/vault key, add the identity, then re-enable"
+                .to_string(),
+        );
+    }
     let keypair = secp256k1::Keypair::from_seckey_slice(secp, &secret)
         .map_err(|_| "invalid secret key".to_string())?;
     let (xonly, _) = keypair.x_only_public_key();
@@ -118,12 +152,17 @@ pub(crate) fn store_master(
 ///
 /// Idempotent: deriving a name that already has a master slot (same pubkey)
 /// reports that slot with existing=true instead of duplicating it.
+///
+/// Storing a NEW child is a master-set change pushed by the host, so it is
+/// gated on a physical hold (FW-M3), consistent with add and removal; the
+/// idempotent re-derive lookup changes nothing and needs no approval.
 pub fn handle_derive(
     usb: &mut SerialPort<'_>,
     frame: &Frame,
     nvs: &mut EspNvs<NvsDefault>,
     secp: &Arc<Secp256k1<secp256k1::SignOnly>>,
     display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
     loaded: &[LoadedMaster],
 ) -> Option<LoadedMaster> {
     if frame.payload.len() < 2 {
@@ -182,6 +221,20 @@ pub fn handle_derive(
         let npub = encode_npub(&existing.pubkey);
         log::info!("DERIVE_IDENTITY '{name}' already provisioned in slot {}", existing.slot);
         respond(usb, existing.slot, &existing.label, &npub, true);
+        return None;
+    }
+
+    // A new master is about to be written on the host's say-so — physical
+    // hold first, naming the branch being derived (FW-M3). 30 s window, as
+    // for removal, so host tools' response timeouts still cover the hold.
+    let short_name: String = name.chars().take(18).collect();
+    let prompt = format!("Derive identity?\n'{short_name}'");
+    let approval = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
+        oled::show_change_approval(d, &prompt, remaining, 30);
+    });
+    if !matches!(approval, crate::approval::ApprovalResult::Approved) {
+        log::info!("DERIVE_IDENTITY '{name}' denied or timed out on device");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"denied");
         return None;
     }
 
@@ -247,6 +300,19 @@ pub fn handle_generate(
         )
     };
     let entropy_len = if words == 24 { 32 } else { 16 };
+
+    // At-rest encryption cannot wrap a fresh seed this session (FW-M5) —
+    // refuse before the owner plays the entropy game for nothing.
+    if masters::encryption_at_rest_active(nvs) {
+        log::warn!("GENERATE_IDENTITY refused: at-rest encryption active");
+        oled::show_error(display, "Disable PIN/vault\nbefore adding");
+        protocol::write_frame(
+            usb,
+            FRAME_TYPE_NACK,
+            b"at-rest encryption active: clear the PIN/vault key, add the identity, then re-enable",
+        );
+        return None;
+    }
 
     // Offer the entropy game: the owner's button timing becomes a second,
     // independent entropy source, stacked with the hardware RNG draw so
@@ -479,6 +545,19 @@ pub fn handle_restore(
         }
         String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string()
     };
+
+    // At-rest encryption cannot wrap a restored seed this session (FW-M5) —
+    // refuse before the owner enters twelve words for nothing.
+    if masters::encryption_at_rest_active(nvs) {
+        log::warn!("RESTORE_IDENTITY refused: at-rest encryption active");
+        oled::show_error(display, "Disable PIN/vault\nbefore adding");
+        protocol::write_frame(
+            usb,
+            FRAME_TYPE_NACK,
+            b"at-rest encryption active: clear the PIN/vault key, add the identity, then re-enable",
+        );
+        return None;
+    }
 
     oled::show_restore_intro(display, button_b.is_some());
     esp_idf_hal::delay::FreeRtos::delay_ms(2200);
@@ -800,12 +879,13 @@ fn npub_from_secret(secret: &[u8; 32], secp: &Arc<Secp256k1<secp256k1::SignOnly>
 ///
 /// The removal is journalled across every slot-indexed authority record. The
 /// caller must reboot after `true` so all in-memory caches reload from the
-/// completed transaction.
+/// completed transaction — which is why this takes the master list
+/// immutably: no in-memory fixup survives the restart, so none is done.
 pub fn handle_remove(
     usb: &mut SerialPort<'_>,
     frame: &Frame,
     nvs: &mut EspNvs<NvsDefault>,
-    loaded: &mut Vec<LoadedMaster>,
+    loaded: &[LoadedMaster],
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
 ) -> bool {
@@ -840,11 +920,9 @@ pub fn handle_remove(
 
     match masters::remove_master(nvs, slot) {
         Ok(()) => {
-            // Remove from the in-memory list and re-number to match NVS order.
-            loaded.retain(|m| m.slot != slot);
-            for (i, m) in loaded.iter_mut().enumerate() {
-                m.slot = i as u8;
-            }
+            // NVS slots below the removed one have shifted; the caller reboots
+            // before any further signing so every in-memory, slot-indexed
+            // cache reloads from the completed journal transaction.
             let msg = format!("Removed slot {slot}");
             oled::show_error(display, &msg);
             protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);

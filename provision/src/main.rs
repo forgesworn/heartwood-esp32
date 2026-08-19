@@ -56,8 +56,11 @@ enum Command {
         #[arg(short, long, default_value = "tree-mnemonic")]
         mode: String,
 
-        /// Also pair this 32-byte bridge secret (64 hex) with the device.
-        #[arg(long)]
+        /// Also pair a 32-byte bridge secret with the device. Bare
+        /// `--bridge-secret` prompts for it interactively (preferred);
+        /// `--bridge-secret <64 hex>` on argv is DEPRECATED (shell history /
+        /// ps exposure).
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
         bridge_secret: Option<String>,
 
         /// Generate a fresh bridge secret, set it on the device, and print it
@@ -78,8 +81,11 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         words: u8,
 
-        /// Also pair this 32-byte bridge secret (64 hex) with the device.
-        #[arg(long)]
+        /// Also pair a 32-byte bridge secret with the device. Bare
+        /// `--bridge-secret` prompts for it interactively (preferred);
+        /// `--bridge-secret <64 hex>` on argv is DEPRECATED (shell history /
+        /// ps exposure).
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
         bridge_secret: Option<String>,
 
         /// Generate a fresh bridge secret, set it on the device, and print it.
@@ -405,27 +411,45 @@ fn decode_hex32(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Resolve the bridge secret from the CLI flags: an explicit `--bridge-secret`
-/// hex, or a freshly generated one (`--gen-bridge-secret`, printed so the
-/// operator can copy it into the bridge daemon's `bridge.secret` file), or none.
+/// Resolve the bridge secret from the CLI flags: a bare `--bridge-secret`
+/// (read interactively, never on argv), an inline `--bridge-secret <hex>`
+/// (deprecated — argv leaks into shell history / ps), a freshly generated one
+/// (`--gen-bridge-secret`, printed so the operator can copy it into the bridge
+/// daemon's `bridge.secret` file), or none.
 fn resolve_bridge_secret(bridge_secret: &Option<String>, gen: bool) -> Option<[u8; 32]> {
     if bridge_secret.is_some() && gen {
         eprintln!("Pass only one of --bridge-secret / --gen-bridge-secret.");
         std::process::exit(1);
     }
-    if let Some(hex) = bridge_secret {
-        Some(decode_hex32(hex).unwrap_or_else(|e| {
-            eprintln!("invalid --bridge-secret: {e}");
-            std::process::exit(1);
-        }))
-    } else if gen {
-        let mut s = [0u8; 32];
-        getrandom::getrandom(&mut s).expect("OS entropy for bridge secret");
-        println!("\nGenerated bridge secret — put this in the bridge daemon's bridge.secret file:");
-        println!("  {}\n", hex_encode(&s));
-        Some(s)
-    } else {
-        None
+    match bridge_secret {
+        Some(hex) if hex.is_empty() => {
+            let entered = zeroize::Zeroizing::new(
+                rpassword::prompt_password("Bridge secret (64 hex): ")
+                    .expect("failed to read bridge secret"),
+            );
+            Some(decode_hex32(&entered).unwrap_or_else(|e| {
+                eprintln!("invalid bridge secret: {e}");
+                std::process::exit(1);
+            }))
+        }
+        Some(hex) => {
+            eprintln!(
+                "warning: --bridge-secret <hex> on argv is deprecated (shell history / ps \
+                 exposure); pass --bridge-secret with no value for an interactive prompt."
+            );
+            Some(decode_hex32(hex).unwrap_or_else(|e| {
+                eprintln!("invalid --bridge-secret: {e}");
+                std::process::exit(1);
+            }))
+        }
+        None if gen => {
+            let mut s = [0u8; 32];
+            getrandom::getrandom(&mut s).expect("OS entropy for bridge secret");
+            println!("\nGenerated bridge secret — put this in the bridge daemon's bridge.secret file:");
+            println!("  {}\n", hex_encode(&s));
+            Some(s)
+        }
+        None => None,
     }
 }
 
@@ -498,15 +522,19 @@ fn handle_provision(
 ) {
     let mut root_secret = match mode {
         "bunker" => {
-            let key = rpassword::prompt_password("Enter nsec (nsec1...) or 24-word key backup: ")
-                .expect("failed to read key");
+            let key = zeroize::Zeroizing::new(
+                rpassword::prompt_password("Enter nsec (nsec1...) or 24-word key backup: ")
+                    .expect("failed to read key"),
+            );
             let secret = decode_key_input(&key).expect("invalid key");
             println!("\nMode: bunker (raw key, no tree derivation)");
             secret
         }
         "tree-nsec" => {
-            let key = rpassword::prompt_password("Enter nsec (nsec1...) or 24-word key backup: ")
-                .expect("failed to read key");
+            let key = zeroize::Zeroizing::new(
+                rpassword::prompt_password("Enter nsec (nsec1...) or 24-word key backup: ")
+                    .expect("failed to read key"),
+            );
             let mut nsec_bytes = decode_key_input(&key).expect("invalid key");
             let secret = nsec_to_tree_root(&nsec_bytes).expect("tree-nsec derivation failed");
             nsec_bytes.zeroize();
@@ -514,10 +542,14 @@ fn handle_provision(
             secret
         }
         "tree-mnemonic" | _ => {
-            let mnemonic = rpassword::prompt_password("Enter mnemonic: ")
-                .expect("failed to read mnemonic");
-            let passphrase = rpassword::prompt_password("Enter passphrase (empty for none): ")
-                .expect("failed to read passphrase");
+            let mnemonic = zeroize::Zeroizing::new(
+                rpassword::prompt_password("Enter mnemonic: ")
+                    .expect("failed to read mnemonic"),
+            );
+            let passphrase = zeroize::Zeroizing::new(
+                rpassword::prompt_password("Enter passphrase (empty for none): ")
+                    .expect("failed to read passphrase"),
+            );
             let secret = derive_root_secret(&mnemonic, &passphrase)
                 .expect("derivation failed");
             println!("\nMode: tree-mnemonic (BIP-39 -> BIP-32 -> tree root)");
@@ -564,7 +596,7 @@ fn handle_generate(
     getrandom::getrandom(&mut entropy).expect("OS entropy for key generation");
     let mnemonic = bip39::Mnemonic::from_entropy(&entropy).expect("entropy -> mnemonic");
     entropy.zeroize();
-    let phrase = mnemonic.to_string();
+    let phrase = zeroize::Zeroizing::new(mnemonic.to_string());
 
     println!("\n========================================================");
     println!("  WRITE THESE {words} WORDS DOWN — they are the ONLY backup of");

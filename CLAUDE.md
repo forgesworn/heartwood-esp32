@@ -12,7 +12,7 @@ Hardware signing device for Nostr on a Heltec WiFi LoRa 32 (ESP32-S3). Both the 
 - **USB-bridged mode (high-assurance default):** all radios disabled, USB serial only. Pi compromise is survivable — keys live on the ESP32, and in device-decrypts mode the Pi only ever sees ciphertext.
 - **WiFi-standalone mode (opt-in convenience tier):** WiFi *is* enabled and the device reaches relays directly — a deliberately larger attack surface, accepted in exchange for dropping the Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected. Don't enable this tier where the USB high-assurance model is required.
 - **Portable mode** (roadmap, not built) — would enable only BLE (short range) and hold a child key, never the master.
-- **JTAG disabled** in production firmware to prevent debug-port key extraction.
+- **JTAG remains enabled** — disabling it requires eFuse burning, which permanently locks the chip and is deliberately rejected (see `docs/memory/feedback_no_efuse.md`); physical security is the protection model, including against debug-port key extraction.
 
 ## Feature flags & mode selection
 

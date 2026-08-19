@@ -69,10 +69,12 @@ unsafe impl Send for OtaSession {}
 ///
 /// Verifies the release signature over the claimed digest first — a bad or
 /// missing signature is refused before the owner is asked to approve.  Then
-/// shows the firmware size on the OLED and runs the 45-second approval loop
-/// (hold button 2 seconds to confirm).  On approval, opens the inactive OTA
-/// partition and initialises an `OtaSession`.  Sends `OTA_STATUS(READY)` on
-/// success or an appropriate error code on failure.
+/// bounds `total_size` against the target partition (also pre-approval), shows
+/// the firmware size on the OLED and runs the 45-second approval loop (hold
+/// button 2 seconds to confirm).  On approval, any half-finished earlier
+/// session is aborted cleanly and the inactive OTA partition is opened.
+/// Sends `OTA_STATUS(READY)` on success or an appropriate error code on
+/// failure.
 pub fn handle_ota_begin(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
@@ -122,6 +124,24 @@ pub fn handle_ota_begin(
     // serial data and corrupts OTA_STATUS responses on the host side.
     // The OLED shows the firmware size instead.
 
+    // Locate the target partition and bound the image against it BEFORE the
+    // owner is asked to approve (FW-L6): an image that cannot fit the slot is
+    // a host-visible error up front, not a post-approval esp_ota_begin
+    // failure after a 2 MB transfer.
+    let partition = unsafe { esp_idf_svc::sys::esp_ota_get_next_update_partition(core::ptr::null()) };
+    if partition.is_null() {
+        send_ota_status(usb, OTA_STATUS_ERR_WRITE, "No OTA partition");
+        return;
+    }
+    let partition_size = unsafe { (*partition).size } as usize;
+    if total_size == 0 || total_size as usize > partition_size {
+        log::warn!(
+            "OTA_BEGIN: image size {total_size} does not fit the OTA partition ({partition_size})"
+        );
+        send_ota_status(usb, OTA_STATUS_ERR_SIZE, "Image too large");
+        return;
+    }
+
     // Show firmware size and run the approval loop (45 s, 2 s hold — the
     // update is driven from a browser or the Pi, so allow for the operator
     // looking at the wrong screen when the countdown starts).
@@ -143,6 +163,16 @@ pub fn handle_ota_begin(
         }
     }
 
+    // The approved new transfer supersedes any half-finished one: abort its
+    // handle cleanly instead of leaking it across the session overwrite
+    // (FW-L6). A denied or invalid BEGIN above leaves it running.
+    if let Some(old) = session.take() {
+        unsafe {
+            esp_idf_svc::sys::esp_ota_abort(old.ota_handle);
+        }
+        log::info!("OTA_BEGIN: aborted a previous incomplete session");
+    }
+
     // Suppress ALL logging (including ESP-IDF internal) during partition
     // setup and status frame send.  esp_ota_begin erases flash and emits
     // log lines through VFS which share the USB serial with framed data.
@@ -153,16 +183,8 @@ pub fn handle_ota_begin(
         );
     }
 
-    // Locate the inactive OTA partition and begin the update.
-    let (ota_handle, partition) = unsafe {
-        let partition =
-            esp_idf_svc::sys::esp_ota_get_next_update_partition(core::ptr::null());
-        if partition.is_null() {
-            restore_logging();
-            send_ota_status(usb, OTA_STATUS_ERR_WRITE, "No OTA partition");
-            return;
-        }
-
+    // Begin the update on the partition validated above.
+    let ota_handle = unsafe {
         let mut handle: esp_idf_svc::sys::esp_ota_handle_t = 0;
         let err = esp_idf_svc::sys::esp_ota_begin(partition, total_size as usize, &mut handle);
         if err != esp_idf_svc::sys::ESP_OK {
@@ -170,8 +192,7 @@ pub fn handle_ota_begin(
             send_ota_status(usb, OTA_STATUS_ERR_WRITE, "esp_ota_begin failed");
             return;
         }
-
-        (handle, partition)
+        handle
     };
 
     *session = Some(OtaSession {

@@ -8,7 +8,7 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -126,6 +126,32 @@ fn api_err(code: StatusCode, msg: impl Into<String>) -> Response {
     (code, Json(ErrorResponse { error: msg.into() })).into_response()
 }
 
+/// Await a `spawn_blocking` backend call, mapping a `JoinError` (the backend
+/// panicked) to a 500 instead of panicking the request handler and resetting
+/// the connection (HD-L5).
+async fn join_backend<T>(
+    handle: tokio::task::JoinHandle<Result<T, BackendError>>,
+) -> Result<T, BackendError> {
+    handle
+        .await
+        .unwrap_or_else(|e| Err(BackendError::Internal(format!("backend task failed: {e}"))))
+}
+
+/// Constant-time bearer-token comparison, shared by the `Authorization`
+/// header middleware and the `/api/logs` WebSocket query-param path (HD-M2).
+fn token_matches(expected: &str, presented: &str) -> bool {
+    let expected_bytes = expected.as_bytes();
+    let presented_bytes = presented.as_bytes();
+    if expected_bytes.len() != presented_bytes.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in expected_bytes.iter().zip(presented_bytes.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 fn backend_to_http(err: BackendError) -> Response {
     match err {
         BackendError::NotSupported => {
@@ -186,7 +212,7 @@ async fn get_info(State(state): State<AppState>) -> Response {
 
 /// Protected: list all provisioned masters and daemon summary.
 async fn get_status(State(state): State<AppState>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.list_masters().map(|masters| {
             let info = &state.daemon_info;
             Json(StatusResponse {
@@ -198,7 +224,7 @@ async fn get_status(State(state): State<AppState>) -> Response {
                 },
             }).into_response()
         })
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(resp) => resp,
@@ -208,9 +234,9 @@ async fn get_status(State(state): State<AppState>) -> Response {
 
 /// Protected: unlock the backend with a passphrase (Soft mode only).
 async fn post_unlock(State(state): State<AppState>, Json(body): Json<UnlockBody>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.unlock(&body.passphrase)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
@@ -232,9 +258,9 @@ async fn create_master(State(state): State<AppState>, Json(body): Json<CreateMas
     if !matches!(words, 12 | 24) {
         return api_err(StatusCode::BAD_REQUEST, "words must be 12 or 24");
     }
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.create_master(&body.label, words)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(master) => (StatusCode::CREATED, Json(master)).into_response(),
@@ -246,9 +272,9 @@ async fn create_master(State(state): State<AppState>, Json(body): Json<CreateMas
 /// button confirmation on the device (and the device reboots afterwards);
 /// Soft mode removes it from the encrypted keystore.
 async fn delete_master(State(state): State<AppState>, Path(slot): Path<u8>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.remove_master(slot)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(()) => Json(OkResponse { ok: true }).into_response(),
@@ -258,9 +284,9 @@ async fn delete_master(State(state): State<AppState>, Path(slot): Path<u8>) -> R
 
 /// Protected: list all connection slots for a master.
 async fn get_slots(State(state): State<AppState>, Path(master): Path<u8>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.list_slots(master)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(slots) => {
@@ -278,9 +304,9 @@ async fn create_slot(
     Json(body): Json<CreateSlotBody>,
 ) -> Response {
     let snapshot_state = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.create_slot(master, &body.label)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(slot) => {
@@ -299,10 +325,10 @@ async fn update_slot(
     Json(body): Json<UpdateSlotBody>,
 ) -> Response {
     let snapshot_state = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         let patch = serde_json::to_value(&body).unwrap_or(serde_json::Value::Object(Default::default()));
         state.backend.update_slot(master, index, patch)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(slot) => {
@@ -320,9 +346,9 @@ async fn delete_slot(
     Path((master, index)): Path<(u8, u8)>,
 ) -> Response {
     let snapshot_state = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.revoke_slot(master, index)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(slot) => {
@@ -340,10 +366,10 @@ async fn get_slot_uri(
     State(state): State<AppState>,
     Path((master, index)): Path<(u8, u8)>,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         let relays = state.daemon_info.relays.clone();
         state.backend.get_slot_uri(master, index, &relays)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(uri) => Json(serde_json::json!({ "bunker_uri": uri })).into_response(),
@@ -375,9 +401,9 @@ async fn post_approval(
 
 /// Protected: trigger a factory reset. Requires physical button confirmation on Hard mode.
 async fn factory_reset(State(state): State<AppState>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.factory_reset()
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(()) => Json(OkResponse { ok: true }).into_response(),
@@ -426,9 +452,9 @@ async fn ota_upload(
         }
     };
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.ota_upload(&firmware, signature.as_ref())
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(()) => Json(OkResponse { ok: true }).into_response(),
@@ -456,13 +482,13 @@ async fn get_vault_status(State(state): State<AppState>) -> Response {
 /// on a device whose seeds are already PIN-encrypted replaces the wrap --
 /// that is intended.
 async fn post_vault_enable(State(state): State<AppState>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         let mut key = crate::vault::load_or_generate_vault_key(&state.vault_key_path)
             .map_err(BackendError::Internal)?;
         let result = state.backend.vault_enable(&key);
         key.zeroize();
         result
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
@@ -473,9 +499,9 @@ async fn post_vault_enable(State(state): State<AppState>) -> Response {
 /// Protected: disable at-rest vault encryption (VAULT_SET with empty payload),
 /// restoring plaintext seeds. Also button-gated on the device.
 async fn post_vault_disable(State(state): State<AppState>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         state.backend.vault_disable()
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
@@ -487,14 +513,14 @@ async fn post_vault_disable(State(state): State<AppState>) -> Response {
 /// (password manager). Same bearer-token auth as the rest of the management
 /// API -- this endpoint hands out the credential that unlocks the device.
 async fn get_vault_export(State(state): State<AppState>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         let mut key = crate::vault::load_vault_key(&state.vault_key_path)
             .map_err(BackendError::Internal)?
             .ok_or_else(|| BackendError::Internal("no vault key stored".to_string()))?;
         let hex = heartwood_common::hex::hex_encode(&key);
         key.zeroize();
         Ok::<_, BackendError>(hex)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(hex) => Json(serde_json::json!({ "vault_key_hex": hex })).into_response(),
@@ -533,7 +559,7 @@ async fn get_backup(State(state): State<AppState>) -> Response {
 
 /// Protected: trigger a fresh export, encrypt with the stored passphrase, save to disk, and return.
 async fn post_backup_export(State(state): State<AppState>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         let mut payload = state.backend.backup_export()?;
         payload.created_at = crate::backup::unix_now();
 
@@ -555,7 +581,7 @@ async fn post_backup_export(State(state): State<AppState>) -> Response {
         let json = serde_json::to_vec(&envelope)
             .map_err(|e| BackendError::Internal(format!("serialise envelope: {e}")))?;
         Ok::<_, BackendError>(json)
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(data) => {
@@ -574,7 +600,7 @@ async fn post_backup_import(
     body: axum::body::Bytes,
 ) -> Response {
     let data = body.to_vec();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         let envelope: crate::backup::BackupEnvelope = serde_json::from_slice(&data)
             .map_err(|e| BackendError::Internal(format!("parse backup: {e}")))?;
 
@@ -609,7 +635,7 @@ async fn post_backup_import(
             "ok": true,
             "masters": match_report,
         }))
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(report) => Json(report).into_response(),
@@ -635,7 +661,7 @@ async fn put_backup_passphrase(
     State(state): State<AppState>,
     Json(body): Json<ChangePassphraseBody>,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = join_backend(tokio::task::spawn_blocking(move || {
         let token = state.api_token.as_deref().map(|s| s.as_str()).unwrap_or("");
 
         if body.new_passphrase.len() < 8 {
@@ -699,7 +725,7 @@ async fn put_backup_passphrase(
             .map_err(|e| BackendError::Internal(e))?;
 
         Ok::<_, BackendError>(())
-    }).await.unwrap();
+    })).await;
 
     match result {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
@@ -714,7 +740,7 @@ fn trigger_auto_snapshot(state: AppState) {
         return;
     }
     tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
+        let result = join_backend(tokio::task::spawn_blocking(move || {
             let mut payload = state.backend.backup_export()?;
             payload.created_at = crate::backup::unix_now();
 
@@ -734,7 +760,7 @@ fn trigger_auto_snapshot(state: AppState) {
                 .map_err(|e| BackendError::Internal(format!("write: {e}")))?;
 
             Ok::<_, BackendError>(())
-        }).await.unwrap();
+        })).await;
 
         match result {
             Ok(()) => log::info!("Auto-snapshot: backup saved"),
@@ -747,10 +773,31 @@ fn trigger_auto_snapshot(state: AppState) {
 // WebSocket log streaming
 // ---------------------------------------------------------------------------
 
+/// Query string for the /api/logs WebSocket. Browsers cannot set custom
+/// headers on WebSocket upgrades, so the bearer token travels as `?token=`
+/// instead of an `Authorization` header (HD-M2).
+#[derive(Deserialize)]
+struct LogsQuery {
+    token: Option<String>,
+}
+
 async fn ws_logs(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    Query(query): Query<LogsQuery>,
 ) -> Response {
+    // Same bearer check as the protected routes, via query param. Without it
+    // any web page a LAN user visits could open this cross-origin WebSocket
+    // and stream live device activity (signing, client pubkeys, slot labels).
+    if let Some(expected) = state.api_token.as_ref() {
+        let presented = query.token.as_deref().unwrap_or("");
+        if !token_matches(expected, presented) {
+            return api_err(
+                StatusCode::UNAUTHORIZED,
+                "bearer token required (pass as ?token=)",
+            );
+        }
+    }
     let rx = state.log_tx.subscribe();
     ws.on_upgrade(move |socket| handle_ws_logs(socket, rx))
 }
@@ -830,16 +877,7 @@ async fn require_bearer(
     let presented = header.strip_prefix("Bearer ").unwrap_or("");
 
     // Constant-time comparison to avoid leaking token length / bytes.
-    let expected_bytes = expected.as_bytes();
-    let presented_bytes = presented.as_bytes();
-    if expected_bytes.len() != presented_bytes.len() {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let mut diff = 0u8;
-    for (a, b) in expected_bytes.iter().zip(presented_bytes.iter()) {
-        diff |= a ^ b;
-    }
-    if diff != 0 {
+    if !token_matches(expected, presented) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -881,12 +919,13 @@ pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> 
 
     // Public routes:
     //   /api/info -- basic daemon info, public by definition (no secrets).
-    //   /api/logs -- read-only WebSocket stream of ESP-IDF log lines. Browsers
-    //     cannot send custom headers on WebSocket upgrades, and the log content
-    //     does not contain secrets (same text the Pi journal shows), so this
-    //     is intentionally unauthenticated even when api_token is set. Worst
-    //     case a LAN observer sees public device activity, already visible on
-    //     Nostr relays.
+    //   /api/logs -- read-only WebSocket stream of device log lines. Browsers
+    //     cannot send custom headers on WebSocket upgrades, so this route
+    //     takes the bearer token as a ?token= query parameter instead of the
+    //     Authorization header (checked in the handler when api_token is
+    //     set). The log content carries no secrets, but signing activity and
+    //     client metadata are no longer broadcast to unauthenticated
+    //     cross-origin pages (HD-M2).
     let public: Router<AppState> = Router::new()
         .route("/api/info", get(get_info))
         .route("/api/logs", get(ws_logs));
@@ -913,4 +952,26 @@ pub fn router(state: AppState, sapwood_dir: Option<&str>, enable_cors: bool) -> 
     }
 
     app
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_matches_accepts_identical_tokens() {
+        assert!(token_matches("abc123", "abc123"));
+    }
+
+    #[test]
+    fn token_matches_rejects_wrong_and_mismatched_length() {
+        assert!(!token_matches("abc123", "abc124"));
+        assert!(!token_matches("abc123", "abc12"));
+        assert!(!token_matches("abc123", "abc1234"));
+        assert!(!token_matches("abc123", ""));
+    }
 }

@@ -20,6 +20,7 @@ Generate fresh secrets with:
 
 import binascii
 import getpass
+import json
 import os
 import struct
 import subprocess
@@ -66,8 +67,8 @@ def build_frame(frame_type, payload):
     return b"\x48\x57" + bytes([frame_type]) + struct.pack(">H", length) + payload + struct.pack(">I", crc)
 
 
-def wait_for_ack(port, timeout=35):
-    """Wait for an ACK (0x06) or NACK (0x15) frame."""
+def read_response(port, timeout=35):
+    """Read one frame; return (frame_type, payload), or (None, None) on timeout."""
     start = time.time()
     while time.time() - start < timeout:
         b = port.read(1)
@@ -81,14 +82,40 @@ def wait_for_ack(port, timeout=35):
             continue
         resp_type = header[0]
         resp_len = struct.unpack(">H", header[1:3])[0]
-        port.read(resp_len + 4)  # payload + CRC
-        return resp_type
-    return None
+        body = port.read(resp_len + 4)  # payload + CRC
+        return resp_type, body[:resp_len]
+    return None, None
+
+
+def wait_for_ack(port, timeout=35):
+    """Wait for an ACK (0x06) or NACK (0x15) frame; return the frame type."""
+    resp_type, _ = read_response(port, timeout)
+    return resp_type
+
+
+# --- bech32 (BIP-173) ---
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def _bech32_polymod(values):
+    """BIP-173 checksum primitive: hrp_expand(hrp) + data + checksum == 1."""
+    generators = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ v
+        for i, g in enumerate(generators):
+            if (top >> i) & 1:
+                chk ^= g
+    return chk
+
+
+def _bech32_hrp_expand(hrp):
+    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
 
 
 def decode_nsec(nsec_str):
-    """Decode a bech32 nsec to 32 raw bytes."""
-    CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+    """Decode a bech32 nsec to 32 raw bytes, verifying the checksum."""
     nsec_str = nsec_str.strip().lower()
     if not nsec_str.startswith("nsec1"):
         # Might be raw hex
@@ -106,6 +133,10 @@ def decode_nsec(nsec_str):
         if idx < 0:
             raise ValueError(f"Invalid bech32 character: {c}")
         values.append(idx)
+    # Verify the checksum BEFORE stripping it — a one-char typo must fail
+    # loudly here rather than silently provision a different key.
+    if _bech32_polymod(_bech32_hrp_expand("nsec") + values) != 1:
+        raise ValueError("Bad bech32 checksum — check the nsec for typos")
     # Strip 6-char checksum
     values = values[:-6]
     # Convert 5-bit to 8-bit
@@ -188,25 +219,52 @@ def main():
         port.close()
         sys.exit(1)
 
+    # Step 4: Read the identity back so the operator can eyeball the npub
+    # (same confirmation provision/ does). The checksum catches typos; this
+    # confirms the device actually holds the intended key.
+    print()
+    port.write(build_frame(0x05, b""))  # PROVISION_LIST
+    port.flush()
+    rtype, rpayload = read_response(port, timeout=10)
+    if rtype == 0x07:  # PROVISION_LIST_RESPONSE
+        try:
+            masters = json.loads(rpayload.decode("utf-8", "replace"))
+            for m in masters:
+                if not m.get("persona"):
+                    print(
+                        f"  Device identity: {m.get('npub', '?')} "
+                        f"(slot {m.get('slot', '?')}, '{m.get('label', '?')}')"
+                    )
+        except ValueError:
+            print(f"  Could not parse identity response: {rpayload[:64]!r}")
+    else:
+        print("  (no identity read-back — older firmware?)")
+
     port.close()
     print()
 
-    # Step 4: Start bridge
+    # Step 5: Start bridge. Secrets go via the environment — never argv
+    # (visible in ps / /proc/<pid>/cmdline for the daemon's whole lifetime)
+    # and never echoed.
     print("Starting bridge in passthrough mode...")
     print()
     cmd = [
         "heartwood-bridge",
         "--port", SERIAL_PORT,
-        "--bunker-secret", BUNKER_SECRET,
-        "--bridge-secret", BRIDGE_SECRET,
         "--relays", RELAYS,
     ]
-    print(f"  {' '.join(cmd)}")
+    env = {
+        **os.environ,
+        "RUST_LOG": "info",
+        "HEARTWOOD_BUNKER_SECRET": BUNKER_SECRET,
+        "HEARTWOOD_BRIDGE_SECRET": BRIDGE_SECRET,
+    }
+    print(f"  {' '.join(cmd)}  (bunker + bridge secrets passed via environment)")
     print()
     print("Bridge output below (Ctrl+C to stop):")
     print("-" * 60)
     try:
-        subprocess.run(cmd, env={**__import__("os").environ, "RUST_LOG": "info"})
+        subprocess.run(cmd, env=env)
     except KeyboardInterrupt:
         print("\nBridge stopped.")
 

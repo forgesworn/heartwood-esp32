@@ -575,6 +575,18 @@ impl<'a> CryptoParams<'a> {
     }
 }
 
+/// Read an optional non-negative integer param, rejecting values that do not
+/// fit a u32 rather than truncating them (`as u32` on a u64 wraps, so index
+/// 2³² used to come out as 0). Absent or non-numeric keeps `default`,
+/// matching the long-standing lenient contract of these extractors.
+fn optional_u32_param(value: Option<&Value>, default: u32) -> Result<u32, &'static str> {
+    match value.and_then(Value::as_u64) {
+        Some(v) if v > u64::from(u32::MAX) => Err("integer param exceeds u32 range"),
+        Some(v) => Ok(v as u32),
+        None => Ok(default),
+    }
+}
+
 /// `heartwood_derive`: `[purpose, index?]`.
 pub struct DeriveParams<'a> {
     pub purpose: &'a str,
@@ -588,7 +600,7 @@ impl<'a> DeriveParams<'a> {
                 .first()
                 .and_then(Value::as_str)
                 .ok_or("requires [purpose, index?]")?,
-            index: params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32,
+            index: optional_u32_param(params.get(1), 0)?,
         })
     }
 }
@@ -606,7 +618,7 @@ impl<'a> PersonaParams<'a> {
                 .first()
                 .and_then(Value::as_str)
                 .ok_or("requires [name, index?]")?,
-            index: params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32,
+            index: optional_u32_param(params.get(1), 0)?,
         })
     }
 }
@@ -624,7 +636,7 @@ impl<'a> SwitchParams<'a> {
                 .first()
                 .and_then(Value::as_str)
                 .ok_or("requires [target, index_hint?]")?,
-            index_hint: params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32,
+            index_hint: optional_u32_param(params.get(1), 0)?,
         })
     }
 }
@@ -636,9 +648,20 @@ pub struct RecoverParams {
 
 impl RecoverParams {
     pub fn from_params(params: &[Value]) -> Self {
-        Self {
-            lookahead: params.first().and_then(Value::as_u64).unwrap_or(20) as u32,
-        }
+        // The "never fails" contract is load-bearing for existing callers
+        // (firmware, the Ledger app), so an out-of-range lookahead falls back
+        // to the default here like any other unusable value. New callers
+        // should prefer `try_from_params`, which rejects `> u32::MAX` outright
+        // instead of substituting the default.
+        Self::try_from_params(params).unwrap_or(Self { lookahead: 20 })
+    }
+
+    /// Fallible form of `from_params`: an integer lookahead beyond the u32
+    /// range is rejected rather than truncated or defaulted.
+    pub fn try_from_params(params: &[Value]) -> Result<Self, &'static str> {
+        Ok(Self {
+            lookahead: optional_u32_param(params.first(), 20)?,
+        })
     }
 }
 
@@ -728,45 +751,135 @@ pub fn request_ceiling(json: &str, standard: usize, object_compact: usize) -> us
     }
 }
 
+/// The outcome of a string-aware scan for one envelope key.
+enum KeyScan {
+    /// No plausible occurrence at envelope depth 1.
+    Absent,
+    /// Exactly one plausible occurrence; the payload is the byte offset just
+    /// past the `:` that follows the key.
+    Unique(usize),
+    /// More than one plausible occurrence. JSON object-key order is free and
+    /// serde_json honours the LAST of duplicate keys, so any first-match rule
+    /// can be made to disagree with the real parse (the CM-L1 key-reordering
+    /// attack). Ambiguity must always resolve to the tighter budget.
+    Ambiguous,
+}
+
+/// Find `key` (bare name, e.g. `method`) used at envelope depth 1 of a JSON
+/// document, WITHOUT parsing it.
+///
+/// Strings are tokenised properly — escapes and all — so an occurrence inside
+/// a stringified event (where every quote is backslash-escaped) is string
+/// content and never a key, and a key nested inside `params` sits at depth 2
+/// or below and does not count either. Key spellings that use escapes
+/// (`"meth\u006fd"`) are deliberately not recognised: they cannot be matched
+/// with certainty without unescaping, so they fall back to the conservative
+/// answer. Brace depth is tracked with the same saturating rule as
+/// `json_depth_ok`; a document malformed enough to confuse the counter is
+/// rejected by the real parse that always follows.
+fn scan_envelope_key(json: &str, key: &str) -> KeyScan {
+    let bytes = json.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    let mut found: Option<usize> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                // Tokenise the string: find its closing quote, honouring
+                // backslash escapes.
+                let start = i + 1;
+                let mut end = start;
+                let mut has_escape = false;
+                while end < bytes.len() {
+                    match bytes[end] {
+                        b'\\' => {
+                            has_escape = true;
+                            end += 2;
+                        }
+                        b'"' => break,
+                        _ => end += 1,
+                    }
+                }
+                if end >= bytes.len() {
+                    // Unterminated string: not valid JSON, nothing more to learn.
+                    break;
+                }
+                // A key candidate is a string at envelope depth 1 immediately
+                // followed (modulo whitespace) by ':'. Whitespace is legal
+                // around each token, so step over it rather than assuming the
+                // compact spelling a particular client happens to emit. All
+                // ASCII, so byte indexing lands on character boundaries.
+                let mut colon = end + 1;
+                while colon < bytes.len() && bytes[colon].is_ascii_whitespace() {
+                    colon += 1;
+                }
+                if depth == 1
+                    && !has_escape
+                    && &json[start..end] == key
+                    && bytes.get(colon) == Some(&b':')
+                {
+                    if found.is_some() {
+                        return KeyScan::Ambiguous;
+                    }
+                    found = Some(colon + 1);
+                }
+                i = end + 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    match found {
+        Some(after_colon) => KeyScan::Unique(after_colon),
+        None => KeyScan::Absent,
+    }
+}
+
 /// Read the `method` value out of a request WITHOUT parsing it.
 ///
 /// Same reason as `scan_rpc_id`: the budget a request is allowed depends on what
 /// it is asking for, and that has to be known before serde_json touches it.
 ///
-/// Matches the key with unescaped quotes, so an occurrence inside a stringified
-/// event (where every quote is backslash-escaped) cannot be mistaken for it.
-/// Returns `None` when absent or unterminated, which selects the tighter budget.
+/// Only a `"method"` key at envelope depth 1 counts, and only when it is the
+/// UNIQUE such key (see `scan_envelope_key`): a `"method"` inside a params
+/// object or a stringified event is a decoy, and a duplicated envelope key
+/// cannot be resolved without knowing which one serde_json will honour.
+/// Returns `None` when absent, ambiguous, non-string, escaped, or
+/// unterminated — every one of those selects the tighter budget.
 pub fn scan_method(json: &str) -> Option<&str> {
-    const KEY: &str = "\"method\"";
-    let mut from = 0usize;
-    loop {
-        let at = from + json[from..].find(KEY)?;
-        if at > 0 && json.as_bytes()[at - 1] == b'\\' {
-            from = at + KEY.len();
-            continue;
-        }
-        let rest = &json[at + KEY.len()..];
-        let bytes = rest.as_bytes();
-        // Whitespace, colon, whitespace, opening quote. All ASCII, so byte
-        // indexing lands on character boundaries.
-        let mut i = 0usize;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if bytes.get(i) != Some(&b':') {
-            return None;
-        }
+    let after_colon = match scan_envelope_key(json, "method") {
+        KeyScan::Unique(at) => at,
+        KeyScan::Absent | KeyScan::Ambiguous => return None,
+    };
+    let bytes = json[after_colon..].as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if bytes.get(i) != Some(&b'"') {
-            return None;
-        }
-        let value = &rest[i + 1..];
-        let end = value.find(['"', '\\'])?;
-        return Some(&value[..end]);
     }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    // The value must be a plainly-spelt, terminated string. A method spelling
+    // with escapes cannot be matched with certainty this cheaply, so it takes
+    // the tighter budget like everything else unusual.
+    let value = &json[after_colon + i + 1..];
+    let vbytes = value.as_bytes();
+    let mut end = 0usize;
+    loop {
+        match vbytes.get(end) {
+            None | Some(b'\\') => return None,
+            Some(b'"') => break,
+            _ => end += 1,
+        }
+    }
+    Some(&value[..end])
 }
 
 /// Whether `params[0]` is a JSON object, decided WITHOUT parsing.
@@ -781,33 +894,19 @@ pub fn scan_method(json: &str) -> Option<&str> {
 /// pass at all. Heartwood accepts either (see `parse_unsigned_event`), so a
 /// client that sends the object form can be allowed a much larger event.
 ///
-/// Scans for the `"params":` key with unescaped quotes. Inside a stringified
-/// event every quote is backslash-escaped, so an occurrence in the payload
-/// cannot be mistaken for the real key; the preceding-backslash check makes
-/// that explicit rather than incidental. Returns false when absent or
-/// malformed, which is the conservative answer: it selects the tighter budget.
+/// Only a unique, envelope-depth-1 `"params"` key is consulted (see
+/// `scan_envelope_key`); anything nested, escaped, or duplicated returns
+/// false, which is the conservative answer: it selects the tighter budget.
 pub fn params_first_is_object(json: &str) -> bool {
-    const KEY: &str = "\"params\"";
-    let mut from = 0usize;
-    while let Some(found) = json[from..].find(KEY) {
-        let at = from + found;
-        // A backslash immediately before means this sits inside a JSON string.
-        if at > 0 && json.as_bytes()[at - 1] == b'\\' {
-            from = at + KEY.len();
-            continue;
-        }
-        // Whitespace is legal around each token, so step over it rather than
-        // assuming the compact spelling a particular client happens to emit.
-        let mut chars = json[at + KEY.len()..].chars().skip_while(|c| c.is_whitespace());
-        if chars.next() != Some(':') {
-            return false;
-        }
-        if chars.find(|c| !c.is_whitespace()) != Some('[') {
-            return false;
-        }
-        return chars.find(|c| !c.is_whitespace()) == Some('{');
+    let after_colon = match scan_envelope_key(json, "params") {
+        KeyScan::Unique(at) => at,
+        KeyScan::Absent | KeyScan::Ambiguous => return false,
+    };
+    let mut chars = json[after_colon..].chars().skip_while(|c| c.is_whitespace());
+    if chars.next() != Some('[') {
+        return false;
     }
-    false
+    chars.find(|c| !c.is_whitespace()) == Some('{')
 }
 
 /// Extract an `UnsignedEvent` from NIP-46 `sign_event` params.
@@ -1427,6 +1526,37 @@ mod tests {
     }
 
     #[test]
+    fn request_ceiling_is_not_fooled_by_key_reordering() {
+        // CM-L1 regression: object-key order is free in JSON, so the client puts
+        // params FIRST with an inner `"method":"sign_event_compact"` key inside
+        // the event object, and the real `"method":"sign_event"` LAST. A
+        // first-byte-match scanner reads the inner key and grants the compact
+        // budget; the real parse is sign_event, which then builds the full
+        // reply — the allocation pair that aborts the chip. The envelope-depth
+        // scan must see only the real method.
+        let event = r#"{"method":"sign_event_compact","kind":1,"created_at":1,"tags":[],"content":"hi"}"#;
+        let req = format!(r#"{{"id":"a","params":[{event}],"method":"sign_event"}}"#);
+        assert_eq!(scan_method(&req), Some("sign_event"));
+        assert!(params_first_is_object(&req));
+        assert_eq!(request_ceiling(&req, 12288, 18432), 12288);
+    }
+
+    #[test]
+    fn request_ceiling_is_conservative_on_duplicate_keys() {
+        // serde_json honours the LAST of duplicate keys; a scanner that cannot
+        // tell which key the real parse will honour must take the tighter
+        // budget. Two envelope-depth `"method"` keys are ambiguous even though
+        // the first one alone would have granted the headroom.
+        let dup_method = r#"{"method":"sign_event_compact","method":"sign_event","params":[{"kind":1}]}"#;
+        assert_eq!(scan_method(dup_method), None);
+        assert_eq!(request_ceiling(dup_method, 12288, 18432), 12288);
+        // Same discipline for params: two plausible envelope-depth arrays.
+        let dup_params = r#"{"method":"sign_event_compact","params":["{}"],"params":[{"kind":1}]}"#;
+        assert!(!params_first_is_object(dup_params));
+        assert_eq!(request_ceiling(dup_params, 12288, 18432), 12288);
+    }
+
+    #[test]
     fn sign_event_compact_is_policed_exactly_as_sign_event() {
         // Load-bearing invariant, not a formality. `evaluate_slot_policy` is
         // handed `Nip46Method::as_str()`, and it gates on the literal
@@ -2038,6 +2168,31 @@ mod tests {
 
         assert_eq!(RecoverParams::from_params(&[]).lookahead, 20);
         assert_eq!(RecoverParams::from_params(&[serde_json::json!(5)]).lookahead, 5);
+    }
+
+    #[test]
+    fn typed_param_extractors_reject_indices_beyond_u32() {
+        // A u64 that does not fit a u32 must be an error, not a silent wrap:
+        // `2^32 as u32` is 0, which used to redirect a derive to index 0.
+        let beyond = serde_json::json!(u64::from(u32::MAX) + 1);
+        assert!(DeriveParams::from_params(&[serde_json::json!("games"), beyond.clone()]).is_err());
+        assert!(PersonaParams::from_params(&[serde_json::json!("forge"), beyond.clone()]).is_err());
+        assert!(SwitchParams::from_params(&[serde_json::json!("master"), beyond]).is_err());
+        // RecoverParams keeps its "never fails" signature, so it falls back to
+        // the default; the fallible form rejects.
+        assert_eq!(
+            RecoverParams::from_params(&[serde_json::json!(u64::from(u32::MAX) + 1)]).lookahead,
+            20
+        );
+        assert!(
+            RecoverParams::try_from_params(&[serde_json::json!(u64::from(u32::MAX) + 1)]).is_err()
+        );
+        // u32::MAX itself still fits.
+        let max = serde_json::json!(u64::from(u32::MAX));
+        assert_eq!(
+            DeriveParams::from_params(&[serde_json::json!("games"), max]).unwrap().index,
+            u32::MAX
+        );
     }
 
     #[test]

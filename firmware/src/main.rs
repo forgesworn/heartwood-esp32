@@ -481,7 +481,15 @@ fn main() {
     // Missing/blank/invalid partition → no-op.
     if let Some((json, crc)) = boot_config::read_flash_config() {
         if net_config_store::read_seeded_crc(&nvs) != Some(crc) {
-            if heartwood_common::net_config::parse_net_config(&json).is_ok() {
+            // The full local bounds, not just "parses" (FW-M4): a seeded
+            // config with an oversized SSID/password used to boot-panic the
+            // relay loop before USB recovery could run.
+            let seed_valid = heartwood_common::net_config::parse_net_config(&json)
+                .and_then(|cfg| {
+                    heartwood_common::net_config::validate_local_net_config(&cfg).map(|()| cfg)
+                })
+                .is_ok();
+            if seed_valid {
                 match net_config_store::bump_network_revision(&mut nvs)
                     .and_then(|_| net_config_store::cancel_trial(&mut nvs))
                     .and_then(|_| net_config_store::write_net_config(&mut nvs, &json))
@@ -520,7 +528,8 @@ fn main() {
             // serial line — an untouched unprovisioned board rebooted every
             // watchdog period and wiped whatever card was on screen (#65).
             // Poll with a bounded wait and feed between windows instead.
-            let frame = loop {
+            // `mut`: secret-bearing payloads are scrubbed after use (FW-L3).
+            let mut frame = loop {
                 wdt::feed();
                 if let Some(frame) = protocol::try_read_frame(&mut usb, 1000) {
                     break frame;
@@ -550,8 +559,10 @@ fn main() {
                         FRAME_TYPE_RESTORE_IDENTITY => {
                             provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &buttons)
                         }
-                        _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display),
+                        _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display, &buttons),
                     };
+                    // 0x01's payload carries the host-pushed seed (FW-L3).
+                    frame.scrub_payload();
                     if let Some(master) = provisioned {
                         loaded_masters.push(master);
                         log::info!("First master provisioned — continuing boot");
@@ -597,6 +608,8 @@ fn main() {
                     ) {
                         net_cfg = Some(cfg);
                     }
+                    // The config JSON carries the WiFi password (FW-L3).
+                    frame.scrub_payload();
                     oled::show_provision_wait(&mut display);
                 }
                 // Read-only state probe, so setup tooling can sequence itself
@@ -663,7 +676,8 @@ fn main() {
             // Same idle-line watchdog starvation as the provision wait (#65):
             // a locked USB-bridged board left alone must sit on the locked
             // screen indefinitely, not watchdog-cycle every period.
-            let frame = loop {
+            // `mut`: secret-bearing payloads are scrubbed after use (FW-L3).
+            let mut frame = loop {
                 wdt::feed();
                 if let Some(frame) = protocol::try_read_frame(&mut usb, 1000) {
                     break frame;
@@ -683,8 +697,10 @@ fn main() {
                         // self-heals any torn sealed state) — one extra
                         // PBKDF2 run.
                         notes::sync_sealed(&frame.payload);
+                        frame.scrub_payload();
                         break; // Unlocked — seeds now in RAM, continue boot.
                     }
+                    frame.scrub_payload();
                 }
                 FRAME_TYPE_SESSION_AUTH => {
                     match session::verify_bridge_secret(&frame.payload, &nvs) {
@@ -693,18 +709,21 @@ fn main() {
                             protocol::write_frame(&mut usb, FRAME_TYPE_SESSION_ACK, &[0x00]);
                         }
                         Some(false) => {
-                            vault_authed = false;
+                            // A wrong secret must not deauthenticate an
+                            // already-authenticated vault session (FW-M1).
                             protocol::write_frame(&mut usb, FRAME_TYPE_SESSION_ACK, &[0x01]);
                         }
                         None => {
                             protocol::write_frame(&mut usb, FRAME_TYPE_SESSION_ACK, &[0x02]);
                         }
                     }
+                    frame.scrub_payload();
                 }
                 FRAME_TYPE_VAULT_UNLOCK => {
                     if !vault_authed {
                         log::warn!("VAULT_UNLOCK rejected — bridge not authenticated");
                         protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"bridge auth required");
+                        frame.scrub_payload();
                         continue;
                     }
                     if pin::handle_vault_unlock(
@@ -718,8 +737,10 @@ fn main() {
                         // self-heals any torn sealed state) — one extra
                         // PBKDF2 run.
                         notes::sync_sealed(&frame.payload);
+                        frame.scrub_payload();
                         break; // Unlocked — seeds now in RAM, continue boot.
                     }
+                    frame.scrub_payload();
                 }
                 FRAME_TYPE_PROVISION_LIST => {
                     // Allow listing masters even when locked — no secrets exposed,
@@ -867,7 +888,9 @@ fn main() {
     loop {
         // Poll for an incoming frame with a short timeout so we can also check
         // the button state and display timeout while idle.
-        let frame = loop {
+        // `mut`: secret-bearing payloads are scrubbed in place after their
+        // handlers run (FW-L3).
+        let mut frame = loop {
             wdt::feed();
             match protocol::try_read_frame(&mut usb, IDLE_POLL_MS) {
                 Some(f) => {
@@ -948,8 +971,11 @@ fn main() {
                     FRAME_TYPE_RESTORE_IDENTITY => {
                         provision::handle_restore(&mut usb, &frame, &mut nvs, &secp, &mut display, &buttons)
                     }
-                    _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display),
+                    _ => provision::handle_add(&mut usb, &frame, &mut nvs, &secp, &mut display, &buttons),
                 };
+                // 0x01's payload carries the host-pushed seed — scrub it now
+                // that the handler has copied what it needs (FW-L3).
+                frame.scrub_payload();
                 if let Some(master) = provisioned {
                     loaded_masters.push(master);
                 }
@@ -964,6 +990,7 @@ fn main() {
                     &mut nvs,
                     &secp,
                     &mut display,
+                    &buttons,
                     &loaded_masters,
                 ) {
                     loaded_masters.push(master);
@@ -980,8 +1007,21 @@ fn main() {
             }
 
             // 0x5B — Sapwood-provisioned display metadata (name + avatar). Stored
-            // in NVS; the signer never fetches/decodes images itself.
+            // in NVS; the signer never fetches/decodes images itself. Gated on
+            // bridge auth once a bridge secret exists (FW-L1): the name/avatar on
+            // the OLED is the identity card the owner approves against, so an
+            // arbitrary USB host must not rewrite it; the relay twin already
+            // requires operator auth. Same open-tier carve-out as the FW-M2
+            // dispatch gate: with NO secret provisioned, first-run tethered
+            // flows (avatar sync before pairing) rely on the cable as anchor.
             FRAME_TYPE_SET_IDENTITY_META => {
+                if !policy_engine.bridge_authenticated
+                    && crate::session::read_bridge_secret(&nvs).is_some()
+                {
+                    log::warn!("SET_IDENTITY_META rejected — bridge not authenticated");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"bridge auth required");
+                    continue;
+                }
                 let ok = identity_meta::handle_frame(&frame.payload, &loaded_masters, &mut nvs);
                 protocol::write_frame(&mut usb, if ok { FRAME_TYPE_ACK } else { FRAME_TYPE_NACK }, &[]);
                 // Refresh the single-master identity card with the new avatar.
@@ -1055,7 +1095,7 @@ fn main() {
                     &mut usb,
                     &frame,
                     &mut nvs,
-                    &mut loaded_masters,
+                    &loaded_masters,
                     &mut display,
                     &buttons,
                 ) {
@@ -1109,6 +1149,8 @@ fn main() {
                     &nvs,
                     &mut policy_engine,
                 );
+                // The payload is the presented bridge secret (FW-L3).
+                frame.scrub_payload();
             }
 
             // 0x23 — set bridge secret
@@ -1121,6 +1163,7 @@ fn main() {
                     &mut display,
                     &buttons,
                 );
+                frame.scrub_payload();
             }
 
             // 0x54 — set WiFi-standalone network config
@@ -1133,6 +1176,8 @@ fn main() {
                     &buttons,
                     true,
                 );
+                // The config JSON carries the WiFi password (FW-L3).
+                frame.scrub_payload();
             }
 
             FRAME_TYPE_GET_NET_CONFIG => {
@@ -1151,6 +1196,8 @@ fn main() {
                     &mut display,
                     &buttons,
                 );
+                // A `set` password action carries the WiFi password (FW-L3).
+                frame.scrub_payload();
             }
 
             FRAME_TYPE_SET_OPERATOR => {
@@ -1191,6 +1238,9 @@ fn main() {
                         notes::sync_sealed(&frame.payload);
                     }
                 }
+                // The payload is the PIN digits — scrub after every consumer
+                // (handler, note-key rewrap) has run (FW-L3).
+                frame.scrub_payload();
             }
 
             // 0x62 — set/clear the host-held vault key (re-wraps the seeds)
@@ -1211,6 +1261,8 @@ fn main() {
                         notes::sync_sealed(&frame.payload);
                     }
                 }
+                // The payload is the vault key (FW-L3).
+                frame.scrub_payload();
             }
 
             // 0x63 — vault unlock in the main loop is a no-op (the device is
@@ -1226,6 +1278,8 @@ fn main() {
             // frames — fail closed, per the goal doc.
             FRAME_TYPE_NOTE_CMD => {
                 notes::handle_note_cmd_frame(&mut usb, &frame.payload, &mut display, &buttons);
+                // Import-style commands carry bearer-note secrets (FW-L3).
+                frame.scrub_payload();
             }
 
             // 0x40 -- create a connection slot
@@ -1270,17 +1324,27 @@ fn main() {
                 );
             }
 
-            // 0x52 -- backup import (restore slots + bridge secret)
+            // 0x52 -- backup import (restore slots + bridge secret). Gated on
+            // bridge auth exactly like export (FW-H2): installing authority
+            // must require the same session that can read it.
             FRAME_TYPE_BACKUP_IMPORT_REQUEST => {
-                backup::handle_import(
-                    &mut usb,
-                    &frame.payload,
-                    &loaded_masters,
-                    &mut policy_engine,
-                    &mut nvs,
-                    &mut display,
-                    &buttons,
-                );
+                if !policy_engine.bridge_authenticated {
+                    log::warn!("Backup import rejected -- bridge not authenticated");
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"bridge auth required");
+                } else {
+                    backup::handle_import(
+                        &mut usb,
+                        &frame.payload,
+                        &loaded_masters,
+                        &mut policy_engine,
+                        &mut nvs,
+                        &mut display,
+                        &buttons,
+                    );
+                }
+                // The payload carries slot secrets and the bridge secret —
+                // scrub on every outcome (FW-L3).
+                frame.scrub_payload();
             }
 
             // 0x30 -- OTA begin (sends size + expected SHA-256, triggers approval)

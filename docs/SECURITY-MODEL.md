@@ -14,12 +14,46 @@ manager.
 | **Master seed** | 32-byte root (the 12-word phrase) | Full impersonation — the attacker *is* the identity |
 | **Operator key** | kind-24134 management authority (Sapwood) | Can manage clients, scoped signing policy, and WiFi configuration (see below) |
 | **Bridge secret** | USB management session auth | Can manage clients over USB |
-| **Slot secrets** | per-client bunker connection credentials | Can connect as that client (subject to its policy) |
+| **Slot secrets** | per-client bunker connection credentials | Bearer credential — first connect binds the presenter's pubkey with no confirmation (TOFU); a rebind on a signing-capable slot needs the physical hold. See "Slot-secret custody" below |
+| **Bearer notes** | LUD-25 (LNURLcash) note secrets held by the note locker | Spendable cash — whoever reads the secrets can redeem the notes first |
 
-The master seed is the crown jewel. **It is generated on-device from hardware
-entropy and is never transmitted off the device by any code path** — not over
-USB, not over the relay, not in a backup. The only place it is ever displayed is
-the OLED, once, at creation.
+The master seed is the crown jewel. For an identity **generated on-device**
+(frame 0x57), the seed comes from hardware entropy and **is never transmitted
+off the device by any code path** — not over USB, not over the relay, not in a
+backup; the only place it is ever displayed is the OLED, once, at creation.
+Restored or imported identities are the exception: a mnemonic or nsec pushed
+over USB provisioning, or a seed derived browser-side in a Sapwood restore
+flow, necessarily transits the host, which must then be trusted with it. Where
+the threat model requires that no host ever sees the seed, prefer on-device
+generation.
+
+Bearer notes ride the seeds' at-rest posture: **plaintext in NVS when no PIN
+or vault key is set** — the same physical-custody model — and they are
+deliberately **excluded from backups**: a note restored onto two boards is a
+double-spend, so bearer value is unrecoverable by design (see
+`docs/plans/2026-08-18-note-locker-goal.md`).
+
+### Slot-secret custody
+
+A slot secret is a **bearer credential**, and it is deliberately widely held:
+served to any heartwoodd API-token holder, carried in `BACKUP_EXPORT`, and
+stored in every paired client app. Treat any copy as compromised together:
+
+- **First bind is trust-on-first-use.** The first connect presenting a valid
+  secret binds that pubkey with no device confirmation — a captured bunker URI
+  lets an attacker pair *first* and become the slot's client. Mitigation is
+  procedural: pair over a channel you control, and treat a "slot already
+  bound" surprise as a leak.
+- **A rebind on a signing-capable slot needs the physical hold.** If the
+  slot's current policy includes `sign_event`, swapping to a different client
+  pubkey stops for the same button approval as any other authority grant — a
+  stolen secret no longer silently inherits signing authority. (Non-signing
+  slots — encrypt/decrypt only — still swap with just an OLED flash: there is
+  no signing authority to inherit, and the flash keeps the event visible.)
+- **There is no rotation frame.** The leak response is revoke + recreate the
+  slot (fresh secret) — either operator can do it remotely. A backup restore
+  never re-imports signing: grants are stripped on import and each slot
+  re-earns them physically (legacy) or from operator policy (strict v2).
 
 ## Components and trust boundaries
 
@@ -34,6 +68,21 @@ the OLED, once, at creation.
   whole system.
 - **Relay / network** — untrusted. Sees only NIP-44 ciphertext.
 - **Browser / Sapwood** — semi-trusted. Holds the *operator* key, not the seed.
+- **heartwoodd (bridge daemon)** — semi-trusted host courier. Holds the bridge
+  secret and, when the vault is enabled, the vault key — never the seeds. Its
+  management API is cleartext HTTP and binds to **loopback only** by default;
+  `--bind 0.0.0.0` is an explicit opt-in (with a loud startup warning) that
+  exposes the API token, unlock passphrase, vault key and connect secrets to
+  every host on the LAN. TLS is not implemented — treat any non-loopback bind
+  as a trusted-network decision, not a safe default.
+- **ESP8266 tethered signer** (`esp8266-firmware/`) — the second, bare-metal
+  signer tier: USB-tethered only (no radio), with NIP-46 couriered by the
+  bridge daemon, which never sees plaintext or keys. Seeds are host-supplied
+  at provisioning behind a button hold (no OLED phrase flow exists on that
+  hardware), signing is OLED-plus-hold approved, and a boot self-test halts a
+  silently corrupting chip. Its flash key store is unsealed — no PIN/vault
+  path — so physical possession equals key recovery, the same posture as an
+  unsealed ESP32.
 - **Physical device** — see "Physical access" below; this is the weak boundary.
 
 ### Authority boundary
@@ -50,6 +99,43 @@ it is not the device trust root:
 There is deliberately **no remote OTA implementation**. Firmware updates remain
 USB-only, release-signed, and physically approved.
 
+**Board caveat: the physical-approval anchor is only as strong as the USB
+wiring.** On the UART-transport boards (Heltec V3, T-Display) the approval
+button is GPIO0, which sits behind the CP2102/CH9102 auto-download circuit — a
+host with serial control can hold that line low and satisfy a button hold
+remotely, collapsing the "USB + physical approval" tier into plain "USB". The
+native-USB boards (V4, C6) have no such bridge and are unaffected; prefer them
+for high-value keys.
+
+### USB frame authority
+
+The USB host is untrusted; what a frame may do depends on session state, not
+on the cable. Two independent gates apply:
+
+- **Session gate (bridge auth).** Once a bridge secret is provisioned, an
+  authenticated `SESSION_AUTH` session is required for: connection-slot
+  management (`CONNSLOT_*`), backup export **and** import, identity-meta
+  writes (0x5B), vault unlock delivery (0x63), and the plaintext-USB NIP-46
+  decrypt methods and persona-registry mutations (frames 0x02/0x03 with no
+  bound client). With **no** bridge secret provisioned the device is in the
+  open tier: a cabled host is the whole trust anchor and those paths stay
+  open — the tethered first-run flows (provisioning, avatar sync before
+  pairing) rely on it. A failed `SESSION_AUTH` never drops an established
+  session, and repeated failures are refused under a short cooldown.
+- **Physical hold (independent of session).** Every frame that creates,
+  destroys, or re-roots authority stops for the button: PROVISION / GENERATE /
+  RESTORE / DERIVE / REMOVE (0x01/0x57/0x58/0x60/0x04), SET_BRIDGE_SECRET
+  (0x23 — also refused while a session is authenticated, so replacement is a
+  deliberate physical act), SET_PIN, VAULT_SET (0x62 — also bridge-auth),
+  SET/PATCH_NET_CONFIG, SET_OPERATOR (also revision-bound), backup import,
+  and OTA (additionally release-signed). A relay-side client rebind on a
+  signing-capable slot takes the same hold via the deferred-approval
+  machinery.
+
+Read-only probes (firmware info, identity list, redacted network state) are
+open on every tier: they disclose nothing secret-bearing. There is no frame
+that exports a seed, on any tier.
+
 ## Threat: remote / network attacker — **resisted**
 
 An attacker on the network (or running a malicious relay) can observe and inject
@@ -58,12 +144,17 @@ relay traffic. They cannot:
 - **Read messages** — NIP-44 encrypted master⇄counterparty; the relay sees only
   ciphertext.
 - **Forge or replay management** — kind-24134 commands are accepted only if
-  authored by the baked **operator key** (`mgmt::is_operator`). Every mutation
+  authored by the operator key authorised for the addressed identity — the
+  baked **device operator**, or that identity's per-identity **delegate**
+  (`mgmt::is_authorised_operator`). Every mutation
   must also carry the current device-issued 256-bit challenge. Firmware persists
   and reads back a fresh challenge before dispatch, so a captured command stays
   stale across reboot and after its id leaves the bounded duplicate-delivery
   set. Challenge discovery and responses remain inside the authenticated NIP-44
-  channel.
+  channel. (The full method catalogue, error codes and stale-retry semantics
+  live in the dispatch code — `relay.rs` and the `mgmt` module; there is no
+  standalone kind-24134 spec document, so this model states the
+  security-relevant invariants.)
 - **Reach the seed or firmware** — no relay method exposes or replaces the seed,
   and remote OTA is not implemented.
 - **Get a signature for free or monopolise the approval loop** — `sign_event`
@@ -311,8 +402,20 @@ Security properties and honest residuals:
   operator — but exploiting it still requires the physical flash. Sapwood
   therefore never auto-sends; the operator taps, and only for a signer they
   know rebooted.
-- Theft of device **and** host together collapses to the host-side store
-  (heartwoodd keyfile passphrase / browser storage) — keep those strong.
+- Theft of device **and** host together is full compromise, and the host side
+  is weaker than the design spec intended: heartwoodd stores the vault key as
+  **plaintext hex** in `<data-dir>/vault.key` (mode 0600) and delivers it
+  automatically at boot — the spec's Argon2id-encrypted keyfile with a
+  Sapwood-typed passphrase is **not implemented**. So a Pi compromise alone
+  already hands over one of the two halves; with flash access as well, the
+  seeds collapse to nothing. The other host store is Sapwood's browser
+  storage — same plaintext-at-rest posture. Until the keyfile design is
+  built, protect the Pi's filesystem accordingly.
+- Host RAM hygiene is best-effort, not guaranteed: heartwoodd scrubs master
+  secrets and keystore buffers on drop/lock (`Zeroizing`), but vault-key
+  handling is documented as callers' duty and one residual (`ConnectSlot.secret`,
+  a plain `String` whose type is shared with the firmware in `common/`) is not
+  scrubbed.
 - Escrow: Sapwood offers the vault key for export at setup (password manager,
   safe), the analogue of writing down the recovery phrase. Losing every copy
   of the vault key with no PIN set means the seeds are unrecoverable by
@@ -345,22 +448,73 @@ Design spec: `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`.
 
 ## Known limits (accepted)
 
-- **One operator, shared handoff credential:** current firmware trusts one
-  `op_mgmt` pubkey, and Sapwood's phone handoff copies that operator credential
-  rather than enrolling an independently revocable phone key. Browsers may also
-  reuse one operator across several signers, increasing its compromise blast
-  radius. Per-device multi-manager enrolment/revocation is future hardening;
-  today rotation/recovery requires trusted USB.
-- **Bounded duplicate history:** the RAM-only request-id set is bounded
-  (`SEEN_MAX = 64`) and resets on reboot. An old `mgmt_seen` NVS blob from
-  earlier firmware is ignored. An evicted read may be processed again, but reads
-  cannot consume or mutate authority. An evicted or post-reboot mutation still
-  carries its already-used NVS challenge and is rejected. Keeping polled read ids
-  out of NVS avoids roughly 43,200 writes/day from a manager open at a four-second
-  poll interval.
-- **`BACKUP_EXPORT` over USB** returns slot + bridge secrets (not the seed) and is
-  not separately bridge-auth-gated; this is defence-in-depth only, since USB
-  physical access already implies a flash read. Worth gating regardless.
+- **One device operator; per-identity delegates:** the device-wide `op_mgmt`
+  pubkey is the management root. Any identity can additionally be delegated to
+  its own operator via `set_identity_operator` — device-operator only,
+  challenge-protected like every mutation, applied at restart. A delegate is
+  confined to its one identity: it manages that identity's clients, policies
+  and metadata, but cannot add identities, delegate further, read device-wide
+  state (network configuration, audit ring, relay topology, storage
+  inventory), or even enumerate the owner's other identities. The delegation
+  is stored per slot and travels/clears with the slot bundle on removal, so a
+  slot shift can never bind a stale delegate to a different identity. Two
+  residuals: Sapwood's phone handoff still copies the device-operator
+  credential rather than enrolling an independently revocable delegate, and
+  browsers may reuse one operator across several signers, increasing its
+  compromise blast radius. Replacing the device operator itself remains a
+  trusted-USB, physical-hold operation.
+- **Bounded duplicate history; no freshness window:** the RAM-only request-id
+  set is bounded (`SEEN_MAX = 64`) and resets on reboot. An old `mgmt_seen`
+  NVS blob from earlier firmware is ignored. An evicted read may be processed
+  again, but reads cannot consume or mutate authority. An evicted or
+  post-reboot mutation still carries its already-used NVS challenge and is
+  rejected. Keeping polled read ids out of NVS avoids roughly 43,200
+  writes/day from a manager open at a four-second poll interval. NIP-46 client
+  requests ride a separate 64-entry RAM ring with the same eviction/reset
+  properties, and **no `created_at` freshness window is enforced on any
+  inbound path** (firmware relay side, or heartwoodd, which likewise ignores
+  `created_at` and will re-process a redelivered request). What a replayed,
+  previously valid request can therefore achieve, per method class:
+  **mutations** (slot, policy, network, operator writes) — nothing; they carry
+  the durable one-time challenge and are rejected as stale after first use,
+  across reboots and evictions. **`sign_event`** — a fresh signature on the
+  identical, already-public event (relays dedupe the shared id); the owner
+  authorised that exact event once already. **encrypt/decrypt** — the response
+  re-seals to the original client's pubkey, so a replaying attacker without
+  that client's key reads nothing new. **Button-gated methods** — one captured
+  request can re-arm a 30 s prompt: an availability nuisance bounded by the
+  physical button, never an approval. **Management reads** — redacted state
+  only, and only inside the authenticated operator channel. This is accepted
+  deliberately: a `created_at` window would break legitimate clients with
+  skewed clocks, while the durable challenge already anchors every mutation.
+- **No wired rate limiting:** the April design's 60 req/60 s per-client
+  counter exists (`policy.rs`) but is not consulted in dispatch. Abuse is
+  bounded instead by policy gating (unknown clients are button-only), the
+  unbound-peer denial set, and the bounded approval machinery. Wiring the
+  counter in is future hardening, documented here so the gap is honest.
+- **PIN KDF cost scales per identity:** unlocking pays the PBKDF2-HMAC-SHA256
+  cost (100k rounds) once per sealed master — about 26 s for three identities
+  on current hardware (HARDWARE-TEST-CHECKLIST), so boot unlock allows 60 s.
+  The per-guess cost is the point (every offline brute-force attempt pays it),
+  but it bounds how many identities a PIN user will tolerate; the vault-key
+  path pays no per-identity human-secret cost for the same at-rest protection.
+- **Bridge-secret rotation is physical:** the USB pairing secret can only be
+  set or replaced while no session is authenticated, under the physical hold
+  (Sapwood surfaces this as "replace pairing"). There is no remote rotation —
+  the bridge secret never transits the relay path — so a leaked pairing is
+  revoked on the device, not over the wire.
+- **Backups carry slot + bridge secrets (never seeds).** `BACKUP_EXPORT` and
+  `BACKUP_IMPORT` both require an authenticated bridge session and a physical
+  hold. Import never restores authority as-is: every slot is re-validated
+  against the management policy validator, `signing_approved`/`sign_event` and
+  kind ceilings are stripped (each slot re-earns signing physically or from
+  operator policy), and a carried bridge secret installs only under its own
+  distinct hold. The export file remains a plaintext secrets dump by design —
+  protect it accordingly.
+- **Legacy NIP-04 is a decryption oracle for weak crypto.** Permitting the
+  legacy `nip04_decrypt` method in a slot policy makes the device a decryption
+  oracle for AES-256-CBC — unauthenticated legacy encryption — so prefer the
+  NIP-44 methods in policies wherever the client supports them.
 - **No Anti-Exfil-style nonce commitment.** A *weak or dead* RNG cannot weaken
   signatures: BIP-340 derives the nonce from the secret key and message, and
   `aux_rand` (drawn via `fill_random`, `firmware/src/sign.rs`) can only add

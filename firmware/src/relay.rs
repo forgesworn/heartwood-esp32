@@ -708,14 +708,29 @@ pub fn run_wifi_standalone<'d, 'b>(
 
     // Ordered join candidates: the primary pair first, then the stored
     // fallback list. Owned copies so the list is free of `cfg` borrows for
-    // the lifetime of the loop below.
+    // the lifetime of the loop below. Any credential that does not fit the
+    // fixed-capacity ESP-IDF fields is dropped, loudly (FW-M4): a config
+    // written by older/looser firmware must degrade to a USB-servable
+    // config error, never a boot-time panic.
     let wifi_candidates: Vec<(String, String)> = cfg
         .network_candidates()
         .into_iter()
         .map(|(ssid, password)| (ssid.to_string(), password.to_string()))
+        .filter(|(ssid, password)| {
+            let usable = wifi_client_config(ssid, password).is_some();
+            if !usable {
+                log::error!(
+                    "[relay] stored credential for {ssid:?} exceeds ESP-IDF field bounds — unusable"
+                );
+            }
+            usable
+        })
         .collect();
+    let wifi_config_ok = !wifi_candidates.is_empty();
     let mut wifi_candidate_idx = 0usize;
-    select_wifi_candidate(&mut wifi, &wifi_candidates, wifi_candidate_idx);
+    if wifi_config_ok {
+        select_wifi_candidate(&mut wifi, &wifi_candidates, wifi_candidate_idx);
+    }
     wifi.start().expect("relay: wifi start");
     // RF entropy source is live from here on — plain esp_fill_random (via
     // crate::fill_random) is a true RNG again.
@@ -852,6 +867,27 @@ pub fn run_wifi_standalone<'d, 'b>(
             // any socket read (including another session's degraded blocking
             // read) before the deadline is serviced at the top of the loop.
             FreeRtos::delay_ms(20);
+            continue;
+        }
+        if !wifi_config_ok {
+            // No stored credential is usable (FW-M4) — a config error,
+            // fixable only over USB. Exactly like the no-relay case below:
+            // not the watchdog's case, and the cable stays fully served.
+            last_relay_healthy = Instant::now();
+            log::error!("[relay] no usable wifi credential in stored config");
+            set_network_runtime(
+                &mut ctx,
+                NetworkRuntimeStage::ConfigError,
+                true,
+                false,
+                NetworkRuntimeError::InvalidConfig,
+            );
+            let until = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < until {
+                poll_usb(usb, &mut ctx, Some(&mut wifi));
+                service_button(&mut ctx);
+                FreeRtos::delay_ms(20);
+            }
             continue;
         }
         // Every relay session depends on the station link; restore it before
@@ -1523,7 +1559,11 @@ fn publish_locked_announce(
 /// minimum-strength scan threshold, so WPA2 admits WPA2 and stronger WPA3
 /// APs, while PMF-capable supplies the WPA3 requirement without excluding a
 /// WPA2 AP that does not advertise PMF. Open networks advertise no PMF.
-fn wifi_client_config(ssid: &str, password: &str) -> WifiConfig {
+///
+/// Returns `None` when a stored credential does not fit the fixed-capacity
+/// ESP-IDF fields — never a panic (FW-M4): a malformed stored config must
+/// degrade to a USB-servable config error, not a boot loop.
+fn wifi_client_config(ssid: &str, password: &str) -> Option<WifiConfig> {
     let (auth, pmf_cfg) = if password.is_empty() {
         (AuthMethod::None, PmfConfiguration::NotCapable)
     } else {
@@ -1532,13 +1572,13 @@ fn wifi_client_config(ssid: &str, password: &str) -> WifiConfig {
             PmfConfiguration::Capable { required: false },
         )
     };
-    WifiConfig::Client(ClientConfiguration {
-        ssid: ssid.try_into().expect("relay: ssid too long"),
-        password: password.try_into().expect("relay: pass too long"),
+    Some(WifiConfig::Client(ClientConfiguration {
+        ssid: ssid.try_into().ok()?,
+        password: password.try_into().ok()?,
         auth_method: auth,
         pmf_cfg,
         ..Default::default()
-    })
+    }))
 }
 
 /// Point the station at candidate `idx` (mod len) of the configured network
@@ -1549,6 +1589,9 @@ fn select_wifi_candidate(
     candidates: &[(String, String)],
     idx: usize,
 ) {
+    if candidates.is_empty() {
+        return;
+    }
     let (ssid, password) = &candidates[idx % candidates.len()];
     if candidates.len() > 1 {
         log::info!(
@@ -1558,7 +1601,11 @@ fn select_wifi_candidate(
             ssid
         );
     }
-    if let Err(e) = wifi.set_configuration(&wifi_client_config(ssid, password)) {
+    let Some(config) = wifi_client_config(ssid, password) else {
+        log::error!("[relay] stored credential for {ssid:?} exceeds ESP-IDF field bounds — skipped");
+        return;
+    };
+    if let Err(e) = wifi.set_configuration(&config) {
         log::error!("[relay] wifi config for {ssid:?} failed: {e:?}");
     }
 }
@@ -1712,7 +1759,8 @@ fn locked_relay_phase(
         }
 
         // USB stays live while locked over relay: PIN or vault unlock locally.
-        if let Some(frame) = crate::protocol::try_read_frame(usb, 0) {
+        // `mut`: secret-bearing payloads are scrubbed after use (FW-L3).
+        if let Some(mut frame) = crate::protocol::try_read_frame(usb, 0) {
             match frame.frame_type {
                 FRAME_TYPE_PIN_UNLOCK => {
                     if crate::pin::handle_pin_unlock(
@@ -1727,9 +1775,11 @@ fn locked_relay_phase(
                         // self-heals torn sealed state) — relay-created
                         // notes must not sit plaintext under sealed seeds.
                         crate::notes::sync_sealed(&frame.payload);
+                        frame.scrub_payload();
                         unlock_sk.iter_mut().for_each(|b| *b = 0);
                         return;
                     }
+                    frame.scrub_payload();
                 }
                 FRAME_TYPE_SESSION_AUTH => {
                     match crate::session::verify_bridge_secret(&frame.payload, nvs) {
@@ -1738,17 +1788,20 @@ fn locked_relay_phase(
                             crate::protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x00]);
                         }
                         Some(false) => {
-                            vault_authed = false;
+                            // A wrong secret must not deauthenticate an
+                            // already-authenticated vault session (FW-M1).
                             crate::protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x01]);
                         }
                         None => {
                             crate::protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x02]);
                         }
                     }
+                    frame.scrub_payload();
                 }
                 FRAME_TYPE_VAULT_UNLOCK => {
                     if !vault_authed {
                         crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
+                        frame.scrub_payload();
                     } else if crate::pin::handle_vault_unlock(
                         usb,
                         &frame.payload,
@@ -1759,8 +1812,11 @@ fn locked_relay_phase(
                         // See PIN_UNLOCK above: the note key rides the same
                         // secret.
                         crate::notes::sync_sealed(&frame.payload);
+                        frame.scrub_payload();
                         unlock_sk.iter_mut().for_each(|b| *b = 0);
                         return;
+                    } else {
+                        frame.scrub_payload();
                     }
                 }
                 FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
@@ -1928,7 +1984,7 @@ fn poll_usb(
     ctx: &mut SignCtx,
     wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
 ) {
-    let frame = match crate::protocol::try_read_frame(usb, 0) {
+    let mut frame = match crate::protocol::try_read_frame(usb, 0) {
         Some(f) => f,
         None => return,
     };
@@ -1948,8 +2004,18 @@ fn poll_usb(
         ),
 
         // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
-        // NVS. The signer never fetches/decodes images itself.
+        // NVS. The signer never fetches/decodes images itself. Bridge-auth gated
+        // (FW-L1) exactly as in the USB-only loop: the OLED identity card is
+        // what the owner approves against, so it is not freely rewritable. Same
+        // open-tier carve-out as FW-M2: no bridge secret provisioned → the
+        // cable is the trust anchor (first-run avatar sync precedes pairing).
         FRAME_TYPE_SET_IDENTITY_META => {
+            if !ctx.policy_engine.bridge_authenticated
+                && crate::session::read_bridge_secret(ctx.nvs).is_some()
+            {
+                log::warn!("[relay] SET_IDENTITY_META rejected — bridge not authenticated");
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
+            } else {
             let ok = crate::identity_meta::handle_frame(&frame.payload, ctx.masters, ctx.nvs);
             crate::protocol::write_frame(
                 usb,
@@ -1965,6 +2031,7 @@ fn poll_usb(
                     None => (None, None),
                 };
                 crate::oled::show_npub(ctx.display, name, &npub, avatar);
+            }
             }
         }
 
@@ -2053,16 +2120,21 @@ fn poll_usb(
         FRAME_TYPE_SIGN_ENVELOPE => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]),
 
         FRAME_TYPE_SESSION_AUTH => {
-            crate::session::handle_auth(usb, &frame.payload, ctx.nvs, ctx.policy_engine)
+            crate::session::handle_auth(usb, &frame.payload, ctx.nvs, ctx.policy_engine);
+            // The payload is the presented bridge secret (FW-L3).
+            frame.scrub_payload();
         }
-        FRAME_TYPE_SET_BRIDGE_SECRET => crate::session::handle_set_bridge_secret(
-            usb,
-            &frame.payload,
-            ctx.nvs,
-            ctx.policy_engine,
-            ctx.display,
-            ctx.buttons,
-        ),
+        FRAME_TYPE_SET_BRIDGE_SECRET => {
+            crate::session::handle_set_bridge_secret(
+                usb,
+                &frame.payload,
+                ctx.nvs,
+                ctx.policy_engine,
+                ctx.display,
+                ctx.buttons,
+            );
+            frame.scrub_payload();
+        }
 
         // Network reconfig — the handler reboots into the new mode itself on a
         // wifi save (and simply persists a radio-off save).
@@ -2075,19 +2147,25 @@ fn poll_usb(
                 ctx.buttons,
                 true,
             );
+            // The config JSON carries the WiFi password (FW-L3).
+            frame.scrub_payload();
         }
 
         FRAME_TYPE_GET_NET_CONFIG => {
             crate::net_config_store::handle_get_net_config(usb, ctx.nvs, ctx.network_runtime)
         }
 
-        FRAME_TYPE_PATCH_NET_CONFIG => crate::net_config_store::handle_patch_net_config(
-            usb,
-            &frame.payload,
-            ctx.nvs,
-            ctx.display,
-            ctx.buttons,
-        ),
+        FRAME_TYPE_PATCH_NET_CONFIG => {
+            crate::net_config_store::handle_patch_net_config(
+                usb,
+                &frame.payload,
+                ctx.nvs,
+                ctx.display,
+                ctx.buttons,
+            );
+            // A `set` password action carries the WiFi password (FW-L3).
+            frame.scrub_payload();
+        }
 
         FRAME_TYPE_SET_OPERATOR => crate::net_config_store::handle_set_operator(
             usb,
@@ -2120,6 +2198,8 @@ fn poll_usb(
                     ctx.buttons,
                 );
             }
+            // The payload is the PIN digits (FW-L3).
+            frame.scrub_payload();
         }
 
         // Vault management over the cable in wifi mode (mirrors the USB-only
@@ -2144,6 +2224,8 @@ fn poll_usb(
                     ctx.buttons,
                 );
             }
+            // The payload is the vault key (FW-L3).
+            frame.scrub_payload();
         }
         FRAME_TYPE_VAULT_UNLOCK => {
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"already unlocked");
@@ -2183,15 +2265,28 @@ fn poll_usb(
                 );
             }
         }
-        FRAME_TYPE_BACKUP_IMPORT_REQUEST => crate::backup::handle_import(
-            usb,
-            &frame.payload,
-            ctx.masters,
-            ctx.policy_engine,
-            ctx.nvs,
-            ctx.display,
-            ctx.buttons,
-        ),
+        FRAME_TYPE_BACKUP_IMPORT_REQUEST => {
+            // Same bridge-auth gate as export (FW-H2).
+            if !ctx.policy_engine.bridge_authenticated {
+                log::warn!("[relay] Backup import rejected -- bridge not authenticated");
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
+            } else if approval_card_open(ctx) {
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+            } else {
+                crate::backup::handle_import(
+                    usb,
+                    &frame.payload,
+                    ctx.masters,
+                    ctx.policy_engine,
+                    ctx.nvs,
+                    ctx.display,
+                    ctx.buttons,
+                );
+            }
+            // The payload carries slot secrets and the bridge secret — scrub
+            // on every outcome (FW-L3).
+            frame.scrub_payload();
+        }
 
         // OTA — the finish handler verifies the image and reboots into it.
         FRAME_TYPE_OTA_BEGIN => crate::ota::handle_ota_begin(
@@ -2212,6 +2307,11 @@ fn poll_usb(
         // from the fresh master set. `masters` here is a shared slice, so the
         // add handlers persist to NVS and we reboot rather than mutate in place.
         FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
+            if approval_card_open(ctx) {
+                // One screen, one decision: these handlers now run their own
+                // button prompt (FW-M3) and must not paint over a relay card.
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+            } else {
             let provisioned = match frame.frame_type {
                 FRAME_TYPE_GENERATE_IDENTITY => crate::provision::handle_generate(
                     usb,
@@ -2232,10 +2332,13 @@ fn poll_usb(
                     ctx.display,
                     ctx.buttons,
                 ),
-                _ => crate::provision::handle_add(usb, &frame, ctx.nvs, ctx.secp, ctx.display),
+                _ => crate::provision::handle_add(usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.buttons),
             };
+            // 0x01's payload carries the host-pushed seed (FW-L3).
+            frame.scrub_payload();
             if provisioned.is_some() {
                 reboot_after_state_change("master added");
+            }
             }
         }
 
@@ -2243,31 +2346,33 @@ fn poll_usb(
         // master-set change like PROVISION, so reboot to re-subscribe; an
         // idempotent re-derive (existing slot) returns None and needs none.
         FRAME_TYPE_DERIVE_IDENTITY => {
-            if crate::provision::handle_derive(usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.masters)
+            if approval_card_open(ctx) {
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+            } else if crate::provision::handle_derive(usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.buttons, ctx.masters)
                 .is_some()
             {
                 reboot_after_state_change("identity derived");
             }
         }
+        // 0x04 — remove a master. Routes through the same handler as the
+        // USB-only loop (FW-H1): the OLED shows slot + npub and the owner must
+        // complete the 2 s hold — a bare frame from the USB host must never
+        // destroy an identity on a wifi-standalone signer. On success the
+        // relay subscription re-derives from the fresh master set by reboot.
         FRAME_TYPE_PROVISION_REMOVE => {
-            if frame.payload.len() == 1 {
-                let slot = frame.payload[0];
-                match crate::masters::remove_master(ctx.nvs, slot) {
-                    Ok(()) => {
-                        crate::oled::show_error(ctx.display, &format!("Removed slot {slot}"));
-                        crate::protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
-                        reboot_after_state_change("master removed");
-                    }
-                    Err(e) => {
-                        log::error!("[relay] remove master slot {slot} failed: {e}");
-                        crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-                        if crate::masters::removal_pending(ctx.nvs) {
-                            reboot_after_state_change("master removal recovery pending");
-                        }
-                    }
-                }
-            } else {
-                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            if approval_card_open(ctx) {
+                // One screen, one decision: a relay approval card already owns
+                // the display and the button.
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+            } else if crate::provision::handle_remove(
+                usb,
+                &frame,
+                ctx.nvs,
+                ctx.masters,
+                ctx.display,
+                ctx.buttons,
+            ) {
+                reboot_after_state_change("master removed");
             }
         }
         // Factory reset wipes NVS and reboots inside the handler.

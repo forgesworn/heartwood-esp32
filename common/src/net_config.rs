@@ -809,6 +809,66 @@ pub fn parse_net_config(bytes: &[u8]) -> Result<NetConfig, &'static str> {
     serde_json::from_slice(bytes).map_err(|_| "invalid net config json")
 }
 
+/// Validation for a LOCAL whole-config replacement (USB SET_NET_CONFIG frame
+/// or the flash `config` partition seed). Stronger than the legacy
+/// `NetConfig::validate` — the stored blob boots straight into
+/// `wifi_client_config`'s fixed-capacity ESP-IDF fields, so anything that
+/// could panic there must be rejected at write time (FW-M4) — but
+/// deliberately NOT the remote validator: local custody may select usb mode,
+/// and ws:// LAN relays stay allowed (only the remote channel is wss-only).
+#[cfg(feature = "nip46")]
+pub fn validate_local_net_config(cfg: &NetConfig) -> Result<(), &'static str> {
+    cfg.validate()?;
+    // Dormant fields in usb mode are shape-checked too: a later local edit
+    // can promote the config to wifi without re-sending them.
+    if !cfg.ssid.is_empty() {
+        validate_ssid(&cfg.ssid)?;
+    }
+    validate_wifi_password(&cfg.password)?;
+    if cfg.networks.len() > MAX_EXTRA_NETWORKS {
+        return Err("too many fallback networks");
+    }
+    for network in &cfg.networks {
+        validate_ssid(&network.ssid)?;
+        validate_wifi_password(&network.password)?;
+    }
+    if cfg.relays.len() > 8 {
+        return Err("at most eight relays");
+    }
+    for relay in &cfg.relays {
+        validate_local_relay(relay)?;
+    }
+    Ok(())
+}
+
+/// Local relay rule: ws:// or wss:// (a LAN relay is legitimate on the
+/// cabled / flash-seeded path), bounded length, a nonempty host, and no
+/// whitespace or control characters.
+#[cfg(feature = "nip46")]
+fn validate_local_relay(relay: &str) -> Result<(), &'static str> {
+    let rest = relay
+        .strip_prefix("wss://")
+        .or_else(|| relay.strip_prefix("ws://"))
+        .ok_or("relay must be a ws:// or wss:// URL")?;
+    if relay.len() > 255 {
+        return Err("relay URL too long");
+    }
+    if relay
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err("relay URL contains whitespace or control characters");
+    }
+    let host = rest
+        .split(|c| c == '/' || c == '?' || c == '#' || c == ':')
+        .next()
+        .unwrap_or("");
+    if host.is_empty() || !host.bytes().any(|b| b.is_ascii_alphanumeric()) {
+        return Err("relay URL requires a nonempty host");
+    }
+    Ok(())
+}
+
 #[cfg(all(test, feature = "nip46"))]
 mod tests {
     use super::*;

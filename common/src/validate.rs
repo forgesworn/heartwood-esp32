@@ -99,12 +99,15 @@ pub fn validate_persona_name(name: &str) -> Result<(), &'static str> {
     if contains_control_char(name) {
         return Err("persona name must not contain control characters");
     }
-    // The "nostr:persona:" prefix (PROTOCOL v1.1 §3.1) is 14 bytes, so the
-    // persona name itself cannot exceed MAX_PURPOSE_BYTES - 14 = 241 bytes. Be
-    // conservative and cap at 128 — far larger than any reasonable human name
-    // but well inside the limit after any future prefix changes.
-    if name.len() > 128 {
-        return Err("persona name exceeds 128 bytes");
+    // The "nostr:persona:" prefix (PROTOCOL v1.1 §3.1) is 14 bytes, and the
+    // packed persona registry caps a stored purpose at
+    // `persona_pack::MAX_PURPOSE_LEN` = 128 bytes — so a 115–128-byte name
+    // would derive fine yet be refused at persistence (CM-I4). Cap at 114 so
+    // every name that validates here also fits the registry. This is stricter
+    // than the nsec-tree / heartwood-core reference validators (128): those
+    // have no packed-registry constraint.
+    if name.len() > 114 {
+        return Err("persona name exceeds 114 bytes");
     }
     Ok(())
 }
@@ -230,13 +233,24 @@ mod tests {
 
     #[test]
     fn persona_name_rejects_too_long() {
-        let long = "a".repeat(129);
+        let long = "a".repeat(115);
         assert!(validate_persona_name(&long).is_err());
     }
 
     #[test]
     fn persona_name_accepts_max_length() {
-        let max = "a".repeat(128);
+        let max = "a".repeat(114);
         assert!(validate_persona_name(&max).is_ok());
+    }
+
+    #[test]
+    fn persona_name_cap_fits_the_packed_registry() {
+        // CM-I4: the stored purpose is "nostr:persona:" + name and the packed
+        // registry refuses purposes longer than MAX_PURPOSE_LEN, so the name
+        // cap must leave room for the prefix — 114 fits exactly, 115 does not.
+        use crate::persona_pack::MAX_PURPOSE_LEN;
+        let longest = format!("nostr:persona:{}", "a".repeat(114));
+        assert_eq!(longest.len(), MAX_PURPOSE_LEN);
+        assert!("nostr:persona:".len() + 115 > MAX_PURPOSE_LEN);
     }
 }

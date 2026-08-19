@@ -11,9 +11,14 @@ type+len+payload (NOT the magic), matching the firmware and heartwood-bridge.
 
 Usage:
     pip install pyserial
-    # generate a fresh seed on the host (or pass --seed <64 hex>):
-    python3 provision.py --port /dev/cu.wchusbserial1420 --gen \
-        --bridge-secret <64-hex-bridge-secret>      # e.g. "$(printf '42%.0s' {1..32})"
+    # generate a fresh seed on the host; bridge secret via env var:
+    HEARTWOOD_BRIDGE_SECRET=<64-hex> \
+        python3 provision.py --port /dev/cu.wchusbserial1420 --gen
+
+With no --gen / --seed and no HEARTWOOD_BRIDGE_SECRET, the seed and bridge
+secret are prompted for interactively (input hidden). The --seed and
+--bridge-secret argv flags still work but are DEPRECATED: argv leaks into
+shell history and `ps`.
 
 Then set the daemon's `bridge.secret` to the SAME 32 bytes.
 
@@ -24,6 +29,7 @@ GENERATE_IDENTITY path + an OLED to show the phrase — a later addition.
 """
 
 import argparse
+import getpass
 import os
 import struct
 import sys
@@ -80,19 +86,32 @@ def main():
     ap = argparse.ArgumentParser(description="Provision the Heartwood ESP8266 signer.")
     ap.add_argument("--port", required=True, help="e.g. /dev/cu.wchusbserial1420")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--seed", help="32-byte master seed as 64 hex chars")
+    ap.add_argument("--seed", help="32-byte master seed as 64 hex chars "
+                                   "(DEPRECATED on argv — omit for a hidden prompt)")
     ap.add_argument("--gen", action="store_true", help="generate a random 32-byte seed")
-    ap.add_argument("--bridge-secret", required=True, help="32-byte bridge secret, 64 hex chars")
+    ap.add_argument("--bridge-secret", help="32-byte bridge secret, 64 hex chars "
+                                            "(DEPRECATED on argv — use HEARTWOOD_BRIDGE_SECRET "
+                                            "or omit for a hidden prompt)")
     a = ap.parse_args()
 
     if a.gen:
         seed = os.urandom(32)
         print("generated seed:", seed.hex())
     elif a.seed:
+        print("warning: --seed on argv is deprecated (shell history / ps); "
+              "omit it for a hidden prompt", file=sys.stderr)
         seed = bytes.fromhex(a.seed)
     else:
-        sys.exit("provide --seed <64 hex> or --gen")
-    secret = bytes.fromhex(a.bridge_secret)
+        seed = bytes.fromhex(getpass.getpass("master seed (64 hex, hidden): ").strip())
+
+    if a.bridge_secret:
+        print("warning: --bridge-secret on argv is deprecated (shell history / ps); "
+              "use HEARTWOOD_BRIDGE_SECRET or omit it for a hidden prompt", file=sys.stderr)
+        secret = bytes.fromhex(a.bridge_secret)
+    elif os.environ.get("HEARTWOOD_BRIDGE_SECRET"):
+        secret = bytes.fromhex(os.environ["HEARTWOOD_BRIDGE_SECRET"].strip())
+    else:
+        secret = bytes.fromhex(getpass.getpass("bridge secret (64 hex, hidden): ").strip())
     if len(seed) != 32 or len(secret) != 32:
         sys.exit("seed and bridge-secret must each be 32 bytes (64 hex chars)")
 

@@ -9,6 +9,7 @@
 #[allow(unused_imports)]
 use alloc::{format, string::{String, ToString}, vec, vec::Vec};
 
+use zeroize::Zeroize;
 
 use crate::types::{FRAME_OVERHEAD, FRAME_HEADER_SIZE, MAGIC_BYTES, MAX_PAYLOAD_SIZE};
 
@@ -17,6 +18,17 @@ use crate::types::{FRAME_OVERHEAD, FRAME_HEADER_SIZE, MAGIC_BYTES, MAX_PAYLOAD_S
 pub struct Frame {
     pub frame_type: u8,
     pub payload: Vec<u8>,
+}
+
+impl Frame {
+    /// Zero the payload in place. Secret-bearing frames (PIN digits, vault
+    /// key, bridge secret, provisioned seeds, backup slot secrets) must be
+    /// scrubbed once every handler is done with them, so the bytes do not
+    /// linger in freed heap (FW-L3). Callers scrub at the dispatch site,
+    /// after ALL consumers of the payload have run.
+    pub fn scrub_payload(&mut self) {
+        self.payload.zeroize();
+    }
 }
 
 /// Errors that can occur when building or parsing a frame.

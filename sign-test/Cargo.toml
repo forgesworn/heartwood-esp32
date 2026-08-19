@@ -3,6 +3,7 @@ name = "heartwood-sign-test"
 version = "0.1.0"
 edition = "2021"
 description = "Test harness for heartwood-esp32 signing oracle"
+license = "MIT"
 
 [dependencies]
 heartwood-common = { path = "../common", features = ["nip46"] }

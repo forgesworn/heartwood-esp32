@@ -30,9 +30,12 @@ pub struct BackupMaster {
 
 /// The complete backup payload (plaintext, before encryption).
 ///
-/// SECURITY: this struct contains the bridge secret in plaintext.
-/// It must only exist in memory or inside an encrypted backup envelope.
-/// Never serialise to disk, logs, or the wire without encrypting first.
+/// SECURITY: this struct contains the bridge secret in plaintext. Callers
+/// MUST encrypt it (the Argon2id + XChaCha20-Poly1305 backup envelope) before
+/// serialising — nothing in the type system enforces encrypt-before-serialise,
+/// so every new consumer is responsible for upholding it. It must only exist
+/// in memory or inside an encrypted backup envelope. Never serialise to disk,
+/// logs, or the wire without encrypting first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupPayload {
     /// Unix timestamp (seconds) when the backup was created.

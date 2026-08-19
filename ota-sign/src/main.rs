@@ -304,11 +304,24 @@ fn sig_extension(image: &Path) -> String {
 
 /// Write a secret file with owner-only permissions.
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    std::fs::write(path, format!("{contents}\n"))?;
+    // Open with mode 0600 from the start: std::fs::write + a set_permissions
+    // afterthought leaves a world-readable (0644) window under a typical
+    // umask. create_new also means an existing file is never truncated here
+    // (keygen refuses overwrites itself, with a friendlier error).
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        writeln!(f, "{contents}")?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, format!("{contents}\n"))?;
     }
     Ok(())
 }

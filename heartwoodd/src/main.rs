@@ -79,6 +79,16 @@ struct Cli {
     #[arg(long, default_value_t = 3100)]
     api_port: u16,
 
+    /// Management API bind address (default: 127.0.0.1, loopback only).
+    /// The API is plain HTTP authenticated by a bearer token, so LAN exposure
+    /// is opt-in: binding a non-loopback address (e.g. 0.0.0.0) sends the
+    /// token and all management traffic -- keystore passphrase, vault key,
+    /// connect secrets -- across the network in cleartext, readable by any
+    /// passive observer. Prefer an SSH tunnel or a TLS reverse proxy for
+    /// remote access.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: std::net::IpAddr,
+
     /// Sapwood static files directory
     #[arg(long)]
     sapwood_dir: Option<String>,
@@ -109,7 +119,9 @@ struct Cli {
 
     /// Boot PIN (4-8 ASCII digits). Sent as a PIN_UNLOCK frame before SESSION_AUTH.
     /// Omit if the device has no PIN set or is already unlocked.
-    #[arg(long)]
+    /// Prefer the HEARTWOOD_PIN env var over passing on the command line:
+    /// anything in --flags is visible in /proc/<pid>/cmdline to every local user.
+    #[arg(long, env = "HEARTWOOD_PIN", hide_env_values = true)]
     pin: Option<String>,
 
     /// One-shot: enable at-rest vault encryption on the device, then exit.
@@ -366,8 +378,8 @@ fn send_frame_wait_ack(
 /// Perform a one-shot vault enable/disable over serial, then return the
 /// process exit code. For operators without Sapwood: opens the port, runs
 /// PIN unlock (if given) and bridge session auth, sends VAULT_SET, and
-/// reports the device reply. The key is zeroized after use.
-fn run_vault_oneshot(cli: &Cli, vault_key_path: &std::path::Path) -> i32 {
+/// reports the device reply. The key and PIN are zeroized after use.
+fn run_vault_oneshot(cli: &mut Cli, vault_key_path: &std::path::Path) -> i32 {
     let mut port = match RawSerial::open(&cli.port, cli.baud) {
         Ok(p) => p,
         Err(e) => {
@@ -379,8 +391,10 @@ fn run_vault_oneshot(cli: &Cli, vault_key_path: &std::path::Path) -> i32 {
     drain_serial(&mut port);
 
     // PIN unlock must happen before any other frame exchange.
-    if let Some(pin) = &cli.pin {
-        if let Err(e) = unlock_pin(&mut port, pin) {
+    if let Some(mut pin) = cli.pin.take() {
+        let result = unlock_pin(&mut port, &pin);
+        pin.zeroize();
+        if let Err(e) = result {
             log::error!("PIN unlock failed: {e}");
             return 1;
         }
@@ -625,7 +639,7 @@ fn load_or_generate_api_token(data_dir: &str) -> Result<String, String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // Broadcast channel for device log lines (WebSocket streaming to Sapwood).
     // Created early so startup-time serial helpers can forward non-frame bytes
@@ -639,7 +653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One-shot vault operations run over serial and exit without starting
     // the daemon (--vault-enable / --vault-disable).
     if cli.vault_enable || cli.vault_disable {
-        std::process::exit(run_vault_oneshot(&cli, &vault_key_path));
+        std::process::exit(run_vault_oneshot(&mut cli, &vault_key_path));
     }
 
     let relay_list: Vec<String> = cli.relays.split(',')
@@ -673,8 +687,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             drain_serial(&mut port);
 
             // PIN unlock must happen before any other frame exchange.
-            if let Some(pin) = &cli.pin {
-                if let Err(e) = unlock_pin(&mut port, pin) {
+            if let Some(mut pin) = cli.pin.take() {
+                let result = unlock_pin(&mut port, &pin);
+                pin.zeroize();
+                if let Err(e) = result {
                     panic!("PIN unlock failed: {e}");
                 }
             }
@@ -911,17 +927,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_port = cli.api_port;
 
     log::info!("Spawning management API on port {api_port}...");
+    let bind_addr = cli.bind;
     tokio::spawn(async move {
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], api_port));
+        let addr = std::net::SocketAddr::from((bind_addr, api_port));
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
-                log::info!("Management API listening on http://0.0.0.0:{api_port}");
+                if !bind_addr.is_loopback() {
+                    // Loud by design (HD-H1): over plain HTTP the bearer token
+                    // and every management payload cross the wire in cleartext.
+                    log::warn!("============================================================");
+                    log::warn!("WARNING: management API bound to {addr} -- reachable from");
+                    log::warn!("the network over CLEARTEXT HTTP. The API bearer token and");
+                    log::warn!("all management traffic (keystore passphrase, vault key,");
+                    log::warn!("connect secrets) are visible to any passive observer on");
+                    log::warn!("the path, who can then take full control of this signer.");
+                    log::warn!("Prefer an SSH tunnel or a TLS reverse proxy instead.");
+                    log::warn!("============================================================");
+                }
+                log::info!("Management API listening on http://{addr}");
                 if let Err(e) = axum::serve(listener, api_router).await {
                     log::error!("API server error: {e}");
                 }
             }
             Err(e) => {
-                log::error!("Failed to bind API port {api_port}: {e}");
+                log::error!("Failed to bind API address {addr}: {e}");
             }
         }
     });
@@ -948,7 +977,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .authenticator(SignerAuthenticator::new(bunker_keys.clone()))
             .build();
         for url in &relay_list {
-            client.add_relay(url.as_str()).await?;
+            // A relay that fails to be added (bad URL, DNS, ...) must not
+            // kill the daemon -- log it and carry on with the rest (HD-L9).
+            if let Err(e) = client.add_relay(url.as_str()).await {
+                log::error!("Failed to add relay {url}: {e} -- continuing without it");
+            }
         }
         client.connect().await;
 

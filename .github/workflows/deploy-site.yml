@@ -15,11 +15,14 @@ on:
       - ".github/workflows/deploy-site.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Deploy to Hetzner
         env:
@@ -28,7 +31,15 @@ jobs:
           mkdir -p ~/.ssh
           echo "$HETZNER_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H 95.217.39.110 >> ~/.ssh/known_hosts
+          # Pinned host keys for 95.217.39.110 (captured with ssh-keyscan on
+          # 2026-08-19) — replaces the per-run ssh-keyscan TOFU, under which a
+          # MITM during the scan could redirect the rsync. If the box is
+          # reinstalled, re-scan deliberately and update these lines.
+          cat > ~/.ssh/known_hosts <<'EOF'
+          95.217.39.110 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBIvyQS88Q/dHmMqiHA5nlSZ36QoLg8iMJxGAFRxcCatkweNgbz/agQ71UTdf/UQlSu0EebJkyVRAHMrwL/lPB8Y=
+          95.217.39.110 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILClsLCThi06mGvX7qW0RPSzt4UoZsEgdc79drRvMc6n
+          95.217.39.110 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDSyyA3UaBvMmn9mCEsRqLkH7RV4POorSVkPcYv83yULffRsgmS74vmEkE3vOBLCfZERCsT9kkcEnLAXl8ccw+Ai4+XEDjbpHLL/27e+dFS3KFprZq7YWUBr40jn7DpyuK+fgo1gK5iiKQAozaEXYsdS8orifBg0Y1+ZBe6oaViduOCY3MTUFHes7nvaxn4VKjQBvudTTXTzj1YdtHOg7wd70rSrSvgjSGicGFCBPojryFtkwMsw+ljlsFiBOw4VhZRGb9AVlEZSyvVzTHOoTLkB6l5FurOJ8ZIprR8l5oN2+jc0kEkeBUSYLYkTA2RwxaNv0N2oTdOmLtFljwUbbJoFBDZ7zm+j+tmLcyYIUzi6OtDODEjthgNkN5/duWXFMfRwcrAsZwde+N4AuQBjRJ9XwG0MxRJdpx9rHoQKXUiKUm1G59sd99wj9f+gLoi+nPi85qbakEEUR7O1+56oPT3jvmCt3cfXrlbo+U2faaLLptOnqeVLI2uN09461ZzVVk=
+          EOF
           rsync -avz --delete \
             --exclude "deploy/" \
             -e "ssh -i ~/.ssh/deploy_key" \

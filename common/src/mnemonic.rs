@@ -52,12 +52,20 @@ pub fn derive_root_secret(mnemonic: &str, passphrase: &str) -> Result<[u8; 32], 
 
     // All indices are hardened: I = HMAC-SHA512(chain, 0x00 || key || index_be);
     // child_key = (parse256(I_L) + key) mod n; child_chain = I_R.
+    //
+    // BIP-32 edge case: the spec says to retry with the NEXT index when I_L is
+    // zero or ≥ the curve order (or the resulting child key is zero); this code
+    // aborts the derivation instead. The probability is ~2^-127 per level, so
+    // this is a correctness nit, not a live concern — and a loud failure is
+    // preferable to quietly diverging from what other tooling would derive.
     for raw in PATH {
         let index = raw | HARDENED;
-        let mut data = [0u8; 37];
+        // `data` holds the current round's private key across the HMAC call;
+        // wrap it so each round's key material is scrubbed on scope exit.
+        let mut data = Zeroizing::new([0u8; 37]);
         data[1..33].copy_from_slice(&key);
         data[33..37].copy_from_slice(&index.to_be_bytes());
-        let i = Zeroizing::new(hmac_sha512(&chain, &data));
+        let i = Zeroizing::new(hmac_sha512(&chain, data.as_slice()));
 
         let il: [u8; 32] = i[0..32].try_into().unwrap();
         // (parse256(I_L) + key) mod n, via whichever curve backend is active —

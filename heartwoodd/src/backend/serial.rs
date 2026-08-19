@@ -185,6 +185,11 @@ impl SerialBackend {
     /// background log_poller task cannot access the serial mutex while it is held
     /// here.
     ///
+    /// Note: after a request times out, a stale late response may still arrive
+    /// and be consumed by the NEXT request's read. Harmless: encrypted
+    /// responses are bound to the original client's pubkey, so a mismatched
+    /// payload fails decryption downstream rather than crossing sessions.
+    ///
     /// Returns the payload as a UTF-8 string (raw JSON or NIP-44 ciphertext).
     fn read_any_response(
         &self,
@@ -638,11 +643,13 @@ impl SigningBackend for SerialBackend {
             .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
 
         let mut port = self.acquire()?;
+        // 40-second timeout -- the device shows a 30 s physical-hold prompt
+        // before exporting, so the host wait must outlast it.
         let resp = self.send_and_receive(
             &mut port,
             &frame_bytes,
             &[FRAME_TYPE_BACKUP_EXPORT_RESPONSE],
-            10,
+            40,
         )?;
 
         serde_json::from_slice(&resp.payload)
@@ -660,12 +667,14 @@ impl SigningBackend for SerialBackend {
             .map_err(|e| BackendError::Internal(format!("frame build failed: {e:?}")))?;
 
         let mut port = self.acquire()?;
-        // 60-second timeout -- user must press the physical button.
+        // 90-second timeout -- the device can show two sequential 30 s
+        // physical-hold prompts on import (slot summary, then bridge-secret
+        // replacement), and a slow owner must not overrun the host wait.
         let resp = self.send_and_receive(
             &mut port,
             &frame_bytes,
             &[FRAME_TYPE_BACKUP_IMPORT_RESPONSE],
-            60,
+            90,
         )?;
 
         if resp.payload.first().copied() == Some(0x01) {

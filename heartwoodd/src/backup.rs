@@ -11,8 +11,9 @@
 // Atomic writes (write-to-tmp, fsync, rename) prevent partial-write corruption
 // on power loss.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +40,26 @@ const NONCE_LEN: usize = 24;
 pub const DEFAULT_M_COST: u32 = 65_536; // 64 MiB
 pub const DEFAULT_T_COST: u32 = 3;
 pub const DEFAULT_P_COST: u32 = 1;
+
+/// Ceilings for KDF parameters read from an uploaded backup envelope. The
+/// envelope is attacker-controlled (any API-token holder can upload one), and
+/// unbounded values let a crafted file demand absurd Argon2 resources
+/// (m_cost up to ~4 TiB) and abort the daemon (HD-L2).
+const MAX_M_COST: u32 = 262_144; // 256 MiB
+const MAX_T_COST: u32 = 10;
+const MAX_P_COST: u32 = 4;
+
+/// Clamp envelope-supplied KDF parameters to sane ceilings before deriving.
+/// Clamping rather than rejecting keeps honest envelopes working: anything
+/// pushed over the ceiling derives a wrong key and fails at the AEAD step
+/// like any other corrupted backup.
+fn clamp_kdf_params(p: &KdfParams) -> (u32, u32, u32) {
+    (
+        p.m_cost.min(MAX_M_COST),
+        p.t_cost.min(MAX_T_COST),
+        p.p_cost.min(MAX_P_COST),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -169,8 +190,8 @@ pub fn decrypt_backup(
         .decode(&envelope.ciphertext)
         .map_err(|e| format!("base64 ciphertext: {e}"))?;
 
-    let p = &envelope.kdf_params;
-    let key = derive_key(passphrase.as_bytes(), &salt, p.m_cost, p.t_cost, p.p_cost)?;
+    let (m_cost, t_cost, p_cost) = clamp_kdf_params(&envelope.kdf_params);
+    let key = derive_key(passphrase.as_bytes(), &salt, m_cost, t_cost, p_cost)?;
 
     if nonce_bytes.len() != NONCE_LEN {
         return Err(format!(
@@ -276,8 +297,13 @@ pub fn write_passphrase(path: &Path, passphrase: &str, api_token: &str) -> Resul
 
     let tmp_path = path.with_extension("tmp");
     {
-        let mut file =
-            File::create(&tmp_path).map_err(|e| format!("create passphrase tmp file: {e}"))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("create passphrase tmp file: {e}"))?;
         file.write_all(json.as_bytes())
             .map_err(|e| format!("write passphrase tmp file: {e}"))?;
         file.flush()
@@ -299,7 +325,9 @@ pub fn write_passphrase(path: &Path, passphrase: &str, api_token: &str) -> Resul
 /// Write a `BackupEnvelope` to `path` atomically.
 ///
 /// Writes to `path.tmp`, fsyncs, then renames over `path`. This prevents
-/// a partial write from leaving a corrupted backup after power loss.
+/// a partial write from leaving a corrupted backup after power loss. The tmp
+/// file is created with mode 0600 (matching api-token/vault.key): encrypted
+/// or not, it is offline-crackable material (HD-L6).
 pub fn write_backup(path: &Path, envelope: &BackupEnvelope) -> Result<(), String> {
     let json = serde_json::to_string_pretty(envelope)
         .map_err(|e| format!("serialise backup envelope: {e}"))?;
@@ -307,8 +335,13 @@ pub fn write_backup(path: &Path, envelope: &BackupEnvelope) -> Result<(), String
     let tmp_path = path.with_extension("tmp");
 
     {
-        let mut file =
-            File::create(&tmp_path).map_err(|e| format!("create backup tmp file: {e}"))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("create backup tmp file: {e}"))?;
         file.write_all(json.as_bytes())
             .map_err(|e| format!("write backup tmp file: {e}"))?;
         file.flush()
@@ -510,5 +543,58 @@ mod tests {
 
         let status = backup_status(&path);
         assert!(status.is_none());
+    }
+
+    #[test]
+    fn kdf_params_are_clamped_to_ceilings() {
+        // Attacker-crafted envelope values are pulled down to the ceilings
+        // (HD-L2) rather than fed to Argon2 unbounded.
+        let hostile = KdfParams {
+            m_cost: u32::MAX,
+            t_cost: u32::MAX,
+            p_cost: u32::MAX,
+        };
+        assert_eq!(
+            clamp_kdf_params(&hostile),
+            (MAX_M_COST, MAX_T_COST, MAX_P_COST)
+        );
+
+        // Honest envelopes (at or below the ceilings) pass through untouched.
+        let honest = KdfParams {
+            m_cost: DEFAULT_M_COST,
+            t_cost: DEFAULT_T_COST,
+            p_cost: DEFAULT_P_COST,
+        };
+        assert_eq!(
+            clamp_kdf_params(&honest),
+            (DEFAULT_M_COST, DEFAULT_T_COST, DEFAULT_P_COST)
+        );
+    }
+
+    #[test]
+    fn backup_file_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.json");
+
+        let payload = test_payload();
+        let env = encrypt_backup(&payload, "pass", M, T, P).unwrap();
+        write_backup(&path, &env).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn passphrase_file_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup-passphrase.json");
+        write_passphrase(&path, "my-secret-passphrase", "api-token-abc").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

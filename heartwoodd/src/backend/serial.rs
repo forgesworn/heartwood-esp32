@@ -185,6 +185,11 @@ impl SerialBackend {
     /// background log_poller task cannot access the serial mutex while it is held
     /// here.
     ///
+    /// Note: after a request times out, a stale late response may still arrive
+    /// and be consumed by the NEXT request's read. Harmless: encrypted
+    /// responses are bound to the original client's pubkey, so a mismatched
+    /// payload fails decryption downstream rather than crossing sessions.
+    ///
     /// Returns the payload as a UTF-8 string (raw JSON or NIP-44 ciphertext).
     fn read_any_response(
         &self,

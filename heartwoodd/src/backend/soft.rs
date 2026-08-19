@@ -2,7 +2,8 @@
 //
 // Soft mode: local NIP-46 signing using k256. Keys are held in an
 // Argon2id-encrypted keyfile; the decrypted state lives in memory behind an
-// RwLock and is zeroized on lock.
+// RwLock, with master secrets stored zeroizing so they are scrubbed from
+// the heap on lock (see SoftMaster's Drop impl in soft_store.rs).
 //
 // The NIP-44/NIP-46 pipeline mirrors what the ESP32 firmware does, but runs
 // entirely on the Pi -- decrypt the client request, evaluate slot policy,
@@ -16,7 +17,7 @@ use std::time::Instant;
 use k256::schnorr::signature::hazmat::PrehashSigner;
 use serde_json::Value;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use heartwood_common::encoding::encode_npub;
 use heartwood_common::hex::hex_encode;
@@ -37,6 +38,12 @@ use super::{BackendError, SigningBackend, Tier};
 
 /// TTL for pending approvals (seconds).
 const APPROVAL_TTL_SECS: u64 = 60;
+
+/// Maximum pending approvals held at once. The queue is fillable by any
+/// unauthenticated relay user who knows a (public) master pubkey, so it must
+/// stay bounded: expired entries are pruned on every insert and a full queue
+/// evicts the oldest entry (HD-M1).
+const MAX_PENDING_APPROVALS: usize = 100;
 
 /// Default keystore filename.
 const KEYSTORE_FILE: &str = "keystore.json";
@@ -102,8 +109,53 @@ impl SoftBackend {
     /// Wire the channel that carries approved-response envelopes to the relay
     /// publisher. Called once from main before the backend is shared.
     pub fn set_response_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
-        let mut guard = self.response_tx.write().expect("response_tx lock poisoned");
+        let mut guard = self.response_tx.write().unwrap_or_else(|e| e.into_inner());
         *guard = Some(tx);
+    }
+
+    // -- Lock helpers ----------------------------------------------------------
+    //
+    // Every guard recovers from poisoning: a panicking holder must not wedge
+    // soft mode (all subsequent API calls failing on a poisoned lock) for the
+    // rest of the daemon's uptime (HD-L5). The guarded state is plain data
+    // with no cross-field invariants maintained mid-mutation, so resuming
+    // after a panic is safe.
+
+    fn state_read(&self) -> std::sync::RwLockReadGuard<'_, Option<UnlockedState>> {
+        self.state.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn state_write(&self) -> std::sync::RwLockWriteGuard<'_, Option<UnlockedState>> {
+        self.state.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn approvals_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<String, PendingApproval>> {
+        self.approvals.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queue a pending approval. Expired entries are pruned on every insert
+    /// (not only on read), and a full queue evicts the oldest entry before
+    /// inserting, so the map stays bounded under relay-side flooding (HD-M1).
+    fn queue_approval(&self, approval: PendingApproval) {
+        let mut approvals = self.approvals_write();
+        let now = Instant::now();
+        approvals
+            .retain(|_, v| now.duration_since(v.created_at).as_secs() < APPROVAL_TTL_SECS);
+        while approvals.len() >= MAX_PENDING_APPROVALS {
+            let oldest = approvals
+                .iter()
+                .min_by_key(|(_, v)| v.created_at)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(id) => {
+                    approvals.remove(&id);
+                }
+                None => break,
+            }
+        }
+        approvals.insert(approval.id.clone(), approval);
     }
 
     // -- Private helpers -----------------------------------------------------
@@ -320,7 +372,7 @@ impl SoftBackend {
         created_at: u64,
         ciphertext: &str,
     ) -> Result<String, BackendError> {
-        let guard = self.state.read().expect("state lock poisoned");
+        let guard = self.state_read();
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
 
         let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
@@ -379,9 +431,7 @@ impl SigningBackend for SoftBackend {
     }
 
     fn signing_pubkeys(&self) -> Vec<[u8; 32]> {
-        let Ok(guard) = self.state.read() else {
-            return Vec::new();
-        };
+        let guard = self.state_read();
         let Some(state) = guard.as_ref() else {
             return Vec::new();
         };
@@ -398,17 +448,23 @@ impl SigningBackend for SoftBackend {
     }
 
     fn is_locked(&self) -> bool {
-        self.state
-            .read()
-            .expect("state lock poisoned")
-            .is_none()
+        self.state_read().is_none()
     }
 
     fn unlock(&self, passphrase: &str) -> Result<(), BackendError> {
         let path = self.keyfile_path();
 
         if !path.exists() {
-            // First run: create an empty keystore.
+            // First run: create an empty keystore. Enforce the same minimum
+            // passphrase length as the backup passphrase policy (HD-L7).
+            // Existing keystores always unlock -- a weak passphrase cannot be
+            // tightened retroactively from here.
+            if passphrase.len() < 8 {
+                return Err(BackendError::Internal(
+                    "passphrase must be at least 8 characters".into(),
+                ));
+            }
+
             std::fs::create_dir_all(&self.data_dir)
                 .map_err(|e| BackendError::Internal(format!("create data_dir: {e}")))?;
 
@@ -429,7 +485,7 @@ impl SigningBackend for SoftBackend {
             let (keystore, key) = soft_store::decrypt_keystore(&envelope, passphrase)
                 .map_err(|e| BackendError::Internal(format!("decrypt new keystore: {e}")))?;
 
-            let mut guard = self.state.write().expect("state lock poisoned");
+            let mut guard = self.state_write();
             *guard = Some(UnlockedState {
                 keystore,
                 encryption_key: key,
@@ -452,7 +508,7 @@ impl SigningBackend for SoftBackend {
         let (keystore, key) = soft_store::decrypt_keystore(&envelope, passphrase)
             .map_err(|_| BackendError::Internal("wrong passphrase or corrupted keystore".into()))?;
 
-        let mut guard = self.state.write().expect("state lock poisoned");
+        let mut guard = self.state_write();
         *guard = Some(UnlockedState {
             keystore,
             encryption_key: key,
@@ -465,7 +521,7 @@ impl SigningBackend for SoftBackend {
     }
 
     fn lock(&self) -> Result<(), BackendError> {
-        let mut guard = self.state.write().expect("state lock poisoned");
+        let mut guard = self.state_write();
         *guard = None;
         Ok(())
     }
@@ -499,7 +555,7 @@ impl SigningBackend for SoftBackend {
         created_at: u64,
         ciphertext: &str,
     ) -> Result<String, BackendError> {
-        let guard = self.state.read().expect("state lock poisoned");
+        let guard = self.state_read();
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
 
         let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
@@ -550,7 +606,7 @@ impl SigningBackend for SoftBackend {
     // -- Master management ---------------------------------------------------
 
     fn list_masters(&self) -> Result<Vec<Value>, BackendError> {
-        let guard = self.state.read().expect("state lock poisoned");
+        let guard = self.state_read();
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
 
         let mut result = Vec::new();
@@ -579,7 +635,7 @@ impl SigningBackend for SoftBackend {
         let mut secret_bytes = [0u8; 32];
         getrandom::getrandom(&mut secret_bytes)
             .map_err(|e| BackendError::Internal(format!("getrandom: {e}")))?;
-        let secret_hex = hex_encode(&secret_bytes);
+        let mut secret_hex = hex_encode(&secret_bytes);
         // Zeroize the local copy after encoding.
         let mut secret_zeroize = Zeroizing::new(secret_bytes);
         *secret_zeroize = [0u8; 32];
@@ -597,22 +653,23 @@ impl SigningBackend for SoftBackend {
 
         let path = self.keyfile_path();
         let slot_index = {
-            let guard = self.state.read().expect("state lock poisoned");
+            let guard = self.state_read();
             let state = guard.as_ref().ok_or(BackendError::Locked)?;
-            // Assign the next available slot index.
-            let max_slot = state
-                .keystore
-                .masters
-                .iter()
-                .map(|m| m.slot)
-                .max()
-                .map(|s| s + 1)
-                .unwrap_or(0);
-            max_slot
+            // Lowest unused slot index, mirroring policy::next_slot_index:
+            // `max + 1` wraps to 0 after 255 masters (a duplicate slot) and
+            // never fills holes left by removed masters (HD-L8).
+            let mut free = None;
+            for i in 0..=u8::MAX {
+                if !state.keystore.masters.iter().any(|m| m.slot == i) {
+                    free = Some(i);
+                    break;
+                }
+            }
+            free.ok_or_else(|| BackendError::Internal("no free master slot index".into()))?
         };
 
-        {
-            let mut guard = self.state.write().expect("state lock poisoned");
+        let persist_result = {
+            let mut guard = self.state_write();
             let state = guard.as_mut().ok_or(BackendError::Locked)?;
             state.keystore.masters.push(SoftMaster {
                 slot: slot_index,
@@ -621,8 +678,12 @@ impl SigningBackend for SoftBackend {
                 mode: "soft".to_string(),
                 connection_slots: vec![],
             });
-            Self::persist(state, &path)?;
-        }
+            Self::persist(state, &path)
+        };
+        // The in-keystore copy is scrubbed by SoftMaster's Drop; scrub the
+        // local copy regardless of whether the persist succeeded.
+        secret_hex.zeroize();
+        persist_result?;
 
         Ok(serde_json::json!({
             "index": slot_index,
@@ -639,7 +700,7 @@ impl SigningBackend for SoftBackend {
     /// token is the authority. The in-memory secret bytes are scrubbed as the
     /// entry drops out of the keystore.
     fn remove_master(&self, slot: u8) -> Result<(), BackendError> {
-        let mut guard = self.state.write().expect("state lock poisoned");
+        let mut guard = self.state_write();
         let state = guard.as_mut().ok_or(BackendError::Locked)?;
 
         let before = state.keystore.masters.len();
@@ -655,7 +716,7 @@ impl SigningBackend for SoftBackend {
     // -- Connection slot management ------------------------------------------
 
     fn list_slots(&self, master: u8) -> Result<Value, BackendError> {
-        let guard = self.state.read().expect("state lock poisoned");
+        let guard = self.state_read();
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
 
         let m = state
@@ -685,7 +746,7 @@ impl SigningBackend for SoftBackend {
 
         let path = self.keyfile_path();
         let new_slot = {
-            let mut guard = self.state.write().expect("state lock poisoned");
+            let mut guard = self.state_write();
             let state = guard.as_mut().ok_or(BackendError::Locked)?;
 
             let m = state
@@ -731,7 +792,7 @@ impl SigningBackend for SoftBackend {
     fn update_slot(&self, master: u8, index: u8, patch: Value) -> Result<Value, BackendError> {
         let path = self.keyfile_path();
         let updated_slot = {
-            let mut guard = self.state.write().expect("state lock poisoned");
+            let mut guard = self.state_write();
             let state = guard.as_mut().ok_or(BackendError::Locked)?;
 
             let m = state
@@ -780,7 +841,7 @@ impl SigningBackend for SoftBackend {
 
     fn revoke_slot(&self, master: u8, index: u8) -> Result<Value, BackendError> {
         let path = self.keyfile_path();
-        let mut guard = self.state.write().expect("state lock poisoned");
+        let mut guard = self.state_write();
         let state = guard.as_mut().ok_or(BackendError::Locked)?;
 
         let m = state
@@ -804,7 +865,7 @@ impl SigningBackend for SoftBackend {
     }
 
     fn get_slot_uri(&self, master: u8, index: u8, relays: &[String]) -> Result<String, BackendError> {
-        let guard = self.state.read().expect("state lock poisoned");
+        let guard = self.state_read();
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
 
         let m = state
@@ -840,7 +901,7 @@ impl SigningBackend for SoftBackend {
 
     fn list_approvals(&self) -> Vec<Value> {
         let now = Instant::now();
-        let mut approvals = self.approvals.write().expect("approvals lock poisoned");
+        let mut approvals = self.approvals_write();
 
         // Prune expired entries.
         approvals.retain(|_, v| {
@@ -865,7 +926,7 @@ impl SigningBackend for SoftBackend {
 
     fn approve_request(&self, id: &str) -> Result<(), BackendError> {
         let approval = {
-            let mut approvals = self.approvals.write().expect("approvals lock poisoned");
+            let mut approvals = self.approvals_write();
             approvals
                 .remove(id)
                 .ok_or_else(|| BackendError::Internal(format!("approval {id} not found")))?
@@ -888,7 +949,11 @@ impl SigningBackend for SoftBackend {
         )?;
 
         // Hand the signed envelope to the relay publisher task.
-        let tx = self.response_tx.read().expect("response_tx lock poisoned").clone();
+        let tx = self
+            .response_tx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         match tx {
             Some(tx) => {
                 if tx.send(signed_event_json).is_err() {
@@ -901,7 +966,7 @@ impl SigningBackend for SoftBackend {
     }
 
     fn deny_request(&self, id: &str) -> Result<(), BackendError> {
-        let mut approvals = self.approvals.write().expect("approvals lock poisoned");
+        let mut approvals = self.approvals_write();
         if approvals.remove(id).is_some() {
             Ok(())
         } else {
@@ -917,7 +982,7 @@ impl SigningBackend for SoftBackend {
             std::fs::remove_file(&path)
                 .map_err(|e| BackendError::Internal(format!("delete keystore: {e}")))?;
         }
-        let mut guard = self.state.write().expect("state lock poisoned");
+        let mut guard = self.state_write();
         *guard = None;
         Ok(())
     }
@@ -931,7 +996,7 @@ impl SigningBackend for SoftBackend {
     fn backup_export(&self) -> Result<heartwood_common::backup::BackupPayload, BackendError> {
         use heartwood_common::backup::{BackupMaster, BackupPayload};
 
-        let guard = self.state.read().expect("state lock poisoned");
+        let guard = self.state_read();
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
 
         let mut masters = Vec::new();
@@ -965,7 +1030,7 @@ impl SigningBackend for SoftBackend {
         payload: &heartwood_common::backup::BackupPayload,
     ) -> Result<(), BackendError> {
         let path = self.keyfile_path();
-        let mut guard = self.state.write().expect("state lock poisoned");
+        let mut guard = self.state_write();
         let state = guard.as_mut().ok_or(BackendError::Locked)?;
 
         for backup_master in &payload.masters {
@@ -1010,7 +1075,7 @@ impl SoftBackend {
         // Take a read lock to fetch what we need, then release before any
         // potential write that persist() would need.
         let (master_secret, slot_info, master_slot_index) = {
-            let guard = self.state.read().expect("state lock poisoned");
+            let guard = self.state_read();
             let state = guard.as_ref().ok_or(BackendError::Locked)?;
 
             let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
@@ -1073,7 +1138,7 @@ impl SoftBackend {
                 None => log::info!("soft: sign_event (unparsed kind) from {client_short}…{slot_suffix}"),
             }
         } else {
-            log::info!("soft: {} from {client_short}…{slot_suffix}", req.method);
+            log::info!("soft: {} from {client_short}…{slot_suffix}", log_safe_method(&method));
         }
 
         // For connect: validate secret and bind the slot.
@@ -1087,7 +1152,7 @@ impl SoftBackend {
 
             // Find the slot by secret and bind it to this client pubkey.
             if !provided_secret.is_empty() {
-                let mut guard = self.state.write().expect("state lock poisoned");
+                let mut guard = self.state_write();
                 let state = guard.as_mut().ok_or(BackendError::Locked)?;
                 let master_mut = state
                     .keystore
@@ -1123,7 +1188,7 @@ impl SoftBackend {
             }
 
             // Re-read the master after the write to get the updated slot.
-            let guard = self.state.read().expect("state lock poisoned");
+            let guard = self.state_read();
             let state = guard.as_ref().ok_or(BackendError::Locked)?;
             let master = state
                 .keystore
@@ -1143,7 +1208,7 @@ impl SoftBackend {
 
         // Always-auto-approve methods (ping, get_public_key, heartwood_list_identities, etc.).
         if method.always_auto_approve() {
-            let guard = self.state.read().expect("state lock poisoned");
+            let guard = self.state_read();
             let state = guard.as_ref().ok_or(BackendError::Locked)?;
             let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
                 .ok_or_else(|| BackendError::Internal("master not found".into()))?;
@@ -1164,7 +1229,7 @@ impl SoftBackend {
             None => {
                 log::warn!(
                     "soft: {} from {client_short}… QUEUED — no connection slot bound to this client",
-                    req.method
+                    log_safe_method(&method)
                 );
                 // No slot for this client -- queue for approval.
                 let approval_id = Uuid::new_v4().to_string();
@@ -1180,8 +1245,7 @@ impl SoftBackend {
                     client_pubkey: *client_pubkey,
                     ciphertext: ciphertext.to_string(),
                 };
-                let mut approvals = self.approvals.write().expect("approvals lock poisoned");
-                approvals.insert(approval_id.clone(), approval);
+                self.queue_approval(approval);
                 return Err(BackendError::PendingApproval(approval_id));
             }
         };
@@ -1193,7 +1257,7 @@ impl SoftBackend {
         if !preapproved && !method_allowed {
             log::warn!(
                 "soft: {} from {client_short}… QUEUED — method not in slot \"{slot_label}\" policy",
-                req.method,
+                log_safe_method(&method),
             );
             let approval_id = Uuid::new_v4().to_string();
             let approval = PendingApproval {
@@ -1208,8 +1272,7 @@ impl SoftBackend {
                 client_pubkey: *client_pubkey,
                 ciphertext: ciphertext.to_string(),
             };
-            let mut approvals = self.approvals.write().expect("approvals lock poisoned");
-            approvals.insert(approval_id.clone(), approval);
+            self.queue_approval(approval);
             return Err(BackendError::PendingApproval(approval_id));
         }
 
@@ -1242,14 +1305,13 @@ impl SoftBackend {
                         client_pubkey: *client_pubkey,
                         ciphertext: ciphertext.to_string(),
                     };
-                    let mut approvals = self.approvals.write().expect("approvals lock poisoned");
-                    approvals.insert(approval_id.clone(), approval);
+                    self.queue_approval(approval);
                     return Err(BackendError::PendingApproval(approval_id));
                 }
             } else if !slot.auto_approve {
                 log::warn!(
                     "soft: {} from {client_short}… QUEUED — auto-approve disabled (slot \"{}\")",
-                    req.method,
+                    log_safe_method(&method),
                     slot.label
                 );
                 let approval_id = Uuid::new_v4().to_string();
@@ -1265,14 +1327,13 @@ impl SoftBackend {
                     client_pubkey: *client_pubkey,
                     ciphertext: ciphertext.to_string(),
                 };
-                let mut approvals = self.approvals.write().expect("approvals lock poisoned");
-                approvals.insert(approval_id.clone(), approval);
+                self.queue_approval(approval);
                 return Err(BackendError::PendingApproval(approval_id));
             }
         }
 
         // Policy passed -- process the request.
-        let guard = self.state.read().expect("state lock poisoned");
+        let guard = self.state_read();
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
         let master = Self::find_master_by_pubkey(&state.keystore, master_pubkey)
             .ok_or_else(|| BackendError::Internal("master not found".into()))?;
@@ -1280,12 +1341,12 @@ impl SoftBackend {
         if preapproved {
             log::info!(
                 "soft: {} from {client_short}… APPROVED BY OPERATOR{slot_suffix}",
-                req.method,
+                log_safe_method(&method),
             );
         } else {
             log::info!(
                 "soft: {} from {client_short}… APPROVED (slot \"{slot_label}\")",
-                req.method,
+                log_safe_method(&method),
             );
         }
 
@@ -1341,6 +1402,20 @@ fn derive_x_only_bytes(secret_key_bytes: &[u8; 32]) -> Result<[u8; 32], String> 
 fn derive_pubkey_hex(secret_key_bytes: &[u8; 32]) -> Result<String, String> {
     let pk = derive_x_only_bytes(secret_key_bytes)?;
     Ok(hex_encode(&pk))
+}
+
+/// Render a parsed NIP-46 method for logs. Known methods are static strings;
+/// an unknown method carries attacker-controlled text, which is truncated and
+/// Debug-escaped so embedded control characters (e.g. newlines) cannot forge
+/// journal lines (HD-L4).
+fn log_safe_method(method: &Nip46Method) -> String {
+    match method {
+        Nip46Method::Unknown(raw) => {
+            let truncated: String = raw.chars().take(32).collect();
+            format!("{truncated:?}")
+        }
+        known => known.as_str().to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1778,5 +1853,90 @@ mod tests {
 
         // The queue is empty: approval did not re-queue the request.
         assert!(backend.list_approvals().is_empty());
+    }
+
+    fn make_approval(id: &str, age_secs: u64) -> PendingApproval {
+        PendingApproval {
+            id: id.to_string(),
+            method: "sign_event".to_string(),
+            event_kind: Some(1),
+            content_preview: String::new(),
+            slot_label: String::new(),
+            master_slot: 0,
+            created_at: Instant::now()
+                .checked_sub(std::time::Duration::from_secs(age_secs))
+                .unwrap_or_else(Instant::now),
+            master_pubkey: [0u8; 32],
+            client_pubkey: [0u8; 32],
+            ciphertext: String::new(),
+        }
+    }
+
+    #[test]
+    fn approval_queue_is_capped_and_prunes_expired_on_insert() {
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+
+        // An expired entry is pruned on the next insert, not only on read.
+        backend.queue_approval(make_approval("expired", APPROVAL_TTL_SECS + 10));
+
+        // Flood well past the cap.
+        for i in 0..(MAX_PENDING_APPROVALS + 50) {
+            backend.queue_approval(make_approval(&format!("flood-{i}"), 0));
+        }
+
+        let guard = backend.approvals.read().unwrap();
+        assert_eq!(guard.len(), MAX_PENDING_APPROVALS);
+        assert!(!guard.contains_key("expired"), "expired entry not pruned");
+        // The oldest flooded entries were evicted first.
+        assert!(!guard.contains_key("flood-0"), "oldest entry not evicted");
+        assert!(guard.contains_key(&format!("flood-{}", MAX_PENDING_APPROVALS + 49)));
+    }
+
+    #[test]
+    fn first_run_unlock_rejects_short_passphrase() {
+        let dir = TempDir::new().unwrap();
+        let backend = SoftBackend::new(dir.path().to_path_buf());
+
+        // No keyfile yet: first-run creation enforces the same >= 8 character
+        // floor as the backup passphrase policy (HD-L7).
+        let err = backend.unlock("short").unwrap_err();
+        match err {
+            BackendError::Internal(msg) => assert!(msg.contains("at least 8")),
+            other => panic!("expected Internal error, got {other:?}"),
+        }
+        // Rejection happened before any keyfile was created.
+        assert!(!dir.path().join(KEYSTORE_FILE).exists());
+        assert!(backend.is_locked());
+    }
+
+    #[test]
+    fn create_master_reuses_lowest_free_slot() {
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+
+        let m0 = backend.create_master("m0", 12).unwrap();
+        let m1 = backend.create_master("m1", 12).unwrap();
+        assert_eq!(m0["index"].as_u64().unwrap(), 0);
+        assert_eq!(m1["index"].as_u64().unwrap(), 1);
+
+        // Removing slot 0 leaves a hole; the next create fills it rather
+        // than taking max + 1 (HD-L8).
+        backend.remove_master(0).unwrap();
+        let m2 = backend.create_master("m2", 12).unwrap();
+        assert_eq!(m2["index"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn log_safe_method_escapes_unknown_methods() {
+        // Known methods render as their plain name.
+        assert_eq!(log_safe_method(&Nip46Method::Ping), "ping");
+
+        // Unknown (attacker-controlled) text is escaped and truncated so it
+        // cannot forge journal lines (HD-L4).
+        let evil = Nip46Method::from_str("sign_event\nForged journal line");
+        let rendered = log_safe_method(&evil);
+        assert!(!rendered.contains('\n'), "raw newline leaked into log: {rendered}");
+        assert!(rendered.len() <= 34, "not truncated: {rendered}");
     }
 }

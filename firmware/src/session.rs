@@ -5,6 +5,9 @@
 
 use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+// AtomicU32, not 64: the Xtensa targets have no 64-bit atomics; uptime
+// seconds wrap in ~136 years, which this cooldown will never see.
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use heartwood_common::types::{
     FRAME_TYPE_ACK, FRAME_TYPE_NACK, FRAME_TYPE_SESSION_ACK,
@@ -14,6 +17,15 @@ use crate::policy::PolicyEngine;
 use crate::protocol;
 
 const NVS_BRIDGE_SECRET_KEY: &str = "bridge_secret";
+
+/// Cooldown after a failed SESSION_AUTH: further attempts inside the window
+/// are refused unevaluated, so an unauthenticated USB peer cannot brute-force
+/// the 32-byte secret at frame rate nor use failures to keep the bridge
+/// deauthenticated (FW-M1). Boot-time seconds; a reboot resets it, which is
+/// fine — the secret is 256 bits, the cooldown is a nuisance control, and the
+/// compare is constant-time either way.
+const AUTH_FAILURE_COOLDOWN_SECS: u64 = 5;
+static AUTH_COOLDOWN_UNTIL: AtomicU32 = AtomicU32::new(0);
 
 /// Read the bridge authentication secret from NVS.
 pub fn read_bridge_secret(nvs: &EspNvs<NvsDefault>) -> Option<[u8; 32]> {
@@ -55,12 +67,23 @@ pub fn verify_bridge_secret(payload: &[u8], nvs: &EspNvs<NvsDefault>) -> Option<
 /// The bridge sends its 32-byte shared secret; we compare it in constant time
 /// against the value stored in NVS. On success we mark the policy engine as
 /// authenticated and reply with a SESSION_ACK (0x00 = success).
+///
+/// A failed attempt NEVER clears an established authentication (FW-M1):
+/// otherwise any unauthenticated USB peer could kick a working bridge off
+/// and re-open the plaintext path underneath it. Failures also start a short
+/// cooldown during which attempts are refused unevaluated.
 pub fn handle_auth(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
     nvs: &EspNvs<NvsDefault>,
     policy_engine: &mut PolicyEngine,
 ) {
+    let now = crate::uptime_s() as u32;
+    if now < AUTH_COOLDOWN_UNTIL.load(Ordering::Relaxed) {
+        log::warn!("SESSION_AUTH refused — failure cooldown active");
+        protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x01]);
+        return;
+    }
     match verify_bridge_secret(payload, nvs) {
         Some(true) => {
             log::info!("Bridge authenticated successfully");
@@ -69,7 +92,10 @@ pub fn handle_auth(
         }
         Some(false) => {
             log::warn!("Bridge authentication failed — wrong secret");
-            policy_engine.bridge_authenticated = false;
+            AUTH_COOLDOWN_UNTIL.store(
+                now + AUTH_FAILURE_COOLDOWN_SECS as u32,
+                Ordering::Relaxed,
+            );
             protocol::write_frame(usb, FRAME_TYPE_SESSION_ACK, &[0x01]); // 0x01 = failed
         }
         None => {
@@ -122,7 +148,10 @@ pub fn handle_set_bridge_secret(
     }
 
     let secret: [u8; 32] = payload.try_into().unwrap();
-    match write_bridge_secret(nvs, &secret) {
+    let written = write_bridge_secret(nvs, &secret);
+    let mut secret = secret;
+    zeroize::Zeroize::zeroize(&mut secret);
+    match written {
         Ok(()) => {
             log::info!("Bridge secret written to NVS");
             crate::oled::show_change_done(display, "Bridge secret set", "Bridge can authenticate");

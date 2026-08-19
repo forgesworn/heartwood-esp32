@@ -136,6 +136,15 @@ pub fn read_master_count(nvs: &EspNvs<NvsDefault>) -> u8 {
     }
 }
 
+/// Whether at-rest seed encryption is active for ANY provisioned slot (the
+/// durable `m<slot>_seed_enc` blob is the source of truth — runtime `locked`
+/// flags clear at unlock while the ciphertext stays). While this holds, every
+/// seed on flash must be ciphertext; see `provision::store_master` (FW-M5).
+pub fn encryption_at_rest_active(nvs: &EspNvs<NvsDefault>) -> bool {
+    let count = read_master_count(nvs);
+    (0..count).any(|slot| read_secret_enc(nvs, slot).is_some())
+}
+
 /// Write the master count to NVS.
 fn write_master_count(nvs: &mut EspNvs<NvsDefault>, count: u8) -> Result<(), &'static str> {
     nvs.set_blob("master_count", &[count])

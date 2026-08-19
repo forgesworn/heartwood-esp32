@@ -53,6 +53,10 @@ fn denied_before_dispatch(
 /// A public relay is not an approval queue. Only a client already bound to a
 /// slot may make the device wait for a physical decision; otherwise strangers
 /// can serialize fresh keys/ids into an endless series of 30-second prompts.
+/// `heartwood_list_identities` joins the denial set not for the button but
+/// because it enumerates the per-boot identity cache (persona purposes/names,
+/// child npubs) — metadata an unbound relay peer has no business reading
+/// (FW-L5).
 fn unbound_remote_request_denied(
     has_client: bool,
     client_is_bound: bool,
@@ -61,6 +65,7 @@ fn unbound_remote_request_denied(
     has_client
         && !client_is_bound
         && (matches!(method, nip46::Nip46Method::SignEvent)
+            || matches!(method, nip46::Nip46Method::HeartwoodListIdentities)
             || method.always_requires_button()
             || is_note_method(method))
 }
@@ -715,6 +720,34 @@ fn dispatch_inner(
         return build_error_json(&request.id, -1, "unauthorised");
     }
 
+    // Zero-trust USB (FW-M2): with a bridge secret provisioned, an
+    // unauthenticated plaintext-USB peer (`has_client == false`) must not use
+    // the master as a NIP-44/04 decrypt oracle nor mutate the persisted
+    // persona registry — those need SESSION_AUTH first. A device with NO
+    // bridge secret deliberately keeps this open direct-USB tier: a locally
+    // cabled app is then the whole trust anchor (physical-possession
+    // semantics), which the tethered setup flows rely on.
+    if !has_client
+        && !policy_engine.bridge_authenticated
+        && matches!(
+            method,
+            nip46::Nip46Method::Nip44Decrypt
+                | nip46::Nip46Method::Nip04Decrypt
+                | nip46::Nip46Method::HeartwoodDerive
+                | nip46::Nip46Method::HeartwoodDerivePersona
+                | nip46::Nip46Method::HeartwoodRemovePersona
+                | nip46::Nip46Method::HeartwoodRenamePersona
+                | nip46::Nip46Method::HeartwoodRecover
+        )
+        && crate::session::read_bridge_secret(nvs).is_some()
+    {
+        log::warn!(
+            "{}: refused — bridge secret provisioned; USB channel needs SESSION_AUTH first",
+            request.method
+        );
+        return build_error_json(&request.id, -1, "unauthorised");
+    }
+
     // A ButtonRequired tier is meaningful only if the handler actually stops
     // for the button. Keep this single gate before dispatch so a new extension
     // cannot accidentally mutate state merely by omitting approval code from
@@ -890,6 +923,12 @@ fn dispatch_inner(
                         let slot_index = slot.slot_index;
                         let slot_label = slot.label.clone();
                         let was_signing = slot.signing_approved;
+                        // The authority that matters for a rebind (DS-H2): can
+                        // this slot sign RIGHT NOW. A stored signing grant whose
+                        // method ceiling no longer lists sign_event is not
+                        // currently exercisable and keeps the flash-only path.
+                        let slot_can_sign =
+                            slot.allowed_methods.iter().any(|m| m == "sign_event");
                         let old_pubkey = slot.current_pubkey.clone();
 
                         match &old_pubkey {
@@ -928,8 +967,72 @@ fn dispatch_inner(
                             }
                             Some(_old) => {
                                 // New ephemeral key for existing slot.
-                                if was_signing {
-                                    // OLED flash for signing-approved slots.
+                                //
+                                // DS-H2: a slot whose policy currently includes
+                                // sign_event must never SILENTLY re-bind to a
+                                // new client key — the slot secret is a bearer
+                                // credential, so a captured bunker URI would
+                                // otherwise inherit the slot's whole approved
+                                // signing authority with only a transient OLED
+                                // flash. The swap now needs the same physical
+                                // hold as any other authority grant. (Spec
+                                // deviation, deliberate: connect-slots-design
+                                // §"Connect Flow" specified the flash; the audit
+                                // showed the flash is not an approval.)
+                                if slot_can_sign {
+                                    let preview = format!("rebind '{slot_label}'");
+                                    match approval {
+                                        ApprovalDecision::Deferred => {
+                                            *deferred = Some(Box::new(DeferredAsk {
+                                                card: AskCard::Extension {
+                                                    master_label: master_label.to_string(),
+                                                    method: request.method.clone(),
+                                                    preview,
+                                                },
+                                                request,
+                                                event: None,
+                                            }));
+                                            return String::new();
+                                        }
+                                        ApprovalDecision::ButtonApproved => {
+                                            log::info!(
+                                                "connect: slot {slot_index} rebind dispatching on a hold already completed"
+                                            );
+                                        }
+                                        ApprovalDecision::Interactive => {
+                                            let result = crate::approval::run_approval_loop(
+                                                display,
+                                                buttons,
+                                                APPROVAL_TIMEOUT_SECS,
+                                                |d, remaining| {
+                                                    crate::oled::show_master_sign_request(
+                                                        d,
+                                                        master_label,
+                                                        "connect",
+                                                        None,
+                                                        &preview,
+                                                        remaining,
+                                                    );
+                                                },
+                                            );
+                                            if let Some(response) =
+                                                extension_approval_failure(&request.id, result)
+                                            {
+                                                log::info!(
+                                                    "connect: slot {slot_index} rebind denied or timed out"
+                                                );
+                                                crate::oled::show_result(display, "Not approved");
+                                                return response;
+                                            }
+                                            log::info!(
+                                                "connect: slot {slot_index} rebind physically approved"
+                                            );
+                                        }
+                                    }
+                                } else if was_signing {
+                                    // Signing grant stored but not currently in
+                                    // the method ceiling: keep the historic OLED
+                                    // flash for the swap.
                                     crate::oled::show_auto_approved(
                                         display,
                                         &slot_label,

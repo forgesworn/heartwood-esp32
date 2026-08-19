@@ -52,6 +52,13 @@ CONFIG_ESP_TASK_WDT_INIT=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 CONFIG_ESP_TASK_WDT_PANIC=y
 
+# Stack-smashing canaries for the ESP-IDF C code (mbedTLS, libsecp256k1, the
+# WiFi/TLS stack) — a smashed frame aborts at the function epilogue instead of
+# running on corrupted state (FW-I1). NORM (-fstack-protector) covers every
+# function with a large local buffer, which includes the crypto paths, and is
+# the conservative choice against the tight 2 MB OTA slot ceiling.
+CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
+
 # Keep the version embedded in the ESP-IDF application descriptor aligned with
 # the Rust package/API version. scripts/build-firmware.sh rejects a drift before
 # compiling, so release images never fall back to a stale `git describe` tag.

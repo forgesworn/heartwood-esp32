@@ -178,8 +178,12 @@ pub fn handle_pin_unlock(
         wipe_and_reboot(usb, display);
     }
 
-    if payload.is_empty() || payload.len() > 8 {
-        log::warn!("PIN_UNLOCK: invalid PIN length {}", payload.len());
+    // Reject out-of-policy PINs BEFORE they can burn a wipe-counter attempt
+    // (FW-L4): SET_PIN only ever stores 4–8 ASCII digits, so anything else
+    // can never be the PIN — refusing it here costs the owner nothing and
+    // keeps the counter for genuine mistakes.
+    if payload.len() < 4 || payload.len() > 8 || !payload.iter().all(|b| b.is_ascii_digit()) {
+        log::warn!("PIN_UNLOCK: out-of-policy PIN ({} bytes)", payload.len());
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
         return false;
     }

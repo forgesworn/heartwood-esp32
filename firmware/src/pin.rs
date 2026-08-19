@@ -86,21 +86,43 @@ fn enable_encryption(
     nvs: &mut EspNvs<NvsDefault>,
     masters: &[LoadedMaster],
     pin: &[u8],
+    display: &mut crate::oled::Display<'_>,
 ) -> Result<(), &'static str> {
+    // Two 100k-round KDFs per seed is ~17 s of silence each. Without progress
+    // the card still reads "approved" and the device looks hung, which invites
+    // exactly the power-cut this function must not take mid-rewrap.
+    let total = masters.iter().filter(|m| !m.locked).count();
+    let mut done = 0usize;
     let mut prepared: Vec<(u8, Vec<u8>)> = Vec::new();
     for m in masters.iter() {
         // Each slot pays two 100k-round PBKDF2 runs (encrypt + self-check);
-        // with several masters this phase runs for tens of seconds.
+        // with several masters this phase runs for tens of seconds. Yield so
+        // IDLE0 runs between the KDF stretches — its watchdog aborts after 60 s
+        // of unbroken compute, and feeding our own task is not enough because
+        // the idle tasks are separately monitored (CHECK_IDLE_TASK_CPU0=y).
+        // The unlock path below has always yielded here; this loop did not, so
+        // VAULT_SET on a 4-master board rebooted mid-rewrap and left at-rest
+        // encryption silently OFF (nothing persists until the store loop).
+        esp_idf_hal::delay::FreeRtos::delay_ms(20);
         crate::wdt::feed();
         if m.locked {
             continue; // already encrypted (defensive)
         }
+        done += 1;
+        crate::oled::show_result(
+            display,
+            &format!("Encrypting {done}/{total}\nKeep power on"),
+        );
         let mut salt = [0u8; SALT_LEN];
         let mut nonce = [0u8; NONCE_LEN];
         fill_random(&mut salt);
         fill_random(&mut nonce);
 
         let blob = encrypt_seed(pin, &m.secret, &salt, &nonce);
+        // Encrypt and self-check are a 100k-round KDF each: yield between them
+        // too, so the longest unbroken stretch is one KDF rather than two.
+        esp_idf_hal::delay::FreeRtos::delay_ms(20);
+        crate::wdt::feed();
         match decrypt_seed(pin, &blob) {
             Ok(check) if check == m.secret => {}
             _ => return Err("encrypt self-check failed"),
@@ -108,6 +130,7 @@ fn enable_encryption(
         prepared.push((m.slot, blob));
     }
     for (slot, blob) in prepared {
+        crate::wdt::feed();
         masters::store_secret_enc(nvs, slot, &blob)?;
     }
     Ok(())
@@ -278,7 +301,7 @@ pub fn handle_set_pin(
     let outcome = if payload.is_empty() {
         disable_encryption(nvs, masters).map(|()| "PIN removed")
     } else {
-        enable_encryption(nvs, masters, payload).map(|()| "PIN set")
+        enable_encryption(nvs, masters, payload, display).map(|()| "PIN set")
     };
 
     match outcome {
@@ -397,7 +420,7 @@ pub fn handle_vault_set(
     let outcome = if payload.is_empty() {
         disable_encryption(nvs, masters).map(|()| "Vault disabled")
     } else {
-        enable_encryption(nvs, masters, payload).map(|()| "Vault enabled")
+        enable_encryption(nvs, masters, payload, display).map(|()| "Vault enabled")
     };
 
     match outcome {

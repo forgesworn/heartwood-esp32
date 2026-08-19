@@ -189,6 +189,37 @@ fn build_sign_reply(
     }
 }
 
+/// Persist a connect-slot bind, undoing it if the write does not land.
+///
+/// #75: `connect` used to answer success as soon as the pubkey was assigned in
+/// RAM, so a full NVS produced a client that believed it was paired against a
+/// slot the board held no key for — every later request then failed as an
+/// unknown client, and the obvious reading was "the signer is broken" rather
+/// than "the bind never persisted". Mirrors the relay path's
+/// `persist_slot_mutation_or_rollback` (the #67 pattern): a reply that says
+/// success must mean the authority survives a reboot.
+fn persist_bind_or_rollback(
+    policy_engine: &mut PolicyEngine,
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    master_slot: u8,
+    snapshot: crate::policy::SlotStateSnapshot,
+) -> Result<(), String> {
+    if policy_engine.persist_slots(nvs, master_slot) {
+        return Ok(());
+    }
+    if policy_engine.restore_slot_state_durably(nvs, snapshot) {
+        log::error!("connect: bind was not durable; prior slot authority restored durably");
+        Err("could not persist client bind; request was not applied".into())
+    } else {
+        log::error!(
+            "connect: FATAL: bind failed and prior slot authority could not be restored durably"
+        );
+        Err("fatal storage error: could not restore prior client policy after bind; \
+             take the device offline for USB recovery"
+            .into())
+    }
+}
+
 fn connect_success_response(request_id: &str, client_secret: &str) -> String {
     if client_secret.is_empty() {
         nip46::build_connect_response(request_id).unwrap_or_default()
@@ -930,6 +961,12 @@ fn dispatch_inner(
                         let slot_can_sign =
                             slot.allowed_methods.iter().any(|m| m == "sign_event");
                         let old_pubkey = slot.current_pubkey.clone();
+                        // #75: the bind must be durable before it is
+                        // acknowledged. Snapshot the prior authority so a
+                        // failed write can be undone rather than leaving the
+                        // client holding a pairing the board has no key for.
+                        let bind_snapshot = policy_engine.snapshot_slot_state(master_slot);
+                        let mut bind_mutated = false;
 
                         match &old_pubkey {
                             None => {
@@ -956,6 +993,7 @@ fn dispatch_inner(
                                     slot_label,
                                     &client_hex[..16.min(client_hex.len())]
                                 );
+                                bind_mutated = true;
                             }
                             Some(existing) if existing == &client_hex => {
                                 // Same pubkey reconnecting -- no-op.
@@ -1045,6 +1083,22 @@ fn dispatch_inner(
                                     client_hex.clone(),
                                 );
                                 log::info!("Slot {} ({}) pubkey swapped", slot_index, slot_label);
+                                bind_mutated = true;
+                            }
+                        }
+
+                        // Answer only once the bind is on flash. Before #75 a
+                        // full NVS let `connect` report success while the slot
+                        // kept no key, so the client believed it was paired and
+                        // every later request failed as an unknown client.
+                        if bind_mutated {
+                            if let Err(reason) = persist_bind_or_rollback(
+                                policy_engine,
+                                nvs,
+                                master_slot,
+                                bind_snapshot,
+                            ) {
+                                return build_error_json(&request.id, -4, &reason);
                             }
                         }
 

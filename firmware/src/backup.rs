@@ -99,10 +99,19 @@ pub fn handle_export(
         Ok(json) => {
             log::info!("Backup export: {} masters, {} bytes", payload.masters.len(), json.len());
             protocol::write_frame(usb, FRAME_TYPE_BACKUP_EXPORT_RESPONSE, &json);
+            // Repaint, or the OLED is left on the approval card forever: the
+            // operator sees "approved" and nothing else, reads the device as
+            // hung, and reaches for the power. handle_import has always closed
+            // with "Restore complete"; export was the odd one out.
+            let done = format!("{} masters/{} slots", loaded_masters.len(), total_slots);
+            crate::oled::show_change_done(display, "Backup exported", &done);
+            esp_idf_hal::delay::FreeRtos::delay_ms(1200);
         }
         Err(e) => {
             log::error!("Backup export serialisation failed: {e}");
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            crate::oled::show_error(display, "Backup export failed");
+            esp_idf_hal::delay::FreeRtos::delay_ms(1500);
         }
     }
 }

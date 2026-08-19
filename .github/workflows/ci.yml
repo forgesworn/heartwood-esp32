@@ -12,6 +12,11 @@ on:
   push:
     branches: [main]
 
+# Default to the least privilege any job here needs; no job in this workflow
+# writes to the repo (release.yml scopes its own `contents: write`).
+permissions:
+  contents: read
+
 jobs:
   # Server-side enforcement of the check-in identity rule (the local pre-commit
   # hook can be bypassed with --no-verify; this gate cannot). The banned string
@@ -19,7 +24,7 @@ jobs:
   identity-guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Forbid the banned commit identity
@@ -46,6 +51,31 @@ jobs:
           [ "$fail" -eq 0 ] && echo "OK: banned identity absent ($range)"
           exit "$fail"
 
+  # Server-side twin of scripts/git-hooks/pre-commit's secret scan: the local
+  # hook only runs for contributors who installed it and is bypassable with
+  # --no-verify; this gate is neither. Scans every line a PR adds for 64-hex
+  # secrets, nsec keys, SECRET=<hex> assignments and the deny-listed
+  # credentials leaked in 97d3f954.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Scan added lines for secrets
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          if [ -n "${BASE:-}" ] && [ -n "${HEAD:-}" ]; then
+            range="$BASE...$HEAD"
+          else
+            # Push to main: scan the tip commit (mirrors identity-guard).
+            range="HEAD~1...HEAD"
+          fi
+          python3 scripts/git-hooks/pre-commit --range "$range"
+
   # Pure host-testable logic (auth/replay decisions, BIP-39 generation, policy,
   # validation). Fast — no Xtensa toolchain. `+stable` overrides the repo's
   # rust-toolchain.toml (channel = "esp") which would otherwise force the
@@ -53,8 +83,8 @@ jobs:
   common-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       # Pass 1 — secp256k1 backend (the firmware's curve) + BIP-39 mnemonic/derive.
       - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen
       # Pass 2 — k256 backend with the full data-plane crypto. Without this the
@@ -74,7 +104,7 @@ jobs:
   cargo-deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
         with:
@@ -82,7 +112,7 @@ jobs:
       - name: cargo-deny (host crates)
         run: |
           set -eu
-          for crate in common heartwoodd provision ota ota-sign; do
+          for crate in common heartwoodd provision ota ota-sign sign-test sprite-gen ui-preview; do
             echo "::group::cargo-deny $crate"
             cargo deny --manifest-path "$crate/Cargo.toml" \
               check --config deny.toml advisories licenses sources bans
@@ -96,8 +126,8 @@ jobs:
   provision-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - run: cargo +stable test --manifest-path provision/Cargo.toml
 
@@ -107,8 +137,8 @@ jobs:
   ota-sign-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - run: cargo +stable test --manifest-path ota-sign/Cargo.toml
 
   # Real firmware build for every Xtensa esp-idf board, plus the app-slot fit
@@ -137,8 +167,8 @@ jobs:
             limit: 3145728
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: esp-rs/xtensa-toolchain@v1.5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: esp-rs/xtensa-toolchain@b989c80ffd4be88d30c09606ee9b449bd0d41958 # v1.5
         # Authenticate the action's "latest Xtensa Rust" GitHub API lookup so it
         # uses the 5000/hr limit, not the 60/hr unauthenticated one that has
         # 403'd under concurrent matrix jobs.
@@ -148,14 +178,14 @@ jobs:
           default: true
           buildtargets: ${{ matrix.chip }}
           ldproxy: true
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: firmware
           # Per-board cache: the boards now span esp32s3 and esp32, and esp-idf-sys
           # keeps a STICKY generated sdkconfig keyed to the chip — a shared cache
           # would let one board's sdkconfig bleed into another board's build.
           key: ${{ matrix.board }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2
         with:
           tool: espflash
       - name: Build firmware (${{ matrix.board }}, release)
@@ -189,7 +219,7 @@ jobs:
   firmware-build-c6:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install the esp Rust toolchain (espup — nightly Rust + LLVM)
         run: |
           set -eu
@@ -216,11 +246,11 @@ jobs:
           echo "$HOME/.local/riscv32-esp-elf/bin" >> "$GITHUB_PATH"
       - name: Install ldproxy (esp-idf linker shim)
         run: cargo install ldproxy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: firmware
           key: c6
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2
         with:
           tool: espflash
       - name: Build firmware (c6, release)
@@ -260,8 +290,8 @@ jobs:
   esp8266-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: esp-rs/xtensa-toolchain@v1.5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: esp-rs/xtensa-toolchain@b989c80ffd4be88d30c09606ee9b449bd0d41958 # v1.5
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
@@ -281,7 +311,7 @@ jobs:
           mkdir -p "$HOME/.local"
           tar -xzf /tmp/lx106.tar.gz -C "$HOME/.local"
           echo "$HOME/.local/xtensa-lx106-elf/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: esp8266-firmware
           key: esp8266

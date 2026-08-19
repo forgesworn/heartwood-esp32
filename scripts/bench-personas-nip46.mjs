@@ -23,7 +23,7 @@ const { SerialPort } = await loadDep('serialport', 'serialport/dist/index.js')
 const { generateSecretKey, getPublicKey } = await loadDep('nostr-tools/pure', 'nostr-tools/lib/esm/pure.js')
 const { getConversationKey, encrypt, decrypt } = await loadDep('nostr-tools/nip44', 'nostr-tools/lib/esm/nip44.js')
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
-import { execSync } from 'node:child_process'
+import { execFileSync, execSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { promptForPress } from './press-prompt.mjs'
 
@@ -171,8 +171,11 @@ function unlockWithRetries() {
   // KDF is deliberately slow; probe until SESSION_AUTH answers.
   for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      execSync(
-        `node ${FW_REPO}/scripts/vault-unlock.mjs --port ${PORT} --secret-file ${BENCH}/bridge.secret --vault-key-file ${BENCH}/vault.key`,
+      // execFileSync + args array, not a shell string: FW_REPO/BENCH/PORT
+      // would otherwise be word-split and globbed by the shell.
+      execFileSync(
+        'node',
+        [`${FW_REPO}/scripts/vault-unlock.mjs`, '--port', PORT, '--secret-file', `${BENCH}/bridge.secret`, '--vault-key-file', `${BENCH}/vault.key`],
         { stdio: 'inherit', timeout: 180000 },
       )
       return
@@ -260,7 +263,7 @@ async function main() {
   // --- reboot + re-unlock ---
   console.log('resetting signer...')
   await closePort()
-  execSync(`espflash reset --port ${PORT}`, { stdio: 'ignore' })
+  execFileSync('espflash', ['reset', '--port', PORT], { stdio: 'ignore' })
   await new Promise((r) => setTimeout(r, 12000))
   console.log('re-unlocking...')
   unlockWithRetries()

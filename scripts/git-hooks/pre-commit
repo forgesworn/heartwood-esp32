@@ -6,16 +6,26 @@ Scans the additions in staged changes (`git diff --cached -U0`) for:
   - 64-hex literals (secp256k1 private keys, bridge secrets, bunker secrets)
   - nsec1 bech32 strings (typed Nostr private keys)
   - Environment-variable assignments of the form SECRET=<hex>
+  - The two credentials leaked in commit 97d3f954 (permanently deny-listed)
 
 Allows:
   - Known test vectors listed in ALLOW_HEX
   - Files under path prefixes listed in ALLOW_PATHS (nip44/nip46 test files,
     frozen derivation vectors, this hook itself)
+  - A 64-hex literal that is plausibly a public key: the direct value of a
+    `pubkey:` / `public_key:` / `npub:` field marker, or the hex form of an
+    npub1 bech32 on the same line -- and ONLY those literals; a marker no
+    longer whitelists every other hex on the line
   - Lines containing the marker string `# pragma: allow-secret` (escape hatch
-    for the very rare case where a hex literal is both load-bearing and safe)
+    for the very rare case where a hex literal is both load-bearing and safe;
+    it does NOT reinstate deny-listed values)
 
 Run manually to preview:
     python3 scripts/git-hooks/pre-commit --dry-run
+
+Scan an arbitrary diff range instead of the staging area (this is how the CI
+secret-scan job enforces the same check server-side):
+    python3 scripts/git-hooks/pre-commit --range main...HEAD
 
 Install:
     bash scripts/install-hooks.sh
@@ -52,6 +62,18 @@ ALLOW_HEX = {
     "3cdfa635d0a058119b412999f061870e7e0a6d41df5deffadb0c1ff4a9d339b7",
 }
 
+# Leaked LIVE credentials, permanently deny-listed: the bridge and bunker
+# secrets committed in 97d3f954 (2026-04-03), removed in 2863eac but still in
+# 39 historical blobs. Rotation was asserted in the fix commit but is
+# unverifiable, so these values must never reappear in tracked content.
+# Checked before every allowance, including the pragma escape hatch.
+DENY_HEX = {
+    # bridge secret from 97d3f954:scripts/setup-hsm.py
+    "6db9d0876c4f390b589810fecdcc23e7cc82ae1ebf56cdb483355dc8ffd65d69",
+    # bunker secret from 97d3f954:scripts/setup-hsm.py
+    "3bd5c8427095d4a2b7bc292905962dbe257eedfa86223045caa300d6976d99a9",
+}
+
 # Path prefixes that are allowed to contain hex literals (test files, this
 # hook itself, documentation of known-good vectors).
 ALLOW_PATHS = (
@@ -76,27 +98,66 @@ ALLOW_BASENAMES = (
     "yarn.lock",
 )
 
-HEX_64_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-f]{64})(?![0-9a-fA-F])")
-NSEC_RE = re.compile(r"nsec1[02-9ac-hj-np-z]{58}")
-NPUB_RE = re.compile(r"npub1[02-9ac-hj-np-z]{58}")
-# Field markers that identify a hex literal as a public key (safe to skip).
-# Matches `pubkey:`, `pubkey =`, `"pubkey":`, `pub_key:`, `public_key:`, etc.
-PUBKEY_FIELD_RE = re.compile(r"\b(pubkey|pub_key|public_key|npub)\s*[:=]", re.IGNORECASE)
+# Case-insensitive throughout: a key typed or pasted in uppercase is the same
+# key (bech32 permits all-lowercase or all-uppercase encodings).
+HEX_64_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{64})(?![0-9a-fA-F])")
+NSEC_RE = re.compile(r"nsec1[02-9ac-hj-np-z]{58}", re.IGNORECASE)
+NPUB_RE = re.compile(r"npub1[02-9ac-hj-np-z]{58}", re.IGNORECASE)
+# A 64-hex literal directly named as a public key: `pubkey: "<hex>"`,
+# `pub_key = <hex>`, `"npub": "<hex>"`, etc. Only the hex ADJACENT to the
+# marker is whitelisted -- every other hex on the same line is still scanned.
+PUBKEY_FIELD_HEX_RE = re.compile(
+    r"\b(?:pubkey|pub_key|public_key|npub)\s*[:=]\s*[\"']?([0-9a-fA-F]{64})",
+    re.IGNORECASE,
+)
 ASSIGN_RE = re.compile(
     r"(BRIDGE_SECRET|BUNKER_SECRET|API_TOKEN|NSEC|PRIVATE_KEY)\s*[:=]\s*['\"]?([0-9a-f]{64})",
     re.IGNORECASE,
 )
 MARKER = "pragma: allow-secret"
 
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
-def staged_additions():
-    """Yield (path, lineno_hint, line) tuples for every added line in staged changes."""
-    result = subprocess.run(
-        ["git", "diff", "--cached", "-U0", "--no-color", "--diff-filter=AM"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+
+def npub_to_hex(npub: str):
+    """Decode an npub1 bech32 string to its 64-char hex public key.
+
+    Best-effort: returns None on malformed input, which simply means the npub
+    whitelist does not apply -- a bad decode never hides anything.
+    """
+    values = []
+    for c in npub[5:].lower():
+        idx = _BECH32_CHARSET.find(c)
+        if idx < 0:
+            return None
+        values.append(idx)
+    if len(values) < 6:
+        return None
+    values = values[:-6]  # drop the 6-char checksum
+    acc = 0
+    bits = 0
+    out = bytearray()
+    for v in values:
+        acc = (acc << 5) | v
+        bits += 5
+        while bits >= 8:
+            bits -= 8
+            out.append((acc >> bits) & 0xFF)
+    return out.hex() if len(out) == 32 else None
+
+
+def added_lines(diff_range=None):
+    """Yield (path, lineno_hint, line) tuples for every added line in a diff.
+
+    With no range this scans the staged changes; with a range (e.g.
+    "main...HEAD", how the CI secret-scan job runs it) that diff instead.
+    """
+    cmd = ["git", "diff", "-U0", "--no-color", "--diff-filter=AM"]
+    if diff_range:
+        cmd.append(diff_range)
+    else:
+        cmd.append("--cached")
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     current_path = None
     current_lineno = 0
     for raw in result.stdout.splitlines():
@@ -127,10 +188,26 @@ def path_allowed(path: str) -> bool:
     return False
 
 
-def check():
+def check(diff_range=None):
     findings = []
-    for path, lineno, line in staged_additions():
+    for path, lineno, line in added_lines(diff_range):
         if path_allowed(path):
+            continue
+
+        # 0. Deny-listed leaked credentials -- absolute: no path allowance
+        #    (beyond this hook's own allow-listed directory), pubkey marker,
+        #    or pragma reinstates them.
+        leaked = [d for d in DENY_HEX if d in line.lower()]
+        if leaked:
+            for d in leaked:
+                findings.append(
+                    (
+                        path,
+                        lineno,
+                        "deny-listed credential leaked in 97d3f954",
+                        d[:8] + "...",
+                    )
+                )
             continue
         if MARKER in line:
             continue
@@ -153,20 +230,20 @@ def check():
                 )
             )
 
-        # 3. Generic 64-hex literals -- skip known test vectors and known
-        #    public-key contexts. A hex on a line with either:
-        #      - an npub1 bech32 (same identity, documented in two forms), or
-        #      - a `pubkey:` / `public_key:` / `npub:` field marker
-        #    is treated as a public key reference and allowed. nsec1 is caught
-        #    separately and is never whitelisted by these heuristics.
-        line_has_npub = bool(NPUB_RE.search(line))
-        line_has_pubkey_field = bool(PUBKEY_FIELD_RE.search(line))
-        is_public_context = line_has_npub or line_has_pubkey_field
+        # 3. Generic 64-hex literals -- skip known test vectors and the hex
+        #    literal(s) plausibly being a public key on this line: the direct
+        #    value of a `pubkey:` / `public_key:` / `npub:` field marker, or
+        #    the hex form of an npub1 bech32 on the line. Previously ANY such
+        #    marker whitelisted EVERY hex on the line, so
+        #    `"pubkey": "<pub>", "sec": "<realkey>"` passed unscanned.
+        public_hexes = {m.group(1).lower() for m in PUBKEY_FIELD_HEX_RE.finditer(line)}
+        for m in NPUB_RE.finditer(line):
+            decoded = npub_to_hex(m.group(0))
+            if decoded:
+                public_hexes.add(decoded)
         for m in HEX_64_RE.finditer(line):
             hex_value = m.group(1).lower()
-            if hex_value in ALLOW_HEX:
-                continue
-            if is_public_context:
+            if hex_value in ALLOW_HEX or hex_value in public_hexes:
                 continue
             findings.append(
                 (path, lineno, "64-char hex literal (possible secret)", hex_value[:8] + "...")
@@ -177,7 +254,17 @@ def check():
 
 def main():
     dry_run = "--dry-run" in sys.argv
-    findings = check()
+    diff_range = None
+    if "--range" in sys.argv:
+        idx = sys.argv.index("--range")
+        if idx + 1 >= len(sys.argv):
+            print(
+                "pre-commit: --range needs a git diff range (e.g. main...HEAD)",
+                file=sys.stderr,
+            )
+            return 2
+        diff_range = sys.argv[idx + 1]
+    findings = check(diff_range)
     if not findings:
         if dry_run:
             print("pre-commit: no suspected secrets in staged changes")
@@ -191,6 +278,7 @@ def main():
         "  - add the specific hex to ALLOW_HEX in scripts/git-hooks/pre-commit\n"
         "  - add the path prefix to ALLOW_PATHS\n"
         "  - append `# pragma: allow-secret` to the specific line as an escape hatch\n"
+        "\nDeny-listed leaked credentials (97d3f954) can never be committed.\n"
         "\nTo bypass this check entirely (use with extreme care, and only if you know\n"
         "what you are doing): git commit --no-verify",
         file=sys.stderr,

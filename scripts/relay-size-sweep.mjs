@@ -18,11 +18,16 @@
 // The slot must have auto-sign enabled, or every step waits on a button press.
 //
 // Usage:
-//   node scripts/relay-size-sweep.mjs 'bunker://<pubkey>?relay=<url>&secret=<hex>'
+//   HEARTWOOD_SWEEP_BUNKER='bunker://<pubkey>?relay=<url>&secret=<hex>' \
+//     node scripts/relay-size-sweep.mjs
+//   node scripts/relay-size-sweep.mjs --uri-file <path-to-0600-file>
 //
-// The URI is an ARGUMENT, never a file: it carries a live signing credential.
+// The URI carries a live signing credential: pass it via the env var or a
+// file, not inline — argv leaks into shell history and `ps`. A bare argv URI
+// still works as a fallback for a one-off throwaway slot.
 
 import { env, argv } from 'node:process'
+import { readFileSync, writeFileSync } from 'node:fs'
 
 const load = async (spec) => {
   const candidates = [
@@ -38,9 +43,12 @@ const load = async (spec) => {
 const nt = await load('nostr-tools')
 const { finalizeEvent, generateSecretKey, getPublicKey, nip44 } = nt
 
-const uri = argv[2]
+const uriFile = argv.includes('--uri-file') ? argv[argv.indexOf('--uri-file') + 1] : null
+const uri = env.HEARTWOOD_SWEEP_BUNKER ?? (uriFile ? readFileSync(uriFile, 'utf8').trim() : argv[2])
 if (!uri?.startsWith('bunker://')) {
-  console.error("usage: node scripts/relay-size-sweep.mjs 'bunker://<pubkey>?relay=<url>&secret=<hex>'")
+  console.error("usage: HEARTWOOD_SWEEP_BUNKER='bunker://<pubkey>?relay=<url>&secret=<hex>' node scripts/relay-size-sweep.mjs")
+  console.error('   or: node scripts/relay-size-sweep.mjs --uri-file <path>')
+  console.error('   (a bare argv URI still works, but leaks into shell history / ps)')
   process.exit(2)
 }
 
@@ -62,11 +70,12 @@ if (!remotePubkey || relays.length === 0) { console.error('bunker URI needs a pu
 // script deliberately (not in the repo — scripts/.sweep-clients.json is
 // gitignored) and the slot should be revoked when the sweep is done.
 const keyStore = new URL('.sweep-clients.json', import.meta.url)
-const { readFileSync, writeFileSync } = await import('node:fs')
 let store = {}
 try { store = JSON.parse(readFileSync(keyStore, 'utf8')) } catch { /* first run */ }
 
-const skHexArg = argv.includes('--sk') ? argv[argv.indexOf('--sk') + 1] : null
+// Same argv-leak caveat for an explicit client key: prefer HEARTWOOD_SWEEP_SK
+// over `--sk <hex>` (the argv fallback is kept for one-off runs).
+const skHexArg = env.HEARTWOOD_SWEEP_SK ?? (argv.includes('--sk') ? argv[argv.indexOf('--sk') + 1] : null)
 const hexToBytes = (h) => Uint8Array.from(h.match(/.{2}/g).map((b) => parseInt(b, 16)))
 const bytesToHex = (b) => Buffer.from(b).toString('hex')
 

@@ -359,7 +359,14 @@ fn offer_removal_recovery_wipe(
     buttons: &crate::button::Buttons<'_>,
 ) {
     let approval = approval::run_approval_loop(display, buttons, 30, |d, remaining| {
-        oled::show_sign_request(d, "RECOVERY", 0, "WIPE ALL DATA?", remaining);
+        // NEVER title this "RECOVERY". It reads as "repair the device" and the
+        // hold erases every key on it. Worse, the old call passed the warning
+        // as show_sign_request's `_content_preview`, which that renderer drops
+        // on the floor — so the screen showed the single word RECOVERY and the
+        // words WIPE ALL DATA? were never drawn. An operator held the button
+        // expecting a repair and lost four masters and every pairing
+        // (2026-08-19). show_change_approval actually renders its title.
+        oled::show_change_approval(d, "ERASE ALL KEYS\nThis is NOT a repair", remaining, 30);
     });
     if !matches!(approval, approval::ApprovalResult::Approved) {
         return;

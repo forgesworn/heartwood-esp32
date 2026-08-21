@@ -3758,6 +3758,9 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         return;
     }
 
+    // First draw of this wording: a join sets last_remaining back to MAX to
+    // force a redraw, so a card that grows logs again with what it now says.
+    let first_draw = ctx.button_cards[0].last_remaining == u32::MAX;
     if remaining == ctx.button_cards[0].last_remaining {
         return;
     }
@@ -3800,6 +3803,20 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             Draw::Titled("RECEIVE NOTE", title.clone())
         }
     };
+    // What the panel now READS, once per wording. The batch path logs its
+    // own line on a join; this one covers every card, so a bench can check
+    // an amount or a mint without a camera on the OLED (checklist 13, 2b).
+    if first_draw {
+        let (head, body) = match &card {
+            Draw::Sign(label, kind) => ("SIGN".into(), format!("{label} / kind {kind}")),
+            Draw::Extension(label, method, preview) => {
+                (method.clone(), format!("{label} / {preview}"))
+            }
+            Draw::Titled(header, title) => ((*header).to_string(), title.clone()),
+            Draw::Batch(header, title) => (header.clone(), title.clone()),
+        };
+        log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
+    }
     match card {
         Draw::Sign(label, kind) => {
             crate::oled::show_sign_request(ctx.display, &label, kind, "", remaining)

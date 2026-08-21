@@ -17,6 +17,9 @@
 //! The batch cap is the security-relevant one: it is the most signatures a
 //! single physical hold can ever authorise, and the card names the count so
 //! the operator is never told "sign this" when they are approving eight.
+//! Bearer-note cards go further and name the total (`note_cmd::batch_card`):
+//! "release this 12-sat note" must never be the wording on a hold that
+//! releases three notes worth a thousand.
 
 use alloc::string::String;
 

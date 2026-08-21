@@ -317,6 +317,10 @@ struct SignCtx<'a, 'd, 'b> {
     /// from `wrap_seen` after [`LAPSED_WRAP_RETRY`] so the catch-up can
     /// offer it again.
     wrap_lapsed: Vec<(String, Instant)>,
+    /// The button was down when the card on screen resolved: the rest of
+    /// that hold, and its release, belong to the card and must not page the
+    /// idle carousel. Cleared the first time the button is seen up.
+    button_settle: bool,
     /// Last failed nostrconnect dial (url, when): throttles operator-driven
     /// re-dials of a dead relay, which the pinned backoff cannot cover (no
     /// PinnedRelay exists until a dial succeeds).
@@ -383,6 +387,19 @@ fn reply_stamp(ctx: &SignCtx, request_created_at: u64, held: Duration) -> u64 {
 /// the USB-serving wait windows, so a wake press keeps working while WiFi is
 /// reconnecting instead of playing dead for the length of the retry.
 fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
+    // The finger that approved (or declined) the last card is still coming
+    // off the button. A 2 s hold does not end the instant the bar fills, and
+    // the release that follows was reported from the bench as "approving
+    // takes you onto the next screen". Swallow the level until it is up,
+    // and the edge with it.
+    if ctx.button_settle {
+        crate::button::clear_press_edge();
+        if ctx.buttons.a.is_low() {
+            return;
+        }
+        ctx.button_settle = false;
+        return;
+    }
     // A latched edge counts even when the finger is already off: this loop's
     // pass is ~1 s (socket recv timeouts dominate), longer than a human tap,
     // so sampling the live level alone missed most dismiss-taps (#61).
@@ -843,6 +860,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             .unwrap_or_default(),
         wrap_retry_when_room: false,
         wrap_lapsed: Vec::new(),
+        button_settle: false,
         dial_cooldown: None,
         network_trial_id,
         network_trial_deadline,
@@ -3830,6 +3848,12 @@ fn resolve_button_card(
         return;
     }
     let card = ctx.button_cards.remove(index);
+    if index == 0 {
+        // Whatever the button did to decide this card is spent: the edge
+        // that started the hold, and the hold itself if it is still going.
+        crate::button::clear_press_edge();
+        ctx.button_settle = ctx.buttons.a.is_low();
+    }
     if card
         .asks
         .first()

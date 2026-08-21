@@ -137,6 +137,23 @@ const LAPSED_WRAP_RETRY: Duration = Duration::from_secs(10 * 60);
 /// to the next catch-up early rather than forgotten.
 const LAPSED_WRAP_MAX: usize = 8;
 
+/// A catch-up that comes back with a full page may be hiding older wraps
+/// behind it (#89): the relay hands back the newest CATCH_UP_LIMIT, and a
+/// flood, or simply a long life, pushes an undecided wrap past them. Page
+/// down with `until` this many times before giving up for this pass.
+const CATCH_UP_MAX_PAGES: u8 = 4;
+/// The side subscription the pages arrive on, closed after each page.
+const CATCH_UP_PAGE_SUB: &str = "wrappage";
+
+/// A catch-up in progress: what the current page has delivered so far.
+struct CatchUp {
+    delivered: u32,
+    /// Oldest `created_at` seen across every page of this pass; the next
+    /// page asks for strictly older.
+    oldest: u64,
+    pages: u8,
+}
+
 /// Re-send the `REQ` this often so a silently-dropped subscription self-heals.
 /// Some relays close a subscription (or stop delivering to it) while keeping the
 /// WS connection alive, so the connection never looks dead — periodic re-REQ
@@ -321,6 +338,8 @@ struct SignCtx<'a, 'd, 'b> {
     /// that hold, and its release, belong to the card and must not page the
     /// idle carousel. Cleared the first time the button is seen up.
     button_settle: bool,
+    /// The catch-up pass in flight, if any (see [`CatchUp`]).
+    catch_up: Option<CatchUp>,
     /// Last failed nostrconnect dial (url, when): throttles operator-driven
     /// re-dials of a dead relay, which the pinned backoff cannot cover (no
     /// PinnedRelay exists until a dial succeeds).
@@ -861,6 +880,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         wrap_retry_when_room: false,
         wrap_lapsed: Vec::new(),
         button_settle: false,
+        catch_up: None,
         dial_cooldown: None,
         network_trial_id,
         network_trial_deadline,
@@ -1307,6 +1327,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             if !sessions.is_empty() {
                 let sub_req = build_sub_req(&ctx, true);
                 let keepalive_req = build_sub_req(&ctx, false);
+                ctx.catch_up = Some(CatchUp { delivered: 0, oldest: u64::MAX, pages: 0 });
                 for s in sessions.iter_mut() {
                     s.sub_req = keepalive_req.clone();
                     s.last_resub = Instant::now();
@@ -1463,15 +1484,7 @@ fn build_sub_req(ctx: &SignCtx, catch_up: bool) -> String {
     // than the last decision less the NIP-59 backdate. The keepalive re-REQ
     // goes back to live-only so the relay is not replaying every 40 s.
     let wrap_filter = if catch_up {
-        let since = ctx
-            .wrap_ledger
-            .since(wall_clock_estimate())
-            .map(|s| format!(r##","since":{s}"##))
-            .unwrap_or_default();
-        format!(
-            r##"{{"kinds":[{GIFT_WRAP_KIND}],"#p":[{master_p_list}]{since},"limit":{}}}"##,
-            heartwood_common::wrap_ledger::CATCH_UP_LIMIT
-        )
+        wrap_catch_up_filter(ctx, None)
     } else {
         format!(r##"{{"kinds":[{GIFT_WRAP_KIND}],"#p":[{master_p_list}],"limit":0}}"##)
     };
@@ -1486,10 +1499,65 @@ fn build_sub_req(ctx: &SignCtx, catch_up: bool) -> String {
     }
 }
 
+/// At the end of a catch-up page: if the relay filled it, there may be
+/// older wraps behind it, so ask for the next page below the oldest seen,
+/// on a side subscription that is closed again once it has answered.
+fn continue_catch_up(s: &mut RelaySession, ctx: &mut SignCtx) {
+    let Some(c) = ctx.catch_up.as_mut() else {
+        return;
+    };
+    let full_page = c.delivered >= heartwood_common::wrap_ledger::CATCH_UP_LIMIT;
+    if full_page && c.pages < CATCH_UP_MAX_PAGES && c.oldest > 0 {
+        c.pages += 1;
+        c.delivered = 0;
+        let until = c.oldest - 1;
+        let page = c.pages;
+        let req = format!(r##"["REQ","{CATCH_UP_PAGE_SUB}",{}]"##, wrap_catch_up_filter(ctx, Some(until)));
+        match ws_send(&mut s.tls, OP_TEXT, req.as_bytes()) {
+            Ok(()) => log::info!("[relay] catch-up page {page}: wraps older than {until}"),
+            Err(e) => {
+                log::warn!("[relay] catch-up page failed to send: {e}");
+                ctx.catch_up = None;
+            }
+        }
+        return;
+    }
+    if c.pages > 0 {
+        if full_page {
+            log::warn!("[relay] catch-up stopped after {} pages with more behind", c.pages);
+        }
+        let close = format!(r##"["CLOSE","{CATCH_UP_PAGE_SUB}"]"##);
+        let _ = ws_send(&mut s.tls, OP_TEXT, close.as_bytes());
+    }
+    ctx.catch_up = None;
+}
+
+/// The stored-wrap filter: newest CATCH_UP_LIMIT, no older than the ledger
+/// allows, and when paging, strictly older than `until`.
+fn wrap_catch_up_filter(ctx: &SignCtx, until: Option<u64>) -> String {
+    let master_p_list = ctx
+        .masters
+        .iter()
+        .map(|m| format!("\"{}\"", hex_encode(&m.pubkey)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let since = ctx
+        .wrap_ledger
+        .since(wall_clock_estimate())
+        .map(|s| format!(r##","since":{s}"##))
+        .unwrap_or_default();
+    let until = until.map(|u| format!(r##","until":{u}"##)).unwrap_or_default();
+    format!(
+        r##"{{"kinds":[{GIFT_WRAP_KIND}],"#p":[{master_p_list}]{since}{until},"limit":{}}}"##,
+        heartwood_common::wrap_ledger::CATCH_UP_LIMIT
+    )
+}
+
 /// Open one relay session: TLS → WS handshake → recv timeout → subscribe.
 fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySession, String> {
     let sub_req = build_sub_req(ctx, true);
     let keepalive_req = build_sub_req(ctx, false);
+    ctx.catch_up = Some(CatchUp { delivered: 0, oldest: u64::MAX, pages: 0 });
     // A session without the recv timeout would starve its peers, so a pinned
     // dial (or a network trial, whose rollback deadline must stay live)
     // refuses to run degraded.
@@ -2590,6 +2658,7 @@ fn handle_relay_msg(
                 NetworkRuntimeError::None,
             );
             log::info!("[relay] EOSE — live, waiting for requests");
+            continue_catch_up(s, ctx);
         }
         "OK" => {
             set_network_runtime(
@@ -4012,6 +4081,10 @@ fn resolve_button_card(
 /// put a RECEIVE card up. Every failure is silent, as vault delivery is --
 /// an unsolicited event from anyone on the internet gets no diagnostics.
 fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
+    if let Some(c) = ctx.catch_up.as_mut() {
+        c.delivered += 1;
+        c.oldest = c.oldest.min(ev.created_at);
+    }
     // Decided across reboots, or already on a card / already junk this
     // boot. The catch-up REQ replays stored wraps on every connect and
     // settle, so this is the common path, and it runs before any decrypt.

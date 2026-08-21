@@ -466,6 +466,17 @@ fn show_network_feedback(
     wake: bool,
     restore_after: Option<Duration>,
 ) {
+    // An approval card owns the screen until the operator answers it - the
+    // same rule the idle carousel and the confirm-restore already follow.
+    // Connectivity churn is frequent and unprompted, so without this a relay
+    // reconnect or a wifi rejoin repaints straight over a live card: the
+    // operator is asked to hold a button for something they can no longer
+    // see, and the hold they do make lands on whatever replaced it. Found
+    // running checklist section 14, where a RECEIVE card was clobbered by
+    // the wifi-standalone screen mid-decision.
+    if approval_card_open(ctx) {
+        return;
+    }
     if wake && !ctx.display_on {
         crate::oled::wake_display(ctx.display);
         ctx.display_on = true;
@@ -1276,10 +1287,15 @@ pub fn run_wifi_standalone<'d, 'b>(
 /// A live candidate that is never committed is aborted and rebooted back to A.
 fn network_state_tick(ctx: &mut SignCtx) {
     let now = Instant::now();
+    // Deferred while a card is up, not cancelled: the deadline stays pending
+    // so the identity screen still returns once the operator has answered.
+    // Firing it under a live card is what put "N masters loaded" over a
+    // RECEIVE card in the section 14 bench run.
     if ctx
         .network_display_restore_at
         .map(|deadline| now >= deadline)
         .unwrap_or(false)
+        && !approval_card_open(ctx)
     {
         ctx.network_display_restore_at = None;
         show_idle_identity(ctx);
@@ -3644,6 +3660,11 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         // whatever the operator was doing then, not to this decision.
         crate::button::clear_press_edge();
         ctx.button_cards[0].opened_at = Some(now);
+        log::info!(
+            "[relay] card took the screen: queue={} asks={}",
+            ctx.button_cards.len(),
+            ctx.button_cards[0].asks.len()
+        );
     }
 
     let opened_at = ctx.button_cards[0].opened_at.unwrap_or(now);
@@ -3687,10 +3708,15 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     }
 
     if hold_ms > 0 {
-        // The button is down: follow it closely for a short burst so the bar
-        // fills smoothly and the approval lands when the hold completes,
-        // rather than up to a whole loop pass later.
-        let burst_until = Instant::now() + CARD_HOLD_BURST;
+        // The button is down: follow it to the end rather than for a fixed
+        // burst. A 600 ms window did not cover a 2 s hold, so the bar froze
+        // partway - reported from the bench as "only got to 75% before it
+        // said 12 sats" - while the relay pass that followed took long
+        // enough for the hold to complete unseen. An operator with a finger
+        // on the button is a foreground interaction: the socket can wait the
+        // second or so it takes, and the watchdog is fed every poll.
+        let burst_until = Instant::now()
+            + CARD_HOLD_BURST.max(Duration::from_millis(u64::from(CARD_HOLD_MS - hold_ms) + 200));
         loop {
             crate::wdt::feed();
             let held = crate::button::hold_ms();

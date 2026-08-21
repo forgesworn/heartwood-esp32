@@ -1142,6 +1142,14 @@ notecase `heartwood send`.
    a collect frees a slot (seen on the bench: two deferred zaps landed
    380 ms apart the moment the collect finished). `heartwood untrust` needs no hold and the next wrap from
    that key gets a card again.
+2c. Pair from a wallet: from a bound wallet (`notecase heartwood pair
+   phone`, or the web wallet's Settings → Hardware signer → Pair another
+   device). Expect a PAIR NEW WALLET card ("for 'phone' / it will see your
+   notes"); hold. The response is a bunker URI whose relays match
+   GET_NET_CONFIG and whose secret is fresh; a second wallet links with it
+   and `heartwood notes` works there. An unbound client, or a USB NIP-46
+   session with no client, gets `unauthorised`: there is still no way onto
+   the device without a binding or the cable.
 3a. From a stranger's client: on a phone running any NIP-17 client
    (0xchat, Amethyst), resolve the device's NIP-05, and DM it a note as
    plain text, once as `lnurlw://...`, once as bech32 `LNURL1...`, once

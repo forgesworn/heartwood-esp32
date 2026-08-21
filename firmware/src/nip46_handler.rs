@@ -792,7 +792,10 @@ fn dispatch_inner(
     if remote_extension_requires_approval(has_client, &method, tier) {
         // A note card shows the money, not the method name: amount, mint
         // and (for send) the recipient, as the cable path already does.
-        let note_card = if is_note_method(&method) {
+        let note_card = if matches!(method, nip46::Nip46Method::HeartwoodPairWallet) {
+            let label = pair_wallet_label(&request.params);
+            Some(("PAIR NEW WALLET", format!("for '{label}'\nit will see your notes")))
+        } else if is_note_method(&method) {
             let cmd = heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params).ok();
             if let Some(refusal) = cmd.as_ref().and_then(crate::notes::relay_precheck) {
                 if !matches!(approval, ApprovalDecision::ButtonApproved) {
@@ -1607,8 +1610,49 @@ fn dispatch_inner(
                 "heartwood_note_send",
                 "heartwood_note_trust",
                 "heartwood_note_trusted",
+                "heartwood_pair_wallet",
             ];
             nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
+        }
+
+        "heartwood_pair_wallet" => {
+            // A wallet that is already bound mints a slot for another one.
+            // The only unauthenticated way onto this device stays "none":
+            // the caller proved a binding, and the owner held the button for
+            // this specific card. The URI's secret is shown exactly once.
+            if !has_client {
+                return build_error_json(&request.id, -1, "unauthorised");
+            }
+            let label = pair_wallet_label(&request.params);
+            let mut secret_bytes = [0u8; 32];
+            crate::fill_random_strong(&mut secret_bytes);
+            let secret_hex = hex_encode(&secret_bytes);
+            secret_bytes.iter_mut().for_each(|b| *b = 0);
+            let Some(slot_index) = policy_engine.create_slot(master_slot, label.clone(), secret_hex.clone()) else {
+                return build_error_json(&request.id, -1, "no free slot");
+            };
+            if !policy_engine.persist_slots(nvs, master_slot) {
+                // A slot that would not survive a reboot is one the other
+                // wallet binds to and then loses: refuse rather than mislead.
+                policy_engine.revoke_slot(master_slot, slot_index);
+                return build_error_json(&request.id, -1, "storage_full");
+            }
+            let master_hex = match secp256k1::Keypair::from_seckey_slice(secp, master_secret) {
+                Ok(kp) => hex_encode(&kp.x_only_public_key().0.serialize()),
+                Err(_) => return build_error_json(&request.id, -1, "invalid master secret"),
+            };
+            let relays = crate::net_config_store::read_net_config(nvs)
+                .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
+                .map(|cfg| cfg.relays)
+                .unwrap_or_default();
+            let relay_query = relays
+                .iter()
+                .map(|r| format!("&relay={r}"))
+                .collect::<String>();
+            let uri = format!("bunker://{master_hex}?secret={secret_hex}{relay_query}");
+            log::info!("{m}: slot {slot_index} '{label}' minted for another wallet", m = "heartwood_pair_wallet");
+            let body = serde_json::json!({"ok": true, "slot_index": slot_index, "label": label, "uri": uri});
+            nip46::build_result_response(&request.id, &body.to_string()).unwrap_or_default()
         }
 
         m if m.starts_with("heartwood_note_") => {
@@ -2190,6 +2234,18 @@ fn random_iv_16() -> [u8; 16] {
 
 /// Build a NIP-46 error response JSON string.
 /// Falls back to an empty string on serialisation failure (should never occur).
+/// The label a new slot is minted under, from `params[0].label`, bounded
+/// and ASCII so the card and the slot list stay legible.
+fn pair_wallet_label(params: &[Value]) -> String {
+    let raw = params
+        .first()
+        .and_then(|p| p.get("label"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("another wallet");
+    let clean: String = raw.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(24).collect();
+    if clean.trim().is_empty() { "another wallet".to_string() } else { clean.trim().to_string() }
+}
+
 fn build_error_json(request_id: &str, code: i32, message: &str) -> String {
     nip46::build_error_response(request_id, code, message).unwrap_or_default()
 }

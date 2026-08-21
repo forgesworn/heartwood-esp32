@@ -1031,10 +1031,14 @@ USB tier, unlocked, no at-rest:
     `21 sats`, 2 100 000 shows `2 100 sats` (grouped, so it cannot be
     misread as 21 000), 999 shows `999 msat` and NOT `0 sats`, 1 999 shows
     `1 999 msat`. Then confirm one against a long host
-    (`mint.forgesworn.example.com/w`): the amount must be complete and
-    unclipped, the host elided from the LEFT with a leading `..` so the TLD
-    survives, and on the 128 px Heltec the two must fall on separate lines
-    rather than one centred line running off both edges. NOT YET BENCH-RUN.
+    (`mint.forgesworn.example.com/u/alice/w`): the amount must be complete
+    and unclipped; the host shortened out of the MIDDLE with a leading `..`
+    so that both the registrable domain with its TLD and the whole withdraw
+    path survive (PR #77 — two tenants of one mint must never draw the same
+    card); and on the 128 px Heltec the amount and the host must fall on
+    separate lines rather than one centred line running off both edges.
+    Confirm a second note at `.../u/bob/w` and check the two cards differ.
+    NOT YET BENCH-RUN.
 3. Destructive gating: `mark_spent` / `discard` / `rename` / `delete` each
    raise a card; wrong-state commands answer `invalid_state` with NO card
    (watch the OLED — the serial answer alone does not prove it). NOT YET
@@ -1112,9 +1116,7 @@ scripts/nip46-client.mjs conventions):
     checkable without eyes on the panel. Seen on the v4 board 2026-08-21
     21:27 UTC, and the hold that followed answered both asks:
     `joins the open approval card (2 asks); card reads 'RELEASE 2 NOTES'
-    / '24 sats @ mint.forgesworn.dev/w'`. (That wording predates the
-    amount formatter below: the withdraw path is now dropped from the host,
-    so the same card today reads `24 sats @ mint.forgesworn.dev`.)
+    / '24 sats @ mint.forgesworn.dev/w'`.
 
 Regression watch: a USB `sign_event` approval and a factory reset must behave
 exactly as before; FIRMWARE_INFO's nvs entry stats now include the

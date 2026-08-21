@@ -3622,15 +3622,17 @@ fn queue_button_ask(
 ) -> Result<(), String> {
     use heartwood_common::approval_queue::{admit, Admission, AskKey};
 
-    let key = AskKey::new(
-        slot,
-        client_hex.to_string(),
-        hex_encode(target_pk),
-        heartwood_common::nip59::method_or_kind_key(
-            &ask.request.method,
-            ask.event.as_ref().map(|event| event.kind),
-        ),
+    let mut kind_key = heartwood_common::nip59::method_or_kind_key(
+        &ask.request.method,
+        ask.event.as_ref().map(|event| event.kind),
     );
+    // Sends to two recipients are two decisions: the batch card names one
+    // recipient, so only sends to that recipient may share it.
+    if ask.request.method == "heartwood_note_send" {
+        let to = note_param(&ask.request, "to").unwrap_or_default();
+        kind_key = format!("{kind_key}:{to}");
+    }
+    let key = AskKey::new(slot, client_hex.to_string(), hex_encode(target_pk), kind_key);
     let weight = ask
         .event
         .as_ref()
@@ -3689,10 +3691,27 @@ fn queue_button_ask(
                     weight,
                     audit,
                 });
-                // Redraw: the card now speaks for more than it did.
+                // Redraw: the card now speaks for more than it did. And
+                // disarm: a press already under way was aimed at the card
+                // as it read a moment ago, so it is discarded along with
+                // its release, and the operator must press again on the
+                // card that names the whole batch (tick_button_card).
                 card.last_remaining = u32::MAX;
+                card.armed = false;
+                // Log what the card now READS, not just how many asks it
+                // holds: the bench needs to check the wording that a hold
+                // answers without a camera on the OLED.
+                let reads = card
+                    .asks
+                    .first()
+                    .and_then(|first| note_card_header(&first.ask.request.method))
+                    .map(|header| {
+                        let (head, title) = note_batch_card(header, &card.asks);
+                        format!("; card reads '{head}' / '{}'", title.replace('\n', " / "))
+                    })
+                    .unwrap_or_default();
                 log::info!(
-                    "[relay] {request_id} joins the open approval card ({} asks)",
+                    "[relay] {request_id} joins the open approval card ({} asks){reads}",
                     card.asks.len()
                 );
             }
@@ -3750,6 +3769,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         Sign(String, u64),
         Extension(String, String, String),
         Titled(&'static str, String),
+        Batch(String, String),
     }
     let card = match &ctx.button_cards[0].asks[0].ask.card {
         crate::nip46_handler::AskCard::Sign { requester, kind } => {
@@ -3767,6 +3787,12 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             method,
             preview,
         } => match note_card_header(method) {
+            // A batched note card must say what the one hold releases: the
+            // count, the total and the mint, never just the first note.
+            Some(header) if batch > 1 => {
+                let (head, title) = note_batch_card(header, &ctx.button_cards[0].asks);
+                Draw::Batch(head, title)
+            }
             Some(header) => Draw::Titled(header, preview.clone()),
             None => Draw::Extension(master_label.clone(), method.clone(), preview.clone()),
         },
@@ -3793,7 +3819,52 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             remaining,
             CARD_WINDOW.as_secs() as u32,
         ),
+        Draw::Batch(header, title) => crate::oled::show_titled_approval(
+            ctx.display,
+            &header,
+            &title,
+            remaining,
+            CARD_WINDOW.as_secs() as u32,
+        ),
     }
+}
+
+/// A string parameter of a `heartwood_note_*` request (`params[0].<name>`).
+fn note_param(request: &nip46::Nip46Request, name: &str) -> Option<String> {
+    request
+        .params
+        .first()
+        .and_then(|p| p.get(name))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Header and title for a note card answering several asks with one hold:
+/// each ask's note looked up in the locker now, so the total is what the
+/// locker would release, and the count is every ask whatever the locker
+/// says (`heartwood_common::note_cmd::batch_card`).
+fn note_batch_card(header: &str, asks: &[ButtonAsk]) -> (String, String) {
+    use heartwood_common::note_cmd::{batch_card, BatchNote};
+    let metas: Vec<Option<heartwood_common::note_store::NoteMeta>> = asks
+        .iter()
+        .map(|a| {
+            let id = note_param(&a.ask.request, "id")?;
+            crate::notes::with_locker(|notes| notes.store.get_meta(&id))
+        })
+        .collect();
+    let notes: Vec<BatchNote<'_>> = metas
+        .iter()
+        .map(|m| match m {
+            Some(m) => BatchNote { amount_msat: m.amount_msat, host: m.host.as_str() },
+            None => BatchNote { amount_msat: 0, host: "" },
+        })
+        .collect();
+    let to = if header == "SEND NOTE" {
+        asks.first().and_then(|a| note_param(&a.ask.request, "to"))
+    } else {
+        None
+    };
+    batch_card(header, &notes, to.as_deref())
 }
 
 /// Note methods get the amount card rather than the method-name card, with

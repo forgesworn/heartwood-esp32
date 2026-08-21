@@ -60,6 +60,8 @@ pub mod note_wrap;
 #[cfg(feature = "nip46")]
 pub mod note_cmd;
 
+pub mod note_fmt;
+
 #[cfg(feature = "mnemonic")]
 pub mod mnemonic;
 

@@ -1084,7 +1084,21 @@ scripts/nip46-client.mjs conventions):
 17. Same-method batch collapse: several `heartwood_note_export` asks from
     the same client collapse onto one card whose single hold answers the
     batch; a concurrent `sign_event` ask gets its OWN card — one hold must
-    never cover both a signature and a disclosure. NOT YET BENCH-RUN.
+    never cover both a signature and a disclosure. BENCH-RUN 2026-08-21
+    (web wallet collecting three notes) and it exposed a lie: the card
+    read `RELEASE NOTE / 12 sats` while the hold released three notes
+    worth 1,110 sats. Now: a batched note card reads `RELEASE 3 NOTES /
+    1110 sats @ <host>` (or `@ 2 mints`), the count and total re-drawn as
+    each ask joins, and a join DISARMS the card so a press already under
+    way is discarded and the operator presses again on the card that names
+    the batch. Sends to different recipients never share a card. Verify:
+    collect three notes from the web wallet; the card must name `3 NOTES`
+    and the sum before you hold, then `SPEND 3 NOTES` the same way. The
+    serial log now prints the wording each join produced, so this is
+    checkable without eyes on the panel. Seen on the v4 board 2026-08-21
+    21:27 UTC, and the hold that followed answered both asks:
+    `joins the open approval card (2 asks); card reads 'RELEASE 2 NOTES'
+    / '24 sats @ mint.forgesworn.dev/w'`.
 
 Regression watch: a USB `sign_event` approval and a factory reset must behave
 exactly as before; FIRMWARE_INFO's nvs entry stats now include the

@@ -480,6 +480,51 @@ pub const NOTE_METHODS: [&str; 11] = [
 /// so the translation is host-tested; `Err` is the NIP-46 error string.
 /// Unknown methods and non-object params are refused here, so the firmware
 /// arm stays a straight pipe.
+/// One note a relay card speaks for: what the locker knows about it.
+pub struct BatchNote<'a> {
+    pub amount_msat: u64,
+    pub host: &'a str,
+}
+
+/// Header and title for a relay card that answers MORE THAN ONE gated note
+/// command with a single hold.
+///
+/// The batch machinery (approval_queue) lets the same client's repeat asks
+/// for the same method share a card, which is how a wallet collects three
+/// notes with one hold instead of three. That is fine only if the card says
+/// so: a card reading "RELEASE NOTE / 12 sats" whose hold releases three
+/// notes worth 1,110 sats has told the owner a lie about their money. So a
+/// batch card names the count, the total, and the mint (or how many mints)
+/// — the same rule the signing card follows with its "x3".
+///
+/// `header` is the single-note header ("RELEASE NOTE"); `notes` is every
+/// ask on the card, locker-known amounts only (a missing note contributes
+/// nothing and the count still includes it, so the total can only ever be
+/// an under-statement, never an over-statement that hides a note).
+pub fn batch_card(header: &str, notes: &[BatchNote<'_>], recipient: Option<&str>) -> (String, String) {
+    let action = header.strip_suffix(" NOTE").unwrap_or(header);
+    let head = format!("{action} {} NOTES", notes.len());
+    // Summed in msat and formatted ONCE. Truncating each note to sats first
+    // and adding those loses up to a sat per note: three notes of 1 999 msat
+    // are 5 997 msat, not the 3 sats a per-note division reports.
+    let total = notes.iter().fold(0u64, |acc, n| acc.saturating_add(n.amount_msat));
+    let amount = crate::note_fmt::format_amount(total);
+    let mut hosts: Vec<&str> = notes.iter().map(|n| n.host).filter(|h| !h.is_empty()).collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    let first = match hosts.as_slice() {
+        [] => amount,
+        [one] => format!("{amount} @ {}", crate::note_fmt::elide_host(one, crate::note_fmt::CARD_LINE_CHARS)),
+        many => format!("{amount} @ {} mints", many.len()),
+    };
+    let title = match recipient {
+        Some(to) if to.len() == 64 => format!("{first}\nto {}..{}", &to[..8], &to[56..]),
+        Some(_) => format!("{first}\nto ?"),
+        None => first,
+    };
+    (head, title)
+}
+
 pub fn note_cmd_for_method(method: &str, params: &[Value]) -> Result<Value, &'static str> {
     let cmd = match method {
         "heartwood_note_list" => "list_notes",
@@ -1078,5 +1123,71 @@ mod tests {
         assert_eq!(note_cmd_for_method("heartwood_note_trusted", &[]).unwrap()["cmd"], "list_trusted");
         assert!(NOTE_METHODS.contains(&"heartwood_note_trust"));
         assert!(NOTE_METHODS.contains(&"heartwood_note_trusted"));
+    }
+
+    #[test]
+    fn a_batch_card_names_the_count_total_and_mint() {
+        let notes = [
+            BatchNote { amount_msat: 12_000, host: "mint.forgesworn.dev" },
+            BatchNote { amount_msat: 104_000, host: "mint.forgesworn.dev" },
+            BatchNote { amount_msat: 994_000, host: "mint.forgesworn.dev" },
+        ];
+        let (head, title) = batch_card("RELEASE NOTE", &notes, None);
+        assert_eq!(head, "RELEASE 3 NOTES");
+        assert_eq!(title, "1 110 sats @ mint.forgesworn.dev");
+        let (head, title) = batch_card("SPEND NOTE", &notes[..2], None);
+        assert_eq!(head, "SPEND 2 NOTES");
+        assert_eq!(title, "116 sats @ mint.forgesworn.dev");
+    }
+
+    #[test]
+    fn a_batch_across_mints_says_how_many_mints() {
+        let notes = [
+            BatchNote { amount_msat: 50_000, host: "a.example" },
+            BatchNote { amount_msat: 50_000, host: "b.example" },
+            BatchNote { amount_msat: 1_000, host: "a.example" },
+        ];
+        let (_, title) = batch_card("RELEASE NOTE", &notes, None);
+        assert_eq!(title, "101 sats @ 2 mints");
+    }
+
+    #[test]
+    fn a_batch_send_names_the_recipient_once() {
+        let to = "ab".repeat(32);
+        let notes = [
+            BatchNote { amount_msat: 5_000, host: "a.example" },
+            BatchNote { amount_msat: 5_000, host: "a.example" },
+        ];
+        let (head, title) = batch_card("SEND NOTE", &notes, Some(&to));
+        assert_eq!(head, "SEND 2 NOTES");
+        assert_eq!(title, "10 sats @ a.example\nto abababab..abababab");
+        let (_, title) = batch_card("SEND NOTE", &notes, Some("junk"));
+        assert!(title.ends_with("\nto ?"));
+    }
+
+    #[test]
+    fn a_batch_of_sub_sat_notes_is_not_rounded_to_nothing() {
+        let notes = [
+            BatchNote { amount_msat: 1_999, host: "a.example" },
+            BatchNote { amount_msat: 1_999, host: "a.example" },
+            BatchNote { amount_msat: 1_999, host: "a.example" },
+        ];
+        let (_, title) = batch_card("RELEASE NOTE", &notes, None);
+        // Dividing each note by 1000 first and adding those would have said
+        // "3 sats" for 5 997 msat, and "0 sats" for any note under one sat.
+        assert_eq!(title, "5 997 msat @ a.example");
+    }
+
+    #[test]
+    fn a_batch_with_an_unknown_note_still_counts_it() {
+        // The total can under-state (an unknown amount adds nothing) but the
+        // count never does: the owner is told how many holds this one is.
+        let notes = [
+            BatchNote { amount_msat: 7_000, host: "a.example" },
+            BatchNote { amount_msat: 0, host: "" },
+        ];
+        let (head, title) = batch_card("DISCARD NOTE", &notes, None);
+        assert_eq!(head, "DISCARD 2 NOTES");
+        assert_eq!(title, "7 sats @ a.example");
     }
 }

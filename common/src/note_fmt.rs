@@ -79,15 +79,29 @@ pub fn elide_host(host: &str, max: usize) -> String {
     format!("..{tail}")
 }
 
+/// The money line of a note card, forced onto ONE line, for a card whose
+/// second line is already spoken for (a send names its recipient there).
+///
+/// The host gives up the characters, never the amount: a clipped host is a
+/// host the owner must look harder at, a clipped amount is a wrong number.
+/// If there is not even room for a useful host, the amount goes alone.
+pub fn amount_and_host_line(msat: u64, host: &str, max: usize) -> String {
+    let amount = format_amount(msat);
+    let room = max.saturating_sub(amount.chars().count() + 3);
+    if room < 6 {
+        return amount;
+    }
+    format!("{amount} @ {}", elide_host(host, room))
+}
+
 /// The money line of a note card: the amount, and the mint it is drawn on.
 ///
-/// Returns one line when both fit, two when they do not. The amount is never
-/// the field that gets elided — a clipped host is a host the owner must look
-/// harder at, a clipped amount is a wrong number.
+/// Returns one line when both fit, two when they do not, so a long host
+/// costs a line rather than costing the owner the host. Only for cards with
+/// a spare line; use [`amount_and_host_line`] where the second is taken.
 pub fn amount_and_host(msat: u64, host: &str, max: usize) -> String {
     let amount = format_amount(msat);
-    let inline_host = elide_host(host, max);
-    let inline = format!("{amount} @ {inline_host}");
+    let inline = format!("{amount} @ {}", elide_host(host, max));
     if inline.chars().count() <= max {
         return inline;
     }
@@ -135,6 +149,23 @@ mod tests {
         assert_eq!(out.chars().count(), 20);
         assert!(out.ends_with("evil.example.com"));
         assert!(out.starts_with(".."));
+    }
+
+    #[test]
+    fn a_one_line_card_gives_up_host_characters_not_amount_ones() {
+        // A send card's second line is the recipient, so the money has to
+        // fit on one line whatever the host costs.
+        let out = amount_and_host_line(1_110_000, "mint.forgesworn.dev/w", 25);
+        assert_eq!(out.chars().count(), 25);
+        assert!(out.starts_with("1 110 sats @ "));
+        // Elided from the left, so the registrable domain and TLD survive.
+        assert!(out.ends_with("esworn.dev"), "{out}");
+        assert!(out.contains(" @ .."));
+        assert!(!out.contains('\n'));
+
+        // No room for a host worth reading: the amount goes alone rather
+        // than sharing a line with two characters of mint.
+        assert_eq!(amount_and_host_line(2_100_000_000, "mint.example", 16), "2 100 000 sats");
     }
 
     #[test]

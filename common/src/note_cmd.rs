@@ -27,6 +27,7 @@ use zeroize::Zeroize;
 
 use crate::hex::{hex_decode, hex_encode};
 use crate::note_store::{NoteError, NoteMeta, NoteState, NoteStorage, NoteStore, Peer, SECRET_LEN};
+use crate::trust::TrustList;
 
 /// Which command is asking for physical approval, so the OLED can name the
 /// action rather than showing a generic prompt.
@@ -40,6 +41,9 @@ pub enum GatedCmd {
     /// Seal the secret to another pubkey on-device (note_wrap.rs). A
     /// disclosure, like export, but the host never sees the plaintext.
     Send,
+    /// Add a sender whose wraps are stored without a hold (trust.rs). Not
+    /// about a note, so it goes through `approve_trust`, not `approve`.
+    Trust,
 }
 
 impl GatedCmd {
@@ -51,6 +55,7 @@ impl GatedCmd {
             GatedCmd::Rename => "rename",
             GatedCmd::Delete => "delete",
             GatedCmd::Send => "send",
+            GatedCmd::Trust => "trust",
         }
     }
 }
@@ -86,6 +91,11 @@ pub struct NoteCmdContext<'a> {
     /// dispatcher itself gates everything in [`GatedCmd`].
     pub approve: &'a mut dyn FnMut(GatedCmd, &NoteMeta) -> Approval,
     pub wrap: Option<WrapFn<'a>>,
+    /// Senders whose wraps are stored without a hold. Persisted through
+    /// `storage.save_trust`; a refusal there is `storage_full`.
+    pub trust: &'a mut TrustList,
+    /// Asked before a sender is trusted: the card names the key, not a note.
+    pub approve_trust: &'a mut dyn FnMut(&[u8; 32]) -> Approval,
     /// Seconds since some fixed epoch for created_at/updated_at. Boot time is
     /// fine — informational, never authoritative (the mint's state is).
     pub now: u32,
@@ -206,7 +216,45 @@ pub fn handle_note_cmd(ctx: &mut NoteCmdContext<'_>, msg: &str) -> Value {
                 "note_count": note_count,
                 "pending_count": pending_count,
                 "received_count": ctx.store.received_count(),
+                "trusted_count": ctx.trust.len(),
             })
+        }
+
+        // ---- trusted senders: wraps from these are stored without a hold ----
+        "list_trusted" => json!({
+            "ok": true,
+            "trusted": ctx.trust.iter().map(|k| Value::String(hex_encode(k))).collect::<Vec<_>>(),
+        }),
+
+        "trust" => {
+            let Some(pubkey) = str_field(&cmd, "pubkey").and_then(pubkey_field) else {
+                return err_msg("bad_request", "pubkey must be 32 bytes of hex");
+            };
+            if cmd.get("remove").and_then(Value::as_bool) == Some(true) {
+                // Withdrawing trust only ever adds a hold back; no button.
+                let was = ctx.trust.remove(&pubkey);
+                if was && ctx.storage.save_trust(&ctx.trust.encode()).is_err() {
+                    return err("storage_full");
+                }
+                return json!({"ok": true, "trusted": false, "changed": was});
+            }
+            if ctx.trust.contains(&pubkey) {
+                return json!({"ok": true, "trusted": true, "changed": false});
+            }
+            if ctx.trust.len() >= crate::trust::MAX_TRUSTED {
+                return err_msg("bad_request", "trust list full");
+            }
+            if let Some(resp) = approval_err((ctx.approve_trust)(&pubkey)) {
+                return resp;
+            }
+            if ctx.trust.add(pubkey) != Ok(true) {
+                return err_msg("bad_request", "trust list full");
+            }
+            if ctx.storage.save_trust(&ctx.trust.encode()).is_err() {
+                ctx.trust.remove(&pubkey);
+                return err("storage_full");
+            }
+            json!({"ok": true, "trusted": true, "changed": true})
         }
 
         "list_notes" => {
@@ -375,7 +423,8 @@ fn required_state(kind: GatedCmd) -> Option<NoteState> {
         }
         GatedCmd::Discard => Some(NoteState::Pending),
         GatedCmd::Delete => Some(NoteState::Spent),
-        GatedCmd::Rename => None,
+        // Rename takes any state; trust is not about a note at all.
+        GatedCmd::Rename | GatedCmd::Trust => None,
     }
 }
 
@@ -411,7 +460,7 @@ fn gated_by_id(
 /// The note methods served over the relay path, in the order the
 /// capabilities advert lists them. Rename/delete are deliberately absent:
 /// housekeeping stays a USB-cable operation.
-pub const NOTE_METHODS: [&str; 9] = [
+pub const NOTE_METHODS: [&str; 11] = [
     "heartwood_note_list",
     "heartwood_note_new",
     "heartwood_note_new_pair",
@@ -421,6 +470,8 @@ pub const NOTE_METHODS: [&str; 9] = [
     "heartwood_note_import",
     "heartwood_note_spent",
     "heartwood_note_send",
+    "heartwood_note_trust",
+    "heartwood_note_trusted",
 ];
 
 /// Map a `heartwood_note_*` NIP-46 request onto the wire command object the
@@ -440,6 +491,8 @@ pub fn note_cmd_for_method(method: &str, params: &[Value]) -> Result<Value, &'st
         "heartwood_note_import" => "import_secret",
         "heartwood_note_spent" => "mark_spent",
         "heartwood_note_send" => "send",
+        "heartwood_note_trust" => "trust",
+        "heartwood_note_trusted" => "list_trusted",
         _ => return Err("unknown note method"),
     };
     let mut fields = match params.first() {
@@ -465,11 +518,13 @@ mod tests {
     struct MemStorage {
         index: Option<Vec<String>>,
         notes: BTreeMap<String, Vec<u8>>,
+            trust: Option<Vec<u8>>,
+        persist_ok: bool,
     }
 
     impl MemStorage {
         fn new() -> Self {
-            MemStorage { index: None, notes: BTreeMap::new() }
+            MemStorage { index: None, notes: BTreeMap::new(), trust: None, persist_ok: true }
         }
     }
 
@@ -492,6 +547,13 @@ mod tests {
             self.notes.remove(id);
             Ok(())
         }
+        fn save_trust(&mut self, blob: &[u8]) -> Result<(), StorageError> {
+            if !self.persist_ok {
+                return Err(StorageError);
+            }
+            self.trust = Some(blob.to_vec());
+            Ok(())
+        }
     }
 
     struct Harness {
@@ -503,6 +565,9 @@ mod tests {
         /// went where it should and nowhere else.
         wrapped: Vec<([u8; SECRET_LEN], [u8; 32])>,
         can_wrap: bool,
+        trust: TrustList,
+        trust_asked: Vec<[u8; 32]>,
+        persist_ok: bool,
     }
 
     impl Harness {
@@ -516,6 +581,9 @@ mod tests {
                 asked: Vec::new(),
                 wrapped: Vec::new(),
                 can_wrap: true,
+                trust: TrustList::new(),
+                trust_asked: Vec::new(),
+                persist_ok: true,
             }
         }
 
@@ -540,12 +608,20 @@ mod tests {
                 wrapped.push((*secret, *to));
                 Ok(serde_json::json!({"kind": 1059, "content": "sealed"}))
             };
+            let trust_asked = &mut self.trust_asked;
+            let mut approve_trust = move |pk: &[u8; 32]| {
+                trust_asked.push(*pk);
+                answer
+            };
+            self.storage.persist_ok = self.persist_ok;
             let mut ctx = NoteCmdContext {
                 store: &mut self.store,
                 storage: &mut self.storage,
                 rng: &mut rng,
                 approve: &mut approve,
                 wrap: if self.can_wrap { Some(&mut wrap) } else { None },
+                trust: &mut self.trust,
+                approve_trust: &mut approve_trust,
                 now: 42,
                 fw_version: "0.0.0-test",
                 board: "host",
@@ -929,5 +1005,78 @@ mod tests {
             assert_eq!(res["ok"], false, "{msg}");
             assert_eq!(res["error"], "bad_request", "{msg}");
         }
+    }
+
+    #[test]
+    fn trusting_a_sender_is_gated_once_and_persisted() {
+        let mut h = Harness::new();
+        let mint = "ab".repeat(32);
+        let res = h.run(&format!(r#"{{"cmd":"trust","pubkey":"{mint}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(res["changed"], true);
+        assert_eq!(h.trust_asked.len(), 1, "one hold to trust");
+        assert!(h.trust.contains(&[0xab; 32]));
+        assert_eq!(h.storage.trust.as_deref(), Some(h.trust.encode().as_slice()));
+
+        // Again: already trusted, no second hold.
+        let res = h.run(&format!(r#"{{"cmd":"trust","pubkey":"{mint}"}}"#));
+        assert_eq!(res["changed"], false);
+        assert_eq!(h.trust_asked.len(), 1);
+
+        let res = h.run(r#"{"cmd":"list_trusted"}"#);
+        assert_eq!(res["trusted"], serde_json::json!([mint]));
+        let info = h.run(r#"{"cmd":"get_info"}"#);
+        assert_eq!(info["trusted_count"], 1);
+
+        // Withdrawing trust needs no hold.
+        let res = h.run(&format!(r#"{{"cmd":"trust","pubkey":"{mint}","remove":true}}"#));
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["changed"], true);
+        assert!(h.trust.is_empty());
+        assert_eq!(h.trust_asked.len(), 1);
+    }
+
+    #[test]
+    fn trust_refuses_a_bad_key_a_declined_hold_and_a_full_list() {
+        let mut h = Harness::new();
+        assert_eq!(h.run(r#"{"cmd":"trust","pubkey":"abc"}"#)["error"], "bad_request");
+        assert_eq!(h.run(r#"{"cmd":"trust"}"#)["error"], "bad_request");
+        assert!(h.trust_asked.is_empty(), "nothing askable was asked");
+
+        h.answer = Approval::Declined;
+        let res = h.run(&format!(r#"{{"cmd":"trust","pubkey":"{}"}}"#, "cd".repeat(32)));
+        assert_eq!(res["error"], "user_declined");
+        assert!(h.trust.is_empty());
+        assert!(h.storage.trust.is_none(), "a refusal writes nothing");
+
+        h.answer = Approval::Approved;
+        for n in 0..crate::trust::MAX_TRUSTED as u8 {
+            let res = h.run(&format!(r#"{{"cmd":"trust","pubkey":"{}"}}"#, format!("{n:02x}").repeat(32)));
+            assert_eq!(res["ok"], true, "{res}");
+        }
+        let res = h.run(&format!(r#"{{"cmd":"trust","pubkey":"{}"}}"#, "ff".repeat(32)));
+        assert_eq!(res["error"], "bad_request");
+        assert_eq!(res["message"], "trust list full");
+        // The declined one above, plus the eight that filled it; not the ninth.
+        assert_eq!(h.trust_asked.len(), 1 + crate::trust::MAX_TRUSTED, "a full list is refused before the hold");
+    }
+
+    #[test]
+    fn a_trust_that_cannot_be_persisted_is_not_trusted() {
+        let mut h = Harness::new();
+        h.persist_ok = false;
+        let res = h.run(&format!(r#"{{"cmd":"trust","pubkey":"{}"}}"#, "ee".repeat(32)));
+        assert_eq!(res["error"], "storage_full");
+        assert!(h.trust.is_empty(), "an unpersisted trust would vanish at reboot and mislead until then");
+    }
+
+    #[test]
+    fn trust_methods_map_onto_the_wire_commands() {
+        let cmd = note_cmd_for_method("heartwood_note_trust", &[serde_json::json!({"pubkey": "ab"})]).unwrap();
+        assert_eq!(cmd["cmd"], "trust");
+        assert_eq!(cmd["pubkey"], "ab");
+        assert_eq!(note_cmd_for_method("heartwood_note_trusted", &[]).unwrap()["cmd"], "list_trusted");
+        assert!(NOTE_METHODS.contains(&"heartwood_note_trust"));
+        assert!(NOTE_METHODS.contains(&"heartwood_note_trusted"));
     }
 }

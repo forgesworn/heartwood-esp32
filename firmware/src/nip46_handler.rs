@@ -86,6 +86,8 @@ fn is_note_method(method: &nip46::Nip46Method) -> bool {
             | nip46::Nip46Method::HeartwoodNoteImport
             | nip46::Nip46Method::HeartwoodNoteSpent
             | nip46::Nip46Method::HeartwoodNoteSend
+            | nip46::Nip46Method::HeartwoodNoteTrust
+            | nip46::Nip46Method::HeartwoodNoteTrusted
     )
 }
 
@@ -1603,6 +1605,8 @@ fn dispatch_inner(
                 "heartwood_note_import",
                 "heartwood_note_spent",
                 "heartwood_note_send",
+                "heartwood_note_trust",
+                "heartwood_note_trusted",
             ];
             nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
         }

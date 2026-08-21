@@ -213,6 +213,13 @@ pub trait NoteStorage {
     fn load_note(&mut self, id: &str) -> Result<Option<Vec<u8>>, StorageError>;
     fn save_note(&mut self, id: &str, blob: &[u8]) -> Result<(), StorageError>;
     fn delete_note(&mut self, id: &str) -> Result<(), StorageError>;
+    /// The trusted-sender list (`trust::TrustList::encode`), beside the
+    /// notes. A storage that cannot keep it refuses, and the command layer
+    /// then refuses the trust: an unpersisted trust would vanish at reboot
+    /// and mislead until then.
+    fn save_trust(&mut self, _blob: &[u8]) -> Result<(), StorageError> {
+        Err(StorageError)
+    }
 }
 
 // ---- codec ----

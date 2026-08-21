@@ -1129,6 +1129,16 @@ notecase `heartwood send`.
    seal signer, and a rumor whose URL has no amount. Expect: silent drop
    with one `[relay] gift wrap ... not for us / is not a note` log line,
    no card, no wake.
+2b. Trusted sender: `notecase heartwood trust <mint npub>` puts up a
+   TRUST SENDER card (npub, both ends visible); hold. `heartwood trusted`
+   lists it; it survives a reboot. A wrap sealed by that key now stores
+   on arrival with NO card: a three-second "N sats received / from
+   <host>" toast, `note ... received from trusted sender` in the log, and
+   the ledger has it (reboot: no re-offer). A wrap from anyone else still
+   gets the card. With the letterbox full, a trusted wrap is deferred
+   exactly as an untrusted one (`dropped until there is room`), never
+   silently lost. `heartwood untrust` needs no hold and the next wrap from
+   that key gets a card again.
 3a. From a stranger's client: on a phone running any NIP-17 client
    (0xchat, Amethyst), resolve the device's NIP-05, and DM it a note as
    plain text, once as `lnurlw://...`, once as bech32 `LNURL1...`, once

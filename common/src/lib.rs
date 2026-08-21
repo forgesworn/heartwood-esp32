@@ -50,6 +50,8 @@ pub mod approval_queue;
 
 pub mod wrap_ledger;
 
+pub mod trust;
+
 pub mod note_store;
 
 #[cfg(feature = "nip46")]

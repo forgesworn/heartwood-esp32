@@ -94,6 +94,13 @@ positive amount. A rumor whose `pubkey` is not the seal's signer (the
 NIP-59 rule). The receiver's own card shows the amount and host from the
 note, and those are the sender's word until a mint is asked.
 
+**Trusted senders.** A receiver MAY store a note without asking its owner
+when the seal's signer is a key the owner has trusted, for instance the
+Nostr key a public mint publishes as `nostrPubkey` on its zap payRequest.
+Trust attaches to the seal signer, which NIP-59 authenticates, never to
+the wrap's throwaway key. A trusted sender gets no more room than anyone
+else: storage caps apply before trust is consulted.
+
 **Stored wraps.** A kind `1059` is a regular event: relays keep it. A
 receiver that is not always online MUST ask for stored wraps when it
 connects, not only stream live ones, or a note sent while it was off is

@@ -4061,6 +4061,44 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
 
     let sender_hex = hex_encode(&opened.sender);
     let sats = note.amount_msat / 1000;
+
+    // A trusted sender (a public mint the owner holds the button for once,
+    // see common/src/trust.rs) is stored on arrival: a zap paid out as a
+    // note should not need a human. The hold protected a slot, and the
+    // letterbox cap above still does. Decided for the ledger as a hold
+    // would be; a refusal by the locker is left undecided so the wrap
+    // comes back once there is room.
+    if crate::notes::is_trusted_sender(&opened.sender) {
+        match crate::notes::receive_note(&note.secret, &note.host, note.amount_msat, &opened.sender) {
+            Ok((id, created)) => {
+                log::info!(
+                    "[relay] note {id} received from trusted sender {} (new: {created})",
+                    &sender_hex[..8]
+                );
+                remember_wrap(ctx, &ev.id);
+                if ctx.wrap_ledger.decide(&ev.id, ev.created_at) {
+                    crate::notes::store_wrap_ledger(&ctx.wrap_ledger.encode());
+                }
+                if created && !approval_card_open(ctx) {
+                    if !ctx.display_on {
+                        crate::oled::wake_display(ctx.display);
+                        ctx.display_on = true;
+                    }
+                    let bare_host = note.host.split('/').next().unwrap_or(note.host.as_str());
+                    crate::oled::show_change_done(
+                        ctx.display,
+                        &format!("{sats} sats received"),
+                        &format!("from {bare_host}"),
+                    );
+                    ctx.last_activity = Instant::now();
+                    ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(3));
+                }
+            }
+            Err(e) => log::warn!("[relay] trusted note refused by the locker: {}", e.code()),
+        }
+        return;
+    }
+
     // The host is the field that decides whether this note is worth
     // anything, and it is the field an attacker wants cut short: clipped at
     // the panel's edge, mint.forgesworn.dev and mint.forgesworn.evil.com

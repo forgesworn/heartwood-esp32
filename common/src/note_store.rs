@@ -99,6 +99,10 @@ pub struct Note {
     pub secret: [u8; SECRET_LEN],
     pub state: NoteState,
     pub amount_msat: u64,
+    /// The note's withdraw endpoint, path and all: "mint.example/w", not
+    /// "mint.example/w". LUD-25 makes `lnurlw://<host>?k1=..&amount=..` the
+    /// bearer note itself, so a host stored without its path yields a URL that
+    /// 404s and a note nobody can claim. Stored opaquely; never parsed here.
     pub host: String,
     pub label: String,
     /// Optional LUD-25 mint signature over (note id, amount), hex. Stored
@@ -123,6 +127,10 @@ pub struct NoteMeta {
     pub id: String,
     pub state: NoteState,
     pub amount_msat: u64,
+    /// The note's withdraw endpoint, path and all: "mint.example/w", not
+    /// "mint.example/w". LUD-25 makes `lnurlw://<host>?k1=..&amount=..` the
+    /// bearer note itself, so a host stored without its path yields a URL that
+    /// 404s and a note nobody can claim. Stored opaquely; never parsed here.
     pub host: String,
     pub label: String,
     pub sig: String,
@@ -894,7 +902,7 @@ mod tests {
             secret: [7u8; SECRET_LEN],
             state: NoteState::Confirmed,
             amount_msat: 21_000,
-            host: "mint.example".to_string(),
+            host: "mint.example/w".to_string(),
             label: "coffee float".to_string(),
             sig: "ab".repeat(65),
             parent_ids: vec!["deadbeef".to_string(), "cafef00d".to_string()],
@@ -955,7 +963,7 @@ mod tests {
         assert_eq!(h.len(), 64);
         assert_eq!(store.counts(), (1, 1));
 
-        store.confirm(&mut storage, &id, 21_000, "mint.example", None, 20).unwrap();
+        store.confirm(&mut storage, &id, 21_000, "mint.example/w", None, 20).unwrap();
         let meta = store.get_meta(&id).unwrap();
         assert_eq!(meta.state, NoteState::Confirmed);
         assert_eq!(meta.amount_msat, 21_000);
@@ -988,10 +996,10 @@ mod tests {
         assert_eq!(store.mark_spent(&mut storage, &id, 0), Err(NoteError::InvalidState));
         assert_eq!(store.delete(&mut storage, &id), Err(NoteError::InvalidState));
 
-        store.confirm(&mut storage, &id, 1_000, "mint.example", None, 0).unwrap();
+        store.confirm(&mut storage, &id, 1_000, "mint.example/w", None, 0).unwrap();
         // CONFIRMED: no re-confirm, no discard, no delete.
         assert_eq!(
-            store.confirm(&mut storage, &id, 1_000, "mint.example", None, 0),
+            store.confirm(&mut storage, &id, 1_000, "mint.example/w", None, 0),
             Err(NoteError::InvalidState)
         );
         assert_eq!(store.discard(&mut storage, &id), Err(NoteError::InvalidState));
@@ -1014,7 +1022,7 @@ mod tests {
         let k1 = "ab".repeat(32);
 
         let (id, created) = store
-            .import_secret(&mut storage, &mut rng, &k1, "mint.example", 5_000, "gift", 10)
+            .import_secret(&mut storage, &mut rng, &k1, "mint.example/w", 5_000, "gift", 10)
             .unwrap();
         assert!(created);
 
@@ -1026,13 +1034,13 @@ mod tests {
         assert!(!created2);
         let meta = store.get_meta(&id).unwrap();
         assert_eq!(meta.amount_msat, 5_000);
-        assert_eq!(meta.host, "mint.example");
+        assert_eq!(meta.host, "mint.example/w");
         assert_eq!(store.counts(), (1, 0));
 
         // Re-importing an already-spent secret returns it, still SPENT.
         store.mark_spent(&mut storage, &id, 30).unwrap();
         let (id3, created3) = store
-            .import_secret(&mut storage, &mut rng, &k1, "mint.example", 5_000, "", 40)
+            .import_secret(&mut storage, &mut rng, &k1, "mint.example/w", 5_000, "", 40)
             .unwrap();
         assert_eq!(id3, id);
         assert!(!created3);
@@ -1074,7 +1082,7 @@ mod tests {
         // Seed one confirmed note, then make the index unreadable.
         let mut store = fresh_store(&mut storage);
         let (id, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
-        store.confirm(&mut storage, &id, 1_000, "mint.example", None, 0).unwrap();
+        store.confirm(&mut storage, &id, 1_000, "mint.example/w", None, 0).unwrap();
 
         storage.index_read_fails = true;
         let outcome = NoteStore::load(&mut storage, MAX_NOTES);
@@ -1255,11 +1263,11 @@ mod tests {
         // Mint: preimage arrives from the browser, is imported, and per
         // LUD-25 immediately rotated (the mint was a prior holder).
         let preimage = "5a".repeat(32);
-        let (minted, _) = step!(store.import_secret(storage, &mut rng, &preimage, "mint.example", 10_000, "mint", 1));
+        let (minted, _) = step!(store.import_secret(storage, &mut rng, &preimage, "mint.example/w", 10_000, "mint", 1));
         let (rot_id, rot_h) = step!(store.new_secret(storage, &mut rng, &[minted.clone()], "", 2));
         disclosed.push((rot_id.clone(), rot_h));
         // Mint said OK to the rotate:
-        step!(store.confirm(storage, &rot_id, 10_000, "mint.example", None, 3));
+        step!(store.confirm(storage, &rot_id, 10_000, "mint.example/w", None, 3));
         step!(mark_spent_idem(&mut store, storage, &minted, 4));
 
         // Spend 3 000 of it: split into target + change, melt the target.
@@ -1268,8 +1276,8 @@ mod tests {
             step!(store.new_secret_pair(storage, &mut rng, &[rot_id.clone()], "", 5));
         disclosed.push((tgt.clone(), tgt_h));
         disclosed.push((chg.clone(), chg_h));
-        step!(store.confirm(storage, &tgt, 3_000, "mint.example", None, 6));
-        step!(store.confirm(storage, &chg, 7_000, "mint.example", None, 6));
+        step!(store.confirm(storage, &tgt, 3_000, "mint.example/w", None, 6));
+        step!(store.confirm(storage, &chg, 7_000, "mint.example/w", None, 6));
         step!(mark_spent_idem(&mut store, storage, &rot_id, 7));
         // Melt of the target settled:
         step!(mark_spent_idem(&mut store, storage, &tgt, 8));
@@ -1331,7 +1339,7 @@ mod tests {
         let id = {
             let mut store = fresh_store(&mut storage);
             let (id, created) = store
-                .import_secret(&mut storage, &mut rng, &k1, "mint.example", 5_000, "", 0)
+                .import_secret(&mut storage, &mut rng, &k1, "mint.example/w", 5_000, "", 0)
                 .unwrap();
             assert!(created);
             id
@@ -1339,7 +1347,7 @@ mod tests {
         // A fresh boot must still recognise the secret as already held.
         let mut store = fresh_store(&mut storage);
         let (id2, created2) = store
-            .import_secret(&mut storage, &mut rng, &k1, "mint.example", 5_000, "", 1)
+            .import_secret(&mut storage, &mut rng, &k1, "mint.example/w", 5_000, "", 1)
             .unwrap();
         assert_eq!(id2, id);
         assert!(!created2);
@@ -1401,7 +1409,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .import_secret(&mut storage, &mut rng, "zz", "mint.example", 1, "", 0)
+                .import_secret(&mut storage, &mut rng, "zz", "mint.example/w", 1, "", 0)
                 .err(),
             Some(NoteError::BadRequest)
         );
@@ -1420,7 +1428,7 @@ mod tests {
         let mut store = fresh_store(&mut storage);
         let (a, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
         let (b, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
-        store.confirm(&mut storage, &a, 1_000, "mint.example", None, 1).unwrap();
+        store.confirm(&mut storage, &a, 1_000, "mint.example/w", None, 1).unwrap();
 
         // Fail after the first of the two blob writes.
         storage.budget = Some(1);
@@ -1442,14 +1450,14 @@ mod tests {
 
         storage.budget = Some(0);
         assert_eq!(
-            store.confirm(&mut storage, &id, 1_000, "mint.example", None, 1).err(),
+            store.confirm(&mut storage, &id, 1_000, "mint.example/w", None, 1).err(),
             Some(NoteError::StorageFull)
         );
         storage.budget = None;
 
         // RAM still says PENDING, matching flash, and the retry converges.
         assert_eq!(store.get_meta(&id).unwrap().state, NoteState::Pending);
-        store.confirm(&mut storage, &id, 1_000, "mint.example", None, 2).unwrap();
+        store.confirm(&mut storage, &id, 1_000, "mint.example/w", None, 2).unwrap();
         let reloaded = fresh_store(&mut storage);
         assert_eq!(reloaded.get_meta(&id).unwrap().state, NoteState::Confirmed);
     }

@@ -49,11 +49,13 @@ pub const MAX_HOST_LEN: usize = 64;
 /// bytes = 130 hex chars; allow a little slack for format drift upstream.
 pub const MAX_SIG_LEN: usize = 132;
 pub const MAX_PARENTS: usize = 16;
-/// Cap on notes that arrived by Nostr gift wrap and have not yet been rotated
-/// by a wallet. A letterbox, not a vault: the secret also sits encrypted on
-/// every relay that carried the wrap, and the device cannot rotate it, so
-/// these are held only until a wallet collects them. Low so a stranger
-/// cannot fill the locker with dust.
+/// Cap on notes that arrived by Nostr gift wrap from a sender the owner has
+/// NOT trusted, and have not yet been rotated by a wallet. A letterbox, not
+/// a vault: the secret also sits encrypted on every relay that carried the
+/// wrap, and the device cannot rotate it, so these are held only until a
+/// wallet collects them. Low so a stranger cannot fill the locker with
+/// dust. A trusted sender (trust.rs) is bounded by [`MAX_NOTES`] alone: a
+/// zap-paying mint is the owner's choice, and four is an evening of zaps.
 pub const MAX_RECEIVED: usize = 4;
 
 const NOTE_MAGIC: [u8; 4] = *b"HWNB";
@@ -213,6 +215,13 @@ pub trait NoteStorage {
     fn load_note(&mut self, id: &str) -> Result<Option<Vec<u8>>, StorageError>;
     fn save_note(&mut self, id: &str, blob: &[u8]) -> Result<(), StorageError>;
     fn delete_note(&mut self, id: &str) -> Result<(), StorageError>;
+    /// The trusted-sender list (`trust::TrustList::encode`), beside the
+    /// notes. A storage that cannot keep it refuses, and the command layer
+    /// then refuses the trust: an unpersisted trust would vanish at reboot
+    /// and mislead until then.
+    fn save_trust(&mut self, _blob: &[u8]) -> Result<(), StorageError> {
+        Err(StorageError)
+    }
 }
 
 // ---- codec ----
@@ -471,6 +480,17 @@ impl NoteStore {
         (self.notes.len(), pending)
     }
 
+    /// Whether one more received note would be admitted: the letterbox cap
+    /// for a stranger, the locker's own cap for a trusted sender. The
+    /// relay loop asks this before drawing a card or storing, so a wrap the
+    /// locker would refuse is deferred rather than shown.
+    pub fn has_room_for_received(&self, trusted: bool) -> bool {
+        if self.admit_creation(1).is_err() {
+            return false;
+        }
+        trusted || self.received_count() < MAX_RECEIVED
+    }
+
     /// Received notes a wallet has not yet rotated and marked spent.
     pub fn received_count(&self) -> usize {
         self.notes
@@ -658,7 +678,7 @@ impl NoteStore {
     /// Store a secret that arrived by gift wrap from `from`, CONFIRMED with
     /// provenance. Idempotent on the secret, like import: a relay replaying
     /// the same wrap yields the existing id and no second entry. Subject to
-    /// [`MAX_RECEIVED`] as well as the overall cap.
+    /// [`MAX_RECEIVED`] unless `trusted`, and to the overall cap always.
     #[allow(clippy::too_many_arguments)]
     pub fn receive(
         &mut self,
@@ -669,6 +689,7 @@ impl NoteStore {
         amount_msat: u64,
         from: &[u8; 32],
         now: u32,
+        trusted: bool,
     ) -> Result<(String, bool), NoteError> {
         if host.is_empty() || host.len() > MAX_HOST_LEN {
             return Err(NoteError::BadRequest);
@@ -676,7 +697,7 @@ impl NoteStore {
         if let Some(existing) = self.notes.iter().find(|n| n.secret == *secret) {
             return Ok((existing.id.clone(), false));
         }
-        if self.received_count() >= MAX_RECEIVED {
+        if !self.has_room_for_received(trusted) {
             return Err(NoteError::StorageFull);
         }
         self.admit_creation(1)?;
@@ -1087,7 +1108,7 @@ mod tests {
         let bob = [0xb0u8; 32];
 
         let (rid, created) = store
-            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], "mint.example", 5_000, &alice, 10)
+            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], "mint.example", 5_000, &alice, 10, false)
             .unwrap();
         assert!(created);
         let meta = store.get_meta(&rid).unwrap();
@@ -1096,7 +1117,7 @@ mod tests {
         assert_eq!(store.received_count(), 1);
         // Replayed wrap: same secret, same id, nothing new.
         let (again, created) = store
-            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], "other.example", 1, &bob, 11)
+            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], "other.example", 1, &bob, 11, false)
             .unwrap();
         assert_eq!(again, rid);
         assert!(!created);
@@ -1140,13 +1161,21 @@ mod tests {
         let alice = [0xa1u8; 32];
         for i in 0..MAX_RECEIVED {
             store
-                .receive(&mut storage, &mut rng, &[i as u8 + 1; SECRET_LEN], "m.example", 1, &alice, 1)
+                .receive(&mut storage, &mut rng, &[i as u8 + 1; SECRET_LEN], "m.example", 1, &alice, 1, false)
                 .unwrap();
         }
         assert_eq!(
-            store.receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], "m.example", 1, &alice, 1),
+            store.receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], "m.example", 1, &alice, 1, false),
             Err(NoteError::StorageFull)
         );
+        assert!(!store.has_room_for_received(false));
+        // A trusted sender is not bound by the letterbox, only by the locker.
+        assert!(store.has_room_for_received(true));
+        assert!(store
+            .receive(&mut storage, &mut rng, &[0x78; SECRET_LEN], "m.example", 1, &alice, 1, true)
+            .is_ok());
+        assert_eq!(store.received_count(), MAX_RECEIVED + 1);
+        store.mark_spent(&mut storage, &store.list(0, 8).notes[MAX_RECEIVED].id.clone(), 2).unwrap();
         // Minting is unaffected by the received cap.
         assert!(store.new_secret(&mut storage, &mut rng, &[], "", 2).is_ok());
         // Rotating one out (spent) frees a slot.
@@ -1154,7 +1183,7 @@ mod tests {
         store.mark_spent(&mut storage, &id, 3).unwrap();
         assert_eq!(store.received_count(), MAX_RECEIVED - 1);
         assert!(store
-            .receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], "m.example", 1, &alice, 4)
+            .receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], "m.example", 1, &alice, 4, false)
             .is_ok());
         // Nothing was written for the refused one.
         assert!(store.get_meta(&id).unwrap().state == NoteState::Spent);

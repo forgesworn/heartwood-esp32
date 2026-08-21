@@ -33,6 +33,7 @@ use heartwood_common::note_store::{
     NoteError, NoteMeta, NoteStorage, NoteStore, StorageError, ID_LEN, MAX_NOTES, SECRET_LEN,
 };
 use heartwood_common::seed_cipher;
+use heartwood_common::trust::TrustList;
 use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_NOTE_RESP};
 use zeroize::Zeroize;
 
@@ -46,6 +47,14 @@ const NAMESPACE: &str = "hw_notes";
 const INDEX_KEY: &str = "idx";
 /// The wrapped note key: `seed_cipher::encrypt_seed(secret, note_key)`.
 const NK_KEY: &str = "nk";
+/// The gift-wrap ledger (`wrap_ledger::WrapLedger::encode`): which wraps the
+/// owner has decided on, so a catch-up REQ does not re-offer them.
+const WRAPS_KEY: &str = "wraps";
+/// Trusted senders (`trust::TrustList::encode`): wraps sealed by these are
+/// stored without a hold.
+const TRUST_KEY: &str = "trust";
+const TRUST_BUF: usize = 1 + heartwood_common::trust::MAX_TRUSTED * 32;
+const WRAPS_BUF: usize = 16 + heartwood_common::wrap_ledger::RING_LEN * heartwood_common::wrap_ledger::ID_PREFIX_LEN;
 
 /// A note blob is ~120 B for typical hosts/labels; the encoded ceiling with
 /// every field maxed is under 600. One page of index is 16 ids × 8 bytes.
@@ -187,6 +196,14 @@ impl NoteStorage for NoteNvs {
             StorageError
         })
     }
+
+    fn save_trust(&mut self, blob: &[u8]) -> Result<(), StorageError> {
+        self.nvs.set_blob(TRUST_KEY, blob).map_err(|e| {
+            log::error!("[notes] trust list write failed: {e}");
+            self.failed = true;
+            StorageError
+        })
+    }
 }
 
 // The common crate is no_std/alloc; keep the type paths uniform here.
@@ -258,6 +275,12 @@ impl NoteStorage for Storage {
             Storage::Null(s) => s.delete_note(id),
         }
     }
+    fn save_trust(&mut self, blob: &[u8]) -> Result<(), StorageError> {
+        match self {
+            Storage::Nvs(s) => s.save_trust(blob),
+            Storage::Null(s) => s.save_trust(blob),
+        }
+    }
 }
 
 /// The one shared locker instance. Two surfaces reach it — the USB frame
@@ -282,6 +305,42 @@ pub struct Notes {
     pub store: NoteStore,
     storage: Storage,
     boot_state: &'static str,
+    /// Senders whose wraps skip the RECEIVE card. Loaded at boot; a blob
+    /// that does not decode is an empty list, never a guess.
+    pub trust: TrustList,
+}
+
+impl Notes {
+    fn load_trust(storage: &mut Storage) -> TrustList {
+        let Storage::Nvs(nvs) = storage else {
+            return TrustList::new();
+        };
+        let mut buf = [0u8; TRUST_BUF];
+        match nvs.nvs.get_blob(TRUST_KEY, &mut buf) {
+            Ok(Some(bytes)) => TrustList::decode(bytes).unwrap_or_else(|| {
+                log::warn!("[notes] trust list unreadable; treating as empty");
+                TrustList::new()
+            }),
+            Ok(None) => TrustList::new(),
+            Err(e) => {
+                log::warn!("[notes] trust list read failed: {e}");
+                TrustList::new()
+            }
+        }
+    }
+
+}
+
+/// Is this seal signer a trusted sender? Read on the relay loop for every
+/// opened wrap.
+pub fn is_trusted_sender(pubkey: &[u8; 32]) -> bool {
+    with_locker(|notes| notes.trust.contains(pubkey))
+}
+
+/// Would the locker take one more note from this sender? The letterbox
+/// cap for a stranger, the locker's own cap for a trusted one.
+pub fn has_room_for_wrap_from(pubkey: &[u8; 32]) -> bool {
+    with_locker(|notes| notes.store.has_room_for_received(notes.trust.contains(pubkey)))
 }
 
 impl Notes {
@@ -327,6 +386,7 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
                 store: NoteStore::storage_unavailable(MAX_NOTES),
                 storage: Storage::Null(NullStorage),
                 boot_state: "unavailable",
+                trust: TrustList::new(),
             };
         }
     };
@@ -361,7 +421,12 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
         log::info!("[notes] loaded {count} note(s), {pending} pending");
         "ok"
     };
-    Notes { store: outcome.store, storage: Storage::Nvs(storage), boot_state }
+    let mut storage = Storage::Nvs(storage);
+    let trust = Notes::load_trust(&mut storage);
+    if !trust.is_empty() {
+        log::info!("[notes] {} trusted sender(s)", trust.len());
+    }
+    Notes { store: outcome.store, storage, boot_state, trust }
 }
 
 /// Whether the device holds any notes (loaded or sealed), for code with no
@@ -373,6 +438,38 @@ static NOTES_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 
 pub fn any_notes_held() -> bool {
     NOTES_HELD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The persisted gift-wrap ledger blob, or `None` when there is none (first
+/// boot, or a locker with no storage).
+pub fn load_wrap_ledger() -> Option<alloc_vec::Vec<u8>> {
+    with_locker(|notes| {
+        let Storage::Nvs(nvs) = &mut notes.storage else {
+            return None;
+        };
+        let mut buf = [0u8; WRAPS_BUF];
+        match nvs.nvs.get_blob(WRAPS_KEY, &mut buf) {
+            Ok(Some(bytes)) => Some(bytes.to_vec()),
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("[notes] wrap ledger unreadable: {e}");
+                None
+            }
+        }
+    })
+}
+
+/// Persist the gift-wrap ledger. Human-paced: one write per owner decision
+/// on a RECEIVE card, never per wrap seen.
+pub fn store_wrap_ledger(blob: &[u8]) {
+    with_locker(|notes| {
+        let Storage::Nvs(nvs) = &mut notes.storage else {
+            return;
+        };
+        if let Err(e) = nvs.nvs.set_blob(WRAPS_KEY, blob) {
+            log::warn!("[notes] wrap ledger write failed: {e}");
+        }
+    })
 }
 
 impl Notes {
@@ -570,6 +667,13 @@ fn now_secs() -> u32 {
 
 /// One line of card text for the approval loop: what is being decided, in
 /// units the owner thinks in.
+/// The cable-path card for trusting a sender: the key, elided from the
+/// middle so both ends stay checkable against the mint's published npub.
+fn trust_card_title(pk: &[u8; 32]) -> String {
+    let npub = heartwood_common::encoding::encode_npub(pk);
+    format!("Trust sender?\n{}..{}\nnotes skip the hold", &npub[..12], &npub[npub.len() - 8..])
+}
+
 fn card_title(kind: GatedCmd, meta: &NoteMeta) -> String {
     let sats = meta.amount_msat / 1000;
     let action = match kind {
@@ -579,6 +683,7 @@ fn card_title(kind: GatedCmd, meta: &NoteMeta) -> String {
         GatedCmd::Rename => "Rename",
         GatedCmd::Delete => "Delete",
         GatedCmd::Send => "Send",
+        GatedCmd::Trust => "Trust",
     };
     if sats > 0 {
         format!("{action} note?\n{sats} sats @ {}", meta.host)
@@ -593,6 +698,12 @@ fn card_title(kind: GatedCmd, meta: &NoteMeta) -> String {
 /// hold -- the dispatcher answers those without a card anyway.
 pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
     let name = cmd.get("cmd")?.as_str()?;
+    if name == "trust" {
+        let pk = cmd.get("pubkey")?.as_str()?;
+        let bytes: [u8; 32] = heartwood_common::hex::hex_decode(pk).ok()?.try_into().ok()?;
+        let npub = heartwood_common::encoding::encode_npub(&bytes);
+        return Some(("TRUST SENDER", format!("{}..{}\nnotes skip the hold", &npub[..12], &npub[npub.len() - 8..])));
+    }
     let id = cmd.get("id")?.as_str()?;
     let header = match name {
         "export_secret" => "RELEASE NOTE",
@@ -618,6 +729,20 @@ pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
 /// `None` means ask.
 pub fn relay_precheck(cmd: &serde_json::Value) -> Option<&'static str> {
     let name = cmd.get("cmd")?.as_str()?;
+    if name == "trust" {
+        let pk = cmd.get("pubkey")?.as_str()?;
+        let bytes: [u8; 32] = match heartwood_common::hex::hex_decode(pk).ok().and_then(|v| v.try_into().ok()) {
+            Some(b) => b,
+            None => return Some("bad_request"),
+        };
+        return with_locker(|notes| {
+            if notes.trust.contains(&bytes) {
+                // Already trusted: the command answers unchanged, no card.
+                return Some("already_trusted");
+            }
+            (notes.trust.len() >= heartwood_common::trust::MAX_TRUSTED).then_some("bad_request")
+        });
+    }
     let id = cmd.get("id")?.as_str()?;
     with_locker(|notes| {
         let store = &notes.store;
@@ -641,8 +766,10 @@ pub fn relay_precheck(cmd: &serde_json::Value) -> Option<&'static str> {
 }
 
 /// Store a note that arrived by gift wrap, once the owner has held the
-/// button for it. Idempotent on the secret, so a relay replaying the wrap
-/// is harmless.
+/// button for it, or straight away from a trusted sender. Idempotent on
+/// the secret, so a relay replaying the wrap is harmless. Trust is read
+/// here, under the same lock, so it cannot change between the check and
+/// the store.
 pub fn receive_note(
     secret: &[u8; SECRET_LEN],
     host: &str,
@@ -651,6 +778,7 @@ pub fn receive_note(
 ) -> Result<(String, bool), NoteError> {
     with_locker(|notes| {
         let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
+        let trusted = notes.trust.contains(from);
         let out = notes.store.receive(
             &mut notes.storage,
             &mut rng,
@@ -659,6 +787,7 @@ pub fn receive_note(
             amount_msat,
             from,
             now_secs(),
+            trusted,
         );
         NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
         out
@@ -692,9 +821,13 @@ fn handle_note_cmd_frame_inner(
     };
 
     let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
-    let mut approve = |kind: GatedCmd, meta: &NoteMeta| -> Approval {
-        let title = card_title(kind, meta);
-        let result = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
+    // Two askers, one panel. The dispatcher calls at most one at a time,
+    // so sharing the display through a RefCell is sound; the borrow checker
+    // just cannot see the sequencing.
+    let display = core::cell::RefCell::new(display);
+    let ask = |title: String| -> Approval {
+        let mut d = display.borrow_mut();
+        let result = crate::approval::run_approval_loop(&mut d, buttons, 30, |d, remaining| {
             crate::oled::show_change_approval(d, &title, remaining, 30);
         });
         match result {
@@ -703,6 +836,8 @@ fn handle_note_cmd_frame_inner(
             crate::approval::ApprovalResult::TimedOut => Approval::TimedOut,
         }
     };
+    let mut approve = |kind: GatedCmd, meta: &NoteMeta| -> Approval { ask(card_title(kind, meta)) };
+    let mut approve_trust = |pk: &[u8; 32]| -> Approval { ask(trust_card_title(pk)) };
 
     // Read the state before ctx takes its mutable borrows of `notes`. A
     // write failing inside THIS dispatch shows in the next get_info, which
@@ -715,6 +850,8 @@ fn handle_note_cmd_frame_inner(
         approve: &mut approve,
         // No identity to seal as on the cable: send answers bad_request.
         wrap: None,
+        trust: &mut notes.trust,
+        approve_trust: &mut approve_trust,
         now: now_secs(),
         fw_version: env!("CARGO_PKG_VERSION"),
         board: crate::board::BOARD,
@@ -782,6 +919,7 @@ pub fn run_note_cmd_approved(
     with_locker(|notes| {
         let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
         let mut approve = |_kind: GatedCmd, _meta: &NoteMeta| Approval::Approved;
+        let mut approve_trust = |_pk: &[u8; 32]| Approval::Approved;
         let storage_state = notes.storage_state();
         // Reborrow so the hook's lifetime is this scope's, not the caller's:
         // the context ties every borrow to one lifetime.
@@ -792,6 +930,8 @@ pub fn run_note_cmd_approved(
             rng: &mut rng,
             approve: &mut approve,
             wrap,
+            trust: &mut notes.trust,
+                approve_trust: &mut approve_trust,
             now: now_secs(),
             fw_version: env!("CARGO_PKG_VERSION"),
             board: crate::board::BOARD,

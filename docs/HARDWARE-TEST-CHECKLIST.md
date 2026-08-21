@@ -1111,20 +1111,51 @@ notecase `heartwood send`.
    `get_info.received_count` 1. Tap (B) or let it expire: nothing stored,
    count unchanged.
 2. Replay: publish the SAME wrap again (relay replay, or two sessions).
-   Expect no second card (`wrap_seen`), and if it arrives after a reboot,
-   the card comes up but a hold stores nothing new (idempotent on the
-   secret: same id back, `received_count` still 1).
-3. Not for us: a wrap to a persona pubkey, a wrap to the master from a DM
-   (kind 14 rumor), a wrap whose rumor claims a different author than the
+   Expect no second card (`wrap_seen`). After a reboot it must NOT come
+   back either: the hold went to the persisted ledger (`wrap_ledger`), and
+   the connect-time catch-up REQ skips it before any decrypt. Same for a
+   wrap the owner declined with (B). A wrap that merely lapsed DOES come
+   back: at the next connect, and ten minutes after each lapse while the
+   device stays up, until it is held or declined.
+2a. Catch-up: power the device OFF, wrap a note to its master npub, wait
+   for the relay to confirm, power ON. Expect the RECEIVE card within a few
+   seconds of `subscribed on`, with no sender action. Then: with ONE held
+   decision in the ledger, wrap a note, power-cycle, and confirm the REQ on
+   the wire carries `"since":<mark - 172800>,"limit":16` and the card still
+   comes up; with an empty ledger the REQ carries `"limit":16` and no
+   `since`. The keepalive re-REQ 40 s later must be back to `"limit":0`.
+3. Not for us: a wrap to a persona pubkey, a kind-14 DM whose text has no
+   note (or two), a wrap whose rumor claims a different author than the
    seal signer, and a rumor whose URL has no amount. Expect: silent drop
    with one `[relay] gift wrap ... not for us / is not a note` log line,
    no card, no wake.
+2b. Trusted sender: `notecase heartwood trust <mint npub>` puts up a
+   TRUST SENDER card (npub, both ends visible); hold. `heartwood trusted`
+   lists it; it survives a reboot. A wrap sealed by that key now stores
+   on arrival with NO card: a three-second "N sats received / from
+   <host>" toast, `note ... received from trusted sender` in the log, and
+   the ledger has it (reboot: no re-offer). A wrap from anyone else still
+   gets the card. A trusted sender is not bound by the 4-note letterbox,
+   only by the locker's 16: with four received notes held, a fifth from
+   the trusted mint stores; a fifth from a stranger is deferred (`dropped
+   until there is room`), never silently lost, and arrives by itself once
+   a collect frees a slot (seen on the bench: two deferred zaps landed
+   380 ms apart the moment the collect finished). `heartwood untrust` needs no hold and the next wrap from
+   that key gets a card again.
+3a. From a stranger's client: on a phone running any NIP-17 client
+   (0xchat, Amethyst), resolve the device's NIP-05, and DM it a note as
+   plain text, once as `lnurlw://...`, once as bech32 `LNURL1...`, once
+   with a `lightning:` prefix, once wrapped in a sentence. Expect the same
+   RECEIVE card each time, with the sender's npub on it. A DM carrying two
+   notes is dropped (`more than one note in the message`).
 4. Letterbox cap: with MAX_RECEIVED (4) received notes held, a fifth wrap
-   logs `letterbox full; dropped` and raises no card. Mark one spent over
-   the relay, send again: card. Also: two wraps in quick succession raise
-   ONE card (`a note is already waiting on the button; wrap dropped`); a
-   `sign_event` ask arriving behind a RECEIVE card still queues and gets
-   its own card after it.
+   logs `letterbox full; dropped until there is room` and raises no card.
+   Mark one spent over the relay: WITHOUT sending again, the catch-up
+   re-runs and the fifth wrap's card comes up on its own. Also: two wraps
+   in quick succession raise ONE card (`a note is already waiting on the
+   button; wrap deferred`); settle it, and the second's card follows
+   without anyone resending. A `sign_event` ask arriving behind a RECEIVE
+   card still queues and gets its own card after it.
 5. Collect: from notecase, `heartwood link <bunker>` then `heartwood
    collect`. Expect RELEASE NOTE card (amount @ host), hold; notecase
    claims it at the mint (the wrapped secret is now burned); SPEND NOTE

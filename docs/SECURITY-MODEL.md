@@ -33,6 +33,18 @@ deliberately **excluded from backups**: a note restored onto two boards is a
 double-spend, so bearer value is unrecoverable by design (see
 `docs/plans/2026-08-18-note-locker-goal.md`).
 
+Notes can also move as **NIP-59 gift wraps** (`common/src/note_wrap.rs`).
+Sending seals the secret to the recipient's pubkey inside the signing
+boundary: the client that asked gets an opaque kind-1059 back and never sees
+the plaintext, which no other path out of the locker (export, QR, browser)
+can say. Two consequences are deliberate. A wrap is a permanent copy of the
+secret under the recipient's key on every relay that carried it, so a
+received note is held only until a wallet rotates it (the device has no mint
+client and cannot), under a low cap (`MAX_RECEIVED`), and is never forwarded
+by wrap again. And sending does not burn: the note stays CONFIRMED with
+`sent_to` recorded so the owner can rotate it back if unclaimed, but it can
+never be sealed a second time.
+
 ### Slot-secret custody
 
 A slot secret is a **bearer credential**, and it is deliberately widely held:

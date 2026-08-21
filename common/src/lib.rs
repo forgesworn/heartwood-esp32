@@ -51,6 +51,9 @@ pub mod approval_queue;
 pub mod note_store;
 
 #[cfg(feature = "nip46")]
+pub mod note_wrap;
+
+#[cfg(feature = "nip46")]
 pub mod note_cmd;
 
 #[cfg(feature = "mnemonic")]

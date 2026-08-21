@@ -1090,6 +1090,61 @@ Regression watch: a USB `sign_event` approval and a factory reset must behave
 exactly as before; FIRMWARE_INFO's nvs entry stats now include the
 `hw_notes` namespace's usage.
 
+## 14. Bearer notes over Nostr (added 2026-08-21; NOT YET BENCH-RUN)
+
+`note_wrap_v1` in get_status. A kind-1059 gift wrap addressed to a master
+npub, carrying a kind-2525 rumor whose content is a LUD-25 note URL
+(`common/src/note_wrap.rs`), puts a RECEIVE card up; `heartwood_note_send`
+seals one of the locker's own notes to a recipient on-device and hands the
+client an opaque wrap to relay. Drive the receive half with
+`scripts/send-note-wrap.mjs` (or notecase `send <sats> --to <device npub>`);
+the send half with `scripts/nip46-client.mjs --method heartwood_note_send
+--params '[{"id":"<note id>","to":"<64hex>"}]'` from a bound slot, or
+notecase `heartwood send`.
+
+1. Wrap a test-mint note to the device's master npub while it sits on the
+   relays with no host attached. Expect: panel wakes, amber card headed
+   RECEIVE NOTE, first line `<sats> sats @ <host>`, second `from
+   <npub8>..<npub8>`; no NIP-46 response is published to anyone. Hold:
+   green "N sats received / wallet collects it", back to idle after ~3 s;
+   `heartwood_note_list` shows the note CONFIRMED with `from` set and
+   `get_info.received_count` 1. Tap (B) or let it expire: nothing stored,
+   count unchanged.
+2. Replay: publish the SAME wrap again (relay replay, or two sessions).
+   Expect no second card (`wrap_seen`), and if it arrives after a reboot,
+   the card comes up but a hold stores nothing new (idempotent on the
+   secret: same id back, `received_count` still 1).
+3. Not for us: a wrap to a persona pubkey, a wrap to the master from a DM
+   (kind 14 rumor), a wrap whose rumor claims a different author than the
+   seal signer, and a rumor whose URL has no amount. Expect: silent drop
+   with one `[relay] gift wrap ... not for us / is not a note` log line,
+   no card, no wake.
+4. Letterbox cap: with MAX_RECEIVED (4) received notes held, a fifth wrap
+   logs `letterbox full; dropped` and raises no card. Mark one spent over
+   the relay, send again: card. Also: two wraps in quick succession raise
+   ONE card (`a note is already waiting on the button; wrap dropped`); a
+   `sign_event` ask arriving behind a RECEIVE card still queues and gets
+   its own card after it.
+5. Collect: from notecase, `heartwood link <bunker>` then `heartwood
+   collect`. Expect RELEASE NOTE card (amount @ host), hold; notecase
+   claims it at the mint (the wrapped secret is now burned); SPEND NOTE
+   card, hold; `heartwood_note_list` shows it SPENT.
+6. Send: `heartwood_note_send` on a CONFIRMED note of the device's own.
+   Expect SEND NOTE card, `<sats> sats @ <host>` / `to <hex8>..<hex8>`; hold
+   returns `{"ok":true,"event":{...kind 1059...}}` and NO `k1` anywhere in
+   the response; the note lists as CONFIRMED with `sent_to`. Repeat on the
+   same note: `invalid_state` with no card. `heartwood_note_export` on it
+   still raises a card (unsend path). A received note (`from` set) answers
+   `invalid_state` to send with no card.
+7. The wrap from 6, published to the recipient's inbox relays, opens in
+   notecase (`inbox`) and on a second heartwood (RECEIVE card) — the same
+   bytes, both ends.
+8. Over USB, `{"cmd":"send",...}` on the 0x70 frame answers `bad_request`
+   "send is not available on this surface" without a card.
+9. Regression: a `sign_event` card, a non-note extension card and a C4 park
+   all behave exactly as in §12; the REQ now carries a fourth filter and the
+   40 s re-REQ still lands (watch for the kind-0 profile refresh).
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

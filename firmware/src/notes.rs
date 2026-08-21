@@ -27,10 +27,10 @@
 
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 
-use heartwood_common::note_cmd::{self, Approval, GatedCmd, NoteCmdContext};
+use heartwood_common::note_cmd::{self, Approval, GatedCmd, NoteCmdContext, WrapFn};
 use heartwood_common::note_seal;
 use heartwood_common::note_store::{
-    NoteMeta, NoteStorage, NoteStore, StorageError, ID_LEN, MAX_NOTES,
+    NoteError, NoteMeta, NoteStorage, NoteStore, StorageError, ID_LEN, MAX_NOTES, SECRET_LEN,
 };
 use heartwood_common::seed_cipher;
 use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_NOTE_RESP};
@@ -578,12 +578,63 @@ fn card_title(kind: GatedCmd, meta: &NoteMeta) -> String {
         GatedCmd::Discard => "Discard",
         GatedCmd::Rename => "Rename",
         GatedCmd::Delete => "Delete",
+        GatedCmd::Send => "Send",
     };
     if sats > 0 {
         format!("{action} note?\n{sats} sats @ {}", meta.host)
     } else {
         format!("{action} note?\n{}", meta.id)
     }
+}
+
+/// Header and two-line title for a relay approval card, from the wire
+/// command a `heartwood_note_*` request mapped onto. `None` for anything
+/// that is not a gated note command, or names a note the locker does not
+/// hold -- the dispatcher answers those without a card anyway.
+pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
+    let name = cmd.get("cmd")?.as_str()?;
+    let id = cmd.get("id")?.as_str()?;
+    let header = match name {
+        "export_secret" => "RELEASE NOTE",
+        "mark_spent" => "SPEND NOTE",
+        "discard" => "DISCARD NOTE",
+        "send" => "SEND NOTE",
+        _ => return None,
+    };
+    let meta = with_locker(|notes| notes.store.get_meta(id))?;
+    let sats = meta.amount_msat / 1000;
+    let first = if sats > 0 { format!("{sats} sats @ {}", meta.host) } else { meta.id.clone() };
+    let second = match (name, cmd.get("to").and_then(|v| v.as_str())) {
+        ("send", Some(to)) if to.len() == 64 => format!("to {}..{}", &to[..8], &to[56..]),
+        ("send", _) => "to ?".to_string(),
+        _ => String::new(),
+    };
+    Some((header, if second.is_empty() { first } else { format!("{first}\n{second}") }))
+}
+
+/// Store a note that arrived by gift wrap, once the owner has held the
+/// button for it. Idempotent on the secret, so a relay replaying the wrap
+/// is harmless.
+pub fn receive_note(
+    secret: &[u8; SECRET_LEN],
+    host: &str,
+    amount_msat: u64,
+    from: &[u8; 32],
+) -> Result<(String, bool), NoteError> {
+    with_locker(|notes| {
+        let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
+        let out = notes.store.receive(
+            &mut notes.storage,
+            &mut rng,
+            secret,
+            host,
+            amount_msat,
+            from,
+            now_secs(),
+        );
+        NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
+        out
+    })
 }
 
 /// Handle one `FRAME_TYPE_NOTE_CMD` (0x70) frame: JSON command in the
@@ -634,6 +685,8 @@ fn handle_note_cmd_frame_inner(
         storage: &mut notes.storage,
         rng: &mut rng,
         approve: &mut approve,
+        // No identity to seal as on the cable: send answers bad_request.
+        wrap: None,
         now: now_secs(),
         fw_version: env!("CARGO_PKG_VERSION"),
         board: crate::board::BOARD,
@@ -694,16 +747,23 @@ fn handle_note_cmd_frame_locked_inner(
 /// no slot policy can silence it) BEFORE this runs — by the time we are
 /// here, either the method needs no button or the hold has completed. The
 /// lifecycle rules still apply: approval never overrides them.
-pub fn run_note_cmd_approved(msg: &str) -> serde_json::Value {
+pub fn run_note_cmd_approved(
+    msg: &str,
+    mut wrap: Option<&mut dyn FnMut(&[u8; SECRET_LEN], &NoteMeta, &[u8; 32]) -> Result<serde_json::Value, &'static str>>,
+) -> serde_json::Value {
     with_locker(|notes| {
         let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
         let mut approve = |_kind: GatedCmd, _meta: &NoteMeta| Approval::Approved;
         let storage_state = notes.storage_state();
+        // Reborrow so the hook's lifetime is this scope's, not the caller's:
+        // the context ties every borrow to one lifetime.
+        let wrap: Option<WrapFn<'_>> = wrap.as_mut().map(|w| &mut **w as WrapFn<'_>);
         let mut ctx = NoteCmdContext {
             store: &mut notes.store,
             storage: &mut notes.storage,
             rng: &mut rng,
             approve: &mut approve,
+            wrap,
             now: now_secs(),
             fw_version: env!("CARGO_PKG_VERSION"),
             board: crate::board::BOARD,

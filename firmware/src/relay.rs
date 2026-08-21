@@ -47,6 +47,7 @@ use esp_idf_svc::wifi::{
     PmfConfiguration,
 };
 use secp256k1::{Keypair, Secp256k1, SignOnly};
+use zeroize::Zeroize;
 
 use heartwood_common::deadline::{
     deadline_io_action, retryable_tls_io_code, DeadlineIoAction, NonblockingIoEvent,
@@ -94,6 +95,7 @@ const TLS_PORT: u16 = 443;
 const WS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 /// NIP-46 request/response event kind (also the inline envelope kind).
 const NIP46_KIND: u64 = 24133;
+const GIFT_WRAP_KIND: u64 = heartwood_common::nip59::GIFT_WRAP_KIND;
 /// Relay-management event kind (distinct permission boundary from NIP-46).
 /// Requests are authenticated to the baked operator key (`op_mgmt`).
 const MGMT_KIND: u64 = 24134;
@@ -291,6 +293,9 @@ struct SignCtx<'a, 'd, 'b> {
     /// prompt, or a double execution of a non-idempotent method. Bounded ring;
     /// management (24134) has its own persisted inner-id replay guard.
     nip46_seen: Vec<String>,
+    /// Same ring for bearer-note gift wraps (kind 1059), kept apart so busy
+    /// NIP-46 traffic cannot evict a wrap id inside the re-REQ interval.
+    wrap_seen: Vec<String>,
     /// Last failed nostrconnect dial (url, when): throttles operator-driven
     /// re-dials of a dead relay, which the pinned backoff cannot cover (no
     /// PinnedRelay exists until a dial succeeds).
@@ -800,6 +805,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         sign_audit: Vec::new(),
         sign_audit_seq: 0,
         nip46_seen: Vec::new(),
+        wrap_seen: Vec::new(),
         dial_cooldown: None,
         network_trial_id,
         network_trial_deadline,
@@ -1367,13 +1373,19 @@ fn build_sub_req(ctx: &SignCtx) -> String {
     nip46_p.extend(ctx.personas.iter().map(|p| quoted(&p.pubkey)));
     let nip46_p_list = nip46_p.join(",");
     let profile_filter = format!(r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":1}}"##);
+    // Bearer notes gift-wrapped to a master npub. Live only: anything that
+    // arrived while the device was off is the wallet's to collect from the
+    // inbox relays, since the wallet can rotate it and the device cannot.
+    let wrap_filter = format!(
+        r##"{{"kinds":[{GIFT_WRAP_KIND}],"#p":[{master_p_list}],"limit":0}}"##
+    );
     if ctx.op_mgmt.is_some() {
         format!(
-            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{{"kinds":[{MGMT_KIND}],"#p":[{master_p_list}],"limit":0}},{profile_filter}]"##
+            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{{"kinds":[{MGMT_KIND}],"#p":[{master_p_list}],"limit":0}},{profile_filter},{wrap_filter}]"##
         )
     } else {
         format!(
-            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{profile_filter}]"##
+            r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{profile_filter},{wrap_filter}]"##
         )
     }
 }
@@ -2581,11 +2593,16 @@ fn process_event(
     // our sense of "now" fresh. Backdated events (a NIP-59 seal jitters into
     // the past) cannot drag it backwards.
     ctx.reply_clock.observe(ev.created_at, crate::uptime_s());
+    note_wall_clock(ctx);
 
     // Our own kind-0 profile: cache the name and refresh the idle identity
     // screen. This is not a user request, so it must never wake a blanked panel.
     if ev.kind == 0 {
         handle_profile_event(&ev, ctx);
+        return Ok(());
+    }
+    if ev.kind == GIFT_WRAP_KIND {
+        handle_note_wrap(ev, ctx);
         return Ok(());
     }
     if ev.kind != NIP46_KIND && ev.kind != MGMT_KIND {
@@ -2851,6 +2868,17 @@ fn emit_gift_wrap(
     recipient_pk: &[u8; 32],
     expiration: Option<u64>,
 ) -> Result<(), String> {
+    let wrap = build_gift_wrap(secp, rumor, author_secret, recipient_pk, expiration)?;
+    ws_send_event(tls, &wrap).map(|_| ())
+}
+
+fn build_gift_wrap(
+    secp: &Arc<Secp256k1<SignOnly>>,
+    rumor: &heartwood_common::nip46::UnsignedEvent,
+    author_secret: &[u8; 32],
+    recipient_pk: &[u8; 32],
+    expiration: Option<u64>,
+) -> Result<SignedEvent, String> {
     // Rumors here are small (~600 B of tags); the outermost plaintext is the
     // serialised seal, roughly 1.5x the rumor after one NIP-44+base64 round.
     // Budget conservatively at 2x + envelope overhead and skip when tight.
@@ -2902,8 +2930,7 @@ fn emit_gift_wrap(
         &sign,
     );
     eph_sk.iter_mut().for_each(|b| *b = 0);
-    let wrap = wrap.map_err(|e| format!("gift wrap: {e}"))?;
-    ws_send_event(tls, &wrap).map(|_| ())
+    wrap.map_err(|e| format!("gift wrap: {e}"))
 }
 
 /// Publish the §1.1 approval-needed notice for a park, addressed to the
@@ -3544,6 +3571,11 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     ctx.button_cards[0].last_pct = u32::MAX;
 
     let batch = ctx.button_cards[0].asks.len();
+    enum Draw {
+        Sign(String, u64),
+        Extension(String, String, String),
+        Titled(&'static str, String),
+    }
     let card = match &ctx.button_cards[0].asks[0].ask.card {
         crate::nip46_handler::AskCard::Sign { requester, kind } => {
             // The count belongs on screen: one hold answers all of them, and
@@ -3553,19 +3585,25 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             } else {
                 requester.clone()
             };
-            Ok((label, *kind))
+            Draw::Sign(label, *kind)
         }
         crate::nip46_handler::AskCard::Extension {
             master_label,
             method,
             preview,
-        } => Err((master_label.clone(), method.clone(), preview.clone())),
+        } => match note_card_header(method) {
+            Some(header) => Draw::Titled(header, preview.clone()),
+            None => Draw::Extension(master_label.clone(), method.clone(), preview.clone()),
+        },
+        crate::nip46_handler::AskCard::Receive { title } => {
+            Draw::Titled("RECEIVE NOTE", title.clone())
+        }
     };
     match card {
-        Ok((label, kind)) => {
+        Draw::Sign(label, kind) => {
             crate::oled::show_sign_request(ctx.display, &label, kind, "", remaining)
         }
-        Err((master_label, method, preview)) => crate::oled::show_master_sign_request(
+        Draw::Extension(master_label, method, preview) => crate::oled::show_master_sign_request(
             ctx.display,
             &master_label,
             &method,
@@ -3573,7 +3611,26 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             &preview,
             remaining,
         ),
+        Draw::Titled(header, title) => crate::oled::show_titled_approval(
+            ctx.display,
+            header,
+            &title,
+            remaining,
+            CARD_WINDOW.as_secs() as u32,
+        ),
     }
+}
+
+/// Note methods get the amount card rather than the method-name card, with
+/// the same header the cable path uses for the same command.
+fn note_card_header(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "heartwood_note_export" => "RELEASE NOTE",
+        "heartwood_note_spent" => "SPEND NOTE",
+        "heartwood_note_discard" => "DISCARD NOTE",
+        "heartwood_note_send" => "SEND NOTE",
+        _ => return None,
+    })
 }
 
 /// Advance the front card by one loop pass.
@@ -3676,6 +3733,16 @@ fn resolve_button_card(
         return;
     }
     let card = ctx.button_cards.remove(index);
+    if card
+        .asks
+        .first()
+        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::Receive { .. }))
+    {
+        // Nobody is owed a NIP-46 response: the wrap's sender hears nothing
+        // either way, and the outcome is the locker's state.
+        resolve_receive_card(ctx, card, outcome, index == 0);
+        return;
+    }
     if index == 0 {
         match outcome {
             CardTick::Approved => crate::oled::show_approved(ctx.display),
@@ -3815,6 +3882,268 @@ fn resolve_button_card(
             log::warn!("[relay] approval publish for {request_id}: {e}");
         }
     }
+}
+
+/// A kind-1059 addressed to one of our masters: open it, read the note, and
+/// put a RECEIVE card up. Every failure is silent, as vault delivery is --
+/// an unsolicited event from anyone on the internet gets no diagnostics.
+fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
+    if ctx.wrap_seen.iter().any(|id| *id == ev.id) {
+        return;
+    }
+    if ctx.wrap_seen.len() >= SEEN_MAX {
+        ctx.wrap_seen.remove(0);
+    }
+    ctx.wrap_seen.push(ev.id.clone());
+
+    let Some(target_pk) = ev
+        .tags
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == "p")
+        .and_then(|t| hex_decode(&t[1]).ok())
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+    else {
+        return;
+    };
+    let Some(midx) = masters::find_by_pubkey(ctx.masters, &target_pk) else {
+        return;
+    };
+    let slot = ctx.masters[midx].slot;
+    let secret = zeroize::Zeroizing::new(ctx.masters[midx].secret);
+    let opened = match heartwood_common::nip59::unwrap(&ev, &secret) {
+        Ok(o) => o,
+        Err(e) => {
+            log::info!("[relay] gift wrap {} not for us: {e}", &ev.id[..8.min(ev.id.len())]);
+            return;
+        }
+    };
+    let note = match heartwood_common::note_wrap::parse_note_rumor(&opened.rumor) {
+        Ok(n) => n,
+        Err(e) => {
+            log::info!("[relay] gift wrap {} is not a note: {e}", &ev.id[..8.min(ev.id.len())]);
+            return;
+        }
+    };
+    // The locker refuses past the received cap; say so once, before the
+    // owner is shown a card for money the device cannot keep.
+    let room = crate::notes::with_locker(|n| {
+        n.store.received_count() < heartwood_common::note_store::MAX_RECEIVED
+    });
+    if !room {
+        log::warn!("[relay] note received with the letterbox full; dropped");
+        return;
+    }
+
+    let sender_hex = hex_encode(&opened.sender);
+    let sats = note.amount_msat / 1000;
+    let title = format!(
+        "{sats} sats @ {}\nfrom {}..{}",
+        note.host,
+        &sender_hex[..8],
+        &sender_hex[56..]
+    );
+    queue_receive_card(
+        ctx,
+        slot,
+        &target_pk,
+        &opened.sender,
+        &ev.id,
+        title,
+        // The rumor rides the ask the way a sign_event's event does: the
+        // secret is re-read from it at resolution and zeroised there.
+        opened.rumor.clone(),
+        ev.created_at,
+    );
+}
+
+/// Queue a RECEIVE card outside `queue_button_ask`: there is no client to
+/// answer busy to, and a full queue simply drops the wrap (the wallet can
+/// still collect it from the inbox relays).
+#[allow(clippy::too_many_arguments)]
+fn queue_receive_card(
+    ctx: &mut SignCtx,
+    slot: u8,
+    target_pk: &[u8; 32],
+    sender: &[u8; 32],
+    wrap_id: &str,
+    title: String,
+    rumor: UnsignedEvent,
+    created_at: u64,
+) {
+    use heartwood_common::approval_queue::{admit, Admission, AskKey};
+    // One RECEIVE card at a time. Anyone on the internet can address a wrap
+    // to a public npub, and the approval queue is shared with the owner's
+    // own sign requests; a stranger must not be able to fill it.
+    if ctx.button_cards.iter().any(|card| {
+        card.asks
+            .first()
+            .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::Receive { .. }))
+    }) {
+        log::info!("[relay] a note is already waiting on the button; wrap dropped");
+        return;
+    }
+    // Keyed on the wrap id so two notes never collapse into one hold.
+    let key = AskKey::new(
+        slot,
+        hex_encode(sender),
+        hex_encode(target_pk),
+        format!("receive:{}", &wrap_id[..16.min(wrap_id.len())]),
+    );
+    let weight = rumor.content.len() + 256;
+    let held_bytes: usize = ctx
+        .button_cards
+        .iter()
+        .flat_map(|card| card.asks.iter())
+        .map(|ask| ask.weight)
+        .sum();
+    let open = ctx.button_cards.first();
+    let admission = if held_bytes.saturating_add(weight) > CARD_BYTE_BUDGET {
+        Admission::Busy
+    } else {
+        admit(
+            open.map(|card| &card.key),
+            open.map(|card| card.asks.len()).unwrap_or(0),
+            ctx.button_cards.len().saturating_sub(1),
+            &key,
+        )
+    };
+    match admission {
+        Admission::Busy | Admission::Collapse => {
+            log::warn!("[relay] approval queue full; note wrap dropped");
+        }
+        Admission::Open | Admission::Wait => {
+            log::info!("[relay] note received; waiting on the button");
+            ctx.button_cards.push(ButtonCard {
+                key,
+                target_pk: *target_pk,
+                client_pubkey: *sender,
+                asks: vec![ButtonAsk {
+                    ask: crate::nip46_handler::DeferredAsk {
+                        card: crate::nip46_handler::AskCard::Receive { title },
+                        request: nip46::Nip46Request {
+                            id: wrap_id.to_string(),
+                            method: "heartwood_note_receive".to_string(),
+                            params: Vec::new(),
+                            heartwood: None,
+                            legacy_client_pubkey: None,
+                        },
+                        event: Some(rumor),
+                    },
+                    created_at,
+                    received_uptime: crate::uptime_s(),
+                    weight,
+                    audit: None,
+                }],
+                opened_at: None,
+                armed: false,
+                last_remaining: u32::MAX,
+                last_pct: u32::MAX,
+            });
+        }
+    }
+}
+
+/// Settle a RECEIVE card: store the note on a hold, forget it otherwise.
+fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick, on_screen: bool) {
+    let sender = card.client_pubkey;
+    for mut ask in card.asks {
+        let Some(mut rumor) = ask.ask.event.take() else { continue };
+        if matches!(outcome, CardTick::Approved) {
+            match heartwood_common::note_wrap::parse_note_rumor(&rumor) {
+                Ok(note) => {
+                    match crate::notes::receive_note(
+                        &note.secret,
+                        &note.host,
+                        note.amount_msat,
+                        &sender,
+                    ) {
+                        Ok((id, created)) => {
+                            log::info!("[relay] note {id} received (new: {created})");
+                            if on_screen {
+                                let sats = note.amount_msat / 1000;
+                                crate::oled::show_change_done(
+                                    ctx.display,
+                                    &format!("{sats} sats received"),
+                                    "wallet collects it",
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("[relay] note receive refused: {}", e.code());
+                            if on_screen {
+                                crate::oled::show_error(ctx.display, "Note not kept");
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::warn!("[relay] note rumor unreadable at accept: {e}"),
+            }
+        } else if on_screen {
+            match outcome {
+                CardTick::Denied => crate::oled::show_denied(ctx.display),
+                _ => crate::oled::show_request_expired(ctx.display),
+            }
+        }
+        rumor.content.zeroize();
+    }
+    if on_screen {
+        ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(3));
+    }
+}
+
+/// Build the kind-1059 for a `send`: the note as a rumor authored by the
+/// served identity, sealed to `to`. Called from the note dispatch arm with
+/// the secret the locker handed over for exactly this; the wrap is what the
+/// client relays.
+pub fn seal_note_wrap(
+    secp: &Arc<Secp256k1<SignOnly>>,
+    author_secret: &[u8; 32],
+    secret: &[u8; 32],
+    meta: &heartwood_common::note_store::NoteMeta,
+    to: &[u8; 32],
+) -> Result<serde_json::Value, &'static str> {
+    let author_pk = Keypair::from_seckey_slice(secp, author_secret)
+        .map_err(|_| "bad signing key")?
+        .x_only_public_key()
+        .0
+        .serialize();
+    let rumor = heartwood_common::note_wrap::build_note_rumor(
+        &hex_encode(&author_pk),
+        to,
+        secret,
+        &meta.host,
+        meta.amount_msat,
+        wall_clock_estimate(),
+    );
+    // No NIP-40 expiry: the recipient may not have a wallet yet, and the
+    // wrap waiting on their inbox relay until they do is the point.
+    let wrap = build_gift_wrap(secp, &rumor, author_secret, to, None)
+        .map_err(|_| "gift wrap failed")?;
+    serde_json::to_value(wrap).map_err(|_| "wrap serialisation failed")
+}
+
+/// Wall-clock reading for code that has no `SignCtx` in hand (the note
+/// dispatch arm). Refreshed from the reply clock on every inbound event.
+/// u32 because the Xtensa core has no 64-bit atomics; good until 2106.
+static WALL_HINT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static WALL_HINT_UPTIME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn note_wall_clock(ctx: &SignCtx) {
+    let up = crate::uptime_s();
+    let projected = ctx.reply_clock.projected(up);
+    if projected > 0 {
+        WALL_HINT.store(projected.min(u32::MAX as u64) as u32, std::sync::atomic::Ordering::Relaxed);
+        WALL_HINT_UPTIME.store(up.min(u32::MAX as u64) as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn wall_clock_estimate() -> u64 {
+    let hint = WALL_HINT.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    if hint == 0 {
+        return 0;
+    }
+    let then = WALL_HINT_UPTIME.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    hint.saturating_add(crate::uptime_s().saturating_sub(then))
 }
 
 /// Service the interactive approval cards: one tick of the front card, and the
@@ -6436,7 +6765,11 @@ fn dispatch_mgmt(
                     // Bearer-note locker served over heartwood_note_*
                     // extensions (gated methods pinned always-button, held
                     // through the deferred-approval machinery).
-                    "note_locker_v1"
+                    "note_locker_v1",
+                    // Bearer notes as gift wraps: heartwood_note_send seals
+                    // on-device, and a kind-1059 to a master npub puts a
+                    // RECEIVE card up.
+                    "note_wrap_v1"
             ]);
             // A delegate (per-identity operator) sees only what it needs to
             // feature-detect and manage its own identity — never the

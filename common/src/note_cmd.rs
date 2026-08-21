@@ -23,8 +23,10 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use serde_json::{json, Map, Value};
+use zeroize::Zeroize;
 
-use crate::note_store::{NoteError, NoteMeta, NoteState, NoteStorage, NoteStore};
+use crate::hex::{hex_decode, hex_encode};
+use crate::note_store::{NoteError, NoteMeta, NoteState, NoteStorage, NoteStore, Peer, SECRET_LEN};
 
 /// Which command is asking for physical approval, so the OLED can name the
 /// action rather than showing a generic prompt.
@@ -35,6 +37,9 @@ pub enum GatedCmd {
     Discard,
     Rename,
     Delete,
+    /// Seal the secret to another pubkey on-device (note_wrap.rs). A
+    /// disclosure, like export, but the host never sees the plaintext.
+    Send,
 }
 
 impl GatedCmd {
@@ -45,9 +50,17 @@ impl GatedCmd {
             GatedCmd::Discard => "discard",
             GatedCmd::Rename => "rename",
             GatedCmd::Delete => "delete",
+            GatedCmd::Send => "send",
         }
     }
 }
+
+/// Builds the signed kind-1059 event for `send`: `(secret, note, recipient)`
+/// in, the wrap as JSON out. Injected because it needs the signing identity,
+/// an RNG and a clock the dispatcher does not have. `None` on a surface with
+/// no identity to seal as (direct USB), where `send` answers `bad_request`.
+pub type WrapFn<'a> =
+    &'a mut dyn FnMut(&[u8; SECRET_LEN], &NoteMeta, &[u8; 32]) -> Result<Value, &'static str>;
 
 /// The owner's answer to a gated command. `Unavailable` is the vault's
 /// `display_unavailable`: the device could not ask, which is deliberately
@@ -72,6 +85,7 @@ pub struct NoteCmdContext<'a> {
     /// whether to put a card up or answer `Approved` immediately; the
     /// dispatcher itself gates everything in [`GatedCmd`].
     pub approve: &'a mut dyn FnMut(GatedCmd, &NoteMeta) -> Approval,
+    pub wrap: Option<WrapFn<'a>>,
     /// Seconds since some fixed epoch for created_at/updated_at. Boot time is
     /// fine — informational, never authoritative (the mint's state is).
     pub now: u32,
@@ -130,6 +144,15 @@ fn meta_json(m: &NoteMeta) -> Value {
     );
     obj.insert("created_at".into(), json!(m.created_at));
     obj.insert("updated_at".into(), json!(m.updated_at));
+    match m.peer {
+        None => {}
+        Some(Peer::From(pk)) => {
+            obj.insert("from".into(), Value::String(hex_encode(&pk)));
+        }
+        Some(Peer::To(pk)) => {
+            obj.insert("sent_to".into(), Value::String(hex_encode(&pk)));
+        }
+    }
     Value::Object(obj)
 }
 
@@ -139,6 +162,13 @@ fn str_field<'a>(cmd: &'a Value, key: &str) -> Option<&'a str> {
 
 fn u64_field(cmd: &Value, key: &str) -> Option<u64> {
     cmd.get(key).and_then(Value::as_u64)
+}
+
+fn pubkey_field(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    hex_decode(hex).ok().and_then(|v| v.try_into().ok())
 }
 
 fn parent_ids(cmd: &Value) -> Result<Vec<String>, Value> {
@@ -175,6 +205,7 @@ pub fn handle_note_cmd(ctx: &mut NoteCmdContext<'_>, msg: &str) -> Value {
                 "storage": ctx.storage_state,
                 "note_count": note_count,
                 "pending_count": pending_count,
+                "received_count": ctx.store.received_count(),
             })
         }
 
@@ -296,6 +327,39 @@ pub fn handle_note_cmd(ctx: &mut NoteCmdContext<'_>, msg: &str) -> Value {
             ctx.store.delete(ctx.storage, id)
         }),
 
+        "send" => {
+            let Some(id) = str_field(&cmd, "id") else { return err("bad_request") };
+            let Some(to) = str_field(&cmd, "to").and_then(pubkey_field) else {
+                return err("bad_request");
+            };
+            let Some(meta) = ctx.store.get_meta(id) else { return err("not_found") };
+            if let Err(e) = ctx.store.can_send(id) {
+                return note_err(e);
+            }
+            if ctx.wrap.is_none() {
+                return err_msg("bad_request", "send is not available on this surface");
+            }
+            if let Some(resp) = approval_err((ctx.approve)(GatedCmd::Send, &meta)) {
+                return resp;
+            }
+            let mut secret = match ctx.store.secret_for_send(id) {
+                Ok(s) => s,
+                Err(e) => return note_err(e),
+            };
+            let wrapped = (ctx.wrap.as_mut().expect("checked above"))(&secret, &meta, &to);
+            secret.zeroize();
+            let event = match wrapped {
+                Ok(v) => v,
+                Err(m) => return err_msg("bad_request", m),
+            };
+            // Persisted before the wrap leaves: a cut here strands an
+            // unpublished wrap, never a note that can be sent twice.
+            match ctx.store.mark_sent(ctx.storage, id, &to, ctx.now) {
+                Ok(()) => json!({"ok": true, "event": event}),
+                Err(e) => note_err(e),
+            }
+        }
+
         other => err_msg("bad_request", &format!("unknown cmd {other}")),
     }
 }
@@ -306,7 +370,9 @@ pub fn handle_note_cmd(ctx: &mut NoteCmdContext<'_>, msg: &str) -> Value {
 /// `None` means any state is acceptable (rename).
 fn required_state(kind: GatedCmd) -> Option<NoteState> {
     match kind {
-        GatedCmd::ExportSecret | GatedCmd::MarkSpent => Some(NoteState::Confirmed),
+        GatedCmd::ExportSecret | GatedCmd::MarkSpent | GatedCmd::Send => {
+            Some(NoteState::Confirmed)
+        }
         GatedCmd::Discard => Some(NoteState::Pending),
         GatedCmd::Delete => Some(NoteState::Spent),
         GatedCmd::Rename => None,
@@ -345,7 +411,7 @@ fn gated_by_id(
 /// The note methods served over the relay path, in the order the
 /// capabilities advert lists them. Rename/delete are deliberately absent:
 /// housekeeping stays a USB-cable operation.
-pub const NOTE_METHODS: [&str; 8] = [
+pub const NOTE_METHODS: [&str; 9] = [
     "heartwood_note_list",
     "heartwood_note_new",
     "heartwood_note_new_pair",
@@ -354,6 +420,7 @@ pub const NOTE_METHODS: [&str; 8] = [
     "heartwood_note_export",
     "heartwood_note_import",
     "heartwood_note_spent",
+    "heartwood_note_send",
 ];
 
 /// Map a `heartwood_note_*` NIP-46 request onto the wire command object the
@@ -372,6 +439,7 @@ pub fn note_cmd_for_method(method: &str, params: &[Value]) -> Result<Value, &'st
         "heartwood_note_export" => "export_secret",
         "heartwood_note_import" => "import_secret",
         "heartwood_note_spent" => "mark_spent",
+        "heartwood_note_send" => "send",
         _ => return Err("unknown note method"),
     };
     let mut fields = match params.first() {
@@ -431,13 +499,24 @@ mod tests {
         storage: MemStorage,
         answer: Approval,
         asked: Vec<(GatedCmd, String)>,
+        /// Secrets handed to the wrap hook, so a test can check the plaintext
+        /// went where it should and nowhere else.
+        wrapped: Vec<([u8; SECRET_LEN], [u8; 32])>,
+        can_wrap: bool,
     }
 
     impl Harness {
         fn new() -> Self {
             let mut storage = MemStorage::new();
             let store = NoteStore::load(&mut storage, MAX_NOTES).store;
-            Harness { store, storage, answer: Approval::Approved, asked: Vec::new() }
+            Harness {
+                store,
+                storage,
+                answer: Approval::Approved,
+                asked: Vec::new(),
+                wrapped: Vec::new(),
+                can_wrap: true,
+            }
         }
 
         fn run(&mut self, msg: &str) -> Value {
@@ -456,11 +535,17 @@ mod tests {
                 asked.push((kind, meta.id.clone()));
                 answer
             };
+            let wrapped = &mut self.wrapped;
+            let mut wrap = move |secret: &[u8; SECRET_LEN], _meta: &NoteMeta, to: &[u8; 32]| {
+                wrapped.push((*secret, *to));
+                Ok(serde_json::json!({"kind": 1059, "content": "sealed"}))
+            };
             let mut ctx = NoteCmdContext {
                 store: &mut self.store,
                 storage: &mut self.storage,
                 rng: &mut rng,
                 approve: &mut approve,
+                wrap: if self.can_wrap { Some(&mut wrap) } else { None },
                 now: 42,
                 fw_version: "0.0.0-test",
                 board: "host",
@@ -736,6 +821,7 @@ mod tests {
             ("heartwood_note_export", true),
             ("heartwood_note_spent", true),
             ("heartwood_note_discard", true),
+            ("heartwood_note_send", true),
             ("heartwood_note_list", false),
             ("heartwood_note_new", false),
             ("heartwood_note_new_pair", false),
@@ -748,6 +834,85 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    #[test]
+    fn send_seals_on_device_once_and_records_the_recipient() {
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        let bob = "bb".repeat(32);
+        let res = h.run(&format!(r#"{{"cmd":"send","id":"{id}","to":"{bob}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(res["event"]["kind"], 1059);
+        // The secret went to the wrap hook and nowhere in the response.
+        assert_eq!(h.wrapped.len(), 1);
+        assert_eq!(h.wrapped[0].1, [0xbb; 32]);
+        assert!(res.get("k1").is_none());
+        assert_eq!(h.asked, vec![(GatedCmd::Send, id.clone())]);
+        // Listed as sent, still confirmed on the wire.
+        let list = h.run(r#"{"cmd":"list_notes"}"#);
+        assert_eq!(list["notes"][0]["state"], "confirmed");
+        assert_eq!(list["notes"][0]["sent_to"], bob);
+        // A second send never reaches the owner.
+        let res = h.run(&format!(r#"{{"cmd":"send","id":"{id}","to":"{bob}"}}"#));
+        assert_eq!(res["error"], "invalid_state");
+        assert_eq!(h.asked.len(), 1);
+        assert_eq!(h.wrapped.len(), 1);
+        // Unsend path: export still works (gated) so the owner's wallet can
+        // rotate the note out from under an unclaimed wrap.
+        let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true);
+    }
+
+    #[test]
+    fn send_validates_before_prompting_and_needs_a_surface_that_can_seal() {
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        for bad in [
+            format!(r#"{{"cmd":"send","id":"{id}"}}"#),
+            format!(r#"{{"cmd":"send","id":"{id}","to":"abc"}}"#),
+            format!(r#"{{"cmd":"send","id":"{id}","to":"{}"}}"#, "zz".repeat(32)),
+        ] {
+            assert_eq!(h.run(&bad)["error"], "bad_request", "{bad}");
+        }
+        let res = h.run(&format!(r#"{{"cmd":"send","id":"deadbeef","to":"{}"}}"#, "bb".repeat(32)));
+        assert_eq!(res["error"], "not_found");
+        // Pending note: state error, no prompt.
+        let pending = h.run(r#"{"cmd":"new_secret"}"#)["id"].as_str().unwrap().to_string();
+        let res = h.run(&format!(r#"{{"cmd":"send","id":"{pending}","to":"{}"}}"#, "bb".repeat(32)));
+        assert_eq!(res["error"], "invalid_state");
+        assert!(h.asked.is_empty());
+        // Declined: nothing sealed, nothing marked.
+        h.answer = Approval::Declined;
+        let res = h.run(&format!(r#"{{"cmd":"send","id":"{id}","to":"{}"}}"#, "bb".repeat(32)));
+        assert_eq!(res["error"], "user_declined");
+        assert!(h.wrapped.is_empty());
+        assert!(h.run(r#"{"cmd":"list_notes"}"#)["notes"][0].get("sent_to").is_none());
+        // No wrap hook (direct USB): refused before the owner is asked.
+        h.answer = Approval::Approved;
+        h.can_wrap = false;
+        let res = h.run(&format!(r#"{{"cmd":"send","id":"{id}","to":"{}"}}"#, "bb".repeat(32)));
+        assert_eq!(res["error"], "bad_request");
+        assert_eq!(h.asked.len(), 1);
+    }
+
+    #[test]
+    fn received_notes_list_their_sender_and_count() {
+        let mut h = Harness::new();
+        let mut rng = |buf: &mut [u8]| buf.fill(9);
+        h.store
+            .receive(&mut h.storage, &mut rng, &[5u8; SECRET_LEN], "mint.example/w", 3_000, &[0xaa; 32], 1)
+            .unwrap();
+        let list = h.run(r#"{"cmd":"list_notes"}"#);
+        assert_eq!(list["notes"][0]["state"], "confirmed");
+        assert_eq!(list["notes"][0]["from"], "aa".repeat(32));
+        assert!(list["notes"][0].get("sent_to").is_none());
+        assert_eq!(h.run(r#"{"cmd":"get_info"}"#)["received_count"], 1);
+        let id = list["notes"][0]["id"].as_str().unwrap().to_string();
+        // Forwarding a received note is refused without a prompt.
+        let res = h.run(&format!(r#"{{"cmd":"send","id":"{id}","to":"{}"}}"#, "bb".repeat(32)));
+        assert_eq!(res["error"], "invalid_state");
+        assert!(h.asked.is_empty());
     }
 
     #[test]

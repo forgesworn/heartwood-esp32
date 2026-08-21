@@ -612,6 +612,34 @@ pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
     Some((header, if second.is_empty() { first } else { format!("{first}\n{second}") }))
 }
 
+/// The state check a gated note command would fail, BEFORE the relay card
+/// goes up -- the cable path's rule (a card for a command that cannot run
+/// teaches the owner to press without reading), applied to the relay path.
+/// `None` means ask.
+pub fn relay_precheck(cmd: &serde_json::Value) -> Option<&'static str> {
+    let name = cmd.get("cmd")?.as_str()?;
+    let id = cmd.get("id")?.as_str()?;
+    with_locker(|notes| {
+        let store = &notes.store;
+        let meta = match store.get_meta(id) {
+            Some(m) => m,
+            None => return Some("not_found"),
+        };
+        use heartwood_common::note_store::NoteState;
+        let ok = match name {
+            "export_secret" | "mark_spent" => meta.state == NoteState::Confirmed,
+            "discard" => meta.state == NoteState::Pending,
+            "send" => store.can_send(id).is_ok(),
+            _ => true,
+        };
+        if ok {
+            None
+        } else {
+            Some("invalid_state")
+        }
+    })
+}
+
 /// Store a note that arrived by gift wrap, once the owner has held the
 /// button for it. Idempotent on the secret, so a relay replaying the wrap
 /// is harmless.

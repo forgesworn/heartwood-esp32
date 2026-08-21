@@ -791,9 +791,13 @@ fn dispatch_inner(
         // A note card shows the money, not the method name: amount, mint
         // and (for send) the recipient, as the cable path already does.
         let note_card = if is_note_method(&method) {
-            heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params)
-                .ok()
-                .and_then(|cmd| crate::notes::relay_card(&cmd))
+            let cmd = heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params).ok();
+            if let Some(refusal) = cmd.as_ref().and_then(crate::notes::relay_precheck) {
+                if !matches!(approval, ApprovalDecision::ButtonApproved) {
+                    return build_error_json(&request.id, -1, refusal);
+                }
+            }
+            cmd.and_then(|cmd| crate::notes::relay_card(&cmd))
         } else {
             None
         };

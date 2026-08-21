@@ -102,6 +102,9 @@ pub enum Nip46Method {
     HeartwoodNoteSend,
     HeartwoodNoteTrust,
     HeartwoodNoteTrusted,
+    /// Mint a connection slot for another wallet, from a wallet already
+    /// bound. Gated by a hold; answers with a one-time bunker URI.
+    HeartwoodPairWallet,
     // Unknown method
     Unknown(String),
 }
@@ -144,6 +147,7 @@ impl Nip46Method {
             "heartwood_note_send" => Self::HeartwoodNoteSend,
             "heartwood_note_trust" => Self::HeartwoodNoteTrust,
             "heartwood_note_trusted" => Self::HeartwoodNoteTrusted,
+            "heartwood_pair_wallet" => Self::HeartwoodPairWallet,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -180,6 +184,7 @@ impl Nip46Method {
             Self::HeartwoodNoteSend => "heartwood_note_send",
             Self::HeartwoodNoteTrust => "heartwood_note_trust",
             Self::HeartwoodNoteTrusted => "heartwood_note_trusted",
+            Self::HeartwoodPairWallet => "heartwood_pair_wallet",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -203,6 +208,7 @@ impl Nip46Method {
                 | Self::HeartwoodNoteDiscard
                 | Self::HeartwoodNoteSend
                 | Self::HeartwoodNoteTrust
+                | Self::HeartwoodPairWallet
         )
     }
 

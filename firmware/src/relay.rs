@@ -3735,6 +3735,8 @@ fn note_card_header(method: &str) -> Option<&'static str> {
         "heartwood_note_spent" => "SPEND NOTE",
         "heartwood_note_discard" => "DISCARD NOTE",
         "heartwood_note_send" => "SEND NOTE",
+        "heartwood_note_trust" => "TRUST SENDER",
+        "heartwood_pair_wallet" => "PAIR NEW WALLET",
         _ => return None,
     })
 }

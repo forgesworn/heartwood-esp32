@@ -3347,6 +3347,10 @@ const CARD_HOLD_MS: u32 = 2000;
 /// exists to remove: it happens only during a hold, and only for as long as
 /// the hold lasts.
 const CARD_HOLD_BURST: Duration = Duration::from_millis(600);
+/// Characters that fit one title line on the narrowest panel we ship
+/// (128 px at FONT_5X8). Titles are built to this so the renderer never has
+/// to clip one.
+const TITLE_LINE_CHARS: usize = 25;
 const CARD_HOLD_POLL_MS: u32 = 40;
 
 /// Total bytes all waiting asks may hold. Cards keep whole parsed requests
@@ -3962,12 +3966,31 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
 
     let sender_hex = hex_encode(&opened.sender);
     let sats = note.amount_msat / 1000;
-    let title = format!(
-        "{sats} sats @ {}\nfrom {}..{}",
-        note.host,
-        &sender_hex[..8],
-        &sender_hex[56..]
-    );
+    // The host is the field that decides whether this note is worth
+    // anything, and it is the field an attacker wants cut short: clipped at
+    // the panel's edge, mint.forgesworn.dev and mint.forgesworn.evil.com
+    // read the same. So drop the withdraw path, which carries no identity,
+    // and give the host a line of its own when it cannot share one.
+    let bare_host = note.host.split('/').next().unwrap_or(note.host.as_str());
+    // Elide from the LEFT: a host is decided by its tail, so dropping the
+    // front keeps the registrable domain and TLD on screen. Cutting the end
+    // instead is what makes a lookalike indistinguishable.
+    let host = if bare_host.chars().count() > TITLE_LINE_CHARS {
+        let tail: String = bare_host
+            .chars()
+            .skip(bare_host.chars().count() - (TITLE_LINE_CHARS - 2))
+            .collect();
+        format!("..{tail}")
+    } else {
+        bare_host.to_string()
+    };
+    let sender_short = format!("{}..{}", &sender_hex[..8], &sender_hex[56..]);
+    let inline = format!("{sats} sats @ {host}");
+    let title = if inline.chars().count() <= TITLE_LINE_CHARS {
+        format!("{inline}\nfrom {sender_short}")
+    } else {
+        format!("{host}\n{sats} sats from {}", &sender_hex[..8])
+    };
     queue_receive_card(
         ctx,
         slot,

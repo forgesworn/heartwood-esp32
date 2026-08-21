@@ -504,14 +504,18 @@ pub struct BatchNote<'a> {
 pub fn batch_card(header: &str, notes: &[BatchNote<'_>], recipient: Option<&str>) -> (String, String) {
     let action = header.strip_suffix(" NOTE").unwrap_or(header);
     let head = format!("{action} {} NOTES", notes.len());
-    let total: u64 = notes.iter().map(|n| n.amount_msat / 1000).sum();
+    // Summed in msat and formatted ONCE. Truncating each note to sats first
+    // and adding those loses up to a sat per note: three notes of 1 999 msat
+    // are 5 997 msat, not the 3 sats a per-note division reports.
+    let total = notes.iter().fold(0u64, |acc, n| acc.saturating_add(n.amount_msat));
+    let amount = crate::note_fmt::format_amount(total);
     let mut hosts: Vec<&str> = notes.iter().map(|n| n.host).filter(|h| !h.is_empty()).collect();
     hosts.sort_unstable();
     hosts.dedup();
     let first = match hosts.as_slice() {
-        [] => format!("{total} sats"),
-        [one] => format!("{total} sats @ {one}"),
-        many => format!("{total} sats @ {} mints", many.len()),
+        [] => amount,
+        [one] => format!("{amount} @ {}", crate::note_fmt::elide_host(one, crate::note_fmt::CARD_LINE_CHARS)),
+        many => format!("{amount} @ {} mints", many.len()),
     };
     let title = match recipient {
         Some(to) if to.len() == 64 => format!("{first}\nto {}..{}", &to[..8], &to[56..]),
@@ -1130,7 +1134,7 @@ mod tests {
         ];
         let (head, title) = batch_card("RELEASE NOTE", &notes, None);
         assert_eq!(head, "RELEASE 3 NOTES");
-        assert_eq!(title, "1110 sats @ mint.forgesworn.dev");
+        assert_eq!(title, "1 110 sats @ mint.forgesworn.dev");
         let (head, title) = batch_card("SPEND NOTE", &notes[..2], None);
         assert_eq!(head, "SPEND 2 NOTES");
         assert_eq!(title, "116 sats @ mint.forgesworn.dev");

@@ -3698,8 +3698,20 @@ fn queue_button_ask(
                 // card that names the whole batch (tick_button_card).
                 card.last_remaining = u32::MAX;
                 card.armed = false;
+                // Log what the card now READS, not just how many asks it
+                // holds: the bench needs to check the wording that a hold
+                // answers without a camera on the OLED.
+                let reads = card
+                    .asks
+                    .first()
+                    .and_then(|first| note_card_header(&first.ask.request.method))
+                    .map(|header| {
+                        let (head, title) = note_batch_card(header, &card.asks);
+                        format!("; card reads '{head}' / '{}'", title.replace('\n', " / "))
+                    })
+                    .unwrap_or_default();
                 log::info!(
-                    "[relay] {request_id} joins the open approval card ({} asks)",
+                    "[relay] {request_id} joins the open approval card ({} asks){reads}",
                     card.asks.len()
                 );
             }

@@ -64,26 +64,45 @@ pub fn format_amount(msat: u64) -> String {
 
 /// The mint, as much of it as a card line can carry.
 ///
-/// The withdraw path is dropped: it carries no identity, and the characters
-/// are better spent on the host. What remains is elided from the LEFT,
-/// because a host is decided by its tail — cutting the end instead is
+/// The whole withdraw endpoint, path and all, because that is what the field
+/// is (PR #77): `mint.example/w` and `mint.example/u/alice/w` are different
+/// endpoints holding different people's money, and a card that shows only
+/// `mint.example` cannot tell one tenant of a shared mint from another.
+///
+/// Two parts of the string decide identity and neither may be cut: the tail
+/// of the HOSTNAME (the registrable domain and TLD — cutting the end is
 /// exactly what makes `mint.forgesworn.dev` and `mint.forgesworn.evil.com`
-/// read the same at the edge of a panel.
+/// read the same at the edge of a panel) and the path (which tenant). So the
+/// characters come out of the middle of the hostname, which is the only part
+/// that identifies nothing.
 pub fn elide_host(host: &str, max: usize) -> String {
-    let bare = host.split('/').next().unwrap_or(host);
-    let len = bare.chars().count();
+    let len = host.chars().count();
     if len <= max || max < 3 {
-        return bare.to_string();
+        return host.to_string();
     }
-    let tail: String = bare.chars().skip(len - (max - 2)).collect();
+    let (name, path) = match host.find('/') {
+        Some(i) => host.split_at(i),
+        None => (host, ""),
+    };
+    // What is left for the hostname once the path and the ".." are paid for.
+    let room = max.saturating_sub(path.chars().count() + 2);
+    if room >= 2 {
+        let name_len = name.chars().count();
+        let keep: String = name.chars().skip(name_len.saturating_sub(room)).collect();
+        return format!("..{keep}{path}");
+    }
+    // The path alone will not fit. Keep its tail, which is the tenant: a
+    // wrong tenant is a wrong recipient, a truncated one is merely ugly.
+    let tail: String = host.chars().skip(len - (max - 2)).collect();
     format!("..{tail}")
 }
 
 /// The money line of a note card, forced onto ONE line, for a card whose
 /// second line is already spoken for (a send names its recipient there).
 ///
-/// The host gives up the characters, never the amount: a clipped host is a
-/// host the owner must look harder at, a clipped amount is a wrong number.
+/// The host gives up the characters, never the amount: a shortened host
+/// still shows the domain and the tenant, a clipped amount is a wrong
+/// number.
 /// If there is not even room for a useful host, the amount goes alone.
 pub fn amount_and_host_line(msat: u64, host: &str, max: usize) -> String {
     let amount = format_amount(msat);
@@ -141,14 +160,15 @@ mod tests {
     }
 
     #[test]
-    fn a_host_is_elided_from_the_left_and_loses_its_path() {
-        assert_eq!(elide_host("mint.example/w", 25), "mint.example");
+    fn a_host_keeps_its_domain_tld_and_path() {
+        assert_eq!(elide_host("mint.example/w", 25), "mint.example/w");
         // The lookalike case: the tail is what survives.
         let long = "mint.forgesworn.evil.example.com/w";
         let out = elide_host(long, 20);
         assert_eq!(out.chars().count(), 20);
-        assert!(out.ends_with("evil.example.com"));
         assert!(out.starts_with(".."));
+        // Domain, TLD and path all survive; the subdomain pays.
+        assert_eq!(out, "..evil.example.com/w");
     }
 
     #[test]
@@ -159,7 +179,7 @@ mod tests {
         assert_eq!(out.chars().count(), 25);
         assert!(out.starts_with("1 110 sats @ "));
         // Elided from the left, so the registrable domain and TLD survive.
-        assert!(out.ends_with("esworn.dev"), "{out}");
+        assert!(out.ends_with("worn.dev/w"), "{out}");
         assert!(out.contains(" @ .."));
         assert!(!out.contains('\n'));
 
@@ -169,9 +189,22 @@ mod tests {
     }
 
     #[test]
+    fn two_tenants_of_one_mint_never_render_the_same() {
+        // The reason the path stays (PR #77): these are different endpoints
+        // holding different people's money.
+        let alice = elide_host("mint.example.com/u/alice/w", 23);
+        let bob = elide_host("mint.example.com/u/bob/w", 23);
+        assert_ne!(alice, bob);
+        assert!(alice.ends_with("/u/alice/w"), "{alice}");
+        assert!(bob.ends_with("/u/bob/w"), "{bob}");
+        // And the TLD is still there to check the mint itself against.
+        assert!(alice.contains(".com"), "{alice}");
+    }
+
+    #[test]
     fn the_amount_is_never_the_field_that_gets_clipped() {
         let one = amount_and_host(21_000, "mint.example/w", 25);
-        assert_eq!(one, "21 sats @ mint.example");
+        assert_eq!(one, "21 sats @ mint.example/w");
 
         // Too long inline: the amount keeps a whole line to itself.
         let two = amount_and_host(1_110_000, "mint.forgesworn.dev/w", 25);

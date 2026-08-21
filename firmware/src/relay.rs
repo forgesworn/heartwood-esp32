@@ -4250,10 +4250,11 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
     // the panel's edge, mint.forgesworn.dev and mint.forgesworn.evil.com
     // read the same. So drop the withdraw path, which carries no identity,
     // and give the host a line of its own when it cannot share one.
-    // Elide from the LEFT: a host is decided by its tail, so dropping the
-    // front keeps the registrable domain and TLD on screen. Cutting the end
-    // instead is what makes a lookalike indistinguishable. Shared with the
-    // gated note cards in common/src/note_fmt.rs.
+    // Shortened out of the middle of the hostname, the only part that
+    // identifies nothing: the registrable domain and TLD stay (cutting them
+    // is what makes a lookalike indistinguishable) and so does the withdraw
+    // path, which is what tells two tenants of one mint apart. Shared with
+    // the gated note cards in common/src/note_fmt.rs.
     let host = heartwood_common::note_fmt::elide_host(&note.host, TITLE_LINE_CHARS);
     let sender_short = format!("{}..{}", &sender_hex[..8], &sender_hex[56..]);
     let inline = format!("{amount} @ {host}");

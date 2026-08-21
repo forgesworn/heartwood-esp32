@@ -1093,7 +1093,12 @@ scripts/nip46-client.mjs conventions):
     way is discarded and the operator presses again on the card that names
     the batch. Sends to different recipients never share a card. Verify:
     collect three notes from the web wallet; the card must name `3 NOTES`
-    and the sum before you hold, then `SPEND 3 NOTES` the same way.
+    and the sum before you hold, then `SPEND 3 NOTES` the same way. The
+    serial log now prints the wording each join produced, so this is
+    checkable without eyes on the panel. Seen on the v4 board 2026-08-21
+    21:27 UTC, and the hold that followed answered both asks:
+    `joins the open approval card (2 asks); card reads 'RELEASE 2 NOTES'
+    / '24 sats @ mint.forgesworn.dev/w'`.
 
 Regression watch: a USB `sign_event` approval and a factory reset must behave
 exactly as before; FIRMWARE_INFO's nvs entry stats now include the

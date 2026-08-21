@@ -1166,6 +1166,19 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_of_sub_sat_notes_is_not_rounded_to_nothing() {
+        let notes = [
+            BatchNote { amount_msat: 1_999, host: "a.example" },
+            BatchNote { amount_msat: 1_999, host: "a.example" },
+            BatchNote { amount_msat: 1_999, host: "a.example" },
+        ];
+        let (_, title) = batch_card("RELEASE NOTE", &notes, None);
+        // Dividing each note by 1000 first and adding those would have said
+        // "3 sats" for 5 997 msat, and "0 sats" for any note under one sat.
+        assert_eq!(title, "5 997 msat @ a.example");
+    }
+
+    #[test]
     fn a_batch_with_an_unknown_note_still_counts_it() {
         // The total can under-state (an unknown amount adds nothing) but the
         // count never does: the owner is told how many holds this one is.

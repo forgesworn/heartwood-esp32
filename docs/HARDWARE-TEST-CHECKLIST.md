@@ -1124,11 +1124,17 @@ notecase `heartwood send`.
    the wire carries `"since":<mark - 172800>,"limit":16` and the card still
    comes up; with an empty ledger the REQ carries `"limit":16` and no
    `since`. The keepalive re-REQ 40 s later must be back to `"limit":0`.
-3. Not for us: a wrap to a persona pubkey, a wrap to the master from a DM
-   (kind 14 rumor), a wrap whose rumor claims a different author than the
+3. Not for us: a wrap to a persona pubkey, a kind-14 DM whose text has no
+   note (or two), a wrap whose rumor claims a different author than the
    seal signer, and a rumor whose URL has no amount. Expect: silent drop
    with one `[relay] gift wrap ... not for us / is not a note` log line,
    no card, no wake.
+3a. From a stranger's client: on a phone running any NIP-17 client
+   (0xchat, Amethyst), resolve the device's NIP-05, and DM it a note as
+   plain text, once as `lnurlw://...`, once as bech32 `LNURL1...`, once
+   with a `lightning:` prefix, once wrapped in a sentence. Expect the same
+   RECEIVE card each time, with the sender's npub on it. A DM carrying two
+   notes is dropped (`more than one note in the message`).
 4. Letterbox cap: with MAX_RECEIVED (4) received notes held, a fifth wrap
    logs `letterbox full; dropped until there is room` and raises no card.
    Mark one spent over the relay: WITHOUT sending again, the catch-up

@@ -466,6 +466,17 @@ fn show_network_feedback(
     wake: bool,
     restore_after: Option<Duration>,
 ) {
+    // An approval card owns the screen until the operator answers it - the
+    // same rule the idle carousel and the confirm-restore already follow.
+    // Connectivity churn is frequent and unprompted, so without this a relay
+    // reconnect or a wifi rejoin repaints straight over a live card: the
+    // operator is asked to hold a button for something they can no longer
+    // see, and the hold they do make lands on whatever replaced it. Found
+    // running checklist section 14, where a RECEIVE card was clobbered by
+    // the wifi-standalone screen mid-decision.
+    if approval_card_open(ctx) {
+        return;
+    }
     if wake && !ctx.display_on {
         crate::oled::wake_display(ctx.display);
         ctx.display_on = true;
@@ -1276,10 +1287,15 @@ pub fn run_wifi_standalone<'d, 'b>(
 /// A live candidate that is never committed is aborted and rebooted back to A.
 fn network_state_tick(ctx: &mut SignCtx) {
     let now = Instant::now();
+    // Deferred while a card is up, not cancelled: the deadline stays pending
+    // so the identity screen still returns once the operator has answered.
+    // Firing it under a live card is what put "N masters loaded" over a
+    // RECEIVE card in the section 14 bench run.
     if ctx
         .network_display_restore_at
         .map(|deadline| now >= deadline)
         .unwrap_or(false)
+        && !approval_card_open(ctx)
     {
         ctx.network_display_restore_at = None;
         show_idle_identity(ctx);
@@ -3331,6 +3347,10 @@ const CARD_HOLD_MS: u32 = 2000;
 /// exists to remove: it happens only during a hold, and only for as long as
 /// the hold lasts.
 const CARD_HOLD_BURST: Duration = Duration::from_millis(600);
+/// Characters that fit one title line on the narrowest panel we ship
+/// (128 px at FONT_5X8). Titles are built to this so the renderer never has
+/// to clip one.
+const TITLE_LINE_CHARS: usize = 25;
 const CARD_HOLD_POLL_MS: u32 = 40;
 
 /// Total bytes all waiting asks may hold. Cards keep whole parsed requests
@@ -3644,6 +3664,11 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         // whatever the operator was doing then, not to this decision.
         crate::button::clear_press_edge();
         ctx.button_cards[0].opened_at = Some(now);
+        log::info!(
+            "[relay] card took the screen: queue={} asks={}",
+            ctx.button_cards.len(),
+            ctx.button_cards[0].asks.len()
+        );
     }
 
     let opened_at = ctx.button_cards[0].opened_at.unwrap_or(now);
@@ -3687,10 +3712,15 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     }
 
     if hold_ms > 0 {
-        // The button is down: follow it closely for a short burst so the bar
-        // fills smoothly and the approval lands when the hold completes,
-        // rather than up to a whole loop pass later.
-        let burst_until = Instant::now() + CARD_HOLD_BURST;
+        // The button is down: follow it to the end rather than for a fixed
+        // burst. A 600 ms window did not cover a 2 s hold, so the bar froze
+        // partway - reported from the bench as "only got to 75% before it
+        // said 12 sats" - while the relay pass that followed took long
+        // enough for the hold to complete unseen. An operator with a finger
+        // on the button is a foreground interaction: the socket can wait the
+        // second or so it takes, and the watchdog is fed every poll.
+        let burst_until = Instant::now()
+            + CARD_HOLD_BURST.max(Duration::from_millis(u64::from(CARD_HOLD_MS - hold_ms) + 200));
         loop {
             crate::wdt::feed();
             let held = crate::button::hold_ms();
@@ -3936,12 +3966,31 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
 
     let sender_hex = hex_encode(&opened.sender);
     let sats = note.amount_msat / 1000;
-    let title = format!(
-        "{sats} sats @ {}\nfrom {}..{}",
-        note.host,
-        &sender_hex[..8],
-        &sender_hex[56..]
-    );
+    // The host is the field that decides whether this note is worth
+    // anything, and it is the field an attacker wants cut short: clipped at
+    // the panel's edge, mint.forgesworn.dev and mint.forgesworn.evil.com
+    // read the same. So drop the withdraw path, which carries no identity,
+    // and give the host a line of its own when it cannot share one.
+    let bare_host = note.host.split('/').next().unwrap_or(note.host.as_str());
+    // Elide from the LEFT: a host is decided by its tail, so dropping the
+    // front keeps the registrable domain and TLD on screen. Cutting the end
+    // instead is what makes a lookalike indistinguishable.
+    let host = if bare_host.chars().count() > TITLE_LINE_CHARS {
+        let tail: String = bare_host
+            .chars()
+            .skip(bare_host.chars().count() - (TITLE_LINE_CHARS - 2))
+            .collect();
+        format!("..{tail}")
+    } else {
+        bare_host.to_string()
+    };
+    let sender_short = format!("{}..{}", &sender_hex[..8], &sender_hex[56..]);
+    let inline = format!("{sats} sats @ {host}");
+    let title = if inline.chars().count() <= TITLE_LINE_CHARS {
+        format!("{inline}\nfrom {sender_short}")
+    } else {
+        format!("{host}\n{sats} sats from {}", &sender_hex[..8])
+    };
     queue_receive_card(
         ctx,
         slot,

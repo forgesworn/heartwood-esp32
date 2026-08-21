@@ -200,7 +200,7 @@ mod tests {
             secret: [0x5a; SECRET_LEN],
             state: NoteState::Confirmed,
             amount_msat: 21_000,
-            host: "mint.example".to_string(),
+            host: "mint.example/w".to_string(),
             label: "float".to_string(),
             sig: alloc::string::String::new(),
             parent_ids: vec![],

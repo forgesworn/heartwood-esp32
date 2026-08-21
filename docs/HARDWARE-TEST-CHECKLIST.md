@@ -1018,9 +1018,27 @@ USB tier, unlocked, no at-rest:
 
 1. `get_info` answers version/board/storage/counts; `new_secret` then
    `confirm` then `list_notes` shows one CONFIRMED note. NOT YET BENCH-RUN.
-2. `export_secret` raises "Release note? N sats @ host" — hold approves and
-   returns 64-hex `k1`; short press denies (`user_declined`); unattended
-   card times out (`timeout`) with the note untouched. NOT YET BENCH-RUN.
+2. `export_secret` raises a card headed `RELEASE NOTE` whose title is the
+   money — `<amount> @ <host>`, the action having moved into the header so
+   both title lines are available to the amount and the mint — hold
+   approves and returns 64-hex `k1`; short press denies (`user_declined`);
+   unattended card times out (`timeout`) with the note untouched. NOT YET
+   BENCH-RUN.
+2b. Amount rendering, on the panel, against dni's rules
+    (`common/src/note_fmt.rs`, mirroring lnurl-vault's
+    `src/proto/note_display.h`). Confirm a note at each of these and read
+    the RELEASE card: 1 000 msat shows `1 sat` (singular), 21 000 shows
+    `21 sats`, 2 100 000 shows `2 100 sats` (grouped, so it cannot be
+    misread as 21 000), 999 shows `999 msat` and NOT `0 sats`, 1 999 shows
+    `1 999 msat`. Then confirm one against a long host
+    (`mint.forgesworn.example.com/u/alice/w`): the amount must be complete
+    and unclipped; the host shortened out of the MIDDLE with a leading `..`
+    so that both the registrable domain with its TLD and the whole withdraw
+    path survive (PR #77 — two tenants of one mint must never draw the same
+    card); and on the 128 px Heltec the amount and the host must fall on
+    separate lines rather than one centred line running off both edges.
+    Confirm a second note at `.../u/bob/w` and check the two cards differ.
+    NOT YET BENCH-RUN.
 3. Destructive gating: `mark_spent` / `discard` / `rename` / `delete` each
    raise a card; wrong-state commands answer `invalid_state` with NO card
    (watch the OLED — the serial answer alone does not prove it). NOT YET
@@ -1088,7 +1106,7 @@ scripts/nip46-client.mjs conventions):
     (web wallet collecting three notes) and it exposed a lie: the card
     read `RELEASE NOTE / 12 sats` while the hold released three notes
     worth 1,110 sats. Now: a batched note card reads `RELEASE 3 NOTES /
-    1110 sats @ <host>` (or `@ 2 mints`), the count and total re-drawn as
+    1 110 sats @ <host>` (or `@ 2 mints`), the count and total re-drawn as
     each ask joins, and a join DISARMS the card so a press already under
     way is discarded and the operator presses again on the card that names
     the batch. Sends to different recipients never share a card. Verify:
@@ -1118,9 +1136,9 @@ notecase `heartwood send`.
 
 1. Wrap a test-mint note to the device's master npub while it sits on the
    relays with no host attached. Expect: panel wakes, amber card headed
-   RECEIVE NOTE, first line `<sats> sats @ <host>`, second `from
+   RECEIVE NOTE, first line `<amount> @ <host>`, second `from
    <npub8>..<npub8>`; no NIP-46 response is published to anyone. Hold:
-   green "N sats received / wallet collects it", back to idle after ~3 s;
+   green "<amount> received / wallet collects it", back to idle after ~3 s;
    `heartwood_note_list` shows the note CONFIRMED with `from` set and
    `get_info.received_count` 1. Tap (B) or let it expire: nothing stored,
    count unchanged.
@@ -1186,7 +1204,7 @@ notecase `heartwood send`.
    claims it at the mint (the wrapped secret is now burned); SPEND NOTE
    card, hold; `heartwood_note_list` shows it SPENT.
 6. Send: `heartwood_note_send` on a CONFIRMED note of the device's own.
-   Expect SEND NOTE card, `<sats> sats @ <host>` / `to <hex8>..<hex8>`; hold
+   Expect SEND NOTE card, `<amount> @ <host>` / `to <hex8>..<hex8>`; hold
    returns `{"ok":true,"event":{...kind 1059...}}` and NO `k1` anywhere in
    the response; the note lists as CONFIRMED with `sent_to`. Repeat on the
    same note: `invalid_state` with no card. `heartwood_note_export` on it

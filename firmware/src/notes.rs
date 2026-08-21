@@ -28,6 +28,7 @@
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 
 use heartwood_common::note_cmd::{self, Approval, GatedCmd, NoteCmdContext, WrapFn};
+use heartwood_common::note_fmt::{amount_and_host, amount_and_host_line, CARD_LINE_CHARS};
 use heartwood_common::note_seal;
 use heartwood_common::note_store::{
     NoteError, NoteMeta, NoteStorage, NoteStore, StorageError, ID_LEN, MAX_NOTES, SECRET_LEN,
@@ -669,27 +670,45 @@ fn now_secs() -> u32 {
 /// units the owner thinks in.
 /// The cable-path card for trusting a sender: the key, elided from the
 /// middle so both ends stay checkable against the mint's published npub.
-fn trust_card_title(pk: &[u8; 32]) -> String {
-    let npub = heartwood_common::encoding::encode_npub(pk);
-    format!("Trust sender?\n{}..{}\nnotes skip the hold", &npub[..12], &npub[npub.len() - 8..])
+/// The header a gated note card is drawn under. Shared with the relay path
+/// (`relay_card`) so the same command names itself the same way whether the
+/// wallet reached the device over the cable or over a relay.
+fn card_header(kind: GatedCmd) -> &'static str {
+    match kind {
+        GatedCmd::ExportSecret => "RELEASE NOTE",
+        GatedCmd::MarkSpent => "SPEND NOTE",
+        GatedCmd::Discard => "DISCARD NOTE",
+        GatedCmd::Rename => "RENAME NOTE",
+        GatedCmd::Delete => "DELETE NOTE",
+        GatedCmd::Send => "SEND NOTE",
+        GatedCmd::Trust => "TRUST SENDER",
+    }
 }
 
-fn card_title(kind: GatedCmd, meta: &NoteMeta) -> String {
-    let sats = meta.amount_msat / 1000;
-    let action = match kind {
-        GatedCmd::ExportSecret => "Release",
-        GatedCmd::MarkSpent => "Spend",
-        GatedCmd::Discard => "Discard",
-        GatedCmd::Rename => "Rename",
-        GatedCmd::Delete => "Delete",
-        GatedCmd::Send => "Send",
-        GatedCmd::Trust => "Trust",
-    };
-    if sats > 0 {
-        format!("{action} note?\n{sats} sats @ {}", meta.host)
+fn trust_card_title(pk: &[u8; 32]) -> (&'static str, String) {
+    let npub = heartwood_common::encoding::encode_npub(pk);
+    // Two lines, not three: show_titled_approval draws the first two and
+    // drops the rest, which used to silently eat "notes skip the hold" --
+    // the line that says what trusting actually does.
+    (
+        card_header(GatedCmd::Trust),
+        format!("{}..{}\nnotes skip the hold", &npub[..12], &npub[npub.len() - 8..]),
+    )
+}
+
+/// Header and title for a gated note card on the cable. The action moved
+/// into the header so both title lines are the money: an amount that has to
+/// share a line with "Release note?" is an amount that gets clipped.
+fn card_title(kind: GatedCmd, meta: &NoteMeta) -> (&'static str, String) {
+    // A PENDING note has no confirmed value yet, so it is named by its id;
+    // anything with a value shows it, including a sub-sat one, which a
+    // divide-by-1000 used to draw as "0 sats" (common/src/note_fmt.rs).
+    let body = if meta.amount_msat > 0 {
+        amount_and_host(meta.amount_msat, &meta.host, CARD_LINE_CHARS)
     } else {
-        format!("{action} note?\n{}", meta.id)
-    }
+        meta.id.clone()
+    };
+    (card_header(kind), body)
 }
 
 /// Header and two-line title for a relay approval card, from the wire
@@ -713,12 +732,19 @@ pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
         _ => return None,
     };
     let meta = with_locker(|notes| notes.store.get_meta(id))?;
-    let sats = meta.amount_msat / 1000;
-    let first = if sats > 0 { format!("{sats} sats @ {}", meta.host) } else { meta.id.clone() };
     let second = match (name, cmd.get("to").and_then(|v| v.as_str())) {
         ("send", Some(to)) if to.len() == 64 => format!("to {}..{}", &to[..8], &to[56..]),
         ("send", _) => "to ?".to_string(),
         _ => String::new(),
+    };
+    // A send spends the second line on the recipient, so its money has to
+    // fit on one; everything else may take two rather than lose the mint.
+    let first = if meta.amount_msat == 0 {
+        meta.id.clone()
+    } else if second.is_empty() {
+        amount_and_host(meta.amount_msat, &meta.host, CARD_LINE_CHARS)
+    } else {
+        amount_and_host_line(meta.amount_msat, &meta.host, CARD_LINE_CHARS)
     };
     Some((header, if second.is_empty() { first } else { format!("{first}\n{second}") }))
 }
@@ -825,10 +851,10 @@ fn handle_note_cmd_frame_inner(
     // so sharing the display through a RefCell is sound; the borrow checker
     // just cannot see the sequencing.
     let display = core::cell::RefCell::new(display);
-    let ask = |title: String| -> Approval {
+    let ask = |(header, title): (&'static str, String)| -> Approval {
         let mut d = display.borrow_mut();
         let result = crate::approval::run_approval_loop(&mut d, buttons, 30, |d, remaining| {
-            crate::oled::show_change_approval(d, &title, remaining, 30);
+            crate::oled::show_titled_approval(d, header, &title, remaining, 30);
         });
         match result {
             crate::approval::ApprovalResult::Approved => Approval::Approved,

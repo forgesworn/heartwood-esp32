@@ -4205,7 +4205,7 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
     }
 
     let sender_hex = hex_encode(&opened.sender);
-    let sats = note.amount_msat / 1000;
+    let amount = heartwood_common::note_fmt::format_amount(note.amount_msat);
 
     // A trusted sender (a public mint the owner holds the button for once,
     // see common/src/trust.rs) is stored on arrival: a zap paid out as a
@@ -4229,10 +4229,11 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
                         crate::oled::wake_display(ctx.display);
                         ctx.display_on = true;
                     }
-                    let bare_host = note.host.split('/').next().unwrap_or(note.host.as_str());
+                    let bare_host =
+                        heartwood_common::note_fmt::elide_host(&note.host, TITLE_LINE_CHARS - 5);
                     crate::oled::show_change_done(
                         ctx.display,
-                        &format!("{sats} sats received"),
+                        &format!("{amount} received"),
                         &format!("from {bare_host}"),
                     );
                     ctx.last_activity = Instant::now();
@@ -4249,25 +4250,18 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
     // the panel's edge, mint.forgesworn.dev and mint.forgesworn.evil.com
     // read the same. So drop the withdraw path, which carries no identity,
     // and give the host a line of its own when it cannot share one.
-    let bare_host = note.host.split('/').next().unwrap_or(note.host.as_str());
-    // Elide from the LEFT: a host is decided by its tail, so dropping the
-    // front keeps the registrable domain and TLD on screen. Cutting the end
-    // instead is what makes a lookalike indistinguishable.
-    let host = if bare_host.chars().count() > TITLE_LINE_CHARS {
-        let tail: String = bare_host
-            .chars()
-            .skip(bare_host.chars().count() - (TITLE_LINE_CHARS - 2))
-            .collect();
-        format!("..{tail}")
-    } else {
-        bare_host.to_string()
-    };
+    // Shortened out of the middle of the hostname, the only part that
+    // identifies nothing: the registrable domain and TLD stay (cutting them
+    // is what makes a lookalike indistinguishable) and so does the withdraw
+    // path, which is what tells two tenants of one mint apart. Shared with
+    // the gated note cards in common/src/note_fmt.rs.
+    let host = heartwood_common::note_fmt::elide_host(&note.host, TITLE_LINE_CHARS);
     let sender_short = format!("{}..{}", &sender_hex[..8], &sender_hex[56..]);
-    let inline = format!("{sats} sats @ {host}");
+    let inline = format!("{amount} @ {host}");
     let title = if inline.chars().count() <= TITLE_LINE_CHARS {
         format!("{inline}\nfrom {sender_short}")
     } else {
-        format!("{host}\n{sats} sats from {}", &sender_hex[..8])
+        format!("{host}\n{amount} from {}", &sender_hex[..8])
     };
     queue_receive_card(
         ctx,
@@ -4426,10 +4420,11 @@ fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick,
                             log::info!("[relay] note {id} received (new: {created})");
                             ledger_changed |= ctx.wrap_ledger.decide(&wrap_id, ask.created_at);
                             if on_screen {
-                                let sats = note.amount_msat / 1000;
+                                let amount =
+                                    heartwood_common::note_fmt::format_amount(note.amount_msat);
                                 crate::oled::show_change_done(
                                     ctx.display,
-                                    &format!("{sats} sats received"),
+                                    &format!("{amount} received"),
                                     "wallet collects it",
                                 );
                             }

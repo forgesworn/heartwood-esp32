@@ -483,12 +483,39 @@ impl NoteStore {
     /// Whether one more received note would be admitted: the letterbox cap
     /// for a stranger, the locker's own cap for a trusted sender. The
     /// relay loop asks this before drawing a card or storing, so a wrap the
-    /// locker would refuse is deferred rather than shown.
+    /// locker would refuse is deferred rather than shown. A spent note the
+    /// locker could evict counts as room (see [`Self::evict_spent_for_room`]).
     pub fn has_room_for_received(&self, trusted: bool) -> bool {
-        if self.admit_creation(1).is_err() {
+        if self.admit_creation(1).is_err() && self.oldest_spent().is_none() {
             return false;
         }
         trusted || self.received_count() < MAX_RECEIVED
+    }
+
+    fn oldest_spent(&self) -> Option<usize> {
+        if !self.index_known {
+            return None;
+        }
+        self.notes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.state == NoteState::Spent)
+            .min_by_key(|(_, n)| (n.updated_at, n.created_at))
+            .map(|(i, _)| i)
+    }
+
+    /// A spent note is a record, not money: its secret is burned at the
+    /// mint and the wallet that spent it holds the history. When a received
+    /// note needs the slot, the oldest spent record gives way. Found the
+    /// hard way: sixteen spent notes filled the locker and every zap after
+    /// that was deferred "until there is room" that never came, because
+    /// deleting is a cable-only operation.
+    fn evict_spent_for_room(&mut self, storage: &mut dyn NoteStorage) -> Result<(), NoteError> {
+        if self.admit_creation(1).is_ok() {
+            return Ok(());
+        }
+        let idx = self.oldest_spent().ok_or(NoteError::StorageFull)?;
+        self.persist_remove(storage, idx)
     }
 
     /// Received notes a wallet has not yet rotated and marked spent.
@@ -700,6 +727,7 @@ impl NoteStore {
         if !self.has_room_for_received(trusted) {
             return Err(NoteError::StorageFull);
         }
+        self.evict_spent_for_room(storage)?;
         self.admit_creation(1)?;
         let id = self.fresh_id(rng, None).ok_or(NoteError::StorageFull)?;
         let note = Note {
@@ -1151,6 +1179,42 @@ mod tests {
         assert_eq!(reloaded.get_meta(&rid).unwrap().peer, Some(Peer::From(alice)));
         assert_eq!(reloaded.get_meta(&sid).unwrap().peer, Some(Peer::To(bob)));
         assert_eq!(reloaded.can_send(&sid), Err(NoteError::InvalidState));
+    }
+
+    #[test]
+    fn a_full_locker_of_spent_notes_makes_room_for_a_received_one() {
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let alice = [0xa1u8; 32];
+        // Fill the locker with minted-then-spent notes, oldest first.
+        for i in 0..MAX_NOTES {
+            let (id, _) = store.new_secret(&mut storage, &mut rng, &[], "", 10 + i as u32).unwrap();
+            store.confirm(&mut storage, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
+            store.mark_spent(&mut storage, &id, 30 + i as u32).unwrap();
+        }
+        assert_eq!(store.counts().0, MAX_NOTES);
+        let oldest = store.list(0, 1).notes[0].id.clone();
+        assert!(store.has_room_for_received(true), "a spent record is room");
+        let (id, created) = store
+            .receive(&mut storage, &mut rng, &[0x55; SECRET_LEN], "m.example", 7_000, &alice, 99, true)
+            .unwrap();
+        assert!(created);
+        assert_eq!(store.counts().0, MAX_NOTES, "one in, one out");
+        assert!(store.get_meta(&oldest).is_none(), "the oldest spent record gave way");
+        assert_eq!(store.get_meta(&id).unwrap().state, NoteState::Confirmed);
+        // A locker full of LIVE notes still refuses: only spent records give way.
+        let mut storage2 = FakeStorage::new();
+        let mut store2 = fresh_store(&mut storage2);
+        for i in 0..MAX_NOTES {
+            let (id, _) = store2.new_secret(&mut storage2, &mut rng, &[], "", 10 + i as u32).unwrap();
+            store2.confirm(&mut storage2, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
+        }
+        assert!(!store2.has_room_for_received(true));
+        assert_eq!(
+            store2.receive(&mut storage2, &mut rng, &[0x56; SECRET_LEN], "m.example", 1, &alice, 1, true),
+            Err(NoteError::StorageFull)
+        );
     }
 
     #[test]

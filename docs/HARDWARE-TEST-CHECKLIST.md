@@ -1136,7 +1136,10 @@ notecase `heartwood send`.
    <host>" toast, `note ... received from trusted sender` in the log, and
    the ledger has it (reboot: no re-offer). A wrap from anyone else still
    gets the card. A trusted sender is not bound by the 4-note letterbox,
-   only by the locker's 16: with four received notes held, a fifth from
+   only by the locker's 16, and a spent record is not a note: with the
+   locker full of spent notes, the next received note evicts the oldest
+   spent one (seen live: sixteen collected zaps filled it and every zap
+   after was deferred). With four received notes held, a fifth from
    the trusted mint stores; a fifth from a stranger is deferred (`dropped
    until there is room`), never silently lost, and arrives by itself once
    a collect frees a slot (seen on the bench: two deferred zaps landed

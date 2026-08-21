@@ -337,6 +337,12 @@ pub fn is_trusted_sender(pubkey: &[u8; 32]) -> bool {
     with_locker(|notes| notes.trust.contains(pubkey))
 }
 
+/// Would the locker take one more note from this sender? The letterbox
+/// cap for a stranger, the locker's own cap for a trusted one.
+pub fn has_room_for_wrap_from(pubkey: &[u8; 32]) -> bool {
+    with_locker(|notes| notes.store.has_room_for_received(notes.trust.contains(pubkey)))
+}
+
 impl Notes {
     /// The `storage` string `get_info` reports, computed per call so a write
     /// that failed after boot shows up: boot diagnosis first, then the
@@ -760,8 +766,10 @@ pub fn relay_precheck(cmd: &serde_json::Value) -> Option<&'static str> {
 }
 
 /// Store a note that arrived by gift wrap, once the owner has held the
-/// button for it. Idempotent on the secret, so a relay replaying the wrap
-/// is harmless.
+/// button for it, or straight away from a trusted sender. Idempotent on
+/// the secret, so a relay replaying the wrap is harmless. Trust is read
+/// here, under the same lock, so it cannot change between the check and
+/// the store.
 pub fn receive_note(
     secret: &[u8; SECRET_LEN],
     host: &str,
@@ -770,6 +778,7 @@ pub fn receive_note(
 ) -> Result<(String, bool), NoteError> {
     with_locker(|notes| {
         let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
+        let trusted = notes.trust.contains(from);
         let out = notes.store.receive(
             &mut notes.storage,
             &mut rng,
@@ -778,6 +787,7 @@ pub fn receive_note(
             amount_msat,
             from,
             now_secs(),
+            trusted,
         );
         NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
         out

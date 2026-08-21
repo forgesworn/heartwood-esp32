@@ -977,7 +977,7 @@ mod tests {
         let mut h = Harness::new();
         let mut rng = |buf: &mut [u8]| buf.fill(9);
         h.store
-            .receive(&mut h.storage, &mut rng, &[5u8; SECRET_LEN], "mint.example/w", 3_000, &[0xaa; 32], 1)
+            .receive(&mut h.storage, &mut rng, &[5u8; SECRET_LEN], "mint.example/w", 3_000, &[0xaa; 32], 1, false)
             .unwrap();
         let list = h.run(r#"{"cmd":"list_notes"}"#);
         assert_eq!(list["notes"][0]["state"], "confirmed");

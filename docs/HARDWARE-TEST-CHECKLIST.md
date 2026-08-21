@@ -1135,9 +1135,12 @@ notecase `heartwood send`.
    on arrival with NO card: a three-second "N sats received / from
    <host>" toast, `note ... received from trusted sender` in the log, and
    the ledger has it (reboot: no re-offer). A wrap from anyone else still
-   gets the card. With the letterbox full, a trusted wrap is deferred
-   exactly as an untrusted one (`dropped until there is room`), never
-   silently lost. `heartwood untrust` needs no hold and the next wrap from
+   gets the card. A trusted sender is not bound by the 4-note letterbox,
+   only by the locker's 16: with four received notes held, a fifth from
+   the trusted mint stores; a fifth from a stranger is deferred (`dropped
+   until there is room`), never silently lost, and arrives by itself once
+   a collect frees a slot (seen on the bench: two deferred zaps landed
+   380 ms apart the moment the collect finished). `heartwood untrust` needs no hold and the next wrap from
    that key gets a card again.
 3a. From a stranger's client: on a phone running any NIP-17 client
    (0xchat, Amethyst), resolve the device's NIP-05, and DM it a note as

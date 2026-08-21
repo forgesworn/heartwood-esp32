@@ -1284,10 +1284,11 @@ pub fn run_wifi_standalone<'d, 'b>(
         // A RECEIVE card settling, or the letterbox regaining room, raises
         // the same flag: the catch-up filter goes out once, and the stored
         // keepalive copy stays live-only.
+        // Re-run once ANY room appears (a trusted sender's room is the
+        // wider of the two); a stranger's wrap that still does not fit is
+        // cheaply deferred again.
         if ctx.wrap_retry_when_room
-            && crate::notes::with_locker(|n| {
-                n.store.received_count() < heartwood_common::note_store::MAX_RECEIVED
-            })
+            && crate::notes::with_locker(|n| n.store.has_room_for_received(true))
         {
             ctx.wrap_retry_when_room = false;
             ctx.resubscribe_needed = true;
@@ -4046,14 +4047,12 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
             return;
         }
     };
-    // The locker refuses past the received cap; say so once, before the
+    // The locker refuses past its cap (the letterbox cap for a stranger,
+    // the locker's own for a trusted sender); say so once, before the
     // owner is shown a card for money the device cannot keep. Not
     // remembered: the wrap is still on the relay, and the catch-up re-runs
     // when the wallet collects and makes room.
-    let room = crate::notes::with_locker(|n| {
-        n.store.received_count() < heartwood_common::note_store::MAX_RECEIVED
-    });
-    if !room {
+    if !crate::notes::has_room_for_wrap_from(&opened.sender) {
         log::warn!("[relay] note received with the letterbox full; dropped until there is room");
         ctx.wrap_retry_when_room = true;
         return;

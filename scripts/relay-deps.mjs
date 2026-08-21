@@ -40,7 +40,7 @@ const nip44Module = await loadDep('nostr-tools/nip44', 'nostr-tools/lib/esm/nip4
 
 /** `ws` is CommonJS, so the constructor arrives as the module default. */
 export const WebSocket = wsModule.default ?? wsModule
-export const { finalizeEvent, getPublicKey } = pure
+export const { finalizeEvent, getPublicKey, getEventHash } = pure
 export const nip19 = nip19Module
 export const nip44 = nip44Module
 

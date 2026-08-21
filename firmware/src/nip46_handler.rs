@@ -85,6 +85,7 @@ fn is_note_method(method: &nip46::Nip46Method) -> bool {
             | nip46::Nip46Method::HeartwoodNoteExport
             | nip46::Nip46Method::HeartwoodNoteImport
             | nip46::Nip46Method::HeartwoodNoteSpent
+            | nip46::Nip46Method::HeartwoodNoteSend
     )
 }
 
@@ -394,6 +395,9 @@ pub enum AskCard {
         method: String,
         preview: String,
     },
+    /// A bearer note that arrived by gift wrap (relay.rs). No client is
+    /// owed an answer; the rumor rides `DeferredAsk::event`.
+    Receive { title: String },
 }
 
 /// An ask handed back to a deferring caller, and handed in again once the
@@ -784,7 +788,23 @@ fn dispatch_inner(
     // cannot accidentally mutate state merely by omitting approval code from
     // its individual match arm. Strict v2 denials returned above never prompt.
     if remote_extension_requires_approval(has_client, &method, tier) {
-        let preview = extension_approval_preview(&requester_label, &request.params);
+        // A note card shows the money, not the method name: amount, mint
+        // and (for send) the recipient, as the cable path already does.
+        let note_card = if is_note_method(&method) {
+            let cmd = heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params).ok();
+            if let Some(refusal) = cmd.as_ref().and_then(crate::notes::relay_precheck) {
+                if !matches!(approval, ApprovalDecision::ButtonApproved) {
+                    return build_error_json(&request.id, -1, refusal);
+                }
+            }
+            cmd.and_then(|cmd| crate::notes::relay_card(&cmd))
+        } else {
+            None
+        };
+        let preview = match note_card {
+            Some((_, title)) => title,
+            None => extension_approval_preview(&requester_label, &request.params),
+        };
         match approval {
             ApprovalDecision::Deferred => {
                 *deferred = Some(Box::new(DeferredAsk {
@@ -1582,6 +1602,7 @@ fn dispatch_inner(
                 "heartwood_note_export",
                 "heartwood_note_import",
                 "heartwood_note_spent",
+                "heartwood_note_send",
             ];
             nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
         }
@@ -1599,8 +1620,16 @@ fn dispatch_inner(
                 Ok(cmd) => {
                     // Approval for the gated methods happened in the
                     // pre-dispatch gate above (pinned ButtonRequired);
-                    // lifecycle rules still apply inside.
-                    let response = crate::notes::run_note_cmd_approved(&cmd.to_string());
+                    // lifecycle rules still apply inside. Send seals the
+                    // note as the served identity, so the client relays an
+                    // opaque wrap and never sees k1.
+                    let mut wrap = |secret: &[u8; 32],
+                                    meta: &heartwood_common::note_store::NoteMeta,
+                                    to: &[u8; 32]| {
+                        crate::relay::seal_note_wrap(secp, master_secret, secret, meta, to)
+                    };
+                    let response =
+                        crate::notes::run_note_cmd_approved(&cmd.to_string(), Some(&mut wrap));
                     if response.get("ok") == Some(&serde_json::Value::Bool(true)) {
                         nip46::build_result_response(&request.id, &response.to_string())
                             .unwrap_or_default()

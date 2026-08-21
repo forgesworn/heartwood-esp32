@@ -49,9 +49,16 @@ pub const MAX_HOST_LEN: usize = 64;
 /// bytes = 130 hex chars; allow a little slack for format drift upstream.
 pub const MAX_SIG_LEN: usize = 132;
 pub const MAX_PARENTS: usize = 16;
+/// Cap on notes that arrived by Nostr gift wrap and have not yet been rotated
+/// by a wallet. A letterbox, not a vault: the secret also sits encrypted on
+/// every relay that carried the wrap, and the device cannot rotate it, so
+/// these are held only until a wallet collects them. Low so a stranger
+/// cannot fill the locker with dust.
+pub const MAX_RECEIVED: usize = 4;
 
 const NOTE_MAGIC: [u8; 4] = *b"HWNB";
-const NOTE_VERSION: u8 = 1;
+/// v2 appends the Nostr peer. v1 blobs decode with `peer: None`.
+const NOTE_VERSION: u8 = 2;
 
 /// `pending` → `confirmed` → `spent`, exactly the vault lifecycle: a secret
 /// exists and its hash may be registered mint-side (PENDING), the mint has
@@ -91,6 +98,18 @@ impl NoteState {
     }
 }
 
+/// Nostr provenance. A note that arrived by gift wrap, or left by one. Not a
+/// lifecycle state (the wire protocol's three states are fixed by the vault
+/// client) but it changes what the note may do: a note with a peer can never
+/// be sent again -- a received secret is already on the relays under someone
+/// else's key and must be rotated first, and a sent one would be a double
+/// spend waiting for the mint to settle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Peer {
+    From([u8; 32]),
+    To([u8; 32]),
+}
+
 /// A held note, secret included. Never serialise this onto a wire — that is
 /// what [`NoteMeta`] exists for. The secret is zeroised on drop.
 #[derive(Clone)]
@@ -107,6 +126,7 @@ pub struct Note {
     pub parent_ids: Vec<String>,
     pub created_at: u32,
     pub updated_at: u32,
+    pub peer: Option<Peer>,
 }
 
 impl Drop for Note {
@@ -129,6 +149,7 @@ pub struct NoteMeta {
     pub parent_ids: Vec<String>,
     pub created_at: u32,
     pub updated_at: u32,
+    pub peer: Option<Peer>,
 }
 
 impl Note {
@@ -143,6 +164,7 @@ impl Note {
             parent_ids: self.parent_ids.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
+            peer: self.peer,
         }
     }
 }
@@ -237,6 +259,17 @@ pub fn encode_note(note: &Note) -> Result<Vec<u8>, &'static str> {
         }
         out.extend_from_slice(p.as_bytes());
     }
+    match note.peer {
+        None => out.push(0),
+        Some(Peer::From(pk)) => {
+            out.push(1);
+            out.extend_from_slice(&pk);
+        }
+        Some(Peer::To(pk)) => {
+            out.push(2);
+            out.extend_from_slice(&pk);
+        }
+    }
     Ok(out)
 }
 
@@ -248,7 +281,8 @@ pub fn decode_note(blob: &[u8]) -> Option<Note> {
     if r.take(4)? != NOTE_MAGIC {
         return None;
     }
-    if r.u8()? != NOTE_VERSION {
+    let version = r.u8()?;
+    if version != 1 && version != NOTE_VERSION {
         return None;
     }
     let id = r.str_exact(ID_LEN)?;
@@ -279,6 +313,16 @@ pub fn decode_note(blob: &[u8]) -> Option<Note> {
         }
         parent_ids.push(p);
     }
+    let peer = if version >= 2 {
+        match r.u8()? {
+            0 => None,
+            1 => Some(Peer::From(r.take(32)?.try_into().ok()?)),
+            2 => Some(Peer::To(r.take(32)?.try_into().ok()?)),
+            _ => return None,
+        }
+    } else {
+        None
+    };
     if !r.0.is_empty() {
         // Trailing bytes mean the blob is not what it claims to be.
         return None;
@@ -294,6 +338,7 @@ pub fn decode_note(blob: &[u8]) -> Option<Note> {
         parent_ids,
         created_at,
         updated_at,
+        peer,
     })
 }
 
@@ -424,6 +469,14 @@ impl NoteStore {
     pub fn counts(&self) -> (usize, usize) {
         let pending = self.notes.iter().filter(|n| n.state == NoteState::Pending).count();
         (self.notes.len(), pending)
+    }
+
+    /// Received notes a wallet has not yet rotated and marked spent.
+    pub fn received_count(&self) -> usize {
+        self.notes
+            .iter()
+            .filter(|n| n.state == NoteState::Confirmed && matches!(n.peer, Some(Peer::From(_))))
+            .count()
     }
 
     pub fn get_meta(&self, id: &str) -> Option<NoteMeta> {
@@ -596,9 +649,92 @@ impl NoteStore {
             parent_ids: Vec::new(),
             created_at: now,
             updated_at: now,
+            peer: None,
         };
         self.persist_new(storage, alloc::vec![note])?;
         Ok((id, true))
+    }
+
+    /// Store a secret that arrived by gift wrap from `from`, CONFIRMED with
+    /// provenance. Idempotent on the secret, like import: a relay replaying
+    /// the same wrap yields the existing id and no second entry. Subject to
+    /// [`MAX_RECEIVED`] as well as the overall cap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive(
+        &mut self,
+        storage: &mut dyn NoteStorage,
+        rng: &mut dyn FnMut(&mut [u8]),
+        secret: &[u8; SECRET_LEN],
+        host: &str,
+        amount_msat: u64,
+        from: &[u8; 32],
+        now: u32,
+    ) -> Result<(String, bool), NoteError> {
+        if host.is_empty() || host.len() > MAX_HOST_LEN {
+            return Err(NoteError::BadRequest);
+        }
+        if let Some(existing) = self.notes.iter().find(|n| n.secret == *secret) {
+            return Ok((existing.id.clone(), false));
+        }
+        if self.received_count() >= MAX_RECEIVED {
+            return Err(NoteError::StorageFull);
+        }
+        self.admit_creation(1)?;
+        let id = self.fresh_id(rng, None).ok_or(NoteError::StorageFull)?;
+        let note = Note {
+            id: id.clone(),
+            secret: *secret,
+            state: NoteState::Confirmed,
+            amount_msat,
+            host: host.to_string(),
+            label: String::new(),
+            sig: String::new(),
+            parent_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            peer: Some(Peer::From(*from)),
+        };
+        self.persist_new(storage, alloc::vec![note])?;
+        Ok((id, true))
+    }
+
+    /// Whether `mark_sent` (and so a gift-wrapped send) may proceed:
+    /// CONFIRMED and never given to or received from anyone.
+    pub fn can_send(&self, id: &str) -> Result<(), NoteError> {
+        let idx = self.find(id)?;
+        let n = &self.notes[idx];
+        if n.state != NoteState::Confirmed || n.peer.is_some() {
+            return Err(NoteError::InvalidState);
+        }
+        Ok(())
+    }
+
+    /// Record that the secret was sealed to `to`. Persisted BEFORE the wrap
+    /// leaves the device, so a cut between the two strands a wrap that was
+    /// never published rather than a note that can be sent twice. The note
+    /// stays CONFIRMED (the mint still honours it until someone rotates, which
+    /// is what makes unsend possible) but can never be sent again.
+    pub fn mark_sent(
+        &mut self,
+        storage: &mut dyn NoteStorage,
+        id: &str,
+        to: &[u8; 32],
+        now: u32,
+    ) -> Result<(), NoteError> {
+        self.can_send(id)?;
+        let idx = self.find(id)?;
+        let mut updated = self.notes[idx].clone();
+        updated.peer = Some(Peer::To(*to));
+        updated.updated_at = now;
+        self.persist_rewrite(storage, idx, updated)
+    }
+
+    /// The raw secret, for sealing inside a gift wrap on-device. State check
+    /// only, as with `export_secret`; the caller zeroises its copy.
+    pub fn secret_for_send(&self, id: &str) -> Result<[u8; SECRET_LEN], NoteError> {
+        self.can_send(id)?;
+        let idx = self.find(id)?;
+        Ok(self.notes[idx].secret)
     }
 
     /// CONFIRMED → SPENT once the wallet confirms settlement (or the note was
@@ -731,6 +867,7 @@ impl NoteStore {
             parent_ids: parent_ids.to_vec(),
             created_at: now,
             updated_at: now,
+            peer: None,
         })
     }
 
@@ -900,6 +1037,7 @@ mod tests {
             parent_ids: vec!["deadbeef".to_string(), "cafef00d".to_string()],
             created_at: 100,
             updated_at: 200,
+            peer: Some(Peer::From([0xab; 32])),
         }
     }
 
@@ -918,6 +1056,108 @@ mod tests {
         assert_eq!(back.parent_ids, note.parent_ids);
         assert_eq!(back.created_at, note.created_at);
         assert_eq!(back.updated_at, note.updated_at);
+        assert_eq!(back.peer, note.peer);
+    }
+
+    #[test]
+    fn codec_reads_v1_blobs_without_a_peer() {
+        let mut note = sample_note();
+        note.peer = None;
+        let v2 = encode_note(&note).unwrap();
+        // A v1 record is the v2 record minus the trailing peer tag.
+        let mut v1 = v2[..v2.len() - 1].to_vec();
+        v1[4] = 1;
+        let back = decode_note(&v1).unwrap();
+        assert_eq!(back.peer, None);
+        assert_eq!(back.secret, note.secret);
+        // The peer tag is not optional in v2.
+        assert!(decode_note(&v2[..v2.len() - 1]).is_none());
+        // Unknown peer tag.
+        let mut bad = v2.clone();
+        *bad.last_mut().unwrap() = 9;
+        assert!(decode_note(&bad).is_none());
+    }
+
+    #[test]
+    fn receive_and_send_provenance() {
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let alice = [0xa1u8; 32];
+        let bob = [0xb0u8; 32];
+
+        let (rid, created) = store
+            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], "mint.example", 5_000, &alice, 10)
+            .unwrap();
+        assert!(created);
+        let meta = store.get_meta(&rid).unwrap();
+        assert_eq!(meta.state, NoteState::Confirmed);
+        assert_eq!(meta.peer, Some(Peer::From(alice)));
+        assert_eq!(store.received_count(), 1);
+        // Replayed wrap: same secret, same id, nothing new.
+        let (again, created) = store
+            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], "other.example", 1, &bob, 11)
+            .unwrap();
+        assert_eq!(again, rid);
+        assert!(!created);
+        assert_eq!(store.counts().0, 1);
+        // A received note is exportable (the wallet collects it) but never
+        // forwardable.
+        assert!(store.can_export(&rid).is_ok());
+        assert_eq!(store.can_send(&rid), Err(NoteError::InvalidState));
+        assert_eq!(
+            store.mark_sent(&mut storage, &rid, &bob, 12),
+            Err(NoteError::InvalidState)
+        );
+
+        // A minted, confirmed note can be sent exactly once.
+        let (sid, _) = store.new_secret(&mut storage, &mut rng, &[], "", 20).unwrap();
+        assert_eq!(store.can_send(&sid), Err(NoteError::InvalidState));
+        store.confirm(&mut storage, &sid, 7_000, "mint.example", None, 21).unwrap();
+        assert!(store.can_send(&sid).is_ok());
+        let secret = store.secret_for_send(&sid).unwrap();
+        store.mark_sent(&mut storage, &sid, &bob, 22).unwrap();
+        assert_eq!(store.get_meta(&sid).unwrap().peer, Some(Peer::To(bob)));
+        assert_eq!(store.can_send(&sid), Err(NoteError::InvalidState));
+        assert_eq!(store.secret_for_send(&sid), Err(NoteError::InvalidState));
+        // Still exportable: unsend rotates it through the owner's wallet.
+        assert_eq!(store.export_secret(&sid).unwrap(), hex_encode(&secret));
+        store.mark_spent(&mut storage, &sid, 23).unwrap();
+        assert_eq!(store.received_count(), 1);
+
+        // Provenance survives a reload.
+        let reloaded = fresh_store(&mut storage);
+        assert_eq!(reloaded.get_meta(&rid).unwrap().peer, Some(Peer::From(alice)));
+        assert_eq!(reloaded.get_meta(&sid).unwrap().peer, Some(Peer::To(bob)));
+        assert_eq!(reloaded.can_send(&sid), Err(NoteError::InvalidState));
+    }
+
+    #[test]
+    fn received_cap_is_separate_and_low() {
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let alice = [0xa1u8; 32];
+        for i in 0..MAX_RECEIVED {
+            store
+                .receive(&mut storage, &mut rng, &[i as u8 + 1; SECRET_LEN], "m.example", 1, &alice, 1)
+                .unwrap();
+        }
+        assert_eq!(
+            store.receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], "m.example", 1, &alice, 1),
+            Err(NoteError::StorageFull)
+        );
+        // Minting is unaffected by the received cap.
+        assert!(store.new_secret(&mut storage, &mut rng, &[], "", 2).is_ok());
+        // Rotating one out (spent) frees a slot.
+        let id = store.list(0, 1).notes[0].id.clone();
+        store.mark_spent(&mut storage, &id, 3).unwrap();
+        assert_eq!(store.received_count(), MAX_RECEIVED - 1);
+        assert!(store
+            .receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], "m.example", 1, &alice, 4)
+            .is_ok());
+        // Nothing was written for the refused one.
+        assert!(store.get_meta(&id).unwrap().state == NoteState::Spent);
     }
 
     #[test]

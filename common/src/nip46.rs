@@ -99,6 +99,7 @@ pub enum Nip46Method {
     HeartwoodNoteExport,
     HeartwoodNoteImport,
     HeartwoodNoteSpent,
+    HeartwoodNoteSend,
     // Unknown method
     Unknown(String),
 }
@@ -138,6 +139,7 @@ impl Nip46Method {
             "heartwood_note_export" => Self::HeartwoodNoteExport,
             "heartwood_note_import" => Self::HeartwoodNoteImport,
             "heartwood_note_spent" => Self::HeartwoodNoteSpent,
+            "heartwood_note_send" => Self::HeartwoodNoteSend,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -171,6 +173,7 @@ impl Nip46Method {
             Self::HeartwoodNoteExport => "heartwood_note_export",
             Self::HeartwoodNoteImport => "heartwood_note_import",
             Self::HeartwoodNoteSpent => "heartwood_note_spent",
+            Self::HeartwoodNoteSend => "heartwood_note_send",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -192,6 +195,7 @@ impl Nip46Method {
                 | Self::HeartwoodNoteExport
                 | Self::HeartwoodNoteSpent
                 | Self::HeartwoodNoteDiscard
+                | Self::HeartwoodNoteSend
         )
     }
 

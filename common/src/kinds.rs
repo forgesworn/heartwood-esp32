@@ -15,6 +15,7 @@ pub fn kind_label(kind: u64) -> Option<&'static str> {
         6 => "Repost",
         7 => "Reaction",
         1059 => "Gift Wrap",
+        2525 => "Bearer Note",
         1063 => "File Metadata",
         1984 => "Report",
         9734 => "Zap Request",

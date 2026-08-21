@@ -311,6 +311,85 @@ pub fn gift_wrap(
     })
 }
 
+/// A gift wrap opened by its recipient: who sealed it (the seal's signer,
+/// which the rumor's `pubkey` must match) and the rumor itself.
+pub struct Unwrapped {
+    pub sender: [u8; 32],
+    pub rumor: UnsignedEvent,
+}
+
+impl Drop for Unwrapped {
+    fn drop(&mut self) {
+        // Rumor content may be a bearer secret (note_wrap.rs).
+        self.rumor.content.zeroize();
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RumorIn {
+    id: String,
+    #[serde(default)]
+    pubkey: String,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Vec<String>>,
+    content: String,
+}
+
+/// Open a kind 1059 addressed to `recipient_secret`'s key: verify the wrap,
+/// decrypt to the seal, verify the seal, decrypt to the rumor, and refuse a
+/// rumor whose `pubkey` is not the seal's signer (the NIP-59 forgery gate)
+/// or whose `id` is not its own canonical hash. The inverse of
+/// [`gift_wrap`]; both backends verify, so this is host-testable.
+pub fn unwrap(wrap: &SignedEvent, recipient_secret: &[u8; 32]) -> Result<Unwrapped, &'static str> {
+    if wrap.kind != GIFT_WRAP_KIND {
+        return Err("not a gift wrap");
+    }
+    nip46::verify_signed_event(wrap)?;
+    let eph_pk = pubkey_bytes(&wrap.pubkey)?;
+    let mut wrap_conv = nip44::get_conversation_key(recipient_secret, &eph_pk)?;
+    let seal_json = nip44::decrypt(&wrap_conv, &wrap.content);
+    wrap_conv.zeroize();
+    let seal: SignedEvent =
+        serde_json::from_str(&seal_json?).map_err(|_| "seal is not an event")?;
+    if seal.kind != SEAL_KIND {
+        return Err("inner event is not a seal");
+    }
+    nip46::verify_signed_event(&seal)?;
+    let sender = pubkey_bytes(&seal.pubkey)?;
+    let mut seal_conv = nip44::get_conversation_key(recipient_secret, &sender)?;
+    let rumor_json = nip44::decrypt(&seal_conv, &seal.content);
+    seal_conv.zeroize();
+    let mut rumor_json = rumor_json?;
+    let parsed: Result<RumorIn, _> = serde_json::from_str(&rumor_json);
+    rumor_json.zeroize();
+    let mut parsed = parsed.map_err(|_| "rumor is not an event")?;
+    if parsed.pubkey != seal.pubkey {
+        parsed.content.zeroize();
+        return Err("rumor author is not the seal signer");
+    }
+    let rumor = UnsignedEvent {
+        pubkey: core::mem::take(&mut parsed.pubkey),
+        created_at: parsed.created_at,
+        kind: parsed.kind,
+        tags: core::mem::take(&mut parsed.tags),
+        content: core::mem::take(&mut parsed.content),
+    };
+    if parsed.id != hex_encode(&nip46::compute_event_id(&rumor)) {
+        let mut rumor = rumor;
+        rumor.content.zeroize();
+        return Err("rumor id does not match its content");
+    }
+    Ok(Unwrapped { sender, rumor })
+}
+
+fn pubkey_bytes(hex: &str) -> Result<[u8; 32], &'static str> {
+    crate::hex::hex_decode(hex)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+        .ok_or("bad pubkey")
+}
+
 #[cfg(all(test, feature = "k256-backend"))]
 mod tests {
     use super::*;
@@ -558,5 +637,101 @@ mod tests {
         .unwrap();
         assert_eq!(wrap.tags.len(), 1);
         assert_eq!(wrap.tags[0][0], "p");
+    }
+
+    #[test]
+    fn unwrap_inverts_gift_wrap_and_rejects_forgery() {
+        let (author_sk, author_pk) = keypair(0x11);
+        let (recipient_sk, recipient_pk) = keypair(0x22);
+        let (eph_sk, eph_pk) = keypair(0x33);
+        let (other_sk, _) = keypair(0x44);
+        let rumor = UnsignedEvent {
+            pubkey: hex_encode(&author_pk),
+            created_at: 1_700_000_000,
+            kind: 2525,
+            tags: vec![vec!["p".to_string(), hex_encode(&recipient_pk)]],
+            content: "lnurlw://mint.example/w?k1=ab&amount=1".to_string(),
+        };
+        let wrap = gift_wrap(
+            &rumor,
+            &author_sk,
+            &recipient_pk,
+            &eph_sk,
+            &eph_pk,
+            WrapTimes { seal_created_at: 5, wrap_created_at: 4 },
+            None,
+            &[0x06; 32],
+            &[0x07; 32],
+            &k256_sign,
+        )
+        .unwrap();
+
+        let opened = unwrap(&wrap, &recipient_sk).unwrap();
+        assert_eq!(opened.sender, author_pk);
+        assert_eq!(opened.rumor.kind, 2525);
+        assert_eq!(opened.rumor.content, rumor.content);
+        assert_eq!(opened.rumor.tags, rumor.tags);
+        assert_eq!(opened.rumor.created_at, rumor.created_at);
+
+        // Wrong recipient key: the wrap layer fails to authenticate.
+        assert!(unwrap(&wrap, &other_sk).is_err());
+        // Wrong kind.
+        let mut not_wrap = wrap.clone();
+        not_wrap.kind = 4;
+        assert!(unwrap(&not_wrap, &recipient_sk).is_err());
+        // Tampered ciphertext fails the wrap signature before any decrypt.
+        let mut tampered = wrap.clone();
+        tampered.content.push('A');
+        assert!(unwrap(&tampered, &recipient_sk).is_err());
+
+        // A seal honestly signed by the author but carrying a rumor that
+        // claims another pubkey: the rumor's pubkey is what a recipient would
+        // trust, so it must match the seal signer. gift_wrap cannot build
+        // this (it stamps the seal from the rumor), so assemble it by hand.
+        let mut spoofed = rumor.clone();
+        spoofed.pubkey = hex_encode(&keypair(0x55).1);
+        let seal_conv = nip44::get_conversation_key(&author_sk, &recipient_pk).unwrap();
+        let seal_unsigned = UnsignedEvent {
+            pubkey: hex_encode(&author_pk),
+            created_at: 5,
+            kind: SEAL_KIND,
+            tags: vec![],
+            content: nip44::encrypt_owned(&seal_conv, rumor_json(&spoofed).unwrap(), &[0x08; 32])
+                .unwrap(),
+        };
+        let seal_id = nip46::compute_event_id(&seal_unsigned);
+        let seal = SignedEvent {
+            id: hex_encode(&seal_id),
+            pubkey: seal_unsigned.pubkey,
+            created_at: seal_unsigned.created_at,
+            kind: seal_unsigned.kind,
+            tags: seal_unsigned.tags,
+            content: seal_unsigned.content,
+            sig: hex_encode(&k256_sign(&author_sk, &seal_id).unwrap()),
+        };
+        let wrap_conv = nip44::get_conversation_key(&eph_sk, &recipient_pk).unwrap();
+        let wrap_unsigned = UnsignedEvent {
+            pubkey: hex_encode(&eph_pk),
+            created_at: 4,
+            kind: GIFT_WRAP_KIND,
+            tags: vec![vec!["p".to_string(), hex_encode(&recipient_pk)]],
+            content: nip44::encrypt_owned(
+                &wrap_conv,
+                serde_json::to_string(&seal).unwrap(),
+                &[0x09; 32],
+            )
+            .unwrap(),
+        };
+        let wrap_id = nip46::compute_event_id(&wrap_unsigned);
+        let wrap = SignedEvent {
+            id: hex_encode(&wrap_id),
+            pubkey: wrap_unsigned.pubkey,
+            created_at: wrap_unsigned.created_at,
+            kind: wrap_unsigned.kind,
+            tags: wrap_unsigned.tags,
+            content: wrap_unsigned.content,
+            sig: hex_encode(&k256_sign(&eph_sk, &wrap_id).unwrap()),
+        };
+        assert_eq!(unwrap(&wrap, &recipient_sk).err(), Some("rumor author is not the seal signer"));
     }
 }

@@ -913,6 +913,19 @@ fn show_status_card(
 /// `total_secs` is the caller's approval-window length, so the countdown bar
 /// starts full and drains to empty exactly as the signing screens do.
 pub fn show_change_approval(display: &mut Display<'_>, title: &str, remaining: u32, total_secs: u32) {
+    show_titled_approval(display, "CONFIRM CHANGE", title, remaining, total_secs);
+}
+
+/// The same amber card under any header: the bearer-note cards use it with
+/// "RECEIVE NOTE" / "SEND NOTE", where the title's two lines are the amount
+/// and the counterparty.
+pub fn show_titled_approval(
+    display: &mut Display<'_>,
+    header_text: &str,
+    title: &str,
+    remaining: u32,
+    total_secs: u32,
+) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -925,7 +938,6 @@ pub fn show_change_approval(display: &mut Display<'_>, title: &str, remaining: u
         .text_color(MUTED)
         .build();
 
-    let header_text = "CONFIRM CHANGE";
     Text::new(
         header_text,
         Point::new(

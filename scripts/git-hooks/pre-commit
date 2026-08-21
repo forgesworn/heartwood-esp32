@@ -77,6 +77,9 @@ DENY_HEX = {
 # Path prefixes that are allowed to contain hex literals (test files, this
 # hook itself, documentation of known-good vectors).
 ALLOW_PATHS = (
+    # Gift-wrap interop fixtures: fixed-seed test keys (0x11.., 0x22..) and
+    # the ciphertext they produce, shared with the notecase test suite.
+    "common/tests/fixtures/",
     "common/src/nip44.rs",
     "common/src/nip46.rs",
     "common/src/derive.rs",

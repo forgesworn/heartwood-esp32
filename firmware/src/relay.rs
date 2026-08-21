@@ -128,6 +128,15 @@ const SEND_TIMEOUT_MS: i64 = 8_000;
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// Reconnect if nothing at all (data or pong) arrives for this long.
 const SILENCE_LIMIT: Duration = Duration::from_secs(50);
+/// A RECEIVE card that lapsed is offered again this much later, and keeps
+/// being offered until the owner holds or declines: a note that landed while
+/// nobody was watching must not need a power cycle to come back, and must
+/// not take the screen every 30 s either.
+const LAPSED_WRAP_RETRY: Duration = Duration::from_secs(10 * 60);
+/// Lapsed wraps tracked for that retry. Past this, the oldest is released
+/// to the next catch-up early rather than forgotten.
+const LAPSED_WRAP_MAX: usize = 8;
+
 /// Re-send the `REQ` this often so a silently-dropped subscription self-heals.
 /// Some relays close a subscription (or stop delivering to it) while keeping the
 /// WS connection alive, so the connection never looks dead — periodic re-REQ
@@ -295,7 +304,19 @@ struct SignCtx<'a, 'd, 'b> {
     nip46_seen: Vec<String>,
     /// Same ring for bearer-note gift wraps (kind 1059), kept apart so busy
     /// NIP-46 traffic cannot evict a wrap id inside the re-REQ interval.
+    /// Holds what is on a card or was junk; a wrap dropped for want of room
+    /// is deliberately NOT here, so the next catch-up can offer it again.
     wrap_seen: Vec<String>,
+    /// Wraps the owner has decided on, across reboots, and the lower bound
+    /// of the catch-up REQ (`wrap_ledger`).
+    wrap_ledger: heartwood_common::wrap_ledger::WrapLedger,
+    /// A wrap was dropped because the letterbox was full: re-run the
+    /// catch-up once there is room, rather than waiting for a reconnect.
+    wrap_retry_when_room: bool,
+    /// RECEIVE cards that lapsed, oldest first, with when: each is released
+    /// from `wrap_seen` after [`LAPSED_WRAP_RETRY`] so the catch-up can
+    /// offer it again.
+    wrap_lapsed: Vec<(String, Instant)>,
     /// Last failed nostrconnect dial (url, when): throttles operator-driven
     /// re-dials of a dead relay, which the pinned backoff cannot cover (no
     /// PinnedRelay exists until a dial succeeds).
@@ -817,6 +838,11 @@ pub fn run_wifi_standalone<'d, 'b>(
         sign_audit_seq: 0,
         nip46_seen: Vec::new(),
         wrap_seen: Vec::new(),
+        wrap_ledger: crate::notes::load_wrap_ledger()
+            .and_then(|blob| heartwood_common::wrap_ledger::WrapLedger::decode(&blob))
+            .unwrap_or_default(),
+        wrap_retry_when_room: false,
+        wrap_lapsed: Vec::new(),
         dial_cooldown: None,
         network_trial_id,
         network_trial_deadline,
@@ -1237,12 +1263,33 @@ pub fn run_wifi_standalone<'d, 'b>(
         // would resend the stale stored filters). The stored copy is updated
         // so the keepalive stays truthful. A failed send is left to the
         // session's own silence/reconnect machinery.
+        // A RECEIVE card settling, or the letterbox regaining room, raises
+        // the same flag: the catch-up filter goes out once, and the stored
+        // keepalive copy stays live-only.
+        if ctx.wrap_retry_when_room
+            && crate::notes::with_locker(|n| {
+                n.store.received_count() < heartwood_common::note_store::MAX_RECEIVED
+            })
+        {
+            ctx.wrap_retry_when_room = false;
+            ctx.resubscribe_needed = true;
+        }
+        if ctx
+            .wrap_lapsed
+            .first()
+            .is_some_and(|(_, at)| at.elapsed() >= LAPSED_WRAP_RETRY)
+        {
+            let (id, _) = ctx.wrap_lapsed.remove(0);
+            ctx.wrap_seen.retain(|seen| *seen != id);
+            ctx.resubscribe_needed = true;
+        }
         if ctx.resubscribe_needed {
             ctx.resubscribe_needed = false;
             if !sessions.is_empty() {
-                let sub_req = build_sub_req(&ctx);
+                let sub_req = build_sub_req(&ctx, true);
+                let keepalive_req = build_sub_req(&ctx, false);
                 for s in sessions.iter_mut() {
-                    s.sub_req = sub_req.clone();
+                    s.sub_req = keepalive_req.clone();
                     s.last_resub = Instant::now();
                     if let Err(e) = ws_send(&mut s.tls, OP_TEXT, sub_req.as_bytes()) {
                         log::warn!(
@@ -1377,7 +1424,8 @@ fn retune_recv_timeouts(sessions: &mut [RelaySession]) {
 /// filters keep that boundary explicit. limit:0 → no stored replay, live
 /// stream only. A third filter fetches our own masters' kind-0 profiles (by
 /// author, limit:1 → the stored replaceable event) for the idle screen name.
-fn build_sub_req(ctx: &SignCtx) -> String {
+/// `catch_up` widens the gift-wrap filter to stored events; see there.
+fn build_sub_req(ctx: &SignCtx, catch_up: bool) -> String {
     let quoted = |pk: &[u8; 32]| format!("\"{}\"", hex_encode(pk));
     let master_p = ctx
         .masters
@@ -1389,12 +1437,25 @@ fn build_sub_req(ctx: &SignCtx) -> String {
     nip46_p.extend(ctx.personas.iter().map(|p| quoted(&p.pubkey)));
     let nip46_p_list = nip46_p.join(",");
     let profile_filter = format!(r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":1}}"##);
-    // Bearer notes gift-wrapped to a master npub. Live only: anything that
-    // arrived while the device was off is the wallet's to collect from the
-    // inbox relays, since the wallet can rotate it and the device cannot.
-    let wrap_filter = format!(
-        r##"{{"kinds":[{GIFT_WRAP_KIND}],"#p":[{master_p_list}],"limit":0}}"##
-    );
+    // Bearer notes gift-wrapped to a master npub. A wrap is a stored event
+    // and nobody but this device can open one sealed to its key, so the
+    // connect-time REQ (and the one after a settled card) asks for what
+    // arrived while the device was off: newest first, bounded, and no older
+    // than the last decision less the NIP-59 backdate. The keepalive re-REQ
+    // goes back to live-only so the relay is not replaying every 40 s.
+    let wrap_filter = if catch_up {
+        let since = ctx
+            .wrap_ledger
+            .since(wall_clock_estimate())
+            .map(|s| format!(r##","since":{s}"##))
+            .unwrap_or_default();
+        format!(
+            r##"{{"kinds":[{GIFT_WRAP_KIND}],"#p":[{master_p_list}]{since},"limit":{}}}"##,
+            heartwood_common::wrap_ledger::CATCH_UP_LIMIT
+        )
+    } else {
+        format!(r##"{{"kinds":[{GIFT_WRAP_KIND}],"#p":[{master_p_list}],"limit":0}}"##)
+    };
     if ctx.op_mgmt.is_some() {
         format!(
             r##"["REQ","hw",{{"kinds":[{NIP46_KIND}],"#p":[{nip46_p_list}],"limit":0}},{{"kinds":[{MGMT_KIND}],"#p":[{master_p_list}],"limit":0}},{profile_filter},{wrap_filter}]"##
@@ -1408,12 +1469,18 @@ fn build_sub_req(ctx: &SignCtx) -> String {
 
 /// Open one relay session: TLS → WS handshake → recv timeout → subscribe.
 fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySession, String> {
-    let sub_req = build_sub_req(ctx);
+    let sub_req = build_sub_req(ctx, true);
+    let keepalive_req = build_sub_req(ctx, false);
     // A session without the recv timeout would starve its peers, so a pinned
     // dial (or a network trial, whose rollback deadline must stay live)
     // refuses to run degraded.
     let require_recv_timeout = pinned || ctx.network_trial_id.is_some();
-    connect_relay_raw(url, sub_req, pinned, require_recv_timeout).map_err(|e| {
+    connect_relay_raw(url, sub_req, pinned, require_recv_timeout)
+        .map(|mut s| {
+            s.sub_req = keepalive_req;
+            s
+        })
+        .map_err(|e| {
         if e == RECV_TIMEOUT_REQUIRED && require_recv_timeout {
             if pinned {
                 "pinned relay needs a recv timeout (would starve the primary)".into()
@@ -3918,13 +3985,12 @@ fn resolve_button_card(
 /// put a RECEIVE card up. Every failure is silent, as vault delivery is --
 /// an unsolicited event from anyone on the internet gets no diagnostics.
 fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
-    if ctx.wrap_seen.iter().any(|id| *id == ev.id) {
+    // Decided across reboots, or already on a card / already junk this
+    // boot. The catch-up REQ replays stored wraps on every connect and
+    // settle, so this is the common path, and it runs before any decrypt.
+    if ctx.wrap_ledger.decided(&ev.id) || ctx.wrap_seen.iter().any(|id| *id == ev.id) {
         return;
     }
-    if ctx.wrap_seen.len() >= SEEN_MAX {
-        ctx.wrap_seen.remove(0);
-    }
-    ctx.wrap_seen.push(ev.id.clone());
 
     let Some(target_pk) = ev
         .tags
@@ -3944,6 +4010,7 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
         Ok(o) => o,
         Err(e) => {
             log::info!("[relay] gift wrap {} not for us: {e}", &ev.id[..8.min(ev.id.len())]);
+            remember_wrap(ctx, &ev.id);
             return;
         }
     };
@@ -3951,16 +4018,20 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
         Ok(n) => n,
         Err(e) => {
             log::info!("[relay] gift wrap {} is not a note: {e}", &ev.id[..8.min(ev.id.len())]);
+            remember_wrap(ctx, &ev.id);
             return;
         }
     };
     // The locker refuses past the received cap; say so once, before the
-    // owner is shown a card for money the device cannot keep.
+    // owner is shown a card for money the device cannot keep. Not
+    // remembered: the wrap is still on the relay, and the catch-up re-runs
+    // when the wallet collects and makes room.
     let room = crate::notes::with_locker(|n| {
         n.store.received_count() < heartwood_common::note_store::MAX_RECEIVED
     });
     if !room {
-        log::warn!("[relay] note received with the letterbox full; dropped");
+        log::warn!("[relay] note received with the letterbox full; dropped until there is room");
+        ctx.wrap_retry_when_room = true;
         return;
     }
 
@@ -4028,7 +4099,9 @@ fn queue_receive_card(
             .first()
             .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::Receive { .. }))
     }) {
-        log::info!("[relay] a note is already waiting on the button; wrap dropped");
+        // Not remembered: the catch-up after that card settles brings this
+        // one back for its own card.
+        log::info!("[relay] a note is already waiting on the button; wrap deferred");
         return;
     }
     // Keyed on the wrap id so two notes never collapse into one hold.
@@ -4058,10 +4131,11 @@ fn queue_receive_card(
     };
     match admission {
         Admission::Busy | Admission::Collapse => {
-            log::warn!("[relay] approval queue full; note wrap dropped");
+            log::warn!("[relay] approval queue full; note wrap deferred");
         }
         Admission::Open | Admission::Wait => {
             log::info!("[relay] note received; waiting on the button");
+            remember_wrap(ctx, wrap_id);
             ctx.button_cards.push(ButtonCard {
                 key,
                 target_pk: *target_pk,
@@ -4092,10 +4166,45 @@ fn queue_receive_card(
     }
 }
 
+/// This boot has dealt with the wrap: on a card, or junk. RAM only.
+fn remember_wrap(ctx: &mut SignCtx, wrap_id: &str) {
+    if ctx.wrap_seen.iter().any(|id| id == wrap_id) {
+        return;
+    }
+    if ctx.wrap_seen.len() >= SEEN_MAX {
+        ctx.wrap_seen.remove(0);
+    }
+    ctx.wrap_seen.push(wrap_id.to_string());
+}
+
 /// Settle a RECEIVE card: store the note on a hold, forget it otherwise.
+///
+/// A hold or a decline is the owner's decision and goes to the ledger, so
+/// no catch-up offers that wrap again. A lapse is nobody's decision: the
+/// wrap is offered again after [`LAPSED_WRAP_RETRY`], so money that landed
+/// while nobody was watching is not lost, and not a 30 s loop either.
+/// Either way the catch-up re-runs now, for any wrap deferred behind this
+/// card.
 fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick, on_screen: bool) {
     let sender = card.client_pubkey;
+    let mut ledger_changed = false;
     for mut ask in card.asks {
+        let wrap_id = ask.ask.request.id.clone();
+        match outcome {
+            // A hold is recorded below, once the locker has the note: a
+            // hold the locker refused must come back, not be written off.
+            CardTick::Approved => {}
+            CardTick::Denied => {
+                ledger_changed |= ctx.wrap_ledger.decide(&wrap_id, ask.created_at);
+            }
+            _ => {
+                if ctx.wrap_lapsed.len() >= LAPSED_WRAP_MAX {
+                    let (old, _) = ctx.wrap_lapsed.remove(0);
+                    ctx.wrap_seen.retain(|id| *id != old);
+                }
+                ctx.wrap_lapsed.push((wrap_id.clone(), Instant::now()));
+            }
+        }
         let Some(mut rumor) = ask.ask.event.take() else { continue };
         if matches!(outcome, CardTick::Approved) {
             match heartwood_common::note_wrap::parse_note_rumor(&rumor) {
@@ -4108,6 +4217,7 @@ fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick,
                     ) {
                         Ok((id, created)) => {
                             log::info!("[relay] note {id} received (new: {created})");
+                            ledger_changed |= ctx.wrap_ledger.decide(&wrap_id, ask.created_at);
                             if on_screen {
                                 let sats = note.amount_msat / 1000;
                                 crate::oled::show_change_done(
@@ -4135,6 +4245,10 @@ fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick,
         }
         rumor.content.zeroize();
     }
+    if ledger_changed {
+        crate::notes::store_wrap_ledger(&ctx.wrap_ledger.encode());
+    }
+    ctx.resubscribe_needed = true;
     if on_screen {
         ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(3));
     }

@@ -1111,20 +1111,32 @@ notecase `heartwood send`.
    `get_info.received_count` 1. Tap (B) or let it expire: nothing stored,
    count unchanged.
 2. Replay: publish the SAME wrap again (relay replay, or two sessions).
-   Expect no second card (`wrap_seen`), and if it arrives after a reboot,
-   the card comes up but a hold stores nothing new (idempotent on the
-   secret: same id back, `received_count` still 1).
+   Expect no second card (`wrap_seen`). After a reboot it must NOT come
+   back either: the hold went to the persisted ledger (`wrap_ledger`), and
+   the connect-time catch-up REQ skips it before any decrypt. Same for a
+   wrap the owner declined with (B). A wrap that merely lapsed DOES come
+   back: at the next connect, and ten minutes after each lapse while the
+   device stays up, until it is held or declined.
+2a. Catch-up: power the device OFF, wrap a note to its master npub, wait
+   for the relay to confirm, power ON. Expect the RECEIVE card within a few
+   seconds of `subscribed on`, with no sender action. Then: with ONE held
+   decision in the ledger, wrap a note, power-cycle, and confirm the REQ on
+   the wire carries `"since":<mark - 172800>,"limit":16` and the card still
+   comes up; with an empty ledger the REQ carries `"limit":16` and no
+   `since`. The keepalive re-REQ 40 s later must be back to `"limit":0`.
 3. Not for us: a wrap to a persona pubkey, a wrap to the master from a DM
    (kind 14 rumor), a wrap whose rumor claims a different author than the
    seal signer, and a rumor whose URL has no amount. Expect: silent drop
    with one `[relay] gift wrap ... not for us / is not a note` log line,
    no card, no wake.
 4. Letterbox cap: with MAX_RECEIVED (4) received notes held, a fifth wrap
-   logs `letterbox full; dropped` and raises no card. Mark one spent over
-   the relay, send again: card. Also: two wraps in quick succession raise
-   ONE card (`a note is already waiting on the button; wrap dropped`); a
-   `sign_event` ask arriving behind a RECEIVE card still queues and gets
-   its own card after it.
+   logs `letterbox full; dropped until there is room` and raises no card.
+   Mark one spent over the relay: WITHOUT sending again, the catch-up
+   re-runs and the fifth wrap's card comes up on its own. Also: two wraps
+   in quick succession raise ONE card (`a note is already waiting on the
+   button; wrap deferred`); settle it, and the second's card follows
+   without anyone resending. A `sign_event` ask arriving behind a RECEIVE
+   card still queues and gets its own card after it.
 5. Collect: from notecase, `heartwood link <bunker>` then `heartwood
    collect`. Expect RELEASE NOTE card (amount @ host), hold; notecase
    claims it at the mint (the wrapped secret is now burned); SPEND NOTE

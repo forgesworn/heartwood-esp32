@@ -46,6 +46,10 @@ const NAMESPACE: &str = "hw_notes";
 const INDEX_KEY: &str = "idx";
 /// The wrapped note key: `seed_cipher::encrypt_seed(secret, note_key)`.
 const NK_KEY: &str = "nk";
+/// The gift-wrap ledger (`wrap_ledger::WrapLedger::encode`): which wraps the
+/// owner has decided on, so a catch-up REQ does not re-offer them.
+const WRAPS_KEY: &str = "wraps";
+const WRAPS_BUF: usize = 16 + heartwood_common::wrap_ledger::RING_LEN * heartwood_common::wrap_ledger::ID_PREFIX_LEN;
 
 /// A note blob is ~120 B for typical hosts/labels; the encoded ceiling with
 /// every field maxed is under 600. One page of index is 16 ids × 8 bytes.
@@ -373,6 +377,38 @@ static NOTES_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 
 pub fn any_notes_held() -> bool {
     NOTES_HELD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The persisted gift-wrap ledger blob, or `None` when there is none (first
+/// boot, or a locker with no storage).
+pub fn load_wrap_ledger() -> Option<alloc_vec::Vec<u8>> {
+    with_locker(|notes| {
+        let Storage::Nvs(nvs) = &mut notes.storage else {
+            return None;
+        };
+        let mut buf = [0u8; WRAPS_BUF];
+        match nvs.nvs.get_blob(WRAPS_KEY, &mut buf) {
+            Ok(Some(bytes)) => Some(bytes.to_vec()),
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("[notes] wrap ledger unreadable: {e}");
+                None
+            }
+        }
+    })
+}
+
+/// Persist the gift-wrap ledger. Human-paced: one write per owner decision
+/// on a RECEIVE card, never per wrap seen.
+pub fn store_wrap_ledger(blob: &[u8]) {
+    with_locker(|notes| {
+        let Storage::Nvs(nvs) = &mut notes.storage else {
+            return;
+        };
+        if let Err(e) = nvs.nvs.set_blob(WRAPS_KEY, blob) {
+            log::warn!("[notes] wrap ledger write failed: {e}");
+        }
+    })
 }
 
 impl Notes {

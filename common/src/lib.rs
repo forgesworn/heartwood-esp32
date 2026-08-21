@@ -48,6 +48,8 @@ pub mod reply_clock;
 
 pub mod approval_queue;
 
+pub mod wrap_ledger;
+
 pub mod note_store;
 
 #[cfg(feature = "nip46")]

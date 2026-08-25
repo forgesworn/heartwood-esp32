@@ -193,13 +193,26 @@ impl<'a> Jd9853Display<'a> {
         Ok(())
     }
 
-    /// Turn the backlight on (full brightness) or off via LEDC.
+    /// Turn the panel off/on for the idle display-sleep path: the backlight via
+    /// LEDC, and — going dark — the framebuffer with it.
+    ///
+    /// Duty zero only hides the image. This is an LCD, so the crystal goes on
+    /// holding whatever was last written to it, and a pixel held in one state
+    /// for as long as a signer sits powered is how a panel comes to wear a
+    /// permanent copy of the idle card. The mono OLED path needs none of this
+    /// and correctly does none of it — its pixels ARE the light. See
+    /// `st7789.rs`'s version, which carries the full reasoning.
+    ///
+    /// Light out first, so the wipe is never seen happening; and waking does
+    /// not repaint, because every caller draws immediately afterwards.
     pub fn set_display_on(&mut self, on: bool) -> Result<(), Jd9853Error> {
         if on {
             let max = self.backlight.get_max_duty();
             self.backlight.set_duty(max).ok();
         } else {
             self.backlight.set_duty(0).ok();
+            self.clear_buffer();
+            self.flush()?;
         }
         Ok(())
     }

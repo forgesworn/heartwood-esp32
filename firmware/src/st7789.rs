@@ -147,9 +147,33 @@ impl<'a> St7789Display<'a> {
             .map_err(|_| St7789Error)
     }
 
-    /// Turn the panel backlight on/off. Mirrors `Ssd1306::set_display_on` for
-    /// the idle display-sleep path (cutting the backlight saves more power than
-    /// the SSD1306 panel-off command and is instant).
+    /// Turn the panel off/on for the idle display-sleep path. Mirrors
+    /// `Ssd1306::set_display_on`, but does more than the name suggests on an
+    /// LCD, and has to.
+    ///
+    /// Cutting the backlight saves more power than the SSD1306's panel-off
+    /// command and is instant — but it only hides the image, it does not stop
+    /// the panel holding it. An LCD's crystal keeps whatever was last written
+    /// to it, so a dark backlight over a held frame is still a pixel being
+    /// asked to stay in one state for as long as the signer sits powered, and
+    /// that is how a panel ends up wearing a permanent copy of the idle card.
+    /// So the framebuffer is blanked too.
+    ///
+    /// The mono path needs none of this and correctly does none of it: an
+    /// OLED's pixels ARE the light, so `set_display_on(false)` genuinely stops
+    /// them emitting. That is why the SSD1306 version can preserve display RAM
+    /// for a fast restore and this one cannot.
+    ///
+    /// Order matters. The light goes out first, so the wipe is never seen
+    /// happening — the screen goes dark rather than visibly erasing itself and
+    /// then going dark.
+    ///
+    /// Waking deliberately does not repaint. Every caller draws immediately
+    /// afterwards (see relay.rs, which already redraws rather than re-lighting
+    /// panel RAM, for the reason written down there: waking into a stale
+    /// approval countdown reads as a live prompt that ignores the buttons), so
+    /// the panel goes from black to the new frame rather than flashing the
+    /// frame from a minute ago.
     pub fn set_display_on(&mut self, on: bool) -> Result<(), St7789Error> {
         let drive_high = on ^ self.backlight_active_low;
         let r = if drive_high {
@@ -157,7 +181,12 @@ impl<'a> St7789Display<'a> {
         } else {
             self.backlight.set_low()
         };
-        r.map_err(|_| St7789Error)
+        r.map_err(|_| St7789Error)?;
+        if !on {
+            self.clear_buffer();
+            self.flush()?;
+        }
+        Ok(())
     }
 }
 

@@ -77,8 +77,8 @@ pub const FRAME_TYPE_BACKUP_IMPORT_RESPONSE: u8 = 0x53;  // device -> host: 0x01
 pub const FRAME_TYPE_SET_NET_CONFIG: u8 = 0x54;  // host -> device: JSON NetConfig {ssid,password,relays,mode}; reply ACK/NACK. Accepted before the first identity exists too (provision-wait, #66) — a staged wifi config takes effect when the first identity lands.
 pub const FRAME_TYPE_WIFI_SCAN_REQUEST: u8 = 0x55;   // host -> device: empty payload; device scans nearby 2.4 GHz APs (reply 0x56, or NACK if it cannot scan)
 pub const FRAME_TYPE_WIFI_SCAN_RESPONSE: u8 = 0x56;  // device -> host: JSON [{ssid,rssi,channel,auth,band24}] (strongest first, one per SSID) for the SSID picker
-pub const FRAME_TYPE_GENERATE_IDENTITY: u8 = 0x57;   // host -> device: optional [label_len][label][words?] — words is 12 (default when absent) or 24; device plays the entropy game, self-generates from stacked entropy, shows the phrase on its OLED, stores it, replies ACK (npub via PROVISION_LIST). The phrase is NEVER sent to the host.
-pub const FRAME_TYPE_RESTORE_IDENTITY: u8 = 0x58;    // host -> device: optional [label_len][label]; device drives an on-screen one-button picker for the owner to re-enter an existing 12-word phrase, validates the checksum, stores it, replies ACK (npub) or NACK (cancel/invalid). The phrase is entered ON the device and is NEVER sent from the host.
+pub const FRAME_TYPE_GENERATE_IDENTITY: u8 = 0x57;   // host -> device: optional [label_len][label][payload_words?] — payload is 12 (default) or 24 BIP-39 words; device plays the entropy game, self-generates, shows 19/31 typed ForgeSworn recovery words, stores it, replies ACK. Recovery words are NEVER sent to the host.
+pub const FRAME_TYPE_RESTORE_IDENTITY: u8 = 0x58;    // host -> device: optional [label_len][label][word_count?]; typed counts are 19/22/25/28/31 and explicit legacy BIP-39 counts are 12/15/18/21/24 (absent defaults to 12). Device drives on-screen entry, validates checksum/fingerprint, stores it, replies ACK/NACK. Words are entered ON the device and NEVER sent to the host.
 pub const FRAME_TYPE_FIRMWARE_INFO: u8 = 0x59;       // host -> device: empty; read-only version query. Safe (no secrets) so it is also served in WiFi mode.
 pub const FRAME_TYPE_FIRMWARE_INFO_RESPONSE: u8 = 0x5A; // device -> host: JSON { version, board }
 pub const FRAME_TYPE_SET_IDENTITY_META: u8 = 0x5B;   // host -> device: pre-resized display metadata for one identity, so the signer never fetches/decodes images itself. Payload: [pubkey 32][w 1][h 1][name_len 1][name UTF-8][avatar w*h*2 Rgb565 big-endian]. Reply ACK/NACK.
@@ -257,6 +257,15 @@ impl MasterMode {
     pub fn is_tree(&self) -> bool {
         matches!(self, Self::TreeMnemonic | Self::TreeNsec)
     }
+
+    /// Version of the nsec-tree derivation applied to the stored secret.
+    /// Bunker secrets are used directly and therefore have no derivation.
+    pub const fn derivation_version(self) -> u8 {
+        match self {
+            Self::Bunker => 0,
+            Self::TreeMnemonic | Self::TreeNsec => 1,
+        }
+    }
 }
 
 /// Public metadata for a provisioned master (no secret material).
@@ -266,6 +275,9 @@ pub struct MasterInfo {
     pub slot: u8,
     pub label: String,
     pub mode: u8,
+    /// 0 means no derivation; 1 is the frozen nsec-tree v1 derivation.
+    #[serde(default)]
+    pub derivation_version: u8,
     pub npub: String,
 }
 

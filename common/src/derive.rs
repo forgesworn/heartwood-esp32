@@ -322,6 +322,13 @@ pub fn create_tree_root(secret: &[u8; 32]) -> Result<TreeRoot, &'static str> {
     Ok(TreeRoot::new(zeroize::Zeroizing::new(*secret), npub))
 }
 
+/// Derive the x-only public key for a secret through the selected curve
+/// backend. Recovery-word fingerprints use this narrow public seam so their
+/// vectors stay identical on k256 and secp256k1 builds.
+pub fn public_key_xonly(secret: &[u8; 32]) -> Result<[u8; 32], &'static str> {
+    backend::pubkey_from_secret(secret)
+}
+
 /// Build the HMAC context message for child key derivation.
 ///
 /// Format: `b"nsec-tree\0" || purpose_utf8 || 0x00 || index_u32_big_endian`

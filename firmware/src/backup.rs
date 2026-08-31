@@ -66,6 +66,7 @@ pub fn handle_export(
             slot: m.slot,
             label: m.label.clone(),
             mode: m.mode as u8,
+            derivation_version: m.derivation_version,
             pubkey: pubkey_hex,
             connection_slots: slots,
         });

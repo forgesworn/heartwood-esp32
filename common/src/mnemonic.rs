@@ -1,8 +1,8 @@
 //! On-device recovery-phrase generation.
 //!
-//! Lets the ESP signer create its OWN master seed and show the 12-word recovery
-//! phrase on its own screen — so the phrase is generated and displayed only on
-//! the device, never in the browser. The browser just asks the device to
+//! Lets the ESP signer create its OWN master seed. The underlying 12/24-word
+//! BIP-39 payload is wrapped in typed 19/31-word ForgeSworn recovery words and
+//! displayed only on the device, never in the browser. The browser just asks the device to
 //! generate; only the resulting public npub comes back.
 //!
 //! The entropy → BIP-39 mnemonic → BIP-32 (`m/44'/1237'/727'/0'/0'`) → tree-root

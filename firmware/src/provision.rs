@@ -24,6 +24,9 @@ use crate::button::Gesture;
 use crate::masters::{self, LoadedMaster};
 use crate::oled::{self, Display};
 use crate::protocol;
+use heartwood_common::recovery_words::{
+    create_mnemonic_recovery_words_for_root, decode_recovery_words, restore_recovery_words,
+};
 use heartwood_common::restore::{restore_root, Choice, WordEntry};
 
 /// Handle a PROVISION_ADD frame (0x01). Returns the new `LoadedMaster` on success.
@@ -111,7 +114,7 @@ pub fn handle_add(
 
 /// Derive the x-only pubkey from a 32-byte root secret and persist the master to
 /// NVS. No display, no ACK — the caller decides what to show (the npub for an
-/// import, the recovery phrase for a self-generated identity). Crate-visible so
+/// import, typed recovery words for a self-generated identity). Crate-visible so
 /// the relay's `derive_identity` management method stores through the same path.
 ///
 /// At-rest encryption (FW-M5): when any slot already carries an encrypted seed
@@ -138,7 +141,16 @@ pub(crate) fn store_master(
     let (xonly, _) = keypair.x_only_public_key();
     let pubkey = xonly.serialize();
     let slot = masters::add_master(nvs, &secret, &label, mode, &pubkey)?;
-    Ok(LoadedMaster { slot, secret, label, mode, pubkey, locked: false, operator: None })
+    Ok(LoadedMaster {
+        slot,
+        secret,
+        label,
+        mode,
+        derivation_version: mode.derivation_version(),
+        pubkey,
+        locked: false,
+        operator: None,
+    })
 }
 
 /// Handle a DERIVE_IDENTITY frame (0x60): [parent_slot][name utf8...].
@@ -260,10 +272,11 @@ pub fn handle_derive(
 
 /// Handle a GENERATE_IDENTITY frame (0x57). The device generates its OWN seed
 /// from stacked entropy, derives the tree root, stores it, and shows the
-/// recovery phrase on its OLED for the owner to write down. The phrase
-/// is NEVER sent to the host — only the public npub is discoverable (via
+/// typed recovery words on its OLED for the owner to write down. The words
+/// are NEVER sent to the host — only the public npub is discoverable (via
 /// PROVISION_LIST). Payload is optional `[label_len][label][words?]`: empty ⇒
-/// "default" label, 12 words; the trailing words byte (new hosts) is 12 or 24.
+/// "default" label, a 12-word payload; the trailing byte selects a 12/24-word
+/// payload, displayed as 19/31 typed recovery words.
 pub fn handle_generate(
     usb: &mut SerialPort<'_>,
     frame: &Frame,
@@ -355,6 +368,16 @@ pub fn handle_generate(
     };
     entropy.iter_mut().for_each(|b| *b = 0);
 
+    let recovery_words = match create_mnemonic_recovery_words_for_root(&phrase, false, &root) {
+        Ok(words) => words,
+        Err(e) => {
+            let mut root = root;
+            root.iter_mut().for_each(|b| *b = 0);
+            log::error!("on-device recovery words encode failed: {e}");
+            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            return None;
+        }
+    };
     let mut root = root; // own it so we can zeroize after storing
     let result = store_master(nvs, root, label, MasterMode::TreeMnemonic, secp);
     root.iter_mut().for_each(|b| *b = 0);
@@ -368,14 +391,16 @@ pub fn handle_generate(
             // Sent now so the host advances to its "write it down" step while the
             // owner steps through the words on the device.
             protocol::write_frame(usb, FRAME_TYPE_ACK, npub.as_bytes());
-            // Walk the owner through the phrase one big word at a time and block
+            // Walk the owner through the typed words one big word at a time and block
             // the caller from redrawing (or, for a wifi device, rebooting) until
             // they confirm with a hold. The phrase only ever appears here.
-            walk_recovery_phrase(display, buttons, &phrase);
+            walk_recovery_phrase(display, buttons, &recovery_words);
+            drop(recovery_words);
             drop(phrase); // Zeroizing: phrase bytes are wiped on drop
             Some(master)
         }
         Err(e) => {
+            drop(recovery_words);
             drop(phrase); // Zeroizing: phrase bytes are wiped on drop
             log::error!("Generate-identity store failed: {e}");
             oled::show_error(display, "Generate failed");
@@ -385,11 +410,11 @@ pub fn handle_generate(
     }
 }
 
-/// Walk the owner through the freshly-generated recovery phrase one large word
+/// Walk the owner through the freshly-generated typed recovery sequence one large word
 /// at a time, advancing on a PRG tap, then gate completion behind a deliberate
 /// hold on a final confirm screen.
 ///
-/// This is the only moment the phrase is ever visible, and a wifi-standalone
+/// This is the only moment the recovery sequence is ever visible, and a wifi-standalone
 /// device reboots within a second of provisioning, so we must NOT return (and
 /// let the caller redraw or reboot) until the owner confirms. There is no
 /// timeout: an unconfirmed phrase staying on screen is the safe failure mode —
@@ -514,14 +539,16 @@ fn press_blocking(
     }
 }
 
-/// Handle a RESTORE_IDENTITY frame (0x58). The owner re-enters an EXISTING
-/// 12-word recovery phrase on the device itself via the single PRG button — the
+/// Handle a RESTORE_IDENTITY frame (0x58). The owner re-enters existing typed
+/// ForgeSworn recovery words (19/22/25/28/31) or an explicit legacy BIP-39
+/// phrase (12/15/18/21/24) on the device itself via the buttons — the
 /// phrase is never typed into or sent from the host (the host only triggers the
 /// flow and learns the resulting public npub). The device drives an on-screen
 /// one-button picker (tap = next choice, double-tap = pick, hold = go back),
-/// lets the owner review and edit all 12 words, validates the BIP-39
-/// checksum, shows the derived npub to confirm the account, then stores it as a
-/// `TreeMnemonic` master. Payload is optional `[label_len][label]`; empty ⇒ "default".
+/// lets the owner review and edit every word, validates the typed checksum and
+/// public fingerprint, shows the derived npub to confirm the account, then
+/// stores it with the embedded mode. Payload is
+/// `[label_len][label][word_count?]`; an absent count keeps legacy 12-word behaviour.
 pub fn handle_restore(
     usb: &mut SerialPort<'_>,
     frame: &Frame,
@@ -534,8 +561,8 @@ pub fn handle_restore(
     // set, word entry runs the two-button picker (A = move, B = pick, no
     // timing); single-button boards (Heltec, C6) keep the gesture picker.
     let button_b = buttons.b.as_ref();
-    let label = if frame.payload.is_empty() {
-        "default".to_string()
+    let (label, total) = if frame.payload.is_empty() {
+        ("default".to_string(), 12usize)
     } else {
         let label_len = frame.payload[0] as usize;
         if frame.payload.len() < 1 + label_len {
@@ -543,11 +570,28 @@ pub fn handle_restore(
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             return None;
         }
-        String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string()
+        let total = match frame.payload.len() - (1 + label_len) {
+            0 => 12,
+            1 if matches!(
+                frame.payload[1 + label_len],
+                12 | 15 | 18 | 19 | 21 | 22 | 24 | 25 | 28 | 31
+            ) => {
+                frame.payload[1 + label_len] as usize
+            }
+            n => {
+                log::warn!("RESTORE_IDENTITY bad word-count byte (trailing {n} byte(s))");
+                protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                return None;
+            }
+        };
+        (
+            String::from_utf8_lossy(&frame.payload[1..1 + label_len]).to_string(),
+            total,
+        )
     };
 
     // At-rest encryption cannot wrap a restored seed this session (FW-M5) —
-    // refuse before the owner enters twelve words for nothing.
+    // refuse before the owner enters the words for nothing.
     if masters::encryption_at_rest_active(nvs) {
         log::warn!("RESTORE_IDENTITY refused: at-rest encryption active");
         oled::show_error(display, "Disable PIN/vault\nbefore adding");
@@ -562,14 +606,13 @@ pub fn handle_restore(
     oled::show_restore_intro(display, button_b.is_some());
     esp_idf_hal::delay::FreeRtos::delay_ms(2200);
 
-    const TOTAL: usize = 12;
-    let mut words: Vec<&'static str> = Vec::with_capacity(TOTAL);
+    let mut words: Vec<&'static str> = Vec::with_capacity(total);
 
-    // Sequential entry of all 12 words. Holding "back" past the start of an empty
+    // Sequential entry of every selected word. Holding "back" past the start of an empty
     // word steps to the previous one; stepping back past word 1 cancels the restore.
-    while words.len() < TOTAL {
+    while words.len() < total {
         let idx = words.len() + 1;
-        match enter_one_word(display, buttons, button_b, idx, TOTAL) {
+        match enter_one_word(display, buttons, button_b, idx, total) {
             WordResult::Accepted(w) => words.push(w),
             WordResult::Back => {
                 if words.pop().is_none() {
@@ -587,12 +630,31 @@ pub fn handle_restore(
         match review_phrase(display, buttons, button_b, &mut words, invalid) {
             ReviewOutcome::Cancel => return cancel_restore(usb, display),
             ReviewOutcome::Save => {
-                let phrase = words.join(" ");
-                let mut root = match restore_root(&phrase) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        invalid = true; // back to review, banner on
+                let phrase = zeroize::Zeroizing::new(words.join(" "));
+                let (mut root, mode) = if matches!(total, 19 | 22 | 25 | 28 | 31) {
+                    if decode_recovery_words(&phrase)
+                        .map(|decoded| decoded.passphrase_required)
+                        .unwrap_or(false)
+                    {
+                        oled::show_error(display, "Passphrase required\nUse Sapwood paste");
+                        esp_idf_hal::delay::FreeRtos::delay_ms(2200);
+                        invalid = true;
                         continue;
+                    }
+                    match restore_recovery_words(&phrase, "") {
+                        Ok(restored) => (*restored.secret, restored.mode),
+                        Err(_) => {
+                            invalid = true;
+                            continue;
+                        }
+                    }
+                } else {
+                    match restore_root(&phrase) {
+                        Ok(root) => (root, MasterMode::TreeMnemonic),
+                        Err(_) => {
+                            invalid = true;
+                            continue;
+                        }
                     }
                 };
                 invalid = false;
@@ -622,7 +684,7 @@ pub fn handle_restore(
                     continue;
                 }
 
-                let result = store_master(nvs, root, label, MasterMode::TreeMnemonic, secp);
+                let result = store_master(nvs, root, label, mode, secp);
                 root.iter_mut().for_each(|b| *b = 0);
                 return match result {
                     Ok(master) => {
@@ -960,6 +1022,7 @@ pub fn handle_list(
                 "slot": m.slot,
                 "label": m.label,
                 "mode": m.mode as u8,
+                "derivation_version": m.derivation_version,
                 "npub": encode_npub(&m.pubkey),
                 // True while the seed is still encrypted at rest (pre-unlock).
                 // Hosts use this to show the "awaiting unlock" state.

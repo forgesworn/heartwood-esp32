@@ -76,3 +76,6 @@ pub mod note_seal;
 
 #[cfg(feature = "mnemonic")]
 pub mod restore;
+
+#[cfg(feature = "mnemonic")]
+pub mod recovery_words;

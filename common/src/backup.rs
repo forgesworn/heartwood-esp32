@@ -23,6 +23,10 @@ pub struct BackupMaster {
     pub label: String,
     /// Provisioning mode (0=Bunker, 1=TreeMnemonic, 2=TreeNsec).
     pub mode: u8,
+    /// 0 for direct/raw keys; 1 for the frozen nsec-tree v1 derivation.
+    /// Missing on historical backup JSON and therefore defaults to unknown/0.
+    #[serde(default)]
+    pub derivation_version: u8,
     /// Hex-encoded x-only public key (64 chars).
     pub pubkey: String,
     pub connection_slots: Vec<ConnectSlot>,
@@ -82,6 +86,7 @@ mod tests {
                 slot: 0,
                 label: "Personal".to_string(),
                 mode: 1,
+                derivation_version: 1,
                 pubkey: "ff".repeat(32),
                 connection_slots: vec![sample_slot(0, "nostrudel desktop")],
             }],
@@ -99,10 +104,31 @@ mod tests {
         assert_eq!(master.slot, 0);
         assert_eq!(master.label, "Personal");
         assert_eq!(master.mode, 1);
+        assert_eq!(master.derivation_version, 1);
         assert_eq!(master.pubkey, "ff".repeat(32));
         assert_eq!(master.connection_slots.len(), 1);
         assert_eq!(master.connection_slots[0].label, "nostrudel desktop");
         assert_eq!(master.connection_slots[0].slot_index, 0);
+    }
+
+    #[test]
+    fn historical_backup_without_derivation_version_defaults_to_zero() {
+        let json = r#"{
+            "created_at": 1700000000,
+            "device_id": "legacy-device",
+            "masters": [{
+                "slot": 0,
+                "label": "Legacy",
+                "mode": 1,
+                "pubkey": "legacy-pubkey",
+                "connection_slots": []
+            }],
+            "bridge_secret": "legacy-bridge-secret"
+        }"#;
+
+        let decoded: BackupPayload = serde_json::from_str(json).unwrap();
+
+        assert_eq!(decoded.masters[0].derivation_version, 0);
     }
 
     #[test]
@@ -132,6 +158,7 @@ mod tests {
                     slot: 0,
                     label: "Work".to_string(),
                     mode: 2,
+                    derivation_version: 1,
                     pubkey: "33".repeat(32),
                     connection_slots: vec![
                         sample_slot(0, "Bark browser"),
@@ -142,6 +169,7 @@ mod tests {
                     slot: 1,
                     label: "Personal".to_string(),
                     mode: 0,
+                    derivation_version: 0,
                     pubkey: "44".repeat(32),
                     connection_slots: vec![],
                 },

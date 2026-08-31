@@ -18,6 +18,9 @@ use heartwood_common::derive::create_tree_root;
 use heartwood_common::frame;
 use heartwood_common::hex::hex_encode;
 use heartwood_common::policy::ClientPolicy;
+use heartwood_common::recovery_words::{
+    create_mnemonic_recovery_words_for_root, decode_recovery_words, restore_recovery_words,
+};
 use heartwood_common::types::{
     FRAME_TYPE_ACK, FRAME_TYPE_NACK, FRAME_TYPE_POLICY_LIST_REQUEST,
     FRAME_TYPE_POLICY_LIST_RESPONSE, FRAME_TYPE_POLICY_REVOKE, FRAME_TYPE_POLICY_UPDATE,
@@ -44,7 +47,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Provision an EXISTING master secret onto the device (restore from a
-    /// recovery phrase, an nsec, or a 24-word key backup made by Sapwood).
+    /// typed recovery words, an nsec, or explicit legacy BIP-39 words).
     /// RUN OFFLINE — the key must never touch a networked machine. The secret
     /// is read interactively, never from argv.
     Provision {
@@ -69,7 +72,7 @@ enum Command {
         gen_bridge_secret: bool,
     },
 
-    /// Generate a FRESH key on this (offline) host, show the recovery phrase to
+    /// Generate a FRESH key on this (offline) host, show typed recovery words to
     /// write down, then provision it. The phrase is shown once and never written
     /// to disk. RUN OFFLINE.
     Generate {
@@ -324,6 +327,45 @@ fn derive_root_secret(mnemonic: &str, passphrase: &str) -> Result<[u8; 32], Stri
     Ok(result)
 }
 
+/// Resolve a typed recovery sequence automatically, or apply the explicitly
+/// selected legacy mode to an nsec/bare BIP-39 input. Typed word counts cannot
+/// be valid BIP-39 mnemonics, so a damaged header is never silently re-read as
+/// a legacy seed.
+fn resolve_provision_input(
+    input: &str,
+    selected_mode: &str,
+    passphrase: &str,
+) -> Result<([u8; 32], &'static str), String> {
+    match decode_recovery_words(input) {
+        Ok(_) => {
+            let recovered = restore_recovery_words(input, passphrase)?;
+            let mode = match recovered.mode {
+                heartwood_common::types::MasterMode::Bunker => "bunker",
+                heartwood_common::types::MasterMode::TreeMnemonic => "tree-mnemonic",
+                heartwood_common::types::MasterMode::TreeNsec => "tree-nsec",
+            };
+            Ok((*recovered.secret, mode))
+        }
+        Err(typed_error) => {
+            let count = input.split_whitespace().count();
+            if matches!(count, 19 | 22 | 25 | 28 | 31) {
+                return Err(typed_error);
+            }
+            match selected_mode {
+                "bunker" => Ok((decode_key_input(input)?, "bunker")),
+                "tree-nsec" => {
+                    let mut nsec = decode_key_input(input)?;
+                    let root = nsec_to_tree_root(&nsec)?;
+                    nsec.zeroize();
+                    Ok((root, "tree-nsec"))
+                }
+                "tree-mnemonic" => Ok((derive_root_secret(input, passphrase)?, "tree-mnemonic")),
+                other => Err(format!("unknown provisioning mode: {other}")),
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Frame builders
 // ---------------------------------------------------------------------------
@@ -520,42 +562,33 @@ fn handle_provision(
     bridge_secret: &Option<String>,
     gen_bridge_secret: bool,
 ) {
-    let mut root_secret = match mode {
-        "bunker" => {
-            let key = zeroize::Zeroizing::new(
-                rpassword::prompt_password("Enter nsec (nsec1...) or 24-word key backup: ")
-                    .expect("failed to read key"),
-            );
-            let secret = decode_key_input(&key).expect("invalid key");
-            println!("\nMode: bunker (raw key, no tree derivation)");
-            secret
-        }
-        "tree-nsec" => {
-            let key = zeroize::Zeroizing::new(
-                rpassword::prompt_password("Enter nsec (nsec1...) or 24-word key backup: ")
-                    .expect("failed to read key"),
-            );
-            let mut nsec_bytes = decode_key_input(&key).expect("invalid key");
-            let secret = nsec_to_tree_root(&nsec_bytes).expect("tree-nsec derivation failed");
-            nsec_bytes.zeroize();
-            println!("\nMode: tree-nsec (nsec -> HMAC -> tree root)");
-            secret
-        }
-        "tree-mnemonic" | _ => {
-            let mnemonic = zeroize::Zeroizing::new(
-                rpassword::prompt_password("Enter mnemonic: ")
-                    .expect("failed to read mnemonic"),
-            );
-            let passphrase = zeroize::Zeroizing::new(
-                rpassword::prompt_password("Enter passphrase (empty for none): ")
-                    .expect("failed to read passphrase"),
-            );
-            let secret = derive_root_secret(&mnemonic, &passphrase)
-                .expect("derivation failed");
-            println!("\nMode: tree-mnemonic (BIP-39 -> BIP-32 -> tree root)");
-            secret
-        }
+    let recovery_input = zeroize::Zeroizing::new(
+        rpassword::prompt_password(
+            "Enter ForgeSworn recovery words, nsec, or explicit legacy BIP-39 words: ",
+        )
+        .expect("failed to read recovery input"),
+    );
+    let typed = decode_recovery_words(&recovery_input).ok();
+    let needs_passphrase = typed
+        .as_ref()
+        .map(|decoded| decoded.passphrase_required)
+        .unwrap_or(mode == "tree-mnemonic");
+    drop(typed);
+    let passphrase = if needs_passphrase {
+        zeroize::Zeroizing::new(
+            rpassword::prompt_password("Enter recovery passphrase (empty for none): ")
+                .expect("failed to read passphrase"),
+        )
+    } else {
+        zeroize::Zeroizing::new(String::new())
     };
+    let (mut root_secret, effective_mode) =
+        resolve_provision_input(&recovery_input, mode, &passphrase).expect("invalid recovery input");
+    match effective_mode {
+        "bunker" => println!("\nMode: bunker (raw key, no tree derivation)"),
+        "tree-nsec" => println!("\nMode: tree-nsec (nsec -> HMAC -> tree root)"),
+        _ => println!("\nMode: tree-mnemonic (BIP-39 -> BIP-32 -> tree root)"),
+    }
 
     let root = create_tree_root(&root_secret).expect("invalid root secret");
     let npub = root.master_npub.clone();
@@ -573,7 +606,7 @@ fn handle_provision(
     }
 
     let bridge = resolve_bridge_secret(bridge_secret, gen_bridge_secret);
-    finish_provisioning(port_name, baud, &mut root_secret, label, mode, bridge, &npub);
+    finish_provisioning(port_name, baud, &mut root_secret, label, effective_mode, bridge, &npub);
 }
 
 fn handle_generate(
@@ -597,13 +630,18 @@ fn handle_generate(
     let mnemonic = bip39::Mnemonic::from_entropy(&entropy).expect("entropy -> mnemonic");
     entropy.zeroize();
     let phrase = zeroize::Zeroizing::new(mnemonic.to_string());
+    let mut root_secret = derive_root_secret(&phrase, "").expect("derivation failed");
+    let recovery_words = create_mnemonic_recovery_words_for_root(&phrase, false, &root_secret)
+        .expect("recovery words encode failed");
+    let recovery_count = recovery_words.split_whitespace().count();
 
     println!("\n========================================================");
-    println!("  WRITE THESE {words} WORDS DOWN — they are the ONLY backup of");
+    println!("  WRITE THESE {recovery_count} WORDS DOWN — they are the ONLY backup of");
     println!("  this key. Do NOT photograph them or store them on any");
-    println!("  networked computer. Anyone with them controls the signer.");
+    println!("  networked computer. Their typed header preserves the exact");
+    println!("  ForgeSworn derivation. Anyone with them controls the signer.");
     println!("========================================================\n");
-    for (i, w) in phrase.split_whitespace().enumerate() {
+    for (i, w) in recovery_words.split_whitespace().enumerate() {
         println!("  {:>2}. {w}", i + 1);
     }
     print!("\nType 'yes' once you have written them down: ");
@@ -611,11 +649,11 @@ fn handle_generate(
     let mut confirm = String::new();
     io::stdin().read_line(&mut confirm).unwrap();
     if confirm.trim().to_lowercase() != "yes" {
+        root_secret.zeroize();
         println!("Aborted — nothing was provisioned.");
         return;
     }
 
-    let mut root_secret = derive_root_secret(&phrase, "").expect("derivation failed");
     let root = create_tree_root(&root_secret).expect("invalid root secret");
     let npub = root.master_npub.clone();
     println!("\nPubkey: {npub}");
@@ -902,6 +940,26 @@ mod tests {
     fn test_key_backup_rejects_bad_checksum() {
         let junk = "abandon ".repeat(24);
         assert!(decode_key_input(junk.trim()).is_err());
+    }
+
+    #[test]
+    fn typed_recovery_words_override_the_legacy_mode_switch() {
+        let mnemonic_words = "edge obtain doll auto level leave morning abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let (mnemonic_root, mnemonic_mode) =
+            resolve_provision_input(mnemonic_words, "bunker", "").unwrap();
+        assert_eq!(mnemonic_mode, "tree-mnemonic");
+        assert_eq!(hex_encode(&mnemonic_root), "cc92d213b5eccd19eb85c12c2cf6fd168f27c2cc347c51a7c4c62ac67795fc65");
+
+        let raw_words = "edge obtain lizard frost kitten own grit abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon diesel";
+        let (raw, raw_mode) = resolve_provision_input(raw_words, "tree-mnemonic", "").unwrap();
+        assert_eq!(raw_mode, "bunker");
+        assert_eq!(raw[31], 1);
+    }
+
+    #[test]
+    fn typed_recovery_tampering_is_not_reinterpreted_as_legacy_input() {
+        let tampered = "edge obtain doll auto level leave motion abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        assert!(resolve_provision_input(tampered, "tree-mnemonic", "").is_err());
     }
 
     /// Passphrase changes the derived secret.

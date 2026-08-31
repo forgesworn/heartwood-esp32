@@ -1012,6 +1012,7 @@ impl SigningBackend for SoftBackend {
                 label: m.label.clone(),
                 // Soft mode always uses mode=0 (Bunker equivalent) as the provisioning mode.
                 mode: 0,
+                derivation_version: 0,
                 pubkey: pubkey_hex,
                 connection_slots: m.connection_slots.clone(),
             });

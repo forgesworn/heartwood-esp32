@@ -413,6 +413,7 @@ mod tests {
                 slot: 0,
                 label: "personal".to_string(),
                 mode: 1,
+                derivation_version: 1,
                 pubkey: "ef".repeat(32),
                 connection_slots: vec![],
             }],

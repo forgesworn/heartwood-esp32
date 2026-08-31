@@ -22,7 +22,8 @@ Plug the device into the offline computer, find its port (`ls /dev/tty*` /
 `/dev/cu.*`), then:
 
 ```sh
-# From a 12/24-word recovery phrase (BIP-39 → tree root):
+# Typed ForgeSworn recovery words auto-select their embedded mode. The mode
+# switch below applies only to explicit legacy input:
 heartwood-provision --port /dev/ttyUSB0 provision --mode tree-mnemonic
 
 # From an nsec (HMAC → tree root):
@@ -32,20 +33,21 @@ heartwood-provision --port /dev/ttyUSB0 provision --mode tree-nsec
 heartwood-provision --port /dev/ttyUSB0 provision --mode bunker
 ```
 
-You'll be prompted for the phrase/nsec (hidden input). The tool shows the npub it
-derived, asks you to confirm, then sends it. **Hold the device's button** to
-approve when it prompts. It reads the npub back from the device to confirm.
+You'll be prompted for typed recovery words, an nsec, or explicit legacy
+BIP-39 input (hidden input). Typed words override a conflicting `--mode` and
+their fingerprint is checked before the tool shows the npub. **Hold the
+device's button** to approve. It reads the npub back to confirm.
 
 ## Generate a fresh key
 
 ```sh
-heartwood-provision --port /dev/ttyUSB0 generate            # 12 words
-heartwood-provision --port /dev/ttyUSB0 generate --words 24 # 24 words
+heartwood-provision --port /dev/ttyUSB0 generate            # 19 typed words (128-bit payload)
+heartwood-provision --port /dev/ttyUSB0 generate --words 24 # 31 typed words (256-bit payload)
 ```
 
-The 12/24 words are shown **once** for you to write down — they are the only
-backup, and are never written to disk. Type `yes` to confirm, then provision as
-above.
+The typed words are shown **once** for you to write down. They carry the
+recovery format, nsec-tree v1 meaning, and a public fingerprint, and are never
+written to disk. Type `yes` to confirm, then provision as above.
 
 ## Pair the bridge secret in the same step
 

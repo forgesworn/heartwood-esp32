@@ -371,6 +371,7 @@ name = "heartwood-common"
 version = "0.1.0"
 dependencies = [
  "bech32",
+ "bip39",
  "crc32fast",
  "hmac",
  "k256",

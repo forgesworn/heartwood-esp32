@@ -38,6 +38,7 @@ pub struct LoadedMaster {
     pub secret: [u8; 32],
     pub label: String,
     pub mode: MasterMode,
+    pub derivation_version: u8,
     pub pubkey: [u8; 32],
     /// True when the seed is encrypted at rest and not yet decrypted.
     pub locked: bool,
@@ -199,6 +200,14 @@ fn load_one(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<LoadedMaster> {
         _ => MasterMode::TreeMnemonic,
     };
 
+    let mut derivation_buf = [0u8; 1];
+    let derivation_version = match nvs.get_blob(&format!("{prefix}_deriv"), &mut derivation_buf) {
+        Ok(Some(b)) if b.len() == 1 => b[0],
+        // Existing slots predate the metadata but their mode still identifies
+        // the exact derivation that created their stored key.
+        _ => mode.derivation_version(),
+    };
+
     let mut pubkey = [0u8; 32];
     let pubkey_key = format!("{prefix}_pubkey");
     match nvs.get_blob(&pubkey_key, &mut pubkey) {
@@ -219,6 +228,7 @@ fn load_one(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<LoadedMaster> {
         secret,
         label,
         mode,
+        derivation_version,
         pubkey,
         locked,
         operator,
@@ -270,6 +280,8 @@ pub fn add_master(
         .map_err(|_| "failed to write label")?;
     nvs.set_blob(&format!("{prefix}_mode"), &[mode as u8])
         .map_err(|_| "failed to write mode")?;
+    nvs.set_blob(&format!("{prefix}_deriv"), &[mode.derivation_version()])
+        .map_err(|_| "failed to write derivation version")?;
     nvs.set_blob(&format!("{prefix}_pubkey"), pubkey)
         .map_err(|_| "failed to write pubkey")?;
 
@@ -522,13 +534,14 @@ fn rewrite_pinned_relays_from_shadow(
     }
 }
 
-fn slot_keys(slot: u8) -> [String; 11] {
+fn slot_keys(slot: u8) -> [String; 12] {
     let master = format!("master_{slot}");
     [
         format!("{master}_secret"),
         secret_enc_key(slot),
         format!("{master}_label"),
         format!("{master}_mode"),
+        format!("{master}_deriv"),
         format!("{master}_pubkey"),
         format!("{master}_conn"),
         format!("connslots_{slot}"),

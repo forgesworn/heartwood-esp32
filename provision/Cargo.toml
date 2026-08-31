@@ -6,7 +6,7 @@ description = "Provisioning CLI for heartwood-esp32 — derives root secret from
 license = "MIT"
 
 [dependencies]
-heartwood-common = { path = "../common", features = ["nip46"] }
+heartwood-common = { path = "../common", features = ["nip46", "mnemonic"] }
 serde_json = "1"
 bip39 = "2"
 bip32 = "0.5"

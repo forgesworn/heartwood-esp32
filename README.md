@@ -2,6 +2,12 @@
 
 # Heartwood ESP32
 
+> **Untested alpha:** firmware `0.18.0-alpha.1` contains ForgeSworn Recovery
+> Words v1 for integration testing. Its automated suites and board builds pass,
+> but the complete physical write-down, wipe, and restore matrix has not run.
+> Use a test-only signer, retain an independent backup, and do not use this
+> alpha for funds or an irreplaceable identity.
+
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/TheCryptoDonkey?logo=githubsponsors&color=ea4aaa&label=Sponsor)](https://github.com/sponsors/TheCryptoDonkey)
 
 A hardware signing device for Nostr on supported ESP32 boards: **Heltec WiFi LoRa 32 V3/V4**, **LilyGO/TENSTAR T-Display**, and **Waveshare ESP32-C6-LCD-1.47**. Pick the target with the board-aware build script. Heartwood holds multi-master nsec material and signs on request; master private keys never leave the chip. Signing is policy-gated: requests outside automatic authority need the physical button and are shown on the display, while an authenticated operator can install an exact per-client method/event-kind policy for unattended signing.
@@ -195,13 +201,12 @@ cd provision && cargo run -- --port /dev/cu.usbserial-*
 
 Enter mnemonic and passphrase when prompted. After ACK, the device reboots with the stored identity.
 
-To restore an existing key rather than a phrase, pick a mode: `--mode bunker`
-(the device signs as that exact key, same npub) or `--mode tree-nsec` (a fresh
-tree root is derived from it, new npub). Both prompt for the key and accept
-either an `nsec1...` or the 24-word key backup Sapwood writes out at import --
-the key's own bytes as BIP-39 entropy, so the identical npub comes back. A
-12-word phrase is a seed, not a key, and belongs in the default tree-mnemonic
-mode. Format and instructions:
+Alpha Sapwood and Heartwood `0.18.0-alpha.1` produce typed 19/31-word recovery sequences with
+an embedded recovery kind, nsec-tree version, and public fingerprint. The
+provision CLI recognises these automatically. `--mode bunker`, `--mode
+tree-nsec`, and `--mode tree-mnemonic` now apply only to explicit legacy nsec or
+bare BIP-39 input. Historical 24-word key backups remain supported but require
+the original meaning to be selected out of band. Format and instructions:
 [sapwood/docs/key-backup.md](https://github.com/forgesworn/sapwood/blob/main/docs/key-backup.md).
 
 Subsequent boots display the master npub immediately (no provisioning needed).

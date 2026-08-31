@@ -372,7 +372,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          notes="Firmware ${GITHUB_REF_NAME} for every supported board. Each esp-idf board ships \`app-<board>.bin\` + \`bootloader-<board>.bin\` + \`partition-table-<board>.bin\`; the esp8266 ships a single \`app-esp8266.bin\` (flash at 0x0). Every app image carries an ed25519 release signature (\`app-<board>.bin.sig\`, also embedded in \`version.json\`) that signature-enforcing firmware verifies before installing an OTA. \`version.json\` describes them, including a per-board \`ota\` flag — heltec-v3/v4 are OTA-updatable (2 MB A/B), the T-Display/C6 are 4 MB factory (USB re-flash), the esp8266 has no OTA. Pull into Sapwood with \`npm run sync:firmware\`."
+          prerelease_args=()
+          case "$GITHUB_REF_NAME" in
+            *-*)
+              notes="$(printf '%s\n\n%s' 'UNTESTED ALPHA: use a test-only signer and retain an independent backup. The complete physical write-down, wipe, and restore matrix has not run.' "$notes")"
+              prerelease_args=(--prerelease)
+              ;;
+          esac
           gh release create "$GITHUB_REF_NAME" \
             --title "Firmware $GITHUB_REF_NAME" \
-            --notes "Firmware ${GITHUB_REF_NAME} for every supported board. Each esp-idf board ships \`app-<board>.bin\` + \`bootloader-<board>.bin\` + \`partition-table-<board>.bin\`; the esp8266 ships a single \`app-esp8266.bin\` (flash at 0x0). Every app image carries an ed25519 release signature (\`app-<board>.bin.sig\`, also embedded in \`version.json\`) that signature-enforcing firmware verifies before installing an OTA. \`version.json\` describes them, including a per-board \`ota\` flag — heltec-v3/v4 are OTA-updatable (2 MB A/B), the T-Display/C6 are 4 MB factory (USB re-flash), the esp8266 has no OTA. Pull into Sapwood with \`npm run sync:firmware\`." \
+            --notes "$notes" \
+            "${prerelease_args[@]}" \
             out/app-*.bin out/app-*.bin.sig out/bootloader-*.bin out/partition-table-*.bin out/version.json

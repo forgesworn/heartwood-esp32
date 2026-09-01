@@ -166,6 +166,12 @@ fn backend_to_http(err: BackendError) -> Response {
         BackendError::DeviceTimeout => {
             api_err(StatusCode::GATEWAY_TIMEOUT, "device did not respond")
         }
+        BackendError::DeviceSessionLost => {
+            api_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "device serial session is out of sync after a timeout; restart heartwoodd to reconnect",
+            )
+        }
         BackendError::Denied => {
             api_err(StatusCode::FORBIDDEN, "request denied")
         }

@@ -51,6 +51,9 @@ pub enum BackendError {
     DeviceBusy,
     /// A serial/USB timeout occurred waiting for the device.
     DeviceTimeout,
+    /// A previous timeout made the no-request-ID serial stream ambiguous.
+    /// Hard mode must not issue another request until the daemon reconnects.
+    DeviceSessionLost,
     /// The physical button was not pressed; the request was denied.
     Denied,
     /// The user did not confirm the operation (button not pressed or timed out).
@@ -78,6 +81,10 @@ impl fmt::Display for BackendError {
             BackendError::Locked          => write!(f, "backend is locked"),
             BackendError::DeviceBusy      => write!(f, "device is busy"),
             BackendError::DeviceTimeout   => write!(f, "device timed out"),
+            BackendError::DeviceSessionLost => write!(
+                f,
+                "device serial session is out of sync; restart heartwoodd to reconnect"
+            ),
             BackendError::Denied          => write!(f, "request denied"),
             BackendError::UserCancelled   => write!(f, "user did not confirm"),
             BackendError::PendingApproval(id) => write!(f, "pending approval: {id}"),

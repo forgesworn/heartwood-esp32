@@ -12,6 +12,7 @@
 // those files are refactored (Tasks 7-9) to go through this backend.
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -44,12 +45,17 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub struct SerialBackend {
     serial: Arc<Mutex<RawSerial>>,
     log_tx: broadcast::Sender<String>,
+    session_lost: AtomicBool,
 }
 
 impl SerialBackend {
     /// Construct a new SerialBackend.
     pub fn new(serial: Arc<Mutex<RawSerial>>, log_tx: broadcast::Sender<String>) -> Self {
-        Self { serial, log_tx }
+        Self {
+            serial,
+            log_tx,
+            session_lost: AtomicBool::new(false),
+        }
     }
 
     /// Access the underlying serial mutex (needed by the log poller task).
@@ -68,13 +74,37 @@ impl SerialBackend {
     /// with LOCK_RETRY_DELAY between attempts. Returns DeviceBusy if the lock
     /// cannot be obtained after all retries.
     fn acquire(&self) -> Result<MutexGuard<'_, RawSerial>, BackendError> {
+        if self.session_lost.load(Ordering::Acquire) {
+            return Err(BackendError::DeviceSessionLost);
+        }
         for _ in 0..LOCK_RETRIES {
             if let Ok(guard) = self.serial.try_lock() {
+                // A request that held the mutex may have timed out after our
+                // first check. Recheck only once we own the port, before any
+                // later request can write to the ambiguous stream.
+                if self.session_lost.load(Ordering::Acquire) {
+                    drop(guard);
+                    return Err(BackendError::DeviceSessionLost);
+                }
                 return Ok(guard);
             }
             std::thread::sleep(LOCK_RETRY_DELAY);
         }
         Err(BackendError::DeviceBusy)
+    }
+
+    /// A timed-out exchange cannot be correlated with a response that arrives
+    /// later because Heartwood frames carry no request ID and many management
+    /// operations share ACK/NACK response types. The request that discovered
+    /// the timeout reports DeviceTimeout; every later request fails before it
+    /// writes until heartwoodd is restarted and opens a fresh serial session.
+    fn poison_on_timeout(&self) -> BackendError {
+        if !self.session_lost.swap(true, Ordering::AcqRel) {
+            log::error!(
+                "Serial response timed out; disabling the ambiguous session until heartwoodd restarts"
+            );
+        }
+        BackendError::DeviceTimeout
     }
 
     /// Send a frame and wait for a response whose type is one of `expected_types`.
@@ -100,7 +130,7 @@ impl SerialBackend {
 
         loop {
             if Instant::now() > deadline {
-                return Err(BackendError::DeviceTimeout);
+                return Err(self.poison_on_timeout());
             }
 
             let mut byte = [0u8; 1];
@@ -161,7 +191,7 @@ impl SerialBackend {
         let mut pos = 0;
         while pos < buf.len() {
             if Instant::now() > deadline {
-                return Err(BackendError::DeviceTimeout);
+                return Err(self.poison_on_timeout());
             }
             match file.read(&mut buf[pos..]) {
                 Ok(n) if n > 0 => pos += n,
@@ -185,10 +215,10 @@ impl SerialBackend {
     /// background log_poller task cannot access the serial mutex while it is held
     /// here.
     ///
-    /// Note: after a request times out, a stale late response may still arrive
-    /// and be consumed by the NEXT request's read. Harmless: encrypted
-    /// responses are bound to the original client's pubkey, so a mismatched
-    /// payload fails decryption downstream rather than crossing sessions.
+    /// A timeout poisons this SerialBackend before it returns. No later request
+    /// may reuse the stream: although encrypted responses are bound to their
+    /// original client, management operations share generic ACK/NACK frames and
+    /// a stale one could otherwise approve the wrong operation.
     ///
     /// Returns the payload as a UTF-8 string (raw JSON or NIP-44 ciphertext).
     fn read_any_response(
@@ -213,7 +243,7 @@ impl SerialBackend {
         loop {
             if Instant::now() > deadline {
                 flush_log_line(&mut log_line_buf);
-                return Err(BackendError::DeviceTimeout);
+                return Err(self.poison_on_timeout());
             }
 
             let mut byte = [0u8; 1];
@@ -333,6 +363,23 @@ impl SerialBackend {
             };
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_poison_prevents_the_next_request_from_acquiring_the_port() {
+        let file = std::fs::File::open("/dev/null").expect("open test file");
+        let serial = Arc::new(Mutex::new(RawSerial { file }));
+        let (log_tx, _) = broadcast::channel(1);
+        let backend = SerialBackend::new(serial, log_tx);
+
+        assert!(backend.acquire().is_ok());
+        assert!(matches!(backend.poison_on_timeout(), BackendError::DeviceTimeout));
+        assert!(matches!(backend.acquire(), Err(BackendError::DeviceSessionLost)));
     }
 }
 

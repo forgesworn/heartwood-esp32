@@ -2,11 +2,11 @@
 
 # Heartwood ESP32
 
-> **Untested alpha:** firmware `0.18.0-alpha.1` contains ForgeSworn Recovery
-> Words v1 for integration testing. Its automated suites and board builds pass,
-> but the complete physical write-down, wipe, and restore matrix has not run.
-> Use a test-only signer, retain an independent backup, and do not use this
-> alpha for funds or an irreplaceable identity.
+> **Beta:** firmware `0.18.0-beta.1` is the first retained-state beta. Automated
+> suites, signed board builds, the named Heltec V4 migration, reboot/unlock and
+> small-value settlement are release gates. Keep an independent recovery copy
+> and use small values while the complete destructive cross-board recovery
+> matrix remains unfinished.
 
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/TheCryptoDonkey?logo=githubsponsors&color=ea4aaa&label=Sponsor)](https://github.com/sponsors/TheCryptoDonkey)
 
@@ -201,7 +201,7 @@ cd provision && cargo run -- --port /dev/cu.usbserial-*
 
 Enter mnemonic and passphrase when prompted. After ACK, the device reboots with the stored identity.
 
-Alpha Sapwood and Heartwood `0.18.0-alpha.1` produce typed 19/31-word recovery sequences with
+Sapwood and Heartwood `0.18.0-beta.1` produce typed 19/31-word recovery sequences with
 an embedded recovery kind, nsec-tree version, and public fingerprint. The
 provision CLI recognises these automatically. `--mode bunker`, `--mode
 tree-nsec`, and `--mode tree-mnemonic` now apply only to explicit legacy nsec or

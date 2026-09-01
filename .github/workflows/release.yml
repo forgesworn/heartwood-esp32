@@ -97,6 +97,15 @@ jobs:
           cp "$bl" "bootloader-$BOARD.bin"
           cp "$pt" "partition-table-$BOARD.bin"
 
+          # The single 16 MB V4 bench unit predates the fleet table and has a
+          # 24 KiB NVS. Ship its byte-exact, state-preserving migration table as
+          # an additive recovery asset; it is never the fresh-flash default.
+          if [ "$BOARD" = "heltec-v4" ]; then
+            node ../scripts/partition-table.mjs compile \
+              partitions-v4-16mb-legacy-nvs-bigapp.csv \
+              partition-table-heltec-v4-legacy-nvs-bigapp.bin
+          fi
+
           appsha=$(sha256sum "app-$BOARD.bin" | cut -d' ' -f1)
           blsha=$(sha256sum "bootloader-$BOARD.bin" | cut -d' ' -f1)
           ptsha=$(sha256sum "partition-table-$BOARD.bin" | cut -d' ' -f1)
@@ -107,6 +116,14 @@ jobs:
             --argjson ota "$OTA" \
             '{($b): {app: $a, sha256: $as, bytes: $an, ota: $ota, bootloader: $bl, bootloaderSha256: $bs, partitionTable: $pt, partitionTableSha256: $ps}}' \
             > "frag-$BOARD.json"
+          if [ "$BOARD" = "heltec-v4" ]; then
+            migration="partition-table-heltec-v4-legacy-nvs-bigapp.bin"
+            migrationsha=$(sha256sum "$migration" | cut -d' ' -f1)
+            jq --arg b "$BOARD" --arg file "$migration" --arg sha "$migrationsha" \
+              '.[$b].migration.legacyNvsBigApp = {partitionTable: $file, partitionTableSha256: $sha, nvsOffset: 36864, nvsBytes: 24576, appOffset: 65536, appBytes: 4194304, configOffset: 4259840, configBytes: 16384, otadataOffset: 4276224, otadataBytes: 8192}' \
+              "frag-$BOARD.json" > "frag-$BOARD.tmp"
+            mv "frag-$BOARD.tmp" "frag-$BOARD.json"
+          fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -115,6 +132,7 @@ jobs:
             firmware/app-${{ matrix.board }}.bin
             firmware/bootloader-${{ matrix.board }}.bin
             firmware/partition-table-${{ matrix.board }}.bin
+            firmware/partition-table-${{ matrix.board }}-legacy-nvs-bigapp.bin
             firmware/frag-${{ matrix.board }}.json
 
   # ESP32-C6 (RISC-V rv32imac). The Xtensa toolchain action can't install a
@@ -372,16 +390,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          notes="Firmware ${GITHUB_REF_NAME} for every supported board. Each esp-idf board ships \`app-<board>.bin\` + \`bootloader-<board>.bin\` + \`partition-table-<board>.bin\`; the esp8266 ships a single \`app-esp8266.bin\` (flash at 0x0). Every app image carries an ed25519 release signature (\`app-<board>.bin.sig\`, also embedded in \`version.json\`) that signature-enforcing firmware verifies before installing an OTA. \`version.json\` describes them, including a per-board \`ota\` flag — heltec-v3/v4 are OTA-updatable (2 MB A/B), the T-Display/C6 are 4 MB factory (USB re-flash), the esp8266 has no OTA. Pull into Sapwood with \`npm run sync:firmware\`."
-          prerelease_args=()
+          notes="Firmware ${GITHUB_REF_NAME} for every supported board. Each esp-idf board ships \`app-<board>.bin\` + \`bootloader-<board>.bin\` + \`partition-table-<board>.bin\`; the esp8266 ships a single \`app-esp8266.bin\` (flash at 0x0). Every app image carries an ed25519 release signature (\`app-<board>.bin.sig\`, also embedded in \`version.json\`) that signature-enforcing firmware verifies before installing an OTA. \`version.json\` describes them, including a per-board \`ota\` flag — heltec-v3/v4 are OTA-updatable (2 MB A/B), the T-Display/C6 are 4 MB factory (USB re-flash), the esp8266 has no OTA. The extra \`partition-table-heltec-v4-legacy-nvs-bigapp.bin\` is only for the explicit encrypted-backup migration in \`scripts/migrate-legacy-v4.mjs\`; it preserves that one development board's 24 KiB NVS and is not a fleet table. Pull into Sapwood with \`npm run sync:firmware\`."
+          release_args=()
           case "$GITHUB_REF_NAME" in
-            *-*)
+            *-alpha.*)
               notes="$(printf '%s\n\n%s' 'UNTESTED ALPHA: use a test-only signer and retain an independent backup. The complete physical write-down, wipe, and restore matrix has not run.' "$notes")"
-              prerelease_args=(--prerelease)
+              release_args=(--prerelease)
+              ;;
+            *-beta.*)
+              notes="$(printf '%s\n\n%s' 'BETA CANDIDATE: automated and signed-build gates passed. This release remains a draft until the retained-state migration, reboot/unlock and small-value settlement gates pass on the named Heltec V4.' "$notes")"
+              release_args=(--prerelease --draft)
               ;;
           esac
           gh release create "$GITHUB_REF_NAME" \
             --title "Firmware $GITHUB_REF_NAME" \
             --notes "$notes" \
-            "${prerelease_args[@]}" \
+            "${release_args[@]}" \
             out/app-*.bin out/app-*.bin.sig out/bootloader-*.bin out/partition-table-*.bin out/version.json

@@ -73,3 +73,6 @@ after the read-only gate succeeds.
 After migration, run `scripts/vault-unlock.mjs`, verify the master and note
 counts, power-cycle and repeat the unlock, then complete a tiny-value
 mint-confirm-export-melt-spent round trip before publishing the beta draft.
+`scripts/net-mode.mjs` provides the physically confirmed, password-preserving
+switch to USB mode needed for local note housekeeping, and the matching switch
+back to WiFi relay mode afterwards.

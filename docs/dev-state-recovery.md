@@ -31,12 +31,13 @@ it, and atomically renames the ciphertext into place.
 ```sh
 node scripts/dev-state-backup.mjs \
   --port /dev/cu.usbmodem3401 \
-  --firmware-version 0.18.0-beta.1 \
+  --firmware-version 0.18.0-beta.2 \
   --out /secure/heartwood-heltec-v4-dev-state-YYYYMMDDTHHMMSSZ.tar.gz.age \
   --recipient age1LOCAL... \
   --recipient age1OFFSITE... \
   --verify-identity /secure/local-age-identity.txt \
-  --esptool /secure/tools/esptool
+  --esptool /secure/tools/esptool \
+  --leave-in-loader
 ```
 
 Copy only the encrypted `.age` file off-site. Store the second identity
@@ -60,15 +61,20 @@ never written.
 cargo +stable build --release --manifest-path ota-sign/Cargo.toml
 node scripts/migrate-legacy-v4.mjs \
   --port /dev/cu.usbmodem3401 \
-  --release-dir /secure/heartwood-v0.18.0-beta.1 \
+  --release-dir /secure/heartwood-v0.18.0-beta.2 \
   --backup /secure/heartwood-heltec-v4-dev-state-....tar.gz.age \
   --backup-identity /secure/local-age-identity.txt \
   --esptool /secure/tools/esptool \
+  --loader-session \
   --check-only
 ```
 
 Run that exact command once with `--write` in place of `--check-only` only
-after the read-only gate succeeds.
+after the read-only gate succeeds. Do not reset, unlock, power-cycle or run a
+normal esptool command between backup, check-only and write: all three phases
+share one flasher-stub session so firmware cannot rewrite NVS or boot from a
+partially updated image between operations. The final verified readback is the
+only command that hard-resets into the new firmware.
 
 After migration, run `scripts/vault-unlock.mjs`, verify the master and note
 counts, power-cycle and repeat the unlock, then complete a tiny-value

@@ -29,7 +29,7 @@ function assertHash(path, expected, what) {
 
 function writeFlash(esptool, port, offset, path) {
   run(esptool, [
-    '--chip', 'esp32s3', '--port', port, 'write-flash',
+    '--chip', 'esp32s3', '--port', port, '--before', 'no-reset', '--after', 'no-reset', 'write-flash',
     `0x${offset.toString(16)}`, path,
   ], { stdio: 'inherit' })
 }
@@ -37,7 +37,8 @@ function writeFlash(esptool, port, offset, path) {
 function usage() {
   console.error('usage: node scripts/migrate-legacy-v4.mjs --port <serial> --release-dir <dir> \\')
   console.error('  --backup <dev-state.tar.gz.age> --backup-identity <age identity> \\')
-  console.error('  [--esptool <path>] [--ota-verifier <heartwood-ota-sign>] (--check-only | --write)')
+  console.error('  [--esptool <path>] [--ota-verifier <heartwood-ota-sign>] \\')
+  console.error('  --loader-session (--check-only | --write)')
 }
 
 function main(args) {
@@ -54,11 +55,13 @@ function main(args) {
   const verifier = resolve(value(args, '--ota-verifier', join(repo, 'ota-sign/target/release/heartwood-ota-sign')))
   const checkOnly = args.includes('--check-only')
   const allowWrite = args.includes('--write')
+  const loaderSession = args.includes('--loader-session')
   if (!port || !value(args, '--release-dir') || !value(args, '--backup') || !value(args, '--backup-identity')) {
     usage()
     throw new Error('all required arguments must be supplied')
   }
   if (checkOnly === allowWrite) throw new Error('choose exactly one of --check-only or --write')
+  if (!loaderSession) throw new Error('the verified backup must leave the board in one continuous loader session; pass --loader-session')
   requireFile(join(releaseDir, 'version.json'), 'release manifest')
   requireFile(backup, 'encrypted backup')
   requireFile(identity, 'backup identity')
@@ -99,7 +102,9 @@ function main(args) {
 
   withRamWorkspace((root) => {
     const installedTable = join(root, 'installed-partition-table.bin')
-    readFlash(esptool, 'esp32s3', port, 0x8000, 0xc00, installedTable)
+    readFlash(esptool, 'esp32s3', port, 0x8000, 0xc00, installedTable, {
+      before: 'no-reset', after: 'no-reset',
+    })
     const installedLayout = parseBinary(readFileSync(installedTable))
     const alreadyMigrated = sameLayout(installedLayout, targetLayout)
     if (!alreadyMigrated && !sameLayout(installedLayout, twoSlotCsv)) {
@@ -115,34 +120,45 @@ function main(args) {
       throw new Error('installed NVS bounds do not match the backup manifest')
     }
     const currentNvs = join(root, 'current-nvs.bin')
-    readFlash(esptool, 'esp32s3', port, installedNvsEntry.offset, installedNvsEntry.size, currentNvs)
+    readFlash(esptool, 'esp32s3', port, installedNvsEntry.offset, installedNvsEntry.size, currentNvs, {
+      before: 'no-reset', after: 'no-reset',
+    })
     assertHash(currentNvs, backupNvs.sha256, 'current NVS versus encrypted backup')
 
     console.log(`Pre-write gate passed: signed ${version.version}; encrypted backup exactly matches current NVS.`)
     if (checkOnly) {
-      console.log('Check-only complete; no flash region was written or erased.')
+      console.log('Check-only complete; no flash region was written or erased. Device remains in the same loader session for --write.')
       return
     }
     writeFlash(esptool, port, 0x10000, app)
     const appReadback = join(root, basename(app))
-    readFlash(esptool, 'esp32s3', port, 0x10000, readFileSync(app).length, appReadback)
+    readFlash(esptool, 'esp32s3', port, 0x10000, readFileSync(app).length, appReadback, {
+      before: 'no-reset', after: 'no-reset',
+    })
     assertHash(appReadback, board.sha256, 'app readback')
 
     writeFlash(esptool, port, 0x0, bootloader)
     const bootloaderReadback = join(root, basename(bootloader))
-    readFlash(esptool, 'esp32s3', port, 0x0, readFileSync(bootloader).length, bootloaderReadback)
+    readFlash(esptool, 'esp32s3', port, 0x0, readFileSync(bootloader).length, bootloaderReadback, {
+      before: 'no-reset', after: 'no-reset',
+    })
     assertHash(bootloaderReadback, board.bootloaderSha256, 'bootloader readback')
 
     if (!alreadyMigrated) writeFlash(esptool, port, 0x8000, table)
     const tableReadback = join(root, 'partition-table-readback.bin')
-    readFlash(esptool, 'esp32s3', port, 0x8000, 0xc00, tableReadback)
+    readFlash(esptool, 'esp32s3', port, 0x8000, 0xc00, tableReadback, {
+      before: 'no-reset', after: 'no-reset',
+    })
     assertHash(tableReadback, migration.partitionTableSha256, 'partition table readback')
 
     run(esptool, [
-      '--chip', 'esp32s3', '--port', port, 'erase-region', '0x414000', '0x2000',
+      '--chip', 'esp32s3', '--port', port, '--before', 'no-reset', '--after', 'no-reset',
+      'erase-region', '0x414000', '0x2000',
     ], { stdio: 'inherit' })
     const otadata = join(root, 'otadata-readback.bin')
-    readFlash(esptool, 'esp32s3', port, 0x414000, 0x2000, otadata)
+    readFlash(esptool, 'esp32s3', port, 0x414000, 0x2000, otadata, {
+      before: 'no-reset', after: 'hard-reset',
+    })
     if (!readFileSync(otadata).every((byte) => byte === 0xff)) throw new Error('otadata erase readback is not blank')
 
     console.log(JSON.stringify({

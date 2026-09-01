@@ -2386,10 +2386,16 @@ pub fn show_ota_complete(display: &mut Display<'_>) {
 // Display power management
 // ---------------------------------------------------------------------------
 
-/// Turn the SSD1306 display panel off to prevent burn-in and save power.
+/// Turn the display panel off to prevent burn-in and save power.
 ///
-/// The display RAM is preserved — calling [`wake_display`] and flushing
-/// will restore the last frame without needing a full re-init.
+/// What that means differs by panel, and both are right for what they are.
+/// On the mono SSD1306 the panel-off command stops the pixels emitting — they
+/// ARE the light — so display RAM is preserved and [`wake_display`] plus a
+/// flush restores the last frame without a re-init. On the colour LCDs
+/// (`st7789.rs`, `jd9853.rs`) cutting the backlight only hides the image
+/// while the crystal goes on holding it, so those blank the framebuffer as
+/// well; waking there shows black until the caller draws, which every caller
+/// does immediately.
 pub fn sleep_display(display: &mut Display<'_>) {
     if let Err(e) = display.set_display_on(false) {
         log::warn!("OLED sleep failed: {:?}", e);

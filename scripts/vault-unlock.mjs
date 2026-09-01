@@ -6,8 +6,9 @@
 // sequence heartwoodd's auto-unlock performs — usable standalone on a bench
 // where no daemon is running. Secrets are read from files, never printed.
 //
-// The unseal runs a deliberately slow KDF per identity (~26 s for three
-// masters on a V4), so the ACK wait is generous.
+// Native USB can enumerate before the locked command loop is ready, so session
+// auth retries for up to a minute. The unseal then runs a deliberately slow KDF
+// per identity (~26 s for three masters on a V4), so its ACK wait is generous.
 //
 // Usage:
 //   node scripts/vault-unlock.mjs --port /dev/cu.usbmodemXXXX \
@@ -16,6 +17,7 @@
 
 import { argv, env } from 'node:process'
 import { readFileSync } from 'node:fs'
+import { authenticateSession } from './lib/session-auth.mjs'
 
 const { SerialPort } = await (async () => {
   const candidates = [
@@ -126,14 +128,17 @@ await new Promise((resolve, reject) => {
   port.once('error', reject)
 })
 
-console.log('SESSION_AUTH...')
-port.write(buildFrame(SESSION_AUTH, secret))
-const auth = await readFrame(port, [SESSION_ACK], 10_000)
-if (!auth) {
-  console.error('No SESSION_ACK within 10 s.')
+const authResult = await authenticateSession({
+  sendAuth: () => port.write(buildFrame(SESSION_AUTH, secret)),
+  waitForAck: (timeoutMs) => readFrame(port, [SESSION_ACK], timeoutMs),
+  onAttempt: (attempt, attempts) => console.log(`SESSION_AUTH (${attempt}/${attempts})...`),
+})
+if (!authResult) {
+  console.error('No SESSION_ACK after 6 attempts over 60 s.')
   port.close()
   process.exit(1)
 }
+const auth = authResult.reply
 const code = auth.payload[0]
 if (code !== 0x00) {
   console.error(

@@ -2,7 +2,7 @@
 
 # Heartwood ESP32
 
-> **Beta:** firmware `0.18.0-beta.1` is the first retained-state beta. Automated
+> **Beta:** firmware `0.18.0-beta.2` is the first retained-state beta. Automated
 > suites, signed board builds, the named Heltec V4 migration, reboot/unlock and
 > small-value settlement are release gates. Keep an independent recovery copy
 > and use small values while the complete destructive cross-board recovery
@@ -201,7 +201,7 @@ cd provision && cargo run -- --port /dev/cu.usbserial-*
 
 Enter mnemonic and passphrase when prompted. After ACK, the device reboots with the stored identity.
 
-Sapwood and Heartwood `0.18.0-beta.1` produce typed 19/31-word recovery sequences with
+Sapwood and Heartwood `0.18.0-beta.2` produce typed 19/31-word recovery sequences with
 an embedded recovery kind, nsec-tree version, and public fingerprint. The
 provision CLI recognises these automatically. `--mode bunker`, `--mode
 tree-nsec`, and `--mode tree-mnemonic` now apply only to explicit legacy nsec or

@@ -73,12 +73,19 @@ export function withRamWorkspace(callback) {
   }
 }
 
-export function readFlash(esptool, chip, port, offset, size, output) {
+export function readFlash(esptool, chip, port, offset, size, output, options = {}) {
+  const connection = [
+    ...(options.before ? ['--before', options.before] : []),
+    ...(options.after ? ['--after', options.after] : []),
+  ]
   run(esptool, [
-    '--chip', chip,
-    '--port', port,
+    '--chip', chip, '--port', port, ...connection,
     'read-flash', `0x${offset.toString(16)}`, `0x${size.toString(16)}`, output,
   ], { stdio: 'inherit' })
+}
+
+export function resumeFromLoader(esptool, chip, port) {
+  run(esptool, ['--chip', chip, '--port', port, '--before', 'no-reset', 'run'], { stdio: 'inherit' })
 }
 
 export function decryptBackup(backup, identity) {
@@ -119,7 +126,8 @@ function value(args, name, fallback) {
 function usage() {
   console.error('usage: node scripts/dev-state-backup.mjs --port <serial> --firmware-version <version> \\')
   console.error('  --out <backup.tar.gz.age> --recipient <age1...> --recipient <age1...> \\')
-  console.error('  --verify-identity <age identity file> [--esptool <path>] [--board heltec-v4]')
+  console.error('  --verify-identity <age identity file> [--esptool <path>] [--board heltec-v4] \\')
+  console.error('  [--leave-in-loader]')
 }
 
 function main(args) {
@@ -134,6 +142,7 @@ function main(args) {
   const esptool = value(args, '--esptool', 'esptool')
   const board = value(args, '--board', 'heltec-v4')
   const chip = value(args, '--chip', 'esp32s3')
+  const leaveInLoader = args.includes('--leave-in-loader')
   const recipients = [...new Set(values(args, '--recipient'))]
   if (!port || !firmwareVersion || !output || !identity || recipients.length !== 2) {
     usage()
@@ -148,22 +157,34 @@ function main(args) {
   if (!existsSync(dirname(finalPath))) throw new Error(`output directory does not exist: ${dirname(finalPath)}`)
   if (!existsSync(identity)) throw new Error(`verification identity does not exist: ${identity}`)
 
+  let loaderHeld = false
   try {
     withRamWorkspace((root) => {
       const tablePath = join(root, 'partition-table.bin')
-      readFlash(esptool, chip, port, 0x8000, 0xc00, tablePath)
+      readFlash(esptool, chip, port, 0x8000, 0xc00, tablePath, { after: 'no-reset' })
+      loaderHeld = true
       const layout = parseBinary(readFileSync(tablePath))
       const named = new Map(layout.map((entry) => [entry.label, entry]))
       const nvs = named.get('nvs')
       if (!nvs) throw new Error('installed partition table has no NVS partition')
 
-      const regions = [{ name: 'nvs', ...nvs }]
+      // NVS is deliberately last. Every read shares one flasher-stub session,
+      // so firmware cannot mutate NVS between the captured table/config and
+      // the NVS bytes the migration gate will compare.
+      const regions = []
       for (const optional of ['config', 'otadata']) {
         const entry = named.get(optional)
         if (entry) regions.push({ name: optional, ...entry })
       }
-      for (const region of regions) {
-        readFlash(esptool, chip, port, region.offset, region.size, join(root, `${region.name}.bin`))
+      regions.push({ name: 'nvs', ...nvs })
+      for (const [index, region] of regions.entries()) {
+        const last = index === regions.length - 1
+        const after = last && !leaveInLoader ? 'hard-reset' : 'no-reset'
+        readFlash(esptool, chip, port, region.offset, region.size, join(root, `${region.name}.bin`), {
+          before: 'no-reset',
+          after,
+        })
+        loaderHeld = after === 'no-reset'
       }
 
       const files = [
@@ -210,12 +231,20 @@ function main(args) {
         recipients: recipients.length,
         decryptVerified: true,
         archiveHashesVerified: verified.archiveHashesVerified,
+        leftInLoader: loaderHeld,
       }, null, 2))
     })
   } catch (error) {
     // The partial contains ciphertext only, but it must never be mistaken for
     // an accepted backup when decrypt/list/manifest verification did not pass.
     if (existsSync(partialPath)) rmSync(partialPath)
+    if (loaderHeld) {
+      try {
+        resumeFromLoader(esptool, chip, port)
+      } catch {
+        console.error('backup failed while the device was in its ROM loader; power-cycle it before normal use')
+      }
+    }
     throw error
   }
 }

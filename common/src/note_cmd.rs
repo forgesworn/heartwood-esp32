@@ -192,16 +192,65 @@ fn parent_ids(cmd: &Value) -> Result<Vec<String>, Value> {
     }
 }
 
+/// Longest `tag` a client may send, in bytes. Matches `lnurl-vault`'s
+/// `TAG_MAX_LEN` and the fixed buffer behind it, so one client driving either
+/// device gets the same answer to the same tag.
+pub const TAG_MAX_LEN: usize = 32;
+
 /// Dispatch one command message (already parsed from its transport frame).
 /// Always returns a response object — an unparseable or unknown command is a
 /// `bad_request` response, never silence, because the client's only timeout
 /// is the long physical-confirm one.
+///
+/// A command may carry `tag`, echoed verbatim on whatever answers it. The
+/// wire has no request ids, so without one a reply that is never coming looks
+/// exactly like a slow one, and a late reply looks exactly like the reply to
+/// the next command — which is why a client's own timeout had to be fatal, and
+/// why this firmware poisons a serial session after one (#102). A tag makes
+/// that survivable: the client keeps the stream open, retires the straggler by
+/// its tag when it turns up, and retries an idempotent command whose reply
+/// arrived torn. Same field, same limit and same refusal as `lnurl-vault`'s
+/// dispatcher, because one CLI drives both devices and a protocol that is
+/// almost the same on each is worse than one that differs openly.
 pub fn handle_note_cmd(ctx: &mut NoteCmdContext<'_>, msg: &str) -> Value {
     let cmd: Value = match serde_json::from_str(msg) {
         Ok(v) => v,
+        // No tag to echo: nothing here parsed. A client correlating replies
+        // treats a line with no tag as not being the answer to anything it
+        // tagged, which is exactly right for a line the device could not read.
         Err(_) => return err_msg("bad_request", "not a JSON object"),
     };
-    let Some(name) = str_field(&cmd, "cmd") else {
+
+    // Read before anything can answer, so even a refusal carries it: a client
+    // correlating replies needs its errors matched too. A tag that cannot be
+    // echoed as given is refused outright rather than echoed truncated or
+    // coerced, which would match nothing the client sent — and that refusal
+    // carries no tag, for the same reason.
+    let tag = match cmd.get("tag") {
+        None => None,
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= TAG_MAX_LEN => {
+            Some(value.clone())
+        }
+        Some(_) => {
+            return err_msg(
+                "bad_request",
+                "tag must be a non-empty string of at most 32 characters",
+            )
+        }
+    };
+
+    let mut response = dispatch(ctx, &cmd);
+    if let (Some(tag), Some(obj)) = (tag, response.as_object_mut()) {
+        obj.insert("tag".into(), Value::String(tag));
+    }
+    response
+}
+
+/// The command itself. Split out from [`handle_note_cmd`] so that every
+/// top-level reply — a success, an error, a listing page — leaves through one
+/// place and none can miss the tag.
+fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
+    let Some(name) = str_field(cmd, "cmd") else {
         return err_msg("bad_request", "missing cmd");
     };
 
@@ -686,6 +735,124 @@ mod tests {
             assert_eq!(res["ok"], true, "{res}");
             id
         }
+    }
+
+    // ---- the client's tag ----
+    //
+    // The wire has no request ids. Without a tag, a reply that is never
+    // coming is indistinguishable from a slow one, and a late reply from the
+    // reply to the next command, so this firmware had to poison a serial
+    // session after a timeout (#102). With one, a client keeps the stream open
+    // and retires the straggler when it turns up. Same field and same limit as
+    // lnurl-vault, because one CLI drives both.
+
+    #[test]
+    fn a_tag_comes_back_on_a_success() {
+        let mut h = Harness::new();
+        let res = h.run(r#"{"cmd":"get_info","tag":"a1"}"#);
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["tag"], "a1");
+    }
+
+    #[test]
+    fn a_tag_comes_back_on_an_error_too() {
+        // The refusals are what a client most needs matched: an untagged
+        // error is a line it cannot attribute to any command it sent.
+        let mut h = Harness::new();
+        for msg in [
+            r#"{"cmd":"nonsense","tag":"a2"}"#,
+            r#"{"cmd":"confirm","tag":"a2"}"#,
+            r#"{"cmd":"export_secret","id":"deadbeef","tag":"a2"}"#,
+        ] {
+            let res = h.run(msg);
+            assert_eq!(res["ok"], false, "{res}");
+            assert_eq!(res["tag"], "a2", "{res}");
+        }
+    }
+
+    #[test]
+    fn a_tag_comes_back_on_a_listing_page() {
+        let mut h = Harness::new();
+        for _ in 0..10 {
+            h.run(r#"{"cmd":"new_secret"}"#);
+        }
+        let res = h.run(r#"{"cmd":"list_notes","tag":"a3"}"#);
+        assert_eq!(res["tag"], "a3");
+        assert_eq!(res["next_offset"], LIST_PAGE_MAX);
+        let res = h.run(&format!(
+            r#"{{"cmd":"list_notes","offset":{LIST_PAGE_MAX},"tag":"a3"}}"#
+        ));
+        assert_eq!(res["tag"], "a3");
+    }
+
+    #[test]
+    fn a_tag_survives_the_round_trip_verbatim() {
+        // Echoed as given, not re-encoded: a client matches the bytes it sent.
+        let mut h = Harness::new();
+        for tag in [r#"a " quote"#, "spaces and 🔑", "0", "-"] {
+            let msg = serde_json::json!({"cmd": "get_info", "tag": tag}).to_string();
+            assert_eq!(h.run(&msg)["tag"], tag);
+        }
+    }
+
+    #[test]
+    fn a_tag_that_cannot_be_echoed_as_given_is_refused() {
+        // Truncating or coercing would echo something the client never sent,
+        // which is worse than refusing: it would match the wrong reply.
+        let mut h = Harness::new();
+        let at_limit = "t".repeat(TAG_MAX_LEN);
+        assert_eq!(h.run(&format!(r#"{{"cmd":"get_info","tag":"{at_limit}"}}"#))["tag"], at_limit);
+
+        let too_long = "t".repeat(TAG_MAX_LEN + 1);
+        for msg in [
+            format!(r#"{{"cmd":"get_info","tag":"{too_long}"}}"#),
+            r#"{"cmd":"get_info","tag":""}"#.to_string(),
+            r#"{"cmd":"get_info","tag":7}"#.to_string(),
+            r#"{"cmd":"get_info","tag":null}"#.to_string(),
+            r#"{"cmd":"get_info","tag":["a"]}"#.to_string(),
+        ] {
+            let res = h.run(&msg);
+            assert_eq!(res["ok"], false, "{msg} -> {res}");
+            assert_eq!(res["error"], "bad_request", "{msg} -> {res}");
+            // and the refusal carries no tag, for the same reason
+            assert!(res.get("tag").is_none(), "{msg} -> {res}");
+        }
+    }
+
+    #[test]
+    fn a_bad_tag_never_runs_the_command() {
+        // Read before anything can answer: a refused tag must not leave a
+        // note behind, or a client retrying under a good tag would make two.
+        let mut h = Harness::new();
+        let too_long = "t".repeat(TAG_MAX_LEN + 1);
+        let res = h.run(&format!(r#"{{"cmd":"new_secret","tag":"{too_long}"}}"#));
+        assert_eq!(res["error"], "bad_request", "{res}");
+        assert_eq!(h.run(r#"{"cmd":"get_info"}"#)["note_count"], 0);
+    }
+
+    #[test]
+    fn a_tag_does_not_leak_into_the_next_command() {
+        let mut h = Harness::new();
+        assert_eq!(h.run(r#"{"cmd":"get_info","tag":"a4"}"#)["tag"], "a4");
+        assert!(h.run(r#"{"cmd":"get_info"}"#).get("tag").is_none());
+    }
+
+    #[test]
+    fn an_unparseable_line_is_answered_without_one() {
+        // Nothing parsed, so there is no tag to echo - and a client treating
+        // an untagged line as the answer to nothing it sent is exactly right.
+        let mut h = Harness::new();
+        let res = h.run(r#"{"cmd":"get_info","tag":"a5""#);
+        assert_eq!(res["error"], "bad_request");
+        assert!(res.get("tag").is_none(), "{res}");
+    }
+
+    #[test]
+    fn a_client_that_sends_no_tags_sees_the_wire_as_before() {
+        let mut h = Harness::new();
+        let res = h.run(r#"{"cmd":"get_info"}"#);
+        assert_eq!(res["ok"], true);
+        assert!(res.get("tag").is_none(), "{res}");
     }
 
     #[test]

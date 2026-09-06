@@ -63,10 +63,16 @@ nip04 = ["dep:aes", "dep:cbc", "dep:base64"]
 mnemonic = ["dep:bip39"]
 # Back-compat alias: BIP-39 on the secp256k1 backend (the WiFi firmware + CI path).
 mnemonic-gen = ["mnemonic", "secp256k1-backend"]
+# LUD-25 seed-recoverable note secrets (m/139'). Reuses the BIP-32 scalar step
+# `mnemonic` already needs, and adds ONE thing to the curve backends: a
+# compressed public key. heartwood is x-only everywhere else and its own tree
+# is hardened at every level, so no other path has ever needed the parity byte
+# - LUD-25's does, because d1..d4 are raw uint32 and about half land unhardened.
+cash = ["mnemonic"]
 # OTA release signatures: sign (CI tool) + verify (device) share one module so
 # the message format can never drift between signer and verifier.
 ota-sign = ["dep:ed25519-compact"]
 # PIN-derived seed encryption at rest (P5). Pulls PBKDF2 + reuses chacha20.
 seed-encrypt = ["dep:pbkdf2", "dep:chacha20"]
 # Convenience alias for secp256k1 backend with full feature set (used by firmware)
-firmware = ["secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen", "ota-sign", "seed-encrypt"]
+firmware = ["secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen", "ota-sign", "seed-encrypt", "cash"]

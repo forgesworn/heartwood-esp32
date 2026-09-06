@@ -40,6 +40,25 @@ import sys
 # Known-safe hex constants (test vectors, mathematical constants, frozen
 # pubkeys). These are public by definition.
 ALLOW_HEX = {
+    # BIP-32 published test vector 1 (the spec's own chain, seed 000102..0f).
+    # Walked in common/src/cash.rs to prove the UNHARDENED step, which no other
+    # path in this firmware exercises.
+    "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35",  # m key
+    "873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508",  # m chain code
+    "edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea",  # m/0' key
+    "47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141",  # m/0' chain code
+    "3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368",  # m/0'/1 key
+    "2a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c19",  # m/0'/1 chain code
+    "cbce0d719ecf7431d88e6a89fa1483e02e35092af60c042b1df2ff59fa424dca",  # m/0'/1/2' key
+    # lnurlcash-conformance 0.7.0 vectors/cash-derivation.json -- the LUD-25
+    # note secrets a wallet derives from two published BIP-39 phrases. Public
+    # by construction: the whole point is that every implementation gets these
+    # same bytes, and the seeds they come from are in the vector file too.
+    "1f2b8080d4c9431b1dec780abb4eee3c4aaf7ff03f7dd126a7e005ec7af372e0",
+    "267570df5ba8098d728e839a698f729c2df6fa7b8b7ae7c9c7ffa7dda3417e1d",
+    "d5376fa38f01b39d55be6dc0ea8f3aa6b91f37c183c5a394bb7e30b624855a78",
+    "d7bcc5c9e7015ca2688ed10e24db3f82163d5b59fc887e5dd346abf2426b1270",
+    "de5b81405a12e1297b350d80e2ad85043ed5b9436a0c5592d3302778de330499",
     # secp256k1 generator point G.x -- mathematical constant
     "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
     # Frozen mnemonic derivation test pubkey -- asserted against in provision/

@@ -6,11 +6,36 @@
 #
 # IMPORTANT: Console must NOT be routed to USB-Serial-JTAG. The VFS console
 # driver and UsbSerialDriver both write to the same hardware TX FIFO and
-# their bytes interleave, corrupting frame data. The ESP-IDF default for S3
-# is UART0 (GPIO43/44), which is not connected to USB-C on the V4 -- log
-# output simply goes nowhere, keeping the USB-Serial-JTAG channel clean for
-# frame data. This is the correct behaviour for a device that uses the USB
-# link exclusively for a binary protocol.
+# their bytes interleave, corrupting frame data.
+#
+# Relying on the ESP-IDF default was not enough, and this comment used to say
+# it was. The PRIMARY console does default to UART0 (GPIO43/44), which is not
+# connected to USB-C on the V4, so those bytes do go nowhere. But IDF also
+# enables a SECONDARY console on S3, and that one is USB-Serial-JTAG:
+#
+#   CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+#   CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y   <-- interleaves
+#
+# Caught on the bench 2026-09-06: a malformed frame drew a coloured, timestamped
+# `W (67716) heartwood_esp32::protocol: try_read_frame ...` back down the same
+# port the frame protocol uses. The noisiest moment is a protocol error, which
+# is exactly when a client is retrying.
+#
+# So silence the console entirely, as heltec-v3, tdisplay and c6 already do,
+# and for the reason the V3 file states plainly: log lines interleaved with
+# binary frames force every reader to hunt for magic bytes and corrupt OTA
+# transfers outright. The firmware still calls log::info!/warn!/error!; the
+# backend drops the output. Bring logs back on a dev build by flipping this to
+# CONFIG_ESP_CONSOLE_UART_DEFAULT=y and wiring a UART probe to unused GPIOs --
+# never to USB-Serial-JTAG, which is the frame channel.
+CONFIG_ESP_CONSOLE_NONE=y
+# BOTH are needed, and this is the trap: CONFIG_ESP_CONSOLE_NONE only silences
+# the PRIMARY console. Verified against the generated sdkconfig -- with NONE
+# alone, CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG stays =y and the log
+# bytes still reach GPIO19/20, which on this board is the USB-C port carrying
+# the frame protocol. heltec-v3 and the others get away with NONE by itself
+# only because their native USB pins are not wired to anything.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 #
 # Flash -- Heltec V4 typically ships with 16MB external flash (ESP32-S3R2),
 # but 8MB is a safe floor and matches the partition table. Leaving the flash

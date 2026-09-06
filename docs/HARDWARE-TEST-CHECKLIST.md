@@ -1023,7 +1023,29 @@ USB tier, unlocked, no at-rest:
    `{"cmd":"get_info","tag":""}` is refused `bad_request` and that refusal
    carries no tag. The point of the check on real hardware rather than in the
    native suite: the tag has to survive the framing, which is where a lost or
-   torn reply happens in the first place. NOT YET BENCH-RUN.
+   torn reply happens in the first place. **PASSED 2026-09-06** (Heltec V4,
+   USB mode): `bench-zulu` echoed verbatim; no tag leaves the reply with no
+   `tag` field; empty and 33-byte tags both refused `bad_request` with no tag
+   on the refusal; and the tag is echoed on error replies too (a card that
+   timed out came back carrying its tag). The straggler case turned up for
+   real in passing: a client with no tag filtering picked up the previous
+   request's late reply, which is precisely what the field prevents.
+
+1c. LUD-25 seed-recoverable note secrets, end to end. **PASSED 2026-09-06**
+   (Heltec V4, USB mode, after the `Storage` delegation fix in #109 — before
+   it, `provision_cash_node` failed `storage_full` on a board with 156 free
+   NVS entries, because the write never reached NVS at all):
+   `provision_cash_node` with `lnurlcash-conformance` 0.7.0's own domain node
+   for `mint.example` raised a held-button card and persisted;
+   `new_secret --host mint.example` derived index 0 to
+   `h=7db9da2845cd45c1c3c2e302d6135da46823e245f756b830ef59ac324b769e02`,
+   byte-identical to that vector's published value, from 64 bytes the device
+   treats as opaque; the counter advanced 0 to 1 and survived a reboot; and a
+   refusal raised before an index is taken (`admit_creation`, locker at
+   `MAX_NOTES`) burnt no index.
+
+   Not covered: index 1 against its own vector, because the locker is at
+   `MAX_NOTES` — see the capacity note at the end of this section.
 2. `export_secret` raises a card headed `RELEASE NOTE` whose title is the
    money — `<amount> @ <host>`, the action having moved into the header so
    both title lines are available to the amount and the mint — hold
@@ -1127,6 +1149,19 @@ scripts/nip46-client.mjs conventions):
 Regression watch: a USB `sign_event` approval and a factory reset must behave
 exactly as before; FIRMWARE_INFO's nvs entry stats now include the
 `hw_notes` namespace's usage.
+
+### Locker capacity, measured 2026-09-06
+
+The bench V4 sits AT `MAX_NOTES` (16). Fifteen of those slots held SPENT
+records — `mint.forgesworn.dev` (sunset 27 Aug) and `moneyer.dev` — against a
+single live CONFIRMED note of 994,000 msat. `admit_creation` then refuses every
+new mint with `storage_full`, which is correct behaviour but means the device
+had been one note away from refusing all along, in ordinary use, with nothing
+saying so.
+
+This is issue #96 (spent records prunable only over a cable, and not at all in
+WiFi mode) biting in practice rather than in principle. Freeing a slot costs one
+held-button `delete` card per record, which is a poor answer for fifteen of them.
 
 ## 14. Bearer notes over Nostr (added 2026-08-21; NOT YET BENCH-RUN)
 

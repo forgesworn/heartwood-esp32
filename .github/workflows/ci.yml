@@ -85,14 +85,19 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      # Pass 1 — secp256k1 backend (the firmware's curve) + BIP-39 mnemonic/derive.
-      - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen
+      # Pass 1 — secp256k1 backend (the firmware's curve) + BIP-39 mnemonic/derive,
+      # and LUD-25's note derivation on that same curve. `cash` has to run under
+      # BOTH backends: it is the only path here with an unhardened level, so it
+      # is the only one that touches a compressed public key, and the two
+      # backends compute that separately. A secret that differs between them is
+      # a note one build of this firmware can spend and the other cannot.
+      - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen,cash
       # Pass 2 — k256 backend with the full data-plane crypto. Without this the
       # nip44/nip46/nip04/backup modules stay feature-gated OFF, so their tests
       # (the official NIP-44 vectors, NIP-04 round-trips, the synthetic nonce)
       # never run anywhere in CI. ota-sign covers the OTA release-signature
       # scheme (the on-device verifier and the CI signer share this module).
-      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,seed-encrypt
+      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,seed-encrypt,cash
 
   # Supply-chain gate over the host-buildable crates: RUSTSEC advisories,
   # licence allow-list and source registries, enforced against the shared

@@ -65,6 +65,12 @@ pub mod note_fmt;
 #[cfg(feature = "mnemonic")]
 pub mod mnemonic;
 
+/// LUD-25 seed-recoverable note secrets. See the module docs for why this is a
+/// separate tree from `derive`'s: different purpose, different shape, and the
+/// only path on this device with an unhardened level in it.
+#[cfg(feature = "cash")]
+pub mod cash;
+
 #[cfg(feature = "ota-sign")]
 pub mod ota_sign;
 

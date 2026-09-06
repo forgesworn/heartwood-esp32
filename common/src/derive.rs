@@ -45,12 +45,31 @@ pub(crate) mod backend {
         Ok(sk.verifying_key().to_bytes().into())
     }
 
+    /// `serP(point(k))` — the 33-byte compressed public key BIP-32 hashes over
+    /// on an UNHARDENED child step. Nothing else in this firmware needs a
+    /// compressed key: Nostr is x-only throughout, and heartwood's own tree is
+    /// hardened at every level. LUD-25's note path is not (see `cash`), so this
+    /// is the one place the parity byte matters.
+    #[cfg(feature = "cash")]
+    pub fn compressed_pubkey(secret: &[u8; 32]) -> Result<[u8; 33], &'static str> {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        let sk = k256::SecretKey::from_slice(secret).map_err(|_| "invalid secret key")?;
+        let encoded = sk.public_key().to_encoded_point(true);
+        let bytes = encoded.as_bytes();
+        if bytes.len() != 33 {
+            return Err("compressed public key was not 33 bytes");
+        }
+        let mut out = [0u8; 33];
+        out.copy_from_slice(bytes);
+        Ok(out)
+    }
+
     /// BIP-32 hardened-child scalar step: `(tweak + key) mod n`, used by
     /// `mnemonic::derive_root_secret`. Errors if `tweak` (I_L) is ≥ the curve
     /// order or the sum is zero — both invalid per BIP-32. The backend-agnostic
     /// counterpart of the secp256k1 version, so the mnemonic path derives the
     /// same key on whichever curve backend is active.
-    #[cfg(feature = "mnemonic")]
+    #[cfg(any(feature = "mnemonic", feature = "cash"))]
     pub fn tweak_add(key: &[u8; 32], tweak: &[u8; 32]) -> Result<[u8; 32], &'static str> {
         use k256::elliptic_curve::ff::PrimeField;
         let parse = |b: &[u8; 32]| -> Option<k256::Scalar> {
@@ -80,9 +99,18 @@ pub(crate) mod backend {
         Ok(xonly.serialize())
     }
 
+    /// `serP(point(k))` — see the k256 backend's `compressed_pubkey`.
+    #[cfg(feature = "cash")]
+    pub fn compressed_pubkey(secret: &[u8; 32]) -> Result<[u8; 33], &'static str> {
+        use secp256k1::{PublicKey, SecretKey};
+        let secp = Secp256k1::signing_only();
+        let sk = SecretKey::from_slice(secret).map_err(|_| "invalid secret key")?;
+        Ok(PublicKey::from_secret_key(&secp, &sk).serialize())
+    }
+
     /// BIP-32 hardened-child scalar step: `(tweak + key) mod n` via secp256k1's
     /// scalar arithmetic. See the k256 backend's `tweak_add` for the contract.
-    #[cfg(feature = "mnemonic")]
+    #[cfg(any(feature = "mnemonic", feature = "cash"))]
     pub fn tweak_add(key: &[u8; 32], tweak: &[u8; 32]) -> Result<[u8; 32], &'static str> {
         use secp256k1::{Scalar, SecretKey};
         let parent = SecretKey::from_slice(key).map_err(|_| "BIP-32 parent key out of range")?;

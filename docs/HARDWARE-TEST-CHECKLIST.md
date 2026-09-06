@@ -1044,8 +1044,12 @@ USB tier, unlocked, no at-rest:
    refusal raised before an index is taken (`admit_creation`, locker at
    `MAX_NOTES`) burnt no index.
 
-   Not covered: index 1 against its own vector, because the locker is at
-   `MAX_NOTES` — see the capacity note at the end of this section.
+   Index 1 followed on the same board once `MAX_SPENT` and the mint-path
+   eviction landed: `h=99b98cb845940e0d6401e176aaca1446365aa315201803861e17f3c530ed1dcf`,
+   again byte-identical to the published vector, with the ladder at
+   `next_index: 2`. The mint that produced it is itself the proof of the
+   eviction fix — the locker was at `MAX_NOTES` and the same call had returned
+   `storage_full` minutes earlier.
 2. `export_secret` raises a card headed `RELEASE NOTE` whose title is the
    money — `<amount> @ <host>`, the action having moved into the header so
    both title lines are available to the amount and the mint — hold
@@ -1159,9 +1163,18 @@ new mint with `storage_full`, which is correct behaviour but means the device
 had been one note away from refusing all along, in ordinary use, with nothing
 saying so.
 
-This is issue #96 (spent records prunable only over a cable, and not at all in
-WiFi mode) biting in practice rather than in principle. Freeing a slot costs one
+This was issue #96 (spent records prunable only over a cable, and not at all in
+WiFi mode) biting in practice rather than in principle. Freeing a slot cost one
 held-button `delete` card per record, which is a poor answer for fifteen of them.
+
+**Addressed the same day.** `MAX_SPENT` caps spent records at the spend
+transition, and `evict_spent_for_room` now runs on the mint paths as well as
+`receive` — the asymmetry was that a full locker accepted a note someone sent
+it and refused to mint one of its own. Verified on this board: a mint that had
+returned `storage_full` succeeded, `note_count` held at `MAX_NOTES`, and a
+spent record gave way. The backlog drains one slot per mint rather than all at
+once, which is deliberate: nothing removes a record the owner has not caused a
+state change to.
 
 ## 14. Bearer notes over Nostr (added 2026-08-21; NOT YET BENCH-RUN)
 

@@ -71,6 +71,11 @@ pub mod mnemonic;
 #[cfg(feature = "cash")]
 pub mod cash;
 
+/// Which mints this device can derive notes for, and how far up each ladder
+/// it has walked. The state behind [`cash`]'s arithmetic.
+#[cfg(feature = "cash")]
+pub mod cash_store;
+
 #[cfg(feature = "ota-sign")]
 pub mod ota_sign;
 

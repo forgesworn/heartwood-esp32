@@ -273,6 +273,16 @@ impl NoteStorage for NullStorage {
     fn delete_note(&mut self, _id: &str) -> Result<(), StorageError> {
         Err(StorageError)
     }
+    // Spelled out rather than left to the trait defaults. They happen to say
+    // nearly the same thing, but "this storage cannot keep a counter" is the
+    // whole reason a derived secret must not be minted here, and a reader
+    // should not have to go and check the trait to learn it.
+    fn load_cash(&mut self) -> Result<Option<alloc_vec::Vec<u8>>, StorageError> {
+        Err(StorageError)
+    }
+    fn save_cash(&mut self, _blob: &[u8]) -> Result<(), StorageError> {
+        Err(StorageError)
+    }
 }
 
 /// Concrete storage so `storage_state()` can inspect the runtime failure
@@ -317,6 +327,27 @@ impl NoteStorage for Storage {
         match self {
             Storage::Nvs(s) => s.save_trust(blob),
             Storage::Null(s) => s.save_trust(blob),
+        }
+    }
+    // EVERY NoteStorage method has to be delegated here. These two were not,
+    // and the trait's defaults answered instead: save_cash returned
+    // Err(StorageError) for every write, load_cash returned Ok(None) for
+    // every read. On the bench that surfaced as provision_cash_node failing
+    // with `storage_full` on a board with 156 free NVS entries -- the write
+    // never reached NVS at all -- and it would also have meant an empty
+    // registry at every boot even if it had. Native tests cannot catch it:
+    // they drive the store through MemStorage, which implements the methods
+    // directly and never passes through this enum.
+    fn load_cash(&mut self) -> Result<Option<alloc_vec::Vec<u8>>, StorageError> {
+        match self {
+            Storage::Nvs(s) => s.load_cash(),
+            Storage::Null(s) => s.load_cash(),
+        }
+    }
+    fn save_cash(&mut self, blob: &[u8]) -> Result<(), StorageError> {
+        match self {
+            Storage::Nvs(s) => s.save_cash(blob),
+            Storage::Null(s) => s.save_cash(blob),
         }
     }
 }

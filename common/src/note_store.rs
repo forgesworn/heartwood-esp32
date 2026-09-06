@@ -58,6 +58,19 @@ pub const MAX_PARENTS: usize = 16;
 /// zap-paying mint is the owner's choice, and four is an evening of zaps.
 pub const MAX_RECEIVED: usize = 4;
 
+/// How many SPENT records the locker keeps. A spent note is a record, not
+/// money: its secret is burned at the mint and the wallet that spent it holds
+/// the history. Keeping a few is useful — a repeated `mark_spent` or a
+/// re-import of the same secret is recognised rather than treated as new — and
+/// keeping many is how a sixteen-note locker ends up holding nothing.
+///
+/// Measured on the bench 2026-09-06: a board sat at `MAX_NOTES` with FIFTEEN
+/// spent records against one live note, and every new mint was refused
+/// `storage_full`. Nothing had said so, and the only way to tidy was a
+/// held-button `delete` card per record. Capping here means that state cannot
+/// be reached, which is worth more than any way of getting out of it.
+pub const MAX_SPENT: usize = 4;
+
 const NOTE_MAGIC: [u8; 4] = *b"HWNB";
 /// v2 appends the Nostr peer. v1 blobs decode with `peer: None`.
 const NOTE_VERSION: u8 = 2;
@@ -547,12 +560,19 @@ impl NoteStore {
     /// hard way: sixteen spent notes filled the locker and every zap after
     /// that was deferred "until there is room" that never came, because
     /// deleting is a cable-only operation.
-    fn evict_spent_for_room(&mut self, storage: &mut dyn NoteStorage) -> Result<(), NoteError> {
-        if self.admit_creation(1).is_ok() {
-            return Ok(());
+    /// `needed` is how many slots the caller is about to use, so a split
+    /// asking for two does not stop at one: the check is room for the WHOLE
+    /// request, not for a first note that would then strand its second.
+    fn evict_spent_for_room(
+        &mut self,
+        storage: &mut dyn NoteStorage,
+        needed: usize,
+    ) -> Result<(), NoteError> {
+        while self.admit_creation(needed).is_err() {
+            let idx = self.oldest_spent().ok_or(NoteError::StorageFull)?;
+            self.persist_remove(storage, idx)?;
         }
-        let idx = self.oldest_spent().ok_or(NoteError::StorageFull)?;
-        self.persist_remove(storage, idx)
+        Ok(())
     }
 
     /// Received notes a wallet has not yet rotated and marked spent.
@@ -645,6 +665,12 @@ impl NoteStore {
         label: &str,
         now: u32,
     ) -> Result<(String, String), NoteError> {
+        // Same courtesy the receive path has always had: a locker full of
+        // spent records is full of nothing, and refusing to MINT while
+        // happily accepting a note someone sends you is the same device
+        // giving two answers depending on which way the value arrives.
+        // Measured on the bench 2026-09-06 — see MAX_SPENT.
+        self.evict_spent_for_room(storage, 1)?;
         self.admit_creation(1)?;
         #[cfg(feature = "cash")]
         let drawn = match cash {
@@ -679,6 +705,10 @@ impl NoteStore {
         label: &str,
         now: u32,
     ) -> Result<(String, String, String, String), NoteError> {
+        // Two slots, and asking for both at once matters: making room for
+        // one and then failing on the second would leave a spent record
+        // destroyed for nothing. See new_secret.
+        self.evict_spent_for_room(storage, 2)?;
         self.admit_creation(2)?;
         // Both indices come off the ladder under ONE counter write. Two
         // separate writes would leave a cut between them holding a counter
@@ -854,7 +884,7 @@ impl NoteStore {
         if !self.has_room_for_received(trusted) {
             return Err(NoteError::StorageFull);
         }
-        self.evict_spent_for_room(storage)?;
+        self.evict_spent_for_room(storage, 1)?;
         self.admit_creation(1)?;
         let id = self.fresh_id(rng, None).ok_or(NoteError::StorageFull)?;
         let note = Note {
@@ -928,7 +958,38 @@ impl NoteStore {
         let mut updated = self.notes[idx].clone();
         updated.state = NoteState::Spent;
         updated.updated_at = now;
-        self.persist_rewrite(storage, idx, updated)
+        self.persist_rewrite(storage, idx, updated)?;
+        // Trim AFTER the rewrite, never before: the note has to actually be
+        // spent before it can be counted as one, and a cut between the two
+        // leaves a spent record that the next spend trims instead. Failing to
+        // trim is not worth failing the spend over — the value moved either
+        // way, and `evict_spent_for_room` is still behind this.
+        let _ = self.trim_spent(storage);
+        Ok(())
+    }
+
+    /// Drop spent records beyond [`MAX_SPENT`], oldest first.
+    ///
+    /// Deliberately not an error path for its caller. Nothing here is money:
+    /// every record it removes names a secret already burned at the mint. If
+    /// storage refuses a removal the locker is simply still carrying it, which
+    /// is the situation this exists to improve rather than to guarantee.
+    fn trim_spent(&mut self, storage: &mut dyn NoteStorage) -> Result<(), NoteError> {
+        loop {
+            let spent = self
+                .notes
+                .iter()
+                .filter(|n| n.state == NoteState::Spent)
+                .count();
+            if spent <= MAX_SPENT {
+                return Ok(());
+            }
+            let idx = match self.oldest_spent() {
+                Some(idx) => idx,
+                None => return Ok(()),
+            };
+            self.persist_remove(storage, idx)?;
+        }
     }
 
     /// Relabel a note in any state. Blob-only rewrite.
@@ -1318,37 +1379,106 @@ mod tests {
     }
 
     #[test]
-    fn a_full_locker_of_spent_notes_makes_room_for_a_received_one() {
+    fn spending_never_leaves_more_than_the_spent_cap() {
+        // The situation this cap exists to prevent, driven the way it
+        // actually happened: mint, confirm, spend, over and over. Before the
+        // cap this ended with MAX_NOTES spent records and a locker that
+        // refused everything; a real board was found in exactly that state.
         let mut storage = FakeStorage::new();
         let mut rng = test_rng();
         let mut store = fresh_store(&mut storage);
-        let alice = [0xa1u8; 32];
-        // Fill the locker with minted-then-spent notes, oldest first.
+        let mut spent_ids = alloc::vec::Vec::new();
         for i in 0..MAX_NOTES {
             let (id, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 10 + i as u32).unwrap();
             store.confirm(&mut storage, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
             store.mark_spent(&mut storage, &id, 30 + i as u32).unwrap();
+            spent_ids.push(id);
+        }
+        let held = store.list(0, MAX_NOTES).notes;
+        assert_eq!(held.len(), MAX_SPENT, "the cap bounds what a spend can leave behind");
+        assert!(held.iter().all(|n| n.state == NoteState::Spent));
+        // and it is the OLDEST that went: the survivors are the last four.
+        for old in &spent_ids[..MAX_NOTES - MAX_SPENT] {
+            assert!(store.get_meta(old).is_none(), "{old} should have been trimmed");
+        }
+        for recent in &spent_ids[MAX_NOTES - MAX_SPENT..] {
+            assert!(store.get_meta(recent).is_some(), "{recent} should have survived");
+        }
+        // The locker is now mostly empty, which is the whole point: there is
+        // room to mint again without anyone holding a button.
+        assert!(store.new_secret(&mut storage, &mut rng, None, &[], "", 99).is_ok());
+    }
+
+    #[test]
+    fn minting_evicts_a_spent_record_just_as_receiving_does() {
+        // The asymmetry found on the bench: evict_spent_for_room was called
+        // from receive() only, so a locker full of dead records accepted a
+        // note someone sent it and refused to mint one of its own. Same
+        // device, same full locker, two answers depending on which way the
+        // value was arriving.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        // Fill it with spent records, bypassing mark_spent's own trim so the
+        // pre-cap state can still be constructed.
+        for i in 0..MAX_NOTES {
+            let (id, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 10 + i as u32).unwrap();
+            store.confirm(&mut storage, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
+            let idx = store.find(&id).unwrap();
+            let mut updated = store.notes[idx].clone();
+            updated.state = NoteState::Spent;
+            updated.updated_at = 30 + i as u32;
+            store.persist_rewrite(&mut storage, idx, updated).unwrap();
         }
         assert_eq!(store.counts().0, MAX_NOTES);
         let oldest = store.list(0, 1).notes[0].id.clone();
-        assert!(store.has_room_for_received(true), "a spent record is room");
-        let (id, created) = store
-            .receive(&mut storage, &mut rng, &[0x55; SECRET_LEN], "m.example", 7_000, &alice, 99, true)
-            .unwrap();
-        assert!(created);
+
+        let (fresh, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 99).unwrap();
+
         assert_eq!(store.counts().0, MAX_NOTES, "one in, one out");
         assert!(store.get_meta(&oldest).is_none(), "the oldest spent record gave way");
-        assert_eq!(store.get_meta(&id).unwrap().state, NoteState::Confirmed);
-        // A locker full of LIVE notes still refuses: only spent records give way.
-        let mut storage2 = FakeStorage::new();
-        let mut store2 = fresh_store(&mut storage2);
+        assert!(store.get_meta(&fresh).is_some());
+    }
+
+    #[test]
+    fn a_split_makes_room_for_both_of_its_outputs() {
+        // Making room for one and then failing on the second would destroy a
+        // spent record for nothing, so the ask is for the whole request.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
         for i in 0..MAX_NOTES {
-            let (id, _) = store2.new_secret(&mut storage2, &mut rng, None, &[], "", 10 + i as u32).unwrap();
-            store2.confirm(&mut storage2, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
+            let (id, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 10 + i as u32).unwrap();
+            store.confirm(&mut storage, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
+            let idx = store.find(&id).unwrap();
+            let mut updated = store.notes[idx].clone();
+            updated.state = NoteState::Spent;
+            updated.updated_at = 30 + i as u32;
+            store.persist_rewrite(&mut storage, idx, updated).unwrap();
         }
-        assert!(!store2.has_room_for_received(true));
+        let (a, _, b, _) = store.new_secret_pair(&mut storage, &mut rng, None, &[], "", 99).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(store.counts().0, MAX_NOTES, "two in, two out");
+    }
+
+    #[test]
+    fn a_locker_full_of_live_notes_still_refuses() {
+        // Only spent records give way. Nothing here may evict money.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let alice = [0xa1u8; 32];
+        for i in 0..MAX_NOTES {
+            let (id, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 10 + i as u32).unwrap();
+            store.confirm(&mut storage, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
+        }
+        assert!(!store.has_room_for_received(true));
         assert_eq!(
-            store2.receive(&mut storage2, &mut rng, &[0x56; SECRET_LEN], "m.example", 1, &alice, 1, true),
+            store.receive(&mut storage, &mut rng, &[0x56; SECRET_LEN], "m.example", 1, &alice, 1, true),
+            Err(NoteError::StorageFull)
+        );
+        assert_eq!(
+            store.new_secret(&mut storage, &mut rng, None, &[], "", 99),
             Err(NoteError::StorageFull)
         );
     }

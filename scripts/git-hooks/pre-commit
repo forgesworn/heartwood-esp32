@@ -56,10 +56,12 @@ ALLOW_HEX = {
     # are computed from, so the test helpers in cash_store.rs repeat it.
     "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1",
     "9a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4",
-    # sha256 of cash-derivation.json's index-0 secret for mint.example: the
-    # note id a device derives from that published vector, quoted in the
-    # hardware checklist as the value the 2026-09-06 bench run matched.
+    # sha256 of cash-derivation.json's index-0 and index-1 secrets for
+    # mint.example: the note ids a device derives from those published
+    # vectors, quoted in the hardware checklist as the values the 2026-09-06
+    # bench run matched.
     "7db9da2845cd45c1c3c2e302d6135da46823e245f756b830ef59ac324b769e02",
+    "99b98cb845940e0d6401e176aaca1446365aa315201803861e17f3c530ed1dcf",
     # lnurlcash-conformance 0.7.0 vectors/cash-derivation.json -- the LUD-25
     # note secrets a wallet derives from two published BIP-39 phrases. Public
     # by construction: the whole point is that every implementation gets these

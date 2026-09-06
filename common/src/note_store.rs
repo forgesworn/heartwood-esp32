@@ -230,6 +230,35 @@ pub trait NoteStorage {
     fn save_trust(&mut self, _blob: &[u8]) -> Result<(), StorageError> {
         Err(StorageError)
     }
+
+    /// The cash registry (`cash_store::CashRegistry::encode`): which mints
+    /// this device can derive note secrets for, and how far up each ladder it
+    /// has walked.
+    ///
+    /// Defaulted to "nothing stored / cannot store" so a storage that predates
+    /// derived secrets keeps working unchanged: `new_secret` without a host
+    /// behaves exactly as it always did, and one WITH a host refuses rather
+    /// than deriving against a counter it cannot persist. That refusal is the
+    /// point - a counter that does not survive a reboot re-issues secrets.
+    fn load_cash(&mut self) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
+    }
+
+    fn save_cash(&mut self, _blob: &[u8]) -> Result<(), StorageError> {
+        Err(StorageError)
+    }
+}
+
+/// Ask for seed-recoverable secrets instead of random ones: the mint to derive
+/// for, and the registry holding its subtree and counter.
+///
+/// `None` at a call site is the old behaviour exactly — a client that never
+/// learned about this keeps getting random secrets, which are still perfectly
+/// good notes and simply cannot be found from the seed alone.
+#[cfg(feature = "cash")]
+pub struct CashDraw<'a> {
+    pub registry: &'a mut crate::cash_store::CashRegistry,
+    pub host: &'a str,
 }
 
 // ---- codec ----
@@ -553,20 +582,85 @@ impl NoteStore {
         }
     }
 
+    /// Take `count` indices off a mint's ladder and PERSIST THE COUNTER before
+    /// returning the secrets derived at them.
+    ///
+    /// The order is the whole of this function. A counter written after the
+    /// secret is used would, on a cut in between, come back one index low, and
+    /// the next mint at that index would hand out a secret the SERVICE has
+    /// already issued a note against — two notes answering to one `k1`, which
+    /// is the one failure a locker must not have. Written first, the same cut
+    /// costs a burnt index: nothing is minted at it, and a restore scan walks
+    /// past the gap exactly as it walks past a note that was spent.
+    ///
+    /// So: indices out, counter down, secrets back. Never any other order.
+    #[cfg(feature = "cash")]
+    fn take_derived(
+        storage: &mut dyn NoteStorage,
+        cash: &mut CashDraw<'_>,
+        count: usize,
+    ) -> Result<Vec<[u8; SECRET_LEN]>, NoteError> {
+        let mint_node = cash
+            .registry
+            .get(cash.host)
+            .ok_or(NoteError::BadRequest)?
+            .node
+            .clone();
+        let mut indices = Vec::with_capacity(count);
+        for _ in 0..count {
+            indices.push(
+                cash.registry
+                    .take_index(cash.host)
+                    .map_err(|_| NoteError::BadRequest)?,
+            );
+        }
+        // Before a single derived byte exists.
+        storage
+            .save_cash(&cash.registry.encode())
+            .map_err(|_| NoteError::StorageFull)?;
+
+        let mut out = Vec::with_capacity(count);
+        for index in indices {
+            let secret =
+                crate::cash::cash_secret_at(&mint_node, index).map_err(|_| NoteError::BadRequest)?;
+            out.push(*secret);
+        }
+        Ok(out)
+    }
+
     /// Generate one fresh secret (rotate/merge replacement). Persists the
     /// PENDING note — blob first, then index — and only then returns
     /// `(id, h)`. The hash crossing this function's boundary is the
     /// disclosure the persist-before-disclose invariant is about.
+    ///
+    /// With `cash`, the secret comes off this mint's LUD-25 ladder instead of
+    /// the RNG, so a seed phrase can find it again. See `take_derived` for why
+    /// the counter is written before the secret exists.
     pub fn new_secret(
         &mut self,
         storage: &mut dyn NoteStorage,
         rng: &mut dyn FnMut(&mut [u8]),
+        #[cfg(feature = "cash")] cash: Option<&mut CashDraw<'_>>,
         parent_ids: &[String],
         label: &str,
         now: u32,
     ) -> Result<(String, String), NoteError> {
         self.admit_creation(1)?;
-        let note = self.build_pending(storage, rng, parent_ids, label, now)?;
+        #[cfg(feature = "cash")]
+        let drawn = match cash {
+            Some(c) => Some(Self::take_derived(storage, c, 1)?),
+            None => None,
+        };
+        #[cfg(not(feature = "cash"))]
+        let drawn: Option<Vec<[u8; SECRET_LEN]>> = None;
+        let note = self.build_pending(
+            storage,
+            rng,
+            drawn.as_ref().map(|d| &d[0]),
+            parent_ids,
+            label,
+            now,
+        )?;
         let (id, h) = (note.id.clone(), secret_hash_hex(&note.secret));
         self.persist_new(storage, alloc::vec![note])?;
         Ok((id, h))
@@ -580,15 +674,40 @@ impl NoteStore {
         &mut self,
         storage: &mut dyn NoteStorage,
         rng: &mut dyn FnMut(&mut [u8]),
+        #[cfg(feature = "cash")] cash: Option<&mut CashDraw<'_>>,
         parent_ids: &[String],
         label: &str,
         now: u32,
     ) -> Result<(String, String, String, String), NoteError> {
         self.admit_creation(2)?;
-        let first = self.build_pending(storage, rng, parent_ids, label, now)?;
+        // Both indices come off the ladder under ONE counter write. Two
+        // separate writes would leave a cut between them holding a counter
+        // that covers the first secret and not the second.
+        #[cfg(feature = "cash")]
+        let drawn = match cash {
+            Some(c) => Some(Self::take_derived(storage, c, 2)?),
+            None => None,
+        };
+        #[cfg(not(feature = "cash"))]
+        let drawn: Option<Vec<[u8; SECRET_LEN]>> = None;
+        let first = self.build_pending(
+            storage,
+            rng,
+            drawn.as_ref().map(|d| &d[0]),
+            parent_ids,
+            label,
+            now,
+        )?;
         // The second draw must not collide with the first, which is not yet
         // in `self.notes` — check explicitly.
-        let mut second = self.build_pending(storage, rng, parent_ids, label, now)?;
+        let mut second = self.build_pending(
+            storage,
+            rng,
+            drawn.as_ref().map(|d| &d[1]),
+            parent_ids,
+            label,
+            now,
+        )?;
         if second.id == first.id {
             second.id = self.fresh_id(rng, Some(&first.id)).ok_or(NoteError::StorageFull)?;
         }
@@ -898,6 +1017,7 @@ impl NoteStore {
         &self,
         _storage: &mut dyn NoteStorage,
         rng: &mut dyn FnMut(&mut [u8]),
+        derived: Option<&[u8; SECRET_LEN]>,
         parent_ids: &[String],
         label: &str,
         now: u32,
@@ -911,7 +1031,15 @@ impl NoteStore {
             }
         }
         let mut secret = [0u8; SECRET_LEN];
-        rng(&mut secret);
+        match derived {
+            // Seed-recoverable: the caller already took an index off this
+            // mint's ladder and persisted the counter. See new_secret.
+            Some(bytes) => secret.copy_from_slice(bytes),
+            None => rng(&mut secret),
+        }
+        // The id stays random either way. It is a display handle for the
+        // owner and a key for the store, never money, and deriving it would
+        // leak how many notes exist at a mint to anyone who saw two of them.
         let id = self.fresh_id(rng, None).ok_or(NoteError::StorageFull)?;
         Ok(Note {
             id,
@@ -1168,7 +1296,7 @@ mod tests {
         );
 
         // A minted, confirmed note can be sent exactly once.
-        let (sid, _) = store.new_secret(&mut storage, &mut rng, &[], "", 20).unwrap();
+        let (sid, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 20).unwrap();
         assert_eq!(store.can_send(&sid), Err(NoteError::InvalidState));
         store.confirm(&mut storage, &sid, 7_000, "mint.example", None, 21).unwrap();
         assert!(store.can_send(&sid).is_ok());
@@ -1197,7 +1325,7 @@ mod tests {
         let alice = [0xa1u8; 32];
         // Fill the locker with minted-then-spent notes, oldest first.
         for i in 0..MAX_NOTES {
-            let (id, _) = store.new_secret(&mut storage, &mut rng, &[], "", 10 + i as u32).unwrap();
+            let (id, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 10 + i as u32).unwrap();
             store.confirm(&mut storage, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
             store.mark_spent(&mut storage, &id, 30 + i as u32).unwrap();
         }
@@ -1215,7 +1343,7 @@ mod tests {
         let mut storage2 = FakeStorage::new();
         let mut store2 = fresh_store(&mut storage2);
         for i in 0..MAX_NOTES {
-            let (id, _) = store2.new_secret(&mut storage2, &mut rng, &[], "", 10 + i as u32).unwrap();
+            let (id, _) = store2.new_secret(&mut storage2, &mut rng, None, &[], "", 10 + i as u32).unwrap();
             store2.confirm(&mut storage2, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
         }
         assert!(!store2.has_room_for_received(true));
@@ -1249,7 +1377,7 @@ mod tests {
         assert_eq!(store.received_count(), MAX_RECEIVED + 1);
         store.mark_spent(&mut storage, &store.list(0, 8).notes[MAX_RECEIVED].id.clone(), 2).unwrap();
         // Minting is unaffected by the received cap.
-        assert!(store.new_secret(&mut storage, &mut rng, &[], "", 2).is_ok());
+        assert!(store.new_secret(&mut storage, &mut rng, None, &[], "", 2).is_ok());
         // Rotating one out (spent) frees a slot.
         let id = store.list(0, 1).notes[0].id.clone();
         store.mark_spent(&mut storage, &id, 3).unwrap();
@@ -1292,7 +1420,7 @@ mod tests {
         let mut rng = test_rng();
         let mut store = fresh_store(&mut storage);
 
-        let (id, h) = store.new_secret(&mut storage, &mut rng, &[], "float", 10).unwrap();
+        let (id, h) = store.new_secret(&mut storage, &mut rng, None, &[], "float", 10).unwrap();
         assert_eq!(h.len(), 64);
         assert_eq!(store.counts(), (1, 1));
 
@@ -1322,7 +1450,7 @@ mod tests {
         let mut storage = FakeStorage::new();
         let mut rng = test_rng();
         let mut store = fresh_store(&mut storage);
-        let (id, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        let (id, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
 
         // PENDING: no export, no spend, no delete.
         assert_eq!(store.export_secret(&id), Err(NoteError::InvalidState));
@@ -1386,18 +1514,18 @@ mod tests {
         let mut rng = test_rng();
         let mut store = NoteStore::load(&mut storage, 3).store;
 
-        store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
-        store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
+        store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
         // A pair would exceed the cap of 3 by one.
         assert_eq!(
             store
-                .new_secret_pair(&mut storage, &mut rng, &[], "", 0)
+                .new_secret_pair(&mut storage, &mut rng, None, &[], "", 0)
                 .err(),
             Some(NoteError::StorageFull)
         );
-        store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
         assert_eq!(
-            store.new_secret(&mut storage, &mut rng, &[], "", 0).err(),
+            store.new_secret(&mut storage, &mut rng, None, &[], "", 0).err(),
             Some(NoteError::StorageFull)
         );
         assert_eq!(
@@ -1414,7 +1542,7 @@ mod tests {
         let mut rng = test_rng();
         // Seed one confirmed note, then make the index unreadable.
         let mut store = fresh_store(&mut storage);
-        let (id, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        let (id, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
         store.confirm(&mut storage, &id, 1_000, "mint.example/w", None, 0).unwrap();
 
         storage.index_read_fails = true;
@@ -1425,7 +1553,7 @@ mod tests {
 
         // Creation and index rewrites refuse; the note on flash is safe.
         assert_eq!(
-            blind.new_secret(&mut storage, &mut rng, &[], "", 0).err(),
+            blind.new_secret(&mut storage, &mut rng, None, &[], "", 0).err(),
             Some(NoteError::StorageFull)
         );
         assert_eq!(
@@ -1447,8 +1575,8 @@ mod tests {
         let mut storage = FakeStorage::new();
         let mut rng = test_rng();
         let mut store = fresh_store(&mut storage);
-        let (id_a, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
-        let (id_b, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        let (id_a, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
+        let (id_b, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
 
         // Corrupt one blob on flash.
         storage.notes.insert(id_a.clone(), vec![1, 2, 3]);
@@ -1471,7 +1599,7 @@ mod tests {
             let mut store = fresh_store(&mut storage);
             storage.budget = Some(budget);
 
-            let result = store.new_secret_pair(&mut storage, &mut rng, &[], "", 0);
+            let result = store.new_secret_pair(&mut storage, &mut rng, None, &[], "", 0);
             storage.budget = None;
 
             match result {
@@ -1597,7 +1725,7 @@ mod tests {
         // LUD-25 immediately rotated (the mint was a prior holder).
         let preimage = "5a".repeat(32);
         let (minted, _) = step!(store.import_secret(storage, &mut rng, &preimage, "mint.example/w", 10_000, "mint", 1));
-        let (rot_id, rot_h) = step!(store.new_secret(storage, &mut rng, &[minted.clone()], "", 2));
+        let (rot_id, rot_h) = step!(store.new_secret(storage, &mut rng, None, &[minted.clone()], "", 2));
         disclosed.push((rot_id.clone(), rot_h));
         // Mint said OK to the rotate:
         step!(store.confirm(storage, &rot_id, 10_000, "mint.example/w", None, 3));
@@ -1606,7 +1734,7 @@ mod tests {
         // Spend 3 000 of it: split into target + change, melt the target.
         let _k1 = step!(store.export_secret(&rot_id).map_err(|e| e));
         let (tgt, tgt_h, chg, chg_h) =
-            step!(store.new_secret_pair(storage, &mut rng, &[rot_id.clone()], "", 5));
+            step!(store.new_secret_pair(storage, &mut rng, None, &[rot_id.clone()], "", 5));
         disclosed.push((tgt.clone(), tgt_h));
         disclosed.push((chg.clone(), chg_h));
         step!(store.confirm(storage, &tgt, 3_000, "mint.example/w", None, 6));
@@ -1634,7 +1762,7 @@ mod tests {
         let mut store = fresh_store(&mut storage);
         let parents = vec!["deadbeef".to_string()];
         let (id, h, id2, h2) = store
-            .new_secret_pair(&mut storage, &mut rng, &parents, "split", 0)
+            .new_secret_pair(&mut storage, &mut rng, None, &parents, "split", 0)
             .unwrap();
         assert_ne!(id, id2);
         assert_ne!(h, h2);
@@ -1656,7 +1784,7 @@ mod tests {
                 *b = fill;
             }
         };
-        let (id, _, id2, _) = store.new_secret_pair(&mut storage, &mut rng, &[], "", 0).unwrap();
+        let (id, _, id2, _) = store.new_secret_pair(&mut storage, &mut rng, None, &[], "", 0).unwrap();
         assert_ne!(id, id2);
         // Both persisted under their (distinct) ids and reloadable.
         let reloaded = fresh_store(&mut storage);
@@ -1699,8 +1827,8 @@ mod tests {
                 *b = fill;
             }
         };
-        let (id_a, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
-        let (id_b, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        let (id_a, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
+        let (id_b, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
         assert_ne!(id_a, id_b);
     }
 
@@ -1710,7 +1838,7 @@ mod tests {
         let mut rng = test_rng();
         let mut store = fresh_store(&mut storage);
         for _ in 0..5 {
-            store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+            store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
         }
         let page = store.list(0, 2);
         assert_eq!((page.total, page.notes.len(), page.next_offset), (5, 2, Some(2)));
@@ -1731,12 +1859,12 @@ mod tests {
 
         let long_label = "x".repeat(MAX_LABEL_LEN + 1);
         assert_eq!(
-            store.new_secret(&mut storage, &mut rng, &[], &long_label, 0).err(),
+            store.new_secret(&mut storage, &mut rng, None, &[], &long_label, 0).err(),
             Some(NoteError::BadRequest)
         );
         assert_eq!(
             store
-                .new_secret(&mut storage, &mut rng, &["nothex!!".to_string()], "", 0)
+                .new_secret(&mut storage, &mut rng, None, &["nothex!!".to_string()], "", 0)
                 .err(),
             Some(NoteError::BadRequest)
         );
@@ -1759,8 +1887,8 @@ mod tests {
         let mut storage = FakeStorage::new();
         let mut rng = test_rng();
         let mut store = fresh_store(&mut storage);
-        let (a, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
-        let (b, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        let (a, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
+        let (b, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
         store.confirm(&mut storage, &a, 1_000, "mint.example/w", None, 1).unwrap();
 
         // Fail after the first of the two blob writes.
@@ -1779,7 +1907,7 @@ mod tests {
         let mut storage = FakeStorage::new();
         let mut rng = test_rng();
         let mut store = fresh_store(&mut storage);
-        let (id, _) = store.new_secret(&mut storage, &mut rng, &[], "", 0).unwrap();
+        let (id, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 0).unwrap();
 
         storage.budget = Some(0);
         assert_eq!(

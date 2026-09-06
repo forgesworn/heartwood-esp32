@@ -96,6 +96,16 @@ pub struct NoteCmdContext<'a> {
     pub trust: &'a mut TrustList,
     /// Asked before a sender is trusted: the card names the key, not a note.
     pub approve_trust: &'a mut dyn FnMut(&[u8; 32]) -> Approval,
+    /// Asked before a mint's LUD-25 subtree is stored: the card names the
+    /// HOST, not a note and not the node.
+    ///
+    /// It is a hold rather than a quiet write because of what the node is:
+    /// whoever supplied it can derive every note secret this device will ever
+    /// hold at that mint. The card cannot show the owner the node — 64 bytes
+    /// of hex is not something anyone checks off a panel — so it shows the one
+    /// thing they can check, which is which mint they were expecting to set up.
+    #[cfg(feature = "cash")]
+    pub approve_cash: &'a mut dyn FnMut(&str) -> Approval,
     /// Seconds since some fixed epoch for created_at/updated_at. Boot time is
     /// fine — informational, never authoritative (the mint's state is).
     pub now: u32,
@@ -106,6 +116,14 @@ pub struct NoteCmdContext<'a> {
     /// `index_unreadable`, ...). The firmware owns the diagnosis; this layer
     /// only forwards it.
     pub storage_state: &'a str,
+    /// Which mints this device can derive seed-recoverable note secrets for.
+    ///
+    /// Absent on a build without the `cash` feature (the lx106, whose DRAM
+    /// cannot hold a second BIP-32 walk), and on one that simply has nothing
+    /// provisioned. Either way `new_secret` without a `host` behaves as it
+    /// always has.
+    #[cfg(feature = "cash")]
+    pub cash: &'a mut crate::cash_store::CashRegistry,
 }
 
 /// Hard ceiling on notes per `list_notes` page. A vault-protocol client
@@ -127,6 +145,31 @@ fn err_msg(code: &str, message: &str) -> Value {
 
 fn note_err(e: NoteError) -> Value {
     err(e.code())
+}
+
+/// Turn a command's optional `host` into a draw against that mint's ladder.
+///
+/// No `host` means no derivation: the secret comes from the RNG exactly as it
+/// always did. That is not a fallback, it is the documented old behaviour, and
+/// a client that has not been taught about mints keeps working unchanged.
+///
+/// A `host` that is NOT provisioned is refused rather than quietly drawn at
+/// random. The caller asked for a note its seed phrase could find again; a
+/// random one would satisfy the request and silently not be that, and nobody
+/// would learn otherwise until a restore came up empty.
+#[cfg(feature = "cash")]
+fn cash_draw<'a>(
+    registry: &'a mut crate::cash_store::CashRegistry,
+    host: Option<&'a str>,
+) -> Result<Option<crate::note_store::CashDraw<'a>>, Value> {
+    let Some(host) = host else { return Ok(None) };
+    if registry.get(host).is_none() {
+        return Err(err_msg(
+            "bad_request",
+            "no cash node is provisioned for that host - provision_cash_node first",
+        ));
+    }
+    Ok(Some(crate::note_store::CashDraw { registry, host }))
 }
 
 fn approval_err(a: Approval) -> Option<Value> {
@@ -306,6 +349,102 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             json!({"ok": true, "trusted": true, "changed": true})
         }
 
+        // ---- LUD-25 seed-recoverable note secrets ----
+
+        #[cfg(feature = "cash")]
+        "provision_cash_node" => {
+            let Some(host) = str_field(&cmd, "host") else {
+                return err_msg("bad_request", "host is required");
+            };
+            let Some(node_hex) = str_field(&cmd, "node") else {
+                return err_msg("bad_request", "node must be 64 bytes of hex");
+            };
+            let Ok(bytes) = crate::hex::hex_decode(node_hex) else {
+                return err_msg("bad_request", "node must be 64 bytes of hex");
+            };
+            let Ok(node_bytes) = <[u8; 64]>::try_from(bytes.as_slice()) else {
+                return err_msg("bad_request", "node must be 64 bytes of hex");
+            };
+            // Approval AFTER the request is known to be well-formed and
+            // BEFORE anything is written. A card for a request that could
+            // never succeed teaches the owner to press without reading, and
+            // this device already learned that lesson once.
+            if let Some(resp) = approval_err((ctx.approve_cash)(host)) {
+                return resp;
+            }
+            let node = crate::cash::cash_node_from_bytes(&node_bytes);
+            // Reported back so a client can tell "set up" from "restarted the
+            // ladder at zero", which are very different things to have just
+            // done to a mint you already had notes at.
+            let replaced = ctx.cash.get(host).is_some();
+            match ctx.cash.provision(host, node) {
+                Ok(()) => {}
+                Err(crate::cash_store::CashError::Full) => return err("storage_full"),
+                Err(_) => return err_msg("bad_request", "host must be a lowercase mint host"),
+            }
+            if ctx.storage.save_cash(&ctx.cash.encode()).is_err() {
+                // Roll RAM back to match what survived: a registry that says
+                // it can derive for a mint whose counter is not persisted
+                // would re-issue secrets after a reboot.
+                ctx.cash.forget(host);
+                return err("storage_full");
+            }
+            json!({"ok": true, "host": host, "replaced": replaced, "next_index": 0})
+        }
+
+        #[cfg(feature = "cash")]
+        "forget_cash_node" => {
+            // No hold. Forgetting only ever removes an ability — the secrets
+            // of notes already held are stored, never re-derived, so this
+            // cannot lose money. Same reasoning as withdrawing trust.
+            let Some(host) = str_field(&cmd, "host") else {
+                return err_msg("bad_request", "host is required");
+            };
+            let changed = ctx.cash.forget(host);
+            if changed && ctx.storage.save_cash(&ctx.cash.encode()).is_err() {
+                return err("storage_full");
+            }
+            json!({"ok": true, "changed": changed})
+        }
+
+        #[cfg(feature = "cash")]
+        "list_cash_mints" => {
+            let mints: Vec<Value> = ctx
+                .cash
+                .hosts()
+                .map(|(host, next_index)| json!({"host": host, "next_index": next_index}))
+                .collect();
+            // Never the node. It is bearer material for every note at that
+            // mint, and nothing a client does needs it back.
+            json!({"ok": true, "mints": mints})
+        }
+
+        #[cfg(feature = "cash")]
+        "set_cash_index" => {
+            // Raising only. A wallet that has minted further than this device
+            // knows says so here, and the ladder skips to meet it. Lowering is
+            // not offered at all: an index handed out twice is two notes
+            // answering to one k1, and no client is well placed to ask for it.
+            let Some(host) = str_field(&cmd, "host") else {
+                return err_msg("bad_request", "host is required");
+            };
+            let Some(at_least) = u64_field(&cmd, "next_index") else {
+                return err_msg("bad_request", "next_index is required");
+            };
+            if at_least > crate::cash::MAX_NOTE_INDEX as u64 {
+                return err_msg("bad_request", "next_index must be below 2^31");
+            }
+            match ctx.cash.raise_index(host, at_least as u32) {
+                Ok(next_index) => {
+                    if ctx.storage.save_cash(&ctx.cash.encode()).is_err() {
+                        return err("storage_full");
+                    }
+                    json!({"ok": true, "host": host, "next_index": next_index})
+                }
+                Err(_) => err_msg("bad_request", "no cash node is provisioned for that host"),
+            }
+        }
+
         "list_notes" => {
             let offset = u64_field(&cmd, "offset").unwrap_or(0) as usize;
             let limit = u64_field(&cmd, "limit")
@@ -333,7 +472,24 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
                 Err(e) => return e,
             };
             let label = str_field(&cmd, "label").unwrap_or("");
-            match ctx.store.new_secret(ctx.storage, ctx.rng, &parents, label, ctx.now) {
+            #[cfg(feature = "cash")]
+            let result = {
+                let host = str_field(&cmd, "host");
+                match cash_draw(ctx.cash, host) {
+                    Err(resp) => return resp,
+                    Ok(mut draw) => ctx.store.new_secret(
+                        ctx.storage,
+                        ctx.rng,
+                        draw.as_mut(),
+                        &parents,
+                        label,
+                        ctx.now,
+                    ),
+                }
+            };
+            #[cfg(not(feature = "cash"))]
+            let result = ctx.store.new_secret(ctx.storage, ctx.rng, &parents, label, ctx.now);
+            match result {
                 Ok((id, h)) => json!({"ok": true, "id": id, "h": h}),
                 Err(e) => note_err(e),
             }
@@ -345,7 +501,24 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
                 Err(e) => return e,
             };
             let label = str_field(&cmd, "label").unwrap_or("");
-            match ctx.store.new_secret_pair(ctx.storage, ctx.rng, &parents, label, ctx.now) {
+            #[cfg(feature = "cash")]
+            let result = {
+                let host = str_field(&cmd, "host");
+                match cash_draw(ctx.cash, host) {
+                    Err(resp) => return resp,
+                    Ok(mut draw) => ctx.store.new_secret_pair(
+                        ctx.storage,
+                        ctx.rng,
+                        draw.as_mut(),
+                        &parents,
+                        label,
+                        ctx.now,
+                    ),
+                }
+            };
+            #[cfg(not(feature = "cash"))]
+            let result = ctx.store.new_secret_pair(ctx.storage, ctx.rng, &parents, label, ctx.now);
+            match result {
                 Ok((id, h, id2, h2)) => json!({"ok": true, "id": id, "h": h, "id2": id2, "h2": h2}),
                 Err(e) => note_err(e),
             }
@@ -612,13 +785,20 @@ mod tests {
     struct MemStorage {
         index: Option<Vec<String>>,
         notes: BTreeMap<String, Vec<u8>>,
-            trust: Option<Vec<u8>>,
+        trust: Option<Vec<u8>>,
+        cash: Option<Vec<u8>>,
         persist_ok: bool,
     }
 
     impl MemStorage {
         fn new() -> Self {
-            MemStorage { index: None, notes: BTreeMap::new(), trust: None, persist_ok: true }
+            MemStorage {
+                index: None,
+                notes: BTreeMap::new(),
+                trust: None,
+                cash: None,
+                persist_ok: true,
+            }
         }
     }
 
@@ -648,6 +828,16 @@ mod tests {
             self.trust = Some(blob.to_vec());
             Ok(())
         }
+        fn load_cash(&mut self) -> Result<Option<Vec<u8>>, StorageError> {
+            Ok(self.cash.clone())
+        }
+        fn save_cash(&mut self, blob: &[u8]) -> Result<(), StorageError> {
+            if !self.persist_ok {
+                return Err(StorageError);
+            }
+            self.cash = Some(blob.to_vec());
+            Ok(())
+        }
     }
 
     struct Harness {
@@ -661,6 +851,8 @@ mod tests {
         can_wrap: bool,
         trust: TrustList,
         trust_asked: Vec<[u8; 32]>,
+        cash: crate::cash_store::CashRegistry,
+        cash_asked: Vec<String>,
         persist_ok: bool,
     }
 
@@ -677,6 +869,8 @@ mod tests {
                 can_wrap: true,
                 trust: TrustList::new(),
                 trust_asked: Vec::new(),
+                cash: crate::cash_store::CashRegistry::new(),
+                cash_asked: Vec::new(),
                 persist_ok: true,
             }
         }
@@ -707,6 +901,11 @@ mod tests {
                 trust_asked.push(*pk);
                 answer
             };
+            let cash_asked = &mut self.cash_asked;
+            let mut approve_cash = move |host: &str| {
+                cash_asked.push(host.to_string());
+                answer
+            };
             self.storage.persist_ok = self.persist_ok;
             let mut ctx = NoteCmdContext {
                 store: &mut self.store,
@@ -716,6 +915,8 @@ mod tests {
                 wrap: if self.can_wrap { Some(&mut wrap) } else { None },
                 trust: &mut self.trust,
                 approve_trust: &mut approve_trust,
+                cash: &mut self.cash,
+                approve_cash: &mut approve_cash,
                 now: 42,
                 fw_version: "0.0.0-test",
                 board: "host",
@@ -734,6 +935,280 @@ mod tests {
             ));
             assert_eq!(res["ok"], true, "{res}");
             id
+        }
+    }
+
+    // ---- LUD-25 seed-recoverable note secrets ----
+    //
+    // Without a host, new_secret draws at random exactly as it always has.
+    // With one, the secret comes off that mint's ladder so a seed phrase can
+    // find it again. The rules with teeth are all about the counter.
+
+    #[cfg(feature = "cash")]
+    mod cash_tests {
+        use super::*;
+        use crate::cash::{cash_secret_at, derive_cash_domain_node, derive_cash_root};
+        use crate::cash_store::MAX_CASH_MINTS;
+
+        const SEED_HEX: &str = "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4";
+
+        fn seed() -> [u8; 64] {
+            let mut out = [0u8; 64];
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = u8::from_str_radix(&SEED_HEX[i * 2..i * 2 + 2], 16).unwrap();
+            }
+            out
+        }
+
+        fn node_hex(host: &str) -> String {
+            let node =
+                derive_cash_domain_node(&derive_cash_root(&seed()).unwrap(), host).unwrap();
+            crate::hex::hex_encode(crate::cash::cash_node_to_bytes(&node).as_ref())
+        }
+
+        /// What the wallet would derive at this index, to compare against.
+        fn expected_h(host: &str, index: u32) -> String {
+            let node =
+                derive_cash_domain_node(&derive_cash_root(&seed()).unwrap(), host).unwrap();
+            let secret = cash_secret_at(&node, index).unwrap();
+            crate::note_store::secret_hash_hex(&secret)
+        }
+
+        fn provision(h: &mut Harness, host: &str) -> Value {
+            h.run(&format!(
+                r#"{{"cmd":"provision_cash_node","host":"{host}","node":"{}"}}"#,
+                node_hex(host)
+            ))
+        }
+
+        #[test]
+        fn a_provisioned_mint_mints_the_secret_the_wallet_would_derive() {
+            // The whole point: the device and the wallet, from one seed, have
+            // to produce the same 32 bytes, or the money is findable from only
+            // one of them.
+            let mut h = Harness::new();
+            assert_eq!(provision(&mut h, "mint.example")["ok"], true);
+
+            let res = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            assert_eq!(res["ok"], true, "{res}");
+            assert_eq!(res["h"], expected_h("mint.example", 0));
+
+            let res = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            assert_eq!(res["h"], expected_h("mint.example", 1));
+        }
+
+        #[test]
+        fn a_split_takes_two_indices_in_order() {
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            let res = h.run(r#"{"cmd":"new_secret_pair","host":"mint.example"}"#);
+            assert_eq!(res["ok"], true, "{res}");
+            assert_eq!(res["h"], expected_h("mint.example", 0));
+            assert_eq!(res["h2"], expected_h("mint.example", 1));
+            // and the next one carries on rather than repeating either
+            let res = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            assert_eq!(res["h"], expected_h("mint.example", 2));
+        }
+
+        #[test]
+        fn no_host_still_draws_at_random() {
+            // A client that never learned about mints keeps working, and its
+            // notes are still perfectly good - just not findable from a seed.
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            let a = h.run(r#"{"cmd":"new_secret"}"#);
+            assert_eq!(a["ok"], true);
+            assert_ne!(a["h"], expected_h("mint.example", 0));
+            // and it did not move the ladder
+            let b = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            assert_eq!(b["h"], expected_h("mint.example", 0));
+        }
+
+        #[test]
+        fn an_unprovisioned_host_is_refused_rather_than_quietly_drawn() {
+            // The caller asked for a note its seed could find. A random one
+            // would satisfy the request and silently not be that, and nobody
+            // would learn otherwise until a restore came up empty.
+            let mut h = Harness::new();
+            let res = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            assert_eq!(res["ok"], false, "{res}");
+            assert_eq!(res["error"], "bad_request");
+            assert_eq!(h.run(r#"{"cmd":"get_info"}"#)["note_count"], 0);
+        }
+
+        #[test]
+        fn the_counter_is_persisted_before_the_secret_exists() {
+            // The ordering that matters. A counter written after the secret
+            // was used would, on a cut in between, come back one index low,
+            // and the next mint there would hand out a secret the SERVICE has
+            // already issued a note against.
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+
+            // Reload the registry from what actually reached storage.
+            let blob = h.storage.cash.clone().expect("a cash blob was written");
+            let reloaded = crate::cash_store::CashRegistry::decode(&blob).expect("decodes");
+            assert_eq!(reloaded.get("mint.example").unwrap().next_index, 1);
+        }
+
+        #[test]
+        fn a_storage_that_cannot_keep_the_counter_mints_nothing() {
+            // Deriving against a counter that will not survive a reboot is how
+            // one k1 ends up behind two notes. Refusing is the only safe
+            // answer, and it has to refuse BEFORE the note exists.
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            h.persist_ok = false;
+            let res = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            assert_eq!(res["ok"], false, "{res}");
+            assert_eq!(res["error"], "storage_full");
+            h.persist_ok = true;
+            assert_eq!(h.run(r#"{"cmd":"get_info"}"#)["note_count"], 0);
+        }
+
+        #[test]
+        fn provisioning_asks_the_owner_and_names_the_host() {
+            // The card cannot show 64 bytes of hex to check, so it shows the
+            // one thing the owner can check: which mint this is.
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            assert_eq!(h.cash_asked, alloc::vec!["mint.example".to_string()]);
+        }
+
+        #[test]
+        fn a_declined_provision_stores_nothing() {
+            let mut h = Harness::new();
+            h.answer = Approval::Declined;
+            let res = provision(&mut h, "mint.example");
+            assert_eq!(res["ok"], false, "{res}");
+            assert_eq!(res["error"], "user_declined");
+            assert_eq!(h.run(r#"{"cmd":"list_cash_mints"}"#)["mints"].as_array().unwrap().len(), 0);
+        }
+
+        #[test]
+        fn a_malformed_node_never_reaches_a_card() {
+            // A card for a request that could never succeed teaches the owner
+            // to press without reading.
+            let mut h = Harness::new();
+            for msg in [
+                r#"{"cmd":"provision_cash_node","host":"mint.example"}"#,
+                r#"{"cmd":"provision_cash_node","host":"mint.example","node":"beef"}"#,
+                r#"{"cmd":"provision_cash_node","host":"mint.example","node":"zz"}"#,
+                r#"{"cmd":"provision_cash_node","node":"00"}"#,
+            ] {
+                let res = h.run(msg);
+                assert_eq!(res["ok"], false, "{msg} -> {res}");
+                assert_eq!(res["error"], "bad_request", "{msg} -> {res}");
+            }
+            assert!(h.cash_asked.is_empty(), "asked: {:?}", h.cash_asked);
+        }
+
+        #[test]
+        fn replacing_a_node_says_so_and_restarts_the_ladder() {
+            // Two very different things to have just done to a mint you
+            // already hold notes at, so the answer distinguishes them.
+            let mut h = Harness::new();
+            assert_eq!(provision(&mut h, "mint.example")["replaced"], false);
+            h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            let again = provision(&mut h, "mint.example");
+            assert_eq!(again["replaced"], true);
+            assert_eq!(again["next_index"], 0);
+            let res = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            assert_eq!(res["h"], expected_h("mint.example", 0));
+        }
+
+        #[test]
+        fn the_index_can_be_raised_but_never_lowered() {
+            // A wallet that has minted further than this device knows says so
+            // here. Lowering is not offered: an index handed out twice is two
+            // notes answering to one k1.
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            let res = h.run(r#"{"cmd":"set_cash_index","host":"mint.example","next_index":9}"#);
+            assert_eq!(res["next_index"], 9, "{res}");
+            let res = h.run(r#"{"cmd":"set_cash_index","host":"mint.example","next_index":3}"#);
+            assert_eq!(res["next_index"], 9, "{res}");
+            let res = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            assert_eq!(res["h"], expected_h("mint.example", 9));
+        }
+
+        #[test]
+        fn an_index_past_the_ladder_is_refused() {
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            let res =
+                h.run(r#"{"cmd":"set_cash_index","host":"mint.example","next_index":2147483648}"#);
+            assert_eq!(res["ok"], false, "{res}");
+            assert_eq!(res["error"], "bad_request");
+        }
+
+        #[test]
+        fn listing_mints_never_shows_the_node() {
+            // It is bearer material for every note at that mint, and nothing
+            // a client does needs it back.
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            let res = h.run(r#"{"cmd":"list_cash_mints"}"#);
+            let mints = res["mints"].as_array().unwrap();
+            assert_eq!(mints.len(), 1);
+            assert_eq!(mints[0]["host"], "mint.example");
+            assert_eq!(mints[0]["next_index"], 1);
+            assert!(!res.to_string().contains(&node_hex("mint.example")));
+        }
+
+        #[test]
+        fn forgetting_a_mint_needs_no_hold_and_loses_no_note() {
+            // It only ever removes an ability. Secrets already held are
+            // stored, never re-derived.
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            let minted = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            let id = minted["id"].as_str().unwrap().to_string();
+            h.cash_asked.clear();
+
+            let res = h.run(r#"{"cmd":"forget_cash_node","host":"mint.example"}"#);
+            assert_eq!(res["changed"], true, "{res}");
+            assert!(h.cash_asked.is_empty(), "forgetting asked for a hold");
+            // the note is still there, and still spendable
+            assert_eq!(h.run(r#"{"cmd":"get_info"}"#)["note_count"], 1);
+            let res = h.run(&format!(r#"{{"cmd":"list_notes","id":"{id}"}}"#));
+            assert_eq!(res["ok"], true, "{res}");
+            // but no more can be minted there
+            let res = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            assert_eq!(res["error"], "bad_request");
+            // and forgetting twice is not a change
+            assert_eq!(
+                h.run(r#"{"cmd":"forget_cash_node","host":"mint.example"}"#)["changed"],
+                false
+            );
+        }
+
+        #[test]
+        fn two_mints_keep_separate_ladders() {
+            // One counter shared across mints would skip indices at both and
+            // leave a restore scanning gaps it should never have.
+            let mut h = Harness::new();
+            provision(&mut h, "mint.example");
+            provision(&mut h, "127.0.0.1:8899");
+            let a = h.run(r#"{"cmd":"new_secret","host":"mint.example"}"#);
+            let b = h.run(r#"{"cmd":"new_secret","host":"127.0.0.1:8899"}"#);
+            assert_eq!(a["h"], expected_h("mint.example", 0));
+            assert_eq!(b["h"], expected_h("127.0.0.1:8899", 0));
+            assert_ne!(a["h"], b["h"]);
+        }
+
+        #[test]
+        fn the_registry_fills_up_and_says_storage_full() {
+            let mut h = Harness::new();
+            for i in 0..MAX_CASH_MINTS {
+                let host = format!("mint{i}.example");
+                assert_eq!(provision(&mut h, &host)["ok"], true);
+            }
+            let res = provision(&mut h, "one.too.many");
+            assert_eq!(res["ok"], false, "{res}");
+            assert_eq!(res["error"], "storage_full");
         }
     }
 

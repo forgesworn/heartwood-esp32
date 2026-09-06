@@ -1018,6 +1018,12 @@ USB tier, unlocked, no at-rest:
 
 1. `get_info` answers version/board/storage/counts; `new_secret` then
    `confirm` then `list_notes` shows one CONFIRMED note. NOT YET BENCH-RUN.
+1b. `{"cmd":"get_info","tag":"a1"}` comes back carrying `"tag":"a1"`, and the
+   same `get_info` with no tag comes back with no `tag` field at all. Then
+   `{"cmd":"get_info","tag":""}` is refused `bad_request` and that refusal
+   carries no tag. The point of the check on real hardware rather than in the
+   native suite: the tag has to survive the framing, which is where a lost or
+   torn reply happens in the first place. NOT YET BENCH-RUN.
 2. `export_secret` raises a card headed `RELEASE NOTE` whose title is the
    money — `<amount> @ <host>`, the action having moved into the header so
    both title lines are available to the amount and the mint — hold

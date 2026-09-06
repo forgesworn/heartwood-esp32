@@ -54,7 +54,19 @@ const WRAPS_KEY: &str = "wraps";
 /// Trusted senders (`trust::TrustList::encode`): wraps sealed by these are
 /// stored without a hold.
 const TRUST_KEY: &str = "trust";
+/// The cash registry blob (`cash_store::CashRegistry::encode`): which mints
+/// this device can derive LUD-25 note secrets for, and how far up each
+/// ladder it has walked. Short like every other key here — ESP-IDF caps an
+/// NVS key at 15 characters.
+const CASH_KEY: &str = "cash";
 const TRUST_BUF: usize = 1 + heartwood_common::trust::MAX_TRUSTED * 32;
+/// Version byte, then per mint: a length-prefixed host (<= MAX_HOST_LEN), a
+/// 64-byte node and a u32 index. Sized for the worst case so a full registry
+/// still reads back — a short buffer here would present as "unreadable",
+/// which this treats as empty, which would silently restart every ladder.
+const CASH_BUF: usize = 1
+    + heartwood_common::cash_store::MAX_CASH_MINTS
+        * (1 + heartwood_common::note_store::MAX_HOST_LEN + 64 + 4);
 const WRAPS_BUF: usize = 16 + heartwood_common::wrap_ledger::RING_LEN * heartwood_common::wrap_ledger::ID_PREFIX_LEN;
 
 /// A note blob is ~120 B for typical hosts/labels; the encoded ceiling with
@@ -205,6 +217,31 @@ impl NoteStorage for NoteNvs {
             StorageError
         })
     }
+
+    /// The cash registry, read back rather than cached, because the counter
+    /// inside it is the thing that must never come back low.
+    fn load_cash(&mut self) -> Result<Option<alloc_vec::Vec<u8>>, StorageError> {
+        let mut buf = [0u8; CASH_BUF];
+        match self.nvs.get_blob(CASH_KEY, &mut buf) {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                log::warn!("[notes] cash registry read failed: {e}");
+                Err(StorageError)
+            }
+        }
+    }
+
+    /// A failure here is what stops a derived secret existing at all: the
+    /// caller takes an index, writes the counter, and only then derives. See
+    /// `note_store::take_derived`.
+    fn save_cash(&mut self, blob: &[u8]) -> Result<(), StorageError> {
+        self.nvs.set_blob(CASH_KEY, blob).map_err(|e| {
+            log::error!("[notes] cash registry write failed: {e}");
+            self.failed = true;
+            StorageError
+        })
+    }
 }
 
 // The common crate is no_std/alloc; keep the type paths uniform here.
@@ -309,6 +346,11 @@ pub struct Notes {
     /// Senders whose wraps skip the RECEIVE card. Loaded at boot; a blob
     /// that does not decode is an empty list, never a guess.
     pub trust: TrustList,
+    /// Which mints this device can derive note secrets for. Same rule as the
+    /// trust list: a blob that does not decode is an empty registry, never a
+    /// guess. Empty costs a provisioning round trip; a guessed counter costs
+    /// somebody's note.
+    pub cash: heartwood_common::cash_store::CashRegistry,
 }
 
 impl Notes {
@@ -330,6 +372,28 @@ impl Notes {
         }
     }
 
+    fn load_cash(storage: &mut Storage) -> heartwood_common::cash_store::CashRegistry {
+        use heartwood_common::cash_store::CashRegistry;
+        let Storage::Nvs(nvs) = storage else {
+            return CashRegistry::new();
+        };
+        let mut buf = [0u8; CASH_BUF];
+        match nvs.nvs.get_blob(CASH_KEY, &mut buf) {
+            Ok(Some(bytes)) => CashRegistry::decode(bytes).unwrap_or_else(|| {
+                // Not a guess. A salvaged counter can come back low, and a low
+                // counter re-issues a secret the mint already has a note
+                // against. Empty means the next `new_secret` with a host says
+                // so, and the owner provisions again.
+                log::warn!("[notes] cash registry unreadable; treating as empty");
+                CashRegistry::new()
+            }),
+            Ok(None) => CashRegistry::new(),
+            Err(e) => {
+                log::warn!("[notes] cash registry read failed: {e}");
+                CashRegistry::new()
+            }
+        }
+    }
 }
 
 /// Is this seal signer a trusted sender? Read on the relay loop for every
@@ -388,6 +452,12 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
                 storage: Storage::Null(NullStorage),
                 boot_state: "unavailable",
                 trust: TrustList::new(),
+                // Empty, and it stays empty: with no namespace there is
+                // nowhere to persist a counter, so `new_secret` with a host
+                // refuses rather than deriving against one that cannot
+                // survive a reboot. Exactly the storage-unavailable posture
+                // the rest of this branch takes.
+                cash: heartwood_common::cash_store::CashRegistry::new(),
             };
         }
     };
@@ -427,7 +497,15 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
     if !trust.is_empty() {
         log::info!("[notes] {} trusted sender(s)", trust.len());
     }
-    Notes { store: outcome.store, storage, boot_state, trust }
+    let cash = Notes::load_cash(&mut storage);
+    if !cash.is_empty() {
+        // The hosts and their next index, never the nodes: a node in the log
+        // is every note secret at that mint.
+        for (host, next_index) in cash.hosts() {
+            log::info!("[notes] cash mint {host}, next index {next_index}");
+        }
+    }
+    Notes { store: outcome.store, storage, boot_state, trust, cash }
 }
 
 /// Whether the device holds any notes (loaded or sealed), for code with no
@@ -696,6 +774,29 @@ fn trust_card_title(pk: &[u8; 32]) -> (&'static str, String) {
     )
 }
 
+/// The card for provisioning a mint's LUD-25 subtree.
+///
+/// Two lines: which mint, and what saying yes does. The node itself is 64
+/// bytes of hex and nobody checks that off a panel, so the host is the one
+/// thing the owner can actually recognise — and recognising it is the whole
+/// decision, because whoever supplied the node can derive every note secret
+/// this device will ever hold at that mint.
+///
+/// Middle-elided like the trust card's npub, and for the same reason: the tail
+/// of a host carries the port and the TLD, which is exactly where a lookalike
+/// differs. Nothing downstream truncates for us — `show_titled_approval` drops
+/// to a smaller font and then overflows — and the host is ASCII by the time it
+/// gets here (`cash_store::valid_host`, checked before the card), so slicing
+/// by byte is safe.
+fn cash_card_title(host: &str) -> (&'static str, String) {
+    let shown = if host.len() <= 22 {
+        host.to_string()
+    } else {
+        format!("{}..{}", &host[..12], &host[host.len() - 8..])
+    };
+    ("SET UP MINT", format!("{shown}\nseed can find its notes"))
+}
+
 /// Header and title for a gated note card on the cable. The action moved
 /// into the header so both title lines are the money: an amount that has to
 /// share a line with "Release note?" is an amount that gets clipped.
@@ -864,6 +965,7 @@ fn handle_note_cmd_frame_inner(
     };
     let mut approve = |kind: GatedCmd, meta: &NoteMeta| -> Approval { ask(card_title(kind, meta)) };
     let mut approve_trust = |pk: &[u8; 32]| -> Approval { ask(trust_card_title(pk)) };
+    let mut approve_cash = |host: &str| -> Approval { ask(cash_card_title(host)) };
 
     // Read the state before ctx takes its mutable borrows of `notes`. A
     // write failing inside THIS dispatch shows in the next get_info, which
@@ -878,6 +980,8 @@ fn handle_note_cmd_frame_inner(
         wrap: None,
         trust: &mut notes.trust,
         approve_trust: &mut approve_trust,
+        cash: &mut notes.cash,
+        approve_cash: &mut approve_cash,
         now: now_secs(),
         fw_version: env!("CARGO_PKG_VERSION"),
         board: crate::board::BOARD,
@@ -946,6 +1050,13 @@ pub fn run_note_cmd_approved(
         let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
         let mut approve = |_kind: GatedCmd, _meta: &NoteMeta| Approval::Approved;
         let mut approve_trust = |_pk: &[u8; 32]| Approval::Approved;
+        // Declined, not Approved, and deliberately unlike its neighbours.
+        // Provisioning a mint's subtree is not in NOTE_METHODS, so nothing
+        // over the relay can reach it and this should never be called. If a
+        // future method ever does reach it, the pre-dispatch gate above would
+        // not know to demand a hold for it, and 64 bytes of bearer material
+        // would land with no button pressed. Fail closed and say why.
+        let mut approve_cash = |_host: &str| Approval::Declined;
         let storage_state = notes.storage_state();
         // Reborrow so the hook's lifetime is this scope's, not the caller's:
         // the context ties every borrow to one lifetime.
@@ -957,7 +1068,9 @@ pub fn run_note_cmd_approved(
             approve: &mut approve,
             wrap,
             trust: &mut notes.trust,
-                approve_trust: &mut approve_trust,
+            approve_trust: &mut approve_trust,
+            cash: &mut notes.cash,
+            approve_cash: &mut approve_cash,
             now: now_secs(),
             fw_version: env!("CARGO_PKG_VERSION"),
             board: crate::board::BOARD,

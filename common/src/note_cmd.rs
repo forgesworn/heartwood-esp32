@@ -365,6 +365,15 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             let Ok(node_bytes) = <[u8; 64]>::try_from(bytes.as_slice()) else {
                 return err_msg("bad_request", "node must be 64 bytes of hex");
             };
+            // The host is checked HERE, before the card, not left to
+            // `provision` below. A card naming a host the registry would
+            // refuse is a hold that could never have succeeded, and this
+            // device has learned once already what that teaches an owner. It
+            // also keeps a non-ASCII host away from the card, whose eliding
+            // slices by byte.
+            if !crate::cash_store::valid_host(host) {
+                return err_msg("bad_request", "host must be a lowercase mint host");
+            }
             // Approval AFTER the request is known to be well-formed and
             // BEFORE anything is written. A card for a request that could
             // never succeed teaches the owner to press without reading, and
@@ -1084,6 +1093,24 @@ mod tests {
             assert_eq!(res["ok"], false, "{res}");
             assert_eq!(res["error"], "user_declined");
             assert_eq!(h.run(r#"{"cmd":"list_cash_mints"}"#)["mints"].as_array().unwrap().len(), 0);
+        }
+
+        #[test]
+        fn a_host_that_could_never_be_provisioned_never_reaches_a_card() {
+            // Checked before the hold, not left to the registry underneath.
+            // A card naming a host that would be refused anyway is a hold
+            // that could never have succeeded, and the non-ASCII case would
+            // also reach a card that elides by byte.
+            let mut h = Harness::new();
+            let node = node_hex("mint.example");
+            for host in ["Mint.Example", "mint.example/w", "héllo.example", ""] {
+                let res = h.run(&format!(
+                    r#"{{"cmd":"provision_cash_node","host":"{host}","node":"{node}"}}"#
+                ));
+                assert_eq!(res["ok"], false, "{host} -> {res}");
+                assert_eq!(res["error"], "bad_request", "{host} -> {res}");
+            }
+            assert!(h.cash_asked.is_empty(), "asked: {:?}", h.cash_asked);
         }
 
         #[test]

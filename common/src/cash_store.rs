@@ -96,11 +96,16 @@ pub enum CashError {
 }
 
 /// The one spelling rule, applied at the door rather than trusted from the
-/// caller: a host that differs by case is a different BIP-32 tree, so
+/// caller, and public so the command layer can apply it BEFORE it puts a host
+/// on an approval card. A card for a request that could never succeed teaches
+/// the owner to press without reading, and a host that reaches a card without
+/// passing here could also be non-ASCII, which the card's byte slicing would
+/// panic on.
+/// a host that differs by case is a different BIP-32 tree, so
 /// `Mint.Example` and `mint.example` would each hold notes the other cannot
 /// see. Uppercase is refused rather than folded, because folding it silently
 /// would leave the caller believing it provisioned what it typed.
-fn valid_host(host: &str) -> bool {
+pub fn valid_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= MAX_HOST_LEN
         && host

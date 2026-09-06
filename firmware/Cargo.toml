@@ -35,7 +35,7 @@ c6 = []
 demo-game = []
 
 [dependencies]
-heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen", "ota-sign", "seed-encrypt"] }
+heartwood-common = { path = "../common", default-features = false, features = ["nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen", "ota-sign", "seed-encrypt", "cash"] }
 
 # Crypto — libsecp256k1 C FFI (alignment-safe on Xtensa, unlike k256)
 # BIP-340 verification otherwise links libsecp256k1's ~1.1 MB default

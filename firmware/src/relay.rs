@@ -558,6 +558,16 @@ fn set_network_runtime(
         wifi_connected,
         relay_connected,
         last_error_class,
+        // Carried across a stage change, and cleared the instant no relay is
+        // being served. A stale index would name a relay that is no longer
+        // answering, which is worse than admitting we are between sessions:
+        // the whole point of reporting it is to tell "deaf on the relay you
+        // can reach" apart from "offline".
+        relay_index: if relay_connected {
+            ctx.network_runtime.relay_index
+        } else {
+            None
+        },
     };
     if ctx.network_runtime == next {
         return;
@@ -1113,6 +1123,11 @@ pub fn run_wifi_standalone<'d, 'b>(
                         ctx.relay_url = url;
                         sessions.push(s);
                         retune_recv_timeouts(&mut sessions);
+                        // Publish which relay this actually is before the
+                        // status update, so the two land together and a host
+                        // never reads `relay_connected: true` with no index.
+                        ctx.network_runtime.relay_index =
+                            u8::try_from(relay_idx % relays.len()).ok();
                         set_network_runtime(
                             &mut ctx,
                             NetworkRuntimeStage::SubscriptionSent,

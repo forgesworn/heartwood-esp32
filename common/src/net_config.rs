@@ -59,8 +59,9 @@ pub enum NetworkRuntimeError {
 
 /// Additive runtime portion of `GET_NET_CONFIG`.
 ///
-/// All fields are booleans or closed enums so future callers cannot
-/// accidentally surface a network identifier through this type.
+/// All fields are booleans, closed enums, or an index into a list the same
+/// response already returns in full, so future callers cannot accidentally
+/// surface a network identifier through this type.
 #[cfg(feature = "nip46")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkRuntimeStatus {
@@ -68,6 +69,22 @@ pub struct NetworkRuntimeStatus {
     pub wifi_connected: bool,
     pub relay_connected: bool,
     pub last_error_class: NetworkRuntimeError,
+    /// Which configured relay is actually being served, as a position in the
+    /// `relays` array of the same response — `None` while none is.
+    ///
+    /// The signer listens to ONE relay at a time and fails over on silence,
+    /// while clients publish to every relay in the bunker URI. So a client can
+    /// be talking to four relays, three of those publishes are wasted, and the
+    /// fourth is the only one that matters — with no way to tell which. That
+    /// makes "the signer is deaf on the relay you can reach" indistinguishable
+    /// from "the signer is offline", and an unexplained multi-minute stall is
+    /// what an operator actually experiences (see #92).
+    ///
+    /// An index rather than a URL, deliberately: it names a position in a list
+    /// the caller is already holding, so it discloses nothing the response did
+    /// not already carry, and this type stays `Copy` and identifier-free.
+    #[serde(default)]
+    pub relay_index: Option<u8>,
 }
 
 #[cfg(feature = "nip46")]
@@ -78,6 +95,7 @@ impl NetworkRuntimeStatus {
             wifi_connected: false,
             relay_connected: false,
             last_error_class: NetworkRuntimeError::None,
+            relay_index: None,
         }
     }
 
@@ -87,6 +105,7 @@ impl NetworkRuntimeStatus {
             wifi_connected: false,
             relay_connected: false,
             last_error_class: NetworkRuntimeError::None,
+            relay_index: None,
         }
     }
 }
@@ -890,6 +909,7 @@ mod tests {
             wifi_connected: true,
             relay_connected: false,
             last_error_class: NetworkRuntimeError::WebsocketUpgrade,
+            relay_index: None,
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(
@@ -899,6 +919,7 @@ mod tests {
                 "wifi_connected": true,
                 "relay_connected": false,
                 "last_error_class": "websocket_upgrade",
+                "relay_index": serde_json::Value::Null,
             })
         );
         let keys = value
@@ -907,15 +928,51 @@ mod tests {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        // The whole key set, asserted exactly: this object is the one place a
+        // network identifier could leak out of the read-only status frame, so
+        // a new field has to be a deliberate edit here rather than a surprise.
         assert_eq!(
             keys,
             vec![
                 "last_error_class",
                 "relay_connected",
+                "relay_index",
                 "stage",
                 "wifi_connected"
             ]
         );
+    }
+
+    #[test]
+    fn a_served_relay_is_reported_as_a_position_not_a_url() {
+        // The signer listens to one relay at a time while clients publish to
+        // all of them, so "which one" is the difference between "deaf on the
+        // relay you can reach" and "offline" (#92). It travels as an index
+        // into the `relays` array the same response already returns, never as
+        // a URL — that keeps this type Copy and identifier-free.
+        let status = NetworkRuntimeStatus {
+            stage: NetworkRuntimeStage::Online,
+            wifi_connected: true,
+            relay_connected: true,
+            last_error_class: NetworkRuntimeError::None,
+            relay_index: Some(1),
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["relay_index"], serde_json::json!(1));
+        assert!(value.as_object().unwrap().values().all(|v| !v
+            .as_str()
+            .is_some_and(|s| s.contains("://"))));
+    }
+
+    #[test]
+    fn a_status_from_firmware_without_the_index_still_parses() {
+        // Additive field: an older device answering 0x5C omits it entirely,
+        // and a host that refused to parse that would break on every board it
+        // has not yet updated.
+        let older = br#"{"stage":"online","wifi_connected":true,"relay_connected":true,"last_error_class":"none"}"#;
+        let status: NetworkRuntimeStatus = serde_json::from_slice(older).unwrap();
+        assert_eq!(status.relay_index, None);
+        assert!(status.relay_connected);
     }
 
     #[test]

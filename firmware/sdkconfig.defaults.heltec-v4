@@ -42,3 +42,16 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # size at 8MB means a V4 with a 16MB variant simply under-uses the remaining
 # space.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# Run the CPU at the 240 MHz this chip supports, not the 160 MHz default.
+#
+# Straight 1.5x on everything compute-bound, for one line and no code change.
+# The unseal is the case that made this visible -- ~29 s per sealed slot, and
+# a cycle count says it should be a fraction of that (#121) -- but the same
+# applies to every KDF on the device, including the note-key derivations and
+# the at-rest rewrap.
+#
+# The cost is power draw, which matters for a battery-run signer and not at
+# all for a USB-powered one. Revisit if this firmware ever ships on a board
+# expected to run from its battery connector for long stretches.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y

@@ -649,6 +649,9 @@ struct RelaySession {
     last_ping: Instant,
     last_resub: Instant,
     recv_timeout_on: bool,
+    /// Wall clock from this relay's `Date` header at upgrade, if it sent one.
+    /// The signer has no RTC; this is where it learns the time.
+    server_time: Option<u64>,
     /// The subscription REQ sent at connect, re-sent periodically to self-heal.
     sub_req: String,
     pinned: bool,
@@ -1637,7 +1640,7 @@ fn connect_relay_raw(
     // one absolute deadline, so a partial TLS record cannot restart a blocking
     // socket timeout. The original fd flags are restored before this returns.
     let upgrade_started = Instant::now();
-    ws_handshake(&mut tls, &host, upgrade_started)?;
+    let server_time = ws_handshake(&mut tls, &host, upgrade_started)?;
     log::info!("[relay] websocket open ({url})");
 
     // From here on, reads are paced by a shorter recv timeout so the pump wakes
@@ -1680,6 +1683,7 @@ fn connect_relay_raw(
         last_ping: now,
         last_resub: now,
         recv_timeout_on,
+        server_time,
         sub_req,
         pinned,
         skip: 0,
@@ -1699,22 +1703,7 @@ pub const VAULT_DELIVERY_KIND: u64 = 24136;
 /// How often a locked signer re-announces. Ephemeral events are not stored,
 /// so an operator who opens Sapwood after the boot must still hear it.
 const LOCKED_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
-/// Ask the relay for the single newest note and read its `created_at` as
-/// "now", on subscription id `clk`. The signer has no clock of its own and the
-/// main loop already learns
-/// one exactly this way (`ReplyClock::observe` on every event it receives) —
-/// but the locked phase subscribes with `limit: 0` to one kind that only
-/// arrives *after* the announcement it is trying to stamp, so it must ask.
-/// A relay could lie about the time. It costs deliverability, never secrecy:
-/// the vault key is NIP-44 sealed to the one-time unlock key either way, and
-/// this announcement is already unauthenticated by design (see the security
-/// notes on `locked_relay_phase`).
-const CLOCK_REQ: &str = r#"["REQ","clk",{"kinds":[1],"limit":1}]"#;
-/// Drop the clock subscription the moment it has answered. `limit: 1` bounds
-/// the stored replay only — the relay keeps streaming new notes live after
-/// EOSE, and a kind-1 firehose into the locked loop would starve the unlock
-/// it exists to serve.
-const CLOCK_CLOSE: &str = r#"["CLOSE","clk"]"#;
+
 
 /// Publish the locked-boot announcement: a one-time unlock pubkey the
 /// operator's Sapwood can encrypt the vault key to. See the security notes on
@@ -1913,17 +1902,29 @@ fn locked_relay_phase(
         // (Re)connect round-robin until a relay holds.
         if session.is_none() && wifi.is_up().unwrap_or(false) {
             match connect_relay_raw(&relays[relay_idx], sub_req.clone(), false, true) {
-                Ok(mut s) => {
+                Ok(s) => {
                     log::info!("[relay] locked: connected {}", relays[relay_idx]);
-                    // Ask this relay what time it is before announcing to it.
-                    // A reading from the previous relay is not carried over:
-                    // the dial that failed may have been minutes ago.
+                    // The upgrade response already told us the time. A reading
+                    // from the previous relay is not carried over: the dial
+                    // that failed may have been minutes ago.
                     clock = heartwood_common::reply_clock::ReplyClock::new();
-                    if let Err(e) = ws_send(&mut s.tls, OP_TEXT, CLOCK_REQ.as_bytes()) {
-                        log::warn!("[relay] locked: clock REQ failed on {}: {e}", relays[relay_idx]);
-                        relay_idx = (relay_idx + 1) % relays.len();
-                        FreeRtos::delay_ms(1000);
-                        continue;
+                    match s.server_time {
+                        Some(now) => {
+                            clock.observe(now, crate::uptime_s());
+                            log::info!("[relay] locked: clock {now} from Date header");
+                        }
+                        None => {
+                            // No clock, no announcement a relay would keep. Try
+                            // the next one rather than sit here stamping events
+                            // that will be rejected as expired.
+                            log::warn!(
+                                "[relay] locked: no Date header from {}; rotating",
+                                relays[relay_idx]
+                            );
+                            relay_idx = (relay_idx + 1) % relays.len();
+                            FreeRtos::delay_ms(1000);
+                            continue;
+                        }
                     }
                     session = Some(s);
                     // Announce immediately on every (re)connect.
@@ -1968,22 +1969,12 @@ fn locked_relay_phase(
                             serde_json::from_slice::<nip46::RelayEventMessage>(&raw)
                         {
                             let ev = &msg.2;
-                            // Every event carries a clock reading, whichever
-                            // subscription it arrived on. `observe` only ever
-                            // moves the estimate forward, so a backdated event
-                            // cannot drag it into the rejection window.
-                            let had_clock = clock.projected(crate::uptime_s()) > 0;
-                            clock.observe(ev.created_at, crate::uptime_s());
-                            if !had_clock && clock.projected(crate::uptime_s()) > 0 {
-                                // Reading in hand: stop the kind-1 stream
-                                // before it competes with the unlock. A failed
-                                // CLOSE is not fatal — the session is about to
-                                // be torn down and redialled anyway.
-                                if let Err(e) = ws_send(&mut s.tls, OP_TEXT, CLOCK_CLOSE.as_bytes()) {
-                                    log::warn!("[relay] locked: clock CLOSE failed: {e}");
-                                }
-                                log::info!("[relay] locked: clock sampled from relay");
-                            }
+                            // Deliberately NOT fed to the clock. Events are
+                            // stamped by whoever wrote them and can be in the
+                            // future — measured 2026-09-07, one relay's newest
+                            // note was 42 s ahead — and `projected` has no skew
+                            // cap. The Date header is the relay's own clock and
+                            // is the only source used here.
                             if ev.kind == VAULT_DELIVERY_KIND
                                 && handle_vault_delivery(
                                     ev, &unlock_sk, op_mgmt, nvs, masters, display,
@@ -7541,7 +7532,7 @@ enum WsMsg {
     Other,
 }
 
-fn ws_handshake(tls: &mut Tls, host: &str, started: Instant) -> Result<(), String> {
+fn ws_handshake(tls: &mut Tls, host: &str, started: Instant) -> Result<Option<u64>, String> {
     let mut socket_mode = NonblockingSocketGuard::enter(tls)
         .map_err(|e| format!("ws upgrade nonblocking setup: {e}"))?;
     let result = ws_handshake_nonblocking(tls, host, started);
@@ -7549,14 +7540,18 @@ fn ws_handshake(tls: &mut Tls, host: &str, started: Instant) -> Result<(), Strin
         .restore()
         .map_err(|e| format!("ws upgrade socket flags restore: {e}"));
     match (result, restored) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(clock), Ok(())) => Ok(clock),
         (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(restore_error)) => Err(format!("{error}; {restore_error}")),
     }
 }
 
-fn ws_handshake_nonblocking(tls: &mut Tls, host: &str, started: Instant) -> Result<(), String> {
+fn ws_handshake_nonblocking(
+    tls: &mut Tls,
+    host: &str,
+    started: Instant,
+) -> Result<Option<u64>, String> {
     // A fixed Sec-WebSocket-Key is fine for a client that doesn't verify the
     // Accept header — security is TLS + NIP-44, not the WS nonce. (RFC example.)
     let req = format!(
@@ -7584,7 +7579,25 @@ fn ws_handshake_nonblocking(tls: &mut Tls, host: &str, started: Instant) -> Resu
         }
     }
 
-    let mut buf = [0u8; 1024];
+    // 4 KB, on the heap, because 1 KB was not enough for a real relay.
+    //
+    // Measured 2026-09-07 by sending this exact request to the four relays this
+    // firmware ships pointed at: the upgrade response headers were 255, 623,
+    // 748 and 1275 bytes. The 1275-byte one overflowed the old 1 KB stack array
+    // before `\r\n\r\n` appeared, so the loop below hit "headers too large" and
+    // that relay could NEVER be used -- on every boot, silently, with the
+    // rotation quietly falling through to the next one. A relay behind a proxy
+    // that adds a few headers is entirely ordinary; 1 KB was simply too tight.
+    //
+    // Heap rather than a bigger stack array: this runs on the relay task and
+    // 4 KB is a meaningful slice of its stack, while the heap has room.
+    //
+    // Known and deliberately unchanged: bytes arriving after the header
+    // terminator in the same read are discarded rather than handed to the
+    // session's rx buffer. Harmless today because relays send nothing until we
+    // publish a REQ, but it is a latent bug and not one to fix in the same
+    // change as a buffer size.
+    let mut buf = vec![0u8; 4096];
     let mut n = 0usize;
     loop {
         ensure_upgrade_deadline(started)?;
@@ -7623,7 +7636,19 @@ fn ws_handshake_nonblocking(tls: &mut Tls, host: &str, started: Instant) -> Resu
         ));
     }
     ensure_upgrade_deadline(started)?;
-    Ok(())
+    Ok(server_date(resp))
+}
+
+/// The relay's own clock, out of the `Date` header of the upgrade response.
+///
+/// This is the signer's only trustworthy source of wall time: it has no RTC,
+/// and RFC 9110 has every origin server with a clock stamp this on the
+/// response. Absent or unparseable is not an error — the caller simply has no
+/// clock from this relay and behaves as it did before it asked.
+fn server_date(resp: &str) -> Option<u64> {
+    resp.lines()
+        .find(|line| line.len() > 5 && line[..5].eq_ignore_ascii_case("date:"))
+        .and_then(|line| heartwood_common::http_date::parse_http_date(&line[5..]))
 }
 
 fn ensure_upgrade_deadline(started: Instant) -> Result<(), String> {

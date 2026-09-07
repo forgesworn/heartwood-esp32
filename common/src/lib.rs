@@ -11,6 +11,7 @@ pub mod encoding;
 pub mod entropy;
 pub mod frame;
 pub mod hex;
+pub mod http_date;
 pub mod kinds;
 pub mod types;
 pub mod validate;

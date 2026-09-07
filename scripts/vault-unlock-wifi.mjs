@@ -32,6 +32,8 @@ import { finalizeEvent, getPublicKey, nip44, arg, relayList, RelayFanout } from 
 
 const LOCKED_ANNOUNCE_KIND = 24135
 const VAULT_DELIVERY_KIND = 24136
+/** Two announce cycles plus slack; older is a stored replay, not a live offer. */
+const MAX_ANNOUNCE_AGE_SECS = 150
 
 const RELAYS = relayList(argv)
 const KEY_FILE = arg(argv, '--key-file', `${env.HOME}/heartwood-bench/operator.key`)
@@ -77,6 +79,16 @@ const announced = await new Promise((resolve) => {
     if (msg[0] !== 'EVENT' || msg[1] !== 'locked-announce') return
     const ev = msg[2]
     if (ev.kind !== LOCKED_ANNOUNCE_KIND) return
+    // Ephemeral kinds are not supposed to be stored, and some relays store
+    // them anyway: a replayed announcement names a one-time unlock key from a
+    // boot that has already ended, so a delivery to it is silently discarded
+    // and the signer stays locked. The signer re-announces every 60 s, so
+    // anything older than a couple of cycles is a ghost, not an offer.
+    const age = Math.round(Date.now() / 1000) - ev.created_at
+    if (age > MAX_ANNOUNCE_AGE_SECS) {
+      console.log(`  ignoring a ${age}s-old replay of ${ev.pubkey.slice(0, 16)}…`)
+      return
+    }
     clearTimeout(timer)
     resolve({ ev, url })
   })

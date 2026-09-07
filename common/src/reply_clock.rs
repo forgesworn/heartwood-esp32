@@ -144,6 +144,37 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_sample_keeps_the_locked_announce_fresh_across_re_announcements() {
+        // The locked phase samples one event's created_at when it dials, then
+        // re-announces every 60 s until an operator answers. Every one of those
+        // announcements needs a stamp a relay will still accept, so the reading
+        // has to advance with uptime rather than repeat the instant it was
+        // taken — a stamp frozen at dial time would age back out of the
+        // ephemeral window it was sampled to stay inside (#116).
+        let mut clock = ReplyClock::new();
+        clock.observe(REQ, 30);
+        assert_eq!(clock.projected(30), REQ);
+        assert_eq!(clock.projected(90), REQ + 60);
+        assert_eq!(clock.projected(150), REQ + 120);
+    }
+
+    #[test]
+    fn a_stale_first_sample_is_corrected_by_the_next_event_and_never_undone() {
+        // Nothing obliges a relay to answer the clock REQ with something
+        // recent. A stale reading still beats boot time, and the next event to
+        // arrive pulls the estimate forward; an older one after that must not
+        // push it back, or a backdated seal could walk the announce into the
+        // rejection window it exists to avoid.
+        let mut clock = ReplyClock::new();
+        clock.observe(REQ - 3_600, 10);
+        assert_eq!(clock.projected(10), REQ - 3_600);
+        clock.observe(REQ, 20);
+        assert_eq!(clock.projected(20), REQ);
+        clock.observe(REQ - 7_200, 30);
+        assert_eq!(clock.projected(30), REQ + 10);
+    }
+
+    #[test]
     fn a_backdated_event_never_drags_the_clock_backwards() {
         let mut clock = ReplyClock::new();
         clock.observe(REQ, 100);

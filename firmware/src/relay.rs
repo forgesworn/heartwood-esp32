@@ -1684,6 +1684,22 @@ pub const VAULT_DELIVERY_KIND: u64 = 24136;
 /// How often a locked signer re-announces. Ephemeral events are not stored,
 /// so an operator who opens Sapwood after the boot must still hear it.
 const LOCKED_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+/// Ask the relay for the single newest note and read its `created_at` as
+/// "now", on subscription id `clk`. The signer has no clock of its own and the
+/// main loop already learns
+/// one exactly this way (`ReplyClock::observe` on every event it receives) —
+/// but the locked phase subscribes with `limit: 0` to one kind that only
+/// arrives *after* the announcement it is trying to stamp, so it must ask.
+/// A relay could lie about the time. It costs deliverability, never secrecy:
+/// the vault key is NIP-44 sealed to the one-time unlock key either way, and
+/// this announcement is already unauthenticated by design (see the security
+/// notes on `locked_relay_phase`).
+const CLOCK_REQ: &str = r#"["REQ","clk",{"kinds":[1],"limit":1}]"#;
+/// Drop the clock subscription the moment it has answered. `limit: 1` bounds
+/// the stored replay only — the relay keeps streaming new notes live after
+/// EOSE, and a kind-1 firehose into the locked loop would starve the unlock
+/// it exists to serve.
+const CLOCK_CLOSE: &str = r#"["CLOSE","clk"]"#;
 
 /// Publish the locked-boot announcement: a one-time unlock pubkey the
 /// operator's Sapwood can encrypt the vault key to. See the security notes on
@@ -1694,12 +1710,23 @@ fn publish_locked_announce(
     unlock_sk: &[u8; 32],
     unlock_pk_hex: &str,
     op_mgmt: &[u8; 32],
+    created_at: u64,
 ) -> Result<(), String> {
     let unsigned = UnsignedEvent {
         pubkey: unlock_pk_hex.to_string(),
-        // No wall clock on the signer; ephemeral events are never stored, so
-        // relays do not age-filter them. Seconds-since-boot is fine here.
-        created_at: (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u64,
+        // Wall clock, sampled from the relay — NOT seconds-since-boot, which is
+        // what this used to send. Relays age-filter ephemeral events precisely
+        // *because* they are forwarded live rather than stored, and a freshly
+        // booted signer stamping `created_at` in the low tens is announcing
+        // from January 1970. Measured 2026-09-07 publishing this very kind:
+        // nos.lol and relay.damus.io both answered `invalid: ephemeral event
+        // expired`, relay.primal.net dropped it with no OK at all, and all
+        // three accepted the identical event carrying a wall clock. The
+        // announcement therefore never reached an operator, the one-time
+        // unlock pubkey was never learned, no kind-24136 delivery could be
+        // addressed, and every unlock fell back to the cable — which is the
+        // whole thing the WiFi path exists to avoid.
+        created_at,
         kind: LOCKED_ANNOUNCE_KIND,
         tags: vec![vec!["p".to_string(), hex_encode(op_mgmt)]],
         content: "{\"status\":\"locked\"}".to_string(),
@@ -1840,6 +1867,12 @@ fn locked_relay_phase(
     let mut next_announce = Instant::now();
     let mut wifi_idx = 0usize;
     let mut next_wifi_attempt = Instant::now();
+    // Wall clock, learned from the relay. Until it has a reading there is
+    // nothing worth publishing: an announcement stamped from boot time is
+    // rejected as an expired ephemeral event, so it would be a signature and a
+    // round trip spent on an event no operator will ever see. Reset per dial —
+    // the sample belongs to the relay that gave it.
+    let mut clock = heartwood_common::reply_clock::ReplyClock::new();
 
     loop {
         crate::wdt::feed();
@@ -1865,8 +1898,18 @@ fn locked_relay_phase(
         // (Re)connect round-robin until a relay holds.
         if session.is_none() && wifi.is_up().unwrap_or(false) {
             match connect_relay_raw(&relays[relay_idx], sub_req.clone(), false, true) {
-                Ok(s) => {
+                Ok(mut s) => {
                     log::info!("[relay] locked: connected {}", relays[relay_idx]);
+                    // Ask this relay what time it is before announcing to it.
+                    // A reading from the previous relay is not carried over:
+                    // the dial that failed may have been minutes ago.
+                    clock = heartwood_common::reply_clock::ReplyClock::new();
+                    if let Err(e) = ws_send(&mut s.tls, OP_TEXT, CLOCK_REQ.as_bytes()) {
+                        log::warn!("[relay] locked: clock REQ failed on {}: {e}", relays[relay_idx]);
+                        relay_idx = (relay_idx + 1) % relays.len();
+                        FreeRtos::delay_ms(1000);
+                        continue;
+                    }
                     session = Some(s);
                     // Announce immediately on every (re)connect.
                     next_announce = Instant::now();
@@ -1880,11 +1923,20 @@ fn locked_relay_phase(
         }
 
         if let Some(s) = session.as_mut() {
-            // Periodic boot announcement.
-            if Instant::now() >= next_announce {
-                if let Err(e) =
-                    publish_locked_announce(&mut s.tls, secp, &unlock_sk, &unlock_pk_hex, op_mgmt)
-                {
+            // Periodic boot announcement, but only once the relay has said what
+            // time it is. Without a reading there is nothing to publish that a
+            // relay would keep, so this waits rather than spending a signature
+            // and a round trip on an event that is rejected as expired.
+            let now_wall = clock.projected(crate::uptime_s());
+            if now_wall > 0 && Instant::now() >= next_announce {
+                if let Err(e) = publish_locked_announce(
+                    &mut s.tls,
+                    secp,
+                    &unlock_sk,
+                    &unlock_pk_hex,
+                    op_mgmt,
+                    now_wall,
+                ) {
                     log::warn!("[relay] locked: announce failed: {e}");
                     session = None;
                     continue;
@@ -1901,6 +1953,22 @@ fn locked_relay_phase(
                             serde_json::from_slice::<nip46::RelayEventMessage>(&raw)
                         {
                             let ev = &msg.2;
+                            // Every event carries a clock reading, whichever
+                            // subscription it arrived on. `observe` only ever
+                            // moves the estimate forward, so a backdated event
+                            // cannot drag it into the rejection window.
+                            let had_clock = clock.projected(crate::uptime_s()) > 0;
+                            clock.observe(ev.created_at, crate::uptime_s());
+                            if !had_clock && clock.projected(crate::uptime_s()) > 0 {
+                                // Reading in hand: stop the kind-1 stream
+                                // before it competes with the unlock. A failed
+                                // CLOSE is not fatal — the session is about to
+                                // be torn down and redialled anyway.
+                                if let Err(e) = ws_send(&mut s.tls, OP_TEXT, CLOCK_CLOSE.as_bytes()) {
+                                    log::warn!("[relay] locked: clock CLOSE failed: {e}");
+                                }
+                                log::info!("[relay] locked: clock sampled from relay");
+                            }
                             if ev.kind == VAULT_DELIVERY_KIND
                                 && handle_vault_delivery(ev, &unlock_sk, op_mgmt, nvs, masters)
                             {

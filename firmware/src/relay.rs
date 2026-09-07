@@ -1985,7 +1985,9 @@ fn locked_relay_phase(
                                 log::info!("[relay] locked: clock sampled from relay");
                             }
                             if ev.kind == VAULT_DELIVERY_KIND
-                                && handle_vault_delivery(ev, &unlock_sk, op_mgmt, nvs, masters)
+                                && handle_vault_delivery(
+                                    ev, &unlock_sk, op_mgmt, nvs, masters, display,
+                                )
                             {
                                 unlock_sk.iter_mut().for_each(|b| *b = 0);
                                 crate::oled::show_error(display, "Unlocked!");
@@ -2120,6 +2122,7 @@ fn handle_vault_delivery(
     op_mgmt: &[u8; 32],
     nvs: &mut EspNvs<NvsDefault>,
     masters: &mut [LoadedMaster],
+    display: &mut Display<'_>,
 ) -> bool {
     if hex_decode(&ev.pubkey).ok().and_then(|v| v.try_into().ok())
         != Some(*op_mgmt)
@@ -2148,7 +2151,11 @@ fn handle_vault_delivery(
             return false;
         }
     };
-    let ok = crate::pin::try_unlock(nvs, masters, &vault_key);
+    // The unseal is the slow part of a WiFi unlock too, and this path has an
+    // OLED in front of the owner just like the cabled one.
+    let ok = crate::pin::try_unlock(nvs, masters, &vault_key, &mut |done, total| {
+        crate::oled::show_unseal_progress(display, done, total)
+    });
     if ok {
         log::info!("[relay] vault key accepted — device unlocked");
         crate::pin::clear_failed_attempts(nvs);

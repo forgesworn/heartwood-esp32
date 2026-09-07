@@ -1544,6 +1544,65 @@ pub fn show_auto_signed(
 /// Display "hold to confirm" with a graphical progress bar filling over time.
 ///
 /// `hold_pct` is 0-100 representing how far through the 2-second hold.
+/// Unsealing progress, one step per encrypted master.
+///
+/// The mirror of what `pin::enable_encryption` already does on the way in: it
+/// draws "Encrypting n/total — Keep power on" because two 100k-round KDFs per
+/// seed is ~17 s of silence and a still card reads as a hung device. Coming
+/// back out was silent, and costs more — roughly 25 s per sealed slot on this
+/// board, so a three-master unlock runs over a minute with nothing on screen.
+/// A silence that long is indistinguishable from a wedged board, and the
+/// operator's rational response is to pull the cable and start again, which
+/// throws the work away and buys another full wait (#117).
+///
+/// `done` slots are finished; `total` is how many are sealed.
+pub fn show_unseal_progress(display: &mut Display<'_>, done: usize, total: usize) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(l.font_body())
+        .text_color(OK)
+        .build();
+
+    Text::new("UNSEALING", Point::new(l.sx(14), l.sy(10)), header).draw(display).ok();
+
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display).ok();
+
+    // "2 of 3", then the reassurance that matters: this is meant to be slow.
+    let label = format!("{} of {}", done.min(total), total);
+    let label_x = l.center_x(label.len() as i32 * Layout::glyph_w(l.font_body()));
+    Text::new(&label, Point::new(label_x, l.sy(32)), body).draw(display).ok();
+
+    let note = "Keep power on";
+    let note_x = l.center_x(note.len() as i32 * Layout::glyph_w(l.font_body()));
+    Text::new(note, Point::new(note_x, l.sy(44)), body).draw(display).ok();
+
+    let bar_y = l.sy(52);
+    let bar_w = l.s(124) as u32;
+    let bar_x = l.sx(2);
+
+    Rectangle::new(Point::new(bar_x, bar_y), Size::new(bar_w, l.s(8) as u32))
+        .into_styled(PrimitiveStyle::with_stroke(MUTED, l.s(1) as u32))
+        .draw(display).ok();
+
+    let pct = if total == 0 { 0 } else { (done.min(total) * 100 / total) as u32 };
+    let fill_w = (pct * (bar_w - l.s(2) as u32)) / 100;
+    if fill_w > 0 {
+        Rectangle::new(Point::new(bar_x + l.s(1), bar_y + l.s(1)), Size::new(fill_w, l.s(6) as u32))
+            .into_styled(PrimitiveStyle::with_fill(OK))
+            .draw(display).ok();
+    }
+
+    display.flush().ok();
+}
+
 pub fn show_hold_progress(display: &mut Display<'_>, hold_pct: u32) {
     let l = layout(display);
     display.clear_buffer();

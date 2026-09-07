@@ -155,8 +155,15 @@ pub fn try_unlock(
     nvs: &EspNvs<NvsDefault>,
     masters: &mut [LoadedMaster],
     pin: &[u8],
+    on_progress: &mut dyn FnMut(usize, usize),
 ) -> bool {
     // Decrypt all first; only commit to `masters` once every slot succeeds.
+    //
+    // `on_progress(done, sealed)` fires BEFORE each stretch rather than after.
+    // The whole point is to say what is happening during the ~25 s a slot
+    // costs on this board, not to report it once it is already over (#117).
+    let sealed = masters.iter().filter(|m| m.locked).count();
+    let mut done = 0usize;
     let mut decrypted: Vec<(usize, [u8; 32])> = Vec::new();
     for (i, m) in masters.iter().enumerate() {
         // Yield so IDLE0 runs between per-slot KDF stretches (its watchdog
@@ -166,15 +173,20 @@ pub fn try_unlock(
         if !m.locked {
             continue;
         }
+        on_progress(done, sealed);
         let blob = match masters::read_secret_enc(nvs, m.slot) {
             Some(b) => b,
             None => return false, // marked locked but no blob — inconsistent
         };
         match decrypt_seed(pin, &blob) {
-            Ok(seed) => decrypted.push((i, seed)),
+            Ok(seed) => {
+                decrypted.push((i, seed));
+                done += 1;
+            }
             Err(_) => return false, // wrong PIN (or tampered blob)
         }
     }
+    on_progress(done, sealed);
     for (i, seed) in decrypted {
         masters[i].secret = seed;
         masters[i].locked = false;
@@ -211,7 +223,9 @@ pub fn handle_pin_unlock(
         return false;
     }
 
-    if try_unlock(nvs, masters, payload) {
+    if try_unlock(nvs, masters, payload, &mut |done, total| {
+        crate::oled::show_unseal_progress(display, done, total)
+    }) {
         log::info!("PIN verified — seeds decrypted, device unlocked");
         *failed_attempts = 0;
         clear_failed_attempts(nvs);
@@ -458,7 +472,9 @@ pub fn handle_vault_unlock(
         return false;
     }
 
-    if try_unlock(nvs, masters, payload) {
+    if try_unlock(nvs, masters, payload, &mut |done, total| {
+        crate::oled::show_unseal_progress(display, done, total)
+    }) {
         log::info!("Vault key accepted — seeds decrypted, device unlocked");
         // A prior PIN-attempt counter is meaningless after a successful
         // vault unlock — clear it so a later PIN attempt starts fresh.

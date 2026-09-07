@@ -68,6 +68,20 @@ export async function openFramedPort(path, { env = process.env, baudRate = 11520
 
   return {
     port,
+    /**
+     * Arm a listener for one of `want` without sending anything.
+     *
+     * For callers that own their own send/retry policy — `authenticateSession`
+     * arms before every send precisely so a fast ACK cannot land in the gap
+     * between writing and starting to listen.
+     */
+    waitFor(want, timeoutMs) {
+      return waitFor(want.includes(NACK) ? want : [...want, NACK])(timeoutMs)
+    },
+    /** Write one frame. Pair with `waitFor` when you are driving the retries. */
+    send(type, payload = Buffer.alloc(0)) {
+      port.write(buildFrame(type, payload))
+    },
     /** Fire a frame and wait for one of `want` (NACK always included). */
     request(type, want, { payload = Buffer.alloc(0), deadlineMs = 90_000, intervalMs = 2_000 } = {}) {
       const wanted = want.includes(NACK) ? want : [...want, NACK]

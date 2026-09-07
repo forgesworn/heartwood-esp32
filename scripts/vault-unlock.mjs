@@ -8,33 +8,40 @@
 //
 // Native USB can enumerate before the locked command loop is ready, so session
 // auth retries for up to a minute. The unseal then runs a deliberately slow KDF
-// per identity (~26 s for three masters on a V4), so its ACK wait is generous.
+// per identity, so its ACK wait is generous: measured 2026-09-07 on a bench V4
+// with three masters, ACK came back 73.8 s after SESSION_ACK, not the ~26 s
+// this file used to claim. A wait that long with nothing on the terminal is
+// the whole reason for the heartbeat below.
+//
+// Two things this does before and during that wait, both learned the hard way
+// on 2026-09-07 (see #117):
+//
+//   * It asks PROVISION_LIST first. An unlock sent blind to a device that is
+//     already unlocked runs the whole KDF only to answer `already unlocked`,
+//     which is 25 s spent to learn nothing. `locked` is in that reply, it is
+//     served in the locked relay phase, and it costs one round trip.
+//   * It ticks while the unseal runs. A silent 25 s is indistinguishable from
+//     a wedged board, which is exactly what makes an operator pull the cable
+//     and start again — and the second attempt then hits the case above.
 //
 // Usage:
 //   node scripts/vault-unlock.mjs --port /dev/cu.usbmodemXXXX \
 //     --secret-file ~/heartwood-bench/bridge.secret \
 //     --vault-key-file ~/heartwood-bench/vault.key
+//   [--force]   unlock even if the device reports itself already unlocked
 
-import { argv, env } from 'node:process'
+import { argv, env, stdout } from 'node:process'
 import { readFileSync } from 'node:fs'
+
+import { ACK, NACK } from './lib/frame.mjs'
+import { openFramedPort } from './lib/port.mjs'
 import { authenticateSession } from './lib/session-auth.mjs'
 
-const { SerialPort } = await (async () => {
-  const candidates = [
-    'serialport',
-    new URL(`${env.SAPWOOD_DIR ?? '../sapwood'}/node_modules/serialport/dist/index.js`,
-      new URL('../', import.meta.url)).href,
-  ]
-  for (const c of candidates) {
-    try {
-      return await import(c)
-    } catch {
-      // try the next candidate
-    }
-  }
-  console.error('cannot resolve node-serialport; set SAPWOOD_DIR to a checkout that has it')
-  process.exit(2)
-})()
+const PROVISION_LIST = 0x05
+const PROVISION_LIST_RESPONSE = 0x07
+const SESSION_AUTH = 0x21
+const SESSION_ACK = 0x22
+const VAULT_UNLOCK = 0x63
 
 function arg(name) {
   const i = argv.indexOf(name)
@@ -53,112 +60,91 @@ function readHex32(path, what) {
 const PORT = arg('--port')
 const SECRET_FILE = arg('--secret-file')
 const VAULT_KEY_FILE = arg('--vault-key-file')
+const FORCE = argv.includes('--force')
 if (!PORT || !SECRET_FILE || !VAULT_KEY_FILE) {
   console.error(
-    'usage: node scripts/vault-unlock.mjs --port <port> --secret-file <path> --vault-key-file <path>')
+    'usage: node scripts/vault-unlock.mjs --port <port> --secret-file <path> --vault-key-file <path> [--force]')
   process.exit(2)
 }
 
 const secret = readHex32(SECRET_FILE, 'bridge secret')
 const vaultKey = readHex32(VAULT_KEY_FILE, 'vault key')
 
-const MAGIC = [0x48, 0x57]
-const SESSION_AUTH = 0x21
-const SESSION_ACK = 0x22
-const VAULT_UNLOCK = 0x63
-const ACK = 0x06
-const NACK = 0x15
-
-const CRC_TABLE = (() => {
-  const t = new Uint32Array(256)
-  for (let n = 0; n < 256; n++) {
-    let c = n
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-    t[n] = c >>> 0
-  }
-  return t
-})()
-
-function crc32(bytes) {
-  let c = 0xffffffff
-  for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8)
-  return (c ^ 0xffffffff) >>> 0
-}
-
-function buildFrame(type, payload) {
-  const head = Buffer.from([type, (payload.length >> 8) & 0xff, payload.length & 0xff])
-  const body = Buffer.concat([head, payload])
-  const crc = Buffer.alloc(4)
-  crc.writeUInt32BE(crc32(body))
-  return Buffer.concat([Buffer.from(MAGIC), body, crc])
-}
-
-function readFrame(port, want, timeoutMs) {
-  return new Promise((resolve) => {
-    let buf = Buffer.alloc(0)
-    const done = (v) => {
-      clearTimeout(timer)
-      port.removeListener('data', onData)
-      resolve(v)
-    }
-    const timer = setTimeout(() => done(null), timeoutMs)
-    const onData = (chunk) => {
-      buf = Buffer.concat([buf, chunk])
-      for (;;) {
-        const i = buf.indexOf(Buffer.from(MAGIC))
-        if (i === -1 || buf.length < i + 5) return
-        const type = buf[i + 2]
-        const len = buf.readUInt16BE(i + 3)
-        if (buf.length < i + 5 + len + 4) return
-        const payload = buf.subarray(i + 5, i + 5 + len)
-        buf = buf.subarray(i + 5 + len + 4)
-        if (want.includes(type)) {
-          done({ type, payload })
-          return
-        }
-      }
-    }
-    port.on('data', onData)
-  })
-}
-
-const port = new SerialPort({ path: PORT, baudRate: 115200 })
-await new Promise((resolve, reject) => {
-  port.once('open', resolve)
-  port.once('error', reject)
+const session = await openFramedPort(PORT, { env }).catch((error) => {
+  console.error(error.message)
+  process.exit(2)
 })
 
+// 1. Is there anything to do? Cheap, and served while locked.
+if (!FORCE) {
+  const listed = await session.request(PROVISION_LIST, [PROVISION_LIST_RESPONSE], {
+    deadlineMs: 10_000,
+  })
+  if (listed && listed.type === PROVISION_LIST_RESPONSE) {
+    try {
+      const masters = JSON.parse(listed.payload.toString())
+      const locked = masters.filter((m) => m.locked)
+      if (masters.length && locked.length === 0) {
+        console.log(`Already unlocked — ${masters.length} master(s), none sealed. Nothing to do.`)
+        session.close()
+        process.exit(0)
+      }
+      console.log(`${locked.length} of ${masters.length} master(s) sealed; unlocking.`)
+    } catch {
+      // A reply we cannot read is not a reason to refuse the unlock.
+      console.log('Could not read the master list; unlocking anyway.')
+    }
+  }
+  // No reply is not "unlocked": a device mid-KDF or still enumerating simply
+  // has not answered yet, and refusing here would be worse than the 25 s.
+}
+
+// 2. Authenticate. Retries because native USB can enumerate before the
+//    firmware reaches its locked command loop.
 const authResult = await authenticateSession({
-  sendAuth: () => port.write(buildFrame(SESSION_AUTH, secret)),
-  waitForAck: (timeoutMs) => readFrame(port, [SESSION_ACK], timeoutMs),
+  sendAuth: () => session.send(SESSION_AUTH, secret),
+  waitForAck: (timeoutMs) => session.waitFor([SESSION_ACK], timeoutMs),
   onAttempt: (attempt, attempts) => console.log(`SESSION_AUTH (${attempt}/${attempts})...`),
 })
 if (!authResult) {
   console.error('No SESSION_ACK after 6 attempts over 60 s.')
-  port.close()
+  session.close()
   process.exit(1)
 }
-const auth = authResult.reply
-const code = auth.payload[0]
+const code = authResult.reply.payload[0]
 if (code !== 0x00) {
   console.error(
     code === 0x01 ? 'SESSION_ACK 0x01 — wrong bridge secret.'
       : code === 0x02 ? 'SESSION_ACK 0x02 — no bridge secret configured on the device.'
         : `SESSION_ACK 0x${code.toString(16)} — unexpected.`)
-  port.close()
+  session.close()
   process.exit(1)
 }
-console.log('Authenticated. VAULT_UNLOCK (slow unseal — allow up to 2 minutes)...')
-port.write(buildFrame(VAULT_UNLOCK, vaultKey))
-const reply = await readFrame(port, [ACK, NACK], 120_000)
-port.close()
 
+// 3. Unseal, and say so while it runs. The device is deriving a key per
+//    identity and cannot answer until it finishes; silence here reads as a
+//    hang, so keep a heartbeat on the terminal.
+console.log('Authenticated. VAULT_UNLOCK — slow unseal, around 75 s for three masters.')
+const started = Date.now()
+const tick = setInterval(() => {
+  const secs = Math.round((Date.now() - started) / 1000)
+  stdout.write(`\r  unsealing... ${secs}s elapsed (do not unplug)`)
+}, 1000)
+
+session.send(VAULT_UNLOCK, vaultKey)
+const reply = await session.waitFor([ACK], 120_000)
+
+clearInterval(tick)
+stdout.write('\r'.padEnd(50) + '\r')
+session.close()
+
+const took = ((Date.now() - started) / 1000).toFixed(1)
 if (!reply) {
-  console.error('No reply within 120 s.')
+  console.error(`No reply within 120 s (waited ${took}s).`)
   process.exit(1)
 }
 if (reply.type === ACK) {
-  console.log('ACK — device unlocked; seeds unsealed and boot continuing.')
+  console.log(`ACK in ${took}s — device unlocked; seeds unsealed and boot continuing.`)
   process.exit(0)
 }
 console.error(`NACK — ${reply.payload.toString() || 'unlock refused'}.`)

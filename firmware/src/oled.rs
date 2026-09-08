@@ -1071,13 +1071,13 @@ pub fn show_error(display: &mut Display<'_>, msg: &str) {
     }
 }
 
-fn kind_name_line(kind: u64) -> String {
+pub(crate) fn kind_name_line(kind: u64) -> String {
     heartwood_common::kinds::kind_label(kind)
         .unwrap_or("Unknown Kind")
         .to_string()
 }
 
-fn display_app_label(label: &str) -> String {
+pub(crate) fn display_app_label(label: &str) -> String {
     let label = label.trim();
     let label = if label.is_empty() { "app" } else { label };
     let mut chars = label.chars();
@@ -1106,6 +1106,12 @@ fn ellipsize_chars(value: &str, max_chars: usize) -> String {
     let mut out = take_chars(value, max_chars - 3);
     out.push_str("...");
     out
+}
+
+/// The header `show_master_sign_request` draws, framed as the question it is.
+/// Shared so the relay's card log reports the panel's wording, not the label.
+pub(crate) fn master_sign_heading(master_label: &str) -> String {
+    format!("SIGN AS {}?", truncate_str(master_label, 12))
 }
 
 /// Display a signing request with requester, kind, content preview, and countdown.
@@ -1396,8 +1402,7 @@ pub fn show_master_sign_request(
 
     // Header: SIGN AS {label}? — frame it as the question it is, like the
     // per-app screen, so it doesn't read as a bare label.
-    let label = truncate_str(master_label, 12);
-    let heading = format!("SIGN AS {}?", label);
+    let heading = master_sign_heading(master_label);
     Text::new(&heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))

@@ -3779,20 +3779,11 @@ fn queue_button_ask(
                 // card that names the whole batch (tick_button_card).
                 card.last_remaining = u32::MAX;
                 card.armed = false;
-                // Log what the card now READS, not just how many asks it
-                // holds: the bench needs to check the wording that a hold
-                // answers without a camera on the OLED.
-                let reads = card
-                    .asks
-                    .first()
-                    .and_then(|first| note_card_header(&first.ask.request.method))
-                    .map(|header| {
-                        let (head, title) = note_batch_card(header, &card.asks);
-                        format!("; card reads '{head}' / '{}'", title.replace('\n', " / "))
-                    })
-                    .unwrap_or_default();
+                // The wording belongs to draw_button_card, which logs it on
+                // the redraw the MAX above forces. Reporting it here too gave
+                // a bench two "card reads" lines for one card.
                 log::info!(
-                    "[relay] {request_id} joins the open approval card ({} asks){reads}",
+                    "[relay] {request_id} joins the open approval card ({} asks)",
                     card.asks.len()
                 );
             }
@@ -3839,6 +3830,9 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         return;
     }
 
+    // First draw of this wording: a join sets last_remaining back to MAX to
+    // force a redraw, so a card that grows logs again with what it now says.
+    let first_draw = ctx.button_cards[0].last_remaining == u32::MAX;
     if remaining == ctx.button_cards[0].last_remaining {
         return;
     }
@@ -3881,6 +3875,31 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             Draw::Titled("RECEIVE NOTE", title.clone())
         }
     };
+    // What the panel now READS, once per wording, so a bench can check an
+    // amount or a mint without a camera on the OLED (checklist 13, 2b).
+    // Header and body take the roles the renderer gives them, through the
+    // renderer's own helpers, so a line here is the panel's wording and not
+    // the values behind it. Widths are still the renderer's: this says what
+    // was handed to the glass, never whether the glass had room for it.
+    if first_draw {
+        let (head, body) = match &card {
+            Draw::Sign(label, kind) => (
+                "HOLD TO SIGN".to_string(),
+                format!(
+                    "{} / {} / kind {kind}",
+                    crate::oled::display_app_label(label),
+                    crate::oled::kind_name_line(*kind),
+                ),
+            ),
+            Draw::Extension(master_label, method, preview) => (
+                crate::oled::master_sign_heading(master_label),
+                format!("{method} / {preview}"),
+            ),
+            Draw::Titled(header, title) => ((*header).to_string(), title.clone()),
+            Draw::Batch(header, title) => (header.clone(), title.clone()),
+        };
+        log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
+    }
     match card {
         Draw::Sign(label, kind) => {
             crate::oled::show_sign_request(ctx.display, &label, kind, "", remaining)

@@ -1405,10 +1405,12 @@ grant is entirely device-side.
    over the cable a `rename` of it still raises RENAME NOTE. (`discard` and
    `delete` need a PENDING and a SPENT note respectively, so they cannot share
    an export's grant at all; neither is ever covered by one.)
-7. Batch: `heartwood collect` with several notes held. Expect ONE hold for the
-   release of all of them and NO second card for the write-offs (was two
-   holds). Beyond eight notes in one batch the oldest grants are evicted and
-   those write-offs raise a card, which is correct and not a fault.
+7. Batch: `heartwood collect` with several notes held (up to eight, which is
+   `approval_queue::MAX_BATCH` and already the cap on one card). Expect ONE
+   hold for the release of all of them and NO second card for the write-offs,
+   where it used to be two holds. The grant table holds exactly one card's
+   worth, so it is never the binding limit; a ninth ask is refused `busy` at
+   the release stage as it always was.
 
 ## Notes
 

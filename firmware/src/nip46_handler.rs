@@ -88,6 +88,8 @@ fn is_note_method(method: &nip46::Nip46Method) -> bool {
             | nip46::Nip46Method::HeartwoodNoteSend
             | nip46::Nip46Method::HeartwoodNoteTrust
             | nip46::Nip46Method::HeartwoodNoteTrusted
+            | nip46::Nip46Method::HeartwoodNoteAddress
+            | nip46::Nip46Method::HeartwoodNoteClaim
     )
 }
 
@@ -1610,6 +1612,8 @@ fn dispatch_inner(
                 "heartwood_note_send",
                 "heartwood_note_trust",
                 "heartwood_note_trusted",
+                "heartwood_note_address",
+                "heartwood_note_claim",
                 "heartwood_pair_wallet",
             ];
             nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
@@ -1676,8 +1680,14 @@ fn dispatch_inner(
                                     to: &[u8; 32]| {
                         crate::relay::seal_note_wrap(secp, master_secret, secret, meta, to)
                     };
-                    let response =
-                        crate::notes::run_note_cmd_approved(&cmd.to_string(), Some(&mut wrap));
+                    // The served identity is also the root of the address
+                    // branches a mint pays this npub's lightning address to
+                    // (cash_address, claim_key_note).
+                    let response = crate::notes::run_note_cmd_approved(
+                        &cmd.to_string(),
+                        Some(&mut wrap),
+                        Some(master_secret),
+                    );
                     if response.get("ok") == Some(&serde_json::Value::Bool(true)) {
                         nip46::build_result_response(&request.id, &response.to_string())
                             .unwrap_or_default()

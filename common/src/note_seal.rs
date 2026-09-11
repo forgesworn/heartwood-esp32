@@ -207,6 +207,7 @@ mod tests {
             created_at: 1,
             updated_at: 2,
             peer: None,
+            key: None,
         };
         let plain = encode_note(&note).unwrap();
         let sealed = seal(&key(7), &plain, &[4u8; NONCE_LEN]);

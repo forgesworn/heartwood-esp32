@@ -85,6 +85,40 @@ pub(crate) mod backend {
         out.copy_from_slice(child.to_repr().as_ref());
         Ok(out)
     }
+
+    /// `n - key`: the same point's other y. LUD-25 Part 2 names a branch by
+    /// its x coordinate alone, which BIP-340 reads as the EVEN-y point, so a
+    /// branch key whose own point has odd y is negated before any note key is
+    /// derived from it (see `cash_key`).
+    #[cfg(feature = "cash")]
+    pub fn negate(key: &[u8; 32]) -> Result<[u8; 32], &'static str> {
+        use k256::elliptic_curve::ff::PrimeField;
+        let k: Option<k256::Scalar> = k256::Scalar::from_repr(k256::FieldBytes::from(*key)).into();
+        let k = k.ok_or("key out of range")?;
+        if bool::from(k.is_zero()) {
+            return Err("key is zero");
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice((-k).to_repr().as_ref());
+        Ok(out)
+    }
+
+    /// RFC6979 ECDSA over a 32-byte digest, low-S, as `r || s || recovery id`.
+    /// The layout a LUD-25 `ck1` carries: whoever holds the signature recovers
+    /// the public key from it, which is how a mint finds the note it spends.
+    #[cfg(feature = "cash")]
+    pub fn sign_recoverable(secret: &[u8; 32], digest: &[u8; 32]) -> Result<[u8; 65], &'static str> {
+        let key = k256::ecdsa::SigningKey::from_bytes(&k256::FieldBytes::from(*secret))
+            .map_err(|_| "invalid secret key")?;
+        // k256 normalises s to the low half and flips the recovery id to
+        // match, which is what libsecp256k1 does on the firmware backend.
+        let (signature, recovery) =
+            key.sign_prehash_recoverable(digest).map_err(|_| "signing failed")?;
+        let mut out = [0u8; 65];
+        out[..64].copy_from_slice(&signature.to_bytes());
+        out[64] = recovery.to_byte();
+        Ok(out)
+    }
 }
 
 #[cfg(feature = "secp256k1-backend")]
@@ -117,6 +151,30 @@ pub(crate) mod backend {
         let t = Scalar::from_be_bytes(*tweak).map_err(|_| "BIP-32 I_L out of range")?;
         let child = parent.add_tweak(&t).map_err(|_| "BIP-32 derived a zero key")?;
         Ok(child.secret_bytes())
+    }
+
+    /// `n - key`. See the k256 backend's `negate`.
+    #[cfg(feature = "cash")]
+    pub fn negate(key: &[u8; 32]) -> Result<[u8; 32], &'static str> {
+        use secp256k1::SecretKey;
+        let key = SecretKey::from_slice(key).map_err(|_| "key out of range")?;
+        Ok(key.negate().secret_bytes())
+    }
+
+    /// RFC6979 ECDSA, low-S, as `r || s || recovery id`. See the k256
+    /// backend's `sign_recoverable`.
+    #[cfg(feature = "cash")]
+    pub fn sign_recoverable(secret: &[u8; 32], digest: &[u8; 32]) -> Result<[u8; 65], &'static str> {
+        use secp256k1::{Message, SecretKey};
+        let secp = Secp256k1::signing_only();
+        let key = SecretKey::from_slice(secret).map_err(|_| "invalid secret key")?;
+        let (recovery, compact) = secp
+            .sign_ecdsa_recoverable(&Message::from_digest(*digest), &key)
+            .serialize_compact();
+        let mut out = [0u8; 65];
+        out[..64].copy_from_slice(&compact);
+        out[64] = recovery.to_i32() as u8;
+        Ok(out)
     }
 }
 

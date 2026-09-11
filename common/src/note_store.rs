@@ -74,6 +74,11 @@ pub const MAX_SPENT: usize = 4;
 const NOTE_MAGIC: [u8; 4] = *b"HWNB";
 /// v2 appends the Nostr peer. v1 blobs decode with `peer: None`.
 const NOTE_VERSION: u8 = 2;
+/// v3 is v2 plus the [`KeyNote`] a Part 2 note is paid to, and is written
+/// ONLY for those. A plain note stays byte-identical v2, so a firmware that
+/// predates key notes still reads every note it could read before and skips
+/// (never deletes) the ones it cannot.
+const KEY_NOTE_VERSION: u8 = 3;
 
 /// `pending` → `confirmed` → `spent`, exactly the vault lifecycle: a secret
 /// exists and its hash may be registered mint-side (PENDING), the mint has
@@ -125,6 +130,19 @@ pub enum Peer {
     To([u8; 32]),
 }
 
+/// A LUD-25 Part 2 note, paid to one of this device's own keys instead of
+/// sitting behind a hash (`cash_key.rs`). The note's `secret` is then that
+/// key, and the note is spent with a `ck1`, an ownership signature the key
+/// makes, never with the key itself. The mint files the note under `pubkey`.
+///
+/// `index` is where on the owner's address branch the key sits: kept so a
+/// wallet scanning that branch can tell which keys this locker already holds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyNote {
+    pub index: u32,
+    pub pubkey: [u8; 32],
+}
+
 /// A held note, secret included. Never serialise this onto a wire — that is
 /// what [`NoteMeta`] exists for. The secret is zeroised on drop.
 #[derive(Clone)]
@@ -139,13 +157,16 @@ pub struct Note {
     /// 404s and a note nobody can claim. Stored opaquely; never parsed here.
     pub host: String,
     pub label: String,
-    /// Optional LUD-25 mint signature over (note id, amount), hex. Stored
-    /// opaquely for the wallet to verify — the device never interprets it.
+    /// Optional LUD-25 mint signature over (note id, amount): hex for a
+    /// Part 1 note, a `cs1` for a key note. Stored opaquely for the wallet to
+    /// verify — the device never interprets it.
     pub sig: String,
     pub parent_ids: Vec<String>,
     pub created_at: u32,
     pub updated_at: u32,
     pub peer: Option<Peer>,
+    /// Set for a Part 2 note: `secret` is a key, not a preimage.
+    pub key: Option<KeyNote>,
 }
 
 impl Drop for Note {
@@ -173,6 +194,7 @@ pub struct NoteMeta {
     pub created_at: u32,
     pub updated_at: u32,
     pub peer: Option<Peer>,
+    pub key: Option<KeyNote>,
 }
 
 impl Note {
@@ -188,6 +210,7 @@ impl Note {
             created_at: self.created_at,
             updated_at: self.updated_at,
             peer: self.peer,
+            key: self.key,
         }
     }
 }
@@ -290,7 +313,7 @@ pub fn encode_note(note: &Note) -> Result<Vec<u8>, &'static str> {
     if note.label.len() > MAX_LABEL_LEN {
         return Err("label too long");
     }
-    if note.sig.len() > MAX_SIG_LEN || !is_lower_hex_or_empty(&note.sig) {
+    if !valid_sig(&note.sig) {
         return Err("sig malformed");
     }
     if note.parent_ids.len() > MAX_PARENTS {
@@ -298,7 +321,7 @@ pub fn encode_note(note: &Note) -> Result<Vec<u8>, &'static str> {
     }
     let mut out = Vec::with_capacity(64 + SECRET_LEN + note.host.len() + note.label.len());
     out.extend_from_slice(&NOTE_MAGIC);
-    out.push(NOTE_VERSION);
+    out.push(if note.key.is_some() { KEY_NOTE_VERSION } else { NOTE_VERSION });
     out.extend_from_slice(note.id.as_bytes());
     out.push(note.state.to_byte());
     out.extend_from_slice(&note.amount_msat.to_be_bytes());
@@ -329,6 +352,10 @@ pub fn encode_note(note: &Note) -> Result<Vec<u8>, &'static str> {
             out.extend_from_slice(&pk);
         }
     }
+    if let Some(key) = note.key {
+        out.extend_from_slice(&key.index.to_be_bytes());
+        out.extend_from_slice(&key.pubkey);
+    }
     Ok(out)
 }
 
@@ -341,7 +368,7 @@ pub fn decode_note(blob: &[u8]) -> Option<Note> {
         return None;
     }
     let version = r.u8()?;
-    if version != 1 && version != NOTE_VERSION {
+    if !(1..=KEY_NOTE_VERSION).contains(&version) {
         return None;
     }
     let id = r.str_exact(ID_LEN)?;
@@ -357,7 +384,7 @@ pub fn decode_note(blob: &[u8]) -> Option<Note> {
     let host = r.str_prefixed(MAX_HOST_LEN)?;
     let label = r.str_prefixed(MAX_LABEL_LEN)?;
     let sig = r.str_prefixed(MAX_SIG_LEN)?;
-    if !is_lower_hex_or_empty(&sig) {
+    if !valid_sig(&sig) {
         return None;
     }
     let parent_count = r.u8()? as usize;
@@ -382,6 +409,11 @@ pub fn decode_note(blob: &[u8]) -> Option<Note> {
     } else {
         None
     };
+    let key = if version == KEY_NOTE_VERSION {
+        Some(KeyNote { index: r.u32()?, pubkey: r.take(32)?.try_into().ok()? })
+    } else {
+        None
+    };
     if !r.0.is_empty() {
         // Trailing bytes mean the blob is not what it claims to be.
         return None;
@@ -398,6 +430,7 @@ pub fn decode_note(blob: &[u8]) -> Option<Note> {
         created_at,
         updated_at,
         peer,
+        key,
     })
 }
 
@@ -439,6 +472,15 @@ fn is_lower_hex(s: &str) -> bool {
 
 fn is_lower_hex_or_empty(s: &str) -> bool {
     s.is_empty() || is_lower_hex(s)
+}
+
+/// A mint certificate as the locker keeps it: absent, hex (Part 1), or a
+/// lowercase `cs1` (Part 2). Checked, not interpreted: the wallet verifies it.
+fn valid_sig(s: &str) -> bool {
+    s.len() <= MAX_SIG_LEN
+        && (is_lower_hex_or_empty(s)
+            || (!s.bytes().any(|b| b.is_ascii_uppercase())
+                && crate::encoding::decode_cs1(s).is_some()))
 }
 
 /// `sha256(secret)` as lowercase hex — the `h` a wallet registers with the
@@ -806,12 +848,22 @@ impl NoteStore {
         Ok(())
     }
 
-    /// Reveal a CONFIRMED note's secret as hex. State check only — the
-    /// physical gate is the dispatcher's job, exactly the `vault.c` split.
+    /// Reveal a CONFIRMED note's `k1`: its secret as hex, or for a key note
+    /// the `ck1` its key signs, which is what a wallet presents to spend it.
+    /// The key itself never leaves. State check only — the physical gate is
+    /// the dispatcher's job, exactly the `vault.c` split.
     pub fn export_secret(&self, id: &str) -> Result<String, NoteError> {
         self.can_export(id)?;
         let idx = self.find(id)?;
-        Ok(hex_encode(&self.notes[idx].secret))
+        let note = &self.notes[idx];
+        if note.key.is_none() {
+            return Ok(hex_encode(&note.secret));
+        }
+        #[cfg(feature = "cash")]
+        return crate::cash_key::ck1_of(&note.secret).map_err(|_| NoteError::InvalidState);
+        // A build that cannot sign never made a key note, and cannot spend one.
+        #[cfg(not(feature = "cash"))]
+        Err(NoteError::InvalidState)
     }
 
     /// Register an externally-known secret directly as CONFIRMED. Idempotent
@@ -854,28 +906,80 @@ impl NoteStore {
             created_at: now,
             updated_at: now,
             peer: None,
+            key: None,
         };
         self.persist_new(storage, alloc::vec![note])?;
         Ok((id, true))
     }
 
-    /// Store a secret that arrived by gift wrap from `from`, CONFIRMED with
+    /// Store a key note a wallet found by scanning this device's address
+    /// branch (a payment whose wrap never arrived), CONFIRMED and with no
+    /// peer, like an import. `secret` is the key the device derived at
+    /// `key.index`, already checked against `key.pubkey` by the caller.
+    /// Idempotent on the key, so a scan that finds the same note twice keeps
+    /// one entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_key(
+        &mut self,
+        storage: &mut dyn NoteStorage,
+        rng: &mut dyn FnMut(&mut [u8]),
+        secret: &[u8; SECRET_LEN],
+        key: KeyNote,
+        host: &str,
+        amount_msat: u64,
+        sig: &str,
+        now: u32,
+    ) -> Result<(String, bool), NoteError> {
+        if host.is_empty() || host.len() > MAX_HOST_LEN || !valid_sig(sig) {
+            return Err(NoteError::BadRequest);
+        }
+        if let Some(existing) = self.notes.iter().find(|n| n.secret == *secret) {
+            return Ok((existing.id.clone(), false));
+        }
+        self.evict_spent_for_room(storage, 1)?;
+        self.admit_creation(1)?;
+        let id = self.fresh_id(rng, None).ok_or(NoteError::StorageFull)?;
+        let note = Note {
+            id: id.clone(),
+            secret: *secret,
+            state: NoteState::Confirmed,
+            amount_msat,
+            host: host.to_string(),
+            label: String::new(),
+            sig: sig.to_string(),
+            parent_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            peer: None,
+            key: Some(key),
+        };
+        self.persist_new(storage, alloc::vec![note])?;
+        Ok((id, true))
+    }
+
+    /// Store a note that arrived by gift wrap from `from`, CONFIRMED with
     /// provenance. Idempotent on the secret, like import: a relay replaying
     /// the same wrap yields the existing id and no second entry. Subject to
     /// [`MAX_RECEIVED`] unless `trusted`, and to the overall cap always.
+    ///
+    /// `key` is set for a note paid to one of this device's keys, whose
+    /// `secret` is then that key; `sig` is the mint's certificate, if the
+    /// wrap carried one.
     #[allow(clippy::too_many_arguments)]
     pub fn receive(
         &mut self,
         storage: &mut dyn NoteStorage,
         rng: &mut dyn FnMut(&mut [u8]),
         secret: &[u8; SECRET_LEN],
+        key: Option<KeyNote>,
         host: &str,
         amount_msat: u64,
+        sig: &str,
         from: &[u8; 32],
         now: u32,
         trusted: bool,
     ) -> Result<(String, bool), NoteError> {
-        if host.is_empty() || host.len() > MAX_HOST_LEN {
+        if host.is_empty() || host.len() > MAX_HOST_LEN || !valid_sig(sig) {
             return Err(NoteError::BadRequest);
         }
         if let Some(existing) = self.notes.iter().find(|n| n.secret == *secret) {
@@ -894,22 +998,26 @@ impl NoteStore {
             amount_msat,
             host: host.to_string(),
             label: String::new(),
-            sig: String::new(),
+            sig: sig.to_string(),
             parent_ids: Vec::new(),
             created_at: now,
             updated_at: now,
             peer: Some(Peer::From(*from)),
+            key,
         };
         self.persist_new(storage, alloc::vec![note])?;
         Ok((id, true))
     }
 
     /// Whether `mark_sent` (and so a gift-wrapped send) may proceed:
-    /// CONFIRMED and never given to or received from anyone.
+    /// CONFIRMED, never given to or received from anyone, and a plain note.
+    /// A key note's secret is a key, and sealing it into a note URL as if it
+    /// were a `k1` would hand out the key under a name no wallet can spend;
+    /// a wallet rotates it onto a fresh secret first, as it would anyway.
     pub fn can_send(&self, id: &str) -> Result<(), NoteError> {
         let idx = self.find(id)?;
         let n = &self.notes[idx];
-        if n.state != NoteState::Confirmed || n.peer.is_some() {
+        if n.state != NoteState::Confirmed || n.peer.is_some() || n.key.is_some() {
             return Err(NoteError::InvalidState);
         }
         Ok(())
@@ -1114,6 +1222,7 @@ impl NoteStore {
             created_at: now,
             updated_at: now,
             peer: None,
+            key: None,
         })
     }
 
@@ -1284,7 +1393,124 @@ mod tests {
             created_at: 100,
             updated_at: 200,
             peer: Some(Peer::From([0xab; 32])),
+            key: None,
         }
+    }
+
+    // A real certificate, so the codec's cs1 check is exercised against the
+    // encoding rather than a hand-made string (lnurlcash-kit part2.json).
+    const CS1: &str = "cs1kty9p9j2sthw35e7mr9ry8l9qrq4l8ay9el9wst9gt38t942e7m8c05zqmll9t8sycx86f7jkclsl20rdgdlc2cejfx4a8dkcyv8k5cqte7psz";
+
+    fn key_note() -> Note {
+        let mut note = sample_note();
+        note.sig = CS1.to_string();
+        note.key = Some(KeyNote { index: 4_000_000_000, pubkey: [0x5d; 32] });
+        note
+    }
+
+    #[test]
+    fn a_key_note_round_trips_as_v3_and_a_plain_note_stays_v2() {
+        let blob = encode_note(&key_note()).unwrap();
+        assert_eq!(blob[4], KEY_NOTE_VERSION);
+        let back = decode_note(&blob).unwrap();
+        assert_eq!(back.key, Some(KeyNote { index: 4_000_000_000, pubkey: [0x5d; 32] }));
+        assert_eq!(back.sig, CS1);
+        assert_eq!(back.secret, [7u8; SECRET_LEN]);
+
+        // A plain note is written exactly as before, so a firmware that
+        // predates key notes still reads it: the same note without its key
+        // is a v2 blob, shorter by exactly the key trailer.
+        let mut unkeyed = key_note();
+        unkeyed.key = None;
+        let plain = encode_note(&unkeyed).unwrap();
+        assert_eq!(plain[4], NOTE_VERSION);
+        assert_eq!(plain.len() + 4 + 32, blob.len());
+        assert_eq!(plain[5..], blob[5..plain.len()]);
+
+        // v3 without its key trailer, or with one byte too many, is refused.
+        assert!(decode_note(&blob[..blob.len() - 1]).is_none());
+        let mut long = blob.clone();
+        long.push(0);
+        assert!(decode_note(&long).is_none());
+    }
+
+    #[test]
+    fn a_certificate_is_hex_or_a_lowercase_cs1() {
+        let mut note = sample_note();
+        for good in ["", "ab01", CS1] {
+            note.sig = good.to_string();
+            assert!(encode_note(&note).is_ok(), "{good}");
+        }
+        for bad in [
+            CS1.to_uppercase(),
+            format!("{}q", &CS1[..CS1.len() - 1]), // checksum broken
+            "cs1notreally".to_string(),
+            "AB01".to_string(),
+        ] {
+            note.sig = bad.clone();
+            assert!(encode_note(&note).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_key_note_is_received_imported_once_and_never_sent() {
+        let mut storage = FakeStorage::new();
+        let mut store = fresh_store(&mut storage);
+        let mut rng = test_rng();
+        let key = KeyNote { index: 2, pubkey: [0x11; 32] };
+        let (id, created) = store
+            .receive(&mut storage, &mut rng, &[0x42; SECRET_LEN], Some(key), "moneyer.dev/w", 21_000, CS1, &[0xaa; 32], 1, true)
+            .unwrap();
+        assert!(created);
+        let meta = store.get_meta(&id).unwrap();
+        assert_eq!(meta.key, Some(key));
+        assert_eq!(meta.sig, CS1);
+        // The same key found again by a scan is the same note.
+        let (again, created) = store
+            .import_key(&mut storage, &mut rng, &[0x42; SECRET_LEN], key, "moneyer.dev/w", 21_000, CS1, 2)
+            .unwrap();
+        assert_eq!((again.as_str(), created), (id.as_str(), false));
+        assert_eq!(store.can_send(&id), Err(NoteError::InvalidState));
+
+        // A scan claim is an import: no peer, and so not in the letterbox.
+        let other = KeyNote { index: 3, pubkey: [0x12; 32] };
+        let (claimed, _) = store
+            .import_key(&mut storage, &mut rng, &[0x43; SECRET_LEN], other, "moneyer.dev/w", 5_000, "", 3)
+            .unwrap();
+        let meta = store.get_meta(&claimed).unwrap();
+        assert_eq!((meta.peer, meta.key), (None, Some(other)));
+        assert_eq!(store.can_send(&claimed), Err(NoteError::InvalidState));
+        assert!(store
+            .import_key(&mut storage, &mut rng, &[0x44; SECRET_LEN], other, "moneyer.dev/w", 5_000, "AB", 3)
+            .is_err());
+
+        // And every one of it survives a reload.
+        let reloaded = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert_eq!(reloaded.get_meta(&id).unwrap().key, Some(key));
+        assert_eq!(reloaded.get_meta(&claimed).unwrap().key, Some(other));
+    }
+
+    #[cfg(feature = "cash")]
+    #[test]
+    fn a_key_note_exports_its_ck1_and_never_its_key() {
+        // lnurlcash-kit part2.json, the first branch's first note.
+        let secret: [u8; 32] = crate::hex::hex_decode(
+            "c809325604f901c494bebab0f02d74d43cb3d58c143b753c2b749d1733288f64",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let mut storage = FakeStorage::new();
+        let mut store = fresh_store(&mut storage);
+        let mut rng = test_rng();
+        let key = KeyNote { index: 0, pubkey: [0; 32] };
+        let (id, _) = store
+            .import_key(&mut storage, &mut rng, &secret, key, "mint.example/w", 1_000, "", 1)
+            .unwrap();
+        assert_eq!(
+            store.export_secret(&id).unwrap(),
+            "ck18pf5gt7jfqyrxkyy5ssk7y4t9lauyknjpzjnaf2wppq4y3a68vnn92xvfama804vp27hjyn6h6dy5qz6j5vwy4st8uhe3tqv6thyhfgq0xh4cd"
+        );
     }
 
     #[test]
@@ -1333,7 +1559,7 @@ mod tests {
         let bob = [0xb0u8; 32];
 
         let (rid, created) = store
-            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], "mint.example", 5_000, &alice, 10, false)
+            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], None, "mint.example", 5_000, "", &alice, 10, false)
             .unwrap();
         assert!(created);
         let meta = store.get_meta(&rid).unwrap();
@@ -1342,7 +1568,7 @@ mod tests {
         assert_eq!(store.received_count(), 1);
         // Replayed wrap: same secret, same id, nothing new.
         let (again, created) = store
-            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], "other.example", 1, &bob, 11, false)
+            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], None, "other.example", 1, "", &bob, 11, false)
             .unwrap();
         assert_eq!(again, rid);
         assert!(!created);
@@ -1474,7 +1700,7 @@ mod tests {
         }
         assert!(!store.has_room_for_received(true));
         assert_eq!(
-            store.receive(&mut storage, &mut rng, &[0x56; SECRET_LEN], "m.example", 1, &alice, 1, true),
+            store.receive(&mut storage, &mut rng, &[0x56; SECRET_LEN], None, "m.example", 1, "", &alice, 1, true),
             Err(NoteError::StorageFull)
         );
         assert_eq!(
@@ -1491,18 +1717,18 @@ mod tests {
         let alice = [0xa1u8; 32];
         for i in 0..MAX_RECEIVED {
             store
-                .receive(&mut storage, &mut rng, &[i as u8 + 1; SECRET_LEN], "m.example", 1, &alice, 1, false)
+                .receive(&mut storage, &mut rng, &[i as u8 + 1; SECRET_LEN], None, "m.example", 1, "", &alice, 1, false)
                 .unwrap();
         }
         assert_eq!(
-            store.receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], "m.example", 1, &alice, 1, false),
+            store.receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], None, "m.example", 1, "", &alice, 1, false),
             Err(NoteError::StorageFull)
         );
         assert!(!store.has_room_for_received(false));
         // A trusted sender is not bound by the letterbox, only by the locker.
         assert!(store.has_room_for_received(true));
         assert!(store
-            .receive(&mut storage, &mut rng, &[0x78; SECRET_LEN], "m.example", 1, &alice, 1, true)
+            .receive(&mut storage, &mut rng, &[0x78; SECRET_LEN], None, "m.example", 1, "", &alice, 1, true)
             .is_ok());
         assert_eq!(store.received_count(), MAX_RECEIVED + 1);
         store.mark_spent(&mut storage, &store.list(0, 8).notes[MAX_RECEIVED].id.clone(), 2).unwrap();
@@ -1513,7 +1739,7 @@ mod tests {
         store.mark_spent(&mut storage, &id, 3).unwrap();
         assert_eq!(store.received_count(), MAX_RECEIVED - 1);
         assert!(store
-            .receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], "m.example", 1, &alice, 4, false)
+            .receive(&mut storage, &mut rng, &[0x77; SECRET_LEN], None, "m.example", 1, "", &alice, 4, false)
             .is_ok());
         // Nothing was written for the refused one.
         assert!(store.get_meta(&id).unwrap().state == NoteState::Spent);

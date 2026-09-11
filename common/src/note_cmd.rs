@@ -124,6 +124,13 @@ pub struct NoteCmdContext<'a> {
     /// always has.
     #[cfg(feature = "cash")]
     pub cash: &'a mut crate::cash_store::CashRegistry,
+    /// The secret key of the identity this request is served as: the npub a
+    /// lightning address belongs to, and so the root of the address branches
+    /// its payments are minted to (`cash_key.rs`). `None` on a surface with
+    /// no identity (direct USB), where the commands that need it answer
+    /// `bad_request`, as `send` does without a `wrap`.
+    #[cfg(feature = "cash")]
+    pub identity: Option<&'a [u8; 32]>,
 }
 
 /// Hard ceiling on notes per `list_notes` page. A vault-protocol client
@@ -205,6 +212,12 @@ fn meta_json(m: &NoteMeta) -> Value {
         Some(Peer::To(pk)) => {
             obj.insert("sent_to".into(), Value::String(hex_encode(&pk)));
         }
+    }
+    // A key note is filed at the mint under its public key, which is what a
+    // wallet looks it up by (`?p=`) and checks its certificate against.
+    if let Some(key) = m.key {
+        obj.insert("p".into(), Value::String(crate::encoding::encode_cp1(&key.pubkey)));
+        obj.insert("index".into(), json!(key.index));
     }
     Value::Object(obj)
 }
@@ -454,6 +467,87 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             }
         }
 
+        // ---- LUD-25 Part 2: notes paid to this device's own keys ----
+
+        #[cfg(feature = "cash")]
+        "cash_address" => {
+            // The watch-only branch a mint mints this identity's payments to.
+            // No hold: it spends nothing. It does let whoever holds it link
+            // every payment made to it, which is why it goes to a bound
+            // client and, from there, to the one mint it is for.
+            let Some(identity) = ctx.identity else {
+                return err_msg("bad_request", "cash_address is not available on this surface");
+            };
+            let Some(host) = str_field(&cmd, "host") else {
+                return err_msg("bad_request", "host is required");
+            };
+            if !crate::cash_store::valid_host(host) {
+                return err_msg("bad_request", "host must be a lowercase mint host");
+            }
+            let cx1 = match crate::cash_key::address_node(identity, host)
+                .and_then(|node| crate::cash_key::cx1_of(&node))
+            {
+                Ok(cx1) => cx1,
+                Err(m) => return err_msg("bad_request", m),
+            };
+            let Ok(pubkey) = crate::derive::public_key_xonly(identity) else {
+                return err("bad_request");
+            };
+            // The owner's key comes back with it, so a client can check the
+            // branch belongs to the npub the lightning address does.
+            json!({"ok": true, "host": host, "cx1": cx1, "pubkey": hex_encode(&pubkey)})
+        }
+
+        #[cfg(feature = "cash")]
+        "claim_key_note" => {
+            // A payment a wallet found by scanning the branch, whose wrap never
+            // arrived: the device derives the key at `index` and keeps the note.
+            // No hold, as import has none: it discloses nothing and the note
+            // was already this device's.
+            let Some(identity) = ctx.identity else {
+                return err_msg("bad_request", "claim_key_note is not available on this surface");
+            };
+            let Some(host) = str_field(&cmd, "host") else { return err("bad_request") };
+            let Some(amount) = u64_field(&cmd, "amount_msat") else {
+                return err("bad_request");
+            };
+            let Some(index) = u64_field(&cmd, "index").and_then(|i| u32::try_from(i).ok()) else {
+                return err_msg("bad_request", "index must be a uint32");
+            };
+            let sig = str_field(&cmd, "sig").unwrap_or("");
+            let branch = crate::cash_key::branch_host(host);
+            if !crate::cash_store::valid_host(branch) {
+                return err_msg("bad_request", "host must be a lowercase mint host");
+            }
+            // The key the wallet expected, if it says: a claim for a key this
+            // device would not derive is refused, not stored under another.
+            let expected = match str_field(&cmd, "p") {
+                None => None,
+                Some(p) => match crate::encoding::decode_cp1(p) {
+                    Some(pk) => Some(pk),
+                    None => return err_msg("bad_request", "p is not a cp1"),
+                },
+            };
+            let (secret, pubkey) =
+                match crate::cash_key::claim_note_key(identity, branch, index, expected.as_ref()) {
+                    Ok(found) => found,
+                    Err(m) => return err_msg("bad_request", m),
+                };
+            let key = crate::note_store::KeyNote { index, pubkey };
+            match ctx
+                .store
+                .import_key(ctx.storage, ctx.rng, &secret, key, host, amount, sig, ctx.now)
+            {
+                Ok((id, created)) => json!({
+                    "ok": true,
+                    "id": id,
+                    "created": created,
+                    "p": crate::encoding::encode_cp1(&pubkey),
+                }),
+                Err(e) => note_err(e),
+            }
+        }
+
         "list_notes" => {
             let offset = u64_field(&cmd, "offset").unwrap_or(0) as usize;
             let limit = u64_field(&cmd, "limit")
@@ -691,7 +785,7 @@ fn gated_by_id(
 /// The note methods served over the relay path, in the order the
 /// capabilities advert lists them. Rename/delete are deliberately absent:
 /// housekeeping stays a USB-cable operation.
-pub const NOTE_METHODS: [&str; 11] = [
+pub const NOTE_METHODS: [&str; 13] = [
     "heartwood_note_list",
     "heartwood_note_new",
     "heartwood_note_new_pair",
@@ -703,6 +797,8 @@ pub const NOTE_METHODS: [&str; 11] = [
     "heartwood_note_send",
     "heartwood_note_trust",
     "heartwood_note_trusted",
+    "heartwood_note_address",
+    "heartwood_note_claim",
 ];
 
 /// Map a `heartwood_note_*` NIP-46 request onto the wire command object the
@@ -769,6 +865,8 @@ pub fn note_cmd_for_method(method: &str, params: &[Value]) -> Result<Value, &'st
         "heartwood_note_send" => "send",
         "heartwood_note_trust" => "trust",
         "heartwood_note_trusted" => "list_trusted",
+        "heartwood_note_address" => "cash_address",
+        "heartwood_note_claim" => "claim_key_note",
         _ => return Err("unknown note method"),
     };
     let mut fields = match params.first() {
@@ -863,6 +961,8 @@ mod tests {
         cash: crate::cash_store::CashRegistry,
         cash_asked: Vec<String>,
         persist_ok: bool,
+        /// The identity the request is served as; `None` is direct USB.
+        identity: Option<[u8; 32]>,
     }
 
     impl Harness {
@@ -881,6 +981,7 @@ mod tests {
                 cash: crate::cash_store::CashRegistry::new(),
                 cash_asked: Vec::new(),
                 persist_ok: true,
+                identity: Some([7u8; 32]),
             }
         }
 
@@ -930,6 +1031,7 @@ mod tests {
                 fw_version: "0.0.0-test",
                 board: "host",
                 storage_state: "ok",
+                identity: self.identity.as_ref(),
             };
             handle_note_cmd(&mut ctx, msg)
         }
@@ -1691,7 +1793,7 @@ mod tests {
         let mut h = Harness::new();
         let mut rng = |buf: &mut [u8]| buf.fill(9);
         h.store
-            .receive(&mut h.storage, &mut rng, &[5u8; SECRET_LEN], "mint.example/w", 3_000, &[0xaa; 32], 1, false)
+            .receive(&mut h.storage, &mut rng, &[5u8; SECRET_LEN], None, "mint.example/w", 3_000, "", &[0xaa; 32], 1, false)
             .unwrap();
         let list = h.run(r#"{"cmd":"list_notes"}"#);
         assert_eq!(list["notes"][0]["state"], "confirmed");
@@ -1858,5 +1960,101 @@ mod tests {
         let (head, title) = batch_card("DISCARD NOTE", &notes, None);
         assert_eq!(head, "DISCARD 2 NOTES");
         assert_eq!(title, "7 sats @ a.example");
+    }
+
+    // ---- LUD-25 Part 2 ----
+
+    #[test]
+    fn cash_address_hands_out_the_served_identitys_branch() {
+        let mut h = Harness::new();
+        let res = h.run(r#"{"cmd":"cash_address","host":"moneyer.dev"}"#);
+        assert_eq!(res["ok"], true, "{res}");
+        let node = crate::cash_key::address_node(&[7u8; 32], "moneyer.dev").unwrap();
+        assert_eq!(res["cx1"], crate::cash_key::cx1_of(&node).unwrap());
+        assert_eq!(res["pubkey"], hex_encode(&crate::derive::public_key_xonly(&[7u8; 32]).unwrap()));
+        // it spends nothing, so nobody was asked
+        assert!(h.asked.is_empty());
+
+        for bad in ["", "Moneyer.dev", "moneyer.dev/w", "https://moneyer.dev"] {
+            let res = h.run(&format!(r#"{{"cmd":"cash_address","host":"{bad}"}}"#));
+            assert_eq!(res["error"], "bad_request", "{bad}");
+        }
+        h.identity = None;
+        let res = h.run(r#"{"cmd":"cash_address","host":"moneyer.dev"}"#);
+        assert_eq!(res["error"], "bad_request");
+    }
+
+    #[test]
+    fn a_claimed_key_note_lists_its_key_and_exports_its_ck1() {
+        let mut h = Harness::new();
+        let (_, pubkey) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        let cp1 = crate::encoding::encode_cp1(&pubkey);
+        let claim = format!(
+            r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":21000,"p":"{cp1}"}}"#
+        );
+        let res = h.run(&claim);
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!((res["created"].clone(), res["p"].clone()), (json!(true), json!(cp1)));
+        let id = res["id"].as_str().unwrap().to_string();
+        // claimed again, it is the same note
+        assert_eq!(h.run(&claim)["id"], id.as_str());
+
+        let listed = h.run(r#"{"cmd":"list_notes"}"#);
+        let note = &listed["notes"][0];
+        assert_eq!((note["p"].clone(), note["index"].clone()), (json!(cp1), json!(12)));
+        assert_eq!(note["state"], "confirmed");
+        assert!(note.get("from").is_none());
+
+        let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
+        let k1 = res["k1"].as_str().unwrap();
+        assert!(k1.starts_with("ck1"), "{k1}");
+        let (secret, _) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        assert_eq!(k1, crate::cash_key::ck1_of(&secret).unwrap());
+        assert!(!k1.contains(&hex_encode(secret.as_ref())));
+        assert_eq!(h.asked, vec![(GatedCmd::ExportSecret, id.clone())]);
+
+        // and it is never sealed into a wrap as though its key were a k1
+        let res = h.run(&format!(r#"{{"cmd":"send","id":"{id}","to":"{}"}}"#, "bb".repeat(32)));
+        assert_eq!(res["error"], "invalid_state");
+        assert!(h.wrapped.is_empty());
+    }
+
+    #[test]
+    fn a_claim_for_a_key_this_device_would_not_derive_is_refused() {
+        let mut h = Harness::new();
+        let (_, pubkey) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        let cp1 = crate::encoding::encode_cp1(&pubkey);
+        for (index, host) in [(13, "moneyer.dev/w"), (12, "mint.example/w")] {
+            let res = h.run(&format!(
+                r#"{{"cmd":"claim_key_note","host":"{host}","index":{index},"amount_msat":1000,"p":"{cp1}"}}"#
+            ));
+            assert_eq!(res["error"], "bad_request", "{host} {index}");
+        }
+        for bad in [
+            r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":4294967296,"amount_msat":1000}"#,
+            r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000,"p":"cp1nope"}"#,
+            r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000,"sig":"CS1"}"#,
+            r#"{"cmd":"claim_key_note","host":"Moneyer.dev/w","index":1,"amount_msat":1000}"#,
+            r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","amount_msat":1000}"#,
+        ] {
+            assert_eq!(h.run(bad)["error"], "bad_request", "{bad}");
+        }
+        assert_eq!(h.store.counts().0, 0);
+        h.identity = None;
+        let res = h.run(r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000}"#);
+        assert_eq!(res["error"], "bad_request");
+    }
+
+    #[test]
+    fn the_key_note_methods_map_and_are_not_gated() {
+        use crate::nip46::Nip46Method;
+        assert_eq!(note_cmd_for_method("heartwood_note_address", &[]).unwrap()["cmd"], "cash_address");
+        assert_eq!(note_cmd_for_method("heartwood_note_claim", &[]).unwrap()["cmd"], "claim_key_note");
+        for method in ["heartwood_note_address", "heartwood_note_claim"] {
+            assert!(NOTE_METHODS.contains(&method));
+            let parsed = Nip46Method::from_str(method);
+            assert_eq!(parsed.as_str(), method);
+            assert!(!parsed.always_requires_button(), "{method}");
+        }
     }
 }

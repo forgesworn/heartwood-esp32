@@ -66,7 +66,7 @@ lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =
 HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then lnurl-wallet's
 m/139'/1'/d1..d4 and LUD-25's tweak, graded against lnurlcash-kit's
-part2.json and testdata/lud25-nostr-seed.json on both curve backends). The
+part2.json and tests/fixtures/lud25-nostr-seed.json on both curve backends). The
 mint holds only the cx1 (heartwood_note_address, no hold); a key-note wrap
 carries p/i/sig and no secret, and is opened only if the key is ours
 (note_wrap::open_note_rumor). A key note stores its key as the secret plus

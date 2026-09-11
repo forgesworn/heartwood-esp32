@@ -117,36 +117,45 @@ mod tests {
         bytes.try_into().expect("length")
     }
 
-    // lnurlcash-kit test/vectors/part2.json: the first branch's first note
-    // and the first certificate.
-    const CP1: &str = "cp1k5hqh8wd88kazd70fdnef5xj54038jd2j6q8sw2dfy2ev5d45qhsaxrq2j";
-    const PK: &str = "b52e0b9dcd39edd137cf4b6794d0d2a55f13c9aa968078394d49159651b5a02f";
+    // lnurlcash-kit test/vectors/part2.json, read from the fixture rather than
+    // pasted here: the first branch, its first note and the first certificate.
+    fn part2() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap()
+    }
+
+    fn text<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+        value[key].as_str().unwrap_or_else(|| panic!("{key} missing"))
+    }
 
     #[test]
     fn part2_strings_match_the_kit() {
-        assert_eq!(encode_cp1(&unhex(PK)), CP1);
-        assert_eq!(decode_cp1(CP1), Some(unhex(PK)));
+        let vectors = part2();
+        let branch = &vectors["branches"][0];
+        let note = &branch["notes"][0];
+        let pk = unhex::<32>(text(note, "notePubkey"));
+        assert_eq!(encode_cp1(&pk), text(note, "cp1"));
+        assert_eq!(decode_cp1(text(note, "cp1")), Some(pk));
 
-        let sig = "3853442fd24808335884a4216f12ab2ffbc25a7208a53ea54e08415247ba3b2732a8cc4f77d3beac0abd79127abe9a4a005a9518e2560b3f2f98ac0cd2ee4ba500";
-        let ck1 = "ck18pf5gt7jfqyrxkyy5ssk7y4t9lauyknjpzjnaf2wppq4y3a68vnn92xvfama804vp27hjyn6h6dy5qz6j5vwy4st8uhe3tqv6thyhfgq0xh4cd";
-        assert_eq!(encode_ck1(&unhex(sig)), ck1);
-        assert_eq!(decode_ck1(ck1), Some(unhex(sig)));
+        let sig = unhex::<65>(text(note, "ownershipSignature"));
+        assert_eq!(encode_ck1(&sig), text(note, "ck1"));
+        assert_eq!(decode_ck1(text(note, "ck1")), Some(sig));
 
-        let cert = "b2c850964a82eee8d33ed8ca321fe500c15f9fa42e7e57416542e27596aacfb67c3e8206fff2acf0260c7d27d2b63f0fa9e36a1bfc2b19924d5e9db6c1187b5300";
-        let cs1 = "cs1kty9p9j2sthw35e7mr9ry8l9qrq4l8ay9el9wst9gt38t942e7m8c05zqmll9t8sycx86f7jkclsl20rdgdlc2cejfx4a8dkcyv8k5cqte7psz";
-        assert_eq!(decode_cs1(cs1), Some(unhex(cert)));
+        let cert = &vectors["certificates"][0];
+        assert_eq!(decode_cs1(text(cert, "cs1")), Some(unhex(text(cert, "signature"))));
 
-        let cx1 = "cx1wanzqvp77mazu95h0ry7jlxr084fxg6w5w2dk07t4p25hpenqwhdw5wyjc7fn7eapr4jukq0vmcuz3372fy6js6kw77sj50qdaldcmqz9cgz5";
-        let pubkey = unhex::<32>("776620303ef6fa2e169778c9e97cc379ea93234ea394db3fcba8554b873303ae");
-        let chain = unhex::<32>("d751c4963c99fb3d08eb2e580f66f1c1463e5249a9435677bd0951e06f7edc6c");
-        assert_eq!(encode_cx1(&pubkey, &chain), cx1);
-        assert_eq!(decode_cx1(cx1), Some((pubkey, chain)));
+        let pubkey = unhex::<32>(text(branch, "branchPubkey"));
+        let chain = unhex::<32>(text(branch, "chainCode"));
+        assert_eq!(encode_cx1(&pubkey, &chain), text(branch, "cx1"));
+        assert_eq!(decode_cx1(text(branch, "cx1")), Some((pubkey, chain)));
     }
 
     #[test]
     fn part2_strings_are_read_strictly() {
+        let vectors = part2();
+        let note = &vectors["branches"][0]["notes"][0];
+        let cp1 = text(note, "cp1");
         // all uppercase is the same string (BIP-350)
-        assert_eq!(decode_cp1(&CP1.to_uppercase()), Some(unhex(PK)));
+        assert_eq!(decode_cp1(&cp1.to_uppercase()), Some(unhex(text(note, "notePubkey"))));
         // and each of part2.json's invalid cases is refused
         for bad in [
             "ck1k5hqh8wd88kazd70fdnef5xj54038jd2j6q8sw2dfy2ev5d45qhs89dv0n", // wrong hrp
@@ -157,7 +166,7 @@ mod tests {
         ] {
             assert_eq!(decode_cp1(bad), None, "{bad}");
         }
-        assert_eq!(decode_ck1(CP1), None, "a cp1 is not a ck1");
+        assert_eq!(decode_ck1(cp1), None, "a cp1 is not a ck1");
         assert_eq!(
             decode_cx1("cx1k5hqh8wd88kazd70fdnef5xj54038jd2j6q8sw2dfy2ev5d45qhsnvwp55"),
             None,

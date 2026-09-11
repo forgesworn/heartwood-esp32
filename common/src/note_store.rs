@@ -1494,12 +1494,13 @@ mod tests {
     #[test]
     fn a_key_note_exports_its_ck1_and_never_its_key() {
         // lnurlcash-kit part2.json, the first branch's first note.
-        let secret: [u8; 32] = crate::hex::hex_decode(
-            "c809325604f901c494bebab0f02d74d43cb3d58c143b753c2b749d1733288f64",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
+        let note = &vectors["branches"][0]["notes"][0];
+        let secret: [u8; 32] = crate::hex::hex_decode(note["noteSecretKey"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         let mut storage = FakeStorage::new();
         let mut store = fresh_store(&mut storage);
         let mut rng = test_rng();
@@ -1507,10 +1508,7 @@ mod tests {
         let (id, _) = store
             .import_key(&mut storage, &mut rng, &secret, key, "mint.example/w", 1_000, "", 1)
             .unwrap();
-        assert_eq!(
-            store.export_secret(&id).unwrap(),
-            "ck18pf5gt7jfqyrxkyy5ssk7y4t9lauyknjpzjnaf2wppq4y3a68vnn92xvfama804vp27hjyn6h6dy5qz6j5vwy4st8uhe3tqv6thyhfgq0xh4cd"
-        );
+        assert_eq!(store.export_secret(&id).unwrap(), note["ck1"].as_str().unwrap());
     }
 
     #[test]

@@ -37,7 +37,7 @@
 //!
 //! Graded in the tests below against lnurlcash-kit's `part2.json` (generated
 //! from lnurl-wallet, checked against lnurl-mint) and against vectors the kit
-//! computed for the seed step, `testdata/lud25-nostr-seed.json`.
+//! computed for the seed step, `tests/fixtures/lud25-nostr-seed.json`.
 
 use alloc::string::String;
 
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn the_ownership_digest_is_the_specs() {
-        let vectors: Value = serde_json::from_str(include_str!("../testdata/lud25-part2.json")).unwrap();
+        let vectors: Value = serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
         assert_eq!(
             hex_encode(&ownership_digest()),
             text(&vectors["conventions"], "ownershipDigest")
@@ -253,7 +253,7 @@ mod tests {
     fn matches_the_part2_vectors() {
         // Eight branches, both parities, a host with a port, and indices up
         // to u32::MAX: lnurl-wallet's own output, which lnurl-mint agrees with.
-        let vectors: Value = serde_json::from_str(include_str!("../testdata/lud25-part2.json")).unwrap();
+        let vectors: Value = serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
         let branches = vectors["branches"].as_array().expect("branches");
         assert_eq!(branches.len(), 8);
         let mut odd_seen = false;
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn matches_the_nostr_seed_vectors() {
         let vectors: Value =
-            serde_json::from_str(include_str!("../testdata/lud25-nostr-seed.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-nostr-seed.json")).unwrap();
         for case in vectors["cases"].as_array().expect("cases") {
             let identity = unhex::<32>(text(case, "identity"));
             let host = text(case, "host");

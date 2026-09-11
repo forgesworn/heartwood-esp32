@@ -1333,7 +1333,16 @@ from a bound slot and a mint that pays names to keys (moneyer >= 0.13.1).
 9. `heartwood address custodial <name>`: one HOLD TO SIGN card; the next
    payment arrives as a plain note sealed to the npub, as in 14.
 
-## 16. A second configured relay (#92; added 2026-09-11, NOT YET BENCH-RUN)
+## 16. A second configured relay (#92; added 2026-09-11, items 1 and 2 bench-run the same day)
+
+Bench record, 2026-09-11, Heltec V4 (e8:f6:0a:c9:e7:b4), app-only flash of this
+branch's release build: online on relay 0 with `secondary_index` 1 within 40 s
+of the WiFi unlock; heap with both sessions free 188,024 B, largest block
+92,160 B (one session: 209,480 B and 143,360 B), so a second TLS session costs
+about 21 KB. A `ping` sent to ONE relay at a time from an unbound client was
+answered on relay 0 and relay 1 and not on relay 3, and the note locker
+listed intact over the relay. Items 3 (failover), 4 (pairing) and 5
+(T-Display) not yet run.
 
 The signer used to serve one configured relay at a time, so a relay that
 silently stopped delivering hid every wrap and request sent there, while

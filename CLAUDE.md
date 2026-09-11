@@ -61,7 +61,7 @@ before the wrap leaves, so once only). Advertised note_wrap_v1. WiFi tier NACKs 
 note frames (use the relay methods) and refuses at-rest changes while notes
 are held. Nothing bench-run: checklist section 13.
 
-LUD-25 Part 2 key notes (2026-09-11, checklist section 15, not bench-run): a
+LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =
 HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then lnurl-wallet's

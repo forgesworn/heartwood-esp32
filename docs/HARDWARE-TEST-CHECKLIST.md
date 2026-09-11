@@ -1273,7 +1273,18 @@ notecase `heartwood send`.
    all behave exactly as in §12; the REQ now carries a fourth filter and the
    40 s re-REQ still lands (watch for the kind-0 profile refresh).
 
-## 15. Notes paid to the device's own keys (LUD-25 Part 2; added 2026-09-11, NOT YET BENCH-RUN)
+## 15. Notes paid to the device's own keys (LUD-25 Part 2; added 2026-09-11, items 1, 2, 3 and 6's scan bench-run the same day)
+
+Bench record, 2026-09-11, Heltec V4 (e8:f6:0a:c9:e7:b4), app-only flash of this
+branch's release build, unlocked over WiFi, on real sats at moneyer.dev:
+two operator names owned by the master npub pointed at its keys (one
+kind-27235 hold each; the mint echoed the cx1, and both names share it). 21
+sats to the first was minted to key 0 and stored with no card as `(its own
+key #0)` from the trusted mint key. `heartwood address scan` found key 0 live and already held.
+`heartwood collect <id>` released a ck1 on one hold, the mint burned the note
+(`notes.state = burned`), SPEND NOTE on a second hold. Seen on the way: a
+spent record stamped just after a reboot sorts as the OLDEST (the clock is
+seconds since boot) and is the first trimmed.
 
 `heartwood_note_address` and `heartwood_note_claim` in `heartwood_capabilities`.
 A lightning address whose owner is a master npub can be paid to keys the

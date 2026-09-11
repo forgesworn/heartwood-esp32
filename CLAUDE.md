@@ -52,7 +52,11 @@ what it cannot read). Relay path: heartwood_note_* NIP-46 extensions
 generic extension gate so no slot policy can silence a disclosure, riding the
 #64 deferred machinery. Notes are deliberately NOT in backups (restore onto
 two boards = double-spend); destructive commands (mark_spent/discard/rename/
-delete) are button-gated like lnurl-vault gates them. Notes also travel as
+delete) are button-gated like lnurl-vault gates them, with ONE runtime
+exception (#129): an approved export_secret leaves a single-use, RAM-only
+grant (note_cmd::SpendGrant, 120 s, same note, same client) so the mark_spent
+that completes a collect costs no second hold. The method policy pin is
+unchanged - heartwood_note_spent still answers always_requires_button(). Notes also travel as
 NIP-59 gift wraps (common/src/note_wrap.rs, kind-2525 rumor = LUD-25 URL):
 a 1059 to a master npub raises a RECEIVE card (relay.rs handle_note_wrap,
 stored CONFIRMED with Peer::From, MAX_RECEIVED cap, never re-sent);

@@ -93,6 +93,23 @@ fn is_note_method(method: &nip46::Nip46Method) -> bool {
     )
 }
 
+/// Whether an approved `heartwood_note_export` has left this client a live,
+/// unused grant for the note this `heartwood_note_spent` names (#129), and
+/// spend it if so.
+///
+/// Consumes on every call, which is why the caller must only reach it for
+/// `heartwood_note_spent`: the grant is single use, and a spend mark that
+/// errors has still had its one free pass. A request that names no note, or
+/// whose params do not map, finds nothing and raises its card as before.
+fn spend_grant_covers(method: &str, params: &[Value], client_hex: &str) -> bool {
+    let Some(client) = hex_decode_32(client_hex) else { return false };
+    let Ok(cmd) = heartwood_common::note_cmd::note_cmd_for_method(method, params) else {
+        return false;
+    };
+    let Some(id) = cmd.get("id").and_then(Value::as_str) else { return false };
+    crate::notes::take_spend_grant(id, &client)
+}
+
 /// Exact v2 authority is installed for the relay-addressed identity. An
 /// explicit Heartwood context can redirect the same approved method to an
 /// arbitrary derived child, which that policy did not name, so strict slots
@@ -787,11 +804,29 @@ fn dispatch_inner(
         return build_error_json(&request.id, -1, "unauthorised");
     }
 
+    // #129: a collect is `heartwood_note_export` then `heartwood_note_spent`,
+    // and both are pinned ButtonRequired, so the owner used to hold the button
+    // twice for one note. The second hold bought nothing: by the time it runs
+    // the mint has already burned the note. So an approved export leaves a
+    // single-use grant, and the spend mark for THAT note, from THAT client,
+    // inside a short window, runs with no card.
+    //
+    // It has to be consulted HERE and not only in the dispatcher: on this path
+    // the card decision is made before the command runs at all. The method's
+    // policy pin is untouched; `always_requires_button()` still answers true
+    // for `heartwood_note_spent`, because this is a runtime grant the owner
+    // just earned, not a change to what the method is.
+    let spend_granted = matches!(method, nip46::Nip46Method::HeartwoodNoteSpent)
+        && spend_grant_covers(&request.method, &request.params, &client_hex);
+    if spend_granted {
+        log::info!("{}: riding the export hold just approved for this note", request.method);
+    }
+
     // A ButtonRequired tier is meaningful only if the handler actually stops
     // for the button. Keep this single gate before dispatch so a new extension
     // cannot accidentally mutate state merely by omitting approval code from
     // its individual match arm. Strict v2 denials returned above never prompt.
-    if remote_extension_requires_approval(has_client, &method, tier) {
+    if !spend_granted && remote_extension_requires_approval(has_client, &method, tier) {
         // A note card shows the money, not the method name: amount, mint
         // and (for send) the recipient, as the cable path already does.
         let note_card = if matches!(method, nip46::Nip46Method::HeartwoodPairWallet) {
@@ -1683,10 +1718,16 @@ fn dispatch_inner(
                     // The served identity is also the root of the address
                     // branches a mint pays this npub's lightning address to
                     // (cash_address, claim_key_note).
+                    // The client hex is 64 chars here (has_client checked
+                    // it), so the decode cannot fail; an all-zero fallback
+                    // would only ever fail to match a grant, which costs a
+                    // card and nothing else.
+                    let client = hex_decode_32(&client_hex).unwrap_or([0u8; 32]);
                     let response = crate::notes::run_note_cmd_approved(
                         &cmd.to_string(),
                         Some(&mut wrap),
                         Some(master_secret),
+                        &client,
                     );
                     if response.get("ok") == Some(&serde_json::Value::Bool(true)) {
                         nip46::build_result_response(&request.id, &response.to_string())

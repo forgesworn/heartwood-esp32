@@ -17,6 +17,12 @@
 //! `rename`, `delete`) — the latter because a host marking a CONFIRMED note
 //! spent locks its value forever, which is why "destructive" includes
 //! commands that delete nothing.
+//!
+//! One exception, and only one: a `mark_spent` may ride the `export_secret`
+//! hold that just released the SAME note to the SAME client, once, inside a
+//! short window ([`SpendGrant`], #129). A collect is those two commands back
+//! to back, and by the time the second runs the mint has already burned the
+//! note, so the second card bought a press and nothing else.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -80,6 +86,117 @@ pub enum Approval {
     Unavailable,
 }
 
+/// Which surface a command arrived on, so a grant can never cross from one
+/// to another. The cable is one identity because physical possession is its
+/// whole pairing; a relay client is its slot pubkey.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantClient {
+    /// The USB cable (NOTE_CMD frames). Whoever holds the cable is the client.
+    Cable,
+    /// A relay client, by the pubkey its connection slot is bound to.
+    Relay([u8; 32]),
+}
+
+/// How long after an approved `export_secret` that note's `mark_spent` may
+/// run with no card of its own, in seconds (#129).
+///
+/// Two minutes. What the window has to cover is one mint round trip: the
+/// wallet melts the `ck1` it was just handed, then writes the device record
+/// off, which on a slow mint over a slow link is tens of seconds, not one,
+/// and a batch collect runs several of those back to back. It is
+/// deliberately far shorter than someone walking away: a grant that outlived
+/// the owner's attention would be a card they never saw for a command they
+/// never watched. Measured on the same seconds-since-boot stamp the notes
+/// carry, so a reboot cannot extend it; the grants are gone by then anyway.
+pub const SPEND_GRANT_WINDOW_SECS: u32 = 120;
+
+/// How many exports may be riding at once. Matches
+/// [`crate::approval_queue::MAX_BATCH`], the most gated asks one card already
+/// answers: a wallet that released eight notes on one hold leaves eight
+/// grants, and writes the eight records off on none. The oldest is evicted
+/// past that, which costs a card, never a secret.
+pub const MAX_SPEND_GRANTS: usize = crate::approval_queue::MAX_BATCH;
+
+/// One note's permission to be marked spent without a card of its own.
+struct Grant {
+    id: String,
+    client: GrantClient,
+    /// The stamp the export was approved at (seconds since boot).
+    granted_at: u32,
+}
+
+/// Single-use permission for `mark_spent` to ride the `export_secret`
+/// approval that just happened (#129).
+///
+/// A collect is two gated commands, release the secret then write the
+/// record off, so the owner used to hold the button twice for one note. By
+/// the time the second one runs the mint has already burned the note, so the
+/// device record is worthless and the card guards only against a paired
+/// client lying "that one is spent" to hide live money from its owner: a
+/// nuisance, not theft, and it cost a press on every single collect.
+///
+/// So an approved export leaves a grant behind, and the `mark_spent` for THAT
+/// note, from THAT client, inside a short window, runs without asking again.
+/// The grant never widens: not to another note, not to another client, not to
+/// `discard`, `send` or `delete`, and a declined, timed-out or failed export
+/// leaves none. It is consumed by the first `mark_spent` attempt for its note
+/// whether that attempt succeeds or fails, and it lives in RAM only and
+/// never in NVS, so a reboot between the two halves brings the card back.
+#[derive(Default)]
+pub struct SpendGrant {
+    live: Vec<Grant>,
+}
+
+impl SpendGrant {
+    pub const fn new() -> Self {
+        SpendGrant { live: Vec::new() }
+    }
+
+    /// Record what an approved export just earned. Re-exporting a note
+    /// replaces its grant rather than adding a second one, so one note can
+    /// never be behind two grants.
+    pub fn grant(&mut self, id: &str, client: GrantClient, now: u32) {
+        self.live.retain(|g| g.id != id);
+        if self.live.len() >= MAX_SPEND_GRANTS {
+            self.live.remove(0);
+        }
+        self.live.push(Grant { id: id.to_string(), client, granted_at: now });
+    }
+
+    /// Spend the grant for `id`, if this client has a live one. `true` means
+    /// the caller may skip the card.
+    ///
+    /// A matching grant is removed either way, which is what makes it single
+    /// use, and it is why a timed-out grant answers `false` here rather than
+    /// being left to be found again. A grant for some OTHER note is left
+    /// alone: this attempt is not the one it was minted for.
+    pub fn take(&mut self, id: &str, client: GrantClient, now: u32) -> bool {
+        let Some(at) = self.live.iter().position(|g| g.id == id && g.client == client) else {
+            return false;
+        };
+        let grant = self.live.remove(at);
+        // Monotonic: `now` going backwards means something other than the
+        // boot clock supplied it, which is not a window this can measure.
+        now.checked_sub(grant.granted_at)
+            .is_some_and(|elapsed| elapsed <= SPEND_GRANT_WINDOW_SECS)
+    }
+
+    /// Drop every grant. For a caller that has just changed what "this
+    /// client" means underneath them.
+    pub fn clear(&mut self) {
+        self.live.clear();
+    }
+
+    /// How many grants are live. Diagnostics and tests only.
+    pub fn len(&self) -> usize {
+        self.live.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+}
+
 /// Everything the firmware injects into one command dispatch. Kept as a
 /// struct so the signature survives the relay path growing extra context.
 pub struct NoteCmdContext<'a> {
@@ -90,6 +207,15 @@ pub struct NoteCmdContext<'a> {
     /// whether to put a card up or answer `Approved` immediately; the
     /// dispatcher itself gates everything in [`GatedCmd`].
     pub approve: &'a mut dyn FnMut(GatedCmd, &NoteMeta) -> Approval,
+    /// The device's live spend grants (#129). An approved `export_secret`
+    /// leaves one here; the `mark_spent` for that note, from that client,
+    /// inside [`SPEND_GRANT_WINDOW_SECS`], spends it instead of raising a
+    /// second card. RAM only on the firmware, so a reboot brings the card
+    /// back. See [`SpendGrant`].
+    pub grant: &'a mut SpendGrant,
+    /// Which surface this dispatch is serving, so a grant earned on the
+    /// cable can never be spent by a relay client or the other way round.
+    pub client: GrantClient,
     pub wrap: Option<WrapFn<'a>>,
     /// Senders whose wraps are stored without a hold. Persisted through
     /// `storage.save_trust`; a refusal there is `storage_full`.
@@ -655,8 +781,16 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             if let Some(resp) = approval_err((ctx.approve)(GatedCmd::ExportSecret, &meta)) {
                 return resp;
             }
-            match ctx.store.export_secret(id) {
-                Ok(k1) => json!({"ok": true, "k1": k1}),
+            let exported = ctx.store.export_secret(id);
+            match exported {
+                Ok(k1) => {
+                    // #129: the hold that just released this note also buys
+                    // the right to write its record off. Recorded on success
+                    // only: an export that failed released nothing, so
+                    // there is nothing for a spend mark to follow.
+                    ctx.grant.grant(id, ctx.client, ctx.now);
+                    json!({"ok": true, "k1": k1})
+                }
                 Err(e) => note_err(e),
             }
         }
@@ -770,8 +904,15 @@ fn gated_by_id(
             return err("invalid_state");
         }
     }
-    if let Some(resp) = approval_err((ctx.approve)(kind, &meta)) {
-        return resp;
+    // #129: ONLY mark_spent may ride an export's hold, and only its own
+    // note's, from its own client, inside the window. Everything else in
+    // GatedCmd asks every time; a grant that widened to `discard`, `send`
+    // or `delete` would be a hold answering a question nobody was shown.
+    let granted = kind == GatedCmd::MarkSpent && ctx.grant.take(id, ctx.client, ctx.now);
+    if !granted {
+        if let Some(resp) = approval_err((ctx.approve)(kind, &meta)) {
+            return resp;
+        }
     }
     let id = id.to_string();
     match mutate(ctx, &id) {
@@ -895,6 +1036,9 @@ mod tests {
         trust: Option<Vec<u8>>,
         cash: Option<Vec<u8>>,
         persist_ok: bool,
+        /// Whether a note blob may be written. A record rewrite that fails is
+        /// how a gated command gets to fail AFTER its approval was settled.
+        note_write_ok: bool,
     }
 
     impl MemStorage {
@@ -905,6 +1049,7 @@ mod tests {
                 trust: None,
                 cash: None,
                 persist_ok: true,
+                note_write_ok: true,
             }
         }
     }
@@ -921,6 +1066,9 @@ mod tests {
             Ok(self.notes.get(id).cloned())
         }
         fn save_note(&mut self, id: &str, blob: &[u8]) -> Result<(), StorageError> {
+            if !self.note_write_ok {
+                return Err(StorageError);
+            }
             self.notes.insert(id.to_string(), blob.to_vec());
             Ok(())
         }
@@ -961,8 +1109,14 @@ mod tests {
         cash: crate::cash_store::CashRegistry,
         cash_asked: Vec<String>,
         persist_ok: bool,
+        note_write_ok: bool,
         /// The identity the request is served as; `None` is direct USB.
         identity: Option<[u8; 32]>,
+        /// Live spend grants (#129), and the two dials a test needs to move:
+        /// which surface is asking, and what the boot clock says.
+        grant: SpendGrant,
+        client: GrantClient,
+        now: u32,
     }
 
     impl Harness {
@@ -981,7 +1135,11 @@ mod tests {
                 cash: crate::cash_store::CashRegistry::new(),
                 cash_asked: Vec::new(),
                 persist_ok: true,
+                note_write_ok: true,
                 identity: Some([7u8; 32]),
+                grant: SpendGrant::new(),
+                client: GrantClient::Relay([0xc1; 32]),
+                now: 42,
             }
         }
 
@@ -1017,17 +1175,20 @@ mod tests {
                 answer
             };
             self.storage.persist_ok = self.persist_ok;
+            self.storage.note_write_ok = self.note_write_ok;
             let mut ctx = NoteCmdContext {
                 store: &mut self.store,
                 storage: &mut self.storage,
                 rng: &mut rng,
                 approve: &mut approve,
+                grant: &mut self.grant,
+                client: self.client,
                 wrap: if self.can_wrap { Some(&mut wrap) } else { None },
                 trust: &mut self.trust,
                 approve_trust: &mut approve_trust,
                 cash: &mut self.cash,
                 approve_cash: &mut approve_cash,
-                now: 42,
+                now: self.now,
                 fw_version: "0.0.0-test",
                 board: "host",
                 storage_state: "ok",
@@ -1046,6 +1207,14 @@ mod tests {
             ));
             assert_eq!(res["ok"], true, "{res}");
             id
+        }
+
+        /// Power-cycle the device. The store is NVS-backed and survives; the
+        /// spend grants are RAM only and do not, and the boot clock the
+        /// window is measured on restarts at zero.
+        fn reboot(&mut self) {
+            self.grant = SpendGrant::new();
+            self.now = 0;
         }
     }
 
@@ -1726,6 +1895,257 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+
+    // ---- #129: a spend mark rides the export hold that just happened ----
+    //
+    // A collect is `export_secret` then `mark_spent`, and both were gated, so
+    // the owner held the button twice for one note. The second hold bought
+    // nothing: the mint had already burned the note by then, and the card
+    // guards only against a paired client lying "that one is spent". These
+    // tests pin what the grant may and may not do.
+
+    #[test]
+    fn a_spend_mark_rides_the_export_hold_that_just_happened() {
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        h.asked.clear();
+
+        let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert!(res["k1"].is_string());
+        assert_eq!(h.asked, vec![(GatedCmd::ExportSecret, id.clone())]);
+
+        // The other half of the same collect: no second card.
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(
+            h.asked,
+            vec![(GatedCmd::ExportSecret, id.clone())],
+            "the spend mark asked again"
+        );
+        assert!(h.grant.is_empty(), "the grant outlived its one use");
+        let list = h.run(r#"{"cmd":"list_notes"}"#);
+        assert_eq!(list["notes"][0]["state"], "spent");
+    }
+
+    #[test]
+    fn a_spend_mark_with_no_grant_asks_exactly_as_before() {
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        h.asked.clear();
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, id.clone())]);
+    }
+
+    #[test]
+    fn the_grant_is_spent_by_the_attempt_not_by_its_success() {
+        // Single use, and single use counts FAILURES. A grant left behind by
+        // a spend mark that errored would let a client retry its way to a
+        // free second write-off long after the owner stopped watching.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        h.asked.clear();
+
+        h.note_write_ok = false;
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["error"], "storage_full", "{res}");
+        assert!(h.asked.is_empty(), "a granted spend mark must not ask");
+        assert!(h.grant.is_empty(), "a failed attempt still spends the grant");
+
+        h.note_write_ok = true;
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, id.clone())]);
+    }
+
+    #[test]
+    fn a_grant_never_covers_another_note() {
+        let mut h = Harness::new();
+        let a = h.confirmed_note();
+        let b = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{a}"}}"#))["ok"], true);
+        h.asked.clear();
+
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{b}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, b.clone())]);
+        // ...and b's card did not eat a's grant: that was not the attempt it
+        // was minted for.
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{a}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked.len(), 1, "a's spend mark asked: {:?}", h.asked);
+    }
+
+    #[test]
+    fn a_grant_never_crosses_to_another_client() {
+        // The hold proves a human was present for THAT client's request. A
+        // second client riding it would be a card answered on its behalf.
+        for other in [GrantClient::Relay([0xc2; 32]), GrantClient::Cable] {
+            let mut h = Harness::new();
+            let id = h.confirmed_note();
+            assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+            h.asked.clear();
+            h.client = other;
+            let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+            assert_eq!(res["ok"], true, "{res}");
+            assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, id.clone())], "{other:?}");
+        }
+
+        // And the other way round: a cable hold is not a relay client's.
+        let mut h = Harness::new();
+        h.client = GrantClient::Cable;
+        let id = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        h.asked.clear();
+        h.client = GrantClient::Relay([0xc1; 32]);
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, id.clone())]);
+    }
+
+    #[test]
+    fn a_grant_expires_and_the_card_comes_back() {
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        let at = h.now;
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        h.asked.clear();
+        h.now = at + SPEND_GRANT_WINDOW_SECS + 1;
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, id.clone())]);
+
+        // The last second inside the window is still inside it.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        let at = h.now;
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        h.asked.clear();
+        h.now = at + SPEND_GRANT_WINDOW_SECS;
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert!(h.asked.is_empty(), "asked inside the window: {:?}", h.asked);
+    }
+
+    #[test]
+    fn a_reboot_between_the_two_halves_brings_the_card_back() {
+        // Grants are RAM only and never NVS. A board that came back up has
+        // no memory of the hold, and must not behave as though it did.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        h.reboot();
+        h.asked.clear();
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, id.clone())]);
+    }
+
+    #[test]
+    fn an_export_that_was_not_approved_grants_nothing() {
+        for answer in [Approval::Declined, Approval::TimedOut, Approval::Unavailable] {
+            let mut h = Harness::new();
+            let id = h.confirmed_note();
+            h.answer = answer;
+            let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
+            assert_eq!(res["ok"], false, "{res}");
+            assert!(h.grant.is_empty(), "{answer:?} left a grant");
+
+            h.answer = Approval::Approved;
+            h.asked.clear();
+            let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+            assert_eq!(res["ok"], true, "{res}");
+            assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, id.clone())], "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn a_grant_covers_the_spend_mark_and_no_other_command() {
+        // Forge a live grant against a note in each command's required state:
+        // it must still raise that command's own card, and still be there
+        // afterwards. A grant that widened to `discard`, `send` or `delete`
+        // would answer a question the owner was never shown.
+        let mut h = Harness::new();
+        let pending = h.run(r#"{"cmd":"new_secret"}"#)["id"].as_str().unwrap().to_string();
+        h.grant.grant(&pending, h.client, h.now);
+        h.asked.clear();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"discard","id":"{pending}"}}"#))["ok"], true);
+        assert_eq!(h.asked, vec![(GatedCmd::Discard, pending.clone())]);
+        assert_eq!(h.grant.len(), 1, "discard spent the grant");
+
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        h.grant.grant(&id, h.client, h.now);
+        h.asked.clear();
+        let bob = "bb".repeat(32);
+        let res = h.run(&format!(r#"{{"cmd":"send","id":"{id}","to":"{bob}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::Send, id.clone())]);
+        assert_eq!(h.grant.len(), 1, "send spent the grant");
+
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        h.grant.grant(&id, h.client, h.now);
+        h.asked.clear();
+        let res = h.run(&format!(r#"{{"cmd":"rename","id":"{id}","label":"x"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::Rename, id.clone())]);
+        assert_eq!(h.grant.len(), 1, "rename spent the grant");
+
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#))["ok"], true);
+        h.grant.grant(&id, h.client, h.now);
+        h.asked.clear();
+        let res = h.run(&format!(r#"{{"cmd":"delete","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::Delete, id.clone())]);
+        assert_eq!(h.grant.len(), 1, "delete spent the grant");
+    }
+
+    #[test]
+    fn every_note_in_a_batch_release_leaves_its_own_grant() {
+        // A wallet collecting several notes fires the exports together, which
+        // is what lets ONE card answer them all. Each leaves its own grant, so
+        // the write-offs that follow cost no second hold.
+        let mut h = Harness::new();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_SPEND_GRANTS {
+            ids.push(h.confirmed_note());
+        }
+        for id in &ids {
+            assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        }
+        h.asked.clear();
+        for id in &ids {
+            let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+            assert_eq!(res["ok"], true, "{res}");
+        }
+        assert!(h.asked.is_empty(), "a batch collect asked again: {:?}", h.asked);
+        assert!(h.grant.is_empty());
+    }
+
+    #[test]
+    fn the_grant_table_is_bounded_and_a_re_export_replaces_rather_than_stacks() {
+        let client = GrantClient::Cable;
+        let mut g = SpendGrant::new();
+        for i in 0..=MAX_SPEND_GRANTS {
+            g.grant(&format!("note{i}"), client, 10);
+        }
+        assert_eq!(g.len(), MAX_SPEND_GRANTS);
+        assert!(!g.take("note0", client, 10), "the oldest should have been evicted");
+        assert!(g.take(&format!("note{MAX_SPEND_GRANTS}"), client, 10));
+
+        let mut g = SpendGrant::new();
+        g.grant("a1b2c3d4", client, 10);
+        g.grant("a1b2c3d4", client, 20);
+        assert_eq!(g.len(), 1, "one note behind two grants");
+        assert!(g.take("a1b2c3d4", client, 20));
+        assert!(!g.take("a1b2c3d4", client, 20));
     }
 
     #[test]

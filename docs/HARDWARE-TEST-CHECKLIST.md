@@ -1283,8 +1283,9 @@ sats to the first was minted to key 0 and stored with no card as `(its own
 key #0)` from the trusted mint key. `heartwood address scan` found key 0 live and already held.
 `heartwood collect <id>` released a ck1 on one hold, the mint burned the note
 (`notes.state = burned`), SPEND NOTE on a second hold. Seen on the way: a
-spent record stamped just after a reboot sorts as the OLDEST (the clock is
-seconds since boot) and is the first trimmed.
+spent record stamped just after a reboot sorted as the OLDEST (the clock is
+seconds since boot) and was the first trimmed; the store's stamps now never
+go backwards (`NoteStore::stamp`).
 
 `heartwood_note_address` and `heartwood_note_claim` in `heartwood_capabilities`.
 A lightning address whose owner is a master npub can be paid to keys the

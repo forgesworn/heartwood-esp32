@@ -512,6 +512,8 @@ pub struct NoteStore {
     /// (confirm, mark_spent, rename) stay allowed, matching the vault.
     index_known: bool,
     cap: usize,
+    /// The newest stamp any held record carries. See [`Self::stamp`].
+    stamp_floor: u32,
 }
 
 /// The outcome of loading: the store, plus any indexed ids whose blobs were
@@ -535,7 +537,7 @@ impl NoteStore {
             Ok(None) => Vec::new(),
             Err(_) => {
                 return LoadOutcome {
-                    store: NoteStore { notes: Vec::new(), index_known: false, cap },
+                    store: NoteStore { notes: Vec::new(), index_known: false, cap, stamp_floor: 0 },
                     skipped: Vec::new(),
                 }
             }
@@ -555,12 +557,29 @@ impl NoteStore {
                 _ => skipped.push(id),
             }
         }
-        LoadOutcome { store: NoteStore { notes, index_known: true, cap }, skipped }
+        let stamp_floor = notes.iter().map(|n| n.created_at.max(n.updated_at)).max().unwrap_or(0);
+        LoadOutcome { store: NoteStore { notes, index_known: true, cap, stamp_floor }, skipped }
     }
 
     /// Fail-closed constructor for a boot whose storage never came up at all.
     pub fn storage_unavailable(cap: usize) -> NoteStore {
-        NoteStore { notes: Vec::new(), index_known: false, cap }
+        NoteStore { notes: Vec::new(), index_known: false, cap, stamp_floor: 0 }
+    }
+
+    /// The stamp a write carries: `now`, unless that would sort at or before
+    /// a record already held, and then one past the newest.
+    ///
+    /// The firmware's clock is seconds since boot, so after a reboot `now`
+    /// starts again from zero. Stamps are only informational to a client,
+    /// but in here they order the spent records, and a note spent a minute
+    /// after a reboot would otherwise look older than one spent last week
+    /// and be the first one trimmed. Seen on the bench 2026-09-11: a key note
+    /// spent straight after a flash vanished from the list at once. So a
+    /// stamp never goes backwards, whatever the clock does.
+    fn stamp(&mut self, now: u32) -> u32 {
+        let stamped = if now > self.stamp_floor { now } else { self.stamp_floor.saturating_add(1) };
+        self.stamp_floor = stamped;
+        stamped
     }
 
     pub fn index_known(&self) -> bool {
@@ -707,6 +726,7 @@ impl NoteStore {
         label: &str,
         now: u32,
     ) -> Result<(String, String), NoteError> {
+        let now = self.stamp(now);
         // Same courtesy the receive path has always had: a locker full of
         // spent records is full of nothing, and refusing to MINT while
         // happily accepting a note someone sends you is the same device
@@ -747,6 +767,7 @@ impl NoteStore {
         label: &str,
         now: u32,
     ) -> Result<(String, String, String, String), NoteError> {
+        let now = self.stamp(now);
         // Two slots, and asking for both at once matters: making room for
         // one and then failing on the second would leave a spent record
         // destroyed for nothing. See new_secret.
@@ -804,6 +825,7 @@ impl NoteStore {
         sig: Option<&str>,
         now: u32,
     ) -> Result<(), NoteError> {
+        let now = self.stamp(now);
         if host.is_empty() || host.len() > MAX_HOST_LEN {
             return Err(NoteError::BadRequest);
         }
@@ -879,6 +901,7 @@ impl NoteStore {
         label: &str,
         now: u32,
     ) -> Result<(String, bool), NoteError> {
+        let now = self.stamp(now);
         if k1_hex.len() != SECRET_LEN * 2 {
             return Err(NoteError::BadRequest);
         }
@@ -930,6 +953,7 @@ impl NoteStore {
         sig: &str,
         now: u32,
     ) -> Result<(String, bool), NoteError> {
+        let now = self.stamp(now);
         if host.is_empty() || host.len() > MAX_HOST_LEN || !valid_sig(sig) {
             return Err(NoteError::BadRequest);
         }
@@ -979,6 +1003,7 @@ impl NoteStore {
         now: u32,
         trusted: bool,
     ) -> Result<(String, bool), NoteError> {
+        let now = self.stamp(now);
         if host.is_empty() || host.len() > MAX_HOST_LEN || !valid_sig(sig) {
             return Err(NoteError::BadRequest);
         }
@@ -1035,6 +1060,7 @@ impl NoteStore {
         to: &[u8; 32],
         now: u32,
     ) -> Result<(), NoteError> {
+        let now = self.stamp(now);
         self.can_send(id)?;
         let idx = self.find(id)?;
         let mut updated = self.notes[idx].clone();
@@ -1059,6 +1085,7 @@ impl NoteStore {
         id: &str,
         now: u32,
     ) -> Result<(), NoteError> {
+        let now = self.stamp(now);
         let idx = self.find(id)?;
         if self.notes[idx].state != NoteState::Confirmed {
             return Err(NoteError::InvalidState);
@@ -1108,6 +1135,7 @@ impl NoteStore {
         label: &str,
         now: u32,
     ) -> Result<(), NoteError> {
+        let now = self.stamp(now);
         if label.len() > MAX_LABEL_LEN {
             return Err(NoteError::BadRequest);
         }
@@ -1406,6 +1434,55 @@ mod tests {
         note.sig = CS1.to_string();
         note.key = Some(KeyNote { index: 4_000_000_000, pubkey: [0x5d; 32] });
         note
+    }
+
+    #[test]
+    fn a_note_spent_just_after_a_reboot_is_not_the_first_one_trimmed() {
+        // The bench, 2026-09-11: spent records stamped through a long uptime,
+        // a flash, and a note spent seconds into the new boot. With stamps
+        // taken straight off a clock that restarts at zero, the new record
+        // sorted oldest and was the one trimmed.
+        let mut storage = FakeStorage::new();
+        let mut store = fresh_store(&mut storage);
+        let mut rng = test_rng();
+        let mut ids = Vec::new();
+        for i in 0..=MAX_SPENT {
+            let k1 = format!("{:02x}", i + 1).repeat(SECRET_LEN);
+            let (id, _) = store
+                .import_secret(&mut storage, &mut rng, &k1, "mint.example/w", 1_000, "", 90_000 + i as u32)
+                .unwrap();
+            ids.push(id);
+        }
+        for (i, id) in ids.iter().take(MAX_SPENT).enumerate() {
+            store.mark_spent(&mut storage, id, 91_000 + i as u32).unwrap();
+        }
+        let last = ids[MAX_SPENT].clone();
+
+        // reboot: the clock is back near zero
+        let mut store = NoteStore::load(&mut storage, MAX_NOTES).store;
+        store.mark_spent(&mut storage, &last, 30).unwrap();
+        let meta = store.get_meta(&last).expect("the note just spent is still listed");
+        let newest_before = 91_000 + MAX_SPENT as u32 - 1;
+        assert!(meta.updated_at > newest_before, "{}", meta.updated_at);
+        // and the one trimmed to make room was the oldest spent before the reboot
+        assert!(store.get_meta(&ids[0]).is_none());
+        assert_eq!(store.counts().0, MAX_SPENT);
+    }
+
+    #[test]
+    fn stamps_follow_the_clock_while_it_moves_forward() {
+        let mut storage = FakeStorage::new();
+        let mut store = fresh_store(&mut storage);
+        let mut rng = test_rng();
+        let (id, _) = store
+            .import_secret(&mut storage, &mut rng, &"0a".repeat(SECRET_LEN), "mint.example/w", 1, "", 500)
+            .unwrap();
+        assert_eq!(store.get_meta(&id).unwrap().created_at, 500);
+        store.rename(&mut storage, &id, "later", 900).unwrap();
+        assert_eq!(store.get_meta(&id).unwrap().updated_at, 900);
+        // the same second twice still orders the two writes
+        store.rename(&mut storage, &id, "again", 900).unwrap();
+        assert_eq!(store.get_meta(&id).unwrap().updated_at, 901);
     }
 
     #[test]

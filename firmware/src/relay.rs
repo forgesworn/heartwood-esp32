@@ -4285,7 +4285,10 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
             return;
         }
     };
-    let note = match heartwood_common::note_wrap::parse_note_rumor(&opened.rumor) {
+    // Opened with the key it was addressed to, which is also the root of the
+    // address branch a note paid to a key sits on: one this device does not
+    // hold is refused here, before any card, and never comes back.
+    let note = match heartwood_common::note_wrap::open_note_rumor(&opened.rumor, &secret) {
         Ok(n) => n,
         Err(e) => {
             log::info!("[relay] gift wrap {} is not a note: {e}", &ev.id[..8.min(ev.id.len())]);
@@ -4314,11 +4317,12 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
     // would be; a refusal by the locker is left undecided so the wrap
     // comes back once there is room.
     if crate::notes::is_trusted_sender(&opened.sender) {
-        match crate::notes::receive_note(&note.secret, &note.host, note.amount_msat, &opened.sender) {
+        match crate::notes::receive_note(&note, &opened.sender) {
             Ok((id, created)) => {
                 log::info!(
-                    "[relay] note {id} received from trusted sender {} (new: {created})",
-                    &sender_hex[..8]
+                    "[relay] note {id} received from trusted sender {} (new: {created}{})",
+                    &sender_hex[..8],
+                    if note.key.is_some() { ", paid to a key" } else { "" }
                 );
                 remember_wrap(ctx, &ev.id);
                 if ctx.wrap_ledger.decide(&ev.id, ev.created_at) {
@@ -4488,6 +4492,10 @@ fn remember_wrap(ctx: &mut SignCtx, wrap_id: &str) {
 /// card.
 fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick, on_screen: bool) {
     let sender = card.client_pubkey;
+    // The key the wrap was opened with, which a note paid to a key is
+    // derived from again here: the rumor rides the card, the key does not.
+    let identity = masters::find_by_pubkey(ctx.masters, &card.target_pk)
+        .map(|midx| zeroize::Zeroizing::new(ctx.masters[midx].secret));
     let mut ledger_changed = false;
     for mut ask in card.asks {
         let wrap_id = ask.ask.request.id.clone();
@@ -4508,14 +4516,13 @@ fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick,
         }
         let Some(mut rumor) = ask.ask.event.take() else { continue };
         if matches!(outcome, CardTick::Approved) {
-            match heartwood_common::note_wrap::parse_note_rumor(&rumor) {
+            let opened = match identity.as_deref() {
+                Some(secret) => heartwood_common::note_wrap::open_note_rumor(&rumor, secret),
+                None => Err("the identity it was sent to is no longer on this device"),
+            };
+            match opened {
                 Ok(note) => {
-                    match crate::notes::receive_note(
-                        &note.secret,
-                        &note.host,
-                        note.amount_msat,
-                        &sender,
-                    ) {
+                    match crate::notes::receive_note(&note, &sender) {
                         Ok((id, created)) => {
                             log::info!("[relay] note {id} received (new: {created})");
                             ledger_changed |= ctx.wrap_ledger.decide(&wrap_id, ask.created_at);

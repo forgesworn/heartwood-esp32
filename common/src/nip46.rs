@@ -102,6 +102,11 @@ pub enum Nip46Method {
     HeartwoodNoteSend,
     HeartwoodNoteTrust,
     HeartwoodNoteTrusted,
+    /// LUD-25 Part 2: the served identity's watch-only address branch for a
+    /// mint (`cx1`), and a key note a wallet found by scanning that branch.
+    /// Neither discloses a note, so neither is pinned to the button.
+    HeartwoodNoteAddress,
+    HeartwoodNoteClaim,
     /// Mint a connection slot for another wallet, from a wallet already
     /// bound. Gated by a hold; answers with a one-time bunker URI.
     HeartwoodPairWallet,
@@ -147,6 +152,8 @@ impl Nip46Method {
             "heartwood_note_send" => Self::HeartwoodNoteSend,
             "heartwood_note_trust" => Self::HeartwoodNoteTrust,
             "heartwood_note_trusted" => Self::HeartwoodNoteTrusted,
+            "heartwood_note_address" => Self::HeartwoodNoteAddress,
+            "heartwood_note_claim" => Self::HeartwoodNoteClaim,
             "heartwood_pair_wallet" => Self::HeartwoodPairWallet,
             other => Self::Unknown(other.to_string()),
         }
@@ -184,6 +191,8 @@ impl Nip46Method {
             Self::HeartwoodNoteSend => "heartwood_note_send",
             Self::HeartwoodNoteTrust => "heartwood_note_trust",
             Self::HeartwoodNoteTrusted => "heartwood_note_trusted",
+            Self::HeartwoodNoteAddress => "heartwood_note_address",
+            Self::HeartwoodNoteClaim => "heartwood_note_claim",
             Self::HeartwoodPairWallet => "heartwood_pair_wallet",
             Self::Unknown(s) => s.as_str(),
         }

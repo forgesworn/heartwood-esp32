@@ -68,7 +68,9 @@ mnemonic-gen = ["mnemonic", "secp256k1-backend"]
 # compressed public key. heartwood is x-only everywhere else and its own tree
 # is hardened at every level, so no other path has ever needed the parity byte
 # - LUD-25's does, because d1..d4 are raw uint32 and about half land unhardened.
-cash = ["mnemonic"]
+# Part 2 (notes paid to this device's keys, cash_key.rs) adds recoverable ECDSA:
+# a note is spent with a `ck1`, an ownership signature its key makes.
+cash = ["mnemonic", "k256?/ecdsa", "secp256k1?/recovery"]
 # OTA release signatures: sign (CI tool) + verify (device) share one module so
 # the message format can never drift between signer and verifier.
 ota-sign = ["dep:ed25519-compact"]

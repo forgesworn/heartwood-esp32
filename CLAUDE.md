@@ -61,6 +61,20 @@ before the wrap leaves, so once only). Advertised note_wrap_v1. WiFi tier NACKs 
 note frames (use the relay methods) and refuses at-rest changes while notes
 are held. Nothing bench-run: checklist section 13.
 
+LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
+lightning address owned by a master npub can be paid to keys the device
+derives from that identity key (common/src/cash_key.rs: seed =
+HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then lnurl-wallet's
+m/139'/1'/d1..d4 and LUD-25's tweak, graded against lnurlcash-kit's
+part2.json and tests/fixtures/lud25-nostr-seed.json on both curve backends). The
+mint holds only the cx1 (heartwood_note_address, no hold); a key-note wrap
+carries p/i/sig and no secret, and is opened only if the key is ours
+(note_wrap::open_note_rumor). A key note stores its key as the secret plus
+KeyNote {index, pubkey} (a v3 blob, written only for key notes), exports a
+ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim)
+derives the key itself. Recoverable signing is the one new curve op:
+secp256k1's `recovery` module on the firmware, k256 `ecdsa` on the host.
+
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
 ## Build & flash

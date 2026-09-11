@@ -77,6 +77,11 @@ pub mod cash;
 #[cfg(feature = "cash")]
 pub mod cash_store;
 
+/// LUD-25 Part 2: notes paid to this device's own keys, which it derives
+/// from the identity that owns the lightning address.
+#[cfg(feature = "cash")]
+pub mod cash_key;
+
 #[cfg(feature = "ota-sign")]
 pub mod ota_sign;
 

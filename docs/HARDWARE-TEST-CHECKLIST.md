@@ -1273,6 +1273,65 @@ notecase `heartwood send`.
    all behave exactly as in §12; the REQ now carries a fourth filter and the
    40 s re-REQ still lands (watch for the kind-0 profile refresh).
 
+## 15. Notes paid to the device's own keys (LUD-25 Part 2; added 2026-09-11, items 1, 2, 3 and 6's scan bench-run the same day)
+
+Bench record, 2026-09-11, Heltec V4 (e8:f6:0a:c9:e7:b4), app-only flash of this
+branch's release build, unlocked over WiFi, on real sats at moneyer.dev:
+two operator names owned by the master npub pointed at its keys (one
+kind-27235 hold each; the mint echoed the cx1, and both names share it). 21
+sats to the first was minted to key 0 and stored with no card as `(its own
+key #0)` from the trusted mint key. `heartwood address scan` found key 0 live and already held.
+`heartwood collect <id>` released a ck1 on one hold, the mint burned the note
+(`notes.state = burned`), SPEND NOTE on a second hold. Seen on the way: a
+spent record stamped just after a reboot sorts as the OLDEST (the clock is
+seconds since boot) and is the first trimmed.
+
+`heartwood_note_address` and `heartwood_note_claim` in `heartwood_capabilities`.
+A lightning address whose owner is a master npub can be paid to keys the
+device derives from that identity key (`common/src/cash_key.rs`): seed =
+HMAC-SHA256(identity key, `LNURLcash/nostr-seed`), then lnurl-wallet's
+`m/139'/1'/d1..d4` for the mint. The mint holds only the watch-only `cx1`,
+mints each payment to the next key, and wraps `https://<mint>/w?p=<cp1>&
+amount=&sig=<cs1>&i=<index>`: no secret on any relay. Drive it with notecase
+from a bound slot and a mint that pays names to keys (moneyer >= 0.13.1).
+
+1. `notecase heartwood address keys <name> --mint <host>`, for a name the
+   master npub owns. Expect NO card for the address (it spends nothing), then
+   a HOLD TO SIGN card for kind 27235 (the NIP-98 request); hold within a
+   minute. The mint now pays the name to that `cx1` (moneyer: the
+   `zap_names.cx1` column), and a second `heartwood_note_address` for the same
+   host returns the same `cx1` (deterministic).
+2. Pay the name a few sats (a zap or `<name>@<host>` from any wallet). With
+   the mint's zap key trusted: a "N sats received / from <host>" toast, no
+   card, `note ... received from trusted sender (new: true, paid to a key)` in
+   the log. Untrusted: the RECEIVE card as in 14.1. `heartwood notes` lists it
+   CONFIRMED with `(its own key #0)`; the list JSON carries `p` (the `cp1` the
+   wrap named) and `index` 0, and the note's `sig` is a `cs1`.
+3. `heartwood collect`: RELEASE NOTE card, hold; the k1 notecase receives is a
+   `ck1` (starts `ck1`), never 64 hex, and the mint accepts it; SPEND NOTE
+   card, hold; the note lists SPENT. The mint's `/stats` outstanding count is
+   unchanged by the collect (one note burned, one minted to notecase).
+4. Replay and reboot: the same wrap again raises nothing, and after a reboot
+   the note is still listed with its `p` and `index` (a v3 blob; a plain note
+   written before this is still v2 and still reads).
+5. Not ours: a wrap whose `p` is some other key (edit the index, or wrap a
+   note paid to another npub's branch) logs `is not a note: that note is paid
+   to a key this device does not hold`, raises no card, and is not offered
+   again.
+6. Lost wrap: pay the name while the device is powered off, then delete the
+   wrap from the relays (or pay a second name pointed at the same `cx1` with
+   no relay reachable). `heartwood address scan --mint <host>` reports the
+   device kept it at key #N; no card (a claim discloses nothing). A second
+   scan keeps nothing twice. `heartwood_note_claim` with a `p` the device
+   would not derive answers `bad_request`.
+7. `heartwood_note_send` on a key note answers `invalid_state` with no card:
+   its secret is a key, not a k1, and a wallet rotates it first.
+8. Over USB, `cash_address` and `claim_key_note` on the 0x70 frame answer
+   `bad_request` ("not available on this surface"): there is no identity on
+   the cable.
+9. `heartwood address custodial <name>`: one HOLD TO SIGN card; the next
+   payment arrives as a plain note sealed to the npub, as in 14.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

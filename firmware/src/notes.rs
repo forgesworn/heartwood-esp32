@@ -929,9 +929,7 @@ pub fn relay_precheck(cmd: &serde_json::Value) -> Option<&'static str> {
 /// here, under the same lock, so it cannot change between the check and
 /// the store.
 pub fn receive_note(
-    secret: &[u8; SECRET_LEN],
-    host: &str,
-    amount_msat: u64,
+    note: &heartwood_common::note_wrap::IncomingNote,
     from: &[u8; 32],
 ) -> Result<(String, bool), NoteError> {
     with_locker(|notes| {
@@ -940,9 +938,11 @@ pub fn receive_note(
         let out = notes.store.receive(
             &mut notes.storage,
             &mut rng,
-            secret,
-            host,
-            amount_msat,
+            &note.secret,
+            note.key,
+            &note.host,
+            note.amount_msat,
+            &note.sig,
             from,
             now_secs(),
             trusted,
@@ -1017,6 +1017,9 @@ fn handle_note_cmd_frame_inner(
         fw_version: env!("CARGO_PKG_VERSION"),
         board: crate::board::BOARD,
         storage_state,
+        // Nor any identity to derive an address branch from: cash_address
+        // and claim_key_note are relay methods, like send.
+        identity: None,
     };
     let response = note_cmd::handle_note_cmd(&mut ctx, msg);
     let mut bytes = serde_json::to_vec(&response)
@@ -1076,6 +1079,9 @@ fn handle_note_cmd_frame_locked_inner(
 pub fn run_note_cmd_approved(
     msg: &str,
     mut wrap: Option<&mut dyn FnMut(&[u8; SECRET_LEN], &NoteMeta, &[u8; 32]) -> Result<serde_json::Value, &'static str>>,
+    // The identity the request is served as: the root of its address
+    // branches, for `cash_address` and `claim_key_note`.
+    identity: Option<&[u8; 32]>,
 ) -> serde_json::Value {
     with_locker(|notes| {
         let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
@@ -1106,6 +1112,7 @@ pub fn run_note_cmd_approved(
             fw_version: env!("CARGO_PKG_VERSION"),
             board: crate::board::BOARD,
             storage_state,
+            identity,
         };
         let response = note_cmd::handle_note_cmd(&mut ctx, msg);
         NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);

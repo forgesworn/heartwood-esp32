@@ -6,7 +6,9 @@
 // The command set and semantics are lnurl-vault's docs/PROTOCOL.md; the
 // device side is common/src/note_cmd.rs. Gated commands (export_secret,
 // mark_spent, discard, rename, delete) put a card up and wait for the hold,
-// so the default timeout is the physical-confirm one.
+// so the default timeout is the physical-confirm one. One exception: a
+// mark_spent within two minutes of an approved export_secret of the SAME
+// note answers straight away, riding that hold (#129).
 //
 // Usage:
 //   node scripts/note-cmd.mjs --port /dev/cu.usbmodemXXXX '{"cmd":"get_info"}'

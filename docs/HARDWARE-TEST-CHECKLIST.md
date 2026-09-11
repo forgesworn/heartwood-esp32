@@ -1073,8 +1073,10 @@ USB tier, unlocked, no at-rest:
     NOT YET BENCH-RUN.
 3. Destructive gating: `mark_spent` / `discard` / `rename` / `delete` each
    raise a card; wrong-state commands answer `invalid_state` with NO card
-   (watch the OLED — the serial answer alone does not prove it). NOT YET
-   BENCH-RUN.
+   (watch the OLED; the serial answer alone does not prove it). Run the
+   `mark_spent` here on a note this session has NOT just exported, or it
+   rides that export's hold and shows no card by design (#129, section 17).
+   NOT YET BENCH-RUN.
 4. Full spend shape: `import_secret` (mint preimage) → `new_secret` rotate →
    confirm → mark_spent → `new_secret_pair` split → confirm both →
    mark_spent → delete housekeeping; counts and states correct throughout.
@@ -1369,6 +1371,44 @@ from pairing) always takes precedence. `scripts/net-config.mjs` reports
    is null while the pin holds it. Revoke the client: the secondary returns.
 5. Heap pressure: on the T-Display (no PSRAM), confirm no secondary is ever
    dialled (`secondary_index` stays null) and nothing else regresses.
+
+## 17. One hold per collect (#129; added 2026-09-11, NOT YET BENCH-RUN)
+
+A collect is `heartwood_note_export` then `heartwood_note_spent`, and both are
+pinned ButtonRequired, so the owner held the button twice for one note. The
+second hold bought nothing: the mint has already burned the note by the time
+it runs, and the card guarded only against a paired client lying "that one is
+spent". An approved export now leaves a single-use grant in RAM, and the spend
+mark for THAT note, from THAT client, within two minutes, runs with no card.
+
+Drive it with notecase from a bound slot (`heartwood collect <id>`), or over
+the cable with `scripts/note-cmd.mjs`. Nothing in the wallet changed: the
+grant is entirely device-side.
+
+1. One note, one hold: `heartwood collect <id>` on a CONFIRMED note. Expect
+   exactly ONE card (RELEASE NOTE), one hold, and the note listed SPENT
+   afterwards with NO SPEND NOTE card at any point. Watch the OLED, not only
+   the CLI: the serial answer alone does not prove a card was skipped.
+2. Reboot in between: export a note (`heartwood_note_export`, hold), RESET the
+   board, let it come back up and unlock, then `heartwood_note_spent` the same
+   note. The SPEND NOTE card is back and the hold is required: grants live in
+   RAM only and never in NVS.
+3. Never exported: `heartwood_note_spent` on a CONFIRMED note this boot has
+   not exported. SPEND NOTE card, as before.
+4. Expiry: export a note, hold, then wait more than two minutes before the
+   spend mark. The card is back.
+5. Another client: pair a second wallet, export from wallet A (hold), then
+   spend-mark the same note from wallet B. The card is back. (Wallet A's grant
+   is untouched by B's attempt.)
+6. Never widens: with a note just exported and its grant live,
+   `heartwood_note_send` for that same note still raises a SEND NOTE card, and
+   over the cable a `rename` of it still raises RENAME NOTE. (`discard` and
+   `delete` need a PENDING and a SPENT note respectively, so they cannot share
+   an export's grant at all; neither is ever covered by one.)
+7. Batch: `heartwood collect` with several notes held. Expect ONE hold for the
+   release of all of them and NO second card for the write-offs (was two
+   holds). Beyond eight notes in one batch the oldest grants are evicted and
+   those write-offs raise a card, which is correct and not a fault.
 
 ## Notes
 

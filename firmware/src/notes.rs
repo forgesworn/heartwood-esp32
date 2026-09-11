@@ -27,7 +27,9 @@
 
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 
-use heartwood_common::note_cmd::{self, Approval, GatedCmd, NoteCmdContext, WrapFn};
+use heartwood_common::note_cmd::{
+    self, Approval, GatedCmd, GrantClient, NoteCmdContext, SpendGrant, WrapFn,
+};
 use heartwood_common::note_fmt::{amount_and_host, amount_and_host_line, CARD_LINE_CHARS};
 use heartwood_common::note_seal;
 use heartwood_common::note_store::{
@@ -382,6 +384,14 @@ pub struct Notes {
     /// guess. Empty costs a provisioning round trip; a guessed counter costs
     /// somebody's note.
     pub cash: heartwood_common::cash_store::CashRegistry,
+    /// Single-use permission for a `mark_spent` to ride the `export_secret`
+    /// hold that just released the same note to the same client (#129).
+    ///
+    /// RAM ONLY, deliberately: there is no NVS key for this and there must
+    /// not be one. The hold proves a human was present a moment ago, and a
+    /// board that has rebooted since cannot know that. A grant surviving a
+    /// power cycle would be a card the owner never saw.
+    pub grants: SpendGrant,
 }
 
 impl Notes {
@@ -489,6 +499,7 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
                 // survive a reboot. Exactly the storage-unavailable posture
                 // the rest of this branch takes.
                 cash: heartwood_common::cash_store::CashRegistry::new(),
+                grants: SpendGrant::new(),
             };
         }
     };
@@ -536,7 +547,7 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
             log::info!("[notes] cash mint {host}, next index {next_index}");
         }
     }
-    Notes { store: outcome.store, storage, boot_state, trust, cash }
+    Notes { store: outcome.store, storage, boot_state, trust, cash, grants: SpendGrant::new() }
 }
 
 /// Whether the device holds any notes (loaded or sealed), for code with no
@@ -1007,6 +1018,11 @@ fn handle_note_cmd_frame_inner(
         storage: &mut notes.storage,
         rng: &mut rng,
         approve: &mut approve,
+        grant: &mut notes.grants,
+        // Physical possession is the cable's whole pairing, so every cable
+        // session is one client here - and never the same one as a relay
+        // client, so a grant can never cross between the two surfaces.
+        client: GrantClient::Cable,
         // No identity to seal as on the cable: send answers bad_request.
         wrap: None,
         trust: &mut notes.trust,
@@ -1082,6 +1098,11 @@ pub fn run_note_cmd_approved(
     // The identity the request is served as: the root of its address
     // branches, for `cash_address` and `claim_key_note`.
     identity: Option<&[u8; 32]>,
+    // Which bound client is asking. An approved export leaves ITS client a
+    // single-use grant for the matching spend mark (#129), so the two halves
+    // of one collect cost one hold; another client's spend mark does not
+    // find it.
+    client: &[u8; 32],
 ) -> serde_json::Value {
     with_locker(|notes| {
         let mut rng = |buf: &mut [u8]| crate::fill_random(buf);
@@ -1103,6 +1124,8 @@ pub fn run_note_cmd_approved(
             storage: &mut notes.storage,
             rng: &mut rng,
             approve: &mut approve,
+            grant: &mut notes.grants,
+            client: GrantClient::Relay(*client),
             wrap,
             trust: &mut notes.trust,
             approve_trust: &mut approve_trust,
@@ -1118,4 +1141,19 @@ pub fn run_note_cmd_approved(
         NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
         response
     })
+}
+
+/// Spend the grant an approved `heartwood_note_export` left behind, if this
+/// client has a live one for this note (#129).
+///
+/// The relay path decides whether to raise a card BEFORE the command runs
+/// (nip46_handler's pre-dispatch gate), so the grant has to be consulted
+/// there rather than inside the dispatcher the way the cable path does it.
+/// `true` means the hold that released this note a moment ago answers for
+/// writing its record off too, and no card goes up.
+///
+/// Consuming here is the point: whatever the command then answers, this
+/// client has had its one free write-off for this note.
+pub fn take_spend_grant(id: &str, client: &[u8; 32]) -> bool {
+    with_locker(|notes| notes.grants.take(id, GrantClient::Relay(*client), now_secs()))
 }

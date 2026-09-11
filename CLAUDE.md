@@ -61,6 +61,13 @@ before the wrap leaves, so once only). Advertised note_wrap_v1. WiFi tier NACKs 
 note frames (use the relay methods) and refuses at-rest changes while notes
 are held. Nothing bench-run: checklist section 13.
 
+A second configured relay (#92, 2026-09-11, checklist section 16): besides
+the primary, the relay loop keeps one more configured relay live when the
+second session slot is free and the heap can spare it (SECONDARY_MIN_* in
+relay.rs), is promoted when the primary drops, gives its slot to a pinned
+relay or a pairing, and is shed when the largest block falls below 32 KB.
+net-config reports runtime.secondary_index.
+
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =

@@ -85,6 +85,11 @@ pub struct NetworkRuntimeStatus {
     /// not already carry, and this type stays `Copy` and identifier-free.
     #[serde(default)]
     pub relay_index: Option<u8>,
+    /// A second configured relay the signer also listens on, when the heap
+    /// can spare one (#92): the same kind of position, `None` while there is
+    /// none. A client publishing to either reaches the signer.
+    #[serde(default)]
+    pub secondary_index: Option<u8>,
 }
 
 #[cfg(feature = "nip46")]
@@ -96,6 +101,7 @@ impl NetworkRuntimeStatus {
             relay_connected: false,
             last_error_class: NetworkRuntimeError::None,
             relay_index: None,
+            secondary_index: None,
         }
     }
 
@@ -106,6 +112,7 @@ impl NetworkRuntimeStatus {
             relay_connected: false,
             last_error_class: NetworkRuntimeError::None,
             relay_index: None,
+            secondary_index: None,
         }
     }
 }
@@ -910,6 +917,7 @@ mod tests {
             relay_connected: false,
             last_error_class: NetworkRuntimeError::WebsocketUpgrade,
             relay_index: None,
+            secondary_index: None,
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(
@@ -920,6 +928,7 @@ mod tests {
                 "relay_connected": false,
                 "last_error_class": "websocket_upgrade",
                 "relay_index": serde_json::Value::Null,
+                "secondary_index": serde_json::Value::Null,
             })
         );
         let keys = value
@@ -937,6 +946,7 @@ mod tests {
                 "last_error_class",
                 "relay_connected",
                 "relay_index",
+                "secondary_index",
                 "stage",
                 "wifi_connected"
             ]
@@ -956,9 +966,11 @@ mod tests {
             relay_connected: true,
             last_error_class: NetworkRuntimeError::None,
             relay_index: Some(1),
+            secondary_index: Some(3),
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["relay_index"], serde_json::json!(1));
+        assert_eq!(value["secondary_index"], serde_json::json!(3));
         assert!(value.as_object().unwrap().values().all(|v| !v
             .as_str()
             .is_some_and(|s| s.contains("://"))));
@@ -972,6 +984,7 @@ mod tests {
         let older = br#"{"stage":"online","wifi_connected":true,"relay_connected":true,"last_error_class":"none"}"#;
         let status: NetworkRuntimeStatus = serde_json::from_slice(older).unwrap();
         assert_eq!(status.relay_index, None);
+        assert_eq!(status.secondary_index, None);
         assert!(status.relay_connected);
     }
 

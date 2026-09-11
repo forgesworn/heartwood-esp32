@@ -1333,6 +1333,43 @@ from a bound slot and a mint that pays names to keys (moneyer >= 0.13.1).
 9. `heartwood address custodial <name>`: one HOLD TO SIGN card; the next
    payment arrives as a plain note sealed to the npub, as in 14.
 
+## 16. A second configured relay (#92; added 2026-09-11, items 1 and 2 bench-run the same day)
+
+Bench record, 2026-09-11, Heltec V4 (e8:f6:0a:c9:e7:b4), app-only flash of this
+branch's release build: online on relay 0 with `secondary_index` 1 within 40 s
+of the WiFi unlock; heap with both sessions free 188,024 B, largest block
+92,160 B (one session: 209,480 B and 143,360 B), so a second TLS session costs
+about 21 KB. A `ping` sent to ONE relay at a time from an unbound client was
+answered on relay 0 and relay 1 and not on relay 3, and the note locker
+listed intact over the relay. Items 3 (failover), 4 (pairing) and 5
+(T-Display) not yet run.
+
+The signer used to serve one configured relay at a time, so a relay that
+silently stopped delivering hid every wrap and request sent there, while
+clients and senders publish to all of them. It now keeps a SECOND configured
+relay live when the slot is free and the heap can spare it (at least 120 KB
+free and a 48 KB block; shed below a 32 KB block). A pinned relay (a client's,
+from pairing) always takes precedence. `scripts/net-config.mjs` reports
+`runtime.secondary_index` next to `relay_index`.
+
+1. Boot and unlock with four configured relays. About 15 s after the primary
+   comes up, `net-config` shows `secondary_index` set to another relay, and
+   the heap log reads `2 session(s)` with free heap still well above 120 KB.
+2. Deafness: from a client, publish a NIP-46 request ONLY to the secondary's
+   relay (a one-relay bunker URI for it). The signer answers. Then only to the
+   primary's. It answers. The same request published to both is answered
+   once (dedupe), and a wrap published to both raises one card or toast.
+3. Failover: make the primary's relay unreachable (block it at the router,
+   or pick a relay you can take down). The secondary is promoted at once:
+   `relay_index` becomes the old `secondary_index` with no offline gap, and a
+   new secondary is dialled on the next relay about 3 s later.
+4. Pairing: with a secondary live, pair a client whose relay is none of the
+   configured four (`nostrconnect://` with its own relay). The pairing
+   succeeds; the secondary gives up its slot to the pin, and `secondary_index`
+   is null while the pin holds it. Revoke the client: the secondary returns.
+5. Heap pressure: on the T-Display (no PSRAM), confirm no secondary is ever
+   dialled (`secondary_index` stays null) and nothing else regresses.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

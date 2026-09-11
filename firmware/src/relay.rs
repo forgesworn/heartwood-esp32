@@ -198,6 +198,15 @@ const DIAL_MIN_FREE_HEAP: u32 = 70_000;
 /// 16KB record buffer in one piece, so total-free alone is not enough on a
 /// fragmented heap.
 const DIAL_MIN_LARGEST_BLOCK: usize = 24_000;
+/// The heap a SECOND configured relay may be dialled on (#92). Stricter than
+/// the pinned guard: a pinned relay is one a client needs, the secondary is
+/// redundancy, so it only takes memory the board can comfortably spare. On a
+/// board that never has this much (the no-PSRAM T-Display) it never dials.
+const SECONDARY_MIN_FREE_HEAP: u32 = 120_000;
+const SECONDARY_MIN_LARGEST_BLOCK: usize = 48_000;
+/// Close the secondary when the largest free block falls below this, so a
+/// response, a signature or a note never has to compete with redundancy.
+const SECONDARY_SHED_BLOCK: usize = 32_000;
 /// Relay-health watchdog: restart the signer when WiFi is up and relays are
 /// configured, yet no session has been simultaneously live and publishable
 /// for this long. A fragmented no-PSRAM heap can reach a state where every
@@ -344,6 +353,10 @@ struct SignCtx<'a, 'd, 'b> {
     /// re-dials of a dead relay, which the pinned backoff cannot cover (no
     /// PinnedRelay exists until a dial succeeds).
     dial_cooldown: Option<(String, Instant)>,
+    /// Set when a pairing's relay was dialled while the request arrived on the
+    /// secondary: the main loop closes the secondary as that step returns, so
+    /// the pin keeps the slot (#92).
+    shed_secondary: bool,
     /// Present only while this boot is serving a TRYING network candidate.
     network_trial_id: Option<String>,
     network_trial_deadline: Option<Instant>,
@@ -568,6 +581,11 @@ fn set_network_runtime(
         } else {
             None
         },
+        secondary_index: if relay_connected {
+            ctx.network_runtime.secondary_index
+        } else {
+            None
+        },
     };
     if ctx.network_runtime == next {
         return;
@@ -655,6 +673,11 @@ struct RelaySession {
     /// The subscription REQ sent at connect, re-sent periodically to self-heal.
     sub_req: String,
     pinned: bool,
+    /// A second CONFIGURED relay beside the primary (#92), dialled only when
+    /// the slot is free and the heap can spare it. Neither the primary nor
+    /// pinned: it gives its slot back to a pinned relay or a pairing, is
+    /// promoted when the primary drops, and is shed when the heap tightens.
+    secondary: bool,
     /// Bytes still owed from an oversize frame being discarded. See `try_parse`:
     /// an over-cap frame is skipped rather than killing the session, and it may
     /// span several reads, so the remainder is carried here between pump passes.
@@ -895,6 +918,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         button_settle: false,
         catch_up: None,
         dial_cooldown: None,
+        shed_secondary: false,
         network_trial_id,
         network_trial_deadline,
         network_restart_at: None,
@@ -926,6 +950,12 @@ pub fn run_wifi_standalone<'d, 'b>(
     // management commands can dial new sessions (see RelayPool).
     let mut sessions: Vec<RelaySession> = Vec::new();
     let mut primary_next = Instant::now();
+    // The second configured relay (#92): which one to try next, when, and how
+    // many dials in a row have failed (drives the same backoff as a pinned
+    // relay). It starts one past the primary and never duplicates a live one.
+    let mut secondary_idx: usize = relay_idx.wrapping_add(1);
+    let mut secondary_next = Instant::now() + PINNED_BACKOFF;
+    let mut secondary_fails: u32 = 0;
 
     // Relay-health watchdog + heap telemetry (see RELAY_HEALTH_RESTART_AFTER).
     let mut last_relay_healthy = Instant::now();
@@ -1085,8 +1115,33 @@ pub fn run_wifi_standalone<'d, 'b>(
         // both of them while the card is still on screen (#64).
         service_button_cards(&mut ctx, &mut sessions);
 
+        // The primary dropped while a secondary was live: promote it. It is a
+        // configured relay, already subscribed and past its catch-up, so the
+        // signer never goes deaf while a replacement dials (#92).
+        if !sessions.iter().any(|s| !s.pinned && !s.secondary) {
+            if let Some(promoted) = sessions.iter_mut().find(|s| s.secondary) {
+                promoted.secondary = false;
+                if let Some(idx) = relays.iter().position(|r| same_relay(r, &promoted.url)) {
+                    relay_idx = idx;
+                }
+                log::info!("[relay] {} takes over as the primary", relay_host(&promoted.url));
+                ctx.relay_url = promoted.url.clone();
+                ctx.network_runtime.relay_index = u8::try_from(relay_idx % relays.len()).ok();
+                ctx.network_runtime.secondary_index = None;
+                set_network_runtime(
+                    &mut ctx,
+                    NetworkRuntimeStage::Online,
+                    true,
+                    true,
+                    NetworkRuntimeError::None,
+                );
+                secondary_idx = relay_idx.wrapping_add(1);
+                secondary_next = Instant::now() + PRIMARY_BACKOFF;
+            }
+        }
+
         // Ensure the primary session (rotates over the configured set).
-        if !sessions.iter().any(|s| !s.pinned) && Instant::now() >= primary_next {
+        if !sessions.iter().any(|s| !s.pinned && !s.secondary) && Instant::now() >= primary_next {
             // Same heap guard as the pinned dial below: a fresh mbedTLS
             // session costs ~40-50KB and an allocation failure deep inside
             // the TLS or WiFi stack can abort the chip rather than error.
@@ -1156,6 +1211,23 @@ pub fn run_wifi_standalone<'d, 'b>(
             }
         }
 
+        // A pinned relay is one a client needs; the secondary is only
+        // redundancy. When a pinned relay is due and the secondary holds the
+        // last slot, the secondary gives it back.
+        if sessions.len() >= MAX_SESSIONS
+            && pinned.iter().any(|p| {
+                Instant::now() >= p.next_attempt && !sessions.iter().any(|s| same_relay(&s.url, &p.url))
+            })
+        {
+            if let Some(pos) = sessions.iter().position(|s| s.secondary) {
+                let yielded = sessions.remove(pos);
+                log::info!("[relay] secondary {} yields its slot to a pinned relay", relay_host(&yielded.url));
+                ctx.network_runtime.secondary_index = None;
+                secondary_next = Instant::now() + PRIMARY_BACKOFF;
+                retune_recv_timeouts(&mut sessions);
+            }
+        }
+
         // Ensure pinned sessions, capacity and backoff permitting. A pinned
         // dial failing never advances the primary rotation, and no pinned dial
         // happens while any live session runs degraded (a blocking-read
@@ -1210,6 +1282,57 @@ pub fn run_wifi_standalone<'d, 'b>(
             }
         }
 
+        // A second configured relay, when the slot is free and the heap can
+        // spare it (#92). The primary alone hears only its own relay, and one
+        // that silently stops delivering hides every wrap and request sent
+        // there, while clients and senders publish to all of them.
+        if relays.len() > 1
+            && sessions.len() < MAX_SESSIONS
+            && sessions.iter().any(|s| !s.pinned && !s.secondary)
+            && !sessions.iter().any(|se| !se.recv_timeout_on)
+            && ctx.network_trial_id.is_none()
+            && ctx.ota_session.is_none()
+            && Instant::now() >= secondary_next
+        {
+            let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            let largest = unsafe {
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                    esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                )
+            };
+            let candidate = (0..relays.len())
+                .map(|k| (secondary_idx.wrapping_add(k)) % relays.len())
+                .find(|&k| !sessions.iter().any(|s| same_relay(&s.url, &relays[k])));
+            if free < SECONDARY_MIN_FREE_HEAP || largest < SECONDARY_MIN_LARGEST_BLOCK {
+                // Not a failure: the board simply cannot spare it now.
+                secondary_next = Instant::now() + PINNED_BACKOFF_MAX;
+            } else if let Some(k) = candidate {
+                let url = relays[k].clone();
+                match connect_secondary(&url, &mut ctx) {
+                    Ok(s) => {
+                        log::info!(
+                            "[relay] also listening on {} (relay {} of {})",
+                            relay_host(&url),
+                            k + 1,
+                            relays.len()
+                        );
+                        sessions.push(s);
+                        retune_recv_timeouts(&mut sessions);
+                        secondary_idx = k;
+                        secondary_fails = 0;
+                        ctx.network_runtime.secondary_index = u8::try_from(k).ok();
+                    }
+                    Err(e) => {
+                        secondary_fails = secondary_fails.saturating_add(1);
+                        let delay = (PINNED_BACKOFF * (1u32 << secondary_fails.min(6))).min(PINNED_BACKOFF_MAX);
+                        log::warn!("[relay] secondary {}: {e}; retry in {}s", relay_host(&url), delay.as_secs());
+                        secondary_idx = k.wrapping_add(1);
+                        secondary_next = Instant::now() + delay;
+                    }
+                }
+            }
+        }
+
         // Relay-health watchdog: a session that is live while the heap can
         // still place a response proves the signer useful. Anything else —
         // every dial refused or failing, or a heap too fragmented to publish
@@ -1227,6 +1350,18 @@ pub fn run_wifi_standalone<'d, 'b>(
             };
             if !sessions.is_empty() && largest >= RELAY_HEALTH_MIN_BLOCK {
                 last_relay_healthy = health_now;
+            }
+            if largest < SECONDARY_SHED_BLOCK {
+                if let Some(pos) = sessions.iter().position(|s| s.secondary) {
+                    let shed = sessions.remove(pos);
+                    log::warn!(
+                        "[relay] heap tight (largest {largest} B): closing the secondary on {}",
+                        relay_host(&shed.url)
+                    );
+                    ctx.network_runtime.secondary_index = None;
+                    secondary_next = health_now + PINNED_BACKOFF_MAX;
+                    retune_recv_timeouts(&mut sessions);
+                }
             }
             if heap_log_due {
                 log::info!(
@@ -1277,9 +1412,27 @@ pub fn run_wifi_standalone<'d, 'b>(
                 session_step(&mut s, &mut ctx, &mut pool)
             };
             match step {
+                Ok(()) if s.secondary && ctx.shed_secondary => {
+                    // A pairing arrived through the secondary and dialled the
+                    // client's relay into the pool: the slot is the pin's now.
+                    ctx.shed_secondary = false;
+                    log::info!("[relay] secondary {} closed for a pairing's relay", relay_host(&s.url));
+                    ctx.network_runtime.secondary_index = None;
+                    secondary_next = Instant::now() + PINNED_BACKOFF_MAX;
+                    retune_recv_timeouts(&mut sessions);
+                }
                 Ok(()) => {
                     sessions.insert(i.min(sessions.len()), s);
                     i += 1;
+                }
+                Err(e) if s.secondary => {
+                    secondary_fails = secondary_fails.saturating_add(1);
+                    let delay = (PINNED_BACKOFF * (1u32 << secondary_fails.min(6))).min(PINNED_BACKOFF_MAX);
+                    log::warn!("[relay] secondary {} dropped: {e}; next in {}s", relay_host(&s.url), delay.as_secs());
+                    ctx.network_runtime.secondary_index = None;
+                    secondary_idx = secondary_idx.wrapping_add(1);
+                    secondary_next = Instant::now() + delay;
+                    retune_recv_timeouts(&mut sessions);
                 }
                 Err(e) => {
                     if s.pinned {
@@ -1598,6 +1751,27 @@ fn connect_relay(url: &str, pinned: bool, ctx: &mut SignCtx) -> Result<RelaySess
     })
 }
 
+/// A second configured relay beside the primary (#92). Like a pinned session
+/// it may never run degraded: a blocking read on it would starve the primary.
+fn connect_secondary(url: &str, ctx: &mut SignCtx) -> Result<RelaySession, String> {
+    let sub_req = build_sub_req(ctx, true);
+    let keepalive_req = build_sub_req(ctx, false);
+    ctx.catch_up = Some(CatchUp { delivered: 0, oldest: u64::MAX, pages: 0 });
+    connect_relay_raw(url, sub_req, false, true)
+        .map(|mut s| {
+            s.sub_req = keepalive_req;
+            s.secondary = true;
+            s
+        })
+        .map_err(|e| {
+            if e == RECV_TIMEOUT_REQUIRED {
+                "secondary relay needs a recv timeout (would starve the primary)".into()
+            } else {
+                e
+            }
+        })
+}
+
 /// Sentinel error: the relay socket could not be given a recv timeout and the
 /// caller required one (see [`connect_relay_raw`]).
 const RECV_TIMEOUT_REQUIRED: &str = "recv-timeout required";
@@ -1686,6 +1860,7 @@ fn connect_relay_raw(
         server_time,
         sub_req,
         pinned,
+        secondary: false,
         skip: 0,
     })
 }
@@ -6411,8 +6586,19 @@ fn dispatch_mgmt(
                 if !url.starts_with("wss://") {
                     return Err("relay must be wss://".into());
                 }
-                if 1 + pool.others.len() >= MAX_SESSIONS {
+                // A secondary is redundancy (#92) and never blocks a pairing:
+                // it is not counted, and gives up its slot below.
+                let committed = usize::from(!s.secondary)
+                    + pool.others.iter().filter(|o| !o.secondary).count();
+                if committed >= MAX_SESSIONS {
                     return Err("relay_capacity: signer already serves its maximum relays".into());
+                }
+                // Given back before the guards below, so the heap it held
+                // counts towards the dial. The loop re-dials it later.
+                if let Some(pos) = pool.others.iter().position(|o| o.secondary) {
+                    let yielded = pool.others.remove(pos);
+                    log::info!("[relay] secondary {} yields its slot to a pairing", relay_host(&yielded.url));
+                    ctx.network_runtime.secondary_index = None;
                 }
                 // A dial for a relay that is ALREADY pinned (session currently
                 // down — a re-pair while the pinned link is between retries)
@@ -6534,6 +6720,11 @@ fn dispatch_mgmt(
                 dialled = Some(match connect_relay(url, true, ctx) {
                     Ok(ns) => {
                         ctx.dial_cooldown = None;
+                        // Arrived on the secondary: it closes as this step
+                        // returns, so the new pin keeps the slot.
+                        if s.secondary {
+                            ctx.shed_secondary = true;
+                        }
                         ns
                     }
                     Err(e) => {

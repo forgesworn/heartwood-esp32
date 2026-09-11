@@ -31,7 +31,7 @@ it, and atomically renames the ciphertext into place.
 ```sh
 node scripts/dev-state-backup.mjs \
   --port /dev/cu.usbmodem3401 \
-  --firmware-version 0.18.0-beta.3 \
+  --firmware-version 0.18.0-beta.4 \
   --out /secure/heartwood-heltec-v4-dev-state-YYYYMMDDTHHMMSSZ.tar.gz.age \
   --recipient age1LOCAL... \
   --recipient age1OFFSITE... \
@@ -61,7 +61,7 @@ never written.
 cargo +stable build --release --manifest-path ota-sign/Cargo.toml
 node scripts/migrate-legacy-v4.mjs \
   --port /dev/cu.usbmodem3401 \
-  --release-dir /secure/heartwood-v0.18.0-beta.3 \
+  --release-dir /secure/heartwood-v0.18.0-beta.4 \
   --backup /secure/heartwood-heltec-v4-dev-state-....tar.gz.age \
   --backup-identity /secure/local-age-identity.txt \
   --esptool /secure/tools/esptool \

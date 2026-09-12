@@ -2,7 +2,7 @@
 
 # Heartwood ESP32
 
-> **Beta:** firmware `0.18.0-beta.4` is the current retained-state beta. Automated
+> **Beta:** firmware `0.18.0-beta.5` is the current retained-state beta. Automated
 > suites, signed board builds, the named Heltec V4 migration, reboot/unlock and
 > small-value settlement are release gates. Keep an independent recovery copy
 > and use small values while the complete destructive cross-board recovery

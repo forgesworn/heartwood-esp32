@@ -3675,7 +3675,14 @@ fn complete_parked(
             // session rather than dropped (#82). The verdict's own `applied`
             // value deliberately still reports the failed publish, because
             // that is what the guardian asked about.
-            hold_reply(ctx, &client_pubkey, slot, &request_id, &signed);
+            hold_reply(
+                ctx,
+                &client_pubkey,
+                slot,
+                &request_id,
+                &signed,
+                heartwood_common::held_reply::Decision::Approved,
+            );
             false
         }
     }
@@ -4447,8 +4454,9 @@ fn resolve_button_card(
         let held = Duration::from_secs(crate::uptime_s().saturating_sub(ask.received_uptime));
         // Sealed first, published second: an approved answer that no live
         // session will take is kept for the next one rather than dropped with
-        // the socket (#82). Only the approved branch reaches here holding
-        // something worth keeping: a denial and an expiry seal an error.
+        // the socket (#82). The decision travels with it, and the queue is
+        // what refuses to hold a denial or an expiry; both still go out down
+        // a live session if there is one.
         let sealed = seal_reply(
             ctx.secp,
             &signing_secret,
@@ -4458,22 +4466,21 @@ fn resolve_button_card(
             reply_stamp(ctx, ask.created_at, held),
             response_json,
         );
+        let decision = if matches!(outcome, CardTick::Approved) {
+            heartwood_common::held_reply::Decision::Approved
+        } else {
+            heartwood_common::held_reply::Decision::Refused
+        };
         match sealed {
-            Ok(signed) if matches!(outcome, CardTick::Approved) => publish_reply_or_hold(
+            Ok(signed) => publish_reply_or_hold(
                 sessions,
                 ctx,
                 &card.client_pubkey,
                 slot,
                 &request_id,
                 signed,
+                decision,
             ),
-            Ok(signed) => {
-                if let Some(session) = sessions.first_mut() {
-                    if let Err(e) = publish_sealed(&mut session.tls, &signed) {
-                        log::warn!("[relay] approval publish for {request_id}: {e}");
-                    }
-                }
-            }
             Err(e) => log::warn!("[relay] approval publish for {request_id}: {e}"),
         }
     }
@@ -7782,6 +7789,7 @@ fn publish_reply_or_hold(
     master_slot: u8,
     request_id: &str,
     signed: SignedEvent,
+    decision: heartwood_common::held_reply::Decision,
 ) {
     for index in publish_order(sessions) {
         let session = &mut sessions[index];
@@ -7793,7 +7801,7 @@ fn publish_reply_or_hold(
             ),
         }
     }
-    hold_reply(ctx, client_pubkey, master_slot, request_id, &signed);
+    hold_reply(ctx, client_pubkey, master_slot, request_id, &signed, decision);
 }
 
 /// Which sessions to offer a reply to, in order.
@@ -7815,9 +7823,15 @@ fn hold_reply(
     master_slot: u8,
     request_id: &str,
     signed: &SignedEvent,
+    decision: heartwood_common::held_reply::Decision,
 ) {
-    use heartwood_common::held_reply::{HeldReply, HoldOutcome};
+    use heartwood_common::held_reply::{Decision, HeldReply, HoldOutcome};
 
+    if decision != Decision::Approved {
+        // The queue refuses it anyway; skip the serialise.
+        log::warn!("[relay] reply for {request_id} could not be published; not held (refused)");
+        return;
+    }
     let Ok(payload) = serde_json::to_string(&("EVENT", signed)) else {
         log::warn!("[relay] approved reply for {request_id} could not be held: serialise failed");
         return;
@@ -7832,6 +7846,7 @@ fn hold_reply(
             held_at: now,
             attempts: 0,
         },
+        decision,
         now,
     );
     match outcome {
@@ -7848,6 +7863,8 @@ fn hold_reply(
         HoldOutcome::TooLarge => log::warn!(
             "[relay] approved reply for {request_id} is too large to hold; dropped"
         ),
+        // Unreachable: refusals return above.
+        HoldOutcome::Refused => {}
     }
 }
 

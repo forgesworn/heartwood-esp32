@@ -27,10 +27,11 @@
 //!   signed event whose NIP-44 ciphertext is already bound to that client's
 //!   conversation key, so even a routing bug here could not disclose it to
 //!   anyone else: the check is belt and braces over that.
-//! * **Approved work only.** The caller holds a reply only for a request the
-//!   owner approved. A denied, expired or refused request is answered with an
-//!   error whose loss costs the caller nothing it did not already have (a
-//!   timeout), so none is ever held.
+//! * **Approved work only.** [`HeldReplies::hold`] takes the owner's
+//!   [`Decision`] and refuses anything but [`Decision::Approved`], so the rule
+//!   is enforced here rather than trusted to each call site. A denied, expired
+//!   or refused request is answered with an error whose loss costs the caller
+//!   nothing it did not already have (a timeout).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -108,6 +109,23 @@ impl HeldReply {
     }
 }
 
+/// What the owner decided about the request this reply answers.
+///
+/// The queue enforces this itself rather than trusting each call site to
+/// remember: only work the owner approved is worth a second chance at
+/// delivery. A denial or an expiry is an error response, and a caller that
+/// never receives one simply times out, which is the same outcome by a
+/// slower road. Holding refusals would also spend the bound on replies
+/// nobody is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// The owner held the button (or a guardian approved the park) and the
+    /// device acted.
+    Approved,
+    /// Denied, expired, or refused before it ever reached a card.
+    Refused,
+}
+
 /// What became of a hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoldOutcome {
@@ -117,6 +135,8 @@ pub enum HoldOutcome {
     /// Larger on its own than the whole byte budget: nothing was evicted and
     /// nothing was kept.
     TooLarge,
+    /// Not approved work, so not held. Nothing was evicted.
+    Refused,
 }
 
 /// The device's RAM-only outbox of approved replies (#82).
@@ -148,7 +168,10 @@ impl HeldReplies {
     /// Expired entries go first, then the oldest, until both the count and
     /// the byte budget have room. A reply that could not fit even in an empty
     /// queue is refused without disturbing what is already held.
-    pub fn hold(&mut self, reply: HeldReply, now: u32) -> HoldOutcome {
+    pub fn hold(&mut self, reply: HeldReply, decision: Decision, now: u32) -> HoldOutcome {
+        if decision != Decision::Approved {
+            return HoldOutcome::Refused;
+        }
         if reply.weight() > HELD_REPLY_BYTE_BUDGET {
             return HoldOutcome::TooLarge;
         }
@@ -260,7 +283,7 @@ mod tests {
     fn a_held_reply_comes_back_for_its_own_client() {
         let mut q = HeldReplies::new();
         assert!(matches!(
-            q.hold(reply("r1", 1, 10), 10),
+            q.hold(reply("r1", 1, 10), Decision::Approved, 10),
             HoldOutcome::Held { .. }
         ));
         assert_eq!(q.next_client(11), Some(client(1)));
@@ -272,7 +295,7 @@ mod tests {
     #[test]
     fn never_to_another_client() {
         let mut q = HeldReplies::new();
-        q.hold(reply("r1", 1, 10), 10);
+        q.hold(reply("r1", 1, 10), Decision::Approved, 10);
         // The head of the queue belongs to client 1, and asking as anyone
         // else gets nothing: not the head, and not a "closest match".
         assert_eq!(q.take(&client(2), 11), None);
@@ -284,8 +307,8 @@ mod tests {
     #[test]
     fn a_second_client_is_served_from_its_own_entry() {
         let mut q = HeldReplies::new();
-        q.hold(reply("r1", 1, 10), 10);
-        q.hold(reply("r2", 2, 10), 10);
+        q.hold(reply("r1", 1, 10), Decision::Approved, 10);
+        q.hold(reply("r2", 2, 10), Decision::Approved, 10);
         assert_eq!(q.take(&client(2), 11).map(|r| r.request_id), Some("r2".to_string()));
         assert_eq!(q.take(&client(1), 11).map(|r| r.request_id), Some("r1".to_string()));
         assert!(q.is_empty());
@@ -294,7 +317,7 @@ mod tests {
     #[test]
     fn delivered_once_and_only_once() {
         let mut q = HeldReplies::new();
-        q.hold(reply("r1", 1, 10), 10);
+        q.hold(reply("r1", 1, 10), Decision::Approved, 10);
         assert!(q.take(&client(1), 11).is_some());
         // Whatever the caller did with it, the queue no longer has it: a
         // second flush cannot republish the same approved reply.
@@ -306,7 +329,7 @@ mod tests {
     #[test]
     fn a_failed_publish_may_be_offered_back_but_not_forever() {
         let mut q = HeldReplies::new();
-        q.hold(reply("r1", 1, 10), 10);
+        q.hold(reply("r1", 1, 10), Decision::Approved, 10);
         let first = q.take(&client(1), 11).expect("held");
         assert_eq!(first.attempts, 1);
         assert!(q.requeue(first), "one failure is worth another session");
@@ -319,7 +342,7 @@ mod tests {
     #[test]
     fn it_expires() {
         let mut q = HeldReplies::new();
-        q.hold(reply("r1", 1, 100), 100);
+        q.hold(reply("r1", 1, 100), Decision::Approved, 100);
         // On the boundary it is still deliverable.
         assert_eq!(q.next_client(100 + HELD_REPLY_TTL_SECS), Some(client(1)));
         assert_eq!(q.next_client(100 + HELD_REPLY_TTL_SECS + 1), None);
@@ -329,14 +352,14 @@ mod tests {
     #[test]
     fn an_expired_reply_is_not_handed_to_its_client_either() {
         let mut q = HeldReplies::new();
-        q.hold(reply("r1", 1, 100), 100);
+        q.hold(reply("r1", 1, 100), Decision::Approved, 100);
         assert_eq!(q.take(&client(1), 100 + HELD_REPLY_TTL_SECS + 1), None);
     }
 
     #[test]
     fn a_clock_that_goes_backwards_expires_rather_than_holds() {
         let mut q = HeldReplies::new();
-        q.hold(reply("r1", 1, 100), 100);
+        q.hold(reply("r1", 1, 100), Decision::Approved, 100);
         // Seconds-since-boot cannot go backwards without a reboot, and a
         // reboot must not leave a reply deliverable.
         assert_eq!(q.next_client(5), None);
@@ -346,10 +369,10 @@ mod tests {
     fn the_cap_holds_and_the_oldest_goes_first() {
         let mut q = HeldReplies::new();
         for i in 0..HELD_REPLY_MAX {
-            q.hold(reply(&format!("r{i}"), 1, 10), 10);
+            q.hold(reply(&format!("r{i}"), 1, 10), Decision::Approved, 10);
         }
         assert_eq!(q.len(), HELD_REPLY_MAX);
-        let outcome = q.hold(reply("newest", 1, 10), 10);
+        let outcome = q.hold(reply("newest", 1, 10), Decision::Approved, 10);
         assert_eq!(outcome, HoldOutcome::Held { evicted: vec!["r0".to_string()] });
         assert_eq!(q.len(), HELD_REPLY_MAX);
         // r0 is gone; r1 is now the oldest and "newest" is at the back.
@@ -360,13 +383,13 @@ mod tests {
     fn the_byte_budget_binds_before_the_count_does() {
         let mut q = HeldReplies::new();
         let big = HELD_REPLY_BYTE_BUDGET / 3;
-        q.hold(sized("a", 1, 10, big), 10);
-        q.hold(sized("b", 1, 10, big), 10);
+        q.hold(sized("a", 1, 10, big), Decision::Approved, 10);
+        q.hold(sized("b", 1, 10, big), Decision::Approved, 10);
         assert_eq!(q.len(), 2);
         assert!(q.bytes() <= HELD_REPLY_BYTE_BUDGET);
         // A third of the same size cannot fit beside them, so the oldest goes
         // even though the count cap has room to spare.
-        let outcome = q.hold(sized("c", 1, 10, big), 10);
+        let outcome = q.hold(sized("c", 1, 10, big), Decision::Approved, 10);
         assert_eq!(outcome, HoldOutcome::Held { evicted: vec!["a".to_string()] });
         assert!(q.bytes() <= HELD_REPLY_BYTE_BUDGET);
         assert_eq!(q.len(), 2);
@@ -375,8 +398,8 @@ mod tests {
     #[test]
     fn one_reply_too_large_for_the_budget_is_dropped_not_accumulated() {
         let mut q = HeldReplies::new();
-        q.hold(reply("keeper", 1, 10), 10);
-        let outcome = q.hold(sized("whale", 1, 10, HELD_REPLY_BYTE_BUDGET + 1), 10);
+        q.hold(reply("keeper", 1, 10), Decision::Approved, 10);
+        let outcome = q.hold(sized("whale", 1, 10, HELD_REPLY_BYTE_BUDGET + 1), Decision::Approved, 10);
         assert_eq!(outcome, HoldOutcome::TooLarge);
         // And it did not cost the queue what it was already holding.
         assert_eq!(q.len(), 1);
@@ -387,10 +410,10 @@ mod tests {
     fn holding_expires_stale_entries_rather_than_evicting_live_ones() {
         let mut q = HeldReplies::new();
         for i in 0..HELD_REPLY_MAX {
-            q.hold(reply(&format!("old{i}"), 1, 10), 10);
+            q.hold(reply(&format!("old{i}"), 1, 10), Decision::Approved, 10);
         }
         let later = 10 + HELD_REPLY_TTL_SECS + 1;
-        let outcome = q.hold(reply("fresh", 1, later), later);
+        let outcome = q.hold(reply("fresh", 1, later), Decision::Approved, later);
         assert_eq!(outcome, HoldOutcome::Held { evicted: vec![] });
         assert_eq!(q.len(), 1);
     }
@@ -398,10 +421,10 @@ mod tests {
     #[test]
     fn requeue_refuses_when_the_queue_filled_up_behind_it() {
         let mut q = HeldReplies::new();
-        q.hold(reply("taken", 1, 10), 10);
+        q.hold(reply("taken", 1, 10), Decision::Approved, 10);
         let in_flight = q.take(&client(1), 10).expect("held");
         for i in 0..HELD_REPLY_MAX {
-            q.hold(reply(&format!("r{i}"), 1, 10), 10);
+            q.hold(reply(&format!("r{i}"), 1, 10), Decision::Approved, 10);
         }
         assert!(!q.requeue(in_flight), "a full queue is not made fuller");
         assert_eq!(q.len(), HELD_REPLY_MAX);
@@ -410,11 +433,41 @@ mod tests {
     #[test]
     fn dropping_a_client_takes_only_that_clients_replies() {
         let mut q = HeldReplies::new();
-        q.hold(reply("r1", 1, 10), 10);
-        q.hold(reply("r2", 2, 10), 10);
+        q.hold(reply("r1", 1, 10), Decision::Approved, 10);
+        q.hold(reply("r2", 2, 10), Decision::Approved, 10);
         assert_eq!(q.drop_client(&client(1)), 1);
         assert_eq!(q.len(), 1);
         assert_eq!(q.take(&client(2), 10).map(|r| r.request_id), Some("r2".to_string()));
+    }
+
+    #[test]
+    fn nothing_is_held_for_a_refused_request() {
+        let mut q = HeldReplies::new();
+        // A denial, an expiry and a busy refusal all arrive here as Refused,
+        // and none of them is worth a second chance at delivery: the caller
+        // times out, which is what it was getting anyway.
+        let outcome = q.hold(reply("denied", 1, 10), Decision::Refused, 10);
+        assert_eq!(outcome, HoldOutcome::Refused);
+        assert!(q.is_empty());
+        assert_eq!(q.next_client(10), None);
+        assert_eq!(q.take(&client(1), 10), None);
+    }
+
+    #[test]
+    fn a_refusal_never_evicts_an_approved_reply() {
+        let mut q = HeldReplies::new();
+        for i in 0..HELD_REPLY_MAX {
+            q.hold(reply(&format!("r{i}"), 1, 10), Decision::Approved, 10);
+        }
+        // The queue is full. A refusal must not be the thing that pushes an
+        // approved reply out of it.
+        let outcome = q.hold(reply("denied", 1, 10), Decision::Refused, 10);
+        assert_eq!(outcome, HoldOutcome::Refused);
+        assert_eq!(q.len(), HELD_REPLY_MAX);
+        assert_eq!(
+            q.take(&client(1), 10).map(|r| r.request_id),
+            Some("r0".to_string())
+        );
     }
 
     #[test]

@@ -1591,6 +1591,28 @@ AP to break the session.
 8. **Reboot still clears it.** Section 17 item 2 unchanged: export, hold,
    RESET, unlock, spend mark. The card is back.
 
+## 21. The entropy game is playable (#141; added 2026-09-12, not bench-run)
+
+The game asked for 64 presses inside a 90 s cap while spawning about one
+obstacle every three seconds, so an owner who played as the intro tells them
+to ("tap: jump the blocks") could never finish, and it felt endless. It also
+blitted the whole 1 KiB buffer over 400 kHz I2C on every physics step, about
+25 ms of a 33 ms frame, and the button is only polled between steps, so taps
+landed late and short ones could be missed. Obstacles now spawn about every
+0.8 s and the panel redraws at 15 fps while physics stays at 30.
+
+1. Provision a board and take the game at the intro. Jumping only at
+   obstacles, reach 64 presses well inside the 90 s cap, and time how long it
+   actually takes.
+2. Every tap registers: the counter rises on each press, including quick
+   double taps 30 ms or more apart. Nothing is dropped mid-blit.
+3. The world does not visibly stutter at the lower redraw rate, and a
+   collision still flashes.
+4. Hold to skip still aborts to hardware-only stacking, and the 30 s intro
+   timeout still defaults to skip.
+5. The seed the board then generates is still accepted, and the log still
+   reports the press count it collected.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

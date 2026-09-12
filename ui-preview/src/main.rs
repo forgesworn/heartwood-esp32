@@ -535,6 +535,17 @@ fn draw_word_entry<D: DrawTarget<Color = Rgb565>>(
     Text::new(legend, Point::new(l.sx(2), l.sy(62)), style(l.font_small(), FG)).draw(d).ok();
 }
 
+/// Error card, mirroring `oled::show_error` — including its newline handling,
+/// which is embedded-graphics' own. Rendered here because the RNG refusal
+/// messages are the only two-line error strings on the device and nothing
+/// checked they fit the narrowest panel.
+fn draw_error<D: DrawTarget<Color = Rgb565>>(d: &mut D, msg: &str) {
+    let l = layout_of(d);
+    Text::new(msg, Point::new(l.sx(0), l.sy(30)), style(l.font_body(), DANGER))
+        .draw(d)
+        .ok();
+}
+
 fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565>)) {
     let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
     d.clear(BG).ok();
@@ -595,6 +606,12 @@ fn main() {
         render(&format!("entry-longest-{b}"), w, h, |d| {
             draw_word_entry(d, 3, 19, "announce", true, "use this word", "tap=pick   hold=back")
         });
+        render(&format!("error-rng-wipe-{b}"), w, h, |d| {
+            draw_error(d, "Power-cycle once\nthen generate")
+        });
+        render(&format!("error-rng-failed-{b}"), w, h, |d| {
+            draw_error(d, "RNG self-test failed\nrefusing to generate")
+        });
     }
 
     // Focused T-Display network-operation gallery. The transition case first
@@ -626,4 +643,83 @@ fn main() {
         draw_network_status(d, "Rolling back", "Restoring last network", WARN);
         assert_no_legacy_white_rules(d);
     });
+}
+
+#[cfg(test)]
+mod error_card_tests {
+    use super::layout::Layout;
+
+    /// `oled::show_error` draws its message in `font_body` from `sx(0)` and does
+    /// NOT wrap: embedded-graphics honours the `\n` and silently clips anything
+    /// wider than the panel. On the 128x64 mono OLED that is 18 glyphs, and five
+    /// cards were over it — including the two that tell an owner whether their
+    /// signer's RNG is trustworthy, which read "RNG self-test faile / refusing
+    /// to generat" on real hardware (2026-09-12).
+    ///
+    /// This scans the firmware sources rather than a list of constants kept in
+    /// step by hand, so a card added in any module is covered the day it lands.
+    /// Keep lines inside the budget or give the card its own screen; do not
+    /// widen this test.
+    #[test]
+    fn no_show_error_card_is_clipped_on_the_narrowest_panel() {
+        let l = Layout::new(Layout::BASE_W, Layout::BASE_H);
+        let budget = l.chars_per_line(l.font_body());
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src");
+
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("firmware/src is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let source = std::fs::read_to_string(&path).expect("source is readable");
+            for call in source.match_indices("show_error(") {
+                let rest = &source[call.0 + "show_error(".len()..];
+                let region = &rest[..rest.find(");").map(|i| i.min(400)).unwrap_or(400.min(rest.len()))];
+                for literal in string_literals(region) {
+                    for line in literal.split("\\n") {
+                        checked += 1;
+                        if line.chars().count() > budget {
+                            offenders.push(format!(
+                                "{name}: {} chars (budget {budget}): {line:?}",
+                                line.chars().count()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(checked > 0, "scan found no show_error literals — the parser has drifted");
+        assert!(offenders.is_empty(), "clipped error cards:\n  {}", offenders.join("\n  "));
+    }
+
+    /// Every double-quoted literal in `region`, returned without its quotes.
+    /// Escaped quotes are skipped so `\"` does not end a literal early.
+    fn string_literals(region: &str) -> Vec<String> {
+        let bytes: Vec<char> = region.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == '"' {
+                let mut j = i + 1;
+                let mut lit = String::new();
+                while j < bytes.len() && bytes[j] != '"' {
+                    if bytes[j] == '\\' && j + 1 < bytes.len() {
+                        lit.push(bytes[j]);
+                        j += 1;
+                    }
+                    lit.push(bytes[j]);
+                    j += 1;
+                }
+                out.push(lit);
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
 }

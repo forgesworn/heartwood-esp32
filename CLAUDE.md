@@ -130,8 +130,12 @@ Next: bench the note locker (checklist section 13) and the remaining hardware ve
 Five crates — build each from its own directory:
 
 ```bash
-cd common && cargo test                    # shared crypto tests
-cd common && cargo test --features nip46   # NIP-46 + event ID tests
+# common's tests assume the `cash` feature: note_store's test call sites pass
+# new_secret's cfg-gated `cash` argument unconditionally, so without it the test
+# target does not compile (35 arity errors). Use the two invocations CI uses:
+cargo test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen,cash
+cargo test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,seed-encrypt,cash
+cd ui-preview && cargo test                # screen geometry + the show_error clipping guard
 cd provision && cargo build                # host CLI tool
 cd sign-test && cargo build                # signing test harness
 cd heartwoodd && cargo build               # Pi-side daemon (Soft or Hard mode)

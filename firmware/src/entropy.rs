@@ -36,33 +36,8 @@ use sha2::{Digest, Sha256};
 /// NVS blob key holding the SHA-256 of last boot's self-test draw.
 const NVS_RNG_PROOF_KEY: &str = "rng_proof";
 
-/// Outcome of the boot-time RNG self-test. Only [`RngState::Verified`] permits
-/// fresh key or secret generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RngState {
-    /// This boot's draw differs from the previous boot's. Generation allowed.
-    Verified,
-    /// No previous draw to compare against (first boot after a flash or a
-    /// factory reset). The proof is stored; one more boot proves the draw
-    /// changes. Generation refused, and it is NOT a fault.
-    NeedsSecondBoot,
-    /// The draw was constant, repeated last boot's, or the proof could not be
-    /// read or written. Generation refused.
-    Failed,
-}
-
-impl RngState {
-    /// One line fit for a NACK payload and an operator log.
-    pub fn refusal(self) -> &'static str {
-        match self {
-            Self::Verified => "",
-            Self::NeedsSecondBoot => {
-                "RNG continuity unverified after a wipe: power-cycle the signer once, then retry"
-            }
-            Self::Failed => "RNG self-test failed this boot — refusing to mint key material",
-        }
-    }
-}
+pub use heartwood_common::entropy::RngState;
+use heartwood_common::entropy::{self_test_outcome, ProofLookup};
 
 /// Set by [`boot_self_test`]; read by every fresh-entropy generation path.
 /// Starts at `Failed` so a self-test that never ran cannot mint anything.
@@ -71,6 +46,17 @@ static RNG_STATE: AtomicU8 = AtomicU8::new(STATE_FAILED);
 const STATE_FAILED: u8 = 0;
 const STATE_NEEDS_SECOND_BOOT: u8 = 1;
 const STATE_VERIFIED: u8 = 2;
+
+fn store_state(state: RngState) {
+    RNG_STATE.store(
+        match state {
+            RngState::Verified => STATE_VERIFIED,
+            RngState::NeedsSecondBoot => STATE_NEEDS_SECOND_BOOT,
+            RngState::Failed => STATE_FAILED,
+        },
+        Ordering::Relaxed,
+    );
+}
 
 /// The boot-time RNG self-test outcome.
 pub fn rng_state() -> RngState {
@@ -84,7 +70,7 @@ pub fn rng_state() -> RngState {
 /// Whether the boot-time RNG self-test passed. Key generation must refuse
 /// to run when this is false.
 pub fn rng_ok() -> bool {
-    rng_state() == RngState::Verified
+    rng_state().allows_generation()
 }
 
 /// Why generation is being refused, for screens and NACK payloads. Empty when
@@ -103,57 +89,66 @@ pub fn boot_self_test(nvs: &mut EspNvs<NvsDefault>) {
 
     // A constant 32-byte "random" draw means the entropy source is dead on its
     // face — check the draw itself before it is hashed away.
-    if all_equal(&draw) {
-        draw.iter_mut().for_each(|b| *b = 0);
-        log::error!("RNG self-test FAILED: constant draw — refusing key generation");
-        return;
-    }
-
+    let draw_constant = all_equal(&draw);
     let hash: [u8; 32] = Sha256::digest(draw).into();
     draw.iter_mut().for_each(|b| *b = 0);
 
+    if draw_constant {
+        finish(RngState::Failed, "constant draw");
+        return;
+    }
+
     let mut previous = [0u8; 32];
-    let compared = match nvs.get_blob(NVS_RNG_PROOF_KEY, &mut previous) {
+    let proof = match nvs.get_blob(NVS_RNG_PROOF_KEY, &mut previous) {
         Ok(Some(bytes)) if bytes.len() == 32 => {
             if previous == hash {
-                log::error!(
-                    "RNG self-test FAILED: draw identical to last boot — refusing key generation"
-                );
-                return;
+                ProofLookup::Matched
+            } else {
+                ProofLookup::Differed
             }
-            true
         }
-        Ok(_) => {
-            // First boot after a flash or a factory reset (or an empty/corrupt
-            // slot): nothing to compare against. Store the proof, but do NOT
-            // pass — this is the boot an owner provisions on.
-            false
-        }
+        // First boot after a flash or a factory reset, or a corrupt slot.
+        Ok(_) => ProofLookup::Absent,
         Err(e) => {
-            // Unreadable proof means we can never verify continuity — fail closed.
-            log::error!("RNG self-test FAILED: proof unreadable ({e}) — refusing key generation");
-            return;
+            log::error!("RNG self-test: proof unreadable ({e})");
+            ProofLookup::Unreadable
         }
     };
 
-    if let Err(e) = nvs.set_blob(NVS_RNG_PROOF_KEY, &hash) {
-        // If we can't persist the proof, the NEXT boot can't verify
-        // continuity — fail closed rather than degrade silently.
-        log::error!("RNG self-test FAILED: proof write failed ({e}) — refusing key generation");
-        return;
-    }
+    // No point writing a proof once the outcome is already a refusal, and a
+    // matched draw must not have its own hash written over the evidence.
+    let stored = if matches!(proof, ProofLookup::Matched | ProofLookup::Unreadable) {
+        None
+    } else {
+        match nvs.set_blob(NVS_RNG_PROOF_KEY, &hash) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                log::error!("RNG self-test: proof write failed ({e})");
+                Some(false)
+            }
+        }
+    };
 
-    if !compared {
-        RNG_STATE.store(STATE_NEEDS_SECOND_BOOT, Ordering::Relaxed);
-        log::warn!(
-            "RNG self-test: no previous draw to compare against, proof seeded. \
-             Power-cycle once before generating keys."
-        );
-        return;
-    }
+    finish(self_test_outcome(draw_constant, proof, stored), match proof {
+        ProofLookup::Matched => "draw identical to last boot",
+        ProofLookup::Absent => "no previous draw to compare against",
+        ProofLookup::Unreadable => "proof unreadable",
+        ProofLookup::Differed => "draw moved",
+    });
+}
 
-    RNG_STATE.store(STATE_VERIFIED, Ordering::Relaxed);
-    log::info!("RNG self-test passed");
+/// Record the outcome and say what happened once, in one voice.
+fn finish(state: RngState, why: &str) {
+    store_state(state);
+    match state {
+        RngState::Verified => log::info!("RNG self-test passed ({why})"),
+        RngState::NeedsSecondBoot => log::warn!(
+            "RNG self-test: {why}, proof seeded. Power-cycle once before generating keys."
+        ),
+        RngState::Failed => {
+            log::error!("RNG self-test FAILED: {why} — refusing key generation")
+        }
+    }
 }
 
 /// Fill `out` (up to 32 bytes) with stacked entropy for key generation.

@@ -447,7 +447,7 @@ pub fn handle_vault_set(
         }
         Err(e) => {
             log::error!("VAULT_SET failed: {e}");
-            crate::oled::show_error(display, "Vault change failed");
+            crate::oled::show_error(display, "Vault change\nfailed");
             esp_idf_hal::delay::FreeRtos::delay_ms(1500);
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             false

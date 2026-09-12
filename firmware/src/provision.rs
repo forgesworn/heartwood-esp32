@@ -358,7 +358,7 @@ pub fn handle_generate(
             display,
             match state {
                 crate::entropy::RngState::NeedsSecondBoot => "Power-cycle once\nthen generate",
-                _ => "RNG self-test failed\nrefusing to generate",
+                _ => "RNG CHECK FAILED\nrefusing new keys",
             },
         );
         protocol::write_frame(usb, FRAME_TYPE_NACK, state.refusal().as_bytes());
@@ -670,7 +670,7 @@ pub fn handle_restore(
                         .map(|decoded| decoded.passphrase_required)
                         .unwrap_or(false)
                     {
-                        oled::show_error(display, "Passphrase required\nUse Sapwood paste");
+                        oled::show_error(display, "Passphrase\nrequired. Use\nSapwood paste");
                         esp_idf_hal::delay::FreeRtos::delay_ms(2200);
                         invalid = true;
                         continue;

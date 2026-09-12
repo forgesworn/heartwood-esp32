@@ -17,6 +17,91 @@
 
 use sha2::{Digest, Sha256};
 
+/// Outcome of the boot-time RNG self-test. Only [`RngState::Verified`] permits
+/// fresh key or secret generation.
+///
+/// The state machine lives here, away from ESP-IDF, because the case that
+/// matters most cannot be reached on a bench without erasing a board: the boot
+/// straight after a factory reset, where the stored proof is gone and there is
+/// nothing to compare this boot's draw against. That case used to PASS, which
+/// made the check blind on the exact boot an owner provisions on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RngState {
+    /// This boot's draw differs from the previous boot's. Generation allowed.
+    Verified,
+    /// No previous draw to compare against (first boot after a flash or a
+    /// factory reset). The proof is stored; one more boot proves the draw
+    /// changes. Generation refused, and it is NOT a fault.
+    NeedsSecondBoot,
+    /// The draw was constant, repeated last boot's, or the proof could not be
+    /// read or written. Generation refused.
+    Failed,
+}
+
+impl RngState {
+    /// One line fit for a NACK payload and an operator log. Empty when nothing
+    /// is being refused.
+    pub fn refusal(self) -> &'static str {
+        match self {
+            Self::Verified => "",
+            Self::NeedsSecondBoot => {
+                "RNG continuity unverified after a wipe: power-cycle the signer once, then retry"
+            }
+            Self::Failed => "RNG self-test failed this boot — refusing to mint key material",
+        }
+    }
+
+    /// Whether fresh key or secret generation may proceed.
+    pub fn allows_generation(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+}
+
+/// What the stored continuity proof said about this boot's draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofLookup {
+    /// A stored proof matched this boot's draw: the RNG repeated itself.
+    Matched,
+    /// A stored proof differed: the draw moved, which is what we want.
+    Differed,
+    /// No usable proof stored (first boot after a flash, or after a wipe that
+    /// erased it, or a corrupt slot).
+    Absent,
+    /// The proof could not be read, so continuity can never be established.
+    Unreadable,
+}
+
+/// Decide the self-test outcome from the three facts a boot can establish.
+///
+/// `draw_constant` — every byte of the 32-byte draw was identical.
+/// `proof` — what the stored proof said.
+/// `proof_stored` — whether THIS boot's proof was persisted: `Some(true)` on a
+/// successful write, `Some(false)` on a failed one, `None` when no write was
+/// attempted because the outcome was already decided.
+///
+/// A failed write is fatal even when the draw looks fine: without a proof the
+/// NEXT boot cannot verify continuity either, and silently degrading is the
+/// failure mode this whole mechanism exists to prevent.
+pub fn self_test_outcome(
+    draw_constant: bool,
+    proof: ProofLookup,
+    proof_stored: Option<bool>,
+) -> RngState {
+    if draw_constant
+        || matches!(proof, ProofLookup::Matched | ProofLookup::Unreadable)
+        || proof_stored != Some(true)
+    {
+        return RngState::Failed;
+    }
+    match proof {
+        ProofLookup::Differed => RngState::Verified,
+        // Nothing to compare against. Storing the proof is not evidence; the
+        // next boot's draw is. Refuse until then.
+        ProofLookup::Absent => RngState::NeedsSecondBoot,
+        ProofLookup::Matched | ProofLookup::Unreadable => RngState::Failed,
+    }
+}
+
 /// Domain separator for the final stack mix. Versioned: if the construction
 /// ever changes, the separator changes, so old and new outputs can't collide.
 pub const STACK_DOMAIN: &[u8] = b"heartwood-entropy-v1";
@@ -73,6 +158,84 @@ pub fn digest_timestamps(timestamps_us: &[u64]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wiped_board_must_not_pass_its_first_boot() {
+        // The regression that started all this: a factory reset erases the
+        // continuity proof, and the boot immediately afterwards is the one an
+        // owner provisions on. Passing there makes the check blind exactly
+        // when it matters.
+        assert_eq!(
+            self_test_outcome(false, ProofLookup::Absent, Some(true)),
+            RngState::NeedsSecondBoot
+        );
+        assert!(!self_test_outcome(false, ProofLookup::Absent, Some(true)).allows_generation());
+    }
+
+    #[test]
+    fn only_a_compared_and_stored_draw_verifies() {
+        assert_eq!(
+            self_test_outcome(false, ProofLookup::Differed, Some(true)),
+            RngState::Verified
+        );
+        assert!(self_test_outcome(false, ProofLookup::Differed, Some(true)).allows_generation());
+    }
+
+    #[test]
+    fn every_other_combination_fails_closed() {
+        use ProofLookup::*;
+        for proof in [Matched, Differed, Absent, Unreadable] {
+            for stored in [Some(true), Some(false), None] {
+                for constant in [true, false] {
+                    let state = self_test_outcome(constant, proof, stored);
+                    let should_pass =
+                        !constant && proof == Differed && stored == Some(true);
+                    let should_wait =
+                        !constant && proof == Absent && stored == Some(true);
+                    let expected = if should_pass {
+                        RngState::Verified
+                    } else if should_wait {
+                        RngState::NeedsSecondBoot
+                    } else {
+                        RngState::Failed
+                    };
+                    assert_eq!(
+                        state, expected,
+                        "constant={constant} proof={proof:?} stored={stored:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_repeated_draw_fails_even_when_everything_else_is_healthy() {
+        // The Coldcard case: the draw is well-formed, non-constant, and stores
+        // fine. It is simply the same one as last boot.
+        assert_eq!(
+            self_test_outcome(false, ProofLookup::Matched, Some(true)),
+            RngState::Failed
+        );
+    }
+
+    #[test]
+    fn a_failed_proof_write_is_fatal_not_a_warning() {
+        // Without a stored proof the NEXT boot cannot verify continuity either.
+        assert_eq!(
+            self_test_outcome(false, ProofLookup::Differed, Some(false)),
+            RngState::Failed
+        );
+    }
+
+    #[test]
+    fn refusals_tell_the_two_states_apart() {
+        let wipe = RngState::NeedsSecondBoot.refusal();
+        let fault = RngState::Failed.refusal();
+        assert!(wipe.contains("power-cycle"), "{wipe}");
+        assert!(!fault.contains("power-cycle"), "{fault}");
+        assert_ne!(wipe, fault);
+        assert!(RngState::Verified.refusal().is_empty());
+    }
 
     #[test]
     fn stack_is_deterministic() {

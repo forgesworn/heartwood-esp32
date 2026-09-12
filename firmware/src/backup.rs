@@ -111,7 +111,7 @@ pub fn handle_export(
         Err(e) => {
             log::error!("Backup export serialisation failed: {e}");
             protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
-            crate::oled::show_error(display, "Backup export failed");
+            crate::oled::show_error(display, "Backup export\nfailed");
             esp_idf_hal::delay::FreeRtos::delay_ms(1500);
         }
     }

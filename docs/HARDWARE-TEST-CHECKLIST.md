@@ -1178,6 +1178,29 @@ spent record gave way. The backlog drains one slot per mint rather than all at
 once, which is deliberate: nothing removes a record the owner has not caused a
 state change to.
 
+**One path was missed, fixed 2026-09-12 (NOT YET BENCH-RUN).** `import_secret`
+was the last creation path without the eviction, and it is the ordinary one:
+the browser wallet pays the mint and hands the preimage over with
+`heartwood_note_import`. So a locker that would happily mint still refused the
+note the owner had just paid for. Verify on the board:
+
+1. Get the locker to `MAX_NOTES` with at least one SPENT record in it. Four
+   is the most it will hold now, so mint, `confirm` and `heartwood_note_spent`
+   four notes, then fill the rest with live ones.
+2. Note the id and `updated_at` of the oldest spent record from
+   `heartwood_note_list`.
+3. Pay a small note at the mint from the web wallet and let it import. The
+   import must SUCCEED, not answer `storage_full`.
+4. `heartwood_note_list` again: `note_count` still `MAX_NOTES`, the new note
+   present, and the record from step 2 gone. No CONFIRMED or PENDING note may
+   have moved.
+5. Replay the same import (the wallet re-sending it, or `note-cmd.mjs` run
+   twice). It must return the SAME id, `created: false`, and `note_count`
+   must not drop: the dedupe sits ahead of the eviction, so a replay never
+   costs a record.
+6. With sixteen LIVE notes and no spent record, an import must still be
+   refused `storage_full`. Nothing here may evict money.
+
 ## 14. Bearer notes over Nostr (added 2026-08-21; NOT YET BENCH-RUN)
 
 `note_wrap_v1` in get_status. A kind-1059 gift wrap addressed to a master

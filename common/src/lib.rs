@@ -49,6 +49,8 @@ pub mod reply_clock;
 
 pub mod approval_queue;
 
+pub mod held_reply;
+
 pub mod wrap_ledger;
 
 pub mod trust;

@@ -73,6 +73,19 @@ before the wrap leaves, so once only). Advertised note_wrap_v1. WiFi tier NACKs 
 note frames (use the relay methods) and refuses at-rest changes while notes
 are held. Nothing bench-run: checklist section 13.
 
+An approved reply outlives its session (#82, 2026-09-12, checklist section 19):
+a NIP-46 reply is addressed to a client pubkey, not to a socket, so a reconnect
+between the owner's hold and the publish no longer throws the answer away. A
+card's approved reply is sealed once and offered to every live session; if none
+takes it, it waits in a RAM-only outbox (`common/src/held_reply.rs`: 4 entries,
+4 KB, 60 s, two publication attempts, delivered once and only to the pubkey it
+was sealed to, dropped if that client's slot has since gone) for the next
+session. A card that resolves with no session at all now dispatches and holds
+instead of being abandoned, EXCEPT for a dependant persona, whose C5 audit rail
+needs a live socket. Denials, expiries and `busy` refusals are never held. The
+same hold catches a failed park completion; the guardian's `applied` value is
+unchanged. Nothing bench-run.
+
 A second configured relay (#92, 2026-09-11, checklist section 16): besides
 the primary, the relay loop keeps one more configured relay live when the
 second session slot is free and the heap can spare it (SECONDARY_MIN_* in

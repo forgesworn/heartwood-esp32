@@ -3624,7 +3624,7 @@ fn complete_parked(
     );
     // Same rule as a card's (#137): claim what the dispatch earned next to
     // the dispatch, arm it only if the reply goes out.
-    let mut earned = crate::notes::take_earned_grant();
+    let mut earned = earned_for(crate::notes::take_earned_grant(), &client_pubkey);
     if !ctx.policy_engine.persist_slots(ctx.nvs, slot) {
         log::error!("[relay] slot persist failed after park completion");
     }
@@ -7804,6 +7804,25 @@ fn publish_sealed(tls: &mut Tls, signed: &SignedEvent) -> Result<(), String> {
 /// Called only for work the owner approved. A denial, an expiry or a refusal
 /// is published the old way and lost if it cannot go out, which costs its
 /// caller nothing it was not already going to get from a timeout.
+/// An earned spend grant is armed only for the client the reply is actually
+/// addressed to (#137).
+///
+/// The pending slot is claimed next to the dispatch that filled it, so these
+/// two agree by construction. If they ever stop agreeing the plumbing is
+/// wrong, and no grant is the right answer to that: it costs a card.
+fn earned_for(
+    earned: Option<heartwood_common::note_cmd::Earned>,
+    client_pubkey: &[u8; 32],
+) -> Option<heartwood_common::note_cmd::Earned> {
+    earned.filter(|e| {
+        let mine = e.client == heartwood_common::note_cmd::GrantClient::Relay(*client_pubkey);
+        if !mine {
+            log::error!("[relay] earned grant is not this reply's client; dropped");
+        }
+        mine
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish_reply_or_hold(
     sessions: &mut [RelaySession],
@@ -7815,6 +7834,7 @@ fn publish_reply_or_hold(
     decision: heartwood_common::held_reply::Decision,
     earned: Option<heartwood_common::note_cmd::Earned>,
 ) {
+    let earned = earned_for(earned, client_pubkey);
     for index in publish_order(sessions) {
         let session = &mut sessions[index];
         match publish_sealed(&mut session.tls, &signed) {
@@ -7859,20 +7879,10 @@ fn hold_reply(
     earned: Option<heartwood_common::note_cmd::Earned>,
 ) {
     use heartwood_common::held_reply::{Decision, HeldReply, HoldOutcome};
-    use heartwood_common::note_cmd::GrantClient;
 
     // The note id travels with the reply and is armed on delivery, never
-    // here (#137). Only for the client the reply is addressed to: if those
-    // two ever disagree the plumbing is wrong, and no grant is the safe
-    // answer to that.
-    let earned = earned.filter(|e| {
-        let mine = e.client == GrantClient::Relay(*client_pubkey);
-        if !mine {
-            log::error!("[relay] earned grant is not this reply's client; dropped");
-        }
-        mine
-    });
-    let earned_note = earned.map(|e| e.id);
+    // here (#137), and only ever for this reply's own client.
+    let earned_note = earned_for(earned, client_pubkey).map(|e| e.id);
 
     if decision != Decision::Approved {
         // The queue refuses it anyway; skip the serialise.

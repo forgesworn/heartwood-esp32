@@ -1491,6 +1491,63 @@ with the scripts/nip46-client.mjs conventions.
    answers `unauthorised`: the relay methods serve bound clients, the cable
    has the frame.
 
+## 19. An approved reply survives a reconnect (#82; added 2026-09-12, NOT YET BENCH-RUN)
+
+This reproduces the §14 bench failure of 2026-08-21: the owner held the
+button, the card resolved, the relay session went away, and the wallet was
+told `heartwood_note_export` "did not answer in time" for a release the
+device had already performed. An approved reply is now sealed to its client
+and kept in RAM for up to 60 s, so the next session carries it.
+
+Two boards are not needed; one bound wallet and a way to break the socket
+are. Easiest reconnect trigger with no second machine: `scripts/patch-relay-list.mjs`
+to point the device at a relay that is not there, or pull the AP, and let the
+join loop come back. `scripts/nip46-client.mjs` drives the calls.
+
+1. **The original failure.** Ask for `heartwood_note_export` on a CONFIRMED
+   note, hold the button, and force the reconnect within a second or two of
+   the card resolving (drop the AP as the "approved" screen appears). Expect
+   the reply to arrive once the device is back on a relay, inside the 60 s
+   window, and the wallet to report the `ck1` rather than a timeout. The
+   serial log says `held for the next session` then `delivered on a later
+   session`.
+2. **Delivered once.** Same run: watch for exactly one reply event. A second
+   flush pass must not republish it, and `heartwood_note_list` must show one
+   note, still CONFIRMED (an export mutates nothing).
+3. **No session at all.** Take the relays away entirely (bad relay list), then
+   raise a card over the cable's paired client, or simply let a queued card
+   resolve while the device is between sessions. The work now happens and the
+   answer waits; before this change the card resolved, the OLED said
+   approved, and nothing at all was dispatched.
+4. **It expires.** Repeat item 1 but keep the device off the air for more
+   than 60 s. The reply is dropped (`expired undelivered` in the log), the
+   wallet times out, and the note is still CONFIRMED, so asking again works.
+   Nothing must be published after the window.
+5. **A reboot loses it.** Approve an export, force the reconnect, and RESET
+   the board before it comes back. Nothing is published after boot and no
+   `ck1` appears anywhere. This is the one that matters: a held export reply
+   is spending authority and must never reach flash.
+6. **Only its own client.** With two wallets bound, approve an export for
+   wallet A and force the reconnect. Wallet B must see nothing: no event
+   addressed to it, and nothing it can decrypt. (It could not read A's reply
+   in any case; the ciphertext is sealed to A's conversation key.)
+7. **Nothing held for a refusal.** Decline a card, and let another time out,
+   each with the session breaking as it resolves. Both are errors and neither
+   is retried on the next session; the log must show no `held for the next
+   session` line.
+8. **Revoked in between.** Approve an export, force the reconnect, and revoke
+   that client's slot over the cable before the device reconnects. The held
+   reply is dropped (`that client is no longer bound`), not delivered.
+9. **The grant still lines up.** After a successful item 1, the wallet melts
+   the `ck1` and calls `heartwood_note_spent` for that note. With the reply
+   delivered inside the 60 s window there is still grant left (#129's window
+   is 120 s from the approval), so the write-off takes no second card. Past
+   that, the SPEND NOTE card is back, which is the safe direction.
+10. **The secondary carries it.** With two relays live (§16), break only the
+    primary as a card resolves. The reply should go straight out on the
+    secondary with no hold at all: the log shows `would not take the reply`
+    for the dead one and a normal publish line, and no `held` line.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

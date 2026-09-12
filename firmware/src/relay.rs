@@ -399,6 +399,9 @@ struct SignCtx<'a, 'd, 'b> {
     /// screen; the rest wait their turn. RAM only, capped by the counts in
     /// `approval_queue` and by `CARD_BYTE_BUDGET`.
     button_cards: Vec<ButtonCard>,
+    /// Approved replies that no live session would take, waiting for the next
+    /// one (#82). RAM only and short-lived; see `common::held_reply`.
+    held_replies: heartwood_common::held_reply::HeldReplies,
 }
 
 /// Timestamp for a reply to a request that arrived `held` ago.
@@ -933,6 +936,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         audit_emit_seq: 0,
         reply_clock: heartwood_common::reply_clock::ReplyClock::new(),
         button_cards: Vec::new(),
+        held_replies: heartwood_common::held_reply::HeldReplies::new(),
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -1114,6 +1118,10 @@ pub fn run_wifi_standalone<'d, 'b>(
         // immediately above, and the sessions are pumped immediately below,
         // both of them while the card is still on screen (#64).
         service_button_cards(&mut ctx, &mut sessions);
+
+        // Anything an earlier pass approved but could not publish goes out on
+        // whatever is live now, and ages out if nothing ever is (#82).
+        flush_held_replies(&mut ctx, &mut sessions);
 
         // The primary dropped while a secondary was live: promote it. It is a
         // configured relay, already subscribed and past its catch-up, so the
@@ -3642,8 +3650,7 @@ fn complete_parked(
         )
         .unwrap_or_default();
     }
-    match sign_and_publish(
-        tls,
+    let sealed = seal_reply(
         ctx.secp,
         &signing_secret,
         &conversation_key,
@@ -3651,10 +3658,24 @@ fn complete_parked(
         NIP46_KIND,
         reply_stamp(ctx, created_at, held),
         response_json,
-    ) {
+    );
+    let signed = match sealed {
+        Ok(signed) => signed,
+        Err(e) => {
+            log::warn!("[relay] park completion publish: {e}");
+            return false;
+        }
+    };
+    match publish_sealed(tls, &signed) {
         Ok(()) => true,
         Err(e) => {
             log::warn!("[relay] park completion publish: {e}");
+            // A guardian-approved park is the same shape as an approved card:
+            // the device did the thing, so the answer is kept for the next
+            // session rather than dropped (#82). The verdict's own `applied`
+            // value deliberately still reports the failed publish, because
+            // that is what the guardian asked about.
+            hold_reply(ctx, &client_pubkey, slot, &request_id, &signed);
             false
         }
     }
@@ -4291,14 +4312,6 @@ fn resolve_button_card(
         }
     }
 
-    let Some(session) = sessions.first_mut() else {
-        log::warn!(
-            "[relay] approval decided with no live relay session; {} ask(s) unanswered",
-            card.asks.len()
-        );
-        return;
-    };
-
     let Some((signing_secret, label, mode, slot, persona_purpose)) =
         resolve_served_identity(ctx, &card.target_pk)
     else {
@@ -4314,6 +4327,22 @@ fn resolve_button_card(
     let dependant = persona_purpose
         .as_deref()
         .is_some_and(heartwood_common::escalate::is_dependant_purpose);
+
+    // A card used to be abandoned outright when no session was live, which is
+    // half of what #82 reports: the operator held the button, saw "approved",
+    // and the device did nothing at all. The reply no longer needs a session
+    // (it is sealed and held), so the work can go ahead, with one exception.
+    // A dependant persona's action owes a C5 audit rail, and a rail is a gift
+    // wrap that has to leave down a live socket or not at all. Doing the work
+    // while the accountability record cannot be written is the wrong trade, so
+    // that one case keeps the old behaviour and waits for the next ask.
+    if sessions.is_empty() && dependant {
+        log::warn!(
+            "[relay] approval decided with no relay session and an audit rail owed; {} ask(s) unanswered",
+            card.asks.len()
+        );
+        return;
+    }
 
     for ask in card.asks {
         let request_id = ask.ask.request.id.clone();
@@ -4384,16 +4413,23 @@ fn resolve_button_card(
                 error.as_deref(),
                 false,
             ) {
-                if let Err(e) = emit_audit_rail(
-                    &mut session.tls,
-                    ctx,
-                    slot,
-                    &target_hex,
-                    &draft,
-                    rail_outcome,
-                    ask.created_at,
-                ) {
-                    log::warn!("[relay] audit rail: {e}");
+                match sessions.first_mut() {
+                    Some(session) => {
+                        if let Err(e) = emit_audit_rail(
+                            &mut session.tls,
+                            ctx,
+                            slot,
+                            &target_hex,
+                            &draft,
+                            rail_outcome,
+                            ask.created_at,
+                        ) {
+                            log::warn!("[relay] audit rail: {e}");
+                        }
+                    }
+                    // Unreachable: a dependant persona with no session
+                    // returned above, before anything was dispatched.
+                    None => log::warn!("[relay] audit rail: no live session"),
                 }
             }
         }
@@ -4409,8 +4445,11 @@ fn resolve_button_card(
         }
 
         let held = Duration::from_secs(crate::uptime_s().saturating_sub(ask.received_uptime));
-        if let Err(e) = sign_and_publish(
-            &mut session.tls,
+        // Sealed first, published second: an approved answer that no live
+        // session will take is kept for the next one rather than dropped with
+        // the socket (#82). Only the approved branch reaches here holding
+        // something worth keeping: a denial and an expiry seal an error.
+        let sealed = seal_reply(
             ctx.secp,
             &signing_secret,
             &conversation_key,
@@ -4418,8 +4457,24 @@ fn resolve_button_card(
             NIP46_KIND,
             reply_stamp(ctx, ask.created_at, held),
             response_json,
-        ) {
-            log::warn!("[relay] approval publish for {request_id}: {e}");
+        );
+        match sealed {
+            Ok(signed) if matches!(outcome, CardTick::Approved) => publish_reply_or_hold(
+                sessions,
+                ctx,
+                &card.client_pubkey,
+                slot,
+                &request_id,
+                signed,
+            ),
+            Ok(signed) => {
+                if let Some(session) = sessions.first_mut() {
+                    if let Err(e) = publish_sealed(&mut session.tls, &signed) {
+                        log::warn!("[relay] approval publish for {request_id}: {e}");
+                    }
+                }
+            }
+            Err(e) => log::warn!("[relay] approval publish for {request_id}: {e}"),
         }
     }
 }
@@ -7637,6 +7692,34 @@ fn sign_and_publish(
     created_at: u64,
     response_json: String,
 ) -> Result<(), String> {
+    let signed = seal_reply(
+        secp,
+        signing_secret,
+        conversation_key,
+        recipient_hex,
+        kind,
+        created_at,
+        response_json,
+    )?;
+    publish_sealed(tls, &signed)
+}
+
+/// Seal and sign a reply without sending it.
+///
+/// Split out of [`sign_and_publish`] so an approved answer can be built once
+/// and then offered to more than one session, or held for the next one (#82).
+/// What comes back is bound to `recipient_hex` twice over (the `p` tag and
+/// the NIP-44 ciphertext, which only that client's conversation key opens), so
+/// a sealed reply can never be re-addressed by whoever ends up publishing it.
+fn seal_reply(
+    secp: &Arc<Secp256k1<SignOnly>>,
+    signing_secret: &[u8; 32],
+    conversation_key: &[u8; 32],
+    recipient_hex: &str,
+    kind: u64,
+    created_at: u64,
+    response_json: String,
+) -> Result<SignedEvent, String> {
     let response_len = response_json.len();
     crate::crash_crumb::set(&format!("relay encrypt kind {kind} {response_len}B"));
     let nonce = random_nonce_32();
@@ -7658,7 +7741,7 @@ fn sign_and_publish(
     let event_id = nip46::compute_event_id(&unsigned);
     let sig = sign::sign_hash(secp, signing_secret, &event_id).map_err(|e| format!("sign: {e}"))?;
 
-    let signed = SignedEvent {
+    Ok(SignedEvent {
         id: hex_encode(&event_id),
         pubkey: unsigned.pubkey,
         created_at: unsigned.created_at,
@@ -7666,13 +7749,166 @@ fn sign_and_publish(
         tags: unsigned.tags,
         content: unsigned.content,
         sig: hex_encode(&sig),
-    };
-    let event_len = ws_send_event(tls, &signed)?;
+    })
+}
+
+/// Put an already-sealed reply on the wire.
+fn publish_sealed(tls: &mut Tls, signed: &SignedEvent) -> Result<(), String> {
+    let kind = signed.kind;
+    let event_len = ws_send_event(tls, signed)?;
     log::info!(
         "[relay] published kind:{kind} response ({} bytes)",
         event_len
     );
     Ok(())
+}
+
+/// Publish an approved reply, or keep it for the next session (#82).
+///
+/// A reply is addressed to a client pubkey, not to a socket, so the session
+/// the request arrived on is not the only one that can carry the answer and
+/// its death is not a reason to throw the answer away. Every live session is
+/// offered it (a second configured relay is one the client was handed in the
+/// bunker URI, #92), and only if none will take it does it go to the RAM-only
+/// outbox to wait for the next.
+///
+/// Called only for work the owner approved. A denial, an expiry or a refusal
+/// is published the old way and lost if it cannot go out, which costs its
+/// caller nothing it was not already going to get from a timeout.
+fn publish_reply_or_hold(
+    sessions: &mut [RelaySession],
+    ctx: &mut SignCtx,
+    client_pubkey: &[u8; 32],
+    master_slot: u8,
+    request_id: &str,
+    signed: SignedEvent,
+) {
+    for index in publish_order(sessions) {
+        let session = &mut sessions[index];
+        match publish_sealed(&mut session.tls, &signed) {
+            Ok(()) => return,
+            Err(e) => log::warn!(
+                "[relay] {} would not take the reply for {request_id}: {e}",
+                relay_host(&session.url)
+            ),
+        }
+    }
+    hold_reply(ctx, client_pubkey, master_slot, request_id, &signed);
+}
+
+/// Which sessions to offer a reply to, in order.
+///
+/// Configured relays first. Those are the list every bunker URI advertises, so
+/// a client is listening on one of them; a pinned session belongs to whichever
+/// pairing dialled it and is only worth trying when nothing configured is up.
+/// The previous behaviour simply took session zero, whatever it was.
+fn publish_order(sessions: &[RelaySession]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..sessions.len()).filter(|i| !sessions[*i].pinned).collect();
+    order.extend((0..sessions.len()).filter(|i| sessions[*i].pinned));
+    order
+}
+
+/// Put a sealed reply in the outbox for the next session (#82).
+fn hold_reply(
+    ctx: &mut SignCtx,
+    client_pubkey: &[u8; 32],
+    master_slot: u8,
+    request_id: &str,
+    signed: &SignedEvent,
+) {
+    use heartwood_common::held_reply::{HeldReply, HoldOutcome};
+
+    let Ok(payload) = serde_json::to_string(&("EVENT", signed)) else {
+        log::warn!("[relay] approved reply for {request_id} could not be held: serialise failed");
+        return;
+    };
+    let now = crate::uptime_s() as u32;
+    let outcome = ctx.held_replies.hold(
+        HeldReply {
+            client: *client_pubkey,
+            master_slot,
+            request_id: request_id.to_string(),
+            payload,
+            held_at: now,
+            attempts: 0,
+        },
+        now,
+    );
+    match outcome {
+        HoldOutcome::Held { evicted } => {
+            log::info!(
+                "[relay] approved reply for {request_id} held for the next session ({} held, {} B)",
+                ctx.held_replies.len(),
+                ctx.held_replies.bytes()
+            );
+            for id in evicted {
+                log::warn!("[relay] held reply for {id} evicted to make room");
+            }
+        }
+        HoldOutcome::TooLarge => log::warn!(
+            "[relay] approved reply for {request_id} is too large to hold; dropped"
+        ),
+    }
+}
+
+/// Expire held replies, and offer what is left to a live session (#82).
+///
+/// The expiry runs whether or not anything is connected: the point of the
+/// window is that a `ck1` does not sit in RAM waiting for a network that is
+/// not coming back, and a device with no session is exactly the case where
+/// nothing else would look at the outbox.
+fn flush_held_replies(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
+    let now = crate::uptime_s() as u32;
+    let expired = ctx.held_replies.expire(now);
+    if expired > 0 {
+        log::warn!("[relay] {expired} approved reply(ies) expired undelivered");
+    }
+    if sessions.is_empty() || ctx.held_replies.is_empty() {
+        return;
+    }
+    for _ in 0..heartwood_common::held_reply::HELD_REPLY_MAX {
+        let Some(client) = ctx.held_replies.next_client(now) else {
+            return;
+        };
+        let Some(reply) = ctx.held_replies.take(&client, now) else {
+            return;
+        };
+        // The pairing this was approved for may have been revoked while the
+        // device was off the air. An answer is not a capability a client keeps
+        // after its slot goes.
+        let client_hex = hex_encode(&reply.client);
+        if ctx
+            .policy_engine
+            .find_slot_by_pubkey(reply.master_slot, &client_hex)
+            .is_none()
+        {
+            log::warn!(
+                "[relay] held reply for {} dropped: that client is no longer bound",
+                reply.request_id
+            );
+            continue;
+        }
+        let mut sent = false;
+        for index in publish_order(sessions) {
+            if ws_send(&mut sessions[index].tls, OP_TEXT, reply.payload.as_bytes()).is_ok() {
+                sent = true;
+                break;
+            }
+        }
+        if sent {
+            log::info!(
+                "[relay] held reply for {} delivered on a later session",
+                reply.request_id
+            );
+            continue;
+        }
+        // Nothing live took it, so nothing live will take the rest either.
+        let id = reply.request_id.clone();
+        if !ctx.held_replies.requeue(reply) {
+            log::warn!("[relay] held reply for {id} dropped: no session would take it");
+        }
+        return;
+    }
 }
 
 /// Serialise and mask an EVENT command in one allocation. The generic

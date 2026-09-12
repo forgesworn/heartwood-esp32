@@ -33,6 +33,17 @@ deliberately **excluded from backups**: a note restored onto two boards is a
 double-spend, so bearer value is unrecoverable by design (see
 `docs/plans/2026-08-18-note-locker-goal.md`).
 
+That is sound, and its consequence has to be said out loud rather than left
+for an owner to discover: **a board that dies takes its notes with it, and no
+seed, share set or export brings them back.** Every other secret here is
+recoverable, so this is the one an owner will wrongly assume is handled. The
+locker is a till, not a vault. Collect promptly (since #129 a whole batch
+costs one hold), keep little on it, and let the paired wallet keep the
+INVENTORY: ids, amounts, hosts and states carry no spending authority, so a
+wallet can back those up without ever making a note spendable twice. A loss is
+then legible - the owner can say exactly what existed and show a mint what it
+was - which is the most a copy-free design can offer (#86).
+
 Notes can also move as **NIP-59 gift wraps** (`common/src/note_wrap.rs`).
 Sending seals the secret to the recipient's pubkey inside the signing
 boundary: the client that asked gets an opaque kind-1059 back and never sees

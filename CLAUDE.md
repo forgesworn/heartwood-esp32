@@ -59,7 +59,9 @@ generic extension gate so no slot policy can silence a disclosure, riding the
 section 18): it touches a LIVE note and no amount of pruning corrects a label
 typed wrong, so a tier with no cable needs it; heartwood_note_delete
 deliberately did not, because MAX_SPENT retires the record it would remove. Notes are deliberately NOT in backups (restore onto
-two boards = double-spend); destructive commands (mark_spent/discard/rename/
+two boards = double-spend), so a dead board's notes are gone: the locker is a
+TILL, not a vault - collect promptly and let the wallet keep the inventory
+(#86, SECURITY-MODEL.md); destructive commands (mark_spent/discard/rename/
 delete) are button-gated like lnurl-vault gates them, with ONE runtime
 exception (#129): an approved export_secret leaves a single-use, RAM-only
 grant (note_cmd::SpendGrant, 120 s, same note, same client) so the mark_spent

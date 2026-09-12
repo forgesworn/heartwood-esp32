@@ -1631,10 +1631,17 @@ therefore starts identically to every phrase the board has ever shown, which
 reads as a stuck RNG. The walk now names what each word is, after a one-off
 screen that says so before the words start.
 
+Build first (release ELFs, ready to flash):
+
+```
+bash scripts/build-firmware.sh v4 --release   # -> firmware/target/heartwood-v4.elf
+bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.elf
+```
+
 1. **A wipe costs one power-cycle.** Factory reset a board. When it comes back,
    ask for a new identity over the cable. It must refuse with `Power-cycle
    once / then generate` on the screen and a NACK naming the same reason —
-   NOT `RNG self-test failed`, which means a fault.
+   NOT `RNG CHECK FAILED / refusing new keys`, which means a fault.
 2. **The second boot clears it.** Power-cycle, check the serial log for `RNG
    self-test passed`, then generate. It proceeds.
 3. **Signing never stopped.** Between items 1 and 2, an existing master still
@@ -1654,6 +1661,10 @@ screen that says so before the words start.
    and `obtain`; word 3 is a `d`-word.
 8. **The caption never touches the word.** Check on whichever panel the board
    has. `ui-preview` renders all three, but confirm on glass.
+8b. **The shortened error cards are not clipped.** The five cards that were
+   over the 18-glyph budget now fit; `ui-preview`'s scan enforces it, but read
+   the RNG ones on the actual panel — they are the cards that tell you whether
+   to trust the board.
 9. **The word is bigger on a colour panel.** On a T-Display or C6, the word in
    both the write-down walk and the restore picker is drawn at 2x (3x on a
    landscape C6). On the 128x64 OLED it must look exactly as it did before.

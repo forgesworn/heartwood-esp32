@@ -1548,6 +1548,49 @@ join loop come back. `scripts/nip46-client.mjs` drives the calls.
     secondary with no hold at all: the log shows `would not take the reply`
     for the dead one and a normal publish line, and no `held` line.
 
+## 20. The spend grant starts at the handover (#137; added 2026-09-12, NOT YET BENCH-RUN)
+
+Section 17 pinned what the #129 grant may and may not cover. This pins *when*
+it starts: the moment the reply carrying the `ck1` is handed to the caller,
+not the moment the secret is generated. A released secret that never arrives
+now grants nothing, so the following `heartwood_note_spent` raises its own
+card the way it did before #129.
+
+Same drivers as section 17 and section 19: notecase from a bound slot, or
+`scripts/nip46-client.mjs`, with `scripts/patch-relay-list.mjs` or pulling the
+AP to break the session.
+
+1. **Unchanged in the normal case.** `heartwood collect <id>` on a healthy
+   link. Still exactly ONE card, still SPENT afterwards with no SPEND NOTE
+   card. Section 17 item 1 must still read exactly the same on the OLED.
+2. **A lost reply grants nothing.** Export a note and force the reconnect so
+   the reply is held (section 19 item 1), then, before the flush lands, send
+   `heartwood_note_spent` for that note. Expect a SPEND NOTE card. This is the
+   one this section exists for: before #137 that write-off ran silently.
+3. **An expired reply grants nothing.** Export, force the reconnect, and keep
+   the device off the air past the 60 s held-reply window. When it comes back,
+   `heartwood_note_spent` for that note raises a card, and the note is still
+   CONFIRMED and still exportable.
+4. **A delivered held reply does grant.** Export, force a reconnect short
+   enough that the flush lands (section 19 item 1), then mark spent within two
+   minutes of the *delivery*. No card. The log shows `delivered on a later
+   session` before the spend mark.
+5. **The window runs from the handover.** Repeat item 4 but let the reply sit
+   held for most of a minute before the flush. The write-off must still be
+   free for a full two minutes after it arrives, not two minutes after the
+   hold. Time it from the `delivered on a later session` line.
+6. **A revoked client grants nothing.** Section 19 item 8: approve an export,
+   force the reconnect, revoke that slot over the cable, let the device
+   reconnect. Re-pair and confirm the note is still CONFIRMED, and that a
+   spend mark for it raises a card.
+7. **Cable unchanged.** On a USB-bridged board, `node scripts/note-cmd.mjs
+   --port ... '{"cmd":"export_secret","id":"..."}'` then the matching
+   `mark_spent`: one card for the export, none for the write-off, exactly as
+   section 17 item 1 records it. The cable writes its frame synchronously, so
+   nothing about its timing changed.
+8. **Reboot still clears it.** Section 17 item 2 unchanged: export, hold,
+   RESET, unlock, spend mark. The card is back.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

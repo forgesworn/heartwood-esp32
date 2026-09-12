@@ -28,7 +28,7 @@
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 
 use heartwood_common::note_cmd::{
-    self, Approval, GatedCmd, GrantClient, NoteCmdContext, SpendGrant, WrapFn,
+    self, Approval, Earned, GatedCmd, GrantClient, NoteCmdContext, SpendGrant, WrapFn,
 };
 use heartwood_common::note_fmt::{amount_and_host, amount_and_host_line, CARD_LINE_CHARS};
 use heartwood_common::note_seal;
@@ -1062,6 +1062,15 @@ fn handle_note_cmd_frame_inner(
     // An export response carries a plaintext k1; scrub the buffer we own.
     // (The serde Value's own strings are beyond reach — noted, not hidden.)
     bytes.zeroize();
+    // #137: the frame is out, so what the export earned is a grant now. On
+    // the cable this is the same instant it always was (the write is
+    // synchronous and the next command cannot arrive until it returns), so
+    // nothing observable changed here. What changed is that a response which
+    // never left no longer grants anything, which is the relay tier's case.
+    if let Some(earned) = notes.grants.take_earned() {
+        let now = now_secs();
+        notes.grants.arm(earned, now);
+    }
     NOTES_HELD.store(notes.any_held(), core::sync::atomic::Ordering::Relaxed);
 }
 
@@ -1174,4 +1183,38 @@ pub fn run_note_cmd_approved(
 /// client has had its one free write-off for this note.
 pub fn take_spend_grant(id: &str, client: &[u8; 32]) -> bool {
     with_locker(|notes| notes.grants.take(id, GrantClient::Relay(*client), now_secs()))
+}
+
+/// Claim whatever the note command just dispatched earned (#137).
+///
+/// An approved `export_secret` no longer mints a grant where the secret is
+/// generated: it records what a DELIVERED reply would be worth, and the
+/// surface that publishes decides. Call this straight after a dispatch, so
+/// nothing stale can be claimed later, and hold the result until the reply's
+/// fate is known. Dropping it is always safe and always means no grant,
+/// which costs the owner a card and never a silent write-off.
+pub fn take_earned_grant() -> Option<Earned> {
+    with_locker(|notes| notes.grants.take_earned())
+}
+
+/// Arm what a dispatch earned, now the reply has gone out (#137). The 120 s
+/// window runs from here, not from the dispatch, so a reply held across a
+/// reconnect (#82) does not spend most of its window waiting in RAM.
+pub fn arm_earned_grant(earned: Earned) {
+    with_locker(|notes| {
+        let now = now_secs();
+        notes.grants.arm(earned, now);
+    });
+}
+
+/// Arm a grant for a held reply that has just been delivered (#82, #137).
+///
+/// The client comes from the reply that was actually delivered rather than
+/// from what the dispatch recorded, so a grant can only ever land on the
+/// pubkey the secret reached.
+pub fn arm_delivered_grant(note_id: &str, client: &[u8; 32]) {
+    with_locker(|notes| {
+        let now = now_secs();
+        notes.grants.grant(note_id, GrantClient::Relay(*client), now);
+    });
 }

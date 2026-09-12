@@ -47,7 +47,12 @@ set verbatim, bench driver scripts/note-cmd.mjs); notes are sealed at rest
 under a random note key wrapped by the same PIN/vault secret as the seeds
 (common/src/note_seal.rs, nk blob in the hw_notes namespace, one extra PBKDF2
 at unlock, notes::sync_sealed converges every torn state and never deletes
-what it cannot read). Relay path: heartwood_note_* NIP-46 extensions
+what it cannot read). The locker self-tidies: MAX_SPENT (4) caps spent records
+at the spend transition, and every creation path (both mint calls, receive,
+import and claim) makes room out of the oldest spent record first, so the
+locker cannot fill with dead records and no one has to prune by hand (#96,
+#111). Live notes are never evicted for any reason: a full locker of
+CONFIRMED notes still refuses. Relay path: heartwood_note_* NIP-46 extensions
 (advertised note_locker_v1), gated methods pinned ButtonRequired ahead of the
 generic extension gate so no slot policy can silence a disclosure, riding the
 #64 deferred machinery. Notes are deliberately NOT in backups (restore onto

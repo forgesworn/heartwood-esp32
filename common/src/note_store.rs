@@ -915,6 +915,18 @@ impl NoteStore {
         if let Some(existing) = self.notes.iter().find(|n| n.secret == secret) {
             return Ok((existing.id.clone(), false));
         }
+        // The last creation path that did not do this. `receive`, the two
+        // mint paths and `import_key` all make room out of spent records
+        // first, so a full locker took a note someone sent, minted one of
+        // its own, and claimed one off the address branch, then refused the
+        // import, which is how the browser wallet lands a note it has just
+        // paid for. Same device, same locker, an answer that depended on
+        // which call arrived. Nothing new is reachable by it:
+        // `heartwood_note_import` is ungated exactly as `heartwood_note_new`
+        // is, and that one has evicted since #111.
+        // Dedupe first, above: re-importing a secret already held must never
+        // cost a record.
+        self.evict_spent_for_room(storage, 1)?;
         self.admit_creation(1)?;
         let id = self.fresh_id(rng, None).ok_or(NoteError::StorageFull)?;
         let note = Note {
@@ -1742,6 +1754,48 @@ mod tests {
     }
 
     #[test]
+    fn importing_evicts_a_spent_record_just_as_minting_does() {
+        // The path #111 missed. It is the ordinary one: the browser wallet
+        // pays the mint and hands the preimage over with import_secret, so a
+        // locker that would mint happily still refused the note the owner had
+        // just paid for.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        for i in 0..MAX_NOTES {
+            let (id, _) = store.new_secret(&mut storage, &mut rng, None, &[], "", 10 + i as u32).unwrap();
+            store.confirm(&mut storage, &id, 1_000, "m.example", None, 20 + i as u32).unwrap();
+            let idx = store.find(&id).unwrap();
+            let mut updated = store.notes[idx].clone();
+            updated.state = NoteState::Spent;
+            updated.updated_at = 30 + i as u32;
+            store.persist_rewrite(&mut storage, idx, updated).unwrap();
+        }
+        let oldest = store.list(0, 1).notes[0].id.clone();
+
+        let k1 = "7c".repeat(SECRET_LEN);
+        let (fresh, created) = store
+            .import_secret(&mut storage, &mut rng, &k1, "m.example", 1_000, "", 99)
+            .unwrap();
+
+        assert!(created);
+        assert_eq!(store.counts().0, MAX_NOTES, "one in, one out");
+        assert!(store.get_meta(&oldest).is_none(), "the oldest spent record gave way");
+        assert!(store.get_meta(&fresh).is_some());
+
+        // And re-importing what is already held costs nothing: the dedupe is
+        // ahead of the eviction, so a wallet replaying an import does not
+        // quietly spend a record to learn the id it already had.
+        let before = store.counts().0;
+        let (again, created) = store
+            .import_secret(&mut storage, &mut rng, &k1, "m.example", 1_000, "", 100)
+            .unwrap();
+        assert_eq!(again, fresh);
+        assert!(!created);
+        assert_eq!(store.counts().0, before);
+    }
+
+    #[test]
     fn a_split_makes_room_for_both_of_its_outputs() {
         // Making room for one and then failing on the second would destroy a
         // spent record for nothing, so the ask is for the whole request.
@@ -1782,6 +1836,13 @@ mod tests {
             store.new_secret(&mut storage, &mut rng, None, &[], "", 99),
             Err(NoteError::StorageFull)
         );
+        assert_eq!(
+            store.import_secret(&mut storage, &mut rng, &"7d".repeat(SECRET_LEN), "m.example", 1, "", 99),
+            Err(NoteError::StorageFull)
+        );
+        // Nothing gave way: sixteen live notes are still sixteen live notes.
+        assert_eq!(store.counts().0, MAX_NOTES);
+        assert!(store.list(0, MAX_NOTES).notes.iter().all(|n| n.state == NoteState::Confirmed));
     }
 
     #[test]

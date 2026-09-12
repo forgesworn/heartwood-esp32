@@ -90,7 +90,7 @@ pub enum Nip46Method {
     /// Extension discovery: which methods this signer actually serves.
     HeartwoodCapabilities,
     // Bearer-note locker (relay path; see note_cmd.rs and the note-locker
-    // goal doc). Export/spent/discard are pinned always-button.
+    // goal doc). Export/spent/discard/send/rename are pinned always-button.
     HeartwoodNoteList,
     HeartwoodNoteNew,
     HeartwoodNoteNewPair,
@@ -100,6 +100,10 @@ pub enum Nip46Method {
     HeartwoodNoteImport,
     HeartwoodNoteSpent,
     HeartwoodNoteSend,
+    /// Relabel a note the locker holds (#96). It touches a LIVE note and a
+    /// label is what a wallet's list shows, so it is gated like the other
+    /// mutating commands; the cable has had it since the locker landed.
+    HeartwoodNoteRename,
     HeartwoodNoteTrust,
     HeartwoodNoteTrusted,
     /// LUD-25 Part 2: the served identity's watch-only address branch for a
@@ -150,6 +154,7 @@ impl Nip46Method {
             "heartwood_note_import" => Self::HeartwoodNoteImport,
             "heartwood_note_spent" => Self::HeartwoodNoteSpent,
             "heartwood_note_send" => Self::HeartwoodNoteSend,
+            "heartwood_note_rename" => Self::HeartwoodNoteRename,
             "heartwood_note_trust" => Self::HeartwoodNoteTrust,
             "heartwood_note_trusted" => Self::HeartwoodNoteTrusted,
             "heartwood_note_address" => Self::HeartwoodNoteAddress,
@@ -189,6 +194,7 @@ impl Nip46Method {
             Self::HeartwoodNoteImport => "heartwood_note_import",
             Self::HeartwoodNoteSpent => "heartwood_note_spent",
             Self::HeartwoodNoteSend => "heartwood_note_send",
+            Self::HeartwoodNoteRename => "heartwood_note_rename",
             Self::HeartwoodNoteTrust => "heartwood_note_trust",
             Self::HeartwoodNoteTrusted => "heartwood_note_trusted",
             Self::HeartwoodNoteAddress => "heartwood_note_address",
@@ -216,6 +222,7 @@ impl Nip46Method {
                 | Self::HeartwoodNoteSpent
                 | Self::HeartwoodNoteDiscard
                 | Self::HeartwoodNoteSend
+                | Self::HeartwoodNoteRename
                 | Self::HeartwoodNoteTrust
                 | Self::HeartwoodPairWallet
         )

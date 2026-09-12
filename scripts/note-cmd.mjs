@@ -10,6 +10,12 @@
 // mark_spent within two minutes of an approved export_secret of the SAME
 // note answers straight away, riding that hold (#129).
 //
+// This frame is the USB tier's surface: a WiFi-standalone board NACKs it and
+// serves the locker as heartwood_note_* NIP-46 extensions instead
+// (note_cmd::NOTE_METHODS is the served set, `rename` among them since #96).
+// Device-level housekeeping stays cable-only: get_info, `delete` (MAX_SPENT
+// retires spent records without it, #96/#111) and the mint-subtree commands.
+//
 // Usage:
 //   node scripts/note-cmd.mjs --port /dev/cu.usbmodemXXXX '{"cmd":"get_info"}'
 //   node scripts/note-cmd.mjs --port ... '{"cmd":"new_secret","label":"float"}'

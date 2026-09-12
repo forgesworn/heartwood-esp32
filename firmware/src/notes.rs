@@ -872,6 +872,12 @@ pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
         "mark_spent" => "SPEND NOTE",
         "discard" => "DISCARD NOTE",
         "send" => "SEND NOTE",
+        // The new label is deliberately NOT on the card. The cable card for
+        // the same command shows the money and nothing else, a label is
+        // never drawn on this device anyway (only a wallet's list shows
+        // one), and the decision the owner is being asked for is "this
+        // note's label changes", which the header says.
+        "rename" => "RENAME NOTE",
         _ => return None,
     };
     let meta = with_locker(|notes| notes.store.get_meta(id))?;
@@ -911,6 +917,18 @@ pub fn relay_precheck(cmd: &serde_json::Value) -> Option<&'static str> {
             }
             (notes.trust.len() >= heartwood_common::trust::MAX_TRUSTED).then_some("bad_request")
         });
+    }
+    if name == "rename" {
+        // The label rules, checked BEFORE the card and in the same order the
+        // cable checks them (note_cmd.rs's `rename` arm validates the label
+        // ahead of the note lookup): a label the device would refuse must
+        // never cost a hold, on either surface.
+        let Some(label) = cmd.get("label").and_then(|v| v.as_str()) else {
+            return Some("bad_request");
+        };
+        if label.len() > heartwood_common::note_store::MAX_LABEL_LEN {
+            return Some("bad_request");
+        }
     }
     let id = cmd.get("id")?.as_str()?;
     with_locker(|notes| {

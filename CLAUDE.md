@@ -55,7 +55,10 @@ locker cannot fill with dead records and no one has to prune by hand (#96,
 CONFIRMED notes still refuses. Relay path: heartwood_note_* NIP-46 extensions
 (advertised note_locker_v1), gated methods pinned ButtonRequired ahead of the
 generic extension gate so no slot policy can silence a disclosure, riding the
-#64 deferred machinery. Notes are deliberately NOT in backups (restore onto
+#64 deferred machinery. heartwood_note_rename joined that set (#96, checklist
+section 18): it touches a LIVE note and no amount of pruning corrects a label
+typed wrong, so a tier with no cable needs it; heartwood_note_delete
+deliberately did not, because MAX_SPENT retires the record it would remove. Notes are deliberately NOT in backups (restore onto
 two boards = double-spend); destructive commands (mark_spent/discard/rename/
 delete) are button-gated like lnurl-vault gates them, with ONE runtime
 exception (#129): an approved export_secret leaves a single-use, RAM-only

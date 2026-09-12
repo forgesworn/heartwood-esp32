@@ -47,6 +47,16 @@ const MAX_GAME_MS: i64 = 90_000;
 /// Fixed physics timestep (≈30 fps).
 const FRAME_US: i64 = 33_000;
 
+/// Draw every Nth physics step.
+///
+/// A full flush is the whole 1 KiB buffer over I2C at 400 kHz: about 25 ms of
+/// a 33 ms frame, and the button is only polled BETWEEN steps, so during the
+/// blit a tap lands late and a short one can be missed outright. That reads as
+/// the game ignoring you. Physics still steps at 30 fps, so the world moves as
+/// before; the panel redraws at 15, which halves the time input cannot be
+/// seen. The scroll is 2 px per step, so nothing visibly stutters at 15 fps.
+const FRAMES_PER_DRAW: u32 = 2;
+
 /// Holding PRG this long during play aborts to the hardware-only path.
 const ABORT_HOLD_MS: i64 = 2_000;
 
@@ -126,12 +136,20 @@ pub fn run(display: &mut Display<'_>, button: &PinDriver<'_, Input>) -> Option<[
             vy = (vy + 1).min(6); // gravity
             player_y = (player_y + vy).min(ground_y);
 
-            // Spawn: a chance every 30 frames, driven by the HARDWARE RNG —
+            // Spawn: a chance every 12 frames, driven by the HARDWARE RNG —
             // the stimulus must be independent of the harvested response stream.
-            if scroll % 30 == 0 {
+            //
+            // It used to be a one-in-three chance every 30 frames: about one
+            // obstacle every three seconds, so a 90 s cap offered roughly 30
+            // jumps against a target of 64. Anyone playing as the intro tells
+            // them to could not finish, and the game felt endless. One in two
+            // every 12 frames is about one every 0.8 s, which supplies the
+            // target inside the cap at a pace that stays playable: four slots
+            // and a 2 px scroll keep them from arriving on top of each other.
+            if scroll % 12 == 0 {
                 let mut roll = [0u8; 1];
                 crate::fill_random(&mut roll);
-                if roll[0] % 3 == 0 {
+                if roll[0] % 2 == 0 {
                     if let Some(slot) = obstacles.iter_mut().find(|o| !o.1) {
                         *slot = (128, true);
                     }
@@ -155,7 +173,9 @@ pub fn run(display: &mut Display<'_>, button: &PinDriver<'_, Input>) -> Option<[
                 hit_flash_until = now + 150_000;
             }
 
-            render(display, &l, player_x, player_y, ground_y, &obstacles, count, now < hit_flash_until);
+            if scroll % FRAMES_PER_DRAW == 0 || now < hit_flash_until {
+                render(display, &l, player_x, player_y, ground_y, &obstacles, count, now < hit_flash_until);
+            }
         }
 
         // --- End conditions ---

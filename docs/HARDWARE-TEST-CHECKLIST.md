@@ -1335,7 +1335,7 @@ from a bound slot and a mint that pays names to keys (moneyer >= 0.13.1).
 9. `heartwood address custodial <name>`: one HOLD TO SIGN card; the next
    payment arrives as a plain note sealed to the npub, as in 14.
 
-## 16. A second configured relay (#92; added 2026-09-11, items 1 and 2 bench-run the same day)
+## 16. A second configured relay (#92; added 2026-09-11, items 1-3 bench-run)
 
 Bench record, 2026-09-11, Heltec V4 (e8:f6:0a:c9:e7:b4), app-only flash of this
 branch's release build: online on relay 0 with `secondary_index` 1 within 40 s
@@ -1343,8 +1343,24 @@ of the WiFi unlock; heap with both sessions free 188,024 B, largest block
 92,160 B (one session: 209,480 B and 143,360 B), so a second TLS session costs
 about 21 KB. A `ping` sent to ONE relay at a time from an unbound client was
 answered on relay 0 and relay 1 and not on relay 3, and the note locker
-listed intact over the relay. Items 3 (failover), 4 (pairing) and 5
-(T-Display) not yet run.
+listed intact over the relay. Items 4 (pairing) and 5 (T-Display) not yet run.
+
+Failover bench record, 2026-09-12, same board, firmware v0.18.0-beta.4. A
+relay the bench could kill was needed, so a throwaway in-memory relay was put
+behind TLS at `wss://relaybench.forgesworn.dev` and patched in as relay 0 with
+`scripts/net-relays.mjs`; the other three were left alone. After the reboot
+and unlock the device was `stage=online`, `relay_index` 0, `secondary_index`
+1. Killing the relay PROCESS (so the live socket closed, rather than a relay
+that merely cannot be dialled) promoted the secondary: at the next reading
+`relay_index` was 1 with a new `secondary_index` 2, `stage` never left
+`online`, and `heartwood_note_list` over the relay answered immediately
+after, so the signer was serving on the promoted session. The relay list was
+patched back afterwards and the device came up on its usual relays.
+
+Two honest limits on that record: the cable was polled every few seconds, so
+"promoted at once" is bounded by a 15 s reading rather than measured, and the
+"about 3 s later" figure for the replacement secondary was not timed. A
+tighter run wants the device's own log, not `net-config` polling.
 
 The signer used to serve one configured relay at a time, so a relay that
 silently stopped delivering hid every wrap and request sent there, while
@@ -1361,7 +1377,10 @@ from pairing) always takes precedence. `scripts/net-config.mjs` reports
    relay (a one-relay bunker URI for it). The signer answers. Then only to the
    primary's. It answers. The same request published to both is answered
    once (dedupe), and a wrap published to both raises one card or toast.
-3. Failover: make the primary's relay unreachable (block it at the router,
+3. Failover (bench-run 2026-09-12, see the record above; a relay you can stop
+   the process of beats blocking at the router, and beats a WAF rule, which
+   does not close a WebSocket that is already open): make the primary's relay
+   unreachable (block it at the router,
    or pick a relay you can take down). The secondary is promoted at once:
    `relay_index` becomes the old `secondary_index` with no offline gap, and a
    new secondary is dialled on the next relay about 3 s later.

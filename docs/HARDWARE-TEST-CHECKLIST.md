@@ -1646,10 +1646,19 @@ bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.
    self-test passed`, then generate. It proceeds.
 3. **Signing never stopped.** Between items 1 and 2, an existing master still
    signs. The gate covers new key material only.
-4. **A genuinely stuck RNG is still caught.** Two ordinary reboots with no
-   wipe must log `RNG self-test passed` both times. If a board ever logs
-   `draw identical to last boot`, stop and treat every key it generated as
-   reproducible.
+4. **A genuinely stuck RNG is still caught.** Run this FIRST, before trusting
+   any key the board has made:
+
+   ```
+   node scripts/rng-check.mjs
+   ```
+
+   It taps the serial log passively (never asserts DTR/RTS, so it cannot reset
+   a live signer), asks for two RESET presses with no wipe between, and prints
+   a verdict. Exit 0 = the draw moved and the firmware verified it. Exit 1 on
+   `draw identical to last boot` or `constant draw` means stop, and treat every
+   key the board generated as reproducible. It understands the old firmware's
+   wording too, so it can be run before reflashing.
 5. **Slot secrets are gated too.** On the post-wipe boot, `CONNSLOT_CREATE`
    and the relay's `create_client` both refuse with the power-cycle reason.
 6. **The prefix notice appears once.** Generate an identity: before word 1

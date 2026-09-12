@@ -129,12 +129,20 @@ pub fn boot_self_test(nvs: &mut EspNvs<NvsDefault>) {
         }
     };
 
-    finish(self_test_outcome(draw_constant, proof, stored), match proof {
-        ProofLookup::Matched => "draw identical to last boot",
-        ProofLookup::Absent => "no previous draw to compare against",
-        ProofLookup::Unreadable => "proof unreadable",
-        ProofLookup::Differed => "draw moved",
-    });
+    // Name the reason the operator actually needs. A failed write outranks the
+    // lookup: "no previous draw" would be true and useless when the real fault
+    // is that this boot's proof did not persist.
+    let why = if stored == Some(false) {
+        "proof write failed"
+    } else {
+        match proof {
+            ProofLookup::Matched => "draw identical to last boot",
+            ProofLookup::Absent => "no previous draw to compare against",
+            ProofLookup::Unreadable => "proof unreadable",
+            ProofLookup::Differed => "draw moved",
+        }
+    };
+    finish(self_test_outcome(draw_constant, proof, stored), why);
 }
 
 /// Record the outcome and say what happened once, in one voice.

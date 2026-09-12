@@ -100,6 +100,13 @@ pub struct HeldReply {
     pub held_at: u32,
     /// Publication attempts so far.
     pub attempts: u8,
+    /// The note whose spend grant this reply's DELIVERY earns (#137), if it
+    /// is an export reply. Carried here because the grant must not exist
+    /// until the `ck1` has reached its caller: a reply that expires, is
+    /// dropped for a revoked client, or is lost to a reboot takes this with
+    /// it and grants nothing. The grant is attributed to `client`, so it can
+    /// only ever land on the pubkey the secret actually reached.
+    pub earned: Option<String>,
 }
 
 impl HeldReply {
@@ -269,7 +276,12 @@ mod tests {
             payload: "x".repeat(200),
             held_at: at,
             attempts: 0,
+            earned: None,
         }
+    }
+
+    fn earning(id: &str, who: u8, at: u32, note: &str) -> HeldReply {
+        HeldReply { earned: Some(note.to_string()), ..reply(id, who, at) }
     }
 
     fn sized(id: &str, who: u8, at: u32, bytes: usize) -> HeldReply {
@@ -468,6 +480,36 @@ mod tests {
             q.take(&client(1), 10).map(|r| r.request_id),
             Some("r0".to_string())
         );
+    }
+
+    #[test]
+    fn a_held_export_reply_carries_what_its_delivery_earns() {
+        // #137: the spend grant is armed by the delivery, not by the
+        // dispatch, so the note id has to travel with the reply.
+        let mut q = HeldReplies::new();
+        q.hold(earning("r1", 1, 10, "note7"), Decision::Approved, 10);
+        let taken = q.take(&client(1), 11).expect("held");
+        assert_eq!(taken.earned.as_deref(), Some("note7"));
+        assert_eq!(taken.client, client(1));
+    }
+
+    #[test]
+    fn an_undelivered_reply_takes_its_earned_grant_with_it() {
+        // Expired, evicted or dropped: the queue is the only place the note
+        // id lives, so losing the reply loses the grant. That is the whole
+        // point of arming on delivery.
+        let mut q = HeldReplies::new();
+        q.hold(earning("r1", 1, 100, "note7"), Decision::Approved, 100);
+        assert_eq!(q.next_client(100 + HELD_REPLY_TTL_SECS + 1), None);
+        assert!(q.is_empty());
+
+        let mut q = HeldReplies::new();
+        for i in 0..HELD_REPLY_MAX {
+            q.hold(earning(&format!("r{i}"), 1, 10, &format!("note{i}")), Decision::Approved, 10);
+        }
+        q.hold(earning("newest", 1, 10, "note9"), Decision::Approved, 10);
+        let taken = q.take(&client(1), 10).expect("held");
+        assert_eq!(taken.earned.as_deref(), Some("note1"), "the evicted one came back");
     }
 
     #[test]

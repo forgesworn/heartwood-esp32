@@ -73,6 +73,20 @@ before the wrap leaves, so once only). Advertised note_wrap_v1. WiFi tier NACKs 
 note frames (use the relay methods) and refuses at-rest changes while notes
 are held. Nothing bench-run: checklist section 13.
 
+The spend grant starts at the handover (#137, 2026-09-12, checklist section
+20): #129 minted the grant inside the dispatch, where the secret is generated,
+so a reply lost or held in transit left a live card-free write-off for a note
+whose ck1 the caller never received, and mark_spent takes a note out of
+exportable state for good. The export arm now only records what a DELIVERED
+reply would earn (note_cmd::SpendGrant::earn, one pending slot, nothing can be
+spent against it); the surface that publishes arms it (SpendGrant::arm), and
+the 120 s window runs from there, so a reply held across a reconnect does not
+spend most of its window in RAM. A dropped, refused, expired or too-large
+reply arms nothing, and a held reply carries the note id so its delivery is
+what grants. The cable arms after write_frame, which is the same instant it
+always was. Failure direction: anything that forgets to arm costs a card,
+never a silent write-off. Nothing bench-run.
+
 An approved reply outlives its session (#82, 2026-09-12, checklist section 19):
 a NIP-46 reply is addressed to a client pubkey, not to a socket, so a reconnect
 between the owner's hold and the publish no longer throws the answer away. A

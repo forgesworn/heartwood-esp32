@@ -23,6 +23,10 @@
 //! short window ([`SpendGrant`], #129). A collect is those two commands back
 //! to back, and by the time the second runs the mint has already burned the
 //! note, so the second card bought a press and nothing else.
+//!
+//! That window opens when the reply is handed to the caller, not when the
+//! secret is generated (#137). The export arm only records what a delivered
+//! reply would earn; the surface that publishes arms it.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -142,25 +146,95 @@ struct Grant {
 /// leaves none. It is consumed by the first `mark_spent` attempt for its note
 /// whether that attempt succeeds or fails, and it lives in RAM only and
 /// never in NVS, so a reboot between the two halves brings the card back.
+///
+/// # When the grant starts (#137)
+///
+/// Not when the secret is generated. When the reply carrying it is handed to
+/// the caller.
+///
+/// The premise the grant rests on is that the mint has already burned the
+/// note by the time the spend mark runs, so the device record is worthless
+/// and the card guards nothing. That premise holds only if the caller
+/// actually received the `ck1`. Minting inside the dispatch, as this
+/// originally did, left a live card-free write-off for a note whose secret
+/// was generated and then lost in transit, and `mark_spent` takes a note out
+/// of exportable state for good.
+///
+/// So the export arm calls [`SpendGrant::earn`], which grants nothing and
+/// only records what a delivered reply would be worth, and the surface that
+/// publishes calls [`SpendGrant::grant`] once the reply is on its way. The
+/// window is measured from that call, so a reply held across a reconnect
+/// (#82) does not spend most of its window waiting in RAM.
+///
+/// The failure direction is deliberate: a surface that forgets to arm costs
+/// the owner a card, never a silent write-off.
 #[derive(Default)]
 pub struct SpendGrant {
     live: Vec<Grant>,
+    /// What the last export earned, waiting for its reply to be handed over.
+    /// Not a grant: nothing consults it, and [`SpendGrant::take`] cannot see
+    /// it. One slot, because the surfaces run one command at a time and take
+    /// what it earned before dispatching the next; a second export before the
+    /// first is claimed simply drops the first, which costs a card.
+    pending: Option<Earned>,
+}
+
+/// What a delivered export reply would be worth, before it is delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Earned {
+    /// The note whose record the grant would cover.
+    pub id: String,
+    /// The client the secret was released to.
+    pub client: GrantClient,
 }
 
 impl SpendGrant {
     pub const fn new() -> Self {
-        SpendGrant { live: Vec::new() }
+        SpendGrant { live: Vec::new(), pending: None }
     }
 
-    /// Record what an approved export just earned. Re-exporting a note
-    /// replaces its grant rather than adding a second one, so one note can
-    /// never be behind two grants.
+    /// Record what an export has released, WITHOUT granting anything (#137).
+    ///
+    /// Called from the export arm, where the secret is generated. Nothing can
+    /// be spent against this: it is a note for the publishing surface, which
+    /// turns it into a grant with [`SpendGrant::grant`] if and only if the
+    /// reply reaches the caller.
+    pub fn earn(&mut self, id: &str, client: GrantClient) {
+        self.pending = Some(Earned { id: id.to_string(), client });
+    }
+
+    /// Take what the last export earned, clearing it.
+    ///
+    /// The publishing surface calls this straight after a dispatch and holds
+    /// the result until it knows whether the reply went out. Dropping the
+    /// result is always safe and always means "no grant".
+    pub fn take_earned(&mut self) -> Option<Earned> {
+        self.pending.take()
+    }
+
+    /// Whether an export is waiting on its reply. Diagnostics and tests only.
+    pub fn has_earned(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Arm a grant, now that the reply carrying the secret has been handed to
+    /// its caller (#137). `now` is that handover, and the window runs from it.
+    ///
+    /// Re-exporting a note replaces its grant rather than adding a second one,
+    /// so one note can never be behind two grants.
     pub fn grant(&mut self, id: &str, client: GrantClient, now: u32) {
         self.live.retain(|g| g.id != id);
         if self.live.len() >= MAX_SPEND_GRANTS {
             self.live.remove(0);
         }
         self.live.push(Grant { id: id.to_string(), client, granted_at: now });
+    }
+
+    /// Arm what a dispatch earned, for a surface that has just handed the
+    /// reply over. Convenience over [`SpendGrant::grant`] so a caller never
+    /// has to rebuild the pair and cannot mismatch the two halves.
+    pub fn arm(&mut self, earned: Earned, now: u32) {
+        self.grant(&earned.id, earned.client, now);
     }
 
     /// Spend the grant for `id`, if this client has a live one. `true` means
@@ -181,10 +255,11 @@ impl SpendGrant {
             .is_some_and(|elapsed| elapsed <= SPEND_GRANT_WINDOW_SECS)
     }
 
-    /// Drop every grant. For a caller that has just changed what "this
-    /// client" means underneath them.
+    /// Drop every grant, armed or merely earned. For a caller that has just
+    /// changed what "this client" means underneath them.
     pub fn clear(&mut self) {
         self.live.clear();
+        self.pending = None;
     }
 
     /// How many grants are live. Diagnostics and tests only.
@@ -788,7 +863,13 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
                     // the right to write its record off. Recorded on success
                     // only: an export that failed released nothing, so
                     // there is nothing for a spend mark to follow.
-                    ctx.grant.grant(id, ctx.client, ctx.now);
+                    //
+                    // #137: recorded, not granted. The secret exists here;
+                    // the caller does not have it yet, and on the relay tier
+                    // it may never get it. The surface that publishes arms
+                    // this once the reply is on its way, and the window runs
+                    // from then.
+                    ctx.grant.earn(id, ctx.client);
                     json!({"ok": true, "k1": k1})
                 }
                 Err(e) => note_err(e),
@@ -1236,6 +1317,39 @@ mod tests {
         fn reboot(&mut self) {
             self.grant = SpendGrant::new();
             self.now = 0;
+        }
+
+        /// Hand the last reply to its caller, the way a publishing surface
+        /// does (#137). This is what arms a grant: `run` on its own only
+        /// generates the secret, and a test that never calls this is a test
+        /// of a reply that never arrived.
+        ///
+        /// Returns whether anything was armed.
+        fn deliver(&mut self) -> bool {
+            let now = self.now;
+            match self.grant.take_earned() {
+                Some(earned) => {
+                    self.grant.arm(earned, now);
+                    true
+                }
+                None => false,
+            }
+        }
+
+        /// The reply was lost, refused or expired: whatever it earned is
+        /// dropped and nothing is armed.
+        fn lose_reply(&mut self) {
+            self.grant.take_earned();
+        }
+
+        /// Export and deliver in one step, for the many tests whose subject
+        /// is something other than the handover itself.
+        fn export_and_deliver(&mut self, id: &str) -> Value {
+            let res = self.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
+            if res["ok"] == true {
+                assert!(self.deliver(), "a successful export earns a grant");
+            }
+            res
         }
     }
 
@@ -1866,6 +1980,7 @@ mod tests {
         let id = h.confirmed_note();
         let res = h.run_method("heartwood_note_export", json!({"id": id}));
         assert!(res["k1"].is_string(), "{res}");
+        assert!(h.deliver());
         assert_eq!(h.grant.len(), 1);
         h.asked.clear();
 
@@ -2041,6 +2156,10 @@ mod tests {
         assert_eq!(res["ok"], true, "{res}");
         assert!(res["k1"].is_string());
         assert_eq!(h.asked, vec![(GatedCmd::ExportSecret, id.clone())]);
+        // Nothing is granted until the reply is handed over (#137): the
+        // secret exists, the caller does not have it yet.
+        assert!(h.grant.is_empty(), "the export granted before it was delivered");
+        assert!(h.deliver(), "delivering the reply is what arms the grant");
 
         // The other half of the same collect: no second card.
         let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
@@ -2053,6 +2172,158 @@ mod tests {
         assert!(h.grant.is_empty(), "the grant outlived its one use");
         let list = h.run(r#"{"cmd":"list_notes"}"#);
         assert_eq!(list["notes"][0]["state"], "spent");
+    }
+
+    // ---- #137: the grant starts when the reply is handed over ----
+    //
+    // The premise #129 rests on is that the mint has already burned the note
+    // by the time the spend mark runs. That is true only if the caller
+    // actually received the ck1. Minting inside the dispatch left a live,
+    // card-free write-off for a note whose secret was generated and then lost
+    // in transit, and mark_spent takes a note out of exportable state for
+    // good. So the export arm only records what a delivered reply is worth.
+
+    #[test]
+    fn an_export_grants_nothing_until_its_reply_is_handed_over() {
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert!(res["k1"].is_string(), "the secret was generated");
+
+        // Generated, but not granted. Nothing can be spent against this.
+        assert!(h.grant.is_empty(), "a grant existed before the reply went out");
+        assert!(h.grant.has_earned(), "nothing was recorded for the handover");
+        assert!(
+            !h.grant.take(&id, h.client, h.now),
+            "an earned-but-undelivered export answered a spend mark"
+        );
+    }
+
+    #[test]
+    fn a_lost_reply_leaves_no_grant_at_all() {
+        // The failure this exists for: the secret is released, the reply
+        // never reaches the caller, and a spend mark arrives anyway. It must
+        // raise its own card, because the owner is the only one who knows
+        // whether that note was ever collected.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        h.lose_reply();
+        h.asked.clear();
+
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(
+            h.asked,
+            vec![(GatedCmd::MarkSpent, id.clone())],
+            "a lost export reply bought a card-free write-off"
+        );
+    }
+
+    #[test]
+    fn a_reply_that_is_never_delivered_cannot_be_armed_later() {
+        // A held reply that expires, is dropped for a revoked client, or is
+        // lost to a reboot is dropped along with what it earned. There is no
+        // way back to it.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        h.lose_reply();
+        assert!(!h.grant.has_earned());
+        assert!(!h.deliver(), "a dropped reply armed a grant anyway");
+        assert!(h.grant.is_empty());
+    }
+
+    #[test]
+    fn the_window_is_measured_from_the_handover_not_the_dispatch() {
+        // A reply held across a reconnect (#82) can wait up to a minute. If
+        // the window still ran from the dispatch, a slow flush would eat most
+        // of it and the caller would be handed a secret it had no time to
+        // spend against.
+        let held_for = 55;
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        let dispatched = h.now;
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+
+        // The outbox finally gets a session.
+        h.now = dispatched + held_for;
+        assert!(h.deliver());
+        h.asked.clear();
+
+        // A full window from the handover, not what was left of one from the
+        // dispatch.
+        h.now = dispatched + held_for + SPEND_GRANT_WINDOW_SECS;
+        let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
+        assert_eq!(res["ok"], true, "{res}");
+        assert!(
+            h.asked.is_empty(),
+            "the window was measured from the dispatch: {:?}",
+            h.asked
+        );
+
+        // And it is still a window, not an open door.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        let dispatched = h.now;
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        h.now = dispatched + held_for;
+        assert!(h.deliver());
+        h.asked.clear();
+        h.now = dispatched + held_for + SPEND_GRANT_WINDOW_SECS + 1;
+        assert_eq!(h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#))["ok"], true);
+        assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, id.clone())]);
+    }
+
+    #[test]
+    fn a_second_export_before_the_first_is_claimed_costs_a_card_never_a_grant() {
+        // One pending slot. A surface that dispatched twice without claiming
+        // in between loses the first, which is a card the owner has to give.
+        // What it must never do is arm the wrong note.
+        let mut h = Harness::new();
+        let a = h.confirmed_note();
+        let b = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{a}"}}"#))["ok"], true);
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{b}"}}"#))["ok"], true);
+        assert!(h.deliver());
+        assert_eq!(h.grant.len(), 1, "two grants from one claim");
+        h.asked.clear();
+
+        // b's reply is the one that was claimed, so b's write-off is free...
+        assert_eq!(h.run(&format!(r#"{{"cmd":"mark_spent","id":"{b}"}}"#))["ok"], true);
+        assert!(h.asked.is_empty(), "{:?}", h.asked);
+        // ...and a's is not.
+        assert_eq!(h.run(&format!(r#"{{"cmd":"mark_spent","id":"{a}"}}"#))["ok"], true);
+        assert_eq!(h.asked, vec![(GatedCmd::MarkSpent, a.clone())]);
+    }
+
+    #[test]
+    fn claiming_is_single_shot() {
+        // The publishing surface takes what a dispatch earned and holds it.
+        // A second claim must find nothing, or a retry loop could arm the
+        // same export twice, which is a second window on one hold.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        let first = h.grant.take_earned().expect("the export earned one");
+        assert_eq!(first.id, id);
+        assert_eq!(first.client, h.client);
+        assert!(h.grant.take_earned().is_none(), "claimed twice");
+    }
+
+    #[test]
+    fn an_earned_export_is_dropped_by_a_clear() {
+        // clear() is for a caller that has just changed what "this client"
+        // means. Something waiting to be armed is exactly as stale as a live
+        // grant at that moment.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        assert!(h.grant.has_earned());
+        h.grant.clear();
+        assert!(!h.grant.has_earned());
+        assert!(!h.deliver());
     }
 
     #[test]
@@ -2072,7 +2343,7 @@ mod tests {
         // free second write-off long after the owner stopped watching.
         let mut h = Harness::new();
         let id = h.confirmed_note();
-        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        assert_eq!(h.export_and_deliver(&id)["ok"], true);
         h.asked.clear();
 
         h.note_write_ok = false;
@@ -2092,7 +2363,7 @@ mod tests {
         let mut h = Harness::new();
         let a = h.confirmed_note();
         let b = h.confirmed_note();
-        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{a}"}}"#))["ok"], true);
+        assert_eq!(h.export_and_deliver(&a)["ok"], true);
         h.asked.clear();
 
         let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{b}"}}"#));
@@ -2112,7 +2383,7 @@ mod tests {
         for other in [GrantClient::Relay([0xc2; 32]), GrantClient::Cable] {
             let mut h = Harness::new();
             let id = h.confirmed_note();
-            assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+            assert_eq!(h.export_and_deliver(&id)["ok"], true);
             h.asked.clear();
             h.client = other;
             let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
@@ -2124,7 +2395,7 @@ mod tests {
         let mut h = Harness::new();
         h.client = GrantClient::Cable;
         let id = h.confirmed_note();
-        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        assert_eq!(h.export_and_deliver(&id)["ok"], true);
         h.asked.clear();
         h.client = GrantClient::Relay([0xc1; 32]);
         let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
@@ -2137,7 +2408,7 @@ mod tests {
         let mut h = Harness::new();
         let id = h.confirmed_note();
         let at = h.now;
-        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        assert_eq!(h.export_and_deliver(&id)["ok"], true);
         h.asked.clear();
         h.now = at + SPEND_GRANT_WINDOW_SECS + 1;
         let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
@@ -2148,7 +2419,7 @@ mod tests {
         let mut h = Harness::new();
         let id = h.confirmed_note();
         let at = h.now;
-        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        assert_eq!(h.export_and_deliver(&id)["ok"], true);
         h.asked.clear();
         h.now = at + SPEND_GRANT_WINDOW_SECS;
         let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
@@ -2162,7 +2433,8 @@ mod tests {
         // no memory of the hold, and must not behave as though it did.
         let mut h = Harness::new();
         let id = h.confirmed_note();
-        assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+        assert_eq!(h.export_and_deliver(&id)["ok"], true);
+        assert_eq!(h.grant.len(), 1, "the delivered export earned a grant");
         h.reboot();
         h.asked.clear();
         let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));
@@ -2179,6 +2451,8 @@ mod tests {
             let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
             assert_eq!(res["ok"], false, "{res}");
             assert!(h.grant.is_empty(), "{answer:?} left a grant");
+            assert!(!h.grant.has_earned(), "{answer:?} left something to arm");
+            assert!(!h.deliver(), "{answer:?} armed a grant on delivery");
 
             h.answer = Approval::Approved;
             h.asked.clear();
@@ -2242,9 +2516,14 @@ mod tests {
         for _ in 0..MAX_SPEND_GRANTS {
             ids.push(h.confirmed_note());
         }
+        // One card answered them all, and each reply is handed over in turn,
+        // the way the relay path publishes a batch.
         for id in &ids {
-            assert_eq!(h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["ok"], true);
+            let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
+            assert_eq!(res["ok"], true, "{res}");
+            assert!(h.deliver(), "each delivered reply arms its own grant");
         }
+        assert_eq!(h.grant.len(), MAX_SPEND_GRANTS);
         h.asked.clear();
         for id in &ids {
             let res = h.run(&format!(r#"{{"cmd":"mark_spent","id":"{id}"}}"#));

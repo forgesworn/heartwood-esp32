@@ -3622,6 +3622,9 @@ fn complete_parked(
         ctx.nvs,
         ctx.personas,
     );
+    // Same rule as a card's (#137): claim what the dispatch earned next to
+    // the dispatch, arm it only if the reply goes out.
+    let mut earned = earned_for(crate::notes::take_earned_grant(), &client_pubkey);
     if !ctx.policy_engine.persist_slots(ctx.nvs, slot) {
         log::error!("[relay] slot persist failed after park completion");
     }
@@ -3649,6 +3652,7 @@ fn complete_parked(
             "response too large for this signer's memory; the request was not completed",
         )
         .unwrap_or_default();
+        earned = None;
     }
     let sealed = seal_reply(
         ctx.secp,
@@ -3667,7 +3671,12 @@ fn complete_parked(
         }
     };
     match publish_sealed(tls, &signed) {
-        Ok(()) => true,
+        Ok(()) => {
+            if let Some(earned) = earned {
+                crate::notes::arm_earned_grant(earned);
+            }
+            true
+        }
         Err(e) => {
             log::warn!("[relay] park completion publish: {e}");
             // A guardian-approved park is the same shape as an approved card:
@@ -3682,6 +3691,7 @@ fn complete_parked(
                 &request_id,
                 &signed,
                 heartwood_common::held_reply::Decision::Approved,
+                earned,
             );
             false
         }
@@ -4398,6 +4408,14 @@ fn resolve_button_card(
             _ => nip46::build_error_response(&request_id, -1, "timeout").unwrap_or_default(),
         };
 
+        // #137: an approved export records the grant a DELIVERED reply would
+        // be worth instead of minting one where the secret is generated.
+        // Claim it next to the dispatch that earned it, so nothing stale can
+        // be armed later; on any branch but an approval this is either None
+        // or a leftover, and both are dropped.
+        let mut earned = crate::notes::take_earned_grant()
+            .filter(|_| matches!(outcome, CardTick::Approved));
+
         if matches!(outcome, CardTick::Approved) {
             if !ctx.policy_engine.persist_slots(ctx.nvs, slot) {
                 log::error!("[relay] slot persist failed after an approved card");
@@ -4449,6 +4467,9 @@ fn resolve_button_card(
                 "response too large for this signer's memory; the request was not completed",
             )
             .unwrap_or_default();
+            // The caller is getting an error, not the secret, so nothing was
+            // earned however well the dispatch went (#137).
+            earned = None;
         }
 
         let held = Duration::from_secs(crate::uptime_s().saturating_sub(ask.received_uptime));
@@ -4480,6 +4501,7 @@ fn resolve_button_card(
                 &request_id,
                 signed,
                 decision,
+                earned,
             ),
             Err(e) => log::warn!("[relay] approval publish for {request_id}: {e}"),
         }
@@ -7782,6 +7804,26 @@ fn publish_sealed(tls: &mut Tls, signed: &SignedEvent) -> Result<(), String> {
 /// Called only for work the owner approved. A denial, an expiry or a refusal
 /// is published the old way and lost if it cannot go out, which costs its
 /// caller nothing it was not already going to get from a timeout.
+/// An earned spend grant is armed only for the client the reply is actually
+/// addressed to (#137).
+///
+/// The pending slot is claimed next to the dispatch that filled it, so these
+/// two agree by construction. If they ever stop agreeing the plumbing is
+/// wrong, and no grant is the right answer to that: it costs a card.
+fn earned_for(
+    earned: Option<heartwood_common::note_cmd::Earned>,
+    client_pubkey: &[u8; 32],
+) -> Option<heartwood_common::note_cmd::Earned> {
+    earned.filter(|e| {
+        let mine = e.client == heartwood_common::note_cmd::GrantClient::Relay(*client_pubkey);
+        if !mine {
+            log::error!("[relay] earned grant is not this reply's client; dropped");
+        }
+        mine
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn publish_reply_or_hold(
     sessions: &mut [RelaySession],
     ctx: &mut SignCtx,
@@ -7790,18 +7832,27 @@ fn publish_reply_or_hold(
     request_id: &str,
     signed: SignedEvent,
     decision: heartwood_common::held_reply::Decision,
+    earned: Option<heartwood_common::note_cmd::Earned>,
 ) {
+    let earned = earned_for(earned, client_pubkey);
     for index in publish_order(sessions) {
         let session = &mut sessions[index];
         match publish_sealed(&mut session.tls, &signed) {
-            Ok(()) => return,
+            Ok(()) => {
+                // The `ck1` is on its way, so what the export earned is a
+                // grant now and its window starts here (#137).
+                if let Some(earned) = earned {
+                    crate::notes::arm_earned_grant(earned);
+                }
+                return;
+            }
             Err(e) => log::warn!(
                 "[relay] {} would not take the reply for {request_id}: {e}",
                 relay_host(&session.url)
             ),
         }
     }
-    hold_reply(ctx, client_pubkey, master_slot, request_id, &signed, decision);
+    hold_reply(ctx, client_pubkey, master_slot, request_id, &signed, decision, earned);
 }
 
 /// Which sessions to offer a reply to, in order.
@@ -7817,6 +7868,7 @@ fn publish_order(sessions: &[RelaySession]) -> Vec<usize> {
 }
 
 /// Put a sealed reply in the outbox for the next session (#82).
+#[allow(clippy::too_many_arguments)]
 fn hold_reply(
     ctx: &mut SignCtx,
     client_pubkey: &[u8; 32],
@@ -7824,8 +7876,13 @@ fn hold_reply(
     request_id: &str,
     signed: &SignedEvent,
     decision: heartwood_common::held_reply::Decision,
+    earned: Option<heartwood_common::note_cmd::Earned>,
 ) {
     use heartwood_common::held_reply::{Decision, HeldReply, HoldOutcome};
+
+    // The note id travels with the reply and is armed on delivery, never
+    // here (#137), and only ever for this reply's own client.
+    let earned_note = earned_for(earned, client_pubkey).map(|e| e.id);
 
     if decision != Decision::Approved {
         // The queue refuses it anyway; skip the serialise.
@@ -7845,6 +7902,7 @@ fn hold_reply(
             payload,
             held_at: now,
             attempts: 0,
+            earned: earned_note,
         },
         decision,
         now,
@@ -7917,6 +7975,12 @@ fn flush_held_replies(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
                 "[relay] held reply for {} delivered on a later session",
                 reply.request_id
             );
+            // Delivery, not the dispatch, is what earns the spend grant, and
+            // the window starts now (#137). The client comes from the reply
+            // that actually went out.
+            if let Some(note_id) = reply.earned.as_deref() {
+                crate::notes::arm_delivered_grant(note_id, &reply.client);
+            }
             continue;
         }
         // Nothing live took it, so nothing live will take the rest either.

@@ -87,3 +87,75 @@ fn invalid_nsec_scalar_is_rejected_for_both_nsec_kinds() {
     assert!(create_nsec_recovery_words(&zero, false).is_err());
     assert!(create_nsec_recovery_words(&zero, true).is_err());
 }
+
+/// The labels on the device's word-walk screen are only honest if words 1-2
+/// really are constant. Pin that against every kind, so a format change that
+/// moves the fingerprint earlier fails here rather than silently turning the
+/// "ALWAYS THESE 2 WORDS" caption into a lie.
+#[test]
+fn first_two_words_are_constant_across_kinds_and_keys() {
+    let mut sequences = vec![
+        create_mnemonic_recovery_words(ZERO_PHRASE, "")
+            .unwrap()
+            .to_string(),
+        create_mnemonic_recovery_words(ZERO_PHRASE, "trezor")
+            .unwrap()
+            .to_string(),
+    ];
+    for tail in 1u8..=8 {
+        let mut nsec = [0u8; 32];
+        nsec[31] = tail;
+        sequences.push(
+            create_nsec_recovery_words(&nsec, false)
+                .unwrap()
+                .to_string(),
+        );
+        sequences.push(create_nsec_recovery_words(&nsec, true).unwrap().to_string());
+    }
+
+    for sequence in &sequences {
+        let words: Vec<&str> = sequence.split_whitespace().collect();
+        assert_eq!(&words[..2], &["edge", "obtain"], "prefix moved: {sequence}");
+    }
+}
+
+#[test]
+fn word_roles_split_format_header_and_secret() {
+    use heartwood_common::recovery_words::{recovery_word_role, RecoveryWordRole};
+
+    for total in [19usize, 31] {
+        assert_eq!(recovery_word_role(1, total), Some(RecoveryWordRole::Format));
+        assert_eq!(recovery_word_role(2, total), Some(RecoveryWordRole::Format));
+        assert_eq!(recovery_word_role(3, total), Some(RecoveryWordRole::Header));
+        assert_eq!(recovery_word_role(7, total), Some(RecoveryWordRole::Header));
+        assert_eq!(recovery_word_role(8, total), Some(RecoveryWordRole::Secret));
+        assert_eq!(
+            recovery_word_role(total, total),
+            Some(RecoveryWordRole::Secret)
+        );
+        // Out of range labels nothing rather than labelling wrongly.
+        assert_eq!(recovery_word_role(0, total), None);
+        assert_eq!(recovery_word_role(total + 1, total), None);
+    }
+
+    // A bare 12-word mnemonic is not an envelope: no word carries a role.
+    assert_eq!(recovery_word_role(1, 12), None);
+    assert_eq!(recovery_word_role(1, 24), None);
+}
+
+/// The walk-through labels come from the same envelope length the encoder
+/// produces. If one moves without the other the screen mislabels the payload,
+/// so tie them together here.
+#[test]
+fn every_generated_word_carries_a_role() {
+    use heartwood_common::recovery_words::{recovery_word_role, RecoveryWordRole};
+
+    let words = create_mnemonic_recovery_words(ZERO_PHRASE, "").unwrap();
+    let parts: Vec<&str> = words.split_whitespace().collect();
+    let total = parts.len();
+    let secrets = (1..=total)
+        .filter(|i| recovery_word_role(*i, total) == Some(RecoveryWordRole::Secret))
+        .count();
+    assert_eq!(secrets, 12, "payload words must all be labelled secret");
+    assert!((1..=total).all(|i| recovery_word_role(i, total).is_some()));
+}

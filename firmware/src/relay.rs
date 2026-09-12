@@ -6481,8 +6481,9 @@ fn dispatch_mgmt(
             // Fresh secrets need fresh entropy — fail closed like the USB
             // connslot path if the boot-time RNG self-test didn't pass.
             if !crate::entropy::rng_ok() {
-                log::error!("[relay] mgmt: create_client refused: RNG self-test failed this boot");
-                return Err("RNG self-test failed this boot — refusing to mint secrets".into());
+                let why = crate::entropy::rng_refusal();
+                log::error!("[relay] mgmt: create_client refused: {why}");
+                return Err(why.into());
             }
 
             // Slot secret from the hardware RNG (never leaves except in the URI).
@@ -6783,8 +6784,9 @@ fn dispatch_mgmt(
             // Fresh secrets need fresh entropy — fail closed like the USB
             // connslot path if the boot-time RNG self-test didn't pass.
             if !crate::entropy::rng_ok() {
-                log::error!("[relay] nostrconnect refused: RNG self-test failed this boot");
-                return Err("RNG self-test failed this boot — refusing to mint secrets".into());
+                let why = crate::entropy::rng_refusal();
+                log::error!("[relay] nostrconnect refused: {why}");
+                return Err(why.into());
             }
 
             // A slot secret is still minted (bunker parity), even though this slot

@@ -19,6 +19,19 @@ verify blank. An erase failure is displayed and NACKed where a USB request is
 in flight; the firmware remains in a retry loop rather than returning to a
 signing path with partially erased state.
 
+### A wipe costs one power-cycle before new keys
+
+The boot RNG self-test proves the hardware entropy source is live by comparing
+this boot's draw against a hash of the previous boot's, held in NVS under
+`rng_proof`. A wipe erases that proof along with everything else, so the boot
+immediately afterwards has nothing to compare against — and that is precisely
+the boot an owner provisions on. The device therefore seeds a fresh proof and
+stays UNVERIFIED on a post-wipe boot: signing continues, but generating a seed
+or minting a slot secret is refused until one more boot proves the draw
+changed. The refusal says so ("power-cycle the signer once, then retry") and is
+not a fault. Order of operations after a reset: **wipe, power-cycle, then
+provision.**
+
 ## NVS inventory
 
 All application-owned NVS state found in the firmware is in the `heartwood`
@@ -42,6 +55,7 @@ namespace:
 | `mgmt_seen` | Legacy request-id cache left harmlessly in place but ignored; current duplicate suppression is RAM-only |
 | `root_secret` | Legacy single-master seed key; not used by the current boot path |
 | `rm_journal`, `rm_pinned` | Temporary power-loss journal and pinned-relay shadow during master removal |
+| `rng_proof` | SHA-256 of last boot's RNG self-test draw; a wipe clears it, costing one power-cycle before new key material (see above) |
 
 The factory/PIN wipe erases the partition rather than enumerating this table,
 so a future or unknown key cannot survive merely because a cleanup list was not

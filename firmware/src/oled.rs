@@ -350,17 +350,25 @@ pub fn show_npub(
 /// "WORD n OF 12", advancing on a button tap. It holds the walkthrough — and
 /// blocks the caller from redrawing or rebooting — until the owner confirms, so
 /// nothing can vanish before it is copied down.
-pub fn show_recovery_word(display: &mut Display<'_>, index: usize, total: usize, word: &str) {
+///
+/// `role` captions what the word IS. The typed envelope opens with two words
+/// that are byte-identical on every key ever generated, so without a caption a
+/// fresh ceremony looks like a repeat of the last one and the owner concludes
+/// the RNG is stuck (it happened, 2026-09-12). Pass an empty `role` for a
+/// sequence that is not a typed envelope.
+pub fn show_recovery_word(
+    display: &mut Display<'_>,
+    index: usize,
+    total: usize,
+    word: &str,
+    role: &str,
+) {
     let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
         .font(l.font_header())
         .text_color(ACCENT)
-        .build();
-    let big = MonoTextStyleBuilder::new()
-        .font(l.font_large())
-        .text_color(FG)
         .build();
     let small = MonoTextStyleBuilder::new()
         .font(l.font_small())
@@ -374,10 +382,23 @@ pub fn show_recovery_word(display: &mut Display<'_>, index: usize, total: usize,
         .draw(display)
         .ok();
 
-    // The word, large and centred (FONT_10X20 is 10px per glyph).
-    let glyphs = word.chars().count().min(12) as i32;
-    let x = l.center_x(glyphs * Layout::glyph_w(l.font_large()));
-    Text::new(word, Point::new(x, l.sy(44)), big).draw(display).ok();
+    // The role caption sits between the rule and the word, in ACCENT so it
+    // reads as chrome and is never mistaken for part of the phrase.
+    if !role.is_empty() {
+        let caption = MonoTextStyleBuilder::new()
+            .font(l.font_small())
+            .text_color(ACCENT)
+            .build();
+        Text::new(role, Point::new(l.sx(2), l.sy(26)), caption).draw(display).ok();
+    }
+
+    // The word, as large as the panel can carry. FONT_10X20 is the biggest
+    // built-in font, so the colour panels magnify its glyphs rather than
+    // settling for a word that reads as a thin band on a large screen.
+    let scale = l.word_scale();
+    let width = crate::bigtext::scaled_text_width(word, l.font_large(), scale);
+    let x = l.center_x(width);
+    crate::bigtext::draw_text_scaled(display, word, Point::new(x, l.sy(44)), l.font_large(), scale, FG);
 
     let footer = if index >= total { "tap PRG to finish" } else { "tap PRG for next" };
     Text::new(footer, Point::new(l.sx(2), l.sy(62)), small).draw(display).ok();
@@ -416,6 +437,46 @@ pub fn show_generating(display: &mut Display<'_>) {
 
     Text::new("Working", Point::new(l.sx(29), l.sy(40)), large).draw(display).ok();
     Text::new("creating your keys...", Point::new(l.sx(2), l.sy(58)), small).draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Explain the fixed opening BEFORE the owner walks into it.
+///
+/// Every ForgeSworn recovery sequence begins "edge obtain": magic and version
+/// fill the first two words entirely, so they are identical on every key this
+/// or any other Heartwood has ever produced. An owner who meets that cold
+/// concludes the device repeated a key and distrusts a perfectly good one.
+/// Worse, once they learn to wave the opening away, a genuinely repeated key
+/// looks the same. One screen, one tap, before the words start.
+pub fn show_recovery_prefix_notice(display: &mut Display<'_>) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(l.font_body())
+        .text_color(FG)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(FG)
+        .build();
+
+    Text::new("BEFORE YOU WRITE", Point::new(l.sx(2), l.sy(12)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(16)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display)
+        .ok();
+
+    Text::new("Words 1-7 are", Point::new(l.sx(4), l.sy(32)), body).draw(display).ok();
+    Text::new("format, not key.", Point::new(l.sx(4), l.sy(46)), body).draw(display).ok();
+    Text::new("Same start every time", Point::new(l.sx(2), l.sy(60)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -529,10 +590,6 @@ pub fn show_word_entry(
         .font(l.font_header())
         .text_color(ACCENT)
         .build();
-    let big = MonoTextStyleBuilder::new()
-        .font(l.font_large())
-        .text_color(FG)
-        .build();
     let small = MonoTextStyleBuilder::new()
         .font(l.font_small())
         .text_color(FG)
@@ -545,30 +602,47 @@ pub fn show_word_entry(
         .draw(display)
         .ok();
 
-    // The highlighted ring item, large and centred.
-    let glyphs = big_text.chars().count().min(12) as i32;
-    let x = l.center_x(glyphs * Layout::glyph_w(l.font_large()));
-    Text::new(big_text, Point::new(x, l.sy(40)), big).draw(display).ok();
+    // The highlighted ring item, as large as the panel can carry — this is the
+    // word the owner is reading off paper, so it gets every pixel available.
+    let scale = l.word_scale();
+    let width = crate::bigtext::scaled_text_width(big_text, l.font_large(), scale);
+    let x = l.center_x(width);
+    crate::bigtext::draw_text_scaled(display, big_text, Point::new(x, l.sy(40)), l.font_large(), scale, FG);
     if hl == Highlight::Word {
         // Underline: this is a complete word, not a letter.
-        Rectangle::new(Point::new(x, l.sy(43)), Size::new((glyphs * Layout::glyph_w(l.font_large())) as u32, l.s(1) as u32))
-            .into_styled(PrimitiveStyle::with_fill(FG))
-            .draw(display)
-            .ok();
+        Rectangle::new(
+            Point::new(x, l.sy(43)),
+            Size::new(width as u32, l.s(1) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(FG))
+        .draw(display)
+        .ok();
     }
 
     Text::new(subtitle, Point::new(l.sx(2), l.sy(54)), small).draw(display).ok();
     // Two-button boards move with A and pick with B — no timing, so the legend
     // is fixed. One-button boards cycle on a tap (or accept the sole word) and
     // go back on a hold.
+    //
+    // The full two-button legend is 32 characters, which overruns every panel
+    // narrower than the T-Display: at 5px per glyph it drew 160px onto the
+    // 128px OLED and the last word was simply cut off. Boards that cannot
+    // carry it get the short form, and the pick gesture lives in the
+    // per-state subtitle instead, where there is room for it.
     let legend = if two_button {
-        "A/B move  holdB pick  holdA back"
+        if l.chars_per_line(l.font_small()) >= 34 {
+            "A/B move  holdB pick  holdA back"
+        } else {
+            "A/B move  holdA back"
+        }
     } else if tap_accepts {
         "tap=pick   hold=back"
     } else {
         "tap=next   hold=back"
     };
-    Text::new(legend, Point::new(l.sx(2), l.sy(63)), small).draw(display).ok();
+    // sy(63) put the baseline one row too low: FONT_5X8 sits six rows above its
+    // baseline and is eight tall, so the bottom row fell off a 64px panel.
+    Text::new(legend, Point::new(l.sx(2), l.sy(62)), small).draw(display).ok();
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);

@@ -25,7 +25,8 @@ use crate::masters::{self, LoadedMaster};
 use crate::oled::{self, Display};
 use crate::protocol;
 use heartwood_common::recovery_words::{
-    create_mnemonic_recovery_words_for_root, decode_recovery_words, restore_recovery_words,
+    create_mnemonic_recovery_words_for_root, decode_recovery_words, recovery_word_role,
+    restore_recovery_words, RecoveryWordRole,
 };
 use heartwood_common::restore::{restore_root, Choice, WordEntry};
 
@@ -348,9 +349,19 @@ pub fn handle_generate(
         if let Some(mut d) = game_digest {
             d.iter_mut().for_each(|b| *b = 0);
         }
-        log::error!("on-device generate refused: RNG self-test failed this boot");
-        oled::show_error(display, "RNG self-test failed\nrefusing to generate");
-        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        // Two very different situations share this exit. A post-wipe boot has
+        // simply not earned its continuity proof yet and needs one power-cycle;
+        // saying "self-test failed" there sends an owner hunting a dead board.
+        let state = crate::entropy::rng_state();
+        log::error!("on-device generate refused: {}", state.refusal());
+        oled::show_error(
+            display,
+            match state {
+                crate::entropy::RngState::NeedsSecondBoot => "Power-cycle once\nthen generate",
+                _ => "RNG self-test failed\nrefusing to generate",
+            },
+        );
+        protocol::write_frame(usb, FRAME_TYPE_NACK, state.refusal().as_bytes());
         return None;
     }
     if let Some(mut d) = game_digest {
@@ -431,9 +442,17 @@ fn walk_recovery_phrase(
     let total = words.len();
 
     loop {
+        // Say up front that the opening words repeat, before the owner reaches
+        // them and draws the wrong conclusion. Skipped for a sequence that is
+        // not a typed envelope, where there is no fixed prefix to explain.
+        if recovery_word_role(1, total).is_some() {
+            oled::show_recovery_prefix_notice(display);
+            let _ = press_blocking(buttons);
+        }
+
         // Step through every word; any press advances to the next.
         for (i, word) in words.iter().enumerate() {
-            oled::show_recovery_word(display, i + 1, total, word);
+            oled::show_recovery_word(display, i + 1, total, word, word_role_caption(i + 1, total));
             let _ = press_blocking(buttons);
         }
 
@@ -443,6 +462,21 @@ fn walk_recovery_phrase(
             oled::show_result(display, "SAVED");
             return;
         }
+    }
+}
+
+/// Caption for word `index` of the walkthrough, or `""` when the sequence is
+/// not a typed envelope and nothing can be said honestly about its shape.
+///
+/// Words 1-2 are magic and version: byte-identical on every ForgeSworn key
+/// ever generated. Saying so is the whole point of the caption — an operator
+/// who is not told reads the repeat as a stuck RNG.
+fn word_role_caption(index: usize, total: usize) -> &'static str {
+    match recovery_word_role(index, total) {
+        Some(RecoveryWordRole::Format) => "SAME ON EVERY KEY",
+        Some(RecoveryWordRole::Header) => "HEADER, NOT SECRET",
+        Some(RecoveryWordRole::Secret) => "SECRET",
+        None => "",
     }
 }
 
@@ -759,8 +793,11 @@ fn enter_one_word(
             Choice::Letter(c) => {
                 let mut text = entry.prefix().to_string();
                 text.push(c);
+                // Two-button boards lost "holdB pick" from the legend on any
+                // panel too narrow to draw it, so the pick gesture is carried
+                // here, where the string is short and per-state.
                 let sub = if two {
-                    format!("{} left", entry.candidate_count())
+                    format!("{} left   holdB=pick", entry.candidate_count())
                 } else {
                     format!("{} left   2tap=pick", entry.candidate_count())
                 };

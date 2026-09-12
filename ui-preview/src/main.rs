@@ -11,6 +11,8 @@
 mod layout;
 #[path = "../../firmware/src/palette.rs"]
 mod palette;
+#[path = "../../firmware/src/bigtext.rs"]
+mod bigtext;
 
 use embedded_graphics::{
     mono_font::{MonoFont, MonoTextStyle, MonoTextStyleBuilder},
@@ -456,6 +458,83 @@ fn assert_no_legacy_white_rules(d: &SimulatorDisplay<Rgb565>) {
     }
 }
 
+/// Recovery-word walkthrough, mirroring `oled::show_recovery_word`. The caption
+/// between the rule and the word is the whole point of previewing this screen:
+/// it must not collide with the FONT_10X20 word on any panel.
+fn draw_recovery_word<D: DrawTarget<Color = Rgb565>>(
+    d: &mut D,
+    index: usize,
+    total: usize,
+    word: &str,
+    role: &str,
+) {
+    let l = layout_of(d);
+    header(d, &l, &format!("WORD {index} OF {total}"));
+
+    if !role.is_empty() {
+        Text::new(role, Point::new(l.sx(2), l.sy(26)), style(l.font_small(), ACCENT))
+            .draw(d)
+            .ok();
+    }
+
+    let scale = l.word_scale();
+    let width = bigtext::scaled_text_width(word, l.font_large(), scale);
+    let x = l.center_x(width);
+    bigtext::draw_text_scaled(d, word, Point::new(x, l.sy(44)), l.font_large(), scale, FG);
+
+    let footer = if index >= total { "tap PRG to finish" } else { "tap PRG for next" };
+    Text::new(footer, Point::new(l.sx(2), l.sy(62)), style(l.font_small(), FG))
+        .draw(d)
+        .ok();
+}
+
+/// The one-off explainer shown before the walkthrough, mirroring
+/// `oled::show_recovery_prefix_notice`.
+fn draw_recovery_prefix_notice<D: DrawTarget<Color = Rgb565>>(d: &mut D) {
+    let l = layout_of(d);
+    header(d, &l, "BEFORE YOU WRITE");
+    let body = style(l.font_body(), FG);
+    Text::new("Words 1-7 are", Point::new(l.sx(4), l.sy(32)), body).draw(d).ok();
+    Text::new("format, not key.", Point::new(l.sx(4), l.sy(46)), body).draw(d).ok();
+    Text::new(
+        "Same start every time",
+        Point::new(l.sx(2), l.sy(60)),
+        style(l.font_small(), FG),
+    )
+    .draw(d)
+    .ok();
+}
+
+/// Restore word picker, mirroring `oled::show_word_entry`. Rendered here to
+/// judge how the big word, the subtitle and the legend actually sit on each
+/// panel — the legend is the widest fixed string on any Heartwood screen.
+fn draw_word_entry<D: DrawTarget<Color = Rgb565>>(
+    d: &mut D,
+    word_index: usize,
+    total: usize,
+    big_text: &str,
+    underline: bool,
+    subtitle: &str,
+    legend: &str,
+) {
+    let l = layout_of(d);
+    header(d, &l, &format!("WORD {word_index}/{total}"));
+
+    let scale = l.word_scale();
+    let width = bigtext::scaled_text_width(big_text, l.font_large(), scale);
+    let x = l.center_x(width);
+    bigtext::draw_text_scaled(d, big_text, Point::new(x, l.sy(40)), l.font_large(), scale, FG);
+    if underline {
+        Rectangle::new(Point::new(x, l.sy(43)), Size::new(width as u32, l.s(1) as u32))
+            .into_styled(PrimitiveStyle::with_fill(FG))
+            .draw(d)
+            .ok();
+    }
+
+    Text::new(subtitle, Point::new(l.sx(2), l.sy(54)), style(l.font_small(), FG)).draw(d).ok();
+    Text::new(legend, Point::new(l.sx(2), l.sy(62)), style(l.font_small(), FG)).draw(d).ok();
+}
+
 fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565>)) {
     let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
     d.clear(BG).ok();
@@ -484,6 +563,38 @@ fn main() {
         render(&format!("confirm-{b}"), w, h, |d| draw_confirm(d, 60));
         render(&format!("approved-{b}"), w, h, |d| draw_result(d, "APPROVED", OK));
         render(&format!("denied-{b}"), w, h, |d| draw_result(d, "DENIED", DANGER));
+        // The recovery walkthrough at its three captions, on every panel: the
+        // caption sits between the rule and the word and must clear both.
+        render(&format!("recovery-notice-{b}"), w, h, |d| {
+            draw_recovery_prefix_notice(d)
+        });
+        render(&format!("recovery-format-{b}"), w, h, |d| {
+            draw_recovery_word(d, 1, 19, "edge", "SAME ON EVERY KEY")
+        });
+        render(&format!("recovery-header-{b}"), w, h, |d| {
+            draw_recovery_word(d, 3, 19, "dolphin", "HEADER, NOT SECRET")
+        });
+        render(&format!("recovery-secret-{b}"), w, h, |d| {
+            draw_recovery_word(d, 19, 19, "tomorrow", "SECRET")
+        });
+        render(&format!("entry-letter-{b}"), w, h, |d| {
+            draw_word_entry(d, 3, 19, "dol", false, "14 words match", "tap=next   hold=back")
+        });
+        render(&format!("entry-word-{b}"), w, h, |d| {
+            draw_word_entry(d, 3, 19, "dolphin", true, "use this word", "tap=pick   hold=back")
+        });
+        render(&format!("entry-twobutton-{b}"), w, h, |d| {
+            let l = Layout::new(w as i32, h as i32);
+            let legend = if l.chars_per_line(l.font_small()) >= 34 {
+                "A/B move  holdB pick  holdA back"
+            } else {
+                "A/B move  holdA back"
+            };
+            draw_word_entry(d, 3, 19, "dolphin", true, "use this word", legend)
+        });
+        render(&format!("entry-longest-{b}"), w, h, |d| {
+            draw_word_entry(d, 3, 19, "announce", true, "use this word", "tap=pick   hold=back")
+        });
     }
 
     // Focused T-Display network-operation gallery. The transition case first

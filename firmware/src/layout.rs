@@ -129,6 +129,21 @@ impl Layout {
         &ascii::FONT_10X20
     }
 
+    /// Integer magnification for the ONE word a screen exists to show — a
+    /// recovery word being written down, or picked during a restore.
+    ///
+    /// The built-in ascii fonts stop at FONT_10X20, so [`Self::font_large`]
+    /// cannot grow on a colour panel: the same 20px glyphs that fill a third of
+    /// the 128x64 OLED occupy a fifteenth of the 172x320 C6. Scaling is bounded
+    /// by WIDTH, not height — the longest BIP-39 English word is 8 characters
+    /// and must still fit inside the side margins, which gives 1x on the mono
+    /// OLED and 2x on both colour panels.
+    pub fn word_scale(&self) -> i32 {
+        const LONGEST_WORD: i32 = 8;
+        let usable = self.w - self.sx(4) * 2;
+        (usable / (LONGEST_WORD * Self::glyph_w(self.font_large()))).clamp(1, 3)
+    }
+
     /// Glyph width of a mono font, for centring and character-fitting.
     pub fn glyph_w(font: &MonoFont) -> i32 {
         font.character_size.width as i32
@@ -171,6 +186,23 @@ mod tests {
         assert_eq!(l.sy(64), 134, "fills the 135 height — no letterbox");
         assert!(l.large_tier(), "240x135 uses the large font tier");
         assert_eq!(l.font_header().character_size.width, 10);
+    }
+
+    #[test]
+    fn word_scale_grows_on_colour_panels_and_always_fits_eight_glyphs() {
+        // The mono OLED must stay exactly as it was; the colour panels must
+        // grow. Whatever the scale, the longest BIP-39 word has to fit.
+        for (w, h, expected) in [
+            (128, 64, 1),
+            (240, 135, 2),
+            (172, 320, 2), // portrait C6: width-bound at 2x
+            (320, 172, 3), // landscape C6: 320px of width affords 3x
+        ] {
+            let l = Layout::new(w, h);
+            assert_eq!(l.word_scale(), expected, "{w}x{h} word scale");
+            let widest = 8 * Layout::glyph_w(l.font_large()) * l.word_scale();
+            assert!(widest <= w, "{w}x{h}: an 8-letter word ({widest}px) overflows");
+        }
     }
 
     #[test]

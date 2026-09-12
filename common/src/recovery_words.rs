@@ -22,6 +22,48 @@ use crate::types::MasterMode;
 pub const RECOVERY_WORDS_VERSION: u8 = 1;
 pub const RECOVERY_HEADER_WORDS: usize = 7;
 
+/// What a single word of a recovery sequence actually is, for screens that
+/// walk the owner through it one word at a time.
+///
+/// The header packs magic, version and kind before it reaches the fingerprint,
+/// so the first two words are the SAME on every ForgeSworn recovery sequence
+/// ever produced ("edge obtain"), and the third has only 32 possible values.
+/// An operator stepping through a fresh key sees an opening they have seen
+/// before and reads it as a repeated key. The device must say which words are
+/// format and which are secret, or it teaches its owner to distrust a good key
+/// (and, worse, to trust a genuinely repeated one once they learn to ignore
+/// the opening).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryWordRole {
+    /// Words 1-2: magic and version. Byte-identical on every sequence.
+    Format,
+    /// Words 3-7: kind, flags, public fingerprint, checksum. Derived from the
+    /// key but not secret; they catch a wrong passphrase or derivation.
+    Header,
+    /// Word 8 onwards: the BIP-39 payload. This is the key.
+    Secret,
+}
+
+/// Classify word `index` (1-based) of a `total`-word sequence.
+///
+/// Returns `None` when `total` is not a ForgeSworn envelope length (7 header
+/// words plus a 12- or 24-word BIP-39 payload) or `index` is out of range, so
+/// a caller handed a bare mnemonic labels nothing rather than labelling it
+/// wrongly.
+pub fn recovery_word_role(index: usize, total: usize) -> Option<RecoveryWordRole> {
+    if total != RECOVERY_HEADER_WORDS + 12 && total != RECOVERY_HEADER_WORDS + 24 {
+        return None;
+    }
+    if index < 1 || index > total {
+        return None;
+    }
+    Some(match index {
+        1..=2 => RecoveryWordRole::Format,
+        i if i <= RECOVERY_HEADER_WORDS => RecoveryWordRole::Header,
+        _ => RecoveryWordRole::Secret,
+    })
+}
+
 const MAGIC: u128 = 0x4653;
 const CHECKSUM_BITS: u32 = 17;
 const CHECKSUM_MASK: u128 = (1u128 << CHECKSUM_BITS) - 1;

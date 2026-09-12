@@ -40,6 +40,7 @@ compile_error!(
 
 mod approval;
 mod backup;
+mod bigtext;
 mod board;
 mod button;
 mod confirm;

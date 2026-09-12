@@ -11,17 +11,24 @@
 // boot. A hardware RNG that repeats a full 32-byte draw across resets is
 // broken (or a stub); provisioning refuses to generate keys in that state.
 //
+// A stuck RNG is only provably stuck once a draw REPEATS, so a boot with no
+// stored proof has nothing to compare against. That gap was written off as a
+// one-off "first boot after flashing" cost. It was not: factory reset erases
+// the whole NVS partition (`persistent_wipe::erase_all`), proof included, and
+// the boot straight afterwards is exactly the boot the owner provisions on. So
+// every generate-after-reset ran on the one boot where the check could not
+// fire. A boot with no proof therefore stores the draw and stays UNVERIFIED:
+// key generation waits for a second boot to prove the draw changed. That costs
+// one power-cycle after a reset or a flash, and buys a check that actually
+// covers the ceremony it exists for.
+//
 // Deliberate scope choices:
 //   - One NVS write per boot; wear is negligible.
-//   - First boot after flashing (no stored proof) passes and stores the draw:
-//     a factory-stuck RNG is only provably stuck once it repeats, i.e. from
-//     the second boot onwards. Commented here so the gap is audited, not
-//     discovered.
 //   - Failure does NOT brick the device: existing keys keep signing (their
 //     entropy is already spent), but NEW key/secret generation is gated on
 //     `rng_ok()` — fail closed exactly where fresh entropy matters.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use sha2::{Digest, Sha256};
@@ -29,13 +36,61 @@ use sha2::{Digest, Sha256};
 /// NVS blob key holding the SHA-256 of last boot's self-test draw.
 const NVS_RNG_PROOF_KEY: &str = "rng_proof";
 
+/// Outcome of the boot-time RNG self-test. Only [`RngState::Verified`] permits
+/// fresh key or secret generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RngState {
+    /// This boot's draw differs from the previous boot's. Generation allowed.
+    Verified,
+    /// No previous draw to compare against (first boot after a flash or a
+    /// factory reset). The proof is stored; one more boot proves the draw
+    /// changes. Generation refused, and it is NOT a fault.
+    NeedsSecondBoot,
+    /// The draw was constant, repeated last boot's, or the proof could not be
+    /// read or written. Generation refused.
+    Failed,
+}
+
+impl RngState {
+    /// One line fit for a NACK payload and an operator log.
+    pub fn refusal(self) -> &'static str {
+        match self {
+            Self::Verified => "",
+            Self::NeedsSecondBoot => {
+                "RNG continuity unverified after a wipe: power-cycle the signer once, then retry"
+            }
+            Self::Failed => "RNG self-test failed this boot — refusing to mint key material",
+        }
+    }
+}
+
 /// Set by [`boot_self_test`]; read by every fresh-entropy generation path.
-static RNG_OK: AtomicBool = AtomicBool::new(false);
+/// Starts at `Failed` so a self-test that never ran cannot mint anything.
+static RNG_STATE: AtomicU8 = AtomicU8::new(STATE_FAILED);
+
+const STATE_FAILED: u8 = 0;
+const STATE_NEEDS_SECOND_BOOT: u8 = 1;
+const STATE_VERIFIED: u8 = 2;
+
+/// The boot-time RNG self-test outcome.
+pub fn rng_state() -> RngState {
+    match RNG_STATE.load(Ordering::Relaxed) {
+        STATE_VERIFIED => RngState::Verified,
+        STATE_NEEDS_SECOND_BOOT => RngState::NeedsSecondBoot,
+        _ => RngState::Failed,
+    }
+}
 
 /// Whether the boot-time RNG self-test passed. Key generation must refuse
 /// to run when this is false.
 pub fn rng_ok() -> bool {
-    RNG_OK.load(Ordering::Relaxed)
+    rng_state() == RngState::Verified
+}
+
+/// Why generation is being refused, for screens and NACK payloads. Empty when
+/// nothing is being refused.
+pub fn rng_refusal() -> &'static str {
+    rng_state().refusal()
 }
 
 /// Draw 32 bytes from the guaranteed entropy source and verify the hardware
@@ -58,7 +113,7 @@ pub fn boot_self_test(nvs: &mut EspNvs<NvsDefault>) {
     draw.iter_mut().for_each(|b| *b = 0);
 
     let mut previous = [0u8; 32];
-    match nvs.get_blob(NVS_RNG_PROOF_KEY, &mut previous) {
+    let compared = match nvs.get_blob(NVS_RNG_PROOF_KEY, &mut previous) {
         Ok(Some(bytes)) if bytes.len() == 32 => {
             if previous == hash {
                 log::error!(
@@ -66,18 +121,20 @@ pub fn boot_self_test(nvs: &mut EspNvs<NvsDefault>) {
                 );
                 return;
             }
+            true
         }
         Ok(_) => {
-            // First boot after flashing (or an empty/corrupt slot): nothing to
-            // compare against yet — store and pass.
-            log::info!("RNG self-test: no previous draw recorded, seeding proof");
+            // First boot after a flash or a factory reset (or an empty/corrupt
+            // slot): nothing to compare against. Store the proof, but do NOT
+            // pass — this is the boot an owner provisions on.
+            false
         }
         Err(e) => {
             // Unreadable proof means we can never verify continuity — fail closed.
             log::error!("RNG self-test FAILED: proof unreadable ({e}) — refusing key generation");
             return;
         }
-    }
+    };
 
     if let Err(e) = nvs.set_blob(NVS_RNG_PROOF_KEY, &hash) {
         // If we can't persist the proof, the NEXT boot can't verify
@@ -86,7 +143,16 @@ pub fn boot_self_test(nvs: &mut EspNvs<NvsDefault>) {
         return;
     }
 
-    RNG_OK.store(true, Ordering::Relaxed);
+    if !compared {
+        RNG_STATE.store(STATE_NEEDS_SECOND_BOOT, Ordering::Relaxed);
+        log::warn!(
+            "RNG self-test: no previous draw to compare against, proof seeded. \
+             Power-cycle once before generating keys."
+        );
+        return;
+    }
+
+    RNG_STATE.store(STATE_VERIFIED, Ordering::Relaxed);
     log::info!("RNG self-test passed");
 }
 

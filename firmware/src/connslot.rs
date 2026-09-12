@@ -50,9 +50,11 @@ pub fn handle_create(
         protocol::write_frame(usb, FRAME_TYPE_NACK, BRIDGE_AUTH_REQUIRED);
     } else if !crate::entropy::rng_ok() {
         // Fresh secrets need fresh entropy — fail closed if the boot-time
-        // RNG self-test didn't pass.
-        log::error!("CONNSLOT_CREATE refused: RNG self-test failed this boot");
-        protocol::write_frame(usb, FRAME_TYPE_NACK, b"RNG self-test failed");
+        // RNG self-test didn't pass. The reason distinguishes a real fault
+        // from the power-cycle a post-wipe boot owes us.
+        let why = crate::entropy::rng_refusal();
+        log::error!("CONNSLOT_CREATE refused: {why}");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, why.as_bytes());
     } else if frame.payload.is_empty() {
         log::warn!("CONNSLOT_CREATE missing master_slot");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);

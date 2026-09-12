@@ -1613,6 +1613,57 @@ landed late and short ones could be missed. Obstacles now spawn about every
 5. The seed the board then generates is still accepted, and the log still
    reports the press count it collected.
 
+## 22. The RNG gate and the recovery-word labels (added 2026-09-12, NOT YET BENCH-RUN)
+
+Two findings from a field report where a fresh key looked like a repeat of the
+last one.
+
+The boot RNG self-test compares this boot's draw against a hash stored in NVS
+from the previous boot, but a factory reset erases that proof along with
+everything else — and the boot straight after a reset is exactly the boot an
+owner provisions on. A post-wipe boot now seeds the proof and stays
+UNVERIFIED: signing continues, minting refuses until one more boot proves the
+draw changed.
+
+Separately, every ForgeSworn recovery sequence opens "edge obtain" because
+magic and version fill the first two words entirely. Walking a fresh phrase
+therefore starts identically to every phrase the board has ever shown, which
+reads as a stuck RNG. The walk now names what each word is, after a one-off
+screen that says so before the words start.
+
+1. **A wipe costs one power-cycle.** Factory reset a board. When it comes back,
+   ask for a new identity over the cable. It must refuse with `Power-cycle
+   once / then generate` on the screen and a NACK naming the same reason —
+   NOT `RNG self-test failed`, which means a fault.
+2. **The second boot clears it.** Power-cycle, check the serial log for `RNG
+   self-test passed`, then generate. It proceeds.
+3. **Signing never stopped.** Between items 1 and 2, an existing master still
+   signs. The gate covers new key material only.
+4. **A genuinely stuck RNG is still caught.** Two ordinary reboots with no
+   wipe must log `RNG self-test passed` both times. If a board ever logs
+   `draw identical to last boot`, stop and treat every key it generated as
+   reproducible.
+5. **Slot secrets are gated too.** On the post-wipe boot, `CONNSLOT_CREATE`
+   and the relay's `create_client` both refuse with the power-cycle reason.
+6. **The prefix notice appears once.** Generate an identity: before word 1
+   the screen reads `BEFORE YOU WRITE / Words 1-7 are format, not key. / Same
+   start every time`, and a tap moves on. Restarting the review from the
+   final confirm shows it again.
+7. **Each word is captioned.** Words 1-2 read `SAME ON EVERY KEY`, words 3-7
+   `HEADER, NOT SECRET`, words 8+ `SECRET`. Words 1 and 2 really are `edge`
+   and `obtain`; word 3 is a `d`-word.
+8. **The caption never touches the word.** Check on whichever panel the board
+   has. `ui-preview` renders all three, but confirm on glass.
+9. **The word is bigger on a colour panel.** On a T-Display or C6, the word in
+   both the write-down walk and the restore picker is drawn at 2x (3x on a
+   landscape C6). On the 128x64 OLED it must look exactly as it did before.
+   Check the longest case: restore a phrase containing an 8-letter word such
+   as `announce` and confirm it neither overflows nor is clipped.
+10. **The picker legend fits.** On a two-button board, the legend under the
+    subtitle reads in full with nothing cut off at the right edge or the
+    bottom row. On a narrow panel it reads `A/B move  holdA back` and the
+    pick gesture appears in the subtitle instead.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

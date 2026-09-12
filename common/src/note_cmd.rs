@@ -924,9 +924,16 @@ fn gated_by_id(
 // ---- relay-path mapping (heartwood_note_* NIP-46 extensions) ----
 
 /// The note methods served over the relay path, in the order the
-/// capabilities advert lists them. Rename/delete are deliberately absent:
-/// housekeeping stays a USB-cable operation.
-pub const NOTE_METHODS: [&str; 13] = [
+/// capabilities advert lists them.
+///
+/// `delete` is deliberately absent, and staying absent (#96): `MAX_SPENT`
+/// caps spent records at the spend transition and every creation path makes
+/// room out of the oldest one, so the record a `delete` would remove is
+/// about to age out anyway and no locker can wedge on them. `rename` is not
+/// the same question: it touches a LIVE note, a label is what a wallet's
+/// list shows, and no amount of pruning corrects one typed wrong, so it is
+/// served here rather than left cable-only on a tier that has no cable.
+pub const NOTE_METHODS: [&str; 14] = [
     "heartwood_note_list",
     "heartwood_note_new",
     "heartwood_note_new_pair",
@@ -936,6 +943,7 @@ pub const NOTE_METHODS: [&str; 13] = [
     "heartwood_note_import",
     "heartwood_note_spent",
     "heartwood_note_send",
+    "heartwood_note_rename",
     "heartwood_note_trust",
     "heartwood_note_trusted",
     "heartwood_note_address",
@@ -1004,6 +1012,9 @@ pub fn note_cmd_for_method(method: &str, params: &[Value]) -> Result<Value, &'st
         "heartwood_note_import" => "import_secret",
         "heartwood_note_spent" => "mark_spent",
         "heartwood_note_send" => "send",
+        // The SAME wire command the cable runs, so the label rules, the
+        // gate and the card wording cannot drift between the two surfaces.
+        "heartwood_note_rename" => "rename",
         "heartwood_note_trust" => "trust",
         "heartwood_note_trusted" => "list_trusted",
         "heartwood_note_address" => "cash_address",
@@ -1207,6 +1218,16 @@ mod tests {
             ));
             assert_eq!(res["ok"], true, "{res}");
             id
+        }
+
+        /// Run a request the way the relay path runs one: a
+        /// `heartwood_note_*` method and its `params[0]` object, mapped onto
+        /// the wire command by `note_cmd_for_method` and then dispatched.
+        /// Nothing here re-implements a command; that both surfaces reach
+        /// the same arm is the property being tested.
+        fn run_method(&mut self, method: &str, params: Value) -> Value {
+            let cmd = note_cmd_for_method(method, &[params]).expect("method maps");
+            self.run(&cmd.to_string())
         }
 
         /// Power-cycle the device. The store is NVS-backed and survives; the
@@ -1767,6 +1788,102 @@ mod tests {
         assert_eq!(h.store.get_meta(&id).unwrap().label, "b");
     }
 
+    // ---- rename over the relay (#96) ----
+    //
+    // A WiFi-standalone board NACKs the whole 0x70 surface, so until now a
+    // label typed wrong on that tier could not be corrected by any route.
+    // The method maps onto the SAME wire command the cable runs, so these
+    // pin the properties the mapping must not lose.
+
+    #[test]
+    fn a_relay_rename_applies_on_approval_and_shows_in_the_next_list() {
+        // The client contract, verbatim: method `heartwood_note_rename`,
+        // params `[{id, label}]`, `{"ok":true}`.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        let res = h.run_method("heartwood_note_rename", json!({"id": id, "label": "holiday"}));
+        assert_eq!(res, json!({"ok": true}), "{res}");
+        assert_eq!(h.asked, vec![(GatedCmd::Rename, id.clone())]);
+        // A list is the only place a label is ever read back (the device
+        // never draws one), so this is the whole observable effect.
+        let listed = h.run_method("heartwood_note_list", json!({}));
+        let note = listed["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == id.as_str())
+            .expect("the note is listed")
+            .clone();
+        assert_eq!(note["label"], "holiday");
+    }
+
+    #[test]
+    fn a_declined_relay_rename_changes_nothing() {
+        let mut h = Harness::new();
+        let id = h.confirmed_note(); // labelled "float"
+        h.answer = Approval::Declined;
+        let res = h.run_method("heartwood_note_rename", json!({"id": id, "label": "holiday"}));
+        assert_eq!(res["error"], "user_declined");
+        assert_eq!(h.asked, vec![(GatedCmd::Rename, id.clone())]);
+        assert_eq!(h.store.get_meta(&id).unwrap().label, "float");
+    }
+
+    #[test]
+    fn a_relay_rename_the_device_would_refuse_never_raises_a_card() {
+        // Same rule as the cable, for the same reason: a card for a command
+        // that could never run teaches the owner to press without reading.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        let long = "x".repeat(crate::note_store::MAX_LABEL_LEN + 1);
+        for params in [
+            json!({"id": id, "label": long}),
+            json!({"id": id}),             // no label at all
+            json!({"id": id, "label": 7}), // not a string
+        ] {
+            let res = h.run_method("heartwood_note_rename", params.clone());
+            assert_eq!(res["error"], "bad_request", "{params}");
+        }
+        assert!(h.asked.is_empty(), "a label the device refuses raised a card");
+        assert_eq!(h.store.get_meta(&id).unwrap().label, "float");
+        // The length boundary itself is accepted, and costs a hold like any
+        // other rename; so does clearing the label with an empty string.
+        let max = "y".repeat(crate::note_store::MAX_LABEL_LEN);
+        let res = h.run_method("heartwood_note_rename", json!({"id": id, "label": max}));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.asked.len(), 1);
+        let res = h.run_method("heartwood_note_rename", json!({"id": id, "label": ""}));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(h.store.get_meta(&id).unwrap().label, "");
+    }
+
+    #[test]
+    fn a_relay_rename_never_rides_a_spend_grant() {
+        // #129 buys exactly one thing: the mark_spent that finishes a
+        // collect. A rename of the SAME note, from the SAME client, inside
+        // the window still asks, and the grant is still there afterwards
+        // for the spend mark it was earned for.
+        let mut h = Harness::new();
+        let id = h.confirmed_note();
+        let res = h.run_method("heartwood_note_export", json!({"id": id}));
+        assert!(res["k1"].is_string(), "{res}");
+        assert_eq!(h.grant.len(), 1);
+        h.asked.clear();
+
+        let res = h.run_method("heartwood_note_rename", json!({"id": id, "label": "collected"}));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(
+            h.asked,
+            vec![(GatedCmd::Rename, id.clone())],
+            "the rename rode the export's hold"
+        );
+        assert_eq!(h.grant.len(), 1, "the rename spent the grant");
+
+        h.asked.clear();
+        assert_eq!(h.run_method("heartwood_note_spent", json!({"id": id}))["ok"], true);
+        assert!(h.asked.is_empty(), "the spend mark it was granted for asked anyway");
+        assert_eq!(h.grant.len(), 0);
+    }
+
     #[test]
     fn list_limit_is_clamped() {
         let mut h = Harness::new();
@@ -1883,6 +2000,10 @@ mod tests {
             ("heartwood_note_spent", true),
             ("heartwood_note_discard", true),
             ("heartwood_note_send", true),
+            // #96: a rename touches a live note, so it answers the button
+            // like the rest of the mutating set, and, being pinned here,
+            // can never be covered by a #129 spend grant either.
+            ("heartwood_note_rename", true),
             ("heartwood_note_list", false),
             ("heartwood_note_new", false),
             ("heartwood_note_new_pair", false),
@@ -1894,6 +2015,10 @@ mod tests {
                 gated,
                 "{method}"
             );
+            // Advertised and round-tripping: a method the enum parses but
+            // the advert omits is one no wallet ever finds.
+            assert!(NOTE_METHODS.contains(&method), "{method}");
+            assert_eq!(Nip46Method::from_str(method).as_str(), method);
         }
     }
 

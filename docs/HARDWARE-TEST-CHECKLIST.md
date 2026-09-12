@@ -1444,15 +1444,52 @@ grant is entirely device-side.
    is untouched by B's attempt.)
 6. Never widens: with a note just exported and its grant live,
    `heartwood_note_send` for that same note still raises a SEND NOTE card, and
-   over the cable a `rename` of it still raises RENAME NOTE. (`discard` and
-   `delete` need a PENDING and a SPENT note respectively, so they cannot share
-   an export's grant at all; neither is ever covered by one.)
+   so does a rename of it (`heartwood_note_rename` over the relay, `rename`
+   over the cable): RENAME NOTE, every time. (`discard` and `delete` need a
+   PENDING and a SPENT note respectively, so they cannot share an export's
+   grant at all; neither is ever covered by one.)
 7. Batch: `heartwood collect` with several notes held (up to eight, which is
    `approval_queue::MAX_BATCH` and already the cap on one card). Expect ONE
    hold for the release of all of them and NO second card for the write-offs,
    where it used to be two holds. The grant table holds exactly one card's
    worth, so it is never the binding limit; a ninth ask is refused `busy` at
    the release stage as it always was.
+
+## 18. Renaming a note over the relay (#96; added 2026-09-12, NOT YET BENCH-RUN)
+
+`rename` was cable-only, and a WiFi-standalone board NACKs the whole 0x70
+surface, so on that tier a label typed wrong could not be corrected by any
+route. `heartwood_note_rename` maps onto the same wire command the cable runs,
+so this is checking the relay wrapper, not the rename.
+
+Drive it with `notecase heartwood rename <id> <label>` from a bound slot, or
+with the scripts/nip46-client.mjs conventions.
+
+1. Rename a CONFIRMED note. Expect a RENAME NOTE card showing that note's
+   amount and mint (the new label is deliberately not on the card: the device
+   never draws a label, and the decision is that this note's label changes),
+   one hold, `{"ok":true}`, and the new label in the next
+   `heartwood_note_list`. Watch the OLED, not only the CLI.
+2. Decline it, and let one time out. Both answer as errors and the label is
+   unchanged in the next list.
+3. A label the device refuses (33 bytes or more) must answer `bad_request`
+   with NO card at any point. This is the one that matters: the validation
+   runs before the prompt so a hold is never spent on a command that could
+   never land.
+4. Any state: repeat item 1 on a PENDING note (the card names it by id, since
+   a pending note has no confirmed amount yet) and on a SPENT record. Both
+   rename.
+5. Pinned always-ask: repeat item 1 on a slot whose policy names
+   `heartwood_note_rename` with auto-approve. The card MUST still appear.
+6. Never on a grant: see section 17 item 6. A rename inside a live export
+   grant still raises its own card, and the grant survives for the spend mark.
+7. Unbound client: `heartwood_note_rename` from a client with no slot gets
+   `unauthorised`, like every other note method.
+8. USB tier unchanged: on a USB-bridged board, `node scripts/note-cmd.mjs
+   --port ... '{"cmd":"rename","id":"...","label":"..."}'` behaves exactly as
+   before, and a direct-USB NIP-46 `heartwood_note_rename` (no bound client)
+   answers `unauthorised`: the relay methods serve bound clients, the cable
+   has the frame.
 
 ## Notes
 

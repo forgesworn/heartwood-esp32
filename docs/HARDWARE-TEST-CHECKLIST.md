@@ -12,6 +12,19 @@ Heltec boards this is a 2-second hold of **PRG**.
 Sections 1–5 and 7 are the ESP32 WiFi signer; **§6 is the USB-tethered ESP8266**
 (NodeMCU+OLED) — a different device and flow, with its own board and gestures.
 
+**Reading the device log.** A standard build prints no log at all. The console
+is compiled out on every board (`CONFIG_ESP_CONSOLE_NONE`; the V4 also needs
+`CONFIG_ESP_CONSOLE_SECONDARY_NONE`, since #113 on 2026-09-06), because log
+bytes on the USB port corrupt the frame protocol. `scripts/serial-log.mjs`
+therefore shows nothing on a standard build. Where a step below quotes a log
+line, it is extra detail visible only on a bench build with the console routed
+to a UART probe on spare GPIOs (`CONFIG_ESP_CONSOLE_UART_DEFAULT=y` in the
+board's `sdkconfig.defaults.*`; never USB-Serial-JTAG, which carries the
+frames). Each step also names what you can observe without one: the panel,
+FIRMWARE_INFO, `heartwood_note_list`, or relay traffic via
+`scripts/fetch-events.mjs`. Bench records dated before 2026-09-06 quote log
+lines that did reach USB at the time; they are accurate for their date.
+
 ## Bench record — 2026-07-12 T-Display
 
 Non-destructive checks completed on a provisioned classic ESP32-D0WDQ6
@@ -393,8 +406,8 @@ Approval flow (both boards):
       progress bar; tapping the upper (GPIO 35) button shows CANCELLED and
       Sapwood reports the denial.
 - [ ] T-Display clone check: on a board whose GPIO 35 floats (no external
-      pull-up), boot logs "leaving it unregistered" and approvals behave
-      single-button — B must never self-cancel prompts.
+      pull-up), approvals behave single-button — B must never self-cancel
+      prompts. (A console build also logs "leaving it unregistered" at boot.)
 - [ ] After a Sapwood web flash, without replugging: the display wakes on a
       button PRESS (not release) and the device never looks dead while the
       serial bridge holds GPIO 0.
@@ -410,8 +423,9 @@ Multi-network WiFi (T-Display or Heltec in WiFi mode):
       second AP), reorder them, save, and read back: the list survives the
       reboot and the redacted state shows ssid + password_set only.
 - [ ] Power the primary AP off. The signer rotates to the hotspot within a few
-      retry cycles (~10 s/candidate) and comes online; logs name each
-      candidate as "wifi network N/M".
+      retry cycles (~10 s/candidate) and comes online — Sapwood and paired apps
+      reach it again. (A console build also names each candidate as "wifi
+      network N/M".)
 - [ ] Promote a fallback to primary in Sapwood using its saved password (no
       password typed). The device joins it after reboot.
 - [ ] Encrypted-at-rest + WiFi: with the vault locked, the device now joins
@@ -1146,8 +1160,9 @@ scripts/nip46-client.mjs conventions):
     the batch. Sends to different recipients never share a card. Verify:
     collect three notes from the web wallet; the card must name `3 NOTES`
     and the sum before you hold, then `SPEND 3 NOTES` the same way. The
-    serial log now prints the wording each join produced, so this is
-    checkable without eyes on the panel. Seen on the v4 board 2026-08-21
+    firmware logs the wording each join produced, but since #113 that log
+    reaches only a console build, so on a standard build this needs eyes on
+    the panel. Seen on the v4 board 2026-08-21
     21:27 UTC, and the hold that followed answered both asks:
     `joins the open approval card (2 asks); card reads 'RELEASE 2 NOTES'
     / '24 sats @ mint.forgesworn.dev/w'`.
@@ -1237,15 +1252,16 @@ notecase `heartwood send`.
    `since`. The keepalive re-REQ 40 s later must be back to `"limit":0`.
 3. Not for us: a wrap to a persona pubkey, a kind-14 DM whose text has no
    note (or two), a wrap whose rumor claims a different author than the
-   seal signer, and a rumor whose URL has no amount. Expect: silent drop
-   with one `[relay] gift wrap ... not for us / is not a note` log line,
-   no card, no wake.
+   seal signer, and a rumor whose URL has no amount. Expect: silent drop —
+   no card, no wake, and nothing new in `heartwood_note_list`. (A console build
+   also logs one `[relay] gift wrap ... not for us / is not a note` line.)
 2b. Trusted sender: `notecase heartwood trust <mint npub>` puts up a
    TRUST SENDER card (npub, both ends visible); hold. `heartwood trusted`
    lists it; it survives a reboot. A wrap sealed by that key now stores
    on arrival with NO card: a three-second "N sats received / from
-   <host>" toast, `note ... received from trusted sender` in the log, and
-   the ledger has it (reboot: no re-offer). A wrap from anyone else still
+   <host>" toast, and
+   the ledger has it — `heartwood_note_list` shows it (reboot: no re-offer). A
+   console build also logs `note ... received from trusted sender`. A wrap from anyone else still
    gets the card. A trusted sender is not bound by the 4-note letterbox,
    only by the locker's 16, and a spent record is not a note: with the
    locker full of spent notes, the next received note evicts the oldest
@@ -1271,7 +1287,8 @@ notecase `heartwood send`.
    RECEIVE card each time, with the sender's npub on it. A DM carrying two
    notes is dropped (`more than one note in the message`).
 4. Letterbox cap: with MAX_RECEIVED (4) received notes held, a fifth wrap
-   logs `letterbox full; dropped until there is room` and raises no card.
+   raises no card and `heartwood_note_list` still shows four received notes. (A
+   console build also logs `letterbox full; dropped until there is room`.)
    Mark one spent over the relay: WITHOUT sending again, the catch-up
    re-runs and the fifth wrap's card comes up on its own. Also: two wraps
    in quick succession raise ONE card (`a note is already waiting on the
@@ -1341,9 +1358,9 @@ from a bound slot and a mint that pays names to keys (moneyer >= 0.13.1).
    the note is still listed with its `p` and `index` (a v3 blob; a plain note
    written before this is still v2 and still reads).
 5. Not ours: a wrap whose `p` is some other key (edit the index, or wrap a
-   note paid to another npub's branch) logs `is not a note: that note is paid
-   to a key this device does not hold`, raises no card, and is not offered
-   again.
+   note paid to another npub's branch) raises no card, does not appear in
+   `heartwood_note_list`, and is not offered again. (A console build also logs
+   `is not a note: that note is paid to a key this device does not hold`.)
 6. Lost wrap: pay the name while the device is powered off, then delete the
    wrap from the relays (or pay a second name pointed at the same `cx1` with
    no relay reachable). `heartwood address scan --mint <host>` reports the
@@ -1508,9 +1525,10 @@ join loop come back. `scripts/nip46-client.mjs` drives the calls.
    note, hold the button, and force the reconnect within a second or two of
    the card resolving (drop the AP as the "approved" screen appears). Expect
    the reply to arrive once the device is back on a relay, inside the 60 s
-   window, and the wallet to report the `ck1` rather than a timeout. The
-   serial log says `held for the next session` then `delivered on a later
-   session`.
+   window, and the wallet to report the `ck1` rather than a timeout. On a
+   standard build the wallet reporting the `ck1` after the reconnect is the
+   evidence; a console build also logs `held for the next session` then
+   `delivered on a later session`.
 2. **Delivered once.** Same run: watch for exactly one reply event. A second
    flush pass must not republish it, and `heartwood_note_list` must show one
    note, still CONFIRMED (an export mutates nothing).
@@ -1520,8 +1538,8 @@ join loop come back. `scripts/nip46-client.mjs` drives the calls.
    answer waits; before this change the card resolved, the OLED said
    approved, and nothing at all was dispatched.
 4. **It expires.** Repeat item 1 but keep the device off the air for more
-   than 60 s. The reply is dropped (`expired undelivered` in the log), the
-   wallet times out, and the note is still CONFIRMED, so asking again works.
+   than 60 s. The reply is dropped (a console build logs `expired undelivered`),
+   the wallet times out, and the note is still CONFIRMED, so asking again works.
    Nothing must be published after the window.
 5. **A reboot loses it.** Approve an export, force the reconnect, and RESET
    the board before it comes back. Nothing is published after boot and no
@@ -1545,8 +1563,11 @@ join loop come back. `scripts/nip46-client.mjs` drives the calls.
    that, the SPEND NOTE card is back, which is the safe direction.
 10. **The secondary carries it.** With two relays live (§16), break only the
     primary as a card resolves. The reply should go straight out on the
-    secondary with no hold at all: the log shows `would not take the reply`
-    for the dead one and a normal publish line, and no `held` line.
+    secondary with no hold at all. Watch it with `node scripts/fetch-events.mjs
+    --live --relay <secondary> --filter '{"kinds":[24133]}'` (NIP-46 replies
+    are ephemeral, so only a live subscription sees them): the reply lands as
+    the card resolves, not after a reconnect. A console build also logs
+    `would not take the reply` for the dead relay, and no `held` line.
 
 ## 20. The spend grant starts at the handover (#137; added 2026-09-12, NOT YET BENCH-RUN)
 
@@ -1573,8 +1594,9 @@ AP to break the session.
    CONFIRMED and still exportable.
 4. **A delivered held reply does grant.** Export, force a reconnect short
    enough that the flush lands (section 19 item 1), then mark spent within two
-   minutes of the *delivery*. No card. The log shows `delivered on a later
-   session` before the spend mark.
+   minutes of the *delivery*. No card. Evidence on a standard build: the wallet
+   reports the `ck1` after the reconnect, and only then is the spend mark sent
+   (a console build also logs `delivered on a later session` first).
 5. **The window runs from the handover.** Repeat item 4 but let the reply sit
    held for most of a minute before the flush. The write-off must still be
    free for a full two minutes after it arrives, not two minutes after the

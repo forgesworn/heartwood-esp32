@@ -36,12 +36,17 @@ use sha2::{Digest, Sha256};
 /// NVS blob key holding the SHA-256 of last boot's self-test draw.
 const NVS_RNG_PROOF_KEY: &str = "rng_proof";
 
-pub use heartwood_common::entropy::RngState;
-use heartwood_common::entropy::{self_test_outcome, ProofLookup};
+pub use heartwood_common::entropy::{RngState, SelfTestCause};
+use heartwood_common::entropy::{self_test_cause, self_test_outcome, ProofLookup};
 
 /// Set by [`boot_self_test`]; read by every fresh-entropy generation path.
 /// Starts at `Failed` so a self-test that never ran cannot mint anything.
 static RNG_STATE: AtomicU8 = AtomicU8::new(STATE_FAILED);
+
+/// Why the self-test reached `RNG_STATE`, reported in FIRMWARE_INFO. The log
+/// line saying the same thing never leaves the chip: the console is compiled
+/// out on every board so it cannot corrupt the frame protocol.
+static RNG_CAUSE: AtomicU8 = AtomicU8::new(0); // SelfTestCause::NotRun
 
 const STATE_FAILED: u8 = 0;
 const STATE_NEEDS_SECOND_BOOT: u8 = 1;
@@ -65,6 +70,11 @@ pub fn rng_state() -> RngState {
         STATE_NEEDS_SECOND_BOOT => RngState::NeedsSecondBoot,
         _ => RngState::Failed,
     }
+}
+
+/// Why the self-test reached its state. `NotRun` until it has.
+pub fn rng_cause() -> SelfTestCause {
+    SelfTestCause::from_u8(RNG_CAUSE.load(Ordering::Relaxed))
 }
 
 /// Whether the boot-time RNG self-test passed. Key generation must refuse
@@ -94,7 +104,8 @@ pub fn boot_self_test(nvs: &mut EspNvs<NvsDefault>) {
     draw.iter_mut().for_each(|b| *b = 0);
 
     if draw_constant {
-        finish(RngState::Failed, "constant draw");
+        // Nothing to read or store: the draw itself is the finding.
+        finish(true, ProofLookup::Absent, None);
         return;
     }
 
@@ -129,25 +140,17 @@ pub fn boot_self_test(nvs: &mut EspNvs<NvsDefault>) {
         }
     };
 
-    // Name the reason the operator actually needs. A failed write outranks the
-    // lookup: "no previous draw" would be true and useless when the real fault
-    // is that this boot's proof did not persist.
-    let why = if stored == Some(false) {
-        "proof write failed"
-    } else {
-        match proof {
-            ProofLookup::Matched => "draw identical to last boot",
-            ProofLookup::Absent => "no previous draw to compare against",
-            ProofLookup::Unreadable => "proof unreadable",
-            ProofLookup::Differed => "draw moved",
-        }
-    };
-    finish(self_test_outcome(draw_constant, proof, stored), why);
+    finish(false, proof, stored);
 }
 
-/// Record the outcome and say what happened once, in one voice.
-fn finish(state: RngState, why: &str) {
+/// Decide state and cause from the same three facts, record both, and say what
+/// happened once, in one voice.
+fn finish(draw_constant: bool, proof: ProofLookup, stored: Option<bool>) {
+    let state = self_test_outcome(draw_constant, proof, stored);
+    let cause = self_test_cause(draw_constant, proof, stored);
     store_state(state);
+    RNG_CAUSE.store(cause.to_u8(), Ordering::Relaxed);
+    let why = cause.message();
     match state {
         RngState::Verified => log::info!("RNG self-test passed ({why})"),
         RngState::NeedsSecondBoot => log::warn!(

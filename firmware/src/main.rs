@@ -120,6 +120,13 @@ use secp256k1::Secp256k1;
 
 /// JSON for a FIRMWARE_INFO_RESPONSE — the running firmware version, board,
 /// uptime, why the chip last reset, the signing size ceiling, and live heap.
+///
+/// `rng` and `rng_cause` carry the boot RNG self-test result. They are the ONLY
+/// way to read it: the log console is compiled out on every board (log bytes
+/// would interleave with this very frame protocol), so `RNG self-test passed`
+/// is never seen. A client that needs to know whether a board's keys are
+/// trustworthy branches on `rng_cause` — `draw_repeated` or `constant_draw`
+/// implicate the RNG itself; the proof_* causes are storage faults.
 /// Read-only and secret-free, so it is answered over USB in any mode. The reset
 /// reason lets a manager (and an alpha tester) tell a deliberate restart from a
 /// crash.
@@ -162,12 +169,15 @@ pub fn firmware_info_json() -> String {
         .unwrap_or_default();
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
+         \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
          \"free_heap\":{},\"largest_block\":{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
         reset_reason_str(),
+        entropy::rng_state().wire(),
+        entropy::rng_cause().wire(),
         board::MAX_SIGN_BYTES,
         board::MAX_SIGN_BYTES_OBJECT,
         free_heap,

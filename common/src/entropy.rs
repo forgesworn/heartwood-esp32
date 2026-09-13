@@ -55,6 +55,131 @@ impl RngState {
     pub fn allows_generation(self) -> bool {
         matches!(self, Self::Verified)
     }
+
+    /// Token for FIRMWARE_INFO's `rng` field. Clients branch on these, so they
+    /// are wire contract: add new ones, never rename or reuse one.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::NeedsSecondBoot => "needs_second_boot",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Why the self-test reached its state.
+///
+/// Reported beside [`RngState`] because the states alone conflate two very
+/// different failures. A repeated or constant draw means the hardware RNG is
+/// stuck and every key the board generated may be reproducible. An unreadable
+/// or unwritable proof is a storage fault that says nothing about the RNG at
+/// all. A client that saw only `failed` would have to treat an NVS glitch as a
+/// key compromise, or a key compromise as an NVS glitch.
+///
+/// This exists because the firmware's log console is compiled out on every
+/// board (log bytes would interleave with the frame protocol on the same USB
+/// port), so the `log::` line naming the cause never reaches anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfTestCause {
+    /// The self-test has not run yet this boot.
+    NotRun,
+    /// Compared against the previous boot's proof and the draw moved.
+    DrawMoved,
+    /// No proof to compare against: first boot after a flash or a wipe.
+    NoPreviousDraw,
+    /// Identical to the previous boot's draw. The RNG is stuck.
+    DrawRepeated,
+    /// Every byte of the draw was the same. The entropy source is dead.
+    ConstantDraw,
+    /// The stored proof could not be read. Storage fault; RNG unknown.
+    ProofUnreadable,
+    /// This boot's proof could not be stored. Storage fault; RNG unknown.
+    ProofWriteFailed,
+}
+
+impl SelfTestCause {
+    /// Token for FIRMWARE_INFO's `rng_cause` field. Wire contract, as for
+    /// [`RngState::wire`].
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::NotRun => "not_run",
+            Self::DrawMoved => "draw_moved",
+            Self::NoPreviousDraw => "no_previous_draw",
+            Self::DrawRepeated => "draw_repeated",
+            Self::ConstantDraw => "constant_draw",
+            Self::ProofUnreadable => "proof_unreadable",
+            Self::ProofWriteFailed => "proof_write_failed",
+        }
+    }
+
+    /// Operator-facing phrase for the boot log.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotRun => "self-test not run",
+            Self::DrawMoved => "draw moved",
+            Self::NoPreviousDraw => "no previous draw to compare against",
+            Self::DrawRepeated => "draw identical to last boot",
+            Self::ConstantDraw => "constant draw",
+            Self::ProofUnreadable => "proof unreadable",
+            Self::ProofWriteFailed => "proof write failed",
+        }
+    }
+
+    /// Whether this cause is evidence the hardware RNG itself is broken, as
+    /// opposed to the check being unable to run.
+    pub fn rng_broken(self) -> bool {
+        matches!(self, Self::DrawRepeated | Self::ConstantDraw)
+    }
+
+    /// Stable index for storing the cause in an atomic.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::NotRun => 0,
+            Self::DrawMoved => 1,
+            Self::NoPreviousDraw => 2,
+            Self::DrawRepeated => 3,
+            Self::ConstantDraw => 4,
+            Self::ProofUnreadable => 5,
+            Self::ProofWriteFailed => 6,
+        }
+    }
+
+    /// Inverse of [`Self::to_u8`]; anything unknown reads as `NotRun`.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::DrawMoved,
+            2 => Self::NoPreviousDraw,
+            3 => Self::DrawRepeated,
+            4 => Self::ConstantDraw,
+            5 => Self::ProofUnreadable,
+            6 => Self::ProofWriteFailed,
+            _ => Self::NotRun,
+        }
+    }
+}
+
+/// The cause for the same three facts [`self_test_outcome`] takes. Kept as a
+/// separate function over identical inputs, and pinned consistent with it by
+/// test, so the state and the stated reason can never disagree.
+///
+/// Precedence follows what an operator needs first: a dead or stuck RNG
+/// outranks everything, because it is the only cause that implicates keys
+/// already generated.
+pub fn self_test_cause(
+    draw_constant: bool,
+    proof: ProofLookup,
+    proof_stored: Option<bool>,
+) -> SelfTestCause {
+    if draw_constant {
+        return SelfTestCause::ConstantDraw;
+    }
+    match proof {
+        ProofLookup::Matched => SelfTestCause::DrawRepeated,
+        ProofLookup::Unreadable => SelfTestCause::ProofUnreadable,
+        _ if proof_stored != Some(true) => SelfTestCause::ProofWriteFailed,
+        ProofLookup::Differed => SelfTestCause::DrawMoved,
+        ProofLookup::Absent => SelfTestCause::NoPreviousDraw,
+    }
 }
 
 /// What the stored continuity proof said about this boot's draw.
@@ -235,6 +360,76 @@ mod tests {
         assert!(!fault.contains("power-cycle"), "{fault}");
         assert_ne!(wipe, fault);
         assert!(RngState::Verified.refusal().is_empty());
+    }
+
+    #[test]
+    fn cause_agrees_with_state_across_the_whole_truth_table() {
+        use ProofLookup::*;
+        for proof in [Matched, Differed, Absent, Unreadable] {
+            for stored in [Some(true), Some(false), None] {
+                for constant in [true, false] {
+                    let state = self_test_outcome(constant, proof, stored);
+                    let cause = self_test_cause(constant, proof, stored);
+                    let ctx = format!("constant={constant} proof={proof:?} stored={stored:?}");
+                    match cause {
+                        SelfTestCause::DrawMoved => assert_eq!(state, RngState::Verified, "{ctx}"),
+                        SelfTestCause::NoPreviousDraw => {
+                            assert_eq!(state, RngState::NeedsSecondBoot, "{ctx}")
+                        }
+                        SelfTestCause::NotRun => panic!("a completed test reported not_run: {ctx}"),
+                        _ => assert_eq!(state, RngState::Failed, "{ctx}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_repeated_or_constant_draw_implicates_the_rng() {
+        // The distinction the cause exists to carry: storage faults must not
+        // read as a key compromise, and a stuck RNG must not read as a glitch.
+        assert!(self_test_cause(false, ProofLookup::Matched, None).rng_broken());
+        assert!(self_test_cause(true, ProofLookup::Absent, None).rng_broken());
+        assert!(!self_test_cause(false, ProofLookup::Unreadable, None).rng_broken());
+        assert!(!self_test_cause(false, ProofLookup::Differed, Some(false)).rng_broken());
+        assert!(!self_test_cause(false, ProofLookup::Absent, Some(true)).rng_broken());
+    }
+
+    #[test]
+    fn a_repeated_draw_outranks_a_write_failure() {
+        // Both true at once: the RNG finding is the one that matters.
+        assert_eq!(
+            self_test_cause(false, ProofLookup::Matched, Some(false)),
+            SelfTestCause::DrawRepeated
+        );
+    }
+
+    #[test]
+    fn wire_tokens_are_unique_and_round_trip() {
+        use SelfTestCause::*;
+        let all = [
+            NotRun,
+            DrawMoved,
+            NoPreviousDraw,
+            DrawRepeated,
+            ConstantDraw,
+            ProofUnreadable,
+            ProofWriteFailed,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert_eq!(SelfTestCause::from_u8(a.to_u8()), *a);
+            for b in &all[i + 1..] {
+                assert_ne!(a.wire(), b.wire());
+                assert_ne!(a.to_u8(), b.to_u8());
+            }
+        }
+        assert_eq!(SelfTestCause::from_u8(250), NotRun);
+        let states = [RngState::Verified, RngState::NeedsSecondBoot, RngState::Failed];
+        for (i, a) in states.iter().enumerate() {
+            for b in &states[i + 1..] {
+                assert_ne!(a.wire(), b.wire());
+            }
+        }
     }
 
     #[test]

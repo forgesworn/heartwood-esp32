@@ -1642,8 +1642,10 @@ bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.
    ask for a new identity over the cable. It must refuse with `Power-cycle
    once / then generate` on the screen and a NACK naming the same reason —
    NOT `RNG CHECK FAILED / refusing new keys`, which means a fault.
-2. **The second boot clears it.** Power-cycle, check the serial log for `RNG
-   self-test passed`, then generate. It proceeds.
+2. **The second boot clears it.** Power-cycle, then `node scripts/device-status.mjs
+   --port ...` must show `"rng":"verified","rng_cause":"draw_moved"`. Generate.
+   It proceeds. (Not the serial log: the console is compiled out on every board,
+   so `RNG self-test passed` is never emitted where you can read it.)
 3. **Signing never stopped.** Between items 1 and 2, an existing master still
    signs. The gate covers new key material only.
 4. **A genuinely stuck RNG is still caught.** Run this FIRST, before trusting
@@ -1653,12 +1655,21 @@ bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.
    node scripts/rng-check.mjs
    ```
 
-   It taps the serial log passively (never asserts DTR/RTS, so it cannot reset
-   a live signer), asks for two RESET presses with no wipe between, and prints
-   a verdict. Exit 0 = the draw moved and the firmware verified it. Exit 1 on
-   `draw identical to last boot` or `constant draw` means stop, and treat every
-   key the board generated as reproducible. It understands the old firmware's
-   wording too, so it can be run before reflashing.
+   It reads `rng` and `rng_cause` from FIRMWARE_INFO, never writes DTR/RTS
+   (so it cannot reset a signer), and prints a verdict. A boot that followed
+   another boot is already a comparison, so usually no reset is needed; on the
+   first boot after a flash or a wipe it asks for one RST press. Exit 0 = the
+   draw moved. Exit 1 on `draw_repeated` or `constant_draw` means stop, and
+   treat every key the board generated as reproducible. Exit 2 = no verdict;
+   `proof_unreadable`/`proof_write_failed` are storage faults, not evidence
+   against the RNG.
+
+   Firmware up to 0.18.0-beta.7 cannot be checked at all: its only report was
+   a log line, and the log console is compiled out. The first version of this
+   script waited for that line and could never have seen it (found on a real
+   V4, 2026-09-13). Flash first. The proof key, namespace and hash are unchanged
+   since beta.5 and so is the partition table, so an app flash keeps the masters
+   and the first boot compares against the last proof the old firmware stored.
 5. **Slot secrets are gated too.** On the post-wipe boot, `CONNSLOT_CREATE`
    and the relay's `create_client` both refuse with the power-cycle reason.
 6. **The prefix notice appears once.** Generate an identity: before word 1

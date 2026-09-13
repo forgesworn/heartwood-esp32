@@ -198,24 +198,33 @@ fn read_ota_status(
                                 return Err("OTA_STATUS frame has empty payload".into());
                             }
                             let status = f.payload[0];
+                            // The device sends a reason after the code ("No OTA
+                            // partition", "esp_ota_begin failed", ...). Two very
+                            // different failures share 0x12 — one before the
+                            // owner is asked, one after — so the text is the only
+                            // way to tell them apart. Never drop it.
+                            let reason = String::from_utf8_lossy(&f.payload[1..]).trim().to_string();
+                            let with_reason = |msg: &str| -> String {
+                                if reason.is_empty() { msg.to_string() } else { format!("{msg}: {reason}") }
+                            };
                             // Map device error codes to human-readable messages.
                             match status {
                                 OTA_STATUS_READY
                                 | OTA_STATUS_CHUNK_OK
                                 | OTA_STATUS_VERIFIED => return Ok(status),
                                 OTA_STATUS_ERR_HASH => {
-                                    return Err("device rejected firmware: SHA-256 mismatch (0x10)".into())
+                                    return Err(with_reason("device rejected firmware: SHA-256 mismatch (0x10)"))
                                 }
                                 OTA_STATUS_ERR_SIZE => {
-                                    return Err("device rejected firmware: size mismatch (0x11)".into())
+                                    return Err(with_reason("device rejected firmware: size mismatch (0x11)"))
                                 }
                                 OTA_STATUS_ERR_WRITE => {
-                                    return Err("device reported flash write error (0x12)".into())
+                                    return Err(with_reason("device reported flash write error (0x12)"))
                                 }
                                 OTA_STATUS_ERR_NOT_STARTED => {
-                                    return Err(
-                                        "device received chunk before OTA session started (0x13)".into(),
-                                    )
+                                    return Err(with_reason(
+                                        "device received chunk before OTA session started (0x13)",
+                                    ))
                                 }
                                 OTA_STATUS_ERR_SIG => {
                                     return Err(

@@ -13,6 +13,7 @@ pub mod frame;
 pub mod hex;
 pub mod http_date;
 pub mod kinds;
+pub mod ota_target;
 pub mod types;
 pub mod validate;
 

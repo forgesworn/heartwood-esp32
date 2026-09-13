@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::oled::Display;
 use heartwood_common::ota_sign::verify_ota_signature;
+use heartwood_common::ota_target::{check_ota_target, Slot, TargetRefusal};
 use heartwood_common::types::{
     FRAME_TYPE_OTA_STATUS, OTA_STATUS_CHUNK_OK, OTA_STATUS_ERR_HASH, OTA_STATUS_ERR_NOT_STARTED,
     OTA_STATUS_ERR_SIG, OTA_STATUS_ERR_SIZE, OTA_STATUS_ERR_WRITE, OTA_STATUS_READY,
@@ -128,17 +129,27 @@ pub fn handle_ota_begin(
     // owner is asked to approve (FW-L6): an image that cannot fit the slot is
     // a host-visible error up front, not a post-approval esp_ota_begin
     // failure after a 2 MB transfer.
+    //
+    // A NULL here is not the only way to have nowhere to write: on a table with
+    // a single OTA slot, ESP-IDF wraps around and proposes the running slot.
+    // check_ota_target treats that as no spare slot, so a single-slot board is
+    // refused before the card instead of after the owner approves (see
+    // heartwood_common::ota_target for the incident).
     let partition = unsafe { esp_idf_svc::sys::esp_ota_get_next_update_partition(core::ptr::null()) };
-    if partition.is_null() {
-        send_ota_status(usb, OTA_STATUS_ERR_WRITE, "No OTA partition");
-        return;
-    }
-    let partition_size = unsafe { (*partition).size } as usize;
-    if total_size == 0 || total_size as usize > partition_size {
-        log::warn!(
-            "OTA_BEGIN: image size {total_size} does not fit the OTA partition ({partition_size})"
-        );
-        send_ota_status(usb, OTA_STATUS_ERR_SIZE, "Image too large");
+    let running = unsafe { esp_idf_svc::sys::esp_ota_get_running_partition() };
+    let next = (!partition.is_null()).then(|| unsafe {
+        Slot {
+            offset: (*partition).address,
+            size: (*partition).size,
+        }
+    });
+    let running_offset = (!running.is_null()).then(|| unsafe { (*running).address });
+    if let Err(refusal) = check_ota_target(next, running_offset, total_size) {
+        let code = match refusal {
+            TargetRefusal::NoSpareSlot => OTA_STATUS_ERR_WRITE,
+            TargetRefusal::ImageTooLarge => OTA_STATUS_ERR_SIZE,
+        };
+        send_ota_status(usb, code, refusal.reason());
         return;
     }
 
@@ -189,7 +200,14 @@ pub fn handle_ota_begin(
         let err = esp_idf_svc::sys::esp_ota_begin(partition, total_size as usize, &mut handle);
         if err != esp_idf_svc::sys::ESP_OK {
             restore_logging();
-            send_ota_status(usb, OTA_STATUS_ERR_WRITE, "esp_ota_begin failed");
+            // The owner has just approved on this screen. Leaving that card up
+            // reads as "update in progress" for an update that never started —
+            // on 2026-09-13 an owner stood watching APPROVED for a minute.
+            crate::oled::show_error(display, "Update not started\nfirmware unchanged");
+            // Carry the esp_err_t: this used to be the only diagnostic, and with
+            // the console compiled out nothing else ever reached the host.
+            let reason = format!("esp_ota_begin failed (0x{err:x})");
+            send_ota_status(usb, OTA_STATUS_ERR_WRITE, &reason);
             return;
         }
         handle

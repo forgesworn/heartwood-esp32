@@ -86,8 +86,11 @@ fn read_signature(path: &str) -> Result<[u8; 64], String> {
 /// Payload = [offset_u32_be (4 bytes)] + [data], total must not exceed MAX_PAYLOAD_SIZE.
 const CHUNK_DATA_SIZE: usize = 4088;
 
-/// Timeout waiting for OTA_STATUS_READY after OTA_BEGIN.
-const READY_TIMEOUT: Duration = Duration::from_secs(40);
+/// Timeout waiting for OTA_STATUS_READY after OTA_BEGIN. This spans the
+/// owner's physical approval, which the firmware holds open for 45 s, so it
+/// must be longer than that: at 40 s the tool gave up while the card was still
+/// on the device's screen.
+const READY_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// Timeout waiting for OTA_STATUS_CHUNK_OK after each OTA_CHUNK.
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -225,6 +228,19 @@ fn read_ota_status(
                                     ))
                                 }
                             }
+                        } else if f.frame_type == FRAME_TYPE_NACK {
+                            // A refusal is an answer, not noise. Ignoring it left
+                            // the tool waiting out its whole timeout on a board
+                            // that had already said no.
+                            let reason = String::from_utf8_lossy(&f.payload).trim().to_string();
+                            return Err(if reason.is_empty() {
+                                "device refused the OTA (NACK, no reason given). A board whose \
+                                 seeds are encrypted at rest refuses everything but unlock while \
+                                 locked — unlock it, then retry"
+                                    .into()
+                            } else {
+                                format!("device refused the OTA (NACK): {reason}")
+                            });
                         } else {
                             // Unexpected frame type — ignore and keep accumulating.
                             eprintln!(
@@ -327,9 +343,18 @@ fn main() {
             std::process::exit(1);
         });
 
-    // Disable DTR/RTS — toggling these resets the ESP32.
-    port.write_data_terminal_ready(false).ok();
+    // Release RTS BEFORE DTR. On both the ESP32 USB-Serial-JTAG peripheral and
+    // the classic two-transistor auto-reset circuit, RTS asserted with DTR
+    // de-asserted is the chip-reset state. The port opens with both asserted,
+    // so dropping DTR first passes straight through it and pulses reset. That
+    // is not harmless: a board with seeds encrypted at rest reboots LOCKED, and
+    // a locked board NACKs OTA_BEGIN, so the update fails and the owner has to
+    // unlock again. Seen on a Heltec V4 (native USB) on 2026-09-13: the board
+    // reported last_reset "usb-peripheral-reset" straight after this tool
+    // opened the port. RTS first goes (1,1) -> (1,0) -> (0,0) and never
+    // touches the reset state.
     port.write_request_to_send(false).ok();
+    port.write_data_terminal_ready(false).ok();
 
     println!("Serial port {} open at {} baud", cli.port, cli.baud);
 

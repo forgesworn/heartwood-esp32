@@ -67,19 +67,23 @@ async function resolvePath() {
  * entirely while a native-USB board re-enumerates, so a failed open is retried
  * until `giveUpMs`. Returns null when nothing answered.
  */
+let lastOpenError = null
+
 async function readInfo(path, giveUpMs = 20_000) {
   const giveUp = Date.now() + giveUpMs
   for (;;) {
     let session = null
     try {
+      lastOpenError = null
       session = await openFramedPort(path)
       const reply = await session.request(FIRMWARE_INFO, [FIRMWARE_INFO_RESPONSE], {
         deadlineMs: 8_000,
         intervalMs: 1_000,
       })
       if (reply?.type === FIRMWARE_INFO_RESPONSE) return JSON.parse(reply.payload.toString())
-    } catch {
+    } catch (err) {
       // busy, gone, or mid-boot: retry below
+      lastOpenError = err
     } finally {
       try {
         session?.close()
@@ -143,7 +147,15 @@ console.log(`Reading ${path}...`)
 
 const first = await readInfo(path)
 if (!first) {
-  console.error('The board did not answer FIRMWARE_INFO. Check the port, then re-run.')
+  // "Resource busy" is by far the commonest cause, and it is not the board's
+  // fault: another program has the port. Sapwood in a browser tab grabs it
+  // again after every reboot. Say which, instead of blaming the board.
+  if (/busy/i.test(lastOpenError?.message ?? '')) {
+    console.error(`${path} is held by another program (Sapwood in a browser tab, a serial monitor,`)
+    console.error('heartwoodd). Disconnect it, then re-run.')
+  } else {
+    console.error('The board did not answer FIRMWARE_INFO. Check the port, then re-run.')
+  }
   exit(2)
 }
 console.log(`now:    ${describe(first)}`)

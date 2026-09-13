@@ -1664,6 +1664,14 @@ bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.
    `proof_unreadable`/`proof_write_failed` are storage faults, not evidence
    against the RNG.
 
+   A boot straight after a firmware change compares against a proof the OLD
+   firmware stored. A boot-seeded PRNG can pass that comparison if the two
+   versions consume randomness in a different order before the self-test, so
+   treat it as provisional: press RST once more and confirm `draw_moved` again
+   on the same version. (Done on the one-off legacy V4 on 2026-09-13: beta.5 ->
+   beta.8 read `draw_moved`, then beta.8 -> beta.8 across an RST read
+   `draw_moved` again.)
+
    Firmware up to 0.18.0-beta.7 cannot be checked at all: its only report was
    a log line, and the log console is compiled out. The first version of this
    script waited for that line and could never have seen it (found on a real

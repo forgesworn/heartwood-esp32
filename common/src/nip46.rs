@@ -2267,7 +2267,7 @@ mod tests {
         ]).is_err());
         assert!(RendezvousProvisionParams::from_params(&[
             serde_json::json!("ab".repeat(32)), serde_json::json!(0),
-            serde_json::json!("AAECAwQFBgcICQoLDA0ODA"), serde_json::json!(1),
+            serde_json::json!("AAECAwQFBgcICQoLDA0ODB"), serde_json::json!(1),
         ]).is_err());
 
         let persona_params = vec![serde_json::json!("forge"), serde_json::json!(1)];

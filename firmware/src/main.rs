@@ -77,6 +77,7 @@ mod st7789;
 #[cfg(feature = "c6")]
 mod jd9853;
 mod relay;
+mod rendezvous_provision;
 mod session;
 mod sign;
 mod transport;

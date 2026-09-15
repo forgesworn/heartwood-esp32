@@ -4869,7 +4869,7 @@ fn note_wall_clock(ctx: &SignCtx) {
     }
 }
 
-fn wall_clock_estimate() -> u64 {
+pub(crate) fn wall_clock_estimate() -> u64 {
     let hint = WALL_HINT.load(std::sync::atomic::Ordering::Relaxed) as u64;
     if hint == 0 {
         return 0;

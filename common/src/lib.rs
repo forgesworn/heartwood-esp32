@@ -26,6 +26,13 @@ pub mod nip46;
 #[cfg(feature = "nip44")]
 pub mod nip44;
 
+/// Canonical, encrypted-device-only rendezvous provisioning payloads. This is
+/// deliberately available only alongside NIP-44: the scalar-bearing record
+/// must never be emitted except as the plaintext immediately handed to that
+/// encryption primitive.
+#[cfg(feature = "nip44")]
+pub mod rendezvous_provision;
+
 #[cfg(all(feature = "nip46", feature = "nip44"))]
 pub mod nip59;
 

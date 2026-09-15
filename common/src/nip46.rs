@@ -114,6 +114,10 @@ pub enum Nip46Method {
     /// Mint a connection slot for another wallet, from a wallet already
     /// bound. Gated by a hold; answers with a one-time bunker URI.
     HeartwoodPairWallet,
+    /// Provision the root-derived Vennel rendezvous child directly to one
+    /// device key. This is intentionally neither a generic derivation nor a
+    /// generic secret export operation.
+    HeartwoodProvisionRendezvous,
     // Unknown method
     Unknown(String),
 }
@@ -160,6 +164,7 @@ impl Nip46Method {
             "heartwood_note_address" => Self::HeartwoodNoteAddress,
             "heartwood_note_claim" => Self::HeartwoodNoteClaim,
             "heartwood_pair_wallet" => Self::HeartwoodPairWallet,
+            "heartwood_provision_rendezvous" => Self::HeartwoodProvisionRendezvous,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -200,6 +205,7 @@ impl Nip46Method {
             Self::HeartwoodNoteAddress => "heartwood_note_address",
             Self::HeartwoodNoteClaim => "heartwood_note_claim",
             Self::HeartwoodPairWallet => "heartwood_pair_wallet",
+            Self::HeartwoodProvisionRendezvous => "heartwood_provision_rendezvous",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -225,6 +231,7 @@ impl Nip46Method {
                 | Self::HeartwoodNoteRename
                 | Self::HeartwoodNoteTrust
                 | Self::HeartwoodPairWallet
+                | Self::HeartwoodProvisionRendezvous
         )
     }
 
@@ -264,6 +271,14 @@ impl Nip46Method {
                 | Self::HeartwoodRecover
                 | Self::HeartwoodCreateProof
         )
+    }
+
+    /// This ceremony cannot be delegated by a broad legacy slot policy or a
+    /// transient allowance: every *fresh* target needs its own owner hold.
+    /// Exact slots still need to name the method, so the firmware's policy
+    /// ceiling is consulted before this pin is applied.
+    pub fn requires_fresh_physical_approval(&self) -> bool {
+        matches!(self, Self::HeartwoodProvisionRendezvous)
     }
 }
 
@@ -2178,6 +2193,10 @@ mod tests {
     fn test_nip46_method_from_str() {
         assert_eq!(Nip46Method::from_str("sign_event"), Nip46Method::SignEvent);
         assert_eq!(Nip46Method::from_str("heartwood_derive"), Nip46Method::HeartwoodDerive);
+        assert_eq!(
+            Nip46Method::from_str("heartwood_provision_rendezvous"),
+            Nip46Method::HeartwoodProvisionRendezvous
+        );
         assert_eq!(Nip46Method::from_str("ping"), Nip46Method::Ping);
         assert_eq!(Nip46Method::from_str("switch_relays"), Nip46Method::SwitchRelays);
         assert_eq!(
@@ -2198,7 +2217,10 @@ mod tests {
 
         assert!(Nip46Method::HeartwoodDerive.always_requires_button());
         assert!(Nip46Method::HeartwoodSwitch.always_requires_button());
+        assert!(Nip46Method::HeartwoodProvisionRendezvous.always_requires_button());
+        assert!(Nip46Method::HeartwoodProvisionRendezvous.requires_fresh_physical_approval());
         assert!(!Nip46Method::SignEvent.always_requires_button());
+        assert!(!Nip46Method::SignEvent.requires_fresh_physical_approval());
 
         assert!(!Nip46Method::HeartwoodSwitch.is_oled_notify());
         assert!(!Nip46Method::SignEvent.is_oled_notify());

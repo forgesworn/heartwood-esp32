@@ -9,7 +9,7 @@ license = "MIT"
 # Default build targets the Heltec V4 (native USB-Serial-JTAG on GPIO19/20).
 default = ["heltec-v4"]
 # Heltec WiFi LoRa 32 V4 -- USB-C wired to ESP32-S3 native USB pins.
-heltec-v4 = []
+heltec-v4 = ["dep:qrcodegen-no-heap"]
 # Heltec WiFi LoRa 32 V3 -- USB-C wired through a CP2102 bridge to UART0
 # (GPIO43 TX / GPIO44 RX). Mutually exclusive with heltec-v4.
 heltec-v3 = []
@@ -21,12 +21,12 @@ st7789 = ["dep:mipidsi"]
 st7789-check = ["st7789"]
 # LilyGO / TENSTAR T-Display: classic ESP32-D0WD + ST7789 240x135 colour TFT.
 # Built for the xtensa-esp32-espidf target (see scripts/build-firmware.sh).
-tdisplay = ["st7789"]
+tdisplay = ["st7789", "dep:qrcodegen-no-heap"]
 # Waveshare ESP32-C6-Touch-LCD-1.47: ESP32-C6 (RISC-V rv32imac) + JD9853 172×320
 # portrait IPS panel. Built for the riscv32imac-esp-espidf target.
 # Note: the display controller is JD9853 (NOT ST7789); the jd9853 module sends
 # the vendor init sequence directly over raw SPI without mipidsi.
-c6 = []
+c6 = ["dep:qrcodegen-no-heap"]
 # Branded board-check demo (deliberately NOT the signer): title screen, button
 # check, and a two-button jump-and-duck game. Ships pre-flashed on boards sold
 # untouched-by-vendor-firmware; proves display + both buttons + USB work while
@@ -62,7 +62,7 @@ ssd1306 = "0.9"
 embedded-graphics = "0.8"
 # Heap-free QR encoder for the physical bearer-note handover screen. The
 # bounded v2/v8 output buffers live on the stack and are scrubbed after use.
-qrcodegen-no-heap = "1.8.1"
+qrcodegen-no-heap = { version = "1.8.1", optional = true }
 
 # ST7789 colour TFT driver -- only compiled in for the `st7789` feature
 # (colour-panel boards). Mono-OLED Heltec builds never pull it in.

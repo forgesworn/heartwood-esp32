@@ -60,6 +60,7 @@ mod notes;
 mod personas;
 mod nvs;
 mod nvs_stats;
+#[cfg(not(feature = "heltec-v3"))]
 mod offline_qr;
 mod cat_sprites;
 mod oled;
@@ -968,9 +969,11 @@ fn main() {
                             // A press while a signing confirmation is held
                             // dismisses the run early, back to the idle card.
                             idle_page = 0;
-                        } else if idle_page == 3
-                            && offline_qr::launch_if_requested(&mut display, &buttons)
-                        {
+                        } else if launch_offline_qr_if_requested(
+                            &mut display,
+                            &buttons,
+                            idle_page,
+                        ) {
                             // The QR flow cleared the bearer image before it
                             // returned. Restore the ordinary idle identity;
                             // no secret-bearing frame is ever left behind.
@@ -1452,5 +1455,24 @@ fn main() {
         ) {
             oled::show_awaiting(&mut display);
         }
+    }
+}
+
+/// The V3's fixed 2 MiB OTA slot has no room for the QR encoder. Keep that
+/// legacy board flashable while offering physical bearer handover on V4 and
+/// the colour-panel builds that have enough application budget.
+fn launch_offline_qr_if_requested(
+    display: &mut oled::Display<'_>,
+    buttons: &button::Buttons<'_>,
+    idle_page: u8,
+) -> bool {
+    #[cfg(feature = "heltec-v3")]
+    {
+        let _ = (display, buttons, idle_page);
+        false
+    }
+    #[cfg(not(feature = "heltec-v3"))]
+    {
+        idle_page == 3 && offline_qr::launch_if_requested(display, buttons)
     }
 }

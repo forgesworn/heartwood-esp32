@@ -1935,14 +1935,17 @@ pub fn show_info_notes(
     Text::new(&received_line, Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
     let pending_line = format!("pending: {pending}");
     Text::new(&pending_line, Point::new(l.sx(4), l.sy(52)), small).draw(display).ok();
-    let handoff_hint = "hold 2s: offline QR";
-    Text::new(
-        handoff_hint,
-        Point::new(l.center_x(handoff_hint.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(62)),
-        small,
-    )
-    .draw(display)
-    .ok();
+    #[cfg(not(feature = "heltec-v3"))]
+    {
+        let handoff_hint = "hold 2s: offline QR";
+        Text::new(
+            handoff_hint,
+            Point::new(l.center_x(handoff_hint.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(62)),
+            small,
+        )
+        .draw(display)
+        .ok();
+    }
 
     draw_page_marker(display, &l, 4, 4);
     display.flush().ok();
@@ -1951,6 +1954,7 @@ pub fn show_info_notes(
 /// Secret-free picker shown before an offline bearer-note QR can be revealed.
 /// The amount and mint are the decision; the `k1` is copied only after the
 /// owner double-taps the selected card and completes the ordinary hold gate.
+#[cfg(not(feature = "heltec-v3"))]
 pub fn show_offline_note_picker(
     display: &mut Display<'_>,
     current: usize,

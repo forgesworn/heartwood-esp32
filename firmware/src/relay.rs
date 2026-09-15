@@ -5619,6 +5619,14 @@ fn handle_mgmt_event(
     // the device operator; a delegated per-identity operator is confined to
     // managing the one identity it was granted.
     let is_device_op = device_op == Some(author);
+    // The owner retains the legacy device-wide replay boundary. A delegated
+    // per-identity operator gets an independent one, so its mutation cannot
+    // make an owner's already-fetched challenge stale (or vice versa).
+    let challenge_scope = if is_device_op {
+        crate::management_challenge::Scope::Device
+    } else {
+        crate::management_challenge::Scope::Operator(author)
+    };
 
     // Conversation key is master ⇄ the authenticated operator (device or the
     // per-identity delegate), so the response seals back to whoever sent the
@@ -5718,8 +5726,9 @@ fn handle_mgmt_event(
 
     let dispatch_result = (|| {
         if mgmt::requires_mutation_challenge(&method) {
-            let current = crate::management_challenge::current(
+            let current = crate::management_challenge::current_scoped(
                 ctx.nvs,
+                challenge_scope,
                 crate::management_challenge::EntropySource::RadioActive,
             )
             .map_err(|e| {
@@ -5730,8 +5739,9 @@ fn handle_mgmt_event(
             let supplied = req.get("mutation_challenge").and_then(|value| value.as_str());
             match mgmt::classify_mutation_challenge(&method, supplied, &current_hex) {
                 mgmt::MutationChallenge::Current => {
-                    crate::management_challenge::rotate(
+                    crate::management_challenge::rotate_scoped(
                         ctx.nvs,
+                        challenge_scope,
                         &current,
                         crate::management_challenge::EntropySource::RadioActive,
                     )
@@ -5753,7 +5763,16 @@ fn handle_mgmt_event(
                 mgmt::MutationChallenge::NotRequired => unreachable!(),
             }
         }
-        dispatch_mgmt(&method, &req, s, ctx, master_idx, pool, is_device_op)
+        dispatch_mgmt(
+            &method,
+            &req,
+            s,
+            ctx,
+            master_idx,
+            pool,
+            is_device_op,
+            challenge_scope,
+        )
     })();
     // The breadcrumb stays set across the response publish below too;
     // handle_relay_msg clears it once the whole event is processed.
@@ -5993,6 +6012,9 @@ fn dispatch_mgmt(
     // True when the authenticated author is the device-wide operator (not a
     // per-identity delegate). Gates identity-adding and delegation methods.
     is_device_op: bool,
+    // The challenge scope was selected from the already-authenticated author
+    // before decryption/dispatch; do not derive it from untrusted request data.
+    challenge_scope: crate::management_challenge::Scope,
 ) -> Result<serde_json::Value, String> {
     // Extract owned master facts before borrowing policy_engine mutably.
     let master_slot = ctx.masters[master_idx].slot;
@@ -6000,8 +6022,9 @@ fn dispatch_mgmt(
 
     match method {
         "get_management_challenge" => {
-            let challenge = crate::management_challenge::current(
+            let challenge = crate::management_challenge::current_scoped(
                 ctx.nvs,
+                challenge_scope,
                 crate::management_challenge::EntropySource::RadioActive,
             )
             .map_err(|e| {

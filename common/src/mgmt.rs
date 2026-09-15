@@ -228,6 +228,63 @@ pub fn persisted_challenge_matches(expected: &[u8; 32], stored: Option<&[u8]>) -
     matches!(stored, Some(value) if value == expected.as_slice())
 }
 
+/// NVS key for an identity-scoped management challenge.
+///
+/// ESP-IDF limits NVS keys to 15 ASCII bytes. Four public-key bytes give a
+/// compact, deterministic suffix while the record stored under the key binds
+/// the *whole* operator key. A deliberately or accidentally colliding prefix
+/// therefore fails closed in firmware; it never lets two operators share a
+/// replay boundary.
+pub fn operator_challenge_nvs_key(operator: &[u8; 32]) -> String {
+    let hex = hex_encode(operator);
+    format!("mgmt_{}", &hex[..8])
+}
+
+/// The public-key binding plus the opaque one-time challenge kept at an
+/// identity-scoped NVS key. It contains no operator secret and no request.
+pub const OPERATOR_CHALLENGE_RECORD_LEN: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorChallengeRecord {
+    Missing,
+    /// The record belongs to this operator and supplies its current nonce.
+    Current([u8; 32]),
+    /// Same shortened NVS key, but a different full operator key: fail closed.
+    ScopeMismatch,
+    Malformed,
+}
+
+pub fn encode_operator_challenge_record(
+    operator: &[u8; 32],
+    challenge: &[u8; 32],
+) -> [u8; OPERATOR_CHALLENGE_RECORD_LEN] {
+    let mut record = [0u8; OPERATOR_CHALLENGE_RECORD_LEN];
+    record[..32].copy_from_slice(operator);
+    record[32..].copy_from_slice(challenge);
+    record
+}
+
+/// Decode a scoped record without I/O so the crucial collision and corruption
+/// distinction is host-tested. A foreign full key is never treated as a stale
+/// or replaceable local record.
+pub fn classify_operator_challenge_record(
+    operator: &[u8; 32],
+    stored: Option<&[u8]>,
+) -> OperatorChallengeRecord {
+    let Some(stored) = stored else {
+        return OperatorChallengeRecord::Missing;
+    };
+    if stored.len() != OPERATOR_CHALLENGE_RECORD_LEN {
+        return OperatorChallengeRecord::Malformed;
+    }
+    if stored[..32] != operator[..] {
+        return OperatorChallengeRecord::ScopeMismatch;
+    }
+    let mut challenge = [0u8; 32];
+    challenge.copy_from_slice(&stored[32..]);
+    OperatorChallengeRecord::Current(challenge)
+}
+
 /// Build a NIP-46 `bunker://` connection URI addressed to one identity.
 ///
 /// Shared by `create_client` (which passes `Some(secret)` to bind the connecting
@@ -510,6 +567,33 @@ mod tests {
         assert!(!persisted_challenge_matches(&expected, None));
         assert!(!persisted_challenge_matches(&expected, Some(&expected[..31])));
         assert!(!persisted_challenge_matches(&expected, Some(&different)));
+    }
+
+    #[test]
+    fn scoped_operator_challenge_records_bind_the_full_public_key() {
+        let operator = [0x41; 32];
+        let other_operator = [0x42; 32];
+        let challenge = [0x73; 32];
+        let record = encode_operator_challenge_record(&operator, &challenge);
+
+        assert_eq!(operator_challenge_nvs_key(&operator), "mgmt_41414141");
+        assert!(operator_challenge_nvs_key(&operator).len() <= 15);
+        assert_eq!(
+            classify_operator_challenge_record(&operator, Some(&record)),
+            OperatorChallengeRecord::Current(challenge),
+        );
+        assert_eq!(
+            classify_operator_challenge_record(&other_operator, Some(&record)),
+            OperatorChallengeRecord::ScopeMismatch,
+        );
+        assert_eq!(
+            classify_operator_challenge_record(&operator, Some(&record[..63])),
+            OperatorChallengeRecord::Malformed,
+        );
+        assert_eq!(
+            classify_operator_challenge_record(&operator, None),
+            OperatorChallengeRecord::Missing,
+        );
     }
 
     #[test]

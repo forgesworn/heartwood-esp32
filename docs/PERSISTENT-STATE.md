@@ -51,7 +51,8 @@ namespace:
 | `pin_attempts` | Durable wrong-PIN counter |
 | `net_config`, `net_trial`, `net_rev`, `net_last`, `ncfg_crc` | Active/staged network configuration, outcome, and flash-seed marker |
 | `pinned_rly` | Client-requested relay reachability cache, with master/client slot coordinates |
-| `mgmt_nonce` | One-time remote-management mutation challenge, rotated and read back before dispatch |
+| `mgmt_nonce` | Legacy device-operator one-time remote-management mutation challenge, rotated and read back before dispatch |
+| `mgmt_<operator-prefix>` | Per-delegated-operator one-time challenge record, bound to the full public key; a prefix collision fails closed rather than sharing a replay boundary |
 | `mgmt_seen` | Legacy request-id cache left harmlessly in place but ignored; current duplicate suppression is RAM-only |
 | `root_secret` | Legacy single-master seed key; not used by the current boot path |
 | `rm_journal`, `rm_pinned` | Temporary power-loss journal and pinned-relay shadow during master removal |

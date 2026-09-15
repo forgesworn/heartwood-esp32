@@ -371,7 +371,7 @@ struct SignCtx<'a, 'd, 'b> {
     /// at this deadline. Progress/failure cards leave this unset and remain
     /// visible until the next transition or normal burn-in blanking.
     network_display_restore_at: Option<Instant>,
-    /// Idle info carousel position: 0 identity, 1 network, 2 device. Short
+    /// Idle info carousel position: 0 identity, 1 network, 2 device, 3 notes. Short
     /// presses while the panel is awake advance it; sleep resets it.
     idle_page: u8,
     /// Set when the served persona set changed (a derive over any path, or a
@@ -464,7 +464,7 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
         show_idle_identity(ctx);
     } else {
         // Awake: a short press pages the idle info carousel.
-        ctx.idle_page = (ctx.idle_page + 1) % 3;
+        ctx.idle_page = (ctx.idle_page + 1) % 4;
         draw_relay_idle_page(ctx);
     }
     ctx.last_activity = Instant::now();
@@ -481,7 +481,8 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
 }
 
 /// One page of the idle info carousel. Page 1 shows the stored SSID with the
-/// live runtime stage; page 2 the firmware version, board, and uptime.
+/// live runtime stage; page 2 the firmware version, board, and uptime; page 3
+/// the privacy-preserving locker counts.
 fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
     match ctx.idle_page {
         1 => {
@@ -512,6 +513,15 @@ fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
             crate::board::BOARD,
             crate::uptime_s(),
         ),
+        3 => {
+            let summary = crate::notes::idle_summary();
+            crate::oled::show_info_notes(
+                ctx.display,
+                summary.held,
+                summary.received,
+                summary.pending,
+            );
+        }
         _ => show_idle_identity(ctx),
     }
 }

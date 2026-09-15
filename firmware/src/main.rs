@@ -213,7 +213,7 @@ pub fn uptime_s() -> u64 {
 }
 
 /// One page of the idle info carousel in the USB-bridged loop. Page 0 is the
-/// boot status card; short presses cycle the network and device pages. The
+/// boot status card; short presses cycle the network, device and notes pages. The
 /// radio is off by definition here — the WiFi tier runs its own loop — so the
 /// network page reports the dormant stored network, not a live link.
 pub fn draw_idle_page(
@@ -238,6 +238,10 @@ pub fn draw_idle_page(
             board::BOARD,
             uptime_s(),
         ),
+        3 => {
+            let summary = notes::idle_summary();
+            oled::show_info_notes(display, summary.held, summary.received, summary.pending);
+        }
         _ => oled::show_boot(display, master_count),
     }
 }
@@ -904,7 +908,7 @@ fn main() {
     let mut last_activity = Instant::now();
     let mut display_on = true;
     // Idle info carousel: waking shows page 0 (status); further short presses
-    // cycle network and device pages. Sleep resets to page 0.
+    // cycle network, device and notes pages. Sleep resets to page 0.
     let mut idle_page: u8 = 0;
 
     // --- Frame dispatch loop ---
@@ -965,8 +969,8 @@ fn main() {
                             idle_page = 0;
                         } else {
                             // Awake: a short press pages through the idle
-                            // info carousel (status / network / device).
-                            idle_page = (idle_page + 1) % 3;
+                            // info carousel (status / network / device / notes).
+                            idle_page = (idle_page + 1) % 4;
                         }
                         draw_idle_page(idle_page, &mut display, loaded_masters.len() as u8, &mut nvs);
                         let press_start = Instant::now();

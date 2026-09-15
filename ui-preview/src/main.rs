@@ -202,6 +202,26 @@ fn draw_idle<D: DrawTarget<Color = Rgb565>>(d: &mut D, name: Option<&str>, npub:
     }
 }
 
+/// Idle locker summary, mirroring `oled::show_info_notes`. It deliberately
+/// has counts only: no note value, mint, sender or secret belongs on an idle
+/// panel.
+fn draw_notes<D: DrawTarget<Color = Rgb565>>(d: &mut D, held: usize, received: usize, pending: usize) {
+    let l = layout_of(d);
+    header(d, &l, "NOTES");
+    Text::new(&format!("{held} held"), Point::new(l.sx(4), l.sy(28)), style(l.font_body(), FG))
+        .draw(d)
+        .ok();
+    Text::new(&format!("received: {received}"), Point::new(l.sx(4), l.sy(41)), style(l.font_small(), MUTED))
+        .draw(d)
+        .ok();
+    Text::new(&format!("pending: {pending}"), Point::new(l.sx(4), l.sy(52)), style(l.font_small(), MUTED))
+        .draw(d)
+        .ok();
+    Text::new("4/4", Point::new(l.w - l.sx(4) - 3 * Layout::glyph_w(l.font_small()), l.sy(62)), style(l.font_small(), MUTED))
+        .draw(d)
+        .ok();
+}
+
 /// Signing request: hold-to-sign header, app label, friendly kind label, kind
 /// number, and countdown bar (mirrors `oled::show_sign_request`).
 fn draw_sign<D: DrawTarget<Color = Rgb565>>(
@@ -565,6 +585,7 @@ fn main() {
         render(&format!("ready-{b}"), w, h, |d| draw_ready(d));
         render(&format!("idle-{b}"), w, h, |d| draw_idle(d, None, npub));
         render(&format!("idle-named-{b}"), w, h, |d| draw_idle(d, Some("TheCryptoDonkey"), npub));
+        render(&format!("notes-{b}"), w, h, |d| draw_notes(d, 6, 2, 1));
         render(&format!("sign-{b}"), w, h, |d| {
             draw_sign(d, "primal", "sign_event", 30078, "Sync app settings", 18, 30)
         });

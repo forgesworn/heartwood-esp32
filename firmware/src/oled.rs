@@ -1898,6 +1898,48 @@ pub fn show_info_device(
     display.flush().ok();
 }
 
+/// Idle info page: only the locker counts needed to tell an owner to collect.
+/// Amounts, mints, senders and note state stay off the idle display so this is
+/// never a balance or a useful target advertisement.
+pub fn show_info_notes(
+    display: &mut Display<'_>,
+    held: usize,
+    received: usize,
+    pending: usize,
+) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(l.font_body())
+        .text_color(FG)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+
+    Text::new("NOTES", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display)
+        .ok();
+
+    let held_line = format!("{held} held");
+    Text::new(&held_line, Point::new(l.sx(4), l.sy(28)), body).draw(display).ok();
+    let received_line = format!("received: {received}");
+    Text::new(&received_line, Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
+    let pending_line = format!("pending: {pending}");
+    Text::new(&pending_line, Point::new(l.sx(4), l.sy(52)), small).draw(display).ok();
+
+    draw_page_marker(display, &l, 4, 4);
+    display.flush().ok();
+}
+
 /// Terminal card left on screen when an approval window expires unanswered.
 /// Replaces the countdown so a stale "0s" prompt can never linger looking
 /// like a live request that ignores the buttons. Non-blocking: the caller

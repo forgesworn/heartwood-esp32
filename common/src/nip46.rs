@@ -667,6 +667,11 @@ impl<'a> RendezvousProvisionParams<'a> {
             || !nonce
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            // Sixteen bytes occupy 21 full base64url characters and two bits
+            // of the 22nd. Canonical unpadded encodings therefore end in one
+            // of these four characters; accepting another value would permit
+            // alternate spellings of the same decoded nonce.
+            || !matches!(nonce.as_bytes().last(), Some(b'A' | b'Q' | b'g' | b'w'))
         {
             return Err("rendezvous nonce must be an unpadded 16-byte base64url value");
         }
@@ -2259,6 +2264,10 @@ mod tests {
         assert!(RendezvousProvisionParams::from_params(&[
             serde_json::json!("ab".repeat(32)), serde_json::json!(0),
             serde_json::json!("AAECAwQFBgcICQoLDA0ODw="), serde_json::json!(1),
+        ]).is_err());
+        assert!(RendezvousProvisionParams::from_params(&[
+            serde_json::json!("ab".repeat(32)), serde_json::json!(0),
+            serde_json::json!("AAECAwQFBgcICQoLDA0ODA"), serde_json::json!(1),
         ]).is_err());
 
         let persona_params = vec![serde_json::json!("forge"), serde_json::json!(1)];

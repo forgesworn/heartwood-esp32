@@ -345,6 +345,32 @@ pub fn slot_authorizes(slot: &ConnectSlot, pubkey: &str) -> bool {
         || slot.authorized_pubkeys.iter().any(|p| p == pubkey)
 }
 
+/// Remove a stale remembered client key without changing the slot credential
+/// or policy. The current key is deliberately not removable here: it is the
+/// live holder and must be evicted by revoking/rotating the whole slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveAuthorizedPubkey {
+    Removed,
+    Current,
+    Missing,
+}
+
+pub fn remove_authorized_pubkey(
+    slot: &mut ConnectSlot,
+    pubkey: &str,
+) -> RemoveAuthorizedPubkey {
+    if slot.current_pubkey.as_deref() == Some(pubkey) {
+        return RemoveAuthorizedPubkey::Current;
+    }
+    let before = slot.authorized_pubkeys.len();
+    slot.authorized_pubkeys.retain(|candidate| candidate != pubkey);
+    if slot.authorized_pubkeys.len() < before {
+        RemoveAuthorizedPubkey::Removed
+    } else {
+        RemoveAuthorizedPubkey::Missing
+    }
+}
+
 /// Authorise `pubkey` on a slot: make it the current binding and remember it in
 /// `authorized_pubkeys`. The outgoing `current_pubkey` is preserved in the set,
 /// so an earlier device stays auto-approved instead of being evicted. The set
@@ -1014,6 +1040,30 @@ mod tests {
         authorize_pubkey_on_slot(&mut slot, &sample_pubkey('a'));
         assert_eq!(slot.authorized_pubkeys, vec![sample_pubkey('a')]);
         assert_eq!(slot.current_pubkey, Some(sample_pubkey('a')));
+    }
+
+    #[test]
+    fn removes_only_a_stale_authorized_key() {
+        let mut slot = sample_slot(0, "Signet");
+        let stale = sample_pubkey('a');
+        let current = sample_pubkey('b');
+        authorize_pubkey_on_slot(&mut slot, &stale);
+        authorize_pubkey_on_slot(&mut slot, &current);
+
+        assert_eq!(
+            remove_authorized_pubkey(&mut slot, &stale),
+            RemoveAuthorizedPubkey::Removed,
+        );
+        assert!(!slot_authorizes(&slot, &stale));
+        assert!(slot_authorizes(&slot, &current));
+        assert_eq!(
+            remove_authorized_pubkey(&mut slot, &current),
+            RemoveAuthorizedPubkey::Current,
+        );
+        assert_eq!(
+            remove_authorized_pubkey(&mut slot, &stale),
+            RemoveAuthorizedPubkey::Missing,
+        );
     }
 
     #[test]

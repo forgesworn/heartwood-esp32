@@ -206,7 +206,7 @@ fn draw_qr(display: &mut Display<'_>, qr: &QrCode<'_>, scale: i32, quiet: i32) {
     // QR readers expect dark modules on a light ground. Fill the whole panel,
     // rather than merely the symbol rectangle, so the OLED's spare 7px edge
     // around a v2 symbol is a real light quiet field too.
-    Rectangle::new(bounds.top_left, bounds.size)
+    Rectangle::new(Point::zero(), bounds)
         .into_styled(PrimitiveStyle::with_fill(FG))
         .draw(display)
         .ok();

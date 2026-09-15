@@ -320,6 +320,27 @@ fn decode_event_hex<const N: usize>(
         .map_err(|_| malformed)
 }
 
+/// Refuse a syntactically hex x-only key that cannot be lifted to secp256k1.
+/// Nostr device identities use the same BIP-340 public-key representation as
+/// event authors, so accepting an arbitrary 32-byte string here would let an
+/// issuer approve a provision which can never be decrypted by a device.
+fn validate_xonly_public_key(value: &str, malformed: &'static str) -> Result<(), &'static str> {
+    let bytes = decode_event_hex::<32>(value, malformed)?;
+    #[cfg(all(feature = "k256-backend", not(feature = "secp256k1-backend")))]
+    {
+        k256::schnorr::VerifyingKey::from_bytes(&bytes).map_err(|_| malformed)?;
+    }
+    #[cfg(all(feature = "secp256k1-backend", not(feature = "k256-backend")))]
+    {
+        secp256k1::XOnlyPublicKey::from_slice(&bytes).map_err(|_| malformed)?;
+    }
+    #[cfg(not(any(feature = "k256-backend", feature = "secp256k1-backend")))]
+    {
+        return Err("public-key validation backend unavailable");
+    }
+    Ok(())
+}
+
 #[cfg(all(feature = "k256-backend", not(feature = "secp256k1-backend")))]
 fn verify_event_signature(
     public_key: &[u8; 32],
@@ -655,6 +676,7 @@ impl<'a> RendezvousProvisionParams<'a> {
         {
             return Err("target device pubkey must be 64 lowercase hex characters");
         }
+        validate_xonly_public_key(target_device_pubkey, "target device pubkey is not a secp256k1 x-only key")?;
         let index = params[1]
             .as_u64()
             .ok_or("rendezvous index must be an unsigned integer")
@@ -2259,6 +2281,10 @@ mod tests {
         assert!(RendezvousProvisionParams::from_params(&provision_params[..3]).is_err());
         assert!(RendezvousProvisionParams::from_params(&[
             serde_json::json!("AB".repeat(32)), serde_json::json!(0),
+            serde_json::json!("AAECAwQFBgcICQoLDA0ODw"), serde_json::json!(1),
+        ]).is_err());
+        assert!(RendezvousProvisionParams::from_params(&[
+            serde_json::json!("ff".repeat(32)), serde_json::json!(0),
             serde_json::json!("AAECAwQFBgcICQoLDA0ODw"), serde_json::json!(1),
         ]).is_err());
         assert!(RendezvousProvisionParams::from_params(&[

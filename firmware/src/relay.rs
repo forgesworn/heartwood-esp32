@@ -7345,6 +7345,62 @@ fn dispatch_mgmt(
             }
         }
 
+        // Remove a dead remembered key while retaining the slot secret and
+        // policy. The current key is live authority, so this method refuses it;
+        // revoking the slot is the deliberate response to a compromised secret.
+        "remove_authorized_pubkey" => {
+            let slot_index = req
+                .pointer("/params/slot_index")
+                .and_then(|v| v.as_u64())
+                .ok_or("remove_authorized_pubkey requires params.slot_index")? as u8;
+            let pubkey = req
+                .pointer("/params/pubkey")
+                .and_then(|v| v.as_str())
+                .ok_or("remove_authorized_pubkey requires params.pubkey")?;
+            if pubkey.len() != 64
+                || !pubkey
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err("invalid_authorized_pubkey: expected 64 lowercase hex characters".into());
+            }
+            let target = ctx
+                .policy_engine
+                .list_slots(master_slot)
+                .iter()
+                .find(|slot| slot.slot_index == slot_index)
+                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
+            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
+            match ctx
+                .policy_engine
+                .remove_authorized_pubkey(master_slot, slot_index, pubkey)
+            {
+                Some(heartwood_common::policy::RemoveAuthorizedPubkey::Removed) => {
+                    persist_slot_mutation_or_rollback(
+                        ctx,
+                        master_slot,
+                        slot_snapshot,
+                        "authorised client-key removal",
+                    )?;
+                    Ok(serde_json::json!({
+                        "slot_index": slot_index,
+                        "pubkey": pubkey,
+                        "secret_fingerprint": secret_fingerprint,
+                        "removed": true,
+                    }))
+                }
+                Some(heartwood_common::policy::RemoveAuthorizedPubkey::Current) => {
+                    Err("current_authorized_pubkey: revoke the slot to remove its current key".into())
+                }
+                Some(heartwood_common::policy::RemoveAuthorizedPubkey::Missing) => {
+                    Err("authorized_pubkey_not_found".into())
+                }
+                None => Err(format!("no such slot: {slot_index}")),
+            }
+        }
+
         // Update a client slot's label / policy. Legacy slots retain the
         // historical partial-update/sign_event filter. Strict slots merge
         // omitted fields with their current ceiling, then replace the complete

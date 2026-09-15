@@ -10,8 +10,8 @@ use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{
     authorize_pubkey_on_unique_slot, evaluate_slot_policy, find_slot_by_pubkey,
     find_slot_by_secret, grant_slot_signing, next_slot_index, remove_ambiguous_pubkeys,
-    strict_slot_denies_method, validate_exact_slot_policy, ApprovalTier, ConnectSlot,
-    ExactSlotPolicy, CONNECT_SAFE_METHODS,
+    remove_authorized_pubkey, strict_slot_denies_method, validate_exact_slot_policy,
+    ApprovalTier, ConnectSlot, ExactSlotPolicy, RemoveAuthorizedPubkey, CONNECT_SAFE_METHODS,
 };
 
 /// Maximum concurrent client sessions.
@@ -575,6 +575,24 @@ impl PolicyEngine {
             self.slots_dirty = true;
         }
         removed
+    }
+
+    /// Prune a stale non-current client key from one slot.
+    pub fn remove_authorized_pubkey(
+        &mut self,
+        master_slot: u8,
+        slot_index: u8,
+        pubkey: &str,
+    ) -> Option<RemoveAuthorizedPubkey> {
+        let slot = self
+            .slots_mut(master_slot)
+            .iter_mut()
+            .find(|slot| slot.slot_index == slot_index)?;
+        let outcome = remove_authorized_pubkey(slot, pubkey);
+        if outcome == RemoveAuthorizedPubkey::Removed {
+            self.slots_dirty = true;
+        }
+        Some(outcome)
     }
 
     /// Find a slot by the current client pubkey (immutable).

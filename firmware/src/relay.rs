@@ -462,6 +462,14 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
         // early, back to the idle identity card.
         ctx.idle_page = 0;
         show_idle_identity(ctx);
+    } else if ctx.idle_page == 3
+        && crate::offline_qr::launch_if_requested(ctx.display, ctx.buttons)
+    {
+        // The physically-confirmed QR flow is self-contained and clears its
+        // bearer frame before returning. Restore ordinary idle state instead
+        // of leaving the last QR lit on a relay-connected unattended signer.
+        ctx.idle_page = 0;
+        show_idle_identity(ctx);
     } else {
         // Awake: a short press pages the idle info carousel.
         ctx.idle_page = (ctx.idle_page + 1) % 4;

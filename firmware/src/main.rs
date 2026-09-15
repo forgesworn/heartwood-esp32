@@ -60,6 +60,7 @@ mod notes;
 mod personas;
 mod nvs;
 mod nvs_stats;
+mod offline_qr;
 mod cat_sprites;
 mod oled;
 mod ota;
@@ -966,6 +967,13 @@ fn main() {
                         } else if confirm::dismiss() {
                             // A press while a signing confirmation is held
                             // dismisses the run early, back to the idle card.
+                            idle_page = 0;
+                        } else if idle_page == 3
+                            && offline_qr::launch_if_requested(&mut display, &buttons)
+                        {
+                            // The QR flow cleared the bearer image before it
+                            // returned. Restore the ordinary idle identity;
+                            // no secret-bearing frame is ever left behind.
                             idle_page = 0;
                         } else {
                             // Awake: a short press pages through the idle

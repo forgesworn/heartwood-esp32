@@ -1142,6 +1142,29 @@ pub fn handle_note_cmd_frame(
     with_locker(|notes| handle_note_cmd_frame_inner(usb, payload, notes, display, buttons))
 }
 
+/// Count confirmed plain bearer notes eligible for physical offline handover.
+/// Key notes deliberately do not appear: their secret is a signing key, not a
+/// `k1`, and presenting it as a URL would be both unusable and unsafe.
+pub fn offline_revealable_count() -> usize {
+    with_locker(|notes| notes.store.offline_revealable_count())
+}
+
+/// Copy one confirmed plain bearer note for the physical QR surface. The
+/// returned value zeroises its `k1` on drop; it must never be serialised or
+/// passed to a non-physical transport.
+pub fn offline_revealable_at(
+    ordinal: usize,
+) -> Option<heartwood_common::note_store::OfflineReveal> {
+    with_locker(|notes| notes.store.offline_revealable_at(ordinal))
+}
+
+/// Secret-free metadata for the offline handover picker.
+pub fn offline_revealable_meta_at(
+    ordinal: usize,
+) -> Option<heartwood_common::note_store::NoteMeta> {
+    with_locker(|notes| notes.store.offline_revealable_meta_at(ordinal))
+}
+
 fn handle_note_cmd_frame_inner(
     usb: &mut SerialPort<'_>,
     payload: &[u8],

@@ -60,6 +60,9 @@ esp-idf-hal = "0.46"
 # OLED display
 ssd1306 = "0.9"
 embedded-graphics = "0.8"
+# Heap-free QR encoder for the physical bearer-note handover screen. The
+# bounded v2/v8 output buffers live on the stack and are scrubbed after use.
+qrcodegen-no-heap = "1.8.1"
 
 # ST7789 colour TFT driver -- only compiled in for the `st7789` feature
 # (colour-panel boards). Mono-OLED Heltec builds never pull it in.

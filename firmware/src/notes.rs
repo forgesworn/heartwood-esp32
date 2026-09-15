@@ -683,6 +683,31 @@ pub fn any_notes_held() -> bool {
     NOTES_HELD.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Counts that are safe to show on the idle panel. They intentionally disclose
+/// neither value, secret, mint nor sender: a locker is a till, not a balance
+/// display. Sealed records are still held notes, so they are included even
+/// before the at-rest key has been supplied this boot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdleSummary {
+    pub held: usize,
+    pub received: usize,
+    pub pending: usize,
+}
+
+/// Take a momentary, read-only locker summary for the local idle display.
+/// Holding the mutex is bounded to three in-memory counters; it performs no
+/// flash I/O and cannot change a note or an approval decision.
+pub fn idle_summary() -> IdleSummary {
+    with_locker(|notes| {
+        let (loaded, pending) = notes.store.counts();
+        IdleSummary {
+            held: loaded + notes.sealed_count(),
+            received: notes.store.received_count(),
+            pending,
+        }
+    })
+}
+
 /// The persisted gift-wrap ledger blob, or `None` when there is none (first
 /// boot, or a locker with no storage).
 pub fn load_wrap_ledger() -> Option<alloc_vec::Vec<u8>> {

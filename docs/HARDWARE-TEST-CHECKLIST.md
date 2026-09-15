@@ -1054,6 +1054,16 @@ USB tier, unlocked, no at-rest:
    real in passing: a client with no tag filtering picked up the previous
    request's late reply, which is precisely what the field prevents.
 
+1d. Idle locker summary: on a non-production board, short-press through the
+   four idle pages in both USB and WiFi-standalone modes. The fourth page is
+   `NOTES`, with only `held`, `received` and `pending` counts plus `4/4`.
+   Create one test secret and confirm it: before confirmation the card must
+   agree with `get_info` that one note is held and one is pending; afterwards
+   it must show one held and zero pending. Receive one disposable test wrap
+   and confirm that `received` advances. The card must show no amount, mint,
+   sender, note id or secret, and a sealed-at-rest record must remain included
+   in `held` before unlock. NOT YET BENCH-RUN.
+
 1c. LUD-25 seed-recoverable note secrets, end to end. **PASSED 2026-09-06**
    (Heltec V4, USB mode, after the `Storage` delegation fix in #109 — before
    it, `provision_cash_node` failed `storage_full` on a board with 156 free

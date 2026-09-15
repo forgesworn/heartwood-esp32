@@ -30,6 +30,9 @@ use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 use heartwood_common::note_cmd::{
     self, Approval, Earned, GatedCmd, GrantClient, NoteCmdContext, SpendGrant, WrapFn,
 };
+use heartwood_common::device_identity::{
+    self, DeviceIdentityProof, IDENTITY_SEED_LEN,
+};
 use heartwood_common::note_fmt::{amount_and_host, amount_and_host_line, CARD_LINE_CHARS};
 use heartwood_common::note_seal;
 use heartwood_common::note_store::{
@@ -47,6 +50,11 @@ use crate::serial::SerialPort;
 /// writes per human-paced spend) stays legible in nvs_stats and is trivially
 /// excludable from anything that walks the `heartwood` namespace.
 const NAMESPACE: &str = "hw_notes";
+/// The board-pinning key has its own namespace, deliberately separate from
+/// master identities and note state. A complete factory/PIN wipe erases the
+/// NVS partition and therefore makes a wiped board a new board to TOFU hosts.
+const IDENTITY_NAMESPACE: &str = "hw_device";
+const IDENTITY_KEY: &str = "ed25519";
 const INDEX_KEY: &str = "idx";
 /// The wrapped note key: `seed_cipher::encrypt_seed(secret, note_key)`.
 const NK_KEY: &str = "nk";
@@ -375,6 +383,7 @@ pub fn with_locker<R>(f: impl FnOnce(&mut Notes) -> R) -> R {
 pub struct Notes {
     pub store: NoteStore,
     storage: Storage,
+    device_identity: DeviceIdentityNvs,
     boot_state: &'static str,
     /// Senders whose wraps skip the RECEIVE card. Loaded at boot; a blob
     /// that does not decode is an empty list, never a guess.
@@ -392,6 +401,107 @@ pub struct Notes {
     /// board that has rebooted since cannot know that. A grant surviving a
     /// power cycle would be a card the owner never saw.
     pub grants: SpendGrant,
+}
+
+/// The private seed used only to prove a physical board over the cable.
+///
+/// It is deliberately read, used and wiped per challenge rather than retained
+/// in the long-lived locker state. A missing key is created exactly once at
+/// boot; malformed, blank or unreadable existing state is never overwritten
+/// because silently changing a pinned board identity trains a host to ignore
+/// the warning this mechanism exists to provide.
+struct DeviceIdentityNvs {
+    nvs: Option<EspNvs<NvsDefault>>,
+}
+
+impl DeviceIdentityNvs {
+    fn open(partition: EspNvsPartition<NvsDefault>) -> Self {
+        let Ok(nvs) = EspNvs::new(partition, IDENTITY_NAMESPACE, true) else {
+            log::error!("[identity] namespace unavailable; cable identity disabled");
+            return Self { nvs: None };
+        };
+        let mut identity = Self { nvs: Some(nvs) };
+        identity.ensure_at_boot();
+        identity
+    }
+
+    fn read_seed(&self) -> Result<Option<[u8; IDENTITY_SEED_LEN]>, &'static str> {
+        let Some(nvs) = &self.nvs else {
+            return Err("identity storage unavailable");
+        };
+        let mut seed = [0u8; IDENTITY_SEED_LEN];
+        match nvs.get_blob(IDENTITY_KEY, &mut seed) {
+            Ok(None) => Ok(None),
+            Ok(Some(bytes)) if bytes.len() == IDENTITY_SEED_LEN => {
+                if device_identity::seed_is_blank(&seed) {
+                    seed.zeroize();
+                    Err("identity seed is blank")
+                } else {
+                    Ok(Some(seed))
+                }
+            }
+            Ok(Some(_)) => {
+                seed.zeroize();
+                Err("identity seed has invalid length")
+            }
+            Err(_) => {
+                seed.zeroize();
+                Err("identity seed could not be read")
+            }
+        }
+    }
+
+    fn ensure_at_boot(&mut self) {
+        match self.read_seed() {
+            Ok(Some(mut seed)) => {
+                seed.zeroize();
+            }
+            Err(error) => {
+                log::error!("[identity] {error}; cable identity disabled");
+            }
+            Ok(None) => {
+                let Some(nvs) = self.nvs.as_mut() else {
+                    return;
+                };
+                let mut seed = [0u8; IDENTITY_SEED_LEN];
+                crate::fill_random(&mut seed);
+                if device_identity::seed_is_blank(&seed) {
+                    log::error!("[identity] RNG produced a blank seed; cable identity disabled");
+                    seed.zeroize();
+                    return;
+                }
+                if nvs.set_blob(IDENTITY_KEY, &seed).is_err() {
+                    log::error!("[identity] could not persist generated seed; cable identity disabled");
+                    seed.zeroize();
+                    return;
+                }
+                let verified = self
+                    .read_seed()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|mut stored| {
+                        let matches = stored == seed;
+                        stored.zeroize();
+                        matches
+                    });
+                seed.zeroize();
+                if verified {
+                    log::info!("[identity] generated and persisted cable identity");
+                } else {
+                    log::error!("[identity] generated seed did not read back; cable identity disabled");
+                }
+            }
+        }
+    }
+
+    fn prove(&mut self, nonce: &[u8]) -> Result<DeviceIdentityProof, &'static str> {
+        let mut seed = self
+            .read_seed()?
+            .ok_or("identity seed is absent")?;
+        let proof = device_identity::sign_challenge(&seed, nonce).ok_or("identity signing refused");
+        seed.zeroize();
+        proof
+    }
 }
 
 impl Notes {
@@ -482,6 +592,9 @@ pub fn init(partition: EspNvsPartition<NvsDefault>) {
 }
 
 fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
+    // This opens its own namespace. It remains available on a PIN-locked boot
+    // so a host can reject a swapped cable device before attempting unlock.
+    let device_identity = DeviceIdentityNvs::open(partition.clone());
     let nvs = match EspNvs::new(partition, NAMESPACE, true) {
         Ok(nvs) => nvs,
         Err(e) => {
@@ -491,6 +604,7 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
             return Notes {
                 store: NoteStore::storage_unavailable(MAX_NOTES),
                 storage: Storage::Null(NullStorage),
+                device_identity,
                 boot_state: "unavailable",
                 trust: TrustList::new(),
                 // Empty, and it stays empty: with no namespace there is
@@ -547,7 +661,15 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
             log::info!("[notes] cash mint {host}, next index {next_index}");
         }
     }
-    Notes { store: outcome.store, storage, boot_state, trust, cash, grants: SpendGrant::new() }
+    Notes {
+        store: outcome.store,
+        storage,
+        device_identity,
+        boot_state,
+        trust,
+        cash,
+        grants: SpendGrant::new(),
+    }
 }
 
 /// Whether the device holds any notes (loaded or sealed), for code with no
@@ -1031,6 +1153,7 @@ fn handle_note_cmd_frame_inner(
     // write failing inside THIS dispatch shows in the next get_info, which
     // is when the wallet re-reads it anyway.
     let storage_state = notes.storage_state();
+    let mut device_identity = |nonce: &[u8]| notes.device_identity.prove(nonce);
     let mut ctx = NoteCmdContext {
         store: &mut notes.store,
         storage: &mut notes.storage,
@@ -1041,8 +1164,9 @@ fn handle_note_cmd_frame_inner(
         // session is one client here - and never the same one as a relay
         // client, so a grant can never cross between the two surfaces.
         client: GrantClient::Cable,
-        // No identity to seal as on the cable: send answers bad_request.
+        // No Nostr identity to seal as on the cable: send answers bad_request.
         wrap: None,
+        device_identity: Some(&mut device_identity),
         trust: &mut notes.trust,
         approve_trust: &mut approve_trust,
         cash: &mut notes.cash,
@@ -1076,7 +1200,8 @@ fn handle_note_cmd_frame_inner(
 
 /// The locked-boot subset: `get_info` answers truthfully (counts and storage
 /// state expose no secret and let the wallet say "locked device" instead of
-/// "broken device"); every other command NACKs with a reason. This is the
+/// "broken device"); `identify` can prove the same physical board before an
+/// unlock attempt. Every other command NACKs with a reason. This is the
 /// exception the frame-type comment in types.rs documents.
 pub fn handle_note_cmd_frame_locked(usb: &mut SerialPort<'_>, payload: &[u8]) {
     with_locker(|notes| handle_note_cmd_frame_locked_inner(usb, payload, notes))
@@ -1087,12 +1212,27 @@ fn handle_note_cmd_frame_locked_inner(
     payload: &[u8],
     notes: &mut Notes,
 ) {
-    let is_get_info = core::str::from_utf8(payload)
+    let command = core::str::from_utf8(payload)
         .ok()
-        .and_then(|msg| serde_json::from_str::<serde_json::Value>(msg).ok())
-        .map(|cmd| cmd.get("cmd").and_then(|v| v.as_str()) == Some("get_info"))
-        .unwrap_or(false);
-    if !is_get_info {
+        .and_then(|msg| serde_json::from_str::<serde_json::Value>(msg).ok());
+    let command_name = command
+        .as_ref()
+        .and_then(|cmd| cmd.get("cmd"))
+        .and_then(serde_json::Value::as_str);
+    if command_name == Some("identify") {
+        let nonce = command
+            .as_ref()
+            .and_then(|cmd| cmd.get("nonce"))
+            .and_then(serde_json::Value::as_str);
+        let response = note_cmd::identify_response(nonce, &mut |nonce| {
+            notes.device_identity.prove(nonce)
+        });
+        let bytes = serde_json::to_vec(&response)
+            .unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"bad_request\"}".to_vec());
+        protocol::write_frame(usb, FRAME_TYPE_NOTE_RESP, &bytes);
+        return;
+    }
+    if command_name != Some("get_info") {
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"locked");
         return;
     }
@@ -1154,6 +1294,7 @@ pub fn run_note_cmd_approved(
             grant: &mut notes.grants,
             client: GrantClient::Relay(*client),
             wrap,
+            device_identity: None,
             trust: &mut notes.trust,
             approve_trust: &mut approve_trust,
             cash: &mut notes.cash,

@@ -18,11 +18,13 @@
 //
 // Usage:
 //   node scripts/note-cmd.mjs --port /dev/cu.usbmodemXXXX '{"cmd":"get_info"}'
+//   node scripts/note-cmd.mjs --port ... '{"cmd":"identify","nonce":"0123456789abcdef0123456789abcdef"}'
 //   node scripts/note-cmd.mjs --port ... '{"cmd":"new_secret","label":"float"}'
 //   node scripts/note-cmd.mjs --port ... '{"cmd":"export_secret","id":"a1b2c3d4"}'
 //
 // node-serialport opens do not reset a native-USB S3 (unlike Rust tools) —
-// safe against an unlocked bench device. A locked device NACKs 0x70.
+// safe against an unlocked bench device. A locked device permits only the
+// read-only get_info and identify commands, and NACKs every mutation.
 
 import { argv, env } from 'node:process'
 

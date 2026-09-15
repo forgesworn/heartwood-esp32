@@ -74,6 +74,10 @@ cash = ["mnemonic", "k256?/ecdsa", "secp256k1?/recovery"]
 # OTA release signatures: sign (CI tool) + verify (device) share one module so
 # the message format can never drift between signer and verifier.
 ota-sign = ["dep:ed25519-compact"]
+# Cable trust-on-first-use identity. This deliberately reuses the small
+# Ed25519 implementation already pinned for OTA signatures, but its signing
+# transcript and key material are separate.
+device-identity = ["dep:ed25519-compact"]
 # PIN-derived seed encryption at rest (P5). Pulls PBKDF2 + reuses chacha20.
 seed-encrypt = ["dep:pbkdf2", "dep:chacha20"]
 # Convenience alias for secp256k1 backend with full feature set (used by firmware)

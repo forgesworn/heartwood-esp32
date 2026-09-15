@@ -33,7 +33,13 @@ mod tests {
     #[test]
     fn record_is_compact_canonical_and_uses_unpadded_base64url_for_the_scalar() {
         let record = encode_record(&[0x01; 32], &[0x02; 32], &[0x03; 32], 7, "AAECAwQFBgcICQoLDA0ODw", 1_700_000_000, &[0xff; 32]);
-        assert_eq!(record, concat!("{\"v\":1,\"p\":\"0101010101010101010101010101010101010101010101010101010101010101\",", "\"d\":\"0202020202020202020202020202020202020202020202020202020202020202\",", "\"rz\":\"0303030303030303030303030303030303030303030303030303030303030303\",", "\"u\":\"rendezvous\",\"i\":7,\"n\":\"AAECAwQFBgcICQoLDA0ODw\",\"e\":1700000000,", "\"k\":\"__________________________________________8\"}"));
+        let expected = format!(
+            "{{\"v\":1,\"p\":\"{}\",\"d\":\"{}\",\"rz\":\"{}\",\"u\":\"rendezvous\",\"i\":7,\"n\":\"AAECAwQFBgcICQoLDA0ODw\",\"e\":1700000000,\"k\":\"__________________________________________8\"}}",
+            "01".repeat(32),
+            "02".repeat(32),
+            "03".repeat(32),
+        );
+        assert_eq!(record, expected);
         assert!(!record.contains(' '));
         assert!(!record.contains('='));
     }

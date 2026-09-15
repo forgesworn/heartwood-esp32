@@ -2349,12 +2349,22 @@ fn handle_rendezvous_provision(master_secret: &[u8; 32], master_mode: MasterMode
     let receipt = RendezvousProvisionReceipt { target_device_pubkey: target, rendezvous_pubkey: child_pubkey, index: params.index, nonce_digest: heartwood_common::rendezvous_receipts::nonce_digest(params.nonce), expires_at: params.expires_at };
     if let Err(error) = receipts.record(receipt) { return build_error_json(&request.id, -1, error); }
     if let Err(error) = crate::rendezvous_provision::persist(nvs, master_slot, &receipts) { return build_error_json(&request.id, -4, error); }
-    let result = serde_json::json!({
-        "v": 1, "p": hex_encode(&issuer), "d": params.target_device_pubkey,
-        "rz": hex_encode(&child_pubkey), "u": "rendezvous", "i": params.index,
-        "n": params.nonce, "e": params.expires_at, "c": ciphertext,
-    });
-    nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
+    // These values are fixed-width encodings or were validated by
+    // `RendezvousProvisionParams`, so hand-building this compact public
+    // envelope cannot admit JSON syntax from a caller. Keeping it direct also
+    // avoids pulling serde's map machinery into the constrained Heltec-v3
+    // release image.
+    let result = format!(
+        "{{\"v\":1,\"p\":\"{}\",\"d\":\"{}\",\"rz\":\"{}\",\"u\":\"rendezvous\",\"i\":{},\"n\":\"{}\",\"e\":{},\"c\":\"{}\"}}",
+        hex_encode(&issuer),
+        params.target_device_pubkey,
+        hex_encode(&child_pubkey),
+        params.index,
+        params.nonce,
+        params.expires_at,
+        ciphertext,
+    );
+    nip46::build_result_response(&request.id, &result).unwrap_or_default()
 }
 
 /// Generate a random 16-byte IV for per-message NIP-04 encryption. Same

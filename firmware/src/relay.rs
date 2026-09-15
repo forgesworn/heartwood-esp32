@@ -3400,6 +3400,66 @@ fn emit_gift_wrap(
     ws_send_event(tls, &wrap).map(|_| ())
 }
 
+/// Opted-in guardian-client recipients for a master. The binding must name
+/// the derived guardian NP exactly and the flag is separate from child audit
+/// wrapping, so a dependant reader cannot receive guardian notices merely by
+/// being audit-visible. Invalid or duplicate targets are ignored; the NP is
+/// already receiving the compatibility copy.
+fn guardian_client_targets(
+    ctx: &SignCtx,
+    master_slot: u8,
+    guardian_hex: &str,
+    guardian_pk: &[u8; 32],
+) -> Vec<[u8; 32]> {
+    let mut targets = Vec::new();
+    for client_pk in heartwood_common::policy::guardian_notice_recipient_pubkeys(
+        ctx.policy_engine.list_slots(master_slot),
+        guardian_hex,
+    )
+    .into_iter()
+    .filter_map(|hex| {
+        hex_decode(hex)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+    })
+    {
+        if client_pk != *guardian_pk && !targets.contains(&client_pk) {
+            targets.push(client_pk);
+            if targets.len() == CHILD_WRAP_MAX {
+                break;
+            }
+        }
+    }
+    targets
+}
+
+/// Best-effort local-client copies of C4/C5 guardian notices. The canonical
+/// guardian-NP wrap has already succeeded before this is called, so a failed
+/// extra recipient can never suppress the compatibility path or signing work.
+fn emit_guardian_client_wraps(
+    tls: &mut Tls,
+    ctx: &SignCtx,
+    master_slot: u8,
+    guardian_hex: &str,
+    guardian_secret: &[u8; 32],
+    guardian_pk: &[u8; 32],
+    rumor: &heartwood_common::nip46::UnsignedEvent,
+    expiration: Option<u64>,
+) {
+    for client_pk in guardian_client_targets(ctx, master_slot, guardian_hex, guardian_pk) {
+        if let Err(e) = emit_gift_wrap(
+            tls,
+            ctx.secp,
+            rumor,
+            guardian_secret,
+            &client_pk,
+            expiration,
+        ) {
+            log::warn!("[relay] guardian client wrap: {e}");
+        }
+    }
+}
+
 fn build_gift_wrap(
     secp: &Arc<Secp256k1<SignOnly>>,
     rumor: &heartwood_common::nip46::UnsignedEvent,
@@ -3469,11 +3529,12 @@ fn emit_approval_notice(
     park: &ParkedRequest,
 ) -> Result<(), String> {
     let (np_secret, np_pk) = guardian_np(ctx.masters, park.master_slot)?;
+    let guardian_hex = hex_encode(&np_pk);
     let stamped =
         heartwood_common::nip59::stamp_monotonic(park.created_at, &mut ctx.audit_last_stamped);
     let rumor = heartwood_common::nip59::build_approval_notice(
         &heartwood_common::nip59::ApprovalNotice {
-            guardian_np_hex: &hex_encode(&np_pk),
+            guardian_np_hex: &guardian_hex,
             client_hex: &park.client_hex,
             park_id_hex: &park.park_id,
             identity_hex: &hex_encode(&park.target_pk),
@@ -3483,14 +3544,26 @@ fn emit_approval_notice(
             created_at: stamped,
         },
     );
+    let expiration = Some(stamped + heartwood_common::nip59::APPROVAL_EXPIRY_SECS);
     emit_gift_wrap(
         tls,
         ctx.secp,
         &rumor,
         &np_secret,
         &np_pk,
-        Some(stamped + heartwood_common::nip59::APPROVAL_EXPIRY_SECS),
-    )
+        expiration,
+    )?;
+    emit_guardian_client_wraps(
+        tls,
+        ctx,
+        park.master_slot,
+        &guardian_hex,
+        &np_secret,
+        &np_pk,
+        &rumor,
+        expiration,
+    );
+    Ok(())
 }
 
 /// Count a petition ask and publish the §1.2 notice (low priority, 7-day
@@ -3528,12 +3601,13 @@ fn petition_and_notify(
     };
     let result = (|| -> Result<(), String> {
         let (np_secret, np_pk) = guardian_np(ctx.masters, master_slot)?;
+        let guardian_hex = hex_encode(&np_pk);
         let stamped = heartwood_common::nip59::stamp_monotonic(
             trigger_created_at,
             &mut ctx.audit_last_stamped,
         );
         let rumor = heartwood_common::nip59::build_petition_notice(
-            &hex_encode(&np_pk),
+            &guardian_hex,
             client_hex,
             &hex_encode(target_pk),
             method,
@@ -3541,14 +3615,26 @@ fn petition_and_notify(
             count,
             stamped,
         );
+        let expiration = Some(stamped + heartwood_common::nip59::PETITION_EXPIRY_SECS);
         emit_gift_wrap(
             tls,
             ctx.secp,
             &rumor,
             &np_secret,
             &np_pk,
-            Some(stamped + heartwood_common::nip59::PETITION_EXPIRY_SECS),
-        )
+            expiration,
+        )?;
+        emit_guardian_client_wraps(
+            tls,
+            ctx,
+            master_slot,
+            &guardian_hex,
+            &np_secret,
+            &np_pk,
+            &rumor,
+            expiration,
+        );
+        Ok(())
     })();
     if let Err(e) = result {
         log::warn!("[relay] petition notice: {e}");
@@ -3569,11 +3655,12 @@ fn emit_audit_rail(
     trigger_created_at: u64,
 ) -> Result<(), String> {
     let (np_secret, np_pk) = guardian_np(ctx.masters, master_slot)?;
+    let guardian_hex = hex_encode(&np_pk);
     let stamped =
         heartwood_common::nip59::stamp_monotonic(trigger_created_at, &mut ctx.audit_last_stamped);
     ctx.audit_emit_seq = ctx.audit_emit_seq.wrapping_add(1);
     let rumor = heartwood_common::nip59::build_audit_rumor(&heartwood_common::nip59::AuditRumor {
-        guardian_np_hex: &hex_encode(&np_pk),
+        guardian_np_hex: &guardian_hex,
         dependant_hex: target_hex,
         created_at: stamped,
         emit_counter: ctx.audit_emit_seq,
@@ -3583,6 +3670,16 @@ fn emit_audit_rail(
         counterparty_hex: draft.counterparty.as_deref(),
     });
     emit_gift_wrap(tls, ctx.secp, &rumor, &np_secret, &np_pk, None)?;
+    emit_guardian_client_wraps(
+        tls,
+        ctx,
+        master_slot,
+        &guardian_hex,
+        &np_secret,
+        &np_pk,
+        &rumor,
+        None,
+    );
 
     // §2.1 dual-address: same rumor, sealed by the same NP, wrapped to each
     // audit-visible child slot bound to this identity. Best effort each.
@@ -5929,6 +6026,10 @@ fn exact_policy_from_request(req: &serde_json::Value) -> Result<ExactSlotPolicy,
         .pointer("/params/policy/audit_child_wrap")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    policy.guardian_notice_wrap = req
+        .pointer("/params/policy/guardian_notice_wrap")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     policy.bound_identity = req
         .pointer("/params/policy/bound_identity")
         .and_then(|value| value.as_str())
@@ -6968,6 +7069,7 @@ fn dispatch_mgmt(
                             policy.escalate,
                             policy.petition_on_deny,
                             policy.audit_child_wrap,
+                            policy.guardian_notice_wrap,
                             policy.bound_identity.clone(),
                         );
                     } else {
@@ -7509,6 +7611,9 @@ fn dispatch_mgmt(
                     req.pointer("/params/audit_child_wrap")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(target.audit_child_wrap),
+                    req.pointer("/params/guardian_notice_wrap")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(target.guardian_notice_wrap),
                     req.pointer("/params/bound_identity")
                         .and_then(|v| v.as_str())
                         .filter(|s| is_hex64(s))
@@ -7823,6 +7928,7 @@ fn dispatch_mgmt(
                                 policy.escalate,
                                 policy.petition_on_deny,
                                 policy.audit_child_wrap,
+                                policy.guardian_notice_wrap,
                                 policy.bound_identity.clone(),
                             );
                             persist_slot_mutation_or_rollback(

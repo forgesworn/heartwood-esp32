@@ -172,6 +172,7 @@ pub fn handle_update(
                 if v.get("escalate").is_some()
                     || v.get("petition_on_deny").is_some()
                     || v.get("audit_child_wrap").is_some()
+                    || v.get("guardian_notice_wrap").is_some()
                     || v.get("bound_identity").is_some()
                 {
                     if !changes.is_empty() { changes.push_str(", "); }
@@ -212,6 +213,7 @@ pub fn handle_update(
                         if v.get("escalate").is_some()
                             || v.get("petition_on_deny").is_some()
                             || v.get("audit_child_wrap").is_some()
+                            || v.get("guardian_notice_wrap").is_some()
                             || v.get("bound_identity").is_some()
                         {
                             let existing = policy_engine
@@ -223,16 +225,18 @@ pub fn handle_update(
                                         s.escalate,
                                         s.petition_on_deny,
                                         s.audit_child_wrap,
+                                        s.guardian_notice_wrap,
                                         s.bound_identity.clone(),
                                     )
                                 })
-                                .unwrap_or((false, false, false, None));
+                                .unwrap_or((false, false, false, false, None));
                             policy_engine.set_slot_family_flags(
                                 ms,
                                 idx,
                                 v["escalate"].as_bool().unwrap_or(existing.0),
                                 v["petition_on_deny"].as_bool().unwrap_or(existing.1),
                                 v["audit_child_wrap"].as_bool().unwrap_or(existing.2),
+                                v["guardian_notice_wrap"].as_bool().unwrap_or(existing.3),
                                 v["bound_identity"]
                                     .as_str()
                                     .filter(|s| {
@@ -240,7 +244,7 @@ pub fn handle_update(
                                             && s.bytes().all(|b| b.is_ascii_hexdigit())
                                     })
                                     .map(|s| s.to_ascii_lowercase())
-                                    .or(existing.3),
+                                    .or(existing.4),
                             );
                         }
                         policy_engine.persist_slots(nvs, ms);

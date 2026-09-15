@@ -81,6 +81,12 @@ pub struct ConnectSlot {
     /// pubkey (the child's own paired device), best effort.
     #[serde(default)]
     pub audit_child_wrap: bool,
+    /// C4/C5 guardian copy: when true, notices addressed to this slot's bound
+    /// identity are additionally gift-wrapped to its current client key.
+    /// Kept distinct from `audit_child_wrap`, so a dependant's audit reader
+    /// never becomes an implicit guardian-notice recipient.
+    #[serde(default)]
+    pub guardian_notice_wrap: bool,
     /// The identity (64-char hex pubkey) this pairing is bound to, when the
     /// operator recorded one. Consulted only by the C5 child-wrap scan this
     /// cycle: a policy-decided signing as identity X wraps to every slot of
@@ -155,6 +161,8 @@ pub struct ExactSlotPolicy {
     pub petition_on_deny: bool,
     /// C5 dual-address child wrap (schema doc §2.1). Additive; defaults false.
     pub audit_child_wrap: bool,
+    /// C4/C5 guardian client copy. Additive and opt-in; defaults false.
+    pub guardian_notice_wrap: bool,
     /// Identity binding for the child-wrap scan (schema doc §2.1).
     pub bound_identity: Option<String>,
 }
@@ -197,6 +205,7 @@ pub fn validate_exact_slot_policy(
         escalate: false,
         petition_on_deny: false,
         audit_child_wrap: false,
+        guardian_notice_wrap: false,
         bound_identity: None,
     })
 }
@@ -343,6 +352,24 @@ pub fn upsert_policy(policies: &mut Vec<ClientPolicy>, policy: ClientPolicy) {
 pub fn slot_authorizes(slot: &ConnectSlot, pubkey: &str) -> bool {
     slot.current_pubkey.as_deref() == Some(pubkey)
         || slot.authorized_pubkeys.iter().any(|p| p == pubkey)
+}
+
+/// Return current client keys explicitly opted in to receive a guardian's
+/// C4/C5 copy. A matching identity alone is not enough: the policy flag keeps
+/// child audit readers from becoming guardian-notice recipients by accident.
+/// The relay validates the returned public-key strings before use.
+pub fn guardian_notice_recipient_pubkeys<'a>(
+    slots: &'a [ConnectSlot],
+    guardian_identity: &str,
+) -> Vec<&'a str> {
+    slots
+        .iter()
+        .filter(|slot| {
+            slot.guardian_notice_wrap
+                && slot.bound_identity.as_deref() == Some(guardian_identity)
+        })
+        .filter_map(|slot| slot.current_pubkey.as_deref())
+        .collect()
 }
 
 /// Remove a stale remembered client key without changing the slot credential
@@ -841,6 +868,7 @@ mod tests {
             escalate: false,
             petition_on_deny: false,
             audit_child_wrap: false,
+            guardian_notice_wrap: false,
             bound_identity: None,
         }
     }
@@ -864,6 +892,27 @@ mod tests {
         assert_eq!(
             evaluate_slot_policy(&slot, "nip44_decrypt", None),
             ApprovalTier::Denied,
+        );
+    }
+
+    #[test]
+    fn guardian_notice_recipient_requires_an_explicit_guardian_flag() {
+        let guardian = "11".repeat(32);
+        let recipient = "22".repeat(32);
+        let mut opted_in = sample_slot(0, "guardian app");
+        opted_in.bound_identity = Some(guardian.clone());
+        opted_in.current_pubkey = Some(recipient.clone());
+        opted_in.guardian_notice_wrap = true;
+
+        // A child-audit reader with the same identity binding is not enough.
+        let mut child_only = sample_slot(1, "child audit reader");
+        child_only.bound_identity = Some(guardian.clone());
+        child_only.current_pubkey = Some("33".repeat(32));
+        child_only.audit_child_wrap = true;
+
+        assert_eq!(
+            guardian_notice_recipient_pubkeys(&[opted_in, child_only], &guardian),
+            vec![recipient.as_str()],
         );
     }
 

@@ -72,6 +72,7 @@ mod tests {
             escalate: false,
             petition_on_deny: false,
             audit_child_wrap: false,
+            guardian_notice_wrap: false,
             bound_identity: None,
         }
     }

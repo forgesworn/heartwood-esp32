@@ -34,6 +34,7 @@
 //! (3) A **WS ping** every ~20s plus a silence deadline detects relay-level
 //! death (TCP fine but no events flowing) and forces a reconnect.
 
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,7 +45,7 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use esp_idf_svc::tls::{Config as TlsConfig, EspTls, InternalSocket, KeepAliveConfig};
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfig, EspWifi,
-    PmfConfiguration,
+    PmfConfiguration, WifiEvent,
 };
 use secp256k1::{Keypair, Secp256k1, SignOnly};
 use zeroize::Zeroize;
@@ -58,6 +59,7 @@ use heartwood_common::net_config::{
     apply_remote_net_config_patch, network_activation_source_allowed,
     network_commit_source_allowed, NetConfig, NetworkConfigTransactionParams, NetworkRuntimeError,
     NetworkRuntimeStage, NetworkRuntimeStatus, NetworkTrialPhase, StageNetworkConfigParams,
+    WifiFailureReason,
 };
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
@@ -574,6 +576,16 @@ fn set_network_runtime(
         wifi_connected,
         relay_connected,
         last_error_class,
+        last_wifi_failure: if last_error_class == NetworkRuntimeError::WifiUnavailable {
+            ctx.network_runtime.last_wifi_failure
+        } else {
+            None
+        },
+        last_wifi_error_code: if last_error_class == NetworkRuntimeError::WifiUnavailable {
+            ctx.network_runtime.last_wifi_error_code
+        } else {
+            None
+        },
         // Carried across a stage change, and cleared the instant no relay is
         // being served. A stale index would name a relay that is no longer
         // answering, which is worse than admitting we are between sessions:
@@ -622,6 +634,56 @@ fn set_network_runtime(
         // for burn-in protection. Explicit management transitions do.
         show_network_feedback(ctx, feedback, false, restore);
     }
+}
+
+/// The station reason values are the stable ESP-IDF `wifi_err_reason_t`
+/// values. They are intentionally converted to a closed local label before
+/// they cross the USB frame boundary; the raw code remains only to help an
+/// attached operator compare it with the ESP-IDF manual.
+const WIFI_REASON_AUTH_EXPIRE: u16 = 2;
+const WIFI_REASON_ASSOC_EXPIRE: u16 = 4;
+const WIFI_REASON_ASSOC_TOO_MANY: u16 = 5;
+const WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: u16 = 15;
+const WIFI_REASON_NO_AP_FOUND: u16 = 201;
+const WIFI_REASON_AUTH_FAIL: u16 = 202;
+const WIFI_REASON_ASSOC_FAIL: u16 = 203;
+const WIFI_REASON_HANDSHAKE_TIMEOUT: u16 = 204;
+
+#[derive(Clone, Copy)]
+enum WifiJoinStage {
+    Connect,
+    WaitForIp,
+}
+
+fn classify_wifi_failure(stage: WifiJoinStage, station_reason: u16) -> WifiFailureReason {
+    match station_reason {
+        WIFI_REASON_AUTH_EXPIRE => WifiFailureReason::AuthenticationExpired,
+        WIFI_REASON_AUTH_FAIL => WifiFailureReason::AuthenticationFailed,
+        WIFI_REASON_ASSOC_EXPIRE | WIFI_REASON_ASSOC_TOO_MANY | WIFI_REASON_ASSOC_FAIL => {
+            WifiFailureReason::AssociationFailed
+        }
+        WIFI_REASON_NO_AP_FOUND => WifiFailureReason::NetworkNotFound,
+        WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT | WIFI_REASON_HANDSHAKE_TIMEOUT => {
+            WifiFailureReason::HandshakeTimedOut
+        }
+        _ if matches!(stage, WifiJoinStage::WaitForIp) => WifiFailureReason::IpUnavailable,
+        _ => WifiFailureReason::DriverError,
+    }
+}
+
+fn record_wifi_failure(
+    ctx: &mut SignCtx<'_, '_, '_>,
+    stage: WifiJoinStage,
+    error: &esp_idf_svc::sys::EspError,
+    disconnect_reason: &AtomicU16,
+) {
+    let station_reason = disconnect_reason.load(Ordering::Acquire);
+    ctx.network_runtime.last_wifi_failure = Some(classify_wifi_failure(stage, station_reason));
+    ctx.network_runtime.last_wifi_error_code = Some(if station_reason == 0 {
+        error.code()
+    } else {
+        i32::from(station_reason)
+    });
 }
 
 /// Collapse detailed internal transport errors into the closed diagnostic
@@ -812,9 +874,22 @@ pub fn run_wifi_standalone<'d, 'b>(
     }
 
     let sysloop = EspSystemEventLoop::take().expect("relay: sysloop");
+    // ESP-IDF reports why a station left through the event loop, not through
+    // `connect()`'s generic EspError. Keep only that small numeric reason so
+    // GET_NET_CONFIG can answer an attached owner without bringing console
+    // bytes back onto the shared USB frame channel.
+    let wifi_disconnect_reason = Arc::new(AtomicU16::new(0));
+    let reason_from_event = Arc::clone(&wifi_disconnect_reason);
+    let _wifi_event_subscription = sysloop
+        .subscribe::<WifiEvent<'_>, _>(move |event| {
+            if let WifiEvent::StaDisconnected(disconnected) = event {
+                reason_from_event.store(disconnected.reason(), Ordering::Release);
+            }
+        })
+        .expect("relay: wifi event subscription");
     let mut wifi = BlockingWifi::wrap(
         EspWifi::new(modem, sysloop.clone(), None).expect("relay: wifi new"),
-        sysloop,
+        sysloop.clone(),
     )
     .expect("relay: blocking wrap");
 
@@ -1041,10 +1116,18 @@ pub fn run_wifi_standalone<'d, 'b>(
                 );
                 sessions.clear();
             }
-            if let Err(e) = wifi.connect().and_then(|_| wifi.wait_netif_up()) {
+            wifi_disconnect_reason.store(0, Ordering::Release);
+            let joined = wifi.connect()
+                .map_err(|error| (WifiJoinStage::Connect, error))
+                .and_then(|_| {
+                    wifi.wait_netif_up()
+                        .map_err(|error| (WifiJoinStage::WaitForIp, error))
+                });
+            if let Err((stage, e)) = joined {
                 // Keep serving USB while wifi is unreachable, so a bad SSID or
                 // password can always be fixed over the cable.
                 log::error!("[relay] wifi connect failed: {e:?}; serving USB, retry in 3s");
+                record_wifi_failure(&mut ctx, stage, &e, &wifi_disconnect_reason);
                 // Rotate to the next stored network for the next attempt. With
                 // a single configured network this re-selects the same one.
                 wifi_candidate_idx = wifi_candidate_idx.wrapping_add(1);

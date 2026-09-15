@@ -16,7 +16,7 @@ use zeroize::Zeroize;
 use crate::approval::{self, ApprovalResult};
 use crate::button::{self, Buttons, Gesture};
 use crate::oled::Display;
-use crate::palette::FG;
+use crate::palette::{BG, FG};
 
 const PICK_TIMEOUT: Duration = Duration::from_secs(30);
 const QR_TIMEOUT: Duration = Duration::from_secs(45);
@@ -203,6 +203,13 @@ fn draw_qr(display: &mut Display<'_>, qr: &QrCode<'_>, scale: i32, quiet: i32) {
     let x0 = ((bounds.width as i32 - pixels) / 2).max(0) + quiet;
     let y0 = ((bounds.height as i32 - pixels) / 2).max(0) + quiet;
     display.clear_buffer();
+    // QR readers expect dark modules on a light ground. Fill the whole panel,
+    // rather than merely the symbol rectangle, so the OLED's spare 7px edge
+    // around a v2 symbol is a real light quiet field too.
+    Rectangle::new(bounds.top_left, bounds.size)
+        .into_styled(PrimitiveStyle::with_fill(FG))
+        .draw(display)
+        .ok();
     for y in 0..size {
         for x in 0..size {
             if qr.get_module(x, y) {
@@ -210,14 +217,14 @@ fn draw_qr(display: &mut Display<'_>, qr: &QrCode<'_>, scale: i32, quiet: i32) {
                     Point::new(x0 + x * scale, y0 + y * scale),
                     Size::new(scale as u32, scale as u32),
                 )
-                .into_styled(PrimitiveStyle::with_fill(FG))
+                .into_styled(PrimitiveStyle::with_fill(BG))
                 .draw(display)
                 .ok();
             }
         }
     }
-    // The explicit clear guarantees a black quiet region even on colour
-    // panels whose previous frame had bright pixels.
+    // The light panel fill leaves a scanner-friendly quiet field around the
+    // dark symbol, including after a bright prior UI frame.
     display.flush().ok();
 }
 

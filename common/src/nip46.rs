@@ -320,6 +320,27 @@ fn decode_event_hex<const N: usize>(
         .map_err(|_| malformed)
 }
 
+/// Refuse a syntactically hex x-only key that cannot be lifted to secp256k1.
+/// Nostr device identities use the same BIP-340 public-key representation as
+/// event authors, so accepting an arbitrary 32-byte string here would let an
+/// issuer approve a provision which can never be decrypted by a device.
+fn validate_xonly_public_key(value: &str, malformed: &'static str) -> Result<(), &'static str> {
+    let bytes = decode_event_hex::<32>(value, malformed)?;
+    #[cfg(all(feature = "k256-backend", not(feature = "secp256k1-backend")))]
+    {
+        k256::schnorr::VerifyingKey::from_bytes(&bytes).map_err(|_| malformed)?;
+    }
+    #[cfg(all(feature = "secp256k1-backend", not(feature = "k256-backend")))]
+    {
+        secp256k1::XOnlyPublicKey::from_slice(&bytes).map_err(|_| malformed)?;
+    }
+    #[cfg(not(any(feature = "k256-backend", feature = "secp256k1-backend")))]
+    {
+        return Err("public-key validation backend unavailable");
+    }
+    Ok(())
+}
+
 #[cfg(all(feature = "k256-backend", not(feature = "secp256k1-backend")))]
 fn verify_event_signature(
     public_key: &[u8; 32],
@@ -624,6 +645,61 @@ fn optional_u32_param(value: Option<&Value>, default: u32) -> Result<u32, &'stat
 pub struct DeriveParams<'a> {
     pub purpose: &'a str,
     pub index: u32,
+}
+
+/// `heartwood_provision_rendezvous`: `[target_device_pubkey, index, nonce,
+/// expires_at]`.
+///
+/// This is intentionally not a generic derivation/export shape. The target
+/// device, replay nonce and expiry are all part of the signed-in person's
+/// provision record before Heartwood encrypts it. Keep the lexical boundary
+/// here, where every transport shares it; the firmware owns decoding and the
+/// physical approval that authorises the operation.
+pub struct RendezvousProvisionParams<'a> {
+    pub target_device_pubkey: &'a str,
+    pub index: u32,
+    pub nonce: &'a str,
+    pub expires_at: u64,
+}
+
+impl<'a> RendezvousProvisionParams<'a> {
+    pub fn from_params(params: &'a [Value]) -> Result<Self, &'static str> {
+        const ERR: &str = "requires [target_device_pubkey, index, nonce, expires_at]";
+        if params.len() != 4 {
+            return Err(ERR);
+        }
+        let target_device_pubkey = params[0].as_str().ok_or(ERR)?;
+        if target_device_pubkey.len() != 64
+            || !target_device_pubkey
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err("target device pubkey must be 64 lowercase hex characters");
+        }
+        validate_xonly_public_key(target_device_pubkey, "target device pubkey is not a secp256k1 x-only key")?;
+        let index = params[1]
+            .as_u64()
+            .ok_or("rendezvous index must be an unsigned integer")
+            .and_then(|value| u32::try_from(value).map_err(|_| "rendezvous index exceeds u32 range"))?;
+        let nonce = params[2].as_str().ok_or(ERR)?;
+        // 16 bytes are exactly 22 base64url characters when padding is
+        // forbidden. Decode later in the firmware, but reject padding and
+        // alternate alphabets before an approval card can be raised.
+        if nonce.len() != 22
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            // Sixteen bytes occupy 21 full base64url characters and two bits
+            // of the 22nd. Canonical unpadded encodings therefore end in one
+            // of these four characters; accepting another value would permit
+            // alternate spellings of the same decoded nonce.
+            || !matches!(nonce.as_bytes().last(), Some(b'A' | b'Q' | b'g' | b'w'))
+        {
+            return Err("rendezvous nonce must be an unpadded 16-byte base64url value");
+        }
+        let expires_at = params[3].as_u64().ok_or("rendezvous expiry must be an unsigned integer")?;
+        Ok(Self { target_device_pubkey, index, nonce, expires_at })
+    }
 }
 
 impl<'a> DeriveParams<'a> {
@@ -2190,6 +2266,35 @@ mod tests {
         let derive = DeriveParams::from_params(&stringly).unwrap();
         assert_eq!(derive.index, 0);
         assert!(DeriveParams::from_params(&[]).is_err());
+
+        let provision_params = vec![
+            serde_json::json!("ab".repeat(32)),
+            serde_json::json!(7),
+            serde_json::json!("AAECAwQFBgcICQoLDA0ODw"),
+            serde_json::json!(1_700_000_000u64),
+        ];
+        let provision = RendezvousProvisionParams::from_params(&provision_params).unwrap();
+        assert_eq!(provision.target_device_pubkey, "ab".repeat(32));
+        assert_eq!(provision.index, 7);
+        assert_eq!(provision.nonce, "AAECAwQFBgcICQoLDA0ODw");
+        assert_eq!(provision.expires_at, 1_700_000_000);
+        assert!(RendezvousProvisionParams::from_params(&provision_params[..3]).is_err());
+        assert!(RendezvousProvisionParams::from_params(&[
+            serde_json::json!("AB".repeat(32)), serde_json::json!(0),
+            serde_json::json!("AAECAwQFBgcICQoLDA0ODw"), serde_json::json!(1),
+        ]).is_err());
+        assert!(RendezvousProvisionParams::from_params(&[
+            serde_json::json!("ff".repeat(32)), serde_json::json!(0),
+            serde_json::json!("AAECAwQFBgcICQoLDA0ODw"), serde_json::json!(1),
+        ]).is_err());
+        assert!(RendezvousProvisionParams::from_params(&[
+            serde_json::json!("ab".repeat(32)), serde_json::json!(0),
+            serde_json::json!("AAECAwQFBgcICQoLDA0ODw="), serde_json::json!(1),
+        ]).is_err());
+        assert!(RendezvousProvisionParams::from_params(&[
+            serde_json::json!("ab".repeat(32)), serde_json::json!(0),
+            serde_json::json!("AAECAwQFBgcICQoLDA0ODB"), serde_json::json!(1),
+        ]).is_err());
 
         let persona_params = vec![serde_json::json!("forge"), serde_json::json!(1)];
         let persona = PersonaParams::from_params(&persona_params).unwrap();

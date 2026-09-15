@@ -1935,8 +1935,80 @@ pub fn show_info_notes(
     Text::new(&received_line, Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
     let pending_line = format!("pending: {pending}");
     Text::new(&pending_line, Point::new(l.sx(4), l.sy(52)), small).draw(display).ok();
+    #[cfg(not(feature = "heltec-v3"))]
+    {
+        let handoff_hint = "hold 2s: offline QR";
+        Text::new(
+            handoff_hint,
+            Point::new(l.center_x(handoff_hint.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(62)),
+            small,
+        )
+        .draw(display)
+        .ok();
+    }
 
     draw_page_marker(display, &l, 4, 4);
+    display.flush().ok();
+}
+
+/// Secret-free picker shown before an offline bearer-note QR can be revealed.
+/// The amount and mint are the decision; the `k1` is copied only after the
+/// owner double-taps the selected card and completes the ordinary hold gate.
+#[cfg(not(feature = "heltec-v3"))]
+pub fn show_offline_note_picker(
+    display: &mut Display<'_>,
+    current: usize,
+    total: usize,
+    amount_msat: u64,
+    host: &str,
+) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let body = MonoTextStyleBuilder::new()
+        .font(l.font_body())
+        .text_color(FG)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+
+    Text::new("OFFLINE NOTE", Point::new(l.sx(4), l.sy(10)), header)
+        .draw(display)
+        .ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display)
+        .ok();
+    let ordinal = format!("{current}/{total}");
+    Text::new(&ordinal, Point::new(l.sx(4), l.sy(27)), small)
+        .draw(display)
+        .ok();
+    let amount = format!("{amount_msat} msat");
+    Text::new(&amount, Point::new(l.sx(4), l.sy(41)), body)
+        .draw(display)
+        .ok();
+    let shown_host = if host.len() <= 22 {
+        host.to_string()
+    } else {
+        format!("{}..{}", &host[..12], &host[host.len() - 8..])
+    };
+    Text::new(&shown_host, Point::new(l.sx(4), l.sy(51)), small)
+        .draw(display)
+        .ok();
+    let hint = "tap next,dbl show,B exit";
+    Text::new(
+        hint,
+        Point::new(l.center_x(hint.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(61)),
+        small,
+    )
+    .draw(display)
+    .ok();
     display.flush().ok();
 }
 

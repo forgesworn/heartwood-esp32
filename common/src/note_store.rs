@@ -197,6 +197,30 @@ pub struct NoteMeta {
     pub key: Option<KeyNote>,
 }
 
+/// One locally revealable bearer note. This is deliberately not a wire shape:
+/// it exists for the physical QR handover surface only. Dropping it scrubs the
+/// copied `k1`, just like [`Note`].
+pub struct OfflineReveal {
+    pub id: String,
+    pub amount_msat: u64,
+    pub host: String,
+    secret: [u8; SECRET_LEN],
+}
+
+impl OfflineReveal {
+    /// The raw LUD-25 `k1`, for a QR renderer that is already inside the
+    /// physical-confirmation boundary. It is intentionally not serialisable.
+    pub fn secret(&self) -> &[u8; SECRET_LEN] {
+        &self.secret
+    }
+}
+
+impl Drop for OfflineReveal {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
 impl Note {
     fn meta(&self) -> NoteMeta {
         NoteMeta {
@@ -886,6 +910,43 @@ impl NoteStore {
         // A build that cannot sign never made a key note, and cannot spend one.
         #[cfg(not(feature = "cash"))]
         Err(NoteError::InvalidState)
+    }
+
+    /// Number of notes the physical offline handover may reveal. This mirrors
+    /// `export_secret`: only confirmed plain bearer notes have a `k1` that can
+    /// become a LUD-25 URL. A Part 2 key note is never presented as a `k1`.
+    pub fn offline_revealable_count(&self) -> usize {
+        self.notes
+            .iter()
+            .filter(|note| note.state == NoteState::Confirmed && note.key.is_none())
+            .count()
+    }
+
+    /// Copy one locally revealable bearer note for the physical QR flow.
+    /// `ordinal` is in the stable locker order, rather than exposing the
+    /// store's private record index to an on-device UI.
+    pub fn offline_revealable_at(&self, ordinal: usize) -> Option<OfflineReveal> {
+        self.notes
+            .iter()
+            .filter(|note| note.state == NoteState::Confirmed && note.key.is_none())
+            .nth(ordinal)
+            .map(|note| OfflineReveal {
+                id: note.id.clone(),
+                amount_msat: note.amount_msat,
+                host: note.host.clone(),
+                secret: note.secret,
+            })
+    }
+
+    /// Metadata for the offline picker. This keeps ordinary picker redraws
+    /// secret-free; the raw `k1` is copied only after the owner confirms the
+    /// selected note's reveal.
+    pub fn offline_revealable_meta_at(&self, ordinal: usize) -> Option<NoteMeta> {
+        self.notes
+            .iter()
+            .filter(|note| note.state == NoteState::Confirmed && note.key.is_none())
+            .nth(ordinal)
+            .map(Note::meta)
     }
 
     /// Register an externally-known secret directly as CONFIRMED. Idempotent
@@ -2017,6 +2078,30 @@ mod tests {
         assert_eq!(store.discard(&mut storage, &id), Err(NoteError::InvalidState));
 
         assert_eq!(store.export_secret("00000000"), Err(NoteError::NotFound));
+    }
+
+    #[test]
+    fn offline_reveal_lists_only_confirmed_plain_bearer_notes() {
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let (id, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 10).unwrap();
+
+        // Pending notes have no money registered at the mint yet.
+        assert_eq!(store.offline_revealable_count(), 0);
+        store.confirm(&mut storage, &id, 2_000, "mint.example/w", None, 11).unwrap();
+        assert_eq!(store.offline_revealable_count(), 1);
+        let meta = store.offline_revealable_meta_at(0).unwrap();
+        assert_eq!(meta.id, id);
+        assert_eq!(meta.amount_msat, 2_000);
+        let reveal = store.offline_revealable_at(0).unwrap();
+        assert_eq!(reveal.secret(), &store.notes[0].secret);
+        drop(reveal);
+
+        // A Part 2 record's secret is a signing key, never a `k1`.
+        store.notes[0].key = Some(KeyNote { index: 0, pubkey: [9u8; 32] });
+        assert_eq!(store.offline_revealable_count(), 0);
+        assert!(store.offline_revealable_at(0).is_none());
     }
 
     #[test]

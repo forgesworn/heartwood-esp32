@@ -462,6 +462,12 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
         // early, back to the idle identity card.
         ctx.idle_page = 0;
         show_idle_identity(ctx);
+    } else if launch_offline_qr_if_requested(ctx) {
+        // The physically-confirmed QR flow is self-contained and clears its
+        // bearer frame before returning. Restore ordinary idle state instead
+        // of leaving the last QR lit on a relay-connected unattended signer.
+        ctx.idle_page = 0;
+        show_idle_identity(ctx);
     } else {
         // Awake: a short press pages the idle info carousel.
         ctx.idle_page = (ctx.idle_page + 1) % 4;
@@ -478,6 +484,21 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
     // as a phantom carousel page.
     FreeRtos::delay_ms(30);
     crate::button::clear_press_edge();
+}
+
+/// Keep the V3 within its fixed OTA slot; V4 and colour boards retain the
+/// physical QR handover flow.
+fn launch_offline_qr_if_requested(ctx: &mut SignCtx<'_, '_, '_>) -> bool {
+    #[cfg(feature = "heltec-v3")]
+    {
+        let _ = ctx;
+        false
+    }
+    #[cfg(not(feature = "heltec-v3"))]
+    {
+        ctx.idle_page == 3
+            && crate::offline_qr::launch_if_requested(ctx.display, ctx.buttons)
+    }
 }
 
 /// One page of the idle info carousel. Page 1 shows the stored SSID with the

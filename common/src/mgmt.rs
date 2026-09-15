@@ -127,6 +127,7 @@ pub fn client_summary(slot: &ConnectSlot) -> serde_json::Value {
         "escalate": slot.escalate,
         "petition_on_deny": slot.petition_on_deny,
         "audit_child_wrap": slot.audit_child_wrap,
+        "guardian_notice_wrap": slot.guardian_notice_wrap,
         "bound_identity": slot.bound_identity.clone(),
     })
 }
@@ -625,11 +626,13 @@ mod tests {
             escalate: false,
             petition_on_deny: false,
             audit_child_wrap: false,
+            guardian_notice_wrap: false,
             bound_identity: None,
         };
         let summary = client_summary(&slot);
         assert_eq!(summary["slot_index"], 7);
         assert_eq!(summary["strict_permissions"], true);
+        assert_eq!(summary["guardian_notice_wrap"], false);
         assert_eq!(
             summary["secret_fingerprint"],
             credential_fingerprint(&slot.secret),

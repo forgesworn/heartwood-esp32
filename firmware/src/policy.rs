@@ -425,6 +425,7 @@ impl PolicyEngine {
             escalate: false,
             petition_on_deny: false,
             audit_child_wrap: false,
+            guardian_notice_wrap: false,
             bound_identity: None,
         };
         self.slots_mut(master_slot).push(new_slot);
@@ -460,6 +461,7 @@ impl PolicyEngine {
             escalate: policy.escalate,
             petition_on_deny: policy.petition_on_deny,
             audit_child_wrap: policy.audit_child_wrap,
+            guardian_notice_wrap: policy.guardian_notice_wrap,
             bound_identity: policy.bound_identity,
         });
         self.slots_dirty = true;
@@ -494,7 +496,8 @@ impl PolicyEngine {
     }
 
     /// Apply the family-bunker C3 additive flags (escalate, petition,
-    /// child-wrap + identity binding) to an existing slot. Separate from
+    /// child-wrap, guardian-notice-wrap + identity binding) to an existing
+    /// slot. Separate from
     /// `set_exact_slot_policy` so the exact-policy path and its tests stay
     /// untouched; callers that parsed the flags from the operator envelope
     /// apply them here. Returns true when the slot exists.
@@ -505,6 +508,7 @@ impl PolicyEngine {
         escalate: bool,
         petition_on_deny: bool,
         audit_child_wrap: bool,
+        guardian_notice_wrap: bool,
         bound_identity: Option<String>,
     ) -> bool {
         let slots = self.slots_mut(master_slot);
@@ -512,6 +516,7 @@ impl PolicyEngine {
             slot.escalate = escalate;
             slot.petition_on_deny = petition_on_deny;
             slot.audit_child_wrap = audit_child_wrap;
+            slot.guardian_notice_wrap = guardian_notice_wrap;
             slot.bound_identity = bound_identity;
             self.slots_dirty = true;
             true
@@ -807,6 +812,7 @@ impl PolicyEngine {
                     escalate: false,
                     petition_on_deny: false,
                     audit_child_wrap: false,
+                    guardian_notice_wrap: false,
                     bound_identity: None,
                 };
 

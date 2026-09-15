@@ -793,10 +793,10 @@ fn main() {
                     );
                 }
                 FRAME_TYPE_NOTE_CMD => {
-                    // Locked exception: get_info only (counts and storage
-                    // state, no secrets) so the wallet can say "locked
-                    // device" rather than "broken device". Everything else
-                    // NACKs with a reason.
+                    // Locked exceptions: get_info (counts and storage state,
+                    // no secrets) and cable identity proof, so a host can
+                    // distinguish a locked known board from a swapped one.
+                    // Everything else NACKs with a reason.
                     notes::handle_note_cmd_frame_locked(&mut usb, &frame.payload);
                 }
                 _ => {

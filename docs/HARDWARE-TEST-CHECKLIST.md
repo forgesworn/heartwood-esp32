@@ -1032,6 +1032,15 @@ USB tier, unlocked, no at-rest:
 
 1. `get_info` answers version/board/storage/counts; `new_secret` then
    `confirm` then `list_notes` shows one CONFIRMED note. NOT YET BENCH-RUN.
+1a. Cable identity, including while PIN-locked: send
+    `{"cmd":"identify","nonce":"0123456789abcdef0123456789abcdef"}` and
+    verify the returned 64-hex-character `pubkey` and 128-hex-character `sig`
+    over `lnurlvault-id-v1 || 0x00 || nonce`. A fresh nonce must yield a
+    verifiable proof from the same pubkey; a different test board must have a
+    different pubkey. After a full factory/PIN wipe and reprovisioning, the
+    old pubkey must no longer verify a new proof. Do this only on a
+    non-production USB board: it is a trust-on-first-use board identity, not a
+    Nostr identity, note key, or firmware-signing key. NOT YET BENCH-RUN.
 1b. `{"cmd":"get_info","tag":"a1"}` comes back carrying `"tag":"a1"`, and the
    same `get_info` with no tag comes back with no `tag` field at all. Then
    `{"cmd":"get_info","tag":""}` is refused `bad_request` and that refusal

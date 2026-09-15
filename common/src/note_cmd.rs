@@ -36,6 +36,10 @@ use serde_json::{json, Map, Value};
 use zeroize::Zeroize;
 
 use crate::hex::{hex_decode, hex_encode};
+#[cfg(feature = "device-identity")]
+use crate::device_identity::{
+    DeviceIdentityProof, IDENTITY_NONCE_MAX_LEN, IDENTITY_NONCE_MIN_LEN,
+};
 use crate::note_store::{NoteError, NoteMeta, NoteState, NoteStorage, NoteStore, Peer, SECRET_LEN};
 use crate::trust::TrustList;
 
@@ -76,6 +80,12 @@ impl GatedCmd {
 /// no identity to seal as (direct USB), where `send` answers `bad_request`.
 pub type WrapFn<'a> =
     &'a mut dyn FnMut(&[u8; SECRET_LEN], &NoteMeta, &[u8; 32]) -> Result<Value, &'static str>;
+
+/// Supplies the proof for the cable-only `identify` challenge. The dispatcher
+/// receives only the public result, never the persisted per-board seed.
+#[cfg(feature = "device-identity")]
+pub type DeviceIdentityFn<'a> =
+    &'a mut dyn FnMut(&[u8]) -> Result<DeviceIdentityProof, &'static str>;
 
 /// The owner's answer to a gated command. `Unavailable` is the vault's
 /// `display_unavailable`: the device could not ask, which is deliberately
@@ -292,6 +302,11 @@ pub struct NoteCmdContext<'a> {
     /// cable can never be spent by a relay client or the other way round.
     pub client: GrantClient,
     pub wrap: Option<WrapFn<'a>>,
+    /// A board-local trust-on-first-use identity. It is intentionally absent
+    /// on the relay surface: Nostr already identifies that remote signer by
+    /// its master npub, while this cable command proves only a physical board.
+    #[cfg(feature = "device-identity")]
+    pub device_identity: Option<DeviceIdentityFn<'a>>,
     /// Senders whose wraps are stored without a hold. Persisted through
     /// `storage.save_trust`; a refusal there is `storage_full`.
     pub trust: &'a mut TrustList,
@@ -438,6 +453,36 @@ fn pubkey_field(hex: &str) -> Option<[u8; 32]> {
     hex_decode(hex).ok().and_then(|v| v.try_into().ok())
 }
 
+/// Parse and answer the cable-only `identify` request. Kept public so the
+/// locked USB path can offer exactly this read-only operation too, without
+/// opening any note command that could touch value-bearing state.
+#[cfg(feature = "device-identity")]
+pub fn identify_response(
+    nonce_hex: Option<&str>,
+    identity: &mut dyn FnMut(&[u8]) -> Result<DeviceIdentityProof, &'static str>,
+) -> Value {
+    let Some(nonce_hex) = nonce_hex else {
+        return err_msg("bad_request", "identify requires a hex \"nonce\"");
+    };
+    if nonce_hex.len() % 2 != 0
+        || nonce_hex.len() < IDENTITY_NONCE_MIN_LEN * 2
+        || nonce_hex.len() > IDENTITY_NONCE_MAX_LEN * 2
+    {
+        return err_msg("bad_request", "nonce must be 16 to 32 bytes of hex");
+    }
+    let Ok(nonce) = hex_decode(nonce_hex) else {
+        return err_msg("bad_request", "nonce is not hex");
+    };
+    let Ok(proof) = identity(&nonce) else {
+        return err_msg("unsupported", "this device has no identity key");
+    };
+    json!({
+        "ok": true,
+        "pubkey": hex_encode(&proof.pubkey),
+        "sig": hex_encode(&proof.signature),
+    })
+}
+
 fn parent_ids(cmd: &Value) -> Result<Vec<String>, Value> {
     match cmd.get("parent_ids") {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -512,6 +557,14 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
     };
 
     match name {
+        #[cfg(feature = "device-identity")]
+        "identify" => {
+            let Some(identity) = ctx.device_identity.as_mut() else {
+                return err_msg("unsupported", "this build has no device identity");
+            };
+            identify_response(str_field(cmd, "nonce"), &mut **identity)
+        }
+
         "get_info" => {
             let (note_count, pending_count) = ctx.store.counts();
             json!({
@@ -1266,6 +1319,11 @@ mod tests {
                 cash_asked.push(host.to_string());
                 answer
             };
+            #[cfg(feature = "device-identity")]
+            let mut device_identity = |nonce: &[u8]| {
+                crate::device_identity::sign_challenge(&[0x5au8; 32], nonce)
+                    .ok_or("test identity signing refused")
+            };
             self.storage.persist_ok = self.persist_ok;
             self.storage.note_write_ok = self.note_write_ok;
             let mut ctx = NoteCmdContext {
@@ -1276,6 +1334,8 @@ mod tests {
                 grant: &mut self.grant,
                 client: self.client,
                 wrap: if self.can_wrap { Some(&mut wrap) } else { None },
+                #[cfg(feature = "device-identity")]
+                device_identity: Some(&mut device_identity),
                 trust: &mut self.trust,
                 approve_trust: &mut approve_trust,
                 cash: &mut self.cash,
@@ -1776,12 +1836,53 @@ mod tests {
         assert_eq!(res["board"], "host");
     }
 
+    #[cfg(feature = "device-identity")]
+    #[test]
+    fn identify_returns_a_verifiable_fresh_challenge_proof() {
+        let mut h = Harness::new();
+        let nonce = "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5";
+        let response = h.run(&format!(r#"{{"cmd":"identify","nonce":"{nonce}"}}"#));
+        assert_eq!(response["ok"], true);
+        let pubkey: [u8; 32] = hex_decode(response["pubkey"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signature: [u8; 64] = hex_decode(response["sig"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(crate::device_identity::verify_challenge(
+            &pubkey,
+            &hex_decode(nonce).unwrap(),
+            &signature,
+        ));
+        assert_eq!(
+            h.run(r#"{"cmd":"identify","nonce":"abcd"}"#)["error"],
+            "bad_request"
+        );
+    }
+
+    #[cfg(feature = "device-identity")]
+    #[test]
+    fn identify_refuses_when_the_board_cannot_supply_a_stable_key() {
+        let mut unavailable = |_nonce: &[u8]| Err("identity storage unavailable");
+        let response = identify_response(
+            Some("a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"),
+            &mut unavailable,
+        );
+        assert_eq!(
+            response,
+            json!({"ok": false, "error": "unsupported", "message": "this device has no identity key"})
+        );
+    }
+
     #[test]
     fn list_notes_pages_and_never_carries_secrets() {
         let mut h = Harness::new();
         for _ in 0..10 {
             h.run(r#"{"cmd":"new_secret"}"#);
         }
+
         let res = h.run(r#"{"cmd":"list_notes"}"#);
         assert_eq!(res["total"], 10);
         assert_eq!(res["notes"].as_array().unwrap().len(), LIST_PAGE_MAX);

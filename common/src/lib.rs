@@ -97,6 +97,11 @@ pub mod cash_key;
 #[cfg(feature = "ota-sign")]
 pub mod ota_sign;
 
+/// Per-device cable identity challenge/response. It identifies a board to a
+/// host by a key that is independent of every signer/master identity.
+#[cfg(feature = "device-identity")]
+pub mod device_identity;
+
 #[cfg(feature = "seed-encrypt")]
 pub mod seed_cipher;
 

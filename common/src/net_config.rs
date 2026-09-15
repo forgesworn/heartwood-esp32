@@ -57,11 +57,30 @@ pub enum NetworkRuntimeError {
     InvalidConfig,
 }
 
+/// The privacy-safe reason the station could not join its configured network.
+///
+/// This is deliberately a closed, operational vocabulary. It never carries an
+/// SSID, BSSID, IP address or driver-provided text. The accompanying numeric
+/// code in [`NetworkRuntimeStatus`] is available for an attached owner who
+/// needs the exact ESP-IDF diagnostic without restoring console output.
+#[cfg(feature = "nip46")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WifiFailureReason {
+    AuthenticationExpired,
+    AuthenticationFailed,
+    AssociationFailed,
+    NetworkNotFound,
+    HandshakeTimedOut,
+    IpUnavailable,
+    DriverError,
+}
+
 /// Additive runtime portion of `GET_NET_CONFIG`.
 ///
-/// All fields are booleans, closed enums, or an index into a list the same
-/// response already returns in full, so future callers cannot accidentally
-/// surface a network identifier through this type.
+/// All fields are booleans, closed enums, opaque local diagnostic codes, or an
+/// index into a list the same response already returns in full, so future
+/// callers cannot accidentally surface a network identifier through this type.
 #[cfg(feature = "nip46")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkRuntimeStatus {
@@ -69,6 +88,15 @@ pub struct NetworkRuntimeStatus {
     pub wifi_connected: bool,
     pub relay_connected: bool,
     pub last_error_class: NetworkRuntimeError,
+    /// Additive WiFi failure detail. Present only while the latest error is
+    /// [`NetworkRuntimeError::WifiUnavailable`].
+    #[serde(default)]
+    pub last_wifi_failure: Option<WifiFailureReason>,
+    /// ESP-IDF's station-disconnect reason, or the `esp_err_t` returned by the
+    /// failed join stage when no disconnect event was emitted. It is a local,
+    /// opaque diagnostic code, never a network identifier.
+    #[serde(default)]
+    pub last_wifi_error_code: Option<i32>,
     /// Which configured relay is actually being served, as a position in the
     /// `relays` array of the same response — `None` while none is.
     ///
@@ -100,6 +128,8 @@ impl NetworkRuntimeStatus {
             wifi_connected: false,
             relay_connected: false,
             last_error_class: NetworkRuntimeError::None,
+            last_wifi_failure: None,
+            last_wifi_error_code: None,
             relay_index: None,
             secondary_index: None,
         }
@@ -111,6 +141,8 @@ impl NetworkRuntimeStatus {
             wifi_connected: false,
             relay_connected: false,
             last_error_class: NetworkRuntimeError::None,
+            last_wifi_failure: None,
+            last_wifi_error_code: None,
             relay_index: None,
             secondary_index: None,
         }
@@ -916,6 +948,8 @@ mod tests {
             wifi_connected: true,
             relay_connected: false,
             last_error_class: NetworkRuntimeError::WebsocketUpgrade,
+            last_wifi_failure: None,
+            last_wifi_error_code: None,
             relay_index: None,
             secondary_index: None,
         };
@@ -927,6 +961,8 @@ mod tests {
                 "wifi_connected": true,
                 "relay_connected": false,
                 "last_error_class": "websocket_upgrade",
+                "last_wifi_failure": serde_json::Value::Null,
+                "last_wifi_error_code": serde_json::Value::Null,
                 "relay_index": serde_json::Value::Null,
                 "secondary_index": serde_json::Value::Null,
             })
@@ -944,6 +980,8 @@ mod tests {
             keys,
             vec![
                 "last_error_class",
+                "last_wifi_error_code",
+                "last_wifi_failure",
                 "relay_connected",
                 "relay_index",
                 "secondary_index",
@@ -965,6 +1003,8 @@ mod tests {
             wifi_connected: true,
             relay_connected: true,
             last_error_class: NetworkRuntimeError::None,
+            last_wifi_failure: None,
+            last_wifi_error_code: None,
             relay_index: Some(1),
             secondary_index: Some(3),
         };
@@ -985,7 +1025,29 @@ mod tests {
         let status: NetworkRuntimeStatus = serde_json::from_slice(older).unwrap();
         assert_eq!(status.relay_index, None);
         assert_eq!(status.secondary_index, None);
+        assert_eq!(status.last_wifi_failure, None);
+        assert_eq!(status.last_wifi_error_code, None);
         assert!(status.relay_connected);
+    }
+
+    #[test]
+    fn wifi_failure_diagnostic_is_closed_and_identifier_free() {
+        let status = NetworkRuntimeStatus {
+            stage: NetworkRuntimeStage::WifiConnecting,
+            wifi_connected: false,
+            relay_connected: false,
+            last_error_class: NetworkRuntimeError::WifiUnavailable,
+            last_wifi_failure: Some(WifiFailureReason::AuthenticationFailed),
+            last_wifi_error_code: Some(202),
+            relay_index: None,
+            secondary_index: None,
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["last_wifi_failure"], "authentication_failed");
+        assert_eq!(value["last_wifi_error_code"], 202);
+        assert!(value.as_object().unwrap().values().all(|value| !value
+            .as_str()
+            .is_some_and(|value| value.contains("://"))));
     }
 
     #[test]

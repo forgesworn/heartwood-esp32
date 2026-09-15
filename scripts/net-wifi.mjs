@@ -155,7 +155,9 @@ if (!currentReply || currentReply.type === NACK) {
 const current = JSON.parse(currentReply.payload.toString())
 console.log(`current: ssid=${current.ssid} revision=${current.revision}`
   + ` fallbacks=[${(current.networks ?? []).map((n) => n.ssid).join(', ')}]`
-  + ` stage=${current.runtime?.stage} error=${current.runtime?.last_error_class}`)
+  + ` stage=${current.runtime?.stage} error=${current.runtime?.last_error_class}`
+  + ` wifi_reason=${current.runtime?.last_wifi_failure ?? 'none'}`
+  + ` wifi_code=${current.runtime?.last_wifi_error_code ?? 'none'}`)
 
 const summary = [
   patch.ssid ? `ssid -> ${patch.ssid}` : null,

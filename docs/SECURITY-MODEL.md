@@ -380,6 +380,14 @@ semantics, and power-safe per-master removal journal. There is **no stored PIN h
 would let a flash-dump attacker brute-force the PIN cheaply and skip the slow
 KDF, so the AEAD tag is the sole PIN check and every guess pays the PBKDF2 cost.
 
+Encrypted-seed records made by current firmware also carry an authenticated
+format/version and PBKDF2 round count. The original 92-byte records remain
+valid and keep their original 100,000-round cost, so updating the firmware
+never turns a previously sealed seed into an absent or undecryptable one. A
+later cost retune must still be measured on the slowest supported board; the
+stored count makes that a deliberate new-record policy rather than an unsafe
+global constant change.
+
 **Honest limitation:** with no secure element and no eFuses, the key is derived
 **entirely from the PIN**. An attacker who owns the flash can brute-force the
 PIN offline; the slow KDF raises the per-guess cost but a short PIN is an

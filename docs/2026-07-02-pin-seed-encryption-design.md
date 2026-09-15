@@ -53,8 +53,10 @@ guarantee.
    already pullable via the `nip44`/`nip04` feature deps). AEAD so a wrong PIN
    fails the tag check cleanly (no ambiguous "is this the right seed?").
 3. **NVS layout** — replace the plaintext `master_<slot>_secret` with
-   `m<slot>_seed_enc` = `salt || nonce || ciphertext || tag`. The compact name
-   is required by ESP-IDF's 15-character NVS key limit. Migration:
+   `m<slot>_seed_enc`. Legacy records are `salt || nonce || ciphertext || tag`;
+   current records prepend an authenticated format/version and PBKDF2 round
+   count. The compact name is required by ESP-IDF's 15-character NVS key limit.
+   Migration:
    an existing plaintext seed is re-encrypted on first PIN set (or left as-is if
    the user never sets a PIN — see the opt-in decision).
 4. **Boot flow** — on boot, if an encrypted seed exists, prompt for the PIN
@@ -113,12 +115,16 @@ build it.
 
 ## Status: crypto core BUILT (2026-07-02, `6ca1c71`)
 
-`common/src/seed_cipher.rs` (feature `seed-encrypt`) is done and host-tested (7
-tests): `encrypt_seed`/`decrypt_seed` = `salt||nonce||ct||tag`, PBKDF2-HMAC-SHA256
-KDF + ChaCha20 + HMAC-SHA256 encrypt-then-MAC, wrong-PIN/tamper fail the
-constant-time MAC. `PBKDF2_ITERATIONS = 100_000` is a bench-tune knob. Decisions
-taken as the leans above (6-digit, opt-in, PBKDF2, lost-PIN=phrase-restore,
-5-attempt wipe).
+`common/src/seed_cipher.rs` (feature `seed-encrypt`) is host-tested:
+`encrypt_seed` writes a versioned record containing an authenticated PBKDF2
+round count, while `decrypt_seed` continues to read the original
+`salt||nonce||ct||tag` records at their original 100,000-round cost.
+PBKDF2-HMAC-SHA256 + ChaCha20 + HMAC-SHA256 encrypt-then-MAC means a wrong PIN
+or authenticated-field tamper cannot yield a seed. `PBKDF2_ITERATIONS =
+100_000` remains a bench-tune knob; the record format removes the need to
+re-encrypt every existing seed solely because a future measured retune changes
+that default. Decisions taken as the leans above (6-digit, opt-in, PBKDF2,
+lost-PIN=phrase-restore, 5-attempt wipe).
 
 ## Firmware integration — concrete plan (NOT yet built; lockout-critical)
 

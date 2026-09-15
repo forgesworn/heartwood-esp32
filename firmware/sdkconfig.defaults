@@ -59,6 +59,12 @@ CONFIG_ESP_TASK_WDT_PANIC=y
 # the conservative choice against the tight 2 MB OTA slot ceiling.
 CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 
+# Cargo's release profile already size-optimises Rust, but ESP-IDF defaults
+# its C components to the debug optimisation level unless this is set here.
+# Compile the release C half (Wi-Fi, TLS and C FFI) for size as well; this
+# does not relax assertions, stack canaries or any signing/approval policy.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
 # Keep the version embedded in the ESP-IDF application descriptor aligned with
 # the Rust package/API version. scripts/build-firmware.sh rejects a drift before
 # compiling, so release images never fall back to a stale `git describe` tag.

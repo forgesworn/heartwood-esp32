@@ -54,6 +54,8 @@ pub mod held_reply;
 
 pub mod wrap_ledger;
 
+pub mod rendezvous_receipts;
+
 pub mod trust;
 
 pub mod note_store;

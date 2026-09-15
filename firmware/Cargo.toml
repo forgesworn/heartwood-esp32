@@ -65,8 +65,10 @@ embedded-graphics = "0.8"
 # (colour-panel boards). Mono-OLED Heltec builds never pull it in.
 mipidsi = { version = "0.10", optional = true }
 
-# Logging
-log = "0.4"
+# Logging. Retain warnings and errors in a constrained OTA image, while
+# compiling out the verbose operational trace that is otherwise duplicated by
+# the on-device UI and consumes more than the Heltec V3's remaining app slot.
+log = { version = "0.4", features = ["release_max_level_warn"] }
 
 [[bin]]
 name = "heartwood-demo"

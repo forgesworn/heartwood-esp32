@@ -213,6 +213,15 @@ New v2 slots set `strict_permissions=true`:
 - protocol-wide `ping`/`get_public_key` behavior and operations that always
   require the button remain firmware invariants, not policy-expansion hooks.
 
+The exact-policy method catalogue includes the normal legacy-safe operations
+plus `heartwood_derive_persona`, `heartwood_remove_persona`, and
+`heartwood_rename_persona`. This lets one authenticated, persona-addressed
+manager pairing administer the personas of its owning master when the operator
+has explicitly installed that narrow list. Those operations are not added to
+the legacy TOFU catalogue, and a strict slot that omits any one of them still
+denies it. Identity switching and caller-selected identity context remain
+outside this grant.
+
 This strict denial boundary matters: an out-of-policy request cannot be turned
 into broader authority by pressing the button later. Existing legacy slots keep
 `strict_permissions=false` for compatibility, so their historical out-of-policy

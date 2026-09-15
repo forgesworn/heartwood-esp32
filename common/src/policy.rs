@@ -141,6 +141,27 @@ pub const TOFU_SAFE_METHODS: &[&str] = &[
     "get_public_key",
 ];
 
+/// Methods an authenticated operator may name in an exact v2 slot policy.
+///
+/// This deliberately extends, rather than changes, the legacy TOFU surface:
+/// a remembered legacy client cannot gain persona-management authority merely
+/// by updating firmware. An exact policy is installed through the authenticated
+/// management path and is a hard ceiling for a strict slot. The three added
+/// extensions only manage personas belonging to the slot's owning master;
+/// they never select a caller-supplied signing identity.
+pub const EXACT_POLICY_METHODS: &[&str] = &[
+    "sign_event",
+    "heartwood_provision_rendezvous",
+    "heartwood_derive_persona",
+    "heartwood_remove_persona",
+    "heartwood_rename_persona",
+    "nip44_encrypt",
+    "nip44_decrypt",
+    "nip04_encrypt",
+    "nip04_decrypt",
+    "get_public_key",
+];
+
 /// Bound exact remotely-managed policies so an authenticated but buggy manager
 /// cannot grow the persisted NVS blob without limit.
 pub const MAX_ALLOWED_KINDS: usize = 64;
@@ -177,7 +198,7 @@ pub fn validate_exact_slot_policy(
 ) -> Result<ExactSlotPolicy, &'static str> {
     let mut methods = Vec::new();
     for method in allowed_methods {
-        if !TOFU_SAFE_METHODS.contains(&method.as_str()) {
+        if !EXACT_POLICY_METHODS.contains(&method.as_str()) {
             return Err("policy contains an unsupported method");
         }
         if !methods.iter().any(|existing| existing == &method) {
@@ -653,6 +674,27 @@ mod tests {
         assert!(TOFU_SAFE_METHODS.contains(&"get_public_key"));
     }
 
+    #[test]
+    fn exact_policy_extends_tofu_only_for_persona_management() {
+        for method in TOFU_SAFE_METHODS {
+            assert!(
+                EXACT_POLICY_METHODS.contains(method),
+                "{method} is in TOFU_SAFE but not EXACT_POLICY_METHODS",
+            );
+        }
+        for method in [
+            "heartwood_derive_persona",
+            "heartwood_remove_persona",
+            "heartwood_rename_persona",
+        ] {
+            assert!(EXACT_POLICY_METHODS.contains(&method));
+            assert!(
+                !TOFU_SAFE_METHODS.contains(&method),
+                "{method} must not broaden legacy TOFU pairings",
+            );
+        }
+    }
+
     // --- Connect-safe methods ---
 
     #[test]
@@ -736,6 +778,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(policy.allowed_methods, vec!["heartwood_provision_rendezvous"]);
+        assert!(!policy.signing_approved);
+    }
+
+    #[test]
+    fn exact_policy_can_name_persona_management_without_signing() {
+        let policy = validate_exact_slot_policy(
+            vec![
+                "heartwood_derive_persona".into(),
+                "heartwood_remove_persona".into(),
+                "heartwood_rename_persona".into(),
+            ],
+            vec![],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.allowed_methods,
+            vec![
+                "heartwood_derive_persona",
+                "heartwood_remove_persona",
+                "heartwood_rename_persona",
+            ],
+        );
         assert!(!policy.signing_approved);
     }
 
@@ -930,6 +996,7 @@ mod tests {
             "heartwood_remove_persona".into(),
             "heartwood_rename_persona".into(),
         ];
+        slot.strict_permissions = true;
         slot.auto_approve = true;
         for method in [
             "heartwood_derive_persona",
@@ -946,14 +1013,13 @@ mod tests {
             evaluate_slot_policy(&slot, "heartwood_derive_persona", None),
             ApprovalTier::ButtonRequired,
         );
-        // Unlisted extensions never reach this evaluation with a lift — the
-        // firmware returns ButtonRequired before consulting it — but the
-        // pure result for an unlisted method stays non-approving regardless.
+        // The strict ceiling remains fail-closed if a later policy update
+        // removes an extension.
         slot.auto_approve = true;
         slot.allowed_methods = vec!["get_public_key".into()];
         assert_eq!(
             evaluate_slot_policy(&slot, "heartwood_derive_persona", None),
-            ApprovalTier::ButtonRequired,
+            ApprovalTier::Denied,
         );
     }
 
@@ -980,6 +1046,9 @@ mod tests {
             "heartwood_derive",
             "heartwood_switch",
             "heartwood_list_identities",
+            "heartwood_derive_persona",
+            "heartwood_remove_persona",
+            "heartwood_rename_persona",
             "heartwood_verify_proof",
             "heartwood_provision_rendezvous",
         ] {

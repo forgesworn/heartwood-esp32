@@ -7802,6 +7802,10 @@ fn dispatch_mgmt(
                     // addressed to it, defaulting bound_identity to a persona
                     // endpoint.
                     "pairing_identity_v1",
+                    // Exact v2 policies may name persona derivation, removal
+                    // and rename. Legacy TOFU policies deliberately do not
+                    // inherit those permissions.
+                    "exact_persona_management_v1",
                     "atomic_nostrconnect_policy_v2",
                     "staged_network_config_v1",
                     "mutation_challenge_v1",

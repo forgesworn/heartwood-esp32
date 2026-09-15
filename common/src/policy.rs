@@ -124,6 +124,10 @@ pub const CONNECT_SAFE_METHODS: &[&str] = &[
 /// Includes signing -- only granted after the user explicitly approves once.
 pub const TOFU_SAFE_METHODS: &[&str] = &[
     "sign_event",
+    // Naming this in an exact slot only permits the client to present a
+    // rendezvous provision request. Firmware pins each fresh request to a
+    // physical approval; it is never a silent key-export permission.
+    "heartwood_provision_rendezvous",
     "nip44_encrypt",
     "nip44_decrypt",
     "nip04_encrypt",
@@ -671,6 +675,18 @@ mod tests {
     }
 
     #[test]
+    fn exact_policy_can_name_rendezvous_provision_without_signing() {
+        let policy = validate_exact_slot_policy(
+            vec!["heartwood_provision_rendezvous".into()],
+            vec![],
+            true,
+        )
+        .unwrap();
+        assert_eq!(policy.allowed_methods, vec!["heartwood_provision_rendezvous"]);
+        assert!(!policy.signing_approved);
+    }
+
+    #[test]
     fn exact_policy_rejects_unknown_methods_and_orphan_kinds() {
         assert_eq!(
             validate_exact_slot_policy(vec!["delete_everything".into()], vec![], true),
@@ -890,6 +906,7 @@ mod tests {
             "heartwood_switch",
             "heartwood_list_identities",
             "heartwood_verify_proof",
+            "heartwood_provision_rendezvous",
         ] {
             assert!(strict_slot_denies_method(&slot, extension));
             assert_eq!(

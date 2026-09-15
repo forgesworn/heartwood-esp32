@@ -534,7 +534,7 @@ fn rewrite_pinned_relays_from_shadow(
     }
 }
 
-fn slot_keys(slot: u8) -> [String; 12] {
+fn slot_keys(slot: u8) -> [String; 13] {
     let master = format!("master_{slot}");
     [
         format!("{master}_secret"),
@@ -548,6 +548,10 @@ fn slot_keys(slot: u8) -> [String; 12] {
         format!("policy_{slot}"),
         format!("iman{slot}"),
         format!("imav{slot}"),
+        // Scalar-free rendezvous-provision receipts are still identity state:
+        // move/clear them with their root so a reused slot cannot inherit a
+        // prior person's replay ceiling.
+        crate::rendezvous_provision::key(slot),
         // Per-identity operator MUST travel/clear with the bundle: otherwise a
         // slot shift or reuse leaves a stale delegate bound to whichever
         // identity later occupies the slot — a cross-identity escape.

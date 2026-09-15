@@ -27,6 +27,7 @@ use heartwood_common::hex::hex_encode;
 use heartwood_common::nip04;
 use heartwood_common::nip44;
 use heartwood_common::nip46::{self, HeartwoodContext, SignedEvent, UnsignedEvent};
+use heartwood_common::rendezvous_receipts::{ProvisionReplay, RendezvousProvisionReceipt, MAX_RECEIPTS};
 use heartwood_common::types::MasterMode;
 use heartwood_common::validate::validate_persona_name;
 use secp256k1::{Secp256k1, SignOnly};
@@ -685,6 +686,12 @@ fn dispatch_inner(
     }
 
     let method = nip46::Nip46Method::from_str(&request.method);
+    // Provisioning always derives from the selected root. A caller-selected
+    // context would make the word "root" ambiguous, even though the handler
+    // itself never reads it, so reject it at the protocol boundary.
+    if method.requires_fresh_physical_approval() && explicit_heartwood_context {
+        return build_error_json(&request.id, -3, "rendezvous provision does not accept a Heartwood context");
+    }
     let sign_event = if let Some(event) = prepared_event {
         // Resuming a deferred ask: `params` was emptied when the event was
         // parsed on the first pass, so the event comes back in with the ask
@@ -753,6 +760,13 @@ fn dispatch_inner(
         return build_error_json(&request.id, -1, "unauthorised");
     }
 
+    // This ceremony is relay/device scoped by design. Direct USB has physical
+    // possession, but not a bound NIP-46 client identity to put on the
+    // receipt, so it cannot become a scalar hand-off backdoor.
+    if method.requires_fresh_physical_approval() && !has_client {
+        return build_error_json(&request.id, -1, "unauthorised");
+    }
+
     // A strict slot names methods and event kinds for the identity selected by
     // relay routing. It grants no authority to redirect those same operations
     // to a caller-chosen derived child via top-level `heartwood` context.
@@ -775,6 +789,14 @@ fn dispatch_inner(
     if denied_before_dispatch(has_client, tier) {
         log::warn!("{}: refused — outside exact slot policy", request.method);
         return build_error_json(&request.id, -1, "unauthorised");
+    }
+
+    // Validate replay, trusted expiry and receipt storage *before* raising a
+    // card. A retried or stale request must not consume another physical hold.
+    if method.requires_fresh_physical_approval() {
+        if let Err(error) = rendezvous_provision_preflight(&request, nvs, master_slot) {
+            return build_error_json(&request.id, -1, error);
+        }
     }
 
     // Zero-trust USB (FW-M2): with a bridge secret provisioned, an
@@ -830,7 +852,12 @@ fn dispatch_inner(
     if !spend_granted && remote_extension_requires_approval(has_client, &method, tier) {
         // A note card shows the money, not the method name: amount, mint
         // and (for send) the recipient, as the cable path already does.
-        let note_card = if matches!(method, nip46::Nip46Method::HeartwoodPairWallet) {
+        let note_card = if method.requires_fresh_physical_approval() {
+            match rendezvous_provision_preview(&request.params) {
+                Ok(preview) => Some(("PROVISION RENDEZVOUS", preview)),
+                Err(error) => return build_error_json(&request.id, -3, error),
+            }
+        } else if matches!(method, nip46::Nip46Method::HeartwoodPairWallet) {
             let label = pair_wallet_label(&request.params);
             Some(("PAIR NEW WALLET", format!("for '{label}'\nit will see your notes")))
         } else if is_note_method(&method) {
@@ -1652,6 +1679,7 @@ fn dispatch_inner(
                 "heartwood_note_address",
                 "heartwood_note_claim",
                 "heartwood_pair_wallet",
+                "heartwood_provision_rendezvous",
             ];
             nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
         }
@@ -1695,6 +1723,8 @@ fn dispatch_inner(
             let body = serde_json::json!({"ok": true, "slot_index": slot_index, "label": label, "uri": uri});
             nip46::build_result_response(&request.id, &body.to_string()).unwrap_or_default()
         }
+
+        "heartwood_provision_rendezvous" => handle_rendezvous_provision(master_secret, master_mode, master_slot, secp, &request, nvs),
 
         m if m.starts_with("heartwood_note_") => {
             // Direct USB NIP-46 (no client) has its own surface for the
@@ -2271,6 +2301,60 @@ fn random_nonce_32() -> [u8; 32] {
     let mut nonce = [0u8; 32];
     crate::fill_random(&mut nonce);
     nonce
+}
+
+/// The signer alone owns expiry. Inbound request time is never accepted as a
+/// clock source: without a recent relay-derived hint there is no safe way to
+/// tell a live pairing request from an old QR or relay replay.
+fn rendezvous_provision_preflight(request: &nip46::Nip46Request, nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>, master_slot: u8) -> Result<(), &'static str> {
+    let params = nip46::RendezvousProvisionParams::from_params(&request.params)?;
+    let target = hex_decode_32(params.target_device_pubkey).ok_or("target device pubkey must be 64 lowercase hex characters")?;
+    let now = crate::relay::wall_clock_estimate();
+    if now == 0 { return Err("trusted clock unavailable"); }
+    if params.expires_at <= now || params.expires_at - now > 600 { return Err("rendezvous expiry must be after signer time and within ten minutes"); }
+    let mut receipts = crate::rendezvous_provision::load(nvs, master_slot)?;
+    if receipts.discard_expired(now) > 0 { crate::rendezvous_provision::persist(nvs, master_slot, &receipts)?; }
+    match receipts.classify(&target, params.index, params.nonce, params.expires_at) {
+        ProvisionReplay::Fresh if receipts.len() < MAX_RECEIPTS => Ok(()),
+        ProvisionReplay::Fresh => Err("rendezvous provision receipt store full"),
+        ProvisionReplay::Exact => Err("rendezvous provision already completed"),
+        ProvisionReplay::NonceReused => Err("rendezvous provision nonce already used"),
+    }
+}
+
+/// The owner card must show the public approval bindings, never a scalar or
+/// pairing ciphertext.
+fn rendezvous_provision_preview(params: &[Value]) -> Result<String, &'static str> {
+    let params = nip46::RendezvousProvisionParams::from_params(params)?;
+    Ok(format!("device {}…\nindex {}\nexpires {}", &params.target_device_pubkey[..8], params.index, params.expires_at))
+}
+
+/// Execute only after the central relay/slot/physical gates. The scalar exists
+/// solely in the plaintext String consumed by `encrypt_owned` for the target.
+fn handle_rendezvous_provision(master_secret: &[u8; 32], master_mode: MasterMode, master_slot: u8, secp: &Arc<Secp256k1<SignOnly>>, request: &nip46::Nip46Request, nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>) -> String {
+    let params = match nip46::RendezvousProvisionParams::from_params(&request.params) { Ok(params) => params, Err(error) => return build_error_json(&request.id, -3, error) };
+    // Repeat preflight after an asynchronous hold: another path may have
+    // completed this nonce while the owner was deciding.
+    if let Err(error) = rendezvous_provision_preflight(request, nvs, master_slot) { return build_error_json(&request.id, -1, error); }
+    let target = match hex_decode_32(params.target_device_pubkey) { Some(target) => target, None => return build_error_json(&request.id, -3, "invalid target device pubkey") };
+    let issuer = match secp256k1::Keypair::from_seckey_slice(secp, master_secret) { Ok(keypair) => keypair.x_only_public_key().0.serialize(), Err(_) => return build_error_json(&request.id, -4, "invalid master secret") };
+    let (mut child_secret, child_pubkey) = match derive_identity(master_secret, master_mode, "rendezvous", params.index) { Ok(identity) => identity, Err(error) => return build_error_json(&request.id, -4, &error) };
+    let record = heartwood_common::rendezvous_provision::encode_record(&issuer, &target, &child_pubkey, params.index, params.nonce, params.expires_at, &child_secret);
+    let mut conversation_key = match nip44::get_conversation_key(&child_secret, &target) { Ok(key) => key, Err(error) => { child_secret.zeroize(); return build_error_json(&request.id, -4, error); } };
+    child_secret.zeroize();
+    let nonce = random_nonce_32();
+    let ciphertext = match nip44::encrypt_owned(&conversation_key, record, &nonce) { Ok(ciphertext) => ciphertext, Err(error) => { conversation_key.zeroize(); return build_error_json(&request.id, -4, error); } };
+    conversation_key.zeroize();
+    let mut receipts = match crate::rendezvous_provision::load(nvs, master_slot) { Ok(receipts) => receipts, Err(error) => return build_error_json(&request.id, -4, error) };
+    let receipt = RendezvousProvisionReceipt { target_device_pubkey: target, rendezvous_pubkey: child_pubkey, index: params.index, nonce_digest: heartwood_common::rendezvous_receipts::nonce_digest(params.nonce), expires_at: params.expires_at };
+    if let Err(error) = receipts.record(receipt) { return build_error_json(&request.id, -1, error); }
+    if let Err(error) = crate::rendezvous_provision::persist(nvs, master_slot, &receipts) { return build_error_json(&request.id, -4, error); }
+    let result = serde_json::json!({
+        "v": 1, "p": hex_encode(&issuer), "d": params.target_device_pubkey,
+        "rz": hex_encode(&child_pubkey), "u": "rendezvous", "i": params.index,
+        "n": params.nonce, "e": params.expires_at, "c": ciphertext,
+    });
+    nip46::build_result_response(&request.id, &result.to_string()).unwrap_or_default()
 }
 
 /// Generate a random 16-byte IV for per-message NIP-04 encryption. Same

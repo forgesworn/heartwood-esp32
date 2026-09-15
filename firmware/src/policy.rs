@@ -204,6 +204,15 @@ impl PolicyEngine {
             }
         }
 
+        // A rendezvous-child hand-off is not a reusable privilege. In
+        // particular, an older broad slot must not turn a one-device physical
+        // approval into a silent scalar-delivery capability. Exact slots are
+        // still subject to the method ceiling above; a named exact slot gets a
+        // button for every fresh request as well.
+        if method.requires_fresh_physical_approval() {
+            return ApprovalTier::ButtonRequired;
+        }
+
         // C4 approve-once: a live transient allow lifts this exact
         // (client, method-or-kind) to silent approval — the guardian just
         // said yes to precisely this ask. Checked after the strict method

@@ -9,7 +9,8 @@
 //   enc_key   = km[0..32]      mac_key = km[32..64]
 //   ct        = ChaCha20(enc_key, nonce) XOR seed          (32 bytes)
 //   tag       = HMAC-SHA256(mac_key, nonce || ct)          (32 bytes)
-//   blob      = salt(16) || nonce(12) || ct(32) || tag(32) = 92 bytes
+//   legacy    = salt(16) || nonce(12) || ct(32) || tag(32) = 92 bytes
+//   current   = magic(4) || version(1) || rounds(4) || salt || nonce || ct || tag
 //
 // Decryption recomputes km from the PIN, verifies the tag in constant time
 // (wrong PIN -> different km -> tag mismatch -> Err), then decrypts.
@@ -35,43 +36,92 @@ pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
 pub const SEED_LEN: usize = 32;
 pub const TAG_LEN: usize = 32;
-/// Total on-disk length of an encrypted seed blob.
-pub const BLOB_LEN: usize = SALT_LEN + NONCE_LEN + SEED_LEN + TAG_LEN; // 92
+/// The original, fixed-cost on-disk format. It remains readable forever: a
+/// board that was sealed before the cost was recorded must never be mistaken
+/// for an unprotected board after an update.
+pub const LEGACY_BLOB_LEN: usize = SALT_LEN + NONCE_LEN + SEED_LEN + TAG_LEN; // 92
+const HEADER_MAGIC: [u8; 4] = *b"HWSC";
+const FORMAT_VERSION: u8 = 1;
+const HEADER_LEN: usize = HEADER_MAGIC.len() + 1 + 4;
+/// Total on-disk length of a newly encrypted seed blob.
+pub const BLOB_LEN: usize = HEADER_LEN + LEGACY_BLOB_LEN; // 101
+/// Largest encrypted-seed blob understood by this firmware. NVS readers use
+/// this rather than assuming every board was sealed by the current release.
+pub const MAX_BLOB_LEN: usize = BLOB_LEN;
 
-/// PBKDF2 iteration count. Deliberately slow to raise the per-guess cost of an
-/// offline PIN brute-force. **Bench-tune this** to ~1–2 s on the slowest board
-/// (the Heltec / lx106); it is a cost knob, not a correctness one, and can be
-/// raised on new devices without breaking old blobs (the count is not stored —
-/// so if it ever changes, existing blobs must be re-encrypted; keep it fixed
-/// per protocol version, or store it in the blob if it must vary).
-pub const PBKDF2_ITERATIONS: u32 = 100_000;
+/// The immutable cost of the original, unversioned 92-byte record. It must
+/// never follow a future default retune: these blobs have no stored count.
+pub const LEGACY_PBKDF2_ITERATIONS: u32 = 100_000;
+/// PBKDF2 iteration count written into new records. Deliberately slow to raise
+/// the per-guess cost of an offline PIN brute-force. **Bench-tune this** to
+/// ~1–2 s on the slowest board (the Heltec / lx106); it is a cost knob, not a
+/// correctness one. New blobs record the count, so this can change after a
+/// measured retune without changing how legacy blobs unlock.
+pub const PBKDF2_ITERATIONS: u32 = LEGACY_PBKDF2_ITERATIONS;
+/// Refuse a corrupted header before it can turn an unlock attempt into an
+/// arbitrary-length CPU burn. This is deliberately a generous ceiling, not a
+/// policy target; a retune still needs an actual slow-board measurement.
+pub const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SeedCipherError {
-    /// Blob is not exactly [`BLOB_LEN`] bytes.
+    /// Blob is neither a legacy nor a current encrypted-seed record.
     BadLength,
+    /// A current-size blob does not identify a format this firmware knows.
+    UnsupportedFormat,
+    /// A current-size blob names an impossible or unsafe amount of KDF work.
+    InvalidIterations,
     /// The MAC did not verify — wrong PIN or a tampered blob.
     WrongPinOrTampered,
 }
 
 /// Derive the 64-byte (enc || mac) key material from a PIN and salt.
-fn derive_km(pin: &[u8], salt: &[u8]) -> [u8; 64] {
+fn derive_km(pin: &[u8], salt: &[u8], iterations: u32) -> [u8; 64] {
     let mut km = [0u8; 64];
-    pbkdf2::pbkdf2_hmac::<Sha256>(pin, salt, PBKDF2_ITERATIONS, &mut km);
+    pbkdf2::pbkdf2_hmac::<Sha256>(pin, salt, iterations, &mut km);
     km
 }
 
-/// Encrypt a 32-byte seed under a PIN. `salt` and `nonce` must be random and
-/// fresh per encryption (the caller supplies them so this stays deterministic
-/// and host-testable; the device draws them from its TRNG). Returns the
-/// [`BLOB_LEN`]-byte blob `salt || nonce || ciphertext || tag`.
-pub fn encrypt_seed(
+/// Whether `len` is a format length which may represent an encrypted seed.
+/// This deliberately answers only the length question; callers still pass the
+/// bytes to [`decrypt_seed`] before treating the seed as usable.
+pub const fn is_blob_len(len: usize) -> bool {
+    len == LEGACY_BLOB_LEN || len == BLOB_LEN
+}
+
+fn header(iterations: u32) -> [u8; HEADER_LEN] {
+    let mut out = [0u8; HEADER_LEN];
+    out[..4].copy_from_slice(&HEADER_MAGIC);
+    out[4] = FORMAT_VERSION;
+    out[5..].copy_from_slice(&iterations.to_be_bytes());
+    out
+}
+
+fn parse_current_header(blob: &[u8]) -> Result<u32, SeedCipherError> {
+    if blob[..4] != HEADER_MAGIC || blob[4] != FORMAT_VERSION {
+        return Err(SeedCipherError::UnsupportedFormat);
+    }
+    let iterations =
+        u32::from_be_bytes(blob[5..HEADER_LEN].try_into().expect("fixed header length"));
+    if iterations == 0 || iterations > MAX_PBKDF2_ITERATIONS {
+        return Err(SeedCipherError::InvalidIterations);
+    }
+    Ok(iterations)
+}
+
+fn encrypt_seed_with_iterations(
     pin: &[u8],
     seed: &[u8; SEED_LEN],
     salt: &[u8; SALT_LEN],
     nonce: &[u8; NONCE_LEN],
+    iterations: u32,
 ) -> Vec<u8> {
-    let mut km = derive_km(pin, salt);
+    assert!(
+        iterations > 0 && iterations <= MAX_PBKDF2_ITERATIONS,
+        "invalid PBKDF2 iteration count"
+    );
+    let header = header(iterations);
+    let mut km = derive_km(pin, salt, iterations);
     let (enc_key, mac_key) = km.split_at(32);
 
     let mut ct = *seed;
@@ -79,11 +129,16 @@ pub fn encrypt_seed(
     cipher.apply_keystream(&mut ct);
 
     let mut mac = HmacSha256::new_from_slice(mac_key).expect("HMAC accepts any key length");
+    // The KDF cost and format identifier are authenticated too. The count also
+    // chooses the key, but making the framing explicit keeps this invariant
+    // true if the KDF construction changes in a later format.
+    mac.update(&header);
     mac.update(nonce);
     mac.update(&ct);
     let tag = mac.finalize().into_bytes();
 
     let mut blob = Vec::with_capacity(BLOB_LEN);
+    blob.extend_from_slice(&header);
     blob.extend_from_slice(salt);
     blob.extend_from_slice(nonce);
     blob.extend_from_slice(&ct);
@@ -94,22 +149,45 @@ pub fn encrypt_seed(
     blob
 }
 
+/// Encrypt a 32-byte seed under a PIN. `salt` and `nonce` must be random and
+/// fresh per encryption (the caller supplies them so this stays deterministic
+/// and host-testable; the device draws them from its TRNG). Returns the
+/// [`BLOB_LEN`]-byte blob with an authenticated format/cost header. Existing
+/// 92-byte blobs remain accepted by [`decrypt_seed`].
+pub fn encrypt_seed(
+    pin: &[u8],
+    seed: &[u8; SEED_LEN],
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+) -> Vec<u8> {
+    encrypt_seed_with_iterations(pin, seed, salt, nonce, PBKDF2_ITERATIONS)
+}
+
 /// Decrypt a blob under a PIN. A wrong PIN (or any tampering) fails the
 /// constant-time MAC check and returns [`SeedCipherError::WrongPinOrTampered`]
 /// — never a garbage seed.
 pub fn decrypt_seed(pin: &[u8], blob: &[u8]) -> Result<[u8; SEED_LEN], SeedCipherError> {
-    if blob.len() != BLOB_LEN {
-        return Err(SeedCipherError::BadLength);
-    }
-    let salt = &blob[0..SALT_LEN];
-    let nonce = &blob[SALT_LEN..SALT_LEN + NONCE_LEN];
-    let ct = &blob[SALT_LEN + NONCE_LEN..SALT_LEN + NONCE_LEN + SEED_LEN];
-    let tag = &blob[SALT_LEN + NONCE_LEN + SEED_LEN..];
+    let (header, iterations, body) = match blob.len() {
+        LEGACY_BLOB_LEN => (None, LEGACY_PBKDF2_ITERATIONS, blob),
+        BLOB_LEN => (
+            Some(&blob[..HEADER_LEN]),
+            parse_current_header(blob)?,
+            &blob[HEADER_LEN..],
+        ),
+        _ => return Err(SeedCipherError::BadLength),
+    };
+    let salt = &body[0..SALT_LEN];
+    let nonce = &body[SALT_LEN..SALT_LEN + NONCE_LEN];
+    let ct = &body[SALT_LEN + NONCE_LEN..SALT_LEN + NONCE_LEN + SEED_LEN];
+    let tag = &body[SALT_LEN + NONCE_LEN + SEED_LEN..];
 
-    let mut km = derive_km(pin, salt);
+    let mut km = derive_km(pin, salt, iterations);
     let (enc_key, mac_key) = km.split_at(32);
 
     let mut mac = HmacSha256::new_from_slice(mac_key).expect("HMAC accepts any key length");
+    if let Some(header) = header {
+        mac.update(header);
+    }
     mac.update(nonce);
     mac.update(ct);
     if mac.verify_slice(tag).is_err() {
@@ -146,7 +224,8 @@ mod tests {
     fn ciphertext_is_not_the_seed() {
         let blob = encrypt_seed(PIN, &SEED, &SALT, &NONCE);
         // The ciphertext region must not equal the plaintext seed.
-        let ct = &blob[SALT_LEN + NONCE_LEN..SALT_LEN + NONCE_LEN + SEED_LEN];
+        let ct =
+            &blob[HEADER_LEN + SALT_LEN + NONCE_LEN..HEADER_LEN + SALT_LEN + NONCE_LEN + SEED_LEN];
         assert_ne!(ct, &SEED[..]);
     }
 
@@ -162,7 +241,7 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails() {
         let mut blob = encrypt_seed(PIN, &SEED, &SALT, &NONCE);
-        blob[SALT_LEN + NONCE_LEN] ^= 1; // flip a ciphertext bit
+        blob[HEADER_LEN + SALT_LEN + NONCE_LEN] ^= 1; // flip a ciphertext bit
         assert_eq!(
             decrypt_seed(PIN, &blob),
             Err(SeedCipherError::WrongPinOrTampered)
@@ -172,7 +251,7 @@ mod tests {
     #[test]
     fn tampered_salt_fails() {
         let mut blob = encrypt_seed(PIN, &SEED, &SALT, &NONCE);
-        blob[0] ^= 1; // different salt -> different km -> tag mismatch
+        blob[HEADER_LEN] ^= 1; // different salt -> different km -> tag mismatch
         assert_eq!(
             decrypt_seed(PIN, &blob),
             Err(SeedCipherError::WrongPinOrTampered)
@@ -181,7 +260,10 @@ mod tests {
 
     #[test]
     fn bad_length_fails() {
-        assert_eq!(decrypt_seed(PIN, &[0u8; 10]), Err(SeedCipherError::BadLength));
+        assert_eq!(
+            decrypt_seed(PIN, &[0u8; 10]),
+            Err(SeedCipherError::BadLength)
+        );
     }
 
     #[test]
@@ -208,6 +290,63 @@ mod tests {
         assert_eq!(
             decrypt_seed(&wrong, &blob),
             Err(SeedCipherError::WrongPinOrTampered)
+        );
+    }
+
+    #[test]
+    fn legacy_blob_still_unlocks_at_the_legacy_cost() {
+        let mut km = derive_km(PIN, &SALT, LEGACY_PBKDF2_ITERATIONS);
+        let (enc_key, mac_key) = km.split_at(32);
+        let mut ct = SEED;
+        ChaCha20::new(enc_key.into(), (&NONCE).into()).apply_keystream(&mut ct);
+        let mut mac = HmacSha256::new_from_slice(mac_key).unwrap();
+        mac.update(&NONCE);
+        mac.update(&ct);
+        let tag = mac.finalize().into_bytes();
+        let mut legacy = Vec::with_capacity(LEGACY_BLOB_LEN);
+        legacy.extend_from_slice(&SALT);
+        legacy.extend_from_slice(&NONCE);
+        legacy.extend_from_slice(&ct);
+        legacy.extend_from_slice(&tag);
+        km.zeroize();
+        ct.zeroize();
+
+        assert_eq!(legacy.len(), LEGACY_BLOB_LEN);
+        assert_eq!(decrypt_seed(PIN, &legacy).unwrap(), SEED);
+    }
+
+    #[test]
+    fn current_blob_authenticates_its_cost_and_format() {
+        let mut blob = encrypt_seed_with_iterations(PIN, &SEED, &SALT, &NONCE, 2);
+        assert_eq!(decrypt_seed(PIN, &blob).unwrap(), SEED);
+
+        blob[HEADER_LEN - 1] ^= 1;
+        assert_eq!(
+            decrypt_seed(PIN, &blob),
+            Err(SeedCipherError::WrongPinOrTampered)
+        );
+
+        let mut unsupported = encrypt_seed(PIN, &SEED, &SALT, &NONCE);
+        unsupported[4] = FORMAT_VERSION + 1;
+        assert_eq!(
+            decrypt_seed(PIN, &unsupported),
+            Err(SeedCipherError::UnsupportedFormat)
+        );
+    }
+
+    #[test]
+    fn corrupted_iteration_count_refuses_before_the_kdf() {
+        let mut blob = encrypt_seed(PIN, &SEED, &SALT, &NONCE);
+        blob[5..HEADER_LEN].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(
+            decrypt_seed(PIN, &blob),
+            Err(SeedCipherError::InvalidIterations)
+        );
+
+        blob[5..HEADER_LEN].copy_from_slice(&(MAX_PBKDF2_ITERATIONS + 1).to_be_bytes());
+        assert_eq!(
+            decrypt_seed(PIN, &blob),
+            Err(SeedCipherError::InvalidIterations)
         );
     }
 }

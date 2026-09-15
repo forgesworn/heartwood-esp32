@@ -64,11 +64,11 @@ fn secret_enc_key(slot: u8) -> String {
 }
 
 /// Read a slot's encrypted seed blob, if present and well-formed.
-pub fn read_secret_enc(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<[u8; SEED_ENC_LEN]> {
+pub fn read_secret_enc(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<Vec<u8>> {
     let key = secret_enc_key(slot);
-    let mut buf = [0u8; SEED_ENC_LEN];
+    let mut buf = [0u8; SEED_ENC_MAX_LEN];
     match nvs.get_blob(&key, &mut buf) {
-        Ok(Some(b)) if b.len() == SEED_ENC_LEN => Some(buf),
+        Ok(Some(b)) if heartwood_common::seed_cipher::is_blob_len(b.len()) => Some(b.to_vec()),
         _ => None,
     }
 }
@@ -85,9 +85,11 @@ pub fn pin_unlock_required_after_reboot(
 ) -> Result<bool, &'static str> {
     for master in masters {
         let key = secret_enc_key(master.slot);
-        let mut buf = [0u8; SEED_ENC_LEN];
+        let mut buf = [0u8; SEED_ENC_MAX_LEN];
         match nvs.get_blob(&key, &mut buf) {
-            Ok(Some(blob)) if blob.len() == SEED_ENC_LEN => return Ok(true),
+            Ok(Some(blob)) if heartwood_common::seed_cipher::is_blob_len(blob.len()) => {
+                return Ok(true)
+            }
             Ok(Some(_)) => return Err("malformed encrypted seed state"),
             Ok(None) => {}
             Err(_) => return Err("could not read encrypted seed state"),
@@ -96,8 +98,9 @@ pub fn pin_unlock_required_after_reboot(
     Ok(false)
 }
 
-/// Length of an encrypted seed blob.
-pub const SEED_ENC_LEN: usize = heartwood_common::seed_cipher::BLOB_LEN;
+/// Largest encrypted seed blob understood by this release. Earlier 92-byte
+/// records stay readable; new records carry a version and PBKDF2 cost.
+pub const SEED_ENC_MAX_LEN: usize = heartwood_common::seed_cipher::MAX_BLOB_LEN;
 
 /// Store a slot's encrypted seed blob and remove its plaintext secret. Used when
 /// enabling a PIN — after the caller has verified the blob decrypts.

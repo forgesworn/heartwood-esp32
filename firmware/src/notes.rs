@@ -790,7 +790,9 @@ fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
         // or the 60 s watchdog fires mid-derivation (bench-caught 2026-08-18:
         // two task-wdt reboots inside the verify decrypt).
         if nvs.key.is_none() {
-            let mut buf = [0u8; seed_cipher::BLOB_LEN];
+            // New wraps include an authenticated cost header, while existing
+            // 92-byte wraps remain valid after this firmware update.
+            let mut buf = [0u8; seed_cipher::MAX_BLOB_LEN];
             let nk = nvs.nvs.get_blob(NK_KEY, &mut buf);
             match nk {
                 Ok(Some(blob)) => match {

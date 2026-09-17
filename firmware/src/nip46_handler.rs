@@ -36,7 +36,7 @@ use zeroize::Zeroize;
 
 use crate::approval::ApprovalResult;
 use crate::oled::Display;
-use heartwood_common::policy::{CardKind, Gate};
+use heartwood_common::policy::{resume_decision, CardKind, Gate, ResumeDecision, ShownCard};
 use crate::policy::PolicyEngine;
 
 /// Timeout in seconds shown on the OLED countdown bar.
@@ -433,10 +433,10 @@ pub struct Resume {
     /// session's active identity into the request, which would otherwise read
     /// as caller-supplied on resume and be refused on a strict slot.
     pub explicit_context: bool,
-    /// Whether the card was the gate's own (ALLOW AS / NPUB AS / LIST IDS, or
-    /// a sign card carrying ALLOW AS). A hold answers only the card it was
-    /// shown on: never the method's own card, and never the other way round.
-    pub gate_card: bool,
+    /// The card the hold answers and the identity it named. The resumed
+    /// dispatch acts only if the request still needs exactly this card and
+    /// acts as exactly this identity (`common::policy::resume_decision`).
+    pub shown: ShownCard,
 }
 
 /// How a card's hold came out.
@@ -710,7 +710,9 @@ fn dispatch_inner(
 
     // If no heartwood context in the request, resolve from the session's
     // active identity (set by a prior heartwood_switch call).
-    if request.heartwood.is_none() {
+    // A resumed ask keeps the context its card was shown with: a switch while
+    // the card waited must not change who the hold acts as.
+    if request.heartwood.is_none() && resume.is_none() {
         if let Some(context) =
             resolve_active_context(policy_engine, identity_caches, client_pubkey, master_slot)
         {
@@ -838,13 +840,6 @@ fn dispatch_inner(
         Gate::Allow => None,
         Gate::Card(kind) => Some(kind),
     };
-    // A hold answers exactly the card it was shown on. A resumed ask whose card
-    // was not the gate's must not now stand in for one (its identity approval
-    // was cleared by a rebind while it waited, say).
-    let resumed_gate_card = resume.map(|resume| resume.gate_card);
-    if resumed_gate_card == Some(false) && gate_card.is_some() {
-        return build_error_json(&request.id, -1, "approval changed while waiting; send the request again");
-    }
     let identity_label = identity.as_ref().map(|pubkey| {
         identity_label_for(personas, master_label, pubkey, request.heartwood.as_ref().filter(|_| !note_scoped))
     });
@@ -919,6 +914,42 @@ fn dispatch_inner(
         && !matches!(gate_card, Some(CardKind::SwitchTo { .. }))
         && remote_extension_requires_approval(has_client, &method, tier);
 
+    // A switch card names, approves and switches to one resolved pubkey. A
+    // fresh request resolves the target now; a resumed one keeps the pubkey
+    // its card showed, and only if that identity is still in the cache.
+    let switch_target_now = matches!(gate_card, Some(CardKind::SwitchTo { .. })).then(|| {
+        match resume {
+            Some(resume) => resume.shown.identity.filter(|pubkey| {
+                switch_target_exists(pubkey, identity_caches, master_slot, master_secret, master_mode, secp)
+            }),
+            None => switch_target(&request.params, identity_caches, master_slot, master_secret, master_mode, secp),
+        }
+    });
+    let shown_now = ShownCard {
+        card: gate_card,
+        identity: match switch_target_now {
+            Some(target) => target,
+            None => identity,
+        },
+    };
+    // A hold answers exactly the card it was shown on, for exactly the
+    // identity it named. Never act on or record an identity the card did not.
+    if let Some(resume) = resume {
+        match resume_decision(&resume.shown, shown_now.card, shown_now.identity.as_ref(), own_card) {
+            ResumeDecision::Proceed => {}
+            ResumeDecision::IdentityChanged => {
+                log::warn!("{}: refused: identity changed while the card waited", request.method);
+                return build_error_json(&request.id, -1, "unauthorised");
+            }
+            ResumeDecision::CardChanged => {
+                return build_error_json(&request.id, -1, "approval changed while waiting; send the request again");
+            }
+            ResumeDecision::OwnCardNext => {
+                return build_error_json(&request.id, -1, "identity approved; send the request again");
+            }
+        }
+    }
+
     // The gate's own card, before the method's flow: ALLOW AS <identity>?
     // (this app may act as the identity for every method; recorded unless the
     // list is full), NPUB AS <identity>? (one derived pubkey, recorded nowhere)
@@ -928,11 +959,12 @@ fn dispatch_inner(
         // resolved exactly as the switch arm resolves it.
         let (identity, identity_label) = match kind {
             CardKind::SwitchTo { .. } => {
-                let target = switch_target(&request.params, identity_caches, master_slot, master_secret, master_mode, secp);
-                let label = target.as_ref().map(|(pubkey, context)| {
+                let target = shown_now.identity;
+                let label = target.as_ref().map(|pubkey| {
+                    let context = cached_context(pubkey, identity_caches, master_slot);
                     identity_label_for(personas, master_label, pubkey, context.as_ref())
                 });
-                (target.map(|(pubkey, _)| pubkey), label)
+                (target, label)
             }
             _ => (identity, identity_label.clone()),
         };
@@ -961,7 +993,7 @@ fn dispatch_inner(
                     request,
                     event: None,
                     identity,
-                    resume: Resume { explicit_context: explicit_heartwood_context, gate_card: true },
+                    resume: Resume { explicit_context: explicit_heartwood_context, shown: shown_now },
                 }));
                 return String::new();
             }
@@ -979,14 +1011,6 @@ fn dispatch_inner(
             return response;
         }
     }
-    // A hold on a gate card never approves the method's own card: under a
-    // resumed hold that card has not been shown, so the client asks again and
-    // meets it with the identity now approved.
-    if own_card && resumed_gate_card == Some(true) {
-        return build_error_json(&request.id, -1, "identity approved; send the request again");
-    }
-
-    let mut own_card_approved = false;
     if own_card {
         // A note card shows the money, not the method name: amount, mint
         // and (for send) the recipient, as the cable path already does.
@@ -1022,11 +1046,11 @@ fn dispatch_inner(
                     request,
                     event: None,
                     identity: None,
-                    resume: Resume { explicit_context: explicit_heartwood_context, gate_card: false },
+                    resume: Resume { explicit_context: explicit_heartwood_context, shown: shown_now },
                 }));
                 return String::new();
             }
-            Hold::Approved => own_card_approved = true,
+            Hold::Approved => {}
         }
     }
 
@@ -1097,7 +1121,7 @@ fn dispatch_inner(
                             identity,
                             resume: Resume {
                                 explicit_context: explicit_heartwood_context,
-                                gate_card: allow_sign,
+                                shown: shown_now,
                             },
                         }));
                         return String::new();
@@ -1642,8 +1666,20 @@ fn dispatch_inner(
                     Err(e) => return build_error_json(&request.id, -3, e),
                 };
 
+            // A carded switch goes to exactly the pubkey its card named.
+            let carded = switch_target_now.map(|target| target.ok_or(()));
+            if let Some(Err(())) = carded {
+                return build_error_json(&request.id, -4, "identity not found in cache");
+            }
+            let carded = carded.and_then(Result::ok);
+            let served_pubkey = effective_identity(master_secret, master_mode, secp, None);
+            let to_master = match carded {
+                Some(pubkey) => Some(pubkey) == served_pubkey,
+                None => target == "master",
+            };
+
             // "master" resets to the master identity — return its npub.
-            if target == "master" {
+            if to_master {
                 // Clear active identity on the session.
                 if let Some(cpk) = client_pubkey {
                     if let Some(session) = policy_engine.get_or_create_session(*cpk, master_slot) {
@@ -1679,11 +1715,15 @@ fn dispatch_inner(
                 }
             };
 
-            // Search by npub, then persona name, then purpose+index.
-            let found = cache
-                .find_by_npub(target)
-                .or_else(|| cache.find_by_persona(target))
-                .or_else(|| cache.find(target, index_hint));
+            // Search by npub, then persona name, then purpose+index, unless a
+            // card already fixed the pubkey.
+            let found = match carded {
+                Some(pubkey) => cache.identities.iter().position(|id| id.public_key == pubkey),
+                None => cache
+                    .find_by_npub(target)
+                    .or_else(|| cache.find_by_persona(target))
+                    .or_else(|| cache.find(target, index_hint)),
+            };
 
             match found {
                 Some(idx) => {
@@ -1834,12 +1874,6 @@ fn dispatch_inner(
             let Some(slot_index) = policy_engine.create_slot(master_slot, label.clone(), secret_hex.clone()) else {
                 return build_error_json(&request.id, -1, "no free slot");
             };
-            // The pairing hold approves the identity this wallet is served as.
-            if own_card_approved {
-                if let Some(served) = effective_identity(master_secret, master_mode, secp, None) {
-                    policy_engine.record_identity(master_slot, Err(slot_index), &served);
-                }
-            }
             if !policy_engine.persist_slots(nvs, master_slot) {
                 // A slot that would not survive a reboot is one the other
                 // wallet binds to and then loses: refuse rather than mislead.
@@ -2049,9 +2083,9 @@ pub(crate) fn identity_label_for(
     }
 }
 
-/// Resolve a `heartwood_switch` target to its pubkey (and, for a cached child,
-/// the context naming it) the way the switch arm does: `master` is the served
-/// identity, else the cache by npub, persona name, then purpose and index.
+/// Resolve a `heartwood_switch` target to its pubkey the way an uncarded
+/// switch does: `master` is the served identity, else the cache by npub,
+/// persona name, then purpose and index.
 fn switch_target(
     params: &[Value],
     identity_caches: &[crate::identity_cache::IdentityCache],
@@ -2059,21 +2093,45 @@ fn switch_target(
     master_secret: &[u8; 32],
     master_mode: MasterMode,
     secp: &Arc<Secp256k1<SignOnly>>,
-) -> Option<([u8; 32], Option<HeartwoodContext>)> {
+) -> Option<[u8; 32]> {
     let nip46::SwitchParams { target, index_hint } = nip46::SwitchParams::from_params(params).ok()?;
     if target == "master" {
-        return effective_identity(master_secret, master_mode, secp, None).map(|pubkey| (pubkey, None));
+        return effective_identity(master_secret, master_mode, secp, None);
     }
     let cache = identity_caches.iter().find(|c| c.master_slot == master_slot)?;
     let idx = cache
         .find_by_npub(target)
         .or_else(|| cache.find_by_persona(target))
         .or_else(|| cache.find(target, index_hint))?;
-    let id = &cache.identities[idx];
-    Some((
-        id.public_key,
-        Some(HeartwoodContext { purpose: id.purpose.clone(), index: id.index }),
-    ))
+    Some(cache.identities[idx].public_key)
+}
+
+/// Whether a switch card's stored target is still a switchable identity: the
+/// served identity, or an entry in the identity cache.
+fn switch_target_exists(
+    pubkey: &[u8; 32],
+    identity_caches: &[crate::identity_cache::IdentityCache],
+    master_slot: u8,
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    secp: &Arc<Secp256k1<SignOnly>>,
+) -> bool {
+    effective_identity(master_secret, master_mode, secp, None).as_ref() == Some(pubkey)
+        || cached_context(pubkey, identity_caches, master_slot).is_some()
+}
+
+/// The context naming a cached identity, by pubkey.
+fn cached_context(
+    pubkey: &[u8; 32],
+    identity_caches: &[crate::identity_cache::IdentityCache],
+    master_slot: u8,
+) -> Option<HeartwoodContext> {
+    identity_caches
+        .iter()
+        .filter(|c| c.master_slot == master_slot)
+        .flat_map(|c| c.identities.iter())
+        .find(|id| id.public_key == *pubkey)
+        .map(|id| HeartwoodContext { purpose: id.purpose.clone(), index: id.index })
 }
 
 /// Make a slot grant from a physically approved card durable before the
@@ -2770,6 +2828,7 @@ mod tests {
             guardian_notice_wrap: false,
             bound_identity: None,
             approved_identities: String::new(),
+            was_bound: false,
         });
         engine
     }

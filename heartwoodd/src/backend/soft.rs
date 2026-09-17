@@ -780,6 +780,7 @@ impl SigningBackend for SoftBackend {
                 audit_child_wrap: false,
                 bound_identity: None,
                 approved_identities: String::new(),
+                was_bound: false,
             };
             m.connection_slots.push(slot.clone());
             Self::persist(state, &path)?;

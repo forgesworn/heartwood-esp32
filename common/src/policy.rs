@@ -115,6 +115,17 @@ pub struct ConnectSlot {
     /// counts as approved and anything else prompts once.
     #[serde(default, rename = "ids", skip_serializing_if = "String::is_empty")]
     pub approved_identities: String,
+    /// True once any client key has ever been bound to this slot. A key the
+    /// slot never authorised binding to a slot that was bound before is a new
+    /// holder of the credential and clears `approved_identities`, even when
+    /// the previous key has since been removed (`current_pubkey` is `None`).
+    /// Old blobs default to false: their first bind keeps what it has.
+    #[serde(default, rename = "wb", skip_serializing_if = "is_false")]
+    pub was_bound: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A client's approval policy for a specific master.
@@ -173,6 +184,10 @@ pub const TOFU_SAFE_METHODS: &[&str] = &[
 /// they never select a caller-supplied signing identity.
 pub const EXACT_POLICY_METHODS: &[&str] = &[
     "sign_event",
+    // Reading the identity list. A strict slot is denied it unless listed;
+    // a legacy slot earns it on a LIST IDS card, and a backup of that slot
+    // must still validate on import.
+    "heartwood_list_identities",
     "heartwood_provision_rendezvous",
     "heartwood_derive_persona",
     "heartwood_remove_persona",
@@ -566,6 +581,106 @@ pub fn gate_tier(gate: Gate, tier: ApprovalTier) -> ApprovalTier {
     }
 }
 
+/// What a deferred card showed, kept with the ask so its resumed dispatch can
+/// prove the hold still answers the same question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShownCard {
+    /// The gate card it was (a sign card carrying ALLOW AS counts as
+    /// `AllowAs`), or `None` for a policy card: HOLD TO SIGN or the method's
+    /// own card.
+    pub card: Option<CardKind>,
+    /// The identity the card named and the request would act as: the
+    /// effective identity, or a switch's target. `None` when the request uses
+    /// no identity key.
+    pub identity: Option<[u8; 32]>,
+}
+
+/// How a resumed ask may proceed on a completed hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeDecision {
+    /// The hold answers exactly this request as it now stands.
+    Proceed,
+    /// The request would now act as a different identity from the card's:
+    /// refuse, and never act on or record the new identity.
+    IdentityChanged,
+    /// The request now needs a different card from the one held: answer
+    /// "send the request again" so it meets the right card.
+    CardChanged,
+    /// A gate card was held (the identity is now approved), but the method's
+    /// own card has not been shown: answer "send the request again".
+    OwnCardNext,
+}
+
+/// Compare what a card showed with what its resumed request now needs.
+/// `card_now` is the gate card the request needs now (`None` for none or a
+/// policy card); `identity_now` the identity it would act as now; `own_card`
+/// whether the method's own card is still due after any gate card.
+pub fn resume_decision(
+    shown: &ShownCard,
+    card_now: Option<CardKind>,
+    identity_now: Option<&[u8; 32]>,
+    own_card: bool,
+) -> ResumeDecision {
+    if shown.identity.as_ref() != identity_now {
+        return ResumeDecision::IdentityChanged;
+    }
+    let kind = |card: Option<CardKind>| {
+        card.map(|card| match card {
+            CardKind::AllowAs { .. } => 1,
+            CardKind::NpubAs => 2,
+            CardKind::ListIds => 3,
+            CardKind::SwitchTo { .. } => 4,
+        })
+    };
+    if kind(shown.card) != kind(card_now) {
+        return ResumeDecision::CardChanged;
+    }
+    if shown.card.is_some() && own_card {
+        return ResumeDecision::OwnCardNext;
+    }
+    ResumeDecision::Proceed
+}
+
+/// Whether an approve-once verdict granted for `granted` (the identity the
+/// guardian's notice named, if any) covers a request acting as `requested`.
+/// A request that uses no identity key is covered by the method match alone;
+/// an identity-scoped one only by a verdict for exactly its identity.
+pub fn verdict_covers_identity(granted: Option<&[u8; 32]>, requested: Option<&[u8; 32]>) -> bool {
+    requested.map_or(true, |requested| granted == Some(requested))
+}
+
+/// A marker for an ask's batching key: asks for different cards never share
+/// one hold.
+pub fn card_batch_marker(card: Option<CardKind>) -> &'static str {
+    match card {
+        None => "",
+        Some(CardKind::AllowAs { .. }) => "#allow",
+        Some(CardKind::NpubAs) => "#npub",
+        Some(CardKind::ListIds) => "#list",
+        Some(CardKind::SwitchTo { .. }) => "#switch",
+    }
+}
+
+/// Sanitise one connection slot from a backup before import: signing and kind
+/// ceilings are stripped (a restore never carries silent signing), then the
+/// method ceiling is re-validated. Identity approvals and the bound flag are
+/// kept. Returns whether signing was stripped.
+pub fn sanitise_imported_slot(slot: &mut ConnectSlot) -> Result<bool, &'static str> {
+    let had_signing =
+        slot.signing_approved || slot.allowed_methods.iter().any(|m| m == "sign_event");
+    slot.signing_approved = false;
+    slot.allowed_methods.retain(|m| m != "sign_event");
+    // Kind ceilings are meaningless without sign_event (and the validator
+    // rejects the combination), so they go with it.
+    slot.allowed_kinds.clear();
+    let policy =
+        validate_exact_slot_policy(slot.allowed_methods.clone(), Vec::new(), slot.auto_approve)?;
+    slot.allowed_methods = policy.allowed_methods;
+    slot.allowed_kinds = policy.allowed_kinds;
+    slot.auto_approve = policy.auto_approve;
+    Ok(had_signing)
+}
+
 /// Approval decision for a specific request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalTier {
@@ -697,9 +812,10 @@ pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) {
     // new holder of the credential: identity approvals were given to the old
     // one and do not carry over. A key that paired before keeps them, so two
     // devices sharing one slot do not reset each other.
-    if slot.current_pubkey.is_some() && !slot_authorizes(slot, pubkey) {
+    if (slot.was_bound || slot.current_pubkey.is_some()) && !slot_authorizes(slot, pubkey) {
         slot.approved_identities.clear();
     }
+    slot.was_bound = true;
     if let Some(prev) = slot.current_pubkey.take() {
         if prev != pubkey {
             push_authorized(slot, prev);
@@ -1213,6 +1329,7 @@ mod tests {
             guardian_notice_wrap: false,
             bound_identity: None,
             approved_identities: String::new(),
+            was_bound: false,
         }
     }
 
@@ -1538,6 +1655,165 @@ mod tests {
             };
             assert_eq!(gate_request(&request), Gate::Allow, "{method}");
         }
+    }
+
+    #[test]
+    fn a_switch_between_defer_and_press_is_refused() {
+        // A HOLD TO SIGN / ALLOW AS card shown for the master (no context);
+        // before the press a silent switch makes the session act as a child.
+        let master = IDENTITY_A;
+        let child = IDENTITY_B;
+        let shown = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(master) };
+        assert_eq!(
+            resume_decision(&shown, Some(CardKind::AllowAs { record: true }), Some(&child), false),
+            ResumeDecision::IdentityChanged,
+        );
+        // The same identity proceeds, whatever the record flag now says.
+        assert_eq!(
+            resume_decision(&shown, Some(CardKind::AllowAs { record: false }), Some(&master), false),
+            ResumeDecision::Proceed,
+        );
+        // A plain HOLD TO SIGN card is held to its identity too.
+        let plain = ShownCard { card: None, identity: Some(master) };
+        assert_eq!(resume_decision(&plain, None, Some(&child), false), ResumeDecision::IdentityChanged);
+        assert_eq!(resume_decision(&plain, None, Some(&master), false), ResumeDecision::Proceed);
+    }
+
+    #[test]
+    fn resume_identity_distinguishes_no_context_context_and_persona_addressing() {
+        let served_master = IDENTITY_A;
+        let context_child = IDENTITY_B;
+        let persona = IDENTITY_C;
+        // Shown with no identity key at all (a non-scoped method): a request
+        // that now acts as any identity is refused.
+        let none = ShownCard { card: None, identity: None };
+        assert_eq!(resume_decision(&none, None, None, true), ResumeDecision::Proceed);
+        assert_eq!(resume_decision(&none, None, Some(&served_master), false), ResumeDecision::IdentityChanged);
+        // Shown without context (master), resumed with a context child.
+        let master = ShownCard { card: None, identity: Some(served_master) };
+        assert_eq!(resume_decision(&master, None, Some(&context_child), false), ResumeDecision::IdentityChanged);
+        // Persona-addressed ask, resumed after a master-addressed switch made
+        // the session derive a child of the persona.
+        let addressed = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(persona) };
+        assert_eq!(
+            resume_decision(&addressed, Some(CardKind::AllowAs { record: true }), Some(&context_child), false),
+            ResumeDecision::IdentityChanged,
+        );
+        // A switch keeps its stored target; a vanished target reads as None.
+        let switch = ShownCard { card: Some(CardKind::SwitchTo { record: true }), identity: Some(persona) };
+        assert_eq!(resume_decision(&switch, Some(CardKind::SwitchTo { record: true }), None, false), ResumeDecision::IdentityChanged);
+        assert_eq!(resume_decision(&switch, Some(CardKind::SwitchTo { record: true }), Some(&persona), false), ResumeDecision::Proceed);
+    }
+
+    #[test]
+    fn a_hold_releases_only_the_card_it_was_shown_on() {
+        let id = Some(IDENTITY_A);
+        let gate = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: id };
+        let own = ShownCard { card: None, identity: id };
+        // Gate hold never releases the method's own card.
+        assert_eq!(resume_decision(&gate, Some(CardKind::AllowAs { record: true }), id.as_ref(), true), ResumeDecision::OwnCardNext);
+        // Own-card hold never stands in for a gate card that is now due.
+        assert_eq!(resume_decision(&own, Some(CardKind::AllowAs { record: true }), id.as_ref(), true), ResumeDecision::CardChanged);
+        // Gate hold whose gate card is no longer due (approved meanwhile).
+        assert_eq!(resume_decision(&gate, None, id.as_ref(), false), ResumeDecision::CardChanged);
+        // Different gate cards never answer each other.
+        assert_eq!(resume_decision(&gate, Some(CardKind::NpubAs), id.as_ref(), false), ResumeDecision::CardChanged);
+        // Each held on its own card proceeds.
+        assert_eq!(resume_decision(&own, None, id.as_ref(), true), ResumeDecision::Proceed);
+        assert_eq!(resume_decision(&gate, Some(CardKind::AllowAs { record: true }), id.as_ref(), false), ResumeDecision::Proceed);
+        // Batching markers keep every card kind apart.
+        let markers = [
+            card_batch_marker(None),
+            card_batch_marker(Some(CardKind::AllowAs { record: true })),
+            card_batch_marker(Some(CardKind::NpubAs)),
+            card_batch_marker(Some(CardKind::ListIds)),
+            card_batch_marker(Some(CardKind::SwitchTo { record: true })),
+        ];
+        for (i, a) in markers.iter().enumerate() {
+            for b in &markers[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(card_batch_marker(Some(CardKind::AllowAs { record: false })), card_batch_marker(Some(CardKind::AllowAs { record: true })));
+    }
+
+    #[test]
+    fn verdicts_cover_only_the_identity_they_were_given_for() {
+        assert!(verdict_covers_identity(None, None));
+        assert!(verdict_covers_identity(Some(&IDENTITY_A), None));
+        assert!(verdict_covers_identity(Some(&IDENTITY_A), Some(&IDENTITY_A)));
+        assert!(!verdict_covers_identity(Some(&IDENTITY_A), Some(&IDENTITY_B)));
+        assert!(!verdict_covers_identity(None, Some(&IDENTITY_A)));
+    }
+
+    #[test]
+    fn rebind_clears_even_after_the_previous_key_was_removed() {
+        let mut slot = trusted_legacy_slot();
+        // First bind keeps a pairing seed.
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        authorize_pubkey_on_slot(&mut slot, &sample_pubkey('a'));
+        assert!(identity_approved(&slot, &IDENTITY_A));
+        assert!(slot.was_bound);
+        // The key is removed (ambiguity migration or unique reassignment).
+        slot.current_pubkey = None;
+        slot.authorized_pubkeys.clear();
+        // A never-authorised key binding now is a new holder: cleared.
+        authorize_pubkey_on_slot(&mut slot, &sample_pubkey('b'));
+        assert!(!identity_approved(&slot, &IDENTITY_A));
+
+        // The flag persists and old blobs default to "never bound".
+        let json = serde_json::to_string(&slot).unwrap();
+        assert!(json.contains(r#""wb":true"#), "{json}");
+        let old: ConnectSlot = serde_json::from_str(r#"{"slot_index":0,"label":"old","secret":"aa","ids":"aaaaaaaaaaaaaaaa"}"#).unwrap();
+        assert!(!old.was_bound);
+        let mut old = old;
+        authorize_pubkey_on_slot(&mut old, &sample_pubkey('c'));
+        assert!(identity_approved(&old, &IDENTITY_A), "an old blob's first bind keeps its approvals");
+        assert!(!serde_json::to_string(&trusted_legacy_slot()).unwrap().contains("wb"));
+
+        // Unique reassignment removes a key from its old slot; that slot's
+        // next new key still clears.
+        let mut first = trusted_legacy_slot();
+        first.slot_index = 0;
+        authorize_pubkey_on_slot(&mut first, &sample_pubkey('d'));
+        assert!(record_approved_identity(&mut first, &IDENTITY_B));
+        let mut slots = vec![first, sample_slot(1, "other")];
+        assert!(authorize_pubkey_on_unique_slot(&mut slots, 1, &sample_pubkey('d')));
+        assert!(slots[0].current_pubkey.is_none());
+        assert!(authorize_pubkey_on_unique_slot(&mut slots, 0, &sample_pubkey('e')));
+        assert!(!identity_approved(&slots[0], &IDENTITY_B));
+    }
+
+    #[test]
+    fn a_backup_of_a_granted_slot_imports_with_its_grant_and_identities() {
+        let mut slot = trusted_legacy_slot();
+        authorize_pubkey_on_slot(&mut slot, &sample_pubkey('a'));
+        assert!(grant_slot_method(&mut slot, "heartwood_list_identities"));
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        let payload = crate::backup::BackupPayload {
+            created_at: 1,
+            device_id: "00".repeat(32),
+            masters: vec![crate::backup::BackupMaster {
+                slot: 0,
+                label: "m".into(),
+                mode: 0,
+                derivation_version: 0,
+                pubkey: "11".repeat(32),
+                connection_slots: vec![slot],
+            }],
+            bridge_secret: "22".repeat(32),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let mut restored: crate::backup::BackupPayload = serde_json::from_str(&json).unwrap();
+        let slot = &mut restored.masters[0].connection_slots[0];
+        assert_eq!(sanitise_imported_slot(slot), Ok(true));
+        assert!(slot.allowed_methods.iter().any(|m| m == "heartwood_list_identities"));
+        assert!(!slot.allowed_methods.iter().any(|m| m == "sign_event"));
+        assert!(identity_approved(slot, &IDENTITY_A));
+        assert!(slot.was_bound);
+        // An unknown method still fails the whole import.
+        slot.allowed_methods.push("delete_everything".into());
+        assert!(sanitise_imported_slot(slot).is_err());
     }
 
     #[test]

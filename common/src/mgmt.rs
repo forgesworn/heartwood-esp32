@@ -631,6 +631,7 @@ mod tests {
             guardian_notice_wrap: false,
             bound_identity: None,
             approved_identities: String::new(),
+            was_bound: false,
         };
         let summary = client_summary(&slot);
         assert_eq!(summary["slot_index"], 7);

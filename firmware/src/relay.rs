@@ -4154,6 +4154,9 @@ fn queue_button_ask(
         kind_key.push('@');
         kind_key.extend(heartwood_common::policy::identity_tag(identity).iter().map(|&b| b as char));
     }
+    // A HOLD TO SIGN ask and an ALLOW AS ask (or any two card kinds) are
+    // different decisions and never share one hold.
+    kind_key.push_str(heartwood_common::policy::card_batch_marker(ask.resume.shown.card));
     let key = AskKey::new(slot, client_hex.to_string(), hex_encode(target_pk), kind_key);
     let weight = ask
         .event

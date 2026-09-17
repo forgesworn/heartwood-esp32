@@ -12,6 +12,7 @@ use heartwood_common::policy::{
     find_slot_by_pubkey_mut, find_slot_by_secret, gate_request, grant_slot_method,
     grant_slot_signing, next_slot_index, record_approved_identity, remove_ambiguous_pubkeys,
     remove_authorized_pubkey, set_slot_bound_identity, strict_slot_denies_method,
+    verdict_covers_identity,
     validate_exact_slot_policy, ApprovalTier, ConnectSlot, ExactSlotPolicy, Gate, GateRequest,
     RemoveAuthorizedPubkey, CONNECT_SAFE_METHODS,
 };
@@ -184,7 +185,7 @@ impl PolicyEngine {
                 && allow.client_pubkey == client_pubkey
                 && allow.key == key
                 && allow.until > now
-                && identity.map_or(true, |id| allow.identity.as_ref() == Some(id))
+                && verdict_covers_identity(allow.identity.as_ref(), identity)
         })
     }
 
@@ -525,6 +526,7 @@ impl PolicyEngine {
             guardian_notice_wrap: false,
             bound_identity: None,
             approved_identities: String::new(),
+            was_bound: false,
         };
         self.slots_mut(master_slot).push(new_slot);
         self.slots_dirty = true;
@@ -562,6 +564,7 @@ impl PolicyEngine {
             guardian_notice_wrap: policy.guardian_notice_wrap,
             bound_identity: policy.bound_identity,
             approved_identities: String::new(),
+            was_bound: false,
         });
         self.slots_dirty = true;
         Some(slot_index)
@@ -931,6 +934,7 @@ impl PolicyEngine {
                     guardian_notice_wrap: false,
                     bound_identity: None,
                     approved_identities: String::new(),
+                    was_bound: false,
                 };
 
                 log::info!("Migrated legacy policy for master slot {slot} to connslots format");

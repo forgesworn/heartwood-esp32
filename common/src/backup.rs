@@ -75,6 +75,7 @@ mod tests {
             guardian_notice_wrap: false,
             bound_identity: None,
             approved_identities: String::new(),
+            was_bound: false,
         }
     }
 

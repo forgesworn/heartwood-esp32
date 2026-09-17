@@ -1791,11 +1791,21 @@ master on a legacy slot that already signs silently.
     following `get_public_key` and first sign as it raise no card (Bark: one
     press per switch, as before). A switch a slot policy lets through silently,
     or a guardian verdict, records nothing.
-11. **Pairing approvals seed.** `heartwood_pair_wallet`: after its hold, the new
-    slot lists the served identity's tag in `approved_identities`, and the new
-    wallet's first sign as it is not asked again. A signing slot's rebind hold
-    (a new client key with the slot secret) clears the old approvals and seeds
-    the served identity.
+11. **Rebind seeds; wallet pairing does not.** A signing slot's rebind hold (a
+    new client key with the slot secret) clears the old approvals and seeds the
+    served identity. `heartwood_pair_wallet` records nothing: the new wallet's
+    first note method raises `ALLOW AS`. A never-seen key binding to a slot
+    whose previous key was removed also clears its approvals.
+11b. **A card acts only as it said.** Put up a `HOLD TO SIGN` or `ALLOW AS` card
+    over the relay for the master, then (before holding) switch the same app to
+    a persona silently (a slot that lists `heartwood_switch` with auto-approve).
+    Hold: the request answers `unauthorised`, nothing is signed or recorded.
+    A deferred `SWITCH TO` whose persona is removed before the hold answers
+    `identity not found in cache`; otherwise it switches to exactly the pubkey
+    the card showed, even if another persona now shares the name.
+11c. **Backups keep grants.** Export a legacy slot holding the LIST IDS grant
+    and approved identities, restore it: both survive (signing is stripped as
+    before).
 12. **Binding change clears.** Change a slot's `bound_identity` (USB
     CONNSLOT_UPDATE or `update_client`): `approved_identities` is empty and the
     new binding signs without a card.

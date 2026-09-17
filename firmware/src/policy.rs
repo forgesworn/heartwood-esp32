@@ -9,13 +9,15 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{
     authorize_pubkey_on_unique_slot, evaluate_slot_policy, find_slot_by_pubkey,
-    find_slot_by_pubkey_mut, find_slot_by_secret, grant_slot_signing, identity_approved,
-    next_slot_index, record_approved_identity, remove_ambiguous_pubkeys,
-    remove_authorized_pubkey, strict_slot_denies_method, validate_exact_slot_policy,
-    ApprovalTier, ConnectSlot, ExactSlotPolicy, RemoveAuthorizedPubkey, CONNECT_SAFE_METHODS,
+    find_slot_by_pubkey_mut, find_slot_by_secret, gate_request, grant_slot_method,
+    grant_slot_signing, next_slot_index, record_approved_identity, remove_ambiguous_pubkeys,
+    remove_authorized_pubkey, set_slot_bound_identity, strict_slot_denies_method,
+    validate_exact_slot_policy, ApprovalTier, ConnectSlot, ExactSlotPolicy, Gate, GateRequest,
+    RemoveAuthorizedPubkey, CONNECT_SAFE_METHODS,
 };
 
-/// Upper bound on one master's persisted slot table when loading it: well
+/// Upper bound on one master's persisted slot table, enforced when writing and
+/// when loading it: well
 /// above sixteen fully populated slots, each of which (eight client keys, a
 /// full kind and method ceiling, sixteen approved identities) stays within a
 /// few kilobytes. Anything larger is not a table this firmware wrote.
@@ -282,39 +284,75 @@ impl PolicyEngine {
         evaluate_slot_policy(slot, method.as_str(), event_kind)
     }
 
-    /// Whether this client's slot may act as `identity` (the x-only pubkey of
-    /// the key the request will use) without a new physical approval: its
-    /// binding or approved list says so, or a live approve-once verdict covers
-    /// this exact request AND identity (this dispatch and its retries only).
-    /// A client with no slot is never approved.
-    pub fn identity_approved(
+    /// The identity and list-identities gate for one request: the same pure
+    /// decision (`heartwood_common::policy::gate_request`) whether the relay
+    /// is planning escalation before dispatch or the handler is dispatching.
+    /// `tier` is this request's policy tier; `identity` the x-only pubkey of
+    /// the key it will use, when it uses one. A live approve-once verdict
+    /// counts only for this exact request, and for an identity-scoped request
+    /// only for the identity the guardian was shown.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gate(
         &self,
         master_slot: u8,
         client_pubkey: &str,
+        has_client: bool,
         method: &Nip46Method,
+        method_name: &str,
         event_kind: Option<u64>,
-        identity: &[u8; 32],
-    ) -> bool {
-        let Some(slot) = self.find_slot_by_pubkey(master_slot, client_pubkey) else {
-            return false;
-        };
-        if identity_approved(slot, identity) {
-            return true;
-        }
+        tier: ApprovalTier,
+        explicit_context: bool,
+        has_context: bool,
+        identity: Option<&[u8; 32]>,
+    ) -> Gate {
+        let slot = self.find_slot_by_pubkey(master_slot, client_pubkey);
         let key = heartwood_common::nip59::method_or_kind_key(method.as_str(), event_kind);
-        self.transient_allowed(master_slot, client_pubkey, &key, Some(identity))
+        gate_request(&GateRequest {
+            has_client,
+            slot,
+            method: method_name,
+            tier,
+            explicit_context,
+            has_context,
+            identity,
+            verdict: slot.is_some()
+                && self.transient_allowed(master_slot, client_pubkey, &key, identity),
+        })
     }
 
-    /// Record a physically approved identity on the client's slot. True when
-    /// the slot table changed (the caller makes it durable); a full list
-    /// records nothing and the identity keeps prompting.
-    pub fn record_identity(&mut self, master_slot: u8, client_pubkey: &str, identity: &[u8; 32]) -> bool {
+    /// Record a physically approved identity on a slot, found by client key
+    /// (`Ok`) or by index (`Err`). True when the slot table changed (the caller
+    /// makes it durable); a full list records nothing and the identity keeps
+    /// prompting.
+    pub fn record_identity(
+        &mut self,
+        master_slot: u8,
+        slot: Result<&str, u8>,
+        identity: &[u8; 32],
+    ) -> bool {
+        let changed = self
+            .master_slots
+            .iter_mut()
+            .find(|ms| ms.master_slot == master_slot)
+            .and_then(|ms| match slot {
+                Ok(client_pubkey) => find_slot_by_pubkey_mut(&mut ms.slots, client_pubkey),
+                Err(index) => ms.slots.iter_mut().find(|s| s.slot_index == index),
+            })
+            .is_some_and(|slot| record_approved_identity(slot, identity));
+        self.slots_dirty |= changed;
+        changed
+    }
+
+    /// Add `heartwood_list_identities` to a legacy client's slot after its
+    /// card was physically approved. Strict slots are never widened here.
+    pub fn grant_list_identities(&mut self, master_slot: u8, client_pubkey: &str) -> bool {
         let changed = self
             .master_slots
             .iter_mut()
             .find(|ms| ms.master_slot == master_slot)
             .and_then(|ms| find_slot_by_pubkey_mut(&mut ms.slots, client_pubkey))
-            .is_some_and(|slot| record_approved_identity(slot, identity));
+            .filter(|slot| !slot.strict_permissions)
+            .is_some_and(|slot| grant_slot_method(slot, "heartwood_list_identities"));
         self.slots_dirty |= changed;
         changed
     }
@@ -578,7 +616,9 @@ impl PolicyEngine {
             slot.petition_on_deny = petition_on_deny;
             slot.audit_child_wrap = audit_child_wrap;
             slot.guardian_notice_wrap = guardian_notice_wrap;
-            slot.bound_identity = bound_identity;
+            // A changed binding clears the approved identities, and the new
+            // binding is itself approved.
+            set_slot_bound_identity(slot, bound_identity);
             self.slots_dirty = true;
             true
         } else {
@@ -737,6 +777,12 @@ impl PolicyEngine {
             .find(|ms| ms.master_slot == master_slot);
         let persisted = match ms {
             Some(ms) => match serde_json::to_string(&ms.slots) {
+                // A table the boot loader could not read back is refused, not
+                // written: persisting fails closed and the caller rolls back.
+                Ok(json) if json.len() > MAX_SLOT_BLOB_BYTES => {
+                    log::error!("Slot table for slot {master_slot} exceeds the load cap; not written");
+                    false
+                }
                 Ok(json) => {
                     if let Err(e) = nvs.set_blob(&key, json.as_bytes()) {
                         log::error!("Failed to persist slots for slot {master_slot}: {e:?}");

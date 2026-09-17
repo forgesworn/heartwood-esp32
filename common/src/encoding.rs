@@ -89,45 +89,75 @@ pub fn client_fallback_label(public_key: &[u8; 32]) -> String {
     format!("{}..", &npub[..12])
 }
 
-/// Characters an identity card line may take for its label. With a space and
-/// [`client_fallback_label`]'s 14 the line fits the narrowest panel's 25
+/// Characters an identity label may take on a card. With a space and
+/// [`short_npub`]'s 15 an identity line fits the narrowest panel's 25
 /// small-font columns.
 pub const IDENTITY_LABEL_CHARS: usize = 9;
 
-/// The card line naming the identity a request acts as: a label (persona
-/// name, purpose or served label) cut to [`IDENTITY_LABEL_CHARS`] printable
-/// ASCII characters, then the short npub. The label is a display aid only;
-/// the npub is what identifies.
+/// A short, OLED-safe npub for approval cards: `npub1` plus the first eight
+/// data characters and an ASCII `..`.
+pub fn short_npub(public_key: &[u8; 32]) -> String {
+    let npub = encode_npub(public_key);
+    format!("{}..", &npub[..13])
+}
+
+/// The label an approval card gives an identity, at most
+/// [`IDENTITY_LABEL_CHARS`] printable ASCII characters.
+///
+/// `name` is a registered persona's name, or the served identity's label.
+/// Otherwise the purpose's last `:` segment stands in. An identity that is not
+/// in the persona registry (`registered == false`, a child a context derives)
+/// is marked with a leading `?` and, when its index is not 0, keeps a `#index`
+/// suffix through truncation, so two children of one purpose never read the
+/// same. A label that comes out empty falls back to the first eight npub data
+/// characters (after `npub1`). A display aid only: the npub identifies.
+pub fn identity_label(
+    name: Option<&str>,
+    purpose: Option<&str>,
+    index: u32,
+    registered: bool,
+    public_key: &[u8; 32],
+) -> String {
+    let base = name
+        .filter(|name| !name.is_empty())
+        .or_else(|| purpose.map(|purpose| purpose.rsplit(':').next().unwrap_or(purpose)))
+        .unwrap_or("");
+    let clean = |text: &str, room: usize| -> String {
+        text.chars()
+            .map(|ch| if ch.is_ascii_graphic() { ch } else { '_' })
+            .take(room)
+            .collect()
+    };
+    let unregistered = !registered && purpose.is_some();
+    let suffix = if unregistered && index != 0 { format!("#{index}") } else { String::new() };
+    let prefix = if unregistered { "?" } else { "" };
+    let room = IDENTITY_LABEL_CHARS.saturating_sub(prefix.len() + suffix.len());
+    let body = clean(base, room);
+    if body.is_empty() {
+        let npub = encode_npub(public_key);
+        return format!("{prefix}{}", &npub[5..13]);
+    }
+    format!("{prefix}{body}{suffix}")
+}
+
+/// The card line naming an identity: its label, then its short npub.
 pub fn identity_card_line(label: &str, public_key: &[u8; 32]) -> String {
-    let label = label.strip_prefix("nostr:persona:").unwrap_or(label);
-    let mut line: String = label
-        .chars()
-        .map(|ch| if ch.is_ascii_graphic() { ch } else { '_' })
-        .take(IDENTITY_LABEL_CHARS)
-        .collect();
-    line.push(' ');
-    line.push_str(&client_fallback_label(public_key));
-    line
+    format!("{label} {}", short_npub(public_key))
 }
 
 /// Columns an approval card heading may take: the narrowest panel's header
 /// font. `SIGN AS ` plus a 12-character label and `?` fills it exactly.
 pub const HEADING_CHARS: usize = 21;
 
-/// The heading of an approval card that acts as `label`: a verb matching what
-/// the key will do, then the identity. Anything that is not encryption,
-/// decryption or pubkey disclosure keeps the historical `SIGN AS`. The label
-/// is cut by characters to whatever the verb leaves of [`HEADING_CHARS`].
-pub fn approval_heading(method: &str, label: &str) -> String {
-    let verb = match method {
-        "nip44_decrypt" | "nip04_decrypt" => "DECRYPT",
-        "nip44_encrypt" | "nip04_encrypt" => "ENCRYPT",
-        "get_public_key" => "SHARE KEY",
-        _ => "SIGN",
-    };
-    let room = HEADING_CHARS - verb.len() - 5;
+/// An approval card heading: `prefix`, a space, the label cut by characters to
+/// whatever the prefix leaves of [`HEADING_CHARS`], and `?`. The prefixes in
+/// use are `SIGN AS` (actions of the served identity), `ALLOW AS` (let this
+/// app act as an identity), `NPUB AS` (disclose one derived pubkey) and
+/// `LIST IDS FOR` (let this app read the identity list).
+pub fn card_heading(prefix: &str, label: &str) -> String {
+    let room = HEADING_CHARS.saturating_sub(prefix.len() + 2);
     let label: String = label.chars().take(room).collect();
-    format!("{verb} AS {label}?")
+    format!("{prefix} {label}?")
 }
 
 #[cfg(test)]
@@ -135,38 +165,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn approval_heading_names_the_action_and_fits_the_header() {
-        assert_eq!(approval_heading("sign_event", "Alice"), "SIGN AS Alice?");
-        assert_eq!(approval_heading("heartwood_derive", "Alice"), "SIGN AS Alice?");
-        assert_eq!(approval_heading("nip44_decrypt", "natural-p"), "DECRYPT AS natural-p?");
-        assert_eq!(approval_heading("nip04_decrypt", "x"), "DECRYPT AS x?");
-        assert_eq!(approval_heading("nip44_encrypt", "x"), "ENCRYPT AS x?");
-        assert_eq!(approval_heading("nip04_encrypt", "x"), "ENCRYPT AS x?");
-        assert_eq!(approval_heading("get_public_key", "natural-p"), "SHARE KEY AS natural?");
-        // The historical 12-character master label still fits SIGN exactly.
-        assert_eq!(approval_heading("sign_event", "abcdefghijklmnop"), "SIGN AS abcdefghijkl?");
-        for method in ["sign_event", "nip44_decrypt", "nip44_encrypt", "get_public_key"] {
-            let heading = approval_heading(method, "a-very-long-identity-label");
+    fn card_heading_fits_the_header_for_every_prefix() {
+        assert_eq!(card_heading("SIGN AS", "Alice"), "SIGN AS Alice?");
+        // The historical 12-character served label still fits SIGN AS exactly.
+        assert_eq!(card_heading("SIGN AS", "abcdefghijklmnop"), "SIGN AS abcdefghijkl?");
+        assert_eq!(card_heading("ALLOW AS", "natural-p"), "ALLOW AS natural-p?");
+        assert_eq!(card_heading("NPUB AS", "natural-p"), "NPUB AS natural-p?");
+        assert_eq!(card_heading("LIST IDS FOR", "Bark browser"), "LIST IDS FOR Bark br?");
+        for prefix in ["SIGN AS", "ALLOW AS", "NPUB AS", "LIST IDS FOR"] {
+            let heading = card_heading(prefix, "a-very-long-identity-label");
             assert!(heading.chars().count() <= HEADING_CHARS, "{heading}");
+            // Every identity label fits whole.
+            let label = "?abcdefgh";
+            assert!(card_heading(prefix, label).contains(label) || prefix == "LIST IDS FOR");
         }
         // Cut by characters, never mid-codepoint.
-        assert_eq!(approval_heading("sign_event", "ééééééééééééé"), "SIGN AS éééééééééééé?");
+        assert_eq!(card_heading("SIGN AS", "ééééééééééééé"), "SIGN AS éééééééééééé?");
     }
 
     #[test]
-    fn identity_card_line_is_bounded_ascii_with_short_npub() {
+    fn identity_labels_mark_unregistered_children_and_fall_back_to_the_npub() {
         let pubkey = [0x42u8; 32];
-        let short = client_fallback_label(&pubkey);
+        let npub = encode_npub(&pubkey);
+        assert_eq!(short_npub(&pubkey), format!("{}..", &npub[..13]));
+        assert_eq!(short_npub(&pubkey).len(), 15);
 
-        let line = identity_card_line("nostr:persona:natural-person", &pubkey);
-        assert_eq!(line, format!("natural-p {short}"));
+        // Registered persona: its name, else its purpose tail.
+        assert_eq!(identity_label(Some("Dad"), Some("nostr:persona:dad"), 0, true, &pubkey), "Dad");
+        assert_eq!(identity_label(None, Some("nostr:persona:natural-person"), 0, true, &pubkey), "natural-p");
+        // Served identity with no registry entry: its label.
+        assert_eq!(identity_label(Some("Heartwood"), None, 0, true, &pubkey), "Heartwood");
+        // Unregistered child: marked, index kept through truncation.
+        assert_eq!(identity_label(None, Some("nostr:persona:natural-person"), 0, false, &pubkey), "?natural-");
+        assert_eq!(identity_label(None, Some("nostr:persona:natural-person"), 3, false, &pubkey), "?natura#3");
+        assert_eq!(identity_label(None, Some("social"), 12, false, &pubkey), "?socia#12");
+        // Non-ASCII and spaces never reach the card.
+        assert_eq!(identity_label(Some("Dad's phone é"), None, 0, true, &pubkey), "Dad's_pho");
+        // Empty: eight npub data characters, still marked when unregistered.
+        assert_eq!(identity_label(Some(""), None, 0, true, &pubkey), &npub[5..13]);
+        assert_eq!(identity_label(None, Some(""), 0, false, &pubkey), format!("?{}", &npub[5..13]));
+        for label in [
+            identity_label(None, Some("nostr:persona:natural-person"), 4_000_000_000, false, &pubkey),
+            identity_label(Some("a-very-long-name"), None, 0, true, &pubkey),
+        ] {
+            assert!(label.chars().count() <= IDENTITY_LABEL_CHARS, "{label}");
+            assert!(label.is_ascii());
+        }
+
+        let line = identity_card_line("natural-p", &pubkey);
+        assert_eq!(line, format!("natural-p {}", short_npub(&pubkey)));
         assert!(line.len() <= 25);
-        assert!(line.is_ascii());
-
-        // Spaces and non-ASCII never reach the card.
-        let line = identity_card_line("Dad's phone é", &pubkey);
-        assert_eq!(line, format!("Dad's_pho {short}"));
-        assert_eq!(identity_card_line("", &pubkey), format!(" {short}"));
     }
 
     #[test]

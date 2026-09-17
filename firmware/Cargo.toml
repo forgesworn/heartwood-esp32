@@ -7,7 +7,9 @@ license = "MIT"
 
 [features]
 # Default build targets the Heltec V4 (native USB-Serial-JTAG on GPIO19/20).
-default = ["heltec-v4"]
+# The release log ceiling is repeated here (heltec-v4 carries it too) so an ad
+# hoc build of the default board keeps it even if the board feature changes.
+default = ["heltec-v4", "log/release_max_level_off"]
 # Heltec WiFi LoRa 32 V4 -- USB-C wired to ESP32-S3 native USB pins.
 heltec-v4 = ["dep:qrcodegen-no-heap", "log/release_max_level_off"]
 # Heltec WiFi LoRa 32 V3 -- USB-C wired through a CP2102 bridge to UART0

@@ -4333,7 +4333,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
                 ),
             ),
             Draw::Extension(master_label, method, preview) => (
-                crate::oled::master_sign_heading(master_label),
+                crate::oled::master_sign_heading(method, master_label),
                 format!("{method} / {preview}"),
             ),
             Draw::Titled(header, title) => ((*header).to_string(), title.clone()),

@@ -110,9 +110,48 @@ pub fn identity_card_line(label: &str, public_key: &[u8; 32]) -> String {
     line
 }
 
+/// Columns an approval card heading may take: the narrowest panel's header
+/// font. `SIGN AS ` plus a 12-character label and `?` fills it exactly.
+pub const HEADING_CHARS: usize = 21;
+
+/// The heading of an approval card that acts as `label`: a verb matching what
+/// the key will do, then the identity. Anything that is not encryption,
+/// decryption or pubkey disclosure keeps the historical `SIGN AS`. The label
+/// is cut by characters to whatever the verb leaves of [`HEADING_CHARS`].
+pub fn approval_heading(method: &str, label: &str) -> String {
+    let verb = match method {
+        "nip44_decrypt" | "nip04_decrypt" => "DECRYPT",
+        "nip44_encrypt" | "nip04_encrypt" => "ENCRYPT",
+        "get_public_key" => "SHARE KEY",
+        _ => "SIGN",
+    };
+    let room = HEADING_CHARS - verb.len() - 5;
+    let label: String = label.chars().take(room).collect();
+    format!("{verb} AS {label}?")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_heading_names_the_action_and_fits_the_header() {
+        assert_eq!(approval_heading("sign_event", "Alice"), "SIGN AS Alice?");
+        assert_eq!(approval_heading("heartwood_derive", "Alice"), "SIGN AS Alice?");
+        assert_eq!(approval_heading("nip44_decrypt", "natural-p"), "DECRYPT AS natural-p?");
+        assert_eq!(approval_heading("nip04_decrypt", "x"), "DECRYPT AS x?");
+        assert_eq!(approval_heading("nip44_encrypt", "x"), "ENCRYPT AS x?");
+        assert_eq!(approval_heading("nip04_encrypt", "x"), "ENCRYPT AS x?");
+        assert_eq!(approval_heading("get_public_key", "natural-p"), "SHARE KEY AS natural?");
+        // The historical 12-character master label still fits SIGN exactly.
+        assert_eq!(approval_heading("sign_event", "abcdefghijklmnop"), "SIGN AS abcdefghijkl?");
+        for method in ["sign_event", "nip44_decrypt", "nip44_encrypt", "get_public_key"] {
+            let heading = approval_heading(method, "a-very-long-identity-label");
+            assert!(heading.chars().count() <= HEADING_CHARS, "{heading}");
+        }
+        // Cut by characters, never mid-codepoint.
+        assert_eq!(approval_heading("sign_event", "ééééééééééééé"), "SIGN AS éééééééééééé?");
+    }
 
     #[test]
     fn identity_card_line_is_bounded_ascii_with_short_npub() {

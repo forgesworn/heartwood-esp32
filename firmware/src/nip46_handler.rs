@@ -928,17 +928,23 @@ fn dispatch_inner(
             None
         };
         let preview = match note_card {
-            // The preview names the identity; the heading stays the served
-            // label every extension card uses.
             _ if identity_card => identity_line.clone().unwrap_or_default(),
             Some((_, title)) => title,
             None => extension_approval_preview(&requester_label, &request.params),
+        };
+        // An identity card's heading names the identity the key belongs to
+        // (its label, or the short npub when it has none), never the served
+        // master: "DECRYPT AS <persona>?" must not read "SIGN AS <master>?".
+        let card_label = match (identity_card, preview.split_once(' ')) {
+            (true, Some(("", npub))) => npub,
+            (true, Some((label, _))) => label,
+            _ => master_label,
         };
         match approval {
             ApprovalDecision::Deferred => {
                 *deferred = Some(Box::new(DeferredAsk {
                     card: AskCard::Extension {
-                        master_label: master_label.to_string(),
+                        master_label: card_label.to_string(),
                         method: request.method.clone(),
                         preview,
                     },
@@ -959,7 +965,7 @@ fn dispatch_inner(
                     |d, remaining| {
                         crate::oled::show_master_sign_request(
                             d,
-                            master_label,
+                            card_label,
                             &request.method,
                             None,
                             &preview,

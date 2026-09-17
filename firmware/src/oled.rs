@@ -1184,8 +1184,8 @@ fn ellipsize_chars(value: &str, max_chars: usize) -> String {
 
 /// The header `show_master_sign_request` draws, framed as the question it is.
 /// Shared so the relay's card log reports the panel's wording, not the label.
-pub(crate) fn master_sign_heading(master_label: &str) -> String {
-    format!("SIGN AS {}?", truncate_str(master_label, 12))
+pub(crate) fn master_sign_heading(method: &str, label: &str) -> String {
+    heartwood_common::encoding::approval_heading(method, label)
 }
 
 /// Display a signing request with requester, kind, content preview, and countdown.
@@ -1493,7 +1493,7 @@ pub fn show_master_sign_request(
 
     // Header: SIGN AS {label}? — frame it as the question it is, like the
     // per-app screen, so it doesn't read as a bare label.
-    let heading = master_sign_heading(master_label);
+    let heading = master_sign_heading(method, master_label);
     Text::new(&heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))

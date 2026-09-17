@@ -1762,8 +1762,10 @@ slot JSON's `ids` field (up to 16).
 3. **Relay addressing is scoped too.** Address a request by `#p` to a persona's
    own pubkey from the master-paired app: same card, same one-time approval.
 4. **Crypto and contextual pubkey.** `nip44_decrypt` with a context for an
-   unapproved persona raises `SIGN AS <master>? / nip44_decrypt / <label> npub1..`;
-   `get_public_key` with no context stays silent, with a context it prompts.
+   unapproved persona raises `DECRYPT AS <label>? / nip44_decrypt / <label> npub1..`
+   (the heading never names the master for another identity); encrypt reads
+   `ENCRYPT AS`, and `get_public_key` with a context `SHARE KEY AS`. Without a
+   context `get_public_key` stays silent.
 5. **heartwood_switch.** Switch to an unapproved persona (one hold), then sign:
    a second, one-time hold naming the persona.
 6. **Strict slots.** On a D2 persona-addressed pairing, requests as the bound

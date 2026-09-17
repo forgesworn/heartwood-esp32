@@ -914,13 +914,28 @@ fn dispatch_inner(
     // for the button. Keep this single gate before dispatch so a new extension
     // cannot accidentally mutate state merely by omitting approval code from
     // its individual match arm. Strict v2 denials returned above never prompt.
-    let own_card = !spend_granted && remote_extension_requires_approval(has_client, &method, tier);
+    // A switch's press is the gate's SWITCH TO card, never a second one.
+    let own_card = !spend_granted
+        && !matches!(gate_card, Some(CardKind::SwitchTo { .. }))
+        && remote_extension_requires_approval(has_client, &method, tier);
 
     // The gate's own card, before the method's flow: ALLOW AS <identity>?
     // (this app may act as the identity for every method; recorded unless the
     // list is full), NPUB AS <identity>? (one derived pubkey, recorded nowhere)
     // or LIST IDS FOR <app>? (adds the method to a legacy slot).
     if let Some(kind) = gate_card.filter(|_| !allow_sign) {
+        // The identity a SWITCH TO card names and approves: the switch target,
+        // resolved exactly as the switch arm resolves it.
+        let (identity, identity_label) = match kind {
+            CardKind::SwitchTo { .. } => {
+                let target = switch_target(&request.params, identity_caches, master_slot, master_secret, master_mode, secp);
+                let label = target.as_ref().map(|(pubkey, context)| {
+                    identity_label_for(personas, master_label, pubkey, context.as_ref())
+                });
+                (target.map(|(pubkey, _)| pubkey), label)
+            }
+            _ => (identity, identity_label.clone()),
+        };
         let (heading, preview) = match kind {
             CardKind::ListIds => (
                 heartwood_common::encoding::card_heading("LIST IDS FOR", &requester_label),
@@ -928,8 +943,12 @@ fn dispatch_inner(
             ),
             _ => (
                 heartwood_common::encoding::card_heading(
-                    if kind == CardKind::NpubAs { "NPUB AS" } else { "ALLOW AS" },
-                    identity_label.as_deref().unwrap_or_default(),
+                    match kind {
+                        CardKind::NpubAs => "NPUB AS",
+                        CardKind::SwitchTo { .. } => "SWITCH TO",
+                        _ => "ALLOW AS",
+                    },
+                    identity_label.as_deref().unwrap_or("?"),
                 ),
                 identity.as_ref().map(heartwood_common::encoding::short_npub).unwrap_or_default(),
             ),
@@ -950,7 +969,7 @@ fn dispatch_inner(
         }
         let snapshot = policy_engine.snapshot_slot_state(master_slot);
         let changed = match (kind, identity.as_ref()) {
-            (CardKind::AllowAs { .. }, Some(pubkey)) => {
+            (CardKind::AllowAs { .. } | CardKind::SwitchTo { .. }, Some(pubkey)) => {
                 policy_engine.record_identity(master_slot, Ok(&client_hex), pubkey)
             }
             (CardKind::ListIds, _) => policy_engine.grant_list_identities(master_slot, &client_hex),
@@ -2028,6 +2047,33 @@ pub(crate) fn identity_label_for(
         (None, Some(ctx)) => identity_label(None, Some(&ctx.purpose), ctx.index, false, pubkey),
         (None, None) => identity_label(Some(served_label), None, 0, true, pubkey),
     }
+}
+
+/// Resolve a `heartwood_switch` target to its pubkey (and, for a cached child,
+/// the context naming it) the way the switch arm does: `master` is the served
+/// identity, else the cache by npub, persona name, then purpose and index.
+fn switch_target(
+    params: &[Value],
+    identity_caches: &[crate::identity_cache::IdentityCache],
+    master_slot: u8,
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    secp: &Arc<Secp256k1<SignOnly>>,
+) -> Option<([u8; 32], Option<HeartwoodContext>)> {
+    let nip46::SwitchParams { target, index_hint } = nip46::SwitchParams::from_params(params).ok()?;
+    if target == "master" {
+        return effective_identity(master_secret, master_mode, secp, None).map(|pubkey| (pubkey, None));
+    }
+    let cache = identity_caches.iter().find(|c| c.master_slot == master_slot)?;
+    let idx = cache
+        .find_by_npub(target)
+        .or_else(|| cache.find_by_persona(target))
+        .or_else(|| cache.find(target, index_hint))?;
+    let id = &cache.identities[idx];
+    Some((
+        id.public_key,
+        Some(HeartwoodContext { purpose: id.purpose.clone(), index: id.index }),
+    ))
 }
 
 /// Make a slot grant from a physically approved card durable before the

@@ -448,6 +448,12 @@ pub enum CardKind {
     /// `LIST IDS FOR <app>?`: approval adds `heartwood_list_identities` to a
     /// legacy slot's allowed methods.
     ListIds,
+    /// `SWITCH TO <identity>?`: the physical hold `heartwood_switch` always
+    /// needed, which now also approves the target identity like `ALLOW AS`
+    /// (recorded unless the list is full, `record`). A switch policy lets
+    /// through silently, or a guardian verdict, is not a card and records
+    /// nothing.
+    SwitchTo { record: bool },
 }
 
 /// The gate's decision for one request.
@@ -498,7 +504,8 @@ fn is_crypto_method(method: &str) -> bool {
 /// identity-scoped method or identity listing; a crypto method policy would
 /// only prompt for is refused (a remote crypto oracle is never offered on a
 /// card); `heartwood_list_identities` needs a card unless the slot lists it;
-/// an identity-scoped method acting as an unapproved identity needs a card.
+/// `heartwood_switch` policy would prompt for is the `SWITCH TO` card; an
+/// identity-scoped method acting as an unapproved identity needs a card.
 pub fn gate_request(request: &GateRequest<'_>) -> Gate {
     if !request.has_client {
         return Gate::Allow;
@@ -508,9 +515,10 @@ pub fn gate_request(request: &GateRequest<'_>) -> Gate {
     }
     let method = request.method;
     let lists = method == "heartwood_list_identities";
+    let switch = method == "heartwood_switch";
     let scoped = method_uses_identity_key(method, request.has_context) || method_uses_served_key(method);
     let Some(slot) = request.slot else {
-        return if scoped || lists { Gate::Deny } else { Gate::Allow };
+        return if scoped || lists || switch { Gate::Deny } else { Gate::Allow };
     };
     if slot.strict_permissions && request.explicit_context {
         return Gate::Deny;
@@ -525,6 +533,14 @@ pub fn gate_request(request: &GateRequest<'_>) -> Gate {
             Gate::Card(CardKind::ListIds)
         };
     }
+    let record = slot.approved_identities.len() < MAX_APPROVED_IDENTITIES * IDENTITY_TAG_BYTES * 2;
+    if switch {
+        return if !request.verdict && request.tier == ApprovalTier::ButtonRequired {
+            Gate::Card(CardKind::SwitchTo { record })
+        } else {
+            Gate::Allow
+        };
+    }
     if !scoped {
         return Gate::Allow;
     }
@@ -536,9 +552,7 @@ pub fn gate_request(request: &GateRequest<'_>) -> Gate {
     } else if method == "get_public_key" {
         Gate::Card(CardKind::NpubAs)
     } else {
-        Gate::Card(CardKind::AllowAs {
-            record: slot.approved_identities.len() < MAX_APPROVED_IDENTITIES * IDENTITY_TAG_BYTES * 2,
-        })
+        Gate::Card(CardKind::AllowAs { record })
     }
 }
 
@@ -1263,7 +1277,7 @@ mod tests {
     #[test]
     fn gate_matrix_matches_the_specification() {
         #[derive(Clone, Copy, PartialEq)]
-        enum Family { Sign, Crypto, Pubkey, Note, List, Other }
+        enum Family { Sign, Crypto, Pubkey, Note, List, Switch, Other }
         #[derive(Clone, Copy, PartialEq)]
         enum Context { None, Active, Explicit }
         #[derive(Clone, Copy, PartialEq)]
@@ -1280,7 +1294,8 @@ mod tests {
             (Family::Note, "heartwood_note_send"),
             (Family::Note, "heartwood_note_claim"),
             (Family::List, "heartwood_list_identities"),
-            (Family::Other, "heartwood_switch"),
+            (Family::Switch, "heartwood_switch"),
+            (Family::Other, "heartwood_derive"),
             (Family::Other, "ping"),
         ] {
         for tier in [
@@ -1340,13 +1355,19 @@ mod tests {
             } else if tier == ApprovalTier::Denied {
                 Gate::Deny
             } else if unbound {
-                if scoped || family == Family::List { Gate::Deny } else { Gate::Allow }
+                if scoped || matches!(family, Family::List | Family::Switch) { Gate::Deny } else { Gate::Allow }
             } else if strict && context == Context::Explicit {
                 Gate::Deny
             } else if family == Family::Crypto && tier == ApprovalTier::ButtonRequired {
                 Gate::Deny
             } else if family == Family::List {
                 if verdict || lists_allowed { Gate::Allow } else { Gate::Card(CardKind::ListIds) }
+            } else if family == Family::Switch {
+                if !verdict && tier == ApprovalTier::ButtonRequired {
+                    Gate::Card(CardKind::SwitchTo { record: !full })
+                } else {
+                    Gate::Allow
+                }
             } else if !scoped {
                 Gate::Allow
             } else if approved || bound == Bound::Same || verdict {
@@ -1378,8 +1399,13 @@ mod tests {
                 gate_tier(gate, tier) == ApprovalTier::Denied,
                 gate == Gate::Deny || (gate == Gate::Allow && tier == ApprovalTier::Denied),
             );
+            // A switch is a card only where it always needed a press: a
+            // verdict or a silent policy never records its target.
+            if family == Family::Switch && (verdict || tier != ApprovalTier::ButtonRequired) {
+                assert!(!matches!(gate, Gate::Card(_)), "switch carded without a press");
+            }
         }}}}}}}}}}}
-        assert_eq!(cases, 10 * 4 * 2 * 2 * 3 * 3 * 2 * 2 * 2 * 2 * 2);
+        assert_eq!(cases, 11 * 4 * 2 * 2 * 3 * 3 * 2 * 2 * 2 * 2 * 2);
     }
 
     #[test]
@@ -1457,6 +1483,61 @@ mod tests {
         assert!(approved_identity_tags(&slot).is_empty());
         assert!(record_approved_identity(&mut slot, &IDENTITY_C));
         assert_eq!(approved_identity_tags(&slot), vec!["cccccccccccccccc"]);
+    }
+
+    #[test]
+    fn switch_card_only_where_a_press_was_already_needed() {
+        let slot = trusted_legacy_slot();
+        let request = GateRequest {
+            has_client: true,
+            slot: Some(&slot),
+            method: "heartwood_switch",
+            tier: ApprovalTier::ButtonRequired,
+            explicit_context: false,
+            has_context: false,
+            identity: None,
+            verdict: false,
+        };
+        assert_eq!(gate_request(&request), Gate::Card(CardKind::SwitchTo { record: true }));
+        // A guardian verdict: no card, nothing recorded.
+        assert_eq!(gate_request(&GateRequest { verdict: true, ..request }), Gate::Allow);
+        // A slot that lists the method with auto-approve: no card either.
+        assert_eq!(gate_request(&GateRequest { tier: ApprovalTier::AutoApprove, ..request }), Gate::Allow);
+        // Unbound or strict-unlisted: refused, as the method ceiling already was.
+        assert_eq!(gate_request(&GateRequest { slot: None, ..request }), Gate::Deny);
+        assert_eq!(gate_request(&GateRequest { tier: ApprovalTier::Denied, ..request }), Gate::Deny);
+        // A full list still shows the card and records nothing.
+        let mut full_slot = slot.clone();
+        for i in 0..MAX_APPROVED_IDENTITIES {
+            assert!(record_approved_identity(&mut full_slot, &[0x50 + i as u8; 32]));
+        }
+        let full = GateRequest { slot: Some(&full_slot), ..request };
+        assert_eq!(gate_request(&full), Gate::Card(CardKind::SwitchTo { record: false }));
+    }
+
+    #[test]
+    fn an_approved_switch_leaves_its_target_silent_for_pubkey_and_sign() {
+        // Bark: switch (one press, which records the target), then
+        // get_public_key and the first sign with the active identity.
+        let mut slot = trusted_legacy_slot();
+        let target = IDENTITY_B;
+        assert!(record_approved_identity(&mut slot, &target));
+        for (method, tier) in [
+            ("get_public_key", ApprovalTier::AutoApprove),
+            ("sign_event", ApprovalTier::AutoApprove),
+        ] {
+            let request = GateRequest {
+                has_client: true,
+                slot: Some(&slot),
+                method,
+                tier,
+                explicit_context: false,
+                has_context: true,
+                identity: Some(&target),
+                verdict: false,
+            };
+            assert_eq!(gate_request(&request), Gate::Allow, "{method}");
+        }
     }
 
     #[test]

@@ -1786,8 +1786,11 @@ master on a legacy slot that already signs silently.
    `LIST IDS FOR <app>?`. After the hold the method is in the slot's
    `allowed_methods` and answers silently. On a strict slot it stays
    `unauthorised` unless listed. Bark: see the note on its 5 s connect probe.
-10. **heartwood_switch.** Switch to an unapproved persona (the switch hold), then
-    sign: `ALLOW AS <persona>?`, once.
+10. **heartwood_switch.** Switching reads `SWITCH TO <label>?` with the short
+    npub below. The hold switches and approves the target, so the app's
+    following `get_public_key` and first sign as it raise no card (Bark: one
+    press per switch, as before). A switch a slot policy lets through silently,
+    or a guardian verdict, records nothing.
 11. **Pairing approvals seed.** `heartwood_pair_wallet`: after its hold, the new
     slot lists the served identity's tag in `approved_identities`, and the new
     wallet's first sign as it is not asked again. A signing slot's rebind hold

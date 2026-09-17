@@ -1873,9 +1873,18 @@ channel driver used there), and a note client (notecase, or
 1. **A parked note send completes with no press.** From the escalate slot, send
    `heartwood_note_send`. The board shows no card; the guardian receives the
    approval-needed notice naming the client, `heartwood_note_send` and the
-   identity. Answer `approve-once`. The note is wrapped and sent, the client
-   gets its reply, and **no card ever appears on the OLED**. The verdict
-   answers `applied: "completed"`, `park: "live"`.
+   identity, **and carrying the card the device would have shown**: a `card`
+   tag reading `SEND NOTE` and a `detail` tag with the amount, the mint and
+   `to <recipient>`, the same text as the OLED card in section 13. Check the
+   amount and recipient match the request before answering. Answer
+   `approve-once`. The note is wrapped and sent, the client gets its reply,
+   and **no card ever appears on the OLED**. The verdict answers
+   `applied: "completed"`, `park: "live"`.
+1b. **No preview, no verdict.** A pinned note request the device cannot build a
+   preview for (for example `heartwood_note_send` naming a note id the locker
+   does not hold) must NOT park: it raises the card on the board as it always
+   did, and the guardian is not asked to approve a method name. The log line
+   reads `no card preview to show the guardian`.
 2. **The loop stayed live throughout.** While the park waits, and again while
    the verdict is being applied, a second app on another slot signs a kind 1
    and is answered normally. Before this fix the second app timed out for the
@@ -1910,6 +1919,23 @@ channel driver used there), and a note client (notecase, or
 9. **USB unchanged.** `node scripts/note-cmd.mjs --port ...
    '{"cmd":"send", ...}'` still shows its card and waits for the hold. The
    cable has no guardian and is not escalated.
+10. **A verdict cannot answer for the device.** On the same escalate slot,
+   send `heartwood_provision_rendezvous` and then `heartwood_pair_wallet`.
+   Each must be refused IMMEDIATELY, with `this request must be approved at
+   the device; a guardian verdict cannot answer it`, no card on the OLED, no
+   notice to the guardian, and no park (`get_status` shows none pending).
+   Time the reply: it comes back in the usual second or two, not after 30 s,
+   and another app signing on a second slot is answered throughout.
+11. **The same two still work at the device.** Clear the slot's `escalate`
+   flag and repeat item 10: `PROVISION RENDEZVOUS` and `PAIR NEW WALLET`
+   raise their cards on the board and one hold completes each, exactly as
+   section 11b and the note-locker sections record them. Nothing about the
+   cabled or non-escalated path changed.
+12. **A sign still needs its own approval.** On the escalate slot, park a
+   `sign_event` of a kind the slot does not auto-approve and answer
+   `approve-once`: it completes as it did before this change (the approve-once
+   window is what lifts it, no card is owed). Revoke the identity inside the
+   window first and the retry parks again, as section 23 item 17 records.
 
 ## Notes
 

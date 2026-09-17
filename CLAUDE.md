@@ -114,9 +114,21 @@ changed identity or needs a different card. It widens nothing else: the
 transient allow on its own still cannot silence a pinned method, so a second
 note ask inside the verdict's window parks again rather than riding it, and a
 pinned method on an escalate slot now parks even where the slot policy lifted
-its tier instead of falling through to a card no one will press. Pure halves
-are `common::escalate::{route_request, park_completion}` and
-`nip46::Nip46Method::pinned_physical`, host-tested. Nothing bench-run.
+its tier instead of falling through to a card no one will press.
+
+Two limits keep that narrow. A verdict answers the own card of the
+bearer-note set only (`ApprovalDecision::VerdictApproved` refuses any other
+card instead of pressing it by proxy), and the methods whose card only a press
+can answer (`Nip46Method::device_press_only`: `heartwood_provision_rendezvous`,
+which hands over a derived scalar, and `heartwood_pair_wallet`, which mints a
+slot secret) are refused outright on an escalate slot rather than parked, so
+the loop is never held for them either. And the approver has to see what they
+release: the notice carries the device card itself (`card` and `detail` tags,
+`nip59::ApprovalCard`, the same text `notes::relay_card` draws), and a request
+whose preview cannot be built is not parked at all, it keeps its card. Pure
+halves are `common::escalate::{route_request, park_completion,
+park_verdict_matches}` and `nip46::Nip46Method::{pinned_physical,
+device_press_only, verdict_may_answer_card}`, host-tested. Nothing bench-run.
 
 A second configured relay (#92, 2026-09-11, checklist section 16): besides
 the primary, the relay loop keeps one more configured relay live when the

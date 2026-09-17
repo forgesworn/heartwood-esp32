@@ -126,11 +126,19 @@ pub enum Route {
     Card,
     /// Park it and notify the guardian: nobody is expected to be at the board.
     Park,
+    /// Refuse now, with no card and no park: the method's card is one only a
+    /// press at the device answers ([`crate::nip46::Nip46Method::device_press_only`]),
+    /// and this slot escalates because nobody is there to give it. Parking it
+    /// could only end in a 30 s card nobody presses, holding the relay loop
+    /// for the whole window before refusing anyway (#160).
+    Refuse,
 }
 
 /// Route one request. `tier` is the planned gate tier; `pinned` marks a method
 /// whose own card no slot policy may silence
-/// ([`crate::nip46::Nip46Method::pinned_physical`]); `escalate` is the slot
+/// ([`crate::nip46::Nip46Method::pinned_physical`]); `device_only` marks one
+/// whose card only a press answers
+/// ([`crate::nip46::Nip46Method::device_press_only`]); `escalate` is the slot
 /// flag.
 ///
 /// The pin is read here and not only inside the handler because the two must
@@ -138,40 +146,73 @@ pub enum Route {
 /// tier still owes a card, so on an `escalate` slot it belongs with the
 /// guardian like any other physical ask: otherwise it would fall through to a
 /// card on a board nobody is standing at (#160).
-pub fn route_request(tier: ApprovalTier, pinned: bool, escalate: bool) -> Route {
+///
+/// Escalation never widens what a verdict can do. A device-only method on an
+/// escalate slot is refused where it would otherwise have parked, because no
+/// verdict may complete it and the park could only end in a dead card.
+pub fn route_request(
+    tier: ApprovalTier,
+    pinned: bool,
+    device_only: bool,
+    escalate: bool,
+) -> Route {
     if tier == ApprovalTier::Denied {
         return Route::Dispatch;
     }
     if tier != ApprovalTier::ButtonRequired && !pinned {
         return Route::Dispatch;
     }
-    if escalate {
-        Route::Park
-    } else {
-        Route::Card
+    if !escalate {
+        return Route::Card;
     }
+    if device_only {
+        return Route::Refuse;
+    }
+    Route::Park
 }
 
-/// What the guardian approved, against what the parked request still is.
+/// The refusal a [`Route::Refuse`] answers with: an honest instruction, not a
+/// policy error. The request is well formed and the pairing is allowed it; it
+/// simply cannot be approved from a phone.
+pub const DEVICE_APPROVAL_REQUIRED: &str =
+    "this request must be approved at the device; a guardian verdict cannot answer it";
+
+/// Whether a verdict resolves this park: the id it names, on the master whose
+/// guardian sent it. A verdict never reaches another master's park, and never
+/// one it does not name. This is the cross-check that makes an approve-once an
+/// approval of ONE request; `park_completion` decides what may then be done
+/// with it.
+pub fn park_verdict_matches(
+    park_id: &str,
+    park_master_slot: u8,
+    verdict_park_id: &str,
+    verdict_master_slot: u8,
+) -> bool {
+    park_id == verdict_park_id && park_master_slot == verdict_master_slot
+}
+
+/// What an approve verdict is allowed to do with the park it names.
 ///
-/// The verdict names a park id, and the park id is the request event's own id,
-/// so an approve-once is an approval of ONE request: this client, this
-/// method-or-kind, this identity. The tuple is carried here rather than
-/// assumed so the rule is testable, and so a guardian app that one day names a
-/// method or an identity in the verdict itself meets the same check.
+/// The park id a verdict carries is the request event's own id
+/// ([`park_verdict_matches`] is what pairs them), so an approve-once is an
+/// approval of ONE request. This decides whether that approval may also stand
+/// in for the card the request owes at the device.
 #[derive(Debug, Clone, Copy)]
-pub struct ParkVerdict<'a> {
-    /// The client the notice named, and the client the park is from.
-    pub approved_client_hex: &'a str,
-    pub park_client_hex: &'a str,
-    /// [`crate::nip59::method_or_kind_key`] of each.
-    pub approved_key: &'a str,
-    pub park_key: &'a str,
-    /// The identity each names; `None` when the request uses no identity key.
-    pub approved_identity: Option<&'a [u8; 32]>,
-    pub park_identity: Option<&'a [u8; 32]>,
+pub struct ParkVerdict {
     /// How long the park has been held, against [`PARK_TTL_SECS`].
     pub held_secs: u64,
+    /// The method's card is one only a device press answers
+    /// ([`crate::nip46::Nip46Method::device_press_only`]). Such a request is
+    /// refused before it ever parks; this is the second lock on the door.
+    pub device_press_only: bool,
+    /// The park owes the guardian a preview of what completing it releases:
+    /// the amount, mint and recipient a bearer-note card shows. True for
+    /// exactly the methods whose card the verdict is about to answer.
+    pub needs_preview: bool,
+    /// The notice carried that preview. Without it the guardian approved a
+    /// method name, not a note movement, so the verdict does not answer the
+    /// card and the request falls back to the device.
+    pub notice_showed_preview: bool,
 }
 
 /// How a guardian verdict may be applied to the request it answers.
@@ -189,24 +230,21 @@ pub enum ParkCompletion {
 
 /// Decide what an approve verdict does to its park.
 ///
-/// `Approved` is deliberately the narrow case: it releases exactly the request
-/// the guardian was shown and nothing else. Anything that does not match (a
-/// different client, a different method or kind, a different identity, or a
-/// park that outlived its TTL before the verdict arrived) falls back to the
+/// `Approved` is deliberately the narrow case. Anything else falls back to the
 /// window, which grants no card of its own: the client asks again and meets
-/// the gate afresh (and a pinned method meets its card, or parks again).
-pub fn park_completion(verdict: &ParkVerdict<'_>) -> ParkCompletion {
+/// the gate afresh at the device, where the card it owes goes up in front of
+/// whoever is standing there.
+pub fn park_completion(verdict: &ParkVerdict) -> ParkCompletion {
     if verdict.held_secs >= PARK_TTL_SECS {
         return ParkCompletion::Window { reason: "park expired before the verdict arrived" };
     }
-    if verdict.approved_client_hex != verdict.park_client_hex {
-        return ParkCompletion::Window { reason: "verdict names another client" };
+    if verdict.device_press_only {
+        return ParkCompletion::Window { reason: DEVICE_APPROVAL_REQUIRED };
     }
-    if verdict.approved_key != verdict.park_key {
-        return ParkCompletion::Window { reason: "verdict names another method or kind" };
-    }
-    if verdict.approved_identity != verdict.park_identity {
-        return ParkCompletion::Window { reason: "verdict names another identity" };
+    if verdict.needs_preview && !verdict.notice_showed_preview {
+        return ParkCompletion::Window {
+            reason: "the notice showed no preview of what completing it would release",
+        };
     }
     ParkCompletion::Approved
 }
@@ -282,20 +320,12 @@ mod tests {
 
     // ---- #160: a note method on an escalate slot ----------------------
 
-    const CLIENT: &str = "aa";
-    const OTHER_CLIENT: &str = "bb";
-    const IDENTITY: [u8; 32] = [0x11; 32];
-    const OTHER_IDENTITY: [u8; 32] = [0x22; 32];
-
-    fn note_send_park() -> ParkVerdict<'static> {
+    fn note_send_park() -> ParkVerdict {
         ParkVerdict {
-            approved_client_hex: CLIENT,
-            park_client_hex: CLIENT,
-            approved_key: "heartwood_note_send",
-            park_key: "heartwood_note_send",
-            approved_identity: Some(&IDENTITY),
-            park_identity: Some(&IDENTITY),
             held_secs: 4,
+            device_press_only: false,
+            needs_preview: true,
+            notice_showed_preview: true,
         }
     }
 
@@ -305,23 +335,68 @@ mod tests {
         // The pin makes it physical whatever the slot policy says, so an
         // escalate slot sends it to the guardian rather than to a board
         // nobody is standing at.
-        assert_eq!(route_request(ButtonRequired, true, true), Route::Park);
-        assert_eq!(route_request(AutoApprove, true, true), Route::Park);
+        assert_eq!(route_request(ButtonRequired, true, false, true), Route::Park);
+        assert_eq!(route_request(AutoApprove, true, false, true), Route::Park);
         // A denial is still answered by the handler, never escalated.
-        assert_eq!(route_request(Denied, true, true), Route::Dispatch);
+        assert_eq!(route_request(Denied, true, false, true), Route::Dispatch);
+    }
+
+    #[test]
+    fn a_device_only_method_is_refused_fast_and_never_parked() {
+        use ApprovalTier::*;
+        // heartwood_provision_rendezvous and heartwood_pair_wallet: no
+        // verdict can complete them, so an escalate slot must not park them
+        // and then hold the loop on a card nobody will press.
+        assert_eq!(route_request(ButtonRequired, false, true, true), Route::Refuse);
+        assert_eq!(route_request(ButtonRequired, true, true, true), Route::Refuse);
+        // Off the escalate path they are exactly as they were: a card.
+        assert_eq!(route_request(ButtonRequired, false, true, false), Route::Card);
+        // And where no card is owed at all, nothing changes.
+        assert_eq!(route_request(AutoApprove, false, true, true), Route::Dispatch);
+        assert_eq!(route_request(Denied, false, true, true), Route::Dispatch);
+    }
+
+    #[test]
+    fn the_device_only_set_is_the_scalar_and_secret_minting_pair() {
+        use crate::nip46::Nip46Method as M;
+        assert!(M::HeartwoodProvisionRendezvous.device_press_only());
+        assert!(M::HeartwoodPairWallet.device_press_only());
+        assert!(!M::HeartwoodNoteSend.device_press_only());
+        assert!(!M::HeartwoodDerive.device_press_only());
+        // And neither may ever have its card answered by a verdict.
+        assert!(!M::HeartwoodProvisionRendezvous.verdict_may_answer_card());
+        assert!(!M::HeartwoodPairWallet.verdict_may_answer_card());
+        assert!(!M::HeartwoodDerive.verdict_may_answer_card());
+        assert!(!M::SignEvent.verdict_may_answer_card());
+        // A note method that owes no card of its own has nothing for a
+        // verdict to answer, and must not be made to carry a preview: it
+        // completes on the approve-once window exactly as it always did.
+        assert!(!M::HeartwoodNoteList.verdict_may_answer_card());
+        assert!(!M::HeartwoodNoteAddress.verdict_may_answer_card());
+        assert!(!M::HeartwoodNoteConfirm.verdict_may_answer_card());
+        for method in [
+            M::HeartwoodNoteSend,
+            M::HeartwoodNoteExport,
+            M::HeartwoodNoteDiscard,
+            M::HeartwoodNoteSpent,
+            M::HeartwoodNoteRename,
+            M::HeartwoodNoteTrust,
+        ] {
+            assert!(method.verdict_may_answer_card(), "{}", method.as_str());
+        }
     }
 
     #[test]
     fn the_non_escalate_path_still_raises_the_card() {
         use ApprovalTier::*;
         // No regression: a note send on a normal legacy slot raises SEND NOTE.
-        assert_eq!(route_request(ButtonRequired, true, false), Route::Card);
-        assert_eq!(route_request(AutoApprove, true, false), Route::Card);
+        assert_eq!(route_request(ButtonRequired, true, false, false), Route::Card);
+        assert_eq!(route_request(AutoApprove, true, false, false), Route::Card);
         // And an unpinned method a policy auto-approves is dispatched as ever.
-        assert_eq!(route_request(AutoApprove, false, false), Route::Dispatch);
-        assert_eq!(route_request(AutoApprove, false, true), Route::Dispatch);
-        assert_eq!(route_request(ButtonRequired, false, false), Route::Card);
-        assert_eq!(route_request(ButtonRequired, false, true), Route::Park);
+        assert_eq!(route_request(AutoApprove, false, false, false), Route::Dispatch);
+        assert_eq!(route_request(AutoApprove, false, false, true), Route::Dispatch);
+        assert_eq!(route_request(ButtonRequired, false, false, false), Route::Card);
+        assert_eq!(route_request(ButtonRequired, false, false, true), Route::Park);
     }
 
     #[test]
@@ -330,37 +405,51 @@ mod tests {
     }
 
     #[test]
-    fn a_verdict_completes_nothing_it_did_not_name() {
-        let park = note_send_park();
-        // Another client's ask.
+    fn a_verdict_never_completes_a_device_only_park() {
+        // Belt and braces behind the routing refusal: even if one of these
+        // reached the park queue, the verdict does not press its button.
+        let park = ParkVerdict { device_press_only: true, ..note_send_park() };
+        assert_eq!(
+            park_completion(&park),
+            ParkCompletion::Window { reason: DEVICE_APPROVAL_REQUIRED },
+        );
+        // Including one that owes no preview at all, which is the shape a
+        // rendezvous provision or a wallet pairing has.
         assert!(matches!(
-            park_completion(&ParkVerdict { park_client_hex: OTHER_CLIENT, ..park }),
+            park_completion(&ParkVerdict { needs_preview: false, ..park }),
             ParkCompletion::Window { .. }
         ));
-        // Another method.
+    }
+
+    #[test]
+    fn a_verdict_without_the_preview_does_not_answer_the_card() {
+        // The guardian would have approved a method name, not a note
+        // movement: the request falls back to the device instead.
         assert!(matches!(
-            park_completion(&ParkVerdict { park_key: "heartwood_note_export", ..park }),
+            park_completion(&ParkVerdict { notice_showed_preview: false, ..note_send_park() }),
             ParkCompletion::Window { .. }
         ));
-        // Another kind of the same method.
-        assert!(matches!(
+        // A park that owes no preview (a sign, a crypto method) is unaffected.
+        assert_eq!(
             park_completion(&ParkVerdict {
-                approved_key: "sign_event:1",
-                park_key: "sign_event:4",
-                ..park
+                needs_preview: false,
+                notice_showed_preview: false,
+                ..note_send_park()
             }),
-            ParkCompletion::Window { .. }
-        ));
-        // Another identity: the #156 rule holds through escalation too.
-        assert!(matches!(
-            park_completion(&ParkVerdict { park_identity: Some(&OTHER_IDENTITY), ..park }),
-            ParkCompletion::Window { .. }
-        ));
-        // And a verdict granted for no identity never releases one.
-        assert!(matches!(
-            park_completion(&ParkVerdict { approved_identity: None, ..park }),
-            ParkCompletion::Window { .. }
-        ));
+            ParkCompletion::Approved,
+        );
+    }
+
+    #[test]
+    fn a_verdict_resolves_only_the_park_it_names() {
+        assert!(park_verdict_matches("aa", 0, "aa", 0));
+        // Another park id on the same master.
+        assert!(!park_verdict_matches("aa", 0, "bb", 0));
+        // The same id under another master's guardian.
+        assert!(!park_verdict_matches("aa", 0, "aa", 1));
+        assert!(!park_verdict_matches("aa", 1, "aa", 0));
+        // Case is not folded: a park id is an event id, compared as given.
+        assert!(!park_verdict_matches("aa", 0, "AA", 0));
     }
 
     #[test]

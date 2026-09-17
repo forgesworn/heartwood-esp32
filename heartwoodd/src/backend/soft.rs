@@ -778,6 +778,7 @@ impl SigningBackend for SoftBackend {
                 escalate: false,
                 petition_on_deny: false,
                 audit_child_wrap: false,
+                guardian_notice_wrap: false,
                 bound_identity: None,
                 approved_identities: String::new(),
                 was_bound: false,

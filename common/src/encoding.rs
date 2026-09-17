@@ -13,6 +13,20 @@ pub fn encode_npub(public_key: &[u8; 32]) -> String {
     bech32::encode::<Bech32>(hrp, public_key).expect("valid encoding")
 }
 
+/// Decode a Nostr `npub1...` string to its 32-byte public key. Strict: a
+/// bech32 checksum (not bech32m), the `npub` prefix, a single case, zero
+/// padding and exactly 32 bytes, so no two strings name one key. Surrounding
+/// whitespace is not accepted.
+pub fn decode_npub(value: &str) -> Option<[u8; 32]> {
+    let checked = bech32::primitives::decode::CheckedHrpstring::new::<Bech32>(value).ok()?;
+    if checked.hrp() != Hrp::parse("npub").ok()? {
+        return None;
+    }
+    checked.validate_segwit_padding().ok()?;
+    let bytes: Vec<u8> = checked.byte_iter().collect();
+    bytes.try_into().ok()
+}
+
 // ---- LUD-25 Part 2 ----
 //
 // Four bech32m strings, each a fixed payload: `cp1` a note's x-only public
@@ -215,6 +229,31 @@ mod tests {
         let line = identity_card_line("natural-p", &pubkey);
         assert_eq!(line, format!("natural-p {}", short_npub(&pubkey)));
         assert!(line.len() <= 25);
+    }
+
+    #[test]
+    fn decode_npub_round_trips_and_is_strict() {
+        let pubkey = [0x5au8; 32];
+        let npub = encode_npub(&pubkey);
+        assert_eq!(decode_npub(&npub), Some(pubkey));
+        // All-uppercase is the same bech32 string; mixed case is not.
+        assert_eq!(decode_npub(&npub.to_uppercase()), Some(pubkey));
+        let mut mixed = npub.clone();
+        mixed.replace_range(5..6, &npub[5..6].to_uppercase());
+        assert_eq!(decode_npub(&mixed), None);
+        // Wrong prefix, bad checksum, bech32m, wrong length, whitespace.
+        let nsec = bech32::encode::<Bech32>(Hrp::parse("nsec").unwrap(), &pubkey).unwrap();
+        assert_eq!(decode_npub(&nsec), None);
+        let mut broken = npub.clone();
+        let last = if broken.ends_with('q') { "p" } else { "q" };
+        broken.replace_range(broken.len() - 1.., last);
+        assert_eq!(decode_npub(&broken), None);
+        let m = bech32::encode::<Bech32m>(Hrp::parse("npub").unwrap(), &pubkey).unwrap();
+        assert_eq!(decode_npub(&m), None);
+        let short = bech32::encode::<Bech32>(Hrp::parse("npub").unwrap(), &pubkey[..31]).unwrap();
+        assert_eq!(decode_npub(&short), None);
+        assert_eq!(decode_npub(&format!(" {npub}")), None);
+        assert_eq!(decode_npub(""), None);
     }
 
     #[test]

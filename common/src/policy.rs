@@ -442,6 +442,168 @@ pub fn set_slot_bound_identity(slot: &mut ConnectSlot, bound_identity: Option<St
     true
 }
 
+/// Parse an identity named by a management caller: a 64-character hex x-only
+/// pubkey (either case) or an `npub1...`. Anything else is refused.
+pub fn parse_identity_pubkey(input: &str) -> Result<[u8; 32], &'static str> {
+    const INVALID: &str = "invalid_identity: expected a 64-hex pubkey or an npub";
+    if input.len() == 64 && input.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return crate::hex::hex_decode(input)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(INVALID);
+    }
+    crate::encoding::decode_npub(input).ok_or(INVALID)
+}
+
+/// Whether `pubkey` is the slot's recorded binding. Compared without regard to
+/// case, so a binding written in any case is never mistaken for a revocable
+/// approval.
+fn is_bound_identity(slot: &ConnectSlot, pubkey: &[u8; 32]) -> bool {
+    slot.bound_identity
+        .as_deref()
+        .is_some_and(|bound| bound.eq_ignore_ascii_case(&crate::hex::hex_encode(pubkey)))
+}
+
+/// An identity named for revocation: a whole pubkey, or the 16-hex tag
+/// `list_clients` shows for an approval whose pubkey the caller cannot name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityRef {
+    Pubkey([u8; 32]),
+    /// Lowercase hex, as [`identity_tag`] writes it.
+    Tag([u8; IDENTITY_TAG_BYTES * 2]),
+}
+
+impl IdentityRef {
+    /// The stored tag this identity is approved under.
+    pub fn tag(&self) -> [u8; IDENTITY_TAG_BYTES * 2] {
+        match self {
+            IdentityRef::Pubkey(pubkey) => identity_tag(pubkey),
+            IdentityRef::Tag(tag) => *tag,
+        }
+    }
+
+    /// Whether `pubkey` is this identity: the whole key, or any key with this
+    /// tag.
+    pub fn matches(&self, pubkey: &[u8; 32]) -> bool {
+        match self {
+            IdentityRef::Pubkey(own) => own == pubkey,
+            IdentityRef::Tag(tag) => identity_tag(pubkey) == *tag,
+        }
+    }
+}
+
+/// Parse an identity named for revocation: a 64-hex pubkey or an npub (as
+/// [`parse_identity_pubkey`]), or a 16-hex identity tag in either case.
+pub fn parse_identity_ref(input: &str) -> Result<IdentityRef, &'static str> {
+    const INVALID: &str = "invalid_identity: expected a 64-hex pubkey, an npub or a 16-hex identity tag";
+    let tag_chars = IDENTITY_TAG_BYTES * 2;
+    if input.len() == tag_chars && input.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut tag = [0u8; IDENTITY_TAG_BYTES * 2];
+        for (out, byte) in tag.iter_mut().zip(input.bytes()) {
+            *out = byte.to_ascii_lowercase();
+        }
+        return Ok(IdentityRef::Tag(tag));
+    }
+    parse_identity_pubkey(input).map(IdentityRef::Pubkey).map_err(|_| INVALID)
+}
+
+/// Whether `identity` names the slot's binding: the whole key for a pubkey,
+/// the binding's tag for a tag. Case-insensitive, so a binding written in any
+/// case is never mistaken for a revocable approval.
+fn names_bound_identity(slot: &ConnectSlot, identity: &IdentityRef) -> bool {
+    let Some(bound) = slot.bound_identity.as_deref() else {
+        return false;
+    };
+    match identity {
+        IdentityRef::Pubkey(pubkey) => is_bound_identity(slot, pubkey),
+        IdentityRef::Tag(tag) => bound
+            .as_bytes()
+            .get(..IDENTITY_TAG_BYTES * 2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag)),
+    }
+}
+
+/// What revoking one approved identity did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeIdentity {
+    /// Its tag was in the approved list and is gone.
+    Removed,
+    /// It was not in the list: nothing changed.
+    Absent,
+    /// It is the slot's binding, which is approved without a list entry.
+    /// Removing a tag would leave it approved, so nothing is changed.
+    Bound,
+}
+
+/// Withdraw one identity's approval from a slot, leaving the pairing, its
+/// methods, kinds, binding and client keys alone. The next request as that
+/// identity meets the identity gate's card again. Every copy of its tag goes,
+/// and only whole tags are compared.
+pub fn revoke_approved_identity(slot: &mut ConnectSlot, pubkey: &[u8; 32]) -> RevokeIdentity {
+    revoke_approved_identity_ref(slot, &IdentityRef::Pubkey(*pubkey))
+}
+
+/// [`revoke_approved_identity`] for a pubkey or a tag. A tag that matches the
+/// binding's tag is refused like the binding itself.
+pub fn revoke_approved_identity_ref(slot: &mut ConnectSlot, identity: &IdentityRef) -> RevokeIdentity {
+    if names_bound_identity(slot, identity) {
+        return RevokeIdentity::Bound;
+    }
+    let tag = identity.tag();
+    let kept: Vec<u8> = slot
+        .approved_identities
+        .as_bytes()
+        .chunks(IDENTITY_TAG_BYTES * 2)
+        .filter(|chunk| *chunk != &tag[..])
+        .flatten()
+        .copied()
+        .collect();
+    if kept.len() == slot.approved_identities.len() {
+        return RevokeIdentity::Absent;
+    }
+    // A removed chunk is whole ASCII, so what is left is still valid UTF-8.
+    match String::from_utf8(kept) {
+        Ok(kept) => {
+            slot.approved_identities = kept;
+            RevokeIdentity::Removed
+        }
+        Err(_) => RevokeIdentity::Absent,
+    }
+}
+
+/// Withdraw every recorded identity approval from a slot. The binding, if any,
+/// stays approved: change it through [`set_slot_bound_identity`]. True when
+/// the list changed.
+pub fn clear_approved_identities(slot: &mut ConnectSlot) -> bool {
+    if slot.approved_identities.is_empty() {
+        return false;
+    }
+    slot.approved_identities.clear();
+    true
+}
+
+/// Whether a live approve-once verdict falls with an identity approval
+/// withdrawn from `slot`: it was given to one of the slot's client keys for an
+/// identity-scoped request, and for `revoked` (the whole key, or any key with
+/// the tag), or (`None`, clearing
+/// the list) for any identity but the slot's binding, which stays approved.
+/// A verdict for a request that uses no identity key is untouched.
+pub fn verdict_withdrawn(
+    slot: &ConnectSlot,
+    client_pubkey: &str,
+    granted: Option<&[u8; 32]>,
+    revoked: Option<&IdentityRef>,
+) -> bool {
+    let Some(granted) = granted else {
+        return false;
+    };
+    slot_authorizes(slot, client_pubkey)
+        && match revoked {
+            Some(revoked) => revoked.matches(granted),
+            None => !is_bound_identity(slot, granted),
+        }
+}
+
 /// Add one method to a legacy slot's auto-approved set after an explicit
 /// physical approval, the way [`grant_slot_signing`] adds `sign_event`.
 pub fn grant_slot_method(slot: &mut ConnectSlot, method: &str) -> bool {
@@ -1791,6 +1953,313 @@ mod tests {
         // A note method in the batch still owes its own card.
         let shown = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(IDENTITY_A) };
         assert_eq!(resume_decision(&shown, None, Some(&IDENTITY_A), true, true), ResumeDecision::OwnCardNext);
+    }
+
+    // --- Revoking identity approvals ---
+
+    /// The slot as JSON with its approved list removed: everything a
+    /// revocation must leave alone.
+    fn without_identities(slot: &ConnectSlot) -> serde_json::Value {
+        let mut value = serde_json::to_value(slot).unwrap();
+        value.as_object_mut().unwrap().remove("ids");
+        value
+    }
+
+    /// A slot with the parts a revocation must not touch filled in.
+    fn populated_slot() -> ConnectSlot {
+        let mut slot = trusted_legacy_slot();
+        slot.label = "phone".into();
+        slot.allowed_kinds = vec![1, 7];
+        slot.current_pubkey = Some("11".repeat(32));
+        slot.authorized_pubkeys = vec!["22".repeat(32), "11".repeat(32)];
+        slot.escalate = true;
+        slot.was_bound = true;
+        slot.bound_identity = Some(full_hex(&IDENTITY_C));
+        slot
+    }
+
+    fn gate_for(slot: &ConnectSlot, method: &str, tier: ApprovalTier, identity: &[u8; 32], verdict: bool) -> Gate {
+        gate_request(&GateRequest {
+            has_client: true,
+            slot: Some(slot),
+            method,
+            tier,
+            explicit_context: false,
+            has_context: false,
+            identity: Some(identity),
+            verdict,
+        })
+    }
+
+    #[test]
+    fn revoking_a_present_identity_removes_only_its_tag() {
+        let mut slot = populated_slot();
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        assert!(record_approved_identity(&mut slot, &IDENTITY_B));
+        let untouched = without_identities(&slot);
+
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_A), RevokeIdentity::Removed);
+        assert!(!identity_approved(&slot, &IDENTITY_A));
+        assert!(identity_approved(&slot, &IDENTITY_B));
+        assert!(identity_approved(&slot, &IDENTITY_C), "the binding stays approved");
+        assert_eq!(approved_identity_tags(&slot), vec!["bbbbbbbbbbbbbbbb"]);
+        assert_eq!(without_identities(&slot), untouched);
+
+        // Revoking the last one leaves the list empty, and it serialises away.
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_B), RevokeIdentity::Removed);
+        assert!(slot.approved_identities.is_empty());
+        assert!(serde_json::to_value(&slot).unwrap().get("ids").is_none());
+        assert_eq!(without_identities(&slot), untouched);
+    }
+
+    #[test]
+    fn revoking_an_absent_identity_is_a_no_op() {
+        let mut slot = populated_slot();
+        assert!(record_approved_identity(&mut slot, &IDENTITY_B));
+        let before = serde_json::to_value(&slot).unwrap();
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_A), RevokeIdentity::Absent);
+        assert_eq!(serde_json::to_value(&slot).unwrap(), before);
+        // Idempotent: the second revoke of the same identity changes nothing.
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_B), RevokeIdentity::Removed);
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_B), RevokeIdentity::Absent);
+        // Only a whole tag matches: a key sharing seven bytes is not revoked.
+        let mut near = IDENTITY_B;
+        near[7] = 0x00;
+        assert!(record_approved_identity(&mut slot, &IDENTITY_B));
+        assert_eq!(revoke_approved_identity(&mut slot, &near), RevokeIdentity::Absent);
+        assert!(identity_approved(&slot, &IDENTITY_B));
+        // A torn list keeps whatever it cannot read as a whole tag.
+        slot.approved_identities = format!("{}bbbb", "a".repeat(16));
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_A), RevokeIdentity::Removed);
+        assert_eq!(slot.approved_identities, "bbbb");
+    }
+
+    #[test]
+    fn clearing_removes_every_approval_but_keeps_the_binding() {
+        let mut slot = populated_slot();
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        assert!(record_approved_identity(&mut slot, &IDENTITY_B));
+        let untouched = without_identities(&slot);
+        assert!(clear_approved_identities(&mut slot));
+        assert!(!identity_approved(&slot, &IDENTITY_A));
+        assert!(!identity_approved(&slot, &IDENTITY_B));
+        assert!(identity_approved(&slot, &IDENTITY_C));
+        assert!(approved_identity_tags(&slot).is_empty());
+        assert_eq!(without_identities(&slot), untouched);
+        assert!(!clear_approved_identities(&mut slot), "clearing an empty list changes nothing");
+    }
+
+    #[test]
+    fn revoking_the_bound_identity_is_refused() {
+        let mut slot = populated_slot();
+        // Even with its tag also listed (an imported backup could carry both).
+        slot.approved_identities = core::str::from_utf8(&identity_tag(&IDENTITY_C)).unwrap().to_string();
+        let before = serde_json::to_value(&slot).unwrap();
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_C), RevokeIdentity::Bound);
+        assert_eq!(serde_json::to_value(&slot).unwrap(), before);
+        // A binding stored in upper case is still the binding.
+        slot.bound_identity = Some(full_hex(&IDENTITY_C).to_uppercase());
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_C), RevokeIdentity::Bound);
+        // With no binding the same identity is an ordinary approval.
+        slot.bound_identity = None;
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_C), RevokeIdentity::Removed);
+    }
+
+    #[test]
+    fn a_tag_names_an_identity_for_revocation() {
+        let tag = |pubkey: &[u8; 32]| core::str::from_utf8(&identity_tag(pubkey)).unwrap().to_string();
+        let mut slot = populated_slot();
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        assert!(record_approved_identity(&mut slot, &IDENTITY_B));
+
+        // Exactly as list_clients shows it, or in upper case.
+        assert_eq!(parse_identity_ref(&tag(&IDENTITY_A)), Ok(IdentityRef::Tag(identity_tag(&IDENTITY_A))));
+        assert_eq!(parse_identity_ref(&tag(&IDENTITY_A).to_uppercase()), Ok(IdentityRef::Tag(identity_tag(&IDENTITY_A))));
+        // Pubkeys still parse as pubkeys.
+        assert_eq!(parse_identity_ref(&full_hex(&IDENTITY_A)), Ok(IdentityRef::Pubkey(IDENTITY_A)));
+        assert_eq!(
+            parse_identity_ref(&crate::encoding::encode_npub(&IDENTITY_A)),
+            Ok(IdentityRef::Pubkey(IDENTITY_A)),
+        );
+
+        let by_tag = parse_identity_ref(&tag(&IDENTITY_A).to_uppercase()).unwrap();
+        assert_eq!(revoke_approved_identity_ref(&mut slot, &by_tag), RevokeIdentity::Removed);
+        assert!(!identity_approved(&slot, &IDENTITY_A));
+        assert!(identity_approved(&slot, &IDENTITY_B));
+        assert_eq!(revoke_approved_identity_ref(&mut slot, &by_tag), RevokeIdentity::Absent);
+
+        // A tag verdict match covers every key with that tag, and no other.
+        let client = "11".repeat(32);
+        assert!(verdict_withdrawn(&slot, &client, Some(&IDENTITY_A), Some(&by_tag)));
+        assert!(!verdict_withdrawn(&slot, &client, Some(&IDENTITY_B), Some(&by_tag)));
+        let mut same_tag = IDENTITY_A;
+        same_tag[31] = 0x01;
+        assert!(verdict_withdrawn(&slot, &client, Some(&same_tag), Some(&by_tag)));
+        assert!(!verdict_withdrawn(&slot, &client, Some(&same_tag), Some(&IdentityRef::Pubkey(IDENTITY_A))));
+
+        // The binding's tag is refused like the binding, in either case, even
+        // when that tag is also listed, and nothing changes.
+        slot.approved_identities.push_str(&tag(&IDENTITY_C));
+        let before = serde_json::to_value(&slot).unwrap();
+        for input in [tag(&IDENTITY_C), tag(&IDENTITY_C).to_uppercase()] {
+            let identity = parse_identity_ref(&input).unwrap();
+            assert_eq!(revoke_approved_identity_ref(&mut slot, &identity), RevokeIdentity::Bound);
+        }
+        slot.bound_identity = Some(full_hex(&IDENTITY_C).to_uppercase());
+        assert_eq!(
+            revoke_approved_identity_ref(&mut slot, &IdentityRef::Tag(identity_tag(&IDENTITY_C))),
+            RevokeIdentity::Bound,
+        );
+        slot.bound_identity = Some(full_hex(&IDENTITY_C));
+        assert_eq!(serde_json::to_value(&slot).unwrap(), before);
+
+        // Malformed: every length but 16, 64 and a valid npub, and non-hex.
+        let hex = full_hex(&IDENTITY_A);
+        for len in [0, 1, 8, 15, 17, 32, 63, 65] {
+            let input: String = hex.chars().cycle().take(len).collect();
+            assert!(parse_identity_ref(&input).is_err(), "length {len}");
+        }
+        for bad in ["aaaaaaaaaaaaaaag", " aaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaa ", "0xaaaaaaaaaaaaaa"] {
+            assert_eq!(
+                parse_identity_ref(bad),
+                Err("invalid_identity: expected a 64-hex pubkey, an npub or a 16-hex identity tag"),
+                "{bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn identity_input_is_hex_or_npub_and_nothing_else() {
+        let hex = full_hex(&IDENTITY_A);
+        let npub = crate::encoding::encode_npub(&IDENTITY_A);
+        assert_eq!(parse_identity_pubkey(&hex), Ok(IDENTITY_A));
+        assert_eq!(parse_identity_pubkey(&hex.to_uppercase()), Ok(IDENTITY_A));
+        assert_eq!(parse_identity_pubkey(&npub), Ok(IDENTITY_A));
+        let tag = core::str::from_utf8(&identity_tag(&IDENTITY_A)).unwrap().to_string();
+        for bad in [
+            String::new(),
+            hex[..63].to_string(),
+            format!("{hex}0"),
+            format!("0x{}", &hex[2..]),
+            format!("{}g", &hex[..63]),
+            format!(" {hex}"),
+            tag,
+            npub[..62].to_string(),
+            format!("{npub} "),
+            bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("nsec").unwrap(), &IDENTITY_A).unwrap(),
+        ] {
+            assert!(parse_identity_pubkey(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_revoked_identity_meets_the_allow_as_card_again() {
+        for strict in [false, true] {
+            let mut slot = trusted_legacy_slot();
+            if strict {
+                slot.strict_permissions = true;
+                slot.allowed_methods = vec!["sign_event".into(), "nip44_decrypt".into()];
+            }
+            assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+            assert!(record_approved_identity(&mut slot, &IDENTITY_B));
+            for method in ["sign_event", "nip44_decrypt"] {
+                assert_eq!(gate_for(&slot, method, ApprovalTier::AutoApprove, &IDENTITY_A, false), Gate::Allow);
+            }
+            assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_A), RevokeIdentity::Removed);
+            for method in ["sign_event", "nip44_decrypt"] {
+                assert_eq!(
+                    gate_for(&slot, method, ApprovalTier::AutoApprove, &IDENTITY_A, false),
+                    Gate::Card(CardKind::AllowAs { record: true }),
+                    "{method} strict={strict}",
+                );
+                assert_eq!(gate_for(&slot, method, ApprovalTier::AutoApprove, &IDENTITY_B, false), Gate::Allow);
+            }
+            assert_eq!(scoped_tier(&slot, "sign_event", Some(1), &IDENTITY_A), ApprovalTier::ButtonRequired);
+            assert!(clear_approved_identities(&mut slot));
+            assert_eq!(
+                gate_for(&slot, "sign_event", ApprovalTier::AutoApprove, &IDENTITY_B, false),
+                Gate::Card(CardKind::AllowAs { record: true }),
+            );
+        }
+    }
+
+    #[test]
+    fn a_revocation_withdraws_live_verdicts_for_that_identity_only() {
+        let mut slot = populated_slot();
+        let client = "11".repeat(32);
+        let earlier_client = "22".repeat(32);
+        let stranger = "33".repeat(32);
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        // A live verdict for A lets A through; once withdrawn, the card is back.
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_A), RevokeIdentity::Removed);
+        assert_eq!(gate_for(&slot, "sign_event", ApprovalTier::AutoApprove, &IDENTITY_A, true), Gate::Allow);
+        assert!(verdict_withdrawn(&slot, &client, Some(&IDENTITY_A), Some(&IdentityRef::Pubkey(IDENTITY_A))));
+        assert_eq!(
+            gate_for(&slot, "sign_event", ApprovalTier::AutoApprove, &IDENTITY_A, false),
+            Gate::Card(CardKind::AllowAs { record: true }),
+        );
+        // Every client key of the slot, and no other slot's client.
+        assert!(verdict_withdrawn(&slot, &earlier_client, Some(&IDENTITY_A), Some(&IdentityRef::Pubkey(IDENTITY_A))));
+        assert!(!verdict_withdrawn(&slot, &stranger, Some(&IDENTITY_A), Some(&IdentityRef::Pubkey(IDENTITY_A))));
+        // A verdict for another identity, or for a request with no identity
+        // key, survives a single revocation.
+        assert!(!verdict_withdrawn(&slot, &client, Some(&IDENTITY_B), Some(&IdentityRef::Pubkey(IDENTITY_A))));
+        assert!(!verdict_withdrawn(&slot, &client, None, Some(&IdentityRef::Pubkey(IDENTITY_A))));
+        // Clearing withdraws every identity verdict except the binding's.
+        assert!(verdict_withdrawn(&slot, &client, Some(&IDENTITY_A), None));
+        assert!(verdict_withdrawn(&slot, &client, Some(&IDENTITY_B), None));
+        assert!(!verdict_withdrawn(&slot, &client, Some(&IDENTITY_C), None));
+        assert!(!verdict_withdrawn(&slot, &client, None, None));
+    }
+
+    #[test]
+    fn an_ask_waiting_on_a_revoked_approval_is_refused_on_resume() {
+        // A legacy slot that has not signed: sign_event prompts HOLD TO SIGN.
+        // A was approved, so the ask was deferred on the policy card alone.
+        let mut slot = sample_slot(0, "legacy");
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        let tier = evaluate_slot_policy(&slot, "sign_event", Some(1));
+        assert_eq!(tier, ApprovalTier::ButtonRequired);
+        let card_now = |slot: &ConnectSlot| match gate_for(slot, "sign_event", tier, &IDENTITY_A, false) {
+            Gate::Card(kind) => Some(kind),
+            Gate::Allow => None,
+            Gate::Deny => panic!("denied"),
+        };
+        let recorded = |slot: &ConnectSlot| identity_approved(slot, &IDENTITY_A);
+        let shown = ShownCard { card: card_now(&slot), identity: Some(IDENTITY_A) };
+        assert_eq!(shown.card, None);
+        assert_eq!(resume_decision(&shown, card_now(&slot), Some(&IDENTITY_A), true, recorded(&slot)), ResumeDecision::Proceed);
+
+        // Revoked while the card waited: the hold no longer answers the ask.
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_A), RevokeIdentity::Removed);
+        assert_eq!(
+            resume_decision(&shown, card_now(&slot), Some(&IDENTITY_A), true, recorded(&slot)),
+            ResumeDecision::CardChanged,
+        );
+        // The same after clearing.
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        assert!(clear_approved_identities(&mut slot));
+        assert_eq!(
+            resume_decision(&shown, card_now(&slot), Some(&IDENTITY_A), true, recorded(&slot)),
+            ResumeDecision::CardChanged,
+        );
+
+        // A crypto ask that rode the approval (no card of its own) likewise.
+        let mut slot = trusted_legacy_slot();
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        let shown = ShownCard { card: None, identity: Some(IDENTITY_A) };
+        assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_A), RevokeIdentity::Removed);
+        let now = match gate_for(&slot, "nip44_decrypt", ApprovalTier::AutoApprove, &IDENTITY_A, false) {
+            Gate::Card(kind) => Some(kind),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(resume_decision(&shown, now, Some(&IDENTITY_A), false, false), ResumeDecision::CardChanged);
+
+        // An ask whose own card is ALLOW AS A is not released by the earlier
+        // approval either: its hold is a fresh approval of the identity that
+        // card names, so it proceeds and records A again.
+        let shown = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(IDENTITY_A) };
+        assert_eq!(resume_decision(&shown, now, Some(&IDENTITY_A), false, false), ResumeDecision::Proceed);
     }
 
     #[test]

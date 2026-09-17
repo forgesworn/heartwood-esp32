@@ -1744,7 +1744,25 @@ bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.
     bottom row. On a narrow panel it reads `A/B move  holdA back` and the
     pick gesture appears in the subtitle instead.
 
-## 23. A pairing acts only as the identities it was approved for (added 2026-09-17, NOT YET BENCH-RUN)
+## 23. A pairing acts only as the identities it was approved for (added 2026-09-17; core path bench-run 2026-09-17, desk Heltec V4)
+
+**Bench run 2026-09-17** (V4, 16 MB legacy-NVS bigapp layout, app-only flash at
+0x10000, vault re-unlocked, fresh legacy slot 11 "idscope-bench" over the relay,
+revoked afterwards):
+
+- Items 1, 2: first sign as the master raised its card and one hold approved it;
+  later kind-1 signs answered in ~1.8 s with no card.
+- Item 3: `sign_event` with a context for `nostr:persona:natural-person` raised a
+  card, signed as `2ed46ab2..` (not the master), and the next one was silent
+  (~2.3 s).
+- Item 4: an unregistered child's context raised a card and was approved.
+- Items 15: a card left to expire answered `timeout`, and the slot recorded
+  nothing (`approved_identities` unchanged).
+- Item 17: `revoke_client_identity` with the 16-hex tag answered
+  `changed: true` and dropped the tag; the same call again answered
+  `changed: false`; the master still signed silently; the revoked identity's
+  next sign raised its card again. `revoke_client` then removed the bench slot.
+- Not yet bench-run: items 5 to 14, 11b, 11c, 16.
 
 The whole decision is one pure function, `heartwood_common::policy::gate_request`,
 host-tested as a full matrix; the relay's pre-dispatch plan and the handler both
@@ -1818,6 +1836,24 @@ master on a legacy slot that already signs silently.
 15. **Timeout leaves nothing behind.** Let any of these cards expire: the slot is
     unchanged and a retry prompts.
 16. **USB unchanged.** Direct USB requests (no client pubkey) behave as before.
+17. **Revoke one identity, or all.** With the master and a persona approved on
+    a legacy slot, `revoke_client_identity` (`slot_index`,
+    `expected_secret_fingerprint`, `identity` as the persona's npub, fresh
+    `mutation_challenge`, no button): the result has `changed: true` and
+    `list_clients` no longer lists its tag; the master still signs silently and
+    the persona's next sign reads `ALLOW AS` again. The same call again answers
+    `changed: false`. An approval by its `list_clients` tag (16 hex, either
+    case) revokes the same way. Revoking a strict slot's `bound_identity`, by
+    pubkey or by its tag, answers
+    `bound_identity: identity is the slot's binding; change the binding
+    instead` and changes nothing. `clear_client_identities` empties the list,
+    the binding still signs silently, and the slot's methods, kinds and client
+    keys are unchanged. Put a `HOLD TO SIGN` card up for an approved identity,
+    revoke it before holding: the hold answers `approval changed while waiting;
+    send the request again`. On an `escalate` slot, approve-once a parked sign
+    as the persona, revoke the persona inside the verdict's window: the result
+    shows `verdicts_dropped: 1` and the next sign of that kind parks again
+    instead of riding the verdict.
 
 ## Notes
 

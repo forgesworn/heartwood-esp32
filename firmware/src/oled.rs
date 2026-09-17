@@ -1204,6 +1204,21 @@ pub fn show_sign_request(
     _content_preview: &str,
     seconds_remaining: u32,
 ) {
+    show_sign_request_as(display, requester, kind, None, seconds_remaining);
+}
+
+/// `show_sign_request` for a remote client, naming the identity it signs as.
+///
+/// With an identity the kind name and number share the first small line and
+/// the identity (label + short npub) takes the second, so the layout keeps the
+/// same rows and the countdown bar is untouched.
+pub fn show_sign_request_as(
+    display: &mut Display<'_>,
+    requester: &str,
+    kind: u64,
+    identity: Option<&str>,
+    seconds_remaining: u32,
+) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -1233,13 +1248,15 @@ pub fn show_sign_request(
     let app = ellipsize_chars(&app, l.chars_per_line(l.font_body()));
     Text::new(&app, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
-    let kind_name = kind_name_line(kind);
-    let kind_name = ellipsize_chars(&kind_name, l.chars_per_line(l.font_small()));
-    Text::new(&kind_name, Point::new(l.sx(2), l.sy(39)), small).draw(display).ok();
+    let (kind_line, second_line) = match identity {
+        Some(identity) => (format!("k{kind} {}", kind_name_line(kind)), identity.to_string()),
+        None => (kind_name_line(kind), format!("kind {kind}")),
+    };
+    let kind_line = ellipsize_chars(&kind_line, l.chars_per_line(l.font_small()));
+    Text::new(&kind_line, Point::new(l.sx(2), l.sy(39)), small).draw(display).ok();
 
-    let kind_number = format!("kind {kind}");
-    let kind_number = ellipsize_chars(&kind_number, l.chars_per_line(l.font_small()));
-    Text::new(&kind_number, Point::new(l.sx(2), l.sy(48)), small).draw(display).ok();
+    let second_line = ellipsize_chars(&second_line, l.chars_per_line(l.font_small()));
+    Text::new(&second_line, Point::new(l.sx(2), l.sy(48)), small).draw(display).ok();
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);

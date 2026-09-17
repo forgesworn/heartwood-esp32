@@ -3276,6 +3276,10 @@ struct ParkedRequest {
     master_slot: u8,
     method: String,
     event_kind: Option<u64>,
+    /// Hex pubkey of the identity the request acts as, when identity-scoped
+    /// (it may be a child the context derives, not `target_pk`). The notice
+    /// names it and an approve verdict covers it and nothing else.
+    identity: Option<String>,
     parked_at: Instant,
 }
 
@@ -3286,6 +3290,7 @@ struct ParkTombstone {
     park_id: String,
     client_hex: String,
     key: String,
+    identity: Option<String>,
     master_slot: u8,
 }
 
@@ -3558,7 +3563,10 @@ fn emit_approval_notice(
             guardian_np_hex: &guardian_hex,
             client_hex: &park.client_hex,
             park_id_hex: &park.park_id,
-            identity_hex: &hex_encode(&park.target_pk),
+            identity_hex: &park
+                .identity
+                .clone()
+                .unwrap_or_else(|| hex_encode(&park.target_pk)),
             method: &park.method,
             event_kind: park.event_kind,
             park_ttl_secs: heartwood_common::escalate::PARK_TTL_SECS,
@@ -3734,6 +3742,7 @@ fn tombstone_park(ctx: &mut SignCtx, park: &ParkedRequest) {
         park_id: park.park_id.clone(),
         client_hex: park.client_hex.clone(),
         key: heartwood_common::nip59::method_or_kind_key(&park.method, park.event_kind),
+        identity: park.identity.clone(),
         master_slot: park.master_slot,
     });
 }
@@ -3791,6 +3800,7 @@ fn complete_parked(
         park.master_slot,
         park.client_hex.clone(),
         key,
+        park.identity.clone(),
         window_secs,
     );
 
@@ -4137,6 +4147,11 @@ fn queue_button_ask(
         let to = note_param(&ask.request, "to").unwrap_or_default();
         kind_key = format!("{kind_key}:{to}");
     }
+    // Asks acting as different identities are different decisions: one hold
+    // must never approve an identity its card did not name.
+    if let Some(identity) = ask.identity.as_deref() {
+        kind_key = format!("{kind_key}@{identity}");
+    }
     let key = AskKey::new(slot, client_hex.to_string(), hex_encode(target_pk), kind_key);
     let weight = ask
         .event
@@ -4265,13 +4280,13 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
 
     let batch = ctx.button_cards[0].asks.len();
     enum Draw {
-        Sign(String, u64),
+        Sign(String, u64, Option<String>),
         Extension(String, String, String),
         Titled(&'static str, String),
         Batch(String, String),
     }
     let card = match &ctx.button_cards[0].asks[0].ask.card {
-        crate::nip46_handler::AskCard::Sign { requester, kind } => {
+        crate::nip46_handler::AskCard::Sign { requester, kind, identity } => {
             // The count belongs on screen: one hold answers all of them, and
             // the operator must never be shown "sign this" for a batch.
             let label = if batch > 1 {
@@ -4279,7 +4294,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             } else {
                 requester.clone()
             };
-            Draw::Sign(label, *kind)
+            Draw::Sign(label, *kind, identity.clone())
         }
         crate::nip46_handler::AskCard::Extension {
             master_label,
@@ -4307,12 +4322,13 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // was handed to the glass, never whether the glass had room for it.
     if first_draw {
         let (head, body) = match &card {
-            Draw::Sign(label, kind) => (
+            Draw::Sign(label, kind, identity) => (
                 "HOLD TO SIGN".to_string(),
                 format!(
-                    "{} / {} / kind {kind}",
+                    "{} / {} / kind {kind} / {}",
                     crate::oled::display_app_label(label),
                     crate::oled::kind_name_line(*kind),
+                    identity.as_deref().unwrap_or(""),
                 ),
             ),
             Draw::Extension(master_label, method, preview) => (
@@ -4325,9 +4341,13 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }
     match card {
-        Draw::Sign(label, kind) => {
-            crate::oled::show_sign_request(ctx.display, &label, kind, "", remaining)
-        }
+        Draw::Sign(label, kind, identity) => crate::oled::show_sign_request_as(
+            ctx.display,
+            &label,
+            kind,
+            identity.as_deref(),
+            remaining,
+        ),
         Draw::Extension(master_label, method, preview) => crate::oled::show_master_sign_request(
             ctx.display,
             &master_label,
@@ -4927,6 +4947,7 @@ fn queue_receive_card(
                             legacy_client_pubkey: None,
                         },
                         event: Some(rumor),
+                        identity: None,
                     },
                     created_at,
                     received_uptime: crate::uptime_s(),
@@ -5486,9 +5507,26 @@ fn handle_nip46_event(
     } else {
         None
     };
-    let tier = ctx
-        .policy_engine
-        .check(slot, &ev.pubkey, &method_enum, event_kind);
+    // The identity the request will act as, resolved the way dispatch will
+    // resolve it, so escalation, petitions and rollback see the per-identity
+    // gate and not only the slot's method policy.
+    let request_identity = crate::nip46_handler::request_identity_hex(
+        &request,
+        &signing_secret,
+        mode,
+        slot,
+        ctx.secp,
+        ctx.policy_engine,
+        ctx.identity_caches,
+        &client_pubkey,
+    );
+    let tier = ctx.policy_engine.check_scoped(
+        slot,
+        &ev.pubkey,
+        &method_enum,
+        event_kind,
+        request_identity.as_deref(),
+    );
     let slot_snapshot = crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
         .then(|| ctx.policy_engine.snapshot_slot_state(slot));
 
@@ -5512,6 +5550,7 @@ fn handle_nip46_event(
             master_slot: slot,
             method: request.method.clone(),
             event_kind,
+            identity: request_identity.clone(),
             parked_at: Instant::now(),
             request,
         };
@@ -7921,6 +7960,7 @@ fn dispatch_mgmt(
                             master_slot,
                             t.client_hex,
                             t.key,
+                            t.identity,
                             window,
                         );
                         allow_installed = true;

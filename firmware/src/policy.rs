@@ -8,11 +8,18 @@ use std::time::Instant;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{
-    authorize_pubkey_on_unique_slot, evaluate_slot_policy, find_slot_by_pubkey,
+    apply_identity_gate, approve_slot_identity, authorize_pubkey_on_unique_slot,
+    evaluate_identity_gate, evaluate_slot_policy, find_slot_by_pubkey, find_slot_by_pubkey_mut,
     find_slot_by_secret, grant_slot_signing, next_slot_index, remove_ambiguous_pubkeys,
     remove_authorized_pubkey, strict_slot_denies_method, validate_exact_slot_policy,
-    ApprovalTier, ConnectSlot, ExactSlotPolicy, RemoveAuthorizedPubkey, CONNECT_SAFE_METHODS,
+    ApprovalTier, ConnectSlot, ExactSlotPolicy, IdentityGate, RemoveAuthorizedPubkey,
+    CONNECT_SAFE_METHODS,
 };
+
+/// Upper bound on one master's persisted slot table when loading it. Sixteen
+/// slots each carrying a full approved identity list serialise to roughly
+/// 80 KB; anything larger is not a table this firmware wrote.
+const MAX_SLOT_BLOB_BYTES: usize = 96 * 1024;
 
 /// Maximum concurrent client sessions.
 pub const MAX_SESSIONS: usize = 32;
@@ -88,6 +95,10 @@ pub struct TransientAllow {
     pub client_pubkey: String,
     /// `nip59::method_or_kind_key` of the approved request.
     pub key: String,
+    /// The identity (hex pubkey) the approved request acted as, when it was
+    /// identity-scoped. The verdict covers that identity only: a retry as any
+    /// other identity still meets the per-identity gate.
+    pub identity: Option<String>,
     pub until: Instant,
 }
 
@@ -133,6 +144,7 @@ impl PolicyEngine {
         master_slot: u8,
         client_pubkey: String,
         key: String,
+        identity: Option<String>,
         window_secs: u64,
     ) {
         let now = Instant::now();
@@ -149,6 +161,7 @@ impl PolicyEngine {
             master_slot,
             client_pubkey,
             key,
+            identity,
             until: now + std::time::Duration::from_secs(window_secs),
         });
     }
@@ -258,6 +271,83 @@ impl PolicyEngine {
         };
 
         evaluate_slot_policy(slot, method.as_str(), event_kind)
+    }
+
+    /// Scope a request to the identity whose key it will use (`identity`, hex
+    /// pubkey). A live approve-once verdict for this exact request AND
+    /// identity counts as approval for this dispatch only; otherwise the slot's
+    /// binding and approved list decide (see `evaluate_identity_gate`). A
+    /// client with no slot gets `NeedsApproval`: it can never be approved, and
+    /// the handler refuses unbound clients before any card.
+    pub fn identity_gate(
+        &self,
+        master_slot: u8,
+        client_pubkey: &str,
+        method: &Nip46Method,
+        event_kind: Option<u64>,
+        identity: &str,
+    ) -> IdentityGate {
+        let Some(slot) = self.find_slot_by_pubkey(master_slot, client_pubkey) else {
+            return IdentityGate::NeedsApproval;
+        };
+        let key = heartwood_common::nip59::method_or_kind_key(method.as_str(), event_kind);
+        let now = Instant::now();
+        let verdict = self.transient_allows.iter().any(|allow| {
+            allow.master_slot == master_slot
+                && allow.client_pubkey == client_pubkey
+                && allow.key == key
+                && allow.until > now
+                && allow.identity.as_deref() == Some(identity)
+        });
+        if verdict {
+            // A strict binding is a ceiling no verdict can lift.
+            return match evaluate_identity_gate(slot, identity) {
+                IdentityGate::Mismatch => IdentityGate::Mismatch,
+                _ => IdentityGate::Approved,
+            };
+        }
+        evaluate_identity_gate(slot, identity)
+    }
+
+    /// `check`, then the per-identity gate for a request that acts as
+    /// `identity`. `None` means the request uses no identity key.
+    pub fn check_scoped(
+        &self,
+        master_slot: u8,
+        client_pubkey: &str,
+        method: &Nip46Method,
+        event_kind: Option<u64>,
+        identity: Option<&str>,
+    ) -> ApprovalTier {
+        let tier = self.check(master_slot, client_pubkey, method, event_kind);
+        match identity {
+            Some(identity) => apply_identity_gate(
+                tier,
+                self.identity_gate(master_slot, client_pubkey, method, event_kind, identity),
+            ),
+            None => tier,
+        }
+    }
+
+    /// Record a physically approved identity on the client's slot. Marks the
+    /// slot table dirty when it changed; the caller persists.
+    pub fn approve_identity(
+        &mut self,
+        master_slot: u8,
+        client_pubkey: &str,
+        identity: &str,
+    ) -> Result<bool, &'static str> {
+        let slot = self
+            .master_slots
+            .iter_mut()
+            .find(|ms| ms.master_slot == master_slot)
+            .and_then(|ms| find_slot_by_pubkey_mut(&mut ms.slots, client_pubkey))
+            .ok_or("client is not bound to a slot")?;
+        let changed = approve_slot_identity(slot, identity)?;
+        if changed {
+            self.slots_dirty = true;
+        }
+        Ok(changed)
     }
 
     /// Find or create a client session. Returns mutable reference.
@@ -427,6 +517,7 @@ impl PolicyEngine {
             audit_child_wrap: false,
             guardian_notice_wrap: false,
             bound_identity: None,
+            approved_identities: vec![],
         };
         self.slots_mut(master_slot).push(new_slot);
         self.slots_dirty = true;
@@ -463,6 +554,7 @@ impl PolicyEngine {
             audit_child_wrap: policy.audit_child_wrap,
             guardian_notice_wrap: policy.guardian_notice_wrap,
             bound_identity: policy.bound_identity,
+            approved_identities: vec![],
         });
         self.slots_dirty = true;
         Some(slot_index)
@@ -757,7 +849,16 @@ impl PolicyEngine {
 
         for slot in 0..master_count {
             let new_key = format!("connslots_{slot}");
-            let mut buf = [0u8; 8192];
+            // Size the read from the stored blob: per-slot approved identity
+            // lists can take the table past a fixed buffer, and a blob that
+            // does not fit must not read back as "no slots" (every pairing
+            // silently lost). Bounded so a corrupt length cannot exhaust heap.
+            let blob_len = nvs
+                .blob_len(&new_key)
+                .ok()
+                .flatten()
+                .map_or(8192, |len| len.min(MAX_SLOT_BLOB_BYTES));
+            let mut buf = vec![0u8; blob_len];
 
             // --- Try new format first ---
             if let Ok(Some(data)) = nvs.get_blob(&new_key, &mut buf) {
@@ -814,6 +915,7 @@ impl PolicyEngine {
                     audit_child_wrap: false,
                     guardian_notice_wrap: false,
                     bound_identity: None,
+                    approved_identities: vec![],
                 };
 
                 log::info!("Migrated legacy policy for master slot {slot} to connslots format");

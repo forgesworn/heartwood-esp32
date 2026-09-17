@@ -89,9 +89,57 @@ pub fn client_fallback_label(public_key: &[u8; 32]) -> String {
     format!("{}..", &npub[..12])
 }
 
+/// Characters an identity card line may take for its label. With the short
+/// npub and a separating space the line fits the narrowest panel's 25
+/// small-font columns.
+pub const IDENTITY_LABEL_CHARS: usize = 9;
+
+/// A short, OLED-safe npub for approval cards: `npub1` plus the first four
+/// and last four data characters, so two identities that differ anywhere in
+/// the key rarely read the same, without a 63-character line.
+pub fn short_npub(public_key: &[u8; 32]) -> String {
+    let npub = encode_npub(public_key);
+    format!("{}..{}", &npub[..9], &npub[npub.len() - 4..])
+}
+
+/// The card line naming the identity a request acts as: a label (persona
+/// name, purpose or master label) cut to [`IDENTITY_LABEL_CHARS`] printable
+/// ASCII characters, then the short npub. The label is a display aid only;
+/// the npub is what identifies.
+pub fn identity_card_line(label: &str, public_key: &[u8; 32]) -> String {
+    let label = label.strip_prefix("nostr:persona:").unwrap_or(label);
+    let clean: String = label
+        .chars()
+        .map(|ch| if ch.is_ascii_graphic() { ch } else { '_' })
+        .take(IDENTITY_LABEL_CHARS)
+        .collect();
+    let clean = if clean.is_empty() { "identity".to_string() } else { clean };
+    format!("{clean} {}", short_npub(public_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_card_line_is_bounded_ascii_with_short_npub() {
+        let pubkey = [0x42u8; 32];
+        let npub = encode_npub(&pubkey);
+        let short = short_npub(&pubkey);
+        assert_eq!(short, format!("{}..{}", &npub[..9], &npub[npub.len() - 4..]));
+        assert_eq!(short.len(), 15);
+
+        let line = identity_card_line("nostr:persona:natural-person", &pubkey);
+        assert_eq!(line, format!("natural-p {short}"));
+        assert!(line.len() <= 25);
+        assert!(line.is_ascii());
+
+        // Spaces and non-ASCII never reach the card, so the npub stays the
+        // last space-separated word.
+        let line = identity_card_line("Dad's phone é", &pubkey);
+        assert_eq!(line, format!("Dad's_pho {short}"));
+        assert_eq!(identity_card_line("", &pubkey), format!("identity {short}"));
+    }
 
     #[test]
     fn test_encode_npub_structure() {

@@ -1744,6 +1744,33 @@ bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.
     bottom row. On a narrow panel it reads `A/B move  holdA back` and the
     pick gesture appears in the subtitle instead.
 
+## 23. A pairing acts only as the identities it was approved for (added 2026-09-17, NOT YET BENCH-RUN)
+
+Decision logic is host-tested in `common/src/policy.rs` (identity gate) and
+`common/src/encoding.rs` (card line). Needs a board with at least one persona
+and an app paired to the master on a legacy slot that already signs silently.
+
+1. **Upgrade prompts once.** After flashing, the app's first sign as the
+   master raises `HOLD TO SIGN` with the identity line (`<label> npub1xxxx..yyyy`)
+   under the kind. Hold it; the next sign is silent again.
+2. **Another identity prompts.** From the same app send `sign_event` with a
+   top-level `heartwood` context for `nostr:persona:natural-person`: the card
+   names that persona. Tap to deny; the app gets `user denied` and a retry
+   prompts again. Hold on the retry; a further sign as it is silent.
+3. **Relay addressing is scoped too.** Address a request by `#p` to a persona's
+   own pubkey from the master-paired app: same card, same one-time approval.
+4. **Crypto and contextual pubkey.** `nip44_decrypt` with a context for an
+   unapproved persona raises `SIGN AS <master>? / nip44_decrypt / <label> npub1..`;
+   `get_public_key` with no context stays silent, with a context it prompts.
+5. **heartwood_switch.** Switch to an unapproved persona (one hold), then sign:
+   a second, one-time hold naming the persona.
+6. **Strict bound slot.** On a D2 persona-addressed pairing, a request
+   addressed to the master's pubkey answers `unauthorised` with no card.
+7. **Timeout leaves nothing behind.** Let an identity card expire: the slot's
+   `approved_identities` (USB slot list) is unchanged and a retry prompts.
+8. **USB unchanged.** Direct USB requests (no client pubkey) with a context behave exactly as
+   before (their own prompt, nothing recorded).
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

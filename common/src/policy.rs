@@ -21,6 +21,12 @@ pub const MAX_CONNECT_SLOTS: u8 = 16;
 /// buffer in the firmware's `load_from_nvs`.
 pub const MAX_AUTHORIZED_PUBKEYS: usize = 8;
 
+/// Maximum identities a single slot may be approved to act as. Sized to the
+/// largest persona registry any board carries (64, T-Display) plus the master,
+/// so an app that switches between every persona on one pairing never meets
+/// the cap. Reaching it refuses the new identity; nothing is ever evicted.
+pub const MAX_APPROVED_IDENTITIES: usize = 65;
+
 /// A named connection slot for a specific master.
 ///
 /// Each slot has its own bunker URI secret. The slot -- not the ephemeral
@@ -93,6 +99,15 @@ pub struct ConnectSlot {
     /// the owning master with `audit_child_wrap` and `bound_identity == X`.
     #[serde(default)]
     pub bound_identity: Option<String>,
+    /// Identities (64-char lowercase hex pubkeys) the owner has physically
+    /// approved this pairing to sign, encrypt or decrypt as. A remote client
+    /// acting as any other identity is raised to a physical prompt (legacy)
+    /// or refused (strict, bound). Old NVS blobs without the field deserialise
+    /// to an empty list, which is seeded lazily: `bound_identity` counts as
+    /// approved, and anything else prompts once. Capped at
+    /// [`MAX_APPROVED_IDENTITIES`].
+    #[serde(default)]
+    pub approved_identities: Vec<String>,
 }
 
 /// A client's approval policy for a specific master.
@@ -294,6 +309,111 @@ pub fn grant_slot_signing(slot: &mut ConnectSlot) {
         .any(|method| method == "sign_event")
     {
         slot.allowed_methods.insert(0, "sign_event".to_string());
+    }
+}
+
+/// Whether a request acts AS an identity with that identity's key, and so
+/// must be scoped to the identities the slot was approved for.
+///
+/// `sign_event` (both encodings) and the four NIP-04/NIP-44 methods always
+/// do. `get_public_key` does only when it carries a Heartwood context (caller
+/// supplied or a session's active identity): without one it is protocol
+/// plumbing that names the identity the client already addressed.
+pub fn method_uses_identity_key(method: &str, has_context: bool) -> bool {
+    match method {
+        "sign_event" | "sign_event_compact" | "nip44_encrypt" | "nip44_decrypt"
+        | "nip04_encrypt" | "nip04_decrypt" => true,
+        "get_public_key" => has_context,
+        _ => false,
+    }
+}
+
+/// Whether the per-identity gate applies to a request. Only a remote client
+/// (`has_client`: a relay author, an encrypted USB frame's client key or a
+/// bridge-injected client) is scoped; the direct USB path keeps its
+/// physical-possession semantics. `has_context` is true for a caller-supplied
+/// Heartwood context and for a session's active identity alike.
+pub fn remote_request_identity_scoped(has_client: bool, method: &str, has_context: bool) -> bool {
+    has_client && method_uses_identity_key(method, has_context)
+}
+
+/// Outcome of scoping a slot-bound request to the identity it will act as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityGate {
+    /// The slot may act as this identity under its ordinary policy.
+    Approved,
+    /// Not yet approved: the request needs a physical approval, which also
+    /// records the identity on the slot.
+    NeedsApproval,
+    /// A strict slot bound to a different identity. Refuse.
+    Mismatch,
+    /// Not approved and the slot's approved list is full. Refuse; nothing is
+    /// evicted to make room.
+    Full,
+}
+
+/// Scope a slot-bound request to `identity` (64-char lowercase hex pubkey of
+/// the key the request will actually use; every writer of `bound_identity` and
+/// `approved_identities` stores lowercase).
+///
+/// A recorded `bound_identity` is always approved. On a strict slot it is also
+/// the only identity allowed. Otherwise the identity must be in
+/// `approved_identities`, and an empty list (every slot written before this
+/// field existed) approves nothing but the binding, so the first request after
+/// upgrade prompts once for whatever identity it uses.
+pub fn evaluate_identity_gate(slot: &ConnectSlot, identity: &str) -> IdentityGate {
+    if let Some(bound) = slot.bound_identity.as_deref() {
+        if bound == identity {
+            return IdentityGate::Approved;
+        }
+        if slot.strict_permissions {
+            return IdentityGate::Mismatch;
+        }
+    }
+    if slot
+        .approved_identities
+        .iter()
+        .any(|approved| approved == identity)
+    {
+        return IdentityGate::Approved;
+    }
+    if slot.approved_identities.len() >= MAX_APPROVED_IDENTITIES {
+        return IdentityGate::Full;
+    }
+    IdentityGate::NeedsApproval
+}
+
+/// Fold the identity gate into a policy tier. A mismatch or a full list is a
+/// denial; an unapproved identity raises any non-denied tier to a physical
+/// prompt, whatever `auto_approve` or `allowed_kinds` say.
+pub fn apply_identity_gate(tier: ApprovalTier, gate: IdentityGate) -> ApprovalTier {
+    match gate {
+        IdentityGate::Approved => tier,
+        IdentityGate::Mismatch | IdentityGate::Full => ApprovalTier::Denied,
+        IdentityGate::NeedsApproval => match tier {
+            ApprovalTier::Denied => ApprovalTier::Denied,
+            _ => ApprovalTier::ButtonRequired,
+        },
+    }
+}
+
+/// Record a physically approved identity on a slot. Returns `Ok(true)` when
+/// the list changed, `Ok(false)` when the identity was already approved
+/// (listed or bound). Refuses a malformed pubkey, and refuses rather than
+/// evicts when the list is full.
+pub fn approve_slot_identity(slot: &mut ConnectSlot, identity: &str) -> Result<bool, &'static str> {
+    if identity.len() != 64 || !identity.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("identity must be a 64-char hex pubkey");
+    }
+    let identity = identity.to_ascii_lowercase();
+    match evaluate_identity_gate(slot, &identity) {
+        IdentityGate::Approved => Ok(false),
+        IdentityGate::Mismatch => Err("identity is outside this slot's binding"),
+        IdentityGate::Full => Err("this app has too many approved identities"),
+        IdentityGate::NeedsApproval => {
+            slot.approved_identities.push(identity);
+            Ok(true)
+        }
     }
 }
 
@@ -936,7 +1056,226 @@ mod tests {
             audit_child_wrap: false,
             guardian_notice_wrap: false,
             bound_identity: None,
+            approved_identities: vec![],
         }
+    }
+
+    // --- Per-identity scoping ---
+
+    const IDENTITY_A: &str = "aa00000000000000000000000000000000000000000000000000000000000001"; // pragma: allow-secret (fixed test vector)
+    const IDENTITY_B: &str = "bb00000000000000000000000000000000000000000000000000000000000002"; // pragma: allow-secret (fixed test vector)
+    const IDENTITY_C: &str = "cc00000000000000000000000000000000000000000000000000000000000003"; // pragma: allow-secret (fixed test vector)
+
+    /// A legacy slot that has signed before and auto-approves everything.
+    fn trusted_legacy_slot() -> ConnectSlot {
+        let mut slot = sample_slot(0, "legacy app");
+        grant_slot_signing(&mut slot);
+        slot
+    }
+
+    /// The tier firmware reaches for a policy-controlled method acting as
+    /// `identity`: the slot policy, then the identity gate on top.
+    fn scoped_tier(slot: &ConnectSlot, method: &str, kind: Option<u64>, identity: &str) -> ApprovalTier {
+        apply_identity_gate(
+            evaluate_slot_policy(slot, method, kind),
+            evaluate_identity_gate(slot, identity),
+        )
+    }
+
+    #[test]
+    fn identity_scoped_methods_are_signing_crypto_and_contextual_pubkey() {
+        for method in [
+            "sign_event",
+            "sign_event_compact",
+            "nip44_encrypt",
+            "nip44_decrypt",
+            "nip04_encrypt",
+            "nip04_decrypt",
+        ] {
+            assert!(method_uses_identity_key(method, false), "{method}");
+            assert!(method_uses_identity_key(method, true), "{method}");
+        }
+        // get_public_key without a context is handshake plumbing.
+        assert!(!method_uses_identity_key("get_public_key", false));
+        assert!(method_uses_identity_key("get_public_key", true));
+        for method in ["connect", "ping", "heartwood_switch", "heartwood_list_identities"] {
+            assert!(!method_uses_identity_key(method, true), "{method}");
+        }
+    }
+
+    #[test]
+    fn direct_usb_is_never_identity_scoped() {
+        for method in ["sign_event", "nip44_decrypt", "nip04_decrypt", "get_public_key"] {
+            assert!(!remote_request_identity_scoped(false, method, true), "{method}");
+            assert!(!remote_request_identity_scoped(false, method, false), "{method}");
+        }
+        assert!(remote_request_identity_scoped(true, "sign_event", false));
+        assert!(!remote_request_identity_scoped(true, "get_public_key", false));
+    }
+
+    #[test]
+    fn switched_active_identity_is_scoped_like_an_explicit_context() {
+        // heartwood_switch leaves a session active identity that dispatch
+        // resolves into the request's context. The child it names is the
+        // effective identity, and an approved master does not cover it.
+        let mut slot = trusted_legacy_slot();
+        slot.approved_identities = vec![IDENTITY_A.into()];
+        let switched_child = IDENTITY_B;
+        for method in ["sign_event", "nip44_decrypt", "nip04_encrypt", "get_public_key"] {
+            assert!(remote_request_identity_scoped(true, method, true), "{method}");
+        }
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), switched_child), ApprovalTier::ButtonRequired);
+        assert_eq!(
+            apply_identity_gate(ApprovalTier::AutoApprove, evaluate_identity_gate(&slot, switched_child)),
+            ApprovalTier::ButtonRequired,
+        );
+    }
+
+    #[test]
+    fn legacy_auto_slot_is_silent_only_for_its_approved_identity() {
+        let mut slot = trusted_legacy_slot();
+        slot.approved_identities = vec![IDENTITY_A.into()];
+
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_A), ApprovalTier::AutoApprove);
+        // An explicit context to another identity (e.g. natural-person) must
+        // not ride the slot's auto_approve or its empty kind list.
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_B), ApprovalTier::ButtonRequired);
+        for method in ["nip44_decrypt", "nip04_decrypt", "nip44_encrypt", "nip04_encrypt"] {
+            assert_eq!(scoped_tier(&slot, method, None, IDENTITY_A), ApprovalTier::AutoApprove, "{method}");
+            assert_eq!(scoped_tier(&slot, method, None, IDENTITY_B), ApprovalTier::ButtonRequired, "{method}");
+        }
+        // get_public_key is auto in firmware before the slot is consulted;
+        // with a context the gate still raises it.
+        assert_eq!(
+            apply_identity_gate(ApprovalTier::AutoApprove, evaluate_identity_gate(&slot, IDENTITY_B)),
+            ApprovalTier::ButtonRequired,
+        );
+    }
+
+    #[test]
+    fn approving_an_identity_adds_it_without_widening_anything_else() {
+        let mut slot = trusted_legacy_slot();
+        slot.approved_identities = vec![IDENTITY_A.into()];
+
+        assert_eq!(approve_slot_identity(&mut slot, IDENTITY_B), Ok(true));
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_B), ApprovalTier::AutoApprove);
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_A), ApprovalTier::AutoApprove);
+        assert_eq!(scoped_tier(&slot, "nip44_decrypt", None, IDENTITY_C), ApprovalTier::ButtonRequired);
+        // Idempotent.
+        assert_eq!(approve_slot_identity(&mut slot, IDENTITY_B), Ok(false));
+        assert_eq!(slot.approved_identities.len(), 2);
+    }
+
+    #[test]
+    fn identity_gate_never_lifts_a_policy_prompt_or_denial() {
+        let mut slot = trusted_legacy_slot();
+        slot.approved_identities = vec![IDENTITY_A.into()];
+        slot.allowed_kinds = vec![1];
+        // Approved identity, kind outside the legacy ceiling: still a prompt.
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(4), IDENTITY_A), ApprovalTier::ButtonRequired);
+        assert_eq!(
+            apply_identity_gate(ApprovalTier::Denied, IdentityGate::NeedsApproval),
+            ApprovalTier::Denied,
+        );
+        assert_eq!(
+            apply_identity_gate(ApprovalTier::Denied, IdentityGate::Approved),
+            ApprovalTier::Denied,
+        );
+    }
+
+    #[test]
+    fn empty_list_seeds_from_the_binding_and_nothing_else() {
+        let mut slot = trusted_legacy_slot();
+        slot.bound_identity = Some(IDENTITY_A.into());
+        assert_eq!(evaluate_identity_gate(&slot, IDENTITY_A), IdentityGate::Approved);
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_A), ApprovalTier::AutoApprove);
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_B), ApprovalTier::ButtonRequired);
+
+        // Approving another identity must not un-approve the binding.
+        assert_eq!(approve_slot_identity(&mut slot, IDENTITY_B), Ok(true));
+        assert_eq!(evaluate_identity_gate(&slot, IDENTITY_A), IdentityGate::Approved);
+        // The binding is never copied into the list.
+        assert_eq!(slot.approved_identities, vec![IDENTITY_B.to_string()]);
+    }
+
+    #[test]
+    fn empty_list_without_binding_prompts_for_the_first_identity() {
+        let slot = trusted_legacy_slot();
+        assert!(slot.approved_identities.is_empty());
+        for identity in [IDENTITY_A, IDENTITY_B] {
+            assert_eq!(evaluate_identity_gate(&slot, identity), IdentityGate::NeedsApproval);
+            assert_eq!(scoped_tier(&slot, "sign_event", Some(1), identity), ApprovalTier::ButtonRequired);
+        }
+    }
+
+    #[test]
+    fn full_identity_list_refuses_rather_than_evicts() {
+        let mut slot = trusted_legacy_slot();
+        for i in 0..MAX_APPROVED_IDENTITIES {
+            assert_eq!(approve_slot_identity(&mut slot, &format!("{i:064x}")), Ok(true));
+        }
+        let first = format!("{:064x}", 0);
+        let newcomer = format!("{:064x}", MAX_APPROVED_IDENTITIES);
+        assert_eq!(evaluate_identity_gate(&slot, &newcomer), IdentityGate::Full);
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), &newcomer), ApprovalTier::Denied);
+        assert!(approve_slot_identity(&mut slot, &newcomer).is_err());
+        assert_eq!(slot.approved_identities.len(), MAX_APPROVED_IDENTITIES);
+        // Everything already approved keeps working.
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), &first), ApprovalTier::AutoApprove);
+    }
+
+    #[test]
+    fn approval_refuses_malformed_identities() {
+        let mut slot = trusted_legacy_slot();
+        assert!(approve_slot_identity(&mut slot, "abc").is_err());
+        assert!(approve_slot_identity(&mut slot, &"zz".repeat(32)).is_err());
+        assert!(slot.approved_identities.is_empty());
+        // Stored lowercase so later comparisons and the persisted blob agree.
+        assert_eq!(approve_slot_identity(&mut slot, &IDENTITY_B.to_ascii_uppercase()), Ok(true));
+        assert_eq!(slot.approved_identities, vec![IDENTITY_B.to_string()]);
+    }
+
+    #[test]
+    fn strict_bound_slot_refuses_every_other_identity() {
+        let mut slot = sample_slot(0, "persona app");
+        slot.strict_permissions = true;
+        slot.allowed_methods = vec!["sign_event".into(), "nip44_decrypt".into()];
+        slot.signing_approved = true;
+        slot.bound_identity = Some(IDENTITY_A.into());
+
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_A), ApprovalTier::AutoApprove);
+        assert_eq!(evaluate_identity_gate(&slot, IDENTITY_B), IdentityGate::Mismatch);
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_B), ApprovalTier::Denied);
+        assert_eq!(scoped_tier(&slot, "nip44_decrypt", None, IDENTITY_B), ApprovalTier::Denied);
+        // A stale approved list cannot widen a strict binding either.
+        slot.approved_identities = vec![IDENTITY_B.into()];
+        assert_eq!(evaluate_identity_gate(&slot, IDENTITY_B), IdentityGate::Mismatch);
+        assert!(approve_slot_identity(&mut slot, IDENTITY_C).is_err());
+    }
+
+    #[test]
+    fn strict_unbound_slot_uses_the_approved_list() {
+        let mut slot = sample_slot(0, "master app");
+        slot.strict_permissions = true;
+        slot.allowed_methods = vec!["sign_event".into()];
+        slot.signing_approved = true;
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_A), ApprovalTier::ButtonRequired);
+        assert_eq!(approve_slot_identity(&mut slot, IDENTITY_A), Ok(true));
+        assert_eq!(scoped_tier(&slot, "sign_event", Some(1), IDENTITY_A), ApprovalTier::AutoApprove);
+    }
+
+    #[test]
+    fn old_slot_blob_deserialises_with_no_approved_identities() {
+        let json = r#"[{"slot_index":0,"label":"old","secret":"aa","current_pubkey":"bb",
+            "allowed_methods":["sign_event"],"auto_approve":true,"signing_approved":true,
+            "authorized_pubkeys":["bb"],"bound_identity":null}]"#;
+        let slots: Vec<ConnectSlot> = serde_json::from_str(json).unwrap();
+        assert!(slots[0].approved_identities.is_empty());
+
+        let mut slot = slots[0].clone();
+        assert_eq!(approve_slot_identity(&mut slot, IDENTITY_A), Ok(true));
+        let round: ConnectSlot = serde_json::from_str(&serde_json::to_string(&slot).unwrap()).unwrap();
+        assert_eq!(round.approved_identities, vec![IDENTITY_A.to_string()]);
     }
 
     #[test]

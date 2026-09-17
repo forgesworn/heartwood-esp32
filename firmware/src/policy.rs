@@ -13,7 +13,7 @@ use heartwood_common::policy::{
     find_slot_by_pubkey_mut, find_slot_by_secret, gate_request, grant_slot_method,
     grant_slot_signing, next_slot_index, record_approved_identity, remove_ambiguous_pubkeys,
     remove_authorized_pubkey, set_slot_bound_identity, strict_slot_denies_method,
-    verdict_covers_identity, verdict_withdrawn,
+    verdict_covers_identity, verdict_withdrawn, IdentityRef,
     validate_exact_slot_policy, ApprovalTier, ConnectSlot, ExactSlotPolicy, Gate, GateRequest,
     RemoveAuthorizedPubkey, CONNECT_SAFE_METHODS,
 };
@@ -715,7 +715,7 @@ impl PolicyEngine {
         master_slot: u8,
         slot_index: u8,
         identity: &str,
-    ) -> Option<Result<([u8; 32], bool), &'static str>> {
+    ) -> Option<Result<(IdentityRef, bool), &'static str>> {
         let slot = self
             .slots_mut(master_slot)
             .iter_mut()
@@ -747,7 +747,7 @@ impl PolicyEngine {
         &mut self,
         master_slot: u8,
         slot_index: u8,
-        revoked: Option<&[u8; 32]>,
+        revoked: Option<&IdentityRef>,
     ) -> usize {
         let Some(slot) = self
             .master_slots

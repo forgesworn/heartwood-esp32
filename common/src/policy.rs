@@ -464,6 +464,65 @@ fn is_bound_identity(slot: &ConnectSlot, pubkey: &[u8; 32]) -> bool {
         .is_some_and(|bound| bound.eq_ignore_ascii_case(&crate::hex::hex_encode(pubkey)))
 }
 
+/// An identity named for revocation: a whole pubkey, or the 16-hex tag
+/// `list_clients` shows for an approval whose pubkey the caller cannot name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityRef {
+    Pubkey([u8; 32]),
+    /// Lowercase hex, as [`identity_tag`] writes it.
+    Tag([u8; IDENTITY_TAG_BYTES * 2]),
+}
+
+impl IdentityRef {
+    /// The stored tag this identity is approved under.
+    pub fn tag(&self) -> [u8; IDENTITY_TAG_BYTES * 2] {
+        match self {
+            IdentityRef::Pubkey(pubkey) => identity_tag(pubkey),
+            IdentityRef::Tag(tag) => *tag,
+        }
+    }
+
+    /// Whether `pubkey` is this identity: the whole key, or any key with this
+    /// tag.
+    pub fn matches(&self, pubkey: &[u8; 32]) -> bool {
+        match self {
+            IdentityRef::Pubkey(own) => own == pubkey,
+            IdentityRef::Tag(tag) => identity_tag(pubkey) == *tag,
+        }
+    }
+}
+
+/// Parse an identity named for revocation: a 64-hex pubkey or an npub (as
+/// [`parse_identity_pubkey`]), or a 16-hex identity tag in either case.
+pub fn parse_identity_ref(input: &str) -> Result<IdentityRef, &'static str> {
+    const INVALID: &str = "invalid_identity: expected a 64-hex pubkey, an npub or a 16-hex identity tag";
+    let tag_chars = IDENTITY_TAG_BYTES * 2;
+    if input.len() == tag_chars && input.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut tag = [0u8; IDENTITY_TAG_BYTES * 2];
+        for (out, byte) in tag.iter_mut().zip(input.bytes()) {
+            *out = byte.to_ascii_lowercase();
+        }
+        return Ok(IdentityRef::Tag(tag));
+    }
+    parse_identity_pubkey(input).map(IdentityRef::Pubkey).map_err(|_| INVALID)
+}
+
+/// Whether `identity` names the slot's binding: the whole key for a pubkey,
+/// the binding's tag for a tag. Case-insensitive, so a binding written in any
+/// case is never mistaken for a revocable approval.
+fn names_bound_identity(slot: &ConnectSlot, identity: &IdentityRef) -> bool {
+    let Some(bound) = slot.bound_identity.as_deref() else {
+        return false;
+    };
+    match identity {
+        IdentityRef::Pubkey(pubkey) => is_bound_identity(slot, pubkey),
+        IdentityRef::Tag(tag) => bound
+            .as_bytes()
+            .get(..IDENTITY_TAG_BYTES * 2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag)),
+    }
+}
+
 /// What revoking one approved identity did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokeIdentity {
@@ -481,10 +540,16 @@ pub enum RevokeIdentity {
 /// identity meets the identity gate's card again. Every copy of its tag goes,
 /// and only whole tags are compared.
 pub fn revoke_approved_identity(slot: &mut ConnectSlot, pubkey: &[u8; 32]) -> RevokeIdentity {
-    if is_bound_identity(slot, pubkey) {
+    revoke_approved_identity_ref(slot, &IdentityRef::Pubkey(*pubkey))
+}
+
+/// [`revoke_approved_identity`] for a pubkey or a tag. A tag that matches the
+/// binding's tag is refused like the binding itself.
+pub fn revoke_approved_identity_ref(slot: &mut ConnectSlot, identity: &IdentityRef) -> RevokeIdentity {
+    if names_bound_identity(slot, identity) {
         return RevokeIdentity::Bound;
     }
-    let tag = identity_tag(pubkey);
+    let tag = identity.tag();
     let kept: Vec<u8> = slot
         .approved_identities
         .as_bytes()
@@ -519,21 +584,22 @@ pub fn clear_approved_identities(slot: &mut ConnectSlot) -> bool {
 
 /// Whether a live approve-once verdict falls with an identity approval
 /// withdrawn from `slot`: it was given to one of the slot's client keys for an
-/// identity-scoped request, and for `revoked` exactly, or (`None`, clearing
+/// identity-scoped request, and for `revoked` (the whole key, or any key with
+/// the tag), or (`None`, clearing
 /// the list) for any identity but the slot's binding, which stays approved.
 /// A verdict for a request that uses no identity key is untouched.
 pub fn verdict_withdrawn(
     slot: &ConnectSlot,
     client_pubkey: &str,
     granted: Option<&[u8; 32]>,
-    revoked: Option<&[u8; 32]>,
+    revoked: Option<&IdentityRef>,
 ) -> bool {
     let Some(granted) = granted else {
         return false;
     };
     slot_authorizes(slot, client_pubkey)
         && match revoked {
-            Some(revoked) => granted == revoked,
+            Some(revoked) => revoked.matches(granted),
             None => !is_bound_identity(slot, granted),
         }
 }
@@ -2000,6 +2066,69 @@ mod tests {
     }
 
     #[test]
+    fn a_tag_names_an_identity_for_revocation() {
+        let tag = |pubkey: &[u8; 32]| core::str::from_utf8(&identity_tag(pubkey)).unwrap().to_string();
+        let mut slot = populated_slot();
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        assert!(record_approved_identity(&mut slot, &IDENTITY_B));
+
+        // Exactly as list_clients shows it, or in upper case.
+        assert_eq!(parse_identity_ref(&tag(&IDENTITY_A)), Ok(IdentityRef::Tag(identity_tag(&IDENTITY_A))));
+        assert_eq!(parse_identity_ref(&tag(&IDENTITY_A).to_uppercase()), Ok(IdentityRef::Tag(identity_tag(&IDENTITY_A))));
+        // Pubkeys still parse as pubkeys.
+        assert_eq!(parse_identity_ref(&full_hex(&IDENTITY_A)), Ok(IdentityRef::Pubkey(IDENTITY_A)));
+        assert_eq!(
+            parse_identity_ref(&crate::encoding::encode_npub(&IDENTITY_A)),
+            Ok(IdentityRef::Pubkey(IDENTITY_A)),
+        );
+
+        let by_tag = parse_identity_ref(&tag(&IDENTITY_A).to_uppercase()).unwrap();
+        assert_eq!(revoke_approved_identity_ref(&mut slot, &by_tag), RevokeIdentity::Removed);
+        assert!(!identity_approved(&slot, &IDENTITY_A));
+        assert!(identity_approved(&slot, &IDENTITY_B));
+        assert_eq!(revoke_approved_identity_ref(&mut slot, &by_tag), RevokeIdentity::Absent);
+
+        // A tag verdict match covers every key with that tag, and no other.
+        let client = "11".repeat(32);
+        assert!(verdict_withdrawn(&slot, &client, Some(&IDENTITY_A), Some(&by_tag)));
+        assert!(!verdict_withdrawn(&slot, &client, Some(&IDENTITY_B), Some(&by_tag)));
+        let mut same_tag = IDENTITY_A;
+        same_tag[31] = 0x01;
+        assert!(verdict_withdrawn(&slot, &client, Some(&same_tag), Some(&by_tag)));
+        assert!(!verdict_withdrawn(&slot, &client, Some(&same_tag), Some(&IdentityRef::Pubkey(IDENTITY_A))));
+
+        // The binding's tag is refused like the binding, in either case, even
+        // when that tag is also listed, and nothing changes.
+        slot.approved_identities.push_str(&tag(&IDENTITY_C));
+        let before = serde_json::to_value(&slot).unwrap();
+        for input in [tag(&IDENTITY_C), tag(&IDENTITY_C).to_uppercase()] {
+            let identity = parse_identity_ref(&input).unwrap();
+            assert_eq!(revoke_approved_identity_ref(&mut slot, &identity), RevokeIdentity::Bound);
+        }
+        slot.bound_identity = Some(full_hex(&IDENTITY_C).to_uppercase());
+        assert_eq!(
+            revoke_approved_identity_ref(&mut slot, &IdentityRef::Tag(identity_tag(&IDENTITY_C))),
+            RevokeIdentity::Bound,
+        );
+        slot.bound_identity = Some(full_hex(&IDENTITY_C));
+        assert_eq!(serde_json::to_value(&slot).unwrap(), before);
+
+        // Malformed: every length but 16, 64 and a valid npub, and non-hex.
+        let hex = full_hex(&IDENTITY_A);
+        for len in [0, 1, 8, 15, 17, 32, 63, 65] {
+            let input: String = hex.chars().cycle().take(len).collect();
+            assert!(parse_identity_ref(&input).is_err(), "length {len}");
+        }
+        for bad in ["aaaaaaaaaaaaaaag", " aaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaa ", "0xaaaaaaaaaaaaaa"] {
+            assert_eq!(
+                parse_identity_ref(bad),
+                Err("invalid_identity: expected a 64-hex pubkey, an npub or a 16-hex identity tag"),
+                "{bad:?}",
+            );
+        }
+    }
+
+    #[test]
     fn identity_input_is_hex_or_npub_and_nothing_else() {
         let hex = full_hex(&IDENTITY_A);
         let npub = crate::encoding::encode_npub(&IDENTITY_A);
@@ -2064,18 +2193,18 @@ mod tests {
         // A live verdict for A lets A through; once withdrawn, the card is back.
         assert_eq!(revoke_approved_identity(&mut slot, &IDENTITY_A), RevokeIdentity::Removed);
         assert_eq!(gate_for(&slot, "sign_event", ApprovalTier::AutoApprove, &IDENTITY_A, true), Gate::Allow);
-        assert!(verdict_withdrawn(&slot, &client, Some(&IDENTITY_A), Some(&IDENTITY_A)));
+        assert!(verdict_withdrawn(&slot, &client, Some(&IDENTITY_A), Some(&IdentityRef::Pubkey(IDENTITY_A))));
         assert_eq!(
             gate_for(&slot, "sign_event", ApprovalTier::AutoApprove, &IDENTITY_A, false),
             Gate::Card(CardKind::AllowAs { record: true }),
         );
         // Every client key of the slot, and no other slot's client.
-        assert!(verdict_withdrawn(&slot, &earlier_client, Some(&IDENTITY_A), Some(&IDENTITY_A)));
-        assert!(!verdict_withdrawn(&slot, &stranger, Some(&IDENTITY_A), Some(&IDENTITY_A)));
+        assert!(verdict_withdrawn(&slot, &earlier_client, Some(&IDENTITY_A), Some(&IdentityRef::Pubkey(IDENTITY_A))));
+        assert!(!verdict_withdrawn(&slot, &stranger, Some(&IDENTITY_A), Some(&IdentityRef::Pubkey(IDENTITY_A))));
         // A verdict for another identity, or for a request with no identity
         // key, survives a single revocation.
-        assert!(!verdict_withdrawn(&slot, &client, Some(&IDENTITY_B), Some(&IDENTITY_A)));
-        assert!(!verdict_withdrawn(&slot, &client, None, Some(&IDENTITY_A)));
+        assert!(!verdict_withdrawn(&slot, &client, Some(&IDENTITY_B), Some(&IdentityRef::Pubkey(IDENTITY_A))));
+        assert!(!verdict_withdrawn(&slot, &client, None, Some(&IdentityRef::Pubkey(IDENTITY_A))));
         // Clearing withdraws every identity verdict except the binding's.
         assert!(verdict_withdrawn(&slot, &client, Some(&IDENTITY_A), None));
         assert!(verdict_withdrawn(&slot, &client, Some(&IDENTITY_B), None));

@@ -7590,8 +7590,9 @@ fn dispatch_mgmt(
             }
         }
 
-        // Withdraw one identity approval (`params.identity`, a 64-hex pubkey
-        // or an npub) from a slot, or every one of them, leaving the pairing,
+        // Withdraw one identity approval (`params.identity`, a 64-hex pubkey,
+        // an npub, or the 16-hex tag `list_clients` shows) from a slot, or
+        // every one of them, leaving the pairing,
         // its methods, kinds, binding and client keys alone. Same authority as
         // `update_client` and `remove_authorized_pubkey`: an authorised
         // operator, the mutation challenge and the slot's credential
@@ -7627,11 +7628,11 @@ fn dispatch_mgmt(
             let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             let (revoked, changed) = match identity {
                 Some(identity) => {
-                    let (pubkey, changed) = ctx
+                    let (revoked, changed) = ctx
                         .policy_engine
                         .revoke_identity(master_slot, slot_index, identity)
                         .ok_or_else(|| format!("no such slot: {slot_index}"))??;
-                    (Some(pubkey), changed)
+                    (Some(revoked), changed)
                 }
                 None => (
                     None,

@@ -140,21 +140,23 @@ pub const BOUND_IDENTITY_ERROR: &str =
     "bound_identity: identity is the slot's binding; change the binding instead";
 
 /// `revoke_client_identity`: withdraw one identity's approval from a slot.
-/// `identity` is a 64-hex pubkey or an npub; its tag is derived here. Returns
-/// the parsed pubkey (so the caller can drop verdicts for it) and whether the
+/// `identity` is a 64-hex pubkey or an npub (its tag is derived here), or the
+/// 16-hex tag `client_summary` lists, in either case. Returns the parsed
+/// identity (so the caller can drop verdicts for it) and whether the
 /// approved list changed. Revoking an identity that is not approved is a
 /// successful no-op; revoking the slot's binding is refused and changes
-/// nothing. The pairing, methods, kinds, binding and client keys are untouched.
+/// nothing, whether it is named by pubkey or by the binding's tag. The pairing,
+/// methods, kinds, binding and client keys are untouched.
 #[cfg(feature = "nip46")]
 pub fn revoke_client_identity(
     slot: &mut ConnectSlot,
     identity: &str,
-) -> Result<([u8; 32], bool), &'static str> {
-    use crate::policy::{parse_identity_pubkey, revoke_approved_identity, RevokeIdentity};
-    let pubkey = parse_identity_pubkey(identity)?;
-    match revoke_approved_identity(slot, &pubkey) {
-        RevokeIdentity::Removed => Ok((pubkey, true)),
-        RevokeIdentity::Absent => Ok((pubkey, false)),
+) -> Result<(crate::policy::IdentityRef, bool), &'static str> {
+    use crate::policy::{parse_identity_ref, revoke_approved_identity_ref, RevokeIdentity};
+    let identity = parse_identity_ref(identity)?;
+    match revoke_approved_identity_ref(slot, &identity) {
+        RevokeIdentity::Removed => Ok((identity, true)),
+        RevokeIdentity::Absent => Ok((identity, false)),
         RevokeIdentity::Bound => Err(BOUND_IDENTITY_ERROR),
     }
 }
@@ -716,7 +718,7 @@ mod tests {
     #[cfg(feature = "nip46")]
     #[test]
     fn revoke_client_identity_takes_hex_or_npub_and_shows_in_the_summary() {
-        use crate::policy::{identity_approved, record_approved_identity};
+        use crate::policy::{identity_approved, record_approved_identity, IdentityRef};
         let a = [0xaa; 32];
         let b = [0xbb; 32];
         let mut slot = identity_slot();
@@ -729,22 +731,31 @@ mod tests {
 
         // By npub: removed, and the summary follows.
         let npub = crate::encoding::encode_npub(&a);
-        assert_eq!(revoke_client_identity(&mut slot, &npub), Ok((a, true)));
+        assert_eq!(revoke_client_identity(&mut slot, &npub), Ok((IdentityRef::Pubkey(a), true)));
         assert!(!identity_approved(&slot, &a));
         assert_eq!(client_summary(&slot)["approved_identities"], serde_json::json!(["bbbbbbbbbbbbbbbb"]));
         // Again: a successful no-op.
-        assert_eq!(revoke_client_identity(&mut slot, &npub), Ok((a, false)));
+        assert_eq!(revoke_client_identity(&mut slot, &npub), Ok((IdentityRef::Pubkey(a), false)));
 
         // By hex, either case.
-        assert_eq!(revoke_client_identity(&mut slot, &"BB".repeat(32)), Ok((b, true)));
+        assert_eq!(revoke_client_identity(&mut slot, &"BB".repeat(32)), Ok((IdentityRef::Pubkey(b), true)));
         assert_eq!(client_summary(&slot)["approved_identities"], serde_json::json!([]));
 
         // The binding is refused, and so is anything that is not an identity.
         let before = client_summary(&slot);
         assert_eq!(revoke_client_identity(&mut slot, &"cc".repeat(32)), Err(BOUND_IDENTITY_ERROR));
-        for bad in ["", "npub1", "bbbbbbbbbbbbbbbb", "zz"] {
+        for bad in ["", "npub1", "bbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbbb", "zz"] {
             assert!(revoke_client_identity(&mut slot, bad).unwrap_err().starts_with("invalid_identity"), "{bad}");
         }
+        assert_eq!(client_summary(&slot), before);
+        // By the tag the summary lists, either case; the binding's tag is refused.
+        assert!(record_approved_identity(&mut slot, &b));
+        assert_eq!(
+            revoke_client_identity(&mut slot, "BBBBBBBBBBBBBBBB"),
+            Ok((IdentityRef::Tag(*b"bbbbbbbbbbbbbbbb"), true)),
+        );
+        assert_eq!(client_summary(&slot), before);
+        assert_eq!(revoke_client_identity(&mut slot, "cccccccccccccccc"), Err(BOUND_IDENTITY_ERROR));
         assert_eq!(client_summary(&slot), before);
         // Nothing else about the pairing moved.
         assert_eq!(before["bound_identity"], "cc".repeat(32));

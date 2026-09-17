@@ -1824,7 +1824,9 @@ master on a legacy slot that already signs silently.
     `mutation_challenge`, no button): the result has `changed: true` and
     `list_clients` no longer lists its tag; the master still signs silently and
     the persona's next sign reads `ALLOW AS` again. The same call again answers
-    `changed: false`. Revoking a strict slot's `bound_identity` answers
+    `changed: false`. An approval by its `list_clients` tag (16 hex, either
+    case) revokes the same way. Revoking a strict slot's `bound_identity`, by
+    pubkey or by its tag, answers
     `bound_identity: identity is the slot's binding; change the binding
     instead` and changes nothing. `clear_client_identities` empties the list,
     the binding still signs silently, and the slot's methods, kinds and client

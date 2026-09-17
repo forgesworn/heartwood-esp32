@@ -67,23 +67,7 @@ fn unbound_remote_request_denied(
 /// destructive ones are additionally pinned ButtonRequired whatever the
 /// slot's tier says (see the pin in dispatch_inner).
 fn is_note_method(method: &nip46::Nip46Method) -> bool {
-    matches!(
-        method,
-        nip46::Nip46Method::HeartwoodNoteList
-            | nip46::Nip46Method::HeartwoodNoteNew
-            | nip46::Nip46Method::HeartwoodNoteNewPair
-            | nip46::Nip46Method::HeartwoodNoteConfirm
-            | nip46::Nip46Method::HeartwoodNoteDiscard
-            | nip46::Nip46Method::HeartwoodNoteExport
-            | nip46::Nip46Method::HeartwoodNoteImport
-            | nip46::Nip46Method::HeartwoodNoteSpent
-            | nip46::Nip46Method::HeartwoodNoteSend
-            | nip46::Nip46Method::HeartwoodNoteRename
-            | nip46::Nip46Method::HeartwoodNoteTrust
-            | nip46::Nip46Method::HeartwoodNoteTrusted
-            | nip46::Nip46Method::HeartwoodNoteAddress
-            | nip46::Nip46Method::HeartwoodNoteClaim
-    )
+    method.is_note_method()
 }
 
 /// Whether an approved `heartwood_note_export` has left this client a live,
@@ -778,7 +762,12 @@ fn dispatch_inner(
     // goal doc's recorded decision — cheap to relax later, impossible to
     // un-leak). The pin runs the SAME pre-dispatch gate below, so Deferred
     // callers hold the card exactly like any other extension ask.
-    let tier = if method.always_requires_button() && is_note_method(&method) {
+    //
+    // The pin is about policy, not about who answers. An approval of THIS
+    // request satisfies it: the operator's hold, or, on an escalate slot,
+    // the guardian's verdict for the park this request was raised as, which
+    // arrives here as `ButtonApproved` from `relay::complete_parked` (#160).
+    let tier = if method.pinned_physical() {
         heartwood_common::policy::ApprovalTier::ButtonRequired
     } else {
         tier

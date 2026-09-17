@@ -102,6 +102,22 @@ needs a live socket. Denials, expiries and `busy` refusals are never held. The
 same hold catches a failed park completion; the guardian's `applied` value is
 unchanged. Nothing bench-run.
 
+A guardian verdict answers a note card too (#160, 2026-09-17, checklist section
+24): on an `escalate` slot the approved park completed through the INTERACTIVE
+handler, so a bearer-note method, pinned ButtonRequired whatever the slot
+policy says, put its 30 s card up on a board nobody was standing at, blocked
+the relay loop for the whole window and then refused. The verdict is an
+approval of that one request (the park id IS the request event's id), so the
+completion now dispatches `ButtonApproved` carrying what the notice showed, and
+the handler's existing `Resume` check refuses fast if the request has since
+changed identity or needs a different card. It widens nothing else: the
+transient allow on its own still cannot silence a pinned method, so a second
+note ask inside the verdict's window parks again rather than riding it, and a
+pinned method on an escalate slot now parks even where the slot policy lifted
+its tier instead of falling through to a card no one will press. Pure halves
+are `common::escalate::{route_request, park_completion}` and
+`nip46::Nip46Method::pinned_physical`, host-tested. Nothing bench-run.
+
 A second configured relay (#92, 2026-09-11, checklist section 16): besides
 the primary, the relay loop keeps one more configured relay live when the
 second session slot is free and the heap can spare it (SECONDARY_MIN_* in

@@ -1855,6 +1855,62 @@ master on a legacy slot that already signs silently.
     shows `verdicts_dropped: 1` and the next sign of that kind parks again
     instead of riding the verdict.
 
+## 24. A guardian verdict answers a note card too (#160; added 2026-09-17, NOT YET BENCH-RUN)
+
+Escalation exists so the family's guardian can answer when nobody is at the
+board. A bearer-note disclosure or destruction owes its own card whatever the
+slot policy says, and that card used to go up on the board even after the
+guardian had approved the park: the request completed through the interactive
+handler, sat on a 30 s `SEND NOTE` card nobody was there to press, blocked the
+relay loop for the whole window and then answered `timeout`. The verdict is now
+what answers that card, for the one request the notice named and nothing else.
+
+Needs an `escalate` legacy slot on a board holding at least one CONFIRMED note,
+the guardian channel of section 11 (`scripts/guardian.mjs` or the operator
+channel driver used there), and a note client (notecase, or
+`scripts/nip46-client.mjs`).
+
+1. **A parked note send completes with no press.** From the escalate slot, send
+   `heartwood_note_send`. The board shows no card; the guardian receives the
+   approval-needed notice naming the client, `heartwood_note_send` and the
+   identity. Answer `approve-once`. The note is wrapped and sent, the client
+   gets its reply, and **no card ever appears on the OLED**. The verdict
+   answers `applied: "completed"`, `park: "live"`.
+2. **The loop stayed live throughout.** While the park waits, and again while
+   the verdict is being applied, a second app on another slot signs a kind 1
+   and is answered normally. Before this fix the second app timed out for the
+   30 s the dead card held the loop.
+3. **The verdict covers that request only.** Immediately after item 1, inside
+   the verdict's window, send a second `heartwood_note_send` from the same
+   client for the same identity. It must NOT go silently: it parks again and
+   the guardian is notified again. (A non-pinned method, a `sign_event` of the
+   same kind, does ride the window, which is unchanged.)
+4. **An unapproved identity still needs its own approval.** With the identity
+   absent from the slot's `approved_identities`, repeat item 1. The notice's
+   `identity` tag names it, the verdict completes the send, and afterwards
+   `list_clients` shows `approved_identities` UNCHANGED: the verdict released
+   one request, it did not enrol the identity.
+5. **Denial and expiry.** Answer `deny`: the client gets `user denied`, no card,
+   nothing sent. Let another park expire unanswered (10 min) and then answer
+   `approve-once`: `applied: "window"`, nothing is sent, and the client's own
+   retry parks again rather than riding the late verdict.
+6. **Export and the destructive methods.** Repeat item 1 for
+   `heartwood_note_export` (the `ck1` reaches the client, no card) and for
+   `heartwood_note_spent` inside the export's grant window (still no second
+   card, section 17 unchanged). `heartwood_note_discard` and
+   `heartwood_note_rename` park and complete the same way.
+7. **A slot policy still cannot silence a note method.** On the same escalate
+   slot, add `heartwood_note_send` to `allowed_methods` with `auto_approve`.
+   The next send must still park for the guardian, never run silently, and
+   never fall through to a card on the board.
+8. **No regression off the escalate path.** On a normal legacy slot (no
+   `escalate`), `heartwood_note_send` still raises `SEND NOTE` on the board and
+   still needs the physical hold; section 13 and section 23 item 8 read exactly
+   as they did.
+9. **USB unchanged.** `node scripts/note-cmd.mjs --port ...
+   '{"cmd":"send", ...}'` still shows its card and waits for the hold. The
+   cable has no guardian and is not escalated.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

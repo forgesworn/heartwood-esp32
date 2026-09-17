@@ -235,6 +235,42 @@ impl Nip46Method {
         )
     }
 
+    /// The bearer-note locker's relay methods. All of them require a bound
+    /// slot, and the disclosure and destruction ones are additionally pinned
+    /// physical (see [`Self::pinned_physical`]).
+    pub fn is_note_method(&self) -> bool {
+        matches!(
+            self,
+            Self::HeartwoodNoteList
+                | Self::HeartwoodNoteNew
+                | Self::HeartwoodNoteNewPair
+                | Self::HeartwoodNoteConfirm
+                | Self::HeartwoodNoteDiscard
+                | Self::HeartwoodNoteExport
+                | Self::HeartwoodNoteImport
+                | Self::HeartwoodNoteSpent
+                | Self::HeartwoodNoteSend
+                | Self::HeartwoodNoteRename
+                | Self::HeartwoodNoteTrust
+                | Self::HeartwoodNoteTrusted
+                | Self::HeartwoodNoteAddress
+                | Self::HeartwoodNoteClaim
+        )
+    }
+
+    /// Whether this method's own card is pinned: no slot policy may silence
+    /// it, whatever the tier says. A leaked bearer note cannot be un-leaked,
+    /// so naming a disclosure or a destruction in a policy is deliberately not
+    /// consent to it.
+    ///
+    /// A pin is about policy, not about who answers. An approval of that exact
+    /// request still satisfies it, whether that is the operator's hold or a
+    /// guardian verdict for the park the request was escalated as (see
+    /// [`crate::escalate::park_completion`]).
+    pub fn pinned_physical(&self) -> bool {
+        self.always_requires_button() && self.is_note_method()
+    }
+
     /// Whether this method is always auto-approved (no policy check needed).
     ///
     /// Capabilities discovery sits here deliberately: like connect/ping it is

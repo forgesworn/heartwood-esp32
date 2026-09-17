@@ -3280,6 +3280,12 @@ struct ParkedRequest {
     /// (it may be a child the context derives, not `target_pk`). The notice
     /// names it and an approve verdict covers it and nothing else.
     identity: Option<[u8; 32]>,
+    /// Whether the CALLER sent the Heartwood context the request carries. A
+    /// park resolves a session's active identity into the request before it
+    /// waits, so the completion acts as the identity the notice named; this
+    /// keeps that from reading as caller-supplied on a strict slot, exactly as
+    /// a deferred card's `Resume` does.
+    explicit_context: bool,
     parked_at: Instant,
 }
 
@@ -3786,6 +3792,18 @@ fn service_parks(ctx: &mut SignCtx) {
 /// the signing identity, dispatch through the normal handler, publish the
 /// response with the original request's timestamp, and emit the C5 `approved`
 /// record. Returns true when the response was published.
+///
+/// The dispatch is `ButtonApproved`, never `Interactive` (#160). The verdict
+/// IS the physical approval of this one request: the guardian answered the
+/// notice for this park id, which is the request event's own id. So it also
+/// answers the method's OWN card, which a note disclosure or destruction
+/// always owes and no slot policy can silence. Previously that card went up
+/// on the board and blocked the relay loop for its whole 30 s window, on a
+/// tier whose entire purpose is that nobody is at the board. What the verdict
+/// does not name it still does not release: `park_completion` refuses to
+/// complete anything but the request the notice showed, and the handler's own
+/// `Resume` check refuses if the request now resolves to a different identity
+/// or needs a different card from the one parked.
 fn complete_parked(
     tls: &mut Tls,
     ctx: &mut SignCtx,
@@ -3796,6 +3814,17 @@ fn complete_parked(
     // other: if the request now resolves to a different identity, the
     // completion meets the identity gate like any other request.
     let key = heartwood_common::nip59::method_or_kind_key(&park.method, park.event_kind);
+    let completion = heartwood_common::escalate::park_completion(
+        &heartwood_common::escalate::ParkVerdict {
+            approved_client_hex: &park.client_hex,
+            park_client_hex: &park.client_hex,
+            approved_key: &key,
+            park_key: &key,
+            approved_identity: park.identity.as_ref(),
+            park_identity: park.identity.as_ref(),
+            held_secs: park.parked_at.elapsed().as_secs(),
+        },
+    );
     ctx.policy_engine.install_transient_allow(
         park.master_slot,
         park.client_hex.clone(),
@@ -3803,6 +3832,13 @@ fn complete_parked(
         park.identity,
         window_secs,
     );
+    if let heartwood_common::escalate::ParkCompletion::Window { reason } = completion {
+        // Nothing is dispatched and no card goes up: the client asks again
+        // and meets the gate afresh, with the window standing for the ask the
+        // guardian did approve. `applied` reports `window`, not `completed`.
+        log::info!("[relay] park not completed: {reason}");
+        return false;
+    }
 
     // Re-resolve the identity — the served set may have changed while parked.
     let Some((signing_secret, label, mode, slot, persona_purpose)) =
@@ -3827,9 +3863,19 @@ fn complete_parked(
     let held = park.parked_at.elapsed();
     let client_hex = park.client_hex;
     let client_pubkey = park.client_pubkey;
+    // What the guardian's notice showed, so the dispatch can prove the
+    // verdict still answers the request as it now stands: no gate card of its
+    // own (the transient allow above satisfies the identity gate for exactly
+    // the identity the notice named), and that identity only.
+    let resume = crate::nip46_handler::Resume {
+        explicit_context: park.explicit_context,
+        shown: heartwood_common::policy::ShownCard { card: None, identity: park.identity },
+    };
 
-    let mut response_json = crate::nip46_handler::handle_parsed_request(
+    let mut response_json = match crate::nip46_handler::dispatch(
         park.request,
+        None,
+        Some(resume),
         &signing_secret,
         &label,
         mode,
@@ -3842,7 +3888,17 @@ fn complete_parked(
         Some(&client_pubkey),
         ctx.nvs,
         ctx.personas,
-    );
+        crate::nip46_handler::ApprovalDecision::ButtonApproved,
+    ) {
+        crate::nip46_handler::Dispatch::Answered(json) => json,
+        // Unreachable: an approved dispatch never asks for a card, which is
+        // the whole point: the loop cannot be left holding one.
+        crate::nip46_handler::Dispatch::NeedsApproval(pending) => {
+            log::error!("[relay] park completion asked to defer an approval; refusing");
+            nip46::build_error_response(&pending.request.id, -4, "internal approval error")
+                .unwrap_or_default()
+        }
+    };
     // Same rule as a card's (#137): claim what the dispatch earned next to
     // the dispatch, arm it only if the reply goes out.
     let mut earned = earned_for(crate::notes::take_earned_grant(), &client_pubkey);
@@ -5561,12 +5617,33 @@ fn handle_nip46_event(
     // relay loop on the physical button — the loop must stay live so a fast
     // verdict can complete the request within the client's wait. Non-flagged
     // slots keep today's button behaviour exactly.
-    if matches!(tier, heartwood_common::policy::ApprovalTier::ButtonRequired)
-        && ctx
-            .policy_engine
-            .find_slot_by_pubkey(slot, &ev.pubkey)
-            .is_some_and(|s| s.escalate)
-    {
+    // A pinned method (a bearer-note disclosure or destruction) counts as
+    // physical here even where the slot policy lifted its tier, because the
+    // handler raises its card regardless. Without that, such a request on an
+    // escalate slot fell through to a card on a board nobody is standing at
+    // (#160).
+    let escalate_slot = ctx
+        .policy_engine
+        .find_slot_by_pubkey(slot, &ev.pubkey)
+        .is_some_and(|s| s.escalate);
+    if matches!(
+        heartwood_common::escalate::route_request(
+            tier,
+            method_enum.pinned_physical(),
+            escalate_slot,
+        ),
+        heartwood_common::escalate::Route::Park
+    ) {
+        // The park is dispatched later, out of the verdict, so a session's
+        // active identity is resolved into the request NOW: the notice names
+        // the identity that context derives, and the completion must act as
+        // exactly that one rather than as whatever the session has switched
+        // to by then.
+        let explicit_context = request.heartwood.is_some();
+        let mut request = request;
+        if request.heartwood.is_none() {
+            request.heartwood = active_context;
+        }
         let park = ParkedRequest {
             park_id: ev.id.clone(),
             target_pk: *target_pk,
@@ -5577,6 +5654,7 @@ fn handle_nip46_event(
             method: request.method.clone(),
             event_kind,
             identity: request_identity,
+            explicit_context,
             parked_at: Instant::now(),
             request,
         };

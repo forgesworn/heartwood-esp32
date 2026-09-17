@@ -7590,6 +7590,79 @@ fn dispatch_mgmt(
             }
         }
 
+        // Withdraw one identity approval (`params.identity`, a 64-hex pubkey
+        // or an npub) from a slot, or every one of them, leaving the pairing,
+        // its methods, kinds, binding and client keys alone. Same authority as
+        // `update_client` and `remove_authorized_pubkey`: an authorised
+        // operator, the mutation challenge and the slot's credential
+        // fingerprint, and no button, since it only ever narrows. The next
+        // request as a withdrawn identity meets ALLOW AS again, a live
+        // approve-once verdict for it is dropped, and an ask already waiting
+        // on a card that relied on the approval is refused when it resumes
+        // (`common::policy::resume_decision`). The binding cannot be revoked
+        // here; `clear_client_identities` leaves it approved.
+        "revoke_client_identity" | "clear_client_identities" => {
+            let clearing = method == "clear_client_identities";
+            let slot_index = req
+                .pointer("/params/slot_index")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| format!("{method} requires params.slot_index"))?
+                as u8;
+            let identity = if clearing {
+                None
+            } else {
+                Some(
+                    req.pointer("/params/identity")
+                        .and_then(|v| v.as_str())
+                        .ok_or("revoke_client_identity requires params.identity")?,
+                )
+            };
+            let target = ctx
+                .policy_engine
+                .list_slots(master_slot)
+                .iter()
+                .find(|slot| slot.slot_index == slot_index)
+                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            require_expected_slot_fingerprint(req, target)?;
+            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
+            let (revoked, changed) = match identity {
+                Some(identity) => {
+                    let (pubkey, changed) = ctx
+                        .policy_engine
+                        .revoke_identity(master_slot, slot_index, identity)
+                        .ok_or_else(|| format!("no such slot: {slot_index}"))??;
+                    (Some(pubkey), changed)
+                }
+                None => (
+                    None,
+                    ctx.policy_engine
+                        .clear_identities(master_slot, slot_index)
+                        .ok_or_else(|| format!("no such slot: {slot_index}"))?,
+                ),
+            };
+            if changed {
+                persist_slot_mutation_or_rollback(
+                    ctx,
+                    master_slot,
+                    slot_snapshot,
+                    "identity approval revocation",
+                )?;
+            }
+            let dropped =
+                ctx.policy_engine
+                    .drop_withdrawn_verdicts(master_slot, slot_index, revoked.as_ref());
+            log::info!(
+                "[relay] mgmt: {method} on slot {slot_index} (changed {changed}, verdicts dropped {dropped})"
+            );
+            let slot = ctx
+                .policy_engine
+                .list_slots(master_slot)
+                .iter()
+                .find(|slot| slot.slot_index == slot_index)
+                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            Ok(mgmt::identity_revocation_result(slot, changed, dropped))
+        }
+
         // Update a client slot's label / policy. Legacy slots retain the
         // historical partial-update/sign_event filter. Strict slots merge
         // omitted fields with their current ceiling, then replace the complete
@@ -7887,7 +7960,10 @@ fn dispatch_mgmt(
                     // Bearer notes as gift wraps: heartwood_note_send seals
                     // on-device, and a kind-1059 to a master npub puts a
                     // RECEIVE card up.
-                    "note_wrap_v1"
+                    "note_wrap_v1",
+                    // revoke_client_identity / clear_client_identities withdraw
+                    // identity approvals from a slot without revoking it.
+                    "client_identity_revoke_v1"
             ]);
             // A delegate (per-identity operator) sees only what it needs to
             // feature-detect and manage its own identity — never the

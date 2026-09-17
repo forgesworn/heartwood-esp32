@@ -134,6 +134,50 @@ pub fn client_summary(slot: &ConnectSlot) -> serde_json::Value {
     })
 }
 
+/// Error for revoking a slot's bound identity: the binding is approved without
+/// a list entry, so only changing the binding withdraws it.
+pub const BOUND_IDENTITY_ERROR: &str =
+    "bound_identity: identity is the slot's binding; change the binding instead";
+
+/// `revoke_client_identity`: withdraw one identity's approval from a slot.
+/// `identity` is a 64-hex pubkey or an npub; its tag is derived here. Returns
+/// the parsed pubkey (so the caller can drop verdicts for it) and whether the
+/// approved list changed. Revoking an identity that is not approved is a
+/// successful no-op; revoking the slot's binding is refused and changes
+/// nothing. The pairing, methods, kinds, binding and client keys are untouched.
+#[cfg(feature = "nip46")]
+pub fn revoke_client_identity(
+    slot: &mut ConnectSlot,
+    identity: &str,
+) -> Result<([u8; 32], bool), &'static str> {
+    use crate::policy::{parse_identity_pubkey, revoke_approved_identity, RevokeIdentity};
+    let pubkey = parse_identity_pubkey(identity)?;
+    match revoke_approved_identity(slot, &pubkey) {
+        RevokeIdentity::Removed => Ok((pubkey, true)),
+        RevokeIdentity::Absent => Ok((pubkey, false)),
+        RevokeIdentity::Bound => Err(BOUND_IDENTITY_ERROR),
+    }
+}
+
+/// The result of `revoke_client_identity` / `clear_client_identities`: whether
+/// anything changed (the approved list, or a live approve-once verdict
+/// dropped), and the slot's approvals as they now stand.
+#[cfg(feature = "nip46")]
+pub fn identity_revocation_result(
+    slot: &ConnectSlot,
+    list_changed: bool,
+    verdicts_dropped: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "slot_index": slot.slot_index,
+        "secret_fingerprint": credential_fingerprint(&slot.secret),
+        "changed": list_changed || verdicts_dropped > 0,
+        "verdicts_dropped": verdicts_dropped,
+        "approved_identities": crate::policy::approved_identity_tags(slot),
+        "bound_identity": slot.bound_identity.clone(),
+    })
+}
+
 /// Outcome of the replay/freshness check on a request's inner id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replay {
@@ -476,6 +520,8 @@ mod tests {
             "approve_signing",
             "revoke_client",
             "update_client",
+            "revoke_client_identity",
+            "clear_client_identities",
             "client_uri",
             "set_identity_meta",
             "future_mutation",
@@ -642,6 +688,94 @@ mod tests {
             credential_fingerprint(&slot.secret),
         );
         assert!(summary.get("secret").is_none());
+    }
+
+    #[cfg(feature = "nip46")]
+    fn identity_slot() -> ConnectSlot {
+        ConnectSlot {
+            slot_index: 3,
+            label: "phone".into(),
+            secret: "41".repeat(32),
+            current_pubkey: Some("42".repeat(32)),
+            allowed_methods: vec!["sign_event".into()],
+            allowed_kinds: vec![1],
+            auto_approve: true,
+            signing_approved: true,
+            strict_permissions: true,
+            authorized_pubkeys: vec!["42".repeat(32)],
+            escalate: false,
+            petition_on_deny: false,
+            audit_child_wrap: false,
+            guardian_notice_wrap: false,
+            bound_identity: Some("cc".repeat(32)),
+            approved_identities: String::new(),
+            was_bound: true,
+        }
+    }
+
+    #[cfg(feature = "nip46")]
+    #[test]
+    fn revoke_client_identity_takes_hex_or_npub_and_shows_in_the_summary() {
+        use crate::policy::{identity_approved, record_approved_identity};
+        let a = [0xaa; 32];
+        let b = [0xbb; 32];
+        let mut slot = identity_slot();
+        assert!(record_approved_identity(&mut slot, &a));
+        assert!(record_approved_identity(&mut slot, &b));
+        assert_eq!(
+            client_summary(&slot)["approved_identities"],
+            serde_json::json!(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]),
+        );
+
+        // By npub: removed, and the summary follows.
+        let npub = crate::encoding::encode_npub(&a);
+        assert_eq!(revoke_client_identity(&mut slot, &npub), Ok((a, true)));
+        assert!(!identity_approved(&slot, &a));
+        assert_eq!(client_summary(&slot)["approved_identities"], serde_json::json!(["bbbbbbbbbbbbbbbb"]));
+        // Again: a successful no-op.
+        assert_eq!(revoke_client_identity(&mut slot, &npub), Ok((a, false)));
+
+        // By hex, either case.
+        assert_eq!(revoke_client_identity(&mut slot, &"BB".repeat(32)), Ok((b, true)));
+        assert_eq!(client_summary(&slot)["approved_identities"], serde_json::json!([]));
+
+        // The binding is refused, and so is anything that is not an identity.
+        let before = client_summary(&slot);
+        assert_eq!(revoke_client_identity(&mut slot, &"cc".repeat(32)), Err(BOUND_IDENTITY_ERROR));
+        for bad in ["", "npub1", "bbbbbbbbbbbbbbbb", "zz"] {
+            assert!(revoke_client_identity(&mut slot, bad).unwrap_err().starts_with("invalid_identity"), "{bad}");
+        }
+        assert_eq!(client_summary(&slot), before);
+        // Nothing else about the pairing moved.
+        assert_eq!(before["bound_identity"], "cc".repeat(32));
+        assert_eq!(before["allowed_kinds"], serde_json::json!([1]));
+        assert_eq!(before["authorized_pubkeys"], serde_json::json!(["42".repeat(32)]));
+    }
+
+    #[cfg(feature = "nip46")]
+    #[test]
+    fn identity_revocation_result_reports_what_changed() {
+        use crate::policy::{clear_approved_identities, record_approved_identity};
+        let mut slot = identity_slot();
+        assert!(record_approved_identity(&mut slot, &[0xaa; 32]));
+        let result = identity_revocation_result(&slot, false, 0);
+        assert_eq!(result["changed"], false);
+        assert_eq!(result["approved_identities"], serde_json::json!(["aaaaaaaaaaaaaaaa"]));
+        assert_eq!(result["secret_fingerprint"], credential_fingerprint(&slot.secret));
+        assert!(result.get("secret").is_none());
+
+        assert!(clear_approved_identities(&mut slot));
+        let result = identity_revocation_result(&slot, true, 0);
+        assert_eq!(result["changed"], true);
+        assert_eq!(result["slot_index"], 3);
+        assert_eq!(result["approved_identities"], serde_json::json!([]));
+        assert_eq!(result["bound_identity"], "cc".repeat(32));
+        assert_eq!(client_summary(&slot)["approved_identities"], serde_json::json!([]));
+
+        // A dropped verdict alone is a change.
+        let result = identity_revocation_result(&slot, false, 2);
+        assert_eq!(result["changed"], true);
+        assert_eq!(result["verdicts_dropped"], 2);
     }
 
     #[test]

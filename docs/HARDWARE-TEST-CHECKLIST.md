@@ -1818,6 +1818,22 @@ master on a legacy slot that already signs silently.
 15. **Timeout leaves nothing behind.** Let any of these cards expire: the slot is
     unchanged and a retry prompts.
 16. **USB unchanged.** Direct USB requests (no client pubkey) behave as before.
+17. **Revoke one identity, or all.** With the master and a persona approved on
+    a legacy slot, `revoke_client_identity` (`slot_index`,
+    `expected_secret_fingerprint`, `identity` as the persona's npub, fresh
+    `mutation_challenge`, no button): the result has `changed: true` and
+    `list_clients` no longer lists its tag; the master still signs silently and
+    the persona's next sign reads `ALLOW AS` again. The same call again answers
+    `changed: false`. Revoking a strict slot's `bound_identity` answers
+    `bound_identity: identity is the slot's binding; change the binding
+    instead` and changes nothing. `clear_client_identities` empties the list,
+    the binding still signs silently, and the slot's methods, kinds and client
+    keys are unchanged. Put a `HOLD TO SIGN` card up for an approved identity,
+    revoke it before holding: the hold answers `approval changed while waiting;
+    send the request again`. On an `escalate` slot, approve-once a parked sign
+    as the persona, revoke the persona inside the verdict's window: the result
+    shows `verdicts_dropped: 1` and the next sign of that kind parks again
+    instead of riding the verdict.
 
 ## Notes
 

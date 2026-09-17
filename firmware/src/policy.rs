@@ -8,11 +8,12 @@ use std::time::Instant;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{
-    authorize_pubkey_on_unique_slot, evaluate_slot_policy, find_slot_by_pubkey,
+    authorize_pubkey_on_unique_slot, clear_approved_identities, evaluate_slot_policy,
+    find_slot_by_pubkey,
     find_slot_by_pubkey_mut, find_slot_by_secret, gate_request, grant_slot_method,
     grant_slot_signing, next_slot_index, record_approved_identity, remove_ambiguous_pubkeys,
     remove_authorized_pubkey, set_slot_bound_identity, strict_slot_denies_method,
-    verdict_covers_identity,
+    verdict_covers_identity, verdict_withdrawn,
     validate_exact_slot_policy, ApprovalTier, ConnectSlot, ExactSlotPolicy, Gate, GateRequest,
     RemoveAuthorizedPubkey, CONNECT_SAFE_METHODS,
 };
@@ -702,6 +703,66 @@ impl PolicyEngine {
             self.slots_dirty = true;
         }
         Some(outcome)
+    }
+
+    /// `revoke_client_identity`: withdraw one identity's approval from a slot
+    /// (`heartwood_common::mgmt::revoke_client_identity`). Returns the parsed
+    /// identity and whether the approved list changed, or `None` for no such
+    /// slot. Live verdicts are dropped separately, by
+    /// [`Self::drop_withdrawn_verdicts`], once the change is durable.
+    pub fn revoke_identity(
+        &mut self,
+        master_slot: u8,
+        slot_index: u8,
+        identity: &str,
+    ) -> Option<Result<([u8; 32], bool), &'static str>> {
+        let slot = self
+            .slots_mut(master_slot)
+            .iter_mut()
+            .find(|slot| slot.slot_index == slot_index)?;
+        let outcome = heartwood_common::mgmt::revoke_client_identity(slot, identity);
+        if matches!(outcome, Ok((_, true))) {
+            self.slots_dirty = true;
+        }
+        Some(outcome)
+    }
+
+    /// `clear_client_identities`: withdraw every recorded identity approval
+    /// from a slot, keeping its binding. `None` for no such slot.
+    pub fn clear_identities(&mut self, master_slot: u8, slot_index: u8) -> Option<bool> {
+        let slot = self
+            .slots_mut(master_slot)
+            .iter_mut()
+            .find(|slot| slot.slot_index == slot_index)?;
+        let changed = clear_approved_identities(slot);
+        self.slots_dirty |= changed;
+        Some(changed)
+    }
+
+    /// Drop the live approve-once verdicts an identity revocation withdraws:
+    /// those given to any of the slot's client keys for `revoked`, or with
+    /// `None` (clearing) for any identity but the slot's binding. Returns how
+    /// many were dropped.
+    pub fn drop_withdrawn_verdicts(
+        &mut self,
+        master_slot: u8,
+        slot_index: u8,
+        revoked: Option<&[u8; 32]>,
+    ) -> usize {
+        let Some(slot) = self
+            .master_slots
+            .iter()
+            .find(|ms| ms.master_slot == master_slot)
+            .and_then(|ms| ms.slots.iter().find(|slot| slot.slot_index == slot_index))
+        else {
+            return 0;
+        };
+        let before = self.transient_allows.len();
+        self.transient_allows.retain(|allow| {
+            !(allow.master_slot == master_slot
+                && verdict_withdrawn(slot, &allow.client_pubkey, allow.identity.as_ref(), revoked))
+        });
+        before - self.transient_allows.len()
     }
 
     /// Find a slot by the current client pubkey (immutable).

@@ -1744,7 +1744,25 @@ bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.
     bottom row. On a narrow panel it reads `A/B move  holdA back` and the
     pick gesture appears in the subtitle instead.
 
-## 23. A pairing acts only as the identities it was approved for (added 2026-09-17, NOT YET BENCH-RUN)
+## 23. A pairing acts only as the identities it was approved for (added 2026-09-17; core path bench-run 2026-09-17, desk Heltec V4)
+
+**Bench run 2026-09-17** (V4, 16 MB legacy-NVS bigapp layout, app-only flash at
+0x10000, vault re-unlocked, fresh legacy slot 11 "idscope-bench" over the relay,
+revoked afterwards):
+
+- Items 1, 2: first sign as the master raised its card and one hold approved it;
+  later kind-1 signs answered in ~1.8 s with no card.
+- Item 3: `sign_event` with a context for `nostr:persona:natural-person` raised a
+  card, signed as `2ed46ab2..` (not the master), and the next one was silent
+  (~2.3 s).
+- Item 4: an unregistered child's context raised a card and was approved.
+- Items 15: a card left to expire answered `timeout`, and the slot recorded
+  nothing (`approved_identities` unchanged).
+- Item 17: `revoke_client_identity` with the 16-hex tag answered
+  `changed: true` and dropped the tag; the same call again answered
+  `changed: false`; the master still signed silently; the revoked identity's
+  next sign raised its card again. `revoke_client` then removed the bench slot.
+- Not yet bench-run: items 5 to 14, 11b, 11c, 16.
 
 The whole decision is one pure function, `heartwood_common::policy::gate_request`,
 host-tested as a full matrix; the relay's pre-dispatch plan and the handler both

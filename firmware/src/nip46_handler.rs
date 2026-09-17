@@ -935,7 +935,21 @@ fn dispatch_inner(
     // A hold answers exactly the card it was shown on, for exactly the
     // identity it named. Never act on or record an identity the card did not.
     if let Some(resume) = resume {
-        match resume_decision(&resume.shown, shown_now.card, shown_now.identity.as_ref(), own_card) {
+        // Whether the slot itself now holds what the shown card grants (an
+        // earlier ask in the same batch recorded it), as opposed to a verdict.
+        let recorded = policy_engine
+            .find_slot_by_pubkey(master_slot, &client_hex)
+            .is_some_and(|slot| match resume.shown.card {
+                Some(CardKind::AllowAs { .. }) => shown_now
+                    .identity
+                    .as_ref()
+                    .is_some_and(|pubkey| heartwood_common::policy::identity_approved(slot, pubkey)),
+                Some(CardKind::ListIds) => {
+                    slot.allowed_methods.iter().any(|m| m == "heartwood_list_identities")
+                }
+                _ => false,
+            });
+        match resume_decision(&resume.shown, shown_now.card, shown_now.identity.as_ref(), own_card, recorded) {
             ResumeDecision::Proceed => {}
             ResumeDecision::IdentityChanged => {
                 log::warn!("{}: refused: identity changed while the card waited", request.method);

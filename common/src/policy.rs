@@ -615,15 +615,26 @@ pub enum ResumeDecision {
 /// `card_now` is the gate card the request needs now (`None` for none or a
 /// policy card); `identity_now` the identity it would act as now; `own_card`
 /// whether the method's own card is still due after any gate card.
+///
+/// `recorded` says the slot itself now holds what the shown card grants: the
+/// identity in its approved list (or binding) for `ALLOW AS`, the method in its
+/// allowed set for `LIST IDS`. That is how a batch reads after its first ask
+/// recorded the grant: the later asks need no card, and the one hold answers
+/// them too. A verdict or anything else that merely lets a request through is
+/// not `recorded`, so it still answers "send the request again".
 pub fn resume_decision(
     shown: &ShownCard,
     card_now: Option<CardKind>,
     identity_now: Option<&[u8; 32]>,
     own_card: bool,
+    recorded: bool,
 ) -> ResumeDecision {
     if shown.identity.as_ref() != identity_now {
         return ResumeDecision::IdentityChanged;
     }
+    let granted_by_this_hold = card_now.is_none()
+        && recorded
+        && matches!(shown.card, Some(CardKind::AllowAs { .. } | CardKind::ListIds));
     let kind = |card: Option<CardKind>| {
         card.map(|card| match card {
             CardKind::AllowAs { .. } => 1,
@@ -632,7 +643,7 @@ pub fn resume_decision(
             CardKind::SwitchTo { .. } => 4,
         })
     };
-    if kind(shown.card) != kind(card_now) {
+    if kind(shown.card) != kind(card_now) && !granted_by_this_hold {
         return ResumeDecision::CardChanged;
     }
     if shown.card.is_some() && own_card {
@@ -1665,18 +1676,18 @@ mod tests {
         let child = IDENTITY_B;
         let shown = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(master) };
         assert_eq!(
-            resume_decision(&shown, Some(CardKind::AllowAs { record: true }), Some(&child), false),
+            resume_decision(&shown, Some(CardKind::AllowAs { record: true }), Some(&child), false, false),
             ResumeDecision::IdentityChanged,
         );
         // The same identity proceeds, whatever the record flag now says.
         assert_eq!(
-            resume_decision(&shown, Some(CardKind::AllowAs { record: false }), Some(&master), false),
+            resume_decision(&shown, Some(CardKind::AllowAs { record: false }), Some(&master), false, false),
             ResumeDecision::Proceed,
         );
         // A plain HOLD TO SIGN card is held to its identity too.
         let plain = ShownCard { card: None, identity: Some(master) };
-        assert_eq!(resume_decision(&plain, None, Some(&child), false), ResumeDecision::IdentityChanged);
-        assert_eq!(resume_decision(&plain, None, Some(&master), false), ResumeDecision::Proceed);
+        assert_eq!(resume_decision(&plain, None, Some(&child), false, false), ResumeDecision::IdentityChanged);
+        assert_eq!(resume_decision(&plain, None, Some(&master), false, false), ResumeDecision::Proceed);
     }
 
     #[test]
@@ -1687,22 +1698,22 @@ mod tests {
         // Shown with no identity key at all (a non-scoped method): a request
         // that now acts as any identity is refused.
         let none = ShownCard { card: None, identity: None };
-        assert_eq!(resume_decision(&none, None, None, true), ResumeDecision::Proceed);
-        assert_eq!(resume_decision(&none, None, Some(&served_master), false), ResumeDecision::IdentityChanged);
+        assert_eq!(resume_decision(&none, None, None, true, false), ResumeDecision::Proceed);
+        assert_eq!(resume_decision(&none, None, Some(&served_master), false, false), ResumeDecision::IdentityChanged);
         // Shown without context (master), resumed with a context child.
         let master = ShownCard { card: None, identity: Some(served_master) };
-        assert_eq!(resume_decision(&master, None, Some(&context_child), false), ResumeDecision::IdentityChanged);
+        assert_eq!(resume_decision(&master, None, Some(&context_child), false, false), ResumeDecision::IdentityChanged);
         // Persona-addressed ask, resumed after a master-addressed switch made
         // the session derive a child of the persona.
         let addressed = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(persona) };
         assert_eq!(
-            resume_decision(&addressed, Some(CardKind::AllowAs { record: true }), Some(&context_child), false),
+            resume_decision(&addressed, Some(CardKind::AllowAs { record: true }), Some(&context_child), false, false),
             ResumeDecision::IdentityChanged,
         );
         // A switch keeps its stored target; a vanished target reads as None.
         let switch = ShownCard { card: Some(CardKind::SwitchTo { record: true }), identity: Some(persona) };
-        assert_eq!(resume_decision(&switch, Some(CardKind::SwitchTo { record: true }), None, false), ResumeDecision::IdentityChanged);
-        assert_eq!(resume_decision(&switch, Some(CardKind::SwitchTo { record: true }), Some(&persona), false), ResumeDecision::Proceed);
+        assert_eq!(resume_decision(&switch, Some(CardKind::SwitchTo { record: true }), None, false, false), ResumeDecision::IdentityChanged);
+        assert_eq!(resume_decision(&switch, Some(CardKind::SwitchTo { record: true }), Some(&persona), false, false), ResumeDecision::Proceed);
     }
 
     #[test]
@@ -1711,16 +1722,16 @@ mod tests {
         let gate = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: id };
         let own = ShownCard { card: None, identity: id };
         // Gate hold never releases the method's own card.
-        assert_eq!(resume_decision(&gate, Some(CardKind::AllowAs { record: true }), id.as_ref(), true), ResumeDecision::OwnCardNext);
+        assert_eq!(resume_decision(&gate, Some(CardKind::AllowAs { record: true }), id.as_ref(), true, false), ResumeDecision::OwnCardNext);
         // Own-card hold never stands in for a gate card that is now due.
-        assert_eq!(resume_decision(&own, Some(CardKind::AllowAs { record: true }), id.as_ref(), true), ResumeDecision::CardChanged);
+        assert_eq!(resume_decision(&own, Some(CardKind::AllowAs { record: true }), id.as_ref(), true, false), ResumeDecision::CardChanged);
         // Gate hold whose gate card is no longer due (approved meanwhile).
-        assert_eq!(resume_decision(&gate, None, id.as_ref(), false), ResumeDecision::CardChanged);
+        assert_eq!(resume_decision(&gate, None, id.as_ref(), false, false), ResumeDecision::CardChanged);
         // Different gate cards never answer each other.
-        assert_eq!(resume_decision(&gate, Some(CardKind::NpubAs), id.as_ref(), false), ResumeDecision::CardChanged);
+        assert_eq!(resume_decision(&gate, Some(CardKind::NpubAs), id.as_ref(), false, false), ResumeDecision::CardChanged);
         // Each held on its own card proceeds.
-        assert_eq!(resume_decision(&own, None, id.as_ref(), true), ResumeDecision::Proceed);
-        assert_eq!(resume_decision(&gate, Some(CardKind::AllowAs { record: true }), id.as_ref(), false), ResumeDecision::Proceed);
+        assert_eq!(resume_decision(&own, None, id.as_ref(), true, false), ResumeDecision::Proceed);
+        assert_eq!(resume_decision(&gate, Some(CardKind::AllowAs { record: true }), id.as_ref(), false, false), ResumeDecision::Proceed);
         // Batching markers keep every card kind apart.
         let markers = [
             card_batch_marker(None),
@@ -1735,6 +1746,79 @@ mod tests {
             }
         }
         assert_eq!(card_batch_marker(Some(CardKind::AllowAs { record: false })), card_batch_marker(Some(CardKind::AllowAs { record: true })));
+    }
+
+    #[test]
+    fn a_batched_allow_as_hold_answers_every_ask_in_the_batch() {
+        // Eight nip44_decrypt asks collapsed onto one ALLOW AS card. The first
+        // records the identity; the rest now need no card, and the hold covers
+        // them because the slot holds the grant.
+        let mut slot = trusted_legacy_slot();
+        let shown = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(IDENTITY_A) };
+        for ask in 0..8 {
+            let request = GateRequest {
+                has_client: true,
+                slot: Some(&slot),
+                method: "nip44_decrypt",
+                tier: ApprovalTier::AutoApprove,
+                explicit_context: false,
+                has_context: true,
+                identity: Some(&IDENTITY_A),
+                verdict: false,
+            };
+            let card_now = match gate_request(&request) {
+                Gate::Card(kind) => Some(kind),
+                Gate::Allow => None,
+                Gate::Deny => panic!("ask {ask} denied"),
+            };
+            let recorded = identity_approved(&slot, &IDENTITY_A);
+            assert_eq!(
+                resume_decision(&shown, card_now, Some(&IDENTITY_A), false, recorded),
+                ResumeDecision::Proceed,
+                "ask {ask}",
+            );
+            // What dispatch does on the approved gate card.
+            if card_now.is_some() {
+                record_approved_identity(&mut slot, &IDENTITY_A);
+            }
+        }
+        assert!(identity_approved(&slot, &IDENTITY_A));
+
+        // LIST IDS batches the same way.
+        let shown = ShownCard { card: Some(CardKind::ListIds), identity: None };
+        assert_eq!(resume_decision(&shown, Some(CardKind::ListIds), None, false, false), ResumeDecision::Proceed);
+        assert_eq!(resume_decision(&shown, None, None, false, true), ResumeDecision::Proceed);
+        // A note method in the batch still owes its own card.
+        let shown = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(IDENTITY_A) };
+        assert_eq!(resume_decision(&shown, None, Some(&IDENTITY_A), true, true), ResumeDecision::OwnCardNext);
+    }
+
+    #[test]
+    fn a_batch_whose_identity_changed_mid_way_is_refused() {
+        let shown = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(IDENTITY_A) };
+        // First ask proceeds and records A; a switch then makes the next ask
+        // act as B, which the slot has not approved.
+        assert_eq!(resume_decision(&shown, Some(CardKind::AllowAs { record: true }), Some(&IDENTITY_A), false, false), ResumeDecision::Proceed);
+        assert_eq!(resume_decision(&shown, Some(CardKind::AllowAs { record: true }), Some(&IDENTITY_B), false, false), ResumeDecision::IdentityChanged);
+        // Even when B happens to be approved already, the card never named it.
+        assert_eq!(resume_decision(&shown, None, Some(&IDENTITY_B), false, true), ResumeDecision::IdentityChanged);
+    }
+
+    #[test]
+    fn a_full_list_batch_still_rides_its_hold_and_a_verdict_does_not() {
+        // Full list: the first ask's hold records nothing, so the next ask
+        // still needs the same ALLOW AS card, and the batch's hold answers it.
+        let shown = ShownCard { card: Some(CardKind::AllowAs { record: false }), identity: Some(IDENTITY_A) };
+        assert_eq!(
+            resume_decision(&shown, Some(CardKind::AllowAs { record: false }), Some(&IDENTITY_A), false, false),
+            ResumeDecision::Proceed,
+        );
+        // Let through without a record (a guardian verdict): not this hold's
+        // grant, so the client asks again rather than riding the hold.
+        assert_eq!(resume_decision(&shown, None, Some(&IDENTITY_A), false, false), ResumeDecision::CardChanged);
+        // NPUB AS and SWITCH TO record nothing to ride on.
+        let npub = ShownCard { card: Some(CardKind::NpubAs), identity: Some(IDENTITY_A) };
+        assert_eq!(resume_decision(&npub, None, Some(&IDENTITY_A), false, true), ResumeDecision::CardChanged);
     }
 
     #[test]

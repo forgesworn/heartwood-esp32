@@ -213,7 +213,8 @@ fn build_sign_reply(
     }
 }
 
-/// Persist a connect-slot bind, undoing it if the write does not land.
+/// Persist a connect-slot bind or identity approval, undoing it if the write
+/// does not land.
 ///
 /// #75: `connect` used to answer success as soon as the pubkey was assigned in
 /// RAM, so a full NVS produced a client that believed it was paired against a
@@ -232,13 +233,13 @@ fn persist_bind_or_rollback(
         return Ok(());
     }
     if policy_engine.restore_slot_state_durably(nvs, snapshot) {
-        log::error!("connect: bind was not durable; prior slot authority restored durably");
-        Err("could not persist client bind; request was not applied".into())
+        log::error!("slot authority was not durable; prior slot authority restored durably");
+        Err("could not persist client policy; request was not applied".into())
     } else {
         log::error!(
-            "connect: FATAL: bind failed and prior slot authority could not be restored durably"
+            "FATAL: slot authority not durable and prior authority could not be restored durably"
         );
-        Err("fatal storage error: could not restore prior client policy after bind; \
+        Err("fatal storage error: could not restore prior client policy; \
              take the device offline for USB recovery"
             .into())
     }
@@ -433,11 +434,11 @@ pub struct DeferredAsk {
     pub card: AskCard,
     pub request: nip46::Nip46Request,
     pub event: Option<UnsignedEvent>,
-    /// Hex pubkey of the identity the request acts as, when identity-scoped.
+    /// X-only pubkey of the identity the request acts as, when identity-scoped.
     /// Part of the card's batching key, so one hold never answers asks for an
     /// identity its card did not name. The resumed dispatch re-derives the
     /// same identity from the same served pubkey and request context.
-    pub identity: Option<String>,
+    pub identity: Option<[u8; 32]>,
 }
 
 /// Outcome of a dispatch attempt.
@@ -799,36 +800,30 @@ fn dispatch_inner(
     if identity_scoped && !client_is_bound {
         return build_error_json(&request.id, -1, "unauthorised");
     }
-    // A resumed ask re-derives the same identity: the served key is resolved
-    // again from the same pubkey and the context travels in the request.
-    let identity_hex = if identity_scoped {
-        match effective_identity_hex(master_secret, master_mode, secp, request.heartwood.as_ref()) {
-            Ok(hex) => Some(hex),
-            Err(_) => return build_error_json(&request.id, -4, "key derivation failure"),
+    // Note methods act with the served key and ignore any context. A resumed
+    // ask re-derives the same identity: the served key is resolved again from
+    // the same pubkey and the context travels in the request.
+    let note_scoped = heartwood_common::policy::method_uses_served_key(&request.method);
+    let identity = if identity_scoped {
+        let context = if note_scoped { None } else { request.heartwood.as_ref() };
+        match effective_identity(master_secret, master_mode, secp, context) {
+            Some(pubkey) => Some(pubkey),
+            None => return build_error_json(&request.id, -4, "key derivation failure"),
         }
     } else {
         None
     };
-    let identity_gate = identity_hex.as_deref().map(|identity| {
-        policy_engine.identity_gate(master_slot, &client_hex, &method, event_kind, identity)
+    let identity_needs_approval = identity.as_ref().is_some_and(|pubkey| {
+        !policy_engine.identity_approved(master_slot, &client_hex, &method, event_kind, pubkey)
     });
-    if let Some(refusal) = match identity_gate {
-        Some(heartwood_common::policy::IdentityGate::Mismatch) => Some("unauthorised"),
-        Some(heartwood_common::policy::IdentityGate::Full) => Some("too many approved identities"),
-        _ => None,
-    } {
-        return build_error_json(&request.id, -1, refusal);
+    // Note methods have no identity card: approval is won on a sign or crypto
+    // prompt for the identity, never on a money card.
+    if identity_needs_approval && note_scoped {
+        return build_error_json(&request.id, -1, "unauthorised");
     }
-    let identity_needs_approval = identity_gate
-        == Some(heartwood_common::policy::IdentityGate::NeedsApproval);
-    let identity_line = identity_hex.as_deref().map(|identity| {
-        identity_card_line(
-            personas,
-            master_label,
-            identity,
-            request.heartwood.as_ref(),
-        )
-    });
+    let identity_line = identity
+        .as_ref()
+        .map(|pubkey| identity_card_line(personas, master_label, pubkey, request.heartwood.as_ref()));
 
     // Validate replay, trusted expiry and receipt storage *before* raising a
     // card. A retried or stale request must not consume another physical hold.
@@ -949,7 +944,7 @@ fn dispatch_inner(
                     },
                     request,
                     event: None,
-                    identity: identity_hex,
+                    identity,
                 }));
                 return String::new();
             }
@@ -981,18 +976,16 @@ fn dispatch_inner(
             }
         }
         if identity_card {
-            if let Some(identity) = identity_hex.as_deref() {
-                if let Err(response) = record_identity_approval(
-                    policy_engine,
-                    nvs,
-                    master_slot,
-                    &client_hex,
-                    identity,
-                    &request.id,
-                    None,
-                ) {
-                    return response;
-                }
+            if let Err(response) = record_identity_approval(
+                policy_engine,
+                nvs,
+                master_slot,
+                &client_hex,
+                identity.as_ref(),
+                &request.id,
+                None,
+            ) {
+                return response;
             }
         }
     }
@@ -1054,7 +1047,7 @@ fn dispatch_inner(
                             },
                             request,
                             event: Some(event),
-                            identity: identity_hex.clone(),
+                            identity,
                         }));
                         return String::new();
                     }
@@ -1096,13 +1089,13 @@ fn dispatch_inner(
                             let idx = slot.slot_index;
                             policy_engine.upgrade_to_signing(master_slot, idx);
                         }
-                        if let (true, Some(identity)) = (identity_needs_approval, identity_hex.as_deref()) {
+                        if identity_needs_approval {
                             if let Err(response) = record_identity_approval(
                                 policy_engine,
                                 nvs,
                                 master_slot,
                                 &client_hex,
-                                identity,
+                                identity.as_ref(),
                                 &request.id,
                                 identity_snapshot,
                             ) {
@@ -1929,30 +1922,32 @@ pub(crate) fn resolve_active_context(
     })
 }
 
-/// Hex pubkey of the key a request will actually use: the served identity's
-/// own key with no context, else the child the context derives from it (the
-/// same chain `do_sign` and `resolve_signing_secret` follow).
-pub(crate) fn effective_identity_hex(
+/// X-only pubkey of the key a request will actually use: the served
+/// identity's own key with no context, else the child the context derives
+/// from it (the same chain `do_sign` and `resolve_signing_secret` follow).
+pub(crate) fn effective_identity(
     served_secret: &[u8; 32],
     master_mode: MasterMode,
     secp: &Arc<Secp256k1<SignOnly>>,
     heartwood: Option<&HeartwoodContext>,
-) -> Result<String, String> {
+) -> Option<[u8; 32]> {
     match heartwood {
         Some(ctx) => derive_identity(served_secret, master_mode, &ctx.purpose, ctx.index)
-            .map(|(_secret, pubkey)| hex_encode(&pubkey)),
+            .ok()
+            .map(|(_secret, pubkey)| pubkey),
         None => secp256k1::Keypair::from_seckey_slice(secp, served_secret)
-            .map(|kp| hex_encode(&kp.x_only_public_key().0.serialize()))
-            .map_err(|_| "invalid master secret".to_string()),
+            .ok()
+            .map(|kp| kp.x_only_public_key().0.serialize()),
     }
 }
 
-/// The identity an identity-scoped request resolves to before dispatch, for a
-/// transport that must decide escalation or rollback up front. `None` when the
+/// The identity a card-scoped request resolves to before dispatch, for the
+/// relay, which must decide escalation and rollback up front. `None` when the
 /// request uses no identity key or its context does not derive (dispatch then
-/// refuses it on its own).
+/// refuses it on its own). Note methods are left to dispatch: they refuse an
+/// unapproved identity rather than prompt, so they never escalate.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn request_identity_hex(
+pub(crate) fn request_identity(
     request: &nip46::Nip46Request,
     served_secret: &[u8; 32],
     master_mode: MasterMode,
@@ -1961,7 +1956,7 @@ pub(crate) fn request_identity_hex(
     policy_engine: &PolicyEngine,
     identity_caches: &[crate::identity_cache::IdentityCache],
     client_pubkey: &[u8; 32],
-) -> Option<String> {
+) -> Option<[u8; 32]> {
     let active;
     let context = match request.heartwood.as_ref() {
         Some(context) => Some(context),
@@ -1973,7 +1968,7 @@ pub(crate) fn request_identity_hex(
     if !heartwood_common::policy::method_uses_identity_key(&request.method, context.is_some()) {
         return None;
     }
-    effective_identity_hex(served_secret, master_mode, secp, context).ok()
+    effective_identity(served_secret, master_mode, secp, context)
 }
 
 /// One card line naming an identity: the registry name (or purpose) when it
@@ -1983,51 +1978,38 @@ pub(crate) fn request_identity_hex(
 fn identity_card_line(
     personas: &[crate::personas::LoadedPersona],
     master_label: &str,
-    identity_hex: &str,
+    pubkey: &[u8; 32],
     context: Option<&HeartwoodContext>,
 ) -> String {
-    let Some(pubkey) = hex_decode_32(identity_hex) else {
-        return format!("id {}", &identity_hex[..identity_hex.len().min(12)]);
-    };
-    let registry = crate::personas::find_by_pubkey(personas, &pubkey)
+    let registry = crate::personas::find_by_pubkey(personas, pubkey)
         .map(|idx| &personas[idx])
-        .map(|p| p.name.clone().unwrap_or_else(|| p.purpose.clone()));
+        .map(|p| p.name.as_deref().unwrap_or(&p.purpose));
     let label = registry
-        .or_else(|| context.map(|c| c.purpose.clone()))
-        .unwrap_or_else(|| master_label.to_string());
-    heartwood_common::encoding::identity_card_line(&label, &pubkey)
+        .or_else(|| context.map(|c| c.purpose.as_str()))
+        .unwrap_or(master_label);
+    heartwood_common::encoding::identity_card_line(label, pubkey)
 }
 
 /// Record a physically approved identity on the client's slot and make it
-/// durable before the request's answer may go out. A write that does not land
-/// restores `snapshot` (or the state just before this record) durably and
-/// answers an error, the same rule as a connect bind (#75).
+/// durable before the request's answer may go out, undoing it when the write
+/// does not land (the connect-bind rule, #75). `snapshot` is taken by a
+/// caller that changed authority earlier in the same request.
 fn record_identity_approval(
     policy_engine: &mut PolicyEngine,
     nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
     master_slot: u8,
     client_hex: &str,
-    identity: &str,
+    identity: Option<&[u8; 32]>,
     request_id: &str,
     snapshot: Option<crate::policy::SlotStateSnapshot>,
 ) -> Result<(), String> {
+    let Some(identity) = identity else { return Ok(()) };
     let snapshot = snapshot.unwrap_or_else(|| policy_engine.snapshot_slot_state(master_slot));
-    if let Err(e) = policy_engine.approve_identity(master_slot, client_hex, identity) {
-        return Err(build_error_json(request_id, -1, e));
-    }
-    if policy_engine.persist_slots(nvs, master_slot) {
+    if !policy_engine.record_identity(master_slot, client_hex, identity) {
         return Ok(());
     }
-    let restored = policy_engine.restore_slot_state_durably(nvs, snapshot);
-    Err(build_error_json(
-        request_id,
-        -4,
-        if restored {
-            "client policy could not be saved; request was not applied"
-        } else {
-            "fatal storage error: prior client policy could not be restored; take the device offline for USB recovery"
-        },
-    ))
+    persist_bind_or_rollback(policy_engine, nvs, master_slot, snapshot)
+        .map_err(|reason| build_error_json(request_id, -4, &reason))
 }
 
 /// Label for a client with no slot label: truncated npub, or the legacy hex
@@ -2671,7 +2653,7 @@ mod tests {
             audit_child_wrap: false,
             guardian_notice_wrap: false,
             bound_identity: None,
-            approved_identities: vec![],
+            approved_identities: String::new(),
         });
         engine
     }

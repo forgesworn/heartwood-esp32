@@ -74,7 +74,7 @@ mod tests {
             audit_child_wrap: false,
             guardian_notice_wrap: false,
             bound_identity: None,
-            approved_identities: vec![],
+            approved_identities: String::new(),
         }
     }
 

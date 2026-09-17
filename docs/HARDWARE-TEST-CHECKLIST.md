@@ -1746,13 +1746,15 @@ bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.
 
 ## 23. A pairing acts only as the identities it was approved for (added 2026-09-17, NOT YET BENCH-RUN)
 
-Decision logic is host-tested in `common/src/policy.rs` (identity gate) and
-`common/src/encoding.rs` (card line). Needs a board with at least one persona
-and an app paired to the master on a legacy slot that already signs silently.
+Decision logic is host-tested in `common/src/policy.rs` (identity gate, tag
+storage) and `common/src/encoding.rs` (card line). Needs a board with at least
+one persona and an app paired to the master on a legacy slot that already signs
+silently. Approved identities are stored per slot as 16-hex-char tags in the
+slot JSON's `ids` field (up to 16).
 
 1. **Upgrade prompts once.** After flashing, the app's first sign as the
-   master raises `HOLD TO SIGN` with the identity line (`<label> npub1xxxx..yyyy`)
-   under the kind. Hold it; the next sign is silent again.
+   master raises `HOLD TO SIGN` with `k<kind> <kind name>` and the identity line
+   (`<label> npub1xxxxxxx..`). Hold it; the next sign is silent again.
 2. **Another identity prompts.** From the same app send `sign_event` with a
    top-level `heartwood` context for `nostr:persona:natural-person`: the card
    names that persona. Tap to deny; the app gets `user denied` and a retry
@@ -1764,12 +1766,20 @@ and an app paired to the master on a legacy slot that already signs silently.
    `get_public_key` with no context stays silent, with a context it prompts.
 5. **heartwood_switch.** Switch to an unapproved persona (one hold), then sign:
    a second, one-time hold naming the persona.
-6. **Strict bound slot.** On a D2 persona-addressed pairing, a request
-   addressed to the master's pubkey answers `unauthorised` with no card.
-7. **Timeout leaves nothing behind.** Let an identity card expire: the slot's
-   `approved_identities` (USB slot list) is unchanged and a retry prompts.
-8. **USB unchanged.** Direct USB requests (no client pubkey) with a context behave exactly as
-   before (their own prompt, nothing recorded).
+6. **Strict slots.** On a D2 persona-addressed pairing, requests as the bound
+   persona stay silent; a request addressed to another identity (the master's
+   pubkey) prompts once, or parks for the guardian on an `escalate` slot, and
+   the approval notice's `identity` tag names that identity. An explicit
+   `heartwood` context is still `unauthorised` with no card.
+7. **Note methods.** `heartwood_note_address` addressed to an unapproved
+   identity answers `unauthorised` with no card; after one approved sign as that
+   identity it works.
+8. **Seventeenth identity.** With 16 identities approved on one slot, a
+   seventeenth prompts on every request and is never recorded.
+9. **Timeout leaves nothing behind.** Let an identity card expire: the slot's
+   `ids` (USB slot list) is unchanged and a retry prompts.
+10. **USB unchanged.** Direct USB requests (no client pubkey) with a context
+    behave exactly as before (their own prompt, nothing recorded).
 
 ## Notes
 

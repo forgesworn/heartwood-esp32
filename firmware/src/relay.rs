@@ -3276,10 +3276,10 @@ struct ParkedRequest {
     master_slot: u8,
     method: String,
     event_kind: Option<u64>,
-    /// Hex pubkey of the identity the request acts as, when identity-scoped
+    /// X-only pubkey of the identity the request acts as, when identity-scoped
     /// (it may be a child the context derives, not `target_pk`). The notice
     /// names it and an approve verdict covers it and nothing else.
-    identity: Option<String>,
+    identity: Option<[u8; 32]>,
     parked_at: Instant,
 }
 
@@ -3290,7 +3290,7 @@ struct ParkTombstone {
     park_id: String,
     client_hex: String,
     key: String,
-    identity: Option<String>,
+    identity: Option<[u8; 32]>,
     master_slot: u8,
 }
 
@@ -3563,10 +3563,7 @@ fn emit_approval_notice(
             guardian_np_hex: &guardian_hex,
             client_hex: &park.client_hex,
             park_id_hex: &park.park_id,
-            identity_hex: &park
-                .identity
-                .clone()
-                .unwrap_or_else(|| hex_encode(&park.target_pk)),
+            identity_hex: &hex_encode(park.identity.as_ref().unwrap_or(&park.target_pk)),
             method: &park.method,
             event_kind: park.event_kind,
             park_ttl_secs: heartwood_common::escalate::PARK_TTL_SECS,
@@ -3742,7 +3739,7 @@ fn tombstone_park(ctx: &mut SignCtx, park: &ParkedRequest) {
         park_id: park.park_id.clone(),
         client_hex: park.client_hex.clone(),
         key: heartwood_common::nip59::method_or_kind_key(&park.method, park.event_kind),
-        identity: park.identity.clone(),
+        identity: park.identity,
         master_slot: park.master_slot,
     });
 }
@@ -3795,12 +3792,15 @@ fn complete_parked(
     park: ParkedRequest,
     window_secs: u64,
 ) -> bool {
+    // The verdict covers the identity the guardian's notice named, and no
+    // other: if the request now resolves to a different identity, the
+    // completion meets the identity gate like any other request.
     let key = heartwood_common::nip59::method_or_kind_key(&park.method, park.event_kind);
     ctx.policy_engine.install_transient_allow(
         park.master_slot,
         park.client_hex.clone(),
         key,
-        park.identity.clone(),
+        park.identity,
         window_secs,
     );
 
@@ -4149,8 +4149,9 @@ fn queue_button_ask(
     }
     // Asks acting as different identities are different decisions: one hold
     // must never approve an identity its card did not name.
-    if let Some(identity) = ask.identity.as_deref() {
-        kind_key = format!("{kind_key}@{identity}");
+    if let Some(identity) = ask.identity.as_ref() {
+        kind_key.push('@');
+        kind_key.extend(heartwood_common::policy::identity_tag(identity).iter().map(|&b| b as char));
     }
     let key = AskKey::new(slot, client_hex.to_string(), hex_encode(target_pk), kind_key);
     let weight = ask
@@ -5510,7 +5511,7 @@ fn handle_nip46_event(
     // The identity the request will act as, resolved the way dispatch will
     // resolve it, so escalation, petitions and rollback see the per-identity
     // gate and not only the slot's method policy.
-    let request_identity = crate::nip46_handler::request_identity_hex(
+    let request_identity = crate::nip46_handler::request_identity(
         &request,
         &signing_secret,
         mode,
@@ -5520,12 +5521,12 @@ fn handle_nip46_event(
         ctx.identity_caches,
         &client_pubkey,
     );
-    let tier = ctx.policy_engine.check_scoped(
-        slot,
-        &ev.pubkey,
-        &method_enum,
-        event_kind,
-        request_identity.as_deref(),
+    let tier = heartwood_common::policy::apply_identity_gate(
+        ctx.policy_engine.check(slot, &ev.pubkey, &method_enum, event_kind),
+        request_identity.as_ref().map_or(true, |identity| {
+            ctx.policy_engine
+                .identity_approved(slot, &ev.pubkey, &method_enum, event_kind, identity)
+        }),
     );
     let slot_snapshot = crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
         .then(|| ctx.policy_engine.snapshot_slot_state(slot));
@@ -5550,7 +5551,7 @@ fn handle_nip46_event(
             master_slot: slot,
             method: request.method.clone(),
             event_kind,
-            identity: request_identity.clone(),
+            identity: request_identity,
             parked_at: Instant::now(),
             request,
         };

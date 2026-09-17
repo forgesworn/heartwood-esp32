@@ -1744,6 +1744,81 @@ bash scripts/build-firmware.sh v3 --release   # -> firmware/target/heartwood-v3.
     bottom row. On a narrow panel it reads `A/B move  holdA back` and the
     pick gesture appears in the subtitle instead.
 
+## 23. A pairing acts only as the identities it was approved for (added 2026-09-17, NOT YET BENCH-RUN)
+
+The whole decision is one pure function, `heartwood_common::policy::gate_request`,
+host-tested as a full matrix; the relay's pre-dispatch plan and the handler both
+call it. Card labels and headings are host-tested in `common/src/encoding.rs`.
+Approved identities are stored per slot as 16-hex-char tags in the slot JSON's
+`ids` field (up to 16) and listed read-only as `approved_identities` in
+`list_clients`. Needs a board with at least one persona and an app paired to the
+master on a legacy slot that already signs silently.
+
+1. **Upgrade prompts once.** After flashing, the app's first sign as the master
+   raises a sign card headed `ALLOW AS <master label>?`, with the app, the kind
+   line (`k<kind> <name>`) and `<label> npub1xxxxxxxx..`. One hold signs and
+   approves the identity; the next sign is silent. An approved identity whose
+   sign still needs a hold by policy reads `HOLD TO SIGN` as before.
+2. **Approval covers every method.** After step 1, `nip44_decrypt` as the master
+   is silent (policy permitting).
+3. **Another identity prompts.** `sign_event` with a top-level `heartwood`
+   context for `nostr:persona:natural-person` reads `ALLOW AS natural-p?`. Tap to
+   deny: `user denied`, a retry prompts again. Hold on the retry: further signs,
+   encrypts and decrypts as it are silent.
+4. **Unregistered child.** A context for a purpose not in the registry reads
+   `ALLOW AS ?<tail>#<index>?` (index shown when not 0).
+5. **Relay addressing.** `#p` to a persona's own pubkey from the master-paired
+   app: same card, same one-time approval. Non-identity cards on that connection
+   (for example `heartwood_derive`) read `SIGN AS <persona label>?`, never the
+   master's label.
+6. **Contextual pubkey.** `get_public_key` with a context for an unapproved
+   identity reads `NPUB AS <label>?` with the app and short npub; after the hold
+   it is answered and nothing is recorded (it prompts again next time).
+   Without a context it stays silent.
+7. **Crypto card.** `nip44_decrypt` with a context for an unapproved identity
+   reads `ALLOW AS <label>? / <app> / npub1xxxxxxxx..`.
+8. **Note methods.** `heartwood_note_address` as an unapproved identity raises
+   `ALLOW AS`; after the hold it answers. `heartwood_note_send` as an unapproved
+   identity raises `ALLOW AS`, then the `SEND NOTE` card over USB; over the relay
+   the first request answers `identity approved; send the request again`, and
+   the retry raises `SEND NOTE` alone.
+9. **heartwood_list_identities.** On a legacy pairing that does not list it:
+   `LIST IDS FOR <app>?`. After the hold the method is in the slot's
+   `allowed_methods` and answers silently. On a strict slot it stays
+   `unauthorised` unless listed. Bark: see the note on its 5 s connect probe.
+10. **heartwood_switch.** Switching reads `SWITCH TO <label>?` with the short
+    npub below. The hold switches and approves the target, so the app's
+    following `get_public_key` and first sign as it raise no card (Bark: one
+    press per switch, as before). A switch a slot policy lets through silently,
+    or a guardian verdict, records nothing.
+11. **Rebind seeds; wallet pairing does not.** A signing slot's rebind hold (a
+    new client key with the slot secret) clears the old approvals and seeds the
+    served identity. `heartwood_pair_wallet` records nothing: the new wallet's
+    first note method raises `ALLOW AS`. A never-seen key binding to a slot
+    whose previous key was removed also clears its approvals.
+11b. **A card acts only as it said.** Put up a `HOLD TO SIGN` or `ALLOW AS` card
+    over the relay for the master, then (before holding) switch the same app to
+    a persona silently (a slot that lists `heartwood_switch` with auto-approve).
+    Hold: the request answers `unauthorised`, nothing is signed or recorded.
+    A deferred `SWITCH TO` whose persona is removed before the hold answers
+    `identity not found in cache`; otherwise it switches to exactly the pubkey
+    the card showed, even if another persona now shares the name.
+11c. **Backups keep grants.** Export a legacy slot holding the LIST IDS grant
+    and approved identities, restore it: both survive (signing is stripped as
+    before).
+12. **Binding change clears.** Change a slot's `bound_identity` (USB
+    CONNSLOT_UPDATE or `update_client`): `approved_identities` is empty and the
+    new binding signs without a card.
+13. **Strict slots.** On a D2 persona-addressed pairing, the bound persona is
+    silent; another identity prompts once (or parks for the guardian on an
+    `escalate` slot, with the notice's `identity` tag naming it). An explicit
+    `heartwood` context is still `unauthorised` with no card.
+14. **Seventeenth identity.** With 16 approved on one slot, a seventeenth
+    prompts on every request and is never recorded.
+15. **Timeout leaves nothing behind.** Let any of these cards expire: the slot is
+    unchanged and a retry prompts.
+16. **USB unchanged.** Direct USB requests (no client pubkey) behave as before.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

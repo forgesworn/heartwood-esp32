@@ -1182,10 +1182,11 @@ fn ellipsize_chars(value: &str, max_chars: usize) -> String {
     out
 }
 
-/// The header `show_master_sign_request` draws, framed as the question it is.
-/// Shared so the relay's card log reports the panel's wording, not the label.
-pub(crate) fn master_sign_heading(master_label: &str) -> String {
-    format!("SIGN AS {}?", truncate_str(master_label, 12))
+/// The heading of a card for an action of the served identity, framed as the
+/// question it is: `SIGN AS <label>?`. Gate cards build their own headings
+/// (`ALLOW AS`, `NPUB AS`, `LIST IDS FOR`) through the same helper.
+pub(crate) fn master_sign_heading(label: &str) -> String {
+    heartwood_common::encoding::card_heading("SIGN AS", label)
 }
 
 /// Display a signing request with requester, kind, content preview, and countdown.
@@ -1202,6 +1203,23 @@ pub fn show_sign_request(
     requester: &str,
     kind: u64,
     _content_preview: &str,
+    seconds_remaining: u32,
+) {
+    show_sign_request_as(display, requester, kind, None, None, seconds_remaining);
+}
+
+/// `show_sign_request` for a remote client, naming the identity it signs as.
+///
+/// With an identity the kind name and number share the first small line and
+/// the identity (label + short npub) takes the second, so the layout keeps the
+/// same rows and the countdown bar is untouched. `heading` replaces
+/// `HOLD TO SIGN` when the hold also approves the identity (`ALLOW AS`).
+pub fn show_sign_request_as(
+    display: &mut Display<'_>,
+    requester: &str,
+    kind: u64,
+    identity: Option<&str>,
+    heading: Option<&str>,
     seconds_remaining: u32,
 ) {
     let l = layout(display);
@@ -1221,7 +1239,9 @@ pub fn show_sign_request(
         .build();
 
     // Header
-    Text::new("HOLD TO SIGN", Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    Text::new(heading.unwrap_or("HOLD TO SIGN"), Point::new(l.sx(2), l.sy(10)), header)
+        .draw(display)
+        .ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
@@ -1233,13 +1253,15 @@ pub fn show_sign_request(
     let app = ellipsize_chars(&app, l.chars_per_line(l.font_body()));
     Text::new(&app, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
-    let kind_name = kind_name_line(kind);
-    let kind_name = ellipsize_chars(&kind_name, l.chars_per_line(l.font_small()));
-    Text::new(&kind_name, Point::new(l.sx(2), l.sy(39)), small).draw(display).ok();
+    let (kind_line, second_line) = match identity {
+        Some(identity) => (format!("k{kind} {}", kind_name_line(kind)), identity.to_string()),
+        None => (kind_name_line(kind), format!("kind {kind}")),
+    };
+    let kind_line = ellipsize_chars(&kind_line, l.chars_per_line(l.font_small()));
+    Text::new(&kind_line, Point::new(l.sx(2), l.sy(39)), small).draw(display).ok();
 
-    let kind_number = format!("kind {kind}");
-    let kind_number = ellipsize_chars(&kind_number, l.chars_per_line(l.font_small()));
-    Text::new(&kind_number, Point::new(l.sx(2), l.sy(48)), small).draw(display).ok();
+    let second_line = ellipsize_chars(&second_line, l.chars_per_line(l.font_small()));
+    Text::new(&second_line, Point::new(l.sx(2), l.sy(48)), small).draw(display).ok();
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);
@@ -1445,14 +1467,14 @@ pub fn show_bridge_connected(
 /// Display a signing request with master label, method, kind, content, and countdown.
 ///
 /// Layout:
-///   Header:  master label (FONT_6X10, tracked)
+///   Header:  full heading, e.g. SIGN AS <label>? (FONT_6X10, tracked)
 ///   Rule:    1px line
 ///   Method:  method + kind (FONT_7X14)
 ///   Content: preview (FONT_5X8)
 ///   Bar:     graphical countdown
 pub fn show_master_sign_request(
     display: &mut Display<'_>,
-    master_label: &str,
+    heading: &str,
     method: &str,
     kind: Option<u64>,
     content_preview: &str,
@@ -1474,10 +1496,8 @@ pub fn show_master_sign_request(
         .text_color(FG)
         .build();
 
-    // Header: SIGN AS {label}? — frame it as the question it is, like the
-    // per-app screen, so it doesn't read as a bare label.
-    let heading = master_sign_heading(master_label);
-    Text::new(&heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
+    // Header: the question the hold answers (see `master_sign_heading`).
+    Text::new(heading, Point::new(l.sx(2), l.sy(10)), header).draw(display).ok();
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(ACCENT))

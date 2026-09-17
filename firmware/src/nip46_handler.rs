@@ -36,20 +36,11 @@ use zeroize::Zeroize;
 
 use crate::approval::ApprovalResult;
 use crate::oled::Display;
+use heartwood_common::policy::{resume_decision, CardKind, Gate, ResumeDecision, ShownCard};
 use crate::policy::PolicyEngine;
 
 /// Timeout in seconds shown on the OLED countdown bar.
 const APPROVAL_TIMEOUT_SECS: u64 = 30;
-
-/// A strict slot's `Denied` decision is a dispatch-wide ceiling, not a hint for
-/// individual method arms. Keep the remote-client condition explicit so the
-/// direct USB path retains its physical-possession semantics.
-fn denied_before_dispatch(
-    has_client: bool,
-    tier: heartwood_common::policy::ApprovalTier,
-) -> bool {
-    has_client && tier == heartwood_common::policy::ApprovalTier::Denied
-}
 
 /// A public relay is not an approval queue. Only a client already bound to a
 /// slot may make the device wait for a physical decision; otherwise strangers
@@ -110,19 +101,6 @@ fn spend_grant_covers(method: &str, params: &[Value], client_hex: &str) -> bool 
     };
     let Some(id) = cmd.get("id").and_then(Value::as_str) else { return false };
     crate::notes::take_spend_grant(id, &client)
-}
-
-/// Exact v2 authority is installed for the relay-addressed identity. An
-/// explicit Heartwood context can redirect the same approved method to an
-/// arbitrary derived child, which that policy did not name, so strict slots
-/// reject it independent of method. Legacy slots retain their historical
-/// context behavior; an internally-resolved active identity is not explicit.
-fn strict_slot_denies_explicit_context(
-    has_client: bool,
-    strict_slot: bool,
-    explicit_heartwood_context: bool,
-) -> bool {
-    has_client && strict_slot && explicit_heartwood_context
 }
 
 /// Remote Heartwood extensions that mutate identity state must cross one
@@ -213,7 +191,8 @@ fn build_sign_reply(
     }
 }
 
-/// Persist a connect-slot bind, undoing it if the write does not land.
+/// Persist a connect-slot bind or identity approval, undoing it if the write
+/// does not land.
 ///
 /// #75: `connect` used to answer success as soon as the pubkey was assigned in
 /// RAM, so a full NVS produced a client that believed it was paired against a
@@ -232,13 +211,13 @@ fn persist_bind_or_rollback(
         return Ok(());
     }
     if policy_engine.restore_slot_state_durably(nvs, snapshot) {
-        log::error!("connect: bind was not durable; prior slot authority restored durably");
-        Err("could not persist client bind; request was not applied".into())
+        log::error!("slot authority was not durable; prior slot authority restored durably");
+        Err("could not persist client policy; request was not applied".into())
     } else {
         log::error!(
-            "connect: FATAL: bind failed and prior slot authority could not be restored durably"
+            "FATAL: slot authority not durable and prior authority could not be restored durably"
         );
-        Err("fatal storage error: could not restore prior client policy after bind; \
+        Err("fatal storage error: could not restore prior client policy; \
              take the device offline for USB recovery"
             .into())
     }
@@ -412,9 +391,15 @@ pub enum ApprovalDecision {
 
 /// What the operator is being asked to approve, enough to draw the card.
 pub enum AskCard {
-    Sign { requester: String, kind: u64 },
+    /// `identity` is the card line naming the identity the request signs as
+    /// (label and short npub), present for every slot-bound remote client.
+    /// `heading` replaces `HOLD TO SIGN` when the card also approves the
+    /// identity (`ALLOW AS <identity>?`).
+    Sign { requester: String, kind: u64, identity: Option<String>, heading: Option<String> },
+    /// A card drawn by `show_master_sign_request`: the full heading, the line
+    /// under it (a method name, or the app for a gate card) and a preview.
     Extension {
-        master_label: String,
+        heading: String,
         method: String,
         preview: String,
     },
@@ -431,6 +416,69 @@ pub struct DeferredAsk {
     pub card: AskCard,
     pub request: nip46::Nip46Request,
     pub event: Option<UnsignedEvent>,
+    /// X-only pubkey of the identity the request acts as, when identity-scoped.
+    /// Part of the card's batching key, so one hold never answers asks for an
+    /// identity its card did not name. The resumed dispatch re-derives the
+    /// same identity from the same served pubkey and request context.
+    pub identity: Option<[u8; 32]>,
+    /// What the resumed dispatch must know about the first pass.
+    pub resume: Resume,
+}
+
+/// Facts from a deferred ask's first pass that its resumed dispatch cannot
+/// recompute.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Resume {
+    /// Whether the CALLER sent a Heartwood context. The first pass writes a
+    /// session's active identity into the request, which would otherwise read
+    /// as caller-supplied on resume and be refused on a strict slot.
+    pub explicit_context: bool,
+    /// The card the hold answers and the identity it named. The resumed
+    /// dispatch acts only if the request still needs exactly this card and
+    /// acts as exactly this identity (`common::policy::resume_decision`).
+    pub shown: ShownCard,
+}
+
+/// How a card's hold came out.
+enum Hold {
+    Approved,
+    /// The caller must hand the ask back (`ApprovalDecision::Deferred`).
+    Deferred,
+    /// Denied or timed out: this response ends the request.
+    Refused(String),
+}
+
+/// Obtain a hold on one `show_master_sign_request` card under `approval`.
+fn hold_for_card(
+    approval: ApprovalDecision,
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    heading: &str,
+    line: &str,
+    preview: &str,
+    request_id: &str,
+) -> Hold {
+    match approval {
+        ApprovalDecision::Deferred => Hold::Deferred,
+        ApprovalDecision::ButtonApproved => Hold::Approved,
+        ApprovalDecision::Interactive => {
+            let result = crate::approval::run_approval_loop(
+                display,
+                buttons,
+                APPROVAL_TIMEOUT_SECS,
+                |d, remaining| {
+                    crate::oled::show_master_sign_request(d, heading, line, None, preview, remaining);
+                },
+            );
+            match extension_approval_failure(request_id, result) {
+                Some(response) => {
+                    crate::oled::show_result(display, "Not approved");
+                    Hold::Refused(response)
+                }
+                None => Hold::Approved,
+            }
+        }
+    }
 }
 
 /// Outcome of a dispatch attempt.
@@ -467,6 +515,7 @@ pub fn handle_parsed_request(
     match dispatch(
         request,
         None,
+        None,
         master_secret,
         master_label,
         master_mode,
@@ -498,6 +547,8 @@ pub fn handle_parsed_request(
 pub fn dispatch(
     request: nip46::Nip46Request,
     prepared_event: Option<UnsignedEvent>,
+    // A resumed ask's `DeferredAsk::resume`; `None` for a fresh request.
+    resume: Option<Resume>,
     master_secret: &[u8; 32],
     master_label: &str,
     master_mode: MasterMode,
@@ -516,6 +567,7 @@ pub fn dispatch(
     let json = dispatch_inner(
         request,
         prepared_event,
+        resume,
         master_secret,
         master_label,
         master_mode,
@@ -541,6 +593,7 @@ pub fn dispatch(
 fn dispatch_inner(
     mut request: nip46::Nip46Request,
     prepared_event: Option<UnsignedEvent>,
+    resume: Option<Resume>,
     master_secret: &[u8; 32],
     master_label: &str,
     master_mode: MasterMode,
@@ -645,7 +698,8 @@ fn dispatch_inner(
     // Capture caller intent before a legacy session's active identity may be
     // resolved into this field below. Only a caller-supplied context is a
     // strict-policy redirection attempt.
-    let explicit_heartwood_context = request.heartwood.is_some();
+    let explicit_heartwood_context =
+        resume.map_or(request.heartwood.is_some(), |resume| resume.explicit_context);
 
     log::info!(
         "NIP-46 request: method={} id={} master_slot={}",
@@ -656,32 +710,18 @@ fn dispatch_inner(
 
     // If no heartwood context in the request, resolve from the session's
     // active identity (set by a prior heartwood_switch call).
-    if request.heartwood.is_none() {
-        if let Some(cpk) = client_pubkey {
-            if let Some(session) = policy_engine
-                .sessions
-                .iter()
-                .find(|s| s.client_pubkey == *cpk && s.master_slot == master_slot)
-            {
-                if let Some(identity_idx) = session.active_identity {
-                    if let Some(cache) = identity_caches
-                        .iter()
-                        .find(|c| c.master_slot == master_slot)
-                    {
-                        if let Some(identity) = cache.identities.get(identity_idx) {
-                            log::info!(
-                                "Resolving active identity: purpose={} index={}",
-                                identity.purpose,
-                                identity.index,
-                            );
-                            request.heartwood = Some(HeartwoodContext {
-                                purpose: identity.purpose.clone(),
-                                index: identity.index,
-                            });
-                        }
-                    }
-                }
-            }
+    // A resumed ask keeps the context its card was shown with: a switch while
+    // the card waited must not change who the hold acts as.
+    if request.heartwood.is_none() && resume.is_none() {
+        if let Some(context) =
+            resolve_active_context(policy_engine, identity_caches, client_pubkey, master_slot)
+        {
+            log::info!(
+                "Resolving active identity: purpose={} index={}",
+                context.purpose,
+                context.index,
+            );
+            request.heartwood = Some(context);
         }
     }
 
@@ -721,14 +761,8 @@ fn dispatch_inner(
         request.legacy_client_pubkey.take().unwrap_or_default()
     };
     let has_client = !client_hex.is_empty() && client_hex.len() == 64;
-    let (client_is_bound, strict_slot) = if has_client {
-        policy_engine
-            .find_slot_by_pubkey(master_slot, &client_hex)
-            .map(|slot| (true, slot.strict_permissions))
-            .unwrap_or((false, false))
-    } else {
-        (false, false)
-    };
+    let client_is_bound =
+        has_client && policy_engine.find_slot_by_pubkey(master_slot, &client_hex).is_some();
     let requester_label = if has_client {
         signing_requester_label(policy_engine, master_slot, &client_hex)
     } else {
@@ -767,29 +801,56 @@ fn dispatch_inner(
         return build_error_json(&request.id, -1, "unauthorised");
     }
 
-    // A strict slot names methods and event kinds for the identity selected by
-    // relay routing. It grants no authority to redirect those same operations
-    // to a caller-chosen derived child via top-level `heartwood` context.
-    if strict_slot_denies_explicit_context(
+    // SECURITY BOUNDARY: one pure gate (`heartwood_common::policy::gate_request`,
+    // which the relay's pre-dispatch plan calls too) decides, for a remote
+    // client: the exact v2 ceiling; an explicit Heartwood context on a strict
+    // slot (strict authority names methods and kinds for the identity relay
+    // routing selects, never a caller-chosen child); whether the client may act
+    // as the identity whose key the request will use (the served identity, or
+    // the child a caller context or session active identity derives from it);
+    // and whether it may list identities. Direct USB keeps physical-possession
+    // semantics. The gate runs before any card or match arm, so a new method
+    // cannot bypass it by omitting approval code.
+    let note_scoped = heartwood_common::policy::method_uses_served_key(&request.method);
+    // A resumed ask re-derives the same identity: the served key is resolved
+    // again from the same pubkey and the context travels in the request.
+    let (gate, identity) = match plan_gate(
+        policy_engine,
+        master_slot,
+        &client_hex,
         has_client,
-        strict_slot,
+        &method,
+        &request.method,
+        event_kind,
+        tier,
         explicit_heartwood_context,
+        request.heartwood.as_ref(),
+        master_secret,
+        master_mode,
+        secp,
     ) {
-        log::warn!(
-            "{}: refused — explicit Heartwood identity context is outside exact slot policy",
-            request.method
-        );
-        return build_error_json(&request.id, -1, "unauthorised");
-    }
-
-    // SECURITY BOUNDARY: exact v2 slots deny every method outside their
-    // operator-installed ceiling. Enforce that once before dispatch so a new or
-    // Heartwood-specific method cannot accidentally bypass the policy merely
-    // because its individual match arm does not inspect `tier`.
-    if denied_before_dispatch(has_client, tier) {
-        log::warn!("{}: refused — outside exact slot policy", request.method);
-        return build_error_json(&request.id, -1, "unauthorised");
-    }
+        Ok(plan) => plan,
+        Err(()) => return build_error_json(&request.id, -4, "key derivation failure"),
+    };
+    let gate_card = match gate {
+        Gate::Deny => {
+            log::warn!("{}: refused — outside slot policy or identity scope", request.method);
+            return build_error_json(&request.id, -1, "unauthorised");
+        }
+        Gate::Allow => None,
+        Gate::Card(kind) => Some(kind),
+    };
+    let identity_label = identity.as_ref().map(|pubkey| {
+        identity_label_for(personas, master_label, pubkey, request.heartwood.as_ref().filter(|_| !note_scoped))
+    });
+    let identity_line = identity
+        .as_ref()
+        .zip(identity_label.as_deref())
+        .map(|(pubkey, label)| heartwood_common::encoding::identity_card_line(label, pubkey));
+    // A sign carries ALLOW AS on its own card, so the owner sees the kind with
+    // the identity and presses once.
+    let allow_sign = matches!(method, nip46::Nip46Method::SignEvent)
+        && matches!(gate_card, Some(CardKind::AllowAs { .. }));
 
     // Validate replay, trusted expiry and receipt storage *before* raising a
     // card. A retried or stale request must not consume another physical hold.
@@ -844,12 +905,127 @@ fn dispatch_inner(
     if spend_granted {
         log::info!("{}: riding the export hold just approved for this note", request.method);
     }
-
     // A ButtonRequired tier is meaningful only if the handler actually stops
     // for the button. Keep this single gate before dispatch so a new extension
     // cannot accidentally mutate state merely by omitting approval code from
     // its individual match arm. Strict v2 denials returned above never prompt.
-    if !spend_granted && remote_extension_requires_approval(has_client, &method, tier) {
+    // A switch's press is the gate's SWITCH TO card, never a second one.
+    let own_card = !spend_granted
+        && !matches!(gate_card, Some(CardKind::SwitchTo { .. }))
+        && remote_extension_requires_approval(has_client, &method, tier);
+
+    // A switch card names, approves and switches to one resolved pubkey. A
+    // fresh request resolves the target now; a resumed one keeps the pubkey
+    // its card showed, and only if that identity is still in the cache.
+    let switch_target_now = matches!(gate_card, Some(CardKind::SwitchTo { .. })).then(|| {
+        match resume {
+            Some(resume) => resume.shown.identity.filter(|pubkey| {
+                switch_target_exists(pubkey, identity_caches, master_slot, master_secret, master_mode, secp)
+            }),
+            None => switch_target(&request.params, identity_caches, master_slot, master_secret, master_mode, secp),
+        }
+    });
+    let shown_now = ShownCard {
+        card: gate_card,
+        identity: match switch_target_now {
+            Some(target) => target,
+            None => identity,
+        },
+    };
+    // A hold answers exactly the card it was shown on, for exactly the
+    // identity it named. Never act on or record an identity the card did not.
+    if let Some(resume) = resume {
+        // Whether the slot itself now holds what the shown card grants (an
+        // earlier ask in the same batch recorded it), as opposed to a verdict.
+        let recorded = policy_engine
+            .find_slot_by_pubkey(master_slot, &client_hex)
+            .is_some_and(|slot| match resume.shown.card {
+                Some(CardKind::AllowAs { .. }) => shown_now
+                    .identity
+                    .as_ref()
+                    .is_some_and(|pubkey| heartwood_common::policy::identity_approved(slot, pubkey)),
+                Some(CardKind::ListIds) => {
+                    slot.allowed_methods.iter().any(|m| m == "heartwood_list_identities")
+                }
+                _ => false,
+            });
+        match resume_decision(&resume.shown, shown_now.card, shown_now.identity.as_ref(), own_card, recorded) {
+            ResumeDecision::Proceed => {}
+            ResumeDecision::IdentityChanged => {
+                log::warn!("{}: refused: identity changed while the card waited", request.method);
+                return build_error_json(&request.id, -1, "unauthorised");
+            }
+            ResumeDecision::CardChanged => {
+                return build_error_json(&request.id, -1, "approval changed while waiting; send the request again");
+            }
+            ResumeDecision::OwnCardNext => {
+                return build_error_json(&request.id, -1, "identity approved; send the request again");
+            }
+        }
+    }
+
+    // The gate's own card, before the method's flow: ALLOW AS <identity>?
+    // (this app may act as the identity for every method; recorded unless the
+    // list is full), NPUB AS <identity>? (one derived pubkey, recorded nowhere)
+    // or LIST IDS FOR <app>? (adds the method to a legacy slot).
+    if let Some(kind) = gate_card.filter(|_| !allow_sign) {
+        // The identity a SWITCH TO card names and approves: the switch target,
+        // resolved exactly as the switch arm resolves it.
+        let (identity, identity_label) = match kind {
+            CardKind::SwitchTo { .. } => {
+                let target = shown_now.identity;
+                let label = target.as_ref().map(|pubkey| {
+                    let context = cached_context(pubkey, identity_caches, master_slot);
+                    identity_label_for(personas, master_label, pubkey, context.as_ref())
+                });
+                (target, label)
+            }
+            _ => (identity, identity_label.clone()),
+        };
+        let (heading, preview) = match kind {
+            CardKind::ListIds => (
+                heartwood_common::encoding::card_heading("LIST IDS FOR", &requester_label),
+                "names and npubs".to_string(),
+            ),
+            _ => (
+                heartwood_common::encoding::card_heading(
+                    match kind {
+                        CardKind::NpubAs => "NPUB AS",
+                        CardKind::SwitchTo { .. } => "SWITCH TO",
+                        _ => "ALLOW AS",
+                    },
+                    identity_label.as_deref().unwrap_or("?"),
+                ),
+                identity.as_ref().map(heartwood_common::encoding::short_npub).unwrap_or_default(),
+            ),
+        };
+        match hold_for_card(approval, display, buttons, &heading, &requester_label, &preview, &request.id) {
+            Hold::Refused(response) => return response,
+            Hold::Deferred => {
+                *deferred = Some(Box::new(DeferredAsk {
+                    card: AskCard::Extension { heading, method: requester_label, preview },
+                    request,
+                    event: None,
+                    identity,
+                    resume: Resume { explicit_context: explicit_heartwood_context, shown: shown_now },
+                }));
+                return String::new();
+            }
+            Hold::Approved => {}
+        }
+        let snapshot = policy_engine.snapshot_slot_state(master_slot);
+        let changed = match (kind, identity.as_ref()) {
+            (CardKind::AllowAs { .. } | CardKind::SwitchTo { .. }, Some(pubkey)) => {
+                policy_engine.record_identity(master_slot, Ok(&client_hex), pubkey)
+            }
+            (CardKind::ListIds, _) => policy_engine.grant_list_identities(master_slot, &client_hex),
+            _ => false,
+        };
+        if let Err(response) = persist_grant(policy_engine, nvs, master_slot, &request.id, snapshot, changed) {
+            return response;
+        }
+    }
+    if own_card {
         // A note card shows the money, not the method name: amount, mint
         // and (for send) the recipient, as the cable path already does.
         let note_card = if method.requires_fresh_physical_approval() {
@@ -875,47 +1051,30 @@ fn dispatch_inner(
             Some((_, title)) => title,
             None => extension_approval_preview(&requester_label, &request.params),
         };
-        match approval {
-            ApprovalDecision::Deferred => {
+        let heading = crate::oled::master_sign_heading(master_label);
+        match hold_for_card(approval, display, buttons, &heading, &request.method, &preview, &request.id) {
+            Hold::Refused(response) => return response,
+            Hold::Deferred => {
                 *deferred = Some(Box::new(DeferredAsk {
-                    card: AskCard::Extension {
-                        master_label: master_label.to_string(),
-                        method: request.method.clone(),
-                        preview,
-                    },
+                    card: AskCard::Extension { heading, method: request.method.clone(), preview },
                     request,
                     event: None,
+                    identity: None,
+                    resume: Resume { explicit_context: explicit_heartwood_context, shown: shown_now },
                 }));
                 return String::new();
             }
-            ApprovalDecision::ButtonApproved => {
-                log::info!("{}: dispatching on a hold already completed", request.method);
-            }
-            ApprovalDecision::Interactive => {
-                let result = crate::approval::run_approval_loop(
-                    display,
-                    buttons,
-                    APPROVAL_TIMEOUT_SECS,
-                    |d, remaining| {
-                        crate::oled::show_master_sign_request(
-                            d,
-                            master_label,
-                            &request.method,
-                            None,
-                            &preview,
-                            remaining,
-                        );
-                    },
-                );
-                if let Some(response) = extension_approval_failure(&request.id, result) {
-                    log::info!("{}: physical approval denied or timed out", request.method);
-                    crate::oled::show_result(display, "Not approved");
-                    return response;
-                }
-                log::info!("{}: physically approved", request.method);
-            }
+            Hold::Approved => {}
         }
     }
+
+    // The signing card carries the identity decision: an unapproved identity
+    // raises a sign that policy would auto-approve to the physical prompt.
+    let sign_tier = if allow_sign {
+        heartwood_common::policy::ApprovalTier::ButtonRequired
+    } else {
+        tier
+    };
 
     match request.method.as_str() {
         "sign_event" | SIGN_EVENT_COMPACT => {
@@ -926,7 +1085,7 @@ fn dispatch_inner(
                     return build_error_json(&request.id, -3, "bad event format");
                 }
             };
-            match tier {
+            match sign_tier {
                 heartwood_common::policy::ApprovalTier::AutoApprove => {
                     log::info!("sign_event: auto-approved by policy");
                     crate::confirm::present(
@@ -957,17 +1116,34 @@ fn dispatch_inner(
                     }
                 }
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
+                    let heading = allow_sign.then(|| {
+                        heartwood_common::encoding::card_heading(
+                            "ALLOW AS",
+                            identity_label.as_deref().unwrap_or_default(),
+                        )
+                    });
                     if matches!(approval, ApprovalDecision::Deferred) {
                         *deferred = Some(Box::new(DeferredAsk {
                             card: AskCard::Sign {
                                 requester: requester_label.clone(),
                                 kind: event.kind,
+                                identity: identity_line.clone(),
+                                heading,
                             },
                             request,
                             event: Some(event),
+                            identity,
+                            resume: Resume {
+                                explicit_context: explicit_heartwood_context,
+                                shown: shown_now,
+                            },
                         }));
                         return String::new();
                     }
+                    // Taken before any authority change a successful sign
+                    // makes, so a failed write can undo all of it.
+                    let identity_snapshot =
+                        allow_sign.then(|| policy_engine.snapshot_slot_state(master_slot));
                     let result = if matches!(approval, ApprovalDecision::ButtonApproved) {
                         sign_approved_event(
                             master_secret,
@@ -987,6 +1163,8 @@ fn dispatch_inner(
                             buttons,
                             &request,
                             &requester_label,
+                            identity_line.as_deref(),
+                            heading.as_deref(),
                             event,
                         )
                     };
@@ -1000,6 +1178,19 @@ fn dispatch_inner(
                         {
                             let idx = slot.slot_index;
                             policy_engine.upgrade_to_signing(master_slot, idx);
+                        }
+                        if let (Some(snapshot), Some(pubkey)) = (identity_snapshot, identity.as_ref()) {
+                            let changed = policy_engine.record_identity(master_slot, Ok(&client_hex), pubkey);
+                            if let Err(response) = persist_grant(
+                                policy_engine,
+                                nvs,
+                                master_slot,
+                                &request.id,
+                                snapshot,
+                                changed,
+                            ) {
+                                return response;
+                            }
                         }
                     }
                     result
@@ -1109,53 +1300,24 @@ fn dispatch_inner(
                                 // showed the flash is not an approval.)
                                 if slot_can_sign {
                                     let preview = format!("rebind '{slot_label}'");
-                                    match approval {
-                                        ApprovalDecision::Deferred => {
+                                    let heading = crate::oled::master_sign_heading(master_label);
+                                    match hold_for_card(approval, display, buttons, &heading, "connect", &preview, &request.id) {
+                                        Hold::Refused(response) => return response,
+                                        Hold::Deferred => {
                                             *deferred = Some(Box::new(DeferredAsk {
                                                 card: AskCard::Extension {
-                                                    master_label: master_label.to_string(),
+                                                    heading,
                                                     method: request.method.clone(),
                                                     preview,
                                                 },
                                                 request,
                                                 event: None,
+                                                identity: None,
+                                                resume: Resume::default(),
                                             }));
                                             return String::new();
                                         }
-                                        ApprovalDecision::ButtonApproved => {
-                                            log::info!(
-                                                "connect: slot {slot_index} rebind dispatching on a hold already completed"
-                                            );
-                                        }
-                                        ApprovalDecision::Interactive => {
-                                            let result = crate::approval::run_approval_loop(
-                                                display,
-                                                buttons,
-                                                APPROVAL_TIMEOUT_SECS,
-                                                |d, remaining| {
-                                                    crate::oled::show_master_sign_request(
-                                                        d,
-                                                        master_label,
-                                                        "connect",
-                                                        None,
-                                                        &preview,
-                                                        remaining,
-                                                    );
-                                                },
-                                            );
-                                            if let Some(response) =
-                                                extension_approval_failure(&request.id, result)
-                                            {
-                                                log::info!(
-                                                    "connect: slot {slot_index} rebind denied or timed out"
-                                                );
-                                                crate::oled::show_result(display, "Not approved");
-                                                return response;
-                                            }
-                                            log::info!(
-                                                "connect: slot {slot_index} rebind physically approved"
-                                            );
-                                        }
+                                        Hold::Approved => {}
                                     }
                                 } else if was_signing {
                                     // Signing grant stored but not currently in
@@ -1167,11 +1329,21 @@ fn dispatch_inner(
                                         "reconnected",
                                     );
                                 }
+                                // A new client clears the slot's identity
+                                // approvals; the rebind hold the owner just
+                                // gave approves the identity it is served as.
                                 policy_engine.assign_pubkey_to_slot(
                                     master_slot,
                                     slot_index,
                                     client_hex.clone(),
                                 );
+                                if slot_can_sign {
+                                    if let Some(served) =
+                                        effective_identity(master_secret, master_mode, secp, None)
+                                    {
+                                        policy_engine.record_identity(master_slot, Err(slot_index), &served);
+                                    }
+                                }
                                 log::info!("Slot {} ({}) pubkey swapped", slot_index, slot_label);
                                 bind_mutated = true;
                             }
@@ -1508,8 +1680,20 @@ fn dispatch_inner(
                     Err(e) => return build_error_json(&request.id, -3, e),
                 };
 
+            // A carded switch goes to exactly the pubkey its card named.
+            let carded = switch_target_now.map(|target| target.ok_or(()));
+            if let Some(Err(())) = carded {
+                return build_error_json(&request.id, -4, "identity not found in cache");
+            }
+            let carded = carded.and_then(Result::ok);
+            let served_pubkey = effective_identity(master_secret, master_mode, secp, None);
+            let to_master = match carded {
+                Some(pubkey) => Some(pubkey) == served_pubkey,
+                None => target == "master",
+            };
+
             // "master" resets to the master identity — return its npub.
-            if target == "master" {
+            if to_master {
                 // Clear active identity on the session.
                 if let Some(cpk) = client_pubkey {
                     if let Some(session) = policy_engine.get_or_create_session(*cpk, master_slot) {
@@ -1545,11 +1729,15 @@ fn dispatch_inner(
                 }
             };
 
-            // Search by npub, then persona name, then purpose+index.
-            let found = cache
-                .find_by_npub(target)
-                .or_else(|| cache.find_by_persona(target))
-                .or_else(|| cache.find(target, index_hint));
+            // Search by npub, then persona name, then purpose+index, unless a
+            // card already fixed the pubkey.
+            let found = match carded {
+                Some(pubkey) => cache.identities.iter().position(|id| id.public_key == pubkey),
+                None => cache
+                    .find_by_npub(target)
+                    .or_else(|| cache.find_by_persona(target))
+                    .or_else(|| cache.find(target, index_hint)),
+            };
 
             match found {
                 Some(idx) => {
@@ -1795,6 +1983,189 @@ fn signing_requester_label(
         .unwrap_or_else(|| anonymous_client_label(client_hex))
 }
 
+/// The session's active identity (set by an approved `heartwood_switch`) as
+/// a Heartwood context, when the session has one.
+pub(crate) fn resolve_active_context(
+    policy_engine: &PolicyEngine,
+    identity_caches: &[crate::identity_cache::IdentityCache],
+    client_pubkey: Option<&[u8; 32]>,
+    master_slot: u8,
+) -> Option<HeartwoodContext> {
+    let cpk = client_pubkey?;
+    let identity_idx = policy_engine
+        .sessions
+        .iter()
+        .find(|s| s.client_pubkey == *cpk && s.master_slot == master_slot)?
+        .active_identity?;
+    let identity = identity_caches
+        .iter()
+        .find(|c| c.master_slot == master_slot)?
+        .identities
+        .get(identity_idx)?;
+    Some(HeartwoodContext {
+        purpose: identity.purpose.clone(),
+        index: identity.index,
+    })
+}
+
+/// X-only pubkey of the key a request will actually use: the served
+/// identity's own key with no context, else the child the context derives
+/// from it (the same chain `do_sign` and `resolve_signing_secret` follow).
+pub(crate) fn effective_identity(
+    served_secret: &[u8; 32],
+    master_mode: MasterMode,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    heartwood: Option<&HeartwoodContext>,
+) -> Option<[u8; 32]> {
+    match heartwood {
+        Some(ctx) => derive_identity(served_secret, master_mode, &ctx.purpose, ctx.index)
+            .ok()
+            .map(|(_secret, pubkey)| pubkey),
+        None => secp256k1::Keypair::from_seckey_slice(secp, served_secret)
+            .ok()
+            .map(|kp| kp.x_only_public_key().0.serialize()),
+    }
+}
+
+/// The gate decision for a request and the identity it acts as, shared by the
+/// handler and the relay's pre-dispatch plan so the two derive the same
+/// identity and reach the same decision. `context` is the Heartwood context in
+/// force (caller-supplied, or the session's active identity); `explicit_context`
+/// whether the caller supplied it. `Err` when that context does not derive.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_gate(
+    policy_engine: &PolicyEngine,
+    master_slot: u8,
+    client_hex: &str,
+    has_client: bool,
+    method: &nip46::Nip46Method,
+    method_name: &str,
+    event_kind: Option<u64>,
+    tier: heartwood_common::policy::ApprovalTier,
+    explicit_context: bool,
+    context: Option<&HeartwoodContext>,
+    served_secret: &[u8; 32],
+    master_mode: MasterMode,
+    secp: &Arc<Secp256k1<SignOnly>>,
+) -> Result<(Gate, Option<[u8; 32]>), ()> {
+    use heartwood_common::policy::{method_uses_identity_key, method_uses_served_key};
+    let slot = has_client
+        .then(|| policy_engine.find_slot_by_pubkey(master_slot, client_hex))
+        .flatten();
+    let note_scoped = method_uses_served_key(method_name);
+    let identity = if slot.is_some_and(|slot| !(slot.strict_permissions && explicit_context))
+        && (note_scoped || method_uses_identity_key(method_name, context.is_some()))
+    {
+        // Note methods act with the served key and ignore any context.
+        let context = if note_scoped { None } else { context };
+        Some(effective_identity(served_secret, master_mode, secp, context).ok_or(())?)
+    } else {
+        None
+    };
+    let gate = policy_engine.gate(
+        master_slot,
+        client_hex,
+        has_client,
+        method,
+        method_name,
+        event_kind,
+        tier,
+        explicit_context,
+        context.is_some(),
+        identity.as_ref(),
+    );
+    Ok((gate, identity))
+}
+
+/// The card label of an identity: a registered persona's name (or purpose
+/// tail), else an unregistered child's marked purpose tail and index, else the
+/// served identity's label. See `heartwood_common::encoding::identity_label`.
+pub(crate) fn identity_label_for(
+    personas: &[crate::personas::LoadedPersona],
+    served_label: &str,
+    pubkey: &[u8; 32],
+    context: Option<&HeartwoodContext>,
+) -> String {
+    use heartwood_common::encoding::identity_label;
+    match (crate::personas::find_by_pubkey(personas, pubkey), context) {
+        (Some(idx), _) => {
+            let p = &personas[idx];
+            identity_label(p.name.as_deref(), Some(&p.purpose), p.index, true, pubkey)
+        }
+        (None, Some(ctx)) => identity_label(None, Some(&ctx.purpose), ctx.index, false, pubkey),
+        (None, None) => identity_label(Some(served_label), None, 0, true, pubkey),
+    }
+}
+
+/// Resolve a `heartwood_switch` target to its pubkey the way an uncarded
+/// switch does: `master` is the served identity, else the cache by npub,
+/// persona name, then purpose and index.
+fn switch_target(
+    params: &[Value],
+    identity_caches: &[crate::identity_cache::IdentityCache],
+    master_slot: u8,
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    secp: &Arc<Secp256k1<SignOnly>>,
+) -> Option<[u8; 32]> {
+    let nip46::SwitchParams { target, index_hint } = nip46::SwitchParams::from_params(params).ok()?;
+    if target == "master" {
+        return effective_identity(master_secret, master_mode, secp, None);
+    }
+    let cache = identity_caches.iter().find(|c| c.master_slot == master_slot)?;
+    let idx = cache
+        .find_by_npub(target)
+        .or_else(|| cache.find_by_persona(target))
+        .or_else(|| cache.find(target, index_hint))?;
+    Some(cache.identities[idx].public_key)
+}
+
+/// Whether a switch card's stored target is still a switchable identity: the
+/// served identity, or an entry in the identity cache.
+fn switch_target_exists(
+    pubkey: &[u8; 32],
+    identity_caches: &[crate::identity_cache::IdentityCache],
+    master_slot: u8,
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    secp: &Arc<Secp256k1<SignOnly>>,
+) -> bool {
+    effective_identity(master_secret, master_mode, secp, None).as_ref() == Some(pubkey)
+        || cached_context(pubkey, identity_caches, master_slot).is_some()
+}
+
+/// The context naming a cached identity, by pubkey.
+fn cached_context(
+    pubkey: &[u8; 32],
+    identity_caches: &[crate::identity_cache::IdentityCache],
+    master_slot: u8,
+) -> Option<HeartwoodContext> {
+    identity_caches
+        .iter()
+        .filter(|c| c.master_slot == master_slot)
+        .flat_map(|c| c.identities.iter())
+        .find(|id| id.public_key == *pubkey)
+        .map(|id| HeartwoodContext { purpose: id.purpose.clone(), index: id.index })
+}
+
+/// Make a slot grant from a physically approved card durable before the
+/// request's answer may go out, undoing it when the write does not land (the
+/// connect-bind rule, #75). `snapshot` is the slot state before the grant.
+fn persist_grant(
+    policy_engine: &mut PolicyEngine,
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    master_slot: u8,
+    request_id: &str,
+    snapshot: crate::policy::SlotStateSnapshot,
+    changed: bool,
+) -> Result<(), String> {
+    if !changed {
+        return Ok(());
+    }
+    persist_bind_or_rollback(policy_engine, nvs, master_slot, snapshot)
+        .map_err(|reason| build_error_json(request_id, -4, &reason))
+}
+
 /// Label for a client with no slot label: truncated npub, or the legacy hex
 /// prefix if the pubkey string is malformed. Identification UX only —
 /// approval policy does not depend on the label.
@@ -1837,9 +2208,11 @@ fn handle_sign_event(
     buttons: &crate::button::Buttons<'_>,
     request: &nip46::Nip46Request,
     requester_label: &str,
+    identity_line: Option<&str>,
+    heading: Option<&str>,
     event: UnsignedEvent,
 ) -> String {
-    let (kind, content_preview) = nip46::event_display_summary(&event, 50);
+    let (kind, _content_preview) = nip46::event_display_summary(&event, 50);
 
     // Show the signing request on the OLED and wait for button approval.
     // The countdown bar updates every second; the approval module handles
@@ -1849,7 +2222,7 @@ fn handle_sign_event(
         buttons,
         APPROVAL_TIMEOUT_SECS,
         |d, remaining| {
-            crate::oled::show_sign_request(d, requester_label, kind, &content_preview, remaining);
+            crate::oled::show_sign_request_as(d, requester_label, kind, identity_line, heading, remaining);
         },
     );
 
@@ -2406,13 +2779,46 @@ mod tests {
     use heartwood_common::nip46;
     use heartwood_common::policy::{ApprovalTier, ConnectSlot};
 
+    use heartwood_common::policy::{gate_request, Gate, GateRequest};
+
     use super::{
-        connect_success_response, denied_before_dispatch, extension_approval_failure,
+        connect_success_response, extension_approval_failure,
         remote_extension_requires_approval, request_may_mutate_slot_state,
-        strict_slot_denies_explicit_context, unbound_remote_request_denied,
+        unbound_remote_request_denied,
     };
     use crate::approval::ApprovalResult;
     use crate::policy::PolicyEngine;
+
+    /// The handler's pre-dispatch refusal of a policy denial, which the pure
+    /// gate now owns.
+    fn denied_before_dispatch(has_client: bool, tier: ApprovalTier) -> bool {
+        gate_request(&GateRequest {
+            has_client,
+            slot: None,
+            method: "ping",
+            tier,
+            explicit_context: false,
+            has_context: false,
+            identity: None,
+            verdict: false,
+        }) == Gate::Deny
+    }
+
+    /// The handler's refusal of a caller-supplied context on a strict slot.
+    fn strict_slot_denies_explicit_context(has_client: bool, strict: bool, explicit: bool) -> bool {
+        let engine = engine_with_slot(strict, &["sign_event"]);
+        let slot = &engine.list_slots(0)[0];
+        gate_request(&GateRequest {
+            has_client,
+            slot: Some(slot),
+            method: "connect",
+            tier: ApprovalTier::AutoApprove,
+            explicit_context: explicit,
+            has_context: explicit,
+            identity: None,
+            verdict: false,
+        }) == Gate::Deny
+    }
 
     const CLIENT_HEX: &str =
         "1111111111111111111111111111111111111111111111111111111111111111"; // pragma: allow-secret — fixed test vector
@@ -2435,6 +2841,8 @@ mod tests {
             audit_child_wrap: false,
             guardian_notice_wrap: false,
             bound_identity: None,
+            approved_identities: String::new(),
+            was_bound: false,
         });
         engine
     }

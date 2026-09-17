@@ -7,7 +7,6 @@ use zeroize::Zeroize;
 
 use heartwood_common::backup::{BackupMaster, BackupPayload};
 use heartwood_common::hex::hex_encode;
-use heartwood_common::policy::validate_exact_slot_policy;
 use heartwood_common::types::{
     FRAME_TYPE_BACKUP_EXPORT_RESPONSE, FRAME_TYPE_BACKUP_IMPORT_RESPONSE,
     FRAME_TYPE_NACK,
@@ -125,7 +124,7 @@ pub fn handle_export(
 /// waits for physical button confirmation, then writes to NVS.
 ///
 /// Authority is never imported as-is (FW-H2):
-/// - every slot is re-validated through `validate_exact_slot_policy`, the
+/// - every slot is re-validated through `sanitise_imported_slot`, the
 ///   same validator the management API uses — a backup carrying methods or
 ///   kind ceilings no signed-in path could have installed is refused whole;
 /// - `signing_approved` is forced false and `sign_event`/kind ceilings are
@@ -180,26 +179,10 @@ pub fn handle_import(
             return;
         }
         for slot in &mut bm.connection_slots {
-            let had_signing = slot.signing_approved
-                || slot.allowed_methods.iter().any(|m| m == "sign_event");
-            if had_signing {
-                signing_stripped += 1;
-            }
-            slot.signing_approved = false;
-            slot.allowed_methods.retain(|m| m != "sign_event");
-            // Kind ceilings are meaningless without sign_event (and the
-            // validator rejects the combination) — clear them with it.
-            slot.allowed_kinds.clear();
-            match validate_exact_slot_policy(
-                slot.allowed_methods.clone(),
-                Vec::new(),
-                slot.auto_approve,
-            ) {
-                Ok(policy) => {
-                    slot.allowed_methods = policy.allowed_methods;
-                    slot.allowed_kinds = policy.allowed_kinds;
-                    slot.auto_approve = policy.auto_approve;
-                }
+            // Signing and kind ceilings are stripped and the method ceiling
+            // re-validated (host-tested in common::policy).
+            match heartwood_common::policy::sanitise_imported_slot(slot) {
+                Ok(had_signing) => signing_stripped += usize::from(had_signing),
                 Err(e) => {
                     log::warn!(
                         "Backup import refused: slot {} on master slot {} fails policy validation: {e}",

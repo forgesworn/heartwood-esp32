@@ -120,7 +120,14 @@ pub fn handle_encrypted_request(
         };
         match crate::nip46_handler::derive_identity(&owning.secret, owning.mode, &p.purpose, p.index)
         {
-            Ok((secret, _pubkey)) => (secret, owning.slot, owning.label.clone(), owning.mode, true),
+            // Cards name the identity served, not its owning master.
+            Ok((secret, _pubkey)) => (
+                secret,
+                owning.slot,
+                crate::nip46_handler::identity_label_for(personas, "", &p.pubkey, None),
+                owning.mode,
+                true,
+            ),
             Err(e) => {
                 log::error!("Persona key derivation failed: {e}");
                 protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);

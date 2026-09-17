@@ -129,6 +129,8 @@ pub fn client_summary(slot: &ConnectSlot) -> serde_json::Value {
         "audit_child_wrap": slot.audit_child_wrap,
         "guardian_notice_wrap": slot.guardian_notice_wrap,
         "bound_identity": slot.bound_identity.clone(),
+        // Read-only: 16-hex-char tags of the identities approved on a card.
+        "approved_identities": crate::policy::approved_identity_tags(slot),
     })
 }
 
@@ -628,6 +630,8 @@ mod tests {
             audit_child_wrap: false,
             guardian_notice_wrap: false,
             bound_identity: None,
+            approved_identities: String::new(),
+            was_bound: false,
         };
         let summary = client_summary(&slot);
         assert_eq!(summary["slot_index"], 7);

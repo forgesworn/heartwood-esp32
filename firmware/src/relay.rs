@@ -3276,6 +3276,10 @@ struct ParkedRequest {
     master_slot: u8,
     method: String,
     event_kind: Option<u64>,
+    /// X-only pubkey of the identity the request acts as, when identity-scoped
+    /// (it may be a child the context derives, not `target_pk`). The notice
+    /// names it and an approve verdict covers it and nothing else.
+    identity: Option<[u8; 32]>,
     parked_at: Instant,
 }
 
@@ -3286,6 +3290,7 @@ struct ParkTombstone {
     park_id: String,
     client_hex: String,
     key: String,
+    identity: Option<[u8; 32]>,
     master_slot: u8,
 }
 
@@ -3558,7 +3563,7 @@ fn emit_approval_notice(
             guardian_np_hex: &guardian_hex,
             client_hex: &park.client_hex,
             park_id_hex: &park.park_id,
-            identity_hex: &hex_encode(&park.target_pk),
+            identity_hex: &hex_encode(park.identity.as_ref().unwrap_or(&park.target_pk)),
             method: &park.method,
             event_kind: park.event_kind,
             park_ttl_secs: heartwood_common::escalate::PARK_TTL_SECS,
@@ -3734,6 +3739,7 @@ fn tombstone_park(ctx: &mut SignCtx, park: &ParkedRequest) {
         park_id: park.park_id.clone(),
         client_hex: park.client_hex.clone(),
         key: heartwood_common::nip59::method_or_kind_key(&park.method, park.event_kind),
+        identity: park.identity,
         master_slot: park.master_slot,
     });
 }
@@ -3786,11 +3792,15 @@ fn complete_parked(
     park: ParkedRequest,
     window_secs: u64,
 ) -> bool {
+    // The verdict covers the identity the guardian's notice named, and no
+    // other: if the request now resolves to a different identity, the
+    // completion meets the identity gate like any other request.
     let key = heartwood_common::nip59::method_or_kind_key(&park.method, park.event_kind);
     ctx.policy_engine.install_transient_allow(
         park.master_slot,
         park.client_hex.clone(),
         key,
+        park.identity,
         window_secs,
     );
 
@@ -4098,7 +4108,8 @@ fn resolve_served_identity(
         .map(|(secret, _pk)| {
             (
                 secret,
-                owning.label.clone(),
+                // Cards name the identity served, not its owning master.
+                crate::nip46_handler::identity_label_for(ctx.personas, "", &p.pubkey, None),
                 owning.mode,
                 owning.slot,
                 Some(p.purpose.clone()),
@@ -4137,6 +4148,15 @@ fn queue_button_ask(
         let to = note_param(&ask.request, "to").unwrap_or_default();
         kind_key = format!("{kind_key}:{to}");
     }
+    // Asks acting as different identities are different decisions: one hold
+    // must never approve an identity its card did not name.
+    if let Some(identity) = ask.identity.as_ref() {
+        kind_key.push('@');
+        kind_key.extend(heartwood_common::policy::identity_tag(identity).iter().map(|&b| b as char));
+    }
+    // A HOLD TO SIGN ask and an ALLOW AS ask (or any two card kinds) are
+    // different decisions and never share one hold.
+    kind_key.push_str(heartwood_common::policy::card_batch_marker(ask.resume.shown.card));
     let key = AskKey::new(slot, client_hex.to_string(), hex_encode(target_pk), kind_key);
     let weight = ask
         .event
@@ -4265,13 +4285,13 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
 
     let batch = ctx.button_cards[0].asks.len();
     enum Draw {
-        Sign(String, u64),
+        Sign(String, u64, Option<String>, Option<String>),
         Extension(String, String, String),
         Titled(&'static str, String),
         Batch(String, String),
     }
     let card = match &ctx.button_cards[0].asks[0].ask.card {
-        crate::nip46_handler::AskCard::Sign { requester, kind } => {
+        crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading } => {
             // The count belongs on screen: one hold answers all of them, and
             // the operator must never be shown "sign this" for a batch.
             let label = if batch > 1 {
@@ -4279,13 +4299,17 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             } else {
                 requester.clone()
             };
-            Draw::Sign(label, *kind)
+            Draw::Sign(label, *kind, identity.clone(), heading.clone())
         }
         crate::nip46_handler::AskCard::Extension {
-            master_label,
+            heading,
             method,
             preview,
-        } => match note_card_header(method) {
+        } => match note_card_header(&ctx.button_cards[0].asks[0].ask.request.method)
+            // A gate card (ALLOW AS / NPUB AS / LIST IDS) carries the app, not
+            // the method, on its second line, and is never a money card.
+            .filter(|_| method == &ctx.button_cards[0].asks[0].ask.request.method)
+        {
             // A batched note card must say what the one hold releases: the
             // count, the total and the mint, never just the first note.
             Some(header) if batch > 1 => {
@@ -4293,7 +4317,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
                 Draw::Batch(head, title)
             }
             Some(header) => Draw::Titled(header, preview.clone()),
-            None => Draw::Extension(master_label.clone(), method.clone(), preview.clone()),
+            None => Draw::Extension(heading.clone(), method.clone(), preview.clone()),
         },
         crate::nip46_handler::AskCard::Receive { title } => {
             Draw::Titled("RECEIVE NOTE", title.clone())
@@ -4307,16 +4331,17 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // was handed to the glass, never whether the glass had room for it.
     if first_draw {
         let (head, body) = match &card {
-            Draw::Sign(label, kind) => (
-                "HOLD TO SIGN".to_string(),
+            Draw::Sign(label, kind, identity, heading) => (
+                heading.clone().unwrap_or_else(|| "HOLD TO SIGN".to_string()),
                 format!(
-                    "{} / {} / kind {kind}",
+                    "{} / {} / kind {kind} / {}",
                     crate::oled::display_app_label(label),
                     crate::oled::kind_name_line(*kind),
+                    identity.as_deref().unwrap_or(""),
                 ),
             ),
-            Draw::Extension(master_label, method, preview) => (
-                crate::oled::master_sign_heading(master_label),
+            Draw::Extension(heading, method, preview) => (
+                heading.clone(),
                 format!("{method} / {preview}"),
             ),
             Draw::Titled(header, title) => ((*header).to_string(), title.clone()),
@@ -4325,12 +4350,17 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }
     match card {
-        Draw::Sign(label, kind) => {
-            crate::oled::show_sign_request(ctx.display, &label, kind, "", remaining)
-        }
-        Draw::Extension(master_label, method, preview) => crate::oled::show_master_sign_request(
+        Draw::Sign(label, kind, identity, heading) => crate::oled::show_sign_request_as(
             ctx.display,
-            &master_label,
+            &label,
+            kind,
+            identity.as_deref(),
+            heading.as_deref(),
+            remaining,
+        ),
+        Draw::Extension(heading, method, preview) => crate::oled::show_master_sign_request(
+            ctx.display,
+            &heading,
             &method,
             None,
             &preview,
@@ -4587,6 +4617,7 @@ fn resolve_button_card(
                 match crate::nip46_handler::dispatch(
                     ask.ask.request,
                     ask.ask.event,
+                    Some(ask.ask.resume),
                     &signing_secret,
                     &label,
                     mode,
@@ -4927,6 +4958,8 @@ fn queue_receive_card(
                             legacy_client_pubkey: None,
                         },
                         event: Some(rumor),
+                        identity: None,
+                        resume: Default::default(),
                     },
                     created_at,
                     received_uptime: crate::uptime_s(),
@@ -5313,7 +5346,8 @@ fn handle_nip46_event(
             ) {
                 Ok((secret, _pk)) => (
                     secret,
-                    owning.label.clone(),
+                    // Cards name the identity served, not its owning master.
+                    crate::nip46_handler::identity_label_for(ctx.personas, "", &p.pubkey, None),
                     owning.mode,
                     owning.slot,
                     true,
@@ -5486,9 +5520,39 @@ fn handle_nip46_event(
     } else {
         None
     };
-    let tier = ctx
-        .policy_engine
-        .check(slot, &ev.pubkey, &method_enum, event_kind);
+    // The same gate dispatch will apply, planned from the same facts, so
+    // escalation, petitions, rollback and the notice's identity see the
+    // identity and list-identities cards and not only the method policy.
+    let base_tier = ctx.policy_engine.check(slot, &ev.pubkey, &method_enum, event_kind);
+    let active_context = if request.heartwood.is_none() {
+        crate::nip46_handler::resolve_active_context(
+            ctx.policy_engine,
+            ctx.identity_caches,
+            Some(&client_pubkey),
+            slot,
+        )
+    } else {
+        None
+    };
+    let (tier, request_identity) = match crate::nip46_handler::plan_gate(
+        ctx.policy_engine,
+        slot,
+        &ev.pubkey,
+        true,
+        &method_enum,
+        &request.method,
+        event_kind,
+        base_tier,
+        request.heartwood.is_some(),
+        request.heartwood.as_ref().or(active_context.as_ref()),
+        &signing_secret,
+        mode,
+        ctx.secp,
+    ) {
+        Ok((gate, identity)) => (heartwood_common::policy::gate_tier(gate, base_tier), identity),
+        // Dispatch answers the derivation failure itself.
+        Err(()) => (base_tier, None),
+    };
     let slot_snapshot = crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
         .then(|| ctx.policy_engine.snapshot_slot_state(slot));
 
@@ -5512,6 +5576,7 @@ fn handle_nip46_event(
             master_slot: slot,
             method: request.method.clone(),
             event_kind,
+            identity: request_identity,
             parked_at: Instant::now(),
             request,
         };
@@ -5578,6 +5643,7 @@ fn handle_nip46_event(
     // in hand.
     let mut response_json = match crate::nip46_handler::dispatch(
         request,
+        None,
         None,
         &signing_secret,
         &label,
@@ -7921,6 +7987,7 @@ fn dispatch_mgmt(
                             master_slot,
                             t.client_hex,
                             t.key,
+                            t.identity,
                             window,
                         );
                         allow_installed = true;

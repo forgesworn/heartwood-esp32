@@ -59,9 +59,40 @@ pub const LEGACY_PBKDF2_ITERATIONS: u32 = 100_000;
 /// measured retune without changing how legacy blobs unlock.
 pub const PBKDF2_ITERATIONS: u32 = LEGACY_PBKDF2_ITERATIONS;
 /// Refuse a corrupted header before it can turn an unlock attempt into an
-/// arbitrary-length CPU burn. This is deliberately a generous ceiling, not a
-/// policy target; a retune still needs an actual slow-board measurement.
-pub const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
+/// arbitrary-length CPU burn.
+///
+/// This is **not** a round number and must not be raised to one. The rounds
+/// field is read from flash and the work it names is performed BEFORE
+/// anything is authenticated: the MAC key is PBKDF2 output block 2, so the
+/// header's own MAC cannot be checked until after the KDF has run. A cheap
+/// range check on the parsed count is therefore the only pre-KDF defence that
+/// exists, and its value has to be tied to what the slowest supported path
+/// can actually finish.
+///
+/// The binding case is the **software** path, not the accelerator: a board
+/// whose accelerator is absent or has failed its self-check derives in
+/// software, and that is where a corrupted count hurts.
+///
+///   measured, Heltec V4 (S3, 240 MHz, software):
+///       29 s for 100,000 iterations  ->  290 us per iteration
+///   task watchdog (sdkconfig.defaults, Kconfig maximum):
+///       60 s
+///   budget for one slot, leaving margin:
+///       150,000 x 290 us = 43.5 s, i.e. 16.5 s (27%) inside the window
+///
+/// The previous value of 1,000,000 was 290 s of software work against that
+/// 60 s window, three to five times more than the board could survive, so a
+/// blob with a corrupted rounds field was a reboot loop rather than a clean
+/// "wrong PIN". 150,000 also leaves genuine headroom above the shipped
+/// [`PBKDF2_ITERATIONS`] for a future measured retune without another format
+/// change, while capping the damage a flipped bit can do at 1.5x a legitimate
+/// unseal rather than 10x.
+///
+/// The KDF additionally feeds the watchdog from inside its round loop now
+/// (see [`crate::kdf`]), so the window is a budget rather than a cliff.
+/// The ceiling is still set from the cliff, because the in-loop feed is a courtesy
+/// to other tasks and not a guarantee.
+pub const MAX_PBKDF2_ITERATIONS: u32 = 150_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SeedCipherError {
@@ -76,10 +107,41 @@ pub enum SeedCipherError {
 }
 
 /// Derive the 64-byte (enc || mac) key material from a PIN and salt.
+///
+/// This goes through [`crate::kdf::pbkdf2_for_seed`], which is the unchanged
+/// pure-Rust `pbkdf2` crate everywhere (host tools, host tests, heartwoodd)
+/// except on a board that installed a device KDF hook at boot. Such a board
+/// has already proved that hook byte-identical against a known-answer vector
+/// before its first real derivation, and drops back to software itself if it
+/// could not. See docs/2026-09-18-pbkdf2-cost-and-sha-acceleration.md.
 fn derive_km(pin: &[u8], salt: &[u8], iterations: u32) -> [u8; 64] {
+    derive_km_with(crate::kdf::pbkdf2_for_seed, pin, salt, iterations)
+}
+
+fn derive_km_with(
+    kdf: crate::kdf::KdfHook,
+    pin: &[u8],
+    salt: &[u8],
+    iterations: u32,
+) -> [u8; 64] {
     let mut km = [0u8; 64];
-    pbkdf2::pbkdf2_hmac::<Sha256>(pin, salt, iterations, &mut km);
+    kdf(pin, salt, iterations, &mut km);
     km
+}
+
+/// The KDF cost a blob names, without doing any of that work.
+///
+/// Callers that want to refuse an unreasonable blob before paying for it use
+/// this. [`decrypt_seed`] applies the identical check in its own length
+/// dispatch, which is reached before [`derive_km`]. The ceiling is the only
+/// pre-KDF defence there is, because the header's MAC key is PBKDF2 output
+/// block 2 and so cannot be checked until the work has already been done.
+pub fn blob_iterations(blob: &[u8]) -> Result<u32, SeedCipherError> {
+    match blob.len() {
+        LEGACY_BLOB_LEN => Ok(LEGACY_PBKDF2_ITERATIONS),
+        BLOB_LEN => parse_current_header(blob),
+        _ => Err(SeedCipherError::BadLength),
+    }
 }
 
 /// Whether `len` is a format length which may represent an encrypted seed.
@@ -164,9 +226,37 @@ pub fn encrypt_seed(
 }
 
 /// Decrypt a blob under a PIN. A wrong PIN (or any tampering) fails the
-/// constant-time MAC check and returns [`SeedCipherError::WrongPinOrTampered`]
-/// — never a garbage seed.
+/// constant-time MAC check and returns [`SeedCipherError::WrongPinOrTampered`],
+/// never a garbage seed.
 pub fn decrypt_seed(pin: &[u8], blob: &[u8]) -> Result<[u8; SEED_LEN], SeedCipherError> {
+    decrypt_seed_with(crate::kdf::pbkdf2_for_seed, pin, blob)
+}
+
+/// Decrypt a blob using the pure-Rust reference KDF, whatever engine this
+/// board installed.
+///
+/// This exists for ONE caller shape: verify-after-seal. A board that sealed
+/// with its accelerator must not then check its own work with that same
+/// accelerator, because a deterministic engine fault agrees with itself and
+/// the board would commit a blob only the faulty path can open. Verifying
+/// through the reference means a committed blob is openable by software, on
+/// this board and on any other, for good.
+///
+/// It costs a full software derivation, so it belongs on the rare sealing
+/// path and nowhere near unlock. Callers feed the watchdog around it the way
+/// they always did for a software KDF.
+pub fn decrypt_seed_reference(
+    pin: &[u8],
+    blob: &[u8],
+) -> Result<[u8; SEED_LEN], SeedCipherError> {
+    decrypt_seed_with(crate::kdf::reference_pbkdf2_hmac_sha256, pin, blob)
+}
+
+fn decrypt_seed_with(
+    kdf: crate::kdf::KdfHook,
+    pin: &[u8],
+    blob: &[u8],
+) -> Result<[u8; SEED_LEN], SeedCipherError> {
     let (header, iterations, body) = match blob.len() {
         LEGACY_BLOB_LEN => (None, LEGACY_PBKDF2_ITERATIONS, blob),
         BLOB_LEN => (
@@ -181,7 +271,7 @@ pub fn decrypt_seed(pin: &[u8], blob: &[u8]) -> Result<[u8; SEED_LEN], SeedCiphe
     let ct = &body[SALT_LEN + NONCE_LEN..SALT_LEN + NONCE_LEN + SEED_LEN];
     let tag = &body[SALT_LEN + NONCE_LEN + SEED_LEN..];
 
-    let mut km = derive_km(pin, salt, iterations);
+    let mut km = derive_km_with(kdf, pin, salt, iterations);
     let (enc_key, mac_key) = km.split_at(32);
 
     let mut mac = HmacSha256::new_from_slice(mac_key).expect("HMAC accepts any key length");
@@ -348,5 +438,68 @@ mod tests {
             decrypt_seed(PIN, &blob),
             Err(SeedCipherError::InvalidIterations)
         );
+    }
+
+    /// The ceiling is checked by parsing the header, which is all that can be
+    /// done before the KDF: the MAC key IS PBKDF2 output block 2, so the
+    /// header's authentication tag cannot be verified until after the work
+    /// the header asked for has been performed. `blob_iterations` is that
+    /// pre-KDF check on its own, and `decrypt_seed` reaches `derive_km` only
+    /// through it.
+    #[test]
+    fn the_iteration_ceiling_is_checked_before_any_kdf_work() {
+        let mut blob = encrypt_seed(PIN, &SEED, &SALT, &NONCE);
+
+        // At the ceiling: accepted by the pre-KDF check (not run here, it is
+        // 150,000 rounds).
+        blob[5..HEADER_LEN].copy_from_slice(&MAX_PBKDF2_ITERATIONS.to_be_bytes());
+        assert_eq!(blob_iterations(&blob), Ok(MAX_PBKDF2_ITERATIONS));
+
+        // One above: refused, with no KDF performed.
+        blob[5..HEADER_LEN].copy_from_slice(&(MAX_PBKDF2_ITERATIONS + 1).to_be_bytes());
+        assert_eq!(
+            blob_iterations(&blob),
+            Err(SeedCipherError::InvalidIterations)
+        );
+        assert_eq!(
+            decrypt_seed(PIN, &blob),
+            Err(SeedCipherError::InvalidIterations)
+        );
+
+        // A wildly corrupted count is refused the same way, instantly.
+        blob[5..HEADER_LEN].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            decrypt_seed(PIN, &blob),
+            Err(SeedCipherError::InvalidIterations)
+        );
+
+        // Both stored formats answer the question without hashing anything.
+        assert_eq!(
+            blob_iterations(&[0u8; LEGACY_BLOB_LEN]),
+            Ok(LEGACY_PBKDF2_ITERATIONS)
+        );
+        assert_eq!(blob_iterations(&[0u8; 10]), Err(SeedCipherError::BadLength));
+    }
+
+    /// The ceiling must stay above what this firmware writes, and below what
+    /// the slowest supported path can finish inside the 60 s task watchdog.
+    /// The arithmetic is on the constant; this pins it so a future retune
+    /// cannot quietly break either end.
+    #[test]
+    fn the_ceiling_brackets_the_shipped_cost_and_the_watchdog() {
+        assert!(PBKDF2_ITERATIONS <= MAX_PBKDF2_ITERATIONS);
+        assert!(LEGACY_PBKDF2_ITERATIONS <= MAX_PBKDF2_ITERATIONS);
+
+        // 290 us per iteration, measured on a V4 software unseal.
+        const MEASURED_US_PER_ITERATION: u64 = 290;
+        const WATCHDOG_US: u64 = 60_000_000;
+        let worst = MAX_PBKDF2_ITERATIONS as u64 * MEASURED_US_PER_ITERATION;
+        assert!(
+            worst < WATCHDOG_US,
+            "ceiling of {MAX_PBKDF2_ITERATIONS} is {worst} us of software work, \
+             which does not fit the {WATCHDOG_US} us watchdog window"
+        );
+        // …and with at least 20% of the window to spare.
+        assert!(worst * 10 <= WATCHDOG_US * 8);
     }
 }

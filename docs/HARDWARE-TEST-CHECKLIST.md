@@ -1937,6 +1937,116 @@ channel driver used there), and a note client (notecase, or
    window is what lifts it, no card is owed). Revoke the identity inside the
    window first and the retry parks again, as section 23 item 17 records.
 
+## 25. The sealed-seed KDF on the SHA accelerator (#121; added 2026-09-18, NOT YET BENCH-RUN)
+
+`derive_km` now runs on the chip's SHA peripheral on the ESP32-S3 Heltecs and
+the C6, instead of the pure-Rust `sha2` software path. The iteration count is
+unchanged at 100,000 and the on-disk blob format is untouched, so this is a
+speed change and nothing else, which is exactly what has to be proved. See
+`docs/2026-09-18-pbkdf2-cost-and-sha-acceleration.md` and
+`firmware/src/sha_accel.rs`.
+
+Two items are gates. Item 1 is the **concurrency** gate: the accelerator is
+exclusive only because every other user of it, TLS included, takes
+`esp_sha_acquire_hardware` first, and that assumption is only testable with a
+live TLS session passing traffic while a derivation runs. Item 6 is the
+**correctness** gate: an old sealed blob still opening, because a hardware path
+that derives a *different* key is the one genuinely dangerous failure here. Do
+not sign off this section without both, and do not run any of it on a board
+whose seed you cannot re-provision.
+
+1. **Unseal while a relay session is live on WiFi.** FIRST, because everything
+   else assumes it. This is the contention case the shared SHA/AES lock
+   creates, and it only exists in the WiFi-standalone tier. Provision a board
+   for WiFi-standalone with a vault key, reboot it locked, and let it come up
+   and announce its ephemeral unlock pubkey (kind 24135): the TLS session to
+   the relay is live at that moment. Deliver the vault key with `node
+   scripts/vault-unlock-wifi.mjs` and confirm the device unlocks, the relay
+   session does NOT drop or error, a `sign_event` sent immediately afterwards
+   is answered normally, and the next boot reports no crash crumb.
+
+   Then do it with TLS actually busy rather than merely open: with the board
+   unlocked and an app signing through the relay in a loop (`node
+   scripts/nip46-sign.mjs` repeatedly, or `scripts/bench-personas-nip46.mjs`),
+   trigger a fresh `derive_km` by changing the at-rest secret (`VAULT_SET` or a
+   PIN change, which reseals every slot). Neither side may stall for more than
+   a second or two, no relay frame may be dropped, no signature may be wrong,
+   and the board must not reboot. A log line `SHA accelerator contended -
+   finishing this derivation in software` is the retreat working, not a
+   failure; note how often it fires. Repeat on a board with the note locker
+   enabled, which adds the `nk` re-wrap to the same window.
+2. **Timed unseal, per slot, before and after.** Flash the previous release,
+   set a PIN on a single-master board, power-cycle, and time the unlock from
+   the `PIN_UNLOCK` frame to the ACK (`scripts/device-status.mjs`, or the
+   Sapwood unlock spinner, or a stopwatch on the OLED's `Unsealing 1/1`
+   card). Record it: the figure on record is ~29 s a slot on a V4. Flash this
+   release and repeat with the SAME PIN on the SAME board. Expect roughly
+   0.7-2 s a slot; anything above about 5 s means the accelerator is not in
+   the path and item 3's log line will say so. Record both numbers for the V4,
+   the V3 and the T-Display. The T-Display has no accelerated path by design
+   (its SHA cannot resume from a saved digest state), so its number should be
+   unchanged: that is a pass, not a failure.
+3. **The self-check ran and passed.** On a bench build with the console on a
+   UART probe, the first unlock after boot logs `SHA accelerator self-check
+   passed - sealed-seed KDF is hardware-backed`. On the T-Display the boot line
+   instead reads `accelerator not available on this board - software path`.
+   Without a console, item 2's timing is the observable.
+4. **A three-master unlock.** On a board with three sealed masters, unlock once
+   and confirm: all three slots open on one PIN entry, the OLED progress card
+   counts `1/3`, `2/3`, `3/3`, the total is roughly three times item 2's
+   per-slot figure, and there is NO watchdog reboot (`FIRMWARE_INFO` reports no
+   `task-watchdog` crash crumb on the next boot). Repeat with the bearer-note
+   locker enabled: that is a fourth `derive_km` for the `nk` wrap, so four
+   stretches, not three.
+5. **The seal path still verifies in software.** Enabling at-rest encryption
+   re-derives each blob through the REFERENCE KDF to check its own work, so a
+   `SET_PIN` or `VAULT_SET` on a sealed board is fast-then-slow per slot: about
+   a second of hardware sealing followed by the old ~29 s software verify.
+   That is expected and is what guarantees a committed blob opens without the
+   accelerator. Time it on a three-master board and confirm no watchdog reboot.
+6. **An old sealed blob still opens.** THE CORRECTNESS GATE. Take a board
+   sealed by a PREVIOUS release: ideally one sealed months ago, and at minimum
+   one sealed
+   by the release under test in item 2's "before" half, which must not be
+   re-sealed in between. Flash this release WITHOUT wiping NVS and unlock with
+   the original PIN. The seed must come back byte-identical: confirm by npub,
+   not by "it unlocked". `get_status` must report the same master npubs it
+   reported before the flash, and a `sign_event` must verify against them. Do
+   this for both blob lengths if you have them: a 92-byte legacy record and a
+   101-byte current one (a board provisioned before #155 has the former).
+7. **The self-check mismatch path.** Build with the bench-only feature that
+   deliberately corrupts the hardware answer:
+
+   ```
+   cd firmware
+   export MCU=esp32s3
+   export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heltec-v4"
+   cargo build --target xtensa-esp32s3-espidf --release --no-default-features \
+     --features heltec-v4,sha-selfcheck-fail --bin heartwood-esp32
+   ```
+
+   Flash it to a SCRATCH board (not one holding keys) that has a sealed seed,
+   and unlock. It must: log `SHA accelerator self-check FAILED - known-answer
+   mismatch`, fall back to software for the rest of the session, take the OLD
+   ~29 s per slot, and still unlock correctly to the right npub. It must never
+   report a wrong PIN and must never produce a different key. Reboot and
+   confirm the message repeats: the fallback is per session, not sticky
+   across boots. Then reflash the normal image and confirm item 2's timing
+   comes back.
+8. **The iteration ceiling.** `MAX_PBKDF2_ITERATIONS` is now 150,000 rather
+   than 1,000,000. With a hex editor on an NVS dump from a scratch board, set
+   the `rounds` field of a 101-byte blob to 200,000 and put it back. The
+   unlock must fail FAST, within the usual frame timeout rather than after
+   minutes, with the blob refused before any KDF work, and the board must not reboot.
+   The failed-attempt counter behaviour is unchanged (this is a malformed
+   blob, and it still burns an attempt, as it did before).
+9. **Nothing else moved.** Sanity-sweep the paths that share the KDF: enable
+   at-rest encryption from scratch (`SET_PIN`), disable it, enable the
+   bearer-note locker on a PIN-locked board and confirm its `nk` wrap unwraps,
+   and run one Sapwood backup export/import round trip. All of these call
+   `encrypt_seed`/`decrypt_seed` and all must behave exactly as sections 7 and
+   13 record them.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

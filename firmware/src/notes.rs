@@ -827,7 +827,11 @@ fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
                     // it is trusted as the key's only persistence.
                     esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
                     crate::wdt::feed(); // PBKDF2: wrap verification
-                    if seed_cipher::decrypt_seed(secret, &blob) != Ok(key) {
+                    // Through the reference KDF, not this board's engine: a
+                    // sealing engine must not grade its own work, or a
+                    // deterministic fault writes an nk only that engine can
+                    // unwrap. See seed_cipher::decrypt_seed_reference.
+                    if seed_cipher::decrypt_seed_reference(secret, &blob) != Ok(key) {
                         log::error!("[notes] nk wrap failed verification — notes stay plaintext");
                         key.zeroize();
                         return;
@@ -857,7 +861,8 @@ fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
             let blob = seed_cipher::encrypt_seed(secret, &key, &salt, &nonce);
             esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
             crate::wdt::feed(); // PBKDF2: re-wrap verification
-            if seed_cipher::decrypt_seed(secret, &blob) != Ok(key) {
+            // Reference KDF, for the same reason as the first wrap above.
+            if seed_cipher::decrypt_seed_reference(secret, &blob) != Ok(key) {
                 log::error!("[notes] nk re-wrap failed verification — old wrap kept");
                 return;
             }

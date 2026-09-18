@@ -29,20 +29,38 @@ generation.
 
 Bearer notes ride the seeds' at-rest posture: **plaintext in NVS when no PIN
 or vault key is set** — the same physical-custody model — and they are
-deliberately **excluded from backups**: a note restored onto two boards is a
-double-spend, so bearer value is unrecoverable by design (see
-`docs/plans/2026-08-18-note-locker-goal.md`).
+deliberately **excluded from backups as spendable secrets**: a note restored
+onto two boards is a double-spend, so bearer value is unrecoverable by design
+(see `docs/plans/2026-08-18-note-locker-goal.md`).
 
 That is sound, and its consequence has to be said out loud rather than left
 for an owner to discover: **a board that dies takes its notes with it, and no
 seed, share set or export brings them back.** Every other secret here is
 recoverable, so this is the one an owner will wrongly assume is handled. The
 locker is a till, not a vault. Collect promptly (since #129 a whole batch
-costs one hold), keep little on it, and let the paired wallet keep the
-INVENTORY: ids, amounts, hosts and states carry no spending authority, so a
-wallet can back those up without ever making a note spendable twice. A loss is
-then legible - the owner can say exactly what existed and show a mint what it
-was - which is the most a copy-free design can offer (#86).
+costs one hold) and keep little on it.
+
+What a backup does carry (#86) is the INVENTORY, so the loss is at least
+legible: an optional top-level `note_inventory` array, at most sixteen
+entries, each holding one note's id, its **public commitment**, amount, mint
+host, state and timestamps. The commitment is the identifier the issuing mint
+already files the note under -- `sha256(k1)` for a note behind a hash, the
+note's own x-only public key for one paid to a device key, which is what the
+mint recovers from a `ck1` -- so it carries no spending authority and is
+something an owner can actually show a mint. `key_index` being non-null is
+what tells the two apart. Nothing derived from a preimage or a note key ever
+enters the file, a log line, the display or an error string.
+
+The restore side is the other half, and it is a refusal: `BACKUP_IMPORT`
+shape-checks a carried inventory, logs what it saw and drops it
+(`common/src/backup.rs::inspect_imported_inventory`, which is handed no store,
+no storage and no secret). No code path from an import reaches the note
+locker, so a backup cannot create, resurrect or alter a note -- which is the
+point, because the alternative is a second board believing in money the first
+one already spent. Records still sealed under a key the exporting boot was
+never given are absent rather than guessed at; the export warns and the
+approval card counts only what it could read. The field is optional, so
+pre-#86 backups import unchanged and new backups import on pre-#86 firmware.
 
 Notes can also move as **NIP-59 gift wraps** (`common/src/note_wrap.rs`).
 Sending seals the secret to the recipient's pubkey inside the signing

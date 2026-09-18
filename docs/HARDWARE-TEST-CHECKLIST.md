@@ -2046,6 +2046,80 @@ whose seed you cannot re-provision.
    and run one Sapwood backup export/import round trip. All of these call
    `encrypt_seed`/`decrypt_seed` and all must behave exactly as sections 7 and
    13 record them.
+## 26. A backup carries the note inventory and restores none of it (#86; added 2026-09-18, NOT YET BENCH-RUN)
+
+A bearer note IS its secret, so a restored copy of one is a double spend and
+notes will never be in a backup as money. But a board that dies silently
+taking value with it is the worst kind of loss: unbounded and unprovable. So a
+backup now carries a non-spendable INVENTORY - per readable note, the public
+commitment its mint already files it under, plus amount, mint, state and
+timestamps - and nothing that can move a satoshi. This section checks both
+halves on real hardware: that the inventory is there and honest, and that a
+restore cannot bring a note back.
+
+Needs a board holding at least two notes in different states (mint one and
+confirm it, receive or import a second, mark a third spent if convenient),
+Sapwood's Backup panel, and a text editor for the decrypted file.
+
+1. **The export card says what is leaving.** Sapwood -> Backup -> Export.
+   The board's CONFIRM CHANGE card reads `Export backup?` over
+   `<n>m <n>slots <n>notes` when the locker holds notes, and the familiar
+   `<n> masters/<n> slots` when it does not. Hold to approve; the done card
+   repeats the same line. Sapwood's success message ends "plus a non-spendable
+   inventory of N notes".
+
+2. **The file says the same thing.** Decrypt the downloaded backup with its
+   passphrase (Sapwood's import preview is enough) and read `note_inventory`.
+   One entry per note the card counted, each with `id`, `secret_hash`,
+   `state`, `amount_msat`, `host`, `key_index`, `created_at`, `updated_at`
+   and nothing else. The ids and amounts match `heartwood_note_list` /
+   `scripts/note-cmd.mjs '{"cmd":"list"}'` exactly.
+
+3. **The commitment is the mint's own handle.** For an ordinary note, compare
+   `secret_hash` with the `h` the wallet registered when the note was minted
+   (`note-cmd.mjs` prints it at `new`; the mint's ledger calls it the note id).
+   They are the same 64 hex characters. For a note paid to one of the device's
+   own keys (section 15), `key_index` is non-null and `secret_hash` is the
+   note's PUBLIC key, not a hash - check it against the `p` the mint holds for
+   that index.
+
+4. **No secret is anywhere in the file.** Export a note's secret over the
+   cable (`{"cmd":"export_secret","id":"<id>"}`, one hold) and search the
+   DECRYPTED backup text for that `k1`, for it uppercased, and for the first
+   eight characters of it. Zero hits. Do the same for a key note's key.
+   Nothing but commitments leaves the board.
+
+5. **A locked board is honest about what it cannot see.** With at-rest
+   encryption enabled, reboot and export BEFORE unlocking. The card counts
+   only what the locker can read and the serial log carries
+   `note record(s) unreadable this boot`. Unlock, export again, and the
+   inventory is complete. The rule being checked is that a sealed record is
+   never invented into the file.
+
+6. **A restore creates no note.** On a SECOND board (or the same board after
+   a factory reset and re-provision), import the backup from step 2. The slots
+   restore as section 5 records. `heartwood_note_list` on that board returns
+   exactly what it held before the import - nothing added, nothing changed,
+   no id from the inventory present. The serial log shows
+   `ignoring a <n>-entry note inventory ... notes are never restored`.
+
+7. **A doctored inventory changes nothing either.** Edit the decrypted payload
+   before re-encrypting: change an `amount_msat`, corrupt a `secret_hash` to
+   `not-a-hash`, and add an entry with an id the board has never seen. Import
+   it. The slot restore still succeeds, the log reports the malformed count,
+   and `heartwood_note_list` is unchanged. There is no path from a backup file
+   to a note, and this is what that looks like from outside.
+
+8. **Old and new meet in both directions.** Import a backup taken before this
+   firmware (no `note_inventory` at all): it restores exactly as it always
+   did. Then take a NEW backup and import it on a board running pre-#86
+   firmware: the unknown field is ignored and the slots restore. Neither
+   direction needs a flag.
+
+9. **A locker with no notes still exports.** Spend or discard everything, then
+   export. The card reads `<n> masters/<n> slots` again and the file carries
+   `"note_inventory": []` - an empty inventory, which is a statement, not an
+   absence.
 
 ## Notes
 

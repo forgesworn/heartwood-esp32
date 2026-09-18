@@ -58,10 +58,27 @@ generic extension gate so no slot policy can silence a disclosure, riding the
 #64 deferred machinery. heartwood_note_rename joined that set (#96, checklist
 section 18): it touches a LIVE note and no amount of pruning corrects a label
 typed wrong, so a tier with no cable needs it; heartwood_note_delete
-deliberately did not, because MAX_SPENT retires the record it would remove. Notes are deliberately NOT in backups (restore onto
-two boards = double-spend), so a dead board's notes are gone: the locker is a
-TILL, not a vault - collect promptly and let the wallet keep the inventory
-(#86, SECURITY-MODEL.md); destructive commands (mark_spent/discard/rename/
+deliberately did not, because MAX_SPENT retires the record it would remove. Note SECRETS are deliberately NOT in backups and never
+will be (restore onto two boards = double-spend), so a dead board's money is
+still gone: the locker is a TILL, not a vault - collect promptly. What a
+backup DOES carry since #86 is a non-spendable INVENTORY: an optional
+top-level `note_inventory` array (common/src/backup.rs
+NoteInventoryEntry, at most 16, built by build_note_inventory from
+NoteStore::commitments) holding, per readable note, the public commitment the
+issuing mint already files it under (note_store::note_commitment_hex -
+sha256(k1) for a Part 1 note, the note's own x-only pubkey for a Part 2 key
+note, since that is what the mint recovers from a ck1; key_index non-null
+tells them apart), plus amount, mint host, state and timestamps. It restores
+NOTHING - BACKUP_IMPORT shape-checks it via inspect_imported_inventory, logs
+a count and drops it, and no code path from the import reaches the locker -
+so the point is only that a dead board becomes a legible, provable loss
+instead of a mystery. Records still sealed under a key this boot has not been
+given are not in it and are not guessed at; the export warns and the card
+counts what it could read. The field is optional so pre-#86 backups still
+import, and the payload has no deny_unknown_fields so a new backup still
+imports on pre-#86 firmware (pinned by a test). Sapwood's parser
+(src/lib/backup.ts isNoteInventory) is the matching reader
+(SECURITY-MODEL.md); destructive commands (mark_spent/discard/rename/
 delete) are button-gated like lnurl-vault gates them, with ONE runtime
 exception (#129): an approved export_secret leaves a single-use, RAM-only
 grant (note_cmd::SpendGrant, 120 s, same note, same client) so the mark_spent

@@ -6,11 +6,14 @@
 //! secrets, and the shared approval loop for every gated command. See
 //! docs/plans/2026-08-18-note-locker-goal.md.
 //!
-//! The `hw_notes` namespace is deliberately NOT part of backup export: a
-//! bearer note restored onto two boards is a double-spend waiting to happen,
-//! so notes are unrecoverable by design (backup.rs reads only the seed and
-//! slot keys it always has; nothing to exclude, but the rule is recorded
-//! here where the data lives).
+//! No note SECRET is ever part of a backup export: a bearer note restored
+//! onto two boards is a double-spend waiting to happen, so notes are
+//! unrecoverable by design. What a backup does carry (#86) is
+//! [`backup_inventory`] — one non-spendable line per readable note, holding
+//! the public commitment the mint already files it under, plus amount, mint,
+//! state and timestamps. It makes a dead board a legible, provable loss; it
+//! restores nothing, and the import side has no path from it to this
+//! module. The rule is recorded here, where the data lives.
 //!
 //! At-rest sealing: note blobs ride the PIN/vault secret exactly like the
 //! seeds do. A random 32-byte **note key** is wrapped by
@@ -705,6 +708,35 @@ pub fn idle_summary() -> IdleSummary {
             received: notes.store.received_count(),
             pending,
         }
+    })
+}
+
+/// What a backup export carries about the locker (#86): a non-spendable
+/// inventory line per readable note, and the count of notes it could NOT
+/// read so the caller can say so out loud.
+///
+/// Sealed records awaiting an unlock key, and a boot whose index would not
+/// read, both mean the locker knows less than the board holds. Neither is
+/// guessed at: the inventory lists what is readable, and `unreadable` is how
+/// many notes are known to be missing from it. An operator exporting on a
+/// locked board should unlock first.
+pub fn backup_inventory() -> (
+    alloc_vec::Vec<heartwood_common::backup::NoteInventoryEntry>,
+    usize,
+) {
+    with_locker(|notes| {
+        let sealed = notes.sealed_count();
+        let unreadable = if notes.store.index_known() {
+            sealed
+        } else {
+            // An unreadable index means the store came up empty and refuses
+            // creation; there is no honest count, only "not none".
+            sealed.max(1)
+        };
+        (
+            heartwood_common::backup::build_note_inventory(&notes.store),
+            unreadable,
+        )
     })
 }
 

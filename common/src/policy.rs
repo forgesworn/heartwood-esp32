@@ -1806,6 +1806,38 @@ mod tests {
     }
 
     #[test]
+    fn a_guardian_verdict_answers_the_identity_gate_a_note_send_meets() {
+        // #160: on an escalate slot the guardian answers for an identity the
+        // pairing has never been approved for, so the verdict has to satisfy
+        // the ALLOW AS the request would otherwise meet, and only for the
+        // identity the notice named.
+        let slot = trusted_legacy_slot();
+        let request = GateRequest {
+            has_client: true,
+            slot: Some(&slot),
+            method: "heartwood_note_send",
+            tier: ApprovalTier::ButtonRequired,
+            explicit_context: false,
+            has_context: false,
+            identity: Some(&IDENTITY_A),
+            verdict: false,
+        };
+        // Unapproved and no verdict: its own approval is still owed.
+        assert_eq!(gate_request(&request), Gate::Card(CardKind::AllowAs { record: true }));
+        // The guardian's verdict for this identity answers it, and records
+        // nothing on the slot.
+        assert_eq!(gate_request(&GateRequest { verdict: true, ..request }), Gate::Allow);
+        assert!(!identity_approved(&slot, &IDENTITY_A));
+        // A slot approval for another identity does not help this one.
+        let mut other = trusted_legacy_slot();
+        assert!(record_approved_identity(&mut other, &IDENTITY_B));
+        assert_eq!(
+            gate_request(&GateRequest { slot: Some(&other), ..request }),
+            Gate::Card(CardKind::AllowAs { record: true }),
+        );
+    }
+
+    #[test]
     fn an_approved_switch_leaves_its_target_silent_for_pubkey_and_sign() {
         // Bark: switch (one press, which records the target), then
         // get_public_key and the first sign with the active identity.

@@ -135,6 +135,23 @@ pub struct ApprovalNotice<'a> {
     pub park_ttl_secs: u64,
     /// Per §0.1, already stamped monotonic.
     pub created_at: u64,
+    /// The card the device would otherwise have shown, when the verdict is
+    /// about to answer that card in the operator's place (#160): the heading
+    /// (`SEND NOTE`) and the line under it (the amount, the mint, and for a
+    /// send the recipient). Without it a guardian would be approving a method
+    /// name rather than a bearer-note movement, so a device that cannot build
+    /// the preview does not park the request at all: it keeps the card.
+    pub card: Option<ApprovalCard<'a>>,
+}
+
+/// The device card a notice carries so the approver sees what the approval
+/// releases.
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalCard<'a> {
+    /// The card heading, e.g. `SEND NOTE`.
+    pub heading: &'a str,
+    /// The line under it, newlines already flattened for a tag value.
+    pub detail: &'a str,
 }
 
 /// Build the C4 kind-31001 approval-needed rumor.
@@ -150,6 +167,12 @@ pub fn build_approval_notice(p: &ApprovalNotice<'_>) -> UnsignedEvent {
     ];
     if let Some(kind) = p.event_kind {
         tags.push(vec!["k".to_string(), format!("{kind}")]);
+    }
+    // What the press would have released, for the approver who is not at the
+    // device to read it off the OLED (#160).
+    if let Some(card) = p.card {
+        tags.push(vec!["card".to_string(), card.heading.to_string()]);
+        tags.push(vec!["detail".to_string(), card.detail.to_string()]);
     }
     tags.push(vec!["park-ttl".to_string(), format!("{}", p.park_ttl_secs)]);
     UnsignedEvent {
@@ -499,6 +522,7 @@ mod tests {
             event_kind: Some(1),
             park_ttl_secs: 600,
             created_at: 1_700_000_000,
+            card: None,
         });
         assert_eq!(rumor.kind, NOTICE_KIND);
         assert_eq!(
@@ -514,6 +538,37 @@ mod tests {
                 vec!["park-ttl".to_string(), "600".to_string()],
             ],
         );
+    }
+
+    #[test]
+    fn a_note_park_notice_shows_what_the_approval_releases() {
+        // #160: the verdict answers the SEND NOTE card in the operator's
+        // place, so the notice has to carry what that card said.
+        let rumor = build_approval_notice(&ApprovalNotice {
+            guardian_np_hex: GUARDIAN_NP,
+            client_hex: CLIENT,
+            park_id_hex: PARK,
+            identity_hex: DEP,
+            method: "heartwood_note_send",
+            event_kind: None,
+            park_ttl_secs: 600,
+            created_at: 1_700_000_000,
+            card: Some(ApprovalCard {
+                heading: "SEND NOTE",
+                detail: "12,345 sats mint.example / to abcd1234..ef012345",
+            }),
+        });
+        assert!(rumor.tags.iter().any(|t| t[0] == "card" && t[1] == "SEND NOTE"));
+        assert!(rumor
+            .tags
+            .iter()
+            .any(|t| t[0] == "detail"
+                && t[1] == "12,345 sats mint.example / to abcd1234..ef012345"));
+        // The park handle and the method still read as before, and the
+        // preview never displaces the park-ttl the approver's app counts on.
+        assert!(rumor.tags.iter().any(|t| t[0] == "park" && t[1] == PARK));
+        assert!(rumor.tags.iter().any(|t| t[0] == "park-ttl" && t[1] == "600"));
+        assert_eq!(rumor.tags.last().map(|t| t[0].as_str()), Some("park-ttl"));
     }
 
     #[test]

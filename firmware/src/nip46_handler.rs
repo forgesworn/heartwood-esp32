@@ -67,23 +67,7 @@ fn unbound_remote_request_denied(
 /// destructive ones are additionally pinned ButtonRequired whatever the
 /// slot's tier says (see the pin in dispatch_inner).
 fn is_note_method(method: &nip46::Nip46Method) -> bool {
-    matches!(
-        method,
-        nip46::Nip46Method::HeartwoodNoteList
-            | nip46::Nip46Method::HeartwoodNoteNew
-            | nip46::Nip46Method::HeartwoodNoteNewPair
-            | nip46::Nip46Method::HeartwoodNoteConfirm
-            | nip46::Nip46Method::HeartwoodNoteDiscard
-            | nip46::Nip46Method::HeartwoodNoteExport
-            | nip46::Nip46Method::HeartwoodNoteImport
-            | nip46::Nip46Method::HeartwoodNoteSpent
-            | nip46::Nip46Method::HeartwoodNoteSend
-            | nip46::Nip46Method::HeartwoodNoteRename
-            | nip46::Nip46Method::HeartwoodNoteTrust
-            | nip46::Nip46Method::HeartwoodNoteTrusted
-            | nip46::Nip46Method::HeartwoodNoteAddress
-            | nip46::Nip46Method::HeartwoodNoteClaim
-    )
+    method.is_note_method()
 }
 
 /// Whether an approved `heartwood_note_export` has left this client a live,
@@ -387,6 +371,15 @@ pub enum ApprovalDecision {
     /// The operator has already completed the hold for this exact request.
     /// Skip the card and dispatch as approved.
     ButtonApproved,
+    /// A guardian verdict answered the park this exact request was raised as
+    /// (#160). It is an approval, but it is not a press: it skips only the
+    /// cards a verdict may answer
+    /// ([`nip46::Nip46Method::verdict_may_answer_card`], the bearer-note set,
+    /// and then only because the notice carried the card's own preview).
+    /// Any other card refuses here rather than being pressed by proxy, so a
+    /// scalar hand-off or a wallet pairing can never be approved from a
+    /// phone.
+    VerdictApproved,
 }
 
 /// What the operator is being asked to approve, enough to draw the card.
@@ -449,8 +442,15 @@ enum Hold {
 }
 
 /// Obtain a hold on one `show_master_sign_request` card under `approval`.
+///
+/// `verdict_answers` says whether a guardian verdict may answer THIS card
+/// (#160). It is false for every card by default, including all the gate
+/// cards: a verdict covers the identity gate by being a verdict (the gate
+/// reads it and asks for no card at all), so a gate card still standing here
+/// means the verdict does not cover this request.
 fn hold_for_card(
     approval: ApprovalDecision,
+    verdict_answers: bool,
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
     heading: &str,
@@ -461,6 +461,15 @@ fn hold_for_card(
     match approval {
         ApprovalDecision::Deferred => Hold::Deferred,
         ApprovalDecision::ButtonApproved => Hold::Approved,
+        ApprovalDecision::VerdictApproved if verdict_answers => Hold::Approved,
+        ApprovalDecision::VerdictApproved => {
+            log::warn!("{line}: refused: a verdict cannot answer this card");
+            Hold::Refused(build_error_json(
+                request_id,
+                -1,
+                heartwood_common::escalate::DEVICE_APPROVAL_REQUIRED,
+            ))
+        }
         ApprovalDecision::Interactive => {
             let result = crate::approval::run_approval_loop(
                 display,
@@ -778,7 +787,12 @@ fn dispatch_inner(
     // goal doc's recorded decision — cheap to relax later, impossible to
     // un-leak). The pin runs the SAME pre-dispatch gate below, so Deferred
     // callers hold the card exactly like any other extension ask.
-    let tier = if method.always_requires_button() && is_note_method(&method) {
+    //
+    // The pin is about policy, not about who answers. An approval of THIS
+    // request satisfies it: the operator's hold, or, on an escalate slot,
+    // the guardian's verdict for the park this request was raised as, which
+    // arrives here as `ButtonApproved` from `relay::complete_parked` (#160).
+    let tier = if method.pinned_physical() {
         heartwood_common::policy::ApprovalTier::ButtonRequired
     } else {
         tier
@@ -999,7 +1013,9 @@ fn dispatch_inner(
                 identity.as_ref().map(heartwood_common::encoding::short_npub).unwrap_or_default(),
             ),
         };
-        match hold_for_card(approval, display, buttons, &heading, &requester_label, &preview, &request.id) {
+        // A gate card under a verdict means the verdict does not cover this
+        // request: never pressed by proxy, and never recorded.
+        match hold_for_card(approval, false, display, buttons, &heading, &requester_label, &preview, &request.id) {
             Hold::Refused(response) => return response,
             Hold::Deferred => {
                 *deferred = Some(Box::new(DeferredAsk {
@@ -1039,7 +1055,10 @@ fn dispatch_inner(
         } else if is_note_method(&method) {
             let cmd = heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params).ok();
             if let Some(refusal) = cmd.as_ref().and_then(crate::notes::relay_precheck) {
-                if !matches!(approval, ApprovalDecision::ButtonApproved) {
+                if !matches!(
+                    approval,
+                    ApprovalDecision::ButtonApproved | ApprovalDecision::VerdictApproved
+                ) {
                     return build_error_json(&request.id, -1, refusal);
                 }
             }
@@ -1052,7 +1071,16 @@ fn dispatch_inner(
             None => extension_approval_preview(&requester_label, &request.params),
         };
         let heading = crate::oled::master_sign_heading(master_label);
-        match hold_for_card(approval, display, buttons, &heading, &request.method, &preview, &request.id) {
+        match hold_for_card(
+            approval,
+            method.verdict_may_answer_card(),
+            display,
+            buttons,
+            &heading,
+            &request.method,
+            &preview,
+            &request.id,
+        ) {
             Hold::Refused(response) => return response,
             Hold::Deferred => {
                 *deferred = Some(Box::new(DeferredAsk {
@@ -1139,6 +1167,18 @@ fn dispatch_inner(
                             },
                         }));
                         return String::new();
+                    }
+                    // A verdict never presses a sign card. Reaching here under
+                    // one means no approve-once window lifted this sign, so
+                    // the verdict does not cover it and the hold is still
+                    // owed at the device (#160).
+                    if matches!(approval, ApprovalDecision::VerdictApproved) {
+                        log::warn!("sign_event: refused: a verdict cannot answer this card");
+                        return build_error_json(
+                            &request.id,
+                            -1,
+                            heartwood_common::escalate::DEVICE_APPROVAL_REQUIRED,
+                        );
                     }
                     // Taken before any authority change a successful sign
                     // makes, so a failed write can undo all of it.
@@ -1301,7 +1341,7 @@ fn dispatch_inner(
                                 if slot_can_sign {
                                     let preview = format!("rebind '{slot_label}'");
                                     let heading = crate::oled::master_sign_heading(master_label);
-                                    match hold_for_card(approval, display, buttons, &heading, "connect", &preview, &request.id) {
+                                    match hold_for_card(approval, false, display, buttons, &heading, "connect", &preview, &request.id) {
                                         Hold::Refused(response) => return response,
                                         Hold::Deferred => {
                                             *deferred = Some(Box::new(DeferredAsk {

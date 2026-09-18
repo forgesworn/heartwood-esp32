@@ -235,6 +235,67 @@ impl Nip46Method {
         )
     }
 
+    /// The bearer-note locker's relay methods. All of them require a bound
+    /// slot, and the disclosure and destruction ones are additionally pinned
+    /// physical (see [`Self::pinned_physical`]).
+    pub fn is_note_method(&self) -> bool {
+        matches!(
+            self,
+            Self::HeartwoodNoteList
+                | Self::HeartwoodNoteNew
+                | Self::HeartwoodNoteNewPair
+                | Self::HeartwoodNoteConfirm
+                | Self::HeartwoodNoteDiscard
+                | Self::HeartwoodNoteExport
+                | Self::HeartwoodNoteImport
+                | Self::HeartwoodNoteSpent
+                | Self::HeartwoodNoteSend
+                | Self::HeartwoodNoteRename
+                | Self::HeartwoodNoteTrust
+                | Self::HeartwoodNoteTrusted
+                | Self::HeartwoodNoteAddress
+                | Self::HeartwoodNoteClaim
+        )
+    }
+
+    /// Whether this method's own card is pinned: no slot policy may silence
+    /// it, whatever the tier says. A leaked bearer note cannot be un-leaked,
+    /// so naming a disclosure or a destruction in a policy is deliberately not
+    /// consent to it.
+    ///
+    /// A pin is about policy, not about who answers. An approval of that exact
+    /// request still satisfies it, whether that is the operator's hold or a
+    /// guardian verdict for the park the request was escalated as (see
+    /// [`crate::escalate::park_completion`]).
+    pub fn pinned_physical(&self) -> bool {
+        self.always_requires_button() && self.is_note_method()
+    }
+
+    /// Whether one press at the device is the ONLY approval this method's
+    /// card accepts. A rendezvous provision hands the caller a derived scalar
+    /// and `heartwood_pair_wallet` mints a slot secret and returns it: each
+    /// turns the approval itself into a bearer capability, so no remote
+    /// verdict may stand in for the press. On an escalate slot these are
+    /// refused outright rather than parked, because parking one could only
+    /// ever end in a card nobody is there to press (#160).
+    pub fn device_press_only(&self) -> bool {
+        self.requires_fresh_physical_approval() || matches!(self, Self::HeartwoodPairWallet)
+    }
+
+    /// Whether a guardian verdict may answer this method's OWN card (#160).
+    ///
+    /// Exactly the pinned set: the bearer-note disclosures and destructions,
+    /// whose card goes up whatever the tier says and is therefore the only
+    /// card still standing when a verdict completes a park. That is what
+    /// escalation exists for, the family's guardian answering a note movement
+    /// when nobody is at the board, and it holds only with the card's own
+    /// preview in front of them. Every other own card is a device press, and
+    /// a note method that owes no card of its own (a listing, an address) has
+    /// nothing here to answer.
+    pub fn verdict_may_answer_card(&self) -> bool {
+        self.pinned_physical() && !self.device_press_only()
+    }
+
     /// Whether this method is always auto-approved (no policy check needed).
     ///
     /// Capabilities discovery sits here deliberately: like connect/ping it is

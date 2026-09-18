@@ -596,3 +596,141 @@ That is a concept-rung decision, not a tuning one.
 5. **Open the Argon2id question?** §4.4. Concept rung, its own investigation,
    and the honest answer to the threat model this issue states. Not part of
    #121.
+
+---
+
+## 7. What was built
+
+Branch `perf/kdf-hardware-sha`, same day. The decisions taken before any code
+was written: `PBKDF2_ITERATIONS` stays at 100,000, the KDF moves onto the
+accelerator on the boards that have a usable one, the iteration ceiling is
+fixed in the same change, and Argon2id is parked (§7.6).
+
+### 7.1 The shape
+
+`common/src/kdf.rs` is new: PBKDF2-HMAC-SHA256 written against a
+[`Sha256Engine`] trait whose only required method is one 64-byte compression.
+The HMAC inner and outer pad states are compressed once and carried through the
+whole derivation, so the round loop is exactly two compressions — host-tested
+(`the_round_loop_costs_exactly_two_compressions`), because rehashing the key
+each round would give most of the accelerator's win straight back. Message
+blocks are a 4-byte-aligned `Block` newtype; ESP-IDF's register fill does
+32-bit loads off the caller's buffer, and an unaligned 32-bit load on Xtensa is
+the fault class that made k256 unusable here.
+
+`firmware/src/sha_accel.rs` implements that trait on the peripheral and
+installs it as a whole-PBKDF2 hook from `main`. Everything without a hook —
+host tools, the host tests, `heartwoodd`, the ESP8266 — reaches
+`pbkdf2::pbkdf2_hmac::<Sha256>` exactly as before. `seed_cipher::derive_km` is
+the single diversion point, so every caller (master seeds, the note-key `nk`
+wrap, the self-check on enable) is covered without touching any of them.
+
+### 7.2 The API, and why that one
+
+`esp_sha_acquire_hardware` / `esp_sha_release_hardware` /
+`esp_sha_write_digest_state` / `esp_sha_read_digest_state` from the public port
+header `sha/sha_dma.h`, plus `sha_hal_hash_block` for the block step. §2.3
+called this shape and it holds up: the digest-state pair is what makes PBKDF2
+possible at all, because every HMAC starts from a keyed midstate rather than
+from the IV, and `SOC_SHA_SUPPORT_RESUME` is what decides which boards qualify.
+
+Not `mbedtls_internal_sha256_process` (§2.2, ceremony per 64 bytes) and not
+`esp_sha_dma`: for a single 64-byte block from internal RAM the latter builds a
+DMA descriptor, syncs caches and starts the shared GDMA, which is far more work
+than the 64 accelerator cycles it would be wrapping. No C shim and no extra
+component — the symbols are already in the image, because TLS drives the same
+code.
+
+Board gating is the new `sha-accel` cargo feature, enabled by `heltec-v3`,
+`heltec-v4` and `c6` — the targets whose `soc_caps.h` sets
+`SOC_SHA_SUPPORT_RESUME`. The classic ESP32 (`tdisplay`) has
+`SOC_SHA_SUPPORT_PARALLEL_ENG` with no resume, so it cannot be given a saved
+midstate and keeps the software path; the ESP8266 has no accelerator at all.
+Both still get the new driver's in-loop watchdog feed.
+
+### 7.3 Parity, proven three ways
+
+1. **Known-answer vectors.** Five RFC 6070-shaped PBKDF2-HMAC-SHA256 vectors
+   (including the `pass\0word` / `sa\0lt` embedded-NUL case and a >64-byte
+   password), each asserted against BOTH the `pbkdf2` crate and the new driver.
+   A vector that only agreed with itself would prove nothing.
+2. **A spread, through both paths.** 7 passwords x 5 salts x 8 round counts x
+   4 output lengths = 1,120 cases, each compared against the `pbkdf2` crate.
+   The driver runs behind a `FakeAcceleratorEngine` that implements the same
+   trait over a software compression function and asserts the things the real
+   peripheral relies on: block alignment, balanced acquire/release, no chunk
+   left open, no chunk longer than the declared bound. The accelerator cannot
+   run on the host; its *logic* can, and this is it.
+3. **On the device.** Before the first real derivation after boot, the chosen
+   engine runs a 64-round known-answer vector and compares against
+   `kdf::SELF_CHECK_KM` — a constant that a host test proves is the reference
+   implementation's own answer. A mismatch is logged, the session falls back to
+   software, and no hardware-derived key is ever used. The detection itself is
+   host-tested against a deliberately one-bit-wrong engine, and the bench can
+   force the device-side path with the `sha-selfcheck-fail` build feature
+   (HARDWARE-TEST-CHECKLIST §25 item 6).
+
+### 7.4 Contention
+
+The lock is taken in `begin_chunk` and released in `end_chunk`, around runs of
+`CHUNK_ROUNDS` (256) HMAC rounds — 512 compressions, on the order of 1.5 ms of
+held lock at the estimated hardware rate. It is never held across a whole
+`derive_km`, which §2.4 was explicit about: on the S3 this is
+`esp_crypto_sha_aes_lock_acquire`, the **shared SHA and AES** lock, and a
+locked WiFi-standalone board is doing TLS at exactly that moment to receive its
+vault key.
+
+Deadlock is not possible: the KDF holds nothing else while it takes that lock,
+and `Drop` releases it on any early exit or panic. A concurrent TLS record MAC
+waits one chunk at worst. The ~2 s hold §2.4 warned about does not exist in
+this implementation — the longest hold is one chunk, and a 100,000-round
+derivation is 782 acquire/release pairs, whose overhead is a few milliseconds
+against a derivation of about a second.
+
+If an acquire itself takes longer than 20 ms, the peripheral is genuinely busy;
+the derivation finishes in software and logs that it did. Slower, but it holds
+nothing and produces the same bytes.
+
+For the watchdog, `end_chunk` feeds on every chunk and yields the CPU on a
+250 ms budget rather than per chunk (a FreeRTOS tick is 10 ms, so yielding per
+chunk would cost more than the work). This is strictly more than the old path
+did — `pin.rs` yielded only *between* slots — and `pin.rs` keeps that yield, so
+the multi-master unlock is unchanged where it was already correct.
+
+### 7.5 The iteration ceiling
+
+`MAX_PBKDF2_ITERATIONS` moves from 1,000,000 to **150,000**, which §3.3 asked
+for. The measured software rate is 290 us per iteration on a V4 (29 s for
+100,000), so 150,000 is 43.5 s against the 60 s task watchdog — 27% of the
+window in hand. 1,000,000 was 290 s, three to five times more than the board
+could survive.
+
+The binding case is deliberately the **software fallback**, not the
+accelerator: a board whose accelerator is absent or has failed its self-check
+derives in software, and that is where a corrupted count hurts. The ceiling
+also has to stay above what this firmware writes, so 100,000 and 150,000 are
+the two ends it is squeezed between; 150,000 caps the damage a flipped bit can
+do at 1.5x a legitimate unseal, and leaves headroom for a future measured
+retune without a format change.
+
+On whether the header MAC could be checked first: it cannot, and that is
+inherent rather than an oversight. The MAC key is PBKDF2 output block 2, so
+verifying the header requires already having done the work the header asked
+for. A cheap range check on the parsed count really is all that is available
+pre-KDF, and `blob_iterations` is now that check on its own, exposed and
+host-tested (`the_iteration_ceiling_is_checked_before_any_kdf_work`). The
+refusal happens in `decrypt_seed`'s length dispatch, structurally before
+`derive_km` is reached.
+
+### 7.6 Argon2id, parked
+
+Argon2id remains the real lever for the PIN threat model, and nothing in §7
+changes §4.1: a memory-hard KDF is what destroys the GPU advantage that makes
+a 4-to-8-digit PIN hopeless against a flash dump, while iteration count only
+moves the multiplier. It is deferred rather than dismissed because it is a
+different size of change: it needs a **format version 2** (old blobs keep
+decrypting at PBKDF2/100k forever, new ones use Argon2id) and it needs a
+parameter set that survives this chip's ~180 KB of fragmented heap, which is
+its own investigation and its own bench pass. Speeding up the wrong KDF does
+not make it the right one — it makes the right one affordable to adopt later,
+because the operator's unseal budget is no longer spent.

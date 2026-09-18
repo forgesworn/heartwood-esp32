@@ -283,12 +283,25 @@ pub struct BackupPayload {
     /// #86 is that a loss is legible, and "I cannot see N of them" is a
     /// different statement from "there were none". Zero is omitted, so the
     /// common case adds nothing to the file.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "lenient_count"
+    )]
     pub note_inventory_unreadable: u32,
 }
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+/// Read `note_inventory_unreadable` the way the inventory itself is read:
+/// anything that is not a valid u32 is treated as absent (0), never as an
+/// error, so a garbage count cannot block the restore of identities and
+/// slots.
+fn lenient_count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(raw.as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -770,5 +783,26 @@ mod tests {
         // a shape it does not understand.
         let out = serde_json::to_string(&decoded).unwrap();
         assert!(out.contains("\"note_inventory\":null"));
+    }
+
+    #[test]
+    fn a_garbage_unreadable_count_still_restores_masters_and_slots() {
+        for hostile in ["\"four\"", "-1", "2.5", "4294967296", "{\"n\":4}", "[4]", "null", "true"] {
+            let json = format!(
+                r#"{{"created_at":1,"device_id":"dd","bridge_secret":"ee",
+                     "masters":[{{"slot":0,"label":"Personal","mode":1,
+                       "derivation_version":1,"pubkey":"ff","connection_slots":[]}}],
+                     "note_inventory":[],"note_inventory_unreadable":{hostile}}}"#
+            );
+            let decoded: BackupPayload = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("count {hostile} blocked the restore: {e}"));
+            assert_eq!(decoded.masters.len(), 1);
+            assert_eq!(decoded.masters[0].label, "Personal");
+            assert_eq!(decoded.note_inventory_unreadable, 0, "count {hostile} read as a number");
+        }
+        // A valid count still reads as itself.
+        let ok = r#"{"created_at":1,"device_id":"dd","bridge_secret":"ee","masters":[],
+                     "note_inventory_unreadable":4}"#;
+        assert_eq!(serde_json::from_str::<BackupPayload>(ok).unwrap().note_inventory_unreadable, 4);
     }
 }

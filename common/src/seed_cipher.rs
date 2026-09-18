@@ -59,9 +59,40 @@ pub const LEGACY_PBKDF2_ITERATIONS: u32 = 100_000;
 /// measured retune without changing how legacy blobs unlock.
 pub const PBKDF2_ITERATIONS: u32 = LEGACY_PBKDF2_ITERATIONS;
 /// Refuse a corrupted header before it can turn an unlock attempt into an
-/// arbitrary-length CPU burn. This is deliberately a generous ceiling, not a
-/// policy target; a retune still needs an actual slow-board measurement.
-pub const MAX_PBKDF2_ITERATIONS: u32 = 1_000_000;
+/// arbitrary-length CPU burn.
+///
+/// This is **not** a round number and must not be raised to one. The rounds
+/// field is read from flash and the work it names is performed BEFORE
+/// anything is authenticated — the MAC key is PBKDF2 output block 2, so the
+/// header's own MAC cannot be checked until after the KDF has run. A cheap
+/// range check on the parsed count is therefore the only pre-KDF defence that
+/// exists, and its value has to be tied to what the slowest supported path
+/// can actually finish.
+///
+/// The binding case is the **software** path, not the accelerator: a board
+/// whose accelerator is absent or has failed its self-check derives in
+/// software, and that is where a corrupted count hurts.
+///
+///   measured, Heltec V4 (S3, 240 MHz, software):
+///       29 s for 100,000 iterations  ->  290 us per iteration
+///   task watchdog (sdkconfig.defaults, Kconfig maximum):
+///       60 s
+///   budget for one slot, leaving margin:
+///       150,000 x 290 us = 43.5 s, i.e. 16.5 s (27%) inside the window
+///
+/// The previous value of 1,000,000 was 290 s of software work against that
+/// 60 s window — three to five times more than the board could survive, so a
+/// blob with a corrupted rounds field was a reboot loop rather than a clean
+/// "wrong PIN". 150,000 also leaves genuine headroom above the shipped
+/// [`PBKDF2_ITERATIONS`] for a future measured retune without another format
+/// change, while capping the damage a flipped bit can do at 1.5x a legitimate
+/// unseal rather than 10x.
+///
+/// The KDF additionally feeds the watchdog from inside its round loop now
+/// (see [`crate::kdf`]), so the window is a budget rather than a cliff — but
+/// the ceiling is set from the cliff, because the in-loop feed is a courtesy
+/// to other tasks and not a guarantee.
+pub const MAX_PBKDF2_ITERATIONS: u32 = 150_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SeedCipherError {
@@ -89,6 +120,20 @@ fn derive_km(pin: &[u8], salt: &[u8], iterations: u32) -> [u8; 64] {
     km
 }
 
+/// The KDF cost a blob names, without doing any of that work.
+///
+/// Callers that want to refuse an unreasonable blob before paying for it use
+/// this. [`decrypt_seed`] applies the identical check in its own length
+/// dispatch, which is reached before [`derive_km`] — the ceiling is the only
+/// pre-KDF defence there is, because the header's MAC key is PBKDF2 output
+/// block 2 and so cannot be checked until the work has already been done.
+pub fn blob_iterations(blob: &[u8]) -> Result<u32, SeedCipherError> {
+    match blob.len() {
+        LEGACY_BLOB_LEN => Ok(LEGACY_PBKDF2_ITERATIONS),
+        BLOB_LEN => parse_current_header(blob),
+        _ => Err(SeedCipherError::BadLength),
+    }
+}
 
 /// Whether `len` is a format length which may represent an encrypted seed.
 /// This deliberately answers only the length question; callers still pass the
@@ -356,5 +401,68 @@ mod tests {
             decrypt_seed(PIN, &blob),
             Err(SeedCipherError::InvalidIterations)
         );
+    }
+
+    /// The ceiling is checked by parsing the header, which is all that can be
+    /// done before the KDF: the MAC key IS PBKDF2 output block 2, so the
+    /// header's authentication tag cannot be verified until after the work
+    /// the header asked for has been performed. `blob_iterations` is that
+    /// pre-KDF check on its own, and `decrypt_seed` reaches `derive_km` only
+    /// through it.
+    #[test]
+    fn the_iteration_ceiling_is_checked_before_any_kdf_work() {
+        let mut blob = encrypt_seed(PIN, &SEED, &SALT, &NONCE);
+
+        // At the ceiling: accepted by the pre-KDF check (not run here — it is
+        // 150,000 rounds).
+        blob[5..HEADER_LEN].copy_from_slice(&MAX_PBKDF2_ITERATIONS.to_be_bytes());
+        assert_eq!(blob_iterations(&blob), Ok(MAX_PBKDF2_ITERATIONS));
+
+        // One above: refused, with no KDF performed.
+        blob[5..HEADER_LEN].copy_from_slice(&(MAX_PBKDF2_ITERATIONS + 1).to_be_bytes());
+        assert_eq!(
+            blob_iterations(&blob),
+            Err(SeedCipherError::InvalidIterations)
+        );
+        assert_eq!(
+            decrypt_seed(PIN, &blob),
+            Err(SeedCipherError::InvalidIterations)
+        );
+
+        // A wildly corrupted count is refused the same way, instantly.
+        blob[5..HEADER_LEN].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            decrypt_seed(PIN, &blob),
+            Err(SeedCipherError::InvalidIterations)
+        );
+
+        // Both stored formats answer the question without hashing anything.
+        assert_eq!(
+            blob_iterations(&[0u8; LEGACY_BLOB_LEN]),
+            Ok(LEGACY_PBKDF2_ITERATIONS)
+        );
+        assert_eq!(blob_iterations(&[0u8; 10]), Err(SeedCipherError::BadLength));
+    }
+
+    /// The ceiling must stay above what this firmware writes, and below what
+    /// the slowest supported path can finish inside the 60 s task watchdog.
+    /// The arithmetic is on the constant; this pins it so a future retune
+    /// cannot quietly break either end.
+    #[test]
+    fn the_ceiling_brackets_the_shipped_cost_and_the_watchdog() {
+        assert!(PBKDF2_ITERATIONS <= MAX_PBKDF2_ITERATIONS);
+        assert!(LEGACY_PBKDF2_ITERATIONS <= MAX_PBKDF2_ITERATIONS);
+
+        // 290 us per iteration, measured on a V4 software unseal.
+        const MEASURED_US_PER_ITERATION: u64 = 290;
+        const WATCHDOG_US: u64 = 60_000_000;
+        let worst = MAX_PBKDF2_ITERATIONS as u64 * MEASURED_US_PER_ITERATION;
+        assert!(
+            worst < WATCHDOG_US,
+            "ceiling of {MAX_PBKDF2_ITERATIONS} is {worst} us of software work, \
+             which does not fit the {WATCHDOG_US} us watchdog window"
+        );
+        // …and with at least 20% of the window to spare.
+        assert!(worst * 10 <= WATCHDOG_US * 8);
     }
 }

@@ -76,11 +76,19 @@ pub enum SeedCipherError {
 }
 
 /// Derive the 64-byte (enc || mac) key material from a PIN and salt.
+///
+/// This goes through [`crate::kdf::pbkdf2_for_seed`], which is the unchanged
+/// pure-Rust `pbkdf2` crate everywhere — host tools, host tests, heartwoodd —
+/// except on a board that installed a device KDF hook at boot. Such a board
+/// has already proved that hook byte-identical against a known-answer vector
+/// before its first real derivation, and drops back to software itself if it
+/// could not. See docs/2026-09-18-pbkdf2-cost-and-sha-acceleration.md.
 fn derive_km(pin: &[u8], salt: &[u8], iterations: u32) -> [u8; 64] {
     let mut km = [0u8; 64];
-    pbkdf2::pbkdf2_hmac::<Sha256>(pin, salt, iterations, &mut km);
+    crate::kdf::pbkdf2_for_seed(pin, salt, iterations, &mut km);
     km
 }
+
 
 /// Whether `len` is a format length which may represent an encrypted seed.
 /// This deliberately answers only the length question; callers still pass the

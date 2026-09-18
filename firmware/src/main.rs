@@ -81,6 +81,9 @@ mod jd9853;
 mod relay;
 mod rendezvous_provision;
 mod session;
+/// The sealed-seed KDF on this board's SHA accelerator (S3, C6) or, where
+/// there is none, on the same driver over the software compression function.
+mod sha_accel;
 mod sign;
 mod transport;
 mod wdt;
@@ -416,6 +419,12 @@ fn main() {
     log::info!("Last reset: {}", reset_reason_str());
     init_crash_context();
     wdt::init();
+
+    // Point the sealed-seed KDF at this board's SHA engine before anything can
+    // read or write a sealed blob. The known-answer self-check runs lazily, on
+    // the first real derivation; a mismatch drops the session to software and
+    // no hardware-derived key is used. See sha_accel.rs.
+    sha_accel::install();
 
     let peripherals = Peripherals::take().expect("failed to take peripherals");
 

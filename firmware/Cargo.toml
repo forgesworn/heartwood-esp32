@@ -11,10 +11,10 @@ license = "MIT"
 # hoc build of the default board keeps it even if the board feature changes.
 default = ["heltec-v4", "log/release_max_level_off"]
 # Heltec WiFi LoRa 32 V4 -- USB-C wired to ESP32-S3 native USB pins.
-heltec-v4 = ["dep:qrcodegen-no-heap", "log/release_max_level_off"]
+heltec-v4 = ["dep:qrcodegen-no-heap", "log/release_max_level_off", "sha-accel"]
 # Heltec WiFi LoRa 32 V3 -- USB-C wired through a CP2102 bridge to UART0
 # (GPIO43 TX / GPIO44 RX). Mutually exclusive with heltec-v4.
-heltec-v3 = ["log/release_max_level_off"]
+heltec-v3 = ["log/release_max_level_off", "sha-accel"]
 # Colour ST7789 TFT display backend (T-Display, ESP32-C6). Colour-panel boards
 # enable this; it pulls in the mipidsi driver. Mono-OLED boards (Heltec) leave
 # it off and keep the ssd1306 backend. `st7789-check` compiles the backend
@@ -28,7 +28,20 @@ tdisplay = ["st7789", "dep:qrcodegen-no-heap", "log/release_max_level_warn"]
 # portrait IPS panel. Built for the riscv32imac-esp-espidf target.
 # Note: the display controller is JD9853 (NOT ST7789); the jd9853 module sends
 # the vendor init sequence directly over raw SPI without mipidsi.
-c6 = ["dep:qrcodegen-no-heap", "log/release_max_level_warn"]
+c6 = ["dep:qrcodegen-no-heap", "log/release_max_level_warn", "sha-accel"]
+# Run the sealed-seed KDF on the chip's SHA accelerator. Enabled by every board
+# whose SHA peripheral can be resumed from a saved digest state (SOC_SHA_SUPPORT_RESUME:
+# the ESP32-S3 Heltecs and the ESP32-C6), which is what PBKDF2 needs to carry the
+# HMAC pad midstates. The classic ESP32 (T-Display) has the parallel-engine SHA
+# with no resume, so it leaves this off and keeps the pure-Rust path. See
+# firmware/src/sha_accel.rs and docs/2026-09-18-pbkdf2-cost-and-sha-acceleration.md.
+sha-accel = []
+# BENCH ONLY. Corrupts one bit of every hardware compression so the boot-time
+# known-answer self-check fails, which is how HARDWARE-TEST-CHECKLIST section 25
+# exercises the mismatch path (log, fall back to software, never derive a key
+# with the failed engine). Never enable this in an image anyone will use.
+sha-selfcheck-fail = ["sha-accel"]
+
 # Branded board-check demo (deliberately NOT the signer): title screen, button
 # check, and a two-button jump-and-duck game. Ships pre-flashed on boards sold
 # untouched-by-vendor-firmware; proves display + both buttons + USB work while

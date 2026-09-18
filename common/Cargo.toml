@@ -9,7 +9,10 @@ license = "MIT"
 k256 = { version = "0.13", default-features = false, features = ["schnorr", "arithmetic", "ecdh"], optional = true }
 secp256k1 = { version = "0.29", default-features = false, features = ["alloc"], optional = true }
 hmac = { version = "0.12", default-features = false }
-sha2 = { version = "0.10", default-features = false }
+# `compress` exposes sha2's bare compression function, which common/src/kdf.rs
+# uses as the reference SHA-256 block step behind the swappable engine. It adds
+# no code to an image that does not call it.
+sha2 = { version = "0.10", default-features = false, features = ["compress"] }
 zeroize = { version = "1", default-features = false, features = ["derive", "alloc"] }
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 crc32fast = { version = "1", default-features = false }

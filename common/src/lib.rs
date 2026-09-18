@@ -102,6 +102,12 @@ pub mod ota_sign;
 #[cfg(feature = "device-identity")]
 pub mod device_identity;
 
+/// PBKDF2-HMAC-SHA256 over a swappable SHA-256 compression function, so a
+/// board with a SHA accelerator can run the sealed-seed KDF on the peripheral
+/// while every other build keeps the pure-Rust path.
+#[cfg(feature = "seed-encrypt")]
+pub mod kdf;
+
 #[cfg(feature = "seed-encrypt")]
 pub mod seed_cipher;
 

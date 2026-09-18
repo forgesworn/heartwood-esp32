@@ -2046,6 +2046,103 @@ whose seed you cannot re-provision.
    and run one Sapwood backup export/import round trip. All of these call
    `encrypt_seed`/`decrypt_seed` and all must behave exactly as sections 7 and
    13 record them.
+## 26. A backup carries the note inventory and restores none of it (#86; added 2026-09-18, NOT YET BENCH-RUN)
+
+A bearer note IS its secret, so a restored copy of one is a double spend and
+notes will never be in a backup as money. But a board that dies silently
+taking value with it is the worst kind of loss: unbounded and unprovable. So a
+backup now carries a non-spendable INVENTORY - per readable note, the public
+commitment its mint already files it under, plus amount, mint, state and
+timestamps - and nothing that can move a satoshi. This section checks both
+halves on real hardware: that the inventory is there and honest, and that a
+restore cannot bring a note back.
+
+Needs a board holding at least two notes in different states (mint one and
+confirm it, receive or import a second, mark a third spent if convenient),
+Sapwood's Backup panel, and a text editor for the decrypted file.
+
+1. **The export card says what is leaving.** Sapwood -> Backup -> Export.
+   The board's CONFIRM CHANGE card reads `Export backup?` over
+   `<n>m <n>sl <n>nt+amt/mint` when the locker holds notes - the `+amt/mint`
+   clause is there because the inventory carries amounts and mint hosts as
+   well as commitments - and the familiar `<n> masters/<n> slots` when the
+   locker is empty. Hold to approve; the done card repeats the same line.
+   Sapwood's success message ends "plus a non-spendable inventory of N notes".
+
+2. **The file says the same thing.** Decrypt the downloaded backup with its
+   passphrase (Sapwood's import preview is enough) and read `note_inventory`.
+   One entry per note the card counted, each with exactly these eight fields:
+   `id`, `commitment`, `state`, `amount_msat`, `host`, `key_index`,
+   `created_at`, `updated_at`. There is no `secret_hash` (the field is called
+   `commitment` because for a key note it is a public key, not a hash of
+   anything). The ids and amounts match `heartwood_note_list` /
+   `scripts/note-cmd.mjs '{"cmd":"list"}'` exactly. With every note readable,
+   there is no `note_inventory_unreadable` key at all.
+
+3. **The commitment is the mint's own handle.** For an ordinary note, compare
+   `commitment` with the `h` the wallet registered when the note was minted
+   (`note-cmd.mjs` prints it at `new`; the mint's ledger calls it the note id).
+   They are the same 64 hex characters. For a note paid to one of the device's
+   own keys (section 15), `key_index` is non-null and `commitment` is the
+   note's PUBLIC key, not a hash - check it against the `p` the mint holds for
+   that index.
+
+4. **No secret is anywhere in the file.** Export a note's secret over the
+   cable (`{"cmd":"export_secret","id":"<id>"}`, one hold) and search the
+   DECRYPTED backup text for that `k1`, for it uppercased, and for the first
+   eight characters of it. Zero hits. Do the same for a key note's key.
+   Nothing but commitments leaves the board.
+
+5. **A locked board is honest about what it cannot see, IN THE FILE.** With
+   at-rest encryption enabled and at least two notes held, reboot and export
+   BEFORE unlocking. Every record is sealed, so:
+   - the card reads `<n>m <n>sl 0nt <u> UNREAD` with `<u>` the sealed count,
+     not the plain `masters/slots` line;
+   - the serial log carries `note record(s) unreadable this boot`;
+   - and, the point of this item, the DECRYPTED file carries
+     `"note_inventory": []` **together with** `"note_inventory_unreadable": <u>`.
+   Without that second key the file would be byte-identical to one taken on
+   an empty locker, and an owner would read a nil loss where the truth is an
+   unknown one. Unlock, export again: the inventory is complete and the
+   `note_inventory_unreadable` key is gone. A sealed record is never invented
+   into the file, and never silently omitted from it either.
+
+6. **A restore creates no note.** On a SECOND board (or the same board after
+   a factory reset and re-provision), import the backup from step 2. The slots
+   restore as section 5 records. `heartwood_note_list` on that board returns
+   exactly what it held before the import - nothing added, nothing changed,
+   no id from the inventory present. The serial log shows
+   `ignoring a <n>-entry note inventory ... notes are never restored`.
+
+7. **A doctored inventory changes nothing either.** Edit the decrypted payload
+   before re-encrypting: change an `amount_msat`, corrupt a `commitment` to
+   `not-a-hash`, and add an entry with an id the board has never seen. Import
+   it. The slot restore still succeeds, the log reports the malformed count,
+   and `heartwood_note_list` is unchanged. There is no path from a backup file
+   to a note, and this is what that looks like from outside.
+
+7b. **A broken inventory cannot cost an owner their pairings.** Repeat item 7
+   but replace the whole `note_inventory` value with junk a parser cannot
+   read: first `"note_inventory": 42`, then `"note_inventory": {"not":"a
+   list"}`, then an entry using the pre-release name `secret_hash` instead of
+   `commitment`. Each import must still restore the app slots, and the log
+   must say `the note inventory is in no shape this firmware reads; ignoring
+   it. Identities and app slots are unaffected.` A record of money that is
+   already gone must never be able to block the recovery of the things that
+   are not.
+
+8. **Old and new meet in both directions.** Import a backup taken before this
+   firmware (no `note_inventory` at all): it restores exactly as it always
+   did. Then take a NEW backup and import it on a board running pre-#86
+   firmware: the unknown field is ignored and the slots restore. Neither
+   direction needs a flag.
+
+9. **A locker with no notes still exports.** Spend or discard everything, then
+   export on an UNLOCKED board. The card reads `<n> masters/<n> slots` again
+   and the file carries `"note_inventory": []` with no
+   `note_inventory_unreadable` key - an empty inventory, which is a
+   statement, not an absence. Compare the file with the one from item 5: same
+   empty array, different second key, different meaning.
 
 ## Notes
 

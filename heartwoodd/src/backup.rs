@@ -409,6 +409,8 @@ mod tests {
             created_at: 1_700_000_000,
             device_id: "ab".repeat(32),
             bridge_secret: "cd".repeat(32),
+            note_inventory: None,
+            note_inventory_unreadable: 0,
             masters: vec![BackupMaster {
                 slot: 0,
                 label: "personal".to_string(),

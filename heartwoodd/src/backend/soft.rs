@@ -1025,6 +1025,10 @@ impl SigningBackend for SoftBackend {
             created_at: 0,
             device_id: String::new(),
             bridge_secret: String::new(),
+            // Soft mode has no note locker at all, so it makes no claim
+            // about notes rather than claiming it holds none (#86).
+            note_inventory: None,
+            note_inventory_unreadable: 0,
             masters,
         })
     }

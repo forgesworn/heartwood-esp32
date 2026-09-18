@@ -515,6 +515,33 @@ pub fn secret_hash_hex(secret: &[u8; SECRET_LEN]) -> String {
     hex_encode(&digest)
 }
 
+/// The note's PUBLIC commitment: the single identifier under which the mint
+/// that issued it already files it, and the only thing about a note's secret
+/// that may leave the device without a button behind it.
+///
+/// Two shapes, because LUD-25 has two:
+///
+///  - **Part 1** (a note behind a hash) commits as [`secret_hash_hex`]:
+///    `sha256(k1)`, which is `_note_id` in lnurl-mint's ledger.
+///  - **Part 2** (a note paid to one of this device's keys, [`KeyNote`]) has
+///    no preimage at all: its `secret` IS a private key, and the mint files
+///    the note under the matching x-only PUBLIC key, recovering it from the
+///    `ck1` a spend presents. So the commitment is that public key.
+///
+/// Hashing a Part 2 note's secret would produce 64 hex characters that no
+/// mint has ever seen and that prove nothing to anybody; the public key is
+/// both the honest commitment and the useful one. A reader tells the two
+/// apart by whether the note carries a key index.
+///
+/// Both are 32 bytes, lowercase hex, and neither is invertible to the secret:
+/// one is a preimage-resistant digest, the other a discrete log.
+pub fn note_commitment_hex(note: &Note) -> String {
+    match &note.key {
+        Some(key) => hex_encode(&key.pubkey),
+        None => secret_hash_hex(&note.secret),
+    }
+}
+
 // ---- the store ----
 
 /// What `list_notes` hands back for one page.
@@ -613,6 +640,22 @@ impl NoteStore {
     pub fn counts(&self) -> (usize, usize) {
         let pending = self.notes.iter().filter(|n| n.state == NoteState::Pending).count();
         (self.notes.len(), pending)
+    }
+
+    /// `(metadata, public commitment)` for every note this boot can read.
+    ///
+    /// The one accessor that pairs a note with something derived from its
+    /// secret, and it hands back [`note_commitment_hex`], never the secret,
+    /// and nothing that can be turned back into one. [`NoteMeta`] has no
+    /// secret field by construction, so a caller holding this pair cannot
+    /// spend, disclose or reconstruct anything.
+    ///
+    /// Notes sealed at rest under a key this boot has not been given are NOT
+    /// here: the locker cannot read them, so nothing honest can be said about
+    /// them. Callers that care (the backup export does) should check
+    /// [`Self::index_known`] and their own sealed-record count and say so.
+    pub fn commitments(&self) -> Vec<(NoteMeta, String)> {
+        self.notes.iter().map(|n| (n.meta(), note_commitment_hex(n))).collect()
     }
 
     /// Whether one more received note would be admitted: the letterbox cap
@@ -2555,5 +2598,216 @@ mod tests {
         store.confirm(&mut storage, &id, 1_000, "mint.example/w", None, 2).unwrap();
         let reloaded = fresh_store(&mut storage);
         assert_eq!(reloaded.get_meta(&id).unwrap().state, NoteState::Confirmed);
+    }
+
+    // ---- backup inventory (#86) ----
+    //
+    // These live here rather than beside the payload type because this is
+    // where a store holding KNOWN secrets can be built. The rules they prove
+    // are the two the feature stands on: nothing spendable leaves, and
+    // nothing comes back.
+
+    /// Every byte sequence an attacker holding the backup file must not find
+    /// in it: each secret raw, as lowercase hex and as uppercase hex.
+    #[cfg(feature = "nip46")]
+    fn forbidden_forms(secrets: &[[u8; SECRET_LEN]]) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for secret in secrets {
+            let lower = hex_encode(secret);
+            out.push((format!("raw {lower}"), secret.to_vec()));
+            out.push((format!("hex {lower}"), lower.clone().into_bytes()));
+            out.push((format!("HEX {lower}"), lower.to_uppercase().into_bytes()));
+        }
+        out
+    }
+
+    /// A locker holding one minted note, one imported note and one key note,
+    /// with every secret known to the test.
+    #[cfg(feature = "nip46")]
+    fn store_with_known_secrets(
+        storage: &mut FakeStorage,
+    ) -> (NoteStore, Vec<[u8; SECRET_LEN]>) {
+        let mut rng = test_rng();
+        let mut store = fresh_store(storage);
+
+        // A minted note: the store chose the secret, so read it back out of
+        // the encoded blob rather than assuming one.
+        let (minted, _) = test_new_secret(&mut store, storage, &mut rng, &[], "float", 1).unwrap();
+        store.confirm(storage, &minted, 21_000, "mint.example/w", None, 2).unwrap();
+        let minted_secret = decode_note(storage.notes.get(&minted).unwrap()).unwrap().secret;
+
+        // An imported note, secret chosen here.
+        let imported_secret = [0xa7u8; SECRET_LEN];
+        store
+            .import_secret(
+                storage,
+                &mut rng,
+                &hex_encode(&imported_secret),
+                "mint.example/w",
+                5_000,
+                "wallet",
+                3,
+            )
+            .unwrap();
+
+        // A Part 2 key note: its secret is a PRIVATE KEY, and its commitment
+        // is the matching public key rather than a hash of anything.
+        let key_secret = [0xb3u8; SECRET_LEN];
+        store
+            .import_key(
+                storage,
+                &mut rng,
+                &key_secret,
+                KeyNote { index: 9, pubkey: [0x5d; 32] },
+                "moneyer.dev/w",
+                1_000,
+                "",
+                4,
+            )
+            .unwrap();
+
+        (store, vec![minted_secret, imported_secret, key_secret])
+    }
+
+    #[test]
+    fn a_commitment_is_the_mints_own_handle_on_the_note() {
+        let note = sample_note();
+        // Part 1: sha256(k1), which is lnurl-mint's `_note_id`.
+        assert_eq!(note_commitment_hex(&note), secret_hash_hex(&note.secret));
+
+        // Part 2: the note's public key, which is what the mint recovers
+        // from a `ck1` and files the note under. Hashing the secret here
+        // would produce something no mint has ever seen, and the secret is
+        // a private key, so its digest would be a commitment to nothing
+        // anybody can check.
+        let key = key_note();
+        assert_eq!(note_commitment_hex(&key), hex_encode(&key.key.unwrap().pubkey));
+        assert_ne!(note_commitment_hex(&key), secret_hash_hex(&key.secret));
+    }
+
+    #[test]
+    #[cfg(feature = "nip46")]
+    fn a_serialised_inventory_carries_no_trace_of_any_secret() {
+        let mut storage = FakeStorage::new();
+        let (store, secrets) = store_with_known_secrets(&mut storage);
+
+        let inventory = crate::backup::build_note_inventory(&store);
+        assert_eq!(inventory.len(), 3);
+
+        // Serialise the whole payload, exactly as the export does.
+        let payload = crate::backup::BackupPayload {
+            created_at: 1,
+            device_id: "dd".repeat(32),
+            bridge_secret: "ee".repeat(32),
+            masters: Vec::new(),
+            note_inventory: Some(crate::backup::NoteInventory::Entries(inventory.clone())),
+            note_inventory_unreadable: 0,
+        };
+        let json = serde_json::to_vec(&payload).unwrap();
+
+        for (label, needle) in forbidden_forms(&secrets) {
+            assert!(
+                !json.windows(needle.len()).any(|w| w == needle),
+                "backup payload leaked a note secret ({label})"
+            );
+        }
+
+        // And the commitments really are present, so the test above is not
+        // passing because the inventory is empty of anything at all.
+        for entry in &inventory {
+            assert_eq!(entry.commitment.len(), 64);
+            let hay = String::from_utf8(json.clone()).unwrap();
+            assert!(hay.contains(&entry.commitment));
+        }
+
+        // The commitment of a hash note is the digest of its secret: proof
+        // that the right thing was committed to, checked here rather than in
+        // the serialised bytes, where the preimage must never appear.
+        assert!(inventory.iter().any(|e| e.commitment == secret_hash_hex(&secrets[1])));
+        // The key note commits to its PUBLIC key, not to a digest of its key.
+        assert!(inventory.iter().any(|e| e.commitment == hex_encode(&[0x5du8; 32])));
+        assert!(!inventory.iter().any(|e| e.commitment == secret_hash_hex(&secrets[2])));
+    }
+
+    #[test]
+    #[cfg(feature = "nip46")]
+    fn importing_a_backup_with_an_inventory_leaves_the_locker_byte_identical() {
+        let mut storage = FakeStorage::new();
+        let (store, _) = store_with_known_secrets(&mut storage);
+        let inventory = crate::backup::build_note_inventory(&store);
+        drop(store);
+
+        let before_index = storage.index.clone();
+        let before_notes = storage.notes.clone();
+        let before_writes = storage.writes;
+
+        // A backup whose inventory describes notes this board does NOT hold,
+        // plus a malformed entry: the shape a resurrection attempt would
+        // take if one were possible.
+        let mut carried = inventory;
+        carried.push(crate::backup::NoteInventoryEntry {
+            id: "deadbeef".to_string(),
+            commitment: "99".repeat(32),
+            state: "confirmed".to_string(),
+            amount_msat: 1_000_000,
+            host: "attacker.example/w".to_string(),
+            key_index: None,
+            created_at: 1,
+            updated_at: 1,
+        });
+        carried.push(crate::backup::NoteInventoryEntry {
+            id: "zzzzzzzz".to_string(),
+            commitment: "not-a-hash".to_string(),
+            state: "resurrected".to_string(),
+            amount_msat: 0,
+            host: String::new(),
+            key_index: Some(0),
+            created_at: 0,
+            updated_at: 0,
+        });
+        let carried_len = carried.len();
+
+        let payload = crate::backup::BackupPayload {
+            created_at: 1,
+            device_id: "dd".repeat(32),
+            bridge_secret: "ee".repeat(32),
+            masters: Vec::new(),
+            note_inventory: Some(crate::backup::NoteInventory::Entries(carried)),
+            note_inventory_unreadable: 0,
+        };
+        let json = serde_json::to_vec(&payload).unwrap();
+        let decoded: crate::backup::BackupPayload = serde_json::from_slice(&json).unwrap();
+
+        // The whole of what a restore may do with it.
+        let report = crate::backup::inspect_imported_inventory(&decoded);
+        assert_eq!(report.entries, carried_len);
+        assert_eq!(report.malformed, 1);
+
+        assert_eq!(storage.index, before_index, "restore touched the note index");
+        assert_eq!(storage.notes, before_notes, "restore touched a note blob");
+        assert_eq!(storage.writes, before_writes, "restore wrote to the locker");
+
+        // Reloading sees the same three notes and no fourth.
+        let reloaded = fresh_store(&mut storage);
+        assert_eq!(reloaded.counts().0, 3);
+        assert!(reloaded.get_meta("deadbeef").is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "nip46")]
+    fn a_locker_that_cannot_read_its_index_reports_nothing_rather_than_guessing() {
+        let mut storage = FakeStorage::new();
+        let (store, _) = store_with_known_secrets(&mut storage);
+        drop(store);
+
+        storage.index_read_fails = true;
+        let blind = fresh_store(&mut storage);
+        assert!(!blind.index_known());
+        // Three notes are on flash and the inventory claims none of them.
+        // The caller is expected to say so (firmware notes::backup_inventory
+        // returns the count it could not read); what must not happen is an
+        // invented line.
+        assert!(crate::backup::build_note_inventory(&blind).is_empty());
+        assert_eq!(storage.notes.len(), 3);
     }
 }

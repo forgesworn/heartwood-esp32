@@ -315,8 +315,8 @@ pub const SELF_CHECK_ROUNDS: u32 = 600;
 /// ```text
 /// python3 -c "import hashlib; print(hashlib.pbkdf2_hmac('sha256',
 ///   b'heartwood-kdf-self-check', b'heartwood-salt-0', 600, 64).hex())"
-/// cd8132294d6ca739e7ddb50eeb2d7612fa3518210920016a4cfbef80b5fdce3f
-/// b5062dab09f9e7dc619f805895ac6ec52a2a7c5712cb0c471326db5e8b92c40d
+/// cd8132294d6ca739e7ddb50eeb2d7612fa3518210920016a4cfbef80b5fdce3f  (pragma: allow-secret, public known-answer vector)
+/// b5062dab09f9e7dc619f805895ac6ec52a2a7c5712cb0c471326db5e8b92c40d  (pragma: allow-secret, public known-answer vector)
 /// ```
 ///
 /// `self_check_vector_is_the_reference` below re-asserts it against the
@@ -479,21 +479,21 @@ mod tests {
                 b"salt",
                 1,
                 32,
-                "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+                "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b", // pragma: allow-secret (public RFC 6070 vector)
             ),
             (
                 b"password",
                 b"salt",
                 2,
                 32,
-                "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43",
+                "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43", // pragma: allow-secret (public RFC 6070 vector)
             ),
             (
                 b"password",
                 b"salt",
                 4096,
                 32,
-                "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+                "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a", // pragma: allow-secret (public RFC 6070 vector)
             ),
             (
                 b"passwordPASSWORDpassword",

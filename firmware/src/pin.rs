@@ -21,7 +21,9 @@ use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
 use crate::protocol;
-use heartwood_common::seed_cipher::{decrypt_seed, encrypt_seed, NONCE_LEN, SALT_LEN};
+use heartwood_common::seed_cipher::{
+    decrypt_seed, decrypt_seed_reference, encrypt_seed, NONCE_LEN, SALT_LEN,
+};
 use heartwood_common::types::{FRAME_TYPE_ACK, FRAME_TYPE_NACK};
 
 const NVS_PIN_ATTEMPTS_KEY: &str = "pin_attempts";
@@ -123,7 +125,14 @@ fn enable_encryption(
         // too, so the longest unbroken stretch is one KDF rather than two.
         esp_idf_hal::delay::FreeRtos::delay_ms(20);
         crate::wdt::feed();
-        match decrypt_seed(pin, &blob) {
+        // The self-check goes through the REFERENCE KDF, never this board's
+        // engine. A sealing engine grading its own work would agree with
+        // itself even if it were deterministically wrong, and the board would
+        // commit a blob only that engine can open; a later fix, or the
+        // software fallback after a failed self-check, would then be lost
+        // keys. Verifying in software costs one extra slow derivation on a
+        // rare path and guarantees the committed blob opens anywhere.
+        match decrypt_seed_reference(pin, &blob) {
             Ok(check) if check == m.secret => {}
             _ => return Err("encrypt self-check failed"),
         }

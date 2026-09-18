@@ -47,7 +47,7 @@ pub const SHA256_IV: [u32; 8] = [
 /// [`Sha256Engine::end_chunk`] boundaries.
 ///
 /// Each round is two compressions, so a chunk is 512 compressions. On the S3
-/// accelerator that is on the order of a millisecond and a half of held lock —
+/// accelerator that is on the order of a millisecond and a half of held lock:
 /// short enough that a concurrent TLS record MAC waits for one chunk, not for
 /// a derivation. Larger chunks amortise the acquire better and starve TLS for
 /// longer; this is the trade-off knob.
@@ -90,7 +90,7 @@ pub trait Sha256Engine {
     fn end_chunk(&mut self) {}
 }
 
-/// The portable software compression function — `sha2`'s, unchanged.
+/// The portable software compression function, `sha2`'s, unchanged.
 ///
 /// This is the reference every other engine is graded against, on the host and
 /// in the device self-check.
@@ -124,8 +124,8 @@ fn state_bytes(state: &[u32; 8]) -> [u8; 32] {
 
 /// Streaming SHA-256 absorber that starts from an arbitrary midstate.
 ///
-/// `prefix_len` is how many bytes have already been absorbed into `state` —
-/// 64 when resuming from an HMAC pad block — so the length suffix is right.
+/// `prefix_len` is how many bytes have already been absorbed into `state`:
+/// 64 when resuming from an HMAC pad block, so the length suffix is right.
 struct Absorb {
     state: [u32; 8],
     block: Block,
@@ -243,10 +243,13 @@ pub fn pbkdf2_hmac_sha256<E: Sha256Engine + ?Sized>(
         let mut acc = u;
         let mut in_chunk = 1u32;
 
-        // U_2 .. U_rounds, each one inner + one outer compression.
+        // U_2 .. U_rounds, each one inner + one outer compression. `st` is a
+        // live HMAC midstate, i.e. key-equivalent, so it is scrubbed with
+        // everything else once the loop is done.
+        let mut st = [0u32; 8];
         for _ in 1..rounds {
             tail.0[..32].copy_from_slice(&u);
-            let mut st = ipad_state;
+            st = ipad_state;
             engine.compress(&mut st, &tail);
             u = state_bytes(&st);
 
@@ -273,6 +276,7 @@ pub fn pbkdf2_hmac_sha256<E: Sha256Engine + ?Sized>(
         out_block.copy_from_slice(&acc[..n]);
         acc.zeroize();
         u.zeroize();
+        st.zeroize();
     }
 
     ipad_state.zeroize();
@@ -288,21 +292,41 @@ pub fn pbkdf2_hmac_sha256<E: Sha256Engine + ?Sized>(
 pub const SELF_CHECK_PASSWORD: &[u8] = b"heartwood-kdf-self-check";
 /// Salt for the boot-time known-answer check.
 pub const SELF_CHECK_SALT: &[u8] = b"heartwood-salt-0";
-/// Round count for the boot-time known-answer check. Deliberately small: it
-/// runs once per boot before the first real derivation, and 64 rounds already
-/// exercise the pad precompute, both output blocks and the XOR accumulator.
-pub const SELF_CHECK_ROUNDS: u32 = 64;
+/// Round count for the boot-time known-answer check.
+///
+/// It MUST cross at least two [`CHUNK_ROUNDS`] boundaries. A hardware engine
+/// that is correct within a chunk but loses or corrupts state across a
+/// release/acquire pair is deterministic, so a self-check that never crossed
+/// one would pass, and so would the verify-after-seal that re-derives on the
+/// same engine. The board would then write a blob only the broken path can
+/// open, and the next software fallback, or the fix, would be lost keys.
+///
+/// 600 rounds against a 256-round chunk crosses two boundaries per output
+/// block; the check derives the full 64 bytes, so it walks both output blocks
+/// exactly as a real `derive_km` does. The cost is 2,400 compressions: a few
+/// milliseconds on the accelerator, about 175 ms in software, once per boot.
+pub const SELF_CHECK_ROUNDS: u32 = 600;
 /// Expected 64-byte output of
 /// `PBKDF2-HMAC-SHA256(SELF_CHECK_PASSWORD, SELF_CHECK_SALT, SELF_CHECK_ROUNDS)`.
 ///
-/// Verified against the `pbkdf2` crate by `self_check_vector_is_the_reference`
-/// below, so a board comparing against this constant is comparing against the
-/// reference implementation.
+/// Generated from an implementation that shares no code with this crate, so
+/// the constant cannot inherit a bug from the driver it grades:
+///
+/// ```text
+/// python3 -c "import hashlib; print(hashlib.pbkdf2_hmac('sha256',
+///   b'heartwood-kdf-self-check', b'heartwood-salt-0', 600, 64).hex())"
+/// cd8132294d6ca739e7ddb50eeb2d7612fa3518210920016a4cfbef80b5fdce3f
+/// b5062dab09f9e7dc619f805895ac6ec52a2a7c5712cb0c471326db5e8b92c40d
+/// ```
+///
+/// `self_check_vector_is_the_reference` below re-asserts it against the
+/// `pbkdf2` crate, so a board that matches this constant has matched two
+/// independent implementations.
 pub const SELF_CHECK_KM: [u8; 64] = [
-    0xb5, 0xae, 0x75, 0xe1, 0xbd, 0xa9, 0x63, 0xad, 0x3f, 0xb9, 0x76, 0x4c, 0x03, 0x32, 0xfc, 0x35,
-    0x8f, 0x29, 0xfa, 0xc8, 0x0e, 0x04, 0x0c, 0x3b, 0x45, 0xbf, 0x9c, 0xbe, 0x65, 0x19, 0xa0, 0x53,
-    0x43, 0x56, 0x52, 0xf0, 0x36, 0x15, 0x61, 0xd8, 0x7b, 0xe2, 0x68, 0x05, 0xda, 0xa5, 0x0a, 0x1b,
-    0x26, 0x46, 0xd8, 0x73, 0x5e, 0x02, 0x1f, 0xbf, 0xbf, 0x32, 0xb9, 0x34, 0x28, 0x01, 0x71, 0xf2,
+    0xcd, 0x81, 0x32, 0x29, 0x4d, 0x6c, 0xa7, 0x39, 0xe7, 0xdd, 0xb5, 0x0e, 0xeb, 0x2d, 0x76, 0x12,
+    0xfa, 0x35, 0x18, 0x21, 0x09, 0x20, 0x01, 0x6a, 0x4c, 0xfb, 0xef, 0x80, 0xb5, 0xfd, 0xce, 0x3f,
+    0xb5, 0x06, 0x2d, 0xab, 0x09, 0xf9, 0xe7, 0xdc, 0x61, 0x9f, 0x80, 0x58, 0x95, 0xac, 0x6e, 0xc5,
+    0x2a, 0x2a, 0x7c, 0x57, 0x12, 0xcb, 0x0c, 0x47, 0x13, 0x26, 0xdb, 0x5e, 0x8b, 0x92, 0xc4, 0x0d,
 ];
 
 /// Run the known-answer vector through `engine` and report whether it matched.
@@ -310,6 +334,10 @@ pub const SELF_CHECK_KM: [u8; 64] = [
 /// A device calls this once, before its first real derivation, and must never
 /// derive a key with an engine that failed.
 pub fn self_check<E: Sha256Engine + ?Sized>(engine: &mut E) -> bool {
+    debug_assert!(
+        SELF_CHECK_ROUNDS > CHUNK_ROUNDS * 2,
+        "the self-check must cross at least two chunk boundaries"
+    );
     let mut km = [0u8; 64];
     pbkdf2_hmac_sha256(
         engine,
@@ -549,19 +577,54 @@ mod tests {
         assert_eq!(engine.compressions, expected as u64);
     }
 
+    /// The salt tail that lands 53 to 59 bytes into the block after the HMAC
+    /// pad forces `Absorb::finish` down its two-block padding branch: the
+    /// 0x80 fits but the 8-byte length does not. The production salt is 16
+    /// bytes so this never happens in the field, and an untested branch on
+    /// this path is exactly the sort of thing a later format change walks
+    /// into. Graded against the `pbkdf2` crate.
+    #[test]
+    fn the_two_block_padding_branch_matches_the_reference() {
+        for salt_len in 48..=64usize {
+            let salt: Vec<u8> = (0..salt_len).map(|i| (i as u8).wrapping_mul(7)).collect();
+            for rounds in [1u32, 2, 300] {
+                let want = reference(b"123456", &salt, rounds, 64);
+                let mut engine = FakeAcceleratorEngine::default();
+                let mut got = vec![0u8; 64];
+                pbkdf2_hmac_sha256(&mut engine, b"123456", &salt, rounds, &mut got);
+                assert_eq!(got, want, "salt_len={salt_len} rounds={rounds}");
+            }
+        }
+
+        // The same branch on the >64-byte-password pre-hash, whose prefix is
+        // 0 rather than 64.
+        for password_len in 110..=130usize {
+            let password: Vec<u8> = (0..password_len).map(|i| (i as u8) ^ 0x5a).collect();
+            let want = reference(&password, &[7u8; 16], 9, 64);
+            assert_eq!(driven(&password, &[7u8; 16], 9, 64), want, "{password_len}");
+        }
+    }
+
     /// The device self-check constant is the reference implementation's
     /// answer, so a board that matches it has matched the reference.
     #[test]
     fn self_check_vector_is_the_reference() {
-        let want = reference(
-            SELF_CHECK_PASSWORD,
-            SELF_CHECK_SALT,
-            SELF_CHECK_ROUNDS,
-            64,
-        );
+        let want = reference(SELF_CHECK_PASSWORD, SELF_CHECK_SALT, SELF_CHECK_ROUNDS, 64);
         assert_eq!(&SELF_CHECK_KM[..], &want[..]);
         assert!(self_check(&mut SoftEngine));
         assert!(self_check(&mut FakeAcceleratorEngine::default()));
+    }
+
+    /// The self-check has to walk the shape a real derivation walks: both
+    /// output blocks, and at least two chunk boundaries.
+    #[test]
+    fn the_self_check_crosses_chunk_boundaries() {
+        assert!(SELF_CHECK_ROUNDS > CHUNK_ROUNDS * 2);
+        let mut engine = FakeAcceleratorEngine::default();
+        assert!(self_check(&mut engine));
+        // 2 output blocks x (1 begin + 2 crossings) = 6 acquires.
+        assert_eq!(engine.acquires, 6);
+        assert_eq!(engine.releases, 6);
     }
 
     /// An engine that is subtly wrong must fail the self-check. This is the
@@ -578,7 +641,53 @@ mod tests {
         assert!(!self_check(&mut BrokenEngine));
     }
 
-    /// With no hook installed — host, tests, heartwoodd — the seed KDF is the
+    /// THE reason the self-check has to cross a chunk boundary. This engine
+    /// is perfectly correct within a chunk and only damages the first
+    /// compression after a release/acquire pair, which is what a peripheral
+    /// that lost its digest state over a bus-clock gate would look like. It
+    /// is deterministic, so it would agree with itself in a verify-after-seal
+    /// and write a blob nothing else can open.
+    #[test]
+    fn an_engine_that_breaks_only_across_a_chunk_boundary_fails_the_self_check() {
+        #[derive(Default)]
+        struct CrossChunkBrokenEngine {
+            first_of_chunk: bool,
+            chunks: u32,
+        }
+        impl Sha256Engine for CrossChunkBrokenEngine {
+            fn compress(&mut self, state: &mut [u32; 8], block: &Block) {
+                soft_compress(state, block);
+                // Only the first block after a re-acquire, and only from the
+                // third chunk on. A 64-round vector opens exactly two chunks,
+                // one per output block, so it sails straight past this; the
+                // shipped vector opens six and walks into it.
+                if self.first_of_chunk && self.chunks > 2 {
+                    state[7] ^= 1;
+                }
+                self.first_of_chunk = false;
+            }
+            fn begin_chunk(&mut self) {
+                self.first_of_chunk = true;
+                self.chunks += 1;
+            }
+        }
+
+        // A 64-round vector never re-acquires, so it cannot see the fault:
+        // this is the state the self-check used to be in.
+        let mut short = CrossChunkBrokenEngine::default();
+        let mut got = [0u8; 64];
+        pbkdf2_hmac_sha256(&mut short, SELF_CHECK_PASSWORD, SELF_CHECK_SALT, 64, &mut got);
+        assert_eq!(
+            &got[..],
+            &reference(SELF_CHECK_PASSWORD, SELF_CHECK_SALT, 64, 64)[..],
+            "a 64-round vector agrees with the reference even on a broken engine"
+        );
+
+        // The shipped vector does cross boundaries, and catches it.
+        assert!(!self_check(&mut CrossChunkBrokenEngine::default()));
+    }
+
+    /// With no hook installed (host, tests, heartwoodd) the seed KDF is the
     /// unchanged pure-Rust path.
     #[test]
     fn seed_kdf_defaults_to_the_reference_path() {

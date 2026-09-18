@@ -4,8 +4,8 @@
 //
 // Background and measurements: docs/2026-09-18-pbkdf2-cost-and-sha-acceleration.md.
 // `derive_km` is 400,000 SHA-256 compressions. In pure-Rust software on this
-// board each one costs about 17,400 cycles — it is stalling on instruction
-// fetch through a 16 KB cache, not computing — so one sealed slot takes ~29 s
+// board each one costs about 17,400 cycles: it is stalling on instruction
+// fetch through a 16 KB cache rather than computing, so one sealed slot takes ~29 s
 // and a three-master board takes a minute and a half. The ESP32-S3 and C6 both
 // carry a SHA accelerator that mbedTLS already drives for TLS, and it sits idle
 // through every unseal.
@@ -27,8 +27,8 @@
 //   2. **Bounded lock hold.** On the S3 the SHA lock is the *shared SHA and
 //      AES* lock, and a WiFi-standalone board can be mid-TLS during an unseal
 //      (that is exactly how a locked board receives its vault key). The lock is
-//      taken and released around each chunk of `kdf::CHUNK_ROUNDS` rounds —
-//      about 512 compressions, on the order of 1.5 ms — never across a whole
+//      taken and released around each chunk of `kdf::CHUNK_ROUNDS` rounds,
+//      about 512 compressions or roughly 1.5 ms, never across a whole
 //      derivation. Nothing else is held while it is taken, so no lock cycle
 //      exists and a deadlock is not possible; a TLS record MAC waits for one
 //      chunk at worst.
@@ -53,7 +53,7 @@ use heartwood_common::kdf::{self, Block, Sha256Engine};
 const YIELD_INTERVAL_US: i64 = 250_000;
 
 /// An acquire slower than this means the shared SHA/AES lock is genuinely
-/// contended — finish in software instead of queueing behind TLS.
+/// contended: finish in software instead of queueing behind TLS.
 const CONTENDED_ACQUIRE_US: i64 = 20_000;
 
 // ---------------------------------------------------------------------------
@@ -71,8 +71,8 @@ mod hw {
     pub const SHA2_256: u32 = 2;
 
     // These are ESP-IDF's mbedTLS SHA port and HAL. They are not in
-    // esp-idf-sys's generated bindings, but they are in the image already —
-    // TLS drives the same code — so declaring them is a link, not a new
+    // esp-idf-sys's generated bindings, but they are in the image already,
+    // because TLS drives the same code, so declaring them is a link, not a new
     // component. `esp_sha_{acquire,release}_hardware` and
     // `esp_sha_{read,write}_digest_state` are declared in the public port
     // header `sha/sha_dma.h`; `sha_hal_hash_block` is the HAL block step that
@@ -117,9 +117,23 @@ fn hw_acquire() {
 #[cfg(not(feature = "sha-accel"))]
 fn hw_acquire() {}
 
+/// Release the peripheral, scrubbing the digest registers first.
+///
+/// Those registers still hold the last HMAC midstate when a chunk ends, and a
+/// midstate under the PIN-derived key is key-equivalent: anything that can
+/// acquire the SHA block could read it out. Overwriting with the SHA-256 IV
+/// costs eight register writes per release, so about 6,300 writes across a
+/// 100,000-round derivation: tens of microseconds against roughly a second of
+/// work, and it is not on the hot inner path at all.
 #[cfg(feature = "sha-accel")]
 fn hw_release() {
-    unsafe { hw::esp_sha_release_hardware() }
+    let mut scrub = kdf::SHA256_IV;
+    unsafe {
+        // The engine is idle here: every compression ends in a digest read,
+        // which waits for idle itself.
+        hw::esp_sha_write_digest_state(hw::SHA2_256, scrub.as_mut_ptr().cast());
+        hw::esp_sha_release_hardware();
+    }
 }
 
 #[cfg(not(feature = "sha-accel"))]
@@ -219,7 +233,7 @@ impl Sha256Engine for DeviceEngine {
             hw_release();
             self.held = false;
             if self.retreat {
-                log::warn!("SHA accelerator contended — finishing this derivation in software");
+                log::warn!("SHA accelerator contended: finishing this derivation in software");
                 self.hardware = false;
                 self.retreat = false;
             }
@@ -268,7 +282,7 @@ static MODE: AtomicU8 = AtomicU8::new(MODE_UNTESTED);
 /// path this replaces hashes with the same `sha2` compression function the
 /// software engine uses, so a software engine that failed its vector would
 /// mean `sha2` itself is wrong and a third implementation of the same thing
-/// would fail identically — while refusing to derive at all would mean a
+/// would fail identically, while refusing to derive at all would mean a
 /// sealed board that can never be unsealed. A software failure is therefore
 /// logged loudly and the session continues on exactly the path that shipped
 /// before this change.
@@ -283,14 +297,14 @@ fn resolve_mode() -> u8 {
     if accelerator_available() {
         let mut engine = DeviceEngine::new(true);
         if kdf::self_check(&mut engine) {
-            log::info!("SHA accelerator self-check passed — sealed-seed KDF is hardware-backed");
+            log::info!("SHA accelerator self-check passed: sealed-seed KDF is hardware-backed");
             chosen = MODE_HARDWARE;
         } else {
             // The one genuinely dangerous failure in this subsystem would be a
             // hardware path that derives a *different* key. It is caught here,
             // before any blob is touched, and the session never uses it.
             log::error!(
-                "SHA accelerator self-check FAILED — known-answer mismatch. \
+                "SHA accelerator self-check FAILED: known-answer mismatch. \
                  Falling back to software for this session; no hardware-derived \
                  key will be used."
             );
@@ -300,7 +314,7 @@ fn resolve_mode() -> u8 {
     if chosen == MODE_SOFTWARE {
         let mut engine = DeviceEngine::new(false);
         if !kdf::self_check(&mut engine) {
-            log::error!("Software SHA self-check FAILED — the KDF vector does not match");
+            log::error!("Software SHA self-check FAILED: the KDF vector does not match");
         }
     }
 
@@ -312,7 +326,7 @@ fn resolve_mode() -> u8 {
 /// sealed seed and every note-key wrap.
 ///
 /// One engine type covers both modes at runtime, so the driver is monomorphised
-/// exactly once in the image — the 2 MB OTA slot has no room for two copies of
+/// exactly once in the image: the 2 MB OTA slot has no room for two copies of
 /// it.
 fn device_kdf(password: &[u8], salt: &[u8], rounds: u32, out: &mut [u8]) {
     let hardware = resolve_mode() == MODE_HARDWARE;
@@ -332,7 +346,7 @@ pub fn install() {
         if accelerator_available() {
             "present, self-check pending"
         } else {
-            "not available on this board — software path"
+            "not available on this board, software path"
         }
     );
 }

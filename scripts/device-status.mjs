@@ -35,6 +35,39 @@ function describe(label, reply) {
   return `${label}: ${reply.payload.toString()}`
 }
 
-console.log(describe('firmware', await session.request(FIRMWARE_INFO, [FIRMWARE_INFO_RESPONSE])))
+// The sealed-seed KDF telemetry is the only way to see which path a board
+// actually derived on: the log console is compiled out on every board, so
+// without this a timing result cannot be attributed to hardware or software.
+// Printed as its own line because the raw JSON is long and this is the part a
+// bench run is reading.
+function describeKdf(reply) {
+  if (!reply || reply.type === NACK) return null
+  let info
+  try {
+    info = JSON.parse(reply.payload.toString())
+  } catch {
+    return null
+  }
+  const k = info.kdf
+  if (!k) return 'kdf: not reported (firmware predates the KDF telemetry)'
+  const parts = [
+    `mode=${k.mode}`,
+    `selfcheck=${k.selfcheck}`,
+    `hw_selfcheck=${k.hw_selfcheck_us} us`,
+    `sw_selfcheck=${k.sw_selfcheck_us} us`,
+    `derivations=${k.derivations}`,
+    `fully_hw=${k.hw_full}`,
+    `retreats=${k.retreats}/${k.chunks} chunks`,
+    `max_acquire=${k.max_acquire_ms} ms`,
+    `last_derive=${k.last_derive_ms} ms`,
+    `last_unlock=${k.last_unlock_ms} ms`,
+  ]
+  return `kdf: ${parts.join(', ')}`
+}
+
+const firmware = await session.request(FIRMWARE_INFO, [FIRMWARE_INFO_RESPONSE])
+console.log(describe('firmware', firmware))
+const kdf = describeKdf(firmware)
+if (kdf) console.log(kdf)
 console.log(describe('masters', await session.request(PROVISION_LIST, [PROVISION_LIST_RESPONSE])))
 session.close()

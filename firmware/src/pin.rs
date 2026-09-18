@@ -172,6 +172,7 @@ pub fn try_unlock(
     // The whole point is to say what is happening during the ~25 s a slot
     // costs on this board, not to report it once it is already over (#117).
     let sealed = masters.iter().filter(|m| m.locked).count();
+    crate::sha_accel::unlock_begin();
     let mut done = 0usize;
     let mut decrypted: Vec<(usize, [u8; 32])> = Vec::new();
     for (i, m) in masters.iter().enumerate() {
@@ -196,6 +197,7 @@ pub fn try_unlock(
         }
     }
     on_progress(done, sealed);
+    crate::sha_accel::unlock_end();
     for (i, seed) in decrypted {
         masters[i].secret = seed;
         masters[i].locked = false;

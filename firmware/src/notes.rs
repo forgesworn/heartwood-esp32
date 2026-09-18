@@ -9,7 +9,7 @@
 //! No note SECRET is ever part of a backup export: a bearer note restored
 //! onto two boards is a double-spend waiting to happen, so notes are
 //! unrecoverable by design. What a backup does carry (#86) is
-//! [`backup_inventory`] — one non-spendable line per readable note, holding
+//! [`backup_inventory`]: one non-spendable line per readable note, holding
 //! the public commitment the mint already files it under, plus amount, mint,
 //! state and timestamps. It makes a dead board a legible, provable loss; it
 //! restores nothing, and the import side has no path from it to this

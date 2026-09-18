@@ -1028,6 +1028,7 @@ impl SigningBackend for SoftBackend {
             // Soft mode has no note locker at all, so it makes no claim
             // about notes rather than claiming it holds none (#86).
             note_inventory: None,
+            note_inventory_unreadable: 0,
             masters,
         })
     }

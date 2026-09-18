@@ -26,7 +26,7 @@ use crate::session;
 /// Bearer notes ride along as a non-spendable INVENTORY only (#86): the
 /// public commitment each mint already files a note under, plus amount,
 /// mint, state and timestamps. No `k1`, no note key, nothing from which
-/// either can be derived — restoring this file cannot move a satoshi, it can
+/// either can be derived. Restoring this file cannot move a satoshi, it can
 /// only tell you what a dead board took with it.
 pub fn handle_export(
     usb: &mut SerialPort<'_>,
@@ -42,27 +42,46 @@ pub fn handle_export(
         .sum();
 
     // Read the inventory BEFORE the card, so the operator is told what is
-    // actually about to leave — including that some notes could not be read.
+    // actually about to leave, including that some notes could not be read.
     let (note_inventory, unreadable_notes) = crate::notes::backup_inventory();
     if unreadable_notes > 0 {
         log::warn!(
             "[backup] {unreadable_notes} note record(s) unreadable this boot \
-             (sealed or unindexed) — the exported inventory is incomplete"
+             (sealed or unindexed); the exported inventory is incomplete"
         );
     }
 
-    // Two ~21-glyph lines is the whole card. Keep the familiar line when
-    // there is no locker to mention, and shorten rather than truncate when
-    // there is.
-    let summary = if note_inventory.is_empty() {
+    // The card is two lines and the narrowest panel fits 25 glyphs on the
+    // second, so the clauses are built in priority order and the softest one
+    // is dropped rather than truncated (the same budgeting handle_import
+    // does for its label preview).
+    //
+    // Priority: the counts, then "N unreadable" because a file that is
+    // silently incomplete is the failure this feature exists to prevent,
+    // then "+amt/mint" because the inventory carries amounts and mint hosts
+    // as well as commitments and an operator approving an export should know
+    // that. docs/SECURITY-MODEL.md spells the full contents out.
+    const CARD_LINE: usize = 25;
+    let summary = if note_inventory.is_empty() && unreadable_notes == 0 {
         format!("{} masters/{} slots", loaded_masters.len(), total_slots)
     } else {
-        format!(
-            "{}m {}slots {}notes",
+        let counts = format!(
+            "{}m {}sl {}nt",
             loaded_masters.len(),
             total_slots,
             note_inventory.len(),
-        )
+        );
+        let locked = if unreadable_notes > 0 {
+            format!(" {unreadable_notes} UNREAD")
+        } else {
+            String::new()
+        };
+        let detail = format!("{counts}{locked}+amt/mint");
+        if detail.len() <= CARD_LINE {
+            detail
+        } else {
+            format!("{counts}{locked}")
+        }
     };
 
     let result = crate::approval::run_approval_loop(
@@ -119,7 +138,14 @@ pub fn handle_export(
         device_id,
         masters,
         bridge_secret: bridge_hex,
-        note_inventory: Some(note_inventory),
+        note_inventory: Some(heartwood_common::backup::NoteInventory::Entries(
+            note_inventory,
+        )),
+        // Carried in the FILE, not only in the log above: an export taken on
+        // a locked board would otherwise be byte-identical to one taken on an
+        // empty locker, and "I could not see N of them" is a different
+        // statement from "there were none".
+        note_inventory_unreadable: unreadable_notes as u32,
     };
 
     match serde_json::to_vec(&payload) {
@@ -191,11 +217,24 @@ pub fn handle_import(
     let inventory = heartwood_common::backup::inspect_imported_inventory(&backup);
     if inventory.entries > 0 {
         log::info!(
-            "Backup import: ignoring a {}-entry note inventory ({} malformed{}) \
-             — notes are never restored",
+            "Backup import: ignoring a {}-entry note inventory ({} malformed{}); \
+             notes are never restored",
             inventory.entries,
             inventory.malformed,
             if inventory.over_cap { ", over cap" } else { "" },
+        );
+    }
+    if inventory.unreadable_field {
+        log::info!(
+            "Backup import: the note inventory is in no shape this firmware reads; \
+             ignoring it. Identities and app slots are unaffected."
+        );
+    }
+    if inventory.unreadable_notes > 0 {
+        log::info!(
+            "Backup import: the exporting board could not read {} of its own notes; \
+             its inventory is incomplete by that many",
+            inventory.unreadable_notes
         );
     }
 

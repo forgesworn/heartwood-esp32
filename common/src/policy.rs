@@ -2388,6 +2388,7 @@ mod tests {
             }],
             bridge_secret: "22".repeat(32),
             note_inventory: None,
+            note_inventory_unreadable: 0,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let mut restored: crate::backup::BackupPayload = serde_json::from_str(&json).unwrap();

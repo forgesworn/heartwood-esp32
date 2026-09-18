@@ -62,23 +62,29 @@ deliberately did not, because MAX_SPENT retires the record it would remove. Note
 will be (restore onto two boards = double-spend), so a dead board's money is
 still gone: the locker is a TILL, not a vault - collect promptly. What a
 backup DOES carry since #86 is a non-spendable INVENTORY: an optional
-top-level `note_inventory` array (common/src/backup.rs
-NoteInventoryEntry, at most 16, built by build_note_inventory from
-NoteStore::commitments) holding, per readable note, the public commitment the
-issuing mint already files it under (note_store::note_commitment_hex -
-sha256(k1) for a Part 1 note, the note's own x-only pubkey for a Part 2 key
-note, since that is what the mint recovers from a ck1; key_index non-null
-tells them apart), plus amount, mint host, state and timestamps. It restores
-NOTHING - BACKUP_IMPORT shape-checks it via inspect_imported_inventory, logs
-a count and drops it, and no code path from the import reaches the locker -
-so the point is only that a dead board becomes a legible, provable loss
-instead of a mystery. Records still sealed under a key this boot has not been
-given are not in it and are not guessed at; the export warns and the card
-counts what it could read. The field is optional so pre-#86 backups still
-import, and the payload has no deny_unknown_fields so a new backup still
-imports on pre-#86 firmware (pinned by a test). Sapwood's parser
-(src/lib/backup.ts isNoteInventory) is the matching reader
-(SECURITY-MODEL.md); destructive commands (mark_spent/discard/rename/
+top-level `note_inventory` array (common/src/backup.rs NoteInventoryEntry, at
+most 16, built by build_note_inventory from NoteStore::commitments) holding,
+per readable note, `id`, `commitment`, `state`, `amount_msat`, `host`,
+`key_index`, `created_at`, `updated_at` and nothing else. `commitment` is the
+public identifier the issuing mint already files the note under
+(note_store::note_commitment_hex - sha256(k1) for a Part 1 note, the note's
+own x-only pubkey for a Part 2 key note, since that is what the mint recovers
+from a ck1; key_index non-null tells them apart). It is NOT called
+`secret_hash`: for a key note it is not a hash of anything. A second optional
+top-level `note_inventory_unreadable` (u32, omitted when zero) counts notes
+the exporting board held but could not read - sealed at rest, or an unloadable
+index - because otherwise an export from a locked board is byte-identical to
+one from an empty locker, which is the false completeness the feature exists
+to remove; the export card shows it as `<u> UNREAD`. It restores NOTHING -
+BACKUP_IMPORT shape-checks via inspect_imported_inventory, logs and drops, and
+no code path from the import reaches the locker. The inventory is also
+LENIENT on read (backup::NoteInventory is an untagged Entries-or-Unreadable
+enum): a record of money already gone must never block the restore of
+identities and slots, so any shape that does not parse becomes
+`unreadable_field` and the masters/slots stay exactly as strict as they were.
+Pre-#86 backups still import (serde default), and a new backup still imports
+on pre-#86 firmware (no deny_unknown_fields, pinned by a test). Sapwood's
+parser (src/lib/backup.ts) is the matching reader (SECURITY-MODEL.md); destructive commands (mark_spent/discard/rename/
 delete) are button-gated like lnurl-vault gates them, with ONE runtime
 exception (#129): an approved export_secret leaves a single-use, RAM-only
 grant (note_cmd::SpendGrant, 120 s, same note, same client) so the mark_spent

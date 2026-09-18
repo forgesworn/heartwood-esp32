@@ -521,7 +521,7 @@ pub fn secret_hash_hex(secret: &[u8; SECRET_LEN]) -> String {
 ///
 /// Two shapes, because LUD-25 has two:
 ///
-///  - **Part 1** (a note behind a hash) commits as [`secret_hash_hex`] —
+///  - **Part 1** (a note behind a hash) commits as [`secret_hash_hex`]:
 ///    `sha256(k1)`, which is `_note_id` in lnurl-mint's ledger.
 ///  - **Part 2** (a note paid to one of this device's keys, [`KeyNote`]) has
 ///    no preimage at all: its `secret` IS a private key, and the mint files
@@ -645,7 +645,7 @@ impl NoteStore {
     /// `(metadata, public commitment)` for every note this boot can read.
     ///
     /// The one accessor that pairs a note with something derived from its
-    /// secret, and it hands back [`note_commitment_hex`] — never the secret,
+    /// secret, and it hands back [`note_commitment_hex`], never the secret,
     /// and nothing that can be turned back into one. [`NoteMeta`] has no
     /// secret field by construction, so a caller holding this pair cannot
     /// spend, disclose or reconstruct anything.
@@ -2677,7 +2677,7 @@ mod tests {
 
         // Part 2: the note's public key, which is what the mint recovers
         // from a `ck1` and files the note under. Hashing the secret here
-        // would produce something no mint has ever seen — and the secret is
+        // would produce something no mint has ever seen, and the secret is
         // a private key, so its digest would be a commitment to nothing
         // anybody can check.
         let key = key_note();
@@ -2700,7 +2700,8 @@ mod tests {
             device_id: "dd".repeat(32),
             bridge_secret: "ee".repeat(32),
             masters: Vec::new(),
-            note_inventory: Some(inventory.clone()),
+            note_inventory: Some(crate::backup::NoteInventory::Entries(inventory.clone())),
+            note_inventory_unreadable: 0,
         };
         let json = serde_json::to_vec(&payload).unwrap();
 
@@ -2714,18 +2715,18 @@ mod tests {
         // And the commitments really are present, so the test above is not
         // passing because the inventory is empty of anything at all.
         for entry in &inventory {
-            assert_eq!(entry.secret_hash.len(), 64);
+            assert_eq!(entry.commitment.len(), 64);
             let hay = String::from_utf8(json.clone()).unwrap();
-            assert!(hay.contains(&entry.secret_hash));
+            assert!(hay.contains(&entry.commitment));
         }
 
         // The commitment of a hash note is the digest of its secret: proof
         // that the right thing was committed to, checked here rather than in
         // the serialised bytes, where the preimage must never appear.
-        assert!(inventory.iter().any(|e| e.secret_hash == secret_hash_hex(&secrets[1])));
+        assert!(inventory.iter().any(|e| e.commitment == secret_hash_hex(&secrets[1])));
         // The key note commits to its PUBLIC key, not to a digest of its key.
-        assert!(inventory.iter().any(|e| e.secret_hash == hex_encode(&[0x5du8; 32])));
-        assert!(!inventory.iter().any(|e| e.secret_hash == secret_hash_hex(&secrets[2])));
+        assert!(inventory.iter().any(|e| e.commitment == hex_encode(&[0x5du8; 32])));
+        assert!(!inventory.iter().any(|e| e.commitment == secret_hash_hex(&secrets[2])));
     }
 
     #[test]
@@ -2741,12 +2742,12 @@ mod tests {
         let before_writes = storage.writes;
 
         // A backup whose inventory describes notes this board does NOT hold,
-        // plus a malformed entry — the shape a resurrection attempt would
+        // plus a malformed entry: the shape a resurrection attempt would
         // take if one were possible.
         let mut carried = inventory;
         carried.push(crate::backup::NoteInventoryEntry {
             id: "deadbeef".to_string(),
-            secret_hash: "99".repeat(32),
+            commitment: "99".repeat(32),
             state: "confirmed".to_string(),
             amount_msat: 1_000_000,
             host: "attacker.example/w".to_string(),
@@ -2756,7 +2757,7 @@ mod tests {
         });
         carried.push(crate::backup::NoteInventoryEntry {
             id: "zzzzzzzz".to_string(),
-            secret_hash: "not-a-hash".to_string(),
+            commitment: "not-a-hash".to_string(),
             state: "resurrected".to_string(),
             amount_msat: 0,
             host: String::new(),
@@ -2771,7 +2772,8 @@ mod tests {
             device_id: "dd".repeat(32),
             bridge_secret: "ee".repeat(32),
             masters: Vec::new(),
-            note_inventory: Some(carried),
+            note_inventory: Some(crate::backup::NoteInventory::Entries(carried)),
+            note_inventory_unreadable: 0,
         };
         let json = serde_json::to_vec(&payload).unwrap();
         let decoded: crate::backup::BackupPayload = serde_json::from_slice(&json).unwrap();

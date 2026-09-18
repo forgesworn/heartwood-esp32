@@ -463,7 +463,7 @@ fn hold_for_card(
         ApprovalDecision::ButtonApproved => Hold::Approved,
         ApprovalDecision::VerdictApproved if verdict_answers => Hold::Approved,
         ApprovalDecision::VerdictApproved => {
-            log::warn!("{line}: refused — a verdict cannot answer this card");
+            log::warn!("{line}: refused: a verdict cannot answer this card");
             Hold::Refused(build_error_json(
                 request_id,
                 -1,
@@ -1173,7 +1173,7 @@ fn dispatch_inner(
                     // the verdict does not cover it and the hold is still
                     // owed at the device (#160).
                     if matches!(approval, ApprovalDecision::VerdictApproved) {
-                        log::warn!("sign_event: refused — a verdict cannot answer this card");
+                        log::warn!("sign_event: refused: a verdict cannot answer this card");
                         return build_error_json(
                             &request.id,
                             -1,

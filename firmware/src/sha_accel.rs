@@ -43,7 +43,7 @@
 // the same driver over the software compression function. They still gain the
 // in-loop watchdog feed and yield.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use heartwood_common::kdf::{self, Block, Sha256Engine};
 
@@ -53,8 +53,16 @@ use heartwood_common::kdf::{self, Block, Sha256Engine};
 const YIELD_INTERVAL_US: i64 = 250_000;
 
 /// An acquire slower than this means the shared SHA/AES lock is genuinely
-/// contended: finish in software instead of queueing behind TLS.
-const CONTENDED_ACQUIRE_US: i64 = 20_000;
+/// contended, so this chunk runs in software instead of queueing behind TLS.
+///
+/// 5 ms is generous by two orders of magnitude for a legitimate holder: a TLS
+/// record MAC is microseconds, and even a 16 KB bulk hash through the DMA port
+/// at Espressif's own 90 MB/s floor is about 180 us. A wait above this means
+/// something is genuinely sitting on the peripheral, not that TLS is busy.
+/// The retreat is now per CHUNK, not per derivation, so tripping it costs one
+/// chunk rather than the rest of the unseal; `max_acquire_ms` in the telemetry
+/// is there so this number can be tuned from a bench run instead of guessed.
+const CONTENDED_ACQUIRE_US: i64 = 5_000;
 
 // ---------------------------------------------------------------------------
 // ESP-IDF SHA port
@@ -177,9 +185,14 @@ fn hw_compress(state: &mut [u32; 8], block: &Block) {
 /// trusted, the portable software compression function otherwise, with the
 /// watchdog fed and the CPU yielded on chunk boundaries either way.
 pub struct DeviceEngine {
-    hardware: bool,
+    /// The session's mode says hardware, and this board has some.
+    hw_allowed: bool,
+    /// This chunk holds the accelerator. False outside a chunk, and false for
+    /// a chunk that retreated.
+    chunk_hw: bool,
     held: bool,
-    retreat: bool,
+    /// No chunk of this derivation retreated.
+    all_hw: bool,
     last_yield_us: i64,
 }
 
@@ -187,44 +200,57 @@ impl DeviceEngine {
     /// `hardware` is honoured only if this build actually has the peripheral.
     pub fn new(hardware: bool) -> Self {
         DeviceEngine {
-            hardware: hardware && accelerator_available(),
+            hw_allowed: hardware && accelerator_available(),
+            chunk_hw: false,
             held: false,
-            retreat: false,
+            all_hw: true,
             last_yield_us: now_us(),
         }
+    }
+
+    /// True if every chunk of the derivation just run stayed on the hardware.
+    pub fn stayed_in_hardware(&self) -> bool {
+        self.hw_allowed && self.all_hw
     }
 }
 
 impl Sha256Engine for DeviceEngine {
     fn compress(&mut self, state: &mut [u32; 8], block: &Block) {
-        if self.hardware {
-            // The HMAC pad precompute happens outside any chunk; take and give
-            // back the lock around that one block rather than leaving the
-            // driver to remember.
-            let borrow = !self.held;
-            if borrow {
-                hw_acquire();
-            }
+        if self.chunk_hw {
             hw_compress(state, block);
-            if borrow {
-                hw_release();
-            }
         } else {
+            // Also the HMAC pad precompute, which happens outside any chunk:
+            // two compressions out of 400,002, not worth an acquire.
             kdf::soft_compress(state, block);
         }
     }
 
     fn begin_chunk(&mut self) {
-        if self.hardware {
-            let before = now_us();
-            hw_acquire();
+        CHUNKS.fetch_add(1, Ordering::Relaxed);
+        if !self.hw_allowed {
+            return;
+        }
+        let before = now_us();
+        hw_acquire();
+        let waited = (now_us() - before).clamp(0, u32::MAX as i64) as u32;
+        // Plain load/store rather than `fetch_max`: this is a telemetry
+        // high-water mark, a lost update between two tasks costs nothing, and
+        // the Xtensa backend expands an `atomicrmw umax` into a CAS loop whose
+        // temporary labels it then fails to assemble here.
+        if waited > MAX_ACQUIRE_US.load(Ordering::Relaxed) {
+            MAX_ACQUIRE_US.store(waited, Ordering::Relaxed);
+        }
+        if waited as i64 > CONTENDED_ACQUIRE_US {
+            // Something is sitting on the shared SHA/AES lock. Give it back at
+            // once and do this chunk in software; the next chunk tries again,
+            // so one long TLS hold no longer costs the whole derivation.
+            hw_release();
+            self.chunk_hw = false;
+            self.all_hw = false;
+            RETREATS.fetch_add(1, Ordering::Relaxed);
+        } else {
             self.held = true;
-            if now_us() - before > CONTENDED_ACQUIRE_US {
-                // TLS (or AES) is busy on the shared lock. Finish this chunk
-                // with what we hold, then get out of its way for the rest of
-                // the derivation.
-                self.retreat = true;
-            }
+            self.chunk_hw = true;
         }
     }
 
@@ -232,12 +258,8 @@ impl Sha256Engine for DeviceEngine {
         if self.held {
             hw_release();
             self.held = false;
-            if self.retreat {
-                log::warn!("SHA accelerator contended: finishing this derivation in software");
-                self.hardware = false;
-                self.retreat = false;
-            }
         }
+        self.chunk_hw = false;
 
         // The unseal path used to yield only between slots, which was fine at
         // 29 s a slot and is fine at 1 s, but a large or corrupted round count
@@ -269,37 +291,133 @@ impl Drop for DeviceEngine {
 
 const MODE_UNTESTED: u8 = 0;
 const MODE_HARDWARE: u8 = 1;
+/// Accelerator present and correct, but the software path measured faster.
 const MODE_SOFTWARE: u8 = 2;
+/// Accelerator present and WRONG. Never used again this session.
+const MODE_SELFCHECK_FAILED: u8 = 3;
+/// This board has no accelerated path at all.
+const MODE_NO_ACCEL: u8 = 4;
 
 static MODE: AtomicU8 = AtomicU8::new(MODE_UNTESTED);
 
+// Telemetry. Counters only: no secret, no per-PIN datum, nothing that depends
+// on what was derived. The Heltecs ship with the log console compiled out, so
+// without these there is no way at all to tell which path a board actually
+// ran, and the first bench run of the accelerator could not be read.
+static SELFCHECK_HW: AtomicU8 = AtomicU8::new(0); // 0 untried, 1 pass, 2 fail
+static HW_SELFCHECK_US: AtomicU32 = AtomicU32::new(0);
+static SW_SELFCHECK_US: AtomicU32 = AtomicU32::new(0);
+static DERIVATIONS: AtomicU32 = AtomicU32::new(0);
+static HW_FULL: AtomicU32 = AtomicU32::new(0);
+static RETREATS: AtomicU32 = AtomicU32::new(0);
+static CHUNKS: AtomicU32 = AtomicU32::new(0);
+static MAX_ACQUIRE_US: AtomicU32 = AtomicU32::new(0);
+static LAST_DERIVE_MS: AtomicU32 = AtomicU32::new(0);
+static LAST_UNLOCK_MS: AtomicU32 = AtomicU32::new(0);
+static UNLOCK_START_MS: AtomicU32 = AtomicU32::new(0);
+
+fn now_ms() -> u32 {
+    (now_us() / 1000).clamp(0, u32::MAX as i64) as u32
+}
+
+/// Mark the start of a whole unlock, so the telemetry can report what the
+/// owner actually waited rather than only the last slot.
+pub fn unlock_begin() {
+    UNLOCK_START_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+/// Mark the end of a whole unlock.
+pub fn unlock_end() {
+    let start = UNLOCK_START_MS.load(Ordering::Relaxed);
+    if start != 0 {
+        LAST_UNLOCK_MS.store(now_ms().saturating_sub(start), Ordering::Relaxed);
+    }
+}
+
+// Written as an if-chain rather than a `match`: a dense integer match that
+// yields string literals lowers to a jump table of address constants, and the
+// Xtensa backend fails to assemble one out of a literal pool here ("Undefined
+// temporary symbol"). An if-chain over five values costs nothing.
+fn mode_wire(mode: u8) -> &'static str {
+    if mode == MODE_HARDWARE {
+        "hw"
+    } else if mode == MODE_SOFTWARE {
+        "sw"
+    } else if mode == MODE_SELFCHECK_FAILED {
+        "sw-selfcheck-failed"
+    } else if mode == MODE_NO_ACCEL {
+        "sw-no-accel"
+    } else {
+        "untested"
+    }
+}
+
+fn selfcheck_wire() -> &'static str {
+    let v = SELFCHECK_HW.load(Ordering::Relaxed);
+    if v == 1 {
+        "pass"
+    } else if v == 2 {
+        "fail"
+    } else {
+        "untried"
+    }
+}
+
+/// The `kdf` object for FIRMWARE_INFO, as a leading-comma JSON fragment.
+///
+/// `mode` says which path this session derives on and why. `hw_selfcheck_us`
+/// and `sw_selfcheck_us` are the two timed known-answer runs that chose it, so
+/// the accelerator's real cost on this silicon is readable without a console.
+/// `retreats` and `max_acquire_ms` are the contention picture; `chunks` scales
+/// them. `last_derive_ms` is one slot, `last_unlock_ms` the whole unlock.
+pub fn telemetry_json() -> String {
+    format!(
+        ",\"kdf\":{{\"mode\":\"{}\",\"selfcheck\":\"{}\",\
+         \"hw_selfcheck_us\":{},\"sw_selfcheck_us\":{},\"derivations\":{},\
+         \"hw_full\":{},\"retreats\":{},\"chunks\":{},\"max_acquire_ms\":{},\
+         \"last_derive_ms\":{},\"last_unlock_ms\":{}}}",
+        mode_wire(MODE.load(Ordering::Relaxed)),
+        selfcheck_wire(),
+        HW_SELFCHECK_US.load(Ordering::Relaxed),
+        SW_SELFCHECK_US.load(Ordering::Relaxed),
+        DERIVATIONS.load(Ordering::Relaxed),
+        HW_FULL.load(Ordering::Relaxed),
+        RETREATS.load(Ordering::Relaxed),
+        CHUNKS.load(Ordering::Relaxed),
+        MAX_ACQUIRE_US.load(Ordering::Relaxed) / 1000,
+        LAST_DERIVE_MS.load(Ordering::Relaxed),
+        LAST_UNLOCK_MS.load(Ordering::Relaxed),
+    )
+}
+
 /// Decide, once per boot, which engine derives keys this session.
 ///
-/// Racing tasks may both run this; they do identical work and store identical
-/// results, and neither can publish a hardware mode that failed its vector.
+/// Both candidates must pass the same known-answer vector, and the faster of
+/// the ones that pass wins. Measuring rather than assuming is the point: the
+/// model behind this work predicted 0.7 to 2 s a slot for the accelerator and
+/// the first bench run came back at 17 s, which is exactly the kind of thing a
+/// board can settle for itself in 2,400 compressions. Neither candidate can
+/// win without matching the vector, so a wrong engine is never selected, only
+/// a slow one is rejected.
 ///
-/// There is deliberately no third fallback below software. The `pbkdf2` crate
-/// path this replaces hashes with the same `sha2` compression function the
-/// software engine uses, so a software engine that failed its vector would
-/// mean `sha2` itself is wrong and a third implementation of the same thing
-/// would fail identically, while refusing to derive at all would mean a
-/// sealed board that can never be unsealed. A software failure is therefore
-/// logged loudly and the session continues on exactly the path that shipped
-/// before this change.
+/// Racing tasks may both run this; they do identical work and store identical
+/// results.
 fn resolve_mode() -> u8 {
     let cached = MODE.load(Ordering::Relaxed);
     if cached != MODE_UNTESTED {
         return cached;
     }
 
-    let mut chosen = MODE_SOFTWARE;
-
+    let mut hw_ok = false;
+    let mut hw_us = u32::MAX;
     if accelerator_available() {
+        let started = now_us();
         let mut engine = DeviceEngine::new(true);
-        if kdf::self_check(&mut engine) {
-            log::info!("SHA accelerator self-check passed: sealed-seed KDF is hardware-backed");
-            chosen = MODE_HARDWARE;
-        } else {
+        hw_ok = kdf::self_check(&mut engine);
+        hw_us = (now_us() - started).clamp(0, u32::MAX as i64) as u32;
+        HW_SELFCHECK_US.store(hw_us, Ordering::Relaxed);
+        SELFCHECK_HW.store(if hw_ok { 1 } else { 2 }, Ordering::Relaxed);
+        if !hw_ok {
             // The one genuinely dangerous failure in this subsystem would be a
             // hardware path that derives a *different* key. It is caught here,
             // before any blob is touched, and the session never uses it.
@@ -311,12 +429,29 @@ fn resolve_mode() -> u8 {
         }
     }
 
-    if chosen == MODE_SOFTWARE {
-        let mut engine = DeviceEngine::new(false);
-        if !kdf::self_check(&mut engine) {
-            log::error!("Software SHA self-check FAILED: the KDF vector does not match");
-        }
+    let started = now_us();
+    let sw_ok = kdf::self_check(&mut kdf::SoftEngine);
+    let sw_us = (now_us() - started).clamp(0, u32::MAX as i64) as u32;
+    SW_SELFCHECK_US.store(sw_us, Ordering::Relaxed);
+    if !sw_ok {
+        log::error!("Software SHA self-check FAILED: the KDF vector does not match");
     }
+
+    let chosen = if !accelerator_available() {
+        MODE_NO_ACCEL
+    } else if !hw_ok {
+        MODE_SELFCHECK_FAILED
+    } else if hw_us <= sw_us {
+        MODE_HARDWARE
+    } else {
+        MODE_SOFTWARE
+    };
+    log::info!(
+        "Sealed-seed KDF: {} (hw self-check {} us, sw {} us)",
+        mode_wire(chosen),
+        hw_us,
+        sw_us
+    );
 
     MODE.store(chosen, Ordering::Relaxed);
     chosen
@@ -330,8 +465,17 @@ fn resolve_mode() -> u8 {
 /// it.
 fn device_kdf(password: &[u8], salt: &[u8], rounds: u32, out: &mut [u8]) {
     let hardware = resolve_mode() == MODE_HARDWARE;
+    let started = now_us();
     let mut engine = DeviceEngine::new(hardware);
     kdf::pbkdf2_hmac_sha256(&mut engine, password, salt, rounds, out);
+    LAST_DERIVE_MS.store(
+        ((now_us() - started) / 1000).clamp(0, u32::MAX as i64) as u32,
+        Ordering::Relaxed,
+    );
+    DERIVATIONS.fetch_add(1, Ordering::Relaxed);
+    if engine.stayed_in_hardware() {
+        HW_FULL.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Point the sealed-seed KDF at this board's engine.
@@ -341,12 +485,4 @@ fn device_kdf(password: &[u8], salt: &[u8], rounds: u32, out: &mut [u8]) {
 /// is already long, and a board with no sealed seed never needs to pay for it.
 pub fn install() {
     kdf::install_hook(device_kdf);
-    log::info!(
-        "Sealed-seed KDF engine installed (accelerator {})",
-        if accelerator_available() {
-            "present, self-check pending"
-        } else {
-            "not available on this board, software path"
-        }
-    );
 }

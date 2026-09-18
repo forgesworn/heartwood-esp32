@@ -150,6 +150,14 @@ use secp256k1::Secp256k1;
 /// the heap curve instead of only pass/fail, and a manager can show why a
 /// request that worked yesterday is refused today. Neither is a secret: they
 /// are allocator statistics, not contents.
+///
+/// `kdf` is the sealed-seed KDF's own telemetry: which engine this session
+/// derives on, whether the accelerator passed its known-answer check and how
+/// long each candidate took, plus counters for derivations, chunks, contention
+/// retreats and the slowest lock acquire. The Heltecs ship with the console
+/// compiled out, so this is the ONLY way to see which path a board ran, and
+/// without it a timing surprise on the bench cannot be attributed. Counters
+/// and durations only: nothing here depends on what was derived.
 pub fn firmware_info_json() -> String {
     let crash = crash_context()
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
@@ -177,7 +185,7 @@ pub fn firmware_info_json() -> String {
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
-         \"free_heap\":{},\"largest_block\":{}{}{}}}",
+         \"free_heap\":{},\"largest_block\":{}{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -190,6 +198,7 @@ pub fn firmware_info_json() -> String {
         largest_block,
         crash,
         nvs_stats,
+        crate::sha_accel::telemetry_json(),
     )
 }
 

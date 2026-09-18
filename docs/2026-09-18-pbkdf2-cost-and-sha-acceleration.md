@@ -759,3 +759,162 @@ parameter set that survives this chip's ~180 KB of fragmented heap, which is
 its own investigation and its own bench pass. Speeding up the wrong KDF does
 not make it the right one, it makes the right one affordable to adopt later,
 because the operator's unseal budget is no longer spent.
+
+---
+
+## 8. The first bench run, and why 17 s rather than 1 s
+
+Measured on a real Heltec V4, three sealed masters, WiFi-standalone with a live
+relay TLS session during the unseal, app-only flash of `9098eb7`:
+
+| | per slot | three slots |
+|---|---|---|
+| previous release (software, `pbkdf2` crate) | ~25 s | 73.8 s, **then a watchdog reboot** |
+| this branch | ~17 s | 52 s, clean, npubs identical |
+| §2.3's estimate | 0.7 to 2.0 s | 2 to 6 s |
+
+Correctness held: all three masters unlocked, the AEAD tags verified and the
+npubs matched. #121 is also confirmed as a live failure rather than a nuisance,
+because the old firmware did not merely take 74 s, it died with
+`last_reset = task-watchdog`, `crashed_during = relay reading`.
+
+But 17 s is 400,000 compressions in 17 s, so about 42 us or roughly 10,000
+cycles at 240 MHz for each 64-byte block. The estimate was out by a factor of
+ten and the note has to say why.
+
+### 8.1 Nobody could see which path ran
+
+The Heltecs build with the log console compiled out, so `SHA accelerator
+self-check passed` is never observable. Two completely different stories fit
+the number:
+
+* **the accelerator ran** and costs ~42 us a block rather than the ~3 us §2.3
+  assumed; or
+* **the accelerator never ran** (self-check failed, or the mode was software)
+  and 25 s to 17 s is simply the new driver being leaner than the `pbkdf2`
+  crate, which clones a whole HMAC context on every round.
+
+The second is uncomfortably plausible, and 3 x 17.3 = 52 fits it exactly. This
+is the first thing fixed: `FIRMWARE_INFO` now carries a `kdf` object (§8.5).
+
+### 8.2 (a) Contention retreat: possible, now bounded and counted
+
+`esp_sha_acquire_hardware` takes `esp_crypto_sha_aes_lock_acquire`, which is a
+plain FreeRTOS mutex. A legitimate holder holds it for one operation: a TLS
+record MAC is microseconds, and even a 16 KB bulk hash at Espressif's own
+90 MB/s floor is ~180 us. So a 20 ms threshold should essentially never trip,
+and contention alone cannot explain a uniform 10x.
+
+It could still explain a *mixture*, and the old code made that worse than it
+needed to be: one slow acquire abandoned hardware for the whole derivation. It
+is now per chunk, the threshold is 5 ms, and both the retreat count and the
+slowest acquire are reported. A single long TLS hold now costs one chunk.
+
+### 8.3 (b) Per-compression overhead: real, and about 6 us, not 36
+
+Read off the pinned tree, one compression is:
+
+```
+esp_sha_write_digest_state -> sha_hal_write_digest -> sha_ll_write_digest      8 writes
+sha_hal_hash_block         -> sha_hal_wait_idle    (poll SHA_BUSY_REG)
+                           -> sha_ll_fill_text_block                          16 writes
+                           -> sha_ll_continue_block                            2 writes
+esp_sha_read_digest_state  -> sha_hal_read_digest  -> sha_hal_wait_idle
+                           -> esp_dport_access_read_buffer                     8 reads
+                                                   + an all-zero fault check
+```
+
+34 register accesses plus two busy-wait polls. There is no memcpy, no byte
+swap (the S3 digest registers hold `h0..h7` in the same numeric order `sha2`
+uses, which is why parity holds at all) and no mutex or critical section per
+call: the lock and the `SHA_RCC_ATOMIC` clock gate are per *acquire*, which is
+now once per 256 rounds. At an APB-ish 20 to 30 CPU cycles per access that is
+about 900 cycles, plus perhaps 500 for the polls: **~1,400 cycles, ~6 us**.
+
+The state write and the state read are both unavoidable in this loop. The two
+compressions of one HMAC round resume from different midstates (ipad, then
+opad), so the write cannot be hoisted, and the result of the inner one is the
+message of the outer one, so the read cannot be skipped either. This is the
+structural reason a SHA accelerator is a poor fit for PBKDF2: Espressif's
+90 MB/s figure is 256 blocks streamed per DMA burst with one state save, and
+ours is one block per state save. **The accelerator's ceiling on this loop is
+a small multiple, not the 15x to 40x §2.3 projected.** §2.3 was wrong to
+scale from the bulk figure.
+
+### 8.4 (c) and (d) Instruction fetch: the rest of the gap, and the same wall for both paths
+
+~6 us of register work against 42 us measured leaves ~36 us unaccounted. And
+the software path's own number has the same shape: ~17,400 cycles for a block
+whose arithmetic is 2,000 to 3,000. §1.5's evidence for that being instruction
+fetch is strong and did not depend on the accelerator at all: `opt-level = 3`
+made the KDF *slower*, and a 160 to 240 MHz clock rise did not help.
+
+None of the hot path is in IRAM. `sha_hal.c`, the mbedTLS SHA port and
+`dport_access_common.c` are absent from every `noflash` mapping in ESP-IDF's
+linker fragments, so all of them execute from flash through the 16 KB
+instruction cache, and so does the Rust round loop. The loop is about a
+kilobyte, so the problem is not that it cannot fit the cache: it is that WiFi,
+lwIP, the timer service and the relay task run beside it and keep evicting it.
+That predicts the same wall for both paths, which is exactly what the two
+measurements show.
+
+**IRAM placement is therefore the right fix, and it is blocked on Xtensa.**
+Three routes were tried:
+
+* `#[link_section = ".iram1.…"]` on the Rust functions moves `.text` but not
+  the Xtensa literal pool, and the build fails with `Undefined temporary
+  symbol`. ESP-IDF's `.iram1+` mapping is what `IRAM_ATTR` uses in C, where
+  the compiler also emits the literals into the moved section.
+* `-C llvm-args=-mtext-section-literals`, which is what ESP-IDF's own C build
+  passes, applies to the whole crate graph and fails elsewhere with
+  `symbol '.LCPI0_0' is already defined`.
+* ldgen's `linker.lf` mappings are per component *archive*, and the Rust code
+  is an rlib inside the esp-idf-sys staticlib, so there is no entity to map.
+
+Getting Rust code into IRAM under esp-idf needs a linker-fragment change that
+is bigger than this branch. What is available today, in one reversible line, is
+the §2.5 diagnostic: double the instruction cache.
+
+`HEARTWOOD_ICACHE_32K=1 scripts/build-firmware.sh v4 --release` appends
+`sdkconfig.defaults.icache32` (`CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y`). It
+is deliberately not any board's default, because it costs 16 KB of internal
+SRAM on a firmware whose relay already sheds its secondary session below a
+32 KB largest free block. `free_heap` and `largest_block` are already in
+`FIRMWARE_INFO` beside the new `kdf.last_derive_ms`, so one bench pair of reads
+prices it exactly.
+
+Honest estimate for (d): if the model holds, a hot path that is not being
+evicted should run SHA-256 at 2,000 to 3,000 cycles a block, which is 3.5 to
+5 s a slot in pure software, on every board including the T-Display and with no
+accelerator, no shared lock and no contention story. That would be the better
+primary fix, with the accelerator worth a further small multiple on top. A
+32 KB cache is not the same thing as IRAM, so expect a partial move, not the
+whole distance; if the number does not move at all, §1.5's model is wrong and
+this section needs revisiting before anyone builds a linker fragment.
+
+### 8.5 What the next bench run reads
+
+`node scripts/device-status.mjs --port …` now prints a `kdf:` line from the
+`FIRMWARE_INFO` frame. The fields that settle §8.1 through §8.4:
+
+* `mode`: `hw`, `sw`, `sw-selfcheck-failed` or `sw-no-accel`. If this says
+  anything but `hw` on a Heltec, the 17 s was never the accelerator and §8.2
+  and §8.3 do not apply.
+* `hw_selfcheck_us` and `sw_selfcheck_us`: the two timed known-answer runs of
+  2,400 compressions that chose the mode. Their ratio IS the accelerator's
+  real speed-up on this silicon, measured on the board, and divided by 2,400
+  it gives the per-compression cost that §8.3 estimates at 6 us.
+* `retreats` against `chunks`, and `max_acquire_ms`: see §8.2. Near-zero retreats
+  with a small `max_acquire_ms` clears contention entirely.
+* `hw_full` against `derivations`: how many slots stayed on hardware start to
+  finish.
+* `last_derive_ms` and `last_unlock_ms`: one slot and the whole unlock, which
+  is what the 32 KB cache experiment is compared on, against `free_heap` and
+  `largest_block` for its price.
+
+The mode is now chosen by measurement rather than assumption: at first use the
+board runs the known-answer vector through both engines, times each, and picks
+the faster one that PASSES. A wrong engine can still never be selected; only a
+slow one can now be rejected. If the accelerator really is worth only the small
+multiple §8.3 argues for, a board may legitimately report `mode: "sw"`, and
+that is the correct answer rather than a fault.

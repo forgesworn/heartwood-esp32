@@ -114,6 +114,7 @@ impl Sha256Engine for SoftEngine {
     }
 }
 
+#[inline(always)]
 fn state_bytes(state: &[u32; 8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, w) in state.iter().enumerate() {
@@ -143,7 +144,7 @@ impl Absorb {
         }
     }
 
-    fn update<E: Sha256Engine + ?Sized>(&mut self, engine: &mut E, mut data: &[u8]) {
+    fn update(&mut self, engine: &mut dyn Sha256Engine, mut data: &[u8]) {
         self.total += data.len() as u64;
         while !data.is_empty() {
             let take = core::cmp::min(64 - self.fill, data.len());
@@ -157,7 +158,7 @@ impl Absorb {
         }
     }
 
-    fn finish<E: Sha256Engine + ?Sized>(mut self, engine: &mut E) -> [u8; 32] {
+    fn finish(mut self, engine: &mut dyn Sha256Engine) -> [u8; 32] {
         let bits = self.total * 8;
         self.block.0[self.fill] = 0x80;
         self.fill += 1;
@@ -184,8 +185,14 @@ impl Absorb {
 ///
 /// `rounds` must be non-zero; the caller range-checks it (see
 /// `seed_cipher::MAX_PBKDF2_ITERATIONS`) long before this is reached.
-pub fn pbkdf2_hmac_sha256<E: Sha256Engine + ?Sized>(
-    engine: &mut E,
+///
+/// Non-generic on purpose: one `dyn` call per compression is nothing beside
+/// what a compression costs on this chip, and it keeps a single copy of the
+/// driver in an image with no room for two. It is also what a `link_section`
+/// would need if Rust code could be put in IRAM on Xtensa; see
+/// docs/2026-09-18-pbkdf2-cost-and-sha-acceleration.md §8.
+pub fn pbkdf2_hmac_sha256(
+    engine: &mut dyn Sha256Engine,
     password: &[u8],
     salt: &[u8],
     rounds: u32,
@@ -333,7 +340,7 @@ pub const SELF_CHECK_KM: [u8; 64] = [
 ///
 /// A device calls this once, before its first real derivation, and must never
 /// derive a key with an engine that failed.
-pub fn self_check<E: Sha256Engine + ?Sized>(engine: &mut E) -> bool {
+pub fn self_check(engine: &mut dyn Sha256Engine) -> bool {
     debug_assert!(
         SELF_CHECK_ROUNDS > CHUNK_ROUNDS * 2,
         "the self-check must cross at least two chunk boundaries"

@@ -87,6 +87,21 @@ fi
 # exports win, so MCU/sdkconfig follow the chosen board rather than the S3
 # default baked into the config file.
 export ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.${FEATURE}"
+
+# Bench experiment: HEARTWOOD_ICACHE_32K=1 appends a fragment that doubles the
+# S3 instruction cache to 32 KB, to test whether the sealed-seed KDF is
+# instruction-fetch bound. It costs 16 KB of heap and is deliberately not any
+# board's default. S3 only; the classic ESP32 and the C6 have their own cache
+# geometry and Kconfig names.
+if [[ "${HEARTWOOD_ICACHE_32K:-0}" == "1" ]]; then
+    if [[ "$MCU" != "esp32s3" ]]; then
+        echo "error: HEARTWOOD_ICACHE_32K is an ESP32-S3 experiment; this board is ${MCU}" >&2
+        exit 2
+    fi
+    export ESP_IDF_SDKCONFIG_DEFAULTS="${ESP_IDF_SDKCONFIG_DEFAULTS};sdkconfig.defaults.icache32"
+    echo "    icache                     = 32 KB (bench experiment, costs 16 KB heap)"
+fi
+
 export MCU
 
 echo "==> Building heartwood-esp32 for ${FEATURE}"

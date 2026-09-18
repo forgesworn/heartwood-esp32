@@ -701,7 +701,7 @@ mod tests {
         // is a record, not a restore, so an unrecognised entry shape costs
         // nothing but the record: it is ignored, and the slots still come
         // back.
-        "[{\"id\":\"a1b2c3d4\",\"secret_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"state\":\"spent\",\"amount_msat\":1,\"host\":\"m\",\"key_index\":null,\"created_at\":1,\"updated_at\":1}]", // pragma: allow-secret (dummy test fixture)
+        "[{\"id\":\"a1b2c3d4\",\"secret_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"state\":\"spent\",\"amount_msat\":1,\"host\":\"m\",\"key_index\":null,\"created_at\":1,\"updated_at\":1}]",
     ];
 
     #[test]
@@ -760,7 +760,7 @@ mod tests {
         // read tomorrow's entries, not throw the whole inventory away.
         let json = r#"{"created_at":1,"device_id":"dd","bridge_secret":"ee","masters":[],
              "note_inventory":[{"id":"a1b2c3d4",
-               "commitment":"1111111111111111111111111111111111111111111111111111111111111111", // pragma: allow-secret (dummy test fixture)
+               "commitment":"1111111111111111111111111111111111111111111111111111111111111111",
                "state":"spent","amount_msat":1,"host":"m","key_index":null,
                "created_at":1,"updated_at":1,"future_field":{"deep":[1,2,3]}}]}"#;
         let decoded: BackupPayload = serde_json::from_str(json).unwrap();

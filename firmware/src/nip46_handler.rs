@@ -36,7 +36,10 @@ use zeroize::Zeroize;
 
 use crate::approval::ApprovalResult;
 use crate::oled::Display;
-use heartwood_common::policy::{resume_decision, CardKind, Gate, ResumeDecision, ShownCard};
+use heartwood_common::policy::{
+    classify_connect_pubkey, resume_decision, CardKind, ConnectPubkeyClass, Gate, ResumeDecision,
+    ShownCard,
+};
 use crate::policy::PolicyEngine;
 
 /// Timeout in seconds shown on the OLED countdown bar.
@@ -1281,7 +1284,9 @@ fn dispatch_inner(
                         // currently exercisable and keeps the flash-only path.
                         let slot_can_sign =
                             slot.allowed_methods.iter().any(|m| m == "sign_event");
-                        let old_pubkey = slot.current_pubkey.clone();
+                        // Classify against the pre-mutation state: this is what
+                        // decides how the client's key is treated below.
+                        let class = classify_connect_pubkey(slot, &client_hex);
                         // #75: the bind must be durable before it is
                         // acknowledged. Snapshot the prior authority so a
                         // failed write can be undone rather than leaving the
@@ -1289,9 +1294,40 @@ fn dispatch_inner(
                         let bind_snapshot = policy_engine.snapshot_slot_state(master_slot);
                         let mut bind_mutated = false;
 
-                        match &old_pubkey {
-                            None => {
-                                // First use -- assign pubkey.
+                        match class {
+                            ConnectPubkeyClass::Current => {
+                                // Same pubkey reconnecting -- no-op, no flash.
+                                log::info!(
+                                    "Slot {} ({}) reconnected (same pubkey)",
+                                    slot_index,
+                                    slot_label
+                                );
+                            }
+                            ConnectPubkeyClass::Known => {
+                                // Retained client of this pairing: silent rebind
+                                // back to it. `assign_pubkey_to_slot` preserves
+                                // unique-slot ownership and the current-key
+                                // display; it does not re-seed identity because
+                                // `slot_authorizes` already sees this key.
+                                policy_engine.assign_pubkey_to_slot(
+                                    master_slot,
+                                    slot_index,
+                                    client_hex.clone(),
+                                );
+                                log::info!(
+                                    "Slot {} ({}) reconnected (retained client)",
+                                    slot_index,
+                                    slot_label
+                                );
+                                bind_mutated = true;
+                            }
+                            ConnectPubkeyClass::FirstUse => {
+                                // First-ever binding of the slot. Preserve the
+                                // historic semantics even when sign_event is
+                                // already in the ceiling: the holder supplied
+                                // the slot secret, and operator-issued unused
+                                // pairing retains first-connect semantics rather
+                                // than inheriting an existing authority.
                                 policy_engine.assign_pubkey_to_slot(
                                     master_slot,
                                     slot_index,
@@ -1316,16 +1352,9 @@ fn dispatch_inner(
                                 );
                                 bind_mutated = true;
                             }
-                            Some(existing) if existing == &client_hex => {
-                                // Same pubkey reconnecting -- no-op.
-                                log::info!(
-                                    "Slot {} ({}) reconnected (same pubkey)",
-                                    slot_index,
-                                    slot_label
-                                );
-                            }
-                            Some(_old) => {
-                                // New ephemeral key for existing slot.
+                            ConnectPubkeyClass::Unknown => {
+                                // New ephemeral key, or an evicted/revoked one,
+                                // for a slot with prior history.
                                 //
                                 // DS-H2: a slot whose policy currently includes
                                 // sign_event must never SILENTLY re-bind to a

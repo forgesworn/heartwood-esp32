@@ -1855,6 +1855,41 @@ master on a legacy slot that already signs silently.
     shows `verdicts_dropped: 1` and the next sign of that kind parks again
     instead of riding the verdict.
 
+### Retained-client reconnect regression (added 2026-09-21, NOT YET BENCH-RUN)
+
+Use a disposable signing slot with two already-authorised client keys, A and B.
+Pair both first, then approve the test identity: adding an unknown client still
+clears the slot-wide identity grants in this firmware. Record the slot's
+authorised keys and approved identities without exporting its secret.
+
+1. Reconnect A, then B, then A using their existing credentials. No rebind card
+   appears. Each becomes the displayed current client and the other remains
+   authorised. The approved identity list stays unchanged. Make three requests
+   within the installed method/kind policy after each reconnect: all succeed
+   without a new approval card.
+2. Reconnect the current client again. It remains silent. Reboot/unlock the
+   signer and repeat A → B → A: the retained keys and identity grants survive.
+3. Connect an unknown C to the used signing slot. A physical rebind card is
+   still required. Deny it, then separately let it time out: neither outcome
+   adds C or changes the existing keys/grants. Repeat with a revoked or
+   FIFO-evicted key; it must not be treated as a retained client.
+4. With a bench fixture for a previously-used signing slot whose current key
+   is absent, an unknown key still needs the rebind hold. A retained authorised
+   key is silent. A genuinely unused operator-issued slot retains its existing
+   first-connect behaviour. Do not edit a live user's NVS to create a fixture.
+5. Use a controlled slot-write failure/rollback bench fixture on a retained-key
+   reconnect: no successful connect acknowledgement is sent unless the updated
+   slot state is durable. Preparing that fixture is part of bench acceptance;
+   do not corrupt a live user's storage. Also check a deferred rebind after
+   slot removal or policy change; it must use the live slot state.
+6. Separately verify an ordinary app update and relay reconnect on the user's
+   actual routes: Kithmoot → Bark, Kithmoot → Cambium on Android, and the other
+   consumer → My Signet. Record installed versions, the credential fingerprint,
+   persona, policy, prompt heading and observed result. Distinct app pairings
+   need not share a slot; the two-client bench case above is separate evidence.
+
+Host classifier tests and a firmware build do not establish these outcomes.
+
 ## 24. A guardian verdict answers a note card too (#160; added 2026-09-17, NOT YET BENCH-RUN)
 
 Escalation exists so the family's guardian can answer when nobody is at the

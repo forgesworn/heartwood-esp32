@@ -932,6 +932,46 @@ pub fn slot_authorizes(slot: &ConnectSlot, pubkey: &str) -> bool {
         || slot.authorized_pubkeys.iter().any(|p| p == pubkey)
 }
 
+/// How a `connect` request's client key relates to the slot's current binding
+/// and its retained authority. Computed from the slot's pre-mutation device
+/// state, not from whatever state the client last observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectPubkeyClass {
+    /// The pubkey is already the slot's current binding.
+    Current,
+    /// Not current, but present in `authorized_pubkeys`; a still-authorised
+    /// client of the same pairing.
+    Known,
+    /// No current key, no retained keys, and `was_bound` is false: first-ever
+    /// binding of the slot.
+    FirstUse,
+    /// Neither current nor retained, and the slot is not first-use.
+    Unknown,
+}
+
+/// Classify a `connect` client key against `slot` without mutating it.
+///
+/// `Known` reuses [`slot_authorizes`]; because `Current` is checked first this
+/// means "retained, not current". `was_bound == false` with retained keys is
+/// `Unknown` only for a key not in that retained set: a legacy blob that lost
+/// `was_bound` must not let a stranger inherit an existing pairing's
+/// authority, while keys already present in `authorized_pubkeys` still
+/// classify as `Known`.
+pub fn classify_connect_pubkey(slot: &ConnectSlot, pubkey: &str) -> ConnectPubkeyClass {
+    if slot.current_pubkey.as_deref() == Some(pubkey) {
+        ConnectPubkeyClass::Current
+    } else if slot_authorizes(slot, pubkey) {
+        ConnectPubkeyClass::Known
+    } else if slot.current_pubkey.is_none()
+        && !slot.was_bound
+        && slot.authorized_pubkeys.is_empty()
+    {
+        ConnectPubkeyClass::FirstUse
+    } else {
+        ConnectPubkeyClass::Unknown
+    }
+}
+
 /// Return current client keys explicitly opted in to receive a guardian's
 /// C4/C5 copy. A matching identity alone is not enough: the policy flag keeps
 /// child audit readers from becoming guardian-notice recipients by accident.
@@ -985,7 +1025,9 @@ pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) {
     // new holder of the credential: identity approvals were given to the old
     // one and do not carry over. A key that paired before keeps them, so two
     // devices sharing one slot do not reset each other.
-    if (slot.was_bound || slot.current_pubkey.is_some()) && !slot_authorizes(slot, pubkey) {
+    if (slot.was_bound || slot.current_pubkey.is_some() || !slot.authorized_pubkeys.is_empty())
+        && !slot_authorizes(slot, pubkey)
+    {
         slot.approved_identities.clear();
     }
     slot.was_bound = true;
@@ -2874,6 +2916,234 @@ mod tests {
         assert_eq!(slot.authorized_pubkeys.len(), 2);
         assert!(slot_authorizes(&slot, &sample_pubkey('a')));
         assert!(slot_authorizes(&slot, &sample_pubkey('b')));
+    }
+
+    // --- Connect rebind classification (G1) ---
+
+    fn class_matrix_slot(
+        current: Option<&str>,
+        authorized: &[&str],
+        was_bound: bool,
+    ) -> ConnectSlot {
+        let mut slot = sample_slot(0, "classifier");
+        slot.current_pubkey = current.map(str::to_string);
+        slot.authorized_pubkeys = authorized.iter().map(|s| s.to_string()).collect();
+        slot.was_bound = was_bound;
+        slot
+    }
+
+    #[test]
+    fn classify_connect_pubkey_matrix() {
+        let a = sample_pubkey('a');
+        let b = sample_pubkey('b');
+        let c = sample_pubkey('c');
+
+        // Current wins even when the key is also in the retained set.
+        let slot = class_matrix_slot(Some(&a), &[&a, &b], true);
+        assert_eq!(
+            classify_connect_pubkey(&slot, &a),
+            ConnectPubkeyClass::Current
+        );
+
+        // Retained, not current: Known with or without a current binding.
+        let slot = class_matrix_slot(Some(&b), &[&a, &b], true);
+        assert_eq!(
+            classify_connect_pubkey(&slot, &a),
+            ConnectPubkeyClass::Known
+        );
+        let slot = class_matrix_slot(None, &[&a], true);
+        assert_eq!(
+            classify_connect_pubkey(&slot, &a),
+            ConnectPubkeyClass::Known
+        );
+
+        // First use: no current, no retained, never bound. sign_event in
+        // the ceiling does not change the classification.
+        let mut slot = class_matrix_slot(None, &[], false);
+        assert_eq!(
+            classify_connect_pubkey(&slot, &a),
+            ConnectPubkeyClass::FirstUse
+        );
+        slot.allowed_methods = vec!["sign_event".into()];
+        assert_eq!(
+            classify_connect_pubkey(&slot, &a),
+            ConnectPubkeyClass::FirstUse
+        );
+
+        // Unknown: anything else. Independent of allowed_methods, and not
+        // upgraded to FirstUse by a missing was_bound when keys are retained.
+        for (current, retained, was_bound) in [
+            (Some(b.clone()), vec![a.clone()], true),
+            (None, vec![], true),
+            (None, vec![a.clone()], false),
+            (Some(b.clone()), vec![], true),
+        ] {
+            let mut slot = class_matrix_slot(
+                current.as_deref(),
+                &retained.iter().map(String::as_str).collect::<Vec<_>>(),
+                was_bound,
+            );
+            assert_eq!(
+                classify_connect_pubkey(&slot, &c),
+                ConnectPubkeyClass::Unknown
+            );
+            slot.allowed_methods = vec!["sign_event".into()];
+            assert_eq!(
+                classify_connect_pubkey(&slot, &c),
+                ConnectPubkeyClass::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn classify_connect_pubkey_revocation_and_fifo_eviction_are_unknown() {
+        // Revocation: current removed, was_bound stays true, retained empty.
+        let revoked = class_matrix_slot(None, &[], true);
+        let a = sample_pubkey('a');
+        assert_eq!(
+            classify_connect_pubkey(&revoked, &a),
+            ConnectPubkeyClass::Unknown
+        );
+
+        // FIFO eviction: the evicted key is neither current nor retained.
+        let mut slot = sample_slot(0, "fifo");
+        for i in 0..(MAX_AUTHORIZED_PUBKEYS + 2) {
+            authorize_pubkey_on_slot(&mut slot, &format!("{i:0>64x}"));
+        }
+        let evicted = format!("{:0>64x}", 0);
+        assert!(!slot_authorizes(&slot, &evicted));
+        assert_eq!(
+            classify_connect_pubkey(&slot, &evicted),
+            ConnectPubkeyClass::Unknown
+        );
+        // A retained key that is not current is Known, not Unknown. The
+        // loop writes MAX_AUTHORIZED_PUBKEYS+2 keys, evicting both 0 and 1;
+        // the oldest survivor is index 2.
+        let retained = format!("{:0>64x}", 2);
+        assert!(slot_authorizes(&slot, &retained));
+        assert_eq!(
+            classify_connect_pubkey(&slot, &retained),
+            ConnectPubkeyClass::Known
+        );
+    }
+
+    #[test]
+    fn retain_then_reconnect_a_b_a_keeps_identity_approvals() {
+        // A pairs first, then B; both are retained on the slot. A reconnects
+        // via a Known rebind, which must not clear identity approvals that
+        // were granted on this slot.
+        let mut slot = trusted_legacy_slot();
+        let a = sample_pubkey('a');
+        let b = sample_pubkey('b');
+        authorize_pubkey_on_slot(&mut slot, &a);
+        authorize_pubkey_on_slot(&mut slot, &b);
+        // Record the identity approval only after B has bound: this is the
+        // approval the test is proving survives A's Known rebind.
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        assert_eq!(
+            classify_connect_pubkey(&slot, &a),
+            ConnectPubkeyClass::Known
+        );
+        // Known rebind does not re-run `record_identity`; identity survives.
+        let mut slots = vec![slot];
+        assert!(authorize_pubkey_on_unique_slot(&mut slots, 0, &a));
+        let slot = slots.remove(0);
+        assert!(identity_approved(&slot, &IDENTITY_A));
+        assert!(slot_authorizes(&slot, &a));
+        assert!(slot_authorizes(&slot, &b));
+    }
+
+    #[test]
+    fn unknown_client_on_retained_only_slot_clears_identity_approvals() {
+        // Legacy state: a slot that has a retained key A but no current key and
+        // was_bound=false. An unknown client C binding here is a new holder and
+        // must clear persona grants recorded for IDENTITY_A.
+        let mut slot = trusted_legacy_slot();
+        let a = sample_pubkey('a');
+        let c = sample_pubkey('c');
+        slot.current_pubkey = None;
+        slot.was_bound = false;
+        slot.authorized_pubkeys = vec![a.clone()];
+        assert!(record_approved_identity(&mut slot, &IDENTITY_A));
+        assert_eq!(
+            classify_connect_pubkey(&slot, &a),
+            ConnectPubkeyClass::Known
+        );
+        assert_eq!(
+            classify_connect_pubkey(&slot, &c),
+            ConnectPubkeyClass::Unknown
+        );
+        authorize_pubkey_on_slot(&mut slot, &c);
+        assert!(!identity_approved(&slot, &IDENTITY_A));
+        assert!(slot.was_bound);
+    }
+
+    #[test]
+    fn classify_uses_authorise_and_revoke_helpers() {
+        // Revoking a stale retained key makes it Unknown; the helper must
+        // agree with the classifier's `slot_authorizes` call.
+        let mut slot = sample_slot(0, "revoke");
+        let stale = sample_pubkey('a');
+        let current = sample_pubkey('b');
+        authorize_pubkey_on_slot(&mut slot, &stale);
+        authorize_pubkey_on_slot(&mut slot, &current);
+        assert_eq!(
+            classify_connect_pubkey(&slot, &stale),
+            ConnectPubkeyClass::Known
+        );
+        assert_eq!(
+            remove_authorized_pubkey(&mut slot, &stale),
+            RemoveAuthorizedPubkey::Removed
+        );
+        assert_eq!(
+            classify_connect_pubkey(&slot, &stale),
+            ConnectPubkeyClass::Unknown
+        );
+        // The current key is still Current, not merely Known.
+        assert_eq!(
+            classify_connect_pubkey(&slot, &current),
+            ConnectPubkeyClass::Current
+        );
+    }
+
+    #[test]
+    fn unique_assignment_retains_other_clients_and_keeps_classification() {
+        let client = sample_pubkey('a');
+        let retained = sample_pubkey('b');
+        let mut first = sample_slot(0, "older broad policy");
+        authorize_pubkey_on_slot(&mut first, &retained);
+        authorize_pubkey_on_slot(&mut first, &client);
+        let target = sample_slot(1, "new strict policy");
+        let mut third = sample_slot(2, "stale duplicate");
+        // Mark the older slot as a real, previously-used binding so its
+        // removal on assignment is judged against a realistic state.
+        third.was_bound = true;
+        third.current_pubkey = Some(client.clone());
+        let mut slots = vec![first, target, third];
+
+        assert!(authorize_pubkey_on_unique_slot(&mut slots, 1, &client));
+        // Another client of the source slot is preserved and stays Known.
+        assert_eq!(
+            classify_connect_pubkey(&slots[0], &retained),
+            ConnectPubkeyClass::Known
+        );
+        // The moved key is Unknown on the source: removed from both current
+        // and retained authority by the unique assignment.
+        assert_eq!(
+            classify_connect_pubkey(&slots[0], &client),
+            ConnectPubkeyClass::Unknown
+        );
+        // The target now has the key as its current binding.
+        assert_eq!(
+            classify_connect_pubkey(&slots[1], &client),
+            ConnectPubkeyClass::Current
+        );
+        // The stale duplicate slot no longer carries the key: it is neither
+        // current nor retained there.
+        assert_eq!(
+            classify_connect_pubkey(&slots[2], &client),
+            ConnectPubkeyClass::Unknown
+        );
     }
 
     #[test]

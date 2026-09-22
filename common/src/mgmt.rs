@@ -108,6 +108,19 @@ pub fn classify_credential_fingerprint(
     }
 }
 
+/// Public consent scoped to each actual client credential, never the bunker secret.
+#[cfg(feature = "nip46")]
+pub fn client_approval_summary(slot: &ConnectSlot) -> serde_json::Value {
+    match &slot.client_grants {
+        None => serde_json::Value::Null,
+        Some(grants) => serde_json::Value::Array(grants.client_keys().iter().map(|client| serde_json::json!({
+            "client_pubkey": crate::hex::hex_encode(client),
+            "approved_identities": grants.approved_keys(client).iter().map(|key| crate::hex::hex_encode(key)).collect::<Vec<_>>(),
+            "legacy_identity_tags": grants.approved_tags(client).iter().map(|tag| crate::hex::hex_encode(tag)).collect::<Vec<_>>(),
+        })).collect()),
+    }
+}
+
 /// Public management representation of a client slot. The bearer secret is
 /// deliberately absent; callers get only its stable non-secret fingerprint so
 /// later numeric-index actions can bind to the exact credential they observed.
@@ -131,6 +144,7 @@ pub fn client_summary(slot: &ConnectSlot) -> serde_json::Value {
         "bound_identity": slot.bound_identity.clone(),
         // Read-only: 16-hex-char tags of the identities approved on a card.
         "approved_identities": crate::policy::approved_identity_tags(slot),
+        "client_approvals": client_approval_summary(slot),
     })
 }
 
@@ -176,6 +190,7 @@ pub fn identity_revocation_result(
         "changed": list_changed || verdicts_dropped > 0,
         "verdicts_dropped": verdicts_dropped,
         "approved_identities": crate::policy::approved_identity_tags(slot),
+        "client_approvals": client_approval_summary(slot),
         "bound_identity": slot.bound_identity.clone(),
     })
 }
@@ -680,6 +695,7 @@ mod tests {
             bound_identity: None,
             approved_identities: String::new(),
             was_bound: false,
+            client_grants: None,
         };
         let summary = client_summary(&slot);
         assert_eq!(summary["slot_index"], 7);
@@ -712,6 +728,7 @@ mod tests {
             bound_identity: Some("cc".repeat(32)),
             approved_identities: String::new(),
             was_bound: true,
+            client_grants: None,
         }
     }
 

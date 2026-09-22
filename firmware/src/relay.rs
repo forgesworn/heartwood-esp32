@@ -3264,6 +3264,7 @@ const CHILD_WRAP_MAX: usize = 4;
 /// request (its params carry the event to sign) but never a secret — the
 /// signing key is re-derived at completion, exactly as live dispatch does.
 struct ParkedRequest {
+    authority_epoch: Option<u32>,
     /// The triggering request event's id hex — the notice's `park` handle.
     park_id: String,
     request: nip46::Nip46Request,
@@ -3299,6 +3300,7 @@ struct ParkedRequest {
 /// by installing the transient allow (schema §1.4's expired column).
 #[derive(Clone)]
 struct ParkTombstone {
+    authority_epoch: Option<u32>,
     park_id: String,
     client_hex: String,
     key: String,
@@ -3753,6 +3755,7 @@ fn tombstone_park(ctx: &mut SignCtx, park: &ParkedRequest) {
         ctx.park_tombstones.remove(0);
     }
     ctx.park_tombstones.push(ParkTombstone {
+        authority_epoch: park.authority_epoch,
         park_id: park.park_id.clone(),
         client_hex: park.client_hex.clone(),
         key: heartwood_common::nip59::method_or_kind_key(&park.method, park.event_kind),
@@ -3823,6 +3826,10 @@ fn complete_parked(
     park: ParkedRequest,
     window_secs: u64,
 ) -> bool {
+    if !ctx.policy_engine.approval_is_current(park.authority_epoch) {
+        log::warn!("[relay] stale guardian approval ignored after authority changed");
+        return false;
+    }
     // The verdict covers the identity the guardian's notice named, and no
     // other: if the request now resolves to a different identity, the
     // completion meets the identity gate like any other request.
@@ -3879,6 +3886,7 @@ fn complete_parked(
     // own (the transient allow above satisfies the identity gate for exactly
     // the identity the notice named), and that identity only.
     let resume = crate::nip46_handler::Resume {
+        authority_epoch: park.authority_epoch,
         explicit_context: park.explicit_context,
         shown: heartwood_common::policy::ShownCard { card: None, identity: park.identity },
     };
@@ -5704,6 +5712,7 @@ fn handle_nip46_event(
             request.heartwood = active_context;
         }
         let park = ParkedRequest {
+            authority_epoch: ctx.policy_engine.approval_epoch(),
             park_id: ev.id.clone(),
             target_pk: *target_pk,
             client_pubkey,
@@ -7738,8 +7747,8 @@ fn dispatch_mgmt(
         // request as a withdrawn identity meets ALLOW AS again, a live
         // approve-once verdict for it is dropped, and an ask already waiting
         // on a card that relied on the approval is refused when it resumes
-        // (`common::policy::resume_decision`). The binding cannot be revoked
-        // here; `clear_client_identities` leaves it approved.
+        // (`common::policy::resume_decision`). G4 also withdraws consent for
+        // a bound identity; the binding still selects which identity is served.
         "revoke_client_identity" | "clear_client_identities" => {
             let clearing = method == "clear_client_identities";
             let slot_index = req
@@ -7763,19 +7772,28 @@ fn dispatch_mgmt(
                 .find(|slot| slot.slot_index == slot_index)
                 .ok_or_else(|| format!("no such slot: {slot_index}"))?;
             require_expected_slot_fingerprint(req, target)?;
+            let client = req.pointer("/params/client_pubkey").map(|value| {
+                let key = value.as_str().ok_or("invalid client_pubkey")?;
+                if heartwood_common::policy::decode_client_key(key).is_none()
+                    || !heartwood_common::policy::slot_authorizes(target, key)
+                    || target.client_grants.is_none() {
+                    return Err("unknown client credential");
+                }
+                Ok(key)
+            }).transpose()?;
             let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             let (revoked, changed) = match identity {
                 Some(identity) => {
                     let (revoked, changed) = ctx
                         .policy_engine
-                        .revoke_identity(master_slot, slot_index, identity)
+                        .revoke_identity(master_slot, slot_index, identity, client)
                         .ok_or_else(|| format!("no such slot: {slot_index}"))??;
                     (Some(revoked), changed)
                 }
                 None => (
                     None,
                     ctx.policy_engine
-                        .clear_identities(master_slot, slot_index)
+                        .clear_identities(master_slot, slot_index, client)
                         .ok_or_else(|| format!("no such slot: {slot_index}"))?,
                 ),
             };
@@ -8102,7 +8120,8 @@ fn dispatch_mgmt(
                     "note_wrap_v1",
                     // revoke_client_identity / clear_client_identities withdraw
                     // identity approvals from a slot without revoking it.
-                    "client_identity_revoke_v1"
+                    "client_identity_revoke_v1",
+                    "per_client_identity_consent_v1"
             ]);
             // A delegate (per-identity operator) sees only what it needs to
             // feature-detect and manage its own identity — never the
@@ -8114,6 +8133,7 @@ fn dispatch_mgmt(
                     "mode": "wifi-standalone",
                     "capabilities": capabilities,
                     "slots": ctx.policy_engine.list_slots(master_slot).len(),
+                    "client_storage_ready": ctx.policy_engine.storage_ready(master_slot),
                     "version": env!("CARGO_PKG_VERSION"),
                     "board": crate::board::BOARD,
                 }));
@@ -8129,6 +8149,7 @@ fn dispatch_mgmt(
                 "relays_live": relays_live,
                 "relays_pinned": pool.pinned.iter().map(|p| p.url.clone()).collect::<Vec<_>>(),
                 "slots": ctx.policy_engine.list_slots(master_slot).len(),
+                    "client_storage_ready": ctx.policy_engine.storage_ready(master_slot),
                 "audit": sign_audit_json(ctx),
                 // Reboot attribution: managers show "up 3h, last restart:
                 // software" so a crash-reboot is visible instead of silently
@@ -8177,7 +8198,7 @@ fn dispatch_mgmt(
 
             // A verdict resolves the park it names, on this master only.
             let park_idx = ctx.parks.iter().position(|p| {
-                heartwood_common::escalate::park_verdict_matches(
+                ctx.policy_engine.approval_is_current(p.authority_epoch) && heartwood_common::escalate::park_verdict_matches(
                     &p.park_id,
                     p.master_slot,
                     &park_id,
@@ -8189,7 +8210,7 @@ fn dispatch_mgmt(
                 .park_tombstones
                 .iter()
                 .find(|t| {
-                    heartwood_common::escalate::park_verdict_matches(
+                    ctx.policy_engine.approval_is_current(t.authority_epoch) && heartwood_common::escalate::park_verdict_matches(
                         &t.park_id,
                         t.master_slot,
                         &park_id,
@@ -8222,6 +8243,9 @@ fn dispatch_mgmt(
                 }
                 heartwood_common::escalate::VerdictAction::ApproveRemember => {
                     let policy = exact_policy_from_request(req)?;
+                    let approved_identity = park_idx
+                        .and_then(|idx| ctx.parks[idx].identity)
+                        .or_else(|| tombstone.as_ref().and_then(|t| t.identity));
                     let client_hex = park_idx
                         .map(|idx| ctx.parks[idx].client_hex.clone())
                         .or_else(|| tombstone.as_ref().map(|t| t.client_hex.clone()));
@@ -8250,6 +8274,15 @@ fn dispatch_mgmt(
                                 policy.guardian_notice_wrap,
                                 policy.bound_identity.clone(),
                             );
+                            if let Some(identity) = approved_identity {
+                                ctx.policy_engine.record_identity(master_slot, Ok(&client_hex), &identity);
+                                let remembered = ctx.policy_engine.find_slot_by_pubkey(master_slot, &client_hex)
+                                    .is_some_and(|slot| heartwood_common::policy::client_identity_approved(slot, Some(&client_hex), &identity));
+                                if !remembered {
+                                    ctx.policy_engine.restore_slot_state(snapshot);
+                                    return Err("consent_capacity: remove an unused persona approval or choose approve-once".into());
+                                }
+                            }
                             persist_slot_mutation_or_rollback(
                                 ctx,
                                 master_slot,
@@ -8263,15 +8296,11 @@ fn dispatch_mgmt(
                             );
                         }
                     }
-                    if let Some(idx) = ctx.parks.iter().position(|p| {
-                        heartwood_common::escalate::park_verdict_matches(
-                            &p.park_id,
-                            p.master_slot,
-                            &park_id,
-                            master_slot,
-                        )
-                    }) {
-                        let park = ctx.parks.remove(idx);
+                    if let Some(idx) = park_idx {
+                        let mut park = ctx.parks.remove(idx);
+                        // This same current request was just explicitly approved;
+                        // policy replacement invalidated every other old park.
+                        park.authority_epoch = ctx.policy_engine.approval_epoch();
                         // A short allow guarantees the completion dispatch is
                         // silent even where the written policy is narrower
                         // than this exact ask; the policy is the durable half.

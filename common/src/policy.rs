@@ -36,7 +36,7 @@ pub const IDENTITY_TAG_BYTES: usize = 8;
 /// the slot secret is remembered in `authorized_pubkeys` and stays auto-approved;
 /// clients are never evicted by a later pairing, so multiple devices sharing one
 /// slot (e.g. signet-app on a phone plus a desktop) all sign without prompting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ConnectSlot {
     /// Slot index (0-15).
     pub slot_index: u8,
@@ -46,54 +46,43 @@ pub struct ConnectSlot {
     pub secret: String,
     /// Hex-encoded most-recently-connected client pubkey. Always also present
     /// in `authorized_pubkeys`; kept separately for display ("who's active").
-    #[serde(default)]
     pub current_pubkey: Option<String>,
     /// Which NIP-46 methods are auto-approved for this slot.
     /// Empty means no policy-controlled method is auto-approved.
-    #[serde(default)]
     pub allowed_methods: Vec<String>,
     /// Which event kinds are auto-approved for sign_event.
-    #[serde(default)]
     pub allowed_kinds: Vec<u64>,
     /// Whether to auto-approve matching requests (true) or just OLED-notify (false).
-    #[serde(default)]
     pub auto_approve: bool,
     /// True once the user has physically approved a sign_event via button press.
-    #[serde(default)]
     pub signing_approved: bool,
     /// When true, methods and event kinds outside this slot's policy are denied
     /// instead of falling back to a physical button prompt. New remotely-managed
     /// v2 slots set this; legacy slots default false to preserve first-sign TOFU.
-    #[serde(default)]
     pub strict_permissions: bool,
     /// Every client pubkey that has paired with this slot's secret. All are
     /// auto-approvable (subject to the slot's other gates). Capped at
     /// `MAX_AUTHORIZED_PUBKEYS`. Old NVS blobs without this field deserialise
     /// to an empty vec; `current_pubkey` still matches via [`slot_authorizes`],
     /// so an already-bound client keeps working until it next re-pairs.
-    #[serde(default)]
     pub authorized_pubkeys: Vec<String>,
     /// Family-bunker C4 (2026-08-14 escalation schema §1.5): when true, an
     /// interactive (ButtonRequired) request on this slot is parked and
     /// escalated to the guardian's phone instead of running the physical
     /// button window. Default false keeps today's button behaviour.
-    #[serde(default)]
     pub escalate: bool,
     /// C4 §1.2: when true, a strict auto-deny on this slot records a
     /// petition and emits a low-priority guardian notice. The deny stays
     /// enforced throughout; the petition is purely a message.
-    #[serde(default)]
     pub petition_on_deny: bool,
     /// C5 §2.1: when true, device-emitted audit rumors for this slot's
     /// bound identity are additionally gift-wrapped to this slot's client
     /// pubkey (the child's own paired device), best effort.
-    #[serde(default)]
     pub audit_child_wrap: bool,
     /// C4/C5 guardian copy: when true, notices addressed to this slot's bound
     /// identity are additionally gift-wrapped to its current client key.
     /// Kept distinct from `audit_child_wrap`, so a dependant's audit reader
     /// never becomes an implicit guardian-notice recipient.
-    #[serde(default)]
     pub guardian_notice_wrap: bool,
     /// The identity (64-char hex pubkey) this pairing is bound to, when the
     /// operator recorded one. The C5 child-wrap scan keys off it: a
@@ -104,7 +93,6 @@ pub struct ConnectSlot {
     /// gate ([`identity_approved`]) treats the binding as approved on legacy
     /// and strict slots alike, without a button. Change it only through
     /// [`set_slot_bound_identity`], which clears the approved list.
-    #[serde(default)]
     pub bound_identity: Option<String>,
     /// Identities the owner has physically approved this pairing to sign,
     /// encrypt or decrypt as: [`identity_tag`]s (16 lowercase hex chars each)
@@ -113,19 +101,15 @@ pub struct ConnectSlot {
     /// prompt, or escalated. Serialised as `ids` to keep the NVS blob small;
     /// old blobs without it deserialise empty, seeded lazily: `bound_identity`
     /// counts as approved and anything else prompts once.
-    #[serde(default, rename = "ids", skip_serializing_if = "String::is_empty")]
     pub approved_identities: String,
     /// True once any client key has ever been bound to this slot. A key the
     /// slot never authorised binding to a slot that was bound before is a new
     /// holder of the credential and clears `approved_identities`, even when
     /// the previous key has since been removed (`current_pubkey` is `None`).
     /// Old blobs default to false: their first bind keeps what it has.
-    #[serde(default, rename = "wb", skip_serializing_if = "is_false")]
     pub was_bound: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
+    /// Client-specific authority. Persistence uses the downgrade-safe slot codec.
+    pub client_grants: Option<crate::client_grants::GrantSnapshot>,
 }
 
 /// A client's approval policy for a specific master.
@@ -385,11 +369,41 @@ fn lower_hex_into(bytes: &[u8], out: &mut [u8]) {
 /// field existed) approves nothing but the binding, so the first request after
 /// upgrade prompts once for whatever identity it uses.
 pub fn identity_approved(slot: &ConnectSlot, pubkey: &[u8; 32]) -> bool {
+    if slot.client_grants.is_some() { return false; } // A G4 decision requires a client key.
     let mut full = [0u8; 64];
     lower_hex_into(pubkey, &mut full);
     let tag = &full[..IDENTITY_TAG_BYTES * 2];
     slot.bound_identity.as_deref().map(str::as_bytes) == Some(&full[..])
         || slot.approved_identities.as_bytes().chunks(IDENTITY_TAG_BYTES * 2).any(|t| t == tag)
+}
+
+/// Resolve persona consent for the actual authenticated client credential.
+pub fn client_identity_approved(slot: &ConnectSlot, client: Option<&str>, identity: &[u8; 32]) -> bool {
+    match &slot.client_grants {
+        None => identity_approved(slot, identity),
+        Some(grants) => client.and_then(decode_client_key).is_some_and(|key| grants.allows(&key, identity)),
+    }
+}
+
+pub fn decode_client_key(key: &str) -> Option<[u8; 32]> {
+    if key.len() != 64 || !key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) { return None; }
+    crate::hex::hex_decode(key).ok()?.try_into().ok()
+}
+
+/// Only a physically/operator approved request may call this mutation.
+pub fn record_client_identity(slot: &mut ConnectSlot, client: &str, identity: &[u8; 32]) -> bool {
+    match &mut slot.client_grants {
+        None => record_approved_identity(slot, identity),
+        Some(grants) => decode_client_key(client).and_then(|key| grants.approve(&key, identity).ok()).unwrap_or(false),
+    }
+}
+
+/// The card must say approve-once when remembered-consent capacity is full.
+pub fn can_record_client_identity(slot: &ConnectSlot) -> bool {
+    slot.client_grants.as_ref().map_or(
+        slot.approved_identities.len() < MAX_APPROVED_IDENTITIES * IDENTITY_TAG_BYTES * 2,
+        |g| g.grant_count() < 16,
+    )
 }
 
 /// Fold identity approval into a policy tier: an unapproved identity raises
@@ -408,6 +422,7 @@ pub fn apply_identity_gate(tier: ApprovalTier, approved: bool) -> ApprovalTier {
 /// full list records nothing either: identities beyond it keep prompting on
 /// every request, and nothing is ever evicted.
 pub fn record_approved_identity(slot: &mut ConnectSlot, pubkey: &[u8; 32]) -> bool {
+    if slot.client_grants.is_some() { return false; }
     let tag_chars = IDENTITY_TAG_BYTES * 2;
     if identity_approved(slot, pubkey)
         || slot.approved_identities.len() >= MAX_APPROVED_IDENTITIES * tag_chars
@@ -439,6 +454,7 @@ pub fn set_slot_bound_identity(slot: &mut ConnectSlot, bound_identity: Option<St
     }
     slot.bound_identity = bound_identity;
     slot.approved_identities.clear();
+    if let Some(grants) = &mut slot.client_grants { grants.clear_identities(); }
     true
 }
 
@@ -546,6 +562,9 @@ pub fn revoke_approved_identity(slot: &mut ConnectSlot, pubkey: &[u8; 32]) -> Re
 /// [`revoke_approved_identity`] for a pubkey or a tag. A tag that matches the
 /// binding's tag is refused like the binding itself.
 pub fn revoke_approved_identity_ref(slot: &mut ConnectSlot, identity: &IdentityRef) -> RevokeIdentity {
+    if slot.client_grants.is_some() {
+        return revoke_client_identity_ref(slot, None, identity);
+    }
     if names_bound_identity(slot, identity) {
         return RevokeIdentity::Bound;
     }
@@ -571,10 +590,40 @@ pub fn revoke_approved_identity_ref(slot: &mut ConnectSlot, identity: &IdentityR
     }
 }
 
+/// Withdraw consent for a selected credential, or all credentials in the slot.
+/// A tag deliberately withdraws every matching exact or grandfathered identity.
+pub fn revoke_client_identity_ref(slot: &mut ConnectSlot, client: Option<&str>, identity: &IdentityRef) -> RevokeIdentity {
+    let Some(grants) = &mut slot.client_grants else { return revoke_approved_identity_ref(slot, identity); };
+    let clients = match client { Some(key) => decode_client_key(key).into_iter().collect(), None => grants.client_keys() };
+    let mut changed = false;
+    for key in clients {
+        let identities = match identity {
+            IdentityRef::Pubkey(pubkey) => vec![*pubkey],
+            IdentityRef::Tag(tag) => {
+                let mut identities: Vec<_> = grants.approved_keys(&key).into_iter().filter(|id| identity.matches(id)).collect();
+                if let Ok(bytes) = crate::hex::hex_decode(core::str::from_utf8(tag).unwrap_or("")) {
+                    if bytes.len() == 8 {
+                        let mut placeholder = [0u8; 32];
+                        placeholder[..8].copy_from_slice(&bytes);
+                        identities.push(placeholder);
+                    }
+                }
+                identities
+            }
+        };
+        for pubkey in identities { changed |= grants.revoke_identity(&key, &pubkey).unwrap_or(false); }
+    }
+    if changed { RevokeIdentity::Removed } else { RevokeIdentity::Absent }
+}
+
 /// Withdraw every recorded identity approval from a slot. The binding, if any,
 /// stays approved: change it through [`set_slot_bound_identity`]. True when
 /// the list changed.
 pub fn clear_approved_identities(slot: &mut ConnectSlot) -> bool {
+    if let Some(grants) = &mut slot.client_grants {
+        slot.approved_identities.clear();
+        return grants.clear_identities();
+    }
     if slot.approved_identities.is_empty() {
         return false;
     }
@@ -600,7 +649,7 @@ pub fn verdict_withdrawn(
     slot_authorizes(slot, client_pubkey)
         && match revoked {
             Some(revoked) => revoked.matches(granted),
-            None => !is_bound_identity(slot, granted),
+            None => slot.client_grants.is_some() || !is_bound_identity(slot, granted),
         }
 }
 
@@ -652,6 +701,7 @@ pub struct GateRequest<'a> {
     /// A remote client (relay author, encrypted USB client key or a
     /// bridge-injected client). Direct USB is never gated here.
     pub has_client: bool,
+    pub client_pubkey: Option<&'a str>,
     /// The client's slot; `None` for an unbound client.
     pub slot: Option<&'a ConnectSlot>,
     pub method: &'a str,
@@ -710,7 +760,7 @@ pub fn gate_request(request: &GateRequest<'_>) -> Gate {
             Gate::Card(CardKind::ListIds)
         };
     }
-    let record = slot.approved_identities.len() < MAX_APPROVED_IDENTITIES * IDENTITY_TAG_BYTES * 2;
+    let record = can_record_client_identity(slot);
     if switch {
         return if !request.verdict && request.tier == ApprovalTier::ButtonRequired {
             Gate::Card(CardKind::SwitchTo { record })
@@ -724,7 +774,7 @@ pub fn gate_request(request: &GateRequest<'_>) -> Gate {
     let Some(identity) = request.identity else {
         return Gate::Deny;
     };
-    if request.verdict || identity_approved(slot, identity) {
+    if request.verdict || client_identity_approved(slot, request.client_pubkey, identity) {
         Gate::Allow
     } else if method == "get_public_key" {
         Gate::Card(CardKind::NpubAs)
@@ -839,6 +889,10 @@ pub fn card_batch_marker(card: Option<CardKind>) -> &'static str {
 /// method ceiling is re-validated. Identity approvals and the bound flag are
 /// kept. Returns whether signing was stripped.
 pub fn sanitise_imported_slot(slot: &mut ConnectSlot) -> Result<bool, &'static str> {
+    if slot.client_grants.is_none() {
+        slot.client_grants = Some(crate::client_grants::GrantSnapshot::from_legacy(slot).map_err(|_| "invalid saved client authority")?);
+    }
+    clear_approved_identities(slot);
     let had_signing =
         slot.signing_approved || slot.allowed_methods.iter().any(|m| m == "sign_event");
     slot.signing_approved = false;
@@ -925,6 +979,39 @@ pub fn upsert_policy(policies: &mut Vec<ClientPolicy>, policy: ClientPolicy) {
 // ConnectSlot helpers (testable on host, used by firmware PolicyEngine)
 // ---------------------------------------------------------------------------
 
+/// Validate and migrate one complete master's table before serving requests.
+/// Existing full-format snapshots are never reconstructed from legacy tags.
+/// All candidate snapshots are prepared before any live slot is mutated.
+pub fn validate_slot_table(slots: &[ConnectSlot]) -> Result<(), &'static str> {
+    if slots.len() > MAX_CONNECT_SLOTS as usize { return Err("too many slots"); }
+    for (position, slot) in slots.iter().enumerate() {
+        if slots[..position].iter().any(|s| s.slot_index == slot.slot_index || s.secret == slot.secret) {
+            return Err("duplicate slot or credential");
+        }
+        crate::slot_codec::validate_slot(slot)?;
+    }
+    Ok(())
+}
+
+pub fn migrate_client_grants(slots: &mut [ConnectSlot]) -> Result<bool, &'static str> {
+    validate_slot_table(slots)?;
+    let mut prepared = Vec::new();
+    for slot in slots.iter() {
+        prepared.push(if slot.client_grants.is_none() {
+            Some(crate::client_grants::GrantSnapshot::from_legacy(slot).map_err(|_| "invalid legacy consent")?)
+        } else { None });
+    }
+    let mut changed = false;
+    for (slot, snapshot) in slots.iter_mut().zip(prepared) {
+        if let Some(snapshot) = snapshot {
+            slot.client_grants = Some(snapshot);
+            slot.approved_identities.clear();
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// True if `pubkey` is authorised for this slot -- either the current binding
 /// or any pubkey that has previously paired with the slot secret.
 pub fn slot_authorizes(slot: &ConnectSlot, pubkey: &str) -> bool {
@@ -1009,6 +1096,7 @@ pub fn remove_authorized_pubkey(
     }
     let before = slot.authorized_pubkeys.len();
     slot.authorized_pubkeys.retain(|candidate| candidate != pubkey);
+    if let (Some(grants), Some(key)) = (&mut slot.client_grants, decode_client_key(pubkey)) { let _ = grants.remove_client(&key); }
     if slot.authorized_pubkeys.len() < before {
         RemoveAuthorizedPubkey::Removed
     } else {
@@ -1020,7 +1108,18 @@ pub fn remove_authorized_pubkey(
 /// `authorized_pubkeys`. The outgoing `current_pubkey` is preserved in the set,
 /// so an earlier device stays auto-approved instead of being evicted. The set
 /// is de-duplicated and FIFO-capped at [`MAX_AUTHORIZED_PUBKEYS`].
-pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) {
+pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
+    if let Some(grants) = &mut slot.client_grants {
+        let Some(key) = decode_client_key(pubkey) else { return false; };
+        if grants.add_client(key).is_err() { return false; }
+        slot.was_bound = true;
+        if let Some(previous) = slot.current_pubkey.take() {
+            if !slot.authorized_pubkeys.contains(&previous) { slot.authorized_pubkeys.push(previous); }
+        }
+        if !slot.authorized_pubkeys.iter().any(|p| p == pubkey) { slot.authorized_pubkeys.push(pubkey.to_string()); }
+        slot.current_pubkey = Some(pubkey.to_string());
+        return true;
+    }
     // A client key this slot has never authorised, replacing one it had, is a
     // new holder of the credential: identity approvals were given to the old
     // one and do not carry over. A key that paired before keeps them, so two
@@ -1038,6 +1137,7 @@ pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) {
     }
     push_authorized(slot, pubkey.to_string());
     slot.current_pubkey = Some(pubkey.to_string());
+    true
 }
 
 /// Move `pubkey` onto exactly one slot within a master, then authorise it there.
@@ -1056,6 +1156,8 @@ pub fn authorize_pubkey_on_unique_slot(
         return false;
     };
 
+    let mut target = slots[target_pos].clone();
+    if !authorize_pubkey_on_slot(&mut target, pubkey) { return false; }
     for (position, slot) in slots.iter_mut().enumerate() {
         if position == target_pos {
             continue;
@@ -1064,9 +1166,10 @@ pub fn authorize_pubkey_on_unique_slot(
             slot.current_pubkey = None;
         }
         slot.authorized_pubkeys.retain(|candidate| candidate != pubkey);
+        if let (Some(grants), Some(key)) = (&mut slot.client_grants, decode_client_key(pubkey)) { let _ = grants.remove_client(&key); }
     }
 
-    authorize_pubkey_on_slot(&mut slots[target_pos], pubkey);
+    slots[target_pos] = target;
     true
 }
 
@@ -1116,6 +1219,9 @@ pub fn remove_ambiguous_pubkeys(slots: &mut [ConnectSlot]) -> bool {
         let before = slot.authorized_pubkeys.len();
         slot.authorized_pubkeys
             .retain(|pubkey| !ambiguous.iter().any(|candidate| candidate == pubkey));
+        if let Some(grants) = &mut slot.client_grants {
+            for key in ambiguous.iter().filter_map(|k| decode_client_key(k)) { let _ = grants.remove_client(&key); }
+        }
         changed |= slot.authorized_pubkeys.len() != before;
     }
     changed
@@ -1188,6 +1294,7 @@ pub fn next_slot_index(slots: &[ConnectSlot]) -> Option<u8> {
 pub fn redact_slot(slot: &ConnectSlot) -> ConnectSlot {
     ConnectSlot {
         secret: String::new(),
+        client_grants: None,
         ..slot.clone()
     }
 }
@@ -1545,6 +1652,7 @@ mod tests {
             bound_identity: None,
             approved_identities: String::new(),
             was_bound: false,
+            client_grants: None,
         }
     }
 
@@ -1667,6 +1775,7 @@ mod tests {
                 grant_slot_method(&mut slot, "heartwood_list_identities");
             }
             let request = GateRequest {
+                client_pubkey: None,
                 has_client,
                 slot: (!unbound).then_some(&slot),
                 method,
@@ -1750,6 +1859,7 @@ mod tests {
         slot.allowed_methods = vec!["sign_event".into()];
         slot.signing_approved = true;
         let fresh = GateRequest {
+            client_pubkey: None,
             has_client: true,
             slot: Some(&slot),
             method: "sign_event",
@@ -1770,6 +1880,7 @@ mod tests {
     fn scoped_identity_that_cannot_be_derived_is_refused() {
         let slot = trusted_legacy_slot();
         let request = GateRequest {
+            client_pubkey: None,
             has_client: true,
             slot: Some(&slot),
             method: "sign_event",
@@ -1821,6 +1932,7 @@ mod tests {
     fn switch_card_only_where_a_press_was_already_needed() {
         let slot = trusted_legacy_slot();
         let request = GateRequest {
+            client_pubkey: None,
             has_client: true,
             slot: Some(&slot),
             method: "heartwood_switch",
@@ -1855,6 +1967,7 @@ mod tests {
         // identity the notice named.
         let slot = trusted_legacy_slot();
         let request = GateRequest {
+            client_pubkey: None,
             has_client: true,
             slot: Some(&slot),
             method: "heartwood_note_send",
@@ -1891,6 +2004,7 @@ mod tests {
             ("sign_event", ApprovalTier::AutoApprove),
         ] {
             let request = GateRequest {
+                client_pubkey: None,
                 has_client: true,
                 slot: Some(&slot),
                 method,
@@ -1993,6 +2107,7 @@ mod tests {
         let shown = ShownCard { card: Some(CardKind::AllowAs { record: true }), identity: Some(IDENTITY_A) };
         for ask in 0..8 {
             let request = GateRequest {
+                client_pubkey: None,
                 has_client: true,
                 slot: Some(&slot),
                 method: "nip44_decrypt",
@@ -2054,6 +2169,7 @@ mod tests {
 
     fn gate_for(slot: &ConnectSlot, method: &str, tier: ApprovalTier, identity: &[u8; 32], verdict: bool) -> Gate {
         gate_request(&GateRequest {
+            client_pubkey: None,
             has_client: true,
             slot: Some(slot),
             method,
@@ -2412,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn a_backup_of_a_granted_slot_imports_with_its_grant_and_identities() {
+    fn a_backup_restore_retains_discovery_but_requires_new_identity_consent() {
         let mut slot = trusted_legacy_slot();
         authorize_pubkey_on_slot(&mut slot, &sample_pubkey('a'));
         assert!(grant_slot_method(&mut slot, "heartwood_list_identities"));
@@ -2438,7 +2554,8 @@ mod tests {
         assert_eq!(sanitise_imported_slot(slot), Ok(true));
         assert!(slot.allowed_methods.iter().any(|m| m == "heartwood_list_identities"));
         assert!(!slot.allowed_methods.iter().any(|m| m == "sign_event"));
-        assert!(identity_approved(slot, &IDENTITY_A));
+        assert!(!client_identity_approved(slot, Some(&sample_pubkey('a')), &IDENTITY_A));
+        assert!(slot.client_grants.is_some());
         assert!(slot.was_bound);
         // An unknown method still fails the whole import.
         slot.allowed_methods.push("delete_everything".into());

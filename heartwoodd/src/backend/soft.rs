@@ -782,6 +782,7 @@ impl SigningBackend for SoftBackend {
                 bound_identity: None,
                 approved_identities: String::new(),
                 was_bound: false,
+                client_grants: None,
             };
             m.connection_slots.push(slot.clone());
             Self::persist(state, &path)?;

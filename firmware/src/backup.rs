@@ -279,6 +279,19 @@ pub fn handle_import(
         }
     }
 
+    log::info!("Backup restore requires renewed persona consent; {signing_stripped} signing grants stripped");
+    for master in &mut masters {
+        heartwood_common::policy::remove_ambiguous_pubkeys(&mut master.connection_slots);
+        if heartwood_common::policy::migrate_client_grants(&mut master.connection_slots).is_err() {
+            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+            return;
+        }
+    }
+    if masters.iter().enumerate().any(|(i, m)| masters[..i].iter().any(|previous| previous.pubkey == m.pubkey)) {
+        protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+        return;
+    }
+
     // Match backup masters to device masters by pubkey. The device slot, not
     // the backup's slot number, is where the restore lands.
     let matched: Vec<(u8, &BackupMaster)> = masters
@@ -310,28 +323,8 @@ pub fn handle_import(
         .iter()
         .any(|(device_slot, _)| !policy_engine.list_slots(*device_slot).is_empty());
     if restore_slots > 0 || has_existing {
-        let mut labels: Vec<&str> = Vec::new();
-        for (_, bm) in &matched {
-            for slot in &bm.connection_slots {
-                labels.push(slot.label.as_str());
-            }
-        }
-        let preview = if labels.len() <= 2 {
-            labels.join(", ")
-        } else {
-            format!("{}, +{}", labels[..2].join(", "), labels.len() - 2)
-        };
         let prompt = if restore_slots > 0 {
-            let suffix = if signing_stripped > 0 {
-                format!(" -{signing_stripped} sign")
-            } else if has_existing {
-                " (overwrites)".to_string()
-            } else {
-                String::new()
-            };
-            let budget = 25usize.saturating_sub(suffix.len()).max(8);
-            let preview: String = preview.chars().take(budget).collect();
-            format!("Restore {restore_slots} slots?\n{preview}{suffix}")
+            format!("Restore {restore_slots} slots?\nRenew app consent")
         } else {
             // A matched master with no slots in the backup has its pairings
             // wiped by the replace below — the prompt must exist for that.
@@ -354,14 +347,35 @@ pub fn handle_import(
         }
     }
 
-    // Write connection slots to the policy engine and persist to NVS.
+    // Retain rollback points for every attempted master. NVS is atomic per
+    // key, not across masters: never report a partially persisted restore as
+    // complete. A failed read-back may have committed, so compensate durably.
+    let mut restored_snapshots = Vec::new();
     for (device_slot, backup_master) in &matched {
-        // Replace all slots for this master with the sanitised backup data.
-        let slots = policy_engine.slots_mut(*device_slot);
-        slots.clear();
-        slots.extend(backup_master.connection_slots.iter().cloned());
-        policy_engine.slots_dirty = true;
-        policy_engine.persist_slots(nvs, *device_slot);
+        // A corrupt/quarantined table needs an explicit empty recovery baseline,
+        // verified before serving any authority. This is after the physical hold.
+        let recovered = policy_engine.recover_pairings_for_backup_restore(nvs, *device_slot);
+        if recovered {
+            restored_snapshots.push(policy_engine.snapshot_slot_state(*device_slot));
+            let slots = policy_engine.slots_mut(*device_slot);
+            slots.clear();
+            slots.extend(backup_master.connection_slots.iter().cloned());
+            policy_engine.slots_dirty = true;
+        }
+        if !recovered || !policy_engine.persist_slots(nvs, *device_slot) {
+            let mut rollback_ok = true;
+            for snapshot in restored_snapshots.into_iter().rev() {
+                rollback_ok &= policy_engine.restore_slot_state_durably(nvs, snapshot);
+            }
+            log::error!("Backup import failed: slot persistence; rollback verified={rollback_ok}");
+            crate::oled::show_error(display, if rollback_ok {
+                "Restore failed\nStorage error"
+            } else {
+                "Storage fault\nUse USB recovery"
+            });
+            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+            return;
+        }
 
         log::info!(
             "Backup import: restored {} slots for master slot {}",

@@ -328,6 +328,7 @@ mod tests {
             bound_identity: None,
             approved_identities: String::new(),
             was_bound: false,
+            client_grants: None,
         }
     }
 

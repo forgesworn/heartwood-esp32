@@ -49,6 +49,9 @@ pub mod policy;
 #[cfg(feature = "nip46")]
 pub mod client_grants;
 
+#[cfg(feature = "nip46")]
+pub mod slot_codec;
+
 pub mod net_config;
 
 pub mod mgmt;
@@ -123,3 +126,13 @@ pub mod restore;
 
 #[cfg(feature = "mnemonic")]
 pub mod recovery_words;
+
+// Compile the real firmware policy against fault-injected storage in host CI.
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+extern crate self as esp_idf_svc;
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+extern crate self as heartwood_common;
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+mod firmware_policy_host_tests;
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+pub use firmware_policy_host_tests::nvs;

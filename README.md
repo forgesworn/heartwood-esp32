@@ -165,13 +165,18 @@ scp /tmp/heartwood-esp32.bin pi-host:/tmp/
 # On the Pi: stop any process holding the serial port, then flash.
 # PORT=/dev/ttyACM0 for V4, PORT=/dev/ttyUSB0 for V3.
 PORT=/dev/ttyACM0
+# On a Heltec V4 with native USB, watchdog-reset restored automatic startup
+# after an app-only flash (verified once on beta.13); default hard-reset left
+# that unit unresponsive until a physical reset.
+# Use hard-reset for CP2102-connected V3 (not physically checked in this run).
+AFTER_RESET=watchdog-reset  # V4; set to hard-reset for V3
 sudo systemctl stop <heartwood-services>
 sudo fuser -k "$PORT"
-python3 -m esptool --chip esp32s3 --port "$PORT" --before default-reset \
+python3 -m esptool --chip esp32s3 --port "$PORT" --before default-reset --after "$AFTER_RESET" \
   write-flash 0x10000 /tmp/heartwood-esp32.bin
 
 # Erase otadata to force boot from ota_0
-python3 -m esptool --chip esp32s3 --port "$PORT" --before default-reset \
+python3 -m esptool --chip esp32s3 --port "$PORT" --before default-reset --after "$AFTER_RESET" \
   erase-region 0xd000 0x2000
 ```
 

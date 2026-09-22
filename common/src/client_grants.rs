@@ -2,8 +2,9 @@
 
 //! Isolated G4 per-client persona consent state machine.
 //!
-//! **NOT wired to firmware. NOT durable permission.** This is a pure
-//! `no_std + alloc` prerequisite. Callers must still enforce NIP-46 methods,
+//! The firmware stores `GrantSnapshot` alongside each pairing, through the
+//! restrictive downgrade codec. This pure `no_std + alloc` module covers
+//! persona consent only. Callers must still enforce NIP-46 methods,
 //! event kinds, sensitive rules, guardian escalation, and all persistence.
 //!
 //! `GrantSet::from_legacy` snapshots existing firmware authority. The caller
@@ -16,13 +17,17 @@
 //! error. No persistent anti-replay claim is made. No secret material is
 //! stored here.
 //!
-//! Production snapshot/restore is unsupported. `GrantSet` implements `Clone`
-//! only in unit tests so failed mutations can be compared with their input.
+//! `GrantSnapshot` persists consent without tickets or generation counters.
+//! Restoring a `GrantSet` requires a new caller-supplied lifetime. The firmware
+//! additionally invalidates deferred requests whenever authority changes.
 //!
 //! Limits (8 clients, 16 explicit grants, 16 legacy tags) are provisional;
 //! the final storage schema and caps are not promised.
 
 use alloc::vec::Vec;
+
+mod snapshot;
+pub use snapshot::GrantSnapshot;
 
 const MAX_CLIENTS: usize = 8;
 const MAX_EXPLICIT_GRANTS: usize = 16;
@@ -587,6 +592,7 @@ mod tests {
             bound_identity: None,
             approved_identities: String::new(),
             was_bound: false,
+            client_grants: None,
         }
     }
 

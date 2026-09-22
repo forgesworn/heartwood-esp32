@@ -29,6 +29,9 @@ cbc = { version = "0.1", default-features = false, features = ["alloc", "block-p
 # no_std for the lx106; the `alloc` feature (pulled by `mnemonic`) gives
 # to_seed/from_entropy without std.
 bip39 = { version = "2", optional = true, default-features = false }
+# Unify bip39's existing hash dependency onto its upstream compact routines.
+# Same digests and derivation; avoid the unrolled SHA-512 code exceeding OTA.
+bitcoin_hashes = { version = "0.14", optional = true, default-features = false, features = ["small-hash"] }
 # OTA release-signature scheme (ed25519 over the image digest). Pure Rust and
 # no_std; `opt_size` trades verify speed for code size — the Heltec app must
 # still fit its 2 MB OTA slot.
@@ -43,10 +46,13 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], opti
 ledger_secure_sdk_sys = { version = "1.16", optional = true }
 
 [dev-dependencies]
+log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [features]
+# Upstream size-focused SHA-2 implementation for constrained firmware images.
+compact-hashes = ["sha2/force-soft-compact"]
 default = ["k256-backend"]
 k256-backend = ["dep:k256"]
 secp256k1-backend = ["dep:secp256k1"]
@@ -63,7 +69,7 @@ nip04 = ["dep:aes", "dep:cbc", "dep:base64"]
 # so it derives the same key on either curve backend. bip39 is used with ZERO of
 # its features (mnemonic.rs uses the `_normalized` APIs) — that keeps the giant
 # unicode-normalization tables out, which the bare-metal lx106's DRAM can't hold.
-mnemonic = ["dep:bip39"]
+mnemonic = ["dep:bip39", "dep:bitcoin_hashes"]
 # Back-compat alias: BIP-39 on the secp256k1 backend (the WiFi firmware + CI path).
 mnemonic-gen = ["mnemonic", "secp256k1-backend"]
 # LUD-25 seed-recoverable note secrets (m/139'). Reuses the BIP-32 scalar step
@@ -84,4 +90,4 @@ device-identity = ["dep:ed25519-compact"]
 # PIN-derived seed encryption at rest (P5). Pulls PBKDF2 + reuses chacha20.
 seed-encrypt = ["dep:pbkdf2", "dep:chacha20"]
 # Convenience alias for secp256k1 backend with full feature set (used by firmware)
-firmware = ["secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen", "ota-sign", "seed-encrypt", "cash"]
+firmware = ["compact-hashes", "secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen", "ota-sign", "seed-encrypt", "cash"]

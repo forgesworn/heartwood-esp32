@@ -4,6 +4,14 @@
 // The slot -- not the ephemeral client pubkey -- is the stable identity.
 
 use std::time::Instant;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+// Per-process stamps also distinguish replaced PolicyEngine instances. Pending
+// requests never survive a device reboot. Exhaustion disables deferred approval.
+static NEXT_APPROVAL_EPOCH: AtomicU32 = AtomicU32::new(1);
+fn next_approval_epoch() -> Option<u32> {
+    NEXT_APPROVAL_EPOCH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).ok()
+}
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
@@ -11,7 +19,7 @@ use heartwood_common::policy::{
     authorize_pubkey_on_unique_slot, clear_approved_identities, evaluate_slot_policy,
     find_slot_by_pubkey,
     find_slot_by_pubkey_mut, find_slot_by_secret, gate_request, grant_slot_method,
-    grant_slot_signing, next_slot_index, record_approved_identity, remove_ambiguous_pubkeys,
+    grant_slot_signing, next_slot_index, record_client_identity, remove_ambiguous_pubkeys,
     remove_authorized_pubkey, set_slot_bound_identity, strict_slot_denies_method,
     verdict_covers_identity, verdict_withdrawn, IdentityRef,
     validate_exact_slot_policy, ApprovalTier, ConnectSlot, ExactSlotPolicy, Gate, GateRequest,
@@ -120,6 +128,8 @@ pub struct PolicyEngine {
     pub bridge_authenticated: bool,
     /// Dirty flag: slots changed since last NVS write.
     pub slots_dirty: bool,
+    approval_epoch: Option<u32>,
+    quarantined_masters: Vec<u8>,
     /// Monotonic counter stamped onto sessions on every access — recency
     /// order for LRU eviction without depending on clock resolution.
     session_seq: u64,
@@ -135,9 +145,35 @@ impl PolicyEngine {
             sessions: Vec::new(),
             bridge_authenticated: false,
             slots_dirty: false,
+            approval_epoch: next_approval_epoch(),
+            quarantined_masters: Vec::new(),
             session_seq: 0,
             transient_allows: Vec::new(),
         }
+    }
+
+    pub fn storage_ready(&self, master: u8) -> bool {
+        !self.quarantined_masters.contains(&master)
+    }
+
+    fn quarantine(&mut self, master: u8) {
+        if !self.quarantined_masters.contains(&master) { self.quarantined_masters.push(master); }
+        self.invalidate_approvals();
+    }
+
+    pub fn approval_epoch(&self) -> Option<u32> {
+        self.approval_epoch
+    }
+
+    pub fn approval_is_current(&self, epoch: Option<u32>) -> bool {
+        epoch.is_some() && epoch == self.approval_epoch
+    }
+
+    /// Withdraw pending device/guardian approvals before authority can move.
+    /// Rollback never restores a stamp: a revoked request cannot be revived.
+    pub fn invalidate_approvals(&mut self) {
+        self.approval_epoch = next_approval_epoch();
+        self.transient_allows.clear();
     }
 
     /// Install a C4 approve-once window for `(master, client, key)`. A fresh
@@ -310,6 +346,7 @@ impl PolicyEngine {
         let slot = self.find_slot_by_pubkey(master_slot, client_pubkey);
         let key = heartwood_common::nip59::method_or_kind_key(method.as_str(), event_kind);
         gate_request(&GateRequest {
+            client_pubkey: Some(client_pubkey),
             has_client,
             slot,
             method: method_name,
@@ -340,7 +377,10 @@ impl PolicyEngine {
                 Ok(client_pubkey) => find_slot_by_pubkey_mut(&mut ms.slots, client_pubkey),
                 Err(index) => ms.slots.iter_mut().find(|s| s.slot_index == index),
             })
-            .is_some_and(|slot| record_approved_identity(slot, identity));
+            .is_some_and(|target| {
+                let client = match slot { Ok(key) => Some(key.to_string()), Err(_) => target.current_pubkey.clone() };
+                client.is_some_and(|key| record_client_identity(target, &key, identity))
+            });
         self.slots_dirty |= changed;
         changed
     }
@@ -408,6 +448,7 @@ impl PolicyEngine {
 
     /// Clear all state (bridge disconnected).
     pub fn clear(&mut self) {
+        self.invalidate_approvals();
         self.master_slots.clear();
         self.sessions.clear();
         self.bridge_authenticated = false;
@@ -420,6 +461,7 @@ impl PolicyEngine {
 
     /// List all slots for a master slot.
     pub fn list_slots(&self, master_slot: u8) -> &[ConnectSlot] {
+        if !self.storage_ready(master_slot) { return &[]; }
         self.master_slots
             .iter()
             .find(|ms| ms.master_slot == master_slot)
@@ -429,6 +471,7 @@ impl PolicyEngine {
 
     /// Mutable access to the slot vec for a master slot, creating the entry if absent.
     pub(crate) fn slots_mut(&mut self, master_slot: u8) -> &mut Vec<ConnectSlot> {
+        self.invalidate_approvals();
         if !self
             .master_slots
             .iter()
@@ -462,6 +505,7 @@ impl PolicyEngine {
 
     /// Restore a request's slot state after its durable write failed.
     pub fn restore_slot_state(&mut self, snapshot: SlotStateSnapshot) {
+        self.invalidate_approvals();
         match snapshot.slots {
             Some(slots) => match self
                 .master_slots
@@ -498,6 +542,7 @@ impl PolicyEngine {
         self.slots_dirty = true;
         let restored = self.persist_slots(nvs, master_slot);
         self.slots_dirty = if restored { prior_dirty } else { true };
+        if !restored { self.quarantine(master_slot); }
         restored
     }
 
@@ -528,6 +573,7 @@ impl PolicyEngine {
             bound_identity: None,
             approved_identities: String::new(),
             was_bound: false,
+            client_grants: Some(heartwood_common::client_grants::GrantSnapshot::empty()),
         };
         self.slots_mut(master_slot).push(new_slot);
         self.slots_dirty = true;
@@ -566,6 +612,7 @@ impl PolicyEngine {
             bound_identity: policy.bound_identity,
             approved_identities: String::new(),
             was_bound: false,
+            client_grants: Some(heartwood_common::client_grants::GrantSnapshot::empty()),
         });
         self.slots_dirty = true;
         Some(slot_index)
@@ -715,12 +762,18 @@ impl PolicyEngine {
         master_slot: u8,
         slot_index: u8,
         identity: &str,
+        client: Option<&str>,
     ) -> Option<Result<(IdentityRef, bool), &'static str>> {
         let slot = self
             .slots_mut(master_slot)
             .iter_mut()
             .find(|slot| slot.slot_index == slot_index)?;
-        let outcome = heartwood_common::mgmt::revoke_client_identity(slot, identity);
+        let outcome = if let Some(client) = client {
+            heartwood_common::policy::parse_identity_ref(identity).map(|id| {
+                let result = heartwood_common::policy::revoke_client_identity_ref(slot, Some(client), &id);
+                (id, result == heartwood_common::policy::RevokeIdentity::Removed)
+            })
+        } else { heartwood_common::mgmt::revoke_client_identity(slot, identity) };
         if matches!(outcome, Ok((_, true))) {
             self.slots_dirty = true;
         }
@@ -729,12 +782,18 @@ impl PolicyEngine {
 
     /// `clear_client_identities`: withdraw every recorded identity approval
     /// from a slot, keeping its binding. `None` for no such slot.
-    pub fn clear_identities(&mut self, master_slot: u8, slot_index: u8) -> Option<bool> {
+    pub fn clear_identities(&mut self, master_slot: u8, slot_index: u8, client: Option<&str>) -> Option<bool> {
         let slot = self
             .slots_mut(master_slot)
             .iter_mut()
             .find(|slot| slot.slot_index == slot_index)?;
-        let changed = clear_approved_identities(slot);
+        let changed = match client {
+            None => clear_approved_identities(slot),
+            Some(client) => {
+                let key = heartwood_common::policy::decode_client_key(client)?;
+                slot.client_grants.as_mut()?.clear_client(&key).ok()?
+            }
+        };
         self.slots_dirty |= changed;
         Some(changed)
     }
@@ -831,6 +890,7 @@ impl PolicyEngine {
     /// torn mixture. Exact immediate read-back proves which desired value is
     /// present; callers compensate with their prior snapshot when it does not.
     pub fn persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
+        if !self.storage_ready(master_slot) { return false; }
         if !self.slots_dirty {
             return true;
         }
@@ -839,6 +899,10 @@ impl PolicyEngine {
             .master_slots
             .iter()
             .find(|ms| ms.master_slot == master_slot);
+        if ms.is_some_and(|m| heartwood_common::policy::validate_slot_table(&m.slots).is_err()) {
+            log::error!("Invalid slot table for master {master_slot}; not written");
+            return false;
+        }
         let persisted = match ms {
             Some(ms) => match serde_json::to_string(&ms.slots) {
                 // A table the boot loader could not read back is refused, not
@@ -932,52 +996,61 @@ impl PolicyEngine {
             // lists can take the table past a fixed buffer, and a blob that
             // does not fit must not read back as "no slots" (every pairing
             // silently lost). Bounded so a corrupt length cannot exhaust heap.
-            let blob_len = nvs
-                .blob_len(&new_key)
-                .ok()
-                .flatten()
-                .map_or(8192, |len| len.min(MAX_SLOT_BLOB_BYTES));
-            let mut buf = vec![0u8; blob_len];
-
-            // --- Try new format first ---
-            if let Ok(Some(data)) = nvs.get_blob(&new_key, &mut buf) {
-                if let Ok(mut slots) = serde_json::from_slice::<Vec<ConnectSlot>>(data) {
-                    if remove_ambiguous_pubkeys(&mut slots) {
-                        log::warn!(
-                            "Removed client pubkey shared by multiple slots for master slot {slot}; re-pair required"
-                        );
-                        persist_migrations.push(slot);
+            match nvs.blob_len(&new_key) {
+                Ok(Some(len)) if len <= MAX_SLOT_BLOB_BYTES => {
+                    let mut buf = vec![0u8; len];
+                    let parsed = match nvs.get_blob(&new_key, &mut buf) {
+                        Ok(Some(data)) => serde_json::from_slice::<Vec<ConnectSlot>>(data).ok(),
+                        _ => None,
+                    };
+                    if let Some(mut slots) = parsed {
+                        if remove_ambiguous_pubkeys(&mut slots) {
+                            log::warn!(
+                                "Removed ambiguous client ownership for master slot {slot}"
+                            );
+                            persist_migrations.push(slot);
+                        }
+                        match heartwood_common::policy::migrate_client_grants(&mut slots) {
+                            Ok(true) => { if !persist_migrations.contains(&slot) { persist_migrations.push(slot); } }
+                            Ok(false) => {}
+                            Err(reason) => {
+                                log::error!("Invalid client authority for master {slot}: {reason}; pairings disabled");
+                                engine.quarantine(slot);
+                                continue;
+                            }
+                        }
+                        engine.master_slots.push(MasterSlots {
+                            master_slot: slot,
+                            slots,
+                        });
+                    } else {
+                        log::error!("Unreadable slot table for master {slot}; pairings disabled");
+                        engine.quarantine(slot);
                     }
-                    let count = slots.len();
-                    engine.master_slots.push(MasterSlots {
-                        master_slot: slot,
-                        slots,
-                    });
-                    log::info!("Loaded {count} persisted slots for master slot {slot}");
+                    // A present but unreadable table is not evidence of an
+                    // unmigrated master. Never resurrect its old credential.
                     continue;
                 }
+                Ok(Some(_)) | Err(_) => {
+                    log::error!("Invalid slot table length for master {slot}; pairings disabled");
+                    engine.quarantine(slot);
+                    continue;
+                }
+                Ok(None) => {} // Only proven absence permits the legacy migration.
             }
 
             // --- Migration: check old format ---
-            let old_policy_key = format!("policy_{slot}");
             let old_secret_key = format!("master_{slot}_conn");
-            let mut secret_buf = [0u8; 128];
-
-            let has_old_secret = nvs
-                .get_blob(&old_secret_key, &mut secret_buf)
-                .ok()
-                .flatten()
-                .is_some();
-
-            if has_old_secret {
-                // Retrieve the raw secret bytes and hex-encode them.
-                let secret_bytes = nvs
-                    .get_blob(&old_secret_key, &mut secret_buf)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                let secret_hex = heartwood_common::hex::hex_encode(secret_bytes);
-
+            let mut secret_buf = [0u8; 32];
+            let secret_hex = match nvs.get_blob(&old_secret_key, &mut secret_buf) {
+                Ok(Some(bytes)) if bytes.len() == 32 => heartwood_common::hex::hex_encode(bytes),
+                Ok(None) => continue,
+                _ => {
+                    engine.quarantine(slot);
+                    continue;
+                }
+            };
+            {
                 let migrated_slot = ConnectSlot {
                     slot_index: 0,
                     label: "default".to_string(),
@@ -996,12 +1069,10 @@ impl PolicyEngine {
                     bound_identity: None,
                     approved_identities: String::new(),
                     was_bound: false,
+                    client_grants: Some(heartwood_common::client_grants::GrantSnapshot::empty()),
                 };
 
                 log::info!("Migrated legacy policy for master slot {slot} to connslots format");
-
-                // Remove old policy key; master_{slot}_conn is cleaned up in Task 5.
-                let _ = nvs.remove(&old_policy_key);
 
                 engine.master_slots.push(MasterSlots {
                     master_slot: slot,
@@ -1018,7 +1089,15 @@ impl PolicyEngine {
         for master_slot in persist_migrations {
             engine.slots_dirty = true;
             if !engine.persist_slots(nvs, master_slot) {
+                // Migration is not active until its exact durable form verifies.
+                // Retain the old disk value for recovery but serve no volatile grants.
+                engine.quarantine(master_slot);
+                log::error!("Client consent migration could not persist for master {master_slot}; pairings disabled");
                 persist_failed = true;
+            } else {
+                // Retire old metadata only after the replacement is verified.
+                // Failure leaves redundant data; the present new table always wins.
+                let _ = nvs.remove(&format!("policy_{master_slot}"));
             }
         }
         engine.slots_dirty = persist_failed;

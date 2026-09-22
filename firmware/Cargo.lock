@@ -1072,6 +1072,7 @@ dependencies = [
  "base64",
  "bech32",
  "bip39",
+ "bitcoin_hashes",
  "cbc",
  "chacha20",
  "crc32fast",

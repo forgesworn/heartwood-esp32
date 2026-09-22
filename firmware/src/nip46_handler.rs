@@ -425,6 +425,8 @@ pub struct DeferredAsk {
 /// recompute.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Resume {
+    /// Authority generation when this device card or guardian request was raised.
+    pub authority_epoch: Option<u32>,
     /// Whether the CALLER sent a Heartwood context. The first pass writes a
     /// session's active identity into the request, which would otherwise read
     /// as caller-supplied on resume and be refused on a strict slot.
@@ -776,7 +778,7 @@ fn dispatch_inner(
     let client_is_bound =
         has_client && policy_engine.find_slot_by_pubkey(master_slot, &client_hex).is_some();
     let requester_label = if has_client {
-        signing_requester_label(policy_engine, master_slot, &client_hex)
+        format!("{} {}", signing_requester_label(policy_engine, master_slot, &client_hex), &client_hex[..8])
     } else {
         "direct app".to_string()
     };
@@ -949,6 +951,10 @@ fn dispatch_inner(
             None => identity,
         },
     };
+    if resume.is_some_and(|r| !policy_engine.approval_is_current(r.authority_epoch)) {
+        return build_error_json(&request.id, -1, "approval_changed: pairing or permissions changed; send the request again");
+    }
+
     // A hold answers exactly the card it was shown on, for exactly the
     // identity it named. Never act on or record an identity the card did not.
     if let Some(resume) = resume {
@@ -960,7 +966,7 @@ fn dispatch_inner(
                 Some(CardKind::AllowAs { .. }) => shown_now
                     .identity
                     .as_ref()
-                    .is_some_and(|pubkey| heartwood_common::policy::identity_approved(slot, pubkey)),
+                    .is_some_and(|pubkey| heartwood_common::policy::client_identity_approved(slot, Some(&client_hex), pubkey)),
                 Some(CardKind::ListIds) => {
                     slot.allowed_methods.iter().any(|m| m == "heartwood_list_identities")
                 }
@@ -1008,8 +1014,10 @@ fn dispatch_inner(
                 heartwood_common::encoding::card_heading(
                     match kind {
                         CardKind::NpubAs => "NPUB AS",
-                        CardKind::SwitchTo { .. } => "SWITCH TO",
-                        _ => "ALLOW AS",
+                        CardKind::ListIds => "LIST IDS FOR",
+                        CardKind::SwitchTo { record: false } | CardKind::AllowAs { record: false } => "ONCE AS",
+                        CardKind::SwitchTo { record: true } => "REMEMBER AS",
+                        CardKind::AllowAs { record: true } => "REMEMBER AS",
                     },
                     identity_label.as_deref().unwrap_or("?"),
                 ),
@@ -1026,7 +1034,7 @@ fn dispatch_inner(
                     request,
                     event: None,
                     identity,
-                    resume: Resume { explicit_context: explicit_heartwood_context, shown: shown_now },
+                    resume: Resume { authority_epoch: policy_engine.approval_epoch(), explicit_context: explicit_heartwood_context, shown: shown_now },
                 }));
                 return String::new();
             }
@@ -1034,7 +1042,7 @@ fn dispatch_inner(
         }
         let snapshot = policy_engine.snapshot_slot_state(master_slot);
         let changed = match (kind, identity.as_ref()) {
-            (CardKind::AllowAs { .. } | CardKind::SwitchTo { .. }, Some(pubkey)) => {
+            (CardKind::AllowAs { record: true } | CardKind::SwitchTo { record: true }, Some(pubkey)) => {
                 policy_engine.record_identity(master_slot, Ok(&client_hex), pubkey)
             }
             (CardKind::ListIds, _) => policy_engine.grant_list_identities(master_slot, &client_hex),
@@ -1091,7 +1099,7 @@ fn dispatch_inner(
                     request,
                     event: None,
                     identity: None,
-                    resume: Resume { explicit_context: explicit_heartwood_context, shown: shown_now },
+                    resume: Resume { authority_epoch: policy_engine.approval_epoch(), explicit_context: explicit_heartwood_context, shown: shown_now },
                 }));
                 return String::new();
             }
@@ -1149,7 +1157,7 @@ fn dispatch_inner(
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
                     let heading = allow_sign.then(|| {
                         heartwood_common::encoding::card_heading(
-                            "ALLOW AS",
+                            if matches!(gate_card, Some(CardKind::AllowAs { record: false })) { "ONCE AS" } else { "REMEMBER AS" },
                             identity_label.as_deref().unwrap_or_default(),
                         )
                     });
@@ -1165,6 +1173,7 @@ fn dispatch_inner(
                             event: Some(event),
                             identity,
                             resume: Resume {
+                                authority_epoch: policy_engine.approval_epoch(),
                                 explicit_context: explicit_heartwood_context,
                                 shown: shown_now,
                             },
@@ -1223,7 +1232,8 @@ fn dispatch_inner(
                             policy_engine.upgrade_to_signing(master_slot, idx);
                         }
                         if let (Some(snapshot), Some(pubkey)) = (identity_snapshot, identity.as_ref()) {
-                            let changed = policy_engine.record_identity(master_slot, Ok(&client_hex), pubkey);
+                            let changed = matches!(gate_card, Some(CardKind::AllowAs { record: true }))
+                                && policy_engine.record_identity(master_slot, Ok(&client_hex), pubkey);
                             if let Err(response) = persist_grant(
                                 policy_engine,
                                 nvs,
@@ -1309,11 +1319,13 @@ fn dispatch_inner(
                                 // unique-slot ownership and the current-key
                                 // display; it does not re-seed identity because
                                 // `slot_authorizes` already sees this key.
-                                policy_engine.assign_pubkey_to_slot(
+                                if !policy_engine.assign_pubkey_to_slot(
                                     master_slot,
                                     slot_index,
                                     client_hex.clone(),
-                                );
+                                ) {
+                                    return build_error_json(&request.id, -1, "client_capacity: remove an unused device from this pairing first");
+                                }
                                 log::info!(
                                     "Slot {} ({}) reconnected (retained client)",
                                     slot_index,
@@ -1328,11 +1340,13 @@ fn dispatch_inner(
                                 // the slot secret, and operator-issued unused
                                 // pairing retains first-connect semantics rather
                                 // than inheriting an existing authority.
-                                policy_engine.assign_pubkey_to_slot(
+                                if !policy_engine.assign_pubkey_to_slot(
                                     master_slot,
                                     slot_index,
                                     client_hex.clone(),
-                                );
+                                ) {
+                                    return build_error_json(&request.id, -1, "client_capacity: remove an unused device from this pairing first");
+                                }
                                 // Update label from app metadata if slot is still "default".
                                 if !app_label.is_empty() {
                                     let slots = policy_engine.slots_mut(master_slot);
@@ -1368,8 +1382,8 @@ fn dispatch_inner(
                                 // §"Connect Flow" specified the flash; the audit
                                 // showed the flash is not an approval.)
                                 if slot_can_sign {
-                                    let preview = format!("rebind '{slot_label}'");
-                                    let heading = crate::oled::master_sign_heading(master_label);
+                                    let preview = format!("{}... / {}", &client_hex[..8], slot_label);
+                                    let heading = "ADD DEVICE".to_string();
                                     match hold_for_card(approval, false, display, buttons, &heading, "connect", &preview, &request.id) {
                                         Hold::Refused(response) => return response,
                                         Hold::Deferred => {
@@ -1382,7 +1396,7 @@ fn dispatch_inner(
                                                 request,
                                                 event: None,
                                                 identity: None,
-                                                resume: Resume::default(),
+                                                resume: Resume { authority_epoch: policy_engine.approval_epoch(), ..Resume::default() },
                                             }));
                                             return String::new();
                                         }
@@ -1398,14 +1412,15 @@ fn dispatch_inner(
                                         "reconnected",
                                     );
                                 }
-                                // A new client clears the slot's identity
-                                // approvals; the rebind hold the owner just
-                                // gave approves the identity it is served as.
-                                policy_engine.assign_pubkey_to_slot(
+                                // The hold approves this new client for the served identity;
+                                // existing clients retain their own consent.
+                                if !policy_engine.assign_pubkey_to_slot(
                                     master_slot,
                                     slot_index,
                                     client_hex.clone(),
-                                );
+                                ) {
+                                    return build_error_json(&request.id, -1, "client_capacity: remove an unused device from this pairing first");
+                                }
                                 if slot_can_sign {
                                     if let Some(served) =
                                         effective_identity(master_secret, master_mode, secp, None)
@@ -2862,6 +2877,7 @@ mod tests {
     /// gate now owns.
     fn denied_before_dispatch(has_client: bool, tier: ApprovalTier) -> bool {
         gate_request(&GateRequest {
+            client_pubkey: None,
             has_client,
             slot: None,
             method: "ping",
@@ -2878,6 +2894,7 @@ mod tests {
         let engine = engine_with_slot(strict, &["sign_event"]);
         let slot = &engine.list_slots(0)[0];
         gate_request(&GateRequest {
+            client_pubkey: None,
             has_client,
             slot: Some(slot),
             method: "connect",
@@ -2912,6 +2929,7 @@ mod tests {
             bound_identity: None,
             approved_identities: String::new(),
             was_bound: false,
+            client_grants: None,
         });
         engine
     }

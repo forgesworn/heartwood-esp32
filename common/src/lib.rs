@@ -45,6 +45,10 @@ pub mod nip04;
 #[cfg(feature = "nip46")]
 pub mod policy;
 
+// G4 foundation only; not connected to the firmware's active policy engine.
+#[cfg(feature = "nip46")]
+pub mod client_grants;
+
 pub mod net_config;
 
 pub mod mgmt;

@@ -860,8 +860,19 @@ impl PolicyEngine {
     /// configured before the first signature. A default connect slot already
     /// contains every CONNECT_SAFE_METHOD, so its historical result is still
     /// the complete TOFU set.
-    /// Returns true if the slot was found.
+    /// Returns true for a non-strict slot, including an already granted slot.
     pub fn upgrade_to_signing(&mut self, master_slot: u8, slot_index: u8) -> bool {
+        // A no-op must not invalidate sibling requests awaiting approval.
+        // Only mutable access advances the authority epoch.
+        let Some(slot) = self.list_slots(master_slot).iter().find(|s| s.slot_index == slot_index) else {
+            return false;
+        };
+        if slot.strict_permissions {
+            return false;
+        }
+        if slot.signing_approved && slot.allowed_methods.iter().any(|m| m == "sign_event") {
+            return true;
+        }
         let slots = self.slots_mut(master_slot);
         if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
             // Exact v2 authority is installed only as one validated unit. A

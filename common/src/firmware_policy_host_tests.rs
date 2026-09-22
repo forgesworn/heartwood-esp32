@@ -720,6 +720,26 @@ fn rollback_failure_quarantines_master_and_denies_lookup() {
 }
 
 #[test]
+fn signing_upgrade_invalidates_pending_approval_only_when_authority_changes() {
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "epoch".into(), secret_hex(0x05)).unwrap();
+    let before = engine.approval_epoch();
+    assert!(!engine.upgrade_to_signing(0, 255));
+    assert!(engine.approval_is_current(before));
+
+    assert!(engine.upgrade_to_signing(0, slot));
+    assert!(!engine.approval_is_current(before));
+    let granted = engine.approval_epoch();
+    assert!(engine.upgrade_to_signing(0, slot));
+    assert!(engine.approval_is_current(granted));
+
+    engine.slots_mut(0)[0].strict_permissions = true;
+    let strict = engine.approval_epoch();
+    assert!(!engine.upgrade_to_signing(0, slot));
+    assert!(engine.approval_is_current(strict));
+}
+
+#[test]
 fn approval_epoch_invalidated_by_revoke_and_readd() {
     let mut engine = PolicyEngine::new();
     let slot = engine.create_slot(0, "e".into(), secret_hex(0x05)).unwrap();

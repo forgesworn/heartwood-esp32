@@ -26,11 +26,9 @@ use heartwood_common::policy::{
     RemoveAuthorizedPubkey, CONNECT_SAFE_METHODS,
 };
 
-/// Upper bound on one master's persisted slot table, enforced when writing and
-/// when loading it: well
-/// above sixteen fully populated slots, each of which (eight client keys, a
-/// full kind and method ceiling, sixteen approved identities) stays within a
-/// few kilobytes. Anything larger is not a table this firmware wrote.
+/// Parser/allocation cap, also enforced on writes. Actual storage capacity is
+/// bounded by the board's NVS partition and other records; this is no promise
+/// that every logically permitted combination fits physically.
 const MAX_SLOT_BLOB_BYTES: usize = 64 * 1024;
 
 /// Maximum concurrent client sessions.
@@ -977,6 +975,26 @@ impl PolicyEngine {
             self.slots_dirty = false;
         }
         persisted
+    }
+
+    /// Start a physically approved backup recovery from a quarantined table.
+    /// Install and verify an empty table before lifting quarantine; never delete
+    /// its key (absence could resurrect a pre-migration connection secret).
+    /// If later backup replacement fails, this empty baseline remains safe.
+    /// Only the USB backup path, after its physical hold, may call this method.
+    pub fn recover_pairings_for_backup_restore(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
+        if self.storage_ready(master_slot) { return true; }
+        let key = format!("connslots_{master_slot}");
+        let _ = nvs.set_blob(&key, b"[]");
+        let mut verify = [0u8; 2];
+        let verified = matches!(nvs.blob_len(&key), Ok(Some(2)))
+            && matches!(nvs.get_blob(&key, &mut verify), Ok(Some(bytes)) if bytes == b"[]");
+        if !verified { return false; }
+        self.invalidate_approvals();
+        self.master_slots.retain(|entry| entry.master_slot != master_slot);
+        self.master_slots.push(MasterSlots { master_slot, slots: Vec::new() });
+        self.quarantined_masters.retain(|slot| *slot != master_slot);
+        true
     }
 
     /// Load persisted slots from NVS for all master slots.

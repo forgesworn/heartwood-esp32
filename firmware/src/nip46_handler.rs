@@ -774,11 +774,14 @@ fn dispatch_inner(
         // Legacy mode — bridge injects the relay event author as _client_pubkey.
         request.legacy_client_pubkey.take().unwrap_or_default()
     };
-    let has_client = !client_hex.is_empty() && client_hex.len() == 64;
+    if !client_hex.is_empty() && heartwood_common::policy::decode_client_key(&client_hex).is_none() {
+        return build_error_json(&request.id, -3, "invalid client credential");
+    }
+    let has_client = !client_hex.is_empty();
     let client_is_bound =
         has_client && policy_engine.find_slot_by_pubkey(master_slot, &client_hex).is_some();
     let requester_label = if has_client {
-        format!("{} {}", signing_requester_label(policy_engine, master_slot, &client_hex), &client_hex[..8])
+        format!("{} {}", &client_hex[..8], signing_requester_label(policy_engine, master_slot, &client_hex))
     } else {
         "direct app".to_string()
     };

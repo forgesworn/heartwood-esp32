@@ -45,6 +45,10 @@ table never falls back to an old connection secret. Writes require an exact
 read-back before a durable success response. If a write cannot be verified,
 callers restore and verify their previous snapshot. A failed compensation disables
 that master's pairings for the boot rather than serving uncertain authority.
+A physically approved USB backup restore can recover a quarantined table: it
+first writes and verifies an empty table, then loads the sanitised backup. If a
+later restore step fails, that empty baseline remains; the corrupt table is not
+reinstated and an older connection secret cannot reappear through fallback.
 
 The 64 KiB parser cap is an allocation bound, not a storage promise. Actual
 capacity depends on the board's NVS partition and other stored data. Storage

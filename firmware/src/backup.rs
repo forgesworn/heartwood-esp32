@@ -352,22 +352,26 @@ pub fn handle_import(
     // complete. A failed read-back may have committed, so compensate durably.
     let mut restored_snapshots = Vec::new();
     for (device_slot, backup_master) in &matched {
-        restored_snapshots.push(policy_engine.snapshot_slot_state(*device_slot));
-        // Replace all slots for this master with the sanitised backup data.
-        let slots = policy_engine.slots_mut(*device_slot);
-        slots.clear();
-        slots.extend(backup_master.connection_slots.iter().cloned());
-        policy_engine.slots_dirty = true;
-        if !policy_engine.persist_slots(nvs, *device_slot) {
+        // A corrupt/quarantined table needs an explicit empty recovery baseline,
+        // verified before serving any authority. This is after the physical hold.
+        let recovered = policy_engine.recover_pairings_for_backup_restore(nvs, *device_slot);
+        if recovered {
+            restored_snapshots.push(policy_engine.snapshot_slot_state(*device_slot));
+            let slots = policy_engine.slots_mut(*device_slot);
+            slots.clear();
+            slots.extend(backup_master.connection_slots.iter().cloned());
+            policy_engine.slots_dirty = true;
+        }
+        if !recovered || !policy_engine.persist_slots(nvs, *device_slot) {
             let mut rollback_ok = true;
             for snapshot in restored_snapshots.into_iter().rev() {
                 rollback_ok &= policy_engine.restore_slot_state_durably(nvs, snapshot);
             }
             log::error!("Backup import failed: slot persistence; rollback verified={rollback_ok}");
             crate::oled::show_error(display, if rollback_ok {
-                "Restore failed\nStorage unavailable"
+                "Restore failed\nStorage error"
             } else {
-                "Storage fault\nUSB recovery needed"
+                "Storage fault\nUse USB recovery"
             });
             protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
             return;

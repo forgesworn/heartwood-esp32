@@ -894,3 +894,28 @@ fn full_consent_capacity_offers_once_without_evicting_existing_grants() {
         Gate::Card(CardKind::AllowAs { record: false }));
     assert!(crate::policy::client_identity_approved(&engine.list_slots(0)[0], Some(&client), &[1; 32]));
 }
+
+#[test]
+fn physically_approved_backup_recovery_requires_verified_empty_baseline() {
+    let mut nvs = EspNvs::new();
+    nvs.backend.seed(CONNSLOTS_0, b"corrupt");
+    nvs.backend.seed(MASTER_0_CONN, &legacy_secret_bytes(9));
+    let mut engine = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    assert!(!engine.storage_ready(0));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert!(!engine.recover_pairings_for_backup_restore(&mut nvs, 0));
+    assert!(!engine.storage_ready(0));
+    nvs.backend.fail_once(NvsOp::GetBlob, CONNSLOTS_0, FaultKind::ReadError);
+    assert!(!engine.recover_pairings_for_backup_restore(&mut nvs, 0));
+    assert!(!engine.storage_ready(0));
+    assert!(engine.recover_pairings_for_backup_restore(&mut nvs, 0));
+    assert!(engine.storage_ready(0));
+    assert!(engine.list_slots(0).is_empty());
+    let baseline = engine.snapshot_slot_state(0);
+    engine.create_slot(0, "restore candidate".into(), secret_hex(4)).unwrap();
+    assert!(engine.persist_slots(&mut nvs, 0));
+    assert!(engine.restore_slot_state_durably(&mut nvs, baseline));
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    assert!(reloaded.storage_ready(0));
+    assert!(reloaded.list_slots(0).is_empty(), "empty table must suppress old-secret migration");
+}

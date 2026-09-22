@@ -901,6 +901,7 @@ fn shared_client_revocation_invalidates_pending_but_keeps_other_clients() {
 fn full_consent_capacity_offers_once_without_evicting_existing_grants() {
     use crate::policy::{CardKind, Gate};
     use crate::nip46::Nip46Method;
+    let mut nvs = EspNvs::new();
     let mut engine = PolicyEngine::new();
     let slot = engine.create_slot(0, "capacity".into(), secret_hex(1)).unwrap();
     let client = pubkey_hex(1);
@@ -913,6 +914,42 @@ fn full_consent_capacity_offers_once_without_evicting_existing_grants() {
         Some(30078), crate::policy::ApprovalTier::AutoApprove, false, false, Some(&[17; 32])),
         Gate::Card(CardKind::AllowAs { record: false }));
     assert!(crate::policy::client_identity_approved(&engine.list_slots(0)[0], Some(&client), &[1; 32]));
+
+    assert!(engine.persist_slots(&mut nvs, 0));
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    let retained = &reloaded.list_slots(0)[0];
+    assert!(!crate::policy::client_identity_approved(retained, Some(&client), &[17; 32]));
+    assert!(crate::policy::client_identity_approved(retained, Some(&client), &[1; 32]));
+    assert_eq!(reloaded.gate(0, &client, true, &Nip46Method::SignEvent, "sign_event",
+        Some(30078), crate::policy::ApprovalTier::AutoApprove, false, false, Some(&[17; 32])),
+        Gate::Card(CardKind::AllowAs { record: false }));
+}
+
+#[test]
+fn full_client_capacity_rejects_ninth_and_retains_existing_consent() {
+    use heartwood_common::policy::client_identity_approved;
+
+    let mut nvs = EspNvs::new();
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "full".into(), secret_hex(2)).unwrap();
+    let identity = [0x42; 32];
+    let clients: Vec<String> = (1..=8).map(pubkey_hex).collect();
+    for client in &clients {
+        assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+        assert!(engine.record_identity(0, Ok(client), &identity));
+    }
+    assert!(engine.persist_slots(&mut nvs, 0));
+    let before = engine.list_slots(0)[0].client_grants.clone();
+    let ninth = pubkey_hex(9);
+    assert!(!engine.assign_pubkey_to_slot(0, slot, ninth.clone()));
+    assert_eq!(engine.list_slots(0)[0].client_grants, before);
+
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    let retained = &reloaded.list_slots(0)[0];
+    for client in &clients {
+        assert!(client_identity_approved(retained, Some(client), &identity));
+    }
+    assert!(!client_identity_approved(retained, Some(&ninth), &identity));
 }
 
 #[test]

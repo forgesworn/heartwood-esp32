@@ -808,6 +808,41 @@ impl<'a> PersonaParams<'a> {
     }
 }
 
+/// Where a `heartwood_derive_persona` may be answered. Persona names are
+/// rooted at the master (PROTOCOL v1.1 §3.1), but a request addressed to a
+/// persona is served with the persona's own key, so deriving there would mint
+/// a nested key under the persona's name that no other tool reproduces and
+/// that the board itself cannot re-derive after a reboot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersonaDeriveRoute {
+    /// Addressed to the master: derive as usual.
+    Master,
+    /// Addressed to the very persona asked for: answer with it, nothing written.
+    SelfLookup,
+    /// Addressed to a persona, asking for a different one: refuse.
+    Refuse,
+}
+
+/// `served` is the registry purpose and index of the addressed identity when
+/// it is a persona, `None` when it is a master.
+pub fn persona_derive_route(
+    served: Option<(&str, u32)>,
+    requested_purpose: &str,
+    requested_index: u32,
+) -> PersonaDeriveRoute {
+    match served {
+        None => PersonaDeriveRoute::Master,
+        Some((purpose, index)) if purpose == requested_purpose && index == requested_index => {
+            PersonaDeriveRoute::SelfLookup
+        }
+        Some(_) => PersonaDeriveRoute::Refuse,
+    }
+}
+
+/// The refusal for [`PersonaDeriveRoute::Refuse`].
+pub const PERSONA_DERIVE_NEEDS_MASTER: &str =
+    "heartwood_derive_persona must be addressed to the master, not a persona";
+
 /// `heartwood_switch`: `[target, index_hint?]`.
 pub struct SwitchParams<'a> {
     pub target: &'a str,
@@ -1557,6 +1592,15 @@ pub fn build_result_response(request_id: &str, result: &str) -> Result<String, S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persona_derive_routes_by_the_addressed_identity() {
+        use PersonaDeriveRoute::*;
+        assert_eq!(persona_derive_route(None, "nostr:persona:a", 0), Master);
+        assert_eq!(persona_derive_route(Some(("nostr:persona:a", 0)), "nostr:persona:a", 0), SelfLookup);
+        assert_eq!(persona_derive_route(Some(("nostr:persona:a", 0)), "nostr:persona:a", 1), Refuse);
+        assert_eq!(persona_derive_route(Some(("nostr:persona:a", 0)), "nostr:persona:b", 0), Refuse);
+    }
+
     use super::*;
 
     #[test]

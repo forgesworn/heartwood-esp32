@@ -2,13 +2,14 @@
 
 # Heartwood ESP32
 
-> **Beta:** firmware [`0.18.0-beta.13`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.13)
-> retains app/persona approvals per client. Retained-state installation, normal
-> reboot/unlock, automatic signing and consent isolation passed on the named
-> Heltec V4. Remaining physical coverage, the post-flash reset observation and
-> deferred payment acceptance are recorded in the release notes. Keep an
-> independent recovery copy and use small values while the complete destructive
-> cross-board recovery matrix remains unfinished.
+> **Beta:** firmware [`0.18.0-beta.14`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.14)
+> retains app/persona approvals per client, and a persona derived through a
+> button card now answers relay requests without a reboot. Retained-state
+> installation, normal reboot/unlock, automatic signing and consent isolation
+> passed on the named Heltec V4. Remaining physical coverage and deferred
+> payment acceptance are recorded in the beta.13 and beta.14 release notes.
+> Keep an independent recovery copy and use small values while the complete
+> destructive cross-board recovery matrix remains unfinished.
 
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/TheCryptoDonkey?logo=githubsponsors&color=ea4aaa&label=Sponsor)](https://github.com/sponsors/TheCryptoDonkey)
 

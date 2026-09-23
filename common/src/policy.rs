@@ -385,6 +385,20 @@ pub fn client_identity_approved(slot: &ConnectSlot, client: Option<&str>, identi
     }
 }
 
+/// Re-deriving a persona is a lookup, not a mutation, when the persona is
+/// already in the registry and this client may already act as it: the answer
+/// names a pubkey the client can use anyway and nothing is written, so a press
+/// would buy nothing. Every other `heartwood_derive_persona` keeps its press,
+/// so a client cannot probe persona names to collect the owner's pubkeys.
+pub fn persona_rederive_is_lookup(
+    slot: Option<&ConnectSlot>,
+    client: &str,
+    persona_registered: bool,
+    persona: &[u8; 32],
+) -> bool {
+    persona_registered && slot.is_some_and(|slot| client_identity_approved(slot, Some(client), persona))
+}
+
 pub fn decode_client_key(key: &str) -> Option<[u8; 32]> {
     if key.len() != 64 || !key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) { return None; }
     crate::hex::hex_decode(key).ok()?.try_into().ok()
@@ -2819,6 +2833,23 @@ mod tests {
             guardian_notice_recipient_pubkeys(&[opted_in, child_only], &guardian),
             vec![recipient.as_str()],
         );
+    }
+
+    #[test]
+    fn persona_rederive_is_a_lookup_only_for_an_approved_registered_persona() {
+        let client = "ab".repeat(32);
+        let persona = [0x5a; 32];
+        let mut slot = sample_slot(0, "app");
+        slot.current_pubkey = Some(client.clone());
+        // Registered but never approved for this client: still a press.
+        assert!(!persona_rederive_is_lookup(Some(&slot), &client, true, &persona));
+        assert!(record_client_identity(&mut slot, &client, &persona));
+        assert!(persona_rederive_is_lookup(Some(&slot), &client, true, &persona));
+        // A new registry entry is a mutation whatever the approval says.
+        assert!(!persona_rederive_is_lookup(Some(&slot), &client, false, &persona));
+        // Another persona, or no slot at all, keeps the press.
+        assert!(!persona_rederive_is_lookup(Some(&slot), &client, true, &[0x5b; 32]));
+        assert!(!persona_rederive_is_lookup(None, &client, true, &persona));
     }
 
     #[test]

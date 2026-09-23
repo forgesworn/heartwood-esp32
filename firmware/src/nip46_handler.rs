@@ -106,6 +106,38 @@ fn remote_extension_requires_approval(
         && tier == heartwood_common::policy::ApprovalTier::ButtonRequired
 }
 
+/// Whether this `heartwood_derive_persona` only looks up a persona the client
+/// is already approved to act as (see
+/// `heartwood_common::policy::persona_rederive_is_lookup`). Anything that does
+/// not parse, validate or derive keeps the press.
+fn persona_rederive_is_lookup(
+    params: &[Value],
+    policy_engine: &PolicyEngine,
+    master_slot: u8,
+    client_hex: &str,
+    personas: &[crate::personas::LoadedPersona],
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+) -> bool {
+    let Ok(nip46::PersonaParams { name, index }) = nip46::PersonaParams::from_params(params) else {
+        return false;
+    };
+    if validate_persona_name(name).is_err() {
+        return false;
+    }
+    let Ok((_secret, pubkey)) =
+        derive_identity(master_secret, master_mode, &format!("nostr:persona:{name}"), index)
+    else {
+        return false;
+    };
+    heartwood_common::policy::persona_rederive_is_lookup(
+        policy_engine.find_slot_by_pubkey(master_slot, client_hex),
+        client_hex,
+        crate::personas::contains_pubkey(personas, &pubkey),
+        &pubkey,
+    )
+}
+
 /// `None` is the only outcome that permits dispatch. Denial and timeout become
 /// normal NIP-46 errors before any extension state can be touched.
 fn extension_approval_failure(request_id: &str, result: ApprovalResult) -> Option<String> {
@@ -932,7 +964,22 @@ fn dispatch_inner(
     // cannot accidentally mutate state merely by omitting approval code from
     // its individual match arm. Strict v2 denials returned above never prompt.
     // A switch's press is the gate's SWITCH TO card, never a second one.
+    let rederive_lookup = has_client
+        && matches!(method, nip46::Nip46Method::HeartwoodDerivePersona)
+        && persona_rederive_is_lookup(
+            &request.params,
+            policy_engine,
+            master_slot,
+            &client_hex,
+            personas,
+            master_secret,
+            master_mode,
+        );
+    if rederive_lookup {
+        log::info!("{}: persona already registered and approved for this app; no card", request.method);
+    }
     let own_card = !spend_granted
+        && !rederive_lookup
         && !matches!(gate_card, Some(CardKind::SwitchTo { .. }))
         && remote_extension_requires_approval(has_client, &method, tier);
 

@@ -95,6 +95,25 @@ pub fn admit(open: Option<&AskKey>, batch: usize, waiting: usize, incoming: &Ask
     }
 }
 
+/// What the screen says when a press approved a card but the request behind it
+/// did not complete: `(title, hint)` for a NOT DONE card, or `None` when the
+/// reply was a result. APPROVED is drawn the moment the hold lands, before the
+/// request is re-checked, so without this a refused request left the owner
+/// looking at a success that never happened.
+pub fn approved_but_not_done(error: Option<&str>) -> Option<(&'static str, &'static str)> {
+    let error = error?;
+    Some(if error.starts_with("identity approved") {
+        // ALLOW AS was recorded; the method's own card is still owed.
+        ("Identity approved", "Ask again to finish")
+    } else if error.starts_with("approval_changed") || error.starts_with("approval changed") {
+        // Another pairing changed while this card waited, which withdraws
+        // every pending approval.
+        ("Pairing changed", "Ask again from the app")
+    } else {
+        ("Not completed", "The app was told why")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +121,27 @@ mod tests {
 
     fn key(slot: u8, client: &str, target: &str) -> AskKey {
         AskKey::new(slot, client.to_string(), target.to_string(), "1".to_string())
+    }
+
+    #[test]
+    fn an_approved_card_that_did_not_complete_says_so() {
+        assert_eq!(approved_but_not_done(None), None);
+        assert_eq!(
+            approved_but_not_done(Some("approval_changed: pairing or permissions changed; send the request again")),
+            Some(("Pairing changed", "Ask again from the app"))
+        );
+        assert_eq!(
+            approved_but_not_done(Some("approval changed while waiting; send the request again")),
+            Some(("Pairing changed", "Ask again from the app"))
+        );
+        assert_eq!(
+            approved_but_not_done(Some("identity approved; send the request again")),
+            Some(("Identity approved", "Ask again to finish"))
+        );
+        assert_eq!(
+            approved_but_not_done(Some("identity storage full")),
+            Some(("Not completed", "The app was told why"))
+        );
     }
 
     #[test]

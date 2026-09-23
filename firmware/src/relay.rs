@@ -4648,12 +4648,20 @@ fn resolve_button_card(
     let Some((signing_secret, label, mode, slot, persona_purpose)) =
         resolve_served_identity(ctx, &card.target_pk)
     else {
+        // Nothing can answer: the reply would be signed by the identity that
+        // is gone. The screen must not keep claiming APPROVED.
         log::warn!("[relay] approved identity no longer served; card dropped");
+        if index == 0 && matches!(outcome, CardTick::Approved) {
+            show_card_not_done(ctx, "Identity removed", "Nothing was done");
+        }
         return;
     };
     let Ok(conversation_key) = nip44::get_conversation_key(&signing_secret, &card.client_pubkey)
     else {
         log::warn!("[relay] approval completion: conversation key failed");
+        if index == 0 && matches!(outcome, CardTick::Approved) {
+            show_card_not_done(ctx, "Not completed", "Nothing was done");
+        }
         return;
     };
     let target_hex = hex_encode(&card.target_pk);
@@ -4682,6 +4690,10 @@ fn resolve_button_card(
     // that check or the fresh persona never joins the live `#p` filters until
     // reboot, and requests addressed to it go unanswered.
     let personas_before = ctx.personas.len();
+    // APPROVED went up with the hold; the first request that then failed
+    // replaces it, so the owner is never left looking at a success that did
+    // not happen.
+    let mut not_done = None;
     for ask in card.asks {
         let request_id = ask.ask.request.id.clone();
         let rail = if !dependant {
@@ -4793,6 +4805,11 @@ fn resolve_button_card(
             // earned however well the dispatch went (#137).
             earned = None;
         }
+        if index == 0 && matches!(outcome, CardTick::Approved) && not_done.is_none() {
+            not_done = heartwood_common::approval_queue::approved_but_not_done(
+                response_error_of(&response_json).as_deref(),
+            );
+        }
 
         let held = Duration::from_secs(crate::uptime_s().saturating_sub(ask.received_uptime));
         // Sealed first, published second: an approved answer that no live
@@ -4827,6 +4844,9 @@ fn resolve_button_card(
             ),
             Err(e) => log::warn!("[relay] approval publish for {request_id}: {e}"),
         }
+    }
+    if let Some((title, hint)) = not_done {
+        show_card_not_done(ctx, title, hint);
     }
     if ctx.personas.len() != personas_before {
         ctx.resubscribe_needed = true;
@@ -5238,6 +5258,14 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
         return;
     }
     resolve_button_card(ctx, sessions, 0, &outcome);
+}
+
+/// Replace APPROVED with NOT DONE and hold it long enough to read before the
+/// idle screen returns.
+fn show_card_not_done(ctx: &mut SignCtx, title: &str, hint: &str) {
+    crate::oled::show_not_done(ctx.display, title, hint);
+    ctx.last_activity = Instant::now();
+    ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(5));
 }
 
 /// True while an approval card owns the screen and the button.

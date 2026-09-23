@@ -106,6 +106,72 @@ fn remote_extension_requires_approval(
         && tier == heartwood_common::policy::ApprovalTier::ButtonRequired
 }
 
+/// Route a `heartwood_derive_persona` by the identity it was addressed to (see
+/// `nip46::persona_derive_route`). `None` when the params do not parse or
+/// validate, which the handler arm then reports.
+fn route_persona_derive(
+    params: &[Value],
+    personas: &[crate::personas::LoadedPersona],
+    secp: &Arc<Secp256k1<SignOnly>>,
+    served_secret: &[u8; 32],
+) -> Option<nip46::PersonaDeriveRoute> {
+    let nip46::PersonaParams { name, index } = nip46::PersonaParams::from_params(params).ok()?;
+    validate_persona_name(name).ok()?;
+    let served = served_persona(personas, secp, served_secret);
+    Some(nip46::persona_derive_route(
+        served.map(|p| (p.purpose.as_str(), p.index)),
+        &format!("nostr:persona:{name}"),
+        index,
+    ))
+}
+
+/// The registry entry of the identity a request is served as, when that
+/// identity is a persona rather than a master.
+fn served_persona<'a>(
+    personas: &'a [crate::personas::LoadedPersona],
+    secp: &Arc<Secp256k1<SignOnly>>,
+    served_secret: &[u8; 32],
+) -> Option<&'a crate::personas::LoadedPersona> {
+    let pubkey = secp256k1::Keypair::from_seckey_slice(secp, served_secret)
+        .ok()?
+        .x_only_public_key()
+        .0
+        .serialize();
+    personas.iter().find(|p| p.pubkey == pubkey)
+}
+
+/// Whether this `heartwood_derive_persona` only looks up a persona the client
+/// is already approved to act as (see
+/// `heartwood_common::policy::persona_rederive_is_lookup`). Anything that does
+/// not parse, validate or derive keeps the press.
+fn persona_rederive_is_lookup(
+    params: &[Value],
+    policy_engine: &PolicyEngine,
+    master_slot: u8,
+    client_hex: &str,
+    personas: &[crate::personas::LoadedPersona],
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+) -> bool {
+    let Ok(nip46::PersonaParams { name, index }) = nip46::PersonaParams::from_params(params) else {
+        return false;
+    };
+    if validate_persona_name(name).is_err() {
+        return false;
+    }
+    let Ok((_secret, pubkey)) =
+        derive_identity(master_secret, master_mode, &format!("nostr:persona:{name}"), index)
+    else {
+        return false;
+    };
+    heartwood_common::policy::persona_rederive_is_lookup(
+        policy_engine.find_slot_by_pubkey(master_slot, client_hex),
+        client_hex,
+        crate::personas::contains_pubkey(personas, &pubkey),
+        &pubkey,
+    )
+}
+
 /// `None` is the only outcome that permits dispatch. Denial and timeout become
 /// normal NIP-46 errors before any extension state can be touched.
 fn extension_approval_failure(request_id: &str, result: ApprovalResult) -> Option<String> {
@@ -932,7 +998,35 @@ fn dispatch_inner(
     // cannot accidentally mutate state merely by omitting approval code from
     // its individual match arm. Strict v2 denials returned above never prompt.
     // A switch's press is the gate's SWITCH TO card, never a second one.
+    let persona_route = if matches!(method, nip46::Nip46Method::HeartwoodDerivePersona) {
+        route_persona_derive(&request.params, personas, secp, master_secret)
+    } else {
+        None
+    };
+    // Refused before any card: a press could only end in the same refusal.
+    if persona_route == Some(nip46::PersonaDeriveRoute::Refuse) {
+        log::warn!("{}: refused — addressed to a persona", request.method);
+        return build_error_json(&request.id, -1, nip46::PERSONA_DERIVE_NEEDS_MASTER);
+    }
+    // A persona asked for itself answers with itself: nothing is written and
+    // the client already acts as it.
+    let rederive_lookup = persona_route == Some(nip46::PersonaDeriveRoute::SelfLookup)
+        || (has_client
+            && persona_route == Some(nip46::PersonaDeriveRoute::Master)
+            && persona_rederive_is_lookup(
+                &request.params,
+                policy_engine,
+                master_slot,
+                &client_hex,
+                personas,
+                master_secret,
+                master_mode,
+            ));
+    if rederive_lookup {
+        log::info!("{}: an existing persona this app may act as; no card", request.method);
+    }
     let own_card = !spend_granted
+        && !rederive_lookup
         && !matches!(gate_card, Some(CardKind::SwitchTo { .. }))
         && remote_extension_requires_approval(has_client, &method, tier);
 
@@ -1588,6 +1682,24 @@ fn dispatch_inner(
             // signet, the library, and the CLI's `derive persona` use, so a
             // persona reproduces byte-for-byte across all of them.
             let purpose = format!("nostr:persona:{name}");
+            match route_persona_derive(&request.params, personas, secp, master_secret) {
+                Some(nip46::PersonaDeriveRoute::Refuse) => {
+                    return build_error_json(&request.id, -1, nip46::PERSONA_DERIVE_NEEDS_MASTER);
+                }
+                Some(nip46::PersonaDeriveRoute::SelfLookup) => {
+                    if let Some(persona) = served_persona(personas, secp, master_secret) {
+                        let result = serde_json::json!({
+                            "npub": heartwood_common::encoding::encode_npub(&persona.pubkey),
+                            "purpose": persona.purpose,
+                            "index": persona.index,
+                            "personaName": name,
+                        });
+                        return nip46::build_result_response(&request.id, &result.to_string())
+                            .unwrap_or_default();
+                    }
+                }
+                _ => {}
+            }
 
             let cache = match identity_caches
                 .iter_mut()

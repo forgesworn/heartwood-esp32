@@ -1127,6 +1127,11 @@ pub fn show_change_done(display: &mut Display<'_>, title: &str, hint: &str) {
     show_status_card(display, "DONE", title, hint, OK);
 }
 
+/// A card was approved but the request behind it did not complete.
+pub fn show_not_done(display: &mut Display<'_>, title: &str, hint: &str) {
+    show_status_card(display, "NOT DONE", title, hint, DANGER);
+}
+
 /// Display an error message on the OLED.
 pub fn show_error(display: &mut Display<'_>, msg: &str) {
     let l = layout(display);

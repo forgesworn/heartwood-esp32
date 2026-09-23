@@ -2,9 +2,11 @@
 
 # Heartwood ESP32
 
-> **Beta:** firmware [`0.18.0-beta.14`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.14)
+> **Beta:** firmware [`0.18.0-beta.15`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.15)
 > retains app/persona approvals per client, and a persona derived through a
-> button card now answers relay requests without a reboot. Retained-state
+> button card answers relay requests without a reboot. A card whose request
+> fails after the press now says NOT DONE, and a persona-paired client can no
+> longer derive personas under the persona. Retained-state
 > installation, normal reboot/unlock, automatic signing and consent isolation
 > passed on the named Heltec V4. Remaining physical coverage and deferred
 > payment acceptance are recorded in the beta.13 and beta.14 release notes.

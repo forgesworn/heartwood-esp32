@@ -4677,6 +4677,11 @@ fn resolve_button_card(
         return;
     }
 
+    // A button-approved heartwood_derive_persona (or remove) changes the
+    // registry here, long after the arrival path's growth check has run. Mirror
+    // that check or the fresh persona never joins the live `#p` filters until
+    // reboot, and requests addressed to it go unanswered.
+    let personas_before = ctx.personas.len();
     for ask in card.asks {
         let request_id = ask.ask.request.id.clone();
         let rail = if !dependant {
@@ -4822,6 +4827,9 @@ fn resolve_button_card(
             ),
             Err(e) => log::warn!("[relay] approval publish for {request_id}: {e}"),
         }
+    }
+    if ctx.personas.len() != personas_before {
+        ctx.resubscribe_needed = true;
     }
 }
 

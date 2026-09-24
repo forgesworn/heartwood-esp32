@@ -1,13 +1,13 @@
 # Heartwood ESP32
 
-> Nostr private keys stored on computers are one browser exploit away from theft. Heartwood ESP32 is a hardware signing device that keeps your nsec permanently on a microcontroller — private keys never leave the chip, and signing outside an installed policy requires physical button approval.
+> Nostr private keys stored on computers are one browser exploit away from theft. Heartwood ESP32 is a hardware signing device that keeps your nsec permanently on a microcontroller: private keys never leave the chip, and signing outside an installed policy requires physical button approval.
 
 Heartwood targets Nostr developers and self-hosters who want hardware-grade key custody. It uses the nsec-tree hierarchical derivation scheme to manage multiple Nostr identities from a single master secret, with per-identity child keys derivable on demand. Supported boards: Heltec WiFi LoRa 32 V3/V4 (ESP32-S3, OLED), LilyGO/TENSTAR T-Display (classic ESP32, colour TFT, two buttons), Waveshare ESP32-C6-LCD-1.47 (RISC-V), plus a USB-tethered ESP8266 signer from a separate in-repo crate.
 
 Two deployment modes ship from the same firmware, selected at runtime from the NVS network config:
 
-- **USB-bridged (high-assurance default)** — USB-attached to a Pi running `heartwoodd`, all radios disabled, holds the master secrets. The Pi is zero-trust: all serial traffic is NIP-44 ciphertext, so even full Pi compromise cannot extract keys or forge signatures without physical button access.
-- **WiFi-standalone (opt-in)** — the ESP32 joins WiFi and talks to Nostr relays directly, running the full NIP-46 signing loop on-chip with no Pi. Stores an ordered list of up to eight WiFi networks and rotates through them on failure; reordering never resends passwords (per-SSID `keep` semantics). Relay-side management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected.
+- **USB-bridged (high-assurance default)**: USB-attached to a Pi running `heartwoodd`, all radios disabled, holds the master secrets. The Pi is zero-trust: all serial traffic is NIP-44 ciphertext, so even full Pi compromise cannot extract keys or forge signatures without physical button access.
+- **WiFi-standalone (opt-in)**: the ESP32 joins WiFi and talks to Nostr relays directly, running the full NIP-46 signing loop on-chip with no Pi. Stores an ordered list of up to eight WiFi networks and rotates through them on failure; reordering never resends passwords (per-SSID `keep` semantics). Relay-side management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected.
 
 ## Getting Started
 
@@ -24,12 +24,13 @@ Easiest end-user path: the Sapwood web console (https://sapwood.forgesworn.dev) 
 
 ## Key Concepts
 
-- **nsec-tree derivation** — HMAC-SHA256 keyed derivation producing deterministic child keys from a master secret via a `purpose/label` path (e.g. `persona/social`). Compromise of a child never threatens the root.
-- **Policy engine** — Per-master, per-client approval: exact v2 policies bound method + event-kind sets for unattended signing; everything else needs the display + button. Physical approval is a 2-second hold; on two-button boards the second button is an explicit cancel and the screen labels both.
-- **Multi-master NVS** — Up to 8 master identities. Provisioning modes: `bunker` (raw nsec), `tree-mnemonic` (BIP-39), `tree-nsec`.
-- **Encrypted at rest (opt-in)** — Seeds sealed under a PIN or a host-held 32-byte vault key; a locked WiFi device announces a per-boot unlock pubkey (kind 24135) and receives the key from the operator (kind 24136).
-- **Frame protocol** — Binary serial protocol `[magic][type][length][payload][crc32]` shared by every host tool.
-- **Signed OTA** — Releases are ed25519-signed in CI; the device verifies signature + SHA-256 and rolls back automatically. Heltec boards carry 2 MB A/B slots; 4 MB boards (T-Display, C6) update via a host-side app-only reflash instead.
+- **nsec-tree derivation**: HMAC-SHA256 keyed derivation producing deterministic child keys from a master secret via a `purpose/label` path (e.g. `persona/social`). Compromise of a child never threatens the root.
+- **Policy engine**: Per-master, per-client approval: exact v2 policies bound method + event-kind sets for unattended signing; everything else needs the display + button. Physical approval is a 2-second hold; on two-button boards the second button is an explicit cancel and the screen labels both.
+- **Multi-master NVS**: Up to 8 master identities. Provisioning modes: `bunker` (raw nsec), `tree-mnemonic` (BIP-39), `tree-nsec`.
+- **Per-client persona consent**: each pairing holds up to eight client credentials and sixteen explicit client/persona grants; consent can be withdrawn for one persona on one device, all personas on one device, or every device in the pairing.
+- **Encrypted at rest (opt-in)**: Seeds sealed under a PIN or a host-held 32-byte vault key; a locked WiFi device announces a per-boot unlock pubkey (kind 24135) and receives the key from the operator (kind 24136).
+- **Frame protocol**: Binary serial protocol `[magic][type][length][payload][crc32]` shared by every host tool.
+- **Signed OTA**: Releases are ed25519-signed in CI; the device verifies signature + SHA-256 and rolls back automatically. Heltec boards carry 2 MB A/B slots; 4 MB boards (T-Display, C6) update via a host-side app-only reflash instead.
 
 ## API Surface
 
@@ -37,14 +38,14 @@ Easiest end-user path: the Sapwood web console (https://sapwood.forgesworn.dev) 
 |-------|---------|
 | `common` | Shared crypto: nsec-tree derivation, NIP-44/NIP-04, NIP-46 types, frame protocol, policy + net-config types |
 | `firmware` | ESP32 firmware for all boards, plus the `heartwood-demo` board-check game bin |
-| `heartwoodd` | Pi/host daemon — Hard mode (bridges a USB device) and Soft mode (software-backed signer, no ESP32) |
-| `provision` | Host CLI — provision, generate, restore, and manage client slots over USB serial |
-| `sign-test` | End-to-end harness — sends NIP-46 requests over serial |
+| `heartwoodd` | Pi/host daemon: Hard mode (bridges a USB device) and Soft mode (software-backed signer, no ESP32) |
+| `provision` | Host CLI: provision, generate, restore, and manage client slots over USB serial |
+| `sign-test` | End-to-end harness: sends NIP-46 requests over serial |
 | `ota` | Host-side serial OTA tool with SHA-256 verification |
 | `ota-sign` | Release-key tool: keygen / sign / verify for firmware images |
 | `esp8266-firmware` | Bare-metal USB-tethered signer for the ESP8266 |
 
-The `common` crate has two signing backends: `k256-backend` (pure Rust, host tools/tests) and `secp256k1-backend` (libsecp256k1 C FFI, alignment-safe on Xtensa — required for firmware). Both produce identical outputs, pinned by a frozen test vector.
+The `common` crate has two signing backends: `k256-backend` (pure Rust, host tools/tests) and `secp256k1-backend` (libsecp256k1 C FFI, alignment-safe on Xtensa, required for firmware). Both produce identical outputs, pinned by a frozen test vector.
 
 ## Optional
 
@@ -52,5 +53,6 @@ The `common` crate has two signing backends: `k256-backend` (pure Rust, host too
 - Architecture: `docs/architecture.md`
 - OTA release signing runbook: `docs/ota-signing.md`
 - Hardware test checklist: `docs/HARDWARE-TEST-CHECKLIST.md`
+- Per-client persona consent: `docs/2026-09-22-per-client-consent.md`
 - Web console (flash, manage, update): https://github.com/forgesworn/sapwood
 - AI coding instructions: `CLAUDE.md`

@@ -68,6 +68,10 @@ pub struct St7789Display<'a> {
     framebuffer: Vec<Rgb565>,
     width: i32,
     height: i32,
+    /// Send the frame reversed: the picture turned through 180 degrees
+    /// (display_flip.rs). Done here rather than with the controller's
+    /// orientation so the panel window and its offsets never change.
+    flipped: bool,
 }
 
 impl<'a> St7789Display<'a> {
@@ -126,6 +130,7 @@ impl<'a> St7789Display<'a> {
             framebuffer,
             width,
             height,
+            flipped: false,
         }
     }
 
@@ -136,15 +141,19 @@ impl<'a> St7789Display<'a> {
 
     /// Blit the whole back buffer to the panel. Mirrors `Ssd1306::flush`.
     pub fn flush(&mut self) -> Result<(), St7789Error> {
-        self.panel
-            .set_pixels(
-                0,
-                0,
-                (self.width - 1) as u16,
-                (self.height - 1) as u16,
-                self.framebuffer.iter().copied(),
-            )
-            .map_err(|_| St7789Error)
+        let (ex, ey) = ((self.width - 1) as u16, (self.height - 1) as u16);
+        let sent = if self.flipped {
+            self.panel.set_pixels(0, 0, ex, ey, self.framebuffer.iter().rev().copied())
+        } else {
+            self.panel.set_pixels(0, 0, ex, ey, self.framebuffer.iter().copied())
+        };
+        sent.map_err(|_| St7789Error)
+    }
+
+    /// Turn the picture through 180 degrees, or back. Takes effect on the
+    /// next flush.
+    pub fn set_flipped(&mut self, flipped: bool) {
+        self.flipped = flipped;
     }
 
     /// Turn the panel off/on for the idle display-sleep path. Mirrors

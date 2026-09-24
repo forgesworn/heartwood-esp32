@@ -92,6 +92,15 @@ impl<'a> Display<'a> {
     pub fn set_display_on(&mut self, on: bool) -> Result<(), MonoError> {
         self.inner.set_display_on(on).map_err(|_| MonoError)
     }
+
+    /// Turn the picture through 180 degrees, or back (display_flip.rs). The
+    /// controller reverses its own scan, so the buffer is untouched.
+    pub fn set_flipped(&mut self, flipped: bool) {
+        let rotation = if flipped { DisplayRotation::Rotate180 } else { DisplayRotation::Rotate0 };
+        if let Err(e) = self.inner.set_rotation(rotation) {
+            log::warn!("OLED rotation failed: {:?}", e);
+        }
+    }
 }
 
 #[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
@@ -1071,8 +1080,10 @@ pub fn show_titled_approval(
     // below, the same graphic as the signing screens. On the T-Display the
     // two buttons are labelled on the screen edge beside them instead.
     let tagged = draw_button_tags(display);
-    let hint = if tagged {
+    let hint = if tagged && crate::button::has_button_b() {
         "hold YES or NO"
+    } else if tagged {
+        "hold PRG 2s"
     } else if crate::button::has_button_b() {
         "hold A=yes  B=no"
     } else {
@@ -1097,42 +1108,70 @@ pub fn show_titled_approval(
     }
 }
 
-/// Label the T-Display's two buttons on the screen edge beside them: green
-/// YES level with the approve button (A, GPIO0), red NO level with cancel
-/// (B, GPIO35). Returns false, drawing nothing, on any other board.
-///
-/// Words on the card ("hold lower=yes up=no") were not enough: in the
-/// 2026-09-24 rehearsal the owner could not tell which of the buttons beside
-/// the screen was which, and cancelled a restore by mistake. They sit on the
-/// right-hand edge with the screen upright.
-fn draw_button_tags(display: &mut Display<'_>) -> bool {
+/// Where a board's buttons are with the screen upright: which edge, and
+/// whether the approve button is the upper of the two. Turning the screen
+/// through 180 degrees (display_flip.rs) swaps both.
+struct ButtonEdge {
+    on_right: bool,
+    approve_on_top: bool,
+    /// A second button that cancels (the T-Display's B); `false` where the
+    /// other button is reset (the Heltec's RST).
+    cancel: bool,
+}
+
+/// The board's button layout, confirmed on the bench boards (2026-09-24).
+/// `None` where the card keeps its words only (the C6).
+fn button_edge() -> Option<ButtonEdge> {
     #[cfg(feature = "tdisplay")]
     {
-        if !crate::button::has_button_b() {
-            return false;
+        // Right-hand edge; A (GPIO0, approve) lower, B (GPIO35, cancel) upper.
+        if crate::button::has_button_b() {
+            return Some(ButtonEdge { on_right: true, approve_on_top: false, cancel: true });
         }
-        // Approve (A) is the lower of the two right-hand buttons (confirmed
-        // on the bench board, 2026-09-24).
-        const APPROVE_ON_TOP: bool = false;
-        let l = layout(display);
-        let font = l.font_small();
-        let (top, top_colour, bottom, bottom_colour) = if APPROVE_ON_TOP {
-            ("YES>", OK, "NO>", DANGER)
-        } else {
-            ("NO>", DANGER, "YES>", OK)
-        };
-        for (text, colour, y) in [(top, top_colour, l.sy(10)), (bottom, bottom_colour, l.sy(48))] {
-            let x = l.w - text.len() as i32 * Layout::glyph_w(font) - l.s(1);
-            let style = MonoTextStyleBuilder::new().font(font).text_color(colour).build();
-            Text::new(text, Point::new(x, y), style).draw(display).ok();
-        }
-        true
+        None
     }
-    #[cfg(not(feature = "tdisplay"))]
+    #[cfg(any(feature = "heltec-v3", feature = "heltec-v4"))]
     {
-        let _ = display;
-        false
+        // Left-hand edge; PRG (GPIO0) upper, RST lower.
+        Some(ButtonEdge { on_right: false, approve_on_top: true, cancel: false })
     }
+    #[cfg(not(any(feature = "tdisplay", feature = "heltec-v3", feature = "heltec-v4")))]
+    {
+        None
+    }
+}
+
+/// Label the buttons on the screen edge beside them: a green YES (PRG on the
+/// Heltec, whose other button is reset) level with approve, and a red NO
+/// level with cancel where there is one. Returns false, drawing nothing,
+/// where the layout is not known.
+///
+/// Words on the card ("hold lower=yes up=no") were not enough: in the
+/// 2026-09-24 rehearsal the owner could not tell which of the two buttons
+/// beside the T-Display's screen was which, and cancelled a restore.
+fn draw_button_tags(display: &mut Display<'_>) -> bool {
+    let Some(edge) = button_edge() else {
+        return false;
+    };
+    let flipped = crate::display_flip::is_flipped();
+    let on_right = edge.on_right != flipped;
+    let approve_on_top = edge.approve_on_top != flipped;
+    let l = layout(display);
+    let font = l.font_small();
+    let approve = if edge.cancel { "YES" } else { "PRG" };
+    let mut tags = vec![(approve, OK, approve_on_top)];
+    if edge.cancel {
+        tags.push(("NO", DANGER, !approve_on_top));
+    }
+    for (word, colour, top) in tags {
+        let text = if on_right { format!("{word}>") } else { format!("<{word}") };
+        let w = text.len() as i32 * Layout::glyph_w(font);
+        let x = if on_right { l.w - w - l.s(1) } else { l.s(1) };
+        let y = if top { l.sy(10) } else { l.sy(48) };
+        let style = MonoTextStyleBuilder::new().font(font).text_color(colour).build();
+        Text::new(&text, Point::new(x, y), style).draw(display).ok();
+    }
+    true
 }
 
 /// Show one explicit network transition. The status card has one accent rule,
@@ -1958,6 +1997,15 @@ pub fn show_info_device(
         format!("up {hours:02}:{minutes:02}:{seconds:02}")
     };
     Text::new(&uptime_line, Point::new(l.sx(4), l.sy(52)), small).draw(display).ok();
+    // display_flip::toggle_if_held answers this.
+    let flip_hint = "hold: flip screen";
+    Text::new(
+        flip_hint,
+        Point::new(l.center_x(flip_hint.len() as i32 * Layout::glyph_w(l.font_small())), l.sy(62)),
+        small,
+    )
+    .draw(display)
+    .ok();
 
     draw_page_marker(display, &l, 3, 3);
     display.flush().ok();

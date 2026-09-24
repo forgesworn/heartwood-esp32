@@ -77,7 +77,7 @@ use heartwood_common::types::{
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_PROVISION,
     FRAME_TYPE_DERIVE_IDENTITY,
     FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_RESTORE_IDENTITY,
-    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_END,
+    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_END, FRAME_TYPE_DISPLAY_FLIP,
     FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
     FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN,
     FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK, FRAME_TYPE_PHONE_UNLOCK_CMD,
@@ -465,6 +465,11 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
         // early, back to the idle identity card.
         ctx.idle_page = 0;
         show_idle_identity(ctx);
+    } else if ctx.idle_page == 2
+        && crate::display_flip::toggle_if_held(ctx.nvs, ctx.display, ctx.buttons)
+    {
+        // Turned the screen round: redraw the device page the new way up.
+        draw_relay_idle_page(ctx);
     } else if launch_offline_qr_if_requested(ctx) {
         // The physically-confirmed QR flow is self-contained and clears its
         // bearer frame before returning. Restore ordinary idle state instead
@@ -2916,6 +2921,13 @@ fn poll_usb(
             );
             frame.scrub_payload();
         }
+        FRAME_TYPE_DISPLAY_FLIP => crate::display_flip::handle_frame(
+            usb,
+            &frame.payload,
+            ctx.nvs,
+            ctx.display,
+            ctx.policy_engine.bridge_authenticated,
+        ),
         FRAME_TYPE_SET_BRIDGE_SECRET => {
             crate::session::handle_set_bridge_secret(
                 usb,
@@ -8390,8 +8402,24 @@ fn dispatch_mgmt(
             crate::phone_unlock_cmd::run(cmd, ctx.nvs, ctx.masters, ctx.display, None)
         }
 
+        // Screen orientation: upright, or turned through 180 degrees.
+        // Persisted and applied at once; grants nothing, so no press.
+        "set_display_flip" => {
+            if !is_device_op {
+                return Err("turning the screen is a device-level operation and requires the device operator".into());
+            }
+            let flip = req
+                .pointer("/params/flip")
+                .and_then(|v| v.as_bool())
+                .ok_or("set_display_flip requires params.flip (bool)")?;
+            crate::display_flip::set(ctx.nvs, ctx.display, flip)?;
+            Ok(serde_json::json!({ "flip": flip }))
+        }
+
         "get_status" => {
             let capabilities = serde_json::json!([
+                    // Screen orientation: USB frame 0x66 and set_display_flip.
+                    "display_flip_v1",
                     // Phone unlock: USB frame 0x64 and the list/revoke/
                     // set_announce_operator management methods.
                     "phone_unlock_v1",
@@ -8475,6 +8503,7 @@ fn dispatch_mgmt(
                     esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
                 } as u32,
                 "log_quiet": crate::log_quiet::read(ctx.nvs),
+                "display_flip": crate::display_flip::is_flipped(),
                 // Identity & app storage share one NVS entry table; the
                 // manager's storage gauge is driven from this (null when the
                 // stats API fails, so "unknown" is not "empty").

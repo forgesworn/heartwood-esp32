@@ -42,6 +42,10 @@ pub struct Jd9853Display<'a> {
     backlight: LedcDriver<'a>,
     // Framebuffer: W*H pixels stored as big-endian RGB565 bytes (2 bytes/pixel).
     framebuffer: Vec<u8>,
+    // Send the pixels in reverse order: the picture turned through 180
+    // degrees (display_flip.rs). The panel window is centred, but reversing
+    // here keeps MADCTL and the window exactly as they are.
+    flipped: bool,
 }
 
 impl<'a> Jd9853Display<'a> {
@@ -64,6 +68,7 @@ impl<'a> Jd9853Display<'a> {
             dc,
             backlight,
             framebuffer: vec![0u8; (W as usize) * (H as usize) * 2],
+            flipped: false,
         };
 
         disp.send_init();
@@ -187,10 +192,34 @@ impl<'a> Jd9853Display<'a> {
         self.dc.set_low().ok();
         self.spi.write(&[0x2C]).ok();
         self.dc.set_high().ok();
-        for chunk in self.framebuffer.chunks(512) {
-            self.spi.write(chunk).ok();
+        if self.flipped {
+            // Pixel order reversed, each pixel's two bytes kept in order.
+            let mut chunk = [0u8; 512];
+            let mut n = 0;
+            for px in self.framebuffer.chunks_exact(2).rev() {
+                chunk[n] = px[0];
+                chunk[n + 1] = px[1];
+                n += 2;
+                if n == chunk.len() {
+                    self.spi.write(&chunk).ok();
+                    n = 0;
+                }
+            }
+            if n > 0 {
+                self.spi.write(&chunk[..n]).ok();
+            }
+        } else {
+            for chunk in self.framebuffer.chunks(512) {
+                self.spi.write(chunk).ok();
+            }
         }
         Ok(())
+    }
+
+    /// Turn the picture through 180 degrees, or back. Takes effect on the
+    /// next flush.
+    pub fn set_flipped(&mut self, flipped: bool) {
+        self.flipped = flipped;
     }
 
     /// Turn the panel off/on for the idle display-sleep path: the backlight via

@@ -108,6 +108,15 @@ pub fn announce_operator(nvs: &EspNvs<NvsDefault>) -> bool {
     !matches!(nvs.get_blob(ANNOUNCE_OPERATOR_KEY, &mut buf), Ok(Some([0])))
 }
 
+/// Switch the operator's lock announcement on (the default) or off.
+pub fn set_announce_operator(nvs: &mut EspNvs<NvsDefault>, on: bool) -> Result<(), ()> {
+    if on {
+        nvs.remove(ANNOUNCE_OPERATOR_KEY).map(|_| ()).map_err(|_| ())
+    } else {
+        nvs.set_blob(ANNOUNCE_OPERATOR_KEY, &[0]).map_err(|_| ())
+    }
+}
+
 static DATA_KEY: Mutex<Option<[u8; DK_LEN]>> = Mutex::new(None);
 
 /// This boot's data key, if it has one.

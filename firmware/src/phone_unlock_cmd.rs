@@ -1,0 +1,174 @@
+// firmware/src/phone_unlock_cmd.rs
+//
+// Managing the phones that can unlock this board
+// (docs/specs/2026-09-24-phone-unlock-design.md section 3). One JSON command
+// set, served over the cable (frame 0x64 -> 0x65, authenticated bridge
+// session required) and, except for enrolment, over the relay management
+// channel:
+//
+//   enrol                   adds authority to unlock: needs the board
+//                           unlocked, at-rest encryption on (so a data key
+//                           exists to wrap), relays configured, and a press.
+//                           Cable only for now: the relay loop must not block
+//                           on a card (#64), and enrolment has not been moved
+//                           onto the deferred approval path.
+//   list                    ids and labels; nothing that unlocks.
+//   revoke                  deletes a phone's record, and with it its
+//                           authority. No press: removing authority is always
+//                           allowed.
+//   set_announce_operator   whether the locked board still publishes the
+//                           operator's announcement, the one stable `p` tag.
+
+use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use heartwood_common::data_key::{self, PhoneSet, LABEL_MAX};
+use heartwood_common::phone_unlock::{self, EnrolError, PhoneCmd};
+use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_PHONE_UNLOCK_RESP};
+
+use crate::data_key_store::{self, NvsBlobs};
+use crate::masters::LoadedMaster;
+use crate::serial::SerialPort;
+
+/// Handle a PHONE_UNLOCK_CMD frame (0x64).
+pub fn handle_frame(
+    usb: &mut SerialPort<'_>,
+    payload: &[u8],
+    nvs: &mut EspNvs<NvsDefault>,
+    masters: &[LoadedMaster],
+    bridge_authenticated: bool,
+    display: &mut crate::oled::Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+) {
+    if !bridge_authenticated {
+        crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
+        return;
+    }
+    let outcome = PhoneCmd::parse(payload)
+        .map_err(str::to_string)
+        .and_then(|cmd| run(cmd, nvs, masters, display, Some(buttons)));
+    match outcome {
+        Ok(answer) => crate::protocol::write_frame(
+            usb,
+            FRAME_TYPE_PHONE_UNLOCK_RESP,
+            answer.to_string().as_bytes(),
+        ),
+        Err(e) => {
+            log::warn!("phone unlock: {e}");
+            crate::protocol::write_frame(usb, FRAME_TYPE_NACK, e.as_bytes());
+        }
+    }
+}
+
+fn load(nvs: &mut EspNvs<NvsDefault>) -> Result<PhoneSet, String> {
+    data_key::load_phones(&NvsBlobs(nvs)).map_err(|_| "phone records unreadable".to_string())
+}
+
+fn save(nvs: &mut EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(), String> {
+    data_key::save_phones(&mut NvsBlobs(nvs), phones)
+        .map_err(|_| "phone storage full or failing: nothing was changed".to_string())
+}
+
+fn configured_relays(nvs: &EspNvs<NvsDefault>) -> Vec<String> {
+    crate::net_config_store::read_net_config(nvs)
+        .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
+        .map(|cfg| {
+            cfg.relays
+                .iter()
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Run one command. `buttons` is `None` on the relay path, where enrolment
+/// is refused.
+pub fn run(
+    cmd: PhoneCmd,
+    nvs: &mut EspNvs<NvsDefault>,
+    masters: &[LoadedMaster],
+    display: &mut crate::oled::Display<'_>,
+    buttons: Option<&crate::button::Buttons<'_>>,
+) -> Result<serde_json::Value, String> {
+    match cmd {
+        PhoneCmd::List => {
+            let phones = load(nvs)?;
+            Ok(phone_unlock::list_json(&phones, data_key_store::announce_operator(nvs)))
+        }
+        PhoneCmd::Revoke { id } => {
+            let mut phones = load(nvs)?;
+            phones.revoke(id).map_err(|_| format!("no phone with id {id}"))?;
+            save(nvs, &phones)?;
+            log::info!("phone unlock: revoked phone {id}");
+            Ok(serde_json::json!({ "revoked": id }))
+        }
+        PhoneCmd::SetAnnounceOperator { on } => {
+            data_key_store::set_announce_operator(nvs, on)
+                .map_err(|_| "could not save the setting".to_string())?;
+            Ok(serde_json::json!({ "announce_operator": on }))
+        }
+        PhoneCmd::Enrol { enrol_pubkey, label } => {
+            let Some(buttons) = buttons else {
+                return Err("enrolling a phone needs the cable and a press on the board".into());
+            };
+            let label = if label.is_empty() { "phone".to_string() } else { label };
+            if label.len() > LABEL_MAX {
+                return Err(format!("label longer than {LABEL_MAX} bytes"));
+            }
+            if masters.is_empty() || crate::pin::is_locked(masters) {
+                return Err("unlock the board first".into());
+            }
+            let Some(mut dk) = data_key_store::current() else {
+                return Err(
+                    "phone unlock opens encrypted storage: set a PIN or vault key first".into(),
+                );
+            };
+            let relays = configured_relays(nvs);
+            if relays.is_empty() {
+                dk.iter_mut().for_each(|b| *b = 0);
+                return Err("phone unlock needs WiFi relays configured".into());
+            }
+            let mut phones = match load(nvs) {
+                Ok(p) => p,
+                Err(e) => {
+                    dk.iter_mut().for_each(|b| *b = 0);
+                    return Err(e);
+                }
+            };
+            if phones.records().len() >= data_key::MAX_PHONES {
+                dk.iter_mut().for_each(|b| *b = 0);
+                return Err(format!("{} phones already enrolled; revoke one first", data_key::MAX_PHONES));
+            }
+
+            let title = format!("Add unlock phone?\n{label}");
+            let approved = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
+                crate::oled::show_change_approval(d, &title, remaining, 30);
+            });
+            if !matches!(approved, crate::approval::ApprovalResult::Approved) {
+                dk.iter_mut().for_each(|b| *b = 0);
+                return Err("declined on the board".into());
+            }
+
+            let enrolment = phone_unlock::enrol(
+                &mut phones,
+                &dk,
+                &enrol_pubkey,
+                &label,
+                &relays,
+                &mut |buf: &mut [u8]| crate::fill_random(buf),
+            );
+            dk.iter_mut().for_each(|b| *b = 0);
+            let enrolment = enrolment.map_err(|e| match e {
+                EnrolError::BadEnrolmentKey => "enrol_pubkey is not a valid key".to_string(),
+                EnrolError::NoRelays => "phone unlock needs WiFi relays configured".to_string(),
+                EnrolError::Phone(e) => format!("could not add the phone: {e:?}"),
+                EnrolError::Crypto(e) => format!("enrolment failed: {e}"),
+            })?;
+            // Persist before answering: a phone is never handed a secret the
+            // board did not keep. A full NVS refuses here, cleanly.
+            save(nvs, &phones)?;
+            log::info!("phone unlock: enrolled phone {} ({label})", enrolment.id);
+            crate::oled::show_change_done(display, "Phone added", &label);
+            Ok(phone_unlock::enrolment_json(&enrolment))
+        }
+    }
+}

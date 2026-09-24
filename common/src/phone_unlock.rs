@@ -311,6 +311,229 @@ pub fn judge(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Enrolment
+// ---------------------------------------------------------------------------
+
+/// What the board returns for an enrolment: the record id and the hand-off
+/// sealed to the phone's one-off enrolment key P. Sapwood relays `sealed`
+/// and `ephemeral_pubkey` to the phone without being able to read them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Enrolment {
+    pub id: u32,
+    pub ephemeral_pubkey: [u8; 32],
+    pub sealed: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnrolError {
+    Phone(crate::data_key::PhoneError),
+    BadEnrolmentKey,
+    NoRelays,
+    Crypto(&'static str),
+}
+
+/// The plaintext of an enrolment hand-off, as the phone reads it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandOff {
+    pub v: u8,
+    pub id: u32,
+    pub s: String,
+    pub relays: Vec<String>,
+}
+
+impl Drop for HandOff {
+    fn drop(&mut self) {
+        self.s.zeroize();
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&alloc::format!("{b:02x}"));
+    }
+    out
+}
+
+/// Enrol a phone: draw its slot secret S and a fresh record id, add the
+/// record (K and DK wrapped under S) to `phones`, and seal `{v, id, s, relays}`
+/// to the phone's enrolment key P with NIP-44 from a one-off key. P is used
+/// for this hand-off only and is not stored. The caller persists `phones`
+/// and returns the [`Enrolment`] only once that write has succeeded, so a
+/// phone is never handed a secret the board did not keep.
+pub fn enrol(
+    phones: &mut crate::data_key::PhoneSet,
+    dk: &[u8; 32],
+    enrol_pubkey: &[u8; 32],
+    label: &str,
+    relays: &[String],
+    rng: &mut dyn FnMut(&mut [u8]),
+) -> Result<Enrolment, EnrolError> {
+    if relays.is_empty() {
+        return Err(EnrolError::NoRelays);
+    }
+    // The enrolment key must be a real curve point, or the phone could never
+    // open the hand-off.
+    let mut probe = [0u8; 32];
+    rng(&mut probe);
+    probe[0] |= 1;
+    let probe_ok = crate::nip44::get_conversation_key(&probe, enrol_pubkey).is_ok();
+    probe.zeroize();
+    if !probe_ok {
+        return Err(EnrolError::BadEnrolmentKey);
+    }
+
+    let id = loop {
+        let mut b = [0u8; 4];
+        rng(&mut b);
+        let id = u32::from_be_bytes(b);
+        if !phones.records().iter().any(|r| r.id == id) {
+            break id;
+        }
+    };
+    let mut slot_secret = [0u8; 32];
+    rng(&mut slot_secret);
+    let mut nonce = [0u8; 12];
+    rng(&mut nonce);
+    let added = phones.enrol(id, label, &slot_secret, dk, &nonce);
+    if let Err(e) = added {
+        slot_secret.zeroize();
+        return Err(EnrolError::Phone(e));
+    }
+
+    let mut ephemeral_sk = [0u8; 32];
+    let ephemeral_pubkey = loop {
+        rng(&mut ephemeral_sk);
+        if let Ok(pk) = crate::derive::public_key_xonly(&ephemeral_sk) {
+            break pk;
+        }
+    };
+    let ck = crate::nip44::get_conversation_key(&ephemeral_sk, enrol_pubkey);
+    ephemeral_sk.zeroize();
+    let mut ck = match ck {
+        Ok(ck) => ck,
+        Err(e) => {
+            slot_secret.zeroize();
+            let _ = phones.revoke(id);
+            return Err(EnrolError::Crypto(e));
+        }
+    };
+    let relays_json = serde_json::to_string(relays).expect("strings always serialise");
+    let mut s_hex = hex_lower(&slot_secret);
+    slot_secret.zeroize();
+    let plaintext = alloc::format!("{{\"v\":1,\"id\":{id},\"s\":\"{s_hex}\",\"relays\":{relays_json}}}");
+    s_hex.zeroize();
+    let mut n44 = [0u8; 32];
+    rng(&mut n44);
+    let sealed = crate::nip44::encrypt_owned(&ck, plaintext, &n44);
+    ck.zeroize();
+    match sealed {
+        Ok(sealed) => Ok(Enrolment { id, ephemeral_pubkey, sealed }),
+        Err(e) => {
+            let _ = phones.revoke(id);
+            Err(EnrolError::Crypto(e))
+        }
+    }
+}
+
+/// The phone's side: open a hand-off with its enrolment secret key.
+pub fn open_enrolment(
+    enrol_sk: &[u8; 32],
+    ephemeral_pubkey: &[u8; 32],
+    sealed: &str,
+) -> Result<HandOff, PhoneUnlockError> {
+    let mut ck = crate::nip44::get_conversation_key(enrol_sk, ephemeral_pubkey)
+        .map_err(|_| PhoneUnlockError::NotForUs)?;
+    let plain = crate::nip44::decrypt(&ck, sealed);
+    ck.zeroize();
+    let mut plain = plain.map_err(|_| PhoneUnlockError::NotForUs)?;
+    let parsed: Result<HandOff, _> = serde_json::from_str(&plain);
+    plain.zeroize();
+    let handoff = parsed.map_err(|_| PhoneUnlockError::BadJson)?;
+    if handoff.v != 1 || handoff.s.len() != 64 {
+        return Err(PhoneUnlockError::BadJson);
+    }
+    Ok(handoff)
+}
+
+// ---------------------------------------------------------------------------
+// Management commands (USB frame 0x64, relay management methods)
+// ---------------------------------------------------------------------------
+
+/// One phone-unlock management command.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PhoneCmd {
+    /// Needs a press: it adds authority to unlock.
+    Enrol { enrol_pubkey: [u8; 32], label: String },
+    List,
+    /// No press: removing authority is always allowed.
+    Revoke { id: u32 },
+    SetAnnounceOperator { on: bool },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CmdWire {
+    op: String,
+    #[serde(default)]
+    enrol_pubkey: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    id: Option<u32>,
+    #[serde(default)]
+    on: Option<bool>,
+}
+
+impl PhoneCmd {
+    /// `{"op":"enrol","enrol_pubkey":"<64 hex>","label":"Pixel 8"}`,
+    /// `{"op":"list"}`, `{"op":"revoke","id":N}`,
+    /// `{"op":"set_announce_operator","on":false}`.
+    pub fn parse(json: &[u8]) -> Result<Self, &'static str> {
+        let w: CmdWire = serde_json::from_slice(json).map_err(|_| "malformed phone-unlock command")?;
+        match w.op.as_str() {
+            "enrol" => {
+                let hex = w.enrol_pubkey.ok_or("enrol needs enrol_pubkey")?;
+                let bytes = crate::hex::hex_decode(&hex).map_err(|_| "enrol_pubkey is not hex")?;
+                let enrol_pubkey: [u8; 32] =
+                    bytes.try_into().map_err(|_| "enrol_pubkey must be 32 bytes")?;
+                let label = w.label.unwrap_or_default().trim().into();
+                Ok(PhoneCmd::Enrol { enrol_pubkey, label })
+            }
+            "list" => Ok(PhoneCmd::List),
+            "revoke" => Ok(PhoneCmd::Revoke { id: w.id.ok_or("revoke needs id")? }),
+            "set_announce_operator" => Ok(PhoneCmd::SetAnnounceOperator {
+                on: w.on.ok_or("set_announce_operator needs on")?,
+            }),
+            _ => Err("unknown phone-unlock op"),
+        }
+    }
+}
+
+/// The `list` answer. Ids and labels only; nothing that unlocks.
+pub fn list_json(phones: &crate::data_key::PhoneSet, announce_operator: bool) -> serde_json::Value {
+    serde_json::json!({
+        "phones": phones
+            .records()
+            .iter()
+            .map(|r| serde_json::json!({ "id": r.id, "label": r.label }))
+            .collect::<Vec<_>>(),
+        "max": crate::data_key::MAX_PHONES,
+        "announce_operator": announce_operator,
+    })
+}
+
+/// The `enrol` answer.
+pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
+    serde_json::json!({
+        "id": e.id,
+        "ephemeral_pubkey": hex_lower(&e.ephemeral_pubkey),
+        "sealed": e.sealed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,4 +671,110 @@ mod tests {
         let d = Delivery { id: context.id, slot_secret: s };
         assert_eq!(fixture["delivery"].as_str().unwrap(), d.to_json());
     }
+
+    fn rng_from(seed: u8) -> impl FnMut(&mut [u8]) {
+        let mut n = seed;
+        move |buf: &mut [u8]| {
+            for b in buf.iter_mut() {
+                n = n.wrapping_mul(31).wrapping_add(7);
+                *b = n;
+            }
+        }
+    }
+
+    #[test]
+    fn enrolment_hands_the_phone_a_secret_that_unlocks_and_nothing_else() {
+        use crate::data_key::{PhoneSet, PhoneError};
+        let dk = [0xD0u8; 32];
+        let enrol_sk = [0x42u8; 32];
+        let enrol_pk = crate::derive::public_key_xonly(&enrol_sk).unwrap();
+        let relays = alloc::vec![String::from("wss://relay.example")];
+        let mut phones = PhoneSet::default();
+        let e = enrol(&mut phones, &dk, &enrol_pk, "Pixel 8", &relays, &mut rng_from(1)).unwrap();
+        assert_eq!(phones.records().len(), 1);
+        assert_eq!(phones.records()[0].id, e.id);
+
+        let handoff = open_enrolment(&enrol_sk, &e.ephemeral_pubkey, &e.sealed).unwrap();
+        assert_eq!(handoff.id, e.id);
+        assert_eq!(handoff.relays, relays);
+        let mut s = [0u8; 32];
+        for i in 0..32 {
+            s[i] = u8::from_str_radix(&handoff.s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        assert_eq!(phones.unwrap(e.id, &s), Ok(dk));
+        assert_eq!(phones.records()[0].phone_key, crate::data_key::phone_key(&s));
+
+        // Nobody else opens the hand-off.
+        assert!(open_enrolment(&[0x43u8; 32], &e.ephemeral_pubkey, &e.sealed).is_err());
+
+        // A second enrolment gets a different secret and id.
+        let e2 = enrol(&mut phones, &dk, &enrol_pk, "spare", &relays, &mut rng_from(2)).unwrap();
+        assert_ne!(e2.id, e.id);
+        assert_eq!(phones.unwrap(e2.id, &s), Err(PhoneError::WrongSecret));
+    }
+
+    #[test]
+    fn enrolment_refuses_cleanly() {
+        use crate::data_key::{PhoneError, PhoneSet, MAX_PHONES};
+        let dk = [0xD0u8; 32];
+        let enrol_pk = crate::derive::public_key_xonly(&[0x42u8; 32]).unwrap();
+        let relays = alloc::vec![String::from("wss://relay.example")];
+        let mut phones = PhoneSet::default();
+        assert_eq!(
+            enrol(&mut phones, &dk, &enrol_pk, "x", &[], &mut rng_from(1)),
+            Err(EnrolError::NoRelays)
+        );
+        // x = 0 is not on the curve.
+        assert_eq!(
+            enrol(&mut phones, &dk, &[0u8; 32], "x", &relays, &mut rng_from(1)),
+            Err(EnrolError::BadEnrolmentKey)
+        );
+        assert_eq!(
+            enrol(&mut phones, &dk, &enrol_pk, "seventeen chars!!", &relays, &mut rng_from(1)),
+            Err(EnrolError::Phone(PhoneError::LabelTooLong))
+        );
+        assert!(phones.is_empty(), "a refusal leaves no record");
+        for i in 0..MAX_PHONES {
+            enrol(&mut phones, &dk, &enrol_pk, "p", &relays, &mut rng_from(i as u8 + 10)).unwrap();
+        }
+        assert_eq!(
+            enrol(&mut phones, &dk, &enrol_pk, "p", &relays, &mut rng_from(99)),
+            Err(EnrolError::Phone(PhoneError::Full))
+        );
+    }
+
+    #[test]
+    fn commands_parse_strictly() {
+        let pk = "ab".repeat(32);
+        assert_eq!(
+            PhoneCmd::parse(alloc::format!(r#"{{"op":"enrol","enrol_pubkey":"{pk}","label":" Pixel "}}"#).as_bytes()),
+            Ok(PhoneCmd::Enrol { enrol_pubkey: [0xAB; 32], label: "Pixel".into() })
+        );
+        assert_eq!(PhoneCmd::parse(br#"{"op":"list"}"#), Ok(PhoneCmd::List));
+        assert_eq!(PhoneCmd::parse(br#"{"op":"revoke","id":7}"#), Ok(PhoneCmd::Revoke { id: 7 }));
+        assert_eq!(
+            PhoneCmd::parse(br#"{"op":"set_announce_operator","on":false}"#),
+            Ok(PhoneCmd::SetAnnounceOperator { on: false })
+        );
+        for bad in [
+            &br#"{"op":"enrol"}"#[..],
+            br#"{"op":"enrol","enrol_pubkey":"abcd"}"#,
+            br#"{"op":"revoke"}"#,
+            br#"{"op":"revoke","id":-1}"#,
+            br#"{"op":"list","extra":1}"#,
+            br#"{"op":"reset"}"#,
+            b"not json",
+        ] {
+            assert!(PhoneCmd::parse(bad).is_err(), "{}", core::str::from_utf8(bad).unwrap());
+        }
+    }
+
+    #[test]
+    fn the_list_answer_carries_no_secret() {
+        let mut phones = crate::data_key::PhoneSet::default();
+        phones.enrol(3, "Pixel", &[1u8; 32], &[2u8; 32], &[0u8; 12]).unwrap();
+        let v = list_json(&phones, false);
+        assert_eq!(v, serde_json::json!({"phones":[{"id":3,"label":"Pixel"}],"max":16,"announce_operator":false}));
+    }
+
 }

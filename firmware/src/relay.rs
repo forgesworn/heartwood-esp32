@@ -79,7 +79,7 @@ use heartwood_common::types::{
     FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
     FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN,
-    FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK,
+    FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK, FRAME_TYPE_PHONE_UNLOCK_CMD,
     FRAME_TYPE_SIGN_ENVELOPE, FRAME_TYPE_WIFI_SCAN_REQUEST,
 };
 
@@ -3008,6 +3008,15 @@ fn poll_usb(
         FRAME_TYPE_VAULT_UNLOCK => {
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"already unlocked");
         }
+        FRAME_TYPE_PHONE_UNLOCK_CMD => crate::phone_unlock_cmd::handle_frame(
+            usb,
+            &frame.payload,
+            ctx.nvs,
+            ctx.masters,
+            ctx.policy_engine.bridge_authenticated,
+            ctx.display,
+            ctx.buttons,
+        ),
 
         FRAME_TYPE_CONNSLOT_CREATE => {
             crate::connslot::handle_create(usb, &frame, ctx.policy_engine, ctx.masters, ctx.nvs)
@@ -8337,8 +8346,37 @@ fn dispatch_mgmt(
             Ok(serde_json::json!({ "quiet": quiet }))
         }
 
+        // Phones that can unlock this board. Enrolment is cable-only (it needs
+        // a press, and the relay loop must not block on a card); these three
+        // need no press. See phone_unlock_cmd.rs.
+        "list_unlock_phones" | "revoke_unlock_phone" | "set_announce_operator" => {
+            if !is_device_op {
+                return Err(format!("{method} is a device-level operation and requires the device operator"));
+            }
+            let cmd = match method {
+                "list_unlock_phones" => heartwood_common::phone_unlock::PhoneCmd::List,
+                "revoke_unlock_phone" => heartwood_common::phone_unlock::PhoneCmd::Revoke {
+                    id: req
+                        .pointer("/params/id")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|v| u32::try_from(v).ok())
+                        .ok_or("revoke_unlock_phone requires params.id")?,
+                },
+                _ => heartwood_common::phone_unlock::PhoneCmd::SetAnnounceOperator {
+                    on: req
+                        .pointer("/params/on")
+                        .and_then(|v| v.as_bool())
+                        .ok_or("set_announce_operator requires params.on")?,
+                },
+            };
+            crate::phone_unlock_cmd::run(cmd, ctx.nvs, ctx.masters, ctx.display, None)
+        }
+
         "get_status" => {
             let capabilities = serde_json::json!([
+                    // Phone unlock: USB frame 0x64 and the list/revoke/
+                    // set_announce_operator management methods.
+                    "phone_unlock_v1",
                     "client_policy_v2",
                     // Schema addendum §1.5 family flags (escalate,
                     // petition_on_deny, audit_child_wrap, bound_identity)

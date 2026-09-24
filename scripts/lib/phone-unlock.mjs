@@ -142,3 +142,22 @@ export function parseEnrolmentCode(text) {
   if (!relays.length || !relays.every(relayOk)) return null
   return { enrolPubkey, rendezvous, label, relays }
 }
+
+/**
+ * The six characters the owner compares with Cambium after enrolment, shown
+ * as "9B6 164": spoken-token's deriveToken(key, 'heartwood-unlock:enrol-check',
+ * 0, { format: 'hex', length: 6 }), i.e. the first three bytes of
+ * HMAC-SHA256(key, utf8(context) || counter_be32), with the board's one-off
+ * hand-off key as the key. The board draws it fresh for every enrolment, so an
+ * answer raced in by someone who saw the code matches one time in 16.7 million.
+ * Sapwood uses spoken-token itself; this and Cambium's checkCode are ports held
+ * to vectors it produced.
+ */
+export function checkCode(ephemeralPubkeyHex) {
+  const hex = createHmac('sha256', Buffer.from(ephemeralPubkeyHex, 'hex'))
+    .update(Buffer.concat([Buffer.from('heartwood-unlock:enrol-check'), Buffer.alloc(4)]))
+    .digest('hex')
+    .slice(0, 6)
+    .toUpperCase()
+  return `${hex.slice(0, 3)} ${hex.slice(3)}`
+}

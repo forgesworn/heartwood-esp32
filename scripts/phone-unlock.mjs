@@ -44,6 +44,7 @@ import {
   ANNOUNCE_KIND,
   DELIVERY_KIND,
   HANDOFF_KIND,
+  checkCode,
   deliveryJson,
   hintMatches,
   judge,
@@ -190,7 +191,8 @@ async function enrolFor() {
   fanout.close()
   if (!accepted.length) throw new Error(`board enrolled record ${answer.id}, but no relay accepted the hand-off; revoke it and retry`)
   console.log(`board record ${answer.id}; hand-off accepted by ${accepted.join(', ')}`)
-  console.log('the phone now asks for a fingerprint to keep the key')
+  console.log(`\n    check code ${checkCode(answer.ephemeral_pubkey)}  (the phone must show the same six characters)\n`)
+  console.log("the phone now asks for its screen lock to keep the key")
 }
 
 async function list() {

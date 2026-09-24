@@ -8,6 +8,7 @@ import {
   hintMatches,
   judge,
   openContext,
+  checkCode,
   parseEnrolmentCode,
   phoneKey,
   sealContext,
@@ -89,4 +90,10 @@ test('reads the enrolment code Cambium shows', () => {
   ]) {
     assert.equal(parseEnrolmentCode(bad), null, bad)
   }
+})
+
+// Vectors from spoken-token 2.1.0 itself; Cambium's EnrolmentTest pins the same.
+test('check codes are spoken-token hex tokens of the hand-off key', () => {
+  assert.equal(checkCode('ab'.repeat(32)), '9B6 164')
+  assert.equal(checkCode('00'.repeat(32)), 'EF1 645')
 })

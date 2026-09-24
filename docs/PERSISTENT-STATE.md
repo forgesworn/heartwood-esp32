@@ -56,6 +56,7 @@ namespace:
 | `mgmt_seen` | Legacy request-id cache left harmlessly in place but ignored; current duplicate suppression is RAM-only |
 | `root_secret` | Legacy single-master seed key; not used by the current boot path |
 | `rm_journal`, `rm_pinned` | Temporary power-loss journal and pinned-relay shadow during master removal |
+| `dk_sec`, `dk_ph`, `lk_boots`, `ann_op`, `ph_relays` | Phone unlock: the data key's PIN/vault wrapper, the packed phone records, the locked-restart count, the operator-announcement switch, and the relays the phones were last told about (written when first needed, when a relay change's update rounds finish, and when a change only dropped relays; removed with the last phone) |
 | `rng_proof` | SHA-256 of last boot's RNG self-test draw; a wipe clears it, costing one power-cycle before new key material (see above) |
 
 The factory/PIN wipe erases the partition rather than enumerating this table,

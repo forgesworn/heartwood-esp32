@@ -2179,6 +2179,57 @@ Sapwood's Backup panel, and a text editor for the decrypted file.
    statement, not an absence. Compare the file with the one from item 5: same
    empty array, different second key, different meaning.
 
+## 27. Unlock phones follow a relay change (added 2026-09-25, NOT YET BENCH-RUN)
+
+A phone listens on the relays it has been told about. A board that moves to
+relays its phones never heard of would, at its next locked restart, announce
+where no phone listens. The board now records the relays the phones were last
+told (`ph_relays`) and, while its live list has a relay missing from that
+record, tells them on the OLD relays: locked, by repeating each phone's lock
+announcement there every 5 minutes; unlocked, by a sealed relay update (a
+24135 like any other, sealed `t` = `relays`) at 0 s, 2 min, 15 min, 1 h, 6 h
+and 24 h of unlocked uptime, after which it records the live list.
+
+Needs a WiFi board with a vault key and one phone enrolled with
+`scripts/phone-unlock.mjs enrol` while the board used relay set A, a second
+relay set C sharing no relay with A, and a relay capture on A (any client
+subscribed to `{"kinds":[24135]}`).
+
+1. **In step, nothing extra.** Reset the board. The serial log has no
+   "relays changed" line and no "old relay" line; A carries only the usual
+   announcements.
+
+2. **Change to C, restart locked.** Point the board at C (Sapwood's network
+   editor or `SET_NET_CONFIG`). After the restart the log reads "relays changed
+   since the phones were told; telling them on N old relay(s)", then, after the
+   first announcement on C, "announced on old relay ..." once per A relay.
+   The capture on A shows a 24135 per phone with one `h` tag and no `p` tag,
+   from the same one-time author as the board's announcements on C.
+
+3. **The phone hears it on A and unlocks over C.** Run `phone-unlock.mjs
+   listen` with the state file still listing only A. It prompts once (the
+   repeat on C, if it listens there, is a duplicate), prints "following the
+   board to" the C relays, and delivers; the board unlocks. The state file now
+   lists A and C.
+
+4. **Unlocked, the rounds go out.** With the board unlocked on C, the log
+   shows "relay update round 1 of 6" and one "relay update on old relay"
+   line per A relay, then round 2 about 2 minutes later. The capture on A
+   shows each round's 24135s from a new author, never seen before, each the
+   same length as the lock announcements of step 2. A second `listen` run
+   against a copy of the state file that lists only A prints "relay update:
+   ..." and does NOT prompt.
+
+5. **Revoked and zero-phone boards say nothing.** Revoke the phone mid-drift
+   (`phone-unlock.mjs revoke`) and wait for the next round: the log says "no
+   phones left to tell about the relay change" and A sees nothing more.
+   Reset: no "relays changed" line (the record went with the last phone).
+
+6. **The record ends the drift.** Optional, 24 h: leave the board unlocked
+   through round 6. The log says "phones told about the relay change;
+   recorded", and a reset afterwards has no "relays changed" line. A restart
+   before round 6 starts the rounds again (RAM only) and writes nothing.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

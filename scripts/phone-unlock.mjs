@@ -7,6 +7,11 @@
 //   enrol    over USB: make a one-off enrolment key P, send PHONE_UNLOCK_CMD
 //            (0x64) {op:"enrol"}, press on the board, open the sealed
 //            hand-off with P, and keep {id, s, relays} in the state file.
+//   enrol-for  stand in for Sapwood's panel: take the code a real phone
+//            (Cambium) shows, enrol its key over USB with a press, and publish
+//            the board's sealed answer to the phone as a kind-24137 hand-off
+//            tagged with the code's rendezvous tag. Nothing here can read the
+//            slot secret: the answer is sealed to the phone's enrolment key.
 //   list     over USB: the board's enrolled phones.
 //   revoke   over USB: remove one (--id), and forget it locally.
 //   listen   over the relays, as the phone: subscribe to EVERY kind-24135
@@ -19,6 +24,7 @@
 //
 // Usage:
 //   node scripts/phone-unlock.mjs enrol  --port <port> --secret-file <bridge.secret> [--label "bench phone"]
+//   node scripts/phone-unlock.mjs enrol-for --code '<heartwood-unlock:enrol?...>' --port <port> --secret-file <bridge.secret>
 //   node scripts/phone-unlock.mjs list   --port <port> --secret-file <bridge.secret>
 //   node scripts/phone-unlock.mjs revoke --port <port> --secret-file <bridge.secret> --id <id>
 //   node scripts/phone-unlock.mjs announce-operator on|off --port <port> --secret-file <bridge.secret>
@@ -37,10 +43,13 @@ import { startPressPrompt } from './press-prompt.mjs'
 import {
   ANNOUNCE_KIND,
   DELIVERY_KIND,
+  HANDOFF_KIND,
+  checkCode,
   deliveryJson,
   hintMatches,
   judge,
   openContext,
+  parseEnrolmentCode,
 } from './lib/phone-unlock.mjs'
 
 const SESSION_AUTH = 0x21
@@ -137,6 +146,53 @@ async function enrol() {
   saveState(state)
   console.log(`enrolled as id ${handoff.id}; relays ${handoff.relays.join(', ')}`)
   console.log(`slot secret kept in ${STATE_FILE} (0600)`)
+}
+
+async function enrolFor() {
+  const code = parseEnrolmentCode(arg('--code'))
+  if (!code) {
+    console.error("enrol-for needs --code '<heartwood-unlock:enrol?...>' as the phone shows it")
+    exit(2)
+  }
+  const { finalizeEvent, RelayFanout } = await relayDeps()
+  // Connect first: the hand-off is ephemeral, and the phone is already listening.
+  const fanout = new RelayFanout(code.relays)
+  const live = await fanout.open()
+  console.log(`enrolling "${code.label}" for a phone waiting on ${live.length}/${code.relays.length} relay(s)`)
+  const answer = await usbCommand(
+    { op: 'enrol', enrol_pubkey: code.enrolPubkey, label: code.label },
+    45_000,
+    { press: `adding ${code.label} as an unlock phone` },
+  )
+  const throwaway = randomBytes(32)
+  const handoff = finalizeEvent({
+    kind: HANDOFF_KIND,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [['h', code.rendezvous]],
+    content: JSON.stringify({ id: answer.id, ephemeral_pubkey: answer.ephemeral_pubkey, sealed: answer.sealed }),
+  }, throwaway)
+  throwaway.fill(0)
+  const accepted = await new Promise((resolve) => {
+    const seen = new Set()
+    const timer = setTimeout(() => resolve([...seen]), 10_000)
+    fanout.on((data, url) => {
+      let msg
+      try { msg = JSON.parse(data) } catch { return }
+      if (msg[0] === 'OK' && msg[1] === handoff.id && msg[2] === true) {
+        seen.add(url)
+        if (seen.size === live.length) {
+          clearTimeout(timer)
+          resolve([...seen])
+        }
+      }
+    })
+    fanout.send(['EVENT', handoff])
+  })
+  fanout.close()
+  if (!accepted.length) throw new Error(`board enrolled record ${answer.id}, but no relay accepted the hand-off; revoke it and retry`)
+  console.log(`board record ${answer.id}; hand-off accepted by ${accepted.join(', ')}`)
+  console.log(`\n    check code ${checkCode(answer.ephemeral_pubkey)}  (the phone must show the same six characters)\n`)
+  console.log("the phone now asks for its screen lock to keep the key")
 }
 
 async function list() {
@@ -266,9 +322,9 @@ async function listen() {
   setTimeout(() => { fanout.close(); exit(0) }, 3000)
 }
 
-const commands = { enrol, list, revoke, listen, 'announce-operator': announceOperator }
+const commands = { enrol, 'enrol-for': enrolFor, list, revoke, listen, 'announce-operator': announceOperator }
 if (!commands[COMMAND]) {
-  console.error('usage: node scripts/phone-unlock.mjs {enrol|list|revoke|announce-operator|listen} ...')
+  console.error('usage: node scripts/phone-unlock.mjs {enrol|enrol-for|list|revoke|announce-operator|listen} ...')
   exit(2)
 }
 try {

@@ -17,6 +17,12 @@ import { createCipheriv, createHmac, hkdfSync, timingSafeEqual } from 'node:cryp
 const SALT = Buffer.from('heartwood-phone-unlock-v1')
 export const ANNOUNCE_KIND = 24135
 export const DELIVERY_KIND = 24136
+// Enrolment hand-off, Sapwood (or this bench) -> phone: an ephemeral event from
+// a throwaway key tagged ["h", R] with the phone's one-off rendezvous tag, whose
+// content is the board's enrolment answer passed through untouched. The board
+// never sees it. Cambium: unlock/Enrolment.kt.
+export const HANDOFF_KIND = 24137
+export const LABEL_MAX_BYTES = 16
 export const MAX_ANNOUNCE_AGE_SECS = 120
 export const MAX_FUTURE_SKEW_SECS = 60
 
@@ -97,4 +103,61 @@ export function judge(context, authorHex, createdAt, now, last) {
   if (last && context.boot < last.boot) return 'replay'
   if (last && context.boot === last.boot && last.author === authorHex) return 'duplicate'
   return 'prompt'
+}
+
+/**
+ * The code Cambium shows when it asks to become an unlock phone:
+ *   heartwood-unlock:enrol?v=1&p=<64 hex>&r=<32 hex>&label=<name>&relay=<url>&relay=...
+ * Returns { enrolPubkey, rendezvous, label, relays } or null. Everything in it is
+ * public: P opens only the hand-off, R is used once, the relays are where the
+ * phone waits. Mirrors Cambium's EnrolmentCode.parse.
+ */
+export function parseEnrolmentCode(text) {
+  const prefix = 'heartwood-unlock:enrol?'
+  if (typeof text !== 'string' || !text.startsWith(prefix)) return null
+  const params = []
+  for (const pair of text.slice(prefix.length).split('&')) {
+    const eq = pair.indexOf('=')
+    if (eq <= 0) continue
+    let value
+    try {
+      value = decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, ' '))
+    } catch {
+      return null
+    }
+    params.push([pair.slice(0, eq), value])
+  }
+  const one = (name) => {
+    const found = params.filter(([k]) => k === name)
+    return found.length === 1 ? found[0][1] : null
+  }
+  if (one('v') !== '1') return null
+  const enrolPubkey = one('p')
+  const rendezvous = one('r')
+  const label = one('label')
+  if (!/^[0-9a-f]{64}$/.test(enrolPubkey ?? '') || !/^[0-9a-f]{32}$/.test(rendezvous ?? '')) return null
+  if (!label?.trim() || Buffer.byteLength(label) > LABEL_MAX_BYTES) return null
+  const relays = params.filter(([k]) => k === 'relay').map(([, v]) => v)
+  const relayOk = (url) => /^wss?:\/\/\S+$/.test(url) && url.length <= 256
+  if (!relays.length || !relays.every(relayOk)) return null
+  return { enrolPubkey, rendezvous, label, relays }
+}
+
+/**
+ * The six characters the owner compares with Cambium after enrolment, shown
+ * as "9B6 164": spoken-token's deriveToken(key, 'heartwood-unlock:enrol-check',
+ * 0, { format: 'hex', length: 6 }), i.e. the first three bytes of
+ * HMAC-SHA256(key, utf8(context) || counter_be32), with the board's one-off
+ * hand-off key as the key. The board draws it fresh for every enrolment, so an
+ * answer raced in by someone who saw the code matches one time in 16.7 million.
+ * Sapwood uses spoken-token itself; this and Cambium's checkCode are ports held
+ * to vectors it produced.
+ */
+export function checkCode(ephemeralPubkeyHex) {
+  const hex = createHmac('sha256', Buffer.from(ephemeralPubkeyHex, 'hex'))
+    .update(Buffer.concat([Buffer.from('heartwood-unlock:enrol-check'), Buffer.alloc(4)]))
+    .digest('hex')
+    .slice(0, 6)
+    .toUpperCase()
+  return `${hex.slice(0, 3)} ${hex.slice(3)}`
 }

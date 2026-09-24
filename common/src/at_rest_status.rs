@@ -13,7 +13,7 @@
 // phone. See `heartwood_common::data_key::PhoneRecord` for what stays off
 // this surface (ids, labels, hints never appear here).
 
-use crate::data_key::PhoneSet;
+use crate::data_key::{PhoneSet, SecretKind};
 
 /// How the board's seeds are protected at rest. The wire spelling
 /// (`AtRestMode::wire`) is the JSON value FIRMWARE_INFO and get_status carry.
@@ -26,6 +26,14 @@ pub enum AtRestMode {
     /// Sealed under a host-held vault key (heartwoodd or Sapwood delivers it
     /// on reboot; unattended reboot).
     Vault,
+    /// Sealed, but which secret sealed it is not known — the marker is
+    /// missing or its digest no longer matches the wrapper on flash (see
+    /// `data_key::secret_kind_from_marker`). Never "pin": labelling an
+    /// unattended-vault board as PIN-protected is the dangerous wrong guess —
+    /// only a PIN_UNLOCK guess counts towards the 5-failure wipe, so it
+    /// invites typed guesses into a counter a vault board was never meant to
+    /// arm. "Encrypted" is the honest answer instead.
+    Encrypted,
 }
 
 impl AtRestMode {
@@ -35,43 +43,25 @@ impl AtRestMode {
             AtRestMode::None => "none",
             AtRestMode::Pin => "pin",
             AtRestMode::Vault => "vault",
+            AtRestMode::Encrypted => "encrypted",
         }
     }
 }
 
-/// Which secret currently wraps the data key, once at-rest encryption is on.
-///
-/// The wrapped data key (`dk_sec`) is deliberately opaque about what wrapped
-/// it — the same shape whether the secret was 4-8 PIN digits or a 32-byte
-/// vault key (see `data_key::write_secret_wrap`) — so nothing already on
-/// flash says which one is in force. Firmware persists this alongside the
-/// wrapper it describes (`firmware/src/pin.rs`, written by
-/// `enable_encryption`/`disable_encryption`, the same write that sets or
-/// clears the wrapper). It carries no cryptographic weight: a wrong or
-/// missing value only mislabels the mode a manager shows, never what unlocks
-/// the board.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SecretKind {
-    Pin,
-    Vault,
-}
-
 /// Derive the at-rest mode purely from durable state: whether any seed is
-/// sealed, and — if so — which secret the marker says wrapped it.
-///
-/// `kind` is `None` on a plaintext board (irrelevant there) and also on a
-/// board that was encrypted by firmware older than the marker. The fallback
-/// for that case is [`AtRestMode::Pin`], the more conservative label: it does
-/// not claim a host or Sapwood can unlock the board unattended when that
-/// might not be true. The marker is written the next time the secret is
-/// (re)set, which corrects a mislabelled legacy board.
+/// sealed, and — if so — what [`data_key::secret_kind_from_marker`] (or
+/// [`data_key::read_secret_kind`]) resolved the marker to. `kind` is `None`
+/// both for a plaintext board (irrelevant there) and for a sealed board whose
+/// marker is missing, malformed, or stale — both collapse to
+/// [`AtRestMode::Encrypted`], never a guessed label.
 pub fn derive_mode(encrypted: bool, kind: Option<SecretKind>) -> AtRestMode {
     if !encrypted {
         return AtRestMode::None;
     }
     match kind {
+        Some(SecretKind::Pin) => AtRestMode::Pin,
         Some(SecretKind::Vault) => AtRestMode::Vault,
-        Some(SecretKind::Pin) | None => AtRestMode::Pin,
+        None => AtRestMode::Encrypted,
     }
 }
 
@@ -79,17 +69,40 @@ pub fn derive_mode(encrypted: bool, kind: Option<SecretKind>) -> AtRestMode {
 /// blob (or its absence). Firmware reads this while locked too — phone
 /// records are stored unsealed for exactly that reason (see
 /// [`crate::data_key::PhoneRecord`]) — so the count needs no secret and no
-/// unlock. An unreadable or corrupt blob counts as zero rather than failing
-/// the whole status response, the same way an absent blob does.
-pub fn phone_count_from_blob(blob: Option<&[u8]>) -> usize {
-    blob.and_then(PhoneSet::decode)
-        .map(|set| set.records().len())
-        .unwrap_or(0)
+/// unlock.
+///
+/// `None` (JSON `null`) only for a *present* blob that fails to parse —
+/// [`crate::data_key::load_phones`]'s rule that damage is never mistaken for
+/// zero phones, carried over to the count. An absent blob (never enrolled, or
+/// cleanly cleared) is `Some(0)`, the honest zero.
+pub fn phone_count_from_blob(blob: Option<&[u8]>) -> Option<usize> {
+    match blob {
+        None => Some(0),
+        Some(bytes) => PhoneSet::count(bytes),
+    }
+}
+
+/// Reconcile the phone count with the mode. Once at-rest is "none" there is
+/// no data key left for a phone record to wrap, so a `dk_ph` blob found
+/// alongside it is orphaned, not a phone that can unlock anything — for
+/// example, removing a board's last identity drops its seeds but not `dk_ph`
+/// (`provision.rs`, `masters.rs`), or a board disabled encryption on firmware
+/// older than that cleanup. Reporting the honest position ("no encryption, no
+/// phone can unlock anything") beats surfacing stale bookkeeping, so `mode ==
+/// None` always reports zero — even over a damaged blob, since a mode of
+/// "none" makes the blob's contents moot either way.
+pub fn phone_count_for_mode(mode: AtRestMode, raw: Option<usize>) -> Option<usize> {
+    if mode == AtRestMode::None {
+        Some(0)
+    } else {
+        raw
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_key::{DK_LEN, NONCE_LEN, SLOT_SECRET_LEN};
 
     #[test]
     fn none_when_not_encrypted_whatever_the_marker() {
@@ -109,10 +122,13 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_with_no_marker_falls_back_to_pin() {
-        // A board encrypted before this marker existed. Conservative default:
-        // never claim unattended (vault) recovery that might not be true.
-        assert_eq!(derive_mode(true, None), AtRestMode::Pin);
+    fn encrypted_with_no_resolved_marker_reports_encrypted_never_pin() {
+        // A missing, malformed or stale-digest marker (see
+        // `data_key::secret_kind_from_marker`) must never be reported as
+        // "pin": only a PIN_UNLOCK guess counts towards the 5-failure wipe,
+        // so mislabelling a vault board as "pin" invites typed guesses into a
+        // counter it was never meant to arm.
+        assert_eq!(derive_mode(true, None), AtRestMode::Encrypted);
     }
 
     #[test]
@@ -120,51 +136,72 @@ mod tests {
         assert_eq!(AtRestMode::None.wire(), "none");
         assert_eq!(AtRestMode::Pin.wire(), "pin");
         assert_eq!(AtRestMode::Vault.wire(), "vault");
+        assert_eq!(AtRestMode::Encrypted.wire(), "encrypted");
     }
 
     #[test]
     fn phone_count_absent_blob_is_zero() {
-        assert_eq!(phone_count_from_blob(None), 0);
+        assert_eq!(phone_count_from_blob(None), Some(0));
     }
 
     #[test]
-    fn phone_count_corrupt_blob_is_zero() {
-        assert_eq!(phone_count_from_blob(Some(b"not a phone set")), 0);
+    fn phone_count_corrupt_blob_is_null_not_zero() {
+        assert_eq!(phone_count_from_blob(Some(b"not a phone set")), None);
     }
 
     #[test]
     fn phone_count_empty_set_is_zero() {
         let set = PhoneSet::default();
         let encoded = set.encode();
-        assert_eq!(phone_count_from_blob(Some(&encoded)), 0);
+        assert_eq!(phone_count_from_blob(Some(&encoded)), Some(0));
     }
 
     #[test]
     fn phone_count_matches_several_enrolled() {
-        let dk = [7u8; crate::data_key::DK_LEN];
+        let dk = [7u8; DK_LEN];
         let mut set = PhoneSet::default();
         for i in 0..3u32 {
-            let slot_secret = [i as u8 + 1; crate::data_key::SLOT_SECRET_LEN];
-            let nonce = [i as u8; crate::data_key::NONCE_LEN];
+            let slot_secret = [i as u8 + 1; SLOT_SECRET_LEN];
+            let nonce = [i as u8; NONCE_LEN];
             set.enrol(i, "phone", &slot_secret, &dk, &nonce)
                 .expect("enrol under the cap");
         }
         let encoded = set.encode();
-        assert_eq!(phone_count_from_blob(Some(&encoded)), 3);
+        assert_eq!(phone_count_from_blob(Some(&encoded)), Some(3));
     }
 
     #[test]
     fn phone_count_after_revoke_drops_by_one() {
-        let dk = [9u8; crate::data_key::DK_LEN];
+        let dk = [9u8; DK_LEN];
         let mut set = PhoneSet::default();
         for i in 0..2u32 {
-            let slot_secret = [i as u8 + 1; crate::data_key::SLOT_SECRET_LEN];
-            let nonce = [i as u8; crate::data_key::NONCE_LEN];
+            let slot_secret = [i as u8 + 1; SLOT_SECRET_LEN];
+            let nonce = [i as u8; NONCE_LEN];
             set.enrol(i, "phone", &slot_secret, &dk, &nonce)
                 .expect("enrol under the cap");
         }
         set.revoke(0).expect("id 0 is enrolled");
         let encoded = set.encode();
-        assert_eq!(phone_count_from_blob(Some(&encoded)), 1);
+        assert_eq!(phone_count_from_blob(Some(&encoded)), Some(1));
+    }
+
+    #[test]
+    fn none_mode_always_reports_zero_phones_even_over_a_leftover_or_damaged_blob() {
+        // Removing the last identity leaves `dk_ph` behind (provision.rs,
+        // masters.rs); once at-rest is "none" that blob is orphaned
+        // bookkeeping, not a live phone. The override applies even if the
+        // leftover blob happens to be unreadable.
+        assert_eq!(phone_count_for_mode(AtRestMode::None, Some(5)), Some(0));
+        assert_eq!(phone_count_for_mode(AtRestMode::None, None), Some(0));
+        assert_eq!(phone_count_for_mode(AtRestMode::None, Some(0)), Some(0));
+    }
+
+    #[test]
+    fn other_modes_pass_the_raw_count_through_unchanged() {
+        for mode in [AtRestMode::Pin, AtRestMode::Vault, AtRestMode::Encrypted] {
+            assert_eq!(phone_count_for_mode(mode, Some(2)), Some(2));
+            assert_eq!(phone_count_for_mode(mode, Some(0)), Some(0));
+            assert_eq!(phone_count_for_mode(mode, None), None, "{mode:?} must not paper over damage");
+        }
     }
 }

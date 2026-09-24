@@ -108,12 +108,12 @@ fn scrub(seeds: &mut [(u8, [u8; 32])]) {
 /// keep working. The write order keeps the board openable by exactly one of
 /// the old and new secret across a power cut at any point
 /// (`data_key::set_secret`, cut-tested on the host). `kind` records which
-/// secret this was, for `at_rest_mode` — see its doc comment.
+/// secret this was, for `at_rest_mode` — see `data_key::write_secret_kind`.
 fn enable_encryption(
     nvs: &mut EspNvs<NvsDefault>,
     masters: &[LoadedMaster],
     secret: &[u8],
-    kind: u8,
+    kind: data_key::SecretKind,
     display: &mut crate::oled::Display<'_>,
 ) -> Result<(), &'static str> {
     crate::oled::show_result(display, "Encrypting\nKeep power on");
@@ -130,7 +130,14 @@ fn enable_encryption(
     match outcome {
         Ok(dk) => {
             data_key_store::remember(dk);
-            set_at_rest_kind(nvs, kind);
+            // Best-effort: a failed write here never fails the enable it
+            // rides — the marker is a reporting aid, not part of the
+            // security boundary, so a manager mislabelling the mode (until
+            // the next successful unlock self-repairs it, see `try_unlock`)
+            // is the only consequence.
+            if let Err(e) = data_key::write_secret_kind(&mut NvsBlobs(nvs), kind) {
+                log::warn!("at-rest kind marker not saved: {e:?}");
+            }
             Ok(())
         }
         Err(ChangeError::NoDataKey) => {
@@ -156,7 +163,9 @@ fn disable_encryption(
     scrub(&mut seeds);
     outcome.map_err(|_| "failed to write secret")?;
     data_key_store::forget();
-    clear_at_rest_kind(nvs);
+    // Courtesy cleanup, not required for correctness: `read_secret_kind`
+    // already refuses once the wrapper it binds to is gone.
+    let _ = data_key::clear_secret_kind(&mut NvsBlobs(nvs));
     Ok(())
 }
 
@@ -164,48 +173,30 @@ fn disable_encryption(
 // At-rest mode reporting (FIRMWARE_INFO / get_status)
 // ---------------------------------------------------------------------------
 //
-// `dk_sec` is deliberately opaque about what wrapped it — see
-// `heartwood_common::at_rest_status::SecretKind` — so this one-byte marker is
-// the one addition to what `enable_encryption`/`disable_encryption` already
-// write. Answering FIRMWARE_INFO or get_status still never writes anything;
-// the marker is set (or cleared) only when the PIN or vault key itself is
-// set (or cleared).
+// The marker's encode/decode/read/write live in
+// `heartwood_common::data_key` (over `BlobStore`, host-tested there,
+// including the cut-point models). `at_rest_mode` below only reads: it never
+// writes, so answering FIRMWARE_INFO or get_status never does either. It also
+// only ever needs a *shared* `&EspNvs` — the low-heap get_status fallback
+// runs behind a `&SignCtx` and can never obtain a mutable one — which is why
+// this reads both blobs directly rather than going through the `BlobStore`
+// wrapper (`NvsBlobs` demands `&mut`, since its `set`/`remove` do) and hands
+// the bytes to the pure `secret_kind_from_marker`.
 
-const AT_REST_KIND_KEY: &str = "at_rest_kind";
-const AT_REST_KIND_PIN: u8 = 1;
-const AT_REST_KIND_VAULT: u8 = 2;
-
-/// Record which secret now wraps the data key. Best-effort: a failed write
-/// here never fails the enable it rides — the marker is a reporting aid, not
-/// part of the security boundary, so a manager mislabelling the mode is the
-/// only consequence.
-fn set_at_rest_kind(nvs: &mut EspNvs<NvsDefault>, kind: u8) {
-    if let Err(e) = nvs.set_blob(AT_REST_KIND_KEY, &[kind]) {
-        log::warn!("at-rest kind marker not saved: {e}");
-    }
-}
-
-fn clear_at_rest_kind(nvs: &mut EspNvs<NvsDefault>) {
-    let _ = nvs.remove(AT_REST_KIND_KEY);
-}
-
-/// The at-rest mode reported to a manager (FIRMWARE_INFO, get_status). Purely
-/// a read: `encryption_at_rest_active` is the durable source of truth for
-/// whether any seed is sealed, and the marker above (when present) says which
-/// secret sealed it. See `heartwood_common::at_rest_status::derive_mode` for
-/// the legacy-board fallback.
+/// The at-rest mode reported to a manager (FIRMWARE_INFO, get_status).
 pub fn at_rest_mode(nvs: &EspNvs<NvsDefault>) -> heartwood_common::at_rest_status::AtRestMode {
     let encrypted = crate::masters::encryption_at_rest_active(nvs);
-    let mut buf = [0u8; 1];
-    let kind = match nvs.get_blob(AT_REST_KIND_KEY, &mut buf) {
-        Ok(Some(b)) if b.len() == 1 && b[0] == AT_REST_KIND_VAULT => {
-            Some(heartwood_common::at_rest_status::SecretKind::Vault)
-        }
-        Ok(Some(b)) if b.len() == 1 && b[0] == AT_REST_KIND_PIN => {
-            Some(heartwood_common::at_rest_status::SecretKind::Pin)
-        }
+    let mut wrap_buf = [0u8; data_key::SECRET_WRAP_LEN];
+    let wrap = match nvs.get_blob(data_key::SECRET_WRAP_KEY, &mut wrap_buf) {
+        Ok(Some(b)) => Some(b),
         _ => None,
     };
+    let mut marker_buf = [0u8; data_key::SECRET_KIND_MARKER_LEN];
+    let marker = match nvs.get_blob(data_key::SECRET_KIND_KEY, &mut marker_buf) {
+        Ok(Some(b)) => Some(b),
+        _ => None,
+    };
+    let kind = data_key::secret_kind_from_marker(wrap, marker);
     heartwood_common::at_rest_status::derive_mode(encrypted, kind)
 }
 
@@ -262,6 +253,25 @@ pub fn try_unlock(
     }
     if let Some(dk) = unlocked.dk {
         data_key_store::remember(dk);
+    }
+
+    // Self-repair the at-rest kind marker: this path is the one place a real
+    // PIN or vault key passes through (PIN_UNLOCK, VAULT_UNLOCK, and the
+    // relay's 24136 operator vault delivery all call this function), so its
+    // length settles which kind it is — `SecretKind::from_secret_len` mirrors
+    // the same 4-8-digit-or-32-byte shape check the frame handlers already
+    // enforce before a secret ever reaches here. Fixes a marker a power cut,
+    // a failed write, or a secret changed on firmware without this marker
+    // left missing or wrong. A phone-slot unlock never reaches this function
+    // at all — it calls `data_key::unlock_with_data_key` directly and never
+    // holds a secret to derive a kind from. At most one write: skipped
+    // entirely once the marker already agrees.
+    if let Some(kind) = data_key::SecretKind::from_secret_len(secret.len()) {
+        if data_key::read_secret_kind(&store) != Some(kind) {
+            if let Err(e) = data_key::write_secret_kind(&mut store, kind) {
+                log::warn!("at-rest kind self-repair failed: {e:?}");
+            }
+        }
     }
     true
 }
@@ -385,7 +395,7 @@ pub fn handle_set_pin(
     let outcome = if payload.is_empty() {
         disable_encryption(nvs, masters).map(|()| "PIN removed")
     } else {
-        enable_encryption(nvs, masters, payload, AT_REST_KIND_PIN, display).map(|()| "PIN set")
+        enable_encryption(nvs, masters, payload, data_key::SecretKind::Pin, display).map(|()| "PIN set")
     };
 
     match outcome {
@@ -504,7 +514,7 @@ pub fn handle_vault_set(
     let outcome = if payload.is_empty() {
         disable_encryption(nvs, masters).map(|()| "Vault disabled")
     } else {
-        enable_encryption(nvs, masters, payload, AT_REST_KIND_VAULT, display).map(|()| "Vault enabled")
+        enable_encryption(nvs, masters, payload, data_key::SecretKind::Vault, display).map(|()| "Vault enabled")
     };
 
     match outcome {

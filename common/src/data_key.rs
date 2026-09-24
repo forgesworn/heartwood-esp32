@@ -45,7 +45,7 @@ use alloc::vec::Vec;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::seed_cipher::{self, SeedCipherError};
@@ -407,6 +407,59 @@ impl PhoneSet {
             return None;
         }
         Some(Self { records })
+    }
+
+    /// Count the records in a `dk_ph` blob without building one: the same
+    /// walk and validation as [`decode`](Self::decode) — magic, version, the
+    /// count ceiling, every record's shape, the wrapped DK's sealed format
+    /// and purpose byte, duplicate ids, no trailing bytes — but no
+    /// `Vec<PhoneRecord>` and no per-label `String`. This is what
+    /// FIRMWARE_INFO and get_status poll every few seconds for the phone
+    /// count; `decode`'s allocations are unnecessary cost on that path.
+    /// `None` on any malformation, exactly as `decode` would refuse it — a
+    /// damaged blob must never be counted as zero phones.
+    pub fn count(bytes: &[u8]) -> Option<usize> {
+        if bytes.len() < PHONES_HEADER_LEN
+            || bytes[..4] != PHONES_MAGIC
+            || bytes[4] != PHONES_VERSION
+        {
+            return None;
+        }
+        let count = bytes[5] as usize;
+        if count > MAX_PHONES {
+            return None;
+        }
+        let mut at = PHONES_HEADER_LEN;
+        // Stack-only duplicate-id tracking (MAX_PHONES is 16): the same check
+        // `decode` does with `records.iter().any(...)`, without a Vec.
+        let mut seen_ids = [0u32; MAX_PHONES];
+        for i in 0..count {
+            let id = u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            at += 32; // phone_key: not needed for a count
+            let label_len = *bytes.get(at)? as usize;
+            at += 1;
+            if label_len > LABEL_MAX {
+                return None;
+            }
+            if core::str::from_utf8(bytes.get(at..at + label_len)?).is_err() {
+                return None;
+            }
+            at += label_len;
+            let wrapped_dk = bytes.get(at..at + SEALED_LEN)?;
+            if !is_sealed(wrapped_dk) || wrapped_dk[5] != Purpose::PhoneWrap as u8 {
+                return None;
+            }
+            at += SEALED_LEN;
+            if seen_ids[..i].contains(&id) {
+                return None;
+            }
+            seen_ids[i] = id;
+        }
+        if at != bytes.len() {
+            return None;
+        }
+        Some(count)
     }
 }
 
@@ -836,6 +889,147 @@ pub fn clear_secret<S: BlobStore>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Secret-kind marker (FIRMWARE_INFO / get_status "at_rest": pin vs vault)
+// ---------------------------------------------------------------------------
+//
+// `dk_sec` (the wrapped data key) is deliberately opaque about what wrapped
+// it — the same shape whether the secret was 4-8 PIN digits or a 32-byte
+// vault key (`write_secret_wrap` always calls through the same `SecretKdf`)
+// — so nothing already on flash says which one is in force. This marker
+// records it for reporting only: it carries no cryptographic weight, and a
+// wrong or missing value only mislabels the mode a manager shows, never what
+// unlocks the board.
+//
+// Bound to the wrapper it describes by the first 8 bytes of SHA-256(dk_sec),
+// so a marker that predates (or otherwise disagrees with) the `dk_sec`
+// actually on flash is detected rather than trusted: a power cut between
+// `write_secret_wrap` and this write, a failed marker write, a secret changed
+// on firmware without this marker, and any other re-wrap the marker missed
+// all collapse to the same honest answer — "encrypted, kind unknown" — rather
+// than serving a stale label. `AtRestMode::Encrypted` (see `at_rest_status`)
+// is that answer.
+//
+// The write side needs `BlobStore` (it reads the current wrapper and writes
+// the marker); the read side is exposed both ways — `read_secret_kind` over
+// `BlobStore` for host tests and the self-repair check below, and the pure
+// `secret_kind_from_marker` for firmware call sites that only hold a shared
+// `&EspNvs` reference (get_status's low-heap fallback runs behind a `&SignCtx`
+// and can never obtain a mutable one).
+
+/// NVS key holding the marker. 12 characters, inside ESP-IDF's 15-character
+/// limit (see `masters.rs`'s note on `m<slot>_seed_enc`).
+pub const SECRET_KIND_KEY: &str = "at_rest_kind";
+const SECRET_KIND_DIGEST_LEN: usize = 8;
+/// kind(1) + digest prefix(8).
+pub const SECRET_KIND_MARKER_LEN: usize = 1 + SECRET_KIND_DIGEST_LEN;
+/// `dk_sec`'s fixed size: `write_secret_wrap` always seals through the current
+/// `SecretKdf`, never the legacy per-seed formats, so every `dk_sec` this
+/// module ever writes is exactly `seed_cipher::BLOB_LEN`.
+pub const SECRET_WRAP_LEN: usize = seed_cipher::BLOB_LEN;
+
+/// Which secret currently wraps the data key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SecretKind {
+    /// A human PIN, entered at every boot (P5).
+    Pin = 1,
+    /// A host-held vault key (heartwoodd or Sapwood delivers it).
+    Vault = 2,
+}
+
+impl SecretKind {
+    fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(SecretKind::Pin),
+            2 => Some(SecretKind::Vault),
+            _ => None,
+        }
+    }
+
+    /// The secret's length settles which kind it is: `PIN_UNLOCK`/`SET_PIN`
+    /// only ever carry 4-8 ASCII digits, `VAULT_UNLOCK`/`VAULT_SET` only ever
+    /// carry a 32-byte key (see `pin.rs`'s own payload-shape checks, enforced
+    /// before either ever reaches this module). Anything else is not a shape
+    /// either path accepts, so this is `None` rather than a guess.
+    pub fn from_secret_len(len: usize) -> Option<Self> {
+        match len {
+            4..=8 => Some(SecretKind::Pin),
+            32 => Some(SecretKind::Vault),
+            _ => None,
+        }
+    }
+}
+
+/// First 8 bytes of SHA-256(wrap). Not a security boundary — just enough to
+/// tell "this marker was written for this exact wrapper" from "it wasn't",
+/// with no reason for an attacker to want to force a collision: the worst a
+/// forced match does is mislabel a report, never open anything.
+fn wrap_digest(wrap: &[u8]) -> [u8; SECRET_KIND_DIGEST_LEN] {
+    let full = Sha256::digest(wrap);
+    let mut out = [0u8; SECRET_KIND_DIGEST_LEN];
+    out.copy_from_slice(&full[..SECRET_KIND_DIGEST_LEN]);
+    out
+}
+
+fn encode_secret_kind_marker(kind: SecretKind, wrap: &[u8]) -> [u8; SECRET_KIND_MARKER_LEN] {
+    let mut out = [0u8; SECRET_KIND_MARKER_LEN];
+    out[0] = kind as u8;
+    out[1..].copy_from_slice(&wrap_digest(wrap));
+    out
+}
+
+/// What the marker says, only if it is present, well-formed, AND its digest
+/// still matches `wrap`. Pure — no I/O — so a caller that only holds a shared
+/// `&EspNvs` (get_status's low-heap fallback, `pin::at_rest_mode`) can use it
+/// after reading both blobs with a plain `get_blob`.
+pub fn secret_kind_from_marker(wrap: Option<&[u8]>, marker: Option<&[u8]>) -> Option<SecretKind> {
+    let wrap = wrap?;
+    let marker = marker?;
+    if marker.len() != SECRET_KIND_MARKER_LEN {
+        return None;
+    }
+    if marker[1..] != wrap_digest(wrap)[..] {
+        return None;
+    }
+    SecretKind::from_u8(marker[0])
+}
+
+/// Write the marker for `kind`, bound to the wrapper currently on flash. A
+/// no-op (`Ok(())`) when there is no wrapper to bind to — nothing sealed,
+/// nothing to mislabel. The write itself IS verified read-back
+/// (`set_verified`, the same discipline as every other durable state change
+/// in this module): a verified write is what makes the digest binding
+/// trustworthy rather than merely hopeful. Firmware treats a write failure
+/// here as non-fatal to the PIN/vault change it rides — see `pin.rs`.
+pub fn write_secret_kind<S: BlobStore>(store: &mut S, kind: SecretKind) -> Result<(), ChangeError> {
+    let Some(wrap) = store.get(SECRET_WRAP_KEY)? else {
+        return Ok(());
+    };
+    let marker = encode_secret_kind_marker(kind, &wrap);
+    set_verified(store, SECRET_KIND_KEY, &marker, "secret-kind marker read-back")
+}
+
+/// Remove the marker (courtesy cleanup on disable — a marker left behind by a
+/// cut is harmless, since [`secret_kind_from_marker`] already refuses once
+/// its wrapper is gone).
+pub fn clear_secret_kind<S: BlobStore>(store: &mut S) -> Result<(), ChangeError> {
+    if store.get(SECRET_KIND_KEY)?.is_some() {
+        remove_verified(store, SECRET_KIND_KEY, "secret-kind marker removal")?;
+    }
+    Ok(())
+}
+
+/// [`secret_kind_from_marker`] over a [`BlobStore`]: reads both blobs, then
+/// applies the same digest binding. Used by host tests and by the self-repair
+/// check that runs after every PIN/vault-key unlock (`pin::try_unlock`) —
+/// both already hold a `BlobStore`, unlike the low-heap get_status fallback.
+pub fn read_secret_kind<S: BlobStore>(store: &S) -> Option<SecretKind> {
+    let wrap = store.get(SECRET_WRAP_KEY).ok()?;
+    let marker = store.get(SECRET_KIND_KEY).ok()?;
+    secret_kind_from_marker(wrap.as_deref(), marker.as_deref())
+}
+
 /// Read the enrolled phones. Absent is an empty set; a damaged blob is `Err`,
 /// so a caller never mistakes damage for "no phones".
 pub fn load_phones<S: BlobStore>(store: &S) -> Result<PhoneSet, UnlockError> {
@@ -1107,6 +1301,67 @@ mod tests {
         let mut purpose = good;
         purpose[PHONES_HEADER_LEN + 38 + 5] = Purpose::Seed as u8;
         assert!(PhoneSet::decode(&purpose).is_none());
+    }
+
+    #[test]
+    fn count_agrees_with_decode_on_every_case_including_damage() {
+        let dk = [0xD0; 32];
+        let mut set = PhoneSet::default();
+        set.enrol(1, "a", &s(1), &dk, &[0u8; 12]).unwrap();
+        set.enrol(2, "b", &s(2), &dk, &[0u8; 12]).unwrap();
+        let good = set.encode();
+        assert_eq!(PhoneSet::count(&good), Some(2));
+        assert_eq!(
+            PhoneSet::count(&good),
+            PhoneSet::decode(&good).map(|s| s.records().len())
+        );
+
+        // Absent-record shape is a valid, empty blob.
+        assert_eq!(PhoneSet::count(&PhoneSet::default().encode()), Some(0));
+
+        // Every malformation `phone_blob_decode_is_strict` exercises must
+        // refuse here too — a damaged blob must never count as zero.
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert_eq!(PhoneSet::count(&trailing), None);
+        assert_eq!(PhoneSet::count(&good[..good.len() - 1]), None);
+
+        let mut magic = good.clone();
+        magic[0] = b'X';
+        assert_eq!(PhoneSet::count(&magic), None);
+
+        let mut count_byte = good.clone();
+        count_byte[5] = 17;
+        assert_eq!(PhoneSet::count(&count_byte), None);
+
+        let mut dup = good.clone();
+        let second = PHONES_HEADER_LEN + 4 + 32 + 1 + 1 + SEALED_LEN;
+        dup[second..second + 4].copy_from_slice(&1u32.to_be_bytes());
+        assert_eq!(PhoneSet::count(&dup), None);
+
+        let mut label = good.clone();
+        label[PHONES_HEADER_LEN + 36] = LABEL_MAX as u8 + 1;
+        assert_eq!(PhoneSet::count(&label), None);
+
+        let mut utf8 = good.clone();
+        utf8[PHONES_HEADER_LEN + 37] = 0xFF;
+        assert_eq!(PhoneSet::count(&utf8), None);
+
+        let mut purpose = good;
+        purpose[PHONES_HEADER_LEN + 38 + 5] = Purpose::Seed as u8;
+        assert_eq!(PhoneSet::count(&purpose), None);
+    }
+
+    #[test]
+    fn count_matches_decode_at_the_sixteen_phone_ceiling() {
+        let dk = [0xD0; 32];
+        let mut set = PhoneSet::default();
+        for id in 0..MAX_PHONES as u32 {
+            set.enrol(id, "sixteen chars ok", &s(id as u8), &dk, &[0u8; 12])
+                .unwrap();
+        }
+        let bytes = set.encode();
+        assert_eq!(PhoneSet::count(&bytes), Some(MAX_PHONES));
     }
 
     // -- storage model -----------------------------------------------------
@@ -1554,6 +1809,186 @@ mod tests {
             Err(ChangeError::NoDataKey)
         );
         assert_eq!(boot_with(&m, PIN_A), Some(seeds()));
+    }
+
+    // -- secret-kind marker --------------------------------------------------
+
+    #[test]
+    fn secret_kind_from_len_matches_the_frame_payload_rules() {
+        for len in 4..=8 {
+            assert_eq!(SecretKind::from_secret_len(len), Some(SecretKind::Pin), "len {len}");
+        }
+        assert_eq!(SecretKind::from_secret_len(32), Some(SecretKind::Vault));
+        for len in [0, 1, 2, 3, 9, 16, 31, 33, 64] {
+            assert_eq!(SecretKind::from_secret_len(len), None, "len {len}");
+        }
+    }
+
+    #[test]
+    fn writing_the_marker_with_no_wrapper_is_a_noop() {
+        let mut m = Mem::default();
+        assert_eq!(write_secret_kind(&mut m, SecretKind::Pin), Ok(()));
+        assert!(!m.map.contains_key(SECRET_KIND_KEY));
+        assert_eq!(read_secret_kind(&m), None);
+    }
+
+    #[test]
+    fn marker_round_trips_and_a_re_wrap_it_missed_reports_none() {
+        let mut m = legacy_board(PIN_A);
+        unlock_and_migrate(&mut m, PIN_A).unwrap();
+        write_secret_kind(&mut m, SecretKind::Pin).unwrap();
+        assert_eq!(read_secret_kind(&m), Some(SecretKind::Pin));
+
+        // A re-wrap (secret change) that does not also rewrite the marker —
+        // modelling a power cut between `write_secret_wrap` and the marker
+        // write, or older firmware that never wrote one at all — leaves a
+        // marker whose digest no longer matches `dk_sec`. It must not be
+        // trusted: `secret_kind_from_marker`'s caller derives `Encrypted`.
+        let dk = unlock_and_migrate(&mut m, PIN_A).unwrap().dk;
+        set_secret(&mut m, PIN_B, &seeds(), dk, &CheapKdf, &mut Board::default()).unwrap();
+        assert_eq!(read_secret_kind(&m), None, "stale marker must not be trusted");
+
+        // Rewriting it for the new wrapper repairs it.
+        write_secret_kind(&mut m, SecretKind::Pin).unwrap();
+        assert_eq!(read_secret_kind(&m), Some(SecretKind::Pin));
+    }
+
+    #[test]
+    fn a_tampered_digest_is_refused_like_a_missing_marker() {
+        let mut m = legacy_board(PIN_A);
+        unlock_and_migrate(&mut m, PIN_A).unwrap();
+        write_secret_kind(&mut m, SecretKind::Vault).unwrap();
+        m.map.get_mut(SECRET_KIND_KEY).unwrap()[1] ^= 1;
+        assert_eq!(read_secret_kind(&m), None);
+    }
+
+    #[test]
+    fn enabling_and_marking_survives_a_cut_at_every_write() {
+        let start = plaintext_board();
+        sweep(
+            &start,
+            &|m| {
+                set_secret(m, PIN_A, &seeds(), None, &CheapKdf, &mut Board::default())?;
+                write_secret_kind(m, SecretKind::Pin)
+            },
+            &|m, cut, apply| {
+                // Whatever the cut point, the board is safely one of two
+                // states: the marker never landed (falls back to
+                // `Encrypted`, never a wrong claim) or it landed correctly.
+                // A cut can never leave it landed but wrong.
+                assert!(
+                    matches!(read_secret_kind(m), None | Some(SecretKind::Pin)),
+                    "cut {cut} apply {apply}"
+                );
+                // The cut never weakens the secret-change guarantee itself.
+                assert_eq!(boot_with(m, PIN_A), Some(seeds()), "cut {cut} apply {apply}");
+            },
+        );
+    }
+
+    #[test]
+    fn changing_the_secret_and_remarking_survives_a_cut_at_every_write() {
+        let mut start = legacy_board(PIN_A);
+        let dk = unlock_and_migrate(&mut start, PIN_A).unwrap().dk;
+        {
+            let mut m = start.reboot();
+            write_secret_kind(&mut m, SecretKind::Pin).unwrap();
+            start = m;
+        }
+        sweep(
+            &start.reboot(),
+            &|m| {
+                set_secret(m, PIN_B, &seeds(), dk, &CheapKdf, &mut Board::default())?;
+                write_secret_kind(m, SecretKind::Vault)
+            },
+            &|m, cut, apply| {
+                let a = boot_with(m, PIN_A);
+                let b = boot_with(m, PIN_B);
+                assert!(
+                    (a == Some(seeds())) ^ (b == Some(seeds())),
+                    "cut {cut} apply {apply}: exactly one secret must open the board"
+                );
+                // Whichever secret is in force, the marker is never a wrong
+                // claim: it agrees with whichever wrapper actually landed, or
+                // it is absent (`Encrypted`).
+                let kind = read_secret_kind(m);
+                if b == Some(seeds()) {
+                    assert!(
+                        matches!(kind, None | Some(SecretKind::Vault)),
+                        "cut {cut} apply {apply}: new wrapper landed but marker says {kind:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(kind, None | Some(SecretKind::Pin)),
+                        "cut {cut} apply {apply}: old wrapper still in force but marker says {kind:?}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn clearing_the_secret_and_its_marker_survives_a_cut_at_every_write() {
+        let mut start = legacy_board(PIN_A);
+        unlock_and_migrate(&mut start, PIN_A).unwrap();
+        write_secret_kind(&mut start, SecretKind::Pin).unwrap();
+        sweep(
+            &start.reboot(),
+            &|m| {
+                clear_secret(m, &seeds())?;
+                clear_secret_kind(m)
+            },
+            &|m, cut, apply| {
+                // Cleared or not, the marker is never trusted once it might
+                // disagree with the wrapper: `secret_kind_from_marker`
+                // requires the wrapper to still be present at all.
+                if m.map.contains_key(SECRET_WRAP_KEY) {
+                    assert_eq!(
+                        boot_with(m, PIN_A),
+                        Some(seeds()),
+                        "cut {cut} apply {apply}"
+                    );
+                } else {
+                    assert_eq!(read_secret_kind(m), None, "cut {cut} apply {apply}");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn self_repair_writes_only_when_the_marker_is_missing_or_wrong() {
+        // Mirrors `pin::try_unlock`'s rule after a successful PIN_UNLOCK,
+        // VAULT_UNLOCK or 24136 operator delivery: fix the marker if it
+        // disagrees with what the secret's length implies, and touch nothing
+        // if it already agrees. Phone-slot unlocks never call this at all —
+        // they go through `unlock_with_data_key`, which never sees a secret.
+        fn repair(m: &mut Mem, secret_len: usize) -> bool {
+            match SecretKind::from_secret_len(secret_len) {
+                Some(kind) if read_secret_kind(m) != Some(kind) => {
+                    write_secret_kind(m, kind).unwrap();
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        let mut m = legacy_board(PIN_A);
+        unlock_and_migrate(&mut m, PIN_A).unwrap();
+        assert_eq!(read_secret_kind(&m), None, "no marker yet — a legacy board");
+
+        // Missing marker: PIN_UNLOCK's secret (PIN_A, 4 bytes) repairs it.
+        assert!(repair(&mut m, PIN_A.len()));
+        assert_eq!(read_secret_kind(&m), Some(SecretKind::Pin));
+
+        // Already correct: no further write.
+        assert!(!repair(&mut m, PIN_A.len()));
+
+        // Wrong marker (still "pin" from above; a board mislabelled by an
+        // earlier bug, or a re-wrap the marker missed): a 32-byte secret
+        // arriving through this same unlock path corrects it to "vault".
+        assert!(repair(&mut m, 32));
+        assert_eq!(read_secret_kind(&m), Some(SecretKind::Vault));
+        assert!(!repair(&mut m, 32));
     }
 
     #[test]

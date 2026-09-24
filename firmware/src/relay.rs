@@ -5638,11 +5638,16 @@ fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
 /// no-PSRAM heap. get_status is polled every few seconds, so the poll that
 /// reports a starved heap must never itself be the allocation that reboots the
 /// signer. `truncated` tells the manager the request log was omitted this poll.
-fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize) -> String {
+///
+/// `is_device_op` gates this exactly as the full reply does (`dispatch_mgmt`'s
+/// `get_status` arm): a per-identity delegate never sees the device-wide
+/// fields — `master_count`, `relay`, `crashed_during`, `at_rest`,
+/// `unlock_phone_count` and the rest — even under heap pressure. The fallback
+/// must never be a wider leak than the reply it stands in for.
+fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op: bool) -> String {
     let master_hex = hex_encode(&ctx.masters[master_idx].pubkey);
-    serde_json::json!({
-        "id": id,
-        "result": {
+    let result = if is_device_op {
+        serde_json::json!({
             "master_count": ctx.masters.len(),
             "master_npub_hex": master_hex,
             "mode": "wifi-standalone",
@@ -5657,14 +5662,41 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize) -> String {
             "log_quiet": crate::log_quiet::read(ctx.nvs),
             // Same fields as the full reply (plan G2) — cheap reads, so the
             // degraded-heap path still answers them.
-            "at_rest": crate::pin::at_rest_mode(ctx.nvs).wire(),
-            "unlock_phone_count": crate::unlock_phone_count(ctx.nvs),
+            "at_rest": at_rest_json(ctx.nvs),
+            "unlock_phone_count": unlock_phone_count_json(ctx.nvs),
             "version": env!("CARGO_PKG_VERSION"),
             "board": crate::board::BOARD,
             "truncated": true,
-        }
-    })
-    .to_string()
+        })
+    } else {
+        // The reduced shape a delegate's normal get_status reply carries
+        // (see `dispatch_mgmt`), minus `capabilities`, `slots` and
+        // `client_storage_ready` — the low-heap path should not spend memory
+        // on the policy-engine calls those need either.
+        serde_json::json!({
+            "master_npub_hex": master_hex,
+            "mode": "wifi-standalone",
+            "version": env!("CARGO_PKG_VERSION"),
+            "board": crate::board::BOARD,
+            "truncated": true,
+        })
+    };
+    serde_json::json!({ "id": id, "result": result }).to_string()
+}
+
+/// `pin::at_rest_mode`'s wire spelling, for the `serde_json::json!` call
+/// sites in this file (`firmware_info_json` in `main.rs` has its own copy —
+/// see `json_usize_or_null` there — since it builds JSON by hand instead).
+fn at_rest_json(nvs: &EspNvs<NvsDefault>) -> &'static str {
+    crate::pin::at_rest_mode(nvs).wire()
+}
+
+/// `unlock_phone_count` reconciled with the at-rest mode (plan G2): once the
+/// mode is "none" a leftover `dk_ph` blob is orphaned, not a live phone (see
+/// `at_rest_status::phone_count_for_mode`).
+fn unlock_phone_count_json(nvs: &EspNvs<NvsDefault>) -> Option<usize> {
+    let mode = crate::pin::at_rest_mode(nvs);
+    heartwood_common::at_rest_status::phone_count_for_mode(mode, crate::unlock_phone_count(nvs))
 }
 
 /// NIP-46 signing path (kind 24133): resolve the addressed identity → decrypt →
@@ -6426,7 +6458,7 @@ fn handle_mgmt_event(
             "[relay] get_status response ({} B) too large for free heap; sending minimal status",
             response_json.len()
         );
-        minimal_status_json(&id, ctx, master_idx)
+        minimal_status_json(&id, ctx, master_idx, is_device_op)
     } else {
         log::warn!(
             "[relay] mgmt {method} response ({} B) too large for free heap; returning error instead of risking a crash",
@@ -8488,9 +8520,14 @@ fn dispatch_mgmt(
             // this from side effects it happened to witness (an enrolled
             // phone, a seal seen this session). Pure reads of durable state,
             // same as everything else in this branch; never a phone id,
-            // label or hint.
-            let at_rest = crate::pin::at_rest_mode(ctx.nvs).wire();
-            let unlock_phone_count = crate::unlock_phone_count(ctx.nvs);
+            // label or hint. `unlock_phone_count` is `null` over a damaged
+            // phone blob, never a false "zero" — except once `at_rest` is
+            // "none", which always reports zero (see `phone_count_for_mode`).
+            let at_rest = crate::pin::at_rest_mode(ctx.nvs);
+            let unlock_phone_count = heartwood_common::at_rest_status::phone_count_for_mode(
+                at_rest,
+                crate::unlock_phone_count(ctx.nvs),
+            );
             Ok(serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,
@@ -8528,7 +8565,7 @@ fn dispatch_mgmt(
                 // `locked_relay_phase` instead, which never reaches
                 // `dispatch_mgmt`; FIRMWARE_INFO is the surface that reports
                 // this while locked (see its doc comment).
-                "at_rest": at_rest,
+                "at_rest": at_rest.wire(),
                 "unlock_phone_count": unlock_phone_count,
                 // Running firmware, so managers can show version state over
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.

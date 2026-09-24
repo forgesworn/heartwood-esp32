@@ -468,13 +468,38 @@ changes hands:
   authentication **and** physical button confirmation, so a remote party can
   never change the at-rest posture.
 - `FIRMWARE_INFO` and the relay `get_status` reply also carry `at_rest`
-  (`none`/`pin`/`vault`) and `unlock_phone_count`, so a manager stops
-  inferring the mode from side effects it happened to witness. Both are pure
-  reads — see `common/src/at_rest_status.rs`. `FIRMWARE_INFO` answers this to
-  any USB host, in any mode, including while locked (the same trust level as
-  its other operational fields — uptime, RNG state, crash context); `relay`
-  `get_status` only once genuinely unlocked, and only to the device operator,
-  never a per-identity delegate. Neither ever names a phone.
+  (`none`/`pin`/`vault`/`encrypted`) and `unlock_phone_count`, so a manager
+  stops inferring the mode from side effects it happened to witness. Both are
+  pure reads — see `common/src/at_rest_status.rs`. `FIRMWARE_INFO` answers
+  this to any USB host, in any mode, including while locked (the same trust
+  level as its other operational fields — uptime, RNG state, crash context);
+  `relay` `get_status` only once genuinely unlocked, and only to the device
+  operator, never a per-identity delegate — including its low-heap
+  `minimal_status_json` fallback, which used to leak `master_count`, `relay`
+  and `crashed_during` to a delegate too (now fixed alongside this). Neither
+  ever names a phone. `unlock_phone_count` is `null`, never `0`, over a
+  damaged phone blob — except once `at_rest` is `none`, which always reports
+  `0` (a leftover `dk_ph` from removing the last identity, or from disabling
+  encryption on older firmware, is moot once there is no data key left for it
+  to wrap).
+- The wrapped data key (`dk_sec`) does not itself record which secret wrapped
+  it — same shape for a PIN and a vault key — so telling `pin` from `vault`
+  needed a marker (`common/src/data_key.rs`: kind byte + the first 8 bytes of
+  SHA-256(dk_sec), read/written over `BlobStore` so the module's own
+  power-cut model tests cover it). The digest binds the marker to the
+  wrapper it describes: a marker that no longer matches — a cut between the
+  wrap write and the marker write, a failed marker write, a secret changed on
+  firmware that predates this marker, or any other re-wrap the marker missed
+  — reports `encrypted` (sealed, kind unknown) rather than a guess.
+  Deliberately never a `pin` fallback: only a `PIN_UNLOCK` guess counts
+  towards the 5-failure wipe, so mislabelling an unattended vault board as
+  PIN-protected would invite typed guesses into a counter it was never meant
+  to arm. The board's own next successful unlock self-repairs a missing or
+  wrong marker: `PIN_UNLOCK`, `VAULT_UNLOCK` and the relay's 24136 operator
+  vault delivery all resolve through `pin::try_unlock`, and the secret's
+  length settles which kind it is (4-8 digits vs 32 bytes) — at most one
+  write, since an already-correct marker is left alone. A phone-slot unlock
+  never sees the secret and never touches the marker.
 
 Security properties and honest residuals:
 

@@ -126,6 +126,11 @@ pub mod note_seal;
 #[cfg(feature = "seed-encrypt")]
 pub mod data_key;
 
+/// Phone unlock on the wire: per-phone lock announcements, deliveries and the
+/// phone's prompt rule.
+#[cfg(all(feature = "seed-encrypt", feature = "nip44", feature = "nip46"))]
+pub mod phone_unlock;
+
 #[cfg(feature = "mnemonic")]
 pub mod restore;
 

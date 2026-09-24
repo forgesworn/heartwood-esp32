@@ -1446,14 +1446,15 @@ fn dispatch_inner(
                                 }
                                 // Update label from app metadata if slot is still "default".
                                 if !app_label.is_empty() {
-                                    let slots = policy_engine.slots_mut(master_slot);
-                                    if let Some(s) =
-                                        slots.iter_mut().find(|s| s.slot_index == slot_index)
-                                    {
-                                        if s.label == "default" {
-                                            s.label = app_label.clone();
+                                    policy_engine.with_slots_keeping_approvals(master_slot, |slots| {
+                                        if let Some(s) =
+                                            slots.iter_mut().find(|s| s.slot_index == slot_index)
+                                        {
+                                            if s.label == "default" {
+                                                s.label = app_label.clone();
+                                            }
                                         }
-                                    }
+                                    });
                                 }
                                 log::info!(
                                     "Slot {} ({}) assigned to {}",

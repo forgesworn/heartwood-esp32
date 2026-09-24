@@ -295,6 +295,52 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// Why a restore was refused: the byte after the 0x00 of a refused
+/// BACKUP_IMPORT_RESPONSE. Firmware before this sent the 0x00 alone, so a
+/// host reading a one-byte refusal knows only that it failed.
+///
+/// Before these, every refusal read as "confirm the prompt", including a
+/// restore the owner had approved that then ran out of storage (the
+/// 2026-09-24 rehearsal onto a T-Display). The codes are wire format: never
+/// renumber one, only add.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ImportRefusal {
+    /// The payload is not a backup this firmware can read.
+    Malformed = 1,
+    /// No app slots and no bridge secret: nothing to do.
+    NothingToRestore = 2,
+    /// One identity carries more slots than a board holds.
+    TooManySlots = 3,
+    /// A slot fails the policy checks every signed-in path applies.
+    InvalidSlot = 4,
+    /// The same identity appears twice.
+    DuplicateIdentity = 5,
+    /// None of the backup's identities is provisioned on this board.
+    NoMatchingIdentity = 6,
+    /// The owner declined, or let the card time out.
+    Declined = 7,
+    /// Writing the pairings failed (in practice: storage full) and the board
+    /// is back exactly as it was.
+    StorageFailed = 8,
+    /// Writing failed and putting the old pairings back could not be
+    /// verified either.
+    StorageFault = 9,
+}
+
+impl ImportRefusal {
+    /// The whole BACKUP_IMPORT_RESPONSE payload for this refusal.
+    pub fn response(self) -> [u8; 2] {
+        [0x00, self as u8]
+    }
+}
+
+/// NACK payload when a backup is asked for without an authenticated bridge
+/// session. The same words the import path and `vault.ts` already use.
+pub const BACKUP_NACK_AUTH: &[u8] = b"bridge auth required";
+/// NACK payload when the owner declines an export on the board.
+pub const BACKUP_NACK_DECLINED: &[u8] = b"declined on the board";
+
 /// Read `note_inventory_unreadable` the way the inventory itself is read:
 /// anything that is not a valid u32 is treated as absent (0), never as an
 /// error, so a garbage count cannot block the restore of identities and
@@ -805,5 +851,25 @@ mod tests {
         let ok = r#"{"created_at":1,"device_id":"dd","bridge_secret":"ee","masters":[],
                      "note_inventory_unreadable":4}"#;
         assert_eq!(serde_json::from_str::<BackupPayload>(ok).unwrap().note_inventory_unreadable, 4);
+    }
+
+    #[test]
+    fn import_refusal_codes_are_wire_format() {
+        // Sapwood maps these numbers to messages: a renumbering would tell
+        // the owner the wrong thing, so pin every one.
+        let pinned = [
+            (ImportRefusal::Malformed, 1),
+            (ImportRefusal::NothingToRestore, 2),
+            (ImportRefusal::TooManySlots, 3),
+            (ImportRefusal::InvalidSlot, 4),
+            (ImportRefusal::DuplicateIdentity, 5),
+            (ImportRefusal::NoMatchingIdentity, 6),
+            (ImportRefusal::Declined, 7),
+            (ImportRefusal::StorageFailed, 8),
+            (ImportRefusal::StorageFault, 9),
+        ];
+        for (reason, code) in pinned {
+            assert_eq!(reason.response(), [0x00, code]);
+        }
     }
 }

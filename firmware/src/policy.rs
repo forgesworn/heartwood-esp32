@@ -31,6 +31,22 @@ use heartwood_common::policy::{
 /// that every logically permitted combination fits physically.
 const MAX_SLOT_BLOB_BYTES: usize = 64 * 1024;
 
+/// Drop every cached avatar (`imav<slot>`, written by identity_meta.rs) and
+/// keep the names. Returns how many went.
+///
+/// An avatar is a display nicety Sapwood can send again; the pairing table it
+/// competes with for NVS cannot be re-created. On a 24 KiB partition an
+/// 8 KiB avatar left no room for an 11-pairing table, so a restore the owner
+/// had approved failed with "Storage error" (T-Display, 2026-09-24). Called
+/// only when a pairing write fails. Spelt out here rather than in
+/// identity_meta.rs because this file is also host-tested on its own.
+fn evict_avatar_cache(nvs: &mut EspNvs<NvsDefault>) -> usize {
+    // masters::MAX_MASTERS
+    (0..8u8)
+        .filter(|slot| matches!(nvs.remove(&format!("imav{slot}")), Ok(true)))
+        .count()
+}
+
 /// Maximum concurrent client sessions.
 pub const MAX_SESSIONS: usize = 32;
 
@@ -939,7 +955,17 @@ impl PolicyEngine {
                     false
                 }
                 Ok(json) => {
-                    if let Err(e) = nvs.set_blob(&key, json.as_bytes()) {
+                    let mut written = nvs.set_blob(&key, json.as_bytes());
+                    // Pairings outrank the avatar cache: if the write fails
+                    // (in practice, NVS full), drop the avatars and try once
+                    // more before refusing.
+                    if written.is_err() && evict_avatar_cache(nvs) > 0 {
+                        log::warn!(
+                            "Slot table for slot {master_slot} did not fit: dropped cached avatars, retrying"
+                        );
+                        written = nvs.set_blob(&key, json.as_bytes());
+                    }
+                    if let Err(e) = written {
                         log::error!("Failed to persist slots for slot {master_slot}: {e:?}");
                     }
                     // A success return from set_blob is not the authority

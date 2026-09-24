@@ -688,6 +688,27 @@ fn durable_rollback_restores_prior_authority_after_failed_write() {
 }
 
 #[test]
+fn full_storage_drops_the_avatar_cache_before_refusing_pairings() {
+    // A pairing write that fails is retried once after the cached avatars go:
+    // they can be sent again, the pairings cannot. Names stay.
+    let mut nvs = EspNvs::new();
+    nvs.backend.seed("imav0", &[1, 1, 0, 0]);
+    nvs.backend.seed("imav2", &[1, 1, 0, 0]);
+    nvs.backend.seed("iman0", b"TheCryptoDonkey");
+    let mut engine = PolicyEngine::new();
+    engine.create_slot(0, "app".into(), secret_hex(0x06)).unwrap();
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert!(engine.persist_slots(&mut nvs, 0), "the retry after eviction lands");
+    assert!(!nvs.backend.contains("imav0") && !nvs.backend.contains("imav2"));
+    assert!(nvs.backend.contains("iman0"), "the name is not a cache");
+
+    // Nothing left to drop: the failure is reported, not retried.
+    engine.create_slot(0, "second".into(), secret_hex(0x07)).unwrap();
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert!(!engine.persist_slots(&mut nvs, 0));
+}
+
+#[test]
 fn rollback_failure_quarantines_master_and_denies_lookup() {
     // Compensation write also fails: master is quarantined, list_slots empty,
     // and find_slot_by_pubkey denies lookups.

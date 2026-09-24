@@ -62,6 +62,32 @@ pub fn verify_bridge_secret(payload: &[u8], nvs: &EspNvs<NvsDefault>) -> Option<
     Some(diff == 0)
 }
 
+/// Handle a SESSION_END frame (0x2D): forget the bridge authentication.
+///
+/// Authentication used to last until reboot, so once Sapwood let go of the
+/// port the next program to open it inherited an authenticated session
+/// (restore rehearsal, 2026-09-24). Sapwood now ends its session when it
+/// disconnects. The payload must be the bridge secret: an unauthenticated
+/// peer must not be able to knock a working bridge off either (FW-M1).
+/// `authenticated` is the flag to clear: the policy engine's in the main loop,
+/// the vault session's while locked.
+pub fn handle_end(
+    usb: &mut SerialPort<'_>,
+    payload: &[u8],
+    nvs: &EspNvs<NvsDefault>,
+    authenticated: &mut bool,
+) {
+    if verify_bridge_secret(payload, nvs) == Some(true) {
+        if *authenticated {
+            log::info!("Bridge session ended by the host");
+        }
+        *authenticated = false;
+        protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
+    } else {
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"wrong bridge secret");
+    }
+}
+
 /// Handle a SESSION_AUTH frame (0x21).
 ///
 /// The bridge sends its 32-byte shared secret; we compare it in constant time

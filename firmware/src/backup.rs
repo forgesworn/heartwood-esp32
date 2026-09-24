@@ -5,7 +5,9 @@
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use zeroize::Zeroize;
 
-use heartwood_common::backup::{BackupMaster, BackupPayload};
+use heartwood_common::backup::{
+    BackupMaster, BackupPayload, ImportRefusal, BACKUP_NACK_DECLINED,
+};
 use heartwood_common::hex::hex_encode;
 use heartwood_common::types::{
     FRAME_TYPE_BACKUP_EXPORT_RESPONSE, FRAME_TYPE_BACKUP_IMPORT_RESPONSE,
@@ -96,7 +98,7 @@ pub fn handle_export(
 
     if !matches!(result, crate::approval::ApprovalResult::Approved) {
         log::info!("Backup export denied by user");
-        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        protocol::write_frame(usb, FRAME_TYPE_NACK, BACKUP_NACK_DECLINED);
         return;
     }
 
@@ -161,7 +163,7 @@ pub fn handle_export(
         }
         Err(e) => {
             log::error!("Backup export serialisation failed: {e}");
-            protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+            protocol::write_frame(usb, FRAME_TYPE_NACK, b"export failed on the board");
             crate::oled::show_error(display, "Backup export\nfailed");
             esp_idf_hal::delay::FreeRtos::delay_ms(1500);
         }
@@ -207,7 +209,7 @@ pub fn handle_import(
         Ok(b) => b,
         Err(e) => {
             log::error!("Backup import: invalid JSON: {e}");
-            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &ImportRefusal::Malformed.response());
             return;
         }
     };
@@ -245,7 +247,7 @@ pub fn handle_import(
 
     if total_slots == 0 && backup.bridge_secret.is_empty() {
         log::warn!("Backup import: nothing to restore");
-        protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+        protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &ImportRefusal::NothingToRestore.response());
         return;
     }
 
@@ -258,7 +260,7 @@ pub fn handle_import(
                 "Backup import refused: {} slots for one master exceeds the 16-slot capacity",
                 bm.connection_slots.len()
             );
-            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &ImportRefusal::TooManySlots.response());
             return;
         }
         for slot in &mut bm.connection_slots {
@@ -272,7 +274,7 @@ pub fn handle_import(
                         slot.slot_index,
                         bm.slot
                     );
-                    protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+                    protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &ImportRefusal::InvalidSlot.response());
                     return;
                 }
             }
@@ -283,12 +285,12 @@ pub fn handle_import(
     for master in &mut masters {
         heartwood_common::policy::remove_ambiguous_pubkeys(&mut master.connection_slots);
         if heartwood_common::policy::migrate_client_grants(&mut master.connection_slots).is_err() {
-            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &ImportRefusal::InvalidSlot.response());
             return;
         }
     }
     if masters.iter().enumerate().any(|(i, m)| masters[..i].iter().any(|previous| previous.pubkey == m.pubkey)) {
-        protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+        protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &ImportRefusal::DuplicateIdentity.response());
         return;
     }
 
@@ -305,7 +307,7 @@ pub fn handle_import(
         .collect();
     if matched.is_empty() && total_slots > 0 {
         log::warn!("Backup import: no backup master matches a provisioned identity");
-        protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+        protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &ImportRefusal::NoMatchingIdentity.response());
         return;
     }
 
@@ -342,7 +344,7 @@ pub fn handle_import(
 
         if !matches!(result, crate::approval::ApprovalResult::Approved) {
             log::info!("Backup import denied by user");
-            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &ImportRefusal::Declined.response());
             return;
         }
     }
@@ -373,7 +375,13 @@ pub fn handle_import(
             } else {
                 "Storage fault\nUse USB recovery"
             });
-            protocol::write_frame(usb, FRAME_TYPE_BACKUP_IMPORT_RESPONSE, &[0x00]);
+            // Long enough to read: it flashed past before Sapwood repainted.
+            esp_idf_hal::delay::FreeRtos::delay_ms(2500);
+            protocol::write_frame(
+                usb,
+                FRAME_TYPE_BACKUP_IMPORT_RESPONSE,
+                &if rollback_ok { ImportRefusal::StorageFailed } else { ImportRefusal::StorageFault }.response(),
+            );
             return;
         }
 

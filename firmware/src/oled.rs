@@ -1068,11 +1068,13 @@ pub fn show_titled_approval(
     // The old "Hold button - Ns" read as a hold-duration counter, and testers
     // watched the countdown sit at 0 wondering why holding did nothing. Spell
     // out what the hold does here; the expiry lives on the countdown bar
-    // below, the same graphic as the signing screens. On two-button boards,
-    // also say which button is which (A is the lower-left button on the
-    // T-Display; B above it cancels).
-    let hint = if crate::button::has_button_b() {
-        "hold lower=yes up=no"
+    // below, the same graphic as the signing screens. On the T-Display the
+    // two buttons are labelled on the screen edge beside them instead.
+    let tagged = draw_button_tags(display);
+    let hint = if tagged {
+        "hold YES or NO"
+    } else if crate::button::has_button_b() {
+        "hold A=yes  B=no"
     } else {
         "Hold 2s to approve"
     };
@@ -1092,6 +1094,44 @@ pub fn show_titled_approval(
 
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// Label the T-Display's two buttons on the screen edge beside them: green
+/// YES level with the approve button (A, GPIO0), red NO level with cancel
+/// (B, GPIO35). Returns false, drawing nothing, on any other board.
+///
+/// Words on the card ("hold lower=yes up=no") were not enough: in the
+/// 2026-09-24 rehearsal the owner could not tell which of the buttons beside
+/// the screen was which, and cancelled a restore by mistake. They sit on the
+/// right-hand edge with the screen upright.
+fn draw_button_tags(display: &mut Display<'_>) -> bool {
+    #[cfg(feature = "tdisplay")]
+    {
+        if !crate::button::has_button_b() {
+            return false;
+        }
+        // Approve (A) is the lower of the two right-hand buttons (confirmed
+        // on the bench board, 2026-09-24).
+        const APPROVE_ON_TOP: bool = false;
+        let l = layout(display);
+        let font = l.font_small();
+        let (top, top_colour, bottom, bottom_colour) = if APPROVE_ON_TOP {
+            ("YES>", OK, "NO>", DANGER)
+        } else {
+            ("NO>", DANGER, "YES>", OK)
+        };
+        for (text, colour, y) in [(top, top_colour, l.sy(10)), (bottom, bottom_colour, l.sy(48))] {
+            let x = l.w - text.len() as i32 * Layout::glyph_w(font) - l.s(1);
+            let style = MonoTextStyleBuilder::new().font(font).text_color(colour).build();
+            Text::new(text, Point::new(x, y), style).draw(display).ok();
+        }
+        true
+    }
+    #[cfg(not(feature = "tdisplay"))]
+    {
+        let _ = display;
+        false
     }
 }
 

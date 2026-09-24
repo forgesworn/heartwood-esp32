@@ -255,6 +255,14 @@ jobs:
             echo "::error::${{ matrix.board }} app image ($size B) exceeds its app slot ($limit B)"
             exit 1
           fi
+      # Kept for a week so a branch can be benched on a board this machine
+      # cannot build for (the T-Display's classic ESP32): an app-only write at
+      # the board's app offset, never a full flash over its NVS.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: app-${{ matrix.board }}
+          path: /tmp/app.bin
+          retention-days: 7
 
   # ESP32-C6 (RISC-V rv32imac) firmware. The Xtensa toolchain action above cannot
   # install a RISC-V toolchain, so this job uses espup to install the Espressif

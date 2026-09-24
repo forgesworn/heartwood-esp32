@@ -30,7 +30,7 @@ import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { createInterface } from 'node:readline/promises'
 
-import { NACK } from './lib/frame.mjs'
+import { ACK, NACK } from './lib/frame.mjs'
 import { openFramedPort } from './lib/port.mjs'
 import { authenticateSession } from './lib/session-auth.mjs'
 import { startPressPrompt } from './press-prompt.mjs'
@@ -45,6 +45,7 @@ import {
 
 const SESSION_AUTH = 0x21
 const SESSION_ACK = 0x22
+const SESSION_END = 0x2d
 const PHONE_UNLOCK_CMD = 0x64
 const PHONE_UNLOCK_RESP = 0x65
 
@@ -98,6 +99,11 @@ async function usbCommand(command, deadlineMs, { press } = {}) {
   } else {
     reply = await session.request(PHONE_UNLOCK_CMD, [PHONE_UNLOCK_RESP, NACK], { payload, deadlineMs })
   }
+  // End the bridge session before letting go of the port, or the next program
+  // to open it inherits it. Firmware without SESSION_END NACKs; harmless.
+  session.send(SESSION_END, secret)
+  await session.waitFor([ACK, NACK], 2_000)
+  secret.fill(0)
   session.close()
   if (!reply) throw new Error(`no answer within ${deadlineMs / 1000}s`)
   if (reply.type === NACK) throw new Error(`refused: ${reply.payload.toString() || 'no reason'}`)

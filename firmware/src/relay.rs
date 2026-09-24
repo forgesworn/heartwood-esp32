@@ -77,7 +77,8 @@ use heartwood_common::types::{
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_PROVISION,
     FRAME_TYPE_DERIVE_IDENTITY,
     FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_RESTORE_IDENTITY,
-    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
+    FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_END,
+    FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
     FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN,
     FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK, FRAME_TYPE_PHONE_UNLOCK_CMD,
     FRAME_TYPE_SIGN_ENVELOPE, FRAME_TYPE_WIFI_SCAN_REQUEST,
@@ -2411,6 +2412,10 @@ fn locked_relay_phase(
                     }
                     frame.scrub_payload();
                 }
+                FRAME_TYPE_SESSION_END => {
+                    crate::session::handle_end(usb, &frame.payload, nvs, &mut vault_authed);
+                    frame.scrub_payload();
+                }
                 FRAME_TYPE_VAULT_UNLOCK => {
                     if !vault_authed {
                         crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
@@ -2902,6 +2907,15 @@ fn poll_usb(
             // The payload is the presented bridge secret (FW-L3).
             frame.scrub_payload();
         }
+        FRAME_TYPE_SESSION_END => {
+            crate::session::handle_end(
+                usb,
+                &frame.payload,
+                ctx.nvs,
+                &mut ctx.policy_engine.bridge_authenticated,
+            );
+            frame.scrub_payload();
+        }
         FRAME_TYPE_SET_BRIDGE_SECRET => {
             crate::session::handle_set_bridge_secret(
                 usb,
@@ -3040,7 +3054,11 @@ fn poll_usb(
         FRAME_TYPE_BACKUP_EXPORT_REQUEST => {
             if !ctx.policy_engine.bridge_authenticated {
                 log::warn!("[relay] Backup export rejected -- bridge not authenticated");
-                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                crate::protocol::write_frame(
+                    usb,
+                    FRAME_TYPE_NACK,
+                    heartwood_common::backup::BACKUP_NACK_AUTH,
+                );
             } else {
                 crate::backup::handle_export(
                     usb,
@@ -3056,7 +3074,7 @@ fn poll_usb(
             // Same bridge-auth gate as export (FW-H2).
             if !ctx.policy_engine.bridge_authenticated {
                 log::warn!("[relay] Backup import rejected -- bridge not authenticated");
-                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, heartwood_common::backup::BACKUP_NACK_AUTH);
             } else if approval_card_open(ctx) {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
             } else {

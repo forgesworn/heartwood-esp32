@@ -42,6 +42,12 @@ pub const FRAME_TYPE_ENCRYPTED_RESPONSE: u8 = 0x11;
 pub const FRAME_TYPE_POLICY_PUSH: u8 = 0x20;
 pub const FRAME_TYPE_SESSION_AUTH: u8 = 0x21;
 pub const FRAME_TYPE_SESSION_ACK: u8 = 0x22;
+/// host -> device: end the authenticated bridge session. Payload: the 32-byte
+/// bridge secret, so only the holder can log it out (no one else can knock a
+/// working bridge off). ACK when the session was ended, NACK otherwise. A host
+/// sends it before letting go of the port; heartwoodd, which holds its session
+/// for life, never does.
+pub const FRAME_TYPE_SESSION_END: u8 = 0x2D;
 pub const FRAME_TYPE_SET_BRIDGE_SECRET: u8 = 0x23;
 pub const FRAME_TYPE_FACTORY_RESET: u8 = 0x24;
 pub const FRAME_TYPE_SET_PIN: u8 = 0x25;

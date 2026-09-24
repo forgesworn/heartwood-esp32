@@ -114,7 +114,8 @@ use heartwood_common::types::{
     FRAME_TYPE_DERIVE_IDENTITY,
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-    FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
+    FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_END, FRAME_TYPE_SET_BRIDGE_SECRET,
+    FRAME_TYPE_SET_PIN,
     FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK, FRAME_TYPE_NOTE_CMD, FRAME_TYPE_PHONE_UNLOCK_CMD,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_UPDATE,
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
@@ -760,6 +761,10 @@ fn main() {
                     }
                     frame.scrub_payload();
                 }
+                FRAME_TYPE_SESSION_END => {
+                    session::handle_end(&mut usb, &frame.payload, &nvs, &mut vault_authed);
+                    frame.scrub_payload();
+                }
                 FRAME_TYPE_VAULT_UNLOCK => {
                     if !vault_authed {
                         log::warn!("VAULT_UNLOCK rejected — bridge not authenticated");
@@ -1203,6 +1208,17 @@ fn main() {
                 frame.scrub_payload();
             }
 
+            // 0x2D — end the bridge session (host letting go of the port)
+            FRAME_TYPE_SESSION_END => {
+                session::handle_end(
+                    &mut usb,
+                    &frame.payload,
+                    &nvs,
+                    &mut policy_engine.bridge_authenticated,
+                );
+                frame.scrub_payload();
+            }
+
             // 0x23 — set bridge secret
             FRAME_TYPE_SET_BRIDGE_SECRET => {
                 session::handle_set_bridge_secret(
@@ -1372,7 +1388,11 @@ fn main() {
             FRAME_TYPE_BACKUP_EXPORT_REQUEST => {
                 if !policy_engine.bridge_authenticated {
                     log::warn!("Backup export rejected -- bridge not authenticated");
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
+                    protocol::write_frame(
+                        &mut usb,
+                        FRAME_TYPE_NACK,
+                        heartwood_common::backup::BACKUP_NACK_AUTH,
+                    );
                     continue;
                 }
                 backup::handle_export(
@@ -1391,7 +1411,11 @@ fn main() {
             FRAME_TYPE_BACKUP_IMPORT_REQUEST => {
                 if !policy_engine.bridge_authenticated {
                     log::warn!("Backup import rejected -- bridge not authenticated");
-                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"bridge auth required");
+                    protocol::write_frame(
+                        &mut usb,
+                        FRAME_TYPE_NACK,
+                        heartwood_common::backup::BACKUP_NACK_AUTH,
+                    );
                 } else {
                     backup::handle_import(
                         &mut usb,

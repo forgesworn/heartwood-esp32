@@ -2,15 +2,17 @@
 
 # Heartwood ESP32
 
-> **Beta:** firmware [`0.18.0-beta.16`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.16)
-> retains app/persona approvals per client, and a persona derived through a
-> button card answers relay requests without a reboot. A card whose request
-> fails after the press now says NOT DONE, and a persona-paired client can no
-> longer derive personas under the persona. Two apps sharing one pairing no
-> longer cancel each other's waiting cards by reconnecting. Retained-state
-> installation, normal reboot/unlock, automatic signing and consent isolation
-> passed on the named Heltec V4. Remaining physical coverage and deferred
-> payment acceptance are recorded in the beta.13 and beta.14 release notes.
+> **Beta:** firmware [`0.18.0-beta.17`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.17)
+> adds the firmware side of phone unlock: seeds sealed under a data key, one
+> key stretch per unlock, and a one-tap unlock from an enrolled phone with no
+> stable tag on the wire (the phone app is not out yet). A refused restore now
+> says why, a full board makes room for pairings by dropping its avatar cache,
+> and the screen can be turned through 180 degrees. **On a board with a PIN or
+> vault key, turn it off before going back to beta.16 or older:** earlier
+> firmware cannot read the new seed format. Retained-state installation,
+> normal reboot/unlock, automatic signing and consent isolation passed on the
+> named Heltec V4 in earlier betas; this release's hardware checks are in its
+> notes.
 > Keep an independent recovery copy and use small values while the complete
 > destructive cross-board recovery matrix remains unfinished.
 

@@ -8,6 +8,7 @@ import {
   hintMatches,
   judge,
   openContext,
+  parseEnrolmentCode,
   phoneKey,
   sealContext,
 } from './phone-unlock.mjs'
@@ -62,4 +63,30 @@ test('the prompt rule', () => {
   assert.equal(judge(c, a, now, now, { boot: 212, author: b }), 'prompt')
   assert.equal(judge(c, a, now, now, { boot: 213, author: a }), 'replay')
   assert.equal(judge({ ...c, t: 'relays' }, a, now, now, null), 'not-locked')
+})
+
+test('reads the enrolment code Cambium shows', () => {
+  // The exact string Cambium's EnrolmentCodeTest pins, so the two stay in step.
+  const p = 'ab'.repeat(32)
+  const r = 'cd'.repeat(16)
+  const code = `heartwood-unlock:enrol?v=1&p=${p}&r=${r}&label=Pixel+8+Pro&relay=wss%3A%2F%2Frelay.example` +
+    '&relay=wss%3A%2F%2Ftwo.example%2Fpath%3Fx%3D1'
+  assert.deepEqual(parseEnrolmentCode(code), {
+    enrolPubkey: p,
+    rendezvous: r,
+    label: 'Pixel 8 Pro',
+    relays: ['wss://relay.example', 'wss://two.example/path?x=1'],
+  })
+  for (const bad of [
+    '',
+    code.replace('v=1', 'v=2'),
+    code.replace(`p=${p}`, `p=${p.toUpperCase()}`),
+    code.replace(`r=${r}`, `r=${r}00`),
+    code.replace('label=Pixel+8+Pro', `label=${'x'.repeat(17)}`),
+    code.split('&relay=')[0],
+    code.replace('wss%3A%2F%2Frelay.example', 'https%3A%2F%2Frelay.example'),
+    `${code}&p=${p}`,
+  ]) {
+    assert.equal(parseEnrolmentCode(bad), null, bad)
+  }
 })

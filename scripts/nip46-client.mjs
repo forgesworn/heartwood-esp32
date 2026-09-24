@@ -16,6 +16,8 @@
 //   node scripts/nip46-client.mjs --target <identityHex> --client-key-file k.key \
 //     --method sign_event --params-file template.json   (template → [json])
 //   [--relay wss://...] [--timeout 30000]
+//   [--press now|never|<seconds>]   what the spoken prompt tells the owner:
+//     press now (default), do NOT press, or wait n seconds and then press
 
 import { argv, exit } from 'node:process'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
@@ -28,7 +30,7 @@ import {
   relayList,
   RelayFanout,
 } from './relay-deps.mjs'
-import { startPressPrompt } from './press-prompt.mjs'
+import { startPressPlan } from './press-prompt.mjs'
 
 const RELAYS = relayList(argv)
 const TARGET = arg(argv, '--target')
@@ -36,6 +38,7 @@ const METHOD = arg(argv, '--method')
 const TIMEOUT = Number(arg(argv, '--timeout', '30000'))
 const KEY_FILE = arg(argv, '--client-key-file')
 const PARAMS_FILE = arg(argv, '--params-file')
+const PRESS = arg(argv, '--press', 'now')
 
 if (!TARGET || !METHOD || !KEY_FILE || !/^[0-9a-f]{64}$/.test(TARGET)) {
   console.error(
@@ -119,6 +122,6 @@ setTimeout(() => {
   console.error(`request event id: ${ev.id}`)
   ws.send(['EVENT', ev])
   if (MAY_NEED_APPROVAL) {
-    stopPrompt = startPressPrompt(`the ${METHOD} request`)
+    stopPrompt = startPressPlan(`the ${METHOD} request`, PRESS)
   }
 }

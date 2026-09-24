@@ -18,11 +18,23 @@
 // player is fire-and-forget and a machine without one just gets the text.
 
 import { spawn } from 'node:child_process'
-import { argv, platform } from 'node:process'
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { argv, env, platform } from 'node:process'
 
 /** Seconds between reminders while a window is open. Long enough not to
  *  nag, short enough to catch you inside a 30-second approval window. */
 const REPEAT_MS = 8000
+
+/** A card's window is 30 s. A "wait, then press" plan must leave the owner
+ *  most of it: being asked with 10 s left is a scramble, not a press. */
+const CARD_WINDOW_S = 30
+const MIN_TIME_TO_PRESS_S = 20
+
+/** Recorded prompts, if present: `<dir>/<clip>.mp3` (HEARTWOOD_VOICE_DIR,
+ *  default ~/heartwood-bench/voice). Anything missing falls back to `say`. */
+const VOICE_DIR = env.HEARTWOOD_VOICE_DIR ?? join(homedir(), 'heartwood-bench', 'voice')
 
 /** Fire and forget — never throws, never blocks, never fails a step. */
 function play(command, args) {
@@ -35,9 +47,15 @@ function play(command, args) {
   }
 }
 
-/** A short attention sound, and the words if the platform can speak. */
-export function chime(spoken) {
+/** A short attention sound, then the words: the recorded `clip` when there
+ *  is one, otherwise whatever the platform can speak. */
+export function chime(spoken, clip) {
   if (platform === 'darwin') {
+    const recorded = clip && join(VOICE_DIR, `${clip}.mp3`)
+    if (recorded && existsSync(recorded)) {
+      play('sh', ['-c', 'afplay /System/Library/Sounds/Glass.aiff; afplay "$0"', recorded])
+      return
+    }
     play('afplay', ['/System/Library/Sounds/Glass.aiff'])
     if (spoken) play('say', ['-v', 'Daniel', spoken])
     return
@@ -55,7 +73,7 @@ export function chime(spoken) {
  */
 export function promptForPress(what, { hold = '2 s' } = {}) {
   console.log(`\n>>> APPROVE ON THE DEVICE: ${what} — hold the button ${hold}\n`)
-  chime(`Approve on the device: ${what}`)
+  chime(`Approve on the device: ${what}`, 'approve')
 }
 
 /**
@@ -66,7 +84,7 @@ export function promptForPress(what, { hold = '2 s' } = {}) {
  */
 export function startPressPrompt(what, { hold = '2 s', intervalMs = REPEAT_MS } = {}) {
   promptForPress(what, { hold })
-  const timer = setInterval(() => chime('Still waiting for your approval'), intervalMs)
+  const timer = setInterval(() => chime('Still waiting for your approval', 'still-waiting'), intervalMs)
   // Never hold the process open on the reminder alone.
   timer.unref?.()
   let stopped = false
@@ -74,6 +92,50 @@ export function startPressPrompt(what, { hold = '2 s', intervalMs = REPEAT_MS } 
     if (stopped) return
     stopped = true
     clearInterval(timer)
+  }
+}
+
+/**
+ * Say what the finger on the device should do, per `--press` style plans:
+ *   'now'   ask straight away (the default, as before)
+ *   'never' say NOT to press, and keep saying it: the card is meant to be
+ *           left alone (an expiry bench, or a card another step must cancel)
+ *   <n>     say "card coming, don't press yet", then ask after n seconds,
+ *           for a bench that has to do something while the card is up
+ *
+ * Returns `stop()`, as startPressPrompt does.
+ */
+export function startPressPlan(what, plan = 'now', { hold = '2 s', intervalMs = REPEAT_MS } = {}) {
+  if (plan === 'now') return startPressPrompt(what, { hold, intervalMs })
+  if (plan === 'never') {
+    console.log(`\n>>> DO NOT APPROVE ON THE DEVICE: ${what} — leave the card alone\n`)
+    chime(`Do not approve on the device. Leave ${what} alone`, 'do-not-press')
+    const timer = setInterval(() => chime('Still do not press', 'still-do-not-press'), intervalMs)
+    timer.unref?.()
+    return () => clearInterval(timer)
+  }
+  const seconds = Number(plan)
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    throw new Error(`press plan must be now, never or a number of seconds, not ${plan}`)
+  }
+  if (seconds > CARD_WINDOW_S - MIN_TIME_TO_PRESS_S) {
+    throw new Error(
+      `a ${seconds} s wait leaves ${CARD_WINDOW_S - seconds} s of the card window to press in; ` +
+        `ask within ${CARD_WINDOW_S - MIN_TIME_TO_PRESS_S} s and do the bench's own step sooner`,
+    )
+  }
+  console.log(`\n>>> DO NOT PRESS YET: ${what} — you will be asked in ${seconds} s\n`)
+  chime("Card coming. Don't press yet", 'dont-press-yet')
+  let stopInner = () => {}
+  let stopped = false
+  const timer = setTimeout(() => {
+    if (!stopped) stopInner = startPressPrompt(what, { hold, intervalMs })
+  }, seconds * 1000)
+  timer.unref?.()
+  return () => {
+    stopped = true
+    clearTimeout(timer)
+    stopInner()
   }
 }
 

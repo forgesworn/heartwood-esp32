@@ -77,11 +77,10 @@ pub struct LockContext {
     pub t: String,
     /// The phone record this message is for.
     pub id: u32,
-    /// Locked restarts so far on this board. A phone never prompts twice for
-    /// the same count, and drops a lower one as a replay.
+    /// Locked restarts so far on this board. See [`judge`].
     pub boot: u32,
-    /// Why the chip restarted, as ESP-IDF names it (`poweron`, `brownout`,
-    /// `task_wdt`, ...).
+    /// Why the chip restarted, as the board's diagnostics name it
+    /// (`power-on`, `brownout`, `task-watchdog`, ...).
     pub reset: String,
     pub ssid: String,
     /// `aa:bb:cc:dd:ee:ff`, or empty if unknown.
@@ -272,7 +271,7 @@ impl Delivery {
 pub enum Verdict {
     Prompt,
     /// The same locked restart it already prompted for (the board repeats
-    /// its announcement every 60 s).
+    /// its announcement every 60 s under the same one-time author).
     Duplicate,
     /// Older than [`MAX_ANNOUNCE_AGE_SECS`], or too far in the future.
     Stale,
@@ -282,9 +281,21 @@ pub enum Verdict {
     NotLocked,
 }
 
-/// The phone's prompt rule. `last_boot` is the highest restart count this
-/// phone has already prompted for on this board.
-pub fn judge(ctx: &LockContext, created_at: u64, now: u64, last_boot: Option<u32>) -> Verdict {
+/// The phone's prompt rule. `last` is the restart count and one-time author
+/// of the newest announcement this phone has already prompted for on this
+/// board.
+///
+/// A repeat is recognised by count AND author: the board repeats its
+/// announcement all boot under one author, and every boot has a new one. So
+/// a board whose count failed to persist (same count, new author) still gets
+/// its prompt, and a lower count is a replay whoever wrote it.
+pub fn judge(
+    ctx: &LockContext,
+    author: &[u8; 32],
+    created_at: u64,
+    now: u64,
+    last: Option<(u32, [u8; 32])>,
+) -> Verdict {
     if ctx.t != TYPE_LOCKED {
         return Verdict::NotLocked;
     }
@@ -293,9 +304,9 @@ pub fn judge(ctx: &LockContext, created_at: u64, now: u64, last_boot: Option<u32
     {
         return Verdict::Stale;
     }
-    match last_boot {
-        Some(b) if ctx.boot < b => Verdict::Replay,
-        Some(b) if ctx.boot == b => Verdict::Duplicate,
+    match last {
+        Some((boot, _)) if ctx.boot < boot => Verdict::Replay,
+        Some((boot, seen)) if ctx.boot == boot && seen == *author => Verdict::Duplicate,
         _ => Verdict::Prompt,
     }
 }
@@ -384,17 +395,24 @@ mod tests {
     #[test]
     fn the_prompt_rule() {
         let c = ctx();
+        let a = [9u8; 32];
+        let b = [8u8; 32];
         let now = 1_800_000_000;
-        assert_eq!(judge(&c, now, now, None), Verdict::Prompt);
-        assert_eq!(judge(&c, now - 120, now, Some(211)), Verdict::Prompt);
-        assert_eq!(judge(&c, now - 121, now, None), Verdict::Stale);
-        assert_eq!(judge(&c, now + 60, now, None), Verdict::Prompt);
-        assert_eq!(judge(&c, now + 61, now, None), Verdict::Stale);
-        assert_eq!(judge(&c, now, now, Some(212)), Verdict::Duplicate);
-        assert_eq!(judge(&c, now, now, Some(213)), Verdict::Replay);
+        assert_eq!(judge(&c, &a, now, now, None), Verdict::Prompt);
+        assert_eq!(judge(&c, &a, now - 120, now, Some((211, b))), Verdict::Prompt);
+        assert_eq!(judge(&c, &a, now - 121, now, None), Verdict::Stale);
+        assert_eq!(judge(&c, &a, now + 60, now, None), Verdict::Prompt);
+        assert_eq!(judge(&c, &a, now + 61, now, None), Verdict::Stale);
+        assert_eq!(judge(&c, &a, now, now, Some((212, a))), Verdict::Duplicate);
+        assert_eq!(
+            judge(&c, &a, now, now, Some((212, b))),
+            Verdict::Prompt,
+            "same count, new boot: the count failed to persist"
+        );
+        assert_eq!(judge(&c, &a, now, now, Some((213, a))), Verdict::Replay);
         let mut r = ctx();
         r.t = TYPE_RELAYS.into();
-        assert_eq!(judge(&r, now, now, None), Verdict::NotLocked);
+        assert_eq!(judge(&r, &a, now, now, None), Verdict::NotLocked);
     }
 
     /// The published vectors. Regenerate only with a deliberate format bump.

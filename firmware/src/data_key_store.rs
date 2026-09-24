@@ -76,6 +76,38 @@ impl Platform for Board<'_> {
     }
 }
 
+/// Locked restarts of a board with phones enrolled (u32, big-endian). Written
+/// once per entry into the locked relay phase, not once per boot, so a board
+/// with no phones never writes it and a brownout loop that never reaches WiFi
+/// never wears it.
+const LOCKED_BOOTS_KEY: &str = "lk_boots";
+/// `[0]` when the owner has switched off the operator's lock announcement
+/// (the one that p-tags a stable key). Absent means on.
+const ANNOUNCE_OPERATOR_KEY: &str = "ann_op";
+
+/// Count this locked restart and return the new count. A storage failure
+/// still returns the incremented value. A count that fails to persist repeats
+/// on the next restart, which a phone still prompts for, because it treats an
+/// announcement as a duplicate only when the one-time author matches too.
+pub fn next_locked_boot(nvs: &mut EspNvs<NvsDefault>) -> u32 {
+    let mut buf = [0u8; 4];
+    let current = match nvs.get_blob(LOCKED_BOOTS_KEY, &mut buf) {
+        Ok(Some(b)) if b.len() == 4 => u32::from_be_bytes(buf),
+        _ => 0,
+    };
+    let next = current.saturating_add(1);
+    if let Err(e) = nvs.set_blob(LOCKED_BOOTS_KEY, &next.to_be_bytes()) {
+        log::warn!("locked-restart count not saved: {e}");
+    }
+    next
+}
+
+/// Whether the locked board should also publish the operator's announcement.
+pub fn announce_operator(nvs: &EspNvs<NvsDefault>) -> bool {
+    let mut buf = [0u8; 1];
+    !matches!(nvs.get_blob(ANNOUNCE_OPERATOR_KEY, &mut buf), Ok(Some([0])))
+}
+
 static DATA_KEY: Mutex<Option<[u8; DK_LEN]>> = Mutex::new(None);
 
 /// This boot's data key, if it has one.

@@ -84,11 +84,17 @@ export function deliveryJson(id, slotSecret) {
   return `{"v":1,"id":${id},"s":"${slotSecret.toString('hex')}"}`
 }
 
-/** 'prompt' | 'duplicate' | 'stale' | 'replay' | 'not-locked' */
-export function judge(context, createdAt, now, lastBoot) {
+/**
+ * 'prompt' | 'duplicate' | 'stale' | 'replay' | 'not-locked'
+ * `last` is { boot, author } (author as hex) of the newest announcement this
+ * phone already prompted for on this board, or null. A repeat needs the same
+ * count AND author: every boot has a new author, so a count that failed to
+ * persist still prompts.
+ */
+export function judge(context, authorHex, createdAt, now, last) {
   if (context.t !== 'locked') return 'not-locked'
   if (createdAt + MAX_ANNOUNCE_AGE_SECS < now || createdAt > now + MAX_FUTURE_SKEW_SECS) return 'stale'
-  if (lastBoot != null && context.boot < lastBoot) return 'replay'
-  if (lastBoot != null && context.boot === lastBoot) return 'duplicate'
+  if (last && context.boot < last.boot) return 'replay'
+  if (last && context.boot === last.boot && last.author === authorHex) return 'duplicate'
   return 'prompt'
 }

@@ -52,11 +52,14 @@ test('refuses another phone, another author and any tampering', () => {
 
 test('the prompt rule', () => {
   const c = fixture.context
+  const a = fixture.author
+  const b = '08'.repeat(32)
   const now = 1_800_000_000
-  assert.equal(judge(c, now, now, null), 'prompt')
-  assert.equal(judge(c, now - 121, now, null), 'stale')
-  assert.equal(judge(c, now + 61, now, null), 'stale')
-  assert.equal(judge(c, now, now, 212), 'duplicate')
-  assert.equal(judge(c, now, now, 213), 'replay')
-  assert.equal(judge({ ...c, t: 'relays' }, now, now, null), 'not-locked')
+  assert.equal(judge(c, a, now, now, null), 'prompt')
+  assert.equal(judge(c, a, now - 121, now, null), 'stale')
+  assert.equal(judge(c, a, now + 61, now, null), 'stale')
+  assert.equal(judge(c, a, now, now, { boot: 212, author: a }), 'duplicate')
+  assert.equal(judge(c, a, now, now, { boot: 212, author: b }), 'prompt')
+  assert.equal(judge(c, a, now, now, { boot: 213, author: a }), 'replay')
+  assert.equal(judge({ ...c, t: 'relays' }, a, now, now, null), 'not-locked')
 })

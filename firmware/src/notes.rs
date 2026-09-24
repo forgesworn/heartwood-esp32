@@ -811,7 +811,14 @@ impl Notes {
 /// left alone — the sealed notes behind it stay on flash for the secret
 /// that can open them. Never deletes anything it cannot read.
 pub fn sync_sealed(secret: &[u8]) {
-    with_locker(|notes| sync_sealed_inner(notes, secret))
+    with_locker(|notes| sync_sealed_inner(notes, Some(secret)))
+}
+
+/// [`sync_sealed`] after an unlock that proved no secret (a phone delivered
+/// the data key). A note key still wrapped under the PIN or vault key stays
+/// sealed until that secret is next used; nothing is lost.
+pub fn sync_sealed_with_data_key() {
+    with_locker(|notes| sync_sealed_inner(notes, None))
 }
 
 /// Wrap the note key for `nk`. Under the data key when this boot holds one
@@ -819,7 +826,10 @@ pub fn sync_sealed(secret: &[u8]) {
 /// as earlier firmware did. Either way the wrap is proven to reopen before it
 /// is returned: the data-key form directly, the secret form through the
 /// reference KDF (see seed_cipher::decrypt_seed_reference).
-fn wrap_note_key(secret: &[u8], key: &[u8; note_seal::KEY_LEN]) -> Option<alloc_vec::Vec<u8>> {
+fn wrap_note_key(
+    secret: Option<&[u8]>,
+    key: &[u8; note_seal::KEY_LEN],
+) -> Option<alloc_vec::Vec<u8>> {
     if let Some(mut dk) = crate::data_key_store::current() {
         let mut nonce = [0u8; data_key::NONCE_LEN];
         crate::fill_random(&mut nonce);
@@ -828,6 +838,7 @@ fn wrap_note_key(secret: &[u8], key: &[u8; note_seal::KEY_LEN]) -> Option<alloc_
         dk.zeroize();
         return ok.then(|| blob.to_vec());
     }
+    let secret = secret?;
     let mut salt = [0u8; seed_cipher::SALT_LEN];
     let mut nonce = [0u8; seed_cipher::NONCE_LEN];
     crate::fill_random(&mut salt);
@@ -840,7 +851,7 @@ fn wrap_note_key(secret: &[u8], key: &[u8; note_seal::KEY_LEN]) -> Option<alloc_
     (seed_cipher::decrypt_seed_reference(secret, &blob).as_ref() == Ok(key)).then_some(blob)
 }
 
-fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
+fn sync_sealed_inner(notes: &mut Notes, secret: Option<&[u8]>) {
     {
         let Storage::Nvs(nvs) = &mut notes.storage else {
             return; // unavailable locker: nothing to seal, nothing to lose
@@ -880,13 +891,20 @@ fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
                     }
                     false
                 }
+                Ok(Some(_)) if secret.is_none() => {
+                    log::warn!(
+                        "[notes] nk is still wrapped under the PIN/vault key — {} sealed note(s) stay sealed until it is next used",
+                        nvs.sealed_pending.len()
+                    );
+                    return;
+                }
                 Ok(Some(blob)) => match {
                     // Yield so IDLE0 runs between KDF stretches (its
                     // watchdog aborts after 60 s of unbroken compute —
                     // bench-caught 2026-08-18), then feed our own.
                     esp_idf_hal::delay::FreeRtos::delay_ms(20);
                     crate::wdt::feed(); // PBKDF2: nk unwrap
-                    seed_cipher::decrypt_seed(secret, blob)
+                    seed_cipher::decrypt_seed(secret.expect("checked above"), blob)
                 } {
                     Ok(key) => {
                         nvs.key = Some(key);

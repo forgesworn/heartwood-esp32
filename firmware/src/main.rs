@@ -53,6 +53,7 @@ mod layout;
 mod log_quiet;
 mod crash_crumb;
 mod data_key_store;
+mod display_flip;
 mod management_challenge;
 mod palette;
 mod masters;
@@ -115,6 +116,7 @@ use heartwood_common::types::{
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
     FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_END, FRAME_TYPE_SET_BRIDGE_SECRET,
+    FRAME_TYPE_DISPLAY_FLIP,
     FRAME_TYPE_SET_PIN,
     FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK, FRAME_TYPE_NOTE_CMD, FRAME_TYPE_PHONE_UNLOCK_CMD,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_UPDATE,
@@ -180,7 +182,7 @@ pub fn firmware_info_json() -> String {
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
-         \"free_heap\":{},\"largest_block\":{}{}{}}}",
+         \"free_heap\":{},\"largest_block\":{},\"display_flip\":{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -191,6 +193,7 @@ pub fn firmware_info_json() -> String {
         board::MAX_SIGN_BYTES_OBJECT,
         free_heap,
         largest_block,
+        display_flip::is_flipped(),
         crash,
         nvs_stats,
     )
@@ -468,6 +471,9 @@ fn main() {
     // Apply the persisted log verbosity before the chatty phases start. Quiet
     // mode calms boards whose activity LED is wired to the log UART.
     log_quiet::apply(log_quiet::read(&nvs));
+
+    // Screen orientation, before anything past the boot animation is drawn.
+    display_flip::apply(&mut display, display_flip::read(&nvs));
 
     // A master removal spans several NVS keys. Resume its durable journal
     // before loading any seed, persona, policy, or display metadata so a power
@@ -985,6 +991,11 @@ fn main() {
                             // A press while a signing confirmation is held
                             // dismisses the run early, back to the idle card.
                             idle_page = 0;
+                        } else if idle_page == 2
+                            && display_flip::toggle_if_held(&mut nvs, &mut display, &buttons)
+                        {
+                            // Turned the screen round; the device page is
+                            // redrawn below, the new way up.
                         } else if launch_offline_qr_if_requested(
                             &mut display,
                             &buttons,
@@ -1206,6 +1217,17 @@ fn main() {
                 );
                 // The payload is the presented bridge secret (FW-L3).
                 frame.scrub_payload();
+            }
+
+            // 0x66 — screen orientation (ask, or set with bridge auth)
+            FRAME_TYPE_DISPLAY_FLIP => {
+                display_flip::handle_frame(
+                    &mut usb,
+                    &frame.payload,
+                    &mut nvs,
+                    &mut display,
+                    policy_engine.bridge_authenticated,
+                );
             }
 
             // 0x2D — end the bridge session (host letting go of the port)

@@ -21,6 +21,7 @@
 //   node scripts/phone-unlock.mjs enrol  --port <port> --secret-file <bridge.secret> [--label "bench phone"]
 //   node scripts/phone-unlock.mjs list   --port <port> --secret-file <bridge.secret>
 //   node scripts/phone-unlock.mjs revoke --port <port> --secret-file <bridge.secret> --id <id>
+//   node scripts/phone-unlock.mjs announce-operator on|off --port <port> --secret-file <bridge.secret>
 //   node scripts/phone-unlock.mjs listen [--relay wss://...] [--timeout 600000] [--yes]
 //   [--state ~/heartwood-bench/phones.json]
 
@@ -154,6 +155,16 @@ async function revoke() {
   console.log(`revoked ${id} on the board and forgot it here`)
 }
 
+async function announceOperator() {
+  const value = argv[3]
+  if (value !== 'on' && value !== 'off') {
+    console.error('usage: node scripts/phone-unlock.mjs announce-operator on|off --port <port> --secret-file <path>')
+    exit(2)
+  }
+  const answer = await usbCommand({ op: 'set_announce_operator', on: value === 'on' }, 10_000)
+  console.log(`operator announcement ${answer.announce_operator ? 'on' : 'off'} (from the next locked boot)`)
+}
+
 async function listen() {
   const { finalizeEvent, nip44, RelayFanout } = await relayDeps()
   const state = loadState()
@@ -249,9 +260,9 @@ async function listen() {
   setTimeout(() => { fanout.close(); exit(0) }, 3000)
 }
 
-const commands = { enrol, list, revoke, listen }
+const commands = { enrol, list, revoke, listen, 'announce-operator': announceOperator }
 if (!commands[COMMAND]) {
-  console.error('usage: node scripts/phone-unlock.mjs {enrol|list|revoke|listen} ...')
+  console.error('usage: node scripts/phone-unlock.mjs {enrol|list|revoke|announce-operator|listen} ...')
   exit(2)
 }
 try {

@@ -740,6 +740,26 @@ fn signing_upgrade_invalidates_pending_approval_only_when_authority_changes() {
 }
 
 #[test]
+fn a_retained_client_reconnecting_keeps_pending_approvals() {
+    // Two apps sharing one pairing take turns to connect. The rebind moves
+    // only which key is current, so the other app's waiting card must stand.
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "default".into(), secret_hex(0x05)).unwrap();
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(0x0a)));
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(0x0b)));
+
+    let pending = engine.approval_epoch();
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(0x0a)));
+    assert!(engine.approval_is_current(pending), "a known key's rebind withdrew the card");
+    engine.with_slots_keeping_approvals(0, |slots| slots[0].label = "Signet".into());
+    assert!(engine.approval_is_current(pending), "naming the pairing withdrew the card");
+
+    // A key the pairing has never held is still a change of authority.
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(0x0c)));
+    assert!(!engine.approval_is_current(pending));
+}
+
+#[test]
 fn approval_epoch_invalidated_by_revoke_and_readd() {
     let mut engine = PolicyEngine::new();
     let slot = engine.create_slot(0, "e".into(), secret_hex(0x05)).unwrap();

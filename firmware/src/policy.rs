@@ -470,6 +470,26 @@ impl PolicyEngine {
     /// Mutable access to the slot vec for a master slot, creating the entry if absent.
     pub(crate) fn slots_mut(&mut self, master_slot: u8) -> &mut Vec<ConnectSlot> {
         self.invalidate_approvals();
+        self.slot_vec(master_slot)
+    }
+
+    /// Change the slot table for a write that usually changes no authority (a
+    /// retained client reconnecting, an app naming its pairing), withdrawing
+    /// waiting approvals only if it turns out to have changed some after all.
+    pub(crate) fn with_slots_keeping_approvals<R>(
+        &mut self,
+        master_slot: u8,
+        change: impl FnOnce(&mut Vec<ConnectSlot>) -> R,
+    ) -> R {
+        let before = self.slot_vec(master_slot).clone();
+        let result = change(self.slot_vec(master_slot));
+        if heartwood_common::policy::slot_authority_changed(&before, self.slot_vec(master_slot)) {
+            self.invalidate_approvals();
+        }
+        result
+    }
+
+    fn slot_vec(&mut self, master_slot: u8) -> &mut Vec<ConnectSlot> {
         if !self
             .master_slots
             .iter()
@@ -844,11 +864,9 @@ impl PolicyEngine {
         slot_index: u8,
         pubkey: String,
     ) -> bool {
-        let assigned = authorize_pubkey_on_unique_slot(
-            self.slots_mut(master_slot),
-            slot_index,
-            &pubkey,
-        );
+        let assigned = self.with_slots_keeping_approvals(master_slot, |slots| {
+            authorize_pubkey_on_unique_slot(slots, slot_index, &pubkey)
+        });
         if assigned {
             self.slots_dirty = true;
         }

@@ -1187,6 +1187,75 @@ pub fn authorize_pubkey_on_unique_slot(
     true
 }
 
+/// True when `after` differs from `before` in anything a waiting approval may
+/// depend on, so the approval must be withdrawn and asked again.
+///
+/// Two things are deliberately not authority. Which of a slot's authorised
+/// keys is the current one: a retained client reconnecting only moves that
+/// marker, and cancelling every waiting card for it meant two apps sharing a
+/// pairing cancelled each other's cards whenever they took turns to connect.
+/// And the display label. The set of authorised keys still counts, and so
+/// does the current key on a slot that sends guardian notices, because those
+/// go to the current key.
+pub fn slot_authority_changed(before: &[ConnectSlot], after: &[ConnectSlot]) -> bool {
+    before.len() != after.len()
+        || before.iter().zip(after).any(|(a, b)| !same_slot_authority(a, b))
+}
+
+fn same_slot_authority(a: &ConnectSlot, b: &ConnectSlot) -> bool {
+    // Exhaustive on purpose: a new field fails to compile here until someone
+    // decides whether it is authority.
+    let ConnectSlot {
+        slot_index,
+        label: _,
+        secret,
+        current_pubkey,
+        allowed_methods,
+        allowed_kinds,
+        auto_approve,
+        signing_approved,
+        strict_permissions,
+        authorized_pubkeys: _,
+        escalate,
+        petition_on_deny,
+        audit_child_wrap,
+        guardian_notice_wrap,
+        bound_identity,
+        approved_identities,
+        was_bound,
+        client_grants,
+    } = a;
+    *slot_index == b.slot_index
+        && *secret == b.secret
+        && *allowed_methods == b.allowed_methods
+        && *allowed_kinds == b.allowed_kinds
+        && *auto_approve == b.auto_approve
+        && *signing_approved == b.signing_approved
+        && *strict_permissions == b.strict_permissions
+        && *escalate == b.escalate
+        && *petition_on_deny == b.petition_on_deny
+        && *audit_child_wrap == b.audit_child_wrap
+        && *guardian_notice_wrap == b.guardian_notice_wrap
+        && *bound_identity == b.bound_identity
+        && *approved_identities == b.approved_identities
+        && *was_bound == b.was_bound
+        && *client_grants == b.client_grants
+        && client_key_set(a) == client_key_set(b)
+        && (!*guardian_notice_wrap || *current_pubkey == b.current_pubkey)
+}
+
+fn client_key_set(slot: &ConnectSlot) -> Vec<&str> {
+    let mut keys: Vec<&str> = slot
+        .current_pubkey
+        .iter()
+        .chain(slot.authorized_pubkeys.iter())
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
 /// Remove every client pubkey that is authorised by more than one slot.
 ///
 /// This is the fail-closed boot migration for state written before unique slot
@@ -3064,6 +3133,38 @@ mod tests {
         assert_eq!(slot.authorized_pubkeys.len(), 2);
         assert!(slot_authorizes(&slot, &sample_pubkey('a')));
         assert!(slot_authorizes(&slot, &sample_pubkey('b')));
+    }
+
+    #[test]
+    fn a_retained_client_reconnecting_changes_no_authority() {
+        let mut slot = sample_slot(0, "Signet");
+        authorize_pubkey_on_slot(&mut slot, &sample_pubkey('a'));
+        authorize_pubkey_on_slot(&mut slot, &sample_pubkey('b'));
+        let before = vec![slot.clone()];
+
+        let mut rebound = slot.clone();
+        authorize_pubkey_on_slot(&mut rebound, &sample_pubkey('a'));
+        rebound.label = "Signet on the phone".into();
+        assert_ne!(rebound.current_pubkey, slot.current_pubkey);
+        assert!(!slot_authority_changed(&before, &[rebound]));
+
+        // A key the slot never authorised is a new holder.
+        let mut widened = slot.clone();
+        authorize_pubkey_on_slot(&mut widened, &sample_pubkey('c'));
+        assert!(slot_authority_changed(&before, &[widened]));
+
+        // Guardian notices go to the current key, so there it is authority.
+        let mut guardian = slot.clone();
+        guardian.guardian_notice_wrap = true;
+        let mut moved = guardian.clone();
+        authorize_pubkey_on_slot(&mut moved, &sample_pubkey('a'));
+        assert!(slot_authority_changed(&[guardian], &[moved]));
+
+        // Any policy field still counts.
+        let mut policy = slot.clone();
+        policy.auto_approve = !policy.auto_approve;
+        assert!(slot_authority_changed(&before, &[policy]));
+        assert!(slot_authority_changed(&before, &[]));
     }
 
     // --- Connect rebind classification (G1) ---

@@ -1,0 +1,17 @@
+# BENCH EXPERIMENT ONLY, not part of any board's normal build.
+#
+# Doubles the ESP32-S3 instruction cache from its 16 KB default to 32 KB, at a
+# cost of 16 KB of internal SRAM (heap). The KDF investigation
+# (docs/2026-09-18-pbkdf2-cost-and-sha-acceleration.md §1.5, §2.5) argues the
+# sealed-seed KDF is instruction-fetch bound rather than compute bound, on the
+# evidence that opt-level=3 made it SLOWER and that a 160 to 240 MHz clock rise
+# did not help. This is the one-line, reversible way to test that on a board:
+# if `kdf.last_derive_ms` in FIRMWARE_INFO drops materially, the model is right.
+#
+# It is NOT enabled for any board by default because this firmware is already
+# heap-tight (the relay sheds its secondary session below a 32 KB largest free
+# block), and 16 KB is a real bite. Read `free_heap` and `largest_block` from
+# the same FIRMWARE_INFO frame to see what it cost.
+#
+# Use:  HEARTWOOD_ICACHE_32K=1 scripts/build-firmware.sh v4 --release
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y

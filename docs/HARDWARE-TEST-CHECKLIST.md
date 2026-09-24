@@ -2021,11 +2021,28 @@ whose seed you cannot re-provision.
    the V3 and the T-Display. The T-Display has no accelerated path by design
    (its SHA cannot resume from a saved digest state), so its number should be
    unchanged: that is a pass, not a failure.
-3. **The self-check ran and passed.** On a bench build with the console on a
-   UART probe, the first unlock after boot logs `SHA accelerator self-check
-   passed - sealed-seed KDF is hardware-backed`. On the T-Display the boot line
-   instead reads `accelerator not available on this board - software path`.
-   Without a console, item 2's timing is the observable.
+3. **Read the `kdf` telemetry. This is now the primary instrument.** No console
+   is needed: `node scripts/device-status.mjs --port ...` prints a `kdf:` line
+   from FIRMWARE_INFO. After the unlock in item 2, record every field, and read
+   them in this order:
+
+   - `mode`. On a Heltec it should be `hw` or `sw`; on the T-Display,
+     `sw-no-accel`. `sw-selfcheck-failed` means the accelerator answered
+     WRONGLY and the session refused it, which is a defect to report, not a
+     timing result. Note that `sw` on a Heltec is a legitimate outcome: the
+     board times both engines at first use and keeps the faster one that passes
+     the known-answer vector.
+   - `hw_selfcheck_us` and `sw_selfcheck_us`. Each is 2,400 compressions, so
+     `us / 2400` is the per-compression cost of that engine on this silicon.
+     This single pair is what the whole speed question turns on.
+   - `retreats` against `chunks`, and `max_acquire_ms`: contention. Near-zero
+     retreats and a small `max_acquire_ms` means the shared SHA/AES lock is not
+     the problem.
+   - `hw_full` against `derivations`: slots that stayed on hardware throughout.
+   - `last_derive_ms` (one slot) and `last_unlock_ms` (the whole unlock).
+
+   Take the same reading again after item 1's WiFi test, when TLS has been
+   competing, and compare `retreats` and `max_acquire_ms`.
 4. **A three-master unlock.** On a board with three sealed masters, unlock once
    and confirm: all three slots open on one PIN entry, the OLED progress card
    counts `1/3`, `2/3`, `3/3`, the total is roughly three times item 2's
@@ -2075,7 +2092,19 @@ whose seed you cannot re-provision.
    minutes, with the blob refused before any KDF work, and the board must not reboot.
    The failed-attempt counter behaviour is unchanged (this is a malformed
    blob, and it still burns an attempt, as it did before).
-9. **Nothing else moved.** Sanity-sweep the paths that share the KDF: enable
+9. **The 32 KB instruction-cache experiment.** The design note argues the KDF
+   is instruction-fetch bound on both paths (§8.4), and this is the one-line
+   test of it. Build `HEARTWOOD_ICACHE_32K=1 scripts/build-firmware.sh v4
+   --release`, flash a SCRATCH board, and compare two FIRMWARE_INFO reads
+   against the normal image on the same board with the same masters:
+   `kdf.last_derive_ms` and `kdf.last_unlock_ms` for the benefit, `free_heap`
+   and `largest_block` for the 16 KB it costs. Then exercise the WiFi tier on
+   the experimental image (pair, sign, keep a session up for a few minutes) and
+   confirm the relay does not start shedding its secondary session. This image
+   is deliberately NOT a candidate for release unless both halves come back
+   well; record the numbers either way, because a result of "no change" refutes
+   the model and matters just as much.
+10. **Nothing else moved.** Sanity-sweep the paths that share the KDF: enable
    at-rest encryption from scratch (`SET_PIN`), disable it, enable the
    bearer-note locker on a PIN-locked board and confirm its `nk` wrap unwraps,
    and run one Sapwood backup export/import round trip. All of these call

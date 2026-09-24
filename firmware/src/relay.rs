@@ -61,7 +61,9 @@ use heartwood_common::net_config::{
     NetworkRuntimeStage, NetworkRuntimeStatus, NetworkTrialPhase, StageNetworkConfigParams,
     WifiFailureReason,
 };
+use heartwood_common::data_key::PhoneSet;
 use heartwood_common::nip44;
+use heartwood_common::phone_unlock::{self, LockContext};
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
 use heartwood_common::policy::{validate_exact_slot_policy, ExactSlotPolicy};
 use heartwood_common::types::{
@@ -77,7 +79,7 @@ use heartwood_common::types::{
     FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
     FRAME_TYPE_SET_NET_CONFIG, FRAME_TYPE_SET_OPERATOR, FRAME_TYPE_SET_PIN,
-    FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK,
+    FRAME_TYPE_PIN_UNLOCK, FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK, FRAME_TYPE_PHONE_UNLOCK_CMD,
     FRAME_TYPE_SIGN_ENVELOPE, FRAME_TYPE_WIFI_SCAN_REQUEST,
 };
 
@@ -970,24 +972,31 @@ pub fn run_wifi_standalone<'d, 'b>(
     // subscription and every decrypt need the seeds. Serve only the vault
     // delivery channel (plus USB PIN/vault unlock) until they are decrypted,
     // then fall through to the normal boot below with the radio already up.
-    if crate::pin::is_locked(masters) {
-        if let Some(op) = &op_mgmt {
-            if !relays.is_empty() {
-                log::info!("[relay] seeds locked — entering vault-unlock phase");
-                locked_relay_phase(
-                    &mut wifi,
-                    &wifi_candidates,
-                    &relays,
-                    op,
-                    secp,
-                    masters,
-                    personas,
-                    nvs,
-                    usb,
-                    display,
-                    buttons,
-                );
-            }
+    //
+    // The phase runs when someone can answer it: the operator (Sapwood), or
+    // an enrolled phone (phone unlock, docs/specs/2026-09-24-phone-unlock-design.md).
+    if crate::pin::is_locked(masters) && !relays.is_empty() {
+        let phones = heartwood_common::data_key::load_phones(&crate::data_key_store::NvsBlobs(nvs))
+            .unwrap_or_else(|e| {
+                log::error!("[relay] phone records unreadable ({e:?}); phone unlock off this boot");
+                heartwood_common::data_key::PhoneSet::default()
+            });
+        if op_mgmt.is_some() || !phones.is_empty() {
+            log::info!("[relay] seeds locked — entering vault-unlock phase");
+            locked_relay_phase(
+                &mut wifi,
+                &wifi_candidates,
+                &relays,
+                op_mgmt.as_ref(),
+                &phones,
+                secp,
+                masters,
+                personas,
+                nvs,
+                usb,
+                display,
+                buttons,
+            );
         }
     }
 
@@ -2124,7 +2133,8 @@ fn locked_relay_phase(
     wifi: &mut BlockingWifi<EspWifi<'_>>,
     wifi_candidates: &[(String, String)],
     relays: &[String],
-    op_mgmt: &[u8; 32],
+    op_mgmt: Option<&[u8; 32]>,
+    phones: &PhoneSet,
     secp: &Arc<Secp256k1<SignOnly>>,
     masters: &mut [LoadedMaster],
     personas: &[crate::personas::LoadedPersona],
@@ -2148,6 +2158,23 @@ fn locked_relay_phase(
     let sub_req = format!(
         r##"["REQ","locked",{{"kinds":[{VAULT_DELIVERY_KIND}],"#p":["{unlock_pk_hex}"],"limit":0}}]"##
     );
+
+    // Phone unlock: count this locked restart for the phones' prompt rule, and
+    // publish the operator's announcement (the one stable `p` tag) only if the
+    // owner has not switched it off, or no phone could answer instead.
+    let locked_boot = if phones.is_empty() {
+        0
+    } else {
+        crate::data_key_store::next_locked_boot(nvs)
+    };
+    let op_announce = op_mgmt.filter(|_| phones.is_empty() || crate::data_key_store::announce_operator(nvs));
+    if !phones.is_empty() {
+        log::info!(
+            "[relay] locked: {} phone(s) can unlock; operator announcement {}",
+            phones.records().len(),
+            if op_announce.is_some() { "on" } else { "off" }
+        );
+    }
 
     // PIN state for the USB path mirrors the main locked loop exactly.
     let mut failed_attempts: u8 = match crate::pin::read_failed_attempts(nvs) {
@@ -2242,14 +2269,25 @@ fn locked_relay_phase(
             // and a round trip on an event that is rejected as expired.
             let now_wall = clock.projected(crate::uptime_s());
             if now_wall > 0 && Instant::now() >= next_announce {
-                if let Err(e) = publish_locked_announce(
-                    &mut s.tls,
-                    secp,
-                    &unlock_sk,
-                    &unlock_pk_hex,
-                    op_mgmt,
-                    now_wall,
-                ) {
+                let mut published = op_announce.map_or(Ok(()), |op| {
+                    publish_locked_announce(&mut s.tls, secp, &unlock_sk, &unlock_pk_hex, op, now_wall)
+                });
+                if published.is_ok() && !phones.is_empty() {
+                    let ctx = phone_lock_context(wifi, relays, locked_boot);
+                    published = phones.records().iter().try_for_each(|rec| {
+                        publish_phone_announce(
+                            &mut s.tls,
+                            secp,
+                            &unlock_sk,
+                            &unlock_pk,
+                            &unlock_pk_hex,
+                            rec,
+                            &ctx,
+                            now_wall,
+                        )
+                    });
+                }
+                if let Err(e) = published {
                     log::warn!("[relay] locked: announce failed: {e}");
                     session = None;
                     continue;
@@ -2272,11 +2310,31 @@ fn locked_relay_phase(
                             // note was 42 s ahead — and `projected` has no skew
                             // cap. The Date header is the relay's own clock and
                             // is the only source used here.
-                            if ev.kind == VAULT_DELIVERY_KIND
-                                && handle_vault_delivery(
-                                    ev, &unlock_sk, op_mgmt, nvs, masters, display,
-                                )
-                            {
+                            // The operator's key is the only stable author;
+                            // anything else is a phone's throwaway key, and
+                            // holding a slot secret is its only credential.
+                            let from_operator = op_mgmt.is_some_and(|op| {
+                                hex_decode(&ev.pubkey).ok().as_deref() == Some(op.as_slice())
+                            });
+                            let unlocked = ev.kind == VAULT_DELIVERY_KIND
+                                && match op_mgmt {
+                                    Some(op) if from_operator => handle_vault_delivery(
+                                        ev, &unlock_sk, op, nvs, masters, display,
+                                    ),
+                                    _ => {
+                                        !phones.is_empty()
+                                            && handle_phone_delivery(
+                                                ev,
+                                                &unlock_sk,
+                                                &unlock_pk_hex,
+                                                phones,
+                                                nvs,
+                                                masters,
+                                                display,
+                                            )
+                                    }
+                                };
+                            if unlocked {
                                 unlock_sk.iter_mut().for_each(|b| *b = 0);
                                 crate::oled::show_error(display, "Unlocked!");
                                 FreeRtos::delay_ms(500);
@@ -2399,6 +2457,166 @@ fn locked_relay_phase(
     }
 }
 
+/// The context every phone announcement this boot shares, minus the phone
+/// id. Read fresh on each announce tick so it names the network actually in
+/// use.
+fn phone_lock_context(
+    wifi: &BlockingWifi<EspWifi<'_>>,
+    relays: &[String],
+    locked_boot: u32,
+) -> LockContext {
+    let ssid = match wifi.get_configuration() {
+        Ok(WifiConfig::Client(c)) => c.ssid.as_str().to_string(),
+        _ => String::new(),
+    };
+    let bssid = {
+        let mut ap: esp_idf_svc::sys::wifi_ap_record_t = Default::default();
+        // SAFETY: a plain out-parameter call; ESP-IDF fills `ap` or errors.
+        if unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap) } == 0 {
+            ap.bssid.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+        } else {
+            String::new()
+        }
+    };
+    LockContext {
+        v: 1,
+        t: phone_unlock::TYPE_LOCKED.to_string(),
+        id: 0,
+        boot: locked_boot,
+        reset: crate::reset_reason_str().to_string(),
+        ssid,
+        bssid,
+        fw: env!("CARGO_PKG_VERSION").to_string(),
+        relays: relays.to_vec(),
+    }
+}
+
+/// Publish one phone's lock announcement: authored by this boot's one-time
+/// key, tagged only with the per-boot hint that phone can recognise, content
+/// sealed to that phone's key. Nothing in it names the phone.
+#[allow(clippy::too_many_arguments)]
+fn publish_phone_announce(
+    tls: &mut Tls,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    unlock_sk: &[u8; 32],
+    unlock_pk: &[u8; 32],
+    unlock_pk_hex: &str,
+    phone: &heartwood_common::data_key::PhoneRecord,
+    shared: &LockContext,
+    created_at: u64,
+) -> Result<(), String> {
+    let mut ctx = shared.clone();
+    ctx.id = phone.id;
+    let mut nonce = [0u8; 12];
+    crate::fill_random(&mut nonce);
+    let unsigned = UnsignedEvent {
+        pubkey: unlock_pk_hex.to_string(),
+        created_at,
+        kind: LOCKED_ANNOUNCE_KIND,
+        tags: vec![vec![
+            phone_unlock::HINT_TAG.to_string(),
+            phone_unlock::hint(&phone.phone_key, unlock_pk),
+        ]],
+        content: phone_unlock::seal_context(&phone.phone_key, unlock_pk, &ctx, &nonce),
+    };
+    let event_id = nip46::compute_event_id(&unsigned);
+    let sig = sign::sign_hash(secp, unlock_sk, &event_id).map_err(|e| format!("sign: {e}"))?;
+    let signed = SignedEvent {
+        id: hex_encode(&event_id),
+        pubkey: unsigned.pubkey,
+        created_at: unsigned.created_at,
+        kind: unsigned.kind,
+        tags: unsigned.tags,
+        content: unsigned.content,
+        sig: hex_encode(&sig),
+    };
+    ws_send_event(tls, &signed)?;
+    Ok(())
+}
+
+/// Handle a delivery that is not from the operator: a phone's `{v, id, s}`,
+/// NIP-44 from a throwaway key to our one-time key. S unwraps the data key
+/// from that phone's record, and the data key opens the seeds with no
+/// stretching. A failure is a plain refusal: it never feeds the PIN wipe
+/// counter, and costs the board one HKDF and one MAC. Returns true when the
+/// seeds unlocked.
+fn handle_phone_delivery(
+    ev: &SignedEvent,
+    unlock_sk: &[u8; 32],
+    unlock_pk_hex: &str,
+    phones: &PhoneSet,
+    nvs: &mut EspNvs<NvsDefault>,
+    masters: &mut [LoadedMaster],
+    display: &mut Display<'_>,
+) -> bool {
+    // The subscription filters on our `p` tag; relays are not trusted, so
+    // check it again.
+    if !ev.tags.iter().any(|t| t.len() >= 2 && t[0] == "p" && t[1] == unlock_pk_hex) {
+        return false;
+    }
+    let Some(author) = hex_decode(&ev.pubkey).ok().and_then(|v| <[u8; 32]>::try_from(v).ok()) else {
+        return false;
+    };
+    let Ok(conversation_key) = nip44::get_conversation_key(unlock_sk, &author) else {
+        log::warn!("[relay] phone delivery: bad author key");
+        return false;
+    };
+    let mut plaintext = match nip44::decrypt(&conversation_key, &ev.content) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("[relay] phone delivery decrypt failed: {e}");
+            return false;
+        }
+    };
+    let delivery = phone_unlock::Delivery::parse(&plaintext);
+    plaintext.zeroize();
+    let Ok(delivery) = delivery else {
+        log::warn!("[relay] phone delivery malformed");
+        return false;
+    };
+    let mut dk = match phones.unwrap(delivery.id, &delivery.slot_secret) {
+        Ok(dk) => dk,
+        Err(e) => {
+            log::warn!("[relay] phone delivery refused: {e:?}");
+            return false;
+        }
+    };
+    let locked: Vec<u8> = masters.iter().filter(|m| m.locked).map(|m| m.slot).collect();
+    let unlocked = heartwood_common::data_key::unlock_with_data_key(
+        &crate::data_key_store::NvsBlobs(nvs),
+        &locked,
+        &dk,
+    );
+    let unlocked = match unlocked {
+        Ok(u) => u,
+        Err(e) => {
+            // NeedsSecret: a seed is still in the pre-data-key format. The
+            // PIN or vault key has to be used once to migrate it.
+            log::warn!("[relay] phone delivery could not open the seeds: {e:?}");
+            dk.zeroize();
+            return false;
+        }
+    };
+    for (slot, seed) in unlocked.seeds.iter() {
+        if let Some(m) = masters.iter_mut().find(|m| m.slot == *slot) {
+            m.secret = *seed;
+            m.locked = false;
+        }
+    }
+    crate::data_key_store::remember(dk);
+    dk.zeroize();
+    let label = phones
+        .records()
+        .iter()
+        .find(|r| r.id == delivery.id)
+        .map(|r| r.label.clone())
+        .unwrap_or_default();
+    log::info!("[relay] phone {} unlocked the board", delivery.id);
+    crate::oled::show_result(display, &format!("Unlocked by\n{label}"));
+    crate::notes::sync_sealed_with_data_key();
+    true
+}
+
 /// Handle one vault-delivery event. The event must be authored by the
 /// operator and p-tagged to our one-time unlock pubkey (the subscription
 /// already filters the tag; re-check both regardless — relays are not
@@ -2441,8 +2659,8 @@ fn handle_vault_delivery(
     };
     // The unseal is the slow part of a WiFi unlock too, and this path has an
     // OLED in front of the owner just like the cabled one.
-    let ok = crate::pin::try_unlock(nvs, masters, &vault_key, &mut |done, total| {
-        crate::oled::show_unseal_progress(display, done, total)
+    let ok = crate::pin::try_unlock(nvs, masters, &vault_key, &mut |p| {
+        crate::pin::show_unlock_progress(display, p)
     });
     if ok {
         log::info!("[relay] vault key accepted — device unlocked");
@@ -2790,6 +3008,15 @@ fn poll_usb(
         FRAME_TYPE_VAULT_UNLOCK => {
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"already unlocked");
         }
+        FRAME_TYPE_PHONE_UNLOCK_CMD => crate::phone_unlock_cmd::handle_frame(
+            usb,
+            &frame.payload,
+            ctx.nvs,
+            ctx.masters,
+            ctx.policy_engine.bridge_authenticated,
+            ctx.display,
+            ctx.buttons,
+        ),
 
         FRAME_TYPE_CONNSLOT_CREATE => {
             crate::connslot::handle_create(usb, &frame, ctx.policy_engine, ctx.masters, ctx.nvs)
@@ -8119,8 +8346,37 @@ fn dispatch_mgmt(
             Ok(serde_json::json!({ "quiet": quiet }))
         }
 
+        // Phones that can unlock this board. Enrolment is cable-only (it needs
+        // a press, and the relay loop must not block on a card); these three
+        // need no press. See phone_unlock_cmd.rs.
+        "list_unlock_phones" | "revoke_unlock_phone" | "set_announce_operator" => {
+            if !is_device_op {
+                return Err(format!("{method} is a device-level operation and requires the device operator"));
+            }
+            let cmd = match method {
+                "list_unlock_phones" => heartwood_common::phone_unlock::PhoneCmd::List,
+                "revoke_unlock_phone" => heartwood_common::phone_unlock::PhoneCmd::Revoke {
+                    id: req
+                        .pointer("/params/id")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|v| u32::try_from(v).ok())
+                        .ok_or("revoke_unlock_phone requires params.id")?,
+                },
+                _ => heartwood_common::phone_unlock::PhoneCmd::SetAnnounceOperator {
+                    on: req
+                        .pointer("/params/on")
+                        .and_then(|v| v.as_bool())
+                        .ok_or("set_announce_operator requires params.on")?,
+                },
+            };
+            crate::phone_unlock_cmd::run(cmd, ctx.nvs, ctx.masters, ctx.display, None)
+        }
+
         "get_status" => {
             let capabilities = serde_json::json!([
+                    // Phone unlock: USB frame 0x64 and the list/revoke/
+                    // set_announce_operator management methods.
+                    "phone_unlock_v1",
                     "client_policy_v2",
                     // Schema addendum §1.5 family flags (escalate,
                     // petition_on_deny, audit_child_wrap, bound_identity)

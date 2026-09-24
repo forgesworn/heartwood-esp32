@@ -1,30 +1,32 @@
 // firmware/src/pin.rs
 //
 // PIN-derived seed encryption at rest (P5) — the eFuse-free device-theft
-// mitigation. When a PIN is set, each master seed is stored ENCRYPTED
-// (`m<slot>_seed_enc`, see heartwood_common::seed_cipher) and the
-// plaintext is removed. On boot the device is locked until a PIN_UNLOCK frame
-// decrypts the seeds into RAM. After 5 failed attempts both the flash-time
-// config source and the complete NVS partition are wiped.
+// mitigation. When a PIN (or a host-held vault key, below) is set, every
+// master seed is sealed under a random data key (`m<slot>_seed_enc`), the
+// data key is wrapped under the PIN (`dk_sec`), and the plaintext is removed.
+// See heartwood_common::data_key. On boot the device is locked until a
+// PIN_UNLOCK frame opens the wrapper and the seeds into RAM. After 5 failed
+// attempts both the flash-time config source and the complete NVS partition
+// are wiped.
 //
 // There is deliberately NO stored hash of the PIN. A fast hash would let an
 // attacker who owns the flash brute-force the PIN against it (instant),
-// bypassing the slow KDF entirely — so the encrypted blob's AEAD tag is the
-// SOLE PIN check, and every guess must pay the PBKDF2 cost.
+// bypassing the slow KDF entirely — so the wrapper's AEAD tag is the SOLE PIN
+// check, and every guess must pay the PBKDF2 cost.
 //
 // Limitation (see docs/2026-07-02-pin-seed-encryption-design.md): with no
 // secure element the key derives only from the PIN, so a flash dump is
 // offline-brute-forceable — a real uplift, not hardware-wallet-grade.
 
-use crate::masters::{self, LoadedMaster};
+use crate::masters::LoadedMaster;
 use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
+use crate::data_key_store::{self, Board, NvsBlobs};
 use crate::protocol;
-use heartwood_common::seed_cipher::{
-    decrypt_seed, decrypt_seed_reference, encrypt_seed, NONCE_LEN, SALT_LEN,
-};
+use heartwood_common::data_key::{self, BlobStore, ChangeError, Pbkdf2};
 use heartwood_common::types::{FRAME_TYPE_ACK, FRAME_TYPE_NACK};
+use zeroize::Zeroize;
 
 const NVS_PIN_ATTEMPTS_KEY: &str = "pin_attempts";
 pub const MAX_FAILED_ATTEMPTS: u8 = 5;
@@ -33,13 +35,6 @@ pub const MAX_FAILED_ATTEMPTS: u8 = 5;
 /// the device is PIN-locked and must be unlocked before its seeds are usable.
 pub fn is_locked(masters: &[LoadedMaster]) -> bool {
     masters.iter().any(|m| m.locked)
-}
-
-/// Fill a buffer with hardware RNG bytes for a salt/nonce, via the shared
-/// `fill_random` helper — guaranteed true entropy in both tiers (RF source
-/// when the radio is up, SAR-ADC bracket in the radio-off USB tier).
-fn fill_random(buf: &mut [u8]) {
-    crate::fill_random(buf);
 }
 
 /// Read the persisted failed-attempt counter from NVS. Malformed/unreadable
@@ -71,134 +66,149 @@ pub(crate) fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
     let _ = nvs.remove(NVS_PIN_ATTEMPTS_KEY);
 }
 
-/// Encrypt every (unlocked, in-RAM) master seed under `pin` and remove its
-/// plaintext. VERIFY-AFTER-ENCRYPT: each blob is decrypted with the same PIN
-/// and checked against the original seed BEFORE the plaintext is dropped, so a
-/// bad blob can never lose the seed. The seeds stay usable in RAM this session;
-/// they load locked on the next boot.
-///
-/// Two-phase, because the S3 resets when a host reconnects the USB CDC: the
-/// slow PBKDF2 work happens entirely in phase 1 with storage untouched, and
-/// phase 2 is a fast commit of prepared blobs. A reset during phase 1 leaves
-/// the device fully plaintext; a reset during the (millisecond) phase 2 could
-/// still tear per-slot, but every committed blob decrypts under the same key,
-/// so re-running the operation converges — observed in the field 2026-08-08
-/// (slot 0 sealed, slots 1–2 plaintext after a mid-enable reset).
+/// What an unlock is doing, for the OLED.
+#[derive(Clone, Copy)]
+pub enum UnlockProgress {
+    /// Opening sealed seeds: `done` of `total`.
+    Opening { done: usize, total: usize },
+    /// First unlock after the data-key update: resealing the seeds so later
+    /// unlocks cost one stretch. Runs once per board, and a power cut during
+    /// it is safe (see `heartwood_common::data_key`), but it is slow.
+    Upgrading,
+}
+
+/// Draw an [`UnlockProgress`].
+pub fn show_unlock_progress(display: &mut crate::oled::Display<'_>, p: UnlockProgress) {
+    match p {
+        UnlockProgress::Opening { done, total } => {
+            crate::oled::show_unseal_progress(display, done, total)
+        }
+        UnlockProgress::Upgrading => {
+            crate::oled::show_result(display, "Upgrading storage\nKeep power on")
+        }
+    }
+}
+
+/// The in-RAM seeds of every master, for the data-key operations. The caller
+/// zeroises the result.
+fn ram_seeds(masters: &[LoadedMaster]) -> Vec<(u8, [u8; 32])> {
+    masters.iter().map(|m| (m.slot, m.secret)).collect()
+}
+
+fn scrub(seeds: &mut [(u8, [u8; 32])]) {
+    for (_, seed) in seeds.iter_mut() {
+        seed.zeroize();
+    }
+}
+
+/// Seal every (unlocked, in-RAM) master seed under the data key and wrap the
+/// data key under `secret` (PIN digits or the vault key). On a board that is
+/// already sealed only the wrapper changes, so this is one PBKDF2 stretch plus
+/// its reference check whatever the number of identities; enrolled phones
+/// keep working. The write order keeps the board openable by exactly one of
+/// the old and new secret across a power cut at any point
+/// (`data_key::set_secret`, cut-tested on the host).
 fn enable_encryption(
     nvs: &mut EspNvs<NvsDefault>,
     masters: &[LoadedMaster],
-    pin: &[u8],
+    secret: &[u8],
     display: &mut crate::oled::Display<'_>,
 ) -> Result<(), &'static str> {
-    // Two 100k-round KDFs per seed is ~17 s of silence each. Without progress
-    // the card still reads "approved" and the device looks hung, which invites
-    // exactly the power-cut this function must not take mid-rewrap.
-    let total = masters.iter().filter(|m| !m.locked).count();
-    let mut done = 0usize;
-    let mut prepared: Vec<(u8, Vec<u8>)> = Vec::new();
-    for m in masters.iter() {
-        // Each slot pays two 100k-round PBKDF2 runs (encrypt + self-check);
-        // with several masters this phase runs for tens of seconds. Yield so
-        // IDLE0 runs between the KDF stretches — its watchdog aborts after 60 s
-        // of unbroken compute, and feeding our own task is not enough because
-        // the idle tasks are separately monitored (CHECK_IDLE_TASK_CPU0=y).
-        // The unlock path below has always yielded here; this loop did not, so
-        // VAULT_SET on a 4-master board rebooted mid-rewrap and left at-rest
-        // encryption silently OFF (nothing persists until the store loop).
-        esp_idf_hal::delay::FreeRtos::delay_ms(20);
-        crate::wdt::feed();
-        if m.locked {
-            continue; // already encrypted (defensive)
+    crate::oled::show_result(display, "Encrypting\nKeep power on");
+    let mut seeds = ram_seeds(masters);
+    let outcome = data_key::set_secret(
+        &mut NvsBlobs(nvs),
+        secret,
+        &seeds,
+        data_key_store::current(),
+        &Pbkdf2,
+        &mut Board::quiet(),
+    );
+    scrub(&mut seeds);
+    match outcome {
+        Ok(dk) => {
+            data_key_store::remember(dk);
+            Ok(())
         }
-        done += 1;
-        crate::oled::show_result(
-            display,
-            &format!("Encrypting {done}/{total}\nKeep power on"),
-        );
-        let mut salt = [0u8; SALT_LEN];
-        let mut nonce = [0u8; NONCE_LEN];
-        fill_random(&mut salt);
-        fill_random(&mut nonce);
-
-        let blob = encrypt_seed(pin, &m.secret, &salt, &nonce);
-        // Encrypt and self-check are a 100k-round KDF each: yield between them
-        // too, so the longest unbroken stretch is one KDF rather than two.
-        esp_idf_hal::delay::FreeRtos::delay_ms(20);
-        crate::wdt::feed();
-        // The self-check goes through the REFERENCE KDF, never this board's
-        // engine. A sealing engine grading its own work would agree with
-        // itself even if it were deterministically wrong, and the board would
-        // commit a blob only that engine can open; a later fix, or the
-        // software fallback after a failed self-check, would then be lost
-        // keys. Verifying in software costs one extra slow derivation on a
-        // rare path and guarantees the committed blob opens anywhere.
-        match decrypt_seed_reference(pin, &blob) {
-            Ok(check) if check == m.secret => {}
-            _ => return Err("encrypt self-check failed"),
+        Err(ChangeError::NoDataKey) => {
+            Err("storage upgrade unfinished: reboot and unlock, then retry")
         }
-        prepared.push((m.slot, blob));
+        Err(ChangeError::Verify(what)) => {
+            log::error!("at-rest enable: {what}");
+            Err("encrypt self-check failed")
+        }
+        Err(ChangeError::Storage) => Err("failed to write encrypted secret"),
     }
-    for (slot, blob) in prepared {
-        crate::wdt::feed();
-        masters::store_secret_enc(nvs, slot, &blob)?;
-    }
-    Ok(())
 }
 
-/// Re-store every master seed as plaintext and drop its encrypted blob (opt-out
-/// of at-rest encryption). Requires the seeds to be in RAM (device unlocked).
+/// Re-store every master seed as plaintext, then drop the phone records and
+/// the data-key wrapper (opt-out of at-rest encryption). Requires the seeds to
+/// be in RAM (device unlocked).
 fn disable_encryption(
     nvs: &mut EspNvs<NvsDefault>,
     masters: &[LoadedMaster],
 ) -> Result<(), &'static str> {
-    for m in masters.iter() {
-        masters::store_secret_plain(nvs, m.slot, &m.secret)?;
-    }
+    let mut seeds = ram_seeds(masters);
+    let outcome = data_key::clear_secret(&mut NvsBlobs(nvs), &seeds);
+    scrub(&mut seeds);
+    outcome.map_err(|_| "failed to write secret")?;
+    data_key_store::forget();
     Ok(())
 }
 
-/// Try to unlock: decrypt every locked slot with `pin`, filling `.secret` in
-/// RAM. All-or-nothing — a wrong PIN fails the AEAD tag on the first slot and
-/// nothing is filled. Returns true only if every locked slot decrypted.
+/// Try to unlock with the PIN or vault key, filling `.secret` in RAM.
+/// All-or-nothing: nothing is filled unless every locked slot opened.
+///
+/// A migrated board pays one PBKDF2 stretch for the data-key wrapper and
+/// opens every seed without stretching. A board sealed by earlier firmware
+/// pays one stretch per seed this once, then is migrated in place: the seeds
+/// are resealed under a new data key. A migration that stops part-way (power
+/// cut, storage error) leaves a board the same secret still opens, and the
+/// next unlock finishes it.
 pub fn try_unlock(
-    nvs: &EspNvs<NvsDefault>,
+    nvs: &mut EspNvs<NvsDefault>,
     masters: &mut [LoadedMaster],
-    pin: &[u8],
-    on_progress: &mut dyn FnMut(usize, usize),
+    secret: &[u8],
+    on_progress: &mut dyn FnMut(UnlockProgress),
 ) -> bool {
-    // Decrypt all first; only commit to `masters` once every slot succeeds.
-    //
-    // `on_progress(done, sealed)` fires BEFORE each stretch rather than after.
-    // The whole point is to say what is happening during the ~25 s a slot
-    // costs on this board, not to report it once it is already over (#117).
-    let sealed = masters.iter().filter(|m| m.locked).count();
-    let mut done = 0usize;
-    let mut decrypted: Vec<(usize, [u8; 32])> = Vec::new();
-    for (i, m) in masters.iter().enumerate() {
-        // Yield so IDLE0 runs between per-slot KDF stretches (its watchdog
-        // aborts after 60 s of unbroken compute), then feed our own.
-        esp_idf_hal::delay::FreeRtos::delay_ms(20);
-        crate::wdt::feed(); // 100k-round PBKDF2 per locked slot
-        if !m.locked {
-            continue;
+    let locked: Vec<u8> = masters.iter().filter(|m| m.locked).map(|m| m.slot).collect();
+    let mut store = NvsBlobs(nvs);
+    let mut opening = |done: usize, total: usize| on_progress(UnlockProgress::Opening { done, total });
+    let mut board = Board { progress: Some(&mut opening) };
+    let unlocked = data_key::unlock_with_secret(&store, &locked, secret, &Pbkdf2, &mut board);
+    let mut unlocked = match unlocked {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn!("unlock refused: {e:?}");
+            return false;
         }
-        on_progress(done, sealed);
-        let blob = match masters::read_secret_enc(nvs, m.slot) {
-            Some(b) => b,
-            None => return false, // marked locked but no blob — inconsistent
-        };
-        match decrypt_seed(pin, &blob) {
-            Ok(seed) => {
-                decrypted.push((i, seed));
-                done += 1;
-            }
-            Err(_) => return false, // wrong PIN (or tampered blob)
+    };
+    for (slot, seed) in unlocked.seeds.iter() {
+        if let Some(m) = masters.iter_mut().find(|m| m.slot == *slot) {
+            m.secret = *seed;
+            m.locked = false;
         }
     }
-    on_progress(done, sealed);
-    for (i, seed) in decrypted {
-        masters[i].secret = seed;
-        masters[i].locked = false;
+
+    let upgrade_due = unlocked.dk.is_none()
+        || locked.iter().any(|&slot| {
+            store
+                .get(&data_key::seed_enc_key(slot))
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(data_key::seed_format)
+                != Some(data_key::SeedFormat::DataKey)
+        });
+    if upgrade_due {
+        on_progress(UnlockProgress::Upgrading);
+        match data_key::migrate(&mut store, secret, &mut unlocked, &Pbkdf2, &mut Board::quiet()) {
+            Ok(n) => log::info!("at-rest storage on the data key ({n} seed(s) resealed)"),
+            Err(e) => log::error!("data-key migration incomplete ({e:?}); the next unlock resumes it"),
+        }
+    }
+    if let Some(dk) = unlocked.dk {
+        data_key_store::remember(dk);
     }
     true
 }
@@ -232,9 +242,7 @@ pub fn handle_pin_unlock(
         return false;
     }
 
-    if try_unlock(nvs, masters, payload, &mut |done, total| {
-        crate::oled::show_unseal_progress(display, done, total)
-    }) {
+    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p)) {
         log::info!("PIN verified — seeds decrypted, device unlocked");
         *failed_attempts = 0;
         clear_failed_attempts(nvs);
@@ -381,8 +389,8 @@ pub fn wipe_and_reboot(
 //
 // The vault key is a 32-byte random secret generated and held by the host
 // (heartwoodd's encrypted keyfile, or Sapwood's browser storage) — never on
-// the device. Seeds are wrapped with exactly the same `encrypt_seed` AEAD as
-// the human PIN path; only the caller and payload shape differ. Because the
+// the device. It wraps the data key exactly as the human PIN does; only the
+// caller and payload shape differ. Because the
 // key is a 256-bit bearer credential (not a knowledge factor), VAULT_UNLOCK
 // requires an authenticated bridge session, and a wrong key is a plain NACK —
 // it must NOT feed the PIN wipe counter, or a buggy/malicious host could
@@ -481,9 +489,7 @@ pub fn handle_vault_unlock(
         return false;
     }
 
-    if try_unlock(nvs, masters, payload, &mut |done, total| {
-        crate::oled::show_unseal_progress(display, done, total)
-    }) {
+    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p)) {
         log::info!("Vault key accepted — seeds decrypted, device unlocked");
         // A prior PIN-attempt counter is meaningless after a successful
         // vault unlock — clear it so a later PIN attempt starts fresh.

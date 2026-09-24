@@ -52,6 +52,7 @@ mod identity_meta;
 mod layout;
 mod log_quiet;
 mod crash_crumb;
+mod data_key_store;
 mod management_challenge;
 mod palette;
 mod masters;
@@ -67,6 +68,7 @@ mod oled;
 mod ota;
 mod pin;
 mod persistent_wipe;
+mod phone_unlock_cmd;
 mod policy;
 mod protocol;
 mod provision;
@@ -113,7 +115,7 @@ use heartwood_common::types::{
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
     FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_PIN,
-    FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK, FRAME_TYPE_NOTE_CMD,
+    FRAME_TYPE_VAULT_SET, FRAME_TYPE_VAULT_UNLOCK, FRAME_TYPE_NOTE_CMD, FRAME_TYPE_PHONE_UNLOCK_CMD,
     FRAME_TYPE_CONNSLOT_CREATE, FRAME_TYPE_CONNSLOT_LIST, FRAME_TYPE_CONNSLOT_UPDATE,
     FRAME_TYPE_CONNSLOT_REVOKE, FRAME_TYPE_CONNSLOT_URI,
     FRAME_TYPE_BACKUP_EXPORT_REQUEST, FRAME_TYPE_BACKUP_IMPORT_REQUEST,
@@ -1312,6 +1314,17 @@ fn main() {
                 // The payload is the vault key (FW-L3).
                 frame.scrub_payload();
             }
+
+            // 0x64 — phones that can unlock this board (enrol / list / revoke)
+            FRAME_TYPE_PHONE_UNLOCK_CMD => phone_unlock_cmd::handle_frame(
+                &mut usb,
+                &frame.payload,
+                &mut nvs,
+                &loaded_masters,
+                policy_engine.bridge_authenticated,
+                &mut display,
+                &buttons,
+            ),
 
             // 0x63 — vault unlock in the main loop is a no-op (the device is
             // already unlocked to be here); NACK so host bugs are visible.

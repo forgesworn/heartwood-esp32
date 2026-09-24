@@ -43,6 +43,14 @@ export async function openFramedPort(path, { env = process.env, baudRate = 11520
     port.once('open', resolve)
     port.once('error', reject)
   })
+  // A USB-UART bridge (the T-Display's CH9102, the V3's CP2102) wires DTR and
+  // RTS to EN and GPIO0, and macOS asserts both on open, which holds the chip
+  // in reset: the board then answers nothing at all (T-Display, 2026-09-24).
+  // Release them, as Sapwood does after a flash. Native USB-Serial-JTAG ports
+  // (cu.usbmodem*) are left alone: toggling the lines there resets the V4.
+  if (/usbserial|wchusbserial|SLAB_USBtoUART/.test(path)) {
+    await new Promise((resolve) => port.set({ dtr: false, rts: false }, () => resolve()))
+  }
 
   // One reader for the life of the session. Replies to a request that already
   // timed out are stragglers, not answers, so anything nobody is waiting for

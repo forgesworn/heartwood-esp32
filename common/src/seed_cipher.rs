@@ -171,7 +171,7 @@ fn parse_current_header(blob: &[u8]) -> Result<u32, SeedCipherError> {
     Ok(iterations)
 }
 
-fn encrypt_seed_with_iterations(
+pub(crate) fn encrypt_seed_with_iterations(
     pin: &[u8],
     seed: &[u8; SEED_LEN],
     salt: &[u8; SALT_LEN],

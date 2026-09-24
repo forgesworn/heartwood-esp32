@@ -254,6 +254,7 @@ pub fn requires_mutation_challenge(method: &str) -> bool {
             | "get_network_config"
             | "list_clients"
             | "list_identities"
+            | "list_unlock_phones"
             | "get_status"
     )
 }
@@ -513,6 +514,7 @@ mod tests {
             "get_network_config",
             "list_clients",
             "list_identities",
+            "list_unlock_phones",
             "get_status",
         ] {
             assert!(!requires_mutation_challenge(method), "{method}");

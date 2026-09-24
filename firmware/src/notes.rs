@@ -15,11 +15,13 @@
 //! restores nothing, and the import side has no path from it to this
 //! module. The rule is recorded here, where the data lives.
 //!
-//! At-rest sealing: note blobs ride the PIN/vault secret exactly like the
-//! seeds do. A random 32-byte **note key** is wrapped by
-//! `seed_cipher::encrypt_seed` into this namespace's `nk` blob under the
-//! same secret, unwrapped once at unlock (one extra PBKDF2 run), and
-//! retained in RAM for the boot; each record blob is sealed under it via
+//! At-rest sealing: note blobs ride the same unlock as the seeds. A random
+//! 32-byte **note key** is sealed under the board's data key
+//! (`heartwood_common::data_key`) into this namespace's `nk` blob, opened
+//! once at unlock at no KDF cost, and retained in RAM for the boot. Earlier
+//! firmware wrapped it with `seed_cipher::encrypt_seed` under the PIN/vault
+//! secret; such an `nk` still opens, and is moved onto the data key the first
+//! time it does; each record blob is sealed under it via
 //! `note_seal` at the `NoteStorage` boundary, verify-after-seal before every
 //! write. `sync_sealed` makes the sealed state converge with the seeds'
 //! at-rest state from any torn intermediate (enable, disable, PIN change,
@@ -37,6 +39,7 @@ use heartwood_common::device_identity::{
     self, DeviceIdentityProof, IDENTITY_SEED_LEN,
 };
 use heartwood_common::note_fmt::{amount_and_host, amount_and_host_line, CARD_LINE_CHARS};
+use heartwood_common::data_key;
 use heartwood_common::note_seal;
 use heartwood_common::note_store::{
     NoteError, NoteMeta, NoteStorage, NoteStore, StorageError, ID_LEN, MAX_NOTES, SECRET_LEN,
@@ -59,7 +62,8 @@ const NAMESPACE: &str = "hw_notes";
 const IDENTITY_NAMESPACE: &str = "hw_device";
 const IDENTITY_KEY: &str = "ed25519";
 const INDEX_KEY: &str = "idx";
-/// The wrapped note key: `seed_cipher::encrypt_seed(secret, note_key)`.
+/// The wrapped note key: `data_key::seal_note_key(dk, note_key)`, or
+/// `seed_cipher::encrypt_seed(secret, note_key)` as earlier firmware wrote it.
 const NK_KEY: &str = "nk";
 /// The gift-wrap ledger (`wrap_ledger::WrapLedger::encode`): which wraps the
 /// owner has decided on, so a catch-up REQ does not re-offer them.
@@ -807,35 +811,107 @@ impl Notes {
 /// left alone — the sealed notes behind it stay on flash for the secret
 /// that can open them. Never deletes anything it cannot read.
 pub fn sync_sealed(secret: &[u8]) {
-    with_locker(|notes| sync_sealed_inner(notes, secret))
+    with_locker(|notes| sync_sealed_inner(notes, Some(secret)))
 }
 
-fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
+/// [`sync_sealed`] after an unlock that proved no secret (a phone delivered
+/// the data key). A note key still wrapped under the PIN or vault key stays
+/// sealed until that secret is next used; nothing is lost.
+pub fn sync_sealed_with_data_key() {
+    with_locker(|notes| sync_sealed_inner(notes, None))
+}
+
+/// Wrap the note key for `nk`. Under the data key when this boot holds one
+/// (fast, and the form every unlocker can open); otherwise under the secret,
+/// as earlier firmware did. Either way the wrap is proven to reopen before it
+/// is returned: the data-key form directly, the secret form through the
+/// reference KDF (see seed_cipher::decrypt_seed_reference).
+fn wrap_note_key(
+    secret: Option<&[u8]>,
+    key: &[u8; note_seal::KEY_LEN],
+) -> Option<alloc_vec::Vec<u8>> {
+    if let Some(mut dk) = crate::data_key_store::current() {
+        let mut nonce = [0u8; data_key::NONCE_LEN];
+        crate::fill_random(&mut nonce);
+        let blob = data_key::seal_note_key(&dk, key, &nonce);
+        let ok = data_key::open_note_key(&dk, &blob).as_ref() == Ok(key);
+        dk.zeroize();
+        return ok.then(|| blob.to_vec());
+    }
+    let secret = secret?;
+    let mut salt = [0u8; seed_cipher::SALT_LEN];
+    let mut nonce = [0u8; seed_cipher::NONCE_LEN];
+    crate::fill_random(&mut salt);
+    crate::fill_random(&mut nonce);
+    esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
+    crate::wdt::feed(); // PBKDF2: nk wrap
+    let blob = seed_cipher::encrypt_seed(secret, key, &salt, &nonce);
+    esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
+    crate::wdt::feed(); // PBKDF2: wrap verification
+    (seed_cipher::decrypt_seed_reference(secret, &blob).as_ref() == Ok(key)).then_some(blob)
+}
+
+fn sync_sealed_inner(notes: &mut Notes, secret: Option<&[u8]>) {
     {
         let Storage::Nvs(nvs) = &mut notes.storage else {
             return; // unavailable locker: nothing to seal, nothing to lose
         };
 
-        // 1. Establish the note key in RAM. Every seed_cipher call below is
-        // a 100k-round PBKDF2 (~26 s on the S3 at opt-z) — feed the task
-        // watchdog before each one, exactly as pin.rs does per locked slot,
-        // or the 60 s watchdog fires mid-derivation (bench-caught 2026-08-18:
-        // two task-wdt reboots inside the verify decrypt).
-        if nvs.key.is_none() {
-            // New wraps include an authenticated cost header, while existing
-            // 92-byte wraps remain valid after this firmware update.
+        // 1. Establish the note key in RAM, and decide whether `nk` needs
+        // writing. A secret-wrapped `nk` costs a 100k-round PBKDF2 (~26 s on
+        // the S3 at opt-z): feed the task watchdog before each one, exactly as
+        // pin.rs does, or the 60 s watchdog fires mid-derivation (bench-caught
+        // 2026-08-18: two task-wdt reboots inside the verify decrypt). A
+        // data-key-wrapped `nk` costs nothing.
+        let rewrap = if nvs.key.is_none() {
+            // Three stored forms: the data-key seal (82 bytes), and the two
+            // secret wraps earlier firmware wrote (92 and 101 bytes).
             let mut buf = [0u8; seed_cipher::MAX_BLOB_LEN];
             let nk = nvs.nvs.get_blob(NK_KEY, &mut buf);
             match nk {
+                Ok(Some(blob)) if data_key::is_sealed(blob) => {
+                    let Some(mut dk) = crate::data_key_store::current() else {
+                        log::error!(
+                            "[notes] nk is sealed under the data key, which this boot does not hold — {} sealed note(s) stay sealed",
+                            nvs.sealed_pending.len()
+                        );
+                        return;
+                    };
+                    let opened = data_key::open_note_key(&dk, blob);
+                    dk.zeroize();
+                    match opened {
+                        Ok(key) => nvs.key = Some(key),
+                        Err(_) => {
+                            log::error!(
+                                "[notes] nk does not open under the data key — {} sealed note(s) stay sealed",
+                                nvs.sealed_pending.len()
+                            );
+                            return;
+                        }
+                    }
+                    false
+                }
+                Ok(Some(_)) if secret.is_none() => {
+                    log::warn!(
+                        "[notes] nk is still wrapped under the PIN/vault key — {} sealed note(s) stay sealed until it is next used",
+                        nvs.sealed_pending.len()
+                    );
+                    return;
+                }
                 Ok(Some(blob)) => match {
                     // Yield so IDLE0 runs between KDF stretches (its
                     // watchdog aborts after 60 s of unbroken compute —
                     // bench-caught 2026-08-18), then feed our own.
                     esp_idf_hal::delay::FreeRtos::delay_ms(20);
                     crate::wdt::feed(); // PBKDF2: nk unwrap
-                    seed_cipher::decrypt_seed(secret, blob)
+                    seed_cipher::decrypt_seed(secret.expect("checked above"), blob)
                 } {
-                    Ok(key) => nvs.key = Some(key),
+                    Ok(key) => {
+                        nvs.key = Some(key);
+                        // Move it onto the data key, so no later unlock pays
+                        // this stretch.
+                        crate::data_key_store::current().is_some()
+                    }
                     Err(_) => {
                         log::error!(
                             "[notes] nk does not decrypt under this secret — {} sealed note(s) stay sealed",
@@ -845,35 +921,22 @@ fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
                     }
                 },
                 Ok(None) => {
-                    // First enable or self-heal: mint and wrap a fresh key.
+                    // First enable or self-heal: mint a fresh key. It is not
+                    // kept until its wrap is on flash.
                     let mut key = [0u8; note_seal::KEY_LEN];
                     crate::fill_random(&mut key);
-                    let mut salt = [0u8; seed_cipher::SALT_LEN];
-                    let mut nonce = [0u8; seed_cipher::NONCE_LEN];
-                    crate::fill_random(&mut salt);
-                    crate::fill_random(&mut nonce);
-                    esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
-                    crate::wdt::feed(); // PBKDF2: nk wrap
-                    let blob = seed_cipher::encrypt_seed(secret, &key, &salt, &nonce);
-                    // VERIFY-AFTER-ENCRYPT: the wrap must decrypt back before
-                    // it is trusted as the key's only persistence.
-                    esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
-                    crate::wdt::feed(); // PBKDF2: wrap verification
-                    // Through the reference KDF, not this board's engine: a
-                    // sealing engine must not grade its own work, or a
-                    // deterministic fault writes an nk only that engine can
-                    // unwrap. See seed_cipher::decrypt_seed_reference.
-                    if seed_cipher::decrypt_seed_reference(secret, &blob) != Ok(key) {
+                    let Some(blob) = wrap_note_key(secret, &key) else {
                         log::error!("[notes] nk wrap failed verification — notes stay plaintext");
                         key.zeroize();
                         return;
-                    }
+                    };
                     if let Err(e) = nvs.nvs.set_blob(NK_KEY, &blob) {
                         log::error!("[notes] nk write failed: {e} — notes stay plaintext");
                         key.zeroize();
                         return;
                     }
                     nvs.key = Some(key);
+                    false
                 }
                 Err(e) => {
                     log::error!("[notes] nk read failed: {e} — leaving sealed state untouched");
@@ -881,26 +944,20 @@ fn sync_sealed_inner(notes: &mut Notes, secret: &[u8]) {
                 }
             }
         } else {
-            // Key already in RAM: the secret changed — re-wrap the same key
-            // so every sealed record stays valid under the new secret.
-            let key = nvs.key.expect("checked is_some");
-            let mut salt = [0u8; seed_cipher::SALT_LEN];
-            let mut nonce = [0u8; seed_cipher::NONCE_LEN];
-            crate::fill_random(&mut salt);
-            crate::fill_random(&mut nonce);
-            esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
-            crate::wdt::feed(); // PBKDF2: nk re-wrap
-            let blob = seed_cipher::encrypt_seed(secret, &key, &salt, &nonce);
-            esp_idf_hal::delay::FreeRtos::delay_ms(20); // yield for IDLE0
-            crate::wdt::feed(); // PBKDF2: re-wrap verification
-            // Reference KDF, for the same reason as the first wrap above.
-            if seed_cipher::decrypt_seed_reference(secret, &blob) != Ok(key) {
-                log::error!("[notes] nk re-wrap failed verification — old wrap kept");
-                return;
-            }
-            if let Err(e) = nvs.nvs.set_blob(NK_KEY, &blob) {
-                log::error!("[notes] nk re-wrap write failed: {e} — old wrap kept");
-                return;
+            // Key already in RAM: the secret changed. Re-wrap the same key so
+            // every sealed record stays valid under the new secret. Under the
+            // data key this is a fast reseal.
+            true
+        };
+        if rewrap {
+            let key = nvs.key.expect("established above");
+            match wrap_note_key(secret, &key) {
+                Some(blob) => {
+                    if let Err(e) = nvs.nvs.set_blob(NK_KEY, &blob) {
+                        log::error!("[notes] nk re-wrap write failed: {e} — old wrap kept");
+                    }
+                }
+                None => log::error!("[notes] nk re-wrap failed verification — old wrap kept"),
             }
         }
     }

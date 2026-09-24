@@ -52,6 +52,7 @@ mod identity_meta;
 mod layout;
 mod log_quiet;
 mod crash_crumb;
+mod data_key_store;
 mod management_challenge;
 mod palette;
 mod masters;

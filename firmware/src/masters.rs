@@ -58,9 +58,10 @@ impl Drop for LoadedMaster {
 
 /// Compact encrypted-seed key. ESP-IDF limits NVS keys to 15 characters; the
 /// older `master_<slot>_secret_enc` spelling exceeded that limit and could
-/// never be stored by NVS.
+/// never be stored by NVS. Shared with `heartwood_common::data_key`, which
+/// writes these blobs.
 fn secret_enc_key(slot: u8) -> String {
-    format!("m{slot}_seed_enc")
+    heartwood_common::data_key::seed_enc_key(slot)
 }
 
 /// Read a slot's encrypted seed blob, if present and well-formed.
@@ -68,7 +69,7 @@ pub fn read_secret_enc(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<Vec<u8>> {
     let key = secret_enc_key(slot);
     let mut buf = [0u8; SEED_ENC_MAX_LEN];
     match nvs.get_blob(&key, &mut buf) {
-        Ok(Some(b)) if heartwood_common::seed_cipher::is_blob_len(b.len()) => Some(b.to_vec()),
+        Ok(Some(b)) if heartwood_common::data_key::is_seed_blob_len(b.len()) => Some(b.to_vec()),
         _ => None,
     }
 }
@@ -87,7 +88,7 @@ pub fn pin_unlock_required_after_reboot(
         let key = secret_enc_key(master.slot);
         let mut buf = [0u8; SEED_ENC_MAX_LEN];
         match nvs.get_blob(&key, &mut buf) {
-            Ok(Some(blob)) if heartwood_common::seed_cipher::is_blob_len(blob.len()) => {
+            Ok(Some(blob)) if heartwood_common::data_key::is_seed_blob_len(blob.len()) => {
                 return Ok(true)
             }
             Ok(Some(_)) => return Err("malformed encrypted seed state"),
@@ -98,38 +99,10 @@ pub fn pin_unlock_required_after_reboot(
     Ok(false)
 }
 
-/// Largest encrypted seed blob understood by this release. Earlier 92-byte
-/// records stay readable; new records carry a version and PBKDF2 cost.
-pub const SEED_ENC_MAX_LEN: usize = heartwood_common::seed_cipher::MAX_BLOB_LEN;
-
-/// Store a slot's encrypted seed blob and remove its plaintext secret. Used when
-/// enabling a PIN — after the caller has verified the blob decrypts.
-pub fn store_secret_enc(
-    nvs: &mut EspNvs<NvsDefault>,
-    slot: u8,
-    blob: &[u8],
-) -> Result<(), &'static str> {
-    let prefix = format!("master_{slot}");
-    nvs.set_blob(&secret_enc_key(slot), blob)
-        .map_err(|_| "failed to write encrypted secret")?;
-    // The plaintext must not linger next to the ciphertext.
-    let _ = nvs.remove(&format!("{prefix}_secret"));
-    Ok(())
-}
-
-/// Store a slot's seed as plaintext and remove any encrypted blob. Used when a
-/// PIN is cleared (opt-out of at-rest encryption).
-pub fn store_secret_plain(
-    nvs: &mut EspNvs<NvsDefault>,
-    slot: u8,
-    secret: &[u8; 32],
-) -> Result<(), &'static str> {
-    let prefix = format!("master_{slot}");
-    nvs.set_blob(&format!("{prefix}_secret"), secret)
-        .map_err(|_| "failed to write secret")?;
-    let _ = nvs.remove(&secret_enc_key(slot));
-    Ok(())
-}
+/// Largest encrypted seed blob understood by this release: the data-key
+/// format (82 bytes) and both PIN/vault formats (92 and 101) that earlier
+/// firmware wrote, which still unlock and are then migrated.
+pub const SEED_ENC_MAX_LEN: usize = heartwood_common::data_key::MAX_SEED_BLOB_LEN;
 
 /// Read the master count from NVS.
 pub fn read_master_count(nvs: &EspNvs<NvsDefault>) -> u8 {

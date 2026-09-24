@@ -121,6 +121,11 @@ pub mod seed_cipher;
 #[cfg(feature = "seed-encrypt")]
 pub mod note_seal;
 
+/// The data key and its unlockers (PIN or vault key, and enrolled phones):
+/// phone unlock, phase 1.
+#[cfg(feature = "seed-encrypt")]
+pub mod data_key;
+
 #[cfg(feature = "mnemonic")]
 pub mod restore;
 

@@ -88,6 +88,6 @@ ota-sign = ["dep:ed25519-compact"]
 # transcript and key material are separate.
 device-identity = ["dep:ed25519-compact"]
 # PIN-derived seed encryption at rest (P5). Pulls PBKDF2 + reuses chacha20.
-seed-encrypt = ["dep:pbkdf2", "dep:chacha20"]
+seed-encrypt = ["dep:pbkdf2", "dep:chacha20", "dep:hkdf"]
 # Convenience alias for secp256k1 backend with full feature set (used by firmware)
 firmware = ["compact-hashes", "secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen", "ota-sign", "seed-encrypt", "cash"]

@@ -15,7 +15,8 @@
 //   list                    ids and labels; nothing that unlocks.
 //   revoke                  deletes a phone's record, and with it its
 //                           authority. No press: removing authority is always
-//                           allowed.
+//                           allowed. Revoking the last phone also forgets the
+//                           relays the phones were told (relay.rs RelayUpdate).
 //   set_announce_operator   whether the locked board still publishes the
 //                           operator's announcement, the one stable `p` tag.
 
@@ -109,6 +110,10 @@ pub fn run(
             phones.revoke(id).map_err(|_| format!("no phone with id {id}"))?;
             save(nvs, &phones)?;
             log::info!("phone unlock: revoked phone {id}");
+            // No phone listens anywhere now; the next enrolment records afresh.
+            if phones.is_empty() && phone_unlock::forget_told(&mut NvsBlobs(nvs)).is_err() {
+                log::warn!("phone unlock: relay record not cleared");
+            }
             Ok(serde_json::json!({ "revoked": id }))
         }
         PhoneCmd::SetAnnounceOperator { on } => {
@@ -190,6 +195,13 @@ pub fn run(
             // board did not keep. A full NVS refuses here, cleanly.
             save(nvs, &phones)?;
             log::info!("phone unlock: enrolled phone {} ({label})", enrolment.id);
+            // The phone was handed `relays`. Recorded only if nothing is, so
+            // an update the other phones are still owed is not cut short. A
+            // failure here is repaired at the next boot, which records the
+            // live list when there is no record.
+            if phone_unlock::record_told_if_absent(&mut NvsBlobs(nvs), &relays).is_err() {
+                log::warn!("phone unlock: relay record not saved");
+            }
             crate::oled::show_change_done(display, "Phone added", &label);
             Ok(phone_unlock::enrolment_json(&enrolment))
         }

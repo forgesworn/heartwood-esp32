@@ -981,13 +981,39 @@ pub fn run_wifi_standalone<'d, 'b>(
     //
     // The phase runs when someone can answer it: the operator (Sapwood), or
     // an enrolled phone (phone unlock, docs/specs/2026-09-24-phone-unlock-design.md).
-    if crate::pin::is_locked(masters) && !relays.is_empty() {
-        let phones = heartwood_common::data_key::load_phones(&crate::data_key_store::NvsBlobs(nvs))
-            .unwrap_or_else(|e| {
-                log::error!("[relay] phone records unreadable ({e:?}); phone unlock off this boot");
-                heartwood_common::data_key::PhoneSet::default()
-            });
-        if op_mgmt.is_some() || !phones.is_empty() {
+    //
+    // Phone unlock also has to follow relay changes. A change takes effect
+    // only through a restart, so this is the one place to notice one: if the
+    // live list has a relay the phones were never told about, `told_old` is
+    // the list they were told, where they still listen. The locked phase
+    // repeats its lock announcements there, and the unlocked loop posts
+    // relay updates there (RelayUpdate) until the rounds are done.
+    let told_old: Vec<String> = {
+        let phones = if relays.is_empty() {
+            PhoneSet::default()
+        } else {
+            heartwood_common::data_key::load_phones(&crate::data_key_store::NvsBlobs(nvs))
+                .unwrap_or_else(|e| {
+                    log::error!("[relay] phone records unreadable ({e:?}); phone unlock off this boot");
+                    PhoneSet::default()
+                })
+        };
+        let told_old = phone_unlock::relays_at_boot(
+            &mut crate::data_key_store::NvsBlobs(nvs),
+            !phones.is_empty(),
+            &relays,
+        )
+        .unwrap_or_else(|_| {
+            log::warn!("[relay] phones' relay record unreadable; no relay update this boot");
+            Vec::new()
+        });
+        if !told_old.is_empty() {
+            log::info!(
+                "[relay] relays changed since the phones were told; telling them on {} old relay(s)",
+                told_old.len()
+            );
+        }
+        if crate::pin::is_locked(masters) && !relays.is_empty() && (op_mgmt.is_some() || !phones.is_empty()) {
             log::info!("[relay] seeds locked — entering vault-unlock phase");
             locked_relay_phase(
                 &mut wifi,
@@ -995,6 +1021,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 &relays,
                 op_mgmt.as_ref(),
                 &phones,
+                &told_old,
                 secp,
                 masters,
                 personas,
@@ -1004,7 +1031,9 @@ pub fn run_wifi_standalone<'d, 'b>(
                 buttons,
             );
         }
-    }
+        told_old
+    };
+    let mut relay_update = (!told_old.is_empty()).then(|| RelayUpdate::new(told_old));
 
     let network_trial_deadline = network_trial_id
         .as_ref()
@@ -1536,6 +1565,24 @@ pub fn run_wifi_standalone<'d, 'b>(
             continue;
         }
 
+        // Phone unlock: tell the phones about a relay change, one old relay
+        // per pass. Not during a network trial (the list may yet roll back),
+        // an OTA, or while a card waits for the owner.
+        if relay_update.is_some()
+            && ctx.network_trial_id.is_none()
+            && ctx.ota_session.is_none()
+            && !approval_card_open(&ctx)
+        {
+            service_relay_update(
+                &mut relay_update,
+                &mut ctx,
+                &mut sessions,
+                &mut secondary_next,
+                &wifi,
+                &relays,
+            );
+        }
+
         // Pump each session: split-borrow the active one out so management
         // commands arriving on it can dial/address the others.
         let mut i = 0;
@@ -1982,8 +2029,11 @@ fn connect_relay_raw(
         log::warn!("[relay] send-timeout unavailable ({e}); blocking sends");
     }
 
-    ws_send(&mut tls, OP_TEXT, sub_req.as_bytes())?;
-    log::info!("[relay] subscribed on {url}");
+    // An empty REQ is a publish-only connection (see `publish_once`).
+    if !sub_req.is_empty() {
+        ws_send(&mut tls, OP_TEXT, sub_req.as_bytes())?;
+        log::info!("[relay] subscribed on {url}");
+    }
 
     let now = Instant::now();
     Ok(RelaySession {
@@ -2015,6 +2065,12 @@ pub const VAULT_DELIVERY_KIND: u64 = 24136;
 /// How often a locked signer re-announces. Ephemeral events are not stored,
 /// so an operator who opens Sapwood after the boot must still hear it.
 const LOCKED_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+/// How often a locked board whose relays changed since its phones were told
+/// repeats its phone announcements on the old relays. Each is a fresh TLS
+/// dial, so less often than the live relay's minute.
+const LOCKED_OLD_RELAY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How long a publish-only connection waits for the relay's OK frames.
+const PUBLISH_ONCE_ACK_WAIT: Duration = Duration::from_secs(3);
 
 
 /// Publish the locked-boot announcement: a one-time unlock pubkey the
@@ -2141,6 +2197,7 @@ fn locked_relay_phase(
     relays: &[String],
     op_mgmt: Option<&[u8; 32]>,
     phones: &PhoneSet,
+    told_old: &[String],
     secp: &Arc<Secp256k1<SignOnly>>,
     masters: &mut [LoadedMaster],
     personas: &[crate::personas::LoadedPersona],
@@ -2207,6 +2264,11 @@ fn locked_relay_phase(
     // round trip spent on an event no operator will ever see. Reset per dial —
     // the sample belongs to the relay that gave it.
     let mut clock = heartwood_common::reply_clock::ReplyClock::new();
+    // Relays changed since the phones were told (`told_old`): the phones
+    // listen there, not here, so each phone's announcement is repeated on
+    // them, one relay per pass, every LOCKED_OLD_RELAY_INTERVAL.
+    let mut old_queue: Vec<String> = Vec::new();
+    let mut next_old_round = Instant::now();
 
     loop {
         crate::wdt::feed();
@@ -2280,18 +2342,8 @@ fn locked_relay_phase(
                 });
                 if published.is_ok() && !phones.is_empty() {
                     let ctx = phone_lock_context(wifi, relays, locked_boot);
-                    published = phones.records().iter().try_for_each(|rec| {
-                        publish_phone_announce(
-                            &mut s.tls,
-                            secp,
-                            &unlock_sk,
-                            &unlock_pk,
-                            &unlock_pk_hex,
-                            rec,
-                            &ctx,
-                            now_wall,
-                        )
-                    });
+                    published = build_phone_events(secp, &unlock_sk, &unlock_pk, phones, &ctx, now_wall)
+                        .and_then(|events| events.iter().try_for_each(|ev| ws_send_event(&mut s.tls, ev).map(|_| ())));
                 }
                 if let Err(e) = published {
                     log::warn!("[relay] locked: announce failed: {e}");
@@ -2299,6 +2351,15 @@ fn locked_relay_phase(
                     continue;
                 }
                 next_announce = Instant::now() + LOCKED_ANNOUNCE_INTERVAL;
+                if !phones.is_empty() && old_queue.is_empty() && Instant::now() >= next_old_round {
+                    old_queue = told_old
+                        .iter()
+                        .rev()
+                        .filter(|r| !same_relay(r, &s.url))
+                        .cloned()
+                        .collect();
+                    next_old_round = Instant::now() + LOCKED_OLD_RELAY_INTERVAL;
+                }
             }
 
             // Drain one buffered frame, else one read (recv-timeout paced).
@@ -2373,6 +2434,26 @@ fn locked_relay_phase(
                     log::warn!("[relay] locked: frame parse failed: {e}");
                     session = None;
                     continue;
+                }
+            }
+        }
+
+        // One old relay per pass, so the cable is served between dials. The
+        // announcements carry this boot's one-time author, exactly as on the
+        // live relay: a phone that hears both prompts once. Its delivery goes
+        // to the relays the announcement lists, where this phase listens.
+        if let Some(url) = old_queue.pop() {
+            let now_wall = clock.projected(crate::uptime_s());
+            if session.is_some() && now_wall > 0 {
+                let ctx = phone_lock_context(wifi, relays, locked_boot);
+                match publish_once(&url, now_wall, |created_at| {
+                    build_phone_events(secp, &unlock_sk, &unlock_pk, phones, &ctx, created_at)
+                }) {
+                    Ok(accepted) => log::info!(
+                        "[relay] locked: announced on old relay {} ({accepted} accepted)",
+                        relay_host(&url)
+                    ),
+                    Err(e) => log::warn!("[relay] locked: old relay {}: {e}", relay_host(&url)),
                 }
             }
         }
@@ -2501,47 +2582,249 @@ fn phone_lock_context(
     }
 }
 
-/// Publish one phone's lock announcement: authored by this boot's one-time
-/// key, tagged only with the per-boot hint that phone can recognise, content
-/// sealed to that phone's key. Nothing in it names the phone.
-#[allow(clippy::too_many_arguments)]
-fn publish_phone_announce(
-    tls: &mut Tls,
+/// One event per enrolled phone under the one-time key `sk`: tagged only
+/// with the hint that phone can recognise, content sealed to that phone's
+/// key. Nothing in it names the phone. A lock announcement or a relay update,
+/// as `shared.t` says.
+fn build_phone_events(
     secp: &Arc<Secp256k1<SignOnly>>,
-    unlock_sk: &[u8; 32],
-    unlock_pk: &[u8; 32],
-    unlock_pk_hex: &str,
-    phone: &heartwood_common::data_key::PhoneRecord,
+    sk: &[u8; 32],
+    pk: &[u8; 32],
+    phones: &PhoneSet,
     shared: &LockContext,
     created_at: u64,
-) -> Result<(), String> {
-    let mut ctx = shared.clone();
-    ctx.id = phone.id;
-    let mut nonce = [0u8; 12];
-    crate::fill_random(&mut nonce);
-    let unsigned = UnsignedEvent {
-        pubkey: unlock_pk_hex.to_string(),
-        created_at,
-        kind: LOCKED_ANNOUNCE_KIND,
-        tags: vec![vec![
-            phone_unlock::HINT_TAG.to_string(),
-            phone_unlock::hint(&phone.phone_key, unlock_pk),
-        ]],
-        content: phone_unlock::seal_context(&phone.phone_key, unlock_pk, &ctx, &nonce),
+) -> Result<Vec<SignedEvent>, String> {
+    let pk_hex = hex_encode(pk);
+    phone_unlock::per_phone_messages(phones, shared, pk, &mut |buf: &mut [u8]| crate::fill_random(buf))
+        .into_iter()
+        .map(|(hint, content)| {
+            let unsigned = UnsignedEvent {
+                pubkey: pk_hex.clone(),
+                created_at,
+                kind: LOCKED_ANNOUNCE_KIND,
+                tags: vec![vec![phone_unlock::HINT_TAG.to_string(), hint]],
+                content,
+            };
+            let event_id = nip46::compute_event_id(&unsigned);
+            let sig = sign::sign_hash(secp, sk, &event_id).map_err(|e| format!("sign: {e}"))?;
+            Ok(SignedEvent {
+                id: hex_encode(&event_id),
+                pubkey: unsigned.pubkey,
+                created_at: unsigned.created_at,
+                kind: unsigned.kind,
+                tags: unsigned.tags,
+                content: unsigned.content,
+                sig: hex_encode(&sig),
+            })
+        })
+        .collect()
+}
+
+/// Publish to a relay the board is not serving: dial it with no subscription,
+/// send `build(created_at)`, wait up to [`PUBLISH_ONCE_ACK_WAIT`] for the
+/// relay's OKs, and close. `created_at` is `wall` when the caller knows the
+/// time, else the relay's own `Date` header. Returns how many events the
+/// relay accepted. Refuses on a heap too tight for another TLS session, the
+/// same guard as every other dial.
+fn publish_once(
+    url: &str,
+    wall: u64,
+    build: impl FnOnce(u64) -> Result<Vec<SignedEvent>, String>,
+) -> Result<usize, String> {
+    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let largest = unsafe {
+        esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
     };
-    let event_id = nip46::compute_event_id(&unsigned);
-    let sig = sign::sign_hash(secp, unlock_sk, &event_id).map_err(|e| format!("sign: {e}"))?;
-    let signed = SignedEvent {
-        id: hex_encode(&event_id),
-        pubkey: unsigned.pubkey,
-        created_at: unsigned.created_at,
-        kind: unsigned.kind,
-        tags: unsigned.tags,
-        content: unsigned.content,
-        sig: hex_encode(&sig),
+    if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
+        return Err(format!("heap too tight to dial (free {free} B, largest {largest} B)"));
+    }
+    crate::wdt::feed();
+    let mut s = connect_relay_raw(url, String::new(), false, true)?;
+    crate::wdt::feed();
+    let created_at = if wall > 0 { wall } else { s.server_time.unwrap_or(0) };
+    if created_at == 0 {
+        return Err("no clock to stamp with".into());
+    }
+    let events = build(created_at)?;
+    let mut waiting: Vec<String> = Vec::with_capacity(events.len());
+    for ev in &events {
+        ws_send_event(&mut s.tls, ev)?;
+        waiting.push(ev.id.clone());
+    }
+    let mut accepted = 0usize;
+    let until = Instant::now() + PUBLISH_ONCE_ACK_WAIT;
+    while !waiting.is_empty() && Instant::now() < until {
+        match try_parse(&mut s.rx, &mut s.skip) {
+            Ok(Some(WsMsg::Text(raw))) => {
+                if nip46::relay_message_tag(&raw) == Some("OK") {
+                    if let Ok((_, id, ok, _)) =
+                        serde_json::from_slice::<(String, String, bool, serde_json::Value)>(&raw)
+                    {
+                        if let Some(pos) = waiting.iter().position(|w| *w == id) {
+                            waiting.swap_remove(pos);
+                            accepted += usize::from(ok);
+                        }
+                    }
+                }
+            }
+            Ok(Some(WsMsg::Ping(p))) => {
+                let _ = ws_send(&mut s.tls, OP_PONG, &p);
+            }
+            Ok(Some(WsMsg::Close)) | Err(_) => break,
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if pump(&mut s.tls, &mut s.rx).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = ws_send(&mut s.tls, OP_CLOSE, &[]);
+    Ok(accepted)
+}
+
+/// An unlocked board's relay update (see `phone_unlock`, "Relay changes"):
+/// the old relays the phones listen on, the round schedule, and the round
+/// in flight. RAM only; a restart starts the rounds again.
+struct RelayUpdate {
+    old: Vec<String>,
+    rounds: phone_unlock::UpdateRounds,
+    round: Option<UpdateRound>,
+}
+
+/// One round: a fresh one-time key (so rounds are unlinkable to each other
+/// and to any boot's lock announcements), the phones as they stood when it
+/// began, and the old relays still to reach.
+struct UpdateRound {
+    sk: [u8; 32],
+    pk: [u8; 32],
+    phones: PhoneSet,
+    queue: Vec<String>,
+    reached: usize,
+}
+
+impl Drop for UpdateRound {
+    fn drop(&mut self) {
+        self.sk.zeroize();
+    }
+}
+
+impl RelayUpdate {
+    fn new(old: Vec<String>) -> Self {
+        Self { old, rounds: phone_unlock::UpdateRounds::new(), round: None }
+    }
+}
+
+/// Advance the relay update by one step: start a round when one is due,
+/// publish to one old relay, or close a round (and, after the last, record
+/// that the phones now know the live list). Publishes on a live session when
+/// one is on that relay, else dials it once. The secondary (redundancy only)
+/// steps aside for the dial and redials after PINNED_BACKOFF; the dial's own
+/// heap guard covers a pinned relay holding the other slot.
+fn service_relay_update(
+    update: &mut Option<RelayUpdate>,
+    ctx: &mut SignCtx,
+    sessions: &mut Vec<RelaySession>,
+    secondary_next: &mut Instant,
+    wifi: &BlockingWifi<EspWifi<'_>>,
+    relays: &[String],
+) {
+    let Some(u) = update.as_mut() else {
+        return;
     };
-    ws_send_event(tls, &signed)?;
-    Ok(())
+    let now_up = crate::uptime_s();
+    let Some(round) = u.round.as_mut() else {
+        if !u.rounds.due(now_up) {
+            return;
+        }
+        // The phones as they are now: a phone revoked since boot gets nothing.
+        let phones = match heartwood_common::data_key::load_phones(&crate::data_key_store::NvsBlobs(ctx.nvs)) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("[relay] phone records unreadable ({e:?}); relay update dropped");
+                *update = None;
+                return;
+            }
+        };
+        if phones.is_empty() {
+            log::info!("[relay] no phones left to tell about the relay change");
+            *update = None;
+            return;
+        }
+        let mut sk = [0u8; 32];
+        let pk = loop {
+            crate::fill_random(&mut sk);
+            if let Ok(kp) = Keypair::from_seckey_slice(ctx.secp, &sk) {
+                break kp.x_only_public_key().0.serialize();
+            }
+        };
+        log::info!(
+            "[relay] relay update round {} of {}: {} phone(s), {} old relay(s)",
+            u.rounds.rounds_done() + 1,
+            phone_unlock::RELAY_UPDATE_ROUNDS_SECS.len(),
+            phones.records().len(),
+            u.old.len()
+        );
+        u.round = Some(UpdateRound {
+            sk,
+            pk,
+            phones,
+            queue: u.old.iter().rev().cloned().collect(),
+            reached: 0,
+        });
+        return;
+    };
+
+    let Some(url) = round.queue.pop() else {
+        log::info!(
+            "[relay] relay update round {} done: {} of {} old relay(s) took it",
+            u.rounds.rounds_done() + 1,
+            round.reached,
+            u.old.len()
+        );
+        u.round = None;
+        u.rounds.mark_done(now_up);
+        if u.rounds.finished() {
+            match phone_unlock::record_told(&mut crate::data_key_store::NvsBlobs(ctx.nvs), relays) {
+                Ok(()) => log::info!("[relay] phones told about the relay change; recorded"),
+                Err(_) => log::warn!("[relay] relay record not saved; the update repeats next boot"),
+            }
+            *update = None;
+        }
+        return;
+    };
+
+    let shared = phone_lock_context(wifi, relays, crate::data_key_store::locked_boots(ctx.nvs)).as_relay_update();
+    let wall = ctx.reply_clock.projected(crate::uptime_s());
+    if wall > 0 {
+        if let Some(s) = sessions.iter_mut().find(|s| same_relay(&s.url, &url)) {
+            let sent = build_phone_events(ctx.secp, &round.sk, &round.pk, &round.phones, &shared, wall)
+                .and_then(|events| events.iter().try_for_each(|ev| ws_send_event(&mut s.tls, ev).map(|_| ())));
+            match sent {
+                Ok(()) => round.reached += 1,
+                // The session's own pump notices a dead socket.
+                Err(e) => log::warn!("[relay] relay update on {}: {e}", relay_host(&url)),
+            }
+            return;
+        }
+    }
+    if let Some(pos) = sessions.iter().position(|s| s.secondary) {
+        let shed = sessions.remove(pos);
+        log::info!("[relay] secondary {} steps aside for a relay update", relay_host(&shed.url));
+        ctx.network_runtime.secondary_index = None;
+        *secondary_next = Instant::now() + PINNED_BACKOFF;
+        retune_recv_timeouts(sessions);
+    }
+    let secp = ctx.secp;
+    match publish_once(&url, wall, |created_at| {
+        build_phone_events(secp, &round.sk, &round.pk, &round.phones, &shared, created_at)
+    }) {
+        Ok(accepted) => {
+            round.reached += 1;
+            log::info!("[relay] relay update on old relay {} ({accepted} accepted)", relay_host(&url));
+        }
+        Err(e) => log::warn!("[relay] relay update on old relay {}: {e}", relay_host(&url)),
+    }
 }
 
 /// Handle a delivery that is not from the operator: a phone's `{v, id, s}`,

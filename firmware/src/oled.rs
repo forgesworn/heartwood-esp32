@@ -1111,8 +1111,9 @@ fn draw_button_tags(display: &mut Display<'_>) -> bool {
         if !crate::button::has_button_b() {
             return false;
         }
-        // Approve (A) is the upper of the two right-hand buttons.
-        const APPROVE_ON_TOP: bool = true;
+        // Approve (A) is the lower of the two right-hand buttons (confirmed
+        // on the bench board, 2026-09-24).
+        const APPROVE_ON_TOP: bool = false;
         let l = layout(display);
         let font = l.font_small();
         let (top, top_colour, bottom, bottom_colour) = if APPROVE_ON_TOP {

@@ -467,6 +467,14 @@ changes hands:
 - `VAULT_SET` (0x62) enables/disables the wrapping; it requires bridge
   authentication **and** physical button confirmation, so a remote party can
   never change the at-rest posture.
+- `FIRMWARE_INFO` and the relay `get_status` reply also carry `at_rest`
+  (`none`/`pin`/`vault`) and `unlock_phone_count`, so a manager stops
+  inferring the mode from side effects it happened to witness. Both are pure
+  reads — see `common/src/at_rest_status.rs`. `FIRMWARE_INFO` answers this to
+  any USB host, in any mode, including while locked (the same trust level as
+  its other operational fields — uptime, RNG state, crash context); `relay`
+  `get_status` only once genuinely unlocked, and only to the device operator,
+  never a per-identity delegate. Neither ever names a phone.
 
 Security properties and honest residuals:
 

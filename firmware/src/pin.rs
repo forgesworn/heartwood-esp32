@@ -107,11 +107,13 @@ fn scrub(seeds: &mut [(u8, [u8; 32])]) {
 /// its reference check whatever the number of identities; enrolled phones
 /// keep working. The write order keeps the board openable by exactly one of
 /// the old and new secret across a power cut at any point
-/// (`data_key::set_secret`, cut-tested on the host).
+/// (`data_key::set_secret`, cut-tested on the host). `kind` records which
+/// secret this was, for `at_rest_mode` — see its doc comment.
 fn enable_encryption(
     nvs: &mut EspNvs<NvsDefault>,
     masters: &[LoadedMaster],
     secret: &[u8],
+    kind: u8,
     display: &mut crate::oled::Display<'_>,
 ) -> Result<(), &'static str> {
     crate::oled::show_result(display, "Encrypting\nKeep power on");
@@ -128,6 +130,7 @@ fn enable_encryption(
     match outcome {
         Ok(dk) => {
             data_key_store::remember(dk);
+            set_at_rest_kind(nvs, kind);
             Ok(())
         }
         Err(ChangeError::NoDataKey) => {
@@ -153,7 +156,57 @@ fn disable_encryption(
     scrub(&mut seeds);
     outcome.map_err(|_| "failed to write secret")?;
     data_key_store::forget();
+    clear_at_rest_kind(nvs);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// At-rest mode reporting (FIRMWARE_INFO / get_status)
+// ---------------------------------------------------------------------------
+//
+// `dk_sec` is deliberately opaque about what wrapped it — see
+// `heartwood_common::at_rest_status::SecretKind` — so this one-byte marker is
+// the one addition to what `enable_encryption`/`disable_encryption` already
+// write. Answering FIRMWARE_INFO or get_status still never writes anything;
+// the marker is set (or cleared) only when the PIN or vault key itself is
+// set (or cleared).
+
+const AT_REST_KIND_KEY: &str = "at_rest_kind";
+const AT_REST_KIND_PIN: u8 = 1;
+const AT_REST_KIND_VAULT: u8 = 2;
+
+/// Record which secret now wraps the data key. Best-effort: a failed write
+/// here never fails the enable it rides — the marker is a reporting aid, not
+/// part of the security boundary, so a manager mislabelling the mode is the
+/// only consequence.
+fn set_at_rest_kind(nvs: &mut EspNvs<NvsDefault>, kind: u8) {
+    if let Err(e) = nvs.set_blob(AT_REST_KIND_KEY, &[kind]) {
+        log::warn!("at-rest kind marker not saved: {e}");
+    }
+}
+
+fn clear_at_rest_kind(nvs: &mut EspNvs<NvsDefault>) {
+    let _ = nvs.remove(AT_REST_KIND_KEY);
+}
+
+/// The at-rest mode reported to a manager (FIRMWARE_INFO, get_status). Purely
+/// a read: `encryption_at_rest_active` is the durable source of truth for
+/// whether any seed is sealed, and the marker above (when present) says which
+/// secret sealed it. See `heartwood_common::at_rest_status::derive_mode` for
+/// the legacy-board fallback.
+pub fn at_rest_mode(nvs: &EspNvs<NvsDefault>) -> heartwood_common::at_rest_status::AtRestMode {
+    let encrypted = crate::masters::encryption_at_rest_active(nvs);
+    let mut buf = [0u8; 1];
+    let kind = match nvs.get_blob(AT_REST_KIND_KEY, &mut buf) {
+        Ok(Some(b)) if b.len() == 1 && b[0] == AT_REST_KIND_VAULT => {
+            Some(heartwood_common::at_rest_status::SecretKind::Vault)
+        }
+        Ok(Some(b)) if b.len() == 1 && b[0] == AT_REST_KIND_PIN => {
+            Some(heartwood_common::at_rest_status::SecretKind::Pin)
+        }
+        _ => None,
+    };
+    heartwood_common::at_rest_status::derive_mode(encrypted, kind)
 }
 
 /// Try to unlock with the PIN or vault key, filling `.secret` in RAM.
@@ -332,7 +385,7 @@ pub fn handle_set_pin(
     let outcome = if payload.is_empty() {
         disable_encryption(nvs, masters).map(|()| "PIN removed")
     } else {
-        enable_encryption(nvs, masters, payload, display).map(|()| "PIN set")
+        enable_encryption(nvs, masters, payload, AT_REST_KIND_PIN, display).map(|()| "PIN set")
     };
 
     match outcome {
@@ -451,7 +504,7 @@ pub fn handle_vault_set(
     let outcome = if payload.is_empty() {
         disable_encryption(nvs, masters).map(|()| "Vault disabled")
     } else {
-        enable_encryption(nvs, masters, payload, display).map(|()| "Vault enabled")
+        enable_encryption(nvs, masters, payload, AT_REST_KIND_VAULT, display).map(|()| "Vault enabled")
     };
 
     match outcome {

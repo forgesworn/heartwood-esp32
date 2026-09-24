@@ -155,7 +155,15 @@ use secp256k1::Secp256k1;
 /// the heap curve instead of only pass/fail, and a manager can show why a
 /// request that worked yesterday is refused today. Neither is a secret: they
 /// are allocator statistics, not contents.
-pub fn firmware_info_json() -> String {
+///
+/// `at_rest` ("none"/"pin"/"vault") and `unlock_phone_count` (plan G2) let
+/// Sapwood's mode chooser stop inferring the mode from side effects it
+/// happened to witness this session. Both are pure reads of durable state —
+/// see `pin::at_rest_mode` and `unlock_phone_count` — so answering this frame
+/// never writes anything, and this is answered before any PIN or vault key is
+/// entered: a locked board is exactly when a manager most needs to know which
+/// kind of unlock it is waiting for. Neither field names a phone.
+pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>) -> String {
     let crash = crash_context()
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
         .unwrap_or_default();
@@ -178,11 +186,14 @@ pub fn firmware_info_json() -> String {
             )
         })
         .unwrap_or_default();
+    let at_rest = pin::at_rest_mode(nvs).wire();
+    let unlock_phones = unlock_phone_count(nvs);
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
-         \"free_heap\":{},\"largest_block\":{},\"display_flip\":{}{}{}}}",
+         \"free_heap\":{},\"largest_block\":{},\"display_flip\":{},\
+         \"at_rest\":\"{}\",\"unlock_phone_count\":{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -194,9 +205,26 @@ pub fn firmware_info_json() -> String {
         free_heap,
         largest_block,
         display_flip::is_flipped(),
+        at_rest,
+        unlock_phones,
         crash,
         nvs_stats,
     )
+}
+
+/// How many phones are enrolled to unlock this board — read-only, and safe
+/// while locked: phone records are stored unsealed for exactly that reason
+/// (see `heartwood_common::data_key::PhoneRecord`), so this needs no secret
+/// and no unlock. Reported in FIRMWARE_INFO and get_status (plan G2) so a
+/// manager stops inferring at-rest state from an enrolment it happened to
+/// witness. Never discloses which phones — only the count.
+pub fn unlock_phone_count(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>) -> usize {
+    let mut buf = [0u8; heartwood_common::data_key::MAX_PHONES_BLOB_LEN];
+    let blob = match nvs.get_blob(heartwood_common::data_key::PHONES_KEY, &mut buf) {
+        Ok(Some(b)) => Some(b),
+        _ => None,
+    };
+    heartwood_common::at_rest_status::phone_count_from_blob(blob)
 }
 
 /// Minimal JSON string escaping for the small, non-secret breadcrumb labels.
@@ -588,7 +616,7 @@ fn main() {
                     protocol::write_frame(
                         &mut usb,
                         FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                        firmware_info_json().as_bytes(),
+                        firmware_info_json(&nvs).as_bytes(),
                     );
                 }
                 FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
@@ -804,7 +832,7 @@ fn main() {
                     protocol::write_frame(
                         &mut usb,
                         FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                        firmware_info_json().as_bytes(),
+                        firmware_info_json(&nvs).as_bytes(),
                     );
                 }
                 FRAME_TYPE_FACTORY_RESET => {
@@ -1068,7 +1096,7 @@ fn main() {
                 protocol::write_frame(
                     &mut usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    firmware_info_json().as_bytes(),
+                    firmware_info_json(&nvs).as_bytes(),
                 );
             }
 

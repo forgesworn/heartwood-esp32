@@ -2445,7 +2445,7 @@ fn locked_relay_phase(
                 FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
                     usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    crate::firmware_info_json().as_bytes(),
+                    crate::firmware_info_json(nvs).as_bytes(),
                 ),
                 FRAME_TYPE_PROVISION_LIST => {
                     // Safe while locked (npubs only, no secrets) and REQUIRED
@@ -2788,7 +2788,7 @@ fn poll_usb(
         FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
             usb,
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-            crate::firmware_info_json().as_bytes(),
+            crate::firmware_info_json(ctx.nvs).as_bytes(),
         ),
 
         // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
@@ -5655,6 +5655,10 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize) -> String {
                 esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
             } as u32,
             "log_quiet": crate::log_quiet::read(ctx.nvs),
+            // Same fields as the full reply (plan G2) — cheap reads, so the
+            // degraded-heap path still answers them.
+            "at_rest": crate::pin::at_rest_mode(ctx.nvs).wire(),
+            "unlock_phone_count": crate::unlock_phone_count(ctx.nvs),
             "version": env!("CARGO_PKG_VERSION"),
             "board": crate::board::BOARD,
             "truncated": true,
@@ -8463,8 +8467,10 @@ fn dispatch_mgmt(
             ]);
             // A delegate (per-identity operator) sees only what it needs to
             // feature-detect and manage its own identity — never the
-            // device-wide audit ring, relay topology, storage inventory, or an
-            // enumeration of the owner's other identities.
+            // device-wide audit ring, relay topology, storage inventory, an
+            // enumeration of the owner's other identities, or the at-rest
+            // mode and phone count below (device-wide properties, not this
+            // identity's).
             if !is_device_op {
                 return Ok(serde_json::json!({
                     "master_npub_hex": master_hex,
@@ -8478,6 +8484,13 @@ fn dispatch_mgmt(
             }
             let mut relays_live = vec![s.url.clone()];
             relays_live.extend(pool.others.iter().map(|o| o.url.clone()));
+            // Plan G2: the device operator's mode chooser stops inferring
+            // this from side effects it happened to witness (an enrolled
+            // phone, a seal seen this session). Pure reads of durable state,
+            // same as everything else in this branch; never a phone id,
+            // label or hint.
+            let at_rest = crate::pin::at_rest_mode(ctx.nvs).wire();
+            let unlock_phone_count = crate::unlock_phone_count(ctx.nvs);
             Ok(serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,
@@ -8509,6 +8522,14 @@ fn dispatch_mgmt(
                 // stats API fails, so "unknown" is not "empty").
                 "nvs": crate::nvs_stats::as_json(),
                 "max_personas": crate::personas::MAX_PERSONAS,
+                // At-rest mode ("none"/"pin"/"vault") and how many phones can
+                // unlock this board (plan G2). Only reachable here at all
+                // once genuinely unlocked — a locked board runs
+                // `locked_relay_phase` instead, which never reaches
+                // `dispatch_mgmt`; FIRMWARE_INFO is the surface that reports
+                // this while locked (see its doc comment).
+                "at_rest": at_rest,
+                "unlock_phone_count": unlock_phone_count,
                 // Running firmware, so managers can show version state over
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),

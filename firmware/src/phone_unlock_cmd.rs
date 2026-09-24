@@ -111,7 +111,7 @@ pub fn run(
             save(nvs, &phones)?;
             log::info!("phone unlock: revoked phone {id}");
             // No phone listens anywhere now; the next enrolment records afresh.
-            if phones.is_empty() && phone_unlock::forget_told(&mut NvsBlobs(nvs)).is_err() {
+            if phones.is_empty() && heartwood_common::phone_relays::forget_told(&mut NvsBlobs(nvs)).is_err() {
                 log::warn!("phone unlock: relay record not cleared");
             }
             Ok(serde_json::json!({ "revoked": id }))
@@ -176,6 +176,7 @@ pub fn run(
                 return Err("declined on the board".into());
             }
 
+            let had_phones = !phones.is_empty();
             let enrolment = phone_unlock::enrol(
                 &mut phones,
                 &dk,
@@ -195,11 +196,14 @@ pub fn run(
             // board did not keep. A full NVS refuses here, cleanly.
             save(nvs, &phones)?;
             log::info!("phone unlock: enrolled phone {} ({label})", enrolment.id);
-            // The phone was handed `relays`. Recorded only if nothing is, so
-            // an update the other phones are still owed is not cut short. A
-            // failure here is repaired at the next boot, which records the
-            // live list when there is no record.
-            if phone_unlock::record_told_if_absent(&mut NvsBlobs(nvs), &relays).is_err() {
+            // The phone was handed `relays`. As the only phone, whatever the
+            // record said belonged to phones that are gone, so it is replaced;
+            // beside others it is written only if missing, so an update they
+            // are still owed is not cut short. A failed write is repaired at
+            // the next boot, which records the live list when there is none.
+            if heartwood_common::phone_relays::record_told_at_enrolment(&mut NvsBlobs(nvs), had_phones, &relays)
+                .is_err()
+            {
                 log::warn!("phone unlock: relay record not saved");
             }
             crate::oled::show_change_done(display, "Phone added", &label);

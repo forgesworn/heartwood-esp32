@@ -17,7 +17,10 @@
 //   listen   over the relays, as the phone: subscribe to EVERY kind-24135
 //            with no #p or #h filter, match the per-boot hint locally, open
 //            the sealed context, apply the prompt rule, and on a yes answer
-//            with a kind-24136 from a fresh throwaway key.
+//            with a kind-24136 from a fresh throwaway key. Every message it
+//            opens (a lock announcement, or a relay update, t = "relays",
+//            which never prompts) adds the board's relays to the state file;
+//            run listen again to listen on them.
 //
 // The state file holds slot secrets, which unlock the board together with
 // its flash. It is written 0600, and nothing here prints a secret.
@@ -227,6 +230,18 @@ async function announceOperator() {
   console.log(`operator announcement ${answer.announce_operator ? 'on' : 'off'} (from the next locked boot)`)
 }
 
+/** Add a board's relay list to what this phone listens on, never dropping one. */
+function followRelays(id, relays) {
+  const state = loadState()
+  const stored = state.phones.find((p) => p.id === id)
+  if (!stored || !Array.isArray(relays)) return
+  const merged = [...new Set([...stored.relays, ...relays.filter((r) => /^wss?:\/\/\S+$/.test(r))])]
+  if (merged.length === stored.relays.length) return
+  console.log(`  following the board to ${merged.filter((r) => !stored.relays.includes(r)).join(', ')}`)
+  stored.relays = merged
+  saveState(state)
+}
+
 async function listen() {
   const { finalizeEvent, nip44, RelayFanout } = await relayDeps()
   const state = loadState()
@@ -268,8 +283,13 @@ async function listen() {
         if (!context || context.id !== phone.id) continue
         const now = Math.floor(Date.now() / 1000)
         const verdict = judge(context, ev.pubkey, ev.created_at, now, phone.last)
+        // Follow the board's relays from any message it opens, whatever the
+        // verdict, as Cambium does. A relay update (t = "relays") exists only
+        // to carry them.
+        followRelays(phone.id, context.relays)
         if (verdict !== 'prompt') {
-          console.log(`  ${verdict}: restart #${context.boot} (${now - ev.created_at}s old)`)
+          const what = context.t === 'relays' ? 'relay update' : verdict
+          console.log(`  ${what}: restart #${context.boot}, relays ${context.relays.join(', ')} (${now - ev.created_at}s old)`)
           continue
         }
         clearTimeout(timer)
@@ -308,18 +328,31 @@ async function listen() {
     content: nip44.v2.encrypt(deliveryJson(phone.id, Buffer.from(phone.s, 'hex')), ck),
   }, throwaway)
   throwaway.fill(0)
+  // The board listens on the relays its announcement lists, which after a
+  // relay change are not the ones this listener opened. Deliver there too,
+  // as Cambium does.
+  const listed = context.relays.filter((r) => /^wss?:\/\/\S+$/.test(r) && !live.includes(r))
+  let listedFanout = null
+  if (listed.length) {
+    listedFanout = new RelayFanout(listed)
+    try {
+      await listedFanout.open()
+    } catch {
+      listedFanout = null
+    }
+  }
   fanout.send(['EVENT', delivery])
-  console.log(`delivery published to ${live.length} relay(s); the board says "Unlocked by" on its screen`)
+  listedFanout?.send(['EVENT', delivery])
+  const reached = live.length + (listedFanout?.sockets.length ?? 0)
+  console.log(`delivery published to ${reached} relay(s); the board says "Unlocked by" on its screen`)
 
   const state2 = loadState()
   const stored = state2.phones.find((p) => p.id === phone.id)
   if (stored) {
     stored.last = { boot: context.boot, author: ev.pubkey }
-    // Follow relay changes carried in the lock message.
-    stored.relays = [...new Set([...stored.relays, ...context.relays])]
     saveState(state2)
   }
-  setTimeout(() => { fanout.close(); exit(0) }, 3000)
+  setTimeout(() => { fanout.close(); listedFanout?.close(); exit(0) }, 3000)
 }
 
 const commands = { enrol, 'enrol-for': enrolFor, list, revoke, listen, 'announce-operator': announceOperator }

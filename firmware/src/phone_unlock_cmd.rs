@@ -24,9 +24,19 @@ use heartwood_common::data_key::{self, PhoneSet, LABEL_MAX};
 use heartwood_common::phone_unlock::{self, EnrolError, PhoneCmd};
 use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_PHONE_UNLOCK_RESP};
 
+use std::sync::Mutex;
+
 use crate::data_key_store::{self, NvsBlobs};
 use crate::masters::LoadedMaster;
 use crate::serial::SerialPort;
+
+/// Enrolment keys already answered this boot. A phone makes a fresh one-off
+/// key per enrolment, so the same key again is a host resending a command it
+/// has already sent (a retrying request helper queued three extra enrols
+/// behind one press on 2026-09-24, and the secrets of the three records they
+/// made were never read). Refused before any card is shown.
+static USED_ENROL_KEYS: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+const USED_ENROL_KEYS_MAX: usize = 16;
 
 /// Handle a PHONE_UNLOCK_CMD frame (0x64).
 pub fn handle_frame(
@@ -110,6 +120,19 @@ pub fn run(
             let Some(buttons) = buttons else {
                 return Err("enrolling a phone needs the cable and a press on the board".into());
             };
+            // One attempt per enrolment key, whatever its outcome: marked before
+            // anything can fail, so a resend queued behind this command (or one
+            // after a decline) is refused rather than raising another card.
+            {
+                let mut used = USED_ENROL_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+                if used.contains(&enrol_pubkey) {
+                    return Err("this enrolment key was already used: start again on the phone".into());
+                }
+                if used.len() >= USED_ENROL_KEYS_MAX {
+                    used.remove(0);
+                }
+                used.push(enrol_pubkey);
+            }
             let label = if label.is_empty() { "phone".to_string() } else { label };
             if label.len() > LABEL_MAX {
                 return Err(format!("label longer than {LABEL_MAX} bytes"));

@@ -32,6 +32,7 @@ import { createInterface } from 'node:readline/promises'
 import { NACK } from './lib/frame.mjs'
 import { openFramedPort } from './lib/port.mjs'
 import { authenticateSession } from './lib/session-auth.mjs'
+import { startPressPrompt } from './press-prompt.mjs'
 import {
   ANNOUNCE_KIND,
   DELIVERY_KIND,
@@ -64,7 +65,12 @@ function saveState(state) {
   chmodSync(STATE_FILE, 0o600)
 }
 
-async function usbCommand(command, deadlineMs) {
+// `press` sends the frame ONCE and waits, speaking the press prompt until the
+// board answers. A command that raises a card must never go through
+// session.request: it resends every 2 s, and each resend queued behind the
+// card is a whole second command once the first is answered (on 2026-09-24
+// one enrol became four records, three of whose secrets were never read).
+async function usbCommand(command, deadlineMs, { press } = {}) {
   const port = arg('--port')
   const secretFile = arg('--secret-file')
   if (!port || !secretFile) {
@@ -81,11 +87,16 @@ async function usbCommand(command, deadlineMs) {
     session.close()
     throw new Error('bridge session authentication failed')
   }
-  const reply = await session.request(
-    PHONE_UNLOCK_CMD,
-    [PHONE_UNLOCK_RESP, NACK],
-    { payload: Buffer.from(JSON.stringify(command)), deadlineMs },
-  )
+  const payload = Buffer.from(JSON.stringify(command))
+  let reply
+  if (press) {
+    session.send(PHONE_UNLOCK_CMD, payload)
+    const stop = startPressPrompt(press)
+    reply = await session.waitFor([PHONE_UNLOCK_RESP, NACK], deadlineMs)
+    stop()
+  } else {
+    reply = await session.request(PHONE_UNLOCK_CMD, [PHONE_UNLOCK_RESP, NACK], { payload, deadlineMs })
+  }
   session.close()
   if (!reply) throw new Error(`no answer within ${deadlineMs / 1000}s`)
   if (reply.type === NACK) throw new Error(`refused: ${reply.payload.toString() || 'no reason'}`)
@@ -101,8 +112,12 @@ async function enrol() {
   const enrolSk = randomBytes(32)
   const enrolPk = getPublicKey(enrolSk)
   const label = arg('--label', 'bench phone')
-  console.log(`enrolling "${label}": press and hold on the board when it asks`)
-  const answer = await usbCommand({ op: 'enrol', enrol_pubkey: enrolPk, label }, 60_000)
+  console.log(`enrolling "${label}"`)
+  const answer = await usbCommand(
+    { op: 'enrol', enrol_pubkey: enrolPk, label },
+    45_000,
+    { press: `adding ${label} as an unlock phone` },
+  )
   const ck = nip44.v2.utils.getConversationKey(enrolSk, answer.ephemeral_pubkey)
   const handoff = JSON.parse(nip44.v2.decrypt(answer.sealed, ck))
   enrolSk.fill(0)

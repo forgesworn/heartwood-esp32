@@ -37,6 +37,23 @@ test('matches the Rust vectors', () => {
   assert.equal(deliveryJson(fixture.context.id, S), fixture.delivery)
 })
 
+test('a relay update opens like a lock announcement and never prompts', () => {
+  const update = JSON.parse(
+    readFileSync(new URL('../../common/tests/fixtures/phone-unlock-v1-relays.json', import.meta.url), 'utf8'),
+  )
+  const k = phoneKey(hex(update.slot_secret))
+  const author = hex(update.author)
+  assert.ok(hintMatches(k, author, update.hint))
+  const context = openContext(k, author, update.content)
+  assert.deepEqual(context, update.context)
+  assert.equal(context.t, 'relays')
+  assert.equal(sealContext(k, author, ordered(update.context), hex(update.nonce)), update.content)
+  assert.equal(update.content.length, fixture.content.length, 'same size as the lock announcement')
+  const now = 1_800_000_000
+  assert.equal(judge(context, update.author, now, now, null), 'not-locked')
+  assert.equal(judge(context, update.author, now, now, { boot: 1, author: update.author }), 'not-locked')
+})
+
 test('refuses another phone, another author and any tampering', () => {
   const k = phoneKey(S)
   const other = phoneKey(Buffer.alloc(32, 1))

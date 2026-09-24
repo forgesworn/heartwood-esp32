@@ -25,9 +25,16 @@
 // NIP-44(throwaway -> author) of a [`Delivery`] `{v, id, s}`. Holding S is the
 // proof; the board does not care who authored the delivery.
 //
-// Test vectors: tests/fixtures/phone-unlock-v1.json (checked by the tests
-// below and by scripts/lib/phone-unlock.test.mjs, an independent
-// implementation in Node's own crypto).
+// The same construction carries a relay update when the board's relay list
+// changes: `t` is `"relays"` instead of `"locked"`, the author is a fresh
+// one-time key per round, and it is posted on the relays the phones were last
+// told about. A phone never prompts for it and follows its `relays`. See
+// "Relay changes" below.
+//
+// Test vectors: tests/fixtures/phone-unlock-v1.json and
+// phone-unlock-v1-relays.json (checked by the tests below and by
+// scripts/lib/phone-unlock.test.mjs, an independent implementation in Node's
+// own crypto).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -534,6 +541,258 @@ pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Relay changes
+// ---------------------------------------------------------------------------
+//
+// A phone listens on every relay it has been told about (enrolment, and the
+// list inside each message it opens). A board whose relay list moves to relays
+// the phones never heard of would, the next time it restarts locked, announce
+// where no phone listens. So the board remembers the list the phones were last
+// pointed at, [`TOLD_RELAYS_KEY`], and while the live list has a relay that
+// one lacks ("drift"), it tells the phones on the OLD relays:
+//
+// - locked, it also posts each phone's lock announcement on the old relays
+//   (same one-time author as on the live relay, so a phone that hears both
+//   treats the second as a duplicate, never a second prompt);
+// - unlocked, it posts a relay update per phone on the old relays at each of
+//   [`RELAY_UPDATE_ROUNDS_SECS`], then records the live list, which ends the
+//   drift.
+//
+// A relay update is a lock announcement in every wire respect: kind 24135, a
+// fresh one-time author per round, one `h` tag, content sealed as above. Only
+// the sealed `t` says `"relays"`, which the prompt rule answers with
+// [`Verdict::NotLocked`], and which is as long as `"locked"`, so an update is
+// the same size as that boot's lock announcements. A phone follows `relays`
+// from any message it opens, whatever the verdict.
+//
+// Every relay change on this firmware takes effect through a restart, so the
+// comparison runs once per boot and needs no hook in any config path. The
+// record is written only when it changes: once when first needed, once when
+// an update's rounds are done, once when a change only removed relays. The
+// round counter lives in RAM, so a restart before the last round starts the
+// rounds again rather than writing to flash.
+
+/// NVS key: the relays the enrolled phones were last pointed at.
+pub const TOLD_RELAYS_KEY: &str = "ph_relays";
+/// A board's relay list holds at most eight (net_config), and so does this.
+pub const MAX_TOLD_RELAYS: usize = 8;
+const MAX_TOLD_URL_LEN: usize = 255;
+/// Largest encoded record: a JSON array of eight quoted 255-byte URLs and
+/// seven commas ([`encode_told`] keeps no URL that would need escaping).
+pub const MAX_TOLD_BLOB_LEN: usize = 2 + MAX_TOLD_RELAYS * (MAX_TOLD_URL_LEN + 2) + (MAX_TOLD_RELAYS - 1);
+
+/// When an unlocked board posts a relay update, in seconds from its first
+/// chance to (unlocked, a relay live, no network trial pending). Relays keep
+/// no ephemeral event, so each round reaches only the phones listening at
+/// that moment; the spacing covers a phone that is reconnecting, asleep for
+/// an hour, or off overnight.
+pub const RELAY_UPDATE_ROUNDS_SECS: [u64; 6] = [0, 120, 900, 3_600, 21_600, 86_400];
+
+/// Two relay URLs naming the same endpoint, ignoring case and a trailing
+/// slash. The firmware's own comparison, so both sides agree on "the same".
+pub fn same_relay(a: &str, b: &str) -> bool {
+    let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
+    norm(a) == norm(b)
+}
+
+fn told_url_ok(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= MAX_TOLD_URL_LEN
+        && !r.chars().any(|c| c == '"' || c == '\\' || c.is_control())
+}
+
+/// The record's bytes: a JSON array of the (trimmed, de-duplicated) relays,
+/// at most [`MAX_TOLD_RELAYS`]. An empty, overlong or unquotable URL is not a
+/// relay anyone listens on, and is left out.
+pub fn encode_told(relays: &[String]) -> Vec<u8> {
+    let mut kept: Vec<&str> = Vec::new();
+    for r in relays.iter().map(|r| r.trim()) {
+        if kept.len() == MAX_TOLD_RELAYS {
+            break;
+        }
+        if told_url_ok(r) && !kept.iter().any(|k| same_relay(k, r)) {
+            kept.push(r);
+        }
+    }
+    serde_json::to_vec(&kept).expect("strings always serialise")
+}
+
+/// Read a record. `None` for anything [`encode_told`] would not have written.
+pub fn decode_told(bytes: &[u8]) -> Option<Vec<String>> {
+    if bytes.len() > MAX_TOLD_BLOB_LEN {
+        return None;
+    }
+    let relays: Vec<String> = serde_json::from_slice(bytes).ok()?;
+    let ok = relays.len() <= MAX_TOLD_RELAYS
+        && relays.iter().all(|r| !r.trim().is_empty() && told_url_ok(r));
+    ok.then_some(relays)
+}
+
+/// How the live relay list stands against the one the phones were told.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RelayDrift {
+    /// No record: a board whose phones were enrolled by older firmware (whose
+    /// lock messages have carried the live list since), or a damaged record.
+    /// Record the live list.
+    Unrecorded,
+    /// The phones already know every live relay.
+    InStep,
+    /// As [`RelayDrift::InStep`], but the record still names relays the board
+    /// dropped. Record the live list, so an old relay the owner let go of is
+    /// not dialled for the next change.
+    Shrunk,
+    /// A live relay the phones were never told about. `old` is where they
+    /// listen: the recorded list.
+    Drifted { old: Vec<String> },
+}
+
+pub fn relay_drift(told: Option<&[String]>, current: &[String]) -> RelayDrift {
+    let Some(told) = told else {
+        return RelayDrift::Unrecorded;
+    };
+    let known = |r: &String, list: &[String]| list.iter().any(|t| same_relay(t, r));
+    if current.iter().any(|c| !known(c, told)) {
+        let mut old: Vec<String> = Vec::new();
+        for t in told {
+            if !known(t, &old) {
+                old.push(t.clone());
+            }
+        }
+        RelayDrift::Drifted { old }
+    } else if told.iter().any(|t| !known(t, current)) {
+        RelayDrift::Shrunk
+    } else {
+        RelayDrift::InStep
+    }
+}
+
+/// Run once per boot with the live relay list. Returns the relays to tell
+/// the phones on (empty when there is nothing to tell), writing the record
+/// only when it is missing, damaged or names dropped relays. A board with no
+/// phones reads nothing and writes nothing.
+pub fn relays_at_boot<S: crate::data_key::BlobStore>(
+    store: &mut S,
+    have_phones: bool,
+    current: &[String],
+) -> Result<Vec<String>, crate::data_key::StoreError> {
+    if !have_phones || current.is_empty() {
+        return Ok(Vec::new());
+    }
+    let told = store.get(TOLD_RELAYS_KEY)?.and_then(|b| decode_told(&b));
+    match relay_drift(told.as_deref(), current) {
+        RelayDrift::InStep => Ok(Vec::new()),
+        RelayDrift::Unrecorded | RelayDrift::Shrunk => {
+            store.set(TOLD_RELAYS_KEY, &encode_told(current))?;
+            Ok(Vec::new())
+        }
+        RelayDrift::Drifted { old } => Ok(old),
+    }
+}
+
+/// The phones have had every round of an update: they are now pointed at
+/// `current`.
+pub fn record_told<S: crate::data_key::BlobStore>(
+    store: &mut S,
+    current: &[String],
+) -> Result<(), crate::data_key::StoreError> {
+    store.set(TOLD_RELAYS_KEY, &encode_told(current))
+}
+
+/// At enrolment: the new phone was handed `current`. Recorded only if nothing
+/// is, so a drift the other phones are still owed an update for survives.
+pub fn record_told_if_absent<S: crate::data_key::BlobStore>(
+    store: &mut S,
+    current: &[String],
+) -> Result<(), crate::data_key::StoreError> {
+    if store.get(TOLD_RELAYS_KEY)?.is_none() {
+        store.set(TOLD_RELAYS_KEY, &encode_told(current))?;
+    }
+    Ok(())
+}
+
+/// The last phone is gone: nobody listens anywhere. The next enrolment
+/// records afresh.
+pub fn forget_told<S: crate::data_key::BlobStore>(
+    store: &mut S,
+) -> Result<(), crate::data_key::StoreError> {
+    if store.get(TOLD_RELAYS_KEY)?.is_some() {
+        store.remove(TOLD_RELAYS_KEY)?;
+    }
+    Ok(())
+}
+
+/// The unlocked board's update rounds for one drift, on a seconds clock
+/// (uptime). RAM only.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpdateRounds {
+    done: usize,
+    first_at: Option<u64>,
+}
+
+impl UpdateRounds {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the next round is due at `now`.
+    pub fn due(&self, now: u64) -> bool {
+        match (RELAY_UPDATE_ROUNDS_SECS.get(self.done), self.first_at) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(offset), Some(first)) => now >= first.saturating_add(*offset),
+        }
+    }
+
+    /// A round went out at `now` (reaching the phones or not: an old relay
+    /// that stays down must not keep the drift open for ever).
+    pub fn mark_done(&mut self, now: u64) {
+        if self.first_at.is_none() {
+            self.first_at = Some(now);
+        }
+        self.done = (self.done + 1).min(RELAY_UPDATE_ROUNDS_SECS.len());
+    }
+
+    pub fn rounds_done(&self) -> usize {
+        self.done
+    }
+
+    /// Every round has gone out: record the live list.
+    pub fn finished(&self) -> bool {
+        self.done >= RELAY_UPDATE_ROUNDS_SECS.len()
+    }
+}
+
+impl LockContext {
+    /// This context as a relay update: every field as it is (so the sealed
+    /// size matches this boot's lock announcements), `t` = `"relays"`.
+    pub fn as_relay_update(&self) -> LockContext {
+        LockContext { t: TYPE_RELAYS.into(), ..self.clone() }
+    }
+}
+
+/// One message per enrolled phone under `author`: the `h` tag value and the
+/// sealed content of `shared` with that phone's id. Lock announcements and
+/// relay updates both go through here. A board with no phones gets nothing,
+/// and a revoked phone has no record, so nothing here is for it.
+pub fn per_phone_messages(
+    phones: &crate::data_key::PhoneSet,
+    shared: &LockContext,
+    author: &[u8; 32],
+    rng: &mut dyn FnMut(&mut [u8]),
+) -> Vec<(String, String)> {
+    phones
+        .records()
+        .iter()
+        .map(|rec| {
+            let ctx = LockContext { id: rec.id, ..shared.clone() };
+            let mut nonce = [0u8; NONCE_LEN];
+            rng(&mut nonce);
+            (hint(&rec.phone_key, author), seal_context(&rec.phone_key, author, &ctx, &nonce))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +1041,259 @@ mod tests {
         phones.enrol(3, "Pixel", &[1u8; 32], &[2u8; 32], &[0u8; 12]).unwrap();
         let v = list_json(&phones, false);
         assert_eq!(v, serde_json::json!({"phones":[{"id":3,"label":"Pixel"}],"max":16,"announce_operator":false}));
+    }
+
+    // --- Relay changes ------------------------------------------------------
+
+    fn urls(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| String::from(*s)).collect()
+    }
+
+    /// A map that counts every read and write, so a test can say "nothing was
+    /// touched" as well as what was stored.
+    #[derive(Default)]
+    struct Store {
+        map: alloc::collections::BTreeMap<String, Vec<u8>>,
+        reads: core::cell::Cell<usize>,
+        writes: usize,
+    }
+
+    impl crate::data_key::BlobStore for Store {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, crate::data_key::StoreError> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(self.map.get(key).cloned())
+        }
+        fn set(&mut self, key: &str, value: &[u8]) -> Result<(), crate::data_key::StoreError> {
+            self.writes += 1;
+            self.map.insert(key.into(), value.to_vec());
+            Ok(())
+        }
+        fn remove(&mut self, key: &str) -> Result<(), crate::data_key::StoreError> {
+            self.writes += 1;
+            self.map.remove(key);
+            Ok(())
+        }
+    }
+
+    impl Store {
+        fn told(&self) -> Option<Vec<String>> {
+            self.map.get(TOLD_RELAYS_KEY).map(|b| decode_told(b).unwrap())
+        }
+    }
+
+    #[test]
+    fn a_relay_update_is_never_a_prompt_and_looks_like_a_lock_announcement() {
+        assert_eq!(TYPE_RELAYS.len(), TYPE_LOCKED.len(), "the type must not change the size");
+        let lock = ctx();
+        let update = lock.as_relay_update();
+        assert_eq!(update.t, TYPE_RELAYS);
+        assert_eq!(LockContext { t: TYPE_LOCKED.into(), ..update.clone() }, lock, "only t differs");
+
+        let k = phone_key(&[1u8; 32]);
+        let author = [9u8; 32];
+        let sealed_lock = seal_context(&k, &author, &lock, &[3u8; 12]);
+        let sealed_update = seal_context(&k, &author, &update, &[3u8; 12]);
+        assert_eq!(sealed_lock.len(), sealed_update.len(), "same size on the wire");
+        assert_ne!(sealed_lock, sealed_update);
+        assert_eq!(open_context(&k, &author, &sealed_update), Ok(update.clone()));
+
+        // Whatever the timing and history, an update never prompts.
+        let now = 1_800_000_000;
+        for last in [None, Some((0, author)), Some((212, author)), Some((9_999, [1u8; 32]))] {
+            for created in [now, now - 500, now + 500] {
+                assert_eq!(judge(&update, &author, created, now, last), Verdict::NotLocked);
+            }
+        }
+        // Anything but exactly "locked" is not a lock announcement.
+        for t in ["", "Locked", "locked ", "relay", "unlock"] {
+            let odd = LockContext { t: t.into(), ..lock.clone() };
+            assert_eq!(judge(&odd, &author, now, now, None), Verdict::NotLocked, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn per_phone_messages_use_the_lock_scheme_and_skip_revoked_phones() {
+        use crate::data_key::PhoneSet;
+        let dk = [0xD0u8; 32];
+        let (s1, s2) = ([1u8; 32], [2u8; 32]);
+        let mut phones = PhoneSet::default();
+        let author = [9u8; 32];
+        let shared = ctx().as_relay_update();
+
+        assert!(per_phone_messages(&phones, &shared, &author, &mut rng_from(1)).is_empty(), "no phones, nothing");
+
+        phones.enrol(11, "a", &s1, &dk, &[0u8; 12]).unwrap();
+        phones.enrol(22, "b", &s2, &dk, &[1u8; 12]).unwrap();
+        let out = per_phone_messages(&phones, &shared, &author, &mut rng_from(1));
+        assert_eq!(out.len(), 2);
+        for (s, id) in [(s1, 11u32), (s2, 22u32)] {
+            let k = phone_key(&s);
+            let mine: Vec<_> = out.iter().filter(|(h, _)| hint_matches(&k, &author, h)).collect();
+            assert_eq!(mine.len(), 1, "exactly one message is recognisably this phone's");
+            let (h, content) = mine[0];
+            assert_eq!(h, &hint(&k, &author), "the lock announcements' hint");
+            let opened = open_context(&k, &author, content).unwrap();
+            assert_eq!(opened, LockContext { id, ..shared.clone() });
+        }
+        assert!(out.iter().all(|(_, c)| !c.contains("relay.example")));
+
+        // A later round, under a new one-time author, shares no tag with this one.
+        let next = per_phone_messages(&phones, &shared, &[8u8; 32], &mut rng_from(2));
+        assert!(next.iter().all(|(h, _)| out.iter().all(|(o, _)| o != h)));
+
+        // Revoked: the phone that still holds its secret finds nothing.
+        phones.revoke(22).unwrap();
+        let out = per_phone_messages(&phones, &shared, &author, &mut rng_from(3));
+        assert_eq!(out.len(), 1);
+        let k2 = phone_key(&s2);
+        assert!(out.iter().all(|(h, c)| !hint_matches(&k2, &author, h) && open_context(&k2, &author, c).is_err()));
+    }
+
+    #[test]
+    fn relay_drift_compares_as_the_firmware_does() {
+        let told = urls(&["wss://a.example", "wss://b.example/"]);
+        assert_eq!(relay_drift(None, &urls(&["wss://a.example"])), RelayDrift::Unrecorded);
+        assert_eq!(
+            relay_drift(Some(&told), &urls(&["WSS://A.example/", " wss://b.example"])),
+            RelayDrift::InStep,
+            "case, trailing slash and whitespace are the same relay"
+        );
+        assert_eq!(relay_drift(Some(&told), &urls(&["wss://b.example"])), RelayDrift::Shrunk);
+        assert_eq!(
+            relay_drift(Some(&told), &urls(&["wss://b.example", "wss://c.example"])),
+            RelayDrift::Drifted { old: told.clone() },
+            "one new relay is enough; the update goes to every old one"
+        );
+        assert_eq!(
+            relay_drift(Some(&urls(&["wss://a.example", "wss://A.example/"])), &urls(&["wss://c.example"])),
+            RelayDrift::Drifted { old: urls(&["wss://a.example"]) },
+            "old relays are de-duplicated"
+        );
+    }
+
+    #[test]
+    fn the_told_record_round_trips_and_refuses_damage() {
+        let list = urls(&[" wss://a.example ", "", "wss://A.example/", "wss://q\"uote", "wss://b.example"]);
+        let bytes = encode_told(&list);
+        assert_eq!(decode_told(&bytes), Some(urls(&["wss://a.example", "wss://b.example"])));
+        let many: Vec<String> = (0..12).map(|i| alloc::format!("wss://r{i}.example")).collect();
+        assert_eq!(decode_told(&encode_told(&many)).unwrap().len(), MAX_TOLD_RELAYS);
+        let longest: Vec<String> =
+            (0..8).map(|i| alloc::format!("wss://{i}{}", "x".repeat(MAX_TOLD_URL_LEN - 7))).collect();
+        assert_eq!(encode_told(&longest).len(), MAX_TOLD_BLOB_LEN, "the bound is exact");
+        assert!(
+            MAX_TOLD_BLOB_LEN <= crate::data_key::MAX_PHONES_BLOB_LEN,
+            "the firmware reads it through the same bounded blob reader"
+        );
+        for bad in [&b"not json"[..], b"{}", b"[1]", b"[\"\"]", b"[\"  \"]"] {
+            assert_eq!(decode_told(bad), None, "{}", core::str::from_utf8(bad).unwrap());
+        }
+        let nine = serde_json::to_vec(&(0..9).map(|i| alloc::format!("wss://{i}")).collect::<Vec<_>>()).unwrap();
+        assert_eq!(decode_told(&nine), None);
+    }
+
+    #[test]
+    fn the_boot_check_writes_only_when_the_record_changes() {
+        let a = urls(&["wss://a.example"]);
+        let ab = urls(&["wss://a.example", "wss://b.example"]);
+        let c = urls(&["wss://c.example"]);
+
+        // No phones: nothing read, nothing written, nothing to tell.
+        let mut store = Store::default();
+        assert_eq!(relays_at_boot(&mut store, false, &a), Ok(Vec::new()));
+        assert_eq!((store.reads.get(), store.writes), (0, 0));
+
+        // First boot with phones (enrolled by older firmware): record, once.
+        assert_eq!(relays_at_boot(&mut store, true, &ab), Ok(Vec::new()));
+        assert_eq!((store.told(), store.writes), (Some(ab.clone()), 1));
+        assert_eq!(relays_at_boot(&mut store, true, &ab), Ok(Vec::new()));
+        assert_eq!(store.writes, 1, "a board in step never writes");
+
+        // The owner moves to c: every boot until the update is done reports
+        // the old relays, and writes nothing.
+        for _ in 0..3 {
+            assert_eq!(relays_at_boot(&mut store, true, &c), Ok(ab.clone()));
+        }
+        assert_eq!(store.writes, 1);
+        record_told(&mut store, &c).unwrap();
+        assert_eq!(relays_at_boot(&mut store, true, &c), Ok(Vec::new()));
+        assert_eq!(store.writes, 2);
+
+        // Dropping a relay needs no update, one write to forget it.
+        record_told(&mut store, &ab).unwrap();
+        let before = store.writes;
+        assert_eq!(relays_at_boot(&mut store, true, &a), Ok(Vec::new()));
+        assert_eq!((store.told(), store.writes), (Some(a.clone()), before + 1));
+
+        // A damaged record is rewritten from the live list.
+        store.map.insert(TOLD_RELAYS_KEY.into(), b"\xff\xfe".to_vec());
+        assert_eq!(relays_at_boot(&mut store, true, &c), Ok(Vec::new()));
+        assert_eq!(store.told(), Some(c.clone()));
+    }
+
+    #[test]
+    fn enrolment_keeps_an_open_drift_and_the_last_revoke_forgets() {
+        let a = urls(&["wss://a.example"]);
+        let c = urls(&["wss://c.example"]);
+        let mut store = Store::default();
+        record_told_if_absent(&mut store, &a).unwrap();
+        assert_eq!(store.told(), Some(a.clone()), "the first enrolment records");
+        record_told_if_absent(&mut store, &c).unwrap();
+        assert_eq!(store.told(), Some(a.clone()), "the older phones still listen on a");
+        assert_eq!(relays_at_boot(&mut store, true, &c), Ok(a.clone()));
+        forget_told(&mut store).unwrap();
+        assert_eq!(store.told(), None);
+        let writes = store.writes;
+        forget_told(&mut store).unwrap();
+        assert_eq!(store.writes, writes, "nothing to forget, nothing written");
+    }
+
+    #[test]
+    fn update_rounds_follow_the_schedule_and_stop() {
+        let mut r = UpdateRounds::new();
+        assert!(r.due(0) && r.due(5_000), "the first round goes out at once");
+        let start = 1_000;
+        r.mark_done(start);
+        for (i, offset) in RELAY_UPDATE_ROUNDS_SECS.iter().enumerate().skip(1) {
+            assert!(!r.finished());
+            assert_eq!(r.rounds_done(), i);
+            assert!(!r.due(start + offset - 1), "round {i} early");
+            assert!(r.due(start + offset), "round {i} on time");
+            r.mark_done(start + offset + 30);
+        }
+        assert!(r.finished());
+        assert!(!r.due(u64::MAX), "never again after the last round");
+        r.mark_done(u64::MAX);
+        assert_eq!(r.rounds_done(), RELAY_UPDATE_ROUNDS_SECS.len());
+        assert_eq!(RELAY_UPDATE_ROUNDS_SECS[0], 0);
+        assert!(RELAY_UPDATE_ROUNDS_SECS.windows(2).all(|w| w[0] < w[1]));
+        // A restart starts the rounds again (RAM only): a new schedule is due.
+        assert!(UpdateRounds::new().due(0));
+    }
+
+    /// The published relay-update vector (tests/fixtures/phone-unlock-v1-relays.json):
+    /// the v1 fixture's keys and context with `t` = "relays".
+    #[test]
+    fn relay_update_vector_holds() {
+        let v1: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/phone-unlock-v1.json")).unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/phone-unlock-v1-relays.json")).unwrap();
+        for key in ["slot_secret", "phone_key", "author", "hint", "nonce"] {
+            assert_eq!(fixture[key], v1[key], "{key}");
+        }
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+        };
+        let k: [u8; 32] = hex(fixture["phone_key"].as_str().unwrap()).try_into().unwrap();
+        let author: [u8; 32] = hex(fixture["author"].as_str().unwrap()).try_into().unwrap();
+        let nonce: [u8; 12] = hex(fixture["nonce"].as_str().unwrap()).try_into().unwrap();
+        let context: LockContext = serde_json::from_value(fixture["context"].clone()).unwrap();
+        assert_eq!(context, ctx().as_relay_update());
+        let sealed = seal_context(&k, &author, &context, &nonce);
+        assert_eq!(fixture["content"].as_str().unwrap(), sealed);
+        assert_eq!(sealed.len(), v1["content"].as_str().unwrap().len());
+        assert_eq!(judge(&context, &author, 0, 0, None), Verdict::NotLocked);
     }
 
 }

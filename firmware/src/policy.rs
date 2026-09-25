@@ -72,6 +72,10 @@ pub enum RevocationSave {
     /// revoked party is gone, and so is every other pairing of this master
     /// unless a later save succeeds.
     TableLost,
+    /// A write of the table failed part-way and may have damaged the stored
+    /// copy; it is not written again this boot. A restart finds either the
+    /// old table or none.
+    Uncertain,
 }
 
 impl RevocationSave {
@@ -86,6 +90,9 @@ impl RevocationSave {
             )),
             RevocationSave::TableLost => Err(format!(
                 "storage_full: {what} is saved, but this identity's other pairings could not be rewritten and are lost at the next restart unless a later change saves them"
+            )),
+            RevocationSave::Uncertain => Err(format!(
+                "storage_failed: {what} holds until the next restart; the pairing table could not be written and after a restart it is either as it was or gone, so check and revoke again"
             )),
         }
     }
@@ -851,7 +858,7 @@ impl PolicyEngine {
     /// (`heartwood_common::mgmt::revoke_client_identity`). Returns the parsed
     /// identity and whether the approved list changed, or `None` for no such
     /// slot. Live verdicts are dropped separately, by
-    /// [`Self::drop_withdrawn_verdicts`], once the change is durable.
+    /// [`Self::drop_withdrawn_verdicts`], before the change is saved.
     pub fn revoke_identity(
         &mut self,
         master_slot: u8,
@@ -1010,15 +1017,22 @@ impl PolicyEngine {
     /// failure the prior table is NOT restored, in RAM or on flash: that
     /// would re-authorise what was just revoked. RAM keeps the narrower table,
     /// and the next change to this master writes it again (the dirty flag is
-    /// shared, so a save of another master does not). The outcome says what a
-    /// restart would find.
+    /// shared, so a save of another master does not; and not in this boot at
+    /// all after a write failed part-way, `nvs::write_blocked`). Live
+    /// approvals are withdrawn, as the old rollback did. The outcome says what
+    /// a restart would find.
     pub fn persist_revocation(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> RevocationSave {
         if self.persist_slots_as(nvs, master_slot, SlotWrite::Revoke) {
             return RevocationSave::Saved;
         }
+        // What the old rollback did to live approvals, without the rollback:
+        // no approve-once window outlives a revocation that did not save.
+        self.invalidate_approvals();
         self.slots_dirty = true;
-        match nvs.blob_len(&format!("connslots_{master_slot}")) {
+        let key = format!("connslots_{master_slot}");
+        match nvs.blob_len(&key) {
             Ok(None) => RevocationSave::TableLost,
+            _ if crate::nvs::write_blocked(&key) => RevocationSave::Uncertain,
             _ => RevocationSave::OnlyUntilRestart,
         }
     }
@@ -1073,16 +1087,15 @@ impl PolicyEngine {
                             nvs.replace_blob_in_place(&key, json.as_bytes())
                         }
                     };
-                    let mut written = write(nvs);
-                    // Pairings outrank the avatar cache: if the write fails
-                    // (in practice, NVS full), drop the avatars and try once
-                    // more before refusing.
-                    if written.is_err() && evict_avatar_cache(nvs) > 0 {
-                        log::warn!(
-                            "Slot table for slot {master_slot} did not fit: dropped cached avatars, retrying"
-                        );
-                        written = write(nvs);
+                    // Pairings outrank the avatar cache: if the table has no
+                    // room beside what is stored, drop the avatars BEFORE
+                    // writing. Not after a failure: a table is several chunks,
+                    // and a failed multi-chunk write must not be repeated in
+                    // the same boot (`nvs::write_blocked`).
+                    if !crate::nvs::fits(nvs, json.len()) && evict_avatar_cache(nvs) > 0 {
+                        log::warn!("Slot table for slot {master_slot} short of room: dropped cached avatars");
                     }
+                    let written = write(nvs);
                     if let Err(e) = written {
                         log::error!("Failed to persist slots for slot {master_slot}: {e:?}");
                     }

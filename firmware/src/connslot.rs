@@ -176,11 +176,14 @@ pub fn handle_update(
                                 && heartwood_common::policy::slot_authorizes(target, key)).ok_or("unknown client credential")
                         }).transpose()?;
                         let identity = withdrawal.get("identity").map(|value| value.as_str().ok_or("invalid identity")).transpose()?;
-                        match identity {
-                            Some(identity) => { policy_engine.revoke_identity(ms, idx, identity, client).ok_or("pairing not found")??; }
-                            None => { policy_engine.clear_identities(ms, idx, client).ok_or("pairing not found")?; }
-                        }
-                        // Never rolled back: that would restore the grant.
+                        let revoked = match identity {
+                            Some(identity) => Some(policy_engine.revoke_identity(ms, idx, identity, client).ok_or("pairing not found")??.0),
+                            None => { policy_engine.clear_identities(ms, idx, client).ok_or("pairing not found")?; None }
+                        };
+                        // Live approve-once windows go first, whatever the
+                        // save does; and never rolled back, which would
+                        // restore the grant.
+                        policy_engine.drop_withdrawn_verdicts(ms, idx, revoked.as_ref());
                         policy_engine.persist_revocation(nvs, ms).describe("consent withdrawal")
                     })();
                     match result {

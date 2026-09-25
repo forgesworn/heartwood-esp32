@@ -5,11 +5,12 @@
 // that grow the store ([`growth_allowed`]).
 
 use std::ffi::CString;
+use std::sync::Mutex;
 
 use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::{self, esp, EspError};
-use heartwood_common::nvs_budget::{self, Fallback, Plan};
+use heartwood_common::nvs_budget::{self, Fallback, FailedWrites, Plan};
 
 /// Write a blob so a power cut leaves either the old value or the new one.
 ///
@@ -71,7 +72,29 @@ fn not_enough_space() -> EspError {
     EspError::from_infallible::<{ sys::ESP_ERR_NVS_NOT_ENOUGH_SPACE }>()
 }
 
+/// Keys whose multi-chunk write failed this boot (`nvs_budget::FailedWrites`):
+/// not written again until a restart has run ESP-IDF's orphan cleanup.
+static FAILED_WRITES: Mutex<FailedWrites> = Mutex::new(FailedWrites::new());
+
+/// Whether `key` is blocked for the rest of this boot after a failed
+/// multi-chunk write. Its stored value is then uncertain until the restart.
+pub fn write_blocked(key: &str) -> bool {
+    FAILED_WRITES.lock().unwrap_or_else(|e| e.into_inner()).blocks(key)
+}
+
+/// Note a failed write; true if retrying at once is safe.
+fn record_failure(key: &str, len: usize) -> bool {
+    let retry = FAILED_WRITES.lock().unwrap_or_else(|e| e.into_inner()).record(key, len);
+    if !retry {
+        log::error!("nvs: {key} failed part-way; not written again until a restart");
+    }
+    retry
+}
+
 fn write_blob(nvs: &EspNvs<NvsDefault>, key: &str, value: &[u8], fallback: Fallback) -> Result<(), EspError> {
+    if write_blocked(key) {
+        return Err(EspError::from_infallible::<{ sys::ESP_ERR_INVALID_STATE }>());
+    }
     let c_key = CString::new(key)
         .map_err(|_| EspError::from_infallible::<{ sys::ESP_ERR_INVALID_ARG }>())?;
     let available = crate::nvs_stats::read()
@@ -91,7 +114,12 @@ fn write_blob(nvs: &EspNvs<NvsDefault>, key: &str, value: &[u8], fallback: Fallb
         })
     };
     match plan {
-        Plan::Direct => set()?,
+        Plan::Direct => {
+            if let Err(e) = set() {
+                record_failure(key, value.len());
+                return Err(e);
+            }
+        }
         Plan::Refuse => {
             log::warn!("nvs: {key} not written: {} bytes need more room than is free", value.len());
             return Err(not_enough_space());
@@ -100,9 +128,13 @@ fn write_blob(nvs: &EspNvs<NvsDefault>, key: &str, value: &[u8], fallback: Fallb
             log::warn!("nvs: {key} erased before its rewrite: no room for a second copy");
             esp!(unsafe { sys::nvs_erase_key(nvs.handle(), c_key.as_ptr()) })?;
             // The key is now absent, so the old value is gone whatever
-            // happens next. Try the new one twice rather than give up on it:
-            // a caller must never be left thinking the old value survived.
+            // happens next. A single-chunk value is tried once more; a
+            // larger one is not, since a failed multi-chunk write can leave
+            // strays that the same chunk indices would collide with.
             if let Err(e) = set() {
+                if !record_failure(key, value.len()) {
+                    return Err(e);
+                }
                 log::warn!("nvs: {key} rewrite after erase failed ({e}), retrying");
                 set()?;
             }
@@ -116,6 +148,14 @@ fn write_blob(nvs: &EspNvs<NvsDefault>, key: &str, value: &[u8], fallback: Fallb
 fn stored_equals(nvs: &EspNvs<NvsDefault>, key: &str, value: &[u8]) -> Result<bool, EspError> {
     let mut buf = vec![0u8; value.len().max(1)];
     Ok(matches!(nvs.get_blob(key, &mut buf)?, Some(stored) if stored == value))
+}
+
+/// Whether a new copy of `len` bytes fits in the free entries, beside any old
+/// one. False when the numbers cannot be read. The stats are the default
+/// partition's, which every handle here shares; the handle is taken so the
+/// host harness can answer for its own store.
+pub fn fits(_nvs: &EspNvs<NvsDefault>, len: usize) -> bool {
+    crate::nvs_stats::read().is_some_and(|s| nvs_budget::blob_entries(len) <= s.available_entries)
 }
 
 /// Whether a write that grows `key` to `new_len` bytes (a new pairing, a

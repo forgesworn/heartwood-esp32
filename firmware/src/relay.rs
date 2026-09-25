@@ -8546,12 +8546,14 @@ fn dispatch_mgmt(
                         .ok_or_else(|| format!("no such slot: {slot_index}"))?,
                 ),
             };
-            if changed {
-                persist_revocation(ctx, master_slot, "identity approval revocation")?;
-            }
+            // Withdraw the live approve-once windows first, whatever the save
+            // does: an unsaved revocation must not leave them running.
             let dropped =
                 ctx.policy_engine
                     .drop_withdrawn_verdicts(master_slot, slot_index, revoked.as_ref());
+            if changed {
+                persist_revocation(ctx, master_slot, "identity approval revocation")?;
+            }
             log::info!(
                 "[relay] mgmt: {method} on slot {slot_index} (changed {changed}, verdicts dropped {dropped})"
             );

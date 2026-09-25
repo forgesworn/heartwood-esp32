@@ -37,6 +37,7 @@ pub const FIRST_CHUNK_MIN: usize = CHUNK_MAX / 10;
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 fn div_ceil(n: usize, d: usize) -> usize {
     n.div_ceil(d)
@@ -91,6 +92,14 @@ pub enum Fallback {
 
 /// The per-key policy for the `heartwood` namespace. The note locker's
 /// namespace never falls back whatever the key, and says so at its call sites.
+///
+/// Never: the data-key wrapper, the sealed and plaintext seeds and the at-rest
+/// marker (losing them loses keys), `bridge_secret` (without it the USB
+/// bridge-authentication gate is open), `rzrec_N` (a lost receipt reopens its
+/// nonce), and `net_config` / `net_trial` (a lost config brings a WiFi board
+/// up in USB mode, stranding a remote one; a refused network change is safe).
+/// The management challenges fall back: an absent one is minted afresh, and a
+/// replayed request still fails as stale.
 pub fn fallback_for(key: &str) -> Fallback {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let seed_enc = key
@@ -101,14 +110,63 @@ pub fn fallback_for(key: &str) -> Fallback {
         .strip_prefix("master_")
         .and_then(|k| k.strip_suffix("_secret"))
         .is_some_and(digits);
-    let never = matches!(key, "dk_sec" | "at_rest_kind" | "root_secret" | "pin_attempts")
-        || key.starts_with("mgmt_")
+    let receipts = key.strip_prefix("rzrec_").is_some_and(digits);
+    let never = matches!(
+        key,
+        "dk_sec" | "at_rest_kind" | "root_secret" | "pin_attempts" | "bridge_secret" | "net_config" | "net_trial"
+    ) || receipts
         || seed_enc
         || seed_plain;
     if never {
         Fallback::Never
     } else {
         Fallback::EraseFirst
+    }
+}
+
+/// Whether a blob of `len` bytes is always written as one chunk: its first
+/// chunk moves to a fresh page rather than split in less tailroom than
+/// `min(len, FIRST_CHUNK_MIN)`, so up to [`FIRST_CHUNK_MIN`] bytes never split.
+pub fn single_chunk(len: usize) -> bool {
+    len <= FIRST_CHUNK_MIN
+}
+
+/// Keys whose multi-chunk write failed this boot. ESP-IDF v5.3.2's failure
+/// cleanup erases chunks through the page pointer it recorded as it wrote
+/// each one (`nvs_storage.cpp:326-333`, `:363-368`); garbage collection
+/// during the same write can move such a page, so a chunk can survive as a
+/// live stray. Rewriting the key in the same boot writes the same chunk
+/// indices again, and boot then drops the index for a chunk-count mismatch
+/// (`:98-114`). So a key that failed that way is not written again until a
+/// restart has run the orphan cleanup. A single-chunk write is unaffected: a
+/// page move for it happens before its one chunk is written, or inside a
+/// `requestNewPage` that then succeeded, after which only a flash error can
+/// fail the index write.
+#[derive(Default, Debug)]
+pub struct FailedWrites {
+    keys: Vec<String>,
+}
+
+impl FailedWrites {
+    pub const fn new() -> Self {
+        FailedWrites { keys: Vec::new() }
+    }
+
+    /// Whether `key` must not be written again this boot.
+    pub fn blocks(&self, key: &str) -> bool {
+        self.keys.iter().any(|k| k == key)
+    }
+
+    /// Note a failed write of `len` bytes to `key`. True if an immediate
+    /// retry is safe (a single-chunk value); otherwise the key is blocked.
+    pub fn record(&mut self, key: &str, len: usize) -> bool {
+        if single_chunk(len) {
+            return true;
+        }
+        if !self.blocks(key) {
+            self.keys.push(String::from(key));
+        }
+        false
     }
 }
 
@@ -194,12 +252,15 @@ mod tests {
             "at_rest_kind",
             "root_secret",
             "pin_attempts",
+            "bridge_secret",
+            "net_config",
+            "net_trial",
+            "rzrec_0",
+            "rzrec_7",
             "m0_seed_enc",
             "m7_seed_enc",
             "master_0_secret",
             "master_7_secret",
-            "mgmt_nonce",
-            "mgmt_0123abcd",
         ] {
             assert_eq!(fallback_for(key), Fallback::Never, "{key}");
         }
@@ -209,9 +270,10 @@ mod tests {
             "pc0",
             "pcnt",
             "rm_journal",
-            "net_config",
-            "net_trial",
+            "mgmt_nonce",
+            "mgmt_0123abcd",
             "net_last",
+            "rzrec_",
             "ph_relays",
             "pinned_rly",
             "imav0",
@@ -259,6 +321,19 @@ mod tests {
         for len in [101, 82, 9, 32, 64] {
             assert!(blob_entries(len) <= 17, "{len} bytes need {}", blob_entries(len));
         }
+    }
+
+    #[test]
+    fn only_a_value_that_always_fits_one_chunk_may_be_retried() {
+        assert!(single_chunk(0) && single_chunk(FIRST_CHUNK_MIN));
+        assert!(!single_chunk(FIRST_CHUNK_MIN + 1));
+        let mut failed = FailedWrites::new();
+        assert!(failed.record("dk_ph", 300), "one chunk: retry now");
+        assert!(!failed.blocks("dk_ph"));
+        assert!(!failed.record("connslots_0", 3000), "several chunks: no retry");
+        assert!(failed.blocks("connslots_0"));
+        assert!(!failed.record("connslots_0", 3000));
+        assert!(!failed.blocks("connslots_1"));
     }
 
     #[test]

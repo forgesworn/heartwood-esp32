@@ -1416,8 +1416,10 @@ pub fn narrows_only(before: &ConnectSlot, after: &ConnectSlot) -> bool {
     probe.allowed_methods.clone_from(&before.allowed_methods);
     probe.allowed_kinds.clone_from(&before.allowed_kinds);
     probe.auto_approve = before.auto_approve;
+    // Byte comparison of the stored encoding: the same codec the slot table
+    // is persisted with, so no second (Value) path through it.
     matches!(
-        (serde_json::to_value(&probe), serde_json::to_value(before)),
+        (serde_json::to_vec(&probe), serde_json::to_vec(before)),
         (Ok(a), Ok(b)) if a == b
     )
 }

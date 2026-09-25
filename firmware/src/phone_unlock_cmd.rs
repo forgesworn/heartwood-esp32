@@ -137,13 +137,17 @@ pub fn run(
         PhoneCmd::Revoke { id } => {
             let mut phones = load(nvs)?;
             phones.revoke(id).map_err(|_| format!("no phone with id {id}"))?;
-            save_revoked(nvs, &phones, id)?;
+            let saved = save_revoked(nvs, &phones, id);
+            // Whatever the outcome, the records on flash may have changed
+            // (a failed rewrite can leave none), so the relay loop re-reads.
             PHONES_CHANGED.store(true, Ordering::Release);
-            log::info!("phone unlock: revoked phone {id}");
             // No phone listens anywhere now; the next enrolment records afresh.
-            if phones.is_empty() && heartwood_common::phone_relays::forget_told(&mut NvsBlobs(nvs)).is_err() {
+            let none_left = matches!(load(nvs), Ok(stored) if stored.is_empty());
+            if none_left && heartwood_common::phone_relays::forget_told(&mut NvsBlobs(nvs)).is_err() {
                 log::warn!("phone unlock: relay record not cleared");
             }
+            saved?;
+            log::info!("phone unlock: revoked phone {id}");
             Ok(serde_json::json!({ "revoked": id }))
         }
         PhoneCmd::SetAnnounceOperator { on } => {

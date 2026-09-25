@@ -1273,26 +1273,20 @@ pub(crate) fn master_sign_heading(label: &str) -> String {
     heartwood_common::encoding::card_heading("SIGN AS", label)
 }
 
-/// Display a signing request with requester, kind, content preview, and countdown.
+/// Display a signing request: requester, kind and countdown, naming the
+/// identity it signs as when there is one. Signing cards only: it draws "HOLD
+/// TO SIGN" and no free text, so a destructive or settings card must use
+/// `show_titled_approval`, which renders its title. (The old
+/// `show_sign_request` took a preview and dropped it; the factory reset and
+/// identity removal cards used it and never said ERASE.)
 ///
 /// Layout:
-///   Header:  "HOLD TO SIGN" (FONT_6X10, tracked)
+///   Header:  "HOLD TO SIGN" (FONT_6X10, tracked), or `heading`
 ///   Rule:    1px line
 ///   App:     requester label (FONT_7X14)
 ///   Kind:    friendly Nostr kind label (FONT_5X8)
 ///   Number:  "kind {n}" (FONT_5X8)
 ///   Bar:     graphical countdown + seconds
-pub fn show_sign_request(
-    display: &mut Display<'_>,
-    requester: &str,
-    kind: u64,
-    _content_preview: &str,
-    seconds_remaining: u32,
-) {
-    show_sign_request_as(display, requester, kind, None, None, seconds_remaining);
-}
-
-/// `show_sign_request` for a remote client, naming the identity it signs as.
 ///
 /// With an identity the kind name and number share the first small line and
 /// the identity (label + short npub) takes the second, so the layout keeps the

@@ -2188,17 +2188,23 @@ told (`ph_relays`) and, while its live list has a relay missing from that
 record, tells them on the OLD relays (logic and host tests:
 `common/src/phone_relays.rs`):
 
-- locked, it repeats each phone's lock announcement on each old relay, at
-  most every 5 minutes, only on an idle pass at least 10 s after and 30 s
-  before the live relay's own announcement; a failing relay backs off
-  (10, 20, 40, then 60 minutes);
+- locked, it repeats each phone's lock announcement on one old relay per
+  announce interval, in the pass straight after the live announcement (a
+  dial blocks for at most about 35 s, so it ends before the next
+  announcement); each relay rests 5 minutes after a dial, and a failing one
+  backs off (10, 20, 40, then 60 minutes);
 - unlocked, it posts a relay update (a 24135 like any other, sealed `t` =
-  `relays`) on each old relay at 0 s, 2 min, 15 min, 1 h, 6 h and 24 h, always
-  on a publish-only connection of its own, never on a session carrying the
-  signer's subscription. The secondary relay closes for the dial; with the
-  primary and a pinned relay both live, or a heap below the secondary guard,
-  the round waits. The round count is saved after each round, so a restart
-  resumes; after the sixth the live list is recorded and the drift ends.
+  `relays`) on each old relay in six rounds: the first a random 2 to 20
+  minutes after the board comes online, then after gaps of about 2 min,
+  13 min, 45 min, 5 h and 18 h, each randomised by a quarter either way. Every
+  update goes out on a publish-only connection of its own, never on a session
+  carrying the signer's subscription. The secondary relay stays closed for
+  the round; with the primary and a pinned relay both live the round waits,
+  and after 10 minutes the pinned relay steps aside for one dial and
+  redials 15 s later. The round count is saved after each round, so a restart
+  resumes; after the sixth the live list is recorded and the drift ends. A
+  revoke of the last phone, or an enrolment after that, ends the update
+  without touching the new record.
 
 **Release note (next beta):** phones enrolled on beta.17 before a relay
 change also made on beta.17 are not told about it (beta.17 kept no record,
@@ -2217,17 +2223,17 @@ subscribed to `{"kinds":[24135]}`).
 2. **Change to C, restart locked.** Point the board at C (Sapwood's network
    editor or `SET_NET_CONFIG`). After the restart the log reads "relays changed
    since the phones were told; telling them on N old relay(s), 0 of 6 update
-   rounds already sent", then, 10 to 30 s after an announcement on C,
-   "announced on old relay ..." for an A relay. The capture on A shows a 24135
-   per phone with one `h` tag and no `p` tag, from the same one-time author as
-   the board's announcements on C.
+   rounds already sent", then, straight after an announcement on C,
+   "announced on old relay ..." for one A relay (the next A relay a minute
+   later). The capture on A shows a 24135 per phone with one `h` tag and no
+   `p` tag, from the same one-time author as the board's announcements on C.
 
 3. **The phone hears it on A and unlocks over C.** Run `phone-unlock.mjs
    listen` with the state file still listing only A. It prompts once (the
    repeat on C, if it listens there, is a duplicate), prints "following the
-   board to" the C relays, and delivers; the board unlocks within a few
-   seconds of the delivery (no "announced on old relay" line between the
-   delivery and "Unlocked by").
+   board to" the C relays, and delivers; the board shows "Unlocked by" within
+   40 s of the delivery (at most one old-relay dial, started before the
+   delivery, can be in progress), and never announces again after it.
 
 4. **A dead old relay decays.** Add an unreachable `wss://` URL to A before
    the change (or stop one of A's relays). Its "old relay ... failed" lines
@@ -2235,31 +2241,34 @@ subscribed to `{"kinds":[24135]}`).
    unlock over USB still succeeds between them.
 
 5. **Unlocked, the rounds go out on their own connections.** With the board
-   unlocked on C, the log shows "relay update round 1 of 6" and one "relay
-   update on old relay" line per A relay (with "(n accepted)"), then round 2
-   about 2 minutes later. The capture on A shows each round's 24135s from a new
-   author, never seen before, each the same length as the lock announcements
-   of step 2, and arriving on a connection that sent no `REQ`. A second
-   `listen` run against a copy of the state file that lists only A prints
-   "relay update: ..." and does NOT prompt.
+   unlocked on C, "relay update round 1 of 6" appears 2 to 20 minutes after
+   the board came online, with one "relay update on old relay" line per A
+   relay ("(n accepted)"); round 2 follows 90 to 150 s later. The capture on A
+   shows each round's 24135s from a new author, each the same length as the
+   lock announcements of step 2, arriving on a connection that sent no `REQ`.
+   A second `listen` run against a copy of the state file that lists only A
+   prints "relay update: ..." and does NOT prompt.
 
 6. **A restart resumes.** Reset after round 2 and unlock. The boot log says
-   "2 of 6 update rounds already sent" and round 3 goes out at once.
+   "2 of 6 update rounds already sent" and round 3 goes out 2 to 20 minutes
+   after the board comes online.
 
 7. **Ceiling.** With a pinned relay live beside the primary (a nostrconnect
-   pairing on a relay outside C), the log says "relay update deferred: the
-   primary and a pinned relay fill the session ceiling" once, and no third
-   TLS session opens.
+   pairing on a relay outside C), the log says "relay update waiting: the
+   primary and a pinned relay fill the session ceiling" once; about 10
+   minutes later "pinned ... steps aside for one relay update dial", the dial,
+   and the pinned relay rejoining about 15 s later. At no point are three
+   relay sessions open (heap log: "2 session(s)" at most).
 
-8. **Revoked and zero-phone boards say nothing.** Revoke the phone mid-drift
-   (`phone-unlock.mjs revoke`) and wait for the next round: the log says "no
-   phones left to tell about the relay change" and A sees nothing more.
-   Reset: no "relays changed" line (the record went with the last phone).
-   Enrol again on C: no "relays changed" line after a reset.
+8. **Revoked and zero-phone boards say nothing.** Revoke the phone
+   (`phone-unlock.mjs revoke`) while an update is pending, then reset. The
+   boot log has no "relays changed" line (the record went with the last
+   phone), and A sees no further 24135 from the board. Enrol again on C and
+   reset: still no "relays changed" line.
 
-9. **The record ends the drift.** Optional, 24 h: leave the board unlocked
-   through round 6. The log says "phones told about the relay change;
-   recorded", and a reset afterwards has no "relays changed" line.
+9. **The record ends the drift.** Optional, about 24 h: leave the board
+   unlocked through round 6. The log says "phones told about the relay
+   change; recorded", and a reset afterwards has no "relays changed" line.
 
 ## Notes
 

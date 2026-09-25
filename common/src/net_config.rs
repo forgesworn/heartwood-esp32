@@ -877,6 +877,13 @@ pub fn parse_net_config(bytes: &[u8]) -> Result<NetConfig, &'static str> {
 #[cfg(feature = "nip46")]
 pub fn validate_local_net_config(cfg: &NetConfig) -> Result<(), &'static str> {
     cfg.validate()?;
+    // An operator the board cannot decode silently disables relay
+    // management, and would read on the card as "Remove operator?": refuse
+    // it here instead. Empty is "no operator". A malformed value already
+    // stored is still read, as no operator.
+    if !cfg.op_mgmt.is_empty() && cfg.op_mgmt_pubkey().is_none() {
+        return Err("op_mgmt must be 64 hex digits");
+    }
     // Dormant fields in usb mode are shape-checked too: a later local edit
     // can promote the config to wifi without re-sending them.
     if !cfg.ssid.is_empty() {
@@ -908,8 +915,10 @@ pub fn validate_local_net_config(cfg: &NetConfig) -> Result<(), &'static str> {
 pub enum OperatorChange {
     /// The same operator (or none either way).
     Kept,
-    /// A different key becomes the operator, replacing one or the first.
-    Set([u8; 32]),
+    /// A key becomes the operator where there was none.
+    Added([u8; 32]),
+    /// A different key replaces a working operator.
+    Replaced([u8; 32]),
     /// The config names no usable operator where one was set.
     Removed,
 }
@@ -924,22 +933,27 @@ pub fn operator_change(new: &NetConfig, stored: Option<&NetConfig>) -> OperatorC
     let old = stored.and_then(NetConfig::op_mgmt_pubkey);
     match new.op_mgmt_pubkey() {
         key if key == old => OperatorChange::Kept,
-        Some(key) => OperatorChange::Set(key),
+        Some(key) if old.is_some() => OperatorChange::Replaced(key),
+        Some(key) => OperatorChange::Added(key),
         None => OperatorChange::Removed,
     }
 }
 
 /// The SET_NET_CONFIG card's title (two lines at most, `oled::
 /// show_change_approval`): a plain network change, or one that names the
-/// operator it installs or removes, in every mode.
+/// operator it installs or removes, in every mode. A replacement reads
+/// "Replace operator?", as the SET_OPERATOR card does; "New operator?" is
+/// only for a board that had none.
 #[cfg(feature = "nip46")]
 pub fn set_net_config_title(change: OperatorChange) -> String {
+    let with_key = |first: &str, key: &[u8; 32]| {
+        let hex = crate::hex::hex_encode(key);
+        format!("{first}\n{}... +network", &hex[..8])
+    };
     match change {
         OperatorChange::Kept => "Set network config?".to_string(),
-        OperatorChange::Set(key) => {
-            let hex = crate::hex::hex_encode(&key);
-            format!("New operator?\n{}... +network", &hex[..8])
-        }
+        OperatorChange::Added(key) => with_key("New operator?", &key),
+        OperatorChange::Replaced(key) => with_key("Replace operator?", &key),
         OperatorChange::Removed => "Remove operator?\n+ set network".to_string(),
     }
 }
@@ -1643,11 +1657,12 @@ mod tests {
         // The same key, however it is spelt, is no change.
         assert_eq!(operator_change(&with_operator(&"AB".repeat(32)), Some(&stored)), OperatorChange::Kept);
         assert_eq!(operator_change(&stored, Some(&stored)), OperatorChange::Kept);
-        // Another key, whether it replaces one or is the first.
+        // Another key replacing a working one, or the first.
         let other = with_operator(&"cd".repeat(32));
-        assert_eq!(operator_change(&other, Some(&stored)), OperatorChange::Set([0xcd; 32]));
-        assert_eq!(operator_change(&other, Some(&with_operator(""))), OperatorChange::Set([0xcd; 32]));
-        assert_eq!(operator_change(&other, None), OperatorChange::Set([0xcd; 32]));
+        assert_eq!(operator_change(&other, Some(&stored)), OperatorChange::Replaced([0xcd; 32]));
+        assert_eq!(operator_change(&other, Some(&with_operator(""))), OperatorChange::Added([0xcd; 32]));
+        assert_eq!(operator_change(&other, Some(&with_operator("zz"))), OperatorChange::Added([0xcd; 32]));
+        assert_eq!(operator_change(&other, None), OperatorChange::Added([0xcd; 32]));
         // No key, or one that does not decode (which disables relay
         // management just the same), in place of a working one.
         assert_eq!(operator_change(&with_operator(""), Some(&stored)), OperatorChange::Removed);
@@ -1659,16 +1674,37 @@ mod tests {
     #[test]
     fn the_network_card_names_an_operator_change() {
         assert_eq!(set_net_config_title(OperatorChange::Kept), "Set network config?");
-        let set = set_net_config_title(OperatorChange::Set([0xcd; 32]));
-        assert_eq!(set, "New operator?\ncdcdcdcd... +network");
+        // "Replace operator?" as the SET_OPERATOR card says it; "New
+        // operator?" only where there was none.
+        let replaced = set_net_config_title(OperatorChange::Replaced([0xcd; 32]));
+        assert_eq!(replaced, "Replace operator?\ncdcdcdcd... +network");
+        let added = set_net_config_title(OperatorChange::Added([0xcd; 32]));
+        assert_eq!(added, "New operator?\ncdcdcdcd... +network");
         let removed = set_net_config_title(OperatorChange::Removed);
         assert!(removed.starts_with("Remove operator?"), "{removed}");
         // show_titled_approval draws two lines; the second in the small font,
         // 21 columns on the narrowest panel.
-        for title in [set, removed] {
+        for title in [replaced, added, removed] {
             assert_eq!(title.lines().count(), 2, "{title}");
             assert!(title.lines().all(|l| l.len() <= 21), "{title}");
         }
+    }
+
+    #[test]
+    fn a_local_config_with_an_operator_that_does_not_decode_is_refused() {
+        let mut cfg = active();
+        validate_local_net_config(&cfg).unwrap();
+        cfg.op_mgmt = "AB".repeat(32);
+        validate_local_net_config(&cfg).unwrap();
+        cfg.op_mgmt = String::new();
+        validate_local_net_config(&cfg).unwrap();
+        for bad in ["zz".repeat(32), "ab".repeat(31), "ab".repeat(33), "abc".to_string(), "npub1xyz".to_string()] {
+            cfg.op_mgmt = bad.clone();
+            assert!(validate_local_net_config(&cfg).is_err(), "{bad}");
+        }
+        // One already stored stays readable: it is "no operator", never an
+        // error (operator_change above).
+        assert!(parse_net_config(br#"{"ssid":"","password":"","mode":"usb","op_mgmt":"zz"}"#).is_ok());
     }
 
     #[test]

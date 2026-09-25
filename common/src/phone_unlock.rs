@@ -1987,8 +1987,6 @@ mod tests {
         cards: alloc::vec::Vec<u32>,
         expired: alloc::vec::Vec<u32>,
         press_latched: bool,
-        /// A result held on screen, which a takeover must leave alone.
-        held_result: Option<&'static str>,
         /// When set, an expiry fails to take the card off (a card that
         /// could not be answered), to show the takeover still ends.
         stuck: bool,
@@ -2001,7 +1999,6 @@ mod tests {
                 cards: cards.to_vec(),
                 expired: alloc::vec::Vec::new(),
                 press_latched: true,
-                held_result: Some("Not sent / revoke id 3"),
                 stuck: false,
                 cleared_after: usize::MAX,
             }
@@ -2032,7 +2029,10 @@ mod tests {
         assert_eq!(screen.expired, [7, 8, 9], "front first");
         assert!(!screen.press_latched);
         assert_eq!(screen.cleared_after, 3, "the press is cleared after the last expiry");
-        assert_eq!(screen.held_result, Some("Not sent / revoke id 3"), "the held result stays");
+        // That the held result stays is not this function's to break (the
+        // trait gives it no way to reach one): what could break it is an
+        // expiry that holds or releases a screen, which ui-preview's scan of
+        // the relay's resolve paths rules out, with `enrol_result` below.
     }
 
     #[test]
@@ -2041,7 +2041,18 @@ mod tests {
         assert_eq!(take_screen_for_recovery(&mut screen), 0);
         assert!(screen.expired.is_empty());
         assert!(!screen.press_latched);
-        assert!(screen.held_result.is_some());
+    }
+
+    #[test]
+    fn an_expired_enrol_card_holds_no_result() {
+        // A takeover answers the enrol card Expired: whatever was added or
+        // delivered, that is a plain "Expired", never a held screen.
+        for added in [None, Some(3)] {
+            for delivered in [true, false] {
+                assert_eq!(enrol_result(CardOutcome::Expired, added, delivered), EnrolResult::Expired);
+                assert!(!enrol_result(CardOutcome::Expired, added, delivered).holds());
+            }
+        }
     }
 
     #[test]

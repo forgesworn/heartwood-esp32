@@ -1233,6 +1233,45 @@ mod cable_card_tests {
         }
     }
 
+    /// A recovery takeover answers every relay card Expired
+    /// (`resolve_button_card(.., &CardTick::Expired)`) and must leave a held
+    /// result, such as "Not sent / revoke id N", standing. So nothing on the
+    /// resolve paths may hold, replace or release a result screen except
+    /// behind an approval: a guard naming `Approved` within the three lines
+    /// before, or an arm of `EnrolResult::Done`/`NotSent`/`NotAdded`, which
+    /// `enrol_result` never returns for an expiry (common's
+    /// `an_expired_enrol_card_holds_no_result`).
+    #[test]
+    fn an_expired_relay_card_never_touches_a_held_result() {
+        let relay = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/relay.rs")).unwrap();
+        const TOUCHES: &[&str] = &["show_and_hold(", "hold_card_screen(", "release_card_screen_hold(", "card_screen_hold"];
+        const PRESSED_ARMS: &[&str] = &["EnrolResult::Done", "EnrolResult::NotSent", "EnrolResult::NotAdded"];
+        let mut guarded = 0;
+        for name in ["resolve_button_card", "resolve_receive_card", "resolve_phone_enrol_card"] {
+            let start = relay
+                .find(&format!("\nfn {name}("))
+                .unwrap_or_else(|| panic!("{name} is in relay.rs"));
+            let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
+            let lines: Vec<&str> = body.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if !TOUCHES.iter().any(|t| code.contains(t)) {
+                    continue;
+                }
+                let context = &lines[i.saturating_sub(3)..=i];
+                let ok = context.iter().any(|l| {
+                    let l = l.split("//").next().unwrap_or("");
+                    l.contains("Approved") || PRESSED_ARMS.iter().any(|arm| l.trim_start().starts_with(arm))
+                });
+                assert!(ok, "{name} touches a held result outside an approval:\n{}", context.join("\n"));
+                guarded += 1;
+            }
+        }
+        // The enrol card's pressed results do hold; if none is found the
+        // scan has lost its way.
+        assert!(guarded >= 3, "found {guarded} guarded holds: the scan has drifted");
+    }
+
     #[test]
     fn the_scan_sees_every_way_to_the_button() {
         assert!(reaches_button("x(usb, ctx.nvs, ctx.buttons)").is_some());

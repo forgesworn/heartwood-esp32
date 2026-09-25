@@ -236,7 +236,20 @@ impl EspNvs<NvsDefault> {
 // Real firmware engine + helpers
 // ---------------------------------------------------------------------------
 
-pub mod nvs { pub use super::{EspNvs, NvsDefault}; }
+/// Stands in for the firmware's `crate::nvs::ReplaceBlob`, which `policy.rs`
+/// imports: on the board a replace that leaves the old or the new value after
+/// a cut, never neither. The mock's `set_blob` is already exactly that.
+pub trait ReplaceBlob {
+    fn replace_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str>;
+}
+
+impl ReplaceBlob for EspNvs<NvsDefault> {
+    fn replace_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str> {
+        self.set_blob(key, data)
+    }
+}
+
+pub mod nvs { pub use super::{EspNvs, NvsDefault, ReplaceBlob}; }
 
 #[path = "../../firmware/src/policy.rs"]
 pub mod engine;

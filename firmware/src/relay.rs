@@ -42,6 +42,7 @@ use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::modem::Modem;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use esp_idf_svc::tls::{Config as TlsConfig, EspTls, InternalSocket, KeepAliveConfig};
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfig, EspWifi,
@@ -829,7 +830,7 @@ fn load_pinned(nvs: &mut EspNvs<NvsDefault>) -> Vec<PinnedRelay> {
 fn save_pinned(nvs: &mut EspNvs<NvsDefault>, pinned: &[PinnedRelay]) -> bool {
     match serde_json::to_vec(pinned) {
         Ok(json) => {
-            if let Err(e) = nvs.set_blob(PINNED_NVS_KEY, &json) {
+            if let Err(e) = nvs.replace_blob(PINNED_NVS_KEY, &json) {
                 log::error!("[relay] persist pinned relays: {e:?}");
             }
             match nvs.blob_len(PINNED_NVS_KEY) {

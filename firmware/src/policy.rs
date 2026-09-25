@@ -14,6 +14,7 @@ fn next_approval_epoch() -> Option<u32> {
 }
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{
     authorize_pubkey_on_unique_slot, clear_approved_identities, evaluate_slot_policy,
@@ -955,7 +956,7 @@ impl PolicyEngine {
                     false
                 }
                 Ok(json) => {
-                    let mut written = nvs.set_blob(&key, json.as_bytes());
+                    let mut written = nvs.replace_blob(&key, json.as_bytes());
                     // Pairings outrank the avatar cache: if the write fails
                     // (in practice, NVS full), drop the avatars and try once
                     // more before refusing.
@@ -963,12 +964,12 @@ impl PolicyEngine {
                         log::warn!(
                             "Slot table for slot {master_slot} did not fit: dropped cached avatars, retrying"
                         );
-                        written = nvs.set_blob(&key, json.as_bytes());
+                        written = nvs.replace_blob(&key, json.as_bytes());
                     }
                     if let Err(e) = written {
                         log::error!("Failed to persist slots for slot {master_slot}: {e:?}");
                     }
-                    // A success return from set_blob is not the authority
+                    // A success return from replace_blob is not the authority
                     // boundary. Read the exact bytes back before a caller may
                     // ACK a new client or signing grant.
                     match nvs.blob_len(&key) {
@@ -1040,7 +1041,7 @@ impl PolicyEngine {
     pub fn recover_pairings_for_backup_restore(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
         if self.storage_ready(master_slot) { return true; }
         let key = format!("connslots_{master_slot}");
-        let _ = nvs.set_blob(&key, b"[]");
+        let _ = nvs.replace_blob(&key, b"[]");
         let mut verify = [0u8; 2];
         let verified = matches!(nvs.blob_len(&key), Ok(Some(2)))
             && matches!(nvs.get_blob(&key, &mut verify), Ok(Some(bytes)) if bytes == b"[]");

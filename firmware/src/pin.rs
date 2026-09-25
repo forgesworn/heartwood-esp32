@@ -21,6 +21,7 @@
 use crate::masters::LoadedMaster;
 use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 
 use crate::data_key_store::{self, Board, NvsBlobs};
 use crate::protocol;
@@ -53,7 +54,7 @@ fn write_failed_attempts(
     nvs: &mut EspNvs<NvsDefault>,
     count: u8,
 ) -> Result<(), &'static str> {
-    nvs.set_blob(NVS_PIN_ATTEMPTS_KEY, &[count])
+    nvs.replace_blob(NVS_PIN_ATTEMPTS_KEY, &[count])
         .map_err(|_| "could not persist PIN-attempt state")?;
     if read_failed_attempts(nvs)? == count {
         Ok(())

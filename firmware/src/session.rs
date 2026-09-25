@@ -5,6 +5,7 @@
 
 use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 // AtomicU32, not 64: the Xtensa targets have no 64-bit atomics; uptime
 // seconds wrap in ~136 years, which this cooldown will never see.
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -41,7 +42,7 @@ pub fn write_bridge_secret(
     nvs: &mut EspNvs<NvsDefault>,
     secret: &[u8; 32],
 ) -> Result<(), &'static str> {
-    nvs.set_blob(NVS_BRIDGE_SECRET_KEY, secret)
+    nvs.replace_blob(NVS_BRIDGE_SECRET_KEY, secret)
         .map_err(|_| "failed to write bridge secret")
 }
 

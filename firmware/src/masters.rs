@@ -4,6 +4,7 @@
 // with a secret, label, mode, and cached pubkey.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use heartwood_common::persistent_state::{
     remap_master_slot, RemovalJournal, RemovalPhase, NO_PERSONA_IN_FLIGHT,
     REMOVAL_JOURNAL_LEN,
@@ -124,7 +125,7 @@ pub fn encryption_at_rest_active(nvs: &EspNvs<NvsDefault>) -> bool {
 
 /// Write the master count to NVS.
 fn write_master_count(nvs: &mut EspNvs<NvsDefault>, count: u8) -> Result<(), &'static str> {
-    nvs.set_blob("master_count", &[count])
+    nvs.replace_blob("master_count", &[count])
         .map_err(|_| "failed to write master_count")
 }
 
@@ -219,7 +220,7 @@ pub fn set_master_operator(
     slot: u8,
     operator: &[u8; 32],
 ) -> Result<(), String> {
-    nvs.set_blob(&format!("master_{slot}_op"), operator)
+    nvs.replace_blob(&format!("master_{slot}_op"), operator)
         .map_err(|e| format!("persist identity operator: {e}"))
 }
 
@@ -250,15 +251,15 @@ pub fn add_master(
     // operator left in this slot index (belt-and-braces with slot_keys()).
     let _ = nvs.remove(&format!("{prefix}_op"));
 
-    nvs.set_blob(&format!("{prefix}_secret"), secret)
+    nvs.replace_blob(&format!("{prefix}_secret"), secret)
         .map_err(|_| "failed to write secret")?;
-    nvs.set_blob(&format!("{prefix}_label"), label.as_bytes())
+    nvs.replace_blob(&format!("{prefix}_label"), label.as_bytes())
         .map_err(|_| "failed to write label")?;
-    nvs.set_blob(&format!("{prefix}_mode"), &[mode as u8])
+    nvs.replace_blob(&format!("{prefix}_mode"), &[mode as u8])
         .map_err(|_| "failed to write mode")?;
-    nvs.set_blob(&format!("{prefix}_deriv"), &[mode.derivation_version()])
+    nvs.replace_blob(&format!("{prefix}_deriv"), &[mode.derivation_version()])
         .map_err(|_| "failed to write derivation version")?;
-    nvs.set_blob(&format!("{prefix}_pubkey"), pubkey)
+    nvs.replace_blob(&format!("{prefix}_pubkey"), pubkey)
         .map_err(|_| "failed to write pubkey")?;
 
     write_master_count(nvs, count + 1)?;
@@ -425,7 +426,7 @@ fn persist_removal_journal(
     journal: &RemovalJournal,
 ) -> Result<(), &'static str> {
     let encoded = journal.encode();
-    nvs.set_blob(REMOVAL_JOURNAL_KEY, &encoded)
+    nvs.replace_blob(REMOVAL_JOURNAL_KEY, &encoded)
         .map_err(|_| "failed to write master-removal journal")?;
     match read_removal_journal(nvs)? {
         Some(stored) if stored == *journal => Ok(()),
@@ -452,7 +453,7 @@ fn ensure_pinned_shadow(nvs: &mut EspNvs<NvsDefault>) -> Result<(), &'static str
         shadow[0] = 1;
         shadow.extend_from_slice(&current);
     }
-    nvs.set_blob(REMOVAL_PINNED_SHADOW_KEY, &shadow)
+    nvs.replace_blob(REMOVAL_PINNED_SHADOW_KEY, &shadow)
         .map_err(|_| "failed to shadow pinned relay state")?;
     if read_blob(nvs, REMOVAL_PINNED_SHADOW_KEY)?.as_deref() == Some(shadow.as_slice()) {
         Ok(())
@@ -498,7 +499,7 @@ fn rewrite_pinned_relays_from_shadow(
         return clear_blob(nvs, "pinned_rly");
     }
     let encoded = serde_json::to_vec(&shifted).map_err(|_| "failed to encode pinned relays")?;
-    nvs.set_blob("pinned_rly", &encoded)
+    nvs.replace_blob("pinned_rly", &encoded)
         .map_err(|_| "failed to shift pinned relays")?;
     let stored = read_blob(nvs, "pinned_rly")?.ok_or("shifted pinned relays missing")?;
     let verified: Vec<PinnedRelayRecord> =
@@ -562,7 +563,7 @@ fn copy_optional_blob(
 ) -> Result<(), &'static str> {
     match read_blob(nvs, source)? {
         Some(value) => {
-            nvs.set_blob(destination, &value)
+            nvs.replace_blob(destination, &value)
                 .map_err(|_| "failed to shift slot state")?;
             if read_blob(nvs, destination)?.as_deref() != Some(value.as_slice()) {
                 return Err("shifted slot state verification failed");

@@ -11,6 +11,7 @@
 use std::sync::Mutex;
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use heartwood_common::data_key::{BlobStore, Platform, StoreError, DK_LEN, MAX_PHONES_BLOB_LEN};
 use zeroize::Zeroize;
 
@@ -37,7 +38,7 @@ impl BlobStore for NvsBlobs<'_> {
     }
 
     fn set(&mut self, key: &str, value: &[u8]) -> Result<(), StoreError> {
-        self.0.set_blob(key, value).map_err(|_| StoreError)
+        self.0.replace_blob(key, value).map_err(|_| StoreError)
     }
 
     fn remove(&mut self, key: &str) -> Result<(), StoreError> {
@@ -96,7 +97,7 @@ pub fn next_locked_boot(nvs: &mut EspNvs<NvsDefault>) -> u32 {
         _ => 0,
     };
     let next = current.saturating_add(1);
-    if let Err(e) = nvs.set_blob(LOCKED_BOOTS_KEY, &next.to_be_bytes()) {
+    if let Err(e) = nvs.replace_blob(LOCKED_BOOTS_KEY, &next.to_be_bytes()) {
         log::warn!("locked-restart count not saved: {e}");
     }
     next
@@ -124,7 +125,7 @@ pub fn set_announce_operator(nvs: &mut EspNvs<NvsDefault>, on: bool) -> Result<(
     if on {
         nvs.remove(ANNOUNCE_OPERATOR_KEY).map(|_| ()).map_err(|_| ())
     } else {
-        nvs.set_blob(ANNOUNCE_OPERATOR_KEY, &[0]).map_err(|_| ())
+        nvs.replace_blob(ANNOUNCE_OPERATOR_KEY, &[0]).map_err(|_| ())
     }
 }
 

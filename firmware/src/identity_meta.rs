@@ -11,6 +11,7 @@
 // flash region rather than NVS.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 
 use crate::masters::LoadedMaster;
 
@@ -32,13 +33,13 @@ pub fn save(
     h: u8,
     avatar: &[u8],
 ) -> Result<(), String> {
-    nvs.set_blob(&format!("iman{slot}"), name.as_bytes())
+    nvs.replace_blob(&format!("iman{slot}"), name.as_bytes())
         .map_err(|e| format!("name blob: {e:?}"))?;
     let mut blob = Vec::with_capacity(2 + avatar.len());
     blob.push(w);
     blob.push(h);
     blob.extend_from_slice(avatar);
-    nvs.set_blob(&format!("imav{slot}"), &blob)
+    nvs.replace_blob(&format!("imav{slot}"), &blob)
         .map_err(|e| format!("avatar blob: {e:?}"))?;
     Ok(())
 }

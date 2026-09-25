@@ -48,7 +48,7 @@ namespace:
 | `persona_count`, `pE_ms`, `pE_ix`, `pE_pk`, `pE_pp`, `pE_nm` | Compact persona registry; `pE_ms` owns entry E to a master slot |
 | `imanN`, `imavN` | Master-slot display name/avatar |
 | `bridge_secret` | Authenticated USB bridge secret |
-| `pin_fails` | Durable wrong-PIN counter (`u8`); `pin_attempts` is the one-byte blob earlier firmware used, read until the first guess or unlock moves it |
+| `pin_fails` | Durable wrong-PIN counter (`u8`); `pin_attempts` is the one-byte blob earlier firmware used, read until the first guess or unlock moves it. A downgrade reads only the blob, so it shows 0 |
 | `net_config`, `net_trial`, `net_rev`, `net_last`, `ncfg_crc` | Active/staged network configuration, outcome, and flash-seed marker |
 | `pinned_rly` | Client-requested relay reachability cache, with master/client slot coordinates |
 | `mgmt_nonce` | Legacy device-operator one-time remote-management mutation challenge, rotated and read back before dispatch |
@@ -63,10 +63,11 @@ Every blob in this table is written through `ReplaceBlob`
 (`firmware/src/nvs.rs`), which calls ESP-IDF's `nvs_set_blob` with no erase
 in front of it when there is room for the new copy beside the old one: a
 power cut during the write then leaves the old value or the new one. With no
-room, the secrets (`dk_sec`, `mN_seed_enc`, `master_N_secret`,
-`at_rest_kind`, the management challenges) are refused and keep their
-value, and every other key is erased and then written, as all writes were
-before, so a cut there loses that key. `pin_fails`, `net_rev` and `ncfg_crc`
+room, the secrets and the keys whose loss weakens the board (`dk_sec`,
+`mN_seed_enc`, `master_N_secret`, `at_rest_kind`, `bridge_secret`,
+`rzrec_N`, `net_config`, `net_trial`) are refused and keep their value, and
+every other key is erased and then written, as all writes were before, so a
+cut there loses that key. `pin_fails`, `net_rev` and `ncfg_crc`
 are integer items, which ESP-IDF replaces new-before-old in a single entry.
 No write spans two keys, which is what the journals below are for. See
 "Power cuts and NVS writes" in SECURITY-MODEL.md for the per-key table.

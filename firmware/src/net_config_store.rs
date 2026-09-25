@@ -652,7 +652,7 @@ fn ack_and_reboot_change(
 
 /// Physically confirmed partial USB network update. Password `keep` never
 /// exposes or resends the stored credential, and `op_mgmt` is not part of this
-/// request type.
+/// request type. [`check_patch_net_config`] then [`confirm_patch_net_config`].
 pub fn handle_patch_net_config(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
@@ -660,46 +660,82 @@ pub fn handle_patch_net_config(
     display: &mut crate::oled::Display<'_>,
     buttons: &crate::button::Buttons<'_>,
 ) {
+    if let Some(plan) = check_patch_net_config(usb, payload, nvs) {
+        confirm_patch_net_config(usb, plan, nvs, display, buttons);
+    }
+}
+
+/// A PATCH_NET_CONFIG that has passed every check and will raise its card.
+pub struct PatchPlan {
+    previous_raw: Vec<u8>,
+    replacement_raw: Vec<u8>,
+    next_mode: heartwood_common::net_config::DeviceMode,
+}
+
+/// Everything PATCH_NET_CONFIG checks before its card: the patch parses, the
+/// stored config reads, the revision is current and the result is valid and
+/// fits. NACKs and returns `None` on the first failure, so only a frame that
+/// will raise its card gets a plan (the WiFi loop takes the screen from a
+/// relay card only then).
+pub fn check_patch_net_config(
+    usb: &mut SerialPort<'_>,
+    payload: &[u8],
+    nvs: &mut EspNvs<NvsDefault>,
+) -> Option<PatchPlan> {
     let params: LocalNetConfigPatchParams = match serde_json::from_slice(payload) {
         Ok(params) => params,
         Err(_) => {
             protocol::write_frame(usb, FRAME_TYPE_NACK, b"invalid patch");
-            return;
+            return None;
         }
     };
     let (previous_raw, active, revision) = match current_config(nvs) {
         Ok(state) => state,
         Err(error) => {
             protocol::write_frame(usb, FRAME_TYPE_NACK, error.as_bytes());
-            return;
+            return None;
         }
     };
     if params.base_revision != revision {
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"stale network revision");
-        return;
+        return None;
     }
     let replacement = match apply_local_net_config_patch(&active, &params.patch) {
         Ok(candidate) => candidate,
         Err(error) => {
             protocol::write_frame(usb, FRAME_TYPE_NACK, error.as_bytes());
-            return;
+            return None;
         }
     };
     let replacement_raw = match serde_json::to_vec(&replacement) {
         Ok(raw) if raw.len() <= NET_CONFIG_MAX_LEN => raw,
         _ => {
             protocol::write_frame(usb, FRAME_TYPE_NACK, b"network config too large");
-            return;
+            return None;
         }
     };
-    let next_mode = replacement.device_mode();
+    Some(PatchPlan {
+        previous_raw,
+        replacement_raw,
+        next_mode: replacement.device_mode(),
+    })
+}
+
+/// PATCH_NET_CONFIG's card, and the write on approval.
+pub fn confirm_patch_net_config(
+    usb: &mut SerialPort<'_>,
+    plan: PatchPlan,
+    nvs: &mut EspNvs<NvsDefault>,
+    display: &mut crate::oled::Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+) {
     if !approved(display, buttons, "Change network?") {
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"denied");
         return;
     }
     crate::oled::show_network_status(display, NetworkDisplayState::Saving);
-    match persist_local_replacement(nvs, &previous_raw, &replacement_raw) {
-        Ok(_) => ack_and_reboot_network(usb, display, next_mode),
+    match persist_local_replacement(nvs, &plan.previous_raw, &plan.replacement_raw) {
+        Ok(_) => ack_and_reboot_network(usb, display, plan.next_mode),
         Err(error) => {
             crate::oled::show_network_status(display, NetworkDisplayState::SaveFailed);
             protocol::write_frame(usb, FRAME_TYPE_NACK, error.as_bytes());
@@ -789,6 +825,12 @@ pub fn handle_set_operator(
 /// an unprovisioned board would only boot back to the setup screen — the
 /// staged config is returned instead so the caller can pick it up when the
 /// first identity lands.
+///
+/// The config carries `op_mgmt`, the key that manages the board over relays,
+/// so a replacement can change the operator: the card then says so ("New
+/// operator?" with the key's first 8 hex, or "Remove operator?"), in every
+/// mode, where a plain network change says "Set network config?".
+/// [`check_set_net_config`] then [`confirm_set_net_config`].
 pub fn handle_set_net_config(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
@@ -797,19 +839,47 @@ pub fn handle_set_net_config(
     buttons: &crate::button::Buttons<'_>,
     reboot_into_wifi: bool,
 ) -> Option<heartwood_common::net_config::NetConfig> {
-    let cfg = match heartwood_common::net_config::parse_net_config(payload)
-        .and_then(|cfg| {
-            heartwood_common::net_config::validate_local_net_config(&cfg).map(|()| cfg)
-        }) {
-        Ok(cfg) => cfg,
+    let cfg = check_set_net_config(usb, payload)?;
+    confirm_set_net_config(usb, payload, cfg, nvs, display, buttons, reboot_into_wifi)
+}
+
+/// SET_NET_CONFIG's checks before its card: the payload parses and passes
+/// the full local bounds. NACKs "invalid config" and returns `None`
+/// otherwise, so only a frame that will raise its card gets this far.
+pub fn check_set_net_config(
+    usb: &mut SerialPort<'_>,
+    payload: &[u8],
+) -> Option<heartwood_common::net_config::NetConfig> {
+    match heartwood_common::net_config::parse_net_config(payload).and_then(|cfg| {
+        heartwood_common::net_config::validate_local_net_config(&cfg).map(|()| cfg)
+    }) {
+        Ok(cfg) => Some(cfg),
         Err(e) => {
             log::warn!("SET_NET_CONFIG rejected — {e}");
             protocol::write_frame(usb, FRAME_TYPE_NACK, b"invalid config");
-            return None;
+            None
         }
-    };
+    }
+}
+
+/// SET_NET_CONFIG's card for `cfg` (checked by [`check_set_net_config`]),
+/// and the write on approval.
+pub fn confirm_set_net_config(
+    usb: &mut SerialPort<'_>,
+    payload: &[u8],
+    cfg: heartwood_common::net_config::NetConfig,
+    nvs: &mut EspNvs<NvsDefault>,
+    display: &mut crate::oled::Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    reboot_into_wifi: bool,
+) -> Option<heartwood_common::net_config::NetConfig> {
+    let stored = read_net_config(nvs).and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok());
+    let title = heartwood_common::net_config::set_net_config_title(heartwood_common::net_config::operator_change(
+        &cfg,
+        stored.as_ref(),
+    ));
     let result = crate::approval::run_approval_loop(display, buttons, 45, |d, remaining| {
-        crate::oled::show_change_approval(d, "Set network config?", remaining, 45);
+        crate::oled::show_change_approval(d, &title, remaining, 45);
     });
 
     if !matches!(result, crate::approval::ApprovalResult::Approved) {

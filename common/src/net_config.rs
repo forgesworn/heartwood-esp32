@@ -526,10 +526,12 @@ impl NetConfig {
         }
     }
 
-    /// The operator management pubkey (32 bytes) if configured and valid hex.
-    /// `None` disables the relay management channel (kind 24134).
+    /// The operator management pubkey (32 bytes) if configured, valid hex and
+    /// a BIP-340 x-only point (as SET_OPERATOR canonicalises it). `None`
+    /// disables the relay management channel (kind 24134).
     pub fn op_mgmt_pubkey(&self) -> Option<[u8; 32]> {
-        crate::hex::hex_decode(&self.op_mgmt).ok()?.try_into().ok()
+        let key: [u8; 32] = crate::hex::hex_decode(&self.op_mgmt).ok()?.try_into().ok()?;
+        is_xonly_point(&key).then_some(key)
     }
 
     /// WiFi mode requires an SSID and at least one relay; USB mode is always valid.
@@ -867,6 +869,24 @@ pub fn parse_net_config(bytes: &[u8]) -> Result<NetConfig, &'static str> {
     serde_json::from_slice(bytes).map_err(|_| "invalid net config json")
 }
 
+/// Whether `key` is a valid BIP-340 x-only public key on either backend.
+#[cfg(feature = "nip46")]
+fn is_xonly_point(key: &[u8; 32]) -> bool {
+    #[cfg(all(feature = "k256-backend", not(feature = "secp256k1-backend")))]
+    {
+        k256::schnorr::VerifyingKey::from_bytes(key).is_ok()
+    }
+    #[cfg(all(feature = "secp256k1-backend", not(feature = "k256-backend")))]
+    {
+        secp256k1::XOnlyPublicKey::from_slice(key).is_ok()
+    }
+    #[cfg(not(any(feature = "k256-backend", feature = "secp256k1-backend")))]
+    {
+        let _ = key;
+        false
+    }
+}
+
 /// Validation for a LOCAL whole-config replacement (USB SET_NET_CONFIG frame
 /// or the flash `config` partition seed). Stronger than the legacy
 /// `NetConfig::validate` — the stored blob boots straight into
@@ -877,6 +897,13 @@ pub fn parse_net_config(bytes: &[u8]) -> Result<NetConfig, &'static str> {
 #[cfg(feature = "nip46")]
 pub fn validate_local_net_config(cfg: &NetConfig) -> Result<(), &'static str> {
     cfg.validate()?;
+    // An operator the board cannot decode silently disables relay
+    // management, and would read on the card as "Remove operator?": refuse
+    // it here instead. Empty is "no operator". A malformed value already
+    // stored is still read, as no operator.
+    if !cfg.op_mgmt.is_empty() && cfg.op_mgmt_pubkey().is_none() {
+        return Err("op_mgmt must be a 64 hex digit public key");
+    }
     // Dormant fields in usb mode are shape-checked too: a later local edit
     // can promote the config to wifi without re-sending them.
     if !cfg.ssid.is_empty() {
@@ -897,6 +924,71 @@ pub fn validate_local_net_config(cfg: &NetConfig) -> Result<(), &'static str> {
         validate_local_relay(relay)?;
     }
     Ok(())
+}
+
+/// What a whole-config replacement (SET_NET_CONFIG) does to the device
+/// operator, the key that manages the board over relays. It is a field of
+/// the config like any other, so a replacement that looks like a network
+/// change can hand relay management to another key; the card has to say so.
+#[cfg(feature = "nip46")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorChange {
+    /// The same operator (or none either way).
+    Kept,
+    /// A key becomes the operator where there was none.
+    Added([u8; 32]),
+    /// A different key replaces a working operator.
+    Replaced([u8; 32]),
+    /// The config names no usable operator where one was set.
+    Removed,
+}
+
+/// [`OperatorChange`] for replacing `stored` (`None`: nothing readable is
+/// stored) with `new`. Compared by the key each would actually use
+/// ([`NetConfig::op_mgmt_pubkey`]), so the same key spelt in another case is
+/// no change, and a value that does not decode counts as no operator, which
+/// is what the relay management channel makes of it.
+#[cfg(feature = "nip46")]
+pub fn operator_change(new: &NetConfig, stored: Option<&NetConfig>) -> OperatorChange {
+    let old = stored.and_then(NetConfig::op_mgmt_pubkey);
+    match new.op_mgmt_pubkey() {
+        key if key == old => OperatorChange::Kept,
+        Some(key) if old.is_some() => OperatorChange::Replaced(key),
+        Some(key) => OperatorChange::Added(key),
+        None => OperatorChange::Removed,
+    }
+}
+
+/// The SET_NET_CONFIG card's title (two lines at most, `oled::
+/// show_change_approval`): a plain network change, or one that names the
+/// operator it installs or removes, in every mode. A replacement reads
+/// "Replace operator?", as the SET_OPERATOR card does; "New operator?" is
+/// only for a board that had none.
+#[cfg(feature = "nip46")]
+pub fn set_net_config_title(change: OperatorChange) -> String {
+    let with_key = |first: &str, key: &[u8; 32]| {
+        let hex = crate::hex::hex_encode(key);
+        format!("{first}\n{}... +network", &hex[..8])
+    };
+    match change {
+        OperatorChange::Kept => "Set network config?".to_string(),
+        OperatorChange::Added(key) => with_key("New operator?", &key),
+        OperatorChange::Replaced(key) => with_key("Replace operator?", &key),
+        OperatorChange::Removed => "Remove operator?\n+ set network".to_string(),
+    }
+}
+
+/// Whether a SET_NET_CONFIG `payload` keeps the operator of the stored
+/// config (`stored_raw`, the NVS blob). Only such a frame is the owner's
+/// network recovery, which may take the screen from a relay card; one that
+/// changes the operator, does not parse, or has nothing readable to compare
+/// with is an ordinary card, refused while a relay card is up.
+#[cfg(feature = "nip46")]
+pub fn set_net_config_keeps_operator(payload: &[u8], stored_raw: Option<&[u8]>) -> bool {
+    let Some(stored) = stored_raw.and_then(|raw| parse_net_config(raw).ok()) else {
+        return false;
+    };
+    parse_net_config(payload).is_ok_and(|new| operator_change(&new, Some(&stored)) == OperatorChange::Kept)
 }
 
 /// Local relay rule: ws:// or wss:// (a LAN relay is legitimate on the
@@ -1083,7 +1175,7 @@ mod tests {
             password: "old-password".to_string(),
             relays: vec!["wss://old.example".to_string()],
             mode: "wifi".to_string(),
-            op_mgmt: "11".repeat(32),
+            op_mgmt: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string(),
             networks: Vec::new(),
         }
     }
@@ -1571,5 +1663,96 @@ mod tests {
         assert_eq!(effective_network_revision(6, Some(7), None), 7);
         assert_eq!(effective_network_revision(6, None, Some(7)), 7);
         assert_eq!(effective_network_revision(8, Some(7), Some(6)), 8);
+    }
+
+    // x of G and of 2G: valid BIP-340 keys. 0xff repeated is past the field prime, so never a point.
+    const KEY_A: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const KEY_B: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+
+    fn key(hex: &str) -> [u8; 32] {
+        crate::hex::hex_decode(hex).unwrap().try_into().unwrap()
+    }
+
+    fn with_operator(op: &str) -> NetConfig {
+        let mut cfg = active();
+        cfg.op_mgmt = op.to_string();
+        cfg
+    }
+
+    #[test]
+    fn a_set_net_config_that_names_another_operator_says_so() {
+        let stored = with_operator(KEY_A);
+        // The same key, however it is spelt, is no change.
+        assert_eq!(operator_change(&with_operator(&KEY_A.to_uppercase()), Some(&stored)), OperatorChange::Kept);
+        assert_eq!(operator_change(&stored, Some(&stored)), OperatorChange::Kept);
+        // Another key replacing a working one, or the first.
+        let other = with_operator(KEY_B);
+        assert_eq!(operator_change(&other, Some(&stored)), OperatorChange::Replaced(key(KEY_B)));
+        assert_eq!(operator_change(&other, Some(&with_operator(""))), OperatorChange::Added(key(KEY_B)));
+        assert_eq!(operator_change(&other, Some(&with_operator("zz"))), OperatorChange::Added(key(KEY_B)));
+        assert_eq!(operator_change(&other, None), OperatorChange::Added(key(KEY_B)));
+        // No key, or one that does not decode (which disables relay
+        // management just the same), in place of a working one.
+        assert_eq!(operator_change(&with_operator(""), Some(&stored)), OperatorChange::Removed);
+        assert_eq!(operator_change(&with_operator("zz"), Some(&stored)), OperatorChange::Removed);
+        // 64 hex digits that are not a curve point are no key either.
+        let off_curve = "ff".repeat(32);
+        assert_eq!(operator_change(&with_operator(&off_curve), Some(&stored)), OperatorChange::Removed);
+        assert_eq!(operator_change(&other, Some(&with_operator(&off_curve))), OperatorChange::Added(key(KEY_B)));
+        assert_eq!(operator_change(&with_operator(""), Some(&with_operator("zz"))), OperatorChange::Kept);
+        assert_eq!(operator_change(&with_operator(""), None), OperatorChange::Kept);
+    }
+
+    #[test]
+    fn the_network_card_names_an_operator_change() {
+        assert_eq!(set_net_config_title(OperatorChange::Kept), "Set network config?");
+        // "Replace operator?" as the SET_OPERATOR card says it; "New
+        // operator?" only where there was none.
+        let replaced = set_net_config_title(OperatorChange::Replaced([0xcd; 32]));
+        assert_eq!(replaced, "Replace operator?\ncdcdcdcd... +network");
+        let added = set_net_config_title(OperatorChange::Added([0xcd; 32]));
+        assert_eq!(added, "New operator?\ncdcdcdcd... +network");
+        let removed = set_net_config_title(OperatorChange::Removed);
+        assert!(removed.starts_with("Remove operator?"), "{removed}");
+        // show_titled_approval draws two lines; the second in the small font,
+        // 21 columns on the narrowest panel.
+        for title in [replaced, added, removed] {
+            assert_eq!(title.lines().count(), 2, "{title}");
+            assert!(title.lines().all(|l| l.len() <= 21), "{title}");
+        }
+    }
+
+    #[test]
+    fn a_local_config_with_an_operator_that_does_not_decode_is_refused() {
+        let mut cfg = active();
+        validate_local_net_config(&cfg).unwrap();
+        cfg.op_mgmt = KEY_A.to_uppercase();
+        validate_local_net_config(&cfg).unwrap();
+        cfg.op_mgmt = String::new();
+        validate_local_net_config(&cfg).unwrap();
+        for bad in ["ff".repeat(32), "zz".repeat(32), "ab".repeat(31), "ab".repeat(33), "abc".to_string(), "npub1xyz".to_string()] {
+            cfg.op_mgmt = bad.clone();
+            assert!(validate_local_net_config(&cfg).is_err(), "{bad}");
+        }
+        // One already stored stays readable: it is "no operator", never an
+        // error (operator_change above).
+        assert!(parse_net_config(br#"{"ssid":"","password":"","mode":"usb","op_mgmt":"zz"}"#).is_ok());
+    }
+
+    #[test]
+    fn only_a_config_that_keeps_the_stored_operator_is_a_recovery() {
+        let op = "ab".repeat(32);
+        let stored = alloc::format!(r#"{{"ssid":"a","password":"","relays":["wss://r.example"],"mode":"wifi","op_mgmt":"{op}"}}"#);
+        let same = alloc::format!(r#"{{"ssid":"b","password":"p","relays":["wss://s.example"],"mode":"wifi","op_mgmt":"{op}"}}"#);
+        let other = alloc::format!(r#"{{"ssid":"b","password":"p","relays":["wss://s.example"],"mode":"wifi","op_mgmt":"{}"}}"#, "cd".repeat(32));
+        let none = r#"{"ssid":"b","password":"p","relays":["wss://s.example"],"mode":"wifi"}"#;
+        assert!(set_net_config_keeps_operator(same.as_bytes(), Some(stored.as_bytes())));
+        assert!(!set_net_config_keeps_operator(other.as_bytes(), Some(stored.as_bytes())));
+        assert!(!set_net_config_keeps_operator(none.as_bytes(), Some(stored.as_bytes())));
+        // Nothing stored, or nothing readable, is nothing to keep; nor is a
+        // payload that does not parse.
+        assert!(!set_net_config_keeps_operator(same.as_bytes(), None));
+        assert!(!set_net_config_keeps_operator(same.as_bytes(), Some(b"not json")));
+        assert!(!set_net_config_keeps_operator(b"not json", Some(stored.as_bytes())));
     }
 }

@@ -153,6 +153,131 @@ impl Layout {
     pub fn chars_per_line(&self, font: &MonoFont) -> usize {
         (self.w / Self::glyph_w(font)).max(1) as usize
     }
+
+    /// Width the button tags ("<PRG", "YES>", "NO>": four small-font glyphs
+    /// at most) take on their edge: the text, its inset from the edge, and a
+    /// gap before anything else may start.
+    pub fn tag_band(&self) -> i32 {
+        4 * Self::glyph_w(self.font_small()) + self.s(1) + self.s(2)
+    }
+
+    /// The x span, `[left, right)`, that text may use on a card whose button
+    /// tags sit on `side`, keeping clear of them at every height. With no tags,
+    /// a small margin each side.
+    pub fn text_span(&self, side: Option<TagSide>) -> (i32, i32) {
+        let margin = self.s(2);
+        match side {
+            Some(TagSide::Left) => (self.tag_band(), self.w - margin),
+            Some(TagSide::Right) => (margin, self.w - self.tag_band()),
+            None => (margin, self.w - margin),
+        }
+    }
+
+    /// How many glyphs of `font` fit in [`text_span`](Self::text_span).
+    pub fn span_chars(&self, side: Option<TagSide>, font: &MonoFont) -> usize {
+        let (left, right) = self.text_span(side);
+        ((right - left) / Self::glyph_w(font)).max(0) as usize
+    }
+
+    /// X for content `content_w` wide, centred in [`text_span`](Self::text_span).
+    pub fn center_in_span(&self, side: Option<TagSide>, content_w: i32) -> i32 {
+        let (left, right) = self.text_span(side);
+        left + ((right - left - content_w) / 2).max(0)
+    }
+}
+
+/// Where the enrol card draws on a panel (oled.rs `show_enrol_approval`,
+/// mirrored and pixel-checked in ui-preview). Rows are baselines on the
+/// 128x64 canvas, spread by [`Layout::sy`]: on the Heltec the top line's ink
+/// is rows 0-7, the two word lines 9-26 and 28-45, the hint 47-54 and the
+/// countdown row 57-62 (page marker, bar, seconds).
+#[derive(Clone, Copy, Debug)]
+pub struct EnrolGeometry {
+    /// The words' font, drawn at `word_scale` (bigtext.rs).
+    pub word_font: &'static MonoFont<'static>,
+    pub word_scale: i32,
+    /// Left edge of each line's place number (small font) and of its word:
+    /// one block, a number column then the words left-aligned after it,
+    /// centred in the span clear of the tags as wide as the longest word.
+    pub number_x: i32,
+    pub word_x: i32,
+    /// Baselines: the top line, the two word lines, the hint.
+    pub top_y: i32,
+    pub word_y: [i32; 2],
+    pub hint_y: i32,
+    /// The countdown row, all inside the span: the page marker ("1-2 of 5")
+    /// from `marker_x`, the bar (x, y, width, height; its outline drawn
+    /// inside it), and the seconds from `secs_x`. Marker and seconds share
+    /// the baseline `secs_y`.
+    pub marker_x: i32,
+    pub bar: (i32, i32, i32, i32),
+    pub secs_x: i32,
+    pub secs_y: i32,
+}
+
+impl Layout {
+    /// Letters in the longest word a card may show (spoken-token's en-v1
+    /// list: `heartwood_common::spoken_words::WORDLIST_MAX_LEN`).
+    pub const LONGEST_WORD: i32 = 8;
+
+    /// Characters in the longest page marker ("1-2 of 5":
+    /// `heartwood_common::phone_unlock::ENROL_MARKER_MAX_CHARS`).
+    pub const ENROL_MARKER_CHARS: i32 = 8;
+
+    /// Width of a place number and the gap after it.
+    fn number_band(&self) -> i32 {
+        Self::glyph_w(self.font_small()) + self.s(2)
+    }
+
+    /// The largest word font for a card whose lines are a place number and
+    /// one word, across `side`'s span: the header font at 3x or 2x, else the
+    /// small font at 2x, else the header font as it is. On the Heltec that is
+    /// FONT_6X10 at 2x (a place, a gap and eight letters fill its 103 px span
+    /// exactly), 12 px letters with 2 px strokes where the old card drew
+    /// 6 px ones two words a line.
+    pub fn card_word_font(&self, side: Option<TagSide>) -> (&'static MonoFont<'static>, i32) {
+        let (left, right) = self.text_span(side);
+        let room = right - left - self.number_band();
+        [(self.font_header(), 3), (self.font_header(), 2), (self.font_small(), 2)]
+            .into_iter()
+            .find(|(font, scale)| Self::LONGEST_WORD * Self::glyph_w(font) * scale <= room)
+            .unwrap_or((self.font_header(), 1))
+    }
+
+    /// The enrol card's geometry with the button tags on `side`.
+    pub fn enrol_geometry(&self, side: Option<TagSide>) -> EnrolGeometry {
+        let (word_font, word_scale) = self.card_word_font(side);
+        let block = self.number_band() + Self::LONGEST_WORD * Self::glyph_w(word_font) * word_scale;
+        let number_x = self.center_in_span(side, block);
+        let (left, right) = self.text_span(side);
+        let secs_w = 3 * Self::glyph_w(self.font_small());
+        let marker_w = Self::ENROL_MARKER_CHARS * Self::glyph_w(self.font_small());
+        let gap = self.s(2);
+        let bar_x = left + marker_w + gap;
+        let bar_h = self.s(6);
+        let bar_y = self.sy(57);
+        EnrolGeometry {
+            word_font,
+            word_scale,
+            number_x,
+            word_x: number_x + self.number_band(),
+            top_y: self.sy(6),
+            word_y: [self.sy(21), self.sy(40)],
+            hint_y: self.sy(53),
+            marker_x: left,
+            bar: (bar_x, bar_y, right - secs_w - gap - bar_x, bar_h),
+            secs_x: right - secs_w,
+            secs_y: bar_y + bar_h,
+        }
+    }
+}
+
+/// Which edge of the panel carries the button tags (oled.rs
+/// `draw_button_tags`), once the screen's orientation is taken into account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagSide {
+    Left,
+    Right,
 }
 
 #[cfg(test)]
@@ -202,6 +327,71 @@ mod tests {
             assert_eq!(l.word_scale(), expected, "{w}x{h} word scale");
             let widest = 8 * Layout::glyph_w(l.font_large()) * l.word_scale();
             assert!(widest <= w, "{w}x{h}: an 8-letter word ({widest}px) overflows");
+        }
+    }
+
+    #[test]
+    fn text_keeps_clear_of_the_button_tags() {
+        // Heltec: "<PRG" on the left, 4 x 5 px + 1 inset + 2 gap.
+        let heltec = Layout::new(128, 64);
+        assert_eq!(heltec.tag_band(), 23);
+        assert_eq!(heltec.text_span(Some(TagSide::Left)), (23, 126));
+        assert_eq!(heltec.span_chars(Some(TagSide::Left), heltec.font_small()), 20);
+        assert_eq!(heltec.span_chars(None, heltec.font_small()), 24);
+        assert_eq!(heltec.center_in_span(Some(TagSide::Left), 100), 24);
+        // T-Display: "NO>" and "YES>" on the right.
+        let tdisplay = Layout::new(240, 135);
+        let (left, right) = tdisplay.text_span(Some(TagSide::Right));
+        assert_eq!(right, 240 - tdisplay.tag_band());
+        assert!(left < right);
+        // Whatever the panel and side, a centred line never reaches the band.
+        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+            let l = Layout::new(w, h);
+            for side in [Some(TagSide::Left), Some(TagSide::Right), None] {
+                let (left, right) = l.text_span(side);
+                let chars = l.span_chars(side, l.font_small()) as i32;
+                let width = chars * Layout::glyph_w(l.font_small());
+                let x = l.center_in_span(side, width);
+                assert!(x >= left && x + width <= right, "{w}x{h} {side:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_enrol_card_words_are_as_large_as_the_span_allows() {
+        // Heltec, tags either side (the screen turns through 180 degrees):
+        // FONT_6X10 at 2x, a place number, a gap and eight letters filling
+        // the span exactly.
+        let heltec = Layout::new(128, 64);
+        for side in [Some(TagSide::Left), Some(TagSide::Right)] {
+            let g = heltec.enrol_geometry(side);
+            assert_eq!((g.word_font.character_size.width, g.word_scale), (6, 2));
+            let (left, right) = heltec.text_span(side);
+            assert_eq!(g.number_x, left);
+            assert_eq!(g.word_x + 8 * 6 * 2, right);
+        }
+        assert_eq!(heltec.enrol_geometry(Some(TagSide::Left)).word_y, [21, 40]);
+        // T-Display: the 10x20 font at 2x. Portrait C6: its 7x14 at 2x.
+        let t = Layout::new(240, 135).enrol_geometry(Some(TagSide::Right));
+        assert_eq!((t.word_font.character_size.width, t.word_scale), (10, 2));
+        let c6 = Layout::new(172, 320).enrol_geometry(None);
+        assert_eq!((c6.word_font.character_size.width, c6.word_scale), (7, 2));
+        // Every panel and side: the block and the countdown stay in the span,
+        // and the rows run down the screen inside it.
+        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+            let l = Layout::new(w, h);
+            for side in [Some(TagSide::Left), Some(TagSide::Right), None] {
+                let g = l.enrol_geometry(side);
+                let (left, right) = l.text_span(side);
+                let word_w = 8 * Layout::glyph_w(g.word_font) * g.word_scale;
+                assert!(g.number_x >= left && g.word_x + word_w <= right, "{w}x{h} {side:?}");
+                let (bx, by, bw, bh) = g.bar;
+                let marker_w = 8 * Layout::glyph_w(l.font_small());
+                assert!(g.marker_x >= left && g.marker_x + marker_w < bx, "{w}x{h} {side:?}");
+                assert!(bw >= 30 && bx + bw < g.secs_x && g.secs_x + 3 * Layout::glyph_w(l.font_small()) <= right, "{w}x{h} {side:?}");
+                assert!(g.top_y < g.word_y[0] && g.word_y[0] < g.word_y[1] && g.word_y[1] < g.hint_y);
+                assert!(g.hint_y < by && by + bh <= h && g.secs_y <= h, "{w}x{h} {side:?}");
+            }
         }
     }
 

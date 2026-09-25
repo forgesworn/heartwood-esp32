@@ -398,7 +398,7 @@ T-Display (two buttons) and one Heltec (single button).
 
 Approval flow (both boards):
 - [ ] Trigger a network change from Sapwood and let the prompt expire
-      untouched. The screen must show "Request expired / no change made" — not
+      untouched. The screen must show "Expired / no change made" — not
       a stale countdown — and after display sleep, waking must show the idle
       card, never the dead prompt.
 - [ ] T-Display: the prompt names the buttons ("hold lower 2s = yes / tap
@@ -925,7 +925,7 @@ itself.
 4. **Deny by early release.** New ask, press and release inside 2 s: answers
    `user denied` promptly.
 5. **Deny by B (two-button boards).** New ask, press B: answers `user denied`.
-6. **Expiry.** New ask, touch nothing for 30 s: the terminal "request expired"
+6. **Expiry.** New ask, touch nothing for 30 s: the terminal "Expired"
    card appears and the client gets `timeout`.
 7. **Fast hold between passes.** Press and hold for ~2.5 s in one motion,
    releasing quickly. The relay loop only samples once a second, so this is
@@ -2285,6 +2285,280 @@ subscribed to `{"kinds":[24135]}`).
    unlocked through round 6. The log says "phones told about the relay
    change; recorded", and a reset afterwards has no "relays changed" line.
 
+## 29. Adding an unlock phone over the relay (added 2026-09-25, NOT YET BENCH-RUN)
+
+`enrol_unlock_phone` does over the relay what `PHONE_UNLOCK_CMD` (0x64)
+`{"op":"enrol"}` does over the cable, on the deferred card queue (#64), so the
+relay loop keeps serving while the card is up. Device operator only, behind the
+one-time mutation challenge. The enrol card, cable and relay alike, stays up
+45 s (every other card keeps 30 s). It has a small top line `ADD "<label>"?`, then the request
+code, five words from the phone's enrolment key, a page at a time: words 1
+and 2 (0-3 s after the card opens), then 3 and 4 (4-7 s), then 5 (8-11 s),
+and round again, with no press. A page gives way only after it has been on
+screen its full 4 s, so a loop that stalls (a relay redial, a WiFi rejoin)
+leaves the page up longer rather than skipping the next. Each word has its own line with its place
+number beside it, in 12 px letters on the Heltec (FONT_6X10 at 2x). Below
+them the hint, then the countdown row: the page marker ("1-2 of 5", "3-4 of
+5", "5 of 5"), the bar and the seconds. Until every page has had its full
+dwell on screen and 12 s have passed (one cycle, longer after a stall), the
+card cannot be approved: the hint reads "compare all 5 words", a hold that
+starts then never counts (however long it runs), and a short press does
+nothing (it neither declines nor spends the key); B/NO on a T-Display still
+cancels. A card whose pages could not all be shown in its 45 s expires
+("Expired"), adding nothing. Once the cycle has been shown and the button
+is up, the hint reads
+"on phone? hold PRG" (or YES, or the board's own button words). Nothing
+touches the button tags, with the screen either way up. The owner compares
+the board with the phone that made the key, never with the browser. The
+result screen (PHONE ADDED with the check code in large letters and "else
+revoke N", or NOT DONE) stays up until a fresh press, 5 minutes at most. For
+its first 20 s it holds the screen as before: a relay card queued behind it
+waits, and in WiFi mode a cable command that puts up its own card is
+refused "approval on screen". After that a queued relay card takes over and the result is gone,
+while a cable command runs over the top of it and the result comes back
+about 2 s after (the release of that command's hold does not dismiss it); a
+network status or a note banner likewise shows and hands back.
+Logic and host tests: `common/src/phone_unlock.rs` (relay enrolment section),
+`common/src/spoken_words.rs`; the card's geometry on every panel, orientation
+and page: `firmware/src/layout.rs` and `ui-preview` (`cargo test`, and
+`cargo run` renders `out/enrol-*-page{1,2,3}.png`, `out/enrol-*-armed.png` and
+`out/phone-added-*.png`).
+
+Sapwood and Cambium support are pending follow-ups, and this firmware must
+not ship without them (SECURITY-MODEL, "Adding an unlock phone"). Until they
+land, the bench script stands in for both (`enrol` is itself the phone and
+prints the words to compare; `enrol-for` needs a Cambium that shows the
+words).
+
+Needs a WiFi board with a vault key, unlocked, the device operator key in
+`~/heartwood-bench/operator.key`, `HEARTWOOD_RELAYS` (or `--mgmt-relay`) set to
+the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
+
+1. **Enrol over the relay.** `node scripts/phone-unlock.mjs enrol
+   --over-relay --label "relay phone"`. The script (the phone here) prints
+   five words; the board's card shows the same five words under `ADD "relay
+   phone"?`, two a page ("1 <word>", "2 <word>", then 3 and 4, then 5, with
+   "1-2 of 5" and so on beside the bar), stepping every 4 s without a press,
+   and the owner can read every word off the OLED at arm's length without a
+   camera. The countdown starts at 45 s over the relay (44 s on the cable,
+   whose first draw comes a moment after the card starts); page 1 lasts 4 s
+   either way. The hint reads "compare all 5 words" until page 1 comes round
+   again at 12 s, then "on phone? hold PRG".
+   Nothing prints over the "<PRG" tag (or "NO>"/"YES>" on a T-Display); turn
+   the screen round (`set_display_flip`) and repeat: nothing prints over
+   "PRG>" either. While the card is up, a USB `FIRMWARE_INFO` and a
+   `get_status` over the relay both answer. Hold: PHONE ADDED shows "check
+   code", the code in large letters and "else revoke N", and stays up, well
+   past 20 s, until a fresh press (up to 5 minutes; the panel does not blank
+   under it); the script prints the same check code and "enrolled as id N",
+   and `list` shows the phone. Reset the board and run `listen`: it unlocks.
+
+1b. **A hand-off that never arrived.** Run `enrol-for` with a phone code,
+   but stop the phone's screen before the hand-off arrives (close Cambium).
+   The board still shows PHONE ADDED with "else revoke N"; the phone never
+   shows the check code, so revoke N (`revoke --id N`) and `list` no longer
+   shows it. The check code confirms delivery and catches mix-ups; it cannot
+   catch a swap (the five words are the only defence against one).
+
+2. **Decline and expiry add nothing.** Repeat with a new run and, after the
+   hint has changed to "on phone? hold PRG", press B (or a short press): the
+   script says "refused: declined on the board"; another run left alone:
+   "refused: not confirmed on the board in time" after 45 s, and the board
+   shows "Expired". `list` shows no new record either time.
+
+2b. **No approval before all five words.** New run. When page 3 ("5 of 5")
+   comes up, 8-11 s in, start holding PRG and keep holding until about 16 s
+   (a hold that starts before the gate and runs well past it): nothing
+   happens, no hold bar, the card stays and the pages keep turning, and the
+   hint still reads "compare all 5 words" while the button is down. Let go:
+   the hint changes to "on phone? hold PRG", and a fresh 2 s hold approves.
+   On another run, tap PRG during the first 12 s: nothing happens either, no
+   decline, and the same run can still be approved (the key is not spent).
+   Repeat both over the cable (`enrol` without `--over-relay`): the same. On
+   a T-Display, NO during the first 12 s cancels at once ("declined on the
+   board").
+
+3. **One at a time; a key once.** Start two runs a few seconds apart: the
+   second is refused at once ("another phone is already waiting for a press
+   on the board") while the first card is up. Resend the first run's request
+   by hand after it resolves (same `enrol_pubkey`, fresh challenge): refused
+   at once ("this enrolment key was already used"), no card.
+
+4. **Replay.** Capture the first run's kind-24134 request event and publish
+   it again: no card, and the board logs a replay (inside the RAM id set) or
+   answers `stale_management_challenge`. Reset the board, unlock, and publish
+   it again: `stale_management_challenge`, no card.
+
+5. **Delegates never.** With a per-identity operator set on one identity
+   (`set_identity_operator`), send `enrol_unlock_phone` from that key: refused
+   with "enrol_unlock_phone is a device-level operation and requires the
+   device operator", no card.
+
+6. **Refused before any card.** Each answers at once with no card: a label
+   with a newline or a non-ASCII letter ("label must be printable ASCII"), a
+   board with at-rest encryption off ("set a PIN or vault key first"), and a
+   board already holding 16 phones ("16 phones already enrolled; revoke one
+   first"; the legacy V4 storage-limit run in the phase 6 list can share this
+   setup).
+
+7. **No live relay at the press adds nothing.** A relay counts as live for
+   30 s after it was last heard from (the 20 s ping interval plus 10 s of
+   grace); liveness is judged once, at the press, whatever the card's window.
+   The enrol card's 45 s window leaves room to stage this on the card itself
+   (at 30 s it had to wait behind a sign card): start an enrolment and, as
+   soon as its card is up, cut the board's WiFi uplink at the access point
+   (the board keeps its association, so its sockets stay open but hear
+   nothing). Wait until at least 30 s have passed since the cut, with the
+   card still up (hold with 10 s or less on the countdown). The card turns to
+   NOT DONE "No phone added / see Sapwood", which stays until a press, the
+   log says "no relay was live to carry the answer", and `list`, once the
+   uplink is back, shows no new record. Two things can spoil the run, and
+   neither adds a phone: after 50 s of silence the board drops and redials
+   the session, and a redial with the uplink cut can block the loop past the
+   card's window, so the board may show "Expired" (the script: "not
+   confirmed on the board in time") instead of NOT DONE; start again and
+   cut sooner. If it keeps happening, stage it as before: behind an
+   unapproved sign request, cutting while the sign card is up.
+   Also in this step: a quiet but healthy relay (no cut, no other traffic)
+   must NOT trip this; step 1 run after a minute of idle, holding late in the
+   window, covers it, since the pings every 20 s keep it heard from.
+
+8. **Not sent names the record.** Harder to stage, optional: make the
+   answer's publish fail after the record is written (for example, a relay
+   that closes the socket on any EVENT, as the only configured relay). The
+   board shows NOT DONE "Not sent / revoke id N", the log names N, and
+   `revoke --id N` removes it.
+
+9. **Restart mid-card.** Start an enrolment and reset the board while the card
+   is up. After the unlock, `list` shows no new record and the script times
+   out; a fresh `enrol-for` run from the same phone code is accepted, since
+   the key is remembered in RAM only.
+
+10. **The result screen holds, and lets go.** In WiFi mode unless said
+    otherwise; each sub-step starts from a fresh PHONE ADDED.
+    a. Leave PHONE ADDED alone: it is still up after 2 minutes and goes
+       after 5 (back to the idle screen). A fresh press ends it sooner; the
+       release of the approving hold does not.
+    b. While it is up: a USB `FIRMWARE_INFO` answers at any time and PHONE
+       ADDED stays. An auto-approved request (a kind the client's policy
+       allows) shows its AUTO-SIGNED card for 5 s, then PHONE ADDED comes
+       back.
+    c. A cable NIP-46 request that needs a card is refused "approval on
+       screen" for the first 20 s. After that its card runs over PHONE
+       ADDED, and once answered with a hold, PHONE ADDED comes back after
+       that card's own result (2 s, or the SIGNED card's 5 s) and is not
+       dismissed by that hold's release.
+    d. A second cable enrolment within 20 s of the result is refused
+       "approval on screen", like any cable command that raises a card.
+       After 20 s: one with a used code (refused before any card) leaves
+       PHONE ADDED up; one that raises its card and is left to expire
+       shows "Expired" for about 3 s, then the idle screen, not the old
+       PHONE ADDED.
+    e. Queue a relay sign request behind an enrolment card (any client,
+       unapproved kind). After the press, PHONE ADDED stays up about 20 s
+       before the sign card appears, or goes as soon as the button is
+       pressed again; a sign request that arrives a minute after the press
+       takes over at once. Repeat with a cable enrolment
+       (`phone-unlock.mjs enrol` without `--over-relay`): the same.
+    f. Right after a PHONE ADDED, turn the access point off: a press still
+       dismisses it (a few seconds late at worst, while a rejoin attempt
+       blocks the loop), and after 20 s a cable NIP-46 request is served.
+       Then, with the access point still off, raise a relay card just before
+       turning it off (an unapproved sign request): the card still counts
+       down, can be declined, and expires on time ("Expired"). To show the
+       expiry is what frees the cable, use a frame that is refused under a
+       relay card, not a recovery frame (those take the screen whatever the
+       card is doing): a plaintext USB sign request, `node
+       scripts/nip46-sign.mjs --port <port> --kind 1 --content "offline"`
+       (as `bench-approval-cards.mjs` step 16 sends it), is refused
+       "approval on screen" while the card is still counting down, and the
+       same command sent after "Expired" raises its own sign card (decline
+       it; no power cycle needed). Run it on a board no host has authenticated
+       since boot (Sapwood included; restart first if unsure): the plaintext
+       path is NACKed outright once the bridge is authenticated, which would
+       look like the refusal. (`SET_PIN` will
+       not do: the WiFi loop NACKs it while notes are held; nor will
+       `CONNSLOT_UPDATE`, which needs bridge auth.)
+    g. After the cable enrol card of step 11 (45 s with the loop held), the
+       log shows no "silent (no data/pong); reconnecting" for a quiet relay
+       straight after, and a ping goes out on the next pass.
+    h. Optional, needs section 11's dependant persona: raise a relay card
+       for that persona's action, turn the access point off, then approve
+       it. The card shows "Offline / Nothing was done", not APPROVED, and
+       once the access point is back no reply and no audit rail go out.
+
+10b. **A cable card cannot answer a relay card.** With a relay enrol card up
+    (any page, before or after its gate), send each card-raising cable
+    frame in turn: a `CONNSLOT_UPDATE`, a `BACKUP_EXPORT_REQUEST`, a
+    `SET_OPERATOR`, a `SET_PIN` and a plaintext NIP-46 `sign_event`. Each
+    is refused at once with "approval on screen" and no card of its own;
+    the relay card stays, keeps its page, and is neither approved nor
+    declined. A `PHONE_UNLOCK_CMD` `list` is answered as normal. (The
+    classification is `phone_unlock::cable_frame_claim`; `ui-preview`'s
+    tests check it against every cable arm that can reach the button.)
+
+10d. **Recovery takes the screen over.** Only while the relay card is not
+    armed, since a hold on an armed card is followed to its 2 s by the
+    relay loop without reading the cable, and approves it: use an enrol
+    card mid-gate (before "on phone? hold PRG"), or raise a relay card
+    (an unapproved sign request, or a RECEIVE card) while PRG is already
+    held, so the hold began before the card armed. Holding PRG, send a
+    cable `SET_NET_CONFIG` that keeps the stored `op_mgmt` (`node
+    scripts/net-config.mjs --port <port> --set-config cfg.json`, where
+    cfg.json holds the board's current ssid, password, relays and mode; the
+    script copies op_mgmt from the board and prints the card to expect).
+    Repeat with `PATCH_NET_CONFIG` (`net-relays.mjs --relays` naming the
+    current list), a correctly signed `OTA_BEGIN` (the `ota` tool) and
+    `FACTORY_RESET` (`node scripts/factory-reset-card.mjs --port <port>`), declining each: the relay card is answered Expired at once (its client
+    or the operator gets the usual expiry), and the cable card comes up
+    but does not start its hold bar while the button is still down; only a
+    fresh press after letting go counts. Then, each with a relay card up:
+    - a `SET_NET_CONFIG` that does not parse, a `PATCH_NET_CONFIG` with a
+      stale `base_revision` and an `OTA_BEGIN` with a bad signature or
+      length (send one a second for 10 s) are each answered with their
+      error and cancel nothing: the relay card keeps counting down and
+      can still be approved;
+    - a `SET_NET_CONFIG` whose `op_mgmt` differs from the stored one
+      (`--set-config cfg.json --op-mgmt <another key>`, or `--op-mgmt none`)
+      is refused "approval on screen", like 10b. Sent with no card up, its
+      card reads "Replace operator?" with the new key's first 8 hex digits
+      and "+network" (or "Remove operator?"); decline it. On a USB-bridged
+      board the same card appears. With no relay card up, one whose `op_mgmt`
+      is not a 64 hex digit public key is NACKed "invalid config" with no
+      card (under a relay card it reads as an operator removal and is
+      refused "approval on screen"; no bench script sends one);
+    - with a result younger than 20 s on screen (PHONE ADDED, or "Not sent /
+      revoke id N"), a `FACTORY_RESET` still raises its card; decline it,
+      and the result comes back about 2 s later and waits for a press.
+    Every other card-raising frame is still refused, as in 10b.
+
+10c. **Time under another screen is not reading time.** Over an
+    authenticated cable, send `DISPLAY_FLIP` every 2 s during an enrol
+    card's first 12 s (any frame that repaints works; repeated auto-signs do
+    not, since only the first confirmation draws while a card is up). After
+    each flip the enrol card is drawn again at once (turned round) on the
+    same page, and that page then stays a full 4 s from the redraw, so the
+    hint stays "compare all 5 words" well past 12 s. Keep flipping for the
+    whole window: the card never arms and ends "Expired". Stop flipping
+    mid-way instead: the pages resume, and the card arms once each has had
+    a full 4 s.
+
+11. **Cable card matches.** `phone-unlock.mjs enrol` over USB: the same card
+    layout, pages, markers, gate, five words and 45 s window, and PHONE ADDED
+    shows the check code and the id and stays until a press. On a USB-bridged
+    (not WiFi) board as well: PHONE ADDED is not replaced by the "SIGNER
+    READY" screen when the command returns, survives other cable frames (it
+    is drawn again after each), keeps the panel lit, and a press returns to
+    the idle card. Approve a cable sign request while it is up: the hold
+    that approves it does not dismiss PHONE ADDED, which comes back once
+    the SIGNED card has had its 5 s.
+
+12. **Wire capture.** Subscribe to `{"kinds":[24134,24137]}` during step 1:
+    the only new traffic is the operator's 24134 request, the board's 24134
+    answer (both one `p` tag) and, for `enrol-for`, the 24137 tagged with the
+    one-off rendezvous tag. No event carries the label, the enrolment key or
+    the phone's id in the clear.
+
 ## 30. Destructive cards say ERASE (added 2026-09-25, NOT YET BENCH-RUN)
 
 The factory reset and identity removal cards used a renderer that dropped its
@@ -2292,7 +2566,8 @@ text and drew "HOLD TO SIGN / Factory / Profile / kind 0". Both now draw a
 titled card. Deny each one; do not hold PRG on either.
 
 - [ ] **30a. Factory reset.** Send a factory reset over USB (Sapwood, or
-  `scripts/mgmt-request.mjs`). Expected: "FACTORY RESET / ERASE ALL KEYS /
+  `node scripts/factory-reset-card.mjs --port <port>`, which never plays the
+  press prompt). Expected: "FACTORY RESET / ERASE ALL KEYS /
   notes and pairings too", a 30 s countdown and the hold hint. Tap to deny;
   the board NACKs and keeps every key.
 - [ ] **30b. Identity removal.** Remove a non-default slot from Sapwood.

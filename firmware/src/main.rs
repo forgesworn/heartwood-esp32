@@ -959,6 +959,21 @@ fn main() {
     // Idle info carousel: waking shows page 0 (status); further short presses
     // cycle network, device and notes pages. Sleep resets to page 0.
     let mut idle_page: u8 = 0;
+    // PHONE ADDED after a cable enrolment, held until a press or
+    // phone_unlock::RESULT_HOLD_MAX_MS. The host is waiting on every frame
+    // here, so nothing is refused while it is up: a frame is served as ever,
+    // and the result is drawn again once it has been.
+    let mut held_result: Option<(Instant, phone_unlock_cmd::Added)> = None;
+    // A frame's card is often answered by a hold that is still down when the
+    // handler returns. Until the button has been seen up (or 10 s, in case a
+    // serial bridge pins GPIO 0 low), that press belongs to the card, not to
+    // whatever is on screen now: it must not dismiss a held PHONE ADDED or a
+    // signing confirmation, or page the carousel. The relay loop's
+    // button_settle, for the cable-only loop.
+    let mut button_settle_until: Option<Instant> = None;
+    // When to draw the ready screen after an enrol card that added nothing,
+    // so its "Expired" or "Cancelled" card is read first.
+    let mut awaiting_at: Option<Instant> = None;
 
     // --- Frame dispatch loop ---
     log::info!("Entering frame dispatch loop");
@@ -985,6 +1000,26 @@ fn main() {
 
                     // Signing requests always wake the display (handled above when
                     // the frame arrives).  Between frames, check elapsed idle time.
+                    // A held result runs out at its upper bound; until then
+                    // it keeps the panel lit.
+                    if held_result.as_ref().is_some_and(|(since, _)| {
+                        heartwood_common::phone_unlock::ResultHold::expired(
+                            since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        )
+                    }) {
+                        held_result = None;
+                        idle_page = 0;
+                        draw_idle_page(idle_page, &mut display, loaded_masters.len() as u8, &mut nvs);
+                    }
+                    if held_result.is_some() {
+                        last_activity = Instant::now();
+                    }
+                    if awaiting_at.is_some_and(|at| Instant::now() >= at) {
+                        awaiting_at = None;
+                        if display_on && held_result.is_none() && !confirm::active() {
+                            oled::show_awaiting(&mut display);
+                        }
+                    }
                     if display_on && last_activity.elapsed() >= DISPLAY_TIMEOUT {
                         oled::sleep_display(&mut display);
                         display_on = false;
@@ -995,8 +1030,13 @@ fn main() {
                     // Advance held signing confirmations; restore the idle
                     // card once the last hold expires.
                     if display_on && confirm::service(&mut display) {
-                        idle_page = 0;
-                        draw_idle_page(idle_page, &mut display, loaded_masters.len() as u8, &mut nvs);
+                        // Back to the held result, if one is waiting under it.
+                        if let Some((_, added)) = &held_result {
+                            added.show(&mut display);
+                        } else {
+                            idle_page = 0;
+                            draw_idle_page(idle_page, &mut display, loaded_masters.len() as u8, &mut nvs);
+                        }
                     }
 
                     // PRG button press (active-low GPIO 0) wakes the display.
@@ -1005,16 +1045,24 @@ fn main() {
                     // the cable is re-plugged, and requiring a release made the
                     // device look dead in that state. Waking on press also feels
                     // more immediate on a healthy button.
-                    if buttons.a.is_low() {
+                    if button_settle_until
+                        .is_some_and(|until| !buttons.a.is_low() || Instant::now() >= until)
+                    {
+                        button_settle_until = None;
+                    }
+                    if button_settle_until.is_none() && buttons.a.is_low() {
                         last_activity = Instant::now();
                         if !display_on {
                             oled::wake_display(&mut display);
                             display_on = true;
                             idle_page = 0;
                             log::info!("Display woken by button press");
-                        } else if confirm::dismiss() {
-                            // A press while a signing confirmation is held
-                            // dismisses the run early, back to the idle card.
+                        } else if confirm::dismiss() | held_result.take().is_some() {
+                            // A press while a signing confirmation or a held
+                            // result is up dismisses it (both, when one is
+                            // over the other: `|`, not `||`), back to the idle
+                            // card. The approving press was let go before
+                            // handle_frame returned, so this one is fresh.
                             idle_page = 0;
                         } else if idle_page == 2
                             && display_flip::toggle_if_held(&mut nvs, &mut display, &buttons)
@@ -1379,15 +1427,34 @@ fn main() {
             }
 
             // 0x64 — phones that can unlock this board (enrol / list / revoke)
-            FRAME_TYPE_PHONE_UNLOCK_CMD => phone_unlock_cmd::handle_frame(
-                &mut usb,
-                &frame.payload,
-                &mut nvs,
-                &loaded_masters,
-                policy_engine.bridge_authenticated,
-                &mut display,
-                &buttons,
-            ),
+            // PHONE ADDED is held (held_result) until a fresh press. The
+            // approving press does not dismiss it: handle_frame waits for it
+            // to be released before it returns.
+            FRAME_TYPE_PHONE_UNLOCK_CMD => {
+                let screen = phone_unlock_cmd::handle_frame(
+                    &mut usb,
+                    &frame.payload,
+                    &mut nvs,
+                    &loaded_masters,
+                    policy_engine.bridge_authenticated,
+                    &mut display,
+                    &buttons,
+                );
+                match screen {
+                    // Refused before its card, or not an enrolment: a held
+                    // result stays.
+                    phone_unlock_cmd::Screen::Untouched => {}
+                    // A new card went up and added nothing: an older PHONE
+                    // ADDED drawn again after it would read as this phone
+                    // having been added, so it goes, once "Expired" or
+                    // "Cancelled" has been on screen a moment.
+                    phone_unlock_cmd::Screen::NothingAdded => {
+                        held_result = None;
+                        awaiting_at = Some(Instant::now() + Duration::from_secs(3));
+                    }
+                    phone_unlock_cmd::Screen::Added(added) => held_result = Some((Instant::now(), added)),
+                }
+            }
 
             // 0x63 — vault unlock in the main loop is a no-op (the device is
             // already unlocked to be here); NACK so host bugs are visible.
@@ -1533,6 +1600,10 @@ fn main() {
             }
         }
 
+        if buttons.a.is_low() {
+            button_settle_until = Some(Instant::now() + Duration::from_secs(10));
+        }
+
         // Reset activity timestamp after every handler returns.  This is
         // especially important after sign_event, which can hold the button
         // loop for up to 30 seconds -- without this reset the display would
@@ -1546,7 +1617,19 @@ fn main() {
         if !matches!(frame_type,
             FRAME_TYPE_OTA_BEGIN | FRAME_TYPE_OTA_CHUNK | FRAME_TYPE_OTA_FINISH
         ) {
-            oled::show_awaiting(&mut display);
+            // A held PHONE ADDED comes back after anything that drew over
+            // it, unless a signing confirmation is being held (its end
+            // brings the result back, in the poll loop above).
+            match &held_result {
+                Some((_, added)) if !confirm::active() => added.show(&mut display),
+                Some(_) => {}
+                // An enrol card's outcome is left up a moment (awaiting_at).
+                None if awaiting_at.is_some() && frame_type == FRAME_TYPE_PHONE_UNLOCK_CMD => {}
+                None => {
+                    awaiting_at = None;
+                    oled::show_awaiting(&mut display);
+                }
+            }
         }
     }
 }

@@ -503,10 +503,8 @@ impl PhoneCmd {
         match w.op.as_str() {
             "enrol" => {
                 let hex = w.enrol_pubkey.ok_or("enrol needs enrol_pubkey")?;
-                let bytes = crate::hex::hex_decode(&hex).map_err(|_| "enrol_pubkey is not hex")?;
-                let enrol_pubkey: [u8; 32] =
-                    bytes.try_into().map_err(|_| "enrol_pubkey must be 32 bytes")?;
-                let label = w.label.unwrap_or_default().trim().into();
+                let enrol_pubkey = enrol_pubkey_from_hex(&hex)?;
+                let label = enrol_label(w.label.as_deref().unwrap_or_default())?;
                 Ok(PhoneCmd::Enrol { enrol_pubkey, label })
             }
             "list" => Ok(PhoneCmd::List),
@@ -517,6 +515,28 @@ impl PhoneCmd {
             _ => Err("unknown phone-unlock op"),
         }
     }
+}
+
+/// A label as the board keeps and shows it: trimmed, and printable ASCII.
+/// It is the requester's text, and the enrol card draws it under the request
+/// code, so a label that could break a line could draw a code of its own
+/// where the owner looks for the real one, and a glyph the fonts cannot draw
+/// could hide what it says.
+fn enrol_label(raw: &str) -> Result<String, &'static str> {
+    // Checked before trimming: `trim` would quietly drop Unicode spaces.
+    if !raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        return Err(LABEL_ASCII_ERROR);
+    }
+    Ok(raw.trim().into())
+}
+
+/// Labels are printable ASCII: one line, and nothing the board's fonts
+/// would draw as something else.
+pub const LABEL_ASCII_ERROR: &str = "label must be printable ASCII (letters, digits, spaces, punctuation)";
+
+fn enrol_pubkey_from_hex(hex: &str) -> Result<[u8; 32], &'static str> {
+    let bytes = crate::hex::hex_decode(hex).map_err(|_| "enrol_pubkey is not hex")?;
+    bytes.try_into().map_err(|_| "enrol_pubkey must be 32 bytes")
 }
 
 /// The `list` answer. Ids and labels only; nothing that unlocks.
@@ -539,6 +559,666 @@ pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
         "ephemeral_pubkey": hex_lower(&e.ephemeral_pubkey),
         "sealed": e.sealed,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Enrolment over the relay (kind-24134 management, deferred approval)
+// ---------------------------------------------------------------------------
+//
+// The cable enrols with frame 0x64 {"op":"enrol"}. Over the relay the same
+// enrolment is the management method `enrol_unlock_phone`: from the device
+// operator only (never a per-identity delegate; a NIP-46 client has no route
+// to management at all), behind the one-time mutation challenge like every
+// other change, and held on the board's button as a card (#64) rather than
+// blocking the relay loop. What comes back is the cable's answer unchanged,
+// so the manager (Sapwood, once it supports this) hands it to the phone
+// exactly as after a cable enrolment, and the phone cannot tell which way it
+// came.
+//
+// Two codes, both spoken-token tokens of
+// HMAC-SHA256(key, utf8(context) || counter_be32), counter 0.
+//
+//   request code  key = the phone's enrolment key P, FIVE words of the
+//                 2048-word list (spoken_words: word i is
+//                 uint16_be(digest[2i..2i+2]) % 2048, i in 0..5, from digest
+//                 bytes 0..10, so 55 bits). On the board's card BEFORE the
+//                 press, and on the phone, which made P: the owner holds only
+//                 if the two match. The browser that relayed the request may
+//                 show them too, as a convenience, but that proves nothing:
+//                 whoever relays the request can swap in a key of their own.
+//                 The bound: a compromised browser holds P from the moment the
+//                 owner pastes the phone's code, before it sends anything, so
+//                 it can grind a key of its own whose words match for as long
+//                 as the owner waits for a card. Each try is a key generation
+//                 and an HMAC; 55 bits is about 3.6e16 tries, weeks on one GPU
+//                 and hours even on a large rented rack, against an owner who
+//                 waits minutes. 44 bits was about half an hour on one GPU. A
+//                 table built beforehand does not help: P is fresh each time.
+//   check code    key = the board's one-off hand-off key, 3 bytes of hex,
+//                 shown "ABC 123". On the board after the press, in Sapwood
+//                 and on the phone. It confirms delivery and catches mix-ups
+//                 (a stale or crossed hand-off); it does NOT prove the board
+//                 sent the hand-off the phone holds. The hand-off comes from an
+//                 unauthenticated one-off key, so whoever has already swapped
+//                 P can grind 24 bits for a hand-off key whose code matches.
+//                 The five words are the only defence against a swap. An
+//                 authenticated hand-off (the board signing (E, P) with its
+//                 paired identity) is a parked follow-up.
+
+/// The management method that adds a phone over the relay.
+pub const ENROL_METHOD: &str = "enrol_unlock_phone";
+/// Advertised in `get_status.capabilities` by firmware that serves it.
+pub const RELAY_ENROL_CAPABILITY: &str = "phone_enrol_relay_v1";
+/// spoken-token context of the request code (key: the enrolment key P).
+pub const REQUEST_CODE_CONTEXT: &str = "heartwood-unlock:enrol-request";
+/// spoken-token context of the check code (key: the hand-off key).
+pub const CHECK_CODE_CONTEXT: &str = "heartwood-unlock:enrol-check";
+/// How many enrolment keys a board remembers as used this boot.
+pub const USED_ENROL_KEYS_MAX: usize = 16;
+
+fn spoken_digest(key: &[u8; 32], context: &str) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(context.as_bytes());
+    mac.update(&0u32.to_be_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+/// How many words the request code has.
+pub const REQUEST_CODE_WORDS: usize = 5;
+
+/// The request code's words: spoken-token's
+/// `deriveToken(P, 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 5 })`,
+/// word i from digest bytes 2i and 2i + 1.
+pub fn request_words(enrol_pubkey: &[u8; 32]) -> [&'static str; REQUEST_CODE_WORDS] {
+    let digest = spoken_digest(enrol_pubkey, REQUEST_CODE_CONTEXT);
+    core::array::from_fn(|i| crate::spoken_words::word_for(&digest[2 * i..2 * i + 2]))
+}
+
+/// The code the enrol card shows before the press, from the phone's
+/// enrolment key P: five words, space-joined, as spoken-token returns them.
+/// The phone that made P shows the same; the owner holds only if they match.
+pub fn request_code(enrol_pubkey: &[u8; 32]) -> String {
+    request_words(enrol_pubkey).join(" ")
+}
+
+/// The code the board, Sapwood and the phone show after the press, from the
+/// board's one-off hand-off key: spoken-token hex, 6 characters, "ABC 123".
+/// It confirms delivery and catches mix-ups; it cannot prove the board made
+/// the hand-off (see the module notes above).
+pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
+    let d = spoken_digest(ephemeral_pubkey, CHECK_CODE_CONTEXT);
+    let hex = alloc::format!("{:02X}{:02X}{:02X}", d[0], d[1], d[2]);
+    alloc::format!("{} {}", &hex[..3], &hex[3..])
+}
+
+/// How long the enrol card stays up, on the cable and over the relay: half
+/// as long again as the 30 s every other card has. The five words are the
+/// only defence against a swapped enrolment key, and on the Heltec's 128x64
+/// OLED the owner reads them a page at a time and compares each with the
+/// phone (bench, 2026-09-25: at 30 s the card went before they had been
+/// read; 60 s was then judged too long).
+pub const ENROL_CARD_SECS: u32 = 45;
+
+/// How many pages the enrol card steps through: two words a page, so 1 and 2,
+/// then 3 and 4, then 5.
+pub const ENROL_PAGES: usize = REQUEST_CODE_WORDS.div_ceil(2);
+
+/// How long each page of the enrol card stays up before the next, with no
+/// press (a press answers the card).
+pub const ENROL_PAGE_SECS: u32 = 4;
+
+/// The least time the enrol card refuses a hold: one full cycle of its pages
+/// (12 s). [`EnrolGate`] also waits for every page to have had its full
+/// dwell on screen, which a stalled loop can make later still.
+pub const ENROL_GATE_MS: u64 = ENROL_PAGES as u64 * ENROL_PAGE_SECS as u64 * 1000;
+
+/// The page an undisturbed enrol card shows `elapsed_secs` whole seconds
+/// after it opened (previews and docs). The loops themselves turn pages with
+/// [`EnrolGate`], which only moves on from a page that has been on screen for
+/// its full dwell.
+pub fn enrol_page(elapsed_secs: u32) -> usize {
+    (elapsed_secs / ENROL_PAGE_SECS) as usize % ENROL_PAGES
+}
+
+/// The longest page marker, in characters.
+pub const ENROL_MARKER_MAX_CHARS: usize = 8;
+
+/// Where page `page` sits in the code, drawn beside the countdown: "1-2 of
+/// 5", "3-4 of 5", "5 of 5".
+pub fn enrol_page_marker(page: usize) -> &'static str {
+    match page % ENROL_PAGES {
+        0 => "1-2 of 5",
+        1 => "3-4 of 5",
+        _ => "5 of 5",
+    }
+}
+
+/// The enrol card's pages and press gate, stepped by both loops (relay.rs
+/// `tick_button_card`, `approval::run_enrol_approval_loop` on the cable) every
+/// time they look at the card, with the milliseconds since it opened and
+/// whether the A button is down. The caller draws the page `step` returns
+/// whenever it changes, so the page this holds is the page on screen.
+///
+/// A page gives way to the next only once it has been on screen for its full
+/// `ENROL_PAGE_SECS`, however long the loop took to look again, so a loop
+/// that stalls (a relay redial, a WiFi rejoin) cannot skip a page. The card
+/// arms, and a hold starts to count, only once every page has had its full
+/// dwell, [`ENROL_GATE_MS`] has passed and the button has been seen up since:
+/// a hold, or a tap, that began before that never approves or declines
+/// anything, and a hold on page 1 alone would rest on two words, 22 bits,
+/// which a compromised browser grinds in moments. Armed stays armed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnrolGate {
+    page: usize,
+    /// When the page on screen was first drawn; `None` before the first look.
+    page_since_ms: Option<u64>,
+    /// Pages that have completed a full dwell (at most `ENROL_PAGES`).
+    dwelt: usize,
+    armed: bool,
+}
+
+impl EnrolGate {
+    /// One look at the card; returns the page to have on screen.
+    pub fn step(&mut self, elapsed_ms: u64, button_down: bool) -> usize {
+        let dwell = u64::from(ENROL_PAGE_SECS) * 1000;
+        match self.page_since_ms {
+            None => self.page_since_ms = Some(elapsed_ms),
+            Some(since) if elapsed_ms.saturating_sub(since) >= dwell => {
+                self.dwelt = (self.dwelt + 1).min(ENROL_PAGES);
+                self.page = (self.page + 1) % ENROL_PAGES;
+                self.page_since_ms = Some(elapsed_ms);
+            }
+            Some(_) => {}
+        }
+        if self.dwelt >= ENROL_PAGES && elapsed_ms >= ENROL_GATE_MS && !button_down {
+            self.armed = true;
+        }
+        self.page
+    }
+
+    /// Something else was drawn over the card and it has just been drawn
+    /// again (`elapsed_ms` since it opened): the page on screen starts its
+    /// dwell afresh, so time the words were hidden never counts towards the
+    /// gate. A card drawn over again and again only expires.
+    pub fn restart_page(&mut self, elapsed_ms: u64) {
+        if self.page_since_ms.is_some() {
+            self.page_since_ms = Some(elapsed_ms);
+        }
+    }
+
+    /// The page on screen.
+    pub fn page(&self) -> usize {
+        self.page
+    }
+
+    /// Whether a hold now counts.
+    pub fn armed(&self) -> bool {
+        self.armed
+    }
+}
+
+/// What one page of the enrol card draws: a top line naming what is asked,
+/// with the requester's label in quotes, and below it this page's words, one
+/// a line, each with its place in the code (1 to 5). The label never shares a
+/// line with a word, and its quotes keep it from reading as words even when
+/// it is spelt like them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnrolCard {
+    pub top: String,
+    /// `(place, word)`, place counted from 1, at most two a page.
+    pub lines: Vec<(usize, String)>,
+}
+
+/// Page `page` of the enrol card for these words and label (a page past the
+/// last wraps round). `top_max_chars` is how many small-font characters the
+/// top line holds on this panel, clear of the button tags
+/// (`Layout::span_chars`: 20 on the Heltec); a label that would overflow it
+/// is shortened inside its quotes with "..", since it is only a description
+/// (the words are the check). Labels are printable ASCII, so a character is a
+/// byte.
+pub fn enrol_card(words: &[&str; REQUEST_CODE_WORDS], label: &str, top_max_chars: usize, page: usize) -> EnrolCard {
+    // `ADD "` + label + `"?`
+    const FRAME: usize = 7;
+    let room = top_max_chars.saturating_sub(FRAME);
+    let label = if label.len() <= room {
+        String::from(label)
+    } else {
+        alloc::format!("{}..", &label[..room.saturating_sub(2).min(label.len())])
+    };
+    let first = (page % ENROL_PAGES) * 2;
+    EnrolCard {
+        top: alloc::format!("ADD \"{label}\"?"),
+        lines: (first..(first + 2).min(REQUEST_CODE_WORDS))
+            .map(|i| (i + 1, String::from(words[i])))
+            .collect(),
+    }
+}
+
+/// The enrol card's hint line. Before the gate ([`EnrolGate`]) it asks for
+/// the comparison and offers no hold: "compare all 5 words". After it, the
+/// question that matters, whether the phone shows the same words, ahead of
+/// the shortest form of the board's button hint. At most 20 characters, so
+/// it fits the Heltec's span clear of its tag. `tags` is `Some(cancel)`
+/// where the board labels its buttons on the screen edge (with "NO" when
+/// there is a cancel button), `None` where it does not; `button_b` whether a
+/// second button cancels; `armed` whether a hold now counts.
+pub fn enrol_hint(tags: Option<bool>, button_b: bool, armed: bool) -> &'static str {
+    if !armed {
+        return "compare all 5 words";
+    }
+    match (tags, button_b) {
+        (Some(true), _) => "on phone? hold YES",
+        (Some(false), _) => "on phone? hold PRG",
+        (None, true) => "on phone? A=yes B=no",
+        (None, false) => "on phone? hold 2s",
+    }
+}
+
+/// How an enrol card ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardOutcome {
+    Approved,
+    Denied,
+    Expired,
+}
+
+/// What the board shows once an enrol card resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnrolResult {
+    /// Added, and the answer reached a live relay: the check code, and the
+    /// id to revoke if the phone never shows that code.
+    Done { id: u32 },
+    /// Added, but no live relay took the answer: its secret left nowhere.
+    NotSent { id: u32 },
+    /// Pressed, but refused at the press: nothing was written.
+    NotAdded,
+    Declined,
+    Expired,
+}
+
+impl EnrolResult {
+    /// Whether this screen holds the display ([`ResultHold`]): every pressed
+    /// outcome does, since each carries something to read or act on.
+    pub fn holds(self) -> bool {
+        matches!(self, EnrolResult::Done { .. } | EnrolResult::NotSent { .. } | EnrolResult::NotAdded)
+    }
+}
+
+/// The result screen for a card's outcome: `added` is the id of a record
+/// written at the press, `delivered` whether a relay that counted as live at
+/// the press took the answer.
+pub fn enrol_result(outcome: CardOutcome, added: Option<u32>, delivered: bool) -> EnrolResult {
+    match (outcome, added) {
+        (CardOutcome::Approved, Some(id)) if delivered => EnrolResult::Done { id },
+        (CardOutcome::Approved, Some(id)) => EnrolResult::NotSent { id },
+        (CardOutcome::Approved, None) => EnrolResult::NotAdded,
+        // A record is only ever written after a press.
+        (CardOutcome::Denied, _) => EnrolResult::Declined,
+        (CardOutcome::Expired, _) => EnrolResult::Expired,
+    }
+}
+
+/// How long a result screen keeps the display against anything waiting for
+/// it (a relay card queued behind, a cable command that draws its own card):
+/// what every result held before it stayed up until a press. Nothing waits
+/// longer for the screen than it did then.
+pub const RESULT_HOLD_MS: u64 = 20_000;
+
+/// The most a result screen stays up with nothing waiting and no press: long
+/// enough to walk to the phone and compare the check code (bench, 2026-09-25:
+/// at 20 s the owner had to photograph it), short enough that a board left
+/// alone returns to its idle screen.
+pub const RESULT_HOLD_MAX_MS: u64 = 300_000;
+
+/// A result screen holding the display: until a fresh press, until something
+/// waiting for the screen has let it stand [`RESULT_HOLD_MS`], or at most
+/// [`RESULT_HOLD_MAX_MS`]. It arms only once the button has been seen up, so
+/// the release of the hold that approved the card cannot dismiss its own
+/// result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResultHold {
+    armed: bool,
+}
+
+/// What a result hold does on one pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldStep {
+    Hold,
+    Release,
+}
+
+impl ResultHold {
+    /// Whether a hold that began `elapsed_ms` ago has run its longest. Needs
+    /// no button state, so anything that asks whether the screen is taken can
+    /// ask it on any pass, whatever the network is doing.
+    pub fn expired(elapsed_ms: u64) -> bool {
+        elapsed_ms >= RESULT_HOLD_MAX_MS
+    }
+
+    /// Whether a hold that began `elapsed_ms` ago gives way to something
+    /// waiting for the screen.
+    pub fn yields(elapsed_ms: u64) -> bool {
+        elapsed_ms >= RESULT_HOLD_MS
+    }
+
+    /// Something else took the button over the top of the result (a cable
+    /// card, answered by a hold): ignore presses again until the button has
+    /// been seen up, so that card's release does not dismiss the result.
+    pub fn await_release(&mut self) {
+        self.armed = false;
+    }
+
+    /// One pass: `button_down` is whether A is held now, `pressed` whether a
+    /// press finished since the last pass (A released, or B), `waiting`
+    /// whether a card is queued for the screen. Presses seen before the hold
+    /// arms are the approving hold's own, and are ignored.
+    pub fn step(&mut self, elapsed_ms: u64, button_down: bool, pressed: bool, waiting: bool) -> HoldStep {
+        if Self::expired(elapsed_ms) || (waiting && Self::yields(elapsed_ms)) {
+            return HoldStep::Release;
+        }
+        if !self.armed {
+            if !button_down {
+                self.armed = true;
+            }
+            return HoldStep::Hold;
+        }
+        if pressed {
+            HoldStep::Release
+        } else {
+            HoldStep::Hold
+        }
+    }
+}
+
+/// How long after a relay was last heard from it still counts as able to
+/// carry an answer: one ping interval plus a grace for the pong's jitter and
+/// round trip, so a quiet healthy relay is not taken for a dead one.
+pub const ANSWER_LIVE_GRACE_MS: u64 = 10_000;
+
+/// Whether a relay last heard from `since_rx_ms` ago counts as live, for a
+/// board that pings every `ping_interval_ms`.
+pub fn heard_recently(since_rx_ms: u64, ping_interval_ms: u64) -> bool {
+    since_rx_ms < ping_interval_ms.saturating_add(ANSWER_LIVE_GRACE_MS)
+}
+
+impl PhoneCmd {
+    /// A relay management request as a phone command, or `None` when the
+    /// method is not one. `list_unlock_phones`, `revoke_unlock_phone {id}`,
+    /// `set_announce_operator {on}` and `enrol_unlock_phone {enrol_pubkey,
+    /// label?}`. Enrolment takes no other field: one this firmware does not
+    /// understand may be one that matters.
+    pub fn from_mgmt(method: &str, params: Option<&serde_json::Value>) -> Option<Result<Self, &'static str>> {
+        let field = |name: &str| params.and_then(|p| p.get(name));
+        Some(match method {
+            "list_unlock_phones" => Ok(PhoneCmd::List),
+            "revoke_unlock_phone" => field("id")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .map(|id| PhoneCmd::Revoke { id })
+                .ok_or("revoke_unlock_phone requires params.id"),
+            "set_announce_operator" => field("on")
+                .and_then(|v| v.as_bool())
+                .map(|on| PhoneCmd::SetAnnounceOperator { on })
+                .ok_or("set_announce_operator requires params.on"),
+            ENROL_METHOD => (|| {
+                let hex = field("enrol_pubkey")
+                    .and_then(|v| v.as_str())
+                    .ok_or("enrol_unlock_phone requires params.enrol_pubkey")?;
+                if params
+                    .and_then(|p| p.as_object())
+                    .is_some_and(|o| o.keys().any(|k| k != "enrol_pubkey" && k != "label"))
+                {
+                    return Err("enrol_unlock_phone takes only enrol_pubkey and label");
+                }
+                let enrol_pubkey = enrol_pubkey_from_hex(hex)?;
+                let label = match field("label") {
+                    None => String::new(),
+                    Some(v) => enrol_label(v.as_str().ok_or("label must be a string")?)?,
+                };
+                Ok(PhoneCmd::Enrol { enrol_pubkey, label })
+            })(),
+            _ => return None,
+        })
+    }
+}
+
+/// What a USB frame claims of the screen in the WiFi-standalone loop, from
+/// its type and (for PHONE_UNLOCK_CMD) its payload: `types::cable_frame_card`
+/// with the enrolment split resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CableClaim {
+    /// Raises no card.
+    Free,
+    /// Raises a card: refused while a relay card is up.
+    Card,
+    /// Raises a card and takes the screen over from a relay card.
+    Recovery,
+}
+
+/// [`CableClaim`] for one frame. Only `{"op":"enrol"}` with a valid key
+/// raises a card among the phone commands; list, revoke and
+/// set_announce_operator never do, and a command that does not parse is
+/// answered with an error and no card. `stored_net_config` is the stored
+/// network config blob, read for SET_NET_CONFIG only (`None` elsewhere): that
+/// frame is a recovery only when it keeps the stored operator
+/// (`net_config::set_net_config_keeps_operator`), and otherwise an ordinary
+/// card.
+pub fn cable_frame_claim(frame_type: u8, payload: &[u8], stored_net_config: Option<&[u8]>) -> CableClaim {
+    use crate::types::CableCard;
+    match crate::types::cable_frame_card(frame_type) {
+        CableCard::Never => CableClaim::Free,
+        CableCard::Always => CableClaim::Card,
+        CableCard::Recovery => CableClaim::Recovery,
+        CableCard::RecoveryIfOperatorKept => {
+            if crate::net_config::set_net_config_keeps_operator(payload, stored_net_config) {
+                CableClaim::Recovery
+            } else {
+                CableClaim::Card
+            }
+        }
+        CableCard::IfEnrol => match PhoneCmd::parse(payload) {
+            Ok(PhoneCmd::Enrol { .. }) => CableClaim::Card,
+            _ => CableClaim::Free,
+        },
+    }
+}
+
+/// The screen as a cable recovery card finds it in the WiFi-standalone loop
+/// (relay.rs `RelayScreen`): the relay cards up or queued, and the latched
+/// press. There is deliberately no way to reach a held result from here: a
+/// takeover leaves it standing, and `poll_usb` draws it again after the
+/// recovery card, so a "revoke id N" is never lost to one.
+pub trait RecoveryScreen {
+    /// Relay cards on screen or queued behind it.
+    fn relay_cards(&self) -> usize;
+    /// Answer the front relay card Expired, exactly as if its window had run
+    /// (publishing what an expiry publishes).
+    fn expire_front_card(&mut self);
+    /// Drop the latched press edge and release.
+    fn clear_press(&mut self);
+}
+
+/// Take the screen for a cable recovery card ([`CableClaim::Recovery`]) that
+/// is about to go up: called by the handler straight before its approval
+/// loop, after its own parse, signature, revision and authorisation checks,
+/// so a frame that is refused, or garbage, never touches a relay card. Every
+/// relay card is answered Expired, front first, and the latched press is
+/// cleared; the cable card then arms only once the button has been seen up
+/// (`button_arm`), so no hold the owner began for a relay card can answer it.
+/// Returns how many relay cards were answered.
+pub fn take_screen_for_recovery<S: RecoveryScreen + ?Sized>(screen: &mut S) -> usize {
+    // Bounded by the count at the start, whatever an expiry does.
+    let cards = screen.relay_cards();
+    for _ in 0..cards {
+        screen.expire_front_card();
+    }
+    screen.clear_press();
+    cards
+}
+
+/// Enrolment keys already answered this boot. A phone makes a fresh one-off
+/// key per enrolment, so the same key again is a host resending a command it
+/// has already sent (a retrying request helper queued three extra enrols
+/// behind one press on 2026-09-24, and the secrets of the records they made
+/// were never read). RAM only: after a restart a key that never completed
+/// may be tried again, which is harmless, since it completed nothing.
+#[derive(Default)]
+pub struct UsedEnrolKeys {
+    keys: Vec<[u8; 32]>,
+}
+
+impl UsedEnrolKeys {
+    /// Mark `key` used. False if it already was.
+    pub fn claim(&mut self, key: &[u8; 32]) -> bool {
+        if self.keys.contains(key) {
+            return false;
+        }
+        if self.keys.len() >= USED_ENROL_KEYS_MAX {
+            self.keys.remove(0);
+        }
+        self.keys.push(*key);
+        true
+    }
+}
+
+/// Why an enrolment was refused. Every refusal adds nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnrolRefusal {
+    /// A per-identity delegate asked over the relay.
+    NotDeviceOperator,
+    /// An enrolment is already waiting on the board's button.
+    AnotherPending,
+    /// This enrolment key was already used this boot.
+    KeyUsed,
+    LabelTooLong,
+    Locked,
+    /// At-rest encryption is off, so there is no data key to wrap.
+    NoDataKey,
+    NoRelays,
+    /// Sixteen phones already.
+    Full,
+    /// The device operator changed while the card was up.
+    OperatorChanged,
+    /// The press came with no relay live to carry the answer.
+    NoRelaySession,
+    /// The answer would not fit the free heap: refused before the record is
+    /// written, so nothing is kept that could not be handed over.
+    LowMemory,
+}
+
+impl EnrolRefusal {
+    pub fn message(self) -> String {
+        use crate::data_key::{LABEL_MAX, MAX_PHONES};
+        match self {
+            EnrolRefusal::NotDeviceOperator => {
+                alloc::format!("{ENROL_METHOD} is a device-level operation and requires the device operator")
+            }
+            EnrolRefusal::AnotherPending => "another phone is already waiting for a press on the board".into(),
+            EnrolRefusal::KeyUsed => "this enrolment key was already used: start again on the phone".into(),
+            EnrolRefusal::LabelTooLong => alloc::format!("label longer than {LABEL_MAX} bytes"),
+            EnrolRefusal::Locked => "unlock the board first".into(),
+            EnrolRefusal::NoDataKey => "phone unlock opens encrypted storage: set a PIN or vault key first".into(),
+            EnrolRefusal::NoRelays => "phone unlock needs WiFi relays configured".into(),
+            EnrolRefusal::Full => alloc::format!("{MAX_PHONES} phones already enrolled; revoke one first"),
+            EnrolRefusal::OperatorChanged => {
+                "the device operator changed while the card was up: nothing was added".into()
+            }
+            EnrolRefusal::NoRelaySession => "no relay was live to carry the answer: nothing was added".into(),
+            EnrolRefusal::LowMemory => "device low on memory: nothing was added, retry shortly".into(),
+        }
+    }
+}
+
+/// What the board knows when it decides whether an enrolment can go ahead.
+#[derive(Clone, Copy, Debug)]
+pub struct EnrolFacts {
+    pub label_len: usize,
+    /// Identities present and none still sealed.
+    pub unlocked: bool,
+    /// This boot holds the data key the phone's record will wrap.
+    pub data_key: bool,
+    pub relays: bool,
+    pub phones: usize,
+}
+
+/// The board-state refusals, in the order the cable has always checked them.
+/// Asked before any card, and again when the card is pressed.
+pub fn enrol_refusal(f: &EnrolFacts) -> Option<EnrolRefusal> {
+    if f.label_len > crate::data_key::LABEL_MAX {
+        Some(EnrolRefusal::LabelTooLong)
+    } else if !f.unlocked {
+        Some(EnrolRefusal::Locked)
+    } else if !f.data_key {
+        Some(EnrolRefusal::NoDataKey)
+    } else if !f.relays {
+        Some(EnrolRefusal::NoRelays)
+    } else if f.phones >= crate::data_key::MAX_PHONES {
+        Some(EnrolRefusal::Full)
+    } else {
+        None
+    }
+}
+
+/// Who may ask over the relay, before anything else is looked at: the device
+/// operator, with no other enrolment waiting on the button. A delegate is
+/// refused first, so it learns nothing about the board.
+pub fn relay_enrol_gate(device_operator: bool, enrolment_pending: bool) -> Option<EnrolRefusal> {
+    if !device_operator {
+        Some(EnrolRefusal::NotDeviceOperator)
+    } else if enrolment_pending {
+        Some(EnrolRefusal::AnotherPending)
+    } else {
+        None
+    }
+}
+
+/// What the relay answers when the card queue has no room.
+pub const BUSY_ERROR: &str = "signer is busy with another approval; retry shortly";
+
+/// The relay's admission of an `enrol_unlock_phone`, in its fixed order (the
+/// one-time mutation challenge is already spent by then, like every
+/// mutation's): who is asking, whether another enrolment waits, the request
+/// itself, the board, room in the card queue, and last the enrolment key's
+/// claim, so no refusal before it burns the phone's code. Each stage runs
+/// only if every stage before it passed. The firmware passes its own
+/// closures; the host tests pass recording ones.
+pub fn admit_relay_enrol<P>(
+    device_operator: bool,
+    enrolment_pending: bool,
+    parse: impl FnOnce() -> Result<P, String>,
+    board: impl FnOnce(&P) -> Result<(), String>,
+    room: impl FnOnce(&P) -> bool,
+    claim: impl FnOnce(&P) -> bool,
+) -> Result<P, String> {
+    if let Some(refusal) = relay_enrol_gate(device_operator, enrolment_pending) {
+        return Err(refusal.message());
+    }
+    let request = parse()?;
+    board(&request)?;
+    if !room(&request) {
+        return Err(BUSY_ERROR.into());
+    }
+    if !claim(&request) {
+        return Err(EnrolRefusal::KeyUsed.message());
+    }
+    Ok(request)
+}
+
+/// At the press: the operator that asked must still be the device operator,
+/// a relay must be live to carry the answer (a record whose hand-off cannot
+/// leave would be an orphan), and the board must still be able to enrol.
+pub fn relay_enrol_completion(
+    operator_current: bool,
+    relay_live: bool,
+    facts: &EnrolFacts,
+) -> Option<EnrolRefusal> {
+    if !operator_current {
+        Some(EnrolRefusal::OperatorChanged)
+    } else if !relay_live {
+        Some(EnrolRefusal::NoRelaySession)
+    } else {
+        enrol_refusal(facts)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -841,6 +1521,678 @@ mod tests {
         phones.enrol(3, "Pixel", &[1u8; 32], &[2u8; 32], &[0u8; 12]).unwrap();
         let v = list_json(&phones, false);
         assert_eq!(v, serde_json::json!({"phones":[{"id":3,"label":"Pixel"}],"max":16,"announce_operator":false}));
+    }
+
+    // --- Enrolment over the relay -------------------------------------------
+
+    fn good_facts() -> EnrolFacts {
+        EnrolFacts { label_len: 7, unlocked: true, data_key: true, relays: true, phones: 0 }
+    }
+
+    /// Vectors from spoken-token itself; the check-code pair (2.0.4, hex) is
+    /// the one Cambium's EnrolmentTest and scripts/lib/phone-unlock.test.mjs
+    /// already pin.
+    #[test]
+    fn codes_are_spoken_token_hex_tokens() {
+        assert_eq!(check_code(&[0xAB; 32]), "9B6 164");
+        assert_eq!(check_code(&[0x00; 32]), "EF1 645");
+        // Five words, 55 bits, from spoken-token 2.1.0's
+        // deriveToken(P, 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 5 }).
+        assert_eq!(request_code(&[0xAB; 32]), "swim behind stand bugle female");
+        assert_eq!(request_code(&[0x00; 32]), "talent humble reform admit narrow");
+        assert_eq!(request_code(&[0x42; 32]), "profit buddy moment aim kitten");
+        assert_eq!(request_code(&[0xFF; 32]), "what attitude price easy large");
+        assert_eq!(request_words(&[0xAB; 32]), ["swim", "behind", "stand", "bugle", "female"]);
+    }
+
+    #[test]
+    fn the_enrol_card_keeps_the_words_to_their_own_lines() {
+        let words = request_words(&[0xAB; 32]);
+        // The Heltec's top line, clear of its "<PRG" tag: 20 small-font
+        // characters (firmware/src/layout.rs, `span_chars`, pinned by
+        // `text_keeps_clear_of_the_button_tags` in the ui-preview tests).
+        const HELTEC_TOP: usize = 20;
+        // One word a line, numbered with its place in the code, two lines a
+        // page: 1 and 2, then 3 and 4, then 5.
+        let line = |n: usize, w: &str| (n, String::from(w));
+        assert_eq!(
+            enrol_card(&words, "Pixel 8", HELTEC_TOP, 0),
+            EnrolCard { top: "ADD \"Pixel 8\"?".into(), lines: vec![line(1, "swim"), line(2, "behind")] }
+        );
+        assert_eq!(enrol_card(&words, "Pixel 8", HELTEC_TOP, 1).lines, vec![line(3, "stand"), line(4, "bugle")]);
+        assert_eq!(enrol_card(&words, "Pixel 8", HELTEC_TOP, 2).lines, vec![line(5, "female")]);
+        // A page past the last wraps round rather than drawing nothing.
+        assert_eq!(enrol_card(&words, "Pixel 8", HELTEC_TOP, ENROL_PAGES).lines, vec![line(1, "swim"), line(2, "behind")]);
+        // Every word appears once across the pages, in order.
+        let all: Vec<(usize, String)> =
+            (0..ENROL_PAGES).flat_map(|p| enrol_card(&words, "", HELTEC_TOP, p).lines).collect();
+        assert_eq!(all, (1..=REQUEST_CODE_WORDS).map(|n| line(n, words[n - 1])).collect::<Vec<_>>());
+        assert_eq!(enrol_card(&words, "phone", HELTEC_TOP, 0).top, "ADD \"phone\"?");
+        // A long label is shortened inside its quotes on the top line, never
+        // wrapped onto a word line; a wide panel shows it whole.
+        let long = "Sixteen chars 16";
+        assert_eq!(enrol_card(&words, long, HELTEC_TOP, 0).top, "ADD \"Sixteen cha..\"?");
+        assert_eq!(enrol_card(&words, long, HELTEC_TOP, 0).top.len(), HELTEC_TOP);
+        assert_eq!(enrol_card(&words, long, 29, 0).top, "ADD \"Sixteen chars 16\"?");
+        assert_eq!(enrol_card(&words, long, 3, 0).top, "ADD \"..\"?");
+        for max in 0..30 {
+            let top = enrol_card(&words, long, max, 0).top;
+            assert!(top.len() <= max.max(9), "{max}: {top}");
+        }
+        // Even a label spelt as words is quoted on the top line, so it reads
+        // as a name and never as a row of words.
+        let card = enrol_card(&words, "stand bugle", HELTEC_TOP, 1);
+        assert_eq!(card.lines[0].1, "stand");
+        assert_eq!(card.top, "ADD \"stand bugle\"?");
+        for (_, word) in &card.lines {
+            assert!(!word.contains('"'));
+        }
+
+        // A label is the requester's text. One that could break a line could
+        // draw words of its own where the owner looks for the real ones, and
+        // a glyph the ASCII fonts cannot draw could hide what it says. So:
+        // printable ASCII, one line, and always drawn after "for ".
+        let pk = "ab".repeat(32);
+        for label in [
+            "x\nswim behind", "x\rswim", "tab\there", "nul\u{0}", "del\u{7f}", "nel\u{85}x", "Zoë's phone",
+            "\u{2028}x", "\u{200b}swim", "ｓｗｉｍ",
+        ] {
+            let json = serde_json::json!({ "op": "enrol", "enrol_pubkey": pk, "label": label }).to_string();
+            assert_eq!(PhoneCmd::parse(json.as_bytes()), Err(LABEL_ASCII_ERROR), "{label:?}");
+            let params = serde_json::json!({ "enrol_pubkey": pk, "label": label });
+            assert_eq!(PhoneCmd::from_mgmt(ENROL_METHOD, Some(&params)), Some(Err(LABEL_ASCII_ERROR)), "{label:?}");
+        }
+        for label in ["Pixel 8 Pro", "Zoe's phone", "a-b_c.d/e (1)!", "~"] {
+            let params = serde_json::json!({ "enrol_pubkey": pk, "label": label });
+            assert!(matches!(PhoneCmd::from_mgmt(ENROL_METHOD, Some(&params)), Some(Ok(_))), "{label:?}");
+        }
+    }
+
+    #[test]
+    fn management_methods_map_onto_the_cable_commands() {
+        let pk = "ab".repeat(32);
+        let enrol = serde_json::json!({ "enrol_pubkey": pk, "label": " Pixel 8 " });
+        assert_eq!(
+            PhoneCmd::from_mgmt(ENROL_METHOD, Some(&enrol)),
+            Some(Ok(PhoneCmd::Enrol { enrol_pubkey: [0xAB; 32], label: "Pixel 8".into() }))
+        );
+        let no_label = serde_json::json!({ "enrol_pubkey": pk });
+        assert_eq!(
+            PhoneCmd::from_mgmt(ENROL_METHOD, Some(&no_label)),
+            Some(Ok(PhoneCmd::Enrol { enrol_pubkey: [0xAB; 32], label: String::new() }))
+        );
+        assert_eq!(PhoneCmd::from_mgmt("list_unlock_phones", None), Some(Ok(PhoneCmd::List)));
+        assert_eq!(
+            PhoneCmd::from_mgmt("revoke_unlock_phone", Some(&serde_json::json!({ "id": 7 }))),
+            Some(Ok(PhoneCmd::Revoke { id: 7 }))
+        );
+        assert_eq!(
+            PhoneCmd::from_mgmt("set_announce_operator", Some(&serde_json::json!({ "on": false }))),
+            Some(Ok(PhoneCmd::SetAnnounceOperator { on: false }))
+        );
+        // The messages the relay has always answered with.
+        assert_eq!(
+            PhoneCmd::from_mgmt("revoke_unlock_phone", Some(&serde_json::json!({ "id": -1 }))),
+            Some(Err("revoke_unlock_phone requires params.id"))
+        );
+        assert_eq!(
+            PhoneCmd::from_mgmt("revoke_unlock_phone", Some(&serde_json::json!({ "id": 4_294_967_296u64 }))),
+            Some(Err("revoke_unlock_phone requires params.id"))
+        );
+        assert_eq!(PhoneCmd::from_mgmt("set_announce_operator", None), Some(Err("set_announce_operator requires params.on")));
+        // Enrolment is strict: a field this firmware does not understand may
+        // be one that matters, so it is refused rather than ignored.
+        for (params, why) in [
+            (None, "enrol_unlock_phone requires params.enrol_pubkey"),
+            (Some(serde_json::json!({})), "enrol_unlock_phone requires params.enrol_pubkey"),
+            (Some(serde_json::json!({ "enrol_pubkey": "abcd" })), "enrol_pubkey must be 32 bytes"),
+            (Some(serde_json::json!({ "enrol_pubkey": "zz".repeat(32) })), "enrol_pubkey is not hex"),
+            (Some(serde_json::json!({ "enrol_pubkey": 7 })), "enrol_unlock_phone requires params.enrol_pubkey"),
+            (Some(serde_json::json!({ "enrol_pubkey": pk, "label": 7 })), "label must be a string"),
+            (Some(serde_json::json!({ "enrol_pubkey": pk, "relays": [] })), "enrol_unlock_phone takes only enrol_pubkey and label"),
+            (Some(serde_json::json!([pk])), "enrol_unlock_phone requires params.enrol_pubkey"),
+        ] {
+            assert_eq!(PhoneCmd::from_mgmt(ENROL_METHOD, params.as_ref()), Some(Err(why)), "{params:?}");
+        }
+        // Anything else is not a phone command at all.
+        for method in ["enrol", "unlock_phone_enrol", "get_status", "create_client", ""] {
+            assert_eq!(PhoneCmd::from_mgmt(method, None), None, "{method}");
+        }
+    }
+
+    #[test]
+    fn an_enrolment_key_is_used_once_and_the_memory_is_bounded() {
+        let mut used = UsedEnrolKeys::default();
+        assert!(used.claim(&[1u8; 32]));
+        assert!(!used.claim(&[1u8; 32]), "the same key again is a resend");
+        for i in 2..=(USED_ENROL_KEYS_MAX as u8) {
+            assert!(used.claim(&[i; 32]));
+        }
+        assert!(!used.claim(&[1u8; 32]), "still remembered at the cap");
+        assert!(used.claim(&[0xEE; 32]));
+        assert!(used.claim(&[1u8; 32]), "the oldest makes room once the cap is passed");
+        assert!(!used.claim(&[0xEE; 32]));
+    }
+
+    #[test]
+    fn enrolment_is_refused_in_a_fixed_order_and_only_when_it_must_be() {
+        assert_eq!(enrol_refusal(&good_facts()), None);
+        assert_eq!(
+            enrol_refusal(&EnrolFacts { phones: crate::data_key::MAX_PHONES - 1, ..good_facts() }),
+            None,
+            "the sixteenth phone fits"
+        );
+        assert_eq!(
+            enrol_refusal(&EnrolFacts { phones: crate::data_key::MAX_PHONES, ..good_facts() }),
+            Some(EnrolRefusal::Full)
+        );
+        assert_eq!(
+            enrol_refusal(&EnrolFacts { label_len: crate::data_key::LABEL_MAX + 1, ..good_facts() }),
+            Some(EnrolRefusal::LabelTooLong)
+        );
+        assert_eq!(enrol_refusal(&EnrolFacts { unlocked: false, ..good_facts() }), Some(EnrolRefusal::Locked));
+        assert_eq!(enrol_refusal(&EnrolFacts { data_key: false, ..good_facts() }), Some(EnrolRefusal::NoDataKey));
+        assert_eq!(enrol_refusal(&EnrolFacts { relays: false, ..good_facts() }), Some(EnrolRefusal::NoRelays));
+        // A locked board says only that it is locked, whatever else is true.
+        let worst = EnrolFacts { label_len: 3, unlocked: false, data_key: false, relays: false, phones: 99 };
+        assert_eq!(enrol_refusal(&worst), Some(EnrolRefusal::Locked));
+        assert_eq!(
+            enrol_refusal(&EnrolFacts { data_key: false, relays: false, phones: 99, ..good_facts() }),
+            Some(EnrolRefusal::NoDataKey)
+        );
+        assert_eq!(enrol_refusal(&EnrolFacts { relays: false, phones: 99, ..good_facts() }), Some(EnrolRefusal::NoRelays));
+    }
+
+    #[test]
+    fn over_the_relay_only_the_device_operator_asks_and_only_one_waits() {
+        assert_eq!(relay_enrol_gate(true, false), None);
+        assert_eq!(relay_enrol_gate(true, true), Some(EnrolRefusal::AnotherPending));
+        // A delegate learns nothing, not even that a card is up.
+        assert_eq!(relay_enrol_gate(false, false), Some(EnrolRefusal::NotDeviceOperator));
+        assert_eq!(relay_enrol_gate(false, true), Some(EnrolRefusal::NotDeviceOperator));
+    }
+
+    #[test]
+    fn a_pressed_card_rechecks_authority_a_relay_and_the_board() {
+        assert_eq!(relay_enrol_completion(true, true, &good_facts()), None);
+        assert_eq!(relay_enrol_completion(false, true, &good_facts()), Some(EnrolRefusal::OperatorChanged));
+        assert_eq!(relay_enrol_completion(false, false, &good_facts()), Some(EnrolRefusal::OperatorChanged));
+        assert_eq!(
+            relay_enrol_completion(true, false, &good_facts()),
+            Some(EnrolRefusal::NoRelaySession),
+            "no answer could reach the phone: add nothing rather than an orphan"
+        );
+        // Whatever changed while the card was up is caught at the press.
+        assert_eq!(
+            relay_enrol_completion(true, true, &EnrolFacts { data_key: false, ..good_facts() }),
+            Some(EnrolRefusal::NoDataKey)
+        );
+        assert_eq!(
+            relay_enrol_completion(true, true, &EnrolFacts { phones: crate::data_key::MAX_PHONES, ..good_facts() }),
+            Some(EnrolRefusal::Full)
+        );
+    }
+
+    #[test]
+    fn the_enrol_hint_fits_the_narrowest_span() {
+        for tags in [Some(true), Some(false), None] {
+            for b in [true, false] {
+                for armed in [true, false] {
+                    let hint = enrol_hint(tags, b, armed);
+                    assert!(hint.len() <= 20, "{hint}");
+                }
+                assert!(enrol_hint(tags, b, true).starts_with("on phone? "));
+            }
+        }
+    }
+
+    #[test]
+    fn the_result_screen_says_done_only_for_an_answer_that_left() {
+        use CardOutcome::*;
+        assert_eq!(enrol_result(Approved, Some(9), true), EnrolResult::Done { id: 9 });
+        assert_eq!(enrol_result(Approved, Some(9), false), EnrolResult::NotSent { id: 9 });
+        assert_eq!(enrol_result(Approved, None, true), EnrolResult::NotAdded);
+        assert_eq!(enrol_result(Approved, None, false), EnrolResult::NotAdded);
+        assert_eq!(enrol_result(Denied, None, false), EnrolResult::Declined);
+        assert_eq!(enrol_result(Expired, None, true), EnrolResult::Expired);
+        // Every pressed outcome holds the screen; a decline or expiry does not.
+        assert!(EnrolResult::Done { id: 1 }.holds());
+        assert!(EnrolResult::NotSent { id: 1 }.holds());
+        assert!(EnrolResult::NotAdded.holds());
+        assert!(!EnrolResult::Declined.holds());
+        assert!(!EnrolResult::Expired.holds());
+    }
+
+    #[test]
+    fn a_result_hold_outlasts_the_approving_press_and_ends_on_a_new_one() {
+        // The approving hold is still down when the result appears; its
+        // release must not dismiss the screen.
+        let mut hold = ResultHold::default();
+        assert_eq!(hold.step(0, true, false, false), HoldStep::Hold);
+        assert_eq!(hold.step(300, false, true, false), HoldStep::Hold, "the approving hold's own release");
+        assert_eq!(hold.step(600, false, false, false), HoldStep::Hold);
+        assert_eq!(hold.step(900, true, false, false), HoldStep::Hold, "a new press, still down");
+        assert_eq!(hold.step(1_200, false, true, false), HoldStep::Release, "a new press, released");
+
+        // Left alone with nothing waiting, it stays up long past the old
+        // 20 s, and ends only at its upper bound, armed or not.
+        let mut idle = ResultHold::default();
+        assert_eq!(idle.step(0, false, false, false), HoldStep::Hold);
+        assert_eq!(idle.step(RESULT_HOLD_MS, false, false, false), HoldStep::Hold);
+        assert_eq!(idle.step(120_000, false, false, false), HoldStep::Hold, "two minutes to compare");
+        assert_eq!(idle.step(RESULT_HOLD_MAX_MS - 1, false, false, false), HoldStep::Hold);
+        assert_eq!(idle.step(RESULT_HOLD_MAX_MS, false, false, false), HoldStep::Release);
+        let mut stuck = ResultHold::default();
+        assert_eq!(
+            stuck.step(RESULT_HOLD_MAX_MS, true, true, false),
+            HoldStep::Release,
+            "a button held down forever"
+        );
+
+        // Another card's approving hold, over the top of a held result, is
+        // not a press on the result: after await_release its release is
+        // ignored until the button has been seen up.
+        let mut interrupted = ResultHold::default();
+        assert_eq!(interrupted.step(0, false, false, false), HoldStep::Hold);
+        interrupted.await_release();
+        assert_eq!(interrupted.step(30_000, true, false, false), HoldStep::Hold);
+        assert_eq!(interrupted.step(31_000, false, true, false), HoldStep::Hold, "the other card's release");
+        assert_eq!(interrupted.step(32_000, false, true, false), HoldStep::Release, "a fresh press");
+
+        // Expiry needs no button state, so the loop can ask it on any pass.
+        assert!(!ResultHold::expired(RESULT_HOLD_MAX_MS - 1));
+        assert!(ResultHold::expired(RESULT_HOLD_MAX_MS));
+        // A few minutes, not seconds, and never forever.
+        const { assert!(RESULT_HOLD_MAX_MS >= 120_000 && RESULT_HOLD_MAX_MS <= 600_000) };
+    }
+
+    #[test]
+    fn a_waiting_card_takes_over_a_result_after_the_old_hold() {
+        // Nothing that waits for the screen waits longer than it did when
+        // every result ended at RESULT_HOLD_MS.
+        let mut hold = ResultHold::default();
+        assert_eq!(hold.step(0, false, false, true), HoldStep::Hold);
+        assert_eq!(hold.step(RESULT_HOLD_MS - 1, false, false, true), HoldStep::Hold);
+        assert_eq!(hold.step(RESULT_HOLD_MS, false, false, true), HoldStep::Release);
+        // Unarmed (the approving hold never let go) still gives way.
+        let mut pinned = ResultHold::default();
+        assert_eq!(pinned.step(RESULT_HOLD_MS, true, false, true), HoldStep::Release);
+        // Something that turns up later takes over at once.
+        let mut late = ResultHold::default();
+        assert_eq!(late.step(0, false, false, false), HoldStep::Hold);
+        assert_eq!(late.step(90_000, false, false, false), HoldStep::Hold);
+        assert_eq!(late.step(91_000, false, false, true), HoldStep::Release);
+        assert!(!ResultHold::yields(RESULT_HOLD_MS - 1));
+        assert!(ResultHold::yields(RESULT_HOLD_MS));
+    }
+
+    #[test]
+    fn the_enrol_card_shows_every_word_before_it_can_be_approved() {
+        // Half as long again as the shared 30 s: long enough to read five
+        // words a page at a time and compare them with the phone.
+        assert_eq!(ENROL_CARD_SECS, 45);
+        assert_eq!(ENROL_PAGES, REQUEST_CODE_WORDS.div_ceil(2));
+        // Pages turn on EnrolGate, which both loops step: looked at once a
+        // second, page 1 for 0-3 s, page 2 for 4-7, page 3 for 8-11, then
+        // round.
+        let mut gate = EnrolGate::default();
+        let pages: Vec<usize> = (0..ENROL_CARD_SECS).map(|s| gate.step(u64::from(s) * 1000, false)).collect();
+        for (second, page) in pages.iter().enumerate() {
+            assert_eq!(*page, (second / ENROL_PAGE_SECS as usize) % ENROL_PAGES, "second {second}");
+        }
+        // Every run lasts the full dwell, bar the last, which the expiry cuts.
+        let runs: Vec<&[usize]> = pages.chunk_by(|a, b| a == b).collect();
+        assert!(runs[..runs.len() - 1].iter().all(|run| run.len() == ENROL_PAGE_SECS as usize));
+        // The gate is exactly one full cycle: all five words have been on
+        // screen before a hold can count, and the window leaves more than
+        // 30 s to hold after it, while every page comes round twice more.
+        assert_eq!(ENROL_GATE_MS, u64::from(ENROL_PAGE_SECS) * ENROL_PAGES as u64 * 1000);
+        let gate_secs = (ENROL_GATE_MS / 1000) as usize;
+        let before: Vec<usize> = pages[..gate_secs].to_vec();
+        for page in 0..ENROL_PAGES {
+            assert!(before.contains(&page), "page {page} before the gate");
+            let after = pages[gate_secs..]
+                .chunk_by(|a, b| a == b)
+                .filter(|run| run[0] == page && run.len() == ENROL_PAGE_SECS as usize)
+                .count();
+            assert!(after >= 2, "page {page} shown {after} full times after the gate");
+        }
+        assert!(ENROL_CARD_SECS as usize - gate_secs > 30);
+        // Never a page out of range, however long.
+        let mut long = EnrolGate::default();
+        for ms in [0, 1, 11_000, 12_000, 44_000, 45_000, 1_000_000, u64::MAX] {
+            assert!(long.step(ms, false) < ENROL_PAGES);
+        }
+    }
+
+    #[test]
+    fn no_hold_that_starts_before_the_gate_approves_the_enrol_card() {
+        let dwell = u64::from(ENROL_PAGE_SECS) * 1000;
+        // A loop that looks every second: pages turn after their full dwell
+        // and the card arms as the third page's dwell completes, at 12 s.
+        let mut g = EnrolGate::default();
+        let mut pages = Vec::new();
+        for second in 0..=12u64 {
+            pages.push(g.step(second * 1000, false));
+            assert_eq!(g.armed(), second >= 12, "second {second}");
+        }
+        assert_eq!(pages, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0]);
+        assert!(g.step(20_000, true) == g.page() && g.armed(), "armed stays armed: a hold from here counts");
+
+        // A short press during the gate is harmless: ignored, not a decline,
+        // and the card still arms once the button is up after the gate.
+        let mut tap = EnrolGate::default();
+        for ms in (0..=12_000).step_by(500) {
+            tap.step(ms, (3_000..3_400).contains(&ms));
+        }
+        assert!(tap.armed());
+
+        // A hold that starts before the gate never counts, however long it
+        // runs past it; only a fresh press after it can.
+        let mut early = EnrolGate::default();
+        for ms in (0..=15_000).step_by(1_000) {
+            early.step(ms, ms >= 10_000);
+            assert!(!early.armed(), "{ms}: still the hold that began at 10 s");
+        }
+        early.step(15_100, false);
+        assert!(early.armed());
+
+        // The loop stalls (a redial, a WiFi rejoin) with page 1 on screen:
+        // page 1 has had its dwell, but pages 2 and 3 were never drawn, so
+        // the gate stays shut however much time has passed, and each page
+        // still gets its full dwell once the loop is back.
+        let mut stalled = EnrolGate::default();
+        assert_eq!(stalled.step(0, false), 0);
+        assert_eq!(stalled.step(20_000, false), 1, "page 1 was on screen throughout");
+        assert!(!stalled.armed(), "20 s gone, but pages 2 and 3 never shown");
+        assert_eq!(stalled.step(20_000 + dwell - 1, false), 1);
+        assert_eq!(stalled.step(20_000 + dwell, false), 2);
+        assert!(!stalled.armed());
+        assert_eq!(stalled.step(40_000, false), 0);
+        assert!(stalled.armed(), "every page has now had its full dwell");
+
+        // Something else drew over the card (a confirmation, a status):
+        // the page on screen starts its dwell again once the card is back,
+        // so time spent hidden never counts as time read.
+        let mut hidden = EnrolGate::default();
+        hidden.step(0, false);
+        hidden.step(3_000, false);
+        hidden.restart_page(3_500);
+        assert_eq!(hidden.step(4_000, false), 0, "page 1 was hidden from 3 s");
+        assert_eq!(hidden.step(7_499, false), 0);
+        assert_eq!(hidden.step(7_500, false), 1, "a full dwell after it came back");
+        // Drawn over every second, the card never arms: it only expires.
+        let mut flooded = EnrolGate::default();
+        for ms in (0..=45_000).step_by(1_000) {
+            flooded.step(ms, false);
+            flooded.restart_page(ms);
+        }
+        assert!(!flooded.armed());
+        assert_eq!(flooded.page(), 0);
+
+        // A page is never skipped, whatever the gap between looks.
+        let mut jumpy = EnrolGate::default();
+        let seen: Vec<usize> = [0, 9_000, 9_100, 30_000, 30_100, 45_000].iter().map(|ms| jumpy.step(*ms, false)).collect();
+        assert_eq!(seen, [0, 1, 1, 2, 2, 0]);
+    }
+
+    #[test]
+    fn the_enrol_card_says_where_it_is_and_when_it_can_be_held() {
+        assert_eq!(enrol_page_marker(0), "1-2 of 5");
+        assert_eq!(enrol_page_marker(1), "3-4 of 5");
+        assert_eq!(enrol_page_marker(2), "5 of 5");
+        assert_eq!(enrol_page_marker(ENROL_PAGES), "1-2 of 5");
+        for page in 0..ENROL_PAGES {
+            assert!(enrol_page_marker(page).len() <= ENROL_MARKER_MAX_CHARS);
+        }
+        // Before the gate the hint asks for the comparison and offers no hold.
+        for tags in [Some(true), Some(false), None] {
+            for b in [true, false] {
+                let waiting = enrol_hint(tags, b, false);
+                assert_eq!(waiting, "compare all 5 words");
+                assert!(!waiting.contains("hold") && !waiting.contains("yes"));
+                assert!(enrol_hint(tags, b, true).starts_with("on phone? "));
+            }
+        }
+    }
+
+    #[test]
+    fn only_an_enrolment_raises_a_card_among_phone_commands() {
+        use crate::types::*;
+        let pk = "ab".repeat(32);
+        let enrol = alloc::format!(r#"{{"op":"enrol","enrol_pubkey":"{pk}","label":"p"}}"#);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, enrol.as_bytes(), None), CableClaim::Card);
+        for other in [
+            r#"{"op":"list"}"#,
+            r#"{"op":"revoke","id":3}"#,
+            r#"{"op":"set_announce_operator","on":true}"#,
+            r#"{"op":"enrol"}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, other.as_bytes(), None),
+                CableClaim::Free,
+                "{other}"
+            );
+        }
+        assert_eq!(cable_frame_claim(FRAME_TYPE_CONNSLOT_UPDATE, b"", None), CableClaim::Card);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_FACTORY_RESET, b"", None), CableClaim::Recovery);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_PATCH_NET_CONFIG, b"{}", None), CableClaim::Recovery);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_OTA_BEGIN, b"", None), CableClaim::Recovery);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_FIRMWARE_INFO, b"", None), CableClaim::Free);
+    }
+
+    /// A screen that records what a takeover did to it.
+    struct Screen {
+        cards: alloc::vec::Vec<u32>,
+        expired: alloc::vec::Vec<u32>,
+        press_latched: bool,
+        /// When set, an expiry fails to take the card off (a card that
+        /// could not be answered), to show the takeover still ends.
+        stuck: bool,
+        cleared_after: usize,
+    }
+
+    impl Screen {
+        fn new(cards: &[u32]) -> Self {
+            Screen {
+                cards: cards.to_vec(),
+                expired: alloc::vec::Vec::new(),
+                press_latched: true,
+                stuck: false,
+                cleared_after: usize::MAX,
+            }
+        }
+    }
+
+    impl RecoveryScreen for Screen {
+        fn relay_cards(&self) -> usize {
+            self.cards.len()
+        }
+        fn expire_front_card(&mut self) {
+            self.expired.push(self.cards[0]);
+            if !self.stuck {
+                self.cards.remove(0);
+            }
+        }
+        fn clear_press(&mut self) {
+            self.press_latched = false;
+            self.cleared_after = self.expired.len();
+        }
+    }
+
+    #[test]
+    fn a_recovery_takeover_expires_every_relay_card_and_keeps_the_result() {
+        let mut screen = Screen::new(&[7, 8, 9]);
+        assert_eq!(take_screen_for_recovery(&mut screen), 3);
+        assert!(screen.cards.is_empty());
+        assert_eq!(screen.expired, [7, 8, 9], "front first");
+        assert!(!screen.press_latched);
+        assert_eq!(screen.cleared_after, 3, "the press is cleared after the last expiry");
+        // That the held result stays is not this function's to break (the
+        // trait gives it no way to reach one): what could break it is an
+        // expiry that holds or releases a screen, which ui-preview's scan of
+        // the relay's resolve paths rules out, with `enrol_result` below.
+    }
+
+    #[test]
+    fn a_takeover_with_no_relay_card_only_clears_the_press() {
+        let mut screen = Screen::new(&[]);
+        assert_eq!(take_screen_for_recovery(&mut screen), 0);
+        assert!(screen.expired.is_empty());
+        assert!(!screen.press_latched);
+    }
+
+    #[test]
+    fn an_expired_enrol_card_holds_no_result() {
+        // A takeover answers the enrol card Expired: whatever was added or
+        // delivered, that is a plain "Expired", never a held screen.
+        for added in [None, Some(3)] {
+            for delivered in [true, false] {
+                assert_eq!(enrol_result(CardOutcome::Expired, added, delivered), EnrolResult::Expired);
+                assert!(!enrol_result(CardOutcome::Expired, added, delivered).holds());
+            }
+        }
+    }
+
+    #[test]
+    fn a_takeover_ends_even_if_a_card_will_not_come_off() {
+        let mut screen = Screen::new(&[1, 2]);
+        screen.stuck = true;
+        assert_eq!(take_screen_for_recovery(&mut screen), 2);
+        assert_eq!(screen.expired.len(), 2);
+        assert!(!screen.press_latched);
+    }
+
+    #[test]
+    fn a_network_config_is_a_recovery_only_while_it_keeps_the_operator() {
+        use crate::types::FRAME_TYPE_SET_NET_CONFIG;
+        let config = |op: &str| {
+            alloc::format!(r#"{{"ssid":"s","password":"p","relays":["wss://r.example"],"mode":"wifi","op_mgmt":"{op}"}}"#)
+        };
+        let stored = config(&"ab".repeat(32));
+        let claim = |payload: &str, stored: Option<&str>| {
+            cable_frame_claim(FRAME_TYPE_SET_NET_CONFIG, payload.as_bytes(), stored.map(str::as_bytes))
+        };
+        assert_eq!(claim(&config(&"ab".repeat(32)), Some(&stored)), CableClaim::Recovery);
+        // Handing relay management to another key, or to none, waits behind
+        // a relay card like any other card.
+        assert_eq!(claim(&config(&"cd".repeat(32)), Some(&stored)), CableClaim::Card);
+        assert_eq!(claim(&config(""), Some(&stored)), CableClaim::Card);
+        assert_eq!(claim(&config(&"ab".repeat(32)), None), CableClaim::Card);
+        assert_eq!(claim("{}", Some(&stored)), CableClaim::Card);
+    }
+
+    #[test]
+    fn a_quiet_healthy_relay_still_counts_as_live() {
+        let ping = 20_000;
+        // A pong lands a little after each ping interval.
+        assert!(heard_recently(0, ping));
+        assert!(heard_recently(ping + 3_000, ping), "pong after jitter and a round trip");
+        assert!(heard_recently(ping + ANSWER_LIVE_GRACE_MS - 1, ping));
+        assert!(!heard_recently(ping + ANSWER_LIVE_GRACE_MS, ping));
+        assert!(!heard_recently(u64::MAX, ping));
+    }
+
+    /// The relay's order: the challenge is spent before this runs (every
+    /// mutation's, handle_mgmt_event in relay.rs, pinned by the mgmt test that
+    /// enrol_unlock_phone requires one); then who is asking, then the request,
+    /// then the board, then room in the queue, and only then is the key
+    /// claimed, so no refusal burns the phone's code.
+    #[test]
+    fn a_relay_enrolment_claims_its_key_last() {
+        use core::cell::RefCell;
+        let trace = RefCell::new(Vec::<&str>::new());
+        let run = |operator: bool, pending: bool, parses: bool, board: bool, room: bool, fresh: bool| {
+            trace.borrow_mut().clear();
+            let out = admit_relay_enrol(
+                operator,
+                pending,
+                || {
+                    trace.borrow_mut().push("parse");
+                    if parses { Ok(7u8) } else { Err("bad".to_string()) }
+                },
+                |p: &u8| {
+                    assert_eq!(*p, 7);
+                    trace.borrow_mut().push("board");
+                    if board { Ok(()) } else { Err("locked".to_string()) }
+                },
+                |_: &u8| {
+                    trace.borrow_mut().push("room");
+                    room
+                },
+                |_: &u8| {
+                    trace.borrow_mut().push("claim");
+                    fresh
+                },
+            );
+            (out, trace.borrow().clone())
+        };
+        assert_eq!(run(true, false, true, true, true, true), (Ok(7), vec!["parse", "board", "room", "claim"]));
+        // A delegate: nothing else is even looked at.
+        let (out, steps) = run(false, true, true, true, true, true);
+        assert_eq!(out, Err(EnrolRefusal::NotDeviceOperator.message()));
+        assert!(steps.is_empty());
+        let (out, steps) = run(true, true, true, true, true, true);
+        assert_eq!(out, Err(EnrolRefusal::AnotherPending.message()));
+        assert!(steps.is_empty());
+        // Every refusal before the claim leaves the key unclaimed.
+        assert_eq!(run(true, false, false, true, true, true), (Err("bad".into()), vec!["parse"]));
+        assert_eq!(run(true, false, true, false, true, true), (Err("locked".into()), vec!["parse", "board"]));
+        assert_eq!(
+            run(true, false, true, true, false, true),
+            (Err(BUSY_ERROR.into()), vec!["parse", "board", "room"])
+        );
+        assert_eq!(
+            run(true, false, true, true, true, false),
+            (Err(EnrolRefusal::KeyUsed.message()), vec!["parse", "board", "room", "claim"])
+        );
+    }
+
+    #[test]
+    fn refusal_messages_are_distinct_and_keep_the_cable_wording() {
+        use EnrolRefusal::*;
+        let all = [
+            NotDeviceOperator, AnotherPending, KeyUsed, LabelTooLong, Locked, NoDataKey, NoRelays, Full,
+            OperatorChanged, NoRelaySession, LowMemory,
+        ];
+        let messages: Vec<String> = all.iter().map(|r| r.message()).collect();
+        for (i, m) in messages.iter().enumerate() {
+            assert!(!m.is_empty());
+            assert!(messages.iter().skip(i + 1).all(|n| n != m), "{m}");
+        }
+        // What the cable path has always said, which Sapwood shows as is.
+        assert_eq!(KeyUsed.message(), "this enrolment key was already used: start again on the phone");
+        assert_eq!(LabelTooLong.message(), "label longer than 16 bytes");
+        assert_eq!(Locked.message(), "unlock the board first");
+        assert_eq!(NoDataKey.message(), "phone unlock opens encrypted storage: set a PIN or vault key first");
+        assert_eq!(NoRelays.message(), "phone unlock needs WiFi relays configured");
+        assert_eq!(Full.message(), "16 phones already enrolled; revoke one first");
+        assert_eq!(
+            NotDeviceOperator.message(),
+            "enrol_unlock_phone is a device-level operation and requires the device operator"
+        );
+    }
+
+    /// The enrol answer is what crosses the relay (inside the operator's NIP-44)
+    /// and what Sapwood republishes to the phone: nothing in it names the
+    /// phone, its label or its enrolment key.
+    #[test]
+    fn the_enrol_answer_names_neither_the_phone_nor_its_enrolment_key() {
+        use crate::data_key::PhoneSet;
+        let enrol_sk = [0x42u8; 32];
+        let enrol_pk = crate::derive::public_key_xonly(&enrol_sk).unwrap();
+        let relays = alloc::vec![String::from("wss://relay.example")];
+        let mut phones = PhoneSet::default();
+        let e = enrol(&mut phones, &[0xD0; 32], &enrol_pk, "Pixel 8", &relays, &mut rng_from(5)).unwrap();
+        let answer = enrolment_json(&e).to_string();
+        assert!(!answer.contains("Pixel"));
+        assert!(!answer.contains(&hex_lower(&enrol_pk)));
+        let json = enrolment_json(&e);
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["ephemeral_pubkey", "id", "sealed"]);
+        // The code the board shows after the press is the phone's and Sapwood's.
+        assert_eq!(check_code(&e.ephemeral_pubkey).len(), 7);
     }
 
     // --- Relay changes ------------------------------------------------------

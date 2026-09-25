@@ -379,7 +379,7 @@ docs/
 ### Field-test hardening *(shipped 2026-08-14, v0.16.0)*
 
 - [x] Two-button boards: B is an explicit cancel during approvals, with on-screen button hints ("hold lower 2s = yes / tap upper = no"); a floating second button is detected at boot and ignored
-- [x] Approval timeouts paint an explicit "Request expired / no change made" card — a stale countdown can never linger looking live; browser-driven windows widened to 45 s
+- [x] Approval timeouts paint an explicit "Expired / no change made" card — a stale countdown can never linger looking live; browser-driven windows widened to 45 s
 - [x] Display wakes on button press (not release) — a serial bridge pinning GPIO 0 after a web flash no longer makes the device look dead
 - [x] Idle info carousel: short presses page identity / network / device screens
 - [x] Multiple prioritised WiFi networks with per-SSID password `keep`, join-loop rotation, and redacted list reporting over USB and relay

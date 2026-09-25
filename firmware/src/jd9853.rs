@@ -177,6 +177,7 @@ impl<'a> Jd9853Display<'a> {
 
     /// Blit the back-buffer to the panel.
     pub fn flush(&mut self) -> Result<(), Jd9853Error> {
+        crate::oled::note_draw();
         // Set column window (0–319 in landscape).
         self.cd(0x2A, &[0x00, X_OFFSET as u8,
                          ((X_OFFSET + W - 1) >> 8) as u8,

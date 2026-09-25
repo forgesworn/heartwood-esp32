@@ -18,11 +18,12 @@ use embedded_graphics::{
     mono_font::{MonoFont, MonoTextStyle, MonoTextStyleBuilder},
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{Circle, PrimitiveStyle, Rectangle},
+    primitives::{Circle, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment},
     text::Text,
 };
 use embedded_graphics_simulator::{OutputSettingsBuilder, SimulatorDisplay};
-use layout::Layout;
+use heartwood_common::phone_unlock;
+use layout::{Layout, TagSide};
 use palette::*;
 
 /// A text style in `font` drawn in `colour`.
@@ -247,7 +248,13 @@ fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     let kind_number = ellipsize_chars(&format!("kind {kind}"), l.chars_per_line(l.font_small()));
     Text::new(&kind_number, Point::new(l.sx(2), l.sy(48)), small).draw(d).ok();
 
-    // Countdown bar: muted track + proportional fill coloured by urgency.
+    draw_countdown(d, &l, secs, total);
+}
+
+/// Countdown bar: muted track + proportional fill coloured by urgency
+/// (mirrors `oled::draw_countdown_bar`).
+fn draw_countdown<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, secs: u32, total: u32) {
+    let small = style(l.font_small(), FG);
     let bx = l.sx(2);
     let by = l.sy(52);
     let bw = l.s(100);
@@ -285,6 +292,171 @@ fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     )
     .draw(d)
     .ok();
+}
+
+/// A board's button tags (mirrors `oled::draw_button_tags`): which edge they
+/// sit on, whether there is a cancel button ("NO"), and whether approve is the
+/// upper of the two.
+#[derive(Clone, Copy)]
+struct Tags {
+    side: TagSide,
+    cancel: bool,
+    approve_on_top: bool,
+}
+
+const HELTEC_TAGS: Tags = Tags { side: TagSide::Left, cancel: false, approve_on_top: true };
+const TDISPLAY_TAGS: Tags = Tags { side: TagSide::Right, cancel: true, approve_on_top: false };
+/// The Heltec with its screen turned through 180 degrees (display_flip.rs):
+/// the PRG tag moves to the right-hand edge, level with the lower row.
+const HELTEC_FLIPPED_TAGS: Tags = Tags { side: TagSide::Right, cancel: false, approve_on_top: false };
+
+/// Each tag as (text, colour, position).
+fn tag_items(l: &Layout, tags: Tags) -> Vec<(String, Rgb565, Point)> {
+    let font = l.font_small();
+    let approve = if tags.cancel { "YES" } else { "PRG" };
+    let mut list = vec![(approve, OK, tags.approve_on_top)];
+    if tags.cancel {
+        list.push(("NO", DANGER, !tags.approve_on_top));
+    }
+    list.into_iter()
+        .map(|(word, colour, top)| {
+            let on_right = tags.side == TagSide::Right;
+            let text = if on_right { format!("{word}>") } else { format!("<{word}") };
+            let w = text.len() as i32 * Layout::glyph_w(font);
+            let x = if on_right { l.w - w - l.s(1) } else { l.s(1) };
+            let y = if top { l.sy(10) } else { l.sy(48) };
+            (text, colour, Point::new(x, y))
+        })
+        .collect()
+}
+
+/// One piece of text on a card: (text, font, integer scale, colour, baseline).
+type Item = (String, &'static MonoFont<'static>, i32, Rgb565, Point);
+
+/// Draw one [`Item`] (scaled through bigtext, as the firmware does).
+fn draw_item<D: DrawTarget<Color = Rgb565>>(d: &mut D, (text, font, scale, colour, p): &Item) {
+    bigtext::draw_text_scaled(d, text, *p, font, *scale, *colour);
+}
+
+/// The enrol card's text `elapsed` whole seconds after it opened, one entry
+/// per line. Mirrors `oled::show_enrol_approval`: the top line and hint in
+/// the small font, centred clear of the tags; the page's words (two, two,
+/// one) with their place numbers, at the size `Layout::enrol_geometry`
+/// picks; and the countdown row's page marker and seconds. The hint offers
+/// no hold until the gate has passed (`armed`). The countdown bar is a
+/// rectangle, drawn separately.
+fn enrol_items(
+    l: &Layout,
+    tags: Option<Tags>,
+    words: &[&str; phone_unlock::REQUEST_CODE_WORDS],
+    label: &str,
+    elapsed: u32,
+    armed: bool,
+) -> Vec<Item> {
+    let side = tags.map(|t| t.side);
+    let g = l.enrol_geometry(side);
+    let page = phone_unlock::enrol_page(elapsed);
+    let secs = phone_unlock::ENROL_CARD_SECS.saturating_sub(elapsed);
+    let card = phone_unlock::enrol_card(words, label, l.span_chars(side, l.font_small()), page);
+    let small = l.font_small();
+    let centred = |text: &str, y: i32| Point::new(l.center_in_span(side, text.len() as i32 * Layout::glyph_w(small)), y);
+
+    let mut items: Vec<Item> = vec![(card.top.clone(), small, 1, ACCENT, centred(&card.top, g.top_y))];
+    for ((place, word), y) in card.lines.iter().zip(g.word_y) {
+        items.push((place.to_string(), small, 1, MUTED, Point::new(g.number_x, y)));
+        items.push((word.clone(), g.word_font, g.word_scale, WARN, Point::new(g.word_x, y)));
+    }
+    // A tagged board's cancel button is its second one (T-Display); the
+    // untagged C6 is drawn as a single-button board.
+    let hint = phone_unlock::enrol_hint(tags.map(|t| t.cancel), tags.is_some_and(|t| t.cancel), armed).to_string();
+    let p = centred(&hint, g.hint_y);
+    items.push((hint, small, 1, MUTED, p));
+    items.push((phone_unlock::enrol_page_marker(page).into(), small, 1, MUTED, Point::new(g.marker_x, g.secs_y)));
+    items.push((format!("{secs}s"), small, 1, FG, Point::new(g.secs_x, g.secs_y)));
+    items
+}
+
+/// The enrol card's countdown bar: outline (drawn inside the bar, so a thick
+/// stroke on a large panel cannot poke out of the span) and fill (mirrors
+/// `oled::draw_enrol_countdown`).
+fn draw_enrol_bar<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, side: Option<TagSide>, secs: u32, total: u32) {
+    let (x, y, w, h) = l.enrol_geometry(side).bar;
+    Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32))
+        .into_styled(
+            PrimitiveStyleBuilder::new()
+                .stroke_color(MUTED)
+                .stroke_width(l.s(1) as u32)
+                .stroke_alignment(StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(d)
+        .ok();
+    let pct_left = if total > 0 { secs * 100 / total } else { 0 };
+    let urgency = if pct_left > 50 { OK } else if pct_left > 20 { WARN } else { DANGER };
+    let inner = w - 2 * l.s(2);
+    let fill = if total > 0 { secs as i32 * inner / total as i32 } else { 0 };
+    if fill > 0 {
+        Rectangle::new(Point::new(x + l.s(2), y + l.s(2)), Size::new(fill as u32, (h - 2 * l.s(2)).max(1) as u32))
+            .into_styled(PrimitiveStyle::with_fill(urgency))
+            .draw(d)
+            .ok();
+    }
+}
+
+/// Add-an-unlock-phone card `elapsed` seconds after it opened (mirrors
+/// `oled::show_enrol_approval`).
+fn draw_enrol_card<D: DrawTarget<Color = Rgb565> + Dimensions>(
+    d: &mut D,
+    tags: Option<Tags>,
+    words: &[&str; phone_unlock::REQUEST_CODE_WORDS],
+    label: &str,
+    elapsed: u32,
+) {
+    let l = layout_of(d);
+    d.clear(BG).ok();
+    let total = phone_unlock::ENROL_CARD_SECS;
+    let armed = u64::from(elapsed) * 1000 >= phone_unlock::ENROL_GATE_MS;
+    for item in enrol_items(&l, tags, words, label, elapsed, armed) {
+        draw_item(d, &item);
+    }
+    if let Some(tags) = tags {
+        for (text, colour, p) in tag_items(&l, tags) {
+            Text::new(&text, p, style(l.font_small(), colour)).draw(d).ok();
+        }
+    }
+    draw_enrol_bar(d, &l, tags.map(|t| t.side), total.saturating_sub(elapsed), total);
+}
+
+/// PHONE ADDED's text (mirrors `oled::show_phone_added`): the header and its
+/// rule as every status card has them, then "check code" small, the code
+/// itself at the card words' size, and "else revoke N" small.
+fn phone_added_items(l: &Layout, check: &str, id: u32) -> Vec<Item> {
+    let (font, scale) = l.card_word_font(None);
+    let small = l.font_small();
+    let header = l.font_header();
+    let centred = |text: &str, font: &MonoFont<'_>, scale: i32, y: i32| {
+        Point::new(l.center_x(bigtext::scaled_text_width(text, font, scale)), l.sy(y))
+    };
+    let hint = format!("else revoke {id}");
+    vec![
+        ("PHONE ADDED".into(), header, 1, ACCENT, centred("PHONE ADDED", header, 1, 10)),
+        ("check code".into(), small, 1, MUTED, centred("check code", small, 1, 24)),
+        (check.into(), font, scale, OK, centred(check, font, scale, 43)),
+        (hint.clone(), small, 1, MUTED, centred(&hint, small, 1, 56)),
+    ]
+}
+
+/// PHONE ADDED (mirrors `oled::show_phone_added`).
+fn draw_phone_added<D: DrawTarget<Color = Rgb565> + Dimensions>(d: &mut D, check: &str, id: u32) {
+    let l = layout_of(d);
+    d.clear(BG).ok();
+    for item in phone_added_items(&l, check, id) {
+        draw_item(d, &item);
+    }
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(d)
+        .ok();
 }
 
 /// Hold-to-confirm screen: header, big percentage + progress bar in success
@@ -344,10 +516,17 @@ fn draw_network_status<D>(d: &mut D, title: &str, hint: &str, colour: Rgb565)
 where
     D: DrawTarget<Color = Rgb565> + Dimensions,
 {
+    draw_status_card(d, "NETWORK", title, hint, colour);
+}
+
+/// Any `oled::show_status_card` screen.
+fn draw_status_card<D>(d: &mut D, header_text: &str, title: &str, hint: &str, colour: Rgb565)
+where
+    D: DrawTarget<Color = Rgb565> + Dimensions,
+{
     let l = layout_of(d);
     d.clear(BG).ok();
 
-    let header_text = "NETWORK";
     Text::new(
         header_text,
         Point::new(
@@ -579,10 +758,29 @@ fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565
 fn main() {
     std::fs::create_dir_all("out").unwrap();
     let npub = "npub1sg6plzptd64u62a878hep2kev88swjh3tw00gjsfl8f237lmu63q0uf63m";
-    let boards = [("heltec", 128u32, 64u32), ("tdisplay", 240, 135), ("c6", 172, 320)];
+    let boards = [("heltec", 128u32, 64u32), ("tdisplay", 240, 135), ("c6", 172, 320), ("c6-landscape", 320, 172)];
 
     for (b, w, h) in boards {
         render(&format!("ready-{b}"), w, h, |d| draw_ready(d));
+        let tags = match b {
+            "heltec" => Some(HELTEC_TAGS),
+            "tdisplay" => Some(TDISPLAY_TAGS),
+            _ => None,
+        };
+        let words = phone_unlock::request_words(&[0xAB; 32]);
+        // One render per page, before the gate (0, 4 and 8 s), and page 1
+        // again once it has passed (12 s), when the hint offers the hold.
+        for (name, elapsed) in [("page1", 0), ("page2", 4), ("page3", 8), ("armed", 12)] {
+            render(&format!("enrol-{b}-{name}"), w, h, |d| draw_enrol_card(d, tags, &words, "Pixel 8", elapsed));
+            render(&format!("enrol-longest-{b}-{name}"), w, h, |d| {
+                draw_enrol_card(d, tags, &["abstract", "accident", "acoustic", "absolute", "activity"], "WWWWWWWWWWWWWWWW", elapsed)
+            });
+        }
+        if b == "heltec" {
+            // The screen turned through 180 degrees: "PRG>" bottom right.
+            render("enrol-heltec-flipped-armed", w, h, |d| draw_enrol_card(d, Some(HELTEC_FLIPPED_TAGS), &words, "Pixel 8", 12));
+        }
+        render(&format!("phone-added-{b}"), w, h, |d| draw_phone_added(d, "9B6 164", u32::MAX));
         render(&format!("idle-{b}"), w, h, |d| draw_idle(d, None, npub));
         render(&format!("idle-named-{b}"), w, h, |d| draw_idle(d, Some("TheCryptoDonkey"), npub));
         render(&format!("notes-{b}"), w, h, |d| draw_notes(d, 6, 2, 1));
@@ -798,5 +996,454 @@ mod error_card_tests {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod cable_card_tests {
+    use heartwood_common::phone_unlock::{cable_frame_claim, CableClaim};
+    use heartwood_common::types::{cable_frame_card, CableCard, FRAME_TYPE_PHONE_UNLOCK_CMD};
+    use std::collections::HashMap;
+
+    /// relay.rs helpers that take the whole context but only look after the
+    /// screen's ownership; any other call handed bare `ctx` could reach the
+    /// buttons.
+    const SCREEN_HELPERS: &[&str] = &[
+        "cable_card_refused",
+        "approval_card_open",
+        "screen_busy",
+        "release_card_screen_hold",
+        "hold_card_screen",
+        "interrupt_held_result",
+    ];
+
+    /// Whether an arm's text can reach the button: `ctx.buttons`, the
+    /// button module's globals, or a call (other than a screen helper) that
+    /// is handed the whole context.
+    fn reaches_button(text: &str) -> Option<String> {
+        if text.contains("ctx.buttons") {
+            return Some("ctx.buttons".into());
+        }
+        if text.contains("crate::button::") {
+            return Some("crate::button::".into());
+        }
+        let bytes = text.as_bytes();
+        let mut from = 0;
+        while let Some(at) = text[from..].find("ctx") {
+            let i = from + at;
+            from = i + 3;
+            let before = text[..i].trim_end();
+            let after = text[i + 3..].trim_start();
+            let bare = (before.ends_with('(') || before.ends_with(','))
+                && (after.starts_with(',') || after.starts_with(')'))
+                && !(i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'));
+            if !bare {
+                continue;
+            }
+            // The function this argument list belongs to.
+            let mut depth = 0i32;
+            let mut open = None;
+            for (j, c) in text[..i].char_indices().rev() {
+                match c {
+                    ')' => depth += 1,
+                    '(' if depth == 0 => {
+                        open = Some(j);
+                        break;
+                    }
+                    '(' => depth -= 1,
+                    _ => {}
+                }
+            }
+            let name: String = open
+                .map(|j| {
+                    text[..j]
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let short = name.rsplit("::").next().unwrap_or(&name);
+            if !SCREEN_HELPERS.contains(&short) {
+                return Some(format!("{name}(ctx)"));
+            }
+        }
+        None
+    }
+
+    /// Every arm of the WiFi loop's USB dispatch (relay.rs `poll_usb_frame`)
+    /// that can reach the button may raise a card of its own, and a card
+    /// answered with a relay card waiting leaves a hold that card would read
+    /// as its own approval. So each such frame must be classified as
+    /// card-raising in `types::cable_frame_card`, which the loop refuses
+    /// "approval on screen" (or, for recovery frames, takes the screen over
+    /// from) while a relay card is up; and the fall-through arm must not
+    /// reach the button at all. Scans the source, so a new arm is covered the
+    /// day it lands.
+    #[test]
+    fn every_cable_frame_handed_the_buttons_is_refused_under_a_relay_card() {
+        let types = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../common/src/types.rs")).unwrap();
+        let consts: HashMap<String, u8> = types
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix("pub const ")?;
+                let (name, value) = rest.split_once(": u8 = ")?;
+                let hex = value.split(';').next()?.trim().strip_prefix("0x")?;
+                Some((name.to_string(), u8::from_str_radix(hex, 16).ok()?))
+            })
+            .collect();
+        let relay = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/relay.rs")).unwrap();
+        let start = relay.find("fn poll_usb_frame(").expect("poll_usb_frame is in relay.rs");
+        let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
+        let dispatch = &body[body.find("    match frame.frame_type {").expect("the dispatch match")..];
+        // Arms start at eight spaces of indent with a frame name, or the
+        // fall-through `other =>`; each runs to the next.
+        let mut arms: Vec<String> = Vec::new();
+        for line in dispatch.lines().skip(1) {
+            if line.starts_with("        FRAME_TYPE_") || line.starts_with("        other =>") {
+                arms.push(String::new());
+            }
+            if let Some(arm) = arms.last_mut() {
+                arm.push_str(line);
+                arm.push('\n');
+            }
+        }
+        let mut checked = 0;
+        let mut saw_fallthrough = false;
+        for arm in &arms {
+            let reach = reaches_button(arm);
+            if arm.starts_with("        other =>") {
+                saw_fallthrough = true;
+                assert_eq!(reach, None, "the fall-through arm reaches the button");
+                continue;
+            }
+            let pattern = &arm[..arm.find("=>").expect("an arm has =>")];
+            for name in pattern
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| w.starts_with("FRAME_TYPE_"))
+            {
+                let value = *consts.get(name).unwrap_or_else(|| panic!("{name} not in types.rs"));
+                checked += 1;
+                if let Some(how) = &reach {
+                    assert_ne!(cable_frame_card(value), CableCard::Never, "{name} reaches the button via {how}");
+                }
+            }
+        }
+        assert!(saw_fallthrough, "the fall-through arm was not found");
+        assert!(checked >= 35, "scan found {checked} frames: the parser has drifted");
+
+        // The phone commands split: only a valid enrolment raises a card.
+        let pk = "ab".repeat(32);
+        let enrol = format!(r#"{{"op":"enrol","enrol_pubkey":"{pk}"}}"#);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, enrol.as_bytes(), None), CableClaim::Card);
+        for other in [r#"{"op":"list"}"#, r#"{"op":"revoke","id":1}"#, r#"{"op":"set_announce_operator","on":false}"#] {
+            assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, other.as_bytes(), None), CableClaim::Free, "{other}");
+        }
+    }
+
+    /// A cable recovery frame takes the screen from the relay cards only
+    /// once it will actually raise its card: never before the dispatch, only
+    /// in a recovery arm, after that arm's checks (inside their `Some`) and
+    /// before the card itself. A garbage OTA_BEGIN every second from any
+    /// host used to cancel every relay card, because the takeover fired on
+    /// the frame type alone. And the takeover never lets a held result go.
+    #[test]
+    fn a_recovery_frame_takes_the_screen_only_straight_before_its_card() {
+        let types = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../common/src/types.rs")).unwrap();
+        let consts: HashMap<String, u8> = types
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix("pub const ")?;
+                let (name, value) = rest.split_once(": u8 = ")?;
+                let hex = value.split(';').next()?.trim().strip_prefix("0x")?;
+                Some((name.to_string(), u8::from_str_radix(hex, 16).ok()?))
+            })
+            .collect();
+        let relay = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/relay.rs")).unwrap();
+        let start = relay.find("fn poll_usb_frame(").expect("poll_usb_frame is in relay.rs");
+        let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
+        let split = body.find("    match frame.frame_type {").expect("the dispatch match");
+        let take = "take_screen_for_recovery(ctx, sessions)";
+        assert!(!body[..split].contains(take), "the screen is taken before the handler has checked the frame");
+
+        let mut arms: Vec<String> = Vec::new();
+        for line in body[split..].lines().skip(1) {
+            if line.starts_with("        FRAME_TYPE_") || line.starts_with("        other =>") {
+                arms.push(String::new());
+            }
+            if let Some(arm) = arms.last_mut() {
+                arm.push_str(line);
+                arm.push('\n');
+            }
+        }
+        let mut taken = Vec::new();
+        for arm in &arms {
+            let pattern = &arm[..arm.find("=>").expect("an arm has =>")];
+            let frames: Vec<u8> = pattern
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| w.starts_with("FRAME_TYPE_"))
+                .map(|name| *consts.get(name).unwrap_or_else(|| panic!("{name} not in types.rs")))
+                .collect();
+            let recovery = frames
+                .iter()
+                .all(|&t| matches!(cable_frame_card(t), CableCard::Recovery | CableCard::RecoveryIfOperatorKept));
+            let Some(at) = arm.find(take) else {
+                assert!(!recovery || frames.is_empty(), "a recovery arm never takes the screen:\n{arm}");
+                continue;
+            };
+            assert!(recovery && !frames.is_empty(), "a non-recovery arm takes the screen:\n{arm}");
+            assert_eq!(arm.matches(take).count(), 1, "one takeover per arm:\n{arm}");
+            // After the checks, inside their `Some`.
+            if let Some(check) = arm.find("::check_") {
+                assert!(check < at, "the screen is taken before the checks:\n{arm}");
+                assert!(arm[..check].contains("if let Some("), "the checks' answer is not what gates the takeover:\n{arm}");
+            }
+            // Before the card.
+            let card = ["::confirm_", "::handle_factory_reset("]
+                .iter()
+                .filter_map(|c| arm.find(c))
+                .min()
+                .unwrap_or_else(|| panic!("no card after the takeover:\n{arm}"));
+            assert!(at < card, "the card goes up before the screen is taken:\n{arm}");
+            taken.extend(frames);
+        }
+        taken.sort_unstable();
+        let mut expected: Vec<u8> = (0..=u8::MAX)
+            .filter(|&t| matches!(cable_frame_card(t), CableCard::Recovery | CableCard::RecoveryIfOperatorKept))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(taken, expected, "every recovery frame, and only those, takes the screen");
+        // A SET_NET_CONFIG that changes the operator is an ordinary card:
+        // its arm takes the screen only for a recovery claim.
+        let set = arms.iter().find(|a| a.starts_with("        FRAME_TYPE_SET_NET_CONFIG")).unwrap();
+        assert!(set.contains("if claim == heartwood_common::phone_unlock::CableClaim::Recovery"), "{set}");
+        // Nothing else in relay.rs takes the screen.
+        assert_eq!(relay.matches(take).count(), arms.iter().filter(|a| a.contains(take)).count());
+
+        // The takeover leaves a held result alone.
+        let def = relay.find("fn take_screen_for_recovery(").expect("take_screen_for_recovery");
+        let def_body = &relay[def..def + relay[def..].find("\n}\n").unwrap()];
+        let imp = relay.find("RecoveryScreen for RelayScreen").expect("the RecoveryScreen impl");
+        let imp_body = &relay[imp..imp + relay[imp..].find("\n}\n").unwrap()];
+        for text in [def_body, imp_body] {
+            assert!(!text.contains("card_screen_hold"), "a takeover touches the held result:\n{text}");
+        }
+    }
+
+    /// A recovery takeover answers every relay card Expired
+    /// (`resolve_button_card(.., &CardTick::Expired)`) and must leave a held
+    /// result, such as "Not sent / revoke id N", standing. So nothing on the
+    /// resolve paths may hold, replace or release a result screen except
+    /// behind an approval: a guard naming `Approved` within the three lines
+    /// before, or an arm of `EnrolResult::Done`/`NotSent`/`NotAdded`, which
+    /// `enrol_result` never returns for an expiry (common's
+    /// `an_expired_enrol_card_holds_no_result`).
+    #[test]
+    fn an_expired_relay_card_never_touches_a_held_result() {
+        let relay = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/relay.rs")).unwrap();
+        const TOUCHES: &[&str] = &["show_and_hold(", "hold_card_screen(", "release_card_screen_hold(", "card_screen_hold"];
+        const PRESSED_ARMS: &[&str] = &["EnrolResult::Done", "EnrolResult::NotSent", "EnrolResult::NotAdded"];
+        let mut guarded = 0;
+        for name in ["resolve_button_card", "resolve_receive_card", "resolve_phone_enrol_card"] {
+            let start = relay
+                .find(&format!("\nfn {name}("))
+                .unwrap_or_else(|| panic!("{name} is in relay.rs"));
+            let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
+            let lines: Vec<&str> = body.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if !TOUCHES.iter().any(|t| code.contains(t)) {
+                    continue;
+                }
+                let context = &lines[i.saturating_sub(3)..=i];
+                let ok = context.iter().any(|l| {
+                    let l = l.split("//").next().unwrap_or("");
+                    l.contains("Approved") || PRESSED_ARMS.iter().any(|arm| l.trim_start().starts_with(arm))
+                });
+                assert!(ok, "{name} touches a held result outside an approval:\n{}", context.join("\n"));
+                guarded += 1;
+            }
+        }
+        // The enrol card's pressed results do hold; if none is found the
+        // scan has lost its way.
+        assert!(guarded >= 3, "found {guarded} guarded holds: the scan has drifted");
+    }
+
+    #[test]
+    fn the_scan_sees_every_way_to_the_button() {
+        assert!(reaches_button("x(usb, ctx.nvs, ctx.buttons)").is_some());
+        assert!(reaches_button("crate::net_config_store::handle_get_net_config(usb, ctx)").is_some());
+        assert!(reaches_button("handle(ctx, usb)").is_some());
+        assert!(reaches_button("if crate::button::hold_ms() > 0 {}").is_some());
+        assert_eq!(reaches_button("if cable_card_refused(ctx) {}"), None);
+        assert_eq!(reaches_button("release_card_screen_hold(ctx, None)"), None);
+        assert_eq!(reaches_button("x(usb, ctx.nvs, ctx.network_runtime)"), None);
+        assert_eq!(reaches_button("let ctxs = 1; f(my_ctx)"), None);
+    }
+}
+
+#[cfg(test)]
+mod enrol_card_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn lit(draw: impl Fn(&mut SimulatorDisplay<Rgb565>), w: u32, h: u32) -> Vec<Point> {
+        let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
+        d.clear(BG).ok();
+        draw(&mut d);
+        d.bounding_box()
+            .points()
+            .filter(|p| d.get_pixel(*p) != BG)
+            .collect()
+    }
+
+    /// Every piece of the enrol card, drawn alone, shares no pixel with any
+    /// other or with a button tag, and stays inside the span clear of the
+    /// tags, on every panel and orientation, on every page, with the longest
+    /// label and the widest words. The countdown bar is one of the pieces.
+    #[test]
+    fn the_enrol_card_never_overprints_a_tag_or_itself() {
+        let widest: [&str; phone_unlock::REQUEST_CODE_WORDS] =
+            ["abstract", "accident", "acoustic", "absolute", "activity"];
+        let boards = [
+            (128u32, 64u32, Some(HELTEC_TAGS)),
+            (128, 64, Some(HELTEC_FLIPPED_TAGS)),
+            (240, 135, Some(TDISPLAY_TAGS)),
+            (172, 320, None),
+            (320, 172, None),
+        ];
+        for (w, h, tags) in boards {
+            let l = Layout::new(w as i32, h as i32);
+            let side = tags.map(|t| t.side);
+            for label in ["phone", "Pixel 8", "WWWWWWWWWWWWWWWW"] {
+                // Every page, before and after the gate (the hint differs).
+                for (page, elapsed, armed) in [(0, 0, false), (1, 4, false), (2, 8, false), (0, 12, true), (2, 44, true)] {
+                    assert_eq!(phone_unlock::enrol_page(elapsed), page);
+                    let items = enrol_items(&l, tags, &widest, label, elapsed, armed);
+                    let mut layers: Vec<(String, Vec<Point>)> = items
+                        .into_iter()
+                        .map(|item| (item.0.clone(), lit(move |d| draw_item(d, &item), w, h)))
+                        .collect();
+                    let bar_l = l;
+                    layers.push(("countdown bar".into(), lit(move |d| draw_enrol_bar(d, &bar_l, side, 45, 45), w, h)));
+                    let (left, right) = l.text_span(side);
+                    for (text, points) in &layers {
+                        assert!(!points.is_empty(), "{w}x{h}: {text:?} drew nothing");
+                        assert!(
+                            points.iter().all(|p| p.x >= left && p.x < right && p.y >= 0 && p.y < h as i32),
+                            "{w}x{h}: {text:?} leaves the span clear of the tags"
+                        );
+                    }
+                    if let Some(tags) = tags {
+                        for (text, colour, p) in tag_items(&l, tags) {
+                            let font = l.font_small();
+                            let t = text.clone();
+                            layers.push((text, lit(move |d| { Text::new(&t, p, style(font, colour)).draw(d).ok(); }, w, h)));
+                        }
+                    }
+                    let sets: Vec<HashSet<Point>> = layers.iter().map(|(_, points)| points.iter().copied().collect()).collect();
+                    for i in 0..layers.len() {
+                        for j in i + 1..layers.len() {
+                            let clash = layers[i].1.iter().find(|p| sets[j].contains(p));
+                            assert!(
+                                clash.is_none(),
+                                "{w}x{h} label {label:?} page {page}: {:?} and {:?} meet at {clash:?}",
+                                layers[i].0,
+                                layers[j].0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// On the Heltec the words are 12 px letters (FONT_6X10 at 2x), twice
+    /// the old card's, with a clear row between every piece of the card.
+    #[test]
+    fn the_heltec_enrol_words_are_twice_the_old_size() {
+        let l = Layout::new(128, 64);
+        let rows = |item: Item| {
+            let ys: Vec<i32> = lit(move |d| draw_item(d, &item), 128, 64).iter().map(|p| p.y).collect();
+            (*ys.iter().min().unwrap(), *ys.iter().max().unwrap())
+        };
+        let items = enrol_items(&l, Some(HELTEC_TAGS), &["bight", "jury", "ok", "ok", "ok"], "phone", 0, false);
+        let word = items.iter().find(|i| i.0 == "bight").unwrap().clone();
+        assert_eq!((word.1.character_size.width, word.2), (6, 2));
+        // Ascender to descender: 18 rows, where the old card's words had 9.
+        let (top, bottom) = rows(word);
+        assert_eq!(bottom - top + 1, 18);
+        // One piece per row band: the place numbers share their word's rows
+        // and the marker shares the seconds' row.
+        let mut spans: Vec<(i32, i32)> =
+            items.into_iter().filter(|i| i.0 != "1" && i.0 != "2" && i.0 != "1-2 of 5").map(rows).collect();
+        spans.sort();
+        for pair in spans.windows(2) {
+            assert!(pair[1].0 > pair[0].1 + 1, "no clear row between {pair:?}");
+        }
+    }
+
+    /// PHONE ADDED: the check code at the card words' size, every line on
+    /// the panel and apart from the others and the header's rule.
+    #[test]
+    fn phone_added_keeps_its_lines_apart_on_every_panel() {
+        for (w, h) in [(128u32, 64u32), (240, 135), (172, 320), (320, 172)] {
+            let l = Layout::new(w as i32, h as i32);
+            let items = phone_added_items(&l, "9B6 164", u32::MAX);
+            assert_eq!(items[2].2, l.card_word_font(None).1, "{w}x{h}");
+            let mut layers: Vec<(String, Vec<Point>)> =
+                items.into_iter().map(|item| (item.0.clone(), lit(move |d| draw_item(d, &item), w, h))).collect();
+            let rule_y = l.sy(14);
+            layers.push(("rule".into(), (0..w as i32).map(|x| Point::new(x, rule_y)).collect()));
+            for (text, points) in &layers {
+                assert!(points.iter().all(|p| p.x >= 0 && p.x < w as i32 && p.y >= 0 && p.y < h as i32), "{w}x{h} {text}");
+            }
+            let sets: Vec<HashSet<Point>> = layers.iter().map(|(_, points)| points.iter().copied().collect()).collect();
+            for i in 0..layers.len() {
+                for j in i + 1..layers.len() {
+                    let near = layers[i].1.iter().find(|p| (-1..=1).any(|dy| sets[j].contains(&Point::new(p.x, p.y + dy))));
+                    assert!(near.is_none(), "{w}x{h}: {:?} and {:?} touch at {near:?}", layers[i].0, layers[j].0);
+                }
+            }
+        }
+    }
+
+    /// The Heltec's top line holds 20 small-font characters clear of "<PRG",
+    /// the value common's enrol_card tests pin.
+    #[test]
+    fn the_heltec_top_line_width_is_what_common_pins() {
+        let l = Layout::new(128, 64);
+        assert_eq!(l.span_chars(Some(TagSide::Left), l.font_small()), 20);
+        let card = phone_unlock::enrol_card(
+            &phone_unlock::request_words(&[0xAB; 32]),
+            "WWWWWWWWWWWWWWWW",
+            l.span_chars(Some(TagSide::Left), l.font_small()),
+            0,
+        );
+        assert_eq!(card.top.len(), 20);
+    }
+
+    /// The layout's longest word and marker are the word list's and the
+    /// marker function's, so the card can never be sized for less than it
+    /// draws.
+    #[test]
+    fn the_layout_is_sized_for_the_longest_word_and_marker() {
+        assert_eq!(Layout::LONGEST_WORD as usize, heartwood_common::spoken_words::WORDLIST_MAX_LEN);
+        assert_eq!(Layout::ENROL_MARKER_CHARS as usize, phone_unlock::ENROL_MARKER_MAX_CHARS);
+        let longest = (0..phone_unlock::ENROL_PAGES).map(|p| phone_unlock::enrol_page_marker(p).len()).max();
+        assert_eq!(longest, Some(phone_unlock::ENROL_MARKER_MAX_CHARS));
+    }
+
+    /// PHONE ADDED fits its longest id on the narrowest panel.
+    #[test]
+    fn phone_added_fits_the_narrowest_panel() {
+        let l = Layout::new(128, 64);
+        let hint = format!("else revoke {}", u32::MAX);
+        assert!(hint.len() <= l.chars_per_line(l.font_small()), "{hint}");
+        let (font, scale) = l.card_word_font(None);
+        assert!(bigtext::scaled_text_width("9B6 164", font, scale) <= l.w - l.sx(4));
     }
 }

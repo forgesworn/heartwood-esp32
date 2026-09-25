@@ -7,6 +7,12 @@
 //   enrol    over USB: make a one-off enrolment key P, send PHONE_UNLOCK_CMD
 //            (0x64) {op:"enrol"}, press on the board, open the sealed
 //            hand-off with P, and keep {id, s, relays} in the state file.
+//            With --over-relay, the same through the device operator's
+//            kind-24134 channel (enrol_unlock_phone): the board holds it on a
+//            card, and the press is still at the board. Either way the card
+//            leads with the request code, five words from the enrolment key:
+//            hold only if they match the phone that made the key (for enrol,
+//            this script; for enrol-for, the phone's own screen).
 //   enrol-for  stand in for Sapwood's panel: take the code a real phone
 //            (Cambium) shows, enrol its key over USB with a press, and publish
 //            the board's sealed answer to the phone as a kind-24137 hand-off
@@ -28,6 +34,8 @@
 // Usage:
 //   node scripts/phone-unlock.mjs enrol  --port <port> --secret-file <bridge.secret> [--label "bench phone"]
 //   node scripts/phone-unlock.mjs enrol-for --code '<heartwood-unlock:enrol?...>' --port <port> --secret-file <bridge.secret>
+//   node scripts/phone-unlock.mjs enrol|enrol-for ... --over-relay --master <hex|npub>
+//        [--key-file ~/heartwood-bench/operator.key] [--mgmt-relay wss://...] (instead of --port/--secret-file)
 //   node scripts/phone-unlock.mjs list   --port <port> --secret-file <bridge.secret>
 //   node scripts/phone-unlock.mjs revoke --port <port> --secret-file <bridge.secret> --id <id>
 //   node scripts/phone-unlock.mjs announce-operator on|off --port <port> --secret-file <bridge.secret>
@@ -49,6 +57,7 @@ import {
   HANDOFF_KIND,
   checkCode,
   deliveryJson,
+  requestCode,
   hintMatches,
   judge,
   openContext,
@@ -126,17 +135,117 @@ async function relayDeps() {
   return import('./relay-deps.mjs')
 }
 
+const OVER_RELAY = argv.includes('--over-relay')
+
+// A relay enrolment waits on a card: up to 90 s behind other cards (a result
+// screen ahead of it gives way after 20 s), then 45 s on screen, about 140 s
+// at worst. Sent once, like the cable's, and given a generous margin.
+const RELAY_ENROL_DEADLINE_MS = 180_000
+
+// The cable's enrol card blocks for its 45 s window (the five words shown a
+// page at a time, no hold before all have been shown); twice that, since a
+// command sent while another card is up waits for it first.
+const USB_ENROL_DEADLINE_MS = 90_000
+
+/**
+ * Enrol over the device operator's kind-24134 channel: fetch a fresh mutation
+ * challenge, send enrol_unlock_phone ONCE, and wait for the card to answer.
+ * Resolves with the same answer the cable returns.
+ */
+async function relayEnrol(enrolPubkey, label) {
+  const { finalizeEvent, getPublicKey, nip44, toHex, DEFAULT_RELAYS, RelayFanout } = await relayDeps()
+  const masterArg = arg('--master', env.HEARTWOOD_MASTER)
+  if (!masterArg) {
+    console.error(`usage: node scripts/phone-unlock.mjs ${COMMAND} ... --over-relay --master <hex|npub> [--key-file <operator.key>] [--mgmt-relay wss://...]`)
+    exit(2)
+  }
+  const master = toHex(masterArg, '--master')
+  const keyFile = arg('--key-file', `${env.HOME}/heartwood-bench/operator.key`)
+  const skHex = readFileSync(keyFile, 'utf8').trim()
+  if (!/^[0-9a-f]{64}$/.test(skHex)) throw new Error(`operator key file ${keyFile} must hold 64 lowercase hex chars`)
+  const sk = Uint8Array.from(Buffer.from(skHex, 'hex'))
+  const ck = nip44.v2.utils.getConversationKey(sk, master)
+  const picked = []
+  argv.forEach((a, i) => { if (a === '--mgmt-relay' && argv[i + 1]) picked.push(argv[i + 1]) })
+  const relays = picked.length ? picked : DEFAULT_RELAYS
+  if (!relays.length) throw new Error('no relay: pass --mgmt-relay or set HEARTWOOD_RELAYS')
+  const fanout = new RelayFanout(relays)
+
+  const roundTrip = (method, params, extra, deadlineMs) => new Promise((resolve, reject) => {
+    const id = randomBytes(16).toString('hex')
+    const timer = setTimeout(() => { off(); reject(new Error(`${method}: no answer within ${deadlineMs / 1000}s`)) }, deadlineMs)
+    const off = fanout.on((data) => {
+      let msg
+      try { msg = JSON.parse(data.toString()) } catch { return }
+      if (msg[0] !== 'EVENT' || msg[1] !== 'mgmt') return
+      const e = msg[2]
+      if (e.kind !== 24134 || e.pubkey !== master) return
+      let inner
+      try { inner = JSON.parse(nip44.v2.decrypt(e.content, ck)) } catch { return }
+      if (inner.id !== id) return
+      clearTimeout(timer)
+      off()
+      if (inner.error !== undefined) reject(new Error(`refused: ${inner.error}`))
+      else resolve(inner.result)
+    })
+    fanout.send(['EVENT', finalizeEvent({
+      kind: 24134,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [['p', master]],
+      content: nip44.v2.encrypt(JSON.stringify({ id, method, params, ...extra }), ck),
+    }, sk)])
+  })
+
+  try {
+    await fanout.open()
+    // Ephemeral kind: the subscription must be up before anything is sent.
+    fanout.req('mgmt', { kinds: [24134], authors: [master], '#p': [getPublicKey(sk)], limit: 0 })
+    const { challenge } = await roundTrip('get_management_challenge', {}, {}, 20_000)
+    const stop = startPressPrompt(`adding ${label} as an unlock phone`)
+    try {
+      return await roundTrip(
+        'enrol_unlock_phone',
+        { enrol_pubkey: enrolPubkey, label },
+        { mutation_challenge: challenge },
+        RELAY_ENROL_DEADLINE_MS,
+      )
+    } finally {
+      stop()
+    }
+  } finally {
+    fanout.close()
+    sk.fill(0)
+  }
+}
+
+/**
+ * Enrol `enrolPubkey`, over the cable or (--over-relay) the relay. `ownKey`
+ * is true when this script made the key (enrol), so it is the phone and its
+ * words are the ones to compare; for enrol-for the real phone made it, and
+ * the owner compares the board with that phone's screen.
+ */
+async function boardEnrol(enrolPubkey, label, { ownKey = false } = {}) {
+  const words = requestCode(enrolPubkey)
+  if (ownKey) {
+    console.log(`\n    the board's card must read: ${words}\n    (this script is the phone here) hold only if it does\n`)
+  } else {
+    console.log(`\n    compare the board's card with the PHONE, not with this line: hold only if they match\n    (for convenience only: ${words})\n`)
+  }
+  if (OVER_RELAY) return relayEnrol(enrolPubkey, label)
+  return usbCommand(
+    { op: 'enrol', enrol_pubkey: enrolPubkey, label },
+    USB_ENROL_DEADLINE_MS,
+    { press: `adding ${label} as an unlock phone` },
+  )
+}
+
 async function enrol() {
   const { getPublicKey, nip44 } = await relayDeps()
   const enrolSk = randomBytes(32)
   const enrolPk = getPublicKey(enrolSk)
   const label = arg('--label', 'bench phone')
   console.log(`enrolling "${label}"`)
-  const answer = await usbCommand(
-    { op: 'enrol', enrol_pubkey: enrolPk, label },
-    45_000,
-    { press: `adding ${label} as an unlock phone` },
-  )
+  const answer = await boardEnrol(enrolPk, label, { ownKey: true })
   const ck = nip44.v2.utils.getConversationKey(enrolSk, answer.ephemeral_pubkey)
   const handoff = JSON.parse(nip44.v2.decrypt(answer.sealed, ck))
   enrolSk.fill(0)
@@ -148,6 +257,7 @@ async function enrol() {
   state.phones.push({ id: handoff.id, label, s: handoff.s, relays: handoff.relays, last: null })
   saveState(state)
   console.log(`enrolled as id ${handoff.id}; relays ${handoff.relays.join(', ')}`)
+  console.log(`check code ${checkCode(answer.ephemeral_pubkey)} (the board shows the same after the press)`)
   console.log(`slot secret kept in ${STATE_FILE} (0600)`)
 }
 
@@ -162,11 +272,7 @@ async function enrolFor() {
   const fanout = new RelayFanout(code.relays)
   const live = await fanout.open()
   console.log(`enrolling "${code.label}" for a phone waiting on ${live.length}/${code.relays.length} relay(s)`)
-  const answer = await usbCommand(
-    { op: 'enrol', enrol_pubkey: code.enrolPubkey, label: code.label },
-    45_000,
-    { press: `adding ${code.label} as an unlock phone` },
-  )
+  const answer = await boardEnrol(code.enrolPubkey, code.label)
   const throwaway = randomBytes(32)
   const handoff = finalizeEvent({
     kind: HANDOFF_KIND,
@@ -194,7 +300,8 @@ async function enrolFor() {
   fanout.close()
   if (!accepted.length) throw new Error(`board enrolled record ${answer.id}, but no relay accepted the hand-off; revoke it and retry`)
   console.log(`board record ${answer.id}; hand-off accepted by ${accepted.join(', ')}`)
-  console.log(`\n    check code ${checkCode(answer.ephemeral_pubkey)}  (the phone must show the same six characters)\n`)
+  console.log(`\n    check code ${checkCode(answer.ephemeral_pubkey)}  (the phone must show the same six characters)`)
+  console.log(`    if the phone never shows it, revoke board record ${answer.id}: phone-unlock.mjs revoke --id ${answer.id}\n`)
   console.log("the phone now asks for its screen lock to keep the key")
 }
 

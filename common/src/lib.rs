@@ -135,6 +135,8 @@ pub mod at_rest_status;
 /// phone's prompt rule.
 #[cfg(all(feature = "seed-encrypt", feature = "nip44", feature = "nip46"))]
 pub mod phone_unlock;
+/// spoken-token's en-v1 word list, for phone unlock's request code.
+pub mod spoken_words;
 
 /// Phone unlock across a relay change: the record of what the phones were
 /// told, and when and where a board tells them again.

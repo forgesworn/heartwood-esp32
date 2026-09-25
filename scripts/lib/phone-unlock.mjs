@@ -19,6 +19,7 @@
 // Vectors: common/tests/fixtures/phone-unlock-v1.json and -v1-relays.json.
 
 import { createCipheriv, createHmac, hkdfSync, timingSafeEqual } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 
 const SALT = Buffer.from('heartwood-phone-unlock-v1')
 export const ANNOUNCE_KIND = 24135
@@ -164,14 +165,26 @@ export function checkCode(ephemeralPubkeyHex) {
 }
 
 /**
- * The six characters the board's enrol card leads with before the press, and
- * that Sapwood (or this script) shows for the request it sent: the same
- * derivation as checkCode, keyed by the phone's enrolment key P, under
- * 'heartwood-unlock:enrol-request'. Holding only when they match is what
- * stops the owner pressing for a request someone else raced in.
+ * The four words the board's enrol card leads with before the press, and
+ * that the phone which made P shows: spoken-token's deriveToken(P,
+ * 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 4 }). Word i
+ * is WORDLIST[uint16be(digest, 2i) % 2048]. The owner holds only if the board
+ * and the phone agree; whatever relayed the request (Sapwood, this script)
+ * may print them as a convenience, but cannot vouch for them. The word list
+ * is common/src/spoken_words.txt, the bytes the firmware compiles in.
  */
 export function requestCode(enrolPubkeyHex) {
-  return spokenHex6(enrolPubkeyHex, 'heartwood-unlock:enrol-request')
+  const digest = createHmac('sha256', Buffer.from(enrolPubkeyHex, 'hex'))
+    .update(Buffer.concat([Buffer.from('heartwood-unlock:enrol-request'), Buffer.alloc(4)]))
+    .digest()
+  return [0, 1, 2, 3].map((i) => spokenWords()[digest.readUInt16BE(2 * i) % 2048]).join(' ')
+}
+
+let words = null
+function spokenWords() {
+  words ??= readFileSync(new URL('../../common/src/spoken_words.txt', import.meta.url), 'utf8').trimEnd().split('\n')
+  if (words.length !== 2048) throw new Error('spoken_words.txt must hold 2048 words')
+  return words
 }
 
 function spokenHex6(keyHex, context) {

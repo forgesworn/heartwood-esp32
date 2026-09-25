@@ -474,8 +474,9 @@ pub enum AskCard {
     PhoneEnrol {
         enrol_pubkey: [u8; 32],
         label: String,
-        /// `phone_unlock::request_code` of `enrol_pubkey`, as Sapwood shows it.
-        code: String,
+        /// The card's lines: the request code's four words, two a line, then
+        /// the label (`phone_unlock_cmd::enrol_card_lines`).
+        lines: [String; 3],
     },
 }
 

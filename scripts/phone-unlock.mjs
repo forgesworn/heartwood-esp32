@@ -10,7 +10,9 @@
 //            With --over-relay, the same through the device operator's
 //            kind-24134 channel (enrol_unlock_phone): the board holds it on a
 //            card, and the press is still at the board. Either way the card
-//            leads with the request code printed here; hold only if it matches.
+//            leads with the request code, four words from the enrolment key:
+//            hold only if they match the phone that made the key (for enrol,
+//            this script; for enrol-for, the phone's own screen).
 //   enrol-for  stand in for Sapwood's panel: take the code a real phone
 //            (Cambium) shows, enrol its key over USB with a press, and publish
 //            the board's sealed answer to the phone as a kind-24137 hand-off
@@ -210,9 +212,19 @@ async function relayEnrol(enrolPubkey, label) {
   }
 }
 
-/** Enrol `enrolPubkey`, over the cable or (--over-relay) the relay. */
-async function boardEnrol(enrolPubkey, label) {
-  console.log(`\n    the board's card will read ${requestCode(enrolPubkey)}: hold only if it does\n`)
+/**
+ * Enrol `enrolPubkey`, over the cable or (--over-relay) the relay. `ownKey`
+ * is true when this script made the key (enrol), so it is the phone and its
+ * words are the ones to compare; for enrol-for the real phone made it, and
+ * the owner compares the board with that phone's screen.
+ */
+async function boardEnrol(enrolPubkey, label, { ownKey = false } = {}) {
+  const words = requestCode(enrolPubkey)
+  if (ownKey) {
+    console.log(`\n    the board's card must read: ${words}\n    (this script is the phone here) hold only if it does\n`)
+  } else {
+    console.log(`\n    compare the board's card with the PHONE, not with this line: hold only if they match\n    (for convenience only: ${words})\n`)
+  }
   if (OVER_RELAY) return relayEnrol(enrolPubkey, label)
   return usbCommand(
     { op: 'enrol', enrol_pubkey: enrolPubkey, label },
@@ -227,7 +239,7 @@ async function enrol() {
   const enrolPk = getPublicKey(enrolSk)
   const label = arg('--label', 'bench phone')
   console.log(`enrolling "${label}"`)
-  const answer = await boardEnrol(enrolPk, label)
+  const answer = await boardEnrol(enrolPk, label, { ownKey: true })
   const ck = nip44.v2.utils.getConversationKey(enrolSk, answer.ephemeral_pubkey)
   const handoff = JSON.parse(nip44.v2.decrypt(answer.sealed, ck))
   enrolSk.fill(0)

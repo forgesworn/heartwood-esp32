@@ -14,9 +14,11 @@
 //                           operator only) relay.rs holds it as a deferred
 //                           card (#64) and completes it here once pressed:
 //                           [`check_enrol`] before the card, [`complete_enrol`]
-//                           after it. Both cards lead with the request code
-//                           (`phone_unlock::request_code`), and the board
-//                           shows the check code once the phone is added.
+//                           after it. Both cards lead with the request code's
+//                           four words (`phone_unlock::request_words`), which
+//                           the owner compares with the phone that made the
+//                           key, and the board shows the check code once the
+//                           phone is added.
 //   list                    ids and labels; nothing that unlocks.
 //   revoke                  deletes a phone's record, and with it its
 //                           authority. No press: removing authority is always
@@ -157,23 +159,20 @@ pub fn run(
             let label = default_label(label);
             check_enrol(nvs, masters, &label)?;
 
-            let title = phone_unlock::enrol_card_title(&phone_unlock::request_code(&enrol_pubkey), &label);
+            let lines = enrol_card_lines(&enrol_pubkey, &label);
             let approved = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
-                crate::oled::show_titled_approval(d, ENROL_CARD_HEADER, &title, remaining, 30);
+                crate::oled::show_enrol_approval(d, &lines, remaining, 30);
             });
             if !matches!(approved, crate::approval::ApprovalResult::Approved) {
                 return Err("declined on the board".into());
             }
 
-            let enrolment = complete_enrol(nvs, masters, &enrol_pubkey, &label)?;
+            let enrolment = complete_enrol(nvs, masters, &enrol_pubkey, &label, phone_unlock::enrol_refusal, |_| true)?;
             show_enrolled(display, &enrolment);
             Ok(phone_unlock::enrolment_json(&enrolment))
         }
     }
 }
-
-/// The enrol card's header, on the cable and the relay alike.
-pub const ENROL_CARD_HEADER: &str = "ADD UNLOCK PHONE";
 
 /// The label the board keeps when the requester sent none.
 pub fn default_label(label: String) -> String {
@@ -184,49 +183,67 @@ pub fn default_label(label: String) -> String {
     }
 }
 
-/// What the board knows about whether an enrolment of `label` can go ahead.
-/// A relay card's press is checked against these again: anything may have
-/// changed while the card was up.
-pub fn enrol_facts(nvs: &mut EspNvs<NvsDefault>, masters: &[LoadedMaster], label: &str) -> Result<EnrolFacts, String> {
+/// The enrol card, on the cable and the relay alike: the request code's four
+/// words, then the label (`oled::show_enrol_approval`).
+pub fn enrol_card_lines(enrol_pubkey: &[u8; 32], label: &str) -> [String; 3] {
+    phone_unlock::enrol_card_lines(&phone_unlock::request_words(enrol_pubkey), label)
+}
+
+/// What the board knows about whether an enrolment of `label` can go ahead,
+/// and the phone set it counted, decoded once. A locked board refuses as
+/// locked before its phone blob is read.
+fn read_board(
+    nvs: &mut EspNvs<NvsDefault>,
+    masters: &[LoadedMaster],
+    label: &str,
+) -> Result<(EnrolFacts, Option<PhoneSet>, Vec<String>), String> {
     let unlocked = !masters.is_empty() && !crate::pin::is_locked(masters);
     let data_key = data_key_store::current()
         .map(|mut dk| dk.iter_mut().for_each(|b| *b = 0))
         .is_some();
-    let relays = !configured_relays(nvs).is_empty();
-    // A locked board refuses as locked before its phone blob is read.
-    let phones = if unlocked { load(nvs)?.records().len() } else { 0 };
-    Ok(EnrolFacts { label_len: label.len(), unlocked, data_key, relays, phones })
+    let relays = configured_relays(nvs);
+    let phones = if unlocked { Some(load(nvs)?) } else { None };
+    let facts = EnrolFacts {
+        label_len: label.len(),
+        unlocked,
+        data_key,
+        relays: !relays.is_empty(),
+        phones: phones.as_ref().map_or(0, |p| p.records().len()),
+    };
+    Ok((facts, phones, relays))
 }
 
 /// Whether an enrolment of `label` could go ahead now. Asked before a card
 /// goes up, so a board that cannot enrol never asks for a press.
 pub fn check_enrol(nvs: &mut EspNvs<NvsDefault>, masters: &[LoadedMaster], label: &str) -> Result<(), String> {
-    match phone_unlock::enrol_refusal(&enrol_facts(nvs, masters, label)?) {
+    match phone_unlock::enrol_refusal(&read_board(nvs, masters, label)?.0) {
         Some(refusal) => Err(refusal.message()),
         None => Ok(()),
     }
 }
 
-/// Add the phone, once pressed: re-check the board, draw the slot secret,
-/// persist the record, and only then return the hand-off, so a phone is never
-/// handed a secret the board did not keep. A full NVS refuses here, cleanly.
+/// Add the phone, once pressed. The board is read again (the phone set
+/// decoded once) and `gate` decides on what it says: the cable passes
+/// `enrol_refusal`, the relay `relay_enrol_completion` with its operator and
+/// relay checks. Then the slot secret is drawn and the hand-off sealed in
+/// RAM; `fits` says whether the answer carrying it can be sent (the relay's
+/// heap check), and only then is the record persisted, so a phone is never
+/// handed a secret the board did not keep, and a board short of memory
+/// refuses before any NVS write. A full NVS refuses at the save, cleanly.
 pub fn complete_enrol(
     nvs: &mut EspNvs<NvsDefault>,
     masters: &[LoadedMaster],
     enrol_pubkey: &[u8; 32],
     label: &str,
+    gate: impl FnOnce(&EnrolFacts) -> Option<EnrolRefusal>,
+    fits: impl FnOnce(&Enrolment) -> bool,
 ) -> Result<Enrolment, String> {
-    check_enrol(nvs, masters, label)?;
-    let Some(mut dk) = data_key_store::current() else {
+    let (facts, phones, relays) = read_board(nvs, masters, label)?;
+    if let Some(refusal) = gate(&facts) {
+        return Err(refusal.message());
+    }
+    let (Some(mut phones), Some(mut dk)) = (phones, data_key_store::current()) else {
         return Err(EnrolRefusal::NoDataKey.message());
-    };
-    let relays = configured_relays(nvs);
-    let mut phones = match load(nvs) {
-        Ok(p) => p,
-        Err(e) => {
-            dk.iter_mut().for_each(|b| *b = 0);
-            return Err(e);
-        }
     };
     let had_phones = !phones.is_empty();
     let enrolment = phone_unlock::enrol(
@@ -245,6 +262,9 @@ pub fn complete_enrol(
         EnrolError::Phone(e) => format!("could not add the phone: {e:?}"),
         EnrolError::Crypto(e) => format!("enrolment failed: {e}"),
     })?;
+    if !fits(&enrolment) {
+        return Err(EnrolRefusal::LowMemory.message());
+    }
     save(nvs, &phones)?;
     PHONES_CHANGED.store(true, Ordering::Release);
     log::info!("phone unlock: enrolled phone {} ({label})", enrolment.id);
@@ -259,8 +279,9 @@ pub fn complete_enrol(
     Ok(enrolment)
 }
 
-/// The DONE screen after an enrolment: the check code the phone and Sapwood
-/// show, so the owner can see the phone holds this board's hand-off.
+/// The DONE screen after a cable enrolment: the check code the phone shows
+/// (and Sapwood, once it does), so the owner can see the phone holds this
+/// board's hand-off. The relay path draws its own once the answer is out.
 pub fn show_enrolled(display: &mut crate::oled::Display<'_>, enrolment: &Enrolment) {
     crate::oled::show_change_done(
         display,

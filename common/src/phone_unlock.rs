@@ -517,17 +517,22 @@ impl PhoneCmd {
     }
 }
 
-/// A label as the board keeps and shows it: trimmed, and one line of
-/// printable text. It is the requester's text, and the enrol card draws it
-/// under the request code, so a label that could break a line could draw a
-/// code of its own where the owner looks for the real one.
+/// A label as the board keeps and shows it: trimmed, and printable ASCII.
+/// It is the requester's text, and the enrol card draws it under the request
+/// code, so a label that could break a line could draw a code of its own
+/// where the owner looks for the real one, and a glyph the fonts cannot draw
+/// could hide what it says.
 fn enrol_label(raw: &str) -> Result<String, &'static str> {
-    let label = raw.trim();
-    if label.chars().any(char::is_control) {
-        return Err("label must be one line of printable text");
+    // Checked before trimming: `trim` would quietly drop Unicode spaces.
+    if !raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        return Err(LABEL_ASCII_ERROR);
     }
-    Ok(label.into())
+    Ok(raw.trim().into())
 }
+
+/// Labels are printable ASCII: one line, and nothing the board's fonts
+/// would draw as something else.
+pub const LABEL_ASCII_ERROR: &str = "label must be printable ASCII (letters, digits, spaces, punctuation)";
 
 fn enrol_pubkey_from_hex(hex: &str) -> Result<[u8; 32], &'static str> {
     let bytes = crate::hex::hex_decode(hex).map_err(|_| "enrol_pubkey is not hex")?;
@@ -569,15 +574,24 @@ pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
 // so Sapwood hands it to the phone exactly as after a cable enrolment, and
 // the phone cannot tell which way it came.
 //
-// Two codes, both spoken-token hex tokens (the first three bytes of
-// HMAC-SHA256(key, utf8(context) || counter_be32), counter 0), shown "ABC 123":
+// Two codes, both spoken-token tokens of
+// HMAC-SHA256(key, utf8(context) || counter_be32), counter 0.
 //
-//   request code  key = the phone's enrolment key P. On the board's card, and
-//                 in Sapwood BEFORE the press, so the owner holds for the
-//                 request they sent and not for one raced in beside it.
-//   check code    key = the board's one-off hand-off key. On the board after
-//                 the press, in Sapwood and on the phone, so the owner knows
-//                 the phone holds the hand-off this board made.
+//   request code  key = the phone's enrolment key P, FOUR words of the
+//                 2048-word list (spoken_words: each word is
+//                 uint16_be(bytes[2i..2i+2]) % 2048 of the first 8 bytes, so
+//                 44 bits). On the board's card BEFORE the press, and on the
+//                 phone, which made P: the owner holds only if the two match.
+//                 The browser that relayed the request may show them too, as a
+//                 convenience, but that proves nothing: someone holding the
+//                 operator key, or the browser itself, could swap in a key of
+//                 their own. Four words, not three: the attacker chooses P,
+//                 so they could grind 33 bits inside a card's window or look
+//                 them up in a table they built beforehand.
+//   check code    key = the board's one-off hand-off key, 3 bytes of hex,
+//                 shown "ABC 123". On the board after the press, in Sapwood
+//                 and on the phone, so the owner knows the phone holds the
+//                 hand-off this board made.
 
 /// The management method that adds a phone over the relay.
 pub const ENROL_METHOD: &str = "enrol_unlock_phone";
@@ -590,31 +604,47 @@ pub const CHECK_CODE_CONTEXT: &str = "heartwood-unlock:enrol-check";
 /// How many enrolment keys a board remembers as used this boot.
 pub const USED_ENROL_KEYS_MAX: usize = 16;
 
-fn spoken_hex6(key: &[u8; 32], context: &str) -> String {
+fn spoken_digest(key: &[u8; 32], context: &str) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(context.as_bytes());
     mac.update(&0u32.to_be_bytes());
-    let d = mac.finalize().into_bytes();
+    mac.finalize().into_bytes().into()
+}
+
+/// How many words the request code has.
+pub const REQUEST_CODE_WORDS: usize = 4;
+
+/// The request code's words: spoken-token's
+/// `deriveToken(P, 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 4 })`.
+pub fn request_words(enrol_pubkey: &[u8; 32]) -> [&'static str; REQUEST_CODE_WORDS] {
+    let digest = spoken_digest(enrol_pubkey, REQUEST_CODE_CONTEXT);
+    core::array::from_fn(|i| crate::spoken_words::word_for(&digest[2 * i..2 * i + 2]))
+}
+
+/// The code the enrol card shows before the press, from the phone's
+/// enrolment key P: four words, space-joined, as spoken-token returns them.
+/// The phone that made P shows the same; the owner holds only if they match.
+pub fn request_code(enrol_pubkey: &[u8; 32]) -> String {
+    request_words(enrol_pubkey).join(" ")
+}
+
+/// The code the board, Sapwood and the phone show after the press, from the
+/// board's one-off hand-off key: spoken-token hex, 6 characters, "ABC 123".
+pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
+    let d = spoken_digest(ephemeral_pubkey, CHECK_CODE_CONTEXT);
     let hex = alloc::format!("{:02X}{:02X}{:02X}", d[0], d[1], d[2]);
     alloc::format!("{} {}", &hex[..3], &hex[3..])
 }
 
-/// The code the enrol card shows before the press, from the phone's
-/// enrolment key P. Sapwood shows the same code for the request it sent.
-pub fn request_code(enrol_pubkey: &[u8; 32]) -> String {
-    spoken_hex6(enrol_pubkey, REQUEST_CODE_CONTEXT)
-}
-
-/// The code the board, Sapwood and the phone show after the press, from the
-/// board's one-off hand-off key.
-pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
-    spoken_hex6(ephemeral_pubkey, CHECK_CODE_CONTEXT)
-}
-
-/// The enrol card's two lines: the request code on the first, where the
-/// owner looks, and the requester's label below it.
-pub fn enrol_card_title(request_code: &str, label: &str) -> String {
-    alloc::format!("{request_code}\nfor {label}")
+/// The enrol card's three text lines: two words, two words, then the
+/// requester's label behind "for ". The words lead, where the owner looks;
+/// a label can never be drawn on their lines.
+pub fn enrol_card_lines(words: &[&str; REQUEST_CODE_WORDS], label: &str) -> [String; 3] {
+    [
+        alloc::format!("{} {}", words[0], words[1]),
+        alloc::format!("{} {}", words[2], words[3]),
+        alloc::format!("for {label}"),
+    ]
 }
 
 impl PhoneCmd {
@@ -703,6 +733,9 @@ pub enum EnrolRefusal {
     OperatorChanged,
     /// The press came with no relay live to carry the answer.
     NoRelaySession,
+    /// The answer would not fit the free heap: refused before the record is
+    /// written, so nothing is kept that could not be handed over.
+    LowMemory,
 }
 
 impl EnrolRefusal {
@@ -723,6 +756,7 @@ impl EnrolRefusal {
                 "the device operator changed while the card was up: nothing was added".into()
             }
             EnrolRefusal::NoRelaySession => "no relay was live to carry the answer: nothing was added".into(),
+            EnrolRefusal::LowMemory => "device low on memory: nothing was added, retry shortly".into(),
         }
     }
 }
@@ -768,6 +802,38 @@ pub fn relay_enrol_gate(device_operator: bool, enrolment_pending: bool) -> Optio
     } else {
         None
     }
+}
+
+/// What the relay answers when the card queue has no room.
+pub const BUSY_ERROR: &str = "signer is busy with another approval; retry shortly";
+
+/// The relay's admission of an `enrol_unlock_phone`, in its fixed order (the
+/// one-time mutation challenge is already spent by then, like every
+/// mutation's): who is asking, whether another enrolment waits, the request
+/// itself, the board, room in the card queue, and last the enrolment key's
+/// claim, so no refusal before it burns the phone's code. Each stage runs
+/// only if every stage before it passed. The firmware passes its own
+/// closures; the host tests pass recording ones.
+pub fn admit_relay_enrol<P>(
+    device_operator: bool,
+    enrolment_pending: bool,
+    parse: impl FnOnce() -> Result<P, String>,
+    board: impl FnOnce(&P) -> Result<(), String>,
+    room: impl FnOnce(&P) -> bool,
+    claim: impl FnOnce(&P) -> bool,
+) -> Result<P, String> {
+    if let Some(refusal) = relay_enrol_gate(device_operator, enrolment_pending) {
+        return Err(refusal.message());
+    }
+    let request = parse()?;
+    board(&request)?;
+    if !room(&request) {
+        return Err(BUSY_ERROR.into());
+    }
+    if !claim(&request) {
+        return Err(EnrolRefusal::KeyUsed.message());
+    }
+    Ok(request)
 }
 
 /// At the press: the operator that asked must still be the device operator,
@@ -1095,37 +1161,55 @@ mod tests {
         EnrolFacts { label_len: 7, unlocked: true, data_key: true, relays: true, phones: 0 }
     }
 
-    /// Vectors from spoken-token 2.0.4 itself (deriveToken(key, context, 0,
-    /// { format: 'hex', length: 6 })); the check-code pair is the one Cambium's
-    /// EnrolmentTest and scripts/lib/phone-unlock.test.mjs already pin.
+    /// Vectors from spoken-token itself; the check-code pair (2.0.4, hex) is
+    /// the one Cambium's EnrolmentTest and scripts/lib/phone-unlock.test.mjs
+    /// already pin.
     #[test]
     fn codes_are_spoken_token_hex_tokens() {
         assert_eq!(check_code(&[0xAB; 32]), "9B6 164");
         assert_eq!(check_code(&[0x00; 32]), "EF1 645");
-        assert_eq!(request_code(&[0xAB; 32]), "F71 5A0");
-        assert_eq!(request_code(&[0x00; 32]), "071 F6B");
-        assert_ne!(request_code(&[0x42; 32]), check_code(&[0x42; 32]), "the two codes never coincide by construction");
+        // Four words, 44 bits, from spoken-token 2.1.0's
+        // deriveToken(P, 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 4 }).
+        assert_eq!(request_code(&[0xAB; 32]), "swim behind stand bugle");
+        assert_eq!(request_code(&[0x00; 32]), "talent humble reform admit");
+        assert_eq!(request_code(&[0x42; 32]), "profit buddy moment aim");
+        assert_eq!(request_code(&[0xFF; 32]), "what attitude price easy");
+        assert_eq!(request_words(&[0xAB; 32]), ["swim", "behind", "stand", "bugle"]);
     }
 
     #[test]
-    fn the_enrol_card_leads_with_the_code_and_the_label_cannot_forge_a_line() {
-        assert_eq!(enrol_card_title("F71 5A0", "Pixel 8"), "F71 5A0\nfor Pixel 8");
+    fn the_enrol_card_leads_with_the_words_and_the_label_cannot_pass_as_them() {
+        let words = request_words(&[0xAB; 32]);
+        assert_eq!(
+            enrol_card_lines(&words, "Pixel 8"),
+            ["swim behind".to_string(), "stand bugle".into(), "for Pixel 8".into()]
+        );
+        // Two words a line fit the narrowest card: 8 + 1 + 8 characters.
+        let longest = crate::spoken_words::WORDLIST_MAX_LEN;
+        assert_eq!(longest, 8);
         // A label is the requester's text. One that could break a line could
-        // draw a code of its own where the owner looks for the real one.
+        // draw words of its own where the owner looks for the real ones, and
+        // a glyph the ASCII fonts cannot draw could hide what it says. So:
+        // printable ASCII, one line, and always drawn after "for ".
         let pk = "ab".repeat(32);
-        for label in ["x\nF71 5A0", "x\rF71", "tab\there", "nul\u{0}", "del\u{7f}", "nel\u{85}x"] {
+        for label in [
+            "x\nswim behind", "x\rswim", "tab\there", "nul\u{0}", "del\u{7f}", "nel\u{85}x", "Zoë's phone",
+            "\u{2028}x", "\u{200b}swim", "ｓｗｉｍ",
+        ] {
             let json = serde_json::json!({ "op": "enrol", "enrol_pubkey": pk, "label": label }).to_string();
-            assert_eq!(PhoneCmd::parse(json.as_bytes()), Err("label must be one line of printable text"), "{label:?}");
+            assert_eq!(PhoneCmd::parse(json.as_bytes()), Err(LABEL_ASCII_ERROR), "{label:?}");
             let params = serde_json::json!({ "enrol_pubkey": pk, "label": label });
-            assert_eq!(
-                PhoneCmd::from_mgmt(ENROL_METHOD, Some(&params)),
-                Some(Err("label must be one line of printable text")),
-                "{label:?}"
-            );
+            assert_eq!(PhoneCmd::from_mgmt(ENROL_METHOD, Some(&params)), Some(Err(LABEL_ASCII_ERROR)), "{label:?}");
         }
-        // Accented and other printable text is fine.
-        let params = serde_json::json!({ "enrol_pubkey": pk, "label": "Zoë's phone" });
-        assert!(matches!(PhoneCmd::from_mgmt(ENROL_METHOD, Some(&params)), Some(Ok(_))));
+        for label in ["Pixel 8 Pro", "Zoe's phone", "a-b_c.d/e (1)!", "~"] {
+            let params = serde_json::json!({ "enrol_pubkey": pk, "label": label });
+            assert!(matches!(PhoneCmd::from_mgmt(ENROL_METHOD, Some(&params)), Some(Ok(_))), "{label:?}");
+        }
+        // Even a label written as words sits behind "for " on its own line,
+        // never on the lines the words are drawn on.
+        let lines = enrol_card_lines(&words, "stand bugle");
+        assert_eq!(lines[1], "stand bugle");
+        assert_eq!(lines[2], "for stand bugle");
     }
 
     #[test]
@@ -1253,12 +1337,67 @@ mod tests {
         );
     }
 
+    /// The relay's order: the challenge is spent before this runs (every
+    /// mutation's, handle_mgmt_event in relay.rs, pinned by the mgmt test that
+    /// enrol_unlock_phone requires one); then who is asking, then the request,
+    /// then the board, then room in the queue, and only then is the key
+    /// claimed, so no refusal burns the phone's code.
+    #[test]
+    fn a_relay_enrolment_claims_its_key_last() {
+        use core::cell::RefCell;
+        let trace = RefCell::new(Vec::<&str>::new());
+        let run = |operator: bool, pending: bool, parses: bool, board: bool, room: bool, fresh: bool| {
+            trace.borrow_mut().clear();
+            let out = admit_relay_enrol(
+                operator,
+                pending,
+                || {
+                    trace.borrow_mut().push("parse");
+                    if parses { Ok(7u8) } else { Err("bad".to_string()) }
+                },
+                |p: &u8| {
+                    assert_eq!(*p, 7);
+                    trace.borrow_mut().push("board");
+                    if board { Ok(()) } else { Err("locked".to_string()) }
+                },
+                |_: &u8| {
+                    trace.borrow_mut().push("room");
+                    room
+                },
+                |_: &u8| {
+                    trace.borrow_mut().push("claim");
+                    fresh
+                },
+            );
+            (out, trace.borrow().clone())
+        };
+        assert_eq!(run(true, false, true, true, true, true), (Ok(7), vec!["parse", "board", "room", "claim"]));
+        // A delegate: nothing else is even looked at.
+        let (out, steps) = run(false, true, true, true, true, true);
+        assert_eq!(out, Err(EnrolRefusal::NotDeviceOperator.message()));
+        assert!(steps.is_empty());
+        let (out, steps) = run(true, true, true, true, true, true);
+        assert_eq!(out, Err(EnrolRefusal::AnotherPending.message()));
+        assert!(steps.is_empty());
+        // Every refusal before the claim leaves the key unclaimed.
+        assert_eq!(run(true, false, false, true, true, true), (Err("bad".into()), vec!["parse"]));
+        assert_eq!(run(true, false, true, false, true, true), (Err("locked".into()), vec!["parse", "board"]));
+        assert_eq!(
+            run(true, false, true, true, false, true),
+            (Err(BUSY_ERROR.into()), vec!["parse", "board", "room"])
+        );
+        assert_eq!(
+            run(true, false, true, true, true, false),
+            (Err(EnrolRefusal::KeyUsed.message()), vec!["parse", "board", "room", "claim"])
+        );
+    }
+
     #[test]
     fn refusal_messages_are_distinct_and_keep_the_cable_wording() {
         use EnrolRefusal::*;
         let all = [
             NotDeviceOperator, AnotherPending, KeyUsed, LabelTooLong, Locked, NoDataKey, NoRelays, Full,
-            OperatorChanged, NoRelaySession,
+            OperatorChanged, NoRelaySession, LowMemory,
         ];
         let messages: Vec<String> = all.iter().map(|r| r.message()).collect();
         for (i, m) in messages.iter().enumerate() {

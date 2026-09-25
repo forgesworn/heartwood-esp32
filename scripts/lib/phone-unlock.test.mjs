@@ -116,9 +116,11 @@ test('check codes are spoken-token hex tokens of the hand-off key', () => {
   assert.equal(checkCode('00'.repeat(32)), 'EF1 645')
 })
 
-// Vectors from spoken-token 2.0.4; common/src/phone_unlock.rs pins the same.
-test('request codes are spoken-token hex tokens of the enrolment key', () => {
-  assert.equal(requestCode('ab'.repeat(32)), 'F71 5A0')
-  assert.equal(requestCode('00'.repeat(32)), '071 F6B')
-  assert.notEqual(requestCode('42'.repeat(32)), checkCode('42'.repeat(32)))
+// Vectors from spoken-token 2.1.0 (format 'words', count 4);
+// common/src/phone_unlock.rs pins the same.
+test('request codes are four spoken-token words of the enrolment key', () => {
+  assert.equal(requestCode('ab'.repeat(32)), 'swim behind stand bugle')
+  assert.equal(requestCode('00'.repeat(32)), 'talent humble reform admit')
+  assert.equal(requestCode('42'.repeat(32)), 'profit buddy moment aim')
+  assert.equal(requestCode('ff'.repeat(32)), 'what attitude price easy')
 })

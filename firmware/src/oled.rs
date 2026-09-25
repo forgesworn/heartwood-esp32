@@ -1108,6 +1108,63 @@ pub fn show_titled_approval(
     }
 }
 
+/// The card that adds an unlock phone. The request code is four words of up
+/// to eight letters, so they go two a line in the header font (17 characters
+/// at most, 102 px of the OLED's 128), where the owner looks first; the
+/// requester's label comes under them, always behind "for ", in the small
+/// font; the hint asks the question that matters, whether the phone shows the
+/// same words, ahead of the board's own button hint. Rows on the 128x64
+/// baseline: header 10, rule 14, words 24 and 34, label 43, hint 50, then the
+/// shared countdown bar from 52.
+pub fn show_enrol_approval(display: &mut Display<'_>, lines: &[String; 3], remaining: u32, total_secs: u32) {
+    let l = layout(display);
+    display.clear_buffer();
+
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let words = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(WARN)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+    let centred = |text: &str, font: &embedded_graphics::mono_font::MonoFont<'_>, y: i32| {
+        Point::new(l.center_x(text.len() as i32 * Layout::glyph_w(font)), l.sy(y))
+    };
+
+    let head = "ADD UNLOCK PHONE";
+    Text::new(head, centred(head, l.font_header(), 10), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display)
+        .ok();
+    Text::new(&lines[0], centred(&lines[0], l.font_header(), 24), words).draw(display).ok();
+    Text::new(&lines[1], centred(&lines[1], l.font_header(), 34), words).draw(display).ok();
+    Text::new(&lines[2], centred(&lines[2], l.font_small(), 43), small).draw(display).ok();
+
+    let tagged = draw_button_tags(display);
+    let button = if tagged && crate::button::has_button_b() {
+        "hold YES"
+    } else if tagged {
+        "hold PRG"
+    } else if crate::button::has_button_b() {
+        "A=yes B=no"
+    } else {
+        "hold 2s"
+    };
+    let hint = format!("same on phone? {button}");
+    Text::new(&hint, centred(&hint, l.font_small(), 50), small).draw(display).ok();
+
+    draw_countdown_bar(display, remaining, total_secs);
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
 /// Where a board's buttons are with the screen upright: which edge, and
 /// whether the approve button is the upper of the two. Turning the screen
 /// through 180 degrees (display_flip.rs) swaps both.

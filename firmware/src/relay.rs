@@ -408,6 +408,9 @@ struct SignCtx<'a, 'd, 'b> {
     /// Approved replies that no live session would take, waiting for the next
     /// one (#82). RAM only and short-lived; see `common::held_reply`.
     held_replies: heartwood_common::held_reply::HeldReplies,
+    /// A card's result screen that must stay up before anything replaces it
+    /// (an enrolment's check code, or the record to revoke). RAM only.
+    card_screen_hold: Option<ScreenHold>,
 }
 
 /// Timestamp for a reply to a request that arrived `held` ago.
@@ -1099,6 +1102,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         reply_clock: heartwood_common::reply_clock::ReplyClock::new(),
         button_cards: Vec::new(),
         held_replies: heartwood_common::held_reply::HeldReplies::new(),
+        card_screen_hold: None,
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -5041,6 +5045,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         Extension(String, String, String),
         Titled(&'static str, String),
         Batch(String, String),
+        Enrol([String; 3]),
     }
     let card = match &ctx.button_cards[0].asks[0].ask.card {
         crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading } => {
@@ -5074,10 +5079,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         crate::nip46_handler::AskCard::Receive { title } => {
             Draw::Titled("RECEIVE NOTE", title.clone())
         }
-        crate::nip46_handler::AskCard::PhoneEnrol { label, code, .. } => Draw::Titled(
-            crate::phone_unlock_cmd::ENROL_CARD_HEADER,
-            heartwood_common::phone_unlock::enrol_card_title(code, label),
-        ),
+        crate::nip46_handler::AskCard::PhoneEnrol { lines, .. } => Draw::Enrol(lines.clone()),
     };
     // What the panel now READS, once per wording, so a bench can check an
     // amount or a mint without a camera on the OLED (checklist 13, 2b).
@@ -5102,6 +5104,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             ),
             Draw::Titled(header, title) => ((*header).to_string(), title.clone()),
             Draw::Batch(header, title) => (header.clone(), title.clone()),
+            Draw::Enrol(lines) => ("ADD UNLOCK PHONE".to_string(), lines.join("\n")),
         };
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }
@@ -5136,6 +5139,9 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             remaining,
             CARD_WINDOW.as_secs() as u32,
         ),
+        Draw::Enrol(lines) => {
+            crate::oled::show_enrol_approval(ctx.display, &lines, remaining, CARD_WINDOW.as_secs() as u32)
+        }
     }
 }
 
@@ -5876,13 +5882,17 @@ fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick,
 // - the request has already spent the one-time mutation challenge, so it can
 //   raise one card at most, before or after a restart;
 // - one enrolment waits at a time, and its enrolment key is used once;
-// - the card leads with the request code, which Sapwood shows for the request
-//   it sent, so the owner presses for their own phone and not one raced in;
+// - the card leads with the request code, four words from the enrolment key,
+//   which the owner compares with the phone that made the key (never with the
+//   browser, which could have swapped the key), so they press for their own
+//   phone and not one raced in;
 // - the board is checked before the card and again at the press, and nothing
 //   is written until then: a card that expires, is declined, or dies with a
 //   restart leaves no trace but the used key and the spent challenge;
-// - a press with no relay live to carry the answer adds nothing, since a
-//   record whose hand-off cannot leave would be one nobody can use.
+// - a press with no relay heard from lately adds nothing, and neither does
+//   one whose answer would not fit the heap, since a record whose hand-off
+//   cannot leave would be one nobody can use; if the answer still reaches no
+//   live relay, the screen names the record to revoke instead of DONE.
 
 /// Put an `enrol_unlock_phone` request on the button. `Err` is the refusal
 /// the operator hears at once; `Ok` means the card will answer.
@@ -5905,51 +5915,55 @@ fn queue_phone_enrol(
             .first()
             .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::PhoneEnrol { .. }))
     });
-    if let Some(refusal) = phone_unlock::relay_enrol_gate(is_device_op, pending) {
-        return Err(refusal.message());
-    }
-    let (enrol_pubkey, label) = match PhoneCmd::from_mgmt(phone_unlock::ENROL_METHOD, req.get("params")) {
-        Some(Ok(PhoneCmd::Enrol { enrol_pubkey, label })) => (enrol_pubkey, label),
-        Some(Err(why)) => return Err(why.to_string()),
-        _ => return Err("malformed enrol_unlock_phone request".into()),
-    };
-    let label = crate::phone_unlock_cmd::default_label(label);
-    crate::phone_unlock_cmd::check_enrol(ctx.nvs, ctx.masters, &label)?;
-
     let master = &ctx.masters[master_idx];
     let master_slot = master.slot;
     let master_pk = master.pubkey;
     let operator_hex = hex_encode(operator);
-    let pk_hex = hex_encode(&enrol_pubkey);
     // Keyed on the enrolment key, so two enrolments never share one hold.
-    let key = AskKey::new(master_slot, operator_hex, hex_encode(&master_pk), format!("enrol:{}", &pk_hex[..16]));
-    let weight = 256;
-    let held_bytes: usize = ctx
-        .button_cards
-        .iter()
-        .flat_map(|card| card.asks.iter())
-        .map(|ask| ask.weight)
-        .sum();
-    let open = ctx.button_cards.first();
-    let admission = if held_bytes.saturating_add(weight) > CARD_BYTE_BUDGET {
-        Admission::Busy
-    } else {
-        admit(
-            open.map(|card| &card.key),
-            open.map(|card| card.asks.len()).unwrap_or(0),
-            ctx.button_cards.len().saturating_sub(1),
-            &key,
+    let ask_key = |pk: &[u8; 32]| {
+        AskKey::new(
+            master_slot,
+            operator_hex.clone(),
+            hex_encode(&master_pk),
+            format!("enrol:{}", &hex_encode(pk)[..16]),
         )
     };
-    if !matches!(admission, Admission::Open | Admission::Wait) {
-        return Err("signer is busy with another approval; retry shortly".into());
-    }
-    // Last, so a refusal above leaves the phone's code usable once the
-    // owner has fixed what was wrong. From here the key is spent whatever
-    // the card decides.
-    crate::phone_unlock_cmd::claim_enrol_key(&enrol_pubkey)?;
-
-    let code = phone_unlock::request_code(&enrol_pubkey);
+    let weight = 256;
+    let nvs = &mut *ctx.nvs;
+    let masters = ctx.masters;
+    let cards = &ctx.button_cards;
+    // The order is the host-tested one (phone_unlock::admit_relay_enrol);
+    // the mutation challenge was spent before this was called.
+    let (enrol_pubkey, label) = phone_unlock::admit_relay_enrol(
+        is_device_op,
+        pending,
+        || match PhoneCmd::from_mgmt(phone_unlock::ENROL_METHOD, req.get("params")) {
+            Some(Ok(PhoneCmd::Enrol { enrol_pubkey, label })) => {
+                Ok((enrol_pubkey, crate::phone_unlock_cmd::default_label(label)))
+            }
+            Some(Err(why)) => Err(why.to_string()),
+            _ => Err("malformed enrol_unlock_phone request".into()),
+        },
+        |(_, label)| crate::phone_unlock_cmd::check_enrol(nvs, masters, label),
+        |(pk, _)| {
+            let held_bytes: usize = cards.iter().flat_map(|card| card.asks.iter()).map(|ask| ask.weight).sum();
+            let open = cards.first();
+            held_bytes.saturating_add(weight) <= CARD_BYTE_BUDGET
+                && matches!(
+                    admit(
+                        open.map(|card| &card.key),
+                        open.map(|card| card.asks.len()).unwrap_or(0),
+                        cards.len().saturating_sub(1),
+                        &ask_key(pk),
+                    ),
+                    Admission::Open | Admission::Wait
+                )
+        },
+        // From here the key is spent whatever the card decides.
+        |(pk, _)| crate::phone_unlock_cmd::claim_enrol_key(pk).is_ok(),
+    )?;
+    let key = ask_key(&enrol_pubkey);
+    let lines = crate::phone_unlock_cmd::enrol_card_lines(&enrol_pubkey, &label);
     log::info!("[relay] enrol request {request_id} waiting on the button");
     ctx.button_cards.push(ButtonCard {
         key,
@@ -5957,7 +5971,7 @@ fn queue_phone_enrol(
         client_pubkey: *operator,
         asks: vec![ButtonAsk {
             ask: crate::nip46_handler::DeferredAsk {
-                card: crate::nip46_handler::AskCard::PhoneEnrol { enrol_pubkey, label, code },
+                card: crate::nip46_handler::AskCard::PhoneEnrol { enrol_pubkey, label, lines },
                 request: nip46::Nip46Request {
                     id: request_id.to_string(),
                     method: phone_unlock::ENROL_METHOD.to_string(),
@@ -5983,6 +5997,13 @@ fn queue_phone_enrol(
 }
 
 /// Settle an enrol card and answer the device operator on kind 24134.
+///
+/// On a press the board is read again and decided by
+/// `relay_enrol_completion`; the hand-off is sealed in RAM and the record
+/// written only if the answer carrying it fits the heap. The answer then goes
+/// to every configured (not pinned) session, and the screen says DONE with
+/// the check code only if at least one LIVE session took it; otherwise it
+/// names the record to revoke, since its secret left nowhere.
 fn resolve_phone_enrol_card(
     ctx: &mut SignCtx,
     sessions: &mut [RelaySession],
@@ -6003,60 +6024,52 @@ fn resolve_phone_enrol_card(
         log::warn!("[relay] enrol card: its identity is gone; nothing added, nothing answered");
         if on_screen && matches!(outcome, CardTick::Approved) {
             show_card_not_done(ctx, "Identity removed", "No phone added");
+            hold_card_screen(ctx);
         }
         return;
     };
     let signing_secret = zeroize::Zeroizing::new(ctx.masters[midx].secret);
+    let Ok(conversation_key) = nip44::get_conversation_key(&signing_secret, &operator) else {
+        log::warn!("[relay] enrol answer: conversation key failed; nothing added");
+        if on_screen && matches!(outcome, CardTick::Approved) {
+            show_card_not_done(ctx, "No phone added", "see Sapwood");
+            hold_card_screen(ctx);
+        }
+        return;
+    };
+    let answer_json = |result: Result<serde_json::Value, String>| match result {
+        Ok(value) => serde_json::json!({ "id": request_id, "result": value }).to_string(),
+        Err(e) => serde_json::json!({ "id": request_id, "error": e }).to_string(),
+    };
 
-    let result: Result<serde_json::Value, String> = match outcome {
+    let result: Result<heartwood_common::phone_unlock::Enrolment, String> = match outcome {
         CardTick::Approved => {
             let operator_current = ctx.op_mgmt == Some(operator);
-            let relay_live = sessions.iter().any(|s| !s.pinned);
-            let refusal = crate::phone_unlock_cmd::enrol_facts(ctx.nvs, ctx.masters, &label).and_then(|facts| {
-                match phone_unlock::relay_enrol_completion(operator_current, relay_live, &facts) {
-                    Some(refusal) => Err(refusal.message()),
-                    None => Ok(()),
-                }
-            });
-            refusal
-                .and_then(|()| crate::phone_unlock_cmd::complete_enrol(ctx.nvs, ctx.masters, &enrol_pubkey, &label))
-                .map(|enrolment| {
-                    if on_screen {
-                        crate::phone_unlock_cmd::show_enrolled(ctx.display, &enrolment);
-                    }
-                    phone_unlock::enrolment_json(&enrolment)
-                })
+            let relay_live = sessions.iter().any(session_live_for_answer);
+            crate::phone_unlock_cmd::complete_enrol(
+                ctx.nvs,
+                ctx.masters,
+                &enrol_pubkey,
+                &label,
+                |facts| phone_unlock::relay_enrol_completion(operator_current, relay_live, facts),
+                // Checked before the record is written: an answer the heap
+                // cannot carry must not leave a record behind it.
+                |enrolment| {
+                    response_transportable(answer_json(Ok(phone_unlock::enrolment_json(enrolment))).len())
+                },
+            )
         }
         CardTick::Denied => Err("declined on the board".into()),
         _ => Err("not confirmed on the board in time: start again on the phone".into()),
     };
-    if on_screen {
-        match (outcome, &result) {
-            (CardTick::Approved, Ok(_)) => {
-                // Long enough to compare the check code with the phone's.
-                ctx.last_activity = Instant::now();
-                ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(20));
-            }
-            (CardTick::Approved, Err(e)) => {
-                log::warn!("[relay] enrol card pressed but not done: {e}");
-                show_card_not_done(ctx, "No phone added", "see Sapwood");
-            }
-            (CardTick::Denied, _) => crate::oled::show_denied(ctx.display),
-            _ => crate::oled::show_request_expired(ctx.display),
-        }
+    let added = result.as_ref().ok().map(|e| (e.id, phone_unlock::check_code(&e.ephemeral_pubkey)));
+    if let (CardTick::Approved, Err(e)) = (outcome, &result) {
+        log::warn!("[relay] enrol card pressed but no phone added: {e}");
     }
+    let response_json = answer_json(result.map(|e| phone_unlock::enrolment_json(&e)));
 
-    let added = result.is_ok();
-    let response_json = match result {
-        Ok(value) => serde_json::json!({ "id": request_id, "result": value }).to_string(),
-        Err(e) => serde_json::json!({ "id": request_id, "error": e }).to_string(),
-    };
-    let Ok(conversation_key) = nip44::get_conversation_key(&signing_secret, &operator) else {
-        log::warn!("[relay] enrol answer: conversation key failed");
-        return;
-    };
     let held = Duration::from_secs(crate::uptime_s().saturating_sub(ask.received_uptime));
-    let sealed = match seal_reply(
+    let sealed = seal_reply(
         ctx.secp,
         &signing_secret,
         &conversation_key,
@@ -6064,33 +6077,113 @@ fn resolve_phone_enrol_card(
         MGMT_KIND,
         reply_stamp(ctx, ask.created_at, held),
         response_json,
-    ) {
-        Ok(sealed) => sealed,
-        Err(e) => {
-            log::warn!("[relay] enrol answer for {request_id}: {e}");
-            return;
-        }
-    };
+    );
     // Management answers go out on the configured relays only, never on a
     // relay a pairing pinned: that is where the operator listens, and the
-    // management channel has no business on someone else's relay.
-    for index in publish_order(sessions) {
-        if sessions[index].pinned {
-            continue;
+    // management channel has no business on someone else's relay. Every one
+    // of them is offered it; delivery counts only on a live one.
+    let mut delivered = 0usize;
+    match &sealed {
+        Ok(sealed) => {
+            for session in sessions.iter_mut().filter(|s| !s.pinned) {
+                let live = session_live_for_answer(session);
+                match publish_sealed(&mut session.tls, sealed) {
+                    Ok(()) if live => delivered += 1,
+                    Ok(()) => {}
+                    Err(e) => log::warn!(
+                        "[relay] {} would not take the enrol answer for {request_id}: {e}",
+                        relay_host(&session.url)
+                    ),
+                }
+            }
         }
-        match publish_sealed(&mut sessions[index].tls, &sealed) {
-            Ok(()) => return,
-            Err(e) => log::warn!(
-                "[relay] {} would not take the enrol answer for {request_id}: {e}",
-                relay_host(&sessions[index].url)
-            ),
+        Err(e) => log::warn!("[relay] enrol answer for {request_id} not sealed: {e}"),
+    }
+
+    if let Some((id, _)) = &added {
+        if delivered == 0 {
+            // The record wraps the data key under a secret that left nowhere:
+            // it unlocks nothing, but it takes a place until revoked.
+            log::warn!("[relay] enrol answer for {request_id} not sent; revoke phone {id}");
         }
     }
-    if added {
-        // The record holds a wrapper nobody can open: its slot secret left
-        // only inside this answer. Harmless, but it takes a place.
-        log::warn!("[relay] enrol answer for {request_id} not delivered; the new record is unusable, revoke it from the list");
+    if !on_screen {
+        return;
     }
+    match (outcome, &added) {
+        (CardTick::Approved, Some((_, check))) if delivered > 0 => {
+            crate::oled::show_change_done(ctx.display, "Phone added", &format!("check {check}"));
+            hold_card_screen(ctx);
+        }
+        (CardTick::Approved, Some((id, _))) => {
+            show_card_not_done(ctx, "Not sent", &format!("revoke id {id}"));
+            hold_card_screen(ctx);
+        }
+        (CardTick::Approved, None) => {
+            show_card_not_done(ctx, "No phone added", "see Sapwood");
+            hold_card_screen(ctx);
+        }
+        (CardTick::Denied, _) => crate::oled::show_denied(ctx.display),
+        _ => crate::oled::show_request_expired(ctx.display),
+    }
+}
+
+/// Whether a session counts as able to carry an answer now: configured (not
+/// pinned) and heard from within a ping interval. A socket whose uplink has
+/// gone quiet still accepts writes into its buffer, so a write alone proves
+/// nothing.
+fn session_live_for_answer(s: &RelaySession) -> bool {
+    !s.pinned && s.last_rx.elapsed() < PING_INTERVAL
+}
+
+/// How long an enrolment's result stays on screen before the next card, or
+/// the idle screen, may replace it: long enough to compare the check code
+/// with the phone's. A press ends it sooner.
+const CARD_RESULT_HOLD: Duration = Duration::from_secs(20);
+
+/// A result screen holding the display (see [`CARD_RESULT_HOLD`]).
+struct ScreenHold {
+    until: Instant,
+    /// Armed once the button has been seen up, so the release of the hold
+    /// that approved the card does not dismiss its own result.
+    armed: bool,
+}
+
+/// Keep what was just drawn on screen for [`CARD_RESULT_HOLD`].
+fn hold_card_screen(ctx: &mut SignCtx) {
+    crate::button::clear_press_edge();
+    ctx.card_screen_hold = Some(ScreenHold { until: Instant::now() + CARD_RESULT_HOLD, armed: false });
+    ctx.last_activity = Instant::now();
+    ctx.network_display_restore_at = Some(Instant::now() + CARD_RESULT_HOLD);
+}
+
+/// Whether a held result screen still owns the display. Ends at its time,
+/// or at a press (A or B) made after the approving hold was let go.
+fn card_screen_held(ctx: &mut SignCtx) -> bool {
+    let Some(hold) = ctx.card_screen_hold.as_mut() else {
+        return false;
+    };
+    let mut done = Instant::now() >= hold.until;
+    if !done {
+        if !hold.armed {
+            if crate::button::hold_ms() == 0 {
+                hold.armed = true;
+                // The approving hold's own release, if the sampler kept it.
+                let _ = crate::button::take_release();
+                ctx.buttons.drain_b();
+            }
+        } else if crate::button::take_release().is_some() || ctx.buttons.b_pressed() {
+            ctx.buttons.drain_b();
+            done = true;
+        }
+    }
+    if done {
+        ctx.card_screen_hold = None;
+        crate::button::clear_press_edge();
+        ctx.button_settle = ctx.buttons.a.is_low();
+        ctx.network_display_restore_at = Some(Instant::now());
+    }
+    !done
 }
 
 /// Build the kind-1059 for a `send`: the note as a rumor authored by the
@@ -6152,7 +6245,9 @@ pub(crate) fn wall_clock_estimate() -> u64 {
 /// whole batch answered when it resolves. Called once per relay loop pass, so
 /// the websocket, the USB cable and the other clients keep running underneath.
 fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
-    if ctx.button_cards.is_empty() {
+    // An enrolment's result stays up for its window (or until a press)
+    // before the next card is drawn over it.
+    if card_screen_held(ctx) || ctx.button_cards.is_empty() {
         return;
     }
 
@@ -6191,9 +6286,10 @@ fn show_card_not_done(ctx: &mut SignCtx, title: &str, hint: &str) {
     ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(5));
 }
 
-/// True while an approval card owns the screen and the button.
+/// True while an approval card, or a result screen held after one, owns the
+/// screen and the button.
 fn approval_card_open(ctx: &SignCtx) -> bool {
-    !ctx.button_cards.is_empty()
+    !ctx.button_cards.is_empty() || ctx.card_screen_hold.is_some()
 }
 
 fn sign_audit_draft(

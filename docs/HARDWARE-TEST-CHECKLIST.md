@@ -2290,21 +2290,30 @@ subscribed to `{"kinds":[24135]}`).
 `enrol_unlock_phone` does over the relay what `PHONE_UNLOCK_CMD` (0x64)
 `{"op":"enrol"}` does over the cable, on the deferred card queue (#64), so the
 relay loop keeps serving while the card is up. Device operator only, behind the
-one-time mutation challenge; the card (`ADD UNLOCK PHONE`) leads with the
-request code, and the DONE screen shows the check code. Logic and host tests:
-`common/src/phone_unlock.rs` (relay enrolment section).
+one-time mutation challenge. The card (`ADD UNLOCK PHONE`) leads with the
+request code, four words from the phone's enrolment key, two a line, then
+`for <label>`, and its hint asks "same on phone?". The owner compares the
+board with the phone that made the key, never with the browser. The result
+screen (DONE with the check code, or NOT DONE) stays up 20 s or until a press.
+Logic and host tests: `common/src/phone_unlock.rs` (relay enrolment section),
+`common/src/spoken_words.rs`.
+
+Sapwood and Cambium support are pending follow-ups: until they land, the
+bench script stands in for both (`enrol` is itself the phone and prints the
+words to compare; `enrol-for` needs a Cambium that shows the words).
 
 Needs a WiFi board with a vault key, unlocked, the device operator key in
 `~/heartwood-bench/operator.key`, `HEARTWOOD_RELAYS` (or `--mgmt-relay`) set to
 the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
 
 1. **Enrol over the relay.** `node scripts/phone-unlock.mjs enrol
-   --over-relay --label "relay phone"`. The script prints the request code;
-   the board's card reads the same six characters over "for relay phone".
-   While the card is up, a USB `FIRMWARE_INFO` and a `get_status` over the
-   relay both answer. Hold: the board shows DONE "Phone added" with a check
-   code, the script prints the same check code and "enrolled as id N", and
-   `list` shows the phone. Reset the board and run `listen`: it unlocks.
+   --over-relay --label "relay phone"`. The script (the phone here) prints
+   four words; the board's card shows the same four words, two a line, over
+   "for relay phone", and all four are readable on the OLED. While the card is
+   up, a USB `FIRMWARE_INFO` and a `get_status` over the relay both answer.
+   Hold: DONE "Phone added" with a check code stays up about 20 s, the script
+   prints the same check code and "enrolled as id N", and `list` shows the
+   phone. Reset the board and run `listen`: it unlocks.
 
 2. **Decline and expiry add nothing.** Repeat with a new run and press B
    (or a short press): the script says "refused: declined on the board";
@@ -2328,28 +2337,44 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
    device operator", no card.
 
 6. **Refused before any card.** Each answers at once with no card: a label
-   with a newline ("label must be one line of printable text"), a board with
-   at-rest encryption off ("set a PIN or vault key first"), and a board
-   already holding 16 phones ("16 phones already enrolled; revoke one first";
-   the legacy V4 storage-limit run in the phase 6 list can share this setup).
+   with a newline or a non-ASCII letter ("label must be printable ASCII"), a
+   board with at-rest encryption off ("set a PIN or vault key first"), and a
+   board already holding 16 phones ("16 phones already enrolled; revoke one
+   first"; the legacy V4 storage-limit run in the phase 6 list can share this
+   setup).
 
-7. **Checked again at the press.** Start an enrolment, pull the board's WiFi
-   uplink so every relay session drops, then hold. The card turns to NOT DONE
-   "No phone added", and `list`, once the uplink is back, shows no new record.
+7. **No live relay at the press adds nothing.** Start an enrolment and, as
+   soon as the card appears, cut the board's WiFi uplink at the access point
+   (the board keeps its association, so its sockets stay open but hear
+   nothing). Wait until the countdown shows 7 s or less (more than the 20 s
+   ping interval after the cut), then hold. The card turns to NOT DONE
+   "No phone added / see Sapwood", the log says "no relay was live to carry
+   the answer", and `list`, once the uplink is back, shows no new record.
 
-8. **Restart mid-card.** Start an enrolment and reset the board while the card
+8. **Not sent names the record.** Harder to stage, optional: make the
+   answer's publish fail after the record is written (for example, a relay
+   that closes the socket on any EVENT, as the only configured relay). The
+   board shows NOT DONE "Not sent / revoke id N", the log names N, and
+   `revoke --id N` removes it.
+
+9. **Restart mid-card.** Start an enrolment and reset the board while the card
    is up. After the unlock, `list` shows no new record and the script times
-   out; a fresh run from the same phone code (enrol-for) is accepted, since
+   out; a fresh `enrol-for` run from the same phone code is accepted, since
    the key is remembered in RAM only.
 
-9. **Cable card shows the code too.** `phone-unlock.mjs enrol` over USB: the
-   card reads the printed request code, and DONE shows the check code.
+10. **The result screen holds.** Queue a sign request behind an enrolment
+    card (any client, unapproved kind). After the press, DONE stays up about
+    20 s before the sign card appears, or goes as soon as the button is
+    pressed again (the release of the approving hold does not dismiss it).
 
-10. **Wire capture.** Subscribe to `{"kinds":[24134,24137]}` during step 1:
+11. **Cable card matches.** `phone-unlock.mjs enrol` over USB: the same card
+    layout and four words, and DONE shows the check code.
+
+12. **Wire capture.** Subscribe to `{"kinds":[24134,24137]}` during step 1:
     the only new traffic is the operator's 24134 request, the board's 24134
-    answer (both one `p` tag) and, for `enrol-for`, Sapwood's or the script's
-    24137 tagged with the one-off rendezvous tag. No event carries the label,
-    the enrolment key or the phone's id in the clear.
+    answer (both one `p` tag) and, for `enrol-for`, the 24137 tagged with the
+    one-off rendezvous tag. No event carries the label, the enrolment key or
+    the phone's id in the clear.
 
 ## Notes
 

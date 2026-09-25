@@ -280,9 +280,11 @@ They **cannot** extract or replace the master seed, rotate the management trust
 root, disable the radio into USB-only mode, change the boot PIN, or push
 firmware. They can list and revoke unlock phones, but adding one, which would
 be a persistent way to release the data key after a restart, still takes the
-owner's press on the board's card: the card leads with a request code derived
-from the phone's enrolment key, and Sapwood shows the code for the request it
-sent, so a card the owner did not ask for reads differently. Recovery: revoke the rogue client and restore a known-good network
+owner's press on the board's card. The card leads with four words derived from
+the enrolment key, and the owner compares them with the phone that made that
+key, not with the browser: an attacker holding the operator key (or the
+browser itself) can swap in a key of their own, and could show matching words
+in the browser, but not on the owner's phone. Recovery: revoke the rogue client and restore a known-good network
 configuration; if the attacker has removed every route the owner knows, that
 recovery is necessarily over trusted USB. Rotating the operator key likewise
 requires a trusted USB re-flash (it is baked into the config partition).
@@ -570,16 +572,26 @@ is always a press on the board, whichever way the request arrives:
   up, so a replay (live, or after a restart) raises no card. The card is held
   on the deferred-approval queue (#64): 30 s on screen, at most 90 s waiting
   behind other cards, one enrolment at a time, RAM only.
-- **What the owner checks:** both cards lead with the request code
-  (spoken-token hex of the phone's one-off enrolment key P); Sapwood shows the
-  code of the request it sent. After the press the board shows the check code
+- **What the owner checks:** both cards lead with the request code, four
+  words of spoken-token's 2048-word list from the phone's one-off enrolment
+  key P (`deriveToken(P, 'heartwood-unlock:enrol-request', 0, {format:
+  'words', count: 4})`, 44 bits), and the owner holds only if the PHONE, which
+  made P, shows the same four words (Cambium support pending). A browser may
+  show them too, but only as a convenience: whoever relays the request can
+  replace P, and the words in the browser with it. Four words rather than
+  three because the attacker chooses P: 33 bits could be ground inside a
+  card's window or looked up in a table built beforehand. The label is
+  printable ASCII only and always drawn behind "for " on its own line, so it
+  can never pass as the words. After the press the board shows the check code
   (from its one-off hand-off key), which the phone and Sapwood also show.
 - **Only while unlocked:** a locked board serves no management at all, and
   the board is checked again at the press (the operator is still the device
-  operator, a configured relay is live to carry the answer, a data key, relays,
-  fewer than 16 phones). Nothing is written before the press, so a card that
-  is declined, expires or is lost to a restart leaves no record; the phone's
-  enrolment key is spent either way and the phone starts again.
+  operator, a configured relay has been heard from within the ping interval,
+  a data key, relays, fewer than 16 phones), and the record is written only
+  once the answer carrying the hand-off is known to fit the heap. Nothing is
+  written before the press, so a card that is declined, expires or is lost to
+  a restart leaves no record; the phone's enrolment key is spent either way
+  and the phone starts again.
 - **Nothing new on the wire:** the request and answer are the existing
   operator ⇄ identity 24134 exchange (NIP-44, the label and P only inside
   it); the hand-off Sapwood passes to the phone is byte-for-byte the cable's.
@@ -588,9 +600,12 @@ is always a press on the board, whichever way the request arrives:
   address at that moment, which is weaker than the stable link Cambium's own
   NIP-46 pairing already makes.
 - **Residual: a lost answer.** The record is written before the answer is
-  published (a phone is never handed a secret the board did not keep). An
-  answer no relay takes leaves a record whose secret nobody holds; it unlocks
-  nothing and is removed with a revoke.
+  published (a phone is never handed a secret the board did not keep). The
+  answer is offered to every configured relay session; if no live one takes
+  it, the board says "Not sent / revoke id N" instead of DONE and logs the id.
+  Such a record's secret left nowhere: it unlocks nothing and is removed with
+  a revoke. A relay can still accept the answer and lose it, which only the
+  phone never receiving a hand-off shows.
 
 ## What the design already gets right
 

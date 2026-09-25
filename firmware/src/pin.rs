@@ -229,6 +229,55 @@ pub fn at_rest_status(
     heartwood_common::at_rest_status::resolve(encrypted, wrap, marker, phone_blob_len, phone_blob)
 }
 
+/// `phone_relays` in FIRMWARE_INFO and get_status (plan G2's Sapwood
+/// follow-up, third bullet): whether the enrolled phones still need telling
+/// about the board's current relays. Same idiom as [`at_rest_status`] above
+/// and for the same reason — a shared `&EspNvs` read, `blob_len` then
+/// `get_blob` sized to the blob's own length, never a [`BlobStore`], because
+/// the low-heap get_status fallback runs behind a `&SignCtx` and can never
+/// promote it to a mutable reference. Never writes: unlike `relays_at_boot`,
+/// which settles a missing or shrunk record, a status read leaves the record
+/// exactly as it found it for the boot's own relay-update logic to act on.
+///
+/// `have_phones` is the caller's already-computed `unlock_phone_count > 0`
+/// (from this same function's other return value) rather than a second read
+/// of `dk_ph`: FIRMWARE_INFO and get_status both call `at_rest_status` first
+/// and already have the count in hand, so this needs no extra phone-blob
+/// read and inherits its damage handling (a corrupt `dk_ph`, or one orphaned
+/// by `at_rest` being `none`, already counts as "no phones" there).
+///
+/// The current relay list comes from the active net config (`net_config_store
+/// ::read_net_config`), not a network trial candidate: a trial is inert until
+/// committed and rolls back on its own, so basing "phones not yet told" on a
+/// list that may never take effect would be the more surprising choice.
+pub fn phone_relay_status(
+    nvs: &EspNvs<NvsDefault>,
+    have_phones: bool,
+) -> heartwood_common::phone_relays::PhoneRelayStatus {
+    use heartwood_common::phone_relays::{RecordRead, MAX_TOLD_READ_LEN, TOLD_RELAYS_KEY};
+
+    let current: Vec<String> = crate::net_config_store::read_net_config(nvs)
+        .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
+        .map(|cfg| cfg.relays)
+        .unwrap_or_default();
+
+    let told_len = match nvs.blob_len(TOLD_RELAYS_KEY) {
+        Ok(len) => len,
+        Err(_) => Some(usize::MAX),
+    };
+    let safe_len = told_len.filter(|&len| len <= MAX_TOLD_READ_LEN);
+    let mut buf = vec![0u8; safe_len.unwrap_or(0).max(1)];
+    let record = match (told_len, safe_len) {
+        (None, _) => RecordRead::Absent,
+        (Some(_), None) => RecordRead::Unreadable,
+        (Some(len), Some(_)) => match nvs.get_blob(TOLD_RELAYS_KEY, &mut buf) {
+            Ok(Some(b)) if b.len() == len => RecordRead::Present(b),
+            _ => RecordRead::Unreadable,
+        },
+    };
+    heartwood_common::phone_relays::relay_status(have_phones, &current, record)
+}
+
 /// Try to unlock with the PIN or vault key, filling `.secret` in RAM.
 /// All-or-nothing: nothing is filled unless every locked slot opened.
 ///

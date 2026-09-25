@@ -166,6 +166,13 @@ use secp256k1::Secp256k1;
 /// is JSON `null`, not `0`, when a present phone blob fails to parse — damage
 /// is never reported as "no phones" — except when `at_rest` is `"none"`,
 /// which always reports `0`.
+///
+/// `phone_relays` (plan G2's Sapwood follow-up) is `"current"`, `"pending"` or
+/// `"unknown"` — whether an enrolled phone still listens only on relays this
+/// board has since left. Also a pure read (`pin::phone_relay_status`),
+/// answered while locked for the same reason `at_rest` is: a stranded phone
+/// is exactly the case where a locked board most needs to be legible without
+/// waiting for an unlock.
 pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>) -> String {
     let crash = crash_context()
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
@@ -190,12 +197,13 @@ pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDe
         })
         .unwrap_or_default();
     let (at_rest, unlock_phones) = pin::at_rest_status(nvs);
+    let phone_relays = pin::phone_relay_status(nvs, unlock_phones.unwrap_or(0) > 0);
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
          \"free_heap\":{},\"largest_block\":{},\"display_flip\":{},\
-         \"at_rest\":\"{}\",\"unlock_phone_count\":{}{}{}}}",
+         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -209,6 +217,7 @@ pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDe
         display_flip::is_flipped(),
         at_rest.wire(),
         json_usize_or_null(unlock_phones),
+        phone_relays.wire(),
         crash,
         nvs_stats,
     )

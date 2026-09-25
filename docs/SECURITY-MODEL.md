@@ -491,6 +491,25 @@ changes hands:
   always reports `0` (a leftover `dk_ph` from removing the last identity, or
   from disabling encryption on older firmware, is moot once there is no data
   key left for it to wrap).
+- The same two replies also carry `phone_relays` (`current`/`pending`/
+  `unknown`), so a manager can show "phones not yet told" once a relay change
+  leaves an enrolled phone stranded on relays this board has since left (see
+  the relay-change record below). `current`: no phones enrolled, no live
+  relay configured, or the phones already know every relay in use — including
+  once some old relay has accepted a delivery for a change still mid-update,
+  which is this module's own definition of "reached the phones" (the
+  remaining rounds are insurance against a phone that was briefly offline,
+  not the risk this field flags). `pending`: a live relay the phones were
+  never told about, and no old relay has yet accepted a delivery. `unknown`:
+  the record exists but this firmware cannot read it — distinct from no
+  record at all, which is `current` (nothing is yet known to be wrong).
+  Resolved by `heartwood_common::phone_relays::relay_status`, host-tested for
+  every state, behind a pure firmware read (`pin::phone_relay_status`) that
+  never writes — same idiom as `at_rest_status` above, for the same reason:
+  the low-heap `get_status` fallback runs behind a shared reference it can
+  never promote to a mutable one. Device-only, like `at_rest` and
+  `unlock_phone_count`: excluded from both delegate reply shapes by the same
+  `DELEGATE_STATUS_KEYS`/`DELEGATE_STATUS_FALLBACK_KEYS` mechanism, host-tested.
 - The wrapped data key (`dk_sec`) does not itself record which secret wrapped
   it — same shape for a PIN and a vault key — so telling `pin` from `vault`
   needed a marker (`common/src/data_key.rs`: kind byte + the first 8 bytes of

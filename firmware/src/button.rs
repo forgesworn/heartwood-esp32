@@ -339,9 +339,14 @@ fn spawn_press_latch(gpio: i32) {
                         // Release: publish how long it was held, so a loop too
                         // slow to see the hold itself can still tell an early
                         // release (a deny) from a completed hold.
+                        // The release first, then the hold back to 0, both
+                        // Release: a reader that sees the hold at 0 (hold_ms,
+                        // Acquire) then finds the release waiting, and never
+                        // reads "up, nothing released" in the middle of a
+                        // hold (an approval card arming mid-hold).
                         let held = low_since.elapsed().as_millis().min(u32::MAX as u128) as u32;
-                        HOLD_MS.store(0, Ordering::Relaxed);
-                        RELEASE_MS.store(held.max(1), Ordering::Relaxed);
+                        RELEASE_MS.store(held.max(1), Ordering::Release);
+                        HOLD_MS.store(0, Ordering::Release);
                     }
                 }
 
@@ -374,7 +379,7 @@ pub fn clear_press_edge() {
 /// How long the button has been held down right now, in milliseconds; 0 when
 /// it is up. Non-blocking, safe to call from a loop that runs once a second.
 pub fn hold_ms() -> u32 {
-    HOLD_MS.load(Ordering::Relaxed)
+    HOLD_MS.load(Ordering::Acquire)
 }
 
 /// Consume the length of the last completed press, in milliseconds.
@@ -384,7 +389,7 @@ pub fn hold_ms() -> u32 {
 /// at 15 ms whatever the loop is doing, so a press that started and ended
 /// entirely between two loop passes is still reported exactly once.
 pub fn take_release() -> Option<u32> {
-    match RELEASE_MS.swap(0, Ordering::Relaxed) {
+    match RELEASE_MS.swap(0, Ordering::AcqRel) {
         0 => None,
         ms => Some(ms),
     }

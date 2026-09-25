@@ -102,6 +102,17 @@ pub fn next_locked_boot(nvs: &mut EspNvs<NvsDefault>) -> u32 {
     next
 }
 
+/// The locked-restart count as it stands, without counting anything. A relay
+/// update carries it so it seals to the same size as this boot's lock
+/// announcements.
+pub fn locked_boots(nvs: &EspNvs<NvsDefault>) -> u32 {
+    let mut buf = [0u8; 4];
+    match nvs.get_blob(LOCKED_BOOTS_KEY, &mut buf) {
+        Ok(Some(b)) if b.len() == 4 => u32::from_be_bytes(buf),
+        _ => 0,
+    }
+}
+
 /// Whether the locked board should also publish the operator's announcement.
 pub fn announce_operator(nvs: &EspNvs<NvsDefault>) -> bool {
     let mut buf = [0u8; 1];

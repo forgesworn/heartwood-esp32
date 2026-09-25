@@ -543,6 +543,11 @@ mod tests {
             "clear_client_identities",
             "client_uri",
             "set_identity_meta",
+            // Adds authority to unlock: the challenge is spent before the
+            // card goes up, so a replayed request never raises a second one.
+            "enrol_unlock_phone",
+            "revoke_unlock_phone",
+            "set_announce_operator",
             "future_mutation",
             "",
         ] {

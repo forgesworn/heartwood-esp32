@@ -5,6 +5,8 @@
 
 extern crate alloc;
 
+/// When a cable approval card starts listening to the A button.
+pub mod button_arm;
 pub mod deadline;
 pub mod derive;
 pub mod encoding;
@@ -131,10 +133,22 @@ pub mod note_seal;
 #[cfg(feature = "seed-encrypt")]
 pub mod data_key;
 
+/// The at-rest mode and unlock-phone count reported in FIRMWARE_INFO and
+/// get_status, derived from `data_key`'s durable state.
+#[cfg(feature = "seed-encrypt")]
+pub mod at_rest_status;
+
 /// Phone unlock on the wire: per-phone lock announcements, deliveries and the
 /// phone's prompt rule.
 #[cfg(all(feature = "seed-encrypt", feature = "nip44", feature = "nip46"))]
 pub mod phone_unlock;
+/// spoken-token's en-v1 word list, for phone unlock's request code.
+pub mod spoken_words;
+
+/// Phone unlock across a relay change: the record of what the phones were
+/// told, and when and where a board tells them again.
+#[cfg(all(feature = "seed-encrypt", feature = "nip44", feature = "nip46"))]
+pub mod phone_relays;
 
 #[cfg(feature = "mnemonic")]
 pub mod restore;

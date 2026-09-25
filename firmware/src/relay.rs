@@ -63,6 +63,7 @@ use heartwood_common::net_config::{
 };
 use heartwood_common::data_key::PhoneSet;
 use heartwood_common::nip44;
+use heartwood_common::phone_relays;
 use heartwood_common::phone_unlock::{self, LockContext};
 use heartwood_common::nip46::{self, SignedEvent, UnsignedEvent};
 use heartwood_common::policy::{validate_exact_slot_policy, ExactSlotPolicy};
@@ -407,6 +408,9 @@ struct SignCtx<'a, 'd, 'b> {
     /// Approved replies that no live session would take, waiting for the next
     /// one (#82). RAM only and short-lived; see `common::held_reply`.
     held_replies: heartwood_common::held_reply::HeldReplies,
+    /// A card's result screen that must stay up before anything replaces it
+    /// (an enrolment's check code, or the record to revoke). RAM only.
+    card_screen_hold: Option<ScreenHold>,
 }
 
 /// Timestamp for a reply to a request that arrived `held` ago.
@@ -427,6 +431,13 @@ fn reply_stamp(ctx: &SignCtx, request_created_at: u64, held: Duration) -> u64 {
 /// the USB-serving wait windows, so a wake press keeps working while WiFi is
 /// reconnecting instead of playing dead for the length of the retry.
 fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
+    // A held result screen (PHONE ADDED) owns the button: a press dismisses
+    // it, and nothing pages the carousel over it. The loop's WiFi-down and
+    // no-relay waits call this at 20 ms, so the press is caught there too.
+    if ctx.card_screen_hold.is_some() {
+        service_card_screen_hold(ctx);
+        return;
+    }
     // The finger that approved (or declined) the last card is still coming
     // off the button. A 2 s hold does not end the instant the bar fills, and
     // the release that follows was reported from the bench as "approving
@@ -588,7 +599,10 @@ fn show_network_feedback(
     // see, and the hold they do make lands on whatever replaced it. Found
     // running checklist section 14, where a RECEIVE card was clobbered by
     // the wifi-standalone screen mid-decision.
-    if approval_card_open(ctx) {
+    // A result held past its first 20 s (PHONE ADDED, waiting on a press)
+    // does not block a status: the status shows, and the result comes back
+    // after it.
+    if screen_busy(ctx) {
         return;
     }
     if wake && !ctx.display_on {
@@ -600,7 +614,11 @@ fn show_network_feedback(
     }
     crate::oled::show_network_status(ctx.display, state);
     ctx.last_activity = Instant::now();
-    ctx.network_display_restore_at = restore_after.map(|delay| Instant::now() + delay);
+    if ctx.card_screen_hold.is_some() {
+        interrupt_held_result(ctx, restore_after.unwrap_or(Duration::from_secs(3)), false);
+    } else {
+        ctx.network_display_restore_at = restore_after.map(|delay| Instant::now() + delay);
+    }
 }
 
 fn set_network_runtime(
@@ -769,6 +787,12 @@ struct RelaySession {
     rx: Vec<u8>,
     last_rx: Instant,
     last_ping: Instant,
+    /// The silence limit counts from the later of this and `last_rx`. A
+    /// cable card that holds the loop (an enrol card can take about 55 s
+    /// with its release wait) moves it on, so a quiet relay is not redialled
+    /// for silence the board itself caused; `last_rx` stays what was really
+    /// heard, which the enrol card's liveness snapshot depends on.
+    silence_from: Instant,
     last_resub: Instant,
     recv_timeout_on: bool,
     /// Wall clock from this relay's `Date` header at upgrade, if it sent one.
@@ -981,13 +1005,46 @@ pub fn run_wifi_standalone<'d, 'b>(
     //
     // The phase runs when someone can answer it: the operator (Sapwood), or
     // an enrolled phone (phone unlock, docs/specs/2026-09-24-phone-unlock-design.md).
-    if crate::pin::is_locked(masters) && !relays.is_empty() {
-        let phones = heartwood_common::data_key::load_phones(&crate::data_key_store::NvsBlobs(nvs))
-            .unwrap_or_else(|e| {
-                log::error!("[relay] phone records unreadable ({e:?}); phone unlock off this boot");
-                heartwood_common::data_key::PhoneSet::default()
-            });
-        if op_mgmt.is_some() || !phones.is_empty() {
+    //
+    // Phone unlock also has to follow relay changes. A change takes effect
+    // only through a restart, so this is the one place to notice one: if the
+    // live list has a relay the phones were never told about, `told.old` is
+    // the list they were told, where they still listen. The locked phase
+    // repeats its lock announcements there, and the unlocked loop posts
+    // relay updates there (RelayUpdate), resuming from the rounds an earlier
+    // boot already sent. See heartwood_common::phone_relays.
+    let told: phone_relays::BootRelays = {
+        let phones = if relays.is_empty() {
+            PhoneSet::default()
+        } else {
+            heartwood_common::data_key::load_phones(&crate::data_key_store::NvsBlobs(nvs))
+                .unwrap_or_else(|e| {
+                    log::error!("[relay] phone records unreadable ({e:?}); phone unlock off this boot");
+                    PhoneSet::default()
+                })
+        };
+        let told = phone_relays::relays_at_boot(
+            &mut crate::data_key_store::NvsBlobs(nvs),
+            !phones.is_empty(),
+            network_trial_id.is_some(),
+            &relays,
+        )
+        .unwrap_or_else(|_| {
+            log::warn!("[relay] phones' relay record unreadable; no relay update this boot");
+            phone_relays::BootRelays::default()
+        });
+        if told.unreadable {
+            log::warn!("[relay] phones' relay record not readable by this firmware; left as it is, no relay update this boot");
+        }
+        if !told.old.is_empty() {
+            log::info!(
+                "[relay] relays changed since the phones were told; telling them on {} old relay(s), {} of {} update rounds already sent",
+                told.old.len(),
+                told.rounds_done,
+                phone_relays::ROUNDS
+            );
+        }
+        if crate::pin::is_locked(masters) && !relays.is_empty() && (op_mgmt.is_some() || !phones.is_empty()) {
             log::info!("[relay] seeds locked — entering vault-unlock phase");
             locked_relay_phase(
                 &mut wifi,
@@ -995,6 +1052,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 &relays,
                 op_mgmt.as_ref(),
                 &phones,
+                &told.old,
                 secp,
                 masters,
                 personas,
@@ -1004,7 +1062,13 @@ pub fn run_wifi_standalone<'d, 'b>(
                 buttons,
             );
         }
-    }
+        told
+    };
+    let mut relay_update = phone_relays::UpdatePlan::from_boot(told).map(|plan| RelayUpdate {
+        plan,
+        key: None,
+        deferral_logged: false,
+    });
 
     let network_trial_deadline = network_trial_id
         .as_ref()
@@ -1058,6 +1122,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         reply_clock: heartwood_common::reply_clock::ReplyClock::new(),
         button_cards: Vec::new(),
         held_replies: heartwood_common::held_reply::HeldReplies::new(),
+        card_screen_hold: None,
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -1095,12 +1160,16 @@ pub fn run_wifi_standalone<'d, 'b>(
     // the normal relay loop begins immediately afterwards.
     let usb_startup_grace = Instant::now() + Duration::from_secs(2);
     while Instant::now() < usb_startup_grace {
-        poll_usb(usb, &mut ctx, Some(&mut wifi));
+        poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
         FreeRtos::delay_ms(20);
     }
 
     loop {
         crate::wdt::feed();
+        // Before anything that may `continue`: a result screen's hold must
+        // see its press, give way and run out on time whether or not the
+        // relays are up.
+        service_card_screen_hold(&mut ctx);
         network_state_tick(&mut ctx);
         // Expire overdue C4 parks into tombstones so late verdicts still land.
         service_parks(&mut ctx);
@@ -1133,8 +1202,18 @@ pub fn run_wifi_standalone<'d, 'b>(
             );
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx, Some(&mut wifi));
-                service_button(&mut ctx);
+                poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
+                // A relay card still owns the button and the screen: tick it with
+                // no session, so it can be answered (an approval's reply waits in
+                // the #82 outbox; an enrolment finds no live relay and adds
+                // nothing) and, above all, expires on time instead of standing,
+                // and refusing the cable, until a power cycle. A held result is
+                // served inside service_button.
+                if ctx.button_cards.is_empty() {
+                    service_button(&mut ctx);
+                } else {
+                    service_button_cards(&mut ctx, &mut []);
+                }
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -1187,8 +1266,18 @@ pub fn run_wifi_standalone<'d, 'b>(
                 );
                 let until = Instant::now() + Duration::from_secs(3);
                 while Instant::now() < until {
-                    poll_usb(usb, &mut ctx, Some(&mut wifi));
-                    service_button(&mut ctx);
+                    poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
+                    // A relay card still owns the button and the screen: tick it with
+                    // no session, so it can be answered (an approval's reply waits in
+                    // the #82 outbox; an enrolment finds no live relay and adds
+                    // nothing) and, above all, expires on time instead of standing,
+                    // and refusing the cable, until a power cycle. A held result is
+                    // served inside service_button.
+                    if ctx.button_cards.is_empty() {
+                        service_button(&mut ctx);
+                    } else {
+                        service_button_cards(&mut ctx, &mut []);
+                    }
                     FreeRtos::delay_ms(20);
                 }
                 continue;
@@ -1218,8 +1307,18 @@ pub fn run_wifi_standalone<'d, 'b>(
             // fixable over USB.
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx, Some(&mut wifi));
-                service_button(&mut ctx);
+                poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
+                // A relay card still owns the button and the screen: tick it with
+                // no session, so it can be answered (an approval's reply waits in
+                // the #82 outbox; an enrolment finds no live relay and adds
+                // nothing) and, above all, expires on time instead of standing,
+                // and refusing the cable, until a power cycle. A held result is
+                // served inside service_button.
+                if ctx.button_cards.is_empty() {
+                    service_button(&mut ctx);
+                } else {
+                    service_button_cards(&mut ctx, &mut []);
+                }
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -1236,10 +1335,21 @@ pub fn run_wifi_standalone<'d, 'b>(
         // a scan mid-connection would knock the link off its channel, so a
         // 0x55 during live service is declined (matches the old per-session
         // loop, which lent the driver only in the between-sessions gaps).
-        if sessions.is_empty() {
-            poll_usb(usb, &mut ctx, Some(&mut wifi));
+        let blocked = if sessions.is_empty() {
+            poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions)
         } else {
-            poll_usb(usb, &mut ctx, None);
+            poll_usb(usb, &mut ctx, None, &mut sessions)
+        };
+        if blocked {
+            // A cable card held the loop with nothing reading the relays:
+            // excuse that silence, or a quiet relay trips SILENCE_LIMIT and
+            // redials straight after. Nothing was heard, so last_rx (the
+            // enrol card's liveness) is left alone, and so is last_ping, so a
+            // ping goes out on the next idle tick and finds out.
+            let now = Instant::now();
+            for s in sessions.iter_mut() {
+                s.silence_from = now;
+            }
         }
 
         // Advance any approval card. This is the whole point of holding the
@@ -1429,6 +1539,9 @@ pub fn run_wifi_standalone<'d, 'b>(
             && !sessions.iter().any(|se| !se.recv_timeout_on)
             && ctx.network_trial_id.is_none()
             && ctx.ota_session.is_none()
+            // A relay update round closes the secondary and keeps it closed
+            // until the round ends, so its dials never make a third session.
+            && !relay_update.as_ref().is_some_and(|u| u.plan.in_round())
             && Instant::now() >= secondary_next
         {
             let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
@@ -1534,6 +1647,24 @@ pub fn run_wifi_standalone<'d, 'b>(
             // Nothing live and nothing dialled this pass — don't busy-spin.
             FreeRtos::delay_ms(20);
             continue;
+        }
+
+        // Phone unlock: tell the phones about a relay change, one old relay
+        // per pass. Not during a network trial (the list may yet roll back),
+        // an OTA, or while a card waits for the owner.
+        if relay_update.is_some()
+            && ctx.network_trial_id.is_none()
+            && ctx.ota_session.is_none()
+            && !screen_busy(&ctx)
+        {
+            service_relay_update(
+                &mut relay_update,
+                &mut ctx,
+                &mut sessions,
+                &mut pinned,
+                &wifi,
+                &relays,
+            );
         }
 
         // Pump each session: split-borrow the active one out so management
@@ -1982,8 +2113,11 @@ fn connect_relay_raw(
         log::warn!("[relay] send-timeout unavailable ({e}); blocking sends");
     }
 
-    ws_send(&mut tls, OP_TEXT, sub_req.as_bytes())?;
-    log::info!("[relay] subscribed on {url}");
+    // An empty REQ is a publish-only connection (see `publish_once`).
+    if !sub_req.is_empty() {
+        ws_send(&mut tls, OP_TEXT, sub_req.as_bytes())?;
+        log::info!("[relay] subscribed on {url}");
+    }
 
     let now = Instant::now();
     Ok(RelaySession {
@@ -1992,6 +2126,7 @@ fn connect_relay_raw(
         rx: Vec::with_capacity(READ_BUF),
         last_rx: now,
         last_ping: now,
+        silence_from: now,
         last_resub: now,
         recv_timeout_on,
         server_time,
@@ -2015,6 +2150,8 @@ pub const VAULT_DELIVERY_KIND: u64 = 24136;
 /// How often a locked signer re-announces. Ephemeral events are not stored,
 /// so an operator who opens Sapwood after the boot must still hear it.
 const LOCKED_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+/// How long a publish-only connection waits for the relay's OK frames.
+const PUBLISH_ONCE_ACK_WAIT: Duration = Duration::from_secs(3);
 
 
 /// Publish the locked-boot announcement: a one-time unlock pubkey the
@@ -2141,6 +2278,7 @@ fn locked_relay_phase(
     relays: &[String],
     op_mgmt: Option<&[u8; 32]>,
     phones: &PhoneSet,
+    told_old: &[String],
     secp: &Arc<Secp256k1<SignOnly>>,
     masters: &mut [LoadedMaster],
     personas: &[crate::personas::LoadedPersona],
@@ -2207,9 +2345,16 @@ fn locked_relay_phase(
     // round trip spent on an event no operator will ever see. Reset per dial —
     // the sample belongs to the relay that gave it.
     let mut clock = heartwood_common::reply_clock::ReplyClock::new();
+    // Relays changed since the phones were told (`told_old`): the phones
+    // listen there, not here, so each phone's announcement is repeated on
+    // them. When, and how a dead one backs off: phone_relays::OldRelayDials.
+    let mut old_dials = phone_relays::OldRelayDials::new(if phones.is_empty() { &[] } else { told_old });
 
     loop {
         crate::wdt::feed();
+        // Set by the pass that put the phones' announcement on the live
+        // relay: the one pass an old-relay dial may take.
+        let mut just_announced = false;
         // This phase runs before the main loop ever connects the station, so
         // it owns its own join attempts — without this, the unlock announce
         // could never reach a relay. Rotates through the stored network list,
@@ -2279,18 +2424,11 @@ fn locked_relay_phase(
                     publish_locked_announce(&mut s.tls, secp, &unlock_sk, &unlock_pk_hex, op, now_wall)
                 });
                 if published.is_ok() && !phones.is_empty() {
+                    // One phone at a time: built, sent, dropped.
                     let ctx = phone_lock_context(wifi, relays, locked_boot);
                     published = phones.records().iter().try_for_each(|rec| {
-                        publish_phone_announce(
-                            &mut s.tls,
-                            secp,
-                            &unlock_sk,
-                            &unlock_pk,
-                            &unlock_pk_hex,
-                            rec,
-                            &ctx,
-                            now_wall,
-                        )
+                        let ev = build_phone_event(secp, &unlock_sk, &unlock_pk, rec, &ctx, now_wall)?;
+                        ws_send_event(&mut s.tls, &ev).map(|_| ())
                     });
                 }
                 if let Err(e) = published {
@@ -2299,6 +2437,7 @@ fn locked_relay_phase(
                     continue;
                 }
                 next_announce = Instant::now() + LOCKED_ANNOUNCE_INTERVAL;
+                just_announced = !phones.is_empty();
             }
 
             // Drain one buffered frame, else one read (recv-timeout paced).
@@ -2377,6 +2516,42 @@ fn locked_relay_phase(
             }
         }
 
+        // At most one old relay per announce interval, in the pass straight
+        // after the live announcement, before anyone can have answered it. A
+        // dial blocks for at most about 35 s (phone_relays::OldRelayDials), so
+        // it ends well before the next announcement, and a delivery that
+        // arrives during it is read first. The announcements carry this
+        // boot's one-time author, exactly as on the live relay: a phone that
+        // hears both prompts once. Its delivery goes to the relays the
+        // announcement lists, where this phase listens.
+        let now_s = crate::uptime_s();
+        let now_wall = clock.projected(now_s);
+        let dial = session
+            .as_ref()
+            .filter(|_| now_wall > 0)
+            .and_then(|s| old_dials.next(now_s, just_announced, &s.url).map(str::to_string));
+        if let Some(url) = dial {
+            let ctx = phone_lock_context(wifi, relays, locked_boot);
+            // One live session here, so the ordinary dial guard, as for a
+            // pinned relay beside the primary.
+            let outcome = publish_once(&url, now_wall, |created_at, send| {
+                phones.records().iter().try_for_each(|rec| {
+                    send(build_phone_event(secp, &unlock_sk, &unlock_pk, rec, &ctx, created_at)?)
+                })
+            });
+            let reached = matches!(outcome, Ok(n) if n > 0);
+            match outcome {
+                Ok(accepted) => log::info!(
+                    "[relay] locked: announced on old relay {} ({accepted} accepted)",
+                    relay_host(&url)
+                ),
+                Err(e) => log::warn!("[relay] locked: old relay {}: {e}", relay_host(&url)),
+            }
+            // A heap too tight to dial is not the relay's fault, but backing
+            // off is still right: the heap will not be looser in a minute.
+            old_dials.report(&url, reached, crate::uptime_s());
+        }
+
         // USB stays live while locked over relay: PIN or vault unlock locally.
         // `mut`: secret-bearing payloads are scrubbed after use (FW-L3).
         if let Some(mut frame) = crate::protocol::try_read_frame(usb, 0) {
@@ -2445,7 +2620,7 @@ fn locked_relay_phase(
                 FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
                     usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    crate::firmware_info_json().as_bytes(),
+                    crate::firmware_info_json(nvs).as_bytes(),
                 ),
                 FRAME_TYPE_PROVISION_LIST => {
                     // Safe while locked (npubs only, no secrets) and REQUIRED
@@ -2501,37 +2676,31 @@ fn phone_lock_context(
     }
 }
 
-/// Publish one phone's lock announcement: authored by this boot's one-time
-/// key, tagged only with the per-boot hint that phone can recognise, content
-/// sealed to that phone's key. Nothing in it names the phone.
-#[allow(clippy::too_many_arguments)]
-fn publish_phone_announce(
-    tls: &mut Tls,
+/// One phone's event under the one-time key `sk`: tagged only with the hint
+/// that phone can recognise, content sealed to that phone's key. Nothing in
+/// it names the phone. A lock announcement or a relay update, as `shared.t`
+/// says. Built one at a time, so a board never holds every phone's event.
+fn build_phone_event(
     secp: &Arc<Secp256k1<SignOnly>>,
-    unlock_sk: &[u8; 32],
-    unlock_pk: &[u8; 32],
-    unlock_pk_hex: &str,
-    phone: &heartwood_common::data_key::PhoneRecord,
+    sk: &[u8; 32],
+    pk: &[u8; 32],
+    rec: &heartwood_common::data_key::PhoneRecord,
     shared: &LockContext,
     created_at: u64,
-) -> Result<(), String> {
-    let mut ctx = shared.clone();
-    ctx.id = phone.id;
+) -> Result<SignedEvent, String> {
     let mut nonce = [0u8; 12];
     crate::fill_random(&mut nonce);
+    let (hint, content) = phone_unlock::phone_message(rec, shared, pk, &nonce);
     let unsigned = UnsignedEvent {
-        pubkey: unlock_pk_hex.to_string(),
+        pubkey: hex_encode(pk),
         created_at,
         kind: LOCKED_ANNOUNCE_KIND,
-        tags: vec![vec![
-            phone_unlock::HINT_TAG.to_string(),
-            phone_unlock::hint(&phone.phone_key, unlock_pk),
-        ]],
-        content: phone_unlock::seal_context(&phone.phone_key, unlock_pk, &ctx, &nonce),
+        tags: vec![vec![phone_unlock::HINT_TAG.to_string(), hint]],
+        content,
     };
     let event_id = nip46::compute_event_id(&unsigned);
-    let sig = sign::sign_hash(secp, unlock_sk, &event_id).map_err(|e| format!("sign: {e}"))?;
-    let signed = SignedEvent {
+    let sig = sign::sign_hash(secp, sk, &event_id).map_err(|e| format!("sign: {e}"))?;
+    Ok(SignedEvent {
         id: hex_encode(&event_id),
         pubkey: unsigned.pubkey,
         created_at: unsigned.created_at,
@@ -2539,9 +2708,317 @@ fn publish_phone_announce(
         tags: unsigned.tags,
         content: unsigned.content,
         sig: hex_encode(&sig),
+    })
+}
+
+/// Why a publish-only dial did not happen or did not finish.
+enum PublishOnceError {
+    /// The heap cannot spare another TLS session now. Not the relay's fault.
+    HeapTight(String),
+    Failed(String),
+}
+
+impl core::fmt::Display for PublishOnceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PublishOnceError::HeapTight(e) | PublishOnceError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Publish on a connection of its own: dial `url` with no subscription (so
+/// nothing on it names the signer), let `emit` build and `send` its events
+/// one at a time, wait up to [`PUBLISH_ONCE_ACK_WAIT`] for the relay's OKs,
+/// and close. `created_at` is `wall` when the caller knows the time, else the
+/// relay's own `Date` header. Returns how many events the relay accepted.
+/// Refuses, before dialling, on a heap below the ordinary dial guard: the
+/// session lives for seconds, and every caller keeps within MAX_SESSIONS.
+/// Worst case it blocks about 35 s: TLS 10 s, the WebSocket upgrade
+/// (WS_UPGRADE_TIMEOUT) 10 s, one stalled send (SEND_TIMEOUT_MS) 8 s, the OK
+/// wait 3 s plus one 1 s read, and DNS.
+fn publish_once(
+    url: &str,
+    wall: u64,
+    emit: impl FnOnce(u64, &mut dyn FnMut(SignedEvent) -> Result<(), String>) -> Result<(), String>,
+) -> Result<usize, PublishOnceError> {
+    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let largest = unsafe {
+        esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
     };
-    ws_send_event(tls, &signed)?;
-    Ok(())
+    if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
+        return Err(PublishOnceError::HeapTight(format!(
+            "heap too tight to dial (free {free} B, largest {largest} B)"
+        )));
+    }
+    crate::wdt::feed();
+    let mut s = connect_relay_raw(url, String::new(), false, true).map_err(PublishOnceError::Failed)?;
+    crate::wdt::feed();
+    let created_at = if wall > 0 { wall } else { s.server_time.unwrap_or(0) };
+    if created_at == 0 {
+        return Err(PublishOnceError::Failed("no clock to stamp with".into()));
+    }
+    let mut tally = phone_relays::OkTally::new();
+    {
+        let tls = &mut s.tls;
+        let mut send = |ev: SignedEvent| -> Result<(), String> {
+            ws_send_event(tls, &ev)?;
+            tally.expect(ev.id);
+            Ok(())
+        };
+        emit(created_at, &mut send).map_err(PublishOnceError::Failed)?;
+    }
+    crate::wdt::feed();
+    let until = Instant::now() + PUBLISH_ONCE_ACK_WAIT;
+    while !tally.done() && Instant::now() < until {
+        match try_parse(&mut s.rx, &mut s.skip) {
+            Ok(Some(WsMsg::Text(raw))) => tally.feed(&raw),
+            Ok(Some(WsMsg::Ping(p))) => {
+                let _ = ws_send(&mut s.tls, OP_PONG, &p);
+            }
+            Ok(Some(WsMsg::Close)) | Err(_) => break,
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if pump(&mut s.tls, &mut s.rx).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = ws_send(&mut s.tls, OP_CLOSE, &[]);
+    Ok(tally.accepted())
+}
+
+/// An unlocked board's relay update: the plan (common::phone_relays, which
+/// decides everything) and this round's one-time key. RAM only; the round
+/// count is persisted after each round.
+struct RelayUpdate {
+    plan: phone_relays::UpdatePlan,
+    key: Option<RoundKey>,
+    /// A deferral is logged once per round, not every DEFER_SECS.
+    deferral_logged: bool,
+}
+
+/// A round's fresh one-time key: nothing inside a round's events ties it to
+/// another round, to a boot's lock announcements, or to a phone. (Timing and
+/// the board's IP address are what a relay can still see; see phone_relays.)
+struct RoundKey {
+    sk: [u8; 32],
+    pk: [u8; 32],
+}
+
+impl Drop for RoundKey {
+    fn drop(&mut self) {
+        self.sk.zeroize();
+    }
+}
+
+fn secure_draw() -> u32 {
+    let mut b = [0u8; 4];
+    crate::fill_random(&mut b);
+    u32::from_le_bytes(b)
+}
+
+/// Advance the relay update by one step of its plan. Every update goes out
+/// on a publish-only connection of its own, never on a session that carries
+/// the signer's subscription, and never as a third TLS session: the
+/// secondary closes for the round (the main loop does not redial it while a
+/// round is under way), and a pinned relay steps aside for one dial after the
+/// plan has waited MAX_DEFER_SECS on a full ceiling, redialling after
+/// PINNED_BACKOFF. Each step checks that the stored record is still the
+/// plan's and addresses only the round's phones that are still enrolled.
+fn service_relay_update(
+    update: &mut Option<RelayUpdate>,
+    ctx: &mut SignCtx,
+    sessions: &mut Vec<RelaySession>,
+    pinned: &mut [PinnedRelay],
+    wifi: &BlockingWifi<EspWifi<'_>>,
+    relays: &[String],
+) {
+    let Some(u) = update.as_mut() else {
+        return;
+    };
+    // A revoke or an enrolment since the last pass may have replaced or
+    // removed the record: if so, end now rather than at the next round.
+    if crate::phone_unlock_cmd::take_phones_changed()
+        && !phone_relays::record_is(&crate::data_key_store::NvsBlobs(ctx.nvs), u.plan.expected()).unwrap_or(false)
+    {
+        log::info!("[relay] phones' relay record changed (revoke or enrolment); relay update ended");
+        *update = None;
+        return;
+    }
+    let now = crate::uptime_s();
+    let view = phone_relays::Sessions {
+        live: sessions.len(),
+        secondary: sessions.iter().any(|s| s.secondary),
+        pinned: sessions.iter().any(|s| s.pinned),
+    };
+    match u.plan.next_action(now, view, MAX_SESSIONS) {
+        phone_relays::UpdateAction::Wait => {}
+        phone_relays::UpdateAction::Arm => u.plan.arm(now, secure_draw()),
+        phone_relays::UpdateAction::StartRound => {
+            let record = phone_relays::record_is(&crate::data_key_store::NvsBlobs(ctx.nvs), u.plan.expected())
+                .map_err(|_| ());
+            let ids = heartwood_common::data_key::load_phones(&crate::data_key_store::NvsBlobs(ctx.nvs))
+                .map(|p| p.records().iter().map(|r| r.id).collect::<Vec<u32>>())
+                .map_err(|_| ());
+            match u.plan.begin_round(record, ids) {
+                phone_relays::RoundStart::Go => {
+                    let mut sk = [0u8; 32];
+                    let pk = loop {
+                        crate::fill_random(&mut sk);
+                        if let Ok(kp) = Keypair::from_seckey_slice(ctx.secp, &sk) {
+                            break kp.x_only_public_key().0.serialize();
+                        }
+                    };
+                    log::info!(
+                        "[relay] relay update round {} of {}: {} phone(s), {} old relay(s)",
+                        u.plan.rounds_done() + 1,
+                        phone_relays::ROUNDS,
+                        u.plan.round_ids().len(),
+                        u.plan.old().len()
+                    );
+                    u.key = Some(RoundKey { sk, pk });
+                    sk.zeroize();
+                    u.deferral_logged = false;
+                }
+                phone_relays::RoundStart::NoPhones => {
+                    log::info!("[relay] no phones left to tell about the relay change");
+                }
+                phone_relays::RoundStart::Superseded => {
+                    log::info!("[relay] phones' relay record changed (revoke or enrolment); relay update ended");
+                }
+                phone_relays::RoundStart::Unreadable => {
+                    log::error!("[relay] phone records or relay record unreadable; relay update ended");
+                }
+            }
+        }
+        phone_relays::UpdateAction::Defer => {
+            if !u.deferral_logged {
+                log::info!("[relay] relay update waiting: the primary and a pinned relay fill the session ceiling");
+                u.deferral_logged = true;
+            }
+            u.plan.defer(now);
+        }
+        phone_relays::UpdateAction::Dial { url, step_aside } => {
+            let Some(key) = u.key.as_ref() else {
+                u.plan.end();
+                return;
+            };
+            // Still the plan's record, and still these phones.
+            let store = crate::data_key_store::NvsBlobs(ctx.nvs);
+            if !phone_relays::record_is(&store, u.plan.expected()).unwrap_or(false) {
+                log::info!("[relay] phones' relay record changed; relay update ended");
+                u.plan.end();
+                *update = None;
+                return;
+            }
+            let table = match heartwood_common::data_key::load_phones(&store) {
+                Ok(t) => t,
+                Err(_) => {
+                    log::error!("[relay] phone records unreadable; relay update ended");
+                    u.plan.end();
+                    *update = None;
+                    return;
+                }
+            };
+            if phone_relays::round_phones(u.plan.round_ids(), &table).next().is_none() {
+                log::info!("[relay] no phone of this round is still enrolled; round skips {}", relay_host(&url));
+                u.plan.skip();
+                return;
+            }
+            match step_aside {
+                phone_relays::StepAside::None => {}
+                phone_relays::StepAside::Secondary => {
+                    if let Some(pos) = sessions.iter().position(|s| s.secondary) {
+                        let shed = sessions.remove(pos);
+                        log::info!("[relay] secondary {} closes for the relay update round", relay_host(&shed.url));
+                        ctx.network_runtime.secondary_index = None;
+                        retune_recv_timeouts(sessions);
+                    }
+                }
+                phone_relays::StepAside::Pinned => {
+                    if let Some(pos) = sessions.iter().position(|s| s.pinned) {
+                        // Only an idle pinned session closes: nothing buffered,
+                        // nothing received for a few seconds, so no NIP-46
+                        // request is dropped. Otherwise try again next pass.
+                        let quiet = &sessions[pos];
+                        if !phone_relays::pinned_may_step_aside(
+                            quiet.rx.is_empty() && quiet.skip == 0,
+                            quiet.last_rx.elapsed().as_secs(),
+                        ) {
+                            return;
+                        }
+                        let shed = sessions.remove(pos);
+                        log::info!("[relay] pinned {} steps aside for one relay update dial", relay_host(&shed.url));
+                        if let Some(p) = pinned.iter_mut().find(|p| same_relay(&p.url, &shed.url)) {
+                            p.next_attempt = Instant::now() + PINNED_BACKOFF;
+                        }
+                        retune_recv_timeouts(sessions);
+                    }
+                }
+            }
+            let shared = phone_lock_context(wifi, relays, crate::data_key_store::locked_boots(ctx.nvs)).as_relay_update();
+            let wall = ctx.reply_clock.projected(crate::uptime_s());
+            let secp = ctx.secp;
+            let round_ids = u.plan.round_ids();
+            let outcome = publish_once(&url, wall, |created_at, send| {
+                phone_relays::round_phones(round_ids, &table).try_for_each(|rec| {
+                    send(build_phone_event(secp, &key.sk, &key.pk, rec, &shared, created_at)?)
+                })
+            });
+            match outcome {
+                Ok(accepted) => {
+                    log::info!("[relay] relay update on old relay {} ({accepted} accepted)", relay_host(&url));
+                    u.plan.dialled(accepted > 0);
+                }
+                Err(PublishOnceError::HeapTight(e)) => {
+                    if u.plan.heap_tight(crate::uptime_s()) {
+                        log::warn!("[relay] relay update gives up {} this round: {e}", relay_host(&url));
+                    } else if !u.deferral_logged {
+                        log::info!("[relay] relay update waiting: {e}");
+                        u.deferral_logged = true;
+                    }
+                }
+                Err(PublishOnceError::Failed(e)) => {
+                    log::warn!("[relay] relay update on old relay {}: {e}", relay_host(&url));
+                    u.plan.dialled(false);
+                }
+            }
+        }
+        phone_relays::UpdateAction::FinishRound => {
+            u.key = None;
+            let reached = u.plan.reached();
+            let phone_relays::RoundEnd::Counted { done } = u.plan.finish_round(now, secure_draw()) else {
+                log::info!("[relay] relay update round dialled no relay (heap too tight); it will run again");
+                return;
+            };
+            log::info!(
+                "[relay] relay update round {done} done: {reached} of {} old relay(s) took it",
+                u.plan.old().len()
+            );
+            let recorded = phone_relays::record_round(
+                &mut crate::data_key_store::NvsBlobs(ctx.nvs),
+                u.plan.expected(),
+                relays,
+                done,
+                u.plan.reached_any(),
+            );
+            match recorded {
+                Ok(phone_relays::RoundRecorded::Progress(record)) => u.plan.recorded(record),
+                Ok(phone_relays::RoundRecorded::Ended) => {
+                    log::info!("[relay] phones told about the relay change; recorded")
+                }
+                Ok(phone_relays::RoundRecorded::Superseded) => {
+                    log::info!("[relay] phones' relay record changed; relay update ended");
+                    u.plan.end();
+                }
+                Err(_) => log::warn!("[relay] relay record not saved; this round repeats next boot"),
+            }
+        }
+    }
+    if u.plan.is_over() {
+        *update = None;
+    }
 }
 
 /// Handle a delivery that is not from the operator: a phone's `{v, id, s}`,
@@ -2674,7 +3151,8 @@ fn handle_vault_delivery(
     });
     if ok {
         log::info!("[relay] vault key accepted — device unlocked");
-        crate::pin::clear_failed_attempts(nvs);
+        // `try_unlock` already cleared the PIN-attempt counter, before its
+        // own optional writes (migration, marker self-repair).
         // The note key rides the same secret (see the locked-phase USB
         // unlock arms) — sync before the key is scrubbed.
         crate::notes::sync_sealed(&vault_key);
@@ -2709,9 +3187,12 @@ fn session_step(
         if s.rx.capacity() > READ_BUF * 2 {
             s.rx.shrink_to(READ_BUF);
         }
-        // Handling a sign_event can block ~30s on the button; treat that as
-        // activity so the silence deadline doesn't trip right after.
-        s.last_rx = Instant::now();
+        // Handling a frame can block (a card on the button); credit the
+        // silence deadline so it doesn't trip right after. last_rx is left at
+        // the read that brought the frame in: a frame drained from a buffer
+        // filled before a block says nothing about whether the relay is
+        // still there, and the enrol card's liveness snapshot reads last_rx.
+        s.silence_from = Instant::now();
         return Ok(());
     }
 
@@ -2737,7 +3218,7 @@ fn session_step(
             s.last_resub = now;
             log::debug!("[relay] re-subscribed on {} (keepalive)", s.url);
         }
-        if now.duration_since(s.last_rx) >= SILENCE_LIMIT {
+        if now.duration_since(s.last_rx.max(s.silence_from)) >= SILENCE_LIMIT {
             return Err(format!(
                 "relay {} silent (no data/pong); reconnecting",
                 s.url
@@ -2767,14 +3248,59 @@ fn reboot_after_state_change(reason: &str) {
 /// connect loop), letting a 0x55 scan reuse the already-started radio; it is
 /// `None` while a relay connection is being served, where scanning would knock
 /// the link off its channel — that case declines rather than disrupt signing.
+/// Serve one USB frame, if one is waiting ([`poll_usb_frame`]). True when the
+/// frame held the loop for [`CABLE_BLOCKED`] or more: a cable card, answered
+/// or left to expire, while no relay was read (the caller moves the
+/// sessions' `silence_from` on). A result held on screen is drawn again shortly
+/// after any frame, since the command may have drawn over it; after a
+/// blocking one it also waits for the button to come up, so the release of
+/// that card's hold does not dismiss it.
 fn poll_usb(
     usb: &mut SerialPort<'_>,
     ctx: &mut SignCtx,
     wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
-) {
+    sessions: &mut [RelaySession],
+) -> bool {
+    let started = Instant::now();
+    if !poll_usb_frame(usb, ctx, wifi, sessions) {
+        return false;
+    }
+    let blocked = started.elapsed() >= CABLE_BLOCKED;
+    interrupt_held_result(ctx, HELD_RESULT_REDRAW, blocked);
+    if blocked {
+        // Belt and braces for the refusal in poll_usb_frame: whatever held
+        // the loop may have been answered with the button, and that hold is
+        // no relay card's. The front card waits for the button to be seen
+        // up again (the enrol card as well as its gate), and the latched
+        // edge and release go.
+        if let Some(card) = ctx.button_cards.first_mut() {
+            card.armed = false;
+        }
+        crate::button::clear_press_edge();
+    }
+    blocked
+}
+
+/// How long a cable frame must hold the loop to count as blocking: longer
+/// than any frame that does not wait on the button.
+const CABLE_BLOCKED: Duration = Duration::from_secs(2);
+
+/// How long something else may stay on screen over a held result before the
+/// result is drawn again.
+const HELD_RESULT_REDRAW: Duration = Duration::from_secs(2);
+
+/// Read and handle one USB frame; false when none was waiting. `sessions`
+/// carries the answers of relay cards a recovery command takes the screen
+/// from.
+fn poll_usb_frame(
+    usb: &mut SerialPort<'_>,
+    ctx: &mut SignCtx,
+    wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
+    sessions: &mut [RelaySession],
+) -> bool {
     let mut frame = match crate::protocol::try_read_frame(usb, 0) {
         Some(f) => f,
-        None => return,
+        None => return false,
     };
 
     // USB activity wakes the panel, same as a relay request.
@@ -2784,11 +3310,45 @@ fn poll_usb(
     }
     ctx.last_activity = Instant::now();
 
+    // One screen, one button, one decision. A cable card answered while a
+    // relay card waits leaves its hold behind (the sampler latches the
+    // release with the whole press), which the relay card would read as its
+    // own approval: a compromised host could send any card-raising frame
+    // while the owner hesitates over a relay enrolment and harvest the hold.
+    // So every frame that may raise a card (`phone_unlock::cable_frame_claim`,
+    // which ui-preview checks against this match) is refused while a card,
+    // or a result younger than RESULT_HOLD_MS, is up; the per-arm checks
+    // below predate this and are kept. The owner's recovery commands are the
+    // exception: anyone can keep a relay card up (a RECEIVE card comes back
+    // for every wrap published to the board), and a board whose network,
+    // firmware or whole state needs fixing over the cable must not wait on
+    // that, so these take the screen over instead (take_screen_for_recovery).
+    // Not here, though: each recovery arm does it straight before its card,
+    // once its handler's checks have passed, so a frame that is refused (a
+    // garbage OTA_BEGIN every second from any host) never costs a relay card
+    // anything. A SET_NET_CONFIG is a recovery only while it keeps the stored
+    // operator; one that hands relay management to another key waits like
+    // any other card.
+    let stored_net_config = (frame.frame_type == FRAME_TYPE_SET_NET_CONFIG)
+        .then(|| crate::net_config_store::read_net_config(ctx.nvs))
+        .flatten();
+    let claim = heartwood_common::phone_unlock::cable_frame_claim(
+        frame.frame_type,
+        &frame.payload,
+        stored_net_config.as_deref(),
+    );
+    if claim == heartwood_common::phone_unlock::CableClaim::Card && cable_card_refused(ctx) {
+        crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+        // Some of these carry secrets (a PIN, a vault key, a seed).
+        frame.scrub_payload();
+        return true;
+    }
+
     match frame.frame_type {
         FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
             usb,
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-            crate::firmware_info_json().as_bytes(),
+            crate::firmware_info_json(ctx.nvs).as_bytes(),
         ),
 
         // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
@@ -2810,7 +3370,9 @@ fn poll_usb(
                 if ok { FRAME_TYPE_ACK } else { FRAME_TYPE_NACK },
                 &[],
             );
-            if ok && ctx.masters.len() == 1 && ctx.display_on {
+            // Not over a card or a held result: the identity card would hide
+            // the words the owner is reading.
+            if ok && ctx.masters.len() == 1 && ctx.display_on && !approval_card_open(ctx) {
                 let slot = ctx.masters[0].slot;
                 let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
                 let meta = crate::identity_meta::load(ctx.nvs, slot);
@@ -2828,7 +3390,7 @@ fn poll_usb(
         // Plaintext NIP-46 — only when the bridge is not authenticated (mirrors
         // the USB-only loop). Uses the first master, like the tethered path.
         FRAME_TYPE_NIP46_REQUEST => {
-            if approval_card_open(ctx) {
+            if cable_card_refused(ctx) {
                 // The USB paths still put their own card up and block on it,
                 // which would paint over the relay card already on screen and
                 // silently let it expire. One screen, one decision: say so.
@@ -2880,7 +3442,7 @@ fn poll_usb(
 
         // Encrypted NIP-46 (bridge transport) — requires an authenticated bridge.
         FRAME_TYPE_ENCRYPTED_REQUEST => {
-            if approval_card_open(ctx) {
+            if cable_card_refused(ctx) {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
             } else if !ctx.policy_engine.bridge_authenticated {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
@@ -2941,16 +3503,24 @@ fn poll_usb(
         }
 
         // Network reconfig — the handler reboots into the new mode itself on a
-        // wifi save (and simply persists a radio-off save).
+        // wifi save (and simply persists a radio-off save). Recovery arms
+        // (this one only while it keeps the operator) take the screen from
+        // the relay cards straight before their card, after their checks.
         FRAME_TYPE_SET_NET_CONFIG => {
-            crate::net_config_store::handle_set_net_config(
-                usb,
-                &frame.payload,
-                ctx.nvs,
-                ctx.display,
-                ctx.buttons,
-                true,
-            );
+            if let Some(cfg) = crate::net_config_store::check_set_net_config(usb, &frame.payload) {
+                if claim == heartwood_common::phone_unlock::CableClaim::Recovery {
+                    take_screen_for_recovery(ctx, sessions);
+                }
+                crate::net_config_store::confirm_set_net_config(
+                    usb,
+                    &frame.payload,
+                    cfg,
+                    ctx.nvs,
+                    ctx.display,
+                    ctx.buttons,
+                    true,
+                );
+            }
             // The config JSON carries the WiFi password (FW-L3).
             frame.scrub_payload();
         }
@@ -2960,13 +3530,10 @@ fn poll_usb(
         }
 
         FRAME_TYPE_PATCH_NET_CONFIG => {
-            crate::net_config_store::handle_patch_net_config(
-                usb,
-                &frame.payload,
-                ctx.nvs,
-                ctx.display,
-                ctx.buttons,
-            );
+            if let Some(plan) = crate::net_config_store::check_patch_net_config(usb, &frame.payload, ctx.nvs) {
+                take_screen_for_recovery(ctx, sessions);
+                crate::net_config_store::confirm_patch_net_config(usb, plan, ctx.nvs, ctx.display, ctx.buttons);
+            }
             // A `set` password action carries the WiFi password (FW-L3).
             frame.scrub_payload();
         }
@@ -3032,17 +3599,51 @@ fn poll_usb(
             frame.scrub_payload();
         }
         FRAME_TYPE_VAULT_UNLOCK => {
+            // The payload is a vault key, answered or not (FW-L3).
+            frame.scrub_payload();
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"already unlocked");
         }
-        FRAME_TYPE_PHONE_UNLOCK_CMD => crate::phone_unlock_cmd::handle_frame(
-            usb,
-            &frame.payload,
-            ctx.nvs,
-            ctx.masters,
-            ctx.policy_engine.bridge_authenticated,
-            ctx.display,
-            ctx.buttons,
-        ),
+        // A cable enrolment puts its own blocking card up, which would paint
+        // over a relay card already on screen and let it expire unseen: one
+        // screen, one decision. The rest of the command set needs no card.
+        FRAME_TYPE_PHONE_UNLOCK_CMD
+            if matches!(
+                heartwood_common::phone_unlock::PhoneCmd::parse(&frame.payload),
+                Ok(heartwood_common::phone_unlock::PhoneCmd::Enrol { .. })
+            ) && cable_card_refused(ctx) =>
+        {
+            crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+        }
+        FRAME_TYPE_PHONE_UNLOCK_CMD => {
+            let screen = crate::phone_unlock_cmd::handle_frame(
+                usb,
+                &frame.payload,
+                ctx.nvs,
+                ctx.masters,
+                ctx.policy_engine.bridge_authenticated,
+                ctx.display,
+                ctx.buttons,
+            );
+            match screen {
+                // Refused before its card, or not an enrolment: a held
+                // result is untouched.
+                crate::phone_unlock_cmd::Screen::Untouched => {}
+                // A new card went up and added nothing: an older PHONE ADDED
+                // drawn again after it would read as this phone having been
+                // added, so it goes, but only once "Expired" or "Cancelled"
+                // has been read.
+                crate::phone_unlock_cmd::Screen::NothingAdded => {
+                    if ctx.card_screen_hold.is_some() {
+                        release_card_screen_hold(ctx, Some(Duration::from_secs(3)));
+                    }
+                }
+                // The check code stays up until a press, as a relay
+                // enrolment's does (hold_card_screen).
+                crate::phone_unlock_cmd::Screen::Added(added) => {
+                    hold_card_screen(ctx, HeldScreen::PhoneAdded(added));
+                }
+            }
+        }
 
         FRAME_TYPE_CONNSLOT_CREATE => {
             crate::connslot::handle_create(usb, &frame, ctx.policy_engine, ctx.masters, ctx.nvs)
@@ -3087,7 +3688,7 @@ fn poll_usb(
             if !ctx.policy_engine.bridge_authenticated {
                 log::warn!("[relay] Backup import rejected -- bridge not authenticated");
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, heartwood_common::backup::BACKUP_NACK_AUTH);
-            } else if approval_card_open(ctx) {
+            } else if cable_card_refused(ctx) {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
             } else {
                 crate::backup::handle_import(
@@ -3106,13 +3707,12 @@ fn poll_usb(
         }
 
         // OTA — the finish handler verifies the image and reboots into it.
-        FRAME_TYPE_OTA_BEGIN => crate::ota::handle_ota_begin(
-            usb,
-            &frame.payload,
-            ctx.display,
-            ctx.buttons,
-            &mut ctx.ota_session,
-        ),
+        FRAME_TYPE_OTA_BEGIN => {
+            if let Some(plan) = crate::ota::check_ota_begin(usb, &frame.payload) {
+                take_screen_for_recovery(ctx, sessions);
+                crate::ota::confirm_ota_begin(usb, plan, ctx.display, ctx.buttons, &mut ctx.ota_session);
+            }
+        }
         FRAME_TYPE_OTA_CHUNK => {
             crate::ota::handle_ota_chunk(usb, &frame.payload, ctx.display, &mut ctx.ota_session)
         }
@@ -3124,7 +3724,7 @@ fn poll_usb(
         // from the fresh master set. `masters` here is a shared slice, so the
         // add handlers persist to NVS and we reboot rather than mutate in place.
         FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
-            if approval_card_open(ctx) {
+            if cable_card_refused(ctx) {
                 // One screen, one decision: these handlers now run their own
                 // button prompt (FW-M3) and must not paint over a relay card.
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
@@ -3163,7 +3763,7 @@ fn poll_usb(
         // master-set change like PROVISION, so reboot to re-subscribe; an
         // idempotent re-derive (existing slot) returns None and needs none.
         FRAME_TYPE_DERIVE_IDENTITY => {
-            if approval_card_open(ctx) {
+            if cable_card_refused(ctx) {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
             } else if crate::provision::handle_derive(usb, &frame, ctx.nvs, ctx.secp, ctx.display, ctx.buttons, ctx.masters)
                 .is_some()
@@ -3177,7 +3777,7 @@ fn poll_usb(
         // destroy an identity on a wifi-standalone signer. On success the
         // relay subscription re-derives from the fresh master set by reboot.
         FRAME_TYPE_PROVISION_REMOVE => {
-            if approval_card_open(ctx) {
+            if cable_card_refused(ctx) {
                 // One screen, one decision: a relay approval card already owns
                 // the display and the button.
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
@@ -3192,8 +3792,10 @@ fn poll_usb(
                 reboot_after_state_change("master removed");
             }
         }
-        // Factory reset wipes NVS and reboots inside the handler.
+        // Factory reset wipes NVS and reboots inside the handler. It checks
+        // nothing before its card, so it takes the screen at once.
         FRAME_TYPE_FACTORY_RESET => {
+            take_screen_for_recovery(ctx, sessions);
             crate::provision::handle_factory_reset(usb, ctx.nvs, ctx.display, ctx.buttons)
         }
 
@@ -3228,6 +3830,7 @@ fn poll_usb(
     // finished is user activity: restart the blank clock so the outcome
     // card gets its full window.
     ctx.last_activity = Instant::now();
+    true
 }
 
 /// Parse one inbound relay message (`["EVENT",sub,ev]` / `EOSE` / `OK` / …).
@@ -3345,7 +3948,9 @@ fn handle_profile_event(ev: &SignedEvent, ctx: &mut SignCtx) {
         ctx.identity_name.as_deref().unwrap_or("")
     );
 
-    if changed && ctx.display_on && ctx.masters.len() == 1 {
+    // Not over a card or a held result: the identity card would hide what
+    // the owner is reading, and time under it would count as reading time.
+    if changed && ctx.display_on && ctx.masters.len() == 1 && !approval_card_open(ctx) {
         let slot = ctx.masters[0].slot;
         let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
         // Sapwood-provisioned metadata (name + avatar) wins; the kind-0 name is
@@ -4335,8 +4940,29 @@ fn deny_parked(tls: &mut Tls, ctx: &mut SignCtx, park: ParkedRequest) {
 // cannot sign with a stale key.
 
 /// How long a card stays up before it expires unanswered. Matches the blocking
-/// loop's window, so what the operator sees is unchanged.
+/// loop's window, so what the operator sees is unchanged. The enrol card has
+/// its own, longer window ([`card_window`]).
 const CARD_WINDOW: Duration = Duration::from_secs(30);
+
+/// Whether this card adds an unlock phone.
+fn is_enrol_card(card: &ButtonCard) -> bool {
+    card.asks
+        .first()
+        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::PhoneEnrol { .. }))
+}
+
+/// How long this card stays up: [`CARD_WINDOW`], except an unlock phone's
+/// enrol card, which has `phone_unlock::ENROL_CARD_SECS` (45 s) for its five
+/// words to be read a page at a time and compared with the phone, as the
+/// cable's has.
+fn card_window(card: &ButtonCard) -> Duration {
+    if is_enrol_card(card) {
+        Duration::from_secs(u64::from(heartwood_common::phone_unlock::ENROL_CARD_SECS))
+    } else {
+        CARD_WINDOW
+    }
+}
+
 
 /// Hold that approves, matching `approval::run_approval_loop`.
 const CARD_HOLD_MS: u32 = 2000;
@@ -4397,6 +5023,25 @@ struct ButtonCard {
     armed: bool,
     last_remaining: u32,
     last_pct: u32,
+    /// The enrol card's pages and press gate (`phone_unlock::EnrolGate`),
+    /// stepped every tick; unused by other cards.
+    enrol_gate: heartwood_common::phone_unlock::EnrolGate,
+    /// The enrol card's (page, armed) last drawn, so a change is drawn at
+    /// once and the page the gate counts is the page on screen.
+    drawn_view: Option<(usize, bool)>,
+    /// `oled::draw_generation` just after this card last drew its face;
+    /// `None` before the first draw.
+    drawn_gen: Option<u32>,
+}
+
+/// Whether this card has been on screen for its whole window.
+fn card_overdue(card: &ButtonCard) -> bool {
+    card.opened_at.is_some_and(|at| at.elapsed() >= card_window(card))
+}
+
+/// Whether something else has been drawn since this card last drew its face.
+fn card_overdrawn(card: &ButtonCard) -> bool {
+    card.drawn_gen.is_some_and(|g| g != crate::oled::draw_generation())
 }
 
 /// What one card tick concluded.
@@ -4589,6 +5234,9 @@ fn queue_button_ask(
                 armed: false,
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
+                enrol_gate: Default::default(),
+                drawn_view: None,
+                drawn_gen: None,
             });
             Ok(())
         }
@@ -4616,10 +5264,17 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // First draw of this wording: a join sets last_remaining back to MAX to
     // force a redraw, so a card that grows logs again with what it now says.
     let first_draw = ctx.button_cards[0].last_remaining == u32::MAX;
-    if remaining == ctx.button_cards[0].last_remaining {
+    // The enrol card also redraws the moment its page or gate changes.
+    let view = is_enrol_card(&ctx.button_cards[0])
+        .then(|| (ctx.button_cards[0].enrol_gate.page(), ctx.button_cards[0].enrol_gate.armed()));
+    if remaining == ctx.button_cards[0].last_remaining
+        && view == ctx.button_cards[0].drawn_view
+        && !card_overdrawn(&ctx.button_cards[0])
+    {
         return;
     }
     ctx.button_cards[0].last_remaining = remaining;
+    ctx.button_cards[0].drawn_view = view;
     ctx.button_cards[0].last_pct = u32::MAX;
 
     let batch = ctx.button_cards[0].asks.len();
@@ -4628,7 +5283,10 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         Extension(String, String, String),
         Titled(&'static str, String),
         Batch(String, String),
+        Enrol([&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS], String),
     }
+    // The enrol card's page and whether a hold counts yet (its hint).
+    let (card_page, card_armed) = view.unwrap_or((0, true));
     let card = match &ctx.button_cards[0].asks[0].ask.card {
         crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading } => {
             // The count belongs on screen: one hold answers all of them, and
@@ -4666,6 +5324,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         crate::nip46_handler::AskCard::Receive { title } => {
             Draw::Titled("RECEIVE NOTE", title.clone())
         }
+        crate::nip46_handler::AskCard::PhoneEnrol { words, label, .. } => Draw::Enrol(*words, label.clone()),
     };
     // What the panel now READS, once per wording, so a bench can check an
     // amount or a mint without a camera on the OLED (checklist 13, 2b).
@@ -4690,6 +5349,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             ),
             Draw::Titled(header, title) => ((*header).to_string(), title.clone()),
             Draw::Batch(header, title) => (header.clone(), title.clone()),
+            Draw::Enrol(words, label) => (format!("ADD \"{label}\"?"), words.join(" ")),
         };
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }
@@ -4724,7 +5384,18 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             remaining,
             CARD_WINDOW.as_secs() as u32,
         ),
+        Draw::Enrol(words, label) => crate::oled::show_enrol_approval(
+            ctx.display,
+            &words,
+            &label,
+            remaining,
+            heartwood_common::phone_unlock::ENROL_CARD_SECS,
+            card_page,
+            card_armed,
+        ),
     }
+    // What is on the glass is this card's face, as of now.
+    ctx.button_cards[0].drawn_gen = Some(crate::oled::draw_generation());
 }
 
 /// A string parameter of a `heartwood_note_*` request (`params[0].<name>`).
@@ -4814,21 +5485,50 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
 
     let opened_at = ctx.button_cards[0].opened_at.unwrap_or(now);
     let elapsed = now.duration_since(opened_at);
-    if elapsed >= CARD_WINDOW {
+    let window = card_window(&ctx.button_cards[0]);
+    if elapsed >= window {
         return CardTick::Expired;
     }
-    let remaining = (CARD_WINDOW - elapsed).as_secs() as u32;
+    let remaining = (window - elapsed).as_secs() as u32;
 
     let hold_ms = crate::button::hold_ms();
     let released = crate::button::take_release();
 
+    // The enrol card turns its pages and keeps its gate every tick
+    // (phone_unlock::EnrolGate, the cable's rule too): a page moves on only
+    // after its full dwell on screen, however long a stalled pass took, and
+    // the card arms only once every page has had that dwell, 12 s have
+    // passed and the button is up. A hold on page 1 alone would rest on two
+    // words.
+    let enrol = is_enrol_card(&ctx.button_cards[0]);
+    if enrol {
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        // Something else was drawn since the card last drew itself (a
+        // signing confirmation, an OTA chunk, a screen turned round): the
+        // words were hidden for some of that time, so the page on screen
+        // starts its dwell again once the card is back (drawn below). A card
+        // drawn over again and again only expires.
+        if card_overdrawn(&ctx.button_cards[0]) {
+            ctx.button_cards[0].enrol_gate.restart_page(elapsed_ms);
+        }
+        ctx.button_cards[0].enrol_gate.step(elapsed_ms, hold_ms > 0);
+    }
+
     if !ctx.button_cards[0].armed {
-        if hold_ms == 0 {
+        let arms = hold_ms == 0 && (!enrol || ctx.button_cards[0].enrol_gate.armed());
+        if arms {
             ctx.button_cards[0].armed = true;
+        }
+        // B still cancels an enrol card during its gate: it is the explicit
+        // "no", and that is always the owner's to give.
+        if enrol && ctx.buttons.b_pressed() {
+            ctx.buttons.drain_b();
+            return CardTick::Denied;
         }
         // Both the in-progress hold and its release are discarded until the
         // card is armed, so a press aimed at the idle carousel cannot answer
-        // a card that appeared underneath it.
+        // a card that appeared underneath it, and a tap during the enrol
+        // card's gate neither approves nor declines (nor spends the key).
         draw_button_card(ctx, remaining, 0);
         return CardTick::Pending;
     }
@@ -4920,6 +5620,15 @@ fn resolve_button_card(
         resolve_receive_card(ctx, card, outcome, index == 0);
         return;
     }
+    if card
+        .asks
+        .first()
+        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::PhoneEnrol { .. }))
+    {
+        // The device operator is owed a management answer, not a NIP-46 one.
+        resolve_phone_enrol_card(ctx, sessions, card, outcome, index == 0);
+        return;
+    }
     if index == 0 {
         match outcome {
             CardTick::Approved => crate::oled::show_approved(ctx.display),
@@ -4965,6 +5674,10 @@ fn resolve_button_card(
             "[relay] approval decided with no relay session and an audit rail owed; {} ask(s) unanswered",
             card.asks.len()
         );
+        // APPROVED went up with the hold, and nothing was done: say so.
+        if index == 0 && matches!(outcome, CardTick::Approved) {
+            show_card_not_done(ctx, "Offline", "Nothing was done");
+        }
         return;
     }
 
@@ -5216,7 +5929,7 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
                 if ctx.wrap_ledger.decide(&ev.id, ev.created_at) {
                     crate::notes::store_wrap_ledger(&ctx.wrap_ledger.encode());
                 }
-                if created && !approval_card_open(ctx) {
+                if created && !screen_busy(ctx) {
                     if !ctx.display_on {
                         crate::oled::wake_display(ctx.display);
                         ctx.display_on = true;
@@ -5229,7 +5942,12 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
                         &format!("from {bare_host}"),
                     );
                     ctx.last_activity = Instant::now();
-                    ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(3));
+                    if ctx.card_screen_hold.is_some() {
+                        // Over a held result: the banner, then the result again.
+                        interrupt_held_result(ctx, Duration::from_secs(3), false);
+                    } else {
+                        ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(3));
+                    }
                 }
             }
             Err(e) => log::warn!("[relay] trusted note refused by the locker: {}", e.code()),
@@ -5356,6 +6074,9 @@ fn queue_receive_card(
                 armed: false,
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
+                enrol_gate: Default::default(),
+                drawn_view: None,
+                drawn_gen: None,
             });
         }
     }
@@ -5453,6 +6174,472 @@ fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Adding an unlock phone over the relay (enrol_unlock_phone)
+// ---------------------------------------------------------------------------
+//
+// The cable twin is PHONE_UNLOCK_CMD {"op":"enrol"}, whose card blocks. Here
+// the request becomes a card on the #64 queue, so the relay loop keeps
+// serving while the owner walks to the board, and the answer is published to
+// the device operator when the card resolves. An enrolment adds a persistent
+// way to release the data key after a restart, so:
+//
+// - only the device operator may ask, never a per-identity delegate (checked
+//   first, so a delegate learns nothing), and the operator must still be the
+//   device operator at the press;
+// - the request has already spent the one-time mutation challenge, so it can
+//   raise one card at most, before or after a restart;
+// - one enrolment waits at a time, and its enrolment key is used once;
+// - the card leads with the request code, five words from the enrolment key,
+//   which the owner compares with the phone that made the key (never with the
+//   browser, which could have swapped the key), so they press for their own
+//   phone and not one raced in;
+// - the board is checked before the card and again at the press, and nothing
+//   is written until then: a card that expires, is declined, or dies with a
+//   restart leaves no trace but the used key and the spent challenge;
+// - a press with no relay heard from lately adds nothing, and neither does
+//   one whose answer would not fit the heap, since a record whose hand-off
+//   cannot leave would be one nobody can use; if the answer still reaches no
+//   live relay, the screen names the record to revoke instead of DONE.
+
+/// Put an `enrol_unlock_phone` request on the button. `Err` is the refusal
+/// the operator hears at once; `Ok` means the card will answer.
+#[allow(clippy::too_many_arguments)]
+fn queue_phone_enrol(
+    ctx: &mut SignCtx,
+    req: &serde_json::Value,
+    request_id: &str,
+    master_idx: usize,
+    operator: &[u8; 32],
+    is_device_op: bool,
+    created_at: u64,
+    received_uptime: u64,
+) -> Result<(), String> {
+    use heartwood_common::approval_queue::{admit, Admission, AskKey};
+    use heartwood_common::phone_unlock::{self, PhoneCmd};
+
+    let pending = ctx.button_cards.iter().any(|card| {
+        card.asks
+            .first()
+            .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::PhoneEnrol { .. }))
+    });
+    let master = &ctx.masters[master_idx];
+    let master_slot = master.slot;
+    let master_pk = master.pubkey;
+    let operator_hex = hex_encode(operator);
+    // Keyed on the enrolment key, so two enrolments never share one hold.
+    let ask_key = |pk: &[u8; 32]| {
+        AskKey::new(
+            master_slot,
+            operator_hex.clone(),
+            hex_encode(&master_pk),
+            format!("enrol:{}", &hex_encode(pk)[..16]),
+        )
+    };
+    let weight = 256;
+    let nvs = &mut *ctx.nvs;
+    let masters = ctx.masters;
+    let cards = &ctx.button_cards;
+    // The order is the host-tested one (phone_unlock::admit_relay_enrol);
+    // the mutation challenge was spent before this was called.
+    let (enrol_pubkey, label) = phone_unlock::admit_relay_enrol(
+        is_device_op,
+        pending,
+        || match PhoneCmd::from_mgmt(phone_unlock::ENROL_METHOD, req.get("params")) {
+            Some(Ok(PhoneCmd::Enrol { enrol_pubkey, label })) => {
+                Ok((enrol_pubkey, crate::phone_unlock_cmd::default_label(label)))
+            }
+            Some(Err(why)) => Err(why.to_string()),
+            _ => Err("malformed enrol_unlock_phone request".into()),
+        },
+        |(_, label)| crate::phone_unlock_cmd::check_enrol(nvs, masters, label),
+        |(pk, _)| {
+            let held_bytes: usize = cards.iter().flat_map(|card| card.asks.iter()).map(|ask| ask.weight).sum();
+            let open = cards.first();
+            held_bytes.saturating_add(weight) <= CARD_BYTE_BUDGET
+                && matches!(
+                    admit(
+                        open.map(|card| &card.key),
+                        open.map(|card| card.asks.len()).unwrap_or(0),
+                        cards.len().saturating_sub(1),
+                        &ask_key(pk),
+                    ),
+                    Admission::Open | Admission::Wait
+                )
+        },
+        // From here the key is spent whatever the card decides.
+        |(pk, _)| crate::phone_unlock_cmd::claim_enrol_key(pk).is_ok(),
+    )?;
+    let key = ask_key(&enrol_pubkey);
+    let words = phone_unlock::request_words(&enrol_pubkey);
+    log::info!("[relay] enrol request {request_id} waiting on the button");
+    ctx.button_cards.push(ButtonCard {
+        key,
+        target_pk: master_pk,
+        client_pubkey: *operator,
+        asks: vec![ButtonAsk {
+            ask: crate::nip46_handler::DeferredAsk {
+                card: crate::nip46_handler::AskCard::PhoneEnrol { enrol_pubkey, label, words },
+                request: nip46::Nip46Request {
+                    id: request_id.to_string(),
+                    method: phone_unlock::ENROL_METHOD.to_string(),
+                    params: Vec::new(),
+                    heartwood: None,
+                    legacy_client_pubkey: None,
+                },
+                event: None,
+                identity: None,
+                resume: Default::default(),
+            },
+            created_at,
+            received_uptime,
+            weight,
+            audit: None,
+        }],
+        opened_at: None,
+        armed: false,
+        last_remaining: u32::MAX,
+        last_pct: u32::MAX,
+        enrol_gate: Default::default(),
+        drawn_view: None,
+        drawn_gen: None,
+    });
+    Ok(())
+}
+
+/// Settle an enrol card and answer the device operator on kind 24134.
+///
+/// On a press, the configured sessions that count as live are noted ONCE,
+/// and that one snapshot both gates the enrolment and counts the delivery, so
+/// the two can never disagree. The board is read again and decided by
+/// `relay_enrol_completion`; the hand-off is sealed in RAM and the record
+/// written only if the answer carrying it fits the heap. The answer is then
+/// offered to every configured session, and `phone_unlock::enrol_result`
+/// decides the screen: the check code and the id to revoke if the phone never
+/// shows it, or "Not sent" naming the record when no live session took it.
+fn resolve_phone_enrol_card(
+    ctx: &mut SignCtx,
+    sessions: &mut [RelaySession],
+    card: ButtonCard,
+    outcome: &CardTick,
+    on_screen: bool,
+) {
+    use heartwood_common::phone_unlock::{self, CardOutcome, EnrolResult};
+
+    let outcome = match outcome {
+        CardTick::Approved => CardOutcome::Approved,
+        CardTick::Denied => CardOutcome::Denied,
+        _ => CardOutcome::Expired,
+    };
+    let operator = card.client_pubkey;
+    let Some(ask) = card.asks.into_iter().next() else { return };
+    let crate::nip46_handler::AskCard::PhoneEnrol { enrol_pubkey, label, .. } = ask.ask.card else {
+        return;
+    };
+    let request_id = ask.ask.request.id;
+    // The answer is sealed by the identity the request was addressed to.
+    let Some(midx) = masters::find_by_pubkey(ctx.masters, &card.target_pk) else {
+        log::warn!("[relay] enrol card: its identity is gone; nothing added, nothing answered");
+        if on_screen && outcome == CardOutcome::Approved {
+            show_and_hold(ctx, HeldScreen::NotDone { title: "Identity removed", hint: "No phone added".into() });
+        }
+        return;
+    };
+    let signing_secret = zeroize::Zeroizing::new(ctx.masters[midx].secret);
+    let Ok(conversation_key) = nip44::get_conversation_key(&signing_secret, &operator) else {
+        log::warn!("[relay] enrol answer: conversation key failed; nothing added");
+        if on_screen && outcome == CardOutcome::Approved {
+            show_and_hold(ctx, HeldScreen::NotDone { title: "No phone added", hint: "see Sapwood".into() });
+        }
+        return;
+    };
+    let answer_json = |result: Result<serde_json::Value, String>| match result {
+        Ok(value) => serde_json::json!({ "id": request_id, "result": value }).to_string(),
+        Err(e) => serde_json::json!({ "id": request_id, "error": e }).to_string(),
+    };
+
+    // The one liveness snapshot: taken at the press, used for the gate and
+    // for counting the delivery.
+    let live: Vec<bool> = sessions.iter().map(session_live_for_answer).collect();
+    let result: Result<phone_unlock::Enrolment, String> = match outcome {
+        CardOutcome::Approved => {
+            let operator_current = ctx.op_mgmt == Some(operator);
+            let relay_live = live.iter().any(|l| *l);
+            crate::phone_unlock_cmd::complete_enrol(
+                ctx.nvs,
+                ctx.masters,
+                &enrol_pubkey,
+                &label,
+                |facts| phone_unlock::relay_enrol_completion(operator_current, relay_live, facts),
+                // Checked before the record is written: an answer the heap
+                // cannot carry must not leave a record behind it.
+                |enrolment| {
+                    response_transportable(answer_json(Ok(phone_unlock::enrolment_json(enrolment))).len())
+                },
+            )
+        }
+        CardOutcome::Denied => Err("declined on the board".into()),
+        CardOutcome::Expired => Err("not confirmed on the board in time: start again on the phone".into()),
+    };
+    let added = result.as_ref().ok().map(|e| (e.id, phone_unlock::check_code(&e.ephemeral_pubkey)));
+    if let (CardOutcome::Approved, Err(e)) = (outcome, &result) {
+        log::warn!("[relay] enrol card pressed but no phone added: {e}");
+    }
+    let response_json = answer_json(result.map(|e| phone_unlock::enrolment_json(&e)));
+
+    let held = Duration::from_secs(crate::uptime_s().saturating_sub(ask.received_uptime));
+    let sealed = seal_reply(
+        ctx.secp,
+        &signing_secret,
+        &conversation_key,
+        &hex_encode(&operator),
+        MGMT_KIND,
+        reply_stamp(ctx, ask.created_at, held),
+        response_json,
+    );
+    // Management answers go out on the configured relays only, never on a
+    // relay a pairing pinned: that is where the operator listens, and the
+    // management channel has no business on someone else's relay. Every one
+    // of them is offered it; delivery counts only on one the snapshot found
+    // live.
+    let mut delivered = false;
+    match &sealed {
+        Ok(sealed) => {
+            for (session, live) in sessions.iter_mut().zip(live.iter()) {
+                if session.pinned {
+                    continue;
+                }
+                match publish_sealed(&mut session.tls, sealed) {
+                    Ok(()) => delivered |= *live,
+                    Err(e) => log::warn!(
+                        "[relay] {} would not take the enrol answer for {request_id}: {e}",
+                        relay_host(&session.url)
+                    ),
+                }
+            }
+        }
+        Err(e) => log::warn!("[relay] enrol answer for {request_id} not sealed: {e}"),
+    }
+
+    let screen = phone_unlock::enrol_result(outcome, added.as_ref().map(|(id, _)| *id), delivered);
+    match screen {
+        EnrolResult::Done { id } => log::info!("[relay] phone {id} added; answer sent for {request_id}"),
+        // The record wraps the data key under a secret that left nowhere:
+        // it unlocks nothing, but it takes a place until revoked.
+        EnrolResult::NotSent { id } => {
+            log::warn!("[relay] enrol answer for {request_id} not sent; revoke phone {id}")
+        }
+        _ => {}
+    }
+    if !on_screen {
+        return;
+    }
+    // Every pressed outcome holds its screen until a press (`holds`).
+    match screen {
+        EnrolResult::Done { id } => {
+            let check = added.map(|(_, check)| check).unwrap_or_default();
+            show_and_hold(ctx, HeldScreen::PhoneAdded(crate::phone_unlock_cmd::Added { check, id }));
+        }
+        EnrolResult::NotSent { id } => {
+            show_and_hold(ctx, HeldScreen::NotDone { title: "Not sent", hint: format!("revoke id {id}") })
+        }
+        EnrolResult::NotAdded => {
+            show_and_hold(ctx, HeldScreen::NotDone { title: "No phone added", hint: "see Sapwood".into() })
+        }
+        EnrolResult::Declined => crate::oled::show_denied(ctx.display),
+        EnrolResult::Expired => crate::oled::show_request_expired(ctx.display),
+    }
+}
+
+/// Whether a session counts as able to carry an answer now: configured (not
+/// pinned) and heard from within a ping interval plus the pong's grace
+/// (`phone_unlock::heard_recently`). A socket whose uplink has gone quiet
+/// still accepts writes into its buffer, so a write alone proves nothing.
+fn session_live_for_answer(s: &RelaySession) -> bool {
+    !s.pinned
+        && heartwood_common::phone_unlock::heard_recently(
+            s.last_rx.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            PING_INTERVAL.as_millis() as u64,
+        )
+}
+
+/// A result screen that holds the display, kept so it can be drawn again
+/// after a signing confirmation that interrupts it.
+enum HeldScreen {
+    PhoneAdded(crate::phone_unlock_cmd::Added),
+    NotDone { title: &'static str, hint: String },
+}
+
+impl HeldScreen {
+    fn show(&self, display: &mut crate::oled::Display<'_>) {
+        match self {
+            HeldScreen::PhoneAdded(added) => added.show(display),
+            HeldScreen::NotDone { title, hint } => crate::oled::show_not_done(display, title, hint),
+        }
+    }
+}
+
+/// A result screen holding the display (`phone_unlock::ResultHold`).
+struct ScreenHold {
+    since: Instant,
+    state: heartwood_common::phone_unlock::ResultHold,
+    screen: HeldScreen,
+    /// When to draw the result again, after something drew over it
+    /// ([`interrupt_held_result`]).
+    redraw_at: Option<Instant>,
+}
+
+impl ScreenHold {
+    fn elapsed_ms(&self) -> u64 {
+        self.since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+}
+
+/// Draw a result screen and hold it (`hold_card_screen`).
+fn show_and_hold(ctx: &mut SignCtx, screen: HeldScreen) {
+    screen.show(ctx.display);
+    hold_card_screen(ctx, screen);
+}
+
+/// Keep `screen`, already drawn, until a fresh press: never less than
+/// `phone_unlock::RESULT_HOLD_MS` against anything waiting for the screen,
+/// and at most `phone_unlock::RESULT_HOLD_MAX_MS` (`ResultHold`). The idle
+/// screen returns when the hold ends, not on a timer.
+fn hold_card_screen(ctx: &mut SignCtx, screen: HeldScreen) {
+    crate::button::clear_press_edge();
+    ctx.card_screen_hold =
+        Some(ScreenHold { since: Instant::now(), state: Default::default(), screen, redraw_at: None });
+    ctx.last_activity = Instant::now();
+    ctx.network_display_restore_at = None;
+}
+
+/// Advance a held result screen by one pass (`phone_unlock::ResultHold::step`)
+/// and keep it lit. Runs at the top of every loop pass, whatever the network
+/// is doing, and from `service_button`'s waits, so the hold always sees its
+/// press, gives way to a queued card and runs out on time. True while it
+/// still owns the screen.
+fn service_card_screen_hold(ctx: &mut SignCtx) -> bool {
+    use heartwood_common::phone_unlock::HoldStep;
+    let waiting = !ctx.button_cards.is_empty();
+    let Some(hold) = ctx.card_screen_hold.as_mut() else {
+        return false;
+    };
+    let elapsed = hold.elapsed_ms();
+    let down = crate::button::hold_ms() > 0;
+    let b = ctx.buttons.b_pressed();
+    if b {
+        ctx.buttons.drain_b();
+    }
+    let pressed = crate::button::take_release().is_some() || b;
+    if hold.state.step(elapsed, down, pressed, waiting) == HoldStep::Hold {
+        // A held result is activity: the panel must not blank under it
+        // (DISPLAY_TIMEOUT is 30 s; the hold can last minutes).
+        ctx.last_activity = Instant::now();
+        // Something drew over the result: an auto-approved signing's
+        // confirmation (back once that has had its own hold), a cable
+        // command, a network status or a note banner (back after
+        // interrupt_held_result's delay).
+        let confirm_done = ctx.display_on && crate::confirm::service(ctx.display);
+        let due = hold.redraw_at.is_some_and(|at| Instant::now() >= at) && !crate::confirm::active();
+        if ctx.display_on && (confirm_done || due) {
+            hold.redraw_at = None;
+            hold.screen.show(ctx.display);
+        }
+        return true;
+    }
+    // A card waiting for the screen draws itself; otherwise the idle
+    // screen comes back now.
+    release_card_screen_hold(ctx, (!waiting).then_some(Duration::ZERO));
+    false
+}
+
+/// End a result hold. `restore_idle_after` puts the idle screen back that
+/// long from now; `None` where something else is about to draw.
+fn release_card_screen_hold(ctx: &mut SignCtx, restore_idle_after: Option<Duration>) {
+    ctx.card_screen_hold = None;
+    crate::button::clear_press_edge();
+    ctx.button_settle = ctx.buttons.a.is_low();
+    ctx.network_display_restore_at = restore_idle_after.map(|after| Instant::now() + after);
+}
+
+/// Clear the screen for a cable recovery card (`CableClaim::Recovery`) that
+/// is about to go up, called by its arm in `poll_usb_frame` once the
+/// handler's checks have passed: every relay card is answered Expired,
+/// exactly as if its window had run (publishing what an expiry publishes on
+/// the live sessions), and the latched press is cleared
+/// (`phone_unlock::take_screen_for_recovery`, host-tested). A held result
+/// stays: `poll_usb` draws it again after a recovery card that was denied or
+/// timed out, so a "revoke id N" is never lost to one. The cable card arms
+/// only once the button has been seen up (approval.rs, `button_arm`), so no
+/// hold the owner began for a relay card can answer it: a takeover is never
+/// a bait and switch.
+fn take_screen_for_recovery(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
+    let answered = heartwood_common::phone_unlock::take_screen_for_recovery(&mut RelayScreen { ctx, sessions });
+    if answered > 0 {
+        log::warn!("[relay] cable recovery command takes the screen: {answered} relay card(s) answered Expired");
+    }
+}
+
+/// The WiFi loop's screen as a cable recovery card sees it
+/// (`phone_unlock::RecoveryScreen`).
+struct RelayScreen<'r, 'a, 'd, 'b, 's> {
+    ctx: &'r mut SignCtx<'a, 'd, 'b>,
+    sessions: &'s mut [RelaySession],
+}
+
+impl heartwood_common::phone_unlock::RecoveryScreen for RelayScreen<'_, '_, '_, '_, '_> {
+    fn relay_cards(&self) -> usize {
+        self.ctx.button_cards.len()
+    }
+
+    fn expire_front_card(&mut self) {
+        resolve_button_card(self.ctx, self.sessions, 0, &CardTick::Expired);
+    }
+
+    fn clear_press(&mut self) {
+        crate::button::clear_press_edge();
+    }
+}
+
+/// Whether a cable command that puts up its own card must be refused with
+/// "approval on screen": a card is up, or a result has been held for less
+/// than `phone_unlock::RESULT_HOLD_MS` ([`screen_busy`]). Past that the
+/// command runs over the top of the result, which is drawn again after it
+/// (`poll_usb`), so a command that draws nothing, or is then refused, costs
+/// the result nothing.
+fn cable_card_refused(ctx: &SignCtx) -> bool {
+    screen_busy(ctx)
+}
+
+/// What the owner is reading or deciding now: a card, or a result held for
+/// less than `phone_unlock::RESULT_HOLD_MS`. Background work and unprompted
+/// screens (a relay update round, a network status, a note banner) wait for
+/// this, not for a result that may stay up for minutes; over an older result
+/// they go ahead and it is drawn again after them.
+fn screen_busy(ctx: &SignCtx) -> bool {
+    // A front card whose window has passed is not waiting for anyone: its
+    // expiry is only a tick away, and must not keep the cable refused while
+    // the loop cannot tick (a relay redial, a WiFi rejoin).
+    ctx.button_cards.first().is_some_and(|card| !card_overdue(card))
+        || ctx
+            .card_screen_hold
+            .as_ref()
+            .is_some_and(|hold| !heartwood_common::phone_unlock::ResultHold::yields(hold.elapsed_ms()))
+}
+
+/// Something drew over a held result: draw it again `after` from now.
+/// `took_button`: the interruption was a card answered with the button, whose
+/// release must not dismiss the result (`ResultHold::await_release`).
+fn interrupt_held_result(ctx: &mut SignCtx, after: Duration, took_button: bool) {
+    if let Some(hold) = ctx.card_screen_hold.as_mut() {
+        hold.redraw_at = Some(Instant::now() + after);
+        if took_button {
+            hold.state.await_release();
+            crate::button::clear_press_edge();
+        }
+    }
+}
+
 /// Build the kind-1059 for a `send`: the note as a rumor authored by the
 /// served identity, sealed to `to`. Called from the note dispatch arm with
 /// the secret the locker handed over for exactly this; the wrap is what the
@@ -5512,7 +6699,10 @@ pub(crate) fn wall_clock_estimate() -> u64 {
 /// whole batch answered when it resolves. Called once per relay loop pass, so
 /// the websocket, the USB cable and the other clients keep running underneath.
 fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
-    if ctx.button_cards.is_empty() {
+    // An enrolment's result stays up until a press, or until it has stood
+    // long enough for a card waiting here to take over
+    // (service_card_screen_hold, at the top of every pass).
+    if ctx.card_screen_hold.is_some() || ctx.button_cards.is_empty() {
         return;
     }
 
@@ -5551,9 +6741,15 @@ fn show_card_not_done(ctx: &mut SignCtx, title: &str, hint: &str) {
     ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(5));
 }
 
-/// True while an approval card owns the screen and the button.
+/// True while an approval card, or a result screen held after one, owns the
+/// screen and the button. A hold past its time never counts, even on a pass
+/// that has not yet dropped it (`service_card_screen_hold`).
 fn approval_card_open(ctx: &SignCtx) -> bool {
     !ctx.button_cards.is_empty()
+        || ctx
+            .card_screen_hold
+            .as_ref()
+            .is_some_and(|hold| !heartwood_common::phone_unlock::ResultHold::expired(hold.elapsed_ms()))
 }
 
 fn sign_audit_draft(
@@ -5664,11 +6860,22 @@ fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
 /// no-PSRAM heap. get_status is polled every few seconds, so the poll that
 /// reports a starved heap must never itself be the allocation that reboots the
 /// signer. `truncated` tells the manager the request log was omitted this poll.
-fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize) -> String {
+///
+/// `is_device_op` gates this exactly as the full reply does (`dispatch_mgmt`'s
+/// `get_status` arm): a per-identity delegate never sees the device-wide
+/// fields — `master_count`, `relay`, `crashed_during`, `at_rest`,
+/// `unlock_phone_count` and the rest — even under heap pressure. The fallback
+/// must never be a wider leak than the reply it stands in for.
+fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op: bool) -> String {
     let master_hex = hex_encode(&ctx.masters[master_idx].pubkey);
-    serde_json::json!({
-        "id": id,
-        "result": {
+    let result = if is_device_op {
+        // Plan G2: one call resolves both fields (mode from the wrap/marker,
+        // count from `dk_ph`, and how the two combine) — see
+        // `pin::at_rest_status` and `heartwood_common::at_rest_status::
+        // resolve`, which this and `dispatch_mgmt`'s full reply both call
+        // instead of each repeating the composition.
+        let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
+        serde_json::json!({
             "master_count": ctx.masters.len(),
             "master_npub_hex": master_hex,
             "mode": "wifi-standalone",
@@ -5681,12 +6888,39 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize) -> String {
                 esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
             } as u32,
             "log_quiet": crate::log_quiet::read(ctx.nvs),
+            "at_rest": at_rest.wire(),
+            "unlock_phone_count": unlock_phone_count,
             "version": env!("CARGO_PKG_VERSION"),
             "board": crate::board::BOARD,
             "truncated": true,
+        })
+    } else {
+        // Built from `heartwood_common::at_rest_status::
+        // DELEGATE_STATUS_FALLBACK_KEYS`, not just typed out to match it: a
+        // future key added to the constant without a matching arm here is a
+        // panic, not a silent leak past the host-tested subset check on that
+        // constant. The reduced shape a delegate's normal get_status reply
+        // carries (`dispatch_mgmt`, `DELEGATE_STATUS_KEYS`) minus
+        // `capabilities`, `slots` and `client_storage_ready` — the low-heap
+        // path should not spend memory on the policy-engine calls those need
+        // either.
+        let mut fields = serde_json::Map::new();
+        for key in heartwood_common::at_rest_status::DELEGATE_STATUS_FALLBACK_KEYS {
+            let value = match *key {
+                "master_npub_hex" => serde_json::Value::String(master_hex.clone()),
+                "mode" => serde_json::Value::String("wifi-standalone".to_string()),
+                "version" => serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+                "board" => serde_json::Value::String(crate::board::BOARD.to_string()),
+                "truncated" => serde_json::Value::Bool(true),
+                other => unreachable!(
+                    "DELEGATE_STATUS_FALLBACK_KEYS names {other}, with no matching arm here"
+                ),
+            };
+            fields.insert((*key).to_string(), value);
         }
-    })
-    .to_string()
+        serde_json::Value::Object(fields)
+    };
+    serde_json::json!({ "id": id, "result": result }).to_string()
 }
 
 /// NIP-46 signing path (kind 24133): resolve the addressed identity → decrypt →
@@ -6413,6 +7647,22 @@ fn handle_mgmt_event(
                 mgmt::MutationChallenge::NotRequired => unreachable!(),
             }
         }
+        // Adding an unlock phone waits on the button as a card, and the card
+        // answers when it resolves (resolve_phone_enrol_card). The challenge
+        // above is already spent, so this request can never raise a second.
+        if method == heartwood_common::phone_unlock::ENROL_METHOD {
+            return queue_phone_enrol(
+                ctx,
+                &req,
+                &id,
+                master_idx,
+                &author,
+                is_device_op,
+                ev.created_at,
+                received_uptime,
+            )
+            .map(|()| None);
+        }
         dispatch_mgmt(
             &method,
             &req,
@@ -6423,12 +7673,15 @@ fn handle_mgmt_event(
             is_device_op,
             challenge_scope,
         )
+        .map(Some)
     })();
     // The breadcrumb stays set across the response publish below too;
     // handle_relay_msg clears it once the whole event is processed.
 
     let response_json = match dispatch_result {
-        Ok(result) => serde_json::json!({ "id": id, "result": result }).to_string(),
+        // Held on a card: nothing is owed until it resolves.
+        Ok(None) => return Ok(()),
+        Ok(Some(result)) => serde_json::json!({ "id": id, "result": result }).to_string(),
         Err(e) => serde_json::json!({ "id": id, "error": e }).to_string(),
     };
 
@@ -6448,7 +7701,7 @@ fn handle_mgmt_event(
             "[relay] get_status response ({} B) too large for free heap; sending minimal status",
             response_json.len()
         );
-        minimal_status_json(&id, ctx, master_idx)
+        minimal_status_json(&id, ctx, master_idx, is_device_op)
     } else {
         log::warn!(
             "[relay] mgmt {method} response ({} B) too large for free heap; returning error instead of risking a crash",
@@ -8368,7 +9621,9 @@ fn dispatch_mgmt(
             // allocated a fresh avatar buffer at the request's peak heap use,
             // which is exactly when a fragmented mid-TLS heap says no.
             // Never wakes a blanked panel — operator config, not a user request.
-            if ctx.masters.len() == 1 && ctx.display_on {
+            // Not over a card or a held result: the identity card would hide
+            // the words the owner is reading.
+            if ctx.masters.len() == 1 && ctx.display_on && !approval_card_open(ctx) {
                 let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
                 crate::oled::show_npub(
                     ctx.display,
@@ -8402,30 +9657,16 @@ fn dispatch_mgmt(
             Ok(serde_json::json!({ "quiet": quiet }))
         }
 
-        // Phones that can unlock this board. Enrolment is cable-only (it needs
-        // a press, and the relay loop must not block on a card); these three
-        // need no press. See phone_unlock_cmd.rs.
+        // Phones that can unlock this board. These three need no press;
+        // enrol_unlock_phone never reaches here (handle_mgmt_event holds it on
+        // a card, queue_phone_enrol). See phone_unlock_cmd.rs.
         "list_unlock_phones" | "revoke_unlock_phone" | "set_announce_operator" => {
             if !is_device_op {
                 return Err(format!("{method} is a device-level operation and requires the device operator"));
             }
-            let cmd = match method {
-                "list_unlock_phones" => heartwood_common::phone_unlock::PhoneCmd::List,
-                "revoke_unlock_phone" => heartwood_common::phone_unlock::PhoneCmd::Revoke {
-                    id: req
-                        .pointer("/params/id")
-                        .and_then(|v| v.as_u64())
-                        .and_then(|v| u32::try_from(v).ok())
-                        .ok_or("revoke_unlock_phone requires params.id")?,
-                },
-                _ => heartwood_common::phone_unlock::PhoneCmd::SetAnnounceOperator {
-                    on: req
-                        .pointer("/params/on")
-                        .and_then(|v| v.as_bool())
-                        .ok_or("set_announce_operator requires params.on")?,
-                },
-            };
-            crate::phone_unlock_cmd::run(cmd, ctx.nvs, ctx.masters, ctx.display, None)
+            let cmd = heartwood_common::phone_unlock::PhoneCmd::from_mgmt(method, req.get("params"))
+                .unwrap_or(Err("unknown phone-unlock method"))?;
+            crate::phone_unlock_cmd::run(cmd, ctx.nvs)
         }
 
         // Screen orientation: upright, or turned through 180 degrees.
@@ -8449,6 +9690,9 @@ fn dispatch_mgmt(
                     // Phone unlock: USB frame 0x64 and the list/revoke/
                     // set_announce_operator management methods.
                     "phone_unlock_v1",
+                    // enrol_unlock_phone: adding a phone over the relay, on
+                    // a deferred card with the request code.
+                    heartwood_common::phone_unlock::RELAY_ENROL_CAPABILITY,
                     "client_policy_v2",
                     // Schema addendum §1.5 family flags (escalate,
                     // petition_on_deny, audit_child_wrap, bound_identity)
@@ -8489,21 +9733,43 @@ fn dispatch_mgmt(
             ]);
             // A delegate (per-identity operator) sees only what it needs to
             // feature-detect and manage its own identity — never the
-            // device-wide audit ring, relay topology, storage inventory, or an
-            // enumeration of the owner's other identities.
+            // device-wide audit ring, relay topology, storage inventory, an
+            // enumeration of the owner's other identities, or the at-rest
+            // mode and phone count below (device-wide properties, not this
+            // identity's). Built from
+            // `heartwood_common::at_rest_status::DELEGATE_STATUS_KEYS`, not
+            // just typed out to match it, for the same reason
+            // `minimal_status_json`'s fallback is: a key added here without
+            // updating the constant is a panic, not a silent leak past the
+            // host-tested subset check the fallback depends on.
             if !is_device_op {
-                return Ok(serde_json::json!({
-                    "master_npub_hex": master_hex,
-                    "mode": "wifi-standalone",
-                    "capabilities": capabilities,
-                    "slots": ctx.policy_engine.list_slots(master_slot).len(),
-                    "client_storage_ready": ctx.policy_engine.storage_ready(master_slot),
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "board": crate::board::BOARD,
-                }));
+                let mut fields = serde_json::Map::new();
+                for key in heartwood_common::at_rest_status::DELEGATE_STATUS_KEYS {
+                    let value = match *key {
+                        "master_npub_hex" => serde_json::Value::String(master_hex.clone()),
+                        "mode" => serde_json::Value::String("wifi-standalone".to_string()),
+                        "capabilities" => capabilities.clone(),
+                        "slots" => serde_json::json!(ctx.policy_engine.list_slots(master_slot).len()),
+                        "client_storage_ready" => {
+                            serde_json::json!(ctx.policy_engine.storage_ready(master_slot))
+                        }
+                        "version" => serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+                        "board" => serde_json::Value::String(crate::board::BOARD.to_string()),
+                        other => unreachable!(
+                            "DELEGATE_STATUS_KEYS names {other}, with no matching arm here"
+                        ),
+                    };
+                    fields.insert((*key).to_string(), value);
+                }
+                return Ok(serde_json::Value::Object(fields));
             }
             let mut relays_live = vec![s.url.clone()];
             relays_live.extend(pool.others.iter().map(|o| o.url.clone()));
+            // Plan G2: one call resolves both fields (mode from the
+            // wrap/marker, count from `dk_ph`, and how the two combine) —
+            // see `pin::at_rest_status` and `heartwood_common::
+            // at_rest_status::resolve`. Never a phone id, label or hint.
+            let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
             Ok(serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,
@@ -8535,6 +9801,14 @@ fn dispatch_mgmt(
                 // stats API fails, so "unknown" is not "empty").
                 "nvs": crate::nvs_stats::as_json(),
                 "max_personas": crate::personas::MAX_PERSONAS,
+                // At-rest mode ("none"/"pin"/"vault"/"encrypted") and how
+                // many phones can unlock this board (plan G2). Only reachable
+                // here at all once genuinely unlocked — a locked board runs
+                // `locked_relay_phase` instead, which never reaches
+                // `dispatch_mgmt`; FIRMWARE_INFO is the surface that reports
+                // this while locked (see its doc comment).
+                "at_rest": at_rest.wire(),
+                "unlock_phone_count": unlock_phone_count,
                 // Running firmware, so managers can show version state over
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),

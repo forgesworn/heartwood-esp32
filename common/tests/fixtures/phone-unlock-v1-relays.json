@@ -1,0 +1,23 @@
+{
+  "author": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "content": "AcDBwsPExcbHyMnKyzFQxcXFQyzcXtoO8O9od0CIMkGCmHdrZ/R9qJBMXsGnmbhrTQhez1rRlZBiT7rDmChTqf1l5KWW4mGZtfYRpUTO5jqeoSh+GYytdJStg61ANn0BmGJhOQqMvTArYS3qfGXA5qnW9ruxRhbRVxc06JsMPYglF6arkBWvTqDcgxmMqKWeyZ6sk2pFApYnGClttMq5GkNsF708bFYmPbUZsRwvFVy1uaQFtmeANEjRrQzz+hcgULICgRonj8omWwqEeULp1g1CJhcKL4n30TpleM6GoGg=",
+  "context": {
+    "boot": 212,
+    "bssid": "aa:bb:cc:dd:ee:ff",
+    "fw": "0.18.0-beta.17",
+    "id": 7,
+    "relays": [
+      "wss://relay.example",
+      "wss://two.example"
+    ],
+    "reset": "poweron",
+    "ssid": "devolo-753",
+    "t": "relays",
+    "v": 1
+  },
+  "description": "Phone unlock v1 relay-update vector: the v1 keys and context with t = relays. A phone opens it exactly like a lock announcement, follows its relays and never prompts. See common/src/phone_unlock.rs.",
+  "hint": "e692cafe2a6e4a8d",
+  "nonce": "c0c1c2c3c4c5c6c7c8c9cacb",
+  "phone_key": "8d2ad99453444b5a25f142b69b0e1c0df9e49b6dcf3d755e39a1112ad2c6bc12",
+  "slot_secret": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+}

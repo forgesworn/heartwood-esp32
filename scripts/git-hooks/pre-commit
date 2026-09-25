@@ -40,6 +40,9 @@ import sys
 # Known-safe hex constants (test vectors, mathematical constants, frozen
 # pubkeys). These are public by definition.
 ALLOW_HEX = {
+    # x-coordinate of 2G on secp256k1, a public curve constant: a valid x-only
+    # public key fixture in common/src/net_config.rs operator tests.
+    "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
     # SHA-256 of spoken-token's public en-v1 word list joined with "\n",
     # pinned in common/src/spoken_words.rs: a hash of public data, not a secret.
     "0334930ebdfbc76e81ec914515d7567ca85738a6bf3069249d97df951d44661c",

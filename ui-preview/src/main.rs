@@ -306,6 +306,9 @@ struct Tags {
 
 const HELTEC_TAGS: Tags = Tags { side: TagSide::Left, cancel: false, approve_on_top: true };
 const TDISPLAY_TAGS: Tags = Tags { side: TagSide::Right, cancel: true, approve_on_top: false };
+/// The Heltec with its screen turned through 180 degrees (display_flip.rs):
+/// the PRG tag moves to the right-hand edge, level with the lower row.
+const HELTEC_FLIPPED_TAGS: Tags = Tags { side: TagSide::Right, cancel: false, approve_on_top: false };
 
 /// Each tag as (text, colour, position).
 fn tag_items(l: &Layout, tags: Tags) -> Vec<(String, Rgb565, Point)> {
@@ -327,41 +330,68 @@ fn tag_items(l: &Layout, tags: Tags) -> Vec<(String, Rgb565, Point)> {
         .collect()
 }
 
-/// The enrol card's text, one entry per line: (text, font, colour, position).
-/// Mirrors `oled::show_enrol_approval`: the top line and hint in the small
-/// font, the words in the header font, all centred clear of the tags.
+/// One piece of text on a card: (text, font, integer scale, colour, baseline).
+type Item = (String, &'static MonoFont<'static>, i32, Rgb565, Point);
+
+/// Draw one [`Item`] (scaled through bigtext, as the firmware does).
+fn draw_item<D: DrawTarget<Color = Rgb565>>(d: &mut D, (text, font, scale, colour, p): &Item) {
+    bigtext::draw_text_scaled(d, text, *p, font, *scale, *colour);
+}
+
+/// Page `page` of the enrol card's text, one entry per line. Mirrors
+/// `oled::show_enrol_approval`: the top line and hint in the small font,
+/// centred clear of the tags; the page's words (two, two, one) with their
+/// place numbers, at the size `Layout::enrol_geometry` picks; and the
+/// countdown's seconds. The countdown bar is a rectangle, drawn separately.
 fn enrol_items(
     l: &Layout,
     tags: Option<Tags>,
     words: &[&str; phone_unlock::REQUEST_CODE_WORDS],
     label: &str,
-) -> Vec<(String, &'static MonoFont<'static>, Rgb565, Point)> {
+    page: usize,
+    secs: u32,
+) -> Vec<Item> {
     let side = tags.map(|t| t.side);
-    let card = phone_unlock::enrol_card(words, label, l.span_chars(side, l.font_small()));
+    let g = l.enrol_geometry(side);
+    let card = phone_unlock::enrol_card(words, label, l.span_chars(side, l.font_small()), page);
+    let small = l.font_small();
+    let centred = |text: &str, y: i32| Point::new(l.center_in_span(side, text.len() as i32 * Layout::glyph_w(small)), y);
 
-    let at = |text: &str, font: &MonoFont<'_>, y: i32| {
-        Point::new(l.center_in_span(side, text.len() as i32 * Layout::glyph_w(font)), l.sy(y))
-    };
-    let mut items = vec![(card.top.clone(), l.font_small(), ACCENT, at(&card.top, l.font_small(), 7))];
-    let (span_left, span_right) = l.text_span(side);
-    let widest = card.words.iter().map(|w| w.len()).max().unwrap_or(0) as i32;
-    let word_font = if widest * Layout::glyph_w(l.font_header()) <= span_right - span_left {
-        l.font_header()
-    } else {
-        l.font_small()
-    };
-    for (line, y) in card.words.iter().zip([17, 28, 39]) {
-        items.push((line.clone(), word_font, WARN, at(line, word_font, y)));
+    let mut items: Vec<Item> = vec![(card.top.clone(), small, 1, ACCENT, centred(&card.top, g.top_y))];
+    for ((place, word), y) in card.lines.iter().zip(g.word_y) {
+        items.push((place.to_string(), small, 1, MUTED, Point::new(g.number_x, y)));
+        items.push((word.clone(), g.word_font, g.word_scale, WARN, Point::new(g.word_x, y)));
     }
     // A tagged board's cancel button is its second one (T-Display); the
     // untagged C6 is drawn as a single-button board.
     let hint = phone_unlock::enrol_hint(tags.map(|t| t.cancel), tags.is_some_and(|t| t.cancel)).to_string();
-    let p = at(&hint, l.font_small(), 49);
-    items.push((hint, l.font_small(), MUTED, p));
+    let p = centred(&hint, g.hint_y);
+    items.push((hint, small, 1, MUTED, p));
+    items.push((format!("{secs}s"), small, 1, FG, Point::new(g.secs_x, g.secs_y)));
     items
 }
 
-/// Add-an-unlock-phone card (mirrors `oled::show_enrol_approval`).
+/// The enrol card's countdown bar: outline and fill, inside the span
+/// (mirrors `oled::draw_enrol_countdown`).
+fn draw_enrol_bar<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, side: Option<TagSide>, secs: u32, total: u32) {
+    let (x, y, w, h) = l.enrol_geometry(side).bar;
+    Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32))
+        .into_styled(PrimitiveStyle::with_stroke(MUTED, l.s(1) as u32))
+        .draw(d)
+        .ok();
+    let pct_left = if total > 0 { secs * 100 / total } else { 0 };
+    let urgency = if pct_left > 50 { OK } else if pct_left > 20 { WARN } else { DANGER };
+    let inner = w - 2 * l.s(2);
+    let fill = if total > 0 { secs as i32 * inner / total as i32 } else { 0 };
+    if fill > 0 {
+        Rectangle::new(Point::new(x + l.s(2), y + l.s(2)), Size::new(fill as u32, (h - 2 * l.s(2)).max(1) as u32))
+            .into_styled(PrimitiveStyle::with_fill(urgency))
+            .draw(d)
+            .ok();
+    }
+}
+
+/// Add-an-unlock-phone card, one page (mirrors `oled::show_enrol_approval`).
 fn draw_enrol_card<D: DrawTarget<Color = Rgb565> + Dimensions>(
     d: &mut D,
     tags: Option<Tags>,
@@ -371,20 +401,49 @@ fn draw_enrol_card<D: DrawTarget<Color = Rgb565> + Dimensions>(
 ) {
     let l = layout_of(d);
     d.clear(BG).ok();
-    for (text, font, colour, p) in enrol_items(&l, tags, words, label) {
-        Text::new(&text, p, style(font, colour)).draw(d).ok();
+    let total = phone_unlock::ENROL_CARD_SECS;
+    let page = phone_unlock::enrol_page(total, secs);
+    for item in enrol_items(&l, tags, words, label, page, secs) {
+        draw_item(d, &item);
     }
     if let Some(tags) = tags {
         for (text, colour, p) in tag_items(&l, tags) {
             Text::new(&text, p, style(l.font_small(), colour)).draw(d).ok();
         }
     }
-    draw_countdown(d, &l, secs, 30);
+    draw_enrol_bar(d, &l, tags.map(|t| t.side), secs, total);
 }
 
-/// PHONE ADDED (mirrors `oled::show_phone_added` through `show_status_card`).
+/// PHONE ADDED's text (mirrors `oled::show_phone_added`): the header and its
+/// rule as every status card has them, then "check code" small, the code
+/// itself at the card words' size, and "else revoke N" small.
+fn phone_added_items(l: &Layout, check: &str, id: u32) -> Vec<Item> {
+    let (font, scale) = l.card_word_font(None);
+    let small = l.font_small();
+    let header = l.font_header();
+    let centred = |text: &str, font: &MonoFont<'_>, scale: i32, y: i32| {
+        Point::new(l.center_x(bigtext::scaled_text_width(text, font, scale)), l.sy(y))
+    };
+    let hint = format!("else revoke {id}");
+    vec![
+        ("PHONE ADDED".into(), header, 1, ACCENT, centred("PHONE ADDED", header, 1, 10)),
+        ("check code".into(), small, 1, MUTED, centred("check code", small, 1, 24)),
+        (check.into(), font, scale, OK, centred(check, font, scale, 43)),
+        (hint.clone(), small, 1, MUTED, centred(&hint, small, 1, 56)),
+    ]
+}
+
+/// PHONE ADDED (mirrors `oled::show_phone_added`).
 fn draw_phone_added<D: DrawTarget<Color = Rgb565> + Dimensions>(d: &mut D, check: &str, id: u32) {
-    draw_status_card(d, "PHONE ADDED", &format!("check {check}"), &format!("else revoke {id}"), OK);
+    let l = layout_of(d);
+    d.clear(BG).ok();
+    for item in phone_added_items(&l, check, id) {
+        draw_item(d, &item);
+    }
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(d)
+        .ok();
 }
 
 /// Hold-to-confirm screen: header, big percentage + progress bar in success
@@ -696,10 +755,17 @@ fn main() {
             _ => None,
         };
         let words = phone_unlock::request_words(&[0xAB; 32]);
-        render(&format!("enrol-{b}"), w, h, |d| draw_enrol_card(d, tags, &words, "Pixel 8", 24));
-        render(&format!("enrol-longest-{b}"), w, h, |d| {
-            draw_enrol_card(d, tags, &["abstract", "accident", "acoustic", "absolute", "activity"], "WWWWWWWWWWWWWWWW", 24)
-        });
+        // One render per page: 59 s left is page 1, 55 s page 2, 51 s page 3.
+        for (page, secs) in [(1, 59), (2, 55), (3, 51)] {
+            render(&format!("enrol-{b}-page{page}"), w, h, |d| draw_enrol_card(d, tags, &words, "Pixel 8", secs));
+            render(&format!("enrol-longest-{b}-page{page}"), w, h, |d| {
+                draw_enrol_card(d, tags, &["abstract", "accident", "acoustic", "absolute", "activity"], "WWWWWWWWWWWWWWWW", secs)
+            });
+        }
+        if b == "heltec" {
+            // The screen turned through 180 degrees: "PRG>" bottom right.
+            render("enrol-heltec-flipped-page1", w, h, |d| draw_enrol_card(d, Some(HELTEC_FLIPPED_TAGS), &words, "Pixel 8", 59));
+        }
         render(&format!("phone-added-{b}"), w, h, |d| draw_phone_added(d, "9B6 164", u32::MAX));
         render(&format!("idle-{b}"), w, h, |d| draw_idle(d, None, npub));
         render(&format!("idle-named-{b}"), w, h, |d| draw_idle(d, Some("TheCryptoDonkey"), npub));
@@ -877,54 +943,104 @@ mod enrol_card_tests {
             .collect()
     }
 
-    /// Every line of the enrol card, drawn alone, shares no pixel with any
-    /// other line or with a button tag, and stays inside the span clear of
-    /// the tags, on every panel, with the longest label and the widest words.
+    /// Every piece of the enrol card, drawn alone, shares no pixel with any
+    /// other or with a button tag, and stays inside the span clear of the
+    /// tags, on every panel and orientation, on every page, with the longest
+    /// label and the widest words. The countdown bar is one of the pieces.
     #[test]
     fn the_enrol_card_never_overprints_a_tag_or_itself() {
         let widest: [&str; phone_unlock::REQUEST_CODE_WORDS] =
             ["abstract", "accident", "acoustic", "absolute", "activity"];
         let boards = [
             (128u32, 64u32, Some(HELTEC_TAGS)),
+            (128, 64, Some(HELTEC_FLIPPED_TAGS)),
             (240, 135, Some(TDISPLAY_TAGS)),
             (172, 320, None),
         ];
         for (w, h, tags) in boards {
             let l = Layout::new(w as i32, h as i32);
+            let side = tags.map(|t| t.side);
             for label in ["phone", "Pixel 8", "WWWWWWWWWWWWWWWW"] {
-                let items = enrol_items(&l, tags, &widest, label);
-                let mut layers: Vec<(String, Vec<Point>)> = items
-                    .iter()
-                    .map(|(text, font, colour, p)| {
-                        let (text, font, colour, p) = (text.clone(), *font, *colour, *p);
-                        (text.clone(), lit(move |d| { Text::new(&text, p, style(font, colour)).draw(d).ok(); }, w, h))
-                    })
-                    .collect();
-                let (left, right) = l.text_span(tags.map(|t| t.side));
-                for (text, points) in &layers {
-                    assert!(!points.is_empty(), "{w}x{h}: {text:?} drew nothing");
-                    assert!(
-                        points.iter().all(|p| p.x >= left && p.x < right),
-                        "{w}x{h}: {text:?} leaves the span clear of the tags"
-                    );
-                }
-                if let Some(tags) = tags {
-                    for (text, colour, p) in tag_items(&l, tags) {
-                        let font = l.font_small();
-                        let t = text.clone();
-                        layers.push((text, lit(move |d| { Text::new(&t, p, style(font, colour)).draw(d).ok(); }, w, h)));
-                    }
-                }
-                for i in 0..layers.len() {
-                    for j in i + 1..layers.len() {
-                        let clash = layers[i].1.iter().find(|p| layers[j].1.contains(p));
+                for page in 0..phone_unlock::ENROL_PAGES {
+                    let items = enrol_items(&l, tags, &widest, label, page, 60);
+                    let mut layers: Vec<(String, Vec<Point>)> = items
+                        .into_iter()
+                        .map(|item| (item.0.clone(), lit(move |d| draw_item(d, &item), w, h)))
+                        .collect();
+                    let bar_l = l;
+                    layers.push(("countdown bar".into(), lit(move |d| draw_enrol_bar(d, &bar_l, side, 60, 60), w, h)));
+                    let (left, right) = l.text_span(side);
+                    for (text, points) in &layers {
+                        assert!(!points.is_empty(), "{w}x{h}: {text:?} drew nothing");
                         assert!(
-                            clash.is_none(),
-                            "{w}x{h} label {label:?}: {:?} and {:?} meet at {clash:?}",
-                            layers[i].0,
-                            layers[j].0
+                            points.iter().all(|p| p.x >= left && p.x < right && p.y >= 0 && p.y < h as i32),
+                            "{w}x{h}: {text:?} leaves the span clear of the tags"
                         );
                     }
+                    if let Some(tags) = tags {
+                        for (text, colour, p) in tag_items(&l, tags) {
+                            let font = l.font_small();
+                            let t = text.clone();
+                            layers.push((text, lit(move |d| { Text::new(&t, p, style(font, colour)).draw(d).ok(); }, w, h)));
+                        }
+                    }
+                    for i in 0..layers.len() {
+                        for j in i + 1..layers.len() {
+                            let clash = layers[i].1.iter().find(|p| layers[j].1.contains(p));
+                            assert!(
+                                clash.is_none(),
+                                "{w}x{h} label {label:?} page {page}: {:?} and {:?} meet at {clash:?}",
+                                layers[i].0,
+                                layers[j].0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// On the Heltec the words are 12 px letters (FONT_6X10 at 2x), twice
+    /// the old card's, with a clear row between every piece of the card.
+    #[test]
+    fn the_heltec_enrol_words_are_twice_the_old_size() {
+        let l = Layout::new(128, 64);
+        let rows = |item: Item| {
+            let ys: Vec<i32> = lit(move |d| draw_item(d, &item), 128, 64).iter().map(|p| p.y).collect();
+            (*ys.iter().min().unwrap(), *ys.iter().max().unwrap())
+        };
+        let items = enrol_items(&l, Some(HELTEC_TAGS), &["bight", "jury", "ok", "ok", "ok"], "phone", 0, 60);
+        let word = items.iter().find(|i| i.0 == "bight").unwrap().clone();
+        assert_eq!((word.1.character_size.width, word.2), (6, 2));
+        // Ascender to descender: 18 rows, where the old card's words had 9.
+        let (top, bottom) = rows(word);
+        assert_eq!(bottom - top + 1, 18);
+        let mut spans: Vec<(i32, i32)> = items.into_iter().filter(|i| i.0 != "1" && i.0 != "2" && i.0 != "60s").map(rows).collect();
+        spans.sort();
+        for pair in spans.windows(2) {
+            assert!(pair[1].0 > pair[0].1 + 1, "no clear row between {pair:?}");
+        }
+    }
+
+    /// PHONE ADDED: the check code at the card words' size, every line on
+    /// the panel and apart from the others and the header's rule.
+    #[test]
+    fn phone_added_keeps_its_lines_apart_on_every_panel() {
+        for (w, h) in [(128u32, 64u32), (240, 135), (172, 320)] {
+            let l = Layout::new(w as i32, h as i32);
+            let items = phone_added_items(&l, "9B6 164", u32::MAX);
+            assert_eq!(items[2].2, l.card_word_font(None).1, "{w}x{h}");
+            let mut layers: Vec<(String, Vec<Point>)> =
+                items.into_iter().map(|item| (item.0.clone(), lit(move |d| draw_item(d, &item), w, h))).collect();
+            let rule_y = l.sy(14);
+            layers.push(("rule".into(), (0..w as i32).map(|x| Point::new(x, rule_y)).collect()));
+            for (text, points) in &layers {
+                assert!(points.iter().all(|p| p.x >= 0 && p.x < w as i32 && p.y >= 0 && p.y < h as i32), "{w}x{h} {text}");
+            }
+            for i in 0..layers.len() {
+                for j in i + 1..layers.len() {
+                    let near = layers[i].1.iter().find(|p| layers[j].1.iter().any(|q| (q.y - p.y).abs() <= 1 && q.x == p.x));
+                    assert!(near.is_none(), "{w}x{h}: {:?} and {:?} touch at {near:?}", layers[i].0, layers[j].0);
                 }
             }
         }
@@ -940,6 +1056,7 @@ mod enrol_card_tests {
             &phone_unlock::request_words(&[0xAB; 32]),
             "WWWWWWWWWWWWWWWW",
             l.span_chars(Some(TagSide::Left), l.font_small()),
+            0,
         );
         assert_eq!(card.top.len(), 20);
     }
@@ -950,7 +1067,7 @@ mod enrol_card_tests {
         let l = Layout::new(128, 64);
         let hint = format!("else revoke {}", u32::MAX);
         assert!(hint.len() <= l.chars_per_line(l.font_small()), "{hint}");
-        let title = "check 9B6 164";
-        assert!(title.len() as i32 * Layout::glyph_w(l.font_body()) <= l.w - l.sx(4));
+        let (font, scale) = l.card_word_font(None);
+        assert!(bigtext::scaled_text_width("9B6 164", font, scale) <= l.w - l.sx(4));
     }
 }

@@ -651,23 +651,50 @@ pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
     alloc::format!("{} {}", &hex[..3], &hex[3..])
 }
 
-/// What the enrol card draws: a top line naming what is asked, with the
-/// requester's label in quotes, and the five words below it, two, two and
-/// one a line. The label never shares a line with a word, and its quotes
-/// keep it from reading as words even when it is spelt like them.
+/// How long the enrol card stays up, on the cable and over the relay: twice
+/// the 30 s every other card has. The five words are the only defence against
+/// a swapped enrolment key, and on the Heltec's 128x64 OLED the owner reads
+/// them a page at a time and compares each with the phone (bench, 2026-09-25:
+/// at 30 s the card went before they had been read).
+pub const ENROL_CARD_SECS: u32 = 60;
+
+/// How many pages the enrol card steps through: two words a page, so 1 and 2,
+/// then 3 and 4, then 5.
+pub const ENROL_PAGES: usize = REQUEST_CODE_WORDS.div_ceil(2);
+
+/// How long each page of the enrol card stays up before the next. All five
+/// words are shown within 12 s and come round five times in the card's
+/// window, with no press (a press answers the card).
+pub const ENROL_PAGE_SECS: u32 = 4;
+
+/// The page the enrol card shows with `remaining_secs` of `total_secs` left,
+/// as both loops count it (`remaining` is whole seconds, rounded down, so the
+/// first draw sees `total - 1`).
+pub fn enrol_page(total_secs: u32, remaining_secs: u32) -> usize {
+    let elapsed = total_secs.saturating_sub(remaining_secs.saturating_add(1));
+    (elapsed / ENROL_PAGE_SECS) as usize % ENROL_PAGES
+}
+
+/// What one page of the enrol card draws: a top line naming what is asked,
+/// with the requester's label in quotes, and below it this page's words, one
+/// a line, each with its place in the code (1 to 5). The label never shares a
+/// line with a word, and its quotes keep it from reading as words even when
+/// it is spelt like them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnrolCard {
     pub top: String,
-    pub words: [String; 3],
+    /// `(place, word)`, place counted from 1, at most two a page.
+    pub lines: Vec<(usize, String)>,
 }
 
-/// The enrol card for these words and label. `top_max_chars` is how many
-/// small-font characters the top line holds on this panel, clear of the
-/// button tags (`Layout::span_chars`: 20 on the Heltec); a label that would
-/// overflow it is shortened inside its quotes with "..", since it is only a
-/// description (the words are the check). Labels are printable ASCII, so a
-/// character is a byte.
-pub fn enrol_card(words: &[&str; REQUEST_CODE_WORDS], label: &str, top_max_chars: usize) -> EnrolCard {
+/// Page `page` of the enrol card for these words and label (a page past the
+/// last wraps round). `top_max_chars` is how many small-font characters the
+/// top line holds on this panel, clear of the button tags
+/// (`Layout::span_chars`: 20 on the Heltec); a label that would overflow it
+/// is shortened inside its quotes with "..", since it is only a description
+/// (the words are the check). Labels are printable ASCII, so a character is a
+/// byte.
+pub fn enrol_card(words: &[&str; REQUEST_CODE_WORDS], label: &str, top_max_chars: usize, page: usize) -> EnrolCard {
     // `ADD "` + label + `"?`
     const FRAME: usize = 7;
     let room = top_max_chars.saturating_sub(FRAME);
@@ -676,13 +703,12 @@ pub fn enrol_card(words: &[&str; REQUEST_CODE_WORDS], label: &str, top_max_chars
     } else {
         alloc::format!("{}..", &label[..room.saturating_sub(2).min(label.len())])
     };
+    let first = (page % ENROL_PAGES) * 2;
     EnrolCard {
         top: alloc::format!("ADD \"{label}\"?"),
-        words: [
-            alloc::format!("{} {}", words[0], words[1]),
-            alloc::format!("{} {}", words[2], words[3]),
-            String::from(words[4]),
-        ],
+        lines: (first..(first + 2).min(REQUEST_CODE_WORDS))
+            .map(|i| (i + 1, String::from(words[i])))
+            .collect(),
     }
 }
 
@@ -724,8 +750,8 @@ pub enum EnrolResult {
 }
 
 impl EnrolResult {
-    /// Whether this screen holds the display for [`RESULT_HOLD_MS`]: every
-    /// pressed outcome does, since each carries something to read or act on.
+    /// Whether this screen holds the display ([`ResultHold`]): every pressed
+    /// outcome does, since each carries something to read or act on.
     pub fn holds(self) -> bool {
         matches!(self, EnrolResult::Done { .. } | EnrolResult::NotSent { .. } | EnrolResult::NotAdded)
     }
@@ -745,14 +771,23 @@ pub fn enrol_result(outcome: CardOutcome, added: Option<u32>, delivered: bool) -
     }
 }
 
-/// How long a result screen stays up before the next card, or the idle
-/// screen, may replace it: long enough to compare the check code with the
-/// phone. A fresh press ends it sooner.
+/// How long a result screen keeps the display against anything waiting for
+/// it (a relay card queued behind, a cable command that draws its own card):
+/// what every result held before it stayed up until a press. Nothing waits
+/// longer for the screen than it did then.
 pub const RESULT_HOLD_MS: u64 = 20_000;
 
-/// A result screen holding the display. It arms only once the button has
-/// been seen up, so the release of the hold that approved the card cannot
-/// dismiss its own result.
+/// The most a result screen stays up with nothing waiting and no press: long
+/// enough to walk to the phone and compare the check code (bench, 2026-09-25:
+/// at 20 s the owner had to photograph it), short enough that a board left
+/// alone returns to its idle screen.
+pub const RESULT_HOLD_MAX_MS: u64 = 300_000;
+
+/// A result screen holding the display: until a fresh press, until something
+/// waiting for the screen has let it stand [`RESULT_HOLD_MS`], or at most
+/// [`RESULT_HOLD_MAX_MS`]. It arms only once the button has been seen up, so
+/// the release of the hold that approved the card cannot dismiss its own
+/// result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResultHold {
     armed: bool,
@@ -766,18 +801,25 @@ pub enum HoldStep {
 }
 
 impl ResultHold {
-    /// Whether a hold that began `elapsed_ms` ago has run its time. Needs no
-    /// button state, so anything that asks whether the screen is taken can
+    /// Whether a hold that began `elapsed_ms` ago has run its longest. Needs
+    /// no button state, so anything that asks whether the screen is taken can
     /// ask it on any pass, whatever the network is doing.
     pub fn expired(elapsed_ms: u64) -> bool {
+        elapsed_ms >= RESULT_HOLD_MAX_MS
+    }
+
+    /// Whether a hold that began `elapsed_ms` ago gives way to something
+    /// waiting for the screen.
+    pub fn yields(elapsed_ms: u64) -> bool {
         elapsed_ms >= RESULT_HOLD_MS
     }
 
     /// One pass: `button_down` is whether A is held now, `pressed` whether a
-    /// press finished since the last pass (A released, or B). Presses seen
-    /// before the hold arms are the approving hold's own, and are ignored.
-    pub fn step(&mut self, elapsed_ms: u64, button_down: bool, pressed: bool) -> HoldStep {
-        if Self::expired(elapsed_ms) {
+    /// press finished since the last pass (A released, or B), `waiting`
+    /// whether a card is queued for the screen. Presses seen before the hold
+    /// arms are the approving hold's own, and are ignored.
+    pub fn step(&mut self, elapsed_ms: u64, button_down: bool, pressed: bool, waiting: bool) -> HoldStep {
+        if Self::expired(elapsed_ms) || (waiting && Self::yields(elapsed_ms)) {
             return HoldStep::Release;
         }
         if !self.armed {
@@ -1342,34 +1384,40 @@ mod tests {
         // characters (firmware/src/layout.rs, `span_chars`, pinned by
         // `text_keeps_clear_of_the_button_tags` in the ui-preview tests).
         const HELTEC_TOP: usize = 20;
+        // One word a line, numbered with its place in the code, two lines a
+        // page: 1 and 2, then 3 and 4, then 5.
+        let line = |n: usize, w: &str| (n, String::from(w));
         assert_eq!(
-            enrol_card(&words, "Pixel 8", HELTEC_TOP),
-            EnrolCard {
-                top: "ADD \"Pixel 8\"?".into(),
-                words: ["swim behind".into(), "stand bugle".into(), "female".into()],
-            }
+            enrol_card(&words, "Pixel 8", HELTEC_TOP, 0),
+            EnrolCard { top: "ADD \"Pixel 8\"?".into(), lines: vec![line(1, "swim"), line(2, "behind")] }
         );
-        assert_eq!(enrol_card(&words, "phone", HELTEC_TOP).top, "ADD \"phone\"?");
-        // Two words a line fit the header font's 21 characters: 8 + 1 + 8.
-        assert_eq!(crate::spoken_words::WORDLIST_MAX_LEN, 8);
+        assert_eq!(enrol_card(&words, "Pixel 8", HELTEC_TOP, 1).lines, vec![line(3, "stand"), line(4, "bugle")]);
+        assert_eq!(enrol_card(&words, "Pixel 8", HELTEC_TOP, 2).lines, vec![line(5, "female")]);
+        // A page past the last wraps round rather than drawing nothing.
+        assert_eq!(enrol_card(&words, "Pixel 8", HELTEC_TOP, ENROL_PAGES).lines, vec![line(1, "swim"), line(2, "behind")]);
+        // Every word appears once across the pages, in order.
+        let all: Vec<(usize, String)> =
+            (0..ENROL_PAGES).flat_map(|p| enrol_card(&words, "", HELTEC_TOP, p).lines).collect();
+        assert_eq!(all, (1..=REQUEST_CODE_WORDS).map(|n| line(n, words[n - 1])).collect::<Vec<_>>());
+        assert_eq!(enrol_card(&words, "phone", HELTEC_TOP, 0).top, "ADD \"phone\"?");
         // A long label is shortened inside its quotes on the top line, never
         // wrapped onto a word line; a wide panel shows it whole.
         let long = "Sixteen chars 16";
-        assert_eq!(enrol_card(&words, long, HELTEC_TOP).top, "ADD \"Sixteen cha..\"?");
-        assert_eq!(enrol_card(&words, long, HELTEC_TOP).top.len(), HELTEC_TOP);
-        assert_eq!(enrol_card(&words, long, 29).top, "ADD \"Sixteen chars 16\"?");
-        assert_eq!(enrol_card(&words, long, 3).top, "ADD \"..\"?");
+        assert_eq!(enrol_card(&words, long, HELTEC_TOP, 0).top, "ADD \"Sixteen cha..\"?");
+        assert_eq!(enrol_card(&words, long, HELTEC_TOP, 0).top.len(), HELTEC_TOP);
+        assert_eq!(enrol_card(&words, long, 29, 0).top, "ADD \"Sixteen chars 16\"?");
+        assert_eq!(enrol_card(&words, long, 3, 0).top, "ADD \"..\"?");
         for max in 0..30 {
-            let top = enrol_card(&words, long, max).top;
+            let top = enrol_card(&words, long, max, 0).top;
             assert!(top.len() <= max.max(9), "{max}: {top}");
         }
         // Even a label spelt as words is quoted on the top line, so it reads
         // as a name and never as a row of words.
-        let card = enrol_card(&words, "stand bugle", HELTEC_TOP);
-        assert_eq!(card.words[1], "stand bugle");
+        let card = enrol_card(&words, "stand bugle", HELTEC_TOP, 1);
+        assert_eq!(card.lines[0].1, "stand");
         assert_eq!(card.top, "ADD \"stand bugle\"?");
-        for line in &card.words {
-            assert!(!line.contains('"'));
+        for (_, word) in &card.lines {
+            assert!(!word.contains('"'));
         }
 
         // A label is the requester's text. One that could break a line could
@@ -1546,27 +1594,88 @@ mod tests {
     }
 
     #[test]
-    fn a_result_hold_outlasts_the_approving_press_and_ends_on_time_or_a_new_one() {
+    fn a_result_hold_outlasts_the_approving_press_and_ends_on_a_new_one() {
         // The approving hold is still down when the result appears; its
         // release must not dismiss the screen.
         let mut hold = ResultHold::default();
-        assert_eq!(hold.step(0, true, false), HoldStep::Hold);
-        assert_eq!(hold.step(300, false, true), HoldStep::Hold, "the approving hold's own release");
-        assert_eq!(hold.step(600, false, false), HoldStep::Hold);
-        assert_eq!(hold.step(900, true, false), HoldStep::Hold, "a new press, still down");
-        assert_eq!(hold.step(1_200, false, true), HoldStep::Release, "a new press, released");
+        assert_eq!(hold.step(0, true, false, false), HoldStep::Hold);
+        assert_eq!(hold.step(300, false, true, false), HoldStep::Hold, "the approving hold's own release");
+        assert_eq!(hold.step(600, false, false, false), HoldStep::Hold);
+        assert_eq!(hold.step(900, true, false, false), HoldStep::Hold, "a new press, still down");
+        assert_eq!(hold.step(1_200, false, true, false), HoldStep::Release, "a new press, released");
 
-        // Left alone, it ends at its time, armed or not.
+        // Left alone with nothing waiting, it stays up long past the old
+        // 20 s, and ends only at its upper bound, armed or not.
         let mut idle = ResultHold::default();
-        assert_eq!(idle.step(0, false, false), HoldStep::Hold);
-        assert_eq!(idle.step(RESULT_HOLD_MS - 1, false, false), HoldStep::Hold);
-        assert_eq!(idle.step(RESULT_HOLD_MS, false, false), HoldStep::Release);
+        assert_eq!(idle.step(0, false, false, false), HoldStep::Hold);
+        assert_eq!(idle.step(RESULT_HOLD_MS, false, false, false), HoldStep::Hold);
+        assert_eq!(idle.step(120_000, false, false, false), HoldStep::Hold, "two minutes to compare");
+        assert_eq!(idle.step(RESULT_HOLD_MAX_MS - 1, false, false, false), HoldStep::Hold);
+        assert_eq!(idle.step(RESULT_HOLD_MAX_MS, false, false, false), HoldStep::Release);
         let mut stuck = ResultHold::default();
-        assert_eq!(stuck.step(RESULT_HOLD_MS, true, true), HoldStep::Release, "a button held down forever");
+        assert_eq!(
+            stuck.step(RESULT_HOLD_MAX_MS, true, true, false),
+            HoldStep::Release,
+            "a button held down forever"
+        );
 
         // Expiry needs no button state, so the loop can ask it on any pass.
-        assert!(!ResultHold::expired(RESULT_HOLD_MS - 1));
-        assert!(ResultHold::expired(RESULT_HOLD_MS));
+        assert!(!ResultHold::expired(RESULT_HOLD_MAX_MS - 1));
+        assert!(ResultHold::expired(RESULT_HOLD_MAX_MS));
+        // A few minutes, not seconds, and never forever.
+        const { assert!(RESULT_HOLD_MAX_MS >= 120_000 && RESULT_HOLD_MAX_MS <= 600_000) };
+    }
+
+    #[test]
+    fn a_waiting_card_takes_over_a_result_after_the_old_hold() {
+        // Nothing that waits for the screen waits longer than it did when
+        // every result ended at RESULT_HOLD_MS.
+        let mut hold = ResultHold::default();
+        assert_eq!(hold.step(0, false, false, true), HoldStep::Hold);
+        assert_eq!(hold.step(RESULT_HOLD_MS - 1, false, false, true), HoldStep::Hold);
+        assert_eq!(hold.step(RESULT_HOLD_MS, false, false, true), HoldStep::Release);
+        // Unarmed (the approving hold never let go) still gives way.
+        let mut pinned = ResultHold::default();
+        assert_eq!(pinned.step(RESULT_HOLD_MS, true, false, true), HoldStep::Release);
+        // Something that turns up later takes over at once.
+        let mut late = ResultHold::default();
+        assert_eq!(late.step(0, false, false, false), HoldStep::Hold);
+        assert_eq!(late.step(90_000, false, false, false), HoldStep::Hold);
+        assert_eq!(late.step(91_000, false, false, true), HoldStep::Release);
+        assert!(!ResultHold::yields(RESULT_HOLD_MS - 1));
+        assert!(ResultHold::yields(RESULT_HOLD_MS));
+    }
+
+    #[test]
+    fn the_enrol_card_shows_every_word_many_times_in_its_window() {
+        // Twice the shared 30 s: the owner reads five words off the board
+        // and compares them with the phone.
+        assert_eq!(ENROL_CARD_SECS, 60);
+        assert_eq!(ENROL_PAGES, REQUEST_CODE_WORDS.div_ceil(2));
+        // The card's first draw (remaining = window - 1) is the first page.
+        assert_eq!(enrol_page(ENROL_CARD_SECS, ENROL_CARD_SECS - 1), 0);
+        // Walk the window a second at a time, as both loops draw it.
+        let pages: Vec<usize> = (0..ENROL_CARD_SECS).rev().map(|r| enrol_page(ENROL_CARD_SECS, r)).collect();
+        // Each page stays up ENROL_PAGE_SECS, then the next, then round.
+        for (i, page) in pages.iter().enumerate() {
+            assert_eq!(*page, (i / ENROL_PAGE_SECS as usize) % ENROL_PAGES, "second {i}");
+        }
+        // All five words are on screen within the first 12 s, and every page
+        // comes round at least four times before the card expires, with no
+        // press needed.
+        assert!(ENROL_PAGE_SECS as usize * ENROL_PAGES <= 12);
+        for page in 0..ENROL_PAGES {
+            let shown = pages.chunk_by(|a, b| a == b).filter(|run| run[0] == page).count();
+            assert!(shown >= 4, "page {page} shown {shown} times");
+        }
+        // Long enough to read two words: every run lasts the full dwell.
+        assert!(pages.chunk_by(|a, b| a == b).all(|run| run.len() == ENROL_PAGE_SECS as usize));
+        // Any window and any remaining value: never a page out of range.
+        for total in [0, 1, 30, 60, 61] {
+            for remaining in 0..=total + 2 {
+                assert!(enrol_page(total, remaining) < ENROL_PAGES);
+            }
+        }
     }
 
     #[test]

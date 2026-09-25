@@ -1110,18 +1110,23 @@ pub fn show_titled_approval(
 
 /// The card that adds an unlock phone. The request code is five words of up
 /// to eight letters, and they are the one thing the owner must read, so the
-/// card gives them three lines of the header font (two words, two words, one
-/// word: 17 characters at most, 102 px) and drops the usual header and rule.
-/// On the portrait C6, whose 172 px cannot take 17 header-font glyphs, the
-/// words drop to the small font. Above them, one small-font line says what is
-/// asked, `ADD "<label>"?` (the
-/// label shortened inside its quotes if the line would overflow); below them,
-/// the hint (`phone_unlock::enrol_hint`, e.g. "on phone? hold PRG") asks
-/// whether the phone shows the same words. Every line is centred in the span clear of the button tags
-/// (`Layout::text_span`), so nothing prints over "<PRG" on the Heltec or
-/// "NO>"/"YES>" on the T-Display. Rows on the 128x64 baseline: top line 7,
-/// words 17, 28 and 39, hint 49, then the shared countdown bar from 52.
-/// Mirrored in ui-preview (`draw_enrol_card`), which checks the geometry.
+/// card shows them a page at a time, as large as the panel allows: words 1
+/// and 2, then 3 and 4, then 5, each page for `phone_unlock::ENROL_PAGE_SECS`
+/// and round again, so all five come round several times in the card's
+/// window with no press (a press answers the card). Each word has a line of
+/// its own with its place in the code beside it, in the font
+/// `Layout::enrol_geometry` picks: FONT_6X10 at 2x on the Heltec, 12 px
+/// letters where the old card drew 6 px ones two to a line. Above them, one
+/// small-font line says what is asked, `ADD "<label>"?` (the label shortened
+/// inside its quotes if the line would overflow); below them, the hint
+/// (`phone_unlock::enrol_hint`, e.g. "on phone? hold PRG") asks whether the
+/// phone shows the same words, then the countdown. Every line and the
+/// countdown stay in the span clear of the button tags (`Layout::text_span`),
+/// so nothing prints over "<PRG" (or "PRG>" with the screen turned round) on
+/// the Heltec or "NO>"/"YES>" on the T-Display. Ink rows on the 128x64
+/// baseline: top line 0-7, words 9-26 and 28-45, hint 47-54, countdown
+/// 57-62. Mirrored in ui-preview (`draw_enrol_card`), which checks the
+/// geometry on every panel, orientation and page.
 pub fn show_enrol_approval(
     display: &mut Display<'_>,
     words: &[&str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS],
@@ -1129,50 +1134,85 @@ pub fn show_enrol_approval(
     remaining: u32,
     total_secs: u32,
 ) {
+    use heartwood_common::phone_unlock;
     let l = layout(display);
     display.clear_buffer();
 
     let side = tag_side();
-    let card = heartwood_common::phone_unlock::enrol_card(words, label, l.span_chars(side, l.font_small()));
+    let g = l.enrol_geometry(side);
+    let page = phone_unlock::enrol_page(total_secs, remaining);
+    let card = phone_unlock::enrol_card(words, label, l.span_chars(side, l.font_small()), page);
     let top = MonoTextStyleBuilder::new()
         .font(l.font_small())
         .text_color(ACCENT)
         .build();
-    // The header font where the widest word line fits the span (every panel
-    // but the portrait C6, whose 172 px cannot take 17 glyphs of 10 px).
-    let (span_left, span_right) = l.text_span(side);
-    let widest = card.words.iter().map(|w| w.len()).max().unwrap_or(0) as i32;
-    let word_font = if widest * Layout::glyph_w(l.font_header()) <= span_right - span_left {
-        l.font_header()
-    } else {
-        l.font_small()
-    };
-    let word_style = MonoTextStyleBuilder::new()
-        .font(word_font)
-        .text_color(WARN)
-        .build();
-    let small = MonoTextStyleBuilder::new()
+    let muted = MonoTextStyleBuilder::new()
         .font(l.font_small())
         .text_color(MUTED)
         .build();
-    let centred = |text: &str, font: &embedded_graphics::mono_font::MonoFont<'_>, y: i32| {
-        Point::new(l.center_in_span(side, text.len() as i32 * Layout::glyph_w(font)), l.sy(y))
+    let centred = |text: &str, y: i32| {
+        Point::new(l.center_in_span(side, text.len() as i32 * Layout::glyph_w(l.font_small())), y)
     };
 
-    Text::new(&card.top, centred(&card.top, l.font_small(), 7), top).draw(display).ok();
-    for (line, y) in card.words.iter().zip([17, 28, 39]) {
-        Text::new(line, centred(line, word_font, y), word_style).draw(display).ok();
+    Text::new(&card.top, centred(&card.top, g.top_y), top).draw(display).ok();
+    for ((place, word), y) in card.lines.iter().zip(g.word_y) {
+        Text::new(&place.to_string(), Point::new(g.number_x, y), muted).draw(display).ok();
+        crate::bigtext::draw_text_scaled(display, word, Point::new(g.word_x, y), g.word_font, g.word_scale, WARN);
     }
 
     let tagged = draw_button_tags(display);
     let b = crate::button::has_button_b();
-    let hint = heartwood_common::phone_unlock::enrol_hint(tagged.then_some(b), b);
-    Text::new(hint, centred(hint, l.font_small(), 49), small).draw(display).ok();
+    let hint = phone_unlock::enrol_hint(tagged.then_some(b), b);
+    Text::new(hint, centred(hint, g.hint_y), muted).draw(display).ok();
 
-    draw_countdown_bar(display, remaining, total_secs);
+    draw_enrol_countdown(display, &g, remaining, total_secs);
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
     }
+}
+
+/// The enrol card's countdown: the shared bar's outline, urgency colours and
+/// seconds, but lower and inside the span clear of the tags, since the card's
+/// words take the rows the shared bar uses. Mirrored in ui-preview
+/// (`draw_enrol_bar`).
+fn draw_enrol_countdown(
+    display: &mut Display<'_>,
+    g: &crate::layout::EnrolGeometry,
+    remaining: u32,
+    total: u32,
+) {
+    let l = layout(display);
+    let (x, y, w, h) = g.bar;
+    Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32))
+        .into_styled(PrimitiveStyle::with_stroke(MUTED, l.s(1) as u32))
+        .draw(display)
+        .ok();
+    let pct_left = if total > 0 { remaining * 100 / total } else { 0 };
+    let urgency = if pct_left > 50 {
+        OK
+    } else if pct_left > 20 {
+        WARN
+    } else {
+        DANGER
+    };
+    let inner = w - 2 * l.s(2);
+    let fill = if total > 0 { remaining as i32 * inner / total as i32 } else { 0 };
+    if fill > 0 {
+        Rectangle::new(
+            Point::new(x + l.s(2), y + l.s(2)),
+            Size::new(fill as u32, (h - 2 * l.s(2)).max(1) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(urgency))
+        .draw(display)
+        .ok();
+    }
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(FG)
+        .build();
+    Text::new(&format!("{remaining}s"), Point::new(g.secs_x, g.secs_y), small)
+        .draw(display)
+        .ok();
 }
 
 /// Which edge carries the button tags on this board and orientation, or
@@ -1188,16 +1228,43 @@ fn tag_side() -> Option<crate::layout::TagSide> {
 
 /// An unlock phone was added and its answer sent: the check code the phone
 /// should show (it confirms delivery; the five words were the check against
-/// a swap), and the record to revoke if the phone never shows it. Mirrored in
-/// ui-preview (`draw_phone_added`).
+/// a swap), and the record to revoke if the phone never shows it. Framed like
+/// every status card (header and rule), with the code itself at the enrol
+/// card's word size (FONT_6X10 at 2x on the Heltec) under a small "check
+/// code", since it is read off the board and compared with the phone. The
+/// caller holds it until a press (`phone_unlock::ResultHold`). Mirrored in
+/// ui-preview (`draw_phone_added`), which checks the lines keep apart.
 pub fn show_phone_added(display: &mut Display<'_>, check: &str, id: u32) {
-    show_status_card(
-        display,
-        "PHONE ADDED",
-        &format!("check {check}"),
-        &format!("else revoke {id}"),
-        OK,
-    );
+    let l = layout(display);
+    display.clear_buffer();
+    let (font, scale) = l.card_word_font(None);
+    let header = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(ACCENT)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(l.font_small())
+        .text_color(MUTED)
+        .build();
+    let centred = |text: &str, font: &embedded_graphics::mono_font::MonoFont<'_>, scale: i32, y: i32| {
+        Point::new(l.center_x(crate::bigtext::scaled_text_width(text, font, scale)), l.sy(y))
+    };
+
+    let title = "PHONE ADDED";
+    Text::new(title, centred(title, l.font_header(), 1, 10), header).draw(display).ok();
+    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display)
+        .ok();
+    let label = "check code";
+    Text::new(label, centred(label, l.font_small(), 1, 24), small).draw(display).ok();
+    crate::bigtext::draw_text_scaled(display, check, centred(check, font, scale, 43), font, scale, OK);
+    let hint = format!("else revoke {id}");
+    Text::new(&hint, centred(&hint, l.font_small(), 1, 56), small).draw(display).ok();
+
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
 }
 
 /// Where a board's buttons are with the screen upright: which edge, and
@@ -2239,7 +2306,7 @@ pub fn show_request_expired(display: &mut Display<'_>) {
         .draw(display)
         .ok();
 
-    let title = "Request expired";
+    let title = "Expired";
     Text::new(
         title,
         Point::new(l.center_x(title.len() as i32 * Layout::glyph_w(l.font_body())), l.sy(36)),

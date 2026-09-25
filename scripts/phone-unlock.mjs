@@ -137,9 +137,14 @@ async function relayDeps() {
 
 const OVER_RELAY = argv.includes('--over-relay')
 
-// A relay enrolment waits on a card: up to 90 s behind other cards, then 30 s
-// on screen. Sent once, like the cable's, and given longer than both.
-const RELAY_ENROL_DEADLINE_MS = 150_000
+// A relay enrolment waits on a card: up to 90 s behind other cards (a result
+// screen ahead of it gives way after 20 s), then 60 s on screen. Sent once,
+// like the cable's, and given longer than both.
+const RELAY_ENROL_DEADLINE_MS = 180_000
+
+// The cable's enrol card blocks for its 60 s window (twice every other
+// card's, for the five words to be compared with the phone).
+const USB_ENROL_DEADLINE_MS = 90_000
 
 /**
  * Enrol over the device operator's kind-24134 channel: fetch a fresh mutation
@@ -228,7 +233,7 @@ async function boardEnrol(enrolPubkey, label, { ownKey = false } = {}) {
   if (OVER_RELAY) return relayEnrol(enrolPubkey, label)
   return usbCommand(
     { op: 'enrol', enrol_pubkey: enrolPubkey, label },
-    45_000,
+    USB_ENROL_DEADLINE_MS,
     { press: `adding ${label} as an unlock phone` },
   )
 }

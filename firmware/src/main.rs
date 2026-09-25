@@ -959,6 +959,11 @@ fn main() {
     // Idle info carousel: waking shows page 0 (status); further short presses
     // cycle network, device and notes pages. Sleep resets to page 0.
     let mut idle_page: u8 = 0;
+    // PHONE ADDED after a cable enrolment, held until a press or
+    // phone_unlock::RESULT_HOLD_MAX_MS. The host is waiting on every frame
+    // here, so nothing is refused while it is up: a frame is served as ever,
+    // and the result is drawn again once it has been.
+    let mut held_result: Option<(Instant, phone_unlock_cmd::Added)> = None;
 
     // --- Frame dispatch loop ---
     log::info!("Entering frame dispatch loop");
@@ -985,6 +990,20 @@ fn main() {
 
                     // Signing requests always wake the display (handled above when
                     // the frame arrives).  Between frames, check elapsed idle time.
+                    // A held result runs out at its upper bound; until then
+                    // it keeps the panel lit.
+                    if held_result.as_ref().is_some_and(|(since, _)| {
+                        heartwood_common::phone_unlock::ResultHold::expired(
+                            since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                        )
+                    }) {
+                        held_result = None;
+                        idle_page = 0;
+                        draw_idle_page(idle_page, &mut display, loaded_masters.len() as u8, &mut nvs);
+                    }
+                    if held_result.is_some() {
+                        last_activity = Instant::now();
+                    }
                     if display_on && last_activity.elapsed() >= DISPLAY_TIMEOUT {
                         oled::sleep_display(&mut display);
                         display_on = false;
@@ -995,8 +1014,13 @@ fn main() {
                     // Advance held signing confirmations; restore the idle
                     // card once the last hold expires.
                     if display_on && confirm::service(&mut display) {
-                        idle_page = 0;
-                        draw_idle_page(idle_page, &mut display, loaded_masters.len() as u8, &mut nvs);
+                        // Back to the held result, if one is waiting under it.
+                        if let Some((_, added)) = &held_result {
+                            added.show(&mut display);
+                        } else {
+                            idle_page = 0;
+                            draw_idle_page(idle_page, &mut display, loaded_masters.len() as u8, &mut nvs);
+                        }
                     }
 
                     // PRG button press (active-low GPIO 0) wakes the display.
@@ -1012,9 +1036,12 @@ fn main() {
                             display_on = true;
                             idle_page = 0;
                             log::info!("Display woken by button press");
-                        } else if confirm::dismiss() {
-                            // A press while a signing confirmation is held
-                            // dismisses the run early, back to the idle card.
+                        } else if confirm::dismiss() | held_result.take().is_some() {
+                            // A press while a signing confirmation or a held
+                            // result is up dismisses it (both, when one is
+                            // over the other: `|`, not `||`), back to the idle
+                            // card. The approving press was let go before
+                            // handle_frame returned, so this one is fresh.
                             idle_page = 0;
                         } else if idle_page == 2
                             && display_flip::toggle_if_held(&mut nvs, &mut display, &buttons)
@@ -1379,12 +1406,15 @@ fn main() {
             }
 
             // 0x64 — phones that can unlock this board (enrol / list / revoke)
-            // The cable-only loop has no card queue to hold back. The PHONE
-            // ADDED screen survives the approving press because handle_frame
-            // waits for that press to be released before it returns, so the
-            // carousel below never takes it for a page turn.
+            // PHONE ADDED is held (held_result) until a fresh press. The
+            // approving press does not dismiss it: handle_frame waits for it
+            // to be released before it returns.
             FRAME_TYPE_PHONE_UNLOCK_CMD => {
-                phone_unlock_cmd::handle_frame(
+                let enrolling = matches!(
+                    heartwood_common::phone_unlock::PhoneCmd::parse(&frame.payload),
+                    Ok(heartwood_common::phone_unlock::PhoneCmd::Enrol { .. })
+                );
+                let added = phone_unlock_cmd::handle_frame(
                     &mut usb,
                     &frame.payload,
                     &mut nvs,
@@ -1393,6 +1423,12 @@ fn main() {
                     &mut display,
                     &buttons,
                 );
+                // Any enrolment replaces an earlier result, even one that
+                // added nothing: an older PHONE ADDED drawn again after a
+                // declined card would read as this phone having been added.
+                if enrolling {
+                    held_result = added.map(|added| (Instant::now(), added));
+                }
             }
 
             // 0x63 — vault unlock in the main loop is a no-op (the device is
@@ -1552,7 +1588,14 @@ fn main() {
         if !matches!(frame_type,
             FRAME_TYPE_OTA_BEGIN | FRAME_TYPE_OTA_CHUNK | FRAME_TYPE_OTA_FINISH
         ) {
-            oled::show_awaiting(&mut display);
+            // A held PHONE ADDED comes back after anything that drew over
+            // it, unless a signing confirmation is being held (its end
+            // brings the result back, in the poll loop above).
+            match &held_result {
+                Some((_, added)) if !confirm::active() => added.show(&mut display),
+                Some(_) => {}
+                None => oled::show_awaiting(&mut display),
+            }
         }
     }
 }

@@ -64,9 +64,29 @@ pub fn take_phones_changed() -> bool {
     PHONES_CHANGED.swap(false, Ordering::AcqRel)
 }
 
-/// Handle a PHONE_UNLOCK_CMD frame (0x64). True when a phone was enrolled
-/// and its result screen drawn, so a caller that holds result screens
-/// (relay.rs, in WiFi mode) can keep it up before the next card.
+/// The PHONE ADDED screen an enrolment drew, kept so a caller can hold it
+/// until a press (`phone_unlock::ResultHold`) and draw it again after
+/// anything that interrupts it.
+#[derive(Clone, Debug)]
+pub struct Added {
+    pub check: String,
+    pub id: u32,
+}
+
+impl Added {
+    fn of(enrolment: &Enrolment) -> Self {
+        Added { check: phone_unlock::check_code(&enrolment.ephemeral_pubkey), id: enrolment.id }
+    }
+
+    /// Draw the screen again.
+    pub fn show(&self, display: &mut crate::oled::Display<'_>) {
+        crate::oled::show_phone_added(display, &self.check, self.id);
+    }
+}
+
+/// Handle a PHONE_UNLOCK_CMD frame (0x64). `Some` when a phone was enrolled
+/// and its result screen drawn, so the caller can hold it until a press
+/// (main.rs in USB mode, relay.rs in WiFi mode).
 pub fn handle_frame(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
@@ -75,23 +95,30 @@ pub fn handle_frame(
     bridge_authenticated: bool,
     display: &mut crate::oled::Display<'_>,
     buttons: &crate::button::Buttons<'_>,
-) -> bool {
+) -> Option<Added> {
     if !bridge_authenticated {
         crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
-        return false;
+        return None;
     }
-    let parsed = PhoneCmd::parse(payload).map_err(str::to_string);
-    let enrolling = matches!(parsed, Ok(PhoneCmd::Enrol { .. }));
-    let outcome = parsed.and_then(|cmd| run(cmd, nvs, masters, display, Some(buttons)));
+    let mut added = None;
+    let outcome = PhoneCmd::parse(payload).map_err(str::to_string).and_then(|cmd| match cmd {
+        PhoneCmd::Enrol { enrol_pubkey, label } => {
+            enrol_on_cable(&enrol_pubkey, label, nvs, masters, display, buttons).map(|(answer, shown)| {
+                added = Some(shown);
+                answer
+            })
+        }
+        cmd => run(cmd, nvs),
+    });
     match outcome {
         Ok(answer) => {
             crate::protocol::write_frame(usb, FRAME_TYPE_PHONE_UNLOCK_RESP, answer.to_string().as_bytes());
-            enrolling
+            added
         }
         Err(e) => {
             log::warn!("phone unlock: {e}");
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, e.as_bytes());
-            false
+            None
         }
     }
 }
@@ -118,15 +145,10 @@ fn configured_relays(nvs: &EspNvs<NvsDefault>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Run one command. `buttons` is `None` on the relay path, which holds an
-/// enrolment on a deferred card (relay.rs) instead of running it here.
-pub fn run(
-    cmd: PhoneCmd,
-    nvs: &mut EspNvs<NvsDefault>,
-    masters: &[LoadedMaster],
-    display: &mut crate::oled::Display<'_>,
-    buttons: Option<&crate::button::Buttons<'_>>,
-) -> Result<serde_json::Value, String> {
+/// Run one command. Enrolment is not run here: the cable's goes through
+/// [`enrol_on_cable`] (`handle_frame`), and the relay holds its own on a
+/// deferred card (relay.rs).
+pub fn run(cmd: PhoneCmd, nvs: &mut EspNvs<NvsDefault>) -> Result<serde_json::Value, String> {
     match cmd {
         PhoneCmd::List => {
             let phones = load(nvs)?;
@@ -149,35 +171,48 @@ pub fn run(
                 .map_err(|_| "could not save the setting".to_string())?;
             Ok(serde_json::json!({ "announce_operator": on }))
         }
-        PhoneCmd::Enrol { enrol_pubkey, label } => {
-            let Some(buttons) = buttons else {
-                // relay.rs holds a relay enrolment on a deferred card instead.
-                return Err("enrolling a phone over the relay waits on a card: use enrol_unlock_phone".into());
-            };
-            // One attempt per enrolment key, whatever its outcome: marked before
-            // anything can fail, so a resend queued behind this command (or one
-            // after a decline) is refused rather than raising another card.
-            claim_enrol_key(&enrol_pubkey)?;
-            let label = default_label(label);
-            check_enrol(nvs, masters, &label)?;
-
-            let words = phone_unlock::request_words(&enrol_pubkey);
-            let approved = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
-                crate::oled::show_enrol_approval(d, &words, &label, remaining, 30);
-            });
-            if !matches!(approved, crate::approval::ApprovalResult::Approved) {
-                return Err("declined on the board".into());
-            }
-
-            let enrolment = complete_enrol(nvs, masters, &enrol_pubkey, &label, phone_unlock::enrol_refusal, |_| true)?;
-            show_enrolled(display, &enrolment);
-            // The approving hold usually still has the button down here. Let
-            // it go before returning, or the cable-only loop takes the same
-            // press for a carousel page and wipes the check code at once.
-            wait_for_release(buttons);
-            Ok(phone_unlock::enrolment_json(&enrolment))
+        PhoneCmd::Enrol { .. } => {
+            // relay.rs holds a relay enrolment on a deferred card instead.
+            Err("enrolling a phone over the relay waits on a card: use enrol_unlock_phone".into())
         }
     }
+}
+
+/// Enrol over the cable: the blocking card, for `phone_unlock::ENROL_CARD_SECS`
+/// (twice every other card's, for the five words to be read and compared),
+/// then PHONE ADDED. Returns the answer and what PHONE ADDED showed.
+fn enrol_on_cable(
+    enrol_pubkey: &[u8; 32],
+    label: String,
+    nvs: &mut EspNvs<NvsDefault>,
+    masters: &[LoadedMaster],
+    display: &mut crate::oled::Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+) -> Result<(serde_json::Value, Added), String> {
+    // One attempt per enrolment key, whatever its outcome: marked before
+    // anything can fail, so a resend queued behind this command (or one
+    // after a decline) is refused rather than raising another card.
+    claim_enrol_key(enrol_pubkey)?;
+    let label = default_label(label);
+    check_enrol(nvs, masters, &label)?;
+
+    let words = phone_unlock::request_words(enrol_pubkey);
+    let window = phone_unlock::ENROL_CARD_SECS;
+    let approved = crate::approval::run_approval_loop(display, buttons, u64::from(window), |d, remaining| {
+        crate::oled::show_enrol_approval(d, &words, &label, remaining, window);
+    });
+    if !matches!(approved, crate::approval::ApprovalResult::Approved) {
+        return Err("declined on the board".into());
+    }
+
+    let enrolment = complete_enrol(nvs, masters, enrol_pubkey, &label, phone_unlock::enrol_refusal, |_| true)?;
+    let added = Added::of(&enrolment);
+    added.show(display);
+    // The approving hold usually still has the button down here. Let
+    // it go before returning, or the cable-only loop takes the same
+    // press for a carousel page and wipes the check code at once.
+    wait_for_release(buttons);
+    Ok((phone_unlock::enrolment_json(&enrolment), added))
 }
 
 /// The label the board keeps when the requester sent none.
@@ -290,8 +325,3 @@ fn wait_for_release(buttons: &crate::button::Buttons<'_>) {
     }
 }
 
-/// The result screen after an enrolment: the check code the phone must show
-/// (and Sapwood, once it does), and the record to revoke if it never does.
-pub fn show_enrolled(display: &mut crate::oled::Display<'_>, enrolment: &Enrolment) {
-    crate::oled::show_phone_added(display, &phone_unlock::check_code(&enrolment.ephemeral_pubkey), enrolment.id);
-}

@@ -348,7 +348,13 @@ pub fn handle_revoke(
         let idx = frame.payload[1];
         if policy_engine.revoke_slot(ms, idx) {
             // Never rolled back: that would re-authorise the pairing.
-            if let Err(outcome) = policy_engine.persist_revocation(nvs, ms).describe("pairing revocation") {
+            let saved = policy_engine.persist_revocation(nvs, ms).describe("pairing revocation");
+            // Zero the old table's erased entries (the revoked slot secret
+            // among them) whatever the save did. The `ok` reply stays as it
+            // is; get_status's `nvs_scrub_v1` and FIRMWARE_INFO's `nvs_scrub`
+            // say what the scrub did.
+            crate::nvs_scrub::run("pairing revoke");
+            if let Err(outcome) = saved {
                 protocol::write_frame(usb, FRAME_TYPE_NACK, outcome.as_bytes());
                 return;
             }

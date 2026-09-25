@@ -468,6 +468,15 @@ pub enum AskCard {
     /// A bearer note that arrived by gift wrap (relay.rs). No client is
     /// owed an answer; the rumor rides `DeferredAsk::event`.
     Receive { title: String },
+    /// A phone asked to be added as an unlock phone over the relay
+    /// management channel (relay.rs, `enrol_unlock_phone`). The device
+    /// operator is owed a kind-24134 answer, not a NIP-46 one.
+    PhoneEnrol {
+        enrol_pubkey: [u8; 32],
+        label: String,
+        /// `phone_unlock::request_code` of `enrol_pubkey`, as Sapwood shows it.
+        code: String,
+    },
 }
 
 /// An ask handed back to a deferring caller, and handed in again once the

@@ -9,6 +9,7 @@ import {
   judge,
   openContext,
   checkCode,
+  requestCode,
   parseEnrolmentCode,
   phoneKey,
   sealContext,
@@ -113,4 +114,11 @@ test('reads the enrolment code Cambium shows', () => {
 test('check codes are spoken-token hex tokens of the hand-off key', () => {
   assert.equal(checkCode('ab'.repeat(32)), '9B6 164')
   assert.equal(checkCode('00'.repeat(32)), 'EF1 645')
+})
+
+// Vectors from spoken-token 2.0.4; common/src/phone_unlock.rs pins the same.
+test('request codes are spoken-token hex tokens of the enrolment key', () => {
+  assert.equal(requestCode('ab'.repeat(32)), 'F71 5A0')
+  assert.equal(requestCode('00'.repeat(32)), '071 F6B')
+  assert.notEqual(requestCode('42'.repeat(32)), checkCode('42'.repeat(32)))
 })

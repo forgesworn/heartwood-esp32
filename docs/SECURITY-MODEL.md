@@ -154,7 +154,7 @@ it is not the device trust root:
 
 | Authority | May do remotely | May not do remotely |
 |-----------|-----------------|---------------------|
-| **Operator key** | List/create/update/revoke clients; install exact v2 method/kind policy; approve legacy signing; read redacted network state; stage/activate/commit/abort WiFi changes | Read/replace the seed; change the operator key or other trust roots; switch to USB-only mode; change the boot PIN; invoke OTA |
+| **Operator key** | List/create/update/revoke clients; install exact v2 method/kind policy; approve legacy signing; read redacted network state; stage/activate/commit/abort WiFi changes; list and revoke unlock phones; ask to add one (a press on the board's card) | Read/replace the seed; change the operator key or other trust roots; switch to USB-only mode; change the boot PIN; invoke OTA |
 | **Client slot** | Use only its NIP-46 methods and event kinds, under that slot's approval mode | Manage the device or widen its own policy |
 | **USB + physical approval** | Seed lifecycle, trust-root changes, PIN, USB-only mode, signed OTA | Nothing remotely merely because the operator key is present |
 
@@ -278,7 +278,11 @@ the policy they authorised, for as long as the operator key remains trusted.
 
 They **cannot** extract or replace the master seed, rotate the management trust
 root, disable the radio into USB-only mode, change the boot PIN, or push
-firmware. Recovery: revoke the rogue client and restore a known-good network
+firmware. They can list and revoke unlock phones, but adding one, which would
+be a persistent way to release the data key after a restart, still takes the
+owner's press on the board's card: the card leads with a request code derived
+from the phone's enrolment key, and Sapwood shows the code for the request it
+sent, so a card the owner did not ask for reads differently. Recovery: revoke the rogue client and restore a known-good network
 configuration; if the attacker has removed every route the owner knows, that
 recovery is necessarily over trusted USB. Rotating the operator key likewise
 requires a trusted USB re-flash (it is baked into the config partition).
@@ -550,6 +554,43 @@ Security properties and honest residuals:
   design — restore from the phrase.
 
 Design spec: `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`.
+
+### Adding an unlock phone
+
+An enrolled phone holds a slot secret that, with the board's flash, releases
+the data key after any restart, so adding one adds a persistent unlocker. It
+is always a press on the board, whichever way the request arrives:
+
+- **Cable:** `PHONE_UNLOCK_CMD` (0x64) `{"op":"enrol"}`, bridge-authenticated,
+  with a blocking card.
+- **Relay:** `enrol_unlock_phone` on the kind-24134 management channel. Device
+  operator only: a per-identity delegate is refused before anything else is
+  looked at, and a NIP-46 client has no route to management at all. The
+  request spends the durable one-time mutation challenge before the card goes
+  up, so a replay (live, or after a restart) raises no card. The card is held
+  on the deferred-approval queue (#64): 30 s on screen, at most 90 s waiting
+  behind other cards, one enrolment at a time, RAM only.
+- **What the owner checks:** both cards lead with the request code
+  (spoken-token hex of the phone's one-off enrolment key P); Sapwood shows the
+  code of the request it sent. After the press the board shows the check code
+  (from its one-off hand-off key), which the phone and Sapwood also show.
+- **Only while unlocked:** a locked board serves no management at all, and
+  the board is checked again at the press (the operator is still the device
+  operator, a configured relay is live to carry the answer, a data key, relays,
+  fewer than 16 phones). Nothing is written before the press, so a card that
+  is declined, expires or is lost to a restart leaves no record; the phone's
+  enrolment key is spent either way and the phone starts again.
+- **Nothing new on the wire:** the request and answer are the existing
+  operator ⇄ identity 24134 exchange (NIP-44, the label and P only inside
+  it); the hand-off Sapwood passes to the phone is byte-for-byte the cable's.
+  Residual: a relay that sees both the operator's traffic and the phone's
+  one-off rendezvous subscription can link that enrolment to the phone's IP
+  address at that moment, which is weaker than the stable link Cambium's own
+  NIP-46 pairing already makes.
+- **Residual: a lost answer.** The record is written before the answer is
+  published (a phone is never handed a secret the board did not keep). An
+  answer no relay takes leaves a record whose secret nobody holds; it unlocks
+  nothing and is removed with a revoke.
 
 ## What the design already gets right
 

@@ -3442,6 +3442,18 @@ fn poll_usb(
         FRAME_TYPE_VAULT_UNLOCK => {
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"already unlocked");
         }
+        // A cable enrolment puts its own blocking card up, which would paint
+        // over a relay card already on screen and let it expire unseen: one
+        // screen, one decision. The rest of the command set needs no card.
+        FRAME_TYPE_PHONE_UNLOCK_CMD
+            if approval_card_open(ctx)
+                && matches!(
+                    heartwood_common::phone_unlock::PhoneCmd::parse(&frame.payload),
+                    Ok(heartwood_common::phone_unlock::PhoneCmd::Enrol { .. })
+                ) =>
+        {
+            crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+        }
         FRAME_TYPE_PHONE_UNLOCK_CMD => crate::phone_unlock_cmd::handle_frame(
             usb,
             &frame.payload,
@@ -5062,6 +5074,10 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         crate::nip46_handler::AskCard::Receive { title } => {
             Draw::Titled("RECEIVE NOTE", title.clone())
         }
+        crate::nip46_handler::AskCard::PhoneEnrol { label, code, .. } => Draw::Titled(
+            crate::phone_unlock_cmd::ENROL_CARD_HEADER,
+            heartwood_common::phone_unlock::enrol_card_title(code, label),
+        ),
     };
     // What the panel now READS, once per wording, so a bench can check an
     // amount or a mint without a camera on the OLED (checklist 13, 2b).
@@ -5300,6 +5316,15 @@ fn resolve_button_card(
         // Nobody is owed a NIP-46 response: the wrap's sender hears nothing
         // either way, and the outcome is the locker's state.
         resolve_receive_card(ctx, card, outcome, index == 0);
+        return;
+    }
+    if card
+        .asks
+        .first()
+        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::PhoneEnrol { .. }))
+    {
+        // The device operator is owed a management answer, not a NIP-46 one.
+        resolve_phone_enrol_card(ctx, sessions, card, outcome, index == 0);
         return;
     }
     if index == 0 {
@@ -5832,6 +5857,239 @@ fn resolve_receive_card(ctx: &mut SignCtx, card: ButtonCard, outcome: &CardTick,
     ctx.resubscribe_needed = true;
     if on_screen {
         ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(3));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adding an unlock phone over the relay (enrol_unlock_phone)
+// ---------------------------------------------------------------------------
+//
+// The cable twin is PHONE_UNLOCK_CMD {"op":"enrol"}, whose card blocks. Here
+// the request becomes a card on the #64 queue, so the relay loop keeps
+// serving while the owner walks to the board, and the answer is published to
+// the device operator when the card resolves. An enrolment adds a persistent
+// way to release the data key after a restart, so:
+//
+// - only the device operator may ask, never a per-identity delegate (checked
+//   first, so a delegate learns nothing), and the operator must still be the
+//   device operator at the press;
+// - the request has already spent the one-time mutation challenge, so it can
+//   raise one card at most, before or after a restart;
+// - one enrolment waits at a time, and its enrolment key is used once;
+// - the card leads with the request code, which Sapwood shows for the request
+//   it sent, so the owner presses for their own phone and not one raced in;
+// - the board is checked before the card and again at the press, and nothing
+//   is written until then: a card that expires, is declined, or dies with a
+//   restart leaves no trace but the used key and the spent challenge;
+// - a press with no relay live to carry the answer adds nothing, since a
+//   record whose hand-off cannot leave would be one nobody can use.
+
+/// Put an `enrol_unlock_phone` request on the button. `Err` is the refusal
+/// the operator hears at once; `Ok` means the card will answer.
+#[allow(clippy::too_many_arguments)]
+fn queue_phone_enrol(
+    ctx: &mut SignCtx,
+    req: &serde_json::Value,
+    request_id: &str,
+    master_idx: usize,
+    operator: &[u8; 32],
+    is_device_op: bool,
+    created_at: u64,
+    received_uptime: u64,
+) -> Result<(), String> {
+    use heartwood_common::approval_queue::{admit, Admission, AskKey};
+    use heartwood_common::phone_unlock::{self, PhoneCmd};
+
+    let pending = ctx.button_cards.iter().any(|card| {
+        card.asks
+            .first()
+            .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::PhoneEnrol { .. }))
+    });
+    if let Some(refusal) = phone_unlock::relay_enrol_gate(is_device_op, pending) {
+        return Err(refusal.message());
+    }
+    let (enrol_pubkey, label) = match PhoneCmd::from_mgmt(phone_unlock::ENROL_METHOD, req.get("params")) {
+        Some(Ok(PhoneCmd::Enrol { enrol_pubkey, label })) => (enrol_pubkey, label),
+        Some(Err(why)) => return Err(why.to_string()),
+        _ => return Err("malformed enrol_unlock_phone request".into()),
+    };
+    let label = crate::phone_unlock_cmd::default_label(label);
+    crate::phone_unlock_cmd::check_enrol(ctx.nvs, ctx.masters, &label)?;
+
+    let master = &ctx.masters[master_idx];
+    let master_slot = master.slot;
+    let master_pk = master.pubkey;
+    let operator_hex = hex_encode(operator);
+    let pk_hex = hex_encode(&enrol_pubkey);
+    // Keyed on the enrolment key, so two enrolments never share one hold.
+    let key = AskKey::new(master_slot, operator_hex, hex_encode(&master_pk), format!("enrol:{}", &pk_hex[..16]));
+    let weight = 256;
+    let held_bytes: usize = ctx
+        .button_cards
+        .iter()
+        .flat_map(|card| card.asks.iter())
+        .map(|ask| ask.weight)
+        .sum();
+    let open = ctx.button_cards.first();
+    let admission = if held_bytes.saturating_add(weight) > CARD_BYTE_BUDGET {
+        Admission::Busy
+    } else {
+        admit(
+            open.map(|card| &card.key),
+            open.map(|card| card.asks.len()).unwrap_or(0),
+            ctx.button_cards.len().saturating_sub(1),
+            &key,
+        )
+    };
+    if !matches!(admission, Admission::Open | Admission::Wait) {
+        return Err("signer is busy with another approval; retry shortly".into());
+    }
+    // Last, so a refusal above leaves the phone's code usable once the
+    // owner has fixed what was wrong. From here the key is spent whatever
+    // the card decides.
+    crate::phone_unlock_cmd::claim_enrol_key(&enrol_pubkey)?;
+
+    let code = phone_unlock::request_code(&enrol_pubkey);
+    log::info!("[relay] enrol request {request_id} waiting on the button");
+    ctx.button_cards.push(ButtonCard {
+        key,
+        target_pk: master_pk,
+        client_pubkey: *operator,
+        asks: vec![ButtonAsk {
+            ask: crate::nip46_handler::DeferredAsk {
+                card: crate::nip46_handler::AskCard::PhoneEnrol { enrol_pubkey, label, code },
+                request: nip46::Nip46Request {
+                    id: request_id.to_string(),
+                    method: phone_unlock::ENROL_METHOD.to_string(),
+                    params: Vec::new(),
+                    heartwood: None,
+                    legacy_client_pubkey: None,
+                },
+                event: None,
+                identity: None,
+                resume: Default::default(),
+            },
+            created_at,
+            received_uptime,
+            weight,
+            audit: None,
+        }],
+        opened_at: None,
+        armed: false,
+        last_remaining: u32::MAX,
+        last_pct: u32::MAX,
+    });
+    Ok(())
+}
+
+/// Settle an enrol card and answer the device operator on kind 24134.
+fn resolve_phone_enrol_card(
+    ctx: &mut SignCtx,
+    sessions: &mut [RelaySession],
+    card: ButtonCard,
+    outcome: &CardTick,
+    on_screen: bool,
+) {
+    use heartwood_common::phone_unlock;
+
+    let operator = card.client_pubkey;
+    let Some(ask) = card.asks.into_iter().next() else { return };
+    let crate::nip46_handler::AskCard::PhoneEnrol { enrol_pubkey, label, .. } = ask.ask.card else {
+        return;
+    };
+    let request_id = ask.ask.request.id;
+    // The answer is sealed by the identity the request was addressed to.
+    let Some(midx) = masters::find_by_pubkey(ctx.masters, &card.target_pk) else {
+        log::warn!("[relay] enrol card: its identity is gone; nothing added, nothing answered");
+        if on_screen && matches!(outcome, CardTick::Approved) {
+            show_card_not_done(ctx, "Identity removed", "No phone added");
+        }
+        return;
+    };
+    let signing_secret = zeroize::Zeroizing::new(ctx.masters[midx].secret);
+
+    let result: Result<serde_json::Value, String> = match outcome {
+        CardTick::Approved => {
+            let operator_current = ctx.op_mgmt == Some(operator);
+            let relay_live = sessions.iter().any(|s| !s.pinned);
+            let refusal = crate::phone_unlock_cmd::enrol_facts(ctx.nvs, ctx.masters, &label).and_then(|facts| {
+                match phone_unlock::relay_enrol_completion(operator_current, relay_live, &facts) {
+                    Some(refusal) => Err(refusal.message()),
+                    None => Ok(()),
+                }
+            });
+            refusal
+                .and_then(|()| crate::phone_unlock_cmd::complete_enrol(ctx.nvs, ctx.masters, &enrol_pubkey, &label))
+                .map(|enrolment| {
+                    if on_screen {
+                        crate::phone_unlock_cmd::show_enrolled(ctx.display, &enrolment);
+                    }
+                    phone_unlock::enrolment_json(&enrolment)
+                })
+        }
+        CardTick::Denied => Err("declined on the board".into()),
+        _ => Err("not confirmed on the board in time: start again on the phone".into()),
+    };
+    if on_screen {
+        match (outcome, &result) {
+            (CardTick::Approved, Ok(_)) => {
+                // Long enough to compare the check code with the phone's.
+                ctx.last_activity = Instant::now();
+                ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(20));
+            }
+            (CardTick::Approved, Err(e)) => {
+                log::warn!("[relay] enrol card pressed but not done: {e}");
+                show_card_not_done(ctx, "No phone added", "see Sapwood");
+            }
+            (CardTick::Denied, _) => crate::oled::show_denied(ctx.display),
+            _ => crate::oled::show_request_expired(ctx.display),
+        }
+    }
+
+    let added = result.is_ok();
+    let response_json = match result {
+        Ok(value) => serde_json::json!({ "id": request_id, "result": value }).to_string(),
+        Err(e) => serde_json::json!({ "id": request_id, "error": e }).to_string(),
+    };
+    let Ok(conversation_key) = nip44::get_conversation_key(&signing_secret, &operator) else {
+        log::warn!("[relay] enrol answer: conversation key failed");
+        return;
+    };
+    let held = Duration::from_secs(crate::uptime_s().saturating_sub(ask.received_uptime));
+    let sealed = match seal_reply(
+        ctx.secp,
+        &signing_secret,
+        &conversation_key,
+        &hex_encode(&operator),
+        MGMT_KIND,
+        reply_stamp(ctx, ask.created_at, held),
+        response_json,
+    ) {
+        Ok(sealed) => sealed,
+        Err(e) => {
+            log::warn!("[relay] enrol answer for {request_id}: {e}");
+            return;
+        }
+    };
+    // Management answers go out on the configured relays only, never on a
+    // relay a pairing pinned: that is where the operator listens, and the
+    // management channel has no business on someone else's relay.
+    for index in publish_order(sessions) {
+        if sessions[index].pinned {
+            continue;
+        }
+        match publish_sealed(&mut sessions[index].tls, &sealed) {
+            Ok(()) => return,
+            Err(e) => log::warn!(
+                "[relay] {} would not take the enrol answer for {request_id}: {e}",
+                relay_host(&sessions[index].url)
+            ),
+        }
+    }
+    if added {
+        // The record holds a wrapper nobody can open: its slot secret left
+        // only inside this answer. Harmless, but it takes a place.
+        log::warn!("[relay] enrol answer for {request_id} not delivered; the new record is unusable, revoke it from the list");
     }
 }
 
@@ -6833,6 +7091,22 @@ fn handle_mgmt_event(
                 mgmt::MutationChallenge::NotRequired => unreachable!(),
             }
         }
+        // Adding an unlock phone waits on the button as a card, and the card
+        // answers when it resolves (resolve_phone_enrol_card). The challenge
+        // above is already spent, so this request can never raise a second.
+        if method == heartwood_common::phone_unlock::ENROL_METHOD {
+            return queue_phone_enrol(
+                ctx,
+                &req,
+                &id,
+                master_idx,
+                &author,
+                is_device_op,
+                ev.created_at,
+                received_uptime,
+            )
+            .map(|()| None);
+        }
         dispatch_mgmt(
             &method,
             &req,
@@ -6843,12 +7117,15 @@ fn handle_mgmt_event(
             is_device_op,
             challenge_scope,
         )
+        .map(Some)
     })();
     // The breadcrumb stays set across the response publish below too;
     // handle_relay_msg clears it once the whole event is processed.
 
     let response_json = match dispatch_result {
-        Ok(result) => serde_json::json!({ "id": id, "result": result }).to_string(),
+        // Held on a card: nothing is owed until it resolves.
+        Ok(None) => return Ok(()),
+        Ok(Some(result)) => serde_json::json!({ "id": id, "result": result }).to_string(),
         Err(e) => serde_json::json!({ "id": id, "error": e }).to_string(),
     };
 
@@ -8822,29 +9099,15 @@ fn dispatch_mgmt(
             Ok(serde_json::json!({ "quiet": quiet }))
         }
 
-        // Phones that can unlock this board. Enrolment is cable-only (it needs
-        // a press, and the relay loop must not block on a card); these three
-        // need no press. See phone_unlock_cmd.rs.
+        // Phones that can unlock this board. These three need no press;
+        // enrol_unlock_phone never reaches here (handle_mgmt_event holds it on
+        // a card, queue_phone_enrol). See phone_unlock_cmd.rs.
         "list_unlock_phones" | "revoke_unlock_phone" | "set_announce_operator" => {
             if !is_device_op {
                 return Err(format!("{method} is a device-level operation and requires the device operator"));
             }
-            let cmd = match method {
-                "list_unlock_phones" => heartwood_common::phone_unlock::PhoneCmd::List,
-                "revoke_unlock_phone" => heartwood_common::phone_unlock::PhoneCmd::Revoke {
-                    id: req
-                        .pointer("/params/id")
-                        .and_then(|v| v.as_u64())
-                        .and_then(|v| u32::try_from(v).ok())
-                        .ok_or("revoke_unlock_phone requires params.id")?,
-                },
-                _ => heartwood_common::phone_unlock::PhoneCmd::SetAnnounceOperator {
-                    on: req
-                        .pointer("/params/on")
-                        .and_then(|v| v.as_bool())
-                        .ok_or("set_announce_operator requires params.on")?,
-                },
-            };
+            let cmd = heartwood_common::phone_unlock::PhoneCmd::from_mgmt(method, req.get("params"))
+                .unwrap_or(Err("unknown phone-unlock method"))?;
             crate::phone_unlock_cmd::run(cmd, ctx.nvs, ctx.masters, ctx.display, None)
         }
 
@@ -8869,6 +9132,9 @@ fn dispatch_mgmt(
                     // Phone unlock: USB frame 0x64 and the list/revoke/
                     // set_announce_operator management methods.
                     "phone_unlock_v1",
+                    // enrol_unlock_phone: adding a phone over the relay, on
+                    // a deferred card with the request code.
+                    heartwood_common::phone_unlock::RELAY_ENROL_CAPABILITY,
                     "client_policy_v2",
                     // Schema addendum §1.5 family flags (escalate,
                     // petition_on_deny, audit_child_wrap, bound_identity)

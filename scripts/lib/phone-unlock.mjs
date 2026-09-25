@@ -160,8 +160,23 @@ export function parseEnrolmentCode(text) {
  * to vectors it produced.
  */
 export function checkCode(ephemeralPubkeyHex) {
-  const hex = createHmac('sha256', Buffer.from(ephemeralPubkeyHex, 'hex'))
-    .update(Buffer.concat([Buffer.from('heartwood-unlock:enrol-check'), Buffer.alloc(4)]))
+  return spokenHex6(ephemeralPubkeyHex, 'heartwood-unlock:enrol-check')
+}
+
+/**
+ * The six characters the board's enrol card leads with before the press, and
+ * that Sapwood (or this script) shows for the request it sent: the same
+ * derivation as checkCode, keyed by the phone's enrolment key P, under
+ * 'heartwood-unlock:enrol-request'. Holding only when they match is what
+ * stops the owner pressing for a request someone else raced in.
+ */
+export function requestCode(enrolPubkeyHex) {
+  return spokenHex6(enrolPubkeyHex, 'heartwood-unlock:enrol-request')
+}
+
+function spokenHex6(keyHex, context) {
+  const hex = createHmac('sha256', Buffer.from(keyHex, 'hex'))
+    .update(Buffer.concat([Buffer.from(context), Buffer.alloc(4)]))
     .digest('hex')
     .slice(0, 6)
     .toUpperCase()

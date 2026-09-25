@@ -2285,6 +2285,72 @@ subscribed to `{"kinds":[24135]}`).
    unlocked through round 6. The log says "phones told about the relay
    change; recorded", and a reset afterwards has no "relays changed" line.
 
+## 28. Adding an unlock phone over the relay (added 2026-09-25, NOT YET BENCH-RUN)
+
+`enrol_unlock_phone` does over the relay what `PHONE_UNLOCK_CMD` (0x64)
+`{"op":"enrol"}` does over the cable, on the deferred card queue (#64), so the
+relay loop keeps serving while the card is up. Device operator only, behind the
+one-time mutation challenge; the card (`ADD UNLOCK PHONE`) leads with the
+request code, and the DONE screen shows the check code. Logic and host tests:
+`common/src/phone_unlock.rs` (relay enrolment section).
+
+Needs a WiFi board with a vault key, unlocked, the device operator key in
+`~/heartwood-bench/operator.key`, `HEARTWOOD_RELAYS` (or `--mgmt-relay`) set to
+the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
+
+1. **Enrol over the relay.** `node scripts/phone-unlock.mjs enrol
+   --over-relay --label "relay phone"`. The script prints the request code;
+   the board's card reads the same six characters over "for relay phone".
+   While the card is up, a USB `FIRMWARE_INFO` and a `get_status` over the
+   relay both answer. Hold: the board shows DONE "Phone added" with a check
+   code, the script prints the same check code and "enrolled as id N", and
+   `list` shows the phone. Reset the board and run `listen`: it unlocks.
+
+2. **Decline and expiry add nothing.** Repeat with a new run and press B
+   (or a short press): the script says "refused: declined on the board";
+   another run left alone: "refused: not confirmed on the board in time"
+   after 30 s. `list` shows no new record either time.
+
+3. **One at a time; a key once.** Start two runs a few seconds apart: the
+   second is refused at once ("another phone is already waiting for a press
+   on the board") while the first card is up. Resend the first run's request
+   by hand after it resolves (same `enrol_pubkey`, fresh challenge): refused
+   at once ("this enrolment key was already used"), no card.
+
+4. **Replay.** Capture the first run's kind-24134 request event and publish
+   it again: no card, and the board logs a replay (inside the RAM id set) or
+   answers `stale_management_challenge`. Reset the board, unlock, and publish
+   it again: `stale_management_challenge`, no card.
+
+5. **Delegates never.** With a per-identity operator set on one identity
+   (`set_identity_operator`), send `enrol_unlock_phone` from that key: refused
+   with "enrol_unlock_phone is a device-level operation and requires the
+   device operator", no card.
+
+6. **Refused before any card.** Each answers at once with no card: a label
+   with a newline ("label must be one line of printable text"), a board with
+   at-rest encryption off ("set a PIN or vault key first"), and a board
+   already holding 16 phones ("16 phones already enrolled; revoke one first";
+   the legacy V4 storage-limit run in the phase 6 list can share this setup).
+
+7. **Checked again at the press.** Start an enrolment, pull the board's WiFi
+   uplink so every relay session drops, then hold. The card turns to NOT DONE
+   "No phone added", and `list`, once the uplink is back, shows no new record.
+
+8. **Restart mid-card.** Start an enrolment and reset the board while the card
+   is up. After the unlock, `list` shows no new record and the script times
+   out; a fresh run from the same phone code (enrol-for) is accepted, since
+   the key is remembered in RAM only.
+
+9. **Cable card shows the code too.** `phone-unlock.mjs enrol` over USB: the
+   card reads the printed request code, and DONE shows the check code.
+
+10. **Wire capture.** Subscribe to `{"kinds":[24134,24137]}` during step 1:
+    the only new traffic is the operator's 24134 request, the board's 24134
+    answer (both one `p` tag) and, for `enrol-for`, Sapwood's or the script's
+    24137 tagged with the one-off rendezvous tag. No event carries the label,
+    the enrolment key or the phone's id in the clear.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

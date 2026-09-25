@@ -503,10 +503,8 @@ impl PhoneCmd {
         match w.op.as_str() {
             "enrol" => {
                 let hex = w.enrol_pubkey.ok_or("enrol needs enrol_pubkey")?;
-                let bytes = crate::hex::hex_decode(&hex).map_err(|_| "enrol_pubkey is not hex")?;
-                let enrol_pubkey: [u8; 32] =
-                    bytes.try_into().map_err(|_| "enrol_pubkey must be 32 bytes")?;
-                let label = w.label.unwrap_or_default().trim().into();
+                let enrol_pubkey = enrol_pubkey_from_hex(&hex)?;
+                let label = enrol_label(w.label.as_deref().unwrap_or_default())?;
                 Ok(PhoneCmd::Enrol { enrol_pubkey, label })
             }
             "list" => Ok(PhoneCmd::List),
@@ -517,6 +515,23 @@ impl PhoneCmd {
             _ => Err("unknown phone-unlock op"),
         }
     }
+}
+
+/// A label as the board keeps and shows it: trimmed, and one line of
+/// printable text. It is the requester's text, and the enrol card draws it
+/// under the request code, so a label that could break a line could draw a
+/// code of its own where the owner looks for the real one.
+fn enrol_label(raw: &str) -> Result<String, &'static str> {
+    let label = raw.trim();
+    if label.chars().any(char::is_control) {
+        return Err("label must be one line of printable text");
+    }
+    Ok(label.into())
+}
+
+fn enrol_pubkey_from_hex(hex: &str) -> Result<[u8; 32], &'static str> {
+    let bytes = crate::hex::hex_decode(hex).map_err(|_| "enrol_pubkey is not hex")?;
+    bytes.try_into().map_err(|_| "enrol_pubkey must be 32 bytes")
 }
 
 /// The `list` answer. Ids and labels only; nothing that unlocks.
@@ -539,6 +554,237 @@ pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
         "ephemeral_pubkey": hex_lower(&e.ephemeral_pubkey),
         "sealed": e.sealed,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Enrolment over the relay (kind-24134 management, deferred approval)
+// ---------------------------------------------------------------------------
+//
+// The cable enrols with frame 0x64 {"op":"enrol"}. Over the relay the same
+// enrolment is the management method `enrol_unlock_phone`: from the device
+// operator only (never a per-identity delegate; a NIP-46 client has no route
+// to management at all), behind the one-time mutation challenge like every
+// other change, and held on the board's button as a card (#64) rather than
+// blocking the relay loop. What comes back is the cable's answer unchanged,
+// so Sapwood hands it to the phone exactly as after a cable enrolment, and
+// the phone cannot tell which way it came.
+//
+// Two codes, both spoken-token hex tokens (the first three bytes of
+// HMAC-SHA256(key, utf8(context) || counter_be32), counter 0), shown "ABC 123":
+//
+//   request code  key = the phone's enrolment key P. On the board's card, and
+//                 in Sapwood BEFORE the press, so the owner holds for the
+//                 request they sent and not for one raced in beside it.
+//   check code    key = the board's one-off hand-off key. On the board after
+//                 the press, in Sapwood and on the phone, so the owner knows
+//                 the phone holds the hand-off this board made.
+
+/// The management method that adds a phone over the relay.
+pub const ENROL_METHOD: &str = "enrol_unlock_phone";
+/// Advertised in `get_status.capabilities` by firmware that serves it.
+pub const RELAY_ENROL_CAPABILITY: &str = "phone_enrol_relay_v1";
+/// spoken-token context of the request code (key: the enrolment key P).
+pub const REQUEST_CODE_CONTEXT: &str = "heartwood-unlock:enrol-request";
+/// spoken-token context of the check code (key: the hand-off key).
+pub const CHECK_CODE_CONTEXT: &str = "heartwood-unlock:enrol-check";
+/// How many enrolment keys a board remembers as used this boot.
+pub const USED_ENROL_KEYS_MAX: usize = 16;
+
+fn spoken_hex6(key: &[u8; 32], context: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(context.as_bytes());
+    mac.update(&0u32.to_be_bytes());
+    let d = mac.finalize().into_bytes();
+    let hex = alloc::format!("{:02X}{:02X}{:02X}", d[0], d[1], d[2]);
+    alloc::format!("{} {}", &hex[..3], &hex[3..])
+}
+
+/// The code the enrol card shows before the press, from the phone's
+/// enrolment key P. Sapwood shows the same code for the request it sent.
+pub fn request_code(enrol_pubkey: &[u8; 32]) -> String {
+    spoken_hex6(enrol_pubkey, REQUEST_CODE_CONTEXT)
+}
+
+/// The code the board, Sapwood and the phone show after the press, from the
+/// board's one-off hand-off key.
+pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
+    spoken_hex6(ephemeral_pubkey, CHECK_CODE_CONTEXT)
+}
+
+/// The enrol card's two lines: the request code on the first, where the
+/// owner looks, and the requester's label below it.
+pub fn enrol_card_title(request_code: &str, label: &str) -> String {
+    alloc::format!("{request_code}\nfor {label}")
+}
+
+impl PhoneCmd {
+    /// A relay management request as a phone command, or `None` when the
+    /// method is not one. `list_unlock_phones`, `revoke_unlock_phone {id}`,
+    /// `set_announce_operator {on}` and `enrol_unlock_phone {enrol_pubkey,
+    /// label?}`. Enrolment takes no other field: one this firmware does not
+    /// understand may be one that matters.
+    pub fn from_mgmt(method: &str, params: Option<&serde_json::Value>) -> Option<Result<Self, &'static str>> {
+        let field = |name: &str| params.and_then(|p| p.get(name));
+        Some(match method {
+            "list_unlock_phones" => Ok(PhoneCmd::List),
+            "revoke_unlock_phone" => field("id")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .map(|id| PhoneCmd::Revoke { id })
+                .ok_or("revoke_unlock_phone requires params.id"),
+            "set_announce_operator" => field("on")
+                .and_then(|v| v.as_bool())
+                .map(|on| PhoneCmd::SetAnnounceOperator { on })
+                .ok_or("set_announce_operator requires params.on"),
+            ENROL_METHOD => (|| {
+                let hex = field("enrol_pubkey")
+                    .and_then(|v| v.as_str())
+                    .ok_or("enrol_unlock_phone requires params.enrol_pubkey")?;
+                if params
+                    .and_then(|p| p.as_object())
+                    .is_some_and(|o| o.keys().any(|k| k != "enrol_pubkey" && k != "label"))
+                {
+                    return Err("enrol_unlock_phone takes only enrol_pubkey and label");
+                }
+                let enrol_pubkey = enrol_pubkey_from_hex(hex)?;
+                let label = match field("label") {
+                    None => String::new(),
+                    Some(v) => enrol_label(v.as_str().ok_or("label must be a string")?)?,
+                };
+                Ok(PhoneCmd::Enrol { enrol_pubkey, label })
+            })(),
+            _ => return None,
+        })
+    }
+}
+
+/// Enrolment keys already answered this boot. A phone makes a fresh one-off
+/// key per enrolment, so the same key again is a host resending a command it
+/// has already sent (a retrying request helper queued three extra enrols
+/// behind one press on 2026-09-24, and the secrets of the records they made
+/// were never read). RAM only: after a restart a key that never completed
+/// may be tried again, which is harmless, since it completed nothing.
+#[derive(Default)]
+pub struct UsedEnrolKeys {
+    keys: Vec<[u8; 32]>,
+}
+
+impl UsedEnrolKeys {
+    /// Mark `key` used. False if it already was.
+    pub fn claim(&mut self, key: &[u8; 32]) -> bool {
+        if self.keys.contains(key) {
+            return false;
+        }
+        if self.keys.len() >= USED_ENROL_KEYS_MAX {
+            self.keys.remove(0);
+        }
+        self.keys.push(*key);
+        true
+    }
+}
+
+/// Why an enrolment was refused. Every refusal adds nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnrolRefusal {
+    /// A per-identity delegate asked over the relay.
+    NotDeviceOperator,
+    /// An enrolment is already waiting on the board's button.
+    AnotherPending,
+    /// This enrolment key was already used this boot.
+    KeyUsed,
+    LabelTooLong,
+    Locked,
+    /// At-rest encryption is off, so there is no data key to wrap.
+    NoDataKey,
+    NoRelays,
+    /// Sixteen phones already.
+    Full,
+    /// The device operator changed while the card was up.
+    OperatorChanged,
+    /// The press came with no relay live to carry the answer.
+    NoRelaySession,
+}
+
+impl EnrolRefusal {
+    pub fn message(self) -> String {
+        use crate::data_key::{LABEL_MAX, MAX_PHONES};
+        match self {
+            EnrolRefusal::NotDeviceOperator => {
+                alloc::format!("{ENROL_METHOD} is a device-level operation and requires the device operator")
+            }
+            EnrolRefusal::AnotherPending => "another phone is already waiting for a press on the board".into(),
+            EnrolRefusal::KeyUsed => "this enrolment key was already used: start again on the phone".into(),
+            EnrolRefusal::LabelTooLong => alloc::format!("label longer than {LABEL_MAX} bytes"),
+            EnrolRefusal::Locked => "unlock the board first".into(),
+            EnrolRefusal::NoDataKey => "phone unlock opens encrypted storage: set a PIN or vault key first".into(),
+            EnrolRefusal::NoRelays => "phone unlock needs WiFi relays configured".into(),
+            EnrolRefusal::Full => alloc::format!("{MAX_PHONES} phones already enrolled; revoke one first"),
+            EnrolRefusal::OperatorChanged => {
+                "the device operator changed while the card was up: nothing was added".into()
+            }
+            EnrolRefusal::NoRelaySession => "no relay was live to carry the answer: nothing was added".into(),
+        }
+    }
+}
+
+/// What the board knows when it decides whether an enrolment can go ahead.
+#[derive(Clone, Copy, Debug)]
+pub struct EnrolFacts {
+    pub label_len: usize,
+    /// Identities present and none still sealed.
+    pub unlocked: bool,
+    /// This boot holds the data key the phone's record will wrap.
+    pub data_key: bool,
+    pub relays: bool,
+    pub phones: usize,
+}
+
+/// The board-state refusals, in the order the cable has always checked them.
+/// Asked before any card, and again when the card is pressed.
+pub fn enrol_refusal(f: &EnrolFacts) -> Option<EnrolRefusal> {
+    if f.label_len > crate::data_key::LABEL_MAX {
+        Some(EnrolRefusal::LabelTooLong)
+    } else if !f.unlocked {
+        Some(EnrolRefusal::Locked)
+    } else if !f.data_key {
+        Some(EnrolRefusal::NoDataKey)
+    } else if !f.relays {
+        Some(EnrolRefusal::NoRelays)
+    } else if f.phones >= crate::data_key::MAX_PHONES {
+        Some(EnrolRefusal::Full)
+    } else {
+        None
+    }
+}
+
+/// Who may ask over the relay, before anything else is looked at: the device
+/// operator, with no other enrolment waiting on the button. A delegate is
+/// refused first, so it learns nothing about the board.
+pub fn relay_enrol_gate(device_operator: bool, enrolment_pending: bool) -> Option<EnrolRefusal> {
+    if !device_operator {
+        Some(EnrolRefusal::NotDeviceOperator)
+    } else if enrolment_pending {
+        Some(EnrolRefusal::AnotherPending)
+    } else {
+        None
+    }
+}
+
+/// At the press: the operator that asked must still be the device operator,
+/// a relay must be live to carry the answer (a record whose hand-off cannot
+/// leave would be an orphan), and the board must still be able to enrol.
+pub fn relay_enrol_completion(
+    operator_current: bool,
+    relay_live: bool,
+    facts: &EnrolFacts,
+) -> Option<EnrolRefusal> {
+    if !operator_current {
+        Some(EnrolRefusal::OperatorChanged)
+    } else if !relay_live {
+        Some(EnrolRefusal::NoRelaySession)
+    } else {
+        enrol_refusal(facts)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -841,6 +1087,216 @@ mod tests {
         phones.enrol(3, "Pixel", &[1u8; 32], &[2u8; 32], &[0u8; 12]).unwrap();
         let v = list_json(&phones, false);
         assert_eq!(v, serde_json::json!({"phones":[{"id":3,"label":"Pixel"}],"max":16,"announce_operator":false}));
+    }
+
+    // --- Enrolment over the relay -------------------------------------------
+
+    fn good_facts() -> EnrolFacts {
+        EnrolFacts { label_len: 7, unlocked: true, data_key: true, relays: true, phones: 0 }
+    }
+
+    /// Vectors from spoken-token 2.0.4 itself (deriveToken(key, context, 0,
+    /// { format: 'hex', length: 6 })); the check-code pair is the one Cambium's
+    /// EnrolmentTest and scripts/lib/phone-unlock.test.mjs already pin.
+    #[test]
+    fn codes_are_spoken_token_hex_tokens() {
+        assert_eq!(check_code(&[0xAB; 32]), "9B6 164");
+        assert_eq!(check_code(&[0x00; 32]), "EF1 645");
+        assert_eq!(request_code(&[0xAB; 32]), "F71 5A0");
+        assert_eq!(request_code(&[0x00; 32]), "071 F6B");
+        assert_ne!(request_code(&[0x42; 32]), check_code(&[0x42; 32]), "the two codes never coincide by construction");
+    }
+
+    #[test]
+    fn the_enrol_card_leads_with_the_code_and_the_label_cannot_forge_a_line() {
+        assert_eq!(enrol_card_title("F71 5A0", "Pixel 8"), "F71 5A0\nfor Pixel 8");
+        // A label is the requester's text. One that could break a line could
+        // draw a code of its own where the owner looks for the real one.
+        let pk = "ab".repeat(32);
+        for label in ["x\nF71 5A0", "x\rF71", "tab\there", "nul\u{0}", "del\u{7f}", "nel\u{85}x"] {
+            let json = serde_json::json!({ "op": "enrol", "enrol_pubkey": pk, "label": label }).to_string();
+            assert_eq!(PhoneCmd::parse(json.as_bytes()), Err("label must be one line of printable text"), "{label:?}");
+            let params = serde_json::json!({ "enrol_pubkey": pk, "label": label });
+            assert_eq!(
+                PhoneCmd::from_mgmt(ENROL_METHOD, Some(&params)),
+                Some(Err("label must be one line of printable text")),
+                "{label:?}"
+            );
+        }
+        // Accented and other printable text is fine.
+        let params = serde_json::json!({ "enrol_pubkey": pk, "label": "Zoë's phone" });
+        assert!(matches!(PhoneCmd::from_mgmt(ENROL_METHOD, Some(&params)), Some(Ok(_))));
+    }
+
+    #[test]
+    fn management_methods_map_onto_the_cable_commands() {
+        let pk = "ab".repeat(32);
+        let enrol = serde_json::json!({ "enrol_pubkey": pk, "label": " Pixel 8 " });
+        assert_eq!(
+            PhoneCmd::from_mgmt(ENROL_METHOD, Some(&enrol)),
+            Some(Ok(PhoneCmd::Enrol { enrol_pubkey: [0xAB; 32], label: "Pixel 8".into() }))
+        );
+        let no_label = serde_json::json!({ "enrol_pubkey": pk });
+        assert_eq!(
+            PhoneCmd::from_mgmt(ENROL_METHOD, Some(&no_label)),
+            Some(Ok(PhoneCmd::Enrol { enrol_pubkey: [0xAB; 32], label: String::new() }))
+        );
+        assert_eq!(PhoneCmd::from_mgmt("list_unlock_phones", None), Some(Ok(PhoneCmd::List)));
+        assert_eq!(
+            PhoneCmd::from_mgmt("revoke_unlock_phone", Some(&serde_json::json!({ "id": 7 }))),
+            Some(Ok(PhoneCmd::Revoke { id: 7 }))
+        );
+        assert_eq!(
+            PhoneCmd::from_mgmt("set_announce_operator", Some(&serde_json::json!({ "on": false }))),
+            Some(Ok(PhoneCmd::SetAnnounceOperator { on: false }))
+        );
+        // The messages the relay has always answered with.
+        assert_eq!(
+            PhoneCmd::from_mgmt("revoke_unlock_phone", Some(&serde_json::json!({ "id": -1 }))),
+            Some(Err("revoke_unlock_phone requires params.id"))
+        );
+        assert_eq!(
+            PhoneCmd::from_mgmt("revoke_unlock_phone", Some(&serde_json::json!({ "id": 4_294_967_296u64 }))),
+            Some(Err("revoke_unlock_phone requires params.id"))
+        );
+        assert_eq!(PhoneCmd::from_mgmt("set_announce_operator", None), Some(Err("set_announce_operator requires params.on")));
+        // Enrolment is strict: a field this firmware does not understand may
+        // be one that matters, so it is refused rather than ignored.
+        for (params, why) in [
+            (None, "enrol_unlock_phone requires params.enrol_pubkey"),
+            (Some(serde_json::json!({})), "enrol_unlock_phone requires params.enrol_pubkey"),
+            (Some(serde_json::json!({ "enrol_pubkey": "abcd" })), "enrol_pubkey must be 32 bytes"),
+            (Some(serde_json::json!({ "enrol_pubkey": "zz".repeat(32) })), "enrol_pubkey is not hex"),
+            (Some(serde_json::json!({ "enrol_pubkey": 7 })), "enrol_unlock_phone requires params.enrol_pubkey"),
+            (Some(serde_json::json!({ "enrol_pubkey": pk, "label": 7 })), "label must be a string"),
+            (Some(serde_json::json!({ "enrol_pubkey": pk, "relays": [] })), "enrol_unlock_phone takes only enrol_pubkey and label"),
+            (Some(serde_json::json!([pk])), "enrol_unlock_phone requires params.enrol_pubkey"),
+        ] {
+            assert_eq!(PhoneCmd::from_mgmt(ENROL_METHOD, params.as_ref()), Some(Err(why)), "{params:?}");
+        }
+        // Anything else is not a phone command at all.
+        for method in ["enrol", "unlock_phone_enrol", "get_status", "create_client", ""] {
+            assert_eq!(PhoneCmd::from_mgmt(method, None), None, "{method}");
+        }
+    }
+
+    #[test]
+    fn an_enrolment_key_is_used_once_and_the_memory_is_bounded() {
+        let mut used = UsedEnrolKeys::default();
+        assert!(used.claim(&[1u8; 32]));
+        assert!(!used.claim(&[1u8; 32]), "the same key again is a resend");
+        for i in 2..=(USED_ENROL_KEYS_MAX as u8) {
+            assert!(used.claim(&[i; 32]));
+        }
+        assert!(!used.claim(&[1u8; 32]), "still remembered at the cap");
+        assert!(used.claim(&[0xEE; 32]));
+        assert!(used.claim(&[1u8; 32]), "the oldest makes room once the cap is passed");
+        assert!(!used.claim(&[0xEE; 32]));
+    }
+
+    #[test]
+    fn enrolment_is_refused_in_a_fixed_order_and_only_when_it_must_be() {
+        assert_eq!(enrol_refusal(&good_facts()), None);
+        assert_eq!(
+            enrol_refusal(&EnrolFacts { phones: crate::data_key::MAX_PHONES - 1, ..good_facts() }),
+            None,
+            "the sixteenth phone fits"
+        );
+        assert_eq!(
+            enrol_refusal(&EnrolFacts { phones: crate::data_key::MAX_PHONES, ..good_facts() }),
+            Some(EnrolRefusal::Full)
+        );
+        assert_eq!(
+            enrol_refusal(&EnrolFacts { label_len: crate::data_key::LABEL_MAX + 1, ..good_facts() }),
+            Some(EnrolRefusal::LabelTooLong)
+        );
+        assert_eq!(enrol_refusal(&EnrolFacts { unlocked: false, ..good_facts() }), Some(EnrolRefusal::Locked));
+        assert_eq!(enrol_refusal(&EnrolFacts { data_key: false, ..good_facts() }), Some(EnrolRefusal::NoDataKey));
+        assert_eq!(enrol_refusal(&EnrolFacts { relays: false, ..good_facts() }), Some(EnrolRefusal::NoRelays));
+        // A locked board says only that it is locked, whatever else is true.
+        let worst = EnrolFacts { label_len: 3, unlocked: false, data_key: false, relays: false, phones: 99 };
+        assert_eq!(enrol_refusal(&worst), Some(EnrolRefusal::Locked));
+        assert_eq!(
+            enrol_refusal(&EnrolFacts { data_key: false, relays: false, phones: 99, ..good_facts() }),
+            Some(EnrolRefusal::NoDataKey)
+        );
+        assert_eq!(enrol_refusal(&EnrolFacts { relays: false, phones: 99, ..good_facts() }), Some(EnrolRefusal::NoRelays));
+    }
+
+    #[test]
+    fn over_the_relay_only_the_device_operator_asks_and_only_one_waits() {
+        assert_eq!(relay_enrol_gate(true, false), None);
+        assert_eq!(relay_enrol_gate(true, true), Some(EnrolRefusal::AnotherPending));
+        // A delegate learns nothing, not even that a card is up.
+        assert_eq!(relay_enrol_gate(false, false), Some(EnrolRefusal::NotDeviceOperator));
+        assert_eq!(relay_enrol_gate(false, true), Some(EnrolRefusal::NotDeviceOperator));
+    }
+
+    #[test]
+    fn a_pressed_card_rechecks_authority_a_relay_and_the_board() {
+        assert_eq!(relay_enrol_completion(true, true, &good_facts()), None);
+        assert_eq!(relay_enrol_completion(false, true, &good_facts()), Some(EnrolRefusal::OperatorChanged));
+        assert_eq!(relay_enrol_completion(false, false, &good_facts()), Some(EnrolRefusal::OperatorChanged));
+        assert_eq!(
+            relay_enrol_completion(true, false, &good_facts()),
+            Some(EnrolRefusal::NoRelaySession),
+            "no answer could reach the phone: add nothing rather than an orphan"
+        );
+        // Whatever changed while the card was up is caught at the press.
+        assert_eq!(
+            relay_enrol_completion(true, true, &EnrolFacts { data_key: false, ..good_facts() }),
+            Some(EnrolRefusal::NoDataKey)
+        );
+        assert_eq!(
+            relay_enrol_completion(true, true, &EnrolFacts { phones: crate::data_key::MAX_PHONES, ..good_facts() }),
+            Some(EnrolRefusal::Full)
+        );
+    }
+
+    #[test]
+    fn refusal_messages_are_distinct_and_keep_the_cable_wording() {
+        use EnrolRefusal::*;
+        let all = [
+            NotDeviceOperator, AnotherPending, KeyUsed, LabelTooLong, Locked, NoDataKey, NoRelays, Full,
+            OperatorChanged, NoRelaySession,
+        ];
+        let messages: Vec<String> = all.iter().map(|r| r.message()).collect();
+        for (i, m) in messages.iter().enumerate() {
+            assert!(!m.is_empty());
+            assert!(messages.iter().skip(i + 1).all(|n| n != m), "{m}");
+        }
+        // What the cable path has always said, which Sapwood shows as is.
+        assert_eq!(KeyUsed.message(), "this enrolment key was already used: start again on the phone");
+        assert_eq!(LabelTooLong.message(), "label longer than 16 bytes");
+        assert_eq!(Locked.message(), "unlock the board first");
+        assert_eq!(NoDataKey.message(), "phone unlock opens encrypted storage: set a PIN or vault key first");
+        assert_eq!(NoRelays.message(), "phone unlock needs WiFi relays configured");
+        assert_eq!(Full.message(), "16 phones already enrolled; revoke one first");
+        assert_eq!(
+            NotDeviceOperator.message(),
+            "enrol_unlock_phone is a device-level operation and requires the device operator"
+        );
+    }
+
+    /// The enrol answer is what crosses the relay (inside the operator's NIP-44)
+    /// and what Sapwood republishes to the phone: nothing in it names the
+    /// phone, its label or its enrolment key.
+    #[test]
+    fn the_enrol_answer_names_neither_the_phone_nor_its_enrolment_key() {
+        use crate::data_key::PhoneSet;
+        let enrol_sk = [0x42u8; 32];
+        let enrol_pk = crate::derive::public_key_xonly(&enrol_sk).unwrap();
+        let relays = alloc::vec![String::from("wss://relay.example")];
+        let mut phones = PhoneSet::default();
+        let e = enrol(&mut phones, &[0xD0; 32], &enrol_pk, "Pixel 8", &relays, &mut rng_from(5)).unwrap();
+        let answer = enrolment_json(&e).to_string();
+        assert!(!answer.contains("Pixel"));
+        assert!(!answer.contains(&hex_lower(&enrol_pk)));
+        let json = enrolment_json(&e);
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["ephemeral_pubkey", "id", "sealed"]);
+        // The code the board shows after the press is the phone's and Sapwood's.
+        assert_eq!(check_code(&e.ephemeral_pubkey).len(), 7);
     }
 
     // --- Relay changes ------------------------------------------------------

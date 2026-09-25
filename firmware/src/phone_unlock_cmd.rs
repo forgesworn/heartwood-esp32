@@ -90,9 +90,10 @@ pub enum Screen {
     /// card (bad auth, a used key, a board that cannot enrol). Whatever was
     /// on screen is still there.
     Untouched,
-    /// An enrol card went up and ended with nothing added (declined,
-    /// expired, or refused at the press); its "Expired" or "Cancelled" card
-    /// is on screen.
+    /// An enrol card went up and ended with nothing added: declined or
+    /// expired ("Denied", "Cancelled" or "Expired" is on screen), or refused
+    /// after the press (the board full or locked by then, a storage or
+    /// memory failure: "No phone added" is on screen).
     NothingAdded,
     /// A phone was added and PHONE ADDED drawn, for the caller to hold until
     /// a press (main.rs in USB mode, relay.rs in WiFi mode).
@@ -238,7 +239,13 @@ fn enrol_on_cable(
     let enrolment =
         match complete_enrol(nvs, masters, enrol_pubkey, &label, phone_unlock::enrol_refusal, |_| true) {
             Ok(enrolment) => enrolment,
-            Err(e) => return (Err(e), true),
+            Err(e) => {
+                // The approval loop left APPROVED up; say plainly that no
+                // phone was added, as the relay card does.
+                crate::oled::show_not_done(display, "No phone added", "see Sapwood");
+                wait_for_release(buttons);
+                return (Err(e), true);
+            }
         };
     let added = Added::of(&enrolment);
     added.show(display);

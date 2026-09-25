@@ -89,6 +89,9 @@ where
     let mut press_start = Instant::now();
     let mut last_pct: u32 = 101; // force first draw
     let mut last_view: Option<(usize, bool)> = None;
+    // The enrol card: `oled::draw_generation` just after its face was last
+    // drawn, to tell when something else has drawn over it.
+    let mut drawn_gen: Option<u32> = None;
     // When A was last seen down, for the gate's debounced "up".
     let mut last_down = Instant::now();
 
@@ -111,6 +114,13 @@ where
             Some(g) => {
                 let settled_up = now.duration_since(last_down) >= Duration::from_millis(u64::from(DEBOUNCE_MS));
                 let elapsed_ms = now.duration_since(start).as_millis().min(u128::from(u64::MAX)) as u64;
+                // Drawn over since its last draw (nothing in this loop does,
+                // bar its own hold bar): the page starts its dwell again and
+                // the face is drawn at once, as on the relay.
+                if !pressed && drawn_gen.is_some_and(|gen| gen != crate::oled::draw_generation()) {
+                    g.restart_page(elapsed_ms);
+                    last_view = None;
+                }
                 (g.step(elapsed_ms, !settled_up), g.armed())
             }
         };
@@ -122,6 +132,9 @@ where
             show_fn(display, remaining, page, armed);
             last_remaining = remaining;
             last_view = Some((page, armed));
+            if gate.is_some() {
+                drawn_gen = Some(crate::oled::draw_generation());
+            }
         }
 
         // B button (where present) is an explicit cancel — never an approve.

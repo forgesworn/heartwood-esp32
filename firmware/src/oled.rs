@@ -61,6 +61,24 @@ type Ssd1306Panel<'a> = Ssd1306<
     BufferedGraphicsMode<DisplaySize128x64>,
 >;
 
+/// Bumped by every flush and every blanking of the panel, on every backend:
+/// whatever is on the glass has changed. An approval card records it after
+/// its own draw; a different value on its next look means something else was
+/// drawn over it (a signing confirmation, a status), so it draws itself
+/// again at once, and the enrol card restarts its page's dwell
+/// (`phone_unlock::EnrolGate::restart_page`).
+static DRAW_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record that the panel changed (the backends' `flush` and blanking call it).
+pub fn note_draw() {
+    DRAW_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many times the panel has changed ([`note_draw`]).
+pub fn draw_generation() -> u32 {
+    DRAW_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Mono SSD1306 panel presented through the shared `DrawTarget<Color = Rgb565>`
 /// surface. The colour-authored screens draw the same on every board; here each
 /// non-black colour is thresholded to a lit pixel, so the Heltec OLEDs render
@@ -85,11 +103,15 @@ impl<'a> Display<'a> {
 
     /// Blit the back buffer to the panel. Mirrors `Ssd1306::flush`.
     pub fn flush(&mut self) -> Result<(), MonoError> {
+        note_draw();
         self.inner.flush().map_err(|_| MonoError)
     }
 
     /// Turn the panel on/off. Mirrors `Ssd1306::set_display_on`.
     pub fn set_display_on(&mut self, on: bool) -> Result<(), MonoError> {
+        if !on {
+            note_draw();
+        }
         self.inner.set_display_on(on).map_err(|_| MonoError)
     }
 
@@ -1113,8 +1135,11 @@ pub fn show_titled_approval(
 /// must read, so the card shows them a page at a time, as large as the panel
 /// allows: words 1 and 2, then 3 and 4, then 5, each page for
 /// `phone_unlock::ENROL_PAGE_SECS` and round again with no press. The caller
-/// turns the pages with `phone_unlock::EnrolGate`, which counts only pages
-/// actually drawn. Each word has a line of its own with
+/// turns the pages with `phone_unlock::EnrolGate`, which counts a page's
+/// dwell only while this card, as the firmware last drew it, is what is on
+/// the panel: anything else drawn over it ([`draw_generation`] moves on)
+/// restarts the page's dwell once the card is back. Each word has a line of
+/// its own with
 /// its place in the code beside it, in the font `Layout::enrol_geometry`
 /// picks: FONT_6X10 at 2x on the Heltec, 12 px letters where the old card
 /// drew 6 px ones two to a line. Above them, one small-font line says what is

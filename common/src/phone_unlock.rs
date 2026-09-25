@@ -736,6 +736,16 @@ impl EnrolGate {
         self.page
     }
 
+    /// Something else was drawn over the card and it has just been drawn
+    /// again (`elapsed_ms` since it opened): the page on screen starts its
+    /// dwell afresh, so time the words were hidden never counts towards the
+    /// gate. A card drawn over again and again only expires.
+    pub fn restart_page(&mut self, elapsed_ms: u64) {
+        if self.page_since_ms.is_some() {
+            self.page_since_ms = Some(elapsed_ms);
+        }
+    }
+
     /// The page on screen.
     pub fn page(&self) -> usize {
         self.page
@@ -1826,6 +1836,25 @@ mod tests {
         assert!(!stalled.armed());
         assert_eq!(stalled.step(40_000, false), 0);
         assert!(stalled.armed(), "every page has now had its full dwell");
+
+        // Something else drew over the card (a confirmation, a status):
+        // the page on screen starts its dwell again once the card is back,
+        // so time spent hidden never counts as time read.
+        let mut hidden = EnrolGate::default();
+        hidden.step(0, false);
+        hidden.step(3_000, false);
+        hidden.restart_page(3_500);
+        assert_eq!(hidden.step(4_000, false), 0, "page 1 was hidden from 3 s");
+        assert_eq!(hidden.step(7_499, false), 0);
+        assert_eq!(hidden.step(7_500, false), 1, "a full dwell after it came back");
+        // Drawn over every second, the card never arms: it only expires.
+        let mut flooded = EnrolGate::default();
+        for ms in (0..=45_000).step_by(1_000) {
+            flooded.step(ms, false);
+            flooded.restart_page(ms);
+        }
+        assert!(!flooded.armed());
+        assert_eq!(flooded.page(), 0);
 
         // A page is never skipped, whatever the gap between looks.
         let mut jumpy = EnrolGate::default();

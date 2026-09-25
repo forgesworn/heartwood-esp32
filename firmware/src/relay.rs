@@ -1203,7 +1203,11 @@ pub fn run_wifi_standalone<'d, 'b>(
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
                 poll_usb(usb, &mut ctx, Some(&mut wifi));
-                service_button(&mut ctx);
+                // A relay card owns the button and the screen even while it cannot
+                // be answered; a held result is served inside service_button.
+                if ctx.button_cards.is_empty() {
+                    service_button(&mut ctx);
+                }
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -1257,7 +1261,11 @@ pub fn run_wifi_standalone<'d, 'b>(
                 let until = Instant::now() + Duration::from_secs(3);
                 while Instant::now() < until {
                     poll_usb(usb, &mut ctx, Some(&mut wifi));
-                    service_button(&mut ctx);
+                    // A relay card owns the button and the screen even while it cannot
+                    // be answered; a held result is served inside service_button.
+                    if ctx.button_cards.is_empty() {
+                        service_button(&mut ctx);
+                    }
                     FreeRtos::delay_ms(20);
                 }
                 continue;
@@ -1288,7 +1296,11 @@ pub fn run_wifi_standalone<'d, 'b>(
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
                 poll_usb(usb, &mut ctx, Some(&mut wifi));
-                service_button(&mut ctx);
+                // A relay card owns the button and the screen even while it cannot
+                // be answered; a held result is served inside service_button.
+                if ctx.button_cards.is_empty() {
+                    service_button(&mut ctx);
+                }
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -3157,9 +3169,12 @@ fn session_step(
         if s.rx.capacity() > READ_BUF * 2 {
             s.rx.shrink_to(READ_BUF);
         }
-        // Handling a sign_event can block ~30s on the button; treat that as
-        // activity so the silence deadline doesn't trip right after.
-        s.last_rx = Instant::now();
+        // Handling a frame can block (a card on the button); credit the
+        // silence deadline so it doesn't trip right after. last_rx is left at
+        // the read that brought the frame in: a frame drained from a buffer
+        // filled before a block says nothing about whether the relay is
+        // still there, and the enrol card's liveness snapshot reads last_rx.
+        s.silence_from = Instant::now();
         return Ok(());
     }
 
@@ -3233,6 +3248,17 @@ fn poll_usb(
     }
     let blocked = started.elapsed() >= CABLE_BLOCKED;
     interrupt_held_result(ctx, HELD_RESULT_REDRAW, blocked);
+    if blocked {
+        // Belt and braces for the refusal in poll_usb_frame: whatever held
+        // the loop may have been answered with the button, and that hold is
+        // no relay card's. The front card waits for the button to be seen
+        // up again (the enrol card as well as its gate), and the latched
+        // edge and release go.
+        if let Some(card) = ctx.button_cards.first_mut() {
+            card.armed = false;
+        }
+        crate::button::clear_press_edge();
+    }
     blocked
 }
 
@@ -3262,6 +3288,30 @@ fn poll_usb_frame(
     }
     ctx.last_activity = Instant::now();
 
+    // One screen, one button, one decision. A cable card answered while a
+    // relay card waits leaves its hold behind (the sampler latches the
+    // release with the whole press), which the relay card would read as its
+    // own approval: a compromised host could send any card-raising frame
+    // while the owner hesitates over a relay enrolment and harvest the hold.
+    // So every frame that may raise a card (`types::cable_frame_card`, which
+    // ui-preview checks against this match) is refused while a card, or a
+    // result younger than RESULT_HOLD_MS, is up. The per-arm checks below
+    // predate this and are kept.
+    let raises_card = match heartwood_common::types::cable_frame_card(frame.frame_type) {
+        heartwood_common::types::CableCard::Never => false,
+        heartwood_common::types::CableCard::Always => true,
+        heartwood_common::types::CableCard::IfEnrol => matches!(
+            heartwood_common::phone_unlock::PhoneCmd::parse(&frame.payload),
+            Ok(heartwood_common::phone_unlock::PhoneCmd::Enrol { .. })
+        ),
+    };
+    if raises_card && cable_card_refused(ctx) {
+        crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+        // Some of these carry secrets (a PIN, a vault key, a seed).
+        frame.scrub_payload();
+        return true;
+    }
+
     match frame.frame_type {
         FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
             usb,
@@ -3288,7 +3338,9 @@ fn poll_usb_frame(
                 if ok { FRAME_TYPE_ACK } else { FRAME_TYPE_NACK },
                 &[],
             );
-            if ok && ctx.masters.len() == 1 && ctx.display_on {
+            // Not over a card or a held result: the identity card would hide
+            // the words the owner is reading.
+            if ok && ctx.masters.len() == 1 && ctx.display_on && !approval_card_open(ctx) {
                 let slot = ctx.masters[0].slot;
                 let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
                 let meta = crate::identity_meta::load(ctx.nvs, slot);
@@ -4935,6 +4987,14 @@ struct ButtonCard {
     /// The enrol card's (page, armed) last drawn, so a change is drawn at
     /// once and the page the gate counts is the page on screen.
     drawn_view: Option<(usize, bool)>,
+    /// `oled::draw_generation` just after this card last drew its face;
+    /// `None` before the first draw.
+    drawn_gen: Option<u32>,
+}
+
+/// Whether something else has been drawn since this card last drew its face.
+fn card_overdrawn(card: &ButtonCard) -> bool {
+    card.drawn_gen.is_some_and(|g| g != crate::oled::draw_generation())
 }
 
 /// What one card tick concluded.
@@ -5122,6 +5182,7 @@ fn queue_button_ask(
                 last_pct: u32::MAX,
                 enrol_gate: Default::default(),
                 drawn_view: None,
+                drawn_gen: None,
             });
             Ok(())
         }
@@ -5152,7 +5213,10 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // The enrol card also redraws the moment its page or gate changes.
     let view = is_enrol_card(&ctx.button_cards[0])
         .then(|| (ctx.button_cards[0].enrol_gate.page(), ctx.button_cards[0].enrol_gate.armed()));
-    if remaining == ctx.button_cards[0].last_remaining && view == ctx.button_cards[0].drawn_view {
+    if remaining == ctx.button_cards[0].last_remaining
+        && view == ctx.button_cards[0].drawn_view
+        && !card_overdrawn(&ctx.button_cards[0])
+    {
         return;
     }
     ctx.button_cards[0].last_remaining = remaining;
@@ -5271,6 +5335,8 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             card_armed,
         ),
     }
+    // What is on the glass is this card's face, as of now.
+    ctx.button_cards[0].drawn_gen = Some(crate::oled::draw_generation());
 }
 
 /// A string parameter of a `heartwood_note_*` request (`params[0].<name>`).
@@ -5364,11 +5430,19 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     let enrol = is_enrol_card(&ctx.button_cards[0]);
     if enrol {
         let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        // Something else was drawn since the card last drew itself (a
+        // signing confirmation, an OTA chunk, a screen turned round): the
+        // words were hidden for some of that time, so the page on screen
+        // starts its dwell again once the card is back (drawn below). A card
+        // drawn over again and again only expires.
+        if card_overdrawn(&ctx.button_cards[0]) {
+            ctx.button_cards[0].enrol_gate.restart_page(elapsed_ms);
+        }
         ctx.button_cards[0].enrol_gate.step(elapsed_ms, hold_ms > 0);
     }
 
     if !ctx.button_cards[0].armed {
-        let arms = if enrol { ctx.button_cards[0].enrol_gate.armed() } else { hold_ms == 0 };
+        let arms = hold_ms == 0 && (!enrol || ctx.button_cards[0].enrol_gate.armed());
         if arms {
             ctx.button_cards[0].armed = true;
         }
@@ -5925,6 +5999,7 @@ fn queue_receive_card(
                 last_pct: u32::MAX,
                 enrol_gate: Default::default(),
                 drawn_view: None,
+                drawn_gen: None,
             });
         }
     }
@@ -6150,6 +6225,7 @@ fn queue_phone_enrol(
         last_pct: u32::MAX,
         enrol_gate: Default::default(),
         drawn_view: None,
+        drawn_gen: None,
     });
     Ok(())
 }
@@ -9426,7 +9502,9 @@ fn dispatch_mgmt(
             // allocated a fresh avatar buffer at the request's peak heap use,
             // which is exactly when a fragmented mid-TLS heap says no.
             // Never wakes a blanked panel — operator config, not a user request.
-            if ctx.masters.len() == 1 && ctx.display_on {
+            // Not over a card or a held result: the identity card would hide
+            // the words the owner is reading.
+            if ctx.masters.len() == 1 && ctx.display_on && !approval_card_open(ctx) {
                 let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
                 crate::oled::show_npub(
                     ctx.display,

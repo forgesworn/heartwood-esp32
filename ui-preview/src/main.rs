@@ -944,6 +944,71 @@ mod error_card_tests {
 }
 
 #[cfg(test)]
+mod cable_card_tests {
+    use heartwood_common::types::{cable_frame_card, CableCard};
+    use std::collections::HashMap;
+
+    /// Every arm of the WiFi loop's USB dispatch (relay.rs `poll_usb_frame`)
+    /// that hands its handler the buttons may raise a card of its own, and a
+    /// card answered with a relay card waiting leaves a hold that card would
+    /// read as its own approval. So each such frame must be classified as
+    /// card-raising in `types::cable_frame_card`, which the loop refuses
+    /// "approval on screen" while a relay card is up. Scans the source, so a
+    /// new arm is covered the day it lands.
+    #[test]
+    fn every_cable_frame_handed_the_buttons_is_refused_under_a_relay_card() {
+        let types = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../common/src/types.rs")).unwrap();
+        let consts: HashMap<String, u8> = types
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix("pub const ")?;
+                let (name, value) = rest.split_once(": u8 = ")?;
+                let hex = value.split(';').next()?.trim().strip_prefix("0x")?;
+                Some((name.to_string(), u8::from_str_radix(hex, 16).ok()?))
+            })
+            .collect();
+        let relay = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/relay.rs")).unwrap();
+        let start = relay.find("fn poll_usb_frame(").expect("poll_usb_frame is in relay.rs");
+        let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
+        // Arms start at eight spaces of indent with a frame name.
+        let mut arms: Vec<(String, String)> = Vec::new();
+        for line in body.lines() {
+            if line.starts_with("        FRAME_TYPE_") {
+                arms.push((String::new(), String::new()));
+            }
+            if let Some((pattern, text)) = arms.last_mut() {
+                if !text.contains("=>") && !pattern.contains("=>") {
+                    pattern.push_str(line);
+                    pattern.push('\n');
+                } else {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                if pattern.contains("=>") && text.is_empty() {
+                    text.push(' ');
+                }
+            }
+        }
+        let mut checked = 0;
+        for (pattern, text) in &arms {
+            let names: Vec<&str> = pattern
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| w.starts_with("FRAME_TYPE_"))
+                .collect();
+            let handed_buttons = pattern.contains("ctx.buttons") || text.contains("ctx.buttons");
+            for name in names {
+                let value = *consts.get(name).unwrap_or_else(|| panic!("{name} not in types.rs"));
+                checked += 1;
+                if handed_buttons {
+                    assert_ne!(cable_frame_card(value), CableCard::Never, "{name} is handed the buttons");
+                }
+            }
+        }
+        assert!(checked >= 35, "scan found {checked} frames: the parser has drifted");
+    }
+}
+
+#[cfg(test)]
 mod enrol_card_tests {
     use super::*;
     use std::collections::HashSet;

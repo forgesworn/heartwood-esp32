@@ -239,27 +239,30 @@ pub fn at_rest_status(
 /// which settles a missing or shrunk record, a status read leaves the record
 /// exactly as it found it for the boot's own relay-update logic to act on.
 ///
-/// `have_phones` is the caller's already-computed `unlock_phone_count > 0`
-/// (from this same function's other return value) rather than a second read
-/// of `dk_ph`: FIRMWARE_INFO and get_status both call `at_rest_status` first
-/// and already have the count in hand, so this needs no extra phone-blob
-/// read and inherits its damage handling (a corrupt `dk_ph`, or one orphaned
-/// by `at_rest` being `none`, already counts as "no phones" there).
+/// `unlock_phone_count` is the caller's already-computed value from this same
+/// function's other return value, passed straight through rather than a
+/// second read of `dk_ph`: FIRMWARE_INFO and get_status both call
+/// `at_rest_status` first and already have it in hand. `None` (a corrupt
+/// `dk_ph` blob) reports `phone_relays: "unknown"` — a damaged count is not
+/// the same claim as "no phones", so it must not read as `have_phones =
+/// false`. `Some(0)` (no phones, or `at_rest` being `none` orphaning a
+/// leftover blob) reports `"current"` without inspecting the record at all,
+/// matching `relays_at_boot`'s own guard.
 ///
-/// The current relay list comes from the active net config (`net_config_store
-/// ::read_net_config`), not a network trial candidate: a trial is inert until
-/// committed and rolls back on its own, so basing "phones not yet told" on a
-/// list that may never take effect would be the more surprising choice.
+/// `current` is the relay list the caller's relay loop is actually running
+/// this boot — the same list `relays_at_boot`/`record_round` compared
+/// against — not a fresh `read_net_config`: re-reading and parsing the active
+/// net config here would copy WiFi credentials onto the heap on every
+/// get_status poll (worse, twice over in the low-heap fallback, once from
+/// this call and once from the full reply it stands in for), and would
+/// disagree with the running boot if a committed network trial's promotion
+/// into the active blob was itself interrupted.
 pub fn phone_relay_status(
     nvs: &EspNvs<NvsDefault>,
-    have_phones: bool,
+    current: &[String],
+    unlock_phone_count: Option<usize>,
 ) -> heartwood_common::phone_relays::PhoneRelayStatus {
     use heartwood_common::phone_relays::{RecordRead, MAX_TOLD_READ_LEN, TOLD_RELAYS_KEY};
-
-    let current: Vec<String> = crate::net_config_store::read_net_config(nvs)
-        .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
-        .map(|cfg| cfg.relays)
-        .unwrap_or_default();
 
     let told_len = match nvs.blob_len(TOLD_RELAYS_KEY) {
         Ok(len) => len,
@@ -275,7 +278,7 @@ pub fn phone_relay_status(
             _ => RecordRead::Unreadable,
         },
     };
-    heartwood_common::phone_relays::relay_status(have_phones, &current, record)
+    heartwood_common::phone_relays::relay_status(unlock_phone_count, current, record)
 }
 
 /// Try to unlock with the PIN or vault key, filling `.secret` in RAM.

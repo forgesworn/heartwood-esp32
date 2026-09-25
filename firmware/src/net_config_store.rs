@@ -102,6 +102,31 @@ pub fn read_trial(nvs: &EspNvs<NvsDefault>) -> Option<NetworkTrialRecord> {
     Some(record)
 }
 
+/// `phone_relays`'s only relay-list source on FIRMWARE_INFO's USB call sites
+/// that have no relay loop running this boot to ask instead (USB-bridged
+/// mode, or WiFi-standalone before its own boot decision has run) — see
+/// `pin::phone_relay_status`'s doc comment for why every other call site uses
+/// the running list in RAM rather than this.
+///
+/// Prefers a committed trial's candidate over the active config, the same
+/// "trial over active" preference `redacted_state` shows over GET_NET_CONFIG,
+/// so a committed trial whose promotion into the active blob was itself
+/// interrupted still resolves to what actually governs. Unlike
+/// `redacted_state`, this reads only the committed marker (`read_trial`, a
+/// shared reference) rather than calling `reconcile_terminal_state`, which
+/// performs that promotion (a write) — a status read must never write.
+pub fn committed_or_active_relays(nvs: &EspNvs<NvsDefault>) -> Vec<String> {
+    if let Some(trial) = read_trial(nvs) {
+        if trial.phase == NetworkTrialPhase::Committed {
+            return trial.candidate.relays;
+        }
+    }
+    read_net_config(nvs)
+        .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
+        .map(|cfg| cfg.relays)
+        .unwrap_or_default()
+}
+
 fn write_trial(
     nvs: &mut EspNvs<NvsDefault>,
     record: &NetworkTrialRecord,

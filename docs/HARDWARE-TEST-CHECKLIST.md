@@ -2285,6 +2285,31 @@ subscribed to `{"kinds":[24135]}`).
    unlocked through round 6. The log says "phones told about the relay
    change; recorded", and a reset afterwards has no "relays changed" line.
 
+10. **`phone_relays` (Sapwood follow-up) tracks the drift above.** Query
+    FIRMWARE_INFO (USB, any mode) and get_status (Sapwood, once unlocked) at
+    each point:
+    - Before step 2 (in step) and after step 9 (drift settled): both read
+      `"current"`.
+    - Right after step 2 (drift recorded, nothing accepted yet): both read
+      `"pending"`.
+    - From the first "(n accepted)" old-relay line in step 3 or step 5
+      onward — even with five of six rounds still to run — both flip to
+      `"current"`. It stays `"current"` through step 6's restart and step 7's
+      ceiling wait: a resumed or deferred round never regresses it.
+    - Step 8 (last phone revoked): both read `"current"` (no phones enrolled),
+      whatever the now-removed record said.
+    - Second-change regression: repeat step 2 (A -> C, one round accepted, so
+      `phone_relays` reads `"current"`), then before round 2 fires point the
+      board at a THIRD relay set D (sharing no relay with A or C) and restart.
+      The boot log resets to "0 of 6 update rounds already sent" for the new
+      change, and `phone_relays` reads `"pending"` again — the earlier
+      acceptance must not carry over to the new drift.
+    - Damage: with the board unlocked, corrupt the `ph_relays` NVS entry
+      directly (a raw NVS write, or interrupt a write mid-flash) and confirm
+      both FIRMWARE_INFO and get_status read `"unknown"`. A subsequent reset
+      logs "phones' relay record not readable by this firmware" and starts no
+      update — the status read must not have repaired or overwritten it.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

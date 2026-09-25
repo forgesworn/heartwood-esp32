@@ -35,17 +35,26 @@ function (`heartwood_common::phone_relays::relay_status`, host-tested for
 every state) behind a single firmware read (`pin::phone_relay_status`) that
 never writes, shared by all three call sites, and excluded from both delegate
 reply shapes via the same `DELEGATE_STATUS_KEYS`/`DELEGATE_STATUS_FALLBACK_KEYS`
-mechanism. `current`: no phones, no configured relay, or the phones already
-know every relay in use — including once some old relay has accepted a
-delivery for a change still mid-update, since that is `phone_relays.rs`'s own
-definition of "reached the phones" and the remaining rounds are insurance, not
-the risk this field flags. `pending`: a live relay the phones were never told
-about, and nothing has accepted a delivery yet. `unknown`: the `ph_relays`
-record exists but this firmware cannot read it — never confused with no
-record at all, which is `current` (nothing yet known to be wrong). No rounds
-count is exposed: Sapwood's one decision ("does anyone need a nudge") does not
-need it, and it would need its own damage handling for a number nobody asked
-for.
+mechanism. `current`: no phones, no configured relay, or the recorded relay
+list matches what is in use — including once an old relay has accepted an
+update for a change still mid-update (an old relay has accepted an update,
+not proof every phone heard it; later rounds still run regardless).
+`pending`: a live relay the phones were never told about, and nothing has
+accepted a delivery for this change yet — this can persist indefinitely if
+every old relay is dead or refuses the kind-24135 delivery, and the only way
+out is revoking and re-enrolling the phones. `unknown`: the `ph_relays`
+record exists, or the enrolled-phone count could not be read, but this
+firmware cannot make sense of it — never confused with no record at all or
+genuinely zero phones, both of which are `current` (nothing yet known to be
+wrong). Compares against the relay list the relay loop is actually running
+(`ctx.relays` on the relay.rs call sites; a shared read of the committed
+network trial or active config on FIRMWARE_INFO's USB-only call sites, which
+have no running list of their own), not a fresh net-config parse per poll,
+and only trusts a recorded acceptance that belongs to the same relay change
+`current` names (a stale acceptance from an earlier, superseded change is
+never carried over). No rounds count is exposed: Sapwood's one decision
+("does anyone need a nudge") does not need it, and it would need its own
+damage handling for a number nobody asked for.
 
 Field-test feedback landed 2026-08-14 (see docs/plans/2026-08-14-field-test-feedback-triage.md): approval loop hardened (B button = explicit cancel on two-button boards with on-screen hints, debounce, terminal "request expired" card so a stale countdown can never wedge the screen, 45 s browser-driven windows), wake-on-press (a serial bridge pinning GPIO 0 after a web flash no longer makes the device look dead), paged idle carousel (identity / network / device pages on short press), multiple prioritised WiFi networks (`NetConfig.networks` fallback list, per-SSID password `keep`, join-loop rotation incl. the locked vault-unlock phase, which previously never associated the station), and a `demo-game` bin (`scripts/build-firmware.sh demo`) — a branded board-check jump-and-duck game for pre-flashing handed-out T-Displays, deliberately not the signer. Sapwood gained the network-list editor, an app-only quick USB update for factory-layout boards, an update banner, and post-flash DTR/RTS release.
 

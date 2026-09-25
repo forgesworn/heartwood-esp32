@@ -2550,7 +2550,9 @@ fn locked_relay_phase(
                 FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
                     usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    crate::firmware_info_json(nvs).as_bytes(),
+                    // `Some(relays)`: the locked phase's own list, the same
+                    // one `relays_at_boot` compared against this boot.
+                    crate::firmware_info_json(nvs, Some(relays)).as_bytes(),
                 ),
                 FRAME_TYPE_PROVISION_LIST => {
                     // Safe while locked (npubs only, no secrets) and REQUIRED
@@ -3196,7 +3198,9 @@ fn poll_usb(
         FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
             usb,
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-            crate::firmware_info_json(ctx.nvs).as_bytes(),
+            // `Some(&ctx.relays)`: the list this relay loop is actually
+            // running, not a fresh net-config read.
+            crate::firmware_info_json(ctx.nvs, Some(&ctx.relays)).as_bytes(),
         ),
 
         // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
@@ -6064,7 +6068,9 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op:
         let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
         // Plan G2's Sapwood follow-up: same idiom, same call site pattern as
         // `at_rest`/`unlock_phone_count` above — see `pin::phone_relay_status`.
-        let phone_relays = crate::pin::phone_relay_status(ctx.nvs, unlock_phone_count.unwrap_or(0) > 0);
+        // `ctx.relays`, not a fresh net-config read: the list this relay loop
+        // is actually running, with no extra heap parse on this low-heap path.
+        let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
         serde_json::json!({
             "master_count": ctx.masters.len(),
             "master_npub_hex": master_hex,
@@ -8955,7 +8961,10 @@ fn dispatch_mgmt(
             // item on the follow-up list once #191 (relay update) and #192
             // (at-rest state) both merged. Same call-site pattern as
             // `at_rest`/`unlock_phone_count` — see `pin::phone_relay_status`.
-            let phone_relays = crate::pin::phone_relay_status(ctx.nvs, unlock_phone_count.unwrap_or(0) > 0);
+            // `ctx.relays`, not a fresh net-config read: the list this relay
+            // loop is actually running (same list `relays_at_boot` compared
+            // against), and no extra heap parse per poll.
+            let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
             Ok(serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,

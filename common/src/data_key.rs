@@ -1402,12 +1402,30 @@ mod tests {
 
     // -- storage model -----------------------------------------------------
 
+    /// How the store replaces a key that already holds a value.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    enum Replace {
+        /// `nvs_set_blob` on its own, which is what the firmware's
+        /// `nvs::ReplaceBlob` calls: ESP-IDF writes the new value in full
+        /// before it erases the old one, and boot-time recovery drops
+        /// whichever copy is incomplete or superseded, so a cut leaves exactly
+        /// one of them. One step.
+        #[default]
+        Direct,
+        /// esp-idf-svc 0.52.1's `EspNvs::set_blob`, which the firmware used
+        /// before: `nvs_erase_key`, then `nvs_set_blob`. Two steps, and a cut
+        /// between them leaves neither value. Kept so the tests can show what
+        /// that order costs.
+        EraseFirst,
+    }
+
     /// In-memory NVS with a power-cut switch. `cut_after` counts mutating
-    /// writes; the write that crosses it is either lost (`apply_cut_write`
+    /// steps; the step that crosses it is either lost (`apply_cut_write`
     /// false) or lands (true), and then the "power" is off for good: every
     /// later operation fails, which the code under test sees as a store error
-    /// and stops. Both halves are real: NVS commits a blob atomically, so a
-    /// cut write is all-or-nothing.
+    /// and stops. Each step is all-or-nothing, as one NVS item write is. A
+    /// replace is one step or two, according to `replace`; a first write is
+    /// always one (erasing a key that is not there writes nothing).
     #[derive(Clone, Default)]
     struct Mem {
         map: BTreeMap<String, Vec<u8>>,
@@ -1415,6 +1433,7 @@ mod tests {
         cut_after: Option<usize>,
         apply_cut_write: bool,
         dead: Cell<bool>,
+        replace: Replace,
     }
 
     impl Mem {
@@ -1432,10 +1451,11 @@ mod tests {
                 _ => Ok(true),
             }
         }
-        /// Power back on: same flash, no cut armed.
+        /// Power back on: same flash and firmware, no cut armed.
         fn reboot(&self) -> Mem {
             Mem {
                 map: self.map.clone(),
+                replace: self.replace,
                 ..Mem::default()
             }
         }
@@ -1444,7 +1464,15 @@ mod tests {
                 map: self.map.clone(),
                 cut_after: Some(cut_after),
                 apply_cut_write: apply,
+                replace: self.replace,
                 ..Mem::default()
+            }
+        }
+        /// The same flash, written from now on with `replace`.
+        fn replacing(&self, replace: Replace) -> Mem {
+            Mem {
+                replace,
+                ..self.reboot()
             }
         }
     }
@@ -1457,6 +1485,14 @@ mod tests {
             Ok(self.map.get(key).cloned())
         }
         fn set(&mut self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+            if self.replace == Replace::EraseFirst && self.map.contains_key(key) {
+                if self.gate()? {
+                    self.map.remove(key);
+                }
+                if self.dead.get() {
+                    return Err(StoreError);
+                }
+            }
             let apply = self.gate()?;
             if apply {
                 self.map.insert(String::from(key), value.to_vec());
@@ -1795,6 +1831,145 @@ mod tests {
         )
         .unwrap();
         assert_eq!(boot_with(&m, PIN_B), Some(seeds()));
+    }
+
+    // -- replacing a value in place ------------------------------------------
+    //
+    // The sweeps above run on `Replace::Direct`, the firmware's write. These
+    // run three in-place replaces both ways: each holds at every cut when the
+    // new value goes straight over the old one, and each has a cut that breaks
+    // it when the key is erased first, the window esp-idf-svc's `set_blob`
+    // leaves open.
+
+    /// The first cut (and whether the step it crossed landed) after which
+    /// `holds` is false on what a reboot finds, or `None` if it holds at every
+    /// cut.
+    fn first_break(
+        start: &Mem,
+        op: &dyn Fn(&mut Mem) -> Result<(), ChangeError>,
+        holds: &dyn Fn(&Mem) -> bool,
+    ) -> Option<(usize, bool)> {
+        let mut clean = start.reboot();
+        op(&mut clean).expect("clean run succeeds");
+        assert!(holds(&clean.reboot()), "the clean run itself must hold");
+        for cut in 0..clean.writes.get() {
+            for apply in [false, true] {
+                let mut m = start.armed(cut, apply);
+                assert!(op(&mut m).is_err(), "cut {cut} was not reached");
+                if !holds(&m.reboot()) {
+                    return Some((cut, apply));
+                }
+            }
+        }
+        None
+    }
+
+    /// Run `op` on `start` with the cut armed after `cut` steps and the step
+    /// that crosses it landing, and return what the reboot finds.
+    fn cut_at(start: &Mem, cut: usize, op: &dyn Fn(&mut Mem) -> Result<(), ChangeError>) -> Mem {
+        let mut m = start.armed(cut, true);
+        assert!(op(&mut m).is_err(), "cut {cut} was not reached");
+        m.reboot()
+    }
+
+    #[test]
+    fn a_secret_change_on_a_sealed_board_needs_the_wrapper_replaced_in_one_step() {
+        let mut start = legacy_board(PIN_A);
+        let dk = unlock_and_migrate(&mut start, PIN_A).unwrap().dk;
+        let op = |m: &mut Mem| {
+            set_secret(m, PIN_B, &seeds(), dk, &CheapKdf, &mut Board::default()).map(|_| ())
+        };
+        let one_secret_opens = |m: &Mem| {
+            (boot_with(m, PIN_A) == Some(seeds())) ^ (boot_with(m, PIN_B) == Some(seeds()))
+        };
+        assert_eq!(
+            first_break(&start.replacing(Replace::Direct), &op, &one_secret_opens),
+            None
+        );
+
+        // Erase-first: every seed is already under DK, so the wrapper is the
+        // only write, and a cut after its erase leaves sealed seeds with no
+        // `dk_sec`. Neither secret opens the board; only a phone still can.
+        let erase_first = start.replacing(Replace::EraseFirst);
+        assert_eq!(
+            first_break(&erase_first, &op, &one_secret_opens),
+            Some((0, true))
+        );
+        let m = cut_at(&erase_first, 0, &op);
+        assert!(!m.map.contains_key(SECRET_WRAP_KEY));
+        for secret in [PIN_A, PIN_B] {
+            assert!(matches!(
+                unlock_with_secret(&m, &SLOTS, secret, &CheapKdf, &mut Board::default()),
+                Err(UnlockError::Damaged(_))
+            ));
+        }
+        assert_eq!(
+            unlock_with_data_key(&m, &SLOTS, &dk.unwrap()).unwrap().seeds,
+            seeds()
+        );
+    }
+
+    #[test]
+    fn migration_needs_each_seed_resealed_in_one_step() {
+        let start = legacy_board(PIN_A);
+        let op = |m: &mut Mem| unlock_and_migrate(m, PIN_A).map(|_| ());
+        let opens = |m: &Mem| boot_with(m, PIN_A) == Some(seeds());
+        assert_eq!(first_break(&start.replacing(Replace::Direct), &op, &opens), None);
+
+        // Erase-first: `dk_sec` is a first write (step 0); slot 0's reseal
+        // then erases its secret-sealed seed (step 1) before writing the DK
+        // seal. A cut between the two leaves the slot with no seed at all.
+        let erase_first = start.replacing(Replace::EraseFirst);
+        assert_eq!(first_break(&erase_first, &op, &opens), Some((1, true)));
+        let m = cut_at(&erase_first, 1, &op);
+        assert!(!m.map.contains_key(&seed_enc_key(0)));
+        assert!(!m.map.contains_key(&seed_plain_key(0)));
+    }
+
+    /// The note locker's key record, `NK_KEY` in firmware/src/notes.rs.
+    const NOTE_KEY_RECORD: &str = "nk";
+
+    #[test]
+    fn re_wrapping_the_note_key_needs_one_step() {
+        let mut board = legacy_board(PIN_A);
+        let dk = unlock_and_migrate(&mut board, PIN_A).unwrap().dk.unwrap();
+        let note_key = [0x5a; 32];
+        // The two forms `sync_sealed` replaces in place: a wrap under the
+        // secret that earlier firmware wrote, moved onto DK at the next
+        // unlock, and a DK seal, resealed when the secret changes.
+        let under_secret =
+            seed_cipher::encrypt_seed_with_iterations(PIN_A, &note_key, &[7; 16], &[7; 12], 2);
+        let under_dk = seal_note_key(&dk, &note_key, &[8; NONCE_LEN]).to_vec();
+
+        // The firmware's re-wrap: seal under DK, check it, replace `nk`.
+        let op = |m: &mut Mem| {
+            let sealed = seal_note_key(&dk, &note_key, &[9; NONCE_LEN]);
+            set_verified(m, NOTE_KEY_RECORD, &sealed, "note key read-back")
+        };
+        // What the next unlock needs: an `nk` that opens to the key the notes
+        // are sealed under. With no `nk` at all, `sync_sealed` mints a fresh
+        // key and every sealed note stays sealed for good.
+        let notes_keep_their_key = |m: &Mem| match m.map.get(NOTE_KEY_RECORD) {
+            Some(b) if is_sealed(b) => open_note_key(&dk, b).ok() == Some(note_key),
+            Some(b) => seed_cipher::decrypt_seed(PIN_A, b).ok() == Some(note_key),
+            None => false,
+        };
+
+        for stored in [under_secret, under_dk] {
+            let mut start = board.reboot();
+            start.set(NOTE_KEY_RECORD, &stored).unwrap();
+            assert!(notes_keep_their_key(&start));
+            assert_eq!(
+                first_break(&start.replacing(Replace::Direct), &op, &notes_keep_their_key),
+                None
+            );
+            let erase_first = start.replacing(Replace::EraseFirst);
+            assert_eq!(
+                first_break(&erase_first, &op, &notes_keep_their_key),
+                Some((0, true))
+            );
+            assert!(!cut_at(&erase_first, 0, &op).map.contains_key(NOTE_KEY_RECORD));
+        }
     }
 
     #[test]

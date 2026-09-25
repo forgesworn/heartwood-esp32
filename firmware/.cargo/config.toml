@@ -21,6 +21,15 @@ runner = "espflash flash --monitor"
 
 [unstable]
 build-std = ["std", "panic_abort"]
+# Cargo's default build-std feature set minus `backtrace`. That feature links
+# std's backtrace symboliser (gimli, addr2line, object, miniz_oxide and the
+# demangler), about 134 KB of app image on the Heltec builds, and it can never
+# run here: the default panic hook only symbolises when RUST_BACKTRACE is set,
+# nothing sets it on ESP-IDF, and every board builds with its console off, so
+# there is nowhere to print a trace either. Panics still abort into the ESP-IDF
+# panic handler, reset as ESP_RST_PANIC and leave the crash crumb exactly as
+# before; the target's panic strategy was already abort.
+build-std-features = ["panic-unwind", "default"]
 
 [env]
 MCU = "esp32s3"

@@ -810,7 +810,7 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
         #[cfg(feature = "cash")]
         "cash_address_proof" => {
             // LUD-25's registration proof: the branch cash_address hands out
-            // for this host signs, with its index-0 key, the fixed message
+            // for this host signs, with its purpose-0 index-0 key, the fixed message
             // that registers or unregisters one username at one mint. It
             // decides where a name's payments go, so it is a hold, and the
             // card shows all three things the signature commits to.
@@ -878,12 +878,15 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
                     None => return err_msg("bad_request", "p is not a cp1"),
                 },
             };
-            let (secret, pubkey) =
+            // With `p`, the key is looked for on purpose 2 and then on the
+            // pre-purpose ladder; without it, purpose 2 alone
+            // (cash_key::claim_note_key).
+            let (secret, key) =
                 match crate::cash_key::claim_note_key(identity, branch, index, expected.as_ref()) {
                     Ok(found) => found,
                     Err(m) => return err_msg("bad_request", m),
                 };
-            let key = crate::note_store::KeyNote { index, pubkey };
+            let pubkey = key.pubkey;
             match ctx
                 .store
                 .import_key(ctx.storage, ctx.rng, &secret, key, host, amount, sig, ctx.now)
@@ -3059,7 +3062,8 @@ mod tests {
     #[test]
     fn a_claimed_key_note_lists_its_key_and_exports_its_ck1() {
         let mut h = Harness::new();
-        let (_, pubkey) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        let (_, key) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        let pubkey = key.pubkey;
         let cp1 = crate::encoding::encode_cp1(&pubkey);
         let claim = format!(
             r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":21000,"p":"{cp1}"}}"#
@@ -3080,8 +3084,7 @@ mod tests {
         let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
         let k1 = res["k1"].as_str().unwrap();
         assert!(k1.starts_with("ck1"), "{k1}");
-        let (secret, pubkey) =
-            crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        let (secret, _) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
         // The 96-byte key-path spend, bound to the note's own mint.
         assert_eq!(k1, crate::cash_key::ck1_of(&secret, "moneyer.dev").unwrap());
         assert!(matches!(
@@ -3098,16 +3101,61 @@ mod tests {
     }
 
     #[test]
+    fn a_note_paid_before_purposes_is_claimed_and_spends_from_its_own_key() {
+        // notecase walks the old ladder too and names the key it found: the
+        // device finds it there, stores it as that ladder's, and it exports
+        // the old key's ck1 across a reload.
+        use crate::cash_key::{KeyLadder, PURPOSE_ADDRESS};
+        use crate::note_store::decode_note;
+        let mut h = Harness::new();
+        let node = crate::cash_key::address_node(&[7u8; 32], "moneyer.dev").unwrap();
+        let old = crate::cash_key::note_secret_key(&node, KeyLadder::PrePurpose, 12).unwrap();
+        let old_pubkey = crate::cash_key::note_pubkey(&old).unwrap();
+        let cp1 = crate::encoding::encode_cp1(&old_pubkey);
+        let res = h.run(&format!(
+            r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":21000,"p":"{cp1}"}}"#
+        ));
+        assert_eq!((res["ok"].clone(), res["p"].clone()), (json!(true), json!(cp1)), "{res}");
+        let old_id = res["id"].as_str().unwrap().to_string();
+        // The same index on purpose 2 is another note, and both are kept.
+        let (_, current) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        assert_eq!(current.ladder, KeyLadder::Purpose(PURPOSE_ADDRESS));
+        let res = h.run(&format!(
+            r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":5000,"p":"{}"}}"#,
+            crate::encoding::encode_cp1(&current.pubkey)
+        ));
+        assert_eq!(res["created"], true, "{res}");
+        let new_id = res["id"].as_str().unwrap().to_string();
+
+        // Each blob says which ladder it is on: the old one is v3, as every
+        // key note stored before purposes already is.
+        let stored = |id: &str| decode_note(h.storage.notes.get(id).unwrap()).unwrap().key.unwrap();
+        assert_eq!(stored(&old_id).ladder, KeyLadder::PrePurpose);
+        assert_eq!(h.storage.notes.get(&old_id).unwrap()[4], 3);
+        assert_eq!(stored(&new_id).ladder, KeyLadder::Purpose(PURPOSE_ADDRESS));
+
+        h.store = NoteStore::load(&mut h.storage, MAX_NOTES).store;
+        let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{old_id}"}}"#));
+        assert_eq!(res["k1"], crate::cash_key::ck1_of(&old, "moneyer.dev").unwrap().as_str());
+    }
+
+    #[test]
     fn a_claim_for_a_key_this_device_would_not_derive_is_refused() {
         let mut h = Harness::new();
-        let (_, pubkey) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
-        let cp1 = crate::encoding::encode_cp1(&pubkey);
+        let (_, key) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        let cp1 = crate::encoding::encode_cp1(&key.pubkey);
         for (index, host) in [(13, "moneyer.dev/w"), (12, "mint.example/w")] {
             let res = h.run(&format!(
                 r#"{{"cmd":"claim_key_note","host":"{host}","index":{index},"amount_msat":1000,"p":"{cp1}"}}"#
             ));
             assert_eq!(res["error"], "bad_request", "{host} {index}");
         }
+        // A key on no ladder of this branch at all.
+        let foreign = crate::encoding::encode_cp1(&[0x42; 32]);
+        let res = h.run(&format!(
+            r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":1000,"p":"{foreign}"}}"#
+        ));
+        assert_eq!(res["error"], "bad_request");
         for bad in [
             r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":4294967296,"amount_msat":1000}"#,
             r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000,"p":"cp1nope"}"#,

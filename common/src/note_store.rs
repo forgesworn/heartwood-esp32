@@ -79,6 +79,13 @@ const NOTE_VERSION: u8 = 2;
 /// predates key notes still reads every note it could read before and skips
 /// (never deletes) the ones it cannot.
 const KEY_NOTE_VERSION: u8 = 3;
+/// v4 is v3 plus the LUD-25 derivation purpose its key was derived on
+/// ([`KeyLadder::Purpose`]), as a big-endian u32 after the pubkey. Written
+/// ONLY for those: a key from the pre-purpose ladder stays byte-identical v3,
+/// and every v3 blob already on a board reads as [`KeyLadder::PrePurpose`],
+/// which is what it was derived on. A firmware that predates purposes skips
+/// (never deletes) a v4 note, as it does any version it cannot read.
+const PURPOSE_KEY_NOTE_VERSION: u8 = 4;
 
 /// `pending` → `confirmed` → `spent`, exactly the vault lifecycle: a secret
 /// exists and its hash may be registered mint-side (PENDING), the mint has
@@ -137,10 +144,31 @@ pub enum Peer {
 ///
 /// `index` is where on the owner's address branch the key sits: kept so a
 /// wallet scanning that branch can tell which keys this locker already holds.
+/// `ladder` says which of the branch's counters that index is on. Neither is
+/// needed to spend: `secret` is the key itself, so a note exports the same
+/// `ck1` whichever ladder it came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyNote {
     pub index: u32,
     pub pubkey: [u8; 32],
+    pub ladder: KeyLadder,
+}
+
+/// Which of a branch's derivations a key note's key sits on.
+///
+/// LUD-25 splits a branch into independent counters by purpose (0 wallet,
+/// 1 change, 2 lightning address, `cash_key::PURPOSE_*`) and hashes
+/// `ser32(purpose)` in ahead of the index. This firmware derived keys before
+/// that, with no purpose in the hash at all, and a mint has paid notes to
+/// those keys, so that ladder is a value of its own here rather than a
+/// purpose number nobody uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyLadder {
+    /// `t = tagged_hash("LNURLcash/derive", P || chaincode || ser32(i))`:
+    /// every key note stored before purposes (a v3 blob).
+    PrePurpose,
+    /// `t = tagged_hash("LNURLcash/derive", P || chaincode || ser32(purpose) || ser32(i))`.
+    Purpose(u32),
 }
 
 /// A held note, secret included. Never serialise this onto a wire — that is
@@ -347,7 +375,11 @@ pub fn encode_note(note: &Note) -> Result<Vec<u8>, &'static str> {
     }
     let mut out = Vec::with_capacity(64 + SECRET_LEN + note.host.len() + note.label.len());
     out.extend_from_slice(&NOTE_MAGIC);
-    out.push(if note.key.is_some() { KEY_NOTE_VERSION } else { NOTE_VERSION });
+    out.push(match note.key {
+        None => NOTE_VERSION,
+        Some(KeyNote { ladder: KeyLadder::PrePurpose, .. }) => KEY_NOTE_VERSION,
+        Some(KeyNote { ladder: KeyLadder::Purpose(_), .. }) => PURPOSE_KEY_NOTE_VERSION,
+    });
     out.extend_from_slice(note.id.as_bytes());
     out.push(note.state.to_byte());
     out.extend_from_slice(&note.amount_msat.to_be_bytes());
@@ -381,6 +413,9 @@ pub fn encode_note(note: &Note) -> Result<Vec<u8>, &'static str> {
     if let Some(key) = note.key {
         out.extend_from_slice(&key.index.to_be_bytes());
         out.extend_from_slice(&key.pubkey);
+        if let KeyLadder::Purpose(purpose) = key.ladder {
+            out.extend_from_slice(&purpose.to_be_bytes());
+        }
     }
     Ok(out)
 }
@@ -394,7 +429,7 @@ pub fn decode_note(blob: &[u8]) -> Option<Note> {
         return None;
     }
     let version = r.u8()?;
-    if !(1..=KEY_NOTE_VERSION).contains(&version) {
+    if !(1..=PURPOSE_KEY_NOTE_VERSION).contains(&version) {
         return None;
     }
     let id = r.str_exact(ID_LEN)?;
@@ -435,8 +470,15 @@ pub fn decode_note(blob: &[u8]) -> Option<Note> {
     } else {
         None
     };
-    let key = if version == KEY_NOTE_VERSION {
-        Some(KeyNote { index: r.u32()?, pubkey: r.take(32)?.try_into().ok()? })
+    let key = if version >= KEY_NOTE_VERSION {
+        let index = r.u32()?;
+        let pubkey = r.take(32)?.try_into().ok()?;
+        let ladder = if version == PURPOSE_KEY_NOTE_VERSION {
+            KeyLadder::Purpose(r.u32()?)
+        } else {
+            KeyLadder::PrePurpose
+        };
+        Some(KeyNote { index, pubkey, ladder })
     } else {
         None
     };
@@ -1627,7 +1669,7 @@ mod tests {
     fn key_note() -> Note {
         let mut note = sample_note();
         note.sig = CS1.to_string();
-        note.key = Some(KeyNote { index: 4_000_000_000, pubkey: [0x5d; 32] });
+        note.key = Some(KeyNote { index: 4_000_000_000, pubkey: [0x5d; 32], ladder: KeyLadder::PrePurpose });
         note
     }
 
@@ -1685,7 +1727,12 @@ mod tests {
         let blob = encode_note(&key_note()).unwrap();
         assert_eq!(blob[4], KEY_NOTE_VERSION);
         let back = decode_note(&blob).unwrap();
-        assert_eq!(back.key, Some(KeyNote { index: 4_000_000_000, pubkey: [0x5d; 32] }));
+        // Every v3 blob is a key from the pre-purpose ladder, which is what
+        // each one already on a board was derived on.
+        assert_eq!(
+            back.key,
+            Some(KeyNote { index: 4_000_000_000, pubkey: [0x5d; 32], ladder: KeyLadder::PrePurpose })
+        );
         assert_eq!(back.sig, CS1);
         assert_eq!(back.secret, [7u8; SECRET_LEN]);
 
@@ -1704,6 +1751,43 @@ mod tests {
         let mut long = blob.clone();
         long.push(0);
         assert!(decode_note(&long).is_none());
+    }
+
+    #[test]
+    fn a_key_on_a_purpose_round_trips_as_v4_and_the_old_ladder_stays_v3() {
+        let v3 = encode_note(&key_note()).unwrap();
+        for purpose in [0, 1, 2, u32::MAX] {
+            let mut note = key_note();
+            note.key = Some(KeyNote {
+                index: 4_000_000_000,
+                pubkey: [0x5d; 32],
+                ladder: KeyLadder::Purpose(purpose),
+            });
+            let v4 = encode_note(&note).unwrap();
+            assert_eq!(v4[4], PURPOSE_KEY_NOTE_VERSION);
+            // v3 plus the purpose, and nothing else moved.
+            assert_eq!(v4.len(), v3.len() + 4);
+            assert_eq!(v4[5..v3.len()], v3[5..]);
+            assert_eq!(v4[v3.len()..], purpose.to_be_bytes());
+            let back = decode_note(&v4).unwrap();
+            assert_eq!(back.key, note.key, "purpose {purpose}");
+            assert_eq!(back.secret, [7u8; SECRET_LEN]);
+            // Short of its purpose, or with a byte too many, it is refused.
+            assert!(decode_note(&v4[..v4.len() - 1]).is_none());
+            let mut long = v4.clone();
+            long.push(0);
+            assert!(decode_note(&long).is_none());
+        }
+        // A v3 blob relabelled v4 is short of its purpose, not a purpose-0 key.
+        let mut relabelled = v3.clone();
+        relabelled[4] = PURPOSE_KEY_NOTE_VERSION;
+        assert!(decode_note(&relabelled).is_none());
+        // And a v4 relabelled v3 carries four bytes it does not explain.
+        let mut note = key_note();
+        note.key = Some(KeyNote { index: 1, pubkey: [0x5d; 32], ladder: KeyLadder::Purpose(2) });
+        let mut v4 = encode_note(&note).unwrap();
+        v4[4] = KEY_NOTE_VERSION;
+        assert!(decode_note(&v4).is_none());
     }
 
     #[test]
@@ -1729,7 +1813,7 @@ mod tests {
         let mut storage = FakeStorage::new();
         let mut store = fresh_store(&mut storage);
         let mut rng = test_rng();
-        let key = KeyNote { index: 2, pubkey: [0x11; 32] };
+        let key = KeyNote { index: 2, pubkey: [0x11; 32], ladder: KeyLadder::Purpose(2) };
         let (id, created) = store
             .receive(&mut storage, &mut rng, &[0x42; SECRET_LEN], Some(key), "moneyer.dev/w", 21_000, CS1, &[0xaa; 32], 1, true)
             .unwrap();
@@ -1745,7 +1829,7 @@ mod tests {
         assert_eq!(store.can_send(&id), Err(NoteError::InvalidState));
 
         // A scan claim is an import: no peer, and so not in the letterbox.
-        let other = KeyNote { index: 3, pubkey: [0x12; 32] };
+        let other = KeyNote { index: 3, pubkey: [0x12; 32], ladder: KeyLadder::PrePurpose };
         let (claimed, _) = store
             .import_key(&mut storage, &mut rng, &[0x43; SECRET_LEN], other, "moneyer.dev/w", 5_000, "", 3)
             .unwrap();
@@ -1779,7 +1863,7 @@ mod tests {
         let mut storage = FakeStorage::new();
         let mut store = fresh_store(&mut storage);
         let mut rng = test_rng();
-        let key = KeyNote { index: 0, pubkey };
+        let key = KeyNote { index: 0, pubkey, ladder: KeyLadder::Purpose(0) };
         let (id, _) = store
             .import_key(&mut storage, &mut rng, &secret, key, "mint.example/w", 1_000, "", 1)
             .unwrap();
@@ -2231,7 +2315,7 @@ mod tests {
         drop(reveal);
 
         // A Part 2 record's secret is a signing key, never a `k1`.
-        store.notes[0].key = Some(KeyNote { index: 0, pubkey: [9u8; 32] });
+        store.notes[0].key = Some(KeyNote { index: 0, pubkey: [9u8; 32], ladder: KeyLadder::PrePurpose });
         assert_eq!(store.offline_revealable_count(), 0);
         assert!(store.offline_revealable_at(0).is_none());
     }
@@ -2747,7 +2831,7 @@ mod tests {
                 storage,
                 &mut rng,
                 &key_secret,
-                KeyNote { index: 9, pubkey: [0x5d; 32] },
+                KeyNote { index: 9, pubkey: [0x5d; 32], ladder: KeyLadder::Purpose(2) },
                 "moneyer.dev/w",
                 1_000,
                 "",

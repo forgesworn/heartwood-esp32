@@ -2644,6 +2644,33 @@ fails there by design until it is upgraded.
    same proof twice quickly: one card, one hold, both answered with the same
    `sig`.
 
+Items 7 to 10 (added 2026-09-26) cover LUD-25's derivation purposes
+(lnurl/luds lnurlcash 50d740a): a mint now pays a name on purpose 2, the
+registration proof is signed on purpose 0, and a note paid before purposes
+is still this device's. Run them against a mint that credits zaps on purpose
+2 and checks the proof against purpose 0 index 0 (moneyer's taproot build).
+Do items 9 and 10 BEFORE flashing this build if the board still holds a key
+note from the older firmware, and write down its id and `p` first.
+
+7. **A zap lands on purpose 2 and opens.** Pay the device's lightning address.
+   The wrap opens (RECEIVE card, or a trusted store), `list_notes` shows the
+   note with the `p` the mint minted to and its `index`, and it collects as
+   in item 1. A second zap takes the next index.
+8. **The proof item 4 signs is the one the mint now checks.** Repeat item 4
+   on this build: the mint accepts it. The same name's proof from the
+   previous build (index 0 with no purpose) must now be refused by the mint,
+   which is the change working, not a fault.
+9. **A note paid before purposes survives the flash.** On a board holding a
+   key note from the older firmware, flash this build (release, app only).
+   The note is still listed with the same id, `p` and `index`, and collects
+   with its ck1 as before.
+10. **A scan still finds the old ladder.** Run notecase's scan on a board
+    that does not hold a note the branch has on the old ladder (a second
+    board provisioned with the same identity is the safe way; a factory
+    reset erases the notes). The claim succeeds with that note's `p`, the
+    note lists, and its export collects. A claim naming a `p` from another identity, or another mint,
+    answers `bad_request` and stores nothing.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

@@ -175,7 +175,7 @@ part2.json and tests/fixtures/lud25-nostr-seed.json on both curve backends). The
 mint holds only the cx1 (heartwood_note_address, no hold); a key-note wrap
 carries p/i/sig and no secret, and is opened only if the key is ours
 (note_wrap::open_note_rumor). A key note stores its key as the secret plus
-KeyNote {index, pubkey} (a v3 blob, written only for key notes), exports a
+KeyNote {index, pubkey, ladder} (a v3 or v4 blob, written only for key notes), exports a
 ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim)
 derives the key itself.
 
@@ -193,10 +193,34 @@ as the short form and turns into Q itself); `confirm` and wraps now keep a cs1
 whose HRP carries the amount (`cs10n1...`), which a unified mint sends for
 every note. Live moneyer (0.16.x) does not yet accept the domain-bound ck1.
 heartwood_note_address_proof (pinned, REGISTER NAME / UNREGISTER NAME card)
-signs LUD-25's registration proof with the address branch's index-0 key over
-the fixed sha256("LNURLcash:<action>:<domain>:<username>") and nothing else.
-The address branch is still m/139'/1'/d1..d4, one hardened level below the
-spec's m/139'/d1..d4; moving it would move every key note already paid.
+signs LUD-25's registration proof with the address branch's purpose-0
+index-0 key over the fixed sha256("LNURLcash:<action>:<domain>:<username>")
+and nothing else. The address branch is still m/139'/1'/d1..d4, one hardened
+level below the spec's m/139'/d1..d4; moving it would move every key note
+already paid.
+
+LUD-25 derivation purposes (lnurl/luds lnurlcash 50d740a; vectors 1 to 3
+re-copied into tests/fixtures/lud25-taproot.json, every purpose-table value
+graded): the note tweak is now tagged_hash("LNURLcash/derive", P ||
+chaincode || ser32(purpose) || ser32(i)) mod n, purpose 0 the wallet's own
+notes, 1 split change, 2 what a mint credits to a lightning address
+(auto-mint and internal transfer). The address proof moved to purpose 0
+index 0, which is the key a unified mint checks it against. The tweak
+without ser32(purpose), which is what this firmware derived before, is
+note_store::KeyLadder::PrePurpose (graded against 6e865b1's old values and
+the kit's part2/nostr-seed fixtures), and notes a mint already paid there
+stay ours: claim_note_key, given the key the note is paid to (every wrap,
+and notecase's scan, which walks purpose 2 and the old ladder), tries
+purpose 2 then the pre-purpose ladder and keeps whichever matches, refusing
+a key on neither with the same error as before; without `p` (still
+optional on heartwood_note_claim, wire unchanged) it takes purpose 2 alone.
+A stored key note records its ladder: a pre-purpose key stays a
+byte-identical v3 blob, every existing v3 reads as PrePurpose, and a key on
+a purpose is a v4 blob (v3 plus a big-endian u32 purpose), which firmware
+older than this skips and never deletes. The ladder is not needed to spend
+(the key is the stored secret), and neither list_notes' `index` nor the
+backup inventory's `key_index` says which ladder: a wallet names notes by
+`p`. Nothing bench-run: checklist section 31.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

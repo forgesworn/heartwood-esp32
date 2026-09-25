@@ -113,7 +113,7 @@ pub enum Nip46Method {
     HeartwoodNoteClaim,
     /// LUD-25's proof that registers or unregisters a lightning-address
     /// username against the served identity's address branch at a mint: the
-    /// branch's index-0 key over the fixed
+    /// branch's purpose-0 index-0 key over the fixed
     /// `LNURLcash:<action>:<domain>:<username>`. It changes where a name's
     /// payments go, so it is pinned to the button like a trust.
     HeartwoodNoteAddressProof,

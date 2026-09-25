@@ -1121,6 +1121,7 @@ pub fn open_note_key(dk: &[u8; DK_LEN], blob: &[u8]) -> Result<[u8; 32], SealErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nvs_budget;
     use alloc::collections::BTreeMap;
     use core::cell::Cell;
 
@@ -1440,6 +1441,14 @@ mod tests {
         apply_cut_write: bool,
         dead: Cell<bool>,
         replace: Replace,
+        /// A partition of this many entries. Replaces then go through
+        /// `nvs_budget::plan_replace` as the firmware's `ReplaceBlob` does:
+        /// in place when the new copy fits beside the old, erase-first only
+        /// for a revocation of a key that allows it, otherwise refused with
+        /// the old value intact. `None` is unlimited, and `replace` decides.
+        capacity: Option<usize>,
+        /// Writes are revocations (`data_key_store::RevokingBlobs`).
+        revoking: bool,
     }
 
     impl Mem {
@@ -1462,16 +1471,32 @@ mod tests {
             Mem {
                 map: self.map.clone(),
                 replace: self.replace,
+                capacity: self.capacity,
+                revoking: self.revoking,
                 ..Mem::default()
             }
         }
         fn armed(&self, cut_after: usize, apply: bool) -> Mem {
             Mem {
-                map: self.map.clone(),
                 cut_after: Some(cut_after),
                 apply_cut_write: apply,
-                replace: self.replace,
-                ..Mem::default()
+                ..self.reboot()
+            }
+        }
+        /// Entries the stored values occupy (their lower bound, which is
+        /// what `available_entries` would count as used).
+        fn used(&self) -> usize {
+            self.map.values().map(|v| nvs_budget::stored_entries_min(v.len())).sum()
+        }
+        fn available(&self) -> usize {
+            self.capacity.map_or(usize::MAX, |c| c.saturating_sub(self.used()))
+        }
+        /// The same flash in a partition of `capacity` entries.
+        fn limited(&self, capacity: usize, revoking: bool) -> Mem {
+            Mem {
+                capacity: Some(capacity),
+                revoking,
+                ..self.reboot()
             }
         }
         /// The same flash, written from now on with `replace`.
@@ -1491,7 +1516,21 @@ mod tests {
             Ok(self.map.get(key).cloned())
         }
         fn set(&mut self, key: &str, value: &[u8]) -> Result<(), StoreError> {
-            if self.replace == Replace::EraseFirst && self.map.contains_key(key) {
+            if self.dead.get() {
+                return Err(StoreError);
+            }
+            let erase_first = match self.capacity {
+                None => self.replace == Replace::EraseFirst,
+                Some(_) => {
+                    let old = self.map.get(key).map(Vec::len);
+                    match nvs_budget::plan_replace(key, self.available(), old, value.len(), self.revoking) {
+                        nvs_budget::Plan::Direct => false,
+                        nvs_budget::Plan::EraseFirst => true,
+                        nvs_budget::Plan::Refuse => return Err(StoreError),
+                    }
+                }
+            };
+            if erase_first && self.map.contains_key(key) {
                 if self.gate()? {
                     self.map.remove(key);
                 }
@@ -2348,5 +2387,131 @@ mod tests {
             open(&dk, Purpose::Seed, &blob),
             Err(SealError::WrongPurpose)
         );
+    }
+
+    // -- a full partition ----------------------------------------------------
+    //
+    // A replace holds two copies at once, so on a full board it may not fit.
+    // The capacity-limited store runs the firmware's plan (`nvs_budget`):
+    // growth is gated so a later revocation still fits in place, and a board
+    // already past the gate revokes by erasing first rather than failing.
+
+    #[test]
+    fn the_fallback_policy_names_this_modules_keys() {
+        use nvs_budget::{fallback_for, Fallback};
+        assert_eq!(fallback_for(PHONES_KEY), Fallback::EraseFirstOnRevoke);
+        for key in [SECRET_WRAP_KEY, SECRET_KIND_KEY] {
+            assert_eq!(fallback_for(key), Fallback::Never, "{key}");
+        }
+        for slot in 0..8 {
+            assert_eq!(fallback_for(&seed_enc_key(slot)), Fallback::Never);
+            assert_eq!(fallback_for(&seed_plain_key(slot)), Fallback::Never);
+        }
+    }
+
+    /// A migrated board with `n` phones enrolled (ids 1..=n).
+    fn board_with_phones(n: u32) -> (Mem, [u8; DK_LEN], PhoneSet) {
+        let mut m = legacy_board(PIN_A);
+        let dk = unlock_and_migrate(&mut m, PIN_A).unwrap().dk.unwrap();
+        let mut phones = PhoneSet::default();
+        for id in 1..=n {
+            phones.enrol(id, "phone", &s(id as u8), &dk, &[id as u8; 12]).unwrap();
+        }
+        save_phones(&mut m, &phones).unwrap();
+        (m.reboot(), dk, phones)
+    }
+
+    fn phone_ids(m: &Mem) -> Vec<u32> {
+        load_phones(m).unwrap().records().iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn revoking_a_phone_on_a_full_board_still_revokes() {
+        let (m, dk, mut phones) = board_with_phones(MAX_PHONES as u32);
+        phones.revoke(3).unwrap();
+        // The bench V4's measured headroom: far less than a second copy.
+        let capacity = m.used() + 17;
+
+        // A plain replace cannot fit, so it is refused and phone 3 keeps
+        // its unlock. This is what a revocation must not do.
+        let mut plain = m.limited(capacity, false);
+        assert!(save_phones(&mut plain, &phones).is_err());
+        assert!(phone_ids(&plain.reboot()).contains(&3));
+
+        let mut revoking = m.limited(capacity, true);
+        save_phones(&mut revoking, &phones).unwrap();
+        let after = revoking.reboot();
+        assert!(!phone_ids(&after).contains(&3));
+        let loaded = load_phones(&after).unwrap();
+        assert!(loaded.unwrap(3, &s(3)).is_err());
+        assert_eq!(loaded.unwrap(4, &s(4)).unwrap(), dk);
+        assert_eq!(boot_with(&after, PIN_A), Some(seeds()));
+    }
+
+    #[test]
+    fn an_erase_first_revocation_never_authorises_a_phone_it_did_not_have() {
+        let (m, _, mut phones) = board_with_phones(MAX_PHONES as u32);
+        let before = phone_ids(&m);
+        phones.revoke(3).unwrap();
+        let start = m.limited(m.used() + 17, true);
+        let saw_absent = Cell::new(false);
+        let writes = sweep(
+            &start,
+            &|m| save_phones(m, &phones),
+            &|m, cut, apply| {
+                let ids = phone_ids(m);
+                assert!(ids.iter().all(|id| before.contains(id)), "cut {cut} apply {apply}");
+                if !m.map.contains_key(PHONES_KEY) {
+                    saw_absent.set(true);
+                }
+                // The secret opens the board whatever the phones.
+                assert_eq!(boot_with(m, PIN_A), Some(seeds()), "cut {cut} apply {apply}");
+            },
+        );
+        assert_eq!(writes, 2, "an erase and a write");
+        assert!(saw_absent.get(), "the sweep reached the erase-first window");
+    }
+
+    #[test]
+    fn the_growth_gate_keeps_a_later_revocation_in_place() {
+        let (m, dk, _) = board_with_phones(0);
+        let mut m = m.limited(m.used() + 150, false);
+        let mut phones = PhoneSet::default();
+        let mut enrolled = 0u32;
+        for id in 1..=MAX_PHONES as u32 {
+            let mut next = phones.clone();
+            next.enrol(id, "phone", &s(id as u8), &dk, &[id as u8; 12]).unwrap();
+            let old = m.map.get(PHONES_KEY).map(Vec::len);
+            let new = next.encode().len();
+            if !nvs_budget::growth_allowed(m.available(), old, new, new) {
+                break;
+            }
+            save_phones(&mut m, &next).unwrap();
+            phones = next;
+            enrolled = id;
+        }
+        assert!(enrolled > 1 && (enrolled as usize) < MAX_PHONES, "the gate stopped enrolment at {enrolled}");
+
+        // Revoking any one of them is an in-place replace: old or new at
+        // every cut, never no phones at all, even with the fallback allowed.
+        let full = m.reboot().limited(m.capacity.unwrap(), true);
+        let before = phone_ids(&full);
+        for id in 1..=enrolled {
+            let mut fewer = phones.clone();
+            fewer.revoke(id).unwrap();
+            if fewer.is_empty() {
+                continue;
+            }
+            let after = fewer.records().iter().map(|r| r.id).collect::<Vec<_>>();
+            let writes = sweep(
+                &full,
+                &|m| save_phones(m, &fewer),
+                &|m, cut, apply| {
+                    let ids = phone_ids(m);
+                    assert!(ids == before || ids == after, "id {id} cut {cut} apply {apply}");
+                },
+            );
+            assert_eq!(writes, 1, "id {id}: one in-place write");
+        }
     }
 }

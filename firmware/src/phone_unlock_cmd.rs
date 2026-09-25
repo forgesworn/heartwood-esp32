@@ -28,7 +28,7 @@ use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_PHONE_UNLOCK_RESP};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::data_key_store::{self, NvsBlobs};
+use crate::data_key_store::{self, NvsBlobs, RevokingBlobs};
 use crate::masters::LoadedMaster;
 use crate::serial::SerialPort;
 
@@ -88,6 +88,14 @@ fn save(nvs: &mut EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(), String> {
         .map_err(|_| "phone storage full or failing: nothing was changed".to_string())
 }
 
+/// Save after a revocation. On a partition with no room for a second copy of
+/// the records this erases them first rather than fail: a cut in between
+/// leaves no phones at all, never the revoked one.
+fn save_revoked(nvs: &mut EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(), String> {
+    data_key::save_phones(&mut RevokingBlobs(nvs), phones)
+        .map_err(|_| "phone storage failing: the phone may not be revoked yet, try again".to_string())
+}
+
 fn configured_relays(nvs: &EspNvs<NvsDefault>) -> Vec<String> {
     crate::net_config_store::read_net_config(nvs)
         .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
@@ -118,7 +126,7 @@ pub fn run(
         PhoneCmd::Revoke { id } => {
             let mut phones = load(nvs)?;
             phones.revoke(id).map_err(|_| format!("no phone with id {id}"))?;
-            save(nvs, &phones)?;
+            save_revoked(nvs, &phones)?;
             PHONES_CHANGED.store(true, Ordering::Release);
             log::info!("phone unlock: revoked phone {id}");
             // No phone listens anywhere now; the next enrolment records afresh.
@@ -176,6 +184,13 @@ pub fn run(
             if phones.records().len() >= data_key::MAX_PHONES {
                 dk.iter_mut().for_each(|b| *b = 0);
                 return Err(format!("{} phones already enrolled; revoke one first", data_key::MAX_PHONES));
+            }
+            // Leave room to rewrite the records (and the pairing tables) in
+            // place afterwards, so a later revocation is cut-safe.
+            let grown = phones.encode().len() + data_key::MAX_RECORD_LEN;
+            if !crate::nvs::growth_allowed(nvs, data_key::PHONES_KEY, grown) {
+                dk.iter_mut().for_each(|b| *b = 0);
+                return Err("not enough storage left to add a phone: remove an unused pairing, persona or avatar first".into());
             }
 
             let title = format!("Add unlock phone?\n{label}");

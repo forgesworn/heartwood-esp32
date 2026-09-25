@@ -20,8 +20,8 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use crate::nvs::ReplaceBlob;
 use heartwood_common::persona_pack::{
     chunk_index, chunk_offset, decode_chunk, encode_chunk, MigrationJournal, MigrationPhase,
-    PackedPersona, PersonaRemovalJournal, PersonaRemovalPhase, CHUNK_CAPACITY, MAX_NAME_LEN,
-    MIGRATION_JOURNAL_LEN, PERSONA_REMOVAL_JOURNAL_LEN,
+    PackedPersona, PersonaRemovalJournal, PersonaRemovalPhase, CHUNK_CAPACITY, MAX_ENTRY_LEN,
+    MAX_NAME_LEN, MIGRATION_JOURNAL_LEN, PERSONA_REMOVAL_JOURNAL_LEN,
 };
 
 /// Labels are cosmetic; clamp to the stored 64-byte bound at a character
@@ -53,7 +53,7 @@ const MIGRATION_JOURNAL_KEY: &str = "pmig_jnl";
 const REMOVAL_JOURNAL_KEY: &str = "prm_jnl";
 
 /// Worst-case encoded chunk: 6-byte header, 16 maximum-length entries, CRC.
-const MAX_CHUNK_LEN: usize = 6 + CHUNK_CAPACITY * 231 + 4;
+const MAX_CHUNK_LEN: usize = 6 + CHUNK_CAPACITY * MAX_ENTRY_LEN + 4;
 
 /// A persisted persona (no secret — re-derived from the owning master on use).
 pub struct LoadedPersona {
@@ -343,11 +343,19 @@ pub fn capacity_check(nvs: &EspNvs<NvsDefault>) -> Result<(), &'static str> {
     if read_count(nvs) >= MAX_PERSONAS {
         return Err("identity storage full: this device holds its maximum number of personas — remove an unused one first");
     }
-    if !crate::nvs_stats::persona_write_allowed() {
-        return Err("identity storage full: not enough flash headroom left — remove an unused persona or app pairing first");
+    // The chunk the next persona lands in grows by at most one entry.
+    let key = chunk_key(chunk_index(read_count(nvs)));
+    let grown = nvs.blob_len(&key).ok().flatten().unwrap_or(0) + MAX_ENTRY_LEN;
+    if !crate::nvs::growth_allowed(nvs, &key, grown) {
+        return Err(STORAGE_FULL);
     }
     Ok(())
 }
+
+/// Refusal when a persona would leave too little NVS room to rewrite the
+/// pairing tables, phone records and persona chunks in place.
+const STORAGE_FULL: &str =
+    "identity storage full: not enough flash headroom left — remove an unused persona or app pairing first";
 
 /// Persist a new persona. The caller is responsible for checking the
 /// in-memory registry first (`contains_pubkey`) so the same identity isn't
@@ -386,6 +394,10 @@ pub fn add(
         purpose: purpose.to_string(),
         name: name.map(|n| clamp_label(n).to_string()),
     });
+    let grown = encode_chunk(&entries)?.len();
+    if !crate::nvs::growth_allowed(nvs, &chunk_key(chunk), grown) {
+        return Err(STORAGE_FULL);
+    }
     write_chunk(nvs, chunk, &entries)?;
     write_packed_count(nvs, count + 1)?;
     log::info!("Stored persona entry {count}: purpose={purpose} index={index}");

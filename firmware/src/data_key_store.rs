@@ -23,22 +23,48 @@ const MAX_BLOB: usize = MAX_PHONES_BLOB_LEN;
 /// never truncated.
 pub struct NvsBlobs<'a>(pub &'a mut EspNvs<NvsDefault>);
 
-impl BlobStore for NvsBlobs<'_> {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        let len = match self.0.blob_len(key) {
+impl NvsBlobs<'_> {
+    fn get_from(nvs: &EspNvs<NvsDefault>, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let len = match nvs.blob_len(key) {
             Ok(None) => return Ok(None),
             Ok(Some(len)) if len <= MAX_BLOB => len,
             Ok(Some(_)) | Err(_) => return Err(StoreError),
         };
         let mut buf = vec![0u8; len.max(1)];
-        match self.0.get_blob(key, &mut buf) {
+        match nvs.get_blob(key, &mut buf) {
             Ok(Some(bytes)) if bytes.len() == len => Ok(Some(bytes.to_vec())),
             _ => Err(StoreError),
         }
     }
+}
+
+impl BlobStore for NvsBlobs<'_> {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Self::get_from(self.0, key)
+    }
 
     fn set(&mut self, key: &str, value: &[u8]) -> Result<(), StoreError> {
         self.0.replace_blob(key, value).map_err(|_| StoreError)
+    }
+
+    fn remove(&mut self, key: &str) -> Result<(), StoreError> {
+        self.0.remove(key).map(|_| ()).map_err(|_| StoreError)
+    }
+}
+
+/// NVS as the data-key store for a revocation: writes go through
+/// `ReplaceBlob::revoke_blob`, so a key whose policy allows it (the phone
+/// records) is still rewritten when the partition has no room for a second
+/// copy, by erasing first. Reads and removes are [`NvsBlobs`]'s.
+pub struct RevokingBlobs<'a>(pub &'a mut EspNvs<NvsDefault>);
+
+impl BlobStore for RevokingBlobs<'_> {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        NvsBlobs::get_from(self.0, key)
+    }
+
+    fn set(&mut self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+        self.0.revoke_blob(key, value).map_err(|_| StoreError)
     }
 
     fn remove(&mut self, key: &str) -> Result<(), StoreError> {

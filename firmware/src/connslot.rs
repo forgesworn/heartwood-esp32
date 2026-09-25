@@ -181,7 +181,7 @@ pub fn handle_update(
                             Some(identity) => { policy_engine.revoke_identity(ms, idx, identity, client).ok_or("pairing not found")??; }
                             None => { policy_engine.clear_identities(ms, idx, client).ok_or("pairing not found")?; }
                         }
-                        if !policy_engine.persist_slots(nvs, ms) {
+                        if !policy_engine.persist_slots_revoking(nvs, ms) {
                             policy_engine.restore_slot_state_durably(nvs, snapshot);
                             return Err("storage_unavailable: consent withdrawal was not saved");
                         }
@@ -336,7 +336,7 @@ pub fn handle_revoke(
         let idx = frame.payload[1];
         let snapshot = policy_engine.snapshot_slot_state(ms);
         if policy_engine.revoke_slot(ms, idx) {
-            if !policy_engine.persist_slots(nvs, ms) {
+            if !policy_engine.persist_slots_revoking(nvs, ms) {
                 policy_engine.restore_slot_state_durably(nvs, snapshot);
                 protocol::write_frame(usb, FRAME_TYPE_NACK, b"storage_unavailable: pairing was not revoked");
                 return;

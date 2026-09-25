@@ -7021,7 +7021,31 @@ fn persist_slot_mutation_or_rollback(
     snapshot: crate::policy::SlotStateSnapshot,
     action: &str,
 ) -> Result<(), String> {
-    if ctx.policy_engine.persist_slots(ctx.nvs, master_slot) {
+    let persisted = ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+    finish_slot_mutation(ctx, persisted, snapshot, action)
+}
+
+/// As [`persist_slot_mutation_or_rollback`], for a mutation that only removes
+/// authority: on a partition with no room for a second copy of the table it
+/// is still written (erased first) rather than refused, so the revoked party
+/// does not keep its access (`PolicyEngine::persist_slots_revoking`).
+fn persist_revocation_or_rollback(
+    ctx: &mut SignCtx,
+    master_slot: u8,
+    snapshot: crate::policy::SlotStateSnapshot,
+    action: &str,
+) -> Result<(), String> {
+    let persisted = ctx.policy_engine.persist_slots_revoking(ctx.nvs, master_slot);
+    finish_slot_mutation(ctx, persisted, snapshot, action)
+}
+
+fn finish_slot_mutation(
+    ctx: &mut SignCtx,
+    persisted: bool,
+    snapshot: crate::policy::SlotStateSnapshot,
+    action: &str,
+) -> Result<(), String> {
+    if persisted {
         return Ok(());
     }
     if ctx
@@ -8404,7 +8428,7 @@ fn dispatch_mgmt(
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
             let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             if ctx.policy_engine.revoke_slot(master_slot, slot_index) {
-                persist_slot_mutation_or_rollback(
+                persist_revocation_or_rollback(
                     ctx,
                     master_slot,
                     slot_snapshot,
@@ -8454,7 +8478,7 @@ fn dispatch_mgmt(
                 .remove_authorized_pubkey(master_slot, slot_index, pubkey)
             {
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Removed) => {
-                    persist_slot_mutation_or_rollback(
+                    persist_revocation_or_rollback(
                         ctx,
                         master_slot,
                         slot_snapshot,
@@ -8538,7 +8562,7 @@ fn dispatch_mgmt(
                 ),
             };
             if changed {
-                persist_slot_mutation_or_rollback(
+                persist_revocation_or_rollback(
                     ctx,
                     master_slot,
                     slot_snapshot,

@@ -36,6 +36,20 @@ pub struct MockNvsState {
     faults: Vec<Fault>,
     /// Keys touched since the last `take_log`.
     log: Vec<(String, NvsOp)>,
+    /// A partition of this many entries: replaces then follow
+    /// `nvs_budget::plan_replace` as the firmware's `ReplaceBlob` does, and
+    /// `growth_allowed` its gate. `None` is unlimited.
+    capacity: Option<usize>,
+}
+
+impl MockNvsState {
+    fn used(&self) -> usize {
+        self.store.values().map(|v| heartwood_common::nvs_budget::stored_entries_min(v.len())).sum()
+    }
+
+    fn available(&self) -> usize {
+        self.capacity.map_or(usize::MAX / 4, |c| c.saturating_sub(self.used()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +126,16 @@ impl NvsDefault {
 
     pub fn contains(&self, key: &str) -> bool {
         self.inner.borrow().store.contains_key(key)
+    }
+
+    /// Limit the partition to what is stored now plus `headroom` entries.
+    pub fn limit_headroom(&self, headroom: usize) {
+        let mut state = self.inner.borrow_mut();
+        state.capacity = Some(state.used() + headroom);
+    }
+
+    pub fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.inner.borrow().store.get(key).cloned()
     }
 }
 
@@ -238,18 +262,62 @@ impl EspNvs<NvsDefault> {
 
 /// Stands in for the firmware's `crate::nvs::ReplaceBlob`, which `policy.rs`
 /// imports: on the board a replace that leaves the old or the new value after
-/// a cut, never neither. The mock's `set_blob` is already exactly that.
+/// a cut, never neither, and that is planned against the entry budget first.
+/// The mock's `set_blob` is the in-place write; with a capacity set, the plan
+/// is the firmware's (`nvs_budget::plan_replace`).
 pub trait ReplaceBlob {
     fn replace_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str>;
+    fn revoke_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str>;
+}
+
+impl EspNvs<NvsDefault> {
+    fn planned_write(&mut self, key: &str, data: &[u8], revoking: bool) -> Result<(), &'static str> {
+        use heartwood_common::nvs_budget::{plan_replace, Plan};
+        let plan = {
+            let state = self.backend.inner.borrow();
+            let old = state.store.get(key).map(Vec::len);
+            if state.capacity.is_some() && old.is_some() && state.store.get(key).map(Vec::as_slice) == Some(data) {
+                return Ok(());
+            }
+            plan_replace(key, state.available(), old, data.len(), revoking)
+        };
+        match plan {
+            Plan::Direct => self.set_blob(key, data),
+            Plan::EraseFirst => {
+                self.backend.inner.borrow_mut().store.remove(key);
+                self.set_blob(key, data)
+            }
+            Plan::Refuse => Err("not enough space"),
+        }
+    }
 }
 
 impl ReplaceBlob for EspNvs<NvsDefault> {
     fn replace_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str> {
-        self.set_blob(key, data)
+        self.planned_write(key, data, false)
+    }
+
+    fn revoke_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str> {
+        self.planned_write(key, data, true)
     }
 }
 
-pub mod nvs { pub use super::{EspNvs, NvsDefault, ReplaceBlob}; }
+/// Stands in for the firmware's `crate::nvs::growth_allowed`.
+pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+    let state = nvs.backend.inner.borrow();
+    let largest = heartwood_common::nvs_budget::hot_keys()
+        .filter_map(|k| state.store.get(&k).map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    heartwood_common::nvs_budget::growth_allowed(
+        state.available(),
+        state.store.get(key).map(Vec::len),
+        new_len,
+        largest,
+    )
+}
+
+pub mod nvs { pub use super::{growth_allowed, EspNvs, NvsDefault, ReplaceBlob}; }
 
 #[path = "../../firmware/src/policy.rs"]
 pub mod engine;
@@ -1030,3 +1098,99 @@ fn physically_approved_backup_recovery_requires_verified_empty_baseline() {
     assert!(reloaded.storage_ready(0));
     assert!(reloaded.list_slots(0).is_empty(), "empty table must suppress old-secret migration");
 }
+
+// ---------------------------------------------------------------------------
+// A full partition
+// ---------------------------------------------------------------------------
+
+/// A persisted table for master 0 with `n` pairings, on a board that still
+/// holds its pre-migration `master_0_conn` credential.
+fn full_table(n: u8) -> (EspNvs<NvsDefault>, PolicyEngine) {
+    let mut nvs = EspNvs::new();
+    let mut engine = PolicyEngine::new();
+    for i in 0..n {
+        let slot = engine.create_slot(0, format!("app {i}"), secret_hex(0x10 + i)).unwrap();
+        assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(0x60 + i)));
+    }
+    assert!(engine.persist_slots(&mut nvs, 0));
+    nvs.backend.seed(MASTER_0_CONN, &legacy_secret_bytes(0x5E));
+    (nvs, engine)
+}
+
+fn slot_indices(nvs: &mut EspNvs<NvsDefault>) -> Vec<u8> {
+    PolicyEngine::load_from_nvs(nvs, 1).list_slots(0).iter().map(|s| s.slot_index).collect()
+}
+
+#[test]
+fn a_revocation_on_a_full_partition_still_revokes() {
+    let (mut nvs, mut engine) = full_table(8);
+    let before = slot_indices(&mut nvs);
+    assert!(before.contains(&3));
+    // The bench V4's measured headroom, far short of a second table.
+    nvs.backend.limit_headroom(17);
+
+    // As an ordinary change the smaller table does not fit beside the old
+    // one: refused, and the revoked pairing survives the reboot.
+    let snapshot = engine.snapshot_slot_state(0);
+    assert!(engine.revoke_slot(0, 3));
+    assert!(!engine.persist_slots(&mut nvs, 0));
+    assert!(engine.restore_slot_state_durably(&mut nvs, snapshot), "flash still holds the old table");
+    assert_eq!(slot_indices(&mut nvs), before);
+
+    // As a revocation it erases first, and the pairing is gone for good.
+    assert!(engine.revoke_slot(0, 3));
+    assert!(engine.persist_slots_revoking(&mut nvs, 0));
+    let after = slot_indices(&mut nvs);
+    assert!(!after.contains(&3));
+    assert_eq!(after.len(), before.len() - 1);
+    assert!(!nvs.backend.contains(MASTER_0_CONN), "the legacy credential went first");
+}
+
+#[test]
+fn a_cut_inside_an_erase_first_revocation_leaves_no_pairings_not_a_legacy_one() {
+    // Why the legacy credential is removed first: an absent table with it
+    // still present brings back a default pairing on the next boot.
+    let mut bare = EspNvs::new();
+    bare.backend.seed(MASTER_0_CONN, &legacy_secret_bytes(0x5E));
+    assert_eq!(slot_indices(&mut bare), vec![0], "absence resurrects the legacy slot");
+
+    let (mut nvs, mut engine) = full_table(8);
+    nvs.backend.limit_headroom(17);
+    assert!(engine.revoke_slot(0, 3));
+    // The erase lands and the write after it does not: the cut's window.
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert!(!engine.persist_slots_revoking(&mut nvs, 0));
+    assert!(!nvs.backend.contains(CONNSLOTS_0));
+    assert!(!nvs.backend.contains(MASTER_0_CONN));
+    assert!(slot_indices(&mut nvs).is_empty(), "no pairing at all, the revoked one included");
+}
+
+#[test]
+fn a_growing_table_keeps_room_to_revoke_in_place() {
+    let (mut nvs, mut engine) = full_table(4);
+    let stored = nvs.backend.get(CONNSLOTS_0).unwrap();
+    nvs.backend.limit_headroom(160);
+
+    // A fifth pairing would fit, but leave too little room to rewrite the
+    // table in place afterwards: refused, nothing written.
+    let snapshot = engine.snapshot_slot_state(0);
+    engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    let grown = serde_json::to_string(engine.list_slots(0)).unwrap().len();
+    assert!(heartwood_common::nvs_budget::blob_entries(grown) <= 160, "the new copy alone fits");
+    assert!(!engine.persist_slots(&mut nvs, 0));
+    assert!(engine.restore_slot_state_durably(&mut nvs, snapshot));
+    assert_eq!(nvs.backend.get(CONNSLOTS_0).unwrap(), stored);
+
+    // Pairings outrank cached avatars: with one to drop, the same pairing
+    // goes through, and a revocation afterwards still fits in place.
+    nvs.backend.seed("imav0", &vec![0u8; 8194]);
+    nvs.backend.limit_headroom(160);
+    let snapshot = engine.snapshot_slot_state(0);
+    let fifth = engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    assert!(engine.persist_slots(&mut nvs, 0));
+    assert!(!nvs.backend.contains("imav0"));
+    drop(snapshot);
+    assert!(engine.revoke_slot(0, fifth));
+    assert!(engine.persist_slots(&mut nvs, 0), "a plain in-place replace, no fallback needed");
+}
+

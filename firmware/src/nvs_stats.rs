@@ -12,15 +12,13 @@ use esp_idf_svc::sys;
 #[derive(Clone, Copy, Debug)]
 pub struct NvsStats {
     pub used_entries: usize,
+    /// Includes the page NVS keeps back for garbage collection.
     pub free_entries: usize,
+    /// Free entries a write can actually use: `free_entries` less that page.
+    pub available_entries: usize,
     pub total_entries: usize,
     pub namespace_count: usize,
 }
-
-/// Entries held back so policy writes (an app pairing mid-connect writes a
-/// connslot plus a policy blob, each with a copy-on-write shadow) never hit
-/// the wall: persona creation refuses first. 128 entries is 4 KB of table.
-pub const RESERVED_POLICY_ENTRIES: usize = 128;
 
 /// Read the default partition's stats. `None` on API failure.
 pub fn read() -> Option<NvsStats> {
@@ -33,20 +31,10 @@ pub fn read() -> Option<NvsStats> {
     Some(NvsStats {
         used_entries: stats.used_entries as usize,
         free_entries: stats.free_entries as usize,
+        available_entries: stats.available_entries as usize,
         total_entries: stats.total_entries as usize,
         namespace_count: stats.namespace_count as usize,
     })
-}
-
-/// Whether a persona write still leaves the reserved policy headroom. Fails
-/// open on a stats API error: the write itself will still error cleanly if
-/// the partition is genuinely full, and a transient stats failure must not
-/// brick persona creation.
-pub fn persona_write_allowed() -> bool {
-    match read() {
-        Some(stats) => stats.free_entries > RESERVED_POLICY_ENTRIES,
-        None => true,
-    }
 }
 
 /// Stats as a JSON object for FIRMWARE_INFO and the relay `get_status` reply.

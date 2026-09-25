@@ -78,7 +78,7 @@ pub fn handle_create(
             Some(index) => {
                 if !policy_engine.persist_slots(nvs, ms) {
                     policy_engine.restore_slot_state_durably(nvs, snapshot);
-                    protocol::write_frame(usb, FRAME_TYPE_NACK, b"storage_unavailable: pairing was not saved");
+                    protocol::write_frame(usb, FRAME_TYPE_NACK, restart_advised(policy_engine, ms, "storage_unavailable: pairing was not saved").as_bytes());
                     return;
                 }
 
@@ -310,7 +310,7 @@ pub fn handle_update(
                             }
                         } else if !policy_engine.persist_slots(nvs, ms) {
                             policy_engine.restore_slot_state_durably(nvs, snapshot);
-                            protocol::write_frame(usb, FRAME_TYPE_NACK, b"storage_unavailable: permissions were not saved");
+                            protocol::write_frame(usb, FRAME_TYPE_NACK, restart_advised(policy_engine, ms, "storage_unavailable: permissions were not saved").as_bytes());
                             return;
                         }
                         log::info!("Updated slot {} ({}) — approved by button", idx, slot_label);
@@ -357,6 +357,16 @@ pub fn handle_revoke(
         } else {
             protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"not found");
         }
+    }
+}
+
+/// `reply`, ending with the restart instruction when this master's pairing
+/// table is blocked until a restart (`PolicyEngine::restart_needed`).
+fn restart_advised(policy_engine: &PolicyEngine, ms: u8, reply: &str) -> String {
+    if policy_engine.restart_needed(ms) {
+        format!("{reply}; {}", crate::policy::RESTART_ADVICE)
+    } else {
+        reply.to_string()
     }
 }
 

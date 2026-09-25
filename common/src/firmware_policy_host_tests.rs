@@ -1231,8 +1231,15 @@ fn a_small_value_is_retried_after_the_erase_and_a_large_one_is_not() {
     assert!(engine.revoke_slot(0, 3));
     nvs.backend.take_log();
     nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
-    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::TableLost);
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::TableGone, "missing AND blocked: nothing can save it this boot");
     assert!(nvs::write_blocked(CONNSLOTS_0));
+    assert!(engine.restart_needed(0));
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_full: "), "{reply}");
+    assert!(reply.contains("every pairing of this identity is gone after a restart"), "{reply}");
+    assert!(!reply.contains("unless a later change"), "{reply}");
+    assert!(reply.contains(engine::RESTART_ADVICE), "{reply}");
     let writes = nvs.backend.take_log().iter().filter(|(k, op)| k == CONNSLOTS_0 && *op == NvsOp::SetBlob).count();
     assert_eq!(writes, 1, "one attempt only");
     assert!(engine.revoke_slot(0, 4));
@@ -1248,8 +1255,11 @@ fn a_part_written_table_with_the_old_copy_present_is_reported_uncertain() {
     let (mut nvs, mut engine) = full_table(8);
     assert!(engine.revoke_slot(0, 3));
     nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
-    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Uncertain);
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::Uncertain);
     assert!(!engine.list_slots(0).iter().any(|s| s.slot_index == 3), "RAM keeps the revocation");
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_failed: ") && reply.contains(engine::RESTART_ADVICE), "{reply}");
 }
 
 #[test]
@@ -1263,10 +1273,33 @@ fn a_revocation_that_cannot_be_rewritten_is_never_rolled_back() {
     let epoch = engine.approval_epoch();
     assert!(engine.revoke_slot(0, 3));
     nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
-    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::TableLost);
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::TableGone);
     assert!(!engine.list_slots(0).iter().any(|s| s.slot_index == 3), "RAM keeps the revocation");
     assert!(!engine.approval_is_current(epoch), "pending approvals and windows withdrawn");
     assert!(slot_indices(&mut nvs).is_empty(), "no pairings, not the legacy one");
+}
+
+#[test]
+fn a_lost_single_chunk_table_can_still_be_saved_by_a_later_change() {
+    // Revoking the only pairing leaves "[]", one chunk. With no room it is
+    // erased first; both writes after the erase fail, but the key is not
+    // blocked, so the reply may promise a later save, and one lands.
+    let (mut nvs, mut engine) = full_table(1);
+    nvs.backend.limit_headroom(0);
+    assert!(engine.revoke_slot(0, 0));
+    nvs.backend.push_fault(Fault {
+        op: NvsOp::SetBlob,
+        key: Some(CONNSLOTS_0.into()),
+        remaining_calls: 2,
+        kind: FaultKind::WriteFailBeforeCommit,
+    });
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::TableLost);
+    assert!(!engine.restart_needed(0));
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_full: ") && reply.contains("unless a later change"), "{reply}");
+    assert!(engine.persist_slots(&mut nvs, 0));
+    assert_eq!(nvs.backend.get(CONNSLOTS_0).unwrap(), b"[]");
 }
 
 #[test]
@@ -1277,7 +1310,9 @@ fn a_revocation_that_fails_with_the_old_table_intact_holds_until_restart() {
     let (mut nvs, mut engine) = full_table(1);
     assert!(engine.revoke_slot(0, 0));
     nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
-    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::OnlyUntilRestart);
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::OnlyUntilRestart);
+    assert!(!outcome.describe("pairing revocation").unwrap_err().contains(engine::RESTART_ADVICE), "not blocked");
     assert!(engine.list_slots(0).is_empty());
     assert_eq!(slot_indices(&mut nvs), vec![0]);
     assert!(!nvs::write_blocked(CONNSLOTS_0), "one chunk: not blocked");

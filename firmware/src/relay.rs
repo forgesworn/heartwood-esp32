@@ -7046,20 +7046,22 @@ fn finish_slot_mutation(
     if persisted {
         return Ok(());
     }
-    if ctx
-        .policy_engine
-        .restore_slot_state_durably(ctx.nvs, snapshot)
-    {
+    let master_slot = snapshot.master_slot();
+    let restored = ctx.policy_engine.restore_slot_state_durably(ctx.nvs, snapshot);
+    let advice = if ctx.policy_engine.restart_needed(master_slot) {
+        format!("; {}", crate::policy::RESTART_ADVICE)
+    } else {
+        String::new()
+    };
+    if restored {
         log::error!("[relay] {action} was not durable; prior slot authority restored durably");
-        Err(format!(
-            "could not persist {action}; request was not applied"
-        ))
+        Err(format!("could not persist {action}; request was not applied{advice}"))
     } else {
         log::error!(
             "[relay] FATAL: {action} failed and prior slot authority could not be restored durably"
         );
         Err(format!(
-            "fatal storage error: could not restore prior client policy after {action}; take the device offline for USB recovery"
+            "fatal storage error: could not restore prior client policy after {action}; take the device offline for USB recovery{advice}"
         ))
     }
 }

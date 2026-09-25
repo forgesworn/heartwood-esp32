@@ -72,11 +72,20 @@ pub enum RevocationSave {
     /// revoked party is gone, and so is every other pairing of this master
     /// unless a later save succeeds.
     TableLost,
+    /// As `TableLost`, but the rewrite failed part-way, so the key is blocked
+    /// for this boot (`nvs::write_blocked`) and no later save can bring the
+    /// other pairings back: a restart finds none.
+    TableGone,
     /// A write of the table failed part-way and may have damaged the stored
     /// copy; it is not written again this boot. A restart finds either the
     /// old table or none.
     Uncertain,
 }
+
+/// Appended to every reply after a write that blocks the pairing table for
+/// the rest of the boot: until a restart this identity's pairings cannot
+/// change, and a failed change quarantines them.
+pub const RESTART_ADVICE: &str = "restart the device before making any other change";
 
 impl RevocationSave {
     /// The outcome as a caller reports it: `Ok` only when it is on flash,
@@ -91,8 +100,11 @@ impl RevocationSave {
             RevocationSave::TableLost => Err(format!(
                 "storage_full: {what} is saved, but this identity's other pairings could not be rewritten and are lost at the next restart unless a later change saves them"
             )),
+            RevocationSave::TableGone => Err(format!(
+                "storage_full: {what} is saved, but every pairing of this identity is gone after a restart; {RESTART_ADVICE}, then re-pair or restore a backup"
+            )),
             RevocationSave::Uncertain => Err(format!(
-                "storage_failed: {what} holds until the next restart; the pairing table could not be written and after a restart it is either as it was or gone, so check and revoke again"
+                "storage_failed: {what} holds until the next restart; the pairing table could not be written and after a restart it is either as it was or gone; {RESTART_ADVICE}, then check and revoke again"
             )),
         }
     }
@@ -131,6 +143,13 @@ pub struct SlotStateSnapshot {
     master_slot: u8,
     slots: Option<Vec<ConnectSlot>>,
     slots_dirty: bool,
+}
+
+impl SlotStateSnapshot {
+    /// The master this snapshot belongs to.
+    pub fn master_slot(&self) -> u8 {
+        self.master_slot
+    }
 }
 
 /// Per-client session state (rate limiting + active identity).
@@ -1012,6 +1031,12 @@ impl PolicyEngine {
         self.persist_slots_as(nvs, master_slot, SlotWrite::Change)
     }
 
+    /// Whether this master's pairing table is blocked until a restart after a
+    /// failed write (`nvs::write_blocked`). Replies about it should say so.
+    pub fn restart_needed(&self, master_slot: u8) -> bool {
+        crate::nvs::write_blocked(&format!("connslots_{master_slot}"))
+    }
+
     /// Save a table that only lost authority (a revoked pairing, client key
     /// or identity grant, or permissions narrowed). Never gated, and on
     /// failure the prior table is NOT restored, in RAM or on flash: that
@@ -1030,9 +1055,11 @@ impl PolicyEngine {
         self.invalidate_approvals();
         self.slots_dirty = true;
         let key = format!("connslots_{master_slot}");
+        let blocked = crate::nvs::write_blocked(&key);
         match nvs.blob_len(&key) {
+            Ok(None) if blocked => RevocationSave::TableGone,
             Ok(None) => RevocationSave::TableLost,
-            _ if crate::nvs::write_blocked(&key) => RevocationSave::Uncertain,
+            _ if blocked => RevocationSave::Uncertain,
             _ => RevocationSave::OnlyUntilRestart,
         }
     }

@@ -630,7 +630,10 @@ So the residuals are these:
   the same boot if a write failed part-way) instead of restoring the wider
   one, and the reply says what a restart would find: the old table (the
   revocation holds until then only), no table (every pairing of that
-  identity gone), or, after a part-written table, either of those.
+  identity gone), or, after a part-written table, either of those. Once a
+  write has failed part-way the identity's pairings cannot change until a
+  restart, so those replies, and any other slot-change reply for that
+  identity, end by asking for one.
 - **Growth is gated for hygiene.** A new pairing, a persona, an unlock phone
   and an avatar are written only if afterwards the largest pairing table,
   phone record set or persona chunk can still be rewritten in place, plus a

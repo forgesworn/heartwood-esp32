@@ -229,6 +229,58 @@ pub fn at_rest_status(
     heartwood_common::at_rest_status::resolve(encrypted, wrap, marker, phone_blob_len, phone_blob)
 }
 
+/// `phone_relays` in FIRMWARE_INFO and get_status (plan G2's Sapwood
+/// follow-up, third bullet): whether the enrolled phones still need telling
+/// about the board's current relays. Same idiom as [`at_rest_status`] above
+/// and for the same reason: a shared `&EspNvs` read, `blob_len` then
+/// `get_blob` sized to the blob's own length, never a [`BlobStore`], because
+/// the low-heap get_status fallback runs behind a `&SignCtx` and can never
+/// promote it to a mutable reference. Never writes: unlike `relays_at_boot`,
+/// which settles a missing or shrunk record, a status read leaves the record
+/// exactly as it found it for the boot's own relay-update logic to act on.
+///
+/// `unlock_phone_count` is the caller's already-computed value from this same
+/// function's other return value, passed straight through rather than a
+/// second read of `dk_ph`: FIRMWARE_INFO and get_status both call
+/// `at_rest_status` first and already have it in hand. `None` (a corrupt
+/// `dk_ph` blob) reports `phone_relays: "unknown"`, since a damaged count is
+/// not the same claim as "no phones", so it must not read as `have_phones =
+/// false`. `Some(0)` (no phones, or `at_rest` being `none` orphaning a
+/// leftover blob) reports `"current"` without inspecting the record at all,
+/// matching `relays_at_boot`'s own guard.
+///
+/// `current` is the relay list the caller's relay loop is actually running
+/// this boot, the same list `relays_at_boot`/`record_round` compared
+/// against, not a fresh `read_net_config`: re-reading and parsing the active
+/// net config here would copy WiFi credentials onto the heap on every
+/// get_status poll (worse, twice over in the low-heap fallback, once from
+/// this call and once from the full reply it stands in for), and would
+/// disagree with the running boot if a committed network trial's promotion
+/// into the active blob was itself interrupted.
+pub fn phone_relay_status(
+    nvs: &EspNvs<NvsDefault>,
+    current: &[String],
+    unlock_phone_count: Option<usize>,
+) -> heartwood_common::phone_relays::PhoneRelayStatus {
+    use heartwood_common::phone_relays::{RecordRead, MAX_TOLD_READ_LEN, TOLD_RELAYS_KEY};
+
+    let told_len = match nvs.blob_len(TOLD_RELAYS_KEY) {
+        Ok(len) => len,
+        Err(_) => Some(usize::MAX),
+    };
+    let safe_len = told_len.filter(|&len| len <= MAX_TOLD_READ_LEN);
+    let mut buf = vec![0u8; safe_len.unwrap_or(0).max(1)];
+    let record = match (told_len, safe_len) {
+        (None, _) => RecordRead::Absent,
+        (Some(_), None) => RecordRead::Unreadable,
+        (Some(len), Some(_)) => match nvs.get_blob(TOLD_RELAYS_KEY, &mut buf) {
+            Ok(Some(b)) if b.len() == len => RecordRead::Present(b),
+            _ => RecordRead::Unreadable,
+        },
+    };
+    heartwood_common::phone_relays::relay_status(unlock_phone_count, current, record)
+}
+
 /// Try to unlock with the PIN or vault key, filling `.secret` in RAM.
 /// All-or-nothing: nothing is filled unless every locked slot opened.
 ///

@@ -846,6 +846,135 @@ impl OldRelayDials {
 }
 
 // ---------------------------------------------------------------------------
+// Sapwood status ("phones not yet told": plan G2's Sapwood follow-up,
+// third bullet: "show 'phones not yet told' once firmware reports
+// relay-update drift in get_status")
+// ---------------------------------------------------------------------------
+//
+// FIRMWARE_INFO and get_status already report `at_rest` and
+// `unlock_phone_count` (see `heartwood_common::at_rest_status`) so Sapwood
+// stops inferring the encryption mode. This does the same for the one
+// question those two fields cannot answer: does an enrolled phone still
+// listen only on relays the board has since left? `phone_relays` answers it
+// with the smallest honest shape: a mode, nothing else. A rounds-remaining
+// count was considered and dropped: it would tell Sapwood how far through
+// six best-effort delivery rounds the board is, which is useful for
+// debugging this module but not for the one decision Sapwood makes on it
+// ("does anyone need a nudge"), and it would need its own damage handling
+// (`n` without a trustworthy `t` is already discarded on read, see
+// `a_newer_or_sparser_record_still_reads`) for a number nobody asked for.
+//
+// `reached` decides "pending" vs "current", not "every round sent and the
+// live list recorded". [`RoundRecorded::Ended`] (all rounds run, `record_round`
+// stops repeating) is the mechanism's own idea of "finished" (six rounds of
+// insurance against a phone that was briefly offline), but this field clears
+// the moment ONE old relay has accepted an update for the change under way:
+// not proof every phone heard it, only that an old relay took a delivery
+// while later rounds still run behind the scenes. `told.reached` must belong
+// to the SAME change as `current`, exactly the `same_change` check
+// `relays_at_boot` already applies before trusting its own `reached`, or a
+// `reached: true` left over from an EARLIER change (A -> A,B reached, then
+// A,B -> A,C before that drift ever settled) would be misread as evidence
+// for a change it says nothing about, reporting "current" from round zero of
+// a fresh drift after reboot. If every old relay is dead or refuses the
+// kind-24135 delivery, "pending" can persist indefinitely: the mechanism has
+// no giving-up point short of the phones themselves being revoked and
+// re-enrolled on relays that work.
+
+/// How the board's enrolled phones stand against its current relay list. The
+/// wire spelling ([`PhoneRelayStatus::wire`]) is the JSON value FIRMWARE_INFO
+/// and get_status carry under `phone_relays`: never a relay URL, a phone id
+/// or a round count, only this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhoneRelayStatus {
+    /// No phones enrolled, no live relay to compare against, or the recorded
+    /// relay list matches what is in use (including once an old relay has
+    /// accepted an update for the SAME change, even while it is still under
+    /// way and later rounds still run; see the file doc comment above).
+    Current,
+    /// A live relay the phones were never told about, and no old relay has
+    /// yet accepted a delivery for this change. Can last indefinitely if
+    /// every old relay is dead or refuses the kind-24135 delivery; the only
+    /// way out then is revoking and re-enrolling the phones.
+    Pending,
+    /// The `ph_relays` record exists, or the enrolled-phone count could not
+    /// be read (a damaged `dk_ph` blob), but this firmware cannot make sense
+    /// of what it read, distinct from no record at all and genuinely zero
+    /// phones, both of which are [`PhoneRelayStatus::Current`] (nothing
+    /// recorded, or nothing enrolled, is nothing known to be wrong).
+    Unknown,
+}
+
+impl PhoneRelayStatus {
+    /// The wire spelling used by both FIRMWARE_INFO and get_status.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            PhoneRelayStatus::Current => "current",
+            PhoneRelayStatus::Pending => "pending",
+            PhoneRelayStatus::Unknown => "unknown",
+        }
+    }
+}
+
+/// What the caller found at [`TOLD_RELAYS_KEY`], read the way `relays_at_boot`
+/// reads it but without ever writing: a status query must never repair or
+/// settle a record, only report what is there. Firmware builds this from a
+/// shared `&EspNvs` read (`blob_len` then `get_blob`, sized to the blob's own
+/// length) rather than a [`BlobStore`], because the low-heap get_status
+/// fallback runs behind a shared reference it can never promote to a mutable
+/// one, the same reason `at_rest_status::resolve` reads its blobs directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordRead<'a> {
+    /// The key is not present at all.
+    Absent,
+    /// The key is present but could not be read back intact (oversized,
+    /// `blob_len` failed, or a short/torn read).
+    Unreadable,
+    /// Read back in full; may still fail to decode as a [`ToldRecord`].
+    Present(&'a [u8]),
+}
+
+/// Classify the drift for Sapwood, purely from what is already known: how
+/// many phones are enrolled (`None` for a damaged `dk_ph` blob, see
+/// `at_rest_status::phone_count_from_blob`), the relay list the relay loop is
+/// actually running this boot, and what [`TOLD_RELAYS_KEY`] holds. Never
+/// writes.
+///
+/// `phones` of `None` is [`PhoneRelayStatus::Unknown`] before anything else
+/// is inspected: a damaged phone count means this firmware cannot say
+/// whether a phone is stranded, which is not the same claim as "none are".
+/// `Some(0)` and an empty `current` short-circuit to
+/// [`PhoneRelayStatus::Current`] before the record is even inspected, exactly
+/// [`relays_at_boot`]'s own guard, so a damaged record on a board with no
+/// phones, or no configured relay, is never reported as a problem nobody can
+/// act on.
+pub fn relay_status(phones: Option<usize>, current: &[String], record: RecordRead<'_>) -> PhoneRelayStatus {
+    let have_phones = match phones {
+        None => return PhoneRelayStatus::Unknown,
+        Some(n) => n > 0,
+    };
+    if !have_phones || usable_relays(current).is_empty() {
+        return PhoneRelayStatus::Current;
+    }
+    let bytes = match record {
+        RecordRead::Absent => return PhoneRelayStatus::Current,
+        RecordRead::Unreadable => return PhoneRelayStatus::Unknown,
+        RecordRead::Present(bytes) => bytes,
+    };
+    let Some(told) = ToldRecord::decode(bytes) else {
+        return PhoneRelayStatus::Unknown;
+    };
+    // `told.reached` only counts if it belongs to the same change `current`
+    // names: the identical `same_change` guard `relays_at_boot` applies
+    // before trusting its own `reached` (see the file doc comment above).
+    let reached_this_change = told.reached && told.toward == set_tag(current);
+    match relay_drift(Some(&told.relays), current) {
+        RelayDrift::Drifted { .. } if !reached_this_change => PhoneRelayStatus::Pending,
+        _ => PhoneRelayStatus::Current,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Relay OK frames
 // ---------------------------------------------------------------------------
 
@@ -1577,5 +1706,191 @@ mod tests {
         t.feed(br#"["OK","e3",true,"duplicate: already have it"]"#);
         assert!(t.done());
         assert_eq!(t.accepted(), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // relay_status (Sapwood's "phones not yet told")
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn no_phones_is_current_whatever_the_record_says() {
+        let current = urls(&["wss://c.example"]);
+        assert_eq!(relay_status(Some(0), &current, RecordRead::Absent), PhoneRelayStatus::Current);
+        assert_eq!(relay_status(Some(0), &current, RecordRead::Unreadable), PhoneRelayStatus::Current);
+        let junk = b"not json";
+        assert_eq!(relay_status(Some(0), &current, RecordRead::Present(junk)), PhoneRelayStatus::Current);
+        let drifted = ToldRecord { relays: urls(&["wss://a.example"]), rounds: 0, toward: String::new(), reached: false };
+        let bytes = drifted.encode();
+        assert_eq!(relay_status(Some(0), &current, RecordRead::Present(&bytes)), PhoneRelayStatus::Current);
+    }
+
+    #[test]
+    fn a_damaged_phone_count_is_unknown_before_anything_else_is_inspected() {
+        // `phones: None` means this firmware could not tell whether a phone
+        // is enrolled, which is not the same claim as "none are"; it must
+        // never be read as "no phones" (Current), even over an otherwise
+        // perfectly ordinary settled record.
+        let current = urls(&["wss://c.example"]);
+        let settled = ToldRecord::settled(&current).encode();
+        assert_eq!(relay_status(None, &current, RecordRead::Absent), PhoneRelayStatus::Unknown);
+        assert_eq!(relay_status(None, &current, RecordRead::Present(&settled)), PhoneRelayStatus::Unknown);
+        assert_eq!(relay_status(None, &current, RecordRead::Unreadable), PhoneRelayStatus::Unknown);
+        // Contrast: at_rest_status::phone_count_for_mode forces `Some(0)`
+        // once at_rest is "none" (an orphaned dk_ph blob is moot there), and
+        // that genuine zero still reports Current, not Unknown.
+        assert_eq!(relay_status(Some(0), &current, RecordRead::Present(&settled)), PhoneRelayStatus::Current);
+    }
+
+    #[test]
+    fn no_live_relay_is_current_whatever_the_record_says() {
+        let drifted = ToldRecord { relays: urls(&["wss://a.example"]), rounds: 0, toward: String::new(), reached: false };
+        let bytes = drifted.encode();
+        assert_eq!(relay_status(Some(1), &[], RecordRead::Present(&bytes)), PhoneRelayStatus::Current);
+        assert_eq!(
+            relay_status(Some(1), &urls(&["wss://q\"uote"]), RecordRead::Present(&bytes)),
+            PhoneRelayStatus::Current
+        );
+    }
+
+    #[test]
+    fn no_record_at_all_is_current_not_pending() {
+        // A board whose phones were enrolled before this record existed, or
+        // one that has never changed relays: nothing is known to be wrong
+        // (RelayDrift::Unrecorded). The boot check settles a baseline; a
+        // status read never should.
+        let current = urls(&["wss://c.example"]);
+        assert_eq!(relay_status(Some(1), &current, RecordRead::Absent), PhoneRelayStatus::Current);
+    }
+
+    #[test]
+    fn an_unreadable_record_is_unknown() {
+        let current = urls(&["wss://c.example"]);
+        assert_eq!(relay_status(Some(1), &current, RecordRead::Unreadable), PhoneRelayStatus::Unknown);
+    }
+
+    #[test]
+    fn a_present_but_undecodable_record_is_unknown() {
+        let current = urls(&["wss://c.example"]);
+        for junk in [&b"not json"[..], br#"{"r":"not a list"}"#, br#"{"r":["wss://a"],"n":9}"#] {
+            assert_eq!(relay_status(Some(1), &current, RecordRead::Present(junk)), PhoneRelayStatus::Unknown, "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn in_step_or_shrunk_is_current() {
+        let told = ToldRecord::settled(&urls(&["wss://a.example", "wss://b.example"]));
+        let bytes = told.encode();
+        // In step: the live list is exactly what was recorded.
+        assert_eq!(
+            relay_status(Some(1), &urls(&["wss://a.example", "wss://b.example"]), RecordRead::Present(&bytes)),
+            PhoneRelayStatus::Current
+        );
+        // Shrunk: the board dropped a relay the phones still know about.
+        assert_eq!(
+            relay_status(Some(1), &urls(&["wss://a.example"]), RecordRead::Present(&bytes)),
+            PhoneRelayStatus::Current
+        );
+    }
+
+    #[test]
+    fn a_fresh_drift_with_nothing_accepted_is_pending() {
+        let current = urls(&["wss://a.example", "wss://c.example"]);
+        let told = ToldRecord { relays: urls(&["wss://a.example"]), rounds: 2, toward: set_tag(&current), reached: false };
+        let bytes = told.encode();
+        assert_eq!(relay_status(Some(1), &current, RecordRead::Present(&bytes)), PhoneRelayStatus::Pending);
+    }
+
+    #[test]
+    fn a_drift_once_any_old_relay_has_accepted_the_same_change_is_current_even_mid_update() {
+        // Rounds still short of ROUNDS, but this field's own bar is already
+        // met: an old relay took a delivery for this exact change, and later
+        // rounds are insurance, not the risk this field flags. See the file
+        // doc comment.
+        let current = urls(&["wss://a.example", "wss://c.example"]);
+        let told = ToldRecord { relays: urls(&["wss://a.example"]), rounds: 1, toward: set_tag(&current), reached: true };
+        let bytes = told.encode();
+        assert_eq!(relay_status(Some(1), &current, RecordRead::Present(&bytes)), PhoneRelayStatus::Current);
+    }
+
+    #[test]
+    fn a_reached_flag_from_an_earlier_change_is_never_trusted_for_a_new_one() {
+        // `reached: true` with a `toward` tag that does NOT match `current`
+        // means the acceptance belongs to a change other than the one being
+        // asked about (a second change landed before the first ever settled):
+        // it must report Pending, not ride on a stale acceptance.
+        let old_change = urls(&["wss://a.example", "wss://b.example"]);
+        let new_change = urls(&["wss://a.example", "wss://c.example"]);
+        let told = ToldRecord {
+            relays: urls(&["wss://a.example"]),
+            rounds: 1,
+            toward: set_tag(&old_change),
+            reached: true,
+        };
+        let bytes = told.encode();
+        assert_eq!(relay_status(Some(1), &new_change, RecordRead::Present(&bytes)), PhoneRelayStatus::Pending);
+    }
+
+    /// The regression this guards against, driven through the REAL
+    /// `relays_at_boot`/`record_round` pipeline rather than a hand-built
+    /// `ToldRecord`: A -> A,B reaches an old relay and records `reached:
+    /// true` for that change; before the drift settles (five rounds still to
+    /// go), the config changes again to A,C and the board reboots. The
+    /// firmware's own `relays_at_boot` resets `rounds_done` and `reached` to
+    /// zero for the new change (`same_change` fails), and `relay_status`
+    /// reading the very same stored bytes must reach the identical
+    /// conclusion: Pending, not Current.
+    #[test]
+    fn relay_status_matches_relays_at_boot_across_a_second_change_mid_update() {
+        let a = urls(&["wss://a.example"]);
+        let ab = urls(&["wss://a.example", "wss://b.example"]);
+        let ac = urls(&["wss://a.example", "wss://c.example"]);
+        let mut store = Store::with(&a);
+
+        // First drift: A -> A,B. One round reaches an old relay.
+        let boot = relays_at_boot(&mut store, true, false, &ab).unwrap();
+        let mut plan = UpdatePlan::from_boot(boot).unwrap();
+        plan.arm(0, 0);
+        run_round(&mut plan, &store, &[7], FIRST_ROUND_MIN_SECS);
+        let RoundEnd::Counted { done } = plan.finish_round(FIRST_ROUND_MIN_SECS, 0) else {
+            panic!("a dialled round counts");
+        };
+        let RoundRecorded::Progress(rec) = record_round(&mut store, plan.expected(), &ab, done, true).unwrap()
+        else {
+            panic!("first of six rounds records progress, not Ended");
+        };
+        plan.recorded(rec);
+
+        // Sanity: against the SAME change, this is already Current.
+        let bytes = store.record().unwrap().encode();
+        assert_eq!(relay_status(Some(1), &ab, RecordRead::Present(&bytes)), PhoneRelayStatus::Current);
+
+        // The config changes again before the update finishes: A,B -> A,C.
+        // The board reboots into a fresh drift.
+        let boot2 = relays_at_boot(&mut store, true, false, &ac).unwrap();
+        assert_eq!(boot2.rounds_done, 0, "the firmware itself resets rounds for a new change");
+        assert!(!boot2.reached, "the firmware itself never trusts a stale acceptance");
+
+        // relay_status, reading the identical stored bytes, must agree.
+        let bytes2 = store.record().unwrap().encode();
+        assert_eq!(relay_status(Some(1), &ac, RecordRead::Present(&bytes2)), PhoneRelayStatus::Pending);
+    }
+
+    #[test]
+    fn wire_spellings_match_the_plan() {
+        assert_eq!(PhoneRelayStatus::Current.wire(), "current");
+        assert_eq!(PhoneRelayStatus::Pending.wire(), "pending");
+        assert_eq!(PhoneRelayStatus::Unknown.wire(), "unknown");
+    }
+
+    #[test]
+    fn phone_relays_is_never_a_delegate_key() {
+        // A per-identity delegate never sees device-wide at-rest state
+        // (DELEGATE_STATUS_KEYS/DELEGATE_STATUS_FALLBACK_KEYS already exclude
+        // `at_rest` and `unlock_phone_count`); `phone_relays` is the same
+        // kind of device-wide fact and must stay off both lists too.
+        assert!(!crate::at_rest_status::DELEGATE_STATUS_KEYS.contains(&"phone_relays"));
+        assert!(!crate::at_rest_status::DELEGATE_STATUS_FALLBACK_KEYS.contains(&"phone_relays"));
+        assert!(!crate::at_rest_status::DELEGATE_STATUS_KEYS.contains(&"at_rest"));
+        assert!(!crate::at_rest_status::DELEGATE_STATUS_FALLBACK_KEYS.contains(&"at_rest"));
     }
 }

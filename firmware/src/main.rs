@@ -166,7 +166,27 @@ use secp256k1::Secp256k1;
 /// is JSON `null`, not `0`, when a present phone blob fails to parse — damage
 /// is never reported as "no phones" — except when `at_rest` is `"none"`,
 /// which always reports `0`.
-pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>) -> String {
+///
+/// `phone_relays` (plan G2's Sapwood follow-up) is `"current"`, `"pending"` or
+/// `"unknown"`: whether an enrolled phone still needs telling about the
+/// board's relays (an old relay accepting an update is enough to clear
+/// `"pending"`; later rounds keep running regardless). If every old relay is
+/// dead or refuses the delivery, `"pending"` can persist indefinitely, and the
+/// only way out is revoking and re-enrolling the phones. Also a pure read
+/// (`pin::phone_relay_status`), answered while locked for the same reason
+/// `at_rest` is: a stranded phone is exactly the case where a locked board
+/// most needs to be legible without waiting for an unlock.
+///
+/// `running_relays`: the relay list this boot's relay loop is actually
+/// running, when the caller has one (locked or unlocked WiFi-standalone).
+/// `None` when no relay loop has resolved a list yet this boot (USB-bridged
+/// mode, or before WiFi-standalone's own boot decision has run); the only
+/// case that falls back to `net_config_store::committed_or_active_relays`,
+/// which reads NVS instead of RAM.
+pub fn firmware_info_json(
+    nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    running_relays: Option<&[String]>,
+) -> String {
     let crash = crash_context()
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
         .unwrap_or_default();
@@ -190,12 +210,21 @@ pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDe
         })
         .unwrap_or_default();
     let (at_rest, unlock_phones) = pin::at_rest_status(nvs);
+    let fallback_relays;
+    let current_relays: &[String] = match running_relays {
+        Some(r) => r,
+        None => {
+            fallback_relays = net_config_store::committed_or_active_relays(nvs);
+            &fallback_relays
+        }
+    };
+    let phone_relays = pin::phone_relay_status(nvs, current_relays, unlock_phones);
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
          \"free_heap\":{},\"largest_block\":{},\"display_flip\":{},\
-         \"at_rest\":\"{}\",\"unlock_phone_count\":{}{}{}}}",
+         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -209,6 +238,7 @@ pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDe
         display_flip::is_flipped(),
         at_rest.wire(),
         json_usize_or_null(unlock_phones),
+        phone_relays.wire(),
         crash,
         nvs_stats,
     )
@@ -613,7 +643,7 @@ fn main() {
                     protocol::write_frame(
                         &mut usb,
                         FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                        firmware_info_json(&nvs).as_bytes(),
+                        firmware_info_json(&nvs, None).as_bytes(),
                     );
                 }
                 FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
@@ -829,7 +859,7 @@ fn main() {
                     protocol::write_frame(
                         &mut usb,
                         FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                        firmware_info_json(&nvs).as_bytes(),
+                        firmware_info_json(&nvs, None).as_bytes(),
                     );
                 }
                 FRAME_TYPE_FACTORY_RESET => {
@@ -1093,7 +1123,7 @@ fn main() {
                 protocol::write_frame(
                     &mut usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    firmware_info_json(&nvs).as_bytes(),
+                    firmware_info_json(&nvs, None).as_bytes(),
                 );
             }
 

@@ -11,6 +11,7 @@
 // flash region rather than NVS.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 
 use crate::masters::LoadedMaster;
 
@@ -32,13 +33,20 @@ pub fn save(
     h: u8,
     avatar: &[u8],
 ) -> Result<(), String> {
-    nvs.set_blob(&format!("iman{slot}"), name.as_bytes())
-        .map_err(|e| format!("name blob: {e:?}"))?;
     let mut blob = Vec::with_capacity(2 + avatar.len());
     blob.push(w);
     blob.push(h);
     blob.extend_from_slice(avatar);
-    nvs.set_blob(&format!("imav{slot}"), &blob)
+    // An avatar (up to about 8 KB) is the one large write a user makes
+    // besides a pairing; it must not take the room that keeps the pairing
+    // tables and phone records rewritable in place.
+    let avatar_key = format!("imav{slot}");
+    if !crate::nvs::growth_allowed(nvs, &avatar_key, blob.len()) {
+        return Err("avatar blob: not enough storage left; the pairings need the room".into());
+    }
+    nvs.replace_blob(&format!("iman{slot}"), name.as_bytes())
+        .map_err(|e| format!("name blob: {e:?}"))?;
+    nvs.replace_blob(&avatar_key, &blob)
         .map_err(|e| format!("avatar blob: {e:?}"))?;
     Ok(())
 }

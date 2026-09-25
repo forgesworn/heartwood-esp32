@@ -58,6 +58,10 @@ pub mod mgmt;
 
 pub mod persistent_state;
 
+/// NVS entry budget: room for an in-place replace, the per-key erase-first
+/// fallback policy, and the gate on writes that grow the store.
+pub mod nvs_budget;
+
 pub mod persona_pack;
 
 pub mod reply_clock;
@@ -156,3 +160,5 @@ extern crate self as heartwood_common;
 mod firmware_policy_host_tests;
 #[cfg(all(test, feature = "nip46", feature = "nip44"))]
 pub use firmware_policy_host_tests::nvs;
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+pub use firmware_policy_host_tests::personas;

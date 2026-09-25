@@ -17,10 +17,11 @@
 // same style as masters.rs.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use heartwood_common::persona_pack::{
     chunk_index, chunk_offset, decode_chunk, encode_chunk, MigrationJournal, MigrationPhase,
-    PackedPersona, PersonaRemovalJournal, PersonaRemovalPhase, CHUNK_CAPACITY, MAX_NAME_LEN,
-    MIGRATION_JOURNAL_LEN, PERSONA_REMOVAL_JOURNAL_LEN,
+    PackedPersona, PersonaRemovalJournal, PersonaRemovalPhase, CHUNK_CAPACITY, MAX_ENTRY_LEN,
+    MAX_NAME_LEN, MIGRATION_JOURNAL_LEN, PERSONA_REMOVAL_JOURNAL_LEN,
 };
 
 /// Labels are cosmetic; clamp to the stored 64-byte bound at a character
@@ -52,7 +53,7 @@ const MIGRATION_JOURNAL_KEY: &str = "pmig_jnl";
 const REMOVAL_JOURNAL_KEY: &str = "prm_jnl";
 
 /// Worst-case encoded chunk: 6-byte header, 16 maximum-length entries, CRC.
-const MAX_CHUNK_LEN: usize = 6 + CHUNK_CAPACITY * 231 + 4;
+const MAX_CHUNK_LEN: usize = 6 + CHUNK_CAPACITY * MAX_ENTRY_LEN + 4;
 
 /// A persisted persona (no secret — re-derived from the owning master on use).
 pub struct LoadedPersona {
@@ -166,7 +167,7 @@ pub(crate) fn write_registry_count(
     } else {
         LEGACY_COUNT_KEY
     };
-    nvs.set_blob(key, &[count])
+    nvs.replace_blob(key, &[count])
         .map_err(|_| "failed to write persona count")?;
     if read_count_strict(nvs)? == count {
         Ok(())
@@ -176,7 +177,7 @@ pub(crate) fn write_registry_count(
 }
 
 fn write_packed_count(nvs: &mut EspNvs<NvsDefault>, count: u8) -> Result<(), &'static str> {
-    nvs.set_blob(COUNT_KEY, &[count])
+    nvs.replace_blob(COUNT_KEY, &[count])
         .map_err(|_| "failed to write persona count")?;
     if read_count_key(nvs, COUNT_KEY) == count {
         Ok(())
@@ -210,7 +211,7 @@ fn write_chunk(
     entries: &[PackedPersona],
 ) -> Result<(), &'static str> {
     let encoded = encode_chunk(entries)?;
-    nvs.set_blob(&chunk_key(chunk), &encoded)
+    nvs.replace_blob(&chunk_key(chunk), &encoded)
         .map_err(|_| "failed to write persona chunk")?;
     let stored = read_blob_bounded(nvs, &chunk_key(chunk), MAX_CHUNK_LEN)?
         .ok_or("persona chunk missing after write")?;
@@ -342,11 +343,19 @@ pub fn capacity_check(nvs: &EspNvs<NvsDefault>) -> Result<(), &'static str> {
     if read_count(nvs) >= MAX_PERSONAS {
         return Err("identity storage full: this device holds its maximum number of personas — remove an unused one first");
     }
-    if !crate::nvs_stats::persona_write_allowed() {
-        return Err("identity storage full: not enough flash headroom left — remove an unused persona or app pairing first");
+    // The chunk the next persona lands in grows by at most one entry.
+    let key = chunk_key(chunk_index(read_count(nvs)));
+    let grown = nvs.blob_len(&key).ok().flatten().unwrap_or(0) + MAX_ENTRY_LEN;
+    if !crate::nvs::growth_allowed(nvs, &key, grown) {
+        return Err(STORAGE_FULL);
     }
     Ok(())
 }
+
+/// Refusal when a persona would leave too little NVS room to rewrite the
+/// pairing tables, phone records and persona chunks in place.
+const STORAGE_FULL: &str =
+    "identity storage full: not enough flash headroom left — remove an unused persona or app pairing first";
 
 /// Persist a new persona. The caller is responsible for checking the
 /// in-memory registry first (`contains_pubkey`) so the same identity isn't
@@ -385,6 +394,10 @@ pub fn add(
         purpose: purpose.to_string(),
         name: name.map(|n| clamp_label(n).to_string()),
     });
+    let grown = encode_chunk(&entries)?.len();
+    if !crate::nvs::growth_allowed(nvs, &chunk_key(chunk), grown) {
+        return Err(STORAGE_FULL);
+    }
     write_chunk(nvs, chunk, &entries)?;
     write_packed_count(nvs, count + 1)?;
     log::info!("Stored persona entry {count}: purpose={purpose} index={index}");
@@ -529,7 +542,7 @@ fn persist_removal_journal(
     journal: &PersonaRemovalJournal,
 ) -> Result<(), &'static str> {
     let encoded = journal.encode();
-    nvs.set_blob(REMOVAL_JOURNAL_KEY, &encoded)
+    nvs.replace_blob(REMOVAL_JOURNAL_KEY, &encoded)
         .map_err(|_| "failed to write persona-removal journal")?;
     match read_removal_journal(nvs)? {
         Some(stored) if stored == *journal => Ok(()),
@@ -657,7 +670,7 @@ fn persist_migration_journal(
     journal: &MigrationJournal,
 ) -> Result<(), &'static str> {
     let encoded = journal.encode();
-    nvs.set_blob(MIGRATION_JOURNAL_KEY, &encoded)
+    nvs.replace_blob(MIGRATION_JOURNAL_KEY, &encoded)
         .map_err(|_| "failed to write persona-migration journal")?;
     match read_migration_journal(nvs)? {
         Some(stored) if stored == *journal => Ok(()),
@@ -805,7 +818,7 @@ fn legacy_copy_entry(
     for suffix in ["ix", "pk", "pp"] {
         let value = read_blob_bounded(nvs, &legacy_key(source, suffix), 256)?
             .ok_or("required persona state missing")?;
-        nvs.set_blob(&legacy_key(destination, suffix), &value)
+        nvs.replace_blob(&legacy_key(destination, suffix), &value)
             .map_err(|_| "failed to shift persona state")?;
         if read_blob_bounded(nvs, &legacy_key(destination, suffix), 256)?.as_deref()
             != Some(value.as_slice())
@@ -815,7 +828,7 @@ fn legacy_copy_entry(
     }
     match read_blob_bounded(nvs, &legacy_key(source, "nm"), 256)? {
         Some(value) => {
-            nvs.set_blob(&legacy_key(destination, "nm"), &value)
+            nvs.replace_blob(&legacy_key(destination, "nm"), &value)
                 .map_err(|_| "failed to shift persona state")?;
             if read_blob_bounded(nvs, &legacy_key(destination, "nm"), 256)?.as_deref()
                 != Some(value.as_slice())
@@ -825,7 +838,7 @@ fn legacy_copy_entry(
         }
         None => clear_blob(nvs, &legacy_key(destination, "nm"))?,
     }
-    nvs.set_blob(&legacy_key(destination, "ms"), &[mapped_owner])
+    nvs.replace_blob(&legacy_key(destination, "ms"), &[mapped_owner])
         .map_err(|_| "failed to write remapped persona owner")?;
     if entry_owner(nvs, destination)? != mapped_owner {
         return Err("remapped persona owner verification failed");

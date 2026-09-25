@@ -4,6 +4,7 @@
 //! Mirrors the bridge_secret pattern in session.rs.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 
 use heartwood_common::net_config::{
     activate_network_trial_record, apply_local_net_config_patch, commit_network_trial_record,
@@ -59,7 +60,7 @@ pub fn write_net_config(nvs: &mut EspNvs<NvsDefault>, json: &[u8]) -> Result<(),
     if json.len() > NET_CONFIG_MAX_LEN {
         return Err("net config too large");
     }
-    nvs.set_blob(NVS_NET_CONFIG_KEY, json)
+    nvs.replace_blob(NVS_NET_CONFIG_KEY, json)
         .map_err(|_| "nvs write failed")?;
     if read_net_config(nvs).as_deref() != Some(json) {
         return Err("net config read-back verification failed");
@@ -110,7 +111,7 @@ fn write_trial(
     if json.len() > NET_TRIAL_MAX_LEN {
         return Err("network trial too large");
     }
-    nvs.set_blob(NVS_TRIAL_KEY, &json)
+    nvs.replace_blob(NVS_TRIAL_KEY, &json)
         .map_err(|_| "network trial nvs write failed")
 }
 
@@ -150,7 +151,7 @@ fn write_terminal(
     if json.len() > NET_LAST_MAX_LEN {
         return Err("network outcome too large");
     }
-    nvs.set_blob(NVS_LAST_KEY, &json)
+    nvs.replace_blob(NVS_LAST_KEY, &json)
         .map_err(|_| "network outcome nvs write failed")
 }
 

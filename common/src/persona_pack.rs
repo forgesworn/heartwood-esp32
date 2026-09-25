@@ -25,6 +25,9 @@ pub const MAX_PURPOSE_LEN: usize = 128;
 
 /// Maximum name length in bytes (matches the legacy per-key read buffer).
 pub const MAX_NAME_LEN: usize = 64;
+/// The most one entry adds to an encoded chunk: owner, index, pubkey, and
+/// the two length-prefixed strings at their maximum.
+pub const MAX_ENTRY_LEN: usize = 1 + 4 + 32 + 1 + MAX_PURPOSE_LEN + 1 + MAX_NAME_LEN;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -571,5 +574,19 @@ mod tests {
             }
             assert_eq!((entries, count), expected.clone(), "cut after {cut_after}");
         }
+    }
+
+    #[test]
+    fn an_entry_adds_at_most_max_entry_len_to_a_chunk() {
+        let entry = |n: u8| PackedPersona {
+            master_slot: 7,
+            index: u32::MAX,
+            pubkey: [n; 32],
+            purpose: "p".repeat(MAX_PURPOSE_LEN),
+            name: Some("n".repeat(MAX_NAME_LEN)),
+        };
+        let one = encode_chunk(&[entry(1)]).unwrap().len();
+        let two = encode_chunk(&[entry(1), entry(2)]).unwrap().len();
+        assert_eq!(two - one, MAX_ENTRY_LEN);
     }
 }

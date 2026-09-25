@@ -605,8 +605,8 @@ So the residuals are these:
 - **A revocation is never rolled back.** Removing a pairing, a client key or
   an identity grant, or narrowing a slot's methods, kinds or auto-approval,
   is saved as a revocation: if the save fails, RAM keeps the narrower table
-  (and saves it again with the next change) instead of restoring the wider
-  one, and the reply says what a restart would find: the old table (the
+  (written again by the next change to that identity) instead of restoring
+  the wider one, and the reply says what a restart would find: the old table (the
   revocation holds until then only) or no table (every pairing of that
   identity gone).
 - **Growth is gated for hygiene.** A new pairing, a persona, an unlock phone

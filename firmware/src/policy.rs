@@ -1008,9 +1008,10 @@ impl PolicyEngine {
     /// Save a table that only lost authority (a revoked pairing, client key
     /// or identity grant, or permissions narrowed). Never gated, and on
     /// failure the prior table is NOT restored, in RAM or on flash: that
-    /// would re-authorise what was just revoked. RAM keeps the narrower table
-    /// and stays dirty, so the next save of this master writes it again. The
-    /// outcome says what a restart would find.
+    /// would re-authorise what was just revoked. RAM keeps the narrower table,
+    /// and the next change to this master writes it again (the dirty flag is
+    /// shared, so a save of another master does not). The outcome says what a
+    /// restart would find.
     pub fn persist_revocation(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> RevocationSave {
         if self.persist_slots_as(nvs, master_slot, SlotWrite::Revoke) {
             return RevocationSave::Saved;

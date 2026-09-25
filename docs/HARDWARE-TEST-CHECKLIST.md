@@ -2285,7 +2285,28 @@ subscribed to `{"kinds":[24135]}`).
    unlocked through round 6. The log says "phones told about the relay
    change; recorded", and a reset afterwards has no "relays changed" line.
 
-## 29. Adding an unlock phone over the relay (added 2026-09-25, NOT YET BENCH-RUN)
+## 29. Adding an unlock phone over the relay (added 2026-09-25; steps 1, 2, 2b and 10d bench-run 2026-09-25, desk Heltec V4)
+
+**Bench run 2026-09-25** (V4, legacy-NVS bigapp layout, signed v0.18.0-beta.19 written app-only at
+0x10000, readback identical):
+
+- Step 1 on the real path: live Sapwood connected over the relay, Cambium 0.6.0 on a GrapheneOS
+  Pixel. The card's five words matched the phone's, PHONE ADDED showed the same check code as the
+  phone, and after a reset the Pixel unlocked the board with the new record. The Pixel's old
+  record was revoked from Sapwood.
+- Step 2: a tap after the gate declined ("refused: declined on the board"); left alone, the card
+  expired ("not confirmed on the board in time"). Neither added a record.
+- Step 2b: a hold from page 3 until about 17 s did nothing; after letting go, a fresh hold
+  approved (record revoked afterwards).
+- Step 10d: with PRG held under a relay enrol card, a cable `PATCH_NET_CONFIG` restating the
+  current relays answered the relay card Expired and raised "Change network?", which the held
+  button did not approve; a tap after letting go declined it (NACK).
+- Not run: 1b, 3 to 9, 10 (a to h), 10b, 10c, 11 and 12.
+- Found: the computer running Sapwood could not scan Cambium's QR, and the phone's "Copy code"
+  only reaches the phone's clipboard, so the code had to be carried across by hand (the phone can
+  scan a QR on the computer, so the flow should run that way); and Cambium hides its check code once it says Done (the owner saw it under the
+  PIN prompt). Both are Cambium and Sapwood follow-ups.
+
 
 `enrol_unlock_phone` does over the relay what `PHONE_UNLOCK_CMD` (0x64)
 `{"op":"enrol"}` does over the cable, on the deferred card queue (#64), so the
@@ -2559,7 +2580,12 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     one-off rendezvous tag. No event carries the label, the enrolment key or
     the phone's id in the clear.
 
-## 30. Destructive cards say ERASE (added 2026-09-25, NOT YET BENCH-RUN)
+## 30. Destructive cards say ERASE (added 2026-09-25; 30a bench-run 2026-09-25 on beta.19)
+
+**Bench run 2026-09-25** (V4, v0.18.0-beta.19): 30a read "FACTORY RESET / ERASE ALL KEYS / notes
+and pairings too" with its countdown; a tap denied it (NACK after 6 s) and every identity, phone and
+NVS entry was unchanged. 30b not run.
+
 
 The factory reset and identity removal cards used a renderer that dropped its
 text and drew "HOLD TO SIGN / Factory / Profile / kind 0". Both now draw a

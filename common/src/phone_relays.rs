@@ -846,7 +846,7 @@ impl OldRelayDials {
 }
 
 // ---------------------------------------------------------------------------
-// Sapwood status ("phones not yet told" — plan G2's Sapwood follow-up,
+// Sapwood status ("phones not yet told": plan G2's Sapwood follow-up,
 // third bullet: "show 'phones not yet told' once firmware reports
 // relay-update drift in get_status")
 // ---------------------------------------------------------------------------
@@ -856,7 +856,7 @@ impl OldRelayDials {
 // stops inferring the encryption mode. This does the same for the one
 // question those two fields cannot answer: does an enrolled phone still
 // listen only on relays the board has since left? `phone_relays` answers it
-// with the smallest honest shape — a mode, nothing else. A rounds-remaining
+// with the smallest honest shape: a mode, nothing else. A rounds-remaining
 // count was considered and dropped: it would tell Sapwood how far through
 // six best-effort delivery rounds the board is, which is useful for
 // debugging this module but not for the one decision Sapwood makes on it
@@ -866,13 +866,13 @@ impl OldRelayDials {
 //
 // `reached` decides "pending" vs "current", not "every round sent and the
 // live list recorded". [`RoundRecorded::Ended`] (all rounds run, `record_round`
-// stops repeating) is the mechanism's own idea of "finished" — six rounds of
-// insurance against a phone that was briefly offline — but this field clears
+// stops repeating) is the mechanism's own idea of "finished" (six rounds of
+// insurance against a phone that was briefly offline), but this field clears
 // the moment ONE old relay has accepted an update for the change under way:
 // not proof every phone heard it, only that an old relay took a delivery
 // while later rounds still run behind the scenes. `told.reached` must belong
-// to the SAME change as `current` — exactly the `same_change` check
-// `relays_at_boot` already applies before trusting its own `reached` — or a
+// to the SAME change as `current`, exactly the `same_change` check
+// `relays_at_boot` already applies before trusting its own `reached`, or a
 // `reached: true` left over from an EARLIER change (A -> A,B reached, then
 // A,B -> A,C before that drift ever settled) would be misread as evidence
 // for a change it says nothing about, reporting "current" from round zero of
@@ -883,14 +883,14 @@ impl OldRelayDials {
 
 /// How the board's enrolled phones stand against its current relay list. The
 /// wire spelling ([`PhoneRelayStatus::wire`]) is the JSON value FIRMWARE_INFO
-/// and get_status carry under `phone_relays` — never a relay URL, a phone id
+/// and get_status carry under `phone_relays`: never a relay URL, a phone id
 /// or a round count, only this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PhoneRelayStatus {
     /// No phones enrolled, no live relay to compare against, or the recorded
-    /// relay list matches what is in use — including once an old relay has
+    /// relay list matches what is in use (including once an old relay has
     /// accepted an update for the SAME change, even while it is still under
-    /// way and later rounds still run (see the file doc comment above).
+    /// way and later rounds still run; see the file doc comment above).
     Current,
     /// A live relay the phones were never told about, and no old relay has
     /// yet accepted a delivery for this change. Can last indefinitely if
@@ -899,7 +899,7 @@ pub enum PhoneRelayStatus {
     Pending,
     /// The `ph_relays` record exists, or the enrolled-phone count could not
     /// be read (a damaged `dk_ph` blob), but this firmware cannot make sense
-    /// of what it read — distinct from no record at all and genuinely zero
+    /// of what it read, distinct from no record at all and genuinely zero
     /// phones, both of which are [`PhoneRelayStatus::Current`] (nothing
     /// recorded, or nothing enrolled, is nothing known to be wrong).
     Unknown,
@@ -922,7 +922,7 @@ impl PhoneRelayStatus {
 /// shared `&EspNvs` read (`blob_len` then `get_blob`, sized to the blob's own
 /// length) rather than a [`BlobStore`], because the low-heap get_status
 /// fallback runs behind a shared reference it can never promote to a mutable
-/// one — the same reason `at_rest_status::resolve` reads its blobs directly.
+/// one, the same reason `at_rest_status::resolve` reads its blobs directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordRead<'a> {
     /// The key is not present at all.
@@ -935,7 +935,7 @@ pub enum RecordRead<'a> {
 }
 
 /// Classify the drift for Sapwood, purely from what is already known: how
-/// many phones are enrolled (`None` for a damaged `dk_ph` blob — see
+/// many phones are enrolled (`None` for a damaged `dk_ph` blob, see
 /// `at_rest_status::phone_count_from_blob`), the relay list the relay loop is
 /// actually running this boot, and what [`TOLD_RELAYS_KEY`] holds. Never
 /// writes.
@@ -944,10 +944,10 @@ pub enum RecordRead<'a> {
 /// is inspected: a damaged phone count means this firmware cannot say
 /// whether a phone is stranded, which is not the same claim as "none are".
 /// `Some(0)` and an empty `current` short-circuit to
-/// [`PhoneRelayStatus::Current`] before the record is even inspected —
-/// exactly [`relays_at_boot`]'s own guard — so a damaged record on a board
-/// with no phones, or no configured relay, is never reported as a problem
-/// nobody can act on.
+/// [`PhoneRelayStatus::Current`] before the record is even inspected, exactly
+/// [`relays_at_boot`]'s own guard, so a damaged record on a board with no
+/// phones, or no configured relay, is never reported as a problem nobody can
+/// act on.
 pub fn relay_status(phones: Option<usize>, current: &[String], record: RecordRead<'_>) -> PhoneRelayStatus {
     let have_phones = match phones {
         None => return PhoneRelayStatus::Unknown,
@@ -965,7 +965,7 @@ pub fn relay_status(phones: Option<usize>, current: &[String], record: RecordRea
         return PhoneRelayStatus::Unknown;
     };
     // `told.reached` only counts if it belongs to the same change `current`
-    // names — the identical `same_change` guard `relays_at_boot` applies
+    // names: the identical `same_change` guard `relays_at_boot` applies
     // before trusting its own `reached` (see the file doc comment above).
     let reached_this_change = told.reached && told.toward == set_tag(current);
     match relay_drift(Some(&told.relays), current) {
@@ -1727,7 +1727,7 @@ mod tests {
     #[test]
     fn a_damaged_phone_count_is_unknown_before_anything_else_is_inspected() {
         // `phones: None` means this firmware could not tell whether a phone
-        // is enrolled, which is not the same claim as "none are" — it must
+        // is enrolled, which is not the same claim as "none are"; it must
         // never be read as "no phones" (Current), even over an otherwise
         // perfectly ordinary settled record.
         let current = urls(&["wss://c.example"]);
@@ -1816,8 +1816,8 @@ mod tests {
     fn a_reached_flag_from_an_earlier_change_is_never_trusted_for_a_new_one() {
         // `reached: true` with a `toward` tag that does NOT match `current`
         // means the acceptance belongs to a change other than the one being
-        // asked about (a second change landed before the first ever settled)
-        // — it must report Pending, not ride on a stale acceptance.
+        // asked about (a second change landed before the first ever settled):
+        // it must report Pending, not ride on a stale acceptance.
         let old_change = urls(&["wss://a.example", "wss://b.example"]);
         let new_change = urls(&["wss://a.example", "wss://c.example"]);
         let told = ToldRecord {

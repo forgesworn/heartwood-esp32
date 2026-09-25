@@ -36,15 +36,15 @@ every state) behind a single firmware read (`pin::phone_relay_status`) that
 never writes, shared by all three call sites, and excluded from both delegate
 reply shapes via the same `DELEGATE_STATUS_KEYS`/`DELEGATE_STATUS_FALLBACK_KEYS`
 mechanism. `current`: no phones, no configured relay, or the recorded relay
-list matches what is in use — including once an old relay has accepted an
+list matches what is in use. This includes once an old relay has accepted an
 update for a change still mid-update (an old relay has accepted an update,
 not proof every phone heard it; later rounds still run regardless).
 `pending`: a live relay the phones were never told about, and nothing has
-accepted a delivery for this change yet — this can persist indefinitely if
+accepted a delivery for this change yet. This can persist indefinitely if
 every old relay is dead or refuses the kind-24135 delivery, and the only way
 out is revoking and re-enrolling the phones. `unknown`: the `ph_relays`
 record exists, or the enrolled-phone count could not be read, but this
-firmware cannot make sense of it — never confused with no record at all or
+firmware cannot make sense of it; never confused with no record at all or
 genuinely zero phones, both of which are `current` (nothing yet known to be
 wrong). Compares against the relay list the relay loop is actually running
 (`ctx.relays` on the relay.rs call sites; a shared read of the committed

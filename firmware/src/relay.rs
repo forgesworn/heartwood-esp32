@@ -6054,7 +6054,7 @@ fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
 /// `is_device_op` gates this exactly as the full reply does (`dispatch_mgmt`'s
 /// `get_status` arm): a per-identity delegate never sees the device-wide
 /// fields — `master_count`, `relay`, `crashed_during`, `at_rest`,
-/// `unlock_phone_count`, `phone_relays` and the rest — even under heap
+/// `unlock_phone_count`, `phone_relays` and the rest, even under heap
 /// pressure. The fallback must never be a wider leak than the reply it
 /// stands in for.
 fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op: bool) -> String {
@@ -6067,7 +6067,7 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op:
         // instead of each repeating the composition.
         let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
         // Plan G2's Sapwood follow-up: same idiom, same call site pattern as
-        // `at_rest`/`unlock_phone_count` above — see `pin::phone_relay_status`.
+        // `at_rest`/`unlock_phone_count` above; see `pin::phone_relay_status`.
         // `ctx.relays`, not a fresh net-config read: the list this relay loop
         // is actually running, with no extra heap parse on this low-heap path.
         let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
@@ -8960,7 +8960,7 @@ fn dispatch_mgmt(
             // Plan G2's Sapwood follow-up: "phones not yet told", the third
             // item on the follow-up list once #191 (relay update) and #192
             // (at-rest state) both merged. Same call-site pattern as
-            // `at_rest`/`unlock_phone_count` — see `pin::phone_relay_status`.
+            // `at_rest`/`unlock_phone_count`; see `pin::phone_relay_status`.
             // `ctx.relays`, not a fresh net-config read: the list this relay
             // loop is actually running (same list `relays_at_boot` compared
             // against), and no extra heap parse per poll.

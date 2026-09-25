@@ -495,25 +495,25 @@ changes hands:
   `unknown`), so a manager can show "phones not yet told" once a relay change
   leaves an enrolled phone stranded on relays this board has since left (see
   the relay-change record below). `current`: no phones enrolled, no live
-  relay configured, or the recorded relay list matches what is in use —
-  including once an old relay has accepted an update for the change still
+  relay configured, or the recorded relay list matches what is in use. This
+  includes once an old relay has accepted an update for the change still
   mid-update: an old relay has accepted an update, not proof every phone
   heard it, and later rounds still run regardless. `pending`: a live relay
   the phones were never told about, and no old relay has yet accepted a
   delivery for this change. If every old relay is dead or refuses the
-  kind-24135 delivery, `pending` can persist indefinitely — the only way out
+  kind-24135 delivery, `pending` can persist indefinitely; the only way out
   is revoking and re-enrolling the phones. `unknown`: the record exists, or
   the enrolled-phone count could not be read, but this firmware cannot make
-  sense of it — distinct from no record at all and genuinely zero phones,
+  sense of it, distinct from no record at all and genuinely zero phones,
   both of which are `current` (nothing is yet known to be wrong). Resolved by
   `heartwood_common::phone_relays::relay_status`, host-tested for every
   state, behind a pure firmware read (`pin::phone_relay_status`) that never
-  writes — same idiom as `at_rest_status` above, for the same reason: the
+  writes (same idiom as `at_rest_status` above, for the same reason: the
   low-heap `get_status` fallback runs behind a shared reference it can never
-  promote to a mutable one. Compares against the relay list the relay loop is
+  promote to a mutable one). Compares against the relay list the relay loop is
   actually running (not a fresh net-config read), the same list
   `relays_at_boot`/`record_round` compare against; a `reached` acceptance
-  only counts when it belongs to that same relay change — a stale acceptance
+  only counts when it belongs to that same relay change: a stale acceptance
   from an earlier, superseded change is never trusted. Device-only, like
   `at_rest` and `unlock_phone_count`: excluded from both delegate reply
   shapes by the same `DELEGATE_STATUS_KEYS`/`DELEGATE_STATUS_FALLBACK_KEYS`

@@ -2293,7 +2293,7 @@ subscribed to `{"kinds":[24135]}`).
     - Right after step 2 (drift recorded, nothing accepted yet): both read
       `"pending"`.
     - From the first "(n accepted)" old-relay line in step 3 or step 5
-      onward — even with five of six rounds still to run — both flip to
+      onward, even with five of six rounds still to run, both flip to
       `"current"`. It stays `"current"` through step 6's restart and step 7's
       ceiling wait: a resumed or deferred round never regresses it.
     - Step 8 (last phone revoked): both read `"current"` (no phones enrolled),
@@ -2302,13 +2302,13 @@ subscribed to `{"kinds":[24135]}`).
       `phone_relays` reads `"current"`), then before round 2 fires point the
       board at a THIRD relay set D (sharing no relay with A or C) and restart.
       The boot log resets to "0 of 6 update rounds already sent" for the new
-      change, and `phone_relays` reads `"pending"` again — the earlier
+      change, and `phone_relays` reads `"pending"` again; the earlier
       acceptance must not carry over to the new drift.
     - Damage: with the board unlocked, corrupt the `ph_relays` NVS entry
       directly (a raw NVS write, or interrupt a write mid-flash) and confirm
       both FIRMWARE_INFO and get_status read `"unknown"`. A subsequent reset
       logs "phones' relay record not readable by this firmware" and starts no
-      update — the status read must not have repaired or overwritten it.
+      update: the status read must not have repaired or overwritten it.
 
 ## Notes
 

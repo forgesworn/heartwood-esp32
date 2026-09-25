@@ -168,10 +168,10 @@ use secp256k1::Secp256k1;
 /// which always reports `0`.
 ///
 /// `phone_relays` (plan G2's Sapwood follow-up) is `"current"`, `"pending"` or
-/// `"unknown"` — whether an enrolled phone still needs telling about the
+/// `"unknown"`: whether an enrolled phone still needs telling about the
 /// board's relays (an old relay accepting an update is enough to clear
 /// `"pending"`; later rounds keep running regardless). If every old relay is
-/// dead or refuses the delivery, `"pending"` can persist indefinitely — the
+/// dead or refuses the delivery, `"pending"` can persist indefinitely, and the
 /// only way out is revoking and re-enrolling the phones. Also a pure read
 /// (`pin::phone_relay_status`), answered while locked for the same reason
 /// `at_rest` is: a stranded phone is exactly the case where a locked board
@@ -180,7 +180,7 @@ use secp256k1::Secp256k1;
 /// `running_relays`: the relay list this boot's relay loop is actually
 /// running, when the caller has one (locked or unlocked WiFi-standalone).
 /// `None` when no relay loop has resolved a list yet this boot (USB-bridged
-/// mode, or before WiFi-standalone's own boot decision has run) — the only
+/// mode, or before WiFi-standalone's own boot decision has run); the only
 /// case that falls back to `net_config_store::committed_or_active_relays`,
 /// which reads NVS instead of RAM.
 pub fn firmware_info_json(

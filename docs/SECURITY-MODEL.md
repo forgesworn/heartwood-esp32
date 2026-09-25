@@ -564,15 +564,16 @@ the data key after any restart, so adding one adds a persistent unlocker. It
 is always a press on the board, whichever way the request arrives:
 
 - **Cable:** `PHONE_UNLOCK_CMD` (0x64) `{"op":"enrol"}`, bridge-authenticated,
-  with a blocking card (60 s, like the relay's).
+  with a blocking card (45 s, like the relay's).
 - **Relay:** `enrol_unlock_phone` on the kind-24134 management channel. Device
   operator only: a per-identity delegate is refused before anything else is
   looked at, and a NIP-46 client has no route to management at all. The
   request spends the durable one-time mutation challenge before the card goes
   up, so a replay (live, or after a restart) raises no card. The card is held
-  on the deferred-approval queue (#64): 60 s on screen (twice every other
-  card's 30 s, for the words to be read and compared), at most 90 s waiting
-  behind other cards, one enrolment at a time, RAM only.
+  on the deferred-approval queue (#64): 45 s on screen (every other card
+  has 30 s; the words need time to be read and compared, and 45 s stays
+  under the relay loop's 50 s silence limit), at most 90 s waiting behind
+  other cards, one enrolment at a time, RAM only.
 - **What the owner checks:** both cards lead with the request code, five
   words of spoken-token's 2048-word list from the phone's one-off enrolment
   key P (`deriveToken(P, 'heartwood-unlock:enrol-request', 0, {format:
@@ -581,11 +582,18 @@ is always a press on the board, whichever way the request arrives:
   show them too, but only as a convenience: whoever relays the request can
   replace P, and the words in the browser with it. So that the comparison is
   actually made, the card shows the words large enough to read at arm's
-  length on the 128x64 OLED: two a page with their place numbers, stepping
-  every 4 s on its own, all five within 12 s and five times in the window
-  (bench, 2026-09-25: the old card's five words, two to a line in 6 px
-  letters, could only be read from a photograph, by which time the card had
-  gone).
+  length on the 128x64 OLED: two a page with their place numbers and a
+  "1-2 of 5" marker, stepping every 4 s on its own (bench, 2026-09-25: the
+  old card's five words, two to a line in 6 px letters, could only be read
+  from a photograph, by which time the card had gone). Paging brings its own
+  risk, an owner holding after page 1 having seen two words, 22 bits, which a
+  compromised browser grinds in moments. So neither card can be approved
+  until every page has been shown: for the first 12 s, one full cycle, the
+  hint reads "compare all 5 words" and no hold that STARTS then ever counts,
+  however long it runs; a short press then does nothing, so it cannot
+  decline and spend the phone's code (B/NO on a T-Display still cancels).
+  After the gate the pages keep turning, and each comes round at least twice
+  more before the card expires (`phone_unlock::PressGate`, host-tested).
 - **The real bound:** a compromised browser holds P from the moment the owner
   pastes the phone's code, before it sends anything, so it can grind a key of
   its own whose five words match for as long as the owner is willing to wait
@@ -598,9 +606,13 @@ is always a press on the board, whichever way the request arrives:
   of the button tags.
 - **What the check code does, and does not do:** after the press the board
   shows PHONE ADDED with the check code (from its one-off hand-off key E) and
-  "else revoke N", until a press (at most 5 minutes; a card or cable command
-  waiting for the screen takes over once it has stood 20 s). The phone and
-  Sapwood show the same code. It confirms
+  "else revoke N", until a press (at most 5 minutes). For its first 20 s it
+  holds the screen: a relay card waits behind it, and a cable command that
+  would put up its own card is refused "approval on screen" (refused, not
+  queued; the host retries). After that a queued relay card takes over and
+  the result is gone, while a cable command runs over the top of it and the
+  result is drawn again afterwards. The phone and Sapwood show the same
+  code. It confirms
   delivery and catches mix-ups (a stale or crossed hand-off, a phone that
   never received one); it does NOT prove the board sent the hand-off the
   phone holds. The hand-off is sealed from an unauthenticated one-off key, so

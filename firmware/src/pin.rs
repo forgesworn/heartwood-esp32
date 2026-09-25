@@ -21,7 +21,6 @@
 use crate::masters::LoadedMaster;
 use crate::serial::SerialPort;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
-use crate::nvs::ReplaceBlob;
 
 use crate::data_key_store::{self, Board, NvsBlobs};
 use crate::protocol;
@@ -29,7 +28,7 @@ use heartwood_common::data_key::{self, BlobStore, ChangeError, Pbkdf2};
 use heartwood_common::types::{FRAME_TYPE_ACK, FRAME_TYPE_NACK};
 use zeroize::Zeroize;
 
-const NVS_PIN_ATTEMPTS_KEY: &str = "pin_attempts";
+const NVS_PIN_ATTEMPTS_KEY: &str = data_key::PIN_ATTEMPTS_KEY;
 pub const MAX_FAILED_ATTEMPTS: u8 = 5;
 
 /// True if any loaded master's seed is encrypted and not yet decrypted — i.e.
@@ -47,19 +46,6 @@ pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str
         Ok(Some(_)) => Err("malformed PIN-attempt state"),
         Ok(None) => Ok(0),
         Err(_) => Err("could not read PIN-attempt state"),
-    }
-}
-
-fn write_failed_attempts(
-    nvs: &mut EspNvs<NvsDefault>,
-    count: u8,
-) -> Result<(), &'static str> {
-    nvs.replace_blob(NVS_PIN_ATTEMPTS_KEY, &[count])
-        .map_err(|_| "could not persist PIN-attempt state")?;
-    if read_failed_attempts(nvs)? == count {
-        Ok(())
-    } else {
-        Err("PIN-attempt state verification failed")
     }
 }
 
@@ -341,6 +327,31 @@ pub fn handle_pin_unlock(
         return false;
     }
 
+    // Count the guess on flash BEFORE checking it, so no power cut after the
+    // check (during the stretch, or once the PIN is refused) can leave it
+    // uncounted (`data_key::charge_pin_guess`). A right PIN clears the count
+    // inside `try_unlock`.
+    match data_key::charge_pin_guess(&mut NvsBlobs(nvs)) {
+        data_key::GuessCharge::Charged(count) => *failed_attempts = count,
+        data_key::GuessCharge::NotCounted => {
+            // The old count reads back intact: refuse this guess untried
+            // rather than wipe. Nothing was learned about the PIN.
+            log::error!("PIN attempt could not be counted (storage full?): guess refused untried");
+            crate::oled::show_error(display, "Storage full\nPIN not tried");
+            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+            protocol::write_frame(usb, FRAME_TYPE_NACK, b"storage_full: the PIN was not tried");
+            return false;
+        }
+        data_key::GuessCharge::Damaged(e) => {
+            // If the durable counter cannot be trusted, do not grant further
+            // guesses that a reboot could reset.
+            log::error!("PIN attempt persistence failed ({e}) — wiping fail-closed");
+            crate::oled::show_error(display, "PIN STATE ERROR\nWIPING...");
+            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+            wipe_and_reboot(usb, display);
+        }
+    }
+
     if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p)) {
         log::info!("PIN verified — seeds decrypted, device unlocked");
         // The durable counter is already cleared — `try_unlock` does that
@@ -352,15 +363,7 @@ pub fn handle_pin_unlock(
         protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
         true
     } else {
-        *failed_attempts = failed_attempts.saturating_add(1);
-        if let Err(e) = write_failed_attempts(nvs, *failed_attempts) {
-            // If the durable counter cannot be trusted, do not grant further
-            // guesses that a reboot could reset.
-            log::error!("PIN attempt persistence failed ({e}) — wiping fail-closed");
-            crate::oled::show_error(display, "PIN STATE ERROR\nWIPING...");
-            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
-            wipe_and_reboot(usb, display);
-        }
+        // Already counted on flash, above.
         log::warn!("PIN incorrect — attempt {}/{}", failed_attempts, MAX_FAILED_ATTEMPTS);
 
         if *failed_attempts >= MAX_FAILED_ATTEMPTS {

@@ -2291,26 +2291,30 @@ subscribed to `{"kinds":[24135]}`).
 `{"op":"enrol"}` does over the cable, on the deferred card queue (#64), so the
 relay loop keeps serving while the card is up. Device operator only, behind the
 one-time mutation challenge. The enrol card, cable and relay alike, stays up
-45 s (every other card keeps 30 s; 45 s stays under the relay loop's 50 s
-silence limit). It has a small top line `ADD "<label>"?`, then the request
+45 s (every other card keeps 30 s). It has a small top line `ADD "<label>"?`, then the request
 code, five words from the phone's enrolment key, a page at a time: words 1
 and 2 (0-3 s after the card opens), then 3 and 4 (4-7 s), then 5 (8-11 s),
-and round again, with no press. Each word has its own line with its place
+and round again, with no press. A page gives way only after it has been on
+screen its full 4 s, so a loop that stalls (a relay redial, a WiFi rejoin)
+leaves the page up longer rather than skipping the next. Each word has its own line with its place
 number beside it, in 12 px letters on the Heltec (FONT_6X10 at 2x). Below
 them the hint, then the countdown row: the page marker ("1-2 of 5", "3-4 of
-5", "5 of 5"), the bar and the seconds. For the first 12 s, one full cycle,
-the card cannot be approved: the hint reads "compare all 5 words", a hold
-that starts then never counts (however long it runs), and a short press does
+5", "5 of 5"), the bar and the seconds. Until every page has had its full
+dwell on screen and 12 s have passed (one cycle, longer after a stall), the
+card cannot be approved: the hint reads "compare all 5 words", a hold that
+starts then never counts (however long it runs), and a short press does
 nothing (it neither declines nor spends the key); B/NO on a T-Display still
-cancels. Once the cycle has been shown and the button is up, the hint reads
+cancels. A card whose pages could not all be shown in its 45 s expires
+("Expired"), adding nothing. Once the cycle has been shown and the button
+is up, the hint reads
 "on phone? hold PRG" (or YES, or the board's own button words). Nothing
 touches the button tags, with the screen either way up. The owner compares
 the board with the phone that made the key, never with the browser. The
 result screen (PHONE ADDED with the check code in large letters and "else
 revoke N", or NOT DONE) stays up until a fresh press, 5 minutes at most. For
 its first 20 s it holds the screen as before: a relay card queued behind it
-waits, and a cable command that puts up its own card is refused "approval on
-screen". After that a queued relay card takes over and the result is gone,
+waits, and in WiFi mode a cable command that puts up its own card is
+refused "approval on screen". After that a queued relay card takes over and the result is gone,
 while a cable command runs over the top of it and the result comes back
 about 2 s after (the release of that command's hold does not dismiss it); a
 network status or a note banner likewise shows and hands back.
@@ -2362,14 +2366,17 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
    "refused: not confirmed on the board in time" after 45 s, and the board
    shows "Expired". `list` shows no new record either time.
 
-2b. **No approval before all five words.** New run. On page 1, hold PRG for
-   5 s and let go (a hold that starts before the gate, running past it):
-   nothing happens, the card stays, the pages keep turning. Tap PRG during
-   the first 12 s: nothing happens either, no decline, and the same run can
-   still be approved (the key is not spent). After 12 s, with the button up,
-   the hint changes; a fresh 2 s hold approves. Repeat over the cable
-   (`enrol` without `--over-relay`): the same. On a T-Display, NO during the
-   first 12 s cancels at once ("declined on the board").
+2b. **No approval before all five words.** New run. When page 3 ("5 of 5")
+   comes up, 8-11 s in, start holding PRG and keep holding until about 16 s
+   (a hold that starts before the gate and runs well past it): nothing
+   happens, no hold bar, the card stays and the pages keep turning, and the
+   hint still reads "compare all 5 words" while the button is down. Let go:
+   the hint changes to "on phone? hold PRG", and a fresh 2 s hold approves.
+   On another run, tap PRG during the first 12 s: nothing happens either, no
+   decline, and the same run can still be approved (the key is not spent).
+   Repeat both over the cable (`enrol` without `--over-relay`): the same. On
+   a T-Display, NO during the first 12 s cancels at once ("declined on the
+   board").
 
 3. **One at a time; a key once.** Start two runs a few seconds apart: the
    second is refused at once ("another phone is already waiting for a press
@@ -2437,6 +2444,10 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     minute after the press takes over at once. Repeat with a cable
     enrolment (`phone-unlock.mjs enrol` without `--over-relay`) in WiFi mode
     and a relay sign request queued meanwhile: the same. With PHONE ADDED up,
+    start a second cable enrolment with a used code (refused before any
+    card): PHONE ADDED stays. Start one that raises its card and let it
+    expire: "Expired" shows for about 3 s, then the idle screen, not the old
+    PHONE ADDED.
     an auto-approved request (a kind the client's policy allows) shows its
     AUTO-SIGNED card for 5 s, then PHONE ADDED comes back. A USB
     `FIRMWARE_INFO` answers at any time while it is up, and PHONE ADDED
@@ -2450,7 +2461,7 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     the loop), and after 20 s a cable NIP-46 request is served. Also: after
     the cable enrol card of step 11 in WiFi mode (45 s with the loop held),
     the log shows no "silent (no data/pong); reconnecting" for a quiet relay
-    straight after.
+    straight after, and a ping goes out on the next pass.
 
 11. **Cable card matches.** `phone-unlock.mjs enrol` over USB: the same card
     layout, pages, markers, gate, five words and 45 s window, and PHONE ADDED

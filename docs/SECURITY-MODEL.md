@@ -571,9 +571,14 @@ is always a press on the board, whichever way the request arrives:
   request spends the durable one-time mutation challenge before the card goes
   up, so a replay (live, or after a restart) raises no card. The card is held
   on the deferred-approval queue (#64): 45 s on screen (every other card
-  has 30 s; the words need time to be read and compared, and 45 s stays
-  under the relay loop's 50 s silence limit), at most 90 s waiting behind
-  other cards, one enrolment at a time, RAM only.
+  has 30 s; the words need time to be read and compared), at most 90 s
+  waiting behind other cards, one enrolment at a time, RAM only. The relay
+  card does not block the relay loop. The cable card does, for up to about
+  55 s with its wait for the approving button to come up, which passes the
+  loop's 50 s silence limit, so a cable frame that holds the loop credits
+  every relay session's silence clock (`silence_from`) without pretending
+  anything was heard: the liveness judged at a relay enrolment's press is
+  still what was really heard.
 - **What the owner checks:** both cards lead with the request code, five
   words of spoken-token's 2048-word list from the phone's one-off enrolment
   key P (`deriveToken(P, 'heartwood-unlock:enrol-request', 0, {format:
@@ -588,12 +593,17 @@ is always a press on the board, whichever way the request arrives:
   from a photograph, by which time the card had gone). Paging brings its own
   risk, an owner holding after page 1 having seen two words, 22 bits, which a
   compromised browser grinds in moments. So neither card can be approved
-  until every page has been shown: for the first 12 s, one full cycle, the
-  hint reads "compare all 5 words" and no hold that STARTS then ever counts,
-  however long it runs; a short press then does nothing, so it cannot
-  decline and spend the phone's code (B/NO on a T-Display still cancels).
-  After the gate the pages keep turning, and each comes round at least twice
-  more before the card expires (`phone_unlock::PressGate`, host-tested).
+  until every page has actually been on screen for its full 4 s dwell and
+  12 s have passed: the pages turn on what was drawn, not on the clock, so a
+  loop held up by a stalling relay (a redial, a rejoin) cannot let the gate
+  open with words 3 to 5 never shown; the page on screen simply stays up
+  longer. Until then the hint reads "compare all 5 words" and no hold that
+  STARTS then ever counts, however long it runs; a short press does
+  nothing, so it cannot decline and spend the phone's code (B/NO on a
+  T-Display still cancels). The cable and relay cards share the rule
+  (`phone_unlock::EnrolGate`, host-tested). A card whose pages could not all
+  be shown in its 45 s expires and adds nothing; the window is not extended,
+  since expiry is the safe failure and the owner starts again.
 - **The real bound:** a compromised browser holds P from the moment the owner
   pastes the phone's code, before it sends anything, so it can grind a key of
   its own whose five words match for as long as the owner is willing to wait
@@ -607,9 +617,11 @@ is always a press on the board, whichever way the request arrives:
 - **What the check code does, and does not do:** after the press the board
   shows PHONE ADDED with the check code (from its one-off hand-off key E) and
   "else revoke N", until a press (at most 5 minutes). For its first 20 s it
-  holds the screen: a relay card waits behind it, and a cable command that
-  would put up its own card is refused "approval on screen" (refused, not
-  queued; the host retries). After that a queued relay card takes over and
+  holds the screen: a relay card waits behind it, and in WiFi mode a cable
+  command that would put up its own card is refused "approval on screen"
+  (refused, not queued; the host retries). The USB-bridged loop refuses
+  nothing: its host waits on every frame, and the result is drawn again
+  after each. After that a queued relay card takes over and
   the result is gone, while a cable command runs over the top of it and the
   result is drawn again afterwards. The phone and Sapwood show the same
   code. It confirms

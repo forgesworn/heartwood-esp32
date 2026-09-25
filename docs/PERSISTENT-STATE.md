@@ -64,8 +64,10 @@ Every blob in this table is written through `ReplaceBlob`
 before it: a power cut during a write leaves the key's old value or its new
 one, never neither. `net_rev` and `ncfg_crc` are `u32` items, which
 `nvs_set_u32` replaces the same way. No write spans two keys, which is what
-the journals below are for. See "Power cuts and NVS writes" in
-SECURITY-MODEL.md.
+the journals below are for. A replace needs room for both copies; one that
+might not fit is refused before ESP-IDF is asked, except that a revocation of
+`connslots_N` or `dk_ph` erases first. See "Power cuts and NVS writes" in
+SECURITY-MODEL.md for the per-key table and the growth gate.
 
 The factory/PIN wipe erases the partition rather than enumerating this table,
 so a future or unknown key cannot survive merely because a cleanup list was not

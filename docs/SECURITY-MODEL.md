@@ -573,15 +573,58 @@ minted note key, a PIN wipe counter back at zero. The firmware now writes
 every blob through `ReplaceBlob` (`firmware/src/nvs.rs`), which calls
 `nvs_set_blob` and `nvs_commit` with no erase. The host store in
 `common/src/data_key.rs` models both orders: its cut-point sweeps hold at
-every cut with the direct replace and fail with the erase-first one.
+every cut with the direct replace and fail with the erase-first one. The
+PIN wipe counter is also raised before a guess is checked rather than after,
+so a cut once the board has judged a PIN cannot leave that guess uncounted;
+a count that cannot be written, with the old one reading back intact,
+refuses the guess untried instead of wiping.
 
-What it does not provide:
+The price is room: the new copy is written while the old one still holds its
+entries, so a replace needs space for both. Asking ESP-IDF anyway is not
+safe on a nearly full partition. When a v5.3.2 blob write runs out of room
+part-way, its cleanup erases chunk `ii` of each page it used rather than
+chunk `chunkStart + ii` (`nvs_storage.cpp:363-368`, unchanged in the 6.0.1
+tree), and every second replace of a key is written at the version-1 offset,
+so the cleanup can erase a chunk of the old copy (dropped as incomplete at
+its next read) and leave the new chunks live to spoil a later retry at boot.
+`ReplaceBlob` therefore reads `available_entries` (free entries less the page
+NVS keeps back for garbage collection) and plans every write first
+(`common/src/nvs_budget.rs`): if a conservative count of the entries the new
+copy needs does not fit, ESP-IDF is never called and the write is refused
+with the old value untouched. Rewriting a value already stored is a no-op.
+
+Two rules keep that from locking a full board:
+
+- **Growth is gated.** A new or wider pairing table, a persona, an unlock
+  phone and an avatar are written only if afterwards there is still room to
+  rewrite the largest pairing table, phone record set or persona chunk in
+  place, plus a reserve for the small keys (`nvs::growth_allowed`). Cached
+  avatars are dropped first when that makes room for a pairing. A board
+  that stays within this never needs the fallback below.
+- **A revocation that does not fit erases first, for two keys only.**
+  Failing a revocation would leave the revoked party authorised, so:
+
+| Key | Replace that does not fit in place |
+|-----|-----------------------------------|
+| `connslots_N` | Revocation (revoke a pairing, remove a client key, withdraw an identity grant) that does not grow the table: legacy `master_N_conn` removed, then erase and write. A cut in between leaves that identity with no pairings. Any other change: refused |
+| `dk_ph` | Revoking a phone: erase and write. A cut in between leaves no unlock phones; the PIN or vault key still opens the board. Enrolment: refused |
+| `dk_sec`, `mN_seed_enc`, `master_N_secret`, `at_rest_kind` | Refused. Losing the wrapper or a seed loses the keys |
+| `nk`, note records, `idx` | Refused. Losing `nk` strands sealed notes; a note record is money |
+| `pin_attempts`, `mgmt_nonce`, `mgmt_<operator>` | Refused. An absent value resets a counter or replay boundary an attacker is up against |
+| `rm_journal`, persona journals, `pc{c}`, `net_trial`, `net_last`, `ph_relays`, everything else | Refused. An absent journal abandons a transaction half done |
+
+Splitting `connslots_N` into one key per pairing would shrink the largest hot
+blob from the whole table (several KB with a dozen pairings) to one pairing,
+so a revocation would always fit in place and the growth reserve would
+shrink with it. It needs a migration and a new boot loader, and is not built.
+
+What none of this provides:
 
 - Atomicity across keys. A change spanning several keys relies on its own
   write order or journal, as each module documents.
-- Room to spare. The new copy is written while the old one still holds its
-  entries, so a replace needs space for both at once. A write that does not
-  fit fails and leaves the old value, where the erase-first order lost it.
+- A guarantee from the entry count. It is an upper bound derived from the
+  v5.3.2 write path, not a proof; if a write still runs out of room part-way,
+  the ESP-IDF cleanup defect above applies.
 - Removal of the old bytes. The superseded copy is marked erased, not
   overwritten, and stays readable in a raw flash dump until NVS reclaims its
   page.

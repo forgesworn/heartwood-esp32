@@ -25,6 +25,7 @@ use heartwood_common::data_key::{self, PhoneSet, LABEL_MAX};
 use heartwood_common::phone_unlock::{self, EnrolError, PhoneCmd};
 use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_PHONE_UNLOCK_RESP};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::data_key_store::{self, NvsBlobs};
@@ -38,6 +39,15 @@ use crate::serial::SerialPort;
 /// made were never read). Refused before any card is shown.
 static USED_ENROL_KEYS: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
 const USED_ENROL_KEYS_MAX: usize = 16;
+
+/// Set by a revoke or an enrolment, so a relay update under way (relay.rs
+/// RelayUpdate) checks its record on its next pass instead of its next round.
+static PHONES_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the phones changed since the last call.
+pub fn take_phones_changed() -> bool {
+    PHONES_CHANGED.swap(false, Ordering::AcqRel)
+}
 
 /// Handle a PHONE_UNLOCK_CMD frame (0x64).
 pub fn handle_frame(
@@ -109,6 +119,7 @@ pub fn run(
             let mut phones = load(nvs)?;
             phones.revoke(id).map_err(|_| format!("no phone with id {id}"))?;
             save(nvs, &phones)?;
+            PHONES_CHANGED.store(true, Ordering::Release);
             log::info!("phone unlock: revoked phone {id}");
             // No phone listens anywhere now; the next enrolment records afresh.
             if phones.is_empty() && heartwood_common::phone_relays::forget_told(&mut NvsBlobs(nvs)).is_err() {
@@ -195,6 +206,7 @@ pub fn run(
             // Persist before answering: a phone is never handed a secret the
             // board did not keep. A full NVS refuses here, cleanly.
             save(nvs, &phones)?;
+            PHONES_CHANGED.store(true, Ordering::Release);
             log::info!("phone unlock: enrolled phone {} ({label})", enrolment.id);
             // The phone was handed `relays`. As the only phone, whatever the
             // record said belonged to phones that are gone, so it is replaced;

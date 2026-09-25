@@ -2767,6 +2767,15 @@ fn service_relay_update(
     let Some(u) = update.as_mut() else {
         return;
     };
+    // A revoke or an enrolment since the last pass may have replaced or
+    // removed the record: if so, end now rather than at the next round.
+    if crate::phone_unlock_cmd::take_phones_changed()
+        && !phone_relays::record_is(&crate::data_key_store::NvsBlobs(ctx.nvs), u.plan.expected()).unwrap_or(false)
+    {
+        log::info!("[relay] phones' relay record changed (revoke or enrolment); relay update ended");
+        *update = None;
+        return;
+    }
     let now = crate::uptime_s();
     let view = phone_relays::Sessions {
         live: sessions.len(),
@@ -2844,7 +2853,7 @@ fn service_relay_update(
             };
             if phone_relays::round_phones(u.plan.round_ids(), &table).next().is_none() {
                 log::info!("[relay] no phone of this round is still enrolled; round skips {}", relay_host(&url));
-                u.plan.dialled(false);
+                u.plan.skip();
                 return;
             }
             match step_aside {
@@ -2859,6 +2868,16 @@ fn service_relay_update(
                 }
                 phone_relays::StepAside::Pinned => {
                     if let Some(pos) = sessions.iter().position(|s| s.pinned) {
+                        // Only an idle pinned session closes: nothing buffered,
+                        // nothing received for a few seconds, so no NIP-46
+                        // request is dropped. Otherwise try again next pass.
+                        let quiet = &sessions[pos];
+                        if !phone_relays::pinned_may_step_aside(
+                            quiet.rx.is_empty() && quiet.skip == 0,
+                            quiet.last_rx.elapsed().as_secs(),
+                        ) {
+                            return;
+                        }
                         let shed = sessions.remove(pos);
                         log::info!("[relay] pinned {} steps aside for one relay update dial", relay_host(&shed.url));
                         if let Some(p) = pinned.iter_mut().find(|p| same_relay(&p.url, &shed.url)) {
@@ -2899,7 +2918,10 @@ fn service_relay_update(
         phone_relays::UpdateAction::FinishRound => {
             u.key = None;
             let reached = u.plan.reached();
-            let done = u.plan.finish_round(now, secure_draw());
+            let phone_relays::RoundEnd::Counted { done } = u.plan.finish_round(now, secure_draw()) else {
+                log::info!("[relay] relay update round dialled no relay (heap too tight); it will run again");
+                return;
+            };
             log::info!(
                 "[relay] relay update round {done} done: {reached} of {} old relay(s) took it",
                 u.plan.old().len()
@@ -2909,6 +2931,7 @@ fn service_relay_update(
                 u.plan.expected(),
                 relays,
                 done,
+                u.plan.reached_any(),
             );
             match recorded {
                 Ok(phone_relays::RoundRecorded::Progress(record)) => u.plan.recorded(record),

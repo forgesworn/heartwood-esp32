@@ -114,8 +114,9 @@ pub enum SkipReason {
     UnknownState,
     /// A format version other than the one this firmware writes.
     OtherVersion,
-    /// The page changed between planning and writing (another NVS writer),
-    /// so the rest of it was left for the next pass.
+    /// The page header changed between planning and writing (the sector was
+    /// collected, or its state moved on), so the rest of it was left for the
+    /// next pass. Counted in `pages_skipped` like the others.
     Changed,
 }
 
@@ -159,7 +160,8 @@ pub struct ScrubReport {
     pub already_clean: u32,
     /// ERASED or ILLEGAL entries deliberately left on parsed pages.
     pub left: u32,
-    /// Pages skipped whole (unreadable, unparsed, or changed mid-pass).
+    /// Pages skipped whole (unreadable, unparsed), plus pages whose header
+    /// changed part-way through the pass.
     pub pages_skipped: u32,
     /// Writes that failed or did not read back as zero.
     pub failed: u32,
@@ -350,10 +352,24 @@ pub fn plan_page(page: &[u8]) -> PagePlan {
     plan
 }
 
-/// Whether entry `index` may still be zeroed: the page header is exactly the
-/// one planned against (same state, sequence number and CRC, so the sector
-/// has not been collected and reused) and the entry is still ERASED. `now`
-/// is a fresh read of the page's first [`DATA_OFFSET`] bytes.
+/// Whether entry `index` may still be zeroed. Compares only the 32-byte page
+/// header (state word, sequence number, version, CRC) with the one planned
+/// against, plus the target entry's own two state bits; the rest of the
+/// bitmap is not compared. `now` is a fresh read of the page's first
+/// [`DATA_OFFSET`] bytes.
+///
+/// That suffices because ERASED (`0b00`) is terminal: state bits only ever
+/// go from 1 to 0, so an ERASED entry stays ERASED until its sector is
+/// erased, and NVS never reads an ERASED entry's data. The only way the
+/// planned entry could come to hold live data is a sector erase and reuse,
+/// which rewrites the header: the erase leaves it all `0xff`, and NVS then
+/// initialises it with the next, strictly higher sequence number
+/// (`PageManager::activatePage`, `nvs_pagemanager.cpp:198-215`, and
+/// `Page::initialize`, `nvs_page.cpp:767-786`). A page that only moved from
+/// ACTIVE to FULL or FREEING also fails the check, which merely leaves it
+/// for the next pass. It is a backstop, not a lock: a writer between this
+/// read and the write would not be seen, which is why nothing else may
+/// write NVS during a pass (`firmware/src/nvs_scrub.rs`).
 pub fn still_erased(planned: &[u8], now: &[u8], index: usize) -> bool {
     now.len() >= DATA_OFFSET
         && now[..BITMAP_OFFSET] == planned[..BITMAP_OFFSET]
@@ -371,9 +387,10 @@ pub trait Flash {
 /// One pass over a partition of `size` bytes. `page` is a caller-owned
 /// buffer of [`PAGE_SIZE`] bytes (so the firmware decides where it lives).
 ///
-/// Per page: read it, plan it, then for each entry re-read the header and
-/// bitmap, program the entry to zero only if [`still_erased`] holds, and read
-/// it back. The first change seen stops that page for this pass.
+/// Per page: read it, plan it, then for each entry re-read the page header
+/// and bitmap, program the entry to zero only if [`still_erased`] holds (the
+/// header is unchanged and that entry is still ERASED), and read it back.
+/// The first failed check stops that page for this pass.
 pub fn scrub<F: Flash>(flash: &mut F, size: usize, page: &mut [u8]) -> ScrubReport {
     let mut report = ScrubReport::default();
     if page.len() != PAGE_SIZE {

@@ -15,13 +15,13 @@
 // loop runs there, and the only other thread, the button sampler, never
 // touches NVS), and so does every call here. WiFi is created with no NVS
 // partition (`EspWifi::new(.., None)`), so its driver keeps nothing there.
-// The one ESP-IDF writer left is PHY calibration, which stores to the `phy`
-// namespace inside the first `esp_phy_enable` of a boot (esp_phy
-// phy_init.c:252-254, :865-880), reached from the WiFi driver while WiFi
-// starts. Boot runs the scrub before any WiFi exists; every later call comes
-// from the main task after `BlockingWifi::start` has returned, and the
-// common module still re-reads the page header and bitmap before each write
-// and stops on a page that changed.
+// PHY calibration, the one ESP-IDF writer that would otherwise store to NVS
+// (the `phy` namespace, inside the first `esp_phy_enable` of a boot, from the
+// closed WiFi driver: esp_phy phy_init.c:252-254, :859-880), is compiled out
+// by CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n (sdkconfig.defaults). As a
+// backstop, the common module re-checks before each write that the page
+// header is unchanged and the target entry still ERASED
+// (`nvs_scrub::still_erased`), and stops on that page if not.
 
 use core::ffi::{c_char, c_void};
 use std::sync::Mutex;

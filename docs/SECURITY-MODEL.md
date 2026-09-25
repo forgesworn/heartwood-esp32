@@ -773,14 +773,29 @@ write NVS during a pass. Every firmware NVS write and every pass run on the
 main task; the only other thread, the button sampler, never touches NVS. WiFi
 is created with no NVS partition (`EspWifi::new(.., None)`, which esp-idf-svc
 0.52.1 turns into `nvs_enable = 0`, `src/wifi.rs:477`, `:566`). The one
-ESP-IDF writer left is PHY calibration, stored to the `phy` namespace inside
-the first `esp_phy_enable` of a boot (`esp_phy/src/phy_init.c:252-254`,
-`:865-880`), reached from the closed WiFi driver while WiFi starts. Boot runs
-the scrub before WiFi exists; later passes run on the main task after
-`BlockingWifi::start` has returned. That the calibration store has finished
-by then is inferred, not verified (it runs in the closed driver). As a
-backstop the scrub re-reads each page's header and bitmap before every write
-and stops on a page that changed (`still_erased`).
+ESP-IDF writer that would remain is PHY calibration, which by default stores
+to the `phy` namespace inside the first `esp_phy_enable` of a boot whenever
+the stored data is missing or bad (`esp_phy/src/phy_init.c:252-254`,
+`:859-880`), from inside the closed WiFi driver while WiFi starts, so
+possibly after `BlockingWifi::start` has returned. The firmware builds with
+`CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n` (`firmware/sdkconfig.defaults`,
+under every board), which compiles that path out: the PHY runs a full
+calibration once per boot (`:881-883`), about 100 ms longer than the partial
+one it replaces, and never touches NVS. Boards that stored calibration under
+earlier firmware keep those `phy` keys as live entries nothing reads any
+more (about 2 KB); harmless, and a factory wipe clears them.
+
+As a backstop, before each write the scrub re-reads the page's header and
+bitmap and checks that the 32-byte header is byte-for-byte the one it
+planned against and that the target entry is still ERASED
+(`still_erased`); it does not compare the rest of the bitmap. That is
+enough because ERASED is terminal (state bits only go from 1 to 0, so an
+ERASED entry stays ERASED until its sector is erased), and a sector can only
+be erased and reused by rewriting its header, with a strictly higher
+sequence number (`nvs_pagemanager.cpp:198-215`, `nvs_page.cpp:767-786`). A
+failed check stops that page for the pass. It is a check, not a lock: a
+writer between the check and the write would not be seen, which is why no
+other writer may run.
 
 **On the wire.** `get_status.capabilities` carries `nvs_scrub_v1`. The
 `revoke_unlock_phone` answer (USB and relay) gains

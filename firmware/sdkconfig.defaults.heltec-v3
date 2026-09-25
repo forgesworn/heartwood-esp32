@@ -19,3 +19,12 @@ CONFIG_ESP_CONSOLE_NONE=y
 
 # Flash -- the V3 uses the ESP32-S3FN8 with 8MB in-package flash.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# Compile ESP-IDF's own C log calls out (Wi-Fi, TLS, NVS, the drivers). With
+# the console off above, every one of those lines is formatted and then
+# dropped, and the Rust side is already built with log/release_max_level_off,
+# so this only removes the format strings and call sites: about 59 KB of the
+# app image, and nothing a V3 user could see changes. A dev build that brings
+# a console back must lift this too (CONFIG_LOG_DEFAULT_LEVEL_INFO=y), or it
+# will stay silent. The colour-panel boards keep their C logs at the default.
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y

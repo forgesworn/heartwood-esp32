@@ -126,6 +126,11 @@ pub mod note_seal;
 #[cfg(feature = "seed-encrypt")]
 pub mod data_key;
 
+/// The at-rest mode and unlock-phone count reported in FIRMWARE_INFO and
+/// get_status, derived from `data_key`'s durable state.
+#[cfg(feature = "seed-encrypt")]
+pub mod at_rest_status;
+
 /// Phone unlock on the wire: per-phone lock announcements, deliveries and the
 /// phone's prompt rule.
 #[cfg(all(feature = "seed-encrypt", feature = "nip44", feature = "nip46"))]

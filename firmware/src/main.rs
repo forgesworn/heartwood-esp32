@@ -155,7 +155,18 @@ use secp256k1::Secp256k1;
 /// the heap curve instead of only pass/fail, and a manager can show why a
 /// request that worked yesterday is refused today. Neither is a secret: they
 /// are allocator statistics, not contents.
-pub fn firmware_info_json() -> String {
+///
+/// `at_rest` ("none"/"pin"/"vault"/"encrypted") and `unlock_phone_count`
+/// (plan G2) let Sapwood's mode chooser stop inferring the mode from side
+/// effects it happened to witness this session. Both come from
+/// `pin::at_rest_status`, a pure read — so answering this frame never writes
+/// anything — and this is answered before any PIN or vault key is entered: a
+/// locked board is exactly when a manager most needs to know which kind of
+/// unlock it is waiting for. Neither field names a phone. `unlock_phone_count`
+/// is JSON `null`, not `0`, when a present phone blob fails to parse — damage
+/// is never reported as "no phones" — except when `at_rest` is `"none"`,
+/// which always reports `0`.
+pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>) -> String {
     let crash = crash_context()
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
         .unwrap_or_default();
@@ -178,11 +189,13 @@ pub fn firmware_info_json() -> String {
             )
         })
         .unwrap_or_default();
+    let (at_rest, unlock_phones) = pin::at_rest_status(nvs);
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
-         \"free_heap\":{},\"largest_block\":{},\"display_flip\":{}{}{}}}",
+         \"free_heap\":{},\"largest_block\":{},\"display_flip\":{},\
+         \"at_rest\":\"{}\",\"unlock_phone_count\":{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -194,9 +207,21 @@ pub fn firmware_info_json() -> String {
         free_heap,
         largest_block,
         display_flip::is_flipped(),
+        at_rest.wire(),
+        json_usize_or_null(unlock_phones),
         crash,
         nvs_stats,
     )
+}
+
+/// `Option<usize>` as a bare JSON token (`null` or the number), for the
+/// hand-built `format!` strings in this module — `serde_json` isn't in the
+/// picture here the way it is in `relay.rs`'s `get_status`.
+fn json_usize_or_null(v: Option<usize>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "null".to_string(),
+    }
 }
 
 /// Minimal JSON string escaping for the small, non-secret breadcrumb labels.
@@ -588,7 +613,7 @@ fn main() {
                     protocol::write_frame(
                         &mut usb,
                         FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                        firmware_info_json().as_bytes(),
+                        firmware_info_json(&nvs).as_bytes(),
                     );
                 }
                 FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
@@ -804,7 +829,7 @@ fn main() {
                     protocol::write_frame(
                         &mut usb,
                         FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                        firmware_info_json().as_bytes(),
+                        firmware_info_json(&nvs).as_bytes(),
                     );
                 }
                 FRAME_TYPE_FACTORY_RESET => {
@@ -1068,7 +1093,7 @@ fn main() {
                 protocol::write_frame(
                     &mut usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    firmware_info_json().as_bytes(),
+                    firmware_info_json(&nvs).as_bytes(),
                 );
             }
 

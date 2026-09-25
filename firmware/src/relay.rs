@@ -2445,7 +2445,7 @@ fn locked_relay_phase(
                 FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
                     usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    crate::firmware_info_json().as_bytes(),
+                    crate::firmware_info_json(nvs).as_bytes(),
                 ),
                 FRAME_TYPE_PROVISION_LIST => {
                     // Safe while locked (npubs only, no secrets) and REQUIRED
@@ -2674,7 +2674,8 @@ fn handle_vault_delivery(
     });
     if ok {
         log::info!("[relay] vault key accepted — device unlocked");
-        crate::pin::clear_failed_attempts(nvs);
+        // `try_unlock` already cleared the PIN-attempt counter, before its
+        // own optional writes (migration, marker self-repair).
         // The note key rides the same secret (see the locked-phase USB
         // unlock arms) — sync before the key is scrubbed.
         crate::notes::sync_sealed(&vault_key);
@@ -2788,7 +2789,7 @@ fn poll_usb(
         FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
             usb,
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-            crate::firmware_info_json().as_bytes(),
+            crate::firmware_info_json(ctx.nvs).as_bytes(),
         ),
 
         // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
@@ -5638,11 +5639,22 @@ fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
 /// no-PSRAM heap. get_status is polled every few seconds, so the poll that
 /// reports a starved heap must never itself be the allocation that reboots the
 /// signer. `truncated` tells the manager the request log was omitted this poll.
-fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize) -> String {
+///
+/// `is_device_op` gates this exactly as the full reply does (`dispatch_mgmt`'s
+/// `get_status` arm): a per-identity delegate never sees the device-wide
+/// fields — `master_count`, `relay`, `crashed_during`, `at_rest`,
+/// `unlock_phone_count` and the rest — even under heap pressure. The fallback
+/// must never be a wider leak than the reply it stands in for.
+fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op: bool) -> String {
     let master_hex = hex_encode(&ctx.masters[master_idx].pubkey);
-    serde_json::json!({
-        "id": id,
-        "result": {
+    let result = if is_device_op {
+        // Plan G2: one call resolves both fields (mode from the wrap/marker,
+        // count from `dk_ph`, and how the two combine) — see
+        // `pin::at_rest_status` and `heartwood_common::at_rest_status::
+        // resolve`, which this and `dispatch_mgmt`'s full reply both call
+        // instead of each repeating the composition.
+        let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
+        serde_json::json!({
             "master_count": ctx.masters.len(),
             "master_npub_hex": master_hex,
             "mode": "wifi-standalone",
@@ -5655,12 +5667,39 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize) -> String {
                 esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
             } as u32,
             "log_quiet": crate::log_quiet::read(ctx.nvs),
+            "at_rest": at_rest.wire(),
+            "unlock_phone_count": unlock_phone_count,
             "version": env!("CARGO_PKG_VERSION"),
             "board": crate::board::BOARD,
             "truncated": true,
+        })
+    } else {
+        // Built from `heartwood_common::at_rest_status::
+        // DELEGATE_STATUS_FALLBACK_KEYS`, not just typed out to match it: a
+        // future key added to the constant without a matching arm here is a
+        // panic, not a silent leak past the host-tested subset check on that
+        // constant. The reduced shape a delegate's normal get_status reply
+        // carries (`dispatch_mgmt`, `DELEGATE_STATUS_KEYS`) minus
+        // `capabilities`, `slots` and `client_storage_ready` — the low-heap
+        // path should not spend memory on the policy-engine calls those need
+        // either.
+        let mut fields = serde_json::Map::new();
+        for key in heartwood_common::at_rest_status::DELEGATE_STATUS_FALLBACK_KEYS {
+            let value = match *key {
+                "master_npub_hex" => serde_json::Value::String(master_hex.clone()),
+                "mode" => serde_json::Value::String("wifi-standalone".to_string()),
+                "version" => serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+                "board" => serde_json::Value::String(crate::board::BOARD.to_string()),
+                "truncated" => serde_json::Value::Bool(true),
+                other => unreachable!(
+                    "DELEGATE_STATUS_FALLBACK_KEYS names {other}, with no matching arm here"
+                ),
+            };
+            fields.insert((*key).to_string(), value);
         }
-    })
-    .to_string()
+        serde_json::Value::Object(fields)
+    };
+    serde_json::json!({ "id": id, "result": result }).to_string()
 }
 
 /// NIP-46 signing path (kind 24133): resolve the addressed identity → decrypt →
@@ -6422,7 +6461,7 @@ fn handle_mgmt_event(
             "[relay] get_status response ({} B) too large for free heap; sending minimal status",
             response_json.len()
         );
-        minimal_status_json(&id, ctx, master_idx)
+        minimal_status_json(&id, ctx, master_idx, is_device_op)
     } else {
         log::warn!(
             "[relay] mgmt {method} response ({} B) too large for free heap; returning error instead of risking a crash",
@@ -8463,21 +8502,43 @@ fn dispatch_mgmt(
             ]);
             // A delegate (per-identity operator) sees only what it needs to
             // feature-detect and manage its own identity — never the
-            // device-wide audit ring, relay topology, storage inventory, or an
-            // enumeration of the owner's other identities.
+            // device-wide audit ring, relay topology, storage inventory, an
+            // enumeration of the owner's other identities, or the at-rest
+            // mode and phone count below (device-wide properties, not this
+            // identity's). Built from
+            // `heartwood_common::at_rest_status::DELEGATE_STATUS_KEYS`, not
+            // just typed out to match it, for the same reason
+            // `minimal_status_json`'s fallback is: a key added here without
+            // updating the constant is a panic, not a silent leak past the
+            // host-tested subset check the fallback depends on.
             if !is_device_op {
-                return Ok(serde_json::json!({
-                    "master_npub_hex": master_hex,
-                    "mode": "wifi-standalone",
-                    "capabilities": capabilities,
-                    "slots": ctx.policy_engine.list_slots(master_slot).len(),
-                    "client_storage_ready": ctx.policy_engine.storage_ready(master_slot),
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "board": crate::board::BOARD,
-                }));
+                let mut fields = serde_json::Map::new();
+                for key in heartwood_common::at_rest_status::DELEGATE_STATUS_KEYS {
+                    let value = match *key {
+                        "master_npub_hex" => serde_json::Value::String(master_hex.clone()),
+                        "mode" => serde_json::Value::String("wifi-standalone".to_string()),
+                        "capabilities" => capabilities.clone(),
+                        "slots" => serde_json::json!(ctx.policy_engine.list_slots(master_slot).len()),
+                        "client_storage_ready" => {
+                            serde_json::json!(ctx.policy_engine.storage_ready(master_slot))
+                        }
+                        "version" => serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+                        "board" => serde_json::Value::String(crate::board::BOARD.to_string()),
+                        other => unreachable!(
+                            "DELEGATE_STATUS_KEYS names {other}, with no matching arm here"
+                        ),
+                    };
+                    fields.insert((*key).to_string(), value);
+                }
+                return Ok(serde_json::Value::Object(fields));
             }
             let mut relays_live = vec![s.url.clone()];
             relays_live.extend(pool.others.iter().map(|o| o.url.clone()));
+            // Plan G2: one call resolves both fields (mode from the
+            // wrap/marker, count from `dk_ph`, and how the two combine) —
+            // see `pin::at_rest_status` and `heartwood_common::
+            // at_rest_status::resolve`. Never a phone id, label or hint.
+            let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
             Ok(serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,
@@ -8509,6 +8570,14 @@ fn dispatch_mgmt(
                 // stats API fails, so "unknown" is not "empty").
                 "nvs": crate::nvs_stats::as_json(),
                 "max_personas": crate::personas::MAX_PERSONAS,
+                // At-rest mode ("none"/"pin"/"vault"/"encrypted") and how
+                // many phones can unlock this board (plan G2). Only reachable
+                // here at all once genuinely unlocked — a locked board runs
+                // `locked_relay_phase` instead, which never reaches
+                // `dispatch_mgmt`; FIRMWARE_INFO is the surface that reports
+                // this while locked (see its doc comment).
+                "at_rest": at_rest.wire(),
+                "unlock_phone_count": unlock_phone_count,
                 // Running firmware, so managers can show version state over
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),

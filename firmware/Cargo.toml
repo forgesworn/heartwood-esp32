@@ -104,8 +104,13 @@ embuild = "0.33"
 
 # Size-optimise the release binary. The WiFi-standalone + on-device-generation
 # firmware must fit the 2 MB ota_0 slot; default release (opt-level=3) overflowed
-# it. opt-level="z" + a single codegen unit claws it back. (LTO is NOT used —
-# it breaks the secp256k1-sys C build under the xtensa -mlongcalls toolchain.)
+# it. opt-level="z" + a single codegen unit claws it back. LTO is not used. It
+# once broke the secp256k1-sys C build; with -mlongcalls in .cargo/config.toml
+# `lto = "fat"` now links on esp 1.87.0.0 and saves about 135 KB on the Heltec
+# image ("thin" about 45 KB), but it re-inlines every Rust frame, so task stack
+# depth and timing would need a bench pass before it ships. It is the next lever
+# if the slot fills again; std's backtrace (see .cargo/config.toml) and the C
+# log level (the Heltec sdkconfig fragments) were the cheaper ones.
 [profile.release]
 opt-level = "z"
 codegen-units = 1

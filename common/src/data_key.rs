@@ -36,8 +36,14 @@
 //   under the current secret exists.
 //
 // Every operation here writes in an order that keeps it (see the cut-point
-// tests at the bottom). ESP-IDF NVS commits a blob write atomically: after a
-// power cut either the old or the new value is present.
+// tests at the bottom), given that one write replaces a value in one step:
+// after a power cut the key holds either the old value or the new one, never
+// neither. ESP-IDF's `nvs_set_blob` gives that by itself (new copy first, old
+// one erased after, and boot resolves a cut between them), and the firmware's
+// `NvsBlobs` calls it through `nvs::ReplaceBlob`. esp-idf-svc's
+// `EspNvs::set_blob` does not: it erases the key before writing, and a cut
+// between the two leaves no value. The test store models both (`Replace`).
+// Nothing here is atomic across keys; that is what the write order is for.
 
 use alloc::string::String;
 use alloc::vec::Vec;

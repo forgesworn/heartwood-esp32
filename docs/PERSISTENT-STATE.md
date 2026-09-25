@@ -59,6 +59,14 @@ namespace:
 | `dk_sec`, `dk_ph`, `lk_boots`, `ann_op`, `ph_relays` | Phone unlock: the data key's PIN/vault wrapper, the packed phone records, the locked-restart count, the operator-announcement switch, and `ph_relays`, the relays the phones were last told about with the count of relay-update rounds sent (written when first needed, when a change only dropped relays, after each of a relay change's six update rounds, the last of which records the new list, and replaced at the first enrolment after every phone has gone; never on a network-trial boot, never over a record this firmware cannot read; removed with the last phone) |
 | `rng_proof` | SHA-256 of last boot's RNG self-test draw; a wipe clears it, costing one power-cycle before new key material (see above) |
 
+Every blob in this table is written through `ReplaceBlob`
+(`firmware/src/nvs.rs`), which calls ESP-IDF's `nvs_set_blob` with no erase
+before it: a power cut during a write leaves the key's old value or its new
+one, never neither. `net_rev` and `ncfg_crc` are `u32` items, which
+`nvs_set_u32` replaces the same way. No write spans two keys, which is what
+the journals below are for. See "Power cuts and NVS writes" in
+SECURITY-MODEL.md.
+
 The factory/PIN wipe erases the partition rather than enumerating this table,
 so a future or unknown key cannot survive merely because a cleanup list was not
 updated.

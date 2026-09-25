@@ -551,6 +551,41 @@ Security properties and honest residuals:
 
 Design spec: `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`.
 
+### Power cuts and NVS writes
+
+A power cut during a write must leave each NVS key with its old value or its
+new one. Everything that rewrites a key in place depends on that: the data-key
+wrapper (`dk_sec`) on a PIN or vault change, a pre-data-key seed resealed over
+the same `mN_seed_enc` key, the note locker's key (`nk`), the phone records,
+the slot tables, the removal and migration journals, the staged network
+transaction and the PIN wipe counter.
+
+ESP-IDF v5.3.2's `nvs_set_blob` provides it by itself: it writes the new copy
+in full, blob index last, and only then erases the old one, and the next boot
+discards whichever copy is incomplete or superseded
+(`components/nvs_flash/src/nvs_storage.cpp:269-452`,
+`nvs_pagemanager.cpp:57-90`). esp-idf-svc 0.52.1's `EspNvs::set_blob`, which
+every firmware blob write used to go through, erases the key first and writes
+second, so a cut between the two left no value at all: a sealed board with no
+`dk_sec` (only an enrolled phone or the phrase opens it), a seed gone from
+flash part-way through migration, sealed notes stranded behind a freshly
+minted note key, a PIN wipe counter back at zero. The firmware now writes
+every blob through `ReplaceBlob` (`firmware/src/nvs.rs`), which calls
+`nvs_set_blob` and `nvs_commit` with no erase. The host store in
+`common/src/data_key.rs` models both orders: its cut-point sweeps hold at
+every cut with the direct replace and fail with the erase-first one.
+
+What it does not provide:
+
+- Atomicity across keys. A change spanning several keys relies on its own
+  write order or journal, as each module documents.
+- Room to spare. The new copy is written while the old one still holds its
+  entries, so a replace needs space for both at once. A write that does not
+  fit fails and leaves the old value, where the erase-first order lost it.
+- Removal of the old bytes. The superseded copy is marked erased, not
+  overwritten, and stays readable in a raw flash dump until NVS reclaims its
+  page.
+
 ## What the design already gets right
 
 - Seed generated on-device from a **guaranteed hardware entropy source**
@@ -562,8 +597,9 @@ Design spec: `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`.
 - Reusable client indices are bound to a non-secret credential fingerprint for
   every approve/update/revoke/URI action. Slot authority writes use exact
   read-back plus durable compensation of the complete prior snapshot. This
-  recovery model explicitly assumes one ESP-IDF NVS key is atomically old or
-  new after power loss, never a torn mixture.
+  recovery model relies on one NVS key being wholly old or wholly new after
+  power loss, never a torn mixture and never absent; see "Power cuts and NVS
+  writes" for what provides that and what it does not cover.
 - New v2 clients have an **atomic, strict method + event-kind ceiling**; legacy
   slots retain their button-fallback behavior for compatibility.
 - Remote WiFi changes are **staged, revision-bound, one-shot, and rollback-safe**;

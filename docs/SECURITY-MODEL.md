@@ -385,14 +385,33 @@ Procedure:
    on the board (Sapwood's operator panel). A thief with the operator key
    still cannot add a phone of their own without a press on the board.
 
-Residual: revoking deletes the record but does not re-key. The data key stays
-the same, and NVS marks the old record erased without wiping its bytes until
-that flash page is recycled. Someone who has S (which means breaking the
-phone's Keystore) **and** a later dump of the board's flash may still recover
-the data key from the leftover record. There is no re-key-in-place operation
-today; turning encryption off and on again mints a new data key but writes the
-seeds to flash in plaintext on the way, which is worse. If phone and board are
-both lost, treat the identities on the board as exposed.
+Residual: revoking deletes the record but does not wipe it. Someone who has S
+(which means breaking the phone's Keystore) **and** a later dump of the board's
+flash may still recover the data key from the leftover record, and with it the
+seeds. Re-keying would not help: the old sealed seeds are left behind the same
+way, and S still opens them through the old record. See *Leftover bytes in
+NVS* below. If phone and board are both lost, treat the identities on the board
+as exposed.
+
+### Leftover bytes in NVS
+
+ESP-IDF NVS never wipes a deleted or replaced value in place. Deleting a key
+flips two status bits per 32-byte entry (`nvs_page.cpp` in ESP-IDF v5.3.2);
+the bytes stay on flash until garbage collection erases the whole sector,
+which happens only when free pages run low and cannot be steered. There is no
+scrub option or API. So a flash dump can hold:
+
+- the plaintext seed written when each identity was added, since identities
+  can only be added with encryption off and sealing then deletes the
+  plaintext key;
+- an unlock phone's record after it is revoked;
+- any earlier wrapper or setting that was later replaced.
+
+Planned: a scrub that zeroes every entry NVS has marked deleted, at boot,
+after a revoke and after any encryption change. Until it ships, a sealed
+board's at-rest protection covers the live records only. Restoring onto a
+fully erased board does not avoid it, since the restore writes the plaintext
+seed first as well.
 
 ## Threat: malicious firmware (OTA or the web flasher) — **signed USB OTA; flasher is trust-on-first-use**
 
@@ -463,8 +482,10 @@ The one hardening lever that does **not** touch eFuses is **PIN-derived seed
 encryption**, and it is now built (opt-in). When a PIN is set, each master seed
 is stored as ciphertext — `PBKDF2-HMAC-SHA256(pin, salt)` derives the key,
 ChaCha20 + HMAC-SHA256 encrypt-then-MAC it (`common/src/seed_cipher.rs`), and
-the plaintext is removed. A raw `esptool read_flash` now yields ciphertext, not
-the seed. On boot the device is locked until a PIN decrypts the seeds into RAM;
+the plaintext key is deleted. Deleting is not wiping, though (see *Leftover
+bytes in NVS* below): until that flash sector is recycled, a raw
+`esptool read_flash` may still yield the plaintext seed from before sealing.
+The live record is ciphertext. On boot the device is locked until a PIN decrypts the seeds into RAM;
 5 wrong attempts erase and verify both the flash-time `config` source and the
 complete NVS partition, so old WiFi/operator state cannot re-seed itself after
 the wipe. Physical factory reset uses the same complete path. See
@@ -573,8 +594,9 @@ changes hands:
 
 Security properties and honest residuals:
 
-- Flash dump alone: ciphertext under a 256-bit key — unbruteforceable, unlike
-  a short PIN.
+- Flash dump alone: the live records are ciphertext under a 256-bit key,
+  unbruteforceable, unlike a short PIN. Leftover plaintext from before sealing
+  may still be readable (see *Leftover bytes in NVS* below).
 - Pi/browser compromise alone: a vault key that decrypts nothing the host
   possesses.
 - A wrong vault key is a plain NACK and deliberately does **not** feed the

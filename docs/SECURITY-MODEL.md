@@ -611,15 +611,29 @@ is always a press on the board, whichever way the request arrives:
   since expiry is the safe failure and the owner starts again.
 - **One button, one decision:** in WiFi mode, while a relay card (or a result
   younger than 20 s) is up, every cable frame that may raise a card of its
-  own is refused "approval on screen" (`types::cable_frame_card`, checked by
-  ui-preview against every cable arm that is handed the buttons). Otherwise
-  a compromised host could send one while the owner hesitates over a relay
-  enrolment, and the hold that answers the cable card, latched by the
-  button sampler with its full length, would then read as the relay card's
-  approval. As a second line, a cable frame that held the loop 2 s or more
-  disarms the front relay card and clears the latched press, and every
-  relay card (the enrol card after its gate too) arms only with the button
-  seen up.
+  own is refused "approval on screen" (`phone_unlock::cable_frame_claim`,
+  checked by ui-preview against every cable arm that can reach the button).
+  Otherwise a compromised host could send one while the owner hesitates over
+  a relay enrolment, and the hold that answers the cable card, latched by
+  the button sampler with its full length, would then read as the relay
+  card's approval. As a second line, a cable frame that held the loop 2 s or
+  more disarms the front relay card and clears the latched press, and every
+  card, relay or cable (the enrol card after its gate too), arms only once
+  the button has been seen up with it on screen.
+- **Recovery is never locked out:** anyone can keep a relay card up (a
+  RECEIVE card returns for every wrap published to the board), so the
+  owner's recovery commands over the cable, `SET_NET_CONFIG`,
+  `PATCH_NET_CONFIG`, `OTA_BEGIN` and `FACTORY_RESET`, take the screen over
+  instead of being refused: every relay card is answered Expired first
+  (with the reply an expiry always sends), a held result is let go, the
+  latched press is cleared, and the cable card arms only after the button
+  has been seen up, so a hold begun for a relay card cannot answer it. The
+  other card-raising frames (identity, PIN, vault, operator, slots,
+  backups, NIP-46) stay refused: none is needed to get a board back. And a
+  relay card no longer outlives a WiFi outage: the loop's WiFi-down waits
+  tick it with no session, so it still expires on time (an approval made
+  then waits in the #82 outbox), and a card whose window has passed never
+  keeps the cable refused.
 - **The real bound:** a compromised browser holds P from the moment the owner
   pastes the phone's code, before it sends anything, so it can grind a key of
   its own whose five words match for as long as the owner is willing to wait

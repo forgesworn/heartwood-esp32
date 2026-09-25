@@ -2463,6 +2463,11 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     f. Right after a PHONE ADDED, turn the access point off: a press still
        dismisses it (a few seconds late at worst, while a rejoin attempt
        blocks the loop), and after 20 s a cable NIP-46 request is served.
+       Then, with the access point still off, raise a relay card just before
+       turning it off (an unapproved sign request): the card still counts
+       down, can be declined, and expires on time ("Expired"), after which a
+       cable `SET_NET_CONFIG` or `FACTORY_RESET` raises its own card (no
+       power cycle needed).
     g. After the cable enrol card of step 11 (45 s with the loop held), the
        log shows no "silent (no data/pong); reconnecting" for a quiet relay
        straight after, and a ping goes out on the next pass.
@@ -2470,20 +2475,33 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
 10b. **A cable card cannot answer a relay card.** With a relay enrol card up
     (any page, before or after its gate), send each card-raising cable
     frame in turn: a `CONNSLOT_UPDATE`, a `BACKUP_EXPORT_REQUEST`, a
-    `SET_OPERATOR`, an `OTA_BEGIN` and a plaintext NIP-46 `sign_event`. Each
+    `SET_OPERATOR`, a `SET_PIN` and a plaintext NIP-46 `sign_event`. Each
     is refused at once with "approval on screen" and no card of its own;
     the relay card stays, keeps its page, and is neither approved nor
-    declined. (The list the board refuses is `types::cable_frame_card`;
-    `ui-preview`'s tests check it against every cable arm handed the
-    buttons.)
+    declined. A `PHONE_UNLOCK_CMD` `list` is answered as normal. (The
+    classification is `phone_unlock::cable_frame_claim`; `ui-preview`'s
+    tests check it against every cable arm that can reach the button.)
 
-10c. **Time under another screen is not reading time.** During an enrol
-    card's first 12 s, have a client with an auto-approved kind sign twice
-    a second or so apart: each AUTO-SIGNED card flashes, the enrol card
-    comes straight back on the same page, and that page then stays a full
-    4 s from its return; the hint stays "compare all 5 words" for longer
-    than 12 s. Keep it up for the whole window: the card never arms and
-    ends "Expired".
+10d. **Recovery takes the screen over.** With a relay card up (an enrol card
+    mid-gate, then again with a RECEIVE card), start holding PRG for the
+    relay card and, while still holding, send a cable `SET_NET_CONFIG`
+    (repeat with `PATCH_NET_CONFIG`, `OTA_BEGIN` and `FACTORY_RESET`,
+    declining each): the relay card is answered Expired at once (its client
+    or the operator gets the usual expiry), and the cable card comes up
+    but does not start its hold bar while the button is still down; only a
+    fresh press after letting go counts. Every other card-raising frame is
+    still refused, as in 10b.
+
+10c. **Time under another screen is not reading time.** Over an
+    authenticated cable, send `DISPLAY_FLIP` every 2 s during an enrol
+    card's first 12 s (any frame that repaints works; repeated auto-signs do
+    not, since only the first confirmation draws while a card is up). After
+    each flip the enrol card is drawn again at once (turned round) on the
+    same page, and that page then stays a full 4 s from the redraw, so the
+    hint stays "compare all 5 words" well past 12 s. Keep flipping for the
+    whole window: the card never arms and ends "Expired". Stop flipping
+    mid-way instead: the pages resume, and the card arms once each has had
+    a full 4 s.
 
 11. **Cable card matches.** `phone-unlock.mjs enrol` over USB: the same card
     layout, pages, markers, gate, five words and 45 s window, and PHONE ADDED

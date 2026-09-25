@@ -24,11 +24,10 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
 use crate::data_key_store::{self, Board, NvsBlobs};
 use crate::protocol;
-use heartwood_common::data_key::{self, BlobStore, ChangeError, Pbkdf2};
+use heartwood_common::data_key::{self, BlobStore, ChangeError, Pbkdf2, PinCountStore, StoreError};
 use heartwood_common::types::{FRAME_TYPE_ACK, FRAME_TYPE_NACK};
 use zeroize::Zeroize;
 
-const NVS_PIN_ATTEMPTS_KEY: &str = data_key::PIN_ATTEMPTS_KEY;
 pub const MAX_FAILED_ATTEMPTS: u8 = 5;
 
 /// True if any loaded master's seed is encrypted and not yet decrypted — i.e.
@@ -37,20 +36,56 @@ pub fn is_locked(masters: &[LoadedMaster]) -> bool {
     masters.iter().any(|m| m.locked)
 }
 
-/// Read the persisted failed-attempt counter from NVS. Malformed/unreadable
-/// state stays distinct from absence so boot can fail closed into a wipe.
-pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str> {
-    let mut buf = [0u8; 1];
-    match nvs.get_blob(NVS_PIN_ATTEMPTS_KEY, &mut buf) {
-        Ok(Some(b)) if b.len() == 1 => Ok(buf[0]),
-        Ok(Some(_)) => Err("malformed PIN-attempt state"),
-        Ok(None) => Ok(0),
-        Err(_) => Err("could not read PIN-attempt state"),
+/// The failed-PIN count on NVS: a `u8` item (`nvs_set_u8` writes the new
+/// item before erasing the old one, so a cut leaves one of them, and it needs
+/// a single free entry), with the one-byte blob earlier firmware used read
+/// until the first raise or clear moves it (`data_key::PinCountStore`).
+struct PinCounter<'a>(&'a EspNvs<NvsDefault>);
+
+impl PinCountStore for PinCounter<'_> {
+    fn get_count(&self) -> Result<Option<u8>, StoreError> {
+        self.0.get_u8(data_key::PIN_COUNT_KEY).map_err(|_| StoreError)
+    }
+
+    fn set_count(&mut self, count: u8) -> Result<(), StoreError> {
+        self.0.set_u8(data_key::PIN_COUNT_KEY, count).map_err(|_| StoreError)
+    }
+
+    fn remove_count(&mut self) -> Result<(), StoreError> {
+        self.0.remove(data_key::PIN_COUNT_KEY).map(|_| ()).map_err(|_| StoreError)
+    }
+
+    fn get_legacy(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = data_key::PIN_ATTEMPTS_LEGACY_KEY;
+        let len = match self.0.blob_len(key) {
+            Ok(None) => return Ok(None),
+            Ok(Some(len)) if len <= 8 => len,
+            Ok(Some(_)) => return Ok(Some(vec![0; 9])), // malformed, and says so
+            Err(_) => return Err(StoreError),
+        };
+        let mut buf = vec![0u8; len.max(1)];
+        match self.0.get_blob(key, &mut buf) {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            Ok(None) => Ok(None),
+            Err(_) => Err(StoreError),
+        }
+    }
+
+    fn remove_legacy(&mut self) -> Result<(), StoreError> {
+        self.0.remove(data_key::PIN_ATTEMPTS_LEGACY_KEY).map(|_| ()).map_err(|_| StoreError)
     }
 }
 
+/// Read the persisted failed-attempt counter from NVS. Malformed/unreadable
+/// state stays distinct from absence so boot can fail closed into a wipe.
+pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str> {
+    data_key::read_pin_attempts(&PinCounter(nvs))
+}
+
 pub(crate) fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
-    let _ = nvs.remove(NVS_PIN_ATTEMPTS_KEY);
+    if let Err(e) = data_key::clear_pin_attempts(&mut PinCounter(nvs)) {
+        log::warn!("PIN-attempt count not cleared: {e}");
+    }
 }
 
 /// What an unlock is doing, for the OLED.
@@ -331,7 +366,7 @@ pub fn handle_pin_unlock(
     // check (during the stretch, or once the PIN is refused) can leave it
     // uncounted (`data_key::charge_pin_guess`). A right PIN clears the count
     // inside `try_unlock`.
-    match data_key::charge_pin_guess(&mut NvsBlobs(nvs)) {
+    match data_key::charge_pin_guess(&mut PinCounter(nvs)) {
         data_key::GuessCharge::Charged(count) => *failed_attempts = count,
         data_key::GuessCharge::NotCounted => {
             // The old count reads back intact: refuse this guess untried

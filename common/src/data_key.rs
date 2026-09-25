@@ -43,7 +43,11 @@
 // `NvsBlobs` calls it through `nvs::ReplaceBlob`. esp-idf-svc's
 // `EspNvs::set_blob` does not: it erases the key before writing, and a cut
 // between the two leaves no value. The test store models both (`Replace`).
-// Nothing here is atomic across keys; that is what the write order is for.
+// With no room for a second copy, `ReplaceBlob` refuses the wrapper, the
+// sealed seeds and the marker rather than erase them (`nvs_budget`), so for
+// them the guarantee holds on a full board too; `dk_ph` is erased first
+// there, which a cut turns into no phones. Nothing here is atomic across
+// keys; that is what the write order is for.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -1110,23 +1114,49 @@ pub fn save_phones<S: BlobStore>(store: &mut S, phones: &PhoneSet) -> Result<(),
 // guess already counted. A right PIN clears it (`pin::try_unlock`). Checking
 // first and counting after left a window where cutting the power once the
 // board had judged the PIN, and before it wrote the count, bought a free
-// guess every time.
+// guess every time. The cost: a cut during a RIGHT guess leaves it counted
+// too, so an owner who cuts the power mid-unlock on the fifth attempt finds
+// the board wiped at the next boot.
 //
-// The raise is a plain replace (never erase-first: a cut between the erase
-// and the write would reset the count to zero). If it cannot be written and
-// the old count reads back intact, the guess is simply not taken; only a
-// count that cannot be read, or reads back as neither, fails closed.
+// The count is a one-entry integer item (`nvs_set_u8`), which ESP-IDF writes
+// new before erasing old, so a cut leaves one of them and a raise needs one
+// free entry. Earlier firmware kept it as a one-byte blob, which needs seven
+// entries to replace and so could be refused on a nearly full board, leaving
+// a locked PIN board unable to take any guess at all. The blob is read while
+// the integer is absent and removed once the integer has landed, so every
+// cut during that move leaves one authoritative count.
+//
+// If the count cannot be raised and the old count reads back intact, the
+// guess is not taken; only a count that cannot be read, or reads back as
+// neither, fails closed.
 
-/// NVS key holding the failed-PIN count (one byte; absent is zero).
-pub const PIN_ATTEMPTS_KEY: &str = "pin_attempts";
+/// NVS key of the failed-PIN count, a `u8` item (absent is zero).
+pub const PIN_COUNT_KEY: &str = "pin_fails";
+/// NVS key of the one-byte blob earlier firmware kept the count in.
+pub const PIN_ATTEMPTS_LEGACY_KEY: &str = "pin_attempts";
 
-/// The failed-PIN count. Malformed or unreadable state is `Err`, distinct
-/// from absence, so a caller can fail closed.
-pub fn read_pin_attempts<S: BlobStore>(store: &S) -> Result<u8, &'static str> {
-    match store.get(PIN_ATTEMPTS_KEY) {
-        Ok(Some(b)) if b.len() == 1 => Ok(b[0]),
-        Ok(Some(_)) => Err("malformed PIN-attempt state"),
-        Ok(None) => Ok(0),
+/// Where the failed-PIN count lives: the integer item, and the blob earlier
+/// firmware wrote.
+pub trait PinCountStore {
+    fn get_count(&self) -> Result<Option<u8>, StoreError>;
+    fn set_count(&mut self, count: u8) -> Result<(), StoreError>;
+    fn remove_count(&mut self) -> Result<(), StoreError>;
+    fn get_legacy(&self) -> Result<Option<Vec<u8>>, StoreError>;
+    fn remove_legacy(&mut self) -> Result<(), StoreError>;
+}
+
+/// The failed-PIN count: the integer item if present, else the legacy blob.
+/// Malformed or unreadable state is `Err`, distinct from absence, so a
+/// caller can fail closed.
+pub fn read_pin_attempts<S: PinCountStore>(store: &S) -> Result<u8, &'static str> {
+    match store.get_count() {
+        Ok(Some(n)) => Ok(n),
+        Ok(None) => match store.get_legacy() {
+            Ok(Some(b)) if b.len() == 1 => Ok(b[0]),
+            Ok(Some(_)) => Err("malformed PIN-attempt state"),
+            Ok(None) => Ok(0),
+            Err(_) => Err("could not read PIN-attempt state"),
+        },
         Err(_) => Err("could not read PIN-attempt state"),
     }
 }
@@ -1144,7 +1174,7 @@ pub enum GuessCharge {
 }
 
 /// Count a PIN guess on flash before it is checked.
-pub fn charge_pin_guess<S: BlobStore>(store: &mut S) -> GuessCharge {
+pub fn charge_pin_guess<S: PinCountStore>(store: &mut S) -> GuessCharge {
     let current = match read_pin_attempts(store) {
         Ok(n) => n,
         Err(e) => return GuessCharge::Damaged(e),
@@ -1152,12 +1182,35 @@ pub fn charge_pin_guess<S: BlobStore>(store: &mut S) -> GuessCharge {
     let next = current.saturating_add(1);
     // Judged by the read-back, not the return: a write can land and still
     // report an error.
-    let _ = store.set(PIN_ATTEMPTS_KEY, &[next]);
+    let _ = store.set_count(next);
     match read_pin_attempts(store) {
-        Ok(n) if n == next => GuessCharge::Charged(next),
+        Ok(n) if n == next && current != next => {
+            // The integer item holds the count now (the blob never held
+            // `next`), so the blob is dead weight. A failure here costs only
+            // its entries: while the integer exists the blob is never read.
+            if matches!(store.get_legacy(), Ok(Some(_))) {
+                let _ = store.remove_legacy();
+            }
+            GuessCharge::Charged(next)
+        }
         Ok(n) if n == current => GuessCharge::NotCounted,
         Ok(_) => GuessCharge::Damaged("PIN-attempt state changed unexpectedly"),
         Err(e) => GuessCharge::Damaged(e),
+    }
+}
+
+/// Clear the count after a right PIN. The integer goes to zero first, so no
+/// cut leaves the old blob authoritative once the integer has been cleared.
+pub fn clear_pin_attempts<S: PinCountStore>(store: &mut S) -> Result<(), &'static str> {
+    if store.set_count(0).is_err() {
+        store.remove_count().map_err(|_| "could not clear PIN-attempt state")?;
+    }
+    if matches!(store.get_legacy(), Ok(Some(_))) {
+        store.remove_legacy().map_err(|_| "could not clear PIN-attempt state")?;
+    }
+    match read_pin_attempts(store)? {
+        0 => Ok(()),
+        _ => Err("PIN-attempt state did not clear"),
     }
 }
 
@@ -1504,12 +1557,12 @@ mod tests {
         replace: Replace,
         /// A partition of this many entries. Replaces then go through
         /// `nvs_budget::plan_replace` as the firmware's `ReplaceBlob` does:
-        /// in place when the new copy fits beside the old, erase-first only
-        /// for a revocation of a key that allows it, otherwise refused with
-        /// the old value intact. `None` is unlimited, and `replace` decides.
+        /// in place when the new copy fits beside the old, otherwise erased
+        /// first, or refused with the old value intact for a key that never
+        /// falls back. `None` is unlimited, and `replace` decides.
         capacity: Option<usize>,
-        /// Writes are revocations (`data_key_store::RevokingBlobs`).
-        revoking: bool,
+        /// Integer items (`nvs_set_u8`): one entry each.
+        ints: BTreeMap<String, u8>,
     }
 
     impl Mem {
@@ -1533,7 +1586,7 @@ mod tests {
                 map: self.map.clone(),
                 replace: self.replace,
                 capacity: self.capacity,
-                revoking: self.revoking,
+                ints: self.ints.clone(),
                 ..Mem::default()
             }
         }
@@ -1547,16 +1600,16 @@ mod tests {
         /// Entries the stored values occupy (their lower bound, which is
         /// what `available_entries` would count as used).
         fn used(&self) -> usize {
-            self.map.values().map(|v| nvs_budget::stored_entries_min(v.len())).sum()
+            self.map.values().map(|v| nvs_budget::stored_entries_min(v.len())).sum::<usize>()
+                + self.ints.len()
         }
         fn available(&self) -> usize {
             self.capacity.map_or(usize::MAX, |c| c.saturating_sub(self.used()))
         }
         /// The same flash in a partition of `capacity` entries.
-        fn limited(&self, capacity: usize, revoking: bool) -> Mem {
+        fn limited(&self, capacity: usize) -> Mem {
             Mem {
                 capacity: Some(capacity),
-                revoking,
                 ..self.reboot()
             }
         }
@@ -1584,7 +1637,8 @@ mod tests {
                 None => self.replace == Replace::EraseFirst,
                 Some(_) => {
                     let old = self.map.get(key).map(Vec::len);
-                    match nvs_budget::plan_replace(key, self.available(), old, value.len(), self.revoking) {
+                    let fallback = nvs_budget::fallback_for(key);
+                    match nvs_budget::plan_replace(fallback, self.available(), old, value.len()) {
                         nvs_budget::Plan::Direct => false,
                         nvs_budget::Plan::EraseFirst => true,
                         nvs_budget::Plan::Refuse => return Err(StoreError),
@@ -1619,6 +1673,45 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    impl PinCountStore for Mem {
+        fn get_count(&self) -> Result<Option<u8>, StoreError> {
+            if self.dead.get() {
+                return Err(StoreError);
+            }
+            Ok(self.ints.get(PIN_COUNT_KEY).copied())
+        }
+        fn set_count(&mut self, count: u8) -> Result<(), StoreError> {
+            // New item first, then the old one erased: one free entry.
+            if self.dead.get() || self.available() < 1 {
+                return Err(StoreError);
+            }
+            if self.gate()? {
+                self.ints.insert(String::from(PIN_COUNT_KEY), count);
+            }
+            if self.dead.get() {
+                Err(StoreError)
+            } else {
+                Ok(())
+            }
+        }
+        fn remove_count(&mut self) -> Result<(), StoreError> {
+            if self.gate()? {
+                self.ints.remove(PIN_COUNT_KEY);
+            }
+            if self.dead.get() {
+                Err(StoreError)
+            } else {
+                Ok(())
+            }
+        }
+        fn get_legacy(&self) -> Result<Option<Vec<u8>>, StoreError> {
+            self.get(PIN_ATTEMPTS_LEGACY_KEY)
+        }
+        fn remove_legacy(&mut self) -> Result<(), StoreError> {
+            self.remove(PIN_ATTEMPTS_LEGACY_KEY)
         }
     }
 
@@ -2454,14 +2547,13 @@ mod tests {
     //
     // A replace holds two copies at once, so on a full board it may not fit.
     // The capacity-limited store runs the firmware's plan (`nvs_budget`):
-    // growth is gated so a later revocation still fits in place, and a board
-    // already past the gate revokes by erasing first rather than failing.
+    // the secrets refuse and keep their value, everything else erases first.
 
     #[test]
     fn the_fallback_policy_names_this_modules_keys() {
         use nvs_budget::{fallback_for, Fallback};
-        assert_eq!(fallback_for(PHONES_KEY), Fallback::EraseFirstOnRevoke);
-        for key in [SECRET_WRAP_KEY, SECRET_KIND_KEY, PIN_ATTEMPTS_KEY] {
+        assert_eq!(fallback_for(PHONES_KEY), Fallback::EraseFirst);
+        for key in [SECRET_WRAP_KEY, SECRET_KIND_KEY, PIN_ATTEMPTS_LEGACY_KEY] {
             assert_eq!(fallback_for(key), Fallback::Never, "{key}");
         }
         for slot in 0..8 {
@@ -2491,17 +2583,9 @@ mod tests {
         let (m, dk, mut phones) = board_with_phones(MAX_PHONES as u32);
         phones.revoke(3).unwrap();
         // The bench V4's measured headroom: far less than a second copy.
-        let capacity = m.used() + 17;
-
-        // A plain replace cannot fit, so it is refused and phone 3 keeps
-        // its unlock. This is what a revocation must not do.
-        let mut plain = m.limited(capacity, false);
-        assert!(save_phones(&mut plain, &phones).is_err());
-        assert!(phone_ids(&plain.reboot()).contains(&3));
-
-        let mut revoking = m.limited(capacity, true);
-        save_phones(&mut revoking, &phones).unwrap();
-        let after = revoking.reboot();
+        let mut full = m.limited(m.used() + 17);
+        save_phones(&mut full, &phones).unwrap();
+        let after = full.reboot();
         assert!(!phone_ids(&after).contains(&3));
         let loaded = load_phones(&after).unwrap();
         assert!(loaded.unwrap(3, &s(3)).is_err());
@@ -2510,11 +2594,22 @@ mod tests {
     }
 
     #[test]
-    fn an_erase_first_revocation_never_authorises_a_phone_it_did_not_have() {
+    fn a_secret_that_does_not_fit_is_refused_and_kept() {
+        let mut start = legacy_board(PIN_A);
+        let dk = unlock_and_migrate(&mut start, PIN_A).unwrap().dk;
+        let mut full = start.limited(start.used() + 3);
+        assert!(set_secret(&mut full, PIN_B, &seeds(), dk, &CheapKdf, &mut Board::default()).is_err());
+        let after = full.reboot();
+        assert_eq!(boot_with(&after, PIN_A), Some(seeds()), "the old secret still opens it");
+        assert_eq!(boot_with(&after, PIN_B), None);
+    }
+
+    #[test]
+    fn an_erase_first_rewrite_never_authorises_a_phone_it_did_not_have() {
         let (m, _, mut phones) = board_with_phones(MAX_PHONES as u32);
         let before = phone_ids(&m);
         phones.revoke(3).unwrap();
-        let start = m.limited(m.used() + 17, true);
+        let start = m.limited(m.used() + 17);
         let saw_absent = Cell::new(false);
         let writes = sweep(
             &start,
@@ -2536,7 +2631,7 @@ mod tests {
     #[test]
     fn the_growth_gate_keeps_a_later_revocation_in_place() {
         let (m, dk, _) = board_with_phones(0);
-        let mut m = m.limited(m.used() + 150, false);
+        let mut m = m.limited(m.used() + 150);
         let mut phones = PhoneSet::default();
         let mut enrolled = 0u32;
         for id in 1..=MAX_PHONES as u32 {
@@ -2554,8 +2649,8 @@ mod tests {
         assert!(enrolled > 1 && (enrolled as usize) < MAX_PHONES, "the gate stopped enrolment at {enrolled}");
 
         // Revoking any one of them is an in-place replace: old or new at
-        // every cut, never no phones at all, even with the fallback allowed.
-        let full = m.reboot().limited(m.capacity.unwrap(), true);
+        // every cut, never no phones at all.
+        let full = m.reboot();
         let before = phone_ids(&full);
         for id in 1..=enrolled {
             let mut fewer = phones.clone();
@@ -2576,10 +2671,12 @@ mod tests {
         }
     }
 
+    // -- the PIN wipe counter ------------------------------------------------
+
     #[test]
     fn a_pin_guess_is_counted_before_it_is_checked() {
         let mut start = legacy_board(PIN_A);
-        start.set(PIN_ATTEMPTS_KEY, &[1]).unwrap();
+        start.set_count(1).unwrap();
         let start = start.reboot();
         let checked = Cell::new(0u8);
 
@@ -2608,7 +2705,7 @@ mod tests {
             for _ in 0..2 {
                 checked.set(checked.get() + 1);
                 let n = read_pin_attempts(m).map_err(|_| ChangeError::Storage)?;
-                m.set(PIN_ATTEMPTS_KEY, &[n + 1])?;
+                m.set_count(n + 1)?;
             }
             Ok(())
         };
@@ -2619,10 +2716,66 @@ mod tests {
     }
 
     #[test]
+    fn the_legacy_blob_count_moves_to_the_integer_item_safely() {
+        let mut start = legacy_board(PIN_A);
+        start.set(PIN_ATTEMPTS_LEGACY_KEY, &[3]).unwrap();
+        let start = start.reboot();
+        assert_eq!(read_pin_attempts(&start), Ok(3));
+
+        // Every cut through the first guess on the new firmware leaves 3 or
+        // 4 counted, never fewer, and a clean run leaves only the integer.
+        let writes = sweep(
+            &start,
+            &|m| match charge_pin_guess(m) {
+                // The blob's removal is best effort, so ask the store again
+                // to learn whether the power went during it.
+                GuessCharge::Charged(4) => read_pin_attempts(m).map(|_| ()).map_err(|_| ChangeError::Storage),
+                _ => Err(ChangeError::Storage),
+            },
+            &|m, cut, apply| {
+                let n = read_pin_attempts(m).unwrap();
+                assert!(n == 3 || n == 4, "cut {cut} apply {apply}: {n}");
+            },
+        );
+        assert_eq!(writes, 2, "the integer, then the blob's removal");
+        let mut m = start.reboot();
+        assert_eq!(charge_pin_guess(&mut m), GuessCharge::Charged(4));
+        assert!(!m.map.contains_key(PIN_ATTEMPTS_LEGACY_KEY));
+        assert_eq!(m.ints.get(PIN_COUNT_KEY), Some(&4));
+
+        // A right PIN clears both forms, and no cut brings the old count back.
+        sweep(&start, &|m| clear_pin_attempts(m).map_err(|_| ChangeError::Storage), &|m, cut, apply| {
+            let n = read_pin_attempts(m).unwrap();
+            assert!(n == 0 || n == 3, "cut {cut} apply {apply}: {n}");
+        });
+        let mut m = start.reboot();
+        clear_pin_attempts(&mut m).unwrap();
+        assert_eq!(read_pin_attempts(&m), Ok(0));
+        assert!(!m.map.contains_key(PIN_ATTEMPTS_LEGACY_KEY));
+    }
+
+    #[test]
+    fn a_locked_pin_board_with_one_free_entry_still_counts_every_guess() {
+        let mut m = legacy_board(PIN_A);
+        m.set_count(0).unwrap();
+        // One free entry: the integer item is replaced new-then-old, so each
+        // raise needs just that one.
+        let mut full = m.limited(m.reboot().used() + 1);
+        for n in 1..=5 {
+            assert_eq!(charge_pin_guess(&mut full), GuessCharge::Charged(n));
+        }
+        // The one-byte blob earlier firmware used cannot be replaced there.
+        let mut blob = legacy_board(PIN_A);
+        blob.set(PIN_ATTEMPTS_LEGACY_KEY, &[0]).unwrap();
+        let mut full = blob.limited(blob.reboot().used() + 1);
+        assert!(full.set(PIN_ATTEMPTS_LEGACY_KEY, &[1]).is_err());
+    }
+
+    #[test]
     fn a_count_that_cannot_be_raised_refuses_the_guess_without_wiping() {
         let mut m = legacy_board(PIN_A);
-        m.set(PIN_ATTEMPTS_KEY, &[1]).unwrap();
-        let mut full = m.limited(m.reboot().used(), false);
+        m.set_count(1).unwrap();
+        let mut full = m.limited(m.reboot().used());
         assert_eq!(charge_pin_guess(&mut full), GuessCharge::NotCounted);
         assert_eq!(read_pin_attempts(&full), Ok(1));
 
@@ -2634,7 +2787,7 @@ mod tests {
     #[test]
     fn an_unreadable_pin_count_fails_closed() {
         let mut m = Mem::default();
-        m.set(PIN_ATTEMPTS_KEY, &[1, 2]).unwrap();
+        m.set(PIN_ATTEMPTS_LEGACY_KEY, &[1, 2]).unwrap();
         assert!(matches!(charge_pin_guess(&mut m), GuessCharge::Damaged(_)));
         let mut absent = Mem::default();
         assert_eq!(charge_pin_guess(&mut absent), GuessCharge::Charged(1));

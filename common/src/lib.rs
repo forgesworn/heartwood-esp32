@@ -160,3 +160,5 @@ extern crate self as heartwood_common;
 mod firmware_policy_host_tests;
 #[cfg(all(test, feature = "nip46", feature = "nip44"))]
 pub use firmware_policy_host_tests::nvs;
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+pub use firmware_policy_host_tests::personas;

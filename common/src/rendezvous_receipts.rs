@@ -18,6 +18,12 @@ use sha2::{Digest, Sha256};
 /// Approved target devices retained per root. A thirty-two entry store covers
 /// a person's current devices and a reasonable rotation history without
 /// making the signer a general device directory.
+/// The NVS key holding master `master_slot`'s receipts (`rzrec_N`, within
+/// ESP-IDF's 15-character limit).
+pub fn nvs_key(master_slot: u8) -> alloc::string::String {
+    alloc::format!("rzrec_{master_slot}")
+}
+
 pub const MAX_RECEIPTS: usize = 32;
 
 /// We retain 128 bits of a domain-separated nonce digest. The nonce itself is

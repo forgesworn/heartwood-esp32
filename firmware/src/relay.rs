@@ -7025,18 +7025,16 @@ fn persist_slot_mutation_or_rollback(
     finish_slot_mutation(ctx, persisted, snapshot, action)
 }
 
-/// As [`persist_slot_mutation_or_rollback`], for a mutation that only removes
-/// authority: on a partition with no room for a second copy of the table it
-/// is still written (erased first) rather than refused, so the revoked party
-/// does not keep its access (`PolicyEngine::persist_slots_revoking`).
-fn persist_revocation_or_rollback(
-    ctx: &mut SignCtx,
-    master_slot: u8,
-    snapshot: crate::policy::SlotStateSnapshot,
-    action: &str,
-) -> Result<(), String> {
-    let persisted = ctx.policy_engine.persist_slots_revoking(ctx.nvs, master_slot);
-    finish_slot_mutation(ctx, persisted, snapshot, action)
+/// Save a mutation that only removes authority (a revoked pairing, client
+/// key or identity grant, or narrowed permissions). Never rolled back on
+/// failure, since that would re-authorise the revoked party; the error says
+/// what a restart would find (`PolicyEngine::persist_revocation`).
+fn persist_revocation(ctx: &mut SignCtx, master_slot: u8, action: &str) -> Result<(), String> {
+    let outcome = ctx.policy_engine.persist_revocation(ctx.nvs, master_slot);
+    if outcome != crate::policy::RevocationSave::Saved {
+        log::error!("[relay] {action} not fully saved: {outcome:?}");
+    }
+    outcome.describe(action)
 }
 
 fn finish_slot_mutation(
@@ -8426,14 +8424,8 @@ fn dispatch_mgmt(
                 .find(|slot| slot.slot_index == slot_index)
                 .ok_or_else(|| format!("no such slot: {slot_index}"))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
-            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             if ctx.policy_engine.revoke_slot(master_slot, slot_index) {
-                persist_revocation_or_rollback(
-                    ctx,
-                    master_slot,
-                    slot_snapshot,
-                    "client revocation",
-                )?;
+                persist_revocation(ctx, master_slot, "client revocation")?;
                 log::info!("[relay] mgmt: revoked client slot {slot_index} (operator)");
                 Ok(serde_json::json!({
                     "slot_index": slot_index,
@@ -8472,18 +8464,12 @@ fn dispatch_mgmt(
                 .find(|slot| slot.slot_index == slot_index)
                 .ok_or_else(|| format!("no such slot: {slot_index}"))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
-            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             match ctx
                 .policy_engine
                 .remove_authorized_pubkey(master_slot, slot_index, pubkey)
             {
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Removed) => {
-                    persist_revocation_or_rollback(
-                        ctx,
-                        master_slot,
-                        slot_snapshot,
-                        "authorised client-key removal",
-                    )?;
+                    persist_revocation(ctx, master_slot, "authorised client-key removal")?;
                     Ok(serde_json::json!({
                         "slot_index": slot_index,
                         "pubkey": pubkey,
@@ -8545,7 +8531,6 @@ fn dispatch_mgmt(
                 }
                 Ok(key)
             }).transpose()?;
-            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             let (revoked, changed) = match identity {
                 Some(identity) => {
                     let (revoked, changed) = ctx
@@ -8562,12 +8547,7 @@ fn dispatch_mgmt(
                 ),
             };
             if changed {
-                persist_revocation_or_rollback(
-                    ctx,
-                    master_slot,
-                    slot_snapshot,
-                    "identity approval revocation",
-                )?;
+                persist_revocation(ctx, master_slot, "identity approval revocation")?;
             }
             let dropped =
                 ctx.policy_engine
@@ -8601,6 +8581,7 @@ fn dispatch_mgmt(
                 .cloned()
                 .ok_or_else(|| format!("no such slot: {slot_index}"))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, &target)?;
+            let before = target.clone();
             let label = req
                 .pointer("/params/label")
                 .and_then(|v| v.as_str())
@@ -8708,12 +8689,25 @@ fn dispatch_mgmt(
                     .update_slot(master_slot, slot_index, label, methods, kinds, auto)
             };
             if updated {
-                persist_slot_mutation_or_rollback(
-                    ctx,
-                    master_slot,
-                    slot_snapshot,
-                    "client update",
-                )?;
+                let narrowing = ctx
+                    .policy_engine
+                    .list_slots(master_slot)
+                    .iter()
+                    .find(|slot| slot.slot_index == slot_index)
+                    .is_some_and(|after| heartwood_common::policy::narrows_only(&before, after));
+                if narrowing {
+                    // Only takes permissions away: saved as a revocation,
+                    // never rolled back to the wider ones.
+                    drop(slot_snapshot);
+                    persist_revocation(ctx, master_slot, "client permission change")?;
+                } else {
+                    persist_slot_mutation_or_rollback(
+                        ctx,
+                        master_slot,
+                        slot_snapshot,
+                        "client update",
+                    )?;
+                }
                 log::info!("[relay] mgmt: updated client slot {slot_index} (operator)");
                 Ok(serde_json::json!({
                     "slot_index": slot_index,

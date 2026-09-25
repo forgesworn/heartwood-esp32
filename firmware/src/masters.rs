@@ -528,7 +528,7 @@ fn slot_keys(slot: u8) -> [String; 13] {
         // Scalar-free rendezvous-provision receipts are still identity state:
         // move/clear them with their root so a reused slot cannot inherit a
         // prior person's replay ceiling.
-        crate::rendezvous_provision::key(slot),
+        heartwood_common::rendezvous_receipts::nvs_key(slot),
         // Per-identity operator MUST travel/clear with the bundle: otherwise a
         // slot shift or reuse leaves a stale delegate bound to whichever
         // identity later occupies the slot — a cross-identity escape.
@@ -563,7 +563,13 @@ fn copy_optional_blob(
 ) -> Result<(), &'static str> {
     match read_blob(nvs, source)? {
         Some(value) => {
-            nvs.replace_blob(destination, &value)
+            // The destination's old value is either the identity being
+            // removed or one already copied down a slot, and the source
+            // stays intact until the journal moves on, so a copy that has
+            // no room beside the old value may erase it first: a cut then
+            // repeats the copy, and a seed can never be refused here and
+            // wedge the removal at boot.
+            nvs.overwrite_blob(destination, &value)
                 .map_err(|_| "failed to shift slot state")?;
             if read_blob(nvs, destination)?.as_deref() != Some(value.as_slice()) {
                 return Err("shifted slot state verification failed");

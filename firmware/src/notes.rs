@@ -31,6 +31,10 @@
 //! path.
 
 use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
+// Every key in the locker's namespace holds value or guards it (a note
+// record is bearer money, `idx` finds them, `nk` opens them, `cash` keeps
+// derivation indices unique), so none of them is ever erased to make room:
+// a write that does not fit fails as a locker storage error instead.
 use crate::nvs::ReplaceBlob;
 
 use heartwood_common::note_cmd::{
@@ -148,7 +152,7 @@ impl NoteStorage for NoteNvs {
         for id in ids {
             blob.extend_from_slice(id.as_bytes());
         }
-        self.nvs.replace_blob(INDEX_KEY, &blob).map_err(|e| {
+        self.nvs.replace_blob_in_place(INDEX_KEY, &blob).map_err(|e| {
             log::error!("[notes] index write failed: {e}");
             self.failed = true;
             StorageError
@@ -213,7 +217,7 @@ impl NoteStorage for NoteNvs {
             }
             None => blob,
         };
-        self.nvs.replace_blob(id, to_write).map_err(|e| {
+        self.nvs.replace_blob_in_place(id, to_write).map_err(|e| {
             log::error!("[notes] write {id} failed: {e}");
             self.failed = true;
             StorageError
@@ -229,7 +233,7 @@ impl NoteStorage for NoteNvs {
     }
 
     fn save_trust(&mut self, blob: &[u8]) -> Result<(), StorageError> {
-        self.nvs.replace_blob(TRUST_KEY, blob).map_err(|e| {
+        self.nvs.replace_blob_in_place(TRUST_KEY, blob).map_err(|e| {
             log::error!("[notes] trust list write failed: {e}");
             self.failed = true;
             StorageError
@@ -254,7 +258,7 @@ impl NoteStorage for NoteNvs {
     /// caller takes an index, writes the counter, and only then derives. See
     /// `note_store::take_derived`.
     fn save_cash(&mut self, blob: &[u8]) -> Result<(), StorageError> {
-        self.nvs.replace_blob(CASH_KEY, blob).map_err(|e| {
+        self.nvs.replace_blob_in_place(CASH_KEY, blob).map_err(|e| {
             log::error!("[notes] cash registry write failed: {e}");
             self.failed = true;
             StorageError
@@ -478,7 +482,7 @@ impl DeviceIdentityNvs {
                     seed.zeroize();
                     return;
                 }
-                if nvs.replace_blob(IDENTITY_KEY, &seed).is_err() {
+                if nvs.replace_blob_in_place(IDENTITY_KEY, &seed).is_err() {
                     log::error!("[identity] could not persist generated seed; cable identity disabled");
                     seed.zeroize();
                     return;
@@ -771,7 +775,7 @@ pub fn store_wrap_ledger(blob: &[u8]) {
         let Storage::Nvs(nvs) = &mut notes.storage else {
             return;
         };
-        if let Err(e) = nvs.nvs.replace_blob(WRAPS_KEY, blob) {
+        if let Err(e) = nvs.nvs.replace_blob_in_place(WRAPS_KEY, blob) {
             log::warn!("[notes] wrap ledger write failed: {e}");
         }
     })
@@ -931,7 +935,7 @@ fn sync_sealed_inner(notes: &mut Notes, secret: Option<&[u8]>) {
                         key.zeroize();
                         return;
                     };
-                    if let Err(e) = nvs.nvs.replace_blob(NK_KEY, &blob) {
+                    if let Err(e) = nvs.nvs.replace_blob_in_place(NK_KEY, &blob) {
                         log::error!("[notes] nk write failed: {e} — notes stay plaintext");
                         key.zeroize();
                         return;
@@ -954,7 +958,7 @@ fn sync_sealed_inner(notes: &mut Notes, secret: Option<&[u8]>) {
             let key = nvs.key.expect("established above");
             match wrap_note_key(secret, &key) {
                 Some(blob) => {
-                    if let Err(e) = nvs.nvs.replace_blob(NK_KEY, &blob) {
+                    if let Err(e) = nvs.nvs.replace_blob_in_place(NK_KEY, &blob) {
                         log::error!("[notes] nk re-wrap write failed: {e} — old wrap kept");
                     }
                 }

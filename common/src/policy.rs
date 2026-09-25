@@ -1396,6 +1396,32 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Whether `after` grants a client nothing `before` did not: the same slot
+/// with at most a new label, fewer auto-approved methods, a narrower kind
+/// list (empty means every kind) and auto-approval turned off, but never on.
+/// Anything else, including any change to keys, grants or family flags, is
+/// not treated as narrowing. Used to save such an update as a revocation: on
+/// failure it must not be rolled back to the wider permissions.
+pub fn narrows_only(before: &ConnectSlot, after: &ConnectSlot) -> bool {
+    let methods_narrow = after.allowed_methods.iter().all(|m| before.allowed_methods.contains(m));
+    let kinds_narrow = before.allowed_kinds.is_empty()
+        || (!after.allowed_kinds.is_empty()
+            && after.allowed_kinds.iter().all(|k| before.allowed_kinds.contains(k)));
+    let auto_narrow = before.auto_approve || !after.auto_approve;
+    if !(methods_narrow && kinds_narrow && auto_narrow) {
+        return false;
+    }
+    let mut probe = after.clone();
+    probe.label.clone_from(&before.label);
+    probe.allowed_methods.clone_from(&before.allowed_methods);
+    probe.allowed_kinds.clone_from(&before.allowed_kinds);
+    probe.auto_approve = before.auto_approve;
+    matches!(
+        (serde_json::to_value(&probe), serde_json::to_value(before)),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3553,5 +3579,45 @@ mod tests {
         assert!(redacted.secret.is_empty());
         assert_eq!(redacted.label, "test");
         assert_eq!(redacted.slot_index, 0);
+    }
+
+    fn narrowing_slot() -> ConnectSlot {
+        let mut slot = sample_slot(0, "app");
+        slot.allowed_methods = vec!["sign_event".into(), "nip44_encrypt".into()];
+        slot.allowed_kinds = vec![1, 7];
+        slot.auto_approve = true;
+        slot
+    }
+
+    #[test]
+    fn narrowing_a_slot_is_recognised_and_widening_is_not() {
+        let before = narrowing_slot();
+        let mut after = before.clone();
+        after.label = "renamed".into();
+        after.allowed_methods = vec!["sign_event".into()];
+        after.allowed_kinds = vec![1];
+        after.auto_approve = false;
+        assert!(narrows_only(&before, &after));
+        assert!(narrows_only(&before, &before.clone()));
+
+        let widen = |f: &dyn Fn(&mut ConnectSlot)| {
+            let mut w = before.clone();
+            f(&mut w);
+            narrows_only(&before, &w)
+        };
+        assert!(!widen(&|s| s.allowed_methods.push("get_public_key".into())));
+        assert!(!widen(&|s| s.allowed_kinds.push(4)));
+        assert!(!widen(&|s| s.allowed_kinds.clear()), "empty kinds allow every kind");
+        assert!(!widen(&|s| s.escalate = !s.escalate));
+        assert!(!widen(&|s| s.authorized_pubkeys.push("ab".repeat(32))));
+        assert!(!widen(&|s| s.secret = "cd".repeat(32)));
+        let mut off = before.clone();
+        off.auto_approve = false;
+        let mut on = off.clone();
+        on.auto_approve = true;
+        assert!(!narrows_only(&off, &on));
+        let mut all_kinds = before.clone();
+        all_kinds.allowed_kinds.clear();
+        assert!(narrows_only(&all_kinds, &before));
     }
 }

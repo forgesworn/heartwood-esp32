@@ -9,7 +9,7 @@ use std::ffi::CString;
 use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::{self, esp, EspError};
-use heartwood_common::nvs_budget::{self, Plan};
+use heartwood_common::nvs_budget::{self, Fallback, Plan};
 
 /// Write a blob so a power cut leaves either the old value or the new one.
 ///
@@ -33,31 +33,37 @@ use heartwood_common::nvs_budget::{self, Plan};
 /// The new copy is written while the old one still holds its entries, so a
 /// replace needs room for both. Whether there is room is decided here, from
 /// `available_entries`, before ESP-IDF is asked (`nvs_budget::plan_replace`):
-/// a v5.3.2 blob write that runs out of room part-way cleans up the wrong
-/// chunks and can damage the old copy (see `nvs_budget`), so a write that
-/// might not fit is refused with ESP_ERR_NVS_NOT_ENOUGH_SPACE and the old
-/// value left exactly as it was. Rewriting a value that is already stored is
-/// a no-op, whatever the room.
+/// a v5.3.2 blob write that runs out of room part-way, over an existing key,
+/// cleans up the wrong chunks and can damage the old copy (see `nvs_budget`).
+/// When there is no room, secrets and the small critical keys are refused
+/// with ESP_ERR_NVS_NOT_ENOUGH_SPACE and keep their old value; everything
+/// else is erased first and then written, as every write was before this
+/// firmware. Rewriting a value that is already stored is a no-op.
 pub trait ReplaceBlob {
-    /// Replace in place, or refuse and keep the old value.
+    /// Replace under the key's policy (`nvs_budget::fallback_for`).
     fn replace_blob(&self, key: &str, value: &[u8]) -> Result<(), EspError>;
 
-    /// The same, for a write that only removes authority (a revoked pairing
-    /// or phone). Where the key's policy allows it (`nvs_budget::fallback_for`)
-    /// and the new value is no larger, a replace that does not fit in place
-    /// erases the key first: a cut between the two leaves it absent, which
-    /// for those keys is less authority, never more. Any other key behaves
-    /// exactly as [`ReplaceBlob::replace_blob`].
-    fn revoke_blob(&self, key: &str, value: &[u8]) -> Result<(), EspError>;
+    /// Replace in place or refuse, whatever the key. For a namespace whose
+    /// keys all hold value (the note locker).
+    fn replace_blob_in_place(&self, key: &str, value: &[u8]) -> Result<(), EspError>;
+
+    /// Replace, erasing first if there is no room, whatever the key. Only for
+    /// a caller whose old value is recoverable elsewhere: a journalled copy
+    /// whose source stays intact until the copy has landed.
+    fn overwrite_blob(&self, key: &str, value: &[u8]) -> Result<(), EspError>;
 }
 
 impl ReplaceBlob for EspNvs<NvsDefault> {
     fn replace_blob(&self, key: &str, value: &[u8]) -> Result<(), EspError> {
-        write_blob(self, key, value, false)
+        write_blob(self, key, value, nvs_budget::fallback_for(key))
     }
 
-    fn revoke_blob(&self, key: &str, value: &[u8]) -> Result<(), EspError> {
-        write_blob(self, key, value, true)
+    fn replace_blob_in_place(&self, key: &str, value: &[u8]) -> Result<(), EspError> {
+        write_blob(self, key, value, Fallback::Never)
+    }
+
+    fn overwrite_blob(&self, key: &str, value: &[u8]) -> Result<(), EspError> {
+        write_blob(self, key, value, Fallback::EraseFirst)
     }
 }
 
@@ -65,32 +71,43 @@ fn not_enough_space() -> EspError {
     EspError::from_infallible::<{ sys::ESP_ERR_NVS_NOT_ENOUGH_SPACE }>()
 }
 
-fn write_blob(nvs: &EspNvs<NvsDefault>, key: &str, value: &[u8], revoking: bool) -> Result<(), EspError> {
+fn write_blob(nvs: &EspNvs<NvsDefault>, key: &str, value: &[u8], fallback: Fallback) -> Result<(), EspError> {
     let c_key = CString::new(key)
         .map_err(|_| EspError::from_infallible::<{ sys::ESP_ERR_INVALID_ARG }>())?;
     let available = crate::nvs_stats::read()
         .map(|s| s.available_entries)
         .ok_or_else(EspError::from_infallible::<{ sys::ESP_FAIL }>)?;
     let old_len = nvs.blob_len(key)?;
-    let plan = nvs_budget::plan_replace(key, available, old_len, value.len(), revoking);
-    if plan != Plan::Direct {
-        if old_len == Some(value.len()) && stored_equals(nvs, key, value)? {
-            return Ok(());
-        }
-        if plan == Plan::Refuse {
+    let plan = nvs_budget::plan_replace(fallback, available, old_len, value.len());
+    if plan != Plan::Direct && old_len == Some(value.len()) && stored_equals(nvs, key, value)? {
+        return Ok(());
+    }
+    // SAFETY (every call below): the handle is open for as long as `nvs`
+    // lives, the key is a NUL-terminated string that outlives the call, and
+    // ESP-IDF copies exactly `value.len()` bytes from `value`.
+    let set = || {
+        esp!(unsafe {
+            sys::nvs_set_blob(nvs.handle(), c_key.as_ptr(), value.as_ptr().cast(), value.len())
+        })
+    };
+    match plan {
+        Plan::Direct => set()?,
+        Plan::Refuse => {
             log::warn!("nvs: {key} not written: {} bytes need more room than is free", value.len());
             return Err(not_enough_space());
         }
-        log::warn!("nvs: {key} erased before its rewrite: no room for a second copy");
-        // SAFETY: as for nvs_set_blob below.
-        esp!(unsafe { sys::nvs_erase_key(nvs.handle(), c_key.as_ptr()) })?;
+        Plan::EraseFirst => {
+            log::warn!("nvs: {key} erased before its rewrite: no room for a second copy");
+            esp!(unsafe { sys::nvs_erase_key(nvs.handle(), c_key.as_ptr()) })?;
+            // The key is now absent, so the old value is gone whatever
+            // happens next. Try the new one twice rather than give up on it:
+            // a caller must never be left thinking the old value survived.
+            if let Err(e) = set() {
+                log::warn!("nvs: {key} rewrite after erase failed ({e}), retrying");
+                set()?;
+            }
+        }
     }
-    // SAFETY: the handle is open for as long as `nvs` lives, the key is a
-    // NUL-terminated string that outlives the call, and ESP-IDF copies
-    // exactly `value.len()` bytes from `value`.
-    esp!(unsafe {
-        sys::nvs_set_blob(nvs.handle(), c_key.as_ptr(), value.as_ptr().cast(), value.len())
-    })?;
     // A no-op in ESP-IDF v5.3.2 (the write above is already on flash);
     // called as esp-idf-svc does, in case a later version caches.
     esp!(unsafe { sys::nvs_commit(nvs.handle()) })

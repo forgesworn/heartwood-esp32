@@ -52,26 +52,6 @@ impl BlobStore for NvsBlobs<'_> {
     }
 }
 
-/// NVS as the data-key store for a revocation: writes go through
-/// `ReplaceBlob::revoke_blob`, so a key whose policy allows it (the phone
-/// records) is still rewritten when the partition has no room for a second
-/// copy, by erasing first. Reads and removes are [`NvsBlobs`]'s.
-pub struct RevokingBlobs<'a>(pub &'a mut EspNvs<NvsDefault>);
-
-impl BlobStore for RevokingBlobs<'_> {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        NvsBlobs::get_from(self.0, key)
-    }
-
-    fn set(&mut self, key: &str, value: &[u8]) -> Result<(), StoreError> {
-        self.0.revoke_blob(key, value).map_err(|_| StoreError)
-    }
-
-    fn remove(&mut self, key: &str) -> Result<(), StoreError> {
-        self.0.remove(key).map(|_| ()).map_err(|_| StoreError)
-    }
-}
-
 /// TRNG, watchdog and progress for the data-key operations.
 pub struct Board<'p> {
     pub progress: Option<&'p mut dyn FnMut(usize, usize)>,

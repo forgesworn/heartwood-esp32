@@ -28,7 +28,7 @@ use heartwood_common::types::{FRAME_TYPE_NACK, FRAME_TYPE_PHONE_UNLOCK_RESP};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::data_key_store::{self, NvsBlobs, RevokingBlobs};
+use crate::data_key_store::{self, NvsBlobs};
 use crate::masters::LoadedMaster;
 use crate::serial::SerialPort;
 
@@ -88,12 +88,23 @@ fn save(nvs: &mut EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(), String> {
         .map_err(|_| "phone storage full or failing: nothing was changed".to_string())
 }
 
-/// Save after a revocation. On a partition with no room for a second copy of
-/// the records this erases them first rather than fail: a cut in between
-/// leaves no phones at all, never the revoked one.
-fn save_revoked(nvs: &mut EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(), String> {
-    data_key::save_phones(&mut RevokingBlobs(nvs), phones)
-        .map_err(|_| "phone storage failing: the phone may not be revoked yet, try again".to_string())
+/// Save after a revocation, and say truthfully what is on flash if that
+/// fails. On a partition with no room for a second copy the records are
+/// erased before the rewrite, so a failure can leave none at all.
+fn save_revoked(nvs: &mut EspNvs<NvsDefault>, phones: &PhoneSet, id: u32) -> Result<(), String> {
+    if save(nvs, phones).is_ok() {
+        return Ok(());
+    }
+    match load(nvs) {
+        Ok(stored) if stored.records().iter().any(|r| r.id == id) => Err(format!(
+            "phone storage failing: phone {id} is still enrolled on flash, try again"
+        )),
+        Ok(stored) if stored.is_empty() && !phones.is_empty() => Err(format!(
+            "phone storage full: phone {id} is revoked, but so are the other phones; re-enrol them"
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("phone storage failing after revoking phone {id}: {e}")),
+    }
 }
 
 fn configured_relays(nvs: &EspNvs<NvsDefault>) -> Vec<String> {
@@ -126,7 +137,7 @@ pub fn run(
         PhoneCmd::Revoke { id } => {
             let mut phones = load(nvs)?;
             phones.revoke(id).map_err(|_| format!("no phone with id {id}"))?;
-            save_revoked(nvs, &phones)?;
+            save_revoked(nvs, &phones, id)?;
             PHONES_CHANGED.store(true, Ordering::Release);
             log::info!("phone unlock: revoked phone {id}");
             // No phone listens anywhere now; the next enrolment records afresh.

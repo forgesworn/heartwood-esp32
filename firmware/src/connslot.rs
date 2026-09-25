@@ -162,30 +162,26 @@ pub fn handle_update(
                 // changed from a stale management screen. No physical hold is
                 // needed to withdraw authority on an authenticated cable.
                 if let Some(withdrawal) = v.get("withdraw_consent_v1") {
-                    let result = (|| -> Result<(), &'static str> {
-                        if !withdrawal.is_object() { return Err("invalid consent withdrawal"); }
+                    let result = (|| -> Result<(), String> {
+                        if !withdrawal.is_object() { return Err("invalid consent withdrawal".into()); }
                         let target = policy_engine.list_slots(ms).iter()
                             .find(|slot| slot.slot_index == idx).ok_or("pairing not found")?;
-                        if target.client_grants.is_none() { return Err("per-device consent unavailable"); }
+                        if target.client_grants.is_none() { return Err("per-device consent unavailable".into()); }
                         let fingerprint = heartwood_common::mgmt::credential_fingerprint(&target.secret);
                         if v.get("expected_secret_fingerprint").and_then(|value| value.as_str()) != Some(fingerprint.as_str()) {
-                            return Err("pairing_changed: refresh the signer");
+                            return Err("pairing_changed: refresh the signer".into());
                         }
                         let client = withdrawal.get("client_pubkey").map(|value| {
                             value.as_str().filter(|key| heartwood_common::policy::decode_client_key(key).is_some()
                                 && heartwood_common::policy::slot_authorizes(target, key)).ok_or("unknown client credential")
                         }).transpose()?;
                         let identity = withdrawal.get("identity").map(|value| value.as_str().ok_or("invalid identity")).transpose()?;
-                        let snapshot = policy_engine.snapshot_slot_state(ms);
                         match identity {
                             Some(identity) => { policy_engine.revoke_identity(ms, idx, identity, client).ok_or("pairing not found")??; }
                             None => { policy_engine.clear_identities(ms, idx, client).ok_or("pairing not found")?; }
                         }
-                        if !policy_engine.persist_slots_revoking(nvs, ms) {
-                            policy_engine.restore_slot_state_durably(nvs, snapshot);
-                            return Err("storage_unavailable: consent withdrawal was not saved");
-                        }
-                        Ok(())
+                        // Never rolled back: that would restore the grant.
+                        policy_engine.persist_revocation(nvs, ms).describe("consent withdrawal")
                     })();
                     match result {
                         Ok(()) => protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"consent_withdrawn_v1"),
@@ -255,6 +251,7 @@ pub fn handle_update(
                     let auto = v["auto_approve"].as_bool();
 
                     let snapshot = policy_engine.snapshot_slot_state(ms);
+                    let before = policy_engine.list_slots(ms).iter().find(|s| s.slot_index == idx).cloned();
                     if policy_engine.update_slot(ms, idx, label, methods, kinds, auto) {
                         // Family-bunker C3 flags: absent keys keep the slot's
                         // existing values (same merge rule as the fields
@@ -296,7 +293,19 @@ pub fn handle_update(
                                     .or(existing.4),
                             );
                         }
-                        if !policy_engine.persist_slots(nvs, ms) {
+                        let after = policy_engine.list_slots(ms).iter().find(|s| s.slot_index == idx);
+                        let narrowing = matches!((&before, after), (Some(b), Some(a))
+                            if heartwood_common::policy::narrows_only(b, a));
+                        if narrowing {
+                            // Only takes permissions away: saved as a
+                            // revocation, never rolled back to the wider ones.
+                            if let Err(outcome) =
+                                policy_engine.persist_revocation(nvs, ms).describe("permission change")
+                            {
+                                protocol::write_frame(usb, FRAME_TYPE_NACK, outcome.as_bytes());
+                                return;
+                            }
+                        } else if !policy_engine.persist_slots(nvs, ms) {
                             policy_engine.restore_slot_state_durably(nvs, snapshot);
                             protocol::write_frame(usb, FRAME_TYPE_NACK, b"storage_unavailable: permissions were not saved");
                             return;
@@ -334,11 +343,10 @@ pub fn handle_revoke(
     } else {
         let ms = frame.payload[0];
         let idx = frame.payload[1];
-        let snapshot = policy_engine.snapshot_slot_state(ms);
         if policy_engine.revoke_slot(ms, idx) {
-            if !policy_engine.persist_slots_revoking(nvs, ms) {
-                policy_engine.restore_slot_state_durably(nvs, snapshot);
-                protocol::write_frame(usb, FRAME_TYPE_NACK, b"storage_unavailable: pairing was not revoked");
+            // Never rolled back: that would re-authorise the pairing.
+            if let Err(outcome) = policy_engine.persist_revocation(nvs, ms).describe("pairing revocation") {
+                protocol::write_frame(usb, FRAME_TYPE_NACK, outcome.as_bytes());
                 return;
             }
             protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"ok");

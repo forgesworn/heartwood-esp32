@@ -18,7 +18,10 @@
 //! read then drops as incomplete (`:619-624`), and leaves the new chunks live;
 //! a later retry that succeeds then carries those strays, and boot drops its
 //! index for a chunk-count mismatch (`:98-114`). So a replace that might not
-//! fit is refused here, and ESP-IDF is never asked.
+//! fit is either refused here (secrets and small critical keys, which stay
+//! small enough to fit) or written after erasing the old copy (everything
+//! else, as every write was before), and ESP-IDF is never asked to write a
+//! second copy it has no room for.
 //!
 //! Pure and host-tested; the firmware supplies the numbers.
 
@@ -61,10 +64,10 @@ pub fn stored_entries_min(len: usize) -> usize {
     div_ceil(len, ENTRY_SIZE) + 2
 }
 
-/// Room kept for the small keys that must never fall back to erasing first
-/// (the data-key wrapper, a sealed seed, the note key, the PIN wipe counter,
-/// a management challenge): one rewrite of the largest of them at a time,
-/// since each old copy is erased before the next write starts.
+/// Room kept for the small keys that never fall back to erasing first (the
+/// data-key wrapper, a sealed seed, the note key, a management challenge):
+/// one rewrite of the largest of them at a time, since each old copy is
+/// erased before the next write starts.
 pub const SMALL_WRITE_MAX: usize = 128;
 
 /// Entries kept back for [`SMALL_WRITE_MAX`].
@@ -72,40 +75,49 @@ pub fn small_write_reserve() -> usize {
     blob_entries(SMALL_WRITE_MAX)
 }
 
-/// What a replace that does not fit in place may do instead.
+/// What a replace that does not fit beside the old copy does instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fallback {
-    /// Refuse. The old value stays; the caller reports storage full.
+    /// Refuse, before ESP-IDF is asked. The old value stays and the caller
+    /// reports storage full. For secrets and the small keys whose absence
+    /// loses keys or resets a replay boundary.
     Never,
-    /// On a revocation only, and only when the new value is no larger, erase
-    /// the key and then write. A cut between the two leaves the key absent,
-    /// which for these keys means less authority, never more: no pairings
-    /// for that identity, or no unlock phones. Failing the write instead
-    /// would leave the party being revoked authorised.
-    EraseFirstOnRevoke,
+    /// Erase the key, then write. A cut in between leaves it absent, which is
+    /// what every write did before this firmware; with the key absent the
+    /// write starts at version offset 0, where ESP-IDF's failure cleanup
+    /// erases the right chunks.
+    EraseFirst,
 }
 
-/// The per-key fallback policy. Everything not listed is [`Fallback::Never`]:
-/// losing `dk_sec`, a sealed seed, `nk` or a note record loses keys or value,
-/// losing `pin_attempts` or a management challenge resets a counter an
-/// attacker is up against, and losing a journal abandons a transaction
-/// half done.
+/// The per-key policy for the `heartwood` namespace. The note locker's
+/// namespace never falls back whatever the key, and says so at its call sites.
 pub fn fallback_for(key: &str) -> Fallback {
-    // `connslots_N`: one master's pairing table. `dk_ph`: the unlock phones
-    // (`data_key::PHONES_KEY`, spelt out because that module is feature-gated).
-    if key == "dk_ph" || key.strip_prefix("connslots_").is_some_and(|n| !n.is_empty()) {
-        Fallback::EraseFirstOnRevoke
-    } else {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let seed_enc = key
+        .strip_prefix('m')
+        .and_then(|k| k.strip_suffix("_seed_enc"))
+        .is_some_and(digits);
+    let seed_plain = key
+        .strip_prefix("master_")
+        .and_then(|k| k.strip_suffix("_secret"))
+        .is_some_and(digits);
+    let never = matches!(key, "dk_sec" | "at_rest_kind" | "root_secret" | "pin_attempts")
+        || key.starts_with("mgmt_")
+        || seed_enc
+        || seed_plain;
+    if never {
         Fallback::Never
+    } else {
+        Fallback::EraseFirst
     }
 }
 
 /// Master slots a board can hold (`masters::MAX_MASTERS`).
 pub const MAX_MASTER_SLOTS: u8 = 8;
 
-/// The blobs that are rewritten in place and must stay rewritable: every
-/// master's pairing table, the unlock phones and the persona chunks. The
-/// growth gate keeps room for the largest of them.
+/// The blobs most often rewritten in place: every master's pairing table,
+/// the unlock phones and the persona chunks. The growth gate keeps room for
+/// the largest of them.
 pub fn hot_keys() -> impl Iterator<Item = String> {
     (0..MAX_MASTER_SLOTS)
         .map(|slot| format!("connslots_{slot}"))
@@ -124,28 +136,20 @@ pub enum Plan {
     Refuse,
 }
 
-/// Plan a replace of `key` (currently `old_len` bytes, or absent) with
-/// `new_len` bytes, given `available` entries. `revoking` is the caller's
-/// statement that the write only removes authority; it matters only for a key
-/// whose policy allows it.
-pub fn plan_replace(
-    key: &str,
-    available: usize,
-    old_len: Option<usize>,
-    new_len: usize,
-    revoking: bool,
-) -> Plan {
-    let need = blob_entries(new_len);
-    if need <= available {
+/// Plan a replace of a key (currently `old_len` bytes, or absent) with
+/// `new_len` bytes, given `available` entries.
+///
+/// A first write is always attempted: with no old copy the write starts at
+/// version offset 0, so a failure part-way is cleaned up correctly and costs
+/// nothing. A replace that fits beside the old copy is written in place.
+/// Otherwise `fallback` decides.
+pub fn plan_replace(fallback: Fallback, available: usize, old_len: Option<usize>, new_len: usize) -> Plan {
+    if old_len.is_none() || blob_entries(new_len) <= available {
         return Plan::Direct;
     }
-    match (fallback_for(key), old_len) {
-        (Fallback::EraseFirstOnRevoke, Some(old))
-            if revoking && new_len <= old && need <= available + stored_entries_min(old) =>
-        {
-            Plan::EraseFirst
-        }
-        _ => Plan::Refuse,
+    match fallback {
+        Fallback::Never => Plan::Refuse,
+        Fallback::EraseFirst => Plan::EraseFirst,
     }
 }
 
@@ -155,8 +159,8 @@ pub fn plan_replace(
 /// reserve. `old_len` is the growing key's current size (its old copy is
 /// freed once the write completes); `largest_hot` is the largest of the blobs
 /// that are rewritten in place (the pairing tables, `dk_ph`, the persona
-/// chunks). Keeping this true is what keeps a later revocation a direct,
-/// cut-safe replace; the erase-first fallback is for boards already past it.
+/// chunks). Headroom hygiene, not a guarantee: other writes are not gated,
+/// so a board can still end up where a large replace erases first.
 pub fn growth_allowed(available: usize, old_len: Option<usize>, new_len: usize, largest_hot: usize) -> bool {
     let need = blob_entries(new_len);
     if need > available {
@@ -184,62 +188,77 @@ mod tests {
     }
 
     #[test]
-    fn only_pairing_tables_and_phone_records_may_fall_back() {
-        for key in ["connslots_0", "connslots_7", "dk_ph"] {
-            assert_eq!(fallback_for(key), Fallback::EraseFirstOnRevoke, "{key}");
-        }
+    fn only_secrets_and_small_critical_keys_refuse() {
         for key in [
             "dk_sec",
-            "m0_seed_enc",
-            "master_0_secret",
-            "nk",
-            "idx",
+            "at_rest_kind",
+            "root_secret",
             "pin_attempts",
+            "m0_seed_enc",
+            "m7_seed_enc",
+            "master_0_secret",
+            "master_7_secret",
             "mgmt_nonce",
             "mgmt_0123abcd",
-            "at_rest_kind",
-            "rm_journal",
-            "pc0",
-            "net_trial",
-            "connslots_",
-            "connslots",
-            "master_0_conn",
         ] {
             assert_eq!(fallback_for(key), Fallback::Never, "{key}");
         }
-    }
-
-    #[test]
-    fn every_hot_key_but_the_persona_chunks_may_fall_back_on_revoke() {
-        let keys: Vec<String> = hot_keys().collect();
-        assert_eq!(keys.len(), 8 + 1 + crate::persona_pack::MAX_CHUNKS as usize);
-        for key in &keys {
-            let expect = if key.starts_with("pc") { Fallback::Never } else { Fallback::EraseFirstOnRevoke };
-            assert_eq!(fallback_for(key), expect, "{key}");
+        for key in [
+            "connslots_0",
+            "dk_ph",
+            "pc0",
+            "pcnt",
+            "rm_journal",
+            "net_config",
+            "net_trial",
+            "net_last",
+            "ph_relays",
+            "pinned_rly",
+            "imav0",
+            "master_0_label",
+            "master_0_conn",
+            "m0_seed_encx",
+            "mx_seed_enc",
+            "master__secret",
+        ] {
+            assert_eq!(fallback_for(key), Fallback::EraseFirst, "{key}");
         }
     }
 
     #[test]
-    fn a_replace_that_fits_is_direct_whatever_the_key() {
-        let need = blob_entries(500);
-        assert_eq!(plan_replace("dk_sec", need, Some(92), 500, false), Plan::Direct);
-        assert_eq!(plan_replace("connslots_0", need, Some(600), 500, true), Plan::Direct);
+    fn hot_keys_cover_every_pairing_table_the_phones_and_the_persona_chunks() {
+        let keys: Vec<String> = hot_keys().collect();
+        assert_eq!(keys.len(), 8 + 1 + crate::persona_pack::MAX_CHUNKS as usize);
+        assert!(keys.iter().all(|k| fallback_for(k) == Fallback::EraseFirst));
     }
 
     #[test]
-    fn a_revocation_that_does_not_fit_erases_first_only_where_allowed() {
-        let old = 6000;
-        let new = 5400;
-        let available = 17; // the bench V4's measured headroom
-        assert_eq!(plan_replace("connslots_2", available, Some(old), new, true), Plan::EraseFirst);
-        assert_eq!(plan_replace("dk_ph", available, Some(2166), 2031, true), Plan::EraseFirst);
-        // Not a revocation, not a fallback key, growing, or absent: refused.
-        assert_eq!(plan_replace("connslots_2", available, Some(old), new, false), Plan::Refuse);
-        assert_eq!(plan_replace("pc0", available, Some(old), new, true), Plan::Refuse);
-        assert_eq!(plan_replace("connslots_2", available, Some(old), old + 1, true), Plan::Refuse);
-        assert_eq!(plan_replace("connslots_2", available, None, new, true), Plan::Refuse);
-        // Even erasing the old copy would not make room: refused.
-        assert_eq!(plan_replace("connslots_2", 0, Some(40), 40, true), Plan::Refuse);
+    fn a_replace_that_fits_or_a_first_write_is_direct_whatever_the_key() {
+        let need = blob_entries(500);
+        for fallback in [Fallback::Never, Fallback::EraseFirst] {
+            assert_eq!(plan_replace(fallback, need, Some(92), 500), Plan::Direct);
+            assert_eq!(plan_replace(fallback, 0, None, 500), Plan::Direct);
+        }
+    }
+
+    #[test]
+    fn a_replace_that_does_not_fit_erases_first_unless_the_key_forbids_it() {
+        // The bench V4's measured headroom, far short of a second table.
+        let available = 17;
+        assert_eq!(plan_replace(Fallback::EraseFirst, available, Some(6000), 6000), Plan::EraseFirst);
+        assert_eq!(plan_replace(Fallback::EraseFirst, available, Some(6000), 6700), Plan::EraseFirst);
+        assert_eq!(plan_replace(Fallback::Never, available, Some(6000), 5400), Plan::Refuse);
+        // A secret wrapper still fits in place at that headroom.
+        assert_eq!(plan_replace(Fallback::Never, available, Some(101), 101), Plan::Direct);
+    }
+
+    #[test]
+    fn at_the_bench_headroom_every_never_fallback_value_still_fits() {
+        // dk_sec and the sealed seeds are at most 101 bytes, at_rest_kind 9,
+        // a management challenge record at most 64.
+        for len in [101, 82, 9, 32, 64] {
+            assert!(blob_entries(len) <= 17, "{len} bytes need {}", blob_entries(len));
+        }
     }
 
     #[test]
@@ -252,7 +271,7 @@ mod tests {
             - stored_entries_min(table);
         assert!(growth_allowed(available, Some(table), grown, table));
         let after = available - blob_entries(grown) + stored_entries_min(table);
-        assert_eq!(plan_replace("connslots_0", after, Some(grown), table, false), Plan::Direct);
+        assert_eq!(plan_replace(Fallback::EraseFirst, after, Some(grown), table), Plan::Direct);
         available -= 1;
         assert!(!growth_allowed(available, Some(table), grown, table));
         // A small growth is still refused while a larger hot blob would lose

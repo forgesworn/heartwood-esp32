@@ -17,6 +17,8 @@
 //                           authority. No press: removing authority is always
 //                           allowed. Revoking the last phone also forgets the
 //                           relays the phones were told (relay.rs RelayUpdate).
+//                           Then zeroes the deleted bytes (nvs_scrub.rs) and
+//                           says how that went in the answer's `scrub`.
 //   set_announce_operator   whether the locked board still publishes the
 //                           operator's announcement, the one stable `p` tag.
 
@@ -146,9 +148,14 @@ pub fn run(
             if none_left && heartwood_common::phone_relays::forget_told(&mut NvsBlobs(nvs)).is_err() {
                 log::warn!("phone unlock: relay record not cleared");
             }
+            // Deleting the record only marks its entries erased; its bytes
+            // (which the revoked phone's secret opens) stay on flash until
+            // this zeroes them. Run whatever the save did: a failed rewrite
+            // can still have erased the old records.
+            let scrub = crate::nvs_scrub::run("phone revoke");
             saved?;
             log::info!("phone unlock: revoked phone {id}");
-            Ok(serde_json::json!({ "revoked": id }))
+            Ok(phone_unlock::revoke_json(id, &scrub))
         }
         PhoneCmd::SetAnnounceOperator { on } => {
             data_key_store::set_announce_operator(nvs, on)

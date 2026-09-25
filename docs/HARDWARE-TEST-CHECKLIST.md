@@ -2285,6 +2285,83 @@ subscribed to `{"kinds":[24135]}`).
    unlocked through round 6. The log says "phones told about the relay
    change; recorded", and a reset afterwards has no "relays changed" line.
 
+## 28. Deleted NVS entries are zeroed (added 2026-09-25, NOT YET BENCH-RUN)
+
+ESP-IDF marks a deleted or replaced NVS value erased and leaves its bytes
+until the sector is collected. The firmware now zeroes every erased entry at
+boot, after a phone or pairing revoke, an identity removal and every at-rest
+change (SECURITY-MODEL.md, *Leftover bytes in NVS*; logic and host tests:
+`common/src/nvs_scrub.rs`). Nothing here has run on hardware.
+
+Needs a sacrificial V4 on the previous firmware, sealed with a vault key, with
+two phones enrolled, two or three pairings and a few changes behind it (a
+network edit, a revoked pairing), so the partition has residue; ESP-IDF's
+`nvs_tool.py` (in the build tree:
+`firmware/.embuild/espressif/esp-idf/v5.3.2/components/nvs_flash/nvs_partition_tool/nvs_tool.py`,
+run with the IDF Python env); a way to read the NVS partition (`espflash
+read-flash` or `esptool.py read_flash`, offset `0x9000`, length `0x4000` on
+the release table, `0x6000` on the legacy V4 tables); and, for step 6, a
+switched USB power supply or hub.
+
+1. **Residue exists today.** On the previous firmware, dump NVS to
+   `before.bin` and run `nvs_tool.py -d all -i before.bin`. Expect entries in
+   state `Erased` that still show a key and readable data (old `dk_ph`,
+   `connslots_N`, `net_config`, and `master_N_secret` if an identity was
+   added before sealing). Record how many; this measures the residual the
+   scrub closes. Keep `before.bin` for step 6.
+
+2. **The boot pass.** App-only flash the scrub build (NVS untouched) and let
+   it boot. `FIRMWARE_INFO` shows
+   `"nvs_scrub":{"zeroed":N,"pages_skipped":0,"complete":true}` with N > 0.
+   Dump to `after.bin`: in `nvs_tool.py -d all -i after.bin` every `Erased`
+   entry shows an empty key and all-zero data; `-i` reports every page's
+   CRC32 OK and nothing `before.bin` did not already report. `nvs_tool.py -d
+   written` of both dumps differs only in keys a boot rewrites (`rng_proof`,
+   `lk_boots` on a locked boot). Unlock with the vault key, then restart and
+   unlock with each phone: both work. A second restart shows a small
+   `zeroed` (the boot's own rewrites) and `complete: true`.
+
+3. **A phone revoke answers with the scrub.** Revoke one phone
+   (`scripts/phone-unlock.mjs revoke`, or Sapwood). The answer is
+   `{"revoked":<id>,"scrub":{"zeroed":n,"pages_skipped":0,"complete":true}}`
+   with n > 0 (the old `dk_ph` copy at least). Dump: no `Erased` entry holds
+   a non-zero byte. Restart: the revoked phone's unlock answers are ignored;
+   the other phone still unlocks the board.
+
+4. **A pairing revoke.** Over the relay as the device operator,
+   `revoke_client` answers with the same `scrub` object; as a per-identity
+   delegate, the answer has no `scrub` key. Over USB, `CONNSLOT_REVOKE` still
+   answers `ok`, and `FIRMWARE_INFO`'s `nvs_scrub` changes afterwards.
+   `get_status.capabilities` includes `nvs_scrub_v1`.
+
+5. **At-rest changes and removal.** Change the vault key (`VAULT_SET`, hold),
+   clear it, set a PIN, then remove an identity (`PROVISION_REMOVE`, hold):
+   after each, a dump shows no `Erased` entry with non-zero data, and the
+   board unlocks with whatever secret is now current. After sealing, no
+   32-byte run of any identity's plaintext seed appears anywhere in the dump.
+
+6. **Pull power during a boot-time pass, repeatedly.** Write `before.bin`
+   back to the NVS partition (the dirty image), power on, and cut power at a
+   varied delay after power-on (sweep about 100 ms to 1.5 s in 50 ms steps;
+   the pass runs after the boot animation and the journal recoveries). Power
+   on again and let it boot fully. Each time: the board boots and unlocks
+   with the vault key and with each phone; `FIRMWARE_INFO` shows `complete:
+   true`; a dump's `nvs_tool.py -d written` matches step 2's `after.bin`
+   except the boot-rewritten keys, and `-i` adds no complaint. Note roughly
+   how much longer a dirty boot takes than a clean one.
+
+7. **PHY calibration is off NVS.** This firmware builds with
+   `CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n`. On a WiFi board, compare
+   time from reset to "relay connected" with the previous firmware (expect
+   about 100 ms more, a full calibration each boot) and check WiFi joins and
+   holds as before. On a board that had stored calibration, `nvs_tool.py -d
+   all` still lists the `phy` namespace (`cal_data`, `cal_mac`,
+   `cal_version`) as written entries, unchanged across several boots with
+   WiFi: nothing writes them any more. On a freshly wiped board no `phy`
+   namespace appears at all.
+
+8. **Size.** Record the release `app.bin` size against the #197 build.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

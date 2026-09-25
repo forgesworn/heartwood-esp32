@@ -410,7 +410,9 @@ encryption**, and it is now built (opt-in). When a PIN is set, each master seed
 is stored as ciphertext — `PBKDF2-HMAC-SHA256(pin, salt)` derives the key,
 ChaCha20 + HMAC-SHA256 encrypt-then-MAC it (`common/src/seed_cipher.rs`), and
 the plaintext is removed. A raw `esptool read_flash` now yields ciphertext, not
-the seed. On boot the device is locked until a PIN decrypts the seeds into RAM;
+the seed, once the plaintext copy that removal leaves on flash has been zeroed:
+the scrub does that straight after sealing and at every boot (see *Leftover
+bytes in NVS* below). On boot the device is locked until a PIN decrypts the seeds into RAM;
 5 wrong attempts erase and verify both the flash-time `config` source and the
 complete NVS partition, so old WiFi/operator state cannot re-seed itself after
 the wipe. Physical factory reset uses the same complete path. See
@@ -520,7 +522,9 @@ changes hands:
 Security properties and honest residuals:
 
 - Flash dump alone: ciphertext under a 256-bit key — unbruteforceable, unlike
-  a short PIN.
+  a short PIN. That holds for what NVS has deleted too once the scrub has
+  run; a dump taken before it may still hold the plaintext written before
+  sealing (see *Leftover bytes in NVS* below).
 - Pi/browser compromise alone: a vault key that decrypts nothing the host
   possesses.
 - A wrong vault key is a plain NACK and deliberately does **not** feed the
@@ -657,14 +661,150 @@ So the residuals are these:
   wrote to the blob meanwhile.
 - **No write spans two keys.** A change spanning several keys relies on its
   own write order or journal, as each module documents.
-- **The old bytes stay.** The superseded copy is marked erased, not
-  overwritten, and stays readable in a raw flash dump until NVS reclaims its
-  page.
+- **The old bytes stay until the next scrub.** The superseded copy is
+  marked erased, not overwritten. The scrub zeroes it at the next boot, or
+  sooner after a revoke, an identity removal or an at-rest change; until
+  then it is readable in a raw flash dump (see *Leftover bytes in NVS*).
 
 Splitting `connslots_N` into one key per pairing would shrink the largest
 table rewrite from several KB to one pairing, so a full board would erase
 far less on a fallback. It needs a migration and a new boot loader, and is
 not built.
+
+### Leftover bytes in NVS
+
+ESP-IDF NVS never wipes a deleted or replaced value in place. Deleting a key
+flips two state bits per 32-byte entry in the page's state bitmap
+(`components/nvs_flash/src/nvs_page.cpp:371-438`, `:788-834` in v5.3.2); the
+entry's bytes stay until garbage collection erases the whole sector, which
+happens only when free pages run low and cannot be steered. ESP-IDF has no
+scrub option. So, without more, a flash dump can hold:
+
+- the plaintext seed written when each identity was added, since identities
+  can only be added with encryption off and sealing then deletes the
+  plaintext key (a restore onto an erased board writes it first as well);
+- an unlock phone's record after it is revoked, which the stolen phone's
+  slot secret opens, yielding the data key;
+- a revoked pairing's slot secret, in the pairing table it was removed from;
+- any earlier wrapper, note record or setting that was later replaced.
+
+The firmware closes this with a scrub (`common/src/nvs_scrub.rs`, flash glue
+in `firmware/src/nvs_scrub.rs`): one pass over the raw NVS partition that
+programs to zero every entry the bitmap marks erased.
+
+**When it runs.** At every boot, after the journal recoveries and before any
+unlock or WiFi, so a locked board runs it too and a pass a power cut stopped
+is finished. Straight after `revoke_unlock_phone` (USB 0x64 and the relay),
+`revoke_client` (relay) and `CONNSLOT_REVOKE` (USB 0x46), after an identity
+is removed (`PROVISION_REMOVE`), after a PIN or vault key is set, changed or
+cleared, after a seed migration at unlock, and after every note-locker
+sealing sync. Anything else deleted (a network change, a rotated management
+challenge, a withdrawn identity approval, a removed persona) is zeroed by the
+next of these, at the latest the next boot.
+
+**What it removes.** The 32 data bytes of each erased entry, in every
+namespace (ESP-IDF's own `phy` included), on every page NVS holds as ACTIVE
+or FULL with a valid header CRC and the current format. Nothing else is
+touched: not a page header, not the bitmap, not an unwritten or live entry.
+
+**What it does not remove.**
+
+- **A dump taken before the scrub ran.** It keeps whatever it caught. If the
+  board's flash may have been read while a lost phone was enrolled, or before
+  sealing, treat the identities on it as exposed.
+- **The live values**, sealed or not. A board without a PIN or vault key
+  still has its seeds in plaintext; the scrub removes old copies, not the
+  current one.
+- **Anything between a change and the next pass.** A value replaced by a
+  change that does not trigger a pass (above) stays readable until the next
+  one.
+- **Pages it cannot fully parse**, skipped whole and counted in
+  `pages_skipped`: CORRUPT pages (ESP-IDF keeps them "for diagnostics" until it
+  needs a free page, `nvs_page.hpp:65-68`), a FREEING page (mid garbage
+  collection; ESP-IDF finishes or restarts the copy at the next boot,
+  `nvs_pagemanager.cpp:92-125`, and the pass after that sees the result), a
+  bad header CRC, another format version, or an uninitialised header over
+  bytes that are not blank. Their residue stays until ESP-IDF erases them.
+- **A few erased entries it leaves on purpose**, counted and reported as
+  incomplete: on an ACTIVE page, erased entries after the first never-written
+  one (ESP-IDF's half-written-entry check at load reads those by position,
+  `nvs_page.cpp:559-608`, and a zeroed first word would change how far it
+  reads; a normally written page has none); erased entries inside the span of
+  an item whose erase a power cut interrupted (ESP-IDF drops the item at the
+  next boot, `:665-683`, and the next pass zeroes them); and ILLEGAL entries,
+  which only an inconsistent flash shows.
+- **Anything outside NVS**: the web flasher's `config` partition (the
+  network config it was flashed with, WiFi password in plaintext, until a
+  factory reset erases it), `phy_init`, `otadata`, the app image, and RAM.
+
+**Why NVS cannot notice.** ESP-IDF never reads an erased entry's data. Load
+skips erased entries on ACTIVE pages (`nvs_page.cpp:624-627`) and reads only
+written ones on FULL and FREEING pages (`:712-719`); lookups skip anything
+not written (`:898-906`); garbage collection copies only written entries
+(`:481-490`). It keeps no copy of entry data in RAM, only the bitmap, hash
+list and counters, none of which change. The one load step that reads by
+position is the half-written check above, which is why those entries are
+left. The scrub mirrors ESP-IDF's header checks (`nvs_types.cpp:43-150`) and
+is tested against an image ESP-IDF's own `nvs_partition_gen.py` wrote.
+
+**Power cuts.** Each write programs zeros into one entry NVS already ignores,
+so a cut at any point, mid-write included, leaves NVS reading exactly what it
+read before; the next pass finishes. An entry already zero costs no write, so
+a pass over a clean partition only reads. The host tests cut the write
+sequence at every point (nothing written, half the bytes, a scattered subset
+of bits) and check that what ESP-IDF would load is unchanged and that the
+next pass converges.
+
+**Flash.** NOR programming only clears bits, which is all this needs. NVS
+itself reprograms already-written words the same way: the bitmap word on
+every state change (`nvs_page.cpp:788-834`) and the page state word
+(`:836-846`). `esp_partition_write` on this unencrypted partition is
+`esp_flash_write` (`esp_partition/partition_target.c:77-78`), a page program
+with no erase; a 32-byte write at a 32-byte boundary is one program of those
+bytes (`spi_flash/spi_flash_chip_generic.c:279-300`,
+`memspi_host_driver.c:209-231`). The boards use quad SPI flash in DIO mode
+(`CONFIG_ESPTOOLPY_FLASHMODE_DIO`, octal flash off); the S3's flash ECC mode
+is an octal-flash eFuse option, off by default, and this project burns no
+eFuses. Each pass reads the entry back and counts a write that does not read
+as zero in `failed`.
+
+**Other writers.** The scrub bypasses ESP-IDF's NVS lock, so nothing else may
+write NVS during a pass. Every firmware NVS write and every pass run on the
+main task; the only other thread, the button sampler, never touches NVS. WiFi
+is created with no NVS partition (`EspWifi::new(.., None)`, which esp-idf-svc
+0.52.1 turns into `nvs_enable = 0`, `src/wifi.rs:477`, `:566`). The one
+ESP-IDF writer that would remain is PHY calibration, which by default stores
+to the `phy` namespace inside the first `esp_phy_enable` of a boot whenever
+the stored data is missing or bad (`esp_phy/src/phy_init.c:252-254`,
+`:859-880`), from inside the closed WiFi driver while WiFi starts, so
+possibly after `BlockingWifi::start` has returned. The firmware builds with
+`CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n` (`firmware/sdkconfig.defaults`,
+under every board), which compiles that path out: the PHY runs a full
+calibration once per boot (`:881-883`), about 100 ms longer than the partial
+one it replaces, and never touches NVS. Boards that stored calibration under
+earlier firmware keep those `phy` keys as live entries nothing reads any
+more (about 2 KB); harmless, and a factory wipe clears them.
+
+As a backstop, before each write the scrub re-reads the page's header and
+bitmap and checks that the 32-byte header is byte-for-byte the one it
+planned against and that the target entry is still ERASED
+(`still_erased`); it does not compare the rest of the bitmap. That is
+enough because ERASED is terminal (state bits only go from 1 to 0, so an
+ERASED entry stays ERASED until its sector is erased), and a sector can only
+be erased and reused by rewriting its header, with a strictly higher
+sequence number (`nvs_pagemanager.cpp:198-215`, `nvs_page.cpp:767-786`). A
+failed check stops that page for the pass. It is a check, not a lock: a
+writer between the check and the write would not be seen, which is why no
+other writer may run.
+
+**On the wire.** `get_status.capabilities` carries `nvs_scrub_v1`. The
+`revoke_unlock_phone` answer (USB and relay) gains
+`"scrub": {"zeroed": n, "pages_skipped": n, "complete": bool}`; the relay
+`revoke_client` answer gains the same, to the device operator only, since a
+pass covers every identity's entries. `FIRMWARE_INFO` reports the last pass
+this boot as `nvs_scrub` in the same shape (it answers any USB host, which
+could read the flash anyway). `CONNSLOT_REVOKE` still answers `ok`. Counts
+only: nothing names a key, a phone or an identity.
 
 ## What the design already gets right
 

@@ -532,6 +532,14 @@ pub fn list_json(phones: &crate::data_key::PhoneSet, announce_operator: bool) ->
     })
 }
 
+/// The `revoke` answer: the id, and what the NVS scrub that followed the
+/// revocation did (`zeroed`, `pages_skipped`, `complete`). `complete` is what
+/// says the revoked record's old bytes are gone from the board's NVS
+/// (`crate::nvs_scrub`).
+pub fn revoke_json(id: u32, scrub: &crate::nvs_scrub::ScrubReport) -> serde_json::Value {
+    serde_json::json!({ "revoked": id, "scrub": scrub.to_json() })
+}
+
 /// The `enrol` answer.
 pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
     serde_json::json!({
@@ -841,6 +849,19 @@ mod tests {
         phones.enrol(3, "Pixel", &[1u8; 32], &[2u8; 32], &[0u8; 12]).unwrap();
         let v = list_json(&phones, false);
         assert_eq!(v, serde_json::json!({"phones":[{"id":3,"label":"Pixel"}],"max":16,"announce_operator":false}));
+    }
+
+    #[test]
+    fn the_revoke_answer_adds_the_scrub_result() {
+        let done = crate::nvs_scrub::ScrubReport { zeroed: 9, already_clean: 2, ..Default::default() };
+        assert_eq!(
+            revoke_json(3, &done),
+            serde_json::json!({"revoked":3,"scrub":{"zeroed":9,"pages_skipped":0,"complete":true}})
+        );
+        let partial = crate::nvs_scrub::ScrubReport { pages_skipped: 1, ..done };
+        assert_eq!(revoke_json(3, &partial)["scrub"]["complete"], false);
+        // Earlier readers only looked for `revoked`; it is unchanged.
+        assert_eq!(revoke_json(3, &partial)["revoked"], 3);
     }
 
     // --- Relay changes ------------------------------------------------------

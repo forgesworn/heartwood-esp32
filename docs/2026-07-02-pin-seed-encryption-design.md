@@ -62,7 +62,10 @@ guarantee.
 4. **Boot flow** — on boot, if an encrypted seed exists, prompt for the PIN
    **on-device**, derive the key, decrypt into RAM (zeroised on lock/idle).
    Wrong PIN → AEAD failure → increment the existing attempt counter → wipe
-   after N. The seed never exists in plaintext at rest again.
+   after N. The seed never exists in plaintext at rest again. (As built,
+   NVS leaves the deleted plaintext copy's bytes on flash until the NVS
+   scrub zeroes them, straight after sealing and at every boot: see
+   *Leftover bytes in NVS* in SECURITY-MODEL.md.)
 5. **On-device PIN entry** — reuse the button UX. On the **T-Display** this is
    the natural home for the new two-button picker: a digit picker (A = next
    digit, B = pick), which we just built the primitives for. Single-button

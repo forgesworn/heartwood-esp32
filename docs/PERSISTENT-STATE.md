@@ -76,6 +76,22 @@ The factory/PIN wipe erases the partition rather than enumerating this table,
 so a future or unknown key cannot survive merely because a cleanup list was not
 updated.
 
+### Deleted values and the scrub
+
+Removing or replacing any key in this table leaves the old bytes on flash:
+ESP-IDF marks the entries erased and reclaims the sector only when garbage
+collection picks it. The firmware zeroes those entries itself
+(`firmware/src/nvs_scrub.rs` over `common/src/nvs_scrub.rs`):
+
+| Runs | Removes | Leaves |
+|------|---------|--------|
+| At boot, before unlock and before WiFi; after a phone revoke, a pairing revoke (relay or USB) and an identity removal; after a PIN or vault key is set, changed or cleared, a seed migration, and each note-locker sealing sync | The data bytes of every entry marked erased, in every namespace of the `nvs` partition, on pages ESP-IDF holds as ACTIVE or FULL | Live values (plaintext seeds on a board with no PIN or vault key); what an earlier dump caught; values deleted since the last pass; pages it cannot parse (CORRUPT, FREEING, bad header CRC, another format), reported as `pages_skipped`; a few erased entries ESP-IDF still reads by position or has not finished erasing, reported as incomplete; everything outside NVS, including the `config` partition |
+
+A pass writes nothing but zeros into entries ESP-IDF ignores, so a power cut
+mid-pass leaves every key exactly as it was, and the next boot finishes it.
+Only the whole-partition erase above removes everything. See *Leftover bytes
+in NVS* in SECURITY-MODEL.md for the argument and the ESP-IDF citations.
+
 ## Power-safe individual master removal
 
 `PROVISION_REMOVE` remains available for any existing slot. Removal is a

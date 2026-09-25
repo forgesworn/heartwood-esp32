@@ -8427,13 +8427,23 @@ fn dispatch_mgmt(
                 .ok_or_else(|| format!("no such slot: {slot_index}"))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
             if ctx.policy_engine.revoke_slot(master_slot, slot_index) {
-                persist_revocation(ctx, master_slot, "client revocation")?;
+                let saved = persist_revocation(ctx, master_slot, "client revocation");
+                // The old table, slot secret included, is left as erased
+                // entries by the rewrite; zero them whatever the save did.
+                let scrub = crate::nvs_scrub::run("pairing revoke");
+                saved?;
                 log::info!("[relay] mgmt: revoked client slot {slot_index} (operator)");
-                Ok(serde_json::json!({
+                let mut reply = serde_json::json!({
                     "slot_index": slot_index,
                     "secret_fingerprint": secret_fingerprint,
                     "revoked": true,
-                }))
+                });
+                // The scrub covers the whole partition, every identity's
+                // entries included, so only the device operator is told.
+                if is_device_op {
+                    reply["scrub"] = scrub.to_json();
+                }
+                Ok(reply)
             } else {
                 Err(format!("no such slot: {slot_index}"))
             }
@@ -8892,6 +8902,11 @@ fn dispatch_mgmt(
                     // Phone unlock: USB frame 0x64 and the list/revoke/
                     // set_announce_operator management methods.
                     "phone_unlock_v1",
+                    // Deleted NVS entries are zeroed at boot, after a phone
+                    // or pairing revoke, an identity removal and every
+                    // at-rest change; revoke_unlock_phone (and revoke_client,
+                    // to the device operator) answer with a `scrub` result.
+                    "nvs_scrub_v1",
                     "client_policy_v2",
                     // Schema addendum §1.5 family flags (escalate,
                     // petition_on_deny, audit_child_wrap, bound_identity)

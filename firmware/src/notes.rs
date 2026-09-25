@@ -816,14 +816,18 @@ impl Notes {
 /// left alone — the sealed notes behind it stay on flash for the secret
 /// that can open them. Never deletes anything it cannot read.
 pub fn sync_sealed(secret: &[u8]) {
-    with_locker(|notes| sync_sealed_inner(notes, Some(secret)))
+    with_locker(|notes| sync_sealed_inner(notes, Some(secret)));
+    // Sealing replaces plaintext records (bearer secrets) and rewraps `nk`;
+    // zero what that left behind. Reads only, when nothing changed.
+    crate::nvs_scrub::run("note sealing");
 }
 
 /// [`sync_sealed`] after an unlock that proved no secret (a phone delivered
 /// the data key). A note key still wrapped under the PIN or vault key stays
 /// sealed until that secret is next used; nothing is lost.
 pub fn sync_sealed_with_data_key() {
-    with_locker(|notes| sync_sealed_inner(notes, None))
+    with_locker(|notes| sync_sealed_inner(notes, None));
+    crate::nvs_scrub::run("note sealing");
 }
 
 /// Wrap the note key for `nk`. Under the data key when this boot holds one
@@ -999,7 +1003,8 @@ fn sync_sealed_inner(notes: &mut Notes, secret: Option<&[u8]>) {
 /// (harmless — overwritten by the next enable) rather than sealed records
 /// with no wrap.
 pub fn disable_sealing() {
-    with_locker(disable_sealing_inner)
+    with_locker(disable_sealing_inner);
+    crate::nvs_scrub::run("note sealing off");
 }
 
 fn disable_sealing_inner(notes: &mut Notes) {

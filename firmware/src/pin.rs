@@ -160,6 +160,9 @@ fn enable_encryption(
             if let Err(e) = data_key::write_secret_kind(&mut NvsBlobs(nvs), kind) {
                 log::warn!("at-rest kind marker not saved: {e:?}");
             }
+            // Sealing deleted the plaintext seeds (or a change replaced the
+            // old wrapper); their bytes stay on flash until zeroed.
+            crate::nvs_scrub::run("at-rest enabled");
             Ok(())
         }
         Err(ChangeError::NoDataKey) => {
@@ -188,6 +191,8 @@ fn disable_encryption(
     // Courtesy cleanup, not required for correctness: `read_secret_kind`
     // already refuses once the wrapper it binds to is gone.
     let _ = data_key::clear_secret_kind(&mut NvsBlobs(nvs));
+    // The wrapper and the phone records are gone; zero their bytes too.
+    crate::nvs_scrub::run("at-rest cleared");
     Ok(())
 }
 
@@ -313,6 +318,8 @@ pub fn try_unlock(
             Ok(n) => log::info!("at-rest storage on the data key ({n} seed(s) resealed)"),
             Err(e) => log::error!("data-key migration incomplete ({e:?}); the next unlock resumes it"),
         }
+        // The seeds sealed the old way are replaced; zero the old copies.
+        crate::nvs_scrub::run("seed migration");
     }
     if let Some(dk) = unlocked.dk {
         data_key_store::remember(dk);

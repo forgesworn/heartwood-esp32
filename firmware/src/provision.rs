@@ -1019,6 +1019,10 @@ pub fn handle_remove(
 
     match masters::remove_master(nvs, slot) {
         Ok(()) => {
+            // The removed identity's seed (sealed or plaintext) and every
+            // shifted copy are erased entries now; zero them before the ACK.
+            // The reboot that follows runs the boot pass as well.
+            crate::nvs_scrub::run("identity removal");
             // NVS slots below the removed one have shifted; the caller reboots
             // before any further signing so every in-memory, slot-indexed
             // cache reloads from the completed journal transaction.

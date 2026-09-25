@@ -62,6 +62,9 @@ pub mod persistent_state;
 /// fallback policy, and the gate on writes that grow the store.
 pub mod nvs_budget;
 
+/// Zeroing, in place, the NVS entries ESP-IDF has deleted but not yet erased.
+pub mod nvs_scrub;
+
 pub mod persona_pack;
 
 pub mod reply_clock;

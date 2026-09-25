@@ -71,6 +71,21 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
 CONFIG_APP_PROJECT_VER="0.18.0-beta.17"
 
+# PHY calibration never touches NVS. With storage on (the ESP-IDF default),
+# the first esp_phy_enable of a boot writes the `phy` namespace whenever the
+# stored data is missing or bad (esp_phy/src/phy_init.c:859-880), from inside
+# the closed WiFi driver while WiFi starts. That would be the one NVS writer
+# outside our main task, and the NVS scrub (firmware/src/nvs_scrub.rs) writes
+# under NVS's feet, so nothing else may write while it runs. Off, the PHY runs
+# a full calibration once per boot instead (phy_init.c:881-883; later enables
+# in the same boot only wake it, :252-254), which ESP-IDF documents as about
+# 100 ms slower than the partial one (docs/en/api-guides/RF_calibration.rst).
+# Boards that already stored calibration keep their `phy` keys as live NVS
+# entries that nothing reads any more; harmless, and a factory wipe clears
+# them. Every board build layers its fragment over this file, and no fragment
+# sets this option, so this one line covers v3, v4, tdisplay, c6 and demo.
+CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n
+
 # OTA support.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_PARTITION_TABLE_CUSTOM=y

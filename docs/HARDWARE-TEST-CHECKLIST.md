@@ -2350,7 +2350,17 @@ switched USB power supply or hub.
    except the boot-rewritten keys, and `-i` adds no complaint. Note roughly
    how much longer a dirty boot takes than a clean one.
 
-7. **Size.** Record the release `app.bin` size against the #197 build.
+7. **PHY calibration is off NVS.** This firmware builds with
+   `CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n`. On a WiFi board, compare
+   time from reset to "relay connected" with the previous firmware (expect
+   about 100 ms more, a full calibration each boot) and check WiFi joins and
+   holds as before. On a board that had stored calibration, `nvs_tool.py -d
+   all` still lists the `phy` namespace (`cal_data`, `cal_mac`,
+   `cal_version`) as written entries, unchanged across several boots with
+   WiFi: nothing writes them any more. On a freshly wiped board no `phy`
+   namespace appears at all.
+
+8. **Size.** Record the release `app.bin` size against the #197 build.
 
 ## Notes
 

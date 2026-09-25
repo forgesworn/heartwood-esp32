@@ -586,12 +586,23 @@ is always a press on the board, whichever way the request arrives:
   3.6e16 tries, weeks on one GPU and hours on a large rented rack, against an
   owner who waits minutes. (Four words, 44 bits, was about half an hour on one
   GPU.) A table built in advance does not help, since P is fresh each time.
-  The label is printable ASCII only and drawn on a line of its own ("ADD
-  PHONE for <label>"), never beside a word.
-- **Detecting a swap afterwards:** after the press the board shows PHONE
-  ADDED with the check code (from its one-off hand-off key) and "else revoke
-  N". The phone and Sapwood show the same check code; if the phone never shows
-  it, the hand-off went elsewhere, and record N is revoked.
+  The label is printable ASCII only, quoted, and drawn on a line of its own
+  (`ADD "<label>"?`), never beside a word; every line of the card keeps clear
+  of the button tags.
+- **What the check code does, and does not do:** after the press the board
+  shows PHONE ADDED with the check code (from its one-off hand-off key E) and
+  "else revoke N". The phone and Sapwood show the same code. It confirms
+  delivery and catches mix-ups (a stale or crossed hand-off, a phone that
+  never received one); it does NOT prove the board sent the hand-off the
+  phone holds. The hand-off is sealed from an unauthenticated one-off key, so
+  whoever has already swapped P for a key of their own can grind 24 bits for
+  an E' whose check code matches. The five words are the only defence
+  against a swap. "Else revoke N" stays: a phone that never shows the check
+  code never got its hand-off, and record N is revoked.
+- **Parked follow-up (not built): an authenticated hand-off.** The board
+  would sign (E, P) with its paired identity, so the phone could verify the
+  hand-off came from the board it paired with, and a swap after the words
+  would be caught on the phone too.
 - **Only while unlocked:** a locked board serves no management at all, and
   the board is checked again at the press (the operator is still the device
   operator, a configured relay has been heard from within the ping interval

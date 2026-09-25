@@ -571,8 +571,9 @@ pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
 // to management at all), behind the one-time mutation challenge like every
 // other change, and held on the board's button as a card (#64) rather than
 // blocking the relay loop. What comes back is the cable's answer unchanged,
-// so Sapwood hands it to the phone exactly as after a cable enrolment, and
-// the phone cannot tell which way it came.
+// so the manager (Sapwood, once it supports this) hands it to the phone
+// exactly as after a cable enrolment, and the phone cannot tell which way it
+// came.
 //
 // Two codes, both spoken-token tokens of
 // HMAC-SHA256(key, utf8(context) || counter_be32), counter 0.
@@ -595,8 +596,14 @@ pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
 //                 table built beforehand does not help: P is fresh each time.
 //   check code    key = the board's one-off hand-off key, 3 bytes of hex,
 //                 shown "ABC 123". On the board after the press, in Sapwood
-//                 and on the phone, so the owner knows the phone holds the
-//                 hand-off this board made.
+//                 and on the phone. It confirms delivery and catches mix-ups
+//                 (a stale or crossed hand-off); it does NOT prove the board
+//                 sent the hand-off the phone holds. The hand-off comes from an
+//                 unauthenticated one-off key, so whoever has already swapped
+//                 P can grind 24 bits for a hand-off key whose code matches.
+//                 The five words are the only defence against a swap. An
+//                 authenticated hand-off (the board signing (E, P) with its
+//                 paired identity) is a parked follow-up.
 
 /// The management method that adds a phone over the relay.
 pub const ENROL_METHOD: &str = "enrol_unlock_phone";
@@ -636,6 +643,8 @@ pub fn request_code(enrol_pubkey: &[u8; 32]) -> String {
 
 /// The code the board, Sapwood and the phone show after the press, from the
 /// board's one-off hand-off key: spoken-token hex, 6 characters, "ABC 123".
+/// It confirms delivery and catches mix-ups; it cannot prove the board made
+/// the hand-off (see the module notes above).
 pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
     let d = spoken_digest(ephemeral_pubkey, CHECK_CODE_CONTEXT);
     let hex = alloc::format!("{:02X}{:02X}{:02X}", d[0], d[1], d[2]);
@@ -643,8 +652,9 @@ pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
 }
 
 /// What the enrol card draws: a top line naming what is asked, with the
-/// requester's label behind "for ", and the five words below it, two, two
-/// and one a line. The label never shares a line with a word.
+/// requester's label in quotes, and the five words below it, two, two and
+/// one a line. The label never shares a line with a word, and its quotes
+/// keep it from reading as words even when it is spelt like them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnrolCard {
     pub top: String,
@@ -652,24 +662,42 @@ pub struct EnrolCard {
 }
 
 /// The enrol card for these words and label. `top_max_chars` is how many
-/// small-font characters the panel's top line holds; a label that would
-/// overflow it is shortened with "..", since it is only a description (the
-/// words are the check). Labels are printable ASCII, so a character is a byte.
+/// small-font characters the top line holds on this panel, clear of the
+/// button tags (`Layout::span_chars`: 20 on the Heltec); a label that would
+/// overflow it is shortened inside its quotes with "..", since it is only a
+/// description (the words are the check). Labels are printable ASCII, so a
+/// character is a byte.
 pub fn enrol_card(words: &[&str; REQUEST_CODE_WORDS], label: &str, top_max_chars: usize) -> EnrolCard {
-    const LEAD: &str = "ADD PHONE for ";
-    let room = top_max_chars.saturating_sub(LEAD.len());
+    // `ADD "` + label + `"?`
+    const FRAME: usize = 7;
+    let room = top_max_chars.saturating_sub(FRAME);
     let label = if label.len() <= room {
         String::from(label)
     } else {
         alloc::format!("{}..", &label[..room.saturating_sub(2).min(label.len())])
     };
     EnrolCard {
-        top: alloc::format!("{LEAD}{label}"),
+        top: alloc::format!("ADD \"{label}\"?"),
         words: [
             alloc::format!("{} {}", words[0], words[1]),
             alloc::format!("{} {}", words[2], words[3]),
             String::from(words[4]),
         ],
+    }
+}
+
+/// The enrol card's hint line: the question that matters, whether the phone
+/// shows the same words, ahead of the shortest form of the board's button
+/// hint. At most 20 characters, so it fits the Heltec's span clear of its
+/// tag. `tags` is `Some(cancel)` where the board labels its buttons on the
+/// screen edge (with "NO" when there is a cancel button), `None` where it
+/// does not; `button_b` whether a second button cancels.
+pub fn enrol_hint(tags: Option<bool>, button_b: bool) -> &'static str {
+    match (tags, button_b) {
+        (Some(true), _) => "on phone? hold YES",
+        (Some(false), _) => "on phone? hold PRG",
+        (None, true) => "on phone? A=yes B=no",
+        (None, false) => "on phone? hold 2s",
     }
 }
 
@@ -1310,30 +1338,38 @@ mod tests {
     #[test]
     fn the_enrol_card_keeps_the_words_to_their_own_lines() {
         let words = request_words(&[0xAB; 32]);
-        // The Heltec's top line: 128 px of the 5-px small font.
+        // The Heltec's top line, clear of its "<PRG" tag: 20 small-font
+        // characters (firmware/src/layout.rs, `span_chars`, pinned by
+        // `text_keeps_clear_of_the_button_tags` in the ui-preview tests).
+        const HELTEC_TOP: usize = 20;
         assert_eq!(
-            enrol_card(&words, "Pixel 8", 25),
+            enrol_card(&words, "Pixel 8", HELTEC_TOP),
             EnrolCard {
-                top: "ADD PHONE for Pixel 8".into(),
+                top: "ADD \"Pixel 8\"?".into(),
                 words: ["swim behind".into(), "stand bugle".into(), "female".into()],
             }
         );
+        assert_eq!(enrol_card(&words, "phone", HELTEC_TOP).top, "ADD \"phone\"?");
         // Two words a line fit the header font's 21 characters: 8 + 1 + 8.
         assert_eq!(crate::spoken_words::WORDLIST_MAX_LEN, 8);
-        // A long label is shortened on the top line, never wrapped onto a
-        // word line; a wide panel shows it whole.
+        // A long label is shortened inside its quotes on the top line, never
+        // wrapped onto a word line; a wide panel shows it whole.
         let long = "Sixteen chars 16";
-        assert_eq!(enrol_card(&words, long, 25).top, "ADD PHONE for Sixteen c..");
-        assert!(enrol_card(&words, long, 25).top.len() <= 25);
-        assert_eq!(enrol_card(&words, long, 34).top, "ADD PHONE for Sixteen chars 16");
-        assert_eq!(enrol_card(&words, long, 3).top, "ADD PHONE for ..");
-        // Even a label written as words sits behind "ADD PHONE for ", on the
-        // top line, never on the lines the words are drawn on.
-        let card = enrol_card(&words, "stand bugle", 25);
+        assert_eq!(enrol_card(&words, long, HELTEC_TOP).top, "ADD \"Sixteen cha..\"?");
+        assert_eq!(enrol_card(&words, long, HELTEC_TOP).top.len(), HELTEC_TOP);
+        assert_eq!(enrol_card(&words, long, 29).top, "ADD \"Sixteen chars 16\"?");
+        assert_eq!(enrol_card(&words, long, 3).top, "ADD \"..\"?");
+        for max in 0..30 {
+            let top = enrol_card(&words, long, max).top;
+            assert!(top.len() <= max.max(9), "{max}: {top}");
+        }
+        // Even a label spelt as words is quoted on the top line, so it reads
+        // as a name and never as a row of words.
+        let card = enrol_card(&words, "stand bugle", HELTEC_TOP);
         assert_eq!(card.words[1], "stand bugle");
-        assert_eq!(card.top, "ADD PHONE for stand bugle");
+        assert_eq!(card.top, "ADD \"stand bugle\"?");
         for line in &card.words {
-            assert!(!line.contains("for"));
+            assert!(!line.contains('"'));
         }
 
         // A label is the requester's text. One that could break a line could
@@ -1479,6 +1515,17 @@ mod tests {
             relay_enrol_completion(true, true, &EnrolFacts { phones: crate::data_key::MAX_PHONES, ..good_facts() }),
             Some(EnrolRefusal::Full)
         );
+    }
+
+    #[test]
+    fn the_enrol_hint_fits_the_narrowest_span() {
+        for tags in [Some(true), Some(false), None] {
+            for b in [true, false] {
+                let hint = enrol_hint(tags, b);
+                assert!(hint.len() <= 20, "{hint}");
+                assert!(hint.starts_with("on phone? "), "{hint}");
+            }
+        }
     }
 
     #[test]

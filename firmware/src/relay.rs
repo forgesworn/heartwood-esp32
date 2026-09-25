@@ -5114,7 +5114,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             ),
             Draw::Titled(header, title) => ((*header).to_string(), title.clone()),
             Draw::Batch(header, title) => (header.clone(), title.clone()),
-            Draw::Enrol(words, label) => ("ADD PHONE".to_string(), format!("{} / for {label}", words.join(" "))),
+            Draw::Enrol(words, label) => (format!("ADD \"{label}\"?"), words.join(" ")),
         };
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }

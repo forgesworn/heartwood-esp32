@@ -171,6 +171,10 @@ pub fn run(
 
             let enrolment = complete_enrol(nvs, masters, &enrol_pubkey, &label, phone_unlock::enrol_refusal, |_| true)?;
             show_enrolled(display, &enrolment);
+            // The approving hold usually still has the button down here. Let
+            // it go before returning, or the cable-only loop takes the same
+            // press for a carousel page and wipes the check code at once.
+            wait_for_release(buttons);
             Ok(phone_unlock::enrolment_json(&enrolment))
         }
     }
@@ -273,6 +277,17 @@ pub fn complete_enrol(
         log::warn!("phone unlock: relay record not saved");
     }
     Ok(enrolment)
+}
+
+/// Wait, feeding the watchdog, until the button that approved a card is let
+/// go. Bounded: a serial bridge can pin GPIO 0 low after a web flash, and a
+/// pinned button must not hold the board here.
+fn wait_for_release(buttons: &crate::button::Buttons<'_>) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while buttons.a.is_low() && std::time::Instant::now() < until {
+        crate::wdt::feed();
+        esp_idf_hal::delay::FreeRtos::delay_ms(20);
+    }
 }
 
 /// The result screen after an enrolment: the check code the phone must show

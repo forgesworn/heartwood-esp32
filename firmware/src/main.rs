@@ -1379,7 +1379,10 @@ fn main() {
             }
 
             // 0x64 — phones that can unlock this board (enrol / list / revoke)
-            // No card queue on the cable-only loop, so no result hold to arm.
+            // The cable-only loop has no card queue to hold back. The PHONE
+            // ADDED screen survives the approving press because handle_frame
+            // waits for that press to be released before it returns, so the
+            // carousel below never takes it for a page turn.
             FRAME_TYPE_PHONE_UNLOCK_CMD => {
                 phone_unlock_cmd::handle_frame(
                     &mut usb,

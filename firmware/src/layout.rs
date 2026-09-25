@@ -153,6 +153,45 @@ impl Layout {
     pub fn chars_per_line(&self, font: &MonoFont) -> usize {
         (self.w / Self::glyph_w(font)).max(1) as usize
     }
+
+    /// Width the button tags ("<PRG", "YES>", "NO>": four small-font glyphs
+    /// at most) take on their edge: the text, its inset from the edge, and a
+    /// gap before anything else may start.
+    pub fn tag_band(&self) -> i32 {
+        4 * Self::glyph_w(self.font_small()) + self.s(1) + self.s(2)
+    }
+
+    /// The x span, `[left, right)`, that text may use on a card whose button
+    /// tags sit on `side`, keeping clear of them at every height. With no tags,
+    /// a small margin each side.
+    pub fn text_span(&self, side: Option<TagSide>) -> (i32, i32) {
+        let margin = self.s(2);
+        match side {
+            Some(TagSide::Left) => (self.tag_band(), self.w - margin),
+            Some(TagSide::Right) => (margin, self.w - self.tag_band()),
+            None => (margin, self.w - margin),
+        }
+    }
+
+    /// How many glyphs of `font` fit in [`text_span`](Self::text_span).
+    pub fn span_chars(&self, side: Option<TagSide>, font: &MonoFont) -> usize {
+        let (left, right) = self.text_span(side);
+        ((right - left) / Self::glyph_w(font)).max(0) as usize
+    }
+
+    /// X for content `content_w` wide, centred in [`text_span`](Self::text_span).
+    pub fn center_in_span(&self, side: Option<TagSide>, content_w: i32) -> i32 {
+        let (left, right) = self.text_span(side);
+        left + ((right - left - content_w) / 2).max(0)
+    }
+}
+
+/// Which edge of the panel carries the button tags (oled.rs
+/// `draw_button_tags`), once the screen's orientation is taken into account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagSide {
+    Left,
+    Right,
 }
 
 #[cfg(test)]
@@ -202,6 +241,33 @@ mod tests {
             assert_eq!(l.word_scale(), expected, "{w}x{h} word scale");
             let widest = 8 * Layout::glyph_w(l.font_large()) * l.word_scale();
             assert!(widest <= w, "{w}x{h}: an 8-letter word ({widest}px) overflows");
+        }
+    }
+
+    #[test]
+    fn text_keeps_clear_of_the_button_tags() {
+        // Heltec: "<PRG" on the left, 4 x 5 px + 1 inset + 2 gap.
+        let heltec = Layout::new(128, 64);
+        assert_eq!(heltec.tag_band(), 23);
+        assert_eq!(heltec.text_span(Some(TagSide::Left)), (23, 126));
+        assert_eq!(heltec.span_chars(Some(TagSide::Left), heltec.font_small()), 20);
+        assert_eq!(heltec.span_chars(None, heltec.font_small()), 24);
+        assert_eq!(heltec.center_in_span(Some(TagSide::Left), 100), 24);
+        // T-Display: "NO>" and "YES>" on the right.
+        let tdisplay = Layout::new(240, 135);
+        let (left, right) = tdisplay.text_span(Some(TagSide::Right));
+        assert_eq!(right, 240 - tdisplay.tag_band());
+        assert!(left < right);
+        // Whatever the panel and side, a centred line never reaches the band.
+        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+            let l = Layout::new(w, h);
+            for side in [Some(TagSide::Left), Some(TagSide::Right), None] {
+                let (left, right) = l.text_span(side);
+                let chars = l.span_chars(side, l.font_small()) as i32;
+                let width = chars * Layout::glyph_w(l.font_small());
+                let x = l.center_in_span(side, width);
+                assert!(x >= left && x + width <= right, "{w}x{h} {side:?}");
+            }
         }
     }
 

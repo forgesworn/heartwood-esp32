@@ -1111,13 +1111,17 @@ pub fn show_titled_approval(
 /// The card that adds an unlock phone. The request code is five words of up
 /// to eight letters, and they are the one thing the owner must read, so the
 /// card gives them three lines of the header font (two words, two words, one
-/// word: 17 characters at most, 102 px of the OLED's 128) and drops the usual
-/// header and rule. Above them, one small-font line says what is asked,
-/// "ADD PHONE for <label>" (the label shortened with ".." if the line would
-/// overflow); below them, the hint asks whether the phone shows the same
-/// words, ahead of the board's own button hint. Rows on the 128x64 baseline:
-/// top line 7, words 17, 28 and 39, hint 49, then the shared countdown bar
-/// from 52. The label is never on a word line (`phone_unlock::enrol_card`).
+/// word: 17 characters at most, 102 px) and drops the usual header and rule.
+/// On the portrait C6, whose 172 px cannot take 17 header-font glyphs, the
+/// words drop to the small font. Above them, one small-font line says what is
+/// asked, `ADD "<label>"?` (the
+/// label shortened inside its quotes if the line would overflow); below them,
+/// the hint (`phone_unlock::enrol_hint`, e.g. "on phone? hold PRG") asks
+/// whether the phone shows the same words. Every line is centred in the span clear of the button tags
+/// (`Layout::text_span`), so nothing prints over "<PRG" on the Heltec or
+/// "NO>"/"YES>" on the T-Display. Rows on the 128x64 baseline: top line 7,
+/// words 17, 28 and 39, hint 49, then the shared countdown bar from 52.
+/// Mirrored in ui-preview (`draw_enrol_card`), which checks the geometry.
 pub fn show_enrol_approval(
     display: &mut Display<'_>,
     words: &[&str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS],
@@ -1128,14 +1132,23 @@ pub fn show_enrol_approval(
     let l = layout(display);
     display.clear_buffer();
 
-    let top_max = ((l.w - l.sx(4)) / Layout::glyph_w(l.font_small())).max(0) as usize;
-    let card = heartwood_common::phone_unlock::enrol_card(words, label, top_max);
+    let side = tag_side();
+    let card = heartwood_common::phone_unlock::enrol_card(words, label, l.span_chars(side, l.font_small()));
     let top = MonoTextStyleBuilder::new()
         .font(l.font_small())
         .text_color(ACCENT)
         .build();
+    // The header font where the widest word line fits the span (every panel
+    // but the portrait C6, whose 172 px cannot take 17 glyphs of 10 px).
+    let (span_left, span_right) = l.text_span(side);
+    let widest = card.words.iter().map(|w| w.len()).max().unwrap_or(0) as i32;
+    let word_font = if widest * Layout::glyph_w(l.font_header()) <= span_right - span_left {
+        l.font_header()
+    } else {
+        l.font_small()
+    };
     let word_style = MonoTextStyleBuilder::new()
-        .font(l.font_header())
+        .font(word_font)
         .text_color(WARN)
         .build();
     let small = MonoTextStyleBuilder::new()
@@ -1143,26 +1156,18 @@ pub fn show_enrol_approval(
         .text_color(MUTED)
         .build();
     let centred = |text: &str, font: &embedded_graphics::mono_font::MonoFont<'_>, y: i32| {
-        Point::new(l.center_x(text.len() as i32 * Layout::glyph_w(font)), l.sy(y))
+        Point::new(l.center_in_span(side, text.len() as i32 * Layout::glyph_w(font)), l.sy(y))
     };
 
     Text::new(&card.top, centred(&card.top, l.font_small(), 7), top).draw(display).ok();
     for (line, y) in card.words.iter().zip([17, 28, 39]) {
-        Text::new(line, centred(line, l.font_header(), y), word_style).draw(display).ok();
+        Text::new(line, centred(line, word_font, y), word_style).draw(display).ok();
     }
 
     let tagged = draw_button_tags(display);
-    let button = if tagged && crate::button::has_button_b() {
-        "hold YES"
-    } else if tagged {
-        "hold PRG"
-    } else if crate::button::has_button_b() {
-        "A=yes B=no"
-    } else {
-        "hold 2s"
-    };
-    let hint = format!("same on phone? {button}");
-    Text::new(&hint, centred(&hint, l.font_small(), 49), small).draw(display).ok();
+    let b = crate::button::has_button_b();
+    let hint = heartwood_common::phone_unlock::enrol_hint(tagged.then_some(b), b);
+    Text::new(hint, centred(hint, l.font_small(), 49), small).draw(display).ok();
 
     draw_countdown_bar(display, remaining, total_secs);
     if let Err(e) = display.flush() {
@@ -1170,8 +1175,21 @@ pub fn show_enrol_approval(
     }
 }
 
+/// Which edge carries the button tags on this board and orientation, or
+/// `None` where the card keeps its words only.
+fn tag_side() -> Option<crate::layout::TagSide> {
+    let edge = button_edge()?;
+    Some(if edge.on_right != crate::display_flip::is_flipped() {
+        crate::layout::TagSide::Right
+    } else {
+        crate::layout::TagSide::Left
+    })
+}
+
 /// An unlock phone was added and its answer sent: the check code the phone
-/// must show, and the record to revoke if it never does.
+/// should show (it confirms delivery; the five words were the check against
+/// a swap), and the record to revoke if the phone never shows it. Mirrored in
+/// ui-preview (`draw_phone_added`).
 pub fn show_phone_added(display: &mut Display<'_>, check: &str, id: u32) {
     show_status_card(
         display,

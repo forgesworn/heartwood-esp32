@@ -2290,9 +2290,10 @@ subscribed to `{"kinds":[24135]}`).
 `enrol_unlock_phone` does over the relay what `PHONE_UNLOCK_CMD` (0x64)
 `{"op":"enrol"}` does over the cable, on the deferred card queue (#64), so the
 relay loop keeps serving while the card is up. Device operator only, behind the
-one-time mutation challenge. The card has a small top line "ADD PHONE for
-<label>", then the request code, five words from the phone's enrolment key on
-three lines (two, two, one), and its hint asks "same on phone?". The owner
+one-time mutation challenge. The card has a small top line `ADD "<label>"?`,
+then the request code, five words from the phone's enrolment key on three
+lines (two, two, one), and its hint reads "on phone? hold PRG" (or YES, or the
+board's own button words). No line touches the button tags. The owner
 compares the board with the phone that made the key, never with the browser.
 The result screen (PHONE ADDED with the check code and "else revoke N", or
 NOT DONE) stays up 20 s or until a fresh press.
@@ -2312,18 +2313,19 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
 1. **Enrol over the relay.** `node scripts/phone-unlock.mjs enrol
    --over-relay --label "relay phone"`. The script (the phone here) prints
    five words; the board's card shows the same five words (two, two, one a
-   line) under "ADD PHONE for relay phone", and all five are readable on the
-   OLED. While the card is up, a USB `FIRMWARE_INFO` and a `get_status` over
+   line) under `ADD "relay phone"?`, all five are readable on the OLED, and
+   nothing prints over the "<PRG" tag (or "NO>"/"YES>" on a T-Display). While the card is up, a USB `FIRMWARE_INFO` and a `get_status` over
    the relay both answer. Hold: PHONE ADDED with "check <code>" and "else
    revoke N" stays up about 20 s, the script prints the same check code and
    "enrolled as id N", and `list` shows the phone. Reset the board and run
    `listen`: it unlocks.
 
-1b. **Detecting a hand-off that went elsewhere.** Run `enrol-for` with a
-   phone code, but stop the phone's screen before the hand-off arrives (close
-   Cambium). The board still shows PHONE ADDED with "else revoke N"; the phone
-   never shows the check code, so revoke N (`revoke --id N`) and `list` no
-   longer shows it.
+1b. **A hand-off that never arrived.** Run `enrol-for` with a phone code,
+   but stop the phone's screen before the hand-off arrives (close Cambium).
+   The board still shows PHONE ADDED with "else revoke N"; the phone never
+   shows the check code, so revoke N (`revoke --id N`) and `list` no longer
+   shows it. The check code confirms delivery and catches mix-ups; it cannot
+   catch a swap (the five words are the only defence against one).
 
 2. **Decline and expiry add nothing.** Repeat with a new run and press B
    (or a short press): the script says "refused: declined on the board";

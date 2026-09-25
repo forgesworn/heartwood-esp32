@@ -13,31 +13,46 @@
 // relay that record lacks ("drift") it tells the phones on the OLD relays:
 //
 // - locked, it repeats each phone's lock announcement there ([`OldRelayDials`]:
-//   only on an idle pass, well clear of the live relay's own announcements,
-//   with a per-relay backoff so a dead relay decays to an hourly probe);
-// - unlocked, it posts a relay update per phone there at the gaps of
-//   [`RELAY_UPDATE_ROUNDS_SECS`] ([`UpdatePlan`]), then records the live list,
-//   which ends the drift.
+//   one old relay per announce interval, in the pass straight after the live
+//   announcement, with a per-relay backoff so a dead relay decays to an
+//   hourly probe);
+// - unlocked, it posts a relay update per phone there in six rounds over
+//   about a day ([`UpdatePlan`], with random delays), then records the live
+//   list, which ends the drift.
 //
 // Every relay change on this firmware takes effect through a restart, so the
 // comparison runs once per boot ([`relays_at_boot`]) and needs no hook in any
 // config path.
 //
-// Privacy. An update never goes out on a connection that carries the signer's
-// own subscription (its `#p` filter names the signer), because that would tie
-// each round, and the number of phones it holds, to a stable key. Every update
-// goes out on its own publish-only connection. The firmware's session ceiling
-// (two) still holds: the secondary relay steps aside for the dial, and when
-// the primary and a pinned relay fill the ceiling the step is deferred
-// ([`UpdateAction::Defer`]) rather than open a third TLS session.
+// What a relay can and cannot link. Each round has a fresh one-time author and
+// fresh hints, so nothing inside the events ties one round to another, to a
+// boot's lock announcements, or to a phone. What is not hidden is the board's
+// IP address, which every relay it uses already sees, and timing. So an update
+// never goes out on a connection that carries the signer's own subscription
+// (its `#p` filter names the signer), it goes out on a publish-only
+// connection of its own; the first round waits a random 2 to 20 minutes after
+// the board comes online, and every gap in the schedule is randomised by a
+// quarter either way, so the rounds neither sit beside the signer's REQ nor
+// form a fixed, recognisable series. A relay that logs IP addresses can still
+// see that the same address published a burst of 24135s some minutes after
+// its signer reconnected; that is inherent in a board with one address.
+//
+// The firmware's session ceiling (two) always holds. The secondary relay
+// closes for the round. When the primary and a pinned relay fill the ceiling
+// the step waits ([`UpdateAction::Defer`]); after [`MAX_DEFER_SECS`] the pinned
+// session steps aside for one dial, as the secondary does, so every board
+// converges.
 //
 // Writes. The record is one NVS blob, so every write is atomic: a power cut
 // leaves the old or the new record, never a mixture. It is written when first
 // needed, when a change only dropped relays, after each of the first five
 // update rounds (so a board that restarts daily resumes instead of starting
-// over and never converging), and once after the sixth, which also ends the
-// drift: at most six writes per relay change. Network-trial boots write
-// nothing, because the list may yet roll back.
+// over), and once after the sixth, which also ends the drift: at most six
+// writes per relay change. A round writes only while the stored record is
+// still the one it works from: a revoke or an enrolment mid-plan ends the
+// plan instead of being overwritten. Network-trial boots write nothing, and a
+// record this firmware cannot read (damaged, or from newer firmware) is left
+// as it is.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -45,7 +60,7 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::data_key::{BlobStore, StoreError};
+use crate::data_key::{BlobStore, PhoneRecord, PhoneSet, StoreError};
 
 /// NVS key: the relays the enrolled phones were last pointed at.
 pub const TOLD_RELAYS_KEY: &str = "ph_relays";
@@ -54,26 +69,30 @@ pub const MAX_TOLD_RELAYS: usize = 8;
 const MAX_TOLD_URL_LEN: usize = 255;
 const SET_TAG_HEX_LEN: usize = 16;
 
-/// When an unlocked board posts a relay update, in seconds from its first
-/// round. Relays keep no ephemeral event, so each round reaches only the
-/// phones listening at that moment; the spacing covers a phone that is
-/// reconnecting, asleep for an hour, or off overnight.
+/// The update schedule's nominal offsets, in seconds from the first round.
+/// Relays keep no ephemeral event, so each round reaches only the phones
+/// listening at that moment; the spacing covers a phone that is
+/// reconnecting, asleep for an hour, or off overnight. Each gap is
+/// randomised by a quarter either way ([`jittered_gap`]).
 pub const RELAY_UPDATE_ROUNDS_SECS: [u64; 6] = [0, 120, 900, 3_600, 21_600, 86_400];
 pub const ROUNDS: usize = RELAY_UPDATE_ROUNDS_SECS.len();
 
+/// The first round of a boot (a fresh update, or one resumed after a
+/// restart) goes out a random 2 to 20 minutes after the board comes online.
+pub const FIRST_ROUND_MIN_SECS: u64 = 120;
+pub const FIRST_ROUND_MAX_SECS: u64 = 1_200;
+
 /// How long an unlocked board waits before trying a deferred dial again.
 pub const DEFER_SECS: u64 = 30;
+/// How long a dial may wait on a full session ceiling before the pinned
+/// session steps aside, or on a tight heap before the relay is given up for
+/// this round.
+pub const MAX_DEFER_SECS: u64 = 600;
 
 /// A locked board's old-relay announcements: at most one per relay per
 /// interval, doubling per consecutive failure up to the cap.
 pub const LOCKED_OLD_INTERVAL_SECS: u64 = 300;
 pub const LOCKED_OLD_BACKOFF_MAX_SECS: u64 = 3_600;
-/// No old-relay dial within this long after an announcement on the live
-/// relay (a phone's answer usually follows it), nor this long before the
-/// next one (so a dial never pushes an announcement ahead of a delivery that
-/// arrived during it). A dial blocks for at most about 23 s.
-pub const LOCKED_QUIET_AFTER_ANNOUNCE_SECS: u64 = 10;
-pub const LOCKED_QUIET_BEFORE_ANNOUNCE_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Relay URLs
@@ -132,7 +151,7 @@ pub fn set_tag(relays: &[String]) -> String {
 
 /// What [`TOLD_RELAYS_KEY`] holds: the relays the phones were last pointed
 /// at, and, while an update is under way, how many rounds have gone out and
-/// the tag of the list they are telling.
+/// the tag of the list they are telling (empty when unknown).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToldRecord {
     pub relays: Vec<String>,
@@ -140,16 +159,19 @@ pub struct ToldRecord {
     pub toward: String,
 }
 
+/// Lenient on read: unknown fields are ignored and `n` / `t` may be absent,
+/// so a record written by newer firmware still reads here.
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Wire {
     r: Vec<String>,
+    #[serde(default)]
     n: u8,
+    #[serde(default)]
     t: String,
 }
 
-/// Largest encoded record: `{"r":[` eight quoted 255-byte URLs and seven
-/// commas `],"n":5,"t":"<16 hex>"}`.
+/// Largest record this firmware writes: `{"r":[` eight quoted 255-byte URLs
+/// and seven commas `],"n":5,"t":"<16 hex>"}`.
 pub const MAX_TOLD_BLOB_LEN: usize = 5
     + (2 + MAX_TOLD_RELAYS * (MAX_TOLD_URL_LEN + 2) + (MAX_TOLD_RELAYS - 1))
     + 5
@@ -157,6 +179,8 @@ pub const MAX_TOLD_BLOB_LEN: usize = 5
     + 6
     + SET_TAG_HEX_LEN
     + 2;
+/// Largest record it reads: room for fields a newer firmware may add.
+pub const MAX_TOLD_READ_LEN: usize = crate::data_key::MAX_PHONES_BLOB_LEN;
 
 impl ToldRecord {
     /// In step with `current`: no update under way.
@@ -173,9 +197,9 @@ impl ToldRecord {
         serde_json::to_vec(&wire).expect("strings always serialise")
     }
 
-    /// `None` for anything [`ToldRecord::encode`] would not have written.
+    /// `None` for anything this firmware cannot use.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > MAX_TOLD_BLOB_LEN {
+        if bytes.len() > MAX_TOLD_READ_LEN {
             return None;
         }
         let w: Wire = serde_json::from_slice(bytes).ok()?;
@@ -183,17 +207,23 @@ impl ToldRecord {
             && w.r.len() <= MAX_TOLD_RELAYS
             && w.r.iter().all(|r| usable_relay(r) && r.trim() == r)
             && (w.n as usize) < ROUNDS
-            && w.t.len() == SET_TAG_HEX_LEN
-            && w.t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            && (w.t.is_empty()
+                || (w.t.len() == SET_TAG_HEX_LEN
+                    && w.t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))));
         ok.then(|| ToldRecord { relays: w.r, rounds: w.n as usize, toward: w.t })
+    }
+
+    /// As it reads back after [`ToldRecord::encode`].
+    fn stored(&self) -> Self {
+        Self::decode(&self.encode()).expect("an encoded record decodes")
     }
 }
 
 /// How the live relay list stands against the one the phones were told.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RelayDrift {
-    /// No record (a board whose phones were enrolled by older firmware), or
-    /// a damaged one. Record the live list.
+    /// No record: a board whose phones were enrolled by older firmware.
+    /// Record the live list.
     Unrecorded,
     /// The phones already know every live relay.
     InStep,
@@ -224,18 +254,23 @@ pub fn relay_drift(told: Option<&[String]>, current: &[String]) -> RelayDrift {
     }
 }
 
-/// What a boot has to tell the phones: the old relays (empty: nothing) and
-/// how many update rounds an earlier boot already sent for this change.
+/// What a boot has to tell the phones: the old relays (empty: nothing), how
+/// many update rounds an earlier boot already sent for this change, and the
+/// record as it stood (every later write checks it is still there).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BootRelays {
     pub old: Vec<String>,
     pub rounds_done: usize,
+    pub record: Option<ToldRecord>,
+    /// A record was present but this firmware cannot read it; it was left
+    /// untouched and nothing will be told this boot.
+    pub unreadable: bool,
 }
 
 /// Run once per boot with the live relay list. A board with no phones, or no
-/// usable live relay, reads and writes nothing. A missing, damaged or
-/// shrunk record is rewritten from the live list, except on a network-trial
-/// boot (`trial`), which writes nothing.
+/// usable live relay, reads and writes nothing. A missing or shrunk record is
+/// rewritten from the live list, except on a network-trial boot (`trial`),
+/// which writes nothing. A present record it cannot read is left untouched.
 pub fn relays_at_boot<S: BlobStore>(
     store: &mut S,
     have_phones: bool,
@@ -245,7 +280,13 @@ pub fn relays_at_boot<S: BlobStore>(
     if !have_phones || usable_relays(current).is_empty() {
         return Ok(BootRelays::default());
     }
-    let record = store.get(TOLD_RELAYS_KEY)?.and_then(|b| ToldRecord::decode(&b));
+    let record = match store.get(TOLD_RELAYS_KEY)? {
+        None => None,
+        Some(bytes) => match ToldRecord::decode(&bytes) {
+            Some(r) => Some(r),
+            None => return Ok(BootRelays { unreadable: true, ..BootRelays::default() }),
+        },
+    };
     match relay_drift(record.as_ref().map(|r| r.relays.as_slice()), current) {
         RelayDrift::InStep => Ok(BootRelays::default()),
         RelayDrift::Unrecorded | RelayDrift::Shrunk => {
@@ -257,27 +298,50 @@ pub fn relays_at_boot<S: BlobStore>(
         RelayDrift::Drifted { old } => {
             let record = record.expect("a drift needs a record");
             let rounds_done = if record.toward == set_tag(current) { record.rounds } else { 0 };
-            Ok(BootRelays { old, rounds_done })
+            Ok(BootRelays { old, rounds_done, record: Some(record), unreadable: false })
         }
     }
 }
 
-/// Round `done` (counting from one) of telling `old` about `current` has
-/// gone out. Before the last, the record keeps `old` and the count; after the
-/// last, it becomes `current`, which ends the drift. Returns whether it did.
+/// Whether the stored record is still `expected`. A revoke of the last phone
+/// removes it and an enrolment after that replaces it; either way a plan
+/// working from the old record has nothing left to do.
+pub fn record_is<S: BlobStore>(store: &S, expected: &ToldRecord) -> Result<bool, StoreError> {
+    Ok(store.get(TOLD_RELAYS_KEY)?.and_then(|b| ToldRecord::decode(&b)).as_ref() == Some(expected))
+}
+
+/// What [`record_round`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RoundRecorded {
+    /// The stored record is no longer the plan's: nothing written, the plan
+    /// ends.
+    Superseded,
+    /// The count moved on; this is the record now stored.
+    Progress(ToldRecord),
+    /// The last round: the live list is recorded and the drift is over.
+    Ended,
+}
+
+/// Round `done` (counting from one) of telling the phones about `current`
+/// has gone out. Writes only while the stored record is still `expected`.
+/// Before the last round the record keeps the old list and the count; after
+/// the last it becomes `current`.
 pub fn record_round<S: BlobStore>(
     store: &mut S,
-    old: &[String],
+    expected: &ToldRecord,
     current: &[String],
     done: usize,
-) -> Result<bool, StoreError> {
+) -> Result<RoundRecorded, StoreError> {
+    if !record_is(store, expected)? {
+        return Ok(RoundRecorded::Superseded);
+    }
     if done >= ROUNDS {
         store.set(TOLD_RELAYS_KEY, &ToldRecord::settled(current).encode())?;
-        Ok(true)
+        Ok(RoundRecorded::Ended)
     } else {
-        let record = ToldRecord { relays: usable_relays(old), rounds: done, toward: set_tag(current) };
-        store.set(TOLD_RELAYS_KEY, &record.encode())?;
-        Ok(false)
+        let next = ToldRecord { relays: expected.relays.clone(), rounds: done, toward: set_tag(current) };
+        store.set(TOLD_RELAYS_KEY, &next.encode())?;
+        Ok(RoundRecorded::Progress(next.stored()))
     }
 }
 
@@ -306,17 +370,32 @@ pub fn forget_told<S: BlobStore>(store: &mut S) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The phones a dial may still address: those the round began with that are
+/// still enrolled now. A phone revoked mid-round gets nothing from the next
+/// dial, and one enrolled mid-round (handed the live list already) is not
+/// added.
+pub fn round_phones<'a>(round_ids: &'a [u32], table: &'a PhoneSet) -> impl Iterator<Item = &'a PhoneRecord> + 'a {
+    table.records().iter().filter(move |r| round_ids.contains(&r.id))
+}
+
 // ---------------------------------------------------------------------------
 // Unlocked: update rounds
 // ---------------------------------------------------------------------------
 
-/// The round schedule on a seconds clock (uptime). After a restart the first
-/// remaining round goes out at once (the restart itself spaced it), then the
-/// gaps of [`RELAY_UPDATE_ROUNDS_SECS`] apply again.
+/// A gap of the schedule, randomised to between three quarters and five
+/// quarters of `gap` by `r`, a secure random draw.
+pub fn jittered_gap(gap: u64, r: u32) -> u64 {
+    gap * 3 / 4 + u64::from(r) % (gap / 2 + 1)
+}
+
+/// The round schedule on a seconds clock (uptime). Unarmed until the board
+/// first comes online this boot; then the first remaining round is due a
+/// random [`FIRST_ROUND_MIN_SECS`]..=[`FIRST_ROUND_MAX_SECS`] later, and each
+/// later one a [`jittered_gap`] after the one before.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UpdateRounds {
     done: usize,
-    last_at: Option<u64>,
+    due_at: Option<u64>,
 }
 
 impl UpdateRounds {
@@ -325,27 +404,34 @@ impl UpdateRounds {
     }
 
     pub fn resume(done: usize) -> Self {
-        Self { done: done.min(ROUNDS), last_at: None }
+        Self { done: done.min(ROUNDS), due_at: None }
+    }
+
+    pub fn armed(&self) -> bool {
+        self.due_at.is_some()
+    }
+
+    /// The board is online: schedule the first remaining round.
+    pub fn arm(&mut self, now: u64, r: u32) {
+        if self.due_at.is_none() {
+            let span = FIRST_ROUND_MAX_SECS - FIRST_ROUND_MIN_SECS + 1;
+            self.due_at = Some(now + FIRST_ROUND_MIN_SECS + u64::from(r) % span);
+        }
     }
 
     pub fn due(&self, now: u64) -> bool {
-        if self.done >= ROUNDS {
-            return false;
-        }
-        match self.last_at {
-            None => true,
-            Some(last) => {
-                let gap = RELAY_UPDATE_ROUNDS_SECS[self.done] - RELAY_UPDATE_ROUNDS_SECS[self.done - 1];
-                now >= last.saturating_add(gap)
-            }
-        }
+        self.done < ROUNDS && self.due_at.is_some_and(|d| now >= d)
     }
 
     /// A round went out at `now`, reaching the phones or not: an old relay
-    /// that stays down must not keep the drift open for ever.
-    pub fn mark_done(&mut self, now: u64) {
-        self.last_at = Some(now);
+    /// that stays down must not keep the drift open for ever. `r` draws the
+    /// next gap.
+    pub fn mark_done(&mut self, now: u64, r: u32) {
         self.done = (self.done + 1).min(ROUNDS);
+        self.due_at = (self.done < ROUNDS).then(|| {
+            let gap = RELAY_UPDATE_ROUNDS_SECS[self.done] - RELAY_UPDATE_ROUNDS_SECS[self.done - 1];
+            now + jittered_gap(gap, r)
+        });
     }
 
     pub fn rounds_done(&self) -> usize {
@@ -357,16 +443,41 @@ impl UpdateRounds {
     }
 }
 
+/// The relay sessions the unlocked loop has open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sessions {
+    pub live: usize,
+    /// One of them is the redundant secondary.
+    pub secondary: bool,
+    /// One of them is a pinned (client-dictated) relay.
+    pub pinned: bool,
+}
+
+/// Which session closes so a dial stays within the ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepAside {
+    None,
+    /// The secondary; it stays closed until the round ends.
+    Secondary,
+    /// The pinned relay, after [`MAX_DEFER_SECS`] of waiting; it redials
+    /// after its usual backoff.
+    Pinned,
+}
+
 /// What the unlocked loop should do next for a relay update.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateAction {
     /// Nothing due.
     Wait,
-    /// A round is due: load the phones and call [`UpdatePlan::begin_round`].
+    /// The board is online for the first time this boot: call
+    /// [`UpdatePlan::arm`] with a secure random draw.
+    Arm,
+    /// A round is due: check the record, load the phones and call
+    /// [`UpdatePlan::begin_round`].
     StartRound,
     /// Dial `url` publish-only and post this round's updates, after closing
-    /// the secondary session if `shed_secondary`.
-    Dial { url: String, shed_secondary: bool },
+    /// the session `step_aside` names.
+    Dial { url: String, step_aside: StepAside },
     /// The primary and a pinned relay fill the session ceiling: call
     /// [`UpdatePlan::defer`] and try again later, rather than open a third
     /// TLS session.
@@ -376,14 +487,18 @@ pub enum UpdateAction {
     FinishRound,
 }
 
-/// How a round's phone table looked when it began.
+/// How a round began.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RoundStart {
     Go,
     /// The last phone was revoked: nothing to tell anyone. The plan ends.
     NoPhones,
-    /// The table cannot be read: the plan ends for this boot.
+    /// The phone table or the record cannot be read: the plan ends for this
+    /// boot.
     Unreadable,
+    /// The record changed under the plan (a revoke or an enrolment): the plan
+    /// ends.
+    Superseded,
 }
 
 /// An unlocked board's relay update for one drift. RAM only; the round
@@ -391,26 +506,54 @@ pub enum RoundStart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePlan {
     old: Vec<String>,
+    expected: ToldRecord,
     rounds: UpdateRounds,
     queue: Option<Vec<String>>,
+    round_ids: Vec<u32>,
     reached: usize,
     retry_at: u64,
+    waiting_since: Option<u64>,
     over: bool,
 }
 
 impl UpdatePlan {
-    pub fn new(old: Vec<String>, rounds_done: usize) -> Self {
-        let rounds = UpdateRounds::resume(rounds_done);
-        let over = old.is_empty() || rounds.finished();
-        Self { old, rounds, queue: None, reached: 0, retry_at: 0, over }
+    /// The plan for this boot's drift, if there is one.
+    pub fn from_boot(boot: BootRelays) -> Option<Self> {
+        let expected = boot.record?;
+        if boot.old.is_empty() {
+            return None;
+        }
+        let rounds = UpdateRounds::resume(boot.rounds_done);
+        let over = rounds.finished();
+        Some(Self {
+            old: boot.old,
+            expected,
+            rounds,
+            queue: None,
+            round_ids: Vec::new(),
+            reached: 0,
+            retry_at: 0,
+            waiting_since: None,
+            over,
+        })
     }
 
     pub fn old(&self) -> &[String] {
         &self.old
     }
 
+    /// The record every write must still find.
+    pub fn expected(&self) -> &ToldRecord {
+        &self.expected
+    }
+
     pub fn rounds_done(&self) -> usize {
         self.rounds.rounds_done()
+    }
+
+    /// Phone ids this round began with.
+    pub fn round_ids(&self) -> &[u32] {
+        &self.round_ids
     }
 
     /// Old relays this round has reached so far.
@@ -418,20 +561,38 @@ impl UpdatePlan {
         self.reached
     }
 
+    /// A round is under way (the secondary stays closed meanwhile).
+    pub fn in_round(&self) -> bool {
+        self.queue.is_some()
+    }
+
     /// Nothing more will ever be done this boot.
     pub fn is_over(&self) -> bool {
         self.over
     }
 
-    /// `live` is how many relay sessions are open, `has_secondary` whether
-    /// one of them is the redundant secondary, and `max_sessions` the
-    /// firmware's ceiling. The dial itself is one more session.
-    pub fn next_action(&self, now: u64, live: usize, has_secondary: bool, max_sessions: usize) -> UpdateAction {
+    pub fn arm(&mut self, now: u64, r: u32) {
+        self.rounds.arm(now, r);
+    }
+
+    /// End the plan (the record changed, or cannot be read).
+    pub fn end(&mut self) {
+        self.over = true;
+        self.queue = None;
+    }
+
+    pub fn next_action(&self, now: u64, sessions: Sessions, max_sessions: usize) -> UpdateAction {
         if self.over {
             return UpdateAction::Wait;
         }
         let Some(queue) = &self.queue else {
-            return if self.rounds.due(now) { UpdateAction::StartRound } else { UpdateAction::Wait };
+            return if !self.rounds.armed() {
+                UpdateAction::Arm
+            } else if self.rounds.due(now) {
+                UpdateAction::StartRound
+            } else {
+                UpdateAction::Wait
+            };
         };
         let Some(url) = queue.last() else {
             return UpdateAction::FinishRound;
@@ -439,56 +600,85 @@ impl UpdatePlan {
         if now < self.retry_at {
             return UpdateAction::Wait;
         }
-        let staying = live.saturating_sub(usize::from(has_secondary));
-        if staying + 1 > max_sessions {
-            return UpdateAction::Defer;
+        let staying = sessions.live.saturating_sub(usize::from(sessions.secondary));
+        if staying < max_sessions {
+            let step_aside = if sessions.secondary { StepAside::Secondary } else { StepAside::None };
+            return UpdateAction::Dial { url: url.clone(), step_aside };
         }
-        UpdateAction::Dial { url: url.clone(), shed_secondary: has_secondary }
+        let waited_out = self.waiting_since.is_some_and(|w| now >= w.saturating_add(MAX_DEFER_SECS));
+        if sessions.pinned && waited_out && staying - 1 < max_sessions {
+            return UpdateAction::Dial { url: url.clone(), step_aside: StepAside::Pinned };
+        }
+        UpdateAction::Defer
     }
 
-    /// Begin the due round with the phone table as it is now (`Err`:
-    /// unreadable; `Ok(n)`: n phones).
-    pub fn begin_round(&mut self, phones: Result<usize, ()>) -> RoundStart {
-        match phones {
-            Ok(0) => {
-                self.over = true;
-                RoundStart::NoPhones
-            }
-            Err(()) => {
-                self.over = true;
-                RoundStart::Unreadable
-            }
-            Ok(_) => {
+    /// Begin the due round. `record_current`: [`record_is`] against
+    /// [`UpdatePlan::expected`]; `phone_ids`: the enrolled phones now.
+    pub fn begin_round(&mut self, record_current: Result<bool, ()>, phone_ids: Result<Vec<u32>, ()>) -> RoundStart {
+        let start = match (record_current, phone_ids) {
+            (Err(()), _) | (_, Err(())) => RoundStart::Unreadable,
+            (Ok(false), _) => RoundStart::Superseded,
+            (Ok(true), Ok(ids)) if ids.is_empty() => RoundStart::NoPhones,
+            (Ok(true), Ok(ids)) => {
+                self.round_ids = ids;
                 self.queue = Some(self.old.iter().rev().cloned().collect());
                 self.reached = 0;
+                self.waiting_since = None;
                 RoundStart::Go
             }
+        };
+        if start != RoundStart::Go {
+            self.end();
         }
+        start
     }
 
     /// The dial to the head of the queue happened: `true` when the relay
-    /// took the connection and the events (whatever it then said).
+    /// accepted at least one event.
     pub fn dialled(&mut self, reached: bool) {
         if let Some(q) = self.queue.as_mut() {
             q.pop();
         }
         self.reached += usize::from(reached);
+        self.waiting_since = None;
+        self.retry_at = 0;
     }
 
-    /// Put the head of the queue off for [`DEFER_SECS`] (ceiling full, or a
-    /// heap too tight to dial).
+    /// Put the head of the queue off for [`DEFER_SECS`] because the session
+    /// ceiling is full.
     pub fn defer(&mut self, now: u64) {
         self.retry_at = now.saturating_add(DEFER_SECS);
+        self.waiting_since.get_or_insert(now);
     }
 
-    /// Close the round. Returns the rounds done so far, for [`record_round`].
-    pub fn finish_round(&mut self, now: u64) -> usize {
+    /// The heap was too tight to dial. Waits like [`UpdatePlan::defer`];
+    /// after [`MAX_DEFER_SECS`] the relay is given up for this round, so the
+    /// round, and the drift, still end. Returns whether it was given up.
+    pub fn heap_tight(&mut self, now: u64) -> bool {
+        if self.waiting_since.is_some_and(|w| now >= w.saturating_add(MAX_DEFER_SECS)) {
+            self.dialled(false);
+            true
+        } else {
+            self.defer(now);
+            false
+        }
+    }
+
+    /// Close the round; `r` draws the next gap. Returns the rounds done so
+    /// far, for [`record_round`].
+    pub fn finish_round(&mut self, now: u64, r: u32) -> usize {
         self.queue = None;
-        self.rounds.mark_done(now);
+        self.round_ids.clear();
+        self.rounds.mark_done(now, r);
         if self.rounds.finished() {
             self.over = true;
         }
         self.rounds.rounds_done()
+    }
+
+    /// [`record_round`] wrote `record`: later writes check for it.
+    pub fn recorded(&mut self, record: ToldRecord) {
+        self.expected = record;
     }
 }
 
@@ -504,10 +694,14 @@ struct OldRelay {
 }
 
 /// A locked board's schedule for repeating its phone announcements on the
-/// old relays: one dial per idle pass, well clear of the live relay's own
-/// announcements, each relay at most once per [`LOCKED_OLD_INTERVAL_SECS`],
-/// backing off per consecutive failure (pinned-relay style) so a dead relay
-/// costs a blocked loop once an hour, not every five minutes.
+/// old relays: at most one dial per announce interval, in the pass straight
+/// after the live relay's announcement. No human can have answered that
+/// announcement yet, and the dial ends well before the next one (a dial
+/// blocks for at most about 35 s: TLS 10 s, WebSocket upgrade 10 s, one
+/// stalled send 8 s, the OK wait 3 s plus one 1 s read, and DNS), so a
+/// delivery that arrives during it is read before the board announces again.
+/// Each relay rests [`LOCKED_OLD_INTERVAL_SECS`] after a dial, and doubles
+/// that per consecutive failure up to [`LOCKED_OLD_BACKOFF_MAX_SECS`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OldRelayDials {
     relays: Vec<OldRelay>,
@@ -523,20 +717,11 @@ impl OldRelayDials {
         }
     }
 
-    /// The old relay to dial on this pass, if any.
-    ///
-    /// - `idle`: this pass parsed no frame and read nothing from the live
-    ///   relay, so no delivery is waiting behind the dial;
-    /// - `last_announce`: when the live relay last carried an announcement
-    ///   (`None`: not yet, so the phones' author is not out yet either);
-    /// - `next_announce`: when the next one is due;
-    /// - `live`: the live relay's URL, which needs no dial.
-    pub fn next(&self, now: u64, idle: bool, last_announce: Option<u64>, next_announce: u64, live: &str) -> Option<&str> {
-        let last = last_announce?;
-        if !idle
-            || now < last.saturating_add(LOCKED_QUIET_AFTER_ANNOUNCE_SECS)
-            || now.saturating_add(LOCKED_QUIET_BEFORE_ANNOUNCE_SECS) > next_announce
-        {
+    /// The old relay to dial on this pass, if any. `just_announced`: this
+    /// pass put the phones' announcement on the live relay `live`, which
+    /// needs no dial.
+    pub fn next(&self, now: u64, just_announced: bool, live: &str) -> Option<&str> {
+        if !just_announced {
             return None;
         }
         self.relays
@@ -567,16 +752,21 @@ impl OldRelayDials {
 // ---------------------------------------------------------------------------
 
 /// Counts a relay's `["OK", <id>, <accepted>, <message>]` answers to the
-/// events a publish-only connection sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// events a publish-only connection sent, one [`OkTally::expect`] per event.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OkTally {
     waiting: Vec<String>,
     accepted: usize,
 }
 
 impl OkTally {
-    pub fn new(ids: Vec<String>) -> Self {
-        Self { waiting: ids, accepted: 0 }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// An event with this id was sent.
+    pub fn expect(&mut self, id: String) {
+        self.waiting.push(id);
     }
 
     /// Feed one text frame from the relay. Anything that is not an OK for an
@@ -654,6 +844,26 @@ mod tests {
         fn told(&self) -> Option<Vec<String>> {
             self.record().map(|r| r.relays)
         }
+        fn with(relays: &[String]) -> Self {
+            let mut s = Store::default();
+            s.map.insert(TOLD_RELAYS_KEY.into(), ToldRecord::settled(relays).encode());
+            s
+        }
+    }
+
+    fn drifted(old: &[String], rounds_done: usize, record: ToldRecord) -> BootRelays {
+        BootRelays { old: old.to_vec(), rounds_done, record: Some(record), unreadable: false }
+    }
+
+    const ONE: Sessions = Sessions { live: 1, secondary: false, pinned: false };
+
+    /// Run a plan's round to the end with every dial reaching its relay.
+    fn run_round(plan: &mut UpdatePlan, store: &Store, ids: &[u32], now: u64) {
+        assert_eq!(plan.begin_round(record_is(store, plan.expected()).map_err(|_| ()), Ok(ids.to_vec())), RoundStart::Go);
+        while let UpdateAction::Dial { .. } = plan.next_action(now, ONE, 2) {
+            plan.dialled(true);
+        }
+        assert_eq!(plan.next_action(now, ONE, 2), UpdateAction::FinishRound);
     }
 
     #[test]
@@ -685,7 +895,6 @@ mod tests {
             let current = urls(&["wss://a.example", odd]);
             assert_eq!(relay_drift(Some(&told), &current), RelayDrift::InStep, "{odd:?}");
         }
-        // And a live list of nothing usable is left alone entirely.
         let mut store = Store::default();
         assert_eq!(
             relays_at_boot(&mut store, true, false, &urls(&["wss://q\"uote"])),
@@ -695,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn the_record_round_trips_and_refuses_damage() {
+    fn the_record_round_trips_and_refuses_what_it_cannot_use() {
         let rec = ToldRecord {
             relays: urls(&[" wss://a.example ", "", "wss://A.example/", "wss://q\"uote", "wss://b.example"]),
             rounds: 3,
@@ -712,10 +921,7 @@ mod tests {
             (0..8).map(|i| format!("wss://{i}{}", "x".repeat(MAX_TOLD_URL_LEN - 7))).collect();
         let full = ToldRecord { relays: longest.clone(), rounds: ROUNDS - 1, toward: set_tag(&longest) };
         assert_eq!(full.encode().len(), MAX_TOLD_BLOB_LEN, "the bound is exact");
-        assert!(
-            MAX_TOLD_BLOB_LEN <= crate::data_key::MAX_PHONES_BLOB_LEN,
-            "the firmware reads it through the same bounded blob reader"
-        );
+        assert!(MAX_TOLD_BLOB_LEN <= MAX_TOLD_READ_LEN);
 
         let tag = set_tag(&urls(&["wss://a"]));
         for bad in [
@@ -725,9 +931,43 @@ mod tests {
             format!(r#"{{"r":[" wss://a"],"n":0,"t":"{tag}"}}"#),
             format!(r#"{{"r":["wss://a"],"n":6,"t":"{tag}"}}"#),
             String::from(r#"{"r":["wss://a"],"n":0,"t":"XYZ"}"#),
-            format!(r#"{{"r":["wss://a"],"n":0,"t":"{tag}","x":1}}"#),
+            format!(r#"{{"n":0,"t":"{tag}"}}"#),
         ] {
             assert_eq!(ToldRecord::decode(bad.as_bytes()), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_newer_or_sparser_record_still_reads() {
+        let tag = set_tag(&urls(&["wss://c"]));
+        let newer = format!(r#"{{"r":["wss://a"],"n":2,"t":"{tag}","v":2,"extra":{{"x":1}}}}"#);
+        assert_eq!(
+            ToldRecord::decode(newer.as_bytes()),
+            Some(ToldRecord { relays: urls(&["wss://a"]), rounds: 2, toward: tag.clone() }),
+            "unknown fields are ignored"
+        );
+        assert_eq!(
+            ToldRecord::decode(br#"{"r":["wss://a"]}"#),
+            Some(ToldRecord { relays: urls(&["wss://a"]), rounds: 0, toward: String::new() }),
+            "n and t default"
+        );
+        // Without a tag the count cannot be trusted for this change.
+        let mut store = Store::default();
+        store.map.insert(TOLD_RELAYS_KEY.into(), br#"{"r":["wss://a"],"n":4}"#.to_vec());
+        assert_eq!(relays_at_boot(&mut store, true, false, &urls(&["wss://c"])).unwrap().rounds_done, 0);
+    }
+
+    #[test]
+    fn an_unreadable_record_is_left_untouched() {
+        let c = urls(&["wss://c.example"]);
+        for junk in [&b"\xff\xfe"[..], br#"{"r":"not a list"}"#, br#"{"r":["wss://a"],"n":9}"#] {
+            let mut store = Store::default();
+            store.map.insert(TOLD_RELAYS_KEY.into(), junk.to_vec());
+            let boot = relays_at_boot(&mut store, true, false, &c).unwrap();
+            assert!(boot.unreadable && boot.old.is_empty() && boot.record.is_none());
+            assert_eq!(store.writes, 0);
+            assert_eq!(store.map[TOLD_RELAYS_KEY], junk.to_vec());
+            assert_eq!(UpdatePlan::from_boot(boot), None);
         }
     }
 
@@ -745,40 +985,28 @@ mod tests {
         let ab = urls(&["wss://a.example", "wss://b.example"]);
         let c = urls(&["wss://c.example"]);
 
-        // No phones, or no live relay: nothing read, nothing written.
         let mut store = Store::default();
         assert_eq!(relays_at_boot(&mut store, false, false, &a), Ok(BootRelays::default()));
         assert_eq!(relays_at_boot(&mut store, true, false, &[]), Ok(BootRelays::default()));
         assert_eq!((store.reads.get(), store.writes), (0, 0));
 
-        // First boot with phones (enrolled by older firmware): record, once.
         assert_eq!(relays_at_boot(&mut store, true, false, &ab), Ok(BootRelays::default()));
         assert_eq!((store.told(), store.writes), (Some(ab.clone()), 1));
         assert_eq!(relays_at_boot(&mut store, true, false, &ab), Ok(BootRelays::default()));
         assert_eq!(store.writes, 1, "a board in step never writes");
 
-        // The owner moves to c: every boot until the update is done reports
-        // the old relays, and the boot check itself writes nothing.
         for _ in 0..3 {
             assert_eq!(
                 relays_at_boot(&mut store, true, false, &c),
-                Ok(BootRelays { old: ab.clone(), rounds_done: 0 })
+                Ok(drifted(&ab, 0, ToldRecord::settled(&ab)))
             );
         }
         assert_eq!(store.writes, 1);
 
-        // Dropping a relay needs no update, one write to forget it.
-        let mut store = Store::default();
-        store.map.insert(TOLD_RELAYS_KEY.into(), ToldRecord::settled(&ab).encode());
+        let mut store = Store::with(&ab);
         assert_eq!(relays_at_boot(&mut store, true, false, &a), Ok(BootRelays::default()));
         assert_eq!((store.told(), store.writes), (Some(a.clone()), 1));
 
-        // A damaged record is rewritten from the live list.
-        store.map.insert(TOLD_RELAYS_KEY.into(), b"\xff\xfe".to_vec());
-        assert_eq!(relays_at_boot(&mut store, true, false, &c), Ok(BootRelays::default()));
-        assert_eq!(store.told(), Some(c.clone()));
-
-        // A store that fails is an error, never "nothing to do".
         let mut broken = Store { broken: true, ..Store::default() };
         assert_eq!(relays_at_boot(&mut broken, true, false, &a), Err(StoreError));
     }
@@ -791,41 +1019,44 @@ mod tests {
         let mut store = Store::default();
         assert_eq!(relays_at_boot(&mut store, true, true, &a), Ok(BootRelays::default()));
         assert_eq!(store.writes, 0, "unrecorded: left for a committed boot");
-        store.map.insert(TOLD_RELAYS_KEY.into(), ToldRecord::settled(&ab).encode());
+        let mut store = Store::with(&ab);
         assert_eq!(relays_at_boot(&mut store, true, true, &a), Ok(BootRelays::default()));
         assert_eq!(store.writes, 0, "shrunk: left as it is");
         assert_eq!(
             relays_at_boot(&mut store, true, true, &c),
-            Ok(BootRelays { old: ab.clone(), rounds_done: 0 }),
+            Ok(drifted(&ab, 0, ToldRecord::settled(&ab))),
             "a drift is still told (a phone may need to unlock the trial boot)"
         );
-        assert_eq!(store.told(), Some(ab));
     }
 
     #[test]
     fn rounds_persist_resume_and_end_the_drift_in_six_writes() {
         let ab = urls(&["wss://a.example", "wss://b.example"]);
         let c = urls(&["wss://c.example"]);
-        let mut store = Store::default();
-        store.map.insert(TOLD_RELAYS_KEY.into(), ToldRecord::settled(&ab).encode());
+        let mut store = Store::with(&ab);
         let before = store.writes;
 
         // Each boot sends one round and restarts: the record carries the
         // count, so the board converges instead of starting over.
         for round in 1..=ROUNDS {
             let boot = relays_at_boot(&mut store, true, false, &c).unwrap();
-            assert_eq!(boot, BootRelays { old: ab.clone(), rounds_done: round - 1 });
-            let mut plan = UpdatePlan::new(boot.old.clone(), boot.rounds_done);
-            assert_eq!(plan.next_action(0, 1, false, 2), UpdateAction::StartRound, "resumes at once");
-            assert_eq!(plan.begin_round(Ok(2)), RoundStart::Go);
-            while let UpdateAction::Dial { .. } = plan.next_action(0, 1, false, 2) {
-                plan.dialled(true);
-            }
-            assert_eq!(plan.next_action(0, 1, false, 2), UpdateAction::FinishRound);
-            let done = plan.finish_round(0);
+            assert_eq!((boot.old.clone(), boot.rounds_done), (ab.clone(), round - 1));
+            let mut plan = UpdatePlan::from_boot(boot).unwrap();
+            assert_eq!(plan.next_action(0, ONE, 2), UpdateAction::Arm);
+            plan.arm(0, 0);
+            assert_eq!(plan.next_action(FIRST_ROUND_MIN_SECS - 1, ONE, 2), UpdateAction::Wait);
+            assert_eq!(plan.next_action(FIRST_ROUND_MIN_SECS, ONE, 2), UpdateAction::StartRound);
+            run_round(&mut plan, &store, &[7], FIRST_ROUND_MIN_SECS);
+            let done = plan.finish_round(FIRST_ROUND_MIN_SECS, 0);
             assert_eq!(done, round);
-            let ended = record_round(&mut store, plan.old(), &c, done).unwrap();
-            assert_eq!(ended, round == ROUNDS);
+            match record_round(&mut store, plan.expected(), &c, done).unwrap() {
+                RoundRecorded::Progress(r) => {
+                    assert!(round < ROUNDS);
+                    plan.recorded(r);
+                }
+                RoundRecorded::Ended => assert_eq!(round, ROUNDS),
+                RoundRecorded::Superseded => panic!("nothing changed the record"),
+            }
             assert_eq!(plan.is_over(), round == ROUNDS);
         }
         assert_eq!(store.writes - before, ROUNDS, "one write per round, the last ends the drift");
@@ -834,54 +1065,104 @@ mod tests {
     }
 
     #[test]
+    fn rounds_in_one_boot_follow_the_recorded_record() {
+        let a = urls(&["wss://a.example"]);
+        let c = urls(&["wss://c.example"]);
+        let mut store = Store::with(&a);
+        let mut plan = UpdatePlan::from_boot(relays_at_boot(&mut store, true, false, &c).unwrap()).unwrap();
+        plan.arm(0, 0);
+        let mut now = FIRST_ROUND_MIN_SECS;
+        for round in 1..=ROUNDS {
+            assert_eq!(plan.next_action(now, ONE, 2), UpdateAction::StartRound, "round {round}");
+            run_round(&mut plan, &store, &[7], now);
+            let done = plan.finish_round(now, 0);
+            match record_round(&mut store, plan.expected(), &c, done).unwrap() {
+                RoundRecorded::Progress(r) => plan.recorded(r),
+                RoundRecorded::Ended => {}
+                RoundRecorded::Superseded => panic!("round {round} superseded by its own write"),
+            }
+            now += 200_000;
+        }
+        assert!(plan.is_over());
+        assert_eq!(store.told(), Some(c));
+    }
+
+    #[test]
+    fn revoking_every_phone_then_enrolling_mid_plan_ends_the_plan() {
+        let a = urls(&["wss://a.example"]);
+        let c = urls(&["wss://c.example"]);
+        let mut store = Store::with(&a);
+        let mut plan = UpdatePlan::from_boot(relays_at_boot(&mut store, true, false, &c).unwrap()).unwrap();
+        plan.arm(0, 0);
+        run_round(&mut plan, &store, &[7], FIRST_ROUND_MIN_SECS);
+        let done = plan.finish_round(FIRST_ROUND_MIN_SECS, 0);
+        let RoundRecorded::Progress(r) = record_round(&mut store, plan.expected(), &c, done).unwrap() else {
+            panic!("first round records");
+        };
+        plan.recorded(r);
+
+        // Mid-plan: the last phone is revoked (forget_told), then a new one
+        // is enrolled on c (the only phone, so the record is replaced).
+        forget_told(&mut store).unwrap();
+        record_told_at_enrolment(&mut store, false, &c).unwrap();
+        let fresh = store.record().unwrap();
+        assert_eq!(fresh, ToldRecord::settled(&c));
+
+        // The next round never starts, and a late record_round writes nothing.
+        let writes = store.writes;
+        assert_eq!(
+            plan.begin_round(record_is(&store, plan.expected()).map_err(|_| ()), Ok(alloc::vec![9])),
+            RoundStart::Superseded
+        );
+        assert!(plan.is_over());
+        assert_eq!(record_round(&mut store, plan.expected(), &c, 2), Ok(RoundRecorded::Superseded));
+        assert_eq!(store.writes, writes);
+        assert_eq!(store.record(), Some(fresh), "the fresh record survives");
+    }
+
+    #[test]
     fn a_second_change_mid_update_starts_the_rounds_again() {
         let a = urls(&["wss://a.example"]);
         let c = urls(&["wss://c.example"]);
         let d = urls(&["wss://d.example"]);
-        let mut store = Store::default();
-        store.map.insert(TOLD_RELAYS_KEY.into(), ToldRecord::settled(&a).encode());
-        record_round(&mut store, &a, &c, 4).unwrap();
+        let mut store = Store::with(&a);
+        let expected = ToldRecord::settled(&a);
+        let RoundRecorded::Progress(_) = record_round(&mut store, &expected, &c, 4).unwrap() else {
+            panic!("progress");
+        };
         assert_eq!(relays_at_boot(&mut store, true, false, &c).unwrap().rounds_done, 4);
-        assert_eq!(
-            relays_at_boot(&mut store, true, false, &d),
-            Ok(BootRelays { old: a.clone(), rounds_done: 0 }),
-            "the phones on a have been told nothing about d"
-        );
+        let boot = relays_at_boot(&mut store, true, false, &d).unwrap();
+        assert_eq!((boot.old, boot.rounds_done), (a.clone(), 0), "the phones on a know nothing of d");
     }
 
     #[test]
     fn a_failed_final_write_repeats_the_last_round_next_boot() {
         let a = urls(&["wss://a.example"]);
         let c = urls(&["wss://c.example"]);
-        let mut store = Store::default();
-        store.map.insert(TOLD_RELAYS_KEY.into(), ToldRecord::settled(&a).encode());
-        record_round(&mut store, &a, &c, ROUNDS - 1).unwrap();
+        let mut store = Store::with(&a);
+        let RoundRecorded::Progress(r) = record_round(&mut store, &ToldRecord::settled(&a), &c, ROUNDS - 1).unwrap()
+        else {
+            panic!("progress");
+        };
         store.broken = true;
-        assert_eq!(record_round(&mut store, &a, &c, ROUNDS), Err(StoreError));
+        assert_eq!(record_round(&mut store, &r, &c, ROUNDS), Err(StoreError));
         store.broken = false;
-        assert_eq!(
-            relays_at_boot(&mut store, true, false, &c),
-            Ok(BootRelays { old: a.clone(), rounds_done: ROUNDS - 1 })
-        );
+        let boot = relays_at_boot(&mut store, true, false, &c).unwrap();
+        assert_eq!((boot.old, boot.rounds_done), (a, ROUNDS - 1));
     }
 
     #[test]
     fn enrolment_after_every_phone_left_replaces_a_stale_record() {
         let a = urls(&["wss://a.example"]);
         let c = urls(&["wss://c.example"]);
-        // A stale record: its phones went (secret cleared, or a cut between
-        // revoke's save and forget_told) and the board moved on to c.
-        let mut store = Store::default();
-        store.map.insert(TOLD_RELAYS_KEY.into(), ToldRecord::settled(&a).encode());
+        let mut store = Store::with(&a);
         record_told_at_enrolment(&mut store, false, &c).unwrap();
         assert_eq!(store.told(), Some(c.clone()), "the only phone knows c; nobody listens on a");
         assert_eq!(relays_at_boot(&mut store, true, false, &c), Ok(BootRelays::default()));
 
-        // With other phones still owed an update, the record is kept.
-        store.map.insert(TOLD_RELAYS_KEY.into(), ToldRecord::settled(&a).encode());
+        let mut store = Store::with(&a);
         record_told_at_enrolment(&mut store, true, &c).unwrap();
-        assert_eq!(store.told(), Some(a.clone()));
-        // With other phones and no record, it is written.
+        assert_eq!(store.told(), Some(a.clone()), "other phones are still owed an update");
         store.map.clear();
         record_told_at_enrolment(&mut store, true, &c).unwrap();
         assert_eq!(store.told(), Some(c.clone()));
@@ -897,107 +1178,150 @@ mod tests {
     }
 
     #[test]
-    fn update_rounds_follow_the_schedule_and_stop() {
-        let mut r = UpdateRounds::new();
-        assert!(r.due(0) && r.due(5_000), "the first round goes out at once");
-        let start = 1_000;
-        r.mark_done(start);
-        let mut last = start;
-        for i in 1..ROUNDS {
-            let gap = RELAY_UPDATE_ROUNDS_SECS[i] - RELAY_UPDATE_ROUNDS_SECS[i - 1];
-            assert!(!r.finished());
-            assert_eq!(r.rounds_done(), i);
-            assert!(!r.due(last + gap - 1), "round {i} early");
-            assert!(r.due(last + gap), "round {i} on time");
-            last += gap;
-            r.mark_done(last);
+    fn a_dial_addresses_only_the_rounds_phones_still_enrolled() {
+        let dk = [0xD0u8; 32];
+        let mut table = PhoneSet::default();
+        for id in [1u32, 2, 3] {
+            table.enrol(id, "p", &[id as u8; 32], &dk, &[0u8; 12]).unwrap();
         }
-        assert_eq!(last - start, RELAY_UPDATE_ROUNDS_SECS[ROUNDS - 1], "the table is cumulative");
-        assert!(r.finished());
-        assert!(!r.due(u64::MAX));
-        assert!(RELAY_UPDATE_ROUNDS_SECS.windows(2).all(|w| w[0] < w[1]));
+        let round = [1u32, 2];
+        let ids: Vec<u32> = round_phones(&round, &table).map(|r| r.id).collect();
+        assert_eq!(ids, [1, 2], "3 enrolled mid-round is not added");
+        table.revoke(2).unwrap();
+        let ids: Vec<u32> = round_phones(&round, &table).map(|r| r.id).collect();
+        assert_eq!(ids, [1], "2 revoked mid-round gets nothing from the next dial");
+        table.revoke(1).unwrap();
+        assert_eq!(round_phones(&round, &table).count(), 0);
+    }
+
+    #[test]
+    fn the_schedule_is_armed_late_and_jittered() {
+        let mut r = UpdateRounds::new();
+        assert!(!r.armed() && !r.due(u64::MAX), "nothing before the board is online");
+        r.arm(1_000, u32::MAX);
+        assert!(r.armed());
+        let first = 1_000 + FIRST_ROUND_MIN_SECS + u64::from(u32::MAX) % (FIRST_ROUND_MAX_SECS - FIRST_ROUND_MIN_SECS + 1);
+        assert!(!r.due(first - 1) && r.due(first));
+        r.arm(5_000, 0);
+        assert!(!r.due(first - 1), "arming twice changes nothing");
+
+        // Bounds of the first delay and of every gap.
+        for draw in [0u32, 1, 7, 1_000, 65_535, u32::MAX] {
+            let mut x = UpdateRounds::new();
+            x.arm(0, draw);
+            let d = (0..).find(|t| x.due(*t)).unwrap();
+            assert!((FIRST_ROUND_MIN_SECS..=FIRST_ROUND_MAX_SECS).contains(&d), "first {d}");
+            for i in 1..ROUNDS {
+                let gap = RELAY_UPDATE_ROUNDS_SECS[i] - RELAY_UPDATE_ROUNDS_SECS[i - 1];
+                let j = jittered_gap(gap, draw);
+                assert!(j >= gap * 3 / 4 && j <= gap * 5 / 4, "gap {i}: {j} for {gap}");
+            }
+        }
+        assert_ne!(jittered_gap(3_600, 1), jittered_gap(3_600, 2), "the draw moves it");
+
+        let mut last = first;
+        for i in 1..ROUNDS {
+            assert_eq!(r.rounds_done(), i - 1);
+            r.mark_done(last, 42);
+            let gap = RELAY_UPDATE_ROUNDS_SECS[i] - RELAY_UPDATE_ROUNDS_SECS[i - 1];
+            let next = last + jittered_gap(gap, 42);
+            assert!(!r.due(next - 1) && r.due(next), "round {}", i + 1);
+            last = next;
+        }
+        r.mark_done(last, 42);
+        assert!(r.finished() && !r.due(u64::MAX));
 
         let mut resumed = UpdateRounds::resume(3);
-        assert!(resumed.due(0), "after a restart the next round goes out at once");
-        resumed.mark_done(10);
-        assert!(!resumed.due(10 + RELAY_UPDATE_ROUNDS_SECS[4] - RELAY_UPDATE_ROUNDS_SECS[3] - 1));
-        assert!(!UpdateRounds::resume(ROUNDS).due(0));
+        assert!(!resumed.due(0), "a resumed schedule waits to be armed too");
+        resumed.arm(0, 0);
+        assert!(resumed.due(FIRST_ROUND_MIN_SECS));
+        assert!(!UpdateRounds::resume(ROUNDS).due(u64::MAX));
     }
 
     #[test]
-    fn the_plan_dials_publish_only_and_never_breaks_the_session_ceiling() {
+    fn the_plan_never_breaks_the_session_ceiling_and_still_converges() {
         let old = urls(&["wss://a.example", "wss://b.example"]);
-        let mut plan = UpdatePlan::new(old.clone(), 0);
-        assert_eq!(plan.next_action(0, 1, false, 2), UpdateAction::StartRound);
-        assert_eq!(plan.begin_round(Ok(1)), RoundStart::Go);
+        let store = Store::with(&old);
+        let mut plan = UpdatePlan::from_boot(drifted(&old, 0, ToldRecord::settled(&old))).unwrap();
+        plan.arm(0, 0);
+        let t = FIRST_ROUND_MIN_SECS;
+        assert!(!plan.in_round());
+        run_round_start(&mut plan, &store, t);
+        assert!(plan.in_round());
 
-        // Primary alone: dial.
+        let primary = Sessions { live: 1, secondary: false, pinned: false };
+        let with_secondary = Sessions { live: 2, secondary: true, pinned: false };
+        let with_pinned = Sessions { live: 2, secondary: false, pinned: true };
+        assert_eq!(plan.next_action(t, primary, 2), UpdateAction::Dial { url: old[0].clone(), step_aside: StepAside::None });
         assert_eq!(
-            plan.next_action(0, 1, false, 2),
-            UpdateAction::Dial { url: old[0].clone(), shed_secondary: false }
+            plan.next_action(t, with_secondary, 2),
+            UpdateAction::Dial { url: old[0].clone(), step_aside: StepAside::Secondary }
         );
-        // Primary and secondary: the secondary steps aside.
-        assert_eq!(
-            plan.next_action(0, 2, true, 2),
-            UpdateAction::Dial { url: old[0].clone(), shed_secondary: true }
-        );
-        // Primary and a pinned relay fill the ceiling: defer, never a third.
-        assert_eq!(plan.next_action(0, 2, false, 2), UpdateAction::Defer);
-        plan.defer(100);
-        assert_eq!(plan.next_action(100 + DEFER_SECS - 1, 1, false, 2), UpdateAction::Wait);
-        assert!(matches!(plan.next_action(100 + DEFER_SECS, 1, false, 2), UpdateAction::Dial { .. }));
 
-        // Even a live session on an old relay is not used: every old relay is dialled.
+        // Primary plus pinned: defer, then after MAX_DEFER_SECS the pinned
+        // session steps aside for one dial. Never a third session.
+        assert_eq!(plan.next_action(t, with_pinned, 2), UpdateAction::Defer);
+        plan.defer(t);
+        assert_eq!(plan.next_action(t + DEFER_SECS - 1, with_pinned, 2), UpdateAction::Wait);
+        assert_eq!(plan.next_action(t + DEFER_SECS, with_pinned, 2), UpdateAction::Defer);
+        plan.defer(t + DEFER_SECS);
+        let late = t + MAX_DEFER_SECS;
+        assert_eq!(
+            plan.next_action(late, with_pinned, 2),
+            UpdateAction::Dial { url: old[0].clone(), step_aside: StepAside::Pinned }
+        );
         plan.dialled(true);
-        assert_eq!(
-            plan.next_action(200, 1, false, 2),
-            UpdateAction::Dial { url: old[1].clone(), shed_secondary: false }
-        );
-        plan.dialled(false);
+        // The pinned relay is back: the wait starts afresh for the next relay.
+        assert_eq!(plan.next_action(late, with_pinned, 2), UpdateAction::Defer);
+        assert_eq!(plan.next_action(late, primary, 2), UpdateAction::Dial { url: old[1].clone(), step_aside: StepAside::None });
+
+        // A tight heap waits, then gives the relay up so the round ends.
+        assert!(!plan.heap_tight(late));
+        assert_eq!(plan.next_action(late + 1, primary, 2), UpdateAction::Wait);
+        assert!(!plan.heap_tight(late + DEFER_SECS));
+        assert!(plan.heap_tight(late + MAX_DEFER_SECS));
         assert_eq!(plan.reached(), 1);
-        assert_eq!(plan.next_action(200, 1, false, 2), UpdateAction::FinishRound);
-        assert_eq!(plan.finish_round(200), 1);
-        assert_eq!(plan.next_action(201, 1, false, 2), UpdateAction::Wait);
-        assert_eq!(plan.next_action(200 + 120, 1, false, 2), UpdateAction::StartRound);
+        assert_eq!(plan.next_action(late + MAX_DEFER_SECS, primary, 2), UpdateAction::FinishRound);
+        assert_eq!(plan.finish_round(late + MAX_DEFER_SECS, 0), 1);
+        assert!(!plan.in_round());
+    }
+
+    fn run_round_start(plan: &mut UpdatePlan, store: &Store, now: u64) {
+        assert_eq!(plan.next_action(now, ONE, 2), UpdateAction::StartRound);
+        assert_eq!(plan.begin_round(record_is(store, plan.expected()).map_err(|_| ()), Ok(alloc::vec![1])), RoundStart::Go);
+        assert_eq!(plan.round_ids(), &[1]);
     }
 
     #[test]
-    fn the_plan_ends_with_no_phones_or_an_unreadable_table() {
+    fn the_plan_ends_with_no_phones_an_unreadable_table_or_record() {
         let old = urls(&["wss://a.example"]);
-        let mut plan = UpdatePlan::new(old.clone(), 0);
-        assert_eq!(plan.begin_round(Ok(0)), RoundStart::NoPhones);
+        let boot = || drifted(&old, 0, ToldRecord::settled(&old));
+        let mut plan = UpdatePlan::from_boot(boot()).unwrap();
+        assert_eq!(plan.begin_round(Ok(true), Ok(Vec::new())), RoundStart::NoPhones);
         assert!(plan.is_over());
-        assert_eq!(plan.next_action(10_000_000, 0, false, 2), UpdateAction::Wait);
-        let mut plan = UpdatePlan::new(old.clone(), 2);
-        assert_eq!(plan.begin_round(Err(())), RoundStart::Unreadable);
+        assert_eq!(plan.next_action(u64::MAX, ONE, 2), UpdateAction::Wait);
+        let mut plan = UpdatePlan::from_boot(boot()).unwrap();
+        assert_eq!(plan.begin_round(Ok(true), Err(())), RoundStart::Unreadable);
         assert!(plan.is_over());
-        assert!(UpdatePlan::new(Vec::new(), 0).is_over(), "no old relays, nothing to do");
-        assert!(UpdatePlan::new(old, ROUNDS).is_over());
+        let mut plan = UpdatePlan::from_boot(boot()).unwrap();
+        assert_eq!(plan.begin_round(Err(()), Ok(alloc::vec![1])), RoundStart::Unreadable);
+        assert!(plan.is_over());
+        assert_eq!(UpdatePlan::from_boot(BootRelays::default()), None);
+        assert!(UpdatePlan::from_boot(drifted(&old, ROUNDS, ToldRecord::settled(&old))).unwrap().is_over());
     }
 
     #[test]
-    fn locked_dials_wait_for_an_idle_pass_clear_of_announcements() {
+    fn locked_dials_follow_the_announcement_one_per_interval() {
         let old = urls(&["wss://a.example", "wss://live.example", "wss://b.example"]);
         let mut d = OldRelayDials::new(&old);
         let live = "wss://LIVE.example/";
-        // Nothing before the first announcement.
-        assert_eq!(d.next(100, true, None, 160, live), None);
-        // The announce went out at 100; the next is due at 160.
-        assert_eq!(d.next(105, true, Some(100), 160, live), None, "too soon after");
-        assert_eq!(d.next(110, false, Some(100), 160, live), None, "a frame or a read this pass");
-        assert_eq!(d.next(131, true, Some(100), 160, live), None, "too close to the next");
-        assert_eq!(d.next(110, true, Some(100), 160, live), Some("wss://a.example"));
-        assert_eq!(d.next(130, true, Some(100), 160, live), Some("wss://a.example"));
-
-        // The live relay is never dialled; each relay rests an interval.
-        d.report("wss://a.example", true, 110);
-        assert_eq!(d.next(111, true, Some(100), 160, live), Some("wss://b.example"));
-        d.report("wss://b.example", true, 111);
-        assert_eq!(d.next(112, true, Some(100), 160, live), None);
-        assert_eq!(
-            d.next(110 + LOCKED_OLD_INTERVAL_SECS, true, Some(110 + LOCKED_OLD_INTERVAL_SECS - 20), 110 + LOCKED_OLD_INTERVAL_SECS + 40, live),
-            Some("wss://a.example")
-        );
+        assert_eq!(d.next(100, false, live), None, "only in the pass that announced");
+        assert_eq!(d.next(100, true, live), Some("wss://a.example"));
+        d.report("wss://a.example", true, 100);
+        assert_eq!(d.next(160, true, live), Some("wss://b.example"), "the live relay is never dialled");
+        d.report("wss://b.example", true, 160);
+        assert_eq!(d.next(220, true, live), None, "each relay rests an interval");
+        assert_eq!(d.next(100 + LOCKED_OLD_INTERVAL_SECS, true, live), Some("wss://a.example"));
     }
 
     #[test]
@@ -1019,7 +1343,11 @@ mod tests {
 
     #[test]
     fn ok_frames_are_counted_once_per_event() {
-        let mut t = OkTally::new(urls(&["e1", "e2", "e3"]));
+        let mut t = OkTally::new();
+        assert!(t.done());
+        for id in ["e1", "e2", "e3"] {
+            t.expect(id.into());
+        }
         t.feed(br#"["OK","e1",true,""]"#);
         t.feed(br#"["OK","e1",true,""]"#);
         t.feed(br#"["OK","e2",false,"blocked: no"]"#);

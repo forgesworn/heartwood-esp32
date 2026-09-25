@@ -546,7 +546,7 @@ pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 //
 // A relay update is a lock announcement in every wire respect: kind 24135, a
-// one-time author, one `h` tag, content sealed as above. Only the sealed `t`
+// one-time author (fresh per round), one `h` tag, content sealed as above. Only the sealed `t`
 // says `"relays"`, which the prompt rule answers with [`Verdict::NotLocked`],
 // and which is as long as `"locked"`, so an update is the same size as that
 // boot's lock announcements. A phone follows `relays` from any message it
@@ -560,10 +560,22 @@ impl LockContext {
     }
 }
 
-/// One message per enrolled phone under `author`: the `h` tag value and the
-/// sealed content of `shared` with that phone's id. Lock announcements and
-/// relay updates both go through here. A board with no phones gets nothing,
-/// and a revoked phone has no record, so nothing here is for it.
+/// One phone's message under `author`: the `h` tag value and the sealed
+/// content of `shared` with that phone's id. Lock announcements and relay
+/// updates both go through here, one phone at a time, so a board never
+/// holds every phone's event at once. `nonce` must be random and fresh.
+pub fn phone_message(
+    rec: &crate::data_key::PhoneRecord,
+    shared: &LockContext,
+    author: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+) -> (String, String) {
+    let ctx = LockContext { id: rec.id, ..shared.clone() };
+    (hint(&rec.phone_key, author), seal_context(&rec.phone_key, author, &ctx, nonce))
+}
+
+/// [`phone_message`] for every enrolled phone. A board with no phones gets
+/// nothing, and a revoked phone has no record, so nothing here is for it.
 pub fn per_phone_messages(
     phones: &crate::data_key::PhoneSet,
     shared: &LockContext,
@@ -574,10 +586,9 @@ pub fn per_phone_messages(
         .records()
         .iter()
         .map(|rec| {
-            let ctx = LockContext { id: rec.id, ..shared.clone() };
             let mut nonce = [0u8; NONCE_LEN];
             rng(&mut nonce);
-            (hint(&rec.phone_key, author), seal_context(&rec.phone_key, author, &ctx, &nonce))
+            phone_message(rec, shared, author, &nonce)
         })
         .collect()
 }

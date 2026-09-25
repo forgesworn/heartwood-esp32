@@ -99,6 +99,71 @@ pub fn phone_count_for_mode(mode: AtRestMode, raw: Option<usize>) -> Option<usiz
     }
 }
 
+/// Everything FIRMWARE_INFO and get_status report about at-rest state,
+/// resolved in one place from raw NVS reads instead of three call sites each
+/// composing `derive_mode`/`phone_count_from_blob`/`phone_count_for_mode`
+/// themselves. Pure — every input is bytes or a length the caller already
+/// read — so it is host-testable without an `EspNvs`.
+///
+/// - `encrypted`: `masters::encryption_at_rest_active`'s result.
+/// - `wrap`, `marker`: the raw `dk_sec` / `at_rest_kind` blobs, if present.
+/// - `phone_blob_len`: `dk_ph`'s `blob_len()` — `None` only when the key is
+///   absent. A read failure when inspecting the key is the caller's to turn
+///   into "damaged" (a length outside anything valid, e.g. `usize::MAX`),
+///   never into `None`/absent, which this treats as an honest zero phones.
+/// - `phone_blob`: the bytes actually read back for `dk_ph`. A length that
+///   disagrees with `phone_blob_len` (oversized beyond the format ceiling, or
+///   a short read) is treated as damage, exactly like a blob that fails to
+///   parse — see the size cases in the tests below.
+pub fn resolve(
+    encrypted: bool,
+    wrap: Option<&[u8]>,
+    marker: Option<&[u8]>,
+    phone_blob_len: Option<usize>,
+    phone_blob: Option<&[u8]>,
+) -> (AtRestMode, Option<usize>) {
+    let mode = derive_mode(encrypted, crate::data_key::secret_kind_from_marker(wrap, marker));
+    let raw_phones = match phone_blob_len {
+        None => Some(0),
+        Some(len) if len > crate::data_key::MAX_PHONES_BLOB_LEN => None,
+        Some(len) => match phone_blob {
+            Some(bytes) if bytes.len() == len => phone_count_from_blob(Some(bytes)),
+            _ => None,
+        },
+    };
+    (mode, phone_count_for_mode(mode, raw_phones))
+}
+
+/// Keys in the reduced status reply a per-identity delegate receives
+/// (`dispatch_mgmt`'s `get_status` arm, `firmware/src/relay.rs`). Kept here,
+/// not just typed out in `relay.rs`, so the fallback-is-a-subset test below
+/// cannot silently drift from what the firmware actually sends — the
+/// property the closed heap-pressure leak depended on.
+pub const DELEGATE_STATUS_KEYS: &[&str] = &[
+    "master_npub_hex",
+    "mode",
+    "capabilities",
+    "slots",
+    "client_storage_ready",
+    "version",
+    "board",
+];
+
+/// Keys in the same delegate's reply when the board is too low on heap to
+/// answer in full (`minimal_status_json`'s `!is_device_op` branch,
+/// `firmware/src/relay.rs`). `truncated` is the one key here that is not in
+/// [`DELEGATE_STATUS_KEYS`]: a structural "this reply was cut down" marker
+/// present on every low-heap reply, device or delegate, that names no data —
+/// not a fact about the owner's board. Every other key here must already be
+/// one the delegate's normal reply carries; see the subset test.
+pub const DELEGATE_STATUS_FALLBACK_KEYS: &[&str] = &[
+    "master_npub_hex",
+    "mode",
+    "version",
+    "board",
+    "truncated",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +267,108 @@ mod tests {
             assert_eq!(phone_count_for_mode(mode, Some(2)), Some(2));
             assert_eq!(phone_count_for_mode(mode, Some(0)), Some(0));
             assert_eq!(phone_count_for_mode(mode, None), None, "{mode:?} must not paper over damage");
+        }
+    }
+
+    fn phone_set_bytes(count: u32) -> Vec<u8> {
+        let dk = [1u8; DK_LEN];
+        let mut set = PhoneSet::default();
+        for i in 0..count {
+            let slot_secret = [i as u8 + 1; SLOT_SECRET_LEN];
+            let nonce = [i as u8; NONCE_LEN];
+            set.enrol(i, "phone", &slot_secret, &dk, &nonce).unwrap();
+        }
+        set.encode()
+    }
+
+    #[test]
+    fn resolve_none_mode_and_no_phones() {
+        assert_eq!(resolve(false, None, None, None, None), (AtRestMode::None, Some(0)));
+        // A wrapper/marker present alongside `encrypted: false` is
+        // inconsistent state, but "none" still wins — no seed is sealed.
+        assert_eq!(
+            resolve(false, Some(b"x"), Some(b"y"), Some(9), Some(b"garbage!!")),
+            (AtRestMode::None, Some(0))
+        );
+    }
+
+    #[test]
+    fn resolve_vault_mode_with_phones() {
+        let bytes = phone_set_bytes(2);
+        let wrap = [0u8; crate::data_key::SECRET_WRAP_LEN];
+        let marker = crate::data_key::encode_secret_kind_marker(
+            crate::data_key::SecretKind::Vault,
+            &wrap,
+        );
+        assert_eq!(
+            resolve(true, Some(&wrap), Some(&marker), Some(bytes.len()), Some(&bytes)),
+            (AtRestMode::Vault, Some(2))
+        );
+    }
+
+    #[test]
+    fn resolve_encrypted_mode_when_the_marker_is_absent() {
+        let wrap = [0u8; crate::data_key::SECRET_WRAP_LEN];
+        assert_eq!(
+            resolve(true, Some(&wrap), None, None, None),
+            (AtRestMode::Encrypted, Some(0))
+        );
+    }
+
+    #[test]
+    fn resolve_phone_count_null_over_an_oversized_blob() {
+        let wrap = [0u8; crate::data_key::SECRET_WRAP_LEN];
+        let marker = crate::data_key::encode_secret_kind_marker(
+            crate::data_key::SecretKind::Pin,
+            &wrap,
+        );
+        let huge = vec![0u8; crate::data_key::MAX_PHONES_BLOB_LEN + 1];
+        let (mode, count) = resolve(
+            true,
+            Some(&wrap),
+            Some(&marker),
+            Some(huge.len()),
+            Some(&huge),
+        );
+        assert_eq!(mode, AtRestMode::Pin);
+        assert_eq!(count, None, "an oversized blob must read as damage, not a count");
+    }
+
+    #[test]
+    fn resolve_phone_count_null_over_a_length_mismatch() {
+        let wrap = [0u8; crate::data_key::SECRET_WRAP_LEN];
+        let marker = crate::data_key::encode_secret_kind_marker(
+            crate::data_key::SecretKind::Pin,
+            &wrap,
+        );
+        // `blob_len` said 50, but only 10 bytes actually came back — a short
+        // or torn read must not be graded against the wrong length.
+        let short = vec![0u8; 10];
+        let (_, count) = resolve(true, Some(&wrap), Some(&marker), Some(50), Some(&short));
+        assert_eq!(count, None);
+    }
+
+    #[test]
+    fn resolve_phone_count_null_over_a_zero_length_blob() {
+        let wrap = [0u8; crate::data_key::SECRET_WRAP_LEN];
+        let marker = crate::data_key::encode_secret_kind_marker(
+            crate::data_key::SecretKind::Pin,
+            &wrap,
+        );
+        // A stored zero-length `dk_ph` cannot happen through `save_phones`
+        // (it removes the key instead), so this is already damage: shorter
+        // than the format's own header.
+        let (_, count) = resolve(true, Some(&wrap), Some(&marker), Some(0), Some(&[]));
+        assert_eq!(count, None);
+    }
+
+    #[test]
+    fn the_delegate_fallback_never_carries_a_key_the_normal_reply_does_not() {
+        for key in DELEGATE_STATUS_FALLBACK_KEYS {
+            assert!(
+                *key == "truncated" || DELEGATE_STATUS_KEYS.contains(key),
+                "{key} is new in the fallback and not in the delegate's normal reply"
+            );
         }
     }
 }

@@ -972,7 +972,10 @@ fn wrap_digest(wrap: &[u8]) -> [u8; SECRET_KIND_DIGEST_LEN] {
     out
 }
 
-fn encode_secret_kind_marker(kind: SecretKind, wrap: &[u8]) -> [u8; SECRET_KIND_MARKER_LEN] {
+/// `pub(crate)`, not private: `at_rest_status`'s tests need a valid marker
+/// bound to an arbitrary fixture wrapper to exercise `resolve` directly,
+/// without duplicating the digest construction.
+pub(crate) fn encode_secret_kind_marker(kind: SecretKind, wrap: &[u8]) -> [u8; SECRET_KIND_MARKER_LEN] {
     let mut out = [0u8; SECRET_KIND_MARKER_LEN];
     out[0] = kind as u8;
     out[1..].copy_from_slice(&wrap_digest(wrap));
@@ -995,19 +998,25 @@ pub fn secret_kind_from_marker(wrap: Option<&[u8]>, marker: Option<&[u8]>) -> Op
     SecretKind::from_u8(marker[0])
 }
 
-/// Write the marker for `kind`, bound to the wrapper currently on flash. A
-/// no-op (`Ok(())`) when there is no wrapper to bind to — nothing sealed,
-/// nothing to mislabel. The write itself IS verified read-back
-/// (`set_verified`, the same discipline as every other durable state change
-/// in this module): a verified write is what makes the digest binding
-/// trustworthy rather than merely hopeful. Firmware treats a write failure
-/// here as non-fatal to the PIN/vault change it rides — see `pin.rs`.
-pub fn write_secret_kind<S: BlobStore>(store: &mut S, kind: SecretKind) -> Result<(), ChangeError> {
+/// Write the marker for `kind`, bound to the wrapper currently on flash.
+/// Returns whether a write happened: `Ok(false)`, not an error, when there is
+/// no wrapper to bind to — nothing sealed, nothing to mislabel — so a caller
+/// (`repair_secret_kind`) can tell "nothing to do" from "did it". The write
+/// itself IS verified read-back (`set_verified`, the same discipline as every
+/// other durable state change in this module): a verified write is what makes
+/// the digest binding trustworthy rather than merely hopeful. Firmware treats
+/// a write failure here as non-fatal to the PIN/vault change it rides — see
+/// `pin.rs`.
+pub fn write_secret_kind<S: BlobStore>(
+    store: &mut S,
+    kind: SecretKind,
+) -> Result<bool, ChangeError> {
     let Some(wrap) = store.get(SECRET_WRAP_KEY)? else {
-        return Ok(());
+        return Ok(false);
     };
     let marker = encode_secret_kind_marker(kind, &wrap);
-    set_verified(store, SECRET_KIND_KEY, &marker, "secret-kind marker read-back")
+    set_verified(store, SECRET_KIND_KEY, &marker, "secret-kind marker read-back")?;
+    Ok(true)
 }
 
 /// Remove the marker (courtesy cleanup on disable — a marker left behind by a
@@ -1028,6 +1037,33 @@ pub fn read_secret_kind<S: BlobStore>(store: &S) -> Option<SecretKind> {
     let wrap = store.get(SECRET_WRAP_KEY).ok()?;
     let marker = store.get(SECRET_KIND_KEY).ok()?;
     secret_kind_from_marker(wrap.as_deref(), marker.as_deref())
+}
+
+/// Self-repair the marker after a successful secret unlock: write the kind
+/// `secret`'s length implies, but only if the current marker is missing or
+/// disagrees. Takes `&Unlocked` — obtainable only from [`unlock_with_secret`]
+/// or [`migrate`] — so this can never run ahead of a proof the secret was
+/// actually correct; a phone-slot unlock ([`unlock_with_data_key`]) never
+/// produces one from a secret at all, so it never reaches this. Returns
+/// whether a write happened, for tests and for callers that want to know.
+///
+/// A no-op, `Ok(false)`, when: the secret's length names neither PIN nor
+/// vault shape ([`SecretKind::from_secret_len`]), the marker already agrees,
+/// or there is no wrapper on flash to bind a new marker to
+/// ([`write_secret_kind`]'s own no-op). At most one write per call: an
+/// already-correct marker is left untouched.
+pub fn repair_secret_kind<S: BlobStore>(
+    store: &mut S,
+    _proof_of_unlock: &Unlocked,
+    secret: &[u8],
+) -> Result<bool, ChangeError> {
+    let Some(kind) = SecretKind::from_secret_len(secret.len()) else {
+        return Ok(false);
+    };
+    if read_secret_kind(store) == Some(kind) {
+        return Ok(false);
+    }
+    write_secret_kind(store, kind)
 }
 
 /// Read the enrolled phones. Absent is an empty set; a damaged blob is `Err`,
@@ -1827,7 +1863,7 @@ mod tests {
     #[test]
     fn writing_the_marker_with_no_wrapper_is_a_noop() {
         let mut m = Mem::default();
-        assert_eq!(write_secret_kind(&mut m, SecretKind::Pin), Ok(()));
+        assert_eq!(write_secret_kind(&mut m, SecretKind::Pin), Ok(false));
         assert!(!m.map.contains_key(SECRET_KIND_KEY));
         assert_eq!(read_secret_kind(&m), None);
     }
@@ -1869,7 +1905,7 @@ mod tests {
             &start,
             &|m| {
                 set_secret(m, PIN_A, &seeds(), None, &CheapKdf, &mut Board::default())?;
-                write_secret_kind(m, SecretKind::Pin)
+                write_secret_kind(m, SecretKind::Pin).map(|_| ())
             },
             &|m, cut, apply| {
                 // Whatever the cut point, the board is safely one of two
@@ -1899,7 +1935,7 @@ mod tests {
             &start.reboot(),
             &|m| {
                 set_secret(m, PIN_B, &seeds(), dk, &CheapKdf, &mut Board::default())?;
-                write_secret_kind(m, SecretKind::Vault)
+                write_secret_kind(m, SecretKind::Vault).map(|_| ())
             },
             &|m, cut, apply| {
                 let a = boot_with(m, PIN_A);
@@ -1957,38 +1993,82 @@ mod tests {
 
     #[test]
     fn self_repair_writes_only_when_the_marker_is_missing_or_wrong() {
-        // Mirrors `pin::try_unlock`'s rule after a successful PIN_UNLOCK,
-        // VAULT_UNLOCK or 24136 operator delivery: fix the marker if it
-        // disagrees with what the secret's length implies, and touch nothing
-        // if it already agrees. Phone-slot unlocks never call this at all —
-        // they go through `unlock_with_data_key`, which never sees a secret.
-        fn repair(m: &mut Mem, secret_len: usize) -> bool {
-            match SecretKind::from_secret_len(secret_len) {
-                Some(kind) if read_secret_kind(m) != Some(kind) => {
-                    write_secret_kind(m, kind).unwrap();
-                    true
-                }
-                _ => false,
-            }
-        }
-
+        // Exercises the real `repair_secret_kind`, not a copy: mirrors
+        // `pin::try_unlock`'s rule after a successful PIN_UNLOCK, VAULT_UNLOCK
+        // or 24136 operator delivery — fix the marker if it disagrees with
+        // what the secret's length implies, and touch nothing if it already
+        // agrees. Phone-slot unlocks never call this at all — they go through
+        // `unlock_with_data_key`, which produces no `Unlocked` from a secret
+        // to prove one was ever entered.
         let mut m = legacy_board(PIN_A);
-        unlock_and_migrate(&mut m, PIN_A).unwrap();
+        let proof = unlock_and_migrate(&mut m, PIN_A).unwrap();
         assert_eq!(read_secret_kind(&m), None, "no marker yet — a legacy board");
 
         // Missing marker: PIN_UNLOCK's secret (PIN_A, 4 bytes) repairs it.
-        assert!(repair(&mut m, PIN_A.len()));
+        assert_eq!(repair_secret_kind(&mut m, &proof, PIN_A), Ok(true));
         assert_eq!(read_secret_kind(&m), Some(SecretKind::Pin));
 
         // Already correct: no further write.
-        assert!(!repair(&mut m, PIN_A.len()));
+        assert_eq!(repair_secret_kind(&mut m, &proof, PIN_A), Ok(false));
 
         // Wrong marker (still "pin" from above; a board mislabelled by an
         // earlier bug, or a re-wrap the marker missed): a 32-byte secret
         // arriving through this same unlock path corrects it to "vault".
-        assert!(repair(&mut m, 32));
+        let vault_key = [0xAAu8; 32];
+        assert_eq!(repair_secret_kind(&mut m, &proof, &vault_key), Ok(true));
         assert_eq!(read_secret_kind(&m), Some(SecretKind::Vault));
-        assert!(!repair(&mut m, 32));
+        assert_eq!(repair_secret_kind(&mut m, &proof, &vault_key), Ok(false));
+    }
+
+    #[test]
+    fn repair_ignores_a_secret_length_that_names_neither_kind() {
+        let mut m = legacy_board(PIN_A);
+        let proof = unlock_and_migrate(&mut m, PIN_A).unwrap();
+        for len in [0, 1, 3, 9, 16, 31, 33] {
+            let junk = vec![0u8; len];
+            assert_eq!(repair_secret_kind(&mut m, &proof, &junk), Ok(false), "len {len}");
+        }
+        assert_eq!(read_secret_kind(&m), None);
+    }
+
+    #[test]
+    fn repair_is_a_noop_with_no_wrapper_on_flash() {
+        let mut m = Mem::default();
+        // A proof the type permits but that names nothing on flash: legal by
+        // the type (`Unlocked`'s fields are public, since callers already
+        // need to read `.seeds`/`.dk` directly), but `write_secret_kind` has
+        // nothing to bind a marker to.
+        let proof = Unlocked { seeds: Vec::new(), dk: None, stale_secret_wrap: false };
+        assert_eq!(repair_secret_kind(&mut m, &proof, PIN_A), Ok(false));
+        assert!(!m.map.contains_key(SECRET_KIND_KEY));
+    }
+
+    #[test]
+    fn migrating_then_repairing_survives_a_cut_at_every_write() {
+        // The exact sequence `pin::try_unlock` runs for a legacy board's
+        // first post-update unlock: verify (no write), migrate (writes the
+        // wrapper and reseals), then self-repair the marker.
+        let start = legacy_board(PIN_A);
+        let writes = sweep(
+            &start,
+            &|m| {
+                let locked = locked_slots(m);
+                let mut u =
+                    unlock_with_secret(m, &locked, PIN_A, &CheapKdf, &mut Board::default())
+                        .map_err(|_| ChangeError::Storage)?;
+                migrate(m, PIN_A, &mut u, &CheapKdf, &mut Board::default())?;
+                repair_secret_kind(m, &u, PIN_A).map(|_| ())
+            },
+            &|m, cut, apply| {
+                assert_eq!(boot_with(m, PIN_A), Some(seeds()), "cut {cut} apply {apply}");
+                // Never landed, or landed correctly — never a wrong claim.
+                assert!(
+                    matches!(read_secret_kind(m), None | Some(SecretKind::Pin)),
+                    "cut {cut} apply {apply}"
+                );
+            },
+        );
+        assert!(writes > 0);
     }
 
     #[test]

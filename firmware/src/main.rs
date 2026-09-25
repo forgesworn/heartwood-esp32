@@ -158,15 +158,14 @@ use secp256k1::Secp256k1;
 ///
 /// `at_rest` ("none"/"pin"/"vault"/"encrypted") and `unlock_phone_count`
 /// (plan G2) let Sapwood's mode chooser stop inferring the mode from side
-/// effects it happened to witness this session. Both are pure reads of
-/// durable state — see `pin::at_rest_mode` and `unlock_phone_count` — so
-/// answering this frame never writes anything, and this is answered before
-/// any PIN or vault key is entered: a locked board is exactly when a manager
-/// most needs to know which kind of unlock it is waiting for. Neither field
-/// names a phone. `unlock_phone_count` is JSON `null`, not `0`, when a
-/// present phone blob fails to parse — damage is never reported as "no
-/// phones" — except when `at_rest` is `"none"`, which always reports `0`
-/// (see `at_rest_status::phone_count_for_mode`).
+/// effects it happened to witness this session. Both come from
+/// `pin::at_rest_status`, a pure read — so answering this frame never writes
+/// anything — and this is answered before any PIN or vault key is entered: a
+/// locked board is exactly when a manager most needs to know which kind of
+/// unlock it is waiting for. Neither field names a phone. `unlock_phone_count`
+/// is JSON `null`, not `0`, when a present phone blob fails to parse — damage
+/// is never reported as "no phones" — except when `at_rest` is `"none"`,
+/// which always reports `0`.
 pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>) -> String {
     let crash = crash_context()
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
@@ -190,11 +189,7 @@ pub fn firmware_info_json(nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDe
             )
         })
         .unwrap_or_default();
-    let at_rest = pin::at_rest_mode(nvs);
-    let unlock_phones = heartwood_common::at_rest_status::phone_count_for_mode(
-        at_rest,
-        unlock_phone_count(nvs),
-    );
+    let (at_rest, unlock_phones) = pin::at_rest_status(nvs);
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
@@ -227,32 +222,6 @@ fn json_usize_or_null(v: Option<usize>) -> String {
         Some(n) => n.to_string(),
         None => "null".to_string(),
     }
-}
-
-/// How many phones are enrolled to unlock this board — read-only, and safe
-/// while locked: phone records are stored unsealed for exactly that reason
-/// (see `heartwood_common::data_key::PhoneRecord`), so this needs no secret
-/// and no unlock. `None` only when a *present* `dk_ph` blob fails to parse —
-/// damage is never reported as zero phones. Sized from the blob's actual
-/// length (`blob_len`, the same idiom `masters::read_blob` uses) rather than
-/// a fixed 2,166-byte stack buffer: this runs in the same low-heap path
-/// `minimal_status_json` exists for, and the ceiling is 16 full records,
-/// while almost every real board holds far fewer. Never discloses which
-/// phones — only the count.
-pub fn unlock_phone_count(
-    nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
-) -> Option<usize> {
-    let len = match nvs.blob_len(heartwood_common::data_key::PHONES_KEY) {
-        Ok(None) => return heartwood_common::at_rest_status::phone_count_from_blob(None),
-        Ok(Some(len)) if len <= heartwood_common::data_key::MAX_PHONES_BLOB_LEN => len,
-        Ok(Some(_)) | Err(_) => return None,
-    };
-    let mut buf = vec![0u8; len.max(1)];
-    let blob = match nvs.get_blob(heartwood_common::data_key::PHONES_KEY, &mut buf) {
-        Ok(Some(bytes)) if bytes.len() == len => Some(bytes),
-        _ => return None,
-    };
-    heartwood_common::at_rest_status::phone_count_from_blob(blob)
 }
 
 /// Minimal JSON string escaping for the small, non-secret breadcrumb labels.

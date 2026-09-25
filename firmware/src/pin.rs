@@ -108,7 +108,7 @@ fn scrub(seeds: &mut [(u8, [u8; 32])]) {
 /// keep working. The write order keeps the board openable by exactly one of
 /// the old and new secret across a power cut at any point
 /// (`data_key::set_secret`, cut-tested on the host). `kind` records which
-/// secret this was, for `at_rest_mode` — see `data_key::write_secret_kind`.
+/// secret this was, for `at_rest_status` — see `data_key::write_secret_kind`.
 fn enable_encryption(
     nvs: &mut EspNvs<NvsDefault>,
     masters: &[LoadedMaster],
@@ -170,22 +170,27 @@ fn disable_encryption(
 }
 
 // ---------------------------------------------------------------------------
-// At-rest mode reporting (FIRMWARE_INFO / get_status)
+// At-rest status reporting (FIRMWARE_INFO / get_status)
 // ---------------------------------------------------------------------------
 //
-// The marker's encode/decode/read/write live in
-// `heartwood_common::data_key` (over `BlobStore`, host-tested there,
-// including the cut-point models). `at_rest_mode` below only reads: it never
-// writes, so answering FIRMWARE_INFO or get_status never does either. It also
-// only ever needs a *shared* `&EspNvs` — the low-heap get_status fallback
-// runs behind a `&SignCtx` and can never obtain a mutable one — which is why
-// this reads both blobs directly rather than going through the `BlobStore`
-// wrapper (`NvsBlobs` demands `&mut`, since its `set`/`remove` do) and hands
-// the bytes to the pure `secret_kind_from_marker`.
+// The decision — mode from the wrap/marker, phone count from `dk_ph`, and how
+// the two combine — lives entirely in `heartwood_common::at_rest_status::
+// resolve` (pure, host-tested, including the size-damage cases). This is the
+// ONE place in firmware that reads the raw bytes and hands them over; it used
+// to be written out at each of the three call sites (FIRMWARE_INFO in
+// `main.rs`, and get_status's full and low-heap-fallback replies in
+// `relay.rs`) separately. It only ever needs a *shared* `&EspNvs` — the
+// low-heap get_status fallback runs behind a `&SignCtx` and can never obtain
+// a mutable one — which is why this reads every blob directly with
+// `get_blob`/`blob_len` rather than going through the `BlobStore` wrapper
+// (`NvsBlobs` demands `&mut`, since its `set`/`remove` do). Never writes.
 
-/// The at-rest mode reported to a manager (FIRMWARE_INFO, get_status).
-pub fn at_rest_mode(nvs: &EspNvs<NvsDefault>) -> heartwood_common::at_rest_status::AtRestMode {
+/// Everything FIRMWARE_INFO and get_status report about at-rest state.
+pub fn at_rest_status(
+    nvs: &EspNvs<NvsDefault>,
+) -> (heartwood_common::at_rest_status::AtRestMode, Option<usize>) {
     let encrypted = crate::masters::encryption_at_rest_active(nvs);
+
     let mut wrap_buf = [0u8; data_key::SECRET_WRAP_LEN];
     let wrap = match nvs.get_blob(data_key::SECRET_WRAP_KEY, &mut wrap_buf) {
         Ok(Some(b)) => Some(b),
@@ -196,8 +201,32 @@ pub fn at_rest_mode(nvs: &EspNvs<NvsDefault>) -> heartwood_common::at_rest_statu
         Ok(Some(b)) => Some(b),
         _ => None,
     };
-    let kind = data_key::secret_kind_from_marker(wrap, marker);
-    heartwood_common::at_rest_status::derive_mode(encrypted, kind)
+
+    // Sized from the blob's actual length (the `masters::read_blob` idiom),
+    // not a fixed 2,166-byte stack buffer — this runs in the same low-heap
+    // path `minimal_status_json` exists for. A `blob_len` failure (distinct
+    // from the key simply being absent) must read as damage, not as an
+    // honest zero phones, so it is turned into a length no real blob can
+    // have rather than passed through as `None`/absent — `resolve` treats
+    // anything past the format ceiling as damage regardless of the exact
+    // value. `safe_len` gates the allocation itself: an oversized or
+    // sentinel length must never size a buffer, only `phone_blob_len`
+    // (unclamped) reaches `resolve`, so it still reports the damage.
+    let phone_blob_len = match nvs.blob_len(data_key::PHONES_KEY) {
+        Ok(len) => len,
+        Err(_) => Some(usize::MAX),
+    };
+    let safe_len = phone_blob_len.filter(|&len| len <= data_key::MAX_PHONES_BLOB_LEN);
+    let mut phone_buf = vec![0u8; safe_len.unwrap_or(0).max(1)];
+    let phone_blob = match safe_len {
+        Some(len) => match nvs.get_blob(data_key::PHONES_KEY, &mut phone_buf) {
+            Ok(Some(b)) if b.len() == len => Some(b),
+            _ => None,
+        },
+        None => None,
+    };
+
+    heartwood_common::at_rest_status::resolve(encrypted, wrap, marker, phone_blob_len, phone_blob)
 }
 
 /// Try to unlock with the PIN or vault key, filling `.secret` in RAM.
@@ -234,6 +263,18 @@ pub fn try_unlock(
         }
     }
 
+    // The secret is now proven correct — `unlock_with_secret` only reads, so
+    // nothing durable has changed yet. Clear the PIN wipe counter here,
+    // before either optional write below (migration, marker self-repair):
+    // every caller already cleared it unconditionally on success (PIN_UNLOCK,
+    // VAULT_UNLOCK, and the relay's 24136 operator delivery all did their own
+    // `clear_failed_attempts` after this function returned `true`), so this
+    // changes nothing observable — except that a power cut during migration
+    // or the marker write can no longer catch the counter mid-way stale,
+    // leaving an owner who just typed the correct PIN still one guess from a
+    // wipe. The three outer calls are gone; this is the only one now.
+    clear_failed_attempts(store.0);
+
     let upgrade_due = unlocked.dk.is_none()
         || locked.iter().any(|&slot| {
             store
@@ -257,21 +298,15 @@ pub fn try_unlock(
 
     // Self-repair the at-rest kind marker: this path is the one place a real
     // PIN or vault key passes through (PIN_UNLOCK, VAULT_UNLOCK, and the
-    // relay's 24136 operator vault delivery all call this function), so its
-    // length settles which kind it is — `SecretKind::from_secret_len` mirrors
-    // the same 4-8-digit-or-32-byte shape check the frame handlers already
-    // enforce before a secret ever reaches here. Fixes a marker a power cut,
-    // a failed write, or a secret changed on firmware without this marker
-    // left missing or wrong. A phone-slot unlock never reaches this function
-    // at all — it calls `data_key::unlock_with_data_key` directly and never
-    // holds a secret to derive a kind from. At most one write: skipped
-    // entirely once the marker already agrees.
-    if let Some(kind) = data_key::SecretKind::from_secret_len(secret.len()) {
-        if data_key::read_secret_kind(&store) != Some(kind) {
-            if let Err(e) = data_key::write_secret_kind(&mut store, kind) {
-                log::warn!("at-rest kind self-repair failed: {e:?}");
-            }
-        }
+    // relay's 24136 operator vault delivery all call this function). `&
+    // unlocked` is the proof: `repair_secret_kind` can only be called with an
+    // `Unlocked`, which only a successful `unlock_with_secret`/`migrate`
+    // produces. A phone-slot unlock never reaches this function at all — it
+    // calls `data_key::unlock_with_data_key` directly, which produces no such
+    // proof from a secret. At most one write: `repair_secret_kind` skips it
+    // once the marker already agrees.
+    if let Err(e) = data_key::repair_secret_kind(&mut store, &unlocked, secret) {
+        log::warn!("at-rest kind self-repair failed: {e:?}");
     }
     true
 }
@@ -307,8 +342,10 @@ pub fn handle_pin_unlock(
 
     if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p)) {
         log::info!("PIN verified — seeds decrypted, device unlocked");
+        // The durable counter is already cleared — `try_unlock` does that
+        // itself, before its own optional writes (see its doc comment). This
+        // is only the in-RAM mirror this loop iteration reads.
         *failed_attempts = 0;
-        clear_failed_attempts(nvs);
         crate::oled::show_change_done(display, "Unlocked", "");
         esp_idf_hal::delay::FreeRtos::delay_ms(500);
         protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
@@ -554,9 +591,9 @@ pub fn handle_vault_unlock(
 
     if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p)) {
         log::info!("Vault key accepted — seeds decrypted, device unlocked");
-        // A prior PIN-attempt counter is meaningless after a successful
-        // vault unlock — clear it so a later PIN attempt starts fresh.
-        clear_failed_attempts(nvs);
+        // A prior PIN-attempt counter is meaningless after a successful vault
+        // unlock; `try_unlock` already clears it, before its own optional
+        // writes.
         crate::oled::show_change_done(display, "Unlocked", "");
         esp_idf_hal::delay::FreeRtos::delay_ms(500);
         protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);

@@ -352,6 +352,12 @@ pub enum CableCard {
     /// answered Expired first, and the cable card arms only once the button
     /// has been seen up, so no hold made for the relay card can answer it.
     Recovery,
+    /// SET_NET_CONFIG: [`CableCard::Recovery`] when the new config keeps the
+    /// stored operator, otherwise [`CableCard::Always`]. A whole-config
+    /// replacement can name another operator, and handing relay management
+    /// to a new key is no recovery the owner needs to force past a relay
+    /// card (`net_config::set_net_config_keeps_operator`).
+    RecoveryIfOperatorKept,
     /// Raises a card only for one command in its payload
     /// (PHONE_UNLOCK_CMD's `enrol`).
     IfEnrol,
@@ -376,10 +382,10 @@ pub fn cable_frame_card(frame_type: u8) -> CableCard {
         | FRAME_TYPE_RESTORE_IDENTITY
         | FRAME_TYPE_DERIVE_IDENTITY
         | FRAME_TYPE_PROVISION_REMOVE => CableCard::Always,
-        FRAME_TYPE_FACTORY_RESET
-        | FRAME_TYPE_SET_NET_CONFIG
-        | FRAME_TYPE_PATCH_NET_CONFIG
-        | FRAME_TYPE_OTA_BEGIN => CableCard::Recovery,
+        FRAME_TYPE_FACTORY_RESET | FRAME_TYPE_PATCH_NET_CONFIG | FRAME_TYPE_OTA_BEGIN => {
+            CableCard::Recovery
+        }
+        FRAME_TYPE_SET_NET_CONFIG => CableCard::RecoveryIfOperatorKept,
         FRAME_TYPE_PHONE_UNLOCK_CMD => CableCard::IfEnrol,
         _ => CableCard::Never,
     }
@@ -409,17 +415,16 @@ mod cable_card_tests {
         ];
         // The owner's way back from a board the relays are holding hostage:
         // these take the screen over rather than wait behind a relay card.
-        let recovery = [
-            FRAME_TYPE_FACTORY_RESET,
-            FRAME_TYPE_SET_NET_CONFIG,
-            FRAME_TYPE_PATCH_NET_CONFIG,
-            FRAME_TYPE_OTA_BEGIN,
-        ];
+        // PATCH_NET_CONFIG cannot touch the operator; SET_NET_CONFIG can, so
+        // it is a recovery only when it keeps the one stored.
+        let recovery = [FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_OTA_BEGIN];
         for t in 0..=u8::MAX {
             let expected = if always.contains(&t) {
                 CableCard::Always
             } else if recovery.contains(&t) {
                 CableCard::Recovery
+            } else if t == FRAME_TYPE_SET_NET_CONFIG {
+                CableCard::RecoveryIfOperatorKept
             } else if t == FRAME_TYPE_PHONE_UNLOCK_CMD {
                 CableCard::IfEnrol
             } else {

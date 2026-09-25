@@ -3323,21 +3323,25 @@ fn poll_usb_frame(
     // for every wrap published to the board), and a board whose network,
     // firmware or whole state needs fixing over the cable must not wait on
     // that, so these take the screen over instead (take_screen_for_recovery).
-    match heartwood_common::phone_unlock::cable_frame_claim(frame.frame_type, &frame.payload) {
-        heartwood_common::phone_unlock::CableClaim::Free => {}
-        heartwood_common::phone_unlock::CableClaim::Card => {
-            if cable_card_refused(ctx) {
-                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
-                // Some of these carry secrets (a PIN, a vault key, a seed).
-                frame.scrub_payload();
-                return true;
-            }
-        }
-        heartwood_common::phone_unlock::CableClaim::Recovery => {
-            if screen_busy(ctx) {
-                take_screen_for_recovery(ctx, sessions);
-            }
-        }
+    // Not here, though: each recovery arm does it straight before its card,
+    // once its handler's checks have passed, so a frame that is refused (a
+    // garbage OTA_BEGIN every second from any host) never costs a relay card
+    // anything. A SET_NET_CONFIG is a recovery only while it keeps the stored
+    // operator; one that hands relay management to another key waits like
+    // any other card.
+    let stored_net_config = (frame.frame_type == FRAME_TYPE_SET_NET_CONFIG)
+        .then(|| crate::net_config_store::read_net_config(ctx.nvs))
+        .flatten();
+    let claim = heartwood_common::phone_unlock::cable_frame_claim(
+        frame.frame_type,
+        &frame.payload,
+        stored_net_config.as_deref(),
+    );
+    if claim == heartwood_common::phone_unlock::CableClaim::Card && cable_card_refused(ctx) {
+        crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+        // Some of these carry secrets (a PIN, a vault key, a seed).
+        frame.scrub_payload();
+        return true;
     }
 
     match frame.frame_type {
@@ -3499,16 +3503,24 @@ fn poll_usb_frame(
         }
 
         // Network reconfig — the handler reboots into the new mode itself on a
-        // wifi save (and simply persists a radio-off save).
+        // wifi save (and simply persists a radio-off save). Recovery arms
+        // (this one only while it keeps the operator) take the screen from
+        // the relay cards straight before their card, after their checks.
         FRAME_TYPE_SET_NET_CONFIG => {
-            crate::net_config_store::handle_set_net_config(
-                usb,
-                &frame.payload,
-                ctx.nvs,
-                ctx.display,
-                ctx.buttons,
-                true,
-            );
+            if let Some(cfg) = crate::net_config_store::check_set_net_config(usb, &frame.payload) {
+                if claim == heartwood_common::phone_unlock::CableClaim::Recovery {
+                    take_screen_for_recovery(ctx, sessions);
+                }
+                crate::net_config_store::confirm_set_net_config(
+                    usb,
+                    &frame.payload,
+                    cfg,
+                    ctx.nvs,
+                    ctx.display,
+                    ctx.buttons,
+                    true,
+                );
+            }
             // The config JSON carries the WiFi password (FW-L3).
             frame.scrub_payload();
         }
@@ -3518,13 +3530,10 @@ fn poll_usb_frame(
         }
 
         FRAME_TYPE_PATCH_NET_CONFIG => {
-            crate::net_config_store::handle_patch_net_config(
-                usb,
-                &frame.payload,
-                ctx.nvs,
-                ctx.display,
-                ctx.buttons,
-            );
+            if let Some(plan) = crate::net_config_store::check_patch_net_config(usb, &frame.payload, ctx.nvs) {
+                take_screen_for_recovery(ctx, sessions);
+                crate::net_config_store::confirm_patch_net_config(usb, plan, ctx.nvs, ctx.display, ctx.buttons);
+            }
             // A `set` password action carries the WiFi password (FW-L3).
             frame.scrub_payload();
         }
@@ -3698,13 +3707,12 @@ fn poll_usb_frame(
         }
 
         // OTA — the finish handler verifies the image and reboots into it.
-        FRAME_TYPE_OTA_BEGIN => crate::ota::handle_ota_begin(
-            usb,
-            &frame.payload,
-            ctx.display,
-            ctx.buttons,
-            &mut ctx.ota_session,
-        ),
+        FRAME_TYPE_OTA_BEGIN => {
+            if let Some(plan) = crate::ota::check_ota_begin(usb, &frame.payload) {
+                take_screen_for_recovery(ctx, sessions);
+                crate::ota::confirm_ota_begin(usb, plan, ctx.display, ctx.buttons, &mut ctx.ota_session);
+            }
+        }
         FRAME_TYPE_OTA_CHUNK => {
             crate::ota::handle_ota_chunk(usb, &frame.payload, ctx.display, &mut ctx.ota_session)
         }
@@ -3784,8 +3792,10 @@ fn poll_usb_frame(
                 reboot_after_state_change("master removed");
             }
         }
-        // Factory reset wipes NVS and reboots inside the handler.
+        // Factory reset wipes NVS and reboots inside the handler. It checks
+        // nothing before its card, so it takes the screen at once.
         FRAME_TYPE_FACTORY_RESET => {
+            take_screen_for_recovery(ctx, sessions);
             crate::provision::handle_factory_reset(usb, ctx.nvs, ctx.display, ctx.buttons)
         }
 
@@ -5638,6 +5648,10 @@ fn resolve_button_card(
             "[relay] approval decided with no relay session and an audit rail owed; {} ask(s) unanswered",
             card.asks.len()
         );
+        // APPROVED went up with the hold, and nothing was done: say so.
+        if index == 0 && matches!(outcome, CardTick::Approved) {
+            show_card_not_done(ctx, "Offline", "Nothing was done");
+        }
         return;
     }
 
@@ -6522,25 +6536,43 @@ fn release_card_screen_hold(ctx: &mut SignCtx, restore_idle_after: Option<Durati
     ctx.network_display_restore_at = restore_idle_after.map(|after| Instant::now() + after);
 }
 
-/// Clear the screen for a cable recovery command (`CableClaim::Recovery`):
-/// every relay card is answered Expired, exactly as if its window had run
-/// (publishing what an expiry publishes on the live sessions), a held result
-/// is let go, and the latched press is cleared. The cable card that follows
-/// arms only once the button has been seen up (approval.rs), so no hold the
-/// owner began for a relay card can answer it: a takeover is never a bait
-/// and switch.
+/// Clear the screen for a cable recovery card (`CableClaim::Recovery`) that
+/// is about to go up, called by its arm in `poll_usb_frame` once the
+/// handler's checks have passed: every relay card is answered Expired,
+/// exactly as if its window had run (publishing what an expiry publishes on
+/// the live sessions), and the latched press is cleared
+/// (`phone_unlock::take_screen_for_recovery`, host-tested). A held result
+/// stays: `poll_usb` draws it again after a recovery card that was denied or
+/// timed out, so a "revoke id N" is never lost to one. The cable card arms
+/// only once the button has been seen up (approval.rs, `button_arm`), so no
+/// hold the owner began for a relay card can answer it: a takeover is never
+/// a bait and switch.
 fn take_screen_for_recovery(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
-    log::warn!(
-        "[relay] cable recovery command takes the screen: {} relay card(s) answered Expired",
-        ctx.button_cards.len()
-    );
-    while !ctx.button_cards.is_empty() {
-        resolve_button_card(ctx, sessions, 0, &CardTick::Expired);
+    let answered = heartwood_common::phone_unlock::take_screen_for_recovery(&mut RelayScreen { ctx, sessions });
+    if answered > 0 {
+        log::warn!("[relay] cable recovery command takes the screen: {answered} relay card(s) answered Expired");
     }
-    if ctx.card_screen_hold.is_some() {
-        release_card_screen_hold(ctx, None);
+}
+
+/// The WiFi loop's screen as a cable recovery card sees it
+/// (`phone_unlock::RecoveryScreen`).
+struct RelayScreen<'r, 'a, 'd, 'b, 's> {
+    ctx: &'r mut SignCtx<'a, 'd, 'b>,
+    sessions: &'s mut [RelaySession],
+}
+
+impl heartwood_common::phone_unlock::RecoveryScreen for RelayScreen<'_, '_, '_, '_, '_> {
+    fn relay_cards(&self) -> usize {
+        self.ctx.button_cards.len()
     }
-    crate::button::clear_press_edge();
+
+    fn expire_front_card(&mut self) {
+        resolve_button_card(self.ctx, self.sessions, 0, &CardTick::Expired);
+    }
+
+    fn clear_press(&mut self) {
+        crate::button::clear_press_edge();
+    }
 }
 
 /// Whether a cable command that puts up its own card must be refused with

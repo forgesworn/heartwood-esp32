@@ -998,18 +998,62 @@ pub enum CableClaim {
 /// [`CableClaim`] for one frame. Only `{"op":"enrol"}` with a valid key
 /// raises a card among the phone commands; list, revoke and
 /// set_announce_operator never do, and a command that does not parse is
-/// answered with an error and no card.
-pub fn cable_frame_claim(frame_type: u8, payload: &[u8]) -> CableClaim {
+/// answered with an error and no card. `stored_net_config` is the stored
+/// network config blob, read for SET_NET_CONFIG only (`None` elsewhere): that
+/// frame is a recovery only when it keeps the stored operator
+/// (`net_config::set_net_config_keeps_operator`), and otherwise an ordinary
+/// card.
+pub fn cable_frame_claim(frame_type: u8, payload: &[u8], stored_net_config: Option<&[u8]>) -> CableClaim {
     use crate::types::CableCard;
     match crate::types::cable_frame_card(frame_type) {
         CableCard::Never => CableClaim::Free,
         CableCard::Always => CableClaim::Card,
         CableCard::Recovery => CableClaim::Recovery,
+        CableCard::RecoveryIfOperatorKept => {
+            if crate::net_config::set_net_config_keeps_operator(payload, stored_net_config) {
+                CableClaim::Recovery
+            } else {
+                CableClaim::Card
+            }
+        }
         CableCard::IfEnrol => match PhoneCmd::parse(payload) {
             Ok(PhoneCmd::Enrol { .. }) => CableClaim::Card,
             _ => CableClaim::Free,
         },
     }
+}
+
+/// The screen as a cable recovery card finds it in the WiFi-standalone loop
+/// (relay.rs `RelayScreen`): the relay cards up or queued, and the latched
+/// press. There is deliberately no way to reach a held result from here: a
+/// takeover leaves it standing, and `poll_usb` draws it again after the
+/// recovery card, so a "revoke id N" is never lost to one.
+pub trait RecoveryScreen {
+    /// Relay cards on screen or queued behind it.
+    fn relay_cards(&self) -> usize;
+    /// Answer the front relay card Expired, exactly as if its window had run
+    /// (publishing what an expiry publishes).
+    fn expire_front_card(&mut self);
+    /// Drop the latched press edge and release.
+    fn clear_press(&mut self);
+}
+
+/// Take the screen for a cable recovery card ([`CableClaim::Recovery`]) that
+/// is about to go up: called by the handler straight before its approval
+/// loop, after its own parse, signature, revision and authorisation checks,
+/// so a frame that is refused, or garbage, never touches a relay card. Every
+/// relay card is answered Expired, front first, and the latched press is
+/// cleared; the cable card then arms only once the button has been seen up
+/// (`button_arm`), so no hold the owner began for a relay card can answer it.
+/// Returns how many relay cards were answered.
+pub fn take_screen_for_recovery<S: RecoveryScreen + ?Sized>(screen: &mut S) -> usize {
+    // Bounded by the count at the start, whatever an expiry does.
+    let cards = screen.relay_cards();
+    for _ in 0..cards {
+        screen.expire_front_card();
+    }
+    screen.clear_press();
+    cards
 }
 
 /// Enrolment keys already answered this boot. A phone makes a fresh one-off
@@ -1917,7 +1961,7 @@ mod tests {
         use crate::types::*;
         let pk = "ab".repeat(32);
         let enrol = alloc::format!(r#"{{"op":"enrol","enrol_pubkey":"{pk}","label":"p"}}"#);
-        assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, enrol.as_bytes()), CableClaim::Card);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, enrol.as_bytes(), None), CableClaim::Card);
         for other in [
             r#"{"op":"list"}"#,
             r#"{"op":"revoke","id":3}"#,
@@ -1926,15 +1970,106 @@ mod tests {
             "not json",
         ] {
             assert_eq!(
-                cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, other.as_bytes()),
+                cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, other.as_bytes(), None),
                 CableClaim::Free,
                 "{other}"
             );
         }
-        assert_eq!(cable_frame_claim(FRAME_TYPE_CONNSLOT_UPDATE, b""), CableClaim::Card);
-        assert_eq!(cable_frame_claim(FRAME_TYPE_FACTORY_RESET, b""), CableClaim::Recovery);
-        assert_eq!(cable_frame_claim(FRAME_TYPE_SET_NET_CONFIG, b"{}"), CableClaim::Recovery);
-        assert_eq!(cable_frame_claim(FRAME_TYPE_FIRMWARE_INFO, b""), CableClaim::Free);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_CONNSLOT_UPDATE, b"", None), CableClaim::Card);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_FACTORY_RESET, b"", None), CableClaim::Recovery);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_PATCH_NET_CONFIG, b"{}", None), CableClaim::Recovery);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_OTA_BEGIN, b"", None), CableClaim::Recovery);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_FIRMWARE_INFO, b"", None), CableClaim::Free);
+    }
+
+    /// A screen that records what a takeover did to it.
+    struct Screen {
+        cards: alloc::vec::Vec<u32>,
+        expired: alloc::vec::Vec<u32>,
+        press_latched: bool,
+        /// A result held on screen, which a takeover must leave alone.
+        held_result: Option<&'static str>,
+        /// When set, an expiry fails to take the card off (a card that
+        /// could not be answered), to show the takeover still ends.
+        stuck: bool,
+        cleared_after: usize,
+    }
+
+    impl Screen {
+        fn new(cards: &[u32]) -> Self {
+            Screen {
+                cards: cards.to_vec(),
+                expired: alloc::vec::Vec::new(),
+                press_latched: true,
+                held_result: Some("Not sent / revoke id 3"),
+                stuck: false,
+                cleared_after: usize::MAX,
+            }
+        }
+    }
+
+    impl RecoveryScreen for Screen {
+        fn relay_cards(&self) -> usize {
+            self.cards.len()
+        }
+        fn expire_front_card(&mut self) {
+            self.expired.push(self.cards[0]);
+            if !self.stuck {
+                self.cards.remove(0);
+            }
+        }
+        fn clear_press(&mut self) {
+            self.press_latched = false;
+            self.cleared_after = self.expired.len();
+        }
+    }
+
+    #[test]
+    fn a_recovery_takeover_expires_every_relay_card_and_keeps_the_result() {
+        let mut screen = Screen::new(&[7, 8, 9]);
+        assert_eq!(take_screen_for_recovery(&mut screen), 3);
+        assert!(screen.cards.is_empty());
+        assert_eq!(screen.expired, [7, 8, 9], "front first");
+        assert!(!screen.press_latched);
+        assert_eq!(screen.cleared_after, 3, "the press is cleared after the last expiry");
+        assert_eq!(screen.held_result, Some("Not sent / revoke id 3"), "the held result stays");
+    }
+
+    #[test]
+    fn a_takeover_with_no_relay_card_only_clears_the_press() {
+        let mut screen = Screen::new(&[]);
+        assert_eq!(take_screen_for_recovery(&mut screen), 0);
+        assert!(screen.expired.is_empty());
+        assert!(!screen.press_latched);
+        assert!(screen.held_result.is_some());
+    }
+
+    #[test]
+    fn a_takeover_ends_even_if_a_card_will_not_come_off() {
+        let mut screen = Screen::new(&[1, 2]);
+        screen.stuck = true;
+        assert_eq!(take_screen_for_recovery(&mut screen), 2);
+        assert_eq!(screen.expired.len(), 2);
+        assert!(!screen.press_latched);
+    }
+
+    #[test]
+    fn a_network_config_is_a_recovery_only_while_it_keeps_the_operator() {
+        use crate::types::FRAME_TYPE_SET_NET_CONFIG;
+        let config = |op: &str| {
+            alloc::format!(r#"{{"ssid":"s","password":"p","relays":["wss://r.example"],"mode":"wifi","op_mgmt":"{op}"}}"#)
+        };
+        let stored = config(&"ab".repeat(32));
+        let claim = |payload: &str, stored: Option<&str>| {
+            cable_frame_claim(FRAME_TYPE_SET_NET_CONFIG, payload.as_bytes(), stored.map(str::as_bytes))
+        };
+        assert_eq!(claim(&config(&"ab".repeat(32)), Some(&stored)), CableClaim::Recovery);
+        // Handing relay management to another key, or to none, waits behind
+        // a relay card like any other card.
+        assert_eq!(claim(&config(&"cd".repeat(32)), Some(&stored)), CableClaim::Card);
+        assert_eq!(claim(&config(""), Some(&stored)), CableClaim::Card);
+        assert_eq!(claim(&config(&"ab".repeat(32)), None), CableClaim::Card);
+        assert_eq!(claim("{}", Some(&stored)), CableClaim::Card);
     }
 
     #[test]

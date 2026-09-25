@@ -75,7 +75,7 @@ unsafe impl Send for OtaSession {}
 /// button 2 seconds to confirm).  On approval, any half-finished earlier
 /// session is aborted cleanly and the inactive OTA partition is opened.
 /// Sends `OTA_STATUS(READY)` on success or an appropriate error code on
-/// failure.
+/// failure. [`check_ota_begin`] then [`confirm_ota_begin`].
 pub fn handle_ota_begin(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
@@ -83,13 +83,33 @@ pub fn handle_ota_begin(
     buttons: &crate::button::Buttons<'_>,
     session: &mut Option<OtaSession>,
 ) {
+    if let Some(plan) = check_ota_begin(usb, payload) {
+        confirm_ota_begin(usb, plan, display, buttons, session);
+    }
+}
+
+/// An OTA_BEGIN that has passed every check and will raise its card.
+pub struct OtaBeginPlan {
+    total_size: u32,
+    expected_hash: [u8; 32],
+    signature: [u8; 64],
+    partition: *const esp_idf_svc::sys::esp_partition_t,
+}
+
+/// Everything OTA_BEGIN checks before its card: the payload's length, the
+/// release signature over the claimed digest, and a spare slot the image
+/// fits. Answers the host with the error status and returns `None` on the
+/// first failure, so only a frame that will raise its card gets a plan (the
+/// WiFi loop takes the screen from a relay card only then; a garbage
+/// OTA_BEGIN touches nothing).
+pub fn check_ota_begin(usb: &mut SerialPort<'_>, payload: &[u8]) -> Option<OtaBeginPlan> {
     // Validate payload length: 4 bytes size + 32 bytes hash + 64 bytes
     // signature. The old 36-byte unsigned form gets a distinct error so hosts
     // can tell "update your tooling" apart from a malformed frame.
     if payload.len() == 36 {
         log::warn!("OTA_BEGIN: unsigned legacy payload — signature required");
         send_ota_status(usb, OTA_STATUS_ERR_SIG, "Signature required");
-        return;
+        return None;
     }
     if payload.len() != 100 {
         log::warn!(
@@ -97,7 +117,7 @@ pub fn handle_ota_begin(
             payload.len()
         );
         send_ota_status(usb, OTA_STATUS_ERR_SIZE, "Bad payload length");
-        return;
+        return None;
     }
 
     let total_size = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -118,7 +138,7 @@ pub fn handle_ota_begin(
     ) {
         log::warn!("OTA_BEGIN: release signature verification failed");
         send_ota_status(usb, OTA_STATUS_ERR_SIG, "Bad signature");
-        return;
+        return None;
     }
 
     // NOTE: no log::info! here -- VFS logging interleaves with framed
@@ -150,8 +170,32 @@ pub fn handle_ota_begin(
             TargetRefusal::ImageTooLarge => OTA_STATUS_ERR_SIZE,
         };
         send_ota_status(usb, code, refusal.reason());
-        return;
+        return None;
     }
+
+    Some(OtaBeginPlan {
+        total_size,
+        expected_hash,
+        signature,
+        partition,
+    })
+}
+
+/// OTA_BEGIN's card for a checked `plan` ([`check_ota_begin`]), then, on
+/// approval, the session.
+pub fn confirm_ota_begin(
+    usb: &mut SerialPort<'_>,
+    plan: OtaBeginPlan,
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    session: &mut Option<OtaSession>,
+) {
+    let OtaBeginPlan {
+        total_size,
+        expected_hash,
+        signature,
+        partition,
+    } = plan;
 
     // Show firmware size and run the approval loop (45 s, 2 s hold — the
     // update is driven from a browser or the Pi, so allow for the operator

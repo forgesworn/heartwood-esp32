@@ -1138,9 +1138,98 @@ mod cable_card_tests {
         // The phone commands split: only a valid enrolment raises a card.
         let pk = "ab".repeat(32);
         let enrol = format!(r#"{{"op":"enrol","enrol_pubkey":"{pk}"}}"#);
-        assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, enrol.as_bytes()), CableClaim::Card);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, enrol.as_bytes(), None), CableClaim::Card);
         for other in [r#"{"op":"list"}"#, r#"{"op":"revoke","id":1}"#, r#"{"op":"set_announce_operator","on":false}"#] {
-            assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, other.as_bytes()), CableClaim::Free, "{other}");
+            assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, other.as_bytes(), None), CableClaim::Free, "{other}");
+        }
+    }
+
+    /// A cable recovery frame takes the screen from the relay cards only
+    /// once it will actually raise its card: never before the dispatch, only
+    /// in a recovery arm, after that arm's checks (inside their `Some`) and
+    /// before the card itself. A garbage OTA_BEGIN every second from any
+    /// host used to cancel every relay card, because the takeover fired on
+    /// the frame type alone. And the takeover never lets a held result go.
+    #[test]
+    fn a_recovery_frame_takes_the_screen_only_straight_before_its_card() {
+        let types = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../common/src/types.rs")).unwrap();
+        let consts: HashMap<String, u8> = types
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix("pub const ")?;
+                let (name, value) = rest.split_once(": u8 = ")?;
+                let hex = value.split(';').next()?.trim().strip_prefix("0x")?;
+                Some((name.to_string(), u8::from_str_radix(hex, 16).ok()?))
+            })
+            .collect();
+        let relay = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/relay.rs")).unwrap();
+        let start = relay.find("fn poll_usb_frame(").expect("poll_usb_frame is in relay.rs");
+        let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
+        let split = body.find("    match frame.frame_type {").expect("the dispatch match");
+        let take = "take_screen_for_recovery(ctx, sessions)";
+        assert!(!body[..split].contains(take), "the screen is taken before the handler has checked the frame");
+
+        let mut arms: Vec<String> = Vec::new();
+        for line in body[split..].lines().skip(1) {
+            if line.starts_with("        FRAME_TYPE_") || line.starts_with("        other =>") {
+                arms.push(String::new());
+            }
+            if let Some(arm) = arms.last_mut() {
+                arm.push_str(line);
+                arm.push('\n');
+            }
+        }
+        let mut taken = Vec::new();
+        for arm in &arms {
+            let pattern = &arm[..arm.find("=>").expect("an arm has =>")];
+            let frames: Vec<u8> = pattern
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| w.starts_with("FRAME_TYPE_"))
+                .map(|name| *consts.get(name).unwrap_or_else(|| panic!("{name} not in types.rs")))
+                .collect();
+            let recovery = frames
+                .iter()
+                .all(|&t| matches!(cable_frame_card(t), CableCard::Recovery | CableCard::RecoveryIfOperatorKept));
+            let Some(at) = arm.find(take) else {
+                assert!(!recovery || frames.is_empty(), "a recovery arm never takes the screen:\n{arm}");
+                continue;
+            };
+            assert!(recovery && !frames.is_empty(), "a non-recovery arm takes the screen:\n{arm}");
+            assert_eq!(arm.matches(take).count(), 1, "one takeover per arm:\n{arm}");
+            // After the checks, inside their `Some`.
+            if let Some(check) = arm.find("::check_") {
+                assert!(check < at, "the screen is taken before the checks:\n{arm}");
+                assert!(arm[..check].contains("if let Some("), "the checks' answer is not what gates the takeover:\n{arm}");
+            }
+            // Before the card.
+            let card = ["::confirm_", "::handle_factory_reset("]
+                .iter()
+                .filter_map(|c| arm.find(c))
+                .min()
+                .unwrap_or_else(|| panic!("no card after the takeover:\n{arm}"));
+            assert!(at < card, "the card goes up before the screen is taken:\n{arm}");
+            taken.extend(frames);
+        }
+        taken.sort_unstable();
+        let mut expected: Vec<u8> = (0..=u8::MAX)
+            .filter(|&t| matches!(cable_frame_card(t), CableCard::Recovery | CableCard::RecoveryIfOperatorKept))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(taken, expected, "every recovery frame, and only those, takes the screen");
+        // A SET_NET_CONFIG that changes the operator is an ordinary card:
+        // its arm takes the screen only for a recovery claim.
+        let set = arms.iter().find(|a| a.starts_with("        FRAME_TYPE_SET_NET_CONFIG")).unwrap();
+        assert!(set.contains("if claim == heartwood_common::phone_unlock::CableClaim::Recovery"), "{set}");
+        // Nothing else in relay.rs takes the screen.
+        assert_eq!(relay.matches(take).count(), arms.iter().filter(|a| a.contains(take)).count());
+
+        // The takeover leaves a held result alone.
+        let def = relay.find("fn take_screen_for_recovery(").expect("take_screen_for_recovery");
+        let def_body = &relay[def..def + relay[def..].find("\n}\n").unwrap()];
+        let imp = relay.find("RecoveryScreen for RelayScreen").expect("the RecoveryScreen impl");
+        let imp_body = &relay[imp..imp + relay[imp..].find("\n}\n").unwrap()];
+        for text in [def_body, imp_body] {
+            assert!(!text.contains("card_screen_hold"), "a takeover touches the held result:\n{text}");
         }
     }
 

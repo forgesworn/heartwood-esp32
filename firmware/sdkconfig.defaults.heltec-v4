@@ -59,7 +59,7 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # Compile ESP-IDF's own C log calls out (Wi-Fi, TLS, NVS, the drivers). With
 # both consoles off above, every one of those lines is formatted and then
 # dropped, and the Rust side is already built with log/release_max_level_off,
-# so this only removes the format strings and call sites: about 59 KB of the
+# so this only removes the format strings and call sites: about 56 KB of the
 # app image, and nothing a V4 user could see changes. A dev build that brings
 # a console back must lift this too (CONFIG_LOG_DEFAULT_LEVEL_INFO=y), or it
 # will stay silent. The colour-panel boards keep their C logs at the default.

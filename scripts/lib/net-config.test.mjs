@@ -37,6 +37,17 @@ test('--op-mgmt names the change the card will show', () => {
 test('a malformed stored operator counts as none', () => {
   assert.equal(buildSetNetConfig(board('zz'), file, { opMgmt: C }).change, 'added')
   assert.equal(buildSetNetConfig(board('zz'), file, { opMgmt: 'none' }).change, 'kept')
+  // The default sends none rather than the malformed value the board refuses.
+  const kept = buildSetNetConfig(board('zz'), file)
+  assert.equal(kept.change, 'kept')
+  assert.equal(JSON.parse(kept.payload.toString()).op_mgmt, '')
+})
+
+test('fallback networks on the board must be restated', () => {
+  const withFallback = { ...board(A), networks: [{ ssid: 'spare', password_set: true }] }
+  assert.throws(() => buildSetNetConfig(withFallback, file), /erase them/)
+  const networks = [{ ssid: 'spare', password: 'pw' }]
+  assert.deepEqual(JSON.parse(buildSetNetConfig(withFallback, { ...file, networks }).payload.toString()).networks, networks)
 })
 
 test('bad input is refused before anything is sent', () => {

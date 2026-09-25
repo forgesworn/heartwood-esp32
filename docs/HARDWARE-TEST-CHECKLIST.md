@@ -2473,9 +2473,10 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
        (as `bench-approval-cards.mjs` step 16 sends it), is refused
        "approval on screen" while the card is still counting down, and the
        same command sent after "Expired" raises its own sign card (decline
-       it; no power cycle needed). Run it without `--secret-file` on an
-       unlocked board: the plaintext path is NACKed outright once the bridge
-       is authenticated, which would look like the refusal. (`SET_PIN` will
+       it; no power cycle needed). Run it on a board no host has authenticated
+       since boot (Sapwood included; restart first if unsure): the plaintext
+       path is NACKed outright once the bridge is authenticated, which would
+       look like the refusal. (`SET_PIN` will
        not do: the WiFi loop NACKs it while notes are held; nor will
        `CONNSLOT_UPDATE`, which needs bridge auth.)
     g. After the cable enrol card of step 11 (45 s with the loop held), the
@@ -2508,7 +2509,7 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     script copies op_mgmt from the board and prints the card to expect).
     Repeat with `PATCH_NET_CONFIG` (`net-relays.mjs --relays` naming the
     current list), a correctly signed `OTA_BEGIN` (the `ota` tool) and
-    `FACTORY_RESET` (Sapwood's factory reset; no bench script sends 0x24), declining each: the relay card is answered Expired at once (its client
+    `FACTORY_RESET` (`node scripts/factory-reset-card.mjs --port <port>`), declining each: the relay card is answered Expired at once (its client
     or the operator gets the usual expiry), and the cable card comes up
     but does not start its hold bar while the button is still down; only a
     fresh press after letting go counts. Then, each with a relay card up:
@@ -2522,8 +2523,10 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
       is refused "approval on screen", like 10b. Sent with no card up, its
       card reads "Replace operator?" with the new key's first 8 hex digits
       and "+network" (or "Remove operator?"); decline it. On a USB-bridged
-      board the same card appears. One whose `op_mgmt` is not 64 hex digits
-      is NACKed "invalid config" with no card;
+      board the same card appears. With no relay card up, one whose `op_mgmt`
+      is not a 64 hex digit public key is NACKed "invalid config" with no
+      card (under a relay card it reads as an operator removal and is
+      refused "approval on screen"; no bench script sends one);
     - with a result younger than 20 s on screen (PHONE ADDED, or "Not sent /
       revoke id N"), a `FACTORY_RESET` still raises its card; decline it,
       and the result comes back about 2 s later and waits for a press.

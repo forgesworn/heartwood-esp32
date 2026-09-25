@@ -12,8 +12,9 @@
 // --set-config <file.json> [--op-mgmt <64 hex>|none] sends a whole-config
 // SET_NET_CONFIG (0x54) instead, for the bench steps that need one (checklist
 // section 29 step 10d). The file holds { ssid, password, relays, mode,
-// networks? } with the real password (the board only says whether one is
-// set); op_mgmt is copied from the board unless --op-mgmt names another key or
+// networks? } with the real passwords (the board only says whether one is
+// set); networks is required when the board holds fallbacks, since this
+// frame replaces them; op_mgmt is copied from the board unless --op-mgmt names another key or
 // none. The script prints the card the board should show: "Set network
 // config?" when the operator is kept (a recovery, which takes the screen from
 // a relay card), otherwise "New operator?", "Replace operator?" or "Remove
@@ -26,7 +27,6 @@ import { argv, env } from 'node:process'
 import { ACK, NACK } from './lib/frame.mjs'
 import { buildSetNetConfig, SET_NET_CONFIG } from './lib/net-config.mjs'
 import { openFramedPort } from './lib/port.mjs'
-import { startPressPrompt } from './press-prompt.mjs'
 
 const GET_NET_CONFIG = 0x5c
 const GET_NET_CONFIG_RESPONSE = 0x5d
@@ -81,9 +81,10 @@ try {
   process.exit(2)
 }
 console.log(`operator ${built.change}; the card should read: ${built.title.replace('\n', ' / ')}`)
-const stopPrompt = startPressPrompt('the network config card')
+// No spoken press prompt: most bench uses of this card are declines, and the
+// owner follows the voice (see factory-reset-card.mjs).
+console.log('decide on the device (the checklist step says whether to approve)')
 const answer = await session.requestApproval(SET_NET_CONFIG, [ACK], { payload: built.payload, timeoutMs: 70_000 })
-stopPrompt()
 // The payload carries the WiFi password.
 built.payload.fill(0)
 session.close()

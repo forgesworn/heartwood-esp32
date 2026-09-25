@@ -652,8 +652,10 @@ is always a press on the board, whichever way the request arrives:
   mode ("Replace operator?" with the new key's first 8 hex digits, as the
   `SET_OPERATOR` card says it, "New operator?" where there was none, or
   "Remove operator?", where a plain network change reads "Set network
-  config?"). One whose `op_mgmt` is not empty and not 64 hex digits is
-  refused "invalid config" before any card. The other card-raising frames
+  config?"). With no relay card up, one whose `op_mgmt` is not empty and
+  not a 64 hex digit x-only public key is refused "invalid config" before
+  any card; under a relay card it reads as a removal and is refused
+  "approval on screen". The other card-raising frames
   (identity, PIN, vault, operator, slots, backups, NIP-46) stay refused:
   none is needed to get a board back. And a relay card no longer outlives
   a WiFi outage: the loop's WiFi-down waits tick it with no session, so it

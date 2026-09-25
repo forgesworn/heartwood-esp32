@@ -23,6 +23,10 @@ const reply = await session.requestApproval(FACTORY_RESET, [ACK], { timeoutMs: 4
 session.close()
 const seconds = Math.round((Date.now() - started) / 1000)
 if (!reply) { console.error(`no reply after ${seconds} s`); process.exit(1) }
-if (reply.type === NACK) { console.log(`NACK after ${seconds} s: refused, nothing erased`); process.exit(0) }
+// Only an empty NACK is a denial or timeout. A reason means something else:
+// "erase_failed" follows an APPROVED reset whose erase is being retried.
+const reason = reply.type === NACK ? reply.payload.toString() : ''
+if (reply.type === NACK && reason === '') { console.log(`NACK after ${seconds} s: refused, nothing erased`); process.exit(0) }
+if (reply.type === NACK) { console.error(`NACK "${reason}" after ${seconds} s: not a denial; check the board`); process.exit(1) }
 console.log(`ACK after ${seconds} s: the device approved the reset and is erasing`)
 process.exit(1)

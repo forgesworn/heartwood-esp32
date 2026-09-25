@@ -14,7 +14,11 @@ export const SET_NET_CONFIG = 0x54
 
 const HEX64 = /^[0-9a-fA-F]{64}$/
 
-/** The key the board would use for `op`, lowercased, or null for none. */
+/**
+ * The key the board would use for `op`, lowercased, or null for none. The
+ * board also needs it to be a curve point; this does not check that, so an
+ * off-curve key is predicted as a key but NACKed "invalid config".
+ */
 function operatorKey(op) {
   return typeof op === 'string' && HEX64.test(op) ? op.toLowerCase() : null
 }
@@ -35,8 +39,17 @@ export function buildSetNetConfig(current, file, { opMgmt } = {}) {
   const relays = file.relays ?? []
   if (!Array.isArray(relays) || relays.some((r) => typeof r !== 'string')) throw new Error('relays must be a list of URLs')
 
+  // SET_NET_CONFIG replaces the fallback list too, and GET_NET_CONFIG serves
+  // it without passwords, so it cannot be copied: the file must restate it.
+  const stored = Array.isArray(current.networks) ? current.networks.length : 0
+  if (stored > 0 && file.networks === undefined) {
+    throw new Error(`the board holds ${stored} fallback network(s); list them under "networks" in the file (with passwords), or this would erase them`)
+  }
+
   let op
-  if (opMgmt === undefined) op = current.op_mgmt ?? ''
+  // A stored operator that is not 64 hex digits is no operator, and the board
+  // now refuses one in a frame: send none, which it also reads as unchanged.
+  if (opMgmt === undefined) op = operatorKey(current.op_mgmt) ?? ''
   else if (opMgmt === 'none') op = ''
   else if (HEX64.test(opMgmt)) op = opMgmt.toLowerCase()
   else throw new Error('--op-mgmt takes 64 hex digits or "none"')

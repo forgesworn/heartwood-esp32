@@ -223,7 +223,7 @@ fn draw_notes<D: DrawTarget<Color = Rgb565>>(d: &mut D, held: usize, received: u
 }
 
 /// Signing request: hold-to-sign header, app label, friendly kind label, kind
-/// number, and countdown bar (mirrors `oled::show_sign_request`).
+/// number, and countdown bar (mirrors `oled::show_sign_request_as`).
 fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     d: &mut D,
     label: &str,
@@ -715,6 +715,44 @@ mod error_card_tests {
 
         assert!(checked > 0, "scan found no show_error literals — the parser has drifted");
         assert!(offenders.is_empty(), "clipped error cards:\n  {}", offenders.join("\n  "));
+    }
+
+    /// `oled::show_sign_request` dropped its `_content_preview` and drew "HOLD
+    /// TO SIGN" over a kind name, so a destructive card built on it hides what
+    /// the hold does. The factory reset card read "HOLD TO SIGN / Factory /
+    /// Profile / kind 0" and never showed the word ERASE; the removal-journal
+    /// wipe card made the same mistake and cost an owner every key
+    /// (2026-08-19). The renderer is gone; this stops it, or a caller of the
+    /// old name, coming back. Signing screens use `show_sign_request_as`.
+    #[test]
+    fn no_card_is_drawn_with_the_preview_dropping_sign_renderer() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src");
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("firmware/src is readable") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") || name == "oled.rs" {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("source is readable");
+            for (at, _) in source.match_indices("show_sign_request(") {
+                let line = source[..at].lines().count() + 1;
+                offenders.push(format!("{name}:{line}"));
+            }
+        }
+        assert!(offenders.is_empty(), "cards drawn with show_sign_request:\n  {}", offenders.join("\n  "));
+    }
+
+    /// The factory reset card must say it erases, in words drawn on screen.
+    #[test]
+    fn factory_reset_card_says_erase() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/provision.rs");
+        let source = std::fs::read_to_string(path).expect("provision.rs is readable");
+        let start = source.find("pub fn handle_factory_reset(").expect("handle_factory_reset exists");
+        let body = &source[start..];
+        let card = &body[..body.find("match result").expect("approval result is matched")];
+        assert!(card.contains("show_titled_approval("), "factory reset card must use a titled renderer");
+        assert!(card.contains("ERASE ALL KEYS"), "factory reset card must say ERASE ALL KEYS");
     }
 
     /// Every double-quoted literal in `region`, returned without its quotes.

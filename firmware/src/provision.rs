@@ -1007,9 +1007,12 @@ pub fn handle_remove(
         return false;
     };
     let npub = encode_npub(&master.pubkey);
-    let detail = format!("slot {slot} {}…", &npub[..12]);
+    // A titled card, never show_sign_request: that renderer drops its preview
+    // and reads "HOLD TO SIGN", so the npub this comment promises was never
+    // drawn and the hold looked like a signature.
+    let detail = format!("ERASE slot {slot}\n{}…", &npub[..12]);
     let approval = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
-        oled::show_sign_request(d, "REMOVE IDENTITY", 0, &detail, remaining);
+        oled::show_titled_approval(d, "REMOVE IDENTITY", &detail, remaining, 30);
     });
     if !matches!(approval, crate::approval::ApprovalResult::Approved) {
         log::info!("PROVISION_REMOVE slot {slot} denied or timed out on device");
@@ -1106,7 +1109,10 @@ pub fn handle_factory_reset(
         buttons,
         30,
         |d, remaining| {
-            crate::oled::show_sign_request(d, "FACTORY", 0, "ERASE ALL DATA?", remaining);
+            // Never show_sign_request: it drops its preview, so this card read
+            // "HOLD TO SIGN / Factory / Profile / kind 0" and never said ERASE
+            // (the 2026-08-19 wipe card in main.rs made the same mistake).
+            crate::oled::show_titled_approval(d, "FACTORY RESET", "ERASE ALL KEYS\nand every pairing", remaining, 30);
         },
     );
 

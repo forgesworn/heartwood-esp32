@@ -599,7 +599,10 @@ fn show_network_feedback(
     // see, and the hold they do make lands on whatever replaced it. Found
     // running checklist section 14, where a RECEIVE card was clobbered by
     // the wifi-standalone screen mid-decision.
-    if approval_card_open(ctx) {
+    // A result held past its first 20 s (PHONE ADDED, waiting on a press)
+    // does not block a status: the status shows, and the result comes back
+    // after it.
+    if screen_busy(ctx) {
         return;
     }
     if wake && !ctx.display_on {
@@ -611,7 +614,11 @@ fn show_network_feedback(
     }
     crate::oled::show_network_status(ctx.display, state);
     ctx.last_activity = Instant::now();
-    ctx.network_display_restore_at = restore_after.map(|delay| Instant::now() + delay);
+    if ctx.card_screen_hold.is_some() {
+        interrupt_held_result(ctx, restore_after.unwrap_or(Duration::from_secs(3)), false);
+    } else {
+        ctx.network_display_restore_at = restore_after.map(|delay| Instant::now() + delay);
+    }
 }
 
 fn set_network_runtime(
@@ -1292,10 +1299,20 @@ pub fn run_wifi_standalone<'d, 'b>(
         // a scan mid-connection would knock the link off its channel, so a
         // 0x55 during live service is declined (matches the old per-session
         // loop, which lent the driver only in the between-sessions gaps).
-        if sessions.is_empty() {
-            poll_usb(usb, &mut ctx, Some(&mut wifi));
+        let blocked = if sessions.is_empty() {
+            poll_usb(usb, &mut ctx, Some(&mut wifi))
         } else {
-            poll_usb(usb, &mut ctx, None);
+            poll_usb(usb, &mut ctx, None)
+        };
+        if blocked {
+            // A cable card held the loop with nothing reading the relays, as
+            // a relay sign card does inside session_step: count it as heard,
+            // or a quiet relay trips SILENCE_LIMIT and redials straight after.
+            let now = Instant::now();
+            for s in sessions.iter_mut() {
+                s.last_rx = now;
+                s.last_ping = now;
+            }
         }
 
         // Advance any approval card. This is the whole point of holding the
@@ -1601,7 +1618,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         if relay_update.is_some()
             && ctx.network_trial_id.is_none()
             && ctx.ota_session.is_none()
-            && !approval_card_open(&ctx)
+            && !screen_busy(&ctx)
         {
             service_relay_update(
                 &mut relay_update,
@@ -3190,14 +3207,44 @@ fn reboot_after_state_change(reason: &str) {
 /// connect loop), letting a 0x55 scan reuse the already-started radio; it is
 /// `None` while a relay connection is being served, where scanning would knock
 /// the link off its channel — that case declines rather than disrupt signing.
+/// Serve one USB frame, if one is waiting ([`poll_usb_frame`]). True when the
+/// frame held the loop for [`CABLE_BLOCKED`] or more: a cable card, answered
+/// or left to expire, while no relay was read (the caller refreshes the
+/// sessions' silence clocks). A result held on screen is drawn again shortly
+/// after any frame, since the command may have drawn over it; after a
+/// blocking one it also waits for the button to come up, so the release of
+/// that card's hold does not dismiss it.
 fn poll_usb(
     usb: &mut SerialPort<'_>,
     ctx: &mut SignCtx,
     wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
-) {
+) -> bool {
+    let started = Instant::now();
+    if !poll_usb_frame(usb, ctx, wifi) {
+        return false;
+    }
+    let blocked = started.elapsed() >= CABLE_BLOCKED;
+    interrupt_held_result(ctx, HELD_RESULT_REDRAW, blocked);
+    blocked
+}
+
+/// How long a cable frame must hold the loop to count as blocking: longer
+/// than any frame that does not wait on the button.
+const CABLE_BLOCKED: Duration = Duration::from_secs(2);
+
+/// How long something else may stay on screen over a held result before the
+/// result is drawn again.
+const HELD_RESULT_REDRAW: Duration = Duration::from_secs(2);
+
+/// Read and handle one USB frame; false when none was waiting.
+fn poll_usb_frame(
+    usb: &mut SerialPort<'_>,
+    ctx: &mut SignCtx,
+    wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
+) -> bool {
     let mut frame = match crate::protocol::try_read_frame(usb, 0) {
         Some(f) => f,
-        None => return,
+        None => return false,
     };
 
     // USB activity wakes the panel, same as a relay request.
@@ -3469,6 +3516,16 @@ fn poll_usb(
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
         }
         FRAME_TYPE_PHONE_UNLOCK_CMD => {
+            // A new enrolment replaces an earlier result, whatever it comes
+            // to: an older PHONE ADDED drawn again after a declined card
+            // would read as this phone having been added.
+            if matches!(
+                heartwood_common::phone_unlock::PhoneCmd::parse(&frame.payload),
+                Ok(heartwood_common::phone_unlock::PhoneCmd::Enrol { .. })
+            ) && ctx.card_screen_hold.is_some()
+            {
+                release_card_screen_hold(ctx, true);
+            }
             let added = crate::phone_unlock_cmd::handle_frame(
                 usb,
                 &frame.payload,
@@ -3669,6 +3726,7 @@ fn poll_usb(
     // finished is user activity: restart the blank clock so the outcome
     // card gets its full window.
     ctx.last_activity = Instant::now();
+    true
 }
 
 /// Parse one inbound relay message (`["EVENT",sub,ev]` / `EOSE` / `OK` / …).
@@ -4780,21 +4838,39 @@ fn deny_parked(tls: &mut Tls, ctx: &mut SignCtx, park: ParkedRequest) {
 /// its own, longer window ([`card_window`]).
 const CARD_WINDOW: Duration = Duration::from_secs(30);
 
+/// Whether this card adds an unlock phone.
+fn is_enrol_card(card: &ButtonCard) -> bool {
+    card.asks
+        .first()
+        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::PhoneEnrol { .. }))
+}
+
 /// How long this card stays up: [`CARD_WINDOW`], except an unlock phone's
-/// enrol card, which has `phone_unlock::ENROL_CARD_SECS` (60 s) for its five
+/// enrol card, which has `phone_unlock::ENROL_CARD_SECS` (45 s) for its five
 /// words to be read a page at a time and compared with the phone, as the
 /// cable's has.
 fn card_window(card: &ButtonCard) -> Duration {
-    let enrol = card
-        .asks
-        .first()
-        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::PhoneEnrol { .. }));
-    if enrol {
+    if is_enrol_card(card) {
         Duration::from_secs(u64::from(heartwood_common::phone_unlock::ENROL_CARD_SECS))
     } else {
         CARD_WINDOW
     }
 }
+
+/// How long after it opens this card refuses a hold
+/// (`phone_unlock::PressGate`): the enrol card until all its pages have been
+/// shown, every other card not at all.
+fn card_gate_ms(card: &ButtonCard) -> u64 {
+    if is_enrol_card(card) {
+        heartwood_common::phone_unlock::ENROL_GATE_MS
+    } else {
+        0
+    }
+}
+
+// A cable enrol card blocks the relay loop for its whole window; kept under
+// the silence limit, a quiet relay is not taken for a dead one straight after.
+const _: () = assert!((heartwood_common::phone_unlock::ENROL_CARD_SECS as u64) < SILENCE_LIMIT.as_secs());
 
 /// Hold that approves, matching `approval::run_approval_loop`.
 const CARD_HOLD_MS: u32 = 2000;
@@ -5081,6 +5157,10 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         Batch(String, String),
         Enrol([&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS], String),
     }
+    // The enrol card pages on whole seconds since it opened, and its hint
+    // says whether a hold counts yet.
+    let card_elapsed = ctx.button_cards[0].opened_at.map_or(0, |t| t.elapsed().as_secs() as u32);
+    let card_armed = ctx.button_cards[0].armed;
     let card = match &ctx.button_cards[0].asks[0].ask.card {
         crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading } => {
             // The count belongs on screen: one hold answers all of them, and
@@ -5179,6 +5259,8 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             &label,
             remaining,
             heartwood_common::phone_unlock::ENROL_CARD_SECS,
+            card_elapsed,
+            card_armed,
         ),
     }
 }
@@ -5266,12 +5348,24 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     let released = crate::button::take_release();
 
     if !ctx.button_cards[0].armed {
-        if hold_ms == 0 {
+        // The enrol card arms only once every page of its words has been
+        // shown (phone_unlock::ENROL_GATE_MS) and the button has been up
+        // since: a hold on page 1 alone would rest on two words.
+        let gate_ms = card_gate_ms(&ctx.button_cards[0]);
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        if heartwood_common::phone_unlock::PressGate::opens(gate_ms, elapsed_ms, hold_ms > 0) {
             ctx.button_cards[0].armed = true;
+        }
+        // B still cancels an enrol card during its gate: it is the explicit
+        // "no", and that is always the owner's to give.
+        if gate_ms > 0 && ctx.buttons.b_pressed() {
+            ctx.buttons.drain_b();
+            return CardTick::Denied;
         }
         // Both the in-progress hold and its release are discarded until the
         // card is armed, so a press aimed at the idle carousel cannot answer
-        // a card that appeared underneath it.
+        // a card that appeared underneath it, and a tap during the enrol
+        // card's gate neither approves nor declines (nor spends the key).
         draw_button_card(ctx, remaining, 0);
         return CardTick::Pending;
     }
@@ -5668,7 +5762,7 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
                 if ctx.wrap_ledger.decide(&ev.id, ev.created_at) {
                     crate::notes::store_wrap_ledger(&ctx.wrap_ledger.encode());
                 }
-                if created && !approval_card_open(ctx) {
+                if created && !screen_busy(ctx) {
                     if !ctx.display_on {
                         crate::oled::wake_display(ctx.display);
                         ctx.display_on = true;
@@ -5681,7 +5775,12 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
                         &format!("from {bare_host}"),
                     );
                     ctx.last_activity = Instant::now();
-                    ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(3));
+                    if ctx.card_screen_hold.is_some() {
+                        // Over a held result: the banner, then the result again.
+                        interrupt_held_result(ctx, Duration::from_secs(3), false);
+                    } else {
+                        ctx.network_display_restore_at = Some(Instant::now() + Duration::from_secs(3));
+                    }
                 }
             }
             Err(e) => log::warn!("[relay] trusted note refused by the locker: {}", e.code()),
@@ -6212,6 +6311,9 @@ struct ScreenHold {
     since: Instant,
     state: heartwood_common::phone_unlock::ResultHold,
     screen: HeldScreen,
+    /// When to draw the result again, after something drew over it
+    /// ([`interrupt_held_result`]).
+    redraw_at: Option<Instant>,
 }
 
 impl ScreenHold {
@@ -6232,7 +6334,8 @@ fn show_and_hold(ctx: &mut SignCtx, screen: HeldScreen) {
 /// screen returns when the hold ends, not on a timer.
 fn hold_card_screen(ctx: &mut SignCtx, screen: HeldScreen) {
     crate::button::clear_press_edge();
-    ctx.card_screen_hold = Some(ScreenHold { since: Instant::now(), state: Default::default(), screen });
+    ctx.card_screen_hold =
+        Some(ScreenHold { since: Instant::now(), state: Default::default(), screen, redraw_at: None });
     ctx.last_activity = Instant::now();
     ctx.network_display_restore_at = None;
 }
@@ -6259,9 +6362,14 @@ fn service_card_screen_hold(ctx: &mut SignCtx) -> bool {
         // A held result is activity: the panel must not blank under it
         // (DISPLAY_TIMEOUT is 30 s; the hold can last minutes).
         ctx.last_activity = Instant::now();
-        // An auto-approved signing drew its confirmation over the result;
-        // once that has had its own hold, the result comes back.
-        if ctx.display_on && crate::confirm::service(ctx.display) {
+        // Something drew over the result: an auto-approved signing's
+        // confirmation (back once that has had its own hold), a cable
+        // command, a network status or a note banner (back after
+        // interrupt_held_result's delay).
+        let confirm_done = ctx.display_on && crate::confirm::service(ctx.display);
+        let due = hold.redraw_at.is_some_and(|at| Instant::now() >= at) && !crate::confirm::active();
+        if ctx.display_on && (confirm_done || due) {
+            hold.redraw_at = None;
             hold.screen.show(ctx.display);
         }
         return true;
@@ -6282,20 +6390,39 @@ fn release_card_screen_hold(ctx: &mut SignCtx, restore_idle: bool) {
 }
 
 /// Whether a cable command that puts up its own card must be refused with
-/// "approval on screen" because a card owns the screen. A held result gives
-/// way to it once it has stood `phone_unlock::RESULT_HOLD_MS`, as it does to
-/// a relay card queued behind it, so the cable waits no longer than it did
-/// when every result ended then.
-fn cable_card_refused(ctx: &mut SignCtx) -> bool {
-    if ctx.button_cards.is_empty()
-        && ctx
+/// "approval on screen": a card is up, or a result has been held for less
+/// than `phone_unlock::RESULT_HOLD_MS` ([`screen_busy`]). Past that the
+/// command runs over the top of the result, which is drawn again after it
+/// (`poll_usb`), so a command that draws nothing, or is then refused, costs
+/// the result nothing.
+fn cable_card_refused(ctx: &SignCtx) -> bool {
+    screen_busy(ctx)
+}
+
+/// What the owner is reading or deciding now: a card, or a result held for
+/// less than `phone_unlock::RESULT_HOLD_MS`. Background work and unprompted
+/// screens (a relay update round, a network status, a note banner) wait for
+/// this, not for a result that may stay up for minutes; over an older result
+/// they go ahead and it is drawn again after them.
+fn screen_busy(ctx: &SignCtx) -> bool {
+    !ctx.button_cards.is_empty()
+        || ctx
             .card_screen_hold
             .as_ref()
-            .is_some_and(|hold| heartwood_common::phone_unlock::ResultHold::yields(hold.elapsed_ms()))
-    {
-        release_card_screen_hold(ctx, false);
+            .is_some_and(|hold| !heartwood_common::phone_unlock::ResultHold::yields(hold.elapsed_ms()))
+}
+
+/// Something drew over a held result: draw it again `after` from now.
+/// `took_button`: the interruption was a card answered with the button, whose
+/// release must not dismiss the result (`ResultHold::await_release`).
+fn interrupt_held_result(ctx: &mut SignCtx, after: Duration, took_button: bool) {
+    if let Some(hold) = ctx.card_screen_hold.as_mut() {
+        hold.redraw_at = Some(Instant::now() + after);
+        if took_button {
+            hold.state.await_release();
+            crate::button::clear_press_edge();
+        }
     }
-    approval_card_open(ctx)
 }
 
 /// Build the kind-1059 for a `send`: the note as a rumor authored by the

@@ -179,8 +179,8 @@ pub fn run(cmd: PhoneCmd, nvs: &mut EspNvs<NvsDefault>) -> Result<serde_json::Va
 }
 
 /// Enrol over the cable: the blocking card, for `phone_unlock::ENROL_CARD_SECS`
-/// (twice every other card's, for the five words to be read and compared),
-/// then PHONE ADDED. Returns the answer and what PHONE ADDED showed.
+/// (45 s, for the five words to be read a page at a time and compared), gated
+/// until every page has been shown, then PHONE ADDED. Returns the answer and what PHONE ADDED showed.
 fn enrol_on_cable(
     enrol_pubkey: &[u8; 32],
     label: String,
@@ -198,9 +198,17 @@ fn enrol_on_cable(
 
     let words = phone_unlock::request_words(enrol_pubkey);
     let window = phone_unlock::ENROL_CARD_SECS;
-    let approved = crate::approval::run_approval_loop(display, buttons, u64::from(window), |d, remaining| {
-        crate::oled::show_enrol_approval(d, &words, &label, remaining, window);
-    });
+    // No hold counts until every page has been shown (ENROL_GATE_MS); a tap
+    // before then does nothing, so it cannot decline and spend the key.
+    let approved = crate::approval::run_gated_approval_loop(
+        display,
+        buttons,
+        u64::from(window),
+        phone_unlock::ENROL_GATE_MS,
+        |d, remaining, elapsed, armed| {
+            crate::oled::show_enrol_approval(d, &words, &label, remaining, window, elapsed, armed);
+        },
+    );
     if !matches!(approved, crate::approval::ApprovalResult::Approved) {
         return Err("declined on the board".into());
     }

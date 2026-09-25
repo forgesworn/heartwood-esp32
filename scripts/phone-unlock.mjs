@@ -138,12 +138,13 @@ async function relayDeps() {
 const OVER_RELAY = argv.includes('--over-relay')
 
 // A relay enrolment waits on a card: up to 90 s behind other cards (a result
-// screen ahead of it gives way after 20 s), then 60 s on screen. Sent once,
-// like the cable's, and given longer than both.
+// screen ahead of it gives way after 20 s), then 45 s on screen, about 140 s
+// at worst. Sent once, like the cable's, and given a generous margin.
 const RELAY_ENROL_DEADLINE_MS = 180_000
 
-// The cable's enrol card blocks for its 60 s window (twice every other
-// card's, for the five words to be compared with the phone).
+// The cable's enrol card blocks for its 45 s window (the five words shown a
+// page at a time, no hold before all have been shown); twice that, since a
+// command sent while another card is up waits for it first.
 const USB_ENROL_DEADLINE_MS = 90_000
 
 /**

@@ -190,7 +190,7 @@ impl Layout {
 /// mirrored and pixel-checked in ui-preview). Rows are baselines on the
 /// 128x64 canvas, spread by [`Layout::sy`]: on the Heltec the top line's ink
 /// is rows 0-7, the two word lines 9-26 and 28-45, the hint 47-54 and the
-/// countdown 57-62.
+/// countdown row 57-62 (page marker, bar, seconds).
 #[derive(Clone, Copy, Debug)]
 pub struct EnrolGeometry {
     /// The words' font, drawn at `word_scale` (bigtext.rs).
@@ -205,8 +205,11 @@ pub struct EnrolGeometry {
     pub top_y: i32,
     pub word_y: [i32; 2],
     pub hint_y: i32,
-    /// The countdown bar (x, y, width, height), and the baseline and left
-    /// edge of its seconds, all inside the span.
+    /// The countdown row, all inside the span: the page marker ("1-2 of 5")
+    /// from `marker_x`, the bar (x, y, width, height; its outline drawn
+    /// inside it), and the seconds from `secs_x`. Marker and seconds share
+    /// the baseline `secs_y`.
+    pub marker_x: i32,
     pub bar: (i32, i32, i32, i32),
     pub secs_x: i32,
     pub secs_y: i32,
@@ -216,6 +219,10 @@ impl Layout {
     /// Letters in the longest word a card may show (spoken-token's en-v1
     /// list: `heartwood_common::spoken_words::WORDLIST_MAX_LEN`).
     pub const LONGEST_WORD: i32 = 8;
+
+    /// Characters in the longest page marker ("1-2 of 5":
+    /// `heartwood_common::phone_unlock::ENROL_MARKER_MAX_CHARS`).
+    pub const ENROL_MARKER_CHARS: i32 = 8;
 
     /// Width of a place number and the gap after it.
     fn number_band(&self) -> i32 {
@@ -244,6 +251,9 @@ impl Layout {
         let number_x = self.center_in_span(side, block);
         let (left, right) = self.text_span(side);
         let secs_w = 3 * Self::glyph_w(self.font_small());
+        let marker_w = Self::ENROL_MARKER_CHARS * Self::glyph_w(self.font_small());
+        let gap = self.s(2);
+        let bar_x = left + marker_w + gap;
         let bar_h = self.s(6);
         let bar_y = self.sy(57);
         EnrolGeometry {
@@ -254,7 +264,8 @@ impl Layout {
             top_y: self.sy(6),
             word_y: [self.sy(21), self.sy(40)],
             hint_y: self.sy(53),
-            bar: (left, bar_y, right - left - secs_w - self.s(2), bar_h),
+            marker_x: left,
+            bar: (bar_x, bar_y, right - secs_w - gap - bar_x, bar_h),
             secs_x: right - secs_w,
             secs_y: bar_y + bar_h,
         }
@@ -375,7 +386,9 @@ mod tests {
                 let word_w = 8 * Layout::glyph_w(g.word_font) * g.word_scale;
                 assert!(g.number_x >= left && g.word_x + word_w <= right, "{w}x{h} {side:?}");
                 let (bx, by, bw, bh) = g.bar;
-                assert!(bx >= left && bx + bw < g.secs_x && g.secs_x + 15 <= right, "{w}x{h} {side:?}");
+                let marker_w = 8 * Layout::glyph_w(l.font_small());
+                assert!(g.marker_x >= left && g.marker_x + marker_w < bx, "{w}x{h} {side:?}");
+                assert!(bw >= 30 && bx + bw < g.secs_x && g.secs_x + 3 * Layout::glyph_w(l.font_small()) <= right, "{w}x{h} {side:?}");
                 assert!(g.top_y < g.word_y[0] && g.word_y[0] < g.word_y[1] && g.word_y[1] < g.hint_y);
                 assert!(g.hint_y < by && by + bh <= h && g.secs_y <= h, "{w}x{h} {side:?}");
             }

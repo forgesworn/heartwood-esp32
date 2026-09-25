@@ -651,28 +651,76 @@ pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
     alloc::format!("{} {}", &hex[..3], &hex[3..])
 }
 
-/// How long the enrol card stays up, on the cable and over the relay: twice
-/// the 30 s every other card has. The five words are the only defence against
-/// a swapped enrolment key, and on the Heltec's 128x64 OLED the owner reads
-/// them a page at a time and compares each with the phone (bench, 2026-09-25:
-/// at 30 s the card went before they had been read).
-pub const ENROL_CARD_SECS: u32 = 60;
+/// How long the enrol card stays up, on the cable and over the relay: half
+/// as long again as the 30 s every other card has. The five words are the
+/// only defence against a swapped enrolment key, and on the Heltec's 128x64
+/// OLED the owner reads them a page at a time and compares each with the
+/// phone (bench, 2026-09-25: at 30 s the card went before they had been
+/// read). Kept under the relay loop's 50 s silence limit (relay.rs asserts
+/// it), so a cable card that blocks the loop for its whole window does not
+/// make a quiet relay look dead.
+pub const ENROL_CARD_SECS: u32 = 45;
 
 /// How many pages the enrol card steps through: two words a page, so 1 and 2,
 /// then 3 and 4, then 5.
 pub const ENROL_PAGES: usize = REQUEST_CODE_WORDS.div_ceil(2);
 
-/// How long each page of the enrol card stays up before the next. All five
-/// words are shown within 12 s and come round five times in the card's
-/// window, with no press (a press answers the card).
+/// How long each page of the enrol card stays up before the next, with no
+/// press (a press answers the card).
 pub const ENROL_PAGE_SECS: u32 = 4;
 
-/// The page the enrol card shows with `remaining_secs` of `total_secs` left,
-/// as both loops count it (`remaining` is whole seconds, rounded down, so the
-/// first draw sees `total - 1`).
-pub fn enrol_page(total_secs: u32, remaining_secs: u32) -> usize {
-    let elapsed = total_secs.saturating_sub(remaining_secs.saturating_add(1));
-    (elapsed / ENROL_PAGE_SECS) as usize % ENROL_PAGES
+/// How long the enrol card refuses a hold: one full cycle of its pages
+/// (12 s), so no hold can approve before all five words have been on screen.
+/// A hold on page 1 alone would rest on two words, 22 bits, which a
+/// compromised browser grinds in moments.
+pub const ENROL_GATE_MS: u64 = ENROL_PAGES as u64 * ENROL_PAGE_SECS as u64 * 1000;
+
+/// The page the enrol card shows `elapsed_secs` whole seconds after it
+/// opened. Both loops count from their own start of the card, so page 1
+/// lasts 0-3 s on the cable and the relay alike.
+pub fn enrol_page(elapsed_secs: u32) -> usize {
+    (elapsed_secs / ENROL_PAGE_SECS) as usize % ENROL_PAGES
+}
+
+/// The longest page marker, in characters.
+pub const ENROL_MARKER_MAX_CHARS: usize = 8;
+
+/// Where page `page` sits in the code, drawn beside the countdown: "1-2 of
+/// 5", "3-4 of 5", "5 of 5".
+pub fn enrol_page_marker(page: usize) -> &'static str {
+    match page % ENROL_PAGES {
+        0 => "1-2 of 5",
+        1 => "3-4 of 5",
+        _ => "5 of 5",
+    }
+}
+
+/// Whether a card's button counts yet: from `gate_ms` after the card opened,
+/// and from the first moment after that the button is seen up, so a hold (or
+/// a tap) that began before the gate never approves or declines anything.
+/// The enrol card is gated for [`ENROL_GATE_MS`]; a gate of 0 is every other
+/// card's rule, armed as soon as the button is up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PressGate {
+    gate_ms: u64,
+    armed: bool,
+}
+
+impl PressGate {
+    pub fn new(gate_ms: u64) -> Self {
+        PressGate { gate_ms, armed: false }
+    }
+
+    /// Whether a card `elapsed_ms` old may arm now, with the button down or not.
+    pub fn opens(gate_ms: u64, elapsed_ms: u64, button_down: bool) -> bool {
+        elapsed_ms >= gate_ms && !button_down
+    }
+
+    /// One look at the button; true once armed, and it stays armed.
+    pub fn step(&mut self, elapsed_ms: u64, button_down: bool) -> bool {
+        self.armed = self.armed || Self::opens(self.gate_ms, elapsed_ms, button_down);
+        self.armed
+    }
 }
 
 /// What one page of the enrol card draws: a top line naming what is asked,
@@ -712,13 +760,18 @@ pub fn enrol_card(words: &[&str; REQUEST_CODE_WORDS], label: &str, top_max_chars
     }
 }
 
-/// The enrol card's hint line: the question that matters, whether the phone
-/// shows the same words, ahead of the shortest form of the board's button
-/// hint. At most 20 characters, so it fits the Heltec's span clear of its
-/// tag. `tags` is `Some(cancel)` where the board labels its buttons on the
-/// screen edge (with "NO" when there is a cancel button), `None` where it
-/// does not; `button_b` whether a second button cancels.
-pub fn enrol_hint(tags: Option<bool>, button_b: bool) -> &'static str {
+/// The enrol card's hint line. Before the gate ([`PressGate`]) it asks for
+/// the comparison and offers no hold: "compare all 5 words". After it, the
+/// question that matters, whether the phone shows the same words, ahead of
+/// the shortest form of the board's button hint. At most 20 characters, so
+/// it fits the Heltec's span clear of its tag. `tags` is `Some(cancel)`
+/// where the board labels its buttons on the screen edge (with "NO" when
+/// there is a cancel button), `None` where it does not; `button_b` whether a
+/// second button cancels; `armed` whether a hold now counts.
+pub fn enrol_hint(tags: Option<bool>, button_b: bool, armed: bool) -> &'static str {
+    if !armed {
+        return "compare all 5 words";
+    }
     match (tags, button_b) {
         (Some(true), _) => "on phone? hold YES",
         (Some(false), _) => "on phone? hold PRG",
@@ -812,6 +865,13 @@ impl ResultHold {
     /// waiting for the screen.
     pub fn yields(elapsed_ms: u64) -> bool {
         elapsed_ms >= RESULT_HOLD_MS
+    }
+
+    /// Something else took the button over the top of the result (a cable
+    /// card, answered by a hold): ignore presses again until the button has
+    /// been seen up, so that card's release does not dismiss the result.
+    pub fn await_release(&mut self) {
+        self.armed = false;
     }
 
     /// One pass: `button_down` is whether A is held now, `pressed` whether a
@@ -1569,9 +1629,11 @@ mod tests {
     fn the_enrol_hint_fits_the_narrowest_span() {
         for tags in [Some(true), Some(false), None] {
             for b in [true, false] {
-                let hint = enrol_hint(tags, b);
-                assert!(hint.len() <= 20, "{hint}");
-                assert!(hint.starts_with("on phone? "), "{hint}");
+                for armed in [true, false] {
+                    let hint = enrol_hint(tags, b, armed);
+                    assert!(hint.len() <= 20, "{hint}");
+                }
+                assert!(enrol_hint(tags, b, true).starts_with("on phone? "));
             }
         }
     }
@@ -1619,6 +1681,16 @@ mod tests {
             "a button held down forever"
         );
 
+        // Another card's approving hold, over the top of a held result, is
+        // not a press on the result: after await_release its release is
+        // ignored until the button has been seen up.
+        let mut interrupted = ResultHold::default();
+        assert_eq!(interrupted.step(0, false, false, false), HoldStep::Hold);
+        interrupted.await_release();
+        assert_eq!(interrupted.step(30_000, true, false, false), HoldStep::Hold);
+        assert_eq!(interrupted.step(31_000, false, true, false), HoldStep::Hold, "the other card's release");
+        assert_eq!(interrupted.step(32_000, false, true, false), HoldStep::Release, "a fresh press");
+
         // Expiry needs no button state, so the loop can ask it on any pass.
         assert!(!ResultHold::expired(RESULT_HOLD_MAX_MS - 1));
         assert!(ResultHold::expired(RESULT_HOLD_MAX_MS));
@@ -1647,33 +1719,90 @@ mod tests {
     }
 
     #[test]
-    fn the_enrol_card_shows_every_word_many_times_in_its_window() {
-        // Twice the shared 30 s: the owner reads five words off the board
-        // and compares them with the phone.
-        assert_eq!(ENROL_CARD_SECS, 60);
+    fn the_enrol_card_shows_every_word_before_it_can_be_approved() {
+        // Half as long again as the shared 30 s: long enough to read five
+        // words a page at a time and compare them with the phone, and under
+        // the relay loop's 50 s silence limit (asserted in relay.rs), so a
+        // cable card blocking the loop does not make quiet relays redial.
+        assert_eq!(ENROL_CARD_SECS, 45);
         assert_eq!(ENROL_PAGES, REQUEST_CODE_WORDS.div_ceil(2));
-        // The card's first draw (remaining = window - 1) is the first page.
-        assert_eq!(enrol_page(ENROL_CARD_SECS, ENROL_CARD_SECS - 1), 0);
-        // Walk the window a second at a time, as both loops draw it.
-        let pages: Vec<usize> = (0..ENROL_CARD_SECS).rev().map(|r| enrol_page(ENROL_CARD_SECS, r)).collect();
-        // Each page stays up ENROL_PAGE_SECS, then the next, then round.
-        for (i, page) in pages.iter().enumerate() {
-            assert_eq!(*page, (i / ENROL_PAGE_SECS as usize) % ENROL_PAGES, "second {i}");
+        // Pages run on whole seconds since the card opened, the same on the
+        // cable and the relay: page 1 for 0-3 s, page 2 for 4-7, page 3 for
+        // 8-11, then round.
+        let pages: Vec<usize> = (0..ENROL_CARD_SECS).map(enrol_page).collect();
+        for (second, page) in pages.iter().enumerate() {
+            assert_eq!(*page, (second / ENROL_PAGE_SECS as usize) % ENROL_PAGES, "second {second}");
         }
-        // All five words are on screen within the first 12 s, and every page
-        // comes round at least four times before the card expires, with no
-        // press needed.
-        assert!(ENROL_PAGE_SECS as usize * ENROL_PAGES <= 12);
+        // Every run lasts the full dwell, bar the last, which the expiry cuts.
+        let runs: Vec<&[usize]> = pages.chunk_by(|a, b| a == b).collect();
+        assert!(runs[..runs.len() - 1].iter().all(|run| run.len() == ENROL_PAGE_SECS as usize));
+        // The gate is exactly one full cycle: all five words have been on
+        // screen before a hold can count, and the window leaves more than
+        // 30 s to hold after it, while every page comes round twice more.
+        assert_eq!(ENROL_GATE_MS, u64::from(ENROL_PAGE_SECS) * ENROL_PAGES as u64 * 1000);
+        let gate_secs = (ENROL_GATE_MS / 1000) as usize;
+        let before: Vec<usize> = pages[..gate_secs].to_vec();
         for page in 0..ENROL_PAGES {
-            let shown = pages.chunk_by(|a, b| a == b).filter(|run| run[0] == page).count();
-            assert!(shown >= 4, "page {page} shown {shown} times");
+            assert!(before.contains(&page), "page {page} before the gate");
+            let after = pages[gate_secs..]
+                .chunk_by(|a, b| a == b)
+                .filter(|run| run[0] == page && run.len() == ENROL_PAGE_SECS as usize)
+                .count();
+            assert!(after >= 2, "page {page} shown {after} full times after the gate");
         }
-        // Long enough to read two words: every run lasts the full dwell.
-        assert!(pages.chunk_by(|a, b| a == b).all(|run| run.len() == ENROL_PAGE_SECS as usize));
-        // Any window and any remaining value: never a page out of range.
-        for total in [0, 1, 30, 60, 61] {
-            for remaining in 0..=total + 2 {
-                assert!(enrol_page(total, remaining) < ENROL_PAGES);
+        assert!(ENROL_CARD_SECS as usize - gate_secs > 30);
+        // Never a page out of range, however long.
+        for elapsed in [0, 1, 11, 12, 44, 45, 1_000, u32::MAX] {
+            assert!(enrol_page(elapsed) < ENROL_PAGES);
+        }
+    }
+
+    #[test]
+    fn no_hold_that_starts_before_the_gate_approves_the_enrol_card() {
+        let gate = ENROL_GATE_MS;
+        // Untouched: arms at the gate, not before.
+        let mut g = PressGate::new(gate);
+        assert!(!g.step(0, false));
+        assert!(!g.step(gate - 1, false));
+        assert!(g.step(gate, false));
+        assert!(g.step(gate + 5_000, true), "armed stays armed: a hold from here counts");
+        // A short press during the gate is harmless: ignored, not a decline,
+        // and the card still arms once the button is up after the gate.
+        let mut tap = PressGate::new(gate);
+        assert!(!tap.step(3_000, true));
+        assert!(!tap.step(3_300, false));
+        assert!(tap.step(gate, false));
+        // A hold that starts before the gate never counts, however long it
+        // runs past it; only a fresh press after it can.
+        let mut early = PressGate::new(gate);
+        assert!(!early.step(10_000, true));
+        assert!(!early.step(gate, true));
+        assert!(!early.step(gate + 3_000, true), "still the hold that began at 10 s");
+        assert!(early.step(gate + 3_100, false));
+        // No gate: arms as soon as the button is up, as every other card does.
+        let mut none = PressGate::new(0);
+        assert!(!none.step(0, true));
+        assert!(none.step(10, false));
+        assert!(PressGate::opens(gate, gate, false) && !PressGate::opens(gate, gate, true));
+        assert!(!PressGate::opens(gate, gate - 1, false));
+    }
+
+    #[test]
+    fn the_enrol_card_says_where_it_is_and_when_it_can_be_held() {
+        assert_eq!(enrol_page_marker(0), "1-2 of 5");
+        assert_eq!(enrol_page_marker(1), "3-4 of 5");
+        assert_eq!(enrol_page_marker(2), "5 of 5");
+        assert_eq!(enrol_page_marker(ENROL_PAGES), "1-2 of 5");
+        for page in 0..ENROL_PAGES {
+            assert!(enrol_page_marker(page).len() <= ENROL_MARKER_MAX_CHARS);
+        }
+        // Before the gate the hint asks for the comparison and offers no hold.
+        for tags in [Some(true), Some(false), None] {
+            for b in [true, false] {
+                let waiting = enrol_hint(tags, b, false);
+                assert_eq!(waiting, "compare all 5 words");
+                assert!(!waiting.contains("hold") && !waiting.contains("yes"));
+                assert!(enrol_hint(tags, b, true).starts_with("on phone? "));
             }
         }
     }

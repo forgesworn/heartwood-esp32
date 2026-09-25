@@ -964,6 +964,13 @@ fn main() {
     // here, so nothing is refused while it is up: a frame is served as ever,
     // and the result is drawn again once it has been.
     let mut held_result: Option<(Instant, phone_unlock_cmd::Added)> = None;
+    // A frame's card is often answered by a hold that is still down when the
+    // handler returns. Until the button has been seen up (or 10 s, in case a
+    // serial bridge pins GPIO 0 low), that press belongs to the card, not to
+    // whatever is on screen now: it must not dismiss a held PHONE ADDED or a
+    // signing confirmation, or page the carousel. The relay loop's
+    // button_settle, for the cable-only loop.
+    let mut button_settle_until: Option<Instant> = None;
 
     // --- Frame dispatch loop ---
     log::info!("Entering frame dispatch loop");
@@ -1029,7 +1036,12 @@ fn main() {
                     // the cable is re-plugged, and requiring a release made the
                     // device look dead in that state. Waking on press also feels
                     // more immediate on a healthy button.
-                    if buttons.a.is_low() {
+                    if button_settle_until
+                        .is_some_and(|until| !buttons.a.is_low() || Instant::now() >= until)
+                    {
+                        button_settle_until = None;
+                    }
+                    if button_settle_until.is_none() && buttons.a.is_low() {
                         last_activity = Instant::now();
                         if !display_on {
                             oled::wake_display(&mut display);
@@ -1573,6 +1585,10 @@ fn main() {
                 log::warn!("Unknown frame type: 0x{:02x}", frame.frame_type);
                 protocol::write_frame(&mut usb, FRAME_TYPE_NACK, &[]);
             }
+        }
+
+        if buttons.a.is_low() {
+            button_settle_until = Some(Instant::now() + Duration::from_secs(10));
         }
 
         // Reset activity timestamp after every handler returns.  This is

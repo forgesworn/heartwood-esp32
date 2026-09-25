@@ -38,7 +38,29 @@ pub fn run_approval_loop<F>(
 where
     F: FnMut(&mut Display<'_>, u32),
 {
-    let result = approval_loop_inner(display, buttons, timeout_secs, show_fn);
+    let mut show_fn = show_fn;
+    run_gated_approval_loop(display, buttons, timeout_secs, 0, |d, remaining, _, _| show_fn(d, remaining))
+}
+
+/// [`run_approval_loop`] with a press gate (`phone_unlock::PressGate`): the
+/// A button does nothing, neither approving nor declining, until `gate_ms`
+/// after the card opened and the button has been seen up since, so a hold
+/// that starts before the gate never counts however long it runs. B, where
+/// the board has one, still cancels at any time: it is the explicit "no".
+/// `show_fn` gets the remaining seconds, the whole seconds since the card
+/// opened, and whether a hold now counts. Used by the unlock-phone enrol
+/// card, which must show all five words before it can be approved.
+pub fn run_gated_approval_loop<F>(
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    timeout_secs: u64,
+    gate_ms: u64,
+    show_fn: F,
+) -> ApprovalResult
+where
+    F: FnMut(&mut Display<'_>, u32, u32, bool),
+{
+    let result = approval_loop_inner(display, buttons, timeout_secs, gate_ms, show_fn);
     // This loop consumed its presses (and B-cancels) directly off the pins;
     // drop any edge the sampler latched from them, or the approval hold
     // replays in `service_button` and instantly dismisses the very card the
@@ -51,10 +73,11 @@ fn approval_loop_inner<F>(
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
     timeout_secs: u64,
+    gate_ms: u64,
     mut show_fn: F,
 ) -> ApprovalResult
 where
-    F: FnMut(&mut Display<'_>, u32),
+    F: FnMut(&mut Display<'_>, u32, u32, bool),
 {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(timeout_secs);
@@ -62,6 +85,8 @@ where
     let mut pressed = false;
     let mut press_start = Instant::now();
     let mut last_pct: u32 = 101; // force first draw
+    let mut gate = heartwood_common::phone_unlock::PressGate::new(gate_ms);
+    let mut last_armed = gate_ms == 0;
 
     loop {
         crate::wdt::feed();
@@ -72,11 +97,17 @@ where
         }
 
         let remaining = (deadline - now).as_secs() as u32;
+        let elapsed = now.duration_since(start);
+        // No gate (every caller but the enrol card): exactly the loop it
+        // always was, a hold already down when the card appears included.
+        let armed = gate_ms == 0
+            || gate.step(elapsed.as_millis().min(u128::from(u64::MAX)) as u64, buttons.a.is_low());
 
         // Show the caller's screen (countdown) when button is not held.
-        if remaining != last_remaining && !pressed {
-            show_fn(display, remaining);
+        if (remaining != last_remaining || armed != last_armed) && !pressed {
+            show_fn(display, remaining, elapsed.as_secs() as u32, armed);
             last_remaining = remaining;
+            last_armed = armed;
         }
 
         // B button (where present) is an explicit cancel — never an approve.
@@ -85,6 +116,13 @@ where
             crate::oled::show_cancelled(display);
             esp_idf_hal::delay::FreeRtos::delay_ms(500);
             return ApprovalResult::Denied;
+        }
+
+        // Before the gate, A is ignored outright: a tap is not a decline
+        // and a hold is not a start.
+        if !armed {
+            esp_idf_hal::delay::FreeRtos::delay_ms(20);
+            continue;
         }
 
         let mut low = buttons.a.is_low();

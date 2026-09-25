@@ -1108,31 +1108,35 @@ pub fn show_titled_approval(
     }
 }
 
-/// The card that adds an unlock phone. The request code is five words of up
-/// to eight letters, and they are the one thing the owner must read, so the
-/// card shows them a page at a time, as large as the panel allows: words 1
-/// and 2, then 3 and 4, then 5, each page for `phone_unlock::ENROL_PAGE_SECS`
-/// and round again, so all five come round several times in the card's
-/// window with no press (a press answers the card). Each word has a line of
-/// its own with its place in the code beside it, in the font
-/// `Layout::enrol_geometry` picks: FONT_6X10 at 2x on the Heltec, 12 px
-/// letters where the old card drew 6 px ones two to a line. Above them, one
-/// small-font line says what is asked, `ADD "<label>"?` (the label shortened
-/// inside its quotes if the line would overflow); below them, the hint
-/// (`phone_unlock::enrol_hint`, e.g. "on phone? hold PRG") asks whether the
-/// phone shows the same words, then the countdown. Every line and the
-/// countdown stay in the span clear of the button tags (`Layout::text_span`),
-/// so nothing prints over "<PRG" (or "PRG>" with the screen turned round) on
-/// the Heltec or "NO>"/"YES>" on the T-Display. Ink rows on the 128x64
-/// baseline: top line 0-7, words 9-26 and 28-45, hint 47-54, countdown
-/// 57-62. Mirrored in ui-preview (`draw_enrol_card`), which checks the
-/// geometry on every panel, orientation and page.
+/// The card that adds an unlock phone, `elapsed_secs` whole seconds after it
+/// opened. The request code is five words of up to eight letters, and they
+/// are the one thing the owner must read, so the card shows them a page at a
+/// time, as large as the panel allows: words 1 and 2, then 3 and 4, then 5,
+/// each page for `phone_unlock::ENROL_PAGE_SECS` and round again with no
+/// press (`phone_unlock::enrol_page`). Each word has a line of its own with
+/// its place in the code beside it, in the font `Layout::enrol_geometry`
+/// picks: FONT_6X10 at 2x on the Heltec, 12 px letters where the old card
+/// drew 6 px ones two to a line. Above them, one small-font line says what is
+/// asked, `ADD "<label>"?` (the label shortened inside its quotes if the line
+/// would overflow); below them, the hint: "compare all 5 words" until
+/// `armed` (the press gate, one full cycle of pages, has passed and the
+/// button has been up since), then the board's "on phone? hold PRG"
+/// (`phone_unlock::enrol_hint`). Last, the countdown row: the page marker
+/// ("1-2 of 5"), the bar and the seconds. Everything stays in the span clear
+/// of the button tags (`Layout::text_span`), so nothing prints over "<PRG"
+/// (or "PRG>" with the screen turned round) on the Heltec or "NO>"/"YES>" on
+/// the T-Display. Ink rows on the 128x64 baseline: top line 0-7, words 9-26
+/// and 28-45, hint 47-54, countdown row 57-62. Mirrored in ui-preview
+/// (`draw_enrol_card`), which checks the geometry on every panel,
+/// orientation and page.
 pub fn show_enrol_approval(
     display: &mut Display<'_>,
     words: &[&str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS],
     label: &str,
     remaining: u32,
     total_secs: u32,
+    elapsed_secs: u32,
+    armed: bool,
 ) {
     use heartwood_common::phone_unlock;
     let l = layout(display);
@@ -1140,7 +1144,7 @@ pub fn show_enrol_approval(
 
     let side = tag_side();
     let g = l.enrol_geometry(side);
-    let page = phone_unlock::enrol_page(total_secs, remaining);
+    let page = phone_unlock::enrol_page(elapsed_secs);
     let card = phone_unlock::enrol_card(words, label, l.span_chars(side, l.font_small()), page);
     let top = MonoTextStyleBuilder::new()
         .font(l.font_small())
@@ -1162,9 +1166,12 @@ pub fn show_enrol_approval(
 
     let tagged = draw_button_tags(display);
     let b = crate::button::has_button_b();
-    let hint = phone_unlock::enrol_hint(tagged.then_some(b), b);
+    let hint = phone_unlock::enrol_hint(tagged.then_some(b), b, armed);
     Text::new(hint, centred(hint, g.hint_y), muted).draw(display).ok();
 
+    Text::new(phone_unlock::enrol_page_marker(page), Point::new(g.marker_x, g.secs_y), muted)
+        .draw(display)
+        .ok();
     draw_enrol_countdown(display, &g, remaining, total_secs);
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -1172,8 +1179,10 @@ pub fn show_enrol_approval(
 }
 
 /// The enrol card's countdown: the shared bar's outline, urgency colours and
-/// seconds, but lower and inside the span clear of the tags, since the card's
-/// words take the rows the shared bar uses. Mirrored in ui-preview
+/// seconds, but lower, shorter (the page marker leads the row) and inside the
+/// span clear of the tags, since the card's words take the rows the shared
+/// bar uses. The outline is drawn inside the bar, so a thick stroke on a
+/// large panel cannot poke out of it. Mirrored in ui-preview
 /// (`draw_enrol_bar`).
 fn draw_enrol_countdown(
     display: &mut Display<'_>,
@@ -1184,7 +1193,13 @@ fn draw_enrol_countdown(
     let l = layout(display);
     let (x, y, w, h) = g.bar;
     Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32))
-        .into_styled(PrimitiveStyle::with_stroke(MUTED, l.s(1) as u32))
+        .into_styled(
+            embedded_graphics::primitives::PrimitiveStyleBuilder::new()
+                .stroke_color(MUTED)
+                .stroke_width(l.s(1) as u32)
+                .stroke_alignment(embedded_graphics::primitives::StrokeAlignment::Inside)
+                .build(),
+        )
         .draw(display)
         .ok();
     let pct_left = if total > 0 { remaining * 100 / total } else { 0 };

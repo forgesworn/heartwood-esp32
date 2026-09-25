@@ -2465,12 +2465,20 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
        blocks the loop), and after 20 s a cable NIP-46 request is served.
        Then, with the access point still off, raise a relay card just before
        turning it off (an unapproved sign request): the card still counts
-       down, can be declined, and expires on time ("Expired"), after which a
-       cable `SET_NET_CONFIG` or `FACTORY_RESET` raises its own card (no
-       power cycle needed).
+       down, can be declined, and expires on time ("Expired"). To show the
+       expiry is what frees the cable, use a frame that is refused under a
+       relay card, not a recovery frame (those take the screen whatever the
+       card is doing): a cable `SET_PIN` (or `CONNSLOT_UPDATE`) sent while
+       the card is still counting down is refused "approval on screen", and
+       the same frame sent after "Expired" raises its own card (decline it;
+       no power cycle needed).
     g. After the cable enrol card of step 11 (45 s with the loop held), the
        log shows no "silent (no data/pong); reconnecting" for a quiet relay
        straight after, and a ping goes out on the next pass.
+    h. Optional, needs section 11's dependant persona: raise a relay card
+       for that persona's action, turn the access point off, then approve
+       it. The card shows "Offline / Nothing was done", not APPROVED, and
+       once the access point is back no reply and no audit rail go out.
 
 10b. **A cable card cannot answer a relay card.** With a relay enrol card up
     (any page, before or after its gate), send each card-raising cable
@@ -2482,15 +2490,32 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     classification is `phone_unlock::cable_frame_claim`; `ui-preview`'s
     tests check it against every cable arm that can reach the button.)
 
-10d. **Recovery takes the screen over.** With a relay card up (an enrol card
-    mid-gate, then again with a RECEIVE card), start holding PRG for the
-    relay card and, while still holding, send a cable `SET_NET_CONFIG`
-    (repeat with `PATCH_NET_CONFIG`, `OTA_BEGIN` and `FACTORY_RESET`,
+10d. **Recovery takes the screen over.** Only while the relay card is not
+    armed, since a hold on an armed card is followed to its 2 s by the
+    relay loop without reading the cable, and approves it: use an enrol
+    card mid-gate (before "on phone? hold PRG"), or raise a relay card
+    (an unapproved sign request, or a RECEIVE card) while PRG is already
+    held, so the hold began before the card armed. Holding PRG, send a
+    cable `SET_NET_CONFIG` that keeps the stored `op_mgmt` (repeat with
+    `PATCH_NET_CONFIG`, a correctly signed `OTA_BEGIN` and `FACTORY_RESET`,
     declining each): the relay card is answered Expired at once (its client
     or the operator gets the usual expiry), and the cable card comes up
     but does not start its hold bar while the button is still down; only a
-    fresh press after letting go counts. Every other card-raising frame is
-    still refused, as in 10b.
+    fresh press after letting go counts. Then, each with a relay card up:
+    - a `SET_NET_CONFIG` that does not parse, a `PATCH_NET_CONFIG` with a
+      stale `base_revision` and an `OTA_BEGIN` with a bad signature or
+      length (send one a second for 10 s) are each answered with their
+      error and cancel nothing: the relay card keeps counting down and
+      can still be approved;
+    - a `SET_NET_CONFIG` whose `op_mgmt` differs from the stored one (or is
+      empty) is refused "approval on screen", like 10b. Sent with no card
+      up, its card reads "New operator?" with the new key's first 8 hex
+      digits and "+network" (or "Remove operator?"); decline it. On a
+      USB-bridged board the same card appears;
+    - with a result younger than 20 s on screen (PHONE ADDED, or "Not sent /
+      revoke id N"), a `FACTORY_RESET` still raises its card; decline it,
+      and the result comes back about 2 s later and waits for a press.
+    Every other card-raising frame is still refused, as in 10b.
 
 10c. **Time under another screen is not reading time.** Over an
     authenticated cable, send `DISPLAY_FLIP` every 2 s during an enrol

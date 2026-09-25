@@ -622,18 +622,36 @@ is always a press on the board, whichever way the request arrives:
   the button has been seen up with it on screen.
 - **Recovery is never locked out:** anyone can keep a relay card up (a
   RECEIVE card returns for every wrap published to the board), so the
-  owner's recovery commands over the cable, `SET_NET_CONFIG`,
-  `PATCH_NET_CONFIG`, `OTA_BEGIN` and `FACTORY_RESET`, take the screen over
-  instead of being refused: every relay card is answered Expired first
-  (with the reply an expiry always sends), a held result is let go, the
-  latched press is cleared, and the cable card arms only after the button
-  has been seen up, so a hold begun for a relay card cannot answer it. The
-  other card-raising frames (identity, PIN, vault, operator, slots,
-  backups, NIP-46) stay refused: none is needed to get a board back. And a
-  relay card no longer outlives a WiFi outage: the loop's WiFi-down waits
-  tick it with no session, so it still expires on time (an approval made
-  then waits in the #82 outbox), and a card whose window has passed never
-  keeps the cable refused.
+  owner's recovery commands over the cable, `PATCH_NET_CONFIG`,
+  `OTA_BEGIN`, `FACTORY_RESET`, and `SET_NET_CONFIG` while it keeps the
+  stored operator, take the screen over instead of being refused. Only a
+  frame that will actually raise its card does so: the takeover runs
+  straight before the card, after the handler's own checks (the config
+  parses and validates, the patch's revision is current, the image's
+  release signature verifies and it fits a spare slot), so a garbage or
+  refused frame, however often a host sends one, cancels nothing. Every
+  relay card is then answered Expired (with the reply an expiry always
+  sends) and the latched press is cleared; a held result stays, and is
+  drawn again after the recovery card, so a "revoke id N" is not lost to
+  one. The cable card arms only after the button has been seen up, so a
+  hold begun for a relay card cannot answer it. What remains: a host that
+  can send a validly signed OTA_BEGIN (any published release will do) or a
+  FACTORY_RESET can still take the screen, one card at a time, each denied
+  or left to expire by the owner. A `SET_NET_CONFIG` whose `op_mgmt`
+  differs from the stored one hands relay management to another key (or to
+  none), which is no recovery: it is an ordinary card, refused under a
+  relay card, and its card says so in every mode ("New operator?" with the
+  key's first 8 hex digits, or "Remove operator?", where a plain network
+  change reads "Set network config?"). The other card-raising frames
+  (identity, PIN, vault, operator, slots, backups, NIP-46) stay refused:
+  none is needed to get a board back. And a relay card no longer outlives
+  a WiFi outage: the loop's WiFi-down waits tick it with no session, so it
+  still expires on time. An approval made then waits in the #82 outbox for
+  only 60 s (`held_reply::HELD_REPLY_TTL_SECS`) and is dropped if no
+  session takes it by then; a dependant persona's action is not done at
+  all with no session (its C5 audit rail must leave down a live socket),
+  and the card says "Offline / Nothing was done" rather than APPROVED. A
+  card whose window has passed never keeps the cable refused.
 - **The real bound:** a compromised browser holds P from the moment the owner
   pastes the phone's code, before it sends anything, so it can grind a key of
   its own whose five words match for as long as the owner is willing to wait

@@ -280,7 +280,7 @@ They **cannot** extract or replace the master seed, rotate the management trust
 root, disable the radio into USB-only mode, change the boot PIN, or push
 firmware. They can list and revoke unlock phones, but adding one, which would
 be a persistent way to release the data key after a restart, still takes the
-owner's press on the board's card. The card leads with four words derived from
+owner's press on the board's card. The card leads with five words derived from
 the enrolment key, and the owner compares them with the phone that made that
 key, not with the browser: an attacker holding the operator key (or the
 browser itself) can swap in a key of their own, and could show matching words
@@ -572,22 +572,31 @@ is always a press on the board, whichever way the request arrives:
   up, so a replay (live, or after a restart) raises no card. The card is held
   on the deferred-approval queue (#64): 30 s on screen, at most 90 s waiting
   behind other cards, one enrolment at a time, RAM only.
-- **What the owner checks:** both cards lead with the request code, four
+- **What the owner checks:** both cards lead with the request code, five
   words of spoken-token's 2048-word list from the phone's one-off enrolment
   key P (`deriveToken(P, 'heartwood-unlock:enrol-request', 0, {format:
-  'words', count: 4})`, 44 bits), and the owner holds only if the PHONE, which
-  made P, shows the same four words (Cambium support pending). A browser may
+  'words', count: 5})`, 55 bits), and the owner holds only if the PHONE, which
+  made P, shows the same five words (Cambium support pending). A browser may
   show them too, but only as a convenience: whoever relays the request can
-  replace P, and the words in the browser with it. Four words rather than
-  three because the attacker chooses P: 33 bits could be ground inside a
-  card's window or looked up in a table built beforehand. The label is
-  printable ASCII only and always drawn behind "for " on its own line, so it
-  can never pass as the words. After the press the board shows the check code
-  (from its one-off hand-off key), which the phone and Sapwood also show.
+  replace P, and the words in the browser with it.
+- **The real bound:** a compromised browser holds P from the moment the owner
+  pastes the phone's code, before it sends anything, so it can grind a key of
+  its own whose five words match for as long as the owner is willing to wait
+  for a card. Each try is a key generation and an HMAC: 55 bits is about
+  3.6e16 tries, weeks on one GPU and hours on a large rented rack, against an
+  owner who waits minutes. (Four words, 44 bits, was about half an hour on one
+  GPU.) A table built in advance does not help, since P is fresh each time.
+  The label is printable ASCII only and drawn on a line of its own ("ADD
+  PHONE for <label>"), never beside a word.
+- **Detecting a swap afterwards:** after the press the board shows PHONE
+  ADDED with the check code (from its one-off hand-off key) and "else revoke
+  N". The phone and Sapwood show the same check code; if the phone never shows
+  it, the hand-off went elsewhere, and record N is revoked.
 - **Only while unlocked:** a locked board serves no management at all, and
   the board is checked again at the press (the operator is still the device
-  operator, a configured relay has been heard from within the ping interval,
-  a data key, relays, fewer than 16 phones), and the record is written only
+  operator, a configured relay has been heard from within the ping interval
+  plus 10 s, a data key, relays, fewer than 16 phones), and the record is
+  written only
   once the answer carrying the hand-off is known to fit the heap. Nothing is
   written before the press, so a card that is declined, expires or is lost to
   a restart leaves no record; the phone's enrolment key is spent either way
@@ -599,10 +608,17 @@ is always a press on the board, whichever way the request arrives:
   one-off rendezvous subscription can link that enrolment to the phone's IP
   address at that moment, which is weaker than the stable link Cambium's own
   NIP-46 pairing already makes.
+- **Rollout:** this firmware must ship only together with the Cambium
+  release that shows the five words (and keeps its labels to printable ASCII,
+  which the board now requires on the cable too) and the Sapwood release that
+  tells the owner to compare the board with the phone. Shipped alone, owners
+  have nothing trustworthy to compare the card with.
 - **Residual: a lost answer.** The record is written before the answer is
   published (a phone is never handed a secret the board did not keep). The
-  answer is offered to every configured relay session; if no live one takes
-  it, the board says "Not sent / revoke id N" instead of DONE and logs the id.
+  answer is offered to every configured relay session; if none that counted
+  as live at the press (heard from within the ping interval plus 10 s) takes
+  it, the board says "Not sent / revoke id N" instead of PHONE ADDED and logs
+  the id.
   Such a record's secret left nowhere: it unlocks nothing and is removed with
   a revoke. A relay can still accept the answer and lose it, which only the
   phone never receiving a hand-off shows.

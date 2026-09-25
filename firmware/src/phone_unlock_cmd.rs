@@ -15,7 +15,7 @@
 //                           card (#64) and completes it here once pressed:
 //                           [`check_enrol`] before the card, [`complete_enrol`]
 //                           after it. Both cards lead with the request code's
-//                           four words (`phone_unlock::request_words`), which
+//                           five words (`phone_unlock::request_words`), which
 //                           the owner compares with the phone that made the
 //                           key, and the board shows the check code once the
 //                           phone is added.
@@ -64,7 +64,9 @@ pub fn take_phones_changed() -> bool {
     PHONES_CHANGED.swap(false, Ordering::AcqRel)
 }
 
-/// Handle a PHONE_UNLOCK_CMD frame (0x64).
+/// Handle a PHONE_UNLOCK_CMD frame (0x64). True when a phone was enrolled
+/// and its result screen drawn, so a caller that holds result screens
+/// (relay.rs, in WiFi mode) can keep it up before the next card.
 pub fn handle_frame(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
@@ -73,23 +75,23 @@ pub fn handle_frame(
     bridge_authenticated: bool,
     display: &mut crate::oled::Display<'_>,
     buttons: &crate::button::Buttons<'_>,
-) {
+) -> bool {
     if !bridge_authenticated {
         crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
-        return;
+        return false;
     }
-    let outcome = PhoneCmd::parse(payload)
-        .map_err(str::to_string)
-        .and_then(|cmd| run(cmd, nvs, masters, display, Some(buttons)));
+    let parsed = PhoneCmd::parse(payload).map_err(str::to_string);
+    let enrolling = matches!(parsed, Ok(PhoneCmd::Enrol { .. }));
+    let outcome = parsed.and_then(|cmd| run(cmd, nvs, masters, display, Some(buttons)));
     match outcome {
-        Ok(answer) => crate::protocol::write_frame(
-            usb,
-            FRAME_TYPE_PHONE_UNLOCK_RESP,
-            answer.to_string().as_bytes(),
-        ),
+        Ok(answer) => {
+            crate::protocol::write_frame(usb, FRAME_TYPE_PHONE_UNLOCK_RESP, answer.to_string().as_bytes());
+            enrolling
+        }
         Err(e) => {
             log::warn!("phone unlock: {e}");
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, e.as_bytes());
+            false
         }
     }
 }
@@ -159,9 +161,9 @@ pub fn run(
             let label = default_label(label);
             check_enrol(nvs, masters, &label)?;
 
-            let lines = enrol_card_lines(&enrol_pubkey, &label);
+            let words = phone_unlock::request_words(&enrol_pubkey);
             let approved = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
-                crate::oled::show_enrol_approval(d, &lines, remaining, 30);
+                crate::oled::show_enrol_approval(d, &words, &label, remaining, 30);
             });
             if !matches!(approved, crate::approval::ApprovalResult::Approved) {
                 return Err("declined on the board".into());
@@ -181,12 +183,6 @@ pub fn default_label(label: String) -> String {
     } else {
         label
     }
-}
-
-/// The enrol card, on the cable and the relay alike: the request code's four
-/// words, then the label (`oled::show_enrol_approval`).
-pub fn enrol_card_lines(enrol_pubkey: &[u8; 32], label: &str) -> [String; 3] {
-    phone_unlock::enrol_card_lines(&phone_unlock::request_words(enrol_pubkey), label)
 }
 
 /// What the board knows about whether an enrolment of `label` can go ahead,
@@ -279,13 +275,8 @@ pub fn complete_enrol(
     Ok(enrolment)
 }
 
-/// The DONE screen after a cable enrolment: the check code the phone shows
-/// (and Sapwood, once it does), so the owner can see the phone holds this
-/// board's hand-off. The relay path draws its own once the answer is out.
+/// The result screen after an enrolment: the check code the phone must show
+/// (and Sapwood, once it does), and the record to revoke if it never does.
 pub fn show_enrolled(display: &mut crate::oled::Display<'_>, enrolment: &Enrolment) {
-    crate::oled::show_change_done(
-        display,
-        "Phone added",
-        &format!("check {}", phone_unlock::check_code(&enrolment.ephemeral_pubkey)),
-    );
+    crate::oled::show_phone_added(display, &phone_unlock::check_code(&enrolment.ephemeral_pubkey), enrolment.id);
 }

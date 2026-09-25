@@ -474,9 +474,9 @@ pub enum AskCard {
     PhoneEnrol {
         enrol_pubkey: [u8; 32],
         label: String,
-        /// The card's lines: the request code's four words, two a line, then
-        /// the label (`phone_unlock_cmd::enrol_card_lines`).
-        lines: [String; 3],
+        /// The request code's words (`phone_unlock::request_words`), which
+        /// the owner compares with the phone that made the key.
+        words: [&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS],
     },
 }
 

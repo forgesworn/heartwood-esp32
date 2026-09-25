@@ -577,17 +577,22 @@ pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
 // Two codes, both spoken-token tokens of
 // HMAC-SHA256(key, utf8(context) || counter_be32), counter 0.
 //
-//   request code  key = the phone's enrolment key P, FOUR words of the
-//                 2048-word list (spoken_words: each word is
-//                 uint16_be(bytes[2i..2i+2]) % 2048 of the first 8 bytes, so
-//                 44 bits). On the board's card BEFORE the press, and on the
-//                 phone, which made P: the owner holds only if the two match.
-//                 The browser that relayed the request may show them too, as a
-//                 convenience, but that proves nothing: someone holding the
-//                 operator key, or the browser itself, could swap in a key of
-//                 their own. Four words, not three: the attacker chooses P,
-//                 so they could grind 33 bits inside a card's window or look
-//                 them up in a table they built beforehand.
+//   request code  key = the phone's enrolment key P, FIVE words of the
+//                 2048-word list (spoken_words: word i is
+//                 uint16_be(digest[2i..2i+2]) % 2048, i in 0..5, from digest
+//                 bytes 0..10, so 55 bits). On the board's card BEFORE the
+//                 press, and on the phone, which made P: the owner holds only
+//                 if the two match. The browser that relayed the request may
+//                 show them too, as a convenience, but that proves nothing:
+//                 whoever relays the request can swap in a key of their own.
+//                 The bound: a compromised browser holds P from the moment the
+//                 owner pastes the phone's code, before it sends anything, so
+//                 it can grind a key of its own whose words match for as long
+//                 as the owner waits for a card. Each try is a key generation
+//                 and an HMAC; 55 bits is about 3.6e16 tries, weeks on one GPU
+//                 and hours even on a large rented rack, against an owner who
+//                 waits minutes. 44 bits was about half an hour on one GPU. A
+//                 table built beforehand does not help: P is fresh each time.
 //   check code    key = the board's one-off hand-off key, 3 bytes of hex,
 //                 shown "ABC 123". On the board after the press, in Sapwood
 //                 and on the phone, so the owner knows the phone holds the
@@ -612,17 +617,18 @@ fn spoken_digest(key: &[u8; 32], context: &str) -> [u8; 32] {
 }
 
 /// How many words the request code has.
-pub const REQUEST_CODE_WORDS: usize = 4;
+pub const REQUEST_CODE_WORDS: usize = 5;
 
 /// The request code's words: spoken-token's
-/// `deriveToken(P, 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 4 })`.
+/// `deriveToken(P, 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 5 })`,
+/// word i from digest bytes 2i and 2i + 1.
 pub fn request_words(enrol_pubkey: &[u8; 32]) -> [&'static str; REQUEST_CODE_WORDS] {
     let digest = spoken_digest(enrol_pubkey, REQUEST_CODE_CONTEXT);
     core::array::from_fn(|i| crate::spoken_words::word_for(&digest[2 * i..2 * i + 2]))
 }
 
 /// The code the enrol card shows before the press, from the phone's
-/// enrolment key P: four words, space-joined, as spoken-token returns them.
+/// enrolment key P: five words, space-joined, as spoken-token returns them.
 /// The phone that made P shows the same; the owner holds only if they match.
 pub fn request_code(enrol_pubkey: &[u8; 32]) -> String {
     request_words(enrol_pubkey).join(" ")
@@ -636,15 +642,139 @@ pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
     alloc::format!("{} {}", &hex[..3], &hex[3..])
 }
 
-/// The enrol card's three text lines: two words, two words, then the
-/// requester's label behind "for ". The words lead, where the owner looks;
-/// a label can never be drawn on their lines.
-pub fn enrol_card_lines(words: &[&str; REQUEST_CODE_WORDS], label: &str) -> [String; 3] {
-    [
-        alloc::format!("{} {}", words[0], words[1]),
-        alloc::format!("{} {}", words[2], words[3]),
-        alloc::format!("for {label}"),
-    ]
+/// What the enrol card draws: a top line naming what is asked, with the
+/// requester's label behind "for ", and the five words below it, two, two
+/// and one a line. The label never shares a line with a word.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnrolCard {
+    pub top: String,
+    pub words: [String; 3],
+}
+
+/// The enrol card for these words and label. `top_max_chars` is how many
+/// small-font characters the panel's top line holds; a label that would
+/// overflow it is shortened with "..", since it is only a description (the
+/// words are the check). Labels are printable ASCII, so a character is a byte.
+pub fn enrol_card(words: &[&str; REQUEST_CODE_WORDS], label: &str, top_max_chars: usize) -> EnrolCard {
+    const LEAD: &str = "ADD PHONE for ";
+    let room = top_max_chars.saturating_sub(LEAD.len());
+    let label = if label.len() <= room {
+        String::from(label)
+    } else {
+        alloc::format!("{}..", &label[..room.saturating_sub(2).min(label.len())])
+    };
+    EnrolCard {
+        top: alloc::format!("{LEAD}{label}"),
+        words: [
+            alloc::format!("{} {}", words[0], words[1]),
+            alloc::format!("{} {}", words[2], words[3]),
+            String::from(words[4]),
+        ],
+    }
+}
+
+/// How an enrol card ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardOutcome {
+    Approved,
+    Denied,
+    Expired,
+}
+
+/// What the board shows once an enrol card resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnrolResult {
+    /// Added, and the answer reached a live relay: the check code, and the
+    /// id to revoke if the phone never shows that code.
+    Done { id: u32 },
+    /// Added, but no live relay took the answer: its secret left nowhere.
+    NotSent { id: u32 },
+    /// Pressed, but refused at the press: nothing was written.
+    NotAdded,
+    Declined,
+    Expired,
+}
+
+impl EnrolResult {
+    /// Whether this screen holds the display for [`RESULT_HOLD_MS`]: every
+    /// pressed outcome does, since each carries something to read or act on.
+    pub fn holds(self) -> bool {
+        matches!(self, EnrolResult::Done { .. } | EnrolResult::NotSent { .. } | EnrolResult::NotAdded)
+    }
+}
+
+/// The result screen for a card's outcome: `added` is the id of a record
+/// written at the press, `delivered` whether a relay that counted as live at
+/// the press took the answer.
+pub fn enrol_result(outcome: CardOutcome, added: Option<u32>, delivered: bool) -> EnrolResult {
+    match (outcome, added) {
+        (CardOutcome::Approved, Some(id)) if delivered => EnrolResult::Done { id },
+        (CardOutcome::Approved, Some(id)) => EnrolResult::NotSent { id },
+        (CardOutcome::Approved, None) => EnrolResult::NotAdded,
+        // A record is only ever written after a press.
+        (CardOutcome::Denied, _) => EnrolResult::Declined,
+        (CardOutcome::Expired, _) => EnrolResult::Expired,
+    }
+}
+
+/// How long a result screen stays up before the next card, or the idle
+/// screen, may replace it: long enough to compare the check code with the
+/// phone. A fresh press ends it sooner.
+pub const RESULT_HOLD_MS: u64 = 20_000;
+
+/// A result screen holding the display. It arms only once the button has
+/// been seen up, so the release of the hold that approved the card cannot
+/// dismiss its own result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResultHold {
+    armed: bool,
+}
+
+/// What a result hold does on one pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldStep {
+    Hold,
+    Release,
+}
+
+impl ResultHold {
+    /// Whether a hold that began `elapsed_ms` ago has run its time. Needs no
+    /// button state, so anything that asks whether the screen is taken can
+    /// ask it on any pass, whatever the network is doing.
+    pub fn expired(elapsed_ms: u64) -> bool {
+        elapsed_ms >= RESULT_HOLD_MS
+    }
+
+    /// One pass: `button_down` is whether A is held now, `pressed` whether a
+    /// press finished since the last pass (A released, or B). Presses seen
+    /// before the hold arms are the approving hold's own, and are ignored.
+    pub fn step(&mut self, elapsed_ms: u64, button_down: bool, pressed: bool) -> HoldStep {
+        if Self::expired(elapsed_ms) {
+            return HoldStep::Release;
+        }
+        if !self.armed {
+            if !button_down {
+                self.armed = true;
+            }
+            return HoldStep::Hold;
+        }
+        if pressed {
+            HoldStep::Release
+        } else {
+            HoldStep::Hold
+        }
+    }
+}
+
+/// How long after a relay was last heard from it still counts as able to
+/// carry an answer: one ping interval plus a grace for the pong's jitter and
+/// round trip, so a quiet healthy relay is not taken for a dead one.
+pub const ANSWER_LIVE_GRACE_MS: u64 = 10_000;
+
+/// Whether a relay last heard from `since_rx_ms` ago counts as live, for a
+/// board that pings every `ping_interval_ms`.
+pub fn heard_recently(since_rx_ms: u64, ping_interval_ms: u64) -> bool {
+    since_rx_ms < ping_interval_ms.saturating_add(ANSWER_LIVE_GRACE_MS)
 }
 
 impl PhoneCmd {
@@ -1168,25 +1298,44 @@ mod tests {
     fn codes_are_spoken_token_hex_tokens() {
         assert_eq!(check_code(&[0xAB; 32]), "9B6 164");
         assert_eq!(check_code(&[0x00; 32]), "EF1 645");
-        // Four words, 44 bits, from spoken-token 2.1.0's
-        // deriveToken(P, 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 4 }).
-        assert_eq!(request_code(&[0xAB; 32]), "swim behind stand bugle");
-        assert_eq!(request_code(&[0x00; 32]), "talent humble reform admit");
-        assert_eq!(request_code(&[0x42; 32]), "profit buddy moment aim");
-        assert_eq!(request_code(&[0xFF; 32]), "what attitude price easy");
-        assert_eq!(request_words(&[0xAB; 32]), ["swim", "behind", "stand", "bugle"]);
+        // Five words, 55 bits, from spoken-token 2.1.0's
+        // deriveToken(P, 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 5 }).
+        assert_eq!(request_code(&[0xAB; 32]), "swim behind stand bugle female");
+        assert_eq!(request_code(&[0x00; 32]), "talent humble reform admit narrow");
+        assert_eq!(request_code(&[0x42; 32]), "profit buddy moment aim kitten");
+        assert_eq!(request_code(&[0xFF; 32]), "what attitude price easy large");
+        assert_eq!(request_words(&[0xAB; 32]), ["swim", "behind", "stand", "bugle", "female"]);
     }
 
     #[test]
-    fn the_enrol_card_leads_with_the_words_and_the_label_cannot_pass_as_them() {
+    fn the_enrol_card_keeps_the_words_to_their_own_lines() {
         let words = request_words(&[0xAB; 32]);
+        // The Heltec's top line: 128 px of the 5-px small font.
         assert_eq!(
-            enrol_card_lines(&words, "Pixel 8"),
-            ["swim behind".to_string(), "stand bugle".into(), "for Pixel 8".into()]
+            enrol_card(&words, "Pixel 8", 25),
+            EnrolCard {
+                top: "ADD PHONE for Pixel 8".into(),
+                words: ["swim behind".into(), "stand bugle".into(), "female".into()],
+            }
         );
-        // Two words a line fit the narrowest card: 8 + 1 + 8 characters.
-        let longest = crate::spoken_words::WORDLIST_MAX_LEN;
-        assert_eq!(longest, 8);
+        // Two words a line fit the header font's 21 characters: 8 + 1 + 8.
+        assert_eq!(crate::spoken_words::WORDLIST_MAX_LEN, 8);
+        // A long label is shortened on the top line, never wrapped onto a
+        // word line; a wide panel shows it whole.
+        let long = "Sixteen chars 16";
+        assert_eq!(enrol_card(&words, long, 25).top, "ADD PHONE for Sixteen c..");
+        assert!(enrol_card(&words, long, 25).top.len() <= 25);
+        assert_eq!(enrol_card(&words, long, 34).top, "ADD PHONE for Sixteen chars 16");
+        assert_eq!(enrol_card(&words, long, 3).top, "ADD PHONE for ..");
+        // Even a label written as words sits behind "ADD PHONE for ", on the
+        // top line, never on the lines the words are drawn on.
+        let card = enrol_card(&words, "stand bugle", 25);
+        assert_eq!(card.words[1], "stand bugle");
+        assert_eq!(card.top, "ADD PHONE for stand bugle");
+        for line in &card.words {
+            assert!(!line.contains("for"));
+        }
+
         // A label is the requester's text. One that could break a line could
         // draw words of its own where the owner looks for the real ones, and
         // a glyph the ASCII fonts cannot draw could hide what it says. So:
@@ -1205,11 +1354,6 @@ mod tests {
             let params = serde_json::json!({ "enrol_pubkey": pk, "label": label });
             assert!(matches!(PhoneCmd::from_mgmt(ENROL_METHOD, Some(&params)), Some(Ok(_))), "{label:?}");
         }
-        // Even a label written as words sits behind "for " on its own line,
-        // never on the lines the words are drawn on.
-        let lines = enrol_card_lines(&words, "stand bugle");
-        assert_eq!(lines[1], "stand bugle");
-        assert_eq!(lines[2], "for stand bugle");
     }
 
     #[test]
@@ -1335,6 +1479,58 @@ mod tests {
             relay_enrol_completion(true, true, &EnrolFacts { phones: crate::data_key::MAX_PHONES, ..good_facts() }),
             Some(EnrolRefusal::Full)
         );
+    }
+
+    #[test]
+    fn the_result_screen_says_done_only_for_an_answer_that_left() {
+        use CardOutcome::*;
+        assert_eq!(enrol_result(Approved, Some(9), true), EnrolResult::Done { id: 9 });
+        assert_eq!(enrol_result(Approved, Some(9), false), EnrolResult::NotSent { id: 9 });
+        assert_eq!(enrol_result(Approved, None, true), EnrolResult::NotAdded);
+        assert_eq!(enrol_result(Approved, None, false), EnrolResult::NotAdded);
+        assert_eq!(enrol_result(Denied, None, false), EnrolResult::Declined);
+        assert_eq!(enrol_result(Expired, None, true), EnrolResult::Expired);
+        // Every pressed outcome holds the screen; a decline or expiry does not.
+        assert!(EnrolResult::Done { id: 1 }.holds());
+        assert!(EnrolResult::NotSent { id: 1 }.holds());
+        assert!(EnrolResult::NotAdded.holds());
+        assert!(!EnrolResult::Declined.holds());
+        assert!(!EnrolResult::Expired.holds());
+    }
+
+    #[test]
+    fn a_result_hold_outlasts_the_approving_press_and_ends_on_time_or_a_new_one() {
+        // The approving hold is still down when the result appears; its
+        // release must not dismiss the screen.
+        let mut hold = ResultHold::default();
+        assert_eq!(hold.step(0, true, false), HoldStep::Hold);
+        assert_eq!(hold.step(300, false, true), HoldStep::Hold, "the approving hold's own release");
+        assert_eq!(hold.step(600, false, false), HoldStep::Hold);
+        assert_eq!(hold.step(900, true, false), HoldStep::Hold, "a new press, still down");
+        assert_eq!(hold.step(1_200, false, true), HoldStep::Release, "a new press, released");
+
+        // Left alone, it ends at its time, armed or not.
+        let mut idle = ResultHold::default();
+        assert_eq!(idle.step(0, false, false), HoldStep::Hold);
+        assert_eq!(idle.step(RESULT_HOLD_MS - 1, false, false), HoldStep::Hold);
+        assert_eq!(idle.step(RESULT_HOLD_MS, false, false), HoldStep::Release);
+        let mut stuck = ResultHold::default();
+        assert_eq!(stuck.step(RESULT_HOLD_MS, true, true), HoldStep::Release, "a button held down forever");
+
+        // Expiry needs no button state, so the loop can ask it on any pass.
+        assert!(!ResultHold::expired(RESULT_HOLD_MS - 1));
+        assert!(ResultHold::expired(RESULT_HOLD_MS));
+    }
+
+    #[test]
+    fn a_quiet_healthy_relay_still_counts_as_live() {
+        let ping = 20_000;
+        // A pong lands a little after each ping interval.
+        assert!(heard_recently(0, ping));
+        assert!(heard_recently(ping + 3_000, ping), "pong after jitter and a round trip");
+        assert!(heard_recently(ping + ANSWER_LIVE_GRACE_MS - 1, ping));
+        assert!(!heard_recently(ping + ANSWER_LIVE_GRACE_MS, ping));
+        assert!(!heard_recently(u64::MAX, ping));
     }
 
     /// The relay's order: the challenge is spent before this runs (every

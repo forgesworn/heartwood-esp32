@@ -10,7 +10,7 @@
 //            With --over-relay, the same through the device operator's
 //            kind-24134 channel (enrol_unlock_phone): the board holds it on a
 //            card, and the press is still at the board. Either way the card
-//            leads with the request code, four words from the enrolment key:
+//            leads with the request code, five words from the enrolment key:
 //            hold only if they match the phone that made the key (for enrol,
 //            this script; for enrol-for, the phone's own screen).
 //   enrol-for  stand in for Sapwood's panel: take the code a real phone
@@ -294,7 +294,8 @@ async function enrolFor() {
   fanout.close()
   if (!accepted.length) throw new Error(`board enrolled record ${answer.id}, but no relay accepted the hand-off; revoke it and retry`)
   console.log(`board record ${answer.id}; hand-off accepted by ${accepted.join(', ')}`)
-  console.log(`\n    check code ${checkCode(answer.ephemeral_pubkey)}  (the phone must show the same six characters)\n`)
+  console.log(`\n    check code ${checkCode(answer.ephemeral_pubkey)}  (the phone must show the same six characters)`)
+  console.log(`    if the phone never shows it, revoke board record ${answer.id}: phone-unlock.mjs revoke --id ${answer.id}\n`)
   console.log("the phone now asks for its screen lock to keep the key")
 }
 

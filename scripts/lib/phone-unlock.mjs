@@ -165,9 +165,9 @@ export function checkCode(ephemeralPubkeyHex) {
 }
 
 /**
- * The four words the board's enrol card leads with before the press, and
+ * The five words the board's enrol card leads with before the press, and
  * that the phone which made P shows: spoken-token's deriveToken(P,
- * 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 4 }). Word i
+ * 'heartwood-unlock:enrol-request', 0, { format: 'words', count: 5 }). Word i
  * is WORDLIST[uint16be(digest, 2i) % 2048]. The owner holds only if the board
  * and the phone agree; whatever relayed the request (Sapwood, this script)
  * may print them as a convenience, but cannot vouch for them. The word list
@@ -177,7 +177,7 @@ export function requestCode(enrolPubkeyHex) {
   const digest = createHmac('sha256', Buffer.from(enrolPubkeyHex, 'hex'))
     .update(Buffer.concat([Buffer.from('heartwood-unlock:enrol-request'), Buffer.alloc(4)]))
     .digest()
-  return [0, 1, 2, 3].map((i) => spokenWords()[digest.readUInt16BE(2 * i) % 2048]).join(' ')
+  return [0, 1, 2, 3, 4].map((i) => spokenWords()[digest.readUInt16BE(2 * i) % 2048]).join(' ')
 }
 
 let words = null

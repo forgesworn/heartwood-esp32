@@ -2290,17 +2290,20 @@ subscribed to `{"kinds":[24135]}`).
 `enrol_unlock_phone` does over the relay what `PHONE_UNLOCK_CMD` (0x64)
 `{"op":"enrol"}` does over the cable, on the deferred card queue (#64), so the
 relay loop keeps serving while the card is up. Device operator only, behind the
-one-time mutation challenge. The card (`ADD UNLOCK PHONE`) leads with the
-request code, four words from the phone's enrolment key, two a line, then
-`for <label>`, and its hint asks "same on phone?". The owner compares the
-board with the phone that made the key, never with the browser. The result
-screen (DONE with the check code, or NOT DONE) stays up 20 s or until a press.
+one-time mutation challenge. The card has a small top line "ADD PHONE for
+<label>", then the request code, five words from the phone's enrolment key on
+three lines (two, two, one), and its hint asks "same on phone?". The owner
+compares the board with the phone that made the key, never with the browser.
+The result screen (PHONE ADDED with the check code and "else revoke N", or
+NOT DONE) stays up 20 s or until a fresh press.
 Logic and host tests: `common/src/phone_unlock.rs` (relay enrolment section),
 `common/src/spoken_words.rs`.
 
-Sapwood and Cambium support are pending follow-ups: until they land, the
-bench script stands in for both (`enrol` is itself the phone and prints the
-words to compare; `enrol-for` needs a Cambium that shows the words).
+Sapwood and Cambium support are pending follow-ups, and this firmware must
+not ship without them (SECURITY-MODEL, "Adding an unlock phone"). Until they
+land, the bench script stands in for both (`enrol` is itself the phone and
+prints the words to compare; `enrol-for` needs a Cambium that shows the
+words).
 
 Needs a WiFi board with a vault key, unlocked, the device operator key in
 `~/heartwood-bench/operator.key`, `HEARTWOOD_RELAYS` (or `--mgmt-relay`) set to
@@ -2308,12 +2311,19 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
 
 1. **Enrol over the relay.** `node scripts/phone-unlock.mjs enrol
    --over-relay --label "relay phone"`. The script (the phone here) prints
-   four words; the board's card shows the same four words, two a line, over
-   "for relay phone", and all four are readable on the OLED. While the card is
-   up, a USB `FIRMWARE_INFO` and a `get_status` over the relay both answer.
-   Hold: DONE "Phone added" with a check code stays up about 20 s, the script
-   prints the same check code and "enrolled as id N", and `list` shows the
-   phone. Reset the board and run `listen`: it unlocks.
+   five words; the board's card shows the same five words (two, two, one a
+   line) under "ADD PHONE for relay phone", and all five are readable on the
+   OLED. While the card is up, a USB `FIRMWARE_INFO` and a `get_status` over
+   the relay both answer. Hold: PHONE ADDED with "check <code>" and "else
+   revoke N" stays up about 20 s, the script prints the same check code and
+   "enrolled as id N", and `list` shows the phone. Reset the board and run
+   `listen`: it unlocks.
+
+1b. **Detecting a hand-off that went elsewhere.** Run `enrol-for` with a
+   phone code, but stop the phone's screen before the hand-off arrives (close
+   Cambium). The board still shows PHONE ADDED with "else revoke N"; the phone
+   never shows the check code, so revoke N (`revoke --id N`) and `list` no
+   longer shows it.
 
 2. **Decline and expiry add nothing.** Repeat with a new run and press B
    (or a short press): the script says "refused: declined on the board";
@@ -2343,13 +2353,19 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
    first"; the legacy V4 storage-limit run in the phase 6 list can share this
    setup).
 
-7. **No live relay at the press adds nothing.** Start an enrolment and, as
-   soon as the card appears, cut the board's WiFi uplink at the access point
-   (the board keeps its association, so its sockets stay open but hear
-   nothing). Wait until the countdown shows 7 s or less (more than the 20 s
-   ping interval after the cut), then hold. The card turns to NOT DONE
-   "No phone added / see Sapwood", the log says "no relay was live to carry
-   the answer", and `list`, once the uplink is back, shows no new record.
+7. **No live relay at the press adds nothing.** A relay counts as live for
+   30 s after it was last heard from (the 20 s ping interval plus 10 s of
+   grace), and the enrol card's own window is 30 s, so stage it behind another
+   card: send an unapproved sign request from any client, then start an
+   enrolment, which waits behind it. While the sign card is up, cut the
+   board's WiFi uplink at the access point (the board keeps its association,
+   so its sockets stay open but hear nothing). Let the sign card expire (30
+   s); the enrol card then opens. Hold it once at least 30 s have passed
+   since the cut. The card turns to NOT DONE "No phone added / see Sapwood",
+   the log says "no relay was live to carry the answer", and `list`, once the
+   uplink is back, shows no new record. Also in this step: a quiet but
+   healthy relay (no cut, no other traffic) must NOT trip this; step 1 run
+   after a minute of idle covers it.
 
 8. **Not sent names the record.** Harder to stage, optional: make the
    answer's publish fail after the record is written (for example, a relay
@@ -2362,13 +2378,18 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
    out; a fresh `enrol-for` run from the same phone code is accepted, since
    the key is remembered in RAM only.
 
-10. **The result screen holds.** Queue a sign request behind an enrolment
-    card (any client, unapproved kind). After the press, DONE stays up about
-    20 s before the sign card appears, or goes as soon as the button is
-    pressed again (the release of the approving hold does not dismiss it).
+10. **The result screen holds, and lets go.** Queue a sign request behind an
+    enrolment card (any client, unapproved kind). After the press, PHONE
+    ADDED stays up about 20 s before the sign card appears, or goes as soon as
+    the button is pressed again (the release of the approving hold does not
+    dismiss it). Repeat with a cable enrolment (`phone-unlock.mjs enrol`
+    without `--over-relay`) in WiFi mode and a relay sign request queued
+    meanwhile: the same. Then, right after a PHONE ADDED, turn the access
+    point off: within about 20 s a USB `FIRMWARE_INFO` answers and a cable
+    NIP-46 request is no longer refused with "approval on screen".
 
 11. **Cable card matches.** `phone-unlock.mjs enrol` over USB: the same card
-    layout and four words, and DONE shows the check code.
+    layout and five words, and PHONE ADDED shows the check code and the id.
 
 12. **Wire capture.** Subscribe to `{"kinds":[24134,24137]}` during step 1:
     the only new traffic is the operator's 24134 request, the board's 24134

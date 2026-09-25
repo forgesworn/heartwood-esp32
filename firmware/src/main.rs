@@ -1379,15 +1379,18 @@ fn main() {
             }
 
             // 0x64 — phones that can unlock this board (enrol / list / revoke)
-            FRAME_TYPE_PHONE_UNLOCK_CMD => phone_unlock_cmd::handle_frame(
-                &mut usb,
-                &frame.payload,
-                &mut nvs,
-                &loaded_masters,
-                policy_engine.bridge_authenticated,
-                &mut display,
-                &buttons,
-            ),
+            // No card queue on the cable-only loop, so no result hold to arm.
+            FRAME_TYPE_PHONE_UNLOCK_CMD => {
+                phone_unlock_cmd::handle_frame(
+                    &mut usb,
+                    &frame.payload,
+                    &mut nvs,
+                    &loaded_masters,
+                    policy_engine.bridge_authenticated,
+                    &mut display,
+                    &buttons,
+                );
+            }
 
             // 0x63 — vault unlock in the main loop is a no-op (the device is
             // already unlocked to be here); NACK so host bugs are visible.

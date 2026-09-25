@@ -1108,23 +1108,33 @@ pub fn show_titled_approval(
     }
 }
 
-/// The card that adds an unlock phone. The request code is four words of up
-/// to eight letters, so they go two a line in the header font (17 characters
-/// at most, 102 px of the OLED's 128), where the owner looks first; the
-/// requester's label comes under them, always behind "for ", in the small
-/// font; the hint asks the question that matters, whether the phone shows the
-/// same words, ahead of the board's own button hint. Rows on the 128x64
-/// baseline: header 10, rule 14, words 24 and 34, label 43, hint 50, then the
-/// shared countdown bar from 52.
-pub fn show_enrol_approval(display: &mut Display<'_>, lines: &[String; 3], remaining: u32, total_secs: u32) {
+/// The card that adds an unlock phone. The request code is five words of up
+/// to eight letters, and they are the one thing the owner must read, so the
+/// card gives them three lines of the header font (two words, two words, one
+/// word: 17 characters at most, 102 px of the OLED's 128) and drops the usual
+/// header and rule. Above them, one small-font line says what is asked,
+/// "ADD PHONE for <label>" (the label shortened with ".." if the line would
+/// overflow); below them, the hint asks whether the phone shows the same
+/// words, ahead of the board's own button hint. Rows on the 128x64 baseline:
+/// top line 7, words 17, 28 and 39, hint 49, then the shared countdown bar
+/// from 52. The label is never on a word line (`phone_unlock::enrol_card`).
+pub fn show_enrol_approval(
+    display: &mut Display<'_>,
+    words: &[&str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS],
+    label: &str,
+    remaining: u32,
+    total_secs: u32,
+) {
     let l = layout(display);
     display.clear_buffer();
 
-    let header = MonoTextStyleBuilder::new()
-        .font(l.font_header())
+    let top_max = ((l.w - l.sx(4)) / Layout::glyph_w(l.font_small())).max(0) as usize;
+    let card = heartwood_common::phone_unlock::enrol_card(words, label, top_max);
+    let top = MonoTextStyleBuilder::new()
+        .font(l.font_small())
         .text_color(ACCENT)
         .build();
-    let words = MonoTextStyleBuilder::new()
+    let word_style = MonoTextStyleBuilder::new()
         .font(l.font_header())
         .text_color(WARN)
         .build();
@@ -1136,15 +1146,10 @@ pub fn show_enrol_approval(display: &mut Display<'_>, lines: &[String; 3], remai
         Point::new(l.center_x(text.len() as i32 * Layout::glyph_w(font)), l.sy(y))
     };
 
-    let head = "ADD UNLOCK PHONE";
-    Text::new(head, centred(head, l.font_header(), 10), header).draw(display).ok();
-    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(ACCENT))
-        .draw(display)
-        .ok();
-    Text::new(&lines[0], centred(&lines[0], l.font_header(), 24), words).draw(display).ok();
-    Text::new(&lines[1], centred(&lines[1], l.font_header(), 34), words).draw(display).ok();
-    Text::new(&lines[2], centred(&lines[2], l.font_small(), 43), small).draw(display).ok();
+    Text::new(&card.top, centred(&card.top, l.font_small(), 7), top).draw(display).ok();
+    for (line, y) in card.words.iter().zip([17, 28, 39]) {
+        Text::new(line, centred(line, l.font_header(), y), word_style).draw(display).ok();
+    }
 
     let tagged = draw_button_tags(display);
     let button = if tagged && crate::button::has_button_b() {
@@ -1157,12 +1162,24 @@ pub fn show_enrol_approval(display: &mut Display<'_>, lines: &[String; 3], remai
         "hold 2s"
     };
     let hint = format!("same on phone? {button}");
-    Text::new(&hint, centred(&hint, l.font_small(), 50), small).draw(display).ok();
+    Text::new(&hint, centred(&hint, l.font_small(), 49), small).draw(display).ok();
 
     draw_countdown_bar(display, remaining, total_secs);
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
     }
+}
+
+/// An unlock phone was added and its answer sent: the check code the phone
+/// must show, and the record to revoke if it never does.
+pub fn show_phone_added(display: &mut Display<'_>, check: &str, id: u32) {
+    show_status_card(
+        display,
+        "PHONE ADDED",
+        &format!("check {check}"),
+        &format!("else revoke {id}"),
+        OK,
+    );
 }
 
 /// Where a board's buttons are with the screen upright: which edge, and

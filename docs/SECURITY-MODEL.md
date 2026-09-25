@@ -553,81 +553,87 @@ Design spec: `docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md`.
 
 ### Power cuts and NVS writes
 
-A power cut during a write must leave each NVS key with its old value or its
-new one. Everything that rewrites a key in place depends on that: the data-key
-wrapper (`dk_sec`) on a PIN or vault change, a pre-data-key seed resealed over
-the same `mN_seed_enc` key, the note locker's key (`nk`), the phone records,
-the slot tables, the removal and migration journals, the staged network
-transaction and the PIN wipe counter.
-
-ESP-IDF v5.3.2's `nvs_set_blob` provides it by itself: it writes the new copy
-in full, blob index last, and only then erases the old one, and the next boot
-discards whichever copy is incomplete or superseded
+A power cut during a write should leave each NVS key with its old value or
+its new one. ESP-IDF v5.3.2's `nvs_set_blob` provides that by itself: it
+writes the new copy in full, blob index last, and only then erases the old
+one, and the next boot discards whichever copy is incomplete or superseded
 (`components/nvs_flash/src/nvs_storage.cpp:269-452`,
 `nvs_pagemanager.cpp:57-90`). esp-idf-svc 0.52.1's `EspNvs::set_blob`, which
-every firmware blob write used to go through, erases the key first and writes
-second, so a cut between the two left no value at all: a sealed board with no
-`dk_sec` (only an enrolled phone or the phrase opens it), a seed gone from
-flash part-way through migration, sealed notes stranded behind a freshly
-minted note key, a PIN wipe counter back at zero. The firmware now writes
-every blob through `ReplaceBlob` (`firmware/src/nvs.rs`), which calls
-`nvs_set_blob` and `nvs_commit` with no erase. The host store in
-`common/src/data_key.rs` models both orders: its cut-point sweeps hold at
-every cut with the direct replace and fail with the erase-first one. The
-PIN wipe counter is also raised before a guess is checked rather than after,
-so a cut once the board has judged a PIN cannot leave that guess uncounted;
-a count that cannot be written, with the old one reading back intact,
-refuses the guess untried instead of wiping.
+every firmware blob write used to go through, erases the key first, so a cut
+between the two left no value at all: a sealed board with no `dk_sec` (only
+an enrolled phone or the phrase opens it), a seed gone from flash part-way
+through migration, sealed notes stranded behind a freshly minted note key.
+The firmware now writes every blob through `ReplaceBlob`
+(`firmware/src/nvs.rs`), which calls `nvs_set_blob` with no erase in front
+of it whenever there is room. The host store in `common/src/data_key.rs`
+models both orders: its cut-point sweeps hold at every cut with the direct
+replace and fail with the erase-first one.
 
 The price is room: the new copy is written while the old one still holds its
-entries, so a replace needs space for both. Asking ESP-IDF anyway is not
-safe on a nearly full partition. When a v5.3.2 blob write runs out of room
-part-way, its cleanup erases chunk `ii` of each page it used rather than
-chunk `chunkStart + ii` (`nvs_storage.cpp:363-368`, unchanged in the 6.0.1
-tree), and every second replace of a key is written at the version-1 offset,
-so the cleanup can erase a chunk of the old copy (dropped as incomplete at
-its next read) and leave the new chunks live to spoil a later retry at boot.
-`ReplaceBlob` therefore reads `available_entries` (free entries less the page
-NVS keeps back for garbage collection) and plans every write first
-(`common/src/nvs_budget.rs`): if a conservative count of the entries the new
-copy needs does not fit, ESP-IDF is never called and the write is refused
-with the old value untouched. Rewriting a value already stored is a no-op.
+entries, so a replace needs space for both, and asking ESP-IDF anyway is not
+safe. When a v5.3.2 blob write over an existing key runs out of room part-way,
+its cleanup erases chunk `ii` of each page it used rather than chunk
+`chunkStart + ii` (`nvs_storage.cpp:363-368`, unchanged in the 6.0.1 tree);
+every second replace of a key is written at the version-1 offset, so the
+cleanup can erase a chunk of the old copy and leave the new chunks live to
+spoil a later retry at boot. So `ReplaceBlob` reads `available_entries` (free
+entries less the page NVS keeps back for garbage collection) and plans each
+write first (`common/src/nvs_budget.rs`), counting an upper bound on the
+entries the new copy needs. A first write, or a replace that fits, goes
+straight to `nvs_set_blob`. A replace that does not fit follows the key:
 
-Two rules keep that from locking a full board:
+| Key | Replace with no room for a second copy |
+|-----|----------------------------------------|
+| `dk_sec`, `mN_seed_enc`, `master_N_secret`, `at_rest_kind`, `mgmt_nonce`, `mgmt_<operator>`, `root_secret` | Refused before ESP-IDF is asked; the old value stays and the caller reports storage full. All are at most 101 bytes (13 entries). A refusal fails a PIN or vault change, a migration step (retried at the next unlock) or a management command; nothing loops at boot |
+| The note locker's namespace (`nk`, note records, `idx`, `cash`, `wraps`, `trust`) | Refused the same way. A note record is bearer money and the others find, open or de-duplicate it, so a locker storage error is better than a cut that loses one |
+| `pin_fails` | Not a blob: a `u8` item. `nvs_set_u8` writes the new one-entry item before erasing the old (`nvs_storage.cpp:470-520`), so it needs a single free entry |
+| Master-removal copies (seeds, tables and metadata shifted down a slot) | Erased first. The destination's old value is already copied or being removed, and the journal keeps the source until the copy lands, so a cut repeats the copy |
+| Everything else: `connslots_N`, persona chunks and journals, `rm_journal`, `net_config`, `net_trial`, `net_last`, `dk_ph`, `ph_relays`, `pinned_rly`, avatars, receipts, labels | Erased first, then written, exactly as every write was before this change. With the key absent the write starts at version offset 0, where the cleanup is correct. If the write after the erase fails it is tried once more with the new value |
 
-- **Growth is gated.** A new or wider pairing table, a persona, an unlock
-  phone and an avatar are written only if afterwards there is still room to
-  rewrite the largest pairing table, phone record set or persona chunk in
-  place, plus a reserve for the small keys (`nvs::growth_allowed`). Cached
-  avatars are dropped first when that makes room for a pairing. A board
-  that stays within this never needs the fallback below.
-- **A revocation that does not fit erases first, for two keys only.**
-  Failing a revocation would leave the revoked party authorised, so:
+So the residuals are these:
 
-| Key | Replace that does not fit in place |
-|-----|-----------------------------------|
-| `connslots_N` | Revocation (revoke a pairing, remove a client key, withdraw an identity grant) that does not grow the table: legacy `master_N_conn` removed, then erase and write. A cut in between leaves that identity with no pairings. Any other change: refused |
-| `dk_ph` | Revoking a phone: erase and write. A cut in between leaves no unlock phones; the PIN or vault key still opens the board. Enrolment: refused |
-| `dk_sec`, `mN_seed_enc`, `master_N_secret`, `at_rest_kind` | Refused. Losing the wrapper or a seed loses the keys |
-| `nk`, note records, `idx` | Refused. Losing `nk` strands sealed notes; a note record is money |
-| `pin_attempts`, `mgmt_nonce`, `mgmt_<operator>` | Refused. An absent value resets a counter or replay boundary an attacker is up against |
-| `rm_journal`, persona journals, `pc{c}`, `net_trial`, `net_last`, `ph_relays`, everything else | Refused. An absent journal abandons a transaction half done |
-
-Splitting `connslots_N` into one key per pairing would shrink the largest hot
-blob from the whole table (several KB with a dozen pairings) to one pairing,
-so a revocation would always fit in place and the growth reserve would
-shrink with it. It needs a migration and a new boot loader, and is not built.
-
-What none of this provides:
-
-- Atomicity across keys. A change spanning several keys relies on its own
-  write order or journal, as each module documents.
-- A guarantee from the entry count. It is an upper bound derived from the
-  v5.3.2 write path, not a proof; if a write still runs out of room part-way,
-  the ESP-IDF cleanup defect above applies.
-- Removal of the old bytes. The superseded copy is marked erased, not
+- **Secrets are always power-safe**: a cut leaves the old or the new value.
+  On a full board a change to them is refused rather than risked.
+- **A large key on a full board is not**: a cut between the erase and the
+  write loses that key, as it did before this change. For a pairing table
+  that is every pairing of that identity; the pre-migration
+  `master_N_conn` credential is removed before such an erase so absence
+  cannot bring back a legacy pairing. For `dk_ph` it is every unlock phone.
+  For `net_config` it is the network settings, which boot re-seeds from the
+  flash-time config partition. For a journal it is the rest of that
+  transaction.
+- **A revocation is never rolled back.** Removing a pairing, a client key or
+  an identity grant, or narrowing a slot's methods, kinds or auto-approval,
+  is saved as a revocation: if the save fails, RAM keeps the narrower table
+  (and saves it again with the next change) instead of restoring the wider
+  one, and the reply says what a restart would find: the old table (the
+  revocation holds until then only) or no table (every pairing of that
+  identity gone).
+- **Growth is gated for hygiene.** A new pairing, a persona, an unlock phone
+  and an avatar are written only if afterwards the largest pairing table,
+  phone record set or persona chunk can still be rewritten in place, plus a
+  reserve for the small keys (`nvs::growth_allowed`); cached avatars are
+  dropped first to make room for a pairing. Other writes are not gated, so
+  this keeps boards off the fallback most of the time, not always.
+- **The entry count is an upper bound derived from the v5.3.2 write path,
+  not a proof.** If a direct write still runs out of room part-way, the
+  cleanup defect above applies.
+- **The PIN count is raised before a guess is checked**, so a cut once the
+  board has judged a PIN cannot leave that guess uncounted. A cut during a
+  right guess leaves it counted too: an owner who loses power mid-unlock on
+  the fifth attempt finds the board wiped at the next boot. A count that
+  cannot be raised, with the old one reading back intact, refuses the guess
+  untried instead of wiping.
+- **No write spans two keys.** A change spanning several keys relies on its
+  own write order or journal, as each module documents.
+- **The old bytes stay.** The superseded copy is marked erased, not
   overwritten, and stays readable in a raw flash dump until NVS reclaims its
   page.
+
+Splitting `connslots_N` into one key per pairing would shrink the largest
+table rewrite from several KB to one pairing, so a full board would erase
+far less on a fallback. It needs a migration and a new boot loader, and is
+not built.
 
 ## What the design already gets right
 
@@ -639,10 +645,11 @@ What none of this provides:
   for duplicate delivery across live relays.
 - Reusable client indices are bound to a non-secret credential fingerprint for
   every approve/update/revoke/URI action. Slot authority writes use exact
-  read-back plus durable compensation of the complete prior snapshot. This
+  read-back plus durable compensation of the complete prior snapshot, except
+  that a revocation is never compensated back to the wider table. This
   recovery model relies on one NVS key being wholly old or wholly new after
-  power loss, never a torn mixture and never absent; see "Power cuts and NVS
-  writes" for what provides that and what it does not cover.
+  power loss; on a full board a pairing table can instead be absent after a
+  cut. See "Power cuts and NVS writes".
 - New v2 clients have an **atomic, strict method + event-kind ceiling**; legacy
   slots retain their button-fallback behavior for compatibility.
 - Remote WiFi changes are **staged, revision-bound, one-shot, and rollback-safe**;

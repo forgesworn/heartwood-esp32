@@ -48,7 +48,7 @@ namespace:
 | `persona_count`, `pE_ms`, `pE_ix`, `pE_pk`, `pE_pp`, `pE_nm` | Compact persona registry; `pE_ms` owns entry E to a master slot |
 | `imanN`, `imavN` | Master-slot display name/avatar |
 | `bridge_secret` | Authenticated USB bridge secret |
-| `pin_attempts` | Durable wrong-PIN counter |
+| `pin_fails` | Durable wrong-PIN counter (`u8`); `pin_attempts` is the one-byte blob earlier firmware used, read until the first guess or unlock moves it |
 | `net_config`, `net_trial`, `net_rev`, `net_last`, `ncfg_crc` | Active/staged network configuration, outcome, and flash-seed marker |
 | `pinned_rly` | Client-requested relay reachability cache, with master/client slot coordinates |
 | `mgmt_nonce` | Legacy device-operator one-time remote-management mutation challenge, rotated and read back before dispatch |
@@ -61,13 +61,15 @@ namespace:
 
 Every blob in this table is written through `ReplaceBlob`
 (`firmware/src/nvs.rs`), which calls ESP-IDF's `nvs_set_blob` with no erase
-before it: a power cut during a write leaves the key's old value or its new
-one, never neither. `net_rev` and `ncfg_crc` are `u32` items, which
-`nvs_set_u32` replaces the same way. No write spans two keys, which is what
-the journals below are for. A replace needs room for both copies; one that
-might not fit is refused before ESP-IDF is asked, except that a revocation of
-`connslots_N` or `dk_ph` erases first. See "Power cuts and NVS writes" in
-SECURITY-MODEL.md for the per-key table and the growth gate.
+in front of it when there is room for the new copy beside the old one: a
+power cut during the write then leaves the old value or the new one. With no
+room, the secrets (`dk_sec`, `mN_seed_enc`, `master_N_secret`,
+`at_rest_kind`, the management challenges) are refused and keep their
+value, and every other key is erased and then written, as all writes were
+before, so a cut there loses that key. `pin_fails`, `net_rev` and `ncfg_crc`
+are integer items, which ESP-IDF replaces new-before-old in a single entry.
+No write spans two keys, which is what the journals below are for. See
+"Power cuts and NVS writes" in SECURITY-MODEL.md for the per-key table.
 
 The factory/PIN wipe erases the partition rather than enumerating this table,
 so a future or unknown key cannot survive merely because a cleanup list was not

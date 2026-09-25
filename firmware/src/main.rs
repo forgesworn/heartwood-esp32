@@ -971,6 +971,9 @@ fn main() {
     // signing confirmation, or page the carousel. The relay loop's
     // button_settle, for the cable-only loop.
     let mut button_settle_until: Option<Instant> = None;
+    // When to draw the ready screen after an enrol card that added nothing,
+    // so its "Expired" or "Cancelled" card is read first.
+    let mut awaiting_at: Option<Instant> = None;
 
     // --- Frame dispatch loop ---
     log::info!("Entering frame dispatch loop");
@@ -1010,6 +1013,12 @@ fn main() {
                     }
                     if held_result.is_some() {
                         last_activity = Instant::now();
+                    }
+                    if awaiting_at.is_some_and(|at| Instant::now() >= at) {
+                        awaiting_at = None;
+                        if display_on && held_result.is_none() && !confirm::active() {
+                            oled::show_awaiting(&mut display);
+                        }
                     }
                     if display_on && last_activity.elapsed() >= DISPLAY_TIMEOUT {
                         oled::sleep_display(&mut display);
@@ -1422,11 +1431,7 @@ fn main() {
             // approving press does not dismiss it: handle_frame waits for it
             // to be released before it returns.
             FRAME_TYPE_PHONE_UNLOCK_CMD => {
-                let enrolling = matches!(
-                    heartwood_common::phone_unlock::PhoneCmd::parse(&frame.payload),
-                    Ok(heartwood_common::phone_unlock::PhoneCmd::Enrol { .. })
-                );
-                let added = phone_unlock_cmd::handle_frame(
+                let screen = phone_unlock_cmd::handle_frame(
                     &mut usb,
                     &frame.payload,
                     &mut nvs,
@@ -1435,11 +1440,19 @@ fn main() {
                     &mut display,
                     &buttons,
                 );
-                // Any enrolment replaces an earlier result, even one that
-                // added nothing: an older PHONE ADDED drawn again after a
-                // declined card would read as this phone having been added.
-                if enrolling {
-                    held_result = added.map(|added| (Instant::now(), added));
+                match screen {
+                    // Refused before its card, or not an enrolment: a held
+                    // result stays.
+                    phone_unlock_cmd::Screen::Untouched => {}
+                    // A new card went up and added nothing: an older PHONE
+                    // ADDED drawn again after it would read as this phone
+                    // having been added, so it goes, once "Expired" or
+                    // "Cancelled" has been on screen a moment.
+                    phone_unlock_cmd::Screen::NothingAdded => {
+                        held_result = None;
+                        awaiting_at = Some(Instant::now() + Duration::from_secs(3));
+                    }
+                    phone_unlock_cmd::Screen::Added(added) => held_result = Some((Instant::now(), added)),
                 }
             }
 
@@ -1610,7 +1623,12 @@ fn main() {
             match &held_result {
                 Some((_, added)) if !confirm::active() => added.show(&mut display),
                 Some(_) => {}
-                None => oled::show_awaiting(&mut display),
+                // An enrol card's outcome is left up a moment (awaiting_at).
+                None if awaiting_at.is_some() && frame_type == FRAME_TYPE_PHONE_UNLOCK_CMD => {}
+                None => {
+                    awaiting_at = None;
+                    oled::show_awaiting(&mut display);
+                }
             }
         }
     }

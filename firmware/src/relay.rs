@@ -787,6 +787,12 @@ struct RelaySession {
     rx: Vec<u8>,
     last_rx: Instant,
     last_ping: Instant,
+    /// The silence limit counts from the later of this and `last_rx`. A
+    /// cable card that holds the loop (an enrol card can take about 55 s
+    /// with its release wait) moves it on, so a quiet relay is not redialled
+    /// for silence the board itself caused; `last_rx` stays what was really
+    /// heard, which the enrol card's liveness snapshot depends on.
+    silence_from: Instant,
     last_resub: Instant,
     recv_timeout_on: bool,
     /// Wall clock from this relay's `Date` header at upgrade, if it sent one.
@@ -1305,13 +1311,14 @@ pub fn run_wifi_standalone<'d, 'b>(
             poll_usb(usb, &mut ctx, None)
         };
         if blocked {
-            // A cable card held the loop with nothing reading the relays, as
-            // a relay sign card does inside session_step: count it as heard,
-            // or a quiet relay trips SILENCE_LIMIT and redials straight after.
+            // A cable card held the loop with nothing reading the relays:
+            // excuse that silence, or a quiet relay trips SILENCE_LIMIT and
+            // redials straight after. Nothing was heard, so last_rx (the
+            // enrol card's liveness) is left alone, and so is last_ping, so a
+            // ping goes out on the next idle tick and finds out.
             let now = Instant::now();
             for s in sessions.iter_mut() {
-                s.last_rx = now;
-                s.last_ping = now;
+                s.silence_from = now;
             }
         }
 
@@ -2089,6 +2096,7 @@ fn connect_relay_raw(
         rx: Vec::with_capacity(READ_BUF),
         last_rx: now,
         last_ping: now,
+        silence_from: now,
         last_resub: now,
         recv_timeout_on,
         server_time,
@@ -3177,7 +3185,7 @@ fn session_step(
             s.last_resub = now;
             log::debug!("[relay] re-subscribed on {} (keepalive)", s.url);
         }
-        if now.duration_since(s.last_rx) >= SILENCE_LIMIT {
+        if now.duration_since(s.last_rx.max(s.silence_from)) >= SILENCE_LIMIT {
             return Err(format!(
                 "relay {} silent (no data/pong); reconnecting",
                 s.url
@@ -3209,8 +3217,8 @@ fn reboot_after_state_change(reason: &str) {
 /// the link off its channel — that case declines rather than disrupt signing.
 /// Serve one USB frame, if one is waiting ([`poll_usb_frame`]). True when the
 /// frame held the loop for [`CABLE_BLOCKED`] or more: a cable card, answered
-/// or left to expire, while no relay was read (the caller refreshes the
-/// sessions' silence clocks). A result held on screen is drawn again shortly
+/// or left to expire, while no relay was read (the caller moves the
+/// sessions' `silence_from` on). A result held on screen is drawn again shortly
 /// after any frame, since the command may have drawn over it; after a
 /// blocking one it also waits for the button to come up, so the release of
 /// that card's hold does not dismiss it.
@@ -3516,17 +3524,7 @@ fn poll_usb_frame(
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
         }
         FRAME_TYPE_PHONE_UNLOCK_CMD => {
-            // A new enrolment replaces an earlier result, whatever it comes
-            // to: an older PHONE ADDED drawn again after a declined card
-            // would read as this phone having been added.
-            if matches!(
-                heartwood_common::phone_unlock::PhoneCmd::parse(&frame.payload),
-                Ok(heartwood_common::phone_unlock::PhoneCmd::Enrol { .. })
-            ) && ctx.card_screen_hold.is_some()
-            {
-                release_card_screen_hold(ctx, true);
-            }
-            let added = crate::phone_unlock_cmd::handle_frame(
+            let screen = crate::phone_unlock_cmd::handle_frame(
                 usb,
                 &frame.payload,
                 ctx.nvs,
@@ -3535,10 +3533,24 @@ fn poll_usb_frame(
                 ctx.display,
                 ctx.buttons,
             );
-            // The check code stays up until a press, as a relay enrolment's
-            // does (hold_card_screen).
-            if let Some(added) = added {
-                hold_card_screen(ctx, HeldScreen::PhoneAdded(added));
+            match screen {
+                // Refused before its card, or not an enrolment: a held
+                // result is untouched.
+                crate::phone_unlock_cmd::Screen::Untouched => {}
+                // A new card went up and added nothing: an older PHONE ADDED
+                // drawn again after it would read as this phone having been
+                // added, so it goes, but only once "Expired" or "Cancelled"
+                // has been read.
+                crate::phone_unlock_cmd::Screen::NothingAdded => {
+                    if ctx.card_screen_hold.is_some() {
+                        release_card_screen_hold(ctx, Some(Duration::from_secs(3)));
+                    }
+                }
+                // The check code stays up until a press, as a relay
+                // enrolment's does (hold_card_screen).
+                crate::phone_unlock_cmd::Screen::Added(added) => {
+                    hold_card_screen(ctx, HeldScreen::PhoneAdded(added));
+                }
             }
         }
 
@@ -4857,20 +4869,6 @@ fn card_window(card: &ButtonCard) -> Duration {
     }
 }
 
-/// How long after it opens this card refuses a hold
-/// (`phone_unlock::PressGate`): the enrol card until all its pages have been
-/// shown, every other card not at all.
-fn card_gate_ms(card: &ButtonCard) -> u64 {
-    if is_enrol_card(card) {
-        heartwood_common::phone_unlock::ENROL_GATE_MS
-    } else {
-        0
-    }
-}
-
-// A cable enrol card blocks the relay loop for its whole window; kept under
-// the silence limit, a quiet relay is not taken for a dead one straight after.
-const _: () = assert!((heartwood_common::phone_unlock::ENROL_CARD_SECS as u64) < SILENCE_LIMIT.as_secs());
 
 /// Hold that approves, matching `approval::run_approval_loop`.
 const CARD_HOLD_MS: u32 = 2000;
@@ -4931,6 +4929,12 @@ struct ButtonCard {
     armed: bool,
     last_remaining: u32,
     last_pct: u32,
+    /// The enrol card's pages and press gate (`phone_unlock::EnrolGate`),
+    /// stepped every tick; unused by other cards.
+    enrol_gate: heartwood_common::phone_unlock::EnrolGate,
+    /// The enrol card's (page, armed) last drawn, so a change is drawn at
+    /// once and the page the gate counts is the page on screen.
+    drawn_view: Option<(usize, bool)>,
 }
 
 /// What one card tick concluded.
@@ -5116,6 +5120,8 @@ fn queue_button_ask(
                 armed: false,
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
+                enrol_gate: Default::default(),
+                drawn_view: None,
             });
             Ok(())
         }
@@ -5143,10 +5149,14 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // First draw of this wording: a join sets last_remaining back to MAX to
     // force a redraw, so a card that grows logs again with what it now says.
     let first_draw = ctx.button_cards[0].last_remaining == u32::MAX;
-    if remaining == ctx.button_cards[0].last_remaining {
+    // The enrol card also redraws the moment its page or gate changes.
+    let view = is_enrol_card(&ctx.button_cards[0])
+        .then(|| (ctx.button_cards[0].enrol_gate.page(), ctx.button_cards[0].enrol_gate.armed()));
+    if remaining == ctx.button_cards[0].last_remaining && view == ctx.button_cards[0].drawn_view {
         return;
     }
     ctx.button_cards[0].last_remaining = remaining;
+    ctx.button_cards[0].drawn_view = view;
     ctx.button_cards[0].last_pct = u32::MAX;
 
     let batch = ctx.button_cards[0].asks.len();
@@ -5157,10 +5167,8 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         Batch(String, String),
         Enrol([&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS], String),
     }
-    // The enrol card pages on whole seconds since it opened, and its hint
-    // says whether a hold counts yet.
-    let card_elapsed = ctx.button_cards[0].opened_at.map_or(0, |t| t.elapsed().as_secs() as u32);
-    let card_armed = ctx.button_cards[0].armed;
+    // The enrol card's page and whether a hold counts yet (its hint).
+    let (card_page, card_armed) = view.unwrap_or((0, true));
     let card = match &ctx.button_cards[0].asks[0].ask.card {
         crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading } => {
             // The count belongs on screen: one hold answers all of them, and
@@ -5259,7 +5267,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             &label,
             remaining,
             heartwood_common::phone_unlock::ENROL_CARD_SECS,
-            card_elapsed,
+            card_page,
             card_armed,
         ),
     }
@@ -5347,18 +5355,26 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     let hold_ms = crate::button::hold_ms();
     let released = crate::button::take_release();
 
-    if !ctx.button_cards[0].armed {
-        // The enrol card arms only once every page of its words has been
-        // shown (phone_unlock::ENROL_GATE_MS) and the button has been up
-        // since: a hold on page 1 alone would rest on two words.
-        let gate_ms = card_gate_ms(&ctx.button_cards[0]);
+    // The enrol card turns its pages and keeps its gate every tick
+    // (phone_unlock::EnrolGate, the cable's rule too): a page moves on only
+    // after its full dwell on screen, however long a stalled pass took, and
+    // the card arms only once every page has had that dwell, 12 s have
+    // passed and the button is up. A hold on page 1 alone would rest on two
+    // words.
+    let enrol = is_enrol_card(&ctx.button_cards[0]);
+    if enrol {
         let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        if heartwood_common::phone_unlock::PressGate::opens(gate_ms, elapsed_ms, hold_ms > 0) {
+        ctx.button_cards[0].enrol_gate.step(elapsed_ms, hold_ms > 0);
+    }
+
+    if !ctx.button_cards[0].armed {
+        let arms = if enrol { ctx.button_cards[0].enrol_gate.armed() } else { hold_ms == 0 };
+        if arms {
             ctx.button_cards[0].armed = true;
         }
         // B still cancels an enrol card during its gate: it is the explicit
         // "no", and that is always the owner's to give.
-        if gate_ms > 0 && ctx.buttons.b_pressed() {
+        if enrol && ctx.buttons.b_pressed() {
             ctx.buttons.drain_b();
             return CardTick::Denied;
         }
@@ -5907,6 +5923,8 @@ fn queue_receive_card(
                 armed: false,
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
+                enrol_gate: Default::default(),
+                drawn_view: None,
             });
         }
     }
@@ -6130,6 +6148,8 @@ fn queue_phone_enrol(
         armed: false,
         last_remaining: u32::MAX,
         last_pct: u32::MAX,
+        enrol_gate: Default::default(),
+        drawn_view: None,
     });
     Ok(())
 }
@@ -6376,17 +6396,17 @@ fn service_card_screen_hold(ctx: &mut SignCtx) -> bool {
     }
     // A card waiting for the screen draws itself; otherwise the idle
     // screen comes back now.
-    release_card_screen_hold(ctx, !waiting);
+    release_card_screen_hold(ctx, (!waiting).then_some(Duration::ZERO));
     false
 }
 
-/// End a result hold. `restore_idle` puts the idle screen back on the next
-/// pass; leave it false where something else is about to draw.
-fn release_card_screen_hold(ctx: &mut SignCtx, restore_idle: bool) {
+/// End a result hold. `restore_idle_after` puts the idle screen back that
+/// long from now; `None` where something else is about to draw.
+fn release_card_screen_hold(ctx: &mut SignCtx, restore_idle_after: Option<Duration>) {
     ctx.card_screen_hold = None;
     crate::button::clear_press_edge();
     ctx.button_settle = ctx.buttons.a.is_low();
-    ctx.network_display_restore_at = restore_idle.then(Instant::now);
+    ctx.network_display_restore_at = restore_idle_after.map(|after| Instant::now() + after);
 }
 
 /// Whether a cable command that puts up its own card must be refused with

@@ -84,9 +84,22 @@ impl Added {
     }
 }
 
-/// Handle a PHONE_UNLOCK_CMD frame (0x64). `Some` when a phone was enrolled
-/// and its result screen drawn, so the caller can hold it until a press
-/// (main.rs in USB mode, relay.rs in WiFi mode).
+/// What a PHONE_UNLOCK_CMD frame did to the screen.
+pub enum Screen {
+    /// No card went up: another command, or an enrolment refused before its
+    /// card (bad auth, a used key, a board that cannot enrol). Whatever was
+    /// on screen is still there.
+    Untouched,
+    /// An enrol card went up and ended with nothing added (declined,
+    /// expired, or refused at the press); its "Expired" or "Cancelled" card
+    /// is on screen.
+    NothingAdded,
+    /// A phone was added and PHONE ADDED drawn, for the caller to hold until
+    /// a press (main.rs in USB mode, relay.rs in WiFi mode).
+    Added(Added),
+}
+
+/// Handle a PHONE_UNLOCK_CMD frame (0x64), and say what it left on screen.
 pub fn handle_frame(
     usb: &mut SerialPort<'_>,
     payload: &[u8],
@@ -95,16 +108,20 @@ pub fn handle_frame(
     bridge_authenticated: bool,
     display: &mut crate::oled::Display<'_>,
     buttons: &crate::button::Buttons<'_>,
-) -> Option<Added> {
+) -> Screen {
     if !bridge_authenticated {
         crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
-        return None;
+        return Screen::Untouched;
     }
-    let mut added = None;
+    let mut screen = Screen::Untouched;
     let outcome = PhoneCmd::parse(payload).map_err(str::to_string).and_then(|cmd| match cmd {
         PhoneCmd::Enrol { enrol_pubkey, label } => {
-            enrol_on_cable(&enrol_pubkey, label, nvs, masters, display, buttons).map(|(answer, shown)| {
-                added = Some(shown);
+            let (outcome, card_shown) = enrol_on_cable(&enrol_pubkey, label, nvs, masters, display, buttons);
+            if card_shown {
+                screen = Screen::NothingAdded;
+            }
+            outcome.map(|(answer, added)| {
+                screen = Screen::Added(added);
                 answer
             })
         }
@@ -113,14 +130,13 @@ pub fn handle_frame(
     match outcome {
         Ok(answer) => {
             crate::protocol::write_frame(usb, FRAME_TYPE_PHONE_UNLOCK_RESP, answer.to_string().as_bytes());
-            added
         }
         Err(e) => {
             log::warn!("phone unlock: {e}");
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, e.as_bytes());
-            None
         }
     }
+    screen
 }
 
 fn load(nvs: &mut EspNvs<NvsDefault>) -> Result<PhoneSet, String> {
@@ -180,7 +196,9 @@ pub fn run(cmd: PhoneCmd, nvs: &mut EspNvs<NvsDefault>) -> Result<serde_json::Va
 
 /// Enrol over the cable: the blocking card, for `phone_unlock::ENROL_CARD_SECS`
 /// (45 s, for the five words to be read a page at a time and compared), gated
-/// until every page has been shown, then PHONE ADDED. Returns the answer and what PHONE ADDED showed.
+/// until every page has been shown (`approval::run_enrol_approval_loop`), then
+/// PHONE ADDED. Returns the answer and what PHONE ADDED showed, and whether
+/// the card went up at all (false when refused before it).
 fn enrol_on_cable(
     enrol_pubkey: &[u8; 32],
     label: String,
@@ -188,39 +206,47 @@ fn enrol_on_cable(
     masters: &[LoadedMaster],
     display: &mut crate::oled::Display<'_>,
     buttons: &crate::button::Buttons<'_>,
-) -> Result<(serde_json::Value, Added), String> {
+) -> (Result<(serde_json::Value, Added), String>, bool) {
     // One attempt per enrolment key, whatever its outcome: marked before
     // anything can fail, so a resend queued behind this command (or one
     // after a decline) is refused rather than raising another card.
-    claim_enrol_key(enrol_pubkey)?;
+    if let Err(e) = claim_enrol_key(enrol_pubkey) {
+        return (Err(e), false);
+    }
     let label = default_label(label);
-    check_enrol(nvs, masters, &label)?;
+    if let Err(e) = check_enrol(nvs, masters, &label) {
+        return (Err(e), false);
+    }
 
     let words = phone_unlock::request_words(enrol_pubkey);
     let window = phone_unlock::ENROL_CARD_SECS;
-    // No hold counts until every page has been shown (ENROL_GATE_MS); a tap
-    // before then does nothing, so it cannot decline and spend the key.
-    let approved = crate::approval::run_gated_approval_loop(
+    // No hold counts until every page has been on screen its full dwell
+    // (EnrolGate); a tap before then does nothing, so it cannot decline and
+    // spend the key.
+    let approved = crate::approval::run_enrol_approval_loop(
         display,
         buttons,
         u64::from(window),
-        phone_unlock::ENROL_GATE_MS,
-        |d, remaining, elapsed, armed| {
-            crate::oled::show_enrol_approval(d, &words, &label, remaining, window, elapsed, armed);
+        |d, remaining, page, armed| {
+            crate::oled::show_enrol_approval(d, &words, &label, remaining, window, page, armed);
         },
     );
     if !matches!(approved, crate::approval::ApprovalResult::Approved) {
-        return Err("declined on the board".into());
+        return (Err("declined on the board".into()), true);
     }
 
-    let enrolment = complete_enrol(nvs, masters, enrol_pubkey, &label, phone_unlock::enrol_refusal, |_| true)?;
+    let enrolment =
+        match complete_enrol(nvs, masters, enrol_pubkey, &label, phone_unlock::enrol_refusal, |_| true) {
+            Ok(enrolment) => enrolment,
+            Err(e) => return (Err(e), true),
+        };
     let added = Added::of(&enrolment);
     added.show(display);
     // The approving hold usually still has the button down here. Let
     // it go before returning, or the cable-only loop takes the same
     // press for a carousel page and wipes the check code at once.
     wait_for_release(buttons);
-    Ok((phone_unlock::enrolment_json(&enrolment), added))
+    (Ok((phone_unlock::enrolment_json(&enrolment), added)), true)
 }
 
 /// The label the board keeps when the requester sent none.

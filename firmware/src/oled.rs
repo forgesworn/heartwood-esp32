@@ -1108,19 +1108,20 @@ pub fn show_titled_approval(
     }
 }
 
-/// The card that adds an unlock phone, `elapsed_secs` whole seconds after it
-/// opened. The request code is five words of up to eight letters, and they
-/// are the one thing the owner must read, so the card shows them a page at a
-/// time, as large as the panel allows: words 1 and 2, then 3 and 4, then 5,
-/// each page for `phone_unlock::ENROL_PAGE_SECS` and round again with no
-/// press (`phone_unlock::enrol_page`). Each word has a line of its own with
+/// Page `page` of the card that adds an unlock phone. The request code is
+/// five words of up to eight letters, and they are the one thing the owner
+/// must read, so the card shows them a page at a time, as large as the panel
+/// allows: words 1 and 2, then 3 and 4, then 5, each page for
+/// `phone_unlock::ENROL_PAGE_SECS` and round again with no press. The caller
+/// turns the pages with `phone_unlock::EnrolGate`, which counts only pages
+/// actually drawn. Each word has a line of its own with
 /// its place in the code beside it, in the font `Layout::enrol_geometry`
 /// picks: FONT_6X10 at 2x on the Heltec, 12 px letters where the old card
 /// drew 6 px ones two to a line. Above them, one small-font line says what is
 /// asked, `ADD "<label>"?` (the label shortened inside its quotes if the line
 /// would overflow); below them, the hint: "compare all 5 words" until
-/// `armed` (the press gate, one full cycle of pages, has passed and the
-/// button has been up since), then the board's "on phone? hold PRG"
+/// `armed` (the gate: every page has had its full dwell, 12 s have passed
+/// and the button has been up since), then the board's "on phone? hold PRG"
 /// (`phone_unlock::enrol_hint`). Last, the countdown row: the page marker
 /// ("1-2 of 5"), the bar and the seconds. Everything stays in the span clear
 /// of the button tags (`Layout::text_span`), so nothing prints over "<PRG"
@@ -1135,7 +1136,7 @@ pub fn show_enrol_approval(
     label: &str,
     remaining: u32,
     total_secs: u32,
-    elapsed_secs: u32,
+    page: usize,
     armed: bool,
 ) {
     use heartwood_common::phone_unlock;
@@ -1144,7 +1145,6 @@ pub fn show_enrol_approval(
 
     let side = tag_side();
     let g = l.enrol_geometry(side);
-    let page = phone_unlock::enrol_page(elapsed_secs);
     let card = phone_unlock::enrol_card(words, label, l.span_chars(side, l.font_small()), page);
     let top = MonoTextStyleBuilder::new()
         .font(l.font_small())

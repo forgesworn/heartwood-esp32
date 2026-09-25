@@ -656,9 +656,7 @@ pub fn check_code(ephemeral_pubkey: &[u8; 32]) -> String {
 /// only defence against a swapped enrolment key, and on the Heltec's 128x64
 /// OLED the owner reads them a page at a time and compares each with the
 /// phone (bench, 2026-09-25: at 30 s the card went before they had been
-/// read). Kept under the relay loop's 50 s silence limit (relay.rs asserts
-/// it), so a cable card that blocks the loop for its whole window does not
-/// make a quiet relay look dead.
+/// read; 60 s was then judged too long).
 pub const ENROL_CARD_SECS: u32 = 45;
 
 /// How many pages the enrol card steps through: two words a page, so 1 and 2,
@@ -669,15 +667,15 @@ pub const ENROL_PAGES: usize = REQUEST_CODE_WORDS.div_ceil(2);
 /// press (a press answers the card).
 pub const ENROL_PAGE_SECS: u32 = 4;
 
-/// How long the enrol card refuses a hold: one full cycle of its pages
-/// (12 s), so no hold can approve before all five words have been on screen.
-/// A hold on page 1 alone would rest on two words, 22 bits, which a
-/// compromised browser grinds in moments.
+/// The least time the enrol card refuses a hold: one full cycle of its pages
+/// (12 s). [`EnrolGate`] also waits for every page to have had its full
+/// dwell on screen, which a stalled loop can make later still.
 pub const ENROL_GATE_MS: u64 = ENROL_PAGES as u64 * ENROL_PAGE_SECS as u64 * 1000;
 
-/// The page the enrol card shows `elapsed_secs` whole seconds after it
-/// opened. Both loops count from their own start of the card, so page 1
-/// lasts 0-3 s on the cable and the relay alike.
+/// The page an undisturbed enrol card shows `elapsed_secs` whole seconds
+/// after it opened (previews and docs). The loops themselves turn pages with
+/// [`EnrolGate`], which only moves on from a page that has been on screen for
+/// its full dwell.
 pub fn enrol_page(elapsed_secs: u32) -> usize {
     (elapsed_secs / ENROL_PAGE_SECS) as usize % ENROL_PAGES
 }
@@ -695,30 +693,56 @@ pub fn enrol_page_marker(page: usize) -> &'static str {
     }
 }
 
-/// Whether a card's button counts yet: from `gate_ms` after the card opened,
-/// and from the first moment after that the button is seen up, so a hold (or
-/// a tap) that began before the gate never approves or declines anything.
-/// The enrol card is gated for [`ENROL_GATE_MS`]; a gate of 0 is every other
-/// card's rule, armed as soon as the button is up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PressGate {
-    gate_ms: u64,
+/// The enrol card's pages and press gate, stepped by both loops (relay.rs
+/// `tick_button_card`, `approval::run_enrol_approval_loop` on the cable) every
+/// time they look at the card, with the milliseconds since it opened and
+/// whether the A button is down. The caller draws the page `step` returns
+/// whenever it changes, so the page this holds is the page on screen.
+///
+/// A page gives way to the next only once it has been on screen for its full
+/// `ENROL_PAGE_SECS`, however long the loop took to look again, so a loop
+/// that stalls (a relay redial, a WiFi rejoin) cannot skip a page. The card
+/// arms, and a hold starts to count, only once every page has had its full
+/// dwell, [`ENROL_GATE_MS`] has passed and the button has been seen up since:
+/// a hold, or a tap, that began before that never approves or declines
+/// anything, and a hold on page 1 alone would rest on two words, 22 bits,
+/// which a compromised browser grinds in moments. Armed stays armed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnrolGate {
+    page: usize,
+    /// When the page on screen was first drawn; `None` before the first look.
+    page_since_ms: Option<u64>,
+    /// Pages that have completed a full dwell (at most `ENROL_PAGES`).
+    dwelt: usize,
     armed: bool,
 }
 
-impl PressGate {
-    pub fn new(gate_ms: u64) -> Self {
-        PressGate { gate_ms, armed: false }
+impl EnrolGate {
+    /// One look at the card; returns the page to have on screen.
+    pub fn step(&mut self, elapsed_ms: u64, button_down: bool) -> usize {
+        let dwell = u64::from(ENROL_PAGE_SECS) * 1000;
+        match self.page_since_ms {
+            None => self.page_since_ms = Some(elapsed_ms),
+            Some(since) if elapsed_ms.saturating_sub(since) >= dwell => {
+                self.dwelt = (self.dwelt + 1).min(ENROL_PAGES);
+                self.page = (self.page + 1) % ENROL_PAGES;
+                self.page_since_ms = Some(elapsed_ms);
+            }
+            Some(_) => {}
+        }
+        if self.dwelt >= ENROL_PAGES && elapsed_ms >= ENROL_GATE_MS && !button_down {
+            self.armed = true;
+        }
+        self.page
     }
 
-    /// Whether a card `elapsed_ms` old may arm now, with the button down or not.
-    pub fn opens(gate_ms: u64, elapsed_ms: u64, button_down: bool) -> bool {
-        elapsed_ms >= gate_ms && !button_down
+    /// The page on screen.
+    pub fn page(&self) -> usize {
+        self.page
     }
 
-    /// One look at the button; true once armed, and it stays armed.
-    pub fn step(&mut self, elapsed_ms: u64, button_down: bool) -> bool {
-        self.armed = self.armed || Self::opens(self.gate_ms, elapsed_ms, button_down);
+    /// Whether a hold now counts.
+    pub fn armed(&self) -> bool {
         self.armed
     }
 }
@@ -760,7 +784,7 @@ pub fn enrol_card(words: &[&str; REQUEST_CODE_WORDS], label: &str, top_max_chars
     }
 }
 
-/// The enrol card's hint line. Before the gate ([`PressGate`]) it asks for
+/// The enrol card's hint line. Before the gate ([`EnrolGate`]) it asks for
 /// the comparison and offers no hold: "compare all 5 words". After it, the
 /// question that matters, whether the phone shows the same words, ahead of
 /// the shortest form of the board's button hint. At most 20 characters, so
@@ -1721,15 +1745,14 @@ mod tests {
     #[test]
     fn the_enrol_card_shows_every_word_before_it_can_be_approved() {
         // Half as long again as the shared 30 s: long enough to read five
-        // words a page at a time and compare them with the phone, and under
-        // the relay loop's 50 s silence limit (asserted in relay.rs), so a
-        // cable card blocking the loop does not make quiet relays redial.
+        // words a page at a time and compare them with the phone.
         assert_eq!(ENROL_CARD_SECS, 45);
         assert_eq!(ENROL_PAGES, REQUEST_CODE_WORDS.div_ceil(2));
-        // Pages run on whole seconds since the card opened, the same on the
-        // cable and the relay: page 1 for 0-3 s, page 2 for 4-7, page 3 for
-        // 8-11, then round.
-        let pages: Vec<usize> = (0..ENROL_CARD_SECS).map(enrol_page).collect();
+        // Pages turn on EnrolGate, which both loops step: looked at once a
+        // second, page 1 for 0-3 s, page 2 for 4-7, page 3 for 8-11, then
+        // round.
+        let mut gate = EnrolGate::default();
+        let pages: Vec<usize> = (0..ENROL_CARD_SECS).map(|s| gate.step(u64::from(s) * 1000, false)).collect();
         for (second, page) in pages.iter().enumerate() {
             assert_eq!(*page, (second / ENROL_PAGE_SECS as usize) % ENROL_PAGES, "second {second}");
         }
@@ -1752,39 +1775,62 @@ mod tests {
         }
         assert!(ENROL_CARD_SECS as usize - gate_secs > 30);
         // Never a page out of range, however long.
-        for elapsed in [0, 1, 11, 12, 44, 45, 1_000, u32::MAX] {
-            assert!(enrol_page(elapsed) < ENROL_PAGES);
+        let mut long = EnrolGate::default();
+        for ms in [0, 1, 11_000, 12_000, 44_000, 45_000, 1_000_000, u64::MAX] {
+            assert!(long.step(ms, false) < ENROL_PAGES);
         }
     }
 
     #[test]
     fn no_hold_that_starts_before_the_gate_approves_the_enrol_card() {
-        let gate = ENROL_GATE_MS;
-        // Untouched: arms at the gate, not before.
-        let mut g = PressGate::new(gate);
-        assert!(!g.step(0, false));
-        assert!(!g.step(gate - 1, false));
-        assert!(g.step(gate, false));
-        assert!(g.step(gate + 5_000, true), "armed stays armed: a hold from here counts");
+        let dwell = u64::from(ENROL_PAGE_SECS) * 1000;
+        // A loop that looks every second: pages turn after their full dwell
+        // and the card arms as the third page's dwell completes, at 12 s.
+        let mut g = EnrolGate::default();
+        let mut pages = Vec::new();
+        for second in 0..=12u64 {
+            pages.push(g.step(second * 1000, false));
+            assert_eq!(g.armed(), second >= 12, "second {second}");
+        }
+        assert_eq!(pages, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0]);
+        assert!(g.step(20_000, true) == g.page() && g.armed(), "armed stays armed: a hold from here counts");
+
         // A short press during the gate is harmless: ignored, not a decline,
         // and the card still arms once the button is up after the gate.
-        let mut tap = PressGate::new(gate);
-        assert!(!tap.step(3_000, true));
-        assert!(!tap.step(3_300, false));
-        assert!(tap.step(gate, false));
+        let mut tap = EnrolGate::default();
+        for ms in (0..=12_000).step_by(500) {
+            tap.step(ms, (3_000..3_400).contains(&ms));
+        }
+        assert!(tap.armed());
+
         // A hold that starts before the gate never counts, however long it
         // runs past it; only a fresh press after it can.
-        let mut early = PressGate::new(gate);
-        assert!(!early.step(10_000, true));
-        assert!(!early.step(gate, true));
-        assert!(!early.step(gate + 3_000, true), "still the hold that began at 10 s");
-        assert!(early.step(gate + 3_100, false));
-        // No gate: arms as soon as the button is up, as every other card does.
-        let mut none = PressGate::new(0);
-        assert!(!none.step(0, true));
-        assert!(none.step(10, false));
-        assert!(PressGate::opens(gate, gate, false) && !PressGate::opens(gate, gate, true));
-        assert!(!PressGate::opens(gate, gate - 1, false));
+        let mut early = EnrolGate::default();
+        for ms in (0..=15_000).step_by(1_000) {
+            early.step(ms, ms >= 10_000);
+            assert!(!early.armed(), "{ms}: still the hold that began at 10 s");
+        }
+        early.step(15_100, false);
+        assert!(early.armed());
+
+        // The loop stalls (a redial, a WiFi rejoin) with page 1 on screen:
+        // page 1 has had its dwell, but pages 2 and 3 were never drawn, so
+        // the gate stays shut however much time has passed, and each page
+        // still gets its full dwell once the loop is back.
+        let mut stalled = EnrolGate::default();
+        assert_eq!(stalled.step(0, false), 0);
+        assert_eq!(stalled.step(20_000, false), 1, "page 1 was on screen throughout");
+        assert!(!stalled.armed(), "20 s gone, but pages 2 and 3 never shown");
+        assert_eq!(stalled.step(20_000 + dwell - 1, false), 1);
+        assert_eq!(stalled.step(20_000 + dwell, false), 2);
+        assert!(!stalled.armed());
+        assert_eq!(stalled.step(40_000, false), 0);
+        assert!(stalled.armed(), "every page has now had its full dwell");
+
+        // A page is never skipped, whatever the gap between looks.
+        let mut jumpy = EnrolGate::default();
+        let seen: Vec<usize> = [0, 9_000, 9_100, 30_000, 30_100, 45_000].iter().map(|ms| jumpy.step(*ms, false)).collect();
+        assert_eq!(seen, [0, 1, 1, 2, 2, 0]);
     }
 
     #[test]

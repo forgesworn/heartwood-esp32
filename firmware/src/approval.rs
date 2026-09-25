@@ -33,34 +33,12 @@ pub fn run_approval_loop<F>(
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
     timeout_secs: u64,
-    show_fn: F,
+    mut show_fn: F,
 ) -> ApprovalResult
 where
     F: FnMut(&mut Display<'_>, u32),
 {
-    let mut show_fn = show_fn;
-    run_gated_approval_loop(display, buttons, timeout_secs, 0, |d, remaining, _, _| show_fn(d, remaining))
-}
-
-/// [`run_approval_loop`] with a press gate (`phone_unlock::PressGate`): the
-/// A button does nothing, neither approving nor declining, until `gate_ms`
-/// after the card opened and the button has been seen up since, so a hold
-/// that starts before the gate never counts however long it runs. B, where
-/// the board has one, still cancels at any time: it is the explicit "no".
-/// `show_fn` gets the remaining seconds, the whole seconds since the card
-/// opened, and whether a hold now counts. Used by the unlock-phone enrol
-/// card, which must show all five words before it can be approved.
-pub fn run_gated_approval_loop<F>(
-    display: &mut Display<'_>,
-    buttons: &crate::button::Buttons<'_>,
-    timeout_secs: u64,
-    gate_ms: u64,
-    show_fn: F,
-) -> ApprovalResult
-where
-    F: FnMut(&mut Display<'_>, u32, u32, bool),
-{
-    let result = approval_loop_inner(display, buttons, timeout_secs, gate_ms, show_fn);
+    let result = approval_loop_inner(display, buttons, timeout_secs, None, |d, remaining, _, _| show_fn(d, remaining));
     // This loop consumed its presses (and B-cancels) directly off the pins;
     // drop any edge the sampler latched from them, or the approval hold
     // replays in `service_button` and instantly dismisses the very card the
@@ -69,15 +47,40 @@ where
     result
 }
 
+/// [`run_approval_loop`] for the unlock-phone enrol card, gated by
+/// `phone_unlock::EnrolGate`, the same rule the relay card follows: the
+/// pages turn only after each has been on screen its full dwell, and the A
+/// button does nothing, neither approving nor declining, until every page
+/// has had its dwell, 12 s have passed and the button has been seen up since
+/// (for [`DEBOUNCE_MS`], so one bouncing read cannot arm it). A hold that
+/// starts before that never counts, however long it runs. B, where the board
+/// has one, still cancels at any time: it is the explicit "no". `show_fn`
+/// gets the remaining seconds, the page to show and whether a hold counts,
+/// and is called whenever any of them changes.
+pub fn run_enrol_approval_loop<F>(
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    timeout_secs: u64,
+    show_fn: F,
+) -> ApprovalResult
+where
+    F: FnMut(&mut Display<'_>, u32, usize, bool),
+{
+    let mut gate = heartwood_common::phone_unlock::EnrolGate::default();
+    let result = approval_loop_inner(display, buttons, timeout_secs, Some(&mut gate), show_fn);
+    crate::button::clear_press_edge();
+    result
+}
+
 fn approval_loop_inner<F>(
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
     timeout_secs: u64,
-    gate_ms: u64,
+    mut gate: Option<&mut heartwood_common::phone_unlock::EnrolGate>,
     mut show_fn: F,
 ) -> ApprovalResult
 where
-    F: FnMut(&mut Display<'_>, u32, u32, bool),
+    F: FnMut(&mut Display<'_>, u32, usize, bool),
 {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(timeout_secs);
@@ -85,8 +88,9 @@ where
     let mut pressed = false;
     let mut press_start = Instant::now();
     let mut last_pct: u32 = 101; // force first draw
-    let mut gate = heartwood_common::phone_unlock::PressGate::new(gate_ms);
-    let mut last_armed = gate_ms == 0;
+    let mut last_view: Option<(usize, bool)> = None;
+    // When A was last seen down, for the gate's debounced "up".
+    let mut last_down = Instant::now();
 
     loop {
         crate::wdt::feed();
@@ -97,17 +101,27 @@ where
         }
 
         let remaining = (deadline - now).as_secs() as u32;
-        let elapsed = now.duration_since(start);
+        if buttons.a.is_low() {
+            last_down = now;
+        }
         // No gate (every caller but the enrol card): exactly the loop it
         // always was, a hold already down when the card appears included.
-        let armed = gate_ms == 0
-            || gate.step(elapsed.as_millis().min(u128::from(u64::MAX)) as u64, buttons.a.is_low());
+        let (page, armed) = match gate.as_deref_mut() {
+            None => (0, true),
+            Some(g) => {
+                let settled_up = now.duration_since(last_down) >= Duration::from_millis(u64::from(DEBOUNCE_MS));
+                let elapsed_ms = now.duration_since(start).as_millis().min(u128::from(u64::MAX)) as u64;
+                (g.step(elapsed_ms, !settled_up), g.armed())
+            }
+        };
 
-        // Show the caller's screen (countdown) when button is not held.
-        if (remaining != last_remaining || armed != last_armed) && !pressed {
-            show_fn(display, remaining, elapsed.as_secs() as u32, armed);
+        // Show the caller's screen (countdown) when button is not held; the
+        // enrol card also whenever its page or gate changes, so the page the
+        // gate counts is the page on screen.
+        if (remaining != last_remaining || last_view != Some((page, armed))) && !pressed {
+            show_fn(display, remaining, page, armed);
             last_remaining = remaining;
-            last_armed = armed;
+            last_view = Some((page, armed));
         }
 
         // B button (where present) is an explicit cancel — never an approve.

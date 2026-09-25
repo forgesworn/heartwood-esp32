@@ -5,6 +5,8 @@
 
 extern crate alloc;
 
+/// When a cable approval card starts listening to the A button.
+pub mod button_arm;
 pub mod deadline;
 pub mod derive;
 pub mod encoding;

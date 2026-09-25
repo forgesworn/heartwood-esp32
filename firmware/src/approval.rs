@@ -17,8 +17,9 @@ pub enum ApprovalResult {
 
 /// Debounce window on the A button's press and release edges. A single noisy
 /// GPIO read must neither start a hold nor be read as an early release (which
-/// would deny the request outright).
-const DEBOUNCE_MS: u32 = 30;
+/// would deny the request outright). The same span arms a card
+/// (`heartwood_common::button_arm`).
+const DEBOUNCE_MS: u32 = heartwood_common::button_arm::SETTLE_UP_MS as u32;
 
 /// Run the interactive button approval loop.
 ///
@@ -95,13 +96,13 @@ where
     // The enrol card: `oled::draw_generation` just after its face was last
     // drawn, to tell when something else has drawn over it.
     let mut drawn_gen: Option<u32> = None;
-    // When A was last seen down, for the debounced "up" that arms the card.
-    let mut last_down = Instant::now();
     // Every card, gated or not, arms only once A has been seen up for
-    // DEBOUNCE_MS: a hold already down when the card appears (the tail of
-    // an earlier decision, a pinned GPIO 0, a press made for a card that has
-    // just been taken off the screen) is never counted towards this one.
-    let mut plain_armed = false;
+    // `button_arm::SETTLE_UP_MS`: a hold already down when the card appears
+    // (the tail of an earlier decision, a pinned GPIO 0, a press made for a
+    // card that has just been taken off the screen) is never counted towards
+    // this one. The rule is pure and host-tested (`ButtonArm`); the gated
+    // card feeds the same settled "up" to its `EnrolGate`.
+    let mut arm = heartwood_common::button_arm::ButtonArm::default();
 
     loop {
         crate::wdt::feed();
@@ -112,17 +113,11 @@ where
         }
 
         let remaining = (deadline - now).as_secs() as u32;
-        if buttons.a.is_low() {
-            last_down = now;
-        }
-        let settled_up = now.duration_since(last_down) >= Duration::from_millis(u64::from(DEBOUNCE_MS));
+        let elapsed_ms = now.duration_since(start).as_millis().min(u128::from(u64::MAX)) as u64;
+        let settled_up = arm.settled_up(elapsed_ms, buttons.a.is_low());
         let (page, armed) = match gate.as_deref_mut() {
-            None => {
-                plain_armed = plain_armed || settled_up;
-                (0, plain_armed)
-            }
+            None => (0, arm.armed()),
             Some(g) => {
-                let elapsed_ms = now.duration_since(start).as_millis().min(u128::from(u64::MAX)) as u64;
                 // Drawn over since its last draw (nothing in this loop does,
                 // bar its own hold bar): the page starts its dwell again and
                 // the face is drawn at once, as on the relay.

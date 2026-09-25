@@ -634,15 +634,26 @@ is always a press on the board, whichever way the request arrives:
   sends) and the latched press is cleared; a held result stays, and is
   drawn again after the recovery card, so a "revoke id N" is not lost to
   one. The cable card arms only after the button has been seen up, so a
-  hold begun for a relay card cannot answer it. What remains: a host that
-  can send a validly signed OTA_BEGIN (any published release will do) or a
-  FACTORY_RESET can still take the screen, one card at a time, each denied
-  or left to expire by the owner. A `SET_NET_CONFIG` whose `op_mgmt`
-  differs from the stored one hands relay management to another key (or to
-  none), which is no recovery: it is an ordinary card, refused under a
-  relay card, and its card says so in every mode ("New operator?" with the
-  key's first 8 hex digits, or "Remove operator?", where a plain network
-  change reads "Set network config?"). The other card-raising frames
+  hold begun for a relay card cannot answer it. What remains: the checks
+  stop garbage, not a host. Any USB host, with no bridge secret, can pass
+  them with all four frames: `FACTORY_RESET` (checks nothing), an
+  `OTA_BEGIN` carrying any published release's signature, and, since
+  `GET_NET_CONFIG` answers any USB host in WiFi mode with the revision and
+  `op_mgmt`, a `PATCH_NET_CONFIG` restating the config at the current
+  `base_revision` and a `SET_NET_CONFIG` that copies `op_mgmt`. Each
+  expires every relay card and raises a card the owner must deny or let
+  run out; a hostile charger or hub re-sending one every 45 s blocks relay
+  approvals for as long as it is plugged in. That is within the model: USB
+  is physical access, the same access that can already factory-reset the
+  board, and unplugging it ends it. It cannot approve anything. A
+  `SET_NET_CONFIG` whose `op_mgmt` differs from the stored one hands relay
+  management to another key (or to none), which is no recovery: it is an
+  ordinary card, refused under a relay card, and its card says so in every
+  mode ("Replace operator?" with the new key's first 8 hex digits, as the
+  `SET_OPERATOR` card says it, "New operator?" where there was none, or
+  "Remove operator?", where a plain network change reads "Set network
+  config?"). One whose `op_mgmt` is not empty and not 64 hex digits is
+  refused "invalid config" before any card. The other card-raising frames
   (identity, PIN, vault, operator, slots, backups, NIP-46) stay refused:
   none is needed to get a board back. And a relay card no longer outlives
   a WiFi outage: the loop's WiFi-down waits tick it with no session, so it

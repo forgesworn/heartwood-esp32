@@ -2468,10 +2468,16 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
        down, can be declined, and expires on time ("Expired"). To show the
        expiry is what frees the cable, use a frame that is refused under a
        relay card, not a recovery frame (those take the screen whatever the
-       card is doing): a cable `SET_PIN` (or `CONNSLOT_UPDATE`) sent while
-       the card is still counting down is refused "approval on screen", and
-       the same frame sent after "Expired" raises its own card (decline it;
-       no power cycle needed).
+       card is doing): a plaintext USB sign request, `node
+       scripts/nip46-sign.mjs --port <port> --kind 1 --content "offline"`
+       (as `bench-approval-cards.mjs` step 16 sends it), is refused
+       "approval on screen" while the card is still counting down, and the
+       same command sent after "Expired" raises its own sign card (decline
+       it; no power cycle needed). Run it without `--secret-file` on an
+       unlocked board: the plaintext path is NACKed outright once the bridge
+       is authenticated, which would look like the refusal. (`SET_PIN` will
+       not do: the WiFi loop NACKs it while notes are held; nor will
+       `CONNSLOT_UPDATE`, which needs bridge auth.)
     g. After the cable enrol card of step 11 (45 s with the loop held), the
        log shows no "silent (no data/pong); reconnecting" for a quiet relay
        straight after, and a ping goes out on the next pass.
@@ -2496,9 +2502,13 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     card mid-gate (before "on phone? hold PRG"), or raise a relay card
     (an unapproved sign request, or a RECEIVE card) while PRG is already
     held, so the hold began before the card armed. Holding PRG, send a
-    cable `SET_NET_CONFIG` that keeps the stored `op_mgmt` (repeat with
-    `PATCH_NET_CONFIG`, a correctly signed `OTA_BEGIN` and `FACTORY_RESET`,
-    declining each): the relay card is answered Expired at once (its client
+    cable `SET_NET_CONFIG` that keeps the stored `op_mgmt` (`node
+    scripts/net-config.mjs --port <port> --set-config cfg.json`, where
+    cfg.json holds the board's current ssid, password, relays and mode; the
+    script copies op_mgmt from the board and prints the card to expect).
+    Repeat with `PATCH_NET_CONFIG` (`net-relays.mjs --relays` naming the
+    current list), a correctly signed `OTA_BEGIN` (the `ota` tool) and
+    `FACTORY_RESET` (Sapwood's factory reset; no bench script sends 0x24), declining each: the relay card is answered Expired at once (its client
     or the operator gets the usual expiry), and the cable card comes up
     but does not start its hold bar while the button is still down; only a
     fresh press after letting go counts. Then, each with a relay card up:
@@ -2507,11 +2517,13 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
       length (send one a second for 10 s) are each answered with their
       error and cancel nothing: the relay card keeps counting down and
       can still be approved;
-    - a `SET_NET_CONFIG` whose `op_mgmt` differs from the stored one (or is
-      empty) is refused "approval on screen", like 10b. Sent with no card
-      up, its card reads "New operator?" with the new key's first 8 hex
-      digits and "+network" (or "Remove operator?"); decline it. On a
-      USB-bridged board the same card appears;
+    - a `SET_NET_CONFIG` whose `op_mgmt` differs from the stored one
+      (`--set-config cfg.json --op-mgmt <another key>`, or `--op-mgmt none`)
+      is refused "approval on screen", like 10b. Sent with no card up, its
+      card reads "Replace operator?" with the new key's first 8 hex digits
+      and "+network" (or "Remove operator?"); decline it. On a USB-bridged
+      board the same card appears. One whose `op_mgmt` is not 64 hex digits
+      is NACKed "invalid config" with no card;
     - with a result younger than 20 s on screen (PHONE ADDED, or "Not sent /
       revoke id N"), a `FACTORY_RESET` still raises its card; decline it,
       and the result comes back about 2 s later and waits for a press.

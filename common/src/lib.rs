@@ -136,6 +136,11 @@ pub mod at_rest_status;
 #[cfg(all(feature = "seed-encrypt", feature = "nip44", feature = "nip46"))]
 pub mod phone_unlock;
 
+/// Phone unlock across a relay change: the record of what the phones were
+/// told, and when and where a board tells them again.
+#[cfg(all(feature = "seed-encrypt", feature = "nip44", feature = "nip46"))]
+pub mod phone_relays;
+
 #[cfg(feature = "mnemonic")]
 pub mod restore;
 

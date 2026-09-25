@@ -2179,6 +2179,112 @@ Sapwood's Backup panel, and a text editor for the decrypted file.
    statement, not an absence. Compare the file with the one from item 5: same
    empty array, different second key, different meaning.
 
+## 27. Unlock phones follow a relay change (added 2026-09-25, NOT YET BENCH-RUN)
+
+A phone listens on the relays it has been told about. A board that moves to
+relays its phones never heard of would, at its next locked restart, announce
+where no phone listens. The board now records the relays the phones were last
+told (`ph_relays`) and, while its live list has a relay missing from that
+record, tells them on the OLD relays (logic and host tests:
+`common/src/phone_relays.rs`):
+
+- locked, it repeats each phone's lock announcement on one old relay per
+  announce interval, in the pass straight after the live announcement (a
+  dial blocks for at most about 35 s, so it ends before the next
+  announcement); each relay rests 5 minutes after a dial, and a failing one
+  backs off (10, 20, 40, then 60 minutes);
+- unlocked, it posts a relay update (a 24135 like any other, sealed `t` =
+  `relays`) on each old relay in six rounds: the first a random 2 to 20
+  minutes after the board comes online, then after gaps of about 2 min,
+  13 min, 45 min, 5 h and 18 h, each randomised by a quarter either way. Every
+  update goes out on a publish-only connection of its own, never on a session
+  carrying the signer's subscription. The secondary relay stays closed for
+  the round; with the primary and a pinned relay both live the round waits,
+  and after 10 minutes the pinned relay steps aside for one dial and
+  redials 15 s later, once it has been quiet for 5 s with nothing buffered.
+  The round count is saved after each round, so a restart resumes. A round in
+  which the heap was too tight for every dial does not count and comes back
+  later. After the sixth round the live list is recorded and the drift ends,
+  but only if some round had an event accepted by an old relay; until then
+  the sixth round repeats about every 18 h. A revoke of the last phone, or an
+  enrolment after that, ends the update at once without touching the new
+  record.
+
+**Release note (next beta):** phones enrolled on beta.17 before a relay
+change also made on beta.17 are not told about it (beta.17 kept no record,
+and the first boot on this firmware records the live list as what they know):
+re-enrol them.
+
+Needs a WiFi board with a vault key and one phone enrolled with
+`scripts/phone-unlock.mjs enrol` while the board used relay set A, a second
+relay set C sharing no relay with A, and a relay capture on A (any client
+subscribed to `{"kinds":[24135]}`).
+
+1. **In step, nothing extra.** Reset the board. The serial log has no
+   "relays changed" line and no "old relay" line; A carries only the usual
+   announcements.
+
+2. **Change to C, restart locked.** Point the board at C (Sapwood's network
+   editor or `SET_NET_CONFIG`). After the restart the log reads "relays changed
+   since the phones were told; telling them on N old relay(s), 0 of 6 update
+   rounds already sent", then, straight after an announcement on C,
+   "announced on old relay ..." for one A relay (the next A relay a minute
+   later). The capture on A shows a 24135 per phone with one `h` tag and no
+   `p` tag, from the same one-time author as the board's announcements on C.
+
+3. **The phone hears it on A and unlocks over C.** Run `phone-unlock.mjs
+   listen` with the state file still listing only A. It prompts once (the
+   repeat on C, if it listens there, is a duplicate), prints "following the
+   board to" the C relays, and delivers; the board shows "Unlocked by"
+   typically within 5 s of the delivery, and within 40 s at most (the outer
+   bound, when an old-relay dial to a slow or dead relay started just before
+   the delivery), and never announces again after it.
+
+4. **A dead old relay decays.** Add an unreachable `wss://` URL to A before
+   the change (or stop one of A's relays). Its "old relay ... failed" lines
+   come 10, 20, 40 and then 60 minutes apart, and a heartwoodd or Sapwood PIN
+   unlock over USB still succeeds between them.
+
+5. **Unlocked, the rounds go out on their own connections.** With the board
+   unlocked on C, "relay update round 1 of 6" appears 2 to 20 minutes after
+   the board came online, with one "relay update on old relay" line per A
+   relay ("(n accepted)"); round 2 follows 90 to 150 s later. The capture on A
+   shows each round's 24135s from a new author, each the same length as the
+   lock announcements of step 2, arriving on a connection that sent no `REQ`.
+   A second `listen` run against a copy of the state file that lists only A
+   prints "relay update: ..." and does NOT prompt.
+
+6. **A restart resumes.** Reset after round 2 and unlock. The boot log says
+   "2 of 6 update rounds already sent" and round 3 goes out 2 to 20 minutes
+   after the board comes online.
+
+7. **Ceiling.** With a pinned relay live beside the primary (a nostrconnect
+   pairing on a relay outside C), the log says "relay update waiting: the
+   primary and a pinned relay fill the session ceiling" once; about 10
+   minutes later, at a moment the pinned relay has been quiet for 5 s,
+   "pinned ... steps aside for one relay update dial", the dial, and the
+   pinned relay rejoining about 15 s later. At no point are three
+   relay sessions open (heap log: "2 session(s)" at most).
+
+8. **Revoked and zero-phone boards say nothing.** Revoke the phone
+   (`phone-unlock.mjs revoke`) while an update is pending, then reset. The
+   boot log has no "relays changed" line (the record went with the last
+   phone), and A sees no further 24135 from the board. Enrol again on C and
+   reset: still no "relays changed" line.
+
+   8b. **The same in one unlocked boot, no reset.** With an update pending
+   (after step 5's round 1, before round 6), revoke every phone, then enrol
+   a new one on C (`phone-unlock.mjs enrol`, one press). Within a second of
+   the last revoke the log says "phones' relay record changed (revoke or
+   enrolment); relay update ended", and the enrolment after it starts no
+   update. Keep the capture on A running for at
+   least 20 minutes (past the next round's latest time): A sees no further
+   24135 from the board. A reset afterwards has no "relays changed" line.
+
+9. **The record ends the drift.** Optional, about 24 h: leave the board
+   unlocked through round 6. The log says "phones told about the relay
+   change; recorded", and a reset afterwards has no "relays changed" line.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

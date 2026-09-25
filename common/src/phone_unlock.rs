@@ -25,9 +25,16 @@
 // NIP-44(throwaway -> author) of a [`Delivery`] `{v, id, s}`. Holding S is the
 // proof; the board does not care who authored the delivery.
 //
-// Test vectors: tests/fixtures/phone-unlock-v1.json (checked by the tests
-// below and by scripts/lib/phone-unlock.test.mjs, an independent
-// implementation in Node's own crypto).
+// The same construction carries a relay update when the board's relay list
+// changes: `t` is `"relays"` instead of `"locked"`, the author is a fresh
+// one-time key per round, and it is posted on the relays the phones were last
+// told about. A phone never prompts for it and follows its `relays`. When and
+// where it goes: `phone_relays`.
+//
+// Test vectors: tests/fixtures/phone-unlock-v1.json and
+// phone-unlock-v1-relays.json (checked by the tests below and by
+// scripts/lib/phone-unlock.test.mjs, an independent implementation in Node's
+// own crypto).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -534,6 +541,58 @@ pub fn enrolment_json(e: &Enrolment) -> serde_json::Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Relay updates (when and where they go: crate::phone_relays)
+// ---------------------------------------------------------------------------
+//
+// A relay update is a lock announcement in every wire respect: kind 24135, a
+// one-time author (fresh per round), one `h` tag, content sealed as above. Only the sealed `t`
+// says `"relays"`, which the prompt rule answers with [`Verdict::NotLocked`],
+// and which is as long as `"locked"`, so an update is the same size as that
+// boot's lock announcements. A phone follows `relays` from any message it
+// opens, whatever the verdict.
+
+impl LockContext {
+    /// This context as a relay update: every field as it is (so the sealed
+    /// size matches this boot's lock announcements), `t` = `"relays"`.
+    pub fn as_relay_update(&self) -> LockContext {
+        LockContext { t: TYPE_RELAYS.into(), ..self.clone() }
+    }
+}
+
+/// One phone's message under `author`: the `h` tag value and the sealed
+/// content of `shared` with that phone's id. Lock announcements and relay
+/// updates both go through here, one phone at a time, so a board never
+/// holds every phone's event at once. `nonce` must be random and fresh.
+pub fn phone_message(
+    rec: &crate::data_key::PhoneRecord,
+    shared: &LockContext,
+    author: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+) -> (String, String) {
+    let ctx = LockContext { id: rec.id, ..shared.clone() };
+    (hint(&rec.phone_key, author), seal_context(&rec.phone_key, author, &ctx, nonce))
+}
+
+/// [`phone_message`] for every enrolled phone. A board with no phones gets
+/// nothing, and a revoked phone has no record, so nothing here is for it.
+pub fn per_phone_messages(
+    phones: &crate::data_key::PhoneSet,
+    shared: &LockContext,
+    author: &[u8; 32],
+    rng: &mut dyn FnMut(&mut [u8]),
+) -> Vec<(String, String)> {
+    phones
+        .records()
+        .iter()
+        .map(|rec| {
+            let mut nonce = [0u8; NONCE_LEN];
+            rng(&mut nonce);
+            phone_message(rec, shared, author, &nonce)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +841,101 @@ mod tests {
         phones.enrol(3, "Pixel", &[1u8; 32], &[2u8; 32], &[0u8; 12]).unwrap();
         let v = list_json(&phones, false);
         assert_eq!(v, serde_json::json!({"phones":[{"id":3,"label":"Pixel"}],"max":16,"announce_operator":false}));
+    }
+
+    // --- Relay changes ------------------------------------------------------
+
+    #[test]
+    fn a_relay_update_is_never_a_prompt_and_looks_like_a_lock_announcement() {
+        assert_eq!(TYPE_RELAYS.len(), TYPE_LOCKED.len(), "the type must not change the size");
+        let lock = ctx();
+        let update = lock.as_relay_update();
+        assert_eq!(update.t, TYPE_RELAYS);
+        assert_eq!(LockContext { t: TYPE_LOCKED.into(), ..update.clone() }, lock, "only t differs");
+
+        let k = phone_key(&[1u8; 32]);
+        let author = [9u8; 32];
+        let sealed_lock = seal_context(&k, &author, &lock, &[3u8; 12]);
+        let sealed_update = seal_context(&k, &author, &update, &[3u8; 12]);
+        assert_eq!(sealed_lock.len(), sealed_update.len(), "same size on the wire");
+        assert_ne!(sealed_lock, sealed_update);
+        assert_eq!(open_context(&k, &author, &sealed_update), Ok(update.clone()));
+
+        // Whatever the timing and history, an update never prompts.
+        let now = 1_800_000_000;
+        for last in [None, Some((0, author)), Some((212, author)), Some((9_999, [1u8; 32]))] {
+            for created in [now, now - 500, now + 500] {
+                assert_eq!(judge(&update, &author, created, now, last), Verdict::NotLocked);
+            }
+        }
+        // Anything but exactly "locked" is not a lock announcement.
+        for t in ["", "Locked", "locked ", "relay", "unlock"] {
+            let odd = LockContext { t: t.into(), ..lock.clone() };
+            assert_eq!(judge(&odd, &author, now, now, None), Verdict::NotLocked, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn per_phone_messages_use_the_lock_scheme_and_skip_revoked_phones() {
+        use crate::data_key::PhoneSet;
+        let dk = [0xD0u8; 32];
+        let (s1, s2) = ([1u8; 32], [2u8; 32]);
+        let mut phones = PhoneSet::default();
+        let author = [9u8; 32];
+        let shared = ctx().as_relay_update();
+
+        assert!(per_phone_messages(&phones, &shared, &author, &mut rng_from(1)).is_empty(), "no phones, nothing");
+
+        phones.enrol(11, "a", &s1, &dk, &[0u8; 12]).unwrap();
+        phones.enrol(22, "b", &s2, &dk, &[1u8; 12]).unwrap();
+        let out = per_phone_messages(&phones, &shared, &author, &mut rng_from(1));
+        assert_eq!(out.len(), 2);
+        for (s, id) in [(s1, 11u32), (s2, 22u32)] {
+            let k = phone_key(&s);
+            let mine: Vec<_> = out.iter().filter(|(h, _)| hint_matches(&k, &author, h)).collect();
+            assert_eq!(mine.len(), 1, "exactly one message is recognisably this phone's");
+            let (h, content) = mine[0];
+            assert_eq!(h, &hint(&k, &author), "the lock announcements' hint");
+            let opened = open_context(&k, &author, content).unwrap();
+            assert_eq!(opened, LockContext { id, ..shared.clone() });
+        }
+        assert!(out.iter().all(|(_, c)| !c.contains("relay.example")));
+
+        // A later round, under a new one-time author, shares no tag with this one.
+        let next = per_phone_messages(&phones, &shared, &[8u8; 32], &mut rng_from(2));
+        assert!(next.iter().all(|(h, _)| out.iter().all(|(o, _)| o != h)));
+
+        // Revoked: the phone that still holds its secret finds nothing.
+        phones.revoke(22).unwrap();
+        let out = per_phone_messages(&phones, &shared, &author, &mut rng_from(3));
+        assert_eq!(out.len(), 1);
+        let k2 = phone_key(&s2);
+        assert!(out.iter().all(|(h, c)| !hint_matches(&k2, &author, h) && open_context(&k2, &author, c).is_err()));
+    }
+
+    /// The published relay-update vector (tests/fixtures/phone-unlock-v1-relays.json):
+    /// the v1 fixture's keys and context with `t` = "relays".
+    #[test]
+    fn relay_update_vector_holds() {
+        let v1: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/phone-unlock-v1.json")).unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/phone-unlock-v1-relays.json")).unwrap();
+        for key in ["slot_secret", "phone_key", "author", "hint", "nonce"] {
+            assert_eq!(fixture[key], v1[key], "{key}");
+        }
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+        };
+        let k: [u8; 32] = hex(fixture["phone_key"].as_str().unwrap()).try_into().unwrap();
+        let author: [u8; 32] = hex(fixture["author"].as_str().unwrap()).try_into().unwrap();
+        let nonce: [u8; 12] = hex(fixture["nonce"].as_str().unwrap()).try_into().unwrap();
+        let context: LockContext = serde_json::from_value(fixture["context"].clone()).unwrap();
+        assert_eq!(context, ctx().as_relay_update());
+        let sealed = seal_context(&k, &author, &context, &nonce);
+        assert_eq!(fixture["content"].as_str().unwrap(), sealed);
+        assert_eq!(sealed.len(), v1["content"].as_str().unwrap().len());
+        assert_eq!(judge(&context, &author, 0, 0, None), Verdict::NotLocked);
     }
 
 }

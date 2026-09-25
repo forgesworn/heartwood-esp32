@@ -11,6 +11,12 @@
 //   okm      = HKDF-SHA256(salt SALT, ikm K, info "announce" || author) 64 bytes
 //   content  = base64(0x01 || nonce(12) || ChaCha20(okm[0..32], nonce) ^ json
 //                     || HMAC-SHA256(okm[32..64], 0x01 || nonce || ct))
+//
+// The json's `t` is "locked" for a lock announcement and "relays" for a relay
+// update, which a board posts on the relays its phones were last told about
+// when its list changes. judge() never prompts for an update; a phone follows
+// the `relays` of any message it opens, whatever the verdict.
+// Vectors: common/tests/fixtures/phone-unlock-v1.json and -v1-relays.json.
 
 import { createCipheriv, createHmac, hkdfSync, timingSafeEqual } from 'node:crypto'
 

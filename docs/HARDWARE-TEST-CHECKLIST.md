@@ -2563,7 +2563,8 @@ text and drew "HOLD TO SIGN / Factory / Profile / kind 0". Both now draw a
 titled card. Deny each one; do not hold PRG on either.
 
 - [ ] **30a. Factory reset.** Send a factory reset over USB (Sapwood, or
-  `scripts/mgmt-request.mjs`). Expected: "FACTORY RESET / ERASE ALL KEYS /
+  `node scripts/factory-reset-card.mjs --port <port>`, which never plays the
+  press prompt). Expected: "FACTORY RESET / ERASE ALL KEYS /
   notes and pairings too", a 30 s countdown and the hold hint. Tap to deny;
   the board NACKs and keeps every key.
 - [ ] **30b. Identity removal.** Remove a non-default slot from Sapwood.

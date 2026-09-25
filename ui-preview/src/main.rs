@@ -950,7 +950,25 @@ mod error_card_tests {
         let body = &source[start..];
         let card = &body[..body.find("match result").expect("approval result is matched")];
         assert!(card.contains("show_titled_approval("), "factory reset card must use a titled renderer");
-        assert!(card.contains("ERASE ALL KEYS"), "factory reset card must say ERASE ALL KEYS");
+        assert!(
+            string_literals(card).iter().any(|l| l.contains("ERASE ALL KEYS")),
+            "factory reset card must say ERASE ALL KEYS in a drawn string, not a comment"
+        );
+    }
+
+    /// The identity removal card must say it erases, in words drawn on screen.
+    #[test]
+    fn identity_removal_card_says_erase() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/provision.rs");
+        let source = std::fs::read_to_string(path).expect("provision.rs is readable");
+        let start = source.find("pub fn handle_remove(").expect("handle_remove exists");
+        let body = &source[start..];
+        let region = &body[..body.find("if !matches!(approval").expect("approval result is checked")];
+        assert!(region.contains("show_titled_approval("), "removal card must use a titled renderer");
+        assert!(
+            string_literals(region).iter().any(|l| l.starts_with("ERASE slot")),
+            "removal card must say ERASE slot N in a drawn string"
+        );
     }
 
     /// Every double-quoted literal in `region`, returned without its quotes.

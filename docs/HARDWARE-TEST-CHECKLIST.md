@@ -2519,6 +2519,21 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     one-off rendezvous tag. No event carries the label, the enrolment key or
     the phone's id in the clear.
 
+## 30. Destructive cards say ERASE (added 2026-09-25, NOT YET BENCH-RUN)
+
+The factory reset and identity removal cards used a renderer that dropped its
+text and drew "HOLD TO SIGN / Factory / Profile / kind 0". Both now draw a
+titled card. Deny each one; do not hold PRG on either.
+
+- [ ] **30a. Factory reset.** Send a factory reset over USB (Sapwood, or
+  `scripts/mgmt-request.mjs`). Expected: "FACTORY RESET / ERASE ALL KEYS /
+  notes and pairings too", a 30 s countdown and the hold hint. Tap to deny;
+  the board NACKs and keeps every key.
+- [ ] **30b. Identity removal.** Remove a non-default slot from Sapwood.
+  Expected: "REMOVE IDENTITY / ERASE slot N / npub1..." with the first 16
+  characters of that slot's npub, matching Sapwood. Let it time out; the slot
+  stays.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

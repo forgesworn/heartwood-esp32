@@ -1,12 +1,13 @@
 //! LUD-25 Part 2 on this device: notes paid to its own keys.
 //!
-//! A Part 2 note is keyed by a public key rather than a hash. Its holder keeps
-//! the key, the mint only ever learns `cp1<pk>`, and the note is spent with a
-//! `ck1`: a recoverable signature the key makes over one fixed message, from
-//! which the mint recovers `pk` and finds the note. A mint that holds a
-//! watch-only `cx1` for a lightning address mints each payment straight to the
-//! holder's next key, so the gift wrap that tells the holder about it carries
-//! no secret at all, only where to look and at which index.
+//! A key note is a taproot output key `Q` that is simply the note key's own
+//! public key. Its holder keeps the key, the mint only ever learns
+//! `cp1<Q>`, and the note is spent with a `ck1`: `Q` and a BIP-340 signature
+//! over the canonical spend's key-path sighash for that one mint
+//! ([`crate::taproot`]). A mint that holds a watch-only `cx1` for a lightning
+//! address mints each payment straight to the holder's next key, so the gift
+//! wrap that tells the holder about it carries no secret at all, only where
+//! to look and at which index.
 //!
 //! **Where this device's receiving keys come from.** A lightning address on a
 //! Nostr-native mint belongs to an npub: the key that signed the registration
@@ -18,13 +19,17 @@
 //! branch = m/139'/1'/d1/d2/d3/d4 from that seed, d1..d4 from HMAC-SHA256(m/139'/1'/0, host)
 //! t      = tagged_hash("LNURLcash/derive", P || chainCode || ser32_be(i))
 //! sk_i   = (P has even y ? p : n - p) + t   (mod n)
-//! ck1    = recoverable ECDSA by sk_i over sha256(sha256("Lightning Signed Message:" || "LNURLcash"))
+//! ck1    = Q || BIP-340(sk_i, key_path_sighash(Q, mint domain), aux_rand = 0),  Q = x(sk_i·G)
 //! ```
 //!
 //! The first line is this device's own, and the only one. Everything below it
-//! is lnurl-wallet's address path (`cashSecrets.ts`) and LUD-25's tweak
-//! exactly, so lnurlcash-kit's `deriveCashRoot` and `deriveCashAddressNode`,
-//! handed this seed, find every note. It exists because this device never
+//! is lnurlcash-kit's address path and LUD-25's tweak exactly, so the kit's
+//! `deriveCashRoot` and `deriveCashAddressNode`, handed this seed, find every
+//! note. LUD-25 and lnurl-wallet now root the branch one level higher, at
+//! `m/139'/d1..d4` with its hashing key at `m/139'/0`; the `1'` here predates
+//! that and is kept, since moving it would move every key note already
+//! paid. It changes nothing a mint sees: a mint derives from the `cx1`, not
+//! from the path. It exists because this device never
 //! holds a BIP-32 master (see [`crate::cash`]): what it holds is the identity
 //! key, which the owner's recovery phrase already backs up. So these notes come
 //! back from the heartwood's phrase, and nothing paired with the device can
@@ -47,7 +52,8 @@ use zeroize::Zeroizing;
 
 use crate::cash::{derive_cash_child, derive_cash_domain_node, derive_cash_root, CashNode};
 use crate::derive::backend;
-use crate::encoding::{encode_ck1, encode_cx1};
+use crate::encoding::{encode_ck1, encode_cx1, encode_legacy_ck1};
+use crate::taproot::{key_path_sighash, tagged_hash};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -61,9 +67,8 @@ const ADDRESS_BRANCH: u32 = 1 | 0x8000_0000;
 
 const NOTE_DERIVE_TAG: &[u8] = b"LNURLcash/derive";
 
-/// The one message every ownership proof signs, so a note has exactly one
-/// `ck1` from its holder: the value that spends it is the value that proves
-/// it, and re-deriving the key reproduces it (RFC6979).
+/// The fixed message the deprecated recoverable `ck1` signed
+/// ([`legacy_ck1_of`]). A spend now signs the canonical transaction instead.
 pub const OWNERSHIP_MESSAGE: &[u8] = b"LNURLcash";
 
 /// The seed a Nostr identity's address branches hang off.
@@ -116,15 +121,34 @@ pub fn cx1_of(node: &CashNode) -> Result<String, &'static str> {
 }
 
 fn note_tweak(branch: &Branch, index: u32) -> [u8; 32] {
-    let tag = Sha256::digest(NOTE_DERIVE_TAG);
-    Sha256::new()
-        .chain_update(tag)
-        .chain_update(tag)
-        .chain_update(branch.pubkey)
-        .chain_update(branch.chain_code)
-        .chain_update(index.to_be_bytes())
-        .finalize()
-        .into()
+    reduce_mod_n(tagged_hash(
+        NOTE_DERIVE_TAG,
+        &[&branch.pubkey, &branch.chain_code, &index.to_be_bytes()],
+    ))
+}
+
+/// secp256k1's group order n, big-endian.
+const CURVE_ORDER: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+];
+
+/// `t mod n`, as the spec requires and lnurl-wallet does (lnurl-mint refuses
+/// `t >= n` instead; at ~2^-128 the two never meet). A 32-byte value is below
+/// 2n, so one subtraction reduces it. Done here rather than in a backend, so
+/// all three agree.
+fn reduce_mod_n(t: [u8; 32]) -> [u8; 32] {
+    if t < CURVE_ORDER {
+        return t;
+    }
+    let mut out = [0u8; 32];
+    let mut borrow = 0u16;
+    for i in (0..32).rev() {
+        let d = 0x100 + u16::from(t[i]) - u16::from(CURVE_ORDER[i]) - borrow;
+        out[i] = d as u8;
+        borrow = u16::from(d < 0x100);
+    }
+    out
 }
 
 /// The key of note `index` on a branch. `index` is any uint32 and is never
@@ -142,17 +166,42 @@ pub fn note_secret_key(node: &CashNode, index: u32) -> Result<Zeroizing<[u8; 32]
     } else {
         Zeroizing::new(node.private_key)
     };
-    // tweak_add refuses t >= n and a zero sum, the same two cases BIP-341 and
-    // lnurl-mint refuse. Either is a ~2^-128 event, and the answer is the
-    // next index, never a reduced tweak: a wrong key is a note nobody finds.
+    // the tweak is already below n, so tweak_add refuses only a zero sum, a
+    // ~2^-128 event whose answer is the next index
     backend::tweak_add(&base, &tweak)
         .map(Zeroizing::new)
         .map_err(|_| "this note index is unusable on this branch")
 }
 
-/// `x(sk * G)`: what the note is filed under, and what its `cp1` encodes.
+/// `x(sk * G)`: the note's `Q` (a key note takes no BIP-86 tweak), what the
+/// mint files it under, and what its `cp1` encodes.
 pub fn note_pubkey(secret: &[u8; 32]) -> Result<[u8; 32], &'static str> {
     backend::pubkey_from_secret(secret)
+}
+
+/// The note's bearer credential at one mint: what a wallet presents as `k1`
+/// to spend it there. Disclosing it is disclosing the note, exactly as a
+/// bearer note's preimage is.
+///
+/// `Q || sig`, 96 bytes: a BIP-340 signature by the note's key over the
+/// canonical spend's key-path sighash, whose prevout binds `mint`'s domain.
+/// So a `ck1` one mint has seen is refused at every other, and `aux_rand`
+/// is all zeros, so the same key and mint always give the same string: a key
+/// re-derived from the seed spends its note with nothing else stored.
+///
+/// `mint` is the note's withdraw endpoint as the locker keeps it
+/// (`moneyer.dev/w`, with any port and path), or the bare domain; [`spend_domain`]
+/// takes it down to the hostname the signature binds.
+pub fn ck1_of(secret: &[u8; 32], mint: &str) -> Result<String, &'static str> {
+    let domain = spend_domain(mint);
+    if domain.is_empty() {
+        return Err("a ck1 is bound to a mint, and this note names none");
+    }
+    let output_key = note_pubkey(secret)?;
+    let mut signature = backend::sign_bip340(secret, &key_path_sighash(&output_key, domain))?;
+    let ck1 = encode_ck1(&output_key, &signature);
+    zeroize::Zeroize::zeroize(&mut signature);
+    Ok(ck1)
 }
 
 fn ownership_digest() -> [u8; 32] {
@@ -163,16 +212,21 @@ fn ownership_digest() -> [u8; 32] {
     Sha256::digest(inner).into()
 }
 
-/// A note's ownership proof, `r || s || recovery id`.
+/// The deprecated ownership proof, `r || s || recovery id` over the fixed
+/// Lightning message: what [`legacy_ck1_of`] encodes.
 pub fn ownership_signature(secret: &[u8; 32]) -> Result<[u8; 65], &'static str> {
     backend::sign_recoverable(secret, &ownership_digest())
 }
 
-/// The note's bearer credential: what a wallet presents as `k1` to spend it.
-/// Disclosing it is disclosing the note, exactly as a Part 1 secret is.
-pub fn ck1_of(secret: &[u8; 32]) -> Result<String, &'static str> {
+/// The 65-byte recoverable `ck1` this device emitted before spends were
+/// bound to a mint. Bound to none, and deprecated; mints following the
+/// reference still accept it, so every one already handed out stays
+/// redeemable. Nothing on the device's own paths makes one any more. It is
+/// kept because it is what a mint that predates the domain-bound form
+/// accepts, and so the notes spent with it can be reproduced from the key.
+pub fn legacy_ck1_of(secret: &[u8; 32]) -> Result<String, &'static str> {
     let mut signature = ownership_signature(secret)?;
-    let ck1 = encode_ck1(&signature);
+    let ck1 = encode_legacy_ck1(&signature);
     zeroize::Zeroize::zeroize(&mut signature);
     Ok(ck1)
 }
@@ -181,6 +235,119 @@ pub fn ck1_of(secret: &[u8; 32]) -> Result<String, &'static str> {
 /// `moneyer.dev`. The locker stores the endpoint; a branch is per mint.
 pub fn branch_host(note_host: &str) -> &str {
     note_host.split('/').next().unwrap_or(note_host)
+}
+
+/// The domain a spend of a note at `note_host` is bound to: the bare
+/// hostname, never the scheme, the port or the path (lnurl-wallet's
+/// `spendDomainOf`, which is `new URL(..).hostname`). Not lowercased here;
+/// [`crate::taproot::spend_prevout`] does that.
+///
+/// Not [`branch_host`], which keeps the port. The branch a key sits on is
+/// named by host and port as a wallet spells it (lnurl-wallet's `serverOf`),
+/// while a spend binds the hostname alone, so a mint on a non-default port
+/// derives by one string and signs by another. Both are LUD-25's choices.
+pub fn spend_domain(note_host: &str) -> &str {
+    let rest = note_host.split_once("://").map_or(note_host, |(_, rest)| rest);
+    let authority = rest.split(&['/', '?', '#'][..]).next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    if host.starts_with('[') {
+        // An IPv6 literal keeps its brackets, as a URL's hostname does.
+        return host.find(']').map_or(host, |end| &host[..=end]);
+    }
+    host.split(':').next().unwrap_or(host)
+}
+
+/// What a registration proof authorises: LUD-25 has a mint register or
+/// unregister a lightning-address username against a `cx1` only on a proof
+/// from that branch, never on an assertion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressAction {
+    Register,
+    Unregister,
+}
+
+impl AddressAction {
+    pub fn parse(action: &str) -> Option<Self> {
+        match action {
+            "register" => Some(Self::Register),
+            "unregister" => Some(Self::Unregister),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Register => "register",
+            Self::Unregister => "unregister",
+        }
+    }
+}
+
+/// Longest username the device signs a proof for. LUD-16 sets no limit; this
+/// is a bound on what an approval card has to show, not a mint's rule.
+pub const MAX_USERNAME_LEN: usize = 64;
+
+/// A username the device will sign a proof for: LUD-16's alphabet
+/// (`a-z0-9-_.`) and nothing else. That keeps the signed message the fixed
+/// `LNURLcash:<action>:<domain>:<username>`: with a `:` allowed in a name,
+/// one message could be read as another.
+pub fn valid_username(username: &str) -> bool {
+    !username.is_empty()
+        && username.len() <= MAX_USERNAME_LEN
+        && username
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
+}
+
+/// `sha256("LNURLcash:" || action || ":" || domain || ":" || username)`, the
+/// digest a registration proof signs. `domain` is the mint's bare lowercase
+/// hostname, which is what stops a proof one mint has seen being replayed at
+/// another.
+pub fn address_proof_digest(action: AddressAction, domain: &str, username: &str) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"LNURLcash:")
+        .chain_update(action.as_str())
+        .chain_update(b":")
+        .chain_update(domain)
+        .chain_update(b":")
+        .chain_update(username)
+        .finalize()
+        .into()
+}
+
+/// A BIP-340 signature by a branch's index-0 key over
+/// [`address_proof_digest`], with a zero `aux_rand` like every other
+/// signature here. Takes the fixed message's parts, never a digest, so
+/// nothing that reaches this can have it sign anything else.
+pub fn sign_address_proof(
+    index_zero_secret: &[u8; 32],
+    action: AddressAction,
+    domain: &str,
+    username: &str,
+) -> Result<[u8; 64], &'static str> {
+    if domain.is_empty() || !valid_username(username) {
+        return Err("a registration proof needs a mint domain and a lightning-address username");
+    }
+    backend::sign_bip340(index_zero_secret, &address_proof_digest(action, domain, username))
+}
+
+/// The proof the served identity's branch at `host` gives for `action` on
+/// `username`: what a mint requires before it registers the name against
+/// that branch's `cx1` (the one [`cx1_of`] hands out for the same `host`), or
+/// unregisters it.
+///
+/// `host` names the branch as `address_node` does, port and all; the proof
+/// binds its bare hostname ([`spend_domain`]), lowercased, as LUD-25 says.
+pub fn address_proof(
+    identity_secret: &[u8; 32],
+    host: &str,
+    action: AddressAction,
+    username: &str,
+) -> Result<[u8; 64], &'static str> {
+    let domain = spend_domain(host).to_ascii_lowercase();
+    let node = address_node(identity_secret, host)?;
+    let index_zero = note_secret_key(&node, 0)?;
+    sign_address_proof(&index_zero, action, &domain, username)
 }
 
 /// The key a note paid to `identity` at `index` answers to, checked against
@@ -209,7 +376,7 @@ pub fn claim_note_key(
 mod tests {
     use super::*;
     use crate::cash::cash_node_to_bytes;
-    use crate::encoding::encode_cp1;
+    use crate::encoding::{encode_cp1, Ck1};
     use crate::hex::{hex_decode, hex_encode};
     use serde_json::Value;
 
@@ -236,8 +403,152 @@ mod tests {
                     "{label} signature {index}"
                 );
             }
-            assert_eq!(ck1_of(&secret).unwrap(), text(note, "ck1"), "{label} ck1 {index}");
+            // These fixtures predate spends bound to a mint: their ck1 is the
+            // recoverable shape, which a key re-derived today still makes.
+            assert_eq!(legacy_ck1_of(&secret).unwrap(), text(note, "ck1"), "{label} ck1 {index}");
+            // Today's ck1 names the same key the note is filed under.
+            match crate::encoding::decode_ck1(&ck1_of(&secret, "mint.example").unwrap()) {
+                Some(Ck1::KeyPath { output_key, .. }) => assert_eq!(output_key, pubkey, "{label} Q {index}"),
+                other => panic!("{label} {index}: not a key-path ck1: {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn matches_the_specs_derivation_and_key_path_spend() {
+        // LUD-25 test vectors 1 and 3, end to end: the spec's own branch
+        // (m/139'/d1..d4 from a BIP-32 seed, which cash.rs derives), its
+        // index-0 key, and that key's ck1 at mint.example. The address path
+        // above is the same walk one level lower (m/139'/1'), so this is
+        // also the check that nothing but that hop differs from the spec.
+        let vectors: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
+        let (v1, v3) = (&vectors["vector1"], &vectors["vector3"]);
+        let seed = hex_decode(text(v1, "seed")).unwrap();
+        let node = derive_cash_domain_node(&derive_cash_root(&seed).unwrap(), text(v1, "domain")).unwrap();
+        let (branch, odd) = watch(&node).unwrap();
+        assert_eq!(hex_encode(&branch.pubkey), text(v1, "branchPubkey"));
+        assert_eq!(hex_encode(&branch.chain_code), text(v1, "chainCode"));
+        assert!(odd, "vector 1 is the odd-y branch");
+
+        let sk = note_secret_key(&node, 0).unwrap();
+        assert_eq!(hex_encode(sk.as_ref()), text(v1, "sk0"));
+        assert_eq!(hex_encode(&note_pubkey(&sk).unwrap()), text(v1, "pk0"));
+        assert_eq!(text(v3, "sk"), text(v1, "sk0"));
+
+        let ck1 = ck1_of(&sk, text(v3, "domain")).unwrap();
+        assert_eq!(ck1, text(v3, "ck1"));
+        // The same key signs the same ck1 every time (zero aux_rand)...
+        assert_eq!(ck1_of(&sk, text(v3, "domain")).unwrap(), ck1);
+        // ...and the same one from the endpoint the locker stores, whatever
+        // its path, port or case: only the hostname is signed.
+        for mint in ["mint.example/w", "mint.example:8443/w", "https://Mint.Example/w?x=1", "MINT.EXAMPLE"] {
+            assert_eq!(ck1_of(&sk, mint).unwrap(), ck1, "{mint}");
+        }
+        // Another mint is another ck1, and no mint is no ck1.
+        assert_ne!(ck1_of(&sk, "moneyer.dev/w").unwrap(), ck1);
+        assert!(ck1_of(&sk, "").is_err());
+        assert!(ck1_of(&sk, "/w").is_err());
+    }
+
+    #[test]
+    fn matches_the_specs_registration_proof() {
+        // LUD-25 test vector 2: the even-y branch at cash.example.com, its
+        // index-0 key, and that key's register and unregister proofs for
+        // "alice". Derived here from the vector's seed on the spec's path.
+        let vectors: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
+        let v = &vectors["vector2"];
+        let seed = hex_decode(text(v, "seed")).unwrap();
+        let node = derive_cash_domain_node(&derive_cash_root(&seed).unwrap(), text(v, "domain")).unwrap();
+        let (branch, odd) = watch(&node).unwrap();
+        assert_eq!(hex_encode(&branch.pubkey), text(v, "branchPubkey"));
+        assert_eq!(hex_encode(&branch.chain_code), text(v, "chainCode"));
+        assert!(!odd, "vector 2 is the even-y branch");
+        let sk0 = note_secret_key(&node, 0).unwrap();
+        assert_eq!(hex_encode(sk0.as_ref()), text(v, "sk0"));
+        assert_eq!(hex_encode(&note_pubkey(&sk0).unwrap()), text(v, "pk0"));
+
+        let (domain, name) = (text(v, "proofDomain"), text(v, "username"));
+        for (action, message, digest, sig) in [
+            (AddressAction::Register, "registerMessage", "registerDigest", "registerSig"),
+            (AddressAction::Unregister, "unregisterMessage", "unregisterDigest", "unregisterSig"),
+        ] {
+            assert_eq!(
+                format!("LNURLcash:{}:{domain}:{name}", action.as_str()),
+                text(v, message)
+            );
+            assert_eq!(hex_encode(&address_proof_digest(action, domain, name)), text(v, digest));
+            assert_eq!(
+                hex_encode(&sign_address_proof(&sk0, action, domain, name).unwrap()),
+                text(v, sig),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_registration_proof_signs_only_its_fixed_message() {
+        let identity = [7u8; 32];
+        let proof = |host: &str, action, name: &str| address_proof(&identity, host, action, name);
+        let register = proof("moneyer.dev", AddressAction::Register, "alice").unwrap();
+        // It is the branch's index-0 key over the fixed message for the
+        // bare hostname: the key the mint derives pk_0 from the cx1 with.
+        let sk0 = note_secret_key(&address_node(&identity, "moneyer.dev").unwrap(), 0).unwrap();
+        assert_eq!(
+            register,
+            sign_address_proof(&sk0, AddressAction::Register, "moneyer.dev", "alice").unwrap()
+        );
+        // The mint checks it against pk_0, which it derives from the cx1
+        // alone, lift_x(P) + t_0·G: this key's public key.
+        let (branch, _) = watch(&address_node(&identity, "moneyer.dev").unwrap()).unwrap();
+        let (pk0, _) = backend::xonly_tweak_add(&branch.pubkey, &note_tweak(&branch, 0)).unwrap();
+        assert_eq!(pk0, note_pubkey(&sk0).unwrap());
+        // Deterministic, and bound to the action, the name and the mint.
+        assert_eq!(proof("moneyer.dev", AddressAction::Register, "alice").unwrap(), register);
+        assert_ne!(proof("moneyer.dev", AddressAction::Unregister, "alice").unwrap(), register);
+        assert_ne!(proof("moneyer.dev", AddressAction::Register, "alicf").unwrap(), register);
+        assert_ne!(proof("mint.example", AddressAction::Register, "alice").unwrap(), register);
+        // A port names another branch (as cx1_of's host does) but the same
+        // domain in the message.
+        let ported = proof("moneyer.dev:8443", AddressAction::Register, "alice").unwrap();
+        let sk0_ported = note_secret_key(&address_node(&identity, "moneyer.dev:8443").unwrap(), 0).unwrap();
+        assert_eq!(
+            ported,
+            sign_address_proof(&sk0_ported, AddressAction::Register, "moneyer.dev", "alice").unwrap()
+        );
+
+        // Nothing outside LUD-16's alphabet, so no name can smuggle a `:`.
+        for bad in ["", "Alice", "al:ice", "al ice", "alice@moneyer.dev", "ålice", &"a".repeat(65)] {
+            assert!(!valid_username(bad), "{bad}");
+            assert!(proof("moneyer.dev", AddressAction::Register, bad).is_err(), "{bad}");
+        }
+        for good in ["a", "alice", "a.b-c_d", "0x", &"a".repeat(64)] {
+            assert!(valid_username(good), "{good}");
+        }
+        assert_eq!(AddressAction::parse("register"), Some(AddressAction::Register));
+        assert_eq!(AddressAction::parse("unregister"), Some(AddressAction::Unregister));
+        assert_eq!(AddressAction::parse("Register"), None);
+        assert_eq!(AddressAction::parse("sign"), None);
+    }
+
+    #[test]
+    fn a_spend_binds_the_hostname_and_a_branch_the_host() {
+        for (endpoint, domain) in [
+            ("moneyer.dev/w", "moneyer.dev"),
+            ("moneyer.dev", "moneyer.dev"),
+            ("127.0.0.1:8899/w", "127.0.0.1"),
+            ("mint.example:443", "mint.example"),
+            ("https://mint.example/w", "mint.example"),
+            ("lnurlw://mint.example/w?k1=00", "mint.example"),
+            ("user@mint.example:8443/w", "mint.example"),
+            ("[::1]:8899/w", "[::1]"),
+            ("mint.example?p=1", "mint.example"),
+        ] {
+            assert_eq!(spend_domain(endpoint), domain, "{endpoint}");
+        }
+        // The branch keeps the port the spend drops.
+        assert_eq!(branch_host("127.0.0.1:8899/w"), "127.0.0.1:8899");
     }
 
     #[test]
@@ -318,5 +629,27 @@ mod tests {
         assert_eq!(branch_host("moneyer.dev/w"), "moneyer.dev");
         assert_eq!(branch_host("127.0.0.1:8899/w"), "127.0.0.1:8899");
         assert_eq!(branch_host("moneyer.dev"), "moneyer.dev");
+    }
+
+    #[test]
+    fn a_tweak_at_or_above_n_is_reduced_mod_n() {
+        let mut five = [0u8; 32];
+        five[31] = 5;
+        let mut above = CURVE_ORDER;
+        above[31] += 5;
+        assert_eq!(reduce_mod_n(CURVE_ORDER), [0u8; 32]);
+        assert_eq!(reduce_mod_n(above), five);
+        assert_eq!(reduce_mod_n(five), five);
+        // 2^256 - 1 reduces to 2^256 - 1 - n, which n then takes back to all ones
+        let top = reduce_mod_n([0xff; 32]);
+        assert!(top < CURVE_ORDER);
+        let mut sum = [0u8; 32];
+        let mut carry = 0u16;
+        for i in (0..32).rev() {
+            let s = u16::from(top[i]) + u16::from(CURVE_ORDER[i]) + carry;
+            sum[i] = s as u8;
+            carry = s >> 8;
+        }
+        assert_eq!((sum, carry), ([0xff; 32], 0));
     }
 }

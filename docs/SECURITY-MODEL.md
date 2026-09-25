@@ -46,7 +46,7 @@ entries, each holding one note's `id`, `commitment`, `state`, `amount_msat`,
 `host`, `key_index`, `created_at` and `updated_at`. The commitment is the
 identifier the issuing mint already files the note under: `sha256(k1)` for a
 note behind a hash, the note's own x-only public key for one paid to a device
-key, which is what the mint recovers from a `ck1`. It carries no spending
+key, which is its taproot output key and what its `ck1` names. It carries no spending
 authority and is something an owner can actually show a mint. It is
 deliberately not called `secret_hash`, because for half the notes here it is
 not a hash of anything and a name that says otherwise invites a reader to

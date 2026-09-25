@@ -2179,6 +2179,49 @@ Sapwood's Backup panel, and a text editor for the decrypted file.
    statement, not an absence. Compare the file with the one from item 5: same
    empty array, different second key, different meaning.
 
+## 27. LUD-25 unified taproot notes (lnurl/luds 6e865b1; added 2026-09-24, NOT YET BENCH-RUN)
+
+Every note is now a taproot output key Q. A key note's ck1 is `Q || sig`, a
+BIP-340 signature over the canonical spend's key-path sighash bound to the
+mint's hostname, and the device signs LUD-25's registration proof for its
+address branch. Host tests pin every byte against the spec's vectors; what is
+left is the mint, the wallet and the panel. Run items 1 to 4 against a mint
+that verifies the unified form (moneyer's taproot build or the reference
+mint): live moneyer 0.16.x does not accept a domain-bound ck1 yet, so item 1
+fails there by design until it is upgraded.
+
+1. **A key note spends with the new ck1.** Claim or receive a key note, then
+   collect it. The exported `k1` starts `ck1` and is 163 characters (the old
+   recoverable one was 113), the mint melts it, and a second export of the same note gives
+   the identical string. Repeat on a mint reached with a port
+   (`127.0.0.1:8899/w`): the ck1 binds `127.0.0.1` and is accepted.
+2. **A plain note confirms with the mint's cs1.** Rotate a plain note through
+   lnurl-wallet with the device connected. The mint answers with a `cs1` whose
+   human-readable part carries the amount (`cs10n1...`); `confirm` must answer
+   `{"ok":true}`, the note must be CONFIRMED in the next list with that `sig`,
+   and the wallet must show it offline-verified. Before this change the
+   device refused that confirm and the note sat PENDING.
+3. **A zap to a key note opens.** Pay the device's lightning address at a
+   moneyer that puts `sig=cs<amount>1...` in the wrap. The RECEIVE card (or a
+   trusted store) must appear; before this change the wrap was refused as
+   "sig is not a cs1".
+4. **Registration proof.** `heartwood_note_address_proof` with
+   `{"host":"<mint>","name":"<name>","action":"register"}` from a bound slot.
+   Expect a REGISTER NAME card whose two lines are the name and `at <domain>`
+   (no port), both inside the panel with nothing clipped; one hold; a 128-hex
+   `sig` and the same `cx1` `heartwood_note_address` gives for that host. The
+   mint must accept `cx1` plus that `sig`. Then `unregister`: an UNREGISTER
+   NAME card, and the mint releases the name.
+5. **Nothing is signed without the card.** Decline, and let one time out: an
+   error each, no `sig`. A name with a capital or a `:`, an action other than
+   register or unregister, or a host with a path answers `bad_request` with
+   NO card. On a slot whose policy auto-approves the method, the card still
+   appears (pinned).
+6. **One card per proof.** Send two different proofs back to back (two names,
+   or register then unregister): two cards, one after the other. Send the
+   same proof twice quickly: one card, one hold, both answered with the same
+   `sig`.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

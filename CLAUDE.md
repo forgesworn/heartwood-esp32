@@ -68,8 +68,11 @@ per readable note, `id`, `commitment`, `state`, `amount_msat`, `host`,
 `key_index`, `created_at`, `updated_at` and nothing else. `commitment` is the
 public identifier the issuing mint already files the note under
 (note_store::note_commitment_hex - sha256(k1) for a Part 1 note, the note's
-own x-only pubkey for a Part 2 key note, since that is what the mint recovers
-from a ck1; key_index non-null tells them apart). It is NOT called
+own x-only pubkey for a Part 2 key note, which is its taproot Q and what its
+ck1 names; key_index non-null tells them apart). A mint that keys notes by Q
+files a plain note under taproot::bearer_output_key(h) and still reads a
+64-hex h as its short form; h stays the commitment because Q follows from it
+and not the other way round. It is NOT called
 `secret_hash`: for a key note it is not a hash of anything. A second optional
 top-level `note_inventory_unreadable` (u32, omitted when zero) counts notes
 the exporting board held but could not read - sealed at rest, or an unloadable
@@ -163,7 +166,7 @@ net-config reports runtime.secondary_index.
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =
-HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then lnurl-wallet's
+HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then lnurlcash-kit's
 m/139'/1'/d1..d4 and LUD-25's tweak, graded against lnurlcash-kit's
 part2.json and tests/fixtures/lud25-nostr-seed.json on both curve backends). The
 mint holds only the cx1 (heartwood_note_address, no hold); a key-note wrap
@@ -171,8 +174,26 @@ carries p/i/sig and no secret, and is opened only if the key is ours
 (note_wrap::open_note_rumor). A key note stores its key as the secret plus
 KeyNote {index, pubkey} (a v3 blob, written only for key notes), exports a
 ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim)
-derives the key itself. Recoverable signing is the one new curve op:
-secp256k1's `recovery` module on the firmware, k256 `ecdsa` on the host.
+derives the key itself.
+
+LUD-25 unified taproot (lnurl/luds 6e865b1; common/src/taproot.rs, graded
+against the spec's vectors 1 to 5 in tests/fixtures/lud25-taproot.json on both
+curve backends): every note is a BIP-341 output key Q. A key note's Q is its
+key's own x-only pubkey (no BIP-86 tweak) and its ck1 is now Q || a zero
+aux_rand BIP-340 signature over the canonical spend's key-path sighash, whose
+prevout binds the mint's bare hostname (cash_key::spend_domain: no scheme,
+port or path; the branch derivation keeps the port). The old 65-byte
+recoverable ck1 is cash_key::legacy_ck1_of, still decoded, no longer made. A
+bearer note's Q is one OP_SHA256 <h> OP_EQUAL leaf under the NUMS point. The
+vault wire is unchanged (new_secret still answers h, which lnurl-wallet sends
+as the short form and turns into Q itself); `confirm` and wraps now keep a cs1
+whose HRP carries the amount (`cs10n1...`), which a unified mint sends for
+every note. Live moneyer (0.16.x) does not yet accept the domain-bound ck1.
+heartwood_note_address_proof (pinned, REGISTER NAME / UNREGISTER NAME card)
+signs LUD-25's registration proof with the address branch's index-0 key over
+the fixed sha256("LNURLcash:<action>:<domain>:<username>") and nothing else.
+The address branch is still m/139'/1'/d1..d4, one hardened level below the
+spec's m/139'/d1..d4; moving it would move every key note already paid.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

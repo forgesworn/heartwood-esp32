@@ -1109,6 +1109,10 @@ pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
         let npub = heartwood_common::encoding::encode_npub(&bytes);
         return Some(("TRUST SENDER", format!("{}..{}\nnotes skip the hold", &npub[..12], &npub[npub.len() - 8..])));
     }
+    if name == "cash_address_proof" {
+        let (action, username, host) = note_cmd::address_proof_request(cmd)?;
+        return Some(note_cmd::address_proof_card(action, username, host));
+    }
     let id = cmd.get("id")?.as_str()?;
     let header = match name {
         "export_secret" => "RELEASE NOTE",
@@ -1147,6 +1151,15 @@ pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
 /// `None` means ask.
 pub fn relay_precheck(cmd: &serde_json::Value) -> Option<&'static str> {
     let name = cmd.get("cmd")?.as_str()?;
+    if name == "cash_address_proof" {
+        // Names no note. A request the dispatcher would refuse (a name
+        // outside LUD-16's alphabet, an action other than register or
+        // unregister, a host it cannot derive for) must not cost a hold.
+        return match note_cmd::address_proof_request(cmd) {
+            Some(_) => None,
+            None => Some("bad_request"),
+        };
+    }
     if name == "trust" {
         let pk = cmd.get("pubkey")?.as_str()?;
         let bytes: [u8; 32] = match heartwood_common::hex::hex_decode(pk).ok().and_then(|v| v.try_into().ok()) {
@@ -1295,6 +1308,12 @@ fn handle_note_cmd_frame_inner(
     let mut approve = |kind: GatedCmd, meta: &NoteMeta| -> Approval { ask(card_title(kind, meta)) };
     let mut approve_trust = |pk: &[u8; 32]| -> Approval { ask(trust_card_title(pk)) };
     let mut approve_cash = |host: &str| -> Approval { ask(cash_card_title(host)) };
+    // The cable has no identity, so `cash_address_proof` answers bad_request
+    // before this is reached. It still asks, with the relay tier's own card,
+    // so a cable that one day serves an identity cannot sign a proof blind.
+    let mut approve_address = |action, name: &str, host: &str| -> Approval {
+        ask(note_cmd::address_proof_card(action, name, host))
+    };
 
     // Read the state before ctx takes its mutable borrows of `notes`. A
     // write failing inside THIS dispatch shows in the next get_info, which
@@ -1318,6 +1337,7 @@ fn handle_note_cmd_frame_inner(
         approve_trust: &mut approve_trust,
         cash: &mut notes.cash,
         approve_cash: &mut approve_cash,
+        approve_address: &mut approve_address,
         now: now_secs(),
         fw_version: env!("CARGO_PKG_VERSION"),
         board: crate::board::BOARD,
@@ -1429,6 +1449,12 @@ pub fn run_note_cmd_approved(
         // not know to demand a hold for it, and 64 bytes of bearer material
         // would land with no button pressed. Fail closed and say why.
         let mut approve_cash = |_host: &str| Approval::Declined;
+        // `heartwood_note_address_proof` is pinned always-button, so its
+        // REGISTER NAME / UNREGISTER NAME card has been held in the
+        // pre-dispatch gate for this exact request by the time it runs here,
+        // from the same `address_proof_card` the cable would draw.
+        let mut approve_address =
+            |_action: heartwood_common::cash_key::AddressAction, _name: &str, _host: &str| Approval::Approved;
         let storage_state = notes.storage_state();
         // Reborrow so the hook's lifetime is this scope's, not the caller's:
         // the context ties every borrow to one lifetime.
@@ -1446,6 +1472,7 @@ pub fn run_note_cmd_approved(
             approve_trust: &mut approve_trust,
             cash: &mut notes.cash,
             approve_cash: &mut approve_cash,
+            approve_address: &mut approve_address,
             now: now_secs(),
             fw_version: env!("CARGO_PKG_VERSION"),
             board: crate::board::BOARD,

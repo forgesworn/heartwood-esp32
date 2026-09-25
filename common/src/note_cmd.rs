@@ -322,6 +322,14 @@ pub struct NoteCmdContext<'a> {
     /// thing they can check, which is which mint they were expecting to set up.
     #[cfg(feature = "cash")]
     pub approve_cash: &'a mut dyn FnMut(&str) -> Approval,
+    /// Asked before the served identity's address branch signs a
+    /// registration proof: the card names the action, the username and the
+    /// mint ([`address_proof_card`]), which is everything the signature
+    /// commits to. A surface that has already held the button for this exact
+    /// request (the relay tier's pinned pre-dispatch card) answers
+    /// `Approved`.
+    #[cfg(feature = "cash")]
+    pub approve_address: &'a mut dyn FnMut(crate::cash_key::AddressAction, &str, &str) -> Approval,
     /// Seconds since some fixed epoch for created_at/updated_at. Boot time is
     /// fine — informational, never authoritative (the mint's state is).
     pub now: u32,
@@ -393,6 +401,53 @@ fn cash_draw<'a>(
         ));
     }
     Ok(Some(crate::note_store::CashDraw { registry, host }))
+}
+
+/// A `cash_address_proof` command's fields, checked, as `(action, username,
+/// host)`; `None` if any is missing or is not something the device signs a
+/// proof for. The relay tier's precheck, its card and the dispatcher all
+/// read a request through this one function, so the card shows exactly what
+/// gets signed.
+#[cfg(feature = "cash")]
+pub fn address_proof_request(cmd: &Value) -> Option<(crate::cash_key::AddressAction, &str, &str)> {
+    let action = crate::cash_key::AddressAction::parse(str_field(cmd, "action")?)?;
+    let name = str_field(cmd, "name")?;
+    let host = str_field(cmd, "host")?;
+    let signable = crate::cash_key::valid_username(name)
+        && crate::cash_store::valid_host(host)
+        && !crate::cash_key::spend_domain(host).is_empty();
+    signable.then_some((action, name, host))
+}
+
+/// The card a registration proof is held on: the action as the header, then
+/// the username and the mint's domain, the three things the signature
+/// commits to. The port is not shown because it is not signed. Each line
+/// fits [`crate::note_fmt::CARD_LINE_CHARS`]: a long name loses its middle,
+/// keeping both ends, and a long domain keeps its tail, where a lookalike
+/// differs.
+#[cfg(feature = "cash")]
+pub fn address_proof_card(
+    action: crate::cash_key::AddressAction,
+    name: &str,
+    host: &str,
+) -> (&'static str, String) {
+    use crate::note_fmt::{elide_host, CARD_LINE_CHARS};
+    let header = match action {
+        crate::cash_key::AddressAction::Register => "REGISTER NAME",
+        crate::cash_key::AddressAction::Unregister => "UNREGISTER NAME",
+    };
+    let shown_name = if name.chars().count() <= CARD_LINE_CHARS {
+        name.to_string()
+    } else {
+        let head = (CARD_LINE_CHARS - 2) / 2;
+        let tail = CARD_LINE_CHARS - 2 - head;
+        let chars: Vec<char> = name.chars().collect();
+        let (start, end) = (&chars[..head], &chars[chars.len() - tail..]);
+        format!("{}..{}", start.iter().collect::<String>(), end.iter().collect::<String>())
+    };
+    let domain = crate::cash_key::spend_domain(host).to_ascii_lowercase();
+    let at = "at ";
+    (header, format!("{shown_name}\n{at}{}", elide_host(&domain, CARD_LINE_CHARS - at.len())))
 }
 
 fn approval_err(a: Approval) -> Option<Value> {
@@ -753,6 +808,47 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
         }
 
         #[cfg(feature = "cash")]
+        "cash_address_proof" => {
+            // LUD-25's registration proof: the branch cash_address hands out
+            // for this host signs, with its index-0 key, the fixed message
+            // that registers or unregisters one username at one mint. It
+            // decides where a name's payments go, so it is a hold, and the
+            // card shows all three things the signature commits to.
+            let Some(identity) = ctx.identity else {
+                return err_msg("bad_request", "cash_address_proof is not available on this surface");
+            };
+            let Some((action, name, host)) = address_proof_request(&cmd) else {
+                return err_msg(
+                    "bad_request",
+                    "needs a lowercase mint host, a lightning-address username and register or unregister",
+                );
+            };
+            // The branch is derived before the card, so a request that could
+            // not be signed never costs a hold.
+            let cx1 = match crate::cash_key::address_node(identity, host)
+                .and_then(|node| crate::cash_key::cx1_of(&node))
+            {
+                Ok(cx1) => cx1,
+                Err(m) => return err_msg("bad_request", m),
+            };
+            if let Some(resp) = approval_err((ctx.approve_address)(action, name, host)) {
+                return resp;
+            }
+            match crate::cash_key::address_proof(identity, host, action, name) {
+                Ok(sig) => json!({
+                    "ok": true,
+                    "host": host,
+                    "domain": crate::cash_key::spend_domain(host).to_ascii_lowercase(),
+                    "name": name,
+                    "action": action.as_str(),
+                    "cx1": cx1,
+                    "sig": hex_encode(&sig),
+                }),
+                Err(m) => err_msg("bad_request", m),
+            }
+        }
+
+        #[cfg(feature = "cash")]
         "claim_key_note" => {
             // A payment a wallet found by scanning the branch, whose wrap never
             // arrived: the device derives the key at `index` and keeps the note.
@@ -1067,7 +1163,7 @@ fn gated_by_id(
 /// the same question: it touches a LIVE note, a label is what a wallet's
 /// list shows, and no amount of pruning corrects one typed wrong, so it is
 /// served here rather than left cable-only on a tier that has no cable.
-pub const NOTE_METHODS: [&str; 14] = [
+pub const NOTE_METHODS: [&str; 15] = [
     "heartwood_note_list",
     "heartwood_note_new",
     "heartwood_note_new_pair",
@@ -1082,6 +1178,7 @@ pub const NOTE_METHODS: [&str; 14] = [
     "heartwood_note_trusted",
     "heartwood_note_address",
     "heartwood_note_claim",
+    "heartwood_note_address_proof",
 ];
 
 /// Map a `heartwood_note_*` NIP-46 request onto the wire command object the
@@ -1153,6 +1250,7 @@ pub fn note_cmd_for_method(method: &str, params: &[Value]) -> Result<Value, &'st
         "heartwood_note_trusted" => "list_trusted",
         "heartwood_note_address" => "cash_address",
         "heartwood_note_claim" => "claim_key_note",
+        "heartwood_note_address_proof" => "cash_address_proof",
         _ => return Err("unknown note method"),
     };
     let mut fields = match params.first() {
@@ -1253,6 +1351,8 @@ mod tests {
         trust_asked: Vec<[u8; 32]>,
         cash: crate::cash_store::CashRegistry,
         cash_asked: Vec<String>,
+        /// Registration proofs the owner was asked to sign: (action, name, host).
+        address_asked: Vec<(crate::cash_key::AddressAction, String, String)>,
         persist_ok: bool,
         note_write_ok: bool,
         /// The identity the request is served as; `None` is direct USB.
@@ -1279,6 +1379,7 @@ mod tests {
                 trust_asked: Vec::new(),
                 cash: crate::cash_store::CashRegistry::new(),
                 cash_asked: Vec::new(),
+                address_asked: Vec::new(),
                 persist_ok: true,
                 note_write_ok: true,
                 identity: Some([7u8; 32]),
@@ -1319,6 +1420,11 @@ mod tests {
                 cash_asked.push(host.to_string());
                 answer
             };
+            let address_asked = &mut self.address_asked;
+            let mut approve_address = move |action, name: &str, host: &str| {
+                address_asked.push((action, name.to_string(), host.to_string()));
+                answer
+            };
             #[cfg(feature = "device-identity")]
             let mut device_identity = |nonce: &[u8]| {
                 crate::device_identity::sign_challenge(&[0x5au8; 32], nonce)
@@ -1340,6 +1446,7 @@ mod tests {
                 approve_trust: &mut approve_trust,
                 cash: &mut self.cash,
                 approve_cash: &mut approve_cash,
+                approve_address: &mut approve_address,
                 now: self.now,
                 fw_version: "0.0.0-test",
                 board: "host",
@@ -2170,6 +2277,46 @@ mod tests {
     }
 
     #[test]
+    fn a_rotate_at_a_mint_keyed_by_q_keeps_the_wire_as_it_was() {
+        // lnurl-wallet's device flow, against a mint that files notes by
+        // their output key: new_secret still answers `h`, which the wallet
+        // sends as the cp1 short form and from which it derives Q itself to
+        // check the certificate; the mint answers with a cs1 over hex(Q), and
+        // the wallet hands that to confirm verbatim. LUD-25 test vector 5's
+        // cs1 stands in for it.
+        let vectors: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
+        let cs1 = vectors["vector5"]["cs1"].as_str().unwrap();
+        let mut h = Harness::new();
+        let res = h.run(r#"{"cmd":"new_secret"}"#);
+        let id = res["id"].as_str().unwrap().to_string();
+        let staged = res["h"].as_str().unwrap().to_string();
+        let res = h.run(&format!(
+            r#"{{"cmd":"confirm","id":"{id}","amount_msat":1000,"host":"mint.example/w","sig":"{cs1}"}}"#
+        ));
+        assert_eq!(res["ok"], true, "{res}");
+        let listed = h.run(r#"{"cmd":"list_notes"}"#);
+        assert_eq!(listed["notes"][0]["state"], "confirmed");
+        assert_eq!(listed["notes"][0]["sig"], cs1);
+
+        // What the device disclosed is sha256 of the k1 it holds, not Q: the
+        // vault protocol's `h`, unchanged.
+        let k1 = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#))["k1"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(k1.len(), 64);
+        let secret: [u8; 32] = hex_decode(&k1).unwrap().try_into().unwrap();
+        assert_eq!(staged, crate::note_store::secret_hash_hex(&secret));
+        #[cfg(feature = "cash")]
+        {
+            let h_bytes: [u8; 32] = hex_decode(&staged).unwrap().try_into().unwrap();
+            let q = crate::taproot::bearer_output_key(&h_bytes).unwrap();
+            assert_ne!(hex_encode(&q.x), staged, "Q is the mint's key, h the wire's");
+        }
+    }
+
+    #[test]
     fn note_methods_map_onto_the_wire_commands() {
         let cmd = note_cmd_for_method(
             "heartwood_note_confirm",
@@ -2933,8 +3080,14 @@ mod tests {
         let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
         let k1 = res["k1"].as_str().unwrap();
         assert!(k1.starts_with("ck1"), "{k1}");
-        let (secret, _) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
-        assert_eq!(k1, crate::cash_key::ck1_of(&secret).unwrap());
+        let (secret, pubkey) =
+            crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        // The 96-byte key-path spend, bound to the note's own mint.
+        assert_eq!(k1, crate::cash_key::ck1_of(&secret, "moneyer.dev").unwrap());
+        assert!(matches!(
+            crate::encoding::decode_ck1(k1),
+            Some(crate::encoding::Ck1::KeyPath { output_key, .. }) if output_key == pubkey
+        ));
         assert!(!k1.contains(&hex_encode(secret.as_ref())));
         assert_eq!(h.asked, vec![(GatedCmd::ExportSecret, id.clone())]);
 
@@ -2968,6 +3121,133 @@ mod tests {
         h.identity = None;
         let res = h.run(r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000}"#);
         assert_eq!(res["error"], "bad_request");
+    }
+
+    #[test]
+    fn an_address_proof_is_the_branchs_signature_behind_one_hold() {
+        use crate::cash_key::AddressAction;
+        let mut h = Harness::new();
+        // The client contract: `heartwood_note_address_proof` with
+        // {host, name, action}, `host` being the one cash_address took.
+        let params = json!({"host": "moneyer.dev", "name": "alice", "action": "register"});
+        let res = h.run_method("heartwood_note_address_proof", params.clone());
+        assert_eq!(res["ok"], true, "{res}");
+        let expected =
+            crate::cash_key::address_proof(&[7u8; 32], "moneyer.dev", AddressAction::Register, "alice").unwrap();
+        assert_eq!(res["sig"], hex_encode(&expected));
+        assert_eq!((res["domain"].clone(), res["action"].clone()), (json!("moneyer.dev"), json!("register")));
+        // Signed by the branch cash_address hands out for the same host, the
+        // one a mint derives pk_0 from.
+        let address = h.run(r#"{"cmd":"cash_address","host":"moneyer.dev"}"#);
+        assert_eq!(res["cx1"], address["cx1"]);
+        assert_eq!(
+            h.address_asked,
+            vec![(AddressAction::Register, "alice".to_string(), "moneyer.dev".to_string())]
+        );
+
+        // A caller cannot steer what is signed: fields the command does not
+        // read change nothing, least of all a message or digest of its own.
+        let mut smuggled = params.clone();
+        smuggled["message"] = json!("LNURLcash:register:evil.example:alice");
+        smuggled["digest"] = json!("00".repeat(32));
+        smuggled["cmd"] = json!("list_notes");
+        let res = h.run_method("heartwood_note_address_proof", smuggled);
+        assert_eq!(res["sig"], hex_encode(&expected));
+
+        // A port picks the branch, as for cash_address, but is not signed.
+        let res = h.run_method(
+            "heartwood_note_address_proof",
+            json!({"host": "moneyer.dev:8443", "name": "alice", "action": "unregister"}),
+        );
+        assert_eq!(res["domain"], "moneyer.dev");
+        assert_eq!(
+            res["sig"],
+            hex_encode(
+                &crate::cash_key::address_proof(&[7u8; 32], "moneyer.dev:8443", AddressAction::Unregister, "alice")
+                    .unwrap()
+            )
+        );
+
+        // Declined or timed out: nothing is signed and nothing leaves.
+        for (answer, code) in [(Approval::Declined, "user_declined"), (Approval::TimedOut, "timeout")] {
+            h.answer = answer;
+            let res = h.run_method("heartwood_note_address_proof", params.clone());
+            assert_eq!(res["error"], code);
+            assert!(res.get("sig").is_none());
+        }
+        h.answer = Approval::Approved;
+
+        // Refused before any card for anything it would not sign.
+        let asked = h.address_asked.len();
+        for bad in [
+            json!({"host": "moneyer.dev", "name": "Alice", "action": "register"}),
+            json!({"host": "moneyer.dev", "name": "al:ice", "action": "register"}),
+            json!({"host": "moneyer.dev", "name": "", "action": "register"}),
+            json!({"host": "moneyer.dev", "name": "alice", "action": "sign"}),
+            json!({"host": "moneyer.dev", "name": "alice"}),
+            json!({"host": "https://moneyer.dev", "name": "alice", "action": "register"}),
+            json!({"host": "moneyer.dev/w", "name": "alice", "action": "register"}),
+            json!({"host": ":8443", "name": "alice", "action": "register"}),
+            json!({"name": "alice", "action": "register"}),
+        ] {
+            let res = h.run_method("heartwood_note_address_proof", bad.clone());
+            assert_eq!(res["error"], "bad_request", "{bad}");
+        }
+        // And on a surface with no identity to derive the branch from.
+        h.identity = None;
+        let res = h.run_method("heartwood_note_address_proof", params);
+        assert_eq!(res["error"], "bad_request");
+        assert_eq!(h.address_asked.len(), asked, "no card for a request that could not be signed");
+    }
+
+    #[test]
+    fn an_address_proof_card_names_what_is_signed_and_fits_the_panel() {
+        use crate::cash_key::AddressAction;
+        use crate::note_fmt::CARD_LINE_CHARS;
+        let (header, title) = address_proof_card(AddressAction::Register, "alice", "moneyer.dev:8443");
+        assert_eq!((header, title.as_str()), ("REGISTER NAME", "alice\nat moneyer.dev"));
+        assert_eq!(address_proof_card(AddressAction::Unregister, "alice", "moneyer.dev").0, "UNREGISTER NAME");
+
+        // The longest name the device signs for, at a long domain: both ends
+        // of the name and the tail of the domain survive, and nothing clips.
+        let name = format!("{}{}{}", "a".repeat(11), "b".repeat(42), "c".repeat(11));
+        assert_eq!(name.len(), crate::cash_key::MAX_USERNAME_LEN);
+        let (header, title) =
+            address_proof_card(AddressAction::Unregister, &name, "a-rather-long-subdomain.of.mint.example:443");
+        assert!(header.len() <= CARD_LINE_CHARS);
+        let lines: Vec<&str> = title.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(line.chars().count() <= CARD_LINE_CHARS, "{line}");
+        }
+        assert!(lines[0].starts_with("aaaaaaaaaaa") && lines[0].ends_with("cccccccccc"), "{}", lines[0]);
+        assert!(lines[0].contains(".."));
+        assert!(lines[1].starts_with("at ") && lines[1].ends_with("of.mint.example"), "{}", lines[1]);
+
+        // The request reader the card and the precheck share.
+        let cmd = note_cmd_for_method(
+            "heartwood_note_address_proof",
+            &[json!({"host": "moneyer.dev", "name": "alice", "action": "unregister"})],
+        )
+        .unwrap();
+        assert_eq!(address_proof_request(&cmd), Some((AddressAction::Unregister, "alice", "moneyer.dev")));
+    }
+
+    #[test]
+    fn the_address_proof_method_maps_and_is_pinned() {
+        use crate::nip46::Nip46Method;
+        assert_eq!(
+            note_cmd_for_method("heartwood_note_address_proof", &[]).unwrap()["cmd"],
+            "cash_address_proof"
+        );
+        assert!(NOTE_METHODS.contains(&"heartwood_note_address_proof"));
+        let parsed = Nip46Method::from_str("heartwood_note_address_proof");
+        assert_eq!(parsed.as_str(), "heartwood_note_address_proof");
+        // Pinned like a trust: no slot policy can sign one without the card.
+        assert!(parsed.always_requires_button());
+        assert!(parsed.is_note_method());
+        assert!(parsed.pinned_physical());
+        assert!(crate::policy::method_uses_served_key("heartwood_note_address_proof"));
     }
 
     #[test]

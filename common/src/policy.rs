@@ -334,13 +334,17 @@ pub fn method_uses_identity_key(method: &str, has_context: bool) -> bool {
 }
 
 /// Bearer-note methods that act with the served identity's key (sealing a
-/// send, deriving an address or claim key). They are scoped like signing but
+/// send, deriving an address or claim key, signing an address proof with
+/// that branch). They are scoped like signing but
 /// have no identity card of their own: an unapproved identity is refused, and
 /// approval comes from a sign or crypto prompt.
 pub fn method_uses_served_key(method: &str) -> bool {
     matches!(
         method,
-        "heartwood_note_send" | "heartwood_note_address" | "heartwood_note_claim"
+        "heartwood_note_send"
+            | "heartwood_note_address"
+            | "heartwood_note_claim"
+            | "heartwood_note_address_proof"
     )
 }
 
@@ -1780,7 +1784,12 @@ mod tests {
         // (explicit or a heartwood_switch active identity) it is scoped.
         assert!(!method_uses_identity_key("get_public_key", false));
         assert!(method_uses_identity_key("get_public_key", true));
-        for method in ["heartwood_note_send", "heartwood_note_address", "heartwood_note_claim"] {
+        for method in [
+            "heartwood_note_send",
+            "heartwood_note_address",
+            "heartwood_note_claim",
+            "heartwood_note_address_proof",
+        ] {
             assert!(method_uses_served_key(method), "{method}");
             assert!(!method_uses_identity_key(method, true), "{method}");
         }

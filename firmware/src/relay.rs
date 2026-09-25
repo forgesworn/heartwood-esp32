@@ -4480,6 +4480,13 @@ fn queue_button_ask(
         let to = note_param(&ask.request, "to").unwrap_or_default();
         kind_key = format!("{kind_key}:{to}");
     }
+    // Two registration proofs are two decisions for the same reason: the
+    // card names one action, one username and one mint, so only that same
+    // proof may ride its hold.
+    if ask.request.method == "heartwood_note_address_proof" {
+        let part = |name: &str| note_param(&ask.request, name).unwrap_or_default();
+        kind_key = format!("{kind_key}:{}:{}:{}", part("action"), part("host"), part("name"));
+    }
     // Asks acting as different identities are different decisions: one hold
     // must never approve an identity its card did not name.
     if let Some(identity) = ask.identity.as_ref() {
@@ -4637,14 +4644,19 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             heading,
             method,
             preview,
-        } => match note_card_header(&ctx.button_cards[0].asks[0].ask.request.method)
+        } => match own_card_header(&ctx.button_cards[0].asks[0].ask.request)
             // A gate card (ALLOW AS / NPUB AS / LIST IDS) carries the app, not
             // the method, on its second line, and is never a money card.
             .filter(|_| method == &ctx.button_cards[0].asks[0].ask.request.method)
         {
             // A batched note card must say what the one hold releases: the
-            // count, the total and the mint, never just the first note.
-            Some(header) if batch > 1 => {
+            // count, the total and the mint, never just the first note. A
+            // registration proof moves no money, and its batch key admits
+            // only the same proof again, so its own card already says it all.
+            Some(header)
+                if batch > 1
+                    && ctx.button_cards[0].asks[0].ask.request.method != "heartwood_note_address_proof" =>
+            {
                 let (head, title) = note_batch_card(header, &ctx.button_cards[0].asks);
                 Draw::Batch(head, title)
             }
@@ -4751,6 +4763,20 @@ fn note_batch_card(header: &str, asks: &[ButtonAsk]) -> (String, String) {
         None
     };
     batch_card(header, &notes, to.as_deref())
+}
+
+/// The header of a method's own titled card: a note card's, or for a
+/// registration proof the action it signs (REGISTER NAME or UNREGISTER
+/// NAME), read through the same helper that built the card's two lines, so
+/// the header and the lines cannot disagree.
+fn own_card_header(request: &nip46::Nip46Request) -> Option<&'static str> {
+    if request.method == "heartwood_note_address_proof" {
+        use heartwood_common::note_cmd::{address_proof_card, address_proof_request, note_cmd_for_method};
+        let cmd = note_cmd_for_method(&request.method, &request.params).ok()?;
+        let (action, name, host) = address_proof_request(&cmd)?;
+        return Some(address_proof_card(action, name, host).0);
+    }
+    note_card_header(&request.method)
 }
 
 /// Note methods get the amount card rather than the method-name card, with

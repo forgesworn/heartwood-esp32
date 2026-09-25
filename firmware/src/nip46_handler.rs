@@ -2066,6 +2066,7 @@ fn dispatch_inner(
                 "heartwood_note_trusted",
                 "heartwood_note_address",
                 "heartwood_note_claim",
+                "heartwood_note_address_proof",
                 "heartwood_pair_wallet",
                 "heartwood_provision_rendezvous",
             ];

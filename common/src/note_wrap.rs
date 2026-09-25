@@ -530,6 +530,23 @@ mod tests {
         }
 
         #[test]
+        fn a_certificate_that_names_its_amount_is_kept() {
+            // moneyer's wraps carry LUD-25's cs1, whose human-readable part
+            // names the amount (`cs210n` for 21000 msat), not the bare `cs`
+            // above. Before the device read that shape it refused the whole
+            // wrap as "sig is not a cs1".
+            let (_, pubkey) = key_at(6);
+            let payload = crate::encoding::decode_cs1(CS1).unwrap();
+            let hrp = bech32::Hrp::parse("cs210n").unwrap();
+            let current = bech32::encode::<bech32::Bech32m>(hrp, &payload).unwrap();
+            let mut rumor = moneyer_wrap(&pubkey, 6);
+            rumor.content = rumor.content.replace(CS1, &current.to_uppercase());
+            let note = open_note_rumor(&rumor, &IDENTITY).unwrap();
+            assert_eq!(note.sig, current, "kept, and lowercase as the locker stores it");
+            assert_eq!(crate::encoding::decode_cs1_with_amount(&note.sig), Some((payload, Some(21_000))));
+        }
+
+        #[test]
         fn the_index_tag_stands_in_for_one_the_url_lacks() {
             let (_, pubkey) = key_at(9);
             let mut rumor = moneyer_wrap(&pubkey, 9);

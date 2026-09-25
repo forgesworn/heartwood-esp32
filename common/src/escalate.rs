@@ -381,6 +381,7 @@ mod tests {
             M::HeartwoodNoteSpent,
             M::HeartwoodNoteRename,
             M::HeartwoodNoteTrust,
+            M::HeartwoodNoteAddressProof,
         ] {
             assert!(method.verdict_may_answer_card(), "{}", method.as_str());
         }
@@ -481,6 +482,7 @@ mod tests {
             M::HeartwoodNoteSend,
             M::HeartwoodNoteRename,
             M::HeartwoodNoteTrust,
+            M::HeartwoodNoteAddressProof,
         ] {
             assert!(method.pinned_physical(), "{} lost its pin", method.as_str());
         }

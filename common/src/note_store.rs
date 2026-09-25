@@ -157,9 +157,11 @@ pub struct Note {
     /// 404s and a note nobody can claim. Stored opaquely; never parsed here.
     pub host: String,
     pub label: String,
-    /// Optional LUD-25 mint signature over (note id, amount): hex for a
-    /// Part 1 note, a `cs1` for a key note. Stored opaquely for the wallet to
-    /// verify — the device never interprets it.
+    /// Optional LUD-25 mint certificate over (note id, amount): a `cs1`, or
+    /// hex from a mint that predates `cs1`. A mint keying notes by `Q` signs
+    /// `hex(Q)` for every note, a plain one included; an older one signed a
+    /// plain note's `h`. Stored opaquely for the wallet to verify, which
+    /// tries both; the device never interprets it.
     pub sig: String,
     pub parent_ids: Vec<String>,
     pub created_at: u32,
@@ -498,13 +500,32 @@ fn is_lower_hex_or_empty(s: &str) -> bool {
     s.is_empty() || is_lower_hex(s)
 }
 
-/// A mint certificate as the locker keeps it: absent, hex (Part 1), or a
-/// lowercase `cs1` (Part 2). Checked, not interpreted: the wallet verifies it.
+/// A mint certificate as the locker keeps it: absent, lowercase hex (what
+/// mints sent before `cs1`), or a lowercase `cs1`. Checked, not interpreted:
+/// the wallet verifies it.
 fn valid_sig(s: &str) -> bool {
     s.len() <= MAX_SIG_LEN
         && (is_lower_hex_or_empty(s)
             || (!s.bytes().any(|b| b.is_ascii_uppercase())
                 && crate::encoding::decode_cs1(s).is_some()))
+}
+
+/// The certificate `confirm` was handed, as the locker will keep it, or
+/// `None` if it is not one.
+///
+/// A mint that files notes by `Q` certifies every note it mints with a
+/// `cs1`, a bearer note included, and the wallet passes that straight to
+/// `confirm`. So `confirm` takes a `cs1` as well as hex; refusing one would
+/// leave a note the mint had already credited PENDING on the device, with
+/// the wallet retrying the same refused confirm on every reconnect. A `cs1`
+/// may arrive in upper case (BIP-350 allows either) and is stored lowercase.
+fn confirmed_sig(sig: &str) -> Option<String> {
+    let sig = if crate::encoding::decode_cs1(sig).is_some() {
+        sig.trim().to_ascii_lowercase()
+    } else {
+        sig.to_string()
+    };
+    valid_sig(&sig).then_some(sig)
 }
 
 /// `sha256(secret)` as lowercase hex — the `h` a wallet registers with the
@@ -519,19 +540,25 @@ pub fn secret_hash_hex(secret: &[u8; SECRET_LEN]) -> String {
 /// that issued it already files it, and the only thing about a note's secret
 /// that may leave the device without a button behind it.
 ///
-/// Two shapes, because LUD-25 has two:
+/// Two shapes, one per kind of note:
 ///
-///  - **Part 1** (a note behind a hash) commits as [`secret_hash_hex`]:
-///    `sha256(k1)`, which is `_note_id` in lnurl-mint's ledger.
-///  - **Part 2** (a note paid to one of this device's keys, [`KeyNote`]) has
-///    no preimage at all: its `secret` IS a private key, and the mint files
-///    the note under the matching x-only PUBLIC key, recovering it from the
-///    `ck1` a spend presents. So the commitment is that public key.
+///  - **A plain (bearer) note** commits as [`secret_hash_hex`]: `h =
+///    sha256(k1)`. A mint that predates taproot notes files it under `h`
+///    (`_note_id` in lnurl-mint's ledger). One that files every note by its
+///    output key files it under `Q = taproot::bearer_output_key(h)`, and
+///    reads a bare 64-hex `h` wherever a `cp1` goes as that note's short
+///    form. `h` stays the commitment because it names the note at both: `Q`
+///    follows from `h` in public and `h` cannot be had from `Q`, and a reader
+///    of an older backup never has to guess which of the two a record holds.
+///  - **A key note** ([`KeyNote`]) has no preimage at all: its `secret` IS a
+///    private key, and the mint files the note under the matching x-only
+///    PUBLIC key, which is also its `Q` (a key note takes no tweak) and which
+///    its `ck1` carries. So the commitment is that public key.
 ///
-/// Hashing a Part 2 note's secret would produce 64 hex characters that no
-/// mint has ever seen and that prove nothing to anybody; the public key is
-/// both the honest commitment and the useful one. A reader tells the two
-/// apart by whether the note carries a key index.
+/// Hashing a key note's secret would produce 64 hex characters that no mint
+/// has ever seen and that prove nothing to anybody; the public key is both
+/// the honest commitment and the useful one. A reader tells the two apart by
+/// whether the note carries a key index.
 ///
 /// Both are 32 bytes, lowercase hex, and neither is invertible to the secret:
 /// one is a preimage-resistant digest, the other a discrete log.
@@ -896,10 +923,7 @@ impl NoteStore {
         if host.is_empty() || host.len() > MAX_HOST_LEN {
             return Err(NoteError::BadRequest);
         }
-        let sig = sig.unwrap_or("");
-        if sig.len() > MAX_SIG_LEN || !is_lower_hex_or_empty(sig) {
-            return Err(NoteError::BadRequest);
-        }
+        let sig = confirmed_sig(sig.unwrap_or("")).ok_or(NoteError::BadRequest)?;
         let idx = self.find(id)?;
         if self.notes[idx].state != NoteState::Pending {
             return Err(NoteError::InvalidState);
@@ -908,7 +932,7 @@ impl NoteStore {
         updated.state = NoteState::Confirmed;
         updated.amount_msat = amount_msat;
         updated.host = host.to_string();
-        updated.sig = sig.to_string();
+        updated.sig = sig;
         updated.updated_at = now;
         self.persist_rewrite(storage, idx, updated)
     }
@@ -938,9 +962,10 @@ impl NoteStore {
     }
 
     /// Reveal a CONFIRMED note's `k1`: its secret as hex, or for a key note
-    /// the `ck1` its key signs, which is what a wallet presents to spend it.
-    /// The key itself never leaves. State check only — the physical gate is
-    /// the dispatcher's job, exactly the `vault.c` split.
+    /// the `ck1` its key signs for the note's own mint, which is what a
+    /// wallet presents to spend it there. The key itself never leaves. State
+    /// check only: the physical gate is the dispatcher's job, exactly the
+    /// `vault.c` split.
     pub fn export_secret(&self, id: &str) -> Result<String, NoteError> {
         self.can_export(id)?;
         let idx = self.find(id)?;
@@ -948,8 +973,10 @@ impl NoteStore {
         if note.key.is_none() {
             return Ok(hex_encode(&note.secret));
         }
+        // Bound to the mint the note is at, which is all the ck1 is good
+        // for: the same string is refused by every other mint.
         #[cfg(feature = "cash")]
-        return crate::cash_key::ck1_of(&note.secret).map_err(|_| NoteError::InvalidState);
+        return crate::cash_key::ck1_of(&note.secret, &note.host).map_err(|_| NoteError::InvalidState);
         // A build that cannot sign never made a key note, and cannot spend one.
         #[cfg(not(feature = "cash"))]
         Err(NoteError::InvalidState)
@@ -1738,22 +1765,84 @@ mod tests {
     #[cfg(feature = "cash")]
     #[test]
     fn a_key_note_exports_its_ck1_and_never_its_key() {
-        // lnurlcash-kit part2.json, the first branch's first note.
+        // LUD-25 test vector 3: its key held as a note at mint.example/w
+        // exports exactly the vector's ck1, bound to mint.example. The locker
+        // stores the endpoint, path and all, and the path never reaches the
+        // signature.
         let vectors: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
-        let note = &vectors["branches"][0]["notes"][0];
-        let secret: [u8; 32] = crate::hex::hex_decode(note["noteSecretKey"].as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
+        let v = &vectors["vector3"];
+        let unhex = |key: &str| -> [u8; 32] {
+            crate::hex::hex_decode(v[key].as_str().unwrap()).unwrap().try_into().unwrap()
+        };
+        let (secret, pubkey) = (unhex("sk"), unhex("outputKey"));
         let mut storage = FakeStorage::new();
         let mut store = fresh_store(&mut storage);
         let mut rng = test_rng();
-        let key = KeyNote { index: 0, pubkey: [0; 32] };
+        let key = KeyNote { index: 0, pubkey };
         let (id, _) = store
             .import_key(&mut storage, &mut rng, &secret, key, "mint.example/w", 1_000, "", 1)
             .unwrap();
-        assert_eq!(store.export_secret(&id).unwrap(), note["ck1"].as_str().unwrap());
+        let k1 = store.export_secret(&id).unwrap();
+        assert_eq!(k1, v["ck1"].as_str().unwrap());
+        assert!(!k1.contains(&hex_encode(&secret)));
+
+        // The same key at another mint is another ck1: nothing one mint has
+        // seen spends it anywhere else.
+        let mut storage = FakeStorage::new();
+        let mut store = fresh_store(&mut storage);
+        let (id, _) = store
+            .import_key(&mut storage, &mut rng, &secret, key, "moneyer.dev/w", 1_000, "", 1)
+            .unwrap();
+        let elsewhere = store.export_secret(&id).unwrap();
+        assert_ne!(elsewhere, k1);
+        assert_eq!(elsewhere, crate::cash_key::ck1_of(&secret, "moneyer.dev").unwrap());
+    }
+
+    #[test]
+    fn confirm_keeps_a_cs1_as_well_as_hex() {
+        // A mint that files notes by Q certifies a bearer note with a cs1,
+        // and the wallet hands it straight to confirm. LUD-25 test vector 5's
+        // certificate, for a note at mint.example.
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
+        let cs1 = vectors["vector5"]["cs1"].as_str().unwrap();
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let mut confirm_with = |sig: &str| {
+            let (id, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 1).unwrap();
+            let result = store.confirm(&mut storage, &id, 1_000, "mint.example/w", Some(sig), 2);
+            (result, store.get_meta(&id).unwrap())
+        };
+
+        let (result, meta) = confirm_with(cs1);
+        assert_eq!(result, Ok(()));
+        assert_eq!((meta.state, meta.sig.as_str()), (NoteState::Confirmed, cs1));
+        // BIP-350 allows all upper case; the locker keeps it lowercase.
+        let (result, meta) = confirm_with(&cs1.to_uppercase());
+        assert_eq!(result, Ok(()));
+        assert_eq!(meta.sig, cs1);
+        // Hex, as mints sent before cs1, is kept as it was.
+        let (result, meta) = confirm_with(&"ab".repeat(65));
+        assert_eq!(result, Ok(()));
+        assert_eq!(meta.sig, "ab".repeat(65));
+
+        // Anything that is neither is still refused, and the note stays
+        // PENDING for the wallet to confirm properly.
+        let mut broken = String::from(cs1);
+        broken.pop();
+        broken.push(if cs1.ends_with('q') { 'p' } else { 'q' });
+        let mixed = format!("{}{}", &cs1[..10].to_uppercase(), &cs1[10..]);
+        for bad in [broken.as_str(), mixed.as_str(), "not a certificate", "AB"] {
+            let (result, meta) = confirm_with(bad);
+            assert_eq!(result, Err(NoteError::BadRequest), "{bad}");
+            assert_eq!(meta.state, NoteState::Pending, "{bad}");
+        }
+
+        // And a confirmed cs1 survives a reload.
+        let reloaded = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert!(reloaded.list(0, MAX_NOTES).notes.iter().any(|n| n.sig == cs1));
     }
 
     #[test]

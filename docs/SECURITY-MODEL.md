@@ -594,16 +594,32 @@ is always a press on the board, whichever way the request arrives:
   risk, an owner holding after page 1 having seen two words, 22 bits, which a
   compromised browser grinds in moments. So neither card can be approved
   until every page has actually been on screen for its full 4 s dwell and
-  12 s have passed: the pages turn on what was drawn, not on the clock, so a
-  loop held up by a stalling relay (a redial, a rejoin) cannot let the gate
-  open with words 3 to 5 never shown; the page on screen simply stays up
-  longer. Until then the hint reads "compare all 5 words" and no hold that
+  12 s have passed: the pages turn on what the firmware drew, not on the
+  clock, so a loop held up by a stalling relay (a redial, a rejoin) cannot
+  let the gate open with words 3 to 5 never shown; the page on screen simply
+  stays up longer. Time under another screen does not count either: every
+  panel flush moves a draw counter on, and when the card finds it has been
+  drawn over (a signing confirmation, an OTA chunk) it draws itself again at
+  once and the page starts its dwell afresh, so a stream of overdraws only
+  makes the card expire. What the counter cannot see is the panel itself:
+  the dwell assumes the glass shows what was last flushed. Until then the hint reads "compare all 5 words" and no hold that
   STARTS then ever counts, however long it runs; a short press does
   nothing, so it cannot decline and spend the phone's code (B/NO on a
   T-Display still cancels). The cable and relay cards share the rule
   (`phone_unlock::EnrolGate`, host-tested). A card whose pages could not all
   be shown in its 45 s expires and adds nothing; the window is not extended,
   since expiry is the safe failure and the owner starts again.
+- **One button, one decision:** in WiFi mode, while a relay card (or a result
+  younger than 20 s) is up, every cable frame that may raise a card of its
+  own is refused "approval on screen" (`types::cable_frame_card`, checked by
+  ui-preview against every cable arm that is handed the buttons). Otherwise
+  a compromised host could send one while the owner hesitates over a relay
+  enrolment, and the hold that answers the cable card, latched by the
+  button sampler with its full length, would then read as the relay card's
+  approval. As a second line, a cable frame that held the loop 2 s or more
+  disarms the front relay card and clears the latched press, and every
+  relay card (the enrol card after its gate too) arms only with the button
+  seen up.
 - **The real bound:** a compromised browser holds P from the moment the owner
   pastes the phone's code, before it sends anything, so it can grind a key of
   its own whose five words match for as long as the owner is willing to wait

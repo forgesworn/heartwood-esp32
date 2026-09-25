@@ -2434,34 +2434,56 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
    out; a fresh `enrol-for` run from the same phone code is accepted, since
    the key is remembered in RAM only.
 
-10. **The result screen holds, and lets go.** Enrol with nothing else going
-    on and leave PHONE ADDED alone: it is still up after 2 minutes and goes
-    after 5 (back to the idle screen); a fresh press ends it sooner (the
-    release of the approving hold does not). Then queue a sign request
-    behind an enrolment card (any client, unapproved kind). After the press,
-    PHONE ADDED stays up about 20 s before the sign card appears, or goes as
-    soon as the button is pressed again; a sign request that arrives a
-    minute after the press takes over at once. Repeat with a cable
-    enrolment (`phone-unlock.mjs enrol` without `--over-relay`) in WiFi mode
-    and a relay sign request queued meanwhile: the same. With PHONE ADDED up,
-    start a second cable enrolment with a used code (refused before any
-    card): PHONE ADDED stays. Start one that raises its card and let it
-    expire: "Expired" shows for about 3 s, then the idle screen, not the old
-    PHONE ADDED.
-    an auto-approved request (a kind the client's policy allows) shows its
-    AUTO-SIGNED card for 5 s, then PHONE ADDED comes back. A USB
-    `FIRMWARE_INFO` answers at any time while it is up, and PHONE ADDED
-    stays. A cable NIP-46 request that needs a card is refused with
-    "approval on screen" for the first 20 s only; after that its card runs
-    over PHONE ADDED, and once it is answered (by a hold) PHONE ADDED comes
-    back after that card's own result (2 s, or the SIGNED card's 5 s) and
-    is not dismissed by that hold's release. Then,
-    right after a PHONE ADDED, turn the access point off: a press still
-    dismisses it (a few seconds late at worst, while a rejoin attempt blocks
-    the loop), and after 20 s a cable NIP-46 request is served. Also: after
-    the cable enrol card of step 11 in WiFi mode (45 s with the loop held),
-    the log shows no "silent (no data/pong); reconnecting" for a quiet relay
-    straight after, and a ping goes out on the next pass.
+10. **The result screen holds, and lets go.** In WiFi mode unless said
+    otherwise; each sub-step starts from a fresh PHONE ADDED.
+    a. Leave PHONE ADDED alone: it is still up after 2 minutes and goes
+       after 5 (back to the idle screen). A fresh press ends it sooner; the
+       release of the approving hold does not.
+    b. While it is up: a USB `FIRMWARE_INFO` answers at any time and PHONE
+       ADDED stays. An auto-approved request (a kind the client's policy
+       allows) shows its AUTO-SIGNED card for 5 s, then PHONE ADDED comes
+       back.
+    c. A cable NIP-46 request that needs a card is refused "approval on
+       screen" for the first 20 s. After that its card runs over PHONE
+       ADDED, and once answered with a hold, PHONE ADDED comes back after
+       that card's own result (2 s, or the SIGNED card's 5 s) and is not
+       dismissed by that hold's release.
+    d. A second cable enrolment within 20 s of the result is refused
+       "approval on screen", like any cable command that raises a card.
+       After 20 s: one with a used code (refused before any card) leaves
+       PHONE ADDED up; one that raises its card and is left to expire
+       shows "Expired" for about 3 s, then the idle screen, not the old
+       PHONE ADDED.
+    e. Queue a relay sign request behind an enrolment card (any client,
+       unapproved kind). After the press, PHONE ADDED stays up about 20 s
+       before the sign card appears, or goes as soon as the button is
+       pressed again; a sign request that arrives a minute after the press
+       takes over at once. Repeat with a cable enrolment
+       (`phone-unlock.mjs enrol` without `--over-relay`): the same.
+    f. Right after a PHONE ADDED, turn the access point off: a press still
+       dismisses it (a few seconds late at worst, while a rejoin attempt
+       blocks the loop), and after 20 s a cable NIP-46 request is served.
+    g. After the cable enrol card of step 11 (45 s with the loop held), the
+       log shows no "silent (no data/pong); reconnecting" for a quiet relay
+       straight after, and a ping goes out on the next pass.
+
+10b. **A cable card cannot answer a relay card.** With a relay enrol card up
+    (any page, before or after its gate), send each card-raising cable
+    frame in turn: a `CONNSLOT_UPDATE`, a `BACKUP_EXPORT_REQUEST`, a
+    `SET_OPERATOR`, an `OTA_BEGIN` and a plaintext NIP-46 `sign_event`. Each
+    is refused at once with "approval on screen" and no card of its own;
+    the relay card stays, keeps its page, and is neither approved nor
+    declined. (The list the board refuses is `types::cable_frame_card`;
+    `ui-preview`'s tests check it against every cable arm handed the
+    buttons.)
+
+10c. **Time under another screen is not reading time.** During an enrol
+    card's first 12 s, have a client with an auto-approved kind sign twice
+    a second or so apart: each AUTO-SIGNED card flashes, the enrol card
+    comes straight back on the same page, and that page then stays a full
+    4 s from its return; the hint stays "compare all 5 words" for longer
+    than 12 s. Keep it up for the whole window: the card never arms and
+    ends "Expired".
 
 11. **Cable card matches.** `phone-unlock.mjs enrol` over USB: the same card
     layout, pages, markers, gate, five words and 45 s window, and PHONE ADDED

@@ -945,16 +945,88 @@ mod error_card_tests {
 
 #[cfg(test)]
 mod cable_card_tests {
-    use heartwood_common::types::{cable_frame_card, CableCard};
+    use heartwood_common::phone_unlock::{cable_frame_claim, CableClaim};
+    use heartwood_common::types::{cable_frame_card, CableCard, FRAME_TYPE_PHONE_UNLOCK_CMD};
     use std::collections::HashMap;
 
+    /// relay.rs helpers that take the whole context but only look after the
+    /// screen's ownership; any other call handed bare `ctx` could reach the
+    /// buttons.
+    const SCREEN_HELPERS: &[&str] = &[
+        "cable_card_refused",
+        "approval_card_open",
+        "screen_busy",
+        "release_card_screen_hold",
+        "hold_card_screen",
+        "interrupt_held_result",
+    ];
+
+    /// Whether an arm's text can reach the button: `ctx.buttons`, the
+    /// button module's globals, or a call (other than a screen helper) that
+    /// is handed the whole context.
+    fn reaches_button(text: &str) -> Option<String> {
+        if text.contains("ctx.buttons") {
+            return Some("ctx.buttons".into());
+        }
+        if text.contains("crate::button::") {
+            return Some("crate::button::".into());
+        }
+        let bytes = text.as_bytes();
+        let mut from = 0;
+        while let Some(at) = text[from..].find("ctx") {
+            let i = from + at;
+            from = i + 3;
+            let before = text[..i].trim_end();
+            let after = text[i + 3..].trim_start();
+            let bare = (before.ends_with('(') || before.ends_with(','))
+                && (after.starts_with(',') || after.starts_with(')'))
+                && !(i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'));
+            if !bare {
+                continue;
+            }
+            // The function this argument list belongs to.
+            let mut depth = 0i32;
+            let mut open = None;
+            for (j, c) in text[..i].char_indices().rev() {
+                match c {
+                    ')' => depth += 1,
+                    '(' if depth == 0 => {
+                        open = Some(j);
+                        break;
+                    }
+                    '(' => depth -= 1,
+                    _ => {}
+                }
+            }
+            let name: String = open
+                .map(|j| {
+                    text[..j]
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let short = name.rsplit("::").next().unwrap_or(&name);
+            if !SCREEN_HELPERS.contains(&short) {
+                return Some(format!("{name}(ctx)"));
+            }
+        }
+        None
+    }
+
     /// Every arm of the WiFi loop's USB dispatch (relay.rs `poll_usb_frame`)
-    /// that hands its handler the buttons may raise a card of its own, and a
-    /// card answered with a relay card waiting leaves a hold that card would
-    /// read as its own approval. So each such frame must be classified as
+    /// that can reach the button may raise a card of its own, and a card
+    /// answered with a relay card waiting leaves a hold that card would read
+    /// as its own approval. So each such frame must be classified as
     /// card-raising in `types::cable_frame_card`, which the loop refuses
-    /// "approval on screen" while a relay card is up. Scans the source, so a
-    /// new arm is covered the day it lands.
+    /// "approval on screen" (or, for recovery frames, takes the screen over
+    /// from) while a relay card is up; and the fall-through arm must not
+    /// reach the button at all. Scans the source, so a new arm is covered the
+    /// day it lands.
     #[test]
     fn every_cable_frame_handed_the_buttons_is_refused_under_a_relay_card() {
         let types = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../common/src/types.rs")).unwrap();
@@ -970,41 +1042,62 @@ mod cable_card_tests {
         let relay = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/relay.rs")).unwrap();
         let start = relay.find("fn poll_usb_frame(").expect("poll_usb_frame is in relay.rs");
         let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
-        // Arms start at eight spaces of indent with a frame name.
-        let mut arms: Vec<(String, String)> = Vec::new();
-        for line in body.lines() {
-            if line.starts_with("        FRAME_TYPE_") {
-                arms.push((String::new(), String::new()));
+        let dispatch = &body[body.find("    match frame.frame_type {").expect("the dispatch match")..];
+        // Arms start at eight spaces of indent with a frame name, or the
+        // fall-through `other =>`; each runs to the next.
+        let mut arms: Vec<String> = Vec::new();
+        for line in dispatch.lines().skip(1) {
+            if line.starts_with("        FRAME_TYPE_") || line.starts_with("        other =>") {
+                arms.push(String::new());
             }
-            if let Some((pattern, text)) = arms.last_mut() {
-                if !text.contains("=>") && !pattern.contains("=>") {
-                    pattern.push_str(line);
-                    pattern.push('\n');
-                } else {
-                    text.push_str(line);
-                    text.push('\n');
-                }
-                if pattern.contains("=>") && text.is_empty() {
-                    text.push(' ');
-                }
+            if let Some(arm) = arms.last_mut() {
+                arm.push_str(line);
+                arm.push('\n');
             }
         }
         let mut checked = 0;
-        for (pattern, text) in &arms {
-            let names: Vec<&str> = pattern
+        let mut saw_fallthrough = false;
+        for arm in &arms {
+            let reach = reaches_button(arm);
+            if arm.starts_with("        other =>") {
+                saw_fallthrough = true;
+                assert_eq!(reach, None, "the fall-through arm reaches the button");
+                continue;
+            }
+            let pattern = &arm[..arm.find("=>").expect("an arm has =>")];
+            for name in pattern
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .filter(|w| w.starts_with("FRAME_TYPE_"))
-                .collect();
-            let handed_buttons = pattern.contains("ctx.buttons") || text.contains("ctx.buttons");
-            for name in names {
+            {
                 let value = *consts.get(name).unwrap_or_else(|| panic!("{name} not in types.rs"));
                 checked += 1;
-                if handed_buttons {
-                    assert_ne!(cable_frame_card(value), CableCard::Never, "{name} is handed the buttons");
+                if let Some(how) = &reach {
+                    assert_ne!(cable_frame_card(value), CableCard::Never, "{name} reaches the button via {how}");
                 }
             }
         }
+        assert!(saw_fallthrough, "the fall-through arm was not found");
         assert!(checked >= 35, "scan found {checked} frames: the parser has drifted");
+
+        // The phone commands split: only a valid enrolment raises a card.
+        let pk = "ab".repeat(32);
+        let enrol = format!(r#"{{"op":"enrol","enrol_pubkey":"{pk}"}}"#);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, enrol.as_bytes()), CableClaim::Card);
+        for other in [r#"{"op":"list"}"#, r#"{"op":"revoke","id":1}"#, r#"{"op":"set_announce_operator","on":false}"#] {
+            assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, other.as_bytes()), CableClaim::Free, "{other}");
+        }
+    }
+
+    #[test]
+    fn the_scan_sees_every_way_to_the_button() {
+        assert!(reaches_button("x(usb, ctx.nvs, ctx.buttons)").is_some());
+        assert!(reaches_button("crate::net_config_store::handle_get_net_config(usb, ctx)").is_some());
+        assert!(reaches_button("handle(ctx, usb)").is_some());
+        assert!(reaches_button("if crate::button::hold_ms() > 0 {}").is_some());
+        assert_eq!(reaches_button("if cable_card_refused(ctx) {}"), None);
+        assert_eq!(reaches_button("release_card_screen_hold(ctx, None)"), None);
+        assert_eq!(reaches_button("x(usb, ctx.nvs, ctx.network_runtime)"), None);
+        assert_eq!(reaches_button("let ctxs = 1; f(my_ctx)"), None);
     }
 }
 

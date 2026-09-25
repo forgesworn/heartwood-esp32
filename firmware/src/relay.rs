@@ -1160,7 +1160,7 @@ pub fn run_wifi_standalone<'d, 'b>(
     // the normal relay loop begins immediately afterwards.
     let usb_startup_grace = Instant::now() + Duration::from_secs(2);
     while Instant::now() < usb_startup_grace {
-        poll_usb(usb, &mut ctx, Some(&mut wifi));
+        poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
         FreeRtos::delay_ms(20);
     }
 
@@ -1202,11 +1202,17 @@ pub fn run_wifi_standalone<'d, 'b>(
             );
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx, Some(&mut wifi));
-                // A relay card owns the button and the screen even while it cannot
-                // be answered; a held result is served inside service_button.
+                poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
+                // A relay card still owns the button and the screen: tick it with
+                // no session, so it can be answered (an approval's reply waits in
+                // the #82 outbox; an enrolment finds no live relay and adds
+                // nothing) and, above all, expires on time instead of standing,
+                // and refusing the cable, until a power cycle. A held result is
+                // served inside service_button.
                 if ctx.button_cards.is_empty() {
                     service_button(&mut ctx);
+                } else {
+                    service_button_cards(&mut ctx, &mut []);
                 }
                 FreeRtos::delay_ms(20);
             }
@@ -1260,11 +1266,17 @@ pub fn run_wifi_standalone<'d, 'b>(
                 );
                 let until = Instant::now() + Duration::from_secs(3);
                 while Instant::now() < until {
-                    poll_usb(usb, &mut ctx, Some(&mut wifi));
-                    // A relay card owns the button and the screen even while it cannot
-                    // be answered; a held result is served inside service_button.
+                    poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
+                    // A relay card still owns the button and the screen: tick it with
+                    // no session, so it can be answered (an approval's reply waits in
+                    // the #82 outbox; an enrolment finds no live relay and adds
+                    // nothing) and, above all, expires on time instead of standing,
+                    // and refusing the cable, until a power cycle. A held result is
+                    // served inside service_button.
                     if ctx.button_cards.is_empty() {
                         service_button(&mut ctx);
+                    } else {
+                        service_button_cards(&mut ctx, &mut []);
                     }
                     FreeRtos::delay_ms(20);
                 }
@@ -1295,11 +1307,17 @@ pub fn run_wifi_standalone<'d, 'b>(
             // fixable over USB.
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx, Some(&mut wifi));
-                // A relay card owns the button and the screen even while it cannot
-                // be answered; a held result is served inside service_button.
+                poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
+                // A relay card still owns the button and the screen: tick it with
+                // no session, so it can be answered (an approval's reply waits in
+                // the #82 outbox; an enrolment finds no live relay and adds
+                // nothing) and, above all, expires on time instead of standing,
+                // and refusing the cable, until a power cycle. A held result is
+                // served inside service_button.
                 if ctx.button_cards.is_empty() {
                     service_button(&mut ctx);
+                } else {
+                    service_button_cards(&mut ctx, &mut []);
                 }
                 FreeRtos::delay_ms(20);
             }
@@ -1318,9 +1336,9 @@ pub fn run_wifi_standalone<'d, 'b>(
         // 0x55 during live service is declined (matches the old per-session
         // loop, which lent the driver only in the between-sessions gaps).
         let blocked = if sessions.is_empty() {
-            poll_usb(usb, &mut ctx, Some(&mut wifi))
+            poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions)
         } else {
-            poll_usb(usb, &mut ctx, None)
+            poll_usb(usb, &mut ctx, None, &mut sessions)
         };
         if blocked {
             // A cable card held the loop with nothing reading the relays:
@@ -3241,9 +3259,10 @@ fn poll_usb(
     usb: &mut SerialPort<'_>,
     ctx: &mut SignCtx,
     wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
+    sessions: &mut [RelaySession],
 ) -> bool {
     let started = Instant::now();
-    if !poll_usb_frame(usb, ctx, wifi) {
+    if !poll_usb_frame(usb, ctx, wifi, sessions) {
         return false;
     }
     let blocked = started.elapsed() >= CABLE_BLOCKED;
@@ -3270,11 +3289,14 @@ const CABLE_BLOCKED: Duration = Duration::from_secs(2);
 /// result is drawn again.
 const HELD_RESULT_REDRAW: Duration = Duration::from_secs(2);
 
-/// Read and handle one USB frame; false when none was waiting.
+/// Read and handle one USB frame; false when none was waiting. `sessions`
+/// carries the answers of relay cards a recovery command takes the screen
+/// from.
 fn poll_usb_frame(
     usb: &mut SerialPort<'_>,
     ctx: &mut SignCtx,
     wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
+    sessions: &mut [RelaySession],
 ) -> bool {
     let mut frame = match crate::protocol::try_read_frame(usb, 0) {
         Some(f) => f,
@@ -3293,23 +3315,29 @@ fn poll_usb_frame(
     // release with the whole press), which the relay card would read as its
     // own approval: a compromised host could send any card-raising frame
     // while the owner hesitates over a relay enrolment and harvest the hold.
-    // So every frame that may raise a card (`types::cable_frame_card`, which
-    // ui-preview checks against this match) is refused while a card, or a
-    // result younger than RESULT_HOLD_MS, is up. The per-arm checks below
-    // predate this and are kept.
-    let raises_card = match heartwood_common::types::cable_frame_card(frame.frame_type) {
-        heartwood_common::types::CableCard::Never => false,
-        heartwood_common::types::CableCard::Always => true,
-        heartwood_common::types::CableCard::IfEnrol => matches!(
-            heartwood_common::phone_unlock::PhoneCmd::parse(&frame.payload),
-            Ok(heartwood_common::phone_unlock::PhoneCmd::Enrol { .. })
-        ),
-    };
-    if raises_card && cable_card_refused(ctx) {
-        crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
-        // Some of these carry secrets (a PIN, a vault key, a seed).
-        frame.scrub_payload();
-        return true;
+    // So every frame that may raise a card (`phone_unlock::cable_frame_claim`,
+    // which ui-preview checks against this match) is refused while a card,
+    // or a result younger than RESULT_HOLD_MS, is up; the per-arm checks
+    // below predate this and are kept. The owner's recovery commands are the
+    // exception: anyone can keep a relay card up (a RECEIVE card comes back
+    // for every wrap published to the board), and a board whose network,
+    // firmware or whole state needs fixing over the cable must not wait on
+    // that, so these take the screen over instead (take_screen_for_recovery).
+    match heartwood_common::phone_unlock::cable_frame_claim(frame.frame_type, &frame.payload) {
+        heartwood_common::phone_unlock::CableClaim::Free => {}
+        heartwood_common::phone_unlock::CableClaim::Card => {
+            if cable_card_refused(ctx) {
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+                // Some of these carry secrets (a PIN, a vault key, a seed).
+                frame.scrub_payload();
+                return true;
+            }
+        }
+        heartwood_common::phone_unlock::CableClaim::Recovery => {
+            if screen_busy(ctx) {
+                take_screen_for_recovery(ctx, sessions);
+            }
+        }
     }
 
     match frame.frame_type {
@@ -3562,6 +3590,8 @@ fn poll_usb_frame(
             frame.scrub_payload();
         }
         FRAME_TYPE_VAULT_UNLOCK => {
+            // The payload is a vault key, answered or not (FW-L3).
+            frame.scrub_payload();
             crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"already unlocked");
         }
         // A cable enrolment puts its own blocking card up, which would paint
@@ -3908,7 +3938,9 @@ fn handle_profile_event(ev: &SignedEvent, ctx: &mut SignCtx) {
         ctx.identity_name.as_deref().unwrap_or("")
     );
 
-    if changed && ctx.display_on && ctx.masters.len() == 1 {
+    // Not over a card or a held result: the identity card would hide what
+    // the owner is reading, and time under it would count as reading time.
+    if changed && ctx.display_on && ctx.masters.len() == 1 && !approval_card_open(ctx) {
         let slot = ctx.masters[0].slot;
         let npub = heartwood_common::encoding::encode_npub(&ctx.masters[0].pubkey);
         // Sapwood-provisioned metadata (name + avatar) wins; the kind-0 name is
@@ -4990,6 +5022,11 @@ struct ButtonCard {
     /// `oled::draw_generation` just after this card last drew its face;
     /// `None` before the first draw.
     drawn_gen: Option<u32>,
+}
+
+/// Whether this card has been on screen for its whole window.
+fn card_overdue(card: &ButtonCard) -> bool {
+    card.opened_at.is_some_and(|at| at.elapsed() >= card_window(card))
 }
 
 /// Whether something else has been drawn since this card last drew its face.
@@ -6485,6 +6522,27 @@ fn release_card_screen_hold(ctx: &mut SignCtx, restore_idle_after: Option<Durati
     ctx.network_display_restore_at = restore_idle_after.map(|after| Instant::now() + after);
 }
 
+/// Clear the screen for a cable recovery command (`CableClaim::Recovery`):
+/// every relay card is answered Expired, exactly as if its window had run
+/// (publishing what an expiry publishes on the live sessions), a held result
+/// is let go, and the latched press is cleared. The cable card that follows
+/// arms only once the button has been seen up (approval.rs), so no hold the
+/// owner began for a relay card can answer it: a takeover is never a bait
+/// and switch.
+fn take_screen_for_recovery(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
+    log::warn!(
+        "[relay] cable recovery command takes the screen: {} relay card(s) answered Expired",
+        ctx.button_cards.len()
+    );
+    while !ctx.button_cards.is_empty() {
+        resolve_button_card(ctx, sessions, 0, &CardTick::Expired);
+    }
+    if ctx.card_screen_hold.is_some() {
+        release_card_screen_hold(ctx, None);
+    }
+    crate::button::clear_press_edge();
+}
+
 /// Whether a cable command that puts up its own card must be refused with
 /// "approval on screen": a card is up, or a result has been held for less
 /// than `phone_unlock::RESULT_HOLD_MS` ([`screen_busy`]). Past that the
@@ -6501,7 +6559,10 @@ fn cable_card_refused(ctx: &SignCtx) -> bool {
 /// this, not for a result that may stay up for minutes; over an older result
 /// they go ahead and it is drawn again after them.
 fn screen_busy(ctx: &SignCtx) -> bool {
-    !ctx.button_cards.is_empty()
+    // A front card whose window has passed is not waiting for anyone: its
+    // expiry is only a tick away, and must not keep the cable refused while
+    // the loop cannot tick (a relay redial, a WiFi rejoin).
+    ctx.button_cards.first().is_some_and(|card| !card_overdue(card))
         || ctx
             .card_screen_hold
             .as_ref()

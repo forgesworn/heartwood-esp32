@@ -343,36 +343,43 @@ impl Identity {
 pub enum CableCard {
     /// Never raises a card (answers, NACKs, or draws without the button).
     Never,
-    /// May raise a card.
+    /// May raise a card; refused while a relay card is up.
     Always,
+    /// May raise a card, and is the owner's way back from a board the
+    /// relays are holding (a bad network, a factory reset, a firmware fix):
+    /// it takes the screen over instead of waiting behind a relay card, which
+    /// anyone can keep up by publishing to the board. The relay cards are
+    /// answered Expired first, and the cable card arms only once the button
+    /// has been seen up, so no hold made for the relay card can answer it.
+    Recovery,
     /// Raises a card only for one command in its payload
     /// (PHONE_UNLOCK_CMD's `enrol`).
     IfEnrol,
 }
 
 /// [`CableCard`] for `frame_type`, as the WiFi-standalone loop handles it.
-/// Every arm there that hands the handler the buttons must be `Always` or
-/// `IfEnrol`; ui-preview's tests read relay.rs and check it.
+/// Every arm there that hands the handler the buttons (or the whole context)
+/// must be classified; ui-preview's tests read relay.rs and check it.
 pub fn cable_frame_card(frame_type: u8) -> CableCard {
     match frame_type {
         FRAME_TYPE_NIP46_REQUEST
         | FRAME_TYPE_ENCRYPTED_REQUEST
         | FRAME_TYPE_SET_BRIDGE_SECRET
-        | FRAME_TYPE_SET_NET_CONFIG
-        | FRAME_TYPE_PATCH_NET_CONFIG
         | FRAME_TYPE_SET_OPERATOR
         | FRAME_TYPE_SET_PIN
         | FRAME_TYPE_VAULT_SET
         | FRAME_TYPE_CONNSLOT_UPDATE
         | FRAME_TYPE_BACKUP_EXPORT_REQUEST
         | FRAME_TYPE_BACKUP_IMPORT_REQUEST
-        | FRAME_TYPE_OTA_BEGIN
         | FRAME_TYPE_PROVISION
         | FRAME_TYPE_GENERATE_IDENTITY
         | FRAME_TYPE_RESTORE_IDENTITY
         | FRAME_TYPE_DERIVE_IDENTITY
-        | FRAME_TYPE_PROVISION_REMOVE
-        | FRAME_TYPE_FACTORY_RESET => CableCard::Always,
+        | FRAME_TYPE_PROVISION_REMOVE => CableCard::Always,
+        FRAME_TYPE_FACTORY_RESET
+        | FRAME_TYPE_SET_NET_CONFIG
+        | FRAME_TYPE_PATCH_NET_CONFIG
+        | FRAME_TYPE_OTA_BEGIN => CableCard::Recovery,
         FRAME_TYPE_PHONE_UNLOCK_CMD => CableCard::IfEnrol,
         _ => CableCard::Never,
     }
@@ -388,25 +395,31 @@ mod cable_card_tests {
             FRAME_TYPE_NIP46_REQUEST,
             FRAME_TYPE_ENCRYPTED_REQUEST,
             FRAME_TYPE_SET_BRIDGE_SECRET,
-            FRAME_TYPE_SET_NET_CONFIG,
-            FRAME_TYPE_PATCH_NET_CONFIG,
             FRAME_TYPE_SET_OPERATOR,
             FRAME_TYPE_SET_PIN,
             FRAME_TYPE_VAULT_SET,
             FRAME_TYPE_CONNSLOT_UPDATE,
             FRAME_TYPE_BACKUP_EXPORT_REQUEST,
             FRAME_TYPE_BACKUP_IMPORT_REQUEST,
-            FRAME_TYPE_OTA_BEGIN,
             FRAME_TYPE_PROVISION,
             FRAME_TYPE_GENERATE_IDENTITY,
             FRAME_TYPE_RESTORE_IDENTITY,
             FRAME_TYPE_DERIVE_IDENTITY,
             FRAME_TYPE_PROVISION_REMOVE,
+        ];
+        // The owner's way back from a board the relays are holding hostage:
+        // these take the screen over rather than wait behind a relay card.
+        let recovery = [
             FRAME_TYPE_FACTORY_RESET,
+            FRAME_TYPE_SET_NET_CONFIG,
+            FRAME_TYPE_PATCH_NET_CONFIG,
+            FRAME_TYPE_OTA_BEGIN,
         ];
         for t in 0..=u8::MAX {
             let expected = if always.contains(&t) {
                 CableCard::Always
+            } else if recovery.contains(&t) {
+                CableCard::Recovery
             } else if t == FRAME_TYPE_PHONE_UNLOCK_CMD {
                 CableCard::IfEnrol
             } else {

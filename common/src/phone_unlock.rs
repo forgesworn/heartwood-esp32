@@ -982,6 +982,36 @@ impl PhoneCmd {
     }
 }
 
+/// What a USB frame claims of the screen in the WiFi-standalone loop, from
+/// its type and (for PHONE_UNLOCK_CMD) its payload: `types::cable_frame_card`
+/// with the enrolment split resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CableClaim {
+    /// Raises no card.
+    Free,
+    /// Raises a card: refused while a relay card is up.
+    Card,
+    /// Raises a card and takes the screen over from a relay card.
+    Recovery,
+}
+
+/// [`CableClaim`] for one frame. Only `{"op":"enrol"}` with a valid key
+/// raises a card among the phone commands; list, revoke and
+/// set_announce_operator never do, and a command that does not parse is
+/// answered with an error and no card.
+pub fn cable_frame_claim(frame_type: u8, payload: &[u8]) -> CableClaim {
+    use crate::types::CableCard;
+    match crate::types::cable_frame_card(frame_type) {
+        CableCard::Never => CableClaim::Free,
+        CableCard::Always => CableClaim::Card,
+        CableCard::Recovery => CableClaim::Recovery,
+        CableCard::IfEnrol => match PhoneCmd::parse(payload) {
+            Ok(PhoneCmd::Enrol { .. }) => CableClaim::Card,
+            _ => CableClaim::Free,
+        },
+    }
+}
+
 /// Enrolment keys already answered this boot. A phone makes a fresh one-off
 /// key per enrolment, so the same key again is a host resending a command it
 /// has already sent (a retrying request helper queued three extra enrols
@@ -1880,6 +1910,31 @@ mod tests {
                 assert!(enrol_hint(tags, b, true).starts_with("on phone? "));
             }
         }
+    }
+
+    #[test]
+    fn only_an_enrolment_raises_a_card_among_phone_commands() {
+        use crate::types::*;
+        let pk = "ab".repeat(32);
+        let enrol = alloc::format!(r#"{{"op":"enrol","enrol_pubkey":"{pk}","label":"p"}}"#);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, enrol.as_bytes()), CableClaim::Card);
+        for other in [
+            r#"{"op":"list"}"#,
+            r#"{"op":"revoke","id":3}"#,
+            r#"{"op":"set_announce_operator","on":true}"#,
+            r#"{"op":"enrol"}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                cable_frame_claim(FRAME_TYPE_PHONE_UNLOCK_CMD, other.as_bytes()),
+                CableClaim::Free,
+                "{other}"
+            );
+        }
+        assert_eq!(cable_frame_claim(FRAME_TYPE_CONNSLOT_UPDATE, b""), CableClaim::Card);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_FACTORY_RESET, b""), CableClaim::Recovery);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_SET_NET_CONFIG, b"{}"), CableClaim::Recovery);
+        assert_eq!(cable_frame_claim(FRAME_TYPE_FIRMWARE_INFO, b""), CableClaim::Free);
     }
 
     #[test]

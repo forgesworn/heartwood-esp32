@@ -23,7 +23,10 @@ const DEBOUNCE_MS: u32 = 30;
 /// Run the interactive button approval loop.
 ///
 /// Shows `show_fn` on the OLED each second with the remaining countdown,
-/// waits for a 2-second hold of the A button. While the button is held, a
+/// waits for a 2-second hold of the A button, counted only from a press that
+/// starts after the button has been seen up (debounced) with the card on
+/// screen, so a hold already down when it appears never answers it. While
+/// the button is held, a
 /// graphical progress bar fills from 0% to 100% over 2 seconds. On boards
 /// with a second button, a B press is an explicit cancel. Returns the
 /// approval result; on timeout the countdown screen is replaced with an
@@ -92,8 +95,13 @@ where
     // The enrol card: `oled::draw_generation` just after its face was last
     // drawn, to tell when something else has drawn over it.
     let mut drawn_gen: Option<u32> = None;
-    // When A was last seen down, for the gate's debounced "up".
+    // When A was last seen down, for the debounced "up" that arms the card.
     let mut last_down = Instant::now();
+    // Every card, gated or not, arms only once A has been seen up for
+    // DEBOUNCE_MS: a hold already down when the card appears (the tail of
+    // an earlier decision, a pinned GPIO 0, a press made for a card that has
+    // just been taken off the screen) is never counted towards this one.
+    let mut plain_armed = false;
 
     loop {
         crate::wdt::feed();
@@ -107,12 +115,13 @@ where
         if buttons.a.is_low() {
             last_down = now;
         }
-        // No gate (every caller but the enrol card): exactly the loop it
-        // always was, a hold already down when the card appears included.
+        let settled_up = now.duration_since(last_down) >= Duration::from_millis(u64::from(DEBOUNCE_MS));
         let (page, armed) = match gate.as_deref_mut() {
-            None => (0, true),
+            None => {
+                plain_armed = plain_armed || settled_up;
+                (0, plain_armed)
+            }
             Some(g) => {
-                let settled_up = now.duration_since(last_down) >= Duration::from_millis(u64::from(DEBOUNCE_MS));
                 let elapsed_ms = now.duration_since(start).as_millis().min(u128::from(u64::MAX)) as u64;
                 // Drawn over since its last draw (nothing in this loop does,
                 // bar its own hold bar): the page starts its dwell again and

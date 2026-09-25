@@ -526,10 +526,12 @@ impl NetConfig {
         }
     }
 
-    /// The operator management pubkey (32 bytes) if configured and valid hex.
-    /// `None` disables the relay management channel (kind 24134).
+    /// The operator management pubkey (32 bytes) if configured, valid hex and
+    /// a BIP-340 x-only point (as SET_OPERATOR canonicalises it). `None`
+    /// disables the relay management channel (kind 24134).
     pub fn op_mgmt_pubkey(&self) -> Option<[u8; 32]> {
-        crate::hex::hex_decode(&self.op_mgmt).ok()?.try_into().ok()
+        let key: [u8; 32] = crate::hex::hex_decode(&self.op_mgmt).ok()?.try_into().ok()?;
+        is_xonly_point(&key).then_some(key)
     }
 
     /// WiFi mode requires an SSID and at least one relay; USB mode is always valid.
@@ -867,6 +869,24 @@ pub fn parse_net_config(bytes: &[u8]) -> Result<NetConfig, &'static str> {
     serde_json::from_slice(bytes).map_err(|_| "invalid net config json")
 }
 
+/// Whether `key` is a valid BIP-340 x-only public key on either backend.
+#[cfg(feature = "nip46")]
+fn is_xonly_point(key: &[u8; 32]) -> bool {
+    #[cfg(all(feature = "k256-backend", not(feature = "secp256k1-backend")))]
+    {
+        k256::schnorr::VerifyingKey::from_bytes(key).is_ok()
+    }
+    #[cfg(all(feature = "secp256k1-backend", not(feature = "k256-backend")))]
+    {
+        secp256k1::XOnlyPublicKey::from_slice(key).is_ok()
+    }
+    #[cfg(not(any(feature = "k256-backend", feature = "secp256k1-backend")))]
+    {
+        let _ = key;
+        false
+    }
+}
+
 /// Validation for a LOCAL whole-config replacement (USB SET_NET_CONFIG frame
 /// or the flash `config` partition seed). Stronger than the legacy
 /// `NetConfig::validate` — the stored blob boots straight into
@@ -882,7 +902,7 @@ pub fn validate_local_net_config(cfg: &NetConfig) -> Result<(), &'static str> {
     // it here instead. Empty is "no operator". A malformed value already
     // stored is still read, as no operator.
     if !cfg.op_mgmt.is_empty() && cfg.op_mgmt_pubkey().is_none() {
-        return Err("op_mgmt must be 64 hex digits");
+        return Err("op_mgmt must be a 64 hex digit public key");
     }
     // Dormant fields in usb mode are shape-checked too: a later local edit
     // can promote the config to wifi without re-sending them.
@@ -1155,7 +1175,7 @@ mod tests {
             password: "old-password".to_string(),
             relays: vec!["wss://old.example".to_string()],
             mode: "wifi".to_string(),
-            op_mgmt: "11".repeat(32),
+            op_mgmt: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string(),
             networks: Vec::new(),
         }
     }
@@ -1645,6 +1665,14 @@ mod tests {
         assert_eq!(effective_network_revision(8, Some(7), Some(6)), 8);
     }
 
+    // x of G and of 2G: valid BIP-340 keys. 0xff repeated is past the field prime, so never a point.
+    const KEY_A: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const KEY_B: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+
+    fn key(hex: &str) -> [u8; 32] {
+        crate::hex::hex_decode(hex).unwrap().try_into().unwrap()
+    }
+
     fn with_operator(op: &str) -> NetConfig {
         let mut cfg = active();
         cfg.op_mgmt = op.to_string();
@@ -1653,20 +1681,24 @@ mod tests {
 
     #[test]
     fn a_set_net_config_that_names_another_operator_says_so() {
-        let stored = with_operator(&"ab".repeat(32));
+        let stored = with_operator(KEY_A);
         // The same key, however it is spelt, is no change.
-        assert_eq!(operator_change(&with_operator(&"AB".repeat(32)), Some(&stored)), OperatorChange::Kept);
+        assert_eq!(operator_change(&with_operator(&KEY_A.to_uppercase()), Some(&stored)), OperatorChange::Kept);
         assert_eq!(operator_change(&stored, Some(&stored)), OperatorChange::Kept);
         // Another key replacing a working one, or the first.
-        let other = with_operator(&"cd".repeat(32));
-        assert_eq!(operator_change(&other, Some(&stored)), OperatorChange::Replaced([0xcd; 32]));
-        assert_eq!(operator_change(&other, Some(&with_operator(""))), OperatorChange::Added([0xcd; 32]));
-        assert_eq!(operator_change(&other, Some(&with_operator("zz"))), OperatorChange::Added([0xcd; 32]));
-        assert_eq!(operator_change(&other, None), OperatorChange::Added([0xcd; 32]));
+        let other = with_operator(KEY_B);
+        assert_eq!(operator_change(&other, Some(&stored)), OperatorChange::Replaced(key(KEY_B)));
+        assert_eq!(operator_change(&other, Some(&with_operator(""))), OperatorChange::Added(key(KEY_B)));
+        assert_eq!(operator_change(&other, Some(&with_operator("zz"))), OperatorChange::Added(key(KEY_B)));
+        assert_eq!(operator_change(&other, None), OperatorChange::Added(key(KEY_B)));
         // No key, or one that does not decode (which disables relay
         // management just the same), in place of a working one.
         assert_eq!(operator_change(&with_operator(""), Some(&stored)), OperatorChange::Removed);
         assert_eq!(operator_change(&with_operator("zz"), Some(&stored)), OperatorChange::Removed);
+        // 64 hex digits that are not a curve point are no key either.
+        let off_curve = "ff".repeat(32);
+        assert_eq!(operator_change(&with_operator(&off_curve), Some(&stored)), OperatorChange::Removed);
+        assert_eq!(operator_change(&other, Some(&with_operator(&off_curve))), OperatorChange::Added(key(KEY_B)));
         assert_eq!(operator_change(&with_operator(""), Some(&with_operator("zz"))), OperatorChange::Kept);
         assert_eq!(operator_change(&with_operator(""), None), OperatorChange::Kept);
     }
@@ -1694,11 +1726,11 @@ mod tests {
     fn a_local_config_with_an_operator_that_does_not_decode_is_refused() {
         let mut cfg = active();
         validate_local_net_config(&cfg).unwrap();
-        cfg.op_mgmt = "AB".repeat(32);
+        cfg.op_mgmt = KEY_A.to_uppercase();
         validate_local_net_config(&cfg).unwrap();
         cfg.op_mgmt = String::new();
         validate_local_net_config(&cfg).unwrap();
-        for bad in ["zz".repeat(32), "ab".repeat(31), "ab".repeat(33), "abc".to_string(), "npub1xyz".to_string()] {
+        for bad in ["ff".repeat(32), "zz".repeat(32), "ab".repeat(31), "ab".repeat(33), "abc".to_string(), "npub1xyz".to_string()] {
             cfg.op_mgmt = bad.clone();
             assert!(validate_local_net_config(&cfg).is_err(), "{bad}");
         }

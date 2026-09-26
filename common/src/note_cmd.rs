@@ -444,15 +444,22 @@ fn name_pieces(name: &str) -> Vec<String> {
     chars.chunks(per).map(|piece| piece.iter().collect()).collect()
 }
 
-/// The card's last line: the mint the proof is for, as the signature binds
-/// it (its bare lowercase hostname). A long domain keeps its tail, where a
-/// lookalike differs.
+/// The card's last line: the mint the proof is for. The signature binds its
+/// bare lowercase hostname; a port, when there is one, is shown after it,
+/// because the port names the branch whose `cx1` the name is registered
+/// against (`moneyer.dev:8443` is not `moneyer.dev`'s branch). A long domain
+/// keeps its tail, port included, where a lookalike differs.
 #[cfg(feature = "cash")]
 fn address_proof_domain_line(host: &str) -> String {
     use crate::note_fmt::{elide_host, CARD_LINE_CHARS};
     let domain = crate::cash_key::spend_domain(host).to_ascii_lowercase();
+    // `host` has passed cash_store::valid_host: a `:` is followed by a port.
+    let shown = match host.split_once(':') {
+        Some((_, port)) => format!("{domain}:{port}"),
+        None => domain,
+    };
     let at = "at ";
-    format!("{at}{}", elide_host(&domain, CARD_LINE_CHARS - at.len()))
+    format!("{at}{}", elide_host(&shown, CARD_LINE_CHARS - at.len()))
 }
 
 #[cfg(feature = "cash")]
@@ -3111,7 +3118,7 @@ mod tests {
         // it spends nothing, so nobody was asked
         assert!(h.asked.is_empty());
 
-        for bad in ["", "Moneyer.dev", "moneyer.dev/w", "https://moneyer.dev"] {
+        for bad in ["", "Moneyer.dev", "moneyer.dev/w", "https://moneyer.dev", "moneyer.dev:x"] {
             let res = h.run(&format!(r#"{{"cmd":"cash_address","host":"{bad}"}}"#));
             assert_eq!(res["error"], "bad_request", "{bad}");
         }
@@ -3302,6 +3309,9 @@ mod tests {
             json!({"host": "https://moneyer.dev", "name": "alice", "action": "register"}),
             json!({"host": "moneyer.dev/w", "name": "alice", "action": "register"}),
             json!({"host": ":8443", "name": "alice", "action": "register"}),
+            json!({"host": "moneyer.dev:x", "name": "alice", "action": "register"}),
+            json!({"host": "moneyer.dev:0443", "name": "alice", "action": "register"}),
+            json!({"host": "moneyer.dev:65536", "name": "alice", "action": "register"}),
             json!({"name": "alice", "action": "register"}),
         ] {
             let res = h.run_method("heartwood_note_address_proof", bad.clone());
@@ -3319,7 +3329,8 @@ mod tests {
         use crate::cash_key::AddressAction;
         use crate::note_fmt::CARD_LINE_CHARS;
         let (header, title) = address_proof_card(AddressAction::Register, "alice", "moneyer.dev:8443");
-        assert_eq!((header, title.as_str()), ("REGISTER NAME", "alice\nat moneyer.dev"));
+        // The port names the branch, so the card shows it.
+        assert_eq!((header, title.as_str()), ("REGISTER NAME", "alice\nat moneyer.dev:8443"));
         assert_eq!(address_proof_card(AddressAction::Unregister, "alice", "moneyer.dev").0, "UNREGISTER NAME");
 
         // A name that fits one line is one page, and needs no gate.
@@ -3350,7 +3361,7 @@ mod tests {
             let piece = lines[0].strip_suffix(marker.as_str()).unwrap_or_else(|| panic!("{}", lines[0]));
             assert!(!piece.contains(".."), "{piece}");
             spelled.push_str(piece);
-            assert!(lines[1].starts_with("at ") && lines[1].ends_with("of.mint.example"), "{}", lines[1]);
+            assert!(lines[1].starts_with("at ") && lines[1].ends_with("mint.example:443"), "{}", lines[1]);
         }
         assert_eq!(spelled, name, "the pages spell the whole name");
         // Its press waits for all four pages.

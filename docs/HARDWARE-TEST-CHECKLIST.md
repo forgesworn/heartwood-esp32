@@ -2630,7 +2630,8 @@ fails there by design until it is upgraded.
 4. **Registration proof.** `heartwood_note_address_proof` with
    `{"host":"<mint>","name":"<name>","action":"register"}` from a bound slot.
    Expect a REGISTER NAME card whose two lines are the name and `at <domain>`
-   (no port), both inside the panel with nothing clipped; one hold; a 128-hex
+   (with `:<port>` when the host has one), both inside the panel with
+   nothing clipped; one hold; a 128-hex
    `sig` and the same `cx1` `heartwood_note_address` gives for that host. The
    mint must accept `cx1` plus that `sig`. Then `unregister`: an UNREGISTER
    NAME card, and the mint releases the name.
@@ -2644,13 +2645,16 @@ fails there by design until it is upgraded.
    same proof twice quickly: one card, one hold, both answered with the same
    `sig`.
 
-Items 7 to 10 (added 2026-09-26) cover LUD-25's derivation purposes
-(lnurl/luds lnurlcash 50d740a): a mint now pays a name on purpose 2, the
-registration proof is signed on purpose 0, and a note paid before purposes
-is still this device's. Run them against a mint that credits zaps on purpose
-2 and checks the proof against purpose 0 index 0 (moneyer's taproot build).
-Do items 9 and 10 BEFORE flashing this build if the board still holds a key
-note from the older firmware, and write down its id and `p` first.
+Items 7 to 14 (added 2026-09-26) cover LUD-25's derivation purposes
+(lnurl/luds lnurlcash 50d740a) and the review fixes that followed: a mint
+now pays a name on purpose 2, the registration proof is signed on purpose 0,
+a note paid before purposes is still this device's, and the proof card is
+press-only and shows the whole name. Run them against a mint that credits
+zaps on purpose 2, checks the proof against purpose 0 index 0 and accepts
+the domain-bound ck1 (moneyer's taproot build). Live moneyer 0.16.x accepts
+none of those, so this build must not reach an owner before that mint is
+live (CLAUDE.md release note). For item 9, the board must still hold a key
+note from the older firmware: write down its id and `p` before flashing.
 
 7. **A zap lands on purpose 2 and opens.** Pay the device's lightning address.
    The wrap opens (RECEIVE card, or a trusted store), `list_notes` shows the
@@ -2662,14 +2666,40 @@ note from the older firmware, and write down its id and `p` first.
    which is the change working, not a fault.
 9. **A note paid before purposes survives the flash.** On a board holding a
    key note from the older firmware, flash this build (release, app only).
-   The note is still listed with the same id, `p` and `index`, and collects
-   with its ck1 as before.
+   The note is still listed with the same id, `p` and `index`. Its export is
+   now the domain-bound BIP-340 ck1 (163 characters, starting `ck1`), not the
+   113-character recoverable one the older firmware gave: collect it at the
+   upgraded moneyer, which melts it. The same export presented to moneyer
+   0.16.x is refused there, which is the reason for the release note, not a
+   fault in the note; nothing is spent and it collects once the mint is
+   upgraded.
 10. **A scan still finds the old ladder.** Run notecase's scan on a board
     that does not hold a note the branch has on the old ladder (a second
     board provisioned with the same identity is the safe way; a factory
     reset erases the notes). The claim succeeds with that note's `p`, the
-    note lists, and its export collects. A claim naming a `p` from another identity, or another mint,
-    answers `bad_request` and stores nothing.
+    note lists, and its export collects. A claim naming a `p` from another
+    identity, or another mint, answers `bad_request` and stores nothing, and
+    a claim with no `p` at all answers `bad_request` with "p is required".
+11. **A long name is shown whole.** Ask for a proof for a name of 40 or more
+    characters (`a-b-c...`, LUD-16's alphabet only). The card turns its own
+    pages every 3 s, each page a piece of the name ending ` 1/2`, ` 2/2`
+    and so on over the `at <domain>` line; read the pieces together and they
+    spell the name. A hold started on the first page does nothing; once
+    every page has been shown, a hold approves. B (on a two-button board)
+    cancels at any time. Nothing on any page is clipped at the panel edge.
+12. **No guardian answers a proof.** On an escalate slot, ask for a proof.
+    It is refused at once with "this request must be approved at the
+    device" and no notice reaches the guardian, whatever the slot's policy
+    says for the method.
+13. **A port is shown and a bad one refused.** A proof for
+    `moneyer.dev:8443` reads `at moneyer.dev:8443`; one for `moneyer.dev:x`
+    or `moneyer.dev:0443` answers `bad_request` with no card.
+14. **A downgrade keeps its notes.** Only with notes you can afford to
+    re-collect. On a board holding a key note and a plain note confirmed
+    with a bare hex or bare `cs1` certificate, flash the previous release:
+    both still list and collect. A note certified with an amount-bearing
+    `cs1` (`cs10n1...`) is NOT readable by the previous release and is
+    dropped from its index on its next write, so collect those first.
 
 ## Notes
 

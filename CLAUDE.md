@@ -192,7 +192,13 @@ vault wire is unchanged (new_secret still answers h, which lnurl-wallet sends
 as the short form and turns into Q itself); `confirm` and wraps now keep a cs1
 whose HRP carries the amount (`cs10n1...`), which a unified mint sends for
 every note. Live moneyer (0.16.x) does not yet accept the domain-bound ck1.
-heartwood_note_address_proof (pinned, REGISTER NAME / UNREGISTER NAME card)
+heartwood_note_address_proof (pinned and device-press-only, so an escalate
+slot refuses it rather than parking it for a guardian: a proof signs neither
+the cx1 nor a nonce, so it is a replayable key to the name; REGISTER NAME /
+UNREGISTER NAME card, the whole username a page at a time with a k/n marker
+when it runs past 25 characters, each page over `at <domain>[:port]`, and
+no press counts until every page has been on screen, button_arm::PageGate,
+3 s a page, on the relay, USB-bridged and cable holds alike)
 signs LUD-25's registration proof with the address branch's purpose-0
 index-0 key over the fixed sha256("LNURLcash:<action>:<domain>:<username>")
 and nothing else. The address branch is still m/139'/1'/d1..d4, one hardened
@@ -207,20 +213,43 @@ notes, 1 split change, 2 what a mint credits to a lightning address
 (auto-mint and internal transfer). The address proof moved to purpose 0
 index 0, which is the key a unified mint checks it against. The tweak
 without ser32(purpose), which is what this firmware derived before, is
-note_store::KeyLadder::PrePurpose (graded against 6e865b1's old values and
+cash_key::KeyLadder::PrePurpose (graded against 6e865b1's old values and
 the kit's part2/nostr-seed fixtures), and notes a mint already paid there
 stay ours: claim_note_key, given the key the note is paid to (every wrap,
 and notecase's scan, which walks purpose 2 and the old ladder), tries
 purpose 2 then the pre-purpose ladder and keeps whichever matches, refusing
-a key on neither with the same error as before; without `p` (still
-optional on heartwood_note_claim, wire unchanged) it takes purpose 2 alone.
-A stored key note records its ladder: a pre-purpose key stays a
-byte-identical v3 blob, every existing v3 reads as PrePurpose, and a key on
-a purpose is a v4 blob (v3 plus a big-endian u32 purpose), which firmware
-older than this skips and never deletes. The ladder is not needed to spend
-(the key is the stored secret), and neither list_notes' `index` nor the
-backup inventory's `key_index` says which ladder: a wallet names notes by
-`p`. Nothing bench-run: checklist section 31.
+a key on neither with the same error as before. heartwood_note_claim now
+REQUIRES `p` and refuses a claim without it ("p is required") before
+deriving anything; notecase, the only client, always sends it. A stored key
+note does not record its ladder: every key note is the same v3 blob it has
+always been (the key is the stored secret, so nothing needs the ladder to
+spend, and trying purpose 2 then the old ladder against its pubkey recovers
+it). A mint host's `:` must bring a decimal port, 1 to 65535 with no leading
+zero (cash_store::valid_host; a registry entry stored under the old
+character rule still decodes). Nothing bench-run: checklist section 31.
+
+The note store keeps every indexed id it could not read (a newer record
+format, a blob sealed under another key, a failed read) through each index
+rewrite, counts it against the cap and never reuses its id, so a record
+this firmware cannot read is never orphaned for the one that can (an id
+whose blob is absent is still dropped). DOWNGRADE: every key note stays
+the v3 blob older firmware reads, so the purposes change costs nothing on a
+downgrade. One thing does: a note whose certificate is a cs1 with an amount
+in its HRP (`cs10n1...`, what a unified mint sends and `confirm` and wraps
+now keep) fails older firmware's cs1 check, so that firmware skips the note
+and, on its next index write, drops its id: the blob stays on flash but
+nothing indexes it. Before flashing an older build, collect or export every
+note carrying such a certificate (key notes can also be claimed back by a
+scan). That older build still drops unreadable ids on its own rewrites; the
+fix above protects notes from a future format bump only once this firmware
+is on the board.
+
+RELEASE NOTE: ship this firmware only after moneyer's taproot build is live
+on every mint its owners use. It exports the domain-bound BIP-340 ck1 for
+every key note it holds, old ones included, and live moneyer 0.16.x refuses
+that form, so on 0.16.x a key note stops being collectable (the money is
+safe, the export just fails at the mint) until the mint is upgraded. The
+proof it signs is also purpose 0's, which only the upgraded mint checks.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

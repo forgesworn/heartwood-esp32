@@ -2,17 +2,15 @@
 
 # Heartwood ESP32
 
-> **Beta:** firmware [`0.18.0-beta.17`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.17)
-> adds the firmware side of phone unlock: seeds sealed under a data key, one
-> key stretch per unlock, and a one-tap unlock from an enrolled phone with no
-> stable tag on the wire (the phone app is not out yet). A refused restore now
-> says why, a full board makes room for pairings by dropping its avatar cache,
-> and the screen can be turned through 180 degrees. **On a board with a PIN or
-> vault key, turn it off before going back to beta.16 or older:** earlier
-> firmware cannot read the new seed format. Retained-state installation,
-> normal reboot/unlock, automatic signing and consent isolation passed on the
-> named Heltec V4 in earlier betas; this release's hardware checks are in its
-> notes.
+> **Beta:** firmware [`0.18.0-beta.19`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.19)
+> adds an unlock phone over WiFi: Sapwood asks, the board shows five words to
+> compare with the phone, and a hold adds it. Phone unlock needs the Cambium
+> app, 0.6.0 or later; Cambium 0.7.0 can also scan a code from Sapwood instead
+> of showing one. Seeds are sealed under a data key, and an enrolled phone
+> unlocks the board after a power cut with one tap and no stable tag on the
+> wire. **On a board with a PIN or vault key, turn it off before going back to
+> beta.16 or older:** earlier firmware cannot read the sealed seed format.
+> This release's hardware checks are in its notes.
 > Keep an independent recovery copy and use small values while the complete
 > destructive cross-board recovery matrix remains unfinished.
 

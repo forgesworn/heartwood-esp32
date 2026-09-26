@@ -287,7 +287,8 @@ browser itself) can swap in a key of their own, and could show matching words
 in the browser, but not on the owner's phone. Recovery: revoke the rogue client and restore a known-good network
 configuration; if the attacker has removed every route the owner knows, that
 recovery is necessarily over trusted USB. Rotating the operator key likewise
-requires a trusted USB re-flash (it is baked into the config partition).
+needs trusted USB and a physical hold on the signer (see *Local operator
+recovery* below); no re-flash is needed.
 
 Mitigations in place: the operator key lives in browser `localStorage` behind a
 strict **Content-Security-Policy** (`script-src 'self'`, no `eval`, no
@@ -345,6 +346,78 @@ NIP-44 ciphertext in transit. That is a transport guarantee only: flash and NVS
 encryption are disabled, so the active or staged WiFi password is stored as
 plaintext in NVS. Sapwood does not read it back or persist it; physical flash
 access can recover it.
+
+## Threat: lost or stolen unlock phone (**bounded; revoke from Sapwood**)
+
+An unlock phone holds one secret per board, its slot secret S. Cambium keeps S
+sealed under an Android Keystore key that is released only after the owner
+authenticates, for every single use: a strong biometric or the phone's own
+PIN, pattern or password. Enrolling a new biometric invalidates that key. The
+board never stores S; it stores the phone's record, the data key wrapped under
+a key derived from S (`common/src/data_key.rs`).
+
+What a thief holding the phone can do:
+
+- **Without the phone's lock-screen credential or biometric:** nothing. The
+  Keystore will not release S.
+- **With it (a forced fingerprint, an observed PIN):** answer the board's
+  unlock announcement after a restart and unlock it where it sits. That
+  releases the data key into the board's RAM, not to the phone; the seeds never
+  leave the board, and signing still goes through each client's policy and
+  presses. A phone holds no operator key, so it cannot manage clients, change
+  the network, add or revoke phones, or read anything back.
+
+The response is to revoke the phone's record from Sapwood
+(`revoke_unlock_phone {id}`). Only the device operator can, over the relay from
+any browser that holds the operator key or over USB, and it needs no press on
+the board, so it works from another country. Another unlock phone cannot
+revoke: phones unlock, they do not manage. Once the record is gone, S opens
+nothing and the board ignores that phone's unlock answers.
+
+Procedure:
+
+1. In Sapwood, open the board's unlock phones and revoke the lost phone's
+   record. Each record shows its label and id.
+2. If the board is locked (after a restart), it listens only for unlock
+   messages, so a revoke cannot reach it yet. Unlock it first with the vault
+   key or PIN, then revoke. If the stolen phone unlocks it first, the result
+   is the same unlocked board; revoke as soon as it answers.
+3. If the board is switched off or offline, the revoke waits until it is back.
+   Leaving it off does not shut the phone out: the phone can unlock it after
+   the next power-up.
+4. If the stolen phone also held Sapwood's operator key, the thief can manage
+   the board (see *compromised operator key* above). Revoke the phone and any
+   clients you did not create, then replace the operator over USB with a hold
+   on the board (Sapwood's operator panel). A thief with the operator key
+   still cannot add a phone of their own without a press on the board.
+
+Residual: revoking deletes the record but does not wipe it. Someone who has S
+(which means breaking the phone's Keystore) **and** a later dump of the board's
+flash may still recover the data key from the leftover record, and with it the
+seeds. Re-keying would not help: the old sealed seeds are left behind the same
+way, and S still opens them through the old record. See *Leftover bytes in
+NVS* below. If phone and board are both lost, treat the identities on the board
+as exposed.
+
+### Leftover bytes in NVS
+
+ESP-IDF NVS never wipes a deleted or replaced value in place. Deleting a key
+flips two status bits per 32-byte entry (`nvs_page.cpp` in ESP-IDF v5.3.2);
+the bytes stay on flash until garbage collection erases the whole sector,
+which happens only when free pages run low and cannot be steered. There is no
+scrub option or API. So a flash dump can hold:
+
+- the plaintext seed written when each identity was added, since identities
+  can only be added with encryption off and sealing then deletes the
+  plaintext key;
+- an unlock phone's record after it is revoked;
+- any earlier wrapper or setting that was later replaced.
+
+Planned: a scrub that zeroes every entry NVS has marked deleted, at boot,
+after a revoke and after any encryption change. Until it ships, a sealed
+board's at-rest protection covers the live records only. Restoring onto a
+fully erased board does not avoid it, since the restore writes the plaintext
+seed first as well.
 
 ## Threat: malicious firmware (OTA or the web flasher) — **signed USB OTA; flasher is trust-on-first-use**
 
@@ -415,8 +488,10 @@ The one hardening lever that does **not** touch eFuses is **PIN-derived seed
 encryption**, and it is now built (opt-in). When a PIN is set, each master seed
 is stored as ciphertext — `PBKDF2-HMAC-SHA256(pin, salt)` derives the key,
 ChaCha20 + HMAC-SHA256 encrypt-then-MAC it (`common/src/seed_cipher.rs`), and
-the plaintext is removed. A raw `esptool read_flash` now yields ciphertext, not
-the seed. On boot the device is locked until a PIN decrypts the seeds into RAM;
+the plaintext key is deleted. Deleting is not wiping, though (see *Leftover
+bytes in NVS* below): until that flash sector is recycled, a raw
+`esptool read_flash` may still yield the plaintext seed from before sealing.
+The live record is ciphertext. On boot the device is locked until a PIN decrypts the seeds into RAM;
 5 wrong attempts erase and verify both the flash-time `config` source and the
 complete NVS partition, so old WiFi/operator state cannot re-seed itself after
 the wipe. Physical factory reset uses the same complete path. See
@@ -525,8 +600,9 @@ changes hands:
 
 Security properties and honest residuals:
 
-- Flash dump alone: ciphertext under a 256-bit key — unbruteforceable, unlike
-  a short PIN.
+- Flash dump alone: the live records are ciphertext under a 256-bit key,
+  unbruteforceable, unlike a short PIN. Leftover plaintext from before sealing
+  may still be readable (see *Leftover bytes in NVS* below).
 - Pi/browser compromise alone: a vault key that decrypts nothing the host
   possesses.
 - A wrong vault key is a plain NACK and deliberately does **not** feed the

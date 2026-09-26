@@ -117,12 +117,11 @@ fn open_key_note(key: KeyNoteRef, identity_secret: &[u8; 32]) -> Result<Incoming
         return Err("bad host");
     }
     // The wrap names the key, so a note paid on the pre-purpose ladder is
-    // found as well as one on purpose 2, and records which it was.
-    let (secret, found) =
-        crate::cash_key::claim_note_key(identity_secret, host, key.index, Some(&key.pubkey))?;
+    // found as well as one on purpose 2.
+    let found = crate::cash_key::claim_note_key(identity_secret, host, key.index, &key.pubkey)?;
     Ok(IncomingNote {
-        secret: *secret,
-        key: Some(found),
+        secret: *found.secret,
+        key: Some(KeyNote { index: key.index, pubkey: found.pubkey }),
         host: key.host,
         amount_msat: key.amount_msat,
         sig: key.sig,
@@ -493,7 +492,7 @@ mod tests {
     mod key_notes {
         use super::*;
         use crate::encoding::encode_cp1;
-        use crate::note_store::KeyLadder;
+        use crate::cash_key::{paid_to, KeyLadder, PURPOSE_ADDRESS};
 
         // A real certificate (lnurlcash-kit part2.json). The device stores it
         // and never checks it; the wallet does.
@@ -502,9 +501,9 @@ mod tests {
 
         /// The key moneyer pays a name at `index` on: purpose 2.
         fn key_at(index: u32) -> ([u8; 32], [u8; 32]) {
-            let (secret, key) =
-                crate::cash_key::claim_note_key(&IDENTITY, "moneyer.dev", index, None).unwrap();
-            (*secret, key.pubkey)
+            let pubkey = paid_to(&IDENTITY, "moneyer.dev", KeyLadder::Purpose(PURPOSE_ADDRESS), index).unwrap();
+            let found = crate::cash_key::claim_note_key(&IDENTITY, "moneyer.dev", index, &pubkey).unwrap();
+            (*found.secret, found.pubkey)
         }
 
         // What moneyer puts in the wrap for a name with a cx1.
@@ -527,10 +526,7 @@ mod tests {
             let (secret, pubkey) = key_at(5);
             let note = open_note_rumor(&moneyer_wrap(&pubkey, 5), &IDENTITY).unwrap();
             assert_eq!(note.secret, secret);
-            assert_eq!(
-                note.key,
-                Some(KeyNote { index: 5, pubkey, ladder: KeyLadder::Purpose(crate::cash_key::PURPOSE_ADDRESS) })
-            );
+            assert_eq!(note.key, Some(KeyNote { index: 5, pubkey }));
             assert_eq!(note.host, "moneyer.dev/w");
             assert_eq!(note.amount_msat, 21_000);
             assert_eq!(note.sig, CS1);
@@ -546,7 +542,7 @@ mod tests {
             assert_ne!(pubkey, key_at(5).1);
             let note = open_note_rumor(&moneyer_wrap(&pubkey, 5), &IDENTITY).unwrap();
             assert_eq!(note.secret, *secret);
-            assert_eq!(note.key, Some(KeyNote { index: 5, pubkey, ladder: KeyLadder::PrePurpose }));
+            assert_eq!(note.key, Some(KeyNote { index: 5, pubkey }));
         }
 
         #[test]

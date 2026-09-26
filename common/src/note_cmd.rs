@@ -869,27 +869,26 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             if !crate::cash_store::valid_host(branch) {
                 return err_msg("bad_request", "host must be a lowercase mint host");
             }
-            // The key the wallet expected, if it says: a claim for a key this
-            // device would not derive is refused, not stored under another.
-            let expected = match str_field(&cmd, "p") {
-                None => None,
-                Some(p) => match crate::encoding::decode_cp1(p) {
-                    Some(pk) => Some(pk),
-                    None => return err_msg("bad_request", "p is not a cp1"),
-                },
+            // The key the note is paid to. Required: a claim for a key this
+            // device would not derive is refused, not stored under another,
+            // and without it there is no telling which ladder the index is on.
+            let Some(p) = str_field(&cmd, "p") else {
+                return err_msg("bad_request", "p is required: the cp1 of the key the note is paid to");
             };
-            // With `p`, the key is looked for on purpose 2 and then on the
-            // pre-purpose ladder; without it, purpose 2 alone
+            let Some(expected) = crate::encoding::decode_cp1(p) else {
+                return err_msg("bad_request", "p is not a cp1");
+            };
+            // Looked for on purpose 2 and then on the pre-purpose ladder
             // (cash_key::claim_note_key).
-            let (secret, key) =
-                match crate::cash_key::claim_note_key(identity, branch, index, expected.as_ref()) {
-                    Ok(found) => found,
-                    Err(m) => return err_msg("bad_request", m),
-                };
-            let pubkey = key.pubkey;
+            let found = match crate::cash_key::claim_note_key(identity, branch, index, &expected) {
+                Ok(found) => found,
+                Err(m) => return err_msg("bad_request", m),
+            };
+            let pubkey = found.pubkey;
+            let key = crate::note_store::KeyNote { index, pubkey };
             match ctx
                 .store
-                .import_key(ctx.storage, ctx.rng, &secret, key, host, amount, sig, ctx.now)
+                .import_key(ctx.storage, ctx.rng, &found.secret, key, host, amount, sig, ctx.now)
             {
                 Ok((id, created)) => json!({
                     "ok": true,
@@ -3059,11 +3058,16 @@ mod tests {
         assert_eq!(res["error"], "bad_request");
     }
 
+    /// The key moneyer pays a name at `index` on today: purpose 2.
+    fn address_key(index: u32) -> [u8; 32] {
+        use crate::cash_key::{paid_to, KeyLadder, PURPOSE_ADDRESS};
+        paid_to(&[7u8; 32], "moneyer.dev", KeyLadder::Purpose(PURPOSE_ADDRESS), index).unwrap()
+    }
+
     #[test]
     fn a_claimed_key_note_lists_its_key_and_exports_its_ck1() {
         let mut h = Harness::new();
-        let (_, key) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
-        let pubkey = key.pubkey;
+        let pubkey = address_key(12);
         let cp1 = crate::encoding::encode_cp1(&pubkey);
         let claim = format!(
             r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":21000,"p":"{cp1}"}}"#
@@ -3084,7 +3088,7 @@ mod tests {
         let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
         let k1 = res["k1"].as_str().unwrap();
         assert!(k1.starts_with("ck1"), "{k1}");
-        let (secret, _) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        let secret = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, &pubkey).unwrap().secret;
         // The 96-byte key-path spend, bound to the note's own mint.
         assert_eq!(k1, crate::cash_key::ck1_of(&secret, "moneyer.dev").unwrap());
         assert!(matches!(
@@ -3103,10 +3107,9 @@ mod tests {
     #[test]
     fn a_note_paid_before_purposes_is_claimed_and_spends_from_its_own_key() {
         // notecase walks the old ladder too and names the key it found: the
-        // device finds it there, stores it as that ladder's, and it exports
-        // the old key's ck1 across a reload.
-        use crate::cash_key::{KeyLadder, PURPOSE_ADDRESS};
-        use crate::note_store::decode_note;
+        // device finds it there, stores it, and it exports the old key's ck1
+        // across a reload.
+        use crate::cash_key::KeyLadder;
         let mut h = Harness::new();
         let node = crate::cash_key::address_node(&[7u8; 32], "moneyer.dev").unwrap();
         let old = crate::cash_key::note_secret_key(&node, KeyLadder::PrePurpose, 12).unwrap();
@@ -3118,21 +3121,17 @@ mod tests {
         assert_eq!((res["ok"].clone(), res["p"].clone()), (json!(true), json!(cp1)), "{res}");
         let old_id = res["id"].as_str().unwrap().to_string();
         // The same index on purpose 2 is another note, and both are kept.
-        let (_, current) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
-        assert_eq!(current.ladder, KeyLadder::Purpose(PURPOSE_ADDRESS));
         let res = h.run(&format!(
             r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":5000,"p":"{}"}}"#,
-            crate::encoding::encode_cp1(&current.pubkey)
+            crate::encoding::encode_cp1(&address_key(12))
         ));
         assert_eq!(res["created"], true, "{res}");
         let new_id = res["id"].as_str().unwrap().to_string();
 
-        // Each blob says which ladder it is on: the old one is v3, as every
-        // key note stored before purposes already is.
-        let stored = |id: &str| decode_note(h.storage.notes.get(id).unwrap()).unwrap().key.unwrap();
-        assert_eq!(stored(&old_id).ladder, KeyLadder::PrePurpose);
+        // Both are the v3 blob every key note has always been: nothing a
+        // firmware that predates purposes cannot read.
         assert_eq!(h.storage.notes.get(&old_id).unwrap()[4], 3);
-        assert_eq!(stored(&new_id).ladder, KeyLadder::Purpose(PURPOSE_ADDRESS));
+        assert_eq!(h.storage.notes.get(&new_id).unwrap()[4], 3);
 
         h.store = NoteStore::load(&mut h.storage, MAX_NOTES).store;
         let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{old_id}"}}"#));
@@ -3142,8 +3141,7 @@ mod tests {
     #[test]
     fn a_claim_for_a_key_this_device_would_not_derive_is_refused() {
         let mut h = Harness::new();
-        let (_, key) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
-        let cp1 = crate::encoding::encode_cp1(&key.pubkey);
+        let cp1 = crate::encoding::encode_cp1(&address_key(12));
         for (index, host) in [(13, "moneyer.dev/w"), (12, "mint.example/w")] {
             let res = h.run(&format!(
                 r#"{{"cmd":"claim_key_note","host":"{host}","index":{index},"amount_msat":1000,"p":"{cp1}"}}"#
@@ -3156,18 +3154,24 @@ mod tests {
             r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":1000,"p":"{foreign}"}}"#
         ));
         assert_eq!(res["error"], "bad_request");
+        // Without `p` there is no key to check the index against, so no claim,
+        // not even at an index that has a note on purpose 2.
+        let res = h.run(r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":1000}"#);
+        assert_eq!(res["error"], "bad_request");
+        assert!(res["message"].as_str().unwrap_or_default().contains("p is required"), "{res}");
+        let p = format!(r#","p":"{cp1}""#);
         for bad in [
-            r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":4294967296,"amount_msat":1000}"#,
-            r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000,"p":"cp1nope"}"#,
-            r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000,"sig":"CS1"}"#,
-            r#"{"cmd":"claim_key_note","host":"Moneyer.dev/w","index":1,"amount_msat":1000}"#,
-            r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","amount_msat":1000}"#,
+            format!(r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":4294967296,"amount_msat":1000{p}}}"#),
+            r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000,"p":"cp1nope"}"#.to_string(),
+            format!(r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":1000,"sig":"CS1"{p}}}"#),
+            format!(r#"{{"cmd":"claim_key_note","host":"Moneyer.dev/w","index":12,"amount_msat":1000{p}}}"#),
+            format!(r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","amount_msat":1000{p}}}"#),
         ] {
-            assert_eq!(h.run(bad)["error"], "bad_request", "{bad}");
+            assert_eq!(h.run(&bad)["error"], "bad_request", "{bad}");
         }
         assert_eq!(h.store.counts().0, 0);
         h.identity = None;
-        let res = h.run(r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000}"#);
+        let res = h.run(&format!(r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":1000{p}}}"#));
         assert_eq!(res["error"], "bad_request");
     }
 

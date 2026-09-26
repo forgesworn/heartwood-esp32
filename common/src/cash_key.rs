@@ -62,8 +62,6 @@ use zeroize::Zeroizing;
 use crate::cash::{derive_cash_child, derive_cash_domain_node, derive_cash_root, CashNode};
 use crate::derive::backend;
 use crate::encoding::{encode_ck1, encode_cx1, encode_legacy_ck1};
-pub use crate::note_store::KeyLadder;
-use crate::note_store::KeyNote;
 use crate::taproot::{key_path_sighash, tagged_hash};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -88,9 +86,29 @@ pub const PURPOSE_CHANGE: u32 = 1;
 /// transferred to it. The purpose this device is paid on.
 pub const PURPOSE_ADDRESS: u32 = 2;
 
+/// Which of a branch's derivations a key sits on.
+///
+/// LUD-25 splits a branch into independent counters by purpose (0 wallet,
+/// 1 change, 2 lightning address) and hashes `ser32(purpose)` in ahead of
+/// the index. This firmware derived keys before that, with no purpose in the
+/// hash at all, and a mint has paid notes to those keys, so that ladder is a
+/// value of its own here rather than a purpose number nobody uses.
+///
+/// A stored key note does not record it: the key is the stored secret, so
+/// nothing needs it to spend, and trying [`CLAIM_LADDERS`] against the note's
+/// public key recovers it if anything ever does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyLadder {
+    /// `t = tagged_hash("LNURLcash/derive", P || chaincode || ser32(i))`:
+    /// every key note this firmware claimed before purposes.
+    PrePurpose,
+    /// `t = tagged_hash("LNURLcash/derive", P || chaincode || ser32(purpose) || ser32(i))`.
+    Purpose(u32),
+}
+
 /// Where a claim looks for the key a note is paid to, in order: the purpose
 /// a mint pays a name on today, then the ladder it paid on before purposes.
-const CLAIM_LADDERS: [KeyLadder; 2] = [KeyLadder::Purpose(PURPOSE_ADDRESS), KeyLadder::PrePurpose];
+pub const CLAIM_LADDERS: [KeyLadder; 2] = [KeyLadder::Purpose(PURPOSE_ADDRESS), KeyLadder::PrePurpose];
 
 /// The fixed message the deprecated recoverable `ck1` signed
 /// ([`legacy_ck1_of`]). A spend now signs the canonical transaction instead.
@@ -386,11 +404,18 @@ pub fn address_proof(
     sign_address_proof(&index_zero, action, &domain, username)
 }
 
-/// The key at `index` on one ladder of a branch, and the note it names.
-fn key_at(node: &CashNode, ladder: KeyLadder, index: u32) -> Result<(Zeroizing<[u8; 32]>, KeyNote), &'static str> {
+/// A key a claim found: the key, its public key, and the ladder it is on.
+pub struct ClaimedKey {
+    pub secret: Zeroizing<[u8; 32]>,
+    pub pubkey: [u8; 32],
+    pub ladder: KeyLadder,
+}
+
+/// The key at `index` on one ladder of a branch.
+fn key_at(node: &CashNode, ladder: KeyLadder, index: u32) -> Result<ClaimedKey, &'static str> {
     let secret = note_secret_key(node, ladder, index)?;
     let pubkey = note_pubkey(&secret)?;
-    Ok((secret, KeyNote { index, pubkey, ladder }))
+    Ok(ClaimedKey { secret, pubkey, ladder })
 }
 
 /// The key a note paid to `identity` at `index` answers to, checked against
@@ -398,8 +423,7 @@ fn key_at(node: &CashNode, ladder: KeyLadder, index: u32) -> Result<(Zeroizing<[
 ///
 /// This is the whole of what a device that cannot reach the mint can know: a
 /// wrap naming a key this device does not hold is refused here, before any
-/// card is drawn, rather than kept as money that is not ours. Returns the
-/// key and the note it names, ladder included.
+/// card is drawn, rather than kept as money that is not ours.
 ///
 /// A mint pays a name on [`PURPOSE_ADDRESS`], and before purposes it paid on
 /// [`KeyLadder::PrePurpose`], whose notes are still ours. A payment says only
@@ -408,28 +432,33 @@ fn key_at(node: &CashNode, ladder: KeyLadder, index: u32) -> Result<(Zeroizing<[
 /// on neither is refused. The two cannot both match: that would be two
 /// tagged hashes colliding.
 ///
-/// Without `expected` there is nothing to tell the two apart, so the answer
-/// is purpose 2, where every payment now lands. A caller holding a note from
-/// the old ladder names its key, as every wrap and notecase's scan do.
+/// The key is required: without it there is nothing to tell the ladders
+/// apart, and a claim would store whatever key it derived whether or not
+/// anything was paid to it. Every wrap names it, and so does the one client
+/// that claims (notecase's scan).
 pub fn claim_note_key(
     identity_secret: &[u8; 32],
     host: &str,
     index: u32,
-    expected: Option<&[u8; 32]>,
-) -> Result<(Zeroizing<[u8; 32]>, KeyNote), &'static str> {
+    expected: &[u8; 32],
+) -> Result<ClaimedKey, &'static str> {
     let node = address_node(identity_secret, host)?;
-    let Some(want) = expected else {
-        return key_at(&node, KeyLadder::Purpose(PURPOSE_ADDRESS), index);
-    };
     for ladder in CLAIM_LADDERS {
         // An index unusable on one ladder (a ~2^-128 zero sum) says nothing
         // about the other.
-        let Ok((secret, key)) = key_at(&node, ladder, index) else { continue };
-        if key.pubkey == *want {
-            return Ok((secret, key));
+        let Ok(found) = key_at(&node, ladder, index) else { continue };
+        if found.pubkey == *expected {
+            return Ok(found);
         }
     }
     Err("that note is paid to a key this device does not hold")
+}
+
+/// The public key at `index` on one ladder of `identity`'s branch at `host`,
+/// as a mint derives it from the `cx1`. What a claim is checked against.
+pub fn paid_to(identity_secret: &[u8; 32], host: &str, ladder: KeyLadder, index: u32) -> Result<[u8; 32], &'static str> {
+    let secret = note_secret_key(&address_node(identity_secret, host)?, ladder, index)?;
+    note_pubkey(&secret)
 }
 
 #[cfg(test)]
@@ -743,9 +772,9 @@ mod tests {
         }
     }
 
-    /// The public key at `index` on one ladder of `identity`'s branch at
-    /// `host`, as a mint derives it from the cx1.
-    fn paid_to(identity: &[u8; 32], host: &str, ladder: KeyLadder, index: u32) -> [u8; 32] {
+    /// The public key at `index` on one ladder, as a mint derives it from
+    /// the cx1 alone.
+    fn watched(identity: &[u8; 32], host: &str, ladder: KeyLadder, index: u32) -> [u8; 32] {
         let (branch, _) = watch(&address_node(identity, host).unwrap()).unwrap();
         backend::xonly_tweak_add(&branch.pubkey, &note_tweak(&branch, ladder, index)).unwrap().0
     }
@@ -754,27 +783,22 @@ mod tests {
     fn a_claim_finds_a_note_paid_on_purpose_2() {
         let identity = [7u8; 32];
         let address = KeyLadder::Purpose(PURPOSE_ADDRESS);
-        let pubkey = paid_to(&identity, "moneyer.dev", address, 3);
-        let (secret, key) = claim_note_key(&identity, "moneyer.dev", 3, Some(&pubkey)).unwrap();
-        assert_eq!(key, KeyNote { index: 3, pubkey, ladder: address });
-        assert_eq!(note_pubkey(&secret).unwrap(), pubkey);
-        // With no key named, purpose 2 is the answer.
-        let (unnamed, key) = claim_note_key(&identity, "moneyer.dev", 3, None).unwrap();
-        assert_eq!((unnamed.as_ref(), key.ladder, key.pubkey), (secret.as_ref(), address, pubkey));
+        let pubkey = watched(&identity, "moneyer.dev", address, 3);
+        assert_eq!(paid_to(&identity, "moneyer.dev", address, 3).unwrap(), pubkey);
+        let found = claim_note_key(&identity, "moneyer.dev", 3, &pubkey).unwrap();
+        assert_eq!((found.pubkey, found.ladder), (pubkey, address));
+        assert_eq!(note_pubkey(&found.secret).unwrap(), pubkey);
     }
 
     #[test]
     fn a_claim_finds_a_note_paid_on_the_pre_purpose_ladder() {
-        // Paid before purposes: the key is still derived, and the note says
-        // which ladder it is on so nothing later mistakes it for purpose 2.
+        // Paid before purposes: the same index, the old ladder's key.
         let identity = [7u8; 32];
-        let pubkey = paid_to(&identity, "moneyer.dev", KeyLadder::PrePurpose, 3);
-        let (secret, key) = claim_note_key(&identity, "moneyer.dev", 3, Some(&pubkey)).unwrap();
-        assert_eq!(key, KeyNote { index: 3, pubkey, ladder: KeyLadder::PrePurpose });
-        assert_eq!(note_pubkey(&secret).unwrap(), pubkey);
-        // Without its key the claim would land on purpose 2, a different key.
-        let (_, unnamed) = claim_note_key(&identity, "moneyer.dev", 3, None).unwrap();
-        assert_ne!(unnamed.pubkey, pubkey);
+        let pubkey = watched(&identity, "moneyer.dev", KeyLadder::PrePurpose, 3);
+        assert_ne!(pubkey, paid_to(&identity, "moneyer.dev", KeyLadder::Purpose(PURPOSE_ADDRESS), 3).unwrap());
+        let found = claim_note_key(&identity, "moneyer.dev", 3, &pubkey).unwrap();
+        assert_eq!((found.pubkey, found.ladder), (pubkey, KeyLadder::PrePurpose));
+        assert_eq!(note_pubkey(&found.secret).unwrap(), pubkey);
     }
 
     #[test]
@@ -782,12 +806,12 @@ mod tests {
         let identity = [7u8; 32];
         let refused = Err("that note is paid to a key this device does not hold");
         let claim = |identity: &[u8; 32], host: &str, index: u32, want: &[u8; 32]| {
-            claim_note_key(identity, host, index, Some(want)).map(|(_, key)| key)
+            claim_note_key(identity, host, index, want).map(|found| (found.pubkey, found.ladder))
         };
         // A foreign key outright.
         assert_eq!(claim(&identity, "moneyer.dev", 3, &[0x42; 32]), refused);
         for ladder in CLAIM_LADDERS {
-            let pubkey = paid_to(&identity, "moneyer.dev", ladder, 3);
+            let pubkey = watched(&identity, "moneyer.dev", ladder, 3);
             // The next index, another mint and another identity are all other keys.
             assert_eq!(claim(&identity, "moneyer.dev", 4, &pubkey), refused, "{ladder:?}");
             assert_eq!(claim(&identity, "mint.example", 3, &pubkey), refused, "{ladder:?}");
@@ -796,7 +820,7 @@ mod tests {
         // Purposes 0 and 1 are the wallet's own counters, never what a name
         // is paid on: a claim does not reach them.
         for purpose in [PURPOSE_WALLET, PURPOSE_CHANGE] {
-            let pubkey = paid_to(&identity, "moneyer.dev", KeyLadder::Purpose(purpose), 3);
+            let pubkey = watched(&identity, "moneyer.dev", KeyLadder::Purpose(purpose), 3);
             assert_eq!(claim(&identity, "moneyer.dev", 3, &pubkey), refused, "purpose {purpose}");
         }
     }

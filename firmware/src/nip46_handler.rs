@@ -571,6 +571,36 @@ fn hold_for_card(
     }
 }
 
+/// [`hold_for_card`]'s interactive hold for a card that runs over several
+/// pages (a registration proof's long username): the titled card, a page at
+/// a time, and no press counts until every page has been on screen.
+fn hold_for_paged_card(
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    header: &str,
+    pages: &[String],
+    gate: heartwood_common::button_arm::PageGate,
+    request_id: &str,
+) -> Hold {
+    let result = crate::approval::run_paged_approval_loop(
+        display,
+        buttons,
+        APPROVAL_TIMEOUT_SECS,
+        gate,
+        |d, remaining, page, _armed| {
+            let body = pages.get(page).map(String::as_str).unwrap_or_default();
+            crate::oled::show_titled_approval(d, header, body, remaining, APPROVAL_TIMEOUT_SECS as u32);
+        },
+    );
+    match extension_approval_failure(request_id, result) {
+        Some(response) => {
+            crate::oled::show_result(display, "Not approved");
+            Hold::Refused(response)
+        }
+        None => Hold::Approved,
+    }
+}
+
 /// Outcome of a dispatch attempt.
 pub enum Dispatch {
     /// A response to send, whatever it says.
@@ -1189,16 +1219,33 @@ fn dispatch_inner(
             None => extension_approval_preview(&requester_label, &request.params),
         };
         let heading = crate::oled::master_sign_heading(master_label);
-        match hold_for_card(
-            approval,
-            method.verdict_may_answer_card(),
-            display,
-            buttons,
-            &heading,
-            &request.method,
-            &preview,
-            &request.id,
-        ) {
+        // A registration proof names a username the signature commits to in
+        // full, so the cable draws the whole name, a page at a time, rather
+        // than the one-line preview the method card truncates.
+        let proof_pages = matches!(method, nip46::Nip46Method::HeartwoodNoteAddressProof)
+            .then(|| heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params).ok())
+            .flatten()
+            .and_then(|cmd| {
+                let (action, name, host) = heartwood_common::note_cmd::address_proof_request(&cmd)?;
+                let (header, pages) = heartwood_common::note_cmd::address_proof_pages(action, name, host);
+                Some((header, pages, heartwood_common::note_cmd::address_proof_gate(name)))
+            });
+        let hold = match (proof_pages, approval) {
+            (Some((header, pages, gate)), ApprovalDecision::Interactive) => {
+                hold_for_paged_card(display, buttons, header, &pages, gate, &request.id)
+            }
+            _ => hold_for_card(
+                approval,
+                method.verdict_may_answer_card(),
+                display,
+                buttons,
+                &heading,
+                &request.method,
+                &preview,
+                &request.id,
+            ),
+        };
+        match hold {
             Hold::Refused(response) => return response,
             Hold::Deferred => {
                 *deferred = Some(Box::new(DeferredAsk {

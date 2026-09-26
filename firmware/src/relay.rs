@@ -5026,6 +5026,10 @@ struct ButtonCard {
     /// The enrol card's pages and press gate (`phone_unlock::EnrolGate`),
     /// stepped every tick; unused by other cards.
     enrol_gate: heartwood_common::phone_unlock::EnrolGate,
+    /// A registration proof card's pages and press gate
+    /// (`note_cmd::address_proof_gate`), stepped every tick like the enrol
+    /// card's; `None` for every other card.
+    page_gate: Option<heartwood_common::button_arm::PageGate>,
     /// The enrol card's (page, armed) last drawn, so a change is drawn at
     /// once and the page the gate counts is the page on screen.
     drawn_view: Option<(usize, bool)>,
@@ -5219,6 +5223,7 @@ fn queue_button_ask(
         }
         Admission::Open | Admission::Wait => {
             log::info!("[relay] {request_id} waiting on the button");
+            let page_gate = address_proof_view(&ask.request).map(|(_, _, gate)| gate);
             ctx.button_cards.push(ButtonCard {
                 key,
                 target_pk: *target_pk,
@@ -5235,6 +5240,7 @@ fn queue_button_ask(
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
                 enrol_gate: Default::default(),
+                page_gate,
                 drawn_view: None,
                 drawn_gen: None,
             });
@@ -5264,9 +5270,14 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // First draw of this wording: a join sets last_remaining back to MAX to
     // force a redraw, so a card that grows logs again with what it now says.
     let first_draw = ctx.button_cards[0].last_remaining == u32::MAX;
-    // The enrol card also redraws the moment its page or gate changes.
-    let view = is_enrol_card(&ctx.button_cards[0])
-        .then(|| (ctx.button_cards[0].enrol_gate.page(), ctx.button_cards[0].enrol_gate.armed()));
+    // The enrol card, and a paged registration proof, also redraw the
+    // moment their page or gate changes.
+    let view = if is_enrol_card(&ctx.button_cards[0]) {
+        Some((ctx.button_cards[0].enrol_gate.page(), ctx.button_cards[0].enrol_gate.armed()))
+    } else {
+        use heartwood_common::button_arm::CardGate;
+        ctx.button_cards[0].page_gate.as_ref().map(|gate| (gate.page(), gate.armed()))
+    };
     if remaining == ctx.button_cards[0].last_remaining
         && view == ctx.button_cards[0].drawn_view
         && !card_overdrawn(&ctx.button_cards[0])
@@ -5285,7 +5296,8 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         Batch(String, String),
         Enrol([&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS], String),
     }
-    // The enrol card's page and whether a hold counts yet (its hint).
+    // The gated card's page and whether a hold counts yet (the enrol card's
+    // hint).
     let (card_page, card_armed) = view.unwrap_or((0, true));
     let card = match &ctx.button_cards[0].asks[0].ask.card {
         crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading } => {
@@ -5318,7 +5330,14 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
                 let (head, title) = note_batch_card(header, &ctx.button_cards[0].asks);
                 Draw::Batch(head, title)
             }
-            Some(header) => Draw::Titled(header, preview.clone()),
+            // A registration proof shows its whole name, a page at a time.
+            Some(header) => match address_proof_view(&ctx.button_cards[0].asks[0].ask.request) {
+                Some((_, pages, _)) => Draw::Titled(
+                    header,
+                    pages.get(card_page).cloned().unwrap_or_else(|| preview.clone()),
+                ),
+                None => Draw::Titled(header, preview.clone()),
+            },
             None => Draw::Extension(heading.clone(), method.clone(), preview.clone()),
         },
         crate::nip46_handler::AskCard::Receive { title } => {
@@ -5440,6 +5459,22 @@ fn note_batch_card(header: &str, asks: &[ButtonAsk]) -> (String, String) {
 /// registration proof the action it signs (REGISTER NAME or UNREGISTER
 /// NAME), read through the same helper that built the card's two lines, so
 /// the header and the lines cannot disagree.
+/// A registration proof's card as pages, and the gate its press waits
+/// behind (`note_cmd::address_proof_pages`); `None` for any other request,
+/// or one the card could not be built for.
+fn address_proof_view(
+    request: &nip46::Nip46Request,
+) -> Option<(&'static str, Vec<String>, heartwood_common::button_arm::PageGate)> {
+    use heartwood_common::note_cmd::{address_proof_gate, address_proof_pages, address_proof_request, note_cmd_for_method};
+    if request.method != "heartwood_note_address_proof" {
+        return None;
+    }
+    let cmd = note_cmd_for_method(&request.method, &request.params).ok()?;
+    let (action, name, host) = address_proof_request(&cmd)?;
+    let (header, pages) = address_proof_pages(action, name, host);
+    Some((header, pages, address_proof_gate(name)))
+}
+
 fn own_card_header(request: &nip46::Nip46Request) -> Option<&'static str> {
     if request.method == "heartwood_note_address_proof" {
         use heartwood_common::note_cmd::{address_proof_card, address_proof_request, note_cmd_for_method};
@@ -5501,27 +5536,48 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     // passed and the button is up. A hold on page 1 alone would rest on two
     // words.
     let enrol = is_enrol_card(&ctx.button_cards[0]);
-    if enrol {
+    // A registration proof whose name runs over several pages keeps the
+    // same kind of gate (note_cmd::address_proof_gate): its pages turn by
+    // themselves and a hold counts only once each has been on screen, so a
+    // press never rests on half a name.
+    let paged = !enrol && ctx.button_cards[0].page_gate.is_some();
+    if enrol || paged {
+        use heartwood_common::button_arm::CardGate;
         let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let overdrawn = card_overdrawn(&ctx.button_cards[0]);
+        let card = &mut ctx.button_cards[0];
+        let gate: &mut dyn CardGate = match card.page_gate.as_mut() {
+            Some(gate) if paged => gate,
+            _ => &mut card.enrol_gate,
+        };
         // Something else was drawn since the card last drew itself (a
         // signing confirmation, an OTA chunk, a screen turned round): the
         // words were hidden for some of that time, so the page on screen
         // starts its dwell again once the card is back (drawn below). A card
         // drawn over again and again only expires.
-        if card_overdrawn(&ctx.button_cards[0]) {
-            ctx.button_cards[0].enrol_gate.restart_page(elapsed_ms);
+        if overdrawn {
+            gate.restart_page(elapsed_ms);
         }
-        ctx.button_cards[0].enrol_gate.step(elapsed_ms, hold_ms > 0);
+        gate.step(elapsed_ms, hold_ms > 0);
     }
+    let gate_armed = {
+        use heartwood_common::button_arm::CardGate;
+        let card = &ctx.button_cards[0];
+        match (enrol, card.page_gate.as_ref()) {
+            (true, _) => card.enrol_gate.armed(),
+            (false, Some(gate)) => gate.armed(),
+            (false, None) => true,
+        }
+    };
 
     if !ctx.button_cards[0].armed {
-        let arms = hold_ms == 0 && (!enrol || ctx.button_cards[0].enrol_gate.armed());
+        let arms = hold_ms == 0 && gate_armed;
         if arms {
             ctx.button_cards[0].armed = true;
         }
-        // B still cancels an enrol card during its gate: it is the explicit
+        // B still cancels a gated card during its gate: it is the explicit
         // "no", and that is always the owner's to give.
-        if enrol && ctx.buttons.b_pressed() {
+        if (enrol || paged) && ctx.buttons.b_pressed() {
             ctx.buttons.drain_b();
             return CardTick::Denied;
         }
@@ -6075,6 +6131,7 @@ fn queue_receive_card(
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
                 enrol_gate: Default::default(),
+                page_gate: None,
                 drawn_view: None,
                 drawn_gen: None,
             });
@@ -6301,6 +6358,7 @@ fn queue_phone_enrol(
         last_remaining: u32::MAX,
         last_pct: u32::MAX,
         enrol_gate: Default::default(),
+        page_gate: None,
         drawn_view: None,
         drawn_gen: None,
     });

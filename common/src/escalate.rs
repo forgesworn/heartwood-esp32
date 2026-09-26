@@ -357,15 +357,28 @@ mod tests {
     }
 
     #[test]
-    fn the_device_only_set_is_the_scalar_and_secret_minting_pair() {
+    fn the_device_only_set_is_the_scalar_secret_and_name_minting_three() {
         use crate::nip46::Nip46Method as M;
         assert!(M::HeartwoodProvisionRendezvous.device_press_only());
         assert!(M::HeartwoodPairWallet.device_press_only());
+        // A registration proof is a replayable key to the name.
+        assert!(M::HeartwoodNoteAddressProof.device_press_only());
         assert!(!M::HeartwoodNoteSend.device_press_only());
         assert!(!M::HeartwoodDerive.device_press_only());
-        // And neither may ever have its card answered by a verdict.
+        // And none may ever have its card answered by a verdict.
         assert!(!M::HeartwoodProvisionRendezvous.verdict_may_answer_card());
         assert!(!M::HeartwoodPairWallet.verdict_may_answer_card());
+        assert!(!M::HeartwoodNoteAddressProof.verdict_may_answer_card());
+        // It is still pinned: its card goes up whatever the slot says, and on
+        // an escalate slot it is refused rather than parked for a guardian,
+        // whatever tier the slot's policy gives it.
+        let proof = M::HeartwoodNoteAddressProof;
+        assert!(proof.pinned_physical());
+        for tier in [ApprovalTier::ButtonRequired, ApprovalTier::AutoApprove] {
+            let route = |escalate| route_request(tier, proof.pinned_physical(), proof.device_press_only(), escalate);
+            assert_eq!(route(true), Route::Refuse, "{tier:?}");
+            assert_eq!(route(false), Route::Card, "{tier:?}");
+        }
         assert!(!M::HeartwoodDerive.verdict_may_answer_card());
         assert!(!M::SignEvent.verdict_may_answer_card());
         // A note method that owes no card of its own has nothing for a
@@ -381,7 +394,6 @@ mod tests {
             M::HeartwoodNoteSpent,
             M::HeartwoodNoteRename,
             M::HeartwoodNoteTrust,
-            M::HeartwoodNoteAddressProof,
         ] {
             assert!(method.verdict_may_answer_card(), "{}", method.as_str());
         }

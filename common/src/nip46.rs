@@ -285,11 +285,15 @@ impl Nip46Method {
     /// card accepts. A rendezvous provision hands the caller a derived scalar
     /// and `heartwood_pair_wallet` mints a slot secret and returns it: each
     /// turns the approval itself into a bearer capability, so no remote
-    /// verdict may stand in for the press. On an escalate slot these are
+    /// verdict may stand in for the press. A lightning-address registration
+    /// proof is the same kind of thing: it signs neither the `cx1` nor a
+    /// nonce, so whoever holds it can replay it at that mint for good, and
+    /// the name's payments go where it says. On an escalate slot these are
     /// refused outright rather than parked, because parking one could only
     /// ever end in a card nobody is there to press (#160).
     pub fn device_press_only(&self) -> bool {
-        self.requires_fresh_physical_approval() || matches!(self, Self::HeartwoodPairWallet)
+        self.requires_fresh_physical_approval()
+            || matches!(self, Self::HeartwoodPairWallet | Self::HeartwoodNoteAddressProof)
     }
 
     /// Whether a guardian verdict may answer this method's OWN card (#160).

@@ -419,35 +419,97 @@ pub fn address_proof_request(cmd: &Value) -> Option<(crate::cash_key::AddressAct
     signable.then_some((action, name, host))
 }
 
-/// The card a registration proof is held on: the action as the header, then
-/// the username and the mint's domain, the three things the signature
-/// commits to. The port is not shown because it is not signed. Each line
-/// fits [`crate::note_fmt::CARD_LINE_CHARS`]: a long name loses its middle,
-/// keeping both ends, and a long domain keeps its tail, where a lookalike
-/// differs.
+/// How long each page of a registration proof card stays on screen.
+#[cfg(feature = "cash")]
+pub const ADDRESS_PROOF_PAGE_SECS: u32 = 3;
+
+/// A username in the pieces its card shows it in, one a page. A name that
+/// fits a line is one piece. A longer one is cut into even pieces that each
+/// leave room for a ` k/n` page marker on the same line: the whole name is
+/// shown, never elided, because the signature commits to every character of
+/// it and a middle nobody saw is where a lookalike would differ. A name is
+/// LUD-16's alphabet only ([`crate::cash_key::valid_username`]), which has
+/// neither a space nor a `/`, so the marker cannot be read as part of it.
+#[cfg(feature = "cash")]
+fn name_pieces(name: &str) -> Vec<String> {
+    use crate::note_fmt::CARD_LINE_CHARS;
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= CARD_LINE_CHARS {
+        return alloc::vec![name.to_string()];
+    }
+    // " k/n" with n below ten: MAX_USERNAME_LEN needs four pages.
+    let room = CARD_LINE_CHARS - 4;
+    let pages = chars.len().div_ceil(room);
+    let per = chars.len().div_ceil(pages);
+    chars.chunks(per).map(|piece| piece.iter().collect()).collect()
+}
+
+/// The card's last line: the mint the proof is for, as the signature binds
+/// it (its bare lowercase hostname). A long domain keeps its tail, where a
+/// lookalike differs.
+#[cfg(feature = "cash")]
+fn address_proof_domain_line(host: &str) -> String {
+    use crate::note_fmt::{elide_host, CARD_LINE_CHARS};
+    let domain = crate::cash_key::spend_domain(host).to_ascii_lowercase();
+    let at = "at ";
+    format!("{at}{}", elide_host(&domain, CARD_LINE_CHARS - at.len()))
+}
+
+#[cfg(feature = "cash")]
+fn address_proof_header(action: crate::cash_key::AddressAction) -> &'static str {
+    match action {
+        crate::cash_key::AddressAction::Register => "REGISTER NAME",
+        crate::cash_key::AddressAction::Unregister => "UNREGISTER NAME",
+    }
+}
+
+/// The pages a registration proof is held on, under one header (the
+/// action): each page is a piece of the username (with its ` k/n` marker
+/// when there is more than one) over the mint's domain, so every page names
+/// the mint and together they spell the whole name. Every line fits
+/// [`crate::note_fmt::CARD_LINE_CHARS`]. A card of more than one page must
+/// not take a press until each page has been on screen
+/// ([`crate::button_arm::PageGate`], [`ADDRESS_PROOF_PAGE_SECS`] a page).
+#[cfg(feature = "cash")]
+pub fn address_proof_pages(
+    action: crate::cash_key::AddressAction,
+    name: &str,
+    host: &str,
+) -> (&'static str, Vec<String>) {
+    let domain_line = address_proof_domain_line(host);
+    let pieces = name_pieces(name);
+    let count = pieces.len();
+    let pages = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, piece)| match count {
+            1 => format!("{piece}\n{domain_line}"),
+            _ => format!("{piece} {}/{count}\n{domain_line}", i + 1),
+        })
+        .collect();
+    (address_proof_header(action), pages)
+}
+
+/// The gate a registration proof card's press waits behind: one page per
+/// piece of the name, each on screen for [`ADDRESS_PROOF_PAGE_SECS`].
+#[cfg(feature = "cash")]
+pub fn address_proof_gate(name: &str) -> crate::button_arm::PageGate {
+    crate::button_arm::PageGate::new(name_pieces(name).len(), ADDRESS_PROOF_PAGE_SECS)
+}
+
+/// The whole of a registration proof card on one screen's worth of text:
+/// every piece of the name, then the domain, one a line. What a log, a
+/// preview or a renderer without pages gets; a renderer that pages draws
+/// [`address_proof_pages`] instead.
 #[cfg(feature = "cash")]
 pub fn address_proof_card(
     action: crate::cash_key::AddressAction,
     name: &str,
     host: &str,
 ) -> (&'static str, String) {
-    use crate::note_fmt::{elide_host, CARD_LINE_CHARS};
-    let header = match action {
-        crate::cash_key::AddressAction::Register => "REGISTER NAME",
-        crate::cash_key::AddressAction::Unregister => "UNREGISTER NAME",
-    };
-    let shown_name = if name.chars().count() <= CARD_LINE_CHARS {
-        name.to_string()
-    } else {
-        let head = (CARD_LINE_CHARS - 2) / 2;
-        let tail = CARD_LINE_CHARS - 2 - head;
-        let chars: Vec<char> = name.chars().collect();
-        let (start, end) = (&chars[..head], &chars[chars.len() - tail..]);
-        format!("{}..{}", start.iter().collect::<String>(), end.iter().collect::<String>())
-    };
-    let domain = crate::cash_key::spend_domain(host).to_ascii_lowercase();
-    let at = "at ";
-    (header, format!("{shown_name}\n{at}{}", elide_host(&domain, CARD_LINE_CHARS - at.len())))
+    let mut lines = name_pieces(name);
+    lines.push(address_proof_domain_line(host));
+    (address_proof_header(action), lines.join("\n"))
 }
 
 fn approval_err(a: Approval) -> Option<Value> {
@@ -3260,21 +3322,60 @@ mod tests {
         assert_eq!((header, title.as_str()), ("REGISTER NAME", "alice\nat moneyer.dev"));
         assert_eq!(address_proof_card(AddressAction::Unregister, "alice", "moneyer.dev").0, "UNREGISTER NAME");
 
-        // The longest name the device signs for, at a long domain: both ends
-        // of the name and the tail of the domain survive, and nothing clips.
+        // A name that fits one line is one page, and needs no gate.
+        let (_, pages) = address_proof_pages(AddressAction::Register, "alice", "moneyer.dev");
+        assert_eq!(pages, ["alice\nat moneyer.dev"]);
+        assert!(crate::button_arm::CardGate::armed(&address_proof_gate("alice")));
+        let exact = "a".repeat(CARD_LINE_CHARS);
+        assert_eq!(address_proof_pages(AddressAction::Register, &exact, "moneyer.dev").1.len(), 1);
+
+        // The longest name the device signs for, at a long domain: every
+        // character of the name is shown, a piece a page with its marker,
+        // every page names the mint's tail, and nothing clips.
         let name = format!("{}{}{}", "a".repeat(11), "b".repeat(42), "c".repeat(11));
         assert_eq!(name.len(), crate::cash_key::MAX_USERNAME_LEN);
-        let (header, title) =
-            address_proof_card(AddressAction::Unregister, &name, "a-rather-long-subdomain.of.mint.example:443");
+        let host = "a-rather-long-subdomain.of.mint.example:443";
+        let (header, pages) = address_proof_pages(AddressAction::Unregister, &name, host);
+        assert_eq!(header, "UNREGISTER NAME");
         assert!(header.len() <= CARD_LINE_CHARS);
-        let lines: Vec<&str> = title.lines().collect();
-        assert_eq!(lines.len(), 2);
-        for line in &lines {
-            assert!(line.chars().count() <= CARD_LINE_CHARS, "{line}");
+        assert_eq!(pages.len(), 4);
+        let mut spelled = String::new();
+        for (i, page) in pages.iter().enumerate() {
+            let lines: Vec<&str> = page.lines().collect();
+            assert_eq!(lines.len(), 2, "{page}");
+            for line in &lines {
+                assert!(line.chars().count() <= CARD_LINE_CHARS, "{line}");
+            }
+            let marker = format!(" {}/4", i + 1);
+            let piece = lines[0].strip_suffix(marker.as_str()).unwrap_or_else(|| panic!("{}", lines[0]));
+            assert!(!piece.contains(".."), "{piece}");
+            spelled.push_str(piece);
+            assert!(lines[1].starts_with("at ") && lines[1].ends_with("of.mint.example"), "{}", lines[1]);
         }
-        assert!(lines[0].starts_with("aaaaaaaaaaa") && lines[0].ends_with("cccccccccc"), "{}", lines[0]);
-        assert!(lines[0].contains(".."));
-        assert!(lines[1].starts_with("at ") && lines[1].ends_with("of.mint.example"), "{}", lines[1]);
+        assert_eq!(spelled, name, "the pages spell the whole name");
+        // Its press waits for all four pages.
+        let gate = address_proof_gate(&name);
+        assert_eq!(gate.pages(), 4);
+        assert!(!crate::button_arm::CardGate::armed(&gate));
+        // The same card in one piece of text, for a log or a preview.
+        let (_, whole) = address_proof_card(AddressAction::Unregister, &name, host);
+        assert_eq!(whole.lines().count(), 5);
+        assert_eq!(whole.lines().take(4).collect::<String>(), name);
+
+        // Every length from one line to the longest pages cleanly.
+        for len in CARD_LINE_CHARS..=crate::cash_key::MAX_USERNAME_LEN {
+            let name = "x".repeat(len);
+            let (_, pages) = address_proof_pages(AddressAction::Register, &name, "moneyer.dev");
+            let count = pages.len();
+            let mut total = 0;
+            for page in &pages {
+                let first = page.lines().next().unwrap();
+                assert!(first.chars().count() <= CARD_LINE_CHARS, "{len}: {first}");
+                total += first.split(' ').next().unwrap().len();
+            }
+            assert_eq!(total, len, "{len} over {count} pages");
+            assert_eq!(address_proof_gate(&name).pages(), count);
+        }
 
         // The request reader the card and the precheck share.
         let cmd = note_cmd_for_method(

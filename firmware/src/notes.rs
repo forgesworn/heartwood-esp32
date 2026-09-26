@@ -1309,10 +1309,27 @@ fn handle_note_cmd_frame_inner(
     let mut approve_trust = |pk: &[u8; 32]| -> Approval { ask(trust_card_title(pk)) };
     let mut approve_cash = |host: &str| -> Approval { ask(cash_card_title(host)) };
     // The cable has no identity, so `cash_address_proof` answers bad_request
-    // before this is reached. It still asks, with the relay tier's own card,
-    // so a cable that one day serves an identity cannot sign a proof blind.
+    // before this is reached. It still asks, with the relay tier's own paged
+    // card, so a cable that one day serves an identity cannot sign a proof
+    // blind or on half a name.
     let mut approve_address = |action, name: &str, host: &str| -> Approval {
-        ask(note_cmd::address_proof_card(action, name, host))
+        let (header, pages) = note_cmd::address_proof_pages(action, name, host);
+        let mut d = display.borrow_mut();
+        let result = crate::approval::run_paged_approval_loop(
+            &mut d,
+            buttons,
+            30,
+            note_cmd::address_proof_gate(name),
+            |d, remaining, page, _armed| {
+                let body = pages.get(page).map(String::as_str).unwrap_or_default();
+                crate::oled::show_titled_approval(d, header, body, remaining, 30);
+            },
+        );
+        match result {
+            crate::approval::ApprovalResult::Approved => Approval::Approved,
+            crate::approval::ApprovalResult::Denied => Approval::Declined,
+            crate::approval::ApprovalResult::TimedOut => Approval::TimedOut,
+        }
     };
 
     // Read the state before ctx takes its mutable borrows of `notes`. A

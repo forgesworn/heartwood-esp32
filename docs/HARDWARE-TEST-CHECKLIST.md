@@ -2285,7 +2285,7 @@ subscribed to `{"kinds":[24135]}`).
    unlocked through round 6. The log says "phones told about the relay
    change; recorded", and a reset afterwards has no "relays changed" line.
 
-## 29. Adding an unlock phone over the relay (added 2026-09-25; steps 1, 2, 2b and 10d bench-run 2026-09-25, desk Heltec V4)
+## 29. Adding an unlock phone over the relay (added 2026-09-25; steps 1, 2, 2b and 10d bench-run 2026-09-25, step 1 by the reversed path 2026-09-26, desk Heltec V4)
 
 **Bench run 2026-09-25** (V4, legacy-NVS bigapp layout, signed v0.18.0-beta.19 written app-only at
 0x10000, readback identical):
@@ -2306,6 +2306,21 @@ subscribed to `{"kinds":[24135]}`).
   only reaches the phone's clipboard, so the code had to be carried across by hand (the phone can
   scan a QR on the computer, so the flow should run that way); and Cambium hides its check code once it says Done (the owner saw it under the
   PIN prompt). Both are Cambium and Sapwood follow-ups.
+
+**Bench run 2026-09-26** (same V4 on beta.19, live Sapwood over the relay, Cambium 0.7.1 on the
+Pixel): step 1 by the reversed path. Sapwood showed its invite QR and Cambium scanned it. The five
+words matched on Sapwood, the phone and the board's card, the check code matched on the board,
+Sapwood and Cambium, and it stayed on Cambium's Done screen. After a reset the Pixel unlocked the
+board with the new record. Its earlier records and the bench script's "bench phone" record were
+revoked from Sapwood, leaving one record. Both follow-ups found on 2026-09-25 are fixed.
+
+- Found: a hold started after reading page 3 but before its dwell ended did nothing and showed
+  nothing (no hold bar), and a tap after letting go also did nothing, since it was still before
+  the gate. A later hold of about 2 s approved. This is the gate working as designed (as in
+  step 2b), but the only sign of it is the hint changing from "compare all 5 words" to "on
+  phone? hold PRG". Follow-up: show "let go, still reading" while A is held before the gate,
+  make the arming visible, and reconsider a tap declining once armed, since the owner's next tap
+  would have declined.
 
 
 `enrol_unlock_phone` does over the relay what `PHONE_UNLOCK_CMD` (0x64)
@@ -2580,11 +2595,12 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     one-off rendezvous tag. No event carries the label, the enrolment key or
     the phone's id in the clear.
 
-## 30. Destructive cards say ERASE (added 2026-09-25; 30a bench-run 2026-09-25 on beta.19)
+## 30. Destructive cards say ERASE (added 2026-09-25; 30a bench-run 2026-09-25, 30b 2026-09-26, on beta.19)
 
 **Bench run 2026-09-25** (V4, v0.18.0-beta.19): 30a read "FACTORY RESET / ERASE ALL KEYS / notes
 and pairings too" with its countdown; a tap denied it (NACK after 6 s) and every identity, phone and
-NVS entry was unchanged. 30b not run.
+NVS entry was unchanged. 30b was run on 2026-09-26 from live Sapwood over the relay: the card read
+REMOVE IDENTITY / ERASE slot N with the slot's npub prefix, it was left to expire, and the slot stayed.
 
 
 The factory reset and identity removal cards used a renderer that dropped its
@@ -2596,7 +2612,7 @@ titled card. Deny each one; do not hold PRG on either.
   press prompt). Expected: "FACTORY RESET / ERASE ALL KEYS /
   notes and pairings too", a 30 s countdown and the hold hint. Tap to deny;
   the board NACKs and keeps every key.
-- [ ] **30b. Identity removal.** Remove a non-default slot from Sapwood.
+- [x] **30b. Identity removal.** Remove a non-default slot from Sapwood.
   Expected: "REMOVE IDENTITY / ERASE slot N / npub1..." with the first 16
   characters of that slot's npub, matching Sapwood. Let it time out; the slot
   stays.

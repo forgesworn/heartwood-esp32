@@ -1101,7 +1101,7 @@ fn main() {
         let frame_type = frame.frame_type;
         match frame_type {
             // 0x01 — add a master (host-derived) / 0x57 — self-generate on-device
-            // / 0x58 — restore an existing 12-word phrase via the on-device picker
+            // / 0x58 — restore existing recovery words via the on-device picker
             FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
                 let provisioned = match frame.frame_type {
                     FRAME_TYPE_GENERATE_IDENTITY => {

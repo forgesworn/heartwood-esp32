@@ -60,9 +60,10 @@ T-Display. Public identity and credential values are deliberately omitted.
 - [ ] Flash from Sapwood (Flash tab). Board reboots into the boot animation.
 - [ ] Setup shows **Create a fresh identity** and **Restore from my 12 words**.
 - [ ] Create → name → "Create it on my device". OLED shows **NEW IDENTITY / Working**.
-- [ ] OLED walks the 12 words one at a time (**WORD n/12**, big font). Tap advances.
-- [ ] After word 12, **ALL 12 SHOWN** — a short tap re-shows the words; a 2-second
-      hold saves (**SAVED**).
+- [ ] OLED walks the recovery words one at a time (**WORD n OF 19**, or 31 for the
+      longer option; big font). Tap advances.
+- [ ] After the last word, **ALL 19 SHOWN** (or **ALL 31 SHOWN**): the count matches
+      the walkthrough; a short tap re-shows the words; a 2-second hold saves (**SAVED**).
 - [ ] Sapwood shows the npub and moves to "write it down". npub matches the device.
 
 ## 2. On-device restore (the new path)
@@ -2616,6 +2617,24 @@ titled card. Deny each one; do not hold PRG on either.
   Expected: "REMOVE IDENTITY / ERASE slot N / npub1..." with the first 16
   characters of that slot's npub, matching Sapwood. Let it time out; the slot
   stays.
+
+## 31. The info page names the network joined (added 2026-09-30, NOT YET BENCH-RUN)
+
+With a fallback list the board can be online through a network other than the
+primary. The WiFi info page used to show the primary SSID regardless, and
+GET_NET_CONFIG's runtime said `wifi_connected` without saying which network.
+The runtime block now carries `wifi_index` (0 = the top-level `ssid`, n =
+`networks[n-1]`, `null` while WiFi is down), and the info page shows that
+network.
+
+- [ ] **31a.** WiFi mode with a primary out of range and a reachable fallback.
+  Once online, short-press to the network page: it names the fallback, not the
+  primary. GET_NET_CONFIG (`node scripts/net-config.mjs --port <port>`) shows
+  `runtime.wifi_index` naming that fallback (1 for the first entry in
+  `networks`, 2 for the second).
+- [ ] **31b.** Bring the primary back and reboot: the page names the primary and
+  `wifi_index` is 0. Drop WiFi altogether: `wifi_index` reads `null` and the page
+  falls back to the primary SSID.
 
 ## Notes
 

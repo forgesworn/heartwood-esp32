@@ -375,12 +375,13 @@ pub fn show_npub(
 /// to step through with the PRG button.
 ///
 /// The recovery phrase is generated on-device (hardware RNG) and never sent to
-/// the host — this screen is the only place it ever appears. Twelve tiny words
-/// crammed onto the 128x64 panel proved illegible, so the provision handler
-/// walks through them one big word per screen (FONT_10X20), each tagged
-/// "WORD n OF 12", advancing on a button tap. It holds the walkthrough — and
-/// blocks the caller from redrawing or rebooting — until the owner confirms, so
-/// nothing can vanish before it is copied down.
+/// the host — this screen is the only place it ever appears. A dozen or more
+/// tiny words crammed onto the 128x64 panel proved illegible, so the provision
+/// handler walks through them one big word per screen (FONT_10X20), each
+/// tagged "WORD n OF <total>" (19 or 31 for a typed envelope), advancing on a
+/// button tap. It holds the walkthrough — and blocks the caller from
+/// redrawing or rebooting — until the owner confirms, so nothing can vanish
+/// before it is copied down.
 ///
 /// `role` captions what the word IS. The typed envelope opens with two words
 /// that are byte-identical on every key ever generated, so without a caption a
@@ -516,7 +517,8 @@ pub fn show_recovery_prefix_notice(display: &mut Display<'_>) {
 
 /// Final confirm screen after stepping through every recovery word: a long PRG
 /// hold saves, a short tap restarts the walkthrough so the owner can re-check.
-pub fn show_recovery_done(display: &mut Display<'_>) {
+/// `total` is the number of words just shown (19 or 31 for a typed envelope).
+pub fn show_recovery_done(display: &mut Display<'_>, total: usize) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -533,7 +535,8 @@ pub fn show_recovery_done(display: &mut Display<'_>) {
         .text_color(FG)
         .build();
 
-    Text::new("ALL 12 SHOWN", Point::new(l.sx(2), l.sy(12)), header).draw(display).ok();
+    let title = format!("ALL {total} SHOWN");
+    Text::new(&title, Point::new(l.sx(2), l.sy(12)), header).draw(display).ok();
     Rectangle::new(Point::new(l.sx(0), l.sy(16)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(FG))
         .draw(display)
@@ -563,8 +566,9 @@ pub enum Highlight {
 }
 
 /// One-time intro shown when on-device restore begins, teaching the two-gesture
-/// vocabulary before the terse picker takes over. The 12-word phrase is entered
-/// here, on the device — never in the browser.
+/// vocabulary before the terse picker takes over. The phrase (ForgeSworn
+/// recovery words or a legacy BIP-39 phrase) is entered here, on the device —
+/// never in the browser.
 pub fn show_restore_intro(display: &mut Display<'_>, two_button: bool) {
     let l = layout(display);
     display.clear_buffer();
@@ -682,7 +686,7 @@ pub fn show_word_entry(
 
 /// Review screen for one entered word: one-button boards tap to page and
 /// double-tap to edit; two-button boards move with A/B and hold B to edit.
-/// `invalid` flags that the 12 words failed the BIP-39 checksum, so a wrong
+/// `invalid` flags that the entered words failed their checksum, so a wrong
 /// word is somewhere in the list and needs finding.
 pub fn show_review_word(
     display: &mut Display<'_>,

@@ -458,7 +458,7 @@ fn walk_recovery_phrase(
 
         // Confirm with the same 0–100% hold bar used for signing: a full hold
         // saves, a short tap restarts the review.
-        if confirm_recovery_save(display, buttons) {
+        if confirm_recovery_save(display, buttons, total) {
             oled::show_result(display, "SAVED");
             return;
         }
@@ -488,8 +488,9 @@ fn word_role_caption(index: usize, total: usize) -> &'static str {
 fn confirm_recovery_save(
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
+    total: usize,
 ) -> bool {
-    oled::show_recovery_done(display);
+    oled::show_recovery_done(display, total);
     hold_to_confirm(display, buttons)
 }
 
@@ -873,7 +874,7 @@ enum ReviewOutcome {
     Cancel,
 }
 
-/// Page through the 12 entered words (plus SAVE / CANCEL items) and act on one.
+/// Page through the entered words (plus SAVE / CANCEL items) and act on one.
 /// Two-button boards move with A and act with B; one-button boards tap to move,
 /// hold to move back, and double-tap to act. Acting on a word re-enters that one
 /// slot in place. `invalid` shows a banner when the phrase last failed its

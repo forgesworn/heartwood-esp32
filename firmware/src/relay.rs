@@ -520,16 +520,25 @@ fn launch_offline_qr_if_requested(ctx: &mut SignCtx<'_, '_, '_>) -> bool {
     }
 }
 
-/// One page of the idle info carousel. Page 1 shows the stored SSID with the
-/// live runtime stage; page 2 the firmware version, board, and uptime; page 3
-/// the privacy-preserving locker counts.
+/// One page of the idle info carousel. Page 1 shows the network the station
+/// joined (the primary SSID until one has) with the live runtime stage; page 2
+/// the firmware version, board, and uptime; page 3 the privacy-preserving
+/// locker counts.
 fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
     match ctx.idle_page {
         1 => {
+            // With a fallback list the board may be online through a network
+            // other than the primary, so name the one actually joined.
+            let joined = ctx.network_runtime.wifi_index;
             let ssid = crate::net_config_store::read_net_config(ctx.nvs)
                 .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
-                .filter(|cfg| !cfg.ssid.is_empty())
-                .map(|cfg| cfg.ssid);
+                .and_then(|cfg| {
+                    joined
+                        .and_then(|i| cfg.network_at(i))
+                        .or(Some(cfg.ssid.as_str()))
+                        .filter(|ssid| !ssid.is_empty())
+                        .map(str::to_string)
+                });
             let status = match ctx.network_runtime.stage {
                 NetworkRuntimeStage::Online => "online",
                 NetworkRuntimeStage::SubscriptionSent => "relay connecting",
@@ -655,6 +664,13 @@ fn set_network_runtime(
         },
         secondary_index: if relay_connected {
             ctx.network_runtime.secondary_index
+        } else {
+            None
+        },
+        // Likewise the joined network: kept while the station is up, dropped
+        // the moment it is not, so it never names a network we have left.
+        wifi_index: if wifi_connected {
+            ctx.network_runtime.wifi_index
         } else {
             None
         },
@@ -976,6 +992,12 @@ pub fn run_wifi_standalone<'d, 'b>(
             usable
         })
         .collect();
+    // Each candidate's place in the GET_NET_CONFIG response, reported as
+    // `runtime.wifi_index` once that candidate is the one joined.
+    let wifi_positions: Vec<Option<u8>> = wifi_candidates
+        .iter()
+        .map(|(ssid, _)| cfg.network_position(ssid))
+        .collect();
     let wifi_config_ok = !wifi_candidates.is_empty();
     let mut wifi_candidate_idx = 0usize;
     if wifi_config_ok {
@@ -1283,6 +1305,13 @@ pub fn run_wifi_standalone<'d, 'b>(
                 continue;
             }
             log::info!("[relay] wifi up");
+            // The station is still pointed at the last candidate selected, so
+            // that is the network it joined (a fallback, perhaps, not the
+            // primary). Set before the stage change, which carries it.
+            ctx.network_runtime.wifi_index = wifi_positions
+                .get(wifi_candidate_idx % wifi_positions.len().max(1))
+                .copied()
+                .flatten();
             set_network_runtime(
                 &mut ctx,
                 NetworkRuntimeStage::WifiReady,

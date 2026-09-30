@@ -8036,6 +8036,10 @@ fn dispatch_mgmt(
                 "active": active_json,
                 "trial": trial_json,
                 "last_result": last_result,
+                // The network the station joined, as a position in `active`
+                // (see NetworkRuntimeStatus::wifi_index). Only this field of
+                // the runtime: the rest are cable diagnostics.
+                "wifi_index": ctx.network_runtime.wifi_index,
             }))
         }
 

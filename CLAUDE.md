@@ -163,8 +163,10 @@ relay.rs), is promoted when the primary drops, gives its slot to a pinned
 relay or a pairing, and is shed when the largest block falls below 32 KB.
 net-config reports runtime.secondary_index. It also reports
 runtime.wifi_index (0 = the primary `ssid`, n = `networks[n-1]`, null while
-WiFi is down), the network the station actually joined, and the WiFi info
-page names that network rather than the primary (checklist section 31).
+WiFi is down), the network the station actually joined, as does the relay's
+operator-only `get_network_config` reply (top-level `wifi_index`, only that
+runtime field); the WiFi info page and Sapwood's Connectivity panel name that
+network rather than the primary (checklist section 31).
 
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device

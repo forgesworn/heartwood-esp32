@@ -58,7 +58,7 @@ T-Display. Public identity and credential values are deliberately omitted.
 ## 1. Flash + first identity (generate)
 
 - [ ] Flash from Sapwood (Flash tab). Board reboots into the boot animation.
-- [ ] Setup shows **Create a fresh identity** and **Restore from my 12 words**.
+- [ ] Setup shows **Create a fresh key** and **Restore a key I already have**.
 - [ ] Create → name → "Create it on my device". OLED shows **NEW IDENTITY / Working**.
 - [ ] OLED walks the recovery words one at a time (**WORD n OF 19**, or 31 for the
       longer option; big font). Tap advances.
@@ -2624,8 +2624,9 @@ With a fallback list the board can be online through a network other than the
 primary. The WiFi info page used to show the primary SSID regardless, and
 GET_NET_CONFIG's runtime said `wifi_connected` without saying which network.
 The runtime block now carries `wifi_index` (0 = the top-level `ssid`, n =
-`networks[n-1]`, `null` while WiFi is down), and the info page shows that
-network.
+`networks[n-1]`, `null` while WiFi is down), the relay's operator-only
+`get_network_config` reply carries the same `wifi_index` at top level, and the
+info page and Sapwood's Connectivity panel both name that network.
 
 - [ ] **31a.** WiFi mode with a primary out of range and a reachable fallback.
   Once online, short-press to the network page: it names the fallback, not the
@@ -2635,6 +2636,11 @@ network.
 - [ ] **31b.** Bring the primary back and reboot: the page names the primary and
   `wifi_index` is 0. Drop WiFi altogether: `wifi_index` reads `null` and the page
   falls back to the primary SSID.
+- [ ] **31c.** Over the relay (Sapwood's Connectivity panel on a WiFi board, or
+  `get_network_config` on the 24134 channel as the device operator): the reply
+  carries a top-level `wifi_index` matching 31a, and Sapwood reads "Currently on
+  <fallback>, one of the fallback networks". Over USB the same line appears from
+  GET_NET_CONFIG's `runtime.wifi_index`.
 
 ## Notes
 

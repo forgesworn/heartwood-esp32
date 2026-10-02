@@ -141,6 +141,7 @@ impl<'a> St7789Display<'a> {
 
     /// Blit the whole back buffer to the panel. Mirrors `Ssd1306::flush`.
     pub fn flush(&mut self) -> Result<(), St7789Error> {
+        crate::oled::note_draw();
         let (ex, ey) = ((self.width - 1) as u16, (self.height - 1) as u16);
         let sent = if self.flipped {
             self.panel.set_pixels(0, 0, ex, ey, self.framebuffer.iter().rev().copied())

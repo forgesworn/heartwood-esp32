@@ -331,3 +331,120 @@ impl Identity {
         self.private_key.zeroize();
     }
 }
+
+/// Whether a USB frame's handler in the WiFi-standalone loop (relay.rs
+/// `poll_usb_frame`) may put up a button card of its own. The relay loop holds
+/// cards of its own too, and the button is one: a cable card answered while a
+/// relay card waits leaves its hold behind (the sampler latches the release
+/// with the whole press), which the relay card would then read as its own
+/// approval. So every frame that may raise a card is refused "approval on
+/// screen" while a relay card is up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CableCard {
+    /// Never raises a card (answers, NACKs, or draws without the button).
+    Never,
+    /// May raise a card; refused while a relay card is up.
+    Always,
+    /// May raise a card, and is the owner's way back from a board the
+    /// relays are holding (a bad network, a factory reset, a firmware fix):
+    /// it takes the screen over instead of waiting behind a relay card, which
+    /// anyone can keep up by publishing to the board. The relay cards are
+    /// answered Expired first, and the cable card arms only once the button
+    /// has been seen up, so no hold made for the relay card can answer it.
+    Recovery,
+    /// SET_NET_CONFIG: [`CableCard::Recovery`] when the new config keeps the
+    /// stored operator, otherwise [`CableCard::Always`]. A whole-config
+    /// replacement can name another operator, and handing relay management
+    /// to a new key is no recovery the owner needs to force past a relay
+    /// card (`net_config::set_net_config_keeps_operator`).
+    RecoveryIfOperatorKept,
+    /// Raises a card only for one command in its payload
+    /// (PHONE_UNLOCK_CMD's `enrol`).
+    IfEnrol,
+}
+
+/// [`CableCard`] for `frame_type`, as the WiFi-standalone loop handles it.
+/// Every arm there that hands the handler the buttons (or the whole context)
+/// must be classified; ui-preview's tests read relay.rs and check it.
+pub fn cable_frame_card(frame_type: u8) -> CableCard {
+    match frame_type {
+        FRAME_TYPE_NIP46_REQUEST
+        | FRAME_TYPE_ENCRYPTED_REQUEST
+        | FRAME_TYPE_SET_BRIDGE_SECRET
+        | FRAME_TYPE_SET_OPERATOR
+        | FRAME_TYPE_SET_PIN
+        | FRAME_TYPE_VAULT_SET
+        | FRAME_TYPE_CONNSLOT_UPDATE
+        | FRAME_TYPE_BACKUP_EXPORT_REQUEST
+        | FRAME_TYPE_BACKUP_IMPORT_REQUEST
+        | FRAME_TYPE_PROVISION
+        | FRAME_TYPE_GENERATE_IDENTITY
+        | FRAME_TYPE_RESTORE_IDENTITY
+        | FRAME_TYPE_DERIVE_IDENTITY
+        | FRAME_TYPE_PROVISION_REMOVE => CableCard::Always,
+        FRAME_TYPE_FACTORY_RESET | FRAME_TYPE_PATCH_NET_CONFIG | FRAME_TYPE_OTA_BEGIN => {
+            CableCard::Recovery
+        }
+        FRAME_TYPE_SET_NET_CONFIG => CableCard::RecoveryIfOperatorKept,
+        FRAME_TYPE_PHONE_UNLOCK_CMD => CableCard::IfEnrol,
+        _ => CableCard::Never,
+    }
+}
+
+#[cfg(test)]
+mod cable_card_tests {
+    use super::*;
+
+    #[test]
+    fn every_frame_that_can_raise_a_card_is_named() {
+        let always = [
+            FRAME_TYPE_NIP46_REQUEST,
+            FRAME_TYPE_ENCRYPTED_REQUEST,
+            FRAME_TYPE_SET_BRIDGE_SECRET,
+            FRAME_TYPE_SET_OPERATOR,
+            FRAME_TYPE_SET_PIN,
+            FRAME_TYPE_VAULT_SET,
+            FRAME_TYPE_CONNSLOT_UPDATE,
+            FRAME_TYPE_BACKUP_EXPORT_REQUEST,
+            FRAME_TYPE_BACKUP_IMPORT_REQUEST,
+            FRAME_TYPE_PROVISION,
+            FRAME_TYPE_GENERATE_IDENTITY,
+            FRAME_TYPE_RESTORE_IDENTITY,
+            FRAME_TYPE_DERIVE_IDENTITY,
+            FRAME_TYPE_PROVISION_REMOVE,
+        ];
+        // The owner's way back from a board the relays are holding hostage:
+        // these take the screen over rather than wait behind a relay card.
+        // PATCH_NET_CONFIG cannot touch the operator; SET_NET_CONFIG can, so
+        // it is a recovery only when it keeps the one stored.
+        let recovery = [FRAME_TYPE_FACTORY_RESET, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_OTA_BEGIN];
+        for t in 0..=u8::MAX {
+            let expected = if always.contains(&t) {
+                CableCard::Always
+            } else if recovery.contains(&t) {
+                CableCard::Recovery
+            } else if t == FRAME_TYPE_SET_NET_CONFIG {
+                CableCard::RecoveryIfOperatorKept
+            } else if t == FRAME_TYPE_PHONE_UNLOCK_CMD {
+                CableCard::IfEnrol
+            } else {
+                CableCard::Never
+            };
+            assert_eq!(cable_frame_card(t), expected, "frame 0x{t:02x}");
+        }
+        // Answers, reads and frames that draw without the button never
+        // raise one; nor does the USB note surface, NACKed in this loop.
+        for t in [
+            FRAME_TYPE_FIRMWARE_INFO,
+            FRAME_TYPE_SET_IDENTITY_META,
+            FRAME_TYPE_DISPLAY_FLIP,
+            FRAME_TYPE_OTA_CHUNK,
+            FRAME_TYPE_OTA_FINISH,
+            FRAME_TYPE_NOTE_CMD,
+            FRAME_TYPE_CONNSLOT_LIST,
+            FRAME_TYPE_WIFI_SCAN_REQUEST,
+        ] {
+            assert_eq!(cable_frame_card(t), CableCard::Never, "frame 0x{t:02x}");
+        }
+    }
+}

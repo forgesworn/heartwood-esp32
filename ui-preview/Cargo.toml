@@ -11,3 +11,7 @@ embedded-graphics = "0.8"
 # default-features = false drops the SDL2 window backend (we only render to PNG,
 # no native window / no libsdl2 needed).
 embedded-graphics-simulator = { version = "0.7", default-features = false }
+# The enrol card's text (the request words, the quoted label and its
+# shortening) comes from the same pure functions the firmware draws, so the
+# preview and its geometry test cannot drift from them.
+heartwood-common = { path = "../common", features = ["nip44", "nip46", "seed-encrypt"] }

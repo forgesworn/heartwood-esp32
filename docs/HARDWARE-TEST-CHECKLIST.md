@@ -2658,6 +2658,13 @@ the main loop and the locked phase.
   rotates to the fallback and comes online.
 - [ ] **32b.** Same setup, Sapwood over USB during the failed joins: it
   connects and lists the identity without "isn't answering over the cable".
+  Transport half bench-run 2026-10-02 (T-Display): Sapwood's own
+  SerialTransport and connect probe (sapwood a3dbdbf), driven from Node
+  through a Web Serial shim straight after a reset, answered the probe at
+  13.2 s (normal boot), then 38 reads over the join window with 0 failures,
+  slowest 3.3 s (the relay TLS dial), session open throughout, across
+  `wifi_connecting` / `network_not_found` to `online`. Still to do: the same
+  in the browser, watching the screens.
 - [ ] **32c.** Locked board (PIN or vault) in WiFi mode with its networks out of
   range: PIN_UNLOCK / VAULT_UNLOCK over USB are answered within a couple of
   seconds at any point in the join cycle.

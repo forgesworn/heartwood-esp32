@@ -2642,6 +2642,26 @@ info page and Sapwood's Connectivity panel both name that network.
   <fallback>, one of the fallback networks". Over USB the same line appears from
   GET_NET_CONFIG's `runtime.wifi_index`.
 
+## 32. The cable is served during a WiFi join (added 2026-10-02; 32a bench-run 2026-10-02, T-Display)
+
+A failed join used to hold the loop for the whole 15 s `BlockingWifi::connect`
+limit (it ignores the disconnect that reports a missing network), so a WiFi
+board with its networks out of range read USB for 3 s in every 18 and Sapwood's
+connect probe gave it up as dead. Joins are now polled (relay.rs `WifiJoin`), in
+the main loop and the locked phase.
+
+- [x] **32a.** WiFi mode, two configured networks out of range ahead of a
+  reachable fallback. Reset the board and query FIRMWARE_INFO every 300 ms for
+  70 s, recording the longest gap between replies. Bench, 2026-10-02: beta.20
+  showed 17.7 s twice (one per failed join); the fix shows no gap over 2 s
+  except 4.1 s at the relay TLS dial, which still blocks. The board still
+  rotates to the fallback and comes online.
+- [ ] **32b.** Same setup, Sapwood over USB during the failed joins: it
+  connects and lists the identity without "isn't answering over the cable".
+- [ ] **32c.** Locked board (PIN or vault) in WiFi mode with its networks out of
+  range: PIN_UNLOCK / VAULT_UNLOCK over USB are answered within a couple of
+  seconds at any point in the join cycle.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

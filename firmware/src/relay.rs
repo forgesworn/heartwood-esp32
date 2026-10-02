@@ -728,6 +728,79 @@ enum WifiJoinStage {
     WaitForIp,
 }
 
+/// Each join stage's limit: the one `BlockingWifi::connect` and
+/// `wait_netif_up` apply (esp-idf-svc's CONNECT_TIMEOUT).
+const WIFI_JOIN_STAGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A WiFi join that is polled rather than waited on, so the cable is served
+/// while it runs. `BlockingWifi::connect` waits only for the station to
+/// associate and ignores the disconnect that reports a missing network, so a
+/// failed join held the loop for the whole 15 s, leaving USB 3 s in every 18
+/// with a network out of range: Sapwood's connect probe timed out inside the
+/// block and gave the board up as dead, exactly when the cable was the way to
+/// fix its WiFi (2026-10-02). Same stages, limits and timeout error as the
+/// blocking calls, so a failure is recorded and reported as before.
+struct WifiJoin {
+    stage: WifiJoinStage,
+    deadline: Instant,
+}
+
+enum JoinPoll {
+    Pending,
+    Joined,
+    Failed(WifiJoinStage, esp_idf_svc::sys::EspError),
+}
+
+impl WifiJoin {
+    fn start(wifi: &mut BlockingWifi<EspWifi<'_>>) -> Result<Self, esp_idf_svc::sys::EspError> {
+        wifi.wifi_mut().connect()?;
+        Ok(Self {
+            stage: WifiJoinStage::Connect,
+            deadline: Instant::now() + WIFI_JOIN_STAGE_TIMEOUT,
+        })
+    }
+
+    fn poll(&mut self, wifi: &BlockingWifi<EspWifi<'_>>) -> JoinPoll {
+        if matches!(self.stage, WifiJoinStage::Connect) && wifi.is_connected().unwrap_or(false) {
+            self.stage = WifiJoinStage::WaitForIp;
+            self.deadline = Instant::now() + WIFI_JOIN_STAGE_TIMEOUT;
+        }
+        if matches!(self.stage, WifiJoinStage::WaitForIp) && wifi.is_up().unwrap_or(false) {
+            return JoinPoll::Joined;
+        }
+        if Instant::now() >= self.deadline {
+            return JoinPoll::Failed(
+                self.stage,
+                esp_idf_svc::sys::EspError::from_infallible::<{ esp_idf_svc::sys::ESP_ERR_TIMEOUT }>(),
+            );
+        }
+        JoinPoll::Pending
+    }
+}
+
+/// One pass of cable and button service while the relays are unreachable.
+/// `wifi` lends the driver to a 0x55 scan; pass `None` while a join is in
+/// flight, since a scan would pull the radio off the channel it is joining.
+fn serve_offline(
+    usb: &mut SerialPort<'_>,
+    ctx: &mut SignCtx<'_, '_, '_>,
+    wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
+    sessions: &mut [RelaySession],
+) {
+    poll_usb(usb, ctx, wifi, sessions);
+    // A relay card still owns the button and the screen: tick it with
+    // no session, so it can be answered (an approval's reply waits in
+    // the #82 outbox; an enrolment finds no live relay and adds
+    // nothing) and, above all, expires on time instead of standing,
+    // and refusing the cable, until a power cycle. A held result is
+    // served inside service_button.
+    if ctx.button_cards.is_empty() {
+        service_button(ctx);
+    } else {
+        service_button_cards(ctx, &mut []);
+    }
+}
+
 fn classify_wifi_failure(stage: WifiJoinStage, station_reason: u16) -> WifiFailureReason {
     match station_reason {
         WIFI_REASON_AUTH_EXPIRE => WifiFailureReason::AuthenticationExpired,
@@ -1224,18 +1297,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             );
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
-                // A relay card still owns the button and the screen: tick it with
-                // no session, so it can be answered (an approval's reply waits in
-                // the #82 outbox; an enrolment finds no live relay and adds
-                // nothing) and, above all, expires on time instead of standing,
-                // and refusing the cable, until a power cycle. A held result is
-                // served inside service_button.
-                if ctx.button_cards.is_empty() {
-                    service_button(&mut ctx);
-                } else {
-                    service_button_cards(&mut ctx, &mut []);
-                }
+                serve_offline(usb, &mut ctx, Some(&mut wifi), &mut sessions);
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -1264,12 +1326,22 @@ pub fn run_wifi_standalone<'d, 'b>(
                 sessions.clear();
             }
             wifi_disconnect_reason.store(0, Ordering::Release);
-            let joined = wifi.connect()
-                .map_err(|error| (WifiJoinStage::Connect, error))
-                .and_then(|_| {
-                    wifi.wait_netif_up()
-                        .map_err(|error| (WifiJoinStage::WaitForIp, error))
-                });
+            // Polled, not waited on: the cable, the button and a scheduled
+            // restart are all served for as long as the join runs (WifiJoin).
+            let joined = match WifiJoin::start(&mut wifi) {
+                Err(error) => Err((WifiJoinStage::Connect, error)),
+                Ok(mut join) => loop {
+                    crate::wdt::feed();
+                    match join.poll(&wifi) {
+                        JoinPoll::Joined => break Ok(()),
+                        JoinPoll::Failed(stage, error) => break Err((stage, error)),
+                        JoinPoll::Pending => {}
+                    }
+                    network_state_tick(&mut ctx);
+                    serve_offline(usb, &mut ctx, None, &mut sessions);
+                    FreeRtos::delay_ms(20);
+                },
+            };
             if let Err((stage, e)) = joined {
                 // Keep serving USB while wifi is unreachable, so a bad SSID or
                 // password can always be fixed over the cable.
@@ -1288,18 +1360,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 );
                 let until = Instant::now() + Duration::from_secs(3);
                 while Instant::now() < until {
-                    poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
-                    // A relay card still owns the button and the screen: tick it with
-                    // no session, so it can be answered (an approval's reply waits in
-                    // the #82 outbox; an enrolment finds no live relay and adds
-                    // nothing) and, above all, expires on time instead of standing,
-                    // and refusing the cable, until a power cycle. A held result is
-                    // served inside service_button.
-                    if ctx.button_cards.is_empty() {
-                        service_button(&mut ctx);
-                    } else {
-                        service_button_cards(&mut ctx, &mut []);
-                    }
+                    serve_offline(usb, &mut ctx, Some(&mut wifi), &mut sessions);
                     FreeRtos::delay_ms(20);
                 }
                 continue;
@@ -1336,18 +1397,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             // fixable over USB.
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
-                // A relay card still owns the button and the screen: tick it with
-                // no session, so it can be answered (an approval's reply waits in
-                // the #82 outbox; an enrolment finds no live relay and adds
-                // nothing) and, above all, expires on time instead of standing,
-                // and refusing the cable, until a power cycle. A held result is
-                // served inside service_button.
-                if ctx.button_cards.is_empty() {
-                    service_button(&mut ctx);
-                } else {
-                    service_button_cards(&mut ctx, &mut []);
-                }
+                serve_offline(usb, &mut ctx, Some(&mut wifi), &mut sessions);
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -2368,6 +2418,7 @@ fn locked_relay_phase(
     let mut next_announce = Instant::now();
     let mut wifi_idx = 0usize;
     let mut next_wifi_attempt = Instant::now();
+    let mut wifi_join: Option<WifiJoin> = None;
     // Wall clock, learned from the relay. Until it has a reading there is
     // nothing worth publishing: an announcement stamped from boot time is
     // rejected as an expired ephemeral event, so it would be a signature and a
@@ -2387,20 +2438,40 @@ fn locked_relay_phase(
         // This phase runs before the main loop ever connects the station, so
         // it owns its own join attempts — without this, the unlock announce
         // could never reach a relay. Rotates through the stored network list,
-        // paced so USB unlock stays served between blocking attempts.
-        if !wifi.is_up().unwrap_or(false) {
+        // paced so USB unlock stays served between attempts. Each attempt is
+        // polled across passes (WifiJoin), so USB unlock is served during it
+        // too, not only in the 3 s between.
+        if wifi.is_up().unwrap_or(false) {
+            if wifi_join.take().is_some() {
+                log::info!("[relay] locked: wifi up");
+            }
+        } else {
             if session.is_some() {
                 session = None;
             }
-            if Instant::now() >= next_wifi_attempt {
-                if let Err(e) = wifi.connect().and_then(|_| wifi.wait_netif_up()) {
-                    log::warn!("[relay] locked: wifi connect failed: {e:?}; retry in 3s");
-                    wifi_idx = wifi_idx.wrapping_add(1);
-                    select_wifi_candidate(wifi, wifi_candidates, wifi_idx);
-                    next_wifi_attempt = Instant::now() + Duration::from_secs(3);
-                } else {
+            let failed = match wifi_join.as_mut().map(|join| join.poll(wifi)) {
+                Some(JoinPoll::Pending) => None,
+                Some(JoinPoll::Joined) => {
+                    wifi_join = None;
                     log::info!("[relay] locked: wifi up");
+                    None
                 }
+                Some(JoinPoll::Failed(_, e)) => Some(e),
+                None if Instant::now() >= next_wifi_attempt => match WifiJoin::start(wifi) {
+                    Ok(join) => {
+                        wifi_join = Some(join);
+                        None
+                    }
+                    Err(e) => Some(e),
+                },
+                None => None,
+            };
+            if let Some(e) = failed {
+                log::warn!("[relay] locked: wifi connect failed: {e:?}; retry in 3s");
+                wifi_join = None;
+                wifi_idx = wifi_idx.wrapping_add(1);
+                select_wifi_candidate(wifi, wifi_candidates, wifi_idx);
+                next_wifi_attempt = Instant::now() + Duration::from_secs(3);
             }
         }
         // (Re)connect round-robin until a relay holds.

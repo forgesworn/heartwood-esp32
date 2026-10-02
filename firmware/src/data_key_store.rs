@@ -11,6 +11,7 @@
 use std::sync::Mutex;
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use heartwood_common::data_key::{BlobStore, Platform, StoreError, DK_LEN, MAX_PHONES_BLOB_LEN};
 use zeroize::Zeroize;
 
@@ -22,22 +23,28 @@ const MAX_BLOB: usize = MAX_PHONES_BLOB_LEN;
 /// never truncated.
 pub struct NvsBlobs<'a>(pub &'a mut EspNvs<NvsDefault>);
 
-impl BlobStore for NvsBlobs<'_> {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        let len = match self.0.blob_len(key) {
+impl NvsBlobs<'_> {
+    fn get_from(nvs: &EspNvs<NvsDefault>, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let len = match nvs.blob_len(key) {
             Ok(None) => return Ok(None),
             Ok(Some(len)) if len <= MAX_BLOB => len,
             Ok(Some(_)) | Err(_) => return Err(StoreError),
         };
         let mut buf = vec![0u8; len.max(1)];
-        match self.0.get_blob(key, &mut buf) {
+        match nvs.get_blob(key, &mut buf) {
             Ok(Some(bytes)) if bytes.len() == len => Ok(Some(bytes.to_vec())),
             _ => Err(StoreError),
         }
     }
+}
+
+impl BlobStore for NvsBlobs<'_> {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Self::get_from(self.0, key)
+    }
 
     fn set(&mut self, key: &str, value: &[u8]) -> Result<(), StoreError> {
-        self.0.set_blob(key, value).map_err(|_| StoreError)
+        self.0.replace_blob(key, value).map_err(|_| StoreError)
     }
 
     fn remove(&mut self, key: &str) -> Result<(), StoreError> {
@@ -96,7 +103,7 @@ pub fn next_locked_boot(nvs: &mut EspNvs<NvsDefault>) -> u32 {
         _ => 0,
     };
     let next = current.saturating_add(1);
-    if let Err(e) = nvs.set_blob(LOCKED_BOOTS_KEY, &next.to_be_bytes()) {
+    if let Err(e) = nvs.replace_blob(LOCKED_BOOTS_KEY, &next.to_be_bytes()) {
         log::warn!("locked-restart count not saved: {e}");
     }
     next
@@ -124,7 +131,7 @@ pub fn set_announce_operator(nvs: &mut EspNvs<NvsDefault>, on: bool) -> Result<(
     if on {
         nvs.remove(ANNOUNCE_OPERATOR_KEY).map(|_| ()).map_err(|_| ())
     } else {
-        nvs.set_blob(ANNOUNCE_OPERATOR_KEY, &[0]).map_err(|_| ())
+        nvs.replace_blob(ANNOUNCE_OPERATOR_KEY, &[0]).map_err(|_| ())
     }
 }
 

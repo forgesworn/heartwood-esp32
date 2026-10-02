@@ -149,6 +149,25 @@ fn save(nvs: &mut EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(), String> {
         .map_err(|_| "phone storage full or failing: nothing was changed".to_string())
 }
 
+/// Save after a revocation, and say truthfully what is on flash if that
+/// fails. On a partition with no room for a second copy the records are
+/// erased before the rewrite, so a failure can leave none at all.
+fn save_revoked(nvs: &mut EspNvs<NvsDefault>, phones: &PhoneSet, id: u32) -> Result<(), String> {
+    if save(nvs, phones).is_ok() {
+        return Ok(());
+    }
+    match load(nvs) {
+        Ok(stored) if stored.records().iter().any(|r| r.id == id) => Err(format!(
+            "phone storage failing: phone {id} is still enrolled on flash, try again"
+        )),
+        Ok(stored) if stored.is_empty() && !phones.is_empty() => Err(format!(
+            "phone storage full: phone {id} is revoked, but so are the other phones; re-enrol them"
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("phone storage failing after revoking phone {id}: {e}")),
+    }
+}
+
 fn configured_relays(nvs: &EspNvs<NvsDefault>) -> Vec<String> {
     crate::net_config_store::read_net_config(nvs)
         .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
@@ -174,13 +193,17 @@ pub fn run(cmd: PhoneCmd, nvs: &mut EspNvs<NvsDefault>) -> Result<serde_json::Va
         PhoneCmd::Revoke { id } => {
             let mut phones = load(nvs)?;
             phones.revoke(id).map_err(|_| format!("no phone with id {id}"))?;
-            save(nvs, &phones)?;
+            let saved = save_revoked(nvs, &phones, id);
+            // Whatever the outcome, the records on flash may have changed
+            // (a failed rewrite can leave none), so the relay loop re-reads.
             PHONES_CHANGED.store(true, Ordering::Release);
-            log::info!("phone unlock: revoked phone {id}");
             // No phone listens anywhere now; the next enrolment records afresh.
-            if phones.is_empty() && heartwood_common::phone_relays::forget_told(&mut NvsBlobs(nvs)).is_err() {
+            let none_left = matches!(load(nvs), Ok(stored) if stored.is_empty());
+            if none_left && heartwood_common::phone_relays::forget_told(&mut NvsBlobs(nvs)).is_err() {
                 log::warn!("phone unlock: relay record not cleared");
             }
+            saved?;
+            log::info!("phone unlock: revoked phone {id}");
             Ok(serde_json::json!({ "revoked": id }))
         }
         PhoneCmd::SetAnnounceOperator { on } => {
@@ -292,9 +315,24 @@ fn read_board(
 /// Whether an enrolment of `label` could go ahead now. Asked before a card
 /// goes up, so a board that cannot enrol never asks for a press.
 pub fn check_enrol(nvs: &mut EspNvs<NvsDefault>, masters: &[LoadedMaster], label: &str) -> Result<(), String> {
-    match phone_unlock::enrol_refusal(&read_board(nvs, masters, label)?.0) {
-        Some(refusal) => Err(refusal.message()),
+    let (facts, phones, _) = read_board(nvs, masters, label)?;
+    if let Some(refusal) = phone_unlock::enrol_refusal(&facts) {
+        return Err(refusal.message());
+    }
+    match phones {
+        Some(phones) => check_room_for_phone(nvs, &phones),
         None => Ok(()),
+    }
+}
+
+/// Leave room to rewrite the records (and the pairing tables) in place
+/// afterwards, so a later revocation is cut-safe.
+fn check_room_for_phone(nvs: &EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(), String> {
+    let grown = phones.encode().len() + data_key::MAX_RECORD_LEN;
+    if crate::nvs::growth_allowed(nvs, data_key::PHONES_KEY, grown) {
+        Ok(())
+    } else {
+        Err("not enough storage left to add a phone: remove an unused pairing, persona or avatar first".into())
     }
 }
 
@@ -321,6 +359,11 @@ pub fn complete_enrol(
     let (Some(mut phones), Some(mut dk)) = (phones, data_key_store::current()) else {
         return Err(EnrolRefusal::NoDataKey.message());
     };
+    // The card may have stood while storage filled.
+    if let Err(e) = check_room_for_phone(nvs, &phones) {
+        dk.iter_mut().for_each(|b| *b = 0);
+        return Err(e);
+    }
     let had_phones = !phones.is_empty();
     let enrolment = phone_unlock::enrol(
         &mut phones,

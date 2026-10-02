@@ -5,12 +5,12 @@
 //! refusal: forgetting a prior physical approval would reopen its nonce.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use heartwood_common::rendezvous_receipts::{RendezvousProvisionReceipts, MAX_RECEIPTS};
 
-const KEY_PREFIX: &str = "rzrec_";
 const MAX_BLOB_LEN: usize = 1 + MAX_RECEIPTS * (32 + 32 + 4 + 16 + 8);
 
-pub fn key(master_slot: u8) -> String { format!("{KEY_PREFIX}{master_slot}") }
+pub fn key(master_slot: u8) -> String { heartwood_common::rendezvous_receipts::nvs_key(master_slot) }
 
 pub fn load(nvs: &EspNvs<NvsDefault>, master_slot: u8) -> Result<RendezvousProvisionReceipts, &'static str> {
     let key = key(master_slot);
@@ -34,7 +34,7 @@ pub fn persist(nvs: &mut EspNvs<NvsDefault>, master_slot: u8, receipts: &Rendezv
     let key = key(master_slot);
     let encoded = receipts.encode();
     if encoded.len() > MAX_BLOB_LEN { return Err("rendezvous provision receipt storage exceeds bound"); }
-    nvs.set_blob(&key, &encoded).map_err(|_| "failed to persist rendezvous provision receipt")?;
+    nvs.replace_blob(&key, &encoded).map_err(|_| "failed to persist rendezvous provision receipt")?;
     let len = nvs.blob_len(&key).map_err(|_| "failed to verify rendezvous provision receipt")?.ok_or("rendezvous provision receipt missing after write")?;
     if len != encoded.len() { return Err("rendezvous provision receipt verification length mismatch"); }
     let mut verify = vec![0u8; core::cmp::max(len, 1)];

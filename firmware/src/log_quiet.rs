@@ -10,6 +10,7 @@
 //! stay visible in the USB log stream and the boot banner).
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 
 const KEY: &str = "log_quiet";
 
@@ -22,7 +23,7 @@ pub fn read(nvs: &EspNvs<NvsDefault>) -> bool {
 /// Persist the flag. The caller applies it separately so a failed write never
 /// leaves the running level and the stored level disagreeing silently.
 pub fn write(nvs: &mut EspNvs<NvsDefault>, quiet: bool) -> Result<(), String> {
-    nvs.set_blob(KEY, &[u8::from(quiet)])
+    nvs.replace_blob(KEY, &[u8::from(quiet)])
         .map_err(|e| format!("persist log_quiet: {e:?}"))
 }
 

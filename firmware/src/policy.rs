@@ -14,6 +14,7 @@ fn next_approval_epoch() -> Option<u32> {
 }
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{
     authorize_pubkey_on_unique_slot, clear_approved_identities, evaluate_slot_policy,
@@ -47,6 +48,78 @@ fn evict_avatar_cache(nvs: &mut EspNvs<NvsDefault>) -> usize {
         .count()
 }
 
+/// How a slot-table write is judged against the NVS budget.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotWrite {
+    /// A change someone asked for: growth is gated.
+    Change,
+    /// Authority removed: never gated.
+    Revoke,
+    /// Restoring or re-encoding what was already durable (rollback
+    /// compensation, boot-time migrations): never gated.
+    Repair,
+}
+
+/// What a restart finds after [`PolicyEngine::persist_revocation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevocationSave {
+    /// The narrower table is on flash.
+    Saved,
+    /// The old table is still on flash: the revocation holds until the next
+    /// restart only.
+    OnlyUntilRestart,
+    /// The table was erased to make room and could not be rewritten: the
+    /// revoked party is gone, and so is every other pairing of this master
+    /// unless a later save succeeds.
+    TableLost,
+    /// As `TableLost`, but the rewrite failed part-way, so the key is blocked
+    /// for this boot (`nvs::write_blocked`) and no later save can bring the
+    /// other pairings back: a restart finds none.
+    TableGone,
+    /// A write of the table failed part-way and may have damaged the stored
+    /// copy; it is not written again this boot. A restart finds either the
+    /// old table or none.
+    Uncertain,
+}
+
+/// Appended to every reply after a write that blocks the pairing table for
+/// the rest of the boot: until a restart this identity's pairings cannot
+/// change, and a failed change quarantines them.
+pub const RESTART_ADVICE: &str = "restart the device before making any other change";
+
+impl RevocationSave {
+    /// The outcome as a caller reports it: `Ok` only when it is on flash,
+    /// otherwise what a restart would find, in words. `what` names the change
+    /// ("pairing revocation").
+    pub fn describe(self, what: &str) -> Result<(), String> {
+        match self {
+            RevocationSave::Saved => Ok(()),
+            RevocationSave::OnlyUntilRestart => Err(format!(
+                "storage_unavailable: {what} holds until the next restart only; it could not be saved, try again"
+            )),
+            RevocationSave::TableLost => Err(format!(
+                "storage_full: {what} is saved, but this identity's other pairings could not be rewritten and are lost at the next restart unless a later change saves them"
+            )),
+            RevocationSave::TableGone => Err(format!(
+                "storage_full: {what} is saved, but every pairing of this identity is gone after a restart; {RESTART_ADVICE}, then re-pair or restore a backup"
+            )),
+            RevocationSave::Uncertain => Err(format!(
+                "storage_failed: {what} holds until the next restart; the pairing table could not be written and after a restart it is either as it was or gone; {RESTART_ADVICE}, then check and revoke again"
+            )),
+        }
+    }
+}
+
+/// Remove master `slot`'s pre-migration `master_N_conn` credential while its
+/// `connslots_N` table is present, since boot synthesises a default pairing
+/// from it whenever the table is absent, and a rewrite with no room erases
+/// the table first. True when the credential is proven gone.
+fn clear_legacy_connection(nvs: &mut EspNvs<NvsDefault>, slot: u8) -> bool {
+    let legacy = format!("master_{slot}_conn");
+    matches!(nvs.blob_len(&legacy), Ok(None))
+        || (nvs.remove(&legacy).is_ok() && matches!(nvs.blob_len(&legacy), Ok(None)))
+}
+
 /// Maximum concurrent client sessions.
 pub const MAX_SESSIONS: usize = 32;
 
@@ -70,6 +143,13 @@ pub struct SlotStateSnapshot {
     master_slot: u8,
     slots: Option<Vec<ConnectSlot>>,
     slots_dirty: bool,
+}
+
+impl SlotStateSnapshot {
+    /// The master this snapshot belongs to.
+    pub fn master_slot(&self) -> u8 {
+        self.master_slot
+    }
 }
 
 /// Per-client session state (rate limiting + active identity).
@@ -142,6 +222,9 @@ pub struct PolicyEngine {
     pub bridge_authenticated: bool,
     /// Dirty flag: slots changed since last NVS write.
     pub slots_dirty: bool,
+    /// A pairing was added since the last write: the one change the NVS
+    /// growth gate applies to (`persist_slots`).
+    slot_added: bool,
     approval_epoch: Option<u32>,
     quarantined_masters: Vec<u8>,
     /// Monotonic counter stamped onto sessions on every access — recency
@@ -159,6 +242,7 @@ impl PolicyEngine {
             sessions: Vec::new(),
             bridge_authenticated: false,
             slots_dirty: false,
+            slot_added: false,
             approval_epoch: next_approval_epoch(),
             quarantined_masters: Vec::new(),
             session_seq: 0,
@@ -540,6 +624,7 @@ impl PolicyEngine {
     /// Restore a request's slot state after its durable write failed.
     pub fn restore_slot_state(&mut self, snapshot: SlotStateSnapshot) {
         self.invalidate_approvals();
+        self.slot_added = false;
         match snapshot.slots {
             Some(slots) => match self
                 .master_slots
@@ -574,7 +659,7 @@ impl PolicyEngine {
         let prior_dirty = snapshot.slots_dirty;
         self.restore_slot_state(snapshot);
         self.slots_dirty = true;
-        let restored = self.persist_slots(nvs, master_slot);
+        let restored = self.persist_slots_as(nvs, master_slot, SlotWrite::Repair);
         self.slots_dirty = if restored { prior_dirty } else { true };
         if !restored { self.quarantine(master_slot); }
         restored
@@ -611,6 +696,7 @@ impl PolicyEngine {
         };
         self.slots_mut(master_slot).push(new_slot);
         self.slots_dirty = true;
+        self.slot_added = true;
         Some(slot_index)
     }
 
@@ -649,6 +735,7 @@ impl PolicyEngine {
             client_grants: Some(heartwood_common::client_grants::GrantSnapshot::empty()),
         });
         self.slots_dirty = true;
+        self.slot_added = true;
         Some(slot_index)
     }
 
@@ -790,7 +877,7 @@ impl PolicyEngine {
     /// (`heartwood_common::mgmt::revoke_client_identity`). Returns the parsed
     /// identity and whether the approved list changed, or `None` for no such
     /// slot. Live verdicts are dropped separately, by
-    /// [`Self::drop_withdrawn_verdicts`], once the change is durable.
+    /// [`Self::drop_withdrawn_verdicts`], before the change is saved.
     pub fn revoke_identity(
         &mut self,
         master_slot: u8,
@@ -928,11 +1015,56 @@ impl PolicyEngine {
     // -------------------------------------------------------------------------
 
     /// Persist all slots for a master slot to NVS if changed since last write.
-    /// Transaction recovery relies on ESP-IDF NVS's single-key atomicity: a
-    /// `connslots_N` blob is assumed to be wholly old or wholly new, never a
-    /// torn mixture. Exact immediate read-back proves which desired value is
-    /// present; callers compensate with their prior snapshot when it does not.
+    /// Transaction recovery relies on a single-key replace being wholly old or
+    /// wholly new after a cut, never torn and never absent (`nvs::ReplaceBlob`).
+    /// Exact immediate read-back proves which desired value is present;
+    /// callers compensate with their prior snapshot when it does not.
+    ///
+    /// A new pairing must leave room to rewrite the largest pairing table in
+    /// place afterwards (`nvs::growth_allowed`, headroom hygiene);
+    /// cached avatars are dropped first if that makes the room. Otherwise
+    /// nothing is written and this returns false, so the caller rolls back.
+    /// A table with no room for a second copy is erased before its rewrite
+    /// (`nvs::ReplaceBlob`), so a cut there leaves this master with no
+    /// pairings, as every rewrite did before this firmware.
     pub fn persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
+        self.persist_slots_as(nvs, master_slot, SlotWrite::Change)
+    }
+
+    /// Whether this master's pairing table is blocked until a restart after a
+    /// failed write (`nvs::write_blocked`). Replies about it should say so.
+    pub fn restart_needed(&self, master_slot: u8) -> bool {
+        crate::nvs::write_blocked(&format!("connslots_{master_slot}"))
+    }
+
+    /// Save a table that only lost authority (a revoked pairing, client key
+    /// or identity grant, or permissions narrowed). Never gated, and on
+    /// failure the prior table is NOT restored, in RAM or on flash: that
+    /// would re-authorise what was just revoked. RAM keeps the narrower table,
+    /// and the next change to this master writes it again (the dirty flag is
+    /// shared, so a save of another master does not; and not in this boot at
+    /// all after a write failed part-way, `nvs::write_blocked`). Live
+    /// approvals are withdrawn, as the old rollback did. The outcome says what
+    /// a restart would find.
+    pub fn persist_revocation(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> RevocationSave {
+        if self.persist_slots_as(nvs, master_slot, SlotWrite::Revoke) {
+            return RevocationSave::Saved;
+        }
+        // What the old rollback did to live approvals, without the rollback:
+        // no approve-once window outlives a revocation that did not save.
+        self.invalidate_approvals();
+        self.slots_dirty = true;
+        let key = format!("connslots_{master_slot}");
+        let blocked = crate::nvs::write_blocked(&key);
+        match nvs.blob_len(&key) {
+            Ok(None) if blocked => RevocationSave::TableGone,
+            Ok(None) => RevocationSave::TableLost,
+            _ if blocked => RevocationSave::Uncertain,
+            _ => RevocationSave::OnlyUntilRestart,
+        }
+    }
+
+    fn persist_slots_as(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8, mode: SlotWrite) -> bool {
         if !self.storage_ready(master_slot) { return false; }
         if !self.slots_dirty {
             return true;
@@ -955,20 +1087,46 @@ impl PolicyEngine {
                     false
                 }
                 Ok(json) => {
-                    let mut written = nvs.set_blob(&key, json.as_bytes());
-                    // Pairings outrank the avatar cache: if the write fails
-                    // (in practice, NVS full), drop the avatars and try once
-                    // more before refusing.
-                    if written.is_err() && evict_avatar_cache(nvs) > 0 {
-                        log::warn!(
-                            "Slot table for slot {master_slot} did not fit: dropped cached avatars, retrying"
+                    let stored_len = nvs.blob_len(&key);
+                    let growing = !matches!(stored_len, Ok(Some(len)) if json.len() <= len);
+                    let adding = core::mem::take(&mut self.slot_added);
+                    if mode == SlotWrite::Change
+                        && adding
+                        && growing
+                        && !crate::nvs::growth_allowed(nvs, &key, json.len())
+                        && (evict_avatar_cache(nvs) == 0 || !crate::nvs::growth_allowed(nvs, &key, json.len()))
+                    {
+                        log::error!(
+                            "Slot table for slot {master_slot} would leave too little room to rewrite it in place; not written"
                         );
-                        written = nvs.set_blob(&key, json.as_bytes());
+                        return false;
                     }
+                    // A present table may be erased before its rewrite, and
+                    // boot rebuilds a default pairing from a pre-migration
+                    // `master_N_conn` whenever the table is absent. So that
+                    // credential goes first; if it cannot, write in place only.
+                    let table_present = !matches!(stored_len, Ok(None));
+                    let may_erase = !table_present || clear_legacy_connection(nvs, master_slot);
+                    let write = |nvs: &mut EspNvs<NvsDefault>| {
+                        if may_erase {
+                            nvs.replace_blob(&key, json.as_bytes())
+                        } else {
+                            nvs.replace_blob_in_place(&key, json.as_bytes())
+                        }
+                    };
+                    // Pairings outrank the avatar cache: if the table has no
+                    // room beside what is stored, drop the avatars BEFORE
+                    // writing. Not after a failure: a table is several chunks,
+                    // and a failed multi-chunk write must not be repeated in
+                    // the same boot (`nvs::write_blocked`).
+                    if !crate::nvs::fits(nvs, json.len()) && evict_avatar_cache(nvs) > 0 {
+                        log::warn!("Slot table for slot {master_slot} short of room: dropped cached avatars");
+                    }
+                    let written = write(nvs);
                     if let Err(e) = written {
                         log::error!("Failed to persist slots for slot {master_slot}: {e:?}");
                     }
-                    // A success return from set_blob is not the authority
+                    // A success return from replace_blob is not the authority
                     // boundary. Read the exact bytes back before a caller may
                     // ACK a new client or signing grant.
                     match nvs.blob_len(&key) {
@@ -1040,7 +1198,7 @@ impl PolicyEngine {
     pub fn recover_pairings_for_backup_restore(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
         if self.storage_ready(master_slot) { return true; }
         let key = format!("connslots_{master_slot}");
-        let _ = nvs.set_blob(&key, b"[]");
+        let _ = nvs.replace_blob(&key, b"[]");
         let mut verify = [0u8; 2];
         let verified = matches!(nvs.blob_len(&key), Ok(Some(2)))
             && matches!(nvs.get_blob(&key, &mut verify), Ok(Some(bytes)) if bytes == b"[]");
@@ -1161,7 +1319,7 @@ impl PolicyEngine {
         let mut persist_failed = false;
         for master_slot in persist_migrations {
             engine.slots_dirty = true;
-            if !engine.persist_slots(nvs, master_slot) {
+            if !engine.persist_slots_as(nvs, master_slot, SlotWrite::Repair) {
                 // Migration is not active until its exact durable form verifies.
                 // Retain the old disk value for recovery but serve no volatile grants.
                 engine.quarantine(master_slot);

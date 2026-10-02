@@ -5,6 +5,7 @@
 //! authority boundary.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 
 use heartwood_common::mgmt;
 
@@ -43,7 +44,7 @@ fn random_challenge(source: EntropySource) -> [u8; 32] {
 }
 
 fn persist(nvs: &mut EspNvs<NvsDefault>, challenge: &[u8; 32]) -> Result<(), String> {
-    nvs.set_blob(MGMT_CHALLENGE_KEY, challenge)
+    nvs.replace_blob(MGMT_CHALLENGE_KEY, challenge)
         .map_err(|e| format!("persist management challenge: {e:?}"))?;
 
     let mut verify = [0u8; 32];
@@ -133,7 +134,7 @@ fn persist_operator(
 ) -> Result<(), String> {
     let key = mgmt::operator_challenge_nvs_key(operator);
     let record = mgmt::encode_operator_challenge_record(operator, challenge);
-    nvs.set_blob(&key, &record)
+    nvs.replace_blob(&key, &record)
         .map_err(|e| format!("persist scoped management challenge: {e:?}"))?;
 
     let mut verify = [0u8; mgmt::OPERATOR_CHALLENGE_RECORD_LEN];

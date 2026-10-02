@@ -2720,7 +2720,9 @@ fn locked_relay_phase(
                 FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
                     usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    crate::firmware_info_json(nvs).as_bytes(),
+                    // `Some(relays)`: the locked phase's own list, the same
+                    // one `relays_at_boot` compared against this boot.
+                    crate::firmware_info_json(nvs, Some(relays)).as_bytes(),
                 ),
                 FRAME_TYPE_PROVISION_LIST => {
                     // Safe while locked (npubs only, no secrets) and REQUIRED
@@ -3448,7 +3450,9 @@ fn poll_usb_frame(
         FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
             usb,
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-            crate::firmware_info_json(ctx.nvs).as_bytes(),
+            // `Some(&ctx.relays)`: the list this relay loop is actually
+            // running, not a fresh net-config read.
+            crate::firmware_info_json(ctx.nvs, Some(&ctx.relays)).as_bytes(),
         ),
 
         // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
@@ -6938,8 +6942,9 @@ fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
 /// `is_device_op` gates this exactly as the full reply does (`dispatch_mgmt`'s
 /// `get_status` arm): a per-identity delegate never sees the device-wide
 /// fields — `master_count`, `relay`, `crashed_during`, `at_rest`,
-/// `unlock_phone_count` and the rest — even under heap pressure. The fallback
-/// must never be a wider leak than the reply it stands in for.
+/// `unlock_phone_count`, `phone_relays` and the rest, even under heap
+/// pressure. The fallback must never be a wider leak than the reply it
+/// stands in for.
 fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op: bool) -> String {
     let master_hex = hex_encode(&ctx.masters[master_idx].pubkey);
     let result = if is_device_op {
@@ -6949,6 +6954,11 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op:
         // resolve`, which this and `dispatch_mgmt`'s full reply both call
         // instead of each repeating the composition.
         let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
+        // Plan G2's Sapwood follow-up: same idiom, same call site pattern as
+        // `at_rest`/`unlock_phone_count` above; see `pin::phone_relay_status`.
+        // `ctx.relays`, not a fresh net-config read: the list this relay loop
+        // is actually running, with no extra heap parse on this low-heap path.
+        let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
         serde_json::json!({
             "master_count": ctx.masters.len(),
             "master_npub_hex": master_hex,
@@ -6964,6 +6974,7 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op:
             "log_quiet": crate::log_quiet::read(ctx.nvs),
             "at_rest": at_rest.wire(),
             "unlock_phone_count": unlock_phone_count,
+            "phone_relays": phone_relays.wire(),
             "version": env!("CARGO_PKG_VERSION"),
             "board": crate::board::BOARD,
             "truncated": true,
@@ -9813,8 +9824,8 @@ fn dispatch_mgmt(
             // feature-detect and manage its own identity — never the
             // device-wide audit ring, relay topology, storage inventory, an
             // enumeration of the owner's other identities, or the at-rest
-            // mode and phone count below (device-wide properties, not this
-            // identity's). Built from
+            // mode, phone count and phone-relay-drift status below
+            // (device-wide properties, not this identity's). Built from
             // `heartwood_common::at_rest_status::DELEGATE_STATUS_KEYS`, not
             // just typed out to match it, for the same reason
             // `minimal_status_json`'s fallback is: a key added here without
@@ -9848,6 +9859,14 @@ fn dispatch_mgmt(
             // see `pin::at_rest_status` and `heartwood_common::
             // at_rest_status::resolve`. Never a phone id, label or hint.
             let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
+            // Plan G2's Sapwood follow-up: "phones not yet told", the third
+            // item on the follow-up list once #191 (relay update) and #192
+            // (at-rest state) both merged. Same call-site pattern as
+            // `at_rest`/`unlock_phone_count`; see `pin::phone_relay_status`.
+            // `ctx.relays`, not a fresh net-config read: the list this relay
+            // loop is actually running (same list `relays_at_boot` compared
+            // against), and no extra heap parse per poll.
+            let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
             Ok(serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,
@@ -9887,6 +9906,7 @@ fn dispatch_mgmt(
                 // this while locked (see its doc comment).
                 "at_rest": at_rest.wire(),
                 "unlock_phone_count": unlock_phone_count,
+                "phone_relays": phone_relays.wire(),
                 // Running firmware, so managers can show version state over
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),

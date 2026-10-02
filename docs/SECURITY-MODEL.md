@@ -154,7 +154,7 @@ it is not the device trust root:
 
 | Authority | May do remotely | May not do remotely |
 |-----------|-----------------|---------------------|
-| **Operator key** | List/create/update/revoke clients; install exact v2 method/kind policy; approve legacy signing; read redacted network state; stage/activate/commit/abort WiFi changes | Read/replace the seed; change the operator key or other trust roots; switch to USB-only mode; change the boot PIN; invoke OTA |
+| **Operator key** | List/create/update/revoke clients; install exact v2 method/kind policy; approve legacy signing; read redacted network state; stage/activate/commit/abort WiFi changes; list and revoke unlock phones; ask to add one (a press on the board's card) | Read/replace the seed; change the operator key or other trust roots; switch to USB-only mode; change the boot PIN; invoke OTA |
 | **Client slot** | Use only its NIP-46 methods and event kinds, under that slot's approval mode | Manage the device or widen its own policy |
 | **USB + physical approval** | Seed lifecycle, trust-root changes, PIN, USB-only mode, signed OTA | Nothing remotely merely because the operator key is present |
 
@@ -278,10 +278,17 @@ the policy they authorised, for as long as the operator key remains trusted.
 
 They **cannot** extract or replace the master seed, rotate the management trust
 root, disable the radio into USB-only mode, change the boot PIN, or push
-firmware. Recovery: revoke the rogue client and restore a known-good network
+firmware. They can list and revoke unlock phones, but adding one, which would
+be a persistent way to release the data key after a restart, still takes the
+owner's press on the board's card. The card leads with five words derived from
+the enrolment key, and the owner compares them with the phone that made that
+key, not with the browser: an attacker holding the operator key (or the
+browser itself) can swap in a key of their own, and could show matching words
+in the browser, but not on the owner's phone. Recovery: revoke the rogue client and restore a known-good network
 configuration; if the attacker has removed every route the owner knows, that
 recovery is necessarily over trusted USB. Rotating the operator key likewise
-requires a trusted USB re-flash (it is baked into the config partition).
+needs trusted USB and a physical hold on the signer (see *Local operator
+recovery* below); no re-flash is needed.
 
 Mitigations in place: the operator key lives in browser `localStorage` behind a
 strict **Content-Security-Policy** (`script-src 'self'`, no `eval`, no
@@ -339,6 +346,58 @@ NIP-44 ciphertext in transit. That is a transport guarantee only: flash and NVS
 encryption are disabled, so the active or staged WiFi password is stored as
 plaintext in NVS. Sapwood does not read it back or persist it; physical flash
 access can recover it.
+
+## Threat: lost or stolen unlock phone (**bounded; revoke from Sapwood**)
+
+An unlock phone holds one secret per board, its slot secret S. Cambium keeps S
+sealed under an Android Keystore key that is released only after the owner
+authenticates, for every single use: a strong biometric or the phone's own
+PIN, pattern or password. Enrolling a new biometric invalidates that key. The
+board never stores S; it stores the phone's record, the data key wrapped under
+a key derived from S (`common/src/data_key.rs`).
+
+What a thief holding the phone can do:
+
+- **Without the phone's lock-screen credential or biometric:** nothing. The
+  Keystore will not release S.
+- **With it (a forced fingerprint, an observed PIN):** answer the board's
+  unlock announcement after a restart and unlock it where it sits. That
+  releases the data key into the board's RAM, not to the phone; the seeds never
+  leave the board, and signing still goes through each client's policy and
+  presses. A phone holds no operator key, so it cannot manage clients, change
+  the network, add or revoke phones, or read anything back.
+
+The response is to revoke the phone's record from Sapwood
+(`revoke_unlock_phone {id}`). Only the device operator can, over the relay from
+any browser that holds the operator key or over USB, and it needs no press on
+the board, so it works from another country. Another unlock phone cannot
+revoke: phones unlock, they do not manage. Once the record is gone, S opens
+nothing and the board ignores that phone's unlock answers.
+
+Procedure:
+
+1. In Sapwood, open the board's unlock phones and revoke the lost phone's
+   record. Each record shows its label and id.
+2. If the board is locked (after a restart), it listens only for unlock
+   messages, so a revoke cannot reach it yet. Unlock it first with the vault
+   key or PIN, then revoke. If the stolen phone unlocks it first, the result
+   is the same unlocked board; revoke as soon as it answers.
+3. If the board is switched off or offline, the revoke waits until it is back.
+   Leaving it off does not shut the phone out: the phone can unlock it after
+   the next power-up.
+4. If the stolen phone also held Sapwood's operator key, the thief can manage
+   the board (see *compromised operator key* above). Revoke the phone and any
+   clients you did not create, then replace the operator over USB with a hold
+   on the board (Sapwood's operator panel). A thief with the operator key
+   still cannot add a phone of their own without a press on the board.
+
+Residual: revoking deletes the record but does not wipe it. Someone who has S
+(which means breaking the phone's Keystore) **and** a later dump of the board's
+flash may still recover the data key from the leftover record, and with it the
+seeds. Re-keying would not help: the old sealed seeds are left behind the same
+way, and S still opens them through the old record. See *Leftover bytes in
+NVS* below. If phone and board are both lost, treat the identities on the board
+as exposed.
 
 ## Threat: malicious firmware (OTA or the web flasher) — **signed USB OTA; flasher is trust-on-first-use**
 
@@ -493,6 +552,33 @@ changes hands:
   always reports `0` (a leftover `dk_ph` from removing the last identity, or
   from disabling encryption on older firmware, is moot once there is no data
   key left for it to wrap).
+- The same two replies also carry `phone_relays` (`current`/`pending`/
+  `unknown`), so a manager can show "phones not yet told" once a relay change
+  leaves an enrolled phone stranded on relays this board has since left (see
+  the relay-change record below). `current`: no phones enrolled, no live
+  relay configured, or the recorded relay list matches what is in use. This
+  includes once an old relay has accepted an update for the change still
+  mid-update: an old relay has accepted an update, not proof every phone
+  heard it, and later rounds still run regardless. `pending`: a live relay
+  the phones were never told about, and no old relay has yet accepted a
+  delivery for this change. If every old relay is dead or refuses the
+  kind-24135 delivery, `pending` can persist indefinitely; the only way out
+  is revoking and re-enrolling the phones. `unknown`: the record exists, or
+  the enrolled-phone count could not be read, but this firmware cannot make
+  sense of it, distinct from no record at all and genuinely zero phones,
+  both of which are `current` (nothing is yet known to be wrong). Resolved by
+  `heartwood_common::phone_relays::relay_status`, host-tested for every
+  state, behind a pure firmware read (`pin::phone_relay_status`) that never
+  writes (same idiom as `at_rest_status` above, for the same reason: the
+  low-heap `get_status` fallback runs behind a shared reference it can never
+  promote to a mutable one). Compares against the relay list the relay loop is
+  actually running (not a fresh net-config read), the same list
+  `relays_at_boot`/`record_round` compare against; a `reached` acceptance
+  only counts when it belongs to that same relay change: a stale acceptance
+  from an earlier, superseded change is never trusted. Device-only, like
+  `at_rest` and `unlock_phone_count`: excluded from both delegate reply
+  shapes by the same `DELEGATE_STATUS_KEYS`/`DELEGATE_STATUS_FALLBACK_KEYS`
+  mechanism, host-tested.
 - The wrapped data key (`dk_sec`) does not itself record which secret wrapped
   it — same shape for a PIN and a vault key — so telling `pin` from `vault`
   needed a marker (`common/src/data_key.rs`: kind byte + the first 8 bytes of
@@ -805,6 +891,177 @@ pass covers every identity's entries. `FIRMWARE_INFO` reports the last pass
 this boot as `nvs_scrub` in the same shape (it answers any USB host, which
 could read the flash anyway). `CONNSLOT_REVOKE` still answers `ok`. Counts
 only: nothing names a key, a phone or an identity.
+
+### Adding an unlock phone
+
+An enrolled phone holds a slot secret that, with the board's flash, releases
+the data key after any restart, so adding one adds a persistent unlocker. It
+is always a press on the board, whichever way the request arrives:
+
+- **Cable:** `PHONE_UNLOCK_CMD` (0x64) `{"op":"enrol"}`, bridge-authenticated,
+  with a blocking card (45 s, like the relay's).
+- **Relay:** `enrol_unlock_phone` on the kind-24134 management channel. Device
+  operator only: a per-identity delegate is refused before anything else is
+  looked at, and a NIP-46 client has no route to management at all. The
+  request spends the durable one-time mutation challenge before the card goes
+  up, so a replay (live, or after a restart) raises no card. The card is held
+  on the deferred-approval queue (#64): 45 s on screen (every other card
+  has 30 s; the words need time to be read and compared), at most 90 s
+  waiting behind other cards, one enrolment at a time, RAM only. The relay
+  card does not block the relay loop. The cable card does, for up to about
+  55 s with its wait for the approving button to come up, which passes the
+  loop's 50 s silence limit, so a cable frame that holds the loop credits
+  every relay session's silence clock (`silence_from`) without pretending
+  anything was heard: the liveness judged at a relay enrolment's press is
+  still what was really heard.
+- **What the owner checks:** both cards lead with the request code, five
+  words of spoken-token's 2048-word list from the phone's one-off enrolment
+  key P (`deriveToken(P, 'heartwood-unlock:enrol-request', 0, {format:
+  'words', count: 5})`, 55 bits), and the owner holds only if the PHONE, which
+  made P, shows the same five words (Cambium support pending). A browser may
+  show them too, but only as a convenience: whoever relays the request can
+  replace P, and the words in the browser with it. So that the comparison is
+  actually made, the card shows the words large enough to read at arm's
+  length on the 128x64 OLED: two a page with their place numbers and a
+  "1-2 of 5" marker, stepping every 4 s on its own (bench, 2026-09-25: the
+  old card's five words, two to a line in 6 px letters, could only be read
+  from a photograph, by which time the card had gone). Paging brings its own
+  risk, an owner holding after page 1 having seen two words, 22 bits, which a
+  compromised browser grinds in moments. So neither card can be approved
+  until every page has actually been on screen for its full 4 s dwell and
+  12 s have passed: the pages turn on what the firmware drew, not on the
+  clock, so a loop held up by a stalling relay (a redial, a rejoin) cannot
+  let the gate open with words 3 to 5 never shown; the page on screen simply
+  stays up longer. Time under another screen does not count either: every
+  panel flush moves a draw counter on, and when the card finds it has been
+  drawn over (a signing confirmation, an OTA chunk) it draws itself again at
+  once and the page starts its dwell afresh, so a stream of overdraws only
+  makes the card expire. What the counter cannot see is the panel itself:
+  the dwell assumes the glass shows what was last flushed. Until then the hint reads "compare all 5 words" and no hold that
+  STARTS then ever counts, however long it runs; a short press does
+  nothing, so it cannot decline and spend the phone's code (B/NO on a
+  T-Display still cancels). The cable and relay cards share the rule
+  (`phone_unlock::EnrolGate`, host-tested). A card whose pages could not all
+  be shown in its 45 s expires and adds nothing; the window is not extended,
+  since expiry is the safe failure and the owner starts again.
+- **One button, one decision:** in WiFi mode, while a relay card (or a result
+  younger than 20 s) is up, every cable frame that may raise a card of its
+  own is refused "approval on screen" (`phone_unlock::cable_frame_claim`,
+  checked by ui-preview against every cable arm that can reach the button).
+  Otherwise a compromised host could send one while the owner hesitates over
+  a relay enrolment, and the hold that answers the cable card, latched by
+  the button sampler with its full length, would then read as the relay
+  card's approval. As a second line, a cable frame that held the loop 2 s or
+  more disarms the front relay card and clears the latched press, and every
+  card, relay or cable (the enrol card after its gate too), arms only once
+  the button has been seen up with it on screen.
+- **Recovery is never locked out:** anyone can keep a relay card up (a
+  RECEIVE card returns for every wrap published to the board), so the
+  owner's recovery commands over the cable, `PATCH_NET_CONFIG`,
+  `OTA_BEGIN`, `FACTORY_RESET`, and `SET_NET_CONFIG` while it keeps the
+  stored operator, take the screen over instead of being refused. Only a
+  frame that will actually raise its card does so: the takeover runs
+  straight before the card, after the handler's own checks (the config
+  parses and validates, the patch's revision is current, the image's
+  release signature verifies and it fits a spare slot), so a garbage or
+  refused frame, however often a host sends one, cancels nothing. Every
+  relay card is then answered Expired (with the reply an expiry always
+  sends) and the latched press is cleared; a held result stays, and is
+  drawn again after the recovery card, so a "revoke id N" is not lost to
+  one. The cable card arms only after the button has been seen up, so a
+  hold begun for a relay card cannot answer it. What remains: the checks
+  stop garbage, not a host. Any USB host, with no bridge secret, can pass
+  them with all four frames: `FACTORY_RESET` (checks nothing), an
+  `OTA_BEGIN` carrying any published release's signature, and, since
+  `GET_NET_CONFIG` answers any USB host in WiFi mode with the revision and
+  `op_mgmt`, a `PATCH_NET_CONFIG` restating the config at the current
+  `base_revision` and a `SET_NET_CONFIG` that copies `op_mgmt`. Each
+  expires every relay card and raises a card the owner must deny or let
+  run out; a hostile charger or hub re-sending one every 45 s blocks relay
+  approvals for as long as it is plugged in. That is within the model: USB
+  is physical access, the same access that can already factory-reset the
+  board, and unplugging it ends it. It cannot approve anything. A
+  `SET_NET_CONFIG` whose `op_mgmt` differs from the stored one hands relay
+  management to another key (or to none), which is no recovery: it is an
+  ordinary card, refused under a relay card, and its card says so in every
+  mode ("Replace operator?" with the new key's first 8 hex digits, as the
+  `SET_OPERATOR` card says it, "New operator?" where there was none, or
+  "Remove operator?", where a plain network change reads "Set network
+  config?"). With no relay card up, one whose `op_mgmt` is not empty and
+  not a 64 hex digit x-only public key is refused "invalid config" before
+  any card; under a relay card it reads as a removal and is refused
+  "approval on screen". The other card-raising frames
+  (identity, PIN, vault, operator, slots, backups, NIP-46) stay refused:
+  none is needed to get a board back. And a relay card no longer outlives
+  a WiFi outage: the loop's WiFi-down waits tick it with no session, so it
+  still expires on time. An approval made then waits in the #82 outbox for
+  only 60 s (`held_reply::HELD_REPLY_TTL_SECS`) and is dropped if no
+  session takes it by then; a dependant persona's action is not done at
+  all with no session (its C5 audit rail must leave down a live socket),
+  and the card says "Offline / Nothing was done" rather than APPROVED. A
+  card whose window has passed never keeps the cable refused.
+- **The real bound:** a compromised browser holds P from the moment the owner
+  pastes the phone's code, before it sends anything, so it can grind a key of
+  its own whose five words match for as long as the owner is willing to wait
+  for a card. Each try is a key generation and an HMAC: 55 bits is about
+  3.6e16 tries, weeks on one GPU and hours on a large rented rack, against an
+  owner who waits minutes. (Four words, 44 bits, was about half an hour on one
+  GPU.) A table built in advance does not help, since P is fresh each time.
+  The label is printable ASCII only, quoted, and drawn on a line of its own
+  (`ADD "<label>"?`), never beside a word; every line of the card keeps clear
+  of the button tags.
+- **What the check code does, and does not do:** after the press the board
+  shows PHONE ADDED with the check code (from its one-off hand-off key E) and
+  "else revoke N", until a press (at most 5 minutes). For its first 20 s it
+  holds the screen: a relay card waits behind it, and in WiFi mode a cable
+  command that would put up its own card is refused "approval on screen"
+  (refused, not queued; the host retries). The USB-bridged loop refuses
+  nothing: its host waits on every frame, and the result is drawn again
+  after each. After that a queued relay card takes over and
+  the result is gone, while a cable command runs over the top of it and the
+  result is drawn again afterwards. The phone and Sapwood show the same
+  code. It confirms
+  delivery and catches mix-ups (a stale or crossed hand-off, a phone that
+  never received one); it does NOT prove the board sent the hand-off the
+  phone holds. The hand-off is sealed from an unauthenticated one-off key, so
+  whoever has already swapped P for a key of their own can grind 24 bits for
+  an E' whose check code matches. The five words are the only defence
+  against a swap. "Else revoke N" stays: a phone that never shows the check
+  code never got its hand-off, and record N is revoked.
+- **Parked follow-up (not built): an authenticated hand-off.** The board
+  would sign (E, P) with its paired identity, so the phone could verify the
+  hand-off came from the board it paired with, and a swap after the words
+  would be caught on the phone too.
+- **Only while unlocked:** a locked board serves no management at all, and
+  the board is checked again at the press (the operator is still the device
+  operator, a configured relay has been heard from within the ping interval
+  plus 10 s, a data key, relays, fewer than 16 phones), and the record is
+  written only
+  once the answer carrying the hand-off is known to fit the heap. Nothing is
+  written before the press, so a card that is declined, expires or is lost to
+  a restart leaves no record; the phone's enrolment key is spent either way
+  and the phone starts again.
+- **Nothing new on the wire:** the request and answer are the existing
+  operator ⇄ identity 24134 exchange (NIP-44, the label and P only inside
+  it); the hand-off Sapwood passes to the phone is byte-for-byte the cable's.
+  Residual: a relay that sees both the operator's traffic and the phone's
+  one-off rendezvous subscription can link that enrolment to the phone's IP
+  address at that moment, which is weaker than the stable link Cambium's own
+  NIP-46 pairing already makes.
+- **Rollout:** this firmware must ship only together with the Cambium
+  release that shows the five words (and keeps its labels to printable ASCII,
+  which the board now requires on the cable too) and the Sapwood release that
+  tells the owner to compare the board with the phone. Shipped alone, owners
+  have nothing trustworthy to compare the card with.
+- **Residual: a lost answer.** The record is written before the answer is
+  published (a phone is never handed a secret the board did not keep). The
+  answer is offered to every configured relay session; if none that counted
+  as live at the press (heard from within the ping interval plus 10 s) takes
+  it, the board says "Not sent / revoke id N" instead of PHONE ADDED and logs
+  the id.
+  Such a record's secret left nowhere: it unlocks nothing and is removed with
+  a revoke. A relay can still accept the answer and lose it, which only the
+  phone never receiving a hand-off shows.
 
 ## What the design already gets right
 

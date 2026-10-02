@@ -458,7 +458,7 @@ fn walk_recovery_phrase(
 
         // Confirm with the same 0–100% hold bar used for signing: a full hold
         // saves, a short tap restarts the review.
-        if confirm_recovery_save(display, buttons) {
+        if confirm_recovery_save(display, buttons, total) {
             oled::show_result(display, "SAVED");
             return;
         }
@@ -488,8 +488,9 @@ fn word_role_caption(index: usize, total: usize) -> &'static str {
 fn confirm_recovery_save(
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
+    total: usize,
 ) -> bool {
-    oled::show_recovery_done(display);
+    oled::show_recovery_done(display, total);
     hold_to_confirm(display, buttons)
 }
 
@@ -873,7 +874,7 @@ enum ReviewOutcome {
     Cancel,
 }
 
-/// Page through the 12 entered words (plus SAVE / CANCEL items) and act on one.
+/// Page through the entered words (plus SAVE / CANCEL items) and act on one.
 /// Two-button boards move with A and act with B; one-button boards tap to move,
 /// hold to move back, and double-tap to act. Acting on a word re-enters that one
 /// slot in place. `invalid` shows a banner when the phrase last failed its
@@ -1007,9 +1008,12 @@ pub fn handle_remove(
         return false;
     };
     let npub = encode_npub(&master.pubkey);
-    let detail = format!("slot {slot} {}…", &npub[..12]);
+    // A titled card, never show_sign_request: that renderer drops its preview
+    // and reads "HOLD TO SIGN", so the npub this comment promises was never
+    // drawn and the hold looked like a signature.
+    let detail = format!("ERASE slot {slot}\n{}...", &npub[..16]);
     let approval = crate::approval::run_approval_loop(display, buttons, 30, |d, remaining| {
-        oled::show_sign_request(d, "REMOVE IDENTITY", 0, &detail, remaining);
+        oled::show_titled_approval(d, "REMOVE IDENTITY", &detail, remaining, 30);
     });
     if !matches!(approval, crate::approval::ApprovalResult::Approved) {
         log::info!("PROVISION_REMOVE slot {slot} denied or timed out on device");
@@ -1106,7 +1110,10 @@ pub fn handle_factory_reset(
         buttons,
         30,
         |d, remaining| {
-            crate::oled::show_sign_request(d, "FACTORY", 0, "ERASE ALL DATA?", remaining);
+            // Never show_sign_request: it drops its preview, so this card read
+            // "HOLD TO SIGN / Factory / Profile / kind 0" and never said ERASE
+            // (the 2026-08-19 wipe card in main.rs made the same mistake).
+            crate::oled::show_titled_approval(d, "FACTORY RESET", "ERASE ALL KEYS\nnotes and pairings too", remaining, 30);
         },
     );
 

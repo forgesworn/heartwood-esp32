@@ -123,6 +123,9 @@ ALLOW_PATHS = (
     "common/src/nip44.rs",
     "common/src/nip46.rs",
     "common/src/derive.rs",
+    # Signet vault derivation parity: keys derived from a fixed [1u8; 32] root,
+    # mirroring nsec-tree's public signet-vault-v1.json fixture.
+    "common/tests/vault_vectors.rs",
     "provision/src/main.rs",
     "sign-test/src/main.rs",
     "docs/plans/",

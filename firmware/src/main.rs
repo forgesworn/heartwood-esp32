@@ -62,6 +62,7 @@ mod notes;
 mod personas;
 mod nvs;
 mod nvs_stats;
+mod nvs_scrub;
 #[cfg(not(feature = "heltec-v3"))]
 mod offline_qr;
 mod cat_sprites;
@@ -210,6 +211,11 @@ pub fn firmware_info_json(
         })
         .unwrap_or_default();
     let (at_rest, unlock_phones) = pin::at_rest_status(nvs);
+    // The last NVS scrub this boot (boot always runs one): entries zeroed,
+    // pages skipped, and whether it was complete. Omitted if none has run.
+    let scrub = nvs_scrub::last()
+        .map(|r| format!(",\"nvs_scrub\":{}", r.to_json()))
+        .unwrap_or_default();
     let fallback_relays;
     let current_relays: &[String] = match running_relays {
         Some(r) => r,
@@ -224,7 +230,7 @@ pub fn firmware_info_json(
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
          \"free_heap\":{},\"largest_block\":{},\"display_flip\":{},\
-         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}}}",
+         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -241,6 +247,7 @@ pub fn firmware_info_json(
         phone_relays.wire(),
         crash,
         nvs_stats,
+        scrub,
     )
 }
 
@@ -620,6 +627,14 @@ fn main() {
             cfg.relays.len()
         );
     }
+
+    // --- Zero what NVS deleted but kept (nvs_scrub.rs) ---
+    // After every boot-time write above (journal recovery, the flash-config
+    // seed, the network trial), before any unlock and before WiFi exists, so
+    // nothing else writes NVS while it runs. Needs no key: a locked board
+    // runs it too. Clears residue left by earlier firmware, and finishes any
+    // pass a power cut interrupted.
+    nvs_scrub::run("boot");
 
     // If no masters are provisioned, wait for a provision frame before continuing.
     if loaded_masters.is_empty() {

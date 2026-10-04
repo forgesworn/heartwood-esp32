@@ -5235,6 +5235,20 @@ fn queue_button_ask(
         kind_key.push('@');
         kind_key.extend(heartwood_common::policy::identity_tag(identity).iter().map(|&b| b as char));
     }
+    // A login challenge never shares a card: its card shows one code, so one
+    // hold must never also sign a second challenge. The key is unique per ask
+    // and owes nothing to the client, which picks its own request ids.
+    if ask
+        .event
+        .as_ref()
+        .is_some_and(|event| heartwood_common::policy::is_login_challenge(event.kind, &event.tags))
+    {
+        // 32-bit: none of the boards has 64-bit atomics. Wrapping is harmless, as
+        // a key only has to differ from the cards alive beside it.
+        static LOGIN_ASK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = LOGIN_ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        kind_key = heartwood_common::approval_queue::login_kind_key(&kind_key, seq);
+    }
     // A HOLD TO SIGN ask and an ALLOW AS ask (or any two card kinds) are
     // different decisions and never share one hold.
     kind_key.push_str(heartwood_common::policy::card_batch_marker(ask.resume.shown.card));
@@ -5376,7 +5390,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
 
     let batch = ctx.button_cards[0].asks.len();
     enum Draw {
-        Sign(String, u64, Option<String>, Option<String>),
+        Sign(String, u64, Option<String>, Option<String>, Option<String>),
         Extension(String, String, String),
         Titled(&'static str, String),
         Batch(String, String),
@@ -5385,7 +5399,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // The enrol card's page and whether a hold counts yet (its hint).
     let (card_page, card_armed) = view.unwrap_or((0, true));
     let card = match &ctx.button_cards[0].asks[0].ask.card {
-        crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading } => {
+        crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading, login_code } => {
             // The count belongs on screen: one hold answers all of them, and
             // the operator must never be shown "sign this" for a batch.
             let label = if batch > 1 {
@@ -5393,7 +5407,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             } else {
                 requester.clone()
             };
-            Draw::Sign(label, *kind, identity.clone(), heading.clone())
+            Draw::Sign(label, *kind, identity.clone(), heading.clone(), login_code.clone())
         }
         crate::nip46_handler::AskCard::Extension {
             heading,
@@ -5426,7 +5440,11 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // was handed to the glass, never whether the glass had room for it.
     if first_draw {
         let (head, body) = match &card {
-            Draw::Sign(label, kind, identity, heading) => (
+            Draw::Sign(label, _, _, heading, Some(code)) => (
+                heading.clone().unwrap_or_else(|| "LOG IN".to_string()),
+                format!("{} / {code}", crate::oled::display_app_label(label)),
+            ),
+            Draw::Sign(label, kind, identity, heading, None) => (
                 heading.clone().unwrap_or_else(|| "HOLD TO SIGN".to_string()),
                 format!(
                     "{} / {} / kind {kind} / {}",
@@ -5446,12 +5464,13 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }
     match card {
-        Draw::Sign(label, kind, identity, heading) => crate::oled::show_sign_request_as(
+        Draw::Sign(label, kind, identity, heading, login_code) => crate::oled::show_sign_request_as(
             ctx.display,
             &label,
             kind,
             identity.as_deref(),
             heading.as_deref(),
+            login_code.as_deref(),
             remaining,
         ),
         Draw::Extension(heading, method, preview) => crate::oled::show_master_sign_request(
@@ -7236,7 +7255,11 @@ fn handle_nip46_event(
     // The same gate dispatch will apply, planned from the same facts, so
     // escalation, petitions, rollback and the notice's identity see the
     // identity and list-identities cards and not only the method policy.
-    let base_tier = ctx.policy_engine.check(slot, &ev.pubkey, &method_enum, event_kind);
+    let login_challenge = matches!(method_enum, nip46::Nip46Method::SignEvent)
+        && nip46::unsigned_event_is_login_challenge(&request.params);
+    let base_tier = ctx
+        .policy_engine
+        .check_for_event(slot, &ev.pubkey, &method_enum, event_kind, login_challenge);
     let active_context = if request.heartwood.is_none() {
         crate::nip46_handler::resolve_active_context(
             ctx.policy_engine,
@@ -7286,7 +7309,9 @@ fn handle_nip46_event(
     let route = heartwood_common::escalate::route_request(
         tier,
         method_enum.pinned_physical(),
-        method_enum.device_press_only(),
+        // A login challenge must be answered at the device, with its code on
+        // screen; no guardian verdict may complete it.
+        heartwood_common::escalate::device_only_request(method_enum.device_press_only(), login_challenge),
         escalate_slot,
     );
     if matches!(route, heartwood_common::escalate::Route::Refuse) {

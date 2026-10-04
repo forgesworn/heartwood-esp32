@@ -231,22 +231,32 @@ fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     _method: &str,
     kind: u64,
     _content: &str,
+    login_code: Option<&str>,
+    heading: Option<&str>,
     secs: u32,
     total: u32,
 ) {
     let l = layout_of(d);
-    header(d, &l, "HOLD TO SIGN");
+    let default_heading = if login_code.is_some() { "LOG IN" } else { "HOLD TO SIGN" };
+    header(d, &l, heading.unwrap_or(default_heading));
 
     let body = style(l.font_body(), FG);
     let small = style(l.font_small(), FG);
     let app = ellipsize_chars(&display_app_label(label), l.chars_per_line(l.font_body()));
     Text::new(&app, Point::new(l.sx(2), l.sy(25)), body).draw(d).ok();
 
-    let kind_label = ellipsize_chars(kind_name(kind), l.chars_per_line(l.font_small()));
-    Text::new(&kind_label, Point::new(l.sx(2), l.sy(39)), small).draw(d).ok();
+    if let Some(code) = login_code {
+        // The login code replaces the kind lines (mirrors oled.rs).
+        let scale = l.word_scale();
+        let width = bigtext::scaled_text_width(code, l.font_large(), scale);
+        bigtext::draw_text_scaled(d, code, Point::new(l.center_x(width), l.sy(46)), l.font_large(), scale, FG);
+    } else {
+        let kind_label = ellipsize_chars(kind_name(kind), l.chars_per_line(l.font_small()));
+        Text::new(&kind_label, Point::new(l.sx(2), l.sy(39)), small).draw(d).ok();
 
-    let kind_number = ellipsize_chars(&format!("kind {kind}"), l.chars_per_line(l.font_small()));
-    Text::new(&kind_number, Point::new(l.sx(2), l.sy(48)), small).draw(d).ok();
+        let kind_number = ellipsize_chars(&format!("kind {kind}"), l.chars_per_line(l.font_small()));
+        Text::new(&kind_number, Point::new(l.sx(2), l.sy(48)), small).draw(d).ok();
+    }
 
     draw_countdown(d, &l, secs, total);
 }
@@ -785,10 +795,20 @@ fn main() {
         render(&format!("idle-named-{b}"), w, h, |d| draw_idle(d, Some("TheCryptoDonkey"), npub));
         render(&format!("notes-{b}"), w, h, |d| draw_notes(d, 6, 2, 1));
         render(&format!("sign-{b}"), w, h, |d| {
-            draw_sign(d, "primal", "sign_event", 30078, "Sync app settings", 18, 30)
+            draw_sign(d, "primal", "sign_event", 30078, "Sync app settings", None, None, 18, 30)
+        });
+        render(&format!("login-{b}"), w, h, |d| {
+            draw_sign(d, "default", "sign_event", 22242, "Log in to my-node", Some("4821"), None, 18, 30)
+        });
+        render(&format!("login-allow-as-{b}"), w, h, |d| {
+            let heading = heartwood_common::encoding::card_heading("LOG IN AS", "natural-person");
+            draw_sign(d, "default", "sign_event", 22242, "Log in to my-node", Some("4821"), Some(&heading), 18, 30)
+        });
+        render(&format!("login-longest-{b}"), w, h, |d| {
+            draw_sign(d, "WWWWWWWWWWWWWWWWWWWW", "sign_event", 22242, "Log in to my-node", Some("88888888"), None, 18, 30)
         });
         render(&format!("sign-urgent-{b}"), w, h, |d| {
-            draw_sign(d, "primal", "sign_event", 30078, "Sync app settings", 4, 30)
+            draw_sign(d, "primal", "sign_event", 30078, "Sync app settings", None, None, 4, 30)
         });
         render(&format!("confirm-{b}"), w, h, |d| draw_confirm(d, 60));
         render(&format!("approved-{b}"), w, h, |d| draw_result(d, "APPROVED", OK));
@@ -1435,6 +1455,49 @@ mod enrol_card_tests {
         assert_eq!(Layout::ENROL_MARKER_CHARS as usize, phone_unlock::ENROL_MARKER_MAX_CHARS);
         let longest = (0..phone_unlock::ENROL_PAGES).map(|p| phone_unlock::enrol_page_marker(p).len()).max();
         assert_eq!(longest, Some(phone_unlock::ENROL_MARKER_MAX_CHARS));
+    }
+
+    /// The login code, at its longest (8 digits), sits clear of the
+    /// requester line above and the countdown bar below, inside the panel, on
+    /// every board. Rows are baselines: the body font's ink ends at its
+    /// baseline, the code's ink spans `font.baseline` rows above its own.
+    #[test]
+    fn login_code_fits_between_requester_and_countdown_on_every_panel() {
+        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+            let l = Layout::new(w, h);
+            let scale = l.word_scale();
+            let font = l.font_large();
+            let width = bigtext::scaled_text_width("88888888", font, scale);
+            let x = l.center_x(width);
+            assert!(x >= 0 && x + width <= l.w, "{w}x{h}: code width {width}");
+            let baseline = l.sy(46);
+            let top = baseline - font.baseline as i32 * scale;
+            let bottom = baseline + (font.character_size.height as i32 - font.baseline as i32 - 1) * scale;
+            assert!(top > l.sy(25) + 1, "{w}x{h}: code ink starts at {top}, requester ends {}", l.sy(25));
+            assert!(bottom < l.sy(52), "{w}x{h}: code ink ends at {bottom}, bar starts {}", l.sy(52));
+        }
+    }
+
+    /// The heading of a login that also grants an identity says LOG IN and
+    /// fits the header on every panel, with the code still on the card.
+    #[test]
+    fn the_login_allow_as_heading_fits_every_panel() {
+        let heading = heartwood_common::encoding::card_heading("LOG IN AS", "?abcdefgh-long-label");
+        assert!(heading.starts_with("LOG IN AS "), "{heading}");
+        assert!(heading.chars().count() <= heartwood_common::encoding::HEADING_CHARS, "{heading}");
+        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+            let l = Layout::new(w, h);
+            let width = heading.chars().count() as i32 * Layout::glyph_w(l.font_header());
+            // Never wider than the longest heading these cards already carry
+            // (REMEMBER AS <id>?), which is what the panel is sized against;
+            // the narrow portrait panel clips that one too.
+            let existing = heartwood_common::encoding::card_heading("REMEMBER AS", "?abcdefgh-long-label");
+            let existing_width = existing.chars().count() as i32 * Layout::glyph_w(l.font_header());
+            assert!(width <= existing_width, "{w}x{h}: {width} > {existing_width}");
+            if l.sx(2) + existing_width <= l.w {
+                assert!(l.sx(2) + width <= l.w, "{w}x{h}: heading is {width} wide");
+            }
+        }
     }
 
     /// PHONE ADDED fits its longest id on the narrowest panel.

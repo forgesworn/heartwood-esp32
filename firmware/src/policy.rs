@@ -16,7 +16,7 @@ fn next_approval_epoch() -> Option<u32> {
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::policy::{
-    authorize_pubkey_on_unique_slot, clear_approved_identities, evaluate_slot_policy,
+    authorize_pubkey_on_unique_slot, clear_approved_identities, evaluate_slot_policy_for_event,
     find_slot_by_pubkey,
     find_slot_by_pubkey_mut, find_slot_by_secret, gate_request, grant_slot_method,
     grant_slot_signing, next_slot_index, record_client_identity, remove_ambiguous_pubkeys,
@@ -240,13 +240,30 @@ impl PolicyEngine {
         })
     }
 
-    /// Determine the approval tier for a request.
+    /// Test-only: the tier for a request that is not a login challenge.
+    /// Production callers hold the event and use [`Self::check_for_event`].
+    #[cfg(test)]
     pub fn check(
         &self,
         master_slot: u8,
         client_pubkey: &str,
         method: &Nip46Method,
         event_kind: Option<u64>,
+    ) -> ApprovalTier {
+        self.check_for_event(master_slot, client_pubkey, method, event_kind, false)
+    }
+
+    /// Determine the approval tier for a request. `login_challenge` is
+    /// `heartwood_common::policy::is_login_challenge` of the event being
+    /// signed (kind 22242 with a `code` tag): such a request is never lifted
+    /// above a button press, by slot policy or by a guardian's window.
+    pub fn check_for_event(
+        &self,
+        master_slot: u8,
+        client_pubkey: &str,
+        method: &Nip46Method,
+        event_kind: Option<u64>,
+        login_challenge: bool,
     ) -> ApprovalTier {
         // Protocol plumbing remains global even for an exact v2 slot.
         if matches!(
@@ -294,7 +311,10 @@ impl PolicyEngine {
         // said yes to precisely this ask. Checked after the strict method
         // ceiling (a verdict never resurrects an unlisted method) and only
         // for slot-bound clients.
-        if slot.is_some() {
+        // A login challenge is never lifted this way: it owes a press at the
+        // device, so a guardian's remote yes cannot answer it.
+        let is_login = method.as_str() == "sign_event" && login_challenge;
+        if slot.is_some() && !is_login {
             let key = heartwood_common::nip59::method_or_kind_key(method.as_str(), event_kind);
             if self.transient_allowed(master_slot, client_pubkey, &key, None) {
                 return ApprovalTier::AutoApprove;
@@ -316,7 +336,7 @@ impl PolicyEngine {
                     .iter()
                     .any(|allowed| allowed == method.as_str())
                 {
-                    return evaluate_slot_policy(slot, method.as_str(), event_kind);
+                    return evaluate_slot_policy_for_event(slot, method.as_str(), event_kind, login_challenge);
                 }
             }
             return ApprovalTier::ButtonRequired;
@@ -333,7 +353,7 @@ impl PolicyEngine {
             None => return ApprovalTier::ButtonRequired,
         };
 
-        evaluate_slot_policy(slot, method.as_str(), event_kind)
+        evaluate_slot_policy_for_event(slot, method.as_str(), event_kind, login_challenge)
     }
 
     /// The identity and list-identities gate for one request: the same pure

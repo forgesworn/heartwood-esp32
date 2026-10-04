@@ -752,8 +752,12 @@ enum JoinPoll {
 }
 
 impl WifiJoin {
-    fn start(wifi: &mut BlockingWifi<EspWifi<'_>>) -> Result<Self, esp_idf_svc::sys::EspError> {
-        wifi.wifi_mut().connect()?;
+    fn start(
+        wifi: &mut BlockingWifi<EspWifi<'_>>,
+        candidates: &[(String, String)],
+        retry: &crate::wifi_retry::WifiRetry,
+    ) -> Result<Self, esp_idf_svc::sys::EspError> {
+        retry.start(&mut WifiStation { wifi, candidates })?;
         Ok(Self {
             stage: WifiJoinStage::Connect,
             deadline: Instant::now() + WIFI_JOIN_STAGE_TIMEOUT,
@@ -1072,10 +1076,11 @@ pub fn run_wifi_standalone<'d, 'b>(
         .map(|(ssid, _)| cfg.network_position(ssid))
         .collect();
     let wifi_config_ok = !wifi_candidates.is_empty();
-    let mut wifi_candidate_idx = 0usize;
-    if wifi_config_ok {
-        select_wifi_candidate(&mut wifi, &wifi_candidates, wifi_candidate_idx);
-    }
+    let mut wifi_retry = crate::wifi_retry::WifiRetry::default();
+    // Initialise station mode only. Every join applies its own credentials
+    // after cancelling the previous attempt, including the first boot join.
+    wifi.set_configuration(&WifiConfig::Client(ClientConfiguration::default()))
+        .expect("relay: wifi station mode");
     wifi.start().expect("relay: wifi start");
     // RF entropy source is live from here on — plain esp_fill_random (via
     // crate::fill_random) is a true RNG again.
@@ -1144,6 +1149,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             locked_relay_phase(
                 &mut wifi,
                 &wifi_candidates,
+                &mut wifi_retry,
                 &relays,
                 op_mgmt.as_ref(),
                 &phones,
@@ -1304,7 +1310,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         }
         // Every relay session depends on the station link; restore it before
         // attempting any relay dial.
-        if !wifi.is_up().unwrap_or(false) {
+        if wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
             // Offline is not rot: a restart cannot fix the AP, and USB
             // service (fixing credentials over the cable) must never be
             // interrupted. The health watchdog only times unhealthy periods
@@ -1328,7 +1334,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             wifi_disconnect_reason.store(0, Ordering::Release);
             // Polled, not waited on: the cable, the button and a scheduled
             // restart are all served for as long as the join runs (WifiJoin).
-            let joined = match WifiJoin::start(&mut wifi) {
+            let joined = match WifiJoin::start(&mut wifi, &wifi_candidates, &wifi_retry) {
                 Err(error) => Err((WifiJoinStage::Connect, error)),
                 Ok(mut join) => loop {
                     crate::wdt::feed();
@@ -1349,8 +1355,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 record_wifi_failure(&mut ctx, stage, &e, &wifi_disconnect_reason);
                 // Rotate to the next stored network for the next attempt. With
                 // a single configured network this re-selects the same one.
-                wifi_candidate_idx = wifi_candidate_idx.wrapping_add(1);
-                select_wifi_candidate(&mut wifi, &wifi_candidates, wifi_candidate_idx);
+                wifi_retry.advance(wifi_candidates.len());
                 set_network_runtime(
                     &mut ctx,
                     NetworkRuntimeStage::WifiConnecting,
@@ -1366,11 +1371,12 @@ pub fn run_wifi_standalone<'d, 'b>(
                 continue;
             }
             log::info!("[relay] wifi up");
+            wifi_retry.mark_joined();
             // The station is still pointed at the last candidate selected, so
             // that is the network it joined (a fallback, perhaps, not the
             // primary). Set before the stage change, which carries it.
             ctx.network_runtime.wifi_index = wifi_positions
-                .get(wifi_candidate_idx % wifi_positions.len().max(1))
+                .get(wifi_retry.index())
                 .copied()
                 .flatten();
             set_network_runtime(
@@ -1381,6 +1387,13 @@ pub fn run_wifi_standalone<'d, 'b>(
                 NetworkRuntimeError::None,
             );
         }
+
+        // A locked boot may already have joined a fallback before unlock.
+        // Both phases share the cursor, including for runtime reporting.
+        ctx.network_runtime.wifi_index = wifi_positions
+            .get(wifi_retry.index())
+            .copied()
+            .flatten();
 
         if relays.is_empty() {
             // Config error, fixable only over USB — not the watchdog's case.
@@ -2322,38 +2335,49 @@ fn wifi_client_config(ssid: &str, password: &str) -> Option<WifiConfig> {
     }))
 }
 
-/// Point the station at candidate `idx` (mod len) of the configured network
-/// list. Config failures are logged, not fatal: the next connect attempt
-/// fails cleanly and the rotation moves on.
-fn select_wifi_candidate(
-    wifi: &mut BlockingWifi<EspWifi<'_>>,
-    candidates: &[(String, String)],
-    idx: usize,
-) {
-    if candidates.is_empty() {
-        return;
+/// Adapter for the host-tested retry sequence. A failed configuration is
+/// propagated: connecting here with the previous SSID would fake a rotation.
+struct WifiStation<'a, 'd> {
+    wifi: &'a mut BlockingWifi<EspWifi<'d>>,
+    candidates: &'a [(String, String)],
+}
+
+impl crate::wifi_retry::Station for WifiStation<'_, '_> {
+    type Error = esp_idf_svc::sys::EspError;
+
+    fn disconnect(&mut self) -> Result<(), Self::Error> {
+        // Also cancels a pending association. Waiting for the disconnect
+        // event when associated prevents a stale is_up() from completing the
+        // new join before the driver has left the old AP.
+        self.wifi.wifi_mut().disconnect()?;
+        self.wifi.wifi_wait_while(
+            || self.wifi.is_connected(),
+            Some(Duration::from_secs(1)),
+        )
     }
-    let (ssid, password) = &candidates[idx % candidates.len()];
-    if candidates.len() > 1 {
+
+    fn configure(&mut self, index: usize) -> Result<(), Self::Error> {
+        let invalid = || Self::Error::from_infallible::<{ esp_idf_svc::sys::ESP_ERR_INVALID_ARG }>();
+        let (ssid, password) = self.candidates.get(index).ok_or_else(invalid)?;
+        let config = wifi_client_config(ssid, password).ok_or_else(invalid)?;
         log::info!(
             "[relay] wifi network {}/{}: {:?}",
-            idx % candidates.len() + 1,
-            candidates.len(),
+            index + 1,
+            self.candidates.len(),
             ssid
         );
+        self.wifi.set_configuration(&config)
     }
-    let Some(config) = wifi_client_config(ssid, password) else {
-        log::error!("[relay] stored credential for {ssid:?} exceeds ESP-IDF field bounds — skipped");
-        return;
-    };
-    if let Err(e) = wifi.set_configuration(&config) {
-        log::error!("[relay] wifi config for {ssid:?} failed: {e:?}");
+
+    fn connect(&mut self) -> Result<(), Self::Error> {
+        self.wifi.wifi_mut().connect()
     }
 }
 
 fn locked_relay_phase(
     wifi: &mut BlockingWifi<EspWifi<'_>>,
     wifi_candidates: &[(String, String)],
+    wifi_retry: &mut crate::wifi_retry::WifiRetry,
     relays: &[String],
     op_mgmt: Option<&[u8; 32]>,
     phones: &PhoneSet,
@@ -2416,7 +2440,6 @@ fn locked_relay_phase(
     let mut relay_idx = 0usize;
     let mut session: Option<RelaySession> = None;
     let mut next_announce = Instant::now();
-    let mut wifi_idx = 0usize;
     let mut next_wifi_attempt = Instant::now();
     let mut wifi_join: Option<WifiJoin> = None;
     // Wall clock, learned from the relay. Until it has a reading there is
@@ -2441,7 +2464,7 @@ fn locked_relay_phase(
         // paced so USB unlock stays served between attempts. Each attempt is
         // polled across passes (WifiJoin), so USB unlock is served during it
         // too, not only in the 3 s between.
-        if wifi.is_up().unwrap_or(false) {
+        if !wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
             if wifi_join.take().is_some() {
                 log::info!("[relay] locked: wifi up");
             }
@@ -2453,29 +2476,31 @@ fn locked_relay_phase(
                 Some(JoinPoll::Pending) => None,
                 Some(JoinPoll::Joined) => {
                     wifi_join = None;
+                    wifi_retry.mark_joined();
                     log::info!("[relay] locked: wifi up");
                     None
                 }
                 Some(JoinPoll::Failed(_, e)) => Some(e),
-                None if Instant::now() >= next_wifi_attempt => match WifiJoin::start(wifi) {
-                    Ok(join) => {
-                        wifi_join = Some(join);
-                        None
+                None if Instant::now() >= next_wifi_attempt => {
+                    match WifiJoin::start(wifi, wifi_candidates, wifi_retry) {
+                        Ok(join) => {
+                            wifi_join = Some(join);
+                            None
+                        }
+                        Err(e) => Some(e),
                     }
-                    Err(e) => Some(e),
-                },
+                }
                 None => None,
             };
             if let Some(e) = failed {
                 log::warn!("[relay] locked: wifi connect failed: {e:?}; retry in 3s");
                 wifi_join = None;
-                wifi_idx = wifi_idx.wrapping_add(1);
-                select_wifi_candidate(wifi, wifi_candidates, wifi_idx);
+                wifi_retry.advance(wifi_candidates.len());
                 next_wifi_attempt = Instant::now() + Duration::from_secs(3);
             }
         }
         // (Re)connect round-robin until a relay holds.
-        if session.is_none() && wifi.is_up().unwrap_or(false) {
+        if session.is_none() && !wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
             match connect_relay_raw(&relays[relay_idx], sub_req.clone(), false, true) {
                 Ok(s) => {
                     log::info!("[relay] locked: connected {}", relays[relay_idx]);

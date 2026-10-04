@@ -160,3 +160,8 @@ extern crate self as heartwood_common;
 mod firmware_policy_host_tests;
 #[cfg(all(test, feature = "nip46", feature = "nip44"))]
 pub use firmware_policy_host_tests::nvs;
+
+// Exercise the firmware's WiFi retry ordering with a fault-injected radio.
+#[cfg(test)]
+#[path = "../../firmware/src/wifi_retry.rs"]
+mod firmware_wifi_retry;

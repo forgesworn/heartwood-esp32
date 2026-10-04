@@ -424,7 +424,8 @@ Multi-network WiFi (T-Display or Heltec in WiFi mode):
       second AP), reorder them, save, and read back: the list survives the
       reboot and the redacted state shows ssid + password_set only.
 - [ ] Power the primary AP off. The signer rotates to the hotspot within a few
-      retry cycles (~10 s/candidate) and comes online — Sapwood and paired apps
+      retry cycles (up to 15 s for association, another 15 s for DHCP, and
+      3 s backoff per failed candidate) and comes online — Sapwood and paired apps
       reach it again. (A console build also names each candidate as "wifi
       network N/M".)
 - [ ] Promote a fallback to primary in Sapwood using its saved password (no
@@ -432,6 +433,34 @@ Multi-network WiFi (T-Display or Heltec in WiFi mode):
 - [ ] Encrypted-at-rest + WiFi: with the vault locked, the device now joins
       WiFi during the locked phase (previously the station never associated)
       and publishes its kind-24135 unlock announcement.
+
+Location-change regression (2026-10-04; partial T-Display bench verification):
+- [x] App-only update on the connected T-Display: installed factory partition
+      at `0x10000`, size `0x300000`, verified before writing. The 2,204,416-byte
+      patched beta.21 app was read back byte-for-byte (SHA-256
+      `c78855d42ca11df688a6bbce64e8f8aae86e61e610f13a1a861c4b9e8fa24501`). <!-- # pragma: allow-secret (public firmware image SHA-256) -->
+      Previous app captured for recovery; bootloader, partition table and
+      persistent data partitions were not written.
+- [x] Unlocked boot with the existing four saved networks: observed
+      `network_not_found` (201), then `wifi_ready` with `wifi_index: 2`, then
+      `online` on relay index 0. During WiFi retry, all 25 sampled USB network
+      status requests answered (median 88 ms, maximum 91 ms). Three earlier
+      requests before boot service started timed out; relay dial later took
+      2.44 s for one reply. The same identity, two pairings, network revision
+      6 and saved network/relay lists were present after the update.
+      This proves boot fallback and relay reconnection on this unlocked
+      T-Display; powered-on handoff, locked boot and other boards remain below.
+- [ ] Save three networks A/B/C. With only C available, cold boot both locked
+      and unlocked; verify C joins and USB remains responsive during retries.
+- [ ] Unlock on C, then leave it powered while disabling C and enabling B.
+      Verify it cycles C/A/B, reconnects the relay, and reports B's correct
+      `runtime.wifi_index`. Repeat B to A and A to C without rebooting.
+- [ ] Let A associate but withhold DHCP; leave B working. Verify timeout on A
+      cancels its association and B receives an IP and serves paired apps.
+- [ ] Use wrong credentials for A and B; C must still join. Restore A, remove
+      C, and verify the next full rotation recovers without a power cycle.
+- [ ] With one saved AP, take it away and restore it. Verify retry recovery;
+      with every AP absent, verify cable configuration recovery stays usable.
 
 Quick USB update (T-Display / C6):
 - [ ] Sapwood's Firmware section offers "Update to vX over USB" for the

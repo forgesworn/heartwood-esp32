@@ -91,6 +91,7 @@ mod sign;
 mod transport;
 mod wdt;
 mod wifi_scan;
+mod wifi_retry;
 
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};

@@ -2794,8 +2794,9 @@ dispatch without a card, so nothing parks.
   what the Sapwood review lists: Signet paired by Heartwood connect (so it
   reads `heartwood_list_identities` and listens on the `natural-person`
   key, not the master), and the operator key imported under Settings,
-  Advanced. Confirm that is enough, and that the ask shows under Family asks
-  with the app's short npub as its name. Then approve-once there, the app gets its answer. A second same-kind
+  Advanced. Confirm that is enough, and that the ask shows under "Waiting for
+  approval" as "<your name> (you)", with a phone notification reading "An app
+  wants to sign as <name>" (signet-app #17; older Signet says Family asks). Then approve-once there, the app gets its answer. A second same-kind
   ask within 10 minutes signs without asking (the window the acknowledgement
   names).
 - [ ] **33d.** USB-mode board over USB: the switch shows OFF with no Turn on

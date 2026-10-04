@@ -938,7 +938,8 @@ impl NoteStore {
     }
 
     /// Reveal a CONFIRMED note's `k1`: its secret as hex, or for a key note
-    /// the `ck1` its key signs, which is what a wallet presents to spend it.
+    /// the `ck1` its key signs for the note's own mint, which is what a wallet
+    /// presents to spend it there.
     /// The key itself never leaves. State check only — the physical gate is
     /// the dispatcher's job, exactly the `vault.c` split.
     pub fn export_secret(&self, id: &str) -> Result<String, NoteError> {
@@ -949,7 +950,7 @@ impl NoteStore {
             return Ok(hex_encode(&note.secret));
         }
         #[cfg(feature = "cash")]
-        return crate::cash_key::ck1_of(&note.secret).map_err(|_| NoteError::InvalidState);
+        return crate::cash_key::ck1_of(&note.secret, &note.host).map_err(|_| NoteError::InvalidState);
         // A build that cannot sign never made a key note, and cannot spend one.
         #[cfg(not(feature = "cash"))]
         Err(NoteError::InvalidState)
@@ -1738,7 +1739,8 @@ mod tests {
     #[cfg(feature = "cash")]
     #[test]
     fn a_key_note_exports_its_ck1_and_never_its_key() {
-        // lnurlcash-kit part2.json, the first branch's first note.
+        // lnurlcash-conformance part2.json, the first branch's first note,
+        // whose ck1 is bound to that branch's domain.
         let vectors: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
         let note = &vectors["branches"][0]["notes"][0];
@@ -1750,8 +1752,9 @@ mod tests {
         let mut store = fresh_store(&mut storage);
         let mut rng = test_rng();
         let key = KeyNote { index: 0, pubkey: [0; 32] };
+        let endpoint = format!("{}/w", vectors["branches"][0]["host"].as_str().unwrap());
         let (id, _) = store
-            .import_key(&mut storage, &mut rng, &secret, key, "mint.example/w", 1_000, "", 1)
+            .import_key(&mut storage, &mut rng, &secret, key, &endpoint, 1_000, "", 1)
             .unwrap();
         assert_eq!(store.export_secret(&id).unwrap(), note["ck1"].as_str().unwrap());
     }

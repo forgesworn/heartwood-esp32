@@ -2759,6 +2759,53 @@ the main loop and the locked phase.
   range: PIN_UNLOCK / VAULT_UNLOCK over USB are answered within a couple of
   seconds at any point in the join cycle.
 
+## 33. Approve from my phone, per app (added 2026-10-04, NOT YET BENCH-RUN)
+
+The owner's opt-in for the C4 park (section 11b) on their own apps, not only a
+dependant's: Sapwood's Apps panel gains an "Approve from my phone" switch per
+app (the slot's `escalate`), off by default, behind a written acknowledgement
+of what it gives away. Firmware: the relay's `update_client` now honours
+`escalate` on a legacy (non-strict) slot too, as the cable's CONNSLOT_UPDATE
+always has, so a slot flagged at the cable can be unflagged from the phone;
+the cable card names the change ("PHONE MAY OK" / "BUTTON ONLY") instead of
+"family" when `escalate` is the only family key sent.
+
+Side effect on upgrade: Signet's C3 policy push already sends `escalate`
+(true on dependant slots). On a legacy dependant slot that used to be dropped;
+on this firmware it takes effect, so such a slot starts parking where it used
+to draw a card. That is what Signet always asked for, but it is a change.
+Only MANUAL pairings are affected by the switch: an AUTO pairing's requests
+dispatch without a card, so nothing parks.
+
+- [ ] **33a.** WiFi board over USB, a legacy slot: Sapwood > Apps > Approve
+  from my phone > Turn on, tick the acknowledgement, Turn on. The board shows
+  `Update <label>? / PHONE MAY OK`; hold to approve. Sapwood shows ON, and
+  CONNSLOT_LIST reports `escalate: true`. Declining the card leaves it OFF with
+  "the press on the signer was declined or timed out".
+- [ ] **33b.** Same slot, Sapwood over the relay: Turn off. `list_clients`
+  reports `escalate: false` (before this firmware it stayed true and Sapwood
+  says so, pointing at USB). Turn on again over the relay: read back true.
+- [ ] **33c.** End to end for the owner: with 33a's slot on, the app sends a
+  request that needs the button. The board shows no card, the Signet app
+  (bunker-connected to this signer, holding its operator key, with its
+  natural-person route resolving to this board's `natural-person` persona,
+  which is what decrypts the notice) shows the ask in its inbox. From the
+  code (2026-10-04), an owner who has only ever used Sapwood needs exactly
+  what the Sapwood review lists: Signet paired by Heartwood connect (so it
+  reads `heartwood_list_identities` and listens on the `natural-person`
+  key, not the master), and the operator key imported under Settings,
+  Advanced. Confirm that is enough, and that the ask shows under "Waiting for
+  approval" as "<your name> (you)", with a phone notification reading "An app
+  wants to sign as <name>" (signet-app #17; older Signet says Family asks). Then approve-once there, the app gets its answer. A second same-kind
+  ask within 10 minutes signs without asking (the window the acknowledgement
+  names).
+- [ ] **33d.** USB-mode board over USB: the switch shows OFF with no Turn on
+  button, and the "needs the signer in WiFi mode" reason.
+- [ ] **33e.** `heartwood_pair_wallet` on a flagged slot is refused with "must
+  be approved at the device", never parked.
+- [ ] **33f.** Sapwood's own "Sapwood manager" pairing shows no Approve from
+  my phone control.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

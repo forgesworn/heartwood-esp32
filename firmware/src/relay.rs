@@ -5235,6 +5235,12 @@ fn queue_button_ask(
         kind_key.push('@');
         kind_key.extend(heartwood_common::policy::identity_tag(identity).iter().map(|&b| b as char));
     }
+    // Each login challenge is its own decision: its card shows one code, so
+    // one hold must never also sign a second challenge with a different code.
+    if ask.event.as_ref().is_some_and(|event| event.kind == heartwood_common::policy::LOGIN_EVENT_KIND) {
+        kind_key.push('#');
+        kind_key.push_str(&ask.request.id);
+    }
     // A HOLD TO SIGN ask and an ALLOW AS ask (or any two card kinds) are
     // different decisions and never share one hold.
     kind_key.push_str(heartwood_common::policy::card_batch_marker(ask.resume.shown.card));
@@ -5376,7 +5382,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
 
     let batch = ctx.button_cards[0].asks.len();
     enum Draw {
-        Sign(String, u64, Option<String>, Option<String>),
+        Sign(String, u64, Option<String>, Option<String>, Option<String>),
         Extension(String, String, String),
         Titled(&'static str, String),
         Batch(String, String),
@@ -5385,7 +5391,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // The enrol card's page and whether a hold counts yet (its hint).
     let (card_page, card_armed) = view.unwrap_or((0, true));
     let card = match &ctx.button_cards[0].asks[0].ask.card {
-        crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading } => {
+        crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading, login_code } => {
             // The count belongs on screen: one hold answers all of them, and
             // the operator must never be shown "sign this" for a batch.
             let label = if batch > 1 {
@@ -5393,7 +5399,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             } else {
                 requester.clone()
             };
-            Draw::Sign(label, *kind, identity.clone(), heading.clone())
+            Draw::Sign(label, *kind, identity.clone(), heading.clone(), login_code.clone())
         }
         crate::nip46_handler::AskCard::Extension {
             heading,
@@ -5426,7 +5432,11 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // was handed to the glass, never whether the glass had room for it.
     if first_draw {
         let (head, body) = match &card {
-            Draw::Sign(label, kind, identity, heading) => (
+            Draw::Sign(label, _, _, heading, Some(code)) => (
+                heading.clone().unwrap_or_else(|| "LOG IN".to_string()),
+                format!("{} / {code}", crate::oled::display_app_label(label)),
+            ),
+            Draw::Sign(label, kind, identity, heading, None) => (
                 heading.clone().unwrap_or_else(|| "HOLD TO SIGN".to_string()),
                 format!(
                     "{} / {} / kind {kind} / {}",
@@ -5446,12 +5456,13 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }
     match card {
-        Draw::Sign(label, kind, identity, heading) => crate::oled::show_sign_request_as(
+        Draw::Sign(label, kind, identity, heading, login_code) => crate::oled::show_sign_request_as(
             ctx.display,
             &label,
             kind,
             identity.as_deref(),
             heading.as_deref(),
+            login_code.as_deref(),
             remaining,
         ),
         Draw::Extension(heading, method, preview) => crate::oled::show_master_sign_request(
@@ -7286,7 +7297,10 @@ fn handle_nip46_event(
     let route = heartwood_common::escalate::route_request(
         tier,
         method_enum.pinned_physical(),
-        method_enum.device_press_only(),
+        // A login challenge (kind 22242) must be answered at the device, with
+        // its code on screen; no guardian verdict may complete it.
+        method_enum.device_press_only()
+            || event_kind == Some(heartwood_common::policy::LOGIN_EVENT_KIND),
         escalate_slot,
     );
     if matches!(route, heartwood_common::escalate::Route::Refuse) {

@@ -457,7 +457,16 @@ pub enum AskCard {
     /// (label and short npub), present for every slot-bound remote client.
     /// `heading` replaces `HOLD TO SIGN` when the card also approves the
     /// identity (`ALLOW AS <identity>?`).
-    Sign { requester: String, kind: u64, identity: Option<String>, heading: Option<String> },
+    ///
+    /// `login_code` is set only for a kind 22242 login challenge carrying one
+    /// valid `code` tag; the card then reads LOG IN and shows the code large.
+    Sign {
+        requester: String,
+        kind: u64,
+        identity: Option<String>,
+        heading: Option<String>,
+        login_code: Option<String>,
+    },
     /// A card drawn by `show_master_sign_request`: the full heading, the line
     /// under it (a method name, or the app for a gate card) and a preview.
     Extension {
@@ -1275,6 +1284,8 @@ fn dispatch_inner(
                                 kind: event.kind,
                                 identity: identity_line.clone(),
                                 heading,
+                                login_code: heartwood_common::policy::login_code_for_event(event.kind, &event.tags)
+                                    .map(str::to_string),
                             },
                             request,
                             event: Some(event),
@@ -2423,6 +2434,8 @@ fn handle_sign_event(
     event: UnsignedEvent,
 ) -> String {
     let (kind, _content_preview) = nip46::event_display_summary(&event, 50);
+    let login_code = heartwood_common::policy::login_code_for_event(event.kind, &event.tags)
+        .map(str::to_string);
 
     // Show the signing request on the OLED and wait for button approval.
     // The countdown bar updates every second; the approval module handles
@@ -2432,7 +2445,7 @@ fn handle_sign_event(
         buttons,
         APPROVAL_TIMEOUT_SECS,
         |d, remaining| {
-            crate::oled::show_sign_request_as(d, requester_label, kind, identity_line, heading, remaining);
+            crate::oled::show_sign_request_as(d, requester_label, kind, identity_line, heading, login_code.as_deref(), remaining);
         },
     );
 

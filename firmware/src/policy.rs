@@ -294,8 +294,12 @@ impl PolicyEngine {
         // said yes to precisely this ask. Checked after the strict method
         // ceiling (a verdict never resurrects an unlisted method) and only
         // for slot-bound clients.
-        if slot.is_some() {
-            let key = heartwood_common::nip59::method_or_kind_key(method.as_str(), event_kind);
+        // A login challenge (kind 22242) is never lifted this way: it owes a
+        // press at the device, so a guardian's remote yes cannot answer it.
+        let is_login = method.as_str() == "sign_event"
+            && event_kind == Some(heartwood_common::policy::LOGIN_EVENT_KIND);
+        if slot.is_some() && !is_login {
+            let key =heartwood_common::nip59::method_or_kind_key(method.as_str(), event_kind);
             if self.transient_allowed(master_slot, client_pubkey, &key, None) {
                 return ApprovalTier::AutoApprove;
             }

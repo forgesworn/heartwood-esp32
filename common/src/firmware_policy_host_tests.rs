@@ -1017,3 +1017,28 @@ fn physically_approved_backup_recovery_requires_verified_empty_baseline() {
     assert!(reloaded.storage_ready(0));
     assert!(reloaded.list_slots(0).is_empty(), "empty table must suppress old-secret migration");
 }
+
+#[test]
+fn login_challenge_is_never_auto_approved_by_the_engine() {
+    use crate::nip46::Nip46Method;
+    use crate::policy::{ApprovalTier, LOGIN_EVENT_KIND};
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "node".into(), secret_hex(1)).unwrap();
+    // Auto-approve with an empty kind list, then with the kind listed.
+    engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![], true).unwrap();
+    let client = pubkey_hex(1);
+    assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    let check = |engine: &PolicyEngine, kind| engine.check(0, &client, &Nip46Method::SignEvent, Some(kind));
+    assert_eq!(check(&engine, 1), ApprovalTier::AutoApprove);
+    assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![1, LOGIN_EVENT_KIND], true).unwrap();
+    assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    // A guardian's approve-once window cannot lift it either.
+    let key = crate::nip59::method_or_kind_key("sign_event", Some(LOGIN_EVENT_KIND));
+    engine.install_transient_allow(0, client.clone(), key, None, 60);
+    assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    // ...while the same window still lifts an ordinary kind it covers.
+    let key = crate::nip59::method_or_kind_key("sign_event", Some(1));
+    engine.install_transient_allow(0, client.clone(), key, None, 60);
+    assert_eq!(check(&engine, 1), ApprovalTier::AutoApprove);
+}

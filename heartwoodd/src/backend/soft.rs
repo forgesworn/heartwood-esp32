@@ -1294,11 +1294,20 @@ impl SoftBackend {
                 let kind_allowed = slot.allowed_kinds.is_empty()
                     || sign_kind.is_none_or(|k| slot.allowed_kinds.contains(&k));
 
-                if !kind_allowed || !slot.auto_approve {
+                // A login challenge is never silent, whatever the slot allows:
+                // it queues for the operator's explicit approval.
+                let is_login = sign_kind == Some(heartwood_common::policy::LOGIN_EVENT_KIND);
+                if !kind_allowed || !slot.auto_approve || is_login {
                     log::warn!(
                         "soft: sign_event kind {:?} from {client_short}… QUEUED — {} (slot \"{}\")",
                         sign_kind,
-                        if !kind_allowed { "kind not in slot policy" } else { "auto-approve disabled" },
+                        if !kind_allowed {
+                            "kind not in slot policy"
+                        } else if is_login {
+                            "login challenge always needs approval"
+                        } else {
+                            "auto-approve disabled"
+                        },
                         slot.label
                     );
                     let approval_id = Uuid::new_v4().to_string();

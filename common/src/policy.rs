@@ -288,10 +288,54 @@ pub fn evaluate_slot_policy(
         }
     }
 
+    // A kind 22242 sign_event logs somebody in to a node's dashboard, and the
+    // login page is reachable by anyone who can see the node. It is therefore
+    // never silent, whatever the slot allows: a button press with the code on
+    // screen is the only way it signs. (A strict slot that excludes the kind
+    // was already denied above.)
+    if method == "sign_event" && event_kind == Some(LOGIN_EVENT_KIND) {
+        return ApprovalTier::ButtonRequired;
+    }
+
     if slot.auto_approve {
         ApprovalTier::AutoApprove
     } else {
         ApprovalTier::ButtonRequired
+    }
+}
+
+/// The event kind of an Archipelago node login challenge. Always owes a
+/// physical press: see [`evaluate_slot_policy`].
+pub const LOGIN_EVENT_KIND: u64 = 22242;
+
+/// The code a login approval screen shows large: the value of the event's one
+/// `code` tag, when it is 4 to 8 ASCII digits.
+///
+/// Anything else yields `None` so the caller draws the ordinary sign screen:
+/// no `code` tag, a value that is not 4 to 8 ASCII digits, or MORE THAN ONE
+/// `code` tag. Two tags are refused rather than resolved by position, because
+/// the page and the device must agree on which one the owner is comparing.
+pub fn login_code_from_tags(tags: &[Vec<String>]) -> Option<&str> {
+    let mut found = tags
+        .iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("code"));
+    let tag = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let value = tag.get(1)?.as_str();
+    let ok = (4..=8).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit());
+    ok.then_some(value)
+}
+
+/// The login code for an event about to be signed: [`login_code_from_tags`],
+/// but only for [`LOGIN_EVENT_KIND`]. Any other kind returns `None`, so a
+/// `code` tag on an ordinary event can never dress it up as a login.
+pub fn login_code_for_event(kind: u64, tags: &[Vec<String>]) -> Option<&str> {
+    if kind == LOGIN_EVENT_KIND {
+        login_code_from_tags(tags)
+    } else {
+        None
     }
 }
 
@@ -2881,6 +2925,104 @@ mod tests {
             evaluate_slot_policy(&slot, "nip44_decrypt", None),
             ApprovalTier::Denied,
         );
+    }
+
+    fn login_slot(auto: bool, kinds: Vec<u64>, strict: bool) -> ConnectSlot {
+        let mut slot = sample_slot(0, "login");
+        slot.allowed_methods = vec!["sign_event".into()];
+        slot.allowed_kinds = kinds;
+        slot.auto_approve = auto;
+        slot.strict_permissions = strict;
+        slot.signing_approved = true;
+        slot
+    }
+
+    #[test]
+    fn login_kind_is_never_auto_approved() {
+        // auto_approve with no kind ceiling: every other kind is silent,
+        // the login kind is not.
+        let open = login_slot(true, vec![], false);
+        assert_eq!(evaluate_slot_policy(&open, "sign_event", Some(1)), ApprovalTier::AutoApprove);
+        assert_eq!(evaluate_slot_policy(&open, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::ButtonRequired);
+
+        // auto_approve with the kind explicitly listed, strict or legacy.
+        for strict in [false, true] {
+            let listed = login_slot(true, vec![1, LOGIN_EVENT_KIND], strict);
+            assert_eq!(evaluate_slot_policy(&listed, "sign_event", Some(1)), ApprovalTier::AutoApprove);
+            assert_eq!(
+                evaluate_slot_policy(&listed, "sign_event", Some(LOGIN_EVENT_KIND)),
+                ApprovalTier::ButtonRequired,
+                "strict={strict}",
+            );
+        }
+
+        // An event whose kind could not be read is not a login and keeps
+        // today's behaviour.
+        assert_eq!(evaluate_slot_policy(&open, "sign_event", None), ApprovalTier::AutoApprove);
+    }
+
+    #[test]
+    fn login_kind_excluded_by_a_strict_slot_is_still_denied() {
+        let strict = login_slot(true, vec![1, 7], true);
+        assert_eq!(evaluate_slot_policy(&strict, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::Denied);
+        // A legacy slot that excludes it falls back to the button, as for any kind.
+        let legacy = login_slot(true, vec![1, 7], false);
+        assert_eq!(evaluate_slot_policy(&legacy, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::ButtonRequired);
+    }
+
+    #[test]
+    fn login_kind_leaves_other_methods_and_unapproved_slots_alone() {
+        let mut slot = login_slot(true, vec![], true);
+        slot.allowed_methods.push("nip44_encrypt".into());
+        assert_eq!(evaluate_slot_policy(&slot, "nip44_encrypt", None), ApprovalTier::AutoApprove);
+        // A strict slot that never signed still denies, as before.
+        slot.signing_approved = false;
+        assert_eq!(evaluate_slot_policy(&slot, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::Denied);
+    }
+
+    fn tag(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn login_code_extraction() {
+        let challenge = tag(&["challenge", &"ab".repeat(32)]);
+        // Valid, at both length limits.
+        for code in ["1234", "0007", "12345678"] {
+            let tags = vec![challenge.clone(), tag(&["code", code])];
+            assert_eq!(login_code_from_tags(&tags), Some(code));
+        }
+        // Missing tag, and a tag with no value.
+        assert_eq!(login_code_from_tags(&[]), None);
+        assert_eq!(login_code_from_tags(&[challenge.clone()]), None);
+        assert_eq!(login_code_from_tags(&[tag(&["code"])]), None);
+        // Wrong length.
+        for code in ["", "123", "123456789"] {
+            assert_eq!(login_code_from_tags(&[tag(&["code", code])]), None, "{code:?}");
+        }
+        // Not ASCII digits (including Unicode digits and padding).
+        for code in ["12a4", "12 4", "-123", "+123", "12.4", "\u{0661}\u{0662}\u{0663}\u{0664}", "1234\n"] {
+            assert_eq!(login_code_from_tags(&[tag(&["code", code])]), None, "{code:?}");
+        }
+        // More than one code tag, identical or not: none.
+        let two = vec![tag(&["code", "1234"]), tag(&["code", "5678"])];
+        assert_eq!(login_code_from_tags(&two), None);
+        let same = vec![tag(&["code", "1234"]), tag(&["code", "1234"])];
+        assert_eq!(login_code_from_tags(&same), None);
+        // A second, invalid code tag still disqualifies the valid one.
+        let mixed = vec![tag(&["code", "1234"]), tag(&["code", "x"])];
+        assert_eq!(login_code_from_tags(&mixed), None);
+        // Extra elements after the value are ignored; the name must match exactly.
+        assert_eq!(login_code_from_tags(&[tag(&["code", "1234", "extra"])]), Some("1234"));
+        assert_eq!(login_code_from_tags(&[tag(&["Code", "1234"])]), None);
+    }
+
+    #[test]
+    fn login_code_only_applies_to_the_login_kind() {
+        let tags = vec![tag(&["code", "1234"])];
+        assert_eq!(login_code_for_event(LOGIN_EVENT_KIND, &tags), Some("1234"));
+        assert_eq!(login_code_for_event(1, &tags), None);
+        assert_eq!(login_code_for_event(LOGIN_EVENT_KIND, &[]), None);
     }
 
     #[test]

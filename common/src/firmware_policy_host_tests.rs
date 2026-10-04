@@ -1047,3 +1047,37 @@ fn login_challenge_is_never_auto_approved_by_the_engine() {
     engine.install_transient_allow(0, client.clone(), key, None, 60);
     assert_eq!(check(&engine, 1), ApprovalTier::AutoApprove);
 }
+
+#[test]
+fn a_login_press_records_no_identity_grant() {
+    use crate::nip46::Nip46Method;
+    use crate::policy::{press_records_identity, ApprovalTier, CardKind, Gate, LOGIN_EVENT_KIND};
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "node".into(), secret_hex(1)).unwrap();
+    engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![1, LOGIN_EVENT_KIND], true).unwrap();
+    let client = pubkey_hex(1);
+    assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    let persona = [0x77u8; 32];
+    let gate = |engine: &PolicyEngine, kind: u64, login: bool| {
+        let tier = engine.check_for_event(0, &client, &Nip46Method::SignEvent, Some(kind), login);
+        assert!(!matches!(tier, ApprovalTier::Denied));
+        engine.gate(0, &client, true, &Nip46Method::SignEvent, "sign_event", Some(kind), tier, false, false, Some(&persona))
+    };
+    // First login as a persona the pairing has no grant for: the grant card.
+    let card = match gate(&engine, LOGIN_EVENT_KIND, true) {
+        Gate::Card(card) => card,
+        other => panic!("expected a grant card, got {other:?}"),
+    };
+    assert!(matches!(card, CardKind::AllowAs { record: true }));
+    // The press on a login records nothing; the same press on any other
+    // sign card still does.
+    assert!(!press_records_identity(Some(card), true));
+    assert!(press_records_identity(Some(card), false));
+    assert!(!press_records_identity(Some(CardKind::AllowAs { record: false }), false));
+    assert!(!press_records_identity(None, false));
+    // A later ordinary request as that persona raises its own grant card.
+    assert_eq!(gate(&engine, 1, false), Gate::Card(CardKind::AllowAs { record: true }));
+    // Control: had a normal press recorded it, the next request would pass.
+    assert!(engine.record_identity(0, Ok(&client), &persona));
+    assert_eq!(gate(&engine, 1, false), Gate::Allow);
+}

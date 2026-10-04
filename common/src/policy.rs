@@ -353,6 +353,15 @@ pub fn classify_login(kind: u64, tags: &[Vec<String>]) -> LoginChallenge<'_> {
     }
 }
 
+/// Whether the press on a sign card should record the identity it approved.
+///
+/// Only an `AllowAs { record: true }` card records, and never for a login
+/// challenge: its heading says LOG IN, so the press consents to that login
+/// alone. Any later request as the identity raises its own grant card.
+pub fn press_records_identity(card: Option<CardKind>, login_challenge: bool) -> bool {
+    !login_challenge && matches!(card, Some(CardKind::AllowAs { record: true }))
+}
+
 /// Whether an event is a login challenge: kind 22242 carrying any `code`
 /// tag. Such an event always needs a button press.
 pub fn is_login_challenge(kind: u64, tags: &[Vec<String>]) -> bool {

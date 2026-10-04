@@ -1369,7 +1369,7 @@ fn dispatch_inner(
                             policy_engine.upgrade_to_signing(master_slot, idx);
                         }
                         if let (Some(snapshot), Some(pubkey)) = (identity_snapshot, identity.as_ref()) {
-                            let changed = matches!(gate_card, Some(CardKind::AllowAs { record: true }))
+                            let changed = heartwood_common::policy::press_records_identity(gate_card, login_challenge)
                                 && policy_engine.record_identity(master_slot, Ok(&client_hex), pubkey);
                             if let Err(response) = persist_grant(
                                 policy_engine,

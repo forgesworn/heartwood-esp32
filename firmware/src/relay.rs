@@ -5243,7 +5243,9 @@ fn queue_button_ask(
         .as_ref()
         .is_some_and(|event| heartwood_common::policy::is_login_challenge(event.kind, &event.tags))
     {
-        static LOGIN_ASK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // 32-bit: none of the boards has 64-bit atomics. Wrapping is harmless, as
+        // a key only has to differ from the cards alive beside it.
+        static LOGIN_ASK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = LOGIN_ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         kind_key = heartwood_common::approval_queue::login_kind_key(&kind_key, seq);
     }

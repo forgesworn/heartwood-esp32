@@ -257,9 +257,10 @@ pub fn validate_exact_slot_policy(
 /// helper is deliberately pure so the firmware's exact deny boundary runs in
 /// host CI as well as on the ESP.
 ///
-/// This form is for requests that are not login challenges. A caller holding
-/// the event being signed must use [`evaluate_slot_policy_for_event`] with
+/// Test-only: it treats every request as not a login challenge. Production
+/// code holds the event and must use [`evaluate_slot_policy_for_event`] with
 /// [`is_login_challenge`], or a login challenge could be auto-approved.
+#[cfg(test)]
 pub fn evaluate_slot_policy(
     slot: &ConnectSlot,
     method: &str,

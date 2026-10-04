@@ -240,8 +240,9 @@ impl PolicyEngine {
         })
     }
 
-    /// Determine the approval tier for a request that is not a login
-    /// challenge. Callers holding the event must use [`Self::check_for_event`].
+    /// Test-only: the tier for a request that is not a login challenge.
+    /// Production callers hold the event and use [`Self::check_for_event`].
+    #[cfg(test)]
     pub fn check(
         &self,
         master_slot: u8,

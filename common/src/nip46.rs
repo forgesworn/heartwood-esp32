@@ -1187,36 +1187,49 @@ pub fn unsigned_event_kind(params: &[Value]) -> Option<u64> {
 /// full (relay pre-dispatch, USB snapshot). Unreadable params are not a login
 /// challenge; the handler's own parse then refuses them as a bad event.
 pub fn unsigned_event_is_login_challenge(params: &[Value]) -> bool {
-    let parsed;
-    let object = match params.first() {
-        Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
-            Ok(value) => {
-                parsed = value;
-                &parsed
-            }
-            Err(_) => return false,
-        },
-        Some(value) => value,
-        None => return false,
-    };
-    let Some(kind) = object.get("kind").and_then(Value::as_u64) else {
+    // Cheap first: only kind 22242 can be a login challenge, and the kind
+    // scan never copies the content. Every other event, which is nearly all
+    // of them and may be large, returns here.
+    if unsigned_event_kind(params) != Some(crate::policy::LOGIN_EVENT_KIND) {
         return false;
-    };
-    let tags: Vec<Vec<String>> = object
-        .get("tags")
-        .and_then(Value::as_array)
-        .map(|tags| {
-            tags.iter()
-                .filter_map(Value::as_array)
-                .map(|tag| {
-                    tag.iter()
-                        .map(|part| part.as_str().unwrap_or_default().to_string())
+    }
+
+    // The tags of a 22242, and nothing else: serde skips `content` without
+    // allocating it, so a no-PSRAM board never holds a second copy of it.
+    #[derive(Deserialize)]
+    struct KindAndTags {
+        kind: u64,
+        #[serde(default)]
+        tags: Vec<Vec<String>>,
+    }
+
+    match params.first() {
+        Some(Value::String(raw)) => match serde_json::from_str::<KindAndTags>(raw) {
+            Ok(event) => crate::policy::is_login_challenge(event.kind, &event.tags),
+            // A 22242 whose tags cannot be read is refused as a bad event by
+            // the handler; steer it the cautious way meanwhile.
+            Err(_) => true,
+        },
+        Some(Value::Object(object)) => {
+            // Borrow the tags in place: no clone of the event.
+            let tags: Vec<Vec<String>> = object
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(Value::as_array)
+                        .map(|tag| {
+                            tag.iter()
+                                .map(|part| part.as_str().unwrap_or_default().to_string())
+                                .collect()
+                        })
                         .collect()
                 })
-                .collect()
-        })
-        .unwrap_or_default();
-    crate::policy::is_login_challenge(kind, &tags)
+                .unwrap_or_default();
+            crate::policy::is_login_challenge(crate::policy::LOGIN_EVENT_KIND, &tags)
+        }
+        _ => false,
+    }
 }
 
 /// Consume `sign_event` params while parsing the event.
@@ -2578,5 +2591,16 @@ mod tests {
         assert!(!unsigned_event_is_login_challenge(&[other]));
         assert!(!unsigned_event_is_login_challenge(&[]));
         assert!(!unsigned_event_is_login_challenge(&[Value::String("not json".into())]));
+        // A large event of another kind is rejected on the kind scan alone,
+        // and a large login challenge still classifies correctly.
+        let big = "x".repeat(200_000);
+        let large_note = json!({"kind": 1, "tags": [["code", "4821"]], "content": big, "created_at": 1});
+        assert!(!unsigned_event_is_login_challenge(&[Value::String(large_note.to_string())]));
+        let large_login = json!({"kind": 22242, "tags": [["code", "4821"]], "content": big, "created_at": 1});
+        assert!(unsigned_event_is_login_challenge(&[Value::String(large_login.to_string())]));
+        let large_auth = json!({"kind": 22242, "tags": [["relay", "wss://r"]], "content": big, "created_at": 1});
+        assert!(!unsigned_event_is_login_challenge(&[Value::String(large_auth.to_string())]));
+        // A 22242 with unreadable tags is steered cautiously.
+        assert!(unsigned_event_is_login_challenge(&[Value::String(r#"{"kind":22242,"tags":"x"}"#.into())]));
     }
 }

@@ -58,10 +58,10 @@ impl AskKey {
 }
 
 /// The batch key of a login challenge: unique per ask (`seq` is a per-boot
-/// counter), so a login challenge never shares a card and one hold can never
+/// counter, 32-bit because no board has 64-bit atomics), so a login challenge never shares a card and one hold can never
 /// sign two of them. It must not depend on anything the client chooses, such
 /// as the request id.
-pub fn login_kind_key(base: &str, seq: u64) -> String {
+pub fn login_kind_key(base: &str, seq: u32) -> String {
     format!("{base}#login{seq}")
 }
 

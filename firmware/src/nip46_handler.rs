@@ -1285,7 +1285,15 @@ fn dispatch_inner(
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
                     let heading = allow_sign.then(|| {
                         heartwood_common::encoding::card_heading(
-                            if matches!(gate_card, Some(CardKind::AllowAs { record: false })) { "ONCE AS" } else { "REMEMBER AS" },
+                            // A login keeps saying so: an identity grant must
+                            // never turn the card into an unexplained number.
+                            if login_challenge {
+                                "LOG IN AS"
+                            } else if matches!(gate_card, Some(CardKind::AllowAs { record: false })) {
+                                "ONCE AS"
+                            } else {
+                                "REMEMBER AS"
+                            },
                             identity_label.as_deref().unwrap_or_default(),
                         )
                     });

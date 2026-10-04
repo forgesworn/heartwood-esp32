@@ -2789,15 +2789,21 @@ dispatch without a card, so nothing parks.
   request that needs the button. The board shows no card, the Signet app
   (bunker-connected to this signer, holding its operator key, with its
   natural-person route resolving to this board's `natural-person` persona,
-  which is what decrypts the notice) shows the ask in its inbox. Untested for
-  an owner who has only ever used Sapwood: record what Signet setup it took.
-  Then approve-once there, the app gets its answer. A second same-kind
+  which is what decrypts the notice) shows the ask in its inbox. From the
+  code (2026-10-04), an owner who has only ever used Sapwood needs exactly
+  what the Sapwood review lists: Signet paired by Heartwood connect (so it
+  reads `heartwood_list_identities` and listens on the `natural-person`
+  key, not the master), and the operator key imported under Settings,
+  Advanced. Confirm that is enough, and that the ask shows under Family asks
+  with the app's short npub as its name. Then approve-once there, the app gets its answer. A second same-kind
   ask within 10 minutes signs without asking (the window the acknowledgement
   names).
 - [ ] **33d.** USB-mode board over USB: the switch shows OFF with no Turn on
   button, and the "needs the signer in WiFi mode" reason.
 - [ ] **33e.** `heartwood_pair_wallet` on a flagged slot is refused with "must
   be approved at the device", never parked.
+- [ ] **33f.** Sapwood's own "Sapwood manager" pairing shows no Approve from
+  my phone control.
 
 ## Notes
 

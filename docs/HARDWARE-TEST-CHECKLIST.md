@@ -456,8 +456,18 @@ Location-change regression (2026-10-04; partial T-Display bench verification):
       consistent with the approximately 10:35 UTC verification boot above:
       evidence of hotel-to-hotspot recovery within the same boot. The exact
       transition and retry timing were not captured. Identity, two pairings
-      and NVS entry counts remained unchanged. The return handoff, locked
-      boot and other boards are still unverified.
+      and NVS entry counts remained unchanged. Locked boot and other boards
+      are still unverified.
+- [x] Return handoff after the larger WiFi-page update (`defb792`): observed
+      Pixel hotspot online at 12:24 UTC, then hotel WiFi online at 12:30 UTC.
+      Uptime of 576 seconds at approximately 12:32 UTC matches that image's
+      12:22 verification boot, so the return happened without a reboot.
+      Identity, two pairings and configuration revision 6 remained intact.
+      The owner accepted the larger layout but reported an unavailable SSID
+      during retries: the page incorrectly fell back to the primary name
+      whenever the joined index was cleared. The follow-up tracks the actual
+      candidate separately and keeps the open network page visible through
+      connectivity changes; its on-device retry-name check remains pending.
 - [ ] Save three networks A/B/C. With only C available, cold boot both locked
       and unlocked; verify C joins and USB remains responsive during retries.
 - [ ] Unlock on C, then leave it powered while disabling C and enabling B.

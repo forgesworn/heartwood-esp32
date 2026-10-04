@@ -380,6 +380,8 @@ struct SignCtx<'a, 'd, 'b> {
     idle_page: u8,
     /// Refresh only while the network page still owns the panel.
     network_page_draw: Option<(u32, Instant)>,
+    /// Candidate being attempted; distinct from the successfully joined index.
+    wifi_attempt_index: Option<u8>,
     /// Set when the served persona set changed (a derive over any path, or a
     /// registry removal): the live "hw" subscriptions re-REQ with fresh
     /// filters on the next loop pass instead of waiting for a reconnect, so
@@ -532,19 +534,19 @@ fn launch_offline_qr_if_requested(ctx: &mut SignCtx<'_, '_, '_>) -> bool {
 }
 
 /// One page of the idle info carousel. Page 1 shows the network the station
-/// joined (the primary SSID until one has) with the live runtime stage; page 2
+/// joined or is currently attempting, with the live runtime stage; page 2
 /// the firmware version, board, and uptime; page 3 the privacy-preserving
 /// locker counts.
 fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
     match ctx.idle_page {
         1 => {
-            // With a fallback list the board may be online through a network
-            // other than the primary, so name the one actually joined.
-            let joined = ctx.network_runtime.wifi_index;
+            // A failed join clears wifi_index. Keep the actual attempt visible
+            // during rotation instead of repeatedly naming the primary SSID.
+            let selected = ctx.network_runtime.wifi_index.or(ctx.wifi_attempt_index);
             let ssid = crate::net_config_store::read_net_config(ctx.nvs)
                 .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
                 .and_then(|cfg| {
-                    joined
+                    selected
                         .and_then(|i| cfg.network_at(i))
                         .or(Some(cfg.ssid.as_str()))
                         .filter(|ssid| !ssid.is_empty())
@@ -702,6 +704,18 @@ fn set_network_runtime(
         return;
     }
     ctx.network_runtime = next;
+
+    // Keep an explicitly opened network page live through reconnects. Only
+    // redraw if it still owns the glass; never replace a card or its result.
+    if ctx.display_on && ctx.idle_page == 1 && !screen_busy(ctx)
+        && ctx.network_page_draw.is_some_and(|(generation, _)| {
+            generation == crate::oled::draw_generation()
+        })
+    {
+        ctx.network_display_restore_at = None;
+        draw_relay_idle_page(ctx);
+        return;
+    }
 
     let feedback = match stage {
         NetworkRuntimeStage::RadioOff => None,
@@ -1238,6 +1252,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         network_display_restore_at: None,
         idle_page: 0,
         network_page_draw: None,
+        wifi_attempt_index: None,
         resubscribe_needed: false,
         parks: Vec::new(),
         park_tombstones: Vec::new(),
@@ -1340,6 +1355,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             // interrupted. The health watchdog only times unhealthy periods
             // while the station link is up.
             last_relay_healthy = Instant::now();
+            ctx.wifi_attempt_index = wifi_positions.get(wifi_retry.index()).copied().flatten();
             let previous_error = ctx.network_runtime.last_error_class;
             set_network_runtime(
                 &mut ctx,

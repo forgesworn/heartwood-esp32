@@ -449,7 +449,15 @@ Location-change regression (2026-10-04; partial T-Display bench verification):
       2.44 s for one reply. The same identity, two pairings, network revision
       6 and saved network/relay lists were present after the update.
       This proves boot fallback and relay reconnection on this unlocked
-      T-Display; powered-on handoff, locked boot and other boards remain below.
+      T-Display; the follow-up handoff evidence is recorded below.
+- [x] Follow-up at approximately 12:12 UTC: the same T-Display reported
+      `online`, `wifi_index: 3` (Pixel hotspot) and `relay_index: 3`, with
+      configuration revision 6 unchanged. Firmware uptime was 5,809 seconds,
+      consistent with the approximately 10:35 UTC verification boot above:
+      evidence of hotel-to-hotspot recovery within the same boot. The exact
+      transition and retry timing were not captured. Identity, two pairings
+      and NVS entry counts remained unchanged. The return handoff, locked
+      boot and other boards are still unverified.
 - [ ] Save three networks A/B/C. With only C available, cold boot both locked
       and unlocked; verify C joins and USB remains responsive during retries.
 - [ ] Unlock on C, then leave it powered while disabling C and enabling B.

@@ -382,6 +382,7 @@ struct SignCtx<'a, 'd, 'b> {
     network_page_draw: Option<(u32, Instant)>,
     /// Candidate being attempted; distinct from the successfully joined index.
     wifi_attempt_index: Option<u8>,
+    wifi_surveying: bool,
     /// Set when the served persona set changed (a derive over any path, or a
     /// registry removal): the live "hw" subscriptions re-REQ with fresh
     /// filters on the next loop pass instead of waiting for a reconnect, so
@@ -557,6 +558,7 @@ fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
                 NetworkRuntimeStage::SubscriptionSent => "relay connecting",
                 NetworkRuntimeStage::RelayConnecting => "relay connecting",
                 NetworkRuntimeStage::WifiReady => "wifi up",
+                NetworkRuntimeStage::WifiConnecting if ctx.wifi_surveying => "scanning wifi",
                 NetworkRuntimeStage::WifiConnecting => "joining wifi",
                 NetworkRuntimeStage::Starting => "starting",
                 NetworkRuntimeStage::ConfigError => "config error",
@@ -575,7 +577,7 @@ fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
             crate::oled::show_info_network(
                 ctx.display,
                 "WiFi standalone",
-                ssid.as_deref(),
+                if ctx.wifi_surveying { Some("Saved networks") } else { ssid.as_deref() },
                 status,
                 rssi,
             );
@@ -768,6 +770,127 @@ enum WifiJoinStage {
 /// Each join stage's limit: the one `BlockingWifi::connect` and
 /// `wait_netif_up` apply (esp-idf-svc's CONNECT_TIMEOUT).
 const WIFI_JOIN_STAGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Asynchronous surveys keep USB, cards and relay sockets serviced. Offline
+/// rounds are ranked once; connected surveys never disconnect the station.
+struct WifiSelector {
+    survey: Option<(Instant, bool)>, // deadline, offline
+    next_survey: Instant,
+    roam: crate::wifi_retry::Roam,
+}
+
+impl WifiSelector {
+    fn new() -> Self {
+        Self {
+            survey: None,
+            next_survey: Instant::now() + Duration::from_secs(60),
+            roam: Default::default(),
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.survey.is_some()
+    }
+
+    /// False only while an offline survey is pending. An online survey lets
+    /// normal relay service continue; a selected roam is joined next pass.
+    fn poll(
+        &mut self,
+        wifi: &mut BlockingWifi<EspWifi<'_>>,
+        candidates: &[(String, String)],
+        retry: &mut crate::wifi_retry::WifiRetry,
+        allow_roam: bool,
+    ) -> bool {
+        let offline = retry.needs_join(wifi.is_up().unwrap_or(false));
+        if self
+            .survey
+            .is_some_and(|(_, was_offline)| was_offline != offline)
+        {
+            let _ = wifi.wifi_mut().stop_scan();
+            let _ = wifi.wifi_mut().get_scan_result();
+            self.survey = None;
+            self.roam.reset();
+        }
+        if !offline && !allow_roam {
+            self.roam.reset();
+        }
+        if self.survey.is_none() {
+            let needed = if offline {
+                retry.needs_scan(wifi.is_up().unwrap_or(false))
+            } else {
+                allow_roam && candidates.len() > 1 && Instant::now() >= self.next_survey
+            };
+            if !needed {
+                return true;
+            }
+            let started = (|| {
+                if offline {
+                    crate::wifi_retry::Station::disconnect(&mut WifiStation { wifi, candidates })?;
+                }
+                wifi.wifi_mut().start_scan(&Default::default(), false)
+            })();
+            self.next_survey = Instant::now() + Duration::from_secs(30);
+            if let Err(error) = started {
+                log::warn!("[relay] WiFi survey unavailable: {error:?}");
+                if offline {
+                    retry.rank(&vec![None; candidates.len()]);
+                }
+                self.roam.reset();
+                return true;
+            }
+            self.survey = Some((Instant::now() + Duration::from_secs(8), offline));
+            return !offline;
+        }
+        let (deadline, _) = self.survey.unwrap();
+        let complete = wifi.wifi().is_scan_done().unwrap_or(false);
+        if !complete && Instant::now() < deadline {
+            return !offline;
+        }
+        if !complete {
+            let _ = wifi.wifi_mut().stop_scan();
+        }
+        let aps = wifi.wifi_mut().get_scan_result();
+        self.survey = None;
+        let scores: Vec<Option<i8>> = candidates
+            .iter()
+            .map(|(ssid, _)| {
+                aps.as_ref().ok().and_then(|aps| {
+                    aps.iter()
+                        .filter(|ap| ap.ssid.as_str() == ssid)
+                        .map(|ap| ap.signal_strength)
+                        .max()
+                })
+            })
+            .collect();
+        if offline {
+            retry.rank(&scores);
+            self.roam.reset();
+            self.next_survey = Instant::now() + Duration::from_secs(60);
+        } else if complete && aps.is_ok() && allow_roam {
+            if let Ok(ap) = wifi.wifi().get_ap_info() {
+                if let Some(index) = self.roam.observe(
+                    &scores,
+                    retry.index(),
+                    ap.signal_strength,
+                    crate::uptime_s(),
+                ) {
+                    log::info!(
+                        "[relay] stronger saved WiFi confirmed; switching to candidate {}",
+                        index + 1
+                    );
+                    retry.rank(&scores);
+                    retry.prefer(index);
+                    self.roam.reset();
+                }
+            } else {
+                self.roam.reset();
+            }
+        } else {
+            self.roam.reset();
+        }
+        true
+    }
+}
 
 /// A WiFi join that is polled rather than waited on, so the cable is served
 /// while it runs. `BlockingWifi::connect` waits only for the station to
@@ -1114,6 +1237,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         .collect();
     let wifi_config_ok = !wifi_candidates.is_empty();
     let mut wifi_retry = crate::wifi_retry::WifiRetry::default();
+    let mut wifi_selector = WifiSelector::new();
     // Initialise station mode only. Every join applies its own credentials
     // after cancelling the previous attempt, including the first boot join.
     wifi.set_configuration(&WifiConfig::Client(ClientConfiguration::default()))
@@ -1187,6 +1311,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 &mut wifi,
                 &wifi_candidates,
                 &mut wifi_retry,
+                &mut wifi_selector,
                 &relays,
                 op_mgmt.as_ref(),
                 &phones,
@@ -1253,6 +1378,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         idle_page: 0,
         network_page_draw: None,
         wifi_attempt_index: None,
+        wifi_surveying: false,
         resubscribe_needed: false,
         parks: Vec::new(),
         park_tombstones: Vec::new(),
@@ -1347,6 +1473,27 @@ pub fn run_wifi_standalone<'d, 'b>(
             }
             continue;
         }
+        let allow_roam = ctx.button_cards.is_empty()
+            && ctx.card_screen_hold.is_none()
+            && !crate::confirm::active()
+            && ctx.ota_session.is_none()
+            && ctx.network_trial_id.is_none()
+            && ctx.network_restart_at.is_none();
+        let selection_ready = wifi_selector.poll(
+            &mut wifi, &wifi_candidates, &mut wifi_retry, allow_roam,
+        );
+        ctx.wifi_surveying = !selection_ready;
+        if !selection_ready {
+            last_relay_healthy = Instant::now();
+            sessions.clear();
+            set_network_runtime(
+                &mut ctx, NetworkRuntimeStage::WifiConnecting,
+                false, false, NetworkRuntimeError::None,
+            );
+            serve_offline(usb, &mut ctx, None, &mut sessions);
+            FreeRtos::delay_ms(20);
+            continue;
+        }
         // Every relay session depends on the station link; restore it before
         // attempting any relay dial.
         if wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
@@ -1395,6 +1542,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 record_wifi_failure(&mut ctx, stage, &e, &wifi_disconnect_reason);
                 // Rotate to the next stored network for the next attempt. With
                 // a single configured network this re-selects the same one.
+                wifi_selector.roam.failed(wifi_retry.index(), crate::uptime_s());
                 wifi_retry.advance(wifi_candidates.len());
                 set_network_runtime(
                     &mut ctx,
@@ -1412,6 +1560,8 @@ pub fn run_wifi_standalone<'d, 'b>(
             }
             log::info!("[relay] wifi up");
             wifi_retry.mark_joined();
+            wifi_selector.roam.reset();
+            wifi_selector.next_survey = Instant::now() + Duration::from_secs(60);
             // The station is still pointed at the last candidate selected, so
             // that is the network it joined (a fallback, perhaps, not the
             // primary). Set before the stage change, which carries it.
@@ -1463,11 +1613,10 @@ pub fn run_wifi_standalone<'d, 'b>(
         if !approval_card_open(&ctx) {
             service_button(&mut ctx);
         }
-        // The WiFi driver is lent to USB only while no relay session is live —
-        // a scan mid-connection would knock the link off its channel, so a
-        // 0x55 during live service is declined (matches the old per-session
-        // loop, which lent the driver only in the between-sessions gaps).
-        let blocked = if sessions.is_empty() {
+        // The cabled scan is blocking, unlike the roaming survey. Lend the
+        // driver only between sessions and never while a survey owns its
+        // scan results, keeping relay service and scan ownership intact.
+        let blocked = if sessions.is_empty() && !wifi_selector.busy() {
             poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions)
         } else {
             poll_usb(usb, &mut ctx, None, &mut sessions)
@@ -2418,6 +2567,7 @@ fn locked_relay_phase(
     wifi: &mut BlockingWifi<EspWifi<'_>>,
     wifi_candidates: &[(String, String)],
     wifi_retry: &mut crate::wifi_retry::WifiRetry,
+    wifi_selector: &mut WifiSelector,
     relays: &[String],
     op_mgmt: Option<&[u8; 32]>,
     phones: &PhoneSet,
@@ -2504,6 +2654,11 @@ fn locked_relay_phase(
         // paced so USB unlock stays served between attempts. Each attempt is
         // polled across passes (WifiJoin), so USB unlock is served during it
         // too, not only in the 3 s between.
+        let selection_ready = if wifi_join.is_none() && Instant::now() >= next_wifi_attempt {
+            wifi_selector.poll(wifi, wifi_candidates, wifi_retry, true)
+        } else {
+            true
+        };
         if !wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
             if wifi_join.take().is_some() {
                 log::info!("[relay] locked: wifi up");
@@ -2517,11 +2672,13 @@ fn locked_relay_phase(
                 Some(JoinPoll::Joined) => {
                     wifi_join = None;
                     wifi_retry.mark_joined();
+                    wifi_selector.roam.reset();
+                    wifi_selector.next_survey = Instant::now() + Duration::from_secs(60);
                     log::info!("[relay] locked: wifi up");
                     None
                 }
                 Some(JoinPoll::Failed(_, e)) => Some(e),
-                None if Instant::now() >= next_wifi_attempt => {
+                None if selection_ready && Instant::now() >= next_wifi_attempt => {
                     match WifiJoin::start(wifi, wifi_candidates, wifi_retry) {
                         Ok(join) => {
                             wifi_join = Some(join);
@@ -2535,6 +2692,7 @@ fn locked_relay_phase(
             if let Some(e) = failed {
                 log::warn!("[relay] locked: wifi connect failed: {e:?}; retry in 3s");
                 wifi_join = None;
+                wifi_selector.roam.failed(wifi_retry.index(), crate::uptime_s());
                 wifi_retry.advance(wifi_candidates.len());
                 next_wifi_attempt = Instant::now() + Duration::from_secs(3);
             }

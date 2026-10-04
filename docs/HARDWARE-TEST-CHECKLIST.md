@@ -423,16 +423,34 @@ Multi-network WiFi (T-Display or Heltec in WiFi mode):
 - [ ] Over USB, add two fallback networks in Sapwood (e.g. phone hotspot +
       second AP), reorder them, save, and read back: the list survives the
       reboot and the redacted state shows ssid + password_set only.
-- [ ] Power the primary AP off. The signer rotates to the hotspot within a few
-      retry cycles (up to 15 s for association, another 15 s for DHCP, and
+- [ ] Power the primary AP off. The signer scans and tries the strongest visible
+      saved AP first (survey bounded to 8 s), then rotates on failure (up to
+      15 s for association, another 15 s for DHCP, and
       3 s backoff per failed candidate) and comes online — Sapwood and paired apps
       reach it again. (A console build also names each candidate as "wifi
       network N/M".)
 - [ ] Promote a fallback to primary in Sapwood using its saved password (no
-      password typed). The device joins it after reboot.
+      password typed). With it the strongest visible saved network, the device
+      joins it after reboot; saved position alone no longer overrides signal.
 - [ ] Encrypted-at-rest + WiFi: with the vault locked, the device now joins
       WiFi during the locked phase (previously the station never associated)
       and publishes its kind-24135 unlock announcement.
+
+Strongest-network selection and roaming (2026-10-04):
+- [x] Host policy tests cover strongest-first ranking, stable ties, hidden
+      fallbacks, a failed strong AP not starving a weaker one, fresh selection
+      after link loss, two-scan hysteresis and failed-target suppression.
+- [ ] With two saved APs visible, boot locked and unlocked: join the stronger
+      one regardless of saved position, retaining USB responsiveness during scan.
+- [ ] While connected, make another saved AP at least 10 dB stronger for two
+      scans. Verify the board switches and the relay reconnects without reboot.
+- [ ] Fluctuate the advantage below 10 dB, or change the winner between scans:
+      the current connection stays put. Repeat while an approval is displayed;
+      no proactive switch occurs until the approval/result has cleared.
+- [ ] Give the stronger AP incorrect credentials: recover to the working AP
+      and suppress further proactive attempts at the failed AP for five minutes.
+- [ ] The open WiFi page shows scanning, the actual join candidate, then the
+      connected SSID and signal; connectivity cards do not displace that page.
 
 Location-change regression (2026-10-04; partial T-Display bench verification):
 - [x] App-only update on the connected T-Display: installed factory partition

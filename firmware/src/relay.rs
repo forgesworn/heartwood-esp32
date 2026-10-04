@@ -9849,8 +9849,33 @@ fn dispatch_mgmt(
                 ctx.policy_engine
                     .update_slot(master_slot, slot_index, label, None, None, None)
             } else {
-                ctx.policy_engine
-                    .update_slot(master_slot, slot_index, label, methods, kinds, auto)
+                // Away approval: `escalate` is honoured on a legacy slot too,
+                // as the cable's CONNSLOT_UPDATE already does, so a slot
+                // flagged at the cable can be unflagged from the phone. Only
+                // this one family flag; the others keep their strict-only
+                // path. Parsed before anything changes, so a bad value
+                // leaves the slot untouched.
+                let escalate = match req.pointer("/params/escalate") {
+                    None => None,
+                    Some(value) => {
+                        Some(value.as_bool().ok_or("escalate must be a boolean")?)
+                    }
+                };
+                let updated = ctx
+                    .policy_engine
+                    .update_slot(master_slot, slot_index, label, methods, kinds, auto);
+                if let Some(escalate) = escalate.filter(|e| updated && *e != target.escalate) {
+                    ctx.policy_engine.set_slot_family_flags(
+                        master_slot,
+                        slot_index,
+                        escalate,
+                        target.petition_on_deny,
+                        target.audit_child_wrap,
+                        target.guardian_notice_wrap,
+                        target.bound_identity.clone(),
+                    );
+                }
+                updated
             };
             if updated {
                 persist_slot_mutation_or_rollback(

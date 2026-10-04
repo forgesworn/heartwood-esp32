@@ -2132,40 +2132,10 @@ pub fn show_info_network(
     mode_line: &str,
     ssid: Option<&str>,
     status: &str,
+    rssi: Option<i8>,
 ) {
-    let l = layout(display);
     display.clear_buffer();
-
-    let header = MonoTextStyleBuilder::new()
-        .font(l.font_header())
-        .text_color(ACCENT)
-        .build();
-    let body = MonoTextStyleBuilder::new()
-        .font(l.font_body())
-        .text_color(FG)
-        .build();
-    let small = MonoTextStyleBuilder::new()
-        .font(l.font_small())
-        .text_color(MUTED)
-        .build();
-
-    Text::new("NETWORK", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
-    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(ACCENT))
-        .draw(display)
-        .ok();
-
-    Text::new(mode_line, Point::new(l.sx(4), l.sy(28)), body).draw(display).ok();
-    if let Some(ssid) = ssid {
-        let ssid_line = format!("WiFi: {}", truncate_str(ssid, 15));
-        Text::new(&ssid_line, Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
-    } else {
-        Text::new("WiFi: not set", Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
-    }
-    let status_line = format!("Status: {status}");
-    Text::new(&status_line, Point::new(l.sx(4), l.sy(52)), small).draw(display).ok();
-
-    draw_page_marker(display, &l, 2, 3);
+    crate::network_screen::draw(display, mode_line, ssid, status, rssi);
     display.flush().ok();
 }
 

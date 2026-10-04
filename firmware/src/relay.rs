@@ -378,6 +378,8 @@ struct SignCtx<'a, 'd, 'b> {
     /// Idle info carousel position: 0 identity, 1 network, 2 device, 3 notes. Short
     /// presses while the panel is awake advance it; sleep resets it.
     idle_page: u8,
+    /// Refresh only while the network page still owns the panel.
+    network_page_draw: Option<(u32, Instant)>,
     /// Set when the served persona set changed (a derive over any path, or a
     /// registry removal): the live "hw" subscriptions re-REQ with fresh
     /// filters on the next loop pass instead of waiting for a reconnect, so
@@ -450,6 +452,15 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
         }
         ctx.button_settle = false;
         return;
+    }
+    if ctx.display_on && ctx.idle_page == 1 && ctx.button_cards.is_empty() {
+        if let Some((generation, drawn_at)) = ctx.network_page_draw {
+            if generation == crate::oled::draw_generation()
+                && drawn_at.elapsed() >= Duration::from_secs(2)
+            {
+                draw_relay_idle_page(ctx);
+            }
+        }
     }
     // A latched edge counts even when the finger is already off: this loop's
     // pass is ~1 s (socket recv timeouts dominate), longer than a human tap,
@@ -549,12 +560,24 @@ fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
                 NetworkRuntimeStage::ConfigError => "config error",
                 NetworkRuntimeStage::RadioOff => "radio off",
             };
+            let mut ap: esp_idf_svc::sys::wifi_ap_record_t = Default::default();
+            // SAFETY: ESP-IDF fills this valid out-parameter; a disconnected
+            // station returns an error, never a made-up zero-strength reading.
+            let rssi = if ctx.network_runtime.wifi_connected
+                && unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap) } == 0
+            {
+                Some(ap.rssi)
+            } else {
+                None
+            };
             crate::oled::show_info_network(
                 ctx.display,
                 "WiFi standalone",
                 ssid.as_deref(),
                 status,
+                rssi,
             );
+            ctx.network_page_draw = Some((crate::oled::draw_generation(), Instant::now()));
         }
         2 => crate::oled::show_info_device(
             ctx.display,
@@ -1214,6 +1237,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         network_runtime: NetworkRuntimeStatus::starting(),
         network_display_restore_at: None,
         idle_page: 0,
+        network_page_draw: None,
         resubscribe_needed: false,
         parks: Vec::new(),
         park_tombstones: Vec::new(),

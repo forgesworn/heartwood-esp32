@@ -13,6 +13,8 @@ mod layout;
 mod palette;
 #[path = "../../firmware/src/bigtext.rs"]
 mod bigtext;
+#[path = "../../firmware/src/network_screen.rs"]
+mod network_screen;
 
 use embedded_graphics::{
     mono_font::{MonoFont, MonoTextStyle, MonoTextStyleBuilder},
@@ -767,10 +769,26 @@ fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565
 
 fn main() {
     std::fs::create_dir_all("out").unwrap();
+    let network_only = std::env::args().any(|arg| arg == "--network-only");
     let npub = "npub1sg6plzptd64u62a878hep2kev88swjh3tw00gjsfl8f237lmu63q0uf63m";
     let boards = [("heltec", 128u32, 64u32), ("tdisplay", 240, 135), ("c6", 172, 320), ("c6-landscape", 320, 172)];
 
     for (b, w, h) in boards {
+        for (name, ssid, status, rssi) in [
+            ("online", "BOTEL-MARINA", "online", Some(-58)),
+            ("weak", "Pixel_4748", "online", Some(-83)),
+            ("joining", "A very long saved network name!!", "joining wifi", None),
+        ] {
+            render(&format!("wifi-{name}-{b}"), w, h, |d| {
+                network_screen::draw(d, "WiFi standalone", Some(ssid), status, rssi);
+            });
+        }
+        render(&format!("wifi-usb-{b}"), w, h, |d| {
+            network_screen::draw(d, "USB bridge", None, "radio off", None);
+        });
+        if network_only {
+            continue;
+        }
         render(&format!("ready-{b}"), w, h, |d| draw_ready(d));
         let tags = match b {
             "heltec" => Some(HELTEC_TAGS),
@@ -851,6 +869,10 @@ fn main() {
         render(&format!("error-rng-failed-{b}"), w, h, |d| {
             draw_error(d, "RNG self-test failed\nrefusing to generate")
         });
+    }
+
+    if network_only {
+        return;
     }
 
     // Focused T-Display network-operation gallery. The transition case first

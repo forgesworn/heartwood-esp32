@@ -2805,6 +2805,13 @@ dispatch without a card, so nothing parks.
   be approved at the device", never parked.
 - [ ] **33f.** Sapwood's own "Sapwood manager" pairing shows no Approve from
   my phone control.
+- [ ] **33g.** Signet switch (signet-app #18): in Signet, Advanced settings,
+  under the operator key, the owner's own app is listed and the Signet
+  guardian pairing and any dependant pairing are not. Turn the app on from the
+  phone (tick, Turn on), then Sapwood shows the same pairing ON; turn it off
+  from the phone, Sapwood shows OFF and every other field of that pairing
+  (methods, kinds, auto) is unchanged. With the operator key forgotten, the
+  section says to import it and reads nothing from the board.
 
 ## Notes
 

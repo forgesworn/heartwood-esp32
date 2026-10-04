@@ -1180,6 +1180,45 @@ pub fn unsigned_event_kind(params: &[Value]) -> Option<u64> {
     }
 }
 
+/// Whether the `sign_event` params carry a login challenge
+/// ([`crate::policy::is_login_challenge`]): kind 22242 with any `code` tag.
+///
+/// For the places that must decide a tier before the event is parsed in
+/// full (relay pre-dispatch, USB snapshot). Unreadable params are not a login
+/// challenge; the handler's own parse then refuses them as a bad event.
+pub fn unsigned_event_is_login_challenge(params: &[Value]) -> bool {
+    let parsed;
+    let object = match params.first() {
+        Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
+            Ok(value) => {
+                parsed = value;
+                &parsed
+            }
+            Err(_) => return false,
+        },
+        Some(value) => value,
+        None => return false,
+    };
+    let Some(kind) = object.get("kind").and_then(Value::as_u64) else {
+        return false;
+    };
+    let tags: Vec<Vec<String>> = object
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(Value::as_array)
+                .map(|tag| {
+                    tag.iter()
+                        .map(|part| part.as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::policy::is_login_challenge(kind, &tags)
+}
+
 /// Consume `sign_event` params while parsing the event.
 ///
 /// The by-value form lets firmware drop the stringified request body as soon
@@ -2522,5 +2561,22 @@ mod tests {
         let expected: [u8; 32] = hasher.finalize().into();
 
         assert_eq!(compute_event_id(&event), expected);
+    }
+
+    #[test]
+    fn params_login_challenge_predicate() {
+        use serde_json::json;
+        let login = json!({"kind": 22242, "tags": [["challenge", "ab"], ["code", "4821"]], "content": "x", "created_at": 1});
+        let auth = json!({"kind": 22242, "tags": [["relay", "wss://r"]], "content": "", "created_at": 1});
+        let other = json!({"kind": 1, "tags": [["code", "4821"]], "content": "", "created_at": 1});
+        let malformed = json!({"kind": 22242, "tags": [["code", "1"], ["code", "2"]], "content": "", "created_at": 1});
+        // Object form and the stringified form clients usually send.
+        assert!(unsigned_event_is_login_challenge(&[login.clone()]));
+        assert!(unsigned_event_is_login_challenge(&[Value::String(login.to_string())]));
+        assert!(unsigned_event_is_login_challenge(&[malformed]));
+        assert!(!unsigned_event_is_login_challenge(&[auth]));
+        assert!(!unsigned_event_is_login_challenge(&[other]));
+        assert!(!unsigned_event_is_login_challenge(&[]));
+        assert!(!unsigned_event_is_login_challenge(&[Value::String("not json".into())]));
     }
 }

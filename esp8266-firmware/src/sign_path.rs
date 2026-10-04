@@ -197,6 +197,18 @@ fn sign_event(
         Err(e) => return nip46::build_error_response(&req.id, -32602, &e).ok(),
     };
 
+    // A login challenge (kind 22242 with a `code` tag) must be approved with
+    // its code on screen, and this board's prompt shows only the kind and
+    // content. Refuse rather than sign what the owner cannot compare.
+    if heartwood_common::policy::is_login_challenge(ev.kind, &ev.tags) {
+        return nip46::build_error_response(
+            &req.id,
+            -32000,
+            "login challenges need a signer that can show the code",
+        )
+        .ok();
+    }
+
     // Physical-approval gate: the daemon can deliver a sign request but cannot
     // approve it — show what is being signed and require an on-device button hold.
     oled.show_sign_prompt(ev.kind, &ev.content);

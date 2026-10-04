@@ -849,6 +849,18 @@ fn dispatch_inner(
         .as_ref()
         .and_then(|event| event.as_ref().ok())
         .map(|event| event.kind);
+    // A login challenge (kind 22242 with a `code` tag) shows its code on the
+    // card. One whose code cannot be shown is refused outright: never sign
+    // what the owner cannot compare, and never fall back to an ordinary card.
+    let login_class = sign_event
+        .as_ref()
+        .and_then(|event| event.as_ref().ok())
+        .map(|event| heartwood_common::policy::classify_login(event.kind, &event.tags));
+    if matches!(login_class, Some(heartwood_common::policy::LoginChallenge::Malformed)) {
+        log::warn!("sign_event: refused: malformed login challenge");
+        return build_error_json(&request.id, -3, "malformed login challenge");
+    }
+    let login_challenge = login_class.is_some_and(|class| class != heartwood_common::policy::LoginChallenge::No);
 
     // Determine the client pubkey for policy lookups.
     // In encrypted mode (passthrough), it comes from the frame header.
@@ -871,7 +883,7 @@ fn dispatch_inner(
         "direct app".to_string()
     };
     let tier = if has_client {
-        policy_engine.check(master_slot, &client_hex, &method, event_kind)
+        policy_engine.check_for_event(master_slot, &client_hex, &method, event_kind, login_challenge)
     } else {
         heartwood_common::policy::ApprovalTier::ButtonRequired
     };
@@ -1284,8 +1296,7 @@ fn dispatch_inner(
                                 kind: event.kind,
                                 identity: identity_line.clone(),
                                 heading,
-                                login_code: heartwood_common::policy::login_code_for_event(event.kind, &event.tags)
-                                    .map(str::to_string),
+                                login_code: login_code_of(&event),
                             },
                             request,
                             event: Some(event),
@@ -2421,6 +2432,15 @@ fn handle_auto_sign(
 // sign_event (interactive, button-required)
 // ---------------------------------------------------------------------------
 
+/// The code a login card shows for this event: set only for a login challenge
+/// with one valid `code` tag (a malformed one never reaches a card).
+fn login_code_of(event: &UnsignedEvent) -> Option<String> {
+    match heartwood_common::policy::classify_login(event.kind, &event.tags) {
+        heartwood_common::policy::LoginChallenge::Valid(code) => Some(code.to_string()),
+        _ => None,
+    }
+}
+
 fn handle_sign_event(
     master_secret: &[u8; 32],
     master_mode: MasterMode,
@@ -2434,8 +2454,7 @@ fn handle_sign_event(
     event: UnsignedEvent,
 ) -> String {
     let (kind, _content_preview) = nip46::event_display_summary(&event, 50);
-    let login_code = heartwood_common::policy::login_code_for_event(event.kind, &event.tags)
-        .map(str::to_string);
+    let login_code = login_code_of(&event);
 
     // Show the signing request on the OLED and wait for button approval.
     // The countdown bar updates every second; the approval module handles

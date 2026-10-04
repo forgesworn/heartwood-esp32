@@ -21,7 +21,7 @@
 //! "release this 12-sat note" must never be the wording on a hold that
 //! releases three notes worth a thousand.
 
-use alloc::string::String;
+use alloc::{format, string::String};
 
 /// Most asks one hold may authorise. The card shows the count, and the batch
 /// is only ever one client asking for one identity.
@@ -55,6 +55,14 @@ impl AskKey {
             kind_key,
         }
     }
+}
+
+/// The batch key of a login challenge: unique per ask (`seq` is a per-boot
+/// counter), so a login challenge never shares a card and one hold can never
+/// sign two of them. It must not depend on anything the client chooses, such
+/// as the request id.
+pub fn login_kind_key(base: &str, seq: u64) -> String {
+    format!("{base}#login{seq}")
 }
 
 /// What to do with an incoming interactive ask.
@@ -244,5 +252,25 @@ mod tests {
             admit(None, 0, MAX_WAITING, &key(3, "ee", "ff")),
             Admission::Open
         );
+    }
+
+    #[test]
+    fn a_login_challenge_never_shares_a_card() {
+        // Same client, identity and request id: only the sequence differs, and
+        // it is the device's, so the client cannot make two challenges equal.
+        let base = "sign_event:22242";
+        let kk = |_: &str, kind_key: &str| {
+            AskKey::new(1, "cc".to_string(), "dd".to_string(), kind_key.to_string())
+        };
+        let a = kk(base, &login_kind_key(base, 0));
+        let b = kk(base, &login_kind_key(base, 1));
+        assert_ne!(a, b);
+        assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
+        assert_ne!(admit(Some(&a), 1, 0, &b), Admission::Collapse);
+        // Ordinary asks of that kind still batch.
+        let plain = kk(base, base);
+        assert_eq!(admit(Some(&plain), 1, 0, &kk(base, base)), Admission::Collapse);
+        // A login ask does not join an ordinary card of the same kind either.
+        assert_eq!(admit(Some(&plain), 1, 0, &a), Admission::Wait);
     }
 }

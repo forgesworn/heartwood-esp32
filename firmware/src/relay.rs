@@ -5235,11 +5235,17 @@ fn queue_button_ask(
         kind_key.push('@');
         kind_key.extend(heartwood_common::policy::identity_tag(identity).iter().map(|&b| b as char));
     }
-    // Each login challenge is its own decision: its card shows one code, so
-    // one hold must never also sign a second challenge with a different code.
-    if ask.event.as_ref().is_some_and(|event| event.kind == heartwood_common::policy::LOGIN_EVENT_KIND) {
-        kind_key.push('#');
-        kind_key.push_str(&ask.request.id);
+    // A login challenge never shares a card: its card shows one code, so one
+    // hold must never also sign a second challenge. The key is unique per ask
+    // and owes nothing to the client, which picks its own request ids.
+    if ask
+        .event
+        .as_ref()
+        .is_some_and(|event| heartwood_common::policy::is_login_challenge(event.kind, &event.tags))
+    {
+        static LOGIN_ASK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = LOGIN_ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        kind_key = heartwood_common::approval_queue::login_kind_key(&kind_key, seq);
     }
     // A HOLD TO SIGN ask and an ALLOW AS ask (or any two card kinds) are
     // different decisions and never share one hold.
@@ -7247,7 +7253,11 @@ fn handle_nip46_event(
     // The same gate dispatch will apply, planned from the same facts, so
     // escalation, petitions, rollback and the notice's identity see the
     // identity and list-identities cards and not only the method policy.
-    let base_tier = ctx.policy_engine.check(slot, &ev.pubkey, &method_enum, event_kind);
+    let login_challenge = matches!(method_enum, nip46::Nip46Method::SignEvent)
+        && nip46::unsigned_event_is_login_challenge(&request.params);
+    let base_tier = ctx
+        .policy_engine
+        .check_for_event(slot, &ev.pubkey, &method_enum, event_kind, login_challenge);
     let active_context = if request.heartwood.is_none() {
         crate::nip46_handler::resolve_active_context(
             ctx.policy_engine,
@@ -7297,10 +7307,9 @@ fn handle_nip46_event(
     let route = heartwood_common::escalate::route_request(
         tier,
         method_enum.pinned_physical(),
-        // A login challenge (kind 22242) must be answered at the device, with
-        // its code on screen; no guardian verdict may complete it.
-        method_enum.device_press_only()
-            || event_kind == Some(heartwood_common::policy::LOGIN_EVENT_KIND),
+        // A login challenge must be answered at the device, with its code on
+        // screen; no guardian verdict may complete it.
+        heartwood_common::escalate::device_only_request(method_enum.device_press_only(), login_challenge),
         escalate_slot,
     );
     if matches!(route, heartwood_common::escalate::Route::Refuse) {

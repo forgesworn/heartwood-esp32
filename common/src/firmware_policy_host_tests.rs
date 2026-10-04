@@ -1028,9 +1028,14 @@ fn login_challenge_is_never_auto_approved_by_the_engine() {
     engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![], true).unwrap();
     let client = pubkey_hex(1);
     assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
-    let check = |engine: &PolicyEngine, kind| engine.check(0, &client, &Nip46Method::SignEvent, Some(kind));
+    let check = |engine: &PolicyEngine, kind| engine.check_for_event(0, &client, &Nip46Method::SignEvent, Some(kind), kind == LOGIN_EVENT_KIND);
     assert_eq!(check(&engine, 1), ApprovalTier::AutoApprove);
     assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    // Plain NIP-42 relay AUTH (22242 without a code tag) is not a login.
+    assert_eq!(
+        engine.check_for_event(0, &client, &Nip46Method::SignEvent, Some(LOGIN_EVENT_KIND), false),
+        ApprovalTier::AutoApprove,
+    );
     engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![1, LOGIN_EVENT_KIND], true).unwrap();
     assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
     // A guardian's approve-once window cannot lift it either.

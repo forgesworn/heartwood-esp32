@@ -256,10 +256,25 @@ pub fn validate_exact_slot_policy(
 /// invariants such as ping/get_public_key are handled by the caller first; this
 /// helper is deliberately pure so the firmware's exact deny boundary runs in
 /// host CI as well as on the ESP.
+///
+/// This form is for requests that are not login challenges. A caller holding
+/// the event being signed must use [`evaluate_slot_policy_for_event`] with
+/// [`is_login_challenge`], or a login challenge could be auto-approved.
 pub fn evaluate_slot_policy(
     slot: &ConnectSlot,
     method: &str,
     event_kind: Option<u64>,
+) -> ApprovalTier {
+    evaluate_slot_policy_for_event(slot, method, event_kind, false)
+}
+
+/// [`evaluate_slot_policy`] for a request whose event is known:
+/// `login_challenge` is [`is_login_challenge`] of the event about to be signed.
+pub fn evaluate_slot_policy_for_event(
+    slot: &ConnectSlot,
+    method: &str,
+    event_kind: Option<u64>,
+    login_challenge: bool,
 ) -> ApprovalTier {
     if !slot.allowed_methods.iter().any(|allowed| allowed == method) {
         return if strict_slot_denies_method(slot, method) {
@@ -288,12 +303,13 @@ pub fn evaluate_slot_policy(
         }
     }
 
-    // A kind 22242 sign_event logs somebody in to a node's dashboard, and the
-    // login page is reachable by anyone who can see the node. It is therefore
-    // never silent, whatever the slot allows: a button press with the code on
-    // screen is the only way it signs. (A strict slot that excludes the kind
-    // was already denied above.)
-    if method == "sign_event" && event_kind == Some(LOGIN_EVENT_KIND) {
+    // A login challenge (kind 22242 carrying a `code` tag) logs somebody in to
+    // a node's dashboard, and the login page is reachable by anyone who can
+    // see the node. It is therefore never silent, whatever the slot allows: a
+    // button press with the code on screen is the only way it signs. (A strict
+    // slot that excludes the kind was already denied above. Plain NIP-42 relay
+    // AUTH, with no `code` tag, is not a login challenge and is unaffected.)
+    if method == "sign_event" && login_challenge {
         return ApprovalTier::ButtonRequired;
     }
 
@@ -307,6 +323,40 @@ pub fn evaluate_slot_policy(
 /// The event kind of an Archipelago node login challenge. Always owes a
 /// physical press: see [`evaluate_slot_policy`].
 pub const LOGIN_EVENT_KIND: u64 = 22242;
+
+/// How an event reads as a node login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginChallenge<'a> {
+    /// Not a login challenge: another kind, or 22242 with no `code` tag
+    /// (plain NIP-42 relay AUTH). Treated exactly as before.
+    No,
+    /// A login challenge with exactly one valid code, to show on the card.
+    Valid(&'a str),
+    /// Kind 22242 with a `code` tag that is not exactly one 4 to 8 digit
+    /// value. Still a login challenge for policy, but it cannot be displayed,
+    /// so it must be refused: never signed, never shown as an ordinary card.
+    Malformed,
+}
+
+/// Classify an event about to be signed. The one predicate every path uses.
+pub fn classify_login(kind: u64, tags: &[Vec<String>]) -> LoginChallenge<'_> {
+    if kind != LOGIN_EVENT_KIND {
+        return LoginChallenge::No;
+    }
+    if !tags.iter().any(|tag| tag.first().map(String::as_str) == Some("code")) {
+        return LoginChallenge::No;
+    }
+    match login_code_from_tags(tags) {
+        Some(code) => LoginChallenge::Valid(code),
+        None => LoginChallenge::Malformed,
+    }
+}
+
+/// Whether an event is a login challenge: kind 22242 carrying any `code`
+/// tag. Such an event always needs a button press.
+pub fn is_login_challenge(kind: u64, tags: &[Vec<String>]) -> bool {
+    classify_login(kind, tags) != LoginChallenge::No
+}
 
 /// The code a login approval screen shows large: the value of the event's one
 /// `code` tag, when it is 4 to 8 ASCII digits.
@@ -2943,31 +2993,37 @@ mod tests {
         // the login kind is not.
         let open = login_slot(true, vec![], false);
         assert_eq!(evaluate_slot_policy(&open, "sign_event", Some(1)), ApprovalTier::AutoApprove);
-        assert_eq!(evaluate_slot_policy(&open, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::ButtonRequired);
+        assert_eq!(evaluate_slot_policy_for_event(&open, "sign_event", Some(LOGIN_EVENT_KIND), true), ApprovalTier::ButtonRequired);
 
         // auto_approve with the kind explicitly listed, strict or legacy.
         for strict in [false, true] {
             let listed = login_slot(true, vec![1, LOGIN_EVENT_KIND], strict);
             assert_eq!(evaluate_slot_policy(&listed, "sign_event", Some(1)), ApprovalTier::AutoApprove);
             assert_eq!(
-                evaluate_slot_policy(&listed, "sign_event", Some(LOGIN_EVENT_KIND)),
+                evaluate_slot_policy_for_event(&listed, "sign_event", Some(LOGIN_EVENT_KIND), true),
                 ApprovalTier::ButtonRequired,
                 "strict={strict}",
             );
         }
 
+        // Plain NIP-42 relay AUTH (22242, no `code` tag) is not a login
+        // challenge and keeps today's behaviour, listed or not.
+        assert_eq!(evaluate_slot_policy_for_event(&open, "sign_event", Some(LOGIN_EVENT_KIND), false), ApprovalTier::AutoApprove);
         // An event whose kind could not be read is not a login and keeps
-        // today's behaviour.
+        // today's behaviour. That is safe only because every signing caller
+        // derives the kind from the event it signs (an unparseable event is
+        // refused before signing): never feed a scanner-derived kind into a
+        // signing decision.
         assert_eq!(evaluate_slot_policy(&open, "sign_event", None), ApprovalTier::AutoApprove);
     }
 
     #[test]
     fn login_kind_excluded_by_a_strict_slot_is_still_denied() {
         let strict = login_slot(true, vec![1, 7], true);
-        assert_eq!(evaluate_slot_policy(&strict, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::Denied);
+        assert_eq!(evaluate_slot_policy_for_event(&strict, "sign_event", Some(LOGIN_EVENT_KIND), true), ApprovalTier::Denied);
         // A legacy slot that excludes it falls back to the button, as for any kind.
         let legacy = login_slot(true, vec![1, 7], false);
-        assert_eq!(evaluate_slot_policy(&legacy, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::ButtonRequired);
+        assert_eq!(evaluate_slot_policy_for_event(&legacy, "sign_event", Some(LOGIN_EVENT_KIND), true), ApprovalTier::ButtonRequired);
     }
 
     #[test]
@@ -2977,7 +3033,7 @@ mod tests {
         assert_eq!(evaluate_slot_policy(&slot, "nip44_encrypt", None), ApprovalTier::AutoApprove);
         // A strict slot that never signed still denies, as before.
         slot.signing_approved = false;
-        assert_eq!(evaluate_slot_policy(&slot, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::Denied);
+        assert_eq!(evaluate_slot_policy_for_event(&slot, "sign_event", Some(LOGIN_EVENT_KIND), true), ApprovalTier::Denied);
     }
 
     fn tag(parts: &[&str]) -> Vec<String> {
@@ -3023,6 +3079,40 @@ mod tests {
         assert_eq!(login_code_for_event(LOGIN_EVENT_KIND, &tags), Some("1234"));
         assert_eq!(login_code_for_event(1, &tags), None);
         assert_eq!(login_code_for_event(LOGIN_EVENT_KIND, &[]), None);
+    }
+
+    #[test]
+    fn login_challenge_classification() {
+        let valid = vec![tag(&["challenge", "ab"]), tag(&["code", "4821"])];
+        assert_eq!(classify_login(LOGIN_EVENT_KIND, &valid), LoginChallenge::Valid("4821"));
+        assert!(is_login_challenge(LOGIN_EVENT_KIND, &valid));
+        // Plain NIP-42 relay AUTH: 22242 with no code tag is not a login.
+        let auth = vec![tag(&["relay", "wss://r"]), tag(&["challenge", "x"])];
+        assert_eq!(classify_login(LOGIN_EVENT_KIND, &auth), LoginChallenge::No);
+        assert!(!is_login_challenge(LOGIN_EVENT_KIND, &auth));
+        assert!(!is_login_challenge(LOGIN_EVENT_KIND, &[]));
+        // Another kind with a code tag is not a login either.
+        assert_eq!(classify_login(1, &valid), LoginChallenge::No);
+        // A code tag that cannot be shown is malformed, and still a challenge
+        // for policy: wrong length, non-digits, no value, several tags.
+        for tags in [
+            vec![tag(&["code", "12"])],
+            vec![tag(&["code", "12a4"])],
+            vec![tag(&["code"])],
+            vec![tag(&["code", "1234"]), tag(&["code", "5678"])],
+        ] {
+            assert_eq!(classify_login(LOGIN_EVENT_KIND, &tags), LoginChallenge::Malformed, "{tags:?}");
+            assert!(is_login_challenge(LOGIN_EVENT_KIND, &tags));
+        }
+    }
+
+    #[test]
+    fn plain_relay_auth_is_unchanged_by_the_login_rule() {
+        let open = login_slot(true, vec![], false);
+        assert_eq!(evaluate_slot_policy_for_event(&open, "sign_event", Some(LOGIN_EVENT_KIND), false), ApprovalTier::AutoApprove);
+        assert_eq!(evaluate_slot_policy(&open, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::AutoApprove);
+        let strict = login_slot(true, vec![1], true);
+        assert_eq!(evaluate_slot_policy_for_event(&strict, "sign_event", Some(LOGIN_EVENT_KIND), false), ApprovalTier::Denied);
     }
 
     #[test]

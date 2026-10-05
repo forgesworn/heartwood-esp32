@@ -2862,7 +2862,11 @@ take the `cx1` on file from the mint (moneyer: `zap_names.cx1`) or from
    and an approve-once verdict completes it.
 8. USB-bridged board through heartwoodd: the card is the extension card
    (master heading, the method name, then the preview), not the titled
-   ADDRESS PROOF card; check the address and action are readable there. Over
+   ADDRESS PROOF card. KNOWN: `show_master_sign_request` cuts the preview to
+   one small line's worth of characters, so the address shows and the action
+   is cut to `regi...` / `unre...`, as every note card's second line is cut on
+   that path today (trust loses "notes skip the hold"). Record what the panel
+   shows; a titled card on that path is a follow-up for all note cards. Over
    the cable's 0x70 frame, `cash_address_proof` answers `bad_request` ("not
    available on this surface"), as `cash_address` does.
 9. Unbound client: `unauthorised`, like every other note method.

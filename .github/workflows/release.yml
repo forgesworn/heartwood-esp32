@@ -398,7 +398,7 @@ jobs:
               release_args=(--prerelease)
               ;;
             *-beta.*)
-              notes="$(printf '%s\n\n%s' 'BETA CANDIDATE: automated and signed-build gates passed. This release remains a draft until the retained-state migration, reboot/unlock and small-value settlement gates pass on the named Heltec V4.' "$notes")"
+              notes="$(printf '%s\n\n%s' 'BETA CANDIDATE: automated and signed-build gates passed. This release remains a draft until the retained-state migration, reboot/unlock and small-value settlement gates pass on the T-Display, the main device.' "$notes")"
               release_args=(--prerelease --draft)
               ;;
           esac

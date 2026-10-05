@@ -704,6 +704,13 @@ impl NoteStore {
     }
 
     /// Received notes a wallet has not yet rotated and marked spent.
+    /// Notes that are still money or about to be: pending and confirmed.
+    /// A spent record is kept as a receipt (MAX_SPENT) but holds nothing, so
+    /// the idle screen's "held" must not count it.
+    pub fn live_count(&self) -> usize {
+        self.notes.iter().filter(|n| n.state != NoteState::Spent).count()
+    }
+
     pub fn received_count(&self) -> usize {
         self.notes
             .iter()
@@ -1757,6 +1764,25 @@ mod tests {
             .import_key(&mut storage, &mut rng, &secret, key, &endpoint, 1_000, "", 1)
             .unwrap();
         assert_eq!(store.export_secret(&id).unwrap(), note["ck1"].as_str().unwrap());
+    }
+
+    #[test]
+    fn a_spent_record_is_not_a_live_note() {
+        // The idle screen said "2 held" for two notes already paid out.
+        let mut storage = FakeStorage::new();
+        let mut store = fresh_store(&mut storage);
+        let mut rng = test_rng();
+        let alice = [0xa1u8; 32];
+        let (a, _) = store
+            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], None, "mint.example", 5_000, "", &alice, 10, false)
+            .unwrap();
+        store
+            .receive(&mut storage, &mut rng, &[4u8; SECRET_LEN], None, "mint.example", 7_000, "", &alice, 11, false)
+            .unwrap();
+        assert_eq!((store.counts().0, store.live_count()), (2, 2));
+        store.mark_spent(&mut storage, &a, 12).unwrap();
+        // the record stays as a receipt, but it holds nothing
+        assert_eq!((store.counts().0, store.live_count()), (2, 1));
     }
 
     #[test]

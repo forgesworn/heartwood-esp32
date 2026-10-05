@@ -706,9 +706,11 @@ pub struct IdleSummary {
 /// flash I/O and cannot change a note or an approval decision.
 pub fn idle_summary() -> IdleSummary {
     with_locker(|notes| {
-        let (loaded, pending) = notes.store.counts();
+        let (_, pending) = notes.store.counts();
         IdleSummary {
-            held: loaded + notes.sealed_count(),
+            // Spent records are receipts, not money; a sealed record's state
+            // cannot be read yet, so it still counts.
+            held: notes.store.live_count() + notes.sealed_count(),
             received: notes.store.received_count(),
             pending,
         }

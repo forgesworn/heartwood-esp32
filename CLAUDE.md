@@ -241,8 +241,12 @@ that is ours) is checked by the one pure `note_cmd::address_proof_ask` before
 the card, on the relay precheck and in the dispatcher alike; the card
 (`note_cmd::address_proof_card`) is ADDRESS PROOF over `<name>@<domain>` and
 `<action>, current keys` or `old keys`. Pinned ButtonRequired like the other
-note mutations (so a guardian verdict may answer it with that card in front of
-them, section 24), scoped to the served key (`method_uses_served_key`), and an
+note mutations, and device-press-only (`Nip46Method::device_press_only`, as a
+wallet pairing is): a proof never expires and decides where a name pays, so no
+guardian verdict may answer it and an escalate slot is refused outright. It
+never shares a card (`approval_queue::never_shares_card`), and nor, since the
+same change, does `heartwood_note_trust`, which used to batch so one hold
+trusted every sender behind the first npub shown; scoped to the served key (`method_uses_served_key`), and an
 ask never shares a card (`approval_queue::never_shares_card`): a batch card
 speaks in notes and sats and could not name a second proof. The cable has no
 identity, so `cash_address_proof` there refuses before the card, as

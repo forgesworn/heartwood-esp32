@@ -68,10 +68,11 @@ pub fn login_kind_key(base: &str, seq: u32) -> String {
 /// Methods whose ask never shares a card, whoever sends it: each one's card
 /// names a single decision that a batch card has no way to say. An address
 /// proof's card names one lightning address, one action and one branch; a
-/// batch card speaks in notes and sats, so a second proof joining the first
-/// would be signed on a hold that showed the owner neither.
+/// trust card names one sender's npub. A batch card speaks in notes and sats,
+/// so a second proof or a second sender joining the first would be approved
+/// on a hold that showed the owner neither.
 pub fn never_shares_card(method: &str) -> bool {
-    method == "heartwood_note_address_proof"
+    matches!(method, "heartwood_note_address_proof" | "heartwood_note_trust")
 }
 
 /// The batch key of an ask that must never share a card
@@ -288,6 +289,18 @@ mod tests {
         assert_eq!(admit(Some(&plain), 1, 0, &kk(base, base)), Admission::Collapse);
         // A login ask does not join an ordinary card of the same kind either.
         assert_eq!(admit(Some(&plain), 1, 0, &a), Admission::Wait);
+    }
+
+    #[test]
+    fn two_trusts_never_share_a_hold() {
+        // One hold used to trust every sender batched behind the card, while
+        // the card showed only the first npub.
+        let base = "heartwood_note_trust";
+        assert!(never_shares_card(base));
+        let kk = |kind_key: &str| AskKey::new(1, "cc".to_string(), "dd".to_string(), kind_key.to_string());
+        let a = kk(&unshared_kind_key(base, 0));
+        let b = kk(&unshared_kind_key(base, 1));
+        assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
     }
 
     #[test]

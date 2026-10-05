@@ -2857,9 +2857,13 @@ take the `cx1` on file from the mint (moneyer: `zap_names.cx1`) or from
 6. Never batched: two proofs sent back to back from one client raise two
    cards, one after the other, each with its own address and action; one hold
    never answers both.
-7. Escalate slot (section 24): the proof parks, the guardian's notice carries
-   the card's text (`ADDRESS PROOF` / `<name>@<domain> / register, old keys`),
-   and an approve-once verdict completes it.
+7. Escalate slot (section 24): the proof is refused outright, not parked. It
+   is device-press-only (`Nip46Method::device_press_only`), like a wallet
+   pairing: a proof is a standing authority over where a name pays, so no
+   guardian verdict may stand in for the owner at the board.
+7a. Two `heartwood_note_trust` asks for different senders, back to back from
+   one client, raise two TRUST SENDER cards, each with its own npub; one hold
+   never trusts both (they used to batch onto the first card).
 8. USB-bridged board through heartwoodd: the card is the extension card
    (master heading, the method name, then the preview), not the titled
    ADDRESS PROOF card. KNOWN: `show_master_sign_request` cuts the preview to

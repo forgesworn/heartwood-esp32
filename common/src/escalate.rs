@@ -369,6 +369,10 @@ mod tests {
         use crate::nip46::Nip46Method as M;
         assert!(M::HeartwoodProvisionRendezvous.device_press_only());
         assert!(M::HeartwoodPairWallet.device_press_only());
+        // and the address proof, a standing authority over where a name pays
+        assert!(M::HeartwoodNoteAddressProof.device_press_only());
+        assert!(!M::HeartwoodNoteAddressProof.verdict_may_answer_card());
+        assert!(M::HeartwoodNoteAddressProof.pinned_physical());
         assert!(!M::HeartwoodNoteSend.device_press_only());
         assert!(!M::HeartwoodDerive.device_press_only());
         // And neither may ever have its card answered by a verdict.
@@ -389,9 +393,6 @@ mod tests {
             M::HeartwoodNoteSpent,
             M::HeartwoodNoteRename,
             M::HeartwoodNoteTrust,
-            // The guardian sees the same card (relay_card): which address,
-            // which way, and which branch agrees.
-            M::HeartwoodNoteAddressProof,
         ] {
             assert!(method.verdict_may_answer_card(), "{}", method.as_str());
         }

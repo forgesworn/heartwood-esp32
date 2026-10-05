@@ -5472,9 +5472,10 @@ fn queue_button_ask(
         let seq = LOGIN_ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         kind_key = heartwood_common::approval_queue::login_kind_key(&kind_key, seq);
     }
-    // An address proof never shares a card either: its card names one
-    // address, one action and one branch, and a batch card speaks in notes
-    // and sats, so a second proof must never ride the first one's hold.
+    // Nor does an address proof or a trust: each card names one decision
+    // (an address, action and branch; one sender's npub), and a batch card
+    // speaks in notes and sats, so a second ask must never ride the first
+    // one's hold.
     if heartwood_common::approval_queue::never_shares_card(&ask.request.method) {
         static UNSHARED_ASK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = UNSHARED_ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

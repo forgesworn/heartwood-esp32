@@ -389,6 +389,9 @@ mod tests {
             M::HeartwoodNoteSpent,
             M::HeartwoodNoteRename,
             M::HeartwoodNoteTrust,
+            // The guardian sees the same card (relay_card): which address,
+            // which way, and which branch agrees.
+            M::HeartwoodNoteAddressProof,
         ] {
             assert!(method.verdict_may_answer_card(), "{}", method.as_str());
         }
@@ -489,6 +492,7 @@ mod tests {
             M::HeartwoodNoteSend,
             M::HeartwoodNoteRename,
             M::HeartwoodNoteTrust,
+            M::HeartwoodNoteAddressProof,
         ] {
             assert!(method.pinned_physical(), "{} lost its pin", method.as_str());
         }

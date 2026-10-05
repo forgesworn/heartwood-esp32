@@ -108,8 +108,9 @@ pub fn address_node(identity_secret: &[u8; 32], host: &str) -> Result<CashNode, 
 }
 
 /// The same mint's branch on the superseded `m/139'/1'` path. Never handed
-/// out; only claimed from.
-fn superseded_address_node(identity_secret: &[u8; 32], host: &str) -> Result<CashNode, &'static str> {
+/// out; only claimed from, and asked to agree to moving a name off it
+/// ([`address_proof_for`]).
+pub(crate) fn superseded_address_node(identity_secret: &[u8; 32], host: &str) -> Result<CashNode, &'static str> {
     let seed = nostr_cash_seed(identity_secret);
     let root = derive_cash_child(&derive_cash_root(seed.as_ref())?, SUPERSEDED_ADDRESS_BRANCH)?;
     derive_cash_domain_node(&root, host)
@@ -322,6 +323,172 @@ pub fn claim_note_key(
     Err("that note is paid to a key this device does not hold")
 }
 
+// ---- address proofs: the branch on file agrees to a change of name ----
+//
+// A `cx1` is public, so a mint will not point a name at one, or away from
+// one, on the say-so of whoever holds the name's NIP-98 key alone: LUD-25
+// (`50d740a`) wants the branch itself to agree. Agreement is a BIP-340
+// signature by the branch's purpose-0 index-0 key over
+// `sha256(utf8("LNURLcash:<action>:<domain>:<username>"))`. A fresh name is
+// proven by the branch it is pointed at; changing or clearing a name's `cx1`
+// is proven by the branch CURRENTLY on file, which for a name registered
+// before `50d740a` is this device's superseded branch. So a proof is asked
+// for by naming the branch, and signed by whichever of this device's two
+// branches that is.
+
+/// What an address proof says the branch agrees to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressAction {
+    /// Point the name at a branch, or move it off the one on file.
+    Register,
+    /// Clear the name's branch, so its payments are no longer minted to keys.
+    Unregister,
+}
+
+impl AddressAction {
+    pub fn parse(action: &str) -> Option<Self> {
+        match action {
+            "register" => Some(Self::Register),
+            "unregister" => Some(Self::Unregister),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Register => "register",
+            Self::Unregister => "unregister",
+        }
+    }
+}
+
+/// Which of this device's branches at a mint holds a given `cx1`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchKind {
+    /// `m/139'/d1..d4`, the only one handed out since LUD-25 `50d740a`.
+    Current,
+    /// `m/139'/1'/...`, from before then; see the module docs.
+    Superseded,
+}
+
+impl BranchKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// A lightning-address username as a Nostr-native mint registers one:
+/// `^[a-z0-9][a-z0-9._-]{2,31}$`, the rule moneyer's `NAME_RULE` applies to the
+/// name it then checks the proof against. Exact, never folded: the proof signs
+/// the name as written, and a mint lowercases before it checks, so an
+/// uppercase name here would be a signature over a name no mint ever sees.
+/// It also keeps `:` out of the message, so no two (domain, username) pairs
+/// can sign the same string.
+pub fn valid_username(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (3..=32).contains(&bytes.len())
+        && matches!(bytes[0], b'a'..=b'z' | b'0'..=b'9')
+        && bytes[1..]
+            .iter()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+}
+
+/// `sha256(utf8("LNURLcash:<action>:<domain>:<username>"))`: what an address
+/// proof signs. A plain hash, not a tagged one, exactly as LUD-25 and moneyer's
+/// `addressProofVerifies` compute it. The domain is the mint's own, so a proof
+/// one mint has seen cannot be replayed at another; the action and the name
+/// keep a register from being replayed as an unregister, or for another name.
+pub fn address_proof_digest(action: AddressAction, domain: &str, username: &str) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"LNURLcash:")
+        .chain_update(action.as_str().as_bytes())
+        .chain_update(b":")
+        .chain_update(domain.as_bytes())
+        .chain_update(b":")
+        .chain_update(username.as_bytes())
+        .finalize()
+        .into()
+}
+
+/// An address proof and the key it verifies under: the branch's purpose-0
+/// index-0 public key, which a mint derives from the `cx1` alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AddressProof {
+    pub signature: [u8; 64],
+    pub pubkey: [u8; 32],
+    pub branch: BranchKind,
+}
+
+/// Sign an address proof with a branch's purpose-0 index-0 key, aux_rand zero
+/// as LUD-25 has a wallet sign everything, so the same request always gets the
+/// same proof. Returns the signature and that key's public key.
+pub fn sign_address_proof(
+    node: &CashNode,
+    action: AddressAction,
+    domain: &str,
+    username: &str,
+) -> Result<([u8; 64], [u8; 32]), &'static str> {
+    let secret = note_secret_key(node, PURPOSE_WALLET, 0)?;
+    let pubkey = note_pubkey(&secret)?;
+    let signature =
+        backend::sign_bip340_zero_aux(&secret, &address_proof_digest(action, domain, username))?;
+    Ok((signature, pubkey))
+}
+
+/// Which of this identity's branches at `host` is the one `cx1` names, and
+/// the branch itself. Compared as decoded bytes, so an all-uppercase `cx1`
+/// (valid bech32m) names the same branch as its lowercase spelling. Anything
+/// else is refused: this device proves only for branches it holds.
+fn branch_holding(identity_secret: &[u8; 32], host: &str, cx1: &str) -> Result<(BranchKind, CashNode), &'static str> {
+    let (pubkey, chain_code) = crate::encoding::decode_cx1(cx1).ok_or("that is not a cx1")?;
+    let named = Branch { pubkey, chain_code };
+    let current = address_node(identity_secret, host)?;
+    if branch_of(&current)? == named {
+        return Ok((BranchKind::Current, current));
+    }
+    let superseded = superseded_address_node(identity_secret, host)?;
+    if branch_of(&superseded)? == named {
+        return Ok((BranchKind::Superseded, superseded));
+    }
+    Err("that cx1 is not one of this device's branches at that mint")
+}
+
+/// Which of this device's branches at `host` a `cx1` is, if either. For a
+/// check made before anything is shown to the owner.
+pub fn branch_kind_of(identity_secret: &[u8; 32], host: &str, cx1: &str) -> Result<BranchKind, &'static str> {
+    branch_holding(identity_secret, host, cx1).map(|(kind, _)| kind)
+}
+
+/// The proof that the branch `cx1` names agrees to `action` for `username` at
+/// the mint `host`, signed by whichever of this device's two branches at that
+/// mint (current or superseded) it is.
+///
+/// The caller names the branch because LUD-25 wants the proof from the branch
+/// on file, which only the caller knows and which may be the superseded one.
+/// Any other `cx1` is refused rather than proven: a proof by a key this device
+/// does not hold is not one it can make, and a proof by a key it does hold for
+/// a branch the caller did not name is not the proof that was asked for.
+///
+/// `host` is the mint as [`address_node`] takes it (port included); the proof
+/// is bound to its [`spend_domain`]. Never returns the key.
+pub fn address_proof_for(
+    identity_secret: &[u8; 32],
+    host: &str,
+    cx1: &str,
+    action: AddressAction,
+    username: &str,
+) -> Result<AddressProof, &'static str> {
+    if !valid_username(username) {
+        return Err("a name is 3 to 32 of a-z, 0-9, dot, dash or underscore, starting with a letter or digit");
+    }
+    let (branch, node) = branch_holding(identity_secret, host, cx1)?;
+    let (signature, pubkey) = sign_address_proof(&node, action, &spend_domain(host), username)?;
+    Ok(AddressProof { signature, pubkey, branch })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +650,129 @@ mod tests {
         let c = cx1_of(&address_node(&[8u8; 32], "moneyer.dev").unwrap()).unwrap();
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn matches_the_address_proof_vectors() {
+        // Four proofs by the purpose-0 index-0 key of the first part2 branch
+        // (mint.example): register and unregister for alice, register for bob,
+        // and alice again at another domain.
+        let vectors: Value = serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
+        let branch = &vectors["branches"][0];
+        let host = text(branch, "host");
+        let root = derive_cash_root(&hex_decode(text(branch, "seedHex")).unwrap()).unwrap();
+        let node = derive_cash_domain_node(&root, host).unwrap();
+        let proofs = vectors["addressProofs"].as_array().expect("addressProofs");
+        assert_eq!(proofs.len(), 4);
+        let mut seen = (false, false, false);
+        for proof in proofs {
+            let action = AddressAction::parse(text(proof, "action")).expect("action");
+            let domain = text(proof, "domain");
+            let username = text(proof, "username");
+            let at = format!("{} {domain} {username}", action.as_str());
+            assert!(valid_username(username), "{at}");
+            assert_eq!(
+                format!("LNURLcash:{}:{domain}:{username}", action.as_str()),
+                text(proof, "message"),
+                "{at}"
+            );
+            assert_eq!(hex_encode(&address_proof_digest(action, domain, username)), text(proof, "digest"), "{at}");
+            // The key is the branch's own purpose-0 index-0 note key.
+            let secret = note_secret_key(&node, PURPOSE_WALLET, 0).unwrap();
+            assert_eq!(hex_encode(secret.as_ref()), text(proof, "indexZeroSecretKey"), "{at}");
+            // aux_rand zero reproduces the published signature exactly.
+            let (signature, pubkey) = sign_address_proof(&node, action, domain, username).unwrap();
+            assert_eq!(hex_encode(&pubkey), text(proof, "indexZeroPubkey"), "{at}");
+            assert_eq!(hex_encode(&signature), text(proof, "signature"), "{at}");
+            seen.0 |= action == AddressAction::Unregister;
+            seen.1 |= username != "alice";
+            seen.2 |= domain != host;
+        }
+        // Each thing the message separates was in the set.
+        assert_eq!(seen, (true, true, true));
+    }
+
+    #[test]
+    fn an_address_proof_is_signed_by_the_branch_named() {
+        let identity = [7u8; 32];
+        let host = "moneyer.dev";
+        let current = address_node(&identity, host).unwrap();
+        let old = superseded_address_node(&identity, host).unwrap();
+        for (node, kind) in [(&current, BranchKind::Current), (&old, BranchKind::Superseded)] {
+            let cx1 = cx1_of(node).unwrap();
+            for action in [AddressAction::Register, AddressAction::Unregister] {
+                let proof = address_proof_for(&identity, host, &cx1, action, "alice").unwrap();
+                assert_eq!(proof.branch, kind);
+                let (signature, pubkey) = sign_address_proof(node, action, "moneyer.dev", "alice").unwrap();
+                assert_eq!((proof.signature, proof.pubkey), (signature, pubkey));
+                assert_eq!(pubkey, note_pubkey(&note_secret_key(node, PURPOSE_WALLET, 0).unwrap()).unwrap());
+                // never a key note's key: that is purpose 2, and a different key
+                assert_ne!(
+                    pubkey,
+                    note_pubkey(&note_secret_key(node, PURPOSE_LIGHTNING_ADDRESS, 0).unwrap()).unwrap()
+                );
+            }
+            // all-uppercase bech32m is the same cx1
+            let upper = address_proof_for(&identity, host, &cx1.to_ascii_uppercase(), AddressAction::Register, "alice");
+            assert_eq!(upper.unwrap().branch, kind);
+            assert_eq!(branch_kind_of(&identity, host, &cx1), Ok(kind));
+        }
+        let cx1 = cx1_of(&current).unwrap();
+        let register = address_proof_for(&identity, host, &cx1, AddressAction::Register, "alice").unwrap();
+        // deterministic
+        assert_eq!(register, address_proof_for(&identity, host, &cx1, AddressAction::Register, "alice").unwrap());
+        // the action, the name and the mint's domain are all in what is signed
+        let unregister = address_proof_for(&identity, host, &cx1, AddressAction::Unregister, "alice").unwrap();
+        assert_ne!(register.signature, unregister.signature);
+        let bob = address_proof_for(&identity, host, &cx1, AddressAction::Register, "bob").unwrap();
+        assert_ne!(register.signature, bob.signature);
+        // a port is in the branch, not in the domain: the same mint behind a
+        // port is another branch, but its proof is bound to the bare hostname
+        let ported = address_node(&identity, "moneyer.dev:8443").unwrap();
+        let ported_cx1 = cx1_of(&ported).unwrap();
+        let proof = address_proof_for(&identity, "moneyer.dev:8443", &ported_cx1, AddressAction::Register, "alice").unwrap();
+        assert_eq!(
+            (proof.signature, proof.pubkey),
+            sign_address_proof(&ported, AddressAction::Register, "moneyer.dev", "alice").unwrap()
+        );
+    }
+
+    #[test]
+    fn an_address_proof_refuses_a_branch_this_device_does_not_hold() {
+        let identity = [7u8; 32];
+        let ours = cx1_of(&address_node(&identity, "moneyer.dev").unwrap()).unwrap();
+        let theirs = cx1_of(&address_node(&[8u8; 32], "moneyer.dev").unwrap()).unwrap();
+        let other_mint = cx1_of(&address_node(&identity, "mint.example").unwrap()).unwrap();
+        let reg = AddressAction::Register;
+        // another identity's branch, and our own branch at another mint
+        assert!(address_proof_for(&identity, "moneyer.dev", &theirs, reg, "alice").is_err());
+        assert!(address_proof_for(&identity, "moneyer.dev", &other_mint, reg, "alice").is_err());
+        assert!(branch_kind_of(&identity, "moneyer.dev", &theirs).is_err());
+        // not a cx1 at all, or a mixed-case one (invalid bech32m)
+        let mixed = format!("{}{}", &ours[..10], ours[10..].to_ascii_uppercase());
+        for bad in ["", "cx1", "cp1qqqq", mixed.as_str()] {
+            assert!(address_proof_for(&identity, "moneyer.dev", bad, reg, "alice").is_err(), "{bad}");
+        }
+        // names outside the rule
+        for name in ["al", "Alice", "_alice", "al:ce", "a".repeat(33).as_str(), "alice@x", ""] {
+            assert!(address_proof_for(&identity, "moneyer.dev", &ours, reg, name).is_err(), "{name}");
+        }
+        assert!(address_proof_for(&identity, "moneyer.dev", &ours, reg, &"a".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn the_username_rule_is_the_mints() {
+        for good in ["abc", "0ab", "a.b", "a-b", "a_b", "alice", &"z".repeat(32)] {
+            assert!(valid_username(good), "{good}");
+        }
+        for bad in ["", "ab", ".ab", "-ab", "_ab", "Abc", "abC", "a b", "a:b", "a/b", "é12", &"z".repeat(33)] {
+            assert!(!valid_username(bad), "{bad}");
+        }
+        assert_eq!(AddressAction::parse("register"), Some(AddressAction::Register));
+        assert_eq!(AddressAction::parse("unregister"), Some(AddressAction::Unregister));
+        for bad in ["", "Register", "clear", "register "] {
+            assert_eq!(AddressAction::parse(bad), None, "{bad}");
+        }
     }
 
     #[test]

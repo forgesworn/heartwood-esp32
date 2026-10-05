@@ -224,6 +224,31 @@ with; nothing new is handed out there, so re-register a name
 (`heartwood address keys`) to move it to the current branch. The ECDSA
 `recovery`/`ecdsa` backend features are gone.
 
+Address proofs (2026-10-05, checklist section 34, NOT YET BENCH-RUN): since
+`50d740a` a mint changes or clears a name's cx1 only with `"sig"`, a BIP-340
+signature by the purpose-0 index-0 key of the branch CURRENTLY on file over
+sha256("LNURLcash:<register|unregister>:<domain>:<name>"), so a name on the
+superseded branch can be moved only with that branch's agreement.
+`heartwood_note_address_proof {host, name, action, cx1}` (wire command
+`cash_address_proof`, capability `note_address_proof_v1`) signs it with
+whichever of the served identity's two branches at `host` has that exact cx1
+(`cash_key::address_proof_for`, compared as decoded bytes; any other cx1 is
+refused) over `spend_domain(host)`, aux_rand zero, which reproduces all four
+of part2.json's `addressProofs`. It answers the 64-byte `sig`, the index-0
+`pubkey` and `branch` (`current`/`superseded`), never a key. Everything that
+could refuse (mint, name rule `^[a-z0-9][a-z0-9._-]{2,31}$`, action, a cx1
+that is ours) is checked by the one pure `note_cmd::address_proof_ask` before
+the card, on the relay precheck and in the dispatcher alike; the card
+(`note_cmd::address_proof_card`) is ADDRESS PROOF over `<name>@<domain>` and
+`<action>, current keys` or `old keys`. Pinned ButtonRequired like the other
+note mutations (so a guardian verdict may answer it with that card in front of
+them, section 24), scoped to the served key (`method_uses_served_key`), and an
+ask never shares a card (`approval_queue::never_shares_card`): a batch card
+speaks in notes and sats and could not name a second proof. The cable has no
+identity, so `cash_address_proof` there refuses before the card, as
+`cash_address` does; on the USB-bridged NIP-46 path the card is the generic
+extension card, as for every note method.
+
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
 ## Build & flash

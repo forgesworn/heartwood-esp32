@@ -1101,8 +1101,15 @@ fn card_title(kind: GatedCmd, meta: &NoteMeta) -> (&'static str, String) {
 /// command a `heartwood_note_*` request mapped onto. `None` for anything
 /// that is not a gated note command, or names a note the locker does not
 /// hold -- the dispatcher answers those without a card anyway.
-pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
+pub fn relay_card(cmd: &serde_json::Value, identity: Option<&[u8; 32]>) -> Option<(&'static str, String)> {
     let name = cmd.get("cmd")?.as_str()?;
+    if name == "cash_address_proof" {
+        // The same card the cable would draw, from the same checked request:
+        // a request that would be refused has no card to show (and the
+        // precheck has already answered it).
+        let ask = note_cmd::address_proof_ask(cmd, identity?).ok()?;
+        return Some(note_cmd::address_proof_card(&ask));
+    }
     if name == "trust" {
         let pk = cmd.get("pubkey")?.as_str()?;
         let bytes: [u8; 32] = heartwood_common::hex::hex_decode(pk).ok()?.try_into().ok()?;
@@ -1145,8 +1152,14 @@ pub fn relay_card(cmd: &serde_json::Value) -> Option<(&'static str, String)> {
 /// goes up -- the cable path's rule (a card for a command that cannot run
 /// teaches the owner to press without reading), applied to the relay path.
 /// `None` means ask.
-pub fn relay_precheck(cmd: &serde_json::Value) -> Option<&'static str> {
+pub fn relay_precheck(cmd: &serde_json::Value, identity: &[u8; 32]) -> Option<&'static str> {
     let name = cmd.get("cmd")?.as_str()?;
+    if name == "cash_address_proof" {
+        // Everything the dispatcher would refuse (the mint, the name, the
+        // action, and a cx1 that is not one of this identity's branches),
+        // refused before the card by the same pure check.
+        return note_cmd::address_proof_ask(cmd, identity).err().map(|_| "bad_request");
+    }
     if name == "trust" {
         let pk = cmd.get("pubkey")?.as_str()?;
         let bytes: [u8; 32] = match heartwood_common::hex::hex_decode(pk).ok().and_then(|v| v.try_into().ok()) {
@@ -1295,6 +1308,11 @@ fn handle_note_cmd_frame_inner(
     let mut approve = |kind: GatedCmd, meta: &NoteMeta| -> Approval { ask(card_title(kind, meta)) };
     let mut approve_trust = |pk: &[u8; 32]| -> Approval { ask(trust_card_title(pk)) };
     let mut approve_cash = |host: &str| -> Approval { ask(cash_card_title(host)) };
+    // Unreachable today (the cable has no identity, so the command refuses
+    // before asking), but drawn properly rather than left to fail closed: if
+    // the cable ever gains an identity, its card is the relay's card.
+    let mut approve_address_proof =
+        |proof: &note_cmd::AddressProofAsk<'_>| -> Approval { ask(note_cmd::address_proof_card(proof)) };
 
     // Read the state before ctx takes its mutable borrows of `notes`. A
     // write failing inside THIS dispatch shows in the next get_info, which
@@ -1318,6 +1336,7 @@ fn handle_note_cmd_frame_inner(
         approve_trust: &mut approve_trust,
         cash: &mut notes.cash,
         approve_cash: &mut approve_cash,
+        approve_address_proof: &mut approve_address_proof,
         now: now_secs(),
         fw_version: env!("CARGO_PKG_VERSION"),
         board: crate::board::BOARD,
@@ -1429,6 +1448,10 @@ pub fn run_note_cmd_approved(
         // not know to demand a hold for it, and 64 bytes of bearer material
         // would land with no button pressed. Fail closed and say why.
         let mut approve_cash = |_host: &str| Approval::Declined;
+        // Approved, like trust: heartwood_note_address_proof IS in
+        // NOTE_METHODS and pinned ButtonRequired, so the pre-dispatch gate
+        // has already held its ADDRESS PROOF card by the time this runs.
+        let mut approve_address_proof = |_ask: &note_cmd::AddressProofAsk<'_>| Approval::Approved;
         let storage_state = notes.storage_state();
         // Reborrow so the hook's lifetime is this scope's, not the caller's:
         // the context ties every borrow to one lifetime.
@@ -1446,6 +1469,7 @@ pub fn run_note_cmd_approved(
             approve_trust: &mut approve_trust,
             cash: &mut notes.cash,
             approve_cash: &mut approve_cash,
+            approve_address_proof: &mut approve_address_proof,
             now: now_secs(),
             fw_version: env!("CARGO_PKG_VERSION"),
             board: crate::board::BOARD,

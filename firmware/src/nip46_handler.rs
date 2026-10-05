@@ -1193,7 +1193,7 @@ fn dispatch_inner(
             Some(("PAIR NEW WALLET", format!("for '{label}'\nit will see your notes")))
         } else if is_note_method(&method) {
             let cmd = heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params).ok();
-            if let Some(refusal) = cmd.as_ref().and_then(crate::notes::relay_precheck) {
+            if let Some(refusal) = cmd.as_ref().and_then(|cmd| crate::notes::relay_precheck(cmd, master_secret)) {
                 if !matches!(
                     approval,
                     ApprovalDecision::ButtonApproved | ApprovalDecision::VerdictApproved
@@ -1201,7 +1201,7 @@ fn dispatch_inner(
                     return build_error_json(&request.id, -1, refusal);
                 }
             }
-            cmd.and_then(|cmd| crate::notes::relay_card(&cmd))
+            cmd.and_then(|cmd| crate::notes::relay_card(&cmd, Some(master_secret)))
         } else {
             None
         };
@@ -2106,6 +2106,7 @@ fn dispatch_inner(
                 "heartwood_note_trusted",
                 "heartwood_note_address",
                 "heartwood_note_claim",
+                "heartwood_note_address_proof",
                 "heartwood_pair_wallet",
                 "heartwood_provision_rendezvous",
             ];
@@ -2177,7 +2178,8 @@ fn dispatch_inner(
                     };
                     // The served identity is also the root of the address
                     // branches a mint pays this npub's lightning address to
-                    // (cash_address, claim_key_note).
+                    // (cash_address, claim_key_note), and of the keys that
+                    // sign its address proofs (cash_address_proof).
                     // The client hex is 64 chars here (has_client checked
                     // it), so the decode cannot fail; an all-zero fallback
                     // would only ever fail to match a grant, which costs a

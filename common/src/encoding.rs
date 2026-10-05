@@ -29,11 +29,12 @@ pub fn decode_npub(value: &str) -> Option<[u8; 32]> {
 
 // ---- LUD-25 Part 2 ----
 //
-// Four bech32m strings, each a fixed payload: `cp1` a note's x-only public
-// key, `ck1` its 65-byte ownership signature (the note's bearer credential),
-// `cs1` a mint's certificate in the same layout, and `cx1` a watch-only
-// branch, x-only key then chain code. Byte-identical to lnurlcash-kit's
-// `recoverable.ts` and graded against its `part2.json`.
+// Four bech32m strings, each a fixed payload: `cp1` a note's x-only output
+// key Q, `ck1` its key-path spend (Q then a 64-byte BIP-340 signature, the
+// note's bearer credential), `cs1` a mint's 65-byte certificate, whose hrp
+// also carries the amount as a BOLT11 suffix (`cs210n1...` certifies
+// 21,000 msat), and `cx1` a watch-only branch, x-only key then chain code.
+// Graded against lnurlcash-conformance's `part2.json`.
 //
 // Strict on the way in, as BIP-350 and the reference mint are: a bech32 (not
 // bech32m) checksum, a mixed-case string or a payload of the wrong length is
@@ -65,16 +66,36 @@ pub fn decode_cp1(value: &str) -> Option<[u8; 32]> {
     decode_fixed::<32>("cp", value)
 }
 
-pub fn encode_ck1(signature: &[u8; 65]) -> String {
-    encode_fixed("ck", signature)
+/// `ck1`: the note's output key then its key-path signature, 96 bytes.
+pub fn encode_ck1(spend: &[u8; 96]) -> String {
+    encode_fixed("ck", spend)
 }
 
-pub fn decode_ck1(value: &str) -> Option<[u8; 65]> {
-    decode_fixed::<65>("ck", value)
+pub fn decode_ck1(value: &str) -> Option<[u8; 96]> {
+    decode_fixed::<96>("ck", value)
 }
 
+/// A mint certificate. Its hrp is `cs` and, from LUD-25 `50d740a`, the
+/// amount it certifies as a BOLT11 suffix (`cs10n`, `cs210n`); a bare `cs`
+/// is the older spelling. The suffix is checked for shape only: the wallet
+/// that verifies the certificate is the one that compares the amount.
 pub fn decode_cs1(value: &str) -> Option<[u8; 65]> {
-    decode_fixed::<65>("cs", value)
+    let checked = bech32::primitives::decode::CheckedHrpstring::new::<Bech32m>(value.trim()).ok()?;
+    let hrp = checked.hrp();
+    let suffix = hrp.as_str().strip_prefix("cs")?;
+    if !(suffix.is_empty() || bolt11_amount_suffix(suffix)) {
+        return None;
+    }
+    checked.validate_segwit_padding().ok()?;
+    let bytes: Vec<u8> = checked.byte_iter().collect();
+    bytes.try_into().ok()
+}
+
+/// BOLT11's amount: digits without a leading zero, then at most one of the
+/// `m`, `u`, `n` or `p` multipliers.
+fn bolt11_amount_suffix(suffix: &str) -> bool {
+    let digits = suffix.strip_suffix(['m', 'u', 'n', 'p']).unwrap_or(suffix);
+    !digits.is_empty() && !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 pub fn encode_cx1(pubkey_x_only: &[u8; 32], chain_code: &[u8; 32]) -> String {
@@ -299,12 +320,16 @@ mod tests {
         assert_eq!(encode_cp1(&pk), text(note, "cp1"));
         assert_eq!(decode_cp1(text(note, "cp1")), Some(pk));
 
-        let sig = unhex::<65>(text(note, "ownershipSignature"));
-        assert_eq!(encode_ck1(&sig), text(note, "ck1"));
-        assert_eq!(decode_ck1(text(note, "ck1")), Some(sig));
+        let mut spend = [0u8; 96];
+        spend[..32].copy_from_slice(&pk);
+        spend[32..].copy_from_slice(&unhex::<64>(text(note, "keyPathSignature")));
+        assert_eq!(encode_ck1(&spend), text(note, "ck1"));
+        assert_eq!(decode_ck1(text(note, "ck1")), Some(spend));
 
-        let cert = &vectors["certificates"][0];
-        assert_eq!(decode_cs1(text(cert, "cs1")), Some(unhex(text(cert, "signature"))));
+        // every certificate, each hrp carrying its own amount
+        for cert in vectors["certificates"].as_array().expect("certificates") {
+            assert_eq!(decode_cs1(text(cert, "cs1")), Some(unhex(text(cert, "signature"))));
+        }
 
         let pubkey = unhex::<32>(text(branch, "branchPubkey"));
         let chain = unhex::<32>(text(branch, "chainCode"));
@@ -330,6 +355,14 @@ mod tests {
             assert_eq!(decode_cp1(bad), None, "{bad}");
         }
         assert_eq!(decode_ck1(cp1), None, "a cp1 is not a ck1");
+        // a certificate's amount suffix is BOLT11's shape or nothing
+        let cs1 = text(&vectors["certificates"][0], "cs1");
+        assert!(cs1.starts_with("cs10n1"), "{cs1}");
+        assert_eq!(decode_cs1(cp1), None, "a cp1 is not a cs1");
+        assert!(bolt11_amount_suffix("10n") && bolt11_amount_suffix("210n") && bolt11_amount_suffix("5"));
+        for bad in ["", "0n", "010n", "n", "10x", "10nn", "1.5n"] {
+            assert!(!bolt11_amount_suffix(bad), "{bad}");
+        }
         assert_eq!(
             decode_cx1("cx1k5hqh8wd88kazd70fdnef5xj54038jd2j6q8sw2dfy2ev5d45qhsnvwp55"),
             None,

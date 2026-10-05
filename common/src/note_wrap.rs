@@ -116,8 +116,15 @@ fn open_key_note(key: KeyNoteRef, identity_secret: &[u8; 32]) -> Result<Incoming
     if !crate::cash_store::valid_host(host) {
         return Err("bad host");
     }
-    let (secret, pubkey) =
-        crate::cash_key::claim_note_key(identity_secret, host, key.index, Some(&key.pubkey))?;
+    // A mint mints to a holder's keys only by Lightning Address, so a wrapped
+    // key note is on that purpose.
+    let (secret, pubkey) = crate::cash_key::claim_note_key(
+        identity_secret,
+        host,
+        crate::cash_key::PURPOSE_LIGHTNING_ADDRESS,
+        key.index,
+        Some(&key.pubkey),
+    )?;
     Ok(IncomingNote {
         secret: *secret,
         key: Some(KeyNote { index: key.index, pubkey }),
@@ -232,7 +239,8 @@ fn parse_any(
             Some(("amount", v)) => amount = v.parse().ok(),
             Some(("p", v)) => cp1 = Some(v),
             Some(("i", v)) => index = Some(v),
-            Some(("sig", v)) => sig = Some(v),
+            // `c` from LUD-25 `50d740a`; `sig` is the older name
+            Some(("c", v)) | Some(("sig", v)) => sig = Some(v),
             _ => {}
         }
     }
@@ -255,7 +263,7 @@ fn parse_any(
                 None => String::new(),
                 Some(v) => {
                     let lowered = v.to_ascii_lowercase();
-                    crate::encoding::decode_cs1(&lowered).ok_or("sig is not a cs1")?;
+                    crate::encoding::decode_cs1(&lowered).ok_or("c is not a cs1")?;
                     lowered
                 }
             };
@@ -492,21 +500,28 @@ mod tests {
         use super::*;
         use crate::encoding::encode_cp1;
 
-        // A real certificate (lnurlcash-kit part2.json). The device stores it
-        // and never checks it; the wallet does.
-        const CS1: &str = "cs1kty9p9j2sthw35e7mr9ry8l9qrq4l8ay9el9wst9gt38t942e7m8c05zqmll9t8sycx86f7jkclsl20rdgdlc2cejfx4a8dkcyv8k5cqte7psz";
+        // A real certificate for 21,000 msat (lnurlcash-conformance
+        // part2.json), its amount in the hrp. The device stores it and never
+        // checks it; the wallet does.
+        const CS1: &str = "cs210n1f5txhr3ay38cty8zga95stka2t3q8exz6jzu4f7ewj9ryz62jz3rcww92gmwsqr78scv0sv37sf7627tkgl3xl9wvtn6gvhmcgsyypqqjyw5r9";
+        // The same certificate before LUD-25 `50d740a`: a bare `cs` hrp,
+        // under the older `sig` name.
+        const OLD_CS1: &str = "cs1kty9p9j2sthw35e7mr9ry8l9qrq4l8ay9el9wst9gt38t942e7m8c05zqmll9t8sycx86f7jkclsl20rdgdlc2cejfx4a8dkcyv8k5cqte7psz";
         const IDENTITY: [u8; 32] = [7u8; 32];
+
+        const PURPOSE_LA: u32 = crate::cash_key::PURPOSE_LIGHTNING_ADDRESS;
 
         fn key_at(index: u32) -> ([u8; 32], [u8; 32]) {
             let (secret, pubkey) =
-                crate::cash_key::claim_note_key(&IDENTITY, "moneyer.dev", index, None).unwrap();
+                crate::cash_key::claim_note_key(&IDENTITY, "moneyer.dev", PURPOSE_LA, index, None).unwrap();
             (*secret, pubkey)
         }
 
-        // What moneyer puts in the wrap for a name with a cx1.
+        // What moneyer (0.17, LUD-25 `50d740a`) puts in the wrap for a name
+        // with a cx1.
         fn moneyer_wrap(pubkey: &[u8; 32], index: u32) -> UnsignedEvent {
             let mut rumor = with_content(&format!(
-                "https://moneyer.dev/w?p={}&amount=21000&sig={CS1}&i={index}",
+                "https://moneyer.dev/w?p={}&c={CS1}&i={index}",
                 encode_cp1(pubkey)
             ));
             rumor.tags = vec![
@@ -527,6 +542,42 @@ mod tests {
             assert_eq!(note.host, "moneyer.dev/w");
             assert_eq!(note.amount_msat, 21_000);
             assert_eq!(note.sig, CS1);
+        }
+
+        #[test]
+        fn a_wrap_with_the_older_sig_name_still_opens() {
+            let (_, pubkey) = key_at(5);
+            let mut rumor = moneyer_wrap(&pubkey, 5);
+            rumor.content = format!(
+                "https://moneyer.dev/w?p={}&amount=21000&sig={OLD_CS1}&i=5",
+                encode_cp1(&pubkey)
+            );
+            assert_eq!(open_note_rumor(&rumor, &IDENTITY).unwrap().sig, OLD_CS1);
+        }
+
+        #[test]
+        fn a_note_paid_to_a_cx1_from_before_purposes_opens() {
+            // The case that stranded a zap on 2026-10-04: a name registered
+            // with a cx1 on the superseded m/139'/1' branch, paid by a mint
+            // deriving with the purposed tweak, and a `c` in the amount-carrying
+            // spelling. Its key is only on that branch.
+            let seed = crate::cash_key::nostr_cash_seed(&IDENTITY);
+            let old = crate::cash::derive_cash_domain_node(
+                &crate::cash::derive_cash_child(
+                    &crate::cash::derive_cash_root(seed.as_ref()).unwrap(),
+                    1 | 0x8000_0000,
+                )
+                .unwrap(),
+                "moneyer.dev",
+            )
+            .unwrap();
+            let secret = crate::cash_key::note_secret_key(&old, PURPOSE_LA, 0).unwrap();
+            let pubkey = crate::cash_key::note_pubkey(&secret).unwrap();
+            assert_ne!(pubkey, key_at(0).1, "the current branch must not already hold it");
+            let note = open_note_rumor(&moneyer_wrap(&pubkey, 0), &IDENTITY).unwrap();
+            assert_eq!(note.secret, *secret);
+            assert_eq!(note.key, Some(KeyNote { index: 0, pubkey }));
+            assert_eq!((note.amount_msat, note.sig.as_str()), (21_000, CS1));
         }
 
         #[test]
@@ -561,12 +612,13 @@ mod tests {
             for (from, to) in [
                 (encode_cp1(&pubkey), "cp1notreally".to_string()),
                 (CS1.to_string(), "cs1notreally".to_string()),
-                ("amount=21000".to_string(), "amount=0".to_string()),
+                ("&i=5".to_string(), "&amount=0&i=5".to_string()),
                 ("&i=5".to_string(), "&i=4294967296".to_string()),
             ] {
+                // the tags stay: a bad value in the URL is not rescued by them
                 let mut rumor = moneyer_wrap(&pubkey, 5);
+                assert!(good.content.contains(&from), "{from}");
                 rumor.content = good.content.replace(&from, &to);
-                rumor.tags.retain(|t| t[0] != "amount" && t[0] != "i");
                 assert!(open_note_rumor(&rumor, &IDENTITY).is_err(), "{}", rumor.content);
             }
         }

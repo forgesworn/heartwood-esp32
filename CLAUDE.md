@@ -199,16 +199,30 @@ network rather than the primary (checklist section 31).
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =
-HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then lnurl-wallet's
-m/139'/1'/d1..d4 and LUD-25's tweak, graded against lnurlcash-kit's
-part2.json and tests/fixtures/lud25-nostr-seed.json on both curve backends). The
-mint holds only the cx1 (heartwood_note_address, no hold); a key-note wrap
-carries p/i/sig and no secret, and is opened only if the key is ours
-(note_wrap::open_note_rumor). A key note stores its key as the secret plus
+HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then LUD-25's
+m/139'/d1..d4 and its purposed tweak, graded against lnurlcash-conformance
+0.15.0's part2.json and nostr-seed.json in tests/fixtures on both curve
+backends). The mint holds only the cx1 (heartwood_note_address, no hold); a
+key-note wrap carries p/i/c and no secret, and is opened only if the key is
+ours (note_wrap::open_note_rumor). A key note stores its key as the secret plus
 KeyNote {index, pubkey} (a v3 blob, written only for key notes), exports a
-ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim)
-derives the key itself. Recoverable signing is the one new curve op:
-secp256k1's `recovery` module on the firmware, k256 `ecdsa` on the host.
+ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim,
+optional `purpose`, default 2) derives the key itself.
+
+Moved to LUD-25 `50d740a` / `6e865b1` on 2026-10-04 (moneyer 0.17 had
+stranded a zap: the board ignored the wrap). Three changes: the tweak hashes
+`ser32(purpose)` before the index (0 wallet, 1 change, 2 Lightning Address,
+which is what a mint mints to and so what a wrap is on); the branch is
+`m/139'/d1..d4` with the hashing key at `m/139'/0`, not lnurl-wallet's
+`m/139'/1'/...`; and a ck1 is `Q || BIP-340` (aux_rand zero) over the BIP-341
+key-path sighash of the canonical spend bound to the mint's domain
+(cash_key::key_path_sighash), not a recoverable ECDSA signature. A mint
+certificate's hrp now carries its amount (`cs210n1...`) and travels as `c`
+(`sig` still read). A claim that names its key falls back to the superseded
+`m/139'/1'` branch, because a mint keeps paying the cx1 a name was registered
+with; nothing new is handed out there, so re-register a name
+(`heartwood address keys`) to move it to the current branch. The ECDSA
+`recovery`/`ecdsa` backend features are gone.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

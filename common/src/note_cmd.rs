@@ -768,7 +768,17 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             let Some(index) = u64_field(&cmd, "index").and_then(|i| u32::try_from(i).ok()) else {
                 return err_msg("bad_request", "index must be a uint32");
             };
-            let sig = str_field(&cmd, "sig").unwrap_or("");
+            // A scan finds what a mint minted on its own, which is always the
+            // Lightning Address purpose; a wallet may name another.
+            let purpose = match cmd.get("purpose") {
+                None | Some(Value::Null) => crate::cash_key::PURPOSE_LIGHTNING_ADDRESS,
+                Some(v) => match v.as_u64().and_then(|p| u32::try_from(p).ok()) {
+                    Some(p) => p,
+                    None => return err_msg("bad_request", "purpose must be a uint32"),
+                },
+            };
+            // `c` from LUD-25 `50d740a`; `sig` is the older name
+            let sig = str_field(&cmd, "c").or_else(|| str_field(&cmd, "sig")).unwrap_or("");
             let branch = crate::cash_key::branch_host(host);
             if !crate::cash_store::valid_host(branch) {
                 return err_msg("bad_request", "host must be a lowercase mint host");
@@ -783,7 +793,7 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
                 },
             };
             let (secret, pubkey) =
-                match crate::cash_key::claim_note_key(identity, branch, index, expected.as_ref()) {
+                match crate::cash_key::claim_note_key(identity, branch, purpose, index, expected.as_ref()) {
                     Ok(found) => found,
                     Err(m) => return err_msg("bad_request", m),
                 };
@@ -2909,10 +2919,44 @@ mod tests {
         assert_eq!(res["error"], "bad_request");
     }
 
+    const LA: u32 = crate::cash_key::PURPOSE_LIGHTNING_ADDRESS;
+
+    #[test]
+    fn a_claim_is_on_the_lightning_address_purpose_unless_it_names_one() {
+        let mut h = Harness::new();
+        let cs1 = "cs210n1f5txhr3ay38cty8zga95stka2t3q8exz6jzu4f7ewj9ryz62jz3rcww92gmwsqr78scv0sv37sf7627tkgl3xl9wvtn6gvhmcgsyypqqjyw5r9";
+        let (_, on_la) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", LA, 3, None).unwrap();
+        let (_, on_wallet) = crate::cash_key::claim_note_key(
+            &[7u8; 32],
+            "moneyer.dev",
+            crate::cash_key::PURPOSE_WALLET,
+            3,
+            None,
+        )
+        .unwrap();
+        let claim = |p: &[u8; 32], purpose: &str| {
+            format!(
+                r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":3,"amount_msat":21000,"p":"{}"{purpose},"c":"{cs1}"}}"#,
+                crate::encoding::encode_cp1(p)
+            )
+        };
+        // unnamed is purpose 2, and the certificate arrives as `c`
+        let res = h.run(&claim(&on_la, ""));
+        assert_eq!(res["ok"], true, "{res}");
+        let listed = h.run(r#"{"cmd":"list_notes"}"#);
+        assert_eq!(listed["notes"][0]["sig"], cs1);
+        // a wallet note's key is not found there, only where it is named
+        assert_eq!(h.run(&claim(&on_wallet, ""))["error"], "bad_request");
+        assert_eq!(h.run(&claim(&on_wallet, r#","purpose":0"#))["ok"], true);
+        for bad in [r#","purpose":-1"#, r#","purpose":4294967296"#, r#","purpose":"2""#] {
+            assert_eq!(h.run(&claim(&on_la, bad))["error"], "bad_request", "{bad}");
+        }
+    }
+
     #[test]
     fn a_claimed_key_note_lists_its_key_and_exports_its_ck1() {
         let mut h = Harness::new();
-        let (_, pubkey) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        let (_, pubkey) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", LA, 12, None).unwrap();
         let cp1 = crate::encoding::encode_cp1(&pubkey);
         let claim = format!(
             r#"{{"cmd":"claim_key_note","host":"moneyer.dev/w","index":12,"amount_msat":21000,"p":"{cp1}"}}"#
@@ -2933,8 +2977,8 @@ mod tests {
         let res = h.run(&format!(r#"{{"cmd":"export_secret","id":"{id}"}}"#));
         let k1 = res["k1"].as_str().unwrap();
         assert!(k1.starts_with("ck1"), "{k1}");
-        let (secret, _) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
-        assert_eq!(k1, crate::cash_key::ck1_of(&secret).unwrap());
+        let (secret, _) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", LA, 12, None).unwrap();
+        assert_eq!(k1, crate::cash_key::ck1_of(&secret, "moneyer.dev/w").unwrap());
         assert!(!k1.contains(&hex_encode(secret.as_ref())));
         assert_eq!(h.asked, vec![(GatedCmd::ExportSecret, id.clone())]);
 
@@ -2947,7 +2991,7 @@ mod tests {
     #[test]
     fn a_claim_for_a_key_this_device_would_not_derive_is_refused() {
         let mut h = Harness::new();
-        let (_, pubkey) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", 12, None).unwrap();
+        let (_, pubkey) = crate::cash_key::claim_note_key(&[7u8; 32], "moneyer.dev", LA, 12, None).unwrap();
         let cp1 = crate::encoding::encode_cp1(&pubkey);
         for (index, host) in [(13, "moneyer.dev/w"), (12, "mint.example/w")] {
             let res = h.run(&format!(

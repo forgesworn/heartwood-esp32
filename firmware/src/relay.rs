@@ -5472,6 +5472,15 @@ fn queue_button_ask(
         let seq = LOGIN_ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         kind_key = heartwood_common::approval_queue::login_kind_key(&kind_key, seq);
     }
+    // Nor does an address proof or a trust: each card names one decision
+    // (an address, action and branch; one sender's npub), and a batch card
+    // speaks in notes and sats, so a second ask must never ride the first
+    // one's hold.
+    if heartwood_common::approval_queue::never_shares_card(&ask.request.method) {
+        static UNSHARED_ASK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = UNSHARED_ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        kind_key = heartwood_common::approval_queue::unshared_kind_key(&kind_key, seq);
+    }
     // A HOLD TO SIGN ask and an ALLOW AS ask (or any two card kinds) are
     // different decisions and never share one hold.
     kind_key.push_str(heartwood_common::policy::card_batch_marker(ask.resume.shown.card));
@@ -5780,6 +5789,7 @@ fn note_card_header(method: &str) -> Option<&'static str> {
         "heartwood_note_send" => "SEND NOTE",
         "heartwood_note_rename" => "RENAME NOTE",
         "heartwood_note_trust" => "TRUST SENDER",
+        "heartwood_note_address_proof" => heartwood_common::note_cmd::ADDRESS_PROOF_HEADER,
         "heartwood_pair_wallet" => "PAIR NEW WALLET",
         _ => return None,
     })
@@ -7572,7 +7582,7 @@ fn handle_nip46_event(
     {
         let card = heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params)
             .ok()
-            .and_then(|cmd| crate::notes::relay_card(&cmd))
+            .and_then(|cmd| crate::notes::relay_card(&cmd, Some(&*signing_secret)))
             .map(|(heading, detail)| (heading.to_string(), detail.replace('\n', " / ")));
         if card.is_none() {
             log::warn!(
@@ -10088,6 +10098,11 @@ fn dispatch_mgmt(
                     // on-device, and a kind-1059 to a master npub puts a
                     // RECEIVE card up.
                     "note_wrap_v1",
+                    // LUD-25 address proofs: heartwood_note_address_proof
+                    // signs register/unregister for a lightning-address name
+                    // with this identity's current or superseded branch, on a
+                    // pinned ADDRESS PROOF card.
+                    "note_address_proof_v1",
                     // revoke_client_identity / clear_client_identities withdraw
                     // identity approvals from a slot without revoking it.
                     "client_identity_revoke_v1",

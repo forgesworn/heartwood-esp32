@@ -438,13 +438,17 @@ pub fn method_uses_identity_key(method: &str, has_context: bool) -> bool {
 }
 
 /// Bearer-note methods that act with the served identity's key (sealing a
-/// send, deriving an address or claim key). They are scoped like signing but
+/// send, deriving an address or claim key, signing an address proof with an
+/// address branch's key). They are scoped like signing but
 /// have no identity card of their own: an unapproved identity is refused, and
 /// approval comes from a sign or crypto prompt.
 pub fn method_uses_served_key(method: &str) -> bool {
     matches!(
         method,
-        "heartwood_note_send" | "heartwood_note_address" | "heartwood_note_claim"
+        "heartwood_note_send"
+            | "heartwood_note_address"
+            | "heartwood_note_claim"
+            | "heartwood_note_address_proof"
     )
 }
 
@@ -1884,7 +1888,12 @@ mod tests {
         // (explicit or a heartwood_switch active identity) it is scoped.
         assert!(!method_uses_identity_key("get_public_key", false));
         assert!(method_uses_identity_key("get_public_key", true));
-        for method in ["heartwood_note_send", "heartwood_note_address", "heartwood_note_claim"] {
+        for method in [
+            "heartwood_note_send",
+            "heartwood_note_address",
+            "heartwood_note_claim",
+            "heartwood_note_address_proof",
+        ] {
             assert!(method_uses_served_key(method), "{method}");
             assert!(!method_uses_identity_key(method, true), "{method}");
         }
@@ -1920,6 +1929,7 @@ mod tests {
             (Family::Pubkey, "get_public_key"),
             (Family::Note, "heartwood_note_send"),
             (Family::Note, "heartwood_note_claim"),
+            (Family::Note, "heartwood_note_address_proof"),
             (Family::List, "heartwood_list_identities"),
             (Family::Switch, "heartwood_switch"),
             (Family::Other, "heartwood_derive"),
@@ -2033,7 +2043,7 @@ mod tests {
                 assert!(!matches!(gate, Gate::Card(_)), "switch carded without a press");
             }
         }}}}}}}}}}}
-        assert_eq!(cases, 11 * 4 * 2 * 2 * 3 * 3 * 2 * 2 * 2 * 2 * 2);
+        assert_eq!(cases, 12 * 4 * 2 * 2 * 3 * 3 * 2 * 2 * 2 * 2 * 2);
     }
 
     #[test]

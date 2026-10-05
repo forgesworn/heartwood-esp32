@@ -65,6 +65,23 @@ pub fn login_kind_key(base: &str, seq: u32) -> String {
     format!("{base}#login{seq}")
 }
 
+/// Methods whose ask never shares a card, whoever sends it: each one's card
+/// names a single decision that a batch card has no way to say. An address
+/// proof's card names one lightning address, one action and one branch; a
+/// trust card names one sender's npub. A batch card speaks in notes and sats,
+/// so a second proof or a second sender joining the first would be approved
+/// on a hold that showed the owner neither.
+pub fn never_shares_card(method: &str) -> bool {
+    matches!(method, "heartwood_note_address_proof" | "heartwood_note_trust")
+}
+
+/// The batch key of an ask that must never share a card
+/// ([`never_shares_card`]): unique per ask, from a device counter, like
+/// [`login_kind_key`], so nothing the client sends can make two equal.
+pub fn unshared_kind_key(base: &str, seq: u32) -> String {
+    format!("{base}#once{seq}")
+}
+
 /// What to do with an incoming interactive ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
@@ -272,5 +289,36 @@ mod tests {
         assert_eq!(admit(Some(&plain), 1, 0, &kk(base, base)), Admission::Collapse);
         // A login ask does not join an ordinary card of the same kind either.
         assert_eq!(admit(Some(&plain), 1, 0, &a), Admission::Wait);
+    }
+
+    #[test]
+    fn two_trusts_never_share_a_hold() {
+        // One hold used to trust every sender batched behind the card, while
+        // the card showed only the first npub.
+        let base = "heartwood_note_trust";
+        assert!(never_shares_card(base));
+        let kk = |kind_key: &str| AskKey::new(1, "cc".to_string(), "dd".to_string(), kind_key.to_string());
+        let a = kk(&unshared_kind_key(base, 0));
+        let b = kk(&unshared_kind_key(base, 1));
+        assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
+    }
+
+    #[test]
+    fn an_address_proof_never_shares_a_card() {
+        let base = "heartwood_note_address_proof";
+        assert!(never_shares_card(base));
+        for method in ["heartwood_note_export", "heartwood_note_send", "sign_event", "heartwood_note_address"] {
+            assert!(!never_shares_card(method), "{method}");
+        }
+        let kk = |kind_key: &str| AskKey::new(1, "cc".to_string(), "dd".to_string(), kind_key.to_string());
+        let a = kk(&unshared_kind_key(base, 0));
+        let b = kk(&unshared_kind_key(base, 1));
+        assert_ne!(a, b);
+        assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
+        // Nor does it join, or take in, an ordinary card of the same method.
+        assert_eq!(admit(Some(&kk(base)), 1, 0, &a), Admission::Wait);
+        assert_eq!(admit(Some(&a), 1, 0, &kk(base)), Admission::Wait);
+        // And it is never mistaken for a login challenge's key.
+        assert_ne!(unshared_kind_key(base, 0), login_kind_key(base, 0));
     }
 }

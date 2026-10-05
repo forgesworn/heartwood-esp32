@@ -322,6 +322,13 @@ pub struct NoteCmdContext<'a> {
     /// thing they can check, which is which mint they were expecting to set up.
     #[cfg(feature = "cash")]
     pub approve_cash: &'a mut dyn FnMut(&str) -> Approval,
+    /// Asked before an address proof is signed: the card names the lightning
+    /// address, the action and which of this device's branches agrees to it
+    /// ([`address_proof_card`]). Asked only once the request is known to be
+    /// one this device can sign (a valid mint, name and action, and a `cx1`
+    /// that is one of its own branches there).
+    #[cfg(feature = "cash")]
+    pub approve_address_proof: &'a mut dyn FnMut(&AddressProofAsk<'_>) -> Approval,
     /// Seconds since some fixed epoch for created_at/updated_at. Boot time is
     /// fine — informational, never authoritative (the mint's state is).
     pub now: u32,
@@ -753,6 +760,45 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
         }
 
         #[cfg(feature = "cash")]
+        "cash_address_proof" => {
+            // LUD-25's address proof: the branch a name is (or is to be)
+            // registered with agrees to `register` or `unregister` it, by a
+            // signature from its purpose-0 index-0 key. Gated: it is what lets
+            // a mint move or clear where this owner's lightning address pays,
+            // so the owner sees which address and which way before it exists.
+            // Only the signature and the key it verifies under come back,
+            // never the key itself.
+            let Some(identity) = ctx.identity else {
+                return err_msg("bad_request", "cash_address_proof is not available on this surface");
+            };
+            // Everything that could refuse, refused BEFORE the card: a hold
+            // for a proof that could never be signed teaches the owner to
+            // press without reading.
+            let ask = match address_proof_ask(&cmd, identity) {
+                Ok(ask) => ask,
+                Err(m) => return err_msg("bad_request", m),
+            };
+            if let Some(resp) = approval_err((ctx.approve_address_proof)(&ask)) {
+                return resp;
+            }
+            let proof = match crate::cash_key::address_proof_for(identity, ask.host, ask.cx1, ask.action, ask.name) {
+                Ok(proof) => proof,
+                Err(m) => return err_msg("bad_request", m),
+            };
+            json!({
+                "ok": true,
+                "host": ask.host,
+                "domain": crate::cash_key::spend_domain(ask.host),
+                "name": ask.name,
+                "action": ask.action.as_str(),
+                "cx1": ask.cx1,
+                "branch": proof.branch.as_str(),
+                "sig": hex_encode(&proof.signature),
+                "pubkey": hex_encode(&proof.pubkey),
+            })
+        }
+
+        #[cfg(feature = "cash")]
         "claim_key_note" => {
             // A payment a wallet found by scanning the branch, whose wrap never
             // arrived: the device derives the key at `index` and keeps the note.
@@ -1065,6 +1111,83 @@ fn gated_by_id(
     }
 }
 
+// ---- LUD-25 address proofs ----
+
+/// A `cash_address_proof` request this device can sign, checked whole.
+#[cfg(feature = "cash")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddressProofAsk<'a> {
+    /// The mint as [`crate::cash_key::address_node`] takes it, port included.
+    pub host: &'a str,
+    /// The lightning-address username, exactly as the proof signs it.
+    pub name: &'a str,
+    pub action: crate::cash_key::AddressAction,
+    /// The branch the caller wants the proof from, as it gave it.
+    pub cx1: &'a str,
+    /// Which of this device's branches that `cx1` is.
+    pub branch: crate::cash_key::BranchKind,
+}
+
+/// Check a `cash_address_proof` command (`host`, `name`, `action`, `cx1`)
+/// for the identity it would be signed as, without signing anything. Pure,
+/// so the relay path's pre-card check and the dispatcher refuse exactly the
+/// same requests. `Err` is the message for a `bad_request`.
+///
+/// The host is checked first because everything else is about it, and
+/// because it is what makes the card safe to draw: a valid host and a valid
+/// name are both lowercase ASCII, so eliding them by byte cannot split a
+/// character. The `cx1` is checked last, since it costs two branch
+/// derivations and only means anything at a valid mint.
+#[cfg(feature = "cash")]
+pub fn address_proof_ask<'a>(cmd: &'a Value, identity: &[u8; 32]) -> Result<AddressProofAsk<'a>, &'static str> {
+    let host = str_field(cmd, "host").ok_or("host is required")?;
+    if !crate::cash_store::valid_host(host) {
+        return Err("host must be a lowercase mint host");
+    }
+    let name = str_field(cmd, "name").ok_or("name is required")?;
+    if !crate::cash_key::valid_username(name) {
+        return Err("a name is 3 to 32 of a-z, 0-9, dot, dash or underscore, starting with a letter or digit");
+    }
+    let action = str_field(cmd, "action")
+        .and_then(crate::cash_key::AddressAction::parse)
+        .ok_or("action must be register or unregister")?;
+    let cx1 = str_field(cmd, "cx1").ok_or("cx1 is required")?;
+    let branch = crate::cash_key::branch_kind_of(identity, host, cx1)?;
+    Ok(AddressProofAsk { host, name, action, cx1, branch })
+}
+
+/// The header an address-proof card is drawn under, on every surface.
+#[cfg(feature = "cash")]
+pub const ADDRESS_PROOF_HEADER: &str = "ADDRESS PROOF";
+
+/// Header and two-line title for an address-proof card.
+///
+/// Line one is the lightning address the proof is about, `name@domain`: the
+/// domain the proof is bound to, which is the address as anyone writes it.
+/// Middle-elided past one card line, as the trust and mint cards elide, so
+/// both the start of the name and the tail of the domain (where a lookalike
+/// differs) stay on screen; validation before the card keeps it ASCII.
+///
+/// Line two is what the branch agrees to and which branch it is. "old keys"
+/// is the branch this device used before LUD-25 `50d740a`: a name registered
+/// then can be moved or cleared only with that branch's agreement, and an
+/// owner moving their address should see that is the one being asked.
+/// Never a third line: `show_titled_approval` draws two and drops the rest.
+#[cfg(feature = "cash")]
+pub fn address_proof_card(ask: &AddressProofAsk<'_>) -> (&'static str, String) {
+    let address = format!("{}@{}", ask.name, crate::cash_key::spend_domain(ask.host));
+    let shown = if address.len() <= crate::note_fmt::CARD_LINE_CHARS {
+        address
+    } else {
+        format!("{}..{}", &address[..12], &address[address.len() - 8..])
+    };
+    let keys = match ask.branch {
+        crate::cash_key::BranchKind::Current => "current keys",
+        crate::cash_key::BranchKind::Superseded => "old keys",
+    };
+    (ADDRESS_PROOF_HEADER, format!("{shown}\n{}, {keys}", ask.action.as_str()))
+}
+
 // ---- relay-path mapping (heartwood_note_* NIP-46 extensions) ----
 
 /// The note methods served over the relay path, in the order the
@@ -1077,7 +1200,7 @@ fn gated_by_id(
 /// the same question: it touches a LIVE note, a label is what a wallet's
 /// list shows, and no amount of pruning corrects one typed wrong, so it is
 /// served here rather than left cable-only on a tier that has no cable.
-pub const NOTE_METHODS: [&str; 14] = [
+pub const NOTE_METHODS: [&str; 15] = [
     "heartwood_note_list",
     "heartwood_note_new",
     "heartwood_note_new_pair",
@@ -1092,6 +1215,7 @@ pub const NOTE_METHODS: [&str; 14] = [
     "heartwood_note_trusted",
     "heartwood_note_address",
     "heartwood_note_claim",
+    "heartwood_note_address_proof",
 ];
 
 /// Map a `heartwood_note_*` NIP-46 request onto the wire command object the
@@ -1163,6 +1287,7 @@ pub fn note_cmd_for_method(method: &str, params: &[Value]) -> Result<Value, &'st
         "heartwood_note_trusted" => "list_trusted",
         "heartwood_note_address" => "cash_address",
         "heartwood_note_claim" => "claim_key_note",
+        "heartwood_note_address_proof" => "cash_address_proof",
         _ => return Err("unknown note method"),
     };
     let mut fields = match params.first() {
@@ -1263,6 +1388,8 @@ mod tests {
         trust_asked: Vec<[u8; 32]>,
         cash: crate::cash_store::CashRegistry,
         cash_asked: Vec<String>,
+        /// Address-proof cards, as the owner would read them.
+        proof_asked: Vec<(&'static str, String)>,
         persist_ok: bool,
         note_write_ok: bool,
         /// The identity the request is served as; `None` is direct USB.
@@ -1289,6 +1416,7 @@ mod tests {
                 trust_asked: Vec::new(),
                 cash: crate::cash_store::CashRegistry::new(),
                 cash_asked: Vec::new(),
+                proof_asked: Vec::new(),
                 persist_ok: true,
                 note_write_ok: true,
                 identity: Some([7u8; 32]),
@@ -1329,6 +1457,11 @@ mod tests {
                 cash_asked.push(host.to_string());
                 answer
             };
+            let proof_asked = &mut self.proof_asked;
+            let mut approve_address_proof = move |ask: &AddressProofAsk<'_>| {
+                proof_asked.push(address_proof_card(ask));
+                answer
+            };
             #[cfg(feature = "device-identity")]
             let mut device_identity = |nonce: &[u8]| {
                 crate::device_identity::sign_challenge(&[0x5au8; 32], nonce)
@@ -1350,6 +1483,7 @@ mod tests {
                 approve_trust: &mut approve_trust,
                 cash: &mut self.cash,
                 approve_cash: &mut approve_cash,
+                approve_address_proof: &mut approve_address_proof,
                 now: self.now,
                 fw_version: "0.0.0-test",
                 board: "host",
@@ -2230,6 +2364,9 @@ mod tests {
             // like the rest of the mutating set, and, being pinned here,
             // can never be covered by a #129 spend grant either.
             ("heartwood_note_rename", true),
+            // An address proof moves or clears where a lightning address
+            // pays, so it answers the button like the mutating set.
+            ("heartwood_note_address_proof", true),
             ("heartwood_note_list", false),
             ("heartwood_note_new", false),
             ("heartwood_note_new_pair", false),
@@ -3025,5 +3162,168 @@ mod tests {
             assert_eq!(parsed.as_str(), method);
             assert!(!parsed.always_requires_button(), "{method}");
         }
+    }
+
+    // ---- LUD-25 address proofs ----
+
+    fn proof_cmd(host: &str, name: &str, action: &str, cx1: &str) -> String {
+        format!(r#"{{"cmd":"cash_address_proof","host":"{host}","name":"{name}","action":"{action}","cx1":"{cx1}"}}"#)
+    }
+
+    #[test]
+    fn an_address_proof_is_held_for_and_returns_only_the_signature() {
+        use crate::cash_key::{address_node, address_proof_for, cx1_of, AddressAction};
+        let mut h = Harness::new();
+        let cx1 = cx1_of(&address_node(&[7u8; 32], "moneyer.dev").unwrap()).unwrap();
+        let res = h.run(&proof_cmd("moneyer.dev", "alice", "register", &cx1));
+        assert_eq!(res["ok"], true, "{res}");
+        let want = address_proof_for(&[7u8; 32], "moneyer.dev", &cx1, AddressAction::Register, "alice").unwrap();
+        assert_eq!(res["sig"], hex_encode(&want.signature));
+        assert_eq!(res["pubkey"], hex_encode(&want.pubkey));
+        assert_eq!(
+            (res["branch"].clone(), res["domain"].clone(), res["name"].clone(), res["action"].clone()),
+            (json!("current"), json!("moneyer.dev"), json!("alice"), json!("register"))
+        );
+        // One card, naming the address and what the branch agrees to.
+        assert_eq!(h.proof_asked, vec![("ADDRESS PROOF", "alice@moneyer.dev\nregister, current keys".to_string())]);
+        assert!(h.asked.is_empty() && h.trust_asked.is_empty() && h.cash_asked.is_empty());
+        // Never the key: not the identity, not the branch, not index 0.
+        let node = address_node(&[7u8; 32], "moneyer.dev").unwrap();
+        let key = crate::cash_key::note_secret_key(&node, crate::cash_key::PURPOSE_WALLET, 0).unwrap();
+        let text = res.to_string();
+        for secret in [hex_encode(key.as_ref()), hex_encode(&node.private_key), hex_encode(&[7u8; 32])] {
+            assert!(!text.contains(&secret));
+        }
+        // An unregister is its own proof, and its own card.
+        let res = h.run(&proof_cmd("moneyer.dev", "alice", "unregister", &cx1));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_ne!(res["sig"], hex_encode(&want.signature));
+        assert_eq!(h.proof_asked[1].1, "alice@moneyer.dev\nunregister, current keys");
+    }
+
+    #[test]
+    fn an_address_proof_comes_from_the_superseded_branch_when_that_is_the_one_named() {
+        // A name registered before LUD-25 50d740a is on file with the old
+        // branch, and only that branch's agreement moves it.
+        use crate::cash_key::{address_proof_for, cx1_of, superseded_address_node, AddressAction};
+        let mut h = Harness::new();
+        let old = cx1_of(&superseded_address_node(&[7u8; 32], "moneyer.dev").unwrap()).unwrap();
+        let res = h.run(&proof_cmd("moneyer.dev", "alice", "register", &old));
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(res["branch"], "superseded");
+        let want = address_proof_for(&[7u8; 32], "moneyer.dev", &old, AddressAction::Register, "alice").unwrap();
+        assert_eq!(res["sig"], hex_encode(&want.signature));
+        assert_eq!(h.proof_asked, vec![("ADDRESS PROOF", "alice@moneyer.dev\nregister, old keys".to_string())]);
+    }
+
+    #[test]
+    fn an_address_proof_that_could_not_be_signed_raises_no_card() {
+        use crate::cash_key::{address_node, cx1_of};
+        let mut h = Harness::new();
+        let ours = cx1_of(&address_node(&[7u8; 32], "moneyer.dev").unwrap()).unwrap();
+        let theirs = cx1_of(&address_node(&[8u8; 32], "moneyer.dev").unwrap()).unwrap();
+        let elsewhere = cx1_of(&address_node(&[7u8; 32], "mint.example").unwrap()).unwrap();
+        let long = "a".repeat(33);
+        for bad in [
+            proof_cmd("Moneyer.dev", "alice", "register", &ours),
+            proof_cmd("moneyer.dev/w", "alice", "register", &ours),
+            proof_cmd("https://moneyer.dev", "alice", "register", &ours),
+            proof_cmd("", "alice", "register", &ours),
+            proof_cmd("moneyer.dev", "Alice", "register", &ours),
+            proof_cmd("moneyer.dev", "al", "register", &ours),
+            proof_cmd("moneyer.dev", &long, "register", &ours),
+            proof_cmd("moneyer.dev", "al:ce", "register", &ours),
+            proof_cmd("moneyer.dev", "alice", "Register", &ours),
+            proof_cmd("moneyer.dev", "alice", "clear", &ours),
+            proof_cmd("moneyer.dev", "alice", "register", "cx1nope"),
+            proof_cmd("moneyer.dev", "alice", "register", &theirs),
+            proof_cmd("moneyer.dev", "alice", "register", &elsewhere),
+            r#"{"cmd":"cash_address_proof","host":"moneyer.dev","name":"alice","action":"register"}"#.to_string(),
+            r#"{"cmd":"cash_address_proof","name":"alice","action":"register"}"#.to_string(),
+            format!(r#"{{"cmd":"cash_address_proof","host":"moneyer.dev","action":"register","cx1":"{ours}"}}"#),
+            format!(r#"{{"cmd":"cash_address_proof","host":"moneyer.dev","name":"alice","cx1":"{ours}"}}"#),
+        ] {
+            let res = h.run(&bad);
+            assert_eq!(res["error"], "bad_request", "{bad}");
+            assert!(res.get("sig").is_none(), "{bad}");
+        }
+        assert!(h.proof_asked.is_empty(), "no refusal costs a hold");
+        // No identity on this surface (the cable): refused before anything.
+        h.identity = None;
+        let res = h.run(&proof_cmd("moneyer.dev", "alice", "register", &ours));
+        assert_eq!(res["error"], "bad_request");
+        assert!(h.proof_asked.is_empty());
+    }
+
+    #[test]
+    fn a_declined_address_proof_signs_nothing() {
+        use crate::cash_key::{address_node, cx1_of};
+        let cx1 = cx1_of(&address_node(&[7u8; 32], "moneyer.dev").unwrap()).unwrap();
+        for (answer, code) in [
+            (Approval::Declined, "user_declined"),
+            (Approval::TimedOut, "timeout"),
+            (Approval::Unavailable, "display_unavailable"),
+        ] {
+            let mut h = Harness::new();
+            h.answer = answer;
+            let res = h.run(&proof_cmd("moneyer.dev", "alice", "register", &cx1));
+            assert_eq!(res["error"], code);
+            assert!(res.get("sig").is_none());
+            assert_eq!(h.proof_asked.len(), 1);
+        }
+    }
+
+    #[test]
+    fn the_address_proof_card_fits_two_lines() {
+        use crate::cash_key::{address_node, cx1_of, AddressAction, BranchKind};
+        let cx1 = cx1_of(&address_node(&[7u8; 32], "moneyer.dev").unwrap()).unwrap();
+        let long_name = "z".repeat(32);
+        for name in ["abc", "alice", long_name.as_str()] {
+            for host in ["moneyer.dev", "moneyer.dev:8443", "a-very-long-mint-hostname.example.com"] {
+                for action in [AddressAction::Register, AddressAction::Unregister] {
+                    for branch in [BranchKind::Current, BranchKind::Superseded] {
+                        let ask = AddressProofAsk { host, name, action, cx1: &cx1, branch };
+                        let (header, title) = address_proof_card(&ask);
+                        assert_eq!(header, "ADDRESS PROOF");
+                        let lines: Vec<&str> = title.lines().collect();
+                        assert_eq!(lines.len(), 2, "{title}");
+                        for line in &lines {
+                            assert!(line.len() <= crate::note_fmt::CARD_LINE_CHARS, "{line}");
+                        }
+                        assert!(lines[1].starts_with(action.as_str()), "{title}");
+                    }
+                }
+            }
+        }
+        // The port is in the branch, not the address; a long address keeps
+        // the head of the name and the tail of the domain.
+        let ask = |host, name| AddressProofAsk {
+            host,
+            name,
+            action: AddressAction::Register,
+            cx1: &cx1,
+            branch: BranchKind::Current,
+        };
+        assert_eq!(address_proof_card(&ask("moneyer.dev:8443", "alice")).1, "alice@moneyer.dev\nregister, current keys");
+        assert_eq!(
+            address_proof_card(&ask("moneyer.dev", "averyveryverylongname")).1,
+            "averyveryver..eyer.dev\nregister, current keys"
+        );
+    }
+
+    #[test]
+    fn the_address_proof_method_maps_and_is_pinned_to_the_button() {
+        use crate::nip46::Nip46Method;
+        let method = "heartwood_note_address_proof";
+        // a caller-supplied cmd cannot redirect it onto the ungated cash_address
+        let cmd = note_cmd_for_method(method, &[json!({"cmd": "cash_address", "host": "moneyer.dev"})]).unwrap();
+        assert_eq!(cmd["cmd"], "cash_address_proof");
+        assert!(NOTE_METHODS.contains(&method));
+        let parsed = Nip46Method::from_str(method);
+        assert_eq!(parsed.as_str(), method);
+        assert!(parsed.is_note_method());
+        assert!(parsed.always_requires_button());
+        assert!(parsed.pinned_physical());
+        assert!(crate::policy::method_uses_served_key(method));
     }
 }

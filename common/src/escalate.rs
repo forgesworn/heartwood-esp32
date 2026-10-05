@@ -369,6 +369,10 @@ mod tests {
         use crate::nip46::Nip46Method as M;
         assert!(M::HeartwoodProvisionRendezvous.device_press_only());
         assert!(M::HeartwoodPairWallet.device_press_only());
+        // and the address proof, a standing authority over where a name pays
+        assert!(M::HeartwoodNoteAddressProof.device_press_only());
+        assert!(!M::HeartwoodNoteAddressProof.verdict_may_answer_card());
+        assert!(M::HeartwoodNoteAddressProof.pinned_physical());
         assert!(!M::HeartwoodNoteSend.device_press_only());
         assert!(!M::HeartwoodDerive.device_press_only());
         // And neither may ever have its card answered by a verdict.
@@ -489,6 +493,7 @@ mod tests {
             M::HeartwoodNoteSend,
             M::HeartwoodNoteRename,
             M::HeartwoodNoteTrust,
+            M::HeartwoodNoteAddressProof,
         ] {
             assert!(method.pinned_physical(), "{} lost its pin", method.as_str());
         }

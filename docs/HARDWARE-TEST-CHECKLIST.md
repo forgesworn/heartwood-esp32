@@ -2813,6 +2813,68 @@ dispatch without a card, so nothing parks.
   (methods, kinds, auto) is unchanged. With the operator key forgotten, the
   section says to import it and reads nothing from the board.
 
+## 34. Address proofs (LUD-25; added 2026-10-05, NOT YET BENCH-RUN)
+
+Since LUD-25 `50d740a` (moneyer 0.17) a mint changes or clears a name's `cx1`
+only with `"sig"`: a BIP-340 signature by the purpose-0 index-0 key of the
+branch CURRENTLY on file, over `sha256("LNURLcash:<register|unregister>:
+<domain>:<name>")`. A name registered before then is on file with this
+device's superseded `m/139'/1'` branch (section 15), so without this it could
+not be moved to the current one. `heartwood_note_address_proof`
+`{host, name, action, cx1}` signs it with whichever of the served identity's
+two branches at `host` has that `cx1`, and refuses any other; it answers
+`{ok, host, domain, name, action, cx1, branch, sig, pubkey}`, never a key.
+Advertised in `heartwood_capabilities` and as `note_address_proof_v1` in
+get_status.
+
+Drive it with scripts/nip46-client.mjs from a bound slot (`--method
+heartwood_note_address_proof --params '[{"host":"moneyer.dev","name":"<name>",
+"action":"register","cx1":"<cx1>"}]'`) until notecase grows the command, and
+take the `cx1` on file from the mint (moneyer: `zap_names.cx1`) or from
+`heartwood_note_address`.
+
+1. Move a name off the superseded branch: for a name whose `zap_names.cx1` is
+   the old branch, ask for a `register` proof naming THAT `cx1`. Expect an
+   ADDRESS PROOF card reading `<name>@moneyer.dev` over `register, old keys`
+   (watch the OLED, not only the CLI); hold. The reply's `branch` is
+   `superseded`. POST the registration with the new `cx1` (from
+   `heartwood_note_address`), the returned `sig` and the owner's NIP-98 (its
+   own HOLD TO SIGN card for kind 27235): moneyer answers `updated: true` and
+   `zap_names.cx1` is now the current branch. A zap then lands on a key of the
+   current branch (section 15 item 2).
+2. A `register` proof naming the current branch's `cx1` reads `register,
+   current keys` and answers `branch: current`; an `unregister` proof reads
+   `unregister, ...` and, POSTed with `cx1: null`, clears the name's branch.
+3. Refused with NO card, `bad_request` each time: a `cx1` of another npub, this
+   npub's `cx1` at another mint, a `cx1` that is not one (`cx1nope`), an
+   uppercase or two-letter name, `action` other than register/unregister, and
+   a host with a scheme or path. This is the one that matters: a hold is
+   never spent on a proof that could not be signed.
+4. Decline it, and let one time out: both answer as errors, no `sig`.
+5. Pinned always-ask: on a slot whose policy names
+   `heartwood_note_address_proof` with auto-approve, the card MUST still
+   appear.
+6. Never batched: two proofs sent back to back from one client raise two
+   cards, one after the other, each with its own address and action; one hold
+   never answers both.
+7. Escalate slot (section 24): the proof is refused outright, not parked. It
+   is device-press-only (`Nip46Method::device_press_only`), like a wallet
+   pairing: a proof is a standing authority over where a name pays, so no
+   guardian verdict may stand in for the owner at the board.
+7a. Two `heartwood_note_trust` asks for different senders, back to back from
+   one client, raise two TRUST SENDER cards, each with its own npub; one hold
+   never trusts both (they used to batch onto the first card).
+8. USB-bridged board through heartwoodd: the card is the extension card
+   (master heading, the method name, then the preview), not the titled
+   ADDRESS PROOF card. KNOWN: `show_master_sign_request` cuts the preview to
+   one small line's worth of characters, so the address shows and the action
+   is cut to `regi...` / `unre...`, as every note card's second line is cut on
+   that path today (trust loses "notes skip the hold"). Record what the panel
+   shows; a titled card on that path is a follow-up for all note cards. Over
+   the cable's 0x70 frame, `cash_address_proof` answers `bad_request` ("not
+   available on this surface"), as `cash_address` does.
+9. Unbound client: `unauthorised`, like every other note method.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

@@ -111,6 +111,11 @@ pub enum Nip46Method {
     /// Neither discloses a note, so neither is pinned to the button.
     HeartwoodNoteAddress,
     HeartwoodNoteClaim,
+    /// LUD-25's address proof: a signature by one of the served identity's
+    /// address branches agreeing to register or unregister a lightning-address
+    /// name at a mint. It is what lets a mint move or clear where the name
+    /// pays, so it is pinned to the button like the mutating set.
+    HeartwoodNoteAddressProof,
     /// Mint a connection slot for another wallet, from a wallet already
     /// bound. Gated by a hold; answers with a one-time bunker URI.
     HeartwoodPairWallet,
@@ -163,6 +168,7 @@ impl Nip46Method {
             "heartwood_note_trusted" => Self::HeartwoodNoteTrusted,
             "heartwood_note_address" => Self::HeartwoodNoteAddress,
             "heartwood_note_claim" => Self::HeartwoodNoteClaim,
+            "heartwood_note_address_proof" => Self::HeartwoodNoteAddressProof,
             "heartwood_pair_wallet" => Self::HeartwoodPairWallet,
             "heartwood_provision_rendezvous" => Self::HeartwoodProvisionRendezvous,
             other => Self::Unknown(other.to_string()),
@@ -204,6 +210,7 @@ impl Nip46Method {
             Self::HeartwoodNoteTrusted => "heartwood_note_trusted",
             Self::HeartwoodNoteAddress => "heartwood_note_address",
             Self::HeartwoodNoteClaim => "heartwood_note_claim",
+            Self::HeartwoodNoteAddressProof => "heartwood_note_address_proof",
             Self::HeartwoodPairWallet => "heartwood_pair_wallet",
             Self::HeartwoodProvisionRendezvous => "heartwood_provision_rendezvous",
             Self::Unknown(s) => s.as_str(),
@@ -230,6 +237,7 @@ impl Nip46Method {
                 | Self::HeartwoodNoteSend
                 | Self::HeartwoodNoteRename
                 | Self::HeartwoodNoteTrust
+                | Self::HeartwoodNoteAddressProof
                 | Self::HeartwoodPairWallet
                 | Self::HeartwoodProvisionRendezvous
         )
@@ -255,6 +263,7 @@ impl Nip46Method {
                 | Self::HeartwoodNoteTrusted
                 | Self::HeartwoodNoteAddress
                 | Self::HeartwoodNoteClaim
+                | Self::HeartwoodNoteAddressProof
         )
     }
 
@@ -275,11 +284,15 @@ impl Nip46Method {
     /// card accepts. A rendezvous provision hands the caller a derived scalar
     /// and `heartwood_pair_wallet` mints a slot secret and returns it: each
     /// turns the approval itself into a bearer capability, so no remote
-    /// verdict may stand in for the press. On an escalate slot these are
-    /// refused outright rather than parked, because parking one could only
-    /// ever end in a card nobody is there to press (#160).
+    /// verdict may stand in for the press. An address proof is the same: a
+    /// signature that never expires, deciding where a lightning address's
+    /// payments go, so only the owner at the board may give it. On an
+    /// escalate slot these are refused outright rather than parked, because
+    /// parking one could only ever end in a card nobody is there to press
+    /// (#160).
     pub fn device_press_only(&self) -> bool {
-        self.requires_fresh_physical_approval() || matches!(self, Self::HeartwoodPairWallet)
+        self.requires_fresh_physical_approval()
+            || matches!(self, Self::HeartwoodPairWallet | Self::HeartwoodNoteAddressProof)
     }
 
     /// Whether a guardian verdict may answer this method's OWN card (#160).

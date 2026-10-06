@@ -6,8 +6,6 @@
 
 use std::time::{Duration, Instant};
 
-use heartwood_common::button_arm::{CardGate, PageGate};
-
 use crate::oled::Display;
 
 /// Result of the approval loop.
@@ -78,32 +76,11 @@ where
     result
 }
 
-/// [`run_approval_loop`] for a card whose content runs over several pages
-/// (a registration proof's long username), gated by `gate`: the pages turn
-/// on their own, and A does nothing until every page has been on screen for
-/// its full dwell, so a hold never rests on part of what it approves. B
-/// still cancels. `show_fn` gets the remaining seconds, the page and whether
-/// a hold counts yet.
-pub fn run_paged_approval_loop<F>(
-    display: &mut Display<'_>,
-    buttons: &crate::button::Buttons<'_>,
-    timeout_secs: u64,
-    mut gate: PageGate,
-    show_fn: F,
-) -> ApprovalResult
-where
-    F: FnMut(&mut Display<'_>, u32, usize, bool),
-{
-    let result = approval_loop_inner(display, buttons, timeout_secs, Some(&mut gate), show_fn);
-    crate::button::clear_press_edge();
-    result
-}
-
 fn approval_loop_inner<F>(
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
     timeout_secs: u64,
-    mut gate: Option<&mut dyn CardGate>,
+    mut gate: Option<&mut heartwood_common::phone_unlock::EnrolGate>,
     mut show_fn: F,
 ) -> ApprovalResult
 where
@@ -116,7 +93,7 @@ where
     let mut press_start = Instant::now();
     let mut last_pct: u32 = 101; // force first draw
     let mut last_view: Option<(usize, bool)> = None;
-    // A gated card: `oled::draw_generation` just after its face was last
+    // The enrol card: `oled::draw_generation` just after its face was last
     // drawn, to tell when something else has drawn over it.
     let mut drawn_gen: Option<u32> = None;
     // Every card, gated or not, arms only once A has been seen up for

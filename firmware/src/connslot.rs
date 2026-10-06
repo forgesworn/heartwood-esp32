@@ -217,7 +217,16 @@ pub fn handle_update(
                 }
                 // Family-bunker C3 flags travel over the cable too, so the
                 // guardian's own hands can flag a slot without an operator.
-                if v.get("escalate").is_some()
+                // `escalate` alone is the owner's away-approval switch: name
+                // what the press grants or takes back, not "family".
+                let family_others = v.get("petition_on_deny").is_some()
+                    || v.get("audit_child_wrap").is_some()
+                    || v.get("guardian_notice_wrap").is_some()
+                    || v.get("bound_identity").is_some();
+                if let (Some(escalate), false) = (v["escalate"].as_bool(), family_others) {
+                    if !changes.is_empty() { changes.push_str(", "); }
+                    changes.push_str(if escalate { "PHONE MAY OK" } else { "BUTTON ONLY" });
+                } else if v.get("escalate").is_some()
                     || v.get("petition_on_deny").is_some()
                     || v.get("audit_child_wrap").is_some()
                     || v.get("guardian_notice_wrap").is_some()

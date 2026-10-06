@@ -1141,6 +1141,23 @@ impl SoftBackend {
             if let Some(ev) = &parsed {
                 sign_kind = Some(ev.kind);
                 sign_preview = ev.content.chars().take(80).collect();
+                // A login challenge (kind 22242 with a `code` tag) needs a
+                // physical press with its code on a screen, which Soft mode
+                // does not have. An API click on a queue that never shows the
+                // code would let anyone who can reach the node's login page
+                // be approved by mistake, so refuse it before it can queue,
+                // whatever the slot allows and even when pre-approved.
+                if heartwood_common::policy::is_login_challenge(ev.kind, &ev.tags) {
+                    log::warn!("soft: login challenge from {client_short}… refused: needs a hardware signer");
+                    let error_json = nip46::build_error_response(&req.id, -32000, SOFT_LOGIN_REFUSAL)
+                        .map_err(|e| BackendError::Internal(format!("build error response: {e}")))?;
+                    let mut nonce = [0u8; 32];
+                    getrandom::getrandom(&mut nonce)
+                        .map_err(|e| BackendError::Internal(format!("nonce generation: {e}")))?;
+                    let ct = nip44::encrypt(&conv_key, &error_json, &nonce)
+                        .map_err(|e| BackendError::Internal(format!("NIP-44 encrypt: {e}")))?;
+                    return self.wrap_in_envelope(master_pubkey, client_pubkey, created_at, &ct);
+                }
             }
             match sign_kind {
                 Some(k) => log::info!("soft: sign_event kind {k} from {client_short}…{slot_suffix}"),
@@ -1430,6 +1447,10 @@ fn log_safe_method(method: &Nip46Method) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// What a Soft-mode signer answers a login challenge with.
+const SOFT_LOGIN_REFUSAL: &str =
+    "login challenges need a hardware Heartwood: this software signer cannot show the code";
 
 #[cfg(test)]
 mod tests {
@@ -1861,6 +1882,118 @@ mod tests {
         assert_eq!(signed.content, "queued then approved");
 
         // The queue is empty: approval did not re-queue the request.
+        assert!(backend.list_approvals().is_empty());
+    }
+
+    /// Encrypt a `sign_event` request to the master from `client_secret`.
+    fn sign_request_ct(
+        client_secret: &[u8; 32],
+        master_pubkey: &[u8; 32],
+        master_hex: &str,
+        kind: u64,
+        tags: Value,
+    ) -> String {
+        let conv_key = nip44::get_conversation_key(client_secret, master_pubkey).unwrap();
+        let event = serde_json::json!({
+            "kind": kind,
+            "content": "Log in to node",
+            "tags": tags,
+            "created_at": 1_700_000_000u64,
+            "pubkey": master_hex,
+        });
+        let req = serde_json::json!({"id": "r1", "method": "sign_event", "params": [event.to_string()]});
+        nip44::encrypt(&conv_key, &req.to_string(), &[7u8; 32]).unwrap()
+    }
+
+    fn decrypted_reply(client_secret: &[u8; 32], master_pubkey: &[u8; 32], envelope: &str) -> Value {
+        let conv_key = nip44::get_conversation_key(client_secret, master_pubkey).unwrap();
+        let ev: SignedEvent = serde_json::from_str(envelope).unwrap();
+        serde_json::from_str(&nip44::decrypt(&conv_key, &ev.content).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn login_challenge_is_refused_outright_even_on_an_auto_approve_slot() {
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+        let master_json = backend.create_master("login", 12).unwrap();
+        let master_hex = master_json["pubkey"].as_str().unwrap().to_string();
+        let master_pubkey = hex_to_32(&master_hex).unwrap();
+        let client_secret = [0x42u8; 32];
+        let client_hex = derive_pubkey_hex(&client_secret).unwrap();
+        let client_pubkey = hex_to_32(&client_hex).unwrap();
+
+        // A slot bound to this client that auto-approves sign_event for every kind.
+        {
+            let mut guard = backend.state.write().unwrap();
+            let master = &mut guard.as_mut().unwrap().keystore.masters[0];
+            let slot = ConnectSlot {
+                slot_index: 0,
+                label: "node".into(),
+                secret: "ab".repeat(32),
+                current_pubkey: Some(client_hex.clone()),
+                allowed_methods: vec!["sign_event".into()],
+                allowed_kinds: vec![],
+                auto_approve: true,
+                signing_approved: true,
+                strict_permissions: false,
+                authorized_pubkeys: vec![client_hex.clone()],
+                escalate: false,
+                petition_on_deny: false,
+                audit_child_wrap: false,
+                guardian_notice_wrap: false,
+                bound_identity: None,
+                approved_identities: String::new(),
+                was_bound: true,
+                client_grants: None,
+            };
+            master.connection_slots = vec![slot];
+        }
+
+        // Control: an ordinary kind on the same slot signs silently.
+        let ct = sign_request_ct(&client_secret, &master_pubkey, &master_hex, 1, serde_json::json!([]));
+        let reply = backend
+            .handle_encrypted_request(&master_pubkey, &client_pubkey, 1_700_000_001, &ct)
+            .expect("ordinary kind auto-signs");
+        assert!(decrypted_reply(&client_secret, &master_pubkey, &reply).get("error").is_none());
+
+        // Plain NIP-42 AUTH (no code tag) behaves as before: signs silently.
+        let ct = sign_request_ct(&client_secret, &master_pubkey, &master_hex, 22242, serde_json::json!([["relay", "wss://r"], ["challenge", "abc"]]));
+        let reply = backend
+            .handle_encrypted_request(&master_pubkey, &client_pubkey, 1_700_000_001, &ct)
+            .expect("plain relay AUTH is unaffected");
+        assert!(decrypted_reply(&client_secret, &master_pubkey, &reply).get("error").is_none());
+
+        // Login challenges, valid or malformed: an error reply, nothing queued, nothing signed.
+        for tags in [
+            serde_json::json!([["challenge", "ab"], ["relay", "https://n"], ["code", "4821"]]),
+            serde_json::json!([["code", "12"]]),
+            serde_json::json!([["code", "1234"], ["code", "5678"]]),
+        ] {
+            let ct = sign_request_ct(&client_secret, &master_pubkey, &master_hex, 22242, tags.clone());
+            let reply = backend
+                .handle_encrypted_request(&master_pubkey, &client_pubkey, 1_700_000_001, &ct)
+                .expect("a refusal is an error reply, not a backend error");
+            let json = decrypted_reply(&client_secret, &master_pubkey, &reply);
+            assert!(json.get("result").is_none(), "signed {tags}: {json}");
+            assert!(json["error"].as_str().unwrap_or_default().contains("hardware Heartwood"), "{json}");
+            assert!(backend.list_approvals().is_empty(), "queued {tags}");
+        }
+    }
+
+    #[test]
+    fn login_challenge_from_an_unbound_client_is_refused_not_queued() {
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+        let master_json = backend.create_master("login2", 12).unwrap();
+        let master_hex = master_json["pubkey"].as_str().unwrap().to_string();
+        let master_pubkey = hex_to_32(&master_hex).unwrap();
+        let client_secret = [0x43u8; 32];
+        let client_pubkey = hex_to_32(&derive_pubkey_hex(&client_secret).unwrap()).unwrap();
+        let ct = sign_request_ct(&client_secret, &master_pubkey, &master_hex, 22242, serde_json::json!([["code", "4821"]]));
+        let reply = backend
+            .handle_encrypted_request(&master_pubkey, &client_pubkey, 1_700_000_001, &ct)
+            .expect("refusal reply");
+        assert!(decrypted_reply(&client_secret, &master_pubkey, &reply).get("error").is_some());
         assert!(backend.list_approvals().is_empty());
     }
 

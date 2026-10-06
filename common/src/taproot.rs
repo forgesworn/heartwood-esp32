@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(text(v, "auxRand"), "00".repeat(32));
         assert_eq!(backend::pubkey_from_secret(&sk).unwrap(), q);
         let sighash = key_path_sighash(&q, text(v, "domain"));
-        let signature = backend::sign_bip340(&sk, &sighash).unwrap();
+        let signature = backend::sign_bip340_zero_aux(&sk, &sighash).unwrap();
         assert_eq!(hex_encode(&signature), text(v, "signature"));
 
         // And that signature, as the one witness item of the canonical spend

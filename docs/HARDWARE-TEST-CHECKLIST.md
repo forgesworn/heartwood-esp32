@@ -58,11 +58,12 @@ T-Display. Public identity and credential values are deliberately omitted.
 ## 1. Flash + first identity (generate)
 
 - [ ] Flash from Sapwood (Flash tab). Board reboots into the boot animation.
-- [ ] Setup shows **Create a fresh identity** and **Restore from my 12 words**.
+- [ ] Setup shows **Create a fresh key** and **Restore a key I already have**.
 - [ ] Create → name → "Create it on my device". OLED shows **NEW IDENTITY / Working**.
-- [ ] OLED walks the 12 words one at a time (**WORD n/12**, big font). Tap advances.
-- [ ] After word 12, **ALL 12 SHOWN** — a short tap re-shows the words; a 2-second
-      hold saves (**SAVED**).
+- [ ] OLED walks the recovery words one at a time (**WORD n OF 19**, or 31 for the
+      longer option; big font). Tap advances.
+- [ ] After the last word, **ALL 19 SHOWN** (or **ALL 31 SHOWN**): the count matches
+      the walkthrough; a short tap re-shows the words; a 2-second hold saves (**SAVED**).
 - [ ] Sapwood shows the npub and moves to "write it down". npub matches the device.
 
 ## 2. On-device restore (the new path)
@@ -422,15 +423,80 @@ Multi-network WiFi (T-Display or Heltec in WiFi mode):
 - [ ] Over USB, add two fallback networks in Sapwood (e.g. phone hotspot +
       second AP), reorder them, save, and read back: the list survives the
       reboot and the redacted state shows ssid + password_set only.
-- [ ] Power the primary AP off. The signer rotates to the hotspot within a few
-      retry cycles (~10 s/candidate) and comes online — Sapwood and paired apps
+- [ ] Power the primary AP off. The signer scans and tries the strongest visible
+      saved AP first (survey bounded to 8 s), then rotates on failure (up to
+      15 s for association, another 15 s for DHCP, and
+      3 s backoff per failed candidate) and comes online — Sapwood and paired apps
       reach it again. (A console build also names each candidate as "wifi
       network N/M".)
 - [ ] Promote a fallback to primary in Sapwood using its saved password (no
-      password typed). The device joins it after reboot.
+      password typed). With it the strongest visible saved network, the device
+      joins it after reboot; saved position alone no longer overrides signal.
 - [ ] Encrypted-at-rest + WiFi: with the vault locked, the device now joins
       WiFi during the locked phase (previously the station never associated)
       and publishes its kind-24135 unlock announcement.
+
+Strongest-network selection and roaming (2026-10-04):
+- [x] Host policy tests cover strongest-first ranking, stable ties, hidden
+      fallbacks, a failed strong AP not starving a weaker one, fresh selection
+      after link loss, two-scan hysteresis and failed-target suppression.
+- [ ] With two saved APs visible, boot locked and unlocked: join the stronger
+      one regardless of saved position, retaining USB responsiveness during scan.
+- [ ] While connected, make another saved AP at least 10 dB stronger for two
+      scans. Verify the board switches and the relay reconnects without reboot.
+- [ ] Fluctuate the advantage below 10 dB, or change the winner between scans:
+      the current connection stays put. Repeat while an approval is displayed;
+      no proactive switch occurs until the approval/result has cleared.
+- [ ] Give the stronger AP incorrect credentials: recover to the working AP
+      and suppress further proactive attempts at the failed AP for five minutes.
+- [ ] The open WiFi page shows scanning, the actual join candidate, then the
+      connected SSID and signal; connectivity cards do not displace that page.
+
+Location-change regression (2026-10-04; partial T-Display bench verification):
+- [x] App-only update on the connected T-Display: installed factory partition
+      at `0x10000`, size `0x300000`, verified before writing. The 2,204,416-byte
+      patched beta.21 app was read back byte-for-byte (SHA-256
+      `c78855d42ca11df688a6bbce64e8f8aae86e61e610f13a1a861c4b9e8fa24501`). <!-- # pragma: allow-secret (public firmware image SHA-256) -->
+      Previous app captured for recovery; bootloader, partition table and
+      persistent data partitions were not written.
+- [x] Unlocked boot with the existing four saved networks: observed
+      `network_not_found` (201), then `wifi_ready` with `wifi_index: 2`, then
+      `online` on relay index 0. During WiFi retry, all 25 sampled USB network
+      status requests answered (median 88 ms, maximum 91 ms). Three earlier
+      requests before boot service started timed out; relay dial later took
+      2.44 s for one reply. The same identity, two pairings, network revision
+      6 and saved network/relay lists were present after the update.
+      This proves boot fallback and relay reconnection on this unlocked
+      T-Display; the follow-up handoff evidence is recorded below.
+- [x] Follow-up at approximately 12:12 UTC: the same T-Display reported
+      `online`, `wifi_index: 3` (Pixel hotspot) and `relay_index: 3`, with
+      configuration revision 6 unchanged. Firmware uptime was 5,809 seconds,
+      consistent with the approximately 10:35 UTC verification boot above:
+      evidence of hotel-to-hotspot recovery within the same boot. The exact
+      transition and retry timing were not captured. Identity, two pairings
+      and NVS entry counts remained unchanged. Locked boot and other boards
+      are still unverified.
+- [x] Return handoff after the larger WiFi-page update (`defb792`): observed
+      Pixel hotspot online at 12:24 UTC, then hotel WiFi online at 12:30 UTC.
+      Uptime of 576 seconds at approximately 12:32 UTC matches that image's
+      12:22 verification boot, so the return happened without a reboot.
+      Identity, two pairings and configuration revision 6 remained intact.
+      The owner accepted the larger layout but reported an unavailable SSID
+      during retries: the page incorrectly fell back to the primary name
+      whenever the joined index was cleared. The follow-up tracks the actual
+      candidate separately and keeps the open network page visible through
+      connectivity changes; its on-device retry-name check remains pending.
+- [ ] Save three networks A/B/C. With only C available, cold boot both locked
+      and unlocked; verify C joins and USB remains responsive during retries.
+- [ ] Unlock on C, then leave it powered while disabling C and enabling B.
+      Verify it cycles C/A/B, reconnects the relay, and reports B's correct
+      `runtime.wifi_index`. Repeat B to A and A to C without rebooting.
+- [ ] Let A associate but withhold DHCP; leave B working. Verify timeout on A
+      cancels its association and B receives an IP and serves paired apps.
+- [ ] Use wrong credentials for A and B; C must still join. Restore A, remove
+      C, and verify the next full rotation recovers without a power cycle.
+- [ ] With one saved AP, take it away and restore it. Verify retry recovery;
+      with every AP absent, verify cable configuration recovery stays usable.
 
 Quick USB update (T-Display / C6):
 - [ ] Sapwood's Firmware section offers "Update to vX over USB" for the
@@ -2285,7 +2351,32 @@ subscribed to `{"kinds":[24135]}`).
    unlocked through round 6. The log says "phones told about the relay
    change; recorded", and a reset afterwards has no "relays changed" line.
 
-## 29. Adding an unlock phone over the relay (added 2026-09-25; steps 1, 2, 2b and 10d bench-run 2026-09-25, desk Heltec V4)
+10. **`phone_relays` (Sapwood follow-up) tracks the drift above.** Query
+    FIRMWARE_INFO (USB, any mode) and get_status (Sapwood, once unlocked) at
+    each point:
+    - Before step 2 (in step) and after step 9 (drift settled): both read
+      `"current"`.
+    - Right after step 2 (drift recorded, nothing accepted yet): both read
+      `"pending"`.
+    - From the first "(n accepted)" old-relay line in step 3 or step 5
+      onward, even with five of six rounds still to run, both flip to
+      `"current"`. It stays `"current"` through step 6's restart and step 7's
+      ceiling wait: a resumed or deferred round never regresses it.
+    - Step 8 (last phone revoked): both read `"current"` (no phones enrolled),
+      whatever the now-removed record said.
+    - Second-change regression: repeat step 2 (A -> C, one round accepted, so
+      `phone_relays` reads `"current"`), then before round 2 fires point the
+      board at a THIRD relay set D (sharing no relay with A or C) and restart.
+      The boot log resets to "0 of 6 update rounds already sent" for the new
+      change, and `phone_relays` reads `"pending"` again; the earlier
+      acceptance must not carry over to the new drift.
+    - Damage: with the board unlocked, corrupt the `ph_relays` NVS entry
+      directly (a raw NVS write, or interrupt a write mid-flash) and confirm
+      both FIRMWARE_INFO and get_status read `"unknown"`. A subsequent reset
+      logs "phones' relay record not readable by this firmware" and starts no
+      update: the status read must not have repaired or overwritten it.
+
+## 29. Adding an unlock phone over the relay (added 2026-09-25; steps 1, 2, 2b and 10d bench-run 2026-09-25, step 1 by the reversed path 2026-09-26, desk Heltec V4)
 
 **Bench run 2026-09-25** (V4, legacy-NVS bigapp layout, signed v0.18.0-beta.19 written app-only at
 0x10000, readback identical):
@@ -2306,6 +2397,21 @@ subscribed to `{"kinds":[24135]}`).
   only reaches the phone's clipboard, so the code had to be carried across by hand (the phone can
   scan a QR on the computer, so the flow should run that way); and Cambium hides its check code once it says Done (the owner saw it under the
   PIN prompt). Both are Cambium and Sapwood follow-ups.
+
+**Bench run 2026-09-26** (same V4 on beta.19, live Sapwood over the relay, Cambium 0.7.1 on the
+Pixel): step 1 by the reversed path. Sapwood showed its invite QR and Cambium scanned it. The five
+words matched on Sapwood, the phone and the board's card, the check code matched on the board,
+Sapwood and Cambium, and it stayed on Cambium's Done screen. After a reset the Pixel unlocked the
+board with the new record. Its earlier records and the bench script's "bench phone" record were
+revoked from Sapwood, leaving one record. Both follow-ups found on 2026-09-25 are fixed.
+
+- Found: a hold started after reading page 3 but before its dwell ended did nothing and showed
+  nothing (no hold bar), and a tap after letting go also did nothing, since it was still before
+  the gate. A later hold of about 2 s approved. This is the gate working as designed (as in
+  step 2b), but the only sign of it is the hint changing from "compare all 5 words" to "on
+  phone? hold PRG". Follow-up: show "let go, still reading" while A is held before the gate,
+  make the arming visible, and reconsider a tap declining once armed, since the owner's next tap
+  would have declined.
 
 
 `enrol_unlock_phone` does over the relay what `PHONE_UNLOCK_CMD` (0x64)
@@ -2580,11 +2686,12 @@ the board's relays, and `HEARTWOOD_MASTER` set to a master it serves.
     one-off rendezvous tag. No event carries the label, the enrolment key or
     the phone's id in the clear.
 
-## 30. Destructive cards say ERASE (added 2026-09-25; 30a bench-run 2026-09-25 on beta.19)
+## 30. Destructive cards say ERASE (added 2026-09-25; 30a bench-run 2026-09-25, 30b 2026-09-26, on beta.19)
 
 **Bench run 2026-09-25** (V4, v0.18.0-beta.19): 30a read "FACTORY RESET / ERASE ALL KEYS / notes
 and pairings too" with its countdown; a tap denied it (NACK after 6 s) and every identity, phone and
-NVS entry was unchanged. 30b not run.
+NVS entry was unchanged. 30b was run on 2026-09-26 from live Sapwood over the relay: the card read
+REMOVE IDENTITY / ERASE slot N with the slot's npub prefix, it was left to expire, and the slot stayed.
 
 
 The factory reset and identity removal cards used a renderer that dropped its
@@ -2596,110 +2703,206 @@ titled card. Deny each one; do not hold PRG on either.
   press prompt). Expected: "FACTORY RESET / ERASE ALL KEYS /
   notes and pairings too", a 30 s countdown and the hold hint. Tap to deny;
   the board NACKs and keeps every key.
-- [ ] **30b. Identity removal.** Remove a non-default slot from Sapwood.
+- [x] **30b. Identity removal.** Remove a non-default slot from Sapwood.
   Expected: "REMOVE IDENTITY / ERASE slot N / npub1..." with the first 16
   characters of that slot's npub, matching Sapwood. Let it time out; the slot
   stays.
 
-## 31. LUD-25 unified taproot notes (lnurl/luds 6e865b1; added 2026-09-24, NOT YET BENCH-RUN)
+## 31. The info page names the network joined (added 2026-09-30, NOT YET BENCH-RUN)
 
-Every note is now a taproot output key Q. A key note's ck1 is `Q || sig`, a
-BIP-340 signature over the canonical spend's key-path sighash bound to the
-mint's hostname, and the device signs LUD-25's registration proof for its
-address branch. Host tests pin every byte against the spec's vectors; what is
-left is the mint, the wallet and the panel. Run items 1 to 4 against a mint
-that verifies the unified form (moneyer's taproot build or the reference
-mint): live moneyer 0.16.x does not accept a domain-bound ck1 yet, so item 1
-fails there by design until it is upgraded.
+With a fallback list the board can be online through a network other than the
+primary. The WiFi info page used to show the primary SSID regardless, and
+GET_NET_CONFIG's runtime said `wifi_connected` without saying which network.
+The runtime block now carries `wifi_index` (0 = the top-level `ssid`, n =
+`networks[n-1]`, `null` while WiFi is down), the relay's operator-only
+`get_network_config` reply carries the same `wifi_index` at top level, and the
+info page and Sapwood's Connectivity panel both name that network.
 
-1. **A key note spends with the new ck1.** Claim or receive a key note, then
-   collect it. The exported `k1` starts `ck1` and is 163 characters (the old
-   recoverable one was 113), the mint melts it, and a second export of the same note gives
-   the identical string. Repeat on a mint reached with a port
-   (`127.0.0.1:8899/w`): the ck1 binds `127.0.0.1` and is accepted.
-2. **A plain note confirms with the mint's cs1.** Rotate a plain note through
-   lnurl-wallet with the device connected. The mint answers with a `cs1` whose
-   human-readable part carries the amount (`cs10n1...`); `confirm` must answer
-   `{"ok":true}`, the note must be CONFIRMED in the next list with that `sig`,
-   and the wallet must show it offline-verified. Before this change the
-   device refused that confirm and the note sat PENDING.
-3. **A zap to a key note opens.** Pay the device's lightning address at a
-   moneyer that puts `sig=cs<amount>1...` in the wrap. The RECEIVE card (or a
-   trusted store) must appear; before this change the wrap was refused as
-   "sig is not a cs1".
-4. **Registration proof.** `heartwood_note_address_proof` with
-   `{"host":"<mint>","name":"<name>","action":"register"}` from a bound slot.
-   Expect a REGISTER NAME card whose two lines are the name and `at <domain>`
-   (with `:<port>` when the host has one), both inside the panel with
-   nothing clipped; one hold; a 128-hex
-   `sig` and the same `cx1` `heartwood_note_address` gives for that host. The
-   mint must accept `cx1` plus that `sig`. Then `unregister`: an UNREGISTER
-   NAME card, and the mint releases the name.
-5. **Nothing is signed without the card.** Decline, and let one time out: an
-   error each, no `sig`. A name with a capital or a `:`, an action other than
-   register or unregister, or a host with a path answers `bad_request` with
-   NO card. On a slot whose policy auto-approves the method, the card still
-   appears (pinned).
-6. **One card per proof.** Send two different proofs back to back (two names,
-   or register then unregister): two cards, one after the other. Send the
-   same proof twice quickly: one card, one hold, both answered with the same
-   `sig`.
+- [ ] **31a.** WiFi mode with a primary out of range and a reachable fallback.
+  Once online, short-press to the network page: it names the fallback, not the
+  primary. GET_NET_CONFIG (`node scripts/net-config.mjs --port <port>`) shows
+  `runtime.wifi_index` naming that fallback (1 for the first entry in
+  `networks`, 2 for the second).
+- [ ] **31b.** Bring the primary back and reboot: the page names the primary and
+  `wifi_index` is 0. Drop WiFi altogether: `wifi_index` reads `null` and the page
+  falls back to the primary SSID.
+- [ ] **31c.** Over the relay (Sapwood's Connectivity panel on a WiFi board, or
+  `get_network_config` on the 24134 channel as the device operator): the reply
+  carries a top-level `wifi_index` matching 31a, and Sapwood reads "Currently on
+  <fallback>, one of the fallback networks". Over USB the same line appears from
+  GET_NET_CONFIG's `runtime.wifi_index`.
 
-Items 7 to 14 (added 2026-09-26) cover LUD-25's derivation purposes
-(lnurl/luds lnurlcash 50d740a) and the review fixes that followed: a mint
-now pays a name on purpose 2, the registration proof is signed on purpose 0,
-a note paid before purposes is still this device's, and the proof card is
-press-only and shows the whole name. Run them against a mint that credits
-zaps on purpose 2, checks the proof against purpose 0 index 0 and accepts
-the domain-bound ck1 (moneyer's taproot build). Live moneyer 0.16.x accepts
-none of those, so this build must not reach an owner before that mint is
-live (CLAUDE.md release note). For item 9, the board must still hold a key
-note from the older firmware: write down its id and `p` before flashing.
+## 32. The cable is served during a WiFi join (added 2026-10-02; 32a bench-run 2026-10-02, T-Display)
 
-7. **A zap lands on purpose 2 and opens.** Pay the device's lightning address.
-   The wrap opens (RECEIVE card, or a trusted store), `list_notes` shows the
-   note with the `p` the mint minted to and its `index`, and it collects as
-   in item 1. A second zap takes the next index.
-8. **The proof item 4 signs is the one the mint now checks.** Repeat item 4
-   on this build: the mint accepts it. The same name's proof from the
-   previous build (index 0 with no purpose) must now be refused by the mint,
-   which is the change working, not a fault.
-9. **A note paid before purposes survives the flash.** On a board holding a
-   key note from the older firmware, flash this build (release, app only).
-   The note is still listed with the same id, `p` and `index`. Its export is
-   now the domain-bound BIP-340 ck1 (163 characters, starting `ck1`), not the
-   113-character recoverable one the older firmware gave: collect it at the
-   upgraded moneyer, which melts it. The same export presented to moneyer
-   0.16.x is refused there, which is the reason for the release note, not a
-   fault in the note; nothing is spent and it collects once the mint is
-   upgraded.
-10. **A scan still finds the old ladder.** Run notecase's scan on a board
-    that does not hold a note the branch has on the old ladder (a second
-    board provisioned with the same identity is the safe way; a factory
-    reset erases the notes). The claim succeeds with that note's `p`, the
-    note lists, and its export collects. A claim naming a `p` from another
-    identity, or another mint, answers `bad_request` and stores nothing, and
-    a claim with no `p` at all answers `bad_request` with "p is required".
-11. **A long name is shown whole.** Ask for a proof for a name of 40 or more
-    characters (`a-b-c...`, LUD-16's alphabet only). The card turns its own
-    pages every 3 s, each page a piece of the name ending ` 1/2`, ` 2/2`
-    and so on over the `at <domain>` line; read the pieces together and they
-    spell the name. A hold started on the first page does nothing; once
-    every page has been shown, a hold approves. B (on a two-button board)
-    cancels at any time. Nothing on any page is clipped at the panel edge.
-12. **No guardian answers a proof.** On an escalate slot, ask for a proof.
-    It is refused at once with "this request must be approved at the
-    device" and no notice reaches the guardian, whatever the slot's policy
-    says for the method.
-13. **A port is shown and a bad one refused.** A proof for
-    `moneyer.dev:8443` reads `at moneyer.dev:8443`; one for `moneyer.dev:x`
-    or `moneyer.dev:0443` answers `bad_request` with no card.
-14. **A downgrade keeps its notes.** Only with notes you can afford to
-    re-collect. On a board holding a key note and a plain note confirmed
-    with a bare hex or bare `cs1` certificate, flash the previous release:
-    both still list and collect. A note certified with an amount-bearing
-    `cs1` (`cs10n1...`) is NOT readable by the previous release and is
-    dropped from its index on its next write, so collect those first.
+A failed join used to hold the loop for the whole 15 s `BlockingWifi::connect`
+limit (it ignores the disconnect that reports a missing network), so a WiFi
+board with its networks out of range read USB for 3 s in every 18 and Sapwood's
+connect probe gave it up as dead. Joins are now polled (relay.rs `WifiJoin`), in
+the main loop and the locked phase.
+
+- [x] **32a.** WiFi mode, two configured networks out of range ahead of a
+  reachable fallback. Reset the board and query FIRMWARE_INFO every 300 ms for
+  70 s, recording the longest gap between replies. Bench, 2026-10-02: beta.20
+  showed 17.7 s twice (one per failed join); the fix shows no gap over 2 s
+  except 4.1 s at the relay TLS dial, which still blocks. The board still
+  rotates to the fallback and comes online.
+- [ ] **32b.** Same setup, Sapwood over USB during the failed joins: it
+  connects and lists the identity without "isn't answering over the cable".
+  Transport half bench-run 2026-10-02 (T-Display): Sapwood's own
+  SerialTransport and connect probe (sapwood a3dbdbf), driven from Node
+  through a Web Serial shim straight after a reset, answered the probe at
+  13.2 s (normal boot), then 38 reads over the join window with 0 failures,
+  slowest 3.3 s (the relay TLS dial), session open throughout, across
+  `wifi_connecting` / `network_not_found` to `online`. Still to do: the same
+  in the browser, watching the screens.
+- [ ] **32c.** Locked board (PIN or vault) in WiFi mode with its networks out of
+  range: PIN_UNLOCK / VAULT_UNLOCK over USB are answered within a couple of
+  seconds at any point in the join cycle.
+
+## 33. Approve from my phone, per app (added 2026-10-04, NOT YET BENCH-RUN)
+
+The owner's opt-in for the C4 park (section 11b) on their own apps, not only a
+dependant's: Sapwood's Apps panel gains an "Approve from my phone" switch per
+app (the slot's `escalate`), off by default, behind a written acknowledgement
+of what it gives away. Firmware: the relay's `update_client` now honours
+`escalate` on a legacy (non-strict) slot too, as the cable's CONNSLOT_UPDATE
+always has, so a slot flagged at the cable can be unflagged from the phone;
+the cable card names the change ("PHONE MAY OK" / "BUTTON ONLY") instead of
+"family" when `escalate` is the only family key sent.
+
+Side effect on upgrade: Signet's C3 policy push already sends `escalate`
+(true on dependant slots). On a legacy dependant slot that used to be dropped;
+on this firmware it takes effect, so such a slot starts parking where it used
+to draw a card. That is what Signet always asked for, but it is a change.
+Only MANUAL pairings are affected by the switch: an AUTO pairing's requests
+dispatch without a card, so nothing parks.
+
+- [ ] **33a.** WiFi board over USB, a legacy slot: Sapwood > Apps > Approve
+  from my phone > Turn on, tick the acknowledgement, Turn on. The board shows
+  `Update <label>? / PHONE MAY OK`; hold to approve. Sapwood shows ON, and
+  CONNSLOT_LIST reports `escalate: true`. Declining the card leaves it OFF with
+  "the press on the signer was declined or timed out".
+- [ ] **33b.** Same slot, Sapwood over the relay: Turn off. `list_clients`
+  reports `escalate: false` (before this firmware it stayed true and Sapwood
+  says so, pointing at USB). Turn on again over the relay: read back true.
+- [ ] **33c.** End to end for the owner: with 33a's slot on, the app sends a
+  request that needs the button. The board shows no card, the Signet app
+  (bunker-connected to this signer, holding its operator key, with its
+  natural-person route resolving to this board's `natural-person` persona,
+  which is what decrypts the notice) shows the ask in its inbox. From the
+  code (2026-10-04), an owner who has only ever used Sapwood needs exactly
+  what the Sapwood review lists: Signet paired by Heartwood connect (so it
+  reads `heartwood_list_identities` and listens on the `natural-person`
+  key, not the master), and the operator key imported under Settings,
+  Advanced. Confirm that is enough, and that the ask shows under "Waiting for
+  approval" as "<your name> (you)", with a phone notification reading "An app
+  wants to sign as <name>" (signet-app #17; older Signet says Family asks). Then approve-once there, the app gets its answer. A second same-kind
+  ask within 10 minutes signs without asking (the window the acknowledgement
+  names).
+- [ ] **33d.** USB-mode board over USB: the switch shows OFF with no Turn on
+  button, and the "needs the signer in WiFi mode" reason.
+- [ ] **33e.** `heartwood_pair_wallet` on a flagged slot is refused with "must
+  be approved at the device", never parked.
+- [ ] **33f.** Sapwood's own "Sapwood manager" pairing shows no Approve from
+  my phone control.
+- [ ] **33g.** Signet switch (signet-app #18): in Signet, Advanced settings,
+  under the operator key, the owner's own app is listed and the Signet
+  guardian pairing and any dependant pairing are not. Turn the app on from the
+  phone (tick, Turn on), then Sapwood shows the same pairing ON; turn it off
+  from the phone, Sapwood shows OFF and every other field of that pairing
+  (methods, kinds, auto) is unchanged. With the operator key forgotten, the
+  section says to import it and reads nothing from the board.
+
+## 34. Address proofs (LUD-25; added 2026-10-05, NOT YET BENCH-RUN)
+
+Since LUD-25 `50d740a` (moneyer 0.17) a mint changes or clears a name's `cx1`
+only with `"sig"`: a BIP-340 signature by the purpose-0 index-0 key of the
+branch CURRENTLY on file, over `sha256("LNURLcash:<register|unregister>:
+<domain>:<name>")`. A name registered before then is on file with this
+device's superseded `m/139'/1'` branch (section 15), so without this it could
+not be moved to the current one. `heartwood_note_address_proof`
+`{host, name, action, cx1}` signs it with whichever of the served identity's
+two branches at `host` has that `cx1`, and refuses any other; it answers
+`{ok, host, domain, name, action, cx1, branch, sig, pubkey}`, never a key.
+Advertised in `heartwood_capabilities` and as `note_address_proof_v1` in
+get_status.
+
+Drive it with scripts/nip46-client.mjs from a bound slot (`--method
+heartwood_note_address_proof --params '[{"host":"moneyer.dev","name":"<name>",
+"action":"register","cx1":"<cx1>"}]'`) until notecase grows the command, and
+take the `cx1` on file from the mint (moneyer: `zap_names.cx1`) or from
+`heartwood_note_address`.
+
+1. Move a name off the superseded branch: for a name whose `zap_names.cx1` is
+   the old branch, ask for a `register` proof naming THAT `cx1`. Expect an
+   ADDRESS PROOF card reading `<name>@moneyer.dev` over `register, old keys`
+   (watch the OLED, not only the CLI); hold. The reply's `branch` is
+   `superseded`. POST the registration with the new `cx1` (from
+   `heartwood_note_address`), the returned `sig` and the owner's NIP-98 (its
+   own HOLD TO SIGN card for kind 27235): moneyer answers `updated: true` and
+   `zap_names.cx1` is now the current branch. A zap then lands on a key of the
+   current branch (section 15 item 2).
+2. A `register` proof naming the current branch's `cx1` reads `register,
+   current keys` and answers `branch: current`; an `unregister` proof reads
+   `unregister, ...` and, POSTed with `cx1: null`, clears the name's branch.
+3. Refused with NO card, `bad_request` each time: a `cx1` of another npub, this
+   npub's `cx1` at another mint, a `cx1` that is not one (`cx1nope`), an
+   uppercase or two-letter name, `action` other than register/unregister, and
+   a host with a scheme or path. This is the one that matters: a hold is
+   never spent on a proof that could not be signed.
+4. Decline it, and let one time out: both answer as errors, no `sig`.
+5. Pinned always-ask: on a slot whose policy names
+   `heartwood_note_address_proof` with auto-approve, the card MUST still
+   appear.
+6. Never batched: two proofs sent back to back from one client raise two
+   cards, one after the other, each with its own address and action; one hold
+   never answers both.
+7. Escalate slot (section 24): the proof is refused outright, not parked. It
+   is device-press-only (`Nip46Method::device_press_only`), like a wallet
+   pairing: a proof is a standing authority over where a name pays, so no
+   guardian verdict may stand in for the owner at the board.
+7a. Two `heartwood_note_trust` asks for different senders, back to back from
+   one client, raise two TRUST SENDER cards, each with its own npub; one hold
+   never trusts both (they used to batch onto the first card).
+8. USB-bridged board through heartwoodd: the card is the extension card
+   (master heading, the method name, then the preview), not the titled
+   ADDRESS PROOF card. KNOWN: `show_master_sign_request` cuts the preview to
+   one small line's worth of characters, so the address shows and the action
+   is cut to `regi...` / `unre...`, as every note card's second line is cut on
+   that path today (trust loses "notes skip the hold"). Record what the panel
+   shows; a titled card on that path is a follow-up for all note cards. Over
+   the cable's 0x70 frame, `cash_address_proof` answers `bad_request` ("not
+   available on this surface"), as `cash_address` does.
+9. Unbound client: `unauthorised`, like every other note method.
+
+## 35. Carried over from the unified-taproot branch (added 2026-10-06, NOT YET BENCH-RUN)
+
+Four things the local LUD-25 branch had that main did not, merged onto main's
+derivation and address proofs. Run against moneyer 0.17 or later.
+
+1. **A plain note confirms with the mint's cs1.** Deposit a plain note into
+   the device with notecase (rotate onto a `new_secret`). The mint answers
+   with a `cs1` whose human-readable part carries the amount (`cs10n1...`),
+   which notecase hands to `confirm` as `sig`. Expect `{"ok":true}`, the note
+   CONFIRMED in the next list with that `sig` stored lowercase. Before this,
+   `confirm` took hex only, answered `bad_request`, and the note sat PENDING.
+2. **A note paid before purposes is still claimed.** Only if a wrap from a
+   mint that had not yet moved to `50d740a` (moneyer before 0.17) was never
+   opened, or a notecase scan finds a note on the old ladder: the claim, with
+   that note's `p`, succeeds and the note collects. Its key is on the
+   superseded `m/139'/1'` branch with no purpose in the tweak. A claim naming
+   a `p` of another identity or mint still answers `bad_request` and stores
+   nothing.
+3. **A mint host's port is a port.** `heartwood_note_address` or a claim for
+   `moneyer.dev:x`, `moneyer.dev:0443` or `moneyer.dev:65536` answers
+   `bad_request`; `moneyer.dev:8443` is accepted. A mint provisioned under the
+   old rule still loads after the flash (its registry entry decodes).
+4. **An unreadable note keeps its place.** Hard to stage on purpose: a note
+   this firmware cannot read (a future record format, a blob sealed under
+   another key) is reported as skipped at boot, and a later creation or
+   removal leaves its id in the index, so the firmware that can read it finds
+   it again. Host tests cover it (`note_store::an_unreadable_note_*`); on the
+   bench, record only that a normal boot reports nothing skipped.
 
 ## Notes
 

@@ -757,21 +757,6 @@ impl EnrolGate {
     }
 }
 
-impl crate::button_arm::CardGate for EnrolGate {
-    fn step(&mut self, elapsed_ms: u64, button_down: bool) -> usize {
-        EnrolGate::step(self, elapsed_ms, button_down)
-    }
-    fn restart_page(&mut self, elapsed_ms: u64) {
-        EnrolGate::restart_page(self, elapsed_ms)
-    }
-    fn page(&self) -> usize {
-        EnrolGate::page(self)
-    }
-    fn armed(&self) -> bool {
-        EnrolGate::armed(self)
-    }
-}
-
 /// What one page of the enrol card draws: a top line naming what is asked,
 /// with the requester's label in quotes, and below it this page's words, one
 /// a line, each with its place in the code (1 to 5). The label never shares a

@@ -27,19 +27,14 @@ pub fn decode_npub(value: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-// ---- LUD-25 ----
+// ---- LUD-25 Part 2 ----
 //
-// Four bech32m strings, each a fixed payload: `cp1` a note's 32-byte output
-// key `Q`, `ck1` a key-path spend of it, `Q || sig` (96 bytes, the note's
-// bearer credential), `cs1` a mint's 65-byte recoverable certificate, and
-// `cx1` a watch-only branch, x-only key then chain code. Byte-identical to
-// lnurl-wallet's `recoverableNotes.ts`; `cp1`, `cs1` and `cx1` are also
-// graded against lnurlcash-kit's `part2.json`.
-//
-// A `ck1` from before spends were bound to a mint is a bare 65-byte
-// recoverable signature. Mints following the reference still accept one, so
-// it still decodes here ([`Ck1::Legacy`]); nothing here makes a new one
-// except `cash_key::legacy_ck1_of`.
+// Four bech32m strings, each a fixed payload: `cp1` a note's x-only output
+// key Q, `ck1` its key-path spend (Q then a 64-byte BIP-340 signature, the
+// note's bearer credential), `cs1` a mint's 65-byte certificate, whose hrp
+// also carries the amount as a BOLT11 suffix (`cs210n1...` certifies
+// 21,000 msat), and `cx1` a watch-only branch, x-only key then chain code.
+// Graded against lnurlcash-conformance's `part2.json`.
 //
 // Strict on the way in, as BIP-350 and the reference mint are: a bech32 (not
 // bech32m) checksum, a mixed-case string or a payload of the wrong length is
@@ -51,7 +46,7 @@ fn encode_fixed(hrp: &str, bytes: &[u8]) -> String {
     bech32::encode::<Bech32m>(Hrp::parse(hrp).expect("valid hrp"), bytes).expect("valid encoding")
 }
 
-fn decode_payload(hrp: &str, value: &str) -> Option<Vec<u8>> {
+fn decode_fixed<const N: usize>(hrp: &str, value: &str) -> Option<[u8; N]> {
     let checked = bech32::primitives::decode::CheckedHrpstring::new::<Bech32m>(value.trim()).ok()?;
     if checked.hrp() != Hrp::parse(hrp).ok()? {
         return None;
@@ -59,11 +54,8 @@ fn decode_payload(hrp: &str, value: &str) -> Option<Vec<u8>> {
     // BIP-173's padding rule, which is not only segwit's: at most four
     // leftover bits, all zero. Without it two strings would name one key.
     checked.validate_segwit_padding().ok()?;
-    Some(checked.byte_iter().collect())
-}
-
-fn decode_fixed<const N: usize>(hrp: &str, value: &str) -> Option<[u8; N]> {
-    decode_payload(hrp, value)?.try_into().ok()
+    let bytes: Vec<u8> = checked.byte_iter().collect();
+    bytes.try_into().ok()
 }
 
 pub fn encode_cp1(pubkey_x_only: &[u8; 32]) -> String {
@@ -74,97 +66,38 @@ pub fn decode_cp1(value: &str) -> Option<[u8; 32]> {
     decode_fixed::<32>("cp", value)
 }
 
-/// A `ck1`, in either of the two shapes a mint following the reference
-/// accepts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Ck1 {
-    /// `Q || sig`: a BIP-340 signature by `Q` over the canonical spend's
-    /// key-path sighash for one mint (`taproot::key_path_sighash`).
-    KeyPath { output_key: [u8; 32], signature: [u8; 64] },
-    /// `r || s || recovery id` over the fixed Lightning message "LNURLcash".
-    /// Deprecated: bound to no mint, and carries no `Q` (the mint recovers
-    /// it). Still accepted, so a note spent with one stays spendable.
-    Legacy([u8; 65]),
+/// `ck1`: the note's output key then its key-path signature, 96 bytes.
+pub fn encode_ck1(spend: &[u8; 96]) -> String {
+    encode_fixed("ck", spend)
 }
 
-pub fn encode_ck1(output_key: &[u8; 32], signature: &[u8; 64]) -> String {
-    let mut payload = [0u8; 96];
-    payload[..32].copy_from_slice(output_key);
-    payload[32..].copy_from_slice(signature);
-    let encoded = encode_fixed("ck", &payload);
-    zeroize::Zeroize::zeroize(&mut payload);
-    encoded
+pub fn decode_ck1(value: &str) -> Option<[u8; 96]> {
+    decode_fixed::<96>("ck", value)
 }
 
-/// The deprecated 65-byte `ck1`. See [`Ck1::Legacy`].
-pub fn encode_legacy_ck1(signature: &[u8; 65]) -> String {
-    encode_fixed("ck", signature)
-}
-
-/// Either shape, told apart by length, as the reference mint tells them.
-/// Anything else under `ck` is not a `ck1`.
-pub fn decode_ck1(value: &str) -> Option<Ck1> {
-    let payload = decode_payload("ck", value)?;
-    match payload.len() {
-        96 => {
-            let mut output_key = [0u8; 32];
-            let mut signature = [0u8; 64];
-            output_key.copy_from_slice(&payload[..32]);
-            signature.copy_from_slice(&payload[32..]);
-            Some(Ck1::KeyPath { output_key, signature })
-        }
-        65 => payload.try_into().ok().map(Ck1::Legacy),
-        _ => None,
-    }
-}
-
-/// A mint's certificate, `r || s || recovery id`, in either shape a mint
-/// sends. LUD-25's `cs1` names the certified amount in its human-readable
-/// part the way a BOLT-11 invoice does (`cs10n1...` is 1000 msat); a mint
-/// from before that sent a bare `cs1...`. The locker keeps either and never
-/// interprets it: the wallet checks it against the mint's key.
+/// A mint certificate. Its hrp is `cs` and, from LUD-25 `50d740a`, the
+/// amount it certifies as a BOLT11 suffix (`cs10n`, `cs210n`); a bare `cs`
+/// is the older spelling. The suffix is checked for shape only: the wallet
+/// that verifies the certificate is the one that compares the amount.
 pub fn decode_cs1(value: &str) -> Option<[u8; 65]> {
-    decode_cs1_with_amount(value).map(|(signature, _)| signature)
-}
-
-/// [`decode_cs1`], with the amount in msat its human-readable part names:
-/// `None` for the older bare `cs`, which names none. lnurl-wallet's
-/// `decodeCs1WithAmount` and `decodeCs1` together, the one refusing exactly
-/// what the other two refuse.
-pub fn decode_cs1_with_amount(value: &str) -> Option<([u8; 65], Option<u64>)> {
     let checked = bech32::primitives::decode::CheckedHrpstring::new::<Bech32m>(value.trim()).ok()?;
+    // BIP-350 allows an all-uppercase string (CheckedHrpstring has already
+    // refused mixed case), and the hrp keeps the case it was written in.
     let hrp = checked.hrp().to_lowercase();
-    let amount_msat = cs1_amount_msat(hrp.strip_prefix("cs")?)?;
-    checked.validate_segwit_padding().ok()?;
-    let bytes: Vec<u8> = checked.byte_iter().collect();
-    Some((bytes.try_into().ok()?, amount_msat))
-}
-
-/// A BOLT-11 amount, `<digits>[m|u|n|p]` of a bitcoin, as msat: `Some(None)`
-/// when there is none at all, `None` when it is not an exact msat amount (a
-/// `p` count that is not a multiple of ten, an overflow, anything else).
-fn cs1_amount_msat(suffix: &str) -> Option<Option<u64>> {
-    if suffix.is_empty() {
-        return Some(None);
-    }
-    // msat per counted unit; `p` is a tenth of one, handled below.
-    let (digits, per_unit) = match suffix.as_bytes()[suffix.len() - 1] {
-        b'm' => (&suffix[..suffix.len() - 1], Some(100_000_000)),
-        b'u' => (&suffix[..suffix.len() - 1], Some(100_000)),
-        b'n' => (&suffix[..suffix.len() - 1], Some(100)),
-        b'p' => (&suffix[..suffix.len() - 1], None),
-        _ => (suffix, Some(100_000_000_000)),
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let suffix = hrp.strip_prefix("cs")?;
+    if !(suffix.is_empty() || bolt11_amount_suffix(suffix)) {
         return None;
     }
-    let count: u64 = digits.parse().ok()?;
-    let msat = match per_unit {
-        Some(per_unit) => count.checked_mul(per_unit)?,
-        None if count % 10 == 0 => count / 10,
-        None => return None,
-    };
-    Some(Some(msat))
+    checked.validate_segwit_padding().ok()?;
+    let bytes: Vec<u8> = checked.byte_iter().collect();
+    bytes.try_into().ok()
+}
+
+/// BOLT11's amount: digits without a leading zero, then at most one of the
+/// `m`, `u`, `n` or `p` multipliers.
+fn bolt11_amount_suffix(suffix: &str) -> bool {
+    let digits = suffix.strip_suffix(['m', 'u', 'n', 'p']).unwrap_or(suffix);
+    !digits.is_empty() && !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 pub fn encode_cx1(pubkey_x_only: &[u8; 32], chain_code: &[u8; 32]) -> String {
@@ -389,13 +322,19 @@ mod tests {
         assert_eq!(encode_cp1(&pk), text(note, "cp1"));
         assert_eq!(decode_cp1(text(note, "cp1")), Some(pk));
 
-        // part2.json's ck1s are the deprecated recoverable shape.
-        let sig = unhex::<65>(text(note, "ownershipSignature"));
-        assert_eq!(encode_legacy_ck1(&sig), text(note, "ck1"));
-        assert_eq!(decode_ck1(text(note, "ck1")), Some(Ck1::Legacy(sig)));
+        let mut spend = [0u8; 96];
+        spend[..32].copy_from_slice(&pk);
+        spend[32..].copy_from_slice(&unhex::<64>(text(note, "keyPathSignature")));
+        assert_eq!(encode_ck1(&spend), text(note, "ck1"));
+        assert_eq!(decode_ck1(text(note, "ck1")), Some(spend));
 
-        let cert = &vectors["certificates"][0];
-        assert_eq!(decode_cs1(text(cert, "cs1")), Some(unhex(text(cert, "signature"))));
+        // every certificate, each hrp carrying its own amount, and in upper
+        // case as BIP-350 allows
+        for cert in vectors["certificates"].as_array().expect("certificates") {
+            let signature = Some(unhex(text(cert, "signature")));
+            assert_eq!(decode_cs1(text(cert, "cs1")), signature);
+            assert_eq!(decode_cs1(&text(cert, "cs1").to_uppercase()), signature);
+        }
 
         let pubkey = unhex::<32>(text(branch, "branchPubkey"));
         let chain = unhex::<32>(text(branch, "chainCode"));
@@ -421,79 +360,18 @@ mod tests {
             assert_eq!(decode_cp1(bad), None, "{bad}");
         }
         assert_eq!(decode_ck1(cp1), None, "a cp1 is not a ck1");
+        // a certificate's amount suffix is BOLT11's shape or nothing
+        let cs1 = text(&vectors["certificates"][0], "cs1");
+        assert!(cs1.starts_with("cs10n1"), "{cs1}");
+        assert_eq!(decode_cs1(cp1), None, "a cp1 is not a cs1");
+        assert!(bolt11_amount_suffix("10n") && bolt11_amount_suffix("210n") && bolt11_amount_suffix("5"));
+        for bad in ["", "0n", "010n", "n", "10x", "10nn", "1.5n"] {
+            assert!(!bolt11_amount_suffix(bad), "{bad}");
+        }
         assert_eq!(
             decode_cx1("cx1k5hqh8wd88kazd70fdnef5xj54038jd2j6q8sw2dfy2ev5d45qhsnvwp55"),
             None,
             "32 bytes is not a cx1"
         );
-    }
-
-    #[test]
-    fn a_cs1_carries_its_amount_as_bolt11_does() {
-        // LUD-25 test vectors 4 and 5: the amount rides in the
-        // human-readable part, and the payload is the same 65 bytes.
-        let vectors: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
-        let mut certificates: Vec<(&str, &str, u64)> = vectors["vector4"]["certificates"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|c| (text(c, "cs1"), text(c, "signature"), c["amountMsat"].as_u64().unwrap()))
-            .collect();
-        let v5 = &vectors["vector5"];
-        certificates.push((text(v5, "cs1"), text(v5, "certificate"), v5["amountMsat"].as_u64().unwrap()));
-        for (cs1, signature, amount) in certificates {
-            let signature = unhex::<65>(signature);
-            assert_eq!(decode_cs1_with_amount(cs1), Some((signature, Some(amount))), "{cs1}");
-            assert_eq!(decode_cs1(cs1), Some(signature));
-            assert_eq!(decode_cs1(&cs1.to_uppercase()), Some(signature));
-        }
-        // The older bare `cs` still decodes, and names no amount.
-        let vectors = part2();
-        let legacy = text(&vectors["certificates"][0], "cs1");
-        assert!(matches!(decode_cs1_with_amount(legacy), Some((_, None))));
-
-        // Every BOLT-11 multiplier, and what is not an exact msat amount.
-        assert_eq!(cs1_amount_msat("1"), Some(Some(100_000_000_000)));
-        assert_eq!(cs1_amount_msat("2m"), Some(Some(200_000_000)));
-        assert_eq!(cs1_amount_msat("210u"), Some(Some(21_000_000)));
-        assert_eq!(cs1_amount_msat("10n"), Some(Some(1_000)));
-        assert_eq!(cs1_amount_msat("12340p"), Some(Some(1_234)));
-        assert_eq!(cs1_amount_msat("12345p"), None, "a fraction of a msat");
-        for bad in ["m", "n1", "10x", "+10n", "1 0n", "99999999999999999999n"] {
-            assert_eq!(cs1_amount_msat(bad), None, "{bad}");
-        }
-        // Another prefix is not a certificate at all.
-        let hrp = Hrp::parse("cx10n").unwrap();
-        let other = bech32::encode::<Bech32m>(hrp, &[1u8; 65]).unwrap();
-        assert_eq!(decode_cs1(&other), None);
-    }
-
-    #[test]
-    fn a_key_path_ck1_is_q_then_the_signature() {
-        // LUD-25 test vector 3's ck1, from the fixture.
-        let vectors: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
-        let v = &vectors["vector3"];
-        let q = unhex::<32>(text(v, "outputKey"));
-        let sig = unhex::<64>(text(v, "signature"));
-        let ck1 = encode_ck1(&q, &sig);
-        assert_eq!(ck1, text(v, "ck1"));
-        assert_eq!(ck1.len(), 163);
-        assert_eq!(decode_ck1(&ck1), Some(Ck1::KeyPath { output_key: q, signature: sig }));
-        assert_eq!(decode_ck1(&ck1.to_uppercase()), decode_ck1(&ck1));
-
-        // Only 96 and 65 bytes are a ck1: 64 (a bare signature, no Q) and
-        // 97 are not, and neither is a cp1's 32.
-        let hrp = Hrp::parse("ck").unwrap();
-        for len in [0usize, 32, 64, 66, 95, 97] {
-            let odd = bech32::encode::<Bech32m>(hrp, &vec![7u8; len]).unwrap();
-            assert_eq!(decode_ck1(&odd), None, "{len} bytes");
-        }
-        // A bech32 (not bech32m) checksum is not one either.
-        let mut payload = q.to_vec();
-        payload.extend_from_slice(&sig);
-        let bech32 = bech32::encode::<Bech32>(hrp, &payload).unwrap();
-        assert_eq!(decode_ck1(&bech32), None);
     }
 }

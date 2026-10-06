@@ -2,17 +2,15 @@
 
 # Heartwood ESP32
 
-> **Beta:** firmware [`0.18.0-beta.17`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.17)
-> adds the firmware side of phone unlock: seeds sealed under a data key, one
-> key stretch per unlock, and a one-tap unlock from an enrolled phone with no
-> stable tag on the wire (the phone app is not out yet). A refused restore now
-> says why, a full board makes room for pairings by dropping its avatar cache,
-> and the screen can be turned through 180 degrees. **On a board with a PIN or
-> vault key, turn it off before going back to beta.16 or older:** earlier
-> firmware cannot read the new seed format. Retained-state installation,
-> normal reboot/unlock, automatic signing and consent isolation passed on the
-> named Heltec V4 in earlier betas; this release's hardware checks are in its
-> notes.
+> **Beta:** firmware [`0.18.0-beta.19`](https://github.com/forgesworn/heartwood-esp32/releases/tag/v0.18.0-beta.19)
+> adds an unlock phone over WiFi: Sapwood asks, the board shows five words to
+> compare with the phone, and a hold adds it. Phone unlock needs the Cambium
+> app, 0.6.0 or later; Cambium 0.7.0 can also scan a code from Sapwood instead
+> of showing one. Seeds are sealed under a data key, and an enrolled phone
+> unlocks the board after a power cut with one tap and no stable tag on the
+> wire. **On a board with a PIN or vault key, turn it off before going back to
+> beta.16 or older:** earlier firmware cannot read the sealed seed format.
+> This release's hardware checks are in its notes.
 > Keep an independent recovery copy and use small values while the complete
 > destructive cross-board recovery matrix remains unfinished.
 
@@ -51,7 +49,7 @@ Holds the **master secrets** (up to 8 masters across bunker / tree-mnemonic / tr
 
 The ESP32 joins WiFi and connects to Nostr relays directly, running the full NIP-46 signing loop on-chip (`firmware/src/relay.rs`) — no Raspberry Pi. Keys still never leave the chip and NIP-44 is still decrypted on-device. Exact v2 client policies can permit unattended signing for a bounded method/event-kind set; other requests are denied or require the OLED/button according to their legacy policy. An unbound relay peer cannot enter the 30-second button loop: remote physical approval is available only after the client has been provisioned and slot-bound, so strangers cannot keep a shelf signer busy with prompts. Enabled only when the device is provisioned with an SSID + relay list (`mode="wifi"` in the NVS net config); the USB cable stays fully usable in parallel, so a bad SSID or relay is recoverable over the cable. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey, uses a durable one-time mutation challenge, and can manage clients and staged WiFi changes remotely. USB can read password-redacted network/operator state, patch network fields with keep/set/clear password semantics, and replace the operator only through a separate stale-revision-checked physical confirmation. Seed replacement, PIN changes, factory reset, and OTA remain local/USB operations.
 
-The device stores an ordered list of up to eight WiFi networks (v0.16.0): the join loop walks the list in priority order and rotates on failure — home network first, phone hotspot as fallback, say. Reordering or promoting a stored network never resends its password; per-SSID `keep` semantics resolve secrets on-device. Short button presses while idle page through an info carousel: identity, network (SSID + live connection stage), and device (firmware version, board, uptime).
+The device stores up to eight WiFi networks. At startup and after losing a connection, it scans and tries visible saved networks from strongest signal to weakest; saved order breaks ties and supplies hidden or unseen fallbacks. A failed network does not prevent the others being tried. While connected, background scans check for a better saved network: switching requires at least a 10 dB advantage in two consecutive scans, normally 30 seconds apart, with the first scan at least 60 seconds after joining. Switching waits while an approval, held result, update or network trial is active; failed targets are excluded from roaming for five minutes. Reordering a stored network never resends its password; per-SSID `keep` semantics resolve secrets on-device. Short button presses while idle page through identity, network (large SSID, live stage and signal strength), device and locker information.
 
 This is the convenience tier — it accepts a larger attack surface (a live TCP/IP stack on a key-holding device) in exchange for dropping the Pi. The USB-attached mode above remains the high-assurance default; leave the radios off where that matters.
 

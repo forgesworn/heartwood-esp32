@@ -118,6 +118,15 @@ pub struct NetworkRuntimeStatus {
     /// none. A client publishing to either reaches the signer.
     #[serde(default)]
     pub secondary_index: Option<u8>,
+    /// Which stored WiFi network the station actually joined: `0` for the
+    /// top-level `ssid` of the same response, `n` for `networks[n - 1]`,
+    /// and `None` while WiFi is down. With a fallback list the board can be
+    /// online through a network other than the primary, and nothing else
+    /// said which. A position for the same reason as [`Self::relay_index`]:
+    /// it names an entry the caller already holds. See
+    /// [`NetConfig::network_position`].
+    #[serde(default)]
+    pub wifi_index: Option<u8>,
 }
 
 #[cfg(feature = "nip46")]
@@ -132,6 +141,7 @@ impl NetworkRuntimeStatus {
             last_wifi_error_code: None,
             relay_index: None,
             secondary_index: None,
+            wifi_index: None,
         }
     }
 
@@ -145,6 +155,7 @@ impl NetworkRuntimeStatus {
             last_wifi_error_code: None,
             relay_index: None,
             secondary_index: None,
+            wifi_index: None,
         }
     }
 }
@@ -566,6 +577,30 @@ impl NetConfig {
             candidates.push((network.ssid.as_str(), network.password.as_str()));
         }
         candidates
+    }
+
+    /// Where `ssid` sits in this configuration as the GET_NET_CONFIG response
+    /// lays it out: `0` for the primary `ssid`, `n` for `networks[n - 1]`.
+    /// The primary wins over a duplicate in the list, as it does in
+    /// [`Self::network_candidates`]. `None` for an SSID not stored here.
+    pub fn network_position(&self, ssid: &str) -> Option<u8> {
+        if self.ssid == ssid {
+            return Some(0);
+        }
+        let n = self.networks.iter().position(|network| network.ssid == ssid)?;
+        u8::try_from(n + 1).ok()
+    }
+
+    /// The SSID at a [`Self::network_position`], or `None` if the
+    /// configuration no longer has one there.
+    pub fn network_at(&self, position: u8) -> Option<&str> {
+        match position {
+            0 => Some(self.ssid.as_str()),
+            n => self
+                .networks
+                .get(usize::from(n) - 1)
+                .map(|network| network.ssid.as_str()),
+        }
     }
 
     /// The stored password for a known SSID (primary or fallback). `None`
@@ -1044,6 +1079,7 @@ mod tests {
             last_wifi_error_code: None,
             relay_index: None,
             secondary_index: None,
+            wifi_index: None,
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(
@@ -1057,6 +1093,7 @@ mod tests {
                 "last_wifi_error_code": serde_json::Value::Null,
                 "relay_index": serde_json::Value::Null,
                 "secondary_index": serde_json::Value::Null,
+                "wifi_index": serde_json::Value::Null,
             })
         );
         let keys = value
@@ -1078,7 +1115,8 @@ mod tests {
                 "relay_index",
                 "secondary_index",
                 "stage",
-                "wifi_connected"
+                "wifi_connected",
+                "wifi_index"
             ]
         );
     }
@@ -1099,10 +1137,12 @@ mod tests {
             last_wifi_error_code: None,
             relay_index: Some(1),
             secondary_index: Some(3),
+            wifi_index: Some(2),
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["relay_index"], serde_json::json!(1));
         assert_eq!(value["secondary_index"], serde_json::json!(3));
+        assert_eq!(value["wifi_index"], serde_json::json!(2));
         assert!(value.as_object().unwrap().values().all(|v| !v
             .as_str()
             .is_some_and(|s| s.contains("://"))));
@@ -1117,6 +1157,7 @@ mod tests {
         let status: NetworkRuntimeStatus = serde_json::from_slice(older).unwrap();
         assert_eq!(status.relay_index, None);
         assert_eq!(status.secondary_index, None);
+        assert_eq!(status.wifi_index, None);
         assert_eq!(status.last_wifi_failure, None);
         assert_eq!(status.last_wifi_error_code, None);
         assert!(status.relay_connected);
@@ -1133,6 +1174,7 @@ mod tests {
             last_wifi_error_code: Some(202),
             relay_index: None,
             secondary_index: None,
+            wifi_index: None,
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["last_wifi_failure"], "authentication_failed");
@@ -1336,6 +1378,27 @@ mod tests {
         assert_eq!(cfg.known_password("hotspot"), Some("hotspot-pass"));
         assert_eq!(cfg.known_password("starlink"), Some(""));
         assert_eq!(cfg.known_password("unknown"), None);
+    }
+
+    #[test]
+    fn a_joined_network_is_named_by_its_place_in_the_response() {
+        let mut cfg = active_with_fallbacks();
+        cfg.networks.push(WifiNetwork {
+            ssid: "old-network".to_string(),
+            password: "stale-mirror".to_string(),
+        });
+        // Positions follow the response's layout, not the deduped candidate
+        // list: 0 is the top-level ssid, n is networks[n - 1].
+        assert_eq!(cfg.network_position("old-network"), Some(0));
+        assert_eq!(cfg.network_position("hotspot"), Some(1));
+        assert_eq!(cfg.network_position("starlink"), Some(2));
+        assert_eq!(cfg.network_position("unknown"), None);
+        assert_eq!(cfg.network_at(0), Some("old-network"));
+        assert_eq!(cfg.network_at(2), Some("starlink"));
+        assert_eq!(cfg.network_at(4), None);
+        for (ssid, _) in cfg.network_candidates() {
+            assert_eq!(cfg.network_at(cfg.network_position(ssid).unwrap()), Some(ssid));
+        }
     }
 
     #[test]

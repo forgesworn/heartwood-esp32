@@ -457,7 +457,16 @@ pub enum AskCard {
     /// (label and short npub), present for every slot-bound remote client.
     /// `heading` replaces `HOLD TO SIGN` when the card also approves the
     /// identity (`ALLOW AS <identity>?`).
-    Sign { requester: String, kind: u64, identity: Option<String>, heading: Option<String> },
+    ///
+    /// `login_code` is set only for a kind 22242 login challenge carrying one
+    /// valid `code` tag; the card then reads LOG IN and shows the code large.
+    Sign {
+        requester: String,
+        kind: u64,
+        identity: Option<String>,
+        heading: Option<String>,
+        login_code: Option<String>,
+    },
     /// A card drawn by `show_master_sign_request`: the full heading, the line
     /// under it (a method name, or the app for a gate card) and a preview.
     Extension {
@@ -568,36 +577,6 @@ fn hold_for_card(
                 None => Hold::Approved,
             }
         }
-    }
-}
-
-/// [`hold_for_card`]'s interactive hold for a card that runs over several
-/// pages (a registration proof's long username): the titled card, a page at
-/// a time, and no press counts until every page has been on screen.
-fn hold_for_paged_card(
-    display: &mut Display<'_>,
-    buttons: &crate::button::Buttons<'_>,
-    header: &str,
-    pages: &[String],
-    gate: heartwood_common::button_arm::PageGate,
-    request_id: &str,
-) -> Hold {
-    let result = crate::approval::run_paged_approval_loop(
-        display,
-        buttons,
-        APPROVAL_TIMEOUT_SECS,
-        gate,
-        |d, remaining, page, _armed| {
-            let body = pages.get(page).map(String::as_str).unwrap_or_default();
-            crate::oled::show_titled_approval(d, header, body, remaining, APPROVAL_TIMEOUT_SECS as u32);
-        },
-    );
-    match extension_approval_failure(request_id, result) {
-        Some(response) => {
-            crate::oled::show_result(display, "Not approved");
-            Hold::Refused(response)
-        }
-        None => Hold::Approved,
     }
 }
 
@@ -870,6 +849,18 @@ fn dispatch_inner(
         .as_ref()
         .and_then(|event| event.as_ref().ok())
         .map(|event| event.kind);
+    // A login challenge (kind 22242 with a `code` tag) shows its code on the
+    // card. One whose code cannot be shown is refused outright: never sign
+    // what the owner cannot compare, and never fall back to an ordinary card.
+    let login_class = sign_event
+        .as_ref()
+        .and_then(|event| event.as_ref().ok())
+        .map(|event| heartwood_common::policy::classify_login(event.kind, &event.tags));
+    if matches!(login_class, Some(heartwood_common::policy::LoginChallenge::Malformed)) {
+        log::warn!("sign_event: refused: malformed login challenge");
+        return build_error_json(&request.id, -3, "malformed login challenge");
+    }
+    let login_challenge = login_class.is_some_and(|class| class != heartwood_common::policy::LoginChallenge::No);
 
     // Determine the client pubkey for policy lookups.
     // In encrypted mode (passthrough), it comes from the frame header.
@@ -892,7 +883,7 @@ fn dispatch_inner(
         "direct app".to_string()
     };
     let tier = if has_client {
-        policy_engine.check(master_slot, &client_hex, &method, event_kind)
+        policy_engine.check_for_event(master_slot, &client_hex, &method, event_kind, login_challenge)
     } else {
         heartwood_common::policy::ApprovalTier::ButtonRequired
     };
@@ -1202,7 +1193,7 @@ fn dispatch_inner(
             Some(("PAIR NEW WALLET", format!("for '{label}'\nit will see your notes")))
         } else if is_note_method(&method) {
             let cmd = heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params).ok();
-            if let Some(refusal) = cmd.as_ref().and_then(crate::notes::relay_precheck) {
+            if let Some(refusal) = cmd.as_ref().and_then(|cmd| crate::notes::relay_precheck(cmd, master_secret)) {
                 if !matches!(
                     approval,
                     ApprovalDecision::ButtonApproved | ApprovalDecision::VerdictApproved
@@ -1210,7 +1201,7 @@ fn dispatch_inner(
                     return build_error_json(&request.id, -1, refusal);
                 }
             }
-            cmd.and_then(|cmd| crate::notes::relay_card(&cmd))
+            cmd.and_then(|cmd| crate::notes::relay_card(&cmd, Some(master_secret)))
         } else {
             None
         };
@@ -1219,33 +1210,16 @@ fn dispatch_inner(
             None => extension_approval_preview(&requester_label, &request.params),
         };
         let heading = crate::oled::master_sign_heading(master_label);
-        // A registration proof names a username the signature commits to in
-        // full, so the cable draws the whole name, a page at a time, rather
-        // than the one-line preview the method card truncates.
-        let proof_pages = matches!(method, nip46::Nip46Method::HeartwoodNoteAddressProof)
-            .then(|| heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params).ok())
-            .flatten()
-            .and_then(|cmd| {
-                let (action, name, host) = heartwood_common::note_cmd::address_proof_request(&cmd)?;
-                let (header, pages) = heartwood_common::note_cmd::address_proof_pages(action, name, host);
-                Some((header, pages, heartwood_common::note_cmd::address_proof_gate(name)))
-            });
-        let hold = match (proof_pages, approval) {
-            (Some((header, pages, gate)), ApprovalDecision::Interactive) => {
-                hold_for_paged_card(display, buttons, header, &pages, gate, &request.id)
-            }
-            _ => hold_for_card(
-                approval,
-                method.verdict_may_answer_card(),
-                display,
-                buttons,
-                &heading,
-                &request.method,
-                &preview,
-                &request.id,
-            ),
-        };
-        match hold {
+        match hold_for_card(
+            approval,
+            method.verdict_may_answer_card(),
+            display,
+            buttons,
+            &heading,
+            &request.method,
+            &preview,
+            &request.id,
+        ) {
             Hold::Refused(response) => return response,
             Hold::Deferred => {
                 *deferred = Some(Box::new(DeferredAsk {
@@ -1311,7 +1285,15 @@ fn dispatch_inner(
                 heartwood_common::policy::ApprovalTier::ButtonRequired => {
                     let heading = allow_sign.then(|| {
                         heartwood_common::encoding::card_heading(
-                            if matches!(gate_card, Some(CardKind::AllowAs { record: false })) { "ONCE AS" } else { "REMEMBER AS" },
+                            // A login keeps saying so: an identity grant must
+                            // never turn the card into an unexplained number.
+                            if login_challenge {
+                                "LOG IN AS"
+                            } else if matches!(gate_card, Some(CardKind::AllowAs { record: false })) {
+                                "ONCE AS"
+                            } else {
+                                "REMEMBER AS"
+                            },
                             identity_label.as_deref().unwrap_or_default(),
                         )
                     });
@@ -1322,6 +1304,7 @@ fn dispatch_inner(
                                 kind: event.kind,
                                 identity: identity_line.clone(),
                                 heading,
+                                login_code: login_code_of(&event),
                             },
                             request,
                             event: Some(event),
@@ -1386,7 +1369,7 @@ fn dispatch_inner(
                             policy_engine.upgrade_to_signing(master_slot, idx);
                         }
                         if let (Some(snapshot), Some(pubkey)) = (identity_snapshot, identity.as_ref()) {
-                            let changed = matches!(gate_card, Some(CardKind::AllowAs { record: true }))
+                            let changed = heartwood_common::policy::press_records_identity(gate_card, login_challenge)
                                 && policy_engine.record_identity(master_slot, Ok(&client_hex), pubkey);
                             if let Err(response) = persist_grant(
                                 policy_engine,
@@ -2195,7 +2178,8 @@ fn dispatch_inner(
                     };
                     // The served identity is also the root of the address
                     // branches a mint pays this npub's lightning address to
-                    // (cash_address, claim_key_note).
+                    // (cash_address, claim_key_note), and of the keys that
+                    // sign its address proofs (cash_address_proof).
                     // The client hex is 64 chars here (has_client checked
                     // it), so the decode cannot fail; an all-zero fallback
                     // would only ever fail to match a grant, which costs a
@@ -2458,6 +2442,15 @@ fn handle_auto_sign(
 // sign_event (interactive, button-required)
 // ---------------------------------------------------------------------------
 
+/// The code a login card shows for this event: set only for a login challenge
+/// with one valid `code` tag (a malformed one never reaches a card).
+fn login_code_of(event: &UnsignedEvent) -> Option<String> {
+    match heartwood_common::policy::classify_login(event.kind, &event.tags) {
+        heartwood_common::policy::LoginChallenge::Valid(code) => Some(code.to_string()),
+        _ => None,
+    }
+}
+
 fn handle_sign_event(
     master_secret: &[u8; 32],
     master_mode: MasterMode,
@@ -2471,6 +2464,7 @@ fn handle_sign_event(
     event: UnsignedEvent,
 ) -> String {
     let (kind, _content_preview) = nip46::event_display_summary(&event, 50);
+    let login_code = login_code_of(&event);
 
     // Show the signing request on the OLED and wait for button approval.
     // The countdown bar updates every second; the approval module handles
@@ -2480,7 +2474,7 @@ fn handle_sign_event(
         buttons,
         APPROVAL_TIMEOUT_SECS,
         |d, remaining| {
-            crate::oled::show_sign_request_as(d, requester_label, kind, identity_line, heading, remaining);
+            crate::oled::show_sign_request_as(d, requester_label, kind, identity_line, heading, login_code.as_deref(), remaining);
         },
     );
 

@@ -28,6 +28,34 @@ Encrypted backup/restore of connection slots and policies via Sapwood -- MANUAL 
 
 Encrypted at rest on-device (opt-in): either a human PIN (P5, wipes after 5 failures) or a host-held 32-byte vault key (VAULT_SET 0x62 / VAULT_UNLOCK 0x63) that heartwoodd or Sapwood delivers — unattended reboot with ciphertext on flash. WiFi-standalone locked devices announce a per-boot ephemeral unlock pubkey (kind 24135) and receive the vault key live from the operator (kind 24136). Spec: docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md. FIRMWARE_INFO and get_status report the at-rest state directly (`at_rest`: `none`/`pin`/`vault`/`encrypted`, plus `unlock_phone_count`), so a manager stops inferring the mode from side effects it happened to witness — resolved in one place, `heartwood_common::at_rest_status::resolve` (pure, host-tested, including the size-damage cases), behind a single firmware read, `firmware/src/pin.rs::at_rest_status`, that all three call sites (FIRMWARE_INFO, get_status's full and low-heap-fallback replies) share instead of each composing it themselves. FIRMWARE_INFO answers this while locked (any USB host, any mode), get_status only once unlocked and only to the device operator, never a per-identity delegate (including its low-heap `minimal_status_json` fallback) — both delegate reply shapes are keyed off `at_rest_status::DELEGATE_STATUS_KEYS`/`DELEGATE_STATUS_FALLBACK_KEYS`, host-tested so the fallback can never carry a data key the normal reply does not. Since the wrapped data key does not itself record which secret wrapped it, distinguishing PIN from vault needed a marker (`at_rest_kind` in `common/src/data_key.rs`, over `BlobStore` so the existing power-cut model tests cover it): kind byte plus the first 8 bytes of SHA-256(dk_sec), so a marker that no longer matches the wrapper on flash — a cut between the wrap write and the marker write, a failed write, a secret changed on firmware without this marker, any re-wrap it missed — reports `encrypted` (kind unknown) rather than a guess. `encrypted`, not a `pin` fallback: only a PIN_UNLOCK guess counts towards the 5-failure wipe, so mislabelling a vault board as PIN-protected would invite typed guesses into a counter it was never meant to arm. A board's own next successful unlock (PIN_UNLOCK, VAULT_UNLOCK, or the relay's 24136 operator vault delivery — all three run through `pin::try_unlock`) self-repairs a missing or wrong marker from the secret's length (4-8 digits or 32 bytes settles it) via `data_key::repair_secret_kind`, which takes the `Unlocked` proof a real unlock produces so it cannot run ahead of one; a phone-slot unlock never sees the secret and never touches the marker. `try_unlock` clears the PIN wipe counter immediately once the secret is proven correct, before migration or the marker repair — the two optional writes that follow — so a power cut during either can never catch the counter mid-way stale. `unlock_phone_count` is `null`, not `0`, over a damaged phone blob (never mistake damage for no phones), except once `at_rest` is `none`, which always reports `0` — removing the last identity leaves `dk_ph` behind (`provision.rs`, `masters.rs`), and a mode of "none" makes any leftover blob moot. The count itself walks and validates the blob (`PhoneSet::count`) rather than allocating a full `PhoneSet::decode`, sized from the NVS blob's actual length rather than a fixed 2,166-byte buffer, since this runs in the same low-heap path `minimal_status_json` exists for. Phone unlock (common/src/phone_unlock.rs) adds per-phone 24135s (one-time author, `["h", hint]` only, sealed content with `t` = `locked`) answered by a throwaway-key 24136; a relay-list change is told to the phones on their old relays as the same message with `t` = `relays` (common/src/phone_relays.rs: NVS `ph_relays` records what they were told and how many update rounds have gone out; locked boots repeat the announcement there, one old relay per announce interval straight after the live announcement, with per-relay backoff; unlocked boots post six randomly delayed update rounds over about a day, each on a publish-only connection that never carries the signer's subscription and never makes a third TLS session, resuming after a restart, then record the live list).
 
+FIRMWARE_INFO and get_status also report `phone_relays` (`current`/`pending`/
+`unknown`, 2026-09-25, plan G2's Sapwood follow-up, third bullet), alongside
+`at_rest` and `unlock_phone_count` above and built the same way: a pure
+function (`heartwood_common::phone_relays::relay_status`, host-tested for
+every state) behind a single firmware read (`pin::phone_relay_status`) that
+never writes, shared by all three call sites, and excluded from both delegate
+reply shapes via the same `DELEGATE_STATUS_KEYS`/`DELEGATE_STATUS_FALLBACK_KEYS`
+mechanism. `current`: no phones, no configured relay, or the recorded relay
+list matches what is in use. This includes once an old relay has accepted an
+update for a change still mid-update (an old relay has accepted an update,
+not proof every phone heard it; later rounds still run regardless).
+`pending`: a live relay the phones were never told about, and nothing has
+accepted a delivery for this change yet. This can persist indefinitely if
+every old relay is dead or refuses the kind-24135 delivery, and the only way
+out is revoking and re-enrolling the phones. `unknown`: the `ph_relays`
+record exists, or the enrolled-phone count could not be read, but this
+firmware cannot make sense of it; never confused with no record at all or
+genuinely zero phones, both of which are `current` (nothing yet known to be
+wrong). Compares against the relay list the relay loop is actually running
+(`ctx.relays` on the relay.rs call sites; a shared read of the committed
+network trial or active config on FIRMWARE_INFO's USB-only call sites, which
+have no running list of their own), not a fresh net-config parse per poll,
+and only trusts a recorded acceptance that belongs to the same relay change
+`current` names (a stale acceptance from an earlier, superseded change is
+never carried over). No rounds count is exposed: Sapwood's one decision
+("does anyone need a nudge") does not need it, and it would need its own
+damage handling for a number nobody asked for.
+
 A phone can be added over the relay (2026-09-25, checklist section 29, not bench-run; Sapwood and Cambium support are PENDING follow-ups): `enrol_unlock_phone {enrol_pubkey, label?}` on the kind-24134 management channel, the cable's frame-0x64 enrolment moved onto the #64 deferred card queue (relay.rs `queue_phone_enrol` / `resolve_phone_enrol_card`) so the loop keeps serving while the owner walks to the board. Device operator only (a per-identity delegate is refused before anything else is looked at; a NIP-46 client has no route to management), behind the one-time mutation challenge, which is spent before the card goes up, so a request raises at most one card, before or after a restart. Then, in the host-tested order of `phone_unlock::admit_relay_enrol`: one enrolment waiting at a time, the request, the board, room in the queue, and last the claim on the enrolment key (used once per boot). The card (cable and relay alike, `oled::show_enrol_approval`, layout from `phone_unlock::enrol_card`) leads with the request code: FIVE words of spoken-token's en-v1 list (`common/src/spoken_words.txt`, compiled in and read by the Node bench library), `deriveToken(P, 'heartwood-unlock:enrol-request', 0, {format:'words', count:5})`, 55 bits, a page at a time (`phone_unlock::EnrolGate`, stepped by both loops: words 1-2, 3-4, 5, each page on screen for its full `ENROL_PAGE_SECS` = 4 s before the next, however long a stalled pass took, and round again, no press needed, with a "1-2 of 5" marker beside the bar), one word a line with its place number, as large as the span allows (`Layout::enrol_geometry`: FONT_6X10 at 2x on the Heltec, after the 2026-09-25 bench found the old two-a-line 6 px words unreadable in time), under a small top line `ADD "<label>"?`, with the hint (`phone_unlock::enrol_hint`: "compare all 5 words" until the gate, then "on phone? hold PRG") and a countdown, everything inside the span clear of the button tags either way up (`Layout::text_span`; ui-preview mirrors the card and PHONE ADDED and checks no piece meets a tag or another piece on every panel, orientation and page). The enrol card's window is `phone_unlock::ENROL_CARD_SECS` = 45 s, cable and relay (relay.rs `card_window`); every other card keeps 30 s. Neither card can be approved until every page has had its full dwell on screen and `ENROL_GATE_MS` = 12 s have passed (`EnrolGate`, host-tested including a stalled loop): a hold that STARTS before then never counts, however long it runs, and a short press does nothing, so it cannot decline and spend the key (B still cancels); relay.rs `tick_button_card` (the card's `enrol_gate`, drawn the moment its page changes), the cable via `approval::run_enrol_approval_loop`, which also needs the button up 30 ms before arming, as every cable card now does (`run_approval_loop` too; the rule is `heartwood_common::button_arm::ButtonArm`, host-tested). A card whose pages could not all be shown expires; the window is not extended. button.rs publishes a release before clearing the hold (Release/Acquire), so no reader sees "up, nothing released" mid-hold. The owner compares the BOARD with the PHONE, which made P; a browser's copy proves nothing, since whoever holds the operator key or the browser could swap in a key of their own, and a compromised browser can grind a matching key for as long as the owner waits (55 bits is weeks on one GPU, hours on a large rack; 44 was half an hour). Labels are printable ASCII only, quoted, and never share a line with a word. At the press the configured sessions heard from within PING_INTERVAL plus 10 s are noted once (`phone_unlock::heard_recently`), and that one snapshot both gates the enrolment and counts the delivery; the board is read again (phone set decoded once) and decided by `relay_enrol_completion` (still the device operator, a live relay, unlocked, a data key, relays, fewer than 16 phones); the hand-off is sealed in RAM and the record written only if the answer fits the heap (`response_transportable`), so nothing is written before the press and a card declined, expired (45 s on screen, 90 s queue TTL) or lost to a restart leaves no record. The answer is the cable's (`id`, `ephemeral_pubkey`, `sealed`), offered to every configured session; `phone_unlock::enrol_result` picks the screen: PHONE ADDED with the check code and "else revoke N" (if the phone never shows that code, revoke that record; the check code confirms delivery and catches mix-ups, but the hand-off comes from an unauthenticated one-off key, so it cannot prove the board sent it: the five words are the only defence against a swap, and an authenticated hand-off, the board signing (E, P) with its paired identity, is a parked follow-up), or "Not sent / revoke id N" when no live session took it (the answer is not held in the #82 outbox), or "No phone added". PHONE ADDED shows the check code at the card words' size. A cable enrolment waits for the approving press to be released before returning, so that press never dismisses PHONE ADDED. Every pressed result, and a cable enrolment's in either mode, holds the display until a fresh press (`phone_unlock::ResultHold`, `RESULT_HOLD_MAX_MS` = 5 min at most, the panel kept lit); nothing waiting for the screen waits longer than the old 20 s hold (`RESULT_HOLD_MS`, relay.rs `screen_busy`): a queued relay card takes over once the result has stood 20 s and ends it; a cable command that puts up its own card is refused "approval on screen" for those 20 s (`cable_card_refused`) and after them runs over the result, which `poll_usb` draws again 2 s after any frame (`interrupt_held_result`; after a frame that held the loop 2 s or more, `ResultHold::await_release` so that card's approving hold does not dismiss it); an auto-approved confirmation, a network status or a note banner likewise show over it and hand back, and the relay update round waits only on `screen_busy`. A cable frame that held the loop 2 s or more also moves every session's `silence_from` on (the SILENCE_LIMIT credit; a cable enrol card can hold the loop about 55 s), leaving `last_rx` honest for the liveness snapshot and `last_ping` alone so a ping goes out on the next idle tick. A cable enrolment replaces or releases a held result only once its own card was shown (`phone_unlock_cmd::Screen`); after one that added nothing (a refusal after the press now draws "No phone added"), the USB-bridged loop always shows its ready screen 3 s later, so "Expired" is read, and the WiFi loop does so only when a result was being held (otherwise it leaves the outcome up, as before). In WiFi mode every cable frame that may raise a card (`phone_unlock::cable_frame_claim` over `types::cable_frame_card`, pinned by a ui-preview test that scans relay.rs for any arm reaching the button through `ctx.buttons`, bare `ctx` or `crate::button::`) is refused "approval on screen" while a relay card or a result younger than 20 s is up, so a cable hold can never be read as a relay card's approval; the owner's recovery frames (`PATCH_NET_CONFIG`, `OTA_BEGIN`, `FACTORY_RESET`, and `SET_NET_CONFIG` only while its `op_mgmt` names the stored operator, `net_config::set_net_config_keeps_operator`; one that changes or drops the operator is an ordinary card, refused under a relay card) instead take the screen over, since anyone can keep a relay card up by publishing to the board. The takeover (`phone_unlock::take_screen_for_recovery` over relay.rs `RelayScreen`, host-tested: every relay card answered Expired, the press edge cleared, a held result left standing for `poll_usb` to draw again after the recovery card) runs inside the recovery arm straight before its card, after the handler's own checks (`net_config_store::check_set_net_config` / `check_patch_net_config`, `ota::check_ota_begin`: parse, signature, revision, slot), so a refused or garbage frame touches no relay card; a ui-preview scan pins that order. FACTORY_RESET checks nothing and takes the screen at once. The SET_NET_CONFIG card names an operator change in every mode (`net_config::set_net_config_title`: "Replace operator? / <8 hex>... +network", "New operator?" only where there was none, or "Remove operator?"), and `validate_local_net_config` refuses a non-empty `op_mgmt` that is not 64 hex digits (a stored one that does not decode still reads as no operator); bench driver `scripts/net-config.mjs --set-config` (pure half `scripts/lib/net-config.mjs`, node-tested). Any USB host can still take the screen with a signed OTA_BEGIN, a FACTORY_RESET, or a PATCH/SET_NET_CONFIG built from GET_NET_CONFIG's answer, within the "USB is physical" model (SECURITY-MODEL); every cable card (approval.rs) now arms only once the button has been seen up for 30 ms; the WiFi-down waits tick relay cards with no session so they expire on time, and `screen_busy` ignores a front card whose window has passed; a cable frame that held the loop 2 s or more also disarms the front relay card and clears the latched press, and the enrol card re-arms only with the button up. The enrol gate's dwell also ignores time under another screen: every panel flush bumps `oled::draw_generation`, and a card drawn over redraws itself at once and `EnrolGate::restart_page` restarts the page's dwell (cable and relay), so continuous overdraw only expires the card; the `show_npub` redraws and the WiFi-down waits' carousel are held off while a card is up. `session_step` no longer stamps `last_rx` for a frame drained from its buffer (it credits `silence_from` instead), so `last_rx` is always the last actual read. The hold is stepped at the top of every relay loop pass and from `service_button`'s WiFi-down waits, so an outage cannot keep it standing or deaf to a press. In the USB-bridged loop (main.rs `held_result`) nothing is refused: frames are served as ever and PHONE ADDED is drawn again after each, instead of the "SIGNER READY" screen that used to replace it at once; after any frame the button is ignored until it has been seen up (`button_settle_until`, at most 10 s), so another card's approving hold does not dismiss it. ROLLOUT: ship this firmware only together with the Cambium release that shows the five words and keeps labels to printable ASCII, and the Sapwood release that tells the owner to compare with the phone; older Cambium labels outside printable ASCII are refused. Capability `phone_enrol_relay_v1`; bench client `scripts/phone-unlock.mjs enrol|enrol-for --over-relay`.
 
 Field-test feedback landed 2026-08-14 (see docs/plans/2026-08-14-field-test-feedback-triage.md): approval loop hardened (B button = explicit cancel on two-button boards with on-screen hints, debounce, terminal "request expired" card so a stale countdown can never wedge the screen, 45 s browser-driven windows), wake-on-press (a serial bridge pinning GPIO 0 after a web flash no longer makes the device look dead), paged idle carousel (identity / network / device pages on short press), multiple prioritised WiFi networks (`NetConfig.networks` fallback list, per-SSID password `keep`, join-loop rotation incl. the locked vault-unlock phase, which previously never associated the station), and a `demo-game` bin (`scripts/build-firmware.sh demo`) — a branded board-check jump-and-duck game for pre-flashing handed-out T-Displays, deliberately not the signer. Sapwood gained the network-list editor, an app-only quick USB update for factory-layout boards, an update banner, and post-flash DTR/RTS release.
@@ -164,92 +192,93 @@ the primary, the relay loop keeps one more configured relay live when the
 second session slot is free and the heap can spare it (SECONDARY_MIN_* in
 relay.rs), is promoted when the primary drops, gives its slot to a pinned
 relay or a pairing, and is shed when the largest block falls below 32 KB.
-net-config reports runtime.secondary_index.
+net-config reports runtime.secondary_index. It also reports
+runtime.wifi_index (0 = the primary `ssid`, n = `networks[n-1]`, null while
+WiFi is down), the network the station actually joined, as does the relay's
+operator-only `get_network_config` reply (top-level `wifi_index`, only that
+runtime field); the WiFi info page and Sapwood's Connectivity panel name that
+network rather than the primary (checklist section 31).
 
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =
-HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then lnurlcash-kit's
-m/139'/1'/d1..d4 and LUD-25's tweak, graded against lnurlcash-kit's
-part2.json and tests/fixtures/lud25-nostr-seed.json on both curve backends). The
-mint holds only the cx1 (heartwood_note_address, no hold); a key-note wrap
-carries p/i/sig and no secret, and is opened only if the key is ours
-(note_wrap::open_note_rumor). A key note stores its key as the secret plus
-KeyNote {index, pubkey, ladder} (a v3 or v4 blob, written only for key notes), exports a
-ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim)
-derives the key itself.
+HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then LUD-25's
+m/139'/d1..d4 and its purposed tweak, graded against lnurlcash-conformance
+0.15.0's part2.json and nostr-seed.json in tests/fixtures on both curve
+backends). The mint holds only the cx1 (heartwood_note_address, no hold); a
+key-note wrap carries p/i/c and no secret, and is opened only if the key is
+ours (note_wrap::open_note_rumor). A key note stores its key as the secret plus
+KeyNote {index, pubkey} (a v3 blob, written only for key notes), exports a
+ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim,
+optional `purpose`, default 2) derives the key itself.
 
-LUD-25 unified taproot (lnurl/luds 6e865b1; common/src/taproot.rs, graded
-against the spec's vectors 1 to 5 in tests/fixtures/lud25-taproot.json on both
-curve backends): every note is a BIP-341 output key Q. A key note's Q is its
-key's own x-only pubkey (no BIP-86 tweak) and its ck1 is now Q || a zero
-aux_rand BIP-340 signature over the canonical spend's key-path sighash, whose
-prevout binds the mint's bare hostname (cash_key::spend_domain: no scheme,
-port or path; the branch derivation keeps the port). The old 65-byte
-recoverable ck1 is cash_key::legacy_ck1_of, still decoded, no longer made. A
-bearer note's Q is one OP_SHA256 <h> OP_EQUAL leaf under the NUMS point. The
-vault wire is unchanged (new_secret still answers h, which lnurl-wallet sends
-as the short form and turns into Q itself); `confirm` and wraps now keep a cs1
-whose HRP carries the amount (`cs10n1...`), which a unified mint sends for
-every note. Live moneyer (0.16.x) does not yet accept the domain-bound ck1.
-heartwood_note_address_proof (pinned and device-press-only, so an escalate
-slot refuses it rather than parking it for a guardian: a proof signs neither
-the cx1 nor a nonce, so it is a replayable key to the name; REGISTER NAME /
-UNREGISTER NAME card, the whole username a page at a time with a k/n marker
-when it runs past 25 characters, each page over `at <domain>[:port]`, and
-no press counts until every page has been on screen, button_arm::PageGate,
-3 s a page, on the relay, USB-bridged and cable holds alike)
-signs LUD-25's registration proof with the address branch's purpose-0
-index-0 key over the fixed sha256("LNURLcash:<action>:<domain>:<username>")
-and nothing else. The address branch is still m/139'/1'/d1..d4, one hardened
-level below the spec's m/139'/d1..d4; moving it would move every key note
-already paid.
+Moved to LUD-25 `50d740a` / `6e865b1` on 2026-10-04 (moneyer 0.17 had
+stranded a zap: the board ignored the wrap). Three changes: the tweak hashes
+`ser32(purpose)` before the index (0 wallet, 1 change, 2 Lightning Address,
+which is what a mint mints to and so what a wrap is on); the branch is
+`m/139'/d1..d4` with the hashing key at `m/139'/0`, not lnurl-wallet's
+`m/139'/1'/...`; and a ck1 is `Q || BIP-340` (aux_rand zero) over the BIP-341
+key-path sighash of the canonical spend bound to the mint's domain
+(cash_key::key_path_sighash), not a recoverable ECDSA signature. A mint
+certificate's hrp now carries its amount (`cs210n1...`) and travels as `c`
+(`sig` still read). A claim that names its key falls back to the superseded
+`m/139'/1'` branch, because a mint keeps paying the cx1 a name was registered
+with; nothing new is handed out there, so re-register a name
+(`heartwood address keys`) to move it to the current branch. The ECDSA
+`recovery`/`ecdsa` backend features are gone.
 
-LUD-25 derivation purposes (lnurl/luds lnurlcash 50d740a; vectors 1 to 3
-re-copied into tests/fixtures/lud25-taproot.json, every purpose-table value
-graded): the note tweak is now tagged_hash("LNURLcash/derive", P ||
-chaincode || ser32(purpose) || ser32(i)) mod n, purpose 0 the wallet's own
-notes, 1 split change, 2 what a mint credits to a lightning address
-(auto-mint and internal transfer). The address proof moved to purpose 0
-index 0, which is the key a unified mint checks it against. The tweak
-without ser32(purpose), which is what this firmware derived before, is
-cash_key::KeyLadder::PrePurpose (graded against 6e865b1's old values and
-the kit's part2/nostr-seed fixtures), and notes a mint already paid there
-stay ours: claim_note_key, given the key the note is paid to (every wrap,
-and notecase's scan, which walks purpose 2 and the old ladder), tries
-purpose 2 then the pre-purpose ladder and keeps whichever matches, refusing
-a key on neither with the same error as before. heartwood_note_claim now
-REQUIRES `p` and refuses a claim without it ("p is required") before
-deriving anything; notecase, the only client, always sends it. A stored key
-note does not record its ladder: every key note is the same v3 blob it has
-always been (the key is the stored secret, so nothing needs the ladder to
-spend, and trying purpose 2 then the old ladder against its pubkey recovers
-it). A mint host's `:` must bring a decimal port, 1 to 65535 with no leading
-zero (cash_store::valid_host; a registry entry stored under the old
-character rule still decodes). Nothing bench-run: checklist section 31.
+Address proofs (2026-10-05, checklist section 34, NOT YET BENCH-RUN): since
+`50d740a` a mint changes or clears a name's cx1 only with `"sig"`, a BIP-340
+signature by the purpose-0 index-0 key of the branch CURRENTLY on file over
+sha256("LNURLcash:<register|unregister>:<domain>:<name>"), so a name on the
+superseded branch can be moved only with that branch's agreement.
+`heartwood_note_address_proof {host, name, action, cx1}` (wire command
+`cash_address_proof`, capability `note_address_proof_v1`) signs it with
+whichever of the served identity's two branches at `host` has that exact cx1
+(`cash_key::address_proof_for`, compared as decoded bytes; any other cx1 is
+refused) over `spend_domain(host)`, aux_rand zero, which reproduces all four
+of part2.json's `addressProofs`. It answers the 64-byte `sig`, the index-0
+`pubkey` and `branch` (`current`/`superseded`), never a key. Everything that
+could refuse (mint, name rule `^[a-z0-9][a-z0-9._-]{2,31}$`, action, a cx1
+that is ours) is checked by the one pure `note_cmd::address_proof_ask` before
+the card, on the relay precheck and in the dispatcher alike; the card
+(`note_cmd::address_proof_card`) is ADDRESS PROOF over `<name>@<domain>` and
+`<action>, current keys` or `old keys`. Pinned ButtonRequired like the other
+note mutations, and device-press-only (`Nip46Method::device_press_only`, as a
+wallet pairing is): a proof never expires and decides where a name pays, so no
+guardian verdict may answer it and an escalate slot is refused outright. It
+never shares a card (`approval_queue::never_shares_card`), and nor, since the
+same change, does `heartwood_note_trust`, which used to batch so one hold
+trusted every sender behind the first npub shown; scoped to the served key (`method_uses_served_key`), and an
+ask never shares a card (`approval_queue::never_shares_card`): a batch card
+speaks in notes and sats and could not name a second proof. The cable has no
+identity, so `cash_address_proof` there refuses before the card, as
+`cash_address` does; on the USB-bridged NIP-46 path the card is the generic
+extension card, as for every note method.
 
-The note store keeps every indexed id it could not read (a newer record
-format, a blob sealed under another key, a failed read) through each index
-rewrite, counts it against the cap and never reuses its id, so a record
-this firmware cannot read is never orphaned for the one that can (an id
-whose blob is absent is still dropped). DOWNGRADE: every key note stays
-the v3 blob older firmware reads, so the purposes change costs nothing on a
-downgrade. One thing does: a note whose certificate is a cs1 with an amount
-in its HRP (`cs10n1...`, what a unified mint sends and `confirm` and wraps
-now keep) fails older firmware's cs1 check, so that firmware skips the note
-and, on its next index write, drops its id: the blob stays on flash but
-nothing indexes it. Before flashing an older build, collect or export every
-note carrying such a certificate (key notes can also be claimed back by a
-scan). That older build still drops unreadable ids on its own rewrites; the
-fix above protects notes from a future format bump only once this firmware
-is on the board.
-
-RELEASE NOTE: ship this firmware only after moneyer's taproot build is live
-on every mint its owners use. It exports the domain-bound BIP-340 ck1 for
-every key note it holds, old ones included, and live moneyer 0.16.x refuses
-that form, so on 0.16.x a key note stops being collectable (the money is
-safe, the export just fails at the mint) until the mint is upgraded. The
-proof it signs is also purpose 0's, which only the upgraded mint checks.
+Merged from the local unified-taproot branch (2026-10-06, checklist section
+35, NOT YET BENCH-RUN), on main's derivation and address proofs: `confirm`
+keeps a `cs1` (amount HRP or bare, any case, stored lowercase) as well as hex,
+since a mint at `50d740a` certifies a plain note with one and notecase passes
+it straight through (`note_store::confirmed_sig`; before, the note sat
+PENDING). A claim that names its key tries, after the current and superseded
+branches on its purpose, the superseded branch's pre-purpose ladder (`6e865b1`,
+no `ser32(purpose)`, graded against part2.json's `prePurpose` and the spec's
+vectors 1 and 2), where a mint paid before it moved; the current branch was
+never on it. A mint host's `:` must bring a decimal port, 1 to 65535 with no
+leading zero (`cash_store::valid_host`; a registry entry stored under the old
+character rule still decodes). The note store keeps every indexed id it could
+not read (a newer record format, a blob sealed under another key, a failed
+read) through each index rewrite, counts it against the cap and never reuses
+its id, so a record this firmware cannot read is never orphaned for the one
+that can; an id whose blob is absent is still dropped. Older firmware does not
+do this: a note certified with an amount-bearing `cs1` fails its cs1 check and
+is dropped from its index on its next write, so collect those before a
+downgrade. `common/src/taproot.rs` holds LUD-25's taproot arithmetic, graded
+intermediate by intermediate against the spec's vectors 3 and 5
+(tests/fixtures/lud25-taproot.json): `cash_key::key_path_sighash` delegates to
+it, and a bearer note's `Q` (one `OP_SHA256` leaf under the NUMS point) is
+there for the record, not used on the wire.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

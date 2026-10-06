@@ -378,6 +378,11 @@ struct SignCtx<'a, 'd, 'b> {
     /// Idle info carousel position: 0 identity, 1 network, 2 device, 3 notes. Short
     /// presses while the panel is awake advance it; sleep resets it.
     idle_page: u8,
+    /// Refresh only while the network page still owns the panel.
+    network_page_draw: Option<(u32, Instant)>,
+    /// Candidate being attempted; distinct from the successfully joined index.
+    wifi_attempt_index: Option<u8>,
+    wifi_surveying: bool,
     /// Set when the served persona set changed (a derive over any path, or a
     /// registry removal): the live "hw" subscriptions re-REQ with fresh
     /// filters on the next loop pass instead of waiting for a reconnect, so
@@ -451,6 +456,15 @@ fn service_button(ctx: &mut SignCtx<'_, '_, '_>) {
         ctx.button_settle = false;
         return;
     }
+    if ctx.display_on && ctx.idle_page == 1 && ctx.button_cards.is_empty() {
+        if let Some((generation, drawn_at)) = ctx.network_page_draw {
+            if generation == crate::oled::draw_generation()
+                && drawn_at.elapsed() >= Duration::from_secs(2)
+            {
+                draw_relay_idle_page(ctx);
+            }
+        }
+    }
     // A latched edge counts even when the finger is already off: this loop's
     // pass is ~1 s (socket recv timeouts dominate), longer than a human tap,
     // so sampling the live level alone missed most dismiss-taps (#61).
@@ -520,32 +534,54 @@ fn launch_offline_qr_if_requested(ctx: &mut SignCtx<'_, '_, '_>) -> bool {
     }
 }
 
-/// One page of the idle info carousel. Page 1 shows the stored SSID with the
-/// live runtime stage; page 2 the firmware version, board, and uptime; page 3
-/// the privacy-preserving locker counts.
+/// One page of the idle info carousel. Page 1 shows the network the station
+/// joined or is currently attempting, with the live runtime stage; page 2
+/// the firmware version, board, and uptime; page 3 the privacy-preserving
+/// locker counts.
 fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
     match ctx.idle_page {
         1 => {
+            // A failed join clears wifi_index. Keep the actual attempt visible
+            // during rotation instead of repeatedly naming the primary SSID.
+            let selected = ctx.network_runtime.wifi_index.or(ctx.wifi_attempt_index);
             let ssid = crate::net_config_store::read_net_config(ctx.nvs)
                 .and_then(|raw| heartwood_common::net_config::parse_net_config(&raw).ok())
-                .filter(|cfg| !cfg.ssid.is_empty())
-                .map(|cfg| cfg.ssid);
+                .and_then(|cfg| {
+                    selected
+                        .and_then(|i| cfg.network_at(i))
+                        .or(Some(cfg.ssid.as_str()))
+                        .filter(|ssid| !ssid.is_empty())
+                        .map(str::to_string)
+                });
             let status = match ctx.network_runtime.stage {
                 NetworkRuntimeStage::Online => "online",
                 NetworkRuntimeStage::SubscriptionSent => "relay connecting",
                 NetworkRuntimeStage::RelayConnecting => "relay connecting",
                 NetworkRuntimeStage::WifiReady => "wifi up",
+                NetworkRuntimeStage::WifiConnecting if ctx.wifi_surveying => "scanning wifi",
                 NetworkRuntimeStage::WifiConnecting => "joining wifi",
                 NetworkRuntimeStage::Starting => "starting",
                 NetworkRuntimeStage::ConfigError => "config error",
                 NetworkRuntimeStage::RadioOff => "radio off",
             };
+            let mut ap: esp_idf_svc::sys::wifi_ap_record_t = Default::default();
+            // SAFETY: ESP-IDF fills this valid out-parameter; a disconnected
+            // station returns an error, never a made-up zero-strength reading.
+            let rssi = if ctx.network_runtime.wifi_connected
+                && unsafe { esp_idf_svc::sys::esp_wifi_sta_get_ap_info(&mut ap) } == 0
+            {
+                Some(ap.rssi)
+            } else {
+                None
+            };
             crate::oled::show_info_network(
                 ctx.display,
                 "WiFi standalone",
-                ssid.as_deref(),
+                if ctx.wifi_surveying { Some("Saved networks") } else { ssid.as_deref() },
                 status,
+                rssi,
             );
+            ctx.network_page_draw = Some((crate::oled::draw_generation(), Instant::now()));
         }
         2 => crate::oled::show_info_device(
             ctx.display,
@@ -658,11 +694,30 @@ fn set_network_runtime(
         } else {
             None
         },
+        // Likewise the joined network: kept while the station is up, dropped
+        // the moment it is not, so it never names a network we have left.
+        wifi_index: if wifi_connected {
+            ctx.network_runtime.wifi_index
+        } else {
+            None
+        },
     };
     if ctx.network_runtime == next {
         return;
     }
     ctx.network_runtime = next;
+
+    // Keep an explicitly opened network page live through reconnects. Only
+    // redraw if it still owns the glass; never replace a card or its result.
+    if ctx.display_on && ctx.idle_page == 1 && !screen_busy(ctx)
+        && ctx.network_page_draw.is_some_and(|(generation, _)| {
+            generation == crate::oled::draw_generation()
+        })
+    {
+        ctx.network_display_restore_at = None;
+        draw_relay_idle_page(ctx);
+        return;
+    }
 
     let feedback = match stage {
         NetworkRuntimeStage::RadioOff => None,
@@ -710,6 +765,204 @@ const WIFI_REASON_HANDSHAKE_TIMEOUT: u16 = 204;
 enum WifiJoinStage {
     Connect,
     WaitForIp,
+}
+
+/// Each join stage's limit: the one `BlockingWifi::connect` and
+/// `wait_netif_up` apply (esp-idf-svc's CONNECT_TIMEOUT).
+const WIFI_JOIN_STAGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Asynchronous surveys keep USB, cards and relay sockets serviced. Offline
+/// rounds are ranked once; connected surveys never disconnect the station.
+struct WifiSelector {
+    survey: Option<(Instant, bool)>, // deadline, offline
+    next_survey: Instant,
+    roam: crate::wifi_retry::Roam,
+}
+
+impl WifiSelector {
+    fn new() -> Self {
+        Self {
+            survey: None,
+            next_survey: Instant::now() + Duration::from_secs(60),
+            roam: Default::default(),
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.survey.is_some()
+    }
+
+    /// False only while an offline survey is pending. An online survey lets
+    /// normal relay service continue; a selected roam is joined next pass.
+    fn poll(
+        &mut self,
+        wifi: &mut BlockingWifi<EspWifi<'_>>,
+        candidates: &[(String, String)],
+        retry: &mut crate::wifi_retry::WifiRetry,
+        allow_roam: bool,
+    ) -> bool {
+        let offline = retry.needs_join(wifi.is_up().unwrap_or(false));
+        if self
+            .survey
+            .is_some_and(|(_, was_offline)| was_offline != offline)
+        {
+            let _ = wifi.wifi_mut().stop_scan();
+            let _ = wifi.wifi_mut().get_scan_result();
+            self.survey = None;
+            self.roam.reset();
+        }
+        if !offline && !allow_roam {
+            self.roam.reset();
+        }
+        if self.survey.is_none() {
+            let needed = if offline {
+                retry.needs_scan(wifi.is_up().unwrap_or(false))
+            } else {
+                allow_roam && candidates.len() > 1 && Instant::now() >= self.next_survey
+            };
+            if !needed {
+                return true;
+            }
+            let started = (|| {
+                if offline {
+                    crate::wifi_retry::Station::disconnect(&mut WifiStation { wifi, candidates })?;
+                }
+                wifi.wifi_mut().start_scan(&Default::default(), false)
+            })();
+            self.next_survey = Instant::now() + Duration::from_secs(30);
+            if let Err(error) = started {
+                log::warn!("[relay] WiFi survey unavailable: {error:?}");
+                if offline {
+                    retry.rank(&vec![None; candidates.len()]);
+                }
+                self.roam.reset();
+                return true;
+            }
+            self.survey = Some((Instant::now() + Duration::from_secs(8), offline));
+            return !offline;
+        }
+        let (deadline, _) = self.survey.unwrap();
+        let complete = wifi.wifi().is_scan_done().unwrap_or(false);
+        if !complete && Instant::now() < deadline {
+            return !offline;
+        }
+        if !complete {
+            let _ = wifi.wifi_mut().stop_scan();
+        }
+        let aps = wifi.wifi_mut().get_scan_result();
+        self.survey = None;
+        let scores: Vec<Option<i8>> = candidates
+            .iter()
+            .map(|(ssid, _)| {
+                aps.as_ref().ok().and_then(|aps| {
+                    aps.iter()
+                        .filter(|ap| ap.ssid.as_str() == ssid)
+                        .map(|ap| ap.signal_strength)
+                        .max()
+                })
+            })
+            .collect();
+        if offline {
+            retry.rank(&scores);
+            self.roam.reset();
+            self.next_survey = Instant::now() + Duration::from_secs(60);
+        } else if complete && aps.is_ok() && allow_roam {
+            if let Ok(ap) = wifi.wifi().get_ap_info() {
+                if let Some(index) = self.roam.observe(
+                    &scores,
+                    retry.index(),
+                    ap.signal_strength,
+                    crate::uptime_s(),
+                ) {
+                    log::info!(
+                        "[relay] stronger saved WiFi confirmed; switching to candidate {}",
+                        index + 1
+                    );
+                    retry.rank(&scores);
+                    retry.prefer(index);
+                    self.roam.reset();
+                }
+            } else {
+                self.roam.reset();
+            }
+        } else {
+            self.roam.reset();
+        }
+        true
+    }
+}
+
+/// A WiFi join that is polled rather than waited on, so the cable is served
+/// while it runs. `BlockingWifi::connect` waits only for the station to
+/// associate and ignores the disconnect that reports a missing network, so a
+/// failed join held the loop for the whole 15 s, leaving USB 3 s in every 18
+/// with a network out of range: Sapwood's connect probe timed out inside the
+/// block and gave the board up as dead, exactly when the cable was the way to
+/// fix its WiFi (2026-10-02). Same stages, limits and timeout error as the
+/// blocking calls, so a failure is recorded and reported as before.
+struct WifiJoin {
+    stage: WifiJoinStage,
+    deadline: Instant,
+}
+
+enum JoinPoll {
+    Pending,
+    Joined,
+    Failed(WifiJoinStage, esp_idf_svc::sys::EspError),
+}
+
+impl WifiJoin {
+    fn start(
+        wifi: &mut BlockingWifi<EspWifi<'_>>,
+        candidates: &[(String, String)],
+        retry: &crate::wifi_retry::WifiRetry,
+    ) -> Result<Self, esp_idf_svc::sys::EspError> {
+        retry.start(&mut WifiStation { wifi, candidates })?;
+        Ok(Self {
+            stage: WifiJoinStage::Connect,
+            deadline: Instant::now() + WIFI_JOIN_STAGE_TIMEOUT,
+        })
+    }
+
+    fn poll(&mut self, wifi: &BlockingWifi<EspWifi<'_>>) -> JoinPoll {
+        if matches!(self.stage, WifiJoinStage::Connect) && wifi.is_connected().unwrap_or(false) {
+            self.stage = WifiJoinStage::WaitForIp;
+            self.deadline = Instant::now() + WIFI_JOIN_STAGE_TIMEOUT;
+        }
+        if matches!(self.stage, WifiJoinStage::WaitForIp) && wifi.is_up().unwrap_or(false) {
+            return JoinPoll::Joined;
+        }
+        if Instant::now() >= self.deadline {
+            return JoinPoll::Failed(
+                self.stage,
+                esp_idf_svc::sys::EspError::from_infallible::<{ esp_idf_svc::sys::ESP_ERR_TIMEOUT }>(),
+            );
+        }
+        JoinPoll::Pending
+    }
+}
+
+/// One pass of cable and button service while the relays are unreachable.
+/// `wifi` lends the driver to a 0x55 scan; pass `None` while a join is in
+/// flight, since a scan would pull the radio off the channel it is joining.
+fn serve_offline(
+    usb: &mut SerialPort<'_>,
+    ctx: &mut SignCtx<'_, '_, '_>,
+    wifi: Option<&mut BlockingWifi<EspWifi<'_>>>,
+    sessions: &mut [RelaySession],
+) {
+    poll_usb(usb, ctx, wifi, sessions);
+    // A relay card still owns the button and the screen: tick it with
+    // no session, so it can be answered (an approval's reply waits in
+    // the #82 outbox; an enrolment finds no live relay and adds
+    // nothing) and, above all, expires on time instead of standing,
+    // and refusing the cable, until a power cycle. A held result is
+    // served inside service_button.
+    if ctx.button_cards.is_empty() {
+        service_button(ctx);
+    } else {
+        service_button_cards(ctx, &mut []);
+    }
 }
 
 fn classify_wifi_failure(stage: WifiJoinStage, station_reason: u16) -> WifiFailureReason {
@@ -976,11 +1229,19 @@ pub fn run_wifi_standalone<'d, 'b>(
             usable
         })
         .collect();
+    // Each candidate's place in the GET_NET_CONFIG response, reported as
+    // `runtime.wifi_index` once that candidate is the one joined.
+    let wifi_positions: Vec<Option<u8>> = wifi_candidates
+        .iter()
+        .map(|(ssid, _)| cfg.network_position(ssid))
+        .collect();
     let wifi_config_ok = !wifi_candidates.is_empty();
-    let mut wifi_candidate_idx = 0usize;
-    if wifi_config_ok {
-        select_wifi_candidate(&mut wifi, &wifi_candidates, wifi_candidate_idx);
-    }
+    let mut wifi_retry = crate::wifi_retry::WifiRetry::default();
+    let mut wifi_selector = WifiSelector::new();
+    // Initialise station mode only. Every join applies its own credentials
+    // after cancelling the previous attempt, including the first boot join.
+    wifi.set_configuration(&WifiConfig::Client(ClientConfiguration::default()))
+        .expect("relay: wifi station mode");
     wifi.start().expect("relay: wifi start");
     // RF entropy source is live from here on — plain esp_fill_random (via
     // crate::fill_random) is a true RNG again.
@@ -1049,6 +1310,8 @@ pub fn run_wifi_standalone<'d, 'b>(
             locked_relay_phase(
                 &mut wifi,
                 &wifi_candidates,
+                &mut wifi_retry,
+                &mut wifi_selector,
                 &relays,
                 op_mgmt.as_ref(),
                 &phones,
@@ -1113,6 +1376,9 @@ pub fn run_wifi_standalone<'d, 'b>(
         network_runtime: NetworkRuntimeStatus::starting(),
         network_display_restore_at: None,
         idle_page: 0,
+        network_page_draw: None,
+        wifi_attempt_index: None,
+        wifi_surveying: false,
         resubscribe_needed: false,
         parks: Vec::new(),
         park_tombstones: Vec::new(),
@@ -1202,30 +1468,41 @@ pub fn run_wifi_standalone<'d, 'b>(
             );
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
-                // A relay card still owns the button and the screen: tick it with
-                // no session, so it can be answered (an approval's reply waits in
-                // the #82 outbox; an enrolment finds no live relay and adds
-                // nothing) and, above all, expires on time instead of standing,
-                // and refusing the cable, until a power cycle. A held result is
-                // served inside service_button.
-                if ctx.button_cards.is_empty() {
-                    service_button(&mut ctx);
-                } else {
-                    service_button_cards(&mut ctx, &mut []);
-                }
+                serve_offline(usb, &mut ctx, Some(&mut wifi), &mut sessions);
                 FreeRtos::delay_ms(20);
             }
             continue;
         }
+        let allow_roam = ctx.button_cards.is_empty()
+            && ctx.card_screen_hold.is_none()
+            && !crate::confirm::active()
+            && ctx.ota_session.is_none()
+            && ctx.network_trial_id.is_none()
+            && ctx.network_restart_at.is_none();
+        let selection_ready = wifi_selector.poll(
+            &mut wifi, &wifi_candidates, &mut wifi_retry, allow_roam,
+        );
+        ctx.wifi_surveying = !selection_ready;
+        if !selection_ready {
+            last_relay_healthy = Instant::now();
+            sessions.clear();
+            set_network_runtime(
+                &mut ctx, NetworkRuntimeStage::WifiConnecting,
+                false, false, NetworkRuntimeError::None,
+            );
+            serve_offline(usb, &mut ctx, None, &mut sessions);
+            FreeRtos::delay_ms(20);
+            continue;
+        }
         // Every relay session depends on the station link; restore it before
         // attempting any relay dial.
-        if !wifi.is_up().unwrap_or(false) {
+        if wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
             // Offline is not rot: a restart cannot fix the AP, and USB
             // service (fixing credentials over the cable) must never be
             // interrupted. The health watchdog only times unhealthy periods
             // while the station link is up.
             last_relay_healthy = Instant::now();
+            ctx.wifi_attempt_index = wifi_positions.get(wifi_retry.index()).copied().flatten();
             let previous_error = ctx.network_runtime.last_error_class;
             set_network_runtime(
                 &mut ctx,
@@ -1242,12 +1519,22 @@ pub fn run_wifi_standalone<'d, 'b>(
                 sessions.clear();
             }
             wifi_disconnect_reason.store(0, Ordering::Release);
-            let joined = wifi.connect()
-                .map_err(|error| (WifiJoinStage::Connect, error))
-                .and_then(|_| {
-                    wifi.wait_netif_up()
-                        .map_err(|error| (WifiJoinStage::WaitForIp, error))
-                });
+            // Polled, not waited on: the cable, the button and a scheduled
+            // restart are all served for as long as the join runs (WifiJoin).
+            let joined = match WifiJoin::start(&mut wifi, &wifi_candidates, &wifi_retry) {
+                Err(error) => Err((WifiJoinStage::Connect, error)),
+                Ok(mut join) => loop {
+                    crate::wdt::feed();
+                    match join.poll(&wifi) {
+                        JoinPoll::Joined => break Ok(()),
+                        JoinPoll::Failed(stage, error) => break Err((stage, error)),
+                        JoinPoll::Pending => {}
+                    }
+                    network_state_tick(&mut ctx);
+                    serve_offline(usb, &mut ctx, None, &mut sessions);
+                    FreeRtos::delay_ms(20);
+                },
+            };
             if let Err((stage, e)) = joined {
                 // Keep serving USB while wifi is unreachable, so a bad SSID or
                 // password can always be fixed over the cable.
@@ -1255,8 +1542,8 @@ pub fn run_wifi_standalone<'d, 'b>(
                 record_wifi_failure(&mut ctx, stage, &e, &wifi_disconnect_reason);
                 // Rotate to the next stored network for the next attempt. With
                 // a single configured network this re-selects the same one.
-                wifi_candidate_idx = wifi_candidate_idx.wrapping_add(1);
-                select_wifi_candidate(&mut wifi, &wifi_candidates, wifi_candidate_idx);
+                wifi_selector.roam.failed(wifi_retry.index(), crate::uptime_s());
+                wifi_retry.advance(wifi_candidates.len());
                 set_network_runtime(
                     &mut ctx,
                     NetworkRuntimeStage::WifiConnecting,
@@ -1266,23 +1553,22 @@ pub fn run_wifi_standalone<'d, 'b>(
                 );
                 let until = Instant::now() + Duration::from_secs(3);
                 while Instant::now() < until {
-                    poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
-                    // A relay card still owns the button and the screen: tick it with
-                    // no session, so it can be answered (an approval's reply waits in
-                    // the #82 outbox; an enrolment finds no live relay and adds
-                    // nothing) and, above all, expires on time instead of standing,
-                    // and refusing the cable, until a power cycle. A held result is
-                    // served inside service_button.
-                    if ctx.button_cards.is_empty() {
-                        service_button(&mut ctx);
-                    } else {
-                        service_button_cards(&mut ctx, &mut []);
-                    }
+                    serve_offline(usb, &mut ctx, Some(&mut wifi), &mut sessions);
                     FreeRtos::delay_ms(20);
                 }
                 continue;
             }
             log::info!("[relay] wifi up");
+            wifi_retry.mark_joined();
+            wifi_selector.roam.reset();
+            wifi_selector.next_survey = Instant::now() + Duration::from_secs(60);
+            // The station is still pointed at the last candidate selected, so
+            // that is the network it joined (a fallback, perhaps, not the
+            // primary). Set before the stage change, which carries it.
+            ctx.network_runtime.wifi_index = wifi_positions
+                .get(wifi_retry.index())
+                .copied()
+                .flatten();
             set_network_runtime(
                 &mut ctx,
                 NetworkRuntimeStage::WifiReady,
@@ -1291,6 +1577,13 @@ pub fn run_wifi_standalone<'d, 'b>(
                 NetworkRuntimeError::None,
             );
         }
+
+        // A locked boot may already have joined a fallback before unlock.
+        // Both phases share the cursor, including for runtime reporting.
+        ctx.network_runtime.wifi_index = wifi_positions
+            .get(wifi_retry.index())
+            .copied()
+            .flatten();
 
         if relays.is_empty() {
             // Config error, fixable only over USB — not the watchdog's case.
@@ -1307,18 +1600,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             // fixable over USB.
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions);
-                // A relay card still owns the button and the screen: tick it with
-                // no session, so it can be answered (an approval's reply waits in
-                // the #82 outbox; an enrolment finds no live relay and adds
-                // nothing) and, above all, expires on time instead of standing,
-                // and refusing the cable, until a power cycle. A held result is
-                // served inside service_button.
-                if ctx.button_cards.is_empty() {
-                    service_button(&mut ctx);
-                } else {
-                    service_button_cards(&mut ctx, &mut []);
-                }
+                serve_offline(usb, &mut ctx, Some(&mut wifi), &mut sessions);
                 FreeRtos::delay_ms(20);
             }
             continue;
@@ -1331,11 +1613,10 @@ pub fn run_wifi_standalone<'d, 'b>(
         if !approval_card_open(&ctx) {
             service_button(&mut ctx);
         }
-        // The WiFi driver is lent to USB only while no relay session is live —
-        // a scan mid-connection would knock the link off its channel, so a
-        // 0x55 during live service is declined (matches the old per-session
-        // loop, which lent the driver only in the between-sessions gaps).
-        let blocked = if sessions.is_empty() {
+        // The cabled scan is blocking, unlike the roaming survey. Lend the
+        // driver only between sessions and never while a survey owns its
+        // scan results, keeping relay service and scan ownership intact.
+        let blocked = if sessions.is_empty() && !wifi_selector.busy() {
             poll_usb(usb, &mut ctx, Some(&mut wifi), &mut sessions)
         } else {
             poll_usb(usb, &mut ctx, None, &mut sessions)
@@ -2243,38 +2524,50 @@ fn wifi_client_config(ssid: &str, password: &str) -> Option<WifiConfig> {
     }))
 }
 
-/// Point the station at candidate `idx` (mod len) of the configured network
-/// list. Config failures are logged, not fatal: the next connect attempt
-/// fails cleanly and the rotation moves on.
-fn select_wifi_candidate(
-    wifi: &mut BlockingWifi<EspWifi<'_>>,
-    candidates: &[(String, String)],
-    idx: usize,
-) {
-    if candidates.is_empty() {
-        return;
+/// Adapter for the host-tested retry sequence. A failed configuration is
+/// propagated: connecting here with the previous SSID would fake a rotation.
+struct WifiStation<'a, 'd> {
+    wifi: &'a mut BlockingWifi<EspWifi<'d>>,
+    candidates: &'a [(String, String)],
+}
+
+impl crate::wifi_retry::Station for WifiStation<'_, '_> {
+    type Error = esp_idf_svc::sys::EspError;
+
+    fn disconnect(&mut self) -> Result<(), Self::Error> {
+        // Also cancels a pending association. Waiting for the disconnect
+        // event when associated prevents a stale is_up() from completing the
+        // new join before the driver has left the old AP.
+        self.wifi.wifi_mut().disconnect()?;
+        self.wifi.wifi_wait_while(
+            || self.wifi.is_connected(),
+            Some(Duration::from_secs(1)),
+        )
     }
-    let (ssid, password) = &candidates[idx % candidates.len()];
-    if candidates.len() > 1 {
+
+    fn configure(&mut self, index: usize) -> Result<(), Self::Error> {
+        let invalid = || Self::Error::from_infallible::<{ esp_idf_svc::sys::ESP_ERR_INVALID_ARG }>();
+        let (ssid, password) = self.candidates.get(index).ok_or_else(invalid)?;
+        let config = wifi_client_config(ssid, password).ok_or_else(invalid)?;
         log::info!(
             "[relay] wifi network {}/{}: {:?}",
-            idx % candidates.len() + 1,
-            candidates.len(),
+            index + 1,
+            self.candidates.len(),
             ssid
         );
+        self.wifi.set_configuration(&config)
     }
-    let Some(config) = wifi_client_config(ssid, password) else {
-        log::error!("[relay] stored credential for {ssid:?} exceeds ESP-IDF field bounds — skipped");
-        return;
-    };
-    if let Err(e) = wifi.set_configuration(&config) {
-        log::error!("[relay] wifi config for {ssid:?} failed: {e:?}");
+
+    fn connect(&mut self) -> Result<(), Self::Error> {
+        self.wifi.wifi_mut().connect()
     }
 }
 
 fn locked_relay_phase(
     wifi: &mut BlockingWifi<EspWifi<'_>>,
     wifi_candidates: &[(String, String)],
+    wifi_retry: &mut crate::wifi_retry::WifiRetry,
+    wifi_selector: &mut WifiSelector,
     relays: &[String],
     op_mgmt: Option<&[u8; 32]>,
     phones: &PhoneSet,
@@ -2337,8 +2630,8 @@ fn locked_relay_phase(
     let mut relay_idx = 0usize;
     let mut session: Option<RelaySession> = None;
     let mut next_announce = Instant::now();
-    let mut wifi_idx = 0usize;
     let mut next_wifi_attempt = Instant::now();
+    let mut wifi_join: Option<WifiJoin> = None;
     // Wall clock, learned from the relay. Until it has a reading there is
     // nothing worth publishing: an announcement stamped from boot time is
     // rejected as an expired ephemeral event, so it would be a signature and a
@@ -2358,24 +2651,54 @@ fn locked_relay_phase(
         // This phase runs before the main loop ever connects the station, so
         // it owns its own join attempts — without this, the unlock announce
         // could never reach a relay. Rotates through the stored network list,
-        // paced so USB unlock stays served between blocking attempts.
-        if !wifi.is_up().unwrap_or(false) {
+        // paced so USB unlock stays served between attempts. Each attempt is
+        // polled across passes (WifiJoin), so USB unlock is served during it
+        // too, not only in the 3 s between.
+        let selection_ready = if wifi_join.is_none() && Instant::now() >= next_wifi_attempt {
+            wifi_selector.poll(wifi, wifi_candidates, wifi_retry, true)
+        } else {
+            true
+        };
+        if !wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
+            if wifi_join.take().is_some() {
+                log::info!("[relay] locked: wifi up");
+            }
+        } else {
             if session.is_some() {
                 session = None;
             }
-            if Instant::now() >= next_wifi_attempt {
-                if let Err(e) = wifi.connect().and_then(|_| wifi.wait_netif_up()) {
-                    log::warn!("[relay] locked: wifi connect failed: {e:?}; retry in 3s");
-                    wifi_idx = wifi_idx.wrapping_add(1);
-                    select_wifi_candidate(wifi, wifi_candidates, wifi_idx);
-                    next_wifi_attempt = Instant::now() + Duration::from_secs(3);
-                } else {
+            let failed = match wifi_join.as_mut().map(|join| join.poll(wifi)) {
+                Some(JoinPoll::Pending) => None,
+                Some(JoinPoll::Joined) => {
+                    wifi_join = None;
+                    wifi_retry.mark_joined();
+                    wifi_selector.roam.reset();
+                    wifi_selector.next_survey = Instant::now() + Duration::from_secs(60);
                     log::info!("[relay] locked: wifi up");
+                    None
                 }
+                Some(JoinPoll::Failed(_, e)) => Some(e),
+                None if selection_ready && Instant::now() >= next_wifi_attempt => {
+                    match WifiJoin::start(wifi, wifi_candidates, wifi_retry) {
+                        Ok(join) => {
+                            wifi_join = Some(join);
+                            None
+                        }
+                        Err(e) => Some(e),
+                    }
+                }
+                None => None,
+            };
+            if let Some(e) = failed {
+                log::warn!("[relay] locked: wifi connect failed: {e:?}; retry in 3s");
+                wifi_join = None;
+                wifi_selector.roam.failed(wifi_retry.index(), crate::uptime_s());
+                wifi_retry.advance(wifi_candidates.len());
+                next_wifi_attempt = Instant::now() + Duration::from_secs(3);
             }
         }
         // (Re)connect round-robin until a relay holds.
-        if session.is_none() && wifi.is_up().unwrap_or(false) {
+        if session.is_none() && !wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
             match connect_relay_raw(&relays[relay_idx], sub_req.clone(), false, true) {
                 Ok(s) => {
                     log::info!("[relay] locked: connected {}", relays[relay_idx]);
@@ -2620,7 +2943,9 @@ fn locked_relay_phase(
                 FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
                     usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    crate::firmware_info_json(nvs).as_bytes(),
+                    // `Some(relays)`: the locked phase's own list, the same
+                    // one `relays_at_boot` compared against this boot.
+                    crate::firmware_info_json(nvs, Some(relays)).as_bytes(),
                 ),
                 FRAME_TYPE_PROVISION_LIST => {
                     // Safe while locked (npubs only, no secrets) and REQUIRED
@@ -3348,7 +3673,9 @@ fn poll_usb_frame(
         FRAME_TYPE_FIRMWARE_INFO => crate::protocol::write_frame(
             usb,
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-            crate::firmware_info_json(ctx.nvs).as_bytes(),
+            // `Some(&ctx.relays)`: the list this relay loop is actually
+            // running, not a fresh net-config read.
+            crate::firmware_info_json(ctx.nvs, Some(&ctx.relays)).as_bytes(),
         ),
 
         // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
@@ -5026,10 +5353,6 @@ struct ButtonCard {
     /// The enrol card's pages and press gate (`phone_unlock::EnrolGate`),
     /// stepped every tick; unused by other cards.
     enrol_gate: heartwood_common::phone_unlock::EnrolGate,
-    /// A registration proof card's pages and press gate
-    /// (`note_cmd::address_proof_gate`), stepped every tick like the enrol
-    /// card's; `None` for every other card.
-    page_gate: Option<heartwood_common::button_arm::PageGate>,
     /// The enrol card's (page, armed) last drawn, so a change is drawn at
     /// once and the page the gate counts is the page on screen.
     drawn_view: Option<(usize, bool)>,
@@ -5129,18 +5452,34 @@ fn queue_button_ask(
         let to = note_param(&ask.request, "to").unwrap_or_default();
         kind_key = format!("{kind_key}:{to}");
     }
-    // Two registration proofs are two decisions for the same reason: the
-    // card names one action, one username and one mint, so only that same
-    // proof may ride its hold.
-    if ask.request.method == "heartwood_note_address_proof" {
-        let part = |name: &str| note_param(&ask.request, name).unwrap_or_default();
-        kind_key = format!("{kind_key}:{}:{}:{}", part("action"), part("host"), part("name"));
-    }
     // Asks acting as different identities are different decisions: one hold
     // must never approve an identity its card did not name.
     if let Some(identity) = ask.identity.as_ref() {
         kind_key.push('@');
         kind_key.extend(heartwood_common::policy::identity_tag(identity).iter().map(|&b| b as char));
+    }
+    // A login challenge never shares a card: its card shows one code, so one
+    // hold must never also sign a second challenge. The key is unique per ask
+    // and owes nothing to the client, which picks its own request ids.
+    if ask
+        .event
+        .as_ref()
+        .is_some_and(|event| heartwood_common::policy::is_login_challenge(event.kind, &event.tags))
+    {
+        // 32-bit: none of the boards has 64-bit atomics. Wrapping is harmless, as
+        // a key only has to differ from the cards alive beside it.
+        static LOGIN_ASK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = LOGIN_ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        kind_key = heartwood_common::approval_queue::login_kind_key(&kind_key, seq);
+    }
+    // Nor does an address proof or a trust: each card names one decision
+    // (an address, action and branch; one sender's npub), and a batch card
+    // speaks in notes and sats, so a second ask must never ride the first
+    // one's hold.
+    if heartwood_common::approval_queue::never_shares_card(&ask.request.method) {
+        static UNSHARED_ASK_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = UNSHARED_ASK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        kind_key = heartwood_common::approval_queue::unshared_kind_key(&kind_key, seq);
     }
     // A HOLD TO SIGN ask and an ALLOW AS ask (or any two card kinds) are
     // different decisions and never share one hold.
@@ -5223,7 +5562,6 @@ fn queue_button_ask(
         }
         Admission::Open | Admission::Wait => {
             log::info!("[relay] {request_id} waiting on the button");
-            let page_gate = address_proof_view(&ask.request).map(|(_, _, gate)| gate);
             ctx.button_cards.push(ButtonCard {
                 key,
                 target_pk: *target_pk,
@@ -5240,7 +5578,6 @@ fn queue_button_ask(
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
                 enrol_gate: Default::default(),
-                page_gate,
                 drawn_view: None,
                 drawn_gen: None,
             });
@@ -5270,14 +5607,9 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // First draw of this wording: a join sets last_remaining back to MAX to
     // force a redraw, so a card that grows logs again with what it now says.
     let first_draw = ctx.button_cards[0].last_remaining == u32::MAX;
-    // The enrol card, and a paged registration proof, also redraw the
-    // moment their page or gate changes.
-    let view = if is_enrol_card(&ctx.button_cards[0]) {
-        Some((ctx.button_cards[0].enrol_gate.page(), ctx.button_cards[0].enrol_gate.armed()))
-    } else {
-        use heartwood_common::button_arm::CardGate;
-        ctx.button_cards[0].page_gate.as_ref().map(|gate| (gate.page(), gate.armed()))
-    };
+    // The enrol card also redraws the moment its page or gate changes.
+    let view = is_enrol_card(&ctx.button_cards[0])
+        .then(|| (ctx.button_cards[0].enrol_gate.page(), ctx.button_cards[0].enrol_gate.armed()));
     if remaining == ctx.button_cards[0].last_remaining
         && view == ctx.button_cards[0].drawn_view
         && !card_overdrawn(&ctx.button_cards[0])
@@ -5290,17 +5622,16 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
 
     let batch = ctx.button_cards[0].asks.len();
     enum Draw {
-        Sign(String, u64, Option<String>, Option<String>),
+        Sign(String, u64, Option<String>, Option<String>, Option<String>),
         Extension(String, String, String),
         Titled(&'static str, String),
         Batch(String, String),
         Enrol([&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS], String),
     }
-    // The gated card's page and whether a hold counts yet (the enrol card's
-    // hint).
+    // The enrol card's page and whether a hold counts yet (its hint).
     let (card_page, card_armed) = view.unwrap_or((0, true));
     let card = match &ctx.button_cards[0].asks[0].ask.card {
-        crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading } => {
+        crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading, login_code } => {
             // The count belongs on screen: one hold answers all of them, and
             // the operator must never be shown "sign this" for a batch.
             let label = if batch > 1 {
@@ -5308,36 +5639,24 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             } else {
                 requester.clone()
             };
-            Draw::Sign(label, *kind, identity.clone(), heading.clone())
+            Draw::Sign(label, *kind, identity.clone(), heading.clone(), login_code.clone())
         }
         crate::nip46_handler::AskCard::Extension {
             heading,
             method,
             preview,
-        } => match own_card_header(&ctx.button_cards[0].asks[0].ask.request)
+        } => match note_card_header(&ctx.button_cards[0].asks[0].ask.request.method)
             // A gate card (ALLOW AS / NPUB AS / LIST IDS) carries the app, not
             // the method, on its second line, and is never a money card.
             .filter(|_| method == &ctx.button_cards[0].asks[0].ask.request.method)
         {
             // A batched note card must say what the one hold releases: the
-            // count, the total and the mint, never just the first note. A
-            // registration proof moves no money, and its batch key admits
-            // only the same proof again, so its own card already says it all.
-            Some(header)
-                if batch > 1
-                    && ctx.button_cards[0].asks[0].ask.request.method != "heartwood_note_address_proof" =>
-            {
+            // count, the total and the mint, never just the first note.
+            Some(header) if batch > 1 => {
                 let (head, title) = note_batch_card(header, &ctx.button_cards[0].asks);
                 Draw::Batch(head, title)
             }
-            // A registration proof shows its whole name, a page at a time.
-            Some(header) => match address_proof_view(&ctx.button_cards[0].asks[0].ask.request) {
-                Some((_, pages, _)) => Draw::Titled(
-                    header,
-                    pages.get(card_page).cloned().unwrap_or_else(|| preview.clone()),
-                ),
-                None => Draw::Titled(header, preview.clone()),
-            },
+            Some(header) => Draw::Titled(header, preview.clone()),
             None => Draw::Extension(heading.clone(), method.clone(), preview.clone()),
         },
         crate::nip46_handler::AskCard::Receive { title } => {
@@ -5353,7 +5672,11 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // was handed to the glass, never whether the glass had room for it.
     if first_draw {
         let (head, body) = match &card {
-            Draw::Sign(label, kind, identity, heading) => (
+            Draw::Sign(label, _, _, heading, Some(code)) => (
+                heading.clone().unwrap_or_else(|| "LOG IN".to_string()),
+                format!("{} / {code}", crate::oled::display_app_label(label)),
+            ),
+            Draw::Sign(label, kind, identity, heading, None) => (
                 heading.clone().unwrap_or_else(|| "HOLD TO SIGN".to_string()),
                 format!(
                     "{} / {} / kind {kind} / {}",
@@ -5373,12 +5696,13 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }
     match card {
-        Draw::Sign(label, kind, identity, heading) => crate::oled::show_sign_request_as(
+        Draw::Sign(label, kind, identity, heading, login_code) => crate::oled::show_sign_request_as(
             ctx.display,
             &label,
             kind,
             identity.as_deref(),
             heading.as_deref(),
+            login_code.as_deref(),
             remaining,
         ),
         Draw::Extension(heading, method, preview) => crate::oled::show_master_sign_request(
@@ -5455,36 +5779,6 @@ fn note_batch_card(header: &str, asks: &[ButtonAsk]) -> (String, String) {
     batch_card(header, &notes, to.as_deref())
 }
 
-/// The header of a method's own titled card: a note card's, or for a
-/// registration proof the action it signs (REGISTER NAME or UNREGISTER
-/// NAME), read through the same helper that built the card's two lines, so
-/// the header and the lines cannot disagree.
-/// A registration proof's card as pages, and the gate its press waits
-/// behind (`note_cmd::address_proof_pages`); `None` for any other request,
-/// or one the card could not be built for.
-fn address_proof_view(
-    request: &nip46::Nip46Request,
-) -> Option<(&'static str, Vec<String>, heartwood_common::button_arm::PageGate)> {
-    use heartwood_common::note_cmd::{address_proof_gate, address_proof_pages, address_proof_request, note_cmd_for_method};
-    if request.method != "heartwood_note_address_proof" {
-        return None;
-    }
-    let cmd = note_cmd_for_method(&request.method, &request.params).ok()?;
-    let (action, name, host) = address_proof_request(&cmd)?;
-    let (header, pages) = address_proof_pages(action, name, host);
-    Some((header, pages, address_proof_gate(name)))
-}
-
-fn own_card_header(request: &nip46::Nip46Request) -> Option<&'static str> {
-    if request.method == "heartwood_note_address_proof" {
-        use heartwood_common::note_cmd::{address_proof_card, address_proof_request, note_cmd_for_method};
-        let cmd = note_cmd_for_method(&request.method, &request.params).ok()?;
-        let (action, name, host) = address_proof_request(&cmd)?;
-        return Some(address_proof_card(action, name, host).0);
-    }
-    note_card_header(&request.method)
-}
-
 /// Note methods get the amount card rather than the method-name card, with
 /// the same header the cable path uses for the same command.
 fn note_card_header(method: &str) -> Option<&'static str> {
@@ -5495,6 +5789,7 @@ fn note_card_header(method: &str) -> Option<&'static str> {
         "heartwood_note_send" => "SEND NOTE",
         "heartwood_note_rename" => "RENAME NOTE",
         "heartwood_note_trust" => "TRUST SENDER",
+        "heartwood_note_address_proof" => heartwood_common::note_cmd::ADDRESS_PROOF_HEADER,
         "heartwood_pair_wallet" => "PAIR NEW WALLET",
         _ => return None,
     })
@@ -5536,48 +5831,27 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     // passed and the button is up. A hold on page 1 alone would rest on two
     // words.
     let enrol = is_enrol_card(&ctx.button_cards[0]);
-    // A registration proof whose name runs over several pages keeps the
-    // same kind of gate (note_cmd::address_proof_gate): its pages turn by
-    // themselves and a hold counts only once each has been on screen, so a
-    // press never rests on half a name.
-    let paged = !enrol && ctx.button_cards[0].page_gate.is_some();
-    if enrol || paged {
-        use heartwood_common::button_arm::CardGate;
+    if enrol {
         let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        let overdrawn = card_overdrawn(&ctx.button_cards[0]);
-        let card = &mut ctx.button_cards[0];
-        let gate: &mut dyn CardGate = match card.page_gate.as_mut() {
-            Some(gate) if paged => gate,
-            _ => &mut card.enrol_gate,
-        };
         // Something else was drawn since the card last drew itself (a
         // signing confirmation, an OTA chunk, a screen turned round): the
         // words were hidden for some of that time, so the page on screen
         // starts its dwell again once the card is back (drawn below). A card
         // drawn over again and again only expires.
-        if overdrawn {
-            gate.restart_page(elapsed_ms);
+        if card_overdrawn(&ctx.button_cards[0]) {
+            ctx.button_cards[0].enrol_gate.restart_page(elapsed_ms);
         }
-        gate.step(elapsed_ms, hold_ms > 0);
+        ctx.button_cards[0].enrol_gate.step(elapsed_ms, hold_ms > 0);
     }
-    let gate_armed = {
-        use heartwood_common::button_arm::CardGate;
-        let card = &ctx.button_cards[0];
-        match (enrol, card.page_gate.as_ref()) {
-            (true, _) => card.enrol_gate.armed(),
-            (false, Some(gate)) => gate.armed(),
-            (false, None) => true,
-        }
-    };
 
     if !ctx.button_cards[0].armed {
-        let arms = hold_ms == 0 && gate_armed;
+        let arms = hold_ms == 0 && (!enrol || ctx.button_cards[0].enrol_gate.armed());
         if arms {
             ctx.button_cards[0].armed = true;
         }
-        // B still cancels a gated card during its gate: it is the explicit
+        // B still cancels an enrol card during its gate: it is the explicit
         // "no", and that is always the owner's to give.
-        if (enrol || paged) && ctx.buttons.b_pressed() {
+        if enrol && ctx.buttons.b_pressed() {
             ctx.buttons.drain_b();
             return CardTick::Denied;
         }
@@ -6131,7 +6405,6 @@ fn queue_receive_card(
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
                 enrol_gate: Default::default(),
-                page_gate: None,
                 drawn_view: None,
                 drawn_gen: None,
             });
@@ -6358,7 +6631,6 @@ fn queue_phone_enrol(
         last_remaining: u32::MAX,
         last_pct: u32::MAX,
         enrol_gate: Default::default(),
-        page_gate: None,
         drawn_view: None,
         drawn_gen: None,
     });
@@ -6922,8 +7194,9 @@ fn sign_audit_json(ctx: &SignCtx) -> Vec<serde_json::Value> {
 /// `is_device_op` gates this exactly as the full reply does (`dispatch_mgmt`'s
 /// `get_status` arm): a per-identity delegate never sees the device-wide
 /// fields — `master_count`, `relay`, `crashed_during`, `at_rest`,
-/// `unlock_phone_count` and the rest — even under heap pressure. The fallback
-/// must never be a wider leak than the reply it stands in for.
+/// `unlock_phone_count`, `phone_relays` and the rest, even under heap
+/// pressure. The fallback must never be a wider leak than the reply it
+/// stands in for.
 fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op: bool) -> String {
     let master_hex = hex_encode(&ctx.masters[master_idx].pubkey);
     let result = if is_device_op {
@@ -6933,6 +7206,11 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op:
         // resolve`, which this and `dispatch_mgmt`'s full reply both call
         // instead of each repeating the composition.
         let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
+        // Plan G2's Sapwood follow-up: same idiom, same call site pattern as
+        // `at_rest`/`unlock_phone_count` above; see `pin::phone_relay_status`.
+        // `ctx.relays`, not a fresh net-config read: the list this relay loop
+        // is actually running, with no extra heap parse on this low-heap path.
+        let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
         serde_json::json!({
             "master_count": ctx.masters.len(),
             "master_npub_hex": master_hex,
@@ -6948,6 +7226,7 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op:
             "log_quiet": crate::log_quiet::read(ctx.nvs),
             "at_rest": at_rest.wire(),
             "unlock_phone_count": unlock_phone_count,
+            "phone_relays": phone_relays.wire(),
             "version": env!("CARGO_PKG_VERSION"),
             "board": crate::board::BOARD,
             "truncated": true,
@@ -7209,7 +7488,11 @@ fn handle_nip46_event(
     // The same gate dispatch will apply, planned from the same facts, so
     // escalation, petitions, rollback and the notice's identity see the
     // identity and list-identities cards and not only the method policy.
-    let base_tier = ctx.policy_engine.check(slot, &ev.pubkey, &method_enum, event_kind);
+    let login_challenge = matches!(method_enum, nip46::Nip46Method::SignEvent)
+        && nip46::unsigned_event_is_login_challenge(&request.params);
+    let base_tier = ctx
+        .policy_engine
+        .check_for_event(slot, &ev.pubkey, &method_enum, event_kind, login_challenge);
     let active_context = if request.heartwood.is_none() {
         crate::nip46_handler::resolve_active_context(
             ctx.policy_engine,
@@ -7259,7 +7542,9 @@ fn handle_nip46_event(
     let route = heartwood_common::escalate::route_request(
         tier,
         method_enum.pinned_physical(),
-        method_enum.device_press_only(),
+        // A login challenge must be answered at the device, with its code on
+        // screen; no guardian verdict may complete it.
+        heartwood_common::escalate::device_only_request(method_enum.device_press_only(), login_challenge),
         escalate_slot,
     );
     if matches!(route, heartwood_common::escalate::Route::Refuse) {
@@ -7297,7 +7582,7 @@ fn handle_nip46_event(
     {
         let card = heartwood_common::note_cmd::note_cmd_for_method(&request.method, &request.params)
             .ok()
-            .and_then(|cmd| crate::notes::relay_card(&cmd))
+            .and_then(|cmd| crate::notes::relay_card(&cmd, Some(&*signing_secret)))
             .map(|(heading, detail)| (heading.to_string(), detail.replace('\n', " / ")));
         if card.is_none() {
             log::warn!(
@@ -8091,6 +8376,10 @@ fn dispatch_mgmt(
                 "active": active_json,
                 "trial": trial_json,
                 "last_result": last_result,
+                // The network the station joined, as a position in `active`
+                // (see NetworkRuntimeStatus::wifi_index). Only this field of
+                // the runtime: the rest are cable diagnostics.
+                "wifi_index": ctx.network_runtime.wifi_index,
             }))
         }
 
@@ -9570,8 +9859,33 @@ fn dispatch_mgmt(
                 ctx.policy_engine
                     .update_slot(master_slot, slot_index, label, None, None, None)
             } else {
-                ctx.policy_engine
-                    .update_slot(master_slot, slot_index, label, methods, kinds, auto)
+                // Away approval: `escalate` is honoured on a legacy slot too,
+                // as the cable's CONNSLOT_UPDATE already does, so a slot
+                // flagged at the cable can be unflagged from the phone. Only
+                // this one family flag; the others keep their strict-only
+                // path. Parsed before anything changes, so a bad value
+                // leaves the slot untouched.
+                let escalate = match req.pointer("/params/escalate") {
+                    None => None,
+                    Some(value) => {
+                        Some(value.as_bool().ok_or("escalate must be a boolean")?)
+                    }
+                };
+                let updated = ctx
+                    .policy_engine
+                    .update_slot(master_slot, slot_index, label, methods, kinds, auto);
+                if let Some(escalate) = escalate.filter(|e| updated && *e != target.escalate) {
+                    ctx.policy_engine.set_slot_family_flags(
+                        master_slot,
+                        slot_index,
+                        escalate,
+                        target.petition_on_deny,
+                        target.audit_child_wrap,
+                        target.guardian_notice_wrap,
+                        target.bound_identity.clone(),
+                    );
+                }
+                updated
             };
             if updated {
                 persist_slot_mutation_or_rollback(
@@ -9784,6 +10098,11 @@ fn dispatch_mgmt(
                     // on-device, and a kind-1059 to a master npub puts a
                     // RECEIVE card up.
                     "note_wrap_v1",
+                    // LUD-25 address proofs: heartwood_note_address_proof
+                    // signs register/unregister for a lightning-address name
+                    // with this identity's current or superseded branch, on a
+                    // pinned ADDRESS PROOF card.
+                    "note_address_proof_v1",
                     // revoke_client_identity / clear_client_identities withdraw
                     // identity approvals from a slot without revoking it.
                     "client_identity_revoke_v1",
@@ -9793,8 +10112,8 @@ fn dispatch_mgmt(
             // feature-detect and manage its own identity — never the
             // device-wide audit ring, relay topology, storage inventory, an
             // enumeration of the owner's other identities, or the at-rest
-            // mode and phone count below (device-wide properties, not this
-            // identity's). Built from
+            // mode, phone count and phone-relay-drift status below
+            // (device-wide properties, not this identity's). Built from
             // `heartwood_common::at_rest_status::DELEGATE_STATUS_KEYS`, not
             // just typed out to match it, for the same reason
             // `minimal_status_json`'s fallback is: a key added here without
@@ -9828,6 +10147,14 @@ fn dispatch_mgmt(
             // see `pin::at_rest_status` and `heartwood_common::
             // at_rest_status::resolve`. Never a phone id, label or hint.
             let (at_rest, unlock_phone_count) = crate::pin::at_rest_status(ctx.nvs);
+            // Plan G2's Sapwood follow-up: "phones not yet told", the third
+            // item on the follow-up list once #191 (relay update) and #192
+            // (at-rest state) both merged. Same call-site pattern as
+            // `at_rest`/`unlock_phone_count`; see `pin::phone_relay_status`.
+            // `ctx.relays`, not a fresh net-config read: the list this relay
+            // loop is actually running (same list `relays_at_boot` compared
+            // against), and no extra heap parse per poll.
+            let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
             Ok(serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,
@@ -9867,6 +10194,7 @@ fn dispatch_mgmt(
                 // this while locked (see its doc comment).
                 "at_rest": at_rest.wire(),
                 "unlock_phone_count": unlock_phone_count,
+                "phone_relays": phone_relays.wire(),
                 // Running firmware, so managers can show version state over
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),

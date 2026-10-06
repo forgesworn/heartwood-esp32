@@ -748,6 +748,13 @@ impl NoteStore {
     }
 
     /// Received notes a wallet has not yet rotated and marked spent.
+    /// Notes that are still money or about to be: pending and confirmed.
+    /// A spent record is kept as a receipt (MAX_SPENT) but holds nothing, so
+    /// the idle screen's "held" must not count it.
+    pub fn live_count(&self) -> usize {
+        self.notes.iter().filter(|n| n.state != NoteState::Spent).count()
+    }
+
     pub fn received_count(&self) -> usize {
         self.notes
             .iter()
@@ -1786,26 +1793,26 @@ mod tests {
     #[cfg(feature = "cash")]
     #[test]
     fn a_key_note_exports_its_ck1_and_never_its_key() {
-        // LUD-25 test vector 3: its key held as a note at mint.example/w
-        // exports exactly the vector's ck1, bound to mint.example. The locker
-        // stores the endpoint, path and all, and the path never reaches the
-        // signature.
+        // lnurlcash-conformance part2.json, the first branch's first note,
+        // whose ck1 is bound to that branch's domain. The locker stores the
+        // endpoint, path and all, and the path never reaches the signature.
         let vectors: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
-        let v = &vectors["vector3"];
-        let unhex = |key: &str| -> [u8; 32] {
-            crate::hex::hex_decode(v[key].as_str().unwrap()).unwrap().try_into().unwrap()
-        };
-        let (secret, pubkey) = (unhex("sk"), unhex("outputKey"));
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
+        let note = &vectors["branches"][0]["notes"][0];
+        let secret: [u8; 32] = crate::hex::hex_decode(note["noteSecretKey"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         let mut storage = FakeStorage::new();
         let mut store = fresh_store(&mut storage);
         let mut rng = test_rng();
-        let key = KeyNote { index: 0, pubkey };
+        let key = KeyNote { index: 0, pubkey: [0; 32] };
+        let endpoint = format!("{}/w", vectors["branches"][0]["host"].as_str().unwrap());
         let (id, _) = store
-            .import_key(&mut storage, &mut rng, &secret, key, "mint.example/w", 1_000, "", 1)
+            .import_key(&mut storage, &mut rng, &secret, key, &endpoint, 1_000, "", 1)
             .unwrap();
         let k1 = store.export_secret(&id).unwrap();
-        assert_eq!(k1, v["ck1"].as_str().unwrap());
+        assert_eq!(k1, note["ck1"].as_str().unwrap());
         assert!(!k1.contains(&hex_encode(&secret)));
 
         // The same key at another mint is another ck1: nothing one mint has
@@ -1813,11 +1820,11 @@ mod tests {
         let mut storage = FakeStorage::new();
         let mut store = fresh_store(&mut storage);
         let (id, _) = store
-            .import_key(&mut storage, &mut rng, &secret, key, "moneyer.dev/w", 1_000, "", 1)
+            .import_key(&mut storage, &mut rng, &secret, key, "elsewhere.example/w", 1_000, "", 1)
             .unwrap();
         let elsewhere = store.export_secret(&id).unwrap();
         assert_ne!(elsewhere, k1);
-        assert_eq!(elsewhere, crate::cash_key::ck1_of(&secret, "moneyer.dev").unwrap());
+        assert_eq!(elsewhere, crate::cash_key::ck1_of(&secret, "elsewhere.example").unwrap());
     }
 
     #[test]
@@ -1864,6 +1871,25 @@ mod tests {
         // And a confirmed cs1 survives a reload.
         let reloaded = NoteStore::load(&mut storage, MAX_NOTES).store;
         assert!(reloaded.list(0, MAX_NOTES).notes.iter().any(|n| n.sig == cs1));
+    }
+
+    #[test]
+    fn a_spent_record_is_not_a_live_note() {
+        // The idle screen said "2 held" for two notes already paid out.
+        let mut storage = FakeStorage::new();
+        let mut store = fresh_store(&mut storage);
+        let mut rng = test_rng();
+        let alice = [0xa1u8; 32];
+        let (a, _) = store
+            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], None, "mint.example", 5_000, "", &alice, 10, false)
+            .unwrap();
+        store
+            .receive(&mut storage, &mut rng, &[4u8; SECRET_LEN], None, "mint.example", 7_000, "", &alice, 11, false)
+            .unwrap();
+        assert_eq!((store.counts().0, store.live_count()), (2, 2));
+        store.mark_spent(&mut storage, &a, 12).unwrap();
+        // the record stays as a receipt, but it holds nothing
+        assert_eq!((store.counts().0, store.live_count()), (2, 1));
     }
 
     #[test]

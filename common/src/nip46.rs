@@ -111,11 +111,10 @@ pub enum Nip46Method {
     /// Neither discloses a note, so neither is pinned to the button.
     HeartwoodNoteAddress,
     HeartwoodNoteClaim,
-    /// LUD-25's proof that registers or unregisters a lightning-address
-    /// username against the served identity's address branch at a mint: the
-    /// branch's purpose-0 index-0 key over the fixed
-    /// `LNURLcash:<action>:<domain>:<username>`. It changes where a name's
-    /// payments go, so it is pinned to the button like a trust.
+    /// LUD-25's address proof: a signature by one of the served identity's
+    /// address branches agreeing to register or unregister a lightning-address
+    /// name at a mint. It is what lets a mint move or clear where the name
+    /// pays, so it is pinned to the button like the mutating set.
     HeartwoodNoteAddressProof,
     /// Mint a connection slot for another wallet, from a wallet already
     /// bound. Gated by a hold; answers with a one-time bunker URI.
@@ -285,12 +284,12 @@ impl Nip46Method {
     /// card accepts. A rendezvous provision hands the caller a derived scalar
     /// and `heartwood_pair_wallet` mints a slot secret and returns it: each
     /// turns the approval itself into a bearer capability, so no remote
-    /// verdict may stand in for the press. A lightning-address registration
-    /// proof is the same kind of thing: it signs neither the `cx1` nor a
-    /// nonce, so whoever holds it can replay it at that mint for good, and
-    /// the name's payments go where it says. On an escalate slot these are
-    /// refused outright rather than parked, because parking one could only
-    /// ever end in a card nobody is there to press (#160).
+    /// verdict may stand in for the press. An address proof is the same: a
+    /// signature that never expires, deciding where a lightning address's
+    /// payments go, so only the owner at the board may give it. On an
+    /// escalate slot these are refused outright rather than parked, because
+    /// parking one could only ever end in a card nobody is there to press
+    /// (#160).
     pub fn device_press_only(&self) -> bool {
         self.requires_fresh_physical_approval()
             || matches!(self, Self::HeartwoodPairWallet | Self::HeartwoodNoteAddressProof)
@@ -1191,6 +1190,58 @@ pub fn unsigned_event_kind(params: &[Value]) -> Option<u64> {
         Value::String(raw) => serde_json::from_str::<KindOnly>(raw).ok().map(|event| event.kind),
         Value::Object(object) => object.get("kind").and_then(Value::as_u64),
         _ => None,
+    }
+}
+
+/// Whether the `sign_event` params carry a login challenge
+/// ([`crate::policy::is_login_challenge`]): kind 22242 with any `code` tag.
+///
+/// For the places that must decide a tier before the event is parsed in
+/// full (relay pre-dispatch, USB snapshot). Unreadable params are not a login
+/// challenge; the handler's own parse then refuses them as a bad event.
+pub fn unsigned_event_is_login_challenge(params: &[Value]) -> bool {
+    // Cheap first: only kind 22242 can be a login challenge, and the kind
+    // scan never copies the content. Every other event, which is nearly all
+    // of them and may be large, returns here.
+    if unsigned_event_kind(params) != Some(crate::policy::LOGIN_EVENT_KIND) {
+        return false;
+    }
+
+    // The tags of a 22242, and nothing else: serde skips `content` without
+    // allocating it, so a no-PSRAM board never holds a second copy of it.
+    #[derive(Deserialize)]
+    struct KindAndTags {
+        kind: u64,
+        #[serde(default)]
+        tags: Vec<Vec<String>>,
+    }
+
+    match params.first() {
+        Some(Value::String(raw)) => match serde_json::from_str::<KindAndTags>(raw) {
+            Ok(event) => crate::policy::is_login_challenge(event.kind, &event.tags),
+            // A 22242 whose tags cannot be read is refused as a bad event by
+            // the handler; steer it the cautious way meanwhile.
+            Err(_) => true,
+        },
+        Some(Value::Object(object)) => {
+            // Borrow the tags in place: no clone of the event.
+            let tags: Vec<Vec<String>> = object
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(Value::as_array)
+                        .map(|tag| {
+                            tag.iter()
+                                .map(|part| part.as_str().unwrap_or_default().to_string())
+                                .collect()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::policy::is_login_challenge(crate::policy::LOGIN_EVENT_KIND, &tags)
+        }
+        _ => false,
     }
 }
 
@@ -2536,5 +2587,33 @@ mod tests {
         let expected: [u8; 32] = hasher.finalize().into();
 
         assert_eq!(compute_event_id(&event), expected);
+    }
+
+    #[test]
+    fn params_login_challenge_predicate() {
+        use serde_json::json;
+        let login = json!({"kind": 22242, "tags": [["challenge", "ab"], ["code", "4821"]], "content": "x", "created_at": 1});
+        let auth = json!({"kind": 22242, "tags": [["relay", "wss://r"]], "content": "", "created_at": 1});
+        let other = json!({"kind": 1, "tags": [["code", "4821"]], "content": "", "created_at": 1});
+        let malformed = json!({"kind": 22242, "tags": [["code", "1"], ["code", "2"]], "content": "", "created_at": 1});
+        // Object form and the stringified form clients usually send.
+        assert!(unsigned_event_is_login_challenge(&[login.clone()]));
+        assert!(unsigned_event_is_login_challenge(&[Value::String(login.to_string())]));
+        assert!(unsigned_event_is_login_challenge(&[malformed]));
+        assert!(!unsigned_event_is_login_challenge(&[auth]));
+        assert!(!unsigned_event_is_login_challenge(&[other]));
+        assert!(!unsigned_event_is_login_challenge(&[]));
+        assert!(!unsigned_event_is_login_challenge(&[Value::String("not json".into())]));
+        // A large event of another kind is rejected on the kind scan alone,
+        // and a large login challenge still classifies correctly.
+        let big = "x".repeat(200_000);
+        let large_note = json!({"kind": 1, "tags": [["code", "4821"]], "content": big, "created_at": 1});
+        assert!(!unsigned_event_is_login_challenge(&[Value::String(large_note.to_string())]));
+        let large_login = json!({"kind": 22242, "tags": [["code", "4821"]], "content": big, "created_at": 1});
+        assert!(unsigned_event_is_login_challenge(&[Value::String(large_login.to_string())]));
+        let large_auth = json!({"kind": 22242, "tags": [["relay", "wss://r"]], "content": big, "created_at": 1});
+        assert!(!unsigned_event_is_login_challenge(&[Value::String(large_auth.to_string())]));
+        // A 22242 with unreadable tags is steered cautiously.
+        assert!(unsigned_event_is_login_challenge(&[Value::String(r#"{"kind":22242,"tags":"x"}"#.into())]));
     }
 }

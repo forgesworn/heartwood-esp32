@@ -103,34 +103,14 @@ pub(crate) mod backend {
         Ok(out)
     }
 
-    /// RFC6979 ECDSA over a 32-byte digest, low-S, as `r || s || recovery id`.
-    /// The layout a LUD-25 `ck1` carries: whoever holds the signature recovers
-    /// the public key from it, which is how a mint finds the note it spends.
+    /// BIP-340 Schnorr over a 32-byte message with an all-zero `aux_rand`, so
+    /// the signature is a function of the key and the message alone. A LUD-25
+    /// `ck1` is one: the same key spending at the same mint always presents the
+    /// same credential, as the spec's vectors require.
     #[cfg(feature = "cash")]
-    pub fn sign_recoverable(secret: &[u8; 32], digest: &[u8; 32]) -> Result<[u8; 65], &'static str> {
-        let key = k256::ecdsa::SigningKey::from_bytes(&k256::FieldBytes::from(*secret))
-            .map_err(|_| "invalid secret key")?;
-        // k256 normalises s to the low half and flips the recovery id to
-        // match, which is what libsecp256k1 does on the firmware backend.
-        let (signature, recovery) =
-            key.sign_prehash_recoverable(digest).map_err(|_| "signing failed")?;
-        let mut out = [0u8; 65];
-        out[..64].copy_from_slice(&signature.to_bytes());
-        out[64] = recovery.to_byte();
-        Ok(out)
-    }
-
-    /// BIP-340 Schnorr over a 32-byte message with an all-zero `aux_rand`,
-    /// so the signature is a function of the key and the message alone. The
-    /// same contract as the Ledger backend's `sign_bip340`. LUD-25 asks for
-    /// exactly this of a `ck1`, so a note's spend comes back unchanged when
-    /// its key is re-derived from the seed.
-    #[cfg(feature = "cash")]
-    pub fn sign_bip340(secret: &[u8; 32], message: &[u8; 32]) -> Result<[u8; 64], &'static str> {
-        let key = k256::schnorr::SigningKey::from_bytes(secret).map_err(|_| "invalid secret key")?;
-        let signature = key
-            .sign_prehash_with_aux_rand(message, &[0u8; 32])
-            .map_err(|_| "signing failed")?;
+    pub fn sign_bip340_zero_aux(secret: &[u8; 32], message: &[u8; 32]) -> Result<[u8; 64], &'static str> {
+        let key = SigningKey::from_bytes(secret).map_err(|_| "invalid secret key")?;
+        let signature = key.sign_raw(message, &[0u8; 32]).map_err(|_| "signing failed")?;
         Ok(signature.to_bytes())
     }
 
@@ -199,28 +179,10 @@ pub(crate) mod backend {
         Ok(key.negate().secret_bytes())
     }
 
-    /// RFC6979 ECDSA, low-S, as `r || s || recovery id`. See the k256
-    /// backend's `sign_recoverable`.
+    /// BIP-340 Schnorr with an all-zero `aux_rand`. See the k256 backend's
+    /// `sign_bip340_zero_aux`.
     #[cfg(feature = "cash")]
-    pub fn sign_recoverable(secret: &[u8; 32], digest: &[u8; 32]) -> Result<[u8; 65], &'static str> {
-        use secp256k1::{Message, SecretKey};
-        let secp = Secp256k1::signing_only();
-        let key = SecretKey::from_slice(secret).map_err(|_| "invalid secret key")?;
-        let (recovery, compact) = secp
-            .sign_ecdsa_recoverable(&Message::from_digest(*digest), &key)
-            .serialize_compact();
-        let mut out = [0u8; 65];
-        out[..64].copy_from_slice(&compact);
-        out[64] = recovery.to_i32() as u8;
-        Ok(out)
-    }
-
-    /// BIP-340 with an all-zero `aux_rand`. See the k256 backend's
-    /// `sign_bip340`. The zeros are passed explicitly rather than as
-    /// `sign_schnorr_no_aux_rand`'s null, so the two backends are asked for
-    /// the same thing in so many words.
-    #[cfg(feature = "cash")]
-    pub fn sign_bip340(secret: &[u8; 32], message: &[u8; 32]) -> Result<[u8; 64], &'static str> {
+    pub fn sign_bip340_zero_aux(secret: &[u8; 32], message: &[u8; 32]) -> Result<[u8; 64], &'static str> {
         use secp256k1::Message;
         let secp = Secp256k1::signing_only();
         let keypair = Keypair::from_seckey_slice(&secp, secret).map_err(|_| "invalid secret key")?;

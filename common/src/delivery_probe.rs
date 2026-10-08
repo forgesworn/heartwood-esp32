@@ -234,8 +234,9 @@ impl SessionProbe {
     /// this session (a reconnect starts a fresh one) rather than counting a
     /// refusal as deafness. True when `nonce` was the outstanding probe.
     pub fn refused(&mut self, nonce: u32) -> bool {
-        if self.outstanding.is_none_or(|o| o.nonce != nonce) {
-            return false;
+        match self.outstanding {
+            Some(o) if o.nonce == nonce => {}
+            _ => return false,
         }
         self.outstanding = None;
         self.inert = true;

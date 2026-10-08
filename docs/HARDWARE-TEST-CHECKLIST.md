@@ -2951,6 +2951,20 @@ last_reason}` and the capability `relay_delivery_selfcheck_v1`.
    held across an outstanding probe never produces a miss.
 7. T-Display (no PSRAM): the heap log does not drift through the soak, and the
    largest block stays where it was before the soak began.
+8. A relay that refuses us is left alone. On the bench relay from 3, make it
+   answer the device's REQ with `["CLOSED","hw","rate-limited: slow down"]`
+   (or a `NOTICE` saying `banned: ...`). The log shows `relay refused us
+   (rate-limited) on <host>; leaving it 15 min` (60 min for `banned`), once;
+   the primary rotates to relay 1 and does not come back to the bench relay
+   until the cooldown ends, and no secondary is dialled to it meanwhile.
+   `net-config` shows `last_error_class: relay_refused`. An HTTP 429 on the
+   upgrade does the same at dial time.
+9. Every relay refusing: with the bench relay as the only relay, refusing
+   every connection, the primary still dials it, once a minute (`every relay
+   refused us recently; trying <host>`), never every 3 s. A refusal after the
+   socket opens never restarts the board; one at the upgrade (no session at
+   all) still takes the health watchdog's restart after 5 min, as any dead
+   relay list does.
 
 ## Notes
 

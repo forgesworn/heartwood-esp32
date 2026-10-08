@@ -72,6 +72,10 @@ pub mod held_reply;
 /// probe delivered back, or it is redialled.
 pub mod delivery_probe;
 
+/// Relays that refused the client (rate-limited, banned) are left alone for a
+/// while rather than redialled.
+pub mod relay_cooldown;
+
 pub mod wrap_ledger;
 
 pub mod rendezvous_receipts;

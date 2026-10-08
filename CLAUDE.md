@@ -228,6 +228,25 @@ selfcheck` crumb. All of it is `common/src/delivery_probe.rs`
 (`SessionProbe`, `SelfCheckLedger`), host-tested; relay.rs
 `delivery_selfcheck` is the glue.
 
+A relay that refuses this client is left alone (2026-10-08, checklist section
+35 items 8-9, NOT YET BENCH-RUN). relay.damus.io was found answering `banned:
+too many rate-limit violations` to the owner's home address on 2026-10-08;
+the cause is not known, but the loop used to answer every refusal by
+reconnecting (a `CLOSED` re-sent the connect-time REQ at once, catch-up
+included), which is what a violation counter punishes. `relay_cooldown::classify`
+reads the relay's own words (a `NOTICE`, a `CLOSED`, an `OK false`, or the
+upgrade's status line): `banned` cools the host 60 min, `rate-limited:`, the
+same in words, or an HTTP 429 cools it 15 min; `blocked:`, `restricted:` and
+`auth-required:` are about an event or an author and keep their old handling
+(an allowlisted relay's `OK false` still only makes the probe inert). The
+session drops with a `relay refused us` error (runtime class
+`relay_refused`; Sapwood has no label for it yet). A cooling host is never the
+secondary or a pinned dial, and the primary rotation passes it by; when every
+configured relay is cooling, the primary dials the one ending soonest, at most
+once a minute, because a board with no session takes the health watchdog's
+restart, which would forget every cooldown. RAM only; pure half
+`common/src/relay_cooldown.rs` (`RelayCooldowns::pick`), host-tested.
+
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =

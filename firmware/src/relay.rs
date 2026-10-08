@@ -58,6 +58,7 @@ use heartwood_common::delivery_probe::{
 };
 use heartwood_common::hex::{hex_decode, hex_encode};
 use heartwood_common::mgmt;
+use heartwood_common::relay_cooldown::{self, RelayCooldowns};
 use heartwood_common::net_config::{
     apply_remote_net_config_patch, network_activation_source_allowed,
     network_commit_source_allowed, NetConfig, NetworkConfigTransactionParams, NetworkRuntimeError,
@@ -191,6 +192,9 @@ const SIGN_AUDIT_REPORT_MAX: usize = 16;
 const MAX_SESSIONS: usize = 2;
 /// Backoff between reconnect attempts for the primary session (as before).
 const PRIMARY_BACKOFF: Duration = Duration::from_secs(3);
+/// When every configured relay has refused us and is cooling, the primary
+/// still dials (the soonest to end), but no more often than this.
+const COOLED_DIAL_SPACING: Duration = Duration::from_secs(60);
 /// Base backoff for pinned relays — slower than the primary, and doubling per
 /// consecutive failure up to PINNED_BACKOFF_MAX: each failed dial blocks the
 /// loop for up to the 10s TLS timeout, so a dead client relay must decay to a
@@ -427,6 +431,9 @@ struct SignCtx<'a, 'd, 'b> {
     /// Self-check redials since boot, and the escalation that follows when
     /// they stop helping. RAM only.
     selfcheck: SelfCheckLedger,
+    /// Relays that refused this client (rate-limited, banned), left alone
+    /// until their cooldown ends (`common::relay_cooldown`). RAM only.
+    relay_cooldowns: RelayCooldowns,
 }
 
 /// The delivery self-check's per-boot probe key (see
@@ -1045,7 +1052,9 @@ fn record_wifi_failure(
 /// Collapse detailed internal transport errors into the closed diagnostic
 /// vocabulary exposed over USB. Raw messages stay in local logs only.
 fn runtime_error_class(error: &str) -> NetworkRuntimeError {
-    if error.contains("silent") {
+    if error.starts_with(REFUSED_PREFIX) {
+        NetworkRuntimeError::RelayRefused
+    } else if error.contains("silent") {
         NetworkRuntimeError::RelaySilent
     } else if error.starts_with("ws handshake")
         || error.starts_with("ws upgrade")
@@ -1059,6 +1068,41 @@ fn runtime_error_class(error: &str) -> NetworkRuntimeError {
         NetworkRuntimeError::RelayProtocol
     } else {
         NetworkRuntimeError::RelayTransport
+    }
+}
+
+/// Every session error that comes from a relay refusing this client starts
+/// with this, so `runtime_error_class` can name it.
+const REFUSED_PREFIX: &str = "relay refused us";
+
+/// A relay refused this client (`relay_cooldown::classify` on its own words):
+/// cool its host and hand back the error that drops the session, so the loop
+/// rotates or backs off instead of reconnecting into the same refusal.
+fn refused(host: &str, refusal: relay_cooldown::Refusal, ctx: &mut SignCtx) -> String {
+    ctx.relay_cooldowns.cool(host, refusal, uptime_ms());
+    format!(
+        "{REFUSED_PREFIX} ({}) on {host}; leaving it {} min",
+        refusal.label(),
+        refusal.cooldown_ms() / 60_000
+    )
+}
+
+/// The human-readable part of a NOTICE, CLOSED or OK frame: its last string
+/// element. These frames are small, so a Value tree is fine here.
+fn relay_message_text(raw: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.as_array().and_then(|a| a.last()).and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// A dial that failed because the relay refused us at the upgrade (an HTTP
+/// 429): cool it like any other refusal. Other dial failures are left to the
+/// ordinary backoff.
+fn note_dial_refusal(url: &str, error: &str, ctx: &mut SignCtx) {
+    if let Some(refusal) = relay_cooldown::classify(error) {
+        let note = refused(relay_host(url), refusal, ctx);
+        log::warn!("[relay] {note}");
     }
 }
 
@@ -1446,6 +1490,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         probe_key: ProbeKey::generate(secp),
         probe_seq: 0,
         selfcheck: SelfCheckLedger::new(),
+        relay_cooldowns: RelayCooldowns::new(),
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -1463,6 +1508,8 @@ pub fn run_wifi_standalone<'d, 'b>(
     // management commands can dial new sessions (see RelayPool).
     let mut sessions: Vec<RelaySession> = Vec::new();
     let mut primary_next = Instant::now();
+    // When the primary last dialled a relay still cooling (every one was).
+    let mut last_cooled_dial: Option<Instant> = None;
     // The second configured relay (#92): which one to try next, when, and how
     // many dials in a row have failed (drives the same backoff as a pinned
     // relay). It starts one past the primary and never duplicates a live one.
@@ -1742,12 +1789,34 @@ pub fn run_wifi_standalone<'d, 'b>(
                     esp_idf_svc::sys::MALLOC_CAP_8BIT,
                 )
             };
-            if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
+            // Pass by a relay that refused us. When every one is cooling, dial
+            // the one whose cooldown ends soonest rather than none (no session
+            // at all is the relay-health watchdog's restart, which forgets
+            // every cooldown), but only once per COOLED_DIAL_SPACING.
+            let hosts: Vec<&str> = relays.iter().map(|r| relay_host(r)).collect();
+            let pick = ctx.relay_cooldowns.pick(&hosts, relay_idx % relays.len(), uptime_ms());
+            drop(hosts);
+            let all_cooling = pick.is_some_and(|p| p.all_cooling);
+            if let Some(p) = pick {
+                relay_idx = p.index;
+            }
+            let cooled_wait = all_cooling
+                && last_cooled_dial.is_some_and(|t: Instant| t.elapsed() < COOLED_DIAL_SPACING);
+            if cooled_wait {
+                primary_next = last_cooled_dial.map_or_else(Instant::now, |t| t + COOLED_DIAL_SPACING);
+            } else if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
                 log::warn!(
                     "[relay] heap too tight to dial (free {free} B, largest {largest} B); retry in 3s"
                 );
                 primary_next = Instant::now() + PRIMARY_BACKOFF;
             } else {
+                if all_cooling {
+                    last_cooled_dial = Some(Instant::now());
+                    log::warn!(
+                        "[relay] every relay refused us recently; trying {} (its cooldown ends soonest)",
+                        relay_host(&relays[relay_idx % relays.len()])
+                    );
+                }
                 let previous_error = ctx.network_runtime.last_error_class;
                 set_network_runtime(
                     &mut ctx,
@@ -1784,6 +1853,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                         );
                     }
                     Err(e) => {
+                        note_dial_refusal(&url, &e, &mut ctx);
                         log::error!("[relay] {e}; failing over in 3s");
                         let error_class = runtime_error_class(&e);
                         set_network_runtime(
@@ -1831,6 +1901,11 @@ pub fn run_wifi_standalone<'d, 'b>(
             {
                 continue;
             }
+            let cooling_ms = ctx.relay_cooldowns.remaining_ms(relay_host(&p.url), uptime_ms());
+            if cooling_ms > 0 {
+                p.next_attempt = Instant::now() + Duration::from_millis(cooling_ms);
+                continue;
+            }
             // Same heap guard as the pairing-time dial: never let an automatic
             // reconnect abort the chip on a tight heap. Counts as a failure so
             // the backoff still decays a persistently tight board to rare probes.
@@ -1859,6 +1934,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                     retune_recv_timeouts(&mut sessions);
                 }
                 Err(e) => {
+                    note_dial_refusal(&p.url, &e, &mut ctx);
                     p.fails = p.fails.saturating_add(1);
                     let delay = (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
                     log::warn!(
@@ -1892,9 +1968,15 @@ pub fn run_wifi_standalone<'d, 'b>(
                     esp_idf_svc::sys::MALLOC_CAP_8BIT,
                 )
             };
+            // Never a cooling relay: the secondary is only redundancy, and the
+            // primary already guarantees the board something to listen on.
+            let now_ms = uptime_ms();
             let candidate = (0..relays.len())
                 .map(|k| (secondary_idx.wrapping_add(k)) % relays.len())
-                .find(|&k| !sessions.iter().any(|s| same_relay(&s.url, &relays[k])));
+                .find(|&k| {
+                    !sessions.iter().any(|s| same_relay(&s.url, &relays[k]))
+                        && !ctx.relay_cooldowns.cooling(relay_host(&relays[k]), now_ms)
+                });
             if free < SECONDARY_MIN_FREE_HEAP || largest < SECONDARY_MIN_LARGEST_BLOCK {
                 // Not a failure: the board simply cannot spare it now.
                 secondary_next = Instant::now() + PINNED_BACKOFF_MAX;
@@ -1915,6 +1997,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                         ctx.network_runtime.secondary_index = u8::try_from(k).ok();
                     }
                     Err(e) => {
+                        note_dial_refusal(&url, &e, &mut ctx);
                         secondary_fails = secondary_fails.saturating_add(1);
                         let delay = (PINNED_BACKOFF * (1u32 << secondary_fails.min(6))).min(PINNED_BACKOFF_MAX);
                         log::warn!("[relay] secondary {}: {e}; retry in {}s", relay_host(&url), delay.as_secs());
@@ -4500,14 +4583,35 @@ fn handle_relay_msg(
                 NetworkRuntimeError::None,
             );
             log::info!("[relay] OK: {}", snippet(raw, 120));
+            // A publish refused because the relay is limiting us is not the
+            // probe's allowlist case (`probe_ok` makes the self-check inert
+            // for that): leave the relay alone for a while instead.
+            let refusal = serde_json::from_slice::<serde_json::Value>(raw).ok().and_then(|v| {
+                (v.get(2).and_then(|b| b.as_bool()) == Some(false))
+                    .then(|| v.get(3).and_then(|m| m.as_str()).and_then(relay_cooldown::classify))
+                    .flatten()
+            });
+            if let Some(refusal) = refusal {
+                return Err(refused(relay_host(&s.url), refusal, ctx));
+            }
             probe_ok(s, raw);
         }
-        "NOTICE" => log::warn!("[relay] NOTICE: {}", snippet(raw, 160)),
+        "NOTICE" => {
+            log::warn!("[relay] NOTICE: {}", snippet(raw, 160));
+            if let Some(refusal) = relay_cooldown::classify(&relay_message_text(raw)) {
+                return Err(refused(relay_host(&s.url), refusal, ctx));
+            }
+        }
         // The relay closed our subscription (limit, error, policy). The WS stays
         // open so silence-detection won't fire — propagate so we reconnect and
-        // re-subscribe cleanly rather than sit with a dead subscription.
+        // re-subscribe cleanly rather than sit with a dead subscription. Unless
+        // it closed it because it is limiting us: reconnecting at once and
+        // re-sending the connect-time REQ is what a violation counter punishes.
         "CLOSED" => {
             log::warn!("[relay] CLOSED: {}; reconnecting", snippet(raw, 160));
+            if let Some(refusal) = relay_cooldown::classify(&relay_message_text(raw)) {
+                return Err(refused(relay_host(&s.url), refusal, ctx));
+            }
             return Err("relay closed our subscription".into());
         }
         _ => {}

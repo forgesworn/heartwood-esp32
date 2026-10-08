@@ -13,7 +13,11 @@
 //! So every few minutes each live session publishes a probe that its own
 //! subscription must deliver back: a kind-24133 event (the very filter that
 //! carries NIP-46 requests), authored by a per-boot ephemeral key and p-tagged
-//! to a served identity. A probe published on session S has to come back on
+//! to that same key, which [`nip46_p_values`] adds to the `#p` list of the
+//! live kind-24133 filter. It therefore travels through exactly the
+//! subscription that carries requests, yet is addressed to nobody else: no
+//! other signer serving the same identities ever receives it. A probe
+//! published on session S has to come back on
 //! session S, because S is what is being proven. Two probes in a row not seen
 //! within [`PROBE_WAIT_MS`] each drop the session, and the loop's ordinary
 //! reconnect and rotation path redials it.
@@ -384,11 +388,29 @@ impl SelfCheckLedger {
     }
 }
 
-/// The probe's tags: the `p` tag naming the served identity whose `#p`
-/// filter it must travel through, and the nonce.
-pub fn probe_tags(p_hex: &str, nonce: u32) -> Vec<Vec<String>> {
+/// The `#p` values of the live kind-24133 filter: every served identity, in
+/// the order given, then the probe key, so the probe is delivered through
+/// that same filter object. Values are bare lowercase hex; the caller quotes
+/// them. A served identity equal to the probe key (it cannot be, the key is
+/// fresh per boot, but nothing here relies on it) is not listed twice.
+pub fn nip46_p_values(served: &[String], probe_pk_hex: &str) -> Vec<String> {
+    let mut values: Vec<String> = Vec::with_capacity(served.len() + 1);
+    for pk in served {
+        if !values.iter().any(|v| v == pk) {
+            values.push(pk.clone());
+        }
+    }
+    if !values.iter().any(|v| v == probe_pk_hex) {
+        values.push(probe_pk_hex.to_string());
+    }
+    values
+}
+
+/// The probe's tags: the `p` tag naming the probe key itself (so no served
+/// identity, and so no other signer of it, is ever addressed), and the nonce.
+pub fn probe_tags(probe_pk_hex: &str, nonce: u32) -> Vec<Vec<String>> {
     alloc::vec![
-        alloc::vec!["p".to_string(), p_hex.to_string()],
+        alloc::vec!["p".to_string(), probe_pk_hex.to_string()],
         alloc::vec![PROBE_TAG.to_string(), format!("{nonce}")],
     ]
 }
@@ -399,6 +421,22 @@ pub fn probe_nonce(tags: &[Vec<String>]) -> Option<u32> {
     tags.iter()
         .find(|t| t.len() >= 2 && t[0] == PROBE_TAG)
         .and_then(|t| t[1].parse::<u32>().ok())
+}
+
+/// The nonce of one of our probes: authored by the probe key, p-tagged to the
+/// probe key, with a well-formed nonce tag. `None` for anything else. (The
+/// caller has already verified the event's signature.)
+pub fn our_probe_nonce(author_hex: &str, tags: &[Vec<String>], probe_pk_hex: &str) -> Option<u32> {
+    if author_hex != probe_pk_hex {
+        return None;
+    }
+    let addressed_to_probe = tags
+        .iter()
+        .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == probe_pk_hex);
+    if !addressed_to_probe {
+        return None;
+    }
+    probe_nonce(tags)
 }
 
 /// One line describing a self-check redial: the full form goes to the log and
@@ -744,6 +782,38 @@ mod tests {
         }
         assert!(l.proven.len() <= LEDGER_RELAYS_MAX);
         assert!(l.unproven_redialled.len() <= LEDGER_RELAYS_MAX);
+    }
+
+    #[test]
+    fn the_probe_key_joins_the_nip46_filter_after_every_served_identity() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let probe = "cc".repeat(32);
+        let values = nip46_p_values(&[a.clone(), b.clone()], &probe);
+        assert_eq!(values, alloc::vec![a.clone(), b.clone(), probe.clone()]);
+        // No served identity yet: the probe key alone keeps the filter live.
+        assert_eq!(nip46_p_values(&[], &probe), alloc::vec![probe.clone()]);
+        // Never listed twice.
+        let values = nip46_p_values(&[a.clone(), probe.clone(), a.clone()], &probe);
+        assert_eq!(values, alloc::vec![a, probe]);
+    }
+
+    #[test]
+    fn a_probe_is_ours_only_by_our_author_and_addressed_to_our_key() {
+        let probe = "cc".repeat(32);
+        let master = "aa".repeat(32);
+        let tags = probe_tags(&probe, 42);
+        assert_eq!(tags[0], alloc::vec!["p".to_string(), probe.clone()]);
+        assert_eq!(our_probe_nonce(&probe, &tags, &probe), Some(42));
+        // Someone else's key, however tagged.
+        assert_eq!(our_probe_nonce(&master, &tags, &probe), None);
+        // Our key, but addressed to a served identity (a client request
+        // shape): not a probe.
+        let to_master = probe_tags(&master, 42);
+        assert_eq!(our_probe_nonce(&probe, &to_master, &probe), None);
+        // No nonce.
+        let bare = alloc::vec![alloc::vec!["p".to_string(), probe.clone()]];
+        assert_eq!(our_probe_nonce(&probe, &bare, &probe), None);
     }
 
     #[test]

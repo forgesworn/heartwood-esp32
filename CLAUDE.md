@@ -203,9 +203,15 @@ answered on any relay until a power cycle, because pongs and the EOSE each
 re-REQ provokes keep `last_rx` fresh on a session whose EVENTs have stopped.
 Each live session now publishes a probe its own subscription must deliver
 back: kind 24133, authored by a per-boot RAM-only key (relay.rs `ProbeKey`,
-zeroised on drop), p-tagged to the first master, with a `hwprobe` nonce tag,
-recognised by author in `process_event` before the dedupe, the dispatch, the
-panel wake and the reply clock. First 30 s after the subscription, then every
+zeroised on drop) and p-tagged to that same key, which `build_sub_req` adds
+to the `#p` list of the live 24133 filter (`delivery_probe::nip46_p_values`,
+so the connect, keepalive and persona re-subscribe REQs all carry it; the
+locked-boot and catch-up REQs do not), with a `hwprobe` nonce tag. So it
+proves the very filter that carries requests while addressing no served
+identity: another signer of the same master (a Pi heartwoodd) never sees it.
+Recognised in `process_event` (author and `p` both the probe key,
+`delivery_probe::our_probe_nonce`) before the dedupe, the dispatch, the panel
+wake and the reply clock. First 30 s after the subscription, then every
 3 min; 20 s to come back; two misses in a row drop the session through the
 ordinary reconnect path (primary rotates, secondary/pinned back off), logged
 at warn with a crumb and `get_status.delivery_selfcheck` `{redials, streak,

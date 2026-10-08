@@ -2889,8 +2889,10 @@ have stopped reaching the handler.
 
 Each live session now publishes a probe that its own subscription must
 deliver back (`common/src/delivery_probe.rs`): kind 24133 (the NIP-46
-filter), authored by a per-boot ephemeral key, p-tagged to the first master,
-with a `["hwprobe", "<nonce>"]` tag. The first goes out 30 s after the
+filter), authored by a per-boot ephemeral key and p-tagged to that same key,
+which the live REQ adds to the 24133 filter's `#p` list, with a
+`["hwprobe", "<nonce>"]` tag. No served identity is addressed, so another
+signer of the same master never receives one. The first goes out 30 s after the
 subscription, then every 3 min. A probe not back within 20 s is a miss
 (`delivery self-check: probe not delivered back` at warn), and the next one
 goes out 30 s later; two misses in a row drop the session (`delivery
@@ -2920,7 +2922,8 @@ last_reason}` and the capability `relay_delivery_selfcheck_v1`.
    at `redials: 0`, `streak: 0`, `last_reason: null`, and the capability.
 2. Nothing user-visible: through the soak the panel blanks on time and stays
    blank (a probe never wakes it), the sign audit has no probe in it, and no
-   card ever appears for one.
+   card ever appears for one. A Pi heartwoodd (or any other signer) serving
+   the same master logs nothing for the probes.
 3. A forced deaf session. Run a throwaway relay you control behind TLS, as
    section 16's failover record did at `wss://relaybench.forgesworn.dev`,
    patched in as relay 0 with `scripts/net-relays.mjs`, built to stop

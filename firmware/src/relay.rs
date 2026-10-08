@@ -2254,9 +2254,23 @@ fn build_sub_req(ctx: &SignCtx, catch_up: bool) -> String {
         .map(|m| quoted(&m.pubkey))
         .collect::<Vec<_>>();
     let master_p_list = master_p.join(",");
-    let mut nip46_p = master_p.clone();
-    nip46_p.extend(ctx.personas.iter().map(|p| quoted(&p.pubkey)));
-    let nip46_p_list = nip46_p.join(",");
+    // Served identities, then the delivery self-check's probe key: the probe
+    // is p-tagged to that key, so it comes back through this very filter
+    // object without ever being addressed to an identity that another signer
+    // of it (a Pi heartwoodd on the same master) also serves. Every REQ the
+    // loop sends ("hw" at connect, the keepalive copy, the persona
+    // re-subscribe) is built here, so the key is never dropped.
+    let served: Vec<String> = ctx
+        .masters
+        .iter()
+        .map(|m| hex_encode(&m.pubkey))
+        .chain(ctx.personas.iter().map(|p| hex_encode(&p.pubkey)))
+        .collect();
+    let nip46_p_list = delivery_probe::nip46_p_values(&served, &ctx.probe_key.pk_hex)
+        .iter()
+        .map(|pk| format!("\"{pk}\""))
+        .collect::<Vec<_>>()
+        .join(",");
     let profile_filter = format!(r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":1}}"##);
     // Bearer notes gift-wrapped to a master npub. A wrap is a stored event
     // and nobody but this device can open one sealed to its key, so the
@@ -3653,15 +3667,11 @@ fn delivery_selfcheck(s: &mut RelaySession, ctx: &mut SignCtx) -> Result<(), Str
 }
 
 /// Publish one delivery probe on `s`: kind 24133, authored by the per-boot
-/// probe key, p-tagged to the first master (always in the live `#p`
-/// filter), with a nonce tag. Skipped, never counted as a miss, when there
-/// is no identity to address, no wall clock to stamp it with (relays reject
-/// an ephemeral event dated 1970), or a heap below the publish guard.
+/// probe key and p-tagged to that same key (which `build_sub_req` puts in the
+/// live 24133 filter's `#p` list), with a nonce tag. Skipped, never counted
+/// as a miss, when there is no wall clock to stamp it with (relays reject an
+/// ephemeral event dated 1970) or a heap below the publish guard.
 fn send_probe(s: &mut RelaySession, ctx: &mut SignCtx, now_ms: u64) -> Result<(), String> {
-    let Some(master) = ctx.masters.first() else {
-        s.probe.skipped(now_ms);
-        return Ok(());
-    };
     let mut created_at = wall_clock_estimate();
     if created_at == 0 {
         created_at = s
@@ -3680,7 +3690,7 @@ fn send_probe(s: &mut RelaySession, ctx: &mut SignCtx, now_ms: u64) -> Result<()
         pubkey: ctx.probe_key.pk_hex.clone(),
         created_at,
         kind: NIP46_KIND,
-        tags: delivery_probe::probe_tags(&hex_encode(&master.pubkey), nonce),
+        tags: delivery_probe::probe_tags(&ctx.probe_key.pk_hex, nonce),
         content: delivery_probe::PROBE_CONTENT.to_string(),
     };
     let event_id = nip46::compute_event_id(&unsigned);
@@ -3711,7 +3721,7 @@ fn send_probe(s: &mut RelaySession, ctx: &mut SignCtx, now_ms: u64) -> Result<()
 /// A probe of ours arrived on `s`. It counts only if it is the one this
 /// session published (a probe published on S must be seen on S).
 fn probe_delivered(s: &mut RelaySession, ev: &SignedEvent, ctx: &mut SignCtx) {
-    let Some(nonce) = delivery_probe::probe_nonce(&ev.tags) else {
+    let Some(nonce) = delivery_probe::our_probe_nonce(&ev.pubkey, &ev.tags, &ctx.probe_key.pk_hex) else {
         return;
     };
     if s.probe.delivered(nonce, uptime_ms()) {
@@ -4585,7 +4595,9 @@ fn process_event(
     // The delivery self-check's own probe, recognised by its per-boot author
     // before anything else: it is never dispatched, never deduped against
     // client traffic, never wakes the panel or counts as activity, and its
-    // timestamp (our own estimate) never feeds the reply clock.
+    // timestamp (our own estimate) never feeds the reply clock. Anything the
+    // probe key authored is swallowed here; it counts as a delivery only when
+    // it is also p-tagged to the probe key (`our_probe_nonce`).
     if ev.kind == NIP46_KIND && ev.pubkey == ctx.probe_key.pk_hex {
         probe_delivered(s, &ev, ctx);
         return Ok(());

@@ -2875,6 +2875,80 @@ take the `cx1` on file from the mint (moneyer: `zap_names.cx1`) or from
    available on this surface"), as `cash_address` does.
 9. Unbound client: `unauthorised`, like every other note method.
 
+## 35. The relay loop proves delivery, not liveness (added 2026-10-08, NOT YET BENCH-RUN)
+
+Field failure, 2026-10-07, T-Display on v0.18.0-beta.25 in WiFi mode: the
+network page said online and the button worked, but an unpaired client's
+`ping` (normally `pong` in about 0.7 s, no press) went unanswered on all four
+configured relays, probed from two networks. The relay-health watchdog never
+fired, so a session existed and the heap was fine. A power cycle cured it;
+there are no logs from the stall. The keepalive (ping every 20 s, re-REQ every
+40 s, 50 s silence limit) proves the socket, not the subscription: pongs and
+the EOSE each re-REQ provokes keep `last_rx` fresh on a session whose EVENTs
+have stopped reaching the handler.
+
+Each live session now publishes a probe that its own subscription must
+deliver back (`common/src/delivery_probe.rs`): kind 24133 (the NIP-46
+filter), authored by a per-boot ephemeral key, p-tagged to the first master,
+with a `["hwprobe", "<nonce>"]` tag. The first goes out 30 s after the
+subscription, then every 3 min. A probe not back within 20 s is a miss
+(`delivery self-check: probe not delivered back` at warn), and the next one
+goes out 30 s later; two misses in a row drop the session (`delivery
+self-check failed (selfcheck <host> r<index> d<s since delivered> rx<last_rx
+age> q<re-REQs> h<free>k/<largest>k)`) and the ordinary reconnect path redials
+it, rotating the primary. Nothing is sent or judged while a card is open, an
+OTA runs or a network trial runs, and a wait that spans a blocked loop is
+restarted, not counted. A relay that answers the probe `OK false` turns the
+check off for that session; a relay that has never delivered a probe this boot
+gets one redial for it and is then left alone (it may not echo events to
+their publisher). Three self-check redials in a row with no probe delivered
+on any session in between, at least one of them on a relay that has delivered
+this boot, take the relay-health watchdog's controlled restart, crumb `relay
+watchdog: selfcheck x3 ...`, which `get_status.crashed_during` reports after
+the reboot. `get_status` carries `delivery_selfcheck: {redials, streak,
+last_reason}` and the capability `relay_delivery_selfcheck_v1`.
+
+1. Idle soak. Flash, unlock, leave the board idle on its usual relays with the
+   serial tap running (`scripts/serial-log.mjs`). From another machine, run an
+   unpaired ping once a minute, each to ONE relay in turn, for at least two
+   hours:
+   `node scripts/nip46-client.mjs --target <master hex> --client-key-file
+   /tmp/soak.key --method ping --relay wss://<relay> --timeout 10000`.
+   Every ping is answered. The log shows `delivery probe N back on <host>`
+   about every 3 min per live session and no `delivery self-check` warning.
+   `scripts/mgmt-request.mjs --method get_status` shows `delivery_selfcheck`
+   at `redials: 0`, `streak: 0`, `last_reason: null`, and the capability.
+2. Nothing user-visible: through the soak the panel blanks on time and stays
+   blank (a probe never wakes it), the sign audit has no probe in it, and no
+   card ever appears for one.
+3. A forced deaf session. Run a throwaway relay you control behind TLS, as
+   section 16's failover record did at `wss://relaybench.forgesworn.dev`,
+   patched in as relay 0 with `scripts/net-relays.mjs`, built to stop
+   delivering EVENTs to existing subscriptions on a signal (SIGUSR1, say)
+   while it keeps answering pings, REQs (with EOSE) and `OK` for publishes.
+   That is the 2026-10-07 state. Once the device is online on it and its
+   probes are coming back, send the signal. Within about 4 min the log shows
+   two misses then `delivery self-check failed (selfcheck <bench host> r0 ...)`,
+   the primary rotates to relay 1 (`net-config` `relay_index` 1), a ping on
+   relay 1 is answered, and `get_status` shows `redials: 1` with that reason.
+   Do not use a router block or a killed relay process instead: both end the
+   socket, which is the silence limit's case, not this one.
+4. Escalation (needs the bench relay in 3 to drop every subscription, and the
+   other relays removed from the list so rotation only finds it): three
+   self-check redials in a row and the board restarts, logging
+   `restarting, as the relay-health watchdog does`; after the reboot
+   `get_status.crashed_during` reads `relay watchdog: selfcheck x3 ...` and
+   `last_reset` is `software-restart`.
+5. Refusal: patch in a relay that refuses unknown authors (`OK false`, an
+   allowlisted or paid relay). The log shows `refused the delivery probe;
+   self-check off for this session` once per connection and the session is
+   never redialled for it.
+6. Suppression: with an approval card on screen past a probe's due time, no
+   probe goes out until the card resolves; a cable enrol card (about 55 s)
+   held across an outstanding probe never produces a miss.
+7. T-Display (no PSRAM): the heap log does not drift through the soak, and the
+   largest block stays where it was before the soak began.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

@@ -53,6 +53,9 @@ use zeroize::Zeroize;
 use heartwood_common::deadline::{
     deadline_io_action, retryable_tls_io_code, DeadlineIoAction, NonblockingIoEvent,
 };
+use heartwood_common::delivery_probe::{
+    self, MissAction, SelfCheckLedger, SessionProbe, Suppress, Tick,
+};
 use heartwood_common::hex::{hex_decode, hex_encode};
 use heartwood_common::mgmt;
 use heartwood_common::net_config::{
@@ -416,6 +419,49 @@ struct SignCtx<'a, 'd, 'b> {
     /// A card's result screen that must stay up before anything replaces it
     /// (an enrolment's check code, or the record to revoke). RAM only.
     card_screen_hold: Option<ScreenHold>,
+    /// The per-boot key the delivery self-check signs its probes with, so a
+    /// probe is recognised by its author before anything else looks at it.
+    probe_key: ProbeKey,
+    /// Nonce of the last probe published, on any session.
+    probe_seq: u32,
+    /// Self-check redials since boot, and the escalation that follows when
+    /// they stop helping. RAM only.
+    selfcheck: SelfCheckLedger,
+}
+
+/// The delivery self-check's per-boot probe key (see
+/// `heartwood_common::delivery_probe`). It authors nothing but probes, so it
+/// is not an identity and never leaves RAM.
+struct ProbeKey {
+    sk: [u8; 32],
+    pk_hex: String,
+}
+
+impl ProbeKey {
+    fn generate(secp: &Secp256k1<SignOnly>) -> Self {
+        let mut sk = [0u8; 32];
+        let pk = loop {
+            crate::fill_random(&mut sk);
+            if let Ok(kp) = Keypair::from_seckey_slice(secp, &sk) {
+                break kp.x_only_public_key().0.serialize();
+            }
+        };
+        ProbeKey {
+            sk,
+            pk_hex: hex_encode(&pk),
+        }
+    }
+}
+
+impl Drop for ProbeKey {
+    fn drop(&mut self) {
+        self.sk.zeroize();
+    }
+}
+
+/// Uptime in milliseconds, the delivery self-check's clock.
+fn uptime_ms() -> u64 {
+    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000) as u64
 }
 
 /// Timestamp for a reply to a request that arrived `held` ago.
@@ -1063,6 +1109,14 @@ struct RelaySession {
     /// an over-cap frame is skipped rather than killing the session, and it may
     /// span several reads, so the remainder is carried here between pump passes.
     skip: usize,
+    /// Keepalive re-REQs sent on this session (evidence for a self-check
+    /// redial: a deaf session had been re-subscribed this many times).
+    resubs: u32,
+    /// The delivery self-check: probes this session published and must see
+    /// delivered back (`heartwood_common::delivery_probe`). Fresh per connect.
+    probe: SessionProbe,
+    /// Event id of the probe in flight, to match the relay's `OK` for it.
+    probe_id: Option<String>,
 }
 
 /// A relay joined at nostrconnect pairing because the client dictated it.
@@ -1389,6 +1443,9 @@ pub fn run_wifi_standalone<'d, 'b>(
         button_cards: Vec::new(),
         held_replies: heartwood_common::held_reply::HeldReplies::new(),
         card_screen_hold: None,
+        probe_key: ProbeKey::generate(secp),
+        probe_seq: 0,
+        selfcheck: SelfCheckLedger::new(),
     };
 
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
@@ -1628,8 +1685,12 @@ pub fn run_wifi_standalone<'d, 'b>(
             // enrol card's liveness) is left alone, and so is last_ping, so a
             // ping goes out on the next idle tick and finds out.
             let now = Instant::now();
+            let now_ms = uptime_ms();
             for s in sessions.iter_mut() {
                 s.silence_from = now;
+                // Same credit for a delivery probe in flight: it could not
+                // have been read while the card held the loop.
+                s.probe.credit(now_ms);
             }
         }
 
@@ -2415,6 +2476,9 @@ fn connect_relay_raw(
         pinned,
         secondary: false,
         skip: 0,
+        resubs: 0,
+        probe: SessionProbe::new(uptime_ms()),
+        probe_id: None,
     })
 }
 
@@ -3541,8 +3605,14 @@ fn session_step(
         if now.duration_since(s.last_resub) >= RESUB_INTERVAL {
             ws_send(&mut s.tls, OP_TEXT, s.sub_req.as_bytes())?;
             s.last_resub = now;
+            s.resubs = s.resubs.saturating_add(1);
             log::debug!("[relay] re-subscribed on {} (keepalive)", s.url);
         }
+        // Delivery self-check: the ping and the re-REQ above prove the socket,
+        // not the subscription (pongs and EOSEs keep last_rx fresh on a deaf
+        // session). Judged here, on an idle tick with the socket drained, so
+        // a probe still sitting unread in the buffer is never a miss.
+        delivery_selfcheck(s, ctx)?;
         if now.duration_since(s.last_rx.max(s.silence_from)) >= SILENCE_LIMIT {
             return Err(format!(
                 "relay {} silent (no data/pong); reconnecting",
@@ -3551,6 +3621,192 @@ fn session_step(
         }
     }
     Ok(())
+}
+
+/// One idle tick of a session's delivery self-check (see
+/// `heartwood_common::delivery_probe`): send a probe when one is due, count a
+/// probe that never came back, and drop the session when two in a row have
+/// not. An `Err` takes the ordinary reconnect path for the kind of session
+/// this is: the primary rotates, a secondary or pinned relay backs off.
+fn delivery_selfcheck(s: &mut RelaySession, ctx: &mut SignCtx) -> Result<(), String> {
+    let now_ms = uptime_ms();
+    let suppress = Suppress {
+        card: approval_card_open(ctx),
+        ota: ctx.ota_session.is_some(),
+        trial: ctx.network_trial_id.is_some(),
+    };
+    match s.probe.tick(now_ms, suppress) {
+        Tick::Idle => Ok(()),
+        Tick::Send => send_probe(s, ctx, now_ms),
+        Tick::Missed { misses } => {
+            s.probe_id = None;
+            log::warn!(
+                "[relay] delivery self-check: probe not delivered back on {} within {}s ({misses} of {} before a redial)",
+                relay_host(&s.url),
+                delivery_probe::PROBE_WAIT_MS / 1_000,
+                delivery_probe::MISS_LIMIT
+            );
+            Ok(())
+        }
+        Tick::Redial => selfcheck_redial(s, ctx, now_ms),
+    }
+}
+
+/// Publish one delivery probe on `s`: kind 24133, authored by the per-boot
+/// probe key, p-tagged to the first master (always in the live `#p`
+/// filter), with a nonce tag. Skipped, never counted as a miss, when there
+/// is no identity to address, no wall clock to stamp it with (relays reject
+/// an ephemeral event dated 1970), or a heap below the publish guard.
+fn send_probe(s: &mut RelaySession, ctx: &mut SignCtx, now_ms: u64) -> Result<(), String> {
+    let Some(master) = ctx.masters.first() else {
+        s.probe.skipped(now_ms);
+        return Ok(());
+    };
+    let mut created_at = wall_clock_estimate();
+    if created_at == 0 {
+        created_at = s
+            .server_time
+            .map(|t| t + now_ms.saturating_sub(s.probe.connected_ms()) / 1_000)
+            .unwrap_or(0);
+    }
+    if created_at == 0 || !response_transportable(delivery_probe::PROBE_CONTENT.len()) {
+        log::debug!("[relay] delivery probe deferred on {} (no clock or heap tight)", s.url);
+        s.probe.skipped(now_ms);
+        return Ok(());
+    }
+    ctx.probe_seq = ctx.probe_seq.wrapping_add(1);
+    let nonce = ctx.probe_seq;
+    let unsigned = UnsignedEvent {
+        pubkey: ctx.probe_key.pk_hex.clone(),
+        created_at,
+        kind: NIP46_KIND,
+        tags: delivery_probe::probe_tags(&hex_encode(&master.pubkey), nonce),
+        content: delivery_probe::PROBE_CONTENT.to_string(),
+    };
+    let event_id = nip46::compute_event_id(&unsigned);
+    let sig = match sign::sign_hash(ctx.secp, &ctx.probe_key.sk, &event_id) {
+        Ok(sig) => sig,
+        Err(e) => {
+            log::warn!("[relay] delivery probe not signed ({e}); deferred");
+            s.probe.skipped(now_ms);
+            return Ok(());
+        }
+    };
+    let signed = SignedEvent {
+        id: hex_encode(&event_id),
+        pubkey: unsigned.pubkey,
+        created_at: unsigned.created_at,
+        kind: unsigned.kind,
+        tags: unsigned.tags,
+        content: unsigned.content,
+        sig: hex_encode(&sig),
+    };
+    ws_send_event(&mut s.tls, &signed)?;
+    s.probe.sent(nonce, now_ms);
+    log::debug!("[relay] delivery probe {nonce} out on {}", relay_host(&s.url));
+    s.probe_id = Some(signed.id);
+    Ok(())
+}
+
+/// A probe of ours arrived on `s`. It counts only if it is the one this
+/// session published (a probe published on S must be seen on S).
+fn probe_delivered(s: &mut RelaySession, ev: &SignedEvent, ctx: &mut SignCtx) {
+    let Some(nonce) = delivery_probe::probe_nonce(&ev.tags) else {
+        return;
+    };
+    if s.probe.delivered(nonce, uptime_ms()) {
+        s.probe_id = None;
+        ctx.selfcheck.delivered(relay_host(&s.url));
+        log::info!("[relay] delivery probe {nonce} back on {}", relay_host(&s.url));
+    } else {
+        log::debug!(
+            "[relay] delivery probe {nonce} on {} is not this session's; ignored",
+            relay_host(&s.url)
+        );
+    }
+}
+
+/// The relay's `OK` for an event we published: when it is the probe in
+/// flight and the relay refused it (an allowlist, auth, a policy on unknown
+/// authors), the probe can never come back, so the self-check goes inert for
+/// this session instead of reading the refusal as deafness.
+fn probe_ok(s: &mut RelaySession, raw: &[u8]) {
+    let Some(id) = s.probe_id.as_deref() else {
+        return;
+    };
+    if !raw.windows(id.len()).any(|w| w == id.as_bytes()) {
+        return;
+    }
+    let accepted = serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.get(2).and_then(|b| b.as_bool()));
+    if accepted != Some(false) {
+        return;
+    }
+    if let Some(nonce) = s.probe.outstanding_nonce() {
+        if s.probe.refused(nonce) {
+            log::warn!(
+                "[relay] {} refused the delivery probe ({}); self-check off for this session",
+                relay_host(&s.url),
+                snippet(raw, 120)
+            );
+        }
+    }
+    s.probe_id = None;
+}
+
+/// Two probes in a row did not come back on `s`. Record it (log, crumb,
+/// get_status), then drop the session, or, when redialling has stopped
+/// helping, take the relay-health watchdog's controlled restart.
+fn selfcheck_redial(s: &mut RelaySession, ctx: &mut SignCtx, now_ms: u64) -> Result<(), String> {
+    let host = relay_host(&s.url).to_string();
+    let escalate = match ctx.selfcheck.on_redial_due(&host) {
+        MissAction::Inert => {
+            s.probe.go_inert();
+            s.probe_id = None;
+            log::warn!(
+                "[relay] delivery self-check: {host} has not delivered a probe this boot and was already redialled once for it; it may not echo events to their publisher, so the self-check is off for this session"
+            );
+            return Ok(());
+        }
+        MissAction::Redial { escalate } => escalate,
+    };
+    let since_s = s.probe.since_delivered_ms(now_ms) / 1_000;
+    let rx_age_s = s.last_rx.elapsed().as_secs();
+    let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let largest = unsafe {
+        esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
+    } as u32;
+    let index = if s.pinned {
+        None
+    } else {
+        ctx.relays.iter().position(|r| same_relay(r, &s.url))
+    };
+    let reason = delivery_probe::redial_reason(&host, index, since_s, rx_age_s, s.resubs, free, largest);
+    log::warn!(
+        "[relay] delivery self-check failed ({reason}): the session answers pings but its own probes never came back; redialling"
+    );
+    crate::crash_crumb::set(&delivery_probe::redial_crumb(
+        &host, index, since_s, rx_age_s, s.resubs, free, largest,
+    ));
+    ctx.selfcheck.set_reason(reason);
+    if escalate && ctx.network_trial_id.is_none() && ctx.ota_session.is_none() {
+        log::error!(
+            "[relay] delivery self-check: {} redials in a row and no probe delivered on any session; restarting, as the relay-health watchdog does",
+            ctx.selfcheck.streak()
+        );
+        crate::crash_crumb::set(&delivery_probe::escalation_crumb(
+            ctx.selfcheck.streak(),
+            since_s,
+            largest,
+        ));
+        FreeRtos::delay_ms(200);
+        unsafe { esp_idf_svc::sys::esp_restart() };
+    }
+    Err(format!(
+        "relay {} silent to its own delivery probes (self-check); reconnecting",
+        s.url
+    ))
 }
 
 /// Reboot after a command changed persisted state the live relay subscription
@@ -4234,6 +4490,7 @@ fn handle_relay_msg(
                 NetworkRuntimeError::None,
             );
             log::info!("[relay] OK: {}", snippet(raw, 120));
+            probe_ok(s, raw);
         }
         "NOTICE" => log::warn!("[relay] NOTICE: {}", snippet(raw, 160)),
         // The relay closed our subscription (limit, error, policy). The WS stays
@@ -4322,6 +4579,15 @@ fn process_event(
 ) -> Result<(), String> {
     if let Err(e) = nip46::verify_signed_event(&ev) {
         log::warn!("[relay] invalid Nostr EVENT ({e}); ignoring");
+        return Ok(());
+    }
+
+    // The delivery self-check's own probe, recognised by its per-boot author
+    // before anything else: it is never dispatched, never deduped against
+    // client traffic, never wakes the panel or counts as activity, and its
+    // timestamp (our own estimate) never feeds the reply clock.
+    if ev.kind == NIP46_KIND && ev.pubkey == ctx.probe_key.pk_hex {
+        probe_delivered(s, &ev, ctx);
         return Ok(());
     }
 
@@ -10106,7 +10372,11 @@ fn dispatch_mgmt(
                     // revoke_client_identity / clear_client_identities withdraw
                     // identity approvals from a slot without revoking it.
                     "client_identity_revoke_v1",
-                    "per_client_identity_consent_v1"
+                    "per_client_identity_consent_v1",
+                    // WiFi relay loop: each live session must have its own
+                    // probe delivered back or it is redialled; get_status
+                    // reports `delivery_selfcheck`.
+                    "relay_delivery_selfcheck_v1"
             ]);
             // A delegate (per-identity operator) sees only what it needs to
             // feature-detect and manage its own identity — never the
@@ -10195,6 +10465,18 @@ fn dispatch_mgmt(
                 "at_rest": at_rest.wire(),
                 "unlock_phone_count": unlock_phone_count,
                 "phone_relays": phone_relays.wire(),
+                // Delivery self-check (heartwood_common::delivery_probe):
+                // sessions redialled since boot because their own probes
+                // stopped coming back, the current run of them with nothing
+                // delivered in between, and the last one's evidence (host,
+                // relay index, seconds since a delivered probe, last_rx age,
+                // re-REQs, free/largest heap). Device-wide, so not in either
+                // delegate shape.
+                "delivery_selfcheck": {
+                    "redials": ctx.selfcheck.redials(),
+                    "streak": ctx.selfcheck.streak(),
+                    "last_reason": ctx.selfcheck.last_reason(),
+                },
                 // Running firmware, so managers can show version state over
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),

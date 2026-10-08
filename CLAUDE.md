@@ -196,6 +196,32 @@ operator-only `get_network_config` reply (top-level `wifi_index`, only that
 runtime field); the WiFi info page and Sapwood's Connectivity panel name that
 network rather than the primary (checklist section 31).
 
+The relay loop proves delivery, not liveness (2026-10-08, checklist section
+35, NOT YET BENCH-RUN). A T-Display on beta.25 went deaf on 2026-10-07 with a
+live session: online, button working, health watchdog quiet, yet no `ping`
+answered on any relay until a power cycle, because pongs and the EOSE each
+re-REQ provokes keep `last_rx` fresh on a session whose EVENTs have stopped.
+Each live session now publishes a probe its own subscription must deliver
+back: kind 24133, authored by a per-boot RAM-only key (relay.rs `ProbeKey`,
+zeroised on drop), p-tagged to the first master, with a `hwprobe` nonce tag,
+recognised by author in `process_event` before the dedupe, the dispatch, the
+panel wake and the reply clock. First 30 s after the subscription, then every
+3 min; 20 s to come back; two misses in a row drop the session through the
+ordinary reconnect path (primary rotates, secondary/pinned back off), logged
+at warn with a crumb and `get_status.delivery_selfcheck` `{redials, streak,
+last_reason}` (full reply only, so neither delegate shape widens; capability
+`relay_delivery_selfcheck_v1`). Not while a card is open, an OTA runs or a
+trial runs; a blocked loop (a cable card, a dial, a gap of over 5 s between
+idle ticks) restarts the wait; a heap below `response_transportable` or no
+wall clock defers the probe. An `OK false` turns the check off for that
+session, a relay that has never delivered a probe this boot gets one redial
+and is then left alone, and three self-check redials in a row with nothing
+delivered in between (one at least on a relay that has delivered this boot)
+take the health watchdog's controlled restart under a `relay watchdog:
+selfcheck` crumb. All of it is `common/src/delivery_probe.rs`
+(`SessionProbe`, `SelfCheckLedger`), host-tested; relay.rs
+`delivery_selfcheck` is the glue.
+
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =

@@ -2,7 +2,8 @@
 //! not liveness.
 //!
 //! The relay loop's keepalive (a WebSocket ping every 20 s, a re-REQ every
-//! 40 s, a 50 s silence limit) proves that the socket is alive. It does not
+//! 2 min (40 s until 2026-10-08), a 50 s silence limit) proves that the
+//! socket is alive. It does not
 //! prove that the subscription still delivers EVENTs: pongs and the EOSE each
 //! re-REQ provokes keep `last_rx` fresh on a session that has gone deaf. That
 //! was the field failure of 2026-10-07: a T-Display on beta.25 showed

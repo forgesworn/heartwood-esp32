@@ -1334,7 +1334,8 @@ notecase `heartwood send`.
    decision in the ledger, wrap a note, power-cycle, and confirm the REQ on
    the wire carries `"since":<mark - 172800>,"limit":16` and the card still
    comes up; with an empty ledger the REQ carries `"limit":16` and no
-   `since`. The keepalive re-REQ 40 s later must be back to `"limit":0`.
+   `since`. The keepalive re-REQ 2 min later (40 s before 2026-10-08) must be back
+   to `"limit":0`.
 3. Not for us: a wrap to a persona pubkey, a kind-14 DM whose text has no
    note (or two), a wrap whose rumor claims a different author than the
    seal signer, and a rumor whose URL has no amount. Expect: silent drop —
@@ -1398,7 +1399,9 @@ notecase `heartwood send`.
    "send is not available on this surface" without a card.
 9. Regression: a `sign_event` card, a non-note extension card and a C4 park
    all behave exactly as in §12; the REQ now carries a fourth filter and the
-   40 s re-REQ still lands (watch for the kind-0 profile refresh).
+   keepalive re-REQ still lands (every 2 min since 2026-10-08, with the
+   kind-0 filter at `"limit":0`, so no profile replay; edit the profile to
+   see it arrive live).
 
 ## 15. Notes paid to the device's own keys (LUD-25 Part 2; added 2026-09-11, items 1, 2, 3 and 6's scan bench-run the same day)
 
@@ -2965,6 +2968,13 @@ last_reason}` and the capability `relay_delivery_selfcheck_v1`.
    socket opens never restarts the board; one at the upgrade (no session at
    all) still takes the health watchdog's restart after 5 min, as any dead
    relay list does.
+10. Lighter keepalive. With the serial tap at debug, the keepalive re-REQ
+   (`re-subscribed on <host> (keepalive)`) goes out every 2 min per session,
+   and its kind-0 filter reads `"limit":0`; the connect-time REQ keeps
+   `"limit":1` and the idle screen still shows the profile name. Publishing a
+   new kind-0 for the master while the board is up updates the name live.
+   Under a relay you control, count the device's REQs over 30 min: about 15
+   per session, not 45.
 
 ## Notes
 

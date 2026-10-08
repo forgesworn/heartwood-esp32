@@ -168,7 +168,14 @@ struct CatchUp {
 /// Some relays close a subscription (or stop delivering to it) while keeping the
 /// WS connection alive, so the connection never looks dead — periodic re-REQ
 /// (same sub id, idempotent overwrite) re-establishes delivery either way.
-const RESUB_INTERVAL: Duration = Duration::from_secs(40);
+///
+/// Two minutes, not the 40 s it was: every re-REQ is a request a relay counts
+/// against its limits, and the delivery self-check (`delivery_probe`) now
+/// catches a session that has stopped delivering whatever the cause. On a
+/// relay where the self-check went inert (one that does not echo a probe to
+/// its publisher) this is still the only self-heal, and a silent drop there
+/// now lasts up to two minutes rather than 40 s.
+const RESUB_INTERVAL: Duration = Duration::from_secs(120);
 /// Blank the OLED after this much inactivity to prevent burn-in on a 24/7 shelf
 /// device. The wifi-standalone relay loop otherwise leaves a static npub on the
 /// panel forever. Mirrors the USB frame loop's DISPLAY_TIMEOUT. A request or a
@@ -2354,13 +2361,19 @@ fn build_sub_req(ctx: &SignCtx, catch_up: bool) -> String {
         .map(|pk| format!("\"{pk}\""))
         .collect::<Vec<_>>()
         .join(",");
-    let profile_filter = format!(r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":1}}"##);
+    // The stored profile on connect; the keepalive copy is live-only, or the
+    // relay would replay the same kind-0 at every re-REQ. Same sub id, so the
+    // filter stays in place and a profile edit still arrives live.
+    let profile_limit = if catch_up { 1 } else { 0 };
+    let profile_filter = format!(
+        r##"{{"kinds":[0],"authors":[{master_p_list}],"limit":{profile_limit}}}"##
+    );
     // Bearer notes gift-wrapped to a master npub. A wrap is a stored event
     // and nobody but this device can open one sealed to its key, so the
     // connect-time REQ (and the one after a settled card) asks for what
     // arrived while the device was off: newest first, bounded, and no older
     // than the last decision less the NIP-59 backdate. The keepalive re-REQ
-    // goes back to live-only so the relay is not replaying every 40 s.
+    // goes back to live-only so the relay is not replaying at every re-REQ.
     let wrap_filter = if catch_up {
         wrap_catch_up_filter(ctx, None)
     } else {

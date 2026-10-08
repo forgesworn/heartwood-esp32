@@ -246,6 +246,12 @@ configured relay is cooling, the primary dials the one ending soonest, at most
 once a minute, because a board with no session takes the health watchdog's
 restart, which would forget every cooldown. RAM only; pure half
 `common/src/relay_cooldown.rs` (`RelayCooldowns::pick`), host-tested.
+The keepalive got lighter the same day (checklist section 35 item 10): the
+re-REQ goes out every 2 min, not 40 s (`RESUB_INTERVAL`), since the
+self-check now catches a session that stops delivering, and its kind-0
+profile filter is `"limit":0` (the connect-time REQ keeps `"limit":1`), so a
+relay no longer replays the profile at every re-REQ. On a relay where the
+self-check is inert, a silently dropped subscription now lasts up to 2 min.
 
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device

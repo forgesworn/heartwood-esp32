@@ -196,6 +196,63 @@ operator-only `get_network_config` reply (top-level `wifi_index`, only that
 runtime field); the WiFi info page and Sapwood's Connectivity panel name that
 network rather than the primary (checklist section 31).
 
+The relay loop proves delivery, not liveness (2026-10-08, checklist section
+35, NOT YET BENCH-RUN). A T-Display on beta.25 went deaf on 2026-10-07 with a
+live session: online, button working, health watchdog quiet, yet no `ping`
+answered on any relay until a power cycle, because pongs and the EOSE each
+re-REQ provokes keep `last_rx` fresh on a session whose EVENTs have stopped.
+Each live session now publishes a probe its own subscription must deliver
+back: kind 24133, authored by a per-boot RAM-only key (relay.rs `ProbeKey`,
+zeroised on drop) and p-tagged to that same key, which `build_sub_req` adds
+to the `#p` list of the live 24133 filter (`delivery_probe::nip46_p_values`,
+so the connect, keepalive and persona re-subscribe REQs all carry it; the
+locked-boot and catch-up REQs do not), with a `hwprobe` nonce tag. So it
+proves the very filter that carries requests while addressing no served
+identity: another signer of the same master (a Pi heartwoodd) never sees it.
+Recognised in `process_event` (author and `p` both the probe key,
+`delivery_probe::our_probe_nonce`) before the dedupe, the dispatch, the panel
+wake and the reply clock. First 30 s after the subscription, then every
+3 min; 20 s to come back; two misses in a row drop the session through the
+ordinary reconnect path (primary rotates, secondary/pinned back off), logged
+at warn with a crumb and `get_status.delivery_selfcheck` `{redials, streak,
+last_reason}` (full reply only, so neither delegate shape widens; capability
+`relay_delivery_selfcheck_v1`). Not while a card is open, an OTA runs or a
+trial runs; a blocked loop (a cable card, a dial, a gap of over 5 s between
+idle ticks) restarts the wait; a heap below `response_transportable` or no
+wall clock defers the probe. An `OK false` turns the check off for that
+session, a relay that has never delivered a probe this boot gets one redial
+and is then left alone, and three self-check redials in a row with nothing
+delivered in between (one at least on a relay that has delivered this boot)
+take the health watchdog's controlled restart under a `relay watchdog:
+selfcheck` crumb. All of it is `common/src/delivery_probe.rs`
+(`SessionProbe`, `SelfCheckLedger`), host-tested; relay.rs
+`delivery_selfcheck` is the glue.
+
+A relay that refuses this client is left alone (2026-10-08, checklist section
+35 items 8-9, NOT YET BENCH-RUN). relay.damus.io was found answering `banned:
+too many rate-limit violations` to the owner's home address on 2026-10-08;
+the cause is not known, but the loop used to answer every refusal by
+reconnecting (a `CLOSED` re-sent the connect-time REQ at once, catch-up
+included), which is what a violation counter punishes. `relay_cooldown::classify`
+reads the relay's own words (a `NOTICE`, a `CLOSED`, an `OK false`, or the
+upgrade's status line): `banned` cools the host 60 min, `rate-limited:`, the
+same in words, or an HTTP 429 cools it 15 min; `blocked:`, `restricted:` and
+`auth-required:` are about an event or an author and keep their old handling
+(an allowlisted relay's `OK false` still only makes the probe inert). The
+session drops with a `relay refused us` error (runtime class
+`relay_refused`; Sapwood has no label for it yet). A cooling host is never the
+secondary or a pinned dial, and the primary rotation passes it by; when every
+configured relay is cooling, the primary dials the one ending soonest, at most
+once a minute, because a board with no session takes the health watchdog's
+restart, which would forget every cooldown. RAM only; pure half
+`common/src/relay_cooldown.rs` (`RelayCooldowns::pick`), host-tested.
+The keepalive got lighter the same day (checklist section 35 item 10): the
+re-REQ goes out every 2 min, not 40 s (`RESUB_INTERVAL`), since the
+self-check now catches a session that stops delivering, and its kind-0
+profile filter is `"limit":0` (the connect-time REQ keeps `"limit":1`), so a
+relay no longer replays the profile at every re-REQ. On a relay where the
+self-check is inert, a silently dropped subscription now lasts up to 2 min.
+
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =

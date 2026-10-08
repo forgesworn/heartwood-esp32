@@ -1334,7 +1334,8 @@ notecase `heartwood send`.
    decision in the ledger, wrap a note, power-cycle, and confirm the REQ on
    the wire carries `"since":<mark - 172800>,"limit":16` and the card still
    comes up; with an empty ledger the REQ carries `"limit":16` and no
-   `since`. The keepalive re-REQ 40 s later must be back to `"limit":0`.
+   `since`. The keepalive re-REQ 2 min later (40 s before 2026-10-08) must be back
+   to `"limit":0`.
 3. Not for us: a wrap to a persona pubkey, a kind-14 DM whose text has no
    note (or two), a wrap whose rumor claims a different author than the
    seal signer, and a rumor whose URL has no amount. Expect: silent drop —
@@ -1398,7 +1399,9 @@ notecase `heartwood send`.
    "send is not available on this surface" without a card.
 9. Regression: a `sign_event` card, a non-note extension card and a C4 park
    all behave exactly as in §12; the REQ now carries a fourth filter and the
-   40 s re-REQ still lands (watch for the kind-0 profile refresh).
+   keepalive re-REQ still lands (every 2 min since 2026-10-08, with the
+   kind-0 filter at `"limit":0`, so no profile replay; edit the profile to
+   see it arrive live).
 
 ## 15. Notes paid to the device's own keys (LUD-25 Part 2; added 2026-09-11, items 1, 2, 3 and 6's scan bench-run the same day)
 
@@ -2874,6 +2877,104 @@ take the `cx1` on file from the mint (moneyer: `zap_names.cx1`) or from
    the cable's 0x70 frame, `cash_address_proof` answers `bad_request` ("not
    available on this surface"), as `cash_address` does.
 9. Unbound client: `unauthorised`, like every other note method.
+
+## 35. The relay loop proves delivery, not liveness (added 2026-10-08, NOT YET BENCH-RUN)
+
+Field failure, 2026-10-07, T-Display on v0.18.0-beta.25 in WiFi mode: the
+network page said online and the button worked, but an unpaired client's
+`ping` (normally `pong` in about 0.7 s, no press) went unanswered on all four
+configured relays, probed from two networks. The relay-health watchdog never
+fired, so a session existed and the heap was fine. A power cycle cured it;
+there are no logs from the stall. The keepalive (ping every 20 s, re-REQ every
+40 s, 50 s silence limit) proves the socket, not the subscription: pongs and
+the EOSE each re-REQ provokes keep `last_rx` fresh on a session whose EVENTs
+have stopped reaching the handler.
+
+Each live session now publishes a probe that its own subscription must
+deliver back (`common/src/delivery_probe.rs`): kind 24133 (the NIP-46
+filter), authored by a per-boot ephemeral key and p-tagged to that same key,
+which the live REQ adds to the 24133 filter's `#p` list, with a
+`["hwprobe", "<nonce>"]` tag. No served identity is addressed, so another
+signer of the same master never receives one. The first goes out 30 s after the
+subscription, then every 3 min. A probe not back within 20 s is a miss
+(`delivery self-check: probe not delivered back` at warn), and the next one
+goes out 30 s later; two misses in a row drop the session (`delivery
+self-check failed (selfcheck <host> r<index> d<s since delivered> rx<last_rx
+age> q<re-REQs> h<free>k/<largest>k)`) and the ordinary reconnect path redials
+it, rotating the primary. Nothing is sent or judged while a card is open, an
+OTA runs or a network trial runs, and a wait that spans a blocked loop is
+restarted, not counted. A relay that answers the probe `OK false` turns the
+check off for that session; a relay that has never delivered a probe this boot
+gets one redial for it and is then left alone (it may not echo events to
+their publisher). Three self-check redials in a row with no probe delivered
+on any session in between, at least one of them on a relay that has delivered
+this boot, take the relay-health watchdog's controlled restart, crumb `relay
+watchdog: selfcheck x3 ...`, which `get_status.crashed_during` reports after
+the reboot. `get_status` carries `delivery_selfcheck: {redials, streak,
+last_reason}` and the capability `relay_delivery_selfcheck_v1`.
+
+1. Idle soak. Flash, unlock, leave the board idle on its usual relays with the
+   serial tap running (`scripts/serial-log.mjs`). From another machine, run an
+   unpaired ping once a minute, each to ONE relay in turn, for at least two
+   hours:
+   `node scripts/nip46-client.mjs --target <master hex> --client-key-file
+   /tmp/soak.key --method ping --relay wss://<relay> --timeout 10000`.
+   Every ping is answered. The log shows `delivery probe N back on <host>`
+   about every 3 min per live session and no `delivery self-check` warning.
+   `scripts/mgmt-request.mjs --method get_status` shows `delivery_selfcheck`
+   at `redials: 0`, `streak: 0`, `last_reason: null`, and the capability.
+2. Nothing user-visible: through the soak the panel blanks on time and stays
+   blank (a probe never wakes it), the sign audit has no probe in it, and no
+   card ever appears for one. A Pi heartwoodd (or any other signer) serving
+   the same master logs nothing for the probes.
+3. A forced deaf session. Run a throwaway relay you control behind TLS, as
+   section 16's failover record did at `wss://relaybench.forgesworn.dev`,
+   patched in as relay 0 with `scripts/net-relays.mjs`, built to stop
+   delivering EVENTs to existing subscriptions on a signal (SIGUSR1, say)
+   while it keeps answering pings, REQs (with EOSE) and `OK` for publishes.
+   That is the 2026-10-07 state. Once the device is online on it and its
+   probes are coming back, send the signal. Within about 4 min the log shows
+   two misses then `delivery self-check failed (selfcheck <bench host> r0 ...)`,
+   the primary rotates to relay 1 (`net-config` `relay_index` 1), a ping on
+   relay 1 is answered, and `get_status` shows `redials: 1` with that reason.
+   Do not use a router block or a killed relay process instead: both end the
+   socket, which is the silence limit's case, not this one.
+4. Escalation (needs the bench relay in 3 to drop every subscription, and the
+   other relays removed from the list so rotation only finds it): three
+   self-check redials in a row and the board restarts, logging
+   `restarting, as the relay-health watchdog does`; after the reboot
+   `get_status.crashed_during` reads `relay watchdog: selfcheck x3 ...` and
+   `last_reset` is `software-restart`.
+5. Refusal: patch in a relay that refuses unknown authors (`OK false`, an
+   allowlisted or paid relay). The log shows `refused the delivery probe;
+   self-check off for this session` once per connection and the session is
+   never redialled for it.
+6. Suppression: with an approval card on screen past a probe's due time, no
+   probe goes out until the card resolves; a cable enrol card (about 55 s)
+   held across an outstanding probe never produces a miss.
+7. T-Display (no PSRAM): the heap log does not drift through the soak, and the
+   largest block stays where it was before the soak began.
+8. A relay that refuses us is left alone. On the bench relay from 3, make it
+   answer the device's REQ with `["CLOSED","hw","rate-limited: slow down"]`
+   (or a `NOTICE` saying `banned: ...`). The log shows `relay refused us
+   (rate-limited) on <host>; leaving it 15 min` (60 min for `banned`), once;
+   the primary rotates to relay 1 and does not come back to the bench relay
+   until the cooldown ends, and no secondary is dialled to it meanwhile.
+   `net-config` shows `last_error_class: relay_refused`. An HTTP 429 on the
+   upgrade does the same at dial time.
+9. Every relay refusing: with the bench relay as the only relay, refusing
+   every connection, the primary still dials it, once a minute (`every relay
+   refused us recently; trying <host>`), never every 3 s. A refusal after the
+   socket opens never restarts the board; one at the upgrade (no session at
+   all) still takes the health watchdog's restart after 5 min, as any dead
+   relay list does.
+10. Lighter keepalive. With the serial tap at debug, the keepalive re-REQ
+   (`re-subscribed on <host> (keepalive)`) goes out every 2 min per session,
+   and its kind-0 filter reads `"limit":0`; the connect-time REQ keeps
+   `"limit":1` and the idle screen still shows the profile name. Publishing a
+   new kind-0 for the master while the board is up updates the name live.
+   Under a relay you control, count the device's REQs over 30 min: about 15
+   per session, not 45.
 
 ## Notes
 

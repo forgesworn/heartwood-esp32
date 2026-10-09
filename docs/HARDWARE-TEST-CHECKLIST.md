@@ -2975,6 +2975,15 @@ last_reason}` and the capability `relay_delivery_selfcheck_v1`.
    new kind-0 for the master while the board is up updates the name live.
    Under a relay you control, count the device's REQs over 30 min: about 15
    per session, not 45.
+11. Back to relay 1. Make relay 1 drop the board once (restart the bench
+   relay from 3, or block it for a minute) so the primary rotates to relay
+   2, then let relay 1 come back. Within about 15 min the log shows `back to
+   <relay 1>: ...`: `dialling it beside the primary` on a board with room for
+   a second session (Heltec), or `one session fits, so leaving <relay 2> for
+   it` (T-Display, where `secondary_index` stays null), and a ping on relay 1
+   is answered again. With relay 1 kept down, the attempts come 15, 30, 60
+   and then every 120 min, each costing at most one reconnect, and no attempt
+   happens while an approval card is on screen.
 
 ## Notes
 

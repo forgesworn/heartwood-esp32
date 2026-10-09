@@ -76,6 +76,9 @@ pub mod delivery_probe;
 /// while rather than redialled.
 pub mod relay_cooldown;
 
+/// Getting back to the first configured relay after the rotation moved off it.
+pub mod home_relay;
+
 pub mod wrap_ledger;
 
 pub mod rendezvous_receipts;

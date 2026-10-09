@@ -58,6 +58,7 @@ use heartwood_common::delivery_probe::{
 };
 use heartwood_common::hex::{hex_decode, hex_encode};
 use heartwood_common::mgmt;
+use heartwood_common::home_relay::{HomeAction, HomeReturn, HomeState};
 use heartwood_common::relay_cooldown::{self, RelayCooldowns};
 use heartwood_common::net_config::{
     apply_remote_net_config_patch, network_activation_source_allowed,
@@ -1517,6 +1518,8 @@ pub fn run_wifi_standalone<'d, 'b>(
     let mut primary_next = Instant::now();
     // When the primary last dialled a relay still cooling (every one was).
     let mut last_cooled_dial: Option<Instant> = None;
+    // Getting back to relay 1 once the rotation has moved off it.
+    let mut home_return = HomeReturn::new(uptime_ms());
     // The second configured relay (#92): which one to try next, when, and how
     // many dials in a row have failed (drives the same backoff as a pinned
     // relay). It starts one past the primary and never duplicates a live one.
@@ -1780,6 +1783,81 @@ pub fn run_wifi_standalone<'d, 'b>(
                 );
                 secondary_idx = relay_idx.wrapping_add(1);
                 secondary_next = Instant::now() + PRIMARY_BACKOFF;
+            }
+        }
+
+        // Relay 1 is the home relay (common::home_relay): the rotation only
+        // ever moves on, so without this a board that left it stays away, and
+        // a client that knows only relay 1 cannot reach it. Before the primary
+        // and secondary dials below, so whatever this frees is redialled on
+        // this same pass.
+        if !relays.is_empty() {
+            let home = relays[0].clone();
+            let primary_live = sessions.iter().any(|s| !s.pinned && !s.secondary);
+            let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            let largest = unsafe {
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                    esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                )
+            };
+            let now_ms = uptime_ms();
+            let state = HomeState {
+                relays: relays.len(),
+                home_live: sessions.iter().any(|s| same_relay(&s.url, &home)),
+                home_cooling: ctx.relay_cooldowns.cooling(relay_host(&home), now_ms),
+                // No primary: the primary dial below is already choosing.
+                suppress: !primary_live
+                    || approval_card_open(&ctx)
+                    || ctx.ota_session.is_some()
+                    || ctx.network_trial_id.is_some()
+                    || relay_update.as_ref().is_some_and(|u| u.plan.in_round())
+                    || sessions.iter().any(|se| !se.recv_timeout_on),
+                secondary_fits: sessions.len() < MAX_SESSIONS
+                    && free >= SECONDARY_MIN_FREE_HEAP
+                    && largest >= SECONDARY_MIN_LARGEST_BLOCK,
+                secondary_elsewhere: sessions
+                    .iter()
+                    .any(|s| s.secondary && !same_relay(&s.url, &home)),
+            };
+            match home_return.step(now_ms, state) {
+                HomeAction::Nothing => {}
+                HomeAction::DialSecondary => {
+                    log::info!(
+                        "[relay] back to {}: dialling it beside the primary (attempt {})",
+                        relay_host(&home),
+                        home_return.attempts()
+                    );
+                    secondary_idx = 0;
+                    secondary_next = Instant::now();
+                }
+                HomeAction::FreeSecondary => {
+                    if let Some(pos) = sessions.iter().position(|s| s.secondary) {
+                        let freed = sessions.remove(pos);
+                        log::info!(
+                            "[relay] back to {}: closing the secondary on {} to make room",
+                            relay_host(&home),
+                            relay_host(&freed.url)
+                        );
+                        ctx.network_runtime.secondary_index = None;
+                        retune_recv_timeouts(&mut sessions);
+                    }
+                    secondary_idx = 0;
+                    secondary_next = Instant::now();
+                }
+                HomeAction::SwapPrimary => {
+                    if let Some(pos) = sessions.iter().position(|s| !s.pinned && !s.secondary) {
+                        let left = sessions.remove(pos);
+                        log::info!(
+                            "[relay] back to {}: one session fits, so leaving {} for it (attempt {})",
+                            relay_host(&home),
+                            relay_host(&left.url),
+                            home_return.attempts()
+                        );
+                        retune_recv_timeouts(&mut sessions);
+                    }
+                    relay_idx = 0;
+                    primary_next = Instant::now();
+                }
             }
         }
 

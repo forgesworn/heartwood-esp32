@@ -253,6 +253,21 @@ profile filter is `"limit":0` (the connect-time REQ keeps `"limit":1`), so a
 relay no longer replays the profile at every re-REQ. On a relay where the
 self-check is inert, a silently dropped subscription now lasts up to 2 min.
 
+Relay 1 is the home relay (2026-10-09, checklist section 35 item 11, NOT YET
+BENCH-RUN). The rotation only ever moved on, so a board that left relay 1
+stayed away: the soak T-Display left relay.trotters.cc at 21:51 on
+2026-10-08 and served relay.primal.net alone all night (its heap rarely
+spares a second TLS session), while a client that knows only relay 1 (the
+Archipelago link) could not reach it. `home_relay::HomeReturn` (pure,
+host-tested) runs each loop pass before the dials: while no session is on
+relay 1, 15 min after leaving it (then 30, 60, 120 min while attempts fail;
+reset once home), it dials home beside the primary if a second session fits,
+closes a secondary on another relay to make room if one is live, or, when
+one session is all the board can hold, drops the primary and dials home, the
+ordinary rotation carrying on if home fails. Never while a card is open, an
+OTA, a network trial or a relay update round runs, a session is degraded, or
+relay 1 is cooling after refusing us.
+
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =

@@ -1501,6 +1501,7 @@ pub fn show_sign_request_as(
     kind: u64,
     identity: Option<&str>,
     heading: Option<&str>,
+    login_code: Option<&str>,
     seconds_remaining: u32,
 ) {
     let l = layout(display);
@@ -1520,7 +1521,8 @@ pub fn show_sign_request_as(
         .build();
 
     // Header
-    Text::new(heading.unwrap_or("HOLD TO SIGN"), Point::new(l.sx(2), l.sy(10)), header)
+    let default_heading = if login_code.is_some() { "LOG IN" } else { "HOLD TO SIGN" };
+    Text::new(heading.unwrap_or(default_heading), Point::new(l.sx(2), l.sy(10)), header)
         .draw(display)
         .ok();
 
@@ -1534,15 +1536,31 @@ pub fn show_sign_request_as(
     let app = ellipsize_chars(&app, l.chars_per_line(l.font_body()));
     Text::new(&app, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
-    let (kind_line, second_line) = match identity {
-        Some(identity) => (format!("k{kind} {}", kind_name_line(kind)), identity.to_string()),
-        None => (kind_name_line(kind), format!("kind {kind}")),
-    };
-    let kind_line = ellipsize_chars(&kind_line, l.chars_per_line(l.font_small()));
-    Text::new(&kind_line, Point::new(l.sx(2), l.sy(39)), small).draw(display).ok();
+    if let Some(code) = login_code {
+        // A login card: the code the owner compares with the login page
+        // replaces the kind lines, as large as the panel carries (4 to 8
+        // digits always fit at `word_scale`).
+        let scale = l.word_scale();
+        let width = crate::bigtext::scaled_text_width(code, l.font_large(), scale);
+        crate::bigtext::draw_text_scaled(
+            display,
+            code,
+            Point::new(l.center_x(width), l.sy(46)),
+            l.font_large(),
+            scale,
+            FG,
+        );
+    } else {
+        let (kind_line, second_line) = match identity {
+            Some(identity) => (format!("k{kind} {}", kind_name_line(kind)), identity.to_string()),
+            None => (kind_name_line(kind), format!("kind {kind}")),
+        };
+        let kind_line = ellipsize_chars(&kind_line, l.chars_per_line(l.font_small()));
+        Text::new(&kind_line, Point::new(l.sx(2), l.sy(39)), small).draw(display).ok();
 
-    let second_line = ellipsize_chars(&second_line, l.chars_per_line(l.font_small()));
-    Text::new(&second_line, Point::new(l.sx(2), l.sy(48)), small).draw(display).ok();
+        let second_line = ellipsize_chars(&second_line, l.chars_per_line(l.font_small()));
+        Text::new(&second_line, Point::new(l.sx(2), l.sy(48)), small).draw(display).ok();
+    }
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);
@@ -2114,40 +2132,10 @@ pub fn show_info_network(
     mode_line: &str,
     ssid: Option<&str>,
     status: &str,
+    rssi: Option<i8>,
 ) {
-    let l = layout(display);
     display.clear_buffer();
-
-    let header = MonoTextStyleBuilder::new()
-        .font(l.font_header())
-        .text_color(ACCENT)
-        .build();
-    let body = MonoTextStyleBuilder::new()
-        .font(l.font_body())
-        .text_color(FG)
-        .build();
-    let small = MonoTextStyleBuilder::new()
-        .font(l.font_small())
-        .text_color(MUTED)
-        .build();
-
-    Text::new("NETWORK", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
-    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(ACCENT))
-        .draw(display)
-        .ok();
-
-    Text::new(mode_line, Point::new(l.sx(4), l.sy(28)), body).draw(display).ok();
-    if let Some(ssid) = ssid {
-        let ssid_line = format!("WiFi: {}", truncate_str(ssid, 15));
-        Text::new(&ssid_line, Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
-    } else {
-        Text::new("WiFi: not set", Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
-    }
-    let status_line = format!("Status: {status}");
-    Text::new(&status_line, Point::new(l.sx(4), l.sy(52)), small).draw(display).ok();
-
-    draw_page_marker(display, &l, 2, 3);
+    crate::network_screen::draw(display, mode_line, ssid, status, rssi);
     display.flush().ok();
 }
 

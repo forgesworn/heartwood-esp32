@@ -196,19 +196,134 @@ operator-only `get_network_config` reply (top-level `wifi_index`, only that
 runtime field); the WiFi info page and Sapwood's Connectivity panel name that
 network rather than the primary (checklist section 31).
 
+The relay loop proves delivery, not liveness (2026-10-08, checklist section
+35, NOT YET BENCH-RUN). A T-Display on beta.25 went deaf on 2026-10-07 with a
+live session: online, button working, health watchdog quiet, yet no `ping`
+answered on any relay until a power cycle, because pongs and the EOSE each
+re-REQ provokes keep `last_rx` fresh on a session whose EVENTs have stopped.
+Each live session now publishes a probe its own subscription must deliver
+back: kind 24133, authored by a per-boot RAM-only key (relay.rs `ProbeKey`,
+zeroised on drop) and p-tagged to that same key, which `build_sub_req` adds
+to the `#p` list of the live 24133 filter (`delivery_probe::nip46_p_values`,
+so the connect, keepalive and persona re-subscribe REQs all carry it; the
+locked-boot and catch-up REQs do not), with a `hwprobe` nonce tag. So it
+proves the very filter that carries requests while addressing no served
+identity: another signer of the same master (a Pi heartwoodd) never sees it.
+Recognised in `process_event` (author and `p` both the probe key,
+`delivery_probe::our_probe_nonce`) before the dedupe, the dispatch, the panel
+wake and the reply clock. First 30 s after the subscription, then every
+3 min; 20 s to come back; two misses in a row drop the session through the
+ordinary reconnect path (primary rotates, secondary/pinned back off), logged
+at warn with a crumb and `get_status.delivery_selfcheck` `{redials, streak,
+last_reason}` (full reply only, so neither delegate shape widens; capability
+`relay_delivery_selfcheck_v1`). Not while a card is open, an OTA runs or a
+trial runs; a blocked loop (a cable card, a dial, a gap of over 5 s between
+idle ticks) restarts the wait; a heap below `response_transportable` or no
+wall clock defers the probe. An `OK false` turns the check off for that
+session, a relay that has never delivered a probe this boot gets one redial
+and is then left alone, and three self-check redials in a row with nothing
+delivered in between (one at least on a relay that has delivered this boot)
+take the health watchdog's controlled restart under a `relay watchdog:
+selfcheck` crumb. All of it is `common/src/delivery_probe.rs`
+(`SessionProbe`, `SelfCheckLedger`), host-tested; relay.rs
+`delivery_selfcheck` is the glue.
+
+A relay that refuses this client is left alone (2026-10-08, checklist section
+35 items 8-9, NOT YET BENCH-RUN). relay.damus.io was found answering `banned:
+too many rate-limit violations` to the owner's home address on 2026-10-08;
+the cause is not known, but the loop used to answer every refusal by
+reconnecting (a `CLOSED` re-sent the connect-time REQ at once, catch-up
+included), which is what a violation counter punishes. `relay_cooldown::classify`
+reads the relay's own words (a `NOTICE`, a `CLOSED`, an `OK false`, or the
+upgrade's status line): `banned` cools the host 60 min, `rate-limited:`, the
+same in words, or an HTTP 429 cools it 15 min; `blocked:`, `restricted:` and
+`auth-required:` are about an event or an author and keep their old handling
+(an allowlisted relay's `OK false` still only makes the probe inert). The
+session drops with a `relay refused us` error (runtime class
+`relay_refused`; Sapwood has no label for it yet). A cooling host is never the
+secondary or a pinned dial, and the primary rotation passes it by; when every
+configured relay is cooling, the primary dials the one ending soonest, at most
+once a minute, because a board with no session takes the health watchdog's
+restart, which would forget every cooldown. RAM only; pure half
+`common/src/relay_cooldown.rs` (`RelayCooldowns::pick`), host-tested.
+The keepalive got lighter the same day (checklist section 35 item 10): the
+re-REQ goes out every 2 min, not 40 s (`RESUB_INTERVAL`), since the
+self-check now catches a session that stops delivering, and its kind-0
+profile filter is `"limit":0` (the connect-time REQ keeps `"limit":1`), so a
+relay no longer replays the profile at every re-REQ. On a relay where the
+self-check is inert, a silently dropped subscription now lasts up to 2 min.
+
+Relay 1 is the home relay (2026-10-09, checklist section 35 item 11, NOT YET
+BENCH-RUN). The rotation only ever moved on, so a board that left relay 1
+stayed away: the soak T-Display left relay.trotters.cc at 21:51 on
+2026-10-08 and served relay.primal.net alone all night (its heap rarely
+spares a second TLS session), while a client that knows only relay 1 (the
+Archipelago link) could not reach it. `home_relay::HomeReturn` (pure,
+host-tested) runs each loop pass before the dials: while no session is on
+relay 1, 15 min after leaving it (then 30, 60, 120 min while attempts fail;
+reset once home), it dials home beside the primary if a second session fits,
+closes a secondary on another relay to make room if one is live, or, when
+one session is all the board can hold, drops the primary and dials home, the
+ordinary rotation carrying on if home fails. Never while a card is open, an
+OTA, a network trial or a relay update round runs, a session is degraded, or
+relay 1 is cooling after refusing us.
+
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =
-HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then lnurl-wallet's
-m/139'/1'/d1..d4 and LUD-25's tweak, graded against lnurlcash-kit's
-part2.json and tests/fixtures/lud25-nostr-seed.json on both curve backends). The
-mint holds only the cx1 (heartwood_note_address, no hold); a key-note wrap
-carries p/i/sig and no secret, and is opened only if the key is ours
-(note_wrap::open_note_rumor). A key note stores its key as the secret plus
+HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then LUD-25's
+m/139'/d1..d4 and its purposed tweak, graded against lnurlcash-conformance
+0.15.0's part2.json and nostr-seed.json in tests/fixtures on both curve
+backends). The mint holds only the cx1 (heartwood_note_address, no hold); a
+key-note wrap carries p/i/c and no secret, and is opened only if the key is
+ours (note_wrap::open_note_rumor). A key note stores its key as the secret plus
 KeyNote {index, pubkey} (a v3 blob, written only for key notes), exports a
-ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim)
-derives the key itself. Recoverable signing is the one new curve op:
-secp256k1's `recovery` module on the firmware, k256 `ecdsa` on the host.
+ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim,
+optional `purpose`, default 2) derives the key itself.
+
+Moved to LUD-25 `50d740a` / `6e865b1` on 2026-10-04 (moneyer 0.17 had
+stranded a zap: the board ignored the wrap). Three changes: the tweak hashes
+`ser32(purpose)` before the index (0 wallet, 1 change, 2 Lightning Address,
+which is what a mint mints to and so what a wrap is on); the branch is
+`m/139'/d1..d4` with the hashing key at `m/139'/0`, not lnurl-wallet's
+`m/139'/1'/...`; and a ck1 is `Q || BIP-340` (aux_rand zero) over the BIP-341
+key-path sighash of the canonical spend bound to the mint's domain
+(cash_key::key_path_sighash), not a recoverable ECDSA signature. A mint
+certificate's hrp now carries its amount (`cs210n1...`) and travels as `c`
+(`sig` still read). A claim that names its key falls back to the superseded
+`m/139'/1'` branch, because a mint keeps paying the cx1 a name was registered
+with; nothing new is handed out there, so re-register a name
+(`heartwood address keys`) to move it to the current branch. The ECDSA
+`recovery`/`ecdsa` backend features are gone.
+
+Address proofs (2026-10-05, checklist section 34, NOT YET BENCH-RUN): since
+`50d740a` a mint changes or clears a name's cx1 only with `"sig"`, a BIP-340
+signature by the purpose-0 index-0 key of the branch CURRENTLY on file over
+sha256("LNURLcash:<register|unregister>:<domain>:<name>"), so a name on the
+superseded branch can be moved only with that branch's agreement.
+`heartwood_note_address_proof {host, name, action, cx1}` (wire command
+`cash_address_proof`, capability `note_address_proof_v1`) signs it with
+whichever of the served identity's two branches at `host` has that exact cx1
+(`cash_key::address_proof_for`, compared as decoded bytes; any other cx1 is
+refused) over `spend_domain(host)`, aux_rand zero, which reproduces all four
+of part2.json's `addressProofs`. It answers the 64-byte `sig`, the index-0
+`pubkey` and `branch` (`current`/`superseded`), never a key. Everything that
+could refuse (mint, name rule `^[a-z0-9][a-z0-9._-]{2,31}$`, action, a cx1
+that is ours) is checked by the one pure `note_cmd::address_proof_ask` before
+the card, on the relay precheck and in the dispatcher alike; the card
+(`note_cmd::address_proof_card`) is ADDRESS PROOF over `<name>@<domain>` and
+`<action>, current keys` or `old keys`. Pinned ButtonRequired like the other
+note mutations, and device-press-only (`Nip46Method::device_press_only`, as a
+wallet pairing is): a proof never expires and decides where a name pays, so no
+guardian verdict may answer it and an escalate slot is refused outright. It
+never shares a card (`approval_queue::never_shares_card`), and nor, since the
+same change, does `heartwood_note_trust`, which used to batch so one hold
+trusted every sender behind the first npub shown; scoped to the served key (`method_uses_served_key`), and an
+ask never shares a card (`approval_queue::never_shares_card`): a batch card
+speaks in notes and sats and could not name a second proof. The cable has no
+identity, so `cash_address_proof` there refuses before the card, as
+`cash_address` does; on the USB-bridged NIP-46 path the card is the generic
+extension card, as for every note method.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

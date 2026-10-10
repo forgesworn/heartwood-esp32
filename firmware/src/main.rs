@@ -50,6 +50,7 @@ mod entropy_game;
 mod identity_cache;
 mod identity_meta;
 mod layout;
+mod network_screen;
 mod log_quiet;
 mod crash_crumb;
 mod data_key_store;
@@ -91,6 +92,7 @@ mod sign;
 mod transport;
 mod wdt;
 mod wifi_scan;
+mod wifi_retry;
 
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
@@ -296,7 +298,7 @@ pub fn draw_idle_page(
                 .as_ref()
                 .filter(|c| !c.ssid.is_empty())
                 .map(|c| c.ssid.as_str());
-            oled::show_info_network(display, "USB bridge", ssid, "radio off");
+            oled::show_info_network(display, "USB bridge", ssid, "radio off", None);
         }
         2 => oled::show_info_device(
             display,

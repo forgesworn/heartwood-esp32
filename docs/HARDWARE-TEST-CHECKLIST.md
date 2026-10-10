@@ -423,15 +423,80 @@ Multi-network WiFi (T-Display or Heltec in WiFi mode):
 - [ ] Over USB, add two fallback networks in Sapwood (e.g. phone hotspot +
       second AP), reorder them, save, and read back: the list survives the
       reboot and the redacted state shows ssid + password_set only.
-- [ ] Power the primary AP off. The signer rotates to the hotspot within a few
-      retry cycles (~10 s/candidate) and comes online — Sapwood and paired apps
+- [ ] Power the primary AP off. The signer scans and tries the strongest visible
+      saved AP first (survey bounded to 8 s), then rotates on failure (up to
+      15 s for association, another 15 s for DHCP, and
+      3 s backoff per failed candidate) and comes online — Sapwood and paired apps
       reach it again. (A console build also names each candidate as "wifi
       network N/M".)
 - [ ] Promote a fallback to primary in Sapwood using its saved password (no
-      password typed). The device joins it after reboot.
+      password typed). With it the strongest visible saved network, the device
+      joins it after reboot; saved position alone no longer overrides signal.
 - [ ] Encrypted-at-rest + WiFi: with the vault locked, the device now joins
       WiFi during the locked phase (previously the station never associated)
       and publishes its kind-24135 unlock announcement.
+
+Strongest-network selection and roaming (2026-10-04):
+- [x] Host policy tests cover strongest-first ranking, stable ties, hidden
+      fallbacks, a failed strong AP not starving a weaker one, fresh selection
+      after link loss, two-scan hysteresis and failed-target suppression.
+- [ ] With two saved APs visible, boot locked and unlocked: join the stronger
+      one regardless of saved position, retaining USB responsiveness during scan.
+- [ ] While connected, make another saved AP at least 10 dB stronger for two
+      scans. Verify the board switches and the relay reconnects without reboot.
+- [ ] Fluctuate the advantage below 10 dB, or change the winner between scans:
+      the current connection stays put. Repeat while an approval is displayed;
+      no proactive switch occurs until the approval/result has cleared.
+- [ ] Give the stronger AP incorrect credentials: recover to the working AP
+      and suppress further proactive attempts at the failed AP for five minutes.
+- [ ] The open WiFi page shows scanning, the actual join candidate, then the
+      connected SSID and signal; connectivity cards do not displace that page.
+
+Location-change regression (2026-10-04; partial T-Display bench verification):
+- [x] App-only update on the connected T-Display: installed factory partition
+      at `0x10000`, size `0x300000`, verified before writing. The 2,204,416-byte
+      patched beta.21 app was read back byte-for-byte (SHA-256
+      `c78855d42ca11df688a6bbce64e8f8aae86e61e610f13a1a861c4b9e8fa24501`). <!-- # pragma: allow-secret (public firmware image SHA-256) -->
+      Previous app captured for recovery; bootloader, partition table and
+      persistent data partitions were not written.
+- [x] Unlocked boot with the existing four saved networks: observed
+      `network_not_found` (201), then `wifi_ready` with `wifi_index: 2`, then
+      `online` on relay index 0. During WiFi retry, all 25 sampled USB network
+      status requests answered (median 88 ms, maximum 91 ms). Three earlier
+      requests before boot service started timed out; relay dial later took
+      2.44 s for one reply. The same identity, two pairings, network revision
+      6 and saved network/relay lists were present after the update.
+      This proves boot fallback and relay reconnection on this unlocked
+      T-Display; the follow-up handoff evidence is recorded below.
+- [x] Follow-up at approximately 12:12 UTC: the same T-Display reported
+      `online`, `wifi_index: 3` (Pixel hotspot) and `relay_index: 3`, with
+      configuration revision 6 unchanged. Firmware uptime was 5,809 seconds,
+      consistent with the approximately 10:35 UTC verification boot above:
+      evidence of hotel-to-hotspot recovery within the same boot. The exact
+      transition and retry timing were not captured. Identity, two pairings
+      and NVS entry counts remained unchanged. Locked boot and other boards
+      are still unverified.
+- [x] Return handoff after the larger WiFi-page update (`defb792`): observed
+      Pixel hotspot online at 12:24 UTC, then hotel WiFi online at 12:30 UTC.
+      Uptime of 576 seconds at approximately 12:32 UTC matches that image's
+      12:22 verification boot, so the return happened without a reboot.
+      Identity, two pairings and configuration revision 6 remained intact.
+      The owner accepted the larger layout but reported an unavailable SSID
+      during retries: the page incorrectly fell back to the primary name
+      whenever the joined index was cleared. The follow-up tracks the actual
+      candidate separately and keeps the open network page visible through
+      connectivity changes; its on-device retry-name check remains pending.
+- [ ] Save three networks A/B/C. With only C available, cold boot both locked
+      and unlocked; verify C joins and USB remains responsive during retries.
+- [ ] Unlock on C, then leave it powered while disabling C and enabling B.
+      Verify it cycles C/A/B, reconnects the relay, and reports B's correct
+      `runtime.wifi_index`. Repeat B to A and A to C without rebooting.
+- [ ] Let A associate but withhold DHCP; leave B working. Verify timeout on A
+      cancels its association and B receives an IP and serves paired apps.
+- [ ] Use wrong credentials for A and B; C must still join. Restore A, remove
+      C, and verify the next full rotation recovers without a power cycle.
+- [ ] With one saved AP, take it away and restore it. Verify retry recovery;
+      with every AP absent, verify cable configuration recovery stays usable.
 
 Quick USB update (T-Display / C6):
 - [ ] Sapwood's Firmware section offers "Update to vX over USB" for the
@@ -1269,7 +1334,8 @@ notecase `heartwood send`.
    decision in the ledger, wrap a note, power-cycle, and confirm the REQ on
    the wire carries `"since":<mark - 172800>,"limit":16` and the card still
    comes up; with an empty ledger the REQ carries `"limit":16` and no
-   `since`. The keepalive re-REQ 40 s later must be back to `"limit":0`.
+   `since`. The keepalive re-REQ 2 min later (40 s before 2026-10-08) must be back
+   to `"limit":0`.
 3. Not for us: a wrap to a persona pubkey, a kind-14 DM whose text has no
    note (or two), a wrap whose rumor claims a different author than the
    seal signer, and a rumor whose URL has no amount. Expect: silent drop —
@@ -1333,7 +1399,9 @@ notecase `heartwood send`.
    "send is not available on this surface" without a card.
 9. Regression: a `sign_event` card, a non-note extension card and a C4 park
    all behave exactly as in §12; the REQ now carries a fourth filter and the
-   40 s re-REQ still lands (watch for the kind-0 profile refresh).
+   keepalive re-REQ still lands (every 2 min since 2026-10-08, with the
+   kind-0 filter at `"limit":0`, so no profile replay; edit the profile to
+   see it arrive live).
 
 ## 15. Notes paid to the device's own keys (LUD-25 Part 2; added 2026-09-11, items 1, 2, 3 and 6's scan bench-run the same day)
 
@@ -2693,6 +2761,229 @@ the main loop and the locked phase.
 - [ ] **32c.** Locked board (PIN or vault) in WiFi mode with its networks out of
   range: PIN_UNLOCK / VAULT_UNLOCK over USB are answered within a couple of
   seconds at any point in the join cycle.
+
+## 33. Approve from my phone, per app (added 2026-10-04, NOT YET BENCH-RUN)
+
+The owner's opt-in for the C4 park (section 11b) on their own apps, not only a
+dependant's: Sapwood's Apps panel gains an "Approve from my phone" switch per
+app (the slot's `escalate`), off by default, behind a written acknowledgement
+of what it gives away. Firmware: the relay's `update_client` now honours
+`escalate` on a legacy (non-strict) slot too, as the cable's CONNSLOT_UPDATE
+always has, so a slot flagged at the cable can be unflagged from the phone;
+the cable card names the change ("PHONE MAY OK" / "BUTTON ONLY") instead of
+"family" when `escalate` is the only family key sent.
+
+Side effect on upgrade: Signet's C3 policy push already sends `escalate`
+(true on dependant slots). On a legacy dependant slot that used to be dropped;
+on this firmware it takes effect, so such a slot starts parking where it used
+to draw a card. That is what Signet always asked for, but it is a change.
+Only MANUAL pairings are affected by the switch: an AUTO pairing's requests
+dispatch without a card, so nothing parks.
+
+- [ ] **33a.** WiFi board over USB, a legacy slot: Sapwood > Apps > Approve
+  from my phone > Turn on, tick the acknowledgement, Turn on. The board shows
+  `Update <label>? / PHONE MAY OK`; hold to approve. Sapwood shows ON, and
+  CONNSLOT_LIST reports `escalate: true`. Declining the card leaves it OFF with
+  "the press on the signer was declined or timed out".
+- [ ] **33b.** Same slot, Sapwood over the relay: Turn off. `list_clients`
+  reports `escalate: false` (before this firmware it stayed true and Sapwood
+  says so, pointing at USB). Turn on again over the relay: read back true.
+- [ ] **33c.** End to end for the owner: with 33a's slot on, the app sends a
+  request that needs the button. The board shows no card, the Signet app
+  (bunker-connected to this signer, holding its operator key, with its
+  natural-person route resolving to this board's `natural-person` persona,
+  which is what decrypts the notice) shows the ask in its inbox. From the
+  code (2026-10-04), an owner who has only ever used Sapwood needs exactly
+  what the Sapwood review lists: Signet paired by Heartwood connect (so it
+  reads `heartwood_list_identities` and listens on the `natural-person`
+  key, not the master), and the operator key imported under Settings,
+  Advanced. Confirm that is enough, and that the ask shows under "Waiting for
+  approval" as "<your name> (you)", with a phone notification reading "An app
+  wants to sign as <name>" (signet-app #17; older Signet says Family asks). Then approve-once there, the app gets its answer. A second same-kind
+  ask within 10 minutes signs without asking (the window the acknowledgement
+  names).
+- [ ] **33d.** USB-mode board over USB: the switch shows OFF with no Turn on
+  button, and the "needs the signer in WiFi mode" reason.
+- [ ] **33e.** `heartwood_pair_wallet` on a flagged slot is refused with "must
+  be approved at the device", never parked.
+- [ ] **33f.** Sapwood's own "Sapwood manager" pairing shows no Approve from
+  my phone control.
+- [ ] **33g.** Signet switch (signet-app #18): in Signet, Advanced settings,
+  under the operator key, the owner's own app is listed and the Signet
+  guardian pairing and any dependant pairing are not. Turn the app on from the
+  phone (tick, Turn on), then Sapwood shows the same pairing ON; turn it off
+  from the phone, Sapwood shows OFF and every other field of that pairing
+  (methods, kinds, auto) is unchanged. With the operator key forgotten, the
+  section says to import it and reads nothing from the board.
+
+## 34. Address proofs (LUD-25; added 2026-10-05, NOT YET BENCH-RUN)
+
+Since LUD-25 `50d740a` (moneyer 0.17) a mint changes or clears a name's `cx1`
+only with `"sig"`: a BIP-340 signature by the purpose-0 index-0 key of the
+branch CURRENTLY on file, over `sha256("LNURLcash:<register|unregister>:
+<domain>:<name>")`. A name registered before then is on file with this
+device's superseded `m/139'/1'` branch (section 15), so without this it could
+not be moved to the current one. `heartwood_note_address_proof`
+`{host, name, action, cx1}` signs it with whichever of the served identity's
+two branches at `host` has that `cx1`, and refuses any other; it answers
+`{ok, host, domain, name, action, cx1, branch, sig, pubkey}`, never a key.
+Advertised in `heartwood_capabilities` and as `note_address_proof_v1` in
+get_status.
+
+Drive it with scripts/nip46-client.mjs from a bound slot (`--method
+heartwood_note_address_proof --params '[{"host":"moneyer.dev","name":"<name>",
+"action":"register","cx1":"<cx1>"}]'`) until notecase grows the command, and
+take the `cx1` on file from the mint (moneyer: `zap_names.cx1`) or from
+`heartwood_note_address`.
+
+1. Move a name off the superseded branch: for a name whose `zap_names.cx1` is
+   the old branch, ask for a `register` proof naming THAT `cx1`. Expect an
+   ADDRESS PROOF card reading `<name>@moneyer.dev` over `register, old keys`
+   (watch the OLED, not only the CLI); hold. The reply's `branch` is
+   `superseded`. POST the registration with the new `cx1` (from
+   `heartwood_note_address`), the returned `sig` and the owner's NIP-98 (its
+   own HOLD TO SIGN card for kind 27235): moneyer answers `updated: true` and
+   `zap_names.cx1` is now the current branch. A zap then lands on a key of the
+   current branch (section 15 item 2).
+2. A `register` proof naming the current branch's `cx1` reads `register,
+   current keys` and answers `branch: current`; an `unregister` proof reads
+   `unregister, ...` and, POSTed with `cx1: null`, clears the name's branch.
+3. Refused with NO card, `bad_request` each time: a `cx1` of another npub, this
+   npub's `cx1` at another mint, a `cx1` that is not one (`cx1nope`), an
+   uppercase or two-letter name, `action` other than register/unregister, and
+   a host with a scheme or path. This is the one that matters: a hold is
+   never spent on a proof that could not be signed.
+4. Decline it, and let one time out: both answer as errors, no `sig`.
+5. Pinned always-ask: on a slot whose policy names
+   `heartwood_note_address_proof` with auto-approve, the card MUST still
+   appear.
+6. Never batched: two proofs sent back to back from one client raise two
+   cards, one after the other, each with its own address and action; one hold
+   never answers both.
+7. Escalate slot (section 24): the proof is refused outright, not parked. It
+   is device-press-only (`Nip46Method::device_press_only`), like a wallet
+   pairing: a proof is a standing authority over where a name pays, so no
+   guardian verdict may stand in for the owner at the board.
+7a. Two `heartwood_note_trust` asks for different senders, back to back from
+   one client, raise two TRUST SENDER cards, each with its own npub; one hold
+   never trusts both (they used to batch onto the first card).
+8. USB-bridged board through heartwoodd: the card is the extension card
+   (master heading, the method name, then the preview), not the titled
+   ADDRESS PROOF card. KNOWN: `show_master_sign_request` cuts the preview to
+   one small line's worth of characters, so the address shows and the action
+   is cut to `regi...` / `unre...`, as every note card's second line is cut on
+   that path today (trust loses "notes skip the hold"). Record what the panel
+   shows; a titled card on that path is a follow-up for all note cards. Over
+   the cable's 0x70 frame, `cash_address_proof` answers `bad_request` ("not
+   available on this surface"), as `cash_address` does.
+9. Unbound client: `unauthorised`, like every other note method.
+
+## 35. The relay loop proves delivery, not liveness (added 2026-10-08, NOT YET BENCH-RUN)
+
+Field failure, 2026-10-07, T-Display on v0.18.0-beta.25 in WiFi mode: the
+network page said online and the button worked, but an unpaired client's
+`ping` (normally `pong` in about 0.7 s, no press) went unanswered on all four
+configured relays, probed from two networks. The relay-health watchdog never
+fired, so a session existed and the heap was fine. A power cycle cured it;
+there are no logs from the stall. The keepalive (ping every 20 s, re-REQ every
+40 s, 50 s silence limit) proves the socket, not the subscription: pongs and
+the EOSE each re-REQ provokes keep `last_rx` fresh on a session whose EVENTs
+have stopped reaching the handler.
+
+Each live session now publishes a probe that its own subscription must
+deliver back (`common/src/delivery_probe.rs`): kind 24133 (the NIP-46
+filter), authored by a per-boot ephemeral key and p-tagged to that same key,
+which the live REQ adds to the 24133 filter's `#p` list, with a
+`["hwprobe", "<nonce>"]` tag. No served identity is addressed, so another
+signer of the same master never receives one. The first goes out 30 s after the
+subscription, then every 3 min. A probe not back within 20 s is a miss
+(`delivery self-check: probe not delivered back` at warn), and the next one
+goes out 30 s later; two misses in a row drop the session (`delivery
+self-check failed (selfcheck <host> r<index> d<s since delivered> rx<last_rx
+age> q<re-REQs> h<free>k/<largest>k)`) and the ordinary reconnect path redials
+it, rotating the primary. Nothing is sent or judged while a card is open, an
+OTA runs or a network trial runs, and a wait that spans a blocked loop is
+restarted, not counted. A relay that answers the probe `OK false` turns the
+check off for that session; a relay that has never delivered a probe this boot
+gets one redial for it and is then left alone (it may not echo events to
+their publisher). Three self-check redials in a row with no probe delivered
+on any session in between, at least one of them on a relay that has delivered
+this boot, take the relay-health watchdog's controlled restart, crumb `relay
+watchdog: selfcheck x3 ...`, which `get_status.crashed_during` reports after
+the reboot. `get_status` carries `delivery_selfcheck: {redials, streak,
+last_reason}` and the capability `relay_delivery_selfcheck_v1`.
+
+1. Idle soak. Flash, unlock, leave the board idle on its usual relays with the
+   serial tap running (`scripts/serial-log.mjs`). From another machine, run an
+   unpaired ping once a minute, each to ONE relay in turn, for at least two
+   hours:
+   `node scripts/nip46-client.mjs --target <master hex> --client-key-file
+   /tmp/soak.key --method ping --relay wss://<relay> --timeout 10000`.
+   Every ping is answered. The log shows `delivery probe N back on <host>`
+   about every 3 min per live session and no `delivery self-check` warning.
+   `scripts/mgmt-request.mjs --method get_status` shows `delivery_selfcheck`
+   at `redials: 0`, `streak: 0`, `last_reason: null`, and the capability.
+2. Nothing user-visible: through the soak the panel blanks on time and stays
+   blank (a probe never wakes it), the sign audit has no probe in it, and no
+   card ever appears for one. A Pi heartwoodd (or any other signer) serving
+   the same master logs nothing for the probes.
+3. A forced deaf session. Run a throwaway relay you control behind TLS, as
+   section 16's failover record did at `wss://relaybench.forgesworn.dev`,
+   patched in as relay 0 with `scripts/net-relays.mjs`, built to stop
+   delivering EVENTs to existing subscriptions on a signal (SIGUSR1, say)
+   while it keeps answering pings, REQs (with EOSE) and `OK` for publishes.
+   That is the 2026-10-07 state. Once the device is online on it and its
+   probes are coming back, send the signal. Within about 4 min the log shows
+   two misses then `delivery self-check failed (selfcheck <bench host> r0 ...)`,
+   the primary rotates to relay 1 (`net-config` `relay_index` 1), a ping on
+   relay 1 is answered, and `get_status` shows `redials: 1` with that reason.
+   Do not use a router block or a killed relay process instead: both end the
+   socket, which is the silence limit's case, not this one.
+4. Escalation (needs the bench relay in 3 to drop every subscription, and the
+   other relays removed from the list so rotation only finds it): three
+   self-check redials in a row and the board restarts, logging
+   `restarting, as the relay-health watchdog does`; after the reboot
+   `get_status.crashed_during` reads `relay watchdog: selfcheck x3 ...` and
+   `last_reset` is `software-restart`.
+5. Refusal: patch in a relay that refuses unknown authors (`OK false`, an
+   allowlisted or paid relay). The log shows `refused the delivery probe;
+   self-check off for this session` once per connection and the session is
+   never redialled for it.
+6. Suppression: with an approval card on screen past a probe's due time, no
+   probe goes out until the card resolves; a cable enrol card (about 55 s)
+   held across an outstanding probe never produces a miss.
+7. T-Display (no PSRAM): the heap log does not drift through the soak, and the
+   largest block stays where it was before the soak began.
+8. A relay that refuses us is left alone. On the bench relay from 3, make it
+   answer the device's REQ with `["CLOSED","hw","rate-limited: slow down"]`
+   (or a `NOTICE` saying `banned: ...`). The log shows `relay refused us
+   (rate-limited) on <host>; leaving it 15 min` (60 min for `banned`), once;
+   the primary rotates to relay 1 and does not come back to the bench relay
+   until the cooldown ends, and no secondary is dialled to it meanwhile.
+   `net-config` shows `last_error_class: relay_refused`. An HTTP 429 on the
+   upgrade does the same at dial time.
+9. Every relay refusing: with the bench relay as the only relay, refusing
+   every connection, the primary still dials it, once a minute (`every relay
+   refused us recently; trying <host>`), never every 3 s. A refusal after the
+   socket opens never restarts the board; one at the upgrade (no session at
+   all) still takes the health watchdog's restart after 5 min, as any dead
+   relay list does.
+10. Lighter keepalive. With the serial tap at debug, the keepalive re-REQ
+   (`re-subscribed on <host> (keepalive)`) goes out every 2 min per session,
+   and its kind-0 filter reads `"limit":0`; the connect-time REQ keeps
+   `"limit":1` and the idle screen still shows the profile name. Publishing a
+   new kind-0 for the master while the board is up updates the name live.
+   Under a relay you control, count the device's REQs over 30 min: about 15
+   per session, not 45.
+11. Back to relay 1. Make relay 1 drop the board once (restart the bench
+   relay from 3, or block it for a minute) so the primary rotates to relay
+   2, then let relay 1 come back. Within about 15 min the log shows `back to
+   <relay 1>: ...`: `dialling it beside the primary` on a board with room for
+   a second session (Heltec), or `one session fits, so leaving <relay 2> for
+   it` (T-Display, where `secondary_index` stays null), and a ping on relay 1
+   is answered again. With relay 1 kept down, the attempts come 15, 30, 60
+   and then every 120 min, each costing at most one reconnect, and no attempt
+   happens while an approval card is on screen.
 
 ## Notes
 

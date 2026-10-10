@@ -54,6 +54,9 @@ pub enum NetworkRuntimeError {
     RelayProtocol,
     RelayClosed,
     RelaySilent,
+    /// The relay refused this client (rate-limited, banned) and is being left
+    /// alone for a while (`relay_cooldown`).
+    RelayRefused,
     InvalidConfig,
 }
 

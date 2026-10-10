@@ -224,7 +224,9 @@ pub fn handle_encrypted_request(
         } else {
             None
         };
-        let tier = policy_engine.check(owning_slot, &client_pubkey_hex, &method, event_kind);
+        let login = matches!(method, nip46::Nip46Method::SignEvent)
+            && nip46::unsigned_event_is_login_challenge(&request.params);
+        let tier = policy_engine.check_for_event(owning_slot, &client_pubkey_hex, &method, event_kind, login);
         crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
             .then(|| policy_engine.snapshot_slot_state(owning_slot))
     };

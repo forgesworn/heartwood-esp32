@@ -527,12 +527,11 @@ fn current_switch_a_to_b_preserves_both_grants() {
 }
 
 #[test]
-fn full_eight_clients_rejects_ninth_without_eviction() {
+fn full_eight_clients_admits_ninth_by_forgetting_the_oldest() {
     let mut nvs = EspNvs::new();
     let mut engine = PolicyEngine::new();
     let slot = engine.create_slot(0, "many".into(), secret_hex(0x99)).unwrap();
 
-    // Pair 8 distinct clients; 9th must be rejected (no eviction).
     for i in 0u8..8 {
         engine.assign_pubkey_to_slot(0, slot, pubkey_hex(0x40 + i));
     }
@@ -547,25 +546,21 @@ fn full_eight_clients_rejects_ninth_without_eviction() {
         .unwrap_or(0);
     assert_eq!(authorized_count, 8, "exactly 8 authorized clients");
 
-    // 9th client: must not evict; either rejected or capped.
+    // 9th client: admitted, the cap holds, and the oldest goes (FIFO, as
+    // MAX_AUTHORIZED_PUBKEYS documents). Until 2026-10-09 the consent path
+    // refused it instead, which locked a full pairing's owner out.
     let ninth = pubkey_hex(0xFF);
-    engine2.assign_pubkey_to_slot(0, slot, ninth.clone());
+    assert!(engine2.assign_pubkey_to_slot(0, slot, ninth.clone()));
     let after = engine2
         .list_slots(0)
         .iter()
         .find(|s| s.slot_index == slot)
         .map(|s| s.authorized_pubkeys.clone())
         .unwrap_or_default();
-    assert!(
-        after.len() <= 8,
-        "capacity must not exceed MAX_AUTHORIZED_PUBKEYS; got {}",
-        after.len()
-    );
-    // No eviction: the first client granted must still be authorized.
-    assert!(
-        after.contains(&pubkey_hex(0x40)),
-        "the earliest authorized client must not be silently evicted"
-    );
+    assert_eq!(after.len(), 8, "the cap still holds");
+    assert!(after.contains(&ninth));
+    assert!(!after.contains(&pubkey_hex(0x40)), "the oldest client is forgotten");
+    assert!(after.contains(&pubkey_hex(0x41)));
 }
 
 #[test]
@@ -1110,7 +1105,7 @@ fn full_consent_capacity_offers_once_without_evicting_existing_grants() {
 }
 
 #[test]
-fn full_client_capacity_rejects_ninth_and_retains_existing_consent() {
+fn full_pairing_forgets_its_oldest_key_and_keeps_the_rest() {
     use heartwood_common::policy::client_identity_approved;
 
     let mut nvs = EspNvs::new();
@@ -1123,17 +1118,41 @@ fn full_client_capacity_rejects_ninth_and_retains_existing_consent() {
         assert!(engine.record_identity(0, Ok(client), &identity));
     }
     assert!(engine.persist_slots(&mut nvs, 0));
-    let before = engine.list_slots(0)[0].client_grants.clone();
-    let ninth = pubkey_hex(9);
-    assert!(!engine.assign_pubkey_to_slot(0, slot, ninth.clone()));
-    assert_eq!(engine.list_slots(0)[0].client_grants, before);
 
+    // A ninth device: admitted, and the oldest (client 1) is forgotten.
+    let ninth = pubkey_hex(9);
+    assert!(engine.assign_pubkey_to_slot(0, slot, ninth.clone()));
+    assert!(engine.persist_slots(&mut nvs, 0));
     let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
     let retained = &reloaded.list_slots(0)[0];
-    for client in &clients {
+    assert_eq!(retained.current_pubkey.as_deref(), Some(ninth.as_str()));
+    assert!(!heartwood_common::policy::slot_authorizes(retained, &clients[0]));
+    assert!(!retained.authorized_pubkeys.contains(&clients[0]));
+    assert!(!client_identity_approved(retained, Some(&clients[0]), &identity));
+    for client in &clients[1..] {
+        assert!(heartwood_common::policy::slot_authorizes(retained, client));
         assert!(client_identity_approved(retained, Some(client), &identity));
     }
+    // The newcomer has no consent until it is given.
     assert!(!client_identity_approved(retained, Some(&ninth), &identity));
+    assert_eq!(retained.client_grants.as_ref().unwrap().member_count(), 8);
+}
+
+#[test]
+fn full_pairing_never_forgets_the_current_key() {
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "full".into(), secret_hex(2)).unwrap();
+    let clients: Vec<String> = (1..=8).map(pubkey_hex).collect();
+    for client in &clients {
+        assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    }
+    // The oldest key reconnects and becomes current again.
+    assert!(engine.assign_pubkey_to_slot(0, slot, clients[0].clone()));
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(9)));
+    let after = &engine.list_slots(0)[0];
+    // Client 1 was current at the moment of the eviction, so client 2 went.
+    assert!(heartwood_common::policy::slot_authorizes(after, &clients[0]));
+    assert!(!heartwood_common::policy::slot_authorizes(after, &clients[1]));
 }
 
 #[test]
@@ -1445,4 +1464,68 @@ fn on_a_full_partition_the_network_config_and_secrets_are_refused_and_kept() {
         assert!(nvs.replace_blob(key, &[2u8; 32]).is_ok(), "{key}");
         assert_eq!(nvs.backend.get(key).unwrap(), vec![2u8; 32]);
     }
+}
+
+#[test]
+fn login_challenge_is_never_auto_approved_by_the_engine() {
+    use crate::nip46::Nip46Method;
+    use crate::policy::{ApprovalTier, LOGIN_EVENT_KIND};
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "node".into(), secret_hex(1)).unwrap();
+    // Auto-approve with an empty kind list, then with the kind listed.
+    engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![], true).unwrap();
+    let client = pubkey_hex(1);
+    assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    let check = |engine: &PolicyEngine, kind| engine.check_for_event(0, &client, &Nip46Method::SignEvent, Some(kind), kind == LOGIN_EVENT_KIND);
+    assert_eq!(check(&engine, 1), ApprovalTier::AutoApprove);
+    assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    // Plain NIP-42 relay AUTH (22242 without a code tag) is not a login.
+    assert_eq!(
+        engine.check_for_event(0, &client, &Nip46Method::SignEvent, Some(LOGIN_EVENT_KIND), false),
+        ApprovalTier::AutoApprove,
+    );
+    engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![1, LOGIN_EVENT_KIND], true).unwrap();
+    assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    // A guardian's approve-once window cannot lift it either.
+    let key = crate::nip59::method_or_kind_key("sign_event", Some(LOGIN_EVENT_KIND));
+    engine.install_transient_allow(0, client.clone(), key, None, 60);
+    assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    // ...while the same window still lifts an ordinary kind it covers.
+    let key = crate::nip59::method_or_kind_key("sign_event", Some(1));
+    engine.install_transient_allow(0, client.clone(), key, None, 60);
+    assert_eq!(check(&engine, 1), ApprovalTier::AutoApprove);
+}
+
+#[test]
+fn a_login_press_records_no_identity_grant() {
+    use crate::nip46::Nip46Method;
+    use crate::policy::{press_records_identity, ApprovalTier, CardKind, Gate, LOGIN_EVENT_KIND};
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "node".into(), secret_hex(1)).unwrap();
+    engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![1, LOGIN_EVENT_KIND], true).unwrap();
+    let client = pubkey_hex(1);
+    assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    let persona = [0x77u8; 32];
+    let gate = |engine: &PolicyEngine, kind: u64, login: bool| {
+        let tier = engine.check_for_event(0, &client, &Nip46Method::SignEvent, Some(kind), login);
+        assert!(!matches!(tier, ApprovalTier::Denied));
+        engine.gate(0, &client, true, &Nip46Method::SignEvent, "sign_event", Some(kind), tier, false, false, Some(&persona))
+    };
+    // First login as a persona the pairing has no grant for: the grant card.
+    let card = match gate(&engine, LOGIN_EVENT_KIND, true) {
+        Gate::Card(card) => card,
+        other => panic!("expected a grant card, got {other:?}"),
+    };
+    assert!(matches!(card, CardKind::AllowAs { record: true }));
+    // The press on a login records nothing; the same press on any other
+    // sign card still does.
+    assert!(!press_records_identity(Some(card), true));
+    assert!(press_records_identity(Some(card), false));
+    assert!(!press_records_identity(Some(CardKind::AllowAs { record: false }), false));
+    assert!(!press_records_identity(None, false));
+    // A later ordinary request as that persona raises its own grant card.
+    assert_eq!(gate(&engine, 1, false), Gate::Card(CardKind::AllowAs { record: true }));
+    // Control: had a normal press recorded it, the next request would pass.
+    assert!(engine.record_identity(0, Ok(&client), &persona));
+    assert_eq!(gate(&engine, 1, false), Gate::Allow);
 }

@@ -2985,6 +2985,35 @@ last_reason}` and the capability `relay_delivery_selfcheck_v1`.
    and then every 120 min, each costing at most one reconnect, and no attempt
    happens while an approval card is on screen.
 
+## 36. Carried over from the unified-taproot branch (added 2026-10-06, NOT YET BENCH-RUN)
+
+Four things the local LUD-25 branch had that main did not, merged onto main's
+derivation and address proofs. Run against moneyer 0.17 or later.
+
+1. **A plain note confirms with the mint's cs1.** Deposit a plain note into
+   the device with notecase (rotate onto a `new_secret`). The mint answers
+   with a `cs1` whose human-readable part carries the amount (`cs10n1...`),
+   which notecase hands to `confirm` as `sig`. Expect `{"ok":true}`, the note
+   CONFIRMED in the next list with that `sig` stored lowercase. Before this,
+   `confirm` took hex only, answered `bad_request`, and the note sat PENDING.
+2. **A note paid before purposes is still claimed.** Only if a wrap from a
+   mint that had not yet moved to `50d740a` (moneyer before 0.17) was never
+   opened, or a notecase scan finds a note on the old ladder: the claim, with
+   that note's `p`, succeeds and the note collects. Its key is on the
+   superseded `m/139'/1'` branch with no purpose in the tweak. A claim naming
+   a `p` of another identity or mint still answers `bad_request` and stores
+   nothing.
+3. **A mint host's port is a port.** `heartwood_note_address` or a claim for
+   `moneyer.dev:x`, `moneyer.dev:0443` or `moneyer.dev:65536` answers
+   `bad_request`; `moneyer.dev:8443` is accepted. A mint provisioned under the
+   old rule still loads after the flash (its registry entry decodes).
+4. **An unreadable note keeps its place.** Hard to stage on purpose: a note
+   this firmware cannot read (a future record format, a blob sealed under
+   another key) is reported as skipped at boot, and a later creation or
+   removal leaves its id in the index, so the firmware that can read it finds
+   it again. Host tests cover it (`note_store::an_unreadable_note_*`); on the
+   bench, record only that a normal boot reports nothing skipped.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

@@ -98,8 +98,11 @@ per readable note, `id`, `commitment`, `state`, `amount_msat`, `host`,
 `key_index`, `created_at`, `updated_at` and nothing else. `commitment` is the
 public identifier the issuing mint already files the note under
 (note_store::note_commitment_hex - sha256(k1) for a Part 1 note, the note's
-own x-only pubkey for a Part 2 key note, since that is what the mint recovers
-from a ck1; key_index non-null tells them apart). It is NOT called
+own x-only pubkey for a Part 2 key note, which is its taproot Q and what its
+ck1 names; key_index non-null tells them apart). A mint that keys notes by Q
+files a plain note under taproot::bearer_output_key(h) and still reads a
+64-hex h as its short form; h stays the commitment because Q follows from it
+and not the other way round. It is NOT called
 `secret_hash`: for a key note it is not a hash of anything. A second optional
 top-level `note_inventory_unreadable` (u32, omitted when zero) counts notes
 the exporting board held but could not read - sealed at rest, or an unloadable
@@ -324,6 +327,30 @@ speaks in notes and sats and could not name a second proof. The cable has no
 identity, so `cash_address_proof` there refuses before the card, as
 `cash_address` does; on the USB-bridged NIP-46 path the card is the generic
 extension card, as for every note method.
+
+Merged from the local unified-taproot branch (2026-10-06, checklist section
+35, NOT YET BENCH-RUN), on main's derivation and address proofs: `confirm`
+keeps a `cs1` (amount HRP or bare, any case, stored lowercase) as well as hex,
+since a mint at `50d740a` certifies a plain note with one and notecase passes
+it straight through (`note_store::confirmed_sig`; before, the note sat
+PENDING). A claim that names its key tries, after the current and superseded
+branches on its purpose, the superseded branch's pre-purpose ladder (`6e865b1`,
+no `ser32(purpose)`, graded against part2.json's `prePurpose` and the spec's
+vectors 1 and 2), where a mint paid before it moved; the current branch was
+never on it. A mint host's `:` must bring a decimal port, 1 to 65535 with no
+leading zero (`cash_store::valid_host`; a registry entry stored under the old
+character rule still decodes). The note store keeps every indexed id it could
+not read (a newer record format, a blob sealed under another key, a failed
+read) through each index rewrite, counts it against the cap and never reuses
+its id, so a record this firmware cannot read is never orphaned for the one
+that can; an id whose blob is absent is still dropped. Older firmware does not
+do this: a note certified with an amount-bearing `cs1` fails its cs1 check and
+is dropped from its index on its next write, so collect those before a
+downgrade. `common/src/taproot.rs` holds LUD-25's taproot arithmetic, graded
+intermediate by intermediate against the spec's vectors 3 and 5
+(tests/fixtures/lud25-taproot.json): `cash_key::key_path_sighash` delegates to
+it, and a bearer note's `Q` (one `OP_SHA256` leaf under the NUMS point) is
+there for the record, not used on the wire.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

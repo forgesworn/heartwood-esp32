@@ -113,6 +113,30 @@ pub(crate) mod backend {
         let signature = key.sign_raw(message, &[0u8; 32]).map_err(|_| "signing failed")?;
         Ok(signature.to_bytes())
     }
+
+    /// BIP-341's tweak of a public key: `lift_x(x) + t·G`, returned as its x
+    /// coordinate and whether its y is odd. Public data only (an internal
+    /// key and a hash), so nothing here is secret. Refuses an `x` that is
+    /// not on the curve, `t >= n` and the point at infinity, as BIP-341 does.
+    #[cfg(feature = "cash")]
+    pub fn xonly_tweak_add(x: &[u8; 32], tweak: &[u8; 32]) -> Result<([u8; 32], bool), &'static str> {
+        use k256::elliptic_curve::ff::PrimeField;
+        use k256::elliptic_curve::group::Group;
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::{ProjectivePoint, Scalar};
+        let internal = k256::schnorr::VerifyingKey::from_bytes(x).map_err(|_| "not an x-only point")?;
+        let t: Option<Scalar> = Scalar::from_repr(k256::FieldBytes::from(*tweak)).into();
+        let t = t.ok_or("taproot tweak out of range")?;
+        let tweaked = ProjectivePoint::from(*internal.as_affine()) + ProjectivePoint::GENERATOR * t;
+        if bool::from(tweaked.is_identity()) {
+            return Err("taproot tweak gave the point at infinity");
+        }
+        let encoded = tweaked.to_affine().to_encoded_point(true);
+        let bytes = encoded.as_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes[1..33]);
+        Ok((out, bytes[0] == 0x03))
+    }
 }
 
 #[cfg(feature = "secp256k1-backend")]
@@ -165,6 +189,19 @@ pub(crate) mod backend {
         let signature =
             secp.sign_schnorr_with_aux_rand(&Message::from_digest(*message), &keypair, &[0u8; 32]);
         Ok(signature.serialize())
+    }
+
+    /// `lift_x(x) + t·G`, x and odd-y. See the k256 backend's
+    /// `xonly_tweak_add`.
+    #[cfg(feature = "cash")]
+    pub fn xonly_tweak_add(x: &[u8; 32], tweak: &[u8; 32]) -> Result<([u8; 32], bool), &'static str> {
+        use secp256k1::{Parity, Scalar, XOnlyPublicKey};
+        let secp = Secp256k1::verification_only();
+        let internal = XOnlyPublicKey::from_slice(x).map_err(|_| "not an x-only point")?;
+        let t = Scalar::from_be_bytes(*tweak).map_err(|_| "taproot tweak out of range")?;
+        let (tweaked, parity) =
+            internal.add_tweak(&secp, &t).map_err(|_| "taproot tweak gave the point at infinity")?;
+        Ok((tweaked.serialize(), parity == Parity::Odd))
     }
 }
 

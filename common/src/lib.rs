@@ -114,6 +114,11 @@ pub mod cash_store;
 #[cfg(feature = "cash")]
 pub mod cash_key;
 
+/// LUD-25's taproot arithmetic: a note's output key `Q`, and the canonical
+/// spend's key-path sighash a `ck1` signs.
+#[cfg(feature = "cash")]
+pub mod taproot;
+
 #[cfg(feature = "ota-sign")]
 pub mod ota_sign;
 

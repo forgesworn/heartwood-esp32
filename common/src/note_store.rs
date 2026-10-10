@@ -157,9 +157,11 @@ pub struct Note {
     /// 404s and a note nobody can claim. Stored opaquely; never parsed here.
     pub host: String,
     pub label: String,
-    /// Optional LUD-25 mint signature over (note id, amount): hex for a
-    /// Part 1 note, a `cs1` for a key note. Stored opaquely for the wallet to
-    /// verify — the device never interprets it.
+    /// Optional LUD-25 mint certificate over (note id, amount): a `cs1`, or
+    /// hex from a mint that predates `cs1`. A mint keying notes by `Q` signs
+    /// `hex(Q)` for every note, a plain one included; an older one signed a
+    /// plain note's `h`. Stored opaquely for the wallet to verify, which
+    /// tries both; the device never interprets it.
     pub sig: String,
     pub parent_ids: Vec<String>,
     pub created_at: u32,
@@ -498,13 +500,32 @@ fn is_lower_hex_or_empty(s: &str) -> bool {
     s.is_empty() || is_lower_hex(s)
 }
 
-/// A mint certificate as the locker keeps it: absent, hex (Part 1), or a
-/// lowercase `cs1` (Part 2). Checked, not interpreted: the wallet verifies it.
+/// A mint certificate as the locker keeps it: absent, lowercase hex (what
+/// mints sent before `cs1`), or a lowercase `cs1`. Checked, not interpreted:
+/// the wallet verifies it.
 fn valid_sig(s: &str) -> bool {
     s.len() <= MAX_SIG_LEN
         && (is_lower_hex_or_empty(s)
             || (!s.bytes().any(|b| b.is_ascii_uppercase())
                 && crate::encoding::decode_cs1(s).is_some()))
+}
+
+/// The certificate `confirm` was handed, as the locker will keep it, or
+/// `None` if it is not one.
+///
+/// A mint that files notes by `Q` certifies every note it mints with a
+/// `cs1`, a bearer note included, and the wallet passes that straight to
+/// `confirm`. So `confirm` takes a `cs1` as well as hex; refusing one would
+/// leave a note the mint had already credited PENDING on the device, with
+/// the wallet retrying the same refused confirm on every reconnect. A `cs1`
+/// may arrive in upper case (BIP-350 allows either) and is stored lowercase.
+fn confirmed_sig(sig: &str) -> Option<String> {
+    let sig = if crate::encoding::decode_cs1(sig).is_some() {
+        sig.trim().to_ascii_lowercase()
+    } else {
+        sig.to_string()
+    };
+    valid_sig(&sig).then_some(sig)
 }
 
 /// `sha256(secret)` as lowercase hex — the `h` a wallet registers with the
@@ -519,19 +540,25 @@ pub fn secret_hash_hex(secret: &[u8; SECRET_LEN]) -> String {
 /// that issued it already files it, and the only thing about a note's secret
 /// that may leave the device without a button behind it.
 ///
-/// Two shapes, because LUD-25 has two:
+/// Two shapes, one per kind of note:
 ///
-///  - **Part 1** (a note behind a hash) commits as [`secret_hash_hex`]:
-///    `sha256(k1)`, which is `_note_id` in lnurl-mint's ledger.
-///  - **Part 2** (a note paid to one of this device's keys, [`KeyNote`]) has
-///    no preimage at all: its `secret` IS a private key, and the mint files
-///    the note under the matching x-only PUBLIC key, recovering it from the
-///    `ck1` a spend presents. So the commitment is that public key.
+///  - **A plain (bearer) note** commits as [`secret_hash_hex`]: `h =
+///    sha256(k1)`. A mint that predates taproot notes files it under `h`
+///    (`_note_id` in lnurl-mint's ledger). One that files every note by its
+///    output key files it under `Q = taproot::bearer_output_key(h)`, and
+///    reads a bare 64-hex `h` wherever a `cp1` goes as that note's short
+///    form. `h` stays the commitment because it names the note at both: `Q`
+///    follows from `h` in public and `h` cannot be had from `Q`, and a reader
+///    of an older backup never has to guess which of the two a record holds.
+///  - **A key note** ([`KeyNote`]) has no preimage at all: its `secret` IS a
+///    private key, and the mint files the note under the matching x-only
+///    PUBLIC key, which is also its `Q` (a key note takes no tweak) and which
+///    its `ck1` carries. So the commitment is that public key.
 ///
-/// Hashing a Part 2 note's secret would produce 64 hex characters that no
-/// mint has ever seen and that prove nothing to anybody; the public key is
-/// both the honest commitment and the useful one. A reader tells the two
-/// apart by whether the note carries a key index.
+/// Hashing a key note's secret would produce 64 hex characters that no mint
+/// has ever seen and that prove nothing to anybody; the public key is both
+/// the honest commitment and the useful one. A reader tells the two apart by
+/// whether the note carries a key index.
 ///
 /// Both are 32 bytes, lowercase hex, and neither is invertible to the secret:
 /// one is a preimage-resistant digest, the other a discrete log.
@@ -565,6 +592,15 @@ pub struct NoteStore {
     cap: usize,
     /// The newest stamp any held record carries. See [`Self::stamp`].
     stamp_floor: u32,
+    /// Indexed ids whose blob is on flash but this boot could not read: a
+    /// record format newer than this firmware, a sealed blob under another
+    /// key, a read that failed. Every index rewrite keeps them, so a note
+    /// this firmware cannot read is never dropped from the index and
+    /// orphaned for the firmware that can. They count against the cap (the
+    /// index blob holds at most `cap` ids) and no new note takes their id.
+    /// An id whose blob is simply absent is not kept: there is nothing
+    /// behind it to orphan.
+    unreadable: Vec<String>,
 }
 
 /// The outcome of loading: the store, plus any indexed ids whose blobs were
@@ -588,13 +624,14 @@ impl NoteStore {
             Ok(None) => Vec::new(),
             Err(_) => {
                 return LoadOutcome {
-                    store: NoteStore { notes: Vec::new(), index_known: false, cap, stamp_floor: 0 },
+                    store: NoteStore::storage_unavailable(cap),
                     skipped: Vec::new(),
                 }
             }
         };
         let mut notes = Vec::new();
         let mut skipped = Vec::new();
+        let mut unreadable = Vec::new();
         for id in ids {
             match storage.load_note(&id) {
                 Ok(Some(mut blob)) => {
@@ -602,19 +639,26 @@ impl NoteStore {
                     blob.zeroize(); // the raw blob embeds the secret
                     match decoded {
                         Some(note) if note.id == id => notes.push(note),
-                        _ => skipped.push(id),
+                        _ => {
+                            unreadable.push(id.clone());
+                            skipped.push(id);
+                        }
                     }
                 }
-                _ => skipped.push(id),
+                Ok(None) => skipped.push(id),
+                Err(_) => {
+                    unreadable.push(id.clone());
+                    skipped.push(id);
+                }
             }
         }
         let stamp_floor = notes.iter().map(|n| n.created_at.max(n.updated_at)).max().unwrap_or(0);
-        LoadOutcome { store: NoteStore { notes, index_known: true, cap, stamp_floor }, skipped }
+        LoadOutcome { store: NoteStore { notes, index_known: true, cap, stamp_floor, unreadable }, skipped }
     }
 
     /// Fail-closed constructor for a boot whose storage never came up at all.
     pub fn storage_unavailable(cap: usize) -> NoteStore {
-        NoteStore { notes: Vec::new(), index_known: false, cap, stamp_floor: 0 }
+        NoteStore { notes: Vec::new(), index_known: false, cap, stamp_floor: 0, unreadable: Vec::new() }
     }
 
     /// The stamp a write carries: `now`, unless that would sort at or before
@@ -903,10 +947,7 @@ impl NoteStore {
         if host.is_empty() || host.len() > MAX_HOST_LEN {
             return Err(NoteError::BadRequest);
         }
-        let sig = sig.unwrap_or("");
-        if sig.len() > MAX_SIG_LEN || !is_lower_hex_or_empty(sig) {
-            return Err(NoteError::BadRequest);
-        }
+        let sig = confirmed_sig(sig.unwrap_or("")).ok_or(NoteError::BadRequest)?;
         let idx = self.find(id)?;
         if self.notes[idx].state != NoteState::Pending {
             return Err(NoteError::InvalidState);
@@ -915,7 +956,7 @@ impl NoteStore {
         updated.state = NoteState::Confirmed;
         updated.amount_msat = amount_msat;
         updated.host = host.to_string();
-        updated.sig = sig.to_string();
+        updated.sig = sig;
         updated.updated_at = now;
         self.persist_rewrite(storage, idx, updated)
     }
@@ -945,10 +986,10 @@ impl NoteStore {
     }
 
     /// Reveal a CONFIRMED note's `k1`: its secret as hex, or for a key note
-    /// the `ck1` its key signs for the note's own mint, which is what a wallet
-    /// presents to spend it there.
-    /// The key itself never leaves. State check only — the physical gate is
-    /// the dispatcher's job, exactly the `vault.c` split.
+    /// the `ck1` its key signs for the note's own mint, which is what a
+    /// wallet presents to spend it there. The key itself never leaves. State
+    /// check only: the physical gate is the dispatcher's job, exactly the
+    /// `vault.c` split.
     pub fn export_secret(&self, id: &str) -> Result<String, NoteError> {
         self.can_export(id)?;
         let idx = self.find(id)?;
@@ -956,6 +997,8 @@ impl NoteStore {
         if note.key.is_none() {
             return Ok(hex_encode(&note.secret));
         }
+        // Bound to the mint the note is at, which is all the ck1 is good
+        // for: the same string is refused by every other mint.
         #[cfg(feature = "cash")]
         return crate::cash_key::ck1_of(&note.secret, &note.host).map_err(|_| NoteError::InvalidState);
         // A build that cannot sign never made a key note, and cannot spend one.
@@ -1307,7 +1350,7 @@ impl NoteStore {
             // Creating would rewrite an index this boot cannot see.
             return Err(NoteError::StorageFull);
         }
-        if self.notes.len() + adding > self.cap {
+        if self.notes.len() + self.unreadable.len() + adding > self.cap {
             return Err(NoteError::StorageFull);
         }
         Ok(())
@@ -1326,7 +1369,9 @@ impl NoteStore {
             let mut raw = [0u8; ID_LEN / 2];
             rng(&mut raw);
             let id = hex_encode(&raw);
-            let clashes = self.notes.iter().any(|n| n.id == id) || also_not == Some(id.as_str());
+            let clashes = self.notes.iter().any(|n| n.id == id)
+                || self.unreadable.contains(&id)
+                || also_not == Some(id.as_str());
             if !clashes {
                 return Some(id);
             }
@@ -1378,6 +1423,12 @@ impl NoteStore {
         })
     }
 
+    /// Every id the index names that this boot keeps: the notes it read, then
+    /// the ones it could not ([`Self::unreadable`]), so no rewrite drops those.
+    fn indexed_ids(&self) -> Vec<String> {
+        self.notes.iter().map(|n| n.id.clone()).chain(self.unreadable.iter().cloned()).collect()
+    }
+
     /// Persist freshly created notes: every blob first, then one index write,
     /// then RAM. A failure anywhere leaves RAM (and the index) without the
     /// new notes; stranded blobs are unreferenced and get overwritten by a
@@ -1393,7 +1444,7 @@ impl NoteStore {
             blob.zeroize(); // the encoded record embeds the raw secret
             saved.map_err(|_| NoteError::StorageFull)?;
         }
-        let mut ids: Vec<String> = self.notes.iter().map(|n| n.id.clone()).collect();
+        let mut ids = self.indexed_ids();
         ids.extend(new_notes.iter().map(|n| n.id.clone()));
         storage.save_index(&ids).map_err(|_| NoteError::StorageFull)?;
         self.notes.extend(new_notes);
@@ -1424,12 +1475,8 @@ impl NoteStore {
             return Err(NoteError::StorageFull);
         }
         let removed_id = self.notes[idx].id.clone();
-        let ids: Vec<String> = self
-            .notes
-            .iter()
-            .filter(|n| n.id != removed_id)
-            .map(|n| n.id.clone())
-            .collect();
+        let mut ids = self.indexed_ids();
+        ids.retain(|id| *id != removed_id);
         storage.save_index(&ids).map_err(|_| NoteError::StorageFull)?;
         // The blob is unreferenced now; a failed delete strands bytes, not
         // state, and the id-reuse path overwrites them.
@@ -1747,7 +1794,8 @@ mod tests {
     #[test]
     fn a_key_note_exports_its_ck1_and_never_its_key() {
         // lnurlcash-conformance part2.json, the first branch's first note,
-        // whose ck1 is bound to that branch's domain.
+        // whose ck1 is bound to that branch's domain. The locker stores the
+        // endpoint, path and all, and the path never reaches the signature.
         let vectors: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
         let note = &vectors["branches"][0]["notes"][0];
@@ -1763,7 +1811,66 @@ mod tests {
         let (id, _) = store
             .import_key(&mut storage, &mut rng, &secret, key, &endpoint, 1_000, "", 1)
             .unwrap();
-        assert_eq!(store.export_secret(&id).unwrap(), note["ck1"].as_str().unwrap());
+        let k1 = store.export_secret(&id).unwrap();
+        assert_eq!(k1, note["ck1"].as_str().unwrap());
+        assert!(!k1.contains(&hex_encode(&secret)));
+
+        // The same key at another mint is another ck1: nothing one mint has
+        // seen spends it anywhere else.
+        let mut storage = FakeStorage::new();
+        let mut store = fresh_store(&mut storage);
+        let (id, _) = store
+            .import_key(&mut storage, &mut rng, &secret, key, "elsewhere.example/w", 1_000, "", 1)
+            .unwrap();
+        let elsewhere = store.export_secret(&id).unwrap();
+        assert_ne!(elsewhere, k1);
+        assert_eq!(elsewhere, crate::cash_key::ck1_of(&secret, "elsewhere.example").unwrap());
+    }
+
+    #[test]
+    fn confirm_keeps_a_cs1_as_well_as_hex() {
+        // A mint that files notes by Q certifies a bearer note with a cs1,
+        // and the wallet hands it straight to confirm. LUD-25 test vector 5's
+        // certificate, for a note at mint.example.
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
+        let cs1 = vectors["vector5"]["cs1"].as_str().unwrap();
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let mut confirm_with = |sig: &str| {
+            let (id, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 1).unwrap();
+            let result = store.confirm(&mut storage, &id, 1_000, "mint.example/w", Some(sig), 2);
+            (result, store.get_meta(&id).unwrap())
+        };
+
+        let (result, meta) = confirm_with(cs1);
+        assert_eq!(result, Ok(()));
+        assert_eq!((meta.state, meta.sig.as_str()), (NoteState::Confirmed, cs1));
+        // BIP-350 allows all upper case; the locker keeps it lowercase.
+        let (result, meta) = confirm_with(&cs1.to_uppercase());
+        assert_eq!(result, Ok(()));
+        assert_eq!(meta.sig, cs1);
+        // Hex, as mints sent before cs1, is kept as it was.
+        let (result, meta) = confirm_with(&"ab".repeat(65));
+        assert_eq!(result, Ok(()));
+        assert_eq!(meta.sig, "ab".repeat(65));
+
+        // Anything that is neither is still refused, and the note stays
+        // PENDING for the wallet to confirm properly.
+        let mut broken = String::from(cs1);
+        broken.pop();
+        broken.push(if cs1.ends_with('q') { 'p' } else { 'q' });
+        let mixed = format!("{}{}", &cs1[..10].to_uppercase(), &cs1[10..]);
+        for bad in [broken.as_str(), mixed.as_str(), "not a certificate", "AB"] {
+            let (result, meta) = confirm_with(bad);
+            assert_eq!(result, Err(NoteError::BadRequest), "{bad}");
+            assert_eq!(meta.state, NoteState::Pending, "{bad}");
+        }
+
+        // And a confirmed cs1 survives a reload.
+        let reloaded = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert!(reloaded.list(0, MAX_NOTES).notes.iter().any(|n| n.sig == cs1));
     }
 
     #[test]
@@ -2287,6 +2394,93 @@ mod tests {
         // The corrupt bytes were not erased — left for a firmware that
         // understands them.
         assert!(storage.notes.contains_key(&id_a));
+    }
+
+    #[test]
+    fn an_unreadable_note_keeps_its_place_in_the_index() {
+        // A record this firmware cannot read (here a version it does not
+        // know, as a newer firmware's would be) must survive every index
+        // rewrite, so flashing the firmware that reads it finds it again.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let mut import = |store: &mut NoteStore, storage: &mut FakeStorage, byte: &str| {
+            store.import_secret(storage, &mut rng, &byte.repeat(SECRET_LEN), "m.example/w", 1, "", 1).unwrap().0
+        };
+        let newer = import(&mut store, &mut storage, "a1");
+        let kept = import(&mut store, &mut storage, "b2");
+        let absent = import(&mut store, &mut storage, "c3");
+        let original = storage.notes.get(&newer).unwrap().clone();
+        let mut from_the_future = original.clone();
+        from_the_future[4] = 99;
+        storage.notes.insert(newer.clone(), from_the_future.clone());
+        storage.notes.remove(&absent);
+
+        let outcome = NoteStore::load(&mut storage, MAX_NOTES);
+        assert_eq!(outcome.skipped, vec![newer.clone(), absent.clone()]);
+        let mut store = outcome.store;
+        assert_eq!(store.counts(), (1, 0));
+
+        // A creation and a removal both rewrite the index. (Another RNG
+        // stream, so the new note does not happen to reuse the absent id.)
+        let mut rng = |buf: &mut [u8]| buf.fill(0x77);
+        let (added, _) = store
+            .import_secret(&mut storage, &mut rng, &"d4".repeat(SECRET_LEN), "m.example/w", 1, "", 2)
+            .unwrap();
+        store.mark_spent(&mut storage, &kept, 3).unwrap();
+        store.delete(&mut storage, &kept).unwrap();
+        let index = storage.index.clone().unwrap();
+        assert!(index.contains(&newer), "{index:?}");
+        assert!(index.contains(&added));
+        assert!(!index.contains(&kept));
+        // An id with nothing behind it has nothing to orphan, and goes.
+        assert!(!index.contains(&absent));
+        assert_eq!(storage.notes.get(&newer), Some(&from_the_future));
+
+        // The firmware that reads it finds it where it left it.
+        storage.notes.insert(newer.clone(), original);
+        let back = NoteStore::load(&mut storage, MAX_NOTES);
+        assert!(back.skipped.is_empty());
+        assert!(back.store.get_meta(&newer).is_some());
+        assert!(back.store.get_meta(&added).is_some());
+    }
+
+    #[test]
+    fn an_unreadable_note_holds_its_slot_and_its_id() {
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let (unread, _) = store
+            .import_secret(&mut storage, &mut rng, &"a1".repeat(SECRET_LEN), "m.example/w", 1, "", 1)
+            .unwrap();
+        storage.notes.get_mut(&unread).unwrap()[4] = 99;
+
+        // The index holds at most `cap` ids, the unreadable one among them.
+        let mut store = NoteStore::load(&mut storage, 2).store;
+        store.import_secret(&mut storage, &mut rng, &"b2".repeat(SECRET_LEN), "m.example/w", 1, "", 2).unwrap();
+        assert_eq!(
+            store
+                .import_secret(&mut storage, &mut rng, &"c3".repeat(SECRET_LEN), "m.example/w", 1, "", 3)
+                .err(),
+            Some(NoteError::StorageFull)
+        );
+
+        // No new note takes its id, even when the RNG offers it first.
+        let mut store = NoteStore::load(&mut storage, MAX_NOTES).store;
+        let raw = crate::hex::hex_decode(&unread).unwrap();
+        let mut offers = vec![raw.clone(), vec![0x0f, 0x0e, 0x0d, 0x0c]].into_iter();
+        let mut rigged = |buf: &mut [u8]| {
+            if buf.len() == raw.len() {
+                buf.copy_from_slice(&offers.next().unwrap());
+            } else {
+                buf.fill(0x55);
+            }
+        };
+        let (id, _) = store
+            .import_secret(&mut storage, &mut rigged, &"d4".repeat(SECRET_LEN), "m.example/w", 1, "", 4)
+            .unwrap();
+        assert_eq!(id, "0f0e0d0c");
+        assert_eq!(storage.notes.get(&unread).unwrap()[4], 99);
     }
 
     #[test]

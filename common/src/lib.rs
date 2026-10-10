@@ -68,6 +68,17 @@ pub mod approval_queue;
 
 pub mod held_reply;
 
+/// The relay loop's delivery self-check: each live session must have its own
+/// probe delivered back, or it is redialled.
+pub mod delivery_probe;
+
+/// Relays that refused the client (rate-limited, banned) are left alone for a
+/// while rather than redialled.
+pub mod relay_cooldown;
+
+/// Getting back to the first configured relay after the rotation moved off it.
+pub mod home_relay;
+
 pub mod wrap_ledger;
 
 pub mod rendezvous_receipts;

@@ -16,7 +16,10 @@ pub const MAX_CONNECT_SLOTS: u8 = 16;
 
 /// Maximum client pubkeys retained per slot. A slot's secret is a shared
 /// credential, so every device that pairs with it is remembered and stays
-/// auto-approved. Beyond this cap the oldest entry is dropped (FIFO). Keep
+/// auto-approved. Beyond this cap the oldest entry is dropped (FIFO), never
+/// the current one, on both the legacy and the per-client-consent path
+/// (`authorize_pubkey_on_slot`; the consent path refused a ninth key from
+/// 2026-09-22 until 2026-10-09). Keep
 /// this modest: the persisted blob for all 16 slots must fit the NVS read
 /// buffer in the firmware's `load_from_nvs`.
 pub const MAX_AUTHORIZED_PUBKEYS: usize = 8;
@@ -1233,7 +1236,31 @@ pub fn remove_authorized_pubkey(
 pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
     if let Some(grants) = &mut slot.client_grants {
         let Some(key) = decode_client_key(pubkey) else { return false; };
-        if grants.add_client(key).is_err() { return false; }
+        // A full pairing forgets its oldest key, as `MAX_AUTHORIZED_PUBKEYS`
+        // always promised, rather than refusing the newcomer. Never the
+        // current key, and with it go only that key's own consent records,
+        // so a device that comes back later is new and asks again. A new key
+        // on a pairing that can sign gets here only after the owner's hold.
+        let mut next = grants.clone();
+        let mut evicted = None;
+        match next.add_client(key) {
+            Ok(_) => {}
+            Err(crate::client_grants::GrantError::ClientCapacity) => {
+                let current = slot.current_pubkey.as_deref().and_then(decode_client_key);
+                let Some(oldest) = next.client_keys().into_iter().find(|k| Some(*k) != current) else {
+                    return false;
+                };
+                if next.remove_client(&oldest).is_err() || next.add_client(key).is_err() {
+                    return false;
+                }
+                evicted = Some(oldest);
+            }
+            Err(_) => return false,
+        }
+        *grants = next;
+        if let Some(oldest) = evicted {
+            slot.authorized_pubkeys.retain(|p| decode_client_key(p) != Some(oldest));
+        }
         slot.was_bound = true;
         if let Some(previous) = slot.current_pubkey.take() {
             if !slot.authorized_pubkeys.contains(&previous) { slot.authorized_pubkeys.push(previous); }

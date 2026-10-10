@@ -1232,6 +1232,52 @@ fn an_ordinary_change_on_a_full_partition_is_saved_too() {
     assert_eq!(reloaded.list_slots(0).iter().find(|s| s.slot_index == 2).unwrap().label, "renamed");
 }
 
+/// One pairing holding eight client keys, on a board with the bench V4's
+/// headroom. A ninth key forgets the oldest, so the table is rewritten whole.
+fn full_pairing_at_bench_headroom() -> (EspNvs<NvsDefault>, PolicyEngine, u8, Vec<String>) {
+    let mut nvs = EspNvs::new();
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "full".into(), secret_hex(2)).unwrap();
+    let clients: Vec<String> = (1..=8).map(pubkey_hex).collect();
+    for client in &clients {
+        assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    }
+    assert!(engine.persist_slots(&mut nvs, 0));
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    (nvs, engine, slot, clients)
+}
+
+#[test]
+fn a_ninth_key_on_a_full_pairing_lands_on_a_full_partition() {
+    let (mut nvs, mut engine, slot, clients) = full_pairing_at_bench_headroom();
+    let ninth = pubkey_hex(9);
+    assert!(engine.assign_pubkey_to_slot(0, slot, ninth.clone()));
+    assert!(engine.persist_slots(&mut nvs, 0));
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    let retained = &reloaded.list_slots(0)[0];
+    assert_eq!(retained.current_pubkey.as_deref(), Some(ninth.as_str()));
+    assert!(!retained.authorized_pubkeys.contains(&clients[0]), "the oldest is forgotten");
+    for client in &clients[1..] {
+        assert!(heartwood_common::policy::slot_authorizes(retained, client));
+    }
+}
+
+/// Pins the documented residual, so a change to it is a decision and not an
+/// accident: with no room for a second copy the pairing table is rewritten
+/// erase-first, so a failed write loses every pairing of that identity until
+/// a restart, not only the newcomer. A full pairing meets this on each new key.
+#[test]
+fn a_ninth_key_whose_write_fails_loses_the_table_and_blocks_it_until_restart() {
+    let (mut nvs, mut engine, slot, _) = full_pairing_at_bench_headroom();
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(9)));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert!(!engine.persist_slots(&mut nvs, 0), "the write failed, so it is not saved");
+    assert!(nvs::write_blocked(CONNSLOTS_0), "nothing rewrites that table this boot");
+    assert!(engine.restart_needed(0));
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    assert!(reloaded.list_slots(0).is_empty(), "fails closed: no pairing gains access");
+}
+
 #[test]
 fn a_small_value_is_retried_after_the_erase_and_a_large_one_is_not() {
     // One chunk (at most 400 bytes): a failed write after the erase is tried

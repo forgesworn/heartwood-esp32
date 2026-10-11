@@ -1034,6 +1034,7 @@ dependencies = [
  "esp-idf-hal",
  "esp-idf-svc",
  "heartwood-common",
+ "hmac",
  "log",
  "mipidsi",
  "qrcodegen-no-heap",

@@ -22,6 +22,8 @@ const MANIFEST_FRAME: usize = 356;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum InventoryHold {
+    Storage,
+    Changed,
     Custody,
     Missing,
     Format,
@@ -29,6 +31,21 @@ pub(crate) enum InventoryHold {
     Binding,
     Chain,
     Records,
+}
+
+pub(super) fn expected_blob_width(key: &str) -> Option<usize> {
+    match key {
+        "anchor" => Some(ANCHOR_FRAME),
+        "snap0" | "snap1" => Some(SNAP_FRAME),
+        k if k.len() == 3
+            && k.as_bytes()[0] == b'm'
+            && k.as_bytes()[1..].iter().all(u8::is_ascii_digit) =>
+        {
+            let n = (k.as_bytes()[1] - b'0') * 10 + k.as_bytes()[2] - b'0';
+            (1..=32).contains(&n).then_some(MANIFEST_FRAME)
+        }
+        _ => None,
+    }
 }
 
 /// The future adapter must enumerate ALL keys, read exact blobs, propagate any

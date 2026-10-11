@@ -188,3 +188,6 @@ mod held_data_key;
 #[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
 #[path = "../../firmware/src/allocation_root.rs"]
 mod allocation_root;
+
+#[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
+mod allocation_nvs_host_sys;

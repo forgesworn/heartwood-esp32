@@ -5,6 +5,8 @@ use crate::held_data_key;
 use std::sync::Mutex;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+#[path = "allocation_journal_nvs_host_tests.rs"]
+mod nvs_reader_tests;
 
 #[test]
 fn journal_inventory_uses_held_root_and_never_writes_or_initializes() {

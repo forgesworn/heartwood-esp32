@@ -9,6 +9,8 @@ use zeroize::Zeroizing;
 
 #[path = "allocation_journal.rs"]
 mod journal;
+#[path = "allocation_journal_nvs.rs"]
+mod journal_nvs;
 pub(crate) use journal::{InventoryHold, Report, StoredBlob};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -181,6 +183,16 @@ impl<'a> HeldAllocationRoot<'a> {
         let namespace = journal::namespace(&self.root);
         self.recheck().map_err(|_| InventoryHold::Custody)?;
         Ok(namespace)
+    }
+
+    /// Reads only the existing root-derived namespace. Never initializes,
+    /// writes, or interprets missing storage as first use. No runtime caller.
+    pub(crate) fn inspect_persisted_journal(&self) -> Result<Report, InventoryHold> {
+        self.recheck().map_err(|_| InventoryHold::Custody)?;
+        let namespace = Zeroizing::new(journal::namespace(&self.root));
+        let result = journal_nvs::inspect(self.nvs, &namespace, &self.root, &self.issuer);
+        self.recheck().map_err(|_| InventoryHold::Custody)?;
+        result
     }
 
     /// Required again before any future authority decision. A failure is HOLD;

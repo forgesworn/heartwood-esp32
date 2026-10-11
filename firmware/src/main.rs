@@ -477,6 +477,16 @@ fn offer_removal_recovery_wipe(
     }
 }
 
+/// Storage failure is not first use. Stay before seed loading and all command
+/// processing; do not retry initialization, erase, or offer a wipe as repair.
+fn storage_boot_hold(display: &mut oled::Display<'_>) -> ! {
+    oled::show_error(display, "STORAGE HOLD\nPreserve device\nRecovery needed");
+    loop {
+        wdt::feed();
+        esp_idf_hal::delay::FreeRtos::delay_ms(100);
+    }
+}
+
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -513,9 +523,22 @@ fn main() {
     oled::show_boot_animation(&mut display);
 
     // --- NVS init ---
-    let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
-    let mut nvs =
-        EspNvs::new(nvs_partition.clone(), "heartwood", true).expect("NVS namespace init failed");
+    // take() enables erase/reinitialization on NO_FREE_PAGES/NEW_VERSION_FOUND.
+    // Preserve the partition instead: neither error proves that it is disposable.
+    let nvs_partition = match EspDefaultNvsPartition::take_with(false) {
+        Ok(partition) => partition,
+        Err(error) => {
+            log::error!("NVS boot initialization failed (code={})", error.code());
+            storage_boot_hold(&mut display);
+        }
+    };
+    let mut nvs = match EspNvs::new(nvs_partition.clone(), "heartwood", true) {
+        Ok(nvs) => nvs,
+        Err(error) => {
+            log::error!("NVS boot namespace open failed (code={})", error.code());
+            storage_boot_hold(&mut display);
+        }
+    };
 
     // Bearer-note locker (own namespace; never fatal — a broken locker must
     // not take the signer down, it just reports unavailable and refuses).

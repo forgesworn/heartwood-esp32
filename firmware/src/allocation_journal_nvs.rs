@@ -10,13 +10,16 @@ use crate::allocation_nvs_host_sys as sys;
 #[cfg(not(test))]
 use esp_idf_svc::sys;
 
-struct ReadHandle<'a> {
+pub(super) struct ReadHandle<'a> {
     raw: sys::nvs_handle_t,
     // Keeps the existing default partition alive; never take/reinitialize it.
     _owner: &'a EspNvs<NvsDefault>,
 }
 impl<'a> ReadHandle<'a> {
-    fn open(_owner: &'a EspNvs<NvsDefault>, namespace: &str) -> Result<Self, InventoryHold> {
+    pub(super) fn open(
+        _owner: &'a EspNvs<NvsDefault>,
+        namespace: &str,
+    ) -> Result<Self, InventoryHold> {
         let name = Name::from_bytes(namespace.as_bytes())?;
         let mut raw = 0;
         // SAFETY: bounded NUL-terminated name and valid output pointer; the
@@ -39,11 +42,20 @@ impl Drop for ReadHandle<'_> {
     }
 }
 
-struct Entries<'handle, 'partition> {
-    raw: sys::nvs_iterator_t,
-    _owner: &'handle ReadHandle<'partition>,
+pub(super) trait RawHandle {
+    fn raw(&self) -> sys::nvs_handle_t;
 }
-impl Drop for Entries<'_, '_> {
+impl RawHandle for ReadHandle<'_> {
+    fn raw(&self) -> sys::nvs_handle_t {
+        self.raw
+    }
+}
+
+struct Entries<'handle, H: RawHandle> {
+    raw: sys::nvs_iterator_t,
+    _owner: &'handle H,
+}
+impl<H: RawHandle> Drop for Entries<'_, H> {
     fn drop(&mut self) {
         // SDK next() consumes/updates its pointer. Never retain a copied pointer
         // or release the pre-next value. NULL is allowed by the SDK.
@@ -60,12 +72,12 @@ impl Drop for Info {
         self.0.type_ = 0;
     }
 }
-struct Name {
+pub(super) struct Name {
     bytes: Zeroizing<[u8; 16]>,
     len: usize,
 }
 impl Name {
-    fn from_bytes(b: &[u8]) -> Result<Self, InventoryHold> {
+    pub(super) fn from_bytes(b: &[u8]) -> Result<Self, InventoryHold> {
         if b.is_empty() || b.len() > 15 || !b.is_ascii() || b.contains(&0) {
             return Err(InventoryHold::Format);
         }
@@ -90,24 +102,27 @@ impl Name {
     fn text(&self) -> &str {
         std::str::from_utf8(&self.bytes[..self.len]).expect("validated ASCII name")
     }
-    fn ptr(&self) -> *const core::ffi::c_char {
+    pub(super) fn ptr(&self) -> *const core::ffi::c_char {
         self.bytes.as_ptr().cast()
     }
 }
 #[derive(PartialEq, Eq)]
-struct OwnedBlob {
-    key: String,
-    bytes: Vec<u8>,
+pub(super) struct OwnedBlob {
+    pub(super) key: String,
+    pub(super) bytes: Vec<u8>,
 }
 
-fn collect(handle: &ReadHandle<'_>, namespace: &str) -> Result<Vec<OwnedBlob>, InventoryHold> {
+pub(super) fn collect<H: RawHandle>(
+    handle: &H,
+    namespace: &str,
+) -> Result<Vec<OwnedBlob>, InventoryHold> {
     let mut it = Entries {
         raw: ptr::null_mut(),
         _owner: handle,
     };
     // SAFETY: valid live handle, exact SDK enum and initialized output pointer.
     let start = unsafe {
-        sys::nvs_entry_find_in_handle(handle.raw, sys::nvs_type_t_NVS_TYPE_ANY, &mut it.raw)
+        sys::nvs_entry_find_in_handle(handle.raw(), sys::nvs_type_t_NVS_TYPE_ANY, &mut it.raw)
     };
     if start == sys::ESP_ERR_NVS_NOT_FOUND {
         if !it.raw.is_null() {
@@ -139,7 +154,7 @@ fn collect(handle: &ReadHandle<'_>, namespace: &str) -> Result<Vec<OwnedBlob>, I
         }
         let mut length = 0;
         // Query exactly this enumerated blob, then read it at its frozen width.
-        if unsafe { sys::nvs_get_blob(handle.raw, name.ptr(), ptr::null_mut(), &mut length) }
+        if unsafe { sys::nvs_get_blob(handle.raw(), name.ptr(), ptr::null_mut(), &mut length) }
             != sys::ESP_OK
         {
             return Err(InventoryHold::Storage);
@@ -150,7 +165,7 @@ fn collect(handle: &ReadHandle<'_>, namespace: &str) -> Result<Vec<OwnedBlob>, I
         let mut bytes = vec![0; width];
         if unsafe {
             sys::nvs_get_blob(
-                handle.raw,
+                handle.raw(),
                 name.ptr(),
                 bytes.as_mut_ptr().cast(),
                 &mut length,

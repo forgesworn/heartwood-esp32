@@ -2,8 +2,10 @@
 
 This change freezes and implements the private byte formats, at-rest protection,
 and read-only inventory checks. It does **not** implement journal writes,
-enrolment, witness verification, signing, allocation entropy/KDF, or child release.
-The module has no runtime caller. A valid local inventory still requires a fresh,
+enrolment, fresh witness reconciliation, signing, allocation entropy/KDF, or child release.
+Local inspection now derives and checks the descriptor writer and verifies every
+stored witness signature with the shared strict receipt codec. Inventory has no
+runtime caller; boot exercises the crypto backend. A local inventory still requires a fresh,
 strictly verified witness read before any authority decision. Production MLS stays
 disabled. These boundaries are part of this construction, not optional follow-up.
 
@@ -22,8 +24,8 @@ It does not disclose a witness subject prefix. The full encrypted authenticated
 subject and genesis issuer in the anchor must match the held root-derived subject
 and actual issuer; a prefix collision is HOLD, never replacement. Keys are `anchor`, `snap0`,
 `snap1`, and `m01` through `m32`. The scanner must inspect all 32 positions and
-reject unknown keys in this namespace; the future NVS adapter must enumerate
-keys, distinguish absence from read failure, and preserve exact widths.
+reject unknown keys in this namespace; the read-only NVS adapter enumerates
+all keys, distinguishes absence from read failure, and preserves exact widths.
 
 Missing anchor or both snapshots is HOLD, including a restored root. A lone
 valid snapshot is a distinct reconciliation-only report, never an acceptance. There is no
@@ -52,17 +54,19 @@ AEAD sealed, with constant-time tag verification by the pinned cipher crate.
 
 Descriptor (229 bytes): `"HWAD"(4) || version=1(1) || subject32 || writer32 ||
 genesis_actual_issuer32 || installation32 || witness_key32 || route_hash32 ||
-schema_hash32`. Each identity/hash is nonzero. This format's schema hash is
-SHA-256(`"HW allocation journal schema v1\0"`). The route hash must recompute.
+schema_hash32`. Each identity/hash is nonzero.
+The derived writer seed must be nonzero before key construction, and the writer
+must differ from the witness. A valid self-signature cannot satisfy that boundary.
+The schema hash is SHA-256(`"HW allocation journal schema v1\0"`). The route hash must recompute.
 `pins_hash = SHA-256("HW allocation pins v1\0" || descriptor)`.
 
 Anchor plaintext (431 bytes): `descriptor229 || genesis_digest32 || genesis_receipt170`. The genesis digest must equal the empty state digest defined below. The
 receipt is stored in the existing strict VMLS 170-byte wire format. This codec
-only stores/authenticates its exact bytes; it **does not** verify its signature,
-challenge freshness or authority. It does shape-check version1, status Current=0,
-nonzero challenge/signature, subject, sequence and expected state digest. Neither an anchor nor a snapshot is an authority
-token. The future owner must use the pinned public no_std VMLS strict verifier,
-not `ed25519-compact`, for all stored/fresh receipt checks.
+uses the pinned public no_std VMLS strict verifier to check its historical
+signature and exact bindings. It cannot establish challenge freshness or
+independent enrolment authority. Neither an anchor nor a snapshot is an authority
+token. The future owner must also use that shared strict verifier for fresh
+receipts; `ed25519-compact` is not eligible for either check.
 
 Manifest plaintext (278 bytes): `"HWAM"4 || version=1 || ordinal:u8 ||
 actual_issuer32 || salt32 || R32 || target_device32 || browser_installation32 ||
@@ -140,7 +144,11 @@ For the anchor AND every snapshot, stored receipt structural rules are exact:
 length170, version1, status Current=0, subject == descriptor.subject, seq ==
 that object's active_seq (anchor/genesis 0), digest == that object's expected
 active digest (anchor/genesis empty digest), nonzero challenge and signature.
-These parse/binding checks never verify freshness or signature authority.
+The shared `vmls-core` codec additionally verifies each signature strictly under
+the witness key in the authenticated local descriptor. The descriptor's writer
+must equal the Ed25519 public key derived from the held root's writer seed.
+These historical checks establish neither a fresh challenge nor independent
+physical enrolment/pin authority. They never authorize allocation or release.
 
 ## Read-only inventory and crash ordering
 
@@ -159,7 +167,8 @@ can only be described for fresh-witness reconciliation; it cannot release a chil
 There must be at least one valid snapshot. Reports are
 `PairedNeedsWitness`, `LoneNeedsWitness`, `OrphanNeedsWitness`, or HOLD; no report
 is called valid, ready or authorised. All report variants explicitly leave the
-derived writer and witness signatures unverified. Both slots and the anchor must agree
+fresh witness authority false, while identifying the derived writer and stored
+signatures as checked. Both slots and the anchor must agree
 on pins. The only production inventory entry is through `HeldAllocationRoot`,
 with custody recheck before and after inspection and exact subject/issuer binding.
 Before any future anchor creation/enrolment/request/receipt authority, strict
@@ -173,7 +182,7 @@ Future write ordering is mandatory: exact immutable manifest write/readback;
 inactive pending snapshot write/readback; sign/forward the exact witness CAS;
 strict fresh receipt; inactive committed snapshot write/readback; only then
 encrypt/release child. Never overwrite the current authoritative snapshot or use
-a mutable head key. The actual adapter erases before set; cuts after erase,
+a mutable head key. The existing SDK set_blob wrapper erases before set; cuts after erase,
 set/commit, and readback must be injected separately. Orphan recovery requires a
 fresh witness read and the same operation/salt/R; it cannot generate a replacement.
 Witness at exact active state allows exact retry; at exact candidate allows

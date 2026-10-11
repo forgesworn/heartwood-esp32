@@ -3,7 +3,8 @@
 The private `HeldAllocationRoot::inspect_persisted_journal` reads the existing
 root-derived journal namespace and returns only a local inventory report. It
 has no runtime caller, initializes nothing, writes nothing and grants no
-derived-writer or witness authority. Missing data is HOLD, never first use.
+allocation or fresh witness authority. It now checks the root-derived writer
+and stored signatures; missing data is HOLD, never first use.
 The encrypted formats and remaining runtime gates are defined in
 [the journal format](2026-10-11-allocation-journal-format.md).
 
@@ -51,15 +52,13 @@ corruption and permanently retained manifests/orphans. Production board CI
 must also compile the actual SDK bindings; host tests alone do not prove ABI
 compatibility, physical storage behavior or power-cut safety.
 
-Before activating durable allocation storage, the existing firmware boot path
-also needs explicit fail-closed partition handling. It currently calls
-`EspDefaultNvsPartition::take()`, which uses `take_with(true)` in esp-idf-svc
-0.52.1 and can erase/reinitialize the default partition after
-`ESP_ERR_NVS_NO_FREE_PAGES` or `ESP_ERR_NVS_NEW_VERSION_FOUND`. This reader does
-not change that boot behavior. Automatic erasure cannot be an allocation-ledger
-recovery policy; explicit HOLD and external recovery must precede activation.
+The subsequent [boot preservation change](2026-10-11-preserve-nvs-on-boot-error.md)
+uses `take_with(false)` and remains in HOLD on initialization failure. It closes
+the old implicit partition-erase policy; physical faulted-storage acceptance and
+external recovery remain open. The strict crypto boot check also runs before
+NVS initialization, and a failed backend refuses journal access before opening.
 
-Further gates include strict writer/witness verification, crash-safe write and
+Further gates include fresh witness reconciliation and independent pin authority, crash-safe write and
 lost-reply reconciliation, encrypted master eligibility, first physical
 enrolment and external recovery anchors, fragmented capacity and promotion
 reserves, fresh entropy and child release, and physical cut-point testing.

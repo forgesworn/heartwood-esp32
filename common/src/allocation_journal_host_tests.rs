@@ -103,6 +103,16 @@ fn replace(b: &mut [(String, Vec<u8>)], key: &str, v: Vec<u8>) {
     b.iter_mut().find(|(k, _)| k == key).unwrap().1 = v;
 }
 
+// PUBLIC SYNTHETIC fixture witness only; never a production signing API.
+fn resign_witness_receipt(bytes: &mut [u8]) {
+    use ed25519_dalek::Signer;
+    let mut receipt = vmls_core::receipt::WitnessReceipt::parse(bytes).unwrap();
+    let seed = Zeroizing::new([9; 32]);
+    let signer = ed25519_dalek::SigningKey::from_bytes(&seed);
+    receipt.signature = signer.sign(&receipt.digest_to_sign()).to_bytes();
+    bytes.copy_from_slice(&receipt.encode());
+}
+
 #[test]
 fn independent_sodium_vectors_match_all_three_object_kinds_byte_for_byte() {
     let f = fixture();
@@ -143,8 +153,9 @@ fn every_adjacent_transition_and_terminal_record_is_retained() {
         assert_eq!(r.pending, g % 2 == 0);
         assert_eq!(r.orphan_ordinal, None);
         let log = format!("{r:?}");
-        assert!(log.contains("derived_writer_verified: false"));
-        assert!(log.contains("witness_signatures_verified: false"));
+        assert!(log.contains("derived_writer_verified: true"));
+        assert!(log.contains("stored_witness_signatures_verified: true"));
+        assert!(log.contains("fresh_witness_authority: false"));
     }
     // Even terminal entries remain full records; expiry is never consulted.
     assert_eq!(
@@ -317,13 +328,13 @@ fn generation_one_is_exact_genesis_and_receipts_are_not_crypto_authority() {
         replace(&mut b, "snap0", reseal_snapshot(&f, 1, &p));
         assert!(scan(&f, &b).is_err());
     }
-    // Nonzero signature mutations are deliberately NOT verified here. The
-    // report must stay non-authoritative even when local AEAD is authentic.
+    // An authentic local seal cannot turn a corrupted witness signature into
+    // accepted history. A valid stored receipt still proves no fresh authority.
     let mut p = bytes(&f.v["snapshots"][2]["plaintext"]);
     p[224] ^= 1;
     let mut b = inventory(&f, &[3], 1);
     replace(&mut b, "snap0", reseal_snapshot(&f, 3, &p));
-    assert_eq!(scan(&f, &b).unwrap().layout, Layout::LoneNeedsWitness);
+    assert_eq!(scan(&f, &b).unwrap_err(), InventoryHold::Signature);
 }
 
 #[test]
@@ -337,6 +348,106 @@ fn immutable_set_root_is_checked_for_both_old_and_new_snapshot() {
     let mut b = inventory(&f, &[8, 9], 2);
     b.retain(|(k, _)| k != "m02");
     assert_eq!(scan(&f, &b).unwrap_err(), InventoryHold::Records);
+}
+
+#[test]
+fn authentic_anchor_cannot_pin_a_different_derived_writer() {
+    let f = fixture();
+    let mut plain = bytes(&f.v["anchor_plaintext"]);
+    plain[37] ^= 1;
+    let frame = reseal_anchor(&f, &plain);
+    assert_eq!(
+        Codec::new(&f.root, &f.issuer).unwrap().anchor(&frame).err(),
+        Some(InventoryHold::Binding)
+    );
+}
+
+#[test]
+fn authentic_anchor_cannot_use_its_derived_writer_as_its_witness() {
+    use ed25519_dalek::Signer;
+    let f = fixture();
+    let mut plain = bytes(&f.v["anchor_plaintext"]);
+    let writer: [u8; 32] = plain[37..69].try_into().unwrap();
+    plain[133..165].copy_from_slice(&writer);
+    plain[165..197].copy_from_slice(&hash(&[b"HW allocation route v1\0", &[1], &writer]));
+    let pins = hash(&[b"HW allocation pins v1\0", &plain[..229]]);
+    let digest = state_digest(&pins, &state(0, &[], &pins));
+    plain[229..261].copy_from_slice(&digest);
+    plain[261 + 42..261 + 74].copy_from_slice(&digest);
+    let seed = key(&f.root, &[b"VMLS/1 allocation writer seed\0"]);
+    let signer = ed25519_dalek::SigningKey::from_bytes(&seed);
+    assert_eq!(signer.verifying_key().to_bytes(), writer);
+    let mut receipt = vmls_core::receipt::WitnessReceipt::parse(&plain[261..]).unwrap();
+    receipt.signature = signer.sign(&receipt.digest_to_sign()).to_bytes();
+    // Prove this is cryptographically valid self-signed history, not a bad seal,
+    // wrong route or ordinary invalid-signature test.
+    receipt.verify(&writer, &receipt.challenge).unwrap();
+    plain[261..].copy_from_slice(&receipt.encode());
+    let frame = reseal_anchor(&f, &plain);
+    assert_eq!(
+        Codec::new(&f.root, &f.issuer).unwrap().anchor(&frame).err(),
+        Some(InventoryHold::Binding)
+    );
+}
+
+#[test]
+fn authentic_local_seals_cannot_hide_bad_genesis_or_either_snapshot_signature() {
+    let f = fixture();
+    let mut plain = bytes(&f.v["anchor_plaintext"]);
+    plain[261 + 106] ^= 1;
+    let mut b = inventory(&f, &[1, 2], 1);
+    replace(&mut b, "anchor", reseal_anchor(&f, &plain));
+    assert_eq!(scan(&f, &b).unwrap_err(), InventoryHold::Signature);
+    for g in [1, 2] {
+        let mut plain = bytes(&f.v["snapshots"][g - 1]["plaintext"]);
+        plain[118 + 106] ^= 1;
+        let mut b = inventory(&f, &[1, 2], 1);
+        replace(
+            &mut b,
+            &format!("snap{}", f.v["snapshots"][g - 1]["slot"].as_u64().unwrap()),
+            reseal_snapshot(&f, g, &plain),
+        );
+        assert_eq!(scan(&f, &b).unwrap_err(), InventoryHold::Signature);
+    }
+}
+
+#[cfg(feature = "ota-sign")]
+#[test]
+fn compact_accepted_order_two_forgery_is_hold_in_the_real_anchor_path() {
+    let f = fixture();
+    let mut plain = bytes(&f.v["anchor_plaintext"]);
+    let mut weak = [255; 32];
+    weak[0] = 236;
+    weak[31] = 127;
+    plain[133..165].copy_from_slice(&weak);
+    plain[165..197].copy_from_slice(&hash(&[b"HW allocation route v1\0", &[1], &weak]));
+    let pins = hash(&[b"HW allocation pins v1\0", &plain[..229]]);
+    let digest = state_digest(&pins, &state(0, &[], &pins));
+    plain[229..261].copy_from_slice(&digest);
+    plain[261 + 42..261 + 74].copy_from_slice(&digest);
+    plain[261 + 106..].fill(0);
+    plain[261 + 106] = 1;
+    let public = ed25519_compact::PublicKey::from_slice(&weak).unwrap();
+    let signature = ed25519_compact::Signature::from_slice(&plain[261 + 106..]).unwrap();
+    let accepted = (1u16..=512).any(|n| {
+        plain[261 + 74..261 + 106].fill(1);
+        plain[261 + 74..261 + 76].copy_from_slice(&n.to_be_bytes());
+        public
+            .verify(
+                hash(&[b"VMLS/1 witness receipt", &plain[261..261 + 106]]),
+                &signature,
+            )
+            .is_ok()
+    });
+    assert!(
+        accepted,
+        "fixture must reproduce compact's acceptance, not merely be invalid"
+    );
+    let frame = reseal_anchor(&f, &plain);
+    assert_eq!(
+        Codec::new(&f.root, &f.issuer).unwrap().anchor(&frame).err(),
+        Some(InventoryHold::Signature)
+    );
 }
 
 #[test]
@@ -386,17 +497,19 @@ fn capacity_diagnostic_is_only_a_lower_bound_and_never_a_32_record_fit_promise()
 #[test]
 fn authenticated_transition_cannot_skip_a_witness_sequence_or_reuse_receipt() {
     let f = fixture();
-    // Both sequence fields agree structurally, so only the pair's exact +1
-    // transition rule can reject this (signature remains deliberately unchecked).
+    // Both sequence fields agree and the witness signature is valid, so the
+    // pair's exact +1 transition rule must still reject a skipped sequence.
     let mut p = bytes(&f.v["snapshots"][2]["plaintext"]);
     p[78..86].copy_from_slice(&2u64.to_be_bytes());
     p[152..160].copy_from_slice(&2u64.to_be_bytes());
+    resign_witness_receipt(&mut p[118..288]);
     let mut b = inventory(&f, &[2, 3], 1);
     replace(&mut b, "snap0", reseal_snapshot(&f, 3, &p));
     assert_eq!(scan(&f, &b).unwrap_err(), InventoryHold::Chain);
     // A pending frame must retain even the historical receipt exactly.
     let mut p = bytes(&f.v["snapshots"][1]["plaintext"]);
-    p[224] ^= 1;
+    p[192] ^= 1;
+    resign_witness_receipt(&mut p[118..288]);
     let mut b = inventory(&f, &[1, 2], 1);
     replace(&mut b, "snap1", reseal_snapshot(&f, 2, &p));
     assert_eq!(scan(&f, &b).unwrap_err(), InventoryHold::Chain);

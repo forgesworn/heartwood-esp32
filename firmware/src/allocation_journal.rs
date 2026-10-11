@@ -31,6 +31,8 @@ pub(crate) enum InventoryHold {
     Binding,
     Chain,
     Records,
+    Signature,
+    Crypto,
 }
 
 pub(super) fn expected_blob_width(key: &str) -> Option<usize> {
@@ -62,8 +64,8 @@ pub(crate) enum Layout {
     OrphanNeedsWitness,
 }
 
-/// Describes local bytes only. Derived writer and witness signatures are always
-/// UNVERIFIED. There is no valid/ready/authorised token or release API.
+/// Describes local bytes with derived writer and stored signatures checked.
+/// Never fresh witness authority, rollback protection or a child-release token.
 pub(crate) struct Report {
     pub(crate) layout: Layout,
     pub(crate) snapshots_present: u8,
@@ -75,8 +77,9 @@ impl core::fmt::Debug for Report {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LocalInventory")
             .field("layout", &self.layout)
-            .field("derived_writer_verified", &false)
-            .field("witness_signatures_verified", &false)
+            .field("derived_writer_verified", &true)
+            .field("stored_witness_signatures_verified", &true)
+            .field("fresh_witness_authority", &false)
             .finish_non_exhaustive()
     }
 }
@@ -187,13 +190,23 @@ impl<'a> Codec<'a> {
         {
             return Err(InventoryHold::Binding);
         }
+        if a.writer() == a.witness() {
+            return Err(InventoryHold::Binding);
+        }
+        if !super::crypto::backend_ready() {
+            return Err(InventoryHold::Crypto);
+        }
+        let writer_seed = key(self.root, &[b"VMLS/1 allocation writer seed\0"]);
+        if !super::crypto::writer_matches(&writer_seed, a.writer()) {
+            return Err(InventoryHold::Binding);
+        }
         let pins = a.pins();
         let empty = state(0, &[], &pins);
         let digest = state_digest(&pins, &empty);
         if *a.genesis_digest() != digest {
             return Err(InventoryHold::Binding);
         }
-        receipt(a.genesis_receipt(), a.subject(), 0, &digest)?;
+        receipt(a.genesis_receipt(), a.witness(), a.subject(), 0, &digest)?;
         Ok(a)
     }
     fn manifest(&self, frame: &[u8], ordinal: u8, a: &Anchor) -> Result<Manifest, InventoryHold> {
@@ -265,7 +278,13 @@ impl<'a> Codec<'a> {
         {
             return Err(InventoryHold::Binding);
         }
-        receipt(s.receipt(), a.subject(), s.seq(), s.active_digest())?;
+        receipt(
+            s.receipt(),
+            a.witness(),
+            a.subject(),
+            s.seq(),
+            s.active_digest(),
+        )?;
         match s.phase() {
             0 => {
                 if nonzero(&s.data[353..]) {
@@ -299,6 +318,12 @@ impl<'a> Codec<'a> {
 
 struct Anchor(Zeroizing<[u8; ANCHOR_PLAIN]>);
 impl Anchor {
+    fn writer(&self) -> &[u8; 32] {
+        self.0[37..69].try_into().unwrap()
+    }
+    fn witness(&self) -> &[u8; 32] {
+        self.0[133..165].try_into().unwrap()
+    }
     fn subject(&self) -> &[u8; 32] {
         self.0[5..37].try_into().unwrap()
     }
@@ -359,19 +384,15 @@ impl Snapshot {
     }
 }
 
-fn receipt(b: &[u8], subject: &[u8; 32], seq: u64, digest: &[u8; 32]) -> Result<(), InventoryHold> {
-    // These are structural comparisons ONLY, never an Ed25519 or fresh receipt gate.
-    if b.len() != 170
-        || b[..2] != [1, 0]
-        || b[2..34] != *subject
-        || number(b, 34) != seq
-        || b[42..74] != *digest
-        || !nonzero(&b[74..106])
-        || !nonzero(&b[106..])
-    {
-        return Err(InventoryHold::Binding);
-    }
-    Ok(())
+fn receipt(
+    b: &[u8],
+    witness: &[u8; 32],
+    subject: &[u8; 32],
+    seq: u64,
+    digest: &[u8; 32],
+) -> Result<(), InventoryHold> {
+    // Historical signed bytes only. Their stored challenge cannot prove freshness.
+    super::crypto::historical_receipt(b, witness, subject, seq, digest)
 }
 fn check_state(s: &[u8]) -> Result<(), InventoryHold> {
     if s.len() != 65 || s[0] > 32 || !nonzero(&s[1..33]) {

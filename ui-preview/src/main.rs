@@ -869,6 +869,9 @@ fn main() {
         render(&format!("error-storage-hold-{b}"), w, h, |d| {
             draw_error(d, "STORAGE HOLD\nPreserve device\nRecovery needed")
         });
+        render(&format!("error-crypto-hold-{b}"), w, h, |d| {
+            draw_error(d, "CRYPTO HOLD\nPreserve device\nRecovery needed")
+        });
         render(&format!("error-rng-failed-{b}"), w, h, |d| {
             draw_error(d, "RNG self-test failed\nrefusing to generate")
         });
@@ -961,20 +964,22 @@ mod error_card_tests {
     }
 
     #[test]
-    fn storage_boot_hold_card_fits_every_panel_in_both_dimensions() {
+    fn storage_and_crypto_boot_hold_cards_fit_every_panel_in_both_dimensions() {
         use super::{style, DANGER};
         use embedded_graphics::{prelude::*, text::Text};
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/main.rs")).unwrap();
-        let start = source.find("fn storage_boot_hold(").unwrap();
-        let body = &source[start..source[start..].find("fn main()").unwrap() + start];
-        let literal = string_literals(body).into_iter().find(|s| s.starts_with("STORAGE HOLD")).unwrap();
-        let message = literal.replace("\\n", "\n");
-        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+        for (function, heading) in [("storage_boot_hold", "STORAGE HOLD"), ("crypto_boot_hold", "CRYPTO HOLD")] {
+          let start = source.find(&format!("fn {function}(")).unwrap();
+          let body = &source[start..source[start..].find("fn main()").unwrap() + start];
+          let literal = string_literals(body).into_iter().find(|s| s.starts_with(heading)).unwrap();
+          let message = literal.replace("\\n", "\n");
+          for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
             let l = Layout::new(w, h);
             let text = Text::new(&message, Point::new(l.sx(0), l.sy(30)), style(l.font_body(), DANGER));
             let bounds = text.bounding_box();
             assert!(bounds.top_left.x >= 0 && bounds.top_left.y >= 0);
-            assert!(bounds.bottom_right().unwrap().x < w && bounds.bottom_right().unwrap().y < h, "storage card clips on {w}x{h}: {bounds:?}");
+            assert!(bounds.bottom_right().unwrap().x < w && bounds.bottom_right().unwrap().y < h, "{heading} clips on {w}x{h}: {bounds:?}");
+          }
         }
     }
 

@@ -47,3 +47,5 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# Only the first-party shared receipt codec; manifests pin its reviewed revision.
+allow-git = ["https://github.com/forgesworn/vmls-core"]

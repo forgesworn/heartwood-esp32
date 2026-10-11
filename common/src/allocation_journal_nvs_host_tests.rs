@@ -70,7 +70,7 @@ fn actual_adapter_reads_terminal_records_twice_and_only_returns_local_report() {
     let r = h.inspect_persisted_journal().unwrap();
     assert_eq!(r.retained_records, 2);
     assert_eq!(r.layout, journal::Layout::PairedNeedsWitness);
-    assert!(format!("{r:?}").contains("witness_signatures_verified: false"));
+    assert!(format!("{r:?}").contains("stored_witness_signatures_verified: true"));
     assert!(h
         .nvs
         .backend

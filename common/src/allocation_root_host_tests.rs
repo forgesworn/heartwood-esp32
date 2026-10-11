@@ -5,6 +5,49 @@ use crate::held_data_key;
 use std::sync::Mutex;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+#[test]
+fn journal_inventory_uses_held_root_and_never_writes_or_initializes() {
+    let _serial = SERIAL.lock().unwrap();
+    held_data_key::forget();
+    let mut m = master();
+    m.secret = [1; 32];
+    m.mode = MasterMode::TreeNsec;
+    m.derivation_version = 1;
+    m.pubkey = derive::public_key_xonly(&m.secret).unwrap();
+    let mut nvs = stored(&m);
+    let h = HeldAllocationRoot::hold(&mut nvs, &mut m).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/allocation-journal-v1.json")).unwrap();
+    assert_eq!(
+        h.journal_namespace().unwrap(),
+        v["namespace"].as_str().unwrap()
+    );
+    assert_eq!(h.inspect_journal(&[]).unwrap_err(), InventoryHold::Missing);
+    let hex = v["anchor"].as_str().unwrap();
+    let anchor: Vec<u8> = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    assert_eq!(
+        h.inspect_journal(&[StoredBlob {
+            key: "anchor",
+            bytes: &anchor
+        }])
+        .unwrap_err(),
+        InventoryHold::Missing
+    );
+    assert!(h
+        .nvs
+        .backend
+        .take_log()
+        .iter()
+        .all(|(_, op)| *op != NvsOp::SetBlob && *op != NvsOp::Remove));
+    h.nvs.backend.seed("master_0_deriv", &[0]);
+    assert_eq!(h.inspect_journal(&[]).unwrap_err(), InventoryHold::Custody);
+    assert_eq!(h.journal_namespace().unwrap_err(), InventoryHold::Custody);
+}
 fn scalar(n: u8) -> [u8; 32] {
     let mut s = [0; 32];
     s[31] = n;

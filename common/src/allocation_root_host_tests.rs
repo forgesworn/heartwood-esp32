@@ -8,6 +8,29 @@ static SERIAL: Mutex<()> = Mutex::new(());
 #[path = "allocation_journal_nvs_host_tests.rs"]
 mod nvs_reader_tests;
 
+#[cfg(feature = "allocation-crypto-selfcheck-fail")]
+#[test]
+fn injected_backend_failure_holds_actual_root_before_journal_open() {
+    let _serial = SERIAL.lock().unwrap();
+    held_data_key::forget();
+    let mut m = master();
+    let mut nvs = stored(&m);
+    crate::allocation_nvs_host_sys::reset(String::new(), vec![vec![]], None);
+    let h = HeldAllocationRoot::hold(&mut nvs, &mut m).unwrap();
+    assert_eq!(h.inspect_journal(&[]).unwrap_err(), InventoryHold::Crypto);
+    assert_eq!(
+        h.inspect_persisted_journal().unwrap_err(),
+        InventoryHold::Crypto
+    );
+    crate::allocation_nvs_host_sys::checked(|s| assert!(s.calls.is_empty()));
+    assert!(h
+        .nvs
+        .backend
+        .take_log()
+        .iter()
+        .all(|(_, op)| *op != NvsOp::SetBlob && *op != NvsOp::Remove));
+}
+
 #[test]
 fn journal_inventory_uses_held_root_and_never_writes_or_initializes() {
     let _serial = SERIAL.lock().unwrap();

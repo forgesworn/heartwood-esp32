@@ -1,4 +1,5 @@
-//! Dormant allocation prerequisite. No caller, signing, journal or child API.
+//! Private allocation custody and local journal inspection. No allocation owner,
+//! signing, durable writer or child-release API. Boot checks the crypto backend.
 //! It establishes custody of one routed master, not authority to select it.
 #![allow(dead_code)]
 
@@ -7,11 +8,17 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::{data_key, derive, types::MasterMode};
 use zeroize::Zeroizing;
 
+#[path = "allocation_crypto.rs"]
+mod crypto;
 #[path = "allocation_journal.rs"]
 mod journal;
 #[path = "allocation_journal_nvs.rs"]
 mod journal_nvs;
 pub(crate) use journal::{InventoryHold, Report, StoredBlob};
+
+pub(crate) fn crypto_backend_ready() -> bool {
+    crypto::backend_ready()
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Hold {
@@ -173,6 +180,9 @@ impl<'a> HeldAllocationRoot<'a> {
         blobs: &[StoredBlob<'_>],
     ) -> Result<Report, InventoryHold> {
         self.recheck().map_err(|_| InventoryHold::Custody)?;
+        if !crypto::backend_ready() {
+            return Err(InventoryHold::Crypto);
+        }
         let result = journal::inspect(&self.root, &self.issuer, blobs);
         self.recheck().map_err(|_| InventoryHold::Custody)?;
         result
@@ -189,6 +199,9 @@ impl<'a> HeldAllocationRoot<'a> {
     /// writes, or interprets missing storage as first use. No runtime caller.
     pub(crate) fn inspect_persisted_journal(&self) -> Result<Report, InventoryHold> {
         self.recheck().map_err(|_| InventoryHold::Custody)?;
+        if !crypto::backend_ready() {
+            return Err(InventoryHold::Crypto);
+        }
         let namespace = Zeroizing::new(journal::namespace(&self.root));
         let result = journal_nvs::inspect(self.nvs, &namespace, &self.root, &self.issuer);
         self.recheck().map_err(|_| InventoryHold::Custody)?;

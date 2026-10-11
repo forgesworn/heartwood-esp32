@@ -480,7 +480,15 @@ fn offer_removal_recovery_wipe(
 /// Storage failure is not first use. Stay before seed loading and all command
 /// processing; do not retry initialization, erase, or offer a wipe as repair.
 fn storage_boot_hold(display: &mut oled::Display<'_>) -> ! {
-    oled::show_error(display, "STORAGE HOLD\nPreserve device\nRecovery needed");
+    boot_hold(display, "STORAGE HOLD\nPreserve device\nRecovery needed");
+}
+
+fn crypto_boot_hold(display: &mut oled::Display<'_>) -> ! {
+    boot_hold(display, "CRYPTO HOLD\nPreserve device\nRecovery needed");
+}
+
+fn boot_hold(display: &mut oled::Display<'_>, message: &str) -> ! {
+    oled::show_error(display, message);
     loop {
         wdt::feed();
         esp_idf_hal::delay::FreeRtos::delay_ms(100);
@@ -521,6 +529,15 @@ fn main() {
 
     // --- Boot animation ---
     oled::show_boot_animation(&mut display);
+
+    // Link and exercise the actual strict receipt backend before opening NVS
+    // or loading keys. Known-answer failure never selects the OTA verifier.
+    wdt::feed();
+    if !allocation_root::crypto_backend_ready() {
+        log::error!("Allocation crypto self-check failed");
+        crypto_boot_hold(&mut display);
+    }
+    wdt::feed();
 
     // --- NVS init ---
     // take() enables erase/reinitialization on NO_FREE_PAGES/NEW_VERSION_FOUND.

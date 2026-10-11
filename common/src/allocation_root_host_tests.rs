@@ -4,7 +4,7 @@ use crate::firmware_policy_host_tests::{FaultKind, NvsOp};
 use crate::held_data_key;
 use std::sync::Mutex;
 
-static SERIAL: Mutex<()> = Mutex::new(());
+pub(super) static SERIAL: Mutex<()> = Mutex::new(());
 #[path = "allocation_journal_nvs_host_tests.rs"]
 mod nvs_reader_tests;
 
@@ -78,7 +78,7 @@ fn scalar(n: u8) -> [u8; 32] {
     s[31] = n;
     s
 }
-fn master() -> LoadedMaster {
+pub(super) fn master() -> LoadedMaster {
     let secret = scalar(1);
     LoadedMaster {
         slot: 0,
@@ -91,7 +91,7 @@ fn master() -> LoadedMaster {
         operator: None,
     }
 }
-fn stored(m: &LoadedMaster) -> EspNvs<NvsDefault> {
+pub(super) fn stored(m: &LoadedMaster) -> EspNvs<NvsDefault> {
     let nvs = EspNvs::new();
     nvs.backend.seed("master_count", &[m.slot + 1]);
     let p = format!("master_{}", m.slot);
@@ -258,7 +258,7 @@ fn every_storage_failure_holds_without_writes() {
     }
 }
 
-fn encrypted(m: &LoadedMaster, key: &[u8; 32]) -> EspNvs<NvsDefault> {
+pub(super) fn encrypted(m: &LoadedMaster, key: &[u8; 32]) -> EspNvs<NvsDefault> {
     let mut nvs = stored(m);
     nvs.remove("master_0_secret").unwrap();
     let blob = data_key::seal(

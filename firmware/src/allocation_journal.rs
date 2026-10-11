@@ -1,4 +1,5 @@
-//! Dormant read-only local inventory. It grants no writer/witness authority.
+//! Dormant local inventory codec and private construction-gated writer.
+//! Inventory inspection grants no fresh writer/witness authority.
 //! The exact format and unresolved runtime gates are in the journal-format doc.
 #![allow(dead_code)]
 
@@ -617,3 +618,6 @@ pub(super) fn inspect(
 #[cfg(test)]
 #[path = "../../common/src/allocation_journal_host_tests.rs"]
 mod tests;
+
+#[path = "allocation_journal_writer.rs"]
+mod writer;

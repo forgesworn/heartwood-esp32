@@ -1,5 +1,6 @@
 //! Private allocation custody and local journal inspection. No allocation owner,
-//! signing, durable writer or child-release API. Boot checks the crypto backend.
+//! or child-release API. A private dormant writer is construction-gated.
+//! Boot checks the crypto backend.
 //! It establishes custody of one routed master, not authority to select it.
 #![allow(dead_code)]
 
@@ -62,6 +63,7 @@ fn validate(
     nvs: &EspNvs<NvsDefault>,
     master: &LoadedMaster,
     key: &HeldDataKey,
+    require_encrypted: bool,
 ) -> Result<NormalizedMasterRootV1, Hold> {
     if master.locked {
         return Err(Hold::Locked);
@@ -121,6 +123,9 @@ fn validate(
             }
         }
         None => {
+            if require_encrypted {
+                return Err(Hold::Seed);
+            }
             // No downgrade to plaintext on a board with any encrypted slot.
             for slot in 0..count[0] {
                 if nvs
@@ -155,7 +160,7 @@ impl<'a> HeldAllocationRoot<'a> {
         master: &'a mut LoadedMaster,
     ) -> Result<Self, Hold> {
         let data_key = HeldDataKey::try_hold().map_err(|_| Hold::Busy)?;
-        let root = validate(nvs, master, &data_key)?;
+        let root = validate(nvs, master, &data_key, false)?;
         Ok(Self {
             slot: master.slot,
             mode: master.mode,
@@ -211,6 +216,16 @@ impl<'a> HeldAllocationRoot<'a> {
     /// Required again before any future authority decision. A failure is HOLD;
     /// it never reloads/replaces the root or repairs missing metadata.
     pub(crate) fn recheck(&self) -> Result<(), Hold> {
+        self.recheck_storage(false)
+    }
+
+    /// Writer-only eligibility: legacy plaintext can be inspected but never
+    /// authorises persisting a root-encrypted allocation history.
+    fn recheck_for_write(&self) -> Result<(), Hold> {
+        self.recheck_storage(true)
+    }
+
+    fn recheck_storage(&self, require_encrypted: bool) -> Result<(), Hold> {
         if self.master.slot != self.slot
             || self.master.mode != self.mode
             || self.master.derivation_version != self.version
@@ -218,7 +233,7 @@ impl<'a> HeldAllocationRoot<'a> {
         {
             return Err(Hold::Changed);
         }
-        let root = validate(self.nvs, self.master, &self.data_key)?;
+        let root = validate(self.nvs, self.master, &self.data_key, require_encrypted)?;
         if *root.0 != *self.root.0 {
             return Err(Hold::Changed);
         }

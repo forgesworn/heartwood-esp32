@@ -176,3 +176,15 @@ pub use firmware_policy_host_tests::nvs;
 #[cfg(test)]
 #[path = "../../firmware/src/wifi_retry.rs"]
 mod firmware_wifi_retry;
+
+// The allocation prerequisite uses the real firmware identity, custody and
+// storage checks; only ESP NVS I/O is fault injected by the existing mock.
+#[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
+#[path = "../../firmware/src/master_identity.rs"]
+mod master_identity;
+#[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
+#[path = "../../firmware/src/held_data_key.rs"]
+mod held_data_key;
+#[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
+#[path = "../../firmware/src/allocation_root.rs"]
+mod allocation_root;

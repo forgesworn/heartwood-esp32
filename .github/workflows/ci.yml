@@ -98,6 +98,9 @@ jobs:
       # never run anywhere in CI. ota-sign covers the OTA release-signature
       # scheme (the on-device verifier and the CI signer share this module).
       - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes
+      # Execute the actual private allocation custody source on the firmware's
+      # C curve backend as well as k256 above; no hardware or signing API.
+      - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features firmware allocation_root
 
   # Supply-chain gate over the host-buildable crates: RUSTSEC advisories,
   # licence allow-list and source registries, enforced against the shared

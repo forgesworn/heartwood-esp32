@@ -1,0 +1,249 @@
+{
+  "version": 1,
+  "scope": "Public synthetic namespace vectors only; no firmware metadata authority, enrolment, journal, fresh R, counter zero or runtime owner.",
+  "writerDomainHex": "564d4c532f3120616c6c6f636174696f6e20777269746572207365656400",
+  "subjectDomainHex": "564d4c532f3120616c6c6f636174696f6e207375626a65637400",
+  "cases": [
+    {
+      "name": "bunker",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "00",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      },
+      "normalizedRootHex": "980362c45b982ee49206c7c10ce60a3442d4938c085f1e05e76e5d9a383dad2b",
+      "normalizedRootPublicHex": "4ff3124294d4931c6ca433c33efb6acd5de4de1c8bf1596ecbe00d3b6b03911a",
+      "writerSeedHex": "4b498fb03b9e4c8a68332be9bba553f2cfef92beb4c200060614f1e2bab6178c",
+      "writerPublicHex": "cd96354bd41db388a7e673c08ee8d6b972d98b857222a69e2ea9cad42ca6c214",
+      "subjectHex": "6bbc78ee5869a2351e5d4c8f180f68eab0480827d2ce11ff2595923ba83a13bf",
+      "writerWithoutNulHex": "6a80e9f0655f80c9267ef35343114abde4e9e86e1e6e00ad45567a722f5c1f87",
+      "subjectWithoutNulHex": "000b18b281dfcfcf670ef8f31bda3c52dd0bd37bcb258ed1e8ff2f7359567ef3"
+    },
+    {
+      "name": "restored-bunker-slot-and-label",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "00",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": false,
+        "slot": 7,
+        "label": "restored"
+      },
+      "normalizedRootHex": "980362c45b982ee49206c7c10ce60a3442d4938c085f1e05e76e5d9a383dad2b",
+      "normalizedRootPublicHex": "4ff3124294d4931c6ca433c33efb6acd5de4de1c8bf1596ecbe00d3b6b03911a",
+      "writerSeedHex": "4b498fb03b9e4c8a68332be9bba553f2cfef92beb4c200060614f1e2bab6178c",
+      "writerPublicHex": "cd96354bd41db388a7e673c08ee8d6b972d98b857222a69e2ea9cad42ca6c214",
+      "subjectHex": "6bbc78ee5869a2351e5d4c8f180f68eab0480827d2ce11ff2595923ba83a13bf",
+      "writerWithoutNulHex": "6a80e9f0655f80c9267ef35343114abde4e9e86e1e6e00ad45567a722f5c1f87",
+      "subjectWithoutNulHex": "000b18b281dfcfcf670ef8f31bda3c52dd0bd37bcb258ed1e8ff2f7359567ef3"
+    },
+    {
+      "name": "tree-nsec-alias",
+      "loaded": {
+        "masterSecretHex": "980362c45b982ee49206c7c10ce60a3442d4938c085f1e05e76e5d9a383dad2b",
+        "modeHex": "02",
+        "derivationVersionHex": "01",
+        "storedIssuerHex": "4ff3124294d4931c6ca433c33efb6acd5de4de1c8bf1596ecbe00d3b6b03911a",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      },
+      "normalizedRootHex": "980362c45b982ee49206c7c10ce60a3442d4938c085f1e05e76e5d9a383dad2b",
+      "normalizedRootPublicHex": "4ff3124294d4931c6ca433c33efb6acd5de4de1c8bf1596ecbe00d3b6b03911a",
+      "writerSeedHex": "4b498fb03b9e4c8a68332be9bba553f2cfef92beb4c200060614f1e2bab6178c",
+      "writerPublicHex": "cd96354bd41db388a7e673c08ee8d6b972d98b857222a69e2ea9cad42ca6c214",
+      "subjectHex": "6bbc78ee5869a2351e5d4c8f180f68eab0480827d2ce11ff2595923ba83a13bf",
+      "writerWithoutNulHex": "6a80e9f0655f80c9267ef35343114abde4e9e86e1e6e00ad45567a722f5c1f87",
+      "subjectWithoutNulHex": "000b18b281dfcfcf670ef8f31bda3c52dd0bd37bcb258ed1e8ff2f7359567ef3"
+    },
+    {
+      "name": "tree-mnemonic-same-root",
+      "loaded": {
+        "masterSecretHex": "980362c45b982ee49206c7c10ce60a3442d4938c085f1e05e76e5d9a383dad2b",
+        "modeHex": "01",
+        "derivationVersionHex": "01",
+        "storedIssuerHex": "4ff3124294d4931c6ca433c33efb6acd5de4de1c8bf1596ecbe00d3b6b03911a",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      },
+      "normalizedRootHex": "980362c45b982ee49206c7c10ce60a3442d4938c085f1e05e76e5d9a383dad2b",
+      "normalizedRootPublicHex": "4ff3124294d4931c6ca433c33efb6acd5de4de1c8bf1596ecbe00d3b6b03911a",
+      "writerSeedHex": "4b498fb03b9e4c8a68332be9bba553f2cfef92beb4c200060614f1e2bab6178c",
+      "writerPublicHex": "cd96354bd41db388a7e673c08ee8d6b972d98b857222a69e2ea9cad42ca6c214",
+      "subjectHex": "6bbc78ee5869a2351e5d4c8f180f68eab0480827d2ce11ff2595923ba83a13bf",
+      "writerWithoutNulHex": "6a80e9f0655f80c9267ef35343114abde4e9e86e1e6e00ad45567a722f5c1f87",
+      "subjectWithoutNulHex": "000b18b281dfcfcf670ef8f31bda3c52dd0bd37bcb258ed1e8ff2f7359567ef3"
+    },
+    {
+      "name": "different-tree-root",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000002",
+        "modeHex": "01",
+        "derivationVersionHex": "01",
+        "storedIssuerHex": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      },
+      "normalizedRootHex": "0000000000000000000000000000000000000000000000000000000000000002",
+      "normalizedRootPublicHex": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "writerSeedHex": "0cf787eb11ae55a401e8448e5aacfdb6ebfd7954fc770f092a1c6f0f112f5fb1",
+      "writerPublicHex": "0b877122b79a2bb7463f047a2deeb8f3e443ca6d900504298caede3f8a655972",
+      "subjectHex": "083f46d31571bd3b7aa6356111dff29fc6a451a87440941ad84e39615a5eff63",
+      "writerWithoutNulHex": "6212183354b1bdae6f92d40c815bc0ef226efda898678b9dc6979c5df4203ace",
+      "subjectWithoutNulHex": "e0799c1ec8badaebe6553733a6f9a18cd00f6f200fe9443d774eaf5efc9045dc"
+    }
+  ],
+  "invalidLoadedMetadata": [
+    {
+      "name": "missing-mode",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": null,
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "unknown-mode",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "03",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "long-mode",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "0000",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "missing-version",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "00",
+        "derivationVersionHex": null,
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "wrong-bunker-version",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "00",
+        "derivationVersionHex": "01",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "locked",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "00",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": true,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "missing-lock-state",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "00",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": null,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "missing-issuer",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "00",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": null,
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "wrong-issuer",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000001",
+        "modeHex": "00",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "zero-secret",
+      "loaded": {
+        "masterSecretHex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "modeHex": "00",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "scalar-at-order",
+      "loaded": {
+        "masterSecretHex": "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+        "modeHex": "00",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    },
+    {
+      "name": "wrong-tree-version",
+      "loaded": {
+        "masterSecretHex": "980362c45b982ee49206c7c10ce60a3442d4938c085f1e05e76e5d9a383dad2b",
+        "modeHex": "02",
+        "derivationVersionHex": "00",
+        "storedIssuerHex": "4ff3124294d4931c6ca433c33efb6acd5de4de1c8bf1596ecbe00d3b6b03911a",
+        "locked": false,
+        "slot": 0,
+        "label": "synthetic"
+      }
+    }
+  ]
+}

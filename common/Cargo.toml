@@ -46,6 +46,8 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], opti
 ledger_secure_sdk_sys = { version = "1.16", optional = true }
 
 [dev-dependencies]
+# Executes the actual private firmware journal codec; no RNG/default features.
+chacha20poly1305 = { version = "=0.10.1", default-features = false }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

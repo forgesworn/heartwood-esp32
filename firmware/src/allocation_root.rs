@@ -7,6 +7,10 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::{data_key, derive, types::MasterMode};
 use zeroize::Zeroizing;
 
+#[path = "allocation_journal.rs"]
+mod journal;
+pub(crate) use journal::{InventoryHold, Report, StoredBlob};
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Hold {
     Storage,
@@ -157,6 +161,26 @@ impl<'a> HeldAllocationRoot<'a> {
 
     pub(crate) fn issuer(&self) -> &[u8; 32] {
         &self.issuer
+    }
+
+    /// Local bytes only: no derived-writer or witness signature authority.
+    /// The future adapter must open this namespace read-only and enumerate all
+    /// keys/errors. This method has no runtime caller and performs no writes.
+    pub(crate) fn inspect_journal(
+        &self,
+        blobs: &[StoredBlob<'_>],
+    ) -> Result<Report, InventoryHold> {
+        self.recheck().map_err(|_| InventoryHold::Custody)?;
+        let result = journal::inspect(&self.root, &self.issuer, blobs);
+        self.recheck().map_err(|_| InventoryHold::Custody)?;
+        result
+    }
+
+    pub(crate) fn journal_namespace(&self) -> Result<String, InventoryHold> {
+        self.recheck().map_err(|_| InventoryHold::Custody)?;
+        let namespace = journal::namespace(&self.root);
+        self.recheck().map_err(|_| InventoryHold::Custody)?;
+        Ok(namespace)
     }
 
     /// Required again before any future authority decision. A failure is HOLD;

@@ -36,7 +36,14 @@ def u64(n):
     return n.to_bytes(8, "big")
 
 
-def build():
+def build(root=ROOT, records=3, complete=False):
+    # Optional inputs are public fixture construction only, never firmware APIs.
+    assert len(root) == 32 and 1 <= records <= 32
+    assert complete or records == 3
+
+    def hk(*parts):
+        return hmac.digest(root, b"".join(parts), "sha256")
+
     library = ctypes.util.find_library("sodium")
     if library is None and Path("/opt/homebrew/lib/libsodium.dylib").exists():
         library = "/opt/homebrew/lib/libsodium.dylib"
@@ -61,7 +68,7 @@ def build():
 
     subject = hk(b"VMLS/1 allocation subject\0")
     writer = pub(hk(b"VMLS/1 allocation writer seed\0"))
-    issuer = ec.derive_private_key(int.from_bytes(ROOT, "big"), ec.SECP256K1()).public_key().public_numbers().x.to_bytes(32, "big")
+    issuer = ec.derive_private_key(int.from_bytes(root, "big"), ec.SECP256K1()).public_key().public_numbers().x.to_bytes(32, "big")
     witness_secret = ed25519.Ed25519PrivateKey.from_private_bytes(bytes([9]) * 32)
     witness = pub(bytes([9]) * 32)
     schema = sha(b"HW allocation journal schema v1\0")
@@ -92,7 +99,7 @@ def build():
     assert len(anchor) == 476
 
     manifests, ids = [], []
-    for ordinal in range(1, 4):
+    for ordinal in range(1, records + 1):
         data = b"HWAM\x01" + bytes([ordinal]) + issuer
         for base in [50, 60, 70, 80, 90, 100]:
             data += bytes([base+ordinal]) * 32
@@ -127,21 +134,38 @@ def build():
         predecessor = sha(b"HW allocation snapshot v1\0", bytes([slot]), sealed)
         snapshots.append({"slot": slot, "plaintext": data.hex(), "sealed": sealed.hex()})
 
-    one = state(ids[:1], [1])
-    two = state(ids[:2], [1, 1])
-    abandoned = state(ids[:2], [2, 1])
-    retired = state(ids[:2], [2, 3])
-    snapshot(1, 0, empty)
-    snapshot(2, 0, empty, one, 1, 1)
-    snapshot(3, 1, one)
-    snapshot(4, 1, one, two, 1, 2)
-    snapshot(5, 2, two)
-    snapshot(6, 2, two, abandoned, 2, 1)
-    snapshot(7, 3, abandoned)
-    snapshot(8, 3, abandoned, retired, 3, 2)
-    snapshot(9, 4, retired)
-    return {"description": "PUBLIC SYNTHETIC ONLY. ROOT [1;32]; nonce injection is test-only. Python HMAC/SHA and libsodium XChaCha20Poly1305; independent Ed25519 receipts.",
-            "root": ROOT.hex(), "issuer": issuer.hex(), "subject": subject.hex(),
+    if complete:
+        snapshot(1, 0, empty)
+        for ordinal in range(1, records + 1):
+            active = state(ids[:ordinal-1], [1] * (ordinal-1))
+            candidate = state(ids[:ordinal], [1] * ordinal)
+            snapshot(2*ordinal, ordinal-1, active, candidate, 1, ordinal)
+            snapshot(2*ordinal+1, ordinal, candidate)
+        lives = [1] * records
+        for ordinal in range(1, records + 1):
+            active = state(ids, lives)
+            lives[ordinal-1] = 3
+            candidate = state(ids, lives)
+            seq = records + ordinal - 1
+            snapshot(2*records+2*ordinal, seq, active, candidate, 3, ordinal)
+            snapshot(2*records+2*ordinal+1, seq+1, candidate)
+    else:
+        one = state(ids[:1], [1])
+        two = state(ids[:2], [1, 1])
+        abandoned = state(ids[:2], [2, 1])
+        retired = state(ids[:2], [2, 3])
+        snapshot(1, 0, empty)
+        snapshot(2, 0, empty, one, 1, 1)
+        snapshot(3, 1, one)
+        snapshot(4, 1, one, two, 1, 2)
+        snapshot(5, 2, two)
+        snapshot(6, 2, two, abandoned, 2, 1)
+        snapshot(7, 3, abandoned)
+        snapshot(8, 3, abandoned, retired, 3, 2)
+        snapshot(9, 4, retired)
+
+    return {"description": ("PUBLIC SYNTHETIC ONLY. ROOT [1;32]; nonce injection is test-only. Python HMAC/SHA and libsodium XChaCha20Poly1305; independent Ed25519 receipts." if root == ROOT else "PUBLIC SYNTHETIC ONLY. Root is the shown public fixture; nonce injection is test-only. Python HMAC/SHA, libsodium AEAD and Ed25519 receipts."),
+            "root": root.hex(), "issuer": issuer.hex(), "subject": subject.hex(),
             "namespace": "a" + hk(b"HW allocation local namespace v1\0")[:7].hex(),
             "anchor_plaintext": anchor_plain.hex(), "anchor": anchor.hex(), "pins_hash": pins.hex(),
             "manifests": manifests, "snapshots": snapshots}

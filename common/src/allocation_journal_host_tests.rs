@@ -563,3 +563,6 @@ fn zero_nonces_are_refused_for_every_object_kind() {
         assert_eq!(scan(&f, &b).unwrap_err(), InventoryHold::Format);
     }
 }
+
+#[path = "allocation_capacity_profiles_host_tests.rs"]
+mod capacity_profiles;

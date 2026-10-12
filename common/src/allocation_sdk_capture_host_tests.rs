@@ -4,6 +4,8 @@ use super::*;
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
+#[path = "allocation_sdk_lifecycle_host_tests.rs"]
+mod sdk_lifecycle;
 #[path = "allocation_sdk_recovery_host_tests.rs"]
 mod sdk_recovery;
 
@@ -214,7 +216,9 @@ fn sdk_capacity_inventory_batch() {
         let c: Value = serde_json::from_str(&line).unwrap();
         let index = c["profile"].as_u64().unwrap() as usize;
         assert!(index < 8);
-        let mut result = if c.get("allowedStates").is_some() {
+        let mut result = if c.get("allowedLifecycleStates").is_some() {
+            sdk_lifecycle::classify(&profiles[index], &c)
+        } else if c.get("allowedStates").is_some() {
             sdk_recovery::classify(&profiles[index], &c)
         } else {
             let (outcome, detail) = classify(&profiles[index], &c);
@@ -222,6 +226,9 @@ fn sdk_capacity_inventory_batch() {
         };
         if let Some(expected) = c["expectedClass"].as_str() {
             assert_eq!(result["class"].as_str().unwrap(), expected);
+        }
+        if let Some(expected) = c.get("expectedLocalState") {
+            assert_eq!(&result["localState"], expected);
         }
         result["index"] = count.into();
         writeln!(output, "{result}").unwrap();

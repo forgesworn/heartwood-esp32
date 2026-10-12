@@ -98,3 +98,7 @@ reservations remain separate gates. Raw SDK free-entry stats cannot issue a
 capacity token. No reset/absence/retirement permits genesis or reclamation.
 Production geometry, partial programming/erase, wear, timing/RAM/watchdog,
 installed-layout migration and physical custody/witness acceptance remain open.
+
+The next [lifecycle/fullness campaign](2026-10-12-allocation-cold-lifecycle.md)
+adds separate creation/first-append/final-retirement tables and raw SDK fullness
+experiments. Those bounded cases do not close the physical/controller gates.

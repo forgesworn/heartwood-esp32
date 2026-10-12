@@ -15,6 +15,15 @@ independent vectors before code can mint their nominal inputs. This contract
 specifies ownership, order, refusals and acceptance, not final bytes or an
 approved installation, time or recovery service.
 
+The [permanent global admission extension](2026-10-12-allocation-global-admission-contract.md)
+refines the external-before-local reservation steps below: one independently
+authenticated external allocator must atomically own the lifetime scope budget
+and exact candidate; the local catalog is only its authenticated mirror plus a
+separately measured physical reserve. A per-subject reservation followed by an
+independent local slot admission is not sufficient. The extension fixes ownership
+and cut/refusal ordering, while service/protection selection and canonical bytes
+remain separate gates before authority producers.
+
 ## Actual owner and selected master
 
 One firmware command coordinator owns the ceremony. The device physically

@@ -9,6 +9,9 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::{data_key, derive, types::MasterMode};
 use zeroize::Zeroizing;
 
+#[path = "allocation_partition.rs"]
+mod partition;
+
 #[path = "allocation_crypto.rs"]
 mod crypto;
 #[path = "allocation_journal.rs"]

@@ -44,11 +44,23 @@ impl Drop for ReadHandle<'_> {
 
 pub(super) trait RawHandle {
     fn raw(&self) -> sys::nvs_handle_t;
+    // Default adapters preserve their existing behavior. Dedicated partition
+    // handles verify their owner before and after every SDK inventory call.
+    fn recheck(&self) -> Result<(), InventoryHold> {
+        Ok(())
+    }
 }
 impl RawHandle for ReadHandle<'_> {
     fn raw(&self) -> sys::nvs_handle_t {
         self.raw
     }
+}
+
+fn checked<H: RawHandle, T>(handle: &H, call: impl FnOnce() -> T) -> Result<T, InventoryHold> {
+    handle.recheck()?;
+    let result = call();
+    handle.recheck()?;
+    Ok(result)
 }
 
 struct Entries<'handle, H: RawHandle> {
@@ -121,9 +133,9 @@ pub(super) fn collect<H: RawHandle>(
         _owner: handle,
     };
     // SAFETY: valid live handle, exact SDK enum and initialized output pointer.
-    let start = unsafe {
+    let start = checked(handle, || unsafe {
         sys::nvs_entry_find_in_handle(handle.raw(), sys::nvs_type_t_NVS_TYPE_ANY, &mut it.raw)
-    };
+    })?;
     if start == sys::ESP_ERR_NVS_NOT_FOUND {
         if !it.raw.is_null() {
             return Err(InventoryHold::Storage);
@@ -140,7 +152,7 @@ pub(super) fn collect<H: RawHandle>(
         }
         let mut info = Info(sys::nvs_entry_info_t::default());
         // SAFETY: non-null live iterator and valid zero-initialized output.
-        if unsafe { sys::nvs_entry_info(it.raw, &mut info.0) } != sys::ESP_OK {
+        if checked(handle, || unsafe { sys::nvs_entry_info(it.raw, &mut info.0) })? != sys::ESP_OK {
             return Err(InventoryHold::Storage);
         }
         let ns = Name::from_raw(&info.0.namespace_name)?;
@@ -154,7 +166,9 @@ pub(super) fn collect<H: RawHandle>(
         }
         let mut length = 0;
         // Query exactly this enumerated blob, then read it at its frozen width.
-        if unsafe { sys::nvs_get_blob(handle.raw(), name.ptr(), ptr::null_mut(), &mut length) }
+        if checked(handle, || unsafe {
+            sys::nvs_get_blob(handle.raw(), name.ptr(), ptr::null_mut(), &mut length)
+        })?
             != sys::ESP_OK
         {
             return Err(InventoryHold::Storage);
@@ -163,14 +177,14 @@ pub(super) fn collect<H: RawHandle>(
             return Err(InventoryHold::Format);
         }
         let mut bytes = vec![0; width];
-        if unsafe {
+        if checked(handle, || unsafe {
             sys::nvs_get_blob(
                 handle.raw(),
                 name.ptr(),
                 bytes.as_mut_ptr().cast(),
                 &mut length,
             )
-        } != sys::ESP_OK
+        })? != sys::ESP_OK
         {
             return Err(InventoryHold::Storage);
         }
@@ -183,7 +197,7 @@ pub(super) fn collect<H: RawHandle>(
         });
         // SAFETY: mutate only the current pointer. Any non-NOT_FOUND error is
         // HOLD, never end-of-inventory. Pointer/status contradictions also HOLD.
-        let err = unsafe { sys::nvs_entry_next(&mut it.raw) };
+        let err = checked(handle, || unsafe { sys::nvs_entry_next(&mut it.raw) })?;
         if err == sys::ESP_ERR_NVS_NOT_FOUND {
             if !it.raw.is_null() {
                 return Err(InventoryHold::Storage);

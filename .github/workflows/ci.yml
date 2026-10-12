@@ -169,6 +169,8 @@ jobs:
         with:
           node-version: 24
       - run: node --test $(find scripts -name '*.test.mjs' | sort)
+      # Offline full-sector planner; synthetic fixtures, no hardware access.
+      - run: python3 scripts/test_allocation_partition_planner.py
 
   # The OTA release signing tool (ota-sign/) — keygen/sign/verify for the
   # ed25519 release signatures the firmware enforces. Kept green here so the

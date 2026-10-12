@@ -84,3 +84,7 @@ before writes by a future authorized owner, separately from artificial filler
 space exhaustion. Permanent reservations, physical partial programming/erase,
 wear, cuts, timing/watchdog/RAM, reset retention, migration, custody, fresh witness,
 authenticated time and production activation remain open.
+
+The later [bounded reconciliation/recovery campaign](2026-10-12-allocation-cold-reconciliation.md)
+adds explicit record32 orphan/pending/promoted states and repeated cold-init cuts.
+Its finite graph limits do not close the remaining matrix described above.

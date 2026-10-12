@@ -52,7 +52,7 @@ def recipe(profiles, order):
 
 
 class Runner:
-    def __init__(self, args, profiles):
+    def __init__(self, args, profiles, trace_name="allocation-nvs-cold-worst32-traces.jsonl.gz"):
         self.args = args
         self.profiles = profiles
         self.count = 0
@@ -60,7 +60,7 @@ class Runner:
         self.work.mkdir(parents=True, exist_ok=False)
         self.query = args.scratch / "names.txt"
         self.query.write_text("\n".join(p["namespace"] for p in profiles) + "\n")
-        self.archive = gzip.open(args.evidence / "allocation-nvs-cold-worst32-traces.jsonl.gz", "xt", compresslevel=6)
+        self.archive = gzip.open(args.evidence / trace_name, "xt", compresslevel=6)
 
     def run(self, image, ops, mode="none", cut=0):
         self.count += 1
@@ -77,7 +77,7 @@ class Runner:
         trace = work / "trace.jsonl"
         env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:abort_on_error=1", UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
         command = [str(self.args.worker), str(baseline) if image is not None else "-", str(output), str(operation), str(inventory), str(self.query), mode, str(cut), str(trace)]
-        r = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        r = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
         assert r.returncode in (0, 90, 91), (r.returncode, r.stdout.decode(), r.stderr.decode())
         raw = output.read_bytes()
         assert len(raw) == BYTES

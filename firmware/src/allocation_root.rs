@@ -14,6 +14,8 @@ mod partition;
 
 #[path = "allocation_crypto.rs"]
 mod crypto;
+#[path = "allocation_enrolment_candidate.rs"]
+mod enrolment_candidate;
 #[path = "allocation_journal.rs"]
 mod journal;
 #[path = "allocation_journal_nvs.rs"]

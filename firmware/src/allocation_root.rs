@@ -16,6 +16,8 @@ mod partition;
 mod crypto;
 #[path = "allocation_enrolment_candidate.rs"]
 mod enrolment_candidate;
+#[path = "allocation_scope_binding.rs"]
+mod scope_binding;
 #[path = "allocation_journal.rs"]
 mod journal;
 #[path = "allocation_journal_nvs.rs"]

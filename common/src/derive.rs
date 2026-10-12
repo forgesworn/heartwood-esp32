@@ -34,6 +34,23 @@ type HmacSha256 = Hmac<Sha256>;
 // Backend: secret → (valid secp256k1 scalar?, x-only pubkey bytes)
 // ---------------------------------------------------------------------------
 
+/// Point syntax only; this does not establish ownership or issuer authority.
+pub fn is_xonly_public_key(key: &[u8; 32]) -> bool {
+    #[cfg(feature = "k256-backend")]
+    {
+        k256::schnorr::VerifyingKey::from_bytes(key).is_ok()
+    }
+    #[cfg(feature = "secp256k1-backend")]
+    {
+        secp256k1::XOnlyPublicKey::from_slice(key).is_ok()
+    }
+    #[cfg(not(any(feature = "k256-backend", feature = "secp256k1-backend")))]
+    {
+        let _ = key;
+        false
+    }
+}
+
 #[cfg(feature = "k256-backend")]
 pub(crate) mod backend {
     use k256::schnorr::SigningKey;

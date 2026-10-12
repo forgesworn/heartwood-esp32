@@ -4,6 +4,9 @@ use super::*;
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
+#[path = "allocation_sdk_recovery_host_tests.rs"]
+mod sdk_recovery;
+
 fn profiles() -> Vec<Fixture> {
     let v: Value = serde_json::from_str(include_str!(
         "../tests/fixtures/allocation-capacity-profiles-v1.json"
@@ -211,16 +214,17 @@ fn sdk_capacity_inventory_batch() {
         let c: Value = serde_json::from_str(&line).unwrap();
         let index = c["profile"].as_u64().unwrap() as usize;
         assert!(index < 8);
-        let (outcome, detail) = classify(&profiles[index], &c);
+        let mut result = if c.get("allowedStates").is_some() {
+            sdk_recovery::classify(&profiles[index], &c)
+        } else {
+            let (outcome, detail) = classify(&profiles[index], &c);
+            serde_json::json!({"class":outcome,"detail":detail,"authority":false})
+        };
         if let Some(expected) = c["expectedClass"].as_str() {
-            assert_eq!(outcome, expected);
+            assert_eq!(result["class"].as_str().unwrap(), expected);
         }
-        writeln!(
-            output,
-            "{}",
-            serde_json::json!({"index":count,"class":outcome,"detail":detail,"authority":false})
-        )
-        .unwrap();
+        result["index"] = count.into();
+        writeln!(output, "{result}").unwrap();
         count += 1;
     }
     assert!(count > 0);

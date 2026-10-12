@@ -566,3 +566,6 @@ fn zero_nonces_are_refused_for_every_object_kind() {
 
 #[path = "allocation_capacity_profiles_host_tests.rs"]
 mod capacity_profiles;
+
+#[path = "allocation_sdk_capture_host_tests.rs"]
+mod sdk_capture;

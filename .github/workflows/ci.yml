@@ -106,6 +106,8 @@ jobs:
       # Mathematical fresh-R vectors on the actual firmware curve/ECDH backend.
       - run: cargo +stable test --locked --manifest-path common/Cargo.toml --no-default-features --features firmware fresh_r_vectors
       - run: cargo +stable test --locked --manifest-path common/Cargo.toml --no-default-features --features firmware allocation_root::partition
+      # Test-only strict bridge from offline public SDK captures to real codec.
+      - run: cargo +stable test --locked --manifest-path common/Cargo.toml --no-default-features --features firmware sdk_capture
       # Execute the bench-only failed-backend gate: no storage open or fallback.
       - run: cargo +stable test --locked --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes,allocation-crypto-selfcheck-fail injected_backend_failure
 

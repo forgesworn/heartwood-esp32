@@ -101,6 +101,8 @@ jobs:
       # Execute the actual private allocation custody source on the firmware's
       # C curve backend as well as k256 above; no hardware or signing API.
       - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features firmware allocation_root
+      # Execute the real destructive wipe adapter on the firmware backend too.
+      - run: cargo +stable test --locked --manifest-path common/Cargo.toml --no-default-features --features firmware persistent_wipe_host_sys
       # Execute the bench-only failed-backend gate: no storage open or fallback.
       - run: cargo +stable test --locked --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes,allocation-crypto-selfcheck-fail injected_backend_failure
 

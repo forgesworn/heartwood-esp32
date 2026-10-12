@@ -191,3 +191,10 @@ mod allocation_root;
 
 #[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
 mod allocation_nvs_host_sys;
+
+// Execute the actual destructive wipe adapter; only raw partition I/O is mocked.
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+mod persistent_wipe_host_sys;
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+#[path = "../../firmware/src/persistent_wipe.rs"]
+mod firmware_persistent_wipe;

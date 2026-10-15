@@ -139,18 +139,21 @@ feature, target triple, MCU, and sdkconfig fragment cannot drift apart:
 Or the manual form (the wrapper runs exactly these):
 
 ```bash
-cd firmware
-# V4 (default)
-cargo build --release
-# V3
-ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heltec-v3" \
-    cargo build --release --no-default-features --features heltec-v3
-# T-Display (classic ESP32)
-MCU=esp32 ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.tdisplay" \
-    cargo build --release --target xtensa-esp32-espidf --no-default-features --features tdisplay
-# Waveshare ESP32-C6 (RISC-V)
-MCU=esp32c6 ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.c6" \
-    cargo build --release --target riscv32imac-esp-espidf --no-default-features --features c6
+# A subshell, so your shell stays in the repository root for the flash steps below.
+(
+  cd firmware
+  # V4 (default)
+  cargo build --release
+  # V3
+  ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heltec-v3" \
+      cargo build --release --no-default-features --features heltec-v3
+  # T-Display (classic ESP32)
+  MCU=esp32 ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.tdisplay" \
+      cargo build --release --target xtensa-esp32-espidf --no-default-features --features tdisplay
+  # Waveshare ESP32-C6 (RISC-V)
+  MCU=esp32c6 ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.c6" \
+      cargo build --release --target riscv32imac-esp-espidf --no-default-features --features c6
+)
 ```
 
 The wrapper script also writes a board-tagged ELF copy to
@@ -268,7 +271,7 @@ The firmware binary must be an app binary (use `espflash save-image`), not the r
 After first flash, wait for OLED to show "Awaiting secret...", then:
 
 ```bash
-cd provision && cargo run -- --port /dev/cu.usbserial-* provision
+(cd provision && cargo run -- --port /dev/cu.usbserial-* provision)
 ```
 
 `provision` restores an existing secret; `generate` makes a fresh one on the
@@ -296,8 +299,7 @@ tools first (`(cd provision && cargo build)`, `(cd sign-test && cargo build)`,
    never written to disk) and a bridge secret for the daemon:
 
    ```bash
-   cd provision
-   cargo run -- --port /dev/ttyACM0 generate --label primary --gen-bridge-secret
+   (cd provision && cargo run -- --port /dev/ttyACM0 generate --label primary --gen-bridge-secret)
    ```
 
    The command prints the bridge secret; keep it for step 3. To restore an
@@ -310,16 +312,60 @@ tools first (`(cd provision && cargo build)`, `(cd sign-test && cargo build)`,
    last started. `sign_event` needs a button hold on the device:
 
    ```bash
-   cd sign-test
-   cargo run -- --port /dev/ttyACM0 --method get_public_key
-   cargo run -- --port /dev/ttyACM0 --method sign_event --kind 1 --content "hello"
+   (cd sign-test && cargo run -- --port /dev/ttyACM0 --method get_public_key)
+   (cd sign-test && cargo run -- --port /dev/ttyACM0 --method sign_event --kind 1 --content "hello")
    ```
 
-   `sign-test` prints the request it sends (an object with `id`, `method`,
-   `params` and an optional `heartwood` derivation context, e.g. `--purpose
-   persona/social --index 0`) and then the device's reply: an object carrying
-   `result` (the signed event JSON, or the hex public key plus its `npub` for
-   `get_public_key`) or `error`.
+   Run these from the repository root; each subshell leaves your shell where it
+   was. `sign-test` prints the request it sends, then the device's reply. For
+   `get_public_key` the request carries an optional `heartwood` derivation
+   context (`--purpose persona/social --index 0` fills it in; without `--purpose`
+   it is `null`), and the reply is the requested public key as hex (the
+   master's without `--purpose`), after which `sign-test` prints the matching
+   `npub`:
+
+   ```json
+   {
+     "heartwood": null,
+     "id": "sign-test-1",
+     "method": "get_public_key",
+     "params": []
+   }
+   ```
+
+   ```json
+   {
+     "id": "sign-test-1",
+     "result": "<64 hex characters>"
+   }
+   ```
+
+   For `sign_event`, `params[0]` is the unsigned event as a JSON string, with a
+   zero placeholder `pubkey` that the device replaces with the signing key's. The
+   reply's `result` is the signed event, again as a JSON string (hex values
+   shortened here):
+
+   ```json
+   {
+     "heartwood": null,
+     "id": "sign-test-1",
+     "method": "sign_event",
+     "params": [
+       "{\"content\":\"hello\",\"created_at\":1760000000,\"kind\":1,\"pubkey\":\"0000...0000\",\"tags\":[]}"
+     ]
+   }
+   ```
+
+   ```json
+   {
+     "id": "sign-test-1",
+     "result": "{\"id\":\"3f9a...\",\"pubkey\":\"79be...\",\"created_at\":1760000000,\"kind\":1,\"tags\":[],\"content\":\"hello\",\"sig\":\"c2d4...\"}"
+   }
+   ```
+
+   A refused or failed request comes back as `{"id": "sign-test-1", "error":
+   "<message>"}` with no `result`. Over a relay the same `id`/`method`/`params`
+   object travels NIP-44 encrypted inside a NIP-46 kind 24133 event.
 
 3. Run `heartwoodd` (below), then take the bunker URI from
    `<data-dir>/bunker-uri.txt`. It has the form

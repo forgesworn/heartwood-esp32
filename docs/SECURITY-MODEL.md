@@ -508,6 +508,20 @@ later cost retune must still be measured on the slowest supported board; the
 stored count makes that a deliberate new-record policy rather than an unsafe
 global constant change.
 
+**Downgrade is one-way while sealed.** From `v0.18.0-beta.17`, seeds are sealed
+under a random data key as 82-byte `HWDK` blobs (`common/src/data_key.rs`), and
+the first unlock on that firmware migrates an older board's seeds in place.
+Firmware up to `v0.18.0-beta.16` only recognises the 92- and 101-byte
+`seed_cipher` records, so it cannot read the new ones. Before going back to
+beta.16 or older on a board with a PIN or vault key, unlock the board and turn
+at-rest encryption off: `SET_PIN` with an empty payload ("Remove PIN?") or
+`VAULT_SET` with an empty payload ("Disable vault?"), each behind a button hold.
+That stores every seed in plaintext and drops the phone records, so enrolled
+phones must be enrolled again if encryption is turned back on. A WiFi-mode
+board refuses the change while it holds bearer notes ("at-rest changes need USB
+mode while notes are held"), so empty the note locker or switch to USB mode first. Turning it off
+does not wipe the sealed bytes already on flash (see *Leftover bytes in NVS*).
+
 **Honest limitation:** with no secure element and no eFuses, the key is derived
 **entirely from the PIN**. An attacker who owns the flash can brute-force the
 PIN offline; the slow KDF raises the per-guess cost but a short PIN is an

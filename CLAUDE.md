@@ -337,13 +337,14 @@ Five crates — build each from its own directory:
 # target does not compile (35 arity errors). Use the two invocations CI uses:
 cargo test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen,cash
 cargo test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,seed-encrypt,cash
-cd ui-preview && cargo test                # screen geometry + the show_error clipping guard
-cd provision && cargo build                # host CLI tool
-cd sign-test && cargo build                # signing test harness
-cd heartwoodd && cargo build               # Pi-side daemon (Soft or Hard mode)
-cd ota && cargo build                      # Pi-side serial OTA tool
-cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain)
-cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
+# Each line is a subshell, so it can be run from the repository root in sequence.
+(cd ui-preview && cargo test)              # screen geometry + the show_error clipping guard
+(cd provision && cargo build)              # host CLI tool
+(cd sign-test && cargo build)              # signing test harness
+(cd heartwoodd && cargo build)             # Pi-side daemon (Soft or Hard mode)
+(cd ota && cargo build)                    # Pi-side serial OTA tool
+(cd firmware && cargo build)               # ESP32 firmware (needs ESP toolchain)
+(cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32)
 ```
 
 Requires the ESP Rust toolchain for firmware: `espup install`, then `source ~/export-esp.sh`.

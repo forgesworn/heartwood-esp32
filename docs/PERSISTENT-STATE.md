@@ -41,7 +41,7 @@ namespace:
 |------|----------------------|
 | `master_count` | Number of master slots |
 | `master_N_secret` | Plaintext master seed when boot PIN protection is off |
-| `mN_seed_enc` | PIN-encrypted master seed; compact name stays within ESP-IDF's 15-character key limit |
+| `mN_seed_enc` | Sealed master seed (PIN or vault key): an 82-byte `HWDK` blob under the data key from beta.17, or the older 92- or 101-byte `seed_cipher` record until the first unlock on beta.17 or later migrates it; beta.16 and older read only the older records. Compact name stays within ESP-IDF's 15-character key limit |
 | `master_N_label`, `master_N_mode`, `master_N_pubkey` | Master metadata |
 | `master_N_conn`, `policy_N` | Legacy client secret/policy migration state |
 | `connslots_N` | Current client credentials and exact signing policy for master slot N |

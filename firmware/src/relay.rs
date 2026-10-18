@@ -5758,14 +5758,26 @@ fn is_enrol_card(card: &ButtonCard) -> bool {
 fn card_window(card: &ButtonCard) -> Duration {
     if is_enrol_card(card) {
         Duration::from_secs(u64::from(heartwood_common::phone_unlock::ENROL_CARD_SECS))
+    } else if is_full_access_card(card) {
+        // The enrol window (one-hold pairing spec 4.2): time to read.
+        Duration::from_secs(heartwood_common::owner_pairing::FULL_ACCESS_CARD_SECS)
     } else {
         CARD_WINDOW
     }
 }
 
+/// Whether this card is the setup hold's FULL ACCESS card.
+fn is_full_access_card(card: &ButtonCard) -> bool {
+    card.asks
+        .first()
+        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::FullAccess { .. }))
+}
 
-/// Hold that approves, matching `approval::run_approval_loop`.
-const CARD_HOLD_MS: u32 = 2000;
+/// The hold that approves this card, matching the interactive loop's
+/// (`card_hold::hold_ms`): 5 s for FULL ACCESS, 2 s for every other card.
+fn card_hold_ms(card: &ButtonCard) -> u32 {
+    crate::card_hold::hold_ms(is_full_access_card(card))
+}
 
 /// How long the tick may sample closely while the button is actually down,
 /// and how often. The loop's own cadence is roughly a second — far too coarse
@@ -6069,10 +6081,17 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     ctx.last_activity = Instant::now();
 
     if hold_ms > 0 {
-        let pct = (hold_ms * 100 / CARD_HOLD_MS).min(100);
+        let pct = crate::card_hold::hold_pct(card_hold_ms(&ctx.button_cards[0]), hold_ms);
         if pct / 5 != ctx.button_cards[0].last_pct / 5 {
             ctx.button_cards[0].last_pct = pct;
-            crate::oled::show_hold_progress(ctx.display, pct);
+            // The FULL ACCESS card shows its words for the whole hold.
+            match &ctx.button_cards[0].asks[0].ask.card {
+                crate::nip46_handler::AskCard::FullAccess { client_pubkey, .. } => {
+                    let client = *client_pubkey;
+                    crate::oled::show_full_access_hold(ctx.display, &client, pct)
+                }
+                _ => crate::oled::show_hold_progress(ctx.display, pct),
+            }
         }
         return;
     }
@@ -6100,6 +6119,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         Titled(&'static str, String),
         Batch(String, String),
         Enrol([&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS], String),
+        FullAccess(String, [u8; 32], Vec<String>, heartwood_common::owner_pairing::Style),
     }
     // The enrol card's page and whether a hold counts yet (its hint).
     let (card_page, card_armed) = view.unwrap_or((0, true));
@@ -6136,6 +6156,9 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             Draw::Titled("RECEIVE NOTE", title.clone())
         }
         crate::nip46_handler::AskCard::PhoneEnrol { words, label, .. } => Draw::Enrol(*words, label.clone()),
+        crate::nip46_handler::AskCard::FullAccess { label, client_pubkey, act_as, style } => {
+            Draw::FullAccess(label.clone(), *client_pubkey, act_as.clone(), *style)
+        }
     };
     // What the panel now READS, once per wording, so a bench can check an
     // amount or a mint without a camera on the OLED (checklist 13, 2b).
@@ -6165,6 +6188,10 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             Draw::Titled(header, title) => ((*header).to_string(), title.clone()),
             Draw::Batch(header, title) => (header.clone(), title.clone()),
             Draw::Enrol(words, label) => (format!("ADD \"{label}\"?"), words.join(" ")),
+            Draw::FullAccess(label, client, act_as, style) => {
+                let card = heartwood_common::owner_pairing::full_access_card(label, 64, client, act_as, *style);
+                (card.header.to_string(), card.lines()[1..].join(" / "))
+            }
         };
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }
@@ -6208,6 +6235,15 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             heartwood_common::phone_unlock::ENROL_CARD_SECS,
             card_page,
             card_armed,
+        ),
+        Draw::FullAccess(label, client, act_as, style) => crate::oled::show_full_access(
+            ctx.display,
+            &label,
+            &client,
+            &act_as,
+            style,
+            remaining,
+            heartwood_common::owner_pairing::FULL_ACCESS_CARD_SECS as u32,
         ),
     }
     // What is on the glass is this card's face, as of now.
@@ -6342,17 +6378,15 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         return CardTick::Denied;
     }
 
-    if hold_ms >= CARD_HOLD_MS {
-        return CardTick::Approved;
-    }
-    if let Some(ms) = released {
-        // A hold that began and ended between two passes still counts: the
-        // sampler measured it even though the loop never saw it in progress.
-        return if ms >= CARD_HOLD_MS {
-            CardTick::Approved
-        } else {
-            CardTick::Denied
-        };
+    // The card's own hold: 5 s for FULL ACCESS, 2 s for every other card. A
+    // hold that began and ended between two passes still counts: the
+    // sampler measured it even though the loop never saw it in progress. A
+    // shorter press declines.
+    let hold = card_hold_ms(&ctx.button_cards[0]);
+    match crate::card_hold::judge(hold, hold_ms, released) {
+        crate::card_hold::Press::Approved => return CardTick::Approved,
+        crate::card_hold::Press::Declined => return CardTick::Denied,
+        crate::card_hold::Press::Pending => {}
     }
 
     if hold_ms > 0 {
@@ -6364,21 +6398,21 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         // on the button is a foreground interaction: the socket can wait the
         // second or so it takes, and the watchdog is fed every poll.
         let burst_until = Instant::now()
-            + CARD_HOLD_BURST.max(Duration::from_millis(u64::from(CARD_HOLD_MS - hold_ms) + 200));
+            + CARD_HOLD_BURST.max(Duration::from_millis(u64::from(hold.saturating_sub(hold_ms)) + 200));
         loop {
             crate::wdt::feed();
             let held = crate::button::hold_ms();
-            if held >= CARD_HOLD_MS {
+            if held >= hold {
                 return CardTick::Approved;
             }
             if held == 0 {
-                // Released mid-burst: the sampler has the length.
-                return match crate::button::take_release() {
-                    Some(ms) if ms >= CARD_HOLD_MS => CardTick::Approved,
-                    Some(_) => CardTick::Denied,
-                    // No release recorded: treat it as nothing having
-                    // happened and let the next pass decide.
-                    None => CardTick::Pending,
+                // Released mid-burst: the sampler has the length. No release
+                // recorded: treat it as nothing having happened and let the
+                // next pass decide.
+                return match crate::card_hold::judge(hold, 0, crate::button::take_release()) {
+                    crate::card_hold::Press::Approved => CardTick::Approved,
+                    crate::card_hold::Press::Declined => CardTick::Denied,
+                    crate::card_hold::Press::Pending => CardTick::Pending,
                 };
             }
             draw_button_card(ctx, remaining, held);

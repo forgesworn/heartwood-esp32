@@ -496,6 +496,17 @@ pub enum AskCard {
         /// the owner compares with the phone that made the key.
         words: [&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS],
     },
+    /// The setup hold, `heartwood_approve_bundle` (one-hold pairing spec
+    /// 4.2): the inverted FULL ACCESS card, a 5 s hold, a 45 s window, never
+    /// shared. Its lines come from `owner_pairing::full_access_card`: the
+    /// pairing's `label`, the three words of `client_pubkey`, the scope
+    /// `act_as` grants and the `style`'s lines.
+    FullAccess {
+        label: String,
+        client_pubkey: [u8; 32],
+        act_as: Vec<String>,
+        style: heartwood_common::owner_pairing::Style,
+    },
 }
 
 /// An ask handed back to a deferring caller, and handed in again once the

@@ -24,7 +24,8 @@ const DEBOUNCE_MS: u32 = heartwood_common::button_arm::SETTLE_UP_MS as u32;
 /// Run the interactive button approval loop.
 ///
 /// Shows `show_fn` on the OLED each second with the remaining countdown,
-/// waits for a 2-second hold of the A button, counted only from a press that
+/// waits for a 2-second hold (`card_hold::CARD_HOLD_MS`) of the A button,
+/// counted only from a press that
 /// starts after the button has been seen up (debounced) with the card on
 /// screen, so a hold already down when it appears never answers it. While
 /// the button is held, a
@@ -42,7 +43,15 @@ pub fn run_approval_loop<F>(
 where
     F: FnMut(&mut Display<'_>, u32),
 {
-    let result = approval_loop_inner(display, buttons, timeout_secs, None, |d, remaining, _, _| show_fn(d, remaining));
+    let result = approval_loop_inner(
+        display,
+        buttons,
+        timeout_secs,
+        crate::card_hold::CARD_HOLD_MS,
+        None,
+        |d, remaining, _, _| show_fn(d, remaining),
+        crate::oled::show_hold_progress,
+    );
     // This loop consumed its presses (and B-cancels) directly off the pins;
     // drop any edge the sampler latched from them, or the approval hold
     // replays in `service_button` and instantly dismisses the very card the
@@ -71,20 +80,62 @@ where
     F: FnMut(&mut Display<'_>, u32, usize, bool),
 {
     let mut gate = heartwood_common::phone_unlock::EnrolGate::default();
-    let result = approval_loop_inner(display, buttons, timeout_secs, Some(&mut gate), show_fn);
+    let result = approval_loop_inner(
+        display,
+        buttons,
+        timeout_secs,
+        crate::card_hold::CARD_HOLD_MS,
+        Some(&mut gate),
+        show_fn,
+        crate::oled::show_hold_progress,
+    );
     crate::button::clear_press_edge();
     result
 }
 
-fn approval_loop_inner<F>(
+/// [`run_approval_loop`] for the FULL ACCESS card (one-hold pairing spec
+/// 4.2): approved only by a [`crate::card_hold::FULL_ACCESS_HOLD_MS`] (5 s)
+/// hold, a shorter press declines, and `show_hold` draws the hold screen
+/// (the words and the hold's progress, 0 to 100) while the button is down,
+/// in place of the generic CONFIRMING screen.
+pub fn run_full_access_approval_loop<F, H>(
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
     timeout_secs: u64,
+    mut show_fn: F,
+    show_hold: H,
+) -> ApprovalResult
+where
+    F: FnMut(&mut Display<'_>, u32),
+    H: FnMut(&mut Display<'_>, u32),
+{
+    let result = approval_loop_inner(
+        display,
+        buttons,
+        timeout_secs,
+        crate::card_hold::FULL_ACCESS_HOLD_MS,
+        None,
+        |d, remaining, _, _| show_fn(d, remaining),
+        show_hold,
+    );
+    crate::button::clear_press_edge();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approval_loop_inner<F, H>(
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    timeout_secs: u64,
+    // The hold that approves this card (`card_hold::hold_ms`).
+    hold: u32,
     mut gate: Option<&mut heartwood_common::phone_unlock::EnrolGate>,
     mut show_fn: F,
+    mut show_hold: H,
 ) -> ApprovalResult
 where
     F: FnMut(&mut Display<'_>, u32, usize, bool),
+    H: FnMut(&mut Display<'_>, u32),
 {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(timeout_secs);
@@ -173,21 +224,28 @@ where
             esp_idf_hal::delay::FreeRtos::delay_ms(DEBOUNCE_MS);
             low = buttons.a.is_low();
         }
+        let held_ms = if pressed {
+            Instant::now().duration_since(press_start).as_millis().min(u128::from(u32::MAX)) as u32
+        } else {
+            0
+        };
         if low && pressed {
-            let held_ms = Instant::now().duration_since(press_start).as_millis() as u32;
-            if held_ms >= 2000 {
+            if crate::card_hold::judge(hold, held_ms, None) == crate::card_hold::Press::Approved {
                 crate::oled::show_approved(display);
                 esp_idf_hal::delay::FreeRtos::delay_ms(300);
                 return ApprovalResult::Approved;
             }
             // Update hold progress bar (redraw every ~5% to avoid flicker)
-            let pct = (held_ms * 100 / 2000).min(100);
+            let pct = crate::card_hold::hold_pct(hold, held_ms);
             if pct / 5 != last_pct / 5 {
-                crate::oled::show_hold_progress(display, pct);
+                show_hold(display, pct);
                 last_pct = pct;
             }
         }
         if !low && pressed {
+            // Let go before the hold was reached (this loop polls every
+            // 20 ms while the button is down, so a full hold has already
+            // approved above): a short press declines.
             crate::oled::show_denied(display);
             esp_idf_hal::delay::FreeRtos::delay_ms(500);
             return ApprovalResult::Denied;

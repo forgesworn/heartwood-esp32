@@ -43,6 +43,7 @@ mod backup;
 mod bigtext;
 mod board;
 mod button;
+mod card_hold;
 mod confirm;
 mod connslot;
 mod entropy;

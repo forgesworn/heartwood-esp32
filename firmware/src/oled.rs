@@ -1259,6 +1259,162 @@ fn draw_enrol_countdown(
         .ok();
 }
 
+/// The inverted `FULL ACCESS` bar across the top of the screen (one-hold
+/// pairing spec 4.2): a filled bar with the header cut out of it in the
+/// background colour. Only the FULL ACCESS card's two screens draw it, now
+/// and later; no other card is ever inverted (pinned by a ui-preview test
+/// over this file).
+fn draw_full_access_header(display: &mut Display<'_>, l: &Layout, g: &crate::layout::FullAccessGeometry) {
+    let (x, y, w, h) = g.bar;
+    Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display)
+        .ok();
+    let header = heartwood_common::owner_pairing::FULL_ACCESS_HEADER;
+    let style = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(crate::palette::BG)
+        .build();
+    let hx = l.center_x(header.len() as i32 * Layout::glyph_w(l.font_header()));
+    Text::new(header, Point::new(hx, g.header_y), style).draw(display).ok();
+}
+
+/// The FULL ACCESS card (one-hold pairing spec 4.2), at rest: the inverted
+/// header, the pairing's label, the scope line, the style's line(s) and the
+/// hold line, word for word as `owner_pairing::full_access_card` gives them
+/// (My Signet shows the same lines), over a 45 s countdown. The three words
+/// are on the hold screen ([`show_full_access_hold`]): this panel's fonts
+/// cannot fit all eight lines on one screen (`layout::FullAccessGeometry`).
+/// Mirrored and checked in ui-preview (`draw_full_access`).
+pub fn show_full_access(
+    display: &mut Display<'_>,
+    label: &str,
+    client_pubkey: &[u8; 32],
+    act_as: &[String],
+    style: heartwood_common::owner_pairing::Style,
+    remaining: u32,
+    total_secs: u32,
+) {
+    let l = layout(display);
+    display.clear_buffer();
+    let g = l.full_access_geometry();
+    let card = heartwood_common::owner_pairing::full_access_card(
+        label,
+        l.span_chars(None, l.font_small()),
+        client_pubkey,
+        act_as,
+        style,
+    );
+    draw_full_access_header(display, &l, &g);
+
+    let text = |colour| MonoTextStyleBuilder::new().font(l.font_small()).text_color(colour).build();
+    let mut lines: Vec<(&str, Rgb565)> = vec![(card.label.as_str(), FG), (card.scope, WARN)];
+    lines.extend(card.style_lines.iter().map(|line| (*line, FG)));
+    lines.push((card.hold, ACCENT));
+    for (i, (line, colour)) in lines.into_iter().enumerate() {
+        let x = l.center_in_span(None, line.len() as i32 * Layout::glyph_w(l.font_small()));
+        Text::new(line, Point::new(x, g.first_y + i as i32 * g.pitch), text(colour))
+            .draw(display)
+            .ok();
+    }
+    draw_full_access_countdown(display, &l, &g, remaining, total_secs);
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// The FULL ACCESS card's hold screen, drawn while the button is down: the
+/// inverted header, the three words large (`w1 w2` / `w3`) to compare with
+/// the phone for the whole 5 s hold, the hold line and the hold's progress.
+/// Letting go before the bar fills declines. Replaces the generic
+/// CONFIRMING screen for this card only. Mirrored in ui-preview.
+pub fn show_full_access_hold(display: &mut Display<'_>, client_pubkey: &[u8; 32], hold_pct: u32) {
+    let l = layout(display);
+    display.clear_buffer();
+    let g = l.full_access_geometry();
+    let h = l.full_access_hold_geometry();
+    draw_full_access_header(display, &l, &g);
+    let words = heartwood_common::owner_pairing::pair_words(client_pubkey);
+    let word_style = MonoTextStyleBuilder::new().font(h.word_font).text_color(WARN).build();
+    let first = format!("{} {}", words[0], words[1]);
+    for (line, y) in [(first.as_str(), h.word_y[0]), (words[2], h.word_y[1])] {
+        let x = l.center_in_span(None, line.len() as i32 * Layout::glyph_w(h.word_font));
+        Text::new(line, Point::new(x, y), word_style).draw(display).ok();
+    }
+    let hint = heartwood_common::owner_pairing::HOLD_LINE;
+    let hint_style = MonoTextStyleBuilder::new().font(l.font_small()).text_color(MUTED).build();
+    let hx = l.center_in_span(None, hint.len() as i32 * Layout::glyph_w(l.font_small()));
+    Text::new(hint, Point::new(hx, h.hint_y), hint_style).draw(display).ok();
+
+    let (x, y, w, bh) = h.bar;
+    Rectangle::new(Point::new(x, y), Size::new(w as u32, bh as u32))
+        .into_styled(
+            embedded_graphics::primitives::PrimitiveStyleBuilder::new()
+                .stroke_color(MUTED)
+                .stroke_width(l.s(1) as u32)
+                .stroke_alignment(embedded_graphics::primitives::StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(display)
+        .ok();
+    let fill = hold_pct.min(100) as i32 * (w - 2 * l.s(1)) / 100;
+    if fill > 0 {
+        Rectangle::new(
+            Point::new(x + l.s(1), y + l.s(1)),
+            Size::new(fill as u32, (bh - 2 * l.s(1)).max(1) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(OK))
+        .draw(display)
+        .ok();
+    }
+    display.flush().ok();
+}
+
+/// The FULL ACCESS card's countdown row: the shared outline and urgency
+/// colours, inside the span, under the card's last line.
+fn draw_full_access_countdown(
+    display: &mut Display<'_>,
+    l: &Layout,
+    g: &crate::layout::FullAccessGeometry,
+    remaining: u32,
+    total: u32,
+) {
+    let (x, y, w, h) = g.countdown;
+    Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32))
+        .into_styled(
+            embedded_graphics::primitives::PrimitiveStyleBuilder::new()
+                .stroke_color(MUTED)
+                .stroke_width(l.s(1) as u32)
+                .stroke_alignment(embedded_graphics::primitives::StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(display)
+        .ok();
+    let pct_left = if total > 0 { remaining * 100 / total } else { 0 };
+    let urgency = if pct_left > 50 {
+        OK
+    } else if pct_left > 20 {
+        WARN
+    } else {
+        DANGER
+    };
+    let inner = w - 2 * l.s(2);
+    let fill = if total > 0 { (remaining.min(total) as i32 * inner) / total as i32 } else { 0 };
+    if fill > 0 {
+        Rectangle::new(
+            Point::new(x + l.s(2), y + l.s(2)),
+            Size::new(fill as u32, (h - 2 * l.s(2)).max(1) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(urgency))
+        .draw(display)
+        .ok();
+    }
+    let small = MonoTextStyleBuilder::new().font(l.font_small()).text_color(FG).build();
+    Text::new(&format!("{remaining}s"), Point::new(g.secs_x, g.secs_y), small)
+        .draw(display)
+        .ok();
+}
+
 /// Which edge carries the button tags on this board and orientation, or
 /// `None` where the card keeps its words only.
 fn tag_side() -> Option<crate::layout::TagSide> {

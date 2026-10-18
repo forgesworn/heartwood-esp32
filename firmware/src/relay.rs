@@ -7997,9 +7997,16 @@ fn handle_nip46_event(
     // identity and list-identities cards and not only the method policy.
     let login_challenge = matches!(method_enum, nip46::Nip46Method::SignEvent)
         && nip46::unsigned_event_is_login_challenge(&request.params);
-    let base_tier = ctx
-        .policy_engine
-        .check_for_event(slot, &ev.pubkey, &method_enum, event_kind, login_challenge);
+    // The owner-status probe and narrow (one-hold pairing spec 4.1, 4.6) are
+    // answered by the handler before any tier, with no card: planned as
+    // automatic, so an escalate slot never parks them and a strict one never
+    // petitions over them.
+    let base_tier = if method_enum.answered_before_tier() {
+        heartwood_common::policy::ApprovalTier::AutoApprove
+    } else {
+        ctx.policy_engine
+            .check_for_event(slot, &ev.pubkey, &method_enum, event_kind, login_challenge)
+    };
     let active_context = if request.heartwood.is_none() {
         crate::nip46_handler::resolve_active_context(
             ctx.policy_engine,

@@ -506,6 +506,22 @@ impl PolicyEngine {
         Ok(changed)
     }
 
+    /// `heartwood_owner_narrow` (spec 4.6) on the caller's own slot: sets
+    /// Extra careful's list when the kinds list is empty, otherwise nothing.
+    /// Never widens. `Unauthorised` without the owner mark. Waiting cards are
+    /// withdrawn only when the slot actually changed. True when it did.
+    pub fn owner_narrow(
+        &mut self,
+        master_slot: u8,
+        client_pubkey: &str,
+    ) -> Result<bool, heartwood_common::owner_pairing::BundleError> {
+        let changed = self.with_slots_keeping_approvals(master_slot, |slots| {
+            heartwood_common::owner_pairing::owner_narrow(find_slot_by_pubkey_mut(slots, client_pubkey))
+        })?;
+        self.slots_dirty |= changed;
+        Ok(changed)
+    }
+
     /// Find or create a client session. Returns mutable reference.
     pub fn get_or_create_session(
         &mut self,
@@ -1568,6 +1584,26 @@ mod tests {
         // What is on flash is the old table too.
         let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
         assert!(!slot_has_owner_mark(&reloaded.list_slots(0)[0]));
+    }
+
+    #[test]
+    fn narrow_never_widens_and_needs_the_mark() {
+        use heartwood_common::owner_pairing::BundleError;
+        let (mut engine, index) = paired_engine();
+        assert_eq!(engine.owner_narrow(0, CLIENT), Err(BundleError::Unauthorised));
+        press(&mut engine, index, Style::Everyday);
+        let epoch = engine.approval_epoch();
+        assert_eq!(engine.owner_narrow(0, CLIENT), Ok(true));
+        assert_eq!(slot(&engine, index).allowed_kinds, CAREFUL_KINDS.to_vec());
+        let epoch2 = engine.approval_epoch();
+        assert_ne!(epoch, epoch2);
+        // Already careful (or any list): nothing changes, nothing withdrawn.
+        assert_eq!(engine.owner_narrow(0, CLIENT), Ok(false));
+        assert!(engine.approval_is_current(epoch2));
+        assert!(engine.update_slot(0, index, None, None, Some(vec![30078]), None));
+        assert_eq!(engine.owner_narrow(0, CLIENT), Ok(false));
+        assert_eq!(slot(&engine, index).allowed_kinds, vec![30078]);
+        assert_eq!(engine.owner_narrow(0, &"dd".repeat(32)), Err(BundleError::Unauthorised));
     }
 
     #[test]

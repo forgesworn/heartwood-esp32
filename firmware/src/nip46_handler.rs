@@ -474,6 +474,70 @@ fn approve_bundle(
         .unwrap_or_default()
 }
 
+/// `heartwood_owner_status` and `heartwood_owner_narrow` (one-hold pairing
+/// spec 4.1, 4.6), answered before the tier check with no card.
+///
+/// Status: `{"owner", "style"}` for the caller's slot, changing nothing;
+/// `owner` is false on a strict slot, and with no client (direct USB). A
+/// remote client must be slot-bound: an unbound one is refused, as every
+/// other slot question is.
+///
+/// Narrow: `{"v":1,"style":"careful"}` sets Extra careful's kinds list on
+/// the caller's own owner pairing when its list is empty and does nothing
+/// otherwise; it never widens, so it needs no press. `unauthorised` without
+/// the mark. A change is durable before the reply, or rolled back.
+#[allow(clippy::too_many_arguments)]
+fn answer_owner_method(
+    request: &nip46::Nip46Request,
+    method: &nip46::Nip46Method,
+    policy_engine: &mut PolicyEngine,
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    master_slot: u8,
+    client_hex: &str,
+    has_client: bool,
+    client_is_bound: bool,
+) -> String {
+    use heartwood_common::owner_pairing::{self as op, BundleError};
+    let refuse = |e: BundleError| build_error_json(&request.id, e.code(), e.message());
+    match method {
+        nip46::Nip46Method::HeartwoodOwnerStatus => {
+            if has_client && !client_is_bound {
+                log::warn!("heartwood_owner_status: refused — unbound client");
+                return refuse(BundleError::Unauthorised);
+            }
+            let slot = has_client
+                .then(|| policy_engine.find_slot_by_pubkey(master_slot, client_hex))
+                .flatten();
+            nip46::build_result_response(&request.id, &op::owner_status_json(slot)).unwrap_or_default()
+        }
+        nip46::Nip46Method::HeartwoodOwnerNarrow => {
+            if let Err(e) = op::parse_narrow_params(&request.params) {
+                return refuse(e);
+            }
+            if !client_is_bound {
+                return refuse(BundleError::Unauthorised);
+            }
+            let snapshot = policy_engine.snapshot_slot_state(master_slot);
+            match policy_engine.owner_narrow(master_slot, client_hex) {
+                Ok(changed) => {
+                    if let Err(response) =
+                        persist_grant(policy_engine, nvs, master_slot, &request.id, snapshot, changed)
+                    {
+                        return response;
+                    }
+                    if changed {
+                        log::info!("heartwood_owner_narrow: pairing narrowed to Extra careful");
+                    }
+                    nip46::build_result_response(&request.id, &op::owner_narrow_json(changed)).unwrap_or_default()
+                }
+                Err(e) => refuse(e),
+            }
+        }
+        // Only the two methods above are answered before the tier.
+        _ => build_error_json(&request.id, -2, "unknown method"),
+    }
+}
+
 /// Whether a remote request can change durable slot authority when approved.
 /// Callers use this before dispatch to take a rollback snapshot without cloning
 /// the slot table for every routine auto-sign request. `owner_pairing` is
@@ -1168,6 +1232,14 @@ fn dispatch_inner(
     let has_client = !client_hex.is_empty();
     let client_is_bound =
         has_client && policy_engine.find_slot_by_pubkey(master_slot, &client_hex).is_some();
+    // One-hold pairing (spec 4.1, 4.6): the owner-status probe and narrow are
+    // answered here, before the tier check, with no card, for the caller's
+    // own slot. The tier is decided from the method name alone, so left to
+    // it they would prompt (legacy), be refused (strict) or be parked for a
+    // guardian (escalate), and a status question must do none of those.
+    if method.answered_before_tier() {
+        return answer_owner_method(&request, &method, policy_engine, nvs, master_slot, &client_hex, has_client, client_is_bound);
+    }
     let requester_label = if has_client {
         format!("{} {}", &client_hex[..8], signing_requester_label(policy_engine, master_slot, &client_hex))
     } else {

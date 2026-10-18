@@ -297,6 +297,17 @@ impl PolicyEngine {
             }
         }
 
+        // One-hold pairing (spec 4.5): the setup hold always shows its own
+        // FULL ACCESS card and always waits for its 5 s hold, whatever the
+        // slot lists and whatever a guardian verdict says. Pinned before the
+        // transient allow and before the `allowed_methods` lift below, like
+        // `requires_fresh_physical_approval` without its rendezvous checks.
+        // A strict slot was refused above (the bundle is never an exact
+        // method), so it still answers "unauthorised".
+        if method.always_shows_own_card() {
+            return ApprovalTier::ButtonRequired;
+        }
+
         // A rendezvous-child hand-off is not a reusable privilege. In
         // particular, an older broad slot must not turn a one-device physical
         // approval into a silent scalar-delivery capability. Exact slots are
@@ -1201,7 +1212,43 @@ impl PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::PolicyEngine;
-    use heartwood_common::policy::validate_exact_slot_policy;
+    use heartwood_common::nip46::Nip46Method;
+    use heartwood_common::policy::{validate_exact_slot_policy, ApprovalTier};
+
+    const CLIENT: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    /// A bound, non-strict pairing for `CLIENT` on master 0.
+    fn paired_engine() -> (PolicyEngine, u8) {
+        let mut engine = PolicyEngine::new();
+        let index = engine.create_slot(0, "My Signet".into(), "55".repeat(32)).unwrap();
+        assert!(engine.assign_pubkey_to_slot(0, index, CLIENT.into()));
+        (engine, index)
+    }
+
+    #[test]
+    fn the_bundle_always_raises_its_own_card_whatever_the_slot_lists() {
+        // Spec 4.5 / 12: a slot listing heartwood_approve_bundle (however it
+        // got there) still gets the FULL ACCESS card, and a guardian's
+        // approve-once window does not lift it either.
+        let (mut engine, index) = paired_engine();
+        let bundle = Nip46Method::HeartwoodApproveBundle;
+        assert_eq!(engine.check(0, CLIENT, &bundle, None), ApprovalTier::ButtonRequired);
+        engine.slots_mut(0)[index as usize]
+            .allowed_methods
+            .push("heartwood_approve_bundle".into());
+        assert_eq!(engine.check(0, CLIENT, &bundle, None), ApprovalTier::ButtonRequired);
+        engine.install_transient_allow(0, CLIENT.into(), "heartwood_approve_bundle".into(), None, 60);
+        assert_eq!(engine.check(0, CLIENT, &bundle, None), ApprovalTier::ButtonRequired);
+
+        // A strict slot refuses it before the pin (never an exact method).
+        let exact = validate_exact_slot_policy(vec!["sign_event".into()], vec![], true).unwrap();
+        let strict = engine
+            .create_slot_with_exact_policy(0, "strict".into(), "66".repeat(32), exact)
+            .unwrap();
+        let other = "aa".repeat(32);
+        assert!(engine.assign_pubkey_to_slot(0, strict, other.clone()));
+        assert_eq!(engine.check(0, &other, &bundle, None), ApprovalTier::Denied);
+    }
 
     #[test]
     fn slot_snapshot_restores_authority_and_prior_dirty_state() {

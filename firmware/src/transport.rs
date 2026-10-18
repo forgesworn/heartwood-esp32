@@ -227,7 +227,10 @@ pub fn handle_encrypted_request(
         let login = matches!(method, nip46::Nip46Method::SignEvent)
             && nip46::unsigned_event_is_login_challenge(&request.params);
         let tier = policy_engine.check_for_event(owning_slot, &client_pubkey_hex, &method, event_kind, login);
-        crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
+        let owner_pairing = policy_engine
+            .find_slot_by_pubkey(owning_slot, &client_pubkey_hex)
+            .is_some_and(heartwood_common::owner_pairing::is_owner_pairing);
+        crate::nip46_handler::request_may_mutate_slot_state(&request, tier, owner_pairing)
             .then(|| policy_engine.snapshot_slot_state(owning_slot))
     };
 

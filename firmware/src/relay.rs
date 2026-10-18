@@ -7995,8 +7995,13 @@ fn handle_nip46_event(
         // Dispatch answers the derivation failure itself.
         Err(()) => (base_tier, None),
     };
-    let slot_snapshot = crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
-        .then(|| ctx.policy_engine.snapshot_slot_state(slot));
+    let owner_pairing = ctx
+        .policy_engine
+        .find_slot_by_pubkey(slot, &ev.pubkey)
+        .is_some_and(heartwood_common::owner_pairing::is_owner_pairing);
+    let slot_snapshot =
+        crate::nip46_handler::request_may_mutate_slot_state(&request, tier, owner_pairing)
+            .then(|| ctx.policy_engine.snapshot_slot_state(slot));
 
     // C4 escalation (schema §1.1): an interactive ask on an escalate-flagged
     // slot parks and notifies the guardian's phone instead of blocking the

@@ -205,12 +205,21 @@ fn extension_approval_preview(requester: &str, params: &[Value]) -> String {
 
 /// Whether a remote request can change durable slot authority when approved.
 /// Callers use this before dispatch to take a rollback snapshot without cloning
-/// the slot table for every routine auto-sign request.
+/// the slot table for every routine auto-sign request. `owner_pairing` is
+/// whether the requesting client's slot is an owner pairing
+/// (`owner_pairing::is_owner_pairing`): there a persona derive may record the
+/// new identity for the client (spec 6, Rule D).
 pub(crate) fn request_may_mutate_slot_state(
     request: &nip46::Nip46Request,
     tier: heartwood_common::policy::ApprovalTier,
+    owner_pairing: bool,
 ) -> bool {
     match nip46::Nip46Method::from_str(&request.method) {
+        // One-hold pairing (spec 4.5): the setup hold grants, narrow narrows,
+        // and a derive on an owner pairing records (Rule D).
+        nip46::Nip46Method::HeartwoodApproveBundle
+        | nip46::Nip46Method::HeartwoodOwnerNarrow => true,
+        nip46::Nip46Method::HeartwoodDerivePersona => owner_pairing,
         nip46::Nip46Method::Connect => request
             .params
             .get(1)
@@ -2109,6 +2118,12 @@ fn dispatch_inner(
                 "heartwood_note_address_proof",
                 "heartwood_pair_wallet",
                 "heartwood_provision_rendezvous",
+                // One-hold pairing (spec 4.1, 4.5, 4.6). The owner mark
+                // (`heartwood_owner_vault`) is not a method and is never
+                // listed.
+                "heartwood_approve_bundle",
+                "heartwood_owner_status",
+                "heartwood_owner_narrow",
             ];
             nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
         }
@@ -3262,16 +3277,19 @@ mod tests {
             false,
             &derive,
             ApprovalTier::ButtonRequired,
+            false,
         ));
         assert!(!remote_extension_requires_approval(
             true,
             &nip46::Nip46Method::SignEvent,
             ApprovalTier::ButtonRequired,
+            false,
         ));
         assert!(!remote_extension_requires_approval(
             true,
             &nip46::Nip46Method::Nip44Decrypt,
             ApprovalTier::ButtonRequired,
+            false,
         ));
     }
 
@@ -3286,6 +3304,7 @@ mod tests {
         assert!(request_may_mutate_slot_state(
             &connect,
             ApprovalTier::AutoApprove,
+            false,
         ));
 
         let reconnect_without_secret: nip46::Nip46Request =
@@ -3298,6 +3317,7 @@ mod tests {
         assert!(!request_may_mutate_slot_state(
             &reconnect_without_secret,
             ApprovalTier::AutoApprove,
+            false,
         ));
 
         let sign: nip46::Nip46Request = serde_json::from_value(serde_json::json!({
@@ -3309,11 +3329,35 @@ mod tests {
         assert!(request_may_mutate_slot_state(
             &sign,
             ApprovalTier::ButtonRequired,
+            false,
         ));
         assert!(!request_may_mutate_slot_state(
             &sign,
             ApprovalTier::AutoApprove,
+            false,
         ));
+
+        // One-hold pairing (spec 4.5): the bundle and narrow always may; a
+        // persona derive only on an owner pairing (Rule D).
+        for (method, owner, expected) in [
+            ("heartwood_approve_bundle", false, true),
+            ("heartwood_owner_narrow", false, true),
+            ("heartwood_owner_status", true, false),
+            ("heartwood_derive_persona", true, true),
+            ("heartwood_derive_persona", false, false),
+        ] {
+            let request: nip46::Nip46Request = serde_json::from_value(serde_json::json!({
+                "id": "x",
+                "method": method,
+                "params": []
+            }))
+            .unwrap();
+            assert_eq!(
+                request_may_mutate_slot_state(&request, ApprovalTier::AutoApprove, owner),
+                expected,
+                "{method} owner={owner}"
+            );
+        }
     }
 
     #[test]

@@ -95,7 +95,7 @@ pub const SCOPE_PERSONA_ONLY: &str = "PERSONA ONLY";
 /// Scope line when `act_as` includes the real identity.
 pub const SCOPE_PERSONA_AND_REAL_NAME: &str = "PERSONA + REAL NAME";
 /// What Everyday lets the phone do alone.
-pub const EVERYDAY_LINES: &[&str] = &["SIGN IN, POST, BACK UP"];
+pub const EVERYDAY_LINES: &[&str] = &["SIGN IN, POST, BACKUP"];
 /// What Extra careful lets the phone do alone, and what still asks.
 pub const CAREFUL_LINES: &[&str] = &["SIGNS ALONE: BACKUPS", "ASKS: EVERYTHING ELSE"];
 /// The card's last line.
@@ -1050,7 +1050,7 @@ mod tests {
                 format!("{} {}", w[0], w[1]),
                 w[2].to_string(),
                 "PERSONA ONLY".to_string(),
-                "SIGN IN, POST, BACK UP".to_string(),
+                "SIGN IN, POST, BACKUP".to_string(),
                 "HOLD 5 SECONDS".to_string(),
             ]
         );
@@ -1069,19 +1069,20 @@ mod tests {
     }
 
     #[test]
-    fn the_longest_fixed_card_line_is_22_characters() {
+    fn the_longest_fixed_card_line_is_21_characters() {
         // The spec's own words, which My Signet shows verbatim, so they are
-        // not shortened here. `SIGN IN, POST, BACK UP` is 22 characters, one
-        // more than a 128 px panel holds at 6 px a glyph: the OLED builder
-        // must fit it (spec 4.2's review point), not reword it.
+        // not shortened here. `SIGN IN, POST, BACKUP` and `ASKS: EVERYTHING
+        // ELSE` are 21 characters, what a 128 px panel holds at 6 px a glyph.
+        // The OLED builder lays them out (spec 4.2's review point); it never
+        // rewords them.
         let longest = [FULL_ACCESS_HEADER, SCOPE_PERSONA_ONLY, SCOPE_PERSONA_AND_REAL_NAME, HOLD_LINE]
             .iter()
             .chain(EVERYDAY_LINES)
             .chain(CAREFUL_LINES)
             .map(|line| line.len())
             .max();
-        assert_eq!(longest, Some(22));
-        assert_eq!(EVERYDAY_LINES[0].len(), 22);
+        assert_eq!(longest, Some(21));
+        assert_eq!(EVERYDAY_LINES[0].len(), 21);
         // Two longest words and a space.
         assert!(2 * spoken_words::WORDLIST_MAX_LEN + 1 <= 21);
     }

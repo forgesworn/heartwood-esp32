@@ -754,6 +754,16 @@ impl PolicyEngine {
     ) -> bool {
         let slots = self.slots_mut(master_slot);
         if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
+            // One-hold pairing (spec 4.6, 5.2): both lists are judged against
+            // the slot as it was BEFORE this update. The owner mark may be
+            // kept or dropped, never added; heartwood_approve_bundle is never
+            // listed; and while the slot carried the mark its kinds list may
+            // be kept or narrowed, never emptied or extended, even when this
+            // same call drops the mark (methods are set first below).
+            let allowed_methods = allowed_methods
+                .map(|methods| heartwood_common::owner_pairing::update_slot_methods(slot, methods));
+            let allowed_kinds = allowed_kinds
+                .map(|kinds| heartwood_common::owner_pairing::update_slot_kinds(slot, kinds));
             if let Some(l) = label {
                 slot.label = l;
             }
@@ -859,6 +869,10 @@ impl PolicyEngine {
                 slot.client_grants.as_mut()?.clear_client(&key).ok()?
             }
         };
+        // "Forget approvals" also forgets the setup hold (spec 5.2), with or
+        // without a client. Dropped only once the clear itself succeeded, so
+        // a refused clear changes nothing at all.
+        let changed = heartwood_common::owner_pairing::drop_owner_mark(slot) | changed;
         self.slots_dirty |= changed;
         Some(changed)
     }
@@ -887,6 +901,19 @@ impl PolicyEngine {
                 && verdict_withdrawn(slot, &allow.client_pubkey, allow.identity.as_ref(), revoked))
         });
         before - self.transient_allows.len()
+    }
+
+    /// The master's slots as a backup EXPORT writes them: unredacted, but
+    /// without the owner mark or the bundle method (spec 5.2), so a new
+    /// backup still imports on firmware that does not know the mark. The
+    /// import strips them too (`sanitise_imported_slot`); the setup hold is
+    /// the only way back to an owner pairing.
+    pub fn exported_slots(&self, master_slot: u8) -> Vec<ConnectSlot> {
+        let mut slots = self.list_slots(master_slot).to_vec();
+        for slot in &mut slots {
+            heartwood_common::owner_pairing::strip_owner_names(&mut slot.allowed_methods);
+        }
+        slots
     }
 
     /// Find a slot by the current client pubkey (immutable).
@@ -1223,6 +1250,169 @@ mod tests {
         let index = engine.create_slot(0, "My Signet".into(), "55".repeat(32)).unwrap();
         assert!(engine.assign_pubkey_to_slot(0, index, CLIENT.into()));
         (engine, index)
+    }
+
+    use heartwood_common::owner_pairing::{
+        self, is_owner_pairing, slot_has_owner_mark, Style, CAREFUL_KINDS, OWNER_MARK,
+    };
+
+    /// Put the setup hold's grants on the pairing (common's press, steps 2-5).
+    fn press(engine: &mut PolicyEngine, index: u8, style: Style) {
+        let slot = engine.slots_mut(0).iter_mut().find(|s| s.slot_index == index).unwrap();
+        owner_pairing::apply_bundle_press(slot, CLIENT, &[[0x11; 32]], style).unwrap();
+        assert!(is_owner_pairing(slot));
+    }
+
+    fn slot(engine: &PolicyEngine, index: u8) -> &heartwood_common::policy::ConnectSlot {
+        engine.list_slots(0).iter().find(|s| s.slot_index == index).unwrap()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|m| m.to_string()).collect()
+    }
+
+    #[test]
+    fn an_operator_create_then_update_naming_the_mark_leaves_no_mark() {
+        // The stolen-operator-key case (spec 12): create_client then
+        // update_client listing the mark (and the bundle) never makes an
+        // owner pairing.
+        let (mut engine, index) = paired_engine();
+        let mut methods = names(heartwood_common::policy::CONNECT_SAFE_METHODS);
+        methods.push(OWNER_MARK.into());
+        methods.push("heartwood_approve_bundle".into());
+        assert!(engine.update_slot(0, index, None, Some(methods), Some(vec![]), Some(true)));
+        let after = slot(&engine, index);
+        assert!(!slot_has_owner_mark(after));
+        assert!(!after.allowed_methods.iter().any(|m| m == "heartwood_approve_bundle"));
+        // And a slot the update tried to list the bundle on still cards it.
+        assert_eq!(
+            engine.check(0, CLIENT, &Nip46Method::HeartwoodApproveBundle, None),
+            ApprovalTier::ButtonRequired
+        );
+    }
+
+    #[test]
+    fn update_slot_keeps_or_drops_the_mark_and_never_lists_the_bundle() {
+        let (mut engine, index) = paired_engine();
+        press(&mut engine, index, Style::Everyday);
+        // Keeping it in the list keeps it; the bundle is filtered even here.
+        let mut kept = slot(&engine, index).allowed_methods.clone();
+        kept.push("heartwood_approve_bundle".into());
+        assert!(engine.update_slot(0, index, None, Some(kept), None, None));
+        assert!(slot_has_owner_mark(slot(&engine, index)));
+        assert!(!slot(&engine, index).allowed_methods.iter().any(|m| m == "heartwood_approve_bundle"));
+        // Omitting it drops it (Sapwood's Edit).
+        let dropped: Vec<String> = slot(&engine, index)
+            .allowed_methods
+            .iter()
+            .filter(|m| *m != OWNER_MARK)
+            .cloned()
+            .collect();
+        assert!(engine.update_slot(0, index, None, Some(dropped.clone()), None, None));
+        assert!(!slot_has_owner_mark(slot(&engine, index)));
+        // And naming it again cannot bring it back.
+        let mut again = dropped;
+        again.push(OWNER_MARK.into());
+        assert!(engine.update_slot(0, index, None, Some(again), None, None));
+        assert!(!slot_has_owner_mark(slot(&engine, index)));
+    }
+
+    #[test]
+    fn a_marked_slot_kinds_list_may_narrow_but_never_widen() {
+        let (mut engine, index) = paired_engine();
+        press(&mut engine, index, Style::Careful);
+        assert_eq!(slot(&engine, index).allowed_kinds, CAREFUL_KINDS.to_vec());
+        // Emptying (all kinds) and extending are applied with the old list.
+        assert!(engine.update_slot(0, index, None, None, Some(vec![]), None));
+        assert_eq!(slot(&engine, index).allowed_kinds, CAREFUL_KINDS.to_vec());
+        assert!(engine.update_slot(0, index, None, None, Some(vec![30078, 22242, 1]), None));
+        assert_eq!(slot(&engine, index).allowed_kinds, CAREFUL_KINDS.to_vec());
+        // Narrowing is kept.
+        assert!(engine.update_slot(0, index, None, None, Some(vec![30078]), None));
+        assert_eq!(slot(&engine, index).allowed_kinds, vec![30078]);
+
+        // One call that drops the mark AND empties the list keeps the list:
+        // the rule reads the slot as it was before the update.
+        let (mut engine, index) = paired_engine();
+        press(&mut engine, index, Style::Careful);
+        let unmarked: Vec<String> = slot(&engine, index)
+            .allowed_methods
+            .iter()
+            .filter(|m| *m != OWNER_MARK)
+            .cloned()
+            .collect();
+        assert!(engine.update_slot(0, index, None, Some(unmarked), Some(vec![]), None));
+        assert!(!slot_has_owner_mark(slot(&engine, index)));
+        assert_eq!(slot(&engine, index).allowed_kinds, CAREFUL_KINDS.to_vec());
+        // Once the mark is gone an operator may widen it, as today.
+        assert!(engine.update_slot(0, index, None, None, Some(vec![]), None));
+        assert!(slot(&engine, index).allowed_kinds.is_empty());
+
+        // An unmarked slot takes any list, as today.
+        let (mut engine, index) = paired_engine();
+        assert!(engine.update_slot(0, index, None, None, Some(vec![1, 7]), None));
+        assert!(engine.update_slot(0, index, None, None, Some(vec![]), None));
+        assert!(slot(&engine, index).allowed_kinds.is_empty());
+    }
+
+    #[test]
+    fn forget_approvals_drops_the_mark_and_revoke_leaves_it() {
+        for client in [None, Some(CLIENT)] {
+            let (mut engine, index) = paired_engine();
+            press(&mut engine, index, Style::Everyday);
+            engine.slots_dirty = false;
+            assert_eq!(engine.clear_identities(0, index, client), Some(true), "{client:?}");
+            assert!(!slot_has_owner_mark(slot(&engine, index)), "{client:?}");
+            assert!(engine.slots_dirty);
+        }
+        // An unmarked slot with nothing to forget is unchanged.
+        let (mut engine, index) = paired_engine();
+        assert_eq!(engine.clear_identities(0, index, None), Some(false));
+
+        let (mut engine, index) = paired_engine();
+        press(&mut engine, index, Style::Everyday);
+        let identity = heartwood_common::hex::hex_encode(&[0x11; 32]);
+        assert!(matches!(engine.revoke_identity(0, index, &identity, Some(CLIENT)), Some(Ok((_, true)))));
+        assert!(slot_has_owner_mark(slot(&engine, index)));
+    }
+
+    #[test]
+    fn binding_a_second_client_key_drops_the_mark() {
+        let (mut engine, index) = paired_engine();
+        press(&mut engine, index, Style::Everyday);
+        // The same key reconnecting keeps it.
+        assert!(engine.assign_pubkey_to_slot(0, index, CLIENT.into()));
+        assert!(slot_has_owner_mark(slot(&engine, index)));
+        assert!(engine.assign_pubkey_to_slot(0, index, "bb".repeat(32)));
+        assert!(!slot_has_owner_mark(slot(&engine, index)));
+    }
+
+    #[test]
+    fn a_backup_export_omits_the_mark_and_still_imports() {
+        let (mut engine, index) = paired_engine();
+        press(&mut engine, index, Style::Careful);
+        engine.slots_mut(0)[0].allowed_methods.push("heartwood_approve_bundle".into());
+        let exported = engine.exported_slots(0);
+        let out = exported.iter().find(|s| s.slot_index == index).unwrap();
+        assert!(!slot_has_owner_mark(out));
+        assert!(!out.allowed_methods.iter().any(|m| m == "heartwood_approve_bundle"));
+        // The engine itself still has it; only the export leaves it out.
+        assert!(slot_has_owner_mark(slot(&engine, index)));
+        // The export imports (older firmware's sanitiser rejects any unknown
+        // name; this one accepts what it exported).
+        let mut imported = out.clone();
+        assert!(heartwood_common::policy::sanitise_imported_slot(&mut imported).is_ok());
+        assert!(!slot_has_owner_mark(&imported));
+    }
+
+    #[test]
+    fn set_exact_slot_policy_rejects_the_mark_and_the_bundle() {
+        let (mut engine, index) = paired_engine();
+        for name in [OWNER_MARK, "heartwood_approve_bundle", "heartwood_owner_status", "heartwood_owner_narrow"] {
+            let result = engine.set_exact_slot_policy(0, index, vec!["sign_event".into(), name.into()], vec![], true);
+            assert!(result.is_err(), "{name}");
+        }
+        assert!(!slot(&engine, index).strict_permissions);
     }
 
     #[test]

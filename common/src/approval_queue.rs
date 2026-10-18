@@ -70,9 +70,15 @@ pub fn login_kind_key(base: &str, seq: u32) -> String {
 /// proof's card names one lightning address, one action and one branch; a
 /// trust card names one sender's npub. A batch card speaks in notes and sats,
 /// so a second proof or a second sender joining the first would be approved
-/// on a hold that showed the owner neither.
+/// on a hold that showed the owner neither. The FULL ACCESS card
+/// (`heartwood_approve_bundle`, one-hold pairing spec 4.2) names one phone's
+/// three words and one scope: a second bundle sharing its hold would grant a
+/// phone the owner never compared.
 pub fn never_shares_card(method: &str) -> bool {
-    matches!(method, "heartwood_note_address_proof" | "heartwood_note_trust")
+    matches!(
+        method,
+        "heartwood_note_address_proof" | "heartwood_note_trust" | "heartwood_approve_bundle"
+    )
 }
 
 /// The batch key of an ask that must never share a card
@@ -301,6 +307,23 @@ mod tests {
         let a = kk(&unshared_kind_key(base, 0));
         let b = kk(&unshared_kind_key(base, 1));
         assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
+    }
+
+    #[test]
+    fn a_full_access_bundle_never_shares_a_card() {
+        // One-hold pairing spec 4.2: the card names one phone's words; a second
+        // bundle riding the same hold would grant a phone nobody compared.
+        let base = "heartwood_approve_bundle";
+        assert!(never_shares_card(base));
+        for method in ["heartwood_owner_status", "heartwood_owner_narrow", "heartwood_owner_vault"] {
+            assert!(!never_shares_card(method), "{method}");
+        }
+        let kk = |kind_key: &str| AskKey::new(1, "cc".to_string(), "dd".to_string(), kind_key.to_string());
+        let a = kk(&unshared_kind_key(base, 0));
+        let b = kk(&unshared_kind_key(base, 1));
+        assert_ne!(a, b);
+        assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
+        assert_ne!(admit(Some(&a), 1, 0, &b), Admission::Collapse);
     }
 
     #[test]

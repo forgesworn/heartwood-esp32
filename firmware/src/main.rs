@@ -62,6 +62,7 @@ mod masters;
 mod master_identity;
 mod held_data_key;
 mod allocation_root;
+mod nip46_gates;
 mod nip46_handler;
 mod notes;
 mod personas;

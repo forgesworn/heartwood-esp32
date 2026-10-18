@@ -177,6 +177,13 @@ mod firmware_policy_host_tests;
 #[cfg(all(test, feature = "nip46", feature = "nip44"))]
 pub use firmware_policy_host_tests::nvs;
 
+// The NIP-46 handler's pure pre-dispatch gates (firmware/src/nip46_gates.rs):
+// the handler's own test module builds only for the device target, so these
+// run here instead.
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+#[path = "../../firmware/src/nip46_gates.rs"]
+mod firmware_nip46_gates;
+
 // Exercise the firmware's WiFi retry ordering with a fault-injected radio.
 #[cfg(test)]
 #[path = "../../firmware/src/wifi_retry.rs"]

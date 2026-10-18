@@ -1563,6 +1563,9 @@ mod tests {
         assert!(engine.apply_bundle_press(0, &"cc".repeat(32), &[], Style::Everyday).is_err());
     }
 
+    // Host harness only: the fault-injecting NVS exists in common's test
+    // crate, not on the device target.
+    #[cfg(not(target_os = "espidf"))]
     #[test]
     fn a_press_that_cannot_persist_is_rolled_back_durably() {
         // Spec 12: rollback on a failed persist, the handler's

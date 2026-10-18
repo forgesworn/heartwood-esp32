@@ -45,25 +45,10 @@ use crate::policy::PolicyEngine;
 /// Timeout in seconds shown on the OLED countdown bar.
 const APPROVAL_TIMEOUT_SECS: u64 = 30;
 
-/// A public relay is not an approval queue. Only a client already bound to a
-/// slot may make the device wait for a physical decision; otherwise strangers
-/// can serialize fresh keys/ids into an endless series of 30-second prompts.
-/// `heartwood_list_identities` joins the denial set not for the button but
-/// because it enumerates the per-boot identity cache (persona purposes/names,
-/// child npubs) — metadata an unbound relay peer has no business reading
-/// (FW-L5).
-fn unbound_remote_request_denied(
-    has_client: bool,
-    client_is_bound: bool,
-    method: &nip46::Nip46Method,
-) -> bool {
-    has_client
-        && !client_is_bound
-        && (matches!(method, nip46::Nip46Method::SignEvent)
-            || matches!(method, nip46::Nip46Method::HeartwoodListIdentities)
-            || method.always_requires_button()
-            || is_note_method(method))
-}
+// The pure pre-dispatch gates live in nip46_gates.rs, which common's host
+// tests compile, so their tests run in CI.
+use crate::nip46_gates::{remote_extension_requires_approval, unbound_remote_request_denied};
+pub(crate) use crate::nip46_gates::request_may_mutate_slot_state;
 
 /// The bearer-note locker's relay methods. All of them require a bound
 /// slot (see `unbound_remote_request_denied`), and the disclosure and
@@ -88,22 +73,6 @@ fn spend_grant_covers(method: &str, params: &[Value], client_hex: &str) -> bool 
     };
     let Some(id) = cmd.get("id").and_then(Value::as_str) else { return false };
     crate::notes::take_spend_grant(id, &client)
-}
-
-/// Remote Heartwood extensions that mutate identity state must cross one
-/// physical-approval boundary before their match arm can run. `sign_event` owns
-/// its richer event-specific prompt, while direct USB (`has_client == false`)
-/// retains physical-possession semantics. Standard crypto methods are not
-/// included here: an unbound remote crypto request remains refused below.
-fn remote_extension_requires_approval(
-    has_client: bool,
-    method: &nip46::Nip46Method,
-    tier: heartwood_common::policy::ApprovalTier,
-) -> bool {
-    has_client
-        && !matches!(method, nip46::Nip46Method::SignEvent)
-        && method.always_requires_button()
-        && tier == heartwood_common::policy::ApprovalTier::ButtonRequired
 }
 
 /// Route a `heartwood_derive_persona` by the identity it was addressed to (see
@@ -535,36 +504,6 @@ fn answer_owner_method(
         }
         // Only the two methods above are answered before the tier.
         _ => build_error_json(&request.id, -2, "unknown method"),
-    }
-}
-
-/// Whether a remote request can change durable slot authority when approved.
-/// Callers use this before dispatch to take a rollback snapshot without cloning
-/// the slot table for every routine auto-sign request. `owner_pairing` is
-/// whether the requesting client's slot is an owner pairing
-/// (`owner_pairing::is_owner_pairing`): there a persona derive may record the
-/// new identity for the client (spec 6, Rule D).
-pub(crate) fn request_may_mutate_slot_state(
-    request: &nip46::Nip46Request,
-    tier: heartwood_common::policy::ApprovalTier,
-    owner_pairing: bool,
-) -> bool {
-    match nip46::Nip46Method::from_str(&request.method) {
-        // One-hold pairing (spec 4.5): the setup hold grants, narrow narrows,
-        // and a derive on an owner pairing records (Rule D).
-        nip46::Nip46Method::HeartwoodApproveBundle
-        | nip46::Nip46Method::HeartwoodOwnerNarrow => true,
-        nip46::Nip46Method::HeartwoodDerivePersona => owner_pairing,
-        nip46::Nip46Method::Connect => request
-            .params
-            .get(1)
-            .and_then(|value| value.as_str())
-            .map(|secret| !secret.is_empty())
-            .unwrap_or(false),
-        nip46::Nip46Method::SignEvent => {
-            tier == heartwood_common::policy::ApprovalTier::ButtonRequired
-        }
-        _ => false,
     }
 }
 
@@ -3465,11 +3404,10 @@ mod tests {
 
     use heartwood_common::policy::{gate_request, Gate, GateRequest};
 
-    use super::{
-        connect_success_response, extension_approval_failure,
-        remote_extension_requires_approval, request_may_mutate_slot_state,
-        unbound_remote_request_denied,
-    };
+    // The pure gates' own tests (unbound refusal, the central extension
+    // gate, the slot-mutation snapshot table) are in nip46_gates.rs, where
+    // common's host build runs them.
+    use super::{connect_success_response, extension_approval_failure, remote_extension_requires_approval};
     use crate::approval::ApprovalResult;
     use crate::policy::PolicyEngine;
 
@@ -3605,30 +3543,6 @@ mod tests {
     }
 
     #[test]
-    fn unbound_remote_clients_cannot_enter_physical_approval_loops() {
-        for method_name in ["sign_event", "heartwood_derive", "heartwood_switch"] {
-            let method = nip46::Nip46Method::from_str(method_name);
-            assert!(
-                unbound_remote_request_denied(true, false, &method),
-                "{method_name} would let a stranger occupy the relay loop",
-            );
-            assert!(
-                !unbound_remote_request_denied(true, true, &method),
-                "a slot-bound client must retain physical approval fallback",
-            );
-            assert!(
-                !unbound_remote_request_denied(false, false, &method),
-                "direct USB retains physical-possession approval",
-            );
-        }
-
-        for method_name in ["connect", "ping", "get_public_key", "heartwood_capabilities"] {
-            let method = nip46::Nip46Method::from_str(method_name);
-            assert!(!unbound_remote_request_denied(true, false, &method));
-        }
-    }
-
-    #[test]
     fn exact_slots_reject_caller_selected_derived_identity_context() {
         // The gate is deliberately method-independent: get_public_key,
         // sign_event and every standard crypto method could otherwise resolve
@@ -3685,96 +3599,6 @@ mod tests {
         let timed_out: serde_json::Value = serde_json::from_str(&timed_out).unwrap();
         assert_eq!(timed_out["id"], "timed-out");
         assert_eq!(timed_out["error"], "timeout");
-    }
-
-    #[test]
-    fn central_extension_gate_excludes_usb_sign_event_and_remote_crypto() {
-        let derive = nip46::Nip46Method::HeartwoodDerive;
-        assert!(!remote_extension_requires_approval(
-            false,
-            &derive,
-            ApprovalTier::ButtonRequired,
-            false,
-        ));
-        assert!(!remote_extension_requires_approval(
-            true,
-            &nip46::Nip46Method::SignEvent,
-            ApprovalTier::ButtonRequired,
-            false,
-        ));
-        assert!(!remote_extension_requires_approval(
-            true,
-            &nip46::Nip46Method::Nip44Decrypt,
-            ApprovalTier::ButtonRequired,
-            false,
-        ));
-    }
-
-    #[test]
-    fn slot_mutation_snapshot_is_needed_only_for_connect_binding_or_first_sign() {
-        let connect: nip46::Nip46Request = serde_json::from_value(serde_json::json!({
-            "id": "connect",
-            "method": "connect",
-            "params": [CLIENT_HEX, "22".repeat(32)]
-        }))
-        .unwrap();
-        assert!(request_may_mutate_slot_state(
-            &connect,
-            ApprovalTier::AutoApprove,
-            false,
-        ));
-
-        let reconnect_without_secret: nip46::Nip46Request =
-            serde_json::from_value(serde_json::json!({
-                "id": "connect",
-                "method": "connect",
-                "params": [CLIENT_HEX]
-            }))
-            .unwrap();
-        assert!(!request_may_mutate_slot_state(
-            &reconnect_without_secret,
-            ApprovalTier::AutoApprove,
-            false,
-        ));
-
-        let sign: nip46::Nip46Request = serde_json::from_value(serde_json::json!({
-            "id": "sign",
-            "method": "sign_event",
-            "params": [{}]
-        }))
-        .unwrap();
-        assert!(request_may_mutate_slot_state(
-            &sign,
-            ApprovalTier::ButtonRequired,
-            false,
-        ));
-        assert!(!request_may_mutate_slot_state(
-            &sign,
-            ApprovalTier::AutoApprove,
-            false,
-        ));
-
-        // One-hold pairing (spec 4.5): the bundle and narrow always may; a
-        // persona derive only on an owner pairing (Rule D).
-        for (method, owner, expected) in [
-            ("heartwood_approve_bundle", false, true),
-            ("heartwood_owner_narrow", false, true),
-            ("heartwood_owner_status", true, false),
-            ("heartwood_derive_persona", true, true),
-            ("heartwood_derive_persona", false, false),
-        ] {
-            let request: nip46::Nip46Request = serde_json::from_value(serde_json::json!({
-                "id": "x",
-                "method": method,
-                "params": []
-            }))
-            .unwrap();
-            assert_eq!(
-                request_may_mutate_slot_state(&request, ApprovalTier::AutoApprove, owner),
-                expected,
-                "{method} owner={owner}"
-            );
-        }
     }
 
     #[test]

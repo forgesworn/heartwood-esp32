@@ -5779,6 +5779,28 @@ fn card_hold_ms(card: &ButtonCard) -> u32 {
     crate::card_hold::hold_ms(is_full_access_card(card))
 }
 
+/// Judge a press on this card: `card_hold::judge` against its own hold, or,
+/// for FULL ACCESS, `card_hold::judge_full_access`, which counts only the time
+/// the card's words have been on screen.
+fn judge_card_press(card: &ButtonCard, held_ms: u32, released: Option<u32>) -> crate::card_hold::Press {
+    let hold = card_hold_ms(card);
+    if is_full_access_card(card) {
+        crate::card_hold::judge_full_access(hold, card.words, held_ms, released)
+    } else {
+        crate::card_hold::judge(hold, held_ms, released)
+    }
+}
+
+/// How far the front card's hold has got, for its bar and its burst: the
+/// press's length, or for FULL ACCESS the time its words have been up.
+fn card_hold_progress(card: &ButtonCard, held_ms: u32) -> u32 {
+    if is_full_access_card(card) {
+        card.words.shown_ms(held_ms)
+    } else {
+        held_ms
+    }
+}
+
 /// How long the tick may sample closely while the button is actually down,
 /// and how often. The loop's own cadence is roughly a second — far too coarse
 /// to fill a two-second bar, which would jump in two or three steps and then
@@ -5841,9 +5863,13 @@ struct ButtonCard {
     /// The enrol card's (page, armed) last drawn, so a change is drawn at
     /// once and the page the gate counts is the page on screen.
     drawn_view: Option<(usize, bool)>,
-    /// `oled::draw_generation` just after this card last drew its face;
-    /// `None` before the first draw.
+    /// `oled::draw_generation` just after this card last drew its face (the
+    /// FULL ACCESS card: or its hold screen); `None` before the first draw.
     drawn_gen: Option<u32>,
+    /// The FULL ACCESS card's words on its hold screen: its hold counts only
+    /// for the time they have been on the glass (`card_hold::WordsShown`,
+    /// review m1); unused by other cards.
+    words: crate::card_hold::WordsShown,
 }
 
 /// Whether this card has been on screen for its whole window.
@@ -6065,6 +6091,7 @@ fn queue_button_ask(
                 enrol_gate: Default::default(),
                 drawn_view: None,
                 drawn_gen: None,
+                words: Default::default(),
             });
             Ok(())
         }
@@ -6081,14 +6108,21 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     ctx.last_activity = Instant::now();
 
     if hold_ms > 0 {
-        let pct = crate::card_hold::hold_pct(card_hold_ms(&ctx.button_cards[0]), hold_ms);
+        let progress = card_hold_progress(&ctx.button_cards[0], hold_ms);
+        let pct = crate::card_hold::hold_pct(card_hold_ms(&ctx.button_cards[0]), progress);
         if pct / 5 != ctx.button_cards[0].last_pct / 5 {
             ctx.button_cards[0].last_pct = pct;
             // The FULL ACCESS card shows its words for the whole hold.
             match &ctx.button_cards[0].asks[0].ask.card {
                 crate::nip46_handler::AskCard::FullAccess { client_pubkey, .. } => {
                     let client = *client_pubkey;
-                    crate::oled::show_full_access_hold(ctx.display, &client, pct)
+                    crate::oled::show_full_access_hold(ctx.display, &client, pct);
+                    // The hold counts from here, once the words are on the
+                    // glass, on the sampler's clock (review m1). The hold
+                    // screen counts as this card's own face, so a later
+                    // overdraw is seen and restarts the count.
+                    ctx.button_cards[0].words.drawn(crate::button::hold_ms());
+                    ctx.button_cards[0].drawn_gen = Some(crate::oled::draw_generation());
                 }
                 _ => crate::oled::show_hold_progress(ctx.display, pct),
             }
@@ -6378,12 +6412,25 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         return CardTick::Denied;
     }
 
+    // The FULL ACCESS card's words were covered since its hold screen was
+    // drawn (another screen took the panel between passes): the time they
+    // were hidden does not count, so the count starts again at the next draw.
+    if is_full_access_card(&ctx.button_cards[0])
+        && ctx.button_cards[0].words.shown()
+        && card_overdrawn(&ctx.button_cards[0])
+    {
+        ctx.button_cards[0].words.hidden();
+        ctx.button_cards[0].last_pct = u32::MAX;
+    }
+
     // The card's own hold: 5 s for FULL ACCESS, 2 s for every other card. A
-    // hold that began and ended between two passes still counts: the
-    // sampler measured it even though the loop never saw it in progress. A
-    // shorter press declines.
+    // hold that began and ended between two passes still counts for a 2 s
+    // card: the sampler measured it even though the loop never saw it in
+    // progress. FULL ACCESS counts only the time its words were on screen,
+    // so a hold measured between passes alone never approves it (review
+    // m1). A shorter press declines.
     let hold = card_hold_ms(&ctx.button_cards[0]);
-    match crate::card_hold::judge(hold, hold_ms, released) {
+    match judge_card_press(&ctx.button_cards[0], hold_ms, released) {
         crate::card_hold::Press::Approved => return CardTick::Approved,
         crate::card_hold::Press::Declined => return CardTick::Denied,
         crate::card_hold::Press::Pending => {}
@@ -6397,23 +6444,34 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         // enough for the hold to complete unseen. An operator with a finger
         // on the button is a foreground interaction: the socket can wait the
         // second or so it takes, and the watchdog is fed every poll.
+        //
+        // FULL ACCESS follows until its words have been up the whole hold
+        // (they are drawn on the first pass below if they are not yet).
+        let progress = card_hold_progress(&ctx.button_cards[0], hold_ms);
         let burst_until = Instant::now()
-            + CARD_HOLD_BURST.max(Duration::from_millis(u64::from(hold.saturating_sub(hold_ms)) + 200));
+            + CARD_HOLD_BURST.max(Duration::from_millis(u64::from(hold.saturating_sub(progress)) + 200));
         loop {
             crate::wdt::feed();
-            let held = crate::button::hold_ms();
-            if held >= hold {
-                return CardTick::Approved;
+            // The window is enforced at the moment of approval (review m2):
+            // a hold still under way when it closes expires the card, as the
+            // interactive loop's deadline does.
+            if card_overdue(&ctx.button_cards[0]) {
+                return CardTick::Expired;
             }
+            let held = crate::button::hold_ms();
             if held == 0 {
                 // Released mid-burst: the sampler has the length. No release
                 // recorded: treat it as nothing having happened and let the
-                // next pass decide.
-                return match crate::card_hold::judge(hold, 0, crate::button::take_release()) {
+                // next pass decide (FULL ACCESS: a decline once its words
+                // were shown).
+                return match judge_card_press(&ctx.button_cards[0], 0, crate::button::take_release()) {
                     crate::card_hold::Press::Approved => CardTick::Approved,
                     crate::card_hold::Press::Declined => CardTick::Denied,
                     crate::card_hold::Press::Pending => CardTick::Pending,
                 };
+            }
+            if judge_card_press(&ctx.button_cards[0], held, None) == crate::card_hold::Press::Approved {
+                return CardTick::Approved;
             }
             draw_button_card(ctx, remaining, held);
             if Instant::now() >= burst_until {
@@ -6914,6 +6972,7 @@ fn queue_receive_card(
                 enrol_gate: Default::default(),
                 drawn_view: None,
                 drawn_gen: None,
+                words: Default::default(),
             });
         }
     }
@@ -7140,6 +7199,7 @@ fn queue_phone_enrol(
         enrol_gate: Default::default(),
         drawn_view: None,
         drawn_gen: None,
+        words: Default::default(),
     });
     Ok(())
 }

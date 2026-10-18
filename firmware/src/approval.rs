@@ -48,6 +48,7 @@ where
         buttons,
         timeout_secs,
         crate::card_hold::CARD_HOLD_MS,
+        false,
         None,
         |d, remaining, _, _| show_fn(d, remaining),
         crate::oled::show_hold_progress,
@@ -85,6 +86,7 @@ where
         buttons,
         timeout_secs,
         crate::card_hold::CARD_HOLD_MS,
+        false,
         Some(&mut gate),
         show_fn,
         crate::oled::show_hold_progress,
@@ -114,6 +116,7 @@ where
         buttons,
         timeout_secs,
         crate::card_hold::FULL_ACCESS_HOLD_MS,
+        true,
         None,
         |d, remaining, _, _| show_fn(d, remaining),
         show_hold,
@@ -129,6 +132,9 @@ fn approval_loop_inner<F, H>(
     timeout_secs: u64,
     // The hold that approves this card (`card_hold::hold_ms`).
     hold: u32,
+    // FULL ACCESS: the hold counts only from when the hold screen (its three
+    // words) is on the glass, not from the press (review m1).
+    count_from_hold_screen: bool,
     mut gate: Option<&mut heartwood_common::phone_unlock::EnrolGate>,
     mut show_fn: F,
     mut show_hold: H,
@@ -215,6 +221,13 @@ where
                 pressed = true;
                 press_start = Instant::now();
                 last_pct = 101; // force redraw
+                if count_from_hold_screen {
+                    // Draw the words first and start the hold once they are
+                    // on screen, so the whole hold is spent with them up.
+                    show_hold(display, 0);
+                    last_pct = 0;
+                    press_start = Instant::now();
+                }
             }
             continue;
         }

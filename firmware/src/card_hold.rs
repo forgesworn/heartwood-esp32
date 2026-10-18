@@ -53,6 +53,81 @@ pub fn judge(hold: u32, held_ms: u32, released_ms: Option<u32>) -> Press {
     }
 }
 
+/// The FULL ACCESS card's three words, as its hold sees them. They are drawn
+/// only on the hold screen, so a hold counts only for the time they have been
+/// on the glass (review m1): a press measured between two loop passes, or one
+/// that began before the hold screen was drawn, must not approve on time the
+/// owner never saw the words for.
+///
+/// Measured on the button sampler's own clock, not between loop passes: the
+/// press's length is read just after the hold screen is drawn, and the words
+/// have been up for the press's length now minus that reading.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WordsShown {
+    held_at_draw: Option<u32>,
+}
+
+impl WordsShown {
+    /// The hold screen has just been drawn, and the button has now been down
+    /// `held_ms` (read after the draw). Only the first draw of a press
+    /// starts the count; a reading of 0 (let go during the draw) starts
+    /// nothing.
+    pub fn drawn(&mut self, held_ms: u32) {
+        if held_ms > 0 && self.held_at_draw.is_none() {
+            self.held_at_draw = Some(held_ms);
+        }
+    }
+
+    /// Something else covered the words: the count starts again at the next
+    /// draw of the hold screen.
+    pub fn hidden(&mut self) {
+        self.held_at_draw = None;
+    }
+
+    /// Whether the words have been drawn during this press.
+    pub fn shown(&self) -> bool {
+        self.held_at_draw.is_some()
+    }
+
+    /// How long the words have been on screen, for a press now `held_ms`
+    /// long (or one that ended at that length); 0 before they were drawn.
+    pub fn shown_ms(&self, held_ms: u32) -> u32 {
+        self.held_at_draw.map_or(0, |at| held_ms.saturating_sub(at))
+    }
+}
+
+/// Judge a press on the FULL ACCESS card: as [`judge`], but only the time
+/// its words have been on screen counts towards the hold.
+///
+/// - Still down: approved once the words have been up for the whole hold.
+/// - Let go: approved only if the words were up for the whole hold before
+///   the release; any other release declines, including one the words were
+///   never drawn for, however long the press was.
+/// - Up with no release recorded after the words were shown: the press
+///   ended unmeasured, which declines (review m3) rather than leaving the
+///   card waiting for its window to run out.
+pub fn judge_full_access(hold: u32, words: WordsShown, held_ms: u32, released_ms: Option<u32>) -> Press {
+    if let Some(released) = released_ms {
+        return if words.shown() && words.shown_ms(released) >= hold {
+            Press::Approved
+        } else {
+            Press::Declined
+        };
+    }
+    if held_ms > 0 {
+        return if words.shown() && words.shown_ms(held_ms) >= hold {
+            Press::Approved
+        } else {
+            Press::Pending
+        };
+    }
+    if words.shown() {
+        Press::Declined
+    } else {
+        Press::Pending
+    }
+}
+
 /// The hold's progress, 0 to 100, for the bar.
 pub fn hold_pct(hold: u32, held_ms: u32) -> u32 {
     (held_ms.saturating_mul(100) / hold.max(1)).min(100)
@@ -94,6 +169,44 @@ mod tests {
         assert_eq!(judge(card, 0, Some(2_000)), Press::Approved);
         assert_eq!(judge(card, 1_999, None), Press::Pending);
         assert_eq!(judge(card, 0, Some(1_999)), Press::Declined);
+    }
+
+    #[test]
+    fn full_access_counts_only_the_time_the_words_were_on_screen() {
+        let full = hold_ms(true);
+        let mut words = WordsShown::default();
+        // A long press the words were never drawn for: never approves.
+        assert_eq!(judge_full_access(full, words, 0, Some(6_000)), Press::Declined);
+        assert_eq!(judge_full_access(full, words, 9_000, None), Press::Pending);
+        assert_eq!(judge_full_access(full, words, 0, None), Press::Pending);
+
+        // The loop stalled 3 s into the press, then drew the hold screen.
+        words.drawn(3_000);
+        // A second draw in the same press does not move the start.
+        words.drawn(3_500);
+        assert_eq!(words.shown_ms(3_500), 500);
+        // Held 5 s in all, but the words up only 2 s: not yet.
+        assert_eq!(judge_full_access(full, words, 5_000, None), Press::Pending);
+        // Let go at 7.9 s (words up 4.9 s): declined.
+        assert_eq!(judge_full_access(full, words, 0, Some(7_999)), Press::Declined);
+        // Words up the whole 5 s: approved, held or just released.
+        assert_eq!(judge_full_access(full, words, 8_000, None), Press::Approved);
+        assert_eq!(judge_full_access(full, words, 0, Some(8_000)), Press::Approved);
+        // Up with no release recorded after the words were shown: declined.
+        assert_eq!(judge_full_access(full, words, 0, None), Press::Declined);
+
+        // Covered by another screen: the count starts again at the next draw.
+        words.hidden();
+        assert!(!words.shown());
+        words.drawn(6_000);
+        assert_eq!(judge_full_access(full, words, 10_999, None), Press::Pending);
+        assert_eq!(judge_full_access(full, words, 11_000, None), Press::Approved);
+
+        // Let go during the draw (a reading of 0): nothing starts.
+        let mut late = WordsShown::default();
+        late.drawn(0);
+        assert!(!late.shown());
+        assert_eq!(judge_full_access(full, late, 0, Some(5_200)), Press::Declined);
     }
 
     #[test]

@@ -774,16 +774,21 @@ impl PolicyEngine {
     ) -> Result<(), String> {
         let policy = validate_exact_slot_policy(allowed_methods, allowed_kinds, auto_approve)
             .map_err(str::to_string)?;
-        let slot = self
-            .slots_mut(master_slot)
-            .iter_mut()
-            .find(|slot| slot.slot_index == slot_index)
-            .ok_or_else(|| "slot not found".to_string())?;
-        slot.allowed_methods = policy.allowed_methods;
-        slot.allowed_kinds = policy.allowed_kinds;
-        slot.auto_approve = policy.auto_approve;
-        slot.signing_approved = policy.signing_approved;
-        slot.strict_permissions = true;
+        // A write that leaves the slot's authority as it was (an operator's
+        // policy push re-sending the same policy) withdraws no waiting card
+        // (review m4): only a real change does (`slot_authority_changed`).
+        self.with_slots_keeping_approvals(master_slot, |slots| {
+            let slot = slots
+                .iter_mut()
+                .find(|slot| slot.slot_index == slot_index)
+                .ok_or_else(|| "slot not found".to_string())?;
+            slot.allowed_methods = policy.allowed_methods;
+            slot.allowed_kinds = policy.allowed_kinds;
+            slot.auto_approve = policy.auto_approve;
+            slot.signing_approved = policy.signing_approved;
+            slot.strict_permissions = true;
+            Ok::<(), String>(())
+        })?;
         self.slots_dirty = true;
         Ok(())
     }
@@ -804,8 +809,11 @@ impl PolicyEngine {
         guardian_notice_wrap: bool,
         bound_identity: Option<String>,
     ) -> bool {
-        let slots = self.slots_mut(master_slot);
-        if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
+        // Withdraws waiting cards only on a real authority change (review m4).
+        let found = self.with_slots_keeping_approvals(master_slot, |slots| {
+            let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) else {
+                return false;
+            };
             slot.escalate = escalate;
             slot.petition_on_deny = petition_on_deny;
             slot.audit_child_wrap = audit_child_wrap;
@@ -813,11 +821,12 @@ impl PolicyEngine {
             // A changed binding clears the approved identities, and the new
             // binding is itself approved.
             set_slot_bound_identity(slot, bound_identity);
-            self.slots_dirty = true;
             true
-        } else {
-            false
+        });
+        if found {
+            self.slots_dirty = true;
         }
+        found
     }
 
     /// Update fields on an existing slot. Returns true if the slot was found.
@@ -830,8 +839,15 @@ impl PolicyEngine {
         allowed_kinds: Option<Vec<u64>>,
         auto_approve: Option<bool>,
     ) -> bool {
-        let slots = self.slots_mut(master_slot);
-        if let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) {
+        // A no-op write (an operator's policy push re-sending what the slot
+        // already holds) withdraws no waiting card, a FULL ACCESS card
+        // included: only a real authority change does (review m4,
+        // `slot_authority_changed`). Lists compare in order, so a reordered
+        // list counts as a change and still withdraws (fails closed).
+        let found = self.with_slots_keeping_approvals(master_slot, |slots| {
+            let Some(slot) = slots.iter_mut().find(|s| s.slot_index == slot_index) else {
+                return false;
+            };
             // One-hold pairing (spec 4.6, 5.2): both lists are judged against
             // the slot as it was BEFORE this update. The owner mark may be
             // kept or dropped, never added; heartwood_approve_bundle is never
@@ -868,11 +884,12 @@ impl PolicyEngine {
             if let Some(approve) = auto_approve {
                 slot.auto_approve = approve;
             }
-            self.slots_dirty = true;
             true
-        } else {
-            false
+        });
+        if found {
+            self.slots_dirty = true;
         }
+        found
     }
 
     /// Remove a slot by index. Returns true if found and removed.
@@ -1393,6 +1410,58 @@ mod tests {
         again.push(OWNER_MARK.into());
         assert!(engine.update_slot(0, index, None, Some(again), None, None));
         assert!(!slot_has_owner_mark(slot(&engine, index)));
+    }
+
+    #[test]
+    fn a_no_op_slot_write_keeps_waiting_cards_and_a_real_change_withdraws_them() {
+        // Review m4: an operator's policy push that re-sends what the owner
+        // pairing already holds must not void a waiting FULL ACCESS card.
+        let (mut engine, index) = paired_engine();
+        press(&mut engine, index, Style::Everyday);
+        let current = slot(&engine, index).clone();
+        let epoch = engine.approval_epoch();
+        assert!(engine.update_slot(
+            0,
+            index,
+            Some("Renamed".into()),
+            Some(current.allowed_methods.clone()),
+            Some(current.allowed_kinds.clone()),
+            Some(current.auto_approve),
+        ));
+        assert!(engine.approval_is_current(epoch), "same lists and a new label");
+        let mut with_bundle = current.allowed_methods.clone();
+        with_bundle.push("heartwood_approve_bundle".into());
+        assert!(engine.update_slot(0, index, None, Some(with_bundle), None, None));
+        assert!(engine.approval_is_current(epoch), "the bundle is filtered, so nothing changed");
+        assert!(engine.set_slot_family_flags(
+            0,
+            index,
+            current.escalate,
+            current.petition_on_deny,
+            current.audit_child_wrap,
+            current.guardian_notice_wrap,
+            current.bound_identity.clone(),
+        ));
+        assert!(engine.approval_is_current(epoch), "the same family flags");
+        assert!(!engine.update_slot(0, 99, None, Some(vec![]), None, None));
+        assert!(engine.approval_is_current(epoch), "no such slot");
+
+        // A real change withdraws them.
+        assert!(engine.update_slot(0, index, None, None, Some(vec![1]), None));
+        assert!(!engine.approval_is_current(epoch), "a kinds change");
+        let epoch = engine.approval_epoch();
+        assert!(engine.set_slot_family_flags(0, index, true, false, false, false, current.bound_identity.clone()));
+        assert!(!engine.approval_is_current(epoch), "escalate set");
+
+        // The strict path: the same exact policy twice withdraws only once.
+        let (mut engine, index) = paired_engine();
+        let methods = names(&["get_public_key", "nip44_encrypt"]);
+        let epoch = engine.approval_epoch();
+        engine.set_exact_slot_policy(0, index, methods.clone(), vec![], true).unwrap();
+        assert!(!engine.approval_is_current(epoch), "the slot became strict");
+        let epoch = engine.approval_epoch();
+        engine.set_exact_slot_policy(0, index, methods, vec![], true).unwrap();
+        assert!(engine.approval_is_current(epoch), "the same exact policy again");
     }
 
     #[test]

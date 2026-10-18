@@ -54,6 +54,11 @@ pub mod client_grants;
 #[cfg(feature = "nip46")]
 pub mod slot_codec;
 
+/// Heartwood one-hold pairing: the owner mark, the setup hold's params,
+/// card and words, and Rule V / Rule D (signet-plans 2026-10-17 spec).
+#[cfg(feature = "nip46")]
+pub mod owner_pairing;
+
 pub mod net_config;
 
 pub mod mgmt;

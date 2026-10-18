@@ -36,7 +36,8 @@ const F_AUDIT_CHILD: u8 = 32;
 const F_GUARDIAN: u8 = 64;
 const F_WAS_BOUND: u8 = 128;
 
-const MAX_METHODS: usize = 32;
+/// Most names a slot's `allowed_methods` may hold.
+pub const MAX_METHODS: usize = 32;
 const MAX_METHOD_LEN: usize = 64;
 const MAX_KINDS: usize = 64;
 const MAX_MEMBERS: usize = 8;
@@ -703,6 +704,43 @@ struct OldSlot {
                 obj
             }
         }
+    }
+
+    #[test]
+    fn a_slot_carrying_the_owner_mark_round_trips_in_both_shapes_and_old_readers_load_it() {
+        // One-hold pairing spec 5.1 / 5.3: the mark is one more method name,
+        // so no codec change, and a reader that does not know it loads the
+        // slot unchanged.
+        let mark = crate::owner_pairing::OWNER_MARK.to_string();
+        let mut s = base_slot();
+        s.allowed_methods = vec!["sign_event".into(), "nip44_encrypt".into(), mark.clone()];
+        s.signing_approved = true;
+        s.allowed_kinds = crate::owner_pairing::CAREFUL_KINDS.to_vec();
+        s.auto_approve = true;
+        s.current_pubkey = Some(hex64(0x22));
+        s.authorized_pubkeys = vec![hex64(0x22)];
+        s.was_bound = true;
+
+        let json = serde_json::to_string(&s).unwrap();
+        let decoded: ConnectSlot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.allowed_methods, s.allowed_methods);
+        assert_eq!(decoded.allowed_kinds, s.allowed_kinds);
+        let old: OldSlot = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.allowed_methods, s.allowed_methods);
+
+        let mut g = s.clone();
+        let mut snap = GrantSnapshot::empty();
+        snap.add_client([0x22; 32]).unwrap();
+        g.client_grants = Some(snap);
+        let json = serde_json::to_string(&g).unwrap();
+        let decoded: ConnectSlot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.allowed_methods, g.allowed_methods);
+        assert!(decoded.client_grants.is_some());
+        // A pre-G4 reader sees the extended shape's fail-closed projection,
+        // as for any G4 slot: strict and empty, so no mark and no authority.
+        let old: OldSlot = serde_json::from_str(&json).unwrap();
+        assert!(old.strict_permissions);
+        assert!(old.allowed_methods.is_empty());
     }
 
     #[test]

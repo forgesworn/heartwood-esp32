@@ -1010,8 +1010,9 @@ pub fn card_batch_marker(card: Option<CardKind>) -> &'static str {
 }
 
 /// Sanitise one connection slot from a backup before import: signing and kind
-/// ceilings are stripped (a restore never carries silent signing), then the
-/// method ceiling is re-validated. Identity approvals and the bound flag are
+/// ceilings are stripped (a restore never carries silent signing), as are the
+/// owner mark and `heartwood_approve_bundle`, then the method ceiling is
+/// re-validated. Identity approvals and the bound flag are
 /// kept. Returns whether signing was stripped.
 pub fn sanitise_imported_slot(slot: &mut ConnectSlot) -> Result<bool, &'static str> {
     if slot.client_grants.is_none() {
@@ -1022,6 +1023,12 @@ pub fn sanitise_imported_slot(slot: &mut ConnectSlot) -> Result<bool, &'static s
         slot.signing_approved || slot.allowed_methods.iter().any(|m| m == "sign_event");
     slot.signing_approved = false;
     slot.allowed_methods.retain(|m| m != "sign_event");
+    // The owner mark and the setup hold are never carried by a backup (one-hold
+    // pairing spec 5.2): a hand-edited file cannot make an owner pairing, and
+    // stripping them before validation keeps a backup that carries them
+    // (exported on older firmware after a downgrade) importable. A restore
+    // needs the setup hold again, as it needs signing approved again.
+    crate::owner_pairing::strip_owner_names(&mut slot.allowed_methods);
     // Kind ceilings are meaningless without sign_event (and the validator
     // rejects the combination), so they go with it.
     slot.allowed_kinds.clear();
@@ -1234,6 +1241,11 @@ pub fn remove_authorized_pubkey(
 /// so an earlier device stays auto-approved instead of being evicted. The set
 /// is de-duplicated and FIFO-capped at [`MAX_AUTHORIZED_PUBKEYS`].
 pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
+    // A key this slot never authorised is a new holder of the credential: an
+    // owner pairing's mark was given to the phone whose words the owner
+    // compared, so it goes (one-hold pairing spec 5.2: any connect class but
+    // Current/Known). The new key must run the setup hold itself.
+    let new_holder = !slot_authorizes(slot, pubkey);
     if let Some(grants) = &mut slot.client_grants {
         let Some(key) = decode_client_key(pubkey) else { return false; };
         // A full pairing forgets its oldest key, as `MAX_AUTHORIZED_PUBKEYS`
@@ -1267,6 +1279,7 @@ pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
         }
         if !slot.authorized_pubkeys.iter().any(|p| p == pubkey) { slot.authorized_pubkeys.push(pubkey.to_string()); }
         slot.current_pubkey = Some(pubkey.to_string());
+        if new_holder { crate::owner_pairing::drop_owner_mark(slot); }
         return true;
     }
     // A client key this slot has never authorised, replacing one it had, is a
@@ -1277,6 +1290,9 @@ pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
         && !slot_authorizes(slot, pubkey)
     {
         slot.approved_identities.clear();
+    }
+    if new_holder {
+        crate::owner_pairing::drop_owner_mark(slot);
     }
     slot.was_bound = true;
     if let Some(prev) = slot.current_pubkey.take() {
@@ -3444,6 +3460,20 @@ mod tests {
         policy.auto_approve = !policy.auto_approve;
         assert!(slot_authority_changed(&before, &[policy]));
         assert!(slot_authority_changed(&before, &[]));
+    }
+
+    #[test]
+    fn a_change_to_the_owner_mark_is_a_change_of_authority() {
+        // One-hold pairing spec 5.2: adding or dropping the mark withdraws
+        // waiting cards (`allowed_methods` is compared).
+        let slot = sample_slot(0, "My Signet");
+        let before = vec![slot.clone()];
+        let mut marked = slot.clone();
+        assert!(grant_slot_method(&mut marked, crate::owner_pairing::OWNER_MARK));
+        assert!(slot_authority_changed(&before, &[marked.clone()]));
+        let mut dropped = marked.clone();
+        assert!(crate::owner_pairing::drop_owner_mark(&mut dropped));
+        assert!(slot_authority_changed(&[marked], &[dropped]));
     }
 
     // --- Connect rebind classification (G1) ---

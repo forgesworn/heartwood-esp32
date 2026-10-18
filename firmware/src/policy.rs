@@ -15,10 +15,11 @@ fn next_approval_epoch() -> Option<u32> {
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use heartwood_common::nip46::Nip46Method;
+use heartwood_common::owner_pairing::VaultContext;
 use heartwood_common::policy::{
     authorize_pubkey_on_unique_slot, clear_approved_identities, evaluate_slot_policy_for_event,
     find_slot_by_pubkey,
-    find_slot_by_pubkey_mut, find_slot_by_secret, gate_request, grant_slot_method,
+    find_slot_by_pubkey_mut, find_slot_by_secret, gate_request_with_vault, grant_slot_method,
     grant_slot_signing, next_slot_index, record_client_identity, remove_ambiguous_pubkeys,
     remove_authorized_pubkey, set_slot_bound_identity, strict_slot_denies_method,
     verdict_covers_identity, verdict_withdrawn, IdentityRef,
@@ -374,6 +375,7 @@ impl PolicyEngine {
     /// the key it will use, when it uses one. A live approve-once verdict
     /// counts only for this exact request, and for an identity-scoped request
     /// only for the identity the guardian was shown.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn gate(
         &self,
@@ -388,9 +390,45 @@ impl PolicyEngine {
         has_context: bool,
         identity: Option<&[u8; 32]>,
     ) -> Gate {
+        self.gate_with_vault(
+            master_slot,
+            client_pubkey,
+            has_client,
+            method,
+            method_name,
+            event_kind,
+            tier,
+            explicit_context,
+            has_context,
+            identity,
+            VaultContext::NONE,
+        )
+    }
+
+    /// [`Self::gate`] with Rule V (one-hold pairing spec 6): `vault` says
+    /// whether the CALLER supplied a vault context
+    /// (`VaultContext::from_explicit`, never a session's active identity).
+    /// The handler's `plan_gate` is the only production caller, and both the
+    /// handler and the relay's pre-dispatch planner go through it, so the two
+    /// build `vault` the same way and reach the same decision.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gate_with_vault(
+        &self,
+        master_slot: u8,
+        client_pubkey: &str,
+        has_client: bool,
+        method: &Nip46Method,
+        method_name: &str,
+        event_kind: Option<u64>,
+        tier: ApprovalTier,
+        explicit_context: bool,
+        has_context: bool,
+        identity: Option<&[u8; 32]>,
+        vault: VaultContext,
+    ) -> Gate {
         let slot = self.find_slot_by_pubkey(master_slot, client_pubkey);
         let key = heartwood_common::nip59::method_or_kind_key(method.as_str(), event_kind);
-        gate_request(&GateRequest {
+        gate_request_with_vault(&GateRequest {
             client_pubkey: Some(client_pubkey),
             has_client,
             slot,
@@ -401,7 +439,7 @@ impl PolicyEngine {
             identity,
             verdict: slot.is_some()
                 && self.transient_allowed(master_slot, client_pubkey, &key, identity),
-        })
+        }, vault)
     }
 
     /// Record a physically approved identity on a slot, found by client key
@@ -1413,6 +1451,50 @@ mod tests {
             assert!(result.is_err(), "{name}");
         }
         assert!(!slot(&engine, index).strict_permissions);
+    }
+
+    #[test]
+    fn rule_v_skips_the_identity_card_only_for_an_explicit_vault_context_on_an_owner_pairing() {
+        use heartwood_common::owner_pairing::VaultContext;
+        use heartwood_common::policy::{CardKind, Gate};
+        let vault_key = [0x77; 32];
+        let gate = |engine: &PolicyEngine, method: &Nip46Method, name: &str, kind: Option<u64>, explicit: bool, vault: VaultContext| {
+            let tier = engine.check(0, CLIENT, method, kind);
+            engine.gate_with_vault(0, CLIENT, true, method, name, kind, tier, explicit, true, Some(&vault_key), vault)
+        };
+        let vault = |kind| VaultContext::from_explicit(Some("signet:vault:contacts"), kind);
+
+        let (mut engine, index) = paired_engine();
+        // Before the setup hold: today's path, an identity card.
+        assert!(matches!(
+            gate(&engine, &Nip46Method::Nip44Encrypt, "nip44_encrypt", None, true, vault(None)),
+            Gate::Card(CardKind::AllowAs { .. }) | Gate::Deny
+        ));
+        press(&mut engine, index, Style::Everyday);
+        for (method, name, kind) in [
+            (Nip46Method::GetPublicKey, "get_public_key", None),
+            (Nip46Method::Nip44Encrypt, "nip44_encrypt", None),
+            (Nip46Method::Nip44Decrypt, "nip44_decrypt", None),
+            (Nip46Method::SignEvent, "sign_event", Some(30078)),
+            (Nip46Method::SignEvent, "sign_event_compact", Some(30078)),
+        ] {
+            assert_eq!(gate(&engine, &method, name, kind, true, vault(kind)), Gate::Allow, "{name}");
+            // The tier still governs, and is automatic after the hold.
+            assert_eq!(engine.check(0, CLIENT, &method, kind), ApprovalTier::AutoApprove, "{name}");
+            // A context the caller did not supply never counts.
+            assert_ne!(gate(&engine, &method, name, kind, false, VaultContext::from_explicit(None, kind)), Gate::Allow, "{name}");
+        }
+        // Another kind under a vault context takes today's path.
+        assert_ne!(
+            gate(&engine, &Nip46Method::SignEvent, "sign_event", Some(1), true, vault(Some(1))),
+            Gate::Allow
+        );
+        // A context that is not a vault purpose takes today's path.
+        assert_ne!(
+            gate(&engine, &Nip46Method::Nip44Encrypt, "nip44_encrypt", None, true,
+                 VaultContext::from_explicit(Some("nostr:persona:persona"), None)),
+            Gate::Allow
+        );
     }
 
     #[test]

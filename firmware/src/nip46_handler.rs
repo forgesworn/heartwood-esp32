@@ -1771,7 +1771,8 @@ fn dispatch_inner(
                     // request fails when the write fails (#67) — a success
                     // answer must mean the persona survives reboot.
                     let pubkey = cache.identities[idx].public_key;
-                    if !crate::personas::contains_pubkey(personas, &pubkey) {
+                    let newly_registered = !crate::personas::contains_pubkey(personas, &pubkey);
+                    if newly_registered {
                         if let Err(full) = crate::personas::capacity_check(nvs) {
                             if cache.identities.len() > len_before {
                                 cache.identities.truncate(len_before);
@@ -1804,6 +1805,28 @@ fn dispatch_inner(
                             name: reg_name,
                             pubkey,
                         });
+                    }
+                    // Rule D (one-hold pairing spec 6): on an owner pairing, a
+                    // derive that newly registered this name records it for
+                    // the client that made it, card-approved or auto-approved
+                    // alike, while the grant list has room. Never a real
+                    // identity (`natural-person`, `dependant-<n>-np`), never a
+                    // lookup of a name already registered. Durable before the
+                    // answer, like every grant.
+                    if newly_registered
+                        && has_client
+                        && policy_engine
+                            .find_slot_by_pubkey(master_slot, &client_hex)
+                            .is_some_and(|slot| heartwood_common::owner_pairing::rule_d_records(slot, name, true))
+                    {
+                        let snapshot = policy_engine.snapshot_slot_state(master_slot);
+                        let changed = policy_engine.record_identity(master_slot, Ok(&client_hex), &pubkey);
+                        if let Err(response) =
+                            persist_grant(policy_engine, nvs, master_slot, &request.id, snapshot, changed)
+                        {
+                            return response;
+                        }
+                        log::info!("heartwood_derive_persona: recorded for its owner pairing (Rule D)");
                     }
                     let id = &cache.identities[idx];
                     let result = serde_json::json!({
@@ -2319,7 +2342,15 @@ pub(crate) fn plan_gate(
     } else {
         None
     };
-    let gate = policy_engine.gate(
+    // Rule V (one-hold pairing spec 6) counts only a context the CALLER
+    // supplied: a vault purpose set as a session's active identity
+    // (`resolve_active_context`) is no vault context. Built here, once, so
+    // the handler and the relay's pre-dispatch planner build it the same way.
+    let vault = heartwood_common::owner_pairing::VaultContext::from_explicit(
+        context.filter(|_| explicit_context).map(|c| c.purpose.as_str()),
+        event_kind,
+    );
+    let gate = policy_engine.gate_with_vault(
         master_slot,
         client_hex,
         has_client,
@@ -2330,6 +2361,7 @@ pub(crate) fn plan_gate(
         explicit_context,
         context.is_some(),
         identity.as_ref(),
+        vault,
     );
     Ok((gate, identity))
 }

@@ -9776,6 +9776,19 @@ fn dispatch_mgmt(
                 Some(i) => {
                     // Rebind: v2 replaces the complete policy as one validated
                     // unit; legacy keeps its historical partial-kind behavior.
+                    //
+                    // One-hold pairing (review m6), a known operator-key gap
+                    // accepted until spec stage 3: re-pairing the owner phone's
+                    // own client key with `nostrconnect_v2` replaces an owner
+                    // pairing's policy in one call. The slot becomes strict, so
+                    // the owner mark and both gate rules go with it (fails
+                    // closed for Rule V and Rule D), but Extra careful's kinds
+                    // list is replaced by whatever the exact policy names, so
+                    // it can widen in that one call. `update_slot`'s
+                    // no-silent-widening rule (owner_pairing::update_slot_kinds)
+                    // is not applied here on purpose: whoever holds the
+                    // operator key can already drop the mark and widen in two
+                    // calls. Behaviour unchanged; the stage 3 design covers it.
                     if let Some(policy) = &exact_policy {
                         ctx.policy_engine.update_slot(
                             master_slot,

@@ -1887,6 +1887,14 @@ mod full_access_card_tests {
     /// later. Scans the firmware's sources and this mirror: the header text
     /// and background-coloured (cut-out) text appear only in the FULL ACCESS
     /// builders, and only the FULL ACCESS card's two screens draw that bar.
+    ///
+    /// A text heuristic, with a known limit (review m10): it catches the
+    /// header constant, background-coloured text and calls to the header
+    /// builder outside the FULL ACCESS functions, but not an inverted bar
+    /// drawn some other way (a filled ACCENT rectangle under FG text, say).
+    /// ACCENT fills are everywhere as one-pixel header rules, so a pattern
+    /// for them would not separate a bar from a rule. A new full-width
+    /// filled header needs a reviewer's eye, or a render check here.
     #[test]
     fn only_the_full_access_card_uses_the_inverted_header() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src");

@@ -482,6 +482,30 @@ impl PolicyEngine {
         changed
     }
 
+    /// The setup hold's slot step (one-hold pairing spec 4.3, steps 2 to 5),
+    /// after step 1 resolved or registered every name: grants for `act_as`
+    /// (their x-only keys), the owner mark, LIST IDS, NIP-44 both ways,
+    /// signing, and `style`'s kinds list. Adds and never removes (bar
+    /// Everyday emptying Extra careful's list, a widening the hold consents
+    /// to). Every other waiting card is withdrawn: the slot's authority is
+    /// changing. Run inside a snapshot; on `Err` (a grant could not be
+    /// recorded) the caller restores it. True when the slot changed.
+    pub fn apply_bundle_press(
+        &mut self,
+        master_slot: u8,
+        client_pubkey: &str,
+        act_as: &[[u8; 32]],
+        style: heartwood_common::owner_pairing::Style,
+    ) -> Result<bool, heartwood_common::owner_pairing::BundleError> {
+        let slot = find_slot_by_pubkey_mut(self.slots_mut(master_slot), client_pubkey)
+            .filter(|slot| !slot.strict_permissions)
+            .ok_or(heartwood_common::owner_pairing::BundleError::Unauthorised)?;
+        let changed =
+            heartwood_common::owner_pairing::apply_bundle_press(slot, client_pubkey, act_as, style)?;
+        self.slots_dirty |= changed;
+        Ok(changed)
+    }
+
     /// Find or create a client session. Returns mutable reference.
     pub fn get_or_create_session(
         &mut self,
@@ -1495,6 +1519,55 @@ mod tests {
                  VaultContext::from_explicit(Some("nostr:persona:persona"), None)),
             Gate::Allow
         );
+    }
+
+    #[test]
+    fn the_press_grants_withdraws_waiting_cards_and_runs_again_adding_only() {
+        let (mut engine, index) = paired_engine();
+        let epoch = engine.approval_epoch();
+        let persona = [0x22; 32];
+        assert_eq!(engine.apply_bundle_press(0, CLIENT, &[persona], Style::Careful), Ok(true));
+        assert!(!engine.approval_is_current(epoch), "waiting cards are withdrawn");
+        assert!(engine.slots_dirty);
+        let after = slot(&engine, index).clone();
+        assert!(is_owner_pairing(&after));
+        for name in owner_pairing::BUNDLE_GRANTED_METHODS {
+            assert!(after.allowed_methods.iter().any(|m| m == name), "{name}");
+        }
+        assert!(after.signing_approved);
+        assert_eq!(after.allowed_kinds, CAREFUL_KINDS.to_vec());
+        assert!(heartwood_common::policy::client_identity_approved(&after, Some(CLIENT), &persona));
+        // Again, Everyday: adds nothing, removes nothing, widens kinds.
+        assert_eq!(engine.apply_bundle_press(0, CLIENT, &[persona], Style::Everyday), Ok(true));
+        let again = slot(&engine, index);
+        assert!(again.allowed_kinds.is_empty());
+        assert!(heartwood_common::policy::client_identity_approved(again, Some(CLIENT), &persona));
+        assert_eq!(engine.apply_bundle_press(0, CLIENT, &[persona], Style::Everyday), Ok(false));
+        // A stranger's key or a strict slot gets nothing.
+        assert!(engine.apply_bundle_press(0, &"cc".repeat(32), &[], Style::Everyday).is_err());
+    }
+
+    #[test]
+    fn a_press_that_cannot_persist_is_rolled_back_durably() {
+        // Spec 12: rollback on a failed persist, the handler's
+        // persist-or-rollback sequence over common's fault-injecting NVS
+        // (this module only compiles in that host harness).
+        use crate::firmware_policy_host_tests::{FaultKind, NvsOp};
+        let mut nvs = esp_idf_svc::nvs::EspNvs::new();
+        let (mut engine, index) = paired_engine();
+        assert!(engine.persist_slots(&mut nvs, 0));
+        let before = slot(&engine, index).clone();
+        let snapshot = engine.snapshot_slot_state(0);
+        assert_eq!(engine.apply_bundle_press(0, CLIENT, &[[0x33; 32]], Style::Everyday), Ok(true));
+        nvs.backend.fail_once(NvsOp::SetBlob, "connslots_0", FaultKind::WriteFailBeforeCommit);
+        assert!(!engine.persist_slots(&mut nvs, 0));
+        assert!(engine.restore_slot_state_durably(&mut nvs, snapshot));
+        let after = slot(&engine, index);
+        assert_eq!(after.allowed_methods, before.allowed_methods);
+        assert!(!slot_has_owner_mark(after));
+        // What is on flash is the old table too.
+        let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+        assert!(!slot_has_owner_mark(&reloaded.list_slots(0)[0]));
     }
 
     #[test]

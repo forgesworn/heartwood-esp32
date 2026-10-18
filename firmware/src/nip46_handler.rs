@@ -203,6 +203,277 @@ fn extension_approval_preview(requester: &str, params: &[Value]) -> String {
     }
 }
 
+/// The registry's key for a persona name at index 0 under this master, the
+/// bundle's lookup (spec 4.1: every derive uses index 0).
+fn registered_persona(
+    personas: &[crate::personas::LoadedPersona],
+    master_slot: u8,
+    name: &str,
+) -> Option<[u8; 32]> {
+    let purpose = format!("nostr:persona:{name}");
+    personas
+        .iter()
+        .find(|p| p.master_slot == master_slot && p.index == 0 && p.purpose == purpose)
+        .map(|p| p.pubkey)
+}
+
+/// Derive and register one persona the setup hold names (spec 4.3 step 1),
+/// the `heartwood_derive_persona` path: into the identity cache, then the
+/// persisted registry (refusing cleanly when it is full), then the in-memory
+/// registry. The key is checked against `expect` before anything is written.
+/// A registration that lands stays even if the slot step is later rolled
+/// back: a later derive is then a lookup.
+#[allow(clippy::too_many_arguments)]
+fn register_bundle_persona(
+    bundle: &heartwood_common::owner_pairing::BundleRequest,
+    name: &str,
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    master_slot: u8,
+    identity_caches: &mut [crate::identity_cache::IdentityCache],
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    personas: &mut Vec<crate::personas::LoadedPersona>,
+) -> Result<[u8; 32], (i32, String)> {
+    use heartwood_common::owner_pairing::BundleError;
+    let bundle_err = |e: BundleError| (e.code(), e.message().to_string());
+    let derive_secret = derivation_secret(master_secret, master_mode)
+        .map_err(|_| bundle_err(BundleError::NoPersonaTree))?;
+    let cache = identity_caches
+        .iter_mut()
+        .find(|c| c.master_slot == master_slot)
+        .ok_or((-4, "no identity cache for this master".to_string()))?;
+    let purpose = format!("nostr:persona:{name}");
+    let len_before = cache.identities.len();
+    let idx = cache
+        .derive_and_cache(&derive_secret, &purpose, 0, Some(name.to_string()))
+        .map_err(|e| (-4, e.to_string()))?;
+    let pubkey = cache.identities[idx].public_key;
+    let undo = |cache: &mut crate::identity_cache::IdentityCache| {
+        if cache.identities.len() > len_before {
+            cache.identities.truncate(len_before);
+        }
+    };
+    if let Err(e) = heartwood_common::owner_pairing::check_expect(bundle, name, &pubkey) {
+        undo(cache);
+        return Err(bundle_err(e));
+    }
+    if !crate::personas::contains_pubkey(personas, &pubkey) {
+        if crate::personas::capacity_check(nvs).is_err() {
+            undo(cache);
+            return Err(bundle_err(BundleError::StorageFull));
+        }
+        if let Err(e) = crate::personas::add(nvs, master_slot, &purpose, 0, Some(name), &pubkey) {
+            undo(cache);
+            log::warn!("heartwood_approve_bundle: registry write failed — {e}");
+            return Err(if e.starts_with("identity storage full") {
+                bundle_err(BundleError::StorageFull)
+            } else {
+                (-4, e.to_string())
+            });
+        }
+        personas.push(crate::personas::LoadedPersona {
+            master_slot,
+            purpose,
+            index: 0,
+            name: Some(name.to_string()),
+            pubkey,
+        });
+    }
+    Ok(pubkey)
+}
+
+/// `heartwood_approve_bundle` (one-hold pairing spec 4.1-4.3), after the
+/// shared gates (an unbound client and a strict slot were refused there, an
+/// escalate slot by the relay planner and again here).
+///
+/// Every check of 4.1 runs first, in the settled order (param, slot,
+/// registry and `expect`, room), on every pass: nothing is shown or changed
+/// when one fails, and the answer is its message alone. Keys the press would
+/// derive are computed now and compared with `expect` before the card. Then
+/// the FULL ACCESS card (5 s hold, 45 s window, never shared, never a
+/// verdict's to answer). The press registers the missing names, then takes
+/// one slot step (snapshot, grants, mark, methods, signing, kinds) that is
+/// made durable before the reply, or rolled back. Other waiting cards are
+/// withdrawn by the slot step; this ask's own resume carries the authority
+/// epoch, so a slot change while it waited refuses it ("send the request
+/// again").
+#[allow(clippy::too_many_arguments)]
+fn approve_bundle(
+    request: nip46::Nip46Request,
+    resume: Resume,
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    master_slot: u8,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    policy_engine: &mut PolicyEngine,
+    identity_caches: &mut [crate::identity_cache::IdentityCache],
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    personas: &mut Vec<crate::personas::LoadedPersona>,
+    client_hex: &str,
+    approval: ApprovalDecision,
+    deferred: &mut Option<Box<DeferredAsk>>,
+) -> String {
+    use heartwood_common::owner_pairing::{self as op, BundleError};
+    let refuse = |e: BundleError| build_error_json(&request.id, e.code(), e.message());
+
+    // The param. A Heartwood context means nothing to the bundle (it names
+    // its personas itself), so a request carrying one is malformed rather
+    // than quietly served as some other identity.
+    if let Err(e) = op::parse_bundle_params(&request.params) {
+        return refuse(e);
+    }
+    if resume.explicit_context {
+        return refuse(BundleError::Malformed);
+    }
+    // The slot, the registry and `expect`, room (`validate_bundle` runs the
+    // param check again; it is cheap). Direct USB has no client key and so
+    // no slot: the slot check refuses it.
+    let board = op::BundleBoard {
+        has_tree: derivation_secret(master_secret, master_mode).is_ok(),
+        registry_free: if crate::personas::capacity_check(nvs).is_err() {
+            0
+        } else {
+            usize::from(crate::personas::MAX_PERSONAS.saturating_sub(crate::personas::read_count(nvs)))
+        },
+    };
+    let slot = policy_engine.find_slot_by_pubkey(master_slot, client_hex);
+    let (bundle, plan) = match op::validate_bundle(&request.params, slot, client_hex, board, |name| {
+        registered_persona(personas, master_slot, name)
+    }) {
+        Ok(checked) => checked,
+        Err(e) => {
+            log::warn!("heartwood_approve_bundle: refused — {}", e.message());
+            return refuse(e);
+        }
+    };
+    let Some(label) = slot.map(|slot| slot.label.clone()) else {
+        return refuse(BundleError::Unauthorised);
+    };
+    let Some(client_pubkey) = heartwood_common::policy::decode_client_key(client_hex) else {
+        return refuse(BundleError::Unauthorised);
+    };
+    // The personas are the master's own: a request addressed to a persona
+    // would derive under that persona's tree.
+    if served_persona(personas, secp, master_secret).is_some() {
+        log::warn!("heartwood_approve_bundle: refused — addressed to a persona");
+        return build_error_json(&request.id, -1, nip46::PERSONA_DERIVE_NEEDS_MASTER);
+    }
+    // Keys the press would derive are pure computations: compare them with
+    // `expect` now, so a mismatch is refused before the card.
+    for (name, registered) in &plan.resolved {
+        if registered.is_some() {
+            continue;
+        }
+        match derive_identity(master_secret, master_mode, &format!("nostr:persona:{name}"), 0) {
+            Ok((_secret, pubkey)) => {
+                if let Err(e) = op::check_expect(&bundle, name, &pubkey) {
+                    return refuse(e);
+                }
+            }
+            Err(e) => {
+                log::warn!("heartwood_approve_bundle: derive failed — {e}");
+                return build_error_json(&request.id, -4, "key derivation failure");
+            }
+        }
+    }
+
+    // The FULL ACCESS card.
+    match approval {
+        ApprovalDecision::Deferred => {
+            *deferred = Some(Box::new(DeferredAsk {
+                card: AskCard::FullAccess {
+                    label,
+                    client_pubkey,
+                    act_as: bundle.act_as.clone(),
+                    style: bundle.style,
+                },
+                request,
+                event: None,
+                identity: None,
+                resume,
+            }));
+            return String::new();
+        }
+        // `device_press_only`: no guardian verdict answers this card.
+        ApprovalDecision::VerdictApproved => {
+            log::warn!("heartwood_approve_bundle: refused: a verdict cannot answer this card");
+            return build_error_json(&request.id, -1, heartwood_common::escalate::DEVICE_APPROVAL_REQUIRED);
+        }
+        ApprovalDecision::ButtonApproved => {}
+        ApprovalDecision::Interactive => {
+            let total = op::FULL_ACCESS_CARD_SECS;
+            let result = crate::approval::run_full_access_approval_loop(
+                display,
+                buttons,
+                total,
+                |d, remaining| {
+                    crate::oled::show_full_access(
+                        d,
+                        &label,
+                        &client_pubkey,
+                        &bundle.act_as,
+                        bundle.style,
+                        remaining,
+                        total as u32,
+                    )
+                },
+                |d, pct| crate::oled::show_full_access_hold(d, &client_pubkey, pct),
+            );
+            if let Some(response) = extension_approval_failure(&request.id, result) {
+                crate::oled::show_result(display, "Not approved");
+                return response;
+            }
+        }
+    }
+
+    // The press, step 1: every name resolved, or derived and registered.
+    let mut keys: Vec<(String, [u8; 32])> = Vec::with_capacity(plan.resolved.len());
+    for (name, registered) in &plan.resolved {
+        let pubkey = match registered {
+            Some(pubkey) => *pubkey,
+            None => match register_bundle_persona(
+                &bundle,
+                name,
+                master_secret,
+                master_mode,
+                master_slot,
+                identity_caches,
+                nvs,
+                personas,
+            ) {
+                Ok(pubkey) => pubkey,
+                Err((code, message)) => return build_error_json(&request.id, code, &message),
+            },
+        };
+        keys.push((name.clone(), pubkey));
+    }
+    let act_as: Vec<[u8; 32]> = bundle
+        .act_as
+        .iter()
+        .filter_map(|name| keys.iter().find(|(n, _)| n == name).map(|(_, key)| *key))
+        .collect();
+
+    // Steps 2 to 5: one durable slot step.
+    let snapshot = policy_engine.snapshot_slot_state(master_slot);
+    match policy_engine.apply_bundle_press(master_slot, client_hex, &act_as, bundle.style) {
+        Ok(changed) => {
+            if let Err(response) = persist_grant(policy_engine, nvs, master_slot, &request.id, snapshot, changed) {
+                return response;
+            }
+        }
+        Err(e) => {
+            policy_engine.restore_slot_state(snapshot);
+            log::warn!("heartwood_approve_bundle: press not applied — {}", e.message());
+            return refuse(e);
+        }
+    }
+    log::info!("heartwood_approve_bundle: owner pairing set ({} personas, style {})", keys.len(), bundle.style.as_str());
+    nip46::build_result_response(&request.id, &op::bundle_success_json(&keys, &bundle.act_as, bundle.style))
+        .unwrap_or_default()
+}
+
 /// Whether a remote request can change durable slot authority when approved.
 /// Callers use this before dispatch to take a rollback snapshot without cloning
 /// the slot table for every routine auto-sign request. `owner_pairing` is
@@ -1076,8 +1347,11 @@ fn dispatch_inner(
     if rederive_lookup {
         log::info!("{}: an existing persona this app may act as; no card", request.method);
     }
+    // The setup hold raises its own FULL ACCESS card below, never the
+    // generic extension card.
     let own_card = !spend_granted
         && !rederive_lookup
+        && !method.always_shows_own_card()
         && !matches!(gate_card, Some(CardKind::SwitchTo { .. }))
         && remote_extension_requires_approval(has_client, &method, tier);
 
@@ -1133,6 +1407,34 @@ fn dispatch_inner(
                 return build_error_json(&request.id, -1, "identity approved; send the request again");
             }
         }
+    }
+
+    // One-hold pairing (spec 4.1, 4.3): the setup hold. Validated before its
+    // card, on every pass (a resumed ask is checked again against the
+    // registry; the slot's authority epoch was checked above), then the
+    // FULL ACCESS card and its 5 s hold, then one durable slot step.
+    if matches!(method, nip46::Nip46Method::HeartwoodApproveBundle) {
+        return approve_bundle(
+            request,
+            Resume {
+                authority_epoch: policy_engine.approval_epoch(),
+                explicit_context: explicit_heartwood_context,
+                shown: shown_now,
+            },
+            master_secret,
+            master_mode,
+            master_slot,
+            secp,
+            display,
+            buttons,
+            policy_engine,
+            identity_caches,
+            nvs,
+            personas,
+            &client_hex,
+            approval,
+            deferred,
+        );
     }
 
     // The gate's own card, before the method's flow: ALLOW AS <identity>?

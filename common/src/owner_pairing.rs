@@ -229,10 +229,18 @@ pub fn slot_has_owner_mark(slot: &ConnectSlot) -> bool {
     slot.allowed_methods.iter().any(|m| m == OWNER_MARK)
 }
 
-/// Whether the slot is an owner pairing: non-strict and carrying the mark.
-/// Both gate rules (spec 6) apply only to these.
+/// Whether the slot is an owner pairing: non-strict, not escalating, and
+/// carrying the mark. Both gate rules (spec 6) apply only to these.
+///
+/// An escalating slot is not one while `escalate` is set (review m5): its
+/// prompting asks go to a guardian verdict, which the bundle refuses for the
+/// same reason (`check_bundle_slot`), so Rule V and Rule D do not apply, its
+/// status reads `owner: false` and narrow is refused. The mark itself stays,
+/// so clearing `escalate` makes it an owner pairing again, and the no-widen
+/// rules in `update_slot_methods` / `update_slot_kinds` key off the mark
+/// alone, so they still hold while it escalates.
 pub fn is_owner_pairing(slot: &ConnectSlot) -> bool {
-    !slot.strict_permissions && slot_has_owner_mark(slot)
+    !slot.strict_permissions && !slot.escalate && slot_has_owner_mark(slot)
 }
 
 /// Whether a kinds list is exactly Extra careful's, compared as a set.
@@ -1610,6 +1618,32 @@ mod tests {
         let mut strict = owner_slot();
         strict.strict_permissions = true;
         assert!(!rule_v_allows(&strict, "nip44_encrypt", true, vault));
+    }
+
+    #[test]
+    fn an_escalating_slot_is_not_an_owner_pairing_while_it_escalates() {
+        // Review m5: an operator setting `escalate` on the owner phone's
+        // slot turns both gate rules off, as the bundle is refused there.
+        let mut slot = owner_slot();
+        slot.escalate = true;
+        assert!(slot_has_owner_mark(&slot), "the mark stays");
+        assert!(!is_owner_pairing(&slot));
+        let vault = VaultContext { explicit_vault: true, event_kind: Some(VAULT_EVENT_KIND) };
+        assert!(!rule_v_allows(&slot, "nip44_encrypt", true, vault));
+        assert!(!rule_v_allows(&slot, "sign_event", true, vault));
+        assert!(!rule_d_records(&slot, "persona-1", true));
+        let status: Value = serde_json::from_str(&owner_status_json(Some(&slot))).unwrap();
+        assert_eq!(status["owner"], false);
+        assert_eq!(owner_narrow(Some(&mut slot)), Err(BundleError::Unauthorised));
+        // The no-widen rule keys off the mark, so it still holds.
+        let mut careful = slot.clone();
+        careful.allowed_kinds = CAREFUL_KINDS.to_vec();
+        assert_eq!(update_slot_kinds(&careful, vec![]), CAREFUL_KINDS.to_vec());
+        // Escalation cleared: an owner pairing again.
+        slot.escalate = false;
+        assert!(is_owner_pairing(&slot));
+        assert!(rule_v_allows(&slot, "nip44_encrypt", true, vault));
+        assert!(rule_d_records(&slot, "persona-1", true));
     }
 
     #[test]

@@ -322,6 +322,16 @@ fn approve_bundle(
     if resume.explicit_context {
         return refuse(BundleError::Malformed);
     }
+    // The personas are the master's own: a request addressed to a persona
+    // would derive under that persona's tree. Refused here, before the slot,
+    // the room and the registry (review round 2, S2): it depends on none of
+    // them, and after the registry it told a guessing client, with no card,
+    // whether its `expect` matched (a match reached this refusal, a miss got
+    // `pubkey mismatch`).
+    if served_persona(personas, secp, master_secret).is_some() {
+        log::warn!("heartwood_approve_bundle: refused — addressed to a persona");
+        return build_error_json(&request.id, -1, nip46::PERSONA_DERIVE_NEEDS_MASTER);
+    }
     // The slot, the registry and `expect`, room (`validate_bundle` runs the
     // param check again; it is cheap). Direct USB has no client key and so
     // no slot: the slot check refuses it.
@@ -349,12 +359,6 @@ fn approve_bundle(
     let Some(client_pubkey) = heartwood_common::policy::decode_client_key(client_hex) else {
         return refuse(BundleError::Unauthorised);
     };
-    // The personas are the master's own: a request addressed to a persona
-    // would derive under that persona's tree.
-    if served_persona(personas, secp, master_secret).is_some() {
-        log::warn!("heartwood_approve_bundle: refused — addressed to a persona");
-        return build_error_json(&request.id, -1, nip46::PERSONA_DERIVE_NEEDS_MASTER);
-    }
     // Keys the press would derive are pure computations: compare them with
     // `expect` now, so a mismatch is refused before the card.
     for (name, registered) in &plan.resolved {

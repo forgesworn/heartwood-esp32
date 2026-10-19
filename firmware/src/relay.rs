@@ -5811,6 +5811,29 @@ fn refuse_waiting_full_access(ctx: &mut SignCtx) {
     }
 }
 
+/// Whether this relay request is a copy of the bundle a waiting FULL ACCESS
+/// card already holds (review round 2, N1): the same client key, the same
+/// inner request id and the same params, republished (after a relay
+/// reconnect, or to another relay with a new outer event id) to the same
+/// identity. Ignored like
+/// an outer-id duplicate, so the owner's own retry does not close the
+/// owner's own card. Only the client-key holder can make one: the inner id
+/// lives inside NIP-44 under the conversation key of `ev.pubkey`, and an
+/// event that does not decrypt is dropped before dispatch. A different id,
+/// or different params, from the same client is a new bundle, and the
+/// one-card rule applies.
+fn is_waiting_bundle_copy(ctx: &SignCtx, client_hex: &str, target_pk: &[u8; 32], request: &nip46::Nip46Request) -> bool {
+    request.method == heartwood_common::owner_pairing::BUNDLE_METHOD
+        && ctx.button_cards.iter().filter(|card| is_full_access_card(card)).any(|card| {
+            card.key.client_hex == client_hex
+                && card.target_pk == *target_pk
+                && card
+                    .asks
+                    .iter()
+                    .any(|a| a.ask.request.id == request.id && a.ask.request.params == request.params)
+        })
+}
+
 /// Whether this card pages five words at rest and arms only once they have
 /// all been shown (`phone_unlock::EnrolGate`): the enrol card, and the FULL
 /// ACCESS card (review round W2).
@@ -8152,6 +8175,13 @@ fn handle_nip46_event(
         }
     };
     drop(plaintext);
+    if is_waiting_bundle_copy(ctx, &ev.pubkey, target_pk, &request) {
+        log::info!(
+            "[relay] heartwood_approve_bundle {} is a copy of the bundle on its card; ignoring",
+            request.id
+        );
+        return Ok(());
+    }
     let audit = sign_audit_draft(
         &request,
         client_label(ctx, slot, &ev.pubkey),

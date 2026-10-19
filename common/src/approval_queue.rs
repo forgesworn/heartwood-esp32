@@ -72,7 +72,7 @@ pub fn login_kind_key(base: &str, seq: u32) -> String {
 /// so a second proof or a second sender joining the first would be approved
 /// on a hold that showed the owner neither. The FULL ACCESS card
 /// (`heartwood_approve_bundle`, one-hold pairing spec 4.2) names one phone's
-/// three words and one scope: a second bundle sharing its hold would grant a
+/// five words and one scope: a second bundle sharing its hold would grant a
 /// phone the owner never compared.
 pub fn never_shares_card(method: &str) -> bool {
     matches!(

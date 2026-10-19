@@ -96,29 +96,36 @@ where
 }
 
 /// [`run_approval_loop`] for the FULL ACCESS card (one-hold pairing spec
-/// 4.2): approved only by a [`crate::card_hold::FULL_ACCESS_HOLD_MS`] (5 s)
-/// hold, a shorter press declines, and `show_hold` draws the hold screen
-/// (the words and the hold's progress, 0 to 100) while the button is down,
-/// in place of the generic CONFIRMING screen.
+/// 4.2): at rest it pages its five words two at a time on the enrol card's
+/// gate (`phone_unlock::EnrolGate`, review round W2), and A does nothing,
+/// neither approving nor declining, until every page has had its full dwell,
+/// 12 s have passed and the button has been seen up since. Then it is
+/// approved only by a [`crate::card_hold::FULL_ACCESS_HOLD_MS`] (5 s) hold
+/// counted from the hold screen's draw, and a shorter press declines.
+/// `show_fn` gets the remaining seconds, the page to show and whether a hold
+/// counts; `show_hold` draws the hold screen (all five words and the hold's
+/// progress, 0 to 100) while the button is down, in place of the generic
+/// CONFIRMING screen. B, where the board has one, cancels at any time.
 pub fn run_full_access_approval_loop<F, H>(
     display: &mut Display<'_>,
     buttons: &crate::button::Buttons<'_>,
     timeout_secs: u64,
-    mut show_fn: F,
+    show_fn: F,
     show_hold: H,
 ) -> ApprovalResult
 where
-    F: FnMut(&mut Display<'_>, u32),
+    F: FnMut(&mut Display<'_>, u32, usize, bool),
     H: FnMut(&mut Display<'_>, u32),
 {
+    let mut gate = heartwood_common::phone_unlock::EnrolGate::default();
     let result = approval_loop_inner(
         display,
         buttons,
         timeout_secs,
         crate::card_hold::FULL_ACCESS_HOLD_MS,
         true,
-        None,
-        |d, remaining, _, _| show_fn(d, remaining),
+        Some(&mut gate),
+        show_fn,
         show_hold,
     );
     crate::button::clear_press_edge();
@@ -132,7 +139,7 @@ fn approval_loop_inner<F, H>(
     timeout_secs: u64,
     // The hold that approves this card (`card_hold::hold_ms`).
     hold: u32,
-    // FULL ACCESS: the hold counts only from when the hold screen (its three
+    // FULL ACCESS: the hold counts only from when the hold screen (its five
     // words) is on the glass, not from the press (review m1).
     count_from_hold_screen: bool,
     mut gate: Option<&mut heartwood_common::phone_unlock::EnrolGate>,
@@ -150,8 +157,8 @@ where
     let mut press_start = Instant::now();
     let mut last_pct: u32 = 101; // force first draw
     let mut last_view: Option<(usize, bool)> = None;
-    // The enrol card: `oled::draw_generation` just after its face was last
-    // drawn, to tell when something else has drawn over it.
+    // A gated card (enrol, FULL ACCESS): `oled::draw_generation` just after
+    // its face was last drawn, to tell when something else has drawn over it.
     let mut drawn_gen: Option<u32> = None;
     // Every card, gated or not, arms only once A has been seen up for
     // `button_arm::SETTLE_UP_MS`: a hold already down when the card appears

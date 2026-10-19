@@ -777,30 +777,35 @@ fn draw_full_access_header<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout)
 }
 
 /// The FULL ACCESS card's resting text (mirrors `oled::show_full_access`):
-/// label, scope, the style's lines and the hold line, centred, small font,
-/// and the seconds left. The header bar and the countdown bar are drawn
+/// words page `page` in the geometry's word font, then the scope, the
+/// style's lines and the hint (`COMPARE ALL 5 WORDS` until `armed`, then the
+/// hold line), centred, small font, and the page marker and seconds left on
+/// the countdown row. The header bar and the countdown bar are drawn
 /// separately.
 fn full_access_items(
     l: &Layout,
-    label: &str,
+    words: &[&str; heartwood_common::owner_pairing::PAIR_WORDS],
     act_as: &[String],
     style_kind: heartwood_common::owner_pairing::Style,
     secs: u32,
+    page: usize,
+    armed: bool,
 ) -> Vec<Item> {
+    use heartwood_common::owner_pairing as op;
     let g = l.full_access_geometry();
     let small = l.font_small();
-    let card = heartwood_common::owner_pairing::full_access_card(label, l.span_chars(None, small), &[0x42; 32], act_as, style_kind);
-    let mut lines: Vec<(String, Rgb565)> = vec![(card.label.clone(), FG), (card.scope.to_string(), WARN)];
+    let card = op::full_access_card("", 3, &[0x42; 32], act_as, style_kind);
+    let line = op::pair_word_line(words, page);
+    let wx = l.center_in_span(None, line.len() as i32 * Layout::glyph_w(g.word_font));
+    let mut items: Vec<Item> = vec![(line, g.word_font, 1, WARN, Point::new(wx, g.word_y))];
+    let mut lines: Vec<(String, Rgb565)> = vec![(card.scope.to_string(), WARN)];
     lines.extend(card.style_lines.iter().map(|line| (line.to_string(), FG)));
-    lines.push((card.hold.to_string(), ACCENT));
-    let mut items: Vec<Item> = lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, (text, colour))| {
-            let x = l.center_in_span(None, text.len() as i32 * Layout::glyph_w(small));
-            (text, small, 1, colour, Point::new(x, g.first_y + i as i32 * g.pitch))
-        })
-        .collect();
+    lines.push((op::full_access_hint(armed).to_string(), if armed { ACCENT } else { MUTED }));
+    items.extend(lines.into_iter().enumerate().map(|(i, (text, colour))| {
+        let x = l.center_in_span(None, text.len() as i32 * Layout::glyph_w(small));
+        (text, small, 1, colour, Point::new(x, g.first_y + i as i32 * g.pitch))
+    }));
+    items.push((phone_unlock::enrol_page_marker(page).to_string(), small, 1, MUTED, Point::new(g.marker_x, g.secs_y)));
     items.push((format!("{secs}s"), small, 1, FG, Point::new(g.secs_x, g.secs_y)));
     items
 }
@@ -831,36 +836,41 @@ fn draw_full_access_bar<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, se
     }
 }
 
-/// The FULL ACCESS card at rest, `secs` seconds left.
+/// The FULL ACCESS card at rest, `secs` seconds left, on words page `page`.
+#[allow(clippy::too_many_arguments)]
 fn draw_full_access<D: DrawTarget<Color = Rgb565> + Dimensions>(
     d: &mut D,
-    label: &str,
+    words: &[&str; heartwood_common::owner_pairing::PAIR_WORDS],
     act_as: &[String],
     style_kind: heartwood_common::owner_pairing::Style,
     secs: u32,
+    page: usize,
+    armed: bool,
 ) {
     let l = layout_of(d);
     d.clear(BG).ok();
     draw_full_access_header(d, &l);
-    for item in full_access_items(&l, label, act_as, style_kind, secs) {
+    for item in full_access_items(&l, words, act_as, style_kind, secs, page, armed) {
         draw_item(d, &item);
     }
     draw_full_access_bar(d, &l, secs, heartwood_common::owner_pairing::FULL_ACCESS_CARD_SECS as u32);
 }
 
-/// The hold screen's text (mirrors `oled::show_full_access_hold`): the three
-/// words (`w1 w2`, `w3`) at the largest font that fits, and the hold line.
-fn full_access_hold_items(l: &Layout, words: &[&str; 3]) -> Vec<Item> {
+/// The hold screen's text (mirrors `oled::show_full_access_hold`): the label
+/// (small font, shortened past the span), then all five words on three lines
+/// (`w1 w2`, `w3 w4`, `w5`) at the largest font that fits.
+fn full_access_hold_items(l: &Layout, label: &str, words: &[&str; heartwood_common::owner_pairing::PAIR_WORDS]) -> Vec<Item> {
+    use heartwood_common::owner_pairing as op;
     let h = l.full_access_hold_geometry();
     let small = l.font_small();
-    let first = format!("{} {}", words[0], words[1]);
     let centred = |text: &str, font: &MonoFont, y: i32| Point::new(l.center_in_span(None, text.len() as i32 * Layout::glyph_w(font)), y);
-    let hint = heartwood_common::owner_pairing::HOLD_LINE.to_string();
-    vec![
-        (first.clone(), h.word_font, 1, WARN, centred(&first, h.word_font, h.word_y[0])),
-        (words[2].to_string(), h.word_font, 1, WARN, centred(words[2], h.word_font, h.word_y[1])),
-        (hint.clone(), small, 1, MUTED, centred(&hint, small, h.hint_y)),
-    ]
+    let label = op::full_access_card(label, l.span_chars(None, small), &[0x42; 32], &[], op::Style::Everyday).label;
+    let mut items: Vec<Item> = vec![(label.clone(), small, 1, FG, centred(&label, small, h.label_y))];
+    for (page, y) in h.word_y.into_iter().enumerate() {
+        let line = op::pair_word_line(words, page);
+        items.push((line.clone(), h.word_font, 1, WARN, centred(&line, h.word_font, y)));
+    }
+    items
 }
 
 /// The hold screen's progress bar at `pct`.
@@ -886,24 +896,29 @@ fn draw_full_access_hold_bar<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layou
 }
 
 /// The FULL ACCESS card's hold screen, `pct` of the 5 s hold done.
-fn draw_full_access_hold<D: DrawTarget<Color = Rgb565> + Dimensions>(d: &mut D, words: &[&str; 3], pct: u32) {
+fn draw_full_access_hold<D: DrawTarget<Color = Rgb565> + Dimensions>(
+    d: &mut D,
+    label: &str,
+    words: &[&str; heartwood_common::owner_pairing::PAIR_WORDS],
+    pct: u32,
+) {
     let l = layout_of(d);
     d.clear(BG).ok();
     draw_full_access_header(d, &l);
-    for item in full_access_hold_items(&l, words) {
+    for item in full_access_hold_items(&l, label, words) {
         draw_item(d, &item);
     }
     draw_full_access_hold_bar(d, &l, pct);
 }
 
-/// Three of the longest words the pairing words can be (eight letters).
-fn longest_pair_words() -> [&'static str; 3] {
+/// Five of the longest words the pairing words can be (eight letters).
+fn longest_pair_words() -> [&'static str; heartwood_common::owner_pairing::PAIR_WORDS] {
     let long: Vec<&'static str> = (0..heartwood_common::spoken_words::WORDLIST_LEN)
         .map(heartwood_common::spoken_words::word)
         .filter(|w| w.len() == heartwood_common::spoken_words::WORDLIST_MAX_LEN)
-        .take(3)
+        .take(heartwood_common::owner_pairing::PAIR_WORDS)
         .collect();
-    [long[0], long[1], long[2]]
+    core::array::from_fn(|i| long[i])
 }
 
 fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565>)) {
@@ -939,21 +954,26 @@ fn main() {
             continue;
         }
         render(&format!("ready-{b}"), w, h, |d| draw_ready(d));
-        // The FULL ACCESS card (one-hold pairing spec 4.2), both styles, a
-        // label past the panel's width, then its hold screen with the
-        // longest words.
+        // The FULL ACCESS card (one-hold pairing spec 4.2): every words page
+        // at rest with the longest words, Extra careful once armed, then the
+        // hold screen with a label past the panel's width.
         {
             use heartwood_common::owner_pairing::Style;
             let persona = vec!["persona".to_string()];
             let both = vec!["natural-person".to_string(), "persona".to_string()];
-            render(&format!("full-access-everyday-{b}"), w, h, |d| {
-                draw_full_access(d, "My Signet on the kitchen tablet, spare", &persona, Style::Everyday, 45)
-            });
-            render(&format!("full-access-careful-{b}"), w, h, |d| {
-                draw_full_access(d, "My Signet", &both, Style::Careful, 20)
-            });
             let long = longest_pair_words();
-            render(&format!("full-access-hold-{b}"), w, h, |d| draw_full_access_hold(d, &long, 60));
+            let vector = heartwood_common::owner_pairing::pair_words(&[0x42; 32]);
+            for page in 0..heartwood_common::owner_pairing::PAIR_WORD_PAGES {
+                render(&format!("full-access-everyday-p{}-{b}", page + 1), w, h, |d| {
+                    draw_full_access(d, &long, &persona, Style::Everyday, 45 - 4 * page as u32, page, false)
+                });
+            }
+            render(&format!("full-access-careful-armed-{b}"), w, h, |d| {
+                draw_full_access(d, &vector, &both, Style::Careful, 20, 0, true)
+            });
+            render(&format!("full-access-hold-{b}"), w, h, |d| {
+                draw_full_access_hold(d, "My Signet on the kitchen tablet, spare", &long, 60)
+            });
         }
         let tags = match b {
             "heltec" => Some(HELTEC_TAGS),
@@ -1770,67 +1790,88 @@ mod full_access_card_tests {
     }
 
     /// The fit question spec 4.2 leaves for review: at the panel's own
-    /// fonts, does the whole card (header, label, three words on two lines,
-    /// scope, style line(s), hold line) fit one screen above the countdown?
-    /// It does not, for either style, on the Heltec or the T-Display, which
-    /// is why the words move to the hold screen. This test is the record: if
-    /// a font or panel change ever made it fit, it fails, and the one-screen
-    /// layout should be reconsidered.
+    /// small font, does the whole card (header, label, five words on three
+    /// lines, scope, style line(s), hold line) fit one screen above the
+    /// countdown? Not on the Heltec or the T-Display, which is why the words
+    /// page at rest and the label moves to the hold screen. This
+    /// test is the record: if a font or panel change ever made it fit, it
+    /// fails, and the one-screen layout should be reconsidered.
     #[test]
     fn the_whole_card_does_not_fit_one_screen_at_the_current_font() {
         let fits = |w: i32, h: i32, style: Style| {
-            let all_lines = op::full_access_card("x", 24, &[1; 32], &act_as(false), style).lines().len() - 1;
-            Layout::new(w, h).full_access_fits(all_lines, Layout::FULL_ACCESS_LINE_CHARS)
+            let l = Layout::new(w, h);
+            let g = l.full_access_geometry();
+            let all_lines = op::full_access_card("x", 24, &[1; 32], &act_as(false), style).lines().len() as i32 - 1;
+            g.bar.3 + l.s(1) + all_lines * Layout::glyph_h(l.font_small()) < g.countdown.1
         };
-        // The Heltec, the panel the card was written for: neither style.
-        assert!(!fits(128, 64, Style::Everyday));
-        assert!(!fits(128, 64, Style::Careful));
-        // The T-Display would hold Everyday's seven lines but not Extra
-        // careful's eight. One layout everywhere, so the card reads the same
-        // on every board.
-        assert!(fits(240, 135, Style::Everyday));
-        assert!(!fits(240, 135, Style::Careful));
+        // The Heltec, the panel the card was written for, and the
+        // T-Display: neither style.
+        for (w, h) in [(128, 64), (240, 135)] {
+            for style in [Style::Everyday, Style::Careful] {
+                assert!(!fits(w, h, style), "{w}x{h} {style:?}");
+            }
+        }
+        // The C6, either way up, would take either. One layout everywhere,
+        // so the card reads the same on every board.
+        for (w, h) in [(172, 320), (320, 172)] {
+            assert!(fits(w, h, Style::Everyday) && fits(w, h, Style::Careful), "{w}x{h}");
+        }
     }
 
-    /// What the card keeps at rest (label, scope, style lines, hold line)
-    /// fits under the inverted header and above the countdown on every
-    /// panel, for both styles, without shortening a fixed line.
+    /// What the card keeps at rest (one words line, then scope, style lines
+    /// and hint) fits under the inverted header and above the countdown on
+    /// every panel, for both styles, without shortening a fixed line, and the
+    /// words line holds two of the longest words.
     #[test]
     fn the_resting_card_fits_every_panel_in_both_styles() {
         for (w, h) in PANELS {
             let l = Layout::new(w as i32, h as i32);
+            let g = l.full_access_geometry();
+            let (left, right) = l.text_span(None);
+            assert!(Layout::FULL_ACCESS_WORD_LINE_CHARS * Layout::glyph_w(g.word_font) <= right - left, "{w}x{h}");
+            assert!(g.word_font.character_size.width >= l.font_small().character_size.width);
             for style in [Style::Everyday, Style::Careful] {
-                let rest = 3 + style.card_lines().len();
+                let rest = 2 + style.card_lines().len();
                 assert!(l.full_access_fits(rest, Layout::FULL_ACCESS_LINE_CHARS), "{w}x{h} {style:?}");
                 let card = op::full_access_card(LONG_LABEL, l.span_chars(None, l.font_small()), &[1; 32], &act_as(true), style);
-                for line in card.lines().iter().skip(4) {
+                for line in card.lines().iter().skip(2 + op::PAIR_WORD_PAGES) {
                     assert!(line.len() as i32 <= Layout::FULL_ACCESS_LINE_CHARS, "{line:?}");
                 }
+                assert!(op::COMPARE_LINE.len() as i32 <= Layout::FULL_ACCESS_LINE_CHARS);
             }
         }
+        // The Heltec's span holds exactly the longest fixed line.
+        let heltec = Layout::new(128, 64);
+        assert_eq!(heltec.span_chars(None, heltec.font_small()) as i32, Layout::FULL_ACCESS_LINE_CHARS);
     }
 
     #[test]
     fn the_resting_card_never_overprints_itself() {
+        let long = longest_pair_words();
         for (w, h) in PANELS {
             for style in [Style::Everyday, Style::Careful] {
                 for real_name in [false, true] {
-                    for label in ["My Signet", LONG_LABEL] {
-                        let l = Layout::new(w as i32, h as i32);
-                        let items = full_access_items(&l, label, &act_as(real_name), style, 45);
-                        let mut layers: Vec<(String, Vec<Point>)> = items
-                            .into_iter()
-                            .map(|item| (item.0.clone(), lit(move |d| draw_item(d, &item), w, h)))
-                            .collect();
-                        layers.push(("header bar".into(), lit(move |d| draw_full_access_header(d, &l), w, h)));
-                        layers.push(("countdown bar".into(), lit(move |d| draw_full_access_bar(d, &l, 45, 45), w, h)));
-                        assert_apart(w, h, &format!("{style:?} {label:?}"), &layers);
-                        // The lines are the card's own, word for word.
-                        let lines: Vec<String> = layers.iter().map(|(t, _)| t.clone()).collect();
-                        assert!(lines.contains(&op::HOLD_LINE.to_string()));
-                        assert!(lines.contains(&if real_name { op::SCOPE_PERSONA_AND_REAL_NAME } else { op::SCOPE_PERSONA_ONLY }.to_string()));
-                        for line in style.card_lines() {
-                            assert!(lines.contains(&line.to_string()), "{w}x{h}: {line:?} missing");
+                    for page in 0..op::PAIR_WORD_PAGES {
+                        for armed in [false, true] {
+                            let l = Layout::new(w as i32, h as i32);
+                            let items = full_access_items(&l, &long, &act_as(real_name), style, 45, page, armed);
+                            let mut layers: Vec<(String, Vec<Point>)> = items
+                                .into_iter()
+                                .map(|item| (item.0.clone(), lit(move |d| draw_item(d, &item), w, h)))
+                                .collect();
+                            layers.push(("header bar".into(), lit(move |d| draw_full_access_header(d, &l), w, h)));
+                            layers.push(("countdown bar".into(), lit(move |d| draw_full_access_bar(d, &l, 45, 45), w, h)));
+                            assert_apart(w, h, &format!("{style:?} page {page} armed {armed}"), &layers);
+                            // The lines are the card's own, word for word.
+                            let lines: Vec<String> = layers.iter().map(|(t, _)| t.clone()).collect();
+                            assert_eq!(lines[0], op::pair_word_line(&long, page));
+                            assert!(lines.contains(&phone_unlock::enrol_page_marker(page).to_string()));
+                            assert!(lines.contains(&op::full_access_hint(armed).to_string()));
+                            assert_eq!(lines.contains(&op::HOLD_LINE.to_string()), armed, "no hold offered before the gate");
+                            assert!(lines.contains(&if real_name { op::SCOPE_PERSONA_AND_REAL_NAME } else { op::SCOPE_PERSONA_ONLY }.to_string()));
+                            for line in style.card_lines() {
+                                assert!(lines.contains(&line.to_string()), "{w}x{h}: {line:?} missing");
+                            }
                         }
                     }
                 }
@@ -1839,26 +1880,30 @@ mod full_access_card_tests {
     }
 
     #[test]
-    fn the_hold_screen_shows_the_longest_words_whole() {
+    fn the_hold_screen_shows_the_label_and_all_five_longest_words_whole() {
         let words = longest_pair_words();
         assert!(words.iter().all(|w| w.len() == 8));
         for (w, h) in PANELS {
-            let l = Layout::new(w as i32, h as i32);
-            let items = full_access_hold_items(&l, &words);
-            assert_eq!(items[0].0, format!("{} {}", words[0], words[1]));
-            assert_eq!(items[1].0, words[2]);
-            let mut layers: Vec<(String, Vec<Point>)> = items
-                .into_iter()
-                .map(|item| (item.0.clone(), lit(move |d| draw_item(d, &item), w, h)))
-                .collect();
-            layers.push(("header bar".into(), lit(move |d| draw_full_access_header(d, &l), w, h)));
-            layers.push(("hold bar".into(), lit(move |d| draw_full_access_hold_bar(d, &l, 100), w, h)));
-            assert_apart(w, h, "hold screen", &layers);
+            for label in ["My Signet", LONG_LABEL] {
+                let l = Layout::new(w as i32, h as i32);
+                let items = full_access_hold_items(&l, label, &words);
+                assert_eq!(items.len(), 1 + op::PAIR_WORD_PAGES);
+                for page in 0..op::PAIR_WORD_PAGES {
+                    assert_eq!(items[1 + page].0, op::pair_word_line(&words, page));
+                }
+                let mut layers: Vec<(String, Vec<Point>)> = items
+                    .into_iter()
+                    .map(|item| (item.0.clone(), lit(move |d| draw_item(d, &item), w, h)))
+                    .collect();
+                layers.push(("header bar".into(), lit(move |d| draw_full_access_header(d, &l), w, h)));
+                layers.push(("hold bar".into(), lit(move |d| draw_full_access_hold_bar(d, &l, 100), w, h)));
+                assert_apart(w, h, &format!("hold screen {label:?}"), &layers);
+            }
         }
-        // On the Heltec the words are in the body font (7x14), larger than
-        // every other line on the card.
+        // On the Heltec the words are in the header font (6x10), larger than
+        // the card's small-font lines.
         let heltec = Layout::new(128, 64).full_access_hold_geometry();
-        assert_eq!(heltec.word_font.character_size.width, 7);
+        assert_eq!(heltec.word_font.character_size.width, 6);
     }
 
     /// The header is cut out of a filled bar: every pixel of its text is
@@ -1869,7 +1914,7 @@ mod full_access_card_tests {
             let l = Layout::new(w as i32, h as i32);
             let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
             d.clear(BG).ok();
-            draw_full_access(&mut d, "My Signet", &act_as(false), Style::Everyday, 45);
+            draw_full_access(&mut d, &longest_pair_words(), &act_as(false), Style::Everyday, 45, 0, false);
             let g = l.full_access_geometry();
             let hx = l.center_x(op::FULL_ACCESS_HEADER.len() as i32 * Layout::glyph_w(l.font_header()));
             let ink = lit(move |d| { Text::new(op::FULL_ACCESS_HEADER, Point::new(hx, g.header_y), style(l.font_header(), FG)).draw(d).ok(); }, w, h);

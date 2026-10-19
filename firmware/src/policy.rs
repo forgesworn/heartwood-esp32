@@ -508,18 +508,20 @@ impl PolicyEngine {
 
     /// `heartwood_owner_narrow` (spec 4.6) on the caller's own slot: sets
     /// Extra careful's list when the kinds list is empty, otherwise nothing.
-    /// Never widens. `Unauthorised` without the owner mark. Waiting cards are
-    /// withdrawn only when the slot actually changed. True when it did.
+    /// Never widens: a custom list (an operator narrowed it) stays as it is.
+    /// `Unauthorised` without the owner mark. Waiting cards are withdrawn
+    /// only when the slot actually changed. Whether it did, and the style now
+    /// in force.
     pub fn owner_narrow(
         &mut self,
         master_slot: u8,
         client_pubkey: &str,
-    ) -> Result<bool, heartwood_common::owner_pairing::BundleError> {
-        let changed = self.with_slots_keeping_approvals(master_slot, |slots| {
+    ) -> Result<(bool, heartwood_common::owner_pairing::SlotStyle), heartwood_common::owner_pairing::BundleError> {
+        let (changed, style) = self.with_slots_keeping_approvals(master_slot, |slots| {
             heartwood_common::owner_pairing::owner_narrow(find_slot_by_pubkey_mut(slots, client_pubkey))
         })?;
         self.slots_dirty |= changed;
-        Ok(changed)
+        Ok((changed, style))
     }
 
     /// Find or create a client session. Returns mutable reference.
@@ -1660,22 +1662,38 @@ mod tests {
 
     #[test]
     fn narrow_never_widens_and_needs_the_mark() {
-        use heartwood_common::owner_pairing::BundleError;
+        use heartwood_common::owner_pairing::{BundleError, SlotStyle};
         let (mut engine, index) = paired_engine();
         assert_eq!(engine.owner_narrow(0, CLIENT), Err(BundleError::Unauthorised));
         press(&mut engine, index, Style::Everyday);
         let epoch = engine.approval_epoch();
-        assert_eq!(engine.owner_narrow(0, CLIENT), Ok(true));
+        assert_eq!(engine.owner_narrow(0, CLIENT), Ok((true, SlotStyle::Careful)));
         assert_eq!(slot(&engine, index).allowed_kinds, CAREFUL_KINDS.to_vec());
         let epoch2 = engine.approval_epoch();
         assert_ne!(epoch, epoch2);
-        // Already careful (or any list): nothing changes, nothing withdrawn.
-        assert_eq!(engine.owner_narrow(0, CLIENT), Ok(false));
+        // Already careful: nothing changes, nothing withdrawn.
+        assert_eq!(engine.owner_narrow(0, CLIENT), Ok((false, SlotStyle::Careful)));
         assert!(engine.approval_is_current(epoch2));
+        // An operator narrowed it: custom, and narrow leaves it as it is.
         assert!(engine.update_slot(0, index, None, None, Some(vec![30078]), None));
-        assert_eq!(engine.owner_narrow(0, CLIENT), Ok(false));
+        assert_eq!(engine.owner_narrow(0, CLIENT), Ok((false, SlotStyle::Custom)));
         assert_eq!(slot(&engine, index).allowed_kinds, vec![30078]);
         assert_eq!(engine.owner_narrow(0, &"dd".repeat(32)), Err(BundleError::Unauthorised));
+    }
+
+    #[test]
+    fn a_bundle_replaces_the_list_an_operator_narrowed_on_an_owner_pairing() {
+        // Review round W5: the hold is the consent, so a marked slot's
+        // narrowed list is replaced by the chosen style's list, either way.
+        for (style, expected) in [(Style::Everyday, vec![]), (Style::Careful, CAREFUL_KINDS.to_vec())] {
+            let (mut engine, index) = paired_engine();
+            press(&mut engine, index, Style::Careful);
+            assert!(engine.update_slot(0, index, None, None, Some(vec![30078]), None));
+            assert!(heartwood_common::owner_pairing::check_bundle_slot(Some(slot(&engine, index)), CLIENT).is_ok());
+            assert_eq!(engine.apply_bundle_press(0, CLIENT, &[[0x22; 32]], style), Ok(true), "{style:?}");
+            assert_eq!(slot(&engine, index).allowed_kinds, expected, "{style:?}");
+            assert!(slot_has_owner_mark(slot(&engine, index)));
+        }
     }
 
     #[test]

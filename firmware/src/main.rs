@@ -285,6 +285,11 @@ pub fn uptime_s() -> u64 {
     (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u64
 }
 
+/// Milliseconds since boot, on the same clock as [`uptime_s`].
+pub fn uptime_ms() -> u64 {
+    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000) as u64
+}
+
 /// One page of the idle info carousel in the USB-bridged loop. Page 0 is the
 /// boot status card; short presses cycle the network, device and notes pages. The
 /// radio is off by definition here — the WiFi tier runs its own loop — so the

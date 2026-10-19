@@ -707,6 +707,11 @@ pub fn enrol_page_marker(page: usize) -> &'static str {
 /// a hold, or a tap, that began before that never approves or declines
 /// anything, and a hold on page 1 alone would rest on two words, 22 bits,
 /// which a compromised browser grinds in moments. Armed stays armed.
+///
+/// The FULL ACCESS card (one-hold pairing, `owner_pairing`) pages its five
+/// pairing words through this same gate on both loops: same pages, dwell,
+/// gate and window (pinned by
+/// `the_full_access_card_pages_on_the_enrol_gate`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EnrolGate {
     page: usize,
@@ -1934,6 +1939,28 @@ mod tests {
         let mut jumpy = EnrolGate::default();
         let seen: Vec<usize> = [0, 9_000, 9_100, 30_000, 30_100, 45_000].iter().map(|ms| jumpy.step(*ms, false)).collect();
         assert_eq!(seen, [0, 1, 1, 2, 2, 0]);
+    }
+
+    #[test]
+    fn the_full_access_card_pages_on_the_enrol_gate() {
+        // Review round W2: the FULL ACCESS card's five words page at rest on
+        // this gate, so its pages, its words and its window must be the
+        // enrol card's, or the gate's reasoning (every word on screen before
+        // a hold counts, and more than 30 s left to hold) does not carry.
+        use crate::owner_pairing;
+        assert_eq!(owner_pairing::PAIR_WORDS, REQUEST_CODE_WORDS);
+        assert_eq!(owner_pairing::PAIR_WORD_PAGES, ENROL_PAGES);
+        assert_eq!(owner_pairing::FULL_ACCESS_CARD_SECS, u64::from(ENROL_CARD_SECS));
+        let words = owner_pairing::pair_words(&[7; 32]);
+        for page in 0..ENROL_PAGES {
+            let shown: Vec<usize> = owner_pairing::pair_word_page(&words, page).iter().map(|(place, _)| *place).collect();
+            let marker = enrol_page_marker(page);
+            assert!(marker.starts_with(&shown[0].to_string()), "{marker} for {shown:?}");
+            assert!(marker.contains(&shown[shown.len() - 1].to_string()));
+        }
+        // Over the hold that follows the gate: 45 s less the 12 s gate
+        // leaves room for the 5 s hold many times over.
+        assert!(owner_pairing::FULL_ACCESS_CARD_SECS * 1000 - ENROL_GATE_MS > 6 * owner_pairing::FULL_ACCESS_HOLD_MS);
     }
 
     #[test]

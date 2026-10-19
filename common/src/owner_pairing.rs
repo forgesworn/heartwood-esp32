@@ -59,8 +59,16 @@ pub const VAULT_EVENT_KIND: u64 = 30078;
 /// the spec's order; [`is_careful_kinds`] compares as a set.
 pub const CAREFUL_KINDS: [u64; 2] = [VAULT_EVENT_KIND, LOGIN_EVENT_KIND];
 
-/// Most personas one bundle may name (spec 4.1).
-pub const MAX_BUNDLE_PERSONAS: usize = 4;
+/// The only names a bundle may carry, in `personas` and in `act_as` (review
+/// round W6): the owner's persona and real identity, which is all My Signet
+/// sends. Any other name is a malformed bundle, so the card's scope line
+/// ([`SCOPE_PERSONA_ONLY`] / [`SCOPE_PERSONA_AND_REAL_NAME`]) always names
+/// everything the hold grants. More names can come later, with a card that
+/// names them.
+pub const BUNDLE_NAMES: [&str; 2] = [PERSONA, NATURAL_PERSON];
+/// Most personas one bundle may name (spec 4.1): every name in
+/// [`BUNDLE_NAMES`], once.
+pub const MAX_BUNDLE_PERSONAS: usize = BUNDLE_NAMES.len();
 /// Most names a slot's `allowed_methods` may hold (`slot_codec`'s cap).
 pub const MAX_SLOT_METHODS: usize = crate::slot_codec::MAX_METHODS;
 
@@ -76,7 +84,10 @@ pub const BUNDLE_GRANTED_METHODS: [&str; 5] = [
 
 /// The owner's real identity's registry name. Never granted by Rule D.
 pub const NATURAL_PERSON: &str = "natural-person";
-/// Names under this prefix are children's keys: never in a bundle.
+/// The owner's default persona's registry name.
+pub const PERSONA: &str = "persona";
+/// Names under this prefix are children's keys: never in a bundle (outside
+/// [`BUNDLE_NAMES`]), and never recorded by Rule D when real.
 pub const DEPENDANT_PREFIX: &str = "dependant-";
 
 /// The full-access card's hold, in milliseconds (spec 4.2). Every other card
@@ -96,15 +107,44 @@ pub const SCOPE_PERSONA_ONLY: &str = "PERSONA ONLY";
 pub const SCOPE_PERSONA_AND_REAL_NAME: &str = "PERSONA + REAL NAME";
 /// What Everyday lets the phone do alone.
 pub const EVERYDAY_LINES: &[&str] = &["SIGN IN, POST, BACKUP"];
-/// What Extra careful lets the phone do alone, and what still asks.
-pub const CAREFUL_LINES: &[&str] = &["SIGNS ALONE: BACKUPS", "ASKS: EVERYTHING ELSE"];
+/// What Extra careful lets the phone do alone, and what still asks. Backups
+/// and any other app data (kind 30078) under a granted identity sign alone,
+/// so the line names both (review round W9): `SIGNS ALONE: BACKUPS, APP
+/// DATA` is 30 characters, past the 24 the Heltec's span holds, so the
+/// shorter form drops "SIGNS" and never the claim. Relay logins (plain AUTH)
+/// also sign alone; My Signet's style copy says so.
+pub const CAREFUL_LINES: &[&str] = &["ALONE: BACKUPS, APP DATA", "ASKS: EVERYTHING ELSE"];
 /// The card's last line.
 pub const HOLD_LINE: &str = "HOLD 5 SECONDS";
+/// The board's hint line until every words page has had its full dwell
+/// (review round W2): the comparison, and no hold offered yet.
+pub const COMPARE_LINE: &str = "COMPARE ALL 5 WORDS";
+
+/// The board's hint line at rest: [`COMPARE_LINE`] until a hold counts
+/// (`armed`), then [`HOLD_LINE`].
+pub fn full_access_hint(armed: bool) -> &'static str {
+    if armed {
+        HOLD_LINE
+    } else {
+        COMPARE_LINE
+    }
+}
 
 /// Domain separator for the pairing words (spec 4.2), NUL included.
 pub const PAIR_WORDS_DOMAIN: &[u8] = b"heartwood-pair-words\0";
-/// How many words the full-access card shows.
-pub const PAIR_WORDS: usize = 3;
+/// How many words the full-access card shows (review round W1): five, 55
+/// bits, the phone-enrol card's bar. Three (33 bits) could be ground by a
+/// client that holds its own Everything slot and knows the phone's client
+/// key ahead of time.
+pub const PAIR_WORDS: usize = 5;
+/// How many pages the card turns through at rest, two words a page: 1 and
+/// 2, then 3 and 4, then 5 (the enrol card's pages; firmware turns them with
+/// `phone_unlock::EnrolGate`).
+pub const PAIR_WORD_PAGES: usize = PAIR_WORDS.div_ceil(2);
+/// The least gap, in seconds, between a FULL ACCESS card closing (approved,
+/// declined, expired or refused) and the next bundle that may raise one
+/// (review round W3). A bundle sooner than this is refused without a card.
+pub const FULL_ACCESS_COOLDOWN_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -123,8 +163,6 @@ pub enum BundleError {
     PersonaMissing,
     /// `-3 pubkey mismatch`
     PubkeyMismatch,
-    /// `-3 bundle names a child`
-    NamesChild,
     /// `unauthorised`: unbound client, strict slot, or (narrow) no mark.
     Unauthorised,
     /// The existing escalate-slot refusal
@@ -144,18 +182,28 @@ pub enum BundleError {
     ApprovalListFull,
     /// `-4 method list full`
     MethodListFull,
+    /// `unauthorised: another full access request arrived` (review round
+    /// W3): a bundle came while another was waiting, queued or on screen.
+    /// Both get this reply, and the waiting card closes with nothing granted.
+    AnotherFullAccess,
+    /// `unauthorised: full access card shown recently` (review round W3): a
+    /// bundle came less than [`FULL_ACCESS_COOLDOWN_SECS`] after the last
+    /// FULL ACCESS card closed. No card is shown.
+    ShownRecently,
 }
 
 impl BundleError {
     /// The JSON-RPC code the firmware logs (`build_error_json`'s `code`).
     pub fn code(&self) -> i32 {
         match self {
-            Self::Malformed | Self::PersonaMissing | Self::PubkeyMismatch | Self::NamesChild => -3,
+            Self::Malformed | Self::PersonaMissing | Self::PubkeyMismatch => -3,
             Self::Unauthorised
             | Self::DeviceApprovalRequired
             | Self::SharedPairing
             | Self::AsksEveryRequest
-            | Self::HasKindsList => -1,
+            | Self::HasKindsList
+            | Self::AnotherFullAccess
+            | Self::ShownRecently => -1,
             Self::NoPersonaTree | Self::StorageFull | Self::ApprovalListFull | Self::MethodListFull => -4,
         }
     }
@@ -166,7 +214,6 @@ impl BundleError {
             Self::Malformed => "malformed bundle",
             Self::PersonaMissing => "persona missing",
             Self::PubkeyMismatch => "pubkey mismatch",
-            Self::NamesChild => "bundle names a child",
             Self::Unauthorised => "unauthorised",
             Self::DeviceApprovalRequired => crate::escalate::DEVICE_APPROVAL_REQUIRED,
             Self::SharedPairing => "unauthorised: pairing shared by another device",
@@ -176,6 +223,8 @@ impl BundleError {
             Self::StorageFull => "storage full",
             Self::ApprovalListFull => "approval list full",
             Self::MethodListFull => "method list full",
+            Self::AnotherFullAccess => "unauthorised: another full access request arrived",
+            Self::ShownRecently => "unauthorised: full access card shown recently",
         }
     }
 }
@@ -220,6 +269,30 @@ impl Style {
     }
 }
 
+/// The style a slot's kinds list stands for, as `heartwood_owner_status` and
+/// `heartwood_owner_narrow` report it (review round W4). Separate from
+/// [`Style`], which is only ever what a bundle asks for: `custom` can be read
+/// back, never requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotStyle {
+    /// Empty kinds list.
+    Everyday,
+    /// Exactly [`CAREFUL_KINDS`], as a set.
+    Careful,
+    /// Any other non-empty list: an operator narrowed it.
+    Custom,
+}
+
+impl SlotStyle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Everyday => "everyday",
+            Self::Careful => "careful",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The owner mark (spec 2, 5)
 // ---------------------------------------------------------------------------
@@ -253,14 +326,16 @@ pub fn is_careful_kinds(kinds: &[u64]) -> bool {
     sorted.len() == kinds.len() && sorted[..] == careful[..]
 }
 
-/// The style a slot's kinds list stands for. A list that is neither empty
-/// nor the careful list is neither style (an operator narrowed it); it
-/// reports Careful, the stricter reading, since it is not Everyday.
-pub fn slot_style(slot: &ConnectSlot) -> Style {
+/// The style a slot's kinds list stands for: Everyday when empty, Careful
+/// when exactly the careful list, Custom for any other list (an operator
+/// narrowed it; review round W4).
+pub fn slot_style(slot: &ConnectSlot) -> SlotStyle {
     if slot.allowed_kinds.is_empty() {
-        Style::Everyday
+        SlotStyle::Everyday
+    } else if is_careful_kinds(&slot.allowed_kinds) {
+        SlotStyle::Careful
     } else {
-        Style::Careful
+        SlotStyle::Custom
     }
 }
 
@@ -317,20 +392,30 @@ pub fn update_slot_kinds(old: &ConnectSlot, new: Vec<u64>) -> Vec<u64> {
 // The pairing words (spec 4.2)
 // ---------------------------------------------------------------------------
 
-/// The three words the full-access card shows for a client key:
+/// The five words the full-access card shows for a client key:
 /// `d = SHA-256("heartwood-pair-words\0" || client_pubkey_32)`, word i =
-/// `spoken_words::word(u16_be(d[2i], d[2i+1]) % 2048)`. My Signet computes
-/// the same over its own client key.
+/// `spoken_words::word(u16_be(d[2i], d[2i+1]) % 2048)` for i = 0..4, so
+/// `d[0..10]`. The first three are the words the card showed before it took
+/// five. My Signet computes the same over its own client key.
 pub fn pair_words(client_pubkey: &[u8; 32]) -> [&'static str; PAIR_WORDS] {
     let mut hasher = Sha256::new();
     hasher.update(PAIR_WORDS_DOMAIN);
     hasher.update(client_pubkey);
     let d = hasher.finalize();
-    [
-        spoken_words::word_for(&d[0..2]),
-        spoken_words::word_for(&d[2..4]),
-        spoken_words::word_for(&d[4..6]),
-    ]
+    core::array::from_fn(|i| spoken_words::word_for(&d[2 * i..2 * i + 2]))
+}
+
+/// The words page `page` of the card shows at rest, with each word's place
+/// counted from 1: `[(1, w1), (2, w2)]`, `[(3, w3), (4, w4)]`, `[(5, w5)]`. A
+/// page past the last wraps round.
+pub fn pair_word_page<'w>(words: &[&'w str; PAIR_WORDS], page: usize) -> Vec<(usize, &'w str)> {
+    let first = (page % PAIR_WORD_PAGES) * 2;
+    (first..(first + 2).min(PAIR_WORDS)).map(|i| (i + 1, words[i])).collect()
+}
+
+/// A words page as one line, `w1 w2` (the card's own line for that page).
+pub fn pair_word_line(words: &[&str; PAIR_WORDS], page: usize) -> String {
+    pair_word_page(words, page).iter().map(|(_, w)| *w).collect::<Vec<_>>().join(" ")
 }
 
 /// [`pair_words`] for a 64-char lowercase hex client key.
@@ -361,14 +446,14 @@ pub struct FullAccessCard {
 
 impl FullAccessCard {
     /// Every line, in order, the header first: header, label, words 1-2,
-    /// word 3, scope, the style's lines, the hold line. My Signet's choice
-    /// screen shows these same lines word for word (spec A1).
+    /// words 3-4, word 5 (the card's three pages), scope, the style's lines,
+    /// the hold line. My Signet's choice screen shows these same lines word
+    /// for word (spec A1).
     pub fn lines(&self) -> Vec<String> {
-        let mut lines = Vec::with_capacity(6 + self.style_lines.len());
+        let mut lines = Vec::with_capacity(4 + PAIR_WORD_PAGES + self.style_lines.len());
         lines.push(self.header.to_string());
         lines.push(self.label.clone());
-        lines.push(format!("{} {}", self.words[0], self.words[1]));
-        lines.push(self.words[2].to_string());
+        lines.extend((0..PAIR_WORD_PAGES).map(|page| pair_word_line(&self.words, page)));
         lines.push(self.scope.to_string());
         lines.extend(self.style_lines.iter().map(|line| line.to_string()));
         lines.push(self.hold.to_string());
@@ -496,8 +581,9 @@ pub fn parse_bundle_params(params: &[Value]) -> Result<BundleRequest, BundleErro
 
 /// Parse and structurally validate a bundle (every spec 4.1 row that needs
 /// neither the slot nor the registry). Order: shape, `v`, `style`;
-/// `personas` count, validity and duplicates; a child's name in either list;
-/// `act_as`; `expect`.
+/// `personas` count, validity and duplicates; any name in either list
+/// outside [`BUNDLE_NAMES`] (a child's included, review round W6); `act_as`;
+/// `expect`. Every refusal here is `malformed bundle`.
 pub fn parse_bundle(json: &str) -> Result<BundleRequest, BundleError> {
     let raw: RawBundle = serde_json::from_str(json).map_err(|_| BundleError::Malformed)?;
     if raw.v != 1 {
@@ -515,13 +601,13 @@ pub fn parse_bundle(json: &str) -> Result<BundleRequest, BundleError> {
     {
         return Err(BundleError::Malformed);
     }
-    if raw
+    if !raw
         .personas
         .iter()
         .chain(raw.act_as.iter())
-        .any(|name| name.starts_with(DEPENDANT_PREFIX))
+        .all(|name| BUNDLE_NAMES.contains(&name.as_str()))
     {
-        return Err(BundleError::NamesChild);
+        return Err(BundleError::Malformed);
     }
     if raw.act_as.is_empty()
         || has_duplicates(&raw.act_as)
@@ -577,6 +663,12 @@ fn authorised_client_keys(slot: &ConnectSlot) -> Vec<String> {
 /// escalate, this client alone, `auto_approve`, no kinds list (other than
 /// Extra careful's). `slot` is the requesting client's slot
 /// (`find_slot_by_pubkey`), `None` when unbound.
+///
+/// A slot that already carries the owner mark may hold any kinds list
+/// (review round W5): an operator may have narrowed it, and the bundle's
+/// hold is the consent to replace it with the chosen style's list
+/// ([`apply_bundle_press`]). Only a slot without the mark is refused for its
+/// list.
 pub fn check_bundle_slot(slot: Option<&ConnectSlot>, client_hex: &str) -> Result<(), BundleError> {
     let Some(slot) = slot else {
         return Err(BundleError::Unauthorised);
@@ -597,7 +689,7 @@ pub fn check_bundle_slot(slot: Option<&ConnectSlot>, client_hex: &str) -> Result
     if !slot.auto_approve {
         return Err(BundleError::AsksEveryRequest);
     }
-    if !slot.allowed_kinds.is_empty() && !is_careful_kinds(&slot.allowed_kinds) {
+    if !slot_has_owner_mark(slot) && !slot.allowed_kinds.is_empty() && !is_careful_kinds(&slot.allowed_kinds) {
         return Err(BundleError::HasKindsList);
     }
     Ok(())
@@ -628,29 +720,44 @@ impl BundlePlan {
 }
 
 /// Resolve every name against the registry (`lookup`: name to its
-/// registered x-only pubkey at index 0, `None` when not registered).
-/// `create: false` with an unregistered name is `persona missing`; an
-/// `expect` entry for a registered name that differs is `pubkey mismatch`.
-pub fn plan_bundle(
-    request: &BundleRequest,
-    lookup: impl Fn(&str) -> Option<[u8; 32]>,
-) -> Result<BundlePlan, BundleError> {
-    let resolved: Vec<(String, Option<[u8; 32]>)> = request
-        .personas
-        .iter()
-        .map(|name| (name.clone(), lookup(name)))
-        .collect();
-    if !request.create && resolved.iter().any(|(_, key)| key.is_none()) {
+/// registered x-only pubkey at index 0, `None` when not registered). Refuses
+/// nothing: [`check_bundle_registry`] judges the result, after the room
+/// checks (review round W7).
+pub fn resolve_bundle(request: &BundleRequest, lookup: impl Fn(&str) -> Option<[u8; 32]>) -> BundlePlan {
+    BundlePlan {
+        resolved: request
+            .personas
+            .iter()
+            .map(|name| (name.clone(), lookup(name)))
+            .collect(),
+    }
+}
+
+/// The registry rows of spec 4.1: `create: false` with an unregistered name
+/// is `persona missing`; an `expect` entry for a registered name that
+/// differs is `pubkey mismatch`.
+pub fn check_bundle_registry(request: &BundleRequest, plan: &BundlePlan) -> Result<(), BundleError> {
+    if !request.create && plan.resolved.iter().any(|(_, key)| key.is_none()) {
         return Err(BundleError::PersonaMissing);
     }
-    for (name, key) in &resolved {
+    for (name, key) in &plan.resolved {
         if let (Some(registered), Some(expected)) = (key, request.expect.get(name)) {
             if registered != expected {
                 return Err(BundleError::PubkeyMismatch);
             }
         }
     }
-    Ok(BundlePlan { resolved })
+    Ok(())
+}
+
+/// [`resolve_bundle`] then [`check_bundle_registry`].
+pub fn plan_bundle(
+    request: &BundleRequest,
+    lookup: impl Fn(&str) -> Option<[u8; 32]>,
+) -> Result<BundlePlan, BundleError> {
+    let plan = resolve_bundle(request, lookup);
+    check_bundle_registry(request, &plan)?;
+    Ok(plan)
 }
 
 /// The `expect` check for a key the press derived (or computed): a name the
@@ -736,7 +843,16 @@ pub struct BundleBoard {
 /// Every check of spec 4.1, before any card, in the order that leaks least:
 /// the params' shape (needs nothing), then the slot (so an unbound client,
 /// a strict slot or a shared pairing learns nothing about the registry),
-/// then the registry (`persona missing`, `pubkey mismatch`), then room.
+/// then room, then the registry (`persona missing`, `pubkey mismatch`).
+///
+/// Room before the registry (review round W7): a bound, exclusive
+/// Everything slot could otherwise learn, with no card, whether a guessed
+/// npub is a name's key, from a `pubkey mismatch` where a match would have
+/// failed on room. Now a request that would not fit fails on room whatever
+/// it guesses, and one that fits either fails on the registry or raises the
+/// card the owner sees. The firmware's derive-then-[`check_expect`] step for
+/// names not yet registered runs after this, so after room too.
+///
 /// On `Ok` the firmware raises the FULL ACCESS card; on `Err` it answers
 /// `err.message()` and changes nothing.
 pub fn validate_bundle(
@@ -749,8 +865,9 @@ pub fn validate_bundle(
     let request = parse_bundle_params(params)?;
     check_bundle_slot(slot, client_hex)?;
     let slot = slot.ok_or(BundleError::Unauthorised)?;
-    let plan = plan_bundle(&request, lookup)?;
+    let plan = resolve_bundle(&request, lookup);
     check_bundle_room(slot, client_hex, &request, &plan, board.has_tree, board.registry_free)?;
+    check_bundle_registry(&request, &plan)?;
     Ok((request, plan))
 }
 
@@ -760,9 +877,12 @@ pub fn validate_bundle(
 
 /// Apply the press to the slot, after step 1 (resolve or derive and register
 /// every name) gave `act_as_pubkeys`, the keys of the `act_as` names. Adds
-/// and never removes, except that Everyday empties Extra careful's list (a
-/// widening the hold consents to). Run inside one snapshot +
-/// `persist_slot_mutation_or_rollback`. True when the slot changed.
+/// and never removes, except the kinds list, which the hold consents to
+/// replacing: Extra careful sets exactly [`CAREFUL_KINDS`], and Everyday
+/// empties Extra careful's list or, on a slot that already carried the
+/// owner mark, any list (review round W5: an operator may have narrowed it).
+/// Run inside one snapshot + `persist_slot_mutation_or_rollback`. True when
+/// the slot changed.
 ///
 /// Returns `Err(ApprovalListFull)` without a complete grant set only if a
 /// grant could not be recorded (the room check should have caught it): the
@@ -773,6 +893,7 @@ pub fn apply_bundle_press(
     act_as_pubkeys: &[[u8; 32]],
     style: Style,
 ) -> Result<bool, BundleError> {
+    let had_mark = slot_has_owner_mark(slot);
     let before = (
         slot.allowed_methods.clone(),
         slot.allowed_kinds.clone(),
@@ -795,7 +916,7 @@ pub fn apply_bundle_press(
     match style {
         Style::Careful => slot.allowed_kinds = CAREFUL_KINDS.to_vec(),
         Style::Everyday => {
-            if is_careful_kinds(&slot.allowed_kinds) {
+            if had_mark || is_careful_kinds(&slot.allowed_kinds) {
                 slot.allowed_kinds.clear();
             }
         }
@@ -833,10 +954,11 @@ pub fn bundle_success_json(pubkeys: &[(String, [u8; 32])], act_as: &[String], st
 // ---------------------------------------------------------------------------
 
 /// `heartwood_owner_status`'s reply for the caller's slot (`None` when
-/// unbound): `owner` false on a strict or unbound slot.
+/// unbound): `owner` false on a strict or unbound slot; `style` is
+/// `everyday`, `careful` or `custom` ([`slot_style`]).
 pub fn owner_status_json(slot: Option<&ConnectSlot>) -> String {
     let owner = slot.is_some_and(is_owner_pairing);
-    let style = slot.map_or(Style::Everyday, slot_style);
+    let style = slot.map_or(SlotStyle::Everyday, slot_style);
     serde_json::json!({ "owner": owner, "style": style.as_str() }).to_string()
 }
 
@@ -861,10 +983,11 @@ pub fn parse_narrow_params(params: &[Value]) -> Result<(), BundleError> {
 
 /// Narrow the caller's own owner pairing to Extra careful: sets
 /// [`CAREFUL_KINDS`] when `allowed_kinds` is empty, does nothing otherwise
-/// (never widens). `Unauthorised` without the mark (or unbound). Returns
-/// whether it changed; a change goes through snapshot +
-/// `persist_slot_mutation_or_rollback`.
-pub fn owner_narrow(slot: Option<&mut ConnectSlot>) -> Result<bool, BundleError> {
+/// (never widens; a custom list stays as it is). `Unauthorised` without the
+/// mark (or unbound). Returns whether it changed and the style now in force
+/// (`custom` for a list an operator narrowed, review round W4); a change
+/// goes through snapshot + `persist_slot_mutation_or_rollback`.
+pub fn owner_narrow(slot: Option<&mut ConnectSlot>) -> Result<(bool, SlotStyle), BundleError> {
     let Some(slot) = slot else {
         return Err(BundleError::Unauthorised);
     };
@@ -872,15 +995,44 @@ pub fn owner_narrow(slot: Option<&mut ConnectSlot>) -> Result<bool, BundleError>
         return Err(BundleError::Unauthorised);
     }
     if !slot.allowed_kinds.is_empty() {
-        return Ok(false);
+        return Ok((false, slot_style(slot)));
     }
     slot.allowed_kinds = CAREFUL_KINDS.to_vec();
-    Ok(true)
+    Ok((true, SlotStyle::Careful))
 }
 
-/// `heartwood_owner_narrow`'s reply.
-pub fn owner_narrow_json(changed: bool) -> String {
-    serde_json::json!({ "style": "careful", "changed": changed }).to_string()
+/// `heartwood_owner_narrow`'s reply: the style now in force and whether
+/// this call changed it.
+pub fn owner_narrow_json(style: SlotStyle, changed: bool) -> String {
+    serde_json::json!({ "style": style.as_str(), "changed": changed }).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// One FULL ACCESS card at a time (review round W3)
+// ---------------------------------------------------------------------------
+
+/// Whether a bundle that passed every other check may raise a FULL ACCESS
+/// card now. `another_waiting`: a FULL ACCESS card is already waiting,
+/// queued or on screen; `last_closed_ms`: when the last FULL ACCESS card
+/// closed, whatever its outcome (approved, declined, expired, refused), on
+/// the same clock as `now_ms`, `None` if none has since boot.
+///
+/// - Another waiting: [`BundleError::AnotherFullAccess`]. The caller also
+///   closes the waiting card with the same reply and grants nothing.
+/// - Closed less than [`FULL_ACCESS_COOLDOWN_SECS`] ago:
+///   [`BundleError::ShownRecently`], and no card.
+///
+/// So a client that keeps sending bundles can block pairing, but its bundle
+/// never reaches a card the owner might hold while racing another one, and
+/// the owner sees the refusals.
+pub fn full_access_admission(another_waiting: bool, last_closed_ms: Option<u64>, now_ms: u64) -> Result<(), BundleError> {
+    if another_waiting {
+        return Err(BundleError::AnotherFullAccess);
+    }
+    if last_closed_ms.is_some_and(|closed| now_ms.saturating_sub(closed) < FULL_ACCESS_COOLDOWN_SECS * 1000) {
+        return Err(BundleError::ShownRecently);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,6 +1176,12 @@ mod tests {
         }
     }
 
+    /// A registry holding the persona alone: the real identity is derived
+    /// by the press.
+    fn persona_only(name: &str) -> Option<[u8; 32]> {
+        (name == "persona").then_some(PERSONA)
+    }
+
     // --- 4.2 words and card ---
 
     #[test]
@@ -1034,12 +1192,14 @@ mod tests {
         hasher.update(b"heartwood-pair-words\0");
         hasher.update(key);
         let d = hasher.finalize();
-        let by_hand = [0, 1, 2].map(|i| {
+        let by_hand = [0, 1, 2, 3, 4].map(|i| {
             spoken_words::word(usize::from(u16::from_be_bytes([d[2 * i], d[2 * i + 1]])) % 2048)
         });
         assert_eq!(pair_words(&key), by_hand);
         assert_eq!(pair_words_hex(CLIENT), Some(by_hand));
-        assert_eq!(pair_words(&key), ["nice", "never", "repair"]);
+        // Five words from d[0..10] (review round W1); the first three are
+        // the three-word card's, unchanged.
+        assert_eq!(pair_words(&key), ["nice", "never", "repair", "area", "upgrade"]);
         assert!(pair_words(&key).iter().all(|w| w.len() <= spoken_words::WORDLIST_MAX_LEN));
         assert_eq!(pair_words_hex("not hex"), None);
         assert_eq!(pair_words_hex(&CLIENT.to_ascii_uppercase()), None, "lowercase hex only");
@@ -1056,12 +1216,22 @@ mod tests {
                 "FULL ACCESS".to_string(),
                 "My Signet".to_string(),
                 format!("{} {}", w[0], w[1]),
-                w[2].to_string(),
+                format!("{} {}", w[2], w[3]),
+                w[4].to_string(),
                 "PERSONA ONLY".to_string(),
                 "SIGN IN, POST, BACKUP".to_string(),
                 "HOLD 5 SECONDS".to_string(),
             ]
         );
+        // The three word lines are the three pages the board turns through.
+        assert_eq!(pair_word_page(&w, 0), vec![(1, w[0]), (2, w[1])]);
+        assert_eq!(pair_word_page(&w, 1), vec![(3, w[2]), (4, w[3])]);
+        assert_eq!(pair_word_page(&w, 2), vec![(5, w[4])]);
+        assert_eq!(pair_word_page(&w, PAIR_WORD_PAGES), pair_word_page(&w, 0), "a page past the last wraps");
+        assert_eq!(PAIR_WORD_PAGES, 3);
+        // The board's hint offers no hold until every page has been shown.
+        assert_eq!(full_access_hint(false), "COMPARE ALL 5 WORDS");
+        assert_eq!(full_access_hint(true), HOLD_LINE);
         let careful = full_access_card(
             "My Signet",
             21,
@@ -1070,29 +1240,31 @@ mod tests {
             Style::Careful,
         );
         let lines = careful.lines();
-        assert_eq!(lines[4], "PERSONA + REAL NAME");
-        assert_eq!(&lines[5..7], &["SIGNS ALONE: BACKUPS".to_string(), "ASKS: EVERYTHING ELSE".to_string()]);
+        assert_eq!(lines[5], "PERSONA + REAL NAME");
+        assert_eq!(&lines[6..8], &["ALONE: BACKUPS, APP DATA".to_string(), "ASKS: EVERYTHING ELSE".to_string()]);
         assert_eq!(lines.last().unwrap(), "HOLD 5 SECONDS");
-        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.len(), 9);
     }
 
     #[test]
-    fn the_longest_fixed_card_line_is_21_characters() {
+    fn the_longest_fixed_card_line_is_24_characters() {
         // The spec's own words, which My Signet shows verbatim, so they are
-        // not shortened here. `SIGN IN, POST, BACKUP` and `ASKS: EVERYTHING
-        // ELSE` are 21 characters, what a 128 px panel holds at 6 px a glyph.
-        // The OLED builder lays them out (spec 4.2's review point); it never
-        // rewords them.
+        // not shortened here. `ALONE: BACKUPS, APP DATA` (review round W9) is
+        // 24 characters, what the Heltec's span holds in its 5 px small font
+        // (ui-preview checks every panel). The OLED builder lays them out; it
+        // never rewords them.
         let longest = [FULL_ACCESS_HEADER, SCOPE_PERSONA_ONLY, SCOPE_PERSONA_AND_REAL_NAME, HOLD_LINE]
             .iter()
             .chain(EVERYDAY_LINES)
             .chain(CAREFUL_LINES)
             .map(|line| line.len())
             .max();
-        assert_eq!(longest, Some(21));
-        assert_eq!(EVERYDAY_LINES[0].len(), 21);
-        // Two longest words and a space.
-        assert!(2 * spoken_words::WORDLIST_MAX_LEN + 1 <= 21);
+        assert_eq!(longest, Some(24));
+        assert_eq!(CAREFUL_LINES[0].len(), 24);
+        // Extra careful's line names both things that sign alone, never less.
+        assert!(CAREFUL_LINES[0].contains("BACKUPS") && CAREFUL_LINES[0].contains("APP DATA"));
+        // Two longest words and a space: one page's line.
+        assert!(2 * spoken_words::WORDLIST_MAX_LEN + 1 <= 24);
     }
 
     #[test]
@@ -1201,36 +1373,49 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_naming_a_child_is_refused() {
+    fn a_bundle_names_only_the_persona_and_the_real_identity() {
+        // Review round W6: the card's scope line names PERSONA and REAL
+        // NAME, so a bundle may carry nothing else. A child's name, an extra
+        // persona or any other valid persona name is a malformed bundle, in
+        // either list.
         for case in [
             r#"{"v":1,"personas":["dependant-0-np"],"act_as":["dependant-0-np"],"create":true}"#,
             r#"{"v":1,"personas":["persona","dependant-1-persona"],"act_as":["persona"],"create":true}"#,
             r#"{"v":1,"personas":["persona"],"act_as":["dependant-0-persona"],"create":true}"#,
+            r#"{"v":1,"personas":["persona","work"],"act_as":["persona","work"],"create":true}"#,
+            r#"{"v":1,"personas":["persona","work","anon"],"act_as":["persona"],"create":true}"#,
+            r#"{"v":1,"personas":["persona-1"],"act_as":["persona-1"],"create":true}"#,
+            r#"{"v":1,"personas":["Persona"],"act_as":["Persona"],"create":true}"#,
         ] {
-            assert_eq!(bundle(case), Err(BundleError::NamesChild), "{case}");
+            assert_eq!(bundle(case), Err(BundleError::Malformed), "{case}");
         }
-        assert_eq!(BundleError::NamesChild.message(), "bundle names a child");
+        assert_eq!(MAX_BUNDLE_PERSONAS, 2);
+        for (personas, act_as) in [
+            (r#"["persona"]"#, r#"["persona"]"#),
+            (r#"["natural-person"]"#, r#"["natural-person"]"#),
+            (r#"["natural-person","persona"]"#, r#"["persona"]"#),
+            (r#"["persona","natural-person"]"#, r#"["natural-person","persona"]"#),
+        ] {
+            let json = format!(r#"{{"v":1,"personas":{personas},"act_as":{act_as},"create":true}}"#);
+            assert!(bundle(&json).is_ok(), "{json}");
+        }
     }
 
     #[test]
     fn create_false_with_a_missing_name_is_refused_before_the_card() {
-        let request = bundle(&format!(
-            r#"{{"v":1,"personas":["persona","persona-1"],"act_as":["persona"],"expect":{{"persona":"{}","persona-1":"{}"}},"create":false}}"#,
+        let json = format!(
+            r#"{{"v":1,"personas":["persona","natural-person"],"act_as":["persona"],"expect":{{"persona":"{}","natural-person":"{}"}},"create":false}}"#,
             hex(&PERSONA),
             hex(&NP)
-        ))
-        .unwrap();
-        assert_eq!(plan_bundle(&request, registry), Err(BundleError::PersonaMissing));
+        );
+        let request = bundle(&json).unwrap();
+        assert_eq!(plan_bundle(&request, persona_only), Err(BundleError::PersonaMissing));
         let slot = everything_slot();
         let before = slot.clone();
-        let params = [Value::String(format!(
-            r#"{{"v":1,"personas":["persona","persona-1"],"act_as":["persona"],"expect":{{"persona":"{}","persona-1":"{}"}},"create":false}}"#,
-            hex(&PERSONA),
-            hex(&NP)
-        ))];
+        let params = [Value::String(json)];
         let board = BundleBoard { has_tree: true, registry_free: 8 };
         assert_eq!(
-            validate_bundle(&params, Some(&slot), CLIENT, board, registry).unwrap_err(),
+            validate_bundle(&params, Some(&slot), CLIENT, board, persona_only).unwrap_err(),
             BundleError::PersonaMissing
         );
         // Validation is pure: the slot is untouched.
@@ -1259,15 +1444,60 @@ mod tests {
         assert_eq!(plan.registered("persona"), Some(PERSONA));
         // A name the press derives is checked once its key exists.
         let derive = bundle(&format!(
-            r#"{{"v":1,"personas":["persona-2"],"act_as":["persona-2"],"expect":{{"persona-2":"{}"}},"create":true}}"#,
+            r#"{{"v":1,"personas":["natural-person"],"act_as":["natural-person"],"expect":{{"natural-person":"{}"}},"create":true}}"#,
             hex(&NP)
         ))
         .unwrap();
-        let plan = plan_bundle(&derive, registry).unwrap();
+        let plan = plan_bundle(&derive, persona_only).unwrap();
         assert_eq!(plan.derive_count(), 1);
-        assert_eq!(check_expect(&derive, "persona-2", &PERSONA), Err(BundleError::PubkeyMismatch));
-        assert_eq!(check_expect(&derive, "persona-2", &NP), Ok(()));
-        assert_eq!(check_expect(&derive, "unlisted", &NP), Ok(()));
+        assert_eq!(check_expect(&derive, "natural-person", &PERSONA), Err(BundleError::PubkeyMismatch));
+        assert_eq!(check_expect(&derive, "natural-person", &NP), Ok(()));
+        assert_eq!(check_expect(&derive, "persona", &NP), Ok(()), "a name with no expect entry");
+    }
+
+    #[test]
+    fn room_is_checked_before_the_registry_so_a_guess_learns_nothing_without_a_card() {
+        // Review round W7. A bound, exclusive Everything slot guesses the
+        // persona's npub. With no room for the press, a right and a wrong
+        // guess get the same room refusal; with room, a wrong guess is
+        // refused and a right one raises the card (the owner sees it).
+        let guess = |key: [u8; 32]| {
+            [Value::String(format!(
+                r#"{{"v":1,"personas":["persona"],"act_as":["persona"],"expect":{{"persona":"{}"}},"create":false}}"#,
+                hex(&key)
+            ))]
+        };
+        let board = BundleBoard { has_tree: true, registry_free: 8 };
+        let mut full = everything_slot();
+        for i in 0..16u8 {
+            assert!(record_client_identity(&mut full, CLIENT, &[0x40 + i; 32]));
+        }
+        for key in [PERSONA, [0x99; 32]] {
+            assert_eq!(
+                validate_bundle(&guess(key), Some(&full), CLIENT, board, registry).unwrap_err(),
+                BundleError::ApprovalListFull,
+                "no room: the same answer whatever the guess"
+            );
+        }
+        let room = everything_slot();
+        assert_eq!(
+            validate_bundle(&guess([0x99; 32]), Some(&room), CLIENT, board, registry).unwrap_err(),
+            BundleError::PubkeyMismatch
+        );
+        assert!(validate_bundle(&guess(PERSONA), Some(&room), CLIENT, board, registry).is_ok());
+        // A missing name with create:false the same way: room first.
+        let missing = [Value::String(format!(
+            r#"{{"v":1,"personas":["natural-person"],"act_as":["natural-person"],"expect":{{"natural-person":"{}"}},"create":false}}"#,
+            hex(&NP)
+        ))];
+        assert_eq!(
+            validate_bundle(&missing, Some(&full), CLIENT, board, persona_only).unwrap_err(),
+            BundleError::ApprovalListFull
+        );
+        assert_eq!(
+            validate_bundle(&missing, Some(&room), CLIENT, board, persona_only).unwrap_err(),
+            BundleError::PersonaMissing
+        );
     }
 
     // --- 4.1 slot rows ---
@@ -1345,8 +1575,8 @@ mod tests {
     #[test]
     fn the_room_rows_refuse_when_the_press_would_not_fit() {
         let slot = everything_slot();
-        let request = bundle(r#"{"v":1,"personas":["persona","persona-9"],"act_as":["persona","persona-9"],"create":true}"#).unwrap();
-        let plan = plan_bundle(&request, registry).unwrap();
+        let request = bundle(r#"{"v":1,"personas":["persona","natural-person"],"act_as":["persona","natural-person"],"create":true}"#).unwrap();
+        let plan = plan_bundle(&request, persona_only).unwrap();
         assert_eq!(plan.derive_count(), 1);
         assert_eq!(check_bundle_room(&slot, CLIENT, &request, &plan, true, 1), Ok(()));
         assert_eq!(check_bundle_room(&slot, CLIENT, &request, &plan, false, 1), Err(BundleError::NoPersonaTree));
@@ -1441,13 +1671,47 @@ mod tests {
         apply_bundle_press(&mut slot, CLIENT, &[PERSONA], Style::Careful).unwrap();
         assert_eq!(slot.allowed_kinds, vec![30078, 22242]);
         assert!(is_careful_kinds(&slot.allowed_kinds));
-        assert_eq!(slot_style(&slot), Style::Careful);
+        assert_eq!(slot_style(&slot), SlotStyle::Careful);
         apply_bundle_press(&mut slot, CLIENT, &[PERSONA], Style::Everyday).unwrap();
         assert!(slot.allowed_kinds.is_empty());
-        assert_eq!(slot_style(&slot), Style::Everyday);
+        assert_eq!(slot_style(&slot), SlotStyle::Everyday);
         assert!(!is_careful_kinds(&[30078]));
         assert!(!is_careful_kinds(&[30078, 22242, 30078]));
         assert!(is_careful_kinds(&[22242, 30078]));
+    }
+
+    #[test]
+    fn on_a_marked_slot_the_hold_replaces_any_kinds_list() {
+        // Review round W5: an operator narrowed an owner pairing's list. The
+        // bundle is no longer refused for it, and the press sets the chosen
+        // style's list exactly.
+        for (style, expected) in [(Style::Everyday, vec![]), (Style::Careful, CAREFUL_KINDS.to_vec())] {
+            let mut slot = owner_slot();
+            slot.allowed_kinds = vec![30078];
+            assert_eq!(slot_style(&slot), SlotStyle::Custom);
+            assert_eq!(check_bundle_slot(Some(&slot), CLIENT), Ok(()));
+            assert!(apply_bundle_press(&mut slot, CLIENT, &[PERSONA], style).unwrap());
+            assert_eq!(slot.allowed_kinds, expected, "{style:?}");
+            assert!(slot_has_owner_mark(&slot));
+        }
+        // Without the mark, any list but the careful one is still refused,
+        // and the careful one is still accepted.
+        let mut plain = everything_slot();
+        plain.allowed_kinds = vec![30078];
+        assert_eq!(check_bundle_slot(Some(&plain), CLIENT), Err(BundleError::HasKindsList));
+        assert_eq!(BundleError::HasKindsList.message(), "unauthorised: pairing has a kinds list");
+        plain.allowed_kinds = vec![22242, 30078];
+        assert_eq!(check_bundle_slot(Some(&plain), CLIENT), Ok(()));
+        // The other slot rows are unchanged on a marked slot.
+        let mut strict = owner_slot();
+        strict.allowed_kinds = vec![1];
+        strict.escalate = true;
+        assert_eq!(check_bundle_slot(Some(&strict), CLIENT), Err(BundleError::DeviceApprovalRequired));
+        strict.escalate = false;
+        strict.auto_approve = false;
+        assert_eq!(check_bundle_slot(Some(&strict), CLIENT), Err(BundleError::AsksEveryRequest));
+        strict.strict_permissions = true;
+        assert_eq!(check_bundle_slot(Some(&strict), CLIENT), Err(BundleError::Unauthorised));
     }
 
     #[test]
@@ -1496,8 +1760,16 @@ mod tests {
         assert_eq!(parse(owner_status_json(Some(&slot))), serde_json::json!({"owner": true, "style": "everyday"}));
         slot.allowed_kinds = CAREFUL_KINDS.to_vec();
         assert_eq!(parse(owner_status_json(Some(&slot))), serde_json::json!({"owner": true, "style": "careful"}));
+        // Review round W4: any other list is custom.
+        slot.allowed_kinds = vec![22242];
+        assert_eq!(parse(owner_status_json(Some(&slot))), serde_json::json!({"owner": true, "style": "custom"}));
+        slot.allowed_kinds = vec![30078, 22242, 1];
+        assert_eq!(parse(owner_status_json(Some(&slot))), serde_json::json!({"owner": true, "style": "custom"}));
+        slot.allowed_kinds = CAREFUL_KINDS.to_vec();
         slot.strict_permissions = true;
         assert_eq!(parse(owner_status_json(Some(&slot))), serde_json::json!({"owner": false, "style": "careful"}));
+        // "custom" is read back, never asked for.
+        assert_eq!(Style::parse("custom"), None);
     }
 
     #[test]
@@ -1510,20 +1782,47 @@ mod tests {
         assert_eq!(parse_narrow_params(&[]), Err(BundleError::Malformed));
 
         let mut slot = owner_slot();
-        assert_eq!(owner_narrow(Some(&mut slot)), Ok(true));
+        assert_eq!(owner_narrow(Some(&mut slot)), Ok((true, SlotStyle::Careful)));
         assert_eq!(slot.allowed_kinds, CAREFUL_KINDS.to_vec());
-        assert_eq!(owner_narrow(Some(&mut slot)), Ok(false));
+        assert_eq!(owner_narrow(Some(&mut slot)), Ok((false, SlotStyle::Careful)));
         slot.allowed_kinds = vec![30078];
-        assert_eq!(owner_narrow(Some(&mut slot)), Ok(false));
+        assert_eq!(owner_narrow(Some(&mut slot)), Ok((false, SlotStyle::Custom)));
         assert_eq!(slot.allowed_kinds, vec![30078], "a narrower list is left alone");
         let mut plain = everything_slot();
         assert_eq!(owner_narrow(Some(&mut plain)), Err(BundleError::Unauthorised));
         assert!(plain.allowed_kinds.is_empty());
         assert_eq!(owner_narrow(None), Err(BundleError::Unauthorised));
         assert_eq!(
-            serde_json::from_str::<Value>(&owner_narrow_json(true)).unwrap(),
+            serde_json::from_str::<Value>(&owner_narrow_json(SlotStyle::Careful, true)).unwrap(),
             serde_json::json!({"style": "careful", "changed": true})
         );
+        assert_eq!(
+            serde_json::from_str::<Value>(&owner_narrow_json(SlotStyle::Custom, false)).unwrap(),
+            serde_json::json!({"style": "custom", "changed": false})
+        );
+    }
+
+    // --- W3 one FULL ACCESS card at a time ---
+
+    #[test]
+    fn a_second_bundle_or_one_within_a_minute_never_reaches_a_card() {
+        assert_eq!(full_access_admission(false, None, 0), Ok(()));
+        // Another waiting: both get this reply (the caller closes the other).
+        assert_eq!(full_access_admission(true, None, 5_000), Err(BundleError::AnotherFullAccess));
+        assert_eq!(full_access_admission(true, Some(0), 500_000), Err(BundleError::AnotherFullAccess));
+        // Within 60 s of the last card closing, whatever its outcome.
+        let closed = 1_000_000;
+        assert_eq!(full_access_admission(false, Some(closed), closed), Err(BundleError::ShownRecently));
+        assert_eq!(full_access_admission(false, Some(closed), closed + 59_999), Err(BundleError::ShownRecently));
+        assert_eq!(full_access_admission(false, Some(closed), closed + 60_000), Ok(()));
+        // A clock that reads earlier than the close fails closed.
+        assert_eq!(full_access_admission(false, Some(closed), closed - 1), Err(BundleError::ShownRecently));
+        assert_eq!(FULL_ACCESS_COOLDOWN_SECS, 60);
+        // The wire strings, exactly; both code -1.
+        assert_eq!(BundleError::AnotherFullAccess.message(), "unauthorised: another full access request arrived");
+        assert_eq!(BundleError::ShownRecently.message(), "unauthorised: full access card shown recently");
+        assert_eq!(BundleError::AnotherFullAccess.code(), -1);
+        assert_eq!(BundleError::ShownRecently.code(), -1);
     }
 
     // --- 5.2 who adds and removes the mark ---

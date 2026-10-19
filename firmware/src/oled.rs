@@ -1280,43 +1280,58 @@ fn draw_full_access_header(display: &mut Display<'_>, l: &Layout, g: &crate::lay
 }
 
 /// The FULL ACCESS card (one-hold pairing spec 4.2), at rest: the inverted
-/// header, the pairing's label, the scope line, the style's line(s) and the
-/// hold line, word for word as `owner_pairing::full_access_card` gives them
-/// (My Signet shows the same lines), over a 45 s countdown. The three words
-/// are on the hold screen ([`show_full_access_hold`]): this panel's fonts
-/// cannot fit all eight lines on one screen (`layout::FullAccessGeometry`).
-/// Mirrored and checked in ui-preview (`draw_full_access`).
+/// header, words page `page` (`w1 w2`, `w3 w4` or `w5`, review round W2) in
+/// the largest font that fits, the scope line, the style's line(s) and the
+/// hint, word for word as `owner_pairing` gives them (My Signet shows the
+/// same lines), over a 45 s countdown led by the page marker ("1-2 of 5").
+/// The caller turns the pages with `phone_unlock::EnrolGate`, as the enrol
+/// card's do, and passes `armed` once a hold counts: the hint reads
+/// `COMPARE ALL 5 WORDS` until then, `HOLD 5 SECONDS` after
+/// (`owner_pairing::full_access_hint`). The label and all five words are on
+/// the hold screen ([`show_full_access_hold`]): this panel's fonts cannot
+/// fit every line on one screen (`layout::FullAccessGeometry`). Mirrored and
+/// checked in ui-preview (`draw_full_access`).
+#[allow(clippy::too_many_arguments)]
 pub fn show_full_access(
     display: &mut Display<'_>,
-    label: &str,
     client_pubkey: &[u8; 32],
     act_as: &[String],
     style: heartwood_common::owner_pairing::Style,
     remaining: u32,
     total_secs: u32,
+    page: usize,
+    armed: bool,
 ) {
+    use heartwood_common::owner_pairing as op;
     let l = layout(display);
     display.clear_buffer();
     let g = l.full_access_geometry();
-    let card = heartwood_common::owner_pairing::full_access_card(
-        label,
-        l.span_chars(None, l.font_small()),
-        client_pubkey,
-        act_as,
-        style,
-    );
+    // The label is drawn on the hold screen, not here; its width is moot.
+    let card = op::full_access_card("", 3, client_pubkey, act_as, style);
     draw_full_access_header(display, &l, &g);
 
+    let words = op::pair_word_line(&card.words, page);
+    let word_style = MonoTextStyleBuilder::new().font(g.word_font).text_color(WARN).build();
+    let wx = l.center_in_span(None, words.len() as i32 * Layout::glyph_w(g.word_font));
+    Text::new(&words, Point::new(wx, g.word_y), word_style).draw(display).ok();
+
     let text = |colour| MonoTextStyleBuilder::new().font(l.font_small()).text_color(colour).build();
-    let mut lines: Vec<(&str, Rgb565)> = vec![(card.label.as_str(), FG), (card.scope, WARN)];
+    let mut lines: Vec<(&str, Rgb565)> = vec![(card.scope, WARN)];
     lines.extend(card.style_lines.iter().map(|line| (*line, FG)));
-    lines.push((card.hold, ACCENT));
+    lines.push((op::full_access_hint(armed), if armed { ACCENT } else { MUTED }));
     for (i, (line, colour)) in lines.into_iter().enumerate() {
         let x = l.center_in_span(None, line.len() as i32 * Layout::glyph_w(l.font_small()));
         Text::new(line, Point::new(x, g.first_y + i as i32 * g.pitch), text(colour))
             .draw(display)
             .ok();
     }
+    Text::new(
+        heartwood_common::phone_unlock::enrol_page_marker(page),
+        Point::new(g.marker_x, g.secs_y),
+        text(MUTED),
+    )
+    .draw(display)
+    .ok();
     draw_full_access_countdown(display, &l, &g, remaining, total_secs);
     if let Err(e) = display.flush() {
         log::warn!("OLED flush failed: {:?}", e);
@@ -1324,27 +1339,28 @@ pub fn show_full_access(
 }
 
 /// The FULL ACCESS card's hold screen, drawn while the button is down: the
-/// inverted header, the three words large (`w1 w2` / `w3`) to compare with
-/// the phone for the whole 5 s hold, the hold line and the hold's progress.
-/// Letting go before the bar fills declines. Replaces the generic
+/// inverted header, the pairing's label, all five words (`w1 w2` / `w3 w4` /
+/// `w5`) to compare with the phone for the whole 5 s hold, and the hold's
+/// progress. Letting go before the bar fills declines. Replaces the generic
 /// CONFIRMING screen for this card only. Mirrored in ui-preview.
-pub fn show_full_access_hold(display: &mut Display<'_>, client_pubkey: &[u8; 32], hold_pct: u32) {
+pub fn show_full_access_hold(display: &mut Display<'_>, label: &str, client_pubkey: &[u8; 32], hold_pct: u32) {
+    use heartwood_common::owner_pairing as op;
     let l = layout(display);
     display.clear_buffer();
     let g = l.full_access_geometry();
     let h = l.full_access_hold_geometry();
     draw_full_access_header(display, &l, &g);
-    let words = heartwood_common::owner_pairing::pair_words(client_pubkey);
+    let small = l.font_small();
+    let card = op::full_access_card(label, l.span_chars(None, small), client_pubkey, &[], op::Style::Everyday);
+    let label_style = MonoTextStyleBuilder::new().font(small).text_color(FG).build();
+    let lx = l.center_in_span(None, card.label.len() as i32 * Layout::glyph_w(small));
+    Text::new(&card.label, Point::new(lx, h.label_y), label_style).draw(display).ok();
     let word_style = MonoTextStyleBuilder::new().font(h.word_font).text_color(WARN).build();
-    let first = format!("{} {}", words[0], words[1]);
-    for (line, y) in [(first.as_str(), h.word_y[0]), (words[2], h.word_y[1])] {
+    for (page, y) in h.word_y.into_iter().enumerate() {
+        let line = op::pair_word_line(&card.words, page);
         let x = l.center_in_span(None, line.len() as i32 * Layout::glyph_w(h.word_font));
-        Text::new(line, Point::new(x, y), word_style).draw(display).ok();
+        Text::new(&line, Point::new(x, y), word_style).draw(display).ok();
     }
-    let hint = heartwood_common::owner_pairing::HOLD_LINE;
-    let hint_style = MonoTextStyleBuilder::new().font(l.font_small()).text_color(MUTED).build();
-    let hx = l.center_in_span(None, hint.len() as i32 * Layout::glyph_w(l.font_small()));
-    Text::new(hint, Point::new(hx, h.hint_y), hint_style).draw(display).ok();
 
     let (x, y, w, bh) = h.bar;
     Rectangle::new(Point::new(x, y), Size::new(w as u32, bh as u32))

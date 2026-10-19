@@ -53,11 +53,14 @@ pub fn judge(hold: u32, held_ms: u32, released_ms: Option<u32>) -> Press {
     }
 }
 
-/// The FULL ACCESS card's three words, as its hold sees them. They are drawn
-/// only on the hold screen, so a hold counts only for the time they have been
-/// on the glass (review m1): a press measured between two loop passes, or one
-/// that began before the hold screen was drawn, must not approve on time the
-/// owner never saw the words for.
+/// The FULL ACCESS card's five words, as its hold sees them. At rest the card
+/// pages them two at a time (review round W2, `phone_unlock::EnrolGate`), and
+/// no press counts until every page has had its full dwell and the button has
+/// been seen up since. Once a hold starts, the hold screen shows all five,
+/// and the hold counts only for the time they have been on the glass (review
+/// m1): a press measured between two loop passes, or one that began before
+/// the hold screen was drawn, must not approve on time the owner never saw
+/// the words for.
 ///
 /// Measured on the button sampler's own clock, not between loop passes: the
 /// press's length is read just after the hold screen is drawn, and the words
@@ -131,6 +134,29 @@ pub fn judge_full_access(hold: u32, words: WordsShown, held_ms: u32, released_ms
 /// The hold's progress, 0 to 100, for the bar.
 pub fn hold_pct(hold: u32, held_ms: u32) -> u32 {
     (held_ms.saturating_mul(100) / hold.max(1)).min(100)
+}
+
+/// Judge a press on a relay card (relay.rs `judge_card_press`): FULL ACCESS
+/// by [`judge_full_access`] against its 5 s hold and the time its words have
+/// been up, every other card by [`judge`] against 2 s.
+pub fn judge_card(full_access: bool, words: WordsShown, held_ms: u32, released_ms: Option<u32>) -> Press {
+    let hold = hold_ms(full_access);
+    if full_access {
+        judge_full_access(hold, words, held_ms, released_ms)
+    } else {
+        judge(hold, held_ms, released_ms)
+    }
+}
+
+/// How far a relay card's hold has got, for its bar and its burst (relay.rs
+/// `card_hold_progress`): the press's length, or for FULL ACCESS the time its
+/// words have been up.
+pub fn card_progress(full_access: bool, words: WordsShown, held_ms: u32) -> u32 {
+    if full_access {
+        words.shown_ms(held_ms)
+    } else {
+        held_ms
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +233,27 @@ mod tests {
         late.drawn(0);
         assert!(!late.shown());
         assert_eq!(judge_full_access(full, late, 0, Some(5_200)), Press::Declined);
+    }
+
+    #[test]
+    fn a_relay_card_press_is_judged_by_its_own_kind() {
+        // FULL ACCESS: nothing counts before the hold screen's words are up.
+        let none = WordsShown::default();
+        assert_eq!(judge_card(true, none, 9_000, None), Press::Pending);
+        assert_eq!(judge_card(true, none, 0, Some(9_000)), Press::Declined);
+        assert_eq!(card_progress(true, none, 9_000), 0);
+        let mut words = WordsShown::default();
+        words.drawn(1_000);
+        assert_eq!(card_progress(true, words, 3_500), 2_500);
+        assert_eq!(judge_card(true, words, 5_999, None), Press::Pending);
+        assert_eq!(judge_card(true, words, 6_000, None), Press::Approved);
+        assert_eq!(judge_card(true, words, 0, Some(5_000)), Press::Declined, "4 s with the words up");
+        assert_eq!(hold_pct(hold_ms(true), card_progress(true, words, 3_500)), 50);
+        // Every other card: the press itself, 2 s, words or not.
+        assert_eq!(judge_card(false, none, 2_000, None), Press::Approved);
+        assert_eq!(judge_card(false, none, 0, Some(1_999)), Press::Declined);
+        assert_eq!(card_progress(false, words, 1_500), 1_500);
+        assert_eq!(hold_pct(hold_ms(false), card_progress(false, none, 1_000)), 50);
     }
 
     #[test]

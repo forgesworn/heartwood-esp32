@@ -276,49 +276,58 @@ impl Layout {
 /// `show_full_access`, mirrored and checked in ui-preview).
 ///
 /// The card's text does not fit one 128x64 screen at the panel's own fonts:
-/// header, label, three words, scope, one or two style lines and the hold
-/// line are seven or eight lines, and the small font's 8 px rows leave room
-/// for five under the header and above the countdown. The spec's fallback
-/// is taken: the inverted header and the scope lines stay on the card, and
-/// the words move to the hold screen ([`FullAccessHoldGeometry`]) shown while
-/// the button is down, so they are read for the whole 5 s hold and letting go
-/// declines. Every panel uses the same two screens.
+/// header, label, five words, scope, one or two style lines and the hold
+/// line are nine or ten lines, and the small font's 8 px rows leave room for
+/// five under the header and above the countdown. So the card pages its
+/// words at rest, two at a time (review round W2, `phone_unlock::EnrolGate`):
+/// one line of words in the largest font that fits, then the scope, the
+/// style's line(s) and the hint, with the page marker ("1-2 of 5") leading
+/// the countdown row, as on the enrol card. The label moves to the hold
+/// screen ([`FullAccessHoldGeometry`]), which shows all five words while the
+/// button is down. Every panel uses the same two screens.
 #[derive(Clone, Copy, Debug)]
 pub struct FullAccessGeometry {
     /// The inverted header bar (x, y, w, h), full width, and the header
     /// text's baseline inside it.
     pub bar: (i32, i32, i32, i32),
     pub header_y: i32,
-    /// The body lines (label, scope, style lines, hold line), small font:
+    /// The words line (`w1 w2`, `w3 w4` or `w5`): its font, the largest in
+    /// which two longest words and a space fit the span, and its baseline.
+    pub word_font: &'static MonoFont<'static>,
+    pub word_y: i32,
+    /// The small-font lines under the words (scope, style lines, hint):
     /// line `i`'s baseline is `first_y + i * pitch`.
     pub first_y: i32,
     pub pitch: i32,
-    /// The countdown bar (x, y, w, h) and the seconds' position.
+    /// The page marker's x, on the countdown row.
+    pub marker_x: i32,
+    /// The countdown bar (x, y, w, h) and the seconds' position (also the
+    /// marker's baseline).
     pub countdown: (i32, i32, i32, i32),
     pub secs_x: i32,
     pub secs_y: i32,
 }
 
-/// The FULL ACCESS card's hold screen: the same inverted header, the three
-/// words (`w1 w2` then `w3`, as the card's lines have them), the hold line
-/// and the hold's progress bar.
+/// The FULL ACCESS card's hold screen: the same inverted header, the label,
+/// all five words (`w1 w2`, `w3 w4`, `w5`, the card's pages) and the hold's
+/// progress bar.
 #[derive(Clone, Copy, Debug)]
 pub struct FullAccessHoldGeometry {
+    /// Baseline of the label line (small font).
+    pub label_y: i32,
     /// The largest font in which `w1 w2` (two longest words and a space)
-    /// fits across the span.
+    /// fits across the span and the three word lines fit above the bar.
     pub word_font: &'static MonoFont<'static>,
-    pub word_y: [i32; 2],
-    /// Baseline of the hold line (small font).
-    pub hint_y: i32,
+    pub word_y: [i32; 3],
     /// The progress bar (x, y, w, h).
     pub bar: (i32, i32, i32, i32),
 }
 
 impl Layout {
     /// Characters in the FULL ACCESS card's longest fixed line
-    /// (`SIGN IN, POST, BACKUP`, `ASKS: EVERYTHING ELSE`).
+    /// (`ALONE: BACKUPS, APP DATA`, review round W9).
     #[allow(dead_code)]
-    pub const FULL_ACCESS_LINE_CHARS: i32 = 21;
+    pub const FULL_ACCESS_LINE_CHARS: i32 = 24;
 
     /// Characters in `w1 w2` at its longest: two eight-letter words and a
     /// space.
@@ -338,31 +347,42 @@ impl Layout {
     pub fn full_access_geometry(&self) -> FullAccessGeometry {
         let bar_h = self.full_access_bar_h();
         let small = self.font_small();
-        let first_top = bar_h + self.s(1);
         let (left, right) = self.text_span(None);
+        let word_font = [self.font_header(), small]
+            .into_iter()
+            .find(|font| Self::FULL_ACCESS_WORD_LINE_CHARS * Self::glyph_w(font) <= right - left)
+            .unwrap_or(small);
+        let word_top = bar_h + self.s(1);
+        let first_top = word_top + Self::glyph_h(word_font) + self.s(1);
         let secs_w = 3 * Self::glyph_w(small);
+        let marker_w = Self::ENROL_MARKER_CHARS * Self::glyph_w(small);
         let gap = self.s(2);
         let count_h = self.s(6);
         let count_y = self.sy(57);
+        let bar_x = left + marker_w + gap;
         FullAccessGeometry {
             bar: (0, 0, self.w, bar_h),
             header_y: self.s(1) + self.font_header().baseline as i32,
+            word_font,
+            word_y: word_top + word_font.baseline as i32,
             first_y: first_top + small.baseline as i32,
             pitch: Self::glyph_h(small),
-            countdown: (left, count_y, right - secs_w - gap - left, count_h),
+            marker_x: left,
+            countdown: (bar_x, count_y, right - secs_w - gap - bar_x, count_h),
             secs_x: right - secs_w,
             secs_y: count_y + count_h,
         }
     }
 
-    /// Whether `body_lines` small-font lines of up to `chars` characters fit
-    /// between the header bar and the countdown, inside the span. The
-    /// ui-preview tests ask it of both screens' line counts on every panel.
+    /// Whether `small_lines` small-font lines of up to `chars` characters fit
+    /// under the words line and above the countdown, inside the span. The
+    /// ui-preview tests ask it of the resting card's line counts on every
+    /// panel.
     #[allow(dead_code)]
-    pub fn full_access_fits(&self, body_lines: usize, chars: i32) -> bool {
+    pub fn full_access_fits(&self, small_lines: usize, chars: i32) -> bool {
         let g = self.full_access_geometry();
         let small = self.font_small();
-        let last_bottom = g.first_y - small.baseline as i32 + body_lines as i32 * g.pitch;
+        let last_bottom = g.first_y - small.baseline as i32 + small_lines as i32 * g.pitch;
         let (left, right) = self.text_span(None);
         last_bottom < g.countdown.1 && chars * Self::glyph_w(small) <= right - left
     }
@@ -370,19 +390,24 @@ impl Layout {
     /// The FULL ACCESS card's hold screen.
     pub fn full_access_hold_geometry(&self) -> FullAccessHoldGeometry {
         let (left, right) = self.text_span(None);
-        let word_font = [self.font_body(), self.font_header(), self.font_small()]
-            .into_iter()
-            .find(|font| Self::FULL_ACCESS_WORD_LINE_CHARS * Self::glyph_w(font) <= right - left)
-            .unwrap_or(self.font_small());
+        let small = self.font_small();
         let top = self.full_access_bar_h() + self.s(2);
-        let first = top + word_font.baseline as i32;
-        let second = first + Self::glyph_h(word_font);
-        let hint_top = top + 2 * Self::glyph_h(word_font) + self.s(1);
+        let words_top = top + Self::glyph_h(small) + self.s(1);
+        let bar_y = self.sy(55);
+        let word_font = [self.font_body(), self.font_header(), small]
+            .into_iter()
+            .find(|font| {
+                Self::FULL_ACCESS_WORD_LINE_CHARS * Self::glyph_w(font) <= right - left
+                    && words_top + 3 * Self::glyph_h(font) < bar_y
+            })
+            .unwrap_or(small);
+        let first = words_top + word_font.baseline as i32;
+        let h = Self::glyph_h(word_font);
         FullAccessHoldGeometry {
+            label_y: top + small.baseline as i32,
             word_font,
-            word_y: [first, second],
-            hint_y: hint_top + self.font_small().baseline as i32,
-            bar: (left, self.sy(55), right - left, self.s(8)),
+            word_y: [first, first + h, first + 2 * h],
+            bar: (left, bar_y, right - left, self.s(8)),
         }
     }
 }

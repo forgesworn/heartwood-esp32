@@ -251,6 +251,29 @@ fn register_bundle_persona(
     Ok(pubkey)
 }
 
+/// When the last FULL ACCESS card closed, in milliseconds since boot, on
+/// either transport (review round W3): the relay's card resolution and the
+/// cable's blocking loop both record it.
+static FULL_ACCESS_LAST_CLOSED_MS: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// A FULL ACCESS card has just closed, whatever its outcome.
+pub(crate) fn full_access_closed() {
+    let now = crate::uptime_ms();
+    if let Ok(mut last) = FULL_ACCESS_LAST_CLOSED_MS.lock() {
+        *last = Some(now);
+    }
+}
+
+/// Whether a bundle may raise a FULL ACCESS card now
+/// (`owner_pairing::full_access_admission`); `another_waiting` is whether a
+/// FULL ACCESS card is already queued or on screen. A poisoned lock refuses.
+pub(crate) fn full_access_admission(another_waiting: bool) -> Result<(), heartwood_common::owner_pairing::BundleError> {
+    let last = FULL_ACCESS_LAST_CLOSED_MS
+        .lock()
+        .map_err(|_| heartwood_common::owner_pairing::BundleError::ShownRecently)?;
+    heartwood_common::owner_pairing::full_access_admission(another_waiting, *last, crate::uptime_ms())
+}
+
 /// `heartwood_approve_bundle` (one-hold pairing spec 4.1-4.3), after the
 /// shared gates (an unbound client and a strict slot were refused there, an
 /// escalate slot by the relay planner and again here).
@@ -260,7 +283,10 @@ fn register_bundle_persona(
 /// when one fails, and the answer is its message alone. Keys the press would
 /// derive are computed now and compared with `expect` before the card. Then
 /// the FULL ACCESS card (5 s hold, 45 s window, never shared, never a
-/// verdict's to answer). The press registers the missing names, then takes
+/// verdict's to answer), never two at once and never within a minute of the
+/// last (review round W3: the relay checks as it queues the card, the cable
+/// here before its blocking loop). The press registers the missing names,
+/// then takes
 /// one slot step (snapshot, grants, mark, methods, signing, kinds) that is
 /// made durable before the reply, or rolled back. Other waiting cards are
 /// withdrawn by the slot step; this ask's own resume carries the authority
@@ -372,24 +398,32 @@ fn approve_bundle(
         }
         ApprovalDecision::ButtonApproved => {}
         ApprovalDecision::Interactive => {
+            // The cable blocks on this card, so nothing else can be waiting:
+            // only the minute since the last one closed is checked.
+            if let Err(e) = full_access_admission(false) {
+                log::warn!("heartwood_approve_bundle: refused — {}", e.message());
+                return refuse(e);
+            }
             let total = op::FULL_ACCESS_CARD_SECS;
             let result = crate::approval::run_full_access_approval_loop(
                 display,
                 buttons,
                 total,
-                |d, remaining| {
+                |d, remaining, page, armed| {
                     crate::oled::show_full_access(
                         d,
-                        &label,
                         &client_pubkey,
                         &bundle.act_as,
                         bundle.style,
                         remaining,
                         total as u32,
+                        page,
+                        armed,
                     )
                 },
-                |d, pct| crate::oled::show_full_access_hold(d, &client_pubkey, pct),
+                |d, pct| crate::oled::show_full_access_hold(d, &label, &client_pubkey, pct),
             );
+            full_access_closed();
             if let Some(response) = extension_approval_failure(&request.id, result) {
                 crate::oled::show_result(display, "Not approved");
                 return response;
@@ -453,8 +487,10 @@ fn approve_bundle(
 ///
 /// Narrow: `{"v":1,"style":"careful"}` sets Extra careful's kinds list on
 /// the caller's own owner pairing when its list is empty and does nothing
-/// otherwise; it never widens, so it needs no press. `unauthorised` without
-/// the mark. A change is durable before the reply, or rolled back.
+/// otherwise; it never widens, so it needs no press. The reply names the
+/// style now in force (`custom` for a list an operator narrowed).
+/// `unauthorised` without the mark. A change is durable before the reply,
+/// or rolled back.
 #[allow(clippy::too_many_arguments)]
 fn answer_owner_method(
     request: &nip46::Nip46Request,
@@ -488,7 +524,7 @@ fn answer_owner_method(
             }
             let snapshot = policy_engine.snapshot_slot_state(master_slot);
             match policy_engine.owner_narrow(master_slot, client_hex) {
-                Ok(changed) => {
+                Ok((changed, style)) => {
                     if let Err(response) =
                         persist_grant(policy_engine, nvs, master_slot, &request.id, snapshot, changed)
                     {
@@ -497,7 +533,7 @@ fn answer_owner_method(
                     if changed {
                         log::info!("heartwood_owner_narrow: pairing narrowed to Extra careful");
                     }
-                    nip46::build_result_response(&request.id, &op::owner_narrow_json(changed)).unwrap_or_default()
+                    nip46::build_result_response(&request.id, &op::owner_narrow_json(style, changed)).unwrap_or_default()
                 }
                 Err(e) => refuse(e),
             }
@@ -773,7 +809,8 @@ pub enum AskCard {
     /// The setup hold, `heartwood_approve_bundle` (one-hold pairing spec
     /// 4.2): the inverted FULL ACCESS card, a 5 s hold, a 45 s window, never
     /// shared. Its lines come from `owner_pairing::full_access_card`: the
-    /// pairing's `label`, the three words of `client_pubkey`, the scope
+    /// pairing's `label`, the five words of `client_pubkey` (paged at rest,
+    /// all on the hold screen), the scope
     /// `act_as` grants and the `style`'s lines.
     FullAccess {
         label: String,

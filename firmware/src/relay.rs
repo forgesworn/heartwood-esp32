@@ -6389,6 +6389,11 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     if ctx.button_cards.is_empty() {
         return CardTick::Pending;
     }
+    // A FULL ACCESS card a second bundle closed is never ticked towards an
+    // approval, whoever calls this (review round W3).
+    if let Some(refusal) = ctx.button_cards[0].refused {
+        return CardTick::Refused(refusal);
+    }
     let now = Instant::now();
     if ctx.button_cards[0].opened_at.is_none() {
         // Anything the sampler latched before the card went up belongs to

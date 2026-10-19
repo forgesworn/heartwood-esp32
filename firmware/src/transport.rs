@@ -66,6 +66,8 @@ pub fn persist_fresh_identities(
 ///
 /// Payload layout: [master_pubkey_32][client_pubkey_32][created_at_u64_be_8][ciphertext_b64...]
 ///
+/// `bundle_only`: see the parameter.
+///
 /// Decrypts the NIP-44 ciphertext using the target master's secret,
 /// dispatches to the NIP-46 handler, re-encrypts the response, then
 /// builds and signs a kind:24133 envelope event inline. The signed
@@ -82,6 +84,11 @@ pub fn handle_encrypted_request(
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     nvs: &mut EspNvs<NvsDefault>,
+    // WiFi loop only: the screen is busy with a relay card, and that card
+    // is FULL ACCESS. Only a `heartwood_approve_bundle` is dispatched (it is
+    // refused before any card of its own, and closes the relay card); any
+    // other request gets "approval on screen", as it did before the decrypt.
+    bundle_only: bool,
 ) {
     if frame.payload.len() < 73 {
         log::warn!("Encrypted request too short ({} bytes)", frame.payload.len());
@@ -214,6 +221,11 @@ pub fn handle_encrypted_request(
         }
     };
     drop(plaintext_json);
+
+    if bundle_only && request.method != heartwood_common::owner_pairing::BUNDLE_METHOD {
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+        return;
+    }
 
     let client_pubkey_hex = hex_encode(&client_pubkey);
     let request_id = request.id.clone();

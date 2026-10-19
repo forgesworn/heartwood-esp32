@@ -843,7 +843,19 @@ pub struct BundleBoard {
 /// Every check of spec 4.1, before any card, in the order that leaks least:
 /// the params' shape (needs nothing), then the slot (so an unbound client,
 /// a strict slot or a shared pairing learns nothing about the registry),
-/// then room, then the registry (`persona missing`, `pubkey mismatch`).
+/// then `admission`, then room, then the registry (`persona missing`,
+/// `pubkey mismatch`).
+///
+/// `admission` is the one-card-at-a-time rule
+/// ([`full_access_admission`], review round W3) on the passes that may raise
+/// a card, `|| Ok(())` on the pass a hold already answered. It runs before
+/// room and the registry (review round 2, S3): after them, a right `expect`
+/// guess reached `full access card shown recently` and a wrong one got
+/// `pubkey mismatch`, so the minute after any FULL ACCESS card was a
+/// card-free oracle. Now every bundle in that minute, or while another
+/// waits, gets the same refusal whatever it guesses. A bundle refused here
+/// for another waiting still closes that card, though it might later have
+/// failed the registry: the same client could as well send a valid one.
 ///
 /// Room before the registry (review round W7): a bound, exclusive
 /// Everything slot could otherwise learn, with no card, whether a guessed
@@ -860,11 +872,13 @@ pub fn validate_bundle(
     slot: Option<&ConnectSlot>,
     client_hex: &str,
     board: BundleBoard,
+    admission: impl FnOnce() -> Result<(), BundleError>,
     lookup: impl Fn(&str) -> Option<[u8; 32]>,
 ) -> Result<(BundleRequest, BundlePlan), BundleError> {
     let request = parse_bundle_params(params)?;
     check_bundle_slot(slot, client_hex)?;
     let slot = slot.ok_or(BundleError::Unauthorised)?;
+    admission()?;
     let plan = resolve_bundle(&request, lookup);
     check_bundle_room(slot, client_hex, &request, &plan, board.has_tree, board.registry_free)?;
     check_bundle_registry(&request, &plan)?;
@@ -1415,7 +1429,7 @@ mod tests {
         let params = [Value::String(json)];
         let board = BundleBoard { has_tree: true, registry_free: 8 };
         assert_eq!(
-            validate_bundle(&params, Some(&slot), CLIENT, board, persona_only).unwrap_err(),
+            validate_bundle(&params, Some(&slot), CLIENT, board, || Ok(()), persona_only).unwrap_err(),
             BundleError::PersonaMissing
         );
         // Validation is pure: the slot is untouched.
@@ -1474,30 +1488,94 @@ mod tests {
         }
         for key in [PERSONA, [0x99; 32]] {
             assert_eq!(
-                validate_bundle(&guess(key), Some(&full), CLIENT, board, registry).unwrap_err(),
+                validate_bundle(&guess(key), Some(&full), CLIENT, board, || Ok(()), registry).unwrap_err(),
                 BundleError::ApprovalListFull,
                 "no room: the same answer whatever the guess"
             );
         }
         let room = everything_slot();
         assert_eq!(
-            validate_bundle(&guess([0x99; 32]), Some(&room), CLIENT, board, registry).unwrap_err(),
+            validate_bundle(&guess([0x99; 32]), Some(&room), CLIENT, board, || Ok(()), registry).unwrap_err(),
             BundleError::PubkeyMismatch
         );
-        assert!(validate_bundle(&guess(PERSONA), Some(&room), CLIENT, board, registry).is_ok());
+        assert!(validate_bundle(&guess(PERSONA), Some(&room), CLIENT, board, || Ok(()), registry).is_ok());
         // A missing name with create:false the same way: room first.
         let missing = [Value::String(format!(
             r#"{{"v":1,"personas":["natural-person"],"act_as":["natural-person"],"expect":{{"natural-person":"{}"}},"create":false}}"#,
             hex(&NP)
         ))];
         assert_eq!(
-            validate_bundle(&missing, Some(&full), CLIENT, board, persona_only).unwrap_err(),
+            validate_bundle(&missing, Some(&full), CLIENT, board, || Ok(()), persona_only).unwrap_err(),
             BundleError::ApprovalListFull
         );
         assert_eq!(
-            validate_bundle(&missing, Some(&room), CLIENT, board, persona_only).unwrap_err(),
+            validate_bundle(&missing, Some(&room), CLIENT, board, || Ok(()), persona_only).unwrap_err(),
             BundleError::PersonaMissing
         );
+    }
+
+    #[test]
+    fn the_one_card_rule_comes_before_room_and_the_registry_so_a_guess_learns_nothing() {
+        // Review round 2, S3. During the minute after a FULL ACCESS card
+        // closed, or while another waits, a right and a wrong `expect` guess
+        // get the same refusal, and the registry is never read; outside it,
+        // a wrong guess is refused and a right one passes to the card.
+        let guess = |key: [u8; 32]| {
+            [Value::String(format!(
+                r#"{{"v":1,"personas":["persona"],"act_as":["persona"],"expect":{{"persona":"{}"}},"create":false}}"#,
+                hex(&key)
+            ))]
+        };
+        let board = BundleBoard { has_tree: true, registry_free: 8 };
+        let slot = everything_slot();
+        let unread = |_: &str| -> Option<[u8; 32]> { panic!("registry read before the one-card rule") };
+        let closed = 1_000_000u64;
+        for (waiting, now, refusal) in [
+            (false, closed + 30_000, BundleError::ShownRecently),
+            (true, closed + 30_000, BundleError::AnotherFullAccess),
+            (true, closed + 600_000, BundleError::AnotherFullAccess),
+        ] {
+            for key in [PERSONA, [0x99; 32]] {
+                assert_eq!(
+                    validate_bundle(
+                        &guess(key),
+                        Some(&slot),
+                        CLIENT,
+                        board,
+                        || full_access_admission(waiting, Some(closed), now),
+                        unread,
+                    )
+                    .unwrap_err(),
+                    refusal,
+                    "the same answer whatever the guess"
+                );
+            }
+        }
+        // Room comes after the rule too: a slot with no room is refused by
+        // the rule first.
+        let mut full = everything_slot();
+        for i in 0..16u8 {
+            assert!(record_client_identity(&mut full, CLIENT, &[0x40 + i; 32]));
+        }
+        assert_eq!(
+            validate_bundle(
+                &guess(PERSONA),
+                Some(&full),
+                CLIENT,
+                board,
+                || full_access_admission(false, Some(closed), closed + 1),
+                unread,
+            )
+            .unwrap_err(),
+            BundleError::ShownRecently
+        );
+        // Past the minute with nothing waiting, the registry decides.
+        let after = || full_access_admission(false, Some(closed), closed + 60_000);
+        assert_eq!(
+            validate_bundle(&guess([0x99; 32]), Some(&slot), CLIENT, board, after, registry).unwrap_err(),
+            BundleError::PubkeyMismatch
+        );
+        assert!(validate_bundle(&guess(PERSONA), Some(&slot), CLIENT, board, after, registry).is_ok());
     }
 
     // --- 4.1 slot rows ---
@@ -1561,11 +1639,14 @@ mod tests {
         ))];
         let board = BundleBoard { has_tree: true, registry_free: 8 };
         let lookup = |_: &str| -> Option<[u8; 32]> { panic!("registry consulted before the slot checks") };
-        assert_eq!(validate_bundle(&params, None, CLIENT, board, lookup).unwrap_err(), BundleError::Unauthorised);
+        // Nor does the one-card rule run first: an unbound client must not
+        // close the owner's waiting card (review round 2, S3).
+        let admission = || -> Result<(), BundleError> { panic!("admission checked before the slot checks") };
+        assert_eq!(validate_bundle(&params, None, CLIENT, board, admission, lookup).unwrap_err(), BundleError::Unauthorised);
         let mut strict = everything_slot();
         strict.strict_permissions = true;
         assert_eq!(
-            validate_bundle(&params, Some(&strict), CLIENT, board, lookup).unwrap_err(),
+            validate_bundle(&params, Some(&strict), CLIENT, board, admission, lookup).unwrap_err(),
             BundleError::Unauthorised
         );
     }

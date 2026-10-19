@@ -4102,7 +4102,12 @@ fn poll_usb_frame(
         &frame.payload,
         stored_net_config.as_deref(),
     );
-    if claim == heartwood_common::phone_unlock::CableClaim::Card && cable_card_refused(ctx) {
+    // Except an encrypted request while a relay FULL ACCESS card waits: it
+    // may be a second bundle, which must close that card (review round W3,
+    // round 2 S1), so its arm decrypts it and lets nothing but a bundle
+    // through, and a bundle there is refused before any card of its own.
+    let bundle_may_race = frame.frame_type == FRAME_TYPE_ENCRYPTED_REQUEST && full_access_waiting(ctx);
+    if claim == heartwood_common::phone_unlock::CableClaim::Card && cable_card_refused(ctx) && !bundle_may_race {
         crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
         // Some of these carry secrets (a PIN, a vault key, a seed).
         frame.scrub_payload();
@@ -4208,25 +4213,41 @@ fn poll_usb_frame(
         }
 
         // Encrypted NIP-46 (bridge transport) — requires an authenticated bridge.
+        //
+        // While a relay FULL ACCESS card waits (on screen, queued, or with
+        // its window passed but not yet ticked out), a bundle over the cable
+        // is a second bundle (review round W3, round 2 S1): it is refused
+        // `another full access request arrived` before any card of its own,
+        // and the relay card closes with the same reply, nothing granted.
+        // With the screen busy, anything else is still refused "approval on
+        // screen", only now after the decrypt that tells the two apart.
         FRAME_TYPE_ENCRYPTED_REQUEST => {
-            if cable_card_refused(ctx) {
+            let waiting = full_access_waiting(ctx);
+            let busy = cable_card_refused(ctx);
+            if busy && !waiting {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
             } else if !ctx.policy_engine.bridge_authenticated {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             } else {
                 let personas_before = ctx.personas.len();
-                crate::transport::handle_encrypted_request(
-                    usb,
-                    &frame,
-                    ctx.masters,
-                    ctx.personas,
-                    ctx.secp,
-                    ctx.display,
-                    ctx.buttons,
-                    ctx.policy_engine,
-                    ctx.identity_caches,
-                    ctx.nvs,
-                );
+                let ((), raced) = crate::nip46_handler::with_full_access_waiting(waiting, || {
+                    crate::transport::handle_encrypted_request(
+                        usb,
+                        &frame,
+                        ctx.masters,
+                        ctx.personas,
+                        ctx.secp,
+                        ctx.display,
+                        ctx.buttons,
+                        ctx.policy_engine,
+                        ctx.identity_caches,
+                        ctx.nvs,
+                        busy,
+                    )
+                });
+                if raced {
+                    refuse_waiting_full_access(ctx);
+                }
                 if ctx.personas.len() != personas_before {
                     ctx.resubscribe_needed = true;
                 }
@@ -5773,6 +5794,23 @@ fn is_full_access_card(card: &ButtonCard) -> bool {
         .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::FullAccess { .. }))
 }
 
+/// Whether a FULL ACCESS card is queued or on screen, its window passed or
+/// not (review round 2, S1: an overdue card is still one a hold may answer
+/// until the loop ticks it out).
+fn full_access_waiting(ctx: &SignCtx) -> bool {
+    ctx.button_cards.iter().any(is_full_access_card)
+}
+
+/// Close every waiting FULL ACCESS card with nothing granted (review round
+/// W3): a second bundle arrived. Each is answered
+/// `unauthorised: another full access request arrived` on the next pass of
+/// `service_button_cards`, before any press on it is judged.
+fn refuse_waiting_full_access(ctx: &mut SignCtx) {
+    for card in ctx.button_cards.iter_mut().filter(|card| is_full_access_card(card)) {
+        card.refused = Some(heartwood_common::owner_pairing::BundleError::AnotherFullAccess);
+    }
+}
+
 /// Whether this card pages five words at rest and arms only once they have
 /// all been shown (`phone_unlock::EnrolGate`): the enrol card, and the FULL
 /// ACCESS card (review round W2).
@@ -5961,7 +5999,10 @@ fn queue_button_ask(
     use heartwood_common::approval_queue::{admit, Admission, AskKey};
 
     // One FULL ACCESS card at a time (review round W3), before the queue
-    // looks at it: a bundle that arrives while another waits (queued or on
+    // looks at it. The bundle's own validation already applied this rule,
+    // after its slot check and before room and the registry (review round
+    // 2, S3), against the same queue, so this is a second fence that should
+    // never fire: a bundle that arrives while another waits (queued or on
     // screen) is refused, and so is the waiting one, on the next pass of
     // `service_button_cards`, with nothing granted; one that arrives within
     // a minute of the last FULL ACCESS card closing is refused and never
@@ -5971,9 +6012,7 @@ fn queue_button_ask(
         let waiting = ctx.button_cards.iter().any(is_full_access_card);
         if let Err(refusal) = crate::nip46_handler::full_access_admission(waiting) {
             if refusal == heartwood_common::owner_pairing::BundleError::AnotherFullAccess {
-                for card in ctx.button_cards.iter_mut().filter(|card| is_full_access_card(card)) {
-                    card.refused = Some(refusal);
-                }
+                refuse_waiting_full_access(ctx);
             }
             log::warn!("[relay] heartwood_approve_bundle {} refused: {}", ask.request.id, refusal.message());
             let response =
@@ -8342,24 +8381,35 @@ fn handle_nip46_event(
     // for the length of a window (#64). The card goes up, the loop carries on,
     // and the request is dispatched by `resolve_button_card` once the hold is
     // in hand.
-    let mut response_json = match crate::nip46_handler::dispatch(
-        request,
-        None,
-        None,
-        &signing_secret,
-        &label,
-        mode,
-        slot,
-        ctx.secp,
-        ctx.display,
-        ctx.buttons,
-        ctx.policy_engine,
-        ctx.identity_caches,
-        Some(&client_pubkey),
-        ctx.nvs,
-        ctx.personas,
-        crate::nip46_handler::ApprovalDecision::Deferred,
-    ) {
+    //
+    // A bundle sees whether a FULL ACCESS card already waits (review round
+    // W3, checked inside its validation, review round 2 S3), and one refused
+    // for it closes that card.
+    let waiting = full_access_waiting(ctx);
+    let (dispatched, raced) = crate::nip46_handler::with_full_access_waiting(waiting, || {
+        crate::nip46_handler::dispatch(
+            request,
+            None,
+            None,
+            &signing_secret,
+            &label,
+            mode,
+            slot,
+            ctx.secp,
+            ctx.display,
+            ctx.buttons,
+            ctx.policy_engine,
+            ctx.identity_caches,
+            Some(&client_pubkey),
+            ctx.nvs,
+            ctx.personas,
+            crate::nip46_handler::ApprovalDecision::Deferred,
+        )
+    });
+    if raced {
+        refuse_waiting_full_access(ctx);
+    }
+    let mut response_json = match dispatched {
         crate::nip46_handler::Dispatch::Answered(json) => json,
         crate::nip46_handler::Dispatch::NeedsApproval(ask) => {
             return queue_button_ask(

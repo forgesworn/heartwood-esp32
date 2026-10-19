@@ -1350,6 +1350,8 @@ fn main() {
                         &mut policy_engine,
                         &mut identity_caches,
                         &mut nvs,
+                        // No relay cards in this loop.
+                        false,
                     );
                 }
             }

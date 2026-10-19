@@ -274,18 +274,60 @@ pub(crate) fn full_access_admission(another_waiting: bool) -> Result<(), heartwo
     heartwood_common::owner_pairing::full_access_admission(another_waiting, *last, crate::uptime_ms())
 }
 
+/// Whether a relay FULL ACCESS card is queued or on screen while the
+/// current request is dispatched; set only inside
+/// [`with_full_access_waiting`], false everywhere else (the USB-bridged loop
+/// has no relay cards, and a cable card blocks its loop, so nothing else can
+/// wait beside it).
+static FULL_ACCESS_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set when a bundle dispatched inside [`with_full_access_waiting`] was
+/// refused because a FULL ACCESS card was waiting: the caller closes that
+/// card with the same reply.
+static FULL_ACCESS_RACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Dispatch with `waiting` (a relay FULL ACCESS card is queued or on
+/// screen) visible to a bundle's one-card rule (review round W3), which
+/// runs inside `validate_bundle`, after the slot and before room and the
+/// registry (review round 2, S3), where the relay loop's card queue cannot
+/// be seen. Returns `f`'s result and whether a bundle was refused for that
+/// card, in which case the caller must close every waiting FULL ACCESS card
+/// with `AnotherFullAccess` (review round 2, S1: this is how a cable bundle
+/// closes a relay card too). Single-threaded: the relay loop and the
+/// USB-bridged loop never dispatch at once.
+pub(crate) fn with_full_access_waiting<R>(waiting: bool, f: impl FnOnce() -> R) -> (R, bool) {
+    use std::sync::atomic::Ordering;
+    FULL_ACCESS_WAITING.store(waiting, Ordering::SeqCst);
+    FULL_ACCESS_RACED.store(false, Ordering::SeqCst);
+    let out = f();
+    FULL_ACCESS_WAITING.store(false, Ordering::SeqCst);
+    (out, FULL_ACCESS_RACED.swap(false, Ordering::SeqCst))
+}
+
+/// The one-card rule for a bundle that may raise its card on this pass.
+fn bundle_admission() -> Result<(), heartwood_common::owner_pairing::BundleError> {
+    use std::sync::atomic::Ordering;
+    let waiting = FULL_ACCESS_WAITING.load(Ordering::SeqCst);
+    let admitted = full_access_admission(waiting);
+    if admitted == Err(heartwood_common::owner_pairing::BundleError::AnotherFullAccess) {
+        FULL_ACCESS_RACED.store(true, Ordering::SeqCst);
+    }
+    admitted
+}
+
 /// `heartwood_approve_bundle` (one-hold pairing spec 4.1-4.3), after the
 /// shared gates (an unbound client and a strict slot were refused there, an
 /// escalate slot by the relay planner and again here).
 ///
-/// Every check of 4.1 runs first, in the settled order (param, slot,
-/// registry and `expect`, room), on every pass: nothing is shown or changed
-/// when one fails, and the answer is its message alone. Keys the press would
-/// derive are computed now and compared with `expect` before the card. Then
-/// the FULL ACCESS card (5 s hold, 45 s window, never shared, never a
-/// verdict's to answer), never two at once and never within a minute of the
-/// last (review round W3: the relay checks as it queues the card, the cable
-/// here before its blocking loop). The press registers the missing names,
+/// Every check of 4.1 runs first, in the settled order (param, persona
+/// target, slot, the one-card rule, room, registry and `expect`), on every
+/// pass: nothing is shown or changed when one fails, and the answer is its
+/// message alone. Keys the press would derive are computed now and compared
+/// with `expect` before the card. Then the FULL ACCESS card (5 s hold, 45 s
+/// window, never shared, never a verdict's to answer), never two at once
+/// and never within a minute of the last (review round W3, checked after
+/// the slot and before room and the registry on the passes that may raise
+/// the card, review round 2 S3). The press registers the missing names,
 /// then takes
 /// one slot step (snapshot, grants, mark, methods, signing, kinds) that is
 /// made durable before the reply, or rolled back. Other waiting cards are
@@ -344,7 +386,12 @@ fn approve_bundle(
         },
     };
     let slot = policy_engine.find_slot_by_pubkey(master_slot, client_hex);
-    let (bundle, plan) = match op::validate_bundle(&request.params, slot, client_hex, board, |name| {
+    // The one-card rule on the passes that may raise the card. Never on the
+    // pass a hold answered: the card it answered has just closed, and that
+    // re-run would refuse the owner's own approval as shown recently.
+    let may_raise_card = matches!(approval, ApprovalDecision::Deferred | ApprovalDecision::Interactive);
+    let admission = || if may_raise_card { bundle_admission() } else { Ok(()) };
+    let (bundle, plan) = match op::validate_bundle(&request.params, slot, client_hex, board, admission, |name| {
         registered_persona(personas, master_slot, name)
     }) {
         Ok(checked) => checked,
@@ -402,12 +449,11 @@ fn approve_bundle(
         }
         ApprovalDecision::ButtonApproved => {}
         ApprovalDecision::Interactive => {
-            // The cable blocks on this card, so nothing else can be waiting:
-            // only the minute since the last one closed is checked.
-            if let Err(e) = full_access_admission(false) {
-                log::warn!("heartwood_approve_bundle: refused — {}", e.message());
-                return refuse(e);
-            }
+            // The one-card rule ran in `validate_bundle`. Nothing can wait
+            // beside this card while it blocks: in the USB-bridged loop
+            // there are no relay cards, and in the WiFi loop a relay FULL
+            // ACCESS card, even one whose window has passed, was seen by
+            // `with_full_access_waiting` and refused this bundle there.
             let total = op::FULL_ACCESS_CARD_SECS;
             let result = crate::approval::run_full_access_approval_loop(
                 display,

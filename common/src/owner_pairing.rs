@@ -182,6 +182,10 @@ pub enum BundleError {
     ApprovalListFull,
     /// `-4 method list full`
     MethodListFull,
+    /// `-4 no room to save this pairing`: the master's slot table, as the
+    /// press would leave it, does not fit beside the one it replaces in the
+    /// partition's free entries ([`check_bundle_save_room`]). No card.
+    NoRoomToSave,
     /// `unauthorised: another full access request arrived` (review round
     /// W3): a bundle came while another was waiting, queued or on screen.
     /// Both get this reply, and the waiting card closes with nothing granted.
@@ -210,7 +214,11 @@ impl BundleError {
             | Self::AnotherFullAccess
             | Self::ShownRecently
             | Self::QueueBusy => -1,
-            Self::NoPersonaTree | Self::StorageFull | Self::ApprovalListFull | Self::MethodListFull => -4,
+            Self::NoPersonaTree
+            | Self::StorageFull
+            | Self::ApprovalListFull
+            | Self::MethodListFull
+            | Self::NoRoomToSave => -4,
         }
     }
 
@@ -229,6 +237,7 @@ impl BundleError {
             Self::StorageFull => "storage full",
             Self::ApprovalListFull => "approval list full",
             Self::MethodListFull => "method list full",
+            Self::NoRoomToSave => "no room to save this pairing",
             Self::AnotherFullAccess => "unauthorised: another full access request arrived",
             Self::ShownRecently => "unauthorised: full access card shown recently",
             Self::QueueBusy => crate::approval_queue::BUSY_ERROR,
@@ -838,6 +847,108 @@ pub fn check_bundle_room(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Save room (spec 4.1, the room phase): will the press's slot write fit?
+// ---------------------------------------------------------------------------
+
+/// The length of the master's slot table as the press would leave it,
+/// serialised exactly as the firmware's `persist_slots` writes it
+/// (`serde_json::to_string` of the whole table), or `None` when the press
+/// would change nothing and so write nothing.
+///
+/// `table` is the master's slot table and `slot` the caller's slot (found by
+/// `slot_index`; appended when absent, which can only overstate). Names the
+/// press will derive have no key yet: each `act_as` one gets a distinct
+/// stand-in, which serialises to the same length as the real key (grants
+/// are fixed-width hex). Run after [`check_bundle_room`]: a grant that does
+/// not fit is that check's refusal, and here it is passed on.
+pub fn projected_slot_table_len(
+    table: &[ConnectSlot],
+    slot: &ConnectSlot,
+    client_hex: &str,
+    request: &BundleRequest,
+    plan: &BundlePlan,
+) -> Result<Option<usize>, BundleError> {
+    let act_as: Vec<[u8; 32]> = request
+        .act_as
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            plan.registered(name).unwrap_or_else(|| {
+                let mut stand_in = [0xA5u8; 32];
+                stand_in[31] = i as u8;
+                stand_in
+            })
+        })
+        .collect();
+    let mut projected: Vec<ConnectSlot> = table.to_vec();
+    let at = match projected.iter().position(|s| s.slot_index == slot.slot_index) {
+        Some(at) => {
+            projected[at] = slot.clone();
+            at
+        }
+        None => {
+            projected.push(slot.clone());
+            projected.len() - 1
+        }
+    };
+    if !apply_bundle_press(&mut projected[at], client_hex, &act_as, request.style)? {
+        return Ok(None);
+    }
+    serde_json::to_string(&projected)
+        .map(|json| Some(json.len()))
+        .map_err(|_| BundleError::NoRoomToSave)
+}
+
+/// NVS entries the press's persona registrations add before its slot write
+/// (a `create: true` bundle naming unregistered personas): each grows the
+/// packed registry by one entry ([`crate::persona_pack::packed_entry_len`]),
+/// counted as if it were a new blob, which covers both a chunk that grows
+/// and one that starts. The chunk's own copy-on-write peak is not counted
+/// here: the persona registry's capacity check guards that write.
+pub fn registry_write_entries(plan: &BundlePlan) -> usize {
+    plan.resolved
+        .iter()
+        .filter(|(_, key)| key.is_none())
+        .map(|(name, _)| {
+            let purpose_len = "nostr:persona:".len() + name.len();
+            let name_len = name.len().min(crate::persona_pack::MAX_NAME_LEN);
+            crate::nvs_room::blob_entries(crate::persona_pack::packed_entry_len(purpose_len, name_len))
+        })
+        .sum()
+}
+
+/// The save-room row of spec 4.1's room phase: refuse with
+/// [`BundleError::NoRoomToSave`], before any card, when the slot table the
+/// press would write ([`projected_slot_table_len`]) plus the registry
+/// entries it writes first ([`registry_write_entries`]) do not fit in the
+/// partition's free entries while the old table still holds its own
+/// ([`crate::nvs_room`]). `nvs` is `None` when the firmware could not read
+/// the stats: the check then passes, as the persona gate does, and the
+/// write's read-back still refuses cleanly after the hold. A press that
+/// changes nothing writes nothing and always fits.
+pub fn check_bundle_save_room(
+    table: &[ConnectSlot],
+    slot: &ConnectSlot,
+    client_hex: &str,
+    request: &BundleRequest,
+    plan: &BundlePlan,
+    nvs: Option<crate::nvs_room::NvsRoom>,
+) -> Result<(), BundleError> {
+    let Some(nvs) = nvs else {
+        return Ok(());
+    };
+    let Some(len) = projected_slot_table_len(table, slot, client_hex, request, plan)? else {
+        return Ok(());
+    };
+    let needed = crate::nvs_room::blob_entries(len) + registry_write_entries(plan);
+    if nvs.fits(needed) {
+        Ok(())
+    } else {
+        Err(BundleError::NoRoomToSave)
+    }
+}
+
 /// Facts about the board the bundle's checks need beyond the slot.
 #[derive(Debug, Clone, Copy)]
 pub struct BundleBoard {
@@ -872,6 +983,14 @@ pub struct BundleBoard {
 /// card the owner sees. The firmware's derive-then-[`check_expect`] step for
 /// names not yet registered runs after this, so after room too.
 ///
+/// `save_room` is the last room row, after the -4 rows of
+/// [`check_bundle_room`] and before the registry: the firmware's
+/// [`check_bundle_save_room`] (will the slot table the press writes fit in
+/// NVS?), `|_, _| Ok(())` where nothing is written. It depends on the names
+/// the registry holds, never on `expect`, so a right and a wrong guess get
+/// the same `no room to save this pairing`, and no owner holds for a grant
+/// that cannot be saved.
+///
 /// On `Ok` the firmware raises the FULL ACCESS card; on `Err` it answers
 /// `err.message()` and changes nothing.
 pub fn validate_bundle(
@@ -880,6 +999,7 @@ pub fn validate_bundle(
     client_hex: &str,
     board: BundleBoard,
     admission: impl FnOnce() -> Result<(), BundleError>,
+    save_room: impl FnOnce(&BundleRequest, &BundlePlan) -> Result<(), BundleError>,
     lookup: impl Fn(&str) -> Option<[u8; 32]>,
 ) -> Result<(BundleRequest, BundlePlan), BundleError> {
     let request = parse_bundle_params(params)?;
@@ -888,6 +1008,7 @@ pub fn validate_bundle(
     admission()?;
     let plan = resolve_bundle(&request, lookup);
     check_bundle_room(slot, client_hex, &request, &plan, board.has_tree, board.registry_free)?;
+    save_room(&request, &plan)?;
     check_bundle_registry(&request, &plan)?;
     Ok((request, plan))
 }
@@ -1457,7 +1578,7 @@ mod tests {
         let params = [Value::String(json)];
         let board = BundleBoard { has_tree: true, registry_free: 8 };
         assert_eq!(
-            validate_bundle(&params, Some(&slot), CLIENT, board, || Ok(()), persona_only).unwrap_err(),
+            validate_bundle(&params, Some(&slot), CLIENT, board, || Ok(()), |_, _| Ok(()), persona_only).unwrap_err(),
             BundleError::PersonaMissing
         );
         // Validation is pure: the slot is untouched.
@@ -1516,28 +1637,28 @@ mod tests {
         }
         for key in [PERSONA, [0x99; 32]] {
             assert_eq!(
-                validate_bundle(&guess(key), Some(&full), CLIENT, board, || Ok(()), registry).unwrap_err(),
+                validate_bundle(&guess(key), Some(&full), CLIENT, board, || Ok(()), |_, _| Ok(()), registry).unwrap_err(),
                 BundleError::ApprovalListFull,
                 "no room: the same answer whatever the guess"
             );
         }
         let room = everything_slot();
         assert_eq!(
-            validate_bundle(&guess([0x99; 32]), Some(&room), CLIENT, board, || Ok(()), registry).unwrap_err(),
+            validate_bundle(&guess([0x99; 32]), Some(&room), CLIENT, board, || Ok(()), |_, _| Ok(()), registry).unwrap_err(),
             BundleError::PubkeyMismatch
         );
-        assert!(validate_bundle(&guess(PERSONA), Some(&room), CLIENT, board, || Ok(()), registry).is_ok());
+        assert!(validate_bundle(&guess(PERSONA), Some(&room), CLIENT, board, || Ok(()), |_, _| Ok(()), registry).is_ok());
         // A missing name with create:false the same way: room first.
         let missing = [Value::String(format!(
             r#"{{"v":1,"personas":["natural-person"],"act_as":["natural-person"],"expect":{{"natural-person":"{}"}},"create":false}}"#,
             hex(&NP)
         ))];
         assert_eq!(
-            validate_bundle(&missing, Some(&full), CLIENT, board, || Ok(()), persona_only).unwrap_err(),
+            validate_bundle(&missing, Some(&full), CLIENT, board, || Ok(()), |_, _| Ok(()), persona_only).unwrap_err(),
             BundleError::ApprovalListFull
         );
         assert_eq!(
-            validate_bundle(&missing, Some(&room), CLIENT, board, || Ok(()), persona_only).unwrap_err(),
+            validate_bundle(&missing, Some(&room), CLIENT, board, || Ok(()), |_, _| Ok(()), persona_only).unwrap_err(),
             BundleError::PersonaMissing
         );
     }
@@ -1571,6 +1692,7 @@ mod tests {
                         CLIENT,
                         board,
                         || full_access_admission(waiting, Some(closed), now),
+                        |_, _| Ok(()),
                         unread,
                     )
                     .unwrap_err(),
@@ -1592,6 +1714,7 @@ mod tests {
                 CLIENT,
                 board,
                 || full_access_admission(false, Some(closed), closed + 1),
+                |_, _| Ok(()),
                 unread,
             )
             .unwrap_err(),
@@ -1607,6 +1730,7 @@ mod tests {
                     CLIENT,
                     board,
                     || bundle_admission(false, true, None, closed),
+                    |_, _| Ok(()),
                     unread,
                 )
                 .unwrap_err(),
@@ -1621,10 +1745,10 @@ mod tests {
         // Past the minute with nothing waiting, the registry decides.
         let after = || full_access_admission(false, Some(closed), closed + 60_000);
         assert_eq!(
-            validate_bundle(&guess([0x99; 32]), Some(&slot), CLIENT, board, after, registry).unwrap_err(),
+            validate_bundle(&guess([0x99; 32]), Some(&slot), CLIENT, board, after, |_, _| Ok(()), registry).unwrap_err(),
             BundleError::PubkeyMismatch
         );
-        assert!(validate_bundle(&guess(PERSONA), Some(&slot), CLIENT, board, after, registry).is_ok());
+        assert!(validate_bundle(&guess(PERSONA), Some(&slot), CLIENT, board, after, |_, _| Ok(()), registry).is_ok());
     }
 
     // --- 4.1 slot rows ---
@@ -1691,11 +1815,14 @@ mod tests {
         // Nor does the one-card rule run first: an unbound client must not
         // close the owner's waiting card (review round 2, S3).
         let admission = || -> Result<(), BundleError> { panic!("admission checked before the slot checks") };
-        assert_eq!(validate_bundle(&params, None, CLIENT, board, admission, lookup).unwrap_err(), BundleError::Unauthorised);
+        let save_room = |_: &BundleRequest, _: &BundlePlan| -> Result<(), BundleError> {
+            panic!("save room checked before the slot checks")
+        };
+        assert_eq!(validate_bundle(&params, None, CLIENT, board, admission, save_room, lookup).unwrap_err(), BundleError::Unauthorised);
         let mut strict = everything_slot();
         strict.strict_permissions = true;
         assert_eq!(
-            validate_bundle(&params, Some(&strict), CLIENT, board, admission, lookup).unwrap_err(),
+            validate_bundle(&params, Some(&strict), CLIENT, board, admission, save_room, lookup).unwrap_err(),
             BundleError::Unauthorised
         );
     }
@@ -1752,12 +1879,181 @@ mod tests {
             (BundleError::StorageFull, -4, "storage full"),
             (BundleError::ApprovalListFull, -4, "approval list full"),
             (BundleError::MethodListFull, -4, "method list full"),
+            (BundleError::NoRoomToSave, -4, "no room to save this pairing"),
             (BundleError::Malformed, -3, "malformed bundle"),
             (BundleError::PersonaMissing, -3, "persona missing"),
             (BundleError::PubkeyMismatch, -3, "pubkey mismatch"),
         ] {
             assert_eq!((error.code(), error.message()), (code, message));
         }
+    }
+
+    // --- 4.1 save room ---
+
+    /// A master's table of `n` pairings, the caller's Everything slot first.
+    fn table_of(n: u8) -> Vec<ConnectSlot> {
+        (0..n)
+            .map(|i| {
+                let mut slot = everything_slot();
+                slot.slot_index = i;
+                if i > 0 {
+                    let other = crate::hex::hex_encode(&[0x50 + i; 32]);
+                    slot.label = format!("App {i}");
+                    slot.current_pubkey = Some(other.clone());
+                    slot.authorized_pubkeys = vec![other];
+                }
+                slot
+            })
+            .collect()
+    }
+
+    fn nvs(free_entries: usize) -> Option<crate::nvs_room::NvsRoom> {
+        Some(crate::nvs_room::NvsRoom { free_entries, reclaimable_entries: 0 })
+    }
+
+    #[test]
+    fn the_projected_table_is_the_table_the_press_writes() {
+        let table = table_of(3);
+        let slot = table[0].clone();
+        // Registered names: the projection is the serialised table after
+        // the real press.
+        let request = bundle(&create_bundle()).unwrap();
+        let plan = plan_bundle(&request, registry).unwrap();
+        let mut pressed = table.clone();
+        assert!(apply_bundle_press(&mut pressed[0], CLIENT, &[PERSONA], Style::Everyday).unwrap());
+        let written = serde_json::to_string(&pressed).unwrap();
+        assert_eq!(
+            projected_slot_table_len(&table, &slot, CLIENT, &request, &plan),
+            Ok(Some(written.len()))
+        );
+        // A name the press derives: the stand-in key serialises to the
+        // length the derived key will.
+        let derive = bundle(r#"{"v":1,"personas":["persona","natural-person"],"act_as":["persona","natural-person"],"create":true}"#).unwrap();
+        let derive_plan = plan_bundle(&derive, persona_only).unwrap();
+        let mut pressed = table.clone();
+        assert!(apply_bundle_press(&mut pressed[0], CLIENT, &[PERSONA, NP], Style::Careful).unwrap());
+        let mut careful = derive.clone();
+        careful.style = Style::Careful;
+        assert_eq!(
+            projected_slot_table_len(&table, &slot, CLIENT, &careful, &derive_plan),
+            Ok(Some(serde_json::to_string(&pressed).unwrap().len()))
+        );
+        // A press that changes nothing writes nothing.
+        let mut owned = table.clone();
+        owned[0] = owner_slot();
+        assert_eq!(projected_slot_table_len(&owned, &owned[0], CLIENT, &request, &plan), Ok(None));
+        assert_eq!(check_bundle_save_room(&owned, &owned[0], CLIENT, &request, &plan, nvs(0)), Ok(()));
+    }
+
+    #[test]
+    fn the_save_room_row_refuses_a_table_that_would_not_fit() {
+        use crate::nvs_room::{blob_entries, PAGE_ENTRIES};
+        let table = table_of(5);
+        let slot = &table[0];
+        let request = bundle(&create_bundle()).unwrap();
+        let plan = plan_bundle(&request, registry).unwrap();
+        let len = projected_slot_table_len(&table, slot, CLIENT, &request, &plan).unwrap().unwrap();
+        let needed = blob_entries(len);
+        assert_eq!(registry_write_entries(&plan), 0, "nothing to register");
+        // Exactly at the edge: the new table beside the old, and a page
+        // kept back for garbage collection.
+        assert_eq!(check_bundle_save_room(&table, slot, CLIENT, &request, &plan, nvs(PAGE_ENTRIES + needed)), Ok(()));
+        assert_eq!(
+            check_bundle_save_room(&table, slot, CLIENT, &request, &plan, nvs(PAGE_ENTRIES + needed - 1)),
+            Err(BundleError::NoRoomToSave)
+        );
+        // The bench board: 129 free entries holds no table at all.
+        assert_eq!(
+            check_bundle_save_room(&table, slot, CLIENT, &request, &plan, nvs(129)),
+            Err(BundleError::NoRoomToSave)
+        );
+        // Cached avatars the slot write would drop count as room.
+        let with_avatars = Some(crate::nvs_room::NvsRoom { free_entries: 129, reclaimable_entries: needed });
+        assert_eq!(check_bundle_save_room(&table, slot, CLIENT, &request, &plan, with_avatars), Ok(()));
+        // Stats unreadable: the check passes and the write decides.
+        assert_eq!(check_bundle_save_room(&table, slot, CLIENT, &request, &plan, None), Ok(()));
+
+        // A name the press registers first adds its registry entry.
+        let derive = bundle(r#"{"v":1,"personas":["persona","natural-person"],"act_as":["persona"],"create":true}"#).unwrap();
+        let derive_plan = plan_bundle(&derive, persona_only).unwrap();
+        let registry_entries = registry_write_entries(&derive_plan);
+        let purpose_len = "nostr:persona:natural-person".len();
+        assert_eq!(
+            registry_entries,
+            blob_entries(crate::persona_pack::packed_entry_len(purpose_len, "natural-person".len()))
+        );
+        let derive_len = projected_slot_table_len(&table, slot, CLIENT, &derive, &derive_plan).unwrap().unwrap();
+        let derive_needed = blob_entries(derive_len) + registry_entries;
+        assert_eq!(
+            check_bundle_save_room(&table, slot, CLIENT, &derive, &derive_plan, nvs(PAGE_ENTRIES + derive_needed)),
+            Ok(())
+        );
+        assert_eq!(
+            check_bundle_save_room(&table, slot, CLIENT, &derive, &derive_plan, nvs(PAGE_ENTRIES + derive_needed - 1)),
+            Err(BundleError::NoRoomToSave)
+        );
+    }
+
+    #[test]
+    fn the_save_room_row_comes_before_the_registry_so_a_guess_learns_nothing() {
+        // A right and a wrong `expect` guess get the same refusal while the
+        // table would not fit; with room, a wrong guess is refused and a
+        // right one passes to the card.
+        let guess = |key: [u8; 32]| {
+            [Value::String(format!(
+                r#"{{"v":1,"personas":["persona"],"act_as":["persona"],"expect":{{"persona":"{}"}},"create":false}}"#,
+                hex(&key)
+            ))]
+        };
+        let board = BundleBoard { has_tree: true, registry_free: 8 };
+        let table = table_of(5);
+        let slot = &table[0];
+        let table = table.as_slice();
+        let save_room = move |free: usize| {
+            move |request: &BundleRequest, plan: &BundlePlan| {
+                check_bundle_save_room(table, slot, CLIENT, request, plan, nvs(free))
+            }
+        };
+        for key in [PERSONA, [0x99; 32]] {
+            assert_eq!(
+                validate_bundle(&guess(key), Some(slot), CLIENT, board, || Ok(()), save_room(129), registry).unwrap_err(),
+                BundleError::NoRoomToSave,
+                "no room to save: the same answer whatever the guess"
+            );
+        }
+        assert_eq!(BundleError::NoRoomToSave.message(), "no room to save this pairing");
+        assert_eq!(
+            validate_bundle(&guess([0x99; 32]), Some(slot), CLIENT, board, || Ok(()), save_room(756), registry).unwrap_err(),
+            BundleError::PubkeyMismatch
+        );
+        assert!(validate_bundle(&guess(PERSONA), Some(slot), CLIENT, board, || Ok(()), save_room(756), registry).is_ok());
+
+        // It runs after the room rows and after the one-card rule.
+        let unchecked = |_: &BundleRequest, _: &BundlePlan| -> Result<(), BundleError> {
+            panic!("save room checked before the room rows or the one-card rule")
+        };
+        let mut full = everything_slot();
+        for i in 0..16u8 {
+            assert!(record_client_identity(&mut full, CLIENT, &[0x40 + i; 32]));
+        }
+        assert_eq!(
+            validate_bundle(&guess(PERSONA), Some(&full), CLIENT, board, || Ok(()), unchecked, registry).unwrap_err(),
+            BundleError::ApprovalListFull
+        );
+        let closed = 1_000_000u64;
+        assert_eq!(
+            validate_bundle(
+                &guess(PERSONA),
+                Some(slot),
+                CLIENT,
+                board,
+                || full_access_admission(false, Some(closed), closed + 1),
+                unchecked,
+                registry,
+            )
+            .unwrap_err(),
+            BundleError::ShownRecently
+        );
     }
 
     // --- 4.3 the press ---

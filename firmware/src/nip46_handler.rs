@@ -334,7 +334,8 @@ fn bundle_admission() -> Result<(), heartwood_common::owner_pairing::BundleError
 /// escalate slot by the relay planner and again here).
 ///
 /// Every check of 4.1 runs first, in the settled order (param, persona
-/// target, slot, the one-card rule, room, registry and `expect`), on every
+/// target, slot, the one-card rule, room ending with room to save the slot
+/// table, registry and `expect`), on every
 /// pass: nothing is shown or changed when one fails, and the answer is its
 /// message alone. Keys the press would derive are computed now and compared
 /// with `expect` before the card. Then the FULL ACCESS card (5 s hold, 45 s
@@ -388,9 +389,9 @@ fn approve_bundle(
         log::warn!("heartwood_approve_bundle: refused — addressed to a persona");
         return build_error_json(&request.id, -1, nip46::PERSONA_DERIVE_NEEDS_MASTER);
     }
-    // The slot, the registry and `expect`, room (`validate_bundle` runs the
-    // param check again; it is cheap). Direct USB has no client key and so
-    // no slot: the slot check refuses it.
+    // The slot, room (save room last), the registry and `expect`
+    // (`validate_bundle` runs the param check again; it is cheap). Direct
+    // USB has no client key and so no slot: the slot check refuses it.
     let board = op::BundleBoard {
         has_tree: derivation_secret(master_secret, master_mode).is_ok(),
         registry_free: if crate::personas::capacity_check(nvs).is_err() {
@@ -405,7 +406,33 @@ fn approve_bundle(
     // re-run would refuse the owner's own approval as shown recently.
     let may_raise_card = matches!(approval, ApprovalDecision::Deferred | ApprovalDecision::Interactive);
     let admission = || if may_raise_card { bundle_admission() } else { Ok(()) };
-    let (bundle, plan) = match op::validate_bundle(&request.params, slot, client_hex, board, admission, |name| {
+    // Room to save (the last room row, before the registry): the slot table
+    // the press would write must fit in NVS beside the one it replaces, or
+    // the owner would hold for a grant `persist_bind_or_rollback` then
+    // refuses. That write stays the authority; this makes its refusal rare.
+    // Stats read here, only once the earlier rows have passed, from the
+    // source FIRMWARE_INFO and `get_status` report. Every pass, the held
+    // one too: nothing is written before it.
+    let table = policy_engine.list_slots(master_slot);
+    let nvs_read: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault> = nvs;
+    let save_room = |checked: &op::BundleRequest, plan: &op::BundlePlan| {
+        let Some(slot) = slot else {
+            return Err(BundleError::Unauthorised);
+        };
+        let room = crate::nvs_stats::read().map(|stats| heartwood_common::nvs_room::NvsRoom {
+            free_entries: stats.free_entries,
+            reclaimable_entries: crate::policy::avatar_cache_entries(nvs_read),
+        });
+        let verdict = op::check_bundle_save_room(table, slot, client_hex, checked, plan, room);
+        if verdict.is_err() {
+            log::warn!(
+                "heartwood_approve_bundle: slot table would not fit in NVS ({:?})",
+                room.map(|r| (r.free_entries, r.reclaimable_entries))
+            );
+        }
+        verdict
+    };
+    let (bundle, plan) = match op::validate_bundle(&request.params, slot, client_hex, board, admission, save_room, |name| {
         registered_persona(personas, master_slot, name)
     }) {
         Ok(checked) => checked,

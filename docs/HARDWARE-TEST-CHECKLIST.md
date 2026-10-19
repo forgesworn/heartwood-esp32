@@ -2985,6 +2985,54 @@ last_reason}` and the capability `relay_delivery_selfcheck_v1`.
    and then every 120 min, each costing at most one reconnect, and no attempt
    happens while an approval card is on screen.
 
+## 36. The setup hold refuses before the card when the pairing cannot be saved (added 2026-10-19, NOT YET BENCH-RUN)
+
+Bench failure, 2026-10-19, orange T-Display: NVS stats read 756 total, 627
+used, 129 free entries; master 0 held 5 slots and its `connslots_0` blob was
+over 5 KB. The owner held the FULL ACCESS card for 5 s, then `persist_slots`
+failed and the reply was `could not persist client policy; request was not
+applied`. A plain CONNSLOT_CREATE on the same master failed too
+(`storage_unavailable`). After 3 slots were revoked (225 free) the same bundle
+succeeded.
+
+`heartwood_approve_bundle` now projects the master's slot table as the press
+would leave it, serialises it as `persist_slots` does, and refuses with `no
+room to save this pairing` (code -4), before any card, when that blob (plus
+any persona registrations the press makes first) does not fit in
+`free_entries` less the page ESP-IDF keeps free for garbage collection
+(`common/src/nvs_room.rs`). Cached avatars count as room, since
+`persist_slots` drops them before its second try. The post-hold
+`persist_bind_or_rollback` path is unchanged and still decides.
+
+1. Tight partition, no card. Recreate the bench state (5 pairings on master 0,
+   `get_status` or FIRMWARE_INFO showing about 129 free entries). Send a
+   setup hold from My Signet over the relay: the reply is `no room to save
+   this pairing`, no FULL ACCESS card appears, and the log shows
+   `slot table would not fit in NVS (Some((129, 0)))` or close to it. Repeat
+   over the cable (USB-bridged): the same reply, no card.
+2. A guess learns nothing. In the state of 1, send the bundle with
+   `create:false` and a right `expect`, then a wrong one: both get `no room
+   to save this pairing`.
+3. Room again. Revoke 3 pairings (free about 225) and send the same bundle:
+   the FULL ACCESS card appears, the 5 s hold succeeds, and the slot survives
+   a reboot.
+4. The edge. Between 1 and 3, revoke one pairing at a time and note the
+   free entries at which the check first lets the card through. If any
+   bundle passes the check and then fails after the hold with `could not
+   persist client policy; request was not applied`, record the free entries
+   and the `connslots_0` length: the margin (one extra chunk header, one
+   reserved page) is too thin.
+5. Cached avatars. With the state of 1 plus cached avatars (`imav0`), check
+   that a bundle refused without them is let through when the avatars would
+   cover it, and that the save then drops them (log `dropped cached avatars,
+   retrying`).
+6. A derive. On the tight partition, a `create:true` bundle naming an
+   unregistered persona is refused before the card (by `storage full` while
+   the persona gate's 128-entry headroom is not met, else by `no room to
+   save this pairing`), and nothing is registered.
+7. Unchanged answers. CONNSLOT_CREATE and `heartwood_owner_narrow` on the
+   tight partition still give their existing messages.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

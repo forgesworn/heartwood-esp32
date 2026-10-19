@@ -67,6 +67,9 @@ pub mod persistent_state;
 
 pub mod persona_pack;
 
+/// NVS entry arithmetic for a blob write (ESP-IDF's multi-page blob layout).
+pub mod nvs_room;
+
 pub mod reply_clock;
 
 pub mod approval_queue;

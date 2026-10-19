@@ -53,6 +53,12 @@ pub fn chunk_offset(entry: u8) -> usize {
     (entry as usize) % CHUNK_CAPACITY
 }
 
+/// Bytes one entry adds to its chunk, as [`encode_chunk`] lays it out:
+/// master slot, index, key, then the length-prefixed purpose and name.
+pub fn packed_entry_len(purpose_len: usize, name_len: usize) -> usize {
+    1 + 4 + 32 + 1 + purpose_len + 1 + name_len
+}
+
 /// Encode one chunk. Fails if the entry count exceeds the chunk capacity or
 /// any field exceeds its length bound.
 pub fn encode_chunk(entries: &[PackedPersona]) -> Result<Vec<u8>, &'static str> {
@@ -386,6 +392,16 @@ mod tests {
             let entries: Vec<PackedPersona> = (0..n as u8).map(persona).collect();
             let encoded = encode_chunk(&entries).unwrap();
             assert_eq!(decode_chunk(&encoded), Some(entries));
+        }
+    }
+
+    #[test]
+    fn packed_entry_len_is_what_one_entry_adds_to_a_chunk() {
+        for p in [persona(1), persona(2)] {
+            let before = encode_chunk(&[persona(9)]).unwrap().len();
+            let after = encode_chunk(&[persona(9), p.clone()]).unwrap().len();
+            let name_len = p.name.as_deref().map_or(0, str::len);
+            assert_eq!(after - before, packed_entry_len(p.purpose.len(), name_len));
         }
     }
 

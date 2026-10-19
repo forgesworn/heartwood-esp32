@@ -704,6 +704,19 @@ fn full_storage_drops_the_avatar_cache_before_refusing_pairings() {
 }
 
 #[test]
+fn the_avatar_cache_counts_as_room_for_a_slot_write() {
+    // The setup hold's save-room check counts what `persist_slots` would
+    // drop before its second try: every cached avatar, by its blob size.
+    use heartwood_common::nvs_room::blob_entries;
+    let nvs = EspNvs::new();
+    assert_eq!(engine::avatar_cache_entries(&nvs), 0);
+    nvs.backend.seed("imav0", &[1u8; 40]);
+    nvs.backend.seed("imav7", &[1u8; 5000]);
+    nvs.backend.seed("iman0", b"TheCryptoDonkey");
+    assert_eq!(engine::avatar_cache_entries(&nvs), blob_entries(40) + blob_entries(5000));
+}
+
+#[test]
 fn rollback_failure_quarantines_master_and_denies_lookup() {
     // Compensation write also fails: master is quarantined, list_slots empty,
     // and find_slot_by_pubkey denies lookups.

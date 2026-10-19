@@ -4224,7 +4224,9 @@ fn poll_usb_frame(
         FRAME_TYPE_ENCRYPTED_REQUEST => {
             let waiting = full_access_waiting(ctx);
             let busy = cable_card_refused(ctx);
-            if busy && !waiting {
+            // An unauthenticated bridge gets the old answer under a card,
+            // and no decrypt.
+            if busy && (!waiting || !ctx.policy_engine.bridge_authenticated) {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
             } else if !ctx.policy_engine.bridge_authenticated {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);

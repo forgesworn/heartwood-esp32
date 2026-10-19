@@ -4232,7 +4232,8 @@ fn poll_usb_frame(
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             } else {
                 let personas_before = ctx.personas.len();
-                let ((), raced) = crate::nip46_handler::with_full_access_waiting(waiting, || {
+                // No queue on the cable: its own card blocks.
+                let ((), raced) = crate::nip46_handler::with_full_access_waiting(waiting, false, || {
                     crate::transport::handle_encrypted_request(
                         usb,
                         &frame,
@@ -5803,6 +5804,26 @@ fn full_access_waiting(ctx: &SignCtx) -> bool {
     ctx.button_cards.iter().any(is_full_access_card)
 }
 
+/// Whether the card queue would answer a bundle's FULL ACCESS card busy
+/// (`approval_queue::unshared_ask_busy`, the decision `queue_button_ask`
+/// makes for it: a bundle carries no event, so weighs 256 bytes there),
+/// asked before the bundle's room and registry checks (review round 2).
+fn full_access_queue_busy(ctx: &SignCtx) -> bool {
+    let held_bytes: usize = ctx
+        .button_cards
+        .iter()
+        .flat_map(|card| card.asks.iter())
+        .map(|ask| ask.weight)
+        .sum();
+    heartwood_common::approval_queue::unshared_ask_busy(
+        !ctx.button_cards.is_empty(),
+        ctx.button_cards.len().saturating_sub(1),
+        held_bytes,
+        256,
+        CARD_BYTE_BUDGET,
+    )
+}
+
 /// Close every waiting FULL ACCESS card with nothing granted (review round
 /// W3): a second bundle arrived. Each is answered
 /// `unauthorised: another full access request arrived` on the next pass of
@@ -6133,7 +6154,7 @@ fn queue_button_ask(
             let response = nip46::build_error_response(
                 &request_id,
                 -1,
-                "signer is busy with another approval; retry shortly",
+                heartwood_common::approval_queue::BUSY_ERROR,
             )
             .unwrap_or_default();
             sign_and_publish(
@@ -8418,7 +8439,8 @@ fn handle_nip46_event(
     // W3, checked inside its validation, review round 2 S3), and one refused
     // for it closes that card.
     let waiting = full_access_waiting(ctx);
-    let (dispatched, raced) = crate::nip46_handler::with_full_access_waiting(waiting, || {
+    let queue_busy = full_access_queue_busy(ctx);
+    let (dispatched, raced) = crate::nip46_handler::with_full_access_waiting(waiting, queue_busy, || {
         crate::nip46_handler::dispatch(
             request,
             None,

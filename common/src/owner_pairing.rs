@@ -190,6 +190,11 @@ pub enum BundleError {
     /// bundle came less than [`FULL_ACCESS_COOLDOWN_SECS`] after the last
     /// FULL ACCESS card closed. No card is shown.
     ShownRecently,
+    /// The relay's card queue has no room
+    /// ([`crate::approval_queue::BUSY_ERROR`], the same answer as any other
+    /// ask gets): checked with the one-card rule, before room and the
+    /// registry.
+    QueueBusy,
 }
 
 impl BundleError {
@@ -203,7 +208,8 @@ impl BundleError {
             | Self::AsksEveryRequest
             | Self::HasKindsList
             | Self::AnotherFullAccess
-            | Self::ShownRecently => -1,
+            | Self::ShownRecently
+            | Self::QueueBusy => -1,
             Self::NoPersonaTree | Self::StorageFull | Self::ApprovalListFull | Self::MethodListFull => -4,
         }
     }
@@ -225,6 +231,7 @@ impl BundleError {
             Self::MethodListFull => "method list full",
             Self::AnotherFullAccess => "unauthorised: another full access request arrived",
             Self::ShownRecently => "unauthorised: full access card shown recently",
+            Self::QueueBusy => crate::approval_queue::BUSY_ERROR,
         }
     }
 }
@@ -1049,6 +1056,27 @@ pub fn full_access_admission(another_waiting: bool, last_closed_ms: Option<u64>,
     Ok(())
 }
 
+/// [`full_access_admission`], then the card queue's room: `queue_busy` is
+/// whether the relay would answer this bundle's card busy
+/// (`approval_queue::unshared_ask_busy`; always false on the cable, whose
+/// card blocks). The whole of what `validate_bundle`'s admission step
+/// checks, after the slot and before room and the registry, so a full queue
+/// gives a right and a wrong `expect` guess the same answer (review round
+/// 2). Another FULL ACCESS card waiting comes first, so a racing bundle
+/// still closes it however full the queue is.
+pub fn bundle_admission(
+    another_waiting: bool,
+    queue_busy: bool,
+    last_closed_ms: Option<u64>,
+    now_ms: u64,
+) -> Result<(), BundleError> {
+    full_access_admission(another_waiting, last_closed_ms, now_ms)?;
+    if queue_busy {
+        return Err(BundleError::QueueBusy);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Rule V and Rule D (spec 6)
 // ---------------------------------------------------------------------------
@@ -1569,6 +1597,27 @@ mod tests {
             .unwrap_err(),
             BundleError::ShownRecently
         );
+        // A full card queue the same way (review round 2): busy whatever
+        // the guess, and a bundle racing a waiting card still closes it.
+        for key in [PERSONA, [0x99; 32]] {
+            assert_eq!(
+                validate_bundle(
+                    &guess(key),
+                    Some(&slot),
+                    CLIENT,
+                    board,
+                    || bundle_admission(false, true, None, closed),
+                    unread,
+                )
+                .unwrap_err(),
+                BundleError::QueueBusy
+            );
+        }
+        assert_eq!(bundle_admission(true, true, None, closed), Err(BundleError::AnotherFullAccess));
+        assert_eq!(bundle_admission(false, true, Some(closed), closed + 1), Err(BundleError::ShownRecently));
+        assert_eq!(bundle_admission(false, false, Some(closed), closed + 60_000), Ok(()));
+        assert_eq!(BundleError::QueueBusy.message(), "signer is busy with another approval; retry shortly");
+        assert_eq!(BundleError::QueueBusy.code(), -1);
         // Past the minute with nothing waiting, the registry decides.
         let after = || full_access_admission(false, Some(closed), closed + 60_000);
         assert_eq!(

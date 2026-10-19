@@ -147,15 +147,6 @@ pub fn handle_encrypted_request(
         return;
     };
 
-    // A persona connection must operate as the persona for every inner method,
-    // so clear any session active-identity (set by a legacy heartwood_switch)
-    // that would otherwise double-derive on top of the persona secret.
-    if is_persona {
-        if let Some(session) = policy_engine.get_or_create_session(client_pubkey, owning_slot) {
-            session.active_identity = None;
-        }
-    }
-
     // Derive conversation key.
     let conversation_key = match nip44::get_conversation_key(&signing_secret, &client_pubkey) {
         Ok(ck) => ck,
@@ -225,6 +216,19 @@ pub fn handle_encrypted_request(
     if bundle_only && request.method != heartwood_common::owner_pairing::BUNDLE_METHOD {
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
         return;
+    }
+
+    // A persona connection must operate as the persona for every inner method,
+    // so clear any session active-identity (set by a legacy heartwood_switch)
+    // that would otherwise double-derive on top of the persona secret. Only
+    // once the frame has decrypted as this client's (only the holder of its
+    // key can make that ciphertext) and is going to be dispatched: any host
+    // on the cable can name any client key in the header, and must not reach
+    // another client's session state with garbage, under a card or not.
+    if is_persona {
+        if let Some(session) = policy_engine.get_or_create_session(client_pubkey, owning_slot) {
+            session.active_identity = None;
+        }
     }
 
     let client_pubkey_hex = hex_encode(&client_pubkey);

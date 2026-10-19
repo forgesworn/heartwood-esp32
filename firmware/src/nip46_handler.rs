@@ -281,13 +281,19 @@ pub(crate) fn full_access_admission(another_waiting: bool) -> Result<(), heartwo
 /// wait beside it).
 static FULL_ACCESS_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the relay's card queue would answer a bundle's card busy
+/// (`approval_queue::unshared_ask_busy`), set only inside
+/// [`with_full_access_waiting`]; false on the cable, whose card blocks.
+static FULL_ACCESS_QUEUE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Set when a bundle dispatched inside [`with_full_access_waiting`] was
 /// refused because a FULL ACCESS card was waiting: the caller closes that
 /// card with the same reply.
 static FULL_ACCESS_RACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Dispatch with `waiting` (a relay FULL ACCESS card is queued or on
-/// screen) visible to a bundle's one-card rule (review round W3), which
+/// screen) and `queue_busy` (the relay's card queue has no room for one
+/// more card, review round 2) visible to a bundle's one-card rule (review round W3), which
 /// runs inside `validate_bundle`, after the slot and before room and the
 /// registry (review round 2, S3), where the relay loop's card queue cannot
 /// be seen. Returns `f`'s result and whether a bundle was refused for that
@@ -295,20 +301,28 @@ static FULL_ACCESS_RACED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// with `AnotherFullAccess` (review round 2, S1: this is how a cable bundle
 /// closes a relay card too). Single-threaded: the relay loop and the
 /// USB-bridged loop never dispatch at once.
-pub(crate) fn with_full_access_waiting<R>(waiting: bool, f: impl FnOnce() -> R) -> (R, bool) {
+pub(crate) fn with_full_access_waiting<R>(waiting: bool, queue_busy: bool, f: impl FnOnce() -> R) -> (R, bool) {
     use std::sync::atomic::Ordering;
     FULL_ACCESS_WAITING.store(waiting, Ordering::SeqCst);
+    FULL_ACCESS_QUEUE_BUSY.store(queue_busy, Ordering::SeqCst);
     FULL_ACCESS_RACED.store(false, Ordering::SeqCst);
     let out = f();
     FULL_ACCESS_WAITING.store(false, Ordering::SeqCst);
+    FULL_ACCESS_QUEUE_BUSY.store(false, Ordering::SeqCst);
     (out, FULL_ACCESS_RACED.swap(false, Ordering::SeqCst))
 }
 
-/// The one-card rule for a bundle that may raise its card on this pass.
+/// The one-card rule, and the relay queue's room, for a bundle that may
+/// raise its card on this pass (`owner_pairing::bundle_admission`). A
+/// poisoned lock refuses.
 fn bundle_admission() -> Result<(), heartwood_common::owner_pairing::BundleError> {
     use std::sync::atomic::Ordering;
     let waiting = FULL_ACCESS_WAITING.load(Ordering::SeqCst);
-    let admitted = full_access_admission(waiting);
+    let queue_busy = FULL_ACCESS_QUEUE_BUSY.load(Ordering::SeqCst);
+    let admitted = match FULL_ACCESS_LAST_CLOSED_MS.lock() {
+        Ok(last) => heartwood_common::owner_pairing::bundle_admission(waiting, queue_busy, *last, crate::uptime_ms()),
+        Err(_) => Err(heartwood_common::owner_pairing::BundleError::ShownRecently),
+    };
     if admitted == Err(heartwood_common::owner_pairing::BundleError::AnotherFullAccess) {
         FULL_ACCESS_RACED.store(true, Ordering::SeqCst);
     }

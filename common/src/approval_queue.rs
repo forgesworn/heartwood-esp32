@@ -30,6 +30,21 @@ pub const MAX_BATCH: usize = 8;
 /// Most asks parked behind the open card, across all other clients.
 pub const MAX_WAITING: usize = 4;
 
+/// What the relay answers when the card queue has no room.
+pub const BUSY_ERROR: &str = "signer is busy with another approval; retry shortly";
+
+/// Whether an ask that never shares a card ([`never_shares_card`]) would be
+/// answered busy now: its bytes would take the held asks past `budget`, or
+/// a card is open and [`MAX_WAITING`] asks already wait behind it. Exactly
+/// what [`admit`] (plus the relay's byte budget) decides for a unique key,
+/// asked before the ask exists, so a FULL ACCESS bundle can be refused busy
+/// before room and the registry are read (review round 2: after them, a
+/// full queue answered a right `expect` guess busy and a wrong one
+/// `pubkey mismatch`, with no card).
+pub fn unshared_ask_busy(card_open: bool, waiting: usize, held_bytes: usize, weight: usize, budget: usize) -> bool {
+    held_bytes.saturating_add(weight) > budget || (card_open && waiting >= MAX_WAITING)
+}
+
 /// Who is asking, for which identity, and to do what.
 ///
 /// All four must match for two asks to share a card. `kind_key` — the event
@@ -152,6 +167,30 @@ mod tests {
 
     fn key(slot: u8, client: &str, target: &str) -> AskKey {
         AskKey::new(slot, client.to_string(), target.to_string(), "1".to_string())
+    }
+
+    #[test]
+    fn unshared_ask_busy_agrees_with_admit_and_the_byte_budget() {
+        let open = key(0, "aa", "bb");
+        let mut seq = 0u32;
+        for card_open in [false, true] {
+            for waiting in 0..=MAX_WAITING + 1 {
+                for (held, weight) in [(0usize, 256usize), (7_936, 256), (7_937, 256), (8_192, 0)] {
+                    seq += 1;
+                    let incoming = AskKey::new(0, "cc".to_string(), "bb".to_string(), unshared_kind_key("x", seq));
+                    let admitted = if held.saturating_add(weight) > 8_192 {
+                        Admission::Busy
+                    } else {
+                        admit(card_open.then_some(&open), 1, waiting, &incoming)
+                    };
+                    assert_eq!(
+                        unshared_ask_busy(card_open, waiting, held, weight, 8_192),
+                        admitted == Admission::Busy,
+                        "open {card_open} waiting {waiting} held {held} weight {weight}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -1178,7 +1178,7 @@ pub fn relay_enrol_gate(device_operator: bool, enrolment_pending: bool) -> Optio
 }
 
 /// What the relay answers when the card queue has no room.
-pub const BUSY_ERROR: &str = "signer is busy with another approval; retry shortly";
+pub const BUSY_ERROR: &str = crate::approval_queue::BUSY_ERROR;
 
 /// The relay's admission of an `enrol_unlock_phone`, in its fixed order (the
 /// one-time mutation challenge is already spent by then, like every

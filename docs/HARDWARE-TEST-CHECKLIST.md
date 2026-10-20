@@ -3003,7 +3003,9 @@ garbage collection (`common/src/nvs_room.rs`). The writes are modelled in
 order: each persona registration the press makes first (a whole packed-chunk
 rewrite plus the count blob) at its peak, then the slot table beside the old
 one. Each blob is charged a chunk header on every page it could touch (6 on
-the bench's 756 entries) and 13 entries for a skipped first page. Cached
+the bench's 756 entries) and, for a skipped first page, up to 13 entries
+(no more than its own data entries, none for a one-entry blob). An
+unreadable persona registry refuses a bundle that registers a name. Cached
 avatars count as room for the slot table only, since only `persist_slots`
 drops them before its second try. The post-hold `persist_bind_or_rollback`
 path is unchanged and still decides.
@@ -3026,8 +3028,8 @@ path is unchanged and still decides.
    free entries at which the check first lets the card through. If any
    bundle passes the check and then fails after the hold with `could not
    persist client policy; request was not applied`, record the free entries
-   and the `connslots_0` length: the margin (a chunk header per page, 13
-   entries for a skipped first page, one reserved page) is too thin.
+   and the `connslots_0` length: the margin (a chunk header per page, up to
+   13 entries for a skipped first page, one reserved page) is too thin.
 5. Cached avatars. With the state of 1 plus cached avatars (`imav0`), check
    that a bundle refused without them is let through when the avatars would
    cover it, and that the save then drops them (log `dropped cached avatars,

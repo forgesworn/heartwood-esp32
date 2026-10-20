@@ -22,12 +22,21 @@
 //!   under 4000 bytes, so a blob can take a chunk on every page it touches.
 //!   The estimate assumes the worse of the two: `max(ceil(len / 4000) + 1,
 //!   min(pages, ceil(len / 32)))` chunk headers, where `pages` is the
-//!   partition's page count (a chunk holds at least one data entry, and no
-//!   two chunks of one write share a page).
+//!   partition's page count (a chunk holds at least one data entry, and in
+//!   practice one write puts at most one chunk on a page). That is a strong
+//!   heuristic, not a ceiling: a garbage collection inside the write can pick
+//!   as its victim a full page holding an earlier chunk of the same write and
+//!   continue on the page it copied into. The true ceiling is one header per
+//!   data entry; the case is very unlikely and is not charged.
 //! - A first chunk that does not fit a tailroom under `CHUNK_MAX_SIZE / 10`
 //!   (400 bytes, 13 entries) skips that page, and those entries stay empty
-//!   but unusable until garbage collection. Every blob write adds
-//!   [`FIRST_CHUNK_SKIP_SLACK`] for it.
+//!   but unusable until garbage collection. The skip happens only when the
+//!   data does not fit the tailroom, so it strands at most `ceil(len / 32)`
+//!   entries and at most [`FIRST_CHUNK_SKIP_SLACK`]: every blob write adds
+//!   [`first_chunk_skip_slack`] for it. Those entries still count as free in
+//!   the stats until a garbage collection reclaims them, so the slack is a
+//!   buffer for that delay rather than an exact cost, and a skip can repeat
+//!   on later pages before the "not improving" guard ends the write.
 //! - `Storage::writeItem` writes the new blob under the other chunk version
 //!   before it erases the old one (`eraseMultiPageBlob` after
 //!   `writeMultiPageBlob`), so the old blob's entries are still counted as
@@ -53,10 +62,26 @@ pub const PAGE_ENTRIES: usize = 126;
 /// The most data one blob chunk holds (`nvs_page.hpp`: `CHUNK_MAX_SIZE`).
 pub const CHUNK_MAX_SIZE: usize = ENTRY_SIZE * (PAGE_ENTRIES - 1);
 
-/// Entries a write may lose to `writeMultiPageBlob`'s first-chunk rule: a
-/// tailroom under `CHUNK_MAX_SIZE / 10` (400 bytes) is skipped, which leaves
-/// up to 13 entries of that page empty. Counted once per blob write.
+/// The most entries a write can lose to `writeMultiPageBlob`'s first-chunk
+/// rule: a tailroom under `CHUNK_MAX_SIZE / 10` (400 bytes) is skipped, which
+/// leaves up to 13 entries of that page empty.
 pub const FIRST_CHUNK_SKIP_SLACK: usize = (CHUNK_MAX_SIZE / 10).div_ceil(ENTRY_SIZE);
+
+/// Entries one write of `len` bytes may lose to the first-chunk rule. The
+/// rule skips a page only when the data does not fit its tailroom, so it
+/// strands at most `ceil(len / 32)` entries, and at most
+/// [`FIRST_CHUNK_SKIP_SLACK`]. A blob of one data entry strands at most the
+/// page's last entry, which the extra chunk header [`blob_entries`] charges
+/// it already absorbs (4 against a real 3): 0 here. Keep the two in step: if
+/// `blob_entries` stops over-charging, return 1 for those. An empty blob is
+/// not over-charged and may strand 1.
+pub fn first_chunk_skip_slack(len: usize) -> usize {
+    match len.div_ceil(ENTRY_SIZE) {
+        0 => 1,
+        1 => 0,
+        data => data.min(FIRST_CHUNK_SKIP_SLACK),
+    }
+}
 
 /// Entries a new blob of `len` bytes takes on a partition of `pages` pages:
 /// its data entries, a chunk header per chunk (the worse of the fresh-page
@@ -68,10 +93,10 @@ pub fn blob_entries(len: usize, pages: usize) -> usize {
     data + chunk_headers + 1
 }
 
-/// Entries one blob write may need at its peak: [`blob_entries`] plus the
-/// [`FIRST_CHUNK_SKIP_SLACK`] of a skipped first page.
+/// Entries one blob write may need at its peak: [`blob_entries`] plus what
+/// a skipped first page may strand ([`first_chunk_skip_slack`]).
 pub fn blob_write_entries(len: usize, pages: usize) -> usize {
-    blob_entries(len, pages) + FIRST_CHUNK_SKIP_SLACK
+    blob_entries(len, pages) + first_chunk_skip_slack(len)
 }
 
 /// The fewest entries a stored blob of `len` bytes can hold: its data
@@ -148,6 +173,17 @@ mod tests {
         assert_eq!(blob_entries(2900, 6), 91 + 6 + 1);
         assert_eq!(blob_entries(8000, 6), 250 + 6 + 1);
         assert_eq!(blob_write_entries(2900, 6), 91 + 6 + 1 + 13);
+        // A skip strands no more entries than the data would have taken.
+        assert_eq!(first_chunk_skip_slack(0), 1);
+        assert_eq!(first_chunk_skip_slack(1), 0);
+        assert_eq!(first_chunk_skip_slack(32), 0);
+        assert_eq!(first_chunk_skip_slack(33), 2);
+        assert_eq!(first_chunk_skip_slack(158), 5);
+        assert_eq!(first_chunk_skip_slack(416), 13);
+        assert_eq!(first_chunk_skip_slack(417), 13);
+        assert_eq!(first_chunk_skip_slack(5 * 1024), 13);
+        assert_eq!(blob_write_entries(1, 6), 1 + 2 + 1);
+        assert_eq!(blob_write_entries(200, 6), 7 + 6 + 1 + 7);
         // What a stored blob is counted on to free: no phantom chunk.
         assert_eq!(min_blob_entries(0), 1);
         assert_eq!(min_blob_entries(40), 2 + 1 + 1);

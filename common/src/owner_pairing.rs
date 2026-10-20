@@ -1009,8 +1009,12 @@ pub fn save_room_need(
 /// garbage collection ([`crate::nvs_room`]). `nvs` is `None` when the
 /// firmware could not read the stats: the check then passes, as the persona
 /// gate does, and the write's read-back still refuses cleanly after the
-/// hold. A press that registers nothing and changes nothing writes nothing
-/// and always fits.
+/// hold. `registry` is `None` when the firmware could not read the persona
+/// registry: a press that registers a name is then refused (stats or not),
+/// since `personas::add` reads the same state and the rewrite it makes
+/// cannot be bounded; a press that registers nothing never reads it. A
+/// press that registers nothing and changes nothing writes nothing and
+/// always fits.
 pub fn check_bundle_save_room(
     table: &[ConnectSlot],
     slot: &ConnectSlot,
@@ -1018,13 +1022,23 @@ pub fn check_bundle_save_room(
     request: &BundleRequest,
     plan: &BundlePlan,
     nvs: Option<crate::nvs_room::NvsRoom>,
-    registry: RegistryTail,
+    registry: Option<RegistryTail>,
 ) -> Result<(), BundleError> {
+    let entry_lens = registry_entry_lens(plan);
+    // A press that registers names on a registry that could not be read:
+    // `personas::add` reads the same state, and a guess at it could only
+    // understate the rewrite.
+    // With no names to register the tail is never consulted.
+    let registry = match registry {
+        Some(registry) => registry,
+        None if entry_lens.is_empty() => RegistryTail { count: 0, count_stored: true, chunk_len: None },
+        None => return Err(BundleError::NoRoomToSave),
+    };
     let Some(nvs) = nvs else {
         return Ok(());
     };
     let table_len = projected_slot_table_len(table, slot, client_hex, request, plan)?;
-    save_room_verdict(save_room_need(&registry_entry_lens(plan), registry, table_len, nvs.pages()), nvs)
+    save_room_verdict(save_room_need(&entry_lens, registry, table_len, nvs.pages()), nvs)
 }
 
 /// The verdict on a [`SaveRoomNeed`]: the registry writes must fit with no
@@ -2046,7 +2060,7 @@ mod tests {
         let mut owned = table.clone();
         owned[0] = owner_slot();
         assert_eq!(projected_slot_table_len(&owned, &owned[0], CLIENT, &request, &plan), Ok(None));
-        assert_eq!(check_bundle_save_room(&owned, &owned[0], CLIENT, &request, &plan, nvs(0), ONE_PERSONA), Ok(()));
+        assert_eq!(check_bundle_save_room(&owned, &owned[0], CLIENT, &request, &plan, nvs(0), Some(ONE_PERSONA)), Ok(()));
     }
 
     #[test]
@@ -2058,12 +2072,12 @@ mod tests {
         let plan = plan_bundle(&request, registry).unwrap();
         assert!(registry_entry_lens(&plan).is_empty(), "nothing to register");
         let len = projected_slot_table_len(&table, slot, CLIENT, &request, &plan).unwrap().unwrap();
-        assert!(len > 6 * 32, "long enough to touch every one of the 6 pages");
+        assert!(len > 13 * 32, "long enough to touch every one of the 6 pages and take the full 13 slack");
         // The new table beside the old: its data, a chunk header on each of
         // the 6 pages, the index, a skipped first page's 13.
         let needed = len.div_ceil(32) + 6 + 1 + 13;
         // Exactly at the edge, with a page kept back for garbage collection.
-        let check = |nvs| check_bundle_save_room(&table, slot, CLIENT, &request, &plan, nvs, ONE_PERSONA);
+        let check = |nvs| check_bundle_save_room(&table, slot, CLIENT, &request, &plan, nvs, Some(ONE_PERSONA));
         assert_eq!(check(nvs(PAGE_ENTRIES + needed)), Ok(()));
         assert_eq!(check(nvs(PAGE_ENTRIES + needed - 1)), Err(BundleError::NoRoomToSave));
         // The bench board: 129 free entries holds no table at all.
@@ -2080,12 +2094,13 @@ mod tests {
         assert_eq!(registry_entry_lens(&derive_plan), vec![NP_ENTRY]);
         let derive_len = projected_slot_table_len(&table, slot, CLIENT, &derive, &derive_plan).unwrap().unwrap();
         // The chunk grows from 77 to 158 bytes: 5 data + 5 headers (one per
-        // data entry, under the 6 pages) + 1 index = 11, plus 13, plus the
-        // count blob's rewrite (1 + 2 + 1 + 13 = 17): a peak of 41. Erasing
-        // the old chunk frees 3 + 1 + 1 = 5, so it leaves 6.
-        let registry_peak = 41;
+        // data entry, under the 6 pages) + 1 index = 11, plus a skip of at
+        // most its 5 data entries, plus the count blob's rewrite (1 + 2 + 1,
+        // no slack for one data entry): a peak of 20. Erasing the old chunk
+        // frees 3 + 1 + 1 = 5, so it leaves 6.
+        let registry_peak = 20;
         let table_needed = 6 + derive_len.div_ceil(32) + 6 + 1 + 13;
-        let check = |nvs| check_bundle_save_room(&table, slot, CLIENT, &derive, &derive_plan, nvs, ONE_PERSONA);
+        let check = |nvs| check_bundle_save_room(&table, slot, CLIENT, &derive, &derive_plan, nvs, Some(ONE_PERSONA));
         assert_eq!(check(nvs(PAGE_ENTRIES + table_needed)), Ok(()));
         assert_eq!(check(nvs(PAGE_ENTRIES + table_needed - 1)), Err(BundleError::NoRoomToSave));
         // Avatars cover the table but not the registry write before it.
@@ -2094,7 +2109,7 @@ mod tests {
         // Registering a name with the table unchanged still has to fit.
         let mut owned = table.clone();
         owned[0] = owner_slot();
-        let owned_check = |nvs| check_bundle_save_room(&owned, &owned[0], CLIENT, &derive, &derive_plan, nvs, ONE_PERSONA);
+        let owned_check = |nvs| check_bundle_save_room(&owned, &owned[0], CLIENT, &derive, &derive_plan, nvs, Some(ONE_PERSONA));
         assert_eq!(owned_check(nvs(PAGE_ENTRIES + registry_peak)), Ok(()));
         assert_eq!(owned_check(nvs(PAGE_ENTRIES + registry_peak - 1)), Err(BundleError::NoRoomToSave));
     }
@@ -2105,10 +2120,10 @@ mod tests {
         // 8 KB avatar cached, a 5 KB table. The avatar frees 256 data + 3
         // headers + 1 index = 260, so the table alone fits: 6 left by the
         // registry + 160 + 6 + 1 + 13 = 186 <= 140 + 260 - 126 = 274. The
-        // registry's peak of 41 does not fit in 14, and `personas::add`
-        // would have failed after the hold.
+        // registry's peak of 11 + 5 + 4 = 20 does not fit in 14, and
+        // `personas::add` would have failed after the hold.
         let need = save_room_need(&[NP_ENTRY], ONE_PERSONA, Some(5 * 1024), 6);
-        assert_eq!(need, SaveRoomNeed { registry: 41, table: 186 });
+        assert_eq!(need, SaveRoomNeed { registry: 20, table: 186 });
         let avatar = crate::nvs_room::min_blob_entries(8 * 1024);
         assert_eq!(avatar, 260);
         assert_eq!(save_room_verdict(need, room(140, 260)), Err(BundleError::NoRoomToSave));
@@ -2120,32 +2135,52 @@ mod tests {
     fn a_registry_chunk_rewrite_is_counted_at_its_peak() {
         // Review S2: 15 personas of ~80 bytes, a 1210-byte chunk; one more
         // makes it 1291: 41 data + 6 headers + 1 index + 13, plus the count
-        // blob's 17, a peak of 78. A small ~800-byte table: 25 + 6 + 1 + 13
+        // blob's 4, a peak of 65. A small ~800-byte table: 25 + 6 + 1 + 13
         // = 45, after the 48 - 40 = 8 the chunk grew by: 53. Net growth
         // alone (25 + 2 + 1 for the table, 3 + 2 + 1 for one entry, 34) fitted
         // in 40 available; the rewrite would have failed after the hold.
         let fifteen = RegistryTail { count: 15, count_stored: true, chunk_len: Some(10 + 15 * 80) };
         let need = save_room_need(&[NP_ENTRY], fifteen, Some(800), 6);
-        assert_eq!(need, SaveRoomNeed { registry: 78, table: 53 });
+        assert_eq!(need, SaveRoomNeed { registry: 65, table: 53 });
         assert_eq!(save_room_verdict(need, room(126 + 40, 0)), Err(BundleError::NoRoomToSave));
         assert_eq!(save_room_verdict(need, room(126 + 100, 0)), Ok(()));
 
         // Two names: the second starts chunk 1 (count 16), a 10-byte frame
-        // and a 61-byte entry ("work"): 3 + 3 + 1 = 7, peak 7 + 13 + 17 = 37
-        // on top of the 8 left. The first name's 78 is still the worst; the
+        // and a 61-byte entry ("work"): 3 + 3 + 1 = 7, peak 7 + 3 + 4 = 14
+        // on top of the 8 left. The first name's 65 is still the worst; the
         // table comes after 8 + 7 = 15.
         let need = save_room_need(&[NP_ENTRY, 61], fifteen, Some(800), 6);
-        assert_eq!(need, SaveRoomNeed { registry: 78, table: 15 + 45 });
+        assert_eq!(need, SaveRoomNeed { registry: 65, table: 15 + 45 });
 
-        // A fresh board writes the count blob first (peak 17, leaves 4),
-        // then a one-entry chunk of 91 bytes: 3 + 3 + 1 = 7, peak 37, so
-        // 41 at the worst; the table comes after 4 + 7 = 11.
+        // A fresh board writes the count blob first (peak 4, leaves 4),
+        // then a one-entry chunk of 91 bytes: 3 + 3 + 1 = 7, peak 7 + 3 + 4
+        // = 14, so 18 at the worst; the table comes after 4 + 7 = 11.
         let fresh = RegistryTail { count: 0, count_stored: false, chunk_len: None };
         let need = save_room_need(&[NP_ENTRY], fresh, Some(800), 6);
-        assert_eq!(need, SaveRoomNeed { registry: 41, table: 11 + 45 });
+        assert_eq!(need, SaveRoomNeed { registry: 18, table: 11 + 45 });
         // Nothing registered: no registry step at all.
         assert_eq!(save_room_need(&[], fresh, Some(800), 6), SaveRoomNeed { registry: 0, table: 45 });
         assert_eq!(save_room_need(&[], fresh, None, 6), SaveRoomNeed { registry: 0, table: 0 });
+    }
+
+    #[test]
+    fn an_unreadable_registry_refuses_only_a_press_that_registers() {
+        // Review round 2, SF1: no guess at an unreadable registry is safe.
+        let table = table_of(3);
+        let slot = &table[0];
+        let derive = bundle(r#"{"v":1,"personas":["persona","natural-person"],"act_as":["persona"],"create":true}"#).unwrap();
+        let derive_plan = plan_bundle(&derive, persona_only).unwrap();
+        let check = |nvs, tail| check_bundle_save_room(&table, slot, CLIENT, &derive, &derive_plan, nvs, tail);
+        assert_eq!(check(nvs(756), Some(ONE_PERSONA)), Ok(()), "room to spare when the registry reads");
+        assert_eq!(check(nvs(756), None), Err(BundleError::NoRoomToSave));
+        assert_eq!(check(None, None), Err(BundleError::NoRoomToSave), "even with the stats unread");
+        // Every name registered: the registry is never read, and only room decides.
+        let request = bundle(&create_bundle()).unwrap();
+        let plan = plan_bundle(&request, registry).unwrap();
+        let check = |nvs, tail| check_bundle_save_room(&table, slot, CLIENT, &request, &plan, nvs, tail);
+        assert_eq!(check(nvs(756), None), Ok(()));
+        assert_eq!(check(None, None), Ok(()));
+        assert_eq!(check(nvs(129), None), Err(BundleError::NoRoomToSave));
     }
 
     #[test]
@@ -2176,7 +2211,7 @@ mod tests {
         let table = table.as_slice();
         let save_room = move |free: usize| {
             move |request: &BundleRequest, plan: &BundlePlan| {
-                check_bundle_save_room(table, slot, CLIENT, request, plan, nvs(free), ONE_PERSONA)
+                check_bundle_save_room(table, slot, CLIENT, request, plan, nvs(free), Some(ONE_PERSONA))
             }
         };
         for key in [PERSONA, [0x99; 32]] {

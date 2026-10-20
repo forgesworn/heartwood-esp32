@@ -410,10 +410,11 @@ fn approve_bundle(
     // registrations the press makes first must fit without the cached
     // avatars, and the slot table it then writes beside the one it replaces
     // with them, or the owner would hold for a grant that `personas::add` or
-    // `persist_bind_or_rollback` then refuses. That write stays the authority; this makes its refusal rare.
-    // Stats read here, only once the earlier rows have passed, from the
-    // source FIRMWARE_INFO and `get_status` report. Every pass, the held
-    // one too: nothing is written before it.
+    // `persist_bind_or_rollback` then refuses. Those writes stay the
+    // authority; this makes their refusal rare. Stats read here, only once
+    // the earlier rows have passed, from the source FIRMWARE_INFO and
+    // `get_status` report. Every pass, the held one too: nothing is written
+    // before it. An unreadable registry refuses a press that registers.
     let table = policy_engine.list_slots(master_slot);
     let nvs_read: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault> = nvs;
     let save_room = |checked: &op::BundleRequest, plan: &op::BundlePlan| {

@@ -2997,12 +2997,16 @@ succeeded.
 
 `heartwood_approve_bundle` now projects the master's slot table as the press
 would leave it, serialises it as `persist_slots` does, and refuses with `no
-room to save this pairing` (code -4), before any card, when that blob (plus
-any persona registrations the press makes first) does not fit in
-`free_entries` less the page ESP-IDF keeps free for garbage collection
-(`common/src/nvs_room.rs`). Cached avatars count as room, since
-`persist_slots` drops them before its second try. The post-hold
-`persist_bind_or_rollback` path is unchanged and still decides.
+room to save this pairing` (code -4), before any card, when the press's
+writes do not fit in `free_entries` less the page ESP-IDF keeps free for
+garbage collection (`common/src/nvs_room.rs`). The writes are modelled in
+order: each persona registration the press makes first (a whole packed-chunk
+rewrite plus the count blob) at its peak, then the slot table beside the old
+one. Each blob is charged a chunk header on every page it could touch (6 on
+the bench's 756 entries) and 13 entries for a skipped first page. Cached
+avatars count as room for the slot table only, since only `persist_slots`
+drops them before its second try. The post-hold `persist_bind_or_rollback`
+path is unchanged and still decides.
 
 1. Tight partition, no card. Recreate the bench state (5 pairings on master 0,
    `get_status` or FIRMWARE_INFO showing about 129 free entries). Send a
@@ -3015,17 +3019,21 @@ any persona registrations the press makes first) does not fit in
    to save this pairing`.
 3. Room again. Revoke 3 pairings (free about 225) and send the same bundle:
    the FULL ACCESS card appears, the 5 s hold succeeds, and the slot survives
-   a reboot.
+   a reboot. At 225 free the check lets through a projected table of up to
+   2528 bytes (79 data entries + 6 + 1 + 13 = 99); record the `connslots_0`
+   length if it is refused here.
 4. The edge. Between 1 and 3, revoke one pairing at a time and note the
    free entries at which the check first lets the card through. If any
    bundle passes the check and then fails after the hold with `could not
    persist client policy; request was not applied`, record the free entries
-   and the `connslots_0` length: the margin (one extra chunk header, one
-   reserved page) is too thin.
+   and the `connslots_0` length: the margin (a chunk header per page, 13
+   entries for a skipped first page, one reserved page) is too thin.
 5. Cached avatars. With the state of 1 plus cached avatars (`imav0`), check
    that a bundle refused without them is let through when the avatars would
    cover it, and that the save then drops them (log `dropped cached avatars,
-   retrying`).
+   retrying`). A `create:true` bundle naming an unregistered persona is still
+   refused when only the avatars would make room: the registry write comes
+   before the slot write and cannot use them.
 6. A derive. On the tight partition, a `create:true` bundle naming an
    unregistered persona is refused before the card (by `storage full` while
    the persona gate's 128-entry headroom is not met, else by `no room to

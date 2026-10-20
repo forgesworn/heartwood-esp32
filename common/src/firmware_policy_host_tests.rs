@@ -706,14 +706,16 @@ fn full_storage_drops_the_avatar_cache_before_refusing_pairings() {
 #[test]
 fn the_avatar_cache_counts_as_room_for_a_slot_write() {
     // The setup hold's save-room check counts what `persist_slots` would
-    // drop before its second try: every cached avatar, by its blob size.
-    use heartwood_common::nvs_room::blob_entries;
+    // drop before its second try: every cached avatar, by the fewest
+    // entries its blob can hold.
+    // 40 bytes: 2 data + 1 chunk header + 1 index. 5000 bytes: 157 data +
+    // 2 chunk headers + 1 index. No phantom header for the first chunk.
     let nvs = EspNvs::new();
     assert_eq!(engine::avatar_cache_entries(&nvs), 0);
     nvs.backend.seed("imav0", &[1u8; 40]);
     nvs.backend.seed("imav7", &[1u8; 5000]);
     nvs.backend.seed("iman0", b"TheCryptoDonkey");
-    assert_eq!(engine::avatar_cache_entries(&nvs), blob_entries(40) + blob_entries(5000));
+    assert_eq!(engine::avatar_cache_entries(&nvs), (2 + 1 + 1) + (157 + 2 + 1));
 }
 
 #[test]

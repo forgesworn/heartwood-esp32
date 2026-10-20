@@ -406,10 +406,11 @@ fn approve_bundle(
     // re-run would refuse the owner's own approval as shown recently.
     let may_raise_card = matches!(approval, ApprovalDecision::Deferred | ApprovalDecision::Interactive);
     let admission = || if may_raise_card { bundle_admission() } else { Ok(()) };
-    // Room to save (the last room row, before the registry): the slot table
-    // the press would write must fit in NVS beside the one it replaces, or
-    // the owner would hold for a grant `persist_bind_or_rollback` then
-    // refuses. That write stays the authority; this makes its refusal rare.
+    // Room to save (the last room row, before the registry): the persona
+    // registrations the press makes first must fit without the cached
+    // avatars, and the slot table it then writes beside the one it replaces
+    // with them, or the owner would hold for a grant that `personas::add` or
+    // `persist_bind_or_rollback` then refuses. That write stays the authority; this makes its refusal rare.
     // Stats read here, only once the earlier rows have passed, from the
     // source FIRMWARE_INFO and `get_status` report. Every pass, the held
     // one too: nothing is written before it.
@@ -421,9 +422,11 @@ fn approve_bundle(
         };
         let room = crate::nvs_stats::read().map(|stats| heartwood_common::nvs_room::NvsRoom {
             free_entries: stats.free_entries,
+            total_entries: stats.total_entries,
             reclaimable_entries: crate::policy::avatar_cache_entries(nvs_read),
         });
-        let verdict = op::check_bundle_save_room(table, slot, client_hex, checked, plan, room);
+        let registry = crate::personas::registry_tail(nvs_read);
+        let verdict = op::check_bundle_save_room(table, slot, client_hex, checked, plan, room, registry);
         if verdict.is_err() {
             log::warn!(
                 "heartwood_approve_bundle: slot table would not fit in NVS ({:?})",

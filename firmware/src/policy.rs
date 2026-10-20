@@ -32,6 +32,18 @@ use heartwood_common::policy::{
 /// that every logically permitted combination fits physically.
 const MAX_SLOT_BLOB_BYTES: usize = 64 * 1024;
 
+/// NVS entries [`evict_avatar_cache`] can be counted on to free: what a
+/// slot write that does not fit reclaims before its second try, so the
+/// setup hold's save-room check counts it as room. Each avatar at its
+/// fewest entries (`heartwood_common::nvs_room::min_blob_entries`).
+pub(crate) fn avatar_cache_entries(nvs: &EspNvs<NvsDefault>) -> usize {
+    // masters::MAX_MASTERS
+    (0..8u8)
+        .filter_map(|slot| nvs.blob_len(&format!("imav{slot}")).ok().flatten())
+        .map(heartwood_common::nvs_room::min_blob_entries)
+        .sum()
+}
+
 /// Drop every cached avatar (`imav<slot>`, written by identity_meta.rs) and
 /// keep the names. Returns how many went.
 ///
@@ -41,17 +53,6 @@ const MAX_SLOT_BLOB_BYTES: usize = 64 * 1024;
 /// had approved failed with "Storage error" (T-Display, 2026-09-24). Called
 /// only when a pairing write fails. Spelt out here rather than in
 /// identity_meta.rs because this file is also host-tested on its own.
-/// NVS entries [`evict_avatar_cache`] would free: what a slot write that
-/// does not fit can reclaim before its second try, so the setup hold's
-/// save-room check counts it as room (`heartwood_common::nvs_room`).
-pub(crate) fn avatar_cache_entries(nvs: &EspNvs<NvsDefault>) -> usize {
-    // masters::MAX_MASTERS
-    (0..8u8)
-        .filter_map(|slot| nvs.blob_len(&format!("imav{slot}")).ok().flatten())
-        .map(heartwood_common::nvs_room::blob_entries)
-        .sum()
-}
-
 fn evict_avatar_cache(nvs: &mut EspNvs<NvsDefault>) -> usize {
     // masters::MAX_MASTERS
     (0..8u8)

@@ -53,6 +53,10 @@ pub fn chunk_offset(entry: u8) -> usize {
     (entry as usize) % CHUNK_CAPACITY
 }
 
+/// Bytes an encoded chunk takes besides its entries: magic, version and
+/// count before them, the CRC after. An empty chunk is this long.
+pub const CHUNK_FRAME_LEN: usize = 4 + 1 + 1 + 4;
+
 /// Bytes one entry adds to its chunk, as [`encode_chunk`] lays it out:
 /// master slot, index, key, then the length-prefixed purpose and name.
 pub fn packed_entry_len(purpose_len: usize, name_len: usize) -> usize {
@@ -397,6 +401,13 @@ mod tests {
 
     #[test]
     fn packed_entry_len_is_what_one_entry_adds_to_a_chunk() {
+        assert_eq!(encode_chunk(&[]).unwrap().len(), CHUNK_FRAME_LEN);
+        let one = persona(3);
+        let one_name = one.name.as_deref().map_or(0, str::len);
+        assert_eq!(
+            encode_chunk(&[one.clone()]).unwrap().len(),
+            CHUNK_FRAME_LEN + packed_entry_len(one.purpose.len(), one_name)
+        );
         for p in [persona(1), persona(2)] {
             let before = encode_chunk(&[persona(9)]).unwrap().len();
             let after = encode_chunk(&[persona(9), p.clone()]).unwrap().len();

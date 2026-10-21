@@ -3081,6 +3081,56 @@ both times.
   at 173 free answered `changed:true` as before. Neither path has the bundle
   check.
 
+### 36b. One FULL ACCESS card at a time: every refusal is seen, and a cable copy does not close the card (added 2026-10-21, NOT YET BENCH-RUN)
+
+Review round 3. S1: a FULL ACCESS card the one-card rule closed before it
+reached the screen used to close silently, yet still restarted the 60 s rule,
+so a client racing its own bundles could keep pairing blocked with nothing on
+the board. Every such card now draws `NOT DONE / Pairing blocked / 2nd
+request`, opened or still queued; over another card that is an overdraw, so
+that card's page dwell starts again and a press held across the refusal does
+not count. S2: a cable copy of the bundle on a relay FULL ACCESS card (same
+client key, identity, inner id and params) is now NACKed `bundle already on
+screen` before dispatch, instead of closing the card. Client C below has its
+own bound, exclusive Everything slot; a laptop script sends its bundles.
+
+8. Queued, then refused. Put a sign card from another client on screen. C
+   sends bundle A on one relay (it queues behind the sign card), then bundle
+   B, with a new inner id, on another. Both get `another full access request
+   arrived`. `NOT DONE / Pairing blocked / 2nd request` draws over the sign
+   card, then the sign card comes back with its countdown still running. No
+   FULL ACCESS card ever shows. A bundle from C inside the next 60 s gets
+   `full access card shown recently`.
+9. A hold across the refusal. Repeat 8 with the script printing `HOLD NOW` a
+   second before it sends B. Hold the button from `HOLD NOW` until a second
+   after the refusal draws (4 s in all). The sign card is not approved by
+   that hold. After release, a fresh 2 s hold approves it. Repeat with an
+   enrol card on screen instead: the page on screen starts its dwell again
+   from the redraw, and the held press does not approve it.
+10. Nothing on screen. Board idle, C sends A and B on two relays with no
+    delay. Both get `another full access request arrived`. The refusal draws
+    on the idle board, and the identity screen returns after about 5 s. An
+    owner bundle from My Signet inside 60 s gets `full access card shown
+    recently`, and the board has shown the refusal it refers to. After 60 s
+    the owner's bundle raises its card.
+11. Cable copy, relay first. A WiFi board with an authenticated heartwoodd
+    on the cable, bridging the same master on overlapping relays. Send a
+    setup hold from My Signet. One FULL ACCESS card shows. When the cable copy
+    reaches the board, heartwoodd logs `device rejected encrypted request:
+    bundle already on screen` and publishes nothing. The card stays up, the 5
+    s hold grants, and the phone gets one reply, the success. A different
+    bundle from the same client over the cable still closes the card with
+    `another full access request arrived`.
+12. Cable copy, cable first (record only, not changed by this fix). With
+    the setup of 11, if heartwoodd's copy reaches the board first, the cable
+    card blocks the relay loop. Record what the relay copy is answered once
+    that card closes, and which reply the phone shows. Expected today:
+    `full access card shown recently` for the relay copy. It can reach the
+    phone before, or instead of, the success.
+
+The T-Display release build has no console, so these steps are judged by the
+screen, the replies and heartwoodd's log.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

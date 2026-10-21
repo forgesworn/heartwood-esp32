@@ -6645,7 +6645,9 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
 /// Answer every ask on one card with a single decision, and publish.
 ///
 /// `index` is 0 for the card on screen; a later index is a card that timed
-/// out in the queue without ever reaching it, which draws nothing.
+/// out in the queue without ever reaching it, which draws nothing, or a
+/// FULL ACCESS card the one-card rule closed there, whose refusal draws
+/// over the card on screen (review round 3, S1).
 fn resolve_button_card(
     ctx: &mut SignCtx,
     sessions: &mut [RelaySession],
@@ -6686,18 +6688,16 @@ fn resolve_button_card(
         resolve_phone_enrol_card(ctx, sessions, card, outcome, index == 0);
         return;
     }
-    if index == 0 {
-        match outcome {
-            CardTick::Approved => crate::oled::show_approved(ctx.display),
-            CardTick::Denied => crate::oled::show_denied(ctx.display),
-            // A FULL ACCESS card closed by a second bundle: the owner sees
-            // it refused, not merely gone.
-            CardTick::Refused(_) if card.opened_at.is_some() => {
-                show_card_not_done(ctx, "Refused", "2nd pairing request")
-            }
-            CardTick::Refused(_) => {}
-            _ => crate::oled::show_request_expired(ctx.display),
-        }
+    match outcome {
+        // A FULL ACCESS card closed by a second bundle: the owner sees it
+        // refused, not merely gone, whether or not it had reached the screen
+        // (review round 3, S1). Its close restarts the minute, so a racer
+        // could otherwise keep pairing blocked with nothing on the board.
+        CardTick::Refused(_) => show_full_access_blocked(ctx),
+        _ if index != 0 => {}
+        CardTick::Approved => crate::oled::show_approved(ctx.display),
+        CardTick::Denied => crate::oled::show_denied(ctx.display),
+        _ => crate::oled::show_request_expired(ctx.display),
     }
 
     let Some((signing_secret, label, mode, slot, persona_purpose)) =
@@ -7812,6 +7812,31 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
         return;
     }
     resolve_button_card(ctx, sessions, 0, &outcome);
+}
+
+/// Draw the refusal for a FULL ACCESS card the one-card rule closed (review
+/// round 3, S1), opened or still queued. Over another card on screen it is
+/// an overdraw: that card draws itself again on its next pass, its page
+/// starts its dwell afresh (`card_overdrawn`, `EnrolGate::restart_page`),
+/// and it is disarmed, so a press under way across the refusal never
+/// answers it; it arms again once the button has been seen up, as a card
+/// that has just appeared does. Nothing holds the refusal: over a live card
+/// it stays up until that card's next pass.
+fn show_full_access_blocked(ctx: &mut SignCtx) {
+    if !ctx.display_on {
+        crate::oled::wake_display(ctx.display);
+        ctx.display_on = true;
+    }
+    let over_card = match ctx.button_cards.first_mut() {
+        Some(front) if front.opened_at.is_some() => {
+            front.armed = false;
+            crate::button::clear_press_edge();
+            true
+        }
+        _ => false,
+    };
+    log::info!("[relay] FULL ACCESS refusal drawn (over a card: {over_card})");
+    show_card_not_done(ctx, "Pairing blocked", "2nd request");
 }
 
 /// Replace APPROVED with NOT DONE and hold it long enough to read before the

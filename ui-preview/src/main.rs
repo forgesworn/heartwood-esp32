@@ -921,6 +921,12 @@ fn longest_pair_words() -> [&'static str; heartwood_common::owner_pairing::PAIR_
     core::array::from_fn(|i| long[i])
 }
 
+/// The refusal a FULL ACCESS card closed by the one-card rule draws, opened
+/// or still queued (`show_full_access_blocked` in relay.rs, review round 3,
+/// S1): title and hint under "NOT DONE". `error_card_tests` checks these are
+/// the firmware's own words.
+const FULL_ACCESS_BLOCKED: (&str, &str) = ("Pairing blocked", "2nd request");
+
 fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565>)) {
     let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
     d.clear(BG).ok();
@@ -1016,6 +1022,9 @@ fn main() {
         render(&format!("confirm-{b}"), w, h, |d| draw_confirm(d, 60));
         render(&format!("approved-{b}"), w, h, |d| draw_result(d, "APPROVED", OK));
         render(&format!("denied-{b}"), w, h, |d| draw_result(d, "DENIED", DANGER));
+        render(&format!("full-access-blocked-{b}"), w, h, |d| {
+            draw_status_card(d, "NOT DONE", FULL_ACCESS_BLOCKED.0, FULL_ACCESS_BLOCKED.1, DANGER)
+        });
         // The recovery walkthrough at its three captions, on every panel: the
         // caption sits between the rule and the word and must clear both.
         render(&format!("recovery-notice-{b}"), w, h, |d| {
@@ -1165,6 +1174,39 @@ mod error_card_tests {
             assert!(bounds.top_left.x >= 0 && bounds.top_left.y >= 0);
             assert!(bounds.bottom_right().unwrap().x < w && bounds.bottom_right().unwrap().y < h, "{heading} clips on {w}x{h}: {bounds:?}");
           }
+        }
+    }
+
+    /// A FULL ACCESS card the one-card rule closes draws its refusal whether
+    /// or not it reached the screen (review round 3, S1): the `Refused` arm
+    /// of `resolve_button_card` comes before the arm that keeps a queued
+    /// card silent. The words are the preview's, and they read whole on
+    /// every panel: the title at the body font or larger, the hint in the
+    /// small font, both inside the status card's margins.
+    #[test]
+    fn the_full_access_refusal_is_drawn_for_every_closed_card_and_fits_every_panel() {
+        let relay = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/relay.rs")).unwrap();
+        let start = relay.find("\nfn resolve_button_card(").expect("resolve_button_card");
+        let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
+        let refused = body
+            .find("CardTick::Refused(_) => show_full_access_blocked(ctx),")
+            .expect("an unguarded Refused arm draws the refusal");
+        let silent = body.find("_ if index != 0 => {}").expect("the arm that keeps a queued card silent");
+        assert!(refused < silent, "a queued FULL ACCESS card would close without a refusal");
+        assert!(!body.contains("opened_at.is_some()"), "the refusal is drawn only for an opened card");
+
+        let start = relay.find("\nfn show_full_access_blocked(").expect("show_full_access_blocked");
+        let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
+        let call = body.find("show_card_not_done(").expect("the refusal is a NOT DONE card");
+        let words = string_literals(&body[call..]);
+        assert_eq!(&words[..2], &[super::FULL_ACCESS_BLOCKED.0.to_string(), super::FULL_ACCESS_BLOCKED.1.to_string()]);
+
+        let (title, hint) = super::FULL_ACCESS_BLOCKED;
+        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+            let l = Layout::new(w, h);
+            let available = l.w - l.sx(4);
+            assert!(title.len() as i32 * Layout::glyph_w(l.font_body()) <= available, "{title:?} drops to the small font on {w}x{h}");
+            assert!(hint.len() as i32 * Layout::glyph_w(l.font_small()) <= available, "{hint:?} clips on {w}x{h}");
         }
     }
 

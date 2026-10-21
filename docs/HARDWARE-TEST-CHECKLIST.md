@@ -3101,12 +3101,14 @@ own bound, exclusive Everything slot; a laptop script sends its bundles.
    card, then the sign card comes back with its countdown still running. No
    FULL ACCESS card ever shows. A bundle from C inside the next 60 s gets
    `full access card shown recently`.
-9. A hold across the refusal. Repeat 8 with the script printing `HOLD NOW` a
-   second before it sends B. Hold the button from `HOLD NOW` until a second
-   after the refusal draws (4 s in all). The sign card is not approved by
-   that hold. After release, a fresh 2 s hold approves it. Repeat with an
-   enrol card on screen instead: the page on screen starts its dwell again
-   from the redraw, and the held press does not approve it.
+9. A hold across the refusal. Repeat 8 several times, starting a hold on the
+   sign card as near as you can to the moment B is sent. A card follows a
+   hold already under way to its end within one pass, so most tries end
+   APPROVED before B is read, which is correct. The check is the other case:
+   if the refusal is seen on the glass while the finger is still down, the
+   sign card must not then show APPROVED without a fresh hold after release.
+   Repeat with an enrol card on screen instead: after the refusal, the page
+   on screen stays up for its full dwell again from the redraw.
 10. Nothing on screen. Board idle, C sends A and B on two relays with no
     delay. Both get `another full access request arrived`. The refusal draws
     on the idle board, and the identity screen returns after about 5 s. An

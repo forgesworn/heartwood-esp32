@@ -2985,7 +2985,7 @@ last_reason}` and the capability `relay_delivery_selfcheck_v1`.
    and then every 120 min, each costing at most one reconnect, and no attempt
    happens while an approval card is on screen.
 
-## 36. The setup hold refuses before the card when the pairing cannot be saved (added 2026-10-19, NOT YET BENCH-RUN)
+## 36. The setup hold refuses before the card when the pairing cannot be saved (added 2026-10-19, PARTLY BENCH-RUN 2026-10-21)
 
 Bench failure, 2026-10-19, orange T-Display: NVS stats read 756 total, 627
 used, 129 free entries; master 0 held 5 slots and its `connslots_0` blob was
@@ -3042,6 +3042,23 @@ path is unchanged and still decides.
    save this pairing`), and nothing is registered.
 7. Unchanged answers. CONNSLOT_CREATE and `heartwood_owner_narrow` on the
    tight partition still give their existing messages.
+
+Bench run, 2026-10-21, orange T-Display on 7d6869e, a laptop client over the
+relay (`create:false`, persona only, Everyday):
+
+- 1 (relay) PASS. At 197 free entries with a 2536-byte `connslots_0` (three
+  slots), the reply was `no room to save this pairing` in about 2 s, and no
+  card appeared. The cable repeat and the log line were not checked.
+- 2 PASS. A right and a wrong `expect` both got `no room to save this pairing`.
+- 3 PASS. After one pairing was revoked (221 free, a 1738-byte table), the card
+  appeared and the 5 s hold granted it. After a reset the slot still carried
+  the owner mark, with 217 free.
+- 4 PARTIAL. The board refused at 197 free with 2536 bytes and passed at 221
+  free with 1738 bytes. No hold was followed by a failed save. The threshold
+  was not swept, because only two pairings were left on master 0.
+- 5, 6 and 7 were not run. The board has no cached avatars. Persona and
+  natural-person are both already registered on master 0, so a bundle has
+  nothing new to derive. And after step 3 the partition was no longer tight.
 
 ## Notes
 

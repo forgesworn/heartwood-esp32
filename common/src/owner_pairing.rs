@@ -1328,6 +1328,51 @@ pub fn is_bundle_copy(held: &BundleKey<'_>, method: &str, incoming: &BundleKey<'
         && held.params == incoming.params
 }
 
+/// The bundle whose FULL ACCESS card closed last, whatever its outcome, and
+/// when, on the same clock as the one-card rule (review round 3, S2).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosedBundle {
+    pub client_hex: String,
+    pub target: [u8; 32],
+    pub id: String,
+    pub params: Vec<Value>,
+    pub closed_ms: u64,
+}
+
+impl ClosedBundle {
+    /// Remember `bundle`, whose card closed at `closed_ms`.
+    pub fn new(bundle: &BundleKey<'_>, closed_ms: u64) -> Self {
+        Self {
+            client_hex: bundle.client_hex.to_string(),
+            target: *bundle.target,
+            id: bundle.id.to_string(),
+            params: bundle.params.to_vec(),
+            closed_ms,
+        }
+    }
+
+    fn key(&self) -> BundleKey<'_> {
+        BundleKey { client_hex: &self.client_hex, target: &self.target, id: &self.id, params: &self.params }
+    }
+}
+
+/// Whether `incoming`, a request with `method`, is a late copy of the bundle
+/// whose card closed last, inside the minute that close started (review
+/// round 3, S2). The owner's bundle bridged by heartwoodd as well as heard
+/// on a relay: the cable copy's card blocks the relay loop, and the relay
+/// copy is read only once that card has closed. Such a copy is dropped with
+/// no reply and no card, and does not restart the minute: the card's own
+/// reply is the answer for that request id, and `shown recently` would race
+/// it to the phone. A different inner id (the owner's retry) is a new
+/// bundle and is still answered by the one-card rule. A copy cannot be
+/// forged (see [`is_bundle_copy`]), so dropping it opens nothing.
+pub fn is_closed_bundle_copy(closed: Option<&ClosedBundle>, method: &str, incoming: &BundleKey<'_>, now_ms: u64) -> bool {
+    closed.is_some_and(|closed| {
+        now_ms.saturating_sub(closed.closed_ms) < FULL_ACCESS_COOLDOWN_SECS * 1000
+            && is_bundle_copy(&closed.key(), method, incoming)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Rule V and Rule D (spec 6)
 // ---------------------------------------------------------------------------
@@ -1901,6 +1946,33 @@ mod tests {
         let wider = vec![serde_json::json!({ "act_as": ["persona", "natural-person"] })];
         assert!(!is_bundle_copy(&held, BUNDLE_METHOD, &BundleKey { params: &wider, ..same }));
         assert!(!is_bundle_copy(&held, BUNDLE_METHOD, &BundleKey { params: &[], ..same }));
+    }
+
+    #[test]
+    fn a_late_copy_of_the_closed_bundle_is_dropped_only_inside_the_minute() {
+        let params = vec![serde_json::json!({ "act_as": ["persona"] })];
+        let bundle = BundleKey { client_hex: CLIENT, target: &NP, id: "req-1", params: &params };
+        let closed_at = 5_000_000;
+        let closed = ClosedBundle::new(&bundle, closed_at);
+        let copy = |now| is_closed_bundle_copy(Some(&closed), BUNDLE_METHOD, &bundle, now);
+        assert!(copy(closed_at));
+        assert!(copy(closed_at + 59_999));
+        // From the minute on, the one-card rule would admit it anyway.
+        assert!(!copy(closed_at + 60_000));
+        // Nothing has closed since boot.
+        assert!(!is_closed_bundle_copy(None, BUNDLE_METHOD, &bundle, closed_at));
+        // The owner's retry carries a new inner id: still `shown recently`.
+        let retry = BundleKey { id: "req-2", ..bundle };
+        assert!(!is_closed_bundle_copy(Some(&closed), BUNDLE_METHOD, &retry, closed_at + 1));
+        // Another client, identity or params is never the closed bundle.
+        for other in [
+            BundleKey { client_hex: OTHER, ..bundle },
+            BundleKey { target: &PERSONA, ..bundle },
+            BundleKey { params: &[], ..bundle },
+        ] {
+            assert!(!is_closed_bundle_copy(Some(&closed), BUNDLE_METHOD, &other, closed_at + 1));
+        }
+        assert!(!is_closed_bundle_copy(Some(&closed), "sign_event", &bundle, closed_at + 1));
     }
 
     // --- 4.1 slot rows ---

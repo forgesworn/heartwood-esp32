@@ -256,12 +256,40 @@ fn register_bundle_persona(
 /// cable's blocking loop both record it.
 static FULL_ACCESS_LAST_CLOSED_MS: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
-/// A FULL ACCESS card has just closed, whatever its outcome.
-pub(crate) fn full_access_closed() {
+/// The bundle whose FULL ACCESS card closed last, next to its close time
+/// (review round 3, S2): a late copy of it is dropped, not answered `shown
+/// recently` ([`is_closed_bundle_copy`]).
+static FULL_ACCESS_LAST_CLOSED_BUNDLE: std::sync::Mutex<Option<heartwood_common::owner_pairing::ClosedBundle>> =
+    std::sync::Mutex::new(None);
+
+/// A FULL ACCESS card has just closed, whatever its outcome; `bundle` is
+/// the bundle it held.
+pub(crate) fn full_access_closed(bundle: Option<heartwood_common::owner_pairing::BundleKey<'_>>) {
     let now = crate::uptime_ms();
     if let Ok(mut last) = FULL_ACCESS_LAST_CLOSED_MS.lock() {
         *last = Some(now);
     }
+    if let Ok(mut closed) = FULL_ACCESS_LAST_CLOSED_BUNDLE.lock() {
+        *closed = bundle.map(|bundle| heartwood_common::owner_pairing::ClosedBundle::new(&bundle, now));
+    }
+}
+
+/// Whether this request is a late copy of the bundle whose FULL ACCESS card
+/// closed last, inside the minute (`owner_pairing::is_closed_bundle_copy`,
+/// review round 3, S2). Dropped by the caller with no reply and no card,
+/// and the minute is not restarted. A poisoned lock is no copy: the bundle
+/// then meets the one-card rule, which refuses it.
+pub(crate) fn is_closed_bundle_copy(client_hex: &str, target_pk: &[u8; 32], request: &nip46::Nip46Request) -> bool {
+    use heartwood_common::owner_pairing::BundleKey;
+    let incoming = BundleKey { client_hex, target: target_pk, id: &request.id, params: &request.params };
+    FULL_ACCESS_LAST_CLOSED_BUNDLE.lock().is_ok_and(|closed| {
+        heartwood_common::owner_pairing::is_closed_bundle_copy(
+            closed.as_ref(),
+            &request.method,
+            &incoming,
+            crate::uptime_ms(),
+        )
+    })
 }
 
 /// Whether a bundle may raise a FULL ACCESS card now
@@ -518,7 +546,17 @@ fn approve_bundle(
                 },
                 |d, pct| crate::oled::show_full_access_hold(d, &label, &client_pubkey, pct),
             );
-            full_access_closed();
+            // A bundle addressed to a persona was refused above, so the
+            // identity it addresses is the master.
+            let target = secp256k1::Keypair::from_seckey_slice(secp, master_secret)
+                .map(|kp| kp.x_only_public_key().0.serialize())
+                .ok();
+            full_access_closed(target.as_ref().map(|target| op::BundleKey {
+                client_hex,
+                target,
+                id: &request.id,
+                params: &request.params,
+            }));
             if let Some(response) = extension_approval_failure(&request.id, result) {
                 crate::oled::show_result(display, "Not approved");
                 return response;

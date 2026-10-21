@@ -3091,7 +3091,10 @@ request`, opened or still queued; over another card that is an overdraw, so
 that card's page dwell starts again and a press held across the refusal does
 not count. S2: a cable copy of the bundle on a relay FULL ACCESS card (same
 client key, identity, inner id and params) is now NACKed `bundle already on
-screen` before dispatch, instead of closing the card. Client C below has its
+screen` before dispatch, instead of closing the card. A late copy of the
+bundle whose card closed inside the last minute, whatever the outcome, is
+dropped on the relay with no reply and no card (NACKed on the cable), and
+does not restart the minute. Client C below has its
 own bound, exclusive Everything slot; a laptop script sends its bundles.
 
 8. Queued, then refused. Put a sign card from another client on screen. C
@@ -3123,12 +3126,15 @@ own bound, exclusive Everything slot; a laptop script sends its bundles.
     s hold grants, and the phone gets one reply, the success. A different
     bundle from the same client over the cable still closes the card with
     `another full access request arrived`.
-12. Cable copy, cable first (record only, not changed by this fix). With
-    the setup of 11, if heartwoodd's copy reaches the board first, the cable
-    card blocks the relay loop. Record what the relay copy is answered once
-    that card closes, and which reply the phone shows. Expected today:
-    `full access card shown recently` for the relay copy. It can reach the
-    phone before, or instead of, the success.
+12. Cable copy, cable first. With the setup of 11, have heartwoodd's copy
+    reach the board first (or send the bundle over the cable, then the same
+    encrypted request on the relay while the card is up). The cable card
+    shows and blocks the relay loop. Hold 5 s: it grants, and the phone gets
+    one reply, the success, with no `full access card shown recently`. The
+    relay copy, read after the card closes, gets no reply and no card. Then
+    a bundle from My Signet with a new inner id inside 60 s of the close
+    still gets `full access card shown recently`, and one after 60 s raises
+    its card: the dropped copy did not restart the minute.
 
 The T-Display release build has no console, so these steps are judged by the
 screen, the replies and heartwoodd's log.

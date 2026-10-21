@@ -4238,8 +4238,11 @@ fn poll_usb_frame(
                 // dispatch, so it neither raises a card nor closes this one
                 // (review round 3, S2).
                 let cards = &ctx.button_cards;
+                // A late copy of a bundle whose card just closed is NACKed
+                // too, so heartwoodd publishes no `shown recently` for it.
                 let is_copy = |client_hex: &str, target_pk: &[u8; 32], request: &nip46::Nip46Request| {
                     is_waiting_bundle_copy(cards, client_hex, target_pk, request)
+                        || crate::nip46_handler::is_closed_bundle_copy(client_hex, target_pk, request)
                 };
                 // No queue on the cable: its own card blocks.
                 let ((), raced) = crate::nip46_handler::with_full_access_waiting(waiting, false, || {
@@ -6661,7 +6664,14 @@ fn resolve_button_card(
     // Whatever the outcome, a FULL ACCESS card closing starts the minute in
     // which no other may be raised (review round W3).
     if is_full_access_card(&card) {
-        crate::nip46_handler::full_access_closed();
+        crate::nip46_handler::full_access_closed(card.asks.first().map(|a| {
+            heartwood_common::owner_pairing::BundleKey {
+                client_hex: &card.key.client_hex,
+                target: &card.target_pk,
+                id: &a.ask.request.id,
+                params: &a.ask.request.params,
+            }
+        }));
     }
     if index == 0 {
         // Whatever the button did to decide this card is spent: the edge
@@ -8246,6 +8256,18 @@ fn handle_nip46_event(
     if is_waiting_bundle_copy(&ctx.button_cards, &ev.pubkey, target_pk, &request) {
         log::info!(
             "[relay] heartwood_approve_bundle {} is a copy of the bundle on its card; ignoring",
+            request.id
+        );
+        return Ok(());
+    }
+    // A late copy of the bundle whose card just closed (the owner's bundle,
+    // bridged by heartwoodd too, whose cable card blocked this loop while
+    // the relay copy waited): no reply, no card, and the minute is not
+    // restarted (review round 3, S2). The card's own reply answers this
+    // request id; `shown recently` would race it to the phone.
+    if crate::nip46_handler::is_closed_bundle_copy(&ev.pubkey, target_pk, &request) {
+        log::info!(
+            "[relay] heartwood_approve_bundle {} is a copy of the bundle whose card just closed; dropped",
             request.id
         );
         return Ok(());

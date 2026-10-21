@@ -91,8 +91,9 @@ pub fn handle_encrypted_request(
     bundle_only: bool,
     // WiFi loop only: whether a request (client hex, addressed identity,
     // request) is a copy of the bundle a waiting relay FULL ACCESS card
-    // holds (review round 3, S2). The USB-bridged loop has no relay cards
-    // and passes a check that never matches.
+    // holds, or of the bundle whose card closed inside the last minute
+    // (review round 3, S2). The USB-bridged loop has no relay cards and
+    // passes a check that never matches.
     is_waiting_copy: &dyn Fn(&str, &[u8; 32], &nip46::Nip46Request) -> bool,
 ) {
     if frame.payload.len() < 73 {
@@ -226,7 +227,8 @@ pub fn handle_encrypted_request(
     // A copy of the bundle a relay FULL ACCESS card already holds (the
     // owner's own bundle, bridged over the cable as well as heard on the
     // relay) is not a second bundle and must not close that card (review
-    // round 3, S2). It is NACKed before dispatch, so the one-card rule never
+    // round 3, S2); a late copy of the bundle whose card just closed must
+    // not be answered `shown recently`. It is NACKed before dispatch, so the one-card rule never
     // sees it. A NACK and not silence: heartwoodd waits up to 60 s for a
     // reply and then shuts its serial session down, and it logs a NACK and
     // publishes nothing, so the phone hears only the card's real outcome

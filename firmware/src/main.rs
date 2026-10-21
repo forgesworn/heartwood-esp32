@@ -1350,9 +1350,11 @@ fn main() {
                         &mut policy_engine,
                         &mut identity_caches,
                         &mut nvs,
-                        // No relay cards in this loop.
+                        // No relay cards in this loop, but a late copy of
+                        // the bundle whose cable card just closed is NACKed
+                        // here too (review round 3, F3), as in the WiFi loop.
                         false,
-                        &|_, _, _| false,
+                        &nip46_handler::is_closed_bundle_copy,
                     );
                 }
             }

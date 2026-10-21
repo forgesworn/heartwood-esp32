@@ -431,6 +431,11 @@ struct SignCtx<'a, 'd, 'b> {
     /// A card's result screen that must stay up before anything replaces it
     /// (an enrolment's check code, or the record to revoke). RAM only.
     card_screen_hold: Option<ScreenHold>,
+    /// A FULL ACCESS refusal drawn by `show_full_access_blocked` stays on the
+    /// glass until then before a card may tick and draw over it (review round
+    /// 3, F1). Not a held result: nothing waits for a press, and the loop
+    /// keeps running underneath.
+    refusal_shown_until: Option<Instant>,
     /// The per-boot key the delivery self-check signs its probes with, so a
     /// probe is recognised by its author before anything else looks at it.
     probe_key: ProbeKey,
@@ -1495,6 +1500,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         button_cards: Vec::new(),
         held_replies: heartwood_common::held_reply::HeldReplies::new(),
         card_screen_hold: None,
+        refusal_shown_until: None,
         probe_key: ProbeKey::generate(secp),
         probe_seq: 0,
         selfcheck: SelfCheckLedger::new(),
@@ -6661,6 +6667,7 @@ fn resolve_button_card(
         return;
     }
     let card = ctx.button_cards.remove(index);
+    let full_access_unopened = is_full_access_card(&card) && card.opened_at.is_none();
     // Whatever the outcome, a FULL ACCESS card closing starts the minute in
     // which no other may be raised (review round W3).
     if is_full_access_card(&card) {
@@ -6704,6 +6711,10 @@ fn resolve_button_card(
         // (review round 3, S1). Its close restarts the minute, so a racer
         // could otherwise keep pairing blocked with nothing on the board.
         CardTick::Refused(_) => show_full_access_blocked(ctx),
+        // Closed without ever reaching the screen for any other reason (it
+        // expired in the queue): its close restarts the minute just the
+        // same, so the owner sees the same refusal (review round 3, F2).
+        _ if full_access_unopened => show_full_access_blocked(ctx),
         _ if index != 0 => {}
         CardTick::Approved => crate::oled::show_approved(ctx.display),
         CardTick::Denied => crate::oled::show_denied(ctx.display),
@@ -7817,6 +7828,15 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
         return;
     }
 
+    // A FULL ACCESS refusal is still being read (review round 3, F1): the
+    // front card waits to tick, and so to draw, without blocking the loop.
+    // Its window runs on; when it draws again it is an overdraw, so its page
+    // dwell starts afresh, and it was disarmed with the refusal.
+    if ctx.refusal_shown_until.is_some_and(|until| Instant::now() < until) {
+        return;
+    }
+    ctx.refusal_shown_until = None;
+
     let outcome = tick_button_card(ctx);
     if matches!(outcome, CardTick::Pending) {
         return;
@@ -7825,13 +7845,16 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
 }
 
 /// Draw the refusal for a FULL ACCESS card the one-card rule closed (review
-/// round 3, S1), opened or still queued. Over another card on screen it is
+/// round 3, S1), opened or still queued, or that closed without ever
+/// reaching the screen (F2). It stays up for at least
+/// [`REFUSAL_MIN_SHOWN`] before any card ticks again (F1). Over another
+/// card on screen it is
 /// an overdraw: that card draws itself again on its next pass, its page
 /// starts its dwell afresh (`card_overdrawn`, `EnrolGate::restart_page`),
 /// and it is disarmed, so a press under way across the refusal never
 /// answers it; it arms again once the button has been seen up, as a card
-/// that has just appeared does. Nothing holds the refusal: over a live card
-/// it stays up until that card's next pass.
+/// that has just appeared does. Nothing holds the refusal beyond that: over a
+/// live card it stays up until that card's first pass after the minimum.
 fn show_full_access_blocked(ctx: &mut SignCtx) {
     if !ctx.display_on {
         crate::oled::wake_display(ctx.display);
@@ -7847,7 +7870,12 @@ fn show_full_access_blocked(ctx: &mut SignCtx) {
     };
     log::info!("[relay] FULL ACCESS refusal drawn (over a card: {over_card})");
     show_card_not_done(ctx, "Pairing blocked", "2nd request");
+    ctx.refusal_shown_until = Some(Instant::now() + REFUSAL_MIN_SHOWN);
 }
+
+/// How long a FULL ACCESS refusal stays on the glass before a card may draw
+/// over it (review round 3, F1): long enough to read two short lines.
+const REFUSAL_MIN_SHOWN: Duration = Duration::from_millis(1500);
 
 /// Replace APPROVED with NOT DONE and hold it long enough to read before the
 /// idle screen returns.

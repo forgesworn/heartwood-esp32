@@ -3087,21 +3087,25 @@ Review round 3. S1: a FULL ACCESS card the one-card rule closed before it
 reached the screen used to close silently, yet still restarted the 60 s rule,
 so a client racing its own bundles could keep pairing blocked with nothing on
 the board. Every such card now draws `NOT DONE / Pairing blocked / 2nd
-request`, opened or still queued; over another card that is an overdraw, so
+request`, opened or still queued, and so does a FULL ACCESS card that closes
+without ever reaching the screen for any other reason (it expired in the
+queue). The refusal stays up at least 1.5 s before any card draws over it.
+Over another card it is an overdraw, so
 that card's page dwell starts again and a press held across the refusal does
 not count. S2: a cable copy of the bundle on a relay FULL ACCESS card (same
 client key, identity, inner id and params) is now NACKed `bundle already on
 screen` before dispatch, instead of closing the card. A late copy of the
 bundle whose card closed inside the last minute, whatever the outcome, is
-dropped on the relay with no reply and no card (NACKed on the cable), and
-does not restart the minute. Client C below has its
+dropped on the relay with no reply and no card, NACKed on the cable in both
+the WiFi loop and the USB-bridged loop, and does not restart the minute. Client C below has its
 own bound, exclusive Everything slot; a laptop script sends its bundles.
 
 8. Queued, then refused. Put a sign card from another client on screen. C
    sends bundle A on one relay (it queues behind the sign card), then bundle
    B, with a new inner id, on another. Both get `another full access request
    arrived`. `NOT DONE / Pairing blocked / 2nd request` draws over the sign
-   card, then the sign card comes back with its countdown still running. No
+   card and stays legible for about 1.5 s (time it), then the sign card comes
+   back with its countdown still running. No
    FULL ACCESS card ever shows. A bundle from C inside the next 60 s gets
    `full access card shown recently`.
 9. A hold across the refusal. Repeat 8 several times, starting a hold on the
@@ -3135,6 +3139,14 @@ own bound, exclusive Everything slot; a laptop script sends its bundles.
     a bundle from My Signet with a new inner id inside 60 s of the close
     still gets `full access card shown recently`, and one after 60 s raises
     its card: the dropped copy did not restart the minute.
+
+13. Expired in the queue. Queue a FULL ACCESS card from C behind enough
+    other cards (three 30 s sign cards, left unanswered) that it waits past the
+    90 s queue limit without reaching the screen. When it is dropped, it is
+    answered as expired, and `NOT DONE / Pairing blocked / 2nd request` draws
+    over the card then on screen for about 1.5 s. A bundle from C inside the
+    next 60 s gets `full access card shown recently`. If the card queue
+    refuses the bundle busy first, record that, and use fewer cards ahead.
 
 The T-Display release build has no console, so these steps are judged by the
 screen, the replies and heartwoodd's log.

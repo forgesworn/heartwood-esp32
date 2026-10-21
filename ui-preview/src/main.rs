@@ -1178,7 +1178,8 @@ mod error_card_tests {
     }
 
     /// A FULL ACCESS card the one-card rule closes draws its refusal whether
-    /// or not it reached the screen (review round 3, S1): the `Refused` arm
+    /// or not it reached the screen (review round 3, S1), and so does one
+    /// that closes unopened for any other reason (F2): the `Refused` arm
     /// of `resolve_button_card` comes before the arm that keeps a queued
     /// card silent. The words are the preview's, and they read whole on
     /// every panel: the title at the body font or larger, the hint in the
@@ -1193,6 +1194,12 @@ mod error_card_tests {
             .expect("an unguarded Refused arm draws the refusal");
         let silent = body.find("_ if index != 0 => {}").expect("the arm that keeps a queued card silent");
         assert!(refused < silent, "a queued FULL ACCESS card would close without a refusal");
+        // Closed unopened for any other reason (expired in the queue): the
+        // same refusal (review round 3, F2).
+        let unopened = body
+            .find("_ if full_access_unopened => show_full_access_blocked(ctx),")
+            .expect("an unopened FULL ACCESS card draws the refusal whatever closed it");
+        assert!(unopened < silent, "a FULL ACCESS card expired in the queue would close without a refusal");
         assert!(!body.contains("opened_at.is_some()"), "the refusal is drawn only for an opened card");
 
         let start = relay.find("\nfn show_full_access_blocked(").expect("show_full_access_blocked");

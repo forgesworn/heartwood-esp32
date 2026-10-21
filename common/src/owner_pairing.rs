@@ -1301,6 +1301,33 @@ pub fn bundle_admission(
     Ok(())
 }
 
+/// One bundle as the copy check sees it: who sent it, the identity it
+/// addresses, and its inner request id and params.
+#[derive(Clone, Copy)]
+pub struct BundleKey<'a> {
+    pub client_hex: &'a str,
+    pub target: &'a [u8; 32],
+    pub id: &'a str,
+    pub params: &'a [Value],
+}
+
+/// Whether `incoming`, a request with `method`, is a republished copy of
+/// `held`, a bundle a waiting FULL ACCESS card already holds (review round 2
+/// N1; review round 3 S2 for the cable): the same client key, the same
+/// identity, the same inner id and the same params. A copy is never a
+/// second bundle, so it must not close the card; a different id or
+/// different params from the same client is a new bundle, and the one-card
+/// rule applies. Only the client-key holder can make a copy: the inner id
+/// is readable only once the request has decrypted under that key's
+/// conversation key, on either transport.
+pub fn is_bundle_copy(held: &BundleKey<'_>, method: &str, incoming: &BundleKey<'_>) -> bool {
+    method == BUNDLE_METHOD
+        && held.client_hex.eq_ignore_ascii_case(incoming.client_hex)
+        && held.target == incoming.target
+        && held.id == incoming.id
+        && held.params == incoming.params
+}
+
 // ---------------------------------------------------------------------------
 // Rule V and Rule D (spec 6)
 // ---------------------------------------------------------------------------
@@ -1852,6 +1879,28 @@ mod tests {
             BundleError::PubkeyMismatch
         );
         assert!(validate_bundle(&guess(PERSONA), Some(&slot), CLIENT, board, after, |_, _| Ok(()), registry).is_ok());
+    }
+
+    // --- republished copies (review round 2 N1, round 3 S2) ---
+
+    #[test]
+    fn only_the_same_client_identity_id_and_params_is_a_copy() {
+        let params = vec![serde_json::json!({ "act_as": ["persona"] })];
+        let held = BundleKey { client_hex: CLIENT, target: &NP, id: "req-1", params: &params };
+        let same = BundleKey { client_hex: CLIENT, target: &NP, id: "req-1", params: &params };
+        assert!(is_bundle_copy(&held, BUNDLE_METHOD, &same));
+        // The client key is one key whatever its hex case.
+        let upper = CLIENT.to_ascii_uppercase();
+        assert!(is_bundle_copy(&held, BUNDLE_METHOD, &BundleKey { client_hex: &upper, ..same }));
+
+        // Anything else is a second bundle, and the one-card rule applies.
+        assert!(!is_bundle_copy(&held, "sign_event", &same));
+        assert!(!is_bundle_copy(&held, BUNDLE_METHOD, &BundleKey { client_hex: OTHER, ..same }));
+        assert!(!is_bundle_copy(&held, BUNDLE_METHOD, &BundleKey { target: &PERSONA, ..same }));
+        assert!(!is_bundle_copy(&held, BUNDLE_METHOD, &BundleKey { id: "req-2", ..same }));
+        let wider = vec![serde_json::json!({ "act_as": ["persona", "natural-person"] })];
+        assert!(!is_bundle_copy(&held, BUNDLE_METHOD, &BundleKey { params: &wider, ..same }));
+        assert!(!is_bundle_copy(&held, BUNDLE_METHOD, &BundleKey { params: &[], ..same }));
     }
 
     // --- 4.1 slot rows ---

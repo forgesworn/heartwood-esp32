@@ -1352,6 +1352,7 @@ fn main() {
                         &mut nvs,
                         // No relay cards in this loop.
                         false,
+                        &|_, _, _| false,
                     );
                 }
             }

@@ -89,6 +89,11 @@ pub fn handle_encrypted_request(
     // refused before any card of its own, and closes the relay card); any
     // other request gets "approval on screen", as it did before the decrypt.
     bundle_only: bool,
+    // WiFi loop only: whether a request (client hex, addressed identity,
+    // request) is a copy of the bundle a waiting relay FULL ACCESS card
+    // holds (review round 3, S2). The USB-bridged loop has no relay cards
+    // and passes a check that never matches.
+    is_waiting_copy: &dyn Fn(&str, &[u8; 32], &nip46::Nip46Request) -> bool,
 ) {
     if frame.payload.len() < 73 {
         log::warn!("Encrypted request too short ({} bytes)", frame.payload.len());
@@ -215,6 +220,21 @@ pub fn handle_encrypted_request(
 
     if bundle_only && request.method != heartwood_common::owner_pairing::BUNDLE_METHOD {
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+        return;
+    }
+
+    // A copy of the bundle a relay FULL ACCESS card already holds (the
+    // owner's own bundle, bridged over the cable as well as heard on the
+    // relay) is not a second bundle and must not close that card (review
+    // round 3, S2). It is NACKed before dispatch, so the one-card rule never
+    // sees it. A NACK and not silence: heartwoodd waits up to 60 s for a
+    // reply and then shuts its serial session down, and it logs a NACK and
+    // publishes nothing, so the phone hears only the card's real outcome
+    // for this request id. A NIP-46 error here would be signed and
+    // published as that outcome.
+    if is_waiting_copy(&hex_encode(&client_pubkey), &master_pubkey, &request) {
+        log::info!("heartwood_approve_bundle {} over the cable is a copy of the bundle on its card; NACK", request.id);
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"bundle already on screen");
         return;
     }
 

@@ -4218,8 +4218,10 @@ fn poll_usb_frame(
         // its window passed but not yet ticked out), a bundle over the cable
         // is a second bundle (review round W3, round 2 S1): it is refused
         // `another full access request arrived` before any card of its own,
-        // and the relay card closes with the same reply, nothing granted.
-        // With the screen busy, anything else is still refused "approval on
+        // and the relay card closes with the same reply, nothing granted. A
+        // copy of the card's own bundle (the same client, identity, inner id
+        // and params) is not a second bundle: it is NACKed and the card
+        // stays (review round 3, S2). With the screen busy, anything else is still refused "approval on
         // screen", only now after the decrypt that tells the two apart.
         FRAME_TYPE_ENCRYPTED_REQUEST => {
             let waiting = full_access_waiting(ctx);
@@ -4232,6 +4234,13 @@ fn poll_usb_frame(
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             } else {
                 let personas_before = ctx.personas.len();
+                // A copy of the bundle the relay card holds is NACKed before
+                // dispatch, so it neither raises a card nor closes this one
+                // (review round 3, S2).
+                let cards = &ctx.button_cards;
+                let is_copy = |client_hex: &str, target_pk: &[u8; 32], request: &nip46::Nip46Request| {
+                    is_waiting_bundle_copy(cards, client_hex, target_pk, request)
+                };
                 // No queue on the cable: its own card blocks.
                 let ((), raced) = crate::nip46_handler::with_full_access_waiting(waiting, false, || {
                     crate::transport::handle_encrypted_request(
@@ -4246,6 +4255,7 @@ fn poll_usb_frame(
                         ctx.identity_caches,
                         ctx.nvs,
                         busy,
+                        &is_copy,
                     )
                 });
                 if raced {
@@ -5834,27 +5844,37 @@ fn refuse_waiting_full_access(ctx: &mut SignCtx) {
     }
 }
 
-/// Whether this relay request is a copy of the bundle a waiting FULL ACCESS
-/// card already holds (review round 2, N1): the same client key, the same
-/// inner request id and the same params, republished (after a relay
-/// reconnect, or to another relay with a new outer event id) to the same
-/// identity. Ignored like
-/// an outer-id duplicate, so the owner's own retry does not close the
-/// owner's own card. Only the client-key holder can make one: the inner id
-/// lives inside NIP-44 under the conversation key of `ev.pubkey`, and an
-/// event that does not decrypt is dropped before dispatch. A different id,
-/// or different params, from the same client is a new bundle, and the
-/// one-card rule applies.
-fn is_waiting_bundle_copy(ctx: &SignCtx, client_hex: &str, target_pk: &[u8; 32], request: &nip46::Nip46Request) -> bool {
-    request.method == heartwood_common::owner_pairing::BUNDLE_METHOD
-        && ctx.button_cards.iter().filter(|card| is_full_access_card(card)).any(|card| {
-            card.key.client_hex == client_hex
-                && card.target_pk == *target_pk
-                && card
-                    .asks
-                    .iter()
-                    .any(|a| a.ask.request.id == request.id && a.ask.request.params == request.params)
+/// Whether this request is a copy of the bundle a waiting FULL ACCESS card
+/// already holds (review round 2, N1): the same client key, the same inner
+/// request id and the same params, republished (after a relay reconnect, or
+/// to another relay with a new outer event id) to the same identity
+/// (`owner_pairing::is_bundle_copy`). Ignored like an outer-id duplicate on
+/// the relay, and NACKed on the cable (review round 3, S2), so the owner's
+/// own retry does not close the owner's own card. Only the client-key
+/// holder can make one: the inner id lives inside NIP-44 under the
+/// conversation key of the client, and a request that does not decrypt is
+/// dropped before dispatch on either transport. A different id, or
+/// different params, from the same client is a new bundle, and the one-card
+/// rule applies.
+fn is_waiting_bundle_copy(
+    cards: &[ButtonCard],
+    client_hex: &str,
+    target_pk: &[u8; 32],
+    request: &nip46::Nip46Request,
+) -> bool {
+    use heartwood_common::owner_pairing::{is_bundle_copy, BundleKey};
+    let incoming = BundleKey { client_hex, target: target_pk, id: &request.id, params: &request.params };
+    cards.iter().filter(|card| is_full_access_card(card)).any(|card| {
+        card.asks.iter().any(|a| {
+            let held = BundleKey {
+                client_hex: &card.key.client_hex,
+                target: &card.target_pk,
+                id: &a.ask.request.id,
+                params: &a.ask.request.params,
+            };
+            is_bundle_copy(&held, &request.method, &incoming)
         })
+    })
 }
 
 /// Whether this card pages five words at rest and arms only once they have
@@ -8198,7 +8218,7 @@ fn handle_nip46_event(
         }
     };
     drop(plaintext);
-    if is_waiting_bundle_copy(ctx, &ev.pubkey, target_pk, &request) {
+    if is_waiting_bundle_copy(&ctx.button_cards, &ev.pubkey, target_pk, &request) {
         log::info!(
             "[relay] heartwood_approve_bundle {} is a copy of the bundle on its card; ignoring",
             request.id

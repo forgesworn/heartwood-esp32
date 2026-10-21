@@ -2985,7 +2985,7 @@ last_reason}` and the capability `relay_delivery_selfcheck_v1`.
    and then every 120 min, each costing at most one reconnect, and no attempt
    happens while an approval card is on screen.
 
-## 36. The setup hold refuses before the card when the pairing cannot be saved (added 2026-10-19, PARTLY BENCH-RUN 2026-10-21)
+## 36. The setup hold refuses before the card when the pairing cannot be saved (added 2026-10-19, BENCH-RUN 2026-10-21)
 
 Bench failure, 2026-10-19, orange T-Display: NVS stats read 756 total, 627
 used, 129 free entries; master 0 held 5 slots and its `connslots_0` blob was
@@ -3043,22 +3043,43 @@ path is unchanged and still decides.
 7. Unchanged answers. CONNSLOT_CREATE and `heartwood_owner_narrow` on the
    tight partition still give their existing messages.
 
-Bench run, 2026-10-21, orange T-Display on 7d6869e, a laptop client over the
-relay (`create:false`, persona only, Everyday):
+Bench run, 2026-10-21, orange T-Display on 7d6869e, laptop clients over the
+relay unless stated. Every verdict below matched a prediction made from the
+model above (need = data entries + 20 at 6 pages; available = free - 126,
+plus cached-avatar entries for the slot table only). The mark added 131 bytes
+to the table each time, and the saved table matched the projection exactly
+both times.
 
-- 1 (relay) PASS. At 197 free entries with a 2536-byte `connslots_0` (three
-  slots), the reply was `no room to save this pairing` in about 2 s, and no
-  card appeared. The cable repeat and the log line were not checked.
-- 2 PASS. A right and a wrong `expect` both got `no room to save this pairing`.
-- 3 PASS. After one pairing was revoked (221 free, a 1738-byte table), the card
-  appeared and the 5 s hold granted it. After a reset the slot still carried
-  the owner mark, with 217 free.
-- 4 PARTIAL. The board refused at 197 free with 2536 bytes and passed at 221
-  free with 1738 bytes. No hold was followed by a failed save. The threshold
-  was not swept, because only two pairings were left on master 0.
-- 5, 6 and 7 were not run. The board has no cached avatars. Persona and
-  natural-person are both already registered on master 0, so a bundle has
-  nothing new to derive. And after step 3 the partition was no longer tight.
+- 1 PASS. A fresh client at 197 and again at 192 free (2536 and 2668 bytes)
+  got `no room to save this pairing` in about 2 s with no card. Over the
+  cable (encrypted USB path, same client key) at 177 free: the same reply in
+  under a second, no card. The log line could not be checked: the T-Display
+  release build has no console.
+- 2 PASS. A right and a wrong `expect` both got `no room to save this
+  pairing`.
+- 3 PASS. At 221 free with a 1738-byte table the card appeared, the 5 s hold
+  granted it, and the mark survived a reset.
+- 4 PASS, at the exact edge. With a client whose label set the table size to
+  the byte: 213 free and a 2015-byte table (need 88, available 87) was
+  refused; 213 free and a 2013-byte table (need 87, available 87) raised the
+  card, the hold saved a 2144-byte table, and it survived a reset. In that
+  same state a bundle also naming natural-person was refused. No hold was
+  followed by a failed save anywhere in the run; the check sits roughly 20
+  entries above the real write.
+- 5 PASS, without the drop. On a throwaway master with nothing registered,
+  a cached avatar worth 63 entries at 136 free (table fits only with it,
+  registry needs 14 of 10 free-only) refused a `create:true` bundle: the
+  registry write does not use the avatars. With a 42-entry avatar at 158 free
+  (free-only 32, table 54) the card appeared and the hold registered the
+  persona and saved the table. The real save fitted first time, so the
+  avatars were kept and `dropped cached avatars, retrying` was not exercised.
+- 6 PASS. On the same throwaway master, `create:true` naming persona got
+  `storage full` at about 128 free (the persona gate) and `no room to save
+  this pairing` at 149 free. No card either time, nothing registered.
+- 7 PASS. CONNSLOT_CREATE succeeded at 192 free and failed with
+  `storage_unavailable: pairing was not saved` at 129; `heartwood_owner_narrow`
+  at 173 free answered `changed:true` as before. Neither path has the bundle
+  check.
 
 ## Notes
 

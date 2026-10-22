@@ -3210,6 +3210,33 @@ USB-bridged mode, and `ping`. heartwoodd depends on these answers: as things
 stand, a pairing approved over the cable is saved, but the phone only learns
 of it by re-reading `heartwood_owner_status`.
 
+**Root cause, 2026-10-22: the bench laptop, not the firmware.** The laptop
+runs TLP, which sets the CH9102 (1a86:55d4, `cdc_acm`) to USB autosuspend:
+`power/control` = `auto`, `autosuspend_delay_ms` = 2000. With the port open
+and no traffic for 2 s, the bridge suspends. Every request that held the
+board longer than that (any card) was answered into a suspended bridge.
+- A firmware build that buffered its trace in RAM showed the board writing
+  the 0x35 reply at about 32 s (`T writing`, `T done`). The host got 364
+  scrambled bytes as the bridge resumed: the frame's tail, a middle slice,
+  the tail again. No reader can parse that, so the reply looked lost.
+- On the unmodified 7697b0c image, `power/runtime_status` read `suspended`
+  for the whole 30 s card, and `active` again only when the reply landed.
+- Same image, host sends one 0x00 byte a second while it waits (the frame
+  reader drops non-magic bytes): the bridge stayed `active`, and the reply
+  arrived whole. `nip44_encrypt` and `sign_event` each answered
+  `{"error":"timeout"}` at 33.2 s (613 bytes, frame CRC good).
+  `get_public_key` answered in 1.1 s either way.
+- The `nip44_encrypt` "no card" was really an identity card. A fresh slot
+  records no identities (`ids` empty), so the gate shows ALLOW AS for the
+  master's key. The screen read dark at the bench, but the board drew the
+  card every second and timed out on schedule.
+
+No firmware change. A host that bridges a UART board must keep autosuspend
+off for the bridge: `power/control` = `on` (a udev rule, or the TLP USB
+denylist). Otherwise heartwoodd loses every reply that follows a card.
+`echo on` was not tried, since it needs root on the bench laptop. The
+native-USB boards (V4, C6) were not checked.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

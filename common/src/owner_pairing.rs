@@ -1459,7 +1459,7 @@ mod tests {
     use alloc::vec;
 
     const CLIENT: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-    const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222"; // pragma: allow-secret — fixed test pubkey
     const NP: [u8; 32] = [0x11; 32];
     const PERSONA: [u8; 32] = [0x33; 32];
 

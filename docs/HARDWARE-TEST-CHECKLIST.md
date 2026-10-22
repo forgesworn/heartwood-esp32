@@ -3081,7 +3081,7 @@ both times.
   at 173 free answered `changed:true` as before. Neither path has the bundle
   check.
 
-### 36b. One FULL ACCESS card at a time: every refusal is seen, and a cable copy does not close the card (added 2026-10-21, BENCH-RUN 2026-10-22: 12 open, see the run below)
+### 36b. One FULL ACCESS card at a time: every refusal is seen, and a cable copy does not close the card (added 2026-10-21, BENCH-RUN 2026-10-22; the enrol-card half of 9 is not run, as it needs a board with a PIN)
 
 Review round 3. S1: a FULL ACCESS card the one-card rule closed before it
 reached the screen used to close silently, yet still restarted the 60 s rule,
@@ -3182,11 +3182,20 @@ pairing` first.
 - 11 PASS. The cable copy got the NACK `bundle already on screen` in 0.9 s and
   the card stayed up. After the 5 s hold, the relay sent exactly one reply,
   the success (`owner:true`, everyday).
-- 12 OPEN. The cable card showed and the 5 s hold saved the grant
-  (`heartwood_owner_status` then read `owner:true`, everyday). The relay copy
-  got no reply, as intended. But the cable request got no answer either, for
-  90 s. A cable-only bundle, with no relay copy, did the same. The follow-ups
-  inside and after 60 s were not run.
+- 12 PASS on the re-run (14:46), with the bench laptop's USB autosuspend off
+  for the board (TLP `USB_DENYLIST="1a86:55d4"`, see below). The cable card
+  showed, the 5 s hold granted, and the cable got the success at 21 s
+  (`owner:true`, everyday). The relay copy, published 4 s after the cable
+  copy, got no reply: none in 75 s. A bundle with a new inner id, sent as the
+  card closed, got `full access card shown recently`. A bundle 68 s later
+  raised its card (declined), so the dropped copy did not restart the minute.
+  The first run, before the fix, lost the cable answer: the grant was saved,
+  but no reply arrived (see below).
+- Relay note for this run: relay.trotters.cc started refusing every write
+  that was not from its operator (`blocked: this relay accepts writes only
+  from its operator`). The re-run went over wss://relay.primal.net, which is
+  now the board's first relay (net config revision 10: primal, then
+  trotters).
 - 13 PASS, with four cards, not three. Behind three 30 s sign cards, the last
   one closed at 88 s, still inside the 90 s limit, so the bundle opened its
   own card. Behind four, it expired in the queue: the reply was `timeout`
@@ -3194,9 +3203,9 @@ pairing` first.
   showed. The queue took four sign cards plus the bundle without answering
   busy.
 
-**Found in 12: cable requests that go through the slot policy get no answer
-in WiFi mode.** This also happens on origin/main (b0d74ac), so this branch did
-not introduce it. Over 0x10, bridge-authenticated, with every byte captured:
+**Found in the first run of 12 (the cause was the laptop; see the root cause
+below): cable requests that go through the slot policy got no answer in WiFi
+mode.** origin/main (b0d74ac) did the same. Over 0x10, bridge-authenticated, with every byte captured:
 - `get_public_key` and `heartwood_owner_status` were answered in 0.2–1.2 s.
 - These got nothing back after the 0x22 auth ack, not a byte:
   `nip44_encrypt` from an auto-approve slot (no card, screen dark), a

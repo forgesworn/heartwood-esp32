@@ -3228,8 +3228,9 @@ board longer than that (any card) was answered into a suspended bridge.
   `get_public_key` answered in 1.1 s either way.
 - The `nip44_encrypt` "no card" was really an identity card. A fresh slot
   records no identities (`ids` empty), so the gate shows ALLOW AS for the
-  master's key. The screen read dark at the bench, but the board drew the
-  card every second and timed out on schedule.
+  master's key. The firmware called the card's draw every second and timed
+  out on schedule. The screen read dark at the bench, and whether the panel
+  was lit is still unchecked: that needs someone at the board.
 
 No firmware change. A host that bridges a UART board must keep autosuspend
 off for the bridge: `power/control` = `on` (a udev rule, or the TLP USB

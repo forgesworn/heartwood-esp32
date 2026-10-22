@@ -2985,6 +2985,49 @@ last_reason}` and the capability `relay_delivery_selfcheck_v1`.
    and then every 120 min, each costing at most one reconnect, and no attempt
    happens while an approval card is on screen.
 
+## 36. Relay sign-in, NIP-42 (added 2026-10-22, NOT YET BENCH-RUN)
+
+The relay loop answers a relay's `["AUTH", <challenge>]` itself (no button):
+kind 22242, tags `relay` (the URL the board dialled) and `challenge`, empty
+content; masters plus the per-boot probe key when unlocked, the one-time
+unlock key when locked. Needs a relay you control that sends a challenge on
+connect, holds a REQ about 5 s for a sign-in, and answers `auth-required:` /
+`restricted:` (below, `wss://auth.example.com`), with the serial tap open.
+
+1. Relay that never asks. On a relay that sends no `AUTH`, the serial log has
+   no `signing in` line, and the relay's own log shows no kind-22242 from the
+   board. Everything in section 35 behaves as before.
+2. Allowlisted masters. Add the board's masters to the relay's allowlist and
+   make it the only relay. The log shows `signing in to auth.example.com as
+   <masters + 1> key(s)`, the relay answers each with `OK true`, the held "hw"
+   REQ is served (EOSE, profile name on the idle screen), and an unpaired
+   client's NIP-46 `ping` is answered. In the relay's log every 22242 carries
+   exactly the two tags, `relay` equal to the configured URL as typed, and an
+   empty content; no persona key signs in.
+3. Late sign-in. Make the relay close the REQ at once (`["CLOSED","hw",
+   "auth-required: sign in"]`) before the `OK`s. The log shows `signed in to
+   auth.example.com; subscription re-sent` once, then EOSE.
+4. Refused. Take the masters off the allowlist (the board has personas, or
+   the relay applies only the allowlist): the REQ is closed `restricted:`,
+   re-sent once, closed again, and the log shows `relay refused us (sign-in
+   refused) on auth.example.com; leaving it 10 min`. With it the only relay,
+   the board redials it once a minute (`every relay refused us recently`),
+   never every 3 s, and never restarts while a session opens. Put the masters
+   back: within about a minute the board is served again.
+5. Every key refused. Make the relay answer every 22242 `OK false` and close
+   the REQ `auth-required:`: the same 10-minute back-off, no second sign-in on
+   that connection.
+6. Challenge spam. Make the relay send a fresh `AUTH` every second: the board
+   signs in at most twice per connection, and the log shows `not answered:
+   repeat, in flight, or past the per-connection cap` for the rest.
+7. Locked. With a vault-locked board and the relay requiring sign-in for the
+   `locked` REQ (`#p` = the unlock key) but not allowlisting it: the log shows
+   `locked: signing in to auth.example.com as the unlock key`, the 22242's
+   author is the same key the kind-24135 announcement carries, and a Sapwood
+   unlock (kind 24136) arrives and unlocks the board.
+8. Publish-only. During a phone relay-update round (section 29's relay
+   change) on this relay, the publish-only connection sends no 22242.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

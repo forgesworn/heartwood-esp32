@@ -3081,7 +3081,7 @@ both times.
   at 173 free answered `changed:true` as before. Neither path has the bundle
   check.
 
-### 36b. One FULL ACCESS card at a time: every refusal is seen, and a cable copy does not close the card (added 2026-10-21, NOT YET BENCH-RUN)
+### 36b. One FULL ACCESS card at a time: every refusal is seen, and a cable copy does not close the card (added 2026-10-21, BENCH-RUN 2026-10-22: 12 open, see the run below)
 
 Review round 3. S1: a FULL ACCESS card the one-card rule closed before it
 reached the screen used to close silently, yet still restarted the 60 s rule,
@@ -3150,6 +3150,65 @@ own bound, exclusive Everything slot; a laptop script sends its bundles.
 
 The T-Display release build has no console, so these steps are judged by the
 screen, the replies and heartwoodd's log.
+
+Bench run, 2026-10-22, orange T-Display on 7697b0c (WiFi mode, one relay),
+laptop clients. heartwoodd was not used: a bench script sent one request (one
+inner id, one set of params) over both the relay and the encrypted cable path
+(0x10), standing in for its cable copy, and counted the relay replies. "Two
+relays" ran as back-to-back sends on the one relay. Because of the save-room
+rule (36), master 0 held only the sign-card client and one fresh bundle client
+per step: with five pairings there, every bundle got `no room to save this
+pairing` first.
+
+- 8 PASS. Both bundles got `another full access request arrived`. The refusal
+  drew over the sign card (seen, not timed), and the sign card came back and
+  ran out its 30 s. No FULL ACCESS card. A bundle 10 s later got `full access
+  card shown recently`.
+- 9 sign card: correct on all four runs, but the case it is after was not
+  reproduced. Untouched, the card timed out. With a hold already under way,
+  APPROVED came before the bundles were read (their refusals came about 3 s
+  late, while the board finished the hold). After a finger was lifted, the
+  card re-armed and took the next hold. A sign card needs only a 2 s hold, so
+  a hand press never landed with the finger still down when the refusal drew.
+  Seen on the way: when the refusal draws over a held APPROVED result, the
+  owner saw "several screens flash, too fast to read". The 1.5 s minimum holds
+  back a card's next tick, not the result's redraw.
+- 9 enrol card: NOT RUN. `enrol_unlock_phone` is refused on a board with no
+  PIN (`phone unlock opens encrypted storage: set a PIN or vault key first`).
+- 10 PASS. Both bundles got `another full access request arrived`. The refusal
+  drew on the idle board, and the identity screen was back after about 5 s.
+  20 s later a bundle got `full access card shown recently`, with nothing on
+  screen. After 60 s a bundle raised its card.
+- 11 PASS. The cable copy got the NACK `bundle already on screen` in 0.9 s and
+  the card stayed up. After the 5 s hold, the relay sent exactly one reply,
+  the success (`owner:true`, everyday).
+- 12 OPEN. The cable card showed and the 5 s hold saved the grant
+  (`heartwood_owner_status` then read `owner:true`, everyday). The relay copy
+  got no reply, as intended. But the cable request got no answer either, for
+  90 s. A cable-only bundle, with no relay copy, did the same. The follow-ups
+  inside and after 60 s were not run.
+- 13 PASS, with four cards, not three. Behind three 30 s sign cards, the last
+  one closed at 88 s, still inside the 90 s limit, so the bundle opened its
+  own card. Behind four, it expired in the queue: the reply was `timeout`
+  after about 91 s, the owner saw `Pairing blocked`, and no FULL ACCESS card
+  showed. The queue took four sign cards plus the bundle without answering
+  busy.
+
+**Found in 12: cable requests that go through the slot policy get no answer
+in WiFi mode.** This also happens on origin/main (b0d74ac), so this branch did
+not introduce it. Over 0x10, bridge-authenticated, with every byte captured:
+- `get_public_key` and `heartwood_owner_status` were answered in 0.2–1.2 s.
+- These got nothing back after the 0x22 auth ack, not a byte:
+  `nip44_encrypt` from an auto-approve slot (no card, screen dark), a
+  `sign_event` that needed the button (approved, or timed out "Not signed"),
+  and `heartwood_approve_bundle` (approved, grant saved).
+- The board did not reset (uptime unbroken, `last_reset` power-on).
+
+A code read of the 0x10 arm, `handle_encrypted_request` and dispatch found no
+branch that ends without writing a frame. Next checks: the same requests in
+USB-bridged mode, and `ping`. heartwoodd depends on these answers: as things
+stand, a pairing approved over the cable is saved, but the phone only learns
+of it by re-reading `heartwood_owner_status`.
 
 ## Notes
 

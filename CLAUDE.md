@@ -8,9 +8,9 @@ Hardware signing device for Nostr on a Heltec WiFi LoRa 32 (ESP32-S3). Both the 
 
 ## Security model
 
-- **Physical approval required** — OLED shows the request, button press to sign. No silent signing. Applies in every mode, including WiFi-standalone.
+- **Physical approval required** — OLED shows the request, button press to sign. No silent signing. Applies in every mode, including WiFi-standalone. The one exception is the board's own NIP-42 relay sign-in (kind 22242, fixed shape, its own dialled URL, only when the relay challenges; see "Relay sign-in" below and docs/SECURITY-MODEL.md), which signs in its own connection rather than signing anything for anyone.
 - **USB-bridged mode (high-assurance default):** all radios disabled, USB serial only. Pi compromise is survivable — keys live on the ESP32, and in device-decrypts mode the Pi only ever sees ciphertext.
-- **WiFi-standalone mode (opt-in convenience tier):** WiFi *is* enabled and the device reaches relays directly — a deliberately larger attack surface, accepted in exchange for dropping the Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected. Don't enable this tier where the USB high-assurance model is required.
+- **WiFi-standalone mode (opt-in convenience tier):** WiFi *is* enabled and the device reaches relays directly — a deliberately larger attack surface, accepted in exchange for dropping the Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated, except the board's own NIP-42 sign-in to a relay that asks (kind 22242, fixed shape). Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected. Don't enable this tier where the USB high-assurance model is required.
 - **Portable mode** (roadmap, not built) — would enable only BLE (short range) and hold a child key, never the master.
 - **JTAG remains enabled** — disabling it requires eFuse burning, which permanently locks the chip and is deliberately rejected (see `docs/memory/feedback_no_efuse.md`); physical security is the protection model, including against debug-port key extraction.
 
@@ -237,8 +237,11 @@ included), which is what a violation counter punishes. `relay_cooldown::classify
 reads the relay's own words (a `NOTICE`, a `CLOSED`, an `OK false`, or the
 upgrade's status line): `banned` cools the host 60 min, `rate-limited:`, the
 same in words, or an HTTP 429 cools it 15 min; `blocked:`, `restricted:` and
-`auth-required:` are about an event or an author and keep their old handling
-(an allowlisted relay's `OK false` still only makes the probe inert). The
+`auth-required:` are about an event or an author and are never classified
+(an allowlisted relay's `OK false` still only makes the probe inert); a
+subscription closed `auth-required:`/`restricted:` is the NIP-42 sign-in's
+(below), which cools the host 10 min (`Refusal::AuthRefused`) only once a
+sign-in failed or did not help. The
 session drops with a `relay refused us` error (runtime class
 `relay_refused`; Sapwood has no label for it yet). A cooling host is never the
 secondary or a pinned dial, and the primary rotation passes it by; when every
@@ -267,6 +270,41 @@ one session is all the board can hold, drops the primary and dials home, the
 ordinary rotation carrying on if home fails. Never while a card is open, an
 OTA, a network trial or a relay update round runs, a session is degraded, or
 relay 1 is cooling after refusing us.
+
+Relay sign-in, NIP-42 (2026-10-22, checklist section 36, NOT YET BENCH-RUN). A
+relay may refuse every REQ until the connection signs in: it sends `["AUTH",
+<challenge>]`, holds a REQ for a few seconds, then closes it `auth-required:`
+(or `restricted:` when the keys signed in may not read it). The board now
+answers on every subscribing session (primary, secondary, pinned, and the
+locked phase's), never on a publish-only `publish_once` connection (phone
+relay updates, old-relay lock announcements: nothing there may name the
+signer), and never unasked. No button: it is signing in its own connection.
+The event is `relay_auth::auth_event`'s fixed shape: kind 22242, tags exactly
+`relay` (the session's own dialled URL, `s.url`, never anything the relay
+sent) and `challenge`, empty content. Unlocked (relay.rs `answer_auth`): one
+per unlocked master plus one for the per-boot probe key, stamped from
+`session_wall_clock` (the probe's clock); the masters are what the relay's
+allowlist admits, and the probe key costs one signature and completes the
+24133 filter's `#p` on a relay applying only the authors/`#p` rule when the
+board has no personas. Personas are deliberately never signed in: a
+re-derivation and signature each per connect, and a shared challenge would
+prove persona and master are held together. Locked (`locked_relay_auth`):
+the one-time unlock key only, the `#p` of the `locked` REQ, from the Date
+header clock. Challenges must be printable ASCII up to 256 bytes, are never
+answered twice, at most two per connection. `relay_auth::RelayAuth` (pure,
+host-tested, one per session) then decides: a subscription closed for sign-in
+while the `OK`s are outstanding is re-sent when they arrive (any key
+accepted), one closed after sign-in is re-sent at once, each at most once per
+sign-in ("hw" goes out as the connect-time catch-up REQ again; a closed
+`wrappage` just ends the catch-up pass; the locked phase re-sends `locked`);
+a second refusal, every key refused or unanswered within 10 s with a
+subscription closed for it, or `auth-required:` with no challenge within 5 s
+backs off: the session drops as `relay refused us (sign-in refused)` and the
+host cools 10 min (`relay_cooldown::Refusal::AuthRefused`; in the locked
+phase, a phase-local `RelayCooldowns` drives its rotation). A sign-in refused
+with nothing closed changes nothing; any other `CLOSED`, and `restricted:`
+from a relay that never challenged, keep their old handling. The owner's
+relay needs the masters on its allowlist before this helps.
 
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device

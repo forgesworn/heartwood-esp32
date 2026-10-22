@@ -59,6 +59,7 @@ use heartwood_common::delivery_probe::{
 use heartwood_common::hex::{hex_decode, hex_encode};
 use heartwood_common::mgmt;
 use heartwood_common::home_relay::{HomeAction, HomeReturn, HomeState};
+use heartwood_common::relay_auth::{self, RelayAuth};
 use heartwood_common::relay_cooldown::{self, RelayCooldowns};
 use heartwood_common::net_config::{
     apply_remote_net_config_patch, network_activation_source_allowed,
@@ -1169,6 +1170,9 @@ struct RelaySession {
     probe: SessionProbe,
     /// Event id of the probe in flight, to match the relay's `OK` for it.
     probe_id: Option<String>,
+    /// NIP-42 sign-in on this connection (`heartwood_common::relay_auth`).
+    /// Fresh per connect; idle unless the relay sends a challenge.
+    auth: RelayAuth,
 }
 
 /// A relay joined at nostrconnect pairing because the client dictated it.
@@ -2667,6 +2671,7 @@ fn connect_relay_raw(
         resubs: 0,
         probe: SessionProbe::new(uptime_ms()),
         probe_id: None,
+        auth: RelayAuth::new(),
     })
 }
 
@@ -2894,6 +2899,11 @@ fn locked_relay_phase(
     // listen there, not here, so each phone's announcement is repeated on
     // them. When, and how a dead one backs off: phone_relays::OldRelayDials.
     let mut old_dials = phone_relays::OldRelayDials::new(if phones.is_empty() { &[] } else { told_old });
+    // Relays whose NIP-42 sign-in failed or did not help this phase, passed
+    // by in the rotation for a while (`locked_relay_auth`). Empty, and so no
+    // change to the rotation, unless a relay asked for a sign-in.
+    let mut auth_cooldowns = RelayCooldowns::new();
+    let mut dial_after = Instant::now();
 
     loop {
         crate::wdt::feed();
@@ -2950,7 +2960,20 @@ fn locked_relay_phase(
             }
         }
         // (Re)connect round-robin until a relay holds.
-        if session.is_none() && !wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
+        if session.is_none()
+            && !wifi_retry.needs_join(wifi.is_up().unwrap_or(false))
+            && Instant::now() >= dial_after
+        {
+            // Pass by a relay that refused the sign-in; when every one has,
+            // dial the soonest to cool, no more often than the main loop does.
+            let hosts: Vec<&str> = relays.iter().map(|r| relay_host(r)).collect();
+            if let Some(pick) = auth_cooldowns.pick(&hosts, relay_idx, uptime_ms()) {
+                relay_idx = pick.index;
+                if pick.all_cooling {
+                    dial_after = Instant::now() + COOLED_DIAL_SPACING;
+                }
+            }
+            drop(hosts);
             match connect_relay_raw(&relays[relay_idx], sub_req.clone(), false, true) {
                 Ok(s) => {
                     log::info!("[relay] locked: connected {}", relays[relay_idx]);
@@ -3015,11 +3038,47 @@ fn locked_relay_phase(
                 just_announced = !phones.is_empty();
             }
 
+            // Sign-in deadlines (see `locked_relay_auth`).
+            let step = s.auth.tick(uptime_ms());
+            match locked_auth_step(s, step) {
+                Ok(LockedAuth::Continue) => {}
+                Ok(LockedAuth::BackOff) => {
+                    auth_cooldowns.cool(relay_host(&s.url), relay_cooldown::Refusal::AuthRefused, uptime_ms());
+                    log::warn!("[relay] locked: {} refused the sign-in; rotating", relay_host(&s.url));
+                    relay_idx = (relay_idx + 1) % relays.len();
+                    session = None;
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("[relay] locked: re-subscribe failed: {e}");
+                    session = None;
+                    continue;
+                }
+            }
+
             // Drain one buffered frame, else one read (recv-timeout paced).
             match try_parse(&mut s.rx, &mut s.skip) {
                 Ok(Some(WsMsg::Text(raw))) => {
                     s.last_rx = Instant::now();
-                    if nip46::relay_message_tag(&raw) == Some("EVENT") {
+                    let tag = nip46::relay_message_tag(&raw);
+                    if let Some(tag @ ("AUTH" | "OK" | "CLOSED")) = tag {
+                        let wall = clock.projected(crate::uptime_s());
+                        match locked_relay_auth(s, tag, &raw, secp, &unlock_sk, &unlock_pk_hex, wall) {
+                            Ok(LockedAuth::Continue) => {}
+                            Ok(LockedAuth::BackOff) => {
+                                auth_cooldowns.cool(relay_host(&s.url), relay_cooldown::Refusal::AuthRefused, uptime_ms());
+                                log::warn!("[relay] locked: {} refused the sign-in; rotating", relay_host(&s.url));
+                                relay_idx = (relay_idx + 1) % relays.len();
+                                session = None;
+                                continue;
+                            }
+                            Err(e) => {
+                                log::warn!("[relay] locked: sign-in send failed: {e}");
+                                session = None;
+                                continue;
+                            }
+                        }
+                    } else if tag == Some("EVENT") {
                         if let Ok(msg) =
                             serde_json::from_slice::<nip46::RelayEventMessage>(&raw)
                         {
@@ -3216,6 +3275,90 @@ fn locked_relay_phase(
         }
 
         FreeRtos::delay_ms(10);
+    }
+}
+
+/// What the locked phase does with its session after a sign-in frame.
+enum LockedAuth {
+    Continue,
+    /// Drop the session and pass the relay by for a while.
+    BackOff,
+}
+
+/// NIP-42 on the locked phase's session: sign in as this boot's one-time
+/// unlock key, the one key the `locked` REQ names (`#p`), so a relay that
+/// applies the authors/`#p` rule lets the vault delivery through. The key is
+/// per boot and already on the wire as that `#p`, so the sign-in links
+/// nothing new. Only the relay's own challenge, only the URL this phase
+/// dialled. A closure that is not the sign-in's is ignored, as it always was
+/// here. `Err` is a send that failed: drop the session.
+fn locked_relay_auth(
+    s: &mut RelaySession,
+    tag: &str,
+    raw: &[u8],
+    secp: &Secp256k1<SignOnly>,
+    unlock_sk: &[u8; 32],
+    unlock_pk_hex: &str,
+    wall: u64,
+) -> Result<LockedAuth, String> {
+    let step = match tag {
+        "AUTH" => {
+            let Some(challenge) = relay_auth::parse_challenge(raw) else {
+                log::warn!("[relay] locked: AUTH not answered: not a challenge this board signs");
+                return Ok(LockedAuth::Continue);
+            };
+            if !s.auth.challenge(&challenge) {
+                return Ok(LockedAuth::Continue);
+            }
+            let mut ids = Vec::new();
+            if wall == 0 {
+                log::warn!("[relay] locked: no wall clock to stamp a sign-in with");
+            } else {
+                match sign_auth_event(secp, unlock_sk, unlock_pk_hex.to_string(), &s.url, &challenge, wall) {
+                    Ok(ev) => {
+                        ws_send_event(&mut s.tls, &ev)?;
+                        ids.push(ev.id);
+                        log::info!("[relay] locked: signing in to {} as the unlock key", relay_host(&s.url));
+                    }
+                    Err(e) => log::warn!("[relay] locked: sign-in event not signed ({e})"),
+                }
+            }
+            s.auth.sent(ids, uptime_ms())
+        }
+        "OK" => match relay_auth::parse_ok(raw).and_then(|(id, ok)| s.auth.ok(&id, ok)) {
+            Some(step) => step,
+            None => return Ok(LockedAuth::Continue),
+        },
+        "CLOSED" => {
+            let step = relay_auth::parse_closed(raw).and_then(|(sub, message)| {
+                s.auth.closed(&sub, relay_auth::closed_reason(&message), uptime_ms())
+            });
+            match step {
+                Some(step) => step,
+                None => {
+                    log::warn!("[relay] locked: CLOSED: {}", snippet(raw, 160));
+                    return Ok(LockedAuth::Continue);
+                }
+            }
+        }
+        _ => return Ok(LockedAuth::Continue),
+    };
+    locked_auth_step(s, step)
+}
+
+/// Act on the sign-in state machine's step for the locked session: the only
+/// subscription it has is `locked`, re-sent as dialled.
+fn locked_auth_step(s: &mut RelaySession, step: relay_auth::Step) -> Result<LockedAuth, String> {
+    match step {
+        relay_auth::Step::Nothing => Ok(LockedAuth::Continue),
+        relay_auth::Step::Resend(subs) => {
+            if subs.iter().any(|sub| sub == "locked") {
+                ws_send(&mut s.tls, OP_TEXT, s.sub_req.as_bytes())?;
+                log::info!("[relay] locked: signed in to {}; subscription re-sent", relay_host(&s.url));
+            }
+            Ok(LockedAuth::Continue)
+        }
+        relay_auth::Step::BackOff => Ok(LockedAuth::BackOff),
     }
 }
 
@@ -3780,6 +3923,12 @@ fn session_step(
         return Ok(());
     }
 
+    // Sign-in deadlines: OKs that never came, or a challenge that never
+    // followed an `auth-required:` closure. Nothing at all unless the relay
+    // asked for a sign-in or closed a subscription for one.
+    let step = s.auth.tick(uptime_ms());
+    apply_auth_step(s, step, ctx)?;
+
     // Idle tick (only meaningful when the recv timeout is active): keep the
     // relay link warm, refresh the subscription, and bail if it's gone quiet.
     if s.recv_timeout_on {
@@ -3846,13 +3995,7 @@ fn delivery_selfcheck(s: &mut RelaySession, ctx: &mut SignCtx) -> Result<(), Str
 /// as a miss, when there is no wall clock to stamp it with (relays reject an
 /// ephemeral event dated 1970) or a heap below the publish guard.
 fn send_probe(s: &mut RelaySession, ctx: &mut SignCtx, now_ms: u64) -> Result<(), String> {
-    let mut created_at = wall_clock_estimate();
-    if created_at == 0 {
-        created_at = s
-            .server_time
-            .map(|t| t + now_ms.saturating_sub(s.probe.connected_ms()) / 1_000)
-            .unwrap_or(0);
-    }
+    let created_at = session_wall_clock(s, now_ms);
     if created_at == 0 || !response_transportable(delivery_probe::PROBE_CONTENT.len()) {
         log::debug!("[relay] delivery probe deferred on {} (no clock or heap tight)", s.url);
         s.probe.skipped(now_ms);
@@ -3890,6 +4033,123 @@ fn send_probe(s: &mut RelaySession, ctx: &mut SignCtx, now_ms: u64) -> Result<()
     log::debug!("[relay] delivery probe {nonce} out on {}", relay_host(&s.url));
     s.probe_id = Some(signed.id);
     Ok(())
+}
+
+/// Best wall-clock reading for stamping an event on `s`: the loop's estimate,
+/// else this relay's own `Date` header plus the time since it connected.
+/// 0 when neither is known.
+fn session_wall_clock(s: &RelaySession, now_ms: u64) -> u64 {
+    let wall = wall_clock_estimate();
+    if wall > 0 {
+        return wall;
+    }
+    s.server_time
+        .map(|t| t + now_ms.saturating_sub(s.probe.connected_ms()) / 1_000)
+        .unwrap_or(0)
+}
+
+/// One NIP-42 sign-in event for `relay_url`, signed with `sk` (borrowed, not
+/// copied: the caller's key stays where it is zeroised). The shape is
+/// `relay_auth::auth_event`'s and nothing else.
+fn sign_auth_event(
+    secp: &Secp256k1<SignOnly>,
+    sk: &[u8; 32],
+    pubkey_hex: String,
+    relay_url: &str,
+    challenge: &str,
+    created_at: u64,
+) -> Result<SignedEvent, String> {
+    let unsigned = relay_auth::auth_event(&pubkey_hex, relay_url, challenge, created_at);
+    let event_id = nip46::compute_event_id(&unsigned);
+    let sig = sign::sign_hash(secp, sk, &event_id).map_err(|e| format!("sign: {e}"))?;
+    Ok(SignedEvent {
+        id: hex_encode(&event_id),
+        pubkey: unsigned.pubkey,
+        created_at: unsigned.created_at,
+        kind: unsigned.kind,
+        tags: unsigned.tags,
+        content: unsigned.content,
+        sig: hex_encode(&sig),
+    })
+}
+
+/// The relay sent `["AUTH", challenge]` on `s`: sign in as every unlocked
+/// master, and as this boot's delivery-probe key, with the URL this board
+/// dialled as the `relay` tag. No button: this answers the board's own
+/// connection, in a shape that carries nothing but that URL and the
+/// challenge.
+///
+/// Masters, because the owner's relay admits a REQ from any signed-in key on
+/// its allowlist. The probe key, because it costs one signature and makes the
+/// live 24133 filter's `#p` list fully signed in on a relay that applies only
+/// the authors/`#p` rule, whenever the board serves no personas. Personas are
+/// NOT signed in: each one is a re-derivation plus a signature on every
+/// connect to every relay (up to 64 of them on a T-Display), and a 22242 per
+/// persona over the same challenge as its master is a proof anyone can check
+/// that the two are held together, which a persona exists to avoid. A relay
+/// that needs them closes the subscription again and is backed off.
+fn answer_auth(s: &mut RelaySession, raw: &[u8], ctx: &mut SignCtx) -> Result<(), String> {
+    let Some(challenge) = relay_auth::parse_challenge(raw) else {
+        log::warn!("[relay] AUTH from {} not answered: not a challenge this board signs", relay_host(&s.url));
+        return Ok(());
+    };
+    if !s.auth.challenge(&challenge) {
+        log::info!("[relay] AUTH from {} not answered: repeat, in flight, or past the per-connection cap", relay_host(&s.url));
+        return Ok(());
+    }
+    let now_ms = uptime_ms();
+    let created_at = session_wall_clock(s, now_ms);
+    let mut ids = Vec::new();
+    if created_at == 0 {
+        log::warn!("[relay] AUTH from {}: no wall clock to stamp a sign-in with", relay_host(&s.url));
+    } else {
+        let keys = ctx
+            .masters
+            .iter()
+            .filter(|m| !m.locked)
+            .map(|m| (hex_encode(&m.pubkey), &m.secret))
+            .chain(core::iter::once((ctx.probe_key.pk_hex.clone(), &ctx.probe_key.sk)));
+        for (pk_hex, sk) in keys {
+            match sign_auth_event(ctx.secp, sk, pk_hex, &s.url, &challenge, created_at) {
+                Ok(ev) => {
+                    ws_send_event(&mut s.tls, &ev)?;
+                    ids.push(ev.id);
+                }
+                Err(e) => log::warn!("[relay] sign-in event not signed ({e})"),
+            }
+        }
+        log::info!("[relay] signing in to {} as {} key(s)", relay_host(&s.url), ids.len());
+    }
+    let step = s.auth.sent(ids, now_ms);
+    apply_auth_step(s, step, ctx)
+}
+
+/// Act on what the sign-in state machine decided for `s`.
+fn apply_auth_step(s: &mut RelaySession, step: relay_auth::Step, ctx: &mut SignCtx) -> Result<(), String> {
+    match step {
+        relay_auth::Step::Nothing => Ok(()),
+        relay_auth::Step::Resend(subs) => {
+            if subs.iter().any(|sub| sub == "hw") {
+                // The connect-time REQ again, catch-up included: the one the
+                // relay closed delivered nothing. Stored copy stays live-only.
+                let sub_req = build_sub_req(ctx, true);
+                s.sub_req = build_sub_req(ctx, false);
+                ctx.catch_up = Some(CatchUp { delivered: 0, oldest: u64::MAX, pages: 0 });
+                s.last_resub = Instant::now();
+                ws_send(&mut s.tls, OP_TEXT, sub_req.as_bytes())?;
+                log::info!("[relay] signed in to {}; subscription re-sent", relay_host(&s.url));
+            } else if subs.iter().any(|sub| sub == CATCH_UP_PAGE_SUB) {
+                // A page is not worth a REQ of its own: the next catch-up
+                // starts from the top again.
+                ctx.catch_up = None;
+                log::info!("[relay] catch-up page closed on {} for sign-in; left to the next catch-up", relay_host(&s.url));
+            }
+            Ok(())
+        }
+        relay_auth::Step::BackOff => {
+            Err(refused(relay_host(&s.url), relay_cooldown::Refusal::AuthRefused, ctx))
+        }
+    }
 }
 
 /// A probe of ours arrived on `s`. It counts only if it is the one this
@@ -4685,6 +4945,12 @@ fn handle_relay_msg(
             if let Some(refusal) = refusal {
                 return Err(refused(relay_host(&s.url), refusal, ctx));
             }
+            // The OK for one of this connection's sign-in events.
+            if let Some((id, accepted)) = relay_auth::parse_ok(raw) {
+                if let Some(step) = s.auth.ok(&id, accepted) {
+                    return apply_auth_step(s, step, ctx);
+                }
+            }
             probe_ok(s, raw);
         }
         "NOTICE" => {
@@ -4698,13 +4964,26 @@ fn handle_relay_msg(
         // re-subscribe cleanly rather than sit with a dead subscription. Unless
         // it closed it because it is limiting us: reconnecting at once and
         // re-sending the connect-time REQ is what a violation counter punishes.
+        //
+        // `auth-required:` and `restricted:` are the NIP-42 sign-in's
+        // (`relay_auth`): held until the sign-in lands, re-sent once, or
+        // backed off. A `restricted:` from a relay that never asked for a
+        // sign-in, and every other closure, reconnects as it always did.
         "CLOSED" => {
-            log::warn!("[relay] CLOSED: {}; reconnecting", snippet(raw, 160));
+            log::warn!("[relay] CLOSED: {}", snippet(raw, 160));
             if let Some(refusal) = relay_cooldown::classify(&relay_message_text(raw)) {
                 return Err(refused(relay_host(&s.url), refusal, ctx));
             }
+            if let Some((sub, message)) = relay_auth::parse_closed(raw) {
+                let reason = relay_auth::closed_reason(&message);
+                if let Some(step) = s.auth.closed(&sub, reason, uptime_ms()) {
+                    return apply_auth_step(s, step, ctx);
+                }
+            }
             return Err("relay closed our subscription".into());
         }
+        // NIP-42: the relay wants this connection to sign in.
+        "AUTH" => answer_auth(s, raw, ctx)?,
         _ => {}
     }
     Ok(())

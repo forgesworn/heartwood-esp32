@@ -43,6 +43,7 @@ mod backup;
 mod bigtext;
 mod board;
 mod button;
+mod card_hold;
 mod confirm;
 mod connslot;
 mod entropy;
@@ -61,6 +62,7 @@ mod masters;
 mod master_identity;
 mod held_data_key;
 mod allocation_root;
+mod nip46_gates;
 mod nip46_handler;
 mod notes;
 mod personas;
@@ -281,6 +283,11 @@ pub fn json_string(s: &str) -> String {
 /// Seconds since boot (esp_timer starts at reset).
 pub fn uptime_s() -> u64 {
     (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u64
+}
+
+/// Milliseconds since boot, on the same clock as [`uptime_s`].
+pub fn uptime_ms() -> u64 {
+    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000) as u64
 }
 
 /// One page of the idle info carousel in the USB-bridged loop. Page 0 is the
@@ -1343,6 +1350,11 @@ fn main() {
                         &mut policy_engine,
                         &mut identity_caches,
                         &mut nvs,
+                        // No relay cards in this loop, but a late copy of
+                        // the bundle whose cable card just closed is NACKed
+                        // here too (review round 3, F3), as in the WiFi loop.
+                        false,
+                        &nip46_handler::is_closed_bundle_copy,
                     );
                 }
             }

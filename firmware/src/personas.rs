@@ -335,6 +335,20 @@ pub fn find_by_pubkey(personas: &[LoadedPersona], pubkey: &[u8; 32]) -> Option<u
     personas.iter().position(|p| &p.pubkey == pubkey)
 }
 
+/// The registry as the next [`add`] finds it, for the setup hold's
+/// save-room check: the count, whether the count blob exists, and the stored
+/// length of the chunk that add rewrites. Read-only. `None` when any of it
+/// cannot be read (the count blob's presence or value, or the chunk's
+/// length): no guess at that state is safe, since a wrong one can only
+/// understate the rewrite, and `add` reads the same state anyway. The check
+/// then refuses a press that would register a name.
+pub fn registry_tail(nvs: &EspNvs<NvsDefault>) -> Option<heartwood_common::owner_pairing::RegistryTail> {
+    let count_stored = packed_format(nvs).ok()?;
+    let count = if count_stored { read_count_strict(nvs).ok()? } else { 0 };
+    let chunk_len = nvs.blob_len(&chunk_key(chunk_index(count))).ok()?;
+    Some(heartwood_common::owner_pairing::RegistryTail { count, count_stored, chunk_len })
+}
+
 /// Whether the registry (and the NVS partition behind it) can take another
 /// persona. `Err` carries the actionable refusal — the "storage full" NACK
 /// text the design doc requires — so callers can pre-check before deriving.

@@ -240,7 +240,7 @@ impl SoftBackend {
                 let event_id_hex = hex_encode(&event_id);
 
                 let signing_key =
-                    k256::schnorr::SigningKey::from_bytes(&secret_bytes)
+                    k256::schnorr::SigningKey::from_slice(&secret_bytes)
                         .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
                 // BIP340 over the 32-byte event id (see sign_envelope).
                 let sig: k256::schnorr::Signature = signing_key
@@ -437,7 +437,7 @@ impl SoftBackend {
         let event_id = compute_event_id(&unsigned);
         let event_id_hex = hex_encode(&event_id);
 
-        let signing_key = k256::schnorr::SigningKey::from_bytes(&secret_bytes)
+        let signing_key = k256::schnorr::SigningKey::from_slice(&secret_bytes)
             .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
         // BIP340 over the 32-byte event id itself. Signer::sign would prehash
         // the id with SHA-256 first, producing signatures no Nostr client
@@ -620,7 +620,7 @@ impl SigningBackend for SoftBackend {
         let event_id = compute_event_id(&unsigned);
         let event_id_hex = hex_encode(&event_id);
 
-        let signing_key = k256::schnorr::SigningKey::from_bytes(&secret_bytes)
+        let signing_key = k256::schnorr::SigningKey::from_slice(&secret_bytes)
             .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
         // BIP340 over the 32-byte event id itself. Signer::sign would prehash
         // the id with SHA-256 first, producing signatures no Nostr client
@@ -1492,7 +1492,7 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
 
 /// Derive the x-only public key bytes from a secret key.
 fn derive_x_only_bytes(secret_key_bytes: &[u8; 32]) -> Result<[u8; 32], String> {
-    let signing_key = k256::schnorr::SigningKey::from_bytes(secret_key_bytes.as_ref())
+    let signing_key = k256::schnorr::SigningKey::from_slice(secret_key_bytes.as_ref())
         .map_err(|e| format!("signing key: {e}"))?;
     let vk = signing_key.verifying_key();
     let field_bytes = vk.to_bytes();
@@ -1779,9 +1779,11 @@ mod tests {
                 .map(|i| u8::from_str_radix(&sig_hex[i..i + 2], 16).unwrap())
                 .collect();
             let sig = k256::schnorr::Signature::try_from(sig_bytes.as_slice()).unwrap();
-            let vk = k256::schnorr::VerifyingKey::from_bytes(&master_pubkey).unwrap();
+            let vk = k256::schnorr::VerifyingKey::from_slice(&master_pubkey).unwrap();
             // Nostr clients verify BIP340 over the raw 32-byte event id.
             vk.verify_prehash(&id, &sig).unwrap();
+            // Independent Nostr/libsecp256k1 parser verifies the event id and wire signature.
+            nostr::event::Event::from_json(event_json).unwrap().verify().unwrap();
         };
 
         // Relay envelope.
@@ -2031,8 +2033,10 @@ mod tests {
             .map(|i| u8::from_str_radix(&signed.sig[i..i + 2], 16).unwrap())
             .collect();
         let sig = k256::schnorr::Signature::try_from(sig_bytes.as_slice()).unwrap();
-        let vk = k256::schnorr::VerifyingKey::from_bytes(&master_pubkey).unwrap();
+        let vk = k256::schnorr::VerifyingKey::from_slice(&master_pubkey).unwrap();
         vk.verify_prehash(&hex_to_32(&signed.id).unwrap(), &sig).unwrap();
+        // Cross-check the emitted denial envelope with the client verifier.
+        nostr::event::Event::from_json(&envelope).unwrap().verify().unwrap();
         let key = nip44::get_conversation_key(&denied_client, &master_pubkey).unwrap();
         let response: nip46::Nip46Response =
             serde_json::from_str(&nip44::decrypt(&key, &signed.content).unwrap()).unwrap();

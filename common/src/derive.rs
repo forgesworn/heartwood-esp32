@@ -38,7 +38,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub fn is_xonly_public_key(key: &[u8; 32]) -> bool {
     #[cfg(feature = "k256-backend")]
     {
-        k256::schnorr::VerifyingKey::from_bytes(key).is_ok()
+        k256::schnorr::VerifyingKey::from_slice(key).is_ok()
     }
     #[cfg(feature = "secp256k1-backend")]
     {
@@ -58,7 +58,7 @@ pub(crate) mod backend {
     /// Validate a 32-byte secret as a secp256k1 scalar and return the x-only
     /// public key bytes, or None if the scalar is invalid (zero / ≥ order).
     pub fn pubkey_from_secret(secret: &[u8; 32]) -> Result<[u8; 32], &'static str> {
-        let sk = SigningKey::from_bytes(secret).map_err(|_| "invalid secret key")?;
+        let sk = SigningKey::from_slice(secret).map_err(|_| "invalid secret key")?;
         Ok(sk.verifying_key().to_bytes().into())
     }
 
@@ -69,9 +69,9 @@ pub(crate) mod backend {
     /// is the one place the parity byte matters.
     #[cfg(feature = "cash")]
     pub fn compressed_pubkey(secret: &[u8; 32]) -> Result<[u8; 33], &'static str> {
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::elliptic_curve::sec1::ToSec1Point;
         let sk = k256::SecretKey::from_slice(secret).map_err(|_| "invalid secret key")?;
-        let encoded = sk.public_key().to_encoded_point(true);
+        let encoded = sk.public_key().to_sec1_point(true);
         let bytes = encoded.as_bytes();
         if bytes.len() != 33 {
             return Err("compressed public key was not 33 bytes");
@@ -126,7 +126,7 @@ pub(crate) mod backend {
     /// same credential, as the spec's vectors require.
     #[cfg(feature = "cash")]
     pub fn sign_bip340_zero_aux(secret: &[u8; 32], message: &[u8; 32]) -> Result<[u8; 64], &'static str> {
-        let key = SigningKey::from_bytes(secret).map_err(|_| "invalid secret key")?;
+        let key = SigningKey::from_slice(secret).map_err(|_| "invalid secret key")?;
         let signature = key.sign_raw(message, &[0u8; 32]).map_err(|_| "signing failed")?;
         Ok(signature.to_bytes())
     }

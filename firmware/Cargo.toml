@@ -55,7 +55,7 @@ demo-game = []
 chacha20poly1305 = { version = "=0.10.1", default-features = false }
 hmac = { version = "0.12", default-features = false }
 # Shared strict receipt codec; immutable reviewed public source, no std/RNG.
-vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "e6985dd9583207853ffa9f5224b33e05d5094010", default-features = false }
+vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "fa3776ea5dbd929c8598fe28e2d3ad3fba247ebe", default-features = false }
 # Writer public-key derivation uses the same backend; secret keys erase on Drop.
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
 heartwood-common = { path = "../common", default-features = false, features = ["compact-hashes", "nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen", "ota-sign", "device-identity", "seed-encrypt", "cash"] }

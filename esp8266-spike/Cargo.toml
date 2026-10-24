@@ -14,7 +14,9 @@ crate-type = ["staticlib"]
 [dependencies]
 # Pure-Rust secp256k1. default-features=false => no_std, no std, no alloc unless
 # a feature pulls it. `schnorr` gives BIP-340 (x-only, tagged hashes).
-k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+k256 = { version = "=0.14.0", default-features = false, features = ["schnorr"] }
+# Keep the transitively selected constant-time bigint above RUSTSEC-2026-0387.
+crypto-bigint = { version = ">=0.7.6, <0.8", default-features = false }
 
 # Child-key derivation (HMAC-SHA256), the same primitive heartwood-common::derive
 # uses. Both no_std, no alloc.

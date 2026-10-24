@@ -6,7 +6,7 @@ use k256::schnorr::SigningKey;
 /// Derive the 32-byte x-only public key from a 32-byte master secret.
 /// `None` if the secret is not a valid secp256k1 scalar.
 pub fn pubkey(seed: &[u8; 32]) -> Option<[u8; 32]> {
-    let sk = SigningKey::from_bytes(seed).ok()?;
+    let sk = SigningKey::from_slice(seed).ok()?;
     let bytes = sk.verifying_key().to_bytes();
     let mut out = [0u8; 32];
     out.copy_from_slice(bytes.as_ref());
@@ -25,7 +25,7 @@ pub fn pubkey(seed: &[u8; 32]) -> Option<[u8; 32]> {
 ///   message), so signing needs **no RNG** — important on a radio-off lx106 whose
 ///   hardware RNG is poorly seeded.
 pub fn sign(seed: &[u8; 32], message: &[u8; 32]) -> Option<[u8; 64]> {
-    let sk = SigningKey::from_bytes(seed).ok()?;
+    let sk = SigningKey::from_slice(seed).ok()?;
     let sig = sk.sign_prehash_with_aux_rand(message, &[0u8; 32]).ok()?;
     let mut out = [0u8; 64];
     out.copy_from_slice(sig.to_bytes().as_ref());

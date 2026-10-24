@@ -20,13 +20,13 @@ pub fn pubkey(seed: &[u8; 32]) -> Option<[u8; 32]> {
 /// - Nostr signs the event id itself, so we must NOT re-hash it. The `Signer`
 ///   trait's `try_sign` does `sign_raw(Sha256(msg), …)` — that would sign
 ///   `sha256(event_id)`, and every signature would fail verification. We call
-///   `sign_prehash_with_aux_rand`, which signs the 32-byte digest as-is.
+///   `sign_raw`, which signs the 32-byte digest as-is.
 /// - `aux_rand = 0` makes the BIP-340 nonce deterministic (derived from the key +
 ///   message), so signing needs **no RNG** — important on a radio-off lx106 whose
 ///   hardware RNG is poorly seeded.
 pub fn sign(seed: &[u8; 32], message: &[u8; 32]) -> Option<[u8; 64]> {
     let sk = SigningKey::from_slice(seed).ok()?;
-    let sig = sk.sign_prehash_with_aux_rand(message, &[0u8; 32]).ok()?;
+    let sig = sk.sign_raw(message, &[0u8; 32]).ok()?;
     let mut out = [0u8; 64];
     out.copy_from_slice(sig.to_bytes().as_ref());
     Some(out)

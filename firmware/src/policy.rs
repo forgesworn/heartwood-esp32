@@ -1244,6 +1244,14 @@ impl PolicyEngine {
     /// clear, the stored table is compared with RAM first
     /// ([`Self::table_unsaved`]): repeating a revocation whose save failed
     /// writes it, whatever was saved in between.
+    /// Mark the pairing tables unsaved. For a caller that has itself just
+    /// proven, by reading flash, that a master's stored table differs from
+    /// RAM: [`Self::persist_revocation`] must then write, not read flash a
+    /// second time and, on a read fault, answer saved without writing.
+    pub fn mark_slots_unsaved(&mut self) {
+        self.slots_dirty = true;
+    }
+
     pub fn persist_revocation(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> RevocationSave {
         if !self.slots_dirty && self.table_unsaved(nvs, master_slot) {
             self.slots_dirty = true;

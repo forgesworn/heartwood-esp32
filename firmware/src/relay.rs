@@ -9090,6 +9090,7 @@ fn save_unsaved_client_revocation(
         .unsaved_slot_revocation(ctx.nvs, master_slot, slot_index)
         .ok_or_else(|| format!("no such slot: {slot_index}"))?;
     let secret_fingerprint = require_expected_slot_fingerprint(req, &stored)?;
+    ctx.policy_engine.mark_slots_unsaved();
     persist_revocation(ctx, master_slot, "client revocation")?;
     log::info!("[relay] mgmt: saved the earlier revocation of client slot {slot_index} (operator)");
     Ok(serde_json::json!({
@@ -9114,6 +9115,7 @@ fn save_unsaved_key_removal(
     if !ctx.policy_engine.unsaved_key_removal(ctx.nvs, master_slot, slot_index, pubkey) {
         return Err("authorized_pubkey_not_found".into());
     }
+    ctx.policy_engine.mark_slots_unsaved();
     persist_revocation(ctx, master_slot, "authorised client-key removal")?;
     Ok(serde_json::json!({
         "slot_index": slot_index,
@@ -10677,6 +10679,7 @@ fn dispatch_mgmt(
             // Also when nothing changed but the table is unsaved: an
             // earlier withdrawal whose save failed is saved by repeating it.
             if changed || ctx.policy_engine.table_unsaved(ctx.nvs, master_slot) {
+                ctx.policy_engine.mark_slots_unsaved();
                 persist_revocation(ctx, master_slot, "identity approval revocation")?;
             }
             log::info!(

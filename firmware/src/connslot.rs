@@ -370,6 +370,7 @@ pub fn handle_revoke(
         } else if policy_engine.unsaved_slot_revocation(nvs, ms, idx).is_some() {
             // Revoked in RAM by an earlier request whose save failed, and
             // still on flash: repeating the revocation saves it.
+            policy_engine.mark_slots_unsaved();
             if let Err(outcome) = policy_engine.persist_revocation(nvs, ms).describe("pairing revocation") {
                 protocol::write_frame(usb, FRAME_TYPE_NACK, outcome.as_bytes());
                 return;

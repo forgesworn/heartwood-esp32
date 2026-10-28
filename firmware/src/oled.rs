@@ -2126,20 +2126,32 @@ pub fn show_auto_signed(
 /// throws the work away and buys another full wait (#117).
 ///
 /// `done` slots are finished; `total` is how many are sealed.
-pub fn show_unseal_progress(display: &mut Display<'_>, done: usize, total: usize) {
+///
+/// `last_attempt`: this is the final PIN guess the wipe counter allows. The
+/// guess was counted on flash before it is checked, so until a right PIN
+/// clears the count it reads as the limit, and a power cut now wipes the board
+/// at the next boot. The header then says so in place of "UNSEALING"; every
+/// other line is the same.
+pub fn show_unseal_progress(display: &mut Display<'_>, done: usize, total: usize, last_attempt: bool) {
     let l = layout(display);
     display.clear_buffer();
 
     let header = MonoTextStyleBuilder::new()
         .font(l.font_header())
-        .text_color(ACCENT)
+        .text_color(if last_attempt { WARN } else { ACCENT })
         .build();
     let body = MonoTextStyleBuilder::new()
         .font(l.font_body())
         .text_color(OK)
         .build();
 
-    Text::new("UNSEALING", Point::new(l.sx(14), l.sy(10)), header).draw(display).ok();
+    if last_attempt {
+        let title = "LAST ATTEMPT";
+        let title_x = l.center_in_span(None, title.len() as i32 * Layout::glyph_w(l.font_header()));
+        Text::new(title, Point::new(title_x, l.sy(10)), header).draw(display).ok();
+    } else {
+        Text::new("UNSEALING", Point::new(l.sx(14), l.sy(10)), header).draw(display).ok();
+    }
 
     Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
         .into_styled(PrimitiveStyle::with_fill(ACCENT))

@@ -1095,6 +1095,78 @@ pub fn save_phones<S: BlobStore>(store: &mut S, phones: &PhoneSet) -> Result<(),
 }
 
 // ---------------------------------------------------------------------------
+// PIN wipe counter
+// ---------------------------------------------------------------------------
+//
+// Five wrong PINs wipe the board, so the count must survive a power cut at
+// any point of a guess. It is raised on flash BEFORE the guess is checked:
+// a cut during the stretch, or right after it refuses the PIN, finds the
+// guess already counted. A right PIN clears it (`pin::try_unlock`). Checking
+// first and counting after left a window where cutting the power once the
+// board had judged the PIN, and before it wrote the count, bought a free
+// guess every time.
+//
+// The raise is a plain replace (never erase-first: a cut between the erase
+// and the write would reset the count to zero). If it cannot be written and
+// the old count reads back intact, the guess is simply not taken; only a
+// count that cannot be read, or reads back as neither, fails closed.
+
+/// NVS key holding the failed-PIN count (one byte; absent is zero).
+pub const PIN_ATTEMPTS_KEY: &str = "pin_attempts";
+
+/// The failed-PIN count. Malformed or unreadable state is `Err`, distinct
+/// from absence, so a caller can fail closed.
+pub fn read_pin_attempts<S: BlobStore>(store: &S) -> Result<u8, &'static str> {
+    match store.get(PIN_ATTEMPTS_KEY) {
+        Ok(Some(b)) if b.len() == 1 => Ok(b[0]),
+        Ok(Some(_)) => Err("malformed PIN-attempt state"),
+        Ok(None) => Ok(0),
+        Err(_) => Err("could not read PIN-attempt state"),
+    }
+}
+
+/// Whether a 32-byte vault key would unwrap like a PIN. The wrap is
+/// PBKDF2-HMAC-SHA256 over the raw secret, and HMAC pads a short key with
+/// zeros, so `"1234"` and `"1234"` followed by 28 zero bytes derive the same
+/// key. A PIN is at most 8 digits, so any vault key whose bytes 8..32 are all
+/// zero could stand in for one. Such a key is refused on every unlock path
+/// (none of which counts towards the PIN wipe) and is never set. A random key
+/// has that shape with probability 2^-192.
+pub fn secret_aliases_a_pin(secret: &[u8]) -> bool {
+    secret.len() == 32 && secret[8..].iter().all(|&b| b == 0)
+}
+
+/// What raising the count for one guess achieved.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GuessCharge {
+    /// The guess is counted on flash; this is the new count. Check it now.
+    Charged(u8),
+    /// The count could not be raised and the old count reads back intact.
+    /// Refuse the guess without checking it.
+    NotCounted,
+    /// The count cannot be trusted. Fail closed.
+    Damaged(&'static str),
+}
+
+/// Count a PIN guess on flash before it is checked.
+pub fn charge_pin_guess<S: BlobStore>(store: &mut S) -> GuessCharge {
+    let current = match read_pin_attempts(store) {
+        Ok(n) => n,
+        Err(e) => return GuessCharge::Damaged(e),
+    };
+    let next = current.saturating_add(1);
+    // Judged by the read-back, not the return: a write can land and still
+    // report an error.
+    let _ = store.set(PIN_ATTEMPTS_KEY, &[next]);
+    match read_pin_attempts(store) {
+        Ok(n) if n == next => GuessCharge::Charged(next),
+        Ok(n) if n == current => GuessCharge::NotCounted,
+        Ok(_) => GuessCharge::Damaged("PIN-attempt state changed unexpectedly"),
+        Err(e) => GuessCharge::Damaged(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Note-locker key
 // ---------------------------------------------------------------------------
 
@@ -2167,5 +2239,125 @@ mod tests {
             open(&dk, Purpose::Seed, &blob),
             Err(SealError::WrongPurpose)
         );
+    }
+
+    #[test]
+    fn a_pin_guess_is_counted_before_it_is_checked() {
+        let mut start = legacy_board(PIN_A);
+        start.set(PIN_ATTEMPTS_KEY, &[1]).unwrap();
+        let start = start.reboot();
+        let checked = Cell::new(0u8);
+
+        // Two wrong guesses in a row, each counted and then checked. Every
+        // cut finds at least as many counted as were checked.
+        let count_then_check = |m: &mut Mem| {
+            checked.set(0);
+            for _ in 0..2 {
+                match charge_pin_guess(m) {
+                    GuessCharge::Charged(_) => checked.set(checked.get() + 1),
+                    _ => return Err(ChangeError::Storage),
+                }
+            }
+            Ok(())
+        };
+        let writes = sweep(&start, &count_then_check, &|m, cut, apply| {
+            let n = read_pin_attempts(m).unwrap();
+            assert!(n >= 1 + checked.get(), "cut {cut} apply {apply}: a checked guess went uncounted");
+        });
+        assert_eq!(writes, 2);
+
+        // Check, then count (the order before): a cut at the write leaves a
+        // guess that was judged but never counted.
+        let check_then_count = |m: &mut Mem| -> Result<(), ChangeError> {
+            checked.set(0);
+            for _ in 0..2 {
+                checked.set(checked.get() + 1);
+                let n = read_pin_attempts(m).map_err(|_| ChangeError::Storage)?;
+                m.set(PIN_ATTEMPTS_KEY, &[n + 1])?;
+            }
+            Ok(())
+        };
+        let mut m = start.armed(1, false);
+        assert!(check_then_count(&mut m).is_err());
+        assert_eq!(checked.get(), 2);
+        assert_eq!(read_pin_attempts(&m.reboot()), Ok(2), "two judged, one counted");
+    }
+
+    /// A store whose writes are refused and change nothing (a full partition).
+    struct RefusesWrites(Mem);
+    impl BlobStore for RefusesWrites {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+            self.0.get(key)
+        }
+        fn set(&mut self, _: &str, _: &[u8]) -> Result<(), StoreError> {
+            Err(StoreError)
+        }
+        fn remove(&mut self, _: &str) -> Result<(), StoreError> {
+            Err(StoreError)
+        }
+    }
+
+    #[test]
+    fn a_count_that_cannot_be_raised_refuses_the_guess_without_wiping() {
+        let mut m = legacy_board(PIN_A);
+        m.set(PIN_ATTEMPTS_KEY, &[1]).unwrap();
+        let mut full = RefusesWrites(m.reboot());
+        assert_eq!(charge_pin_guess(&mut full), GuessCharge::NotCounted);
+        assert_eq!(read_pin_attempts(&full), Ok(1));
+
+        let mut roomy = m.reboot();
+        assert_eq!(charge_pin_guess(&mut roomy), GuessCharge::Charged(2));
+        assert_eq!(charge_pin_guess(&mut roomy), GuessCharge::Charged(3));
+    }
+
+    /// A store whose failed write also loses the old copy (ESP-IDF's cleanup
+    /// after a write that runs out of pages can erase the old data chunk).
+    struct LosesOldCopy(Mem);
+    impl BlobStore for LosesOldCopy {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+            self.0.get(key)
+        }
+        fn set(&mut self, key: &str, _: &[u8]) -> Result<(), StoreError> {
+            self.0.map.remove(key);
+            Err(StoreError)
+        }
+        fn remove(&mut self, _: &str) -> Result<(), StoreError> {
+            Err(StoreError)
+        }
+    }
+
+    #[test]
+    fn a_write_that_loses_the_old_count_fails_closed_not_to_zero() {
+        let mut m = Mem::default();
+        m.set(PIN_ATTEMPTS_KEY, &[3]).unwrap();
+        let mut lossy = LosesOldCopy(m.reboot());
+        assert!(matches!(charge_pin_guess(&mut lossy), GuessCharge::Damaged(_)));
+    }
+
+    #[test]
+    fn a_zero_padded_vault_key_would_open_a_pin_board() {
+        let m = legacy_board(PIN_A);
+        let mut padded = [0u8; 32];
+        padded[..PIN_A.len()].copy_from_slice(PIN_A);
+        // The alias is real: the padded key opens the PIN's wrap...
+        assert_eq!(boot_with(&m, &padded), Some(seeds()));
+        // ...so it is what the unlock paths refuse.
+        assert!(secret_aliases_a_pin(&padded));
+        let mut eight = [0u8; 32];
+        eight[..8].copy_from_slice(b"12345678");
+        assert!(secret_aliases_a_pin(&eight));
+        assert!(!secret_aliases_a_pin(PIN_A), "a PIN itself is not refused");
+        let mut random = [0u8; 32];
+        random[31] = 1;
+        assert!(!secret_aliases_a_pin(&random));
+    }
+
+    #[test]
+    fn an_unreadable_pin_count_fails_closed() {
+        let mut m = Mem::default();
+        m.set(PIN_ATTEMPTS_KEY, &[1, 2]).unwrap();
+        assert!(matches!(charge_pin_guess(&mut m), GuessCharge::Damaged(_)));
+        let mut absent = Mem::default();
+        assert_eq!(charge_pin_guess(&mut absent), GuessCharge::Charged(1));
     }
 }

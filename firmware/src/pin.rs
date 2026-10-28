@@ -28,7 +28,7 @@ use heartwood_common::data_key::{self, BlobStore, ChangeError, Pbkdf2};
 use heartwood_common::types::{FRAME_TYPE_ACK, FRAME_TYPE_NACK};
 use zeroize::Zeroize;
 
-const NVS_PIN_ATTEMPTS_KEY: &str = "pin_attempts";
+const NVS_PIN_ATTEMPTS_KEY: &str = data_key::PIN_ATTEMPTS_KEY;
 pub const MAX_FAILED_ATTEMPTS: u8 = 5;
 
 /// True if any loaded master's seed is encrypted and not yet decrypted — i.e.
@@ -49,21 +49,86 @@ pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str
     }
 }
 
-fn write_failed_attempts(
-    nvs: &mut EspNvs<NvsDefault>,
-    count: u8,
-) -> Result<(), &'static str> {
-    nvs.set_blob(NVS_PIN_ATTEMPTS_KEY, &[count])
-        .map_err(|_| "could not persist PIN-attempt state")?;
-    if read_failed_attempts(nvs)? == count {
+/// The PIN wipe counter as a [`BlobStore`] whose writes never erase first.
+///
+/// esp-idf-svc's `EspNvs::set_blob` removes the key before writing it, so a
+/// power cut between the two would leave no count, which reads as zero: a
+/// free reset of the wipe counter. ESP-IDF's own `nvs_set_blob` writes the
+/// new value before it retires the old one, so a cut leaves one or the other.
+/// If there is no room for the new copy the write is refused before it
+/// starts, the old count stays and `charge_pin_guess` refuses the guess untried.
+struct PinCounter<'a>(&'a mut EspNvs<NvsDefault>);
+
+impl BlobStore for PinCounter<'_> {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, data_key::StoreError> {
+        let mut buf = [0u8; 8];
+        match self.0.get_blob(key, &mut buf) {
+            Ok(Some(b)) => Ok(Some(b.to_vec())),
+            Ok(None) => Ok(None),
+            Err(_) => Err(data_key::StoreError),
+        }
+    }
+
+    fn set(&mut self, key: &str, value: &[u8]) -> Result<(), data_key::StoreError> {
+        use esp_idf_svc::handle::RawHandle;
+        use esp_idf_svc::sys;
+        use heartwood_common::nvs_room;
+        // Refuse before writing unless the new copy fits. ESP-IDF 5.3.2's
+        // cleanup after a write that runs out of pages can erase the OLD
+        // copy's data, which reads back as no count and wipes the board. A
+        // refusal here leaves the old count whole, and the guess goes untried.
+        let stats = crate::nvs_stats::read().ok_or(data_key::StoreError)?;
+        let pages = stats.total_entries / nvs_room::PAGE_ENTRIES;
+        if nvs_room::available_entries(stats.free_entries)
+            < nvs_room::blob_write_entries(value.len(), pages)
+        {
+            log::warn!("PIN counter: no room for a new copy, guess refused untried");
+            return Err(data_key::StoreError);
+        }
+        let c_key = std::ffi::CString::new(key).map_err(|_| data_key::StoreError)?;
+        // SAFETY: the handle is open for as long as `self.0` lives, the key is
+        // NUL-terminated, and `value` outlives the call.
+        let set = unsafe {
+            sys::nvs_set_blob(self.0.handle(), c_key.as_ptr(), value.as_ptr().cast(), value.len())
+        };
+        if set != sys::ESP_OK {
+            return Err(data_key::StoreError);
+        }
+        // SAFETY: as above.
+        if unsafe { sys::nvs_commit(self.0.handle()) } != sys::ESP_OK {
+            return Err(data_key::StoreError);
+        }
         Ok(())
-    } else {
-        Err("PIN-attempt state verification failed")
+    }
+
+    fn remove(&mut self, key: &str) -> Result<(), data_key::StoreError> {
+        self.0.remove(key).map(|_| ()).map_err(|_| data_key::StoreError)
     }
 }
 
-pub(crate) fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
-    let _ = nvs.remove(NVS_PIN_ATTEMPTS_KEY);
+/// Clear the PIN wipe counter after a proven-correct secret, and check that
+/// it took. The guess was counted before it was checked, so a correct fifth
+/// PIN sits on flash as 5 until this runs: a clear that silently failed would
+/// wipe the board at the next boot. Removal is tried twice, then an in-place
+/// write of 0, each judged by reading the count back. Returns whether the
+/// count now reads 0.
+pub(crate) fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) -> bool {
+    for _ in 0..2 {
+        let _ = nvs.remove(NVS_PIN_ATTEMPTS_KEY);
+        if read_failed_attempts(nvs) == Ok(0) {
+            return true;
+        }
+    }
+    let mut counter = PinCounter(nvs);
+    let _ = counter.set(NVS_PIN_ATTEMPTS_KEY, &[0]);
+    if read_failed_attempts(counter.0) == Ok(0) {
+        return true;
+    }
+    log::error!(
+        "PIN wipe counter could not be cleared after a correct unlock; \
+         the next boot may wipe the board"
+    );
+    false
 }
 
 /// What an unlock is doing, for the OLED.
@@ -77,11 +142,17 @@ pub enum UnlockProgress {
     Upgrading,
 }
 
-/// Draw an [`UnlockProgress`].
-pub fn show_unlock_progress(display: &mut crate::oled::Display<'_>, p: UnlockProgress) {
+/// Draw an [`UnlockProgress`]. `last_attempt` marks the final PIN guess the
+/// wipe counter allows (see [`handle_pin_unlock`]); only `Opening` shows it,
+/// since `Upgrading` runs after a right PIN has cleared the count.
+pub fn show_unlock_progress(
+    display: &mut crate::oled::Display<'_>,
+    p: UnlockProgress,
+    last_attempt: bool,
+) {
     match p {
         UnlockProgress::Opening { done, total } => {
-            crate::oled::show_unseal_progress(display, done, total)
+            crate::oled::show_unseal_progress(display, done, total, last_attempt)
         }
         UnlockProgress::Upgrading => {
             crate::oled::show_result(display, "Upgrading storage\nKeep power on")
@@ -296,6 +367,12 @@ pub fn try_unlock(
     secret: &[u8],
     on_progress: &mut dyn FnMut(UnlockProgress),
 ) -> bool {
+    // A vault key shaped like a zero-padded PIN would test that PIN without
+    // counting it (VAULT_UNLOCK and the relay's 24136 never charge a guess).
+    if data_key::secret_aliases_a_pin(secret) {
+        log::warn!("unlock: refused a vault key that could stand in for a PIN");
+        return false;
+    }
     let locked: Vec<u8> = masters.iter().filter(|m| m.locked).map(|m| m.slot).collect();
     let mut store = NvsBlobs(nvs);
     let mut opening = |done: usize, total: usize| on_progress(UnlockProgress::Opening { done, total });
@@ -325,7 +402,8 @@ pub fn try_unlock(
     // or the marker write can no longer catch the counter mid-way stale,
     // leaving an owner who just typed the correct PIN still one guess from a
     // wipe. The three outer calls are gone; this is the only one now.
-    clear_failed_attempts(store.0);
+    // Logs if the count still reads non-zero; the unlock itself stands.
+    let _ = clear_failed_attempts(store.0);
 
     let upgrade_due = unlocked.dk.is_none()
         || locked.iter().any(|&slot| {
@@ -392,7 +470,44 @@ pub fn handle_pin_unlock(
         return false;
     }
 
-    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p)) {
+    // Count the guess on flash BEFORE checking it, so no power cut after the
+    // check (during the stretch, or once the PIN is refused) can leave it
+    // uncounted (`data_key::charge_pin_guess`). A right PIN clears the count
+    // inside `try_unlock`.
+    match data_key::charge_pin_guess(&mut PinCounter(nvs)) {
+        data_key::GuessCharge::Charged(count) => *failed_attempts = count,
+        data_key::GuessCharge::NotCounted => {
+            // The old count reads back intact: refuse this guess untried
+            // rather than wipe. Nothing was learned about the PIN.
+            log::error!("PIN attempt could not be counted (storage full?): guess refused untried");
+            crate::oled::show_error(display, "Storage full\nPIN not tried");
+            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+            protocol::write_frame(usb, FRAME_TYPE_NACK, b"storage_full: the PIN was not tried");
+            return false;
+        }
+        data_key::GuessCharge::Damaged(e) => {
+            // If the durable counter cannot be trusted, do not grant further
+            // guesses that a reboot could reset.
+            log::error!("PIN attempt persistence failed ({e}) — wiping fail-closed");
+            crate::oled::show_error(display, "PIN STATE ERROR\nWIPING...");
+            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
+            wipe_and_reboot(usb, display);
+        }
+    }
+
+    // The last guess allowed: flash already reads the wipe limit, and stays
+    // there until a right PIN clears it inside `try_unlock`, so a power cut
+    // during the check wipes the board at the next boot, even if this PIN is
+    // right. Say so before the stretch (a migrated board draws nothing until
+    // the PIN is proven) and on every progress redraw up to the clear.
+    let last_attempt = *failed_attempts == MAX_FAILED_ATTEMPTS;
+    if last_attempt {
+        log::warn!("PIN attempt {MAX_FAILED_ATTEMPTS}/{MAX_FAILED_ATTEMPTS}: a power cut now wipes the board");
+        let locked = masters.iter().filter(|m| m.locked).count();
+        crate::oled::show_unseal_progress(display, 0, locked, true);
+    }
+
+    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p, last_attempt)) {
         log::info!("PIN verified — seeds decrypted, device unlocked");
         // The durable counter is already cleared — `try_unlock` does that
         // itself, before its own optional writes (see its doc comment). This
@@ -403,15 +518,7 @@ pub fn handle_pin_unlock(
         protocol::write_frame(usb, FRAME_TYPE_ACK, &[]);
         true
     } else {
-        *failed_attempts = failed_attempts.saturating_add(1);
-        if let Err(e) = write_failed_attempts(nvs, *failed_attempts) {
-            // If the durable counter cannot be trusted, do not grant further
-            // guesses that a reboot could reset.
-            log::error!("PIN attempt persistence failed ({e}) — wiping fail-closed");
-            crate::oled::show_error(display, "PIN STATE ERROR\nWIPING...");
-            esp_idf_hal::delay::FreeRtos::delay_ms(1000);
-            wipe_and_reboot(usb, display);
-        }
+        // Already counted on flash, above.
         log::warn!("PIN incorrect — attempt {}/{}", failed_attempts, MAX_FAILED_ATTEMPTS);
 
         if *failed_attempts >= MAX_FAILED_ATTEMPTS {
@@ -575,6 +682,11 @@ pub fn handle_vault_set(
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
         return false;
     }
+    if data_key::secret_aliases_a_pin(payload) {
+        log::warn!("VAULT_SET: refused a key whose bytes 8..32 are all zero");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"weak vault key");
+        return false;
+    }
     if masters.is_empty() {
         log::warn!("VAULT_SET: no identity to protect");
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
@@ -641,7 +753,7 @@ pub fn handle_vault_unlock(
         return false;
     }
 
-    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p)) {
+    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p, false)) {
         log::info!("Vault key accepted — seeds decrypted, device unlocked");
         // A prior PIN-attempt counter is meaningless after a successful vault
         // unlock; `try_unlock` already clears it, before its own optional

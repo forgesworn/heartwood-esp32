@@ -637,7 +637,11 @@ changes hands:
   proven correct, before migration or the marker repair (the two writes that
   can follow): a power cut during either can no longer catch the counter
   mid-way stale and leave an owner who just typed the right PIN one guess
-  from a wipe.
+  from a wipe. A guess is counted on flash before it is checked, so the one
+  case left is the last guess allowed: the count already reads 5 while the
+  PIN is stretched, and a power cut before that clear wipes the board at the
+  next boot even when the PIN was right. The unlock screen's header reads
+  LAST ATTEMPT for exactly that guess, above "Keep power on".
 
 Security properties and honest residuals:
 

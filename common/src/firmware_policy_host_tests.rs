@@ -1448,6 +1448,63 @@ fn a_growing_table_keeps_room_to_rewrite_in_place() {
 }
 
 #[test]
+fn repeating_a_revocation_that_did_not_save_saves_it() {
+    // Review finding A. The legacy credential cannot be removed, so the
+    // table may only be rewritten in place, and at the bench headroom it has
+    // no room for that: the revocation holds until the next restart only.
+    let (mut nvs, mut engine) = full_table(8);
+    let other = engine.create_slot(1, "other identity".into(), secret_hex(0x31)).unwrap();
+    assert!(engine.persist_slots(&mut nvs, 1));
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    nvs.backend.fail_once(NvsOp::Remove, MASTER_0_CONN, FaultKind::RemoveFail);
+    assert!(engine.revoke_slot(0, 3));
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::OnlyUntilRestart);
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_unavailable: ") && reply.contains("repeat the request"), "{reply}");
+    assert!(slot_indices(&mut nvs).contains(&3), "flash still has it");
+    assert!(engine.table_unsaved(&nvs, 0));
+
+    // A save of another identity clears the shared dirty flag meanwhile.
+    assert!(engine.update_slot(1, other, Some("renamed".into()), None, None, None));
+    assert!(engine.persist_slots(&mut nvs, 1));
+    assert!(!engine.slots_dirty);
+
+    // The retry finds no pairing 3 in RAM; flash still has it, so it is an
+    // unsaved revocation, not "not found", and saving it now lands.
+    assert!(!engine.revoke_slot(0, 3));
+    let stored = engine.unsaved_slot_revocation(&nvs, 0, 3).expect("the stored copy of pairing 3");
+    assert_eq!(stored.slot_index, 3);
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 9).is_none(), "never existed: still not found");
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 2).is_none(), "still live: an ordinary revocation");
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
+    assert!(!slot_indices(&mut nvs).contains(&3), "the narrower table is on flash");
+    assert!(!engine.table_unsaved(&nvs, 0));
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 3).is_none(), "a third try is a real not found");
+
+    // In sync, a revocation that changes nothing writes nothing.
+    nvs.backend.take_log();
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
+    assert!(!nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob));
+}
+
+#[test]
+fn an_unreadable_or_absent_table_is_never_taken_for_an_unsaved_one() {
+    // No table in RAM for the master: nothing to save on a guess.
+    let (nvs, engine) = full_table(2);
+    assert!(!engine.table_unsaved(&nvs, 4));
+    assert!(engine.unsaved_slot_revocation(&nvs, 4, 0).is_none());
+    // A stored table that cannot be read is not compared.
+    let (nvs, mut engine) = full_table(2);
+    assert!(engine.revoke_slot(0, 1));
+    nvs.backend.fail_once(NvsOp::BlobLen, CONNSLOTS_0, FaultKind::ReadError);
+    assert!(!engine.table_unsaved(&nvs, 0));
+    nvs.backend.fail_once(NvsOp::BlobLen, CONNSLOTS_0, FaultKind::ReadError);
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 1).is_none());
+    assert!(engine.table_unsaved(&nvs, 0), "once it reads, the revocation is unsaved");
+}
+
+#[test]
 fn a_pairing_the_growth_gate_refuses_says_storage_full_and_a_fault_does_not() {
     use engine::{SlotSaveError, PAIRING_STORAGE_FULL};
     assert!(PAIRING_STORAGE_FULL.starts_with("storage_full: "));

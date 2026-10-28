@@ -126,7 +126,7 @@ impl RevocationSave {
         match self {
             RevocationSave::Saved => Ok(()),
             RevocationSave::OnlyUntilRestart => Err(format!(
-                "storage_unavailable: {what} holds until the next restart only; it could not be saved, try again"
+                "storage_unavailable: {what} holds until the next restart only; it could not be saved; repeat the request to try the save again"
             )),
             RevocationSave::TableLost => Err(format!(
                 "storage_full: {what} is saved, but this identity's other pairings could not be rewritten and are lost at the next restart unless a later change saves them"
@@ -1238,7 +1238,16 @@ impl PolicyEngine {
     /// all after a write failed part-way, `nvs::write_blocked`). Live
     /// approvals are withdrawn, as the old rollback did. The outcome says what
     /// a restart would find.
+    ///
+    /// The dirty flag is shared by every master, so a save of another one
+    /// clears it while this master's table is still unsaved. So when it is
+    /// clear, the stored table is compared with RAM first
+    /// ([`Self::table_unsaved`]): repeating a revocation whose save failed
+    /// writes it, whatever was saved in between.
     pub fn persist_revocation(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> RevocationSave {
+        if !self.slots_dirty && self.table_unsaved(nvs, master_slot) {
+            self.slots_dirty = true;
+        }
         if self.persist_slots_as(nvs, master_slot, SlotWrite::Revoke) {
             return RevocationSave::Saved;
         }
@@ -1254,6 +1263,85 @@ impl PolicyEngine {
             _ if blocked => RevocationSave::Uncertain,
             _ => RevocationSave::OnlyUntilRestart,
         }
+    }
+
+    /// The bytes of this master's stored table: `Some(None)` when the key is
+    /// absent, `None` when it cannot be read or is over the load cap.
+    fn stored_table_bytes(nvs: &EspNvs<NvsDefault>, master_slot: u8) -> Option<Option<Vec<u8>>> {
+        let key = format!("connslots_{master_slot}");
+        match nvs.blob_len(&key) {
+            Ok(None) => Some(None),
+            Ok(Some(len)) if len <= MAX_SLOT_BLOB_BYTES => {
+                let mut buf = vec![0u8; len];
+                match nvs.get_blob(&key, &mut buf) {
+                    Ok(Some(stored)) if stored.len() == len => Some(Some(buf)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The stored table, parsed. `None` when absent or unreadable.
+    fn stored_slots(nvs: &EspNvs<NvsDefault>, master_slot: u8) -> Option<Vec<ConnectSlot>> {
+        let bytes = Self::stored_table_bytes(nvs, master_slot)??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// RAM's table for a master whose pairings can be written, or `None`.
+    fn ram_table(&self, master_slot: u8) -> Option<&[ConnectSlot]> {
+        if !self.storage_ready(master_slot) {
+            return None;
+        }
+        self.master_slots
+            .iter()
+            .find(|ms| ms.master_slot == master_slot)
+            .map(|ms| ms.slots.as_slice())
+    }
+
+    /// Whether this master's table in RAM differs from the one on flash
+    /// (`heartwood_common::policy::slot_table_unsaved`): a change, such as a
+    /// revocation whose save failed, that no save has written. False when
+    /// RAM has no table for it, the master is quarantined, or the stored
+    /// table cannot be read: nothing is written on a guess.
+    pub fn table_unsaved(&self, nvs: &EspNvs<NvsDefault>, master_slot: u8) -> bool {
+        let Some(ram) = self.ram_table(master_slot) else {
+            return false;
+        };
+        Self::stored_table_bytes(nvs, master_slot)
+            .is_some_and(|stored| heartwood_common::policy::slot_table_unsaved(stored.as_deref(), ram))
+    }
+
+    /// The stored copy of pairing `slot_index` when RAM has revoked it and
+    /// flash still has it: an earlier revocation whose save failed
+    /// ([`RevocationSave::OnlyUntilRestart`]). A revocation that finds no
+    /// such pairing in RAM checks this before answering "not found", and if
+    /// it is `Some`, saves with [`Self::persist_revocation`] instead.
+    pub fn unsaved_slot_revocation(
+        &self,
+        nvs: &EspNvs<NvsDefault>,
+        master_slot: u8,
+        slot_index: u8,
+    ) -> Option<ConnectSlot> {
+        let ram = self.ram_table(master_slot)?;
+        let stored = Self::stored_slots(nvs, master_slot)?;
+        heartwood_common::policy::unsaved_slot_revocation(&stored, ram, slot_index).cloned()
+    }
+
+    /// As [`Self::unsaved_slot_revocation`], for one client key of a pairing
+    /// (`heartwood_common::policy::unsaved_key_removal`).
+    pub fn unsaved_key_removal(
+        &self,
+        nvs: &EspNvs<NvsDefault>,
+        master_slot: u8,
+        slot_index: u8,
+        pubkey: &str,
+    ) -> bool {
+        let Some(ram) = self.ram_table(master_slot) else {
+            return false;
+        };
+        Self::stored_slots(nvs, master_slot)
+            .is_some_and(|stored| heartwood_common::policy::unsaved_key_removal(&stored, ram, slot_index, pubkey))
     }
 
     fn persist_slots_as(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8, mode: SlotWrite) -> bool {

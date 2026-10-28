@@ -10478,6 +10478,29 @@ fn dispatch_mgmt(
                 req.pointer("/params/slot_index")
                     .and_then(|v| v.as_u64())
                     .ok_or("revoke_client requires params.slot_index")? as u8;
+            let live = ctx
+                .policy_engine
+                .list_slots(master_slot)
+                .iter()
+                .any(|slot| slot.slot_index == slot_index);
+            if !live {
+                // Revoked in RAM by an earlier request whose save failed, and
+                // still on flash: repeating the revocation saves it. The
+                // credential is checked against the stored copy, so a stale
+                // screen cannot confirm some other pairing's revocation.
+                let stored = ctx
+                    .policy_engine
+                    .unsaved_slot_revocation(ctx.nvs, master_slot, slot_index)
+                    .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                let secret_fingerprint = require_expected_slot_fingerprint(req, &stored)?;
+                persist_revocation(ctx, master_slot, "client revocation")?;
+                log::info!("[relay] mgmt: saved the earlier revocation of client slot {slot_index} (operator)");
+                return Ok(serde_json::json!({
+                    "slot_index": slot_index,
+                    "secret_fingerprint": secret_fingerprint,
+                    "revoked": true,
+                }));
+            }
             let target = ctx
                 .policy_engine
                 .list_slots(master_slot)
@@ -10540,6 +10563,19 @@ fn dispatch_mgmt(
                 }
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Current) => {
                     Err("current_authorized_pubkey: revoke the slot to remove its current key".into())
+                }
+                Some(heartwood_common::policy::RemoveAuthorizedPubkey::Missing)
+                    if ctx.policy_engine.unsaved_key_removal(ctx.nvs, master_slot, slot_index, pubkey) =>
+                {
+                    // Removed in RAM by an earlier request whose save failed,
+                    // and still on flash: repeating the removal saves it.
+                    persist_revocation(ctx, master_slot, "authorised client-key removal")?;
+                    Ok(serde_json::json!({
+                        "slot_index": slot_index,
+                        "pubkey": pubkey,
+                        "secret_fingerprint": secret_fingerprint,
+                        "removed": true,
+                    }))
                 }
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Missing) => {
                     Err("authorized_pubkey_not_found".into())
@@ -10612,7 +10648,9 @@ fn dispatch_mgmt(
             let dropped =
                 ctx.policy_engine
                     .drop_withdrawn_verdicts(master_slot, slot_index, revoked.as_ref());
-            if changed {
+            // Also when nothing changed but the table is unsaved: an
+            // earlier withdrawal whose save failed is saved by repeating it.
+            if changed || ctx.policy_engine.table_unsaved(ctx.nvs, master_slot) {
                 persist_revocation(ctx, master_slot, "identity approval revocation")?;
             }
             log::info!(

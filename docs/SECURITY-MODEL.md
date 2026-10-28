@@ -753,7 +753,13 @@ So the residuals are these:
   the same boot if a write failed part-way) instead of restoring the wider
   one, and the reply says what a restart would find: the old table (the
   revocation holds until then only), no table (every pairing of that
-  identity gone), or, after a part-written table, either of those. Once a
+  identity gone), or, after a part-written table, either of those. When the
+  old table is still on flash, repeating the request saves it: a revocation
+  that finds the pairing (or client key) already gone from RAM but still on
+  flash writes the narrower table and answers as a revocation would, its
+  credential fingerprint checked against the stored copy, instead of
+  answering "not found" while the pairing returns at the next restart. A
+  repeated identity withdrawal or narrowing saves the same way. Once a
   write has failed part-way the identity's pairings cannot change until a
   restart, so those replies, and any other slot-change reply for that
   identity, end by asking for one.

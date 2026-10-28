@@ -1600,6 +1600,49 @@ pub fn narrows_only(before: &ConnectSlot, after: &ConnectSlot) -> bool {
     )
 }
 
+/// Whether the table a master's `connslots_N` holds on flash (`stored`, or
+/// `None` when the key is absent) differs from the one RAM enforces (`ram`):
+/// a change RAM already holds that no save has written, such as a
+/// revocation whose save failed. Compared as the stored encoding, the codec
+/// the table is persisted with. An absent table and an empty one are the
+/// same (no pairings), so neither is "unsaved" for the other.
+pub fn slot_table_unsaved(stored: Option<&[u8]>, ram: &[ConnectSlot]) -> bool {
+    match stored {
+        Some(bytes) => !serde_json::to_vec(ram).is_ok_and(|encoded| encoded == bytes),
+        None => !ram.is_empty(),
+    }
+}
+
+/// The stored copy of pairing `slot_index` when RAM no longer has it: an
+/// earlier revocation of that pairing whose save failed (the reply said it
+/// holds until the next restart only). Repeating the revocation should then
+/// save the narrower table, not answer "not found" while the pairing comes
+/// back at the next restart. `None` when RAM still has the pairing (an
+/// ordinary revocation) or flash never had it (a real "not found").
+pub fn unsaved_slot_revocation<'a>(
+    stored: &'a [ConnectSlot],
+    ram: &[ConnectSlot],
+    slot_index: u8,
+) -> Option<&'a ConnectSlot> {
+    if ram.iter().any(|slot| slot.slot_index == slot_index) {
+        return None;
+    }
+    stored.iter().find(|slot| slot.slot_index == slot_index)
+}
+
+/// Whether removing `pubkey` from pairing `slot_index` is a removal RAM
+/// already holds and flash does not: the stored copy of the same pairing
+/// (same secret) still authorises the key and RAM's no longer does.
+pub fn unsaved_key_removal(stored: &[ConnectSlot], ram: &[ConnectSlot], slot_index: u8, pubkey: &str) -> bool {
+    let find = |slots: &[ConnectSlot]| slots.iter().find(|slot| slot.slot_index == slot_index).cloned();
+    match (find(stored), find(ram)) {
+        (Some(stored), Some(ram)) => {
+            stored.secret == ram.secret && slot_authorizes(&stored, pubkey) && !slot_authorizes(&ram, pubkey)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4068,5 +4111,42 @@ mod tests {
         let mut all_kinds = before.clone();
         all_kinds.allowed_kinds.clear();
         assert!(narrows_only(&all_kinds, &before));
+    }
+
+    #[test]
+    fn a_table_differing_from_flash_is_unsaved_and_absent_equals_empty() {
+        let table = vec![sample_slot(0, "a"), sample_slot(1, "b")];
+        let encoded = serde_json::to_vec(&table).unwrap();
+        assert!(!slot_table_unsaved(Some(&encoded), &table));
+        assert!(slot_table_unsaved(Some(&encoded), &table[..1]), "a revocation RAM holds");
+        assert!(slot_table_unsaved(Some(b"[]"), &table));
+        assert!(slot_table_unsaved(None, &table), "nothing on flash, pairings in RAM");
+        assert!(!slot_table_unsaved(None, &[]), "absent and empty both mean no pairings");
+        assert!(!slot_table_unsaved(Some(b"[]"), &[]));
+    }
+
+    #[test]
+    fn only_a_pairing_flash_still_has_and_ram_does_not_is_an_unsaved_revocation() {
+        let stored = vec![sample_slot(0, "a"), sample_slot(3, "b")];
+        let ram = vec![sample_slot(0, "a")];
+        assert_eq!(unsaved_slot_revocation(&stored, &ram, 3).map(|s| s.label.as_str()), Some("b"));
+        assert!(unsaved_slot_revocation(&stored, &ram, 0).is_none(), "still live: an ordinary revocation");
+        assert!(unsaved_slot_revocation(&stored, &ram, 5).is_none(), "never existed: not found");
+        assert!(unsaved_slot_revocation(&ram, &ram, 3).is_none(), "already saved: not found");
+    }
+
+    #[test]
+    fn a_key_removal_is_unsaved_only_on_the_same_pairing() {
+        let key = "11".repeat(32);
+        let mut stored_slot = sample_slot(2, "a");
+        stored_slot.authorized_pubkeys.push(key.clone());
+        let ram_slot = sample_slot(2, "a");
+        assert!(unsaved_key_removal(&[stored_slot.clone()], &[ram_slot.clone()], 2, &key));
+        assert!(!unsaved_key_removal(&[ram_slot.clone()], &[ram_slot.clone()], 2, &key), "saved already");
+        assert!(!unsaved_key_removal(&[stored_slot.clone()], &[stored_slot.clone()], 2, &key), "RAM still has it");
+        let mut reused = ram_slot.clone();
+        reused.secret = "cd".repeat(32);
+        assert!(!unsaved_key_removal(&[stored_slot.clone()], &[reused], 2, &key), "a different pairing at that index");
+        assert!(!unsaved_key_removal(&[stored_slot], &[], 2, &key), "no such pairing in RAM");
     }
 }

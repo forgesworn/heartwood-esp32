@@ -367,6 +367,15 @@ pub fn handle_revoke(
             }
             protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"ok");
             log::info!("Revoked connection slot {} for master {}", idx, ms);
+        } else if policy_engine.unsaved_slot_revocation(nvs, ms, idx).is_some() {
+            // Revoked in RAM by an earlier request whose save failed, and
+            // still on flash: repeating the revocation saves it.
+            if let Err(outcome) = policy_engine.persist_revocation(nvs, ms).describe("pairing revocation") {
+                protocol::write_frame(usb, FRAME_TYPE_NACK, outcome.as_bytes());
+                return;
+            }
+            protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"ok");
+            log::info!("Saved the earlier revocation of connection slot {} for master {}", idx, ms);
         } else {
             protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"not found");
         }

@@ -142,11 +142,17 @@ pub enum UnlockProgress {
     Upgrading,
 }
 
-/// Draw an [`UnlockProgress`].
-pub fn show_unlock_progress(display: &mut crate::oled::Display<'_>, p: UnlockProgress) {
+/// Draw an [`UnlockProgress`]. `last_attempt` marks the final PIN guess the
+/// wipe counter allows (see [`handle_pin_unlock`]); only `Opening` shows it,
+/// since `Upgrading` runs after a right PIN has cleared the count.
+pub fn show_unlock_progress(
+    display: &mut crate::oled::Display<'_>,
+    p: UnlockProgress,
+    last_attempt: bool,
+) {
     match p {
         UnlockProgress::Opening { done, total } => {
-            crate::oled::show_unseal_progress(display, done, total)
+            crate::oled::show_unseal_progress(display, done, total, last_attempt)
         }
         UnlockProgress::Upgrading => {
             crate::oled::show_result(display, "Upgrading storage\nKeep power on")
@@ -489,7 +495,19 @@ pub fn handle_pin_unlock(
         }
     }
 
-    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p)) {
+    // The last guess allowed: flash already reads the wipe limit, and stays
+    // there until a right PIN clears it inside `try_unlock`, so a power cut
+    // during the check wipes the board at the next boot, even if this PIN is
+    // right. Say so before the stretch (a migrated board draws nothing until
+    // the PIN is proven) and on every progress redraw up to the clear.
+    let last_attempt = *failed_attempts == MAX_FAILED_ATTEMPTS;
+    if last_attempt {
+        log::warn!("PIN attempt {MAX_FAILED_ATTEMPTS}/{MAX_FAILED_ATTEMPTS}: a power cut now wipes the board");
+        let locked = masters.iter().filter(|m| m.locked).count();
+        crate::oled::show_unseal_progress(display, 0, locked, true);
+    }
+
+    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p, last_attempt)) {
         log::info!("PIN verified — seeds decrypted, device unlocked");
         // The durable counter is already cleared — `try_unlock` does that
         // itself, before its own optional writes (see its doc comment). This
@@ -735,7 +753,7 @@ pub fn handle_vault_unlock(
         return false;
     }
 
-    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p)) {
+    if try_unlock(nvs, masters, payload, &mut |p| show_unlock_progress(display, p, false)) {
         log::info!("Vault key accepted — seeds decrypted, device unlocked");
         // A prior PIN-attempt counter is meaningless after a successful vault
         // unlock; `try_unlock` already clears it, before its own optional

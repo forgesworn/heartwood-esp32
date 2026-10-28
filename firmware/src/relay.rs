@@ -3730,7 +3730,7 @@ fn handle_vault_delivery(
     // The unseal is the slow part of a WiFi unlock too, and this path has an
     // OLED in front of the owner just like the cabled one.
     let ok = crate::pin::try_unlock(nvs, masters, &vault_key, &mut |p| {
-        crate::pin::show_unlock_progress(display, p)
+        crate::pin::show_unlock_progress(display, p, false)
     });
     if ok {
         log::info!("[relay] vault key accepted — device unlocked");

@@ -98,6 +98,18 @@ jobs:
       # never run anywhere in CI. ota-sign covers the OTA release-signature
       # scheme (the on-device verifier and the CI signer share this module).
       - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes
+      # Execute the actual private allocation custody source on the firmware's
+      # C curve backend as well as k256 above; no hardware or signing API.
+      - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features firmware allocation_root
+      # Execute the real destructive wipe adapter on the firmware backend too.
+      - run: cargo +stable test --locked --manifest-path common/Cargo.toml --no-default-features --features firmware persistent_wipe_host_sys
+      # Mathematical fresh-R vectors on the actual firmware curve/ECDH backend.
+      - run: cargo +stable test --locked --manifest-path common/Cargo.toml --no-default-features --features firmware fresh_r_vectors
+      - run: cargo +stable test --locked --manifest-path common/Cargo.toml --no-default-features --features firmware allocation_root::partition
+      # Test-only strict bridge from offline public SDK captures to real codec.
+      - run: cargo +stable test --locked --manifest-path common/Cargo.toml --no-default-features --features firmware sdk_capture
+      # Execute the bench-only failed-backend gate: no storage open or fallback.
+      - run: cargo +stable test --locked --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes,allocation-crypto-selfcheck-fail injected_backend_failure
 
   # Supply-chain gate over the host-buildable crates: RUSTSEC advisories,
   # licence allow-list and source registries, enforced against the shared
@@ -162,6 +174,8 @@ jobs:
         with:
           node-version: 24
       - run: node --test $(find scripts -name '*.test.mjs' | sort)
+      # Offline full-sector planner; synthetic fixtures, no hardware access.
+      - run: python3 scripts/test_allocation_partition_planner.py
 
   # The OTA release signing tool (ota-sign/) — keygen/sign/verify for the
   # ed25519 release signatures the firmware enforces. Kept green here so the

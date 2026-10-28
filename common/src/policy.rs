@@ -859,6 +859,27 @@ fn is_crypto_method(method: &str) -> bool {
 /// `heartwood_switch` policy would prompt for is the `SWITCH TO` card; an
 /// identity-scoped method acting as an unapproved identity needs a card.
 pub fn gate_request(request: &GateRequest<'_>) -> Gate {
+    gate_request_with_vault(request, crate::owner_pairing::VaultContext::NONE)
+}
+
+/// [`gate_request`] with Rule V (one-hold pairing spec 6): on an owner
+/// pairing (`owner_pairing::is_owner_pairing`), a request carrying an
+/// EXPLICIT vault context (`vault`, built by
+/// `owner_pairing::VaultContext::from_explicit` from the caller-supplied
+/// context only) and a Rule V method (`get_public_key`, `nip44_encrypt`,
+/// `nip44_decrypt`, or `sign_event` / `sign_event_compact` of kind 30078) is
+/// allowed with no identity card and nothing recorded. It sits after the
+/// crypto-method refusal, so a crypto method whose tier would prompt is
+/// still refused, and before the `lists` check. `Gate::Allow` only skips the
+/// identity card: the tier still governs through [`gate_tier`]. With
+/// `VaultContext::NONE` this is exactly [`gate_request`], so every other
+/// slot and request decides as before.
+///
+/// A separate entry point rather than a `GateRequest` field so the firmware
+/// keeps compiling untouched until both its callers (the handler's
+/// `plan_gate` and the relay planner, through `PolicyEngine::gate`) pass the
+/// same `vault`.
+pub fn gate_request_with_vault(request: &GateRequest<'_>, vault: crate::owner_pairing::VaultContext) -> Gate {
     if !request.has_client {
         return Gate::Allow;
     }
@@ -877,6 +898,10 @@ pub fn gate_request(request: &GateRequest<'_>) -> Gate {
     }
     if is_crypto_method(method) && request.tier == ApprovalTier::ButtonRequired {
         return Gate::Deny;
+    }
+    // Rule V: backups are quiet on an owner pairing.
+    if crate::owner_pairing::rule_v_allows(slot, method, request.explicit_context, vault) {
+        return Gate::Allow;
     }
     if lists {
         return if request.verdict || slot.allowed_methods.iter().any(|allowed| allowed == method) {
@@ -1010,8 +1035,9 @@ pub fn card_batch_marker(card: Option<CardKind>) -> &'static str {
 }
 
 /// Sanitise one connection slot from a backup before import: signing and kind
-/// ceilings are stripped (a restore never carries silent signing), then the
-/// method ceiling is re-validated. Identity approvals and the bound flag are
+/// ceilings are stripped (a restore never carries silent signing), as are the
+/// owner mark and `heartwood_approve_bundle`, then the method ceiling is
+/// re-validated. Identity approvals and the bound flag are
 /// kept. Returns whether signing was stripped.
 pub fn sanitise_imported_slot(slot: &mut ConnectSlot) -> Result<bool, &'static str> {
     if slot.client_grants.is_none() {
@@ -1022,6 +1048,12 @@ pub fn sanitise_imported_slot(slot: &mut ConnectSlot) -> Result<bool, &'static s
         slot.signing_approved || slot.allowed_methods.iter().any(|m| m == "sign_event");
     slot.signing_approved = false;
     slot.allowed_methods.retain(|m| m != "sign_event");
+    // The owner mark and the setup hold are never carried by a backup (one-hold
+    // pairing spec 5.2): a hand-edited file cannot make an owner pairing, and
+    // stripping them before validation keeps a backup that carries them
+    // (exported on older firmware after a downgrade) importable. A restore
+    // needs the setup hold again, as it needs signing approved again.
+    crate::owner_pairing::strip_owner_names(&mut slot.allowed_methods);
     // Kind ceilings are meaningless without sign_event (and the validator
     // rejects the combination), so they go with it.
     slot.allowed_kinds.clear();
@@ -1234,6 +1266,11 @@ pub fn remove_authorized_pubkey(
 /// so an earlier device stays auto-approved instead of being evicted. The set
 /// is de-duplicated and FIFO-capped at [`MAX_AUTHORIZED_PUBKEYS`].
 pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
+    // A key this slot never authorised is a new holder of the credential: an
+    // owner pairing's mark was given to the phone whose words the owner
+    // compared, so it goes (one-hold pairing spec 5.2: any connect class but
+    // Current/Known). The new key must run the setup hold itself.
+    let new_holder = !slot_authorizes(slot, pubkey);
     if let Some(grants) = &mut slot.client_grants {
         let Some(key) = decode_client_key(pubkey) else { return false; };
         // A full pairing forgets its oldest key, as `MAX_AUTHORIZED_PUBKEYS`
@@ -1267,6 +1304,7 @@ pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
         }
         if !slot.authorized_pubkeys.iter().any(|p| p == pubkey) { slot.authorized_pubkeys.push(pubkey.to_string()); }
         slot.current_pubkey = Some(pubkey.to_string());
+        if new_holder { crate::owner_pairing::drop_owner_mark(slot); }
         return true;
     }
     // A client key this slot has never authorised, replacing one it had, is a
@@ -1277,6 +1315,9 @@ pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
         && !slot_authorizes(slot, pubkey)
     {
         slot.approved_identities.clear();
+    }
+    if new_holder {
+        crate::owner_pairing::drop_owner_mark(slot);
     }
     slot.was_bound = true;
     if let Some(prev) = slot.current_pubkey.take() {
@@ -3472,6 +3513,133 @@ mod tests {
         policy.auto_approve = !policy.auto_approve;
         assert!(slot_authority_changed(&before, &[policy]));
         assert!(slot_authority_changed(&before, &[]));
+    }
+
+    #[test]
+    fn a_change_to_the_owner_mark_is_a_change_of_authority() {
+        // One-hold pairing spec 5.2: adding or dropping the mark withdraws
+        // waiting cards (`allowed_methods` is compared).
+        let slot = sample_slot(0, "My Signet");
+        let before = vec![slot.clone()];
+        let mut marked = slot.clone();
+        assert!(grant_slot_method(&mut marked, crate::owner_pairing::OWNER_MARK));
+        assert!(slot_authority_changed(&before, &[marked.clone()]));
+        let mut dropped = marked.clone();
+        assert!(crate::owner_pairing::drop_owner_mark(&mut dropped));
+        assert!(slot_authority_changed(&[marked], &[dropped]));
+    }
+
+    // --- Rule V (one-hold pairing spec 6) ---
+
+    const VAULT_CLIENT: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    /// A cable "Everything" pairing after the setup hold.
+    fn rule_v_owner_slot() -> ConnectSlot {
+        let mut slot = sample_slot(0, "My Signet");
+        slot.current_pubkey = Some(VAULT_CLIENT.to_string());
+        slot.authorized_pubkeys = vec![VAULT_CLIENT.to_string()];
+        slot.was_bound = true;
+        crate::owner_pairing::apply_bundle_press(&mut slot, VAULT_CLIENT, &[IDENTITY_A], crate::owner_pairing::Style::Everyday)
+            .unwrap();
+        slot
+    }
+
+    fn rule_v_request<'a>(slot: &'a ConnectSlot, method: &'a str, tier: ApprovalTier, identity: &'a [u8; 32]) -> GateRequest<'a> {
+        GateRequest {
+            client_pubkey: Some(VAULT_CLIENT),
+            has_client: true,
+            slot: Some(slot),
+            method,
+            tier,
+            explicit_context: true,
+            has_context: true,
+            identity: Some(identity),
+            verdict: false,
+        }
+    }
+
+    #[test]
+    fn rule_v_lets_an_owner_pairings_vault_requests_through_with_no_card() {
+        use crate::owner_pairing::VaultContext;
+        let owner = rule_v_owner_slot();
+        let vault_key = [0x77; 32];
+        let vault = VaultContext::from_explicit(Some("signet:vault:contacts"), None);
+        let backup = VaultContext::from_explicit(Some("signet:vault:contacts"), Some(30078));
+        for method in ["get_public_key", "nip44_encrypt", "nip44_decrypt"] {
+            let request = rule_v_request(&owner, method, ApprovalTier::AutoApprove, &vault_key);
+            assert_eq!(gate_request_with_vault(&request, vault), Gate::Allow, "{method}");
+            // Without Rule V the vault key would raise its card.
+            assert!(matches!(gate_request(&request), Gate::Card(_)), "{method}");
+        }
+        for method in ["sign_event", "sign_event_compact"] {
+            let request = rule_v_request(&owner, method, ApprovalTier::AutoApprove, &vault_key);
+            assert_eq!(gate_request_with_vault(&request, backup), Gate::Allow, "{method}");
+            // Another kind under a vault context takes today's path.
+            let post = VaultContext::from_explicit(Some("signet:vault:contacts"), Some(1));
+            assert_eq!(
+                gate_request_with_vault(&request, post),
+                Gate::Card(CardKind::AllowAs { record: true }),
+                "{method}"
+            );
+        }
+        // The setup hold made the four methods automatic, so the tier does too.
+        for (method, kind) in [("sign_event", Some(30078)), ("nip44_encrypt", None), ("nip44_decrypt", None)] {
+            assert_eq!(evaluate_slot_policy_for_event(&owner, method, kind, false), ApprovalTier::AutoApprove, "{method}");
+        }
+        // Nothing is recorded: the vault key is still not an approved identity.
+        assert!(!client_identity_approved(&owner, Some(VAULT_CLIENT), &vault_key));
+    }
+
+    #[test]
+    fn rule_v_sits_after_the_crypto_refusal() {
+        // A crypto method under a vault context is still refused when its tier
+        // would prompt: Rule V never turns an oracle into a card or an allow.
+        use crate::owner_pairing::VaultContext;
+        let owner = rule_v_owner_slot();
+        let vault = VaultContext::from_explicit(Some("signet:vault:contacts"), None);
+        for method in ["nip44_encrypt", "nip44_decrypt"] {
+            let request = rule_v_request(&owner, method, ApprovalTier::ButtonRequired, &[0x77; 32]);
+            assert_eq!(gate_request_with_vault(&request, vault), Gate::Deny, "{method}");
+        }
+        // A policy denial and a strict slot's explicit context come first too.
+        let request = rule_v_request(&owner, "nip44_encrypt", ApprovalTier::Denied, &[0x77; 32]);
+        assert_eq!(gate_request_with_vault(&request, vault), Gate::Deny);
+        let mut strict = owner.clone();
+        strict.strict_permissions = true;
+        let request = rule_v_request(&strict, "nip44_encrypt", ApprovalTier::AutoApprove, &[0x77; 32]);
+        assert_eq!(gate_request_with_vault(&request, vault), Gate::Deny);
+        // Rule V only skips the identity card: a prompting sign tier still
+        // stands for a card through gate_tier.
+        let request = rule_v_request(&owner, "sign_event", ApprovalTier::ButtonRequired, &[0x77; 32]);
+        let backup = VaultContext::from_explicit(Some("signet:vault:contacts"), Some(30078));
+        let gate = gate_request_with_vault(&request, backup);
+        assert_eq!(gate, Gate::Allow);
+        assert_eq!(gate_tier(gate, request.tier), ApprovalTier::ButtonRequired);
+    }
+
+    #[test]
+    fn rule_v_changes_nothing_without_the_mark_or_an_explicit_vault_context() {
+        use crate::owner_pairing::VaultContext;
+        let owner = rule_v_owner_slot();
+        let vault = VaultContext::from_explicit(Some("signet:vault:contacts"), None);
+        let mut plain = owner.clone();
+        crate::owner_pairing::drop_owner_mark(&mut plain);
+        let request = rule_v_request(&plain, "get_public_key", ApprovalTier::AutoApprove, &[0x77; 32]);
+        assert_eq!(gate_request_with_vault(&request, vault), Gate::Card(CardKind::NpubAs));
+        // An active (session) context is not an explicit one.
+        let active = GateRequest { explicit_context: false, ..rule_v_request(&owner, "get_public_key", ApprovalTier::AutoApprove, &[0x77; 32]) };
+        assert_eq!(gate_request_with_vault(&active, vault), Gate::Card(CardKind::NpubAs));
+        // A non-vault purpose.
+        let persona = VaultContext::from_explicit(Some("nostr:persona:work"), None);
+        let request = rule_v_request(&owner, "get_public_key", ApprovalTier::AutoApprove, &[0x77; 32]);
+        assert_eq!(gate_request_with_vault(&request, persona), Gate::Card(CardKind::NpubAs));
+        // With no vault context the two entry points agree everywhere.
+        for tier in [ApprovalTier::AutoApprove, ApprovalTier::ButtonRequired, ApprovalTier::Denied] {
+            for method in ["sign_event", "nip44_encrypt", "get_public_key", "heartwood_list_identities", "heartwood_switch"] {
+                let request = rule_v_request(&owner, method, tier, &IDENTITY_A);
+                assert_eq!(gate_request_with_vault(&request, VaultContext::NONE), gate_request(&request), "{method}");
+            }
+        }
     }
 
     // --- Connect rebind classification (G1) ---

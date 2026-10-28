@@ -432,6 +432,11 @@ struct SignCtx<'a, 'd, 'b> {
     /// A card's result screen that must stay up before anything replaces it
     /// (an enrolment's check code, or the record to revoke). RAM only.
     card_screen_hold: Option<ScreenHold>,
+    /// A FULL ACCESS refusal drawn by `show_full_access_blocked` stays on the
+    /// glass until then before a card may tick and draw over it (review round
+    /// 3, F1). Not a held result: nothing waits for a press, and the loop
+    /// keeps running underneath.
+    refusal_shown_until: Option<Instant>,
     /// The per-boot key the delivery self-check signs its probes with, so a
     /// probe is recognised by its author before anything else looks at it.
     probe_key: ProbeKey,
@@ -1496,6 +1501,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         button_cards: Vec::new(),
         held_replies: heartwood_common::held_reply::HeldReplies::new(),
         card_screen_hold: None,
+        refusal_shown_until: None,
         probe_key: ProbeKey::generate(secp),
         probe_seq: 0,
         selfcheck: SelfCheckLedger::new(),
@@ -4103,7 +4109,12 @@ fn poll_usb_frame(
         &frame.payload,
         stored_net_config.as_deref(),
     );
-    if claim == heartwood_common::phone_unlock::CableClaim::Card && cable_card_refused(ctx) {
+    // Except an encrypted request while a relay FULL ACCESS card waits: it
+    // may be a second bundle, which must close that card (review round W3,
+    // round 2 S1), so its arm decrypts it and lets nothing but a bundle
+    // through, and a bundle there is refused before any card of its own.
+    let bundle_may_race = frame.frame_type == FRAME_TYPE_ENCRYPTED_REQUEST && full_access_waiting(ctx);
+    if claim == heartwood_common::phone_unlock::CableClaim::Card && cable_card_refused(ctx) && !bundle_may_race {
         crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
         // Some of these carry secrets (a PIN, a vault key, a seed).
         frame.scrub_payload();
@@ -4209,25 +4220,57 @@ fn poll_usb_frame(
         }
 
         // Encrypted NIP-46 (bridge transport) — requires an authenticated bridge.
+        //
+        // While a relay FULL ACCESS card waits (on screen, queued, or with
+        // its window passed but not yet ticked out), a bundle over the cable
+        // is a second bundle (review round W3, round 2 S1): it is refused
+        // `another full access request arrived` before any card of its own,
+        // and the relay card closes with the same reply, nothing granted. A
+        // copy of the card's own bundle (the same client, identity, inner id
+        // and params) is not a second bundle: it is NACKed and the card
+        // stays (review round 3, S2). With the screen busy, anything else is still refused "approval on
+        // screen", only now after the decrypt that tells the two apart.
         FRAME_TYPE_ENCRYPTED_REQUEST => {
-            if cable_card_refused(ctx) {
+            let waiting = full_access_waiting(ctx);
+            let busy = cable_card_refused(ctx);
+            // An unauthenticated bridge gets the old answer under a card,
+            // and no decrypt.
+            if busy && (!waiting || !ctx.policy_engine.bridge_authenticated) {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
             } else if !ctx.policy_engine.bridge_authenticated {
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
             } else {
                 let personas_before = ctx.personas.len();
-                crate::transport::handle_encrypted_request(
-                    usb,
-                    &frame,
-                    ctx.masters,
-                    ctx.personas,
-                    ctx.secp,
-                    ctx.display,
-                    ctx.buttons,
-                    ctx.policy_engine,
-                    ctx.identity_caches,
-                    ctx.nvs,
-                );
+                // A copy of the bundle the relay card holds is NACKed before
+                // dispatch, so it neither raises a card nor closes this one
+                // (review round 3, S2).
+                let cards = &ctx.button_cards;
+                // A late copy of a bundle whose card just closed is NACKed
+                // too, so heartwoodd publishes no `shown recently` for it.
+                let is_copy = |client_hex: &str, target_pk: &[u8; 32], request: &nip46::Nip46Request| {
+                    is_waiting_bundle_copy(cards, client_hex, target_pk, request)
+                        || crate::nip46_handler::is_closed_bundle_copy(client_hex, target_pk, request)
+                };
+                // No queue on the cable: its own card blocks.
+                let ((), raced) = crate::nip46_handler::with_full_access_waiting(waiting, false, || {
+                    crate::transport::handle_encrypted_request(
+                        usb,
+                        &frame,
+                        ctx.masters,
+                        ctx.personas,
+                        ctx.secp,
+                        ctx.display,
+                        ctx.buttons,
+                        ctx.policy_engine,
+                        ctx.identity_caches,
+                        ctx.nvs,
+                        busy,
+                        &is_copy,
+                    )
+                });
+                if raced {
+                    refuse_waiting_full_access(ctx);
+                }
                 if ctx.personas.len() != personas_before {
                     ctx.resubscribe_needed = true;
                 }
@@ -5759,14 +5802,117 @@ fn is_enrol_card(card: &ButtonCard) -> bool {
 fn card_window(card: &ButtonCard) -> Duration {
     if is_enrol_card(card) {
         Duration::from_secs(u64::from(heartwood_common::phone_unlock::ENROL_CARD_SECS))
+    } else if is_full_access_card(card) {
+        // The enrol window (one-hold pairing spec 4.2): time to read.
+        Duration::from_secs(heartwood_common::owner_pairing::FULL_ACCESS_CARD_SECS)
     } else {
         CARD_WINDOW
     }
 }
 
+/// Whether this card is the setup hold's FULL ACCESS card.
+fn is_full_access_card(card: &ButtonCard) -> bool {
+    card.asks
+        .first()
+        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::FullAccess { .. }))
+}
 
-/// Hold that approves, matching `approval::run_approval_loop`.
-const CARD_HOLD_MS: u32 = 2000;
+/// Whether a FULL ACCESS card is queued or on screen, its window passed or
+/// not (review round 2, S1: an overdue card is still one a hold may answer
+/// until the loop ticks it out).
+fn full_access_waiting(ctx: &SignCtx) -> bool {
+    ctx.button_cards.iter().any(is_full_access_card)
+}
+
+/// Whether the card queue would answer a bundle's FULL ACCESS card busy
+/// (`approval_queue::unshared_ask_busy`, the decision `queue_button_ask`
+/// makes for it: a bundle carries no event, so weighs 256 bytes there),
+/// asked before the bundle's room and registry checks (review round 2).
+fn full_access_queue_busy(ctx: &SignCtx) -> bool {
+    let held_bytes: usize = ctx
+        .button_cards
+        .iter()
+        .flat_map(|card| card.asks.iter())
+        .map(|ask| ask.weight)
+        .sum();
+    heartwood_common::approval_queue::unshared_ask_busy(
+        !ctx.button_cards.is_empty(),
+        ctx.button_cards.len().saturating_sub(1),
+        held_bytes,
+        256,
+        CARD_BYTE_BUDGET,
+    )
+}
+
+/// Close every waiting FULL ACCESS card with nothing granted (review round
+/// W3): a second bundle arrived. Each is answered
+/// `unauthorised: another full access request arrived` on the next pass of
+/// `service_button_cards`, before any press on it is judged.
+fn refuse_waiting_full_access(ctx: &mut SignCtx) {
+    for card in ctx.button_cards.iter_mut().filter(|card| is_full_access_card(card)) {
+        card.refused = Some(heartwood_common::owner_pairing::BundleError::AnotherFullAccess);
+    }
+}
+
+/// Whether this request is a copy of the bundle a waiting FULL ACCESS card
+/// already holds (review round 2, N1): the same client key, the same inner
+/// request id and the same params, republished (after a relay reconnect, or
+/// to another relay with a new outer event id) to the same identity
+/// (`owner_pairing::is_bundle_copy`). Ignored like an outer-id duplicate on
+/// the relay, and NACKed on the cable (review round 3, S2), so the owner's
+/// own retry does not close the owner's own card. Only the client-key
+/// holder can make one: the inner id lives inside NIP-44 under the
+/// conversation key of the client, and a request that does not decrypt is
+/// dropped before dispatch on either transport. A different id, or
+/// different params, from the same client is a new bundle, and the one-card
+/// rule applies.
+fn is_waiting_bundle_copy(
+    cards: &[ButtonCard],
+    client_hex: &str,
+    target_pk: &[u8; 32],
+    request: &nip46::Nip46Request,
+) -> bool {
+    use heartwood_common::owner_pairing::{is_bundle_copy, BundleKey};
+    let incoming = BundleKey { client_hex, target: target_pk, id: &request.id, params: &request.params };
+    cards.iter().filter(|card| is_full_access_card(card)).any(|card| {
+        card.asks.iter().any(|a| {
+            let held = BundleKey {
+                client_hex: &card.key.client_hex,
+                target: &card.target_pk,
+                id: &a.ask.request.id,
+                params: &a.ask.request.params,
+            };
+            is_bundle_copy(&held, &request.method, &incoming)
+        })
+    })
+}
+
+/// Whether this card pages five words at rest and arms only once they have
+/// all been shown (`phone_unlock::EnrolGate`): the enrol card, and the FULL
+/// ACCESS card (review round W2).
+fn is_paged_card(card: &ButtonCard) -> bool {
+    is_enrol_card(card) || is_full_access_card(card)
+}
+
+/// The hold that approves this card, matching the interactive loop's
+/// (`card_hold::hold_ms`): 5 s for FULL ACCESS, 2 s for every other card.
+fn card_hold_ms(card: &ButtonCard) -> u32 {
+    crate::card_hold::hold_ms(is_full_access_card(card))
+}
+
+/// Judge a press on this card: `card_hold::judge` against its own hold, or,
+/// for FULL ACCESS, `card_hold::judge_full_access`, which counts only the time
+/// the card's words have been on screen.
+fn judge_card_press(card: &ButtonCard, held_ms: u32, released: Option<u32>) -> crate::card_hold::Press {
+    crate::card_hold::judge_card(is_full_access_card(card), card.words, held_ms, released)
+}
+
+/// How far the front card's hold has got, for its bar and its burst: the
+/// press's length, or for FULL ACCESS the time its words have been up
+/// (`card_hold::card_progress`, host-tested in ui-preview).
+fn card_hold_progress(card: &ButtonCard, held_ms: u32) -> u32 {
+    crate::card_hold::card_progress(is_full_access_card(card), card.words, held_ms)
+}
 
 /// How long the tick may sample closely while the button is actually down,
 /// and how often. The loop's own cadence is roughly a second — far too coarse
@@ -5824,15 +5970,24 @@ struct ButtonCard {
     armed: bool,
     last_remaining: u32,
     last_pct: u32,
-    /// The enrol card's pages and press gate (`phone_unlock::EnrolGate`),
-    /// stepped every tick; unused by other cards.
-    enrol_gate: heartwood_common::phone_unlock::EnrolGate,
-    /// The enrol card's (page, armed) last drawn, so a change is drawn at
-    /// once and the page the gate counts is the page on screen.
+    /// A paged card's pages and press gate (`phone_unlock::EnrolGate`): the
+    /// enrol card's and the FULL ACCESS card's, stepped every tick; unused
+    /// by other cards.
+    page_gate: heartwood_common::phone_unlock::EnrolGate,
+    /// A paged card's (page, armed) last drawn, so a change is drawn at once
+    /// and the page the gate counts is the page on screen.
     drawn_view: Option<(usize, bool)>,
-    /// `oled::draw_generation` just after this card last drew its face;
-    /// `None` before the first draw.
+    /// `oled::draw_generation` just after this card last drew its face (the
+    /// FULL ACCESS card: or its hold screen); `None` before the first draw.
     drawn_gen: Option<u32>,
+    /// The FULL ACCESS card's words on its hold screen: its hold counts only
+    /// for the time they have been on the glass (`card_hold::WordsShown`,
+    /// review m1); unused by other cards.
+    words: crate::card_hold::WordsShown,
+    /// Closed before it was answered, with this refusal (review round W3: a
+    /// second bundle arrived while this FULL ACCESS card waited). Resolved on
+    /// the next pass of `service_button_cards`; nothing is granted.
+    refused: Option<heartwood_common::owner_pairing::BundleError>,
 }
 
 /// Whether this card has been on screen for its whole window.
@@ -5851,6 +6006,9 @@ enum CardTick {
     Approved,
     Denied,
     Expired,
+    /// Closed unanswered with this refusal (review round W3); nothing is
+    /// granted and every ask on it gets the refusal's message.
+    Refused(heartwood_common::owner_pairing::BundleError),
 }
 
 /// Re-resolve a served identity to its signing key and owning master.
@@ -5915,6 +6073,42 @@ fn queue_button_ask(
     audit: Option<SignAuditDraft>,
 ) -> Result<(), String> {
     use heartwood_common::approval_queue::{admit, Admission, AskKey};
+
+    // One FULL ACCESS card at a time (review round W3), before the queue
+    // looks at it. The bundle's own validation already applied this rule,
+    // after its slot check and before room and the registry (review round
+    // 2, S3), against the same queue, so this is a second fence that should
+    // never fire: a bundle that arrives while another waits (queued or on
+    // screen) is refused, and so is the waiting one, on the next pass of
+    // `service_button_cards`, with nothing granted; one that arrives within
+    // a minute of the last FULL ACCESS card closing is refused and never
+    // shown. A client racing the owner's own bundle can then only block the
+    // pairing, never ride the owner's hold.
+    if matches!(ask.card, crate::nip46_handler::AskCard::FullAccess { .. }) {
+        let waiting = ctx.button_cards.iter().any(is_full_access_card);
+        if let Err(refusal) = crate::nip46_handler::full_access_admission(waiting) {
+            if refusal == heartwood_common::owner_pairing::BundleError::AnotherFullAccess {
+                refuse_waiting_full_access(ctx);
+            }
+            log::warn!("[relay] heartwood_approve_bundle {} refused: {}", ask.request.id, refusal.message());
+            let response =
+                nip46::build_error_response(&ask.request.id, refusal.code(), refusal.message()).unwrap_or_default();
+            return sign_and_publish(
+                tls,
+                ctx.secp,
+                signing_secret,
+                conversation_key,
+                client_hex,
+                NIP46_KIND,
+                reply_stamp(
+                    ctx,
+                    created_at,
+                    Duration::from_secs(crate::uptime_s().saturating_sub(received_uptime)),
+                ),
+                response,
+            );
+        }
+    }
 
     let mut kind_key = heartwood_common::nip59::method_or_kind_key(
         &ask.request.method,
@@ -5990,7 +6184,7 @@ fn queue_button_ask(
             let response = nip46::build_error_response(
                 &request_id,
                 -1,
-                "signer is busy with another approval; retry shortly",
+                heartwood_common::approval_queue::BUSY_ERROR,
             )
             .unwrap_or_default();
             sign_and_publish(
@@ -6051,9 +6245,11 @@ fn queue_button_ask(
                 armed: false,
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
-                enrol_gate: Default::default(),
+                page_gate: Default::default(),
                 drawn_view: None,
                 drawn_gen: None,
+                words: Default::default(),
+                refused: None,
             });
             Ok(())
         }
@@ -6070,10 +6266,25 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     ctx.last_activity = Instant::now();
 
     if hold_ms > 0 {
-        let pct = (hold_ms * 100 / CARD_HOLD_MS).min(100);
+        let progress = card_hold_progress(&ctx.button_cards[0], hold_ms);
+        let pct = crate::card_hold::hold_pct(card_hold_ms(&ctx.button_cards[0]), progress);
         if pct / 5 != ctx.button_cards[0].last_pct / 5 {
             ctx.button_cards[0].last_pct = pct;
-            crate::oled::show_hold_progress(ctx.display, pct);
+            // The FULL ACCESS card shows all five words for the whole hold.
+            match &ctx.button_cards[0].asks[0].ask.card {
+                crate::nip46_handler::AskCard::FullAccess { client_pubkey, label, .. } => {
+                    let client = *client_pubkey;
+                    let label = label.clone();
+                    crate::oled::show_full_access_hold(ctx.display, &label, &client, pct);
+                    // The hold counts from here, once the words are on the
+                    // glass, on the sampler's clock (review m1). The hold
+                    // screen counts as this card's own face, so a later
+                    // overdraw is seen and restarts the count.
+                    ctx.button_cards[0].words.drawn(crate::button::hold_ms());
+                    ctx.button_cards[0].drawn_gen = Some(crate::oled::draw_generation());
+                }
+                _ => crate::oled::show_hold_progress(ctx.display, pct),
+            }
         }
         return;
     }
@@ -6081,9 +6292,10 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
     // First draw of this wording: a join sets last_remaining back to MAX to
     // force a redraw, so a card that grows logs again with what it now says.
     let first_draw = ctx.button_cards[0].last_remaining == u32::MAX;
-    // The enrol card also redraws the moment its page or gate changes.
-    let view = is_enrol_card(&ctx.button_cards[0])
-        .then(|| (ctx.button_cards[0].enrol_gate.page(), ctx.button_cards[0].enrol_gate.armed()));
+    // A paged card (enrol, FULL ACCESS) also redraws the moment its page or
+    // gate changes.
+    let view = is_paged_card(&ctx.button_cards[0])
+        .then(|| (ctx.button_cards[0].page_gate.page(), ctx.button_cards[0].page_gate.armed()));
     if remaining == ctx.button_cards[0].last_remaining
         && view == ctx.button_cards[0].drawn_view
         && !card_overdrawn(&ctx.button_cards[0])
@@ -6101,8 +6313,9 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         Titled(&'static str, String),
         Batch(String, String),
         Enrol([&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS], String),
+        FullAccess(String, [u8; 32], Vec<String>, heartwood_common::owner_pairing::Style),
     }
-    // The enrol card's page and whether a hold counts yet (its hint).
+    // A paged card's page and whether a hold counts yet (its hint).
     let (card_page, card_armed) = view.unwrap_or((0, true));
     let card = match &ctx.button_cards[0].asks[0].ask.card {
         crate::nip46_handler::AskCard::Sign { requester, kind, identity, heading, login_code } => {
@@ -6137,6 +6350,9 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             Draw::Titled("RECEIVE NOTE", title.clone())
         }
         crate::nip46_handler::AskCard::PhoneEnrol { words, label, .. } => Draw::Enrol(*words, label.clone()),
+        crate::nip46_handler::AskCard::FullAccess { label, client_pubkey, act_as, style } => {
+            Draw::FullAccess(label.clone(), *client_pubkey, act_as.clone(), *style)
+        }
     };
     // What the panel now READS, once per wording, so a bench can check an
     // amount or a mint without a camera on the OLED (checklist 13, 2b).
@@ -6166,6 +6382,10 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             Draw::Titled(header, title) => ((*header).to_string(), title.clone()),
             Draw::Batch(header, title) => (header.clone(), title.clone()),
             Draw::Enrol(words, label) => (format!("ADD \"{label}\"?"), words.join(" ")),
+            Draw::FullAccess(label, client, act_as, style) => {
+                let card = heartwood_common::owner_pairing::full_access_card(label, 64, client, act_as, *style);
+                (card.header.to_string(), card.lines()[1..].join(" / "))
+            }
         };
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
     }
@@ -6207,6 +6427,16 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             &label,
             remaining,
             heartwood_common::phone_unlock::ENROL_CARD_SECS,
+            card_page,
+            card_armed,
+        ),
+        Draw::FullAccess(_label, client, act_as, style) => crate::oled::show_full_access(
+            ctx.display,
+            &client,
+            &act_as,
+            style,
+            remaining,
+            heartwood_common::owner_pairing::FULL_ACCESS_CARD_SECS as u32,
             card_page,
             card_armed,
         ),
@@ -6274,6 +6504,11 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     if ctx.button_cards.is_empty() {
         return CardTick::Pending;
     }
+    // A FULL ACCESS card a second bundle closed is never ticked towards an
+    // approval, whoever calls this (review round W3).
+    if let Some(refusal) = ctx.button_cards[0].refused {
+        return CardTick::Refused(refusal);
+    }
     let now = Instant::now();
     if ctx.button_cards[0].opened_at.is_none() {
         // Anything the sampler latched before the card went up belongs to
@@ -6298,14 +6533,15 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
     let hold_ms = crate::button::hold_ms();
     let released = crate::button::take_release();
 
-    // The enrol card turns its pages and keeps its gate every tick
+    // A paged card (the enrol card, and the FULL ACCESS card since review
+    // round W2) turns its pages and keeps its gate every tick
     // (phone_unlock::EnrolGate, the cable's rule too): a page moves on only
     // after its full dwell on screen, however long a stalled pass took, and
     // the card arms only once every page has had that dwell, 12 s have
     // passed and the button is up. A hold on page 1 alone would rest on two
     // words.
-    let enrol = is_enrol_card(&ctx.button_cards[0]);
-    if enrol {
+    let paged = is_paged_card(&ctx.button_cards[0]);
+    if paged {
         let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
         // Something else was drawn since the card last drew itself (a
         // signing confirmation, an OTA chunk, a screen turned round): the
@@ -6313,25 +6549,25 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         // starts its dwell again once the card is back (drawn below). A card
         // drawn over again and again only expires.
         if card_overdrawn(&ctx.button_cards[0]) {
-            ctx.button_cards[0].enrol_gate.restart_page(elapsed_ms);
+            ctx.button_cards[0].page_gate.restart_page(elapsed_ms);
         }
-        ctx.button_cards[0].enrol_gate.step(elapsed_ms, hold_ms > 0);
+        ctx.button_cards[0].page_gate.step(elapsed_ms, hold_ms > 0);
     }
 
     if !ctx.button_cards[0].armed {
-        let arms = hold_ms == 0 && (!enrol || ctx.button_cards[0].enrol_gate.armed());
+        let arms = hold_ms == 0 && (!paged || ctx.button_cards[0].page_gate.armed());
         if arms {
             ctx.button_cards[0].armed = true;
         }
-        // B still cancels an enrol card during its gate: it is the explicit
+        // B still cancels a paged card during its gate: it is the explicit
         // "no", and that is always the owner's to give.
-        if enrol && ctx.buttons.b_pressed() {
+        if paged && ctx.buttons.b_pressed() {
             ctx.buttons.drain_b();
             return CardTick::Denied;
         }
         // Both the in-progress hold and its release are discarded until the
         // card is armed, so a press aimed at the idle carousel cannot answer
-        // a card that appeared underneath it, and a tap during the enrol
+        // a card that appeared underneath it, and a tap during a paged
         // card's gate neither approves nor declines (nor spends the key).
         draw_button_card(ctx, remaining, 0);
         return CardTick::Pending;
@@ -6343,17 +6579,28 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         return CardTick::Denied;
     }
 
-    if hold_ms >= CARD_HOLD_MS {
-        return CardTick::Approved;
+    // The FULL ACCESS card's words were covered since its hold screen was
+    // drawn (another screen took the panel between passes): the time they
+    // were hidden does not count, so the count starts again at the next draw.
+    if is_full_access_card(&ctx.button_cards[0])
+        && ctx.button_cards[0].words.shown()
+        && card_overdrawn(&ctx.button_cards[0])
+    {
+        ctx.button_cards[0].words.hidden();
+        ctx.button_cards[0].last_pct = u32::MAX;
     }
-    if let Some(ms) = released {
-        // A hold that began and ended between two passes still counts: the
-        // sampler measured it even though the loop never saw it in progress.
-        return if ms >= CARD_HOLD_MS {
-            CardTick::Approved
-        } else {
-            CardTick::Denied
-        };
+
+    // The card's own hold: 5 s for FULL ACCESS, 2 s for every other card. A
+    // hold that began and ended between two passes still counts for a 2 s
+    // card: the sampler measured it even though the loop never saw it in
+    // progress. FULL ACCESS counts only the time its words were on screen,
+    // so a hold measured between passes alone never approves it (review
+    // m1). A shorter press declines.
+    let hold = card_hold_ms(&ctx.button_cards[0]);
+    match judge_card_press(&ctx.button_cards[0], hold_ms, released) {
+        crate::card_hold::Press::Approved => return CardTick::Approved,
+        crate::card_hold::Press::Declined => return CardTick::Denied,
+        crate::card_hold::Press::Pending => {}
     }
 
     if hold_ms > 0 {
@@ -6364,23 +6611,34 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
         // enough for the hold to complete unseen. An operator with a finger
         // on the button is a foreground interaction: the socket can wait the
         // second or so it takes, and the watchdog is fed every poll.
+        //
+        // FULL ACCESS follows until its words have been up the whole hold
+        // (they are drawn on the first pass below if they are not yet).
+        let progress = card_hold_progress(&ctx.button_cards[0], hold_ms);
         let burst_until = Instant::now()
-            + CARD_HOLD_BURST.max(Duration::from_millis(u64::from(CARD_HOLD_MS - hold_ms) + 200));
+            + CARD_HOLD_BURST.max(Duration::from_millis(u64::from(hold.saturating_sub(progress)) + 200));
         loop {
             crate::wdt::feed();
-            let held = crate::button::hold_ms();
-            if held >= CARD_HOLD_MS {
-                return CardTick::Approved;
+            // The window is enforced at the moment of approval (review m2):
+            // a hold still under way when it closes expires the card, as the
+            // interactive loop's deadline does.
+            if card_overdue(&ctx.button_cards[0]) {
+                return CardTick::Expired;
             }
+            let held = crate::button::hold_ms();
             if held == 0 {
-                // Released mid-burst: the sampler has the length.
-                return match crate::button::take_release() {
-                    Some(ms) if ms >= CARD_HOLD_MS => CardTick::Approved,
-                    Some(_) => CardTick::Denied,
-                    // No release recorded: treat it as nothing having
-                    // happened and let the next pass decide.
-                    None => CardTick::Pending,
+                // Released mid-burst: the sampler has the length. No release
+                // recorded: treat it as nothing having happened and let the
+                // next pass decide (FULL ACCESS: a decline once its words
+                // were shown).
+                return match judge_card_press(&ctx.button_cards[0], 0, crate::button::take_release()) {
+                    crate::card_hold::Press::Approved => CardTick::Approved,
+                    crate::card_hold::Press::Declined => CardTick::Denied,
+                    crate::card_hold::Press::Pending => CardTick::Pending,
                 };
+            }
+            if judge_card_press(&ctx.button_cards[0], held, None) == crate::card_hold::Press::Approved {
+                return CardTick::Approved;
             }
             draw_button_card(ctx, remaining, held);
             if Instant::now() >= burst_until {
@@ -6397,7 +6655,9 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
 /// Answer every ask on one card with a single decision, and publish.
 ///
 /// `index` is 0 for the card on screen; a later index is a card that timed
-/// out in the queue without ever reaching it, which draws nothing.
+/// out in the queue without ever reaching it, which draws nothing, or a
+/// FULL ACCESS card the one-card rule closed there, whose refusal draws
+/// over the card on screen (review round 3, S1).
 fn resolve_button_card(
     ctx: &mut SignCtx,
     sessions: &mut [RelaySession],
@@ -6408,6 +6668,19 @@ fn resolve_button_card(
         return;
     }
     let card = ctx.button_cards.remove(index);
+    let full_access_unopened = is_full_access_card(&card) && card.opened_at.is_none();
+    // Whatever the outcome, a FULL ACCESS card closing starts the minute in
+    // which no other may be raised (review round W3).
+    if is_full_access_card(&card) {
+        crate::nip46_handler::full_access_closed(card.asks.first().map(|a| {
+            heartwood_common::owner_pairing::BundleKey {
+                client_hex: &card.key.client_hex,
+                target: &card.target_pk,
+                id: &a.ask.request.id,
+                params: &a.ask.request.params,
+            }
+        }));
+    }
     if index == 0 {
         // Whatever the button did to decide this card is spent: the edge
         // that started the hold, and the hold itself if it is still going.
@@ -6433,12 +6706,20 @@ fn resolve_button_card(
         resolve_phone_enrol_card(ctx, sessions, card, outcome, index == 0);
         return;
     }
-    if index == 0 {
-        match outcome {
-            CardTick::Approved => crate::oled::show_approved(ctx.display),
-            CardTick::Denied => crate::oled::show_denied(ctx.display),
-            _ => crate::oled::show_request_expired(ctx.display),
-        }
+    match outcome {
+        // A FULL ACCESS card closed by a second bundle: the owner sees it
+        // refused, not merely gone, whether or not it had reached the screen
+        // (review round 3, S1). Its close restarts the minute, so a racer
+        // could otherwise keep pairing blocked with nothing on the board.
+        CardTick::Refused(_) => show_full_access_blocked(ctx),
+        // Closed without ever reaching the screen for any other reason (it
+        // expired in the queue): its close restarts the minute just the
+        // same, so the owner sees the same refusal (review round 3, F2).
+        _ if full_access_unopened => show_full_access_blocked(ctx),
+        _ if index != 0 => {}
+        CardTick::Approved => crate::oled::show_approved(ctx.display),
+        CardTick::Denied => crate::oled::show_denied(ctx.display),
+        _ => crate::oled::show_request_expired(ctx.display),
     }
 
     let Some((signing_secret, label, mode, slot, persona_purpose)) =
@@ -6539,6 +6820,9 @@ fn resolve_button_card(
             }
             CardTick::Denied => nip46::build_error_response(&request_id, -1, "user denied")
                 .unwrap_or_default(),
+            CardTick::Refused(refusal) => {
+                nip46::build_error_response(&request_id, refusal.code(), refusal.message()).unwrap_or_default()
+            }
             _ => nip46::build_error_response(&request_id, -1, "timeout").unwrap_or_default(),
         };
 
@@ -6878,9 +7162,11 @@ fn queue_receive_card(
                 armed: false,
                 last_remaining: u32::MAX,
                 last_pct: u32::MAX,
-                enrol_gate: Default::default(),
+                page_gate: Default::default(),
                 drawn_view: None,
                 drawn_gen: None,
+                words: Default::default(),
+                refused: None,
             });
         }
     }
@@ -7104,9 +7390,11 @@ fn queue_phone_enrol(
         armed: false,
         last_remaining: u32::MAX,
         last_pct: u32::MAX,
-        enrol_gate: Default::default(),
+        page_gate: Default::default(),
         drawn_view: None,
         drawn_gen: None,
+        words: Default::default(),
+        refused: None,
     });
     Ok(())
 }
@@ -7510,6 +7798,17 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
         return;
     }
 
+    // A FULL ACCESS card a second bundle closed (review round W3) is
+    // answered with that refusal before anything else, so the owner can
+    // never approve it.
+    if let Some(index) = ctx.button_cards.iter().position(|card| card.refused.is_some()) {
+        if let Some(refusal) = ctx.button_cards[index].refused {
+            log::warn!("[relay] FULL ACCESS card closed: {}", refusal.message());
+            resolve_button_card(ctx, sessions, index, &CardTick::Refused(refusal));
+            return;
+        }
+    }
+
     // Anything that has waited past the queue TTL without reaching the screen
     // is answered where it stands, one per pass.
     let now = crate::uptime_s();
@@ -7530,12 +7829,54 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
         return;
     }
 
+    // A FULL ACCESS refusal is still being read (review round 3, F1): the
+    // front card waits to tick, and so to draw, without blocking the loop.
+    // Its window runs on; when it draws again it is an overdraw, so its page
+    // dwell starts afresh, and it was disarmed with the refusal.
+    if ctx.refusal_shown_until.is_some_and(|until| Instant::now() < until) {
+        return;
+    }
+    ctx.refusal_shown_until = None;
+
     let outcome = tick_button_card(ctx);
     if matches!(outcome, CardTick::Pending) {
         return;
     }
     resolve_button_card(ctx, sessions, 0, &outcome);
 }
+
+/// Draw the refusal for a FULL ACCESS card the one-card rule closed (review
+/// round 3, S1), opened or still queued, or that closed without ever
+/// reaching the screen (F2). It stays up for at least
+/// [`REFUSAL_MIN_SHOWN`] before any card ticks again (F1). Over another
+/// card on screen it is
+/// an overdraw: that card draws itself again on its next pass, its page
+/// starts its dwell afresh (`card_overdrawn`, `EnrolGate::restart_page`),
+/// and it is disarmed, so a press under way across the refusal never
+/// answers it; it arms again once the button has been seen up, as a card
+/// that has just appeared does. Nothing holds the refusal beyond that: over a
+/// live card it stays up until that card's first pass after the minimum.
+fn show_full_access_blocked(ctx: &mut SignCtx) {
+    if !ctx.display_on {
+        crate::oled::wake_display(ctx.display);
+        ctx.display_on = true;
+    }
+    let over_card = match ctx.button_cards.first_mut() {
+        Some(front) if front.opened_at.is_some() => {
+            front.armed = false;
+            crate::button::clear_press_edge();
+            true
+        }
+        _ => false,
+    };
+    log::info!("[relay] FULL ACCESS refusal drawn (over a card: {over_card})");
+    show_card_not_done(ctx, "Pairing blocked", "2nd request");
+    ctx.refusal_shown_until = Some(Instant::now() + REFUSAL_MIN_SHOWN);
+}
+
+/// How long a FULL ACCESS refusal stays on the glass before a card may draw
+/// over it (review round 3, F1): long enough to read two short lines.
+const REFUSAL_MIN_SHOWN: Duration = Duration::from_millis(1500);
 
 /// Replace APPROVED with NOT DONE and hold it long enough to read before the
 /// idle screen returns.
@@ -7941,6 +8282,25 @@ fn handle_nip46_event(
         }
     };
     drop(plaintext);
+    if is_waiting_bundle_copy(&ctx.button_cards, &ev.pubkey, target_pk, &request) {
+        log::info!(
+            "[relay] heartwood_approve_bundle {} is a copy of the bundle on its card; ignoring",
+            request.id
+        );
+        return Ok(());
+    }
+    // A late copy of the bundle whose card just closed (the owner's bundle,
+    // bridged by heartwoodd too, whose cable card blocked this loop while
+    // the relay copy waited): no reply, no card, and the minute is not
+    // restarted (review round 3, S2). The card's own reply answers this
+    // request id; `shown recently` would race it to the phone.
+    if crate::nip46_handler::is_closed_bundle_copy(&ev.pubkey, target_pk, &request) {
+        log::info!(
+            "[relay] heartwood_approve_bundle {} is a copy of the bundle whose card just closed; dropped",
+            request.id
+        );
+        return Ok(());
+    }
     let audit = sign_audit_draft(
         &request,
         client_label(ctx, slot, &ev.pubkey),
@@ -7964,9 +8324,16 @@ fn handle_nip46_event(
     // identity and list-identities cards and not only the method policy.
     let login_challenge = matches!(method_enum, nip46::Nip46Method::SignEvent)
         && nip46::unsigned_event_is_login_challenge(&request.params);
-    let base_tier = ctx
-        .policy_engine
-        .check_for_event(slot, &ev.pubkey, &method_enum, event_kind, login_challenge);
+    // The owner-status probe and narrow (one-hold pairing spec 4.1, 4.6) are
+    // answered by the handler before any tier, with no card: planned as
+    // automatic, so an escalate slot never parks them and a strict one never
+    // petitions over them.
+    let base_tier = if method_enum.answered_before_tier() {
+        heartwood_common::policy::ApprovalTier::AutoApprove
+    } else {
+        ctx.policy_engine
+            .check_for_event(slot, &ev.pubkey, &method_enum, event_kind, login_challenge)
+    };
     let active_context = if request.heartwood.is_none() {
         crate::nip46_handler::resolve_active_context(
             ctx.policy_engine,
@@ -7996,8 +8363,13 @@ fn handle_nip46_event(
         // Dispatch answers the derivation failure itself.
         Err(()) => (base_tier, None),
     };
-    let slot_snapshot = crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
-        .then(|| ctx.policy_engine.snapshot_slot_state(slot));
+    let owner_pairing = ctx
+        .policy_engine
+        .find_slot_by_pubkey(slot, &ev.pubkey)
+        .is_some_and(heartwood_common::owner_pairing::is_owner_pairing);
+    let slot_snapshot =
+        crate::nip46_handler::request_may_mutate_slot_state(&request, tier, owner_pairing)
+            .then(|| ctx.policy_engine.snapshot_slot_state(slot));
 
     // C4 escalation (schema §1.1): an interactive ask on an escalate-flagged
     // slot parks and notifies the guardian's phone instead of blocking the
@@ -8158,24 +8530,36 @@ fn handle_nip46_event(
     // for the length of a window (#64). The card goes up, the loop carries on,
     // and the request is dispatched by `resolve_button_card` once the hold is
     // in hand.
-    let mut response_json = match crate::nip46_handler::dispatch(
-        request,
-        None,
-        None,
-        &signing_secret,
-        &label,
-        mode,
-        slot,
-        ctx.secp,
-        ctx.display,
-        ctx.buttons,
-        ctx.policy_engine,
-        ctx.identity_caches,
-        Some(&client_pubkey),
-        ctx.nvs,
-        ctx.personas,
-        crate::nip46_handler::ApprovalDecision::Deferred,
-    ) {
+    //
+    // A bundle sees whether a FULL ACCESS card already waits (review round
+    // W3, checked inside its validation, review round 2 S3), and one refused
+    // for it closes that card.
+    let waiting = full_access_waiting(ctx);
+    let queue_busy = full_access_queue_busy(ctx);
+    let (dispatched, raced) = crate::nip46_handler::with_full_access_waiting(waiting, queue_busy, || {
+        crate::nip46_handler::dispatch(
+            request,
+            None,
+            None,
+            &signing_secret,
+            &label,
+            mode,
+            slot,
+            ctx.secp,
+            ctx.display,
+            ctx.buttons,
+            ctx.policy_engine,
+            ctx.identity_caches,
+            Some(&client_pubkey),
+            ctx.nvs,
+            ctx.personas,
+            crate::nip46_handler::ApprovalDecision::Deferred,
+        )
+    });
+    if raced {
+        refuse_waiting_full_access(ctx);
+    }
+    let mut response_json = match dispatched {
         crate::nip46_handler::Dispatch::Answered(json) => json,
         crate::nip46_handler::Dispatch::NeedsApproval(ask) => {
             return queue_button_ask(
@@ -9695,6 +10079,19 @@ fn dispatch_mgmt(
                 Some(i) => {
                     // Rebind: v2 replaces the complete policy as one validated
                     // unit; legacy keeps its historical partial-kind behavior.
+                    //
+                    // One-hold pairing (review m6), a known operator-key gap
+                    // accepted until spec stage 3: re-pairing the owner phone's
+                    // own client key with `nostrconnect_v2` replaces an owner
+                    // pairing's policy in one call. The slot becomes strict, so
+                    // the owner mark and both gate rules go with it (fails
+                    // closed for Rule V and Rule D), but Extra careful's kinds
+                    // list is replaced by whatever the exact policy names, so
+                    // it can widen in that one call. `update_slot`'s
+                    // no-silent-widening rule (owner_pairing::update_slot_kinds)
+                    // is not applied here on purpose: whoever holds the
+                    // operator key can already drop the mark and widen in two
+                    // calls. Behaviour unchanged; the stage 3 design covers it.
                     if let Some(policy) = &exact_policy {
                         ctx.policy_engine.update_slot(
                             master_slot,

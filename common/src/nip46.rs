@@ -123,6 +123,17 @@ pub enum Nip46Method {
     /// device key. This is intentionally neither a generic derivation nor a
     /// generic secret export operation.
     HeartwoodProvisionRendezvous,
+    /// The one-hold setup of an owner pairing (one-hold pairing spec 4.1):
+    /// resolve or derive the named personas, grant the phone `act_as`, and
+    /// add the owner mark. Always its own FULL ACCESS card and a 5 s hold,
+    /// whatever the slot lists ([`Self::always_shows_own_card`]).
+    HeartwoodApproveBundle,
+    /// Whether the caller's own pairing carries the owner mark, and its
+    /// signing style (spec 4.1). Answered before the tier check, no card.
+    HeartwoodOwnerStatus,
+    /// Narrow the caller's own owner pairing to Extra careful (spec 4.6).
+    /// Never widens, so it is answered before the tier check, no card.
+    HeartwoodOwnerNarrow,
     // Unknown method
     Unknown(String),
 }
@@ -171,6 +182,12 @@ impl Nip46Method {
             "heartwood_note_address_proof" => Self::HeartwoodNoteAddressProof,
             "heartwood_pair_wallet" => Self::HeartwoodPairWallet,
             "heartwood_provision_rendezvous" => Self::HeartwoodProvisionRendezvous,
+            "heartwood_approve_bundle" => Self::HeartwoodApproveBundle,
+            "heartwood_owner_status" => Self::HeartwoodOwnerStatus,
+            "heartwood_owner_narrow" => Self::HeartwoodOwnerNarrow,
+            // `heartwood_owner_vault` (the owner mark) is deliberately NOT a
+            // method: it is only ever a name in a slot's `allowed_methods`,
+            // and a request naming it is an unknown method.
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -213,6 +230,9 @@ impl Nip46Method {
             Self::HeartwoodNoteAddressProof => "heartwood_note_address_proof",
             Self::HeartwoodPairWallet => "heartwood_pair_wallet",
             Self::HeartwoodProvisionRendezvous => "heartwood_provision_rendezvous",
+            Self::HeartwoodApproveBundle => "heartwood_approve_bundle",
+            Self::HeartwoodOwnerStatus => "heartwood_owner_status",
+            Self::HeartwoodOwnerNarrow => "heartwood_owner_narrow",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -240,6 +260,7 @@ impl Nip46Method {
                 | Self::HeartwoodNoteAddressProof
                 | Self::HeartwoodPairWallet
                 | Self::HeartwoodProvisionRendezvous
+                | Self::HeartwoodApproveBundle
         )
     }
 
@@ -292,7 +313,30 @@ impl Nip46Method {
     /// (#160).
     pub fn device_press_only(&self) -> bool {
         self.requires_fresh_physical_approval()
+            || self.always_shows_own_card()
             || matches!(self, Self::HeartwoodPairWallet | Self::HeartwoodNoteAddressProof)
+    }
+
+    /// Whether this method's tier is ButtonRequired and its own card always
+    /// shows, WHATEVER the slot's `allowed_methods` lists (one-hold pairing
+    /// spec 4.5, the M1 fix). The firmware checks it in `check_for_event`
+    /// next to [`Self::requires_fresh_physical_approval`], before the
+    /// `allowed_methods` lift, but without that pin's rendezvous-specific
+    /// checks. Only `heartwood_approve_bundle`: its card is the FULL ACCESS
+    /// card, and a slot that somehow lists the method (an import, a manager
+    /// bug) must never turn that hold into a silent grant.
+    pub fn always_shows_own_card(&self) -> bool {
+        matches!(self, Self::HeartwoodApproveBundle)
+    }
+
+    /// Methods the dispatcher answers BEFORE the tier check, with no card and
+    /// no policy evaluation (one-hold pairing spec 4.1 and 4.6): they read
+    /// or only narrow the caller's own pairing. They are deliberately in
+    /// neither [`Self::always_auto_approve`] (handshake plumbing) nor
+    /// [`Self::always_requires_button`]; left to fall through the tier they
+    /// would prompt on a legacy slot and be denied on a strict one.
+    pub fn answered_before_tier(&self) -> bool {
+        matches!(self, Self::HeartwoodOwnerStatus | Self::HeartwoodOwnerNarrow)
     }
 
     /// Whether a guardian verdict may answer this method's OWN card (#160).
@@ -1667,6 +1711,59 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn one_hold_pairing_methods_round_trip_and_the_mark_is_not_callable() {
+        // Spec 4.5: the three methods parse and print; the owner mark is a
+        // name in `allowed_methods`, never a method a client can call.
+        for (name, method) in [
+            ("heartwood_approve_bundle", Nip46Method::HeartwoodApproveBundle),
+            ("heartwood_owner_status", Nip46Method::HeartwoodOwnerStatus),
+            ("heartwood_owner_narrow", Nip46Method::HeartwoodOwnerNarrow),
+        ] {
+            assert_eq!(Nip46Method::from_str(name), method, "{name}");
+            assert_eq!(method.as_str(), name);
+        }
+        assert_eq!(
+            Nip46Method::from_str("heartwood_owner_vault"),
+            Nip46Method::Unknown("heartwood_owner_vault".to_string())
+        );
+    }
+
+    #[test]
+    fn the_bundle_is_a_device_press_with_its_own_card_whatever_the_slot_lists() {
+        // Spec 4.5 (M1): device-press-only, never answered by a verdict, and
+        // its own card is pinned before any `allowed_methods` lift.
+        let bundle = Nip46Method::HeartwoodApproveBundle;
+        assert!(bundle.always_requires_button());
+        assert!(bundle.device_press_only());
+        assert!(bundle.always_shows_own_card());
+        assert!(!bundle.verdict_may_answer_card());
+        assert!(!bundle.always_auto_approve());
+        assert!(!bundle.answered_before_tier());
+        // `create: false` never derives, so the tree is a per-request check,
+        // not the unconditional bunker-mode refusal.
+        assert!(!bundle.requires_tree_mode());
+        // The pin is the bundle's alone: the rendezvous keeps its own.
+        assert!(!Nip46Method::HeartwoodProvisionRendezvous.always_shows_own_card());
+        assert!(!Nip46Method::HeartwoodPairWallet.always_shows_own_card());
+        assert!(!Nip46Method::HeartwoodDerivePersona.always_shows_own_card());
+        assert!(!bundle.requires_fresh_physical_approval());
+    }
+
+    #[test]
+    fn owner_status_and_narrow_are_answered_before_the_tier_and_never_prompt() {
+        for method in [Nip46Method::HeartwoodOwnerStatus, Nip46Method::HeartwoodOwnerNarrow] {
+            assert!(method.answered_before_tier(), "{method:?}");
+            assert!(!method.always_auto_approve(), "{method:?}");
+            assert!(!method.always_requires_button(), "{method:?}");
+            assert!(!method.device_press_only(), "{method:?}");
+            assert!(!method.always_shows_own_card(), "{method:?}");
+            assert!(!method.requires_tree_mode(), "{method:?}");
+        }
+        assert!(!Nip46Method::HeartwoodCapabilities.answered_before_tier());
+        assert!(!Nip46Method::SignEvent.answered_before_tier());
+    }
 
     #[test]
     fn relay_message_tag_reads_the_leading_tag() {

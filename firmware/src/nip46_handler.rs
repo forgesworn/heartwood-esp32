@@ -45,25 +45,10 @@ use crate::policy::PolicyEngine;
 /// Timeout in seconds shown on the OLED countdown bar.
 const APPROVAL_TIMEOUT_SECS: u64 = 30;
 
-/// A public relay is not an approval queue. Only a client already bound to a
-/// slot may make the device wait for a physical decision; otherwise strangers
-/// can serialize fresh keys/ids into an endless series of 30-second prompts.
-/// `heartwood_list_identities` joins the denial set not for the button but
-/// because it enumerates the per-boot identity cache (persona purposes/names,
-/// child npubs) — metadata an unbound relay peer has no business reading
-/// (FW-L5).
-fn unbound_remote_request_denied(
-    has_client: bool,
-    client_is_bound: bool,
-    method: &nip46::Nip46Method,
-) -> bool {
-    has_client
-        && !client_is_bound
-        && (matches!(method, nip46::Nip46Method::SignEvent)
-            || matches!(method, nip46::Nip46Method::HeartwoodListIdentities)
-            || method.always_requires_button()
-            || is_note_method(method))
-}
+// The pure pre-dispatch gates live in nip46_gates.rs, which common's host
+// tests compile, so their tests run in CI.
+use crate::nip46_gates::{remote_extension_requires_approval, unbound_remote_request_denied};
+pub(crate) use crate::nip46_gates::request_may_mutate_slot_state;
 
 /// The bearer-note locker's relay methods. All of them require a bound
 /// slot (see `unbound_remote_request_denied`), and the disclosure and
@@ -88,22 +73,6 @@ fn spend_grant_covers(method: &str, params: &[Value], client_hex: &str) -> bool 
     };
     let Some(id) = cmd.get("id").and_then(Value::as_str) else { return false };
     crate::notes::take_spend_grant(id, &client)
-}
-
-/// Remote Heartwood extensions that mutate identity state must cross one
-/// physical-approval boundary before their match arm can run. `sign_event` owns
-/// its richer event-specific prompt, while direct USB (`has_client == false`)
-/// retains physical-possession semantics. Standard crypto methods are not
-/// included here: an unbound remote crypto request remains refused below.
-fn remote_extension_requires_approval(
-    has_client: bool,
-    method: &nip46::Nip46Method,
-    tier: heartwood_common::policy::ApprovalTier,
-) -> bool {
-    has_client
-        && !matches!(method, nip46::Nip46Method::SignEvent)
-        && method.always_requires_button()
-        && tier == heartwood_common::policy::ApprovalTier::ButtonRequired
 }
 
 /// Route a `heartwood_derive_persona` by the identity it was addressed to (see
@@ -203,24 +172,507 @@ fn extension_approval_preview(requester: &str, params: &[Value]) -> String {
     }
 }
 
-/// Whether a remote request can change durable slot authority when approved.
-/// Callers use this before dispatch to take a rollback snapshot without cloning
-/// the slot table for every routine auto-sign request.
-pub(crate) fn request_may_mutate_slot_state(
-    request: &nip46::Nip46Request,
-    tier: heartwood_common::policy::ApprovalTier,
-) -> bool {
-    match nip46::Nip46Method::from_str(&request.method) {
-        nip46::Nip46Method::Connect => request
-            .params
-            .get(1)
-            .and_then(|value| value.as_str())
-            .map(|secret| !secret.is_empty())
-            .unwrap_or(false),
-        nip46::Nip46Method::SignEvent => {
-            tier == heartwood_common::policy::ApprovalTier::ButtonRequired
+/// The registry's key for a persona name at index 0 under this master, the
+/// bundle's lookup (spec 4.1: every derive uses index 0).
+fn registered_persona(
+    personas: &[crate::personas::LoadedPersona],
+    master_slot: u8,
+    name: &str,
+) -> Option<[u8; 32]> {
+    let purpose = format!("nostr:persona:{name}");
+    personas
+        .iter()
+        .find(|p| p.master_slot == master_slot && p.index == 0 && p.purpose == purpose)
+        .map(|p| p.pubkey)
+}
+
+/// Derive and register one persona the setup hold names (spec 4.3 step 1),
+/// the `heartwood_derive_persona` path: into the identity cache, then the
+/// persisted registry (refusing cleanly when it is full), then the in-memory
+/// registry. The key is checked against `expect` before anything is written.
+/// A registration that lands stays even if the slot step is later rolled
+/// back: a later derive is then a lookup.
+#[allow(clippy::too_many_arguments)]
+fn register_bundle_persona(
+    bundle: &heartwood_common::owner_pairing::BundleRequest,
+    name: &str,
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    master_slot: u8,
+    identity_caches: &mut [crate::identity_cache::IdentityCache],
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    personas: &mut Vec<crate::personas::LoadedPersona>,
+) -> Result<[u8; 32], (i32, String)> {
+    use heartwood_common::owner_pairing::BundleError;
+    let bundle_err = |e: BundleError| (e.code(), e.message().to_string());
+    let derive_secret = derivation_secret(master_secret, master_mode)
+        .map_err(|_| bundle_err(BundleError::NoPersonaTree))?;
+    let cache = identity_caches
+        .iter_mut()
+        .find(|c| c.master_slot == master_slot)
+        .ok_or((-4, "no identity cache for this master".to_string()))?;
+    let purpose = format!("nostr:persona:{name}");
+    let len_before = cache.identities.len();
+    let idx = cache
+        .derive_and_cache(&derive_secret, &purpose, 0, Some(name.to_string()))
+        .map_err(|e| (-4, e.to_string()))?;
+    let pubkey = cache.identities[idx].public_key;
+    let undo = |cache: &mut crate::identity_cache::IdentityCache| {
+        if cache.identities.len() > len_before {
+            cache.identities.truncate(len_before);
         }
-        _ => false,
+    };
+    if let Err(e) = heartwood_common::owner_pairing::check_expect(bundle, name, &pubkey) {
+        undo(cache);
+        return Err(bundle_err(e));
+    }
+    if !crate::personas::contains_pubkey(personas, &pubkey) {
+        if crate::personas::capacity_check(nvs).is_err() {
+            undo(cache);
+            return Err(bundle_err(BundleError::StorageFull));
+        }
+        if let Err(e) = crate::personas::add(nvs, master_slot, &purpose, 0, Some(name), &pubkey) {
+            undo(cache);
+            log::warn!("heartwood_approve_bundle: registry write failed — {e}");
+            return Err(if e.starts_with("identity storage full") {
+                bundle_err(BundleError::StorageFull)
+            } else {
+                (-4, e.to_string())
+            });
+        }
+        personas.push(crate::personas::LoadedPersona {
+            master_slot,
+            purpose,
+            index: 0,
+            name: Some(name.to_string()),
+            pubkey,
+        });
+    }
+    Ok(pubkey)
+}
+
+/// When the last FULL ACCESS card closed, in milliseconds since boot, on
+/// either transport (review round W3): the relay's card resolution and the
+/// cable's blocking loop both record it.
+static FULL_ACCESS_LAST_CLOSED_MS: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// The bundle whose FULL ACCESS card closed last, next to its close time
+/// (review round 3, S2): a late copy of it is dropped, not answered `shown
+/// recently` ([`is_closed_bundle_copy`]).
+static FULL_ACCESS_LAST_CLOSED_BUNDLE: std::sync::Mutex<Option<heartwood_common::owner_pairing::ClosedBundle>> =
+    std::sync::Mutex::new(None);
+
+/// A FULL ACCESS card has just closed, whatever its outcome; `bundle` is
+/// the bundle it held.
+pub(crate) fn full_access_closed(bundle: Option<heartwood_common::owner_pairing::BundleKey<'_>>) {
+    let now = crate::uptime_ms();
+    if let Ok(mut last) = FULL_ACCESS_LAST_CLOSED_MS.lock() {
+        *last = Some(now);
+    }
+    if let Ok(mut closed) = FULL_ACCESS_LAST_CLOSED_BUNDLE.lock() {
+        *closed = bundle.map(|bundle| heartwood_common::owner_pairing::ClosedBundle::new(&bundle, now));
+    }
+}
+
+/// Whether this request is a late copy of the bundle whose FULL ACCESS card
+/// closed last, inside the minute (`owner_pairing::is_closed_bundle_copy`,
+/// review round 3, S2). Dropped by the caller with no reply and no card,
+/// and the minute is not restarted. A poisoned lock is no copy: the bundle
+/// then meets the one-card rule, which refuses it.
+pub(crate) fn is_closed_bundle_copy(client_hex: &str, target_pk: &[u8; 32], request: &nip46::Nip46Request) -> bool {
+    use heartwood_common::owner_pairing::BundleKey;
+    let incoming = BundleKey { client_hex, target: target_pk, id: &request.id, params: &request.params };
+    FULL_ACCESS_LAST_CLOSED_BUNDLE.lock().is_ok_and(|closed| {
+        heartwood_common::owner_pairing::is_closed_bundle_copy(
+            closed.as_ref(),
+            &request.method,
+            &incoming,
+            crate::uptime_ms(),
+        )
+    })
+}
+
+/// Whether a bundle may raise a FULL ACCESS card now
+/// (`owner_pairing::full_access_admission`); `another_waiting` is whether a
+/// FULL ACCESS card is already queued or on screen. A poisoned lock refuses.
+pub(crate) fn full_access_admission(another_waiting: bool) -> Result<(), heartwood_common::owner_pairing::BundleError> {
+    let last = FULL_ACCESS_LAST_CLOSED_MS
+        .lock()
+        .map_err(|_| heartwood_common::owner_pairing::BundleError::ShownRecently)?;
+    heartwood_common::owner_pairing::full_access_admission(another_waiting, *last, crate::uptime_ms())
+}
+
+/// Whether a relay FULL ACCESS card is queued or on screen while the
+/// current request is dispatched; set only inside
+/// [`with_full_access_waiting`], false everywhere else (the USB-bridged loop
+/// has no relay cards, and a cable card blocks its loop, so nothing else can
+/// wait beside it).
+static FULL_ACCESS_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the relay's card queue would answer a bundle's card busy
+/// (`approval_queue::unshared_ask_busy`), set only inside
+/// [`with_full_access_waiting`]; false on the cable, whose card blocks.
+static FULL_ACCESS_QUEUE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set when a bundle dispatched inside [`with_full_access_waiting`] was
+/// refused because a FULL ACCESS card was waiting: the caller closes that
+/// card with the same reply.
+static FULL_ACCESS_RACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Dispatch with `waiting` (a relay FULL ACCESS card is queued or on
+/// screen) and `queue_busy` (the relay's card queue has no room for one
+/// more card, review round 2) visible to a bundle's one-card rule (review round W3), which
+/// runs inside `validate_bundle`, after the slot and before room and the
+/// registry (review round 2, S3), where the relay loop's card queue cannot
+/// be seen. Returns `f`'s result and whether a bundle was refused for that
+/// card, in which case the caller must close every waiting FULL ACCESS card
+/// with `AnotherFullAccess` (review round 2, S1: this is how a cable bundle
+/// closes a relay card too). Single-threaded: the relay loop and the
+/// USB-bridged loop never dispatch at once.
+pub(crate) fn with_full_access_waiting<R>(waiting: bool, queue_busy: bool, f: impl FnOnce() -> R) -> (R, bool) {
+    use std::sync::atomic::Ordering;
+    FULL_ACCESS_WAITING.store(waiting, Ordering::SeqCst);
+    FULL_ACCESS_QUEUE_BUSY.store(queue_busy, Ordering::SeqCst);
+    FULL_ACCESS_RACED.store(false, Ordering::SeqCst);
+    let out = f();
+    FULL_ACCESS_WAITING.store(false, Ordering::SeqCst);
+    FULL_ACCESS_QUEUE_BUSY.store(false, Ordering::SeqCst);
+    (out, FULL_ACCESS_RACED.swap(false, Ordering::SeqCst))
+}
+
+/// The one-card rule, and the relay queue's room, for a bundle that may
+/// raise its card on this pass (`owner_pairing::bundle_admission`). A
+/// poisoned lock refuses.
+fn bundle_admission() -> Result<(), heartwood_common::owner_pairing::BundleError> {
+    use std::sync::atomic::Ordering;
+    let waiting = FULL_ACCESS_WAITING.load(Ordering::SeqCst);
+    let queue_busy = FULL_ACCESS_QUEUE_BUSY.load(Ordering::SeqCst);
+    let admitted = match FULL_ACCESS_LAST_CLOSED_MS.lock() {
+        Ok(last) => heartwood_common::owner_pairing::bundle_admission(waiting, queue_busy, *last, crate::uptime_ms()),
+        Err(_) => Err(heartwood_common::owner_pairing::BundleError::ShownRecently),
+    };
+    if admitted == Err(heartwood_common::owner_pairing::BundleError::AnotherFullAccess) {
+        FULL_ACCESS_RACED.store(true, Ordering::SeqCst);
+    }
+    admitted
+}
+
+/// `heartwood_approve_bundle` (one-hold pairing spec 4.1-4.3), after the
+/// shared gates (an unbound client and a strict slot were refused there, an
+/// escalate slot by the relay planner and again here).
+///
+/// Every check of 4.1 runs first, in the settled order (param, persona
+/// target, slot, the one-card rule, room ending with room to save the slot
+/// table, registry and `expect`), on every
+/// pass: nothing is shown or changed when one fails, and the answer is its
+/// message alone. Keys the press would derive are computed now and compared
+/// with `expect` before the card. Then the FULL ACCESS card (5 s hold, 45 s
+/// window, never shared, never a verdict's to answer), never two at once
+/// and never within a minute of the last (review round W3, checked after
+/// the slot and before room and the registry on the passes that may raise
+/// the card, review round 2 S3). The press registers the missing names,
+/// then takes
+/// one slot step (snapshot, grants, mark, methods, signing, kinds) that is
+/// made durable before the reply, or rolled back. Other waiting cards are
+/// withdrawn by the slot step; this ask's own resume carries the authority
+/// epoch, so a slot change while it waited refuses it ("send the request
+/// again").
+#[allow(clippy::too_many_arguments)]
+fn approve_bundle(
+    request: nip46::Nip46Request,
+    resume: Resume,
+    master_secret: &[u8; 32],
+    master_mode: MasterMode,
+    master_slot: u8,
+    secp: &Arc<Secp256k1<SignOnly>>,
+    display: &mut Display<'_>,
+    buttons: &crate::button::Buttons<'_>,
+    policy_engine: &mut PolicyEngine,
+    identity_caches: &mut [crate::identity_cache::IdentityCache],
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    personas: &mut Vec<crate::personas::LoadedPersona>,
+    client_hex: &str,
+    approval: ApprovalDecision,
+    deferred: &mut Option<Box<DeferredAsk>>,
+) -> String {
+    use heartwood_common::owner_pairing::{self as op, BundleError};
+    let refuse = |e: BundleError| build_error_json(&request.id, e.code(), e.message());
+
+    // The param. A Heartwood context means nothing to the bundle (it names
+    // its personas itself), so a request carrying one is malformed rather
+    // than quietly served as some other identity.
+    if let Err(e) = op::parse_bundle_params(&request.params) {
+        return refuse(e);
+    }
+    if resume.explicit_context {
+        return refuse(BundleError::Malformed);
+    }
+    // The personas are the master's own: a request addressed to a persona
+    // would derive under that persona's tree. Refused here, before the slot,
+    // the room and the registry (review round 2, S2): it depends on none of
+    // them, and after the registry it told a guessing client, with no card,
+    // whether its `expect` matched (a match reached this refusal, a miss got
+    // `pubkey mismatch`).
+    if served_persona(personas, secp, master_secret).is_some() {
+        log::warn!("heartwood_approve_bundle: refused — addressed to a persona");
+        return build_error_json(&request.id, -1, nip46::PERSONA_DERIVE_NEEDS_MASTER);
+    }
+    // The slot, room (save room last), the registry and `expect`
+    // (`validate_bundle` runs the param check again; it is cheap). Direct
+    // USB has no client key and so no slot: the slot check refuses it.
+    let board = op::BundleBoard {
+        has_tree: derivation_secret(master_secret, master_mode).is_ok(),
+        registry_free: if crate::personas::capacity_check(nvs).is_err() {
+            0
+        } else {
+            usize::from(crate::personas::MAX_PERSONAS.saturating_sub(crate::personas::read_count(nvs)))
+        },
+    };
+    let slot = policy_engine.find_slot_by_pubkey(master_slot, client_hex);
+    // The one-card rule on the passes that may raise the card. Never on the
+    // pass a hold answered: the card it answered has just closed, and that
+    // re-run would refuse the owner's own approval as shown recently.
+    let may_raise_card = matches!(approval, ApprovalDecision::Deferred | ApprovalDecision::Interactive);
+    let admission = || if may_raise_card { bundle_admission() } else { Ok(()) };
+    // Room to save (the last room row, before the registry): the persona
+    // registrations the press makes first must fit without the cached
+    // avatars, and the slot table it then writes beside the one it replaces
+    // with them, or the owner would hold for a grant that `personas::add` or
+    // `persist_bind_or_rollback` then refuses. Those writes stay the
+    // authority; this makes their refusal rare. Stats read here, only once
+    // the earlier rows have passed, from the source FIRMWARE_INFO and
+    // `get_status` report. Every pass, the held one too: nothing is written
+    // before it. An unreadable registry refuses a press that registers.
+    let table = policy_engine.list_slots(master_slot);
+    let nvs_read: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault> = nvs;
+    let save_room = |checked: &op::BundleRequest, plan: &op::BundlePlan| {
+        let Some(slot) = slot else {
+            return Err(BundleError::Unauthorised);
+        };
+        let room = crate::nvs_stats::read().map(|stats| heartwood_common::nvs_room::NvsRoom {
+            free_entries: stats.free_entries,
+            total_entries: stats.total_entries,
+            reclaimable_entries: crate::policy::avatar_cache_entries(nvs_read),
+        });
+        let registry = crate::personas::registry_tail(nvs_read);
+        let verdict = op::check_bundle_save_room(table, slot, client_hex, checked, plan, room, registry);
+        if verdict.is_err() {
+            log::warn!(
+                "heartwood_approve_bundle: slot table would not fit in NVS ({:?})",
+                room.map(|r| (r.free_entries, r.reclaimable_entries))
+            );
+        }
+        verdict
+    };
+    let (bundle, plan) = match op::validate_bundle(&request.params, slot, client_hex, board, admission, save_room, |name| {
+        registered_persona(personas, master_slot, name)
+    }) {
+        Ok(checked) => checked,
+        Err(e) => {
+            log::warn!("heartwood_approve_bundle: refused — {}", e.message());
+            return refuse(e);
+        }
+    };
+    let Some(label) = slot.map(|slot| slot.label.clone()) else {
+        return refuse(BundleError::Unauthorised);
+    };
+    let Some(client_pubkey) = heartwood_common::policy::decode_client_key(client_hex) else {
+        return refuse(BundleError::Unauthorised);
+    };
+    // Keys the press would derive are pure computations: compare them with
+    // `expect` now, so a mismatch is refused before the card.
+    for (name, registered) in &plan.resolved {
+        if registered.is_some() {
+            continue;
+        }
+        match derive_identity(master_secret, master_mode, &format!("nostr:persona:{name}"), 0) {
+            Ok((_secret, pubkey)) => {
+                if let Err(e) = op::check_expect(&bundle, name, &pubkey) {
+                    return refuse(e);
+                }
+            }
+            Err(e) => {
+                log::warn!("heartwood_approve_bundle: derive failed — {e}");
+                return build_error_json(&request.id, -4, "key derivation failure");
+            }
+        }
+    }
+
+    // The FULL ACCESS card.
+    match approval {
+        ApprovalDecision::Deferred => {
+            *deferred = Some(Box::new(DeferredAsk {
+                card: AskCard::FullAccess {
+                    label,
+                    client_pubkey,
+                    act_as: bundle.act_as.clone(),
+                    style: bundle.style,
+                },
+                request,
+                event: None,
+                identity: None,
+                resume,
+            }));
+            return String::new();
+        }
+        // `device_press_only`: no guardian verdict answers this card.
+        ApprovalDecision::VerdictApproved => {
+            log::warn!("heartwood_approve_bundle: refused: a verdict cannot answer this card");
+            return build_error_json(&request.id, -1, heartwood_common::escalate::DEVICE_APPROVAL_REQUIRED);
+        }
+        ApprovalDecision::ButtonApproved => {}
+        ApprovalDecision::Interactive => {
+            // The one-card rule ran in `validate_bundle`. Nothing can wait
+            // beside this card while it blocks: in the USB-bridged loop
+            // there are no relay cards, and in the WiFi loop a relay FULL
+            // ACCESS card, even one whose window has passed, was seen by
+            // `with_full_access_waiting` and refused this bundle there.
+            let total = op::FULL_ACCESS_CARD_SECS;
+            let result = crate::approval::run_full_access_approval_loop(
+                display,
+                buttons,
+                total,
+                |d, remaining, page, armed| {
+                    crate::oled::show_full_access(
+                        d,
+                        &client_pubkey,
+                        &bundle.act_as,
+                        bundle.style,
+                        remaining,
+                        total as u32,
+                        page,
+                        armed,
+                    )
+                },
+                |d, pct| crate::oled::show_full_access_hold(d, &label, &client_pubkey, pct),
+            );
+            // A bundle addressed to a persona was refused above, so the
+            // identity it addresses is the master.
+            let target = secp256k1::Keypair::from_seckey_slice(secp, master_secret)
+                .map(|kp| kp.x_only_public_key().0.serialize())
+                .ok();
+            full_access_closed(target.as_ref().map(|target| op::BundleKey {
+                client_hex,
+                target,
+                id: &request.id,
+                params: &request.params,
+            }));
+            if let Some(response) = extension_approval_failure(&request.id, result) {
+                crate::oled::show_result(display, "Not approved");
+                return response;
+            }
+        }
+    }
+
+    // The press, step 1: every name resolved, or derived and registered.
+    let mut keys: Vec<(String, [u8; 32])> = Vec::with_capacity(plan.resolved.len());
+    for (name, registered) in &plan.resolved {
+        let pubkey = match registered {
+            Some(pubkey) => *pubkey,
+            None => match register_bundle_persona(
+                &bundle,
+                name,
+                master_secret,
+                master_mode,
+                master_slot,
+                identity_caches,
+                nvs,
+                personas,
+            ) {
+                Ok(pubkey) => pubkey,
+                Err((code, message)) => return build_error_json(&request.id, code, &message),
+            },
+        };
+        keys.push((name.clone(), pubkey));
+    }
+    let act_as: Vec<[u8; 32]> = bundle
+        .act_as
+        .iter()
+        .filter_map(|name| keys.iter().find(|(n, _)| n == name).map(|(_, key)| *key))
+        .collect();
+
+    // Steps 2 to 5: one durable slot step.
+    let snapshot = policy_engine.snapshot_slot_state(master_slot);
+    match policy_engine.apply_bundle_press(master_slot, client_hex, &act_as, bundle.style) {
+        Ok(changed) => {
+            if let Err(response) = persist_grant(policy_engine, nvs, master_slot, &request.id, snapshot, changed) {
+                return response;
+            }
+        }
+        Err(e) => {
+            policy_engine.restore_slot_state(snapshot);
+            log::warn!("heartwood_approve_bundle: press not applied — {}", e.message());
+            return refuse(e);
+        }
+    }
+    log::info!("heartwood_approve_bundle: owner pairing set ({} personas, style {})", keys.len(), bundle.style.as_str());
+    nip46::build_result_response(&request.id, &op::bundle_success_json(&keys, &bundle.act_as, bundle.style))
+        .unwrap_or_default()
+}
+
+/// `heartwood_owner_status` and `heartwood_owner_narrow` (one-hold pairing
+/// spec 4.1, 4.6), answered before the tier check with no card.
+///
+/// Status: `{"owner", "style"}` for the caller's slot, changing nothing;
+/// `owner` is false on a strict slot, and with no client (direct USB). A
+/// remote client must be slot-bound: an unbound one is refused, as every
+/// other slot question is.
+///
+/// Narrow: `{"v":1,"style":"careful"}` sets Extra careful's kinds list on
+/// the caller's own owner pairing when its list is empty and does nothing
+/// otherwise; it never widens, so it needs no press. The reply names the
+/// style now in force (`custom` for a list an operator narrowed).
+/// `unauthorised` without the mark. A change is durable before the reply,
+/// or rolled back.
+#[allow(clippy::too_many_arguments)]
+fn answer_owner_method(
+    request: &nip46::Nip46Request,
+    method: &nip46::Nip46Method,
+    policy_engine: &mut PolicyEngine,
+    nvs: &mut esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    master_slot: u8,
+    client_hex: &str,
+    has_client: bool,
+    client_is_bound: bool,
+) -> String {
+    use heartwood_common::owner_pairing::{self as op, BundleError};
+    let refuse = |e: BundleError| build_error_json(&request.id, e.code(), e.message());
+    match method {
+        nip46::Nip46Method::HeartwoodOwnerStatus => {
+            if has_client && !client_is_bound {
+                log::warn!("heartwood_owner_status: refused — unbound client");
+                return refuse(BundleError::Unauthorised);
+            }
+            let slot = has_client
+                .then(|| policy_engine.find_slot_by_pubkey(master_slot, client_hex))
+                .flatten();
+            nip46::build_result_response(&request.id, &op::owner_status_json(slot)).unwrap_or_default()
+        }
+        nip46::Nip46Method::HeartwoodOwnerNarrow => {
+            if let Err(e) = op::parse_narrow_params(&request.params) {
+                return refuse(e);
+            }
+            if !client_is_bound {
+                return refuse(BundleError::Unauthorised);
+            }
+            let snapshot = policy_engine.snapshot_slot_state(master_slot);
+            match policy_engine.owner_narrow(master_slot, client_hex) {
+                Ok((changed, style)) => {
+                    if let Err(response) =
+                        persist_grant(policy_engine, nvs, master_slot, &request.id, snapshot, changed)
+                    {
+                        return response;
+                    }
+                    if changed {
+                        log::info!("heartwood_owner_narrow: pairing narrowed to Extra careful");
+                    }
+                    nip46::build_result_response(&request.id, &op::owner_narrow_json(style, changed)).unwrap_or_default()
+                }
+                Err(e) => refuse(e),
+            }
+        }
+        // Only the two methods above are answered before the tier.
+        _ => build_error_json(&request.id, -2, "unknown method"),
     }
 }
 
@@ -486,6 +938,18 @@ pub enum AskCard {
         /// The request code's words (`phone_unlock::request_words`), which
         /// the owner compares with the phone that made the key.
         words: [&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS],
+    },
+    /// The setup hold, `heartwood_approve_bundle` (one-hold pairing spec
+    /// 4.2): the inverted FULL ACCESS card, a 5 s hold, a 45 s window, never
+    /// shared. Its lines come from `owner_pairing::full_access_card`: the
+    /// pairing's `label`, the five words of `client_pubkey` (paged at rest,
+    /// all on the hold screen), the scope
+    /// `act_as` grants and the `style`'s lines.
+    FullAccess {
+        label: String,
+        client_pubkey: [u8; 32],
+        act_as: Vec<String>,
+        style: heartwood_common::owner_pairing::Style,
     },
 }
 
@@ -877,6 +1341,14 @@ fn dispatch_inner(
     let has_client = !client_hex.is_empty();
     let client_is_bound =
         has_client && policy_engine.find_slot_by_pubkey(master_slot, &client_hex).is_some();
+    // One-hold pairing (spec 4.1, 4.6): the owner-status probe and narrow are
+    // answered here, before the tier check, with no card, for the caller's
+    // own slot. The tier is decided from the method name alone, so left to
+    // it they would prompt (legacy), be refused (strict) or be parked for a
+    // guardian (escalate), and a status question must do none of those.
+    if method.answered_before_tier() {
+        return answer_owner_method(&request, &method, policy_engine, nvs, master_slot, &client_hex, has_client, client_is_bound);
+    }
     let requester_label = if has_client {
         format!("{} {}", &client_hex[..8], signing_requester_label(policy_engine, master_slot, &client_hex))
     } else {
@@ -1056,8 +1528,11 @@ fn dispatch_inner(
     if rederive_lookup {
         log::info!("{}: an existing persona this app may act as; no card", request.method);
     }
+    // The setup hold raises its own FULL ACCESS card below, never the
+    // generic extension card.
     let own_card = !spend_granted
         && !rederive_lookup
+        && !method.always_shows_own_card()
         && !matches!(gate_card, Some(CardKind::SwitchTo { .. }))
         && remote_extension_requires_approval(has_client, &method, tier);
 
@@ -1113,6 +1588,34 @@ fn dispatch_inner(
                 return build_error_json(&request.id, -1, "identity approved; send the request again");
             }
         }
+    }
+
+    // One-hold pairing (spec 4.1, 4.3): the setup hold. Validated before its
+    // card, on every pass (a resumed ask is checked again against the
+    // registry; the slot's authority epoch was checked above), then the
+    // FULL ACCESS card and its 5 s hold, then one durable slot step.
+    if matches!(method, nip46::Nip46Method::HeartwoodApproveBundle) {
+        return approve_bundle(
+            request,
+            Resume {
+                authority_epoch: policy_engine.approval_epoch(),
+                explicit_context: explicit_heartwood_context,
+                shown: shown_now,
+            },
+            master_secret,
+            master_mode,
+            master_slot,
+            secp,
+            display,
+            buttons,
+            policy_engine,
+            identity_caches,
+            nvs,
+            personas,
+            &client_hex,
+            approval,
+            deferred,
+        );
     }
 
     // The gate's own card, before the method's flow: ALLOW AS <identity>?
@@ -1762,7 +2265,8 @@ fn dispatch_inner(
                     // request fails when the write fails (#67) — a success
                     // answer must mean the persona survives reboot.
                     let pubkey = cache.identities[idx].public_key;
-                    if !crate::personas::contains_pubkey(personas, &pubkey) {
+                    let newly_registered = !crate::personas::contains_pubkey(personas, &pubkey);
+                    if newly_registered {
                         if let Err(full) = crate::personas::capacity_check(nvs) {
                             if cache.identities.len() > len_before {
                                 cache.identities.truncate(len_before);
@@ -1795,6 +2299,28 @@ fn dispatch_inner(
                             name: reg_name,
                             pubkey,
                         });
+                    }
+                    // Rule D (one-hold pairing spec 6): on an owner pairing, a
+                    // derive that newly registered this name records it for
+                    // the client that made it, card-approved or auto-approved
+                    // alike, while the grant list has room. Never a real
+                    // identity (`natural-person`, `dependant-<n>-np`), never a
+                    // lookup of a name already registered. Durable before the
+                    // answer, like every grant.
+                    if newly_registered
+                        && has_client
+                        && policy_engine
+                            .find_slot_by_pubkey(master_slot, &client_hex)
+                            .is_some_and(|slot| heartwood_common::owner_pairing::rule_d_records(slot, name, true))
+                    {
+                        let snapshot = policy_engine.snapshot_slot_state(master_slot);
+                        let changed = policy_engine.record_identity(master_slot, Ok(&client_hex), &pubkey);
+                        if let Err(response) =
+                            persist_grant(policy_engine, nvs, master_slot, &request.id, snapshot, changed)
+                        {
+                            return response;
+                        }
+                        log::info!("heartwood_derive_persona: recorded for its owner pairing (Rule D)");
                     }
                     let id = &cache.identities[idx];
                     let result = serde_json::json!({
@@ -2109,6 +2635,12 @@ fn dispatch_inner(
                 "heartwood_note_address_proof",
                 "heartwood_pair_wallet",
                 "heartwood_provision_rendezvous",
+                // One-hold pairing (spec 4.1, 4.5, 4.6). The owner mark
+                // (`heartwood_owner_vault`) is not a method and is never
+                // listed.
+                "heartwood_approve_bundle",
+                "heartwood_owner_status",
+                "heartwood_owner_narrow",
             ];
             nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
         }
@@ -2304,7 +2836,15 @@ pub(crate) fn plan_gate(
     } else {
         None
     };
-    let gate = policy_engine.gate(
+    // Rule V (one-hold pairing spec 6) counts only a context the CALLER
+    // supplied: a vault purpose set as a session's active identity
+    // (`resolve_active_context`) is no vault context. Built here, once, so
+    // the handler and the relay's pre-dispatch planner build it the same way.
+    let vault = heartwood_common::owner_pairing::VaultContext::from_explicit(
+        context.filter(|_| explicit_context).map(|c| c.purpose.as_str()),
+        event_kind,
+    );
+    let gate = policy_engine.gate_with_vault(
         master_slot,
         client_hex,
         has_client,
@@ -2315,6 +2855,7 @@ pub(crate) fn plan_gate(
         explicit_context,
         context.is_some(),
         identity.as_ref(),
+        vault,
     );
     Ok((gate, identity))
 }
@@ -3033,11 +3574,10 @@ mod tests {
 
     use heartwood_common::policy::{gate_request, Gate, GateRequest};
 
-    use super::{
-        connect_success_response, extension_approval_failure,
-        remote_extension_requires_approval, request_may_mutate_slot_state,
-        unbound_remote_request_denied,
-    };
+    // The pure gates' own tests (unbound refusal, the central extension
+    // gate, the slot-mutation snapshot table) are in nip46_gates.rs, where
+    // common's host build runs them.
+    use super::{connect_success_response, extension_approval_failure, remote_extension_requires_approval};
     use crate::approval::ApprovalResult;
     use crate::policy::PolicyEngine;
 
@@ -3173,30 +3713,6 @@ mod tests {
     }
 
     #[test]
-    fn unbound_remote_clients_cannot_enter_physical_approval_loops() {
-        for method_name in ["sign_event", "heartwood_derive", "heartwood_switch"] {
-            let method = nip46::Nip46Method::from_str(method_name);
-            assert!(
-                unbound_remote_request_denied(true, false, &method),
-                "{method_name} would let a stranger occupy the relay loop",
-            );
-            assert!(
-                !unbound_remote_request_denied(true, true, &method),
-                "a slot-bound client must retain physical approval fallback",
-            );
-            assert!(
-                !unbound_remote_request_denied(false, false, &method),
-                "direct USB retains physical-possession approval",
-            );
-        }
-
-        for method_name in ["connect", "ping", "get_public_key", "heartwood_capabilities"] {
-            let method = nip46::Nip46Method::from_str(method_name);
-            assert!(!unbound_remote_request_denied(true, false, &method));
-        }
-    }
-
-    #[test]
     fn exact_slots_reject_caller_selected_derived_identity_context() {
         // The gate is deliberately method-independent: get_public_key,
         // sign_event and every standard crypto method could otherwise resolve
@@ -3253,67 +3769,6 @@ mod tests {
         let timed_out: serde_json::Value = serde_json::from_str(&timed_out).unwrap();
         assert_eq!(timed_out["id"], "timed-out");
         assert_eq!(timed_out["error"], "timeout");
-    }
-
-    #[test]
-    fn central_extension_gate_excludes_usb_sign_event_and_remote_crypto() {
-        let derive = nip46::Nip46Method::HeartwoodDerive;
-        assert!(!remote_extension_requires_approval(
-            false,
-            &derive,
-            ApprovalTier::ButtonRequired,
-        ));
-        assert!(!remote_extension_requires_approval(
-            true,
-            &nip46::Nip46Method::SignEvent,
-            ApprovalTier::ButtonRequired,
-        ));
-        assert!(!remote_extension_requires_approval(
-            true,
-            &nip46::Nip46Method::Nip44Decrypt,
-            ApprovalTier::ButtonRequired,
-        ));
-    }
-
-    #[test]
-    fn slot_mutation_snapshot_is_needed_only_for_connect_binding_or_first_sign() {
-        let connect: nip46::Nip46Request = serde_json::from_value(serde_json::json!({
-            "id": "connect",
-            "method": "connect",
-            "params": [CLIENT_HEX, "22".repeat(32)]
-        }))
-        .unwrap();
-        assert!(request_may_mutate_slot_state(
-            &connect,
-            ApprovalTier::AutoApprove,
-        ));
-
-        let reconnect_without_secret: nip46::Nip46Request =
-            serde_json::from_value(serde_json::json!({
-                "id": "connect",
-                "method": "connect",
-                "params": [CLIENT_HEX]
-            }))
-            .unwrap();
-        assert!(!request_may_mutate_slot_state(
-            &reconnect_without_secret,
-            ApprovalTier::AutoApprove,
-        ));
-
-        let sign: nip46::Nip46Request = serde_json::from_value(serde_json::json!({
-            "id": "sign",
-            "method": "sign_event",
-            "params": [{}]
-        }))
-        .unwrap();
-        assert!(request_may_mutate_slot_state(
-            &sign,
-            ApprovalTier::ButtonRequired,
-        ));
-        assert!(!request_may_mutate_slot_state(
-            &sign,
-            ApprovalTier::AutoApprove,
-        ));
     }
 
     #[test]

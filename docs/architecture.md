@@ -16,7 +16,7 @@ flowchart LR
     end
 
     subgraph Public["Public Nostr"]
-        Relays[("Nostr relays<br/>damus, nos.lol, trotters")]
+        Relays[("Nostr relays<br/>damus, nos.lol, primal")]
     end
 
     subgraph Home["Home — mypi (Pi)"]

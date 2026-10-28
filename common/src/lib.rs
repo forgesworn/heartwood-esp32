@@ -87,6 +87,11 @@ pub mod relay_cooldown;
 /// Getting back to the first configured relay after the rotation moved off it.
 pub mod home_relay;
 
+/// NIP-42 sign-in for the relay loop: the fixed kind-22242 shape, the relay's
+/// AUTH/OK/CLOSED frames, and when to re-send a subscription or back off.
+#[cfg(feature = "nip46")]
+pub mod relay_auth;
+
 pub mod wrap_ledger;
 
 pub mod rendezvous_receipts;

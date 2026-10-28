@@ -367,7 +367,17 @@ pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bo
     )
 }
 
-pub mod nvs { pub use super::{fits, growth_allowed, write_blocked, EspNvs, NvsDefault, ReplaceBlob}; }
+/// Stands in for the firmware's `crate::nvs::growth_run`.
+pub fn growth_run(nvs: &EspNvs<NvsDefault>, steps: &[(Option<usize>, usize)]) -> usize {
+    let state = nvs.backend.inner.borrow();
+    let largest = heartwood_common::nvs_budget::hot_keys()
+        .filter_map(|k| state.store.get(&k).map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    heartwood_common::nvs_budget::growth_run(state.available(), largest, steps.iter().copied())
+}
+
+pub mod nvs { pub use super::{fits, growth_allowed, growth_run, write_blocked, EspNvs, NvsDefault, ReplaceBlob}; }
 
 #[path = "../../firmware/src/policy.rs"]
 pub mod engine;
@@ -1548,6 +1558,36 @@ fn board_with_personas(n: u8) -> EspNvs<NvsDefault> {
         personas::add(&mut nvs, 0, "purpose-of-some-length", i as u32, Some("a persona name"), &persona_key(i + 1)).unwrap();
     }
     nvs
+}
+
+#[test]
+fn a_bundle_pre_check_gates_every_name_as_add_will() {
+    // Review finding D. Across a range of headroom, the pre-check never
+    // promises more registrations than `add` then makes, and somewhere near
+    // the limit it is what tells one name from two.
+    let mut two_refused = false;
+    for headroom in 0..400 {
+        let mut nvs = board_with_personas(3);
+        nvs.backend.limit_headroom(headroom);
+        let one = personas::registrations_that_fit(&nvs, 1);
+        assert_eq!(one == 1, personas::capacity_check(&nvs).is_ok(), "one name is capacity_check ({headroom})");
+        let promised = personas::registrations_that_fit(&nvs, 2);
+        let mut added = 0;
+        for i in 0..2u8 {
+            match personas::add(&mut nvs, 0, "purpose-of-some-length", 10 + u32::from(i), Some("a persona name"), &persona_key(0x40 + i)) {
+                Ok(()) => added += 1,
+                Err(_) => break,
+            }
+        }
+        assert!(added >= promised, "promised {promised}, added {added} ({headroom})");
+        if one == 1 && promised == 1 {
+            two_refused = true;
+        }
+    }
+    assert!(two_refused, "some headroom lets one name through the card and not two");
+    // The count cap is part of it.
+    let nvs = board_with_personas(personas::MAX_PERSONAS - 1);
+    assert_eq!(personas::registrations_that_fit(&nvs, 2), 1);
 }
 
 #[test]

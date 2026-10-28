@@ -422,11 +422,9 @@ fn approve_bundle(
     // USB has no client key and so no slot: the slot check refuses it.
     let board = op::BundleBoard {
         has_tree: derivation_secret(master_secret, master_mode).is_ok(),
-        registry_free: if crate::personas::capacity_check(nvs).is_err() {
-            0
-        } else {
-            usize::from(crate::personas::MAX_PERSONAS.saturating_sub(crate::personas::read_count(nvs)))
-        },
+        // Every name the press could register, each through the gate
+        // `personas::add` applies, as if the names before it were written.
+        registry_free: crate::personas::registrations_that_fit(nvs, op::MAX_BUNDLE_PERSONAS),
     };
     let slot = policy_engine.find_slot_by_pubkey(master_slot, client_hex);
     // The one-card rule on the passes that may raise the card. Never on the

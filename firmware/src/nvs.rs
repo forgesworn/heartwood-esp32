@@ -176,6 +176,22 @@ pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bo
     nvs_budget::growth_allowed(stats.available_entries, old_len, new_len, largest_hot)
 }
 
+/// How many of `steps` growths written one after another (each a hot blob's
+/// current length and new length, in write order) [`growth_allowed`] would
+/// let through in turn (`nvs_budget::growth_run`): the gate a press that
+/// grows several blobs meets at each write, judged before the card. 0 when
+/// the numbers cannot be read.
+pub fn growth_run(nvs: &EspNvs<NvsDefault>, steps: &[(Option<usize>, usize)]) -> usize {
+    let Some(stats) = crate::nvs_stats::read() else {
+        return 0;
+    };
+    let largest_hot = nvs_budget::hot_keys()
+        .filter_map(|k| nvs.blob_len(&k).ok().flatten())
+        .max()
+        .unwrap_or(0);
+    nvs_budget::growth_run(stats.available_entries, largest_hot, steps.iter().copied())
+}
+
 const NVS_NAMESPACE: &str = "heartwood";
 const NVS_KEY: &str = "root_secret";
 

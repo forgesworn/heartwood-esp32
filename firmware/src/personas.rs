@@ -366,6 +366,34 @@ pub fn capacity_check(nvs: &EspNvs<NvsDefault>) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// How many more personas, up to `wanted`, `add` would register one after
+/// another: the count cap, then the growth gate on each name's chunk with a
+/// full-size entry, as [`capacity_check`] judges one (`nvs::growth_run`).
+/// The pre-card check for a press that registers several names, so the
+/// second cannot pass the card on the first's room and fail after the hold.
+/// Stops at a chunk whose length cannot be read.
+pub fn registrations_that_fit(nvs: &EspNvs<NvsDefault>, wanted: usize) -> usize {
+    let count = read_count(nvs);
+    let room = usize::from(MAX_PERSONAS.saturating_sub(count)).min(wanted);
+    let mut steps = Vec::with_capacity(room);
+    // The chunk the previous name grew, and the length it left it at.
+    let mut previous: Option<(u8, usize)> = None;
+    for entry in (count..MAX_PERSONAS).take(room) {
+        let chunk = chunk_index(entry);
+        let old = match previous {
+            Some((grown, len)) if grown == chunk => Some(len),
+            _ => match nvs.blob_len(&chunk_key(chunk)) {
+                Ok(len) => len,
+                Err(_) => break,
+            },
+        };
+        let new = old.unwrap_or(0) + MAX_ENTRY_LEN;
+        steps.push((old, new));
+        previous = Some((chunk, new));
+    }
+    crate::nvs::growth_run(nvs, &steps)
+}
+
 /// Refusal when a persona would leave too little NVS room to rewrite the
 /// pairing tables, phone records and persona chunks in place.
 const STORAGE_FULL: &str =

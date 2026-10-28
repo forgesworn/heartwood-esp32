@@ -228,6 +228,31 @@ pub fn growth_allowed(available: usize, old_len: Option<usize>, new_len: usize, 
     after >= blob_entries(largest_hot.max(new_len)) + small_write_reserve()
 }
 
+/// How many of `steps`, growths written one after another (each a hot
+/// blob's current length, or `None`, and its new length), [`growth_allowed`]
+/// lets through in turn, stopping at the first refusal: the gate each write
+/// would meet, judged before any of them. Each step that passes is taken as
+/// written: it uses [`blob_entries`] of its new length and frees
+/// [`stored_entries_min`] of its old one, the bounds the gate already uses,
+/// so a real write leaves at least the room this assumes, and its new length
+/// joins the hot blobs the later steps must keep room to rewrite.
+pub fn growth_run(
+    mut available: usize,
+    mut largest_hot: usize,
+    steps: impl IntoIterator<Item = (Option<usize>, usize)>,
+) -> usize {
+    let mut passed = 0;
+    for (old_len, new_len) in steps {
+        if !growth_allowed(available, old_len, new_len, largest_hot) {
+            break;
+        }
+        available = available - blob_entries(new_len) + old_len.map_or(0, stored_entries_min);
+        largest_hot = largest_hot.max(new_len);
+        passed += 1;
+    }
+    passed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +378,34 @@ mod tests {
         // its in-place rewrite.
         assert!(!growth_allowed(200, Some(100), 300, 6000));
         assert!(growth_allowed(500, Some(100), 300, 6000));
+    }
+
+    #[test]
+    fn a_run_of_growths_is_judged_as_if_each_earlier_one_was_written() {
+        // One step is exactly the gate.
+        for available in [150, 200, 250, 300, 400] {
+            assert_eq!(
+                growth_run(available, 2000, [(Some(1000), 1150)]),
+                usize::from(growth_allowed(available, Some(1000), 1150, 2000)),
+                "{available}"
+            );
+        }
+        // The least room in which each of two 150-byte growths of a chunk
+        // would pass on its own, judged against today's board.
+        let available = (100..1000)
+            .find(|&a| growth_allowed(a, Some(1150), 1300, 2000))
+            .unwrap();
+        assert!(growth_allowed(available, Some(1000), 1150, 2000), "the first alone passes too");
+        // But after the first is written, the second does not.
+        assert_eq!(growth_run(available, 2000, [(Some(1000), 1150), (Some(1150), 1300)]), 1);
+        // With room for both, both pass; a refusal stops the run.
+        assert_eq!(growth_run(available + 200, 2000, [(Some(1000), 1150), (Some(1150), 1300)]), 2);
+        assert_eq!(growth_run(0, 2000, [(Some(1000), 1150), (None, 100)]), 0);
+        // A step that grows past the largest hot blob raises what later
+        // steps must keep room for.
+        let big = growth_run(10_000, 0, [(None, 9000), (None, 100)]);
+        let small = growth_run(10_000, 0, [(None, 100), (None, 100)]);
+        assert!(big <= small);
     }
 
     /// Every firmware blob write goes through `nvs::ReplaceBlob`. esp-idf-svc's

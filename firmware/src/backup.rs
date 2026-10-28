@@ -106,7 +106,9 @@ pub fn handle_export(
     let mut masters = Vec::new();
     for m in loaded_masters {
         let pubkey_hex = hex_encode(&m.pubkey);
-        let slots = policy_engine.list_slots(m.slot).to_vec();
+        // Without the owner mark (spec 5.2): an older firmware's import
+        // refuses the whole backup over one name it does not know.
+        let slots = policy_engine.exported_slots(m.slot);
 
         masters.push(BackupMaster {
             slot: m.slot,

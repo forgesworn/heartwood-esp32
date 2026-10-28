@@ -8,11 +8,8 @@
 // needed later in the boot to change the PIN or vault key without re-sealing,
 // and to enrol a phone. A plaintext board never has one.
 
-use std::sync::Mutex;
-
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
-use heartwood_common::data_key::{BlobStore, Platform, StoreError, DK_LEN, MAX_PHONES_BLOB_LEN};
-use zeroize::Zeroize;
+use heartwood_common::data_key::{BlobStore, Platform, StoreError, MAX_PHONES_BLOB_LEN};
 
 /// Nothing this module stores is larger than the packed phone records.
 const MAX_BLOB: usize = MAX_PHONES_BLOB_LEN;
@@ -128,25 +125,4 @@ pub fn set_announce_operator(nvs: &mut EspNvs<NvsDefault>, on: bool) -> Result<(
     }
 }
 
-static DATA_KEY: Mutex<Option<[u8; DK_LEN]>> = Mutex::new(None);
-
-/// This boot's data key, if it has one.
-pub fn current() -> Option<[u8; DK_LEN]> {
-    *DATA_KEY.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-pub fn remember(dk: [u8; DK_LEN]) {
-    let mut slot = DATA_KEY.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(old) = slot.as_mut() {
-        old.zeroize();
-    }
-    *slot = Some(dk);
-}
-
-pub fn forget() {
-    let mut slot = DATA_KEY.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(old) = slot.as_mut() {
-        old.zeroize();
-    }
-    *slot = None;
-}
+pub use crate::held_data_key::{current, forget, remember};

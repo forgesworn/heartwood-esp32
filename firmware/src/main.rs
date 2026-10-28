@@ -43,6 +43,7 @@ mod backup;
 mod bigtext;
 mod board;
 mod button;
+mod card_hold;
 mod confirm;
 mod connslot;
 mod entropy;
@@ -58,6 +59,10 @@ mod display_flip;
 mod management_challenge;
 mod palette;
 mod masters;
+mod master_identity;
+mod held_data_key;
+mod allocation_root;
+mod nip46_gates;
 mod nip46_handler;
 mod notes;
 mod personas;
@@ -280,6 +285,11 @@ pub fn uptime_s() -> u64 {
     (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u64
 }
 
+/// Milliseconds since boot, on the same clock as [`uptime_s`].
+pub fn uptime_ms() -> u64 {
+    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000) as u64
+}
+
 /// One page of the idle info carousel in the USB-bridged loop. Page 0 is the
 /// boot status card; short presses cycle the network, device and notes pages. The
 /// radio is off by definition here — the WiFi tier runs its own loop — so the
@@ -474,6 +484,24 @@ fn offer_removal_recovery_wipe(
     }
 }
 
+/// Storage failure is not first use. Stay before seed loading and all command
+/// processing; do not retry initialization, erase, or offer a wipe as repair.
+fn storage_boot_hold(display: &mut oled::Display<'_>) -> ! {
+    boot_hold(display, "STORAGE HOLD\nPreserve device\nRecovery needed");
+}
+
+fn crypto_boot_hold(display: &mut oled::Display<'_>) -> ! {
+    boot_hold(display, "CRYPTO HOLD\nPreserve device\nRecovery needed");
+}
+
+fn boot_hold(display: &mut oled::Display<'_>, message: &str) -> ! {
+    oled::show_error(display, message);
+    loop {
+        wdt::feed();
+        esp_idf_hal::delay::FreeRtos::delay_ms(100);
+    }
+}
+
 fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -509,10 +537,32 @@ fn main() {
     // --- Boot animation ---
     oled::show_boot_animation(&mut display);
 
+    // Link and exercise the actual strict receipt backend before opening NVS
+    // or loading keys. Known-answer failure never selects the OTA verifier.
+    wdt::feed();
+    if !allocation_root::crypto_backend_ready() {
+        log::error!("Allocation crypto self-check failed");
+        crypto_boot_hold(&mut display);
+    }
+    wdt::feed();
+
     // --- NVS init ---
-    let nvs_partition = EspDefaultNvsPartition::take().expect("failed to take NVS partition");
-    let mut nvs =
-        EspNvs::new(nvs_partition.clone(), "heartwood", true).expect("NVS namespace init failed");
+    // take() enables erase/reinitialization on NO_FREE_PAGES/NEW_VERSION_FOUND.
+    // Preserve the partition instead: neither error proves that it is disposable.
+    let nvs_partition = match EspDefaultNvsPartition::take_with(false) {
+        Ok(partition) => partition,
+        Err(error) => {
+            log::error!("NVS boot initialization failed (code={})", error.code());
+            storage_boot_hold(&mut display);
+        }
+    };
+    let mut nvs = match EspNvs::new(nvs_partition.clone(), "heartwood", true) {
+        Ok(nvs) => nvs,
+        Err(error) => {
+            log::error!("NVS boot namespace open failed (code={})", error.code());
+            storage_boot_hold(&mut display);
+        }
+    };
 
     // Bearer-note locker (own namespace; never fatal — a broken locker must
     // not take the signer down, it just reports unavailable and refuses).
@@ -1300,6 +1350,11 @@ fn main() {
                         &mut policy_engine,
                         &mut identity_caches,
                         &mut nvs,
+                        // No relay cards in this loop, but a late copy of
+                        // the bundle whose cable card just closed is NACKed
+                        // here too (review round 3, F3), as in the WiFi loop.
+                        false,
+                        &nip46_handler::is_closed_bundle_copy,
                     );
                 }
             }

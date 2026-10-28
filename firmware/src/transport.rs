@@ -66,6 +66,8 @@ pub fn persist_fresh_identities(
 ///
 /// Payload layout: [master_pubkey_32][client_pubkey_32][created_at_u64_be_8][ciphertext_b64...]
 ///
+/// `bundle_only`: see the parameter.
+///
 /// Decrypts the NIP-44 ciphertext using the target master's secret,
 /// dispatches to the NIP-46 handler, re-encrypts the response, then
 /// builds and signs a kind:24133 envelope event inline. The signed
@@ -82,6 +84,17 @@ pub fn handle_encrypted_request(
     policy_engine: &mut PolicyEngine,
     identity_caches: &mut Vec<crate::identity_cache::IdentityCache>,
     nvs: &mut EspNvs<NvsDefault>,
+    // WiFi loop only: the screen is busy with a relay card, and that card
+    // is FULL ACCESS. Only a `heartwood_approve_bundle` is dispatched (it is
+    // refused before any card of its own, and closes the relay card); any
+    // other request gets "approval on screen", as it did before the decrypt.
+    bundle_only: bool,
+    // WiFi loop only: whether a request (client hex, addressed identity,
+    // request) is a copy of the bundle a waiting relay FULL ACCESS card
+    // holds, or of the bundle whose card closed inside the last minute
+    // (review round 3, S2). The USB-bridged loop has no relay cards and
+    // passes a check that never matches.
+    is_waiting_copy: &dyn Fn(&str, &[u8; 32], &nip46::Nip46Request) -> bool,
 ) {
     if frame.payload.len() < 73 {
         log::warn!("Encrypted request too short ({} bytes)", frame.payload.len());
@@ -139,15 +152,6 @@ pub fn handle_encrypted_request(
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
         return;
     };
-
-    // A persona connection must operate as the persona for every inner method,
-    // so clear any session active-identity (set by a legacy heartwood_switch)
-    // that would otherwise double-derive on top of the persona secret.
-    if is_persona {
-        if let Some(session) = policy_engine.get_or_create_session(client_pubkey, owning_slot) {
-            session.active_identity = None;
-        }
-    }
 
     // Derive conversation key.
     let conversation_key = match nip44::get_conversation_key(&signing_secret, &client_pubkey) {
@@ -215,6 +219,40 @@ pub fn handle_encrypted_request(
     };
     drop(plaintext_json);
 
+    if bundle_only && request.method != heartwood_common::owner_pairing::BUNDLE_METHOD {
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+        return;
+    }
+
+    // A copy of the bundle a relay FULL ACCESS card already holds (the
+    // owner's own bundle, bridged over the cable as well as heard on the
+    // relay) is not a second bundle and must not close that card (review
+    // round 3, S2); a late copy of the bundle whose card just closed must
+    // not be answered `shown recently`. It is NACKed before dispatch, so the one-card rule never
+    // sees it. A NACK and not silence: heartwoodd waits up to 60 s for a
+    // reply and then shuts its serial session down, and it logs a NACK and
+    // publishes nothing, so the phone hears only the card's real outcome
+    // for this request id. A NIP-46 error here would be signed and
+    // published as that outcome.
+    if is_waiting_copy(&hex_encode(&client_pubkey), &master_pubkey, &request) {
+        log::info!("heartwood_approve_bundle {} over the cable is a copy of the bundle on its card; NACK", request.id);
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"bundle already on screen");
+        return;
+    }
+
+    // A persona connection must operate as the persona for every inner method,
+    // so clear any session active-identity (set by a legacy heartwood_switch)
+    // that would otherwise double-derive on top of the persona secret. Only
+    // once the frame has decrypted as this client's (only the holder of its
+    // key can make that ciphertext) and is going to be dispatched: any host
+    // on the cable can name any client key in the header, and must not reach
+    // another client's session state with garbage, under a card or not.
+    if is_persona {
+        if let Some(session) = policy_engine.get_or_create_session(client_pubkey, owning_slot) {
+            session.active_identity = None;
+        }
+    }
+
     let client_pubkey_hex = hex_encode(&client_pubkey);
     let request_id = request.id.clone();
     let slot_snapshot = {
@@ -227,7 +265,10 @@ pub fn handle_encrypted_request(
         let login = matches!(method, nip46::Nip46Method::SignEvent)
             && nip46::unsigned_event_is_login_challenge(&request.params);
         let tier = policy_engine.check_for_event(owning_slot, &client_pubkey_hex, &method, event_kind, login);
-        crate::nip46_handler::request_may_mutate_slot_state(&request, tier)
+        let owner_pairing = policy_engine
+            .find_slot_by_pubkey(owning_slot, &client_pubkey_hex)
+            .is_some_and(heartwood_common::owner_pairing::is_owner_pairing);
+        crate::nip46_handler::request_may_mutate_slot_state(&request, tier, owner_pairing)
             .then(|| policy_engine.snapshot_slot_state(owning_slot))
     };
 

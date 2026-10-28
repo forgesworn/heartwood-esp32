@@ -1,6 +1,6 @@
 [package]
 name = "heartwood-esp32"
-version = "0.18.0-beta.28"
+version = "0.18.0-beta.29"
 edition = "2021"
 description = "nsec-tree signing device firmware for Heltec WiFi LoRa 32 (V3 and V4)"
 license = "MIT"
@@ -41,6 +41,8 @@ sha-accel = []
 # exercises the mismatch path (log, fall back to software, never derive a key
 # with the failed engine). Never enable this in an image anyone will use.
 sha-selfcheck-fail = ["sha-accel"]
+# BENCH ONLY: hold before NVS/key loading; never enable in a usable release.
+allocation-crypto-selfcheck-fail = []
 
 # Branded board-check demo (deliberately NOT the signer): title screen, button
 # check, and a two-button jump-and-duck game. Ships pre-flashed on boards sold
@@ -50,6 +52,12 @@ sha-selfcheck-fail = ["sha-accel"]
 demo-game = []
 
 [dependencies]
+chacha20poly1305 = { version = "=0.10.1", default-features = false }
+hmac = { version = "0.12", default-features = false }
+# Shared strict receipt codec; immutable reviewed public source, no std/RNG.
+vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "e6985dd9583207853ffa9f5224b33e05d5094010", default-features = false }
+# Writer public-key derivation uses the same backend; secret keys erase on Drop.
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
 heartwood-common = { path = "../common", default-features = false, features = ["compact-hashes", "nip46", "nip44", "nip04", "secp256k1-backend", "mnemonic-gen", "ota-sign", "device-identity", "seed-encrypt", "cash"] }
 
 # Crypto — libsecp256k1 C FFI (alignment-safe on Xtensa, unlike k256)

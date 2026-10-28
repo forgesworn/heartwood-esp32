@@ -10,6 +10,9 @@
 use core::ffi::{c_char, c_void};
 use core::fmt;
 
+#[cfg(test)]
+use crate::persistent_wipe_host_sys as sys;
+#[cfg(not(test))]
 use esp_idf_svc::sys;
 use heartwood_common::persistent_state::{PersistentRegion, PERSISTENT_WIPE_ORDER};
 
@@ -61,7 +64,9 @@ fn region_name(region: PersistentRegion) -> &'static str {
 /// `config` is deliberately first. If it is absent (old partition tables), it
 /// is already incapable of reseeding NVS and is treated as blank. NVS itself
 /// is mandatory: a missing NVS partition is an error, not a successful reset.
-/// Every present partition is read back in full and must contain only `0xff`.
+/// The default NVS is selected by its exact `nvs` label: another NVS partition
+/// must never substitute for it. Every present partition is read back in full
+/// and must contain only `0xff`.
 pub fn erase_all() -> Result<(), WipeError> {
     for region in PERSISTENT_WIPE_ORDER {
         erase_region(region)?;
@@ -89,7 +94,10 @@ fn erase_region(region: PersistentRegion) -> Result<(), WipeError> {
     }
 
     verify_blank(partition, size, region)?;
-    log::warn!("[wipe] erased and verified {} partition ({size} bytes)", region_name(region));
+    log::warn!(
+        "[wipe] erased and verified {} partition ({size} bytes)",
+        region_name(region)
+    );
     Ok(())
 }
 
@@ -106,7 +114,7 @@ unsafe fn find_partition(region: PersistentRegion) -> *const sys::esp_partition_
         PersistentRegion::Nvs => sys::esp_partition_find_first(
             sys::esp_partition_type_t_ESP_PARTITION_TYPE_DATA,
             sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_DATA_NVS,
-            core::ptr::null(),
+            b"nvs\0".as_ptr() as *const c_char,
         ),
     }
 }
@@ -121,12 +129,7 @@ fn verify_blank(
     while offset < size {
         let len = core::cmp::min(buf.len(), size - offset);
         let read_result = unsafe {
-            sys::esp_partition_read_raw(
-                partition,
-                offset,
-                buf.as_mut_ptr() as *mut c_void,
-                len,
-            )
+            sys::esp_partition_read_raw(partition, offset, buf.as_mut_ptr() as *mut c_void, len)
         };
         if read_result != sys::ESP_OK {
             return Err(WipeError::VerifyRead {

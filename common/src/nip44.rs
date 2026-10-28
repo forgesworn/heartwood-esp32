@@ -898,3 +898,8 @@ mod tests {
         assert_eq!(decrypted, plaintext, "decrypted plaintext must match official vector 1");
     }
 }
+
+// Mathematical evidence only: no new production allocation or ECDH API.
+#[cfg(all(test, feature = "cash"))]
+#[path = "fresh_r_vectors.rs"]
+mod fresh_r_vectors;

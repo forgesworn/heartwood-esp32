@@ -377,7 +377,13 @@ pub fn growth_run(nvs: &EspNvs<NvsDefault>, steps: &[(Option<usize>, usize)]) ->
     heartwood_common::nvs_budget::growth_run(state.available(), largest, steps.iter().copied())
 }
 
-pub mod nvs { pub use super::{fits, growth_allowed, growth_run, write_blocked, EspNvs, NvsDefault, ReplaceBlob}; }
+/// Stands in for the firmware's `crate::nvs::is_no_room`: the mock's
+/// refusal for lack of room, from a planned write or one that does not fit.
+pub fn is_no_room(e: &&'static str) -> bool {
+    *e == "not enough space"
+}
+
+pub mod nvs { pub use super::{fits, growth_allowed, growth_run, is_no_room, write_blocked, EspNvs, NvsDefault, ReplaceBlob}; }
 
 #[path = "../../firmware/src/policy.rs"]
 pub mod engine;
@@ -1461,7 +1467,8 @@ fn a_growing_table_keeps_room_to_rewrite_in_place() {
 fn repeating_a_revocation_that_did_not_save_saves_it() {
     // Review finding A. The legacy credential cannot be removed, so the
     // table may only be rewritten in place, and at the bench headroom it has
-    // no room for that: the revocation holds until the next restart only.
+    // no room for that: the revocation holds until the next restart only,
+    // and the reply says room is what is missing, not that a write failed.
     let (mut nvs, mut engine) = full_table(8);
     let other = engine.create_slot(1, "other identity".into(), secret_hex(0x31)).unwrap();
     assert!(engine.persist_slots(&mut nvs, 1));
@@ -1469,9 +1476,11 @@ fn repeating_a_revocation_that_did_not_save_saves_it() {
     nvs.backend.fail_once(NvsOp::Remove, MASTER_0_CONN, FaultKind::RemoveFail);
     assert!(engine.revoke_slot(0, 3));
     let outcome = engine.persist_revocation(&mut nvs, 0);
-    assert_eq!(outcome, RevocationSave::OnlyUntilRestart);
+    assert_eq!(outcome, RevocationSave::NoRoom);
     let reply = outcome.describe("pairing revocation").unwrap_err();
-    assert!(reply.starts_with("storage_unavailable: ") && reply.contains("repeat the request"), "{reply}");
+    assert!(reply.starts_with("storage_full: "), "{reply}");
+    assert!(reply.contains("free some room") && reply.contains("then repeat the request"), "{reply}");
+    assert!(!reply.contains(engine::RESTART_ADVICE), "not blocked: {reply}");
     assert!(slot_indices(&mut nvs).contains(&3), "flash still has it");
     assert!(engine.table_unsaved(&nvs, 0));
 
@@ -1496,6 +1505,74 @@ fn repeating_a_revocation_that_did_not_save_saves_it() {
     nvs.backend.take_log();
     assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
     assert!(!nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob));
+}
+
+#[test]
+fn a_change_refused_in_place_for_room_is_still_reported_as_a_failed_write() {
+    // Only a revocation's reply tells the in-place refusal apart: a pairing
+    // change under the same conditions answers as it did before.
+    use engine::SlotSaveError;
+    let (mut nvs, mut engine) = full_table(8);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    nvs.backend.fail_once(NvsOp::Remove, MASTER_0_CONN, FaultKind::RemoveFail);
+    assert!(engine.update_slot(0, 2, Some("renamed".into()), None, None, None));
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::Failed));
+}
+
+#[test]
+fn a_revocation_on_a_quarantined_identity_asks_for_a_restart_not_a_repeat() {
+    // Review finding: a master quarantined because its legacy migration could
+    // not persist has the migrated pairing in RAM, no table on flash and the
+    // legacy credential still there. A revocation edits RAM, the save writes
+    // nothing, and a repeat answers "not found" (`ram_table` is `None` while
+    // quarantined). The migrated table is several chunks, so its failed write
+    // also blocked the key, and reading the absent table the old reply
+    // claimed the revocation saved (`TableGone`), though the next boot turns
+    // the credential back into that pairing.
+    let mut nvs = EspNvs::new();
+    nvs.backend.seed(MASTER_0_CONN, &legacy_secret_bytes(0x5E));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    let mut engine = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    assert!(!engine.storage_ready(0), "the migration did not persist");
+    assert!(engine.revoke_slot(0, 0), "RAM still holds the migrated pairing");
+    nvs.backend.take_log();
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::RestartFirst);
+    assert!(!nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob), "nothing written");
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_unavailable: ") && reply.contains("restart the device, then repeat"), "{reply}");
+    assert!(!reply.contains("repeat the request to try the save again"), "{reply}");
+    assert!(!reply.contains("is saved"), "{reply}");
+    // What the repeat would meet, and why the reply cannot say "saved": no
+    // table and the legacy credential, which a boot turns back into the
+    // pairing (`a_cut_inside_an_erase_first_rewrite_...` pins that).
+    assert!(!engine.revoke_slot(0, 0));
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 0).is_none(), "a repeat answers not found");
+    assert!(!nvs.backend.contains(CONNSLOTS_0) && nvs.backend.contains(MASTER_0_CONN));
+}
+
+#[test]
+fn a_revocation_whose_table_cannot_be_read_asks_for_a_restart_not_a_repeat() {
+    // Review finding: the stored table stops reading mid-boot. The save
+    // fails, and a repeat finds no stored copy to compare (`stored_slots` is
+    // `None`), so it answers "no such slot". One pairing, so its "[]" is one
+    // chunk and a failed write does not block the key.
+    let (mut nvs, mut engine) = full_table(1);
+    assert!(engine.revoke_slot(0, 0));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    nvs.backend.push_fault(Fault {
+        op: NvsOp::BlobLen,
+        key: Some(CONNSLOTS_0.into()),
+        remaining_calls: 64,
+        kind: FaultKind::ReadError,
+    });
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::RestartFirst);
+    assert!(!nvs::write_blocked(CONNSLOTS_0));
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_unavailable: ") && reply.contains("restart the device, then repeat"), "{reply}");
+    assert!(!engine.revoke_slot(0, 0));
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 0).is_none(), "a repeat answers no such slot");
 }
 
 #[test]

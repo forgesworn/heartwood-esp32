@@ -1613,6 +1613,73 @@ pub fn slot_table_unsaved(stored: Option<&[u8]>, ram: &[ConnectSlot]) -> bool {
     }
 }
 
+/// How a master's `connslots_N` reads after a revocation's save failed.
+/// `Readable` means it reads and parses, as the repeat path needs
+/// (`PolicyEngine::unsaved_slot_revocation`): a table that is present but
+/// does not parse is `Unreadable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredSlotTable {
+    Absent,
+    Readable,
+    Unreadable,
+}
+
+/// What a restart finds after a revocation whose save failed, and what can
+/// still save it ([`unsaved_revocation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsavedRevocation {
+    /// The old table is on flash and readable: repeating the request saves
+    /// the narrower one.
+    RepeatSaves,
+    /// The old table may be on flash, but nothing can save the revocation in
+    /// this boot: the master's pairings are quarantined (none is served, and
+    /// none is written), or its stored table cannot be read, so a repeat
+    /// finds nothing to save and answers "not found". After a restart the
+    /// table loads again, or the master stays quarantined.
+    RestartFirst,
+    /// The old table is on flash, readable, and was not rewritten for lack
+    /// of room (an in-place rewrite with no room for a second copy). A
+    /// repeat on the same board meets the same refusal; freeing room first
+    /// lets it save.
+    NoRoom,
+    /// The table was erased to make room and could not be rewritten; a later
+    /// save can still bring the other pairings back.
+    TableLost,
+    /// As `TableLost`, with the key blocked until a restart.
+    TableGone,
+    /// A write failed part-way over a present (or unreadable) table.
+    Uncertain,
+}
+
+/// Classify a revocation whose save failed. `blocked`: the table's key is
+/// blocked for this boot after a part-written write. `storage_ready`: the
+/// master is not quarantined. `no_room`: the write was refused for lack of
+/// room.
+///
+/// Quarantine decides first: a quarantined master's save writes nothing, so
+/// neither the stored state nor a block on its key is the save's doing, and
+/// "saved" cannot be read off an absent table. A migration that could not
+/// persist leaves exactly that: no table (its failed write blocking the key)
+/// and a live legacy credential, which the next boot turns back into the
+/// pairing just revoked. Then a part-written write, whose key is blocked
+/// whatever else holds; then the stored table.
+pub fn unsaved_revocation(
+    blocked: bool,
+    storage_ready: bool,
+    stored: StoredSlotTable,
+    no_room: bool,
+) -> UnsavedRevocation {
+    match (storage_ready, blocked, stored) {
+        (false, _, _) => UnsavedRevocation::RestartFirst,
+        (true, true, StoredSlotTable::Absent) => UnsavedRevocation::TableGone,
+        (true, true, _) => UnsavedRevocation::Uncertain,
+        (true, false, StoredSlotTable::Absent) => UnsavedRevocation::TableLost,
+        (true, false, StoredSlotTable::Unreadable) => UnsavedRevocation::RestartFirst,
+        (true, false, StoredSlotTable::Readable) if no_room => UnsavedRevocation::NoRoom,
+        (true, false, StoredSlotTable::Readable) => UnsavedRevocation::RepeatSaves,
+    }
+}
+
 /// The stored copy of pairing `slot_index` when RAM no longer has it: an
 /// earlier revocation of that pairing whose save failed (the reply said it
 /// holds until the next restart only). Repeating the revocation should then
@@ -4123,6 +4190,43 @@ mod tests {
         assert!(slot_table_unsaved(None, &table), "nothing on flash, pairings in RAM");
         assert!(!slot_table_unsaved(None, &[]), "absent and empty both mean no pairings");
         assert!(!slot_table_unsaved(Some(b"[]"), &[]));
+    }
+
+    #[test]
+    fn an_unsaved_revocation_advises_a_repeat_only_where_one_can_save_it() {
+        use StoredSlotTable::{Absent, Readable, Unreadable};
+        use UnsavedRevocation::*;
+        // Every input, so a new arm cannot slip in unexamined.
+        for blocked in [false, true] {
+            for ready in [false, true] {
+                for stored in [Absent, Readable, Unreadable] {
+                    for no_room in [false, true] {
+                        let got = unsaved_revocation(blocked, ready, stored, no_room);
+                        let want = match (ready, blocked, stored, no_room) {
+                            (false, _, _, _) => RestartFirst,
+                            (true, true, Absent, _) => TableGone,
+                            (true, true, _, _) => Uncertain,
+                            (true, false, Absent, _) => TableLost,
+                            (true, false, Unreadable, _) => RestartFirst,
+                            (true, false, Readable, true) => NoRoom,
+                            (true, false, Readable, false) => RepeatSaves,
+                        };
+                        assert_eq!(got, want, "blocked {blocked}, ready {ready}, {stored:?}, no room {no_room}");
+                    }
+                }
+            }
+        }
+        // The cases a repeat used to be advised for and cannot help.
+        assert_eq!(unsaved_revocation(false, false, Readable, false), RestartFirst, "quarantined");
+        assert_eq!(unsaved_revocation(false, false, Absent, false), RestartFirst, "quarantined, legacy migration unsaved");
+        assert_eq!(
+            unsaved_revocation(true, false, Absent, false),
+            RestartFirst,
+            "quarantined after a migration write that failed part-way: never \"saved\""
+        );
+        assert_eq!(unsaved_revocation(false, true, Unreadable, false), RestartFirst, "table unreadable mid-boot");
+        assert_eq!(unsaved_revocation(false, true, Readable, true), NoRoom, "refused in place for room");
+        assert_eq!(unsaved_revocation(false, true, Readable, false), RepeatSaves);
     }
 
     #[test]

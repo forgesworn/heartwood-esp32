@@ -72,6 +72,14 @@ fn not_enough_space() -> EspError {
     EspError::from_infallible::<{ sys::ESP_ERR_NVS_NOT_ENOUGH_SPACE }>()
 }
 
+/// Whether a write failed for lack of room: ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+/// whether ESP-IDF returned it or [`ReplaceBlob`] refused a replace it had no
+/// room to write in place. Either way the old value is kept, unless the key
+/// was erased first or is now blocked (`write_blocked`).
+pub fn is_no_room(e: &EspError) -> bool {
+    e.code() == not_enough_space().code()
+}
+
 /// Keys whose multi-chunk write failed this boot (`nvs_budget::FailedWrites`):
 /// not written again until a restart has run ESP-IDF's orphan cleanup.
 static FAILED_WRITES: Mutex<FailedWrites> = Mutex::new(FailedWrites::new());

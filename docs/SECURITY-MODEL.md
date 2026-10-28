@@ -754,7 +754,14 @@ So the residuals are these:
   one, and the reply says what a restart would find: the old table (the
   revocation holds until then only), no table (every pairing of that
   identity gone), or, after a part-written table, either of those. When the
-  old table is still on flash, repeating the request saves it: a revocation
+  old table is still on flash and was refused for lack of room (an in-place
+  rewrite with no room for a second copy), the reply starts `storage_full:`
+  and asks for room to be freed before the request is repeated. When the
+  identity's pairings are quarantined, or its stored table cannot be read,
+  nothing can save the revocation in that boot (a repeat would answer "not
+  found"), so the reply asks for a restart first; a quarantined identity
+  serves no pairing until then. Otherwise, with the old table still on
+  flash, repeating the request saves it: a revocation
   that finds the pairing (or client key) already gone from RAM but still on
   flash writes the narrower table and answers as a revocation would, its
   credential fingerprint checked against the stored copy, instead of

@@ -79,8 +79,17 @@ pub enum RevocationSave {
     /// The narrower table is on flash.
     Saved,
     /// The old table is still on flash: the revocation holds until the next
-    /// restart only.
+    /// restart only, and repeating the request saves it.
     OnlyUntilRestart,
+    /// The old table may still be on flash, and nothing saves the revocation
+    /// in this boot: the identity's pairings are quarantined or its stored
+    /// table cannot be read, so a repeat answers "not found". A restart
+    /// loads the table again (then a repeat saves it) or keeps the identity
+    /// quarantined, serving no pairing.
+    RestartFirst,
+    /// The old table is still on flash and was not rewritten for lack of
+    /// room: a repeat saves it only once room has been freed.
+    NoRoom,
     /// The table was erased to make room and could not be rewritten: the
     /// revoked party is gone, and so is every other pairing of this master
     /// unless a later save succeeds.
@@ -118,6 +127,43 @@ pub const PAIRING_STORAGE_FULL: &str =
 /// change, and a failed change quarantines them.
 pub const RESTART_ADVICE: &str = "restart the device before making any other change";
 
+impl From<heartwood_common::policy::UnsavedRevocation> for RevocationSave {
+    fn from(outcome: heartwood_common::policy::UnsavedRevocation) -> Self {
+        use heartwood_common::policy::UnsavedRevocation as U;
+        match outcome {
+            U::RepeatSaves => RevocationSave::OnlyUntilRestart,
+            U::RestartFirst => RevocationSave::RestartFirst,
+            U::NoRoom => RevocationSave::NoRoom,
+            U::TableLost => RevocationSave::TableLost,
+            U::TableGone => RevocationSave::TableGone,
+            U::Uncertain => RevocationSave::Uncertain,
+        }
+    }
+}
+
+/// Why [`PolicyEngine::save_slots_as`] did not save. Finer than
+/// [`SlotSaveError`]: `NoRoomInPlace` is a rewrite the store refused for lack
+/// of room, keeping the old table (`nvs::is_no_room`). Only a revocation's
+/// reply tells it apart; a pairing's still reports it as a failed write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveFailure {
+    /// [`SlotSaveError::NoRoom`]: the growth gate refused a new pairing.
+    Gated,
+    /// The store refused the rewrite for lack of room.
+    NoRoomInPlace,
+    /// [`SlotSaveError::Failed`].
+    Failed,
+}
+
+impl From<SaveFailure> for SlotSaveError {
+    fn from(why: SaveFailure) -> Self {
+        match why {
+            SaveFailure::Gated => SlotSaveError::NoRoom,
+            SaveFailure::NoRoomInPlace | SaveFailure::Failed => SlotSaveError::Failed,
+        }
+    }
+}
+
 impl RevocationSave {
     /// The outcome as a caller reports it: `Ok` only when it is on flash,
     /// otherwise what a restart would find, in words. `what` names the change
@@ -127,6 +173,12 @@ impl RevocationSave {
             RevocationSave::Saved => Ok(()),
             RevocationSave::OnlyUntilRestart => Err(format!(
                 "storage_unavailable: {what} holds until the next restart only; it could not be saved; repeat the request to try the save again"
+            )),
+            RevocationSave::RestartFirst => Err(format!(
+                "storage_unavailable: {what} holds until the next restart only; it could not be saved, and this identity's pairing table cannot be read or written again before a restart; restart the device, then repeat the request if the pairing is still listed"
+            )),
+            RevocationSave::NoRoom => Err(format!(
+                "storage_full: {what} holds until the next restart only; there was no room to save it; free some room (remove an unused pairing, persona or avatar), then repeat the request"
             )),
             RevocationSave::TableLost => Err(format!(
                 "storage_full: {what} is saved, but this identity's other pairings could not be rewritten and are lost at the next restart unless a later change saves them"
@@ -1220,7 +1272,7 @@ impl PolicyEngine {
     /// replies to a new pairing: [`SlotSaveError::NoRoom`] is the growth
     /// gate's refusal ([`PAIRING_STORAGE_FULL`]), anything else a fault.
     pub fn try_persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> Result<(), SlotSaveError> {
-        self.save_slots_as(nvs, master_slot, SlotWrite::Change)
+        self.save_slots_as(nvs, master_slot, SlotWrite::Change).map_err(SlotSaveError::from)
     }
 
     /// Whether this master's pairing table is blocked until a restart after a
@@ -1256,21 +1308,31 @@ impl PolicyEngine {
         if !self.slots_dirty && self.table_unsaved(nvs, master_slot) {
             self.slots_dirty = true;
         }
-        if self.persist_slots_as(nvs, master_slot, SlotWrite::Revoke) {
+        let saved = self.save_slots_as(nvs, master_slot, SlotWrite::Revoke);
+        let Err(why) = saved else {
             return RevocationSave::Saved;
-        }
+        };
         // What the old rollback did to live approvals, without the rollback:
         // no approve-once window outlives a revocation that did not save.
         self.invalidate_approvals();
         self.slots_dirty = true;
-        let key = format!("connslots_{master_slot}");
-        let blocked = crate::nvs::write_blocked(&key);
-        match nvs.blob_len(&key) {
-            Ok(None) if blocked => RevocationSave::TableGone,
-            Ok(None) => RevocationSave::TableLost,
-            _ if blocked => RevocationSave::Uncertain,
-            _ => RevocationSave::OnlyUntilRestart,
-        }
+        use heartwood_common::policy::StoredSlotTable;
+        // Read as the repeat path reads it (`stored_slots`), so a repeat is
+        // advised only where it would find the stored table.
+        let stored = match Self::stored_table_bytes(nvs, master_slot) {
+            Some(None) => StoredSlotTable::Absent,
+            Some(Some(bytes)) if serde_json::from_slice::<Vec<ConnectSlot>>(&bytes).is_ok() => {
+                StoredSlotTable::Readable
+            }
+            _ => StoredSlotTable::Unreadable,
+        };
+        heartwood_common::policy::unsaved_revocation(
+            crate::nvs::write_blocked(&format!("connslots_{master_slot}")),
+            self.storage_ready(master_slot),
+            stored,
+            why == SaveFailure::NoRoomInPlace,
+        )
+        .into()
     }
 
     /// The bytes of this master's stored table: `Some(None)` when the key is
@@ -1361,8 +1423,8 @@ impl PolicyEngine {
         nvs: &mut EspNvs<NvsDefault>,
         master_slot: u8,
         mode: SlotWrite,
-    ) -> Result<(), SlotSaveError> {
-        if !self.storage_ready(master_slot) { return Err(SlotSaveError::Failed); }
+    ) -> Result<(), SaveFailure> {
+        if !self.storage_ready(master_slot) { return Err(SaveFailure::Failed); }
         if !self.slots_dirty {
             return Ok(());
         }
@@ -1373,8 +1435,10 @@ impl PolicyEngine {
             .find(|ms| ms.master_slot == master_slot);
         if ms.is_some_and(|m| heartwood_common::policy::validate_slot_table(&m.slots).is_err()) {
             log::error!("Invalid slot table for master {master_slot}; not written");
-            return Err(SlotSaveError::Failed);
+            return Err(SaveFailure::Failed);
         }
+        // Set when the store refused the write for lack of room.
+        let mut no_room = false;
         let persisted = match ms {
             Some(ms) => match serde_json::to_string(&ms.slots) {
                 // A table the boot loader could not read back is refused, not
@@ -1396,7 +1460,7 @@ impl PolicyEngine {
                         log::error!(
                             "Slot table for slot {master_slot} would leave too little room to rewrite it in place; not written"
                         );
-                        return Err(SlotSaveError::NoRoom);
+                        return Err(SaveFailure::Gated);
                     }
                     // A present table may be erased before its rewrite, and
                     // boot rebuilds a default pairing from a pre-migration
@@ -1422,6 +1486,7 @@ impl PolicyEngine {
                     let written = write(nvs);
                     if let Err(e) = written {
                         log::error!("Failed to persist slots for slot {master_slot}: {e:?}");
+                        no_room = crate::nvs::is_no_room(&e);
                     }
                     // A success return from replace_blob is not the authority
                     // boundary. Read the exact bytes back before a caller may
@@ -1484,8 +1549,10 @@ impl PolicyEngine {
         if persisted {
             self.slots_dirty = false;
             Ok(())
+        } else if no_room {
+            Err(SaveFailure::NoRoomInPlace)
         } else {
-            Err(SlotSaveError::Failed)
+            Err(SaveFailure::Failed)
         }
     }
 

@@ -461,7 +461,7 @@ fn validate_xonly_public_key(value: &str, malformed: &'static str) -> Result<(),
     let bytes = decode_event_hex::<32>(value, malformed)?;
     #[cfg(all(feature = "k256-backend", not(feature = "secp256k1-backend")))]
     {
-        k256::schnorr::VerifyingKey::from_slice(&bytes).map_err(|_| malformed)?;
+        k256::schnorr::VerifyingKey::from_bytes((&bytes).into()).map_err(|_| malformed)?;
     }
     #[cfg(all(feature = "secp256k1-backend", not(feature = "k256-backend")))]
     {
@@ -480,7 +480,7 @@ fn verify_event_signature(
     event_id: &[u8; 32],
     signature: &[u8; 64],
 ) -> Result<(), &'static str> {
-    let verifying_key = k256::schnorr::VerifyingKey::from_slice(public_key)
+    let verifying_key = k256::schnorr::VerifyingKey::from_bytes(public_key.into())
         .map_err(|_| "invalid event public key")?;
     let signature = k256::schnorr::Signature::try_from(signature.as_slice())
         .map_err(|_| "invalid event signature")?;

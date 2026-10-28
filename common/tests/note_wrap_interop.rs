@@ -12,12 +12,12 @@ use heartwood_common::note_wrap;
 
 fn key(seed: u8) -> ([u8; 32], [u8; 32]) {
     let secret = [seed; 32];
-    let sk = k256::schnorr::SigningKey::from_slice(&secret).unwrap();
+    let sk = k256::schnorr::SigningKey::from_bytes((&secret).into()).unwrap();
     (secret, sk.verifying_key().to_bytes().into())
 }
 
 fn k256_sign(secret: &[u8; 32], hash: &[u8; 32]) -> Result<[u8; 64], &'static str> {
-    let sk = k256::schnorr::SigningKey::from_slice(secret).map_err(|_| "bad key")?;
+    let sk = k256::schnorr::SigningKey::from_bytes(secret.into()).map_err(|_| "bad key")?;
     Ok(sk.sign_raw(hash, &[0u8; 32]).map_err(|_| "sign failed")?.to_bytes())
 }
 

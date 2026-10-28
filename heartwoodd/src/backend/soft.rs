@@ -387,7 +387,7 @@ impl SoftBackend {
         if request.method != approval.method {
             return Err(BackendError::Internal("denial method binding changed".into()));
         }
-        let response = nip46::build_error_response(&request.id, -32000, "request denied")
+        let response = nip46::build_error_response(&request.id, -32000, "user denied")
             .map_err(|e| BackendError::Internal(format!("build denial response: {e}")))?;
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce)

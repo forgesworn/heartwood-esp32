@@ -2661,11 +2661,16 @@ fn dispatch_inner(
             let Some(slot_index) = policy_engine.create_slot(master_slot, label.clone(), secret_hex.clone()) else {
                 return build_error_json(&request.id, -1, "no free slot");
             };
-            if !policy_engine.persist_slots(nvs, master_slot) {
+            if let Err(why) = policy_engine.try_persist_slots(nvs, master_slot) {
                 // A slot that would not survive a reboot is one the other
                 // wallet binds to and then loses: refuse rather than mislead.
+                // `storage_full` only for the growth gate's refusal; a fault
+                // is not something freeing room would fix.
                 policy_engine.revoke_slot(master_slot, slot_index);
-                return build_error_json(&request.id, -1, "storage_full");
+                return build_error_json(&request.id, -1, match why {
+                    crate::policy::SlotSaveError::NoRoom => crate::policy::PAIRING_STORAGE_FULL,
+                    crate::policy::SlotSaveError::Failed => "storage_unavailable: pairing was not saved",
+                });
             }
             let master_hex = match secp256k1::Keypair::from_seckey_slice(secp, master_secret) {
                 Ok(kp) => hex_encode(&kp.x_only_public_key().0.serialize()),

@@ -4143,12 +4143,12 @@ fn poll_usb_frame(
                 log::warn!("[relay] SET_IDENTITY_META rejected — bridge not authenticated");
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
             } else {
-            let ok = crate::identity_meta::handle_frame(&frame.payload, ctx.masters, ctx.nvs);
-            crate::protocol::write_frame(
-                usb,
-                if ok { FRAME_TYPE_ACK } else { FRAME_TYPE_NACK },
-                &[],
-            );
+            let stored = crate::identity_meta::handle_frame(&frame.payload, ctx.masters, ctx.nvs);
+            let ok = stored.is_ok();
+            match &stored {
+                Ok(()) => crate::protocol::write_frame(usb, FRAME_TYPE_ACK, &[]),
+                Err(reason) => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, reason.as_bytes()),
+            }
             // Not over a card or a held result: the identity card would hide
             // the words the owner is reading.
             if ok && ctx.masters.len() == 1 && ctx.display_on && !approval_card_open(ctx) {
@@ -9054,7 +9054,7 @@ fn persist_slot_mutation_or_rollback(
     snapshot: crate::policy::SlotStateSnapshot,
     action: &str,
 ) -> Result<(), String> {
-    let persisted = ctx.policy_engine.persist_slots(ctx.nvs, master_slot);
+    let persisted = ctx.policy_engine.try_persist_slots(ctx.nvs, master_slot);
     finish_slot_mutation(ctx, persisted, snapshot, action)
 }
 
@@ -9072,13 +9072,13 @@ fn persist_revocation(ctx: &mut SignCtx, master_slot: u8, action: &str) -> Resul
 
 fn finish_slot_mutation(
     ctx: &mut SignCtx,
-    persisted: bool,
+    persisted: Result<(), crate::policy::SlotSaveError>,
     snapshot: crate::policy::SlotStateSnapshot,
     action: &str,
 ) -> Result<(), String> {
-    if persisted {
+    let Err(why) = persisted else {
         return Ok(());
-    }
+    };
     let master_slot = snapshot.master_slot();
     let restored = ctx.policy_engine.restore_slot_state_durably(ctx.nvs, snapshot);
     let advice = if ctx.policy_engine.restart_needed(master_slot) {
@@ -9086,7 +9086,12 @@ fn finish_slot_mutation(
     } else {
         String::new()
     };
-    if restored {
+    if restored && why == crate::policy::SlotSaveError::NoRoom {
+        // The growth gate refused before anything was written: say so, so a
+        // client can tell "free some room" from a fault.
+        log::warn!("[relay] {action} refused: not enough NVS room for another pairing");
+        Err(format!("{}; {action} was not applied{advice}", crate::policy::PAIRING_STORAGE_FULL))
+    } else if restored {
         log::error!("[relay] {action} was not durable; prior slot authority restored durably");
         Err(format!("could not persist {action}; request was not applied{advice}"))
     } else {
@@ -10238,7 +10243,7 @@ fn dispatch_mgmt(
             // success until the complete policy is durable. If NVS rejects the
             // write, restore RAM and the prior pin; boot-time pruning is an
             // additional fail-closed guard if pin rollback itself cannot write.
-            if !ctx.policy_engine.persist_slots(ctx.nvs, master_slot) {
+            if let Err(why) = ctx.policy_engine.try_persist_slots(ctx.nvs, master_slot) {
                 let slot_rollback_durable = ctx
                     .policy_engine
                     .restore_slot_state_durably(ctx.nvs, slot_snapshot);
@@ -10249,7 +10254,11 @@ fn dispatch_mgmt(
                     true
                 };
                 return if slot_rollback_durable && pin_rollback_durable {
-                    Err("could not persist nostrconnect policy; pairing was not applied".into())
+                    Err(if why == crate::policy::SlotSaveError::NoRoom {
+                        format!("{}; pairing was not applied", crate::policy::PAIRING_STORAGE_FULL)
+                    } else {
+                        "could not persist nostrconnect policy; pairing was not applied".into()
+                    })
                 } else {
                     Err("fatal storage error: could not restore prior pairing state; take the device offline for USB recovery".into())
                 };

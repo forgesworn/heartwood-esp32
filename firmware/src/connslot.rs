@@ -76,9 +76,13 @@ pub fn handle_create(
         let snapshot = policy_engine.snapshot_slot_state(ms);
         match policy_engine.create_slot(ms, label.clone(), secret_hex.clone()) {
             Some(index) => {
-                if !policy_engine.persist_slots(nvs, ms) {
+                if let Err(why) = policy_engine.try_persist_slots(nvs, ms) {
                     policy_engine.restore_slot_state_durably(nvs, snapshot);
-                    protocol::write_frame(usb, FRAME_TYPE_NACK, restart_advised(policy_engine, ms, "storage_unavailable: pairing was not saved").as_bytes());
+                    let reason = match why {
+                        crate::policy::SlotSaveError::NoRoom => crate::policy::PAIRING_STORAGE_FULL,
+                        crate::policy::SlotSaveError::Failed => "storage_unavailable: pairing was not saved",
+                    };
+                    protocol::write_frame(usb, FRAME_TYPE_NACK, restart_advised(policy_engine, ms, reason).as_bytes());
                     return;
                 }
 

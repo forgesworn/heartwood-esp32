@@ -42,7 +42,7 @@ pub fn save(
     // tables and phone records rewritable in place.
     let avatar_key = format!("imav{slot}");
     if !crate::nvs::growth_allowed(nvs, &avatar_key, blob.len()) {
-        return Err("avatar blob: not enough storage left; the pairings need the room".into());
+        return Err("storage_full: not enough storage left for the avatar; the pairings need the room".into());
     }
     nvs.replace_blob(&format!("iman{slot}"), name.as_bytes())
         .map_err(|e| format!("name blob: {e:?}"))?;
@@ -78,52 +78,59 @@ pub fn load(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<IdentityMeta> {
     Some(IdentityMeta { name, w, h, avatar })
 }
 
-/// Parse + store a SET_IDENTITY_META payload. Returns true (ACK) on success.
+/// Parse + store a SET_IDENTITY_META payload. `Ok` (ACK) on success; `Err`
+/// carries the NACK's payload, empty except for the growth gate's
+/// `storage_full:` refusal, so a host can tell "free some room" from a bad
+/// frame or a fault.
 /// Payload: `[pubkey 32][w 1][h 1][name_len 1][name UTF-8][avatar w*h*2]`.
 /// The pubkey must match a loaded master (persona display is a later phase).
 pub fn handle_frame(
     payload: &[u8],
     masters: &[LoadedMaster],
     nvs: &mut EspNvs<NvsDefault>,
-) -> bool {
+) -> Result<(), String> {
     if payload.len() < 35 {
         log::warn!("[idmeta] payload too short ({})", payload.len());
-        return false;
+        return Err(String::new());
     }
     let pubkey: [u8; 32] = match payload[0..32].try_into() {
         Ok(pk) => pk,
-        Err(_) => return false,
+        Err(_) => return Err(String::new()),
     };
     let w = payload[32];
     let h = payload[33];
     let name_len = payload[34] as usize;
     if payload.len() < 35 + name_len {
-        return false;
+        return Err(String::new());
     }
     let name = match core::str::from_utf8(&payload[35..35 + name_len]) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(_) => return Err(String::new()),
     };
     let avatar = &payload[35 + name_len..];
     if avatar.len() != (w as usize) * (h as usize) * 2 {
         log::warn!("[idmeta] avatar len {} != {}*{}*2", avatar.len(), w, h);
-        return false;
+        return Err(String::new());
     }
     let slot = match masters.iter().find(|m| m.pubkey == pubkey) {
         Some(m) => m.slot,
         None => {
             log::warn!("[idmeta] pubkey not a known master; ignoring");
-            return false;
+            return Err(String::new());
         }
     };
     match save(nvs, slot, name, w, h, avatar) {
         Ok(()) => {
             log::info!("[idmeta] stored meta for master slot {slot}: '{name}' {w}x{h}");
-            true
+            Ok(())
+        }
+        Err(e) if e.starts_with("storage_full:") => {
+            log::warn!("[idmeta] not stored: {e}");
+            Err(e)
         }
         Err(e) => {
             log::error!("[idmeta] save failed: {e}");
-            false
+            Err(String::new())
         }
     }
 }

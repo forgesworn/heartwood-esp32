@@ -1447,6 +1447,39 @@ fn a_growing_table_keeps_room_to_rewrite_in_place() {
     assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
 }
 
+#[test]
+fn a_pairing_the_growth_gate_refuses_says_storage_full_and_a_fault_does_not() {
+    use engine::{SlotSaveError, PAIRING_STORAGE_FULL};
+    assert!(PAIRING_STORAGE_FULL.starts_with("storage_full: "));
+
+    // Short of room: the gate refuses before anything is written.
+    let (mut nvs, mut engine) = full_table(4);
+    let stored = nvs.backend.get(CONNSLOTS_0).unwrap();
+    nvs.backend.limit_headroom(160);
+    let snapshot = engine.snapshot_slot_state(0);
+    engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    nvs.backend.take_log();
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::NoRoom));
+    assert!(
+        !nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob),
+        "nothing written"
+    );
+    assert!(engine.restore_slot_state_durably(&mut nvs, snapshot));
+    assert_eq!(nvs.backend.get(CONNSLOTS_0).unwrap(), stored);
+
+    // With room it saves.
+    let (mut nvs, mut engine) = full_table(4);
+    engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Ok(()));
+
+    // With room, a failed write is a fault, not a full board. (Last: the
+    // failure blocks the key for the rest of this test thread's "boot".)
+    let (mut nvs, mut engine) = full_table(4);
+    engine.create_slot(0, "app 6".into(), secret_hex(0x78)).unwrap();
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::Failed));
+}
+
 fn persona_key(n: u8) -> [u8; 32] {
     [n; 32]
 }

@@ -1243,8 +1243,12 @@ fn main() {
                     protocol::write_frame(&mut usb, FRAME_TYPE_NACK, b"bridge auth required");
                     continue;
                 }
-                let ok = identity_meta::handle_frame(&frame.payload, &loaded_masters, &mut nvs);
-                protocol::write_frame(&mut usb, if ok { FRAME_TYPE_ACK } else { FRAME_TYPE_NACK }, &[]);
+                let stored = identity_meta::handle_frame(&frame.payload, &loaded_masters, &mut nvs);
+                let ok = stored.is_ok();
+                match &stored {
+                    Ok(()) => protocol::write_frame(&mut usb, FRAME_TYPE_ACK, &[]),
+                    Err(reason) => protocol::write_frame(&mut usb, FRAME_TYPE_NACK, reason.as_bytes()),
+                }
                 // Refresh the single-master identity card with the new avatar.
                 if ok && loaded_masters.len() == 1 {
                     let m = &loaded_masters[0];

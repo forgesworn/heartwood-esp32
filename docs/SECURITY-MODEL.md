@@ -762,6 +762,12 @@ So the residuals are these:
   phone record set or persona chunk can still be rewritten in place, plus a
   reserve for the small keys (`nvs::growth_allowed`). Other writes are not
   gated, so this keeps boards off the fallback most of the time, not always.
+  A refusal by the gate is reported as a full board, not a fault: the reply
+  starts `storage_full:` for a pairing (USB NACK, NIP-46 error, management
+  reply), a phone and an avatar (including the USB `SET_IDENTITY_META`
+  NACK, which is otherwise empty), and `identity storage full` for a
+  persona, as before. Freeing an unused pairing, persona or avatar helps; a
+  `storage_unavailable:` reply is a write that failed.
 - **The entry count is an upper bound derived from the v5.3.2 write path,
   not a proof.** If a direct write still runs out of room part-way, the
   cleanup defect above applies, and that key is blocked until a restart.

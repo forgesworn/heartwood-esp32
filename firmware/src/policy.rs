@@ -95,6 +95,24 @@ pub enum RevocationSave {
     Uncertain,
 }
 
+/// Why a pairing-table save did not happen ([`PolicyEngine::try_persist_slots`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotSaveError {
+    /// A new pairing was refused by the NVS growth gate (`nvs::growth_allowed`)
+    /// even after the cached avatars were dropped. Nothing was written: the
+    /// board is short of room, not faulty.
+    NoRoom,
+    /// The table was invalid or the master unavailable, or the write or its
+    /// read-back failed.
+    Failed,
+}
+
+/// The refusal a pairing gets from the growth gate ([`SlotSaveError::NoRoom`]),
+/// on every surface that creates one. `storage_full:` tells a client that
+/// freeing room will help, where `storage_unavailable:` is a fault.
+pub const PAIRING_STORAGE_FULL: &str =
+    "storage_full: not enough storage left for another pairing; remove an unused pairing, persona or avatar first";
+
 /// Appended to every reply after a write that blocks the pairing table for
 /// the rest of the boot: until a restart this identity's pairings cannot
 /// change, and a failed change quarantines them.
@@ -1195,7 +1213,14 @@ impl PolicyEngine {
     /// (`nvs::ReplaceBlob`), so a cut there leaves this master with no
     /// pairings, as every rewrite did before this firmware.
     pub fn persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
-        self.persist_slots_as(nvs, master_slot, SlotWrite::Change)
+        self.try_persist_slots(nvs, master_slot).is_ok()
+    }
+
+    /// [`Self::persist_slots`], saying why a save did not happen, for the
+    /// replies to a new pairing: [`SlotSaveError::NoRoom`] is the growth
+    /// gate's refusal ([`PAIRING_STORAGE_FULL`]), anything else a fault.
+    pub fn try_persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> Result<(), SlotSaveError> {
+        self.save_slots_as(nvs, master_slot, SlotWrite::Change)
     }
 
     /// Whether this master's pairing table is blocked until a restart after a
@@ -1232,9 +1257,18 @@ impl PolicyEngine {
     }
 
     fn persist_slots_as(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8, mode: SlotWrite) -> bool {
-        if !self.storage_ready(master_slot) { return false; }
+        self.save_slots_as(nvs, master_slot, mode).is_ok()
+    }
+
+    fn save_slots_as(
+        &mut self,
+        nvs: &mut EspNvs<NvsDefault>,
+        master_slot: u8,
+        mode: SlotWrite,
+    ) -> Result<(), SlotSaveError> {
+        if !self.storage_ready(master_slot) { return Err(SlotSaveError::Failed); }
         if !self.slots_dirty {
-            return true;
+            return Ok(());
         }
         let key = format!("connslots_{master_slot}");
         let ms = self
@@ -1243,7 +1277,7 @@ impl PolicyEngine {
             .find(|ms| ms.master_slot == master_slot);
         if ms.is_some_and(|m| heartwood_common::policy::validate_slot_table(&m.slots).is_err()) {
             log::error!("Invalid slot table for master {master_slot}; not written");
-            return false;
+            return Err(SlotSaveError::Failed);
         }
         let persisted = match ms {
             Some(ms) => match serde_json::to_string(&ms.slots) {
@@ -1266,7 +1300,7 @@ impl PolicyEngine {
                         log::error!(
                             "Slot table for slot {master_slot} would leave too little room to rewrite it in place; not written"
                         );
-                        return false;
+                        return Err(SlotSaveError::NoRoom);
                     }
                     // A present table may be erased before its rewrite, and
                     // boot rebuilds a default pairing from a pre-migration
@@ -1353,8 +1387,10 @@ impl PolicyEngine {
         };
         if persisted {
             self.slots_dirty = false;
+            Ok(())
+        } else {
+            Err(SlotSaveError::Failed)
         }
-        persisted
     }
 
     /// Start a physically approved backup recovery from a quarantined table.

@@ -44,6 +44,13 @@
 //! falls back to that branch: until the name is registered again, it is where
 //! the money lands. Nothing new is ever handed out on it.
 //!
+//! **The pre-purpose ladder.** Before purposes, this device and the mints
+//! that paid it derived from that same superseded branch with no
+//! `ser32(purpose)` in the tweak (lnurl/luds `6e865b1`). A note a mint paid
+//! there before it moved to `50d740a`, whose wrap was never opened, is still
+//! this device's money, so a claim that names its key tries that ladder last
+//! ([`claim_note_key`]). The current branch was never on it.
+//!
 //! HMAC keyed by the secret with a fixed label is the shape
 //! [`crate::derive::nsec_to_tree_root`] already uses. The label is not an
 //! nsec-tree message (those all start `nsec-tree`), so the seed is never a key
@@ -61,6 +68,7 @@ use zeroize::Zeroizing;
 use crate::cash::{derive_cash_child, derive_cash_domain_node, derive_cash_root, CashNode};
 use crate::derive::backend;
 use crate::encoding::{encode_ck1, encode_cx1};
+use crate::taproot::tagged_hash;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -81,8 +89,6 @@ pub const PURPOSE_LIGHTNING_ADDRESS: u32 = 2;
 const SUPERSEDED_ADDRESS_BRANCH: u32 = 1 | 0x8000_0000;
 
 const NOTE_DERIVE_TAG: &[u8] = b"LNURLcash/derive";
-const MINT_PREVOUT_TAG: &[u8] = b"LNURLcash/mint";
-const TAP_SIGHASH_TAG: &[u8] = b"TapSighash";
 
 /// secp256k1's group order, big-endian.
 const CURVE_ORDER: [u8; 32] = [
@@ -143,15 +149,6 @@ pub fn cx1_of(node: &CashNode) -> Result<String, &'static str> {
     Ok(encode_cx1(&branch.pubkey, &branch.chain_code))
 }
 
-fn tagged_hash(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let tag = Sha256::digest(tag);
-    let mut hasher = Sha256::new().chain_update(tag).chain_update(tag);
-    for part in parts {
-        hasher.update(part);
-    }
-    hasher.finalize().into()
-}
-
 /// `value mod n` for a 32-byte big-endian value. One subtraction is enough:
 /// any 256-bit value is below 2n.
 fn reduce_mod_n(value: [u8; 32]) -> [u8; 32] {
@@ -179,6 +176,13 @@ fn note_tweak(branch: &Branch, purpose: u32, index: u32) -> [u8; 32] {
     ))
 }
 
+/// The tweak before purposes (lnurl/luds `6e865b1`): no `ser32(purpose)` at
+/// all. Only ever derived to claim a note a mint paid there; see the module
+/// docs.
+fn pre_purpose_tweak(branch: &Branch, index: u32) -> [u8; 32] {
+    reduce_mod_n(tagged_hash(NOTE_DERIVE_TAG, &[&branch.pubkey, &branch.chain_code, &index.to_be_bytes()]))
+}
+
 /// The key of note `index` on one `purpose` of a branch. Both are any uint32
 /// and never hardened: a watcher holding only the `cx1` derives the matching
 /// public key at every one, which is the point of the scheme.
@@ -187,8 +191,20 @@ fn note_tweak(branch: &Branch, purpose: u32, index: u32) -> [u8; 32] {
 /// carries only x and x names the even-y point. Skipping that would give a key
 /// whose public key is not the one the mint minted to.
 pub fn note_secret_key(node: &CashNode, purpose: u32, index: u32) -> Result<Zeroizing<[u8; 32]>, &'static str> {
+    tweaked_key(node, |branch| note_tweak(branch, purpose, index))
+}
+
+/// The key of note `index` on the pre-purpose ladder of a branch.
+fn pre_purpose_secret_key(node: &CashNode, index: u32) -> Result<Zeroizing<[u8; 32]>, &'static str> {
+    tweaked_key(node, |branch| pre_purpose_tweak(branch, index))
+}
+
+fn tweaked_key(
+    node: &CashNode,
+    tweak_of: impl FnOnce(&Branch) -> [u8; 32],
+) -> Result<Zeroizing<[u8; 32]>, &'static str> {
     let (branch, odd) = watch(node)?;
-    let tweak = note_tweak(&branch, purpose, index);
+    let tweak = tweak_of(&branch);
     let base = if odd {
         Zeroizing::new(backend::negate(&node.private_key)?)
     } else {
@@ -230,42 +246,9 @@ pub fn spend_domain(note_host: &str) -> String {
 /// `ck1` is a standard Taproot signature that is worth nothing at any other
 /// mint.
 pub fn key_path_sighash(domain: &str, output_key: &[u8; 32]) -> [u8; 32] {
-    let txid = tagged_hash(MINT_PREVOUT_TAG, &[domain.as_bytes()]);
-    let sha_prevouts: [u8; 32] = Sha256::new()
-        .chain_update(txid)
-        .chain_update(0u32.to_le_bytes())
-        .finalize()
-        .into();
-    let sha_amounts: [u8; 32] = Sha256::digest(0u64.to_le_bytes()).into();
-    // compact-size 34, then OP_1 and a 32-byte push of Q
-    let sha_script_pubkeys: [u8; 32] = Sha256::new()
-        .chain_update([0x22, 0x51, 0x20])
-        .chain_update(output_key)
-        .finalize()
-        .into();
-    let sha_sequences: [u8; 32] = Sha256::digest(0xffff_ffffu32.to_le_bytes()).into();
-    // value 0, then an empty script (compact-size 0)
-    let sha_outputs: [u8; 32] = Sha256::new()
-        .chain_update(0u64.to_le_bytes())
-        .chain_update([0x00])
-        .finalize()
-        .into();
-    tagged_hash(
-        TAP_SIGHASH_TAG,
-        &[
-            &[0x00],                 // sighash epoch
-            &[0x00],                 // hash_type: SIGHASH_DEFAULT
-            &2u32.to_le_bytes(),     // nVersion
-            &0u32.to_le_bytes(),     // nLockTime
-            &sha_prevouts,
-            &sha_amounts,
-            &sha_script_pubkeys,
-            &sha_sequences,
-            &sha_outputs,
-            &[0x00],                 // spend_type: key path, no annex
-            &0u32.to_le_bytes(),     // input_index
-        ],
-    )
+    // Built field by field, and graded intermediate by intermediate against
+    // LUD-25's vector 3, in crate::taproot.
+    crate::taproot::key_path_sighash(output_key, domain)
 }
 
 /// The note's key-path spend, `Q || signature`: what a `ck1` carries.
@@ -295,8 +278,9 @@ pub fn ck1_of(secret: &[u8; 32], note_host: &str) -> Result<String, &'static str
 /// wrap naming a key this device does not hold is refused here, before any
 /// card is drawn, rather than kept as money that is not ours. A claim that
 /// names its key is also tried on the superseded branch, where a name
-/// registered before LUD-25 `50d740a` is still paid. Returns the key and its
-/// public key.
+/// registered before LUD-25 `50d740a` is still paid, and last on that
+/// branch's pre-purpose ladder, where a mint paid it before it moved to
+/// `50d740a`. Returns the key and its public key.
 pub fn claim_note_key(
     identity_secret: &[u8; 32],
     host: &str,
@@ -304,21 +288,30 @@ pub fn claim_note_key(
     index: u32,
     expected: Option<&[u8; 32]>,
 ) -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), &'static str> {
-    let at = |node: CashNode| -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), &'static str> {
-        let secret = note_secret_key(&node, purpose, index)?;
+    let at = |node: &CashNode| -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), &'static str> {
+        let secret = note_secret_key(node, purpose, index)?;
         let pubkey = note_pubkey(&secret)?;
         Ok((secret, pubkey))
     };
-    let current = at(address_node(identity_secret, host)?)?;
+    let current = at(&address_node(identity_secret, host)?)?;
     let Some(want) = expected else {
         return Ok(current);
     };
     if current.1 == *want {
         return Ok(current);
     }
-    let superseded = at(superseded_address_node(identity_secret, host)?)?;
+    let old_node = superseded_address_node(identity_secret, host)?;
+    let superseded = at(&old_node)?;
     if superseded.1 == *want {
         return Ok(superseded);
+    }
+    // An index unusable on the old ladder (a ~2^-256 zero sum) is a key
+    // nothing was paid to, so it is the same refusal.
+    if let Ok(secret) = pre_purpose_secret_key(&old_node, index) {
+        let pubkey = note_pubkey(&secret)?;
+        if pubkey == *want {
+            return Ok((secret, pubkey));
+        }
     }
     Err("that note is paid to a key this device does not hold")
 }
@@ -631,6 +624,78 @@ mod tests {
         assert_ne!(unnamed, paid);
         // and the superseded branch still answers only its own keys
         assert!(claim_note_key(&identity, "moneyer.dev", PURPOSE_LIGHTNING_ADDRESS, 1, Some(&paid)).is_err());
+    }
+
+    #[test]
+    fn the_pre_purpose_ladder_derives_6e865b1s_keys() {
+        // LUD-25 vectors 1 and 2's branches, at index 0 before purposes, as
+        // lnurl/luds 6e865b1 gave them: what a mint paid before 50d740a.
+        let vectors: Value = serde_json::from_str(include_str!("../tests/fixtures/lud25-taproot.json")).unwrap();
+        for label in ["vector1", "vector2"] {
+            let v = &vectors[label];
+            let seed = hex_decode(text(v, "seed")).unwrap();
+            let node = derive_cash_domain_node(&derive_cash_root(&seed).unwrap(), text(v, "domain")).unwrap();
+            assert_eq!(cx1_of(&node).unwrap(), text(v, "cx1"), "{label}");
+            let old = &v["prePurpose"];
+            let index = old["index"].as_u64().unwrap() as u32;
+            let sk = pre_purpose_secret_key(&node, index).unwrap();
+            assert_eq!(hex_encode(sk.as_ref()), text(old, "sk"), "{label}");
+            assert_eq!(hex_encode(&note_pubkey(&sk).unwrap()), text(old, "pk"), "{label}");
+            // and it is on no purpose
+            for purpose in [PURPOSE_WALLET, PURPOSE_CHANGE, PURPOSE_LIGHTNING_ADDRESS] {
+                assert_ne!(note_secret_key(&node, purpose, index).unwrap().as_ref(), sk.as_ref(), "{label}");
+            }
+        }
+
+        // And lnurlcash-conformance's prePurpose table, on the part2 branch
+        // with the same cx1.
+        let part2: Value = serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
+        let old = &part2["prePurpose"];
+        let branch = part2["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["cx1"] == old["cx1"])
+            .expect("the prePurpose branch is one of part2's");
+        let seed = hex_decode(text(branch, "seedHex")).unwrap();
+        let node = derive_cash_domain_node(&derive_cash_root(&seed).unwrap(), text(old, "host")).unwrap();
+        let notes = old["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 3);
+        for note in notes {
+            let index = note["index"].as_u64().unwrap() as u32;
+            let sk = pre_purpose_secret_key(&node, index).unwrap();
+            assert_eq!(hex_encode(sk.as_ref()), text(note, "noteSecretKey"), "part2 i {index}");
+            let pk = note_pubkey(&sk).unwrap();
+            assert_eq!(hex_encode(&pk), text(note, "notePubkey"), "part2 i {index}");
+            assert_eq!(encode_cp1(&pk), text(note, "cp1"), "part2 i {index}");
+        }
+    }
+
+    #[test]
+    fn a_claim_finds_a_note_paid_on_the_pre_purpose_ladder() {
+        // Paid to the superseded branch's cx1 by a mint from before purposes,
+        // and never claimed: the wrap names the key, so the claim finds it.
+        let identity = [7u8; 32];
+        let old = superseded_address_node(&identity, "moneyer.dev").unwrap();
+        let paid = note_pubkey(&pre_purpose_secret_key(&old, 3).unwrap()).unwrap();
+        for purpose in [PURPOSE_LIGHTNING_ADDRESS, PURPOSE_WALLET] {
+            let (_, on_purpose) = claim_note_key(&identity, "moneyer.dev", purpose, 3, None).unwrap();
+            assert_ne!(on_purpose, paid);
+        }
+        let (secret, pubkey) =
+            claim_note_key(&identity, "moneyer.dev", PURPOSE_LIGHTNING_ADDRESS, 3, Some(&paid)).unwrap();
+        assert_eq!(pubkey, paid);
+        assert_eq!(note_pubkey(&secret).unwrap(), paid);
+        // Only with the key named, and only at its own index, mint and identity.
+        let (_, unnamed) = claim_note_key(&identity, "moneyer.dev", PURPOSE_LIGHTNING_ADDRESS, 3, None).unwrap();
+        assert_ne!(unnamed, paid);
+        assert!(claim_note_key(&identity, "moneyer.dev", PURPOSE_LIGHTNING_ADDRESS, 4, Some(&paid)).is_err());
+        assert!(claim_note_key(&identity, "mint.example", PURPOSE_LIGHTNING_ADDRESS, 3, Some(&paid)).is_err());
+        assert!(claim_note_key(&[8u8; 32], "moneyer.dev", PURPOSE_LIGHTNING_ADDRESS, 3, Some(&paid)).is_err());
+        // The current branch was never on the old ladder.
+        let current = address_node(&identity, "moneyer.dev").unwrap();
+        let never = note_pubkey(&pre_purpose_secret_key(&current, 3).unwrap()).unwrap();
+        assert!(claim_note_key(&identity, "moneyer.dev", PURPOSE_LIGHTNING_ADDRESS, 3, Some(&never)).is_err());
     }
 
     #[test]

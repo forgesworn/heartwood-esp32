@@ -81,8 +81,10 @@ pub fn decode_ck1(value: &str) -> Option<[u8; 96]> {
 /// that verifies the certificate is the one that compares the amount.
 pub fn decode_cs1(value: &str) -> Option<[u8; 65]> {
     let checked = bech32::primitives::decode::CheckedHrpstring::new::<Bech32m>(value.trim()).ok()?;
-    let hrp = checked.hrp();
-    let suffix = hrp.as_str().strip_prefix("cs")?;
+    // BIP-350 allows an all-uppercase string (CheckedHrpstring has already
+    // refused mixed case), and the hrp keeps the case it was written in.
+    let hrp = checked.hrp().to_lowercase();
+    let suffix = hrp.strip_prefix("cs")?;
     if !(suffix.is_empty() || bolt11_amount_suffix(suffix)) {
         return None;
     }
@@ -326,9 +328,12 @@ mod tests {
         assert_eq!(encode_ck1(&spend), text(note, "ck1"));
         assert_eq!(decode_ck1(text(note, "ck1")), Some(spend));
 
-        // every certificate, each hrp carrying its own amount
+        // every certificate, each hrp carrying its own amount, and in upper
+        // case as BIP-350 allows
         for cert in vectors["certificates"].as_array().expect("certificates") {
-            assert_eq!(decode_cs1(text(cert, "cs1")), Some(unhex(text(cert, "signature"))));
+            let signature = Some(unhex(text(cert, "signature")));
+            assert_eq!(decode_cs1(text(cert, "cs1")), signature);
+            assert_eq!(decode_cs1(&text(cert, "cs1").to_uppercase()), signature);
         }
 
         let pubkey = unhex::<32>(text(branch, "branchPubkey"));

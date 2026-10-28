@@ -2110,6 +2110,185 @@ mod tests {
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
+    /// What a queued request's single answer was, read from the envelope the
+    /// relay publisher received: a signed event is an execution, an error with
+    /// no result is a denial.
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Executed,
+        Denied,
+    }
+
+    fn classify_reply(
+        client_secret: &[u8; 32],
+        master_pubkey: &[u8; 32],
+        wire_id: &str,
+        envelope: &str,
+    ) -> Outcome {
+        let reply = decrypted_reply(client_secret, master_pubkey, envelope);
+        assert_eq!(reply["id"].as_str(), Some(wire_id), "reply answers another request");
+        match (reply.get("result").filter(|r| !r.is_null()), reply.get("error").filter(|e| !e.is_null())) {
+            (Some(result), None) => {
+                let signed: SignedEvent = serde_json::from_str(result.as_str().unwrap()).unwrap();
+                assert_eq!(signed.content, wire_id, "signed something other than the queued event");
+                Outcome::Executed
+            }
+            (None, Some(_)) => Outcome::Denied,
+            _ => panic!("reply is neither a clean result nor a clean error: {reply}"),
+        }
+    }
+
+    /// A Soft backend with one master, a wired publisher and one queued
+    /// `sign_event` request from a fixed client.
+    struct RaceFixture {
+        backend: SoftBackend,
+        rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        master_pubkey: [u8; 32],
+        master_hex: String,
+        client_secret: [u8; 32],
+        _dir: TempDir,
+    }
+
+    fn backend_with_publisher() -> RaceFixture {
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+        let master = backend.create_master("race", 12).unwrap();
+        let master_hex = master["pubkey"].as_str().unwrap().to_string();
+        let master_pubkey = hex_to_32(&master_hex).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        backend.set_response_sender(tx);
+        RaceFixture {
+            backend, rx, master_pubkey, master_hex, client_secret: [0x45u8; 32], _dir: dir,
+        }
+    }
+
+    impl RaceFixture {
+        fn queue(&self, wire_id: &str) -> String {
+            queue_manual_sign(
+                &self.backend, &self.master_pubkey, &self.master_hex, &self.client_secret, wire_id,
+            )
+        }
+
+        fn classify(&self, wire_id: &str, envelope: &str) -> Outcome {
+            classify_reply(&self.client_secret, &self.master_pubkey, wire_id, envelope)
+        }
+    }
+
+    #[test]
+    fn approve_then_deny_of_one_request_executes_it_once_and_denial_fails_cleanly() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let mut q = backend_with_publisher();
+        let id = q.queue("wire-approve-first");
+
+        q.backend.approve_request(&id).unwrap();
+        let envelope = q.rx.try_recv().expect("approval must deliver the signed envelope");
+        assert_eq!(q.classify("wire-approve-first", &envelope), Outcome::Executed);
+
+        assert!(q.backend.deny_request(&id).is_err(), "a decided request cannot be denied");
+        assert!(matches!(q.rx.try_recv(), Err(TryRecvError::Empty)), "no denial reply may follow");
+        assert!(q.backend.approve_request(&id).is_err(), "nor approved a second time");
+        assert!(matches!(q.rx.try_recv(), Err(TryRecvError::Empty)), "nor executed again");
+        assert!(q.backend.list_approvals().is_empty());
+    }
+
+    #[test]
+    fn deny_then_approve_of_one_request_publishes_one_denial_and_executes_nothing() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let mut q = backend_with_publisher();
+        let id = q.queue("wire-deny-first");
+
+        q.backend.deny_request(&id).unwrap();
+        let envelope = q.rx.try_recv().expect("denial must reach the relay publisher");
+        assert_eq!(q.classify("wire-deny-first", &envelope), Outcome::Denied);
+
+        assert!(q.backend.approve_request(&id).is_err(), "a decided request cannot be approved");
+        assert!(matches!(q.rx.try_recv(), Err(TryRecvError::Empty)), "nothing may be signed");
+        assert!(q.backend.deny_request(&id).is_err(), "nor denied a second time");
+        assert!(matches!(q.rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(q.backend.list_approvals().is_empty());
+    }
+
+    /// Approve and deny issued at the same moment from two threads, against one
+    /// backend and one queued request, many times over. Whichever the lock
+    /// admits first wins; the other must fail and publish nothing, so every
+    /// round has exactly one reply and it matches the call that returned Ok.
+    #[test]
+    fn concurrent_approve_and_deny_of_one_request_have_exactly_one_outcome() {
+        use std::sync::Barrier;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        const ROUNDS: usize = 200;
+        let mut q = backend_with_publisher();
+        let (mut executed, mut denied) = (0usize, 0usize);
+
+        for round in 0..ROUNDS {
+            let wire_id = format!("wire-race-{round}");
+            let id = q.queue(&wire_id);
+            let barrier = Barrier::new(2);
+            // Deny does its decrypt, sign and encrypt work before it takes the
+            // queue lock, so with no head start approve would always win. Hold
+            // approve back by a swept delay (0 to 98 ms) so that both orders,
+            // and the overlap between them, are exercised. Deny takes about
+            // 3 ms on a fast host; the wide sweep keeps a slow CI runner,
+            // where it may take far longer, inside the range.
+            let approve_delay = std::time::Duration::from_micros((round as u64 % 50) * 2000);
+            let (approve, deny) = std::thread::scope(|s| {
+                // Alternate which side is spawned first so neither always
+                // reaches the barrier ahead of the other.
+                let run_approve = || {
+                    barrier.wait();
+                    std::thread::sleep(approve_delay);
+                    q.backend.approve_request(&id)
+                };
+                let run_deny = || {
+                    barrier.wait();
+                    q.backend.deny_request(&id)
+                };
+                if round % 2 == 0 {
+                    let a = s.spawn(run_approve);
+                    let d = s.spawn(run_deny);
+                    (a.join().unwrap(), d.join().unwrap())
+                } else {
+                    let d = s.spawn(run_deny);
+                    let a = s.spawn(run_approve);
+                    (a.join().unwrap(), d.join().unwrap())
+                }
+            });
+
+            assert!(
+                approve.is_ok() != deny.is_ok(),
+                "round {round}: approve {approve:?}, deny {deny:?}; exactly one may succeed",
+            );
+            let envelope = q.rx.try_recv()
+                .unwrap_or_else(|_| panic!("round {round}: the winner published nothing"));
+            assert!(
+                matches!(q.rx.try_recv(), Err(TryRecvError::Empty)),
+                "round {round}: more than one reply was published",
+            );
+            match q.classify(&wire_id, &envelope) {
+                Outcome::Executed => {
+                    assert!(approve.is_ok(), "round {round}: executed but approve reported failure");
+                    executed += 1;
+                }
+                Outcome::Denied => {
+                    assert!(deny.is_ok(), "round {round}: denied but deny reported failure");
+                    denied += 1;
+                }
+            }
+            assert!(q.backend.list_approvals().is_empty(), "round {round}: entry left queued");
+        }
+        assert_eq!(executed + denied, ROUNDS);
+        // The exact split depends on scheduling and is not pinned, but a run in
+        // which one side never won did not exercise the race at all.
+        assert!(
+            executed > 0 && denied > 0,
+            "race not exercised: {executed} executed, {denied} denied over {ROUNDS} rounds",
+        );
+        eprintln!("concurrent approve/deny: {executed} executed, {denied} denied over {ROUNDS} rounds");
+    }
+
     /// Encrypt a `sign_event` request to the master from `client_secret`.
     fn sign_request_ct(
         client_secret: &[u8; 32],

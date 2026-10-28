@@ -55,8 +55,8 @@ pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str
 /// power cut between the two would leave no count, which reads as zero: a
 /// free reset of the wipe counter. ESP-IDF's own `nvs_set_blob` writes the
 /// new value before it retires the old one, so a cut leaves one or the other.
-/// If there is no room for the new entry the old count stays and
-/// `charge_pin_guess` refuses the guess untried.
+/// If there is no room for the new copy the write is refused before it
+/// starts, the old count stays and `charge_pin_guess` refuses the guess untried.
 struct PinCounter<'a>(&'a mut EspNvs<NvsDefault>);
 
 impl BlobStore for PinCounter<'_> {
@@ -70,7 +70,21 @@ impl BlobStore for PinCounter<'_> {
     }
 
     fn set(&mut self, key: &str, value: &[u8]) -> Result<(), data_key::StoreError> {
+        use esp_idf_svc::handle::RawHandle;
         use esp_idf_svc::sys;
+        use heartwood_common::nvs_room;
+        // Refuse before writing unless the new copy fits. ESP-IDF 5.3.2's
+        // cleanup after a write that runs out of pages can erase the OLD
+        // copy's data, which reads back as no count and wipes the board. A
+        // refusal here leaves the old count whole, and the guess goes untried.
+        let stats = crate::nvs_stats::read().ok_or(data_key::StoreError)?;
+        let pages = stats.total_entries / nvs_room::PAGE_ENTRIES;
+        if nvs_room::available_entries(stats.free_entries)
+            < nvs_room::blob_write_entries(value.len(), pages)
+        {
+            log::warn!("PIN counter: no room for a new copy, guess refused untried");
+            return Err(data_key::StoreError);
+        }
         let c_key = std::ffi::CString::new(key).map_err(|_| data_key::StoreError)?;
         // SAFETY: the handle is open for as long as `self.0` lives, the key is
         // NUL-terminated, and `value` outlives the call.

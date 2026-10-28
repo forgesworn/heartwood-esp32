@@ -252,6 +252,14 @@ fn unlock_pin(port: &mut RawSerial, pin: &str) -> Result<(), String> {
                         log::info!("PIN unlock accepted");
                         return Ok(());
                     } else if f.frame_type == FRAME_TYPE_NACK {
+                        // A guess the board could not count is refused untried
+                        // and costs no attempt; say so rather than "wrong PIN".
+                        if f.payload.starts_with(b"storage_full") {
+                            return Err(format!(
+                                "PIN not tried: {}",
+                                String::from_utf8_lossy(&f.payload)
+                            ));
+                        }
                         return Err("PIN unlock rejected (NACK) -- wrong PIN".into());
                     }
                 }

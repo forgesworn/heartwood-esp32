@@ -106,8 +106,29 @@ impl BlobStore for PinCounter<'_> {
     }
 }
 
-pub(crate) fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) {
-    let _ = nvs.remove(NVS_PIN_ATTEMPTS_KEY);
+/// Clear the PIN wipe counter after a proven-correct secret, and check that
+/// it took. The guess was counted before it was checked, so a correct fifth
+/// PIN sits on flash as 5 until this runs: a clear that silently failed would
+/// wipe the board at the next boot. Removal is tried twice, then an in-place
+/// write of 0, each judged by reading the count back. Returns whether the
+/// count now reads 0.
+pub(crate) fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) -> bool {
+    for _ in 0..2 {
+        let _ = nvs.remove(NVS_PIN_ATTEMPTS_KEY);
+        if read_failed_attempts(nvs) == Ok(0) {
+            return true;
+        }
+    }
+    let mut counter = PinCounter(nvs);
+    let _ = counter.set(NVS_PIN_ATTEMPTS_KEY, &[0]);
+    if read_failed_attempts(counter.0) == Ok(0) {
+        return true;
+    }
+    log::error!(
+        "PIN wipe counter could not be cleared after a correct unlock; \
+         the next boot may wipe the board"
+    );
+    false
 }
 
 /// What an unlock is doing, for the OLED.
@@ -375,7 +396,8 @@ pub fn try_unlock(
     // or the marker write can no longer catch the counter mid-way stale,
     // leaving an owner who just typed the correct PIN still one guess from a
     // wipe. The three outer calls are gone; this is the only one now.
-    clear_failed_attempts(store.0);
+    // Logs if the count still reads non-zero; the unlock itself stands.
+    let _ = clear_failed_attempts(store.0);
 
     let upgrade_due = unlocked.dk.is_none()
         || locked.iter().any(|&slot| {

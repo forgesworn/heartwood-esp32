@@ -3247,6 +3247,40 @@ denylist). Otherwise heartwoodd loses every reply that follows a card.
 `echo on` was not tried, since it needs root on the bench laptop. The
 native-USB boards (V4, C6) were not checked.
 
+## 39. A PIN guess is counted before it is checked (#254; added 2026-10-28, NOT YET BENCH-RUN)
+
+Beta.29 wrote the wipe counter only after a wrong PIN was refused, so a power
+cut between the refusal and the write made that guess free, as often as
+wanted. A guess is now counted on flash, and read back, before it is checked;
+the counter is written in place (never erased first); a vault key that is a
+PIN padded with zeros is refused on every unlock path; and the fifth guess
+warns on screen. Use a board with a PIN set (Heltec and T-Display both, for
+item 6), and USB.
+
+1. A wrong PIN raises the count: the log reads `PIN incorrect — attempt n/5`,
+   rising by one per wrong guess, and the screen shows `Wrong PIN` with the
+   attempts left.
+2. The count survives a power cut. Enter a wrong PIN, cut the power while the
+   board is checking it (during the key stretch), power on: the count includes
+   that guess.
+3. The right PIN clears the count. After two wrong guesses, enter the right
+   PIN: the board unlocks and the count reads 0 after a reboot.
+4. Five wrong PINs wipe the board, as before.
+5. A vault unlock with a zero-padded PIN is refused. Send VAULT_UNLOCK with the
+   PIN's ASCII digits followed by zero bytes to make 32 (for "1234",
+   31 32 33 34 then 28 x 00): NACK, the board stays locked, and the PIN count
+   is unchanged. On an unlocked board, VAULT_SET with such a key answers
+   `weak vault key`.
+6. The last attempt warns. After four wrong guesses, enter the right PIN: while
+   it is checked, the screen reads LAST ATTEMPT above "Keep power on", inside
+   the panel on both boards and in both orientations. The board unlocks and the
+   count reads 0. (Do not cut the power here: with the count at 5 on flash the
+   next boot wipes the board, which is the case the warning is for.)
+7. A guess the board cannot count is refused untried. Only if a board with a
+   nearly full NVS is to hand: the PIN is refused with `storage_full: the PIN
+   was not tried` (heartwoodd says "PIN not tried"), the count is unchanged,
+   and nothing is wiped.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

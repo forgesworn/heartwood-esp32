@@ -340,6 +340,12 @@ pub fn try_unlock(
     secret: &[u8],
     on_progress: &mut dyn FnMut(UnlockProgress),
 ) -> bool {
+    // A vault key shaped like a zero-padded PIN would test that PIN without
+    // counting it (VAULT_UNLOCK and the relay's 24136 never charge a guess).
+    if data_key::secret_aliases_a_pin(secret) {
+        log::warn!("unlock: refused a vault key that could stand in for a PIN");
+        return false;
+    }
     let locked: Vec<u8> = masters.iter().filter(|m| m.locked).map(|m| m.slot).collect();
     let mut store = NvsBlobs(nvs);
     let mut opening = |done: usize, total: usize| on_progress(UnlockProgress::Opening { done, total });
@@ -634,6 +640,11 @@ pub fn handle_vault_set(
     if !payload.is_empty() && payload.len() != VAULT_KEY_LEN {
         log::warn!("VAULT_SET: payload is {} bytes, expected 0 or 32", payload.len());
         protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+        return false;
+    }
+    if data_key::secret_aliases_a_pin(payload) {
+        log::warn!("VAULT_SET: refused a key whose bytes 8..32 are all zero");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"weak vault key");
         return false;
     }
     if masters.is_empty() {

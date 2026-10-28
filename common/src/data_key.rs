@@ -1125,6 +1125,17 @@ pub fn read_pin_attempts<S: BlobStore>(store: &S) -> Result<u8, &'static str> {
     }
 }
 
+/// Whether a 32-byte vault key would unwrap like a PIN. The wrap is
+/// PBKDF2-HMAC-SHA256 over the raw secret, and HMAC pads a short key with
+/// zeros, so `"1234"` and `"1234"` followed by 28 zero bytes derive the same
+/// key. A PIN is at most 8 digits, so any vault key whose bytes 8..32 are all
+/// zero could stand in for one. Such a key is refused on every unlock path
+/// (none of which counts towards the PIN wipe) and is never set. A random key
+/// has that shape with probability 2^-192.
+pub fn secret_aliases_a_pin(secret: &[u8]) -> bool {
+    secret.len() == 32 && secret[8..].iter().all(|&b| b == 0)
+}
+
 /// What raising the count for one guess achieved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum GuessCharge {
@@ -2297,6 +2308,48 @@ mod tests {
         let mut roomy = m.reboot();
         assert_eq!(charge_pin_guess(&mut roomy), GuessCharge::Charged(2));
         assert_eq!(charge_pin_guess(&mut roomy), GuessCharge::Charged(3));
+    }
+
+    /// A store whose failed write also loses the old copy (ESP-IDF's cleanup
+    /// after a write that runs out of pages can erase the old data chunk).
+    struct LosesOldCopy(Mem);
+    impl BlobStore for LosesOldCopy {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+            self.0.get(key)
+        }
+        fn set(&mut self, key: &str, _: &[u8]) -> Result<(), StoreError> {
+            self.0.map.remove(key);
+            Err(StoreError)
+        }
+        fn remove(&mut self, _: &str) -> Result<(), StoreError> {
+            Err(StoreError)
+        }
+    }
+
+    #[test]
+    fn a_write_that_loses_the_old_count_fails_closed_not_to_zero() {
+        let mut m = Mem::default();
+        m.set(PIN_ATTEMPTS_KEY, &[3]).unwrap();
+        let mut lossy = LosesOldCopy(m.reboot());
+        assert!(matches!(charge_pin_guess(&mut lossy), GuessCharge::Damaged(_)));
+    }
+
+    #[test]
+    fn a_zero_padded_vault_key_would_open_a_pin_board() {
+        let m = legacy_board(PIN_A);
+        let mut padded = [0u8; 32];
+        padded[..PIN_A.len()].copy_from_slice(PIN_A);
+        // The alias is real: the padded key opens the PIN's wrap...
+        assert_eq!(boot_with(&m, &padded), Some(seeds()));
+        // ...so it is what the unlock paths refuse.
+        assert!(secret_aliases_a_pin(&padded));
+        let mut eight = [0u8; 32];
+        eight[..8].copy_from_slice(b"12345678");
+        assert!(secret_aliases_a_pin(&eight));
+        assert!(!secret_aliases_a_pin(PIN_A), "a PIN itself is not refused");
+        let mut random = [0u8; 32];
+        random[31] = 1;
+        assert!(!secret_aliases_a_pin(&random));
     }
 
     #[test]

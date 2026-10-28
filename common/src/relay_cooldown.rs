@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn pick_passes_cooling_relays_by_in_rotation_order() {
         let hosts = [
-            "relay.trotters.cc",
+            "relay.example.org",
             "relay.damus.io",
             "relay.primal.net",
             "nos.lol",

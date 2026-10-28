@@ -110,7 +110,7 @@ Like the Imager, the **first** decision is *which device* — it picks the binar
 
 **Step 2 — Configure.**
 - **Wifi:** prefilled from the host's current network (SSID + Keychain password — the Imager touch; proven this session: SSID `VM0030073` + Keychain pull, both staying local), or picked from the device-side **scan dropdown** (`0x55`/`0x56`) for when the device lives on a different network than the laptop.
-- **Relays:** prefilled to `wss://relay.trotters.cc`.
+- **Relays:** prefilled to `wss://relay.primal.net`.
 - **Mode:** WiFi-standalone / USB-bridged.
 
 **Step 3 — Flash & Configure.** `esptool-js` flashes the **board-matched** app + the config blob, resets. Device boots **configured** → wifi-standalone up, signing over relays.

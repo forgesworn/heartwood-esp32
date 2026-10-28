@@ -34,7 +34,7 @@ SERIAL_PORT = os.environ.get("HEARTWOOD_SERIAL_PORT", "/dev/heartwood-hsm")
 BAUD = int(os.environ.get("HEARTWOOD_BAUD", "115200"))
 RELAYS = os.environ.get(
     "HEARTWOOD_RELAYS",
-    "wss://relay.damus.io,wss://nos.lol,wss://relay.trotters.cc",
+    "wss://relay.primal.net,wss://nos.lol,wss://relay.damus.io",
 )
 LABEL = os.environ.get("HEARTWOOD_LABEL", "Heartwood")
 

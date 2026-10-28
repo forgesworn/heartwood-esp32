@@ -14,6 +14,7 @@ fn next_approval_epoch() -> Option<u32> {
 }
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use heartwood_common::nip46::Nip46Method;
 use heartwood_common::owner_pairing::VaultContext;
 use heartwood_common::policy::{
@@ -60,6 +61,148 @@ fn evict_avatar_cache(nvs: &mut EspNvs<NvsDefault>) -> usize {
         .count()
 }
 
+/// How a slot-table write is judged against the NVS budget.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotWrite {
+    /// A change someone asked for: growth is gated.
+    Change,
+    /// Authority removed: never gated.
+    Revoke,
+    /// Restoring or re-encoding what was already durable (rollback
+    /// compensation, boot-time migrations): never gated.
+    Repair,
+}
+
+/// What a restart finds after [`PolicyEngine::persist_revocation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevocationSave {
+    /// The narrower table is on flash.
+    Saved,
+    /// The old table is still on flash: the revocation holds until the next
+    /// restart only, and repeating the request saves it.
+    OnlyUntilRestart,
+    /// The old table may still be on flash, and nothing saves the revocation
+    /// in this boot: the identity's pairings are quarantined or its stored
+    /// table cannot be read, so a repeat answers "not found". A restart
+    /// loads the table again (then a repeat saves it) or keeps the identity
+    /// quarantined, serving no pairing.
+    RestartFirst,
+    /// The old table is still on flash and was not rewritten for lack of
+    /// room: a repeat saves it only once room has been freed.
+    NoRoom,
+    /// The table was erased to make room and could not be rewritten: the
+    /// revoked party is gone, and so is every other pairing of this master
+    /// unless a later save succeeds.
+    TableLost,
+    /// As `TableLost`, but the rewrite failed part-way, so the key is blocked
+    /// for this boot (`nvs::write_blocked`) and no later save can bring the
+    /// other pairings back: a restart finds none.
+    TableGone,
+    /// A write of the table failed part-way and may have damaged the stored
+    /// copy; it is not written again this boot. A restart finds either the
+    /// old table or none.
+    Uncertain,
+}
+
+/// Why a pairing-table save did not happen ([`PolicyEngine::try_persist_slots`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotSaveError {
+    /// A new pairing was refused by the NVS growth gate (`nvs::growth_allowed`)
+    /// even after the cached avatars were dropped. Nothing was written: the
+    /// board is short of room, not faulty.
+    NoRoom,
+    /// The table was invalid or the master unavailable, or the write or its
+    /// read-back failed.
+    Failed,
+}
+
+/// The refusal a pairing gets from the growth gate ([`SlotSaveError::NoRoom`]),
+/// on every surface that creates one. `storage_full:` tells a client that
+/// freeing room will help, where `storage_unavailable:` is a fault.
+pub const PAIRING_STORAGE_FULL: &str =
+    "storage_full: not enough storage left for another pairing; remove an unused pairing, persona or avatar first";
+
+/// Appended to every reply after a write that blocks the pairing table for
+/// the rest of the boot: until a restart this identity's pairings cannot
+/// change, and a failed change quarantines them.
+pub const RESTART_ADVICE: &str = "restart the device before making any other change";
+
+impl From<heartwood_common::policy::UnsavedRevocation> for RevocationSave {
+    fn from(outcome: heartwood_common::policy::UnsavedRevocation) -> Self {
+        use heartwood_common::policy::UnsavedRevocation as U;
+        match outcome {
+            U::RepeatSaves => RevocationSave::OnlyUntilRestart,
+            U::RestartFirst => RevocationSave::RestartFirst,
+            U::NoRoom => RevocationSave::NoRoom,
+            U::TableLost => RevocationSave::TableLost,
+            U::TableGone => RevocationSave::TableGone,
+            U::Uncertain => RevocationSave::Uncertain,
+        }
+    }
+}
+
+/// Why [`PolicyEngine::save_slots_as`] did not save. Finer than
+/// [`SlotSaveError`]: `NoRoomInPlace` is a rewrite the store refused for lack
+/// of room, keeping the old table (`nvs::is_no_room`). Only a revocation's
+/// reply tells it apart; a pairing's still reports it as a failed write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveFailure {
+    /// [`SlotSaveError::NoRoom`]: the growth gate refused a new pairing.
+    Gated,
+    /// The store refused the rewrite for lack of room.
+    NoRoomInPlace,
+    /// [`SlotSaveError::Failed`].
+    Failed,
+}
+
+impl From<SaveFailure> for SlotSaveError {
+    fn from(why: SaveFailure) -> Self {
+        match why {
+            SaveFailure::Gated => SlotSaveError::NoRoom,
+            SaveFailure::NoRoomInPlace | SaveFailure::Failed => SlotSaveError::Failed,
+        }
+    }
+}
+
+impl RevocationSave {
+    /// The outcome as a caller reports it: `Ok` only when it is on flash,
+    /// otherwise what a restart would find, in words. `what` names the change
+    /// ("pairing revocation").
+    pub fn describe(self, what: &str) -> Result<(), String> {
+        match self {
+            RevocationSave::Saved => Ok(()),
+            RevocationSave::OnlyUntilRestart => Err(format!(
+                "storage_unavailable: {what} holds until the next restart only; it could not be saved; repeat the request to try the save again"
+            )),
+            RevocationSave::RestartFirst => Err(format!(
+                "storage_unavailable: {what} holds until the next restart only; it could not be saved, and this identity's pairing table cannot be read or written again before a restart; restart the device, then repeat the request if the pairing is still listed"
+            )),
+            RevocationSave::NoRoom => Err(format!(
+                "storage_full: {what} holds until the next restart only; there was no room to save it; free some room (remove an unused pairing, persona or avatar), then repeat the request"
+            )),
+            RevocationSave::TableLost => Err(format!(
+                "storage_full: {what} is saved, but this identity's other pairings could not be rewritten and are lost at the next restart unless a later change saves them"
+            )),
+            RevocationSave::TableGone => Err(format!(
+                "storage_full: {what} is saved, but every pairing of this identity is gone after a restart; {RESTART_ADVICE}, then re-pair or restore a backup"
+            )),
+            RevocationSave::Uncertain => Err(format!(
+                "storage_failed: {what} holds until the next restart; the pairing table could not be written and after a restart it is either as it was or gone; {RESTART_ADVICE}, then check and revoke again"
+            )),
+        }
+    }
+}
+
+/// Remove master `slot`'s pre-migration `master_N_conn` credential while its
+/// `connslots_N` table is present, since boot synthesises a default pairing
+/// from it whenever the table is absent, and a rewrite with no room erases
+/// the table first. True when the credential is proven gone.
+fn clear_legacy_connection(nvs: &mut EspNvs<NvsDefault>, slot: u8) -> bool {
+    let legacy = format!("master_{slot}_conn");
+    matches!(nvs.blob_len(&legacy), Ok(None))
+        || (nvs.remove(&legacy).is_ok() && matches!(nvs.blob_len(&legacy), Ok(None)))
+}
+
 /// Maximum concurrent client sessions.
 pub const MAX_SESSIONS: usize = 32;
 
@@ -83,6 +226,13 @@ pub struct SlotStateSnapshot {
     master_slot: u8,
     slots: Option<Vec<ConnectSlot>>,
     slots_dirty: bool,
+}
+
+impl SlotStateSnapshot {
+    /// The master this snapshot belongs to.
+    pub fn master_slot(&self) -> u8 {
+        self.master_slot
+    }
 }
 
 /// Per-client session state (rate limiting + active identity).
@@ -155,6 +305,9 @@ pub struct PolicyEngine {
     pub bridge_authenticated: bool,
     /// Dirty flag: slots changed since last NVS write.
     pub slots_dirty: bool,
+    /// A pairing was added since the last write: the one change the NVS
+    /// growth gate applies to (`persist_slots`).
+    slot_added: bool,
     approval_epoch: Option<u32>,
     quarantined_masters: Vec<u8>,
     /// Monotonic counter stamped onto sessions on every access — recency
@@ -172,6 +325,7 @@ impl PolicyEngine {
             sessions: Vec::new(),
             bridge_authenticated: false,
             slots_dirty: false,
+            slot_added: false,
             approval_epoch: next_approval_epoch(),
             quarantined_masters: Vec::new(),
             session_seq: 0,
@@ -663,6 +817,7 @@ impl PolicyEngine {
     /// Restore a request's slot state after its durable write failed.
     pub fn restore_slot_state(&mut self, snapshot: SlotStateSnapshot) {
         self.invalidate_approvals();
+        self.slot_added = false;
         match snapshot.slots {
             Some(slots) => match self
                 .master_slots
@@ -697,7 +852,7 @@ impl PolicyEngine {
         let prior_dirty = snapshot.slots_dirty;
         self.restore_slot_state(snapshot);
         self.slots_dirty = true;
-        let restored = self.persist_slots(nvs, master_slot);
+        let restored = self.persist_slots_as(nvs, master_slot, SlotWrite::Repair);
         self.slots_dirty = if restored { prior_dirty } else { true };
         if !restored { self.quarantine(master_slot); }
         restored
@@ -734,6 +889,7 @@ impl PolicyEngine {
         };
         self.slots_mut(master_slot).push(new_slot);
         self.slots_dirty = true;
+        self.slot_added = true;
         Some(slot_index)
     }
 
@@ -772,6 +928,7 @@ impl PolicyEngine {
             client_grants: Some(heartwood_common::client_grants::GrantSnapshot::empty()),
         });
         self.slots_dirty = true;
+        self.slot_added = true;
         Some(slot_index)
     }
 
@@ -940,7 +1097,7 @@ impl PolicyEngine {
     /// (`heartwood_common::mgmt::revoke_client_identity`). Returns the parsed
     /// identity and whether the approved list changed, or `None` for no such
     /// slot. Live verdicts are dropped separately, by
-    /// [`Self::drop_withdrawn_verdicts`], once the change is durable.
+    /// [`Self::drop_withdrawn_verdicts`], before the change is saved.
     pub fn revoke_identity(
         &mut self,
         master_slot: u8,
@@ -1095,14 +1252,181 @@ impl PolicyEngine {
     // -------------------------------------------------------------------------
 
     /// Persist all slots for a master slot to NVS if changed since last write.
-    /// Transaction recovery relies on ESP-IDF NVS's single-key atomicity: a
-    /// `connslots_N` blob is assumed to be wholly old or wholly new, never a
-    /// torn mixture. Exact immediate read-back proves which desired value is
-    /// present; callers compensate with their prior snapshot when it does not.
+    /// Transaction recovery relies on a single-key replace being wholly old or
+    /// wholly new after a cut, never torn and never absent (`nvs::ReplaceBlob`).
+    /// Exact immediate read-back proves which desired value is present;
+    /// callers compensate with their prior snapshot when it does not.
+    ///
+    /// A new pairing must leave room to rewrite the largest pairing table in
+    /// place afterwards (`nvs::growth_allowed`, headroom hygiene);
+    /// cached avatars are dropped first if that makes the room. Otherwise
+    /// nothing is written and this returns false, so the caller rolls back.
+    /// A table with no room for a second copy is erased before its rewrite
+    /// (`nvs::ReplaceBlob`), so a cut there leaves this master with no
+    /// pairings, as every rewrite did before this firmware.
     pub fn persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
-        if !self.storage_ready(master_slot) { return false; }
+        self.try_persist_slots(nvs, master_slot).is_ok()
+    }
+
+    /// [`Self::persist_slots`], saying why a save did not happen, for the
+    /// replies to a new pairing: [`SlotSaveError::NoRoom`] is the growth
+    /// gate's refusal ([`PAIRING_STORAGE_FULL`]), anything else a fault.
+    pub fn try_persist_slots(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> Result<(), SlotSaveError> {
+        self.save_slots_as(nvs, master_slot, SlotWrite::Change).map_err(SlotSaveError::from)
+    }
+
+    /// Whether this master's pairing table is blocked until a restart after a
+    /// failed write (`nvs::write_blocked`). Replies about it should say so.
+    pub fn restart_needed(&self, master_slot: u8) -> bool {
+        crate::nvs::write_blocked(&format!("connslots_{master_slot}"))
+    }
+
+    /// Save a table that only lost authority (a revoked pairing, client key
+    /// or identity grant, or permissions narrowed). Never gated, and on
+    /// failure the prior table is NOT restored, in RAM or on flash: that
+    /// would re-authorise what was just revoked. RAM keeps the narrower table,
+    /// and the next change to this master writes it again (the dirty flag is
+    /// shared, so a save of another master does not; and not in this boot at
+    /// all after a write failed part-way, `nvs::write_blocked`). Live
+    /// approvals are withdrawn, as the old rollback did. The outcome says what
+    /// a restart would find.
+    ///
+    /// The dirty flag is shared by every master, so a save of another one
+    /// clears it while this master's table is still unsaved. So when it is
+    /// clear, the stored table is compared with RAM first
+    /// ([`Self::table_unsaved`]): repeating a revocation whose save failed
+    /// writes it, whatever was saved in between.
+    /// Mark the pairing tables unsaved. For a caller that has itself just
+    /// proven, by reading flash, that a master's stored table differs from
+    /// RAM: [`Self::persist_revocation`] must then write, not read flash a
+    /// second time and, on a read fault, answer saved without writing.
+    pub fn mark_slots_unsaved(&mut self) {
+        self.slots_dirty = true;
+    }
+
+    pub fn persist_revocation(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> RevocationSave {
+        if !self.slots_dirty && self.table_unsaved(nvs, master_slot) {
+            self.slots_dirty = true;
+        }
+        let saved = self.save_slots_as(nvs, master_slot, SlotWrite::Revoke);
+        let Err(why) = saved else {
+            return RevocationSave::Saved;
+        };
+        // What the old rollback did to live approvals, without the rollback:
+        // no approve-once window outlives a revocation that did not save.
+        self.invalidate_approvals();
+        self.slots_dirty = true;
+        use heartwood_common::policy::StoredSlotTable;
+        // Read as the repeat path reads it (`stored_slots`), so a repeat is
+        // advised only where it would find the stored table.
+        let stored = match Self::stored_table_bytes(nvs, master_slot) {
+            Some(None) => StoredSlotTable::Absent,
+            Some(Some(bytes)) if serde_json::from_slice::<Vec<ConnectSlot>>(&bytes).is_ok() => {
+                StoredSlotTable::Readable
+            }
+            _ => StoredSlotTable::Unreadable,
+        };
+        heartwood_common::policy::unsaved_revocation(
+            crate::nvs::write_blocked(&format!("connslots_{master_slot}")),
+            self.storage_ready(master_slot),
+            stored,
+            why == SaveFailure::NoRoomInPlace,
+        )
+        .into()
+    }
+
+    /// The bytes of this master's stored table: `Some(None)` when the key is
+    /// absent, `None` when it cannot be read or is over the load cap.
+    fn stored_table_bytes(nvs: &EspNvs<NvsDefault>, master_slot: u8) -> Option<Option<Vec<u8>>> {
+        let key = format!("connslots_{master_slot}");
+        match nvs.blob_len(&key) {
+            Ok(None) => Some(None),
+            Ok(Some(len)) if len <= MAX_SLOT_BLOB_BYTES => {
+                let mut buf = vec![0u8; len];
+                match nvs.get_blob(&key, &mut buf) {
+                    Ok(Some(stored)) if stored.len() == len => Some(Some(buf)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The stored table, parsed. `None` when absent or unreadable.
+    fn stored_slots(nvs: &EspNvs<NvsDefault>, master_slot: u8) -> Option<Vec<ConnectSlot>> {
+        let bytes = Self::stored_table_bytes(nvs, master_slot)??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// RAM's table for a master whose pairings can be written, or `None`.
+    fn ram_table(&self, master_slot: u8) -> Option<&[ConnectSlot]> {
+        if !self.storage_ready(master_slot) {
+            return None;
+        }
+        self.master_slots
+            .iter()
+            .find(|ms| ms.master_slot == master_slot)
+            .map(|ms| ms.slots.as_slice())
+    }
+
+    /// Whether this master's table in RAM differs from the one on flash
+    /// (`heartwood_common::policy::slot_table_unsaved`): a change, such as a
+    /// revocation whose save failed, that no save has written. False when
+    /// RAM has no table for it, the master is quarantined, or the stored
+    /// table cannot be read: nothing is written on a guess.
+    pub fn table_unsaved(&self, nvs: &EspNvs<NvsDefault>, master_slot: u8) -> bool {
+        let Some(ram) = self.ram_table(master_slot) else {
+            return false;
+        };
+        Self::stored_table_bytes(nvs, master_slot)
+            .is_some_and(|stored| heartwood_common::policy::slot_table_unsaved(stored.as_deref(), ram))
+    }
+
+    /// The stored copy of pairing `slot_index` when RAM has revoked it and
+    /// flash still has it: an earlier revocation whose save failed
+    /// ([`RevocationSave::OnlyUntilRestart`]). A revocation that finds no
+    /// such pairing in RAM checks this before answering "not found", and if
+    /// it is `Some`, saves with [`Self::persist_revocation`] instead.
+    pub fn unsaved_slot_revocation(
+        &self,
+        nvs: &EspNvs<NvsDefault>,
+        master_slot: u8,
+        slot_index: u8,
+    ) -> Option<ConnectSlot> {
+        let ram = self.ram_table(master_slot)?;
+        let stored = Self::stored_slots(nvs, master_slot)?;
+        heartwood_common::policy::unsaved_slot_revocation(&stored, ram, slot_index).cloned()
+    }
+
+    /// As [`Self::unsaved_slot_revocation`], for one client key of a pairing
+    /// (`heartwood_common::policy::unsaved_key_removal`).
+    pub fn unsaved_key_removal(
+        &self,
+        nvs: &EspNvs<NvsDefault>,
+        master_slot: u8,
+        slot_index: u8,
+        pubkey: &str,
+    ) -> bool {
+        let Some(ram) = self.ram_table(master_slot) else {
+            return false;
+        };
+        Self::stored_slots(nvs, master_slot)
+            .is_some_and(|stored| heartwood_common::policy::unsaved_key_removal(&stored, ram, slot_index, pubkey))
+    }
+
+    fn persist_slots_as(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8, mode: SlotWrite) -> bool {
+        self.save_slots_as(nvs, master_slot, mode).is_ok()
+    }
+
+    fn save_slots_as(
+        &mut self,
+        nvs: &mut EspNvs<NvsDefault>,
+        master_slot: u8,
+        mode: SlotWrite,
+    ) -> Result<(), SaveFailure> {
+        if !self.storage_ready(master_slot) { return Err(SaveFailure::Failed); }
         if !self.slots_dirty {
-            return true;
+            return Ok(());
         }
         let key = format!("connslots_{master_slot}");
         let ms = self
@@ -1111,8 +1435,10 @@ impl PolicyEngine {
             .find(|ms| ms.master_slot == master_slot);
         if ms.is_some_and(|m| heartwood_common::policy::validate_slot_table(&m.slots).is_err()) {
             log::error!("Invalid slot table for master {master_slot}; not written");
-            return false;
+            return Err(SaveFailure::Failed);
         }
+        // Set when the store refused the write for lack of room.
+        let mut no_room = false;
         let persisted = match ms {
             Some(ms) => match serde_json::to_string(&ms.slots) {
                 // A table the boot loader could not read back is refused, not
@@ -1122,20 +1448,47 @@ impl PolicyEngine {
                     false
                 }
                 Ok(json) => {
-                    let mut written = nvs.set_blob(&key, json.as_bytes());
-                    // Pairings outrank the avatar cache: if the write fails
-                    // (in practice, NVS full), drop the avatars and try once
-                    // more before refusing.
-                    if written.is_err() && evict_avatar_cache(nvs) > 0 {
-                        log::warn!(
-                            "Slot table for slot {master_slot} did not fit: dropped cached avatars, retrying"
+                    let stored_len = nvs.blob_len(&key);
+                    let growing = !matches!(stored_len, Ok(Some(len)) if json.len() <= len);
+                    let adding = core::mem::take(&mut self.slot_added);
+                    if mode == SlotWrite::Change
+                        && adding
+                        && growing
+                        && !crate::nvs::growth_allowed(nvs, &key, json.len())
+                        && (evict_avatar_cache(nvs) == 0 || !crate::nvs::growth_allowed(nvs, &key, json.len()))
+                    {
+                        log::error!(
+                            "Slot table for slot {master_slot} would leave too little room to rewrite it in place; not written"
                         );
-                        written = nvs.set_blob(&key, json.as_bytes());
+                        return Err(SaveFailure::Gated);
                     }
+                    // A present table may be erased before its rewrite, and
+                    // boot rebuilds a default pairing from a pre-migration
+                    // `master_N_conn` whenever the table is absent. So that
+                    // credential goes first; if it cannot, write in place only.
+                    let table_present = !matches!(stored_len, Ok(None));
+                    let may_erase = !table_present || clear_legacy_connection(nvs, master_slot);
+                    let write = |nvs: &mut EspNvs<NvsDefault>| {
+                        if may_erase {
+                            nvs.replace_blob(&key, json.as_bytes())
+                        } else {
+                            nvs.replace_blob_in_place(&key, json.as_bytes())
+                        }
+                    };
+                    // Pairings outrank the avatar cache: if the table has no
+                    // room beside what is stored, drop the avatars BEFORE
+                    // writing. Not after a failure: a table is several chunks,
+                    // and a failed multi-chunk write must not be repeated in
+                    // the same boot (`nvs::write_blocked`).
+                    if !crate::nvs::fits(nvs, json.len()) && evict_avatar_cache(nvs) > 0 {
+                        log::warn!("Slot table for slot {master_slot} short of room: dropped cached avatars");
+                    }
+                    let written = write(nvs);
                     if let Err(e) = written {
                         log::error!("Failed to persist slots for slot {master_slot}: {e:?}");
+                        no_room = crate::nvs::is_no_room(&e);
                     }
-                    // A success return from set_blob is not the authority
+                    // A success return from replace_blob is not the authority
                     // boundary. Read the exact bytes back before a caller may
                     // ACK a new client or signing grant.
                     match nvs.blob_len(&key) {
@@ -1195,8 +1548,12 @@ impl PolicyEngine {
         };
         if persisted {
             self.slots_dirty = false;
+            Ok(())
+        } else if no_room {
+            Err(SaveFailure::NoRoomInPlace)
+        } else {
+            Err(SaveFailure::Failed)
         }
-        persisted
     }
 
     /// Start a physically approved backup recovery from a quarantined table.
@@ -1207,7 +1564,7 @@ impl PolicyEngine {
     pub fn recover_pairings_for_backup_restore(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
         if self.storage_ready(master_slot) { return true; }
         let key = format!("connslots_{master_slot}");
-        let _ = nvs.set_blob(&key, b"[]");
+        let _ = nvs.replace_blob(&key, b"[]");
         let mut verify = [0u8; 2];
         let verified = matches!(nvs.blob_len(&key), Ok(Some(2)))
             && matches!(nvs.get_blob(&key, &mut verify), Ok(Some(bytes)) if bytes == b"[]");
@@ -1328,7 +1685,7 @@ impl PolicyEngine {
         let mut persist_failed = false;
         for master_slot in persist_migrations {
             engine.slots_dirty = true;
-            if !engine.persist_slots(nvs, master_slot) {
+            if !engine.persist_slots_as(nvs, master_slot, SlotWrite::Repair) {
                 // Migration is not active until its exact durable form verifies.
                 // Retain the old disk value for recovery but serve no volatile grants.
                 engine.quarantine(master_slot);

@@ -36,6 +36,20 @@ pub struct MockNvsState {
     faults: Vec<Fault>,
     /// Keys touched since the last `take_log`.
     log: Vec<(String, NvsOp)>,
+    /// A partition of this many entries: replaces then follow
+    /// `nvs_budget::plan_replace` as the firmware's `ReplaceBlob` does, and
+    /// `growth_allowed` its gate. `None` is unlimited.
+    capacity: Option<usize>,
+}
+
+impl MockNvsState {
+    fn used(&self) -> usize {
+        self.store.values().map(|v| heartwood_common::nvs_budget::stored_entries_min(v.len())).sum()
+    }
+
+    fn available(&self) -> usize {
+        self.capacity.map_or(usize::MAX / 4, |c| c.saturating_sub(self.used()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +126,16 @@ impl NvsDefault {
 
     pub fn contains(&self, key: &str) -> bool {
         self.inner.borrow().store.contains_key(key)
+    }
+
+    /// Limit the partition to what is stored now plus `headroom` entries.
+    pub fn limit_headroom(&self, headroom: usize) {
+        let mut state = self.inner.borrow_mut();
+        state.capacity = Some(state.used() + headroom);
+    }
+
+    pub fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.inner.borrow().store.get(key).cloned()
     }
 }
 
@@ -236,11 +260,140 @@ impl EspNvs<NvsDefault> {
 // Real firmware engine + helpers
 // ---------------------------------------------------------------------------
 
-pub mod nvs { pub use super::{EspNvs, NvsDefault}; }
+/// Stands in for the firmware's `crate::nvs::ReplaceBlob`, which `policy.rs`,
+/// `personas.rs` and `masters.rs` import: on the board a replace that leaves
+/// the old or the new value after a cut, planned against the entry budget
+/// first. The mock's `set_blob` is the in-place write; with a capacity set,
+/// the plan is the firmware's (`nvs_budget::plan_replace`), including the
+/// retry of the new value after an erase.
+pub trait ReplaceBlob {
+    fn replace_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str>;
+    fn replace_blob_in_place(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str>;
+    fn overwrite_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str>;
+}
+
+thread_local! {
+    /// The firmware's `nvs::FAILED_WRITES`, per test thread.
+    static FAILED_WRITES: RefCell<heartwood_common::nvs_budget::FailedWrites> =
+        RefCell::new(heartwood_common::nvs_budget::FailedWrites::new());
+}
+
+/// Stands in for the firmware's `crate::nvs::fits`.
+pub fn fits(nvs: &EspNvs<NvsDefault>, len: usize) -> bool {
+    heartwood_common::nvs_budget::blob_entries(len) <= nvs.backend.inner.borrow().available()
+}
+
+/// Stands in for the firmware's `crate::nvs::write_blocked`.
+pub fn write_blocked(key: &str) -> bool {
+    FAILED_WRITES.with(|f| f.borrow().blocks(key))
+}
+
+fn record_failure(key: &str, len: usize) -> bool {
+    FAILED_WRITES.with(|f| f.borrow_mut().record(key, len))
+}
+
+impl EspNvs<NvsDefault> {
+    fn planned_write(
+        &mut self,
+        key: &str,
+        data: &[u8],
+        fallback: heartwood_common::nvs_budget::Fallback,
+    ) -> Result<(), &'static str> {
+        use heartwood_common::nvs_budget::{plan_replace, Plan};
+        if write_blocked(key) {
+            return Err("blocked until a restart");
+        }
+        let plan = {
+            let state = self.backend.inner.borrow();
+            let old = state.store.get(key);
+            if state.capacity.is_some() && old.map(Vec::as_slice) == Some(data) {
+                return Ok(());
+            }
+            plan_replace(fallback, state.available(), old.map(Vec::len), data.len())
+        };
+        // A write that does not fit at all fails as ESP-IDF's would.
+        let room = |nvs: &Self| {
+            let state = nvs.backend.inner.borrow();
+            state.capacity.is_none()
+                || heartwood_common::nvs_budget::stored_entries_min(data.len()) <= state.available()
+        };
+        match plan {
+            Plan::Direct if room(self) => self.set_blob(key, data).inspect_err(|_| {
+                record_failure(key, data.len());
+            }),
+            Plan::Direct => Err("not enough space"),
+            Plan::EraseFirst => {
+                self.backend.inner.borrow_mut().store.remove(key);
+                if !room(self) {
+                    return Err("not enough space");
+                }
+                match self.set_blob(key, data) {
+                    Ok(()) => Ok(()),
+                    Err(_) if record_failure(key, data.len()) => self.set_blob(key, data),
+                    Err(e) => Err(e),
+                }
+            }
+            Plan::Refuse => Err("not enough space"),
+        }
+    }
+}
+
+impl ReplaceBlob for EspNvs<NvsDefault> {
+    fn replace_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str> {
+        self.planned_write(key, data, heartwood_common::nvs_budget::fallback_for(key))
+    }
+
+    fn replace_blob_in_place(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str> {
+        self.planned_write(key, data, heartwood_common::nvs_budget::Fallback::Never)
+    }
+
+    fn overwrite_blob(&mut self, key: &str, data: &[u8]) -> Result<(), &'static str> {
+        self.planned_write(key, data, heartwood_common::nvs_budget::Fallback::EraseFirst)
+    }
+}
+
+/// Stands in for the firmware's `crate::nvs::growth_allowed`.
+pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+    let state = nvs.backend.inner.borrow();
+    let largest = heartwood_common::nvs_budget::hot_keys()
+        .filter_map(|k| state.store.get(&k).map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    heartwood_common::nvs_budget::growth_allowed(
+        state.available(),
+        state.store.get(key).map(Vec::len),
+        new_len,
+        largest,
+    )
+}
+
+/// Stands in for the firmware's `crate::nvs::growth_run`.
+pub fn growth_run(nvs: &EspNvs<NvsDefault>, steps: &[(Option<usize>, usize)]) -> usize {
+    let state = nvs.backend.inner.borrow();
+    let largest = heartwood_common::nvs_budget::hot_keys()
+        .filter_map(|k| state.store.get(&k).map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    heartwood_common::nvs_budget::growth_run(state.available(), largest, steps.iter().copied())
+}
+
+/// Stands in for the firmware's `crate::nvs::is_no_room`: the mock's
+/// refusal for lack of room, from a planned write or one that does not fit.
+pub fn is_no_room(e: &&'static str) -> bool {
+    *e == "not enough space"
+}
+
+pub mod nvs { pub use super::{fits, growth_allowed, growth_run, is_no_room, write_blocked, EspNvs, NvsDefault, ReplaceBlob}; }
 
 #[path = "../../firmware/src/policy.rs"]
 pub mod engine;
-use engine::PolicyEngine;
+
+/// The real persona registry and identity removal, over the same mock NVS.
+#[path = "../../firmware/src/personas.rs"]
+pub mod personas;
+#[path = "../../firmware/src/masters.rs"]
+pub mod masters;
+use engine::{PolicyEngine, RevocationSave};
 
 // ---------------------------------------------------------------------------
 // Fixtures / helpers
@@ -690,17 +843,23 @@ fn full_storage_drops_the_avatar_cache_before_refusing_pairings() {
     nvs.backend.seed("imav0", &[1, 1, 0, 0]);
     nvs.backend.seed("imav2", &[1, 1, 0, 0]);
     nvs.backend.seed("iman0", b"TheCryptoDonkey");
+    nvs.backend.seed("imav3", &vec![0u8; 8194]);
     let mut engine = PolicyEngine::new();
     engine.create_slot(0, "app".into(), secret_hex(0x06)).unwrap();
-    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
-    assert!(engine.persist_slots(&mut nvs, 0), "the retry after eviction lands");
-    assert!(!nvs.backend.contains("imav0") && !nvs.backend.contains("imav2"));
+    // No room for the table until the avatars go: they are dropped before
+    // the write, and the write lands.
+    nvs.backend.limit_headroom(20);
+    assert!(engine.persist_slots(&mut nvs, 0), "the write after eviction lands");
+    assert!(!nvs.backend.contains("imav0") && !nvs.backend.contains("imav2") && !nvs.backend.contains("imav3"));
     assert!(nvs.backend.contains("iman0"), "the name is not a cache");
 
-    // Nothing left to drop: the failure is reported, not retried.
+    // A write that fails is not retried: a table is several chunks, and a
+    // failed multi-chunk write is not repeated in the same boot.
     engine.create_slot(0, "second".into(), secret_hex(0x07)).unwrap();
+    nvs.backend.limit_headroom(10_000);
     nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
     assert!(!engine.persist_slots(&mut nvs, 0));
+    assert!(write_blocked(CONNSLOTS_0));
 }
 
 #[test]
@@ -1050,6 +1209,529 @@ fn physically_approved_backup_recovery_requires_verified_empty_baseline() {
     let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
     assert!(reloaded.storage_ready(0));
     assert!(reloaded.list_slots(0).is_empty(), "empty table must suppress old-secret migration");
+}
+
+// ---------------------------------------------------------------------------
+// A full partition
+// ---------------------------------------------------------------------------
+//
+// The bench V4 had about 17 entries free: far short of a second copy of a
+// pairing table or persona chunk. These run the real policy, persona and
+// identity-removal code against that, through the firmware's write plan.
+
+/// The bench V4's measured headroom.
+const BENCH_HEADROOM: usize = 17;
+
+/// A persisted table for master 0 with `n` pairings, on a board that still
+/// holds its pre-migration `master_0_conn` credential.
+fn full_table(n: u8) -> (EspNvs<NvsDefault>, PolicyEngine) {
+    let mut nvs = EspNvs::new();
+    let mut engine = PolicyEngine::new();
+    for i in 0..n {
+        let slot = engine.create_slot(0, format!("app {i}"), secret_hex(0x10 + i)).unwrap();
+        assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(0x60 + i)));
+    }
+    assert!(engine.persist_slots(&mut nvs, 0));
+    nvs.backend.seed(MASTER_0_CONN, &legacy_secret_bytes(0x5E));
+    (nvs, engine)
+}
+
+fn slot_indices(nvs: &mut EspNvs<NvsDefault>) -> Vec<u8> {
+    PolicyEngine::load_from_nvs(nvs, 1).list_slots(0).iter().map(|s| s.slot_index).collect()
+}
+
+#[test]
+fn a_revocation_on_a_full_partition_is_saved() {
+    let (mut nvs, mut engine) = full_table(8);
+    let before = slot_indices(&mut nvs);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    assert!(engine.revoke_slot(0, 3));
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
+    let after = slot_indices(&mut nvs);
+    assert!(!after.contains(&3));
+    assert_eq!(after.len(), before.len() - 1);
+    assert!(!nvs.backend.contains(MASTER_0_CONN), "the legacy credential went first");
+}
+
+#[test]
+fn an_ordinary_change_on_a_full_partition_is_saved_too() {
+    let (mut nvs, mut engine) = full_table(8);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    assert!(engine.update_slot(0, 2, Some("renamed".into()), None, None, None));
+    assert!(engine.persist_slots(&mut nvs, 0));
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    assert_eq!(reloaded.list_slots(0).iter().find(|s| s.slot_index == 2).unwrap().label, "renamed");
+}
+
+/// One pairing holding eight client keys, on a board with the bench V4's
+/// headroom. A ninth key forgets the oldest, so the table is rewritten whole.
+fn full_pairing_at_bench_headroom() -> (EspNvs<NvsDefault>, PolicyEngine, u8, Vec<String>) {
+    let mut nvs = EspNvs::new();
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "full".into(), secret_hex(2)).unwrap();
+    let clients: Vec<String> = (1..=8).map(pubkey_hex).collect();
+    for client in &clients {
+        assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    }
+    assert!(engine.persist_slots(&mut nvs, 0));
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    (nvs, engine, slot, clients)
+}
+
+#[test]
+fn a_ninth_key_on_a_full_pairing_lands_on_a_full_partition() {
+    let (mut nvs, mut engine, slot, clients) = full_pairing_at_bench_headroom();
+    let ninth = pubkey_hex(9);
+    assert!(engine.assign_pubkey_to_slot(0, slot, ninth.clone()));
+    assert!(engine.persist_slots(&mut nvs, 0));
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    let retained = &reloaded.list_slots(0)[0];
+    assert_eq!(retained.current_pubkey.as_deref(), Some(ninth.as_str()));
+    assert!(!retained.authorized_pubkeys.contains(&clients[0]), "the oldest is forgotten");
+    for client in &clients[1..] {
+        assert!(heartwood_common::policy::slot_authorizes(retained, client));
+    }
+}
+
+/// Pins the documented residual, so a change to it is a decision and not an
+/// accident: with no room for a second copy the pairing table is rewritten
+/// erase-first, so a failed write loses every pairing of that identity until
+/// a restart, not only the newcomer. A full pairing meets this on each new key.
+#[test]
+fn a_ninth_key_whose_write_fails_loses_the_table_and_blocks_it_until_restart() {
+    let (mut nvs, mut engine, slot, _) = full_pairing_at_bench_headroom();
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(9)));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert!(!engine.persist_slots(&mut nvs, 0), "the write failed, so it is not saved");
+    assert!(nvs::write_blocked(CONNSLOTS_0), "nothing rewrites that table this boot");
+    assert!(engine.restart_needed(0));
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    assert!(reloaded.list_slots(0).is_empty(), "fails closed: no pairing gains access");
+}
+
+#[test]
+fn a_small_value_is_retried_after_the_erase_and_a_large_one_is_not() {
+    // One chunk (at most 400 bytes): a failed write after the erase is tried
+    // again at once.
+    let (mut nvs, _) = full_table(8);
+    nvs.backend.seed("pinned_rly", &[1u8; 300]);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    nvs.backend.fail_once(NvsOp::SetBlob, "pinned_rly", FaultKind::WriteFailBeforeCommit);
+    assert!(nvs.replace_blob("pinned_rly", &[2u8; 290]).is_ok());
+    assert_eq!(nvs.backend.get("pinned_rly").unwrap(), vec![2u8; 290]);
+
+    // Several chunks: no retry, and no further write of that key this boot,
+    // the next change included.
+    let (mut nvs, mut engine) = full_table(8);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    assert!(engine.revoke_slot(0, 3));
+    nvs.backend.take_log();
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::TableGone, "missing AND blocked: nothing can save it this boot");
+    assert!(nvs::write_blocked(CONNSLOTS_0));
+    assert!(engine.restart_needed(0));
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_full: "), "{reply}");
+    assert!(reply.contains("every pairing of this identity is gone after a restart"), "{reply}");
+    assert!(!reply.contains("unless a later change"), "{reply}");
+    assert!(reply.contains(engine::RESTART_ADVICE), "{reply}");
+    let writes = nvs.backend.take_log().iter().filter(|(k, op)| k == CONNSLOTS_0 && *op == NvsOp::SetBlob).count();
+    assert_eq!(writes, 1, "one attempt only");
+    assert!(engine.revoke_slot(0, 4));
+    assert!(!engine.persist_slots(&mut nvs, 0));
+    assert!(!nvs.backend.contains(CONNSLOTS_0));
+    assert!(!engine.list_slots(0).iter().any(|s| s.slot_index == 3 || s.slot_index == 4));
+}
+
+#[test]
+fn a_part_written_table_with_the_old_copy_present_is_reported_uncertain() {
+    // With room, a direct write that fails part-way may have damaged the
+    // stored copy: neither "saved" nor "until restart" is true.
+    let (mut nvs, mut engine) = full_table(8);
+    assert!(engine.revoke_slot(0, 3));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::Uncertain);
+    assert!(!engine.list_slots(0).iter().any(|s| s.slot_index == 3), "RAM keeps the revocation");
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_failed: ") && reply.contains(engine::RESTART_ADVICE), "{reply}");
+}
+
+#[test]
+fn a_revocation_that_cannot_be_rewritten_is_never_rolled_back() {
+    // The write after the erase fails: the table is gone, and so is the
+    // revoked pairing. Nothing brings the old, wider table back, and live
+    // approvals are withdrawn as the old rollback did.
+    let (mut nvs, mut engine) = full_table(8);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    engine.install_transient_allow(0, pubkey_hex(0x61), "sign_event:1".into(), None, 60);
+    let epoch = engine.approval_epoch();
+    assert!(engine.revoke_slot(0, 3));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::TableGone);
+    assert!(!engine.list_slots(0).iter().any(|s| s.slot_index == 3), "RAM keeps the revocation");
+    assert!(!engine.approval_is_current(epoch), "pending approvals and windows withdrawn");
+    assert!(slot_indices(&mut nvs).is_empty(), "no pairings, not the legacy one");
+}
+
+#[test]
+fn a_lost_single_chunk_table_can_still_be_saved_by_a_later_change() {
+    // Revoking the only pairing leaves "[]", one chunk. With no room it is
+    // erased first; both writes after the erase fail, but the key is not
+    // blocked, so the reply may promise a later save, and one lands.
+    let (mut nvs, mut engine) = full_table(1);
+    nvs.backend.limit_headroom(0);
+    assert!(engine.revoke_slot(0, 0));
+    nvs.backend.push_fault(Fault {
+        op: NvsOp::SetBlob,
+        key: Some(CONNSLOTS_0.into()),
+        remaining_calls: 2,
+        kind: FaultKind::WriteFailBeforeCommit,
+    });
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::TableLost);
+    assert!(!engine.restart_needed(0));
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_full: ") && reply.contains("unless a later change"), "{reply}");
+    assert!(engine.persist_slots(&mut nvs, 0));
+    assert_eq!(nvs.backend.get(CONNSLOTS_0).unwrap(), b"[]");
+}
+
+#[test]
+fn a_revocation_that_fails_with_the_old_table_intact_holds_until_restart() {
+    // Revoking the only pairing leaves "[]", one chunk, written in place;
+    // that write fails cleanly, so the old table is still on flash and the
+    // revocation holds until the restart only.
+    let (mut nvs, mut engine) = full_table(1);
+    assert!(engine.revoke_slot(0, 0));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::OnlyUntilRestart);
+    assert!(!outcome.describe("pairing revocation").unwrap_err().contains(engine::RESTART_ADVICE), "not blocked");
+    assert!(engine.list_slots(0).is_empty());
+    assert_eq!(slot_indices(&mut nvs), vec![0]);
+    assert!(!nvs::write_blocked(CONNSLOTS_0), "one chunk: not blocked");
+}
+
+#[test]
+fn a_cut_inside_an_erase_first_rewrite_leaves_no_pairings_not_a_legacy_one() {
+    // Why the legacy credential is removed first: an absent table with it
+    // still present brings back a default pairing on the next boot.
+    let mut bare = EspNvs::new();
+    bare.backend.seed(MASTER_0_CONN, &legacy_secret_bytes(0x5E));
+    assert_eq!(slot_indices(&mut bare), vec![0], "absence resurrects the legacy slot");
+
+    let (mut nvs, mut engine) = full_table(8);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    assert!(engine.update_slot(0, 2, Some("renamed".into()), None, None, None));
+    // The erase lands and the write after it does not: the cut's window.
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert!(!engine.persist_slots(&mut nvs, 0));
+    assert!(!nvs.backend.contains(CONNSLOTS_0));
+    assert!(!nvs.backend.contains(MASTER_0_CONN));
+    assert!(slot_indices(&mut nvs).is_empty());
+}
+
+#[test]
+fn a_growing_table_keeps_room_to_rewrite_in_place() {
+    let (mut nvs, mut engine) = full_table(4);
+    let stored = nvs.backend.get(CONNSLOTS_0).unwrap();
+    nvs.backend.limit_headroom(160);
+
+    // A fifth pairing would fit, but leave too little room to rewrite the
+    // table in place afterwards: refused, nothing written.
+    let snapshot = engine.snapshot_slot_state(0);
+    engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    let grown = serde_json::to_string(engine.list_slots(0)).unwrap().len();
+    assert!(heartwood_common::nvs_budget::blob_entries(grown) <= 160, "the new copy alone fits");
+    assert!(!engine.persist_slots(&mut nvs, 0));
+    assert!(engine.restore_slot_state_durably(&mut nvs, snapshot));
+    assert_eq!(nvs.backend.get(CONNSLOTS_0).unwrap(), stored);
+
+    // Pairings outrank cached avatars: with one to drop, the same pairing
+    // goes through, and a revocation afterwards still fits in place.
+    nvs.backend.seed("imav0", &vec![0u8; 8194]);
+    nvs.backend.limit_headroom(160);
+    let fifth = engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    assert!(engine.persist_slots(&mut nvs, 0));
+    assert!(!nvs.backend.contains("imav0"));
+    assert!(engine.revoke_slot(0, fifth));
+    let old_table = nvs.backend.get(CONNSLOTS_0).unwrap();
+    let available = nvs.backend.inner.borrow().available();
+    assert!(heartwood_common::nvs_budget::blob_entries(old_table.len()) <= available, "in place, no erase");
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
+}
+
+#[test]
+fn repeating_a_revocation_that_did_not_save_saves_it() {
+    // Review finding A. The legacy credential cannot be removed, so the
+    // table may only be rewritten in place, and at the bench headroom it has
+    // no room for that: the revocation holds until the next restart only,
+    // and the reply says room is what is missing, not that a write failed.
+    let (mut nvs, mut engine) = full_table(8);
+    let other = engine.create_slot(1, "other identity".into(), secret_hex(0x31)).unwrap();
+    assert!(engine.persist_slots(&mut nvs, 1));
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    nvs.backend.fail_once(NvsOp::Remove, MASTER_0_CONN, FaultKind::RemoveFail);
+    assert!(engine.revoke_slot(0, 3));
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::NoRoom);
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_full: "), "{reply}");
+    assert!(reply.contains("free some room") && reply.contains("then repeat the request"), "{reply}");
+    assert!(!reply.contains(engine::RESTART_ADVICE), "not blocked: {reply}");
+    assert!(slot_indices(&mut nvs).contains(&3), "flash still has it");
+    assert!(engine.table_unsaved(&nvs, 0));
+
+    // A save of another identity clears the shared dirty flag meanwhile.
+    assert!(engine.update_slot(1, other, Some("renamed".into()), None, None, None));
+    assert!(engine.persist_slots(&mut nvs, 1));
+    assert!(!engine.slots_dirty);
+
+    // The retry finds no pairing 3 in RAM; flash still has it, so it is an
+    // unsaved revocation, not "not found", and saving it now lands.
+    assert!(!engine.revoke_slot(0, 3));
+    let stored = engine.unsaved_slot_revocation(&nvs, 0, 3).expect("the stored copy of pairing 3");
+    assert_eq!(stored.slot_index, 3);
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 9).is_none(), "never existed: still not found");
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 2).is_none(), "still live: an ordinary revocation");
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
+    assert!(!slot_indices(&mut nvs).contains(&3), "the narrower table is on flash");
+    assert!(!engine.table_unsaved(&nvs, 0));
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 3).is_none(), "a third try is a real not found");
+
+    // In sync, a revocation that changes nothing writes nothing.
+    nvs.backend.take_log();
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
+    assert!(!nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob));
+}
+
+#[test]
+fn a_change_refused_in_place_for_room_is_still_reported_as_a_failed_write() {
+    // Only a revocation's reply tells the in-place refusal apart: a pairing
+    // change under the same conditions answers as it did before.
+    use engine::SlotSaveError;
+    let (mut nvs, mut engine) = full_table(8);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    nvs.backend.fail_once(NvsOp::Remove, MASTER_0_CONN, FaultKind::RemoveFail);
+    assert!(engine.update_slot(0, 2, Some("renamed".into()), None, None, None));
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::Failed));
+}
+
+#[test]
+fn a_revocation_on_a_quarantined_identity_asks_for_a_restart_not_a_repeat() {
+    // Review finding: a master quarantined because its legacy migration could
+    // not persist has the migrated pairing in RAM, no table on flash and the
+    // legacy credential still there. A revocation edits RAM, the save writes
+    // nothing, and a repeat answers "not found" (`ram_table` is `None` while
+    // quarantined). The migrated table is several chunks, so its failed write
+    // also blocked the key, and reading the absent table the old reply
+    // claimed the revocation saved (`TableGone`), though the next boot turns
+    // the credential back into that pairing.
+    let mut nvs = EspNvs::new();
+    nvs.backend.seed(MASTER_0_CONN, &legacy_secret_bytes(0x5E));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    let mut engine = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    assert!(!engine.storage_ready(0), "the migration did not persist");
+    assert!(engine.revoke_slot(0, 0), "RAM still holds the migrated pairing");
+    nvs.backend.take_log();
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::RestartFirst);
+    assert!(!nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob), "nothing written");
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_unavailable: ") && reply.contains("restart the device, then repeat"), "{reply}");
+    assert!(!reply.contains("repeat the request to try the save again"), "{reply}");
+    assert!(!reply.contains("is saved"), "{reply}");
+    // What the repeat would meet, and why the reply cannot say "saved": no
+    // table and the legacy credential, which a boot turns back into the
+    // pairing (`a_cut_inside_an_erase_first_rewrite_...` pins that).
+    assert!(!engine.revoke_slot(0, 0));
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 0).is_none(), "a repeat answers not found");
+    assert!(!nvs.backend.contains(CONNSLOTS_0) && nvs.backend.contains(MASTER_0_CONN));
+}
+
+#[test]
+fn a_revocation_whose_table_cannot_be_read_asks_for_a_restart_not_a_repeat() {
+    // Review finding: the stored table stops reading mid-boot. The save
+    // fails, and a repeat finds no stored copy to compare (`stored_slots` is
+    // `None`), so it answers "no such slot". One pairing, so its "[]" is one
+    // chunk and a failed write does not block the key.
+    let (mut nvs, mut engine) = full_table(1);
+    assert!(engine.revoke_slot(0, 0));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    nvs.backend.push_fault(Fault {
+        op: NvsOp::BlobLen,
+        key: Some(CONNSLOTS_0.into()),
+        remaining_calls: 64,
+        kind: FaultKind::ReadError,
+    });
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::RestartFirst);
+    assert!(!nvs::write_blocked(CONNSLOTS_0));
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_unavailable: ") && reply.contains("restart the device, then repeat"), "{reply}");
+    assert!(!engine.revoke_slot(0, 0));
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 0).is_none(), "a repeat answers no such slot");
+}
+
+#[test]
+fn an_unreadable_or_absent_table_is_never_taken_for_an_unsaved_one() {
+    // No table in RAM for the master: nothing to save on a guess.
+    let (nvs, engine) = full_table(2);
+    assert!(!engine.table_unsaved(&nvs, 4));
+    assert!(engine.unsaved_slot_revocation(&nvs, 4, 0).is_none());
+    // A stored table that cannot be read is not compared.
+    let (nvs, mut engine) = full_table(2);
+    assert!(engine.revoke_slot(0, 1));
+    nvs.backend.fail_once(NvsOp::BlobLen, CONNSLOTS_0, FaultKind::ReadError);
+    assert!(!engine.table_unsaved(&nvs, 0));
+    nvs.backend.fail_once(NvsOp::BlobLen, CONNSLOTS_0, FaultKind::ReadError);
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 1).is_none());
+    assert!(engine.table_unsaved(&nvs, 0), "once it reads, the revocation is unsaved");
+}
+
+#[test]
+fn a_pairing_the_growth_gate_refuses_says_storage_full_and_a_fault_does_not() {
+    use engine::{SlotSaveError, PAIRING_STORAGE_FULL};
+    assert!(PAIRING_STORAGE_FULL.starts_with("storage_full: "));
+
+    // Short of room: the gate refuses before anything is written.
+    let (mut nvs, mut engine) = full_table(4);
+    let stored = nvs.backend.get(CONNSLOTS_0).unwrap();
+    nvs.backend.limit_headroom(160);
+    let snapshot = engine.snapshot_slot_state(0);
+    engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    nvs.backend.take_log();
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::NoRoom));
+    assert!(
+        !nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob),
+        "nothing written"
+    );
+    assert!(engine.restore_slot_state_durably(&mut nvs, snapshot));
+    assert_eq!(nvs.backend.get(CONNSLOTS_0).unwrap(), stored);
+
+    // With room it saves.
+    let (mut nvs, mut engine) = full_table(4);
+    engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Ok(()));
+
+    // With room, a failed write is a fault, not a full board. (Last: the
+    // failure blocks the key for the rest of this test thread's "boot".)
+    let (mut nvs, mut engine) = full_table(4);
+    engine.create_slot(0, "app 6".into(), secret_hex(0x78)).unwrap();
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::Failed));
+}
+
+fn persona_key(n: u8) -> [u8; 32] {
+    [n; 32]
+}
+
+/// `n` personas under master 0, with a full pairing table beside them.
+fn board_with_personas(n: u8) -> EspNvs<NvsDefault> {
+    let (mut nvs, _) = full_table(8);
+    for i in 0..n {
+        personas::add(&mut nvs, 0, "purpose-of-some-length", i as u32, Some("a persona name"), &persona_key(i + 1)).unwrap();
+    }
+    nvs
+}
+
+#[test]
+fn a_bundle_pre_check_gates_every_name_as_add_will() {
+    // Review finding D. Across a range of headroom, the pre-check never
+    // promises more registrations than `add` then makes, and somewhere near
+    // the limit it is what tells one name from two.
+    let mut two_refused = false;
+    for headroom in 0..400 {
+        let mut nvs = board_with_personas(3);
+        nvs.backend.limit_headroom(headroom);
+        let one = personas::registrations_that_fit(&nvs, 1);
+        assert_eq!(one == 1, personas::capacity_check(&nvs).is_ok(), "one name is capacity_check ({headroom})");
+        let promised = personas::registrations_that_fit(&nvs, 2);
+        let mut added = 0;
+        for i in 0..2u8 {
+            match personas::add(&mut nvs, 0, "purpose-of-some-length", 10 + u32::from(i), Some("a persona name"), &persona_key(0x40 + i)) {
+                Ok(()) => added += 1,
+                Err(_) => break,
+            }
+        }
+        assert!(added >= promised, "promised {promised}, added {added} ({headroom})");
+        if one == 1 && promised == 1 {
+            two_refused = true;
+        }
+    }
+    assert!(two_refused, "some headroom lets one name through the card and not two");
+    // The count cap is part of it.
+    let nvs = board_with_personas(personas::MAX_PERSONAS - 1);
+    assert_eq!(personas::registrations_that_fit(&nvs, 2), 1);
+}
+
+#[test]
+fn removing_a_persona_on_a_full_partition_completes() {
+    let mut nvs = board_with_personas(20);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    assert!(personas::remove_by_pubkey(&mut nvs, &persona_key(3)).unwrap());
+    // The journal is gone, so boot has nothing to resume, and the registry
+    // is the other nineteen.
+    assert!(!nvs.backend.contains("prm_jnl"));
+    assert!(personas::resume_pending_removal(&mut nvs).is_ok());
+    let left = personas::load_all(&nvs);
+    assert_eq!(left.len(), 19);
+    assert!(!left.iter().any(|p| p.pubkey == persona_key(3)));
+    assert!(left.iter().any(|p| p.pubkey == persona_key(20)));
+}
+
+#[test]
+fn removing_an_identity_on_a_full_partition_completes() {
+    let mut nvs = EspNvs::new();
+    let mut engine = PolicyEngine::new();
+    for m in 0..3u8 {
+        masters::add_master(&mut nvs, &[0x40 + m; 32], &format!("id {m}"), heartwood_common::types::MasterMode::TreeNsec, &[0x70 + m; 32]).unwrap();
+        for i in 0..8u8 {
+            let slot = engine.create_slot(m, format!("app {i}"), secret_hex(0x10 + i)).unwrap();
+            assert!(engine.assign_pubkey_to_slot(m, slot, pubkey_hex(0x60 + i + m * 8)));
+        }
+        assert!(engine.persist_slots(&mut nvs, m));
+        personas::add(&mut nvs, m, "purpose", 0, None, &persona_key(m + 1)).unwrap();
+    }
+    let table_1 = nvs.backend.get("connslots_1").unwrap();
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+
+    masters::remove_master(&mut nvs, 0).unwrap();
+    assert!(!masters::removal_pending(&nvs), "no journal left for boot to loop on");
+    let left = masters::load_all(&nvs);
+    assert_eq!(left.len(), 2);
+    assert_eq!(left[0].secret, [0x41; 32], "identity 1 moved down to slot 0");
+    assert_eq!(left[1].secret, [0x42; 32]);
+    assert_eq!(nvs.backend.get("connslots_0").unwrap(), table_1);
+    assert!(!nvs.backend.contains("connslots_2"));
+    let owners: Vec<u8> = personas::load_all(&nvs).iter().map(|p| p.master_slot).collect();
+    assert_eq!(owners, vec![0, 1]);
+}
+
+#[test]
+fn on_a_full_partition_the_network_config_and_secrets_are_refused_and_kept() {
+    // net_config_store.rs is not host-compiled; this runs its writes through
+    // the same helper. A lost config would bring a WiFi board up in USB mode,
+    // so a network change that does not fit is refused instead.
+    let (mut nvs, _) = full_table(8);
+    for (key, len) in [("net_config", 1500), ("net_trial", 1700), ("bridge_secret", 32), ("rzrec_0", 2000), ("dk_sec", 101)] {
+        nvs.backend.seed(key, &vec![1u8; len]);
+    }
+    nvs.backend.limit_headroom(3);
+    for (key, len) in [("net_config", 1600), ("net_trial", 1700), ("rzrec_0", 2100), ("dk_sec", 101)] {
+        assert!(nvs.replace_blob(key, &vec![2u8; len]).is_err(), "{key}");
+        assert_eq!(nvs.backend.get(key).unwrap()[0], 1, "{key} kept");
+    }
+    // Everything else erases first and is written: the management challenge,
+    // whose absence would only mint a fresh one, and the outcome record.
+    for key in ["mgmt_nonce", "net_last"] {
+        nvs.backend.seed(key, &[1u8; 32]);
+        nvs.backend.limit_headroom(3);
+        assert!(nvs.replace_blob(key, &[2u8; 32]).is_ok(), "{key}");
+        assert_eq!(nvs.backend.get(key).unwrap(), vec![2u8; 32]);
+    }
 }
 
 #[test]

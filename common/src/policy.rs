@@ -1572,6 +1572,144 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Whether `after` grants a client nothing `before` did not: the same slot
+/// with at most a new label, fewer auto-approved methods, a narrower kind
+/// list (empty means every kind) and auto-approval turned off, but never on.
+/// Anything else, including any change to keys, grants or family flags, is
+/// not treated as narrowing. Used to save such an update as a revocation: on
+/// failure it must not be rolled back to the wider permissions.
+pub fn narrows_only(before: &ConnectSlot, after: &ConnectSlot) -> bool {
+    let methods_narrow = after.allowed_methods.iter().all(|m| before.allowed_methods.contains(m));
+    let kinds_narrow = before.allowed_kinds.is_empty()
+        || (!after.allowed_kinds.is_empty()
+            && after.allowed_kinds.iter().all(|k| before.allowed_kinds.contains(k)));
+    let auto_narrow = before.auto_approve || !after.auto_approve;
+    if !(methods_narrow && kinds_narrow && auto_narrow) {
+        return false;
+    }
+    let mut probe = after.clone();
+    probe.label.clone_from(&before.label);
+    probe.allowed_methods.clone_from(&before.allowed_methods);
+    probe.allowed_kinds.clone_from(&before.allowed_kinds);
+    probe.auto_approve = before.auto_approve;
+    // Byte comparison of the stored encoding: the same codec the slot table
+    // is persisted with, so no second (Value) path through it.
+    matches!(
+        (serde_json::to_vec(&probe), serde_json::to_vec(before)),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
+/// Whether the table a master's `connslots_N` holds on flash (`stored`, or
+/// `None` when the key is absent) differs from the one RAM enforces (`ram`):
+/// a change RAM already holds that no save has written, such as a
+/// revocation whose save failed. Compared as the stored encoding, the codec
+/// the table is persisted with. An absent table and an empty one are the
+/// same (no pairings), so neither is "unsaved" for the other.
+pub fn slot_table_unsaved(stored: Option<&[u8]>, ram: &[ConnectSlot]) -> bool {
+    match stored {
+        Some(bytes) => !serde_json::to_vec(ram).is_ok_and(|encoded| encoded == bytes),
+        None => !ram.is_empty(),
+    }
+}
+
+/// How a master's `connslots_N` reads after a revocation's save failed.
+/// `Readable` means it reads and parses, as the repeat path needs
+/// (`PolicyEngine::unsaved_slot_revocation`): a table that is present but
+/// does not parse is `Unreadable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredSlotTable {
+    Absent,
+    Readable,
+    Unreadable,
+}
+
+/// What a restart finds after a revocation whose save failed, and what can
+/// still save it ([`unsaved_revocation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsavedRevocation {
+    /// The old table is on flash and readable: repeating the request saves
+    /// the narrower one.
+    RepeatSaves,
+    /// The old table may be on flash, but nothing can save the revocation in
+    /// this boot: the master's pairings are quarantined (none is served, and
+    /// none is written), or its stored table cannot be read, so a repeat
+    /// finds nothing to save and answers "not found". After a restart the
+    /// table loads again, or the master stays quarantined.
+    RestartFirst,
+    /// The old table is on flash, readable, and was not rewritten for lack
+    /// of room (an in-place rewrite with no room for a second copy). A
+    /// repeat on the same board meets the same refusal; freeing room first
+    /// lets it save.
+    NoRoom,
+    /// The table was erased to make room and could not be rewritten; a later
+    /// save can still bring the other pairings back.
+    TableLost,
+    /// As `TableLost`, with the key blocked until a restart.
+    TableGone,
+    /// A write failed part-way over a present (or unreadable) table.
+    Uncertain,
+}
+
+/// Classify a revocation whose save failed. `blocked`: the table's key is
+/// blocked for this boot after a part-written write. `storage_ready`: the
+/// master is not quarantined. `no_room`: the write was refused for lack of
+/// room.
+///
+/// Quarantine decides first: a quarantined master's save writes nothing, so
+/// neither the stored state nor a block on its key is the save's doing, and
+/// "saved" cannot be read off an absent table. A migration that could not
+/// persist leaves exactly that: no table (its failed write blocking the key)
+/// and a live legacy credential, which the next boot turns back into the
+/// pairing just revoked. Then a part-written write, whose key is blocked
+/// whatever else holds; then the stored table.
+pub fn unsaved_revocation(
+    blocked: bool,
+    storage_ready: bool,
+    stored: StoredSlotTable,
+    no_room: bool,
+) -> UnsavedRevocation {
+    match (storage_ready, blocked, stored) {
+        (false, _, _) => UnsavedRevocation::RestartFirst,
+        (true, true, StoredSlotTable::Absent) => UnsavedRevocation::TableGone,
+        (true, true, _) => UnsavedRevocation::Uncertain,
+        (true, false, StoredSlotTable::Absent) => UnsavedRevocation::TableLost,
+        (true, false, StoredSlotTable::Unreadable) => UnsavedRevocation::RestartFirst,
+        (true, false, StoredSlotTable::Readable) if no_room => UnsavedRevocation::NoRoom,
+        (true, false, StoredSlotTable::Readable) => UnsavedRevocation::RepeatSaves,
+    }
+}
+
+/// The stored copy of pairing `slot_index` when RAM no longer has it: an
+/// earlier revocation of that pairing whose save failed (the reply said it
+/// holds until the next restart only). Repeating the revocation should then
+/// save the narrower table, not answer "not found" while the pairing comes
+/// back at the next restart. `None` when RAM still has the pairing (an
+/// ordinary revocation) or flash never had it (a real "not found").
+pub fn unsaved_slot_revocation<'a>(
+    stored: &'a [ConnectSlot],
+    ram: &[ConnectSlot],
+    slot_index: u8,
+) -> Option<&'a ConnectSlot> {
+    if ram.iter().any(|slot| slot.slot_index == slot_index) {
+        return None;
+    }
+    stored.iter().find(|slot| slot.slot_index == slot_index)
+}
+
+/// Whether removing `pubkey` from pairing `slot_index` is a removal RAM
+/// already holds and flash does not: the stored copy of the same pairing
+/// (same secret) still authorises the key and RAM's no longer does.
+pub fn unsaved_key_removal(stored: &[ConnectSlot], ram: &[ConnectSlot], slot_index: u8, pubkey: &str) -> bool {
+    let find = |slots: &[ConnectSlot]| slots.iter().find(|slot| slot.slot_index == slot_index).cloned();
+    match (find(stored), find(ram)) {
+        (Some(stored), Some(ram)) => {
+            stored.secret == ram.secret && slot_authorizes(&stored, pubkey) && !slot_authorizes(&ram, pubkey)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4000,5 +4138,119 @@ mod tests {
         assert!(redacted.secret.is_empty());
         assert_eq!(redacted.label, "test");
         assert_eq!(redacted.slot_index, 0);
+    }
+
+    fn narrowing_slot() -> ConnectSlot {
+        let mut slot = sample_slot(0, "app");
+        slot.allowed_methods = vec!["sign_event".into(), "nip44_encrypt".into()];
+        slot.allowed_kinds = vec![1, 7];
+        slot.auto_approve = true;
+        slot
+    }
+
+    #[test]
+    fn narrowing_a_slot_is_recognised_and_widening_is_not() {
+        let before = narrowing_slot();
+        let mut after = before.clone();
+        after.label = "renamed".into();
+        after.allowed_methods = vec!["sign_event".into()];
+        after.allowed_kinds = vec![1];
+        after.auto_approve = false;
+        assert!(narrows_only(&before, &after));
+        assert!(narrows_only(&before, &before.clone()));
+
+        let widen = |f: &dyn Fn(&mut ConnectSlot)| {
+            let mut w = before.clone();
+            f(&mut w);
+            narrows_only(&before, &w)
+        };
+        assert!(!widen(&|s| s.allowed_methods.push("get_public_key".into())));
+        assert!(!widen(&|s| s.allowed_kinds.push(4)));
+        assert!(!widen(&|s| s.allowed_kinds.clear()), "empty kinds allow every kind");
+        assert!(!widen(&|s| s.escalate = !s.escalate));
+        assert!(!widen(&|s| s.authorized_pubkeys.push("ab".repeat(32))));
+        assert!(!widen(&|s| s.secret = "cd".repeat(32)));
+        let mut off = before.clone();
+        off.auto_approve = false;
+        let mut on = off.clone();
+        on.auto_approve = true;
+        assert!(!narrows_only(&off, &on));
+        let mut all_kinds = before.clone();
+        all_kinds.allowed_kinds.clear();
+        assert!(narrows_only(&all_kinds, &before));
+    }
+
+    #[test]
+    fn a_table_differing_from_flash_is_unsaved_and_absent_equals_empty() {
+        let table = vec![sample_slot(0, "a"), sample_slot(1, "b")];
+        let encoded = serde_json::to_vec(&table).unwrap();
+        assert!(!slot_table_unsaved(Some(&encoded), &table));
+        assert!(slot_table_unsaved(Some(&encoded), &table[..1]), "a revocation RAM holds");
+        assert!(slot_table_unsaved(Some(b"[]"), &table));
+        assert!(slot_table_unsaved(None, &table), "nothing on flash, pairings in RAM");
+        assert!(!slot_table_unsaved(None, &[]), "absent and empty both mean no pairings");
+        assert!(!slot_table_unsaved(Some(b"[]"), &[]));
+    }
+
+    #[test]
+    fn an_unsaved_revocation_advises_a_repeat_only_where_one_can_save_it() {
+        use StoredSlotTable::{Absent, Readable, Unreadable};
+        use UnsavedRevocation::*;
+        // Every input, so a new arm cannot slip in unexamined.
+        for blocked in [false, true] {
+            for ready in [false, true] {
+                for stored in [Absent, Readable, Unreadable] {
+                    for no_room in [false, true] {
+                        let got = unsaved_revocation(blocked, ready, stored, no_room);
+                        let want = match (ready, blocked, stored, no_room) {
+                            (false, _, _, _) => RestartFirst,
+                            (true, true, Absent, _) => TableGone,
+                            (true, true, _, _) => Uncertain,
+                            (true, false, Absent, _) => TableLost,
+                            (true, false, Unreadable, _) => RestartFirst,
+                            (true, false, Readable, true) => NoRoom,
+                            (true, false, Readable, false) => RepeatSaves,
+                        };
+                        assert_eq!(got, want, "blocked {blocked}, ready {ready}, {stored:?}, no room {no_room}");
+                    }
+                }
+            }
+        }
+        // The cases a repeat used to be advised for and cannot help.
+        assert_eq!(unsaved_revocation(false, false, Readable, false), RestartFirst, "quarantined");
+        assert_eq!(unsaved_revocation(false, false, Absent, false), RestartFirst, "quarantined, legacy migration unsaved");
+        assert_eq!(
+            unsaved_revocation(true, false, Absent, false),
+            RestartFirst,
+            "quarantined after a migration write that failed part-way: never \"saved\""
+        );
+        assert_eq!(unsaved_revocation(false, true, Unreadable, false), RestartFirst, "table unreadable mid-boot");
+        assert_eq!(unsaved_revocation(false, true, Readable, true), NoRoom, "refused in place for room");
+        assert_eq!(unsaved_revocation(false, true, Readable, false), RepeatSaves);
+    }
+
+    #[test]
+    fn only_a_pairing_flash_still_has_and_ram_does_not_is_an_unsaved_revocation() {
+        let stored = vec![sample_slot(0, "a"), sample_slot(3, "b")];
+        let ram = vec![sample_slot(0, "a")];
+        assert_eq!(unsaved_slot_revocation(&stored, &ram, 3).map(|s| s.label.as_str()), Some("b"));
+        assert!(unsaved_slot_revocation(&stored, &ram, 0).is_none(), "still live: an ordinary revocation");
+        assert!(unsaved_slot_revocation(&stored, &ram, 5).is_none(), "never existed: not found");
+        assert!(unsaved_slot_revocation(&ram, &ram, 3).is_none(), "already saved: not found");
+    }
+
+    #[test]
+    fn a_key_removal_is_unsaved_only_on_the_same_pairing() {
+        let key = "11".repeat(32);
+        let mut stored_slot = sample_slot(2, "a");
+        stored_slot.authorized_pubkeys.push(key.clone());
+        let ram_slot = sample_slot(2, "a");
+        assert!(unsaved_key_removal(&[stored_slot.clone()], &[ram_slot.clone()], 2, &key));
+        assert!(!unsaved_key_removal(&[ram_slot.clone()], &[ram_slot.clone()], 2, &key), "saved already");
+        assert!(!unsaved_key_removal(&[stored_slot.clone()], &[stored_slot.clone()], 2, &key), "RAM still has it");
+        let mut reused = ram_slot.clone();
+        reused.secret = "cd".repeat(32);
+        assert!(!unsaved_key_removal(&[stored_slot.clone()], &[reused], 2, &key), "a different pairing at that index");
+        assert!(!unsaved_key_removal(&[stored_slot], &[], 2, &key), "no such pairing in RAM");
     }
 }

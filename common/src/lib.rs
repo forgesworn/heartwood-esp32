@@ -65,6 +65,10 @@ pub mod mgmt;
 
 pub mod persistent_state;
 
+/// NVS entry budget: room for an in-place replace, the per-key erase-first
+/// fallback policy, and the gate on writes that grow the store.
+pub mod nvs_budget;
+
 pub mod persona_pack;
 
 /// NVS entry arithmetic for a blob write (ESP-IDF's multi-page blob layout).
@@ -179,6 +183,8 @@ extern crate self as heartwood_common;
 mod firmware_policy_host_tests;
 #[cfg(all(test, feature = "nip46", feature = "nip44"))]
 pub use firmware_policy_host_tests::nvs;
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+pub use firmware_policy_host_tests::personas;
 
 // The NIP-46 handler's pure pre-dispatch gates (firmware/src/nip46_gates.rs):
 // the handler's own test module builds only for the device target, so these

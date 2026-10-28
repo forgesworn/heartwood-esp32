@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use heartwood_common::types::{FRAME_TYPE_DISPLAY_FLIP_RESP, FRAME_TYPE_NACK};
 
 use crate::serial::SerialPort;
@@ -42,7 +43,7 @@ pub fn read(nvs: &EspNvs<NvsDefault>) -> bool {
 /// Persist the flag. Callers apply it separately, after the write succeeds, so
 /// the running and stored orientation never disagree silently.
 pub fn write(nvs: &mut EspNvs<NvsDefault>, flipped: bool) -> Result<(), String> {
-    nvs.set_blob(KEY, &[u8::from(flipped)])
+    nvs.replace_blob(KEY, &[u8::from(flipped)])
         .map_err(|e| format!("persist display orientation: {e:?}"))
 }
 

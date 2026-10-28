@@ -408,6 +408,29 @@ crate has a feature flag: `k256-backend` (default, for host tools/tests) and
 `secp256k1-backend` (for firmware). Both backends produce identical outputs —
 verified by the frozen test vector in `common/src/derive.rs`.
 
+### Toolchain and dependency pins (2026-10-28)
+
+- CI and release.yml run on `ubuntu-24.04`, not `ubuntu-latest`: 26.04 has no
+  `libxml2.so.2`, which the ESP toolchain's esp-clang 16.0.1 links against,
+  so every firmware build failed with `Could not install esp-idf`.
+- k256 is 0.14.0 (exact pin) with a crypto-bigint floor of 0.7.6 for
+  RUSTSEC-2026-0387, so the effective Rust floor is 1.87. `vmls-core` is pinned
+  to `fa3776ea` (tag `heartwood-pin-fa3776ea` in forgesworn/vmls-core keeps it
+  reachable). vmls-core is a mirror published from vennel
+  (`scripts/publish-vmls-core.mjs`); move the pin to vmls-core main once vennel
+  publishes the same change. deny.toml carries no exception for it.
+- esp8266-firmware's pinned esp toolchain reports `1.87.0-nightly`, which Cargo
+  ranks below crypto-bigint's 1.87, so its CI build passes
+  `--ignore-rust-version`, and builds `--locked` on sha2 0.11.0 (0.11.1 needs
+  Rust 1.88's `slice_as_chunks`). esp 1.95 drops the build-std feature the
+  lx106 build needs, so the toolchain stays put.
+- Heavy builds and full test suites run on the M4 (workspace CLAUDE.md). Host
+  crates there need `--target aarch64-apple-darwin`; for firmware there,
+  esp-idf-sys's arm64 esp-clang libclang clashes with the x86_64 cargo, so move
+  `firmware/.embuild/espressif/tools/esp-clang/*/esp-clang/lib/libclang.*` aside
+  in the scratch copy. rsync keeps old mtimes: touch the sources after a branch
+  switch or cargo reuses stale binaries.
+
 ## Dependencies
 
 All crypto crates are no_std-compatible but we use the ESP-IDF std framework:

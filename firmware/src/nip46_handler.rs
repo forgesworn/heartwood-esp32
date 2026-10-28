@@ -2663,10 +2663,11 @@ fn dispatch_inner(
                 // A slot that would not survive a reboot is one the other
                 // wallet binds to and then loses: refuse rather than mislead.
                 // `storage_full` only for the growth gate's refusal; a fault
-                // is not something freeing room would fix.
+                // is not something freeing room would fix. The bare code, as
+                // the wallet's other methods (`note_cmd`) answer it.
                 policy_engine.revoke_slot(master_slot, slot_index);
                 return build_error_json(&request.id, -1, match why {
-                    crate::policy::SlotSaveError::NoRoom => crate::policy::PAIRING_STORAGE_FULL,
+                    crate::policy::SlotSaveError::NoRoom => "storage_full",
                     crate::policy::SlotSaveError::Failed => "storage_unavailable: pairing was not saved",
                 });
             }

@@ -271,7 +271,7 @@ ordinary rotation carrying on if home fails. Never while a card is open, an
 OTA, a network trial or a relay update round runs, a session is degraded, or
 relay 1 is cooling after refusing us.
 
-Relay sign-in, NIP-42 (2026-10-22, checklist section 36, NOT YET BENCH-RUN). A
+Relay sign-in, NIP-42 (2026-10-22, checklist section 38, NOT YET BENCH-RUN). A
 relay may refuse every REQ until the connection signs in: it sends `["AUTH",
 <challenge>]`, holds a REQ for a few seconds, then closes it `auth-required:`
 (or `restricted:` when the keys signed in may not read it). The board now

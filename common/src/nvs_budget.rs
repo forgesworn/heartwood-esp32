@@ -358,8 +358,9 @@ mod tests {
     /// Every firmware blob write goes through `nvs::ReplaceBlob`. esp-idf-svc's
     /// `set_blob` and `set_str` erase the key before writing, and
     /// `EspKeyValueStorage::set_raw` removes it first; the raw ESP-IDF calls
-    /// belong to `nvs.rs` alone, where the budget is checked first. Comments
-    /// are skipped, so the reasons can still be written down.
+    /// belong to `nvs.rs` alone, where the budget is checked first. Both call
+    /// forms are caught: `nvs.set_blob(..)` and `EspNvs::set_blob(&nvs, ..)`.
+    /// Comments are skipped, so the reasons can still be written down.
     #[test]
     fn firmware_writes_blobs_only_through_the_budgeted_helper() {
         use std::path::Path;
@@ -382,9 +383,25 @@ mod tests {
         // tolerable only while it is dormant (no runtime caller), and it opens
         // its namespace on the default `nvs` partition, which the signer's keys
         // share. The exemption lapses the moment the writer stops declaring
-        // itself dormant: put its writes under the budget before waking it.
-        let dormant = std::fs::read_to_string(src.join("allocation_journal_writer.rs"))
+        // itself dormant, or the moment any other file reaches into the writer
+        // module (a `writer::` path, or a `use` of it), whatever its header
+        // says: put its writes under the budget before waking it.
+        let journal = |path: &Path| {
+            path.ends_with("allocation_journal_writer.rs") || path.ends_with("allocation_journal_write_nvs.rs")
+        };
+        let header = std::fs::read_to_string(src.join("allocation_journal_writer.rs"))
             .is_ok_and(|t| t.starts_with("//! Dormant, private durable controller."));
+        let mut wakers = Vec::new();
+        for path in files.iter().filter(|p| !journal(p)) {
+            let text = std::fs::read_to_string(path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if names_writer_module(code) {
+                    wakers.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        let dormant = header && wakers.is_empty();
         let mut hits = Vec::new();
         for path in &files {
             if dormant && path.ends_with("allocation_journal_write_nvs.rs") {
@@ -394,7 +411,9 @@ mod tests {
             let is_helper = path.ends_with("nvs.rs") && path.parent() == Some(src.as_path());
             for (n, line) in text.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
-                let mut banned = vec![".set_blob(", ".set_str(", ".set_raw("];
+                let mut banned = vec![
+                    ".set_blob(", ".set_str(", ".set_raw(", "::set_blob(", "::set_str(", "::set_raw(",
+                ];
                 if !is_helper {
                     banned.extend(["nvs_set_blob(", "nvs_set_str(", "nvs_erase_key("]);
                 }
@@ -405,6 +424,39 @@ mod tests {
                 }
             }
         }
-        assert!(hits.is_empty(), "blob writes outside nvs::ReplaceBlob:\n{}", hits.join("\n"));
+        assert!(
+            hits.is_empty(),
+            "blob writes outside nvs::ReplaceBlob:\n{}\nfiles reaching into the dormant journal writer:\n{}",
+            hits.join("\n"),
+            wakers.join("\n")
+        );
+    }
+
+    /// Whether `code` names the allocation journal's `writer` module as a
+    /// path segment (`writer::x`, `super::writer`, `use writer`), as opposed
+    /// to declaring it (`mod writer;`) or an unrelated `writer` word
+    /// (`a.writer()`, `to_writer(`, `writer_seed`).
+    fn names_writer_module(code: &str) -> bool {
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        code.match_indices("writer").any(|(at, _)| {
+            let before = &code[..at];
+            let after = &code[at + "writer".len()..];
+            if before.chars().next_back().is_some_and(word) || after.chars().next().is_some_and(word) {
+                return false;
+            }
+            after.starts_with("::") || before.ends_with("::") || before.trim_end().ends_with("use")
+        })
+    }
+
+    #[test]
+    fn the_journal_writer_scan_tells_a_path_from_a_declaration() {
+        assert!(names_writer_module("    writer::Controller::open(handle)"));
+        assert!(names_writer_module("use super::writer;"));
+        assert!(names_writer_module("pub use writer as journal_writer;"));
+        assert!(names_writer_module("let _ = self::writer::reset();"));
+        assert!(!names_writer_module("mod writer;"));
+        assert!(!names_writer_module("if a.writer() == a.witness() {"));
+        assert!(!names_writer_module("serde_json::to_writer(&mut bytes, value)"));
+        assert!(!names_writer_module("let writer_seed = key(self.root, &[]);"));
     }
 }

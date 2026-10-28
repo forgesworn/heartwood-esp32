@@ -59,7 +59,7 @@ export function toHex(value, what = 'value') {
 }
 
 /** The bench relay these tools default to; override with --relay. */
-export const DEFAULT_RELAY = env.HEARTWOOD_RELAY ?? 'wss://relay.trotters.cc'
+export const DEFAULT_RELAY = env.HEARTWOOD_RELAY ?? 'wss://relay.primal.net'
 
 /** The device's configured set. Its primary session ROTATES over these, so a
  *  tool pinned to one of them goes silent whenever the device is on another —
@@ -72,7 +72,6 @@ export const DEFAULT_RELAYS = (env.HEARTWOOD_RELAYS ?? '')
     env.HEARTWOOD_RELAYS
       ? []
       : [
-          'wss://relay.trotters.cc',
           'wss://nos.lol',
           'wss://relay.damus.io',
           'wss://relay.primal.net',

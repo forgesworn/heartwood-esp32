@@ -72,6 +72,14 @@ fn not_enough_space() -> EspError {
     EspError::from_infallible::<{ sys::ESP_ERR_NVS_NOT_ENOUGH_SPACE }>()
 }
 
+/// Whether a write failed for lack of room: ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+/// whether ESP-IDF returned it or [`ReplaceBlob`] refused a replace it had no
+/// room to write in place. Either way the old value is kept, unless the key
+/// was erased first or is now blocked (`write_blocked`).
+pub fn is_no_room(e: &EspError) -> bool {
+    e.code() == not_enough_space().code()
+}
+
 /// Keys whose multi-chunk write failed this boot (`nvs_budget::FailedWrites`):
 /// not written again until a restart has run ESP-IDF's orphan cleanup.
 static FAILED_WRITES: Mutex<FailedWrites> = Mutex::new(FailedWrites::new());
@@ -174,6 +182,22 @@ pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bo
         .max()
         .unwrap_or(0);
     nvs_budget::growth_allowed(stats.available_entries, old_len, new_len, largest_hot)
+}
+
+/// How many of `steps` growths written one after another (each a hot blob's
+/// current length and new length, in write order) [`growth_allowed`] would
+/// let through in turn (`nvs_budget::growth_run`): the gate a press that
+/// grows several blobs meets at each write, judged before the card. 0 when
+/// the numbers cannot be read.
+pub fn growth_run(nvs: &EspNvs<NvsDefault>, steps: &[(Option<usize>, usize)]) -> usize {
+    let Some(stats) = crate::nvs_stats::read() else {
+        return 0;
+    };
+    let largest_hot = nvs_budget::hot_keys()
+        .filter_map(|k| nvs.blob_len(&k).ok().flatten())
+        .max()
+        .unwrap_or(0);
+    nvs_budget::growth_run(stats.available_entries, largest_hot, steps.iter().copied())
 }
 
 const NVS_NAMESPACE: &str = "heartwood";

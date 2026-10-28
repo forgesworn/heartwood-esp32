@@ -171,6 +171,14 @@ pub fn route_request(
     Route::Park
 }
 
+/// Whether a request's own card can only be answered at the device, for
+/// [`route_request`]'s `device_only`: a method that is press-only, or a login
+/// challenge (kind 22242 with a `code` tag), which must be approved with its
+/// code in front of the owner and so never by a guardian's verdict.
+pub fn device_only_request(device_press_only: bool, login_challenge: bool) -> bool {
+    device_press_only || login_challenge
+}
+
 /// The refusal a [`Route::Refuse`] answers with: an honest instruction, not a
 /// policy error. The request is well formed and the pairing is allowed it; it
 /// simply cannot be approved from a phone.
@@ -361,6 +369,10 @@ mod tests {
         use crate::nip46::Nip46Method as M;
         assert!(M::HeartwoodProvisionRendezvous.device_press_only());
         assert!(M::HeartwoodPairWallet.device_press_only());
+        // and the address proof, a standing authority over where a name pays
+        assert!(M::HeartwoodNoteAddressProof.device_press_only());
+        assert!(!M::HeartwoodNoteAddressProof.verdict_may_answer_card());
+        assert!(M::HeartwoodNoteAddressProof.pinned_physical());
         assert!(!M::HeartwoodNoteSend.device_press_only());
         assert!(!M::HeartwoodDerive.device_press_only());
         // And neither may ever have its card answered by a verdict.
@@ -481,6 +493,7 @@ mod tests {
             M::HeartwoodNoteSend,
             M::HeartwoodNoteRename,
             M::HeartwoodNoteTrust,
+            M::HeartwoodNoteAddressProof,
         ] {
             assert!(method.pinned_physical(), "{} lost its pin", method.as_str());
         }
@@ -490,5 +503,21 @@ mod tests {
         // And a non-note button method is not pinned by a policy ceiling.
         assert!(!M::HeartwoodDerive.pinned_physical());
         assert!(!M::SignEvent.pinned_physical());
+    }
+
+    #[test]
+    fn a_login_challenge_is_refused_on_an_escalate_slot_not_parked() {
+        let login = device_only_request(false, true);
+        assert!(login);
+        // An escalate slot refuses it at once; nothing is parked for a verdict.
+        assert_eq!(route_request(ApprovalTier::ButtonRequired, false, login, true), Route::Refuse);
+        // A slot without escalation raises its own card as ever.
+        assert_eq!(route_request(ApprovalTier::ButtonRequired, false, login, false), Route::Card);
+        // Plain relay AUTH (no code tag) keeps parking on an escalate slot.
+        let plain = device_only_request(false, false);
+        assert!(!plain);
+        assert_eq!(route_request(ApprovalTier::ButtonRequired, false, plain, true), Route::Park);
+        // A press-only method stays device-only either way.
+        assert!(device_only_request(true, false));
     }
 }

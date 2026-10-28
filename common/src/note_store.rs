@@ -704,6 +704,13 @@ impl NoteStore {
     }
 
     /// Received notes a wallet has not yet rotated and marked spent.
+    /// Notes that are still money or about to be: pending and confirmed.
+    /// A spent record is kept as a receipt (MAX_SPENT) but holds nothing, so
+    /// the idle screen's "held" must not count it.
+    pub fn live_count(&self) -> usize {
+        self.notes.iter().filter(|n| n.state != NoteState::Spent).count()
+    }
+
     pub fn received_count(&self) -> usize {
         self.notes
             .iter()
@@ -938,7 +945,8 @@ impl NoteStore {
     }
 
     /// Reveal a CONFIRMED note's `k1`: its secret as hex, or for a key note
-    /// the `ck1` its key signs, which is what a wallet presents to spend it.
+    /// the `ck1` its key signs for the note's own mint, which is what a wallet
+    /// presents to spend it there.
     /// The key itself never leaves. State check only — the physical gate is
     /// the dispatcher's job, exactly the `vault.c` split.
     pub fn export_secret(&self, id: &str) -> Result<String, NoteError> {
@@ -949,7 +957,7 @@ impl NoteStore {
             return Ok(hex_encode(&note.secret));
         }
         #[cfg(feature = "cash")]
-        return crate::cash_key::ck1_of(&note.secret).map_err(|_| NoteError::InvalidState);
+        return crate::cash_key::ck1_of(&note.secret, &note.host).map_err(|_| NoteError::InvalidState);
         // A build that cannot sign never made a key note, and cannot spend one.
         #[cfg(not(feature = "cash"))]
         Err(NoteError::InvalidState)
@@ -1738,7 +1746,8 @@ mod tests {
     #[cfg(feature = "cash")]
     #[test]
     fn a_key_note_exports_its_ck1_and_never_its_key() {
-        // lnurlcash-kit part2.json, the first branch's first note.
+        // lnurlcash-conformance part2.json, the first branch's first note,
+        // whose ck1 is bound to that branch's domain.
         let vectors: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
         let note = &vectors["branches"][0]["notes"][0];
@@ -1750,10 +1759,30 @@ mod tests {
         let mut store = fresh_store(&mut storage);
         let mut rng = test_rng();
         let key = KeyNote { index: 0, pubkey: [0; 32] };
+        let endpoint = format!("{}/w", vectors["branches"][0]["host"].as_str().unwrap());
         let (id, _) = store
-            .import_key(&mut storage, &mut rng, &secret, key, "mint.example/w", 1_000, "", 1)
+            .import_key(&mut storage, &mut rng, &secret, key, &endpoint, 1_000, "", 1)
             .unwrap();
         assert_eq!(store.export_secret(&id).unwrap(), note["ck1"].as_str().unwrap());
+    }
+
+    #[test]
+    fn a_spent_record_is_not_a_live_note() {
+        // The idle screen said "2 held" for two notes already paid out.
+        let mut storage = FakeStorage::new();
+        let mut store = fresh_store(&mut storage);
+        let mut rng = test_rng();
+        let alice = [0xa1u8; 32];
+        let (a, _) = store
+            .receive(&mut storage, &mut rng, &[3u8; SECRET_LEN], None, "mint.example", 5_000, "", &alice, 10, false)
+            .unwrap();
+        store
+            .receive(&mut storage, &mut rng, &[4u8; SECRET_LEN], None, "mint.example", 7_000, "", &alice, 11, false)
+            .unwrap();
+        assert_eq!((store.counts().0, store.live_count()), (2, 2));
+        store.mark_spent(&mut storage, &a, 12).unwrap();
+        // the record stays as a receipt, but it holds nothing
+        assert_eq!((store.counts().0, store.live_count()), (2, 1));
     }
 
     #[test]

@@ -26,7 +26,7 @@ Heartwood Soft mode: `heartwoodd` runs standalone on a Pi with no ESP32. Keys en
 
 Encrypted backup/restore of connection slots and policies via Sapwood -- MANUAL export/import only (there is no auto-snapshot: `runExport` is a button in Backup.svelte, and nothing captures slots on change; a board wiped without a prior manual export loses every pairing, since `create_client` always mints a fresh secret on-device and no raw NVS dump can restore a slot), Argon2id + XChaCha20-Poly1305 encrypted backup file, physical button confirmation on restore. Dedicated backup passphrase (default "heartwood", changeable via Sapwood). Works in both Hard and Soft modes.
 
-Encrypted at rest on-device (opt-in): either a human PIN (P5, wipes after 5 failures) or a host-held 32-byte vault key (VAULT_SET 0x62 / VAULT_UNLOCK 0x63) that heartwoodd or Sapwood delivers — unattended reboot with ciphertext on flash. WiFi-standalone locked devices announce a per-boot ephemeral unlock pubkey (kind 24135) and receive the vault key live from the operator (kind 24136). Spec: docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md. FIRMWARE_INFO and get_status report the at-rest state directly (`at_rest`: `none`/`pin`/`vault`/`encrypted`, plus `unlock_phone_count`), so a manager stops inferring the mode from side effects it happened to witness — resolved in one place, `heartwood_common::at_rest_status::resolve` (pure, host-tested, including the size-damage cases), behind a single firmware read, `firmware/src/pin.rs::at_rest_status`, that all three call sites (FIRMWARE_INFO, get_status's full and low-heap-fallback replies) share instead of each composing it themselves. FIRMWARE_INFO answers this while locked (any USB host, any mode), get_status only once unlocked and only to the device operator, never a per-identity delegate (including its low-heap `minimal_status_json` fallback) — both delegate reply shapes are keyed off `at_rest_status::DELEGATE_STATUS_KEYS`/`DELEGATE_STATUS_FALLBACK_KEYS`, host-tested so the fallback can never carry a data key the normal reply does not. Since the wrapped data key does not itself record which secret wrapped it, distinguishing PIN from vault needed a marker (`at_rest_kind` in `common/src/data_key.rs`, over `BlobStore` so the existing power-cut model tests cover it): kind byte plus the first 8 bytes of SHA-256(dk_sec), so a marker that no longer matches the wrapper on flash — a cut between the wrap write and the marker write, a failed write, a secret changed on firmware without this marker, any re-wrap it missed — reports `encrypted` (kind unknown) rather than a guess. `encrypted`, not a `pin` fallback: only a PIN_UNLOCK guess counts towards the 5-failure wipe, so mislabelling a vault board as PIN-protected would invite typed guesses into a counter it was never meant to arm. A board's own next successful unlock (PIN_UNLOCK, VAULT_UNLOCK, or the relay's 24136 operator vault delivery — all three run through `pin::try_unlock`) self-repairs a missing or wrong marker from the secret's length (4-8 digits or 32 bytes settles it) via `data_key::repair_secret_kind`, which takes the `Unlocked` proof a real unlock produces so it cannot run ahead of one; a phone-slot unlock never sees the secret and never touches the marker. `try_unlock` clears the PIN wipe counter immediately once the secret is proven correct, before migration or the marker repair — the two optional writes that follow — so a power cut during either can never catch the counter mid-way stale. `unlock_phone_count` is `null`, not `0`, over a damaged phone blob (never mistake damage for no phones), except once `at_rest` is `none`, which always reports `0` — removing the last identity leaves `dk_ph` behind (`provision.rs`, `masters.rs`), and a mode of "none" makes any leftover blob moot. The count itself walks and validates the blob (`PhoneSet::count`) rather than allocating a full `PhoneSet::decode`, sized from the NVS blob's actual length rather than a fixed 2,166-byte buffer, since this runs in the same low-heap path `minimal_status_json` exists for. Phone unlock (common/src/phone_unlock.rs) adds per-phone 24135s (one-time author, `["h", hint]` only, sealed content with `t` = `locked`) answered by a throwaway-key 24136; a relay-list change is told to the phones on their old relays as the same message with `t` = `relays` (common/src/phone_relays.rs: NVS `ph_relays` records what they were told and how many update rounds have gone out; locked boots repeat the announcement there, one old relay per announce interval straight after the live announcement, with per-relay backoff; unlocked boots post six randomly delayed update rounds over about a day, each on a publish-only connection that never carries the signer's subscription and never makes a third TLS session, resuming after a restart, then record the live list).
+Encrypted at rest on-device (opt-in): either a human PIN (P5, wipes after 5 failures) or a host-held 32-byte vault key (VAULT_SET 0x62 / VAULT_UNLOCK 0x63) that heartwoodd or Sapwood delivers — unattended reboot with ciphertext on flash. WiFi-standalone locked devices announce a per-boot ephemeral unlock pubkey (kind 24135) and receive the vault key live from the operator (kind 24136). Spec: docs/specs/2026-08-08-encrypted-at-rest-unlock-design.md. Seeds sealed under the data key (82-byte `HWDK` blobs, from v0.18.0-beta.17) are unreadable to beta.16 and older, which know only seed_cipher's 92- and 101-byte records, so a board with a PIN or vault key must have it turned off (`SET_PIN` / `VAULT_SET` with an empty payload, button hold, unlocked) before such a downgrade; docs/SECURITY-MODEL.md has the note. FIRMWARE_INFO and get_status report the at-rest state directly (`at_rest`: `none`/`pin`/`vault`/`encrypted`, plus `unlock_phone_count`), so a manager stops inferring the mode from side effects it happened to witness — resolved in one place, `heartwood_common::at_rest_status::resolve` (pure, host-tested, including the size-damage cases), behind a single firmware read, `firmware/src/pin.rs::at_rest_status`, that all three call sites (FIRMWARE_INFO, get_status's full and low-heap-fallback replies) share instead of each composing it themselves. FIRMWARE_INFO answers this while locked (any USB host, any mode), get_status only once unlocked and only to the device operator, never a per-identity delegate (including its low-heap `minimal_status_json` fallback) — both delegate reply shapes are keyed off `at_rest_status::DELEGATE_STATUS_KEYS`/`DELEGATE_STATUS_FALLBACK_KEYS`, host-tested so the fallback can never carry a data key the normal reply does not. Since the wrapped data key does not itself record which secret wrapped it, distinguishing PIN from vault needed a marker (`at_rest_kind` in `common/src/data_key.rs`, over `BlobStore` so the existing power-cut model tests cover it): kind byte plus the first 8 bytes of SHA-256(dk_sec), so a marker that no longer matches the wrapper on flash — a cut between the wrap write and the marker write, a failed write, a secret changed on firmware without this marker, any re-wrap it missed — reports `encrypted` (kind unknown) rather than a guess. `encrypted`, not a `pin` fallback: only a PIN_UNLOCK guess counts towards the 5-failure wipe, so mislabelling a vault board as PIN-protected would invite typed guesses into a counter it was never meant to arm. A board's own next successful unlock (PIN_UNLOCK, VAULT_UNLOCK, or the relay's 24136 operator vault delivery — all three run through `pin::try_unlock`) self-repairs a missing or wrong marker from the secret's length (4-8 digits or 32 bytes settles it) via `data_key::repair_secret_kind`, which takes the `Unlocked` proof a real unlock produces so it cannot run ahead of one; a phone-slot unlock never sees the secret and never touches the marker. `try_unlock` clears the PIN wipe counter immediately once the secret is proven correct, before migration or the marker repair — the two optional writes that follow — so a power cut during either can never catch the counter mid-way stale. `unlock_phone_count` is `null`, not `0`, over a damaged phone blob (never mistake damage for no phones), except once `at_rest` is `none`, which always reports `0` — removing the last identity leaves `dk_ph` behind (`provision.rs`, `masters.rs`), and a mode of "none" makes any leftover blob moot. The count itself walks and validates the blob (`PhoneSet::count`) rather than allocating a full `PhoneSet::decode`, sized from the NVS blob's actual length rather than a fixed 2,166-byte buffer, since this runs in the same low-heap path `minimal_status_json` exists for. Phone unlock (common/src/phone_unlock.rs) adds per-phone 24135s (one-time author, `["h", hint]` only, sealed content with `t` = `locked`) answered by a throwaway-key 24136; a relay-list change is told to the phones on their old relays as the same message with `t` = `relays` (common/src/phone_relays.rs: NVS `ph_relays` records what they were told and how many update rounds have gone out; locked boots repeat the announcement there, one old relay per announce interval straight after the live announcement, with per-relay backoff; unlocked boots post six randomly delayed update rounds over about a day, each on a publish-only connection that never carries the signer's subscription and never makes a third TLS session, resuming after a restart, then record the live list).
 
 Deleted NVS entries are zeroed (2026-09-25, checklist section 28, not bench-run): ESP-IDF v5.3.2 deletes by flipping bitmap state bits and leaves the bytes until the sector is collected, so a dump could hold a plaintext seed written before sealing, a revoked phone's record or a replaced wrapper. `common/src/nvs_scrub.rs` (pure, host-tested against an nvs_partition_gen.py image, with a cut-at-every-write sweep) plans and runs one pass over the raw partition: only ERASED entries on ACTIVE/FULL pages with a good header CRC and version 0xfe, never headers, the bitmap, EMPTY or WRITTEN entries; ERASED entries past the first EMPTY on an ACTIVE page and inside a live item's span are left (ESP-IDF reads the former by position at load); unparsable pages are skipped and reported; each write is preceded by a check that the page header is unchanged and the target entry still ERASED (`still_erased`; ERASED is terminal until a sector erase, which rewrites the header) and followed by a read-back. PHY calibration storage is off (`CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n`, full calibration each boot) so no ESP-IDF code writes NVS behind the scrub. `firmware/src/nvs_scrub.rs` is the flash glue, called on the main task at boot (before unlock and WiFi), after revoke_unlock_phone, revoke_client/CONNSLOT_REVOKE, PROVISION_REMOVE, PIN/vault set/clear, seed migration and each note sealing sync. `nvs_scrub_v1` capability; revoke replies carry `scrub: {zeroed, pages_skipped, complete}` (revoke_client: device operator only); FIRMWARE_INFO `nvs_scrub`. See SECURITY-MODEL.md, *Leftover bytes in NVS*.
 
@@ -198,19 +198,134 @@ operator-only `get_network_config` reply (top-level `wifi_index`, only that
 runtime field); the WiFi info page and Sapwood's Connectivity panel name that
 network rather than the primary (checklist section 31).
 
+The relay loop proves delivery, not liveness (2026-10-08, checklist section
+35, NOT YET BENCH-RUN). A T-Display on beta.25 went deaf on 2026-10-07 with a
+live session: online, button working, health watchdog quiet, yet no `ping`
+answered on any relay until a power cycle, because pongs and the EOSE each
+re-REQ provokes keep `last_rx` fresh on a session whose EVENTs have stopped.
+Each live session now publishes a probe its own subscription must deliver
+back: kind 24133, authored by a per-boot RAM-only key (relay.rs `ProbeKey`,
+zeroised on drop) and p-tagged to that same key, which `build_sub_req` adds
+to the `#p` list of the live 24133 filter (`delivery_probe::nip46_p_values`,
+so the connect, keepalive and persona re-subscribe REQs all carry it; the
+locked-boot and catch-up REQs do not), with a `hwprobe` nonce tag. So it
+proves the very filter that carries requests while addressing no served
+identity: another signer of the same master (a Pi heartwoodd) never sees it.
+Recognised in `process_event` (author and `p` both the probe key,
+`delivery_probe::our_probe_nonce`) before the dedupe, the dispatch, the panel
+wake and the reply clock. First 30 s after the subscription, then every
+3 min; 20 s to come back; two misses in a row drop the session through the
+ordinary reconnect path (primary rotates, secondary/pinned back off), logged
+at warn with a crumb and `get_status.delivery_selfcheck` `{redials, streak,
+last_reason}` (full reply only, so neither delegate shape widens; capability
+`relay_delivery_selfcheck_v1`). Not while a card is open, an OTA runs or a
+trial runs; a blocked loop (a cable card, a dial, a gap of over 5 s between
+idle ticks) restarts the wait; a heap below `response_transportable` or no
+wall clock defers the probe. An `OK false` turns the check off for that
+session, a relay that has never delivered a probe this boot gets one redial
+and is then left alone, and three self-check redials in a row with nothing
+delivered in between (one at least on a relay that has delivered this boot)
+take the health watchdog's controlled restart under a `relay watchdog:
+selfcheck` crumb. All of it is `common/src/delivery_probe.rs`
+(`SessionProbe`, `SelfCheckLedger`), host-tested; relay.rs
+`delivery_selfcheck` is the glue.
+
+A relay that refuses this client is left alone (2026-10-08, checklist section
+35 items 8-9, NOT YET BENCH-RUN). relay.damus.io was found answering `banned:
+too many rate-limit violations` to the owner's home address on 2026-10-08;
+the cause is not known, but the loop used to answer every refusal by
+reconnecting (a `CLOSED` re-sent the connect-time REQ at once, catch-up
+included), which is what a violation counter punishes. `relay_cooldown::classify`
+reads the relay's own words (a `NOTICE`, a `CLOSED`, an `OK false`, or the
+upgrade's status line): `banned` cools the host 60 min, `rate-limited:`, the
+same in words, or an HTTP 429 cools it 15 min; `blocked:`, `restricted:` and
+`auth-required:` are about an event or an author and keep their old handling
+(an allowlisted relay's `OK false` still only makes the probe inert). The
+session drops with a `relay refused us` error (runtime class
+`relay_refused`; Sapwood has no label for it yet). A cooling host is never the
+secondary or a pinned dial, and the primary rotation passes it by; when every
+configured relay is cooling, the primary dials the one ending soonest, at most
+once a minute, because a board with no session takes the health watchdog's
+restart, which would forget every cooldown. RAM only; pure half
+`common/src/relay_cooldown.rs` (`RelayCooldowns::pick`), host-tested.
+The keepalive got lighter the same day (checklist section 35 item 10): the
+re-REQ goes out every 2 min, not 40 s (`RESUB_INTERVAL`), since the
+self-check now catches a session that stops delivering, and its kind-0
+profile filter is `"limit":0` (the connect-time REQ keeps `"limit":1`), so a
+relay no longer replays the profile at every re-REQ. On a relay where the
+self-check is inert, a silently dropped subscription now lasts up to 2 min.
+
+Relay 1 is the home relay (2026-10-09, checklist section 35 item 11, NOT YET
+BENCH-RUN). The rotation only ever moved on, so a board that left relay 1
+stayed away: the soak T-Display left its relay 1 at 21:51 on
+2026-10-08 and served relay.primal.net alone all night (its heap rarely
+spares a second TLS session), while a client that knows only relay 1 (the
+Archipelago link) could not reach it. `home_relay::HomeReturn` (pure,
+host-tested) runs each loop pass before the dials: while no session is on
+relay 1, 15 min after leaving it (then 30, 60, 120 min while attempts fail;
+reset once home), it dials home beside the primary if a second session fits,
+closes a secondary on another relay to make room if one is live, or, when
+one session is all the board can hold, drops the primary and dials home, the
+ordinary rotation carrying on if home fails. Never while a card is open, an
+OTA, a network trial or a relay update round runs, a session is degraded, or
+relay 1 is cooling after refusing us.
+
 LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =
-HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then lnurl-wallet's
-m/139'/1'/d1..d4 and LUD-25's tweak, graded against lnurlcash-kit's
-part2.json and tests/fixtures/lud25-nostr-seed.json on both curve backends). The
-mint holds only the cx1 (heartwood_note_address, no hold); a key-note wrap
-carries p/i/sig and no secret, and is opened only if the key is ours
-(note_wrap::open_note_rumor). A key note stores its key as the secret plus
+HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then LUD-25's
+m/139'/d1..d4 and its purposed tweak, graded against lnurlcash-conformance
+0.15.0's part2.json and nostr-seed.json in tests/fixtures on both curve
+backends). The mint holds only the cx1 (heartwood_note_address, no hold); a
+key-note wrap carries p/i/c and no secret, and is opened only if the key is
+ours (note_wrap::open_note_rumor). A key note stores its key as the secret plus
 KeyNote {index, pubkey} (a v3 blob, written only for key notes), exports a
-ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim)
-derives the key itself. Recoverable signing is the one new curve op:
-secp256k1's `recovery` module on the firmware, k256 `ecdsa` on the host.
+ck1 (never the key), cannot be sent, and a scan claim (heartwood_note_claim,
+optional `purpose`, default 2) derives the key itself.
+
+Moved to LUD-25 `50d740a` / `6e865b1` on 2026-10-04 (moneyer 0.17 had
+stranded a zap: the board ignored the wrap). Three changes: the tweak hashes
+`ser32(purpose)` before the index (0 wallet, 1 change, 2 Lightning Address,
+which is what a mint mints to and so what a wrap is on); the branch is
+`m/139'/d1..d4` with the hashing key at `m/139'/0`, not lnurl-wallet's
+`m/139'/1'/...`; and a ck1 is `Q || BIP-340` (aux_rand zero) over the BIP-341
+key-path sighash of the canonical spend bound to the mint's domain
+(cash_key::key_path_sighash), not a recoverable ECDSA signature. A mint
+certificate's hrp now carries its amount (`cs210n1...`) and travels as `c`
+(`sig` still read). A claim that names its key falls back to the superseded
+`m/139'/1'` branch, because a mint keeps paying the cx1 a name was registered
+with; nothing new is handed out there, so re-register a name
+(`heartwood address keys`) to move it to the current branch. The ECDSA
+`recovery`/`ecdsa` backend features are gone.
+
+Address proofs (2026-10-05, checklist section 34, NOT YET BENCH-RUN): since
+`50d740a` a mint changes or clears a name's cx1 only with `"sig"`, a BIP-340
+signature by the purpose-0 index-0 key of the branch CURRENTLY on file over
+sha256("LNURLcash:<register|unregister>:<domain>:<name>"), so a name on the
+superseded branch can be moved only with that branch's agreement.
+`heartwood_note_address_proof {host, name, action, cx1}` (wire command
+`cash_address_proof`, capability `note_address_proof_v1`) signs it with
+whichever of the served identity's two branches at `host` has that exact cx1
+(`cash_key::address_proof_for`, compared as decoded bytes; any other cx1 is
+refused) over `spend_domain(host)`, aux_rand zero, which reproduces all four
+of part2.json's `addressProofs`. It answers the 64-byte `sig`, the index-0
+`pubkey` and `branch` (`current`/`superseded`), never a key. Everything that
+could refuse (mint, name rule `^[a-z0-9][a-z0-9._-]{2,31}$`, action, a cx1
+that is ours) is checked by the one pure `note_cmd::address_proof_ask` before
+the card, on the relay precheck and in the dispatcher alike; the card
+(`note_cmd::address_proof_card`) is ADDRESS PROOF over `<name>@<domain>` and
+`<action>, current keys` or `old keys`. Pinned ButtonRequired like the other
+note mutations, and device-press-only (`Nip46Method::device_press_only`, as a
+wallet pairing is): a proof never expires and decides where a name pays, so no
+guardian verdict may answer it and an escalate slot is refused outright. It
+never shares a card (`approval_queue::never_shares_card`), and nor, since the
+same change, does `heartwood_note_trust`, which used to batch so one hold
+trusted every sender behind the first npub shown; scoped to the served key (`method_uses_served_key`), and an
+ask never shares a card (`approval_queue::never_shares_card`): a batch card
+speaks in notes and sats and could not name a second proof. The cable has no
+identity, so `cash_address_proof` there refuses before the card, as
+`cash_address` does; on the USB-bridged NIP-46 path the card is the generic
+extension card, as for every note method.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
@@ -224,13 +339,14 @@ Five crates — build each from its own directory:
 # target does not compile (35 arity errors). Use the two invocations CI uses:
 cargo test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen,cash
 cargo test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,seed-encrypt,cash
-cd ui-preview && cargo test                # screen geometry + the show_error clipping guard
-cd provision && cargo build                # host CLI tool
-cd sign-test && cargo build                # signing test harness
-cd heartwoodd && cargo build               # Pi-side daemon (Soft or Hard mode)
-cd ota && cargo build                      # Pi-side serial OTA tool
-cd firmware && cargo build                 # ESP32 firmware (needs ESP toolchain)
-cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32
+# Each line is a subshell, so it can be run from the repository root in sequence.
+(cd ui-preview && cargo test)              # screen geometry + the show_error clipping guard
+(cd provision && cargo build)              # host CLI tool
+(cd sign-test && cargo build)              # signing test harness
+(cd heartwoodd && cargo build)             # Pi-side daemon (Soft or Hard mode)
+(cd ota && cargo build)                    # Pi-side serial OTA tool
+(cd firmware && cargo build)               # ESP32 firmware (needs ESP toolchain)
+(cd firmware && espflash flash target/xtensa-esp32s3-espidf/debug/heartwood-esp32)
 ```
 
 Requires the ESP Rust toolchain for firmware: `espup install`, then `source ~/export-esp.sh`.

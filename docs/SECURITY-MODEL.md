@@ -488,6 +488,20 @@ later cost retune must still be measured on the slowest supported board; the
 stored count makes that a deliberate new-record policy rather than an unsafe
 global constant change.
 
+**Downgrade is one-way while sealed.** From `v0.18.0-beta.17`, seeds are sealed
+under a random data key as 82-byte `HWDK` blobs (`common/src/data_key.rs`), and
+the first unlock on that firmware migrates an older board's seeds in place.
+Firmware up to `v0.18.0-beta.16` only recognises the 92- and 101-byte
+`seed_cipher` records, so it cannot read the new ones. Before going back to
+beta.16 or older on a board with a PIN or vault key, unlock the board and turn
+at-rest encryption off: `SET_PIN` with an empty payload ("Remove PIN?") or
+`VAULT_SET` with an empty payload ("Disable vault?"), each behind a button hold.
+That stores every seed in plaintext and drops the phone records, so enrolled
+phones must be enrolled again if encryption is turned back on. A WiFi-mode
+board refuses the change while it holds bearer notes ("at-rest changes need USB
+mode while notes are held"), so empty the note locker or switch to USB mode first. Turning it off
+does not wipe the sealed bytes already on flash (see *Leftover bytes in NVS*).
+
 **Honest limitation:** with no secure element and no eFuses, the key is derived
 **entirely from the PIN**. An attacker who owns the flash can brute-force the
 PIN offline; the slow KDF raises the per-guess cost but a short PIN is an
@@ -720,7 +734,20 @@ So the residuals are these:
   the same boot if a write failed part-way) instead of restoring the wider
   one, and the reply says what a restart would find: the old table (the
   revocation holds until then only), no table (every pairing of that
-  identity gone), or, after a part-written table, either of those. Once a
+  identity gone), or, after a part-written table, either of those. When the
+  old table is still on flash and was refused for lack of room (an in-place
+  rewrite with no room for a second copy), the reply starts `storage_full:`
+  and asks for room to be freed before the request is repeated. When the
+  identity's pairings are quarantined, or its stored table cannot be read,
+  nothing can save the revocation in that boot (a repeat would answer "not
+  found"), so the reply asks for a restart first; a quarantined identity
+  serves no pairing until then. Otherwise, with the old table still on
+  flash, repeating the request saves it: a revocation
+  that finds the pairing (or client key) already gone from RAM but still on
+  flash writes the narrower table and answers as a revocation would, its
+  credential fingerprint checked against the stored copy, instead of
+  answering "not found" while the pairing returns at the next restart. A
+  repeated identity withdrawal or narrowing saves the same way. Once a
   write has failed part-way the identity's pairings cannot change until a
   restart, so those replies, and any other slot-change reply for that
   identity, end by asking for one.
@@ -729,6 +756,13 @@ So the residuals are these:
   phone record set or persona chunk can still be rewritten in place, plus a
   reserve for the small keys (`nvs::growth_allowed`). Other writes are not
   gated, so this keeps boards off the fallback most of the time, not always.
+  A refusal by the gate is reported as a full board, not a fault: the reply
+  starts `storage_full:` for a pairing (USB NACK, management reply), a
+  phone and an avatar (including the USB `SET_IDENTITY_META` NACK, which is
+  otherwise empty), is the bare `storage_full` code from
+  `heartwood_pair_wallet` (the wallet's other methods answer the same code),
+  and `identity storage full` for a persona, as before. Freeing an unused pairing, persona or avatar helps; a
+  `storage_unavailable:` reply is a write that failed.
 - **The entry count is an upper bound derived from the v5.3.2 write path,
   not a proof.** If a direct write still runs out of room part-way, the
   cleanup defect above applies, and that key is blocked until a restart.

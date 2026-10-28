@@ -21,7 +21,7 @@
 //! "release this 12-sat note" must never be the wording on a hold that
 //! releases three notes worth a thousand.
 
-use alloc::string::String;
+use alloc::{format, string::String};
 
 /// Most asks one hold may authorise. The card shows the count, and the batch
 /// is only ever one client asking for one identity.
@@ -29,6 +29,21 @@ pub const MAX_BATCH: usize = 8;
 
 /// Most asks parked behind the open card, across all other clients.
 pub const MAX_WAITING: usize = 4;
+
+/// What the relay answers when the card queue has no room.
+pub const BUSY_ERROR: &str = "signer is busy with another approval; retry shortly";
+
+/// Whether an ask that never shares a card ([`never_shares_card`]) would be
+/// answered busy now: its bytes would take the held asks past `budget`, or
+/// a card is open and [`MAX_WAITING`] asks already wait behind it. Exactly
+/// what [`admit`] (plus the relay's byte budget) decides for a unique key,
+/// asked before the ask exists, so a FULL ACCESS bundle can be refused busy
+/// before room and the registry are read (review round 2: after them, a
+/// full queue answered a right `expect` guess busy and a wrong one
+/// `pubkey mismatch`, with no card).
+pub fn unshared_ask_busy(card_open: bool, waiting: usize, held_bytes: usize, weight: usize, budget: usize) -> bool {
+    held_bytes.saturating_add(weight) > budget || (card_open && waiting >= MAX_WAITING)
+}
 
 /// Who is asking, for which identity, and to do what.
 ///
@@ -55,6 +70,37 @@ impl AskKey {
             kind_key,
         }
     }
+}
+
+/// The batch key of a login challenge: unique per ask (`seq` is a per-boot
+/// counter, 32-bit because no board has 64-bit atomics), so a login
+/// challenge never shares a card and one hold can never sign two of them. It
+/// must not depend on anything the client chooses, such as the request id.
+pub fn login_kind_key(base: &str, seq: u32) -> String {
+    format!("{base}#login{seq}")
+}
+
+/// Methods whose ask never shares a card, whoever sends it: each one's card
+/// names a single decision that a batch card has no way to say. An address
+/// proof's card names one lightning address, one action and one branch; a
+/// trust card names one sender's npub. A batch card speaks in notes and sats,
+/// so a second proof or a second sender joining the first would be approved
+/// on a hold that showed the owner neither. The FULL ACCESS card
+/// (`heartwood_approve_bundle`, one-hold pairing spec 4.2) names one phone's
+/// five words and one scope: a second bundle sharing its hold would grant a
+/// phone the owner never compared.
+pub fn never_shares_card(method: &str) -> bool {
+    matches!(
+        method,
+        "heartwood_note_address_proof" | "heartwood_note_trust" | "heartwood_approve_bundle"
+    )
+}
+
+/// The batch key of an ask that must never share a card
+/// ([`never_shares_card`]): unique per ask, from a device counter, like
+/// [`login_kind_key`], so nothing the client sends can make two equal.
+pub fn unshared_kind_key(base: &str, seq: u32) -> String {
+    format!("{base}#once{seq}")
 }
 
 /// What to do with an incoming interactive ask.
@@ -121,6 +167,30 @@ mod tests {
 
     fn key(slot: u8, client: &str, target: &str) -> AskKey {
         AskKey::new(slot, client.to_string(), target.to_string(), "1".to_string())
+    }
+
+    #[test]
+    fn unshared_ask_busy_agrees_with_admit_and_the_byte_budget() {
+        let open = key(0, "aa", "bb");
+        let mut seq = 0u32;
+        for card_open in [false, true] {
+            for waiting in 0..=MAX_WAITING + 1 {
+                for (held, weight) in [(0usize, 256usize), (7_936, 256), (7_937, 256), (8_192, 0)] {
+                    seq += 1;
+                    let incoming = AskKey::new(0, "cc".to_string(), "bb".to_string(), unshared_kind_key("x", seq));
+                    let admitted = if held.saturating_add(weight) > 8_192 {
+                        Admission::Busy
+                    } else {
+                        admit(card_open.then_some(&open), 1, waiting, &incoming)
+                    };
+                    assert_eq!(
+                        unshared_ask_busy(card_open, waiting, held, weight, 8_192),
+                        admitted == Admission::Busy,
+                        "open {card_open} waiting {waiting} held {held} weight {weight}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -244,5 +314,73 @@ mod tests {
             admit(None, 0, MAX_WAITING, &key(3, "ee", "ff")),
             Admission::Open
         );
+    }
+
+    #[test]
+    fn a_login_challenge_never_shares_a_card() {
+        // Same client, identity and request id: only the sequence differs, and
+        // it is the device's, so the client cannot make two challenges equal.
+        let base = "sign_event:22242";
+        let kk = |_: &str, kind_key: &str| {
+            AskKey::new(1, "cc".to_string(), "dd".to_string(), kind_key.to_string())
+        };
+        let a = kk(base, &login_kind_key(base, 0));
+        let b = kk(base, &login_kind_key(base, 1));
+        assert_ne!(a, b);
+        assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
+        assert_ne!(admit(Some(&a), 1, 0, &b), Admission::Collapse);
+        // Ordinary asks of that kind still batch.
+        let plain = kk(base, base);
+        assert_eq!(admit(Some(&plain), 1, 0, &kk(base, base)), Admission::Collapse);
+        // A login ask does not join an ordinary card of the same kind either.
+        assert_eq!(admit(Some(&plain), 1, 0, &a), Admission::Wait);
+    }
+
+    #[test]
+    fn two_trusts_never_share_a_hold() {
+        // One hold used to trust every sender batched behind the card, while
+        // the card showed only the first npub.
+        let base = "heartwood_note_trust";
+        assert!(never_shares_card(base));
+        let kk = |kind_key: &str| AskKey::new(1, "cc".to_string(), "dd".to_string(), kind_key.to_string());
+        let a = kk(&unshared_kind_key(base, 0));
+        let b = kk(&unshared_kind_key(base, 1));
+        assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
+    }
+
+    #[test]
+    fn a_full_access_bundle_never_shares_a_card() {
+        // One-hold pairing spec 4.2: the card names one phone's words; a second
+        // bundle riding the same hold would grant a phone nobody compared.
+        let base = "heartwood_approve_bundle";
+        assert!(never_shares_card(base));
+        for method in ["heartwood_owner_status", "heartwood_owner_narrow", "heartwood_owner_vault"] {
+            assert!(!never_shares_card(method), "{method}");
+        }
+        let kk = |kind_key: &str| AskKey::new(1, "cc".to_string(), "dd".to_string(), kind_key.to_string());
+        let a = kk(&unshared_kind_key(base, 0));
+        let b = kk(&unshared_kind_key(base, 1));
+        assert_ne!(a, b);
+        assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
+        assert_ne!(admit(Some(&a), 1, 0, &b), Admission::Collapse);
+    }
+
+    #[test]
+    fn an_address_proof_never_shares_a_card() {
+        let base = "heartwood_note_address_proof";
+        assert!(never_shares_card(base));
+        for method in ["heartwood_note_export", "heartwood_note_send", "sign_event", "heartwood_note_address"] {
+            assert!(!never_shares_card(method), "{method}");
+        }
+        let kk = |kind_key: &str| AskKey::new(1, "cc".to_string(), "dd".to_string(), kind_key.to_string());
+        let a = kk(&unshared_kind_key(base, 0));
+        let b = kk(&unshared_kind_key(base, 1));
+        assert_ne!(a, b);
+        assert_eq!(admit(Some(&a), 1, 0, &b), Admission::Wait);
+        // Nor does it join, or take in, an ordinary card of the same method.
+        assert_eq!(admit(Some(&kk(base)), 1, 0, &a), Admission::Wait);
+        assert_eq!(admit(Some(&a), 1, 0, &kk(base)), Admission::Wait);
+        // And it is never mistaken for a login challenge's key.
+        assert_ne!(unshared_kind_key(base, 0), login_kind_key(base, 0));
     }
 }

@@ -54,6 +54,11 @@ pub mod client_grants;
 #[cfg(feature = "nip46")]
 pub mod slot_codec;
 
+/// Heartwood one-hold pairing: the owner mark, the setup hold's params,
+/// card and words, and Rule V / Rule D (signet-plans 2026-10-17 spec).
+#[cfg(feature = "nip46")]
+pub mod owner_pairing;
+
 pub mod net_config;
 
 pub mod mgmt;
@@ -69,11 +74,25 @@ pub mod nvs_scrub;
 
 pub mod persona_pack;
 
+/// NVS entry arithmetic for a blob write (ESP-IDF's multi-page blob layout).
+pub mod nvs_room;
+
 pub mod reply_clock;
 
 pub mod approval_queue;
 
 pub mod held_reply;
+
+/// The relay loop's delivery self-check: each live session must have its own
+/// probe delivered back, or it is redialled.
+pub mod delivery_probe;
+
+/// Relays that refused the client (rate-limited, banned) are left alone for a
+/// while rather than redialled.
+pub mod relay_cooldown;
+
+/// Getting back to the first configured relay after the rotation moved off it.
+pub mod home_relay;
 
 pub mod wrap_ledger;
 
@@ -169,3 +188,39 @@ mod firmware_policy_host_tests;
 pub use firmware_policy_host_tests::nvs;
 #[cfg(all(test, feature = "nip46", feature = "nip44"))]
 pub use firmware_policy_host_tests::personas;
+
+// The NIP-46 handler's pure pre-dispatch gates (firmware/src/nip46_gates.rs):
+// the handler's own test module builds only for the device target, so these
+// run here instead.
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+#[path = "../../firmware/src/nip46_gates.rs"]
+mod firmware_nip46_gates;
+
+// Exercise the firmware's WiFi retry ordering with a fault-injected radio.
+#[cfg(test)]
+#[path = "../../firmware/src/wifi_retry.rs"]
+mod firmware_wifi_retry;
+
+// The allocation prerequisite uses the real firmware identity, custody and
+// storage checks; only ESP NVS I/O is fault injected by the existing mock.
+#[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
+#[path = "../../firmware/src/master_identity.rs"]
+mod master_identity;
+#[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
+#[path = "../../firmware/src/held_data_key.rs"]
+mod held_data_key;
+#[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
+#[path = "../../firmware/src/allocation_root.rs"]
+mod allocation_root;
+
+#[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
+mod allocation_nvs_host_sys;
+#[cfg(all(test, feature = "nip46", feature = "nip44", feature = "seed-encrypt"))]
+mod allocation_partition_host_sys;
+
+// Execute the actual destructive wipe adapter; only raw partition I/O is mocked.
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+mod persistent_wipe_host_sys;
+#[cfg(all(test, feature = "nip46", feature = "nip44"))]
+#[path = "../../firmware/src/persistent_wipe.rs"]
+mod firmware_persistent_wipe;

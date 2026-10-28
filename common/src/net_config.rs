@@ -54,6 +54,9 @@ pub enum NetworkRuntimeError {
     RelayProtocol,
     RelayClosed,
     RelaySilent,
+    /// The relay refused this client (rate-limited, banned) and is being left
+    /// alone for a while (`relay_cooldown`).
+    RelayRefused,
     InvalidConfig,
 }
 
@@ -909,7 +912,7 @@ pub fn parse_net_config(bytes: &[u8]) -> Result<NetConfig, &'static str> {
 fn is_xonly_point(key: &[u8; 32]) -> bool {
     #[cfg(all(feature = "k256-backend", not(feature = "secp256k1-backend")))]
     {
-        k256::schnorr::VerifyingKey::from_bytes(key).is_ok()
+        k256::schnorr::VerifyingKey::from_bytes(key.into()).is_ok()
     }
     #[cfg(all(feature = "secp256k1-backend", not(feature = "k256-backend")))]
     {

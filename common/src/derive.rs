@@ -34,6 +34,23 @@ type HmacSha256 = Hmac<Sha256>;
 // Backend: secret → (valid secp256k1 scalar?, x-only pubkey bytes)
 // ---------------------------------------------------------------------------
 
+/// Point syntax only; this does not establish ownership or issuer authority.
+pub fn is_xonly_public_key(key: &[u8; 32]) -> bool {
+    #[cfg(feature = "k256-backend")]
+    {
+        k256::schnorr::VerifyingKey::from_bytes(key.into()).is_ok()
+    }
+    #[cfg(feature = "secp256k1-backend")]
+    {
+        secp256k1::XOnlyPublicKey::from_slice(key).is_ok()
+    }
+    #[cfg(not(any(feature = "k256-backend", feature = "secp256k1-backend")))]
+    {
+        let _ = key;
+        false
+    }
+}
+
 #[cfg(feature = "k256-backend")]
 pub(crate) mod backend {
     use k256::schnorr::SigningKey;
@@ -41,7 +58,7 @@ pub(crate) mod backend {
     /// Validate a 32-byte secret as a secp256k1 scalar and return the x-only
     /// public key bytes, or None if the scalar is invalid (zero / ≥ order).
     pub fn pubkey_from_secret(secret: &[u8; 32]) -> Result<[u8; 32], &'static str> {
-        let sk = SigningKey::from_bytes(secret).map_err(|_| "invalid secret key")?;
+        let sk = SigningKey::from_bytes(secret.into()).map_err(|_| "invalid secret key")?;
         Ok(sk.verifying_key().to_bytes().into())
     }
 
@@ -52,9 +69,9 @@ pub(crate) mod backend {
     /// is the one place the parity byte matters.
     #[cfg(feature = "cash")]
     pub fn compressed_pubkey(secret: &[u8; 32]) -> Result<[u8; 33], &'static str> {
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        use k256::elliptic_curve::sec1::ToSec1Point;
         let sk = k256::SecretKey::from_slice(secret).map_err(|_| "invalid secret key")?;
-        let encoded = sk.public_key().to_encoded_point(true);
+        let encoded = sk.public_key().to_sec1_point(true);
         let bytes = encoded.as_bytes();
         if bytes.len() != 33 {
             return Err("compressed public key was not 33 bytes");
@@ -103,21 +120,15 @@ pub(crate) mod backend {
         Ok(out)
     }
 
-    /// RFC6979 ECDSA over a 32-byte digest, low-S, as `r || s || recovery id`.
-    /// The layout a LUD-25 `ck1` carries: whoever holds the signature recovers
-    /// the public key from it, which is how a mint finds the note it spends.
+    /// BIP-340 Schnorr over a 32-byte message with an all-zero `aux_rand`, so
+    /// the signature is a function of the key and the message alone. A LUD-25
+    /// `ck1` is one: the same key spending at the same mint always presents the
+    /// same credential, as the spec's vectors require.
     #[cfg(feature = "cash")]
-    pub fn sign_recoverable(secret: &[u8; 32], digest: &[u8; 32]) -> Result<[u8; 65], &'static str> {
-        let key = k256::ecdsa::SigningKey::from_bytes(&k256::FieldBytes::from(*secret))
-            .map_err(|_| "invalid secret key")?;
-        // k256 normalises s to the low half and flips the recovery id to
-        // match, which is what libsecp256k1 does on the firmware backend.
-        let (signature, recovery) =
-            key.sign_prehash_recoverable(digest).map_err(|_| "signing failed")?;
-        let mut out = [0u8; 65];
-        out[..64].copy_from_slice(&signature.to_bytes());
-        out[64] = recovery.to_byte();
-        Ok(out)
+    pub fn sign_bip340_zero_aux(secret: &[u8; 32], message: &[u8; 32]) -> Result<[u8; 64], &'static str> {
+        let key = SigningKey::from_bytes(secret.into()).map_err(|_| "invalid secret key")?;
+        let signature = key.sign_raw(message, &[0u8; 32]).map_err(|_| "signing failed")?;
+        Ok(signature.to_bytes())
     }
 }
 
@@ -161,20 +172,16 @@ pub(crate) mod backend {
         Ok(key.negate().secret_bytes())
     }
 
-    /// RFC6979 ECDSA, low-S, as `r || s || recovery id`. See the k256
-    /// backend's `sign_recoverable`.
+    /// BIP-340 Schnorr with an all-zero `aux_rand`. See the k256 backend's
+    /// `sign_bip340_zero_aux`.
     #[cfg(feature = "cash")]
-    pub fn sign_recoverable(secret: &[u8; 32], digest: &[u8; 32]) -> Result<[u8; 65], &'static str> {
-        use secp256k1::{Message, SecretKey};
+    pub fn sign_bip340_zero_aux(secret: &[u8; 32], message: &[u8; 32]) -> Result<[u8; 64], &'static str> {
+        use secp256k1::Message;
         let secp = Secp256k1::signing_only();
-        let key = SecretKey::from_slice(secret).map_err(|_| "invalid secret key")?;
-        let (recovery, compact) = secp
-            .sign_ecdsa_recoverable(&Message::from_digest(*digest), &key)
-            .serialize_compact();
-        let mut out = [0u8; 65];
-        out[..64].copy_from_slice(&compact);
-        out[64] = recovery.to_i32() as u8;
-        Ok(out)
+        let keypair = Keypair::from_seckey_slice(&secp, secret).map_err(|_| "invalid secret key")?;
+        let signature =
+            secp.sign_schnorr_with_aux_rand(&Message::from_digest(*message), &keypair, &[0u8; 32]);
+        Ok(signature.serialize())
     }
 }
 

@@ -76,9 +76,13 @@ pub fn handle_create(
         let snapshot = policy_engine.snapshot_slot_state(ms);
         match policy_engine.create_slot(ms, label.clone(), secret_hex.clone()) {
             Some(index) => {
-                if !policy_engine.persist_slots(nvs, ms) {
+                if let Err(why) = policy_engine.try_persist_slots(nvs, ms) {
                     policy_engine.restore_slot_state_durably(nvs, snapshot);
-                    protocol::write_frame(usb, FRAME_TYPE_NACK, restart_advised(policy_engine, ms, "storage_unavailable: pairing was not saved").as_bytes());
+                    let reason = match why {
+                        crate::policy::SlotSaveError::NoRoom => crate::policy::PAIRING_STORAGE_FULL,
+                        crate::policy::SlotSaveError::Failed => "storage_unavailable: pairing was not saved",
+                    };
+                    protocol::write_frame(usb, FRAME_TYPE_NACK, restart_advised(policy_engine, ms, reason).as_bytes());
                     return;
                 }
 
@@ -216,7 +220,16 @@ pub fn handle_update(
                 }
                 // Family-bunker C3 flags travel over the cable too, so the
                 // guardian's own hands can flag a slot without an operator.
-                if v.get("escalate").is_some()
+                // `escalate` alone is the owner's away-approval switch: name
+                // what the press grants or takes back, not "family".
+                let family_others = v.get("petition_on_deny").is_some()
+                    || v.get("audit_child_wrap").is_some()
+                    || v.get("guardian_notice_wrap").is_some()
+                    || v.get("bound_identity").is_some();
+                if let (Some(escalate), false) = (v["escalate"].as_bool(), family_others) {
+                    if !changes.is_empty() { changes.push_str(", "); }
+                    changes.push_str(if escalate { "PHONE MAY OK" } else { "BUTTON ONLY" });
+                } else if v.get("escalate").is_some()
                     || v.get("petition_on_deny").is_some()
                     || v.get("audit_child_wrap").is_some()
                     || v.get("guardian_notice_wrap").is_some()
@@ -360,6 +373,16 @@ pub fn handle_revoke(
             }
             protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"ok");
             log::info!("Revoked connection slot {} for master {}", idx, ms);
+        } else if policy_engine.unsaved_slot_revocation(nvs, ms, idx).is_some() {
+            // Revoked in RAM by an earlier request whose save failed, and
+            // still on flash: repeating the revocation saves it.
+            policy_engine.mark_slots_unsaved();
+            if let Err(outcome) = policy_engine.persist_revocation(nvs, ms).describe("pairing revocation") {
+                protocol::write_frame(usb, FRAME_TYPE_NACK, outcome.as_bytes());
+                return;
+            }
+            protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"ok");
+            log::info!("Saved the earlier revocation of connection slot {} for master {}", idx, ms);
         } else {
             protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_REVOKE_RESP, b"not found");
         }

@@ -339,7 +339,7 @@ fn check_room_for_phone(nvs: &EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(
     if crate::nvs::growth_allowed(nvs, data_key::PHONES_KEY, grown) {
         Ok(())
     } else {
-        Err("not enough storage left to add a phone: remove an unused pairing, persona or avatar first".into())
+        Err("storage_full: not enough storage left to add a phone; remove an unused pairing, persona or avatar first".into())
     }
 }
 

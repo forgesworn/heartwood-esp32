@@ -1259,6 +1259,178 @@ fn draw_enrol_countdown(
         .ok();
 }
 
+/// The inverted `FULL ACCESS` bar across the top of the screen (one-hold
+/// pairing spec 4.2): a filled bar with the header cut out of it in the
+/// background colour. Only the FULL ACCESS card's two screens draw it, now
+/// and later; no other card is ever inverted (pinned by a ui-preview test
+/// over this file).
+fn draw_full_access_header(display: &mut Display<'_>, l: &Layout, g: &crate::layout::FullAccessGeometry) {
+    let (x, y, w, h) = g.bar;
+    Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32))
+        .into_styled(PrimitiveStyle::with_fill(ACCENT))
+        .draw(display)
+        .ok();
+    let header = heartwood_common::owner_pairing::FULL_ACCESS_HEADER;
+    let style = MonoTextStyleBuilder::new()
+        .font(l.font_header())
+        .text_color(crate::palette::BG)
+        .build();
+    let hx = l.center_x(header.len() as i32 * Layout::glyph_w(l.font_header()));
+    Text::new(header, Point::new(hx, g.header_y), style).draw(display).ok();
+}
+
+/// The FULL ACCESS card (one-hold pairing spec 4.2), at rest: the inverted
+/// header, words page `page` (`w1 w2`, `w3 w4` or `w5`, review round W2) in
+/// the largest font that fits, the scope line, the style's line(s) and the
+/// hint, word for word as `owner_pairing` gives them (My Signet shows the
+/// same lines), over a 45 s countdown led by the page marker ("1-2 of 5").
+/// The caller turns the pages with `phone_unlock::EnrolGate`, as the enrol
+/// card's do, and passes `armed` once a hold counts: the hint reads
+/// `COMPARE ALL 5 WORDS` until then, `HOLD 5 SECONDS` after
+/// (`owner_pairing::full_access_hint`). The label and all five words are on
+/// the hold screen ([`show_full_access_hold`]): this panel's fonts cannot
+/// fit every line on one screen (`layout::FullAccessGeometry`). Mirrored and
+/// checked in ui-preview (`draw_full_access`).
+#[allow(clippy::too_many_arguments)]
+pub fn show_full_access(
+    display: &mut Display<'_>,
+    client_pubkey: &[u8; 32],
+    act_as: &[String],
+    style: heartwood_common::owner_pairing::Style,
+    remaining: u32,
+    total_secs: u32,
+    page: usize,
+    armed: bool,
+) {
+    use heartwood_common::owner_pairing as op;
+    let l = layout(display);
+    display.clear_buffer();
+    let g = l.full_access_geometry();
+    // The label is drawn on the hold screen, not here; its width is moot.
+    let card = op::full_access_card("", 3, client_pubkey, act_as, style);
+    draw_full_access_header(display, &l, &g);
+
+    let words = op::pair_word_line(&card.words, page);
+    let word_style = MonoTextStyleBuilder::new().font(g.word_font).text_color(WARN).build();
+    let wx = l.center_in_span(None, words.len() as i32 * Layout::glyph_w(g.word_font));
+    Text::new(&words, Point::new(wx, g.word_y), word_style).draw(display).ok();
+
+    let text = |colour| MonoTextStyleBuilder::new().font(l.font_small()).text_color(colour).build();
+    let mut lines: Vec<(&str, Rgb565)> = vec![(card.scope, WARN)];
+    lines.extend(card.style_lines.iter().map(|line| (*line, FG)));
+    lines.push((op::full_access_hint(armed), if armed { ACCENT } else { MUTED }));
+    for (i, (line, colour)) in lines.into_iter().enumerate() {
+        let x = l.center_in_span(None, line.len() as i32 * Layout::glyph_w(l.font_small()));
+        Text::new(line, Point::new(x, g.first_y + i as i32 * g.pitch), text(colour))
+            .draw(display)
+            .ok();
+    }
+    Text::new(
+        heartwood_common::phone_unlock::enrol_page_marker(page),
+        Point::new(g.marker_x, g.secs_y),
+        text(MUTED),
+    )
+    .draw(display)
+    .ok();
+    draw_full_access_countdown(display, &l, &g, remaining, total_secs);
+    if let Err(e) = display.flush() {
+        log::warn!("OLED flush failed: {:?}", e);
+    }
+}
+
+/// The FULL ACCESS card's hold screen, drawn while the button is down: the
+/// inverted header, the pairing's label, all five words (`w1 w2` / `w3 w4` /
+/// `w5`) to compare with the phone for the whole 5 s hold, and the hold's
+/// progress. Letting go before the bar fills declines. Replaces the generic
+/// CONFIRMING screen for this card only. Mirrored in ui-preview.
+pub fn show_full_access_hold(display: &mut Display<'_>, label: &str, client_pubkey: &[u8; 32], hold_pct: u32) {
+    use heartwood_common::owner_pairing as op;
+    let l = layout(display);
+    display.clear_buffer();
+    let g = l.full_access_geometry();
+    let h = l.full_access_hold_geometry();
+    draw_full_access_header(display, &l, &g);
+    let small = l.font_small();
+    let card = op::full_access_card(label, l.span_chars(None, small), client_pubkey, &[], op::Style::Everyday);
+    let label_style = MonoTextStyleBuilder::new().font(small).text_color(FG).build();
+    let lx = l.center_in_span(None, card.label.len() as i32 * Layout::glyph_w(small));
+    Text::new(&card.label, Point::new(lx, h.label_y), label_style).draw(display).ok();
+    let word_style = MonoTextStyleBuilder::new().font(h.word_font).text_color(WARN).build();
+    for (page, y) in h.word_y.into_iter().enumerate() {
+        let line = op::pair_word_line(&card.words, page);
+        let x = l.center_in_span(None, line.len() as i32 * Layout::glyph_w(h.word_font));
+        Text::new(&line, Point::new(x, y), word_style).draw(display).ok();
+    }
+
+    let (x, y, w, bh) = h.bar;
+    Rectangle::new(Point::new(x, y), Size::new(w as u32, bh as u32))
+        .into_styled(
+            embedded_graphics::primitives::PrimitiveStyleBuilder::new()
+                .stroke_color(MUTED)
+                .stroke_width(l.s(1) as u32)
+                .stroke_alignment(embedded_graphics::primitives::StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(display)
+        .ok();
+    let fill = hold_pct.min(100) as i32 * (w - 2 * l.s(1)) / 100;
+    if fill > 0 {
+        Rectangle::new(
+            Point::new(x + l.s(1), y + l.s(1)),
+            Size::new(fill as u32, (bh - 2 * l.s(1)).max(1) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(OK))
+        .draw(display)
+        .ok();
+    }
+    display.flush().ok();
+}
+
+/// The FULL ACCESS card's countdown row: the shared outline and urgency
+/// colours, inside the span, under the card's last line.
+fn draw_full_access_countdown(
+    display: &mut Display<'_>,
+    l: &Layout,
+    g: &crate::layout::FullAccessGeometry,
+    remaining: u32,
+    total: u32,
+) {
+    let (x, y, w, h) = g.countdown;
+    Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32))
+        .into_styled(
+            embedded_graphics::primitives::PrimitiveStyleBuilder::new()
+                .stroke_color(MUTED)
+                .stroke_width(l.s(1) as u32)
+                .stroke_alignment(embedded_graphics::primitives::StrokeAlignment::Inside)
+                .build(),
+        )
+        .draw(display)
+        .ok();
+    let pct_left = if total > 0 { remaining * 100 / total } else { 0 };
+    let urgency = if pct_left > 50 {
+        OK
+    } else if pct_left > 20 {
+        WARN
+    } else {
+        DANGER
+    };
+    let inner = w - 2 * l.s(2);
+    let fill = if total > 0 { (remaining.min(total) as i32 * inner) / total as i32 } else { 0 };
+    if fill > 0 {
+        Rectangle::new(
+            Point::new(x + l.s(2), y + l.s(2)),
+            Size::new(fill as u32, (h - 2 * l.s(2)).max(1) as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(urgency))
+        .draw(display)
+        .ok();
+    }
+    let small = MonoTextStyleBuilder::new().font(l.font_small()).text_color(FG).build();
+    Text::new(&format!("{remaining}s"), Point::new(g.secs_x, g.secs_y), small)
+        .draw(display)
+        .ok();
+}
+
 /// Which edge carries the button tags on this board and orientation, or
 /// `None` where the card keeps its words only.
 fn tag_side() -> Option<crate::layout::TagSide> {
@@ -1501,6 +1673,7 @@ pub fn show_sign_request_as(
     kind: u64,
     identity: Option<&str>,
     heading: Option<&str>,
+    login_code: Option<&str>,
     seconds_remaining: u32,
 ) {
     let l = layout(display);
@@ -1520,7 +1693,8 @@ pub fn show_sign_request_as(
         .build();
 
     // Header
-    Text::new(heading.unwrap_or("HOLD TO SIGN"), Point::new(l.sx(2), l.sy(10)), header)
+    let default_heading = if login_code.is_some() { "LOG IN" } else { "HOLD TO SIGN" };
+    Text::new(heading.unwrap_or(default_heading), Point::new(l.sx(2), l.sy(10)), header)
         .draw(display)
         .ok();
 
@@ -1534,15 +1708,31 @@ pub fn show_sign_request_as(
     let app = ellipsize_chars(&app, l.chars_per_line(l.font_body()));
     Text::new(&app, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
-    let (kind_line, second_line) = match identity {
-        Some(identity) => (format!("k{kind} {}", kind_name_line(kind)), identity.to_string()),
-        None => (kind_name_line(kind), format!("kind {kind}")),
-    };
-    let kind_line = ellipsize_chars(&kind_line, l.chars_per_line(l.font_small()));
-    Text::new(&kind_line, Point::new(l.sx(2), l.sy(39)), small).draw(display).ok();
+    if let Some(code) = login_code {
+        // A login card: the code the owner compares with the login page
+        // replaces the kind lines, as large as the panel carries (4 to 8
+        // digits always fit at `word_scale`).
+        let scale = l.word_scale();
+        let width = crate::bigtext::scaled_text_width(code, l.font_large(), scale);
+        crate::bigtext::draw_text_scaled(
+            display,
+            code,
+            Point::new(l.center_x(width), l.sy(46)),
+            l.font_large(),
+            scale,
+            FG,
+        );
+    } else {
+        let (kind_line, second_line) = match identity {
+            Some(identity) => (format!("k{kind} {}", kind_name_line(kind)), identity.to_string()),
+            None => (kind_name_line(kind), format!("kind {kind}")),
+        };
+        let kind_line = ellipsize_chars(&kind_line, l.chars_per_line(l.font_small()));
+        Text::new(&kind_line, Point::new(l.sx(2), l.sy(39)), small).draw(display).ok();
 
-    let second_line = ellipsize_chars(&second_line, l.chars_per_line(l.font_small()));
-    Text::new(&second_line, Point::new(l.sx(2), l.sy(48)), small).draw(display).ok();
+        let second_line = ellipsize_chars(&second_line, l.chars_per_line(l.font_small()));
+        Text::new(&second_line, Point::new(l.sx(2), l.sy(48)), small).draw(display).ok();
+    }
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);
@@ -2114,40 +2304,10 @@ pub fn show_info_network(
     mode_line: &str,
     ssid: Option<&str>,
     status: &str,
+    rssi: Option<i8>,
 ) {
-    let l = layout(display);
     display.clear_buffer();
-
-    let header = MonoTextStyleBuilder::new()
-        .font(l.font_header())
-        .text_color(ACCENT)
-        .build();
-    let body = MonoTextStyleBuilder::new()
-        .font(l.font_body())
-        .text_color(FG)
-        .build();
-    let small = MonoTextStyleBuilder::new()
-        .font(l.font_small())
-        .text_color(MUTED)
-        .build();
-
-    Text::new("NETWORK", Point::new(l.sx(4), l.sy(10)), header).draw(display).ok();
-    Rectangle::new(Point::new(l.sx(0), l.sy(14)), Size::new(l.w as u32, l.s(1) as u32))
-        .into_styled(PrimitiveStyle::with_fill(ACCENT))
-        .draw(display)
-        .ok();
-
-    Text::new(mode_line, Point::new(l.sx(4), l.sy(28)), body).draw(display).ok();
-    if let Some(ssid) = ssid {
-        let ssid_line = format!("WiFi: {}", truncate_str(ssid, 15));
-        Text::new(&ssid_line, Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
-    } else {
-        Text::new("WiFi: not set", Point::new(l.sx(4), l.sy(41)), small).draw(display).ok();
-    }
-    let status_line = format!("Status: {status}");
-    Text::new(&status_line, Point::new(l.sx(4), l.sy(52)), small).draw(display).ok();
-
-    draw_page_marker(display, &l, 2, 3);
+    crate::network_screen::draw(display, mode_line, ssid, status, rssi);
     display.flush().ok();
 }
 

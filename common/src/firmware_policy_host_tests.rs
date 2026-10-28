@@ -367,7 +367,23 @@ pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bo
     )
 }
 
-pub mod nvs { pub use super::{fits, growth_allowed, write_blocked, EspNvs, NvsDefault, ReplaceBlob}; }
+/// Stands in for the firmware's `crate::nvs::growth_run`.
+pub fn growth_run(nvs: &EspNvs<NvsDefault>, steps: &[(Option<usize>, usize)]) -> usize {
+    let state = nvs.backend.inner.borrow();
+    let largest = heartwood_common::nvs_budget::hot_keys()
+        .filter_map(|k| state.store.get(&k).map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    heartwood_common::nvs_budget::growth_run(state.available(), largest, steps.iter().copied())
+}
+
+/// Stands in for the firmware's `crate::nvs::is_no_room`: the mock's
+/// refusal for lack of room, from a planned write or one that does not fit.
+pub fn is_no_room(e: &&'static str) -> bool {
+    *e == "not enough space"
+}
+
+pub mod nvs { pub use super::{fits, growth_allowed, growth_run, is_no_room, write_blocked, EspNvs, NvsDefault, ReplaceBlob}; }
 
 #[path = "../../firmware/src/policy.rs"]
 pub mod engine;
@@ -527,12 +543,11 @@ fn current_switch_a_to_b_preserves_both_grants() {
 }
 
 #[test]
-fn full_eight_clients_rejects_ninth_without_eviction() {
+fn full_eight_clients_admits_ninth_by_forgetting_the_oldest() {
     let mut nvs = EspNvs::new();
     let mut engine = PolicyEngine::new();
     let slot = engine.create_slot(0, "many".into(), secret_hex(0x99)).unwrap();
 
-    // Pair 8 distinct clients; 9th must be rejected (no eviction).
     for i in 0u8..8 {
         engine.assign_pubkey_to_slot(0, slot, pubkey_hex(0x40 + i));
     }
@@ -547,25 +562,21 @@ fn full_eight_clients_rejects_ninth_without_eviction() {
         .unwrap_or(0);
     assert_eq!(authorized_count, 8, "exactly 8 authorized clients");
 
-    // 9th client: must not evict; either rejected or capped.
+    // 9th client: admitted, the cap holds, and the oldest goes (FIFO, as
+    // MAX_AUTHORIZED_PUBKEYS documents). Until 2026-10-09 the consent path
+    // refused it instead, which locked a full pairing's owner out.
     let ninth = pubkey_hex(0xFF);
-    engine2.assign_pubkey_to_slot(0, slot, ninth.clone());
+    assert!(engine2.assign_pubkey_to_slot(0, slot, ninth.clone()));
     let after = engine2
         .list_slots(0)
         .iter()
         .find(|s| s.slot_index == slot)
         .map(|s| s.authorized_pubkeys.clone())
         .unwrap_or_default();
-    assert!(
-        after.len() <= 8,
-        "capacity must not exceed MAX_AUTHORIZED_PUBKEYS; got {}",
-        after.len()
-    );
-    // No eviction: the first client granted must still be authorized.
-    assert!(
-        after.contains(&pubkey_hex(0x40)),
-        "the earliest authorized client must not be silently evicted"
-    );
+    assert_eq!(after.len(), 8, "the cap still holds");
+    assert!(after.contains(&ninth));
+    assert!(!after.contains(&pubkey_hex(0x40)), "the oldest client is forgotten");
+    assert!(after.contains(&pubkey_hex(0x41)));
 }
 
 #[test]
@@ -852,6 +863,21 @@ fn full_storage_drops_the_avatar_cache_before_refusing_pairings() {
 }
 
 #[test]
+fn the_avatar_cache_counts_as_room_for_a_slot_write() {
+    // The setup hold's save-room check counts what `persist_slots` would
+    // drop before its second try: every cached avatar, by the fewest
+    // entries its blob can hold.
+    // 40 bytes: 2 data + 1 chunk header + 1 index. 5000 bytes: 157 data +
+    // 2 chunk headers + 1 index. No phantom header for the first chunk.
+    let nvs = EspNvs::new();
+    assert_eq!(engine::avatar_cache_entries(&nvs), 0);
+    nvs.backend.seed("imav0", &[1u8; 40]);
+    nvs.backend.seed("imav7", &[1u8; 5000]);
+    nvs.backend.seed("iman0", b"TheCryptoDonkey");
+    assert_eq!(engine::avatar_cache_entries(&nvs), (2 + 1 + 1) + (157 + 2 + 1));
+}
+
+#[test]
 fn rollback_failure_quarantines_master_and_denies_lookup() {
     // Compensation write also fails: master is quarantined, list_slots empty,
     // and find_slot_by_pubkey denies lookups.
@@ -1110,7 +1136,7 @@ fn full_consent_capacity_offers_once_without_evicting_existing_grants() {
 }
 
 #[test]
-fn full_client_capacity_rejects_ninth_and_retains_existing_consent() {
+fn full_pairing_forgets_its_oldest_key_and_keeps_the_rest() {
     use heartwood_common::policy::client_identity_approved;
 
     let mut nvs = EspNvs::new();
@@ -1123,17 +1149,41 @@ fn full_client_capacity_rejects_ninth_and_retains_existing_consent() {
         assert!(engine.record_identity(0, Ok(client), &identity));
     }
     assert!(engine.persist_slots(&mut nvs, 0));
-    let before = engine.list_slots(0)[0].client_grants.clone();
-    let ninth = pubkey_hex(9);
-    assert!(!engine.assign_pubkey_to_slot(0, slot, ninth.clone()));
-    assert_eq!(engine.list_slots(0)[0].client_grants, before);
 
+    // A ninth device: admitted, and the oldest (client 1) is forgotten.
+    let ninth = pubkey_hex(9);
+    assert!(engine.assign_pubkey_to_slot(0, slot, ninth.clone()));
+    assert!(engine.persist_slots(&mut nvs, 0));
     let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
     let retained = &reloaded.list_slots(0)[0];
-    for client in &clients {
+    assert_eq!(retained.current_pubkey.as_deref(), Some(ninth.as_str()));
+    assert!(!heartwood_common::policy::slot_authorizes(retained, &clients[0]));
+    assert!(!retained.authorized_pubkeys.contains(&clients[0]));
+    assert!(!client_identity_approved(retained, Some(&clients[0]), &identity));
+    for client in &clients[1..] {
+        assert!(heartwood_common::policy::slot_authorizes(retained, client));
         assert!(client_identity_approved(retained, Some(client), &identity));
     }
+    // The newcomer has no consent until it is given.
     assert!(!client_identity_approved(retained, Some(&ninth), &identity));
+    assert_eq!(retained.client_grants.as_ref().unwrap().member_count(), 8);
+}
+
+#[test]
+fn full_pairing_never_forgets_the_current_key() {
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "full".into(), secret_hex(2)).unwrap();
+    let clients: Vec<String> = (1..=8).map(pubkey_hex).collect();
+    for client in &clients {
+        assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    }
+    // The oldest key reconnects and becomes current again.
+    assert!(engine.assign_pubkey_to_slot(0, slot, clients[0].clone()));
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(9)));
+    let after = &engine.list_slots(0)[0];
+    // Client 1 was current at the moment of the eviction, so client 2 went.
+    assert!(heartwood_common::policy::slot_authorizes(after, &clients[0]));
+    assert!(!heartwood_common::policy::slot_authorizes(after, &clients[1]));
 }
 
 #[test]
@@ -1211,6 +1261,52 @@ fn an_ordinary_change_on_a_full_partition_is_saved_too() {
     assert!(engine.persist_slots(&mut nvs, 0));
     let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
     assert_eq!(reloaded.list_slots(0).iter().find(|s| s.slot_index == 2).unwrap().label, "renamed");
+}
+
+/// One pairing holding eight client keys, on a board with the bench V4's
+/// headroom. A ninth key forgets the oldest, so the table is rewritten whole.
+fn full_pairing_at_bench_headroom() -> (EspNvs<NvsDefault>, PolicyEngine, u8, Vec<String>) {
+    let mut nvs = EspNvs::new();
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "full".into(), secret_hex(2)).unwrap();
+    let clients: Vec<String> = (1..=8).map(pubkey_hex).collect();
+    for client in &clients {
+        assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    }
+    assert!(engine.persist_slots(&mut nvs, 0));
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    (nvs, engine, slot, clients)
+}
+
+#[test]
+fn a_ninth_key_on_a_full_pairing_lands_on_a_full_partition() {
+    let (mut nvs, mut engine, slot, clients) = full_pairing_at_bench_headroom();
+    let ninth = pubkey_hex(9);
+    assert!(engine.assign_pubkey_to_slot(0, slot, ninth.clone()));
+    assert!(engine.persist_slots(&mut nvs, 0));
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    let retained = &reloaded.list_slots(0)[0];
+    assert_eq!(retained.current_pubkey.as_deref(), Some(ninth.as_str()));
+    assert!(!retained.authorized_pubkeys.contains(&clients[0]), "the oldest is forgotten");
+    for client in &clients[1..] {
+        assert!(heartwood_common::policy::slot_authorizes(retained, client));
+    }
+}
+
+/// Pins the documented residual, so a change to it is a decision and not an
+/// accident: with no room for a second copy the pairing table is rewritten
+/// erase-first, so a failed write loses every pairing of that identity until
+/// a restart, not only the newcomer. A full pairing meets this on each new key.
+#[test]
+fn a_ninth_key_whose_write_fails_loses_the_table_and_blocks_it_until_restart() {
+    let (mut nvs, mut engine, slot, _) = full_pairing_at_bench_headroom();
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(9)));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert!(!engine.persist_slots(&mut nvs, 0), "the write failed, so it is not saved");
+    assert!(nvs::write_blocked(CONNSLOTS_0), "nothing rewrites that table this boot");
+    assert!(engine.restart_needed(0));
+    let reloaded = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    assert!(reloaded.list_slots(0).is_empty(), "fails closed: no pairing gains access");
 }
 
 #[test]
@@ -1367,6 +1463,167 @@ fn a_growing_table_keeps_room_to_rewrite_in_place() {
     assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
 }
 
+#[test]
+fn repeating_a_revocation_that_did_not_save_saves_it() {
+    // Review finding A. The legacy credential cannot be removed, so the
+    // table may only be rewritten in place, and at the bench headroom it has
+    // no room for that: the revocation holds until the next restart only,
+    // and the reply says room is what is missing, not that a write failed.
+    let (mut nvs, mut engine) = full_table(8);
+    let other = engine.create_slot(1, "other identity".into(), secret_hex(0x31)).unwrap();
+    assert!(engine.persist_slots(&mut nvs, 1));
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    nvs.backend.fail_once(NvsOp::Remove, MASTER_0_CONN, FaultKind::RemoveFail);
+    assert!(engine.revoke_slot(0, 3));
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::NoRoom);
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_full: "), "{reply}");
+    assert!(reply.contains("free some room") && reply.contains("then repeat the request"), "{reply}");
+    assert!(!reply.contains(engine::RESTART_ADVICE), "not blocked: {reply}");
+    assert!(slot_indices(&mut nvs).contains(&3), "flash still has it");
+    assert!(engine.table_unsaved(&nvs, 0));
+
+    // A save of another identity clears the shared dirty flag meanwhile.
+    assert!(engine.update_slot(1, other, Some("renamed".into()), None, None, None));
+    assert!(engine.persist_slots(&mut nvs, 1));
+    assert!(!engine.slots_dirty);
+
+    // The retry finds no pairing 3 in RAM; flash still has it, so it is an
+    // unsaved revocation, not "not found", and saving it now lands.
+    assert!(!engine.revoke_slot(0, 3));
+    let stored = engine.unsaved_slot_revocation(&nvs, 0, 3).expect("the stored copy of pairing 3");
+    assert_eq!(stored.slot_index, 3);
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 9).is_none(), "never existed: still not found");
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 2).is_none(), "still live: an ordinary revocation");
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
+    assert!(!slot_indices(&mut nvs).contains(&3), "the narrower table is on flash");
+    assert!(!engine.table_unsaved(&nvs, 0));
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 3).is_none(), "a third try is a real not found");
+
+    // In sync, a revocation that changes nothing writes nothing.
+    nvs.backend.take_log();
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
+    assert!(!nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob));
+}
+
+#[test]
+fn a_change_refused_in_place_for_room_is_still_reported_as_a_failed_write() {
+    // Only a revocation's reply tells the in-place refusal apart: a pairing
+    // change under the same conditions answers as it did before.
+    use engine::SlotSaveError;
+    let (mut nvs, mut engine) = full_table(8);
+    nvs.backend.limit_headroom(BENCH_HEADROOM);
+    nvs.backend.fail_once(NvsOp::Remove, MASTER_0_CONN, FaultKind::RemoveFail);
+    assert!(engine.update_slot(0, 2, Some("renamed".into()), None, None, None));
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::Failed));
+}
+
+#[test]
+fn a_revocation_on_a_quarantined_identity_asks_for_a_restart_not_a_repeat() {
+    // Review finding: a master quarantined because its legacy migration could
+    // not persist has the migrated pairing in RAM, no table on flash and the
+    // legacy credential still there. A revocation edits RAM, the save writes
+    // nothing, and a repeat answers "not found" (`ram_table` is `None` while
+    // quarantined). The migrated table is several chunks, so its failed write
+    // also blocked the key, and reading the absent table the old reply
+    // claimed the revocation saved (`TableGone`), though the next boot turns
+    // the credential back into that pairing.
+    let mut nvs = EspNvs::new();
+    nvs.backend.seed(MASTER_0_CONN, &legacy_secret_bytes(0x5E));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    let mut engine = PolicyEngine::load_from_nvs(&mut nvs, 1);
+    assert!(!engine.storage_ready(0), "the migration did not persist");
+    assert!(engine.revoke_slot(0, 0), "RAM still holds the migrated pairing");
+    nvs.backend.take_log();
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::RestartFirst);
+    assert!(!nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob), "nothing written");
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_unavailable: ") && reply.contains("restart the device, then repeat"), "{reply}");
+    assert!(!reply.contains("repeat the request to try the save again"), "{reply}");
+    assert!(!reply.contains("is saved"), "{reply}");
+    // What the repeat would meet, and why the reply cannot say "saved": no
+    // table and the legacy credential, which a boot turns back into the
+    // pairing (`a_cut_inside_an_erase_first_rewrite_...` pins that).
+    assert!(!engine.revoke_slot(0, 0));
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 0).is_none(), "a repeat answers not found");
+    assert!(!nvs.backend.contains(CONNSLOTS_0) && nvs.backend.contains(MASTER_0_CONN));
+}
+
+#[test]
+fn a_revocation_whose_table_cannot_be_read_asks_for_a_restart_not_a_repeat() {
+    // Review finding: the stored table stops reading mid-boot. The save
+    // fails, and a repeat finds no stored copy to compare (`stored_slots` is
+    // `None`), so it answers "no such slot". One pairing, so its "[]" is one
+    // chunk and a failed write does not block the key.
+    let (mut nvs, mut engine) = full_table(1);
+    assert!(engine.revoke_slot(0, 0));
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    nvs.backend.push_fault(Fault {
+        op: NvsOp::BlobLen,
+        key: Some(CONNSLOTS_0.into()),
+        remaining_calls: 64,
+        kind: FaultKind::ReadError,
+    });
+    let outcome = engine.persist_revocation(&mut nvs, 0);
+    assert_eq!(outcome, RevocationSave::RestartFirst);
+    assert!(!nvs::write_blocked(CONNSLOTS_0));
+    let reply = outcome.describe("pairing revocation").unwrap_err();
+    assert!(reply.starts_with("storage_unavailable: ") && reply.contains("restart the device, then repeat"), "{reply}");
+    assert!(!engine.revoke_slot(0, 0));
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 0).is_none(), "a repeat answers no such slot");
+}
+
+#[test]
+fn an_unreadable_or_absent_table_is_never_taken_for_an_unsaved_one() {
+    // No table in RAM for the master: nothing to save on a guess.
+    let (nvs, engine) = full_table(2);
+    assert!(!engine.table_unsaved(&nvs, 4));
+    assert!(engine.unsaved_slot_revocation(&nvs, 4, 0).is_none());
+    // A stored table that cannot be read is not compared.
+    let (nvs, mut engine) = full_table(2);
+    assert!(engine.revoke_slot(0, 1));
+    nvs.backend.fail_once(NvsOp::BlobLen, CONNSLOTS_0, FaultKind::ReadError);
+    assert!(!engine.table_unsaved(&nvs, 0));
+    nvs.backend.fail_once(NvsOp::BlobLen, CONNSLOTS_0, FaultKind::ReadError);
+    assert!(engine.unsaved_slot_revocation(&nvs, 0, 1).is_none());
+    assert!(engine.table_unsaved(&nvs, 0), "once it reads, the revocation is unsaved");
+}
+
+#[test]
+fn a_pairing_the_growth_gate_refuses_says_storage_full_and_a_fault_does_not() {
+    use engine::{SlotSaveError, PAIRING_STORAGE_FULL};
+    assert!(PAIRING_STORAGE_FULL.starts_with("storage_full: "));
+
+    // Short of room: the gate refuses before anything is written.
+    let (mut nvs, mut engine) = full_table(4);
+    let stored = nvs.backend.get(CONNSLOTS_0).unwrap();
+    nvs.backend.limit_headroom(160);
+    let snapshot = engine.snapshot_slot_state(0);
+    engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    nvs.backend.take_log();
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::NoRoom));
+    assert!(
+        !nvs.backend.take_log().iter().any(|(_, op)| *op == NvsOp::SetBlob),
+        "nothing written"
+    );
+    assert!(engine.restore_slot_state_durably(&mut nvs, snapshot));
+    assert_eq!(nvs.backend.get(CONNSLOTS_0).unwrap(), stored);
+
+    // With room it saves.
+    let (mut nvs, mut engine) = full_table(4);
+    engine.create_slot(0, "app 5".into(), secret_hex(0x77)).unwrap();
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Ok(()));
+
+    // With room, a failed write is a fault, not a full board. (Last: the
+    // failure blocks the key for the rest of this test thread's "boot".)
+    let (mut nvs, mut engine) = full_table(4);
+    engine.create_slot(0, "app 6".into(), secret_hex(0x78)).unwrap();
+    nvs.backend.fail_once(NvsOp::SetBlob, CONNSLOTS_0, FaultKind::WriteFailBeforeCommit);
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::Failed));
+}
+
 fn persona_key(n: u8) -> [u8; 32] {
     [n; 32]
 }
@@ -1378,6 +1635,36 @@ fn board_with_personas(n: u8) -> EspNvs<NvsDefault> {
         personas::add(&mut nvs, 0, "purpose-of-some-length", i as u32, Some("a persona name"), &persona_key(i + 1)).unwrap();
     }
     nvs
+}
+
+#[test]
+fn a_bundle_pre_check_gates_every_name_as_add_will() {
+    // Review finding D. Across a range of headroom, the pre-check never
+    // promises more registrations than `add` then makes, and somewhere near
+    // the limit it is what tells one name from two.
+    let mut two_refused = false;
+    for headroom in 0..400 {
+        let mut nvs = board_with_personas(3);
+        nvs.backend.limit_headroom(headroom);
+        let one = personas::registrations_that_fit(&nvs, 1);
+        assert_eq!(one == 1, personas::capacity_check(&nvs).is_ok(), "one name is capacity_check ({headroom})");
+        let promised = personas::registrations_that_fit(&nvs, 2);
+        let mut added = 0;
+        for i in 0..2u8 {
+            match personas::add(&mut nvs, 0, "purpose-of-some-length", 10 + u32::from(i), Some("a persona name"), &persona_key(0x40 + i)) {
+                Ok(()) => added += 1,
+                Err(_) => break,
+            }
+        }
+        assert!(added >= promised, "promised {promised}, added {added} ({headroom})");
+        if one == 1 && promised == 1 {
+            two_refused = true;
+        }
+    }
+    assert!(two_refused, "some headroom lets one name through the card and not two");
+    // The count cap is part of it.
+    let nvs = board_with_personas(personas::MAX_PERSONAS - 1);
+    assert_eq!(personas::registrations_that_fit(&nvs, 2), 1);
 }
 
 #[test]
@@ -1445,4 +1732,68 @@ fn on_a_full_partition_the_network_config_and_secrets_are_refused_and_kept() {
         assert!(nvs.replace_blob(key, &[2u8; 32]).is_ok(), "{key}");
         assert_eq!(nvs.backend.get(key).unwrap(), vec![2u8; 32]);
     }
+}
+
+#[test]
+fn login_challenge_is_never_auto_approved_by_the_engine() {
+    use crate::nip46::Nip46Method;
+    use crate::policy::{ApprovalTier, LOGIN_EVENT_KIND};
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "node".into(), secret_hex(1)).unwrap();
+    // Auto-approve with an empty kind list, then with the kind listed.
+    engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![], true).unwrap();
+    let client = pubkey_hex(1);
+    assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    let check = |engine: &PolicyEngine, kind| engine.check_for_event(0, &client, &Nip46Method::SignEvent, Some(kind), kind == LOGIN_EVENT_KIND);
+    assert_eq!(check(&engine, 1), ApprovalTier::AutoApprove);
+    assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    // Plain NIP-42 relay AUTH (22242 without a code tag) is not a login.
+    assert_eq!(
+        engine.check_for_event(0, &client, &Nip46Method::SignEvent, Some(LOGIN_EVENT_KIND), false),
+        ApprovalTier::AutoApprove,
+    );
+    engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![1, LOGIN_EVENT_KIND], true).unwrap();
+    assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    // A guardian's approve-once window cannot lift it either.
+    let key = crate::nip59::method_or_kind_key("sign_event", Some(LOGIN_EVENT_KIND));
+    engine.install_transient_allow(0, client.clone(), key, None, 60);
+    assert_eq!(check(&engine, LOGIN_EVENT_KIND), ApprovalTier::ButtonRequired);
+    // ...while the same window still lifts an ordinary kind it covers.
+    let key = crate::nip59::method_or_kind_key("sign_event", Some(1));
+    engine.install_transient_allow(0, client.clone(), key, None, 60);
+    assert_eq!(check(&engine, 1), ApprovalTier::AutoApprove);
+}
+
+#[test]
+fn a_login_press_records_no_identity_grant() {
+    use crate::nip46::Nip46Method;
+    use crate::policy::{press_records_identity, ApprovalTier, CardKind, Gate, LOGIN_EVENT_KIND};
+    let mut engine = PolicyEngine::new();
+    let slot = engine.create_slot(0, "node".into(), secret_hex(1)).unwrap();
+    engine.set_exact_slot_policy(0, slot, vec!["sign_event".into()], vec![1, LOGIN_EVENT_KIND], true).unwrap();
+    let client = pubkey_hex(1);
+    assert!(engine.assign_pubkey_to_slot(0, slot, client.clone()));
+    let persona = [0x77u8; 32];
+    let gate = |engine: &PolicyEngine, kind: u64, login: bool| {
+        let tier = engine.check_for_event(0, &client, &Nip46Method::SignEvent, Some(kind), login);
+        assert!(!matches!(tier, ApprovalTier::Denied));
+        engine.gate(0, &client, true, &Nip46Method::SignEvent, "sign_event", Some(kind), tier, false, false, Some(&persona))
+    };
+    // First login as a persona the pairing has no grant for: the grant card.
+    let card = match gate(&engine, LOGIN_EVENT_KIND, true) {
+        Gate::Card(card) => card,
+        other => panic!("expected a grant card, got {other:?}"),
+    };
+    assert!(matches!(card, CardKind::AllowAs { record: true }));
+    // The press on a login records nothing; the same press on any other
+    // sign card still does.
+    assert!(!press_records_identity(Some(card), true));
+    assert!(press_records_identity(Some(card), false));
+    assert!(!press_records_identity(Some(CardKind::AllowAs { record: false }), false));
+    assert!(!press_records_identity(None, false));
+    // A later ordinary request as that persona raises its own grant card.
+    assert_eq!(gate(&engine, 1, false), Gate::Card(CardKind::AllowAs { record: true }));
+    // Control: had a normal press recorded it, the next request would pass.
+    assert!(engine.record_identity(0, Ok(&client), &persona));
+    assert_eq!(gate(&engine, 1, false), Gate::Allow);
 }

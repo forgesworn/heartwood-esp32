@@ -16,7 +16,10 @@ pub const MAX_CONNECT_SLOTS: u8 = 16;
 
 /// Maximum client pubkeys retained per slot. A slot's secret is a shared
 /// credential, so every device that pairs with it is remembered and stays
-/// auto-approved. Beyond this cap the oldest entry is dropped (FIFO). Keep
+/// auto-approved. Beyond this cap the oldest entry is dropped (FIFO), never
+/// the current one, on both the legacy and the per-client-consent path
+/// (`authorize_pubkey_on_slot`; the consent path refused a ninth key from
+/// 2026-09-22 until 2026-10-09). Keep
 /// this modest: the persisted blob for all 16 slots must fit the NVS read
 /// buffer in the firmware's `load_from_nvs`.
 pub const MAX_AUTHORIZED_PUBKEYS: usize = 8;
@@ -256,10 +259,26 @@ pub fn validate_exact_slot_policy(
 /// invariants such as ping/get_public_key are handled by the caller first; this
 /// helper is deliberately pure so the firmware's exact deny boundary runs in
 /// host CI as well as on the ESP.
+///
+/// Test-only: it treats every request as not a login challenge. Production
+/// code holds the event and must use [`evaluate_slot_policy_for_event`] with
+/// [`is_login_challenge`], or a login challenge could be auto-approved.
+#[cfg(test)]
 pub fn evaluate_slot_policy(
     slot: &ConnectSlot,
     method: &str,
     event_kind: Option<u64>,
+) -> ApprovalTier {
+    evaluate_slot_policy_for_event(slot, method, event_kind, false)
+}
+
+/// [`evaluate_slot_policy`] for a request whose event is known:
+/// `login_challenge` is [`is_login_challenge`] of the event about to be signed.
+pub fn evaluate_slot_policy_for_event(
+    slot: &ConnectSlot,
+    method: &str,
+    event_kind: Option<u64>,
+    login_challenge: bool,
 ) -> ApprovalTier {
     if !slot.allowed_methods.iter().any(|allowed| allowed == method) {
         return if strict_slot_denies_method(slot, method) {
@@ -288,10 +307,98 @@ pub fn evaluate_slot_policy(
         }
     }
 
+    // A login challenge (kind 22242 carrying a `code` tag) logs somebody in to
+    // a node's dashboard, and the login page is reachable by anyone who can
+    // see the node. It is therefore never silent, whatever the slot allows: a
+    // button press with the code on screen is the only way it signs. (A strict
+    // slot that excludes the kind was already denied above. Plain NIP-42 relay
+    // AUTH, with no `code` tag, is not a login challenge and is unaffected.)
+    if method == "sign_event" && login_challenge {
+        return ApprovalTier::ButtonRequired;
+    }
+
     if slot.auto_approve {
         ApprovalTier::AutoApprove
     } else {
         ApprovalTier::ButtonRequired
+    }
+}
+
+/// The event kind of an Archipelago node login challenge. Always owes a
+/// physical press: see [`evaluate_slot_policy`].
+pub const LOGIN_EVENT_KIND: u64 = 22242;
+
+/// How an event reads as a node login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginChallenge<'a> {
+    /// Not a login challenge: another kind, or 22242 with no `code` tag
+    /// (plain NIP-42 relay AUTH). Treated exactly as before.
+    No,
+    /// A login challenge with exactly one valid code, to show on the card.
+    Valid(&'a str),
+    /// Kind 22242 with a `code` tag that is not exactly one 4 to 8 digit
+    /// value. Still a login challenge for policy, but it cannot be displayed,
+    /// so it must be refused: never signed, never shown as an ordinary card.
+    Malformed,
+}
+
+/// Classify an event about to be signed. The one predicate every path uses.
+pub fn classify_login(kind: u64, tags: &[Vec<String>]) -> LoginChallenge<'_> {
+    if kind != LOGIN_EVENT_KIND {
+        return LoginChallenge::No;
+    }
+    if !tags.iter().any(|tag| tag.first().map(String::as_str) == Some("code")) {
+        return LoginChallenge::No;
+    }
+    match login_code_from_tags(tags) {
+        Some(code) => LoginChallenge::Valid(code),
+        None => LoginChallenge::Malformed,
+    }
+}
+
+/// Whether the press on a sign card should record the identity it approved.
+///
+/// Only an `AllowAs { record: true }` card records, and never for a login
+/// challenge: its heading says LOG IN, so the press consents to that login
+/// alone. Any later request as the identity raises its own grant card.
+pub fn press_records_identity(card: Option<CardKind>, login_challenge: bool) -> bool {
+    !login_challenge && matches!(card, Some(CardKind::AllowAs { record: true }))
+}
+
+/// Whether an event is a login challenge: kind 22242 carrying any `code`
+/// tag. Such an event always needs a button press.
+pub fn is_login_challenge(kind: u64, tags: &[Vec<String>]) -> bool {
+    classify_login(kind, tags) != LoginChallenge::No
+}
+
+/// The code a login approval screen shows large: the value of the event's one
+/// `code` tag, when it is 4 to 8 ASCII digits.
+///
+/// Anything else yields `None` so the caller draws the ordinary sign screen:
+/// no `code` tag, a value that is not 4 to 8 ASCII digits, or MORE THAN ONE
+/// `code` tag. Two tags are refused rather than resolved by position, because
+/// the page and the device must agree on which one the owner is comparing.
+pub fn login_code_from_tags(tags: &[Vec<String>]) -> Option<&str> {
+    let mut found = tags
+        .iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("code"));
+    let tag = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let value = tag.get(1)?.as_str();
+    let ok = (4..=8).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit());
+    ok.then_some(value)
+}
+
+/// The login code for an event about to be signed: [`login_code_from_tags`],
+/// but only for [`LOGIN_EVENT_KIND`]. Any other kind returns `None`, so a
+/// `code` tag on an ordinary event can never dress it up as a login.
+pub fn login_code_for_event(kind: u64, tags: &[Vec<String>]) -> Option<&str> {
+    if kind == LOGIN_EVENT_KIND {
+        login_code_from_tags(tags)
+    } else {
+        None
     }
 }
 
@@ -334,13 +441,17 @@ pub fn method_uses_identity_key(method: &str, has_context: bool) -> bool {
 }
 
 /// Bearer-note methods that act with the served identity's key (sealing a
-/// send, deriving an address or claim key). They are scoped like signing but
+/// send, deriving an address or claim key, signing an address proof with an
+/// address branch's key). They are scoped like signing but
 /// have no identity card of their own: an unapproved identity is refused, and
 /// approval comes from a sign or crypto prompt.
 pub fn method_uses_served_key(method: &str) -> bool {
     matches!(
         method,
-        "heartwood_note_send" | "heartwood_note_address" | "heartwood_note_claim"
+        "heartwood_note_send"
+            | "heartwood_note_address"
+            | "heartwood_note_claim"
+            | "heartwood_note_address_proof"
     )
 }
 
@@ -748,6 +859,27 @@ fn is_crypto_method(method: &str) -> bool {
 /// `heartwood_switch` policy would prompt for is the `SWITCH TO` card; an
 /// identity-scoped method acting as an unapproved identity needs a card.
 pub fn gate_request(request: &GateRequest<'_>) -> Gate {
+    gate_request_with_vault(request, crate::owner_pairing::VaultContext::NONE)
+}
+
+/// [`gate_request`] with Rule V (one-hold pairing spec 6): on an owner
+/// pairing (`owner_pairing::is_owner_pairing`), a request carrying an
+/// EXPLICIT vault context (`vault`, built by
+/// `owner_pairing::VaultContext::from_explicit` from the caller-supplied
+/// context only) and a Rule V method (`get_public_key`, `nip44_encrypt`,
+/// `nip44_decrypt`, or `sign_event` / `sign_event_compact` of kind 30078) is
+/// allowed with no identity card and nothing recorded. It sits after the
+/// crypto-method refusal, so a crypto method whose tier would prompt is
+/// still refused, and before the `lists` check. `Gate::Allow` only skips the
+/// identity card: the tier still governs through [`gate_tier`]. With
+/// `VaultContext::NONE` this is exactly [`gate_request`], so every other
+/// slot and request decides as before.
+///
+/// A separate entry point rather than a `GateRequest` field so the firmware
+/// keeps compiling untouched until both its callers (the handler's
+/// `plan_gate` and the relay planner, through `PolicyEngine::gate`) pass the
+/// same `vault`.
+pub fn gate_request_with_vault(request: &GateRequest<'_>, vault: crate::owner_pairing::VaultContext) -> Gate {
     if !request.has_client {
         return Gate::Allow;
     }
@@ -766,6 +898,10 @@ pub fn gate_request(request: &GateRequest<'_>) -> Gate {
     }
     if is_crypto_method(method) && request.tier == ApprovalTier::ButtonRequired {
         return Gate::Deny;
+    }
+    // Rule V: backups are quiet on an owner pairing.
+    if crate::owner_pairing::rule_v_allows(slot, method, request.explicit_context, vault) {
+        return Gate::Allow;
     }
     if lists {
         return if request.verdict || slot.allowed_methods.iter().any(|allowed| allowed == method) {
@@ -899,8 +1035,9 @@ pub fn card_batch_marker(card: Option<CardKind>) -> &'static str {
 }
 
 /// Sanitise one connection slot from a backup before import: signing and kind
-/// ceilings are stripped (a restore never carries silent signing), then the
-/// method ceiling is re-validated. Identity approvals and the bound flag are
+/// ceilings are stripped (a restore never carries silent signing), as are the
+/// owner mark and `heartwood_approve_bundle`, then the method ceiling is
+/// re-validated. Identity approvals and the bound flag are
 /// kept. Returns whether signing was stripped.
 pub fn sanitise_imported_slot(slot: &mut ConnectSlot) -> Result<bool, &'static str> {
     if slot.client_grants.is_none() {
@@ -911,6 +1048,12 @@ pub fn sanitise_imported_slot(slot: &mut ConnectSlot) -> Result<bool, &'static s
         slot.signing_approved || slot.allowed_methods.iter().any(|m| m == "sign_event");
     slot.signing_approved = false;
     slot.allowed_methods.retain(|m| m != "sign_event");
+    // The owner mark and the setup hold are never carried by a backup (one-hold
+    // pairing spec 5.2): a hand-edited file cannot make an owner pairing, and
+    // stripping them before validation keeps a backup that carries them
+    // (exported on older firmware after a downgrade) importable. A restore
+    // needs the setup hold again, as it needs signing approved again.
+    crate::owner_pairing::strip_owner_names(&mut slot.allowed_methods);
     // Kind ceilings are meaningless without sign_event (and the validator
     // rejects the combination), so they go with it.
     slot.allowed_kinds.clear();
@@ -1123,15 +1266,45 @@ pub fn remove_authorized_pubkey(
 /// so an earlier device stays auto-approved instead of being evicted. The set
 /// is de-duplicated and FIFO-capped at [`MAX_AUTHORIZED_PUBKEYS`].
 pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
+    // A key this slot never authorised is a new holder of the credential: an
+    // owner pairing's mark was given to the phone whose words the owner
+    // compared, so it goes (one-hold pairing spec 5.2: any connect class but
+    // Current/Known). The new key must run the setup hold itself.
+    let new_holder = !slot_authorizes(slot, pubkey);
     if let Some(grants) = &mut slot.client_grants {
         let Some(key) = decode_client_key(pubkey) else { return false; };
-        if grants.add_client(key).is_err() { return false; }
+        // A full pairing forgets its oldest key, as `MAX_AUTHORIZED_PUBKEYS`
+        // always promised, rather than refusing the newcomer. Never the
+        // current key, and with it go only that key's own consent records,
+        // so a device that comes back later is new and asks again. A new key
+        // on a pairing that can sign gets here only after the owner's hold.
+        let mut next = grants.clone();
+        let mut evicted = None;
+        match next.add_client(key) {
+            Ok(_) => {}
+            Err(crate::client_grants::GrantError::ClientCapacity) => {
+                let current = slot.current_pubkey.as_deref().and_then(decode_client_key);
+                let Some(oldest) = next.client_keys().into_iter().find(|k| Some(*k) != current) else {
+                    return false;
+                };
+                if next.remove_client(&oldest).is_err() || next.add_client(key).is_err() {
+                    return false;
+                }
+                evicted = Some(oldest);
+            }
+            Err(_) => return false,
+        }
+        *grants = next;
+        if let Some(oldest) = evicted {
+            slot.authorized_pubkeys.retain(|p| decode_client_key(p) != Some(oldest));
+        }
         slot.was_bound = true;
         if let Some(previous) = slot.current_pubkey.take() {
             if !slot.authorized_pubkeys.contains(&previous) { slot.authorized_pubkeys.push(previous); }
         }
         if !slot.authorized_pubkeys.iter().any(|p| p == pubkey) { slot.authorized_pubkeys.push(pubkey.to_string()); }
         slot.current_pubkey = Some(pubkey.to_string());
+        if new_holder { crate::owner_pairing::drop_owner_mark(slot); }
         return true;
     }
     // A client key this slot has never authorised, replacing one it had, is a
@@ -1142,6 +1315,9 @@ pub fn authorize_pubkey_on_slot(slot: &mut ConnectSlot, pubkey: &str) -> bool {
         && !slot_authorizes(slot, pubkey)
     {
         slot.approved_identities.clear();
+    }
+    if new_holder {
+        crate::owner_pairing::drop_owner_mark(slot);
     }
     slot.was_bound = true;
     if let Some(prev) = slot.current_pubkey.take() {
@@ -1422,6 +1598,116 @@ pub fn narrows_only(before: &ConnectSlot, after: &ConnectSlot) -> bool {
         (serde_json::to_vec(&probe), serde_json::to_vec(before)),
         (Ok(a), Ok(b)) if a == b
     )
+}
+
+/// Whether the table a master's `connslots_N` holds on flash (`stored`, or
+/// `None` when the key is absent) differs from the one RAM enforces (`ram`):
+/// a change RAM already holds that no save has written, such as a
+/// revocation whose save failed. Compared as the stored encoding, the codec
+/// the table is persisted with. An absent table and an empty one are the
+/// same (no pairings), so neither is "unsaved" for the other.
+pub fn slot_table_unsaved(stored: Option<&[u8]>, ram: &[ConnectSlot]) -> bool {
+    match stored {
+        Some(bytes) => !serde_json::to_vec(ram).is_ok_and(|encoded| encoded == bytes),
+        None => !ram.is_empty(),
+    }
+}
+
+/// How a master's `connslots_N` reads after a revocation's save failed.
+/// `Readable` means it reads and parses, as the repeat path needs
+/// (`PolicyEngine::unsaved_slot_revocation`): a table that is present but
+/// does not parse is `Unreadable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredSlotTable {
+    Absent,
+    Readable,
+    Unreadable,
+}
+
+/// What a restart finds after a revocation whose save failed, and what can
+/// still save it ([`unsaved_revocation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsavedRevocation {
+    /// The old table is on flash and readable: repeating the request saves
+    /// the narrower one.
+    RepeatSaves,
+    /// The old table may be on flash, but nothing can save the revocation in
+    /// this boot: the master's pairings are quarantined (none is served, and
+    /// none is written), or its stored table cannot be read, so a repeat
+    /// finds nothing to save and answers "not found". After a restart the
+    /// table loads again, or the master stays quarantined.
+    RestartFirst,
+    /// The old table is on flash, readable, and was not rewritten for lack
+    /// of room (an in-place rewrite with no room for a second copy). A
+    /// repeat on the same board meets the same refusal; freeing room first
+    /// lets it save.
+    NoRoom,
+    /// The table was erased to make room and could not be rewritten; a later
+    /// save can still bring the other pairings back.
+    TableLost,
+    /// As `TableLost`, with the key blocked until a restart.
+    TableGone,
+    /// A write failed part-way over a present (or unreadable) table.
+    Uncertain,
+}
+
+/// Classify a revocation whose save failed. `blocked`: the table's key is
+/// blocked for this boot after a part-written write. `storage_ready`: the
+/// master is not quarantined. `no_room`: the write was refused for lack of
+/// room.
+///
+/// Quarantine decides first: a quarantined master's save writes nothing, so
+/// neither the stored state nor a block on its key is the save's doing, and
+/// "saved" cannot be read off an absent table. A migration that could not
+/// persist leaves exactly that: no table (its failed write blocking the key)
+/// and a live legacy credential, which the next boot turns back into the
+/// pairing just revoked. Then a part-written write, whose key is blocked
+/// whatever else holds; then the stored table.
+pub fn unsaved_revocation(
+    blocked: bool,
+    storage_ready: bool,
+    stored: StoredSlotTable,
+    no_room: bool,
+) -> UnsavedRevocation {
+    match (storage_ready, blocked, stored) {
+        (false, _, _) => UnsavedRevocation::RestartFirst,
+        (true, true, StoredSlotTable::Absent) => UnsavedRevocation::TableGone,
+        (true, true, _) => UnsavedRevocation::Uncertain,
+        (true, false, StoredSlotTable::Absent) => UnsavedRevocation::TableLost,
+        (true, false, StoredSlotTable::Unreadable) => UnsavedRevocation::RestartFirst,
+        (true, false, StoredSlotTable::Readable) if no_room => UnsavedRevocation::NoRoom,
+        (true, false, StoredSlotTable::Readable) => UnsavedRevocation::RepeatSaves,
+    }
+}
+
+/// The stored copy of pairing `slot_index` when RAM no longer has it: an
+/// earlier revocation of that pairing whose save failed (the reply said it
+/// holds until the next restart only). Repeating the revocation should then
+/// save the narrower table, not answer "not found" while the pairing comes
+/// back at the next restart. `None` when RAM still has the pairing (an
+/// ordinary revocation) or flash never had it (a real "not found").
+pub fn unsaved_slot_revocation<'a>(
+    stored: &'a [ConnectSlot],
+    ram: &[ConnectSlot],
+    slot_index: u8,
+) -> Option<&'a ConnectSlot> {
+    if ram.iter().any(|slot| slot.slot_index == slot_index) {
+        return None;
+    }
+    stored.iter().find(|slot| slot.slot_index == slot_index)
+}
+
+/// Whether removing `pubkey` from pairing `slot_index` is a removal RAM
+/// already holds and flash does not: the stored copy of the same pairing
+/// (same secret) still authorises the key and RAM's no longer does.
+pub fn unsaved_key_removal(stored: &[ConnectSlot], ram: &[ConnectSlot], slot_index: u8, pubkey: &str) -> bool {
+    let find = |slots: &[ConnectSlot]| slots.iter().find(|slot| slot.slot_index == slot_index).cloned();
+    match (find(stored), find(ram)) {
+        (Some(stored), Some(ram)) => {
+            stored.secret == ram.secret && slot_authorizes(&stored, pubkey) && !slot_authorizes(&ram, pubkey)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1808,7 +2094,12 @@ mod tests {
         // (explicit or a heartwood_switch active identity) it is scoped.
         assert!(!method_uses_identity_key("get_public_key", false));
         assert!(method_uses_identity_key("get_public_key", true));
-        for method in ["heartwood_note_send", "heartwood_note_address", "heartwood_note_claim"] {
+        for method in [
+            "heartwood_note_send",
+            "heartwood_note_address",
+            "heartwood_note_claim",
+            "heartwood_note_address_proof",
+        ] {
             assert!(method_uses_served_key(method), "{method}");
             assert!(!method_uses_identity_key(method, true), "{method}");
         }
@@ -1844,6 +2135,7 @@ mod tests {
             (Family::Pubkey, "get_public_key"),
             (Family::Note, "heartwood_note_send"),
             (Family::Note, "heartwood_note_claim"),
+            (Family::Note, "heartwood_note_address_proof"),
             (Family::List, "heartwood_list_identities"),
             (Family::Switch, "heartwood_switch"),
             (Family::Other, "heartwood_derive"),
@@ -1957,7 +2249,7 @@ mod tests {
                 assert!(!matches!(gate, Gate::Card(_)), "switch carded without a press");
             }
         }}}}}}}}}}}
-        assert_eq!(cases, 11 * 4 * 2 * 2 * 3 * 3 * 2 * 2 * 2 * 2 * 2);
+        assert_eq!(cases, 12 * 4 * 2 * 2 * 3 * 3 * 2 * 2 * 2 * 2 * 2);
     }
 
     #[test]
@@ -2911,6 +3203,144 @@ mod tests {
         );
     }
 
+    fn login_slot(auto: bool, kinds: Vec<u64>, strict: bool) -> ConnectSlot {
+        let mut slot = sample_slot(0, "login");
+        slot.allowed_methods = vec!["sign_event".into()];
+        slot.allowed_kinds = kinds;
+        slot.auto_approve = auto;
+        slot.strict_permissions = strict;
+        slot.signing_approved = true;
+        slot
+    }
+
+    #[test]
+    fn login_kind_is_never_auto_approved() {
+        // auto_approve with no kind ceiling: every other kind is silent,
+        // the login kind is not.
+        let open = login_slot(true, vec![], false);
+        assert_eq!(evaluate_slot_policy(&open, "sign_event", Some(1)), ApprovalTier::AutoApprove);
+        assert_eq!(evaluate_slot_policy_for_event(&open, "sign_event", Some(LOGIN_EVENT_KIND), true), ApprovalTier::ButtonRequired);
+
+        // auto_approve with the kind explicitly listed, strict or legacy.
+        for strict in [false, true] {
+            let listed = login_slot(true, vec![1, LOGIN_EVENT_KIND], strict);
+            assert_eq!(evaluate_slot_policy(&listed, "sign_event", Some(1)), ApprovalTier::AutoApprove);
+            assert_eq!(
+                evaluate_slot_policy_for_event(&listed, "sign_event", Some(LOGIN_EVENT_KIND), true),
+                ApprovalTier::ButtonRequired,
+                "strict={strict}",
+            );
+        }
+
+        // Plain NIP-42 relay AUTH (22242, no `code` tag) is not a login
+        // challenge and keeps today's behaviour, listed or not.
+        assert_eq!(evaluate_slot_policy_for_event(&open, "sign_event", Some(LOGIN_EVENT_KIND), false), ApprovalTier::AutoApprove);
+        // An event whose kind could not be read is not a login and keeps
+        // today's behaviour. That is safe only because every signing caller
+        // derives the kind from the event it signs (an unparseable event is
+        // refused before signing): never feed a scanner-derived kind into a
+        // signing decision.
+        assert_eq!(evaluate_slot_policy(&open, "sign_event", None), ApprovalTier::AutoApprove);
+    }
+
+    #[test]
+    fn login_kind_excluded_by_a_strict_slot_is_still_denied() {
+        let strict = login_slot(true, vec![1, 7], true);
+        assert_eq!(evaluate_slot_policy_for_event(&strict, "sign_event", Some(LOGIN_EVENT_KIND), true), ApprovalTier::Denied);
+        // A legacy slot that excludes it falls back to the button, as for any kind.
+        let legacy = login_slot(true, vec![1, 7], false);
+        assert_eq!(evaluate_slot_policy_for_event(&legacy, "sign_event", Some(LOGIN_EVENT_KIND), true), ApprovalTier::ButtonRequired);
+    }
+
+    #[test]
+    fn login_kind_leaves_other_methods_and_unapproved_slots_alone() {
+        let mut slot = login_slot(true, vec![], true);
+        slot.allowed_methods.push("nip44_encrypt".into());
+        assert_eq!(evaluate_slot_policy(&slot, "nip44_encrypt", None), ApprovalTier::AutoApprove);
+        // A strict slot that never signed still denies, as before.
+        slot.signing_approved = false;
+        assert_eq!(evaluate_slot_policy_for_event(&slot, "sign_event", Some(LOGIN_EVENT_KIND), true), ApprovalTier::Denied);
+    }
+
+    fn tag(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn login_code_extraction() {
+        let challenge = tag(&["challenge", &"ab".repeat(32)]);
+        // Valid, at both length limits.
+        for code in ["1234", "0007", "12345678"] {
+            let tags = vec![challenge.clone(), tag(&["code", code])];
+            assert_eq!(login_code_from_tags(&tags), Some(code));
+        }
+        // Missing tag, and a tag with no value.
+        assert_eq!(login_code_from_tags(&[]), None);
+        assert_eq!(login_code_from_tags(&[challenge.clone()]), None);
+        assert_eq!(login_code_from_tags(&[tag(&["code"])]), None);
+        // Wrong length.
+        for code in ["", "123", "123456789"] {
+            assert_eq!(login_code_from_tags(&[tag(&["code", code])]), None, "{code:?}");
+        }
+        // Not ASCII digits (including Unicode digits and padding).
+        for code in ["12a4", "12 4", "-123", "+123", "12.4", "\u{0661}\u{0662}\u{0663}\u{0664}", "1234\n"] {
+            assert_eq!(login_code_from_tags(&[tag(&["code", code])]), None, "{code:?}");
+        }
+        // More than one code tag, identical or not: none.
+        let two = vec![tag(&["code", "1234"]), tag(&["code", "5678"])];
+        assert_eq!(login_code_from_tags(&two), None);
+        let same = vec![tag(&["code", "1234"]), tag(&["code", "1234"])];
+        assert_eq!(login_code_from_tags(&same), None);
+        // A second, invalid code tag still disqualifies the valid one.
+        let mixed = vec![tag(&["code", "1234"]), tag(&["code", "x"])];
+        assert_eq!(login_code_from_tags(&mixed), None);
+        // Extra elements after the value are ignored; the name must match exactly.
+        assert_eq!(login_code_from_tags(&[tag(&["code", "1234", "extra"])]), Some("1234"));
+        assert_eq!(login_code_from_tags(&[tag(&["Code", "1234"])]), None);
+    }
+
+    #[test]
+    fn login_code_only_applies_to_the_login_kind() {
+        let tags = vec![tag(&["code", "1234"])];
+        assert_eq!(login_code_for_event(LOGIN_EVENT_KIND, &tags), Some("1234"));
+        assert_eq!(login_code_for_event(1, &tags), None);
+        assert_eq!(login_code_for_event(LOGIN_EVENT_KIND, &[]), None);
+    }
+
+    #[test]
+    fn login_challenge_classification() {
+        let valid = vec![tag(&["challenge", "ab"]), tag(&["code", "4821"])];
+        assert_eq!(classify_login(LOGIN_EVENT_KIND, &valid), LoginChallenge::Valid("4821"));
+        assert!(is_login_challenge(LOGIN_EVENT_KIND, &valid));
+        // Plain NIP-42 relay AUTH: 22242 with no code tag is not a login.
+        let auth = vec![tag(&["relay", "wss://r"]), tag(&["challenge", "x"])];
+        assert_eq!(classify_login(LOGIN_EVENT_KIND, &auth), LoginChallenge::No);
+        assert!(!is_login_challenge(LOGIN_EVENT_KIND, &auth));
+        assert!(!is_login_challenge(LOGIN_EVENT_KIND, &[]));
+        // Another kind with a code tag is not a login either.
+        assert_eq!(classify_login(1, &valid), LoginChallenge::No);
+        // A code tag that cannot be shown is malformed, and still a challenge
+        // for policy: wrong length, non-digits, no value, several tags.
+        for tags in [
+            vec![tag(&["code", "12"])],
+            vec![tag(&["code", "12a4"])],
+            vec![tag(&["code"])],
+            vec![tag(&["code", "1234"]), tag(&["code", "5678"])],
+        ] {
+            assert_eq!(classify_login(LOGIN_EVENT_KIND, &tags), LoginChallenge::Malformed, "{tags:?}");
+            assert!(is_login_challenge(LOGIN_EVENT_KIND, &tags));
+        }
+    }
+
+    #[test]
+    fn plain_relay_auth_is_unchanged_by_the_login_rule() {
+        let open = login_slot(true, vec![], false);
+        assert_eq!(evaluate_slot_policy_for_event(&open, "sign_event", Some(LOGIN_EVENT_KIND), false), ApprovalTier::AutoApprove);
+        assert_eq!(evaluate_slot_policy(&open, "sign_event", Some(LOGIN_EVENT_KIND)), ApprovalTier::AutoApprove);
+        let strict = login_slot(true, vec![1], true);
+        assert_eq!(evaluate_slot_policy_for_event(&strict, "sign_event", Some(LOGIN_EVENT_KIND), false), ApprovalTier::Denied);
+    }
+
     #[test]
     fn guardian_notice_recipient_requires_an_explicit_guardian_flag() {
         let guardian = "11".repeat(32);
@@ -3193,6 +3623,133 @@ mod tests {
         policy.auto_approve = !policy.auto_approve;
         assert!(slot_authority_changed(&before, &[policy]));
         assert!(slot_authority_changed(&before, &[]));
+    }
+
+    #[test]
+    fn a_change_to_the_owner_mark_is_a_change_of_authority() {
+        // One-hold pairing spec 5.2: adding or dropping the mark withdraws
+        // waiting cards (`allowed_methods` is compared).
+        let slot = sample_slot(0, "My Signet");
+        let before = vec![slot.clone()];
+        let mut marked = slot.clone();
+        assert!(grant_slot_method(&mut marked, crate::owner_pairing::OWNER_MARK));
+        assert!(slot_authority_changed(&before, &[marked.clone()]));
+        let mut dropped = marked.clone();
+        assert!(crate::owner_pairing::drop_owner_mark(&mut dropped));
+        assert!(slot_authority_changed(&[marked], &[dropped]));
+    }
+
+    // --- Rule V (one-hold pairing spec 6) ---
+
+    const VAULT_CLIENT: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    /// A cable "Everything" pairing after the setup hold.
+    fn rule_v_owner_slot() -> ConnectSlot {
+        let mut slot = sample_slot(0, "My Signet");
+        slot.current_pubkey = Some(VAULT_CLIENT.to_string());
+        slot.authorized_pubkeys = vec![VAULT_CLIENT.to_string()];
+        slot.was_bound = true;
+        crate::owner_pairing::apply_bundle_press(&mut slot, VAULT_CLIENT, &[IDENTITY_A], crate::owner_pairing::Style::Everyday)
+            .unwrap();
+        slot
+    }
+
+    fn rule_v_request<'a>(slot: &'a ConnectSlot, method: &'a str, tier: ApprovalTier, identity: &'a [u8; 32]) -> GateRequest<'a> {
+        GateRequest {
+            client_pubkey: Some(VAULT_CLIENT),
+            has_client: true,
+            slot: Some(slot),
+            method,
+            tier,
+            explicit_context: true,
+            has_context: true,
+            identity: Some(identity),
+            verdict: false,
+        }
+    }
+
+    #[test]
+    fn rule_v_lets_an_owner_pairings_vault_requests_through_with_no_card() {
+        use crate::owner_pairing::VaultContext;
+        let owner = rule_v_owner_slot();
+        let vault_key = [0x77; 32];
+        let vault = VaultContext::from_explicit(Some("signet:vault:contacts"), None);
+        let backup = VaultContext::from_explicit(Some("signet:vault:contacts"), Some(30078));
+        for method in ["get_public_key", "nip44_encrypt", "nip44_decrypt"] {
+            let request = rule_v_request(&owner, method, ApprovalTier::AutoApprove, &vault_key);
+            assert_eq!(gate_request_with_vault(&request, vault), Gate::Allow, "{method}");
+            // Without Rule V the vault key would raise its card.
+            assert!(matches!(gate_request(&request), Gate::Card(_)), "{method}");
+        }
+        for method in ["sign_event", "sign_event_compact"] {
+            let request = rule_v_request(&owner, method, ApprovalTier::AutoApprove, &vault_key);
+            assert_eq!(gate_request_with_vault(&request, backup), Gate::Allow, "{method}");
+            // Another kind under a vault context takes today's path.
+            let post = VaultContext::from_explicit(Some("signet:vault:contacts"), Some(1));
+            assert_eq!(
+                gate_request_with_vault(&request, post),
+                Gate::Card(CardKind::AllowAs { record: true }),
+                "{method}"
+            );
+        }
+        // The setup hold made the four methods automatic, so the tier does too.
+        for (method, kind) in [("sign_event", Some(30078)), ("nip44_encrypt", None), ("nip44_decrypt", None)] {
+            assert_eq!(evaluate_slot_policy_for_event(&owner, method, kind, false), ApprovalTier::AutoApprove, "{method}");
+        }
+        // Nothing is recorded: the vault key is still not an approved identity.
+        assert!(!client_identity_approved(&owner, Some(VAULT_CLIENT), &vault_key));
+    }
+
+    #[test]
+    fn rule_v_sits_after_the_crypto_refusal() {
+        // A crypto method under a vault context is still refused when its tier
+        // would prompt: Rule V never turns an oracle into a card or an allow.
+        use crate::owner_pairing::VaultContext;
+        let owner = rule_v_owner_slot();
+        let vault = VaultContext::from_explicit(Some("signet:vault:contacts"), None);
+        for method in ["nip44_encrypt", "nip44_decrypt"] {
+            let request = rule_v_request(&owner, method, ApprovalTier::ButtonRequired, &[0x77; 32]);
+            assert_eq!(gate_request_with_vault(&request, vault), Gate::Deny, "{method}");
+        }
+        // A policy denial and a strict slot's explicit context come first too.
+        let request = rule_v_request(&owner, "nip44_encrypt", ApprovalTier::Denied, &[0x77; 32]);
+        assert_eq!(gate_request_with_vault(&request, vault), Gate::Deny);
+        let mut strict = owner.clone();
+        strict.strict_permissions = true;
+        let request = rule_v_request(&strict, "nip44_encrypt", ApprovalTier::AutoApprove, &[0x77; 32]);
+        assert_eq!(gate_request_with_vault(&request, vault), Gate::Deny);
+        // Rule V only skips the identity card: a prompting sign tier still
+        // stands for a card through gate_tier.
+        let request = rule_v_request(&owner, "sign_event", ApprovalTier::ButtonRequired, &[0x77; 32]);
+        let backup = VaultContext::from_explicit(Some("signet:vault:contacts"), Some(30078));
+        let gate = gate_request_with_vault(&request, backup);
+        assert_eq!(gate, Gate::Allow);
+        assert_eq!(gate_tier(gate, request.tier), ApprovalTier::ButtonRequired);
+    }
+
+    #[test]
+    fn rule_v_changes_nothing_without_the_mark_or_an_explicit_vault_context() {
+        use crate::owner_pairing::VaultContext;
+        let owner = rule_v_owner_slot();
+        let vault = VaultContext::from_explicit(Some("signet:vault:contacts"), None);
+        let mut plain = owner.clone();
+        crate::owner_pairing::drop_owner_mark(&mut plain);
+        let request = rule_v_request(&plain, "get_public_key", ApprovalTier::AutoApprove, &[0x77; 32]);
+        assert_eq!(gate_request_with_vault(&request, vault), Gate::Card(CardKind::NpubAs));
+        // An active (session) context is not an explicit one.
+        let active = GateRequest { explicit_context: false, ..rule_v_request(&owner, "get_public_key", ApprovalTier::AutoApprove, &[0x77; 32]) };
+        assert_eq!(gate_request_with_vault(&active, vault), Gate::Card(CardKind::NpubAs));
+        // A non-vault purpose.
+        let persona = VaultContext::from_explicit(Some("nostr:persona:work"), None);
+        let request = rule_v_request(&owner, "get_public_key", ApprovalTier::AutoApprove, &[0x77; 32]);
+        assert_eq!(gate_request_with_vault(&request, persona), Gate::Card(CardKind::NpubAs));
+        // With no vault context the two entry points agree everywhere.
+        for tier in [ApprovalTier::AutoApprove, ApprovalTier::ButtonRequired, ApprovalTier::Denied] {
+            for method in ["sign_event", "nip44_encrypt", "get_public_key", "heartwood_list_identities", "heartwood_switch"] {
+                let request = rule_v_request(&owner, method, tier, &IDENTITY_A);
+                assert_eq!(gate_request_with_vault(&request, VaultContext::NONE), gate_request(&request), "{method}");
+            }
+        }
     }
 
     // --- Connect rebind classification (G1) ---
@@ -3621,5 +4178,79 @@ mod tests {
         let mut all_kinds = before.clone();
         all_kinds.allowed_kinds.clear();
         assert!(narrows_only(&all_kinds, &before));
+    }
+
+    #[test]
+    fn a_table_differing_from_flash_is_unsaved_and_absent_equals_empty() {
+        let table = vec![sample_slot(0, "a"), sample_slot(1, "b")];
+        let encoded = serde_json::to_vec(&table).unwrap();
+        assert!(!slot_table_unsaved(Some(&encoded), &table));
+        assert!(slot_table_unsaved(Some(&encoded), &table[..1]), "a revocation RAM holds");
+        assert!(slot_table_unsaved(Some(b"[]"), &table));
+        assert!(slot_table_unsaved(None, &table), "nothing on flash, pairings in RAM");
+        assert!(!slot_table_unsaved(None, &[]), "absent and empty both mean no pairings");
+        assert!(!slot_table_unsaved(Some(b"[]"), &[]));
+    }
+
+    #[test]
+    fn an_unsaved_revocation_advises_a_repeat_only_where_one_can_save_it() {
+        use StoredSlotTable::{Absent, Readable, Unreadable};
+        use UnsavedRevocation::*;
+        // Every input, so a new arm cannot slip in unexamined.
+        for blocked in [false, true] {
+            for ready in [false, true] {
+                for stored in [Absent, Readable, Unreadable] {
+                    for no_room in [false, true] {
+                        let got = unsaved_revocation(blocked, ready, stored, no_room);
+                        let want = match (ready, blocked, stored, no_room) {
+                            (false, _, _, _) => RestartFirst,
+                            (true, true, Absent, _) => TableGone,
+                            (true, true, _, _) => Uncertain,
+                            (true, false, Absent, _) => TableLost,
+                            (true, false, Unreadable, _) => RestartFirst,
+                            (true, false, Readable, true) => NoRoom,
+                            (true, false, Readable, false) => RepeatSaves,
+                        };
+                        assert_eq!(got, want, "blocked {blocked}, ready {ready}, {stored:?}, no room {no_room}");
+                    }
+                }
+            }
+        }
+        // The cases a repeat used to be advised for and cannot help.
+        assert_eq!(unsaved_revocation(false, false, Readable, false), RestartFirst, "quarantined");
+        assert_eq!(unsaved_revocation(false, false, Absent, false), RestartFirst, "quarantined, legacy migration unsaved");
+        assert_eq!(
+            unsaved_revocation(true, false, Absent, false),
+            RestartFirst,
+            "quarantined after a migration write that failed part-way: never \"saved\""
+        );
+        assert_eq!(unsaved_revocation(false, true, Unreadable, false), RestartFirst, "table unreadable mid-boot");
+        assert_eq!(unsaved_revocation(false, true, Readable, true), NoRoom, "refused in place for room");
+        assert_eq!(unsaved_revocation(false, true, Readable, false), RepeatSaves);
+    }
+
+    #[test]
+    fn only_a_pairing_flash_still_has_and_ram_does_not_is_an_unsaved_revocation() {
+        let stored = vec![sample_slot(0, "a"), sample_slot(3, "b")];
+        let ram = vec![sample_slot(0, "a")];
+        assert_eq!(unsaved_slot_revocation(&stored, &ram, 3).map(|s| s.label.as_str()), Some("b"));
+        assert!(unsaved_slot_revocation(&stored, &ram, 0).is_none(), "still live: an ordinary revocation");
+        assert!(unsaved_slot_revocation(&stored, &ram, 5).is_none(), "never existed: not found");
+        assert!(unsaved_slot_revocation(&ram, &ram, 3).is_none(), "already saved: not found");
+    }
+
+    #[test]
+    fn a_key_removal_is_unsaved_only_on_the_same_pairing() {
+        let key = "11".repeat(32);
+        let mut stored_slot = sample_slot(2, "a");
+        stored_slot.authorized_pubkeys.push(key.clone());
+        let ram_slot = sample_slot(2, "a");
+        assert!(unsaved_key_removal(&[stored_slot.clone()], &[ram_slot.clone()], 2, &key));
+        assert!(!unsaved_key_removal(&[ram_slot.clone()], &[ram_slot.clone()], 2, &key), "saved already");
+        assert!(!unsaved_key_removal(&[stored_slot.clone()], &[stored_slot.clone()], 2, &key), "RAM still has it");
+        let mut reused = ram_slot.clone();
+        reused.secret = "cd".repeat(32);
+        assert!(!unsaved_key_removal(&[stored_slot.clone()], &[reused], 2, &key), "a different pairing at that index");
+        assert!(!unsaved_key_removal(&[stored_slot], &[], 2, &key), "no such pairing in RAM");
     }
 }

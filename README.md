@@ -26,7 +26,7 @@ The shared `common` crate (derivation, NIP-44/46, policy — `no_std`, host-test
 flowchart LR
     Bark["Bark<br/>(NIP-07 browser ext)"]
     Relays[("Nostr relays")]
-    Bridge["heartwood-bridge<br/>on Pi<br/>(pure transport,<br/>holds no signing keys)"]
+    Bridge["heartwoodd<br/>on Pi<br/>(pure transport,<br/>holds no signing keys)"]
     HSM["Heartwood HSM<br/>(master nsecs,<br/>button / exact-policy signing)"]
 
     Bark <-->|"NIP-44<br/>ciphertext"| Relays
@@ -43,13 +43,13 @@ Deployment modes, selected at runtime from the NVS network config:
 
 ### Home HSM — USB-attached to a Raspberry Pi *(shipped)*
 
-Holds the **master secrets** (up to 8 masters across bunker / tree-mnemonic / tree-nsec modes). All radios are disabled in this mode. The Pi running `heartwood-bridge` handles networking (Nostr relays, NIP-46 transport). The ESP32 handles all cryptography — decryption, signing, envelope construction. A compromised Pi cannot extract a master key or broaden a slot policy; an already-authorised client can still receive whatever signatures its current policy permits. Management UI via [Sapwood](https://github.com/forgesworn/sapwood) is served by the bridge.
+Holds the **master secrets** (up to 8 masters across bunker / tree-mnemonic / tree-nsec modes). All radios are disabled in this mode. The Pi running `heartwoodd` handles networking (Nostr relays, NIP-46 transport). The ESP32 handles all cryptography: decryption, signing, envelope construction. A compromised Pi cannot extract a master key or broaden a slot policy; an already-authorised client can still receive whatever signatures its current policy permits. Management UI via [Sapwood](https://github.com/forgesworn/sapwood) is served by the bridge.
 
 ### WiFi-standalone — on-chip relay client, no Pi *(shipped, opt-in)*
 
 The ESP32 joins WiFi and connects to Nostr relays directly, running the full NIP-46 signing loop on-chip (`firmware/src/relay.rs`) — no Raspberry Pi. Keys still never leave the chip and NIP-44 is still decrypted on-device. Exact v2 client policies can permit unattended signing for a bounded method/event-kind set; other requests are denied or require the OLED/button according to their legacy policy. An unbound relay peer cannot enter the 30-second button loop: remote physical approval is available only after the client has been provisioned and slot-bound, so strangers cannot keep a shelf signer busy with prompts. Enabled only when the device is provisioned with an SSID + relay list (`mode="wifi"` in the NVS net config); the USB cable stays fully usable in parallel, so a bad SSID or relay is recoverable over the cable. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey, uses a durable one-time mutation challenge, and can manage clients and staged WiFi changes remotely. USB can read password-redacted network/operator state, patch network fields with keep/set/clear password semantics, and replace the operator only through a separate stale-revision-checked physical confirmation. Seed replacement, PIN changes, factory reset, and OTA remain local/USB operations.
 
-The device stores an ordered list of up to eight WiFi networks (v0.16.0): the join loop walks the list in priority order and rotates on failure — home network first, phone hotspot as fallback, say. Reordering or promoting a stored network never resends its password; per-SSID `keep` semantics resolve secrets on-device. Short button presses while idle page through an info carousel: identity, network (SSID + live connection stage), and device (firmware version, board, uptime).
+The device stores up to eight WiFi networks. At startup and after losing a connection, it scans and tries visible saved networks from strongest signal to weakest; saved order breaks ties and supplies hidden or unseen fallbacks. A failed network does not prevent the others being tried. While connected, background scans check for a better saved network: switching requires at least a 10 dB advantage in two consecutive scans, normally 30 seconds apart, with the first scan at least 60 seconds after joining. Switching waits while an approval, held result, update or network trial is active; failed targets are excluded from roaming for five minutes. Reordering a stored network never resends its password; per-SSID `keep` semantics resolve secrets on-device. Short button presses while idle page through identity, network (large SSID, live stage and signal strength), device and locker information.
 
 This is the convenience tier — it accepts a larger attack surface (a live TCP/IP stack on a key-holding device) in exchange for dropping the Pi. The USB-attached mode above remains the high-assurance default; leave the radios off where that matters.
 
@@ -99,13 +99,31 @@ source ~/export-esp.sh
 
 ## Build
 
-Three independent crates -- build each from its own directory:
+The crates are independent (there is no workspace root), so build each from its
+own directory. Use a subshell, or `cd` back, so one command does not run inside
+the previous crate's directory:
+
+| Crate | Package | Purpose |
+|-------|---------|---------|
+| `common/` | `heartwood-common` | Shared crypto: nsec-tree derivation, NIP-44/NIP-04, NIP-46 types, frame protocol, policy and net-config types |
+| `firmware/` | `heartwood-esp32` | ESP32 firmware for every board, plus the `heartwood-demo` board-check game bin |
+| `heartwoodd/` | `heartwoodd` | Pi/host daemon: Hard mode (bridges a USB device) and Soft mode (software-backed signer, no ESP32) |
+| `provision/` | `heartwood-provision` | Host CLI: provision, generate, and manage client policies over USB serial |
+| `sign-test/` | `heartwood-sign-test` | End-to-end harness: sends NIP-46 requests over serial |
+| `ota/` | `heartwood-ota` | Host-side serial OTA tool with SHA-256 verification |
+| `ota-sign/` | `heartwood-ota-sign` | Release-key tool: keygen / sign / verify for firmware images |
+| `esp8266-firmware/` | `heartwood-esp8266` | Bare-metal USB-tethered signer for the ESP8266 (untested on hardware, see its `FLASHING.md`) |
+| `ui-preview/` | `ui-preview` | Host renderer for the device screens, sharing `firmware/src/layout.rs` |
 
 ```bash
-cd common && cargo test                    # shared crypto tests
-cd provision && cargo build                # host CLI tool
-cd firmware && cargo build                 # ESP32 firmware (V4 default)
+(cd common && cargo test --no-default-features --features mnemonic-gen,cash)  # shared crypto tests
+(cd provision && cargo build)              # host CLI tool
+(cd firmware && cargo build)               # ESP32 firmware (V4 default)
 ```
+
+`common`'s tests need the `cash` feature, so a bare `cargo test` there does not
+compile; CI also runs a second invocation with `--features
+nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes`.
 
 The firmware crate selects its board at compile time. The default cargo feature
 is `heltec-v4`, but production builds should use the wrapper so the cargo
@@ -118,20 +136,30 @@ feature, target triple, MCU, and sdkconfig fragment cannot drift apart:
 ./scripts/build-firmware.sh c6 --release
 ```
 
-Or the manual form:
+Or the manual form (the wrapper runs exactly these):
 
 ```bash
-cd firmware
-# V4 (default)
-cargo build --release
-# V3
-ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heltec-v3" \
-    cargo build --release --no-default-features --features heltec-v3
+# A subshell, so your shell stays in the repository root for the flash steps below.
+(
+  cd firmware
+  # V4 (default)
+  cargo build --release
+  # V3
+  ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.heltec-v3" \
+      cargo build --release --no-default-features --features heltec-v3
+  # T-Display (classic ESP32)
+  MCU=esp32 ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.tdisplay" \
+      cargo build --release --target xtensa-esp32-espidf --no-default-features --features tdisplay
+  # Waveshare ESP32-C6 (RISC-V)
+  MCU=esp32c6 ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.c6" \
+      cargo build --release --target riscv32imac-esp-espidf --no-default-features --features c6
+)
 ```
 
 The wrapper script also writes a board-tagged ELF copy to
-`target/heartwood-<board>.elf` so you cannot accidentally flash the wrong
-binary onto the wrong hardware.
+`firmware/target/heartwood-<board>.elf` (release builds; `-debug.elf` for debug
+builds) so you cannot accidentally flash the wrong binary onto the wrong
+hardware. `<board>` is the argument you passed (`v3`, `v4`, `tdisplay`, `c6`).
 
 ## Flash & provision
 
@@ -140,14 +168,31 @@ binary onto the wrong hardware.
 ```bash
 # Heltec V4 (default, native USB CDC, enumerates as /dev/ttyACM*)
 ./scripts/build-firmware.sh v4 --release
-espflash flash firmware/target/xtensa-esp32s3-espidf/release/heartwood-esp32
+espflash flash firmware/target/heartwood-v4.elf
 
 # Heltec V3 (CP2102 bridge, typically enumerates as /dev/ttyUSB* or /dev/cu.usbserial-*)
 ./scripts/build-firmware.sh v3 --release
-espflash flash firmware/target/xtensa-esp32s3-espidf/release/heartwood-esp32
+espflash flash firmware/target/heartwood-v3.elf
+
+# T-Display (classic ESP32) and Waveshare C6: same pattern
+./scripts/build-firmware.sh tdisplay --release
+espflash flash firmware/target/heartwood-tdisplay.elf
+./scripts/build-firmware.sh c6 --release
+espflash flash firmware/target/heartwood-c6.elf
 ```
 
-**Always use `--release`** -- debug builds (~2.2MB) exceed the 2 MB OTA partition.
+Flash the board-tagged ELF the wrapper writes, not a path under
+`firmware/target/<triple>/`: that path differs per board (the T-Display builds
+for `xtensa-esp32-espidf`, the C6 for `riscv32imac-esp-espidf`, the Heltec boards
+for `xtensa-esp32s3-espidf`).
+
+For a first flash of a 4 MB board, prefer the Sapwood web flasher, or the
+release's `bootloader-<board>.bin` and `partition-table-<board>.bin`. They are
+generated by the esp-idf build, which the release workflow uses because
+`espflash` can panic on the `config` partition's `0x40` subtype if given the
+CSV (`.github/workflows/release.yml`).
+
+**Always use `--release`** -- debug builds (~2.2MB) exceed the 2 MB OTA slot of the Heltec layout (`firmware/partitions.csv`).
 
 ### Remote flash via esptool (ESP32 attached to a Pi)
 
@@ -161,7 +206,9 @@ Substitute the right path in the commands below.
 ```bash
 # Build and convert to app binary (0xE9 format, not raw ELF)
 ./scripts/build-firmware.sh v4 --release      # or: v3
-espflash save-image --chip esp32s3 firmware/target/xtensa-esp32s3-espidf/release/heartwood-esp32 /tmp/heartwood-esp32.bin
+espflash save-image --chip esp32s3 firmware/target/heartwood-v4.elf /tmp/heartwood-esp32.bin
+# (v3: firmware/target/heartwood-v3.elf; T-Display: --chip esp32 with
+#  heartwood-tdisplay.elf; C6: --chip esp32c6 with heartwood-c6.elf)
 
 # Transfer to the Pi
 scp /tmp/heartwood-esp32.bin pi-host:/tmp/
@@ -179,7 +226,8 @@ sudo fuser -k "$PORT"
 python3 -m esptool --chip esp32s3 --port "$PORT" --before default-reset --after "$AFTER_RESET" \
   write-flash 0x10000 /tmp/heartwood-esp32.bin
 
-# Erase otadata to force boot from ota_0
+# Heltec only: erase otadata to force boot from ota_0. Skip this on the
+# T-Display and C6: their 4 MB layout has no otadata, and 0xd000 lies inside nvs.
 python3 -m esptool --chip esp32s3 --port "$PORT" --before default-reset --after "$AFTER_RESET" \
   erase-region 0xd000 0x2000
 ```
@@ -188,6 +236,20 @@ python3 -m esptool --chip esp32s3 --port "$PORT" --before default-reset --after 
 
 ### OTA update (over serial, device already running)
 
+Serial OTA works on the Heltec boards only: they carry two 2 MB A/B slots
+(`firmware/partitions.csv`). The T-Display and C6 have a single 3 MB factory
+slot (`firmware/partitions-4mb.csv`) and no A/B rollback, so they update with an
+app-only reflash instead: the `esptool` write at `0x10000` in the section above
+(`--chip esp32` or `--chip esp32c6`, no otadata erase) or Sapwood's quick USB update.
+
+Build and install the OTA tool once (it installs as `heartwood-ota`):
+
+```bash
+(cd ota && cargo install --path .)
+```
+
+Then update:
+
 ```bash
 # Stop the daemon holding the serial port
 sudo systemctl stop <heartwood-service>
@@ -195,21 +257,25 @@ sudo systemctl stop <heartwood-service>
 # Flash via OTA (requires button approval on the device -- hold 2s).
 # PORT=/dev/ttyACM0 for V4, PORT=/dev/ttyUSB0 for V3.
 heartwood-ota --port /dev/ttyACM0 --firmware /tmp/heartwood-esp32.bin
+# The release signature is read from /tmp/heartwood-esp32.bin.sig by default
+# (every release ships one per app image); pass --sig <file> to name another.
 
 # Restart the daemon
 sudo systemctl start <heartwood-service>
 ```
 
-The OTA tool is built from the `ota/` crate. The firmware binary must be an app binary (use `espflash save-image`), not the raw ELF from `cargo build`.
+The firmware binary must be an app binary (use `espflash save-image`), not the raw ELF from `cargo build`. Release-key custody and signing are covered in [docs/ota-signing.md](docs/ota-signing.md).
 
 ### Provision
 
 After first flash, wait for OLED to show "Awaiting secret...", then:
 
 ```bash
-cd provision && cargo run -- --port /dev/cu.usbserial-*
+(cd provision && cargo run -- --port /dev/cu.usbserial-* provision)
 ```
 
+`provision` restores an existing secret; `generate` makes a fresh one on the
+offline host and shows its recovery words once (see `cargo run -- --help`).
 Enter mnemonic and passphrase when prompted. After ACK, the device reboots with the stored identity.
 
 Sapwood and Heartwood `0.18.0-beta.2` produce typed 19/31-word recovery sequences with
@@ -221,6 +287,187 @@ the original meaning to be selected out of band. Format and instructions:
 [sapwood/docs/key-backup.md](https://github.com/forgesworn/sapwood/blob/main/docs/key-backup.md).
 
 Subsequent boots display the master npub immediately (no provisioning needed).
+
+## Quick start
+
+From a flashed board to a first signature, USB-bridged mode. Build the host
+tools first (`(cd provision && cargo build)`, `(cd sign-test && cargo build)`,
+`(cd heartwoodd && cargo build)`), and substitute your serial port.
+
+1. Provision. Wait for the OLED to show "Awaiting secret...", then, on an
+   offline machine, generate a fresh identity (recovery words are shown once and
+   never written to disk) and a bridge secret for the daemon:
+
+   ```bash
+   (cd provision && cargo run -- --port /dev/ttyACM0 generate --label primary --gen-bridge-secret)
+   ```
+
+   The command prints the bridge secret; keep it for step 3. To restore an
+   existing identity instead, use the `provision` subcommand above.
+
+2. Check the signer directly. Stop anything holding the port, then ask for the
+   public key and a signature. `sign-test` speaks the plaintext cable frame,
+   which the device refuses once a bridge session is authenticated, so run it
+   before step 3, while no bridge session has authenticated since the device
+   last started. `sign_event` needs a button hold on the device:
+
+   ```bash
+   (cd sign-test && cargo run -- --port /dev/ttyACM0 --method get_public_key)
+   (cd sign-test && cargo run -- --port /dev/ttyACM0 --method sign_event --kind 1 --content "hello")
+   ```
+
+   Run these from the repository root; each subshell leaves your shell where it
+   was. `sign-test` prints the request it sends, then the device's reply. For
+   `get_public_key` the request carries an optional `heartwood` derivation
+   context (`--purpose persona/social --index 0` fills it in; without `--purpose`
+   it is `null`), and the reply is the requested public key as hex (the
+   master's without `--purpose`), after which `sign-test` prints the matching
+   `npub`:
+
+   ```json
+   {
+     "heartwood": null,
+     "id": "sign-test-1",
+     "method": "get_public_key",
+     "params": []
+   }
+   ```
+
+   ```json
+   {
+     "id": "sign-test-1",
+     "result": "<64 hex characters>"
+   }
+   ```
+
+   For `sign_event`, `params[0]` is the unsigned event as a JSON string, with a
+   zero placeholder `pubkey` that the device replaces with the signing key's. The
+   reply's `result` is the signed event, again as a JSON string (hex values
+   shortened here):
+
+   ```json
+   {
+     "heartwood": null,
+     "id": "sign-test-1",
+     "method": "sign_event",
+     "params": [
+       "{\"content\":\"hello\",\"created_at\":1760000000,\"kind\":1,\"pubkey\":\"0000...0000\",\"tags\":[]}"
+     ]
+   }
+   ```
+
+   ```json
+   {
+     "id": "sign-test-1",
+     "result": "{\"id\":\"3f9a...\",\"pubkey\":\"79be...\",\"created_at\":1760000000,\"kind\":1,\"tags\":[],\"content\":\"hello\",\"sig\":\"c2d4...\"}"
+   }
+   ```
+
+   A refused or failed request comes back as `{"id": "sign-test-1", "error":
+   "<message>"}` with no `result`. Over a relay the same `id`/`method`/`params`
+   object travels NIP-44 encrypted inside a NIP-46 kind 24133 event.
+
+3. Run `heartwoodd` (below), then take the bunker URI from
+   `<data-dir>/bunker-uri.txt`. It has the form
+   `bunker://<master pubkey hex>?relay=<url>&relay=<url>`. For a per-client URI
+   that carries a connect secret and its own policy, create a slot and fetch its
+   URI from the management API:
+
+   ```bash
+   TOKEN=$(sudo cat /var/lib/heartwood/api-token)   # unless you set HEARTWOOD_API_TOKEN
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+        -d '{"label":"my client"}' http://127.0.0.1:3100/api/slots/0
+   curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:3100/api/slots/0/0/uri
+   # {"bunker_uri":"bunker://..."}
+   ```
+
+4. Paste the `bunker://` URI into a NIP-46 client. Requests outside an installed
+   policy appear on the OLED and need a button hold.
+
+To run WiFi-standalone instead of using a Pi, stage a network config with
+`mode="wifi"`, an SSID and a relay list, either through Sapwood or over USB with
+`node scripts/net-config.mjs --port /dev/ttyACM0 --set-config net.json` (the file
+holds `{ ssid, password, relays, mode }`; the board shows a card to confirm, and
+a wifi save reboots it).
+
+### Run heartwoodd
+
+`heartwoodd` is the Pi-side daemon. There is no unit file in this repository:
+run it directly or under a unit of your own naming (the `<heartwood-service>`
+placeholder above stands for that unit). It restarts itself by exiting on
+`POST /api/daemon/restart`, so run it under a supervisor such as systemd.
+
+```bash
+export HEARTWOOD_BUNKER_SECRET=<64 hex chars or nsec>   # relay-layer transport identity, Hard mode
+export HEARTWOOD_BRIDGE_SECRET=<64 hex chars>           # printed by `provision`/`generate --gen-bridge-secret`
+heartwoodd --port /dev/ttyACM0 --relays wss://relay.damus.io,wss://nos.lol
+```
+
+Secrets are read from the environment, not argv, so they stay out of
+`/proc/<pid>/cmdline`:
+
+| Variable | Flag | Purpose |
+|----------|------|---------|
+| `HEARTWOOD_BUNKER_SECRET` | `--bunker-secret` | Relay-layer transport key (nsec or hex). Required in Hard mode; Soft mode generates an ephemeral one if omitted. It holds no signing authority. |
+| `HEARTWOOD_BRIDGE_SECRET` | `--bridge-secret` | 64-hex session secret that must match the device's stored bridge secret |
+| `HEARTWOOD_API_TOKEN` | `--api-token` | Bearer token for `/api/*`. If unset, one is generated into `<data-dir>/api-token` (mode 0600) |
+| `HEARTWOOD_PIN` | `--pin` | Boot PIN (4-8 digits), sent before session auth, only if the device has one |
+
+Other flags and their defaults: `--mode auto|hard|soft` (`auto` probes the
+serial port and falls back to Soft mode), `--port /dev/ttyACM0`, `--baud 115200`,
+`--data-dir /var/lib/heartwood`, `--relays wss://relay.damus.io,wss://nos.lol`,
+`--slot 0` (master whose URI goes into `bunker-uri.txt`), `--api-port 3100`,
+`--bind 127.0.0.1`, `--sapwood-dir <path>` (serve Sapwood same-origin), `--cors`
+(off), and the one-shot `--vault-enable` / `--vault-disable`. The API is plain
+HTTP, so keep it on loopback and reach it through an SSH tunnel or a TLS proxy.
+
+Management API on `:3100` (bearer token required except where noted):
+
+| Route | Purpose |
+|-------|---------|
+| `GET /api/info` | Tier, locked state, relays, uptime (no token) |
+| `GET /api/logs` | WebSocket log stream; token as `?token=` |
+| `GET /api/status` | Masters and daemon summary |
+| `POST /api/masters`, `DELETE /api/masters/{slot}` | Add or remove a master |
+| `GET`/`POST /api/slots/{master}` | List or create connection slots (`{"label": ...}`) |
+| `PUT`/`DELETE /api/slots/{master}/{index}` | Update (label, policy) or revoke a slot |
+| `GET /api/slots/{master}/{index}/uri` | `{"bunker_uri": ...}` for that slot |
+| `GET /api/vault/status`, `POST /api/vault/enable`, `POST /api/vault/disable`, `GET /api/vault/export` | At-rest vault key |
+| `POST /api/unlock`, `POST /api/lock` | Soft mode keystore unlock and lock |
+| `GET /api/approvals`, `POST /api/approvals/{id}` | Soft mode approval queue (`{"action":"approve"\|"deny"}`) |
+| `GET /api/backup`, `POST /api/backup/export`, `POST /api/backup/import`, `GET /api/backup/status`, `PUT /api/backup/passphrase` | Encrypted backup of slots and policies |
+| `POST /api/device/factory-reset`, `POST /api/device/ota` | Device operations |
+| `POST /api/daemon/restart` | Exit so the supervisor restarts the daemon |
+
+## Frame protocol
+
+Every serial exchange between the device and a host tool is one frame
+(`common/src/frame.rs`, constants in `common/src/types.rs`):
+
+| Field | Size | Value |
+|-------|------|-------|
+| Magic | 2 bytes | `0x48 0x57` ("HW") |
+| Type | 1 byte | see below |
+| Length | 2 bytes | payload length, unsigned, big-endian; at most 32768 |
+| Payload | `length` bytes | type-specific, usually JSON |
+| CRC32 | 4 bytes | big-endian; standard CRC-32 (IEEE 802.3, as in zlib) over type, length and payload, not the magic |
+
+Common type codes (the full list, with payload layouts, is in `common/src/types.rs`):
+
+| Code | Name | Direction |
+|------|------|-----------|
+| `0x01` | `PROVISION` | host to device |
+| `0x02` / `0x03` | `NIP46_REQUEST` / `NIP46_RESPONSE` (plaintext, refused once a bridge session is authenticated) | host to device / reply |
+| `0x05` / `0x07` | `PROVISION_LIST` / `PROVISION_LIST_RESPONSE` | host to device / reply |
+| `0x06` / `0x15` | `ACK` / `NACK` | device to host |
+| `0x10` / `0x11` | `ENCRYPTED_REQUEST` / `ENCRYPTED_RESPONSE` (NIP-44 ciphertext; the Pi only relays these) | host to device / reply |
+| `0x21` / `0x22` | `SESSION_AUTH` / `SESSION_ACK` | host to device / reply |
+| `0x30`-`0x32` | `OTA_BEGIN` / `OTA_CHUNK` / `OTA_FINISH` | host to device |
+| `0x33` | `OTA_STATUS` | device to host |
+| `0x34` / `0x35` | `SIGN_ENVELOPE` / `SIGN_ENVELOPE_RESPONSE` | host to device / reply |
+| `0x40`-`0x49` | Connection slot create, list, update, revoke and URI | host to device / reply |
+| `0x54` | `SET_NET_CONFIG` | host to device |
+| `0x59` / `0x5A` | `FIRMWARE_INFO` / `FIRMWARE_INFO_RESPONSE` | host to device / reply |
 
 ## Test vector
 
@@ -292,6 +539,12 @@ heartwoodd/              Pi-side daemon (formerly bridge/)
 ota/                     Pi-side serial OTA tool
   src/
     main.rs             Chunked firmware upload with SHA-256 verification
+ota-sign/                Release-key tool: keygen / sign / verify for firmware images
+  src/
+    main.rs             Shares common/src/ota_sign.rs with the device verifier
+esp8266-firmware/        Bare-metal USB-tethered signer for the ESP8266
+                        (untested on hardware; see FLASHING.md and NOTES.md)
+ui-preview/              Host renderer for the device screens (shares firmware/src/layout.rs)
 scripts/
   setup-hsm.py          Interactive provisioning and bridge-start helper
   git-hooks/            Pre-commit secret scanner (64-hex + nsec1 detection)
@@ -329,7 +582,7 @@ docs/
 - [x] Per-request child key derivation with Heartwood extension field
 - [x] Test harness CLI (`sign-test/`) for end-to-end validation
 - [x] Flash and verify end-to-end signing flow on hardware (2026-04-03)
-- [x] Pi-side relay bridge (`bridge/`) — NIP-46 over Nostr relays ←→ NIP-44 ←→ serial ←→ ESP32
+- [x] Pi-side relay bridge (`heartwoodd/`): NIP-46 over Nostr relays ←→ NIP-44 ←→ serial ←→ ESP32
 
 ### Phase 4 — Full NIP-46 HSM *(shipped)*
 
@@ -339,7 +592,7 @@ docs/
 - [x] NIP-04 legacy on-device (AES-256-CBC)
 - [x] Zero-trust Pi transport (ESP32 decrypts inbound 0x10 frames, Pi only sees ciphertext)
 - [x] Bridge session authentication (shared secret, constant-time comparison)
-- [x] Client approval policies (per-master, per-client, RAM-only, pushed from bridge)
+- [x] Client approval policies (per-master, per-client): stored with each connection slot in NVS (`firmware/src/policy.rs`), so they survive a reboot. Legacy slots keep first-sign TOFU; v2 slots carry an exact method and event-kind policy installed by the authenticated operator (Sapwood, or the `heartwoodd` slot API), and fail closed outside it
 - [x] Policy engine (auto-approve / OLED-notify / button-required tiers)
 - [x] NIP-46 core methods plus Heartwood extension dispatch (proof generation/verification currently return explicit `not yet implemented` errors)
 - [x] Multi-master OLED UX (boot screen, bridge status, master labels, auto-approve flash)
@@ -370,7 +623,7 @@ docs/
 - [x] Bridge routes NIP-46 traffic to the real master pubkey (no Pi-side bunker identity masquerade)
 - [x] Pi-side `bunker_keys` demoted to ephemeral relay-layer transport identity with no signing authority
 - [x] `EventBuilder::sign_with_keys` replaced with device round-trip in the response path
-- [x] 1.5 MB OTA partition slots (up from 896 KB) — accommodates current firmware size with 50% headroom
+- [x] 2 MB A/B OTA slots on the Heltec boards (`firmware/partitions.csv`). 4 MB boards (T-Display, C6) use a single 3 MB slot with no serial OTA (`firmware/partitions-4mb.csv`)
 - [ ] Dedicated on-device transport key distinct from user masters
 - [ ] NIP-46 transport architecture spec contribution
 

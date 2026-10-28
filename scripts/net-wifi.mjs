@@ -7,8 +7,8 @@
 // ACK. net-mode.mjs already covered the mode switch; this covers the rest of
 // the same frame, which until now only existed as hand-written one-offs.
 //
-// A fallback is not a nicety. `select_wifi_candidate` rotates
-// `wifi_candidate_idx` on every failed join, and with one configured network
+// A fallback is not a nicety. `WifiRetry` advances through the candidate
+// list on every failed join, and with one configured network
 // that rotation re-selects the same AP for ever — so a single wedged access
 // point is a permanent outage with nothing on the OLED but "WiFi unavailable".
 // Diagnosed on the bench 2026-09-07: the board could see its own AP in a 0x55

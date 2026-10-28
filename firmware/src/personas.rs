@@ -336,6 +336,20 @@ pub fn find_by_pubkey(personas: &[LoadedPersona], pubkey: &[u8; 32]) -> Option<u
     personas.iter().position(|p| &p.pubkey == pubkey)
 }
 
+/// The registry as the next [`add`] finds it, for the setup hold's
+/// save-room check: the count, whether the count blob exists, and the stored
+/// length of the chunk that add rewrites. Read-only. `None` when any of it
+/// cannot be read (the count blob's presence or value, or the chunk's
+/// length): no guess at that state is safe, since a wrong one can only
+/// understate the rewrite, and `add` reads the same state anyway. The check
+/// then refuses a press that would register a name.
+pub fn registry_tail(nvs: &EspNvs<NvsDefault>) -> Option<heartwood_common::owner_pairing::RegistryTail> {
+    let count_stored = packed_format(nvs).ok()?;
+    let count = if count_stored { read_count_strict(nvs).ok()? } else { 0 };
+    let chunk_len = nvs.blob_len(&chunk_key(chunk_index(count))).ok()?;
+    Some(heartwood_common::owner_pairing::RegistryTail { count, count_stored, chunk_len })
+}
+
 /// Whether the registry (and the NVS partition behind it) can take another
 /// persona. `Err` carries the actionable refusal — the "storage full" NACK
 /// text the design doc requires — so callers can pre-check before deriving.
@@ -350,6 +364,34 @@ pub fn capacity_check(nvs: &EspNvs<NvsDefault>) -> Result<(), &'static str> {
         return Err(STORAGE_FULL);
     }
     Ok(())
+}
+
+/// How many more personas, up to `wanted`, `add` would register one after
+/// another: the count cap, then the growth gate on each name's chunk with a
+/// full-size entry, as [`capacity_check`] judges one (`nvs::growth_run`).
+/// The pre-card check for a press that registers several names, so the
+/// second cannot pass the card on the first's room and fail after the hold.
+/// Stops at a chunk whose length cannot be read.
+pub fn registrations_that_fit(nvs: &EspNvs<NvsDefault>, wanted: usize) -> usize {
+    let count = read_count(nvs);
+    let room = usize::from(MAX_PERSONAS.saturating_sub(count)).min(wanted);
+    let mut steps = Vec::with_capacity(room);
+    // The chunk the previous name grew, and the length it left it at.
+    let mut previous: Option<(u8, usize)> = None;
+    for entry in (count..MAX_PERSONAS).take(room) {
+        let chunk = chunk_index(entry);
+        let old = match previous {
+            Some((grown, len)) if grown == chunk => Some(len),
+            _ => match nvs.blob_len(&chunk_key(chunk)) {
+                Ok(len) => len,
+                Err(_) => break,
+            },
+        };
+        let new = old.unwrap_or(0) + MAX_ENTRY_LEN;
+        steps.push((old, new));
+        previous = Some((chunk, new));
+    }
+    crate::nvs::growth_run(nvs, &steps)
 }
 
 /// Refusal when a persona would leave too little NVS room to rewrite the

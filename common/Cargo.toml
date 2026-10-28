@@ -6,7 +6,9 @@ description = "Shared crypto for heartwood-esp32 — derivation, encoding, types
 license = "MIT"
 
 [dependencies]
-k256 = { version = "0.14", default-features = false, features = ["schnorr", "arithmetic", "ecdh"], optional = true }
+k256 = { version = "=0.14.0", default-features = false, features = ["schnorr", "arithmetic", "ecdh"], optional = true }
+# Security floor for the k256/elliptic-curve graph (RUSTSEC-2026-0387).
+crypto-bigint = { version = ">=0.7.6, <0.8", default-features = false, optional = true }
 secp256k1 = { version = "0.29", default-features = false, features = ["alloc"], optional = true }
 hmac = { version = "0.12", default-features = false }
 # `compress` exposes sha2's bare compression function, which common/src/kdf.rs
@@ -48,7 +50,7 @@ ledger_secure_sdk_sys = { version = "1.16", optional = true }
 [dev-dependencies]
 # Executes the actual private firmware journal codec; no RNG/default features.
 chacha20poly1305 = { version = "=0.10.1", default-features = false }
-vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "e6985dd9583207853ffa9f5224b33e05d5094010", default-features = false }
+vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "fa3776ea5dbd929c8598fe28e2d3ad3fba247ebe", default-features = false }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -60,7 +62,7 @@ compact-hashes = ["sha2/force-soft-compact"]
 # Host fault test of the actual firmware boot-crypto guard. Bench only.
 allocation-crypto-selfcheck-fail = []
 default = ["k256-backend"]
-k256-backend = ["dep:k256"]
+k256-backend = ["dep:k256", "dep:crypto-bigint"]
 secp256k1-backend = ["dep:secp256k1"]
 # Curve ops on the Ledger secure element — the heartwood-ledger app's backend.
 # Mutually exclusive with the other two backends, like they are with each

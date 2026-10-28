@@ -932,6 +932,7 @@ dependencies = [
  "bech32 0.11.1",
  "chacha20",
  "crc32fast",
+ "crypto-bigint",
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "k256",

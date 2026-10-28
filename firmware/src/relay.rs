@@ -4145,10 +4145,11 @@ fn poll_usb_frame(
             } else {
             let stored = crate::identity_meta::handle_frame(&frame.payload, ctx.masters, ctx.nvs);
             let ok = stored.is_ok();
-            match &stored {
-                Ok(()) => crate::protocol::write_frame(usb, FRAME_TYPE_ACK, &[]),
-                Err(reason) => crate::protocol::write_frame(usb, FRAME_TYPE_NACK, reason.as_bytes()),
-            }
+            crate::protocol::write_frame(
+                usb,
+                if ok { FRAME_TYPE_ACK } else { FRAME_TYPE_NACK },
+                stored.as_ref().err().map_or(&[][..], |reason| reason.as_bytes()),
+            );
             // Not over a card or a held result: the identity card would hide
             // the words the owner is reading.
             if ok && ctx.masters.len() == 1 && ctx.display_on && !approval_card_open(ctx) {
@@ -9070,6 +9071,68 @@ fn persist_revocation(ctx: &mut SignCtx, master_slot: u8, action: &str) -> Resul
     outcome.describe(action)
 }
 
+/// `revoke_client` for a pairing RAM no longer has. If flash still has it, an
+/// earlier revocation's save failed (`RevocationSave::OnlyUntilRestart`), and
+/// repeating the revocation saves it now. The credential is checked against
+/// the stored copy, so a stale screen cannot confirm some other pairing's
+/// revocation. Otherwise "no such slot", as before. Kept out of
+/// `dispatch_mgmt`, which is already as large as the Xtensa debug build copes
+/// with.
+#[inline(never)]
+fn save_unsaved_client_revocation(
+    ctx: &mut SignCtx,
+    req: &serde_json::Value,
+    master_slot: u8,
+    slot_index: u8,
+) -> Result<serde_json::Value, String> {
+    let stored = ctx
+        .policy_engine
+        .unsaved_slot_revocation(ctx.nvs, master_slot, slot_index)
+        .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+    let secret_fingerprint = require_expected_slot_fingerprint(req, &stored)?;
+    persist_revocation(ctx, master_slot, "client revocation")?;
+    log::info!("[relay] mgmt: saved the earlier revocation of client slot {slot_index} (operator)");
+    Ok(serde_json::json!({
+        "slot_index": slot_index,
+        "secret_fingerprint": secret_fingerprint,
+        "revoked": true,
+    }))
+}
+
+/// `remove_authorized_pubkey` for a key the pairing no longer has in RAM. If
+/// the stored copy of the same pairing still has it, an earlier removal's
+/// save failed, and repeating the removal saves it now; otherwise
+/// `authorized_pubkey_not_found`, as before.
+#[inline(never)]
+fn save_unsaved_key_removal(
+    ctx: &mut SignCtx,
+    master_slot: u8,
+    slot_index: u8,
+    pubkey: &str,
+    secret_fingerprint: String,
+) -> Result<serde_json::Value, String> {
+    if !ctx.policy_engine.unsaved_key_removal(ctx.nvs, master_slot, slot_index, pubkey) {
+        return Err("authorized_pubkey_not_found".into());
+    }
+    persist_revocation(ctx, master_slot, "authorised client-key removal")?;
+    Ok(serde_json::json!({
+        "slot_index": slot_index,
+        "pubkey": pubkey,
+        "secret_fingerprint": secret_fingerprint,
+        "removed": true,
+    }))
+}
+
+/// The reply when a nostrconnect pairing's save failed and was rolled back.
+#[inline(never)]
+fn nostrconnect_not_applied(why: crate::policy::SlotSaveError) -> String {
+    if why == crate::policy::SlotSaveError::NoRoom {
+        format!("{}; pairing was not applied", crate::policy::PAIRING_STORAGE_FULL)
+    } else {
+        "could not persist nostrconnect policy; pairing was not applied".into()
+    }
+}
+
 fn finish_slot_mutation(
     ctx: &mut SignCtx,
     persisted: Result<(), crate::policy::SlotSaveError>,
@@ -10254,11 +10317,7 @@ fn dispatch_mgmt(
                     true
                 };
                 return if slot_rollback_durable && pin_rollback_durable {
-                    Err(if why == crate::policy::SlotSaveError::NoRoom {
-                        format!("{}; pairing was not applied", crate::policy::PAIRING_STORAGE_FULL)
-                    } else {
-                        "could not persist nostrconnect policy; pairing was not applied".into()
-                    })
+                    Err(nostrconnect_not_applied(why))
                 } else {
                     Err("fatal storage error: could not restore prior pairing state; take the device offline for USB recovery".into())
                 };
@@ -10478,28 +10537,8 @@ fn dispatch_mgmt(
                 req.pointer("/params/slot_index")
                     .and_then(|v| v.as_u64())
                     .ok_or("revoke_client requires params.slot_index")? as u8;
-            let live = ctx
-                .policy_engine
-                .list_slots(master_slot)
-                .iter()
-                .any(|slot| slot.slot_index == slot_index);
-            if !live {
-                // Revoked in RAM by an earlier request whose save failed, and
-                // still on flash: repeating the revocation saves it. The
-                // credential is checked against the stored copy, so a stale
-                // screen cannot confirm some other pairing's revocation.
-                let stored = ctx
-                    .policy_engine
-                    .unsaved_slot_revocation(ctx.nvs, master_slot, slot_index)
-                    .ok_or_else(|| format!("no such slot: {slot_index}"))?;
-                let secret_fingerprint = require_expected_slot_fingerprint(req, &stored)?;
-                persist_revocation(ctx, master_slot, "client revocation")?;
-                log::info!("[relay] mgmt: saved the earlier revocation of client slot {slot_index} (operator)");
-                return Ok(serde_json::json!({
-                    "slot_index": slot_index,
-                    "secret_fingerprint": secret_fingerprint,
-                    "revoked": true,
-                }));
+            if !ctx.policy_engine.list_slots(master_slot).iter().any(|slot| slot.slot_index == slot_index) {
+                return save_unsaved_client_revocation(ctx, req, master_slot, slot_index);
             }
             let target = ctx
                 .policy_engine
@@ -10564,21 +10603,8 @@ fn dispatch_mgmt(
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Current) => {
                     Err("current_authorized_pubkey: revoke the slot to remove its current key".into())
                 }
-                Some(heartwood_common::policy::RemoveAuthorizedPubkey::Missing)
-                    if ctx.policy_engine.unsaved_key_removal(ctx.nvs, master_slot, slot_index, pubkey) =>
-                {
-                    // Removed in RAM by an earlier request whose save failed,
-                    // and still on flash: repeating the removal saves it.
-                    persist_revocation(ctx, master_slot, "authorised client-key removal")?;
-                    Ok(serde_json::json!({
-                        "slot_index": slot_index,
-                        "pubkey": pubkey,
-                        "secret_fingerprint": secret_fingerprint,
-                        "removed": true,
-                    }))
-                }
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Missing) => {
-                    Err("authorized_pubkey_not_found".into())
+                    save_unsaved_key_removal(ctx, master_slot, slot_index, pubkey, secret_fingerprint)
                 }
                 None => Err(format!("no such slot: {slot_index}")),
             }

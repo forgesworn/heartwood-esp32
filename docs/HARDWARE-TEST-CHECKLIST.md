@@ -1080,7 +1080,7 @@ before-write held both times. Also observed (pre-existing, not ours):
   no-SoftAP + no-IPv6 (sdkconfig.defaults) took the release app from
   2,105 KB to 1,990 KB — back inside the 2 MB OTA slot with ~107 KB
   headroom. "Certificate validated" + TLS + subscribe + a relay note_list
-  all confirmed on the trimmed bundle against relay.trotters.cc.
+  all confirmed on the trimmed bundle against the board's relay 1.
 - Items 1–6, 8–12 and the no-notes half of 14: NOT YET BENCH-RUN (USB-mode
   items need the board switched to usb mode; sealing round-trip items need
   a reboot/unlock cycle with notes held).
@@ -3191,11 +3191,11 @@ pairing` first.
   raised its card (declined), so the dropped copy did not restart the minute.
   The first run, before the fix, lost the cable answer: the grant was saved,
   but no reply arrived (see below).
-- Relay note for this run: relay.trotters.cc started refusing every write
+- Relay note for this run: the board's relay 1 started refusing every write
   that was not from its operator (`blocked: this relay accepts writes only
   from its operator`). The re-run went over wss://relay.primal.net, which is
   now the board's first relay (net config revision 10: primal, then
-  trotters).
+  the old relay 1).
 - 13 PASS, with four cards, not three. Behind three 30 s sign cards, the last
   one closed at 88 s, still inside the 90 s limit, so the bundle opened its
   own card. Behind four, it expired in the queue: the reply was `timeout`

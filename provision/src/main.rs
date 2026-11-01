@@ -308,7 +308,7 @@ fn derive_root_secret(mnemonic: &str, passphrase: &str) -> Result<[u8; 32], Stri
 
     let seed = zeroize::Zeroizing::new(parsed.to_seed(passphrase));
 
-    let master = bip32::XPrv::new(*seed)
+    let master = bip32::XPrv::new(&*seed)
         .map_err(|e| format!("BIP-32 master key failed: {e}"))?;
 
     let path: bip32::DerivationPath = MNEMONIC_PATH

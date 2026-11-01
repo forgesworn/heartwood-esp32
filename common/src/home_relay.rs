@@ -7,7 +7,7 @@
 //! sessions the secondary might happen to land back on relay 1; on a
 //! T-Display (no PSRAM) the heap rarely spares a second TLS session, so the
 //! board sits on one relay that may not be relay 1 for a day. Field case,
-//! 2026-10-08/09: a board moved off relay.trotters.cc at 21:51 and served
+//! 2026-10-08/09: a board moved off relay 1 at 21:51 and served
 //! relay.primal.net alone all night, while a client that knows only relay 1
 //! (a single-relay bunker URI) could not reach it at all.
 //!

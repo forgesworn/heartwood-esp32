@@ -258,7 +258,7 @@ self-check is inert, a silently dropped subscription now lasts up to 2 min.
 
 Relay 1 is the home relay (2026-10-09, checklist section 35 item 11, NOT YET
 BENCH-RUN). The rotation only ever moved on, so a board that left relay 1
-stayed away: the soak T-Display left relay.trotters.cc at 21:51 on
+stayed away: the soak T-Display left its relay 1 at 21:51 on
 2026-10-08 and served relay.primal.net alone all night (its heap rarely
 spares a second TLS session), while a client that knows only relay 1 (the
 Archipelago link) could not reach it. `home_relay::HomeReturn` (pure,

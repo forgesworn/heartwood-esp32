@@ -90,8 +90,8 @@ fn ecdh_shared_x(
 ) -> Result<[u8; 32], &'static str> {
     use k256::{
         ecdh::diffie_hellman,
-        elliptic_curve::{sec1::FromEncodedPoint, CurveArithmetic},
-        EncodedPoint, SecretKey,
+        elliptic_curve::{sec1::FromSec1Point, CurveArithmetic},
+        Sec1Point, SecretKey,
     };
 
     let sk = SecretKey::from_slice(our_secret).map_err(|_| "invalid secret key")?;
@@ -99,11 +99,11 @@ fn ecdh_shared_x(
     let mut compressed = [0u8; 33];
     compressed[0] = 0x02; // even-y prefix
     compressed[1..].copy_from_slice(peer_pubkey);
-    let encoded = EncodedPoint::from_bytes(&compressed)
+    let encoded = Sec1Point::from_bytes(&compressed)
         .map_err(|_| "invalid peer pubkey encoding")?;
 
     let pk = Option::<<k256::Secp256k1 as CurveArithmetic>::AffinePoint>::from(
-        k256::AffinePoint::from_encoded_point(&encoded),
+        k256::AffinePoint::from_sec1_point(&encoded),
     )
     .ok_or("invalid peer pubkey point")?;
 

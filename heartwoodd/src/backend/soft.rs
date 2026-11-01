@@ -66,6 +66,7 @@ struct UnlockedState {
 // ---------------------------------------------------------------------------
 
 /// A NIP-46 request that requires manual approval before it can be processed.
+#[derive(Clone)]
 pub struct PendingApproval {
     pub id: String,
     pub method: String,
@@ -239,7 +240,7 @@ impl SoftBackend {
                 let event_id_hex = hex_encode(&event_id);
 
                 let signing_key =
-                    k256::schnorr::SigningKey::from_bytes(&secret_bytes)
+                    k256::schnorr::SigningKey::from_bytes((&secret_bytes).into())
                         .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
                 // BIP340 over the 32-byte event id (see sign_envelope).
                 let sig: k256::schnorr::Signature = signing_key
@@ -362,6 +363,46 @@ impl SoftBackend {
         None
     }
 
+    /// Return a refusal to the original NIP-46 request, without dispatching
+    /// the denied method. The queue ID is local; the encrypted request carries
+    /// the wire correlation ID that the client is waiting for.
+    fn denial_envelope(&self, approval: &PendingApproval) -> Result<String, BackendError> {
+        let master_secret = {
+            let guard = self.state_read();
+            let state = guard.as_ref().ok_or(BackendError::Locked)?;
+            let master = Self::find_master_by_pubkey(&state.keystore, &approval.master_pubkey)
+                .ok_or_else(|| BackendError::Internal("denial master no longer exists".into()))?;
+            if master.slot != approval.master_slot {
+                return Err(BackendError::Internal("denial master slot changed".into()));
+            }
+            Zeroizing::new(hex_to_32(&master.secret_key)
+                .map_err(|e| BackendError::Internal(format!("denial master secret: {e}")))?)
+        };
+        let key = nip44::get_conversation_key(&master_secret, &approval.client_pubkey)
+            .map_err(|e| BackendError::Internal(format!("denial conversation key: {e}")))?;
+        let plaintext = nip44::decrypt(&key, &approval.ciphertext)
+            .map_err(|e| BackendError::Internal(format!("denial request decrypt: {e}")))?;
+        let request = nip46::parse_request(plaintext.as_bytes())
+            .map_err(|e| BackendError::Internal(format!("denial request parse: {e}")))?;
+        if request.method != approval.method {
+            return Err(BackendError::Internal("denial method binding changed".into()));
+        }
+        let response = nip46::build_error_response(&request.id, -32000, "user denied")
+            .map_err(|e| BackendError::Internal(format!("build denial response: {e}")))?;
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|e| BackendError::Internal(format!("denial nonce generation: {e}")))?;
+        let ciphertext = nip44::encrypt(&key, &response, &nonce)
+            .map_err(|e| BackendError::Internal(format!("denial response encrypt: {e}")))?;
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.wrap_in_envelope(
+            &approval.master_pubkey, &approval.client_pubkey, created_at, &ciphertext,
+        )
+    }
+
     /// Build and sign a kind:24133 envelope event wrapping the given NIP-44
     /// ciphertext. Used by handle_encrypted_request to return a signed event
     /// instead of raw ciphertext.
@@ -396,7 +437,7 @@ impl SoftBackend {
         let event_id = compute_event_id(&unsigned);
         let event_id_hex = hex_encode(&event_id);
 
-        let signing_key = k256::schnorr::SigningKey::from_bytes(&secret_bytes)
+        let signing_key = k256::schnorr::SigningKey::from_bytes((&secret_bytes).into())
             .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
         // BIP340 over the 32-byte event id itself. Signer::sign would prehash
         // the id with SHA-256 first, producing signatures no Nostr client
@@ -579,7 +620,7 @@ impl SigningBackend for SoftBackend {
         let event_id = compute_event_id(&unsigned);
         let event_id_hex = hex_encode(&event_id);
 
-        let signing_key = k256::schnorr::SigningKey::from_bytes(&secret_bytes)
+        let signing_key = k256::schnorr::SigningKey::from_bytes((&secret_bytes).into())
             .map_err(|e| BackendError::Internal(format!("signing key: {e}")))?;
         // BIP340 over the 32-byte event id itself. Signer::sign would prehash
         // the id with SHA-256 first, producing signatures no Nostr client
@@ -970,12 +1011,48 @@ impl SigningBackend for SoftBackend {
     }
 
     fn deny_request(&self, id: &str) -> Result<(), BackendError> {
-        let mut approvals = self.approvals_write();
-        if approvals.remove(id).is_some() {
-            Ok(())
-        } else {
-            Err(BackendError::Internal(format!("approval {id} not found")))
+        let approval = {
+            let mut approvals = self.approvals_write();
+            let approval = approvals
+                .get(id)
+                .cloned()
+                .ok_or_else(|| BackendError::Internal(format!("approval {id} not found")))?;
+            if approval.created_at.elapsed().as_secs() >= APPROVAL_TTL_SECS {
+                approvals.remove(id);
+                return Err(BackendError::Internal(format!("approval {id} expired")));
+            }
+            approval
+        };
+        let tx = self
+            .response_tx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| BackendError::Internal("denial relay publisher is not wired".into()))?;
+        if tx.is_closed() {
+            return Err(BackendError::Internal("denial relay publisher is closed".into()));
         }
+        let signed_event_json = self.denial_envelope(&approval)?;
+
+        // Sending to this unbounded channel is synchronous. Hold the queue
+        // lock only for that send and removal, so concurrent approve/deny can
+        // neither duplicate the answer nor consume it after a failed send.
+        let mut approvals = self.approvals_write();
+        let current = approvals
+            .get(id)
+            .ok_or_else(|| BackendError::Internal(format!("approval {id} not found")))?;
+        if current.created_at != approval.created_at
+            || current.master_pubkey != approval.master_pubkey
+            || current.client_pubkey != approval.client_pubkey
+            || current.ciphertext != approval.ciphertext
+            || current.created_at.elapsed().as_secs() >= APPROVAL_TTL_SECS
+        {
+            return Err(BackendError::Internal("denial approval changed or expired".into()));
+        }
+        tx.send(signed_event_json)
+            .map_err(|_| BackendError::Internal("denial relay publisher closed before send".into()))?;
+        approvals.remove(id);
+        Ok(())
     }
 
     // -- Device management ---------------------------------------------------
@@ -1415,7 +1492,7 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
 
 /// Derive the x-only public key bytes from a secret key.
 fn derive_x_only_bytes(secret_key_bytes: &[u8; 32]) -> Result<[u8; 32], String> {
-    let signing_key = k256::schnorr::SigningKey::from_bytes(secret_key_bytes.as_ref())
+    let signing_key = k256::schnorr::SigningKey::from_bytes(secret_key_bytes.into())
         .map_err(|e| format!("signing key: {e}"))?;
     let vk = signing_key.verifying_key();
     let field_bytes = vk.to_bytes();
@@ -1702,9 +1779,11 @@ mod tests {
                 .map(|i| u8::from_str_radix(&sig_hex[i..i + 2], 16).unwrap())
                 .collect();
             let sig = k256::schnorr::Signature::try_from(sig_bytes.as_slice()).unwrap();
-            let vk = k256::schnorr::VerifyingKey::from_bytes(&master_pubkey).unwrap();
+            let vk = k256::schnorr::VerifyingKey::from_bytes((&master_pubkey).into()).unwrap();
             // Nostr clients verify BIP340 over the raw 32-byte event id.
             vk.verify_prehash(&id, &sig).unwrap();
+            // Independent Nostr/libsecp256k1 parser verifies the event id and wire signature.
+            nostr::event::Event::from_json(event_json).unwrap().verify().unwrap();
         };
 
         // Relay envelope.
@@ -1883,6 +1962,331 @@ mod tests {
 
         // The queue is empty: approval did not re-queue the request.
         assert!(backend.list_approvals().is_empty());
+    }
+
+    /// Queue a real encrypted request, returning the local approval UUID.
+    /// Its wire ID is intentionally different from that UUID.
+    fn queue_manual_sign(
+        backend: &SoftBackend,
+        master_pubkey: &[u8; 32],
+        master_hex: &str,
+        client_secret: &[u8; 32],
+        wire_id: &str,
+    ) -> String {
+        let client_pubkey = hex_to_32(&derive_pubkey_hex(client_secret).unwrap()).unwrap();
+        let key = nip44::get_conversation_key(client_secret, master_pubkey).unwrap();
+        let event = serde_json::json!({
+            "kind": 1, "content": wire_id, "tags": [],
+            "created_at": 1_700_000_000u64, "pubkey": master_hex,
+        });
+        let req = serde_json::json!({
+            "id": wire_id, "method": "sign_event", "params": [event.to_string()],
+        });
+        let ciphertext = nip44::encrypt(&key, &req.to_string(), &[7u8; 32]).unwrap();
+        let err = backend
+            .handle_encrypted_request(master_pubkey, &client_pubkey, 1_700_000_001, &ciphertext)
+            .unwrap_err();
+        match err {
+            BackendError::PendingApproval(id) => id,
+            other => panic!("expected queued approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn denied_request_returns_one_signed_encrypted_error_for_its_wire_id() {
+        use k256::schnorr::signature::hazmat::PrehashVerifier;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+        let master = backend.create_master("denial", 12).unwrap();
+        let master_hex = master["pubkey"].as_str().unwrap();
+        let master_pubkey = hex_to_32(master_hex).unwrap();
+        let other_master = backend.create_master("other-denial", 12).unwrap();
+        let other_master_hex = other_master["pubkey"].as_str().unwrap();
+        let other_master_pubkey = hex_to_32(other_master_hex).unwrap();
+        let denied_client = [0x42u8; 32];
+        let other_client = [0x43u8; 32];
+        let denied_id = queue_manual_sign(
+            &backend, &master_pubkey, master_hex, &denied_client, "wire-denied",
+        );
+        let other_id = queue_manual_sign(
+            &backend, &other_master_pubkey, other_master_hex, &other_client, "wire-other",
+        );
+        assert_ne!(denied_id, "wire-denied");
+        assert_ne!(denied_id, other_id);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        backend.set_response_sender(tx);
+        backend.deny_request(&denied_id).unwrap();
+        let envelope = rx.try_recv().expect("denial must reach the relay publisher");
+        let signed: SignedEvent = serde_json::from_str(&envelope).unwrap();
+        assert_eq!(signed.kind, 24133);
+        assert_eq!(signed.pubkey, master_hex);
+        assert_eq!(signed.tags, vec![vec!["p".to_string(), derive_pubkey_hex(&denied_client).unwrap()]]);
+        let unsigned = UnsignedEvent {
+            pubkey: signed.pubkey.clone(), created_at: signed.created_at,
+            kind: signed.kind, tags: signed.tags.clone(), content: signed.content.clone(),
+        };
+        assert_eq!(signed.id, hex_encode(&compute_event_id(&unsigned)));
+        let sig_bytes: Vec<u8> = (0..signed.sig.len()).step_by(2)
+            .map(|i| u8::from_str_radix(&signed.sig[i..i + 2], 16).unwrap())
+            .collect();
+        let sig = k256::schnorr::Signature::try_from(sig_bytes.as_slice()).unwrap();
+        let vk = k256::schnorr::VerifyingKey::from_slice(&master_pubkey).unwrap();
+        vk.verify_prehash(&hex_to_32(&signed.id).unwrap(), &sig).unwrap();
+        // Cross-check the emitted denial envelope with the client verifier.
+        nostr::event::Event::from_json(&envelope).unwrap().verify().unwrap();
+        let key = nip44::get_conversation_key(&denied_client, &master_pubkey).unwrap();
+        let response: nip46::Nip46Response =
+            serde_json::from_str(&nip44::decrypt(&key, &signed.content).unwrap()).unwrap();
+        assert_eq!(response.id, "wire-denied");
+        assert_eq!(response.result, None, "denial must not sign the requested event");
+        assert!(response.error.as_deref().is_some_and(|error| !error.is_empty()));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(backend.deny_request(&denied_id).is_err(), "denial must be once-only");
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        // A second client's pending request remains independent and can still
+        // be approved through the unchanged path.
+        backend.approve_request(&other_id).unwrap();
+        let other_envelope: SignedEvent = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(other_envelope.pubkey, other_master_hex);
+        assert_eq!(other_envelope.tags[0][1], derive_pubkey_hex(&other_client).unwrap());
+        let other_key = nip44::get_conversation_key(&other_client, &other_master_pubkey).unwrap();
+        let other_reply: nip46::Nip46Response = serde_json::from_str(
+            &nip44::decrypt(&other_key, &other_envelope.content).unwrap(),
+        ).unwrap();
+        assert_eq!(other_reply.id, "wire-other");
+        assert!(other_reply.error.is_none());
+        assert!(other_reply.result.is_some());
+        assert!(backend.list_approvals().is_empty());
+    }
+
+    #[test]
+    fn denied_request_rejects_unknown_expired_locked_and_unavailable_publisher() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+        let master = backend.create_master("denial-errors", 12).unwrap();
+        let master_hex = master["pubkey"].as_str().unwrap();
+        let master_pubkey = hex_to_32(master_hex).unwrap();
+        let client = [0x44u8; 32];
+        let id = queue_manual_sign(&backend, &master_pubkey, master_hex, &client, "wire-errors");
+        assert!(backend.deny_request("wrong-local-id").is_err());
+        assert!(backend.deny_request(&id).is_err(), "unwired publisher must fail explicitly");
+        assert_eq!(backend.list_approvals().len(), 1);
+
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        drop(closed_rx);
+        backend.set_response_sender(closed_tx);
+        assert!(backend.deny_request(&id).is_err(), "closed publisher must fail explicitly");
+        assert_eq!(backend.list_approvals().len(), 1);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        backend.set_response_sender(tx);
+        backend.lock().unwrap();
+        assert!(matches!(backend.deny_request(&id), Err(BackendError::Locked)));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        backend.unlock("testpass").unwrap();
+        backend.deny_request(&id).unwrap();
+        assert!(rx.try_recv().is_ok());
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let stale = queue_manual_sign(&backend, &master_pubkey, master_hex, &client, "wire-stale");
+        backend.approvals_write().get_mut(&stale).unwrap().created_at =
+            Instant::now() - std::time::Duration::from_secs(APPROVAL_TTL_SECS + 1);
+        assert!(backend.deny_request(&stale).is_err(), "expired denial is not publishable");
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        // Removing a master, even if its slot is reused, cannot turn an old
+        // pending request into a response signed by the replacement identity.
+        let removed = queue_manual_sign(&backend, &master_pubkey, master_hex, &client, "wire-removed");
+        backend.remove_master(master["index"].as_u64().unwrap() as u8).unwrap();
+        let replacement = backend.create_master("replacement", 12).unwrap();
+        assert_eq!(replacement["index"], master["index"]);
+        assert!(backend.deny_request(&removed).is_err());
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// What a queued request's single answer was, read from the envelope the
+    /// relay publisher received: a signed event is an execution, an error with
+    /// no result is a denial.
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Executed,
+        Denied,
+    }
+
+    fn classify_reply(
+        client_secret: &[u8; 32],
+        master_pubkey: &[u8; 32],
+        wire_id: &str,
+        envelope: &str,
+    ) -> Outcome {
+        let reply = decrypted_reply(client_secret, master_pubkey, envelope);
+        assert_eq!(reply["id"].as_str(), Some(wire_id), "reply answers another request");
+        match (reply.get("result").filter(|r| !r.is_null()), reply.get("error").filter(|e| !e.is_null())) {
+            (Some(result), None) => {
+                let signed: SignedEvent = serde_json::from_str(result.as_str().unwrap()).unwrap();
+                assert_eq!(signed.content, wire_id, "signed something other than the queued event");
+                Outcome::Executed
+            }
+            (None, Some(_)) => Outcome::Denied,
+            _ => panic!("reply is neither a clean result nor a clean error: {reply}"),
+        }
+    }
+
+    /// A Soft backend with one master, a wired publisher and one queued
+    /// `sign_event` request from a fixed client.
+    struct RaceFixture {
+        backend: SoftBackend,
+        rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        master_pubkey: [u8; 32],
+        master_hex: String,
+        client_secret: [u8; 32],
+        _dir: TempDir,
+    }
+
+    fn backend_with_publisher() -> RaceFixture {
+        let dir = TempDir::new().unwrap();
+        let backend = make_cheap_backend(&dir);
+        let master = backend.create_master("race", 12).unwrap();
+        let master_hex = master["pubkey"].as_str().unwrap().to_string();
+        let master_pubkey = hex_to_32(&master_hex).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        backend.set_response_sender(tx);
+        RaceFixture {
+            backend, rx, master_pubkey, master_hex, client_secret: [0x45u8; 32], _dir: dir,
+        }
+    }
+
+    impl RaceFixture {
+        fn queue(&self, wire_id: &str) -> String {
+            queue_manual_sign(
+                &self.backend, &self.master_pubkey, &self.master_hex, &self.client_secret, wire_id,
+            )
+        }
+
+        fn classify(&self, wire_id: &str, envelope: &str) -> Outcome {
+            classify_reply(&self.client_secret, &self.master_pubkey, wire_id, envelope)
+        }
+    }
+
+    #[test]
+    fn approve_then_deny_of_one_request_executes_it_once_and_denial_fails_cleanly() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let mut q = backend_with_publisher();
+        let id = q.queue("wire-approve-first");
+
+        q.backend.approve_request(&id).unwrap();
+        let envelope = q.rx.try_recv().expect("approval must deliver the signed envelope");
+        assert_eq!(q.classify("wire-approve-first", &envelope), Outcome::Executed);
+
+        assert!(q.backend.deny_request(&id).is_err(), "a decided request cannot be denied");
+        assert!(matches!(q.rx.try_recv(), Err(TryRecvError::Empty)), "no denial reply may follow");
+        assert!(q.backend.approve_request(&id).is_err(), "nor approved a second time");
+        assert!(matches!(q.rx.try_recv(), Err(TryRecvError::Empty)), "nor executed again");
+        assert!(q.backend.list_approvals().is_empty());
+    }
+
+    #[test]
+    fn deny_then_approve_of_one_request_publishes_one_denial_and_executes_nothing() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let mut q = backend_with_publisher();
+        let id = q.queue("wire-deny-first");
+
+        q.backend.deny_request(&id).unwrap();
+        let envelope = q.rx.try_recv().expect("denial must reach the relay publisher");
+        assert_eq!(q.classify("wire-deny-first", &envelope), Outcome::Denied);
+
+        assert!(q.backend.approve_request(&id).is_err(), "a decided request cannot be approved");
+        assert!(matches!(q.rx.try_recv(), Err(TryRecvError::Empty)), "nothing may be signed");
+        assert!(q.backend.deny_request(&id).is_err(), "nor denied a second time");
+        assert!(matches!(q.rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(q.backend.list_approvals().is_empty());
+    }
+
+    /// Approve and deny issued at the same moment from two threads, against one
+    /// backend and one queued request, many times over. Whichever the lock
+    /// admits first wins; the other must fail and publish nothing, so every
+    /// round has exactly one reply and it matches the call that returned Ok.
+    #[test]
+    fn concurrent_approve_and_deny_of_one_request_have_exactly_one_outcome() {
+        use std::sync::Barrier;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        const ROUNDS: usize = 200;
+        let mut q = backend_with_publisher();
+        let (mut executed, mut denied) = (0usize, 0usize);
+
+        for round in 0..ROUNDS {
+            let wire_id = format!("wire-race-{round}");
+            let id = q.queue(&wire_id);
+            let barrier = Barrier::new(2);
+            // Deny does its decrypt, sign and encrypt work before it takes the
+            // queue lock, so with no head start approve would always win. Hold
+            // approve back by a swept delay (0 to 98 ms) so that both orders,
+            // and the overlap between them, are exercised. Deny takes about
+            // 3 ms on a fast host; the wide sweep keeps a slow CI runner,
+            // where it may take far longer, inside the range.
+            let approve_delay = std::time::Duration::from_micros((round as u64 % 50) * 2000);
+            let (approve, deny) = std::thread::scope(|s| {
+                // Alternate which side is spawned first so neither always
+                // reaches the barrier ahead of the other.
+                let run_approve = || {
+                    barrier.wait();
+                    std::thread::sleep(approve_delay);
+                    q.backend.approve_request(&id)
+                };
+                let run_deny = || {
+                    barrier.wait();
+                    q.backend.deny_request(&id)
+                };
+                if round % 2 == 0 {
+                    let a = s.spawn(run_approve);
+                    let d = s.spawn(run_deny);
+                    (a.join().unwrap(), d.join().unwrap())
+                } else {
+                    let d = s.spawn(run_deny);
+                    let a = s.spawn(run_approve);
+                    (a.join().unwrap(), d.join().unwrap())
+                }
+            });
+
+            assert!(
+                approve.is_ok() != deny.is_ok(),
+                "round {round}: approve {approve:?}, deny {deny:?}; exactly one may succeed",
+            );
+            let envelope = q.rx.try_recv()
+                .unwrap_or_else(|_| panic!("round {round}: the winner published nothing"));
+            assert!(
+                matches!(q.rx.try_recv(), Err(TryRecvError::Empty)),
+                "round {round}: more than one reply was published",
+            );
+            match q.classify(&wire_id, &envelope) {
+                Outcome::Executed => {
+                    assert!(approve.is_ok(), "round {round}: executed but approve reported failure");
+                    executed += 1;
+                }
+                Outcome::Denied => {
+                    assert!(deny.is_ok(), "round {round}: denied but deny reported failure");
+                    denied += 1;
+                }
+            }
+            assert!(q.backend.list_approvals().is_empty(), "round {round}: entry left queued");
+        }
+        assert_eq!(executed + denied, ROUNDS);
+        // The exact split depends on scheduling and is not pinned, but a run in
+        // which one side never won did not exercise the race at all.
+        assert!(
+            executed > 0 && denied > 0,
+            "race not exercised: {executed} executed, {denied} denied over {ROUNDS} rounds",
+        );
+        eprintln!("concurrent approve/deny: {executed} executed, {denied} denied over {ROUNDS} rounds");
     }
 
     /// Encrypt a `sign_event` request to the master from `client_secret`.

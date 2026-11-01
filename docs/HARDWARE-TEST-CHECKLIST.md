@@ -3254,7 +3254,14 @@ native-USB boards (V4, C6) were not checked.
 - If a step wedges, RESET the board; an unsaved phrase staying on screen is the
   safe failure (nothing is stored until the final hold).
 
-## 38. Relay sign-in, NIP-42 (added 2026-10-22, NOT YET BENCH-RUN)
+## 38. Relay sign-in, NIP-42 (added 2026-10-22; benched 2026-10-22, re-bench outstanding for the AUTH frame fix)
+
+Benched 2026-10-22: a T-Display flashed with this build signed through the
+gated strfry relay (allowlisted masters) and served clients on it. The
+2026-11-01 review found the sign-in went out as an `["EVENT", …]` frame, which
+strfry accepts as auth but a strictly-NIP-42 relay does not; it now goes out
+as `["AUTH", <event>]`. Re-run this section against a strict relay (a
+khatru-based one) before calling the feature proven there.
 
 The relay loop answers a relay's `["AUTH", <challenge>]` itself (no button):
 kind 22242, tags `relay` (the URL the board dialled) and `challenge`, empty

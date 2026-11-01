@@ -3322,7 +3322,7 @@ fn locked_relay_auth(
             } else {
                 match sign_auth_event(secp, unlock_sk, unlock_pk_hex.to_string(), &s.url, &challenge, wall) {
                     Ok(ev) => {
-                        ws_send_event(&mut s.tls, &ev)?;
+                        ws_send_auth(&mut s.tls, &ev)?;
                         ids.push(ev.id);
                         log::info!("[relay] locked: signing in to {} as the unlock key", relay_host(&s.url));
                     }
@@ -4118,7 +4118,7 @@ fn answer_auth(s: &mut RelaySession, raw: &[u8], ctx: &mut SignCtx) -> Result<()
         for (pk_hex, sk) in keys {
             match sign_auth_event(ctx.secp, sk, pk_hex, &s.url, &challenge, created_at) {
                 Ok(ev) => {
-                    ws_send_event(&mut s.tls, &ev)?;
+                    ws_send_auth(&mut s.tls, &ev)?;
                     ids.push(ev.id);
                 }
                 Err(e) => log::warn!("[relay] sign-in event not signed ({e})"),
@@ -11817,6 +11817,19 @@ fn flush_held_replies(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
 /// `ws_send` path first builds a JSON String and then copies it into a masked
 /// frame; for a large NIP-46 response that second full copy is avoidable.
 fn ws_send_event(tls: &mut Tls, event: &SignedEvent) -> Result<usize, String> {
+    ws_send_framed(tls, "EVENT", event)
+}
+
+/// A NIP-42 sign-in goes out as `["AUTH", <event>]`. Carried as an ordinary
+/// EVENT instead, a relay written strictly from the NIP treats the 22242 as a
+/// publish: it OKs it, never authenticates the connection, and closes the REQ
+/// `auth-required:` again (strfry tolerates both, which hid this at bench).
+fn ws_send_auth(tls: &mut Tls, event: &SignedEvent) -> Result<usize, String> {
+    ws_send_framed(tls, "AUTH", event)
+}
+
+/// Serialise and mask one command frame in one allocation.
+fn ws_send_framed(tls: &mut Tls, command: &'static str, event: &SignedEvent) -> Result<usize, String> {
     const MAX_HEADER_LEN: usize = 14;
     let mut frame = Vec::with_capacity(
         MAX_HEADER_LEN
@@ -11824,7 +11837,7 @@ fn ws_send_event(tls: &mut Tls, event: &SignedEvent) -> Result<usize, String> {
             .saturating_add(768),
     );
     frame.resize(MAX_HEADER_LEN, 0);
-    serde_json::to_writer(&mut frame, &("EVENT", event))
+    serde_json::to_writer(&mut frame, &(command, event))
         .map_err(|e| format!("serialise: {e}"))?;
 
     let payload_len = frame.len() - MAX_HEADER_LEN;

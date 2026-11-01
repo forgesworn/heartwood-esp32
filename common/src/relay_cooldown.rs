@@ -30,6 +30,10 @@ use alloc::vec::Vec;
 pub const THROTTLED_MS: u64 = 15 * 60_000;
 /// How long a relay that says it has banned us is left alone.
 pub const BANNED_MS: u64 = 60 * 60_000;
+/// How long a relay that would not let this board read after its NIP-42
+/// sign-in (`relay_auth`) is left alone. Shorter than a throttle: the likely
+/// remedy is the relay's operator adding a key to its allowlist.
+pub const AUTH_REFUSED_MS: u64 = 10 * 60_000;
 /// Hosts remembered at once. Configured relays plus a pinned one fit; past
 /// that, the cooldown ending soonest makes room.
 pub const COOLDOWN_RELAYS_MAX: usize = 8;
@@ -43,6 +47,10 @@ pub enum Refusal {
     /// The relay says the client is banned (relay.damus.io's
     /// `banned: too many rate-limit violations, try again later`).
     Banned,
+    /// The relay asked for a NIP-42 sign-in and still refused the
+    /// subscription, refused every key, or never sent the challenge it said
+    /// it needed. Decided by `relay_auth`, never by [`classify`].
+    AuthRefused,
 }
 
 impl Refusal {
@@ -50,6 +58,7 @@ impl Refusal {
         match self {
             Refusal::Throttled => THROTTLED_MS,
             Refusal::Banned => BANNED_MS,
+            Refusal::AuthRefused => AUTH_REFUSED_MS,
         }
     }
 
@@ -57,6 +66,7 @@ impl Refusal {
         match self {
             Refusal::Throttled => "rate-limited",
             Refusal::Banned => "banned",
+            Refusal::AuthRefused => "sign-in refused",
         }
     }
 }
@@ -67,8 +77,11 @@ impl Refusal {
 ///
 /// Deliberately narrow. `blocked:`, `restricted:` and `auth-required:` are
 /// about an event or an author (an allowlisted relay refusing the delivery
-/// probe's throwaway key, say) and keep their existing handling; only the
-/// relay saying it is limiting or has banned this client counts.
+/// probe's throwaway key, say) and are not a refusal of the client here;
+/// only the relay saying it is limiting or has banned this client counts.
+/// A subscription closed `auth-required:` or `restricted:` is the sign-in
+/// state machine's (`relay_auth`), which cools the relay with
+/// [`Refusal::AuthRefused`] only once a sign-in has failed or not helped.
 pub fn classify(message: &str) -> Option<Refusal> {
     let m = message.to_ascii_lowercase();
     if m.contains("banned") {
@@ -230,6 +243,16 @@ mod tests {
         assert!(c.cooling("RELAY.DAMUS.IO", until - 1));
         assert!(!c.cooling("relay.damus.io", until));
         assert!(!c.cooling("relay.primal.net", 1_000));
+    }
+
+    #[test]
+    fn a_refused_sign_in_cools_for_its_own_span() {
+        let mut c = RelayCooldowns::new();
+        let until = c.cool("relay.example.com", Refusal::AuthRefused, 1_000);
+        assert_eq!(until, 1_000 + AUTH_REFUSED_MS);
+        assert!(AUTH_REFUSED_MS < THROTTLED_MS);
+        assert_eq!(Refusal::AuthRefused.label(), "sign-in refused");
+        assert!(!c.cooling("relay.example.com", until));
     }
 
     #[test]

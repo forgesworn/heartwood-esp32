@@ -71,3 +71,40 @@ export function buildSetNetConfig(current, file, { opMgmt } = {}) {
   }[change]
   return { payload: Buffer.from(JSON.stringify(cfg)), change, title }
 }
+
+// ---------------------------------------------------------------------------
+// PATCH_NET_CONFIG (0x5e) — the USB-only relays editor's frame.
+
+/** Physical-USB network patch frame (firmware net_config_store.rs). */
+export const PATCH_NET_CONFIG = 0x5e
+
+const HOST_RULE = /^[0-9a-zA-Z.-]+$/
+
+/**
+ * Pure half of `net-patch.mjs`: the PATCH_NET_CONFIG payload for a relay-list
+ * replacement. Mirrors the firmware's own bounds (validate_remote_net_config
+ * in common/src/net_config.rs: 1-8 relays, each a wss:// URL of at most 255
+ * bytes on a dotted host, port empty or exactly 443) so a bad list fails
+ * here, not on the card. Only `relays` is patched: mode, network, passwords
+ * and the fallback list all stay as stored, so no password ever crosses this
+ * script.
+ *
+ * @param {object} current  the board's GET_NET_CONFIG answer (revision required)
+ * @param {string[]} relays the replacement relay list, in priority order
+ * @returns {{ payload: Buffer }}
+ */
+export function buildNetConfigPatchRelays(current, relays) {
+  const revision = current?.revision
+  if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('board answered without a config revision')
+  if (!Array.isArray(relays) || relays.length === 0 || relays.length > 8) throw new Error('one to eight relays')
+  for (const relay of relays) {
+    if (typeof relay !== 'string' || !relay.startsWith('wss://') || relay.length > 255) throw new Error('relay must be a wss:// URL no longer than 255 bytes')
+    const authority = relay.slice(6).split(/[/?#]/)[0] ?? ''
+    const host = authority.split(':')[0] ?? ''
+    const port = authority.slice(host.length)
+    if (port !== '' && port !== ':443') throw new Error('relay URL port must be 443')
+    if (authority.includes('@') || host === '' || !HOST_RULE.test(host) || ![...host].some((b) => /[0-9a-zA-Z]/.test(b))) throw new Error(`relay URL requires a nonempty host: ${relay}`)
+  }
+  if (new Set(relays).size !== relays.length) throw new Error('duplicate relay')
+  return { payload: Buffer.from(JSON.stringify({ base_revision: revision, patch: { relays } })) }
+}

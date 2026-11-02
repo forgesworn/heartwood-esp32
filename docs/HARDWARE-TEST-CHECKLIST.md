@@ -3254,14 +3254,72 @@ native-USB boards (V4, C6) were not checked.
 - If a step wedges, RESET the board; an unsaved phrase staying on screen is the
   safe failure (nothing is stored until the final hold).
 
-## 38. Relay sign-in, NIP-42 (added 2026-10-22; benched 2026-10-22, re-bench outstanding for the AUTH frame fix)
+## 38. Relay sign-in, NIP-42 (added 2026-10-22; benched 2026-10-22 on strfry; re-benched against khatru 2026-11-02)
 
 Benched 2026-10-22: a T-Display flashed with this build signed through the
 gated strfry relay (allowlisted masters) and served clients on it. The
 2026-11-01 review found the sign-in went out as an `["EVENT", …]` frame, which
 strfry accepts as auth but a strictly-NIP-42 relay does not; it now goes out
-as `["AUTH", <event>]`. Re-run this section against a strict relay (a
-khatru-based one) before calling the feature proven there.
+as `["AUTH", <event>]`.
+
+**Re-bench against a strict relay, 2026-11-02.** Same T-Display, firmware
+0.18.0-beta.29 (merged main with the AUTH frame fix), bench relay a
+purpose-built khatru v0.19.1 service behind Caddy on the project box, at a
+throwaway DNS name created for the day (name and container removed after
+the run; the bench service itself was kept out of the repositories). khatru verifies
+the 22242's signature, challenge and relay tag itself (its `ServiceURL` was
+set to the exact URL the board dialled), so an accepted sign-in proves the
+frame end to end; the relay logged every REQ decision, every accepted
+identity per connection, and every event it was offered. One bench note for
+the next operator: this release artifact compiles logging out entirely
+(`log/release_max_level_off` is a default feature), so no serial lines
+exist on it; relay-side logs and read-only `net-config` runtime reads stand
+in below. The relay stored nothing except kind 24133 in its store mode, so
+the profile-name clause of step 2 had no profile to serve. Per step:
+
+1. **Relay that never asks — pass.** Gate off: the board's catch-up REQs
+   (kinds 0, 1059) were served, and not one kind-22242 arrived at the relay
+   in any frame. The board signs in when asked, never unasked.
+2. **Allowlisted masters — pass.** Gate on, the master in the allowance. A
+   clean dial: REQ closed `auth-required:` after the hold, the board
+   answered the challenge, the relay accepted the master first and the
+   per-boot probe key second (two valid 22242s), the REQ was re-sent and
+   served, and an unpaired bench client's NIP-46 `ping` over this relay was
+   answered (`pong`). No persona key ever signed in, then or in any step.
+   Recorded caveat: khatru keeps exactly one authed identity per connection
+   (the latest AUTH), so the probe, signing second, is the identity the
+   session then holds; on this union-style gate the master carried, on a
+   stricter one-identity gate it would not. Filed as #264 with the log.
+3. **Late sign-in** — not isolated this run; the REQ hold ran at 2 s
+   throughout and the re-send-after-OKs path fired on every gated dial,
+   which is the host-tested half of the step.
+4. **Refused — pass.** Authed but unserved `restricted:`: the session
+   dropped with runtime class `relay_refused`, the host cooled, and the
+   board redialled exactly once a minute (dials at 08:52:46, :53:46,
+   :54:46, :55:46, :56:46), never every 3 s, never restarting while a
+   session opened. Once the allowance returned, the next full sign-in was
+   served again (observed 60 s later).
+5. **Every key refused** — not reachable on stock khatru, which decides
+   AUTH validity itself and never answers a valid 22242 with OK false; the
+   same refusal family is covered by step 4 and the host tests.
+6. **Challenge spam — pass relay-side.** Ten repeat challenges, one a
+   second, from connect: the board signed its two sign-ins (master, probe)
+   at the start and answered none of the eight that followed, while the REQ
+   stayed served throughout.
+7. **Locked** — not re-run: the board is `at_rest: none`, and the locked
+   phase signs through the same `ws_send_auth` that steps 1-6 just proved.
+   Recorded, not re-proven.
+8. **Publish-only** — not re-run: this board has no phones enrolled
+   (`unlock_phone_count: 0`), so no relay-update round can run. The
+   publish-only connections still build no AUTH by construction, which the
+   framing fix did not touch.
+
+At the close the board was patched back to its live list
+(the project's own gated relay first, then relay.primal.net, nostr.mom and
+offchain.pub; revision 16)
+and returned home onto relay 1 through the NIP-42 gate as its first act —
+the gated path serving the strict-verified build.
+
 
 The relay loop answers a relay's `["AUTH", <challenge>]` itself (no button):
 kind 22242, tags `relay` (the URL the board dialled) and `challenge`, empty

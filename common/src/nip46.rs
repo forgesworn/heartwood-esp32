@@ -106,14 +106,14 @@ pub enum Nip46Method {
     HeartwoodNoteRename,
     HeartwoodNoteTrust,
     HeartwoodNoteTrusted,
-    /// LUD-25 Part 2: the served identity's watch-only address branch for a
-    /// mint (`cx1`), and a key note a wallet found by scanning that branch.
+    /// LUD-26: one of the served identity's watch-only shares at a mint
+    /// (`cx1`), and a key note a wallet found by scanning a share.
     /// Neither discloses a note, so neither is pinned to the button.
     HeartwoodNoteAddress,
     HeartwoodNoteClaim,
-    /// LUD-25's address proof: a signature by one of the served identity's
-    /// address branches agreeing to register or unregister a lightning-address
-    /// name at a mint. It is what lets a mint move or clear where the name
+    /// LUD-26's address proof: a signature by one of the served identity's
+    /// shares (or a legacy branch on file) agreeing to register, move or
+    /// unregister a lightning-address name at a mint. It is what lets a mint move or clear where the name
     /// pays, so it is pinned to the button like the mutating set.
     HeartwoodNoteAddressProof,
     /// Mint a connection slot for another wallet, from a wallet already

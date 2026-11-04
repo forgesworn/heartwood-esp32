@@ -50,7 +50,7 @@ pub struct NoteInventoryEntry {
     pub amount_msat: u64,
     /// The note's withdraw endpoint, path and all. At most 64 bytes.
     pub host: String,
-    /// Where on this identity's LUD-25 address branch the note's key sits,
+    /// The note index of the note's key on its share (or legacy branch),
     /// for a note paid to a key; `None` for a note behind a hash.
     pub key_index: Option<u32>,
     pub created_at: u32,

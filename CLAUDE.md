@@ -354,8 +354,9 @@ every share the device can hand out, then both legacy branches on the purposed
 and the pre-purpose tweak (`cash_key::claim_note_key`), where the names
 registered before LUD-26 are still paid. Stored notes need no migration: a key note's secret IS
 its key, and nothing re-derives it to spend. Wire (one capability,
-`note_address_v2`, for all three methods, replacing `note_address_proof_v1`:
-each json! array entry in the capability list costs about 850 B of image):
+`note_address_v2`, for all three methods, replacing `note_address_proof_v1`;
+a second string measured once at about 850 B of image, the capability list
+being a json! array):
 `heartwood_note_address {host, share}` (share REQUIRED, so an old host gets
 `bad_request`, never the whole branch) answers `{ok, host, share, cx1,
 pubkey}`; `heartwood_note_claim` takes an

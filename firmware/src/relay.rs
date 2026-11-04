@@ -7253,7 +7253,7 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
         }
     };
     // Opened with the key it was addressed to, which is also the root of the
-    // address branch a note paid to a key sits on: one this device does not
+    // share a note paid to a key sits on: one this device does not
     // hold is refused here, before any card, and never comes back.
     let note = match heartwood_common::note_wrap::open_note_rumor(&opened.rumor, &secret) {
         Ok(n) => n,

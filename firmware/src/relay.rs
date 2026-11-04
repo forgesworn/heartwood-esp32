@@ -11247,17 +11247,17 @@ fn dispatch_mgmt(
                     // on-device, and a kind-1059 to a master npub puts a
                     // RECEIVE card up.
                     "note_wrap_v1",
-                    // LUD-26 shares: heartwood_note_address hands out share
-                    // n's 65-byte cx1 (`share` required), heartwood_note_claim
-                    // takes an optional `share` and finds a key on any share
-                    // or legacy branch. Replaces the whole-branch answer.
+                    // LUD-26 shares, one string for the three methods that
+                    // changed together: heartwood_note_address hands out
+                    // share n's 65-byte cx1 (`share` required),
+                    // heartwood_note_claim takes an optional `share` and finds
+                    // a key on any share or legacy branch, and
+                    // heartwood_note_address_proof signs register, update
+                    // (sig and newsig on one hold) or unregister, by a share
+                    // or a legacy branch on file, on a pinned ADDRESS PROOF
+                    // card. Replaces note_address_proof_v1, whose message and
+                    // whole-branch answer are gone.
                     "note_address_v2",
-                    // LUD-26 address proofs: heartwood_note_address_proof
-                    // signs register, update (sig and newsig on one hold) or
-                    // unregister for a lightning-address name, by a share or a
-                    // legacy branch on file, on a pinned ADDRESS PROOF card.
-                    // v1's message without the cx1 is gone with it.
-                    "note_address_proof_v2",
                     // revoke_client_identity / clear_client_identities withdraw
                     // identity approvals from a slot without revoking it.
                     "client_identity_revoke_v1",

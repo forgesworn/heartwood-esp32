@@ -2820,7 +2820,7 @@ dispatch without a card, so nothing parks.
 
 SUPERSEDED 2026-11-04 by section 39: the message, the signing key and the
 request shape below are gone (`note_address_proof_v1` is no longer
-advertised). Items 3 to 9 (refusal before the card, decline, pinned
+advertised; `note_address_v2` replaces it). Items 3 to 9 (refusal before the card, decline, pinned
 always-ask, never batched, escalate refused, the USB-bridged card, unbound)
 still describe the gating, and section 39 reruns them on the new shape.
 
@@ -3374,8 +3374,7 @@ moneyer 0.22.0 and dni's lnurl-mint take only LUD-26 (luds `92e430f`): a
 name is registered to a share's 65-byte `cx1`, `S/0'/2/n'` below
 `S = m/139'/d1..d4` (d1..d4 hashed from the mint's hostname WITHOUT its
 port), and its notes are `S/0'/2/n'/i`, plain BIP-32. Advertised as
-`note_address_v2` and `note_address_proof_v2` in get_status (no
-`note_address_proof_v1`). Shares are 0 to 19. Drive it with
+`note_address_v2` in get_status (no `note_address_proof_v1`). Shares are 0 to 19. Drive it with
 scripts/nip46-client.mjs from a bound slot until notecase grows the
 commands. Release build only, app-only flash on the bench V4 (its one-off
 partition table, see the V4 notes); the stored notes must survive it.
@@ -3385,7 +3384,7 @@ partition table, see the V4 notes); the stored notes must survive it.
    (`heartwood collect`) still releases a `ck1` the mint accepts (the key is
    stored; nothing is re-derived).
 2. `heartwood_note_address` with `{"host":"moneyer.dev","share":0}` answers
-   `share` 0, `domain` `moneyer.dev` and a 113-character `cx1` starting `cx1`,
+   `share` 0 and a 113-character `cx1` starting `cx1`,
    with NO card; the same request again answers the same `cx1`; `share` 1
    answers a different one. With no `share`, or `share` 20, it answers
    `bad_request` and no `cx1`.
@@ -3394,8 +3393,8 @@ partition table, see the V4 notes); the stored notes must survive it.
    `{"host":"moneyer.dev","name":"<name>","action":"update","share":0,
    "cx1":"<share 0 cx1>","on_file":"<the 64-byte cx1 on file>"}`. Expect ONE
    ADDRESS PROOF card reading `<name>@moneyer.dev` over
-   `move: old keys > share 0` (watch the OLED); hold. The reply has `signer`
-   `legacy` (or `superseded`), `sig`, `pubkey` (x(P) of the branch) and
+   `move: old keys > share 0` (watch the OLED); hold. The reply has `sig`,
+   `pubkey` (x(P) of the branch, the key its 64-byte cx1 carries) and
    `newsig`, `newpubkey`. PUT `cx1`, `sig`, `newsig` to
    `/.well-known/lnurlp/<name>`: moneyer answers `{"status":"OK"}` and the
    name's cx1 is now the share's. If moneyer refuses the x(P) proof, record

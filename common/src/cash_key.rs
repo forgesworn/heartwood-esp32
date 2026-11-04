@@ -126,6 +126,7 @@ pub fn nostr_cash_seed(identity_secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
 }
 
 /// `m/139'` from an identity's seed.
+#[inline(never)]
 fn identity_root(identity_secret: &[u8; 32]) -> Result<CashNode, &'static str> {
     let seed = nostr_cash_seed(identity_secret);
     derive_cash_root(seed.as_ref())
@@ -150,6 +151,7 @@ pub fn share_chain_of(service_root: &CashNode) -> Result<CashNode, &'static str>
     derive_cash_child(&derive_cash_child(service_root, ACCOUNT_ZERO)?, SHARE_CHAIN)
 }
 
+#[inline(never)]
 fn share_chain(identity_secret: &[u8; 32], host: &str) -> Result<CashNode, &'static str> {
     share_chain_of(&service_root(identity_secret, host)?)
 }
@@ -198,7 +200,7 @@ pub fn share_cx1_of(node: &CashNode) -> Result<String, &'static str> {
 /// the next: the mint skips it, so nothing is ever minted to it.
 pub fn share_note_key(share: &CashNode, index: u32) -> Result<Zeroizing<[u8; 32]>, &'static str> {
     if index >= HARDENED {
-        return Err("a note index on a share is below 2^31");
+        return Err("index must be below 2^31");
     }
     let child = derive_cash_child(share, index)?;
     Ok(Zeroizing::new(child.private_key))
@@ -227,6 +229,7 @@ impl BranchKind {
 /// One of the legacy whole branches at a mint, from `m/139'`. `host` is the
 /// mint as a wallet spelt it then (see [`crate::cash`]): lowercase, port
 /// included, no scheme and no path.
+#[inline(never)]
 pub fn legacy_branch_at(root: &CashNode, host: &str, kind: BranchKind) -> Result<CashNode, &'static str> {
     match kind {
         BranchKind::Legacy => derive_cash_domain_node(root, host),
@@ -297,14 +300,13 @@ fn reduce_mod_n(value: [u8; 32]) -> [u8; 32] {
 
 /// The legacy tweak: with a purpose from `50d740a`, without one before it.
 fn note_tweak(branch: &Branch, purpose: Option<u32>, index: u32) -> [u8; 32] {
-    let digest = match purpose {
-        Some(purpose) => tagged_hash(
-            NOTE_DERIVE_TAG,
-            &[&branch.pubkey, &branch.chain_code, &purpose.to_be_bytes(), &index.to_be_bytes()],
-        ),
-        None => tagged_hash(NOTE_DERIVE_TAG, &[&branch.pubkey, &branch.chain_code, &index.to_be_bytes()]),
+    let purpose = purpose.map(u32::to_be_bytes);
+    let index = index.to_be_bytes();
+    let parts: &[&[u8]] = match &purpose {
+        Some(purpose) => &[&branch.pubkey, &branch.chain_code, purpose, &index],
+        None => &[&branch.pubkey, &branch.chain_code, &index],
     };
-    reduce_mod_n(digest)
+    reduce_mod_n(tagged_hash(NOTE_DERIVE_TAG, parts))
 }
 
 /// The branch key is negated first when its point has odd y, because the
@@ -445,6 +447,39 @@ pub struct ClaimedKey {
 
 const NOT_OURS: &str = "that note is paid to a key this device does not hold";
 
+/// Every refusal of a `cx1` that is not the key asked about.
+pub const NOT_OURS_CX1: &str = "that cx1 is not this identity's at that mint";
+
+/// Note `index` of share `n`. The share's key is dropped here, so a search
+/// holds only the chain.
+#[inline(never)]
+fn share_note_at(chain: &CashNode, n: u32, index: u32) -> Result<ClaimedKey, &'static str> {
+    let secret = share_note_key(&share_at(chain, n)?, index)?;
+    let pubkey = note_pubkey(&secret)?;
+    Ok(ClaimedKey { secret, pubkey, origin: KeyOrigin::Share(n) })
+}
+
+/// Note `index` of one legacy branch that is `want`, on `purpose` or on the
+/// pre-purpose tweak.
+#[inline(never)]
+fn legacy_note_matching(
+    root: &CashNode,
+    host: &str,
+    kind: BranchKind,
+    purpose: u32,
+    index: u32,
+    want: &[u8; 32],
+) -> Option<ClaimedKey> {
+    let node = legacy_branch_at(root, host, kind).ok()?;
+    for purpose in [Some(purpose), None] {
+        let Ok(secret) = tweaked_note_key(&node, purpose, index) else { continue };
+        if note_pubkey(&secret).ok() == Some(*want) {
+            return Some(ClaimedKey { secret, pubkey: *want, origin: KeyOrigin::Branch(kind) });
+        }
+    }
+    None
+}
+
 /// The key a note paid to `identity` at `host` with `index` answers to.
 ///
 /// With `expected`, the public key the note is said to be minted to, every
@@ -458,7 +493,8 @@ const NOT_OURS: &str = "that note is paid to a key this device does not hold";
 /// against, so the share must be named and only that key is derived.
 ///
 /// `host` is the mint as stored, port included (the legacy branches hash it;
-/// the shares hash its [`spend_domain`]).
+/// the shares hash its [`spend_domain`]). Worst case, a key on a legacy
+/// branch, is about fifty point multiplications.
 pub fn claim_note_key(
     identity_secret: &[u8; 32],
     host: &str,
@@ -467,28 +503,20 @@ pub fn claim_note_key(
     share: Option<u32>,
     legacy_purpose: u32,
 ) -> Result<ClaimedKey, &'static str> {
-    if let Some(share) = share {
-        if !valid_share(share) {
-            return Err("a share is 0 to 19");
-        }
+    if share.is_some_and(|n| !valid_share(n)) {
+        return Err("a share is 0 to 19");
     }
     let root = identity_root(identity_secret)?;
     let chain = share_chain_of(&service_root_at(&root, host)?)?;
-    let on_share = |n: u32| -> Result<ClaimedKey, &'static str> {
-        let secret = share_note_key(&share_at(&chain, n)?, index)?;
-        let pubkey = note_pubkey(&secret)?;
-        Ok(ClaimedKey { secret, pubkey, origin: KeyOrigin::Share(n) })
-    };
     let Some(want) = expected else {
-        return on_share(share.ok_or("name the key the note is paid to (p), or its share")?);
+        return share_note_at(&chain, share.ok_or("p or share is required")?, index);
     };
     // Shares hold only indices below 2^31; a legacy branch holds any uint32.
     if index < HARDENED {
-        let named = share.into_iter();
         let rest = (0..SHARE_LIMIT).filter(|n| Some(*n) != share);
-        for n in named.chain(rest) {
+        for n in share.into_iter().chain(rest) {
             // An index BIP-32 refuses on one share is simply not this one.
-            if let Ok(found) = on_share(n) {
+            if let Ok(found) = share_note_at(&chain, n, index) {
                 if found.pubkey == *want {
                     return Ok(found);
                 }
@@ -496,13 +524,8 @@ pub fn claim_note_key(
         }
     }
     for kind in [BranchKind::Legacy, BranchKind::Superseded] {
-        let node = legacy_branch_at(&root, host, kind)?;
-        for purpose in [Some(legacy_purpose), None] {
-            let Ok(secret) = tweaked_note_key(&node, purpose, index) else { continue };
-            let pubkey = note_pubkey(&secret)?;
-            if pubkey == *want {
-                return Ok(ClaimedKey { secret, pubkey, origin: KeyOrigin::Branch(kind) });
-            }
+        if let Some(found) = legacy_note_matching(&root, host, kind, legacy_purpose, index, want) {
+            return Ok(found);
         }
     }
     Err(NOT_OURS)
@@ -590,6 +613,7 @@ pub fn address_proof_message(
 }
 
 /// The plain sha256 of [`address_proof_message`], what a proof signs.
+#[inline(never)]
 pub fn address_proof_digest(
     action: AddressAction,
     domain: &str,
@@ -641,8 +665,34 @@ fn proof_node(identity_secret: &[u8; 32], host: &str, key: ProofKey) -> Result<C
     }
 }
 
-/// Which of this identity's keys at `host` a `cx1` is, as its type and the
-/// `cx1` spelt as this device spells it (lowercase). Compared as decoded
+/// Sign `action`'s message for `request` with the key `key` names; the key
+/// goes no further.
+#[inline(never)]
+fn sign_by(
+    identity_secret: &[u8; 32],
+    request: &ProofRequest<'_>,
+    key: ProofKey,
+    action: AddressAction,
+    cx1: Option<&str>,
+) -> Result<AddressProof, &'static str> {
+    let digest = address_proof_digest(action, &spend_domain(request.host), request.username, cx1)
+        .ok_or("not a proof this device signs")?;
+    sign_address_proof(&proof_node(identity_secret, request.host, key)?, &digest)
+}
+
+/// The public half of share `n`; its key is dropped here.
+#[inline(never)]
+fn share_key_at(chain: &CashNode, n: u32) -> Result<ShareKey, &'static str> {
+    share_key_of(&share_at(chain, n)?)
+}
+
+/// The public half of a legacy branch; its key is dropped here.
+#[inline(never)]
+fn legacy_key_at(root: &CashNode, host: &str, kind: BranchKind) -> Result<Branch, &'static str> {
+    branch_of(&legacy_branch_at(root, host, kind)?)
+}
+
+/// Which of this identity's keys at `host` a `cx1` is. Compared as decoded
 /// bytes, so an all-uppercase `cx1` (valid bech32m) names the same key.
 /// A 65-byte share `cx1` is looked for on `share` if named, else on every
 /// share this device hands out; a 64-byte one on the two legacy branches.
@@ -652,38 +702,32 @@ pub fn proof_key_of(
     host: &str,
     cx1: &str,
     share: Option<u32>,
-) -> Result<(ProofKey, String), &'static str> {
+) -> Result<ProofKey, &'static str> {
     if let Some((chain_code, point)) = crate::encoding::decode_share_cx1(cx1) {
-        let named = ShareKey { chain_code, point };
-        let chain = share_chain(identity_secret, host)?;
+        let named = Ok(ShareKey { chain_code, point });
         let candidates = match share {
             Some(n) if !valid_share(n) => return Err("a share is 0 to 19"),
             Some(n) => n..n + 1,
             None => 0..SHARE_LIMIT,
         };
-        for n in candidates {
-            let node = share_at(&chain, n)?;
-            if share_key_of(&node)? == named {
-                return Ok((ProofKey::Share(n), encode_share_cx1(&chain_code, &point)));
-            }
-        }
-        return Err(match share {
-            Some(_) => "that cx1 is not that share of this identity at that mint",
-            None => "that cx1 is not one of this identity's shares at that mint",
-        });
+        let chain = share_chain(identity_secret, host)?;
+        return candidates
+            .into_iter()
+            .find(|&n| share_key_at(&chain, n) == named)
+            .map(ProofKey::Share)
+            .ok_or(NOT_OURS_CX1);
     }
     let (pubkey, chain_code) = crate::encoding::decode_cx1(cx1).ok_or("that is not a cx1")?;
     if share.is_some() {
-        return Err("a 64-byte cx1 is a whole branch, not a share");
+        return Err(NOT_OURS_CX1);
     }
-    let named = Branch { pubkey, chain_code };
+    let named = Ok(Branch { pubkey, chain_code });
     let root = identity_root(identity_secret)?;
-    for kind in [BranchKind::Legacy, BranchKind::Superseded] {
-        if branch_of(&legacy_branch_at(&root, host, kind)?)? == named {
-            return Ok((ProofKey::Branch(kind), encode_cx1(&pubkey, &chain_code)));
-        }
-    }
-    Err("that cx1 is not one of this device's branches at that mint")
+    [BranchKind::Legacy, BranchKind::Superseded]
+        .into_iter()
+        .find(|&kind| legacy_key_at(&root, host, kind) == named)
+        .map(ProofKey::Branch)
+        .ok_or(NOT_OURS_CX1)
 }
 
 /// What a request for an address proof asks for, once checked.
@@ -716,39 +760,26 @@ pub struct Proofs {
 /// action binds none), so nothing can sign a message the card did not name
 /// by building a request by hand.
 pub fn address_proofs(identity_secret: &[u8; 32], request: &ProofRequest<'_>) -> Result<Proofs, &'static str> {
-    if !valid_username(request.username) {
-        return Err("a name is 3 to 32 of a-z, 0-9, dot, dash or underscore, starting with a letter or digit");
+    let well_formed = valid_username(request.username)
+        && request.action.binds_cx1() == request.share.is_some()
+        && match (request.action, request.share, request.signer) {
+            (AddressAction::Register, Some(n), ProofKey::Share(m)) => n == m,
+            (AddressAction::Register, _, _) => false,
+            (AddressAction::Update, Some(n), ProofKey::Share(m)) => n != m,
+            _ => true,
+        };
+    if !well_formed {
+        return Err("not a proof this device signs");
     }
-    if request.action.binds_cx1() != request.share.is_some() {
-        return Err("register and update bind a share; unregister binds none");
-    }
-    match (request.action, request.share, request.signer) {
-        (AddressAction::Register, Some(n), ProofKey::Share(m)) if n == m => {}
-        (AddressAction::Register, _, _) => return Err("a register is signed by the share it registers"),
-        (AddressAction::Update, Some(n), ProofKey::Share(m)) if n == m => {
-            return Err("that share is the one on file already")
+    let cx1 = match request.share {
+        Some(n) => Some(share_cx1_of(&share_node(identity_secret, request.host, n)?)?),
+        None => None,
+    };
+    let sig = sign_by(identity_secret, request, request.signer, request.action, cx1.as_deref())?;
+    let newsig = match (request.action, request.share) {
+        (AddressAction::Update, Some(n)) => {
+            Some(sign_by(identity_secret, request, ProofKey::Share(n), AddressAction::Register, cx1.as_deref())?)
         }
-        _ => {}
-    }
-    let domain = spend_domain(request.host);
-    let bound = match request.share {
-        Some(n) => Some(share_node(identity_secret, request.host, n)?),
-        None => None,
-    };
-    let cx1 = match &bound {
-        Some(node) => Some(share_cx1_of(node)?),
-        None => None,
-    };
-    let digest = |action| {
-        address_proof_digest(action, &domain, request.username, cx1.as_deref()).ok_or("no such proof")
-    };
-    let signer = match (request.signer, &bound) {
-        (ProofKey::Share(m), Some(node)) if request.share == Some(m) => node.clone(),
-        (key, _) => proof_node(identity_secret, request.host, key)?,
-    };
-    let sig = sign_address_proof(&signer, &digest(request.action)?)?;
-    let newsig = match (request.action, &bound) {
-        (AddressAction::Update, Some(node)) => Some(sign_address_proof(node, &digest(AddressAction::Register)?)?),
         _ => None,
     };
     Ok(Proofs { sig, newsig, cx1 })
@@ -1258,17 +1289,17 @@ mod tests {
     fn a_proof_key_is_found_from_its_cx1() {
         for n in [0, 5, SHARE_LIMIT - 1] {
             let cx1 = share_cx1(n);
-            assert_eq!(proof_key_of(&IDENTITY, "moneyer.dev", &cx1, None), Ok((ProofKey::Share(n), cx1.clone())));
-            assert_eq!(proof_key_of(&IDENTITY, "moneyer.dev", &cx1, Some(n)), Ok((ProofKey::Share(n), cx1.clone())));
-            // uppercase is the same cx1, spelt back in lowercase
-            let upper = proof_key_of(&IDENTITY, "moneyer.dev", &cx1.to_ascii_uppercase(), None).unwrap();
-            assert_eq!(upper, (ProofKey::Share(n), cx1.clone()));
+            assert_eq!(proof_key_of(&IDENTITY, "moneyer.dev", &cx1, None), Ok(ProofKey::Share(n)));
+            assert_eq!(proof_key_of(&IDENTITY, "moneyer.dev", &cx1, Some(n)), Ok(ProofKey::Share(n)));
+            // uppercase is the same cx1
+            let upper = proof_key_of(&IDENTITY, "moneyer.dev", &cx1.to_ascii_uppercase(), None);
+            assert_eq!(upper, Ok(ProofKey::Share(n)));
             // a share named wrong is refused, not searched past
             assert!(proof_key_of(&IDENTITY, "moneyer.dev", &cx1, Some((n + 1) % SHARE_LIMIT)).is_err());
         }
         for kind in [BranchKind::Legacy, BranchKind::Superseded] {
             let cx1 = legacy_cx1(kind);
-            assert_eq!(proof_key_of(&IDENTITY, "moneyer.dev", &cx1, None), Ok((ProofKey::Branch(kind), cx1.clone())));
+            assert_eq!(proof_key_of(&IDENTITY, "moneyer.dev", &cx1, None), Ok(ProofKey::Branch(kind)));
             assert!(proof_key_of(&IDENTITY, "moneyer.dev", &cx1, Some(0)).is_err());
         }
         let theirs = share_cx1_of(&share_node(&[8u8; 32], "moneyer.dev", 0).unwrap()).unwrap();

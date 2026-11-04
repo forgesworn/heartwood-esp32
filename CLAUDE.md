@@ -353,11 +353,12 @@ note index and not the share, so `open_key_note` and a `p`-naming claim try
 every share the device can hand out, then both legacy branches on the purposed
 and the pre-purpose tweak (`cash_key::claim_note_key`), where the names
 registered before LUD-26 are still paid. Stored notes need no migration: a key note's secret IS
-its key, and nothing re-derives it to spend. Wire (capabilities
-`note_address_v2` and `note_address_proof_v2`, replacing
-`note_address_proof_v1`): `heartwood_note_address {host, share}` (share
-REQUIRED, so an old host gets `bad_request`, never the whole branch) answers
-`{ok, host, domain, share, cx1, pubkey}`; `heartwood_note_claim` takes an
+its key, and nothing re-derives it to spend. Wire (one capability,
+`note_address_v2`, for all three methods, replacing `note_address_proof_v1`:
+each json! array entry in the capability list costs about 850 B of image):
+`heartwood_note_address {host, share}` (share REQUIRED, so an old host gets
+`bad_request`, never the whole branch) answers `{ok, host, share, cx1,
+pubkey}`; `heartwood_note_claim` takes an
 optional `share` (tried first; required when there is no `p`) and answers
 `share` or `branch` (`legacy`/`superseded`) for where the key was.
 `heartwood_note_address_proof {host, name, action, ...}`: `register` takes
@@ -372,10 +373,11 @@ reference reads; moneyer takes it or the old index-0 key). A field the action
 does not take, a whole-branch `cx1` to register, a bound `cx1` that is not the
 named share, an update onto the share on file, and any key not this
 identity's are refused by `note_cmd::address_proof_ask` before the card,
-relay precheck and dispatcher alike. Reply: `{ok, host, domain, name, action,
-share?, cx1?, signer: share|legacy|superseded, signer_share?, sig, pubkey,
-newsig?, newpubkey?}`; the domain is always portless, the cx1 always the
-device's lowercase spelling. The card is ADDRESS PROOF over
+relay precheck and dispatcher alike. Reply: `{ok, share?, cx1?, sig, pubkey,
+newsig?, newpubkey?}`, no echo of the request; the message is bound to the
+portless domain and the cx1 is the device's lowercase spelling. Release
+image cost of the change, local V4 build: +5,744 B (main had 8,112 B spare
+on CI's V4 gate at `d4a59df`). The card is ADDRESS PROOF over
 `<name>@<domain>` and `register, share 3`, `move: old keys > share 3` or
 `unregister, share 3` (at most 25 chars, pinned by a test). Every gating rule
 below is unchanged.

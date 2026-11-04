@@ -461,7 +461,7 @@ fn share_field(cmd: &Value, key: &str) -> Result<Option<u32>, &'static str> {
         None | Some(Value::Null) => Ok(None),
         Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()) {
             Some(n) if crate::cash_key::valid_share(n) => Ok(Some(n)),
-            _ => Err("a share is an integer, 0 to 19"),
+            _ => Err("a share is 0 to 19"),
         },
     }
 }
@@ -765,7 +765,7 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             }
             let share = match share_field(&cmd, "share") {
                 Ok(Some(share)) => share,
-                Ok(None) => return err_msg("bad_request", "share is required (LUD-26)"),
+                Ok(None) => return err_msg("bad_request", "share is required"),
                 Err(m) => return err_msg("bad_request", m),
             };
             let cx1 = match crate::cash_key::share_node(identity, host, share)
@@ -782,7 +782,6 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             json!({
                 "ok": true,
                 "host": host,
-                "domain": crate::cash_key::spend_domain(host),
                 "share": share,
                 "cx1": cx1,
                 "pubkey": hex_encode(&pubkey),
@@ -816,19 +815,13 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
                 Ok(proofs) => proofs,
                 Err(m) => return err_msg("bad_request", m),
             };
+            // Not an echo of the request: the host knows what it asked, and
+            // the card is where the owner checks it.
             let mut obj = Map::new();
             obj.insert("ok".into(), Value::Bool(true));
-            obj.insert("host".into(), json!(ask.host));
-            obj.insert("domain".into(), json!(crate::cash_key::spend_domain(ask.host)));
-            obj.insert("name".into(), json!(ask.name));
-            obj.insert("action".into(), json!(ask.action.as_str()));
             if let (Some(share), Some(cx1)) = (ask.share, proofs.cx1) {
                 obj.insert("share".into(), json!(share));
                 obj.insert("cx1".into(), json!(cx1));
-            }
-            obj.insert("signer".into(), json!(ask.signer.as_str()));
-            if let crate::cash_key::ProofKey::Share(n) = ask.signer {
-                obj.insert("signer_share".into(), json!(n));
             }
             obj.insert("sig".into(), json!(hex_encode(&proofs.sig.signature)));
             obj.insert("pubkey".into(), json!(hex_encode(&proofs.sig.pubkey)));
@@ -1238,24 +1231,18 @@ pub fn address_proof_ask<'a>(cmd: &'a Value, identity: &[u8; 32]) -> Result<Addr
     let binds = action.binds_cx1();
     let on_file_taken = action != AddressAction::Register;
     if !binds && (present("cx1") || present("share")) {
-        return Err("unregister binds no cx1: name the key on file as on_file");
+        return Err(UNEXPECTED_FIELD);
     }
     if !on_file_taken && (present("on_file") || present("on_file_share")) {
-        return Err("a register is signed by the share it registers, not by on_file");
+        return Err(UNEXPECTED_FIELD);
     }
     let share = if binds {
         let cx1 = str_field(cmd, "cx1").ok_or("cx1 is required")?;
         let share = share_field(cmd, "share")?.ok_or("share is required")?;
         match crate::cash_key::proof_key_of(identity, host, cx1, Some(share)) {
-            Ok((ProofKey::Share(n), _)) if n == share => Some(share),
-            Ok(_) => return Err("that cx1 is not that share of this identity at that mint"),
-            Err(m) => {
-                return Err(if crate::encoding::decode_cx1(cx1).is_some() {
-                    "a whole-branch cx1 cannot be registered (LUD-26): bind a share"
-                } else {
-                    m
-                })
-            }
+            Ok(ProofKey::Share(n)) if n == share => Some(share),
+            Ok(_) => return Err(crate::cash_key::NOT_OURS_CX1),
+            Err(m) => return Err(m),
         }
     } else {
         None
@@ -1263,7 +1250,7 @@ pub fn address_proof_ask<'a>(cmd: &'a Value, identity: &[u8; 32]) -> Result<Addr
     let signer = if on_file_taken {
         let on_file = str_field(cmd, "on_file").ok_or("on_file is required")?;
         let hint = share_field(cmd, "on_file_share")?;
-        crate::cash_key::proof_key_of(identity, host, on_file, hint)?.0
+        crate::cash_key::proof_key_of(identity, host, on_file, hint)?
     } else {
         ProofKey::Share(share.expect("register binds a share"))
     };
@@ -1272,6 +1259,11 @@ pub fn address_proof_ask<'a>(cmd: &'a Value, identity: &[u8; 32]) -> Result<Addr
     }
     Ok(AddressProofAsk { host, name, action, share, signer })
 }
+
+/// A field the proof's action does not take: `cx1` or `share` on an
+/// unregister, `on_file` on a register.
+#[cfg(feature = "cash")]
+const UNEXPECTED_FIELD: &str = "a field this action does not take";
 
 /// The header an address-proof card is drawn under, on every surface.
 #[cfg(feature = "cash")]
@@ -3186,12 +3178,12 @@ mod tests {
             assert_eq!(res["ok"], true, "{res}");
             assert_eq!(res["cx1"], share_cx1(&[7u8; 32], "moneyer.dev", share));
             assert_eq!(res["cx1"].as_str().unwrap().len(), 113);
-            assert_eq!((res["share"].clone(), res["domain"].clone()), (json!(share), json!("moneyer.dev")));
+            assert_eq!(res["share"], json!(share));
             assert_eq!(res["pubkey"], hex_encode(&crate::derive::public_key_xonly(&[7u8; 32]).unwrap()));
         }
         // the port is in the host and not in the share
         let res = h.run(r#"{"cmd":"cash_address","host":"127.0.0.1:8899","share":0}"#);
-        assert_eq!((res["domain"].clone(), res["cx1"].clone()), (json!("127.0.0.1"), json!(share_cx1(&[7u8; 32], "127.0.0.1", 0))));
+        assert_eq!(res["cx1"], json!(share_cx1(&[7u8; 32], "127.0.0.1", 0)));
         // it spends nothing, so nobody was asked
         assert!(h.asked.is_empty() && h.proof_asked.is_empty());
 
@@ -3381,11 +3373,11 @@ mod tests {
         let cx1 = share_cx1(&[7u8; 32], "moneyer.dev", 2);
         let node = share_node(&[7u8; 32], "moneyer.dev", 2).unwrap();
         signed_by(&res, "sig", AddressAction::Register, Some(&cx1), &node);
-        assert_eq!(
-            (res["domain"].clone(), res["name"].clone(), res["action"].clone(), res["share"].clone(), res["cx1"].clone()),
-            (json!("moneyer.dev"), json!("alice"), json!("register"), json!(2), json!(cx1))
-        );
-        assert_eq!((res["signer"].clone(), res["signer_share"].clone()), (json!("share"), json!(2)));
+        assert_eq!((res["share"].clone(), res["cx1"].clone()), (json!(2), json!(cx1)));
+        // no echo of the request
+        for echo in ["host", "domain", "name", "action", "signer"] {
+            assert!(res.get(echo).is_none(), "{echo}");
+        }
         assert!(res.get("newsig").is_none());
         // One card, naming the address, the action and the share.
         assert_eq!(h.proof_asked, vec![("ADDRESS PROOF", "alice@moneyer.dev\nregister, share 2".to_string())]);
@@ -3417,8 +3409,7 @@ mod tests {
             // the key on file is x(P), the key its 64-byte cx1 carries
             assert_eq!(res["pubkey"], hex_encode(&crate::cash_key::branch_of(&branch).unwrap().pubkey));
             signed_by(&res, "newsig", AddressAction::Register, Some(&cx1), &share_node(&[7u8; 32], "moneyer.dev", 0).unwrap());
-            assert_eq!((res["signer"].clone(), res["action"].clone(), res["share"].clone()), (json!(kind.as_str()), json!("update"), json!(0)));
-            assert!(res.get("signer_share").is_none());
+            assert_eq!(res["share"], json!(0));
             assert_eq!(h.proof_asked, vec![("ADDRESS PROOF", "alice@moneyer.dev\nmove: old keys > share 0".to_string())]);
         }
     }
@@ -3433,7 +3424,6 @@ mod tests {
             assert_eq!(res["ok"], true, "{res}");
             let cx1 = share_cx1(&[7u8; 32], "moneyer.dev", 19);
             signed_by(&res, "sig", AddressAction::Update, Some(&cx1), &share_node(&[7u8; 32], "moneyer.dev", 18).unwrap());
-            assert_eq!((res["signer"].clone(), res["signer_share"].clone()), (json!("share"), json!(18)));
         }
         assert_eq!(h.proof_asked[0].1, "alice@moneyer.dev\nmove: share 18 > share 19");
     }

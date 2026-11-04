@@ -48,7 +48,10 @@ fn encode_fixed(hrp: &str, bytes: &[u8]) -> String {
     bech32::encode::<Bech32m>(Hrp::parse(hrp).expect("valid hrp"), bytes).expect("valid encoding")
 }
 
-fn decode_fixed<const N: usize>(hrp: &str, value: &str) -> Option<[u8; N]> {
+// One body for every payload length, so each fixed type costs the firmware
+// a length check rather than its own copy of the decoder.
+#[inline(never)]
+fn decode_payload(hrp: &str, value: &str) -> Option<Vec<u8>> {
     let checked = bech32::primitives::decode::CheckedHrpstring::new::<Bech32m>(value.trim()).ok()?;
     if checked.hrp() != Hrp::parse(hrp).ok()? {
         return None;
@@ -56,8 +59,11 @@ fn decode_fixed<const N: usize>(hrp: &str, value: &str) -> Option<[u8; N]> {
     // BIP-173's padding rule, which is not only segwit's: at most four
     // leftover bits, all zero. Without it two strings would name one key.
     checked.validate_segwit_padding().ok()?;
-    let bytes: Vec<u8> = checked.byte_iter().collect();
-    bytes.try_into().ok()
+    Some(checked.byte_iter().collect())
+}
+
+fn decode_fixed<const N: usize>(hrp: &str, value: &str) -> Option<[u8; N]> {
+    decode_payload(hrp, value)?.try_into().ok()
 }
 
 pub fn encode_cp1(pubkey_x_only: &[u8; 32]) -> String {

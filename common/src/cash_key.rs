@@ -87,8 +87,11 @@ const SHARE_CHAIN: u32 = 2;
 /// Shares this device hands out, and searches for a wrapped key, at a mint:
 /// 0 to 19. A wrap carries a note's index and not its share, so every share a
 /// payment could be on is tried; a share above this would be one whose wraps
-/// are refused as not ours. One share per name or counterparty, so twenty
-/// names at one mint before this binds. LUD-26's own recovery stops after 5
+/// are refused as not ours. A lifetime budget per mint, not a count of
+/// names: a mint burns every share key it accepts and keeps it burnt after a
+/// move or an unregister ("cx1 already used"), so every register and every
+/// move spends one for good, and this device records none of them. Hosts
+/// keep the count of shares handed out. LUD-26's own recovery stops after 5
 /// consecutive empty shares, which a device handing out at most twenty never
 /// reaches past.
 pub const SHARE_LIMIT: u32 = 20;

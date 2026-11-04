@@ -887,7 +887,7 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             // `c` from LUD-25 `50d740a`; `sig` is the older name
             let sig = str_field(&cmd, "c").or_else(|| str_field(&cmd, "sig")).unwrap_or("");
             let branch = crate::cash_key::branch_host(host);
-            if !crate::cash_store::valid_host(branch) {
+            if !crate::cash_key::valid_mint_host(branch) {
                 return err_msg("bad_request", "host must be a lowercase mint host");
             }
             // The key the wallet expected, if it says: a claim for a key this
@@ -3353,6 +3353,9 @@ mod tests {
             r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":1,"amount_msat":1000,"sig":"CS1"}"#,
             r#"{"cmd":"claim_key_note","host":"Moneyer.dev/w","index":1,"amount_msat":1000,"share":0}"#,
             r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","amount_msat":1000,"share":0}"#,
+            // a mint host whose domain is empty or dotted, which no mint has
+            r#"{"cmd":"claim_key_note","host":":8443/w","index":1,"amount_msat":1000,"share":0}"#,
+            r#"{"cmd":"claim_key_note","host":"moneyer.dev./w","index":1,"amount_msat":1000,"share":0}"#,
             // a share note's index is below 2^31
             r#"{"cmd":"claim_key_note","host":"moneyer.dev/w","index":2147483648,"amount_msat":1000,"share":0}"#,
         ] {
@@ -3435,6 +3438,25 @@ mod tests {
         let res = h.run(&upper);
         assert_eq!(res["cx1"], cx1.as_str());
         signed_by(&res, "sig", AddressAction::Register, Some(&cx1), &node);
+    }
+
+    #[test]
+    fn a_share_named_for_old_keys_on_file_is_refused_before_the_card() {
+        // a 64-byte cx1 is a whole branch, which has no share number
+        use crate::cash_key::BranchKind;
+        let mut h = Harness::new();
+        for kind in [BranchKind::Legacy, BranchKind::Superseded] {
+            let on_file = legacy_cx1(kind);
+            let update = proof_cmd(&format!(
+                r#""action":"update","share":1,"cx1":"{}","on_file":"{on_file}","on_file_share":0"#,
+                share_cx1(&[7u8; 32], "moneyer.dev", 1)
+            ));
+            let unregister = proof_cmd(&format!(r#""action":"unregister","on_file":"{on_file}","on_file_share":0"#));
+            for cmd in [update, unregister] {
+                assert_eq!(h.run(&cmd)["error"], "bad_request", "{cmd}");
+            }
+        }
+        assert!(h.proof_asked.is_empty());
     }
 
     #[test]

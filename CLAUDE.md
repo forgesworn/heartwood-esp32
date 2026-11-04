@@ -348,7 +348,11 @@ on both backends against lnurlcash-conformance 0.16.2's `part2.json`,
 `nostr-seed.json` and `spec-vectors.json` `lud26`, fixtures
 `common/tests/fixtures/lud26-*.json`). Account 0 only, and only its share
 chain: `S/0'/0` and `S/0'/1` (a wallet's own notes) are never derived here.
-Shares are 0 to 19 (`cash_key::SHARE_LIMIT`) everywhere: a wrap names the
+Shares are 0 to 19 (`cash_key::SHARE_LIMIT`) everywhere, a lifetime budget
+per mint rather than a count of names: moneyer and lnurl-mint burn every share
+key they accept and keep it burnt after a move or unregister ("cx1 already
+used"), so each register and each move spends one for good. The device records
+none; hosts keep the count (notecase's `heartwoodShares`). A wrap names the
 note index and not the share, so `open_key_note` and a `p`-naming claim try
 every share the device can hand out, then both legacy branches on the purposed
 and the pre-purpose tweak (`cash_key::claim_note_key`), where the names
@@ -382,8 +386,8 @@ identity's are refused by `note_cmd::address_proof_ask` before the card,
 relay precheck and dispatcher alike. Reply: `{ok, share?, cx1?, sig, pubkey,
 newsig?, newpubkey?}`, no echo of the request; the message is bound to the
 portless domain and the cx1 is the device's lowercase spelling. Release
-image cost of the change, local V4 build: +5,744 B (main had 8,112 B spare
-on CI's V4 gate at `d4a59df`). The card is ADDRESS PROOF over
+image cost of the change, CI's V4 gate at `24ad6f6`: +5,760 B, leaving 2,352 B
+spare (2,094,800 of 2,097,152; main had 8,112 B spare at `d4a59df`). The card is ADDRESS PROOF over
 `<name>@<domain>` and `register, share 3`, `move: old keys > share 3` or
 `unregister, share 3` (at most 25 chars, pinned by a test). Line one always
 shows the WHOLE domain; past 25 chars the name is cut to its head and tail

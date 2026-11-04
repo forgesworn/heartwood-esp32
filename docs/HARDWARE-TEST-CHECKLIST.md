@@ -3430,3 +3430,8 @@ partition table, see the V4 notes); the stored notes must survive it.
 9. Timing: a wrap for a key on old keys is found only after all twenty
    shares are tried. Note how long the RECEIVE toast takes for one on share 0
    and one on old keys, and that the relay loop keeps answering meanwhile.
+   Then send a batch of ten junk wraps (a key note for a key the device does
+   not hold) and reboot: each is searched on all twenty shares and both old
+   branches before any card, and again on every catch-up after a reboot.
+   Time the relay loop through the batch; if it stalls noticeably, cache each
+   mint's share public keys in RAM before release.

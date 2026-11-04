@@ -357,9 +357,14 @@ its key, and nothing re-derives it to spend. Wire (one capability,
 `note_address_v2`, for all three methods, replacing `note_address_proof_v1`;
 a second string measured once at about 850 B of image, the capability list
 being a json! array):
-`heartwood_note_address {host, share}` (share REQUIRED, so an old host gets
-`bad_request`, never the whole branch) answers `{ok, host, share, cx1,
-pubkey}`; `heartwood_note_claim` takes an
+`heartwood_note_address` takes exactly one of `{host, share}`, answering
+`{ok, host, share, cx1, pubkey}` with the share's 65-byte cx1, or `{host,
+branch: "legacy"|"superseded"}`, answering `{ok, host, branch, cx1, pubkey}`
+with that whole branch's 64-byte cx1 (hashed on the host as stored), which a
+host needs as `on_file` to move or clear a name still registered to it and to
+scan it for payments whose wrap never arrived; neither (an old host) is
+`bad_request`. No card either way: both are watch-only, and go only to paired
+clients, as before; `heartwood_note_claim` takes an
 optional `share` (tried first; required when there is no `p`) and answers
 `share` or `branch` (`legacy`/`superseded`) for where the key was.
 `heartwood_note_address_proof {host, name, action, ...}`: `register` takes
@@ -380,7 +385,13 @@ portless domain and the cx1 is the device's lowercase spelling. Release
 image cost of the change, local V4 build: +5,744 B (main had 8,112 B spare
 on CI's V4 gate at `d4a59df`). The card is ADDRESS PROOF over
 `<name>@<domain>` and `register, share 3`, `move: old keys > share 3` or
-`unregister, share 3` (at most 25 chars, pinned by a test). Every gating rule
+`unregister, share 3` (at most 25 chars, pinned by a test). Line one always
+shows the WHOLE domain; past 25 chars the name is cut to its head and tail
+around `..` (`note_cmd::card_address`), and a domain that leaves room for
+fewer than three of the name's characters is refused before the card rather
+than shown in part. A host whose portless domain is empty (`:8443`) or starts
+or ends with a dot is refused by `cash_key::valid_mint_host` in
+`cash_address` and `address_proof_ask` alike. Every gating rule
 below is unchanged.
 
 Address proofs (2026-10-05, checklist section 34; its message and key are

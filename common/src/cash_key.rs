@@ -218,6 +218,14 @@ pub enum BranchKind {
 }
 
 impl BranchKind {
+    pub fn parse(kind: &str) -> Option<Self> {
+        match kind {
+            "legacy" => Some(Self::Legacy),
+            "superseded" => Some(Self::Superseded),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Legacy => "legacy",
@@ -351,6 +359,20 @@ pub fn note_pubkey(secret: &[u8; 32]) -> Result<[u8; 32], &'static str> {
 /// `moneyer.dev`. The locker stores the endpoint; keys are per mint.
 pub fn branch_host(note_host: &str) -> &str {
     note_host.split('/').next().unwrap_or(note_host)
+}
+
+/// A mint host [`crate::cash_store::valid_host`] admits whose
+/// [`spend_domain`] also names something: not empty (`:8443`) and neither
+/// starting nor ending with a dot (`moneyer.dev.`). A share and a proof are
+/// bound to that domain, so one that no mint can have is refused before
+/// anything is derived or shown.
+pub fn valid_mint_host(host: &str) -> bool {
+    if !crate::cash_store::valid_host(host) {
+        return false;
+    }
+    // valid_host admits no `/` and no uppercase, so this is spend_domain
+    let domain = host.split(':').next().unwrap_or(host);
+    !domain.is_empty() && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
 /// The domain a spend, a share's `S` and an address proof are bound to: the

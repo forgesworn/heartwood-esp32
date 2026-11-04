@@ -751,26 +751,49 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             // why there is one share per name or counterparty and it goes to a
             // bound client and, from there, to the one mint it is for.
             //
-            // `share` is required: a host that does not name one is a host
-            // from before LUD-26 asking for the whole branch, which no mint
-            // takes any more and which this device no longer hands out.
+            // Exactly one of `share` (a LUD-26 share, what a name is
+            // registered to now) or `branch` (`legacy` or `superseded`: the
+            // 64-byte whole-branch cx1 this device handed out before LUD-26,
+            // which no mint registers any more but under which a name may
+            // still be on file, so a host needs it as `on_file` to move or
+            // clear that name, and to scan it for payments whose wrap never
+            // arrived). A request naming neither is a host from before
+            // LUD-26, and gets neither.
             let Some(identity) = ctx.identity else {
                 return err_msg("bad_request", "cash_address is not available on this surface");
             };
             let Some(host) = str_field(&cmd, "host") else {
                 return err_msg("bad_request", "host is required");
             };
-            if !crate::cash_store::valid_host(host) {
+            if !crate::cash_key::valid_mint_host(host) {
                 return err_msg("bad_request", "host must be a lowercase mint host");
             }
             let share = match share_field(&cmd, "share") {
-                Ok(Some(share)) => share,
-                Ok(None) => return err_msg("bad_request", "share is required"),
+                Ok(share) => share,
                 Err(m) => return err_msg("bad_request", m),
             };
-            let cx1 = match crate::cash_key::share_node(identity, host, share)
-                .and_then(|node| crate::cash_key::share_cx1_of(&node))
-            {
+            let branch = match cmd.get("branch") {
+                None | Some(Value::Null) => None,
+                Some(v) => match v.as_str().and_then(crate::cash_key::BranchKind::parse) {
+                    Some(kind) => Some(kind),
+                    None => return err_msg("bad_request", "branch must be legacy or superseded"),
+                },
+            };
+            let mut obj = Map::new();
+            obj.insert("ok".into(), Value::Bool(true));
+            obj.insert("host".into(), json!(host));
+            let cx1 = match (share, branch) {
+                (Some(share), None) => {
+                    obj.insert("share".into(), json!(share));
+                    crate::cash_key::share_node(identity, host, share).and_then(|node| crate::cash_key::share_cx1_of(&node))
+                }
+                (None, Some(kind)) => {
+                    obj.insert("branch".into(), json!(kind.as_str()));
+                    crate::cash_key::legacy_branch(identity, host, kind).and_then(|node| crate::cash_key::cx1_of(&node))
+                }
+                _ => return err_msg("bad_request", "exactly one of share or branch is required"),
+            };
+            let cx1 = match cx1 {
                 Ok(cx1) => cx1,
                 Err(m) => return err_msg("bad_request", m),
             };
@@ -778,14 +801,10 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
                 return err("bad_request");
             };
             // The owner's key comes back with it, so a client can check the
-            // share belongs to the npub the lightning address does.
-            json!({
-                "ok": true,
-                "host": host,
-                "share": share,
-                "cx1": cx1,
-                "pubkey": hex_encode(&pubkey),
-            })
+            // keys belong to the npub the lightning address does.
+            obj.insert("cx1".into(), json!(cx1));
+            obj.insert("pubkey".into(), json!(hex_encode(&pubkey)));
+            Value::Object(obj)
         }
 
         #[cfg(feature = "cash")]
@@ -1217,13 +1236,16 @@ impl AddressProofAsk<'_> {
 pub fn address_proof_ask<'a>(cmd: &'a Value, identity: &[u8; 32]) -> Result<AddressProofAsk<'a>, &'static str> {
     use crate::cash_key::{AddressAction, ProofKey};
     let host = str_field(cmd, "host").ok_or("host is required")?;
-    if !crate::cash_store::valid_host(host) {
+    if !crate::cash_key::valid_mint_host(host) {
         return Err("host must be a lowercase mint host");
     }
     let name = str_field(cmd, "name").ok_or("name is required")?;
     if !crate::cash_key::valid_username(name) {
         return Err("a name is 3 to 32 of a-z, 0-9, dot, dash or underscore, starting with a letter or digit");
     }
+    // The card shows the whole domain; one too long to leave room for the
+    // name is refused rather than shown in part.
+    card_address(name, &crate::cash_key::spend_domain(host)).ok_or("that mint's domain is too long for the card")?;
     let action = str_field(cmd, "action")
         .and_then(AddressAction::parse)
         .ok_or("action must be register, update or unregister")?;
@@ -1265,6 +1287,25 @@ pub fn address_proof_ask<'a>(cmd: &'a Value, identity: &[u8; 32]) -> Result<Addr
 #[cfg(feature = "cash")]
 const UNEXPECTED_FIELD: &str = "a field this action does not take";
 
+/// Line one of an address-proof card: always the whole domain, and the name
+/// beside it, its head and tail around `..` when the two do not fit one card
+/// line together. `None` when the domain leaves room for fewer than three of
+/// the name's characters, which the card would have to guess at. Both are
+/// ASCII by then (valid_mint_host, valid_username), so byte slicing is safe.
+#[cfg(feature = "cash")]
+fn card_address(name: &str, domain: &str) -> Option<String> {
+    let line = crate::note_fmt::CARD_LINE_CHARS;
+    if name.len() + 1 + domain.len() <= line {
+        return Some(format!("{name}@{domain}"));
+    }
+    let room = line.checked_sub(domain.len() + 3)?;
+    if room < 3 {
+        return None;
+    }
+    let tail = room / 2;
+    Some(format!("{}..{}@{domain}", &name[..room - tail], &name[name.len() - tail..]))
+}
+
 /// The header an address-proof card is drawn under, on every surface.
 #[cfg(feature = "cash")]
 pub const ADDRESS_PROOF_HEADER: &str = "ADDRESS PROOF";
@@ -1273,9 +1314,10 @@ pub const ADDRESS_PROOF_HEADER: &str = "ADDRESS PROOF";
 ///
 /// Line one is the lightning address the proof is about, `name@domain`: the
 /// domain the proof is bound to, which is the address as anyone writes it.
-/// Middle-elided past one card line, as the trust and mint cards elide, so
-/// both the start of the name and the tail of the domain (where a lookalike
-/// differs) stay on screen; validation before the card keeps it ASCII.
+/// The domain is always shown whole, since it is what the proof is bound to;
+/// past one card line the NAME is shortened to its head and tail
+/// ([`card_address`]), and a domain too long to leave room for it is refused
+/// before the card.
 ///
 /// Line two is what is agreed to and by which keys: `register, share 3`,
 /// `move: old keys > share 3` (an update, from the key on file to the new
@@ -1288,12 +1330,13 @@ pub const ADDRESS_PROOF_HEADER: &str = "ADDRESS PROOF";
 #[cfg(feature = "cash")]
 pub fn address_proof_card(ask: &AddressProofAsk<'_>) -> (&'static str, String) {
     use crate::cash_key::{AddressAction, ProofKey};
-    let address = format!("{}@{}", ask.name, crate::cash_key::spend_domain(ask.host));
-    let shown = if address.len() <= crate::note_fmt::CARD_LINE_CHARS {
-        address
-    } else {
-        format!("{}..{}", &address[..12], &address[address.len() - 8..])
-    };
+    let domain = crate::cash_key::spend_domain(ask.host);
+    // address_proof_ask refuses a domain this cannot show; only a hand-built
+    // ask reaches the fallback, which shows the domain's end.
+    let shown = card_address(ask.name, &domain).unwrap_or_else(|| {
+        let keep = crate::note_fmt::CARD_LINE_CHARS - 2;
+        format!("..{}", &domain[domain.len().saturating_sub(keep)..])
+    });
     let keys = |key: ProofKey| match key {
         ProofKey::Share(n) => format!("share {n}"),
         ProofKey::Branch(_) => "old keys".to_string(),
@@ -3543,7 +3586,7 @@ mod tests {
             all
         };
         for name in ["abc", "alice", long_name.as_str()] {
-            for host in ["moneyer.dev", "moneyer.dev:8443", "a-very-long-mint-hostname.example.com"] {
+            for host in ["moneyer.dev", "moneyer.dev:8443", "mint.lnurlcash.com", "a-very-long-mint-hostname.example.com"] {
                 for ask in asks(host, name) {
                     let (header, title) = address_proof_card(&ask);
                     assert_eq!(header, "ADDRESS PROOF");
@@ -3551,6 +3594,14 @@ mod tests {
                     assert_eq!(lines.len(), 2, "{title}");
                     for line in &lines {
                         assert!(line.len() <= crate::note_fmt::CARD_LINE_CHARS, "{line}");
+                    }
+                    // the whole domain whenever the ask would be accepted;
+                    // only a hand-built ask past that shows the domain's end
+                    let domain = crate::cash_key::spend_domain(host);
+                    if card_address(name, &domain).is_some() {
+                        assert!(lines[0].ends_with(&format!("@{domain}")), "{title}");
+                    } else {
+                        assert!(lines[0].starts_with("..") && lines[0].ends_with(".example.com"), "{title}");
                     }
                     let verb = if ask.action == AddressAction::Update { "move" } else { ask.action.as_str() };
                     assert!(lines[1].starts_with(verb), "{title}");
@@ -3562,7 +3613,7 @@ mod tests {
             }
         }
         // The port is in the host, not the address; a long address keeps
-        // the head of the name and the tail of the domain.
+        // the whole domain and shortens the name.
         let ask = |host, name| AddressProofAsk {
             host,
             name,
@@ -3573,12 +3624,102 @@ mod tests {
         assert_eq!(address_proof_card(&ask("moneyer.dev:8443", "alice")).1, "alice@moneyer.dev\nregister, share 0");
         assert_eq!(
             address_proof_card(&ask("moneyer.dev", "averyveryverylongname")).1,
-            "averyveryver..eyer.dev\nregister, share 0"
+            "averyv..gname@moneyer.dev\nregister, share 0"
         );
         assert_eq!(
             address_proof_card(&AddressProofAsk { share: Some(19), signer: ProofKey::Share(18), action: AddressAction::Update, ..ask("moneyer.dev", "alice") }).1.lines().nth(1).unwrap().len(),
             25
         );
+    }
+
+    #[test]
+    fn the_card_always_shows_the_whole_domain_or_refuses() {
+        let long = "z".repeat(32);
+        // fits whole
+        assert_eq!(card_address("alice", "moneyer.dev").unwrap(), "alice@moneyer.dev");
+        // a long name is shortened, head and tail, and the domain kept
+        let line = card_address(&long, "mint.lnurlcash.com").unwrap();
+        assert_eq!(line, "zz..zz@mint.lnurlcash.com");
+        assert_eq!(line.len(), crate::note_fmt::CARD_LINE_CHARS);
+        assert_eq!(card_address("abcdefghijklmnopqrst", "moneyer.dev").unwrap(), "abcdef..pqrst@moneyer.dev");
+        // the longest domain that still leaves three of a long name: 19
+        assert!(card_address(&long, &"d".repeat(19)).is_some());
+        assert!(card_address(&long, &"d".repeat(20)).is_none());
+        // a short name fits beside a longer domain whole
+        assert_eq!(card_address("abc", &"d".repeat(21)).unwrap(), format!("abc@{}", "d".repeat(21)));
+        assert!(card_address("abc", &"d".repeat(22)).is_none());
+
+        // and the ask refuses before any card what the card cannot show
+        let mut h = Harness::new();
+        let host = "mint.longhost.example";
+        let cx1 = share_cx1(&[7u8; 32], host, 0);
+        let ask = |name: &str| {
+            format!(r#"{{"cmd":"cash_address_proof","host":"{host}","name":"{name}","action":"register","share":0,"cx1":"{cx1}"}}"#)
+        };
+        assert_eq!(h.run(&ask(&long))["error"], "bad_request");
+        assert!(h.proof_asked.is_empty());
+        assert_eq!(h.run(&ask("abc"))["ok"], true);
+        assert_eq!(h.proof_asked[0].1.lines().next().unwrap(), format!("abc@{host}"));
+    }
+
+    #[test]
+    fn a_host_whose_domain_is_empty_or_dotted_is_refused_before_anything() {
+        let mut h = Harness::new();
+        for host in [":x", ":8443", "moneyer.dev.", ".moneyer.dev", "moneyer.dev.:8443", "."] {
+            let res = h.run(&format!(r#"{{"cmd":"cash_address","host":"{host}","share":0}}"#));
+            assert_eq!(res["error"], "bad_request", "{host}");
+            let res = h.run(&format!(r#"{{"cmd":"cash_address","host":"{host}","branch":"legacy"}}"#));
+            assert_eq!(res["error"], "bad_request", "{host}");
+            let res = h.run(&format!(
+                r#"{{"cmd":"cash_address_proof","host":"{host}","name":"alice","action":"unregister","on_file":"{}"}}"#,
+                share_cx1(&[7u8; 32], "moneyer.dev", 0)
+            ));
+            assert_eq!(res["error"], "bad_request", "{host}");
+            assert!(!crate::cash_key::valid_mint_host(host), "{host}");
+        }
+        assert!(h.proof_asked.is_empty());
+        for good in ["moneyer.dev", "moneyer.dev:8443", "127.0.0.1:8899", "localhost"] {
+            assert!(crate::cash_key::valid_mint_host(good), "{good}");
+        }
+    }
+
+    #[test]
+    fn cash_address_hands_out_a_legacy_branch_to_move_a_name_off() {
+        use crate::cash_key::BranchKind;
+        let mut h = Harness::new();
+        for kind in [BranchKind::Legacy, BranchKind::Superseded] {
+            let res = h.run(&format!(r#"{{"cmd":"cash_address","host":"moneyer.dev","branch":"{}"}}"#, kind.as_str()));
+            assert_eq!(res["ok"], true, "{res}");
+            let cx1 = legacy_cx1(kind);
+            assert_eq!(cx1.len(), 112);
+            assert_eq!((res["branch"].clone(), res["cx1"].clone()), (json!(kind.as_str()), json!(cx1)));
+            assert!(res.get("share").is_none());
+            assert_eq!(res["pubkey"], hex_encode(&crate::derive::public_key_xonly(&[7u8; 32]).unwrap()));
+            // and it is exactly the on_file that moves the name to a share
+            let res = h.run(&update_cmd(0, res["cx1"].as_str().unwrap()));
+            assert_eq!(res["ok"], true, "{res}");
+        }
+        // a legacy branch hashes the host as stored, port and all
+        let res = h.run(r#"{"cmd":"cash_address","host":"moneyer.dev:8443","branch":"legacy"}"#);
+        let ported = crate::cash_key::legacy_branch(&[7u8; 32], "moneyer.dev:8443", BranchKind::Legacy).unwrap();
+        assert_eq!(res["cx1"], crate::cash_key::cx1_of(&ported).unwrap());
+        // exactly one of share and branch, and only those two branches
+        for bad in [
+            r#""share":0,"branch":"legacy""#,
+            r#""branch":"current""#,
+            r#""branch":"Legacy""#,
+            r#""branch":1"#,
+            r#""branch":"legacy","share":"0""#,
+        ] {
+            let res = h.run(&format!(r#"{{"cmd":"cash_address","host":"moneyer.dev",{bad}}}"#));
+            assert_eq!(res["error"], "bad_request", "{bad}");
+            assert!(res.get("cx1").is_none(), "{bad}");
+        }
+        // no card: it is as public as a share's cx1
+        assert_eq!(h.proof_asked.len(), 2, "only the two updates held");
+        assert!(h.asked.is_empty());
+        h.identity = None;
+        assert_eq!(h.run(r#"{"cmd":"cash_address","host":"moneyer.dev","branch":"legacy"}"#)["error"], "bad_request");
     }
 
     #[test]

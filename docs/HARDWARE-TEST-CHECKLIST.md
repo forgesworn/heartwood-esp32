@@ -3387,19 +3387,21 @@ partition table, see the V4 notes); the stored notes must survive it.
    `share` 0 and a 113-character `cx1` starting `cx1`,
    with NO card; the same request again answers the same `cx1`; `share` 1
    answers a different one. With no `share`, or `share` 20, it answers
-   `bad_request` and no `cx1`.
+   `bad_request` and no `cx1`. `{"host":"moneyer.dev","branch":"legacy"}`
+   answers `branch` and the 112-character whole-branch `cx1` the bench names
+   are on file with (compare it with the mint's record); `superseded` the
+   older one; both `share` and `branch` is `bad_request`.
 3. Move a legacy name (one of the bench names at moneyer.dev, on file with the
    64-byte whole branch): `heartwood_note_address_proof` with
    `{"host":"moneyer.dev","name":"<name>","action":"update","share":0,
-   "cx1":"<share 0 cx1>","on_file":"<the 64-byte cx1 on file>"}`. Expect ONE
+   "cx1":"<share 0 cx1>","on_file":"<item 2's branch cx1>"}`. Expect ONE
    ADDRESS PROOF card reading `<name>@moneyer.dev` over
    `move: old keys > share 0` (watch the OLED); hold. The reply has `sig`,
    `pubkey` (x(P) of the branch, the key its 64-byte cx1 carries) and
    `newsig`, `newpubkey`. PUT `cx1`, `sig`, `newsig` to
    `/.well-known/lnurlp/<name>`: moneyer answers `{"status":"OK"}` and the
-   name's cx1 is now the share's. If moneyer refuses the x(P) proof, record
-   the reason: the alternative is the old index-0 key, which this firmware no
-   longer signs with.
+   name's cx1 is now the share's (moneyer's `shares.ts` takes a legacy row's
+   proof from the branch key x(P), the first of its `proofKeys`).
 4. Pay the moved name a few sats: the wrap opens to a note on share 0 (no
    card from a trusted mint key, as in 15.2), and `heartwood_note_list` shows
    it CONFIRMED with its `p` and `index`. A payment that landed on the old
@@ -3407,6 +3409,8 @@ partition table, see the V4 notes); the stored notes must survive it.
 5. Register a fresh name: `action` `register` with `share` 1 and its `cx1`
    reads `register, share 1`; POST `cx1` and `sig` to the spec route (or
    `/names` with NIP-98): moneyer answers OK (or a `pr` for the address fee).
+   A name of 30 characters reads as its head and tail around `..` beside the
+   whole `@moneyer.dev`.
    Unregister it: `{"action":"unregister","on_file":"<share 1 cx1>"}` reads
    `unregister, share 1`; DELETE with `sig` clears the share.
 6. `heartwood_note_claim` with `{"host":"moneyer.dev/w","index":<i>,
@@ -3417,7 +3421,8 @@ partition table, see the V4 notes); the stored notes must survive it.
    64-byte whole branch, a `cx1` that is not the named `share`, another npub's
    `cx1` or this npub's at another mint, an update whose `on_file` is the
    share it moves to, an unregister carrying `cx1` or `share` (the v1 shape),
-   a register carrying `on_file`, and section 34's name and host cases.
+   a register carrying `on_file`, a host `moneyer.dev.` or `:8443`, and
+   section 34's name and host cases.
 8. Rerun section 34 items 4 to 9 on the new shape (decline and timeout sign
    nothing; pinned always-ask with an auto-approve policy; two proofs back to
    back raise two cards; an escalate slot refuses outright; the USB-bridged

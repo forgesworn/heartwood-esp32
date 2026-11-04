@@ -33,7 +33,9 @@ pub fn decode_npub(value: &str) -> Option<[u8; 32]> {
 // key Q, `ck1` its key-path spend (Q then a 64-byte BIP-340 signature, the
 // note's bearer credential), `cs1` a mint's 65-byte certificate, whose hrp
 // also carries the amount as a BOLT11 suffix (`cs210n1...` certifies
-// 21,000 msat), and `cx1` a watch-only branch, x-only key then chain code.
+// 21,000 msat), and `cx1` a watch-only key: since LUD-26 a share's chain
+// code then compressed point (65 bytes), before it a whole branch's x-only
+// key then chain code (64 bytes), told apart by length.
 // Graded against lnurlcash-conformance's `part2.json`.
 //
 // Strict on the way in, as BIP-350 and the reference mint are: a bech32 (not
@@ -98,6 +100,9 @@ fn bolt11_amount_suffix(suffix: &str) -> bool {
     !digits.is_empty() && !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The superseded whole-branch `cx1`: x-only key then chain code, 64 bytes.
+/// Read to recognise a branch a name was registered with before LUD-26;
+/// never handed out any more.
 pub fn encode_cx1(pubkey_x_only: &[u8; 32], chain_code: &[u8; 32]) -> String {
     let mut bytes = [0u8; 64];
     bytes[..32].copy_from_slice(pubkey_x_only);
@@ -112,6 +117,31 @@ pub fn decode_cx1(value: &str) -> Option<([u8; 32], [u8; 32])> {
     pubkey.copy_from_slice(&bytes[..32]);
     chain_code.copy_from_slice(&bytes[32..]);
     Some((pubkey, chain_code))
+}
+
+/// LUD-26's `cx1`: a share's BIP-32 extended public key, chain code then the
+/// compressed point, 65 bytes and 113 characters (BIP-32's own order, the
+/// reverse of the superseded shape above).
+pub fn encode_share_cx1(chain_code: &[u8; 32], point: &[u8; 33]) -> String {
+    let mut bytes = [0u8; 65];
+    bytes[..32].copy_from_slice(chain_code);
+    bytes[32..].copy_from_slice(point);
+    encode_fixed("cx", &bytes)
+}
+
+/// A share `cx1` as (chain code, compressed point). The point's prefix must
+/// be 02 or 03; whether it is on the curve is not checked here, since the
+/// one use this device has for a `cx1` is to compare it with one of its own.
+pub fn decode_share_cx1(value: &str) -> Option<([u8; 32], [u8; 33])> {
+    let bytes = decode_fixed::<65>("cx", value)?;
+    if !matches!(bytes[32], 0x02 | 0x03) {
+        return None;
+    }
+    let mut chain_code = [0u8; 32];
+    let mut point = [0u8; 33];
+    chain_code.copy_from_slice(&bytes[..32]);
+    point.copy_from_slice(&bytes[32..]);
+    Some((chain_code, point))
 }
 
 /// Short, OLED-safe label for a signing client that supplied no name: the
@@ -335,6 +365,51 @@ mod tests {
         let chain = unhex::<32>(text(branch, "chainCode"));
         assert_eq!(encode_cx1(&pubkey, &chain), text(branch, "cx1"));
         assert_eq!(decode_cx1(text(branch, "cx1")), Some((pubkey, chain)));
+    }
+
+    #[test]
+    fn lud26_share_cx1s_match_the_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/lud26-part2.json")).unwrap();
+        for branch in vectors["branches"].as_array().expect("branches") {
+            for account in branch["accounts"].as_array().expect("accounts") {
+                for share in account["shares"].as_array().expect("shares") {
+                    let chain = unhex::<32>(text(share, "chainCode"));
+                    let point = unhex::<33>(text(share, "sharePubkey"));
+                    let cx1 = text(share, "cx1");
+                    assert_eq!(cx1.len(), 113);
+                    assert_eq!(encode_share_cx1(&chain, &point), cx1);
+                    assert_eq!(decode_share_cx1(cx1), Some((chain, point)));
+                    // a share is never read as the superseded shape
+                    assert_eq!(decode_cx1(cx1), None);
+                }
+            }
+        }
+        let mut seen = 0;
+        for case in vectors["valid"].as_array().unwrap().iter().chain(vectors["invalid"].as_array().unwrap()) {
+            if text(case, "type") != "cx1" {
+                continue;
+            }
+            seen += 1;
+            let value = text(case, "value");
+            let why = text(case, "why");
+            match case.get("bytes").and_then(|b| b.as_str()) {
+                // valid: the uppercase spelling decodes to the same bytes
+                Some(bytes) => {
+                    let (chain, point) = decode_share_cx1(value).expect(why);
+                    let mut both = chain.to_vec();
+                    both.extend_from_slice(&point);
+                    assert_eq!(crate::hex::hex_encode(&both), bytes, "{why}");
+                }
+                None if why.contains("not on the curve") => {
+                    // shape only here; no point off the curve is ever one of
+                    // this device's shares, which is where it is refused
+                    assert!(decode_share_cx1(value).is_some(), "{why}");
+                }
+                None => assert_eq!(decode_share_cx1(value), None, "{why}"),
+            }
+        }
+        assert_eq!(seen, 5);
     }
 
     #[test]

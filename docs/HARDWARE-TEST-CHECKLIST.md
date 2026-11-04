@@ -2818,6 +2818,12 @@ dispatch without a card, so nothing parks.
 
 ## 34. Address proofs (LUD-25; added 2026-10-05, NOT YET BENCH-RUN)
 
+SUPERSEDED 2026-11-04 by section 39: the message, the signing key and the
+request shape below are gone (`note_address_proof_v1` is no longer
+advertised). Items 3 to 9 (refusal before the card, decline, pinned
+always-ask, never batched, escalate refused, the USB-bridged card, unbound)
+still describe the gating, and section 39 reruns them on the new shape.
+
 Since LUD-25 `50d740a` (moneyer 0.17) a mint changes or clears a name's `cx1`
 only with `"sig"`: a BIP-340 signature by the purpose-0 index-0 key of the
 branch CURRENTLY on file, over `sha256("LNURLcash:<register|unregister>:
@@ -3361,3 +3367,62 @@ connect, holds a REQ about 5 s for a sign-in, and answers `auth-required:` /
    unlock (kind 24136) arrives and unlocks the board.
 8. Publish-only. During a phone relay-update round (section 29's relay
    change) on this relay, the publish-only connection sends no 22242.
+
+## 39. LUD-26 shares and address proofs (added 2026-11-04, NOT YET BENCH-RUN)
+
+moneyer 0.22.0 and dni's lnurl-mint take only LUD-26 (luds `92e430f`): a
+name is registered to a share's 65-byte `cx1`, `S/0'/2/n'` below
+`S = m/139'/d1..d4` (d1..d4 hashed from the mint's hostname WITHOUT its
+port), and its notes are `S/0'/2/n'/i`, plain BIP-32. Advertised as
+`note_address_v2` and `note_address_proof_v2` in get_status (no
+`note_address_proof_v1`). Shares are 0 to 19. Drive it with
+scripts/nip46-client.mjs from a bound slot until notecase grows the
+commands. Release build only, app-only flash on the bench V4 (its one-off
+partition table, see the V4 notes); the stored notes must survive it.
+
+1. Stored notes survive: before flashing, record `heartwood_note_list`; after,
+   every note is still listed in the same state, and a key note collected
+   (`heartwood collect`) still releases a `ck1` the mint accepts (the key is
+   stored; nothing is re-derived).
+2. `heartwood_note_address` with `{"host":"moneyer.dev","share":0}` answers
+   `share` 0, `domain` `moneyer.dev` and a 113-character `cx1` starting `cx1`,
+   with NO card; the same request again answers the same `cx1`; `share` 1
+   answers a different one. With no `share`, or `share` 20, it answers
+   `bad_request` and no `cx1`.
+3. Move a legacy name (one of the bench names at moneyer.dev, on file with the
+   64-byte whole branch): `heartwood_note_address_proof` with
+   `{"host":"moneyer.dev","name":"<name>","action":"update","share":0,
+   "cx1":"<share 0 cx1>","on_file":"<the 64-byte cx1 on file>"}`. Expect ONE
+   ADDRESS PROOF card reading `<name>@moneyer.dev` over
+   `move: old keys > share 0` (watch the OLED); hold. The reply has `signer`
+   `legacy` (or `superseded`), `sig`, `pubkey` (x(P) of the branch) and
+   `newsig`, `newpubkey`. PUT `cx1`, `sig`, `newsig` to
+   `/.well-known/lnurlp/<name>`: moneyer answers `{"status":"OK"}` and the
+   name's cx1 is now the share's. If moneyer refuses the x(P) proof, record
+   the reason: the alternative is the old index-0 key, which this firmware no
+   longer signs with.
+4. Pay the moved name a few sats: the wrap opens to a note on share 0 (no
+   card from a trusted mint key, as in 15.2), and `heartwood_note_list` shows
+   it CONFIRMED with its `p` and `index`. A payment that landed on the old
+   branch before the move still opens (15.2 again, on old keys).
+5. Register a fresh name: `action` `register` with `share` 1 and its `cx1`
+   reads `register, share 1`; POST `cx1` and `sig` to the spec route (or
+   `/names` with NIP-98): moneyer answers OK (or a `pr` for the address fee).
+   Unregister it: `{"action":"unregister","on_file":"<share 1 cx1>"}` reads
+   `unregister, share 1`; DELETE with `sig` clears the share.
+6. `heartwood_note_claim` with `{"host":"moneyer.dev/w","index":<i>,
+   "amount_msat":<m>,"p":"<cp1>"}` for a share note found by a scan answers
+   `share` n; one for a note on old keys answers `branch` `legacy`. Without
+   `p` it needs `share`, else `bad_request`.
+7. Refused with NO card, `bad_request` each time: a register naming the
+   64-byte whole branch, a `cx1` that is not the named `share`, another npub's
+   `cx1` or this npub's at another mint, an update whose `on_file` is the
+   share it moves to, an unregister carrying `cx1` or `share` (the v1 shape),
+   a register carrying `on_file`, and section 34's name and host cases.
+8. Rerun section 34 items 4 to 9 on the new shape (decline and timeout sign
+   nothing; pinned always-ask with an auto-approve policy; two proofs back to
+   back raise two cards; an escalate slot refuses outright; the USB-bridged
+   card is the generic extension card; an unbound client is `unauthorised`).
+9. Timing: a wrap for a key on old keys is found only after all twenty
+   shares are tried. Note how long the RECEIVE toast takes for one on share 0
+   and one on old keys, and that the relay loop keeps answering meanwhile.

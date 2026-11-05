@@ -3368,7 +3368,25 @@ connect, holds a REQ about 5 s for a sign-in, and answers `auth-required:` /
 8. Publish-only. During a phone relay-update round (section 29's relay
    change) on this relay, the publish-only connection sends no 22242.
 
-## 39. LUD-26 shares and address proofs (added 2026-11-04, NOT YET BENCH-RUN)
+## 39. LUD-26 shares and address proofs (added 2026-11-04; items 1-3 run 2026-11-05 on a T-Display)
+
+**Run 2026-11-05, on the owner's live T-Display, not the bench V4.** CI's
+`app-tdisplay` artifact from `01e2b5f`, app-only at 0x10000 (partitions-4mb:
+factory 0x10000, 3 MB) after a full 4 MB read-back kept as the rollback; the
+version string is unchanged (0.18.0-beta.29), so the build is told apart by
+behaviour. Driven by notecase's `feat/heartwood-lud26-shares` over the relay.
+- Item 1, partly: every stored note listed in the same state after the flash.
+  Not yet run: collecting a key note to show its `ck1` still releases.
+- Item 2: share 0 is a 113-character `cx1`, the same on a second ask; share 1
+  differs; share 20 is `bad_request`; `legacy` is the 112-character branch the
+  mint has on file, `superseded` another. The no-`share` and both-fields cases
+  were left to the host tests.
+- Item 3: two live names at moneyer.dev moved off the legacy branch, one card
+  each, onto shares 0 and 1; the mint then held each share's 113-character
+  `cx1`. A scan of 188 keys afterwards found nothing unpaid.
+- Not yet run: items 4 to 9, and nothing on the V4 (only CI's size gate,
+  2,352 B spare).
+
 
 moneyer 0.22.0 and dni's lnurl-mint take only LUD-26 (luds `92e430f`): a
 name is registered to a share's 65-byte `cx1`, `S/0'/2/n'` below

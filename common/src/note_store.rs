@@ -135,8 +135,9 @@ pub enum Peer {
 /// key, and the note is spent with a `ck1`, an ownership signature the key
 /// makes, never with the key itself. The mint files the note under `pubkey`.
 ///
-/// `index` is where on the owner's address branch the key sits: kept so a
-/// wallet scanning that branch can tell which keys this locker already holds.
+/// `index` is the note's index on the owner's share (or legacy branch); the
+/// share is not recorded, since the stored key is what spends. Kept so a
+/// wallet scanning can tell which keys this locker already holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyNote {
     pub index: u32,
@@ -1030,7 +1031,7 @@ impl NoteStore {
         // The last creation path that did not do this. `receive`, the two
         // mint paths and `import_key` all make room out of spent records
         // first, so a full locker took a note someone sent, minted one of
-        // its own, and claimed one off the address branch, then refused the
+        // its own, and claimed one off a share, then refused the
         // import, which is how the browser wallet lands a note it has just
         // paid for. Same device, same locker, an answer that depended on
         // which call arrived. Nothing new is reachable by it:

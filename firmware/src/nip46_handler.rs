@@ -2708,8 +2708,8 @@ fn dispatch_inner(
                                     to: &[u8; 32]| {
                         crate::relay::seal_note_wrap(secp, master_secret, secret, meta, to)
                     };
-                    // The served identity is also the root of the address
-                    // branches a mint pays this npub's lightning address to
+                    // The served identity is also the root of the LUD-26
+                    // shares a mint pays this npub's lightning address to
                     // (cash_address, claim_key_note), and of the keys that
                     // sign its address proofs (cash_address_proof).
                     // The client hex is 64 chars here (has_client checked

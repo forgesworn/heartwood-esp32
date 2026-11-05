@@ -2818,6 +2818,12 @@ dispatch without a card, so nothing parks.
 
 ## 34. Address proofs (LUD-25; added 2026-10-05, NOT YET BENCH-RUN)
 
+SUPERSEDED 2026-11-04 by section 39: the message, the signing key and the
+request shape below are gone (`note_address_proof_v1` is no longer
+advertised; `note_address_v2` replaces it). Items 3 to 9 (refusal before the card, decline, pinned
+always-ask, never batched, escalate refused, the USB-bridged card, unbound)
+still describe the gating, and section 39 reruns them on the new shape.
+
 Since LUD-25 `50d740a` (moneyer 0.17) a mint changes or clears a name's `cx1`
 only with `"sig"`: a BIP-340 signature by the purpose-0 index-0 key of the
 branch CURRENTLY on file, over `sha256("LNURLcash:<register|unregister>:
@@ -3361,3 +3367,110 @@ connect, holds a REQ about 5 s for a sign-in, and answers `auth-required:` /
    unlock (kind 24136) arrives and unlocks the board.
 8. Publish-only. During a phone relay-update round (section 29's relay
    change) on this relay, the publish-only connection sends no 22242.
+
+## 39. LUD-26 shares and address proofs (added 2026-11-04; items 1-4, 6, 7 and 9 run in part 2026-11-05 on a T-Display)
+
+**Run 2026-11-05, on the owner's live T-Display, not the bench V4.** CI's
+`app-tdisplay` artifact from `01e2b5f`, app-only at 0x10000 (partitions-4mb:
+factory 0x10000, 3 MB) after a full 4 MB read-back kept as the rollback; the
+version string is unchanged (0.18.0-beta.29), so the build is told apart by
+behaviour. Driven by notecase's `feat/heartwood-lud26-shares` over the relay.
+- Item 1, partly: every stored note listed in the same state after the flash.
+  Not yet run: collecting a key note to show its `ck1` still releases.
+- Item 2: share 0 is a 113-character `cx1`, the same on a second ask; share 1
+  differs; share 20 is `bad_request`; `legacy` is the 112-character branch the
+  mint has on file, `superseded` another. The no-`share` and both-fields cases
+  were left to the host tests.
+- Item 3: two live names at moneyer.dev moved off the legacy branch, one card
+  each, onto shares 0 and 1; the mint then held each share's 113-character
+  `cx1`. A scan of 188 keys afterwards found nothing unpaid.
+- Item 7: all ten refusals (whole-branch register, wrong share, a stranger's
+  `cx1`, this npub's at another mint, update onto the share on file,
+  unregister with `cx1` or `share`, register with `on_file`, `moneyer.dev.`,
+  `:8443`) answered `bad_request` in 1.7 s each, a plain round trip: no card.
+- Item 9, junk half: ten gift-wrapped key notes for keys the device does not
+  hold, published to the relay it was serving (its own gated relay, found by
+  pinging through each relay alone; damus and nos.lol were unreachable from the
+  bench). A no-card ping every 1.5 s held at 1.7 s (worst 3.3 s, as before
+  the batch), none unanswered. After `espflash reset` it answered within about
+  30 s and then at 1.7 s throughout two minutes of catch-up: no stall, so no
+  RAM cache of share keys is needed for this. The timing of a real wrap on
+  share 0 against one on old keys waits on item 4.
+- Item 4, partly: a 26 sat payment to a moved name was minted to its share 1,
+  key 0, and the mint published the wrap 1 s later. No RECEIVE card was seen
+  (the device trusts no senders, and the card's 30 s had likely run out before
+  anyone looked), so the note came in by scan instead: `heartwood_note_claim`
+  derived share 1's key and stored it CONFIRMED (item 6's positive case). Then
+  the wrap itself: after `espflash reset` the catch-up re-read it and the
+  RECEIVE card for it was seen (a card follows only a key found, so it opened
+  on share 1); left to time out, the device still held the one note.
+- Not yet run: 5 (moneyer.dev has registration closed, and
+  a fresh share is spent for life), 8 (needs
+  presses), and nothing on the V4 (only CI's size gate, 2,352 B spare).
+
+
+moneyer 0.22.0 and dni's lnurl-mint take only LUD-26 (luds `92e430f`): a
+name is registered to a share's 65-byte `cx1`, `S/0'/2/n'` below
+`S = m/139'/d1..d4` (d1..d4 hashed from the mint's hostname WITHOUT its
+port), and its notes are `S/0'/2/n'/i`, plain BIP-32. Advertised as
+`note_address_v2` in get_status (no `note_address_proof_v1`). Shares are 0 to 19. Drive it with
+scripts/nip46-client.mjs from a bound slot until notecase grows the
+commands. Release build only, app-only flash on the bench V4 (its one-off
+partition table, see the V4 notes); the stored notes must survive it.
+
+1. Stored notes survive: before flashing, record `heartwood_note_list`; after,
+   every note is still listed in the same state, and a key note collected
+   (`heartwood collect`) still releases a `ck1` the mint accepts (the key is
+   stored; nothing is re-derived).
+2. `heartwood_note_address` with `{"host":"moneyer.dev","share":0}` answers
+   `share` 0 and a 113-character `cx1` starting `cx1`,
+   with NO card; the same request again answers the same `cx1`; `share` 1
+   answers a different one. With no `share`, or `share` 20, it answers
+   `bad_request` and no `cx1`. `{"host":"moneyer.dev","branch":"legacy"}`
+   answers `branch` and the 112-character whole-branch `cx1` the bench names
+   are on file with (compare it with the mint's record); `superseded` the
+   older one; both `share` and `branch` is `bad_request`.
+3. Move a legacy name (one of the bench names at moneyer.dev, on file with the
+   64-byte whole branch): `heartwood_note_address_proof` with
+   `{"host":"moneyer.dev","name":"<name>","action":"update","share":0,
+   "cx1":"<share 0 cx1>","on_file":"<item 2's branch cx1>"}`. Expect ONE
+   ADDRESS PROOF card reading `<name>@moneyer.dev` over
+   `move: old keys > share 0` (watch the OLED); hold. The reply has `sig`,
+   `pubkey` (x(P) of the branch, the key its 64-byte cx1 carries) and
+   `newsig`, `newpubkey`. PUT `cx1`, `sig`, `newsig` to
+   `/.well-known/lnurlp/<name>`: moneyer answers `{"status":"OK"}` and the
+   name's cx1 is now the share's (moneyer's `shares.ts` takes a legacy row's
+   proof from the branch key x(P), the first of its `proofKeys`).
+4. Pay the moved name a few sats: the wrap opens to a note on share 0 (no
+   card from a trusted mint key, as in 15.2), and `heartwood_note_list` shows
+   it CONFIRMED with its `p` and `index`. A payment that landed on the old
+   branch before the move still opens (15.2 again, on old keys).
+5. Register a fresh name: `action` `register` with `share` 1 and its `cx1`
+   reads `register, share 1`; POST `cx1` and `sig` to the spec route (or
+   `/names` with NIP-98): moneyer answers OK (or a `pr` for the address fee).
+   A name of 30 characters reads as its head and tail around `..` beside the
+   whole `@moneyer.dev`.
+   Unregister it: `{"action":"unregister","on_file":"<share 1 cx1>"}` reads
+   `unregister, share 1`; DELETE with `sig` clears the share.
+6. `heartwood_note_claim` with `{"host":"moneyer.dev/w","index":<i>,
+   "amount_msat":<m>,"p":"<cp1>"}` for a share note found by a scan answers
+   `share` n; one for a note on old keys answers `branch` `legacy`. Without
+   `p` it needs `share`, else `bad_request`.
+7. Refused with NO card, `bad_request` each time: a register naming the
+   64-byte whole branch, a `cx1` that is not the named `share`, another npub's
+   `cx1` or this npub's at another mint, an update whose `on_file` is the
+   share it moves to, an unregister carrying `cx1` or `share` (the v1 shape),
+   a register carrying `on_file`, a host `moneyer.dev.` or `:8443`, and
+   section 34's name and host cases.
+8. Rerun section 34 items 4 to 9 on the new shape (decline and timeout sign
+   nothing; pinned always-ask with an auto-approve policy; two proofs back to
+   back raise two cards; an escalate slot refuses outright; the USB-bridged
+   card is the generic extension card; an unbound client is `unauthorised`).
+9. Timing: a wrap for a key on old keys is found only after all twenty
+   shares are tried. Note how long the RECEIVE toast takes for one on share 0
+   and one on old keys, and that the relay loop keeps answering meanwhile.
+   Then send a batch of ten junk wraps (a key note for a key the device does
+   not hold) and reboot: each is searched on all twenty shares and both old
+   branches before any card, and again on every catch-up after a reboot.
+   Time the relay loop through the batch; if it stalls noticeably, cache each
+   mint's share public keys in RAM before release.

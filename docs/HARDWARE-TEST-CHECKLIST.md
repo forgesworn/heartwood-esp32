@@ -3400,8 +3400,10 @@ behaviour. Driven by notecase's `feat/heartwood-lud26-shares` over the relay.
   key 0, and the mint published the wrap 1 s later. No RECEIVE card was seen
   (the device trusts no senders, and the card's 30 s had likely run out before
   anyone looked), so the note came in by scan instead: `heartwood_note_claim`
-  derived share 1's key and stored it CONFIRMED (item 6's positive case). Still
-  to show: the wrap itself opening on a share, with the screen watched.
+  derived share 1's key and stored it CONFIRMED (item 6's positive case). Then
+  the wrap itself: after `espflash reset` the catch-up re-read it and the
+  RECEIVE card for it was seen (a card follows only a key found, so it opened
+  on share 1); left to time out, the device still held the one note.
 - Not yet run: 5 (moneyer.dev has registration closed, and
   a fresh share is spent for life), 8 (needs
   presses), and nothing on the V4 (only CI's size gate, 2,352 B spare).

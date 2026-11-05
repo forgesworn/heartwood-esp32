@@ -2254,7 +2254,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vmls-core"
 version = "0.1.0"
-source = "git+https://github.com/forgesworn/vmls-core?rev=fa3776ea5dbd929c8598fe28e2d3ad3fba247ebe#fa3776ea5dbd929c8598fe28e2d3ad3fba247ebe"
+source = "git+https://github.com/forgesworn/vmls-core?rev=53fa9a48ac745895eb61aa6f25679bb92c593f57#53fa9a48ac745895eb61aa6f25679bb92c593f57"
 dependencies = [
  "crypto-bigint",
  "ed25519-dalek",

@@ -50,7 +50,7 @@ ledger_secure_sdk_sys = { version = "1.16", optional = true }
 [dev-dependencies]
 # Executes the actual private firmware journal codec; no RNG/default features.
 chacha20poly1305 = { version = "=0.10.1", default-features = false }
-vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "fa3776ea5dbd929c8598fe28e2d3ad3fba247ebe", default-features = false }
+vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "53fa9a48ac745895eb61aa6f25679bb92c593f57", default-features = false }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

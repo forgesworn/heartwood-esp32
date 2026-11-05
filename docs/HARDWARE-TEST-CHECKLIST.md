@@ -3368,7 +3368,7 @@ connect, holds a REQ about 5 s for a sign-in, and answers `auth-required:` /
 8. Publish-only. During a phone relay-update round (section 29's relay
    change) on this relay, the publish-only connection sends no 22242.
 
-## 39. LUD-26 shares and address proofs (added 2026-11-04; items 1-3, 7 and 9 run 2026-11-05 on a T-Display)
+## 39. LUD-26 shares and address proofs (added 2026-11-04; items 1-4, 6, 7 and 9 run in part 2026-11-05 on a T-Display)
 
 **Run 2026-11-05, on the owner's live T-Display, not the bench V4.** CI's
 `app-tdisplay` artifact from `01e2b5f`, app-only at 0x10000 (partitions-4mb:
@@ -3396,8 +3396,14 @@ behaviour. Driven by notecase's `feat/heartwood-lud26-shares` over the relay.
   30 s and then at 1.7 s throughout two minutes of catch-up: no stall, so no
   RAM cache of share keys is needed for this. The timing of a real wrap on
   share 0 against one on old keys waits on item 4.
-- Not yet run: item 4 (a payment), 5 (moneyer.dev has registration closed, and
-  a fresh share is spent for life), 6 (needs a note a scan finds), 8 (needs
+- Item 4, partly: a 26 sat payment to a moved name was minted to its share 1,
+  key 0, and the mint published the wrap 1 s later. No RECEIVE card was seen
+  (the device trusts no senders, and the card's 30 s had likely run out before
+  anyone looked), so the note came in by scan instead: `heartwood_note_claim`
+  derived share 1's key and stored it CONFIRMED (item 6's positive case). Still
+  to show: the wrap itself opening on a share, with the screen watched.
+- Not yet run: 5 (moneyer.dev has registration closed, and
+  a fresh share is spent for life), 8 (needs
   presses), and nothing on the V4 (only CI's size gate, 2,352 B spare).
 
 

@@ -3368,7 +3368,7 @@ connect, holds a REQ about 5 s for a sign-in, and answers `auth-required:` /
 8. Publish-only. During a phone relay-update round (section 29's relay
    change) on this relay, the publish-only connection sends no 22242.
 
-## 39. LUD-26 shares and address proofs (added 2026-11-04; items 1-4, 6, 7 and 9 run in part 2026-11-05 on a T-Display)
+## 39. LUD-26 shares and address proofs (added 2026-11-04; items 1-4 and 6-9 run in part 2026-11-05 on a T-Display)
 
 **Run 2026-11-05, on the owner's live T-Display, not the bench V4.** CI's
 `app-tdisplay` artifact from `01e2b5f`, app-only at 0x10000 (partitions-4mb:
@@ -3404,9 +3404,24 @@ behaviour. Driven by notecase's `feat/heartwood-lud26-shares` over the relay.
   the wrap itself: after `espflash reset` the catch-up re-read it and the
   RECEIVE card for it was seen (a card follows only a key found, so it opened
   on share 1); left to time out, the device still held the one note.
-- Not yet run: 5 (moneyer.dev has registration closed, and
-  a fresh share is spent for life), 8 (needs
-  presses), and nothing on the V4 (only CI's size gate, 2,352 B spare).
+- Item 8, partly, on the signed beta.30 image (same T-Display, same live
+  pairing), with register proofs for an unused name on shares 18 and 19, none
+  ever posted. Section 34 item 4: a decline answered `user denied` and a card
+  left alone answered `timeout` after its 30 s, neither with a `sig`. Item 6:
+  two proofs sent together from one client raised two cards, one after the
+  other, each with its own name and share; left to time out, they answered
+  separately at 32 s and 62 s. Item 9: a client key the device never bound got
+  `unauthorised` for a share and for a proof, with no card. Item 8, cable half:
+  this board runs WiFi-standalone, so the 0x70 frame NACKs `cash_address_proof`
+  and `cash_address` alike ("use heartwood_note_* over the relay") before
+  parsing them; the surface's own `bad_request` needs a board in the USB tier.
+  The relay answered at 1.7 s after the port was opened.
+- Not yet run: 5 (moneyer.dev has registration closed, and a fresh share is
+  spent for life); from item 8, section 34 items 5 (pinned always-ask on an
+  auto-approve slot), 7 (escalate slot) and the heartwoodd-bridged card, each
+  of which needs the board reconfigured (the gating code is unchanged since
+  beta.29; host tests pin `pinned_physical` and `device_press_only` for the
+  proof); and nothing on the V4 (only CI's size gate, 2,352 B spare).
 
 
 moneyer 0.22.0 and dni's lnurl-mint take only LUD-26 (luds `92e430f`): a

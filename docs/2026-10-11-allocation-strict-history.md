@@ -38,10 +38,10 @@ warnings remain unchanged.
 
 The V4 release firmware compiled with the local ESP toolchain. Its app image
 was 2,126,304 bytes, 352 bytes smaller than the old-pin local baseline of
-2,126,656 bytes, but both exceeded the 2,097,152-byte slot. Current main's
-hosted CI image was 2,095,104 bytes. The candidate therefore needs its own
-hosted image-size result; the local size check is not a pass and no physical
-flash was performed.
+2,126,656 bytes, but both exceeded the 2,097,152-byte slot. The local size check
+is therefore not a pass. PR 272's hosted CI 42278785850 passed every job and
+produced a 2,094,800-byte V4 image, leaving 2,352 bytes. Post-merge CI
+42281172418 also passed at `472ae52`. No physical flash was performed.
 
 This is scoped unit/vector and cross-implementation evidence, not complete
 Heartwood acceptance. Binding/capability/Welcome, general record exchange,
@@ -93,9 +93,10 @@ authenticated seals containing bad signatures, wrong writer binding, a forgery
 accepted by the compact verifier but rejected by the actual anchor path, and
 cryptographically valid receipts on invalid transitions. Full board builds,
 image budgets, crypto-hold panel geometry and source review are required.
-The local linked V4 app image is 2,071,424 bytes against its 2,097,152-byte slot,
-leaving 25,728 bytes; the preceding main image was 1,999,664 bytes. This is a
-measured local build, pending independent review and per-board hosted CI.
+Before the 2026-11-06 interoperability update, an earlier local linked V4 app
+image was 2,071,424 bytes against its 2,097,152-byte slot, leaving 25,728 bytes;
+the preceding main image at that time was 1,999,664 bytes. These are historical
+local measurements, not candidate or current hosted CI results.
 Physical boot timing, stack/IRAM behavior, fault-feature hold, journal capacity
 and power-cut acceptance remain open. Linked image size does not establish those
 physical properties or the future writer's complete footprint.

@@ -3253,6 +3253,41 @@ denylist). Otherwise heartwoodd loses every reply that follows a card.
 `echo on` was not tried, since it needs root on the bench laptop. The
 native-USB boards (V4, C6) were not checked.
 
+**Bench 2026-11-08, T-Display, 7697b0c image: "the first FULL ACCESS card
+did not draw".** In the morning, with the board up about 2 h 20 min, the
+phone's first one-hold bundle left the panel backlit and black for about
+45 s. The phone then read "wasn't approved", and a retry 86 s after the
+first got `full access card shown recently`, so the card had opened and
+timed out. A retry about 90 s later drew normally. Rerun from the laptop
+in the afternoon, with a webcam on the panel at one frame a second and no
+button press at any point:
+
+| Run | Result |
+|---|---|
+| Fresh board (power-on 13:04), bundle at 13:10 | Card drew within about 1 s, paged its words, armed, and showed `Expired / no change made` at 45 s. |
+| `heartwood_capabilities` with the panel dark, 13:11 | **FAIL (fixed in this PR).** The backlight came on over a black frame and stayed on for the full 30 s blank timeout, with nothing drawn. Any request or cable frame that draws nothing does the same in the WiFi loop. That is the backlit-black screen seen in the morning, and probably the "screen read dark" ALLOW AS card above. |
+| Idle 13:12-15:45, untouched (webcam frame each minute) | The panel stayed dark throughout. |
+| Bundle after 2 h 33 min idle, uptime 2 h 40 min, 15:45 | **PASS, not reproduced.** The card drew, paged, and expired on time. It went up about 7 s after the send (1 s when fresh). The reply came in at 52.5 s, against 46.8 s when fresh. |
+
+The code agrees with what the webcam saw. A card that times out after
+45 s has been ticked, and every tick redraws it as the countdown changes.
+Nothing in the firmware sleeps or re-initialises the ST7789 controller, and
+there is no power management. So the morning's missing card is not
+explained. One possible reading: the phone's `connect` and capabilities
+requests had left the panel backlit and black, and the card came up some
+seconds later than expected (the afternoon's took 7 s after the idle; that
+run did not show whether the relay or the board's session was the slow
+part). Not proven. The fix
+draws the idle screen whenever a request or cable frame wakes the panel,
+so a backlit black panel no longer appears. If a FULL ACCESS card ever
+again fails to draw, it will now show as the idle screen staying up rather
+than as black.
+
+Bench setup notes: the save-room check refused the test bundle at 216 free
+entries (`no room to save this pairing`, before any card) until five old
+bench slots were revoked (330 free). Moving the board pulled its USB cable,
+which is a power-on reset that restarts any idle being measured.
+
 ## Notes
 
 - Restore and OTA are **USB-only** by design; remote OTA is not implemented.

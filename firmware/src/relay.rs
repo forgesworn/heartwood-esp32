@@ -669,6 +669,24 @@ fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
     }
 }
 
+/// Light a blanked panel for a request or a cable frame, which may draw
+/// nothing at all. A wake alone is not enough: on the colour LCDs the sleep
+/// blanked the frame (`St7789Display::set_display_on`), so the backlight came
+/// on over black and stayed so for the whole blank timeout, which reads as a
+/// hung board (bench 2026-11-08, a `heartwood_capabilities` probe); on the
+/// mono panel it re-lit whatever was last in panel RAM, possibly a stale
+/// card. The idle screen goes up at once, as a button wake already does
+/// ([`service_button`]), and anything the request draws replaces it.
+fn wake_to_idle(ctx: &mut SignCtx<'_, '_, '_>) {
+    if ctx.display_on {
+        return;
+    }
+    crate::oled::wake_display(ctx.display);
+    ctx.display_on = true;
+    ctx.idle_page = 0;
+    show_idle_identity(ctx);
+}
+
 fn show_idle_identity(ctx: &mut SignCtx<'_, '_, '_>) {
     if !ctx.display_on {
         return;
@@ -4335,10 +4353,7 @@ fn poll_usb_frame(
     };
 
     // USB activity wakes the panel, same as a relay request.
-    if !ctx.display_on {
-        crate::oled::wake_display(ctx.display);
-        ctx.display_on = true;
-    }
+    wake_to_idle(ctx);
     ctx.last_activity = Instant::now();
 
     // One screen, one button, one decision. A cable card answered while a
@@ -5141,13 +5156,12 @@ fn process_event(
     if ev.kind != NIP46_KIND && ev.kind != MGMT_KIND {
         return Ok(());
     }
-    // A real request is about to draw to the OLED — wake it and mark activity so
-    // the burn-in blank timer restarts. (Relay control traffic does NOT count,
-    // or the periodic re-REQ would keep the static screen lit forever.)
-    if !ctx.display_on {
-        crate::oled::wake_display(ctx.display);
-        ctx.display_on = true;
-    }
+    // A real request wakes the panel and marks activity so the burn-in blank
+    // timer restarts. (Relay control traffic does NOT count, or the periodic
+    // re-REQ would keep the static screen lit forever.) Many requests draw
+    // nothing (connect, capabilities, an auto-approved sign), so the wake puts
+    // the idle screen up itself.
+    wake_to_idle(ctx);
     ctx.last_activity = Instant::now();
 
     // The identity this request addresses — its `p` tag. NIP-46 (24133) can

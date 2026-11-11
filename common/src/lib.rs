@@ -83,6 +83,9 @@ pub mod persona_pack;
 /// NVS entry arithmetic for a blob write (ESP-IDF's multi-page blob layout).
 pub mod nvs_room;
 
+/// Identity picture pixel formats (Rgb565, Rgb332) and the room check for replacing one.
+pub mod identity_avatar;
+
 pub mod reply_clock;
 
 pub mod approval_queue;

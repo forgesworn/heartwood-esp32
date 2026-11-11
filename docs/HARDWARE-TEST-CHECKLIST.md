@@ -3744,3 +3744,23 @@ with the device operator key.
   whole-frame build might have passed too, so this shows the streamed frame
   arriving intact; that the second content-sized allocation is gone rests on
   `common/tests/ws_frame_memory.rs`.
+
+## 41. RGB332 identity picture (added 2026-11-11, not bench-run)
+
+A 64x64 picture at one byte a pixel (RGB332, `RRRGGGBB`) as well as two (Rgb565).
+The byte length picks the format: `w*h*2` is Rgb565, `w*h` is RGB332, anything
+else is refused. SET_IDENTITY_META (0x5B) and the relay `set_identity_meta`
+method share the rule; the blob is stored as received.
+
+1. Send a 64x64 RGB332 picture (4,096 pixel bytes) over the cable and over
+   the relay. Both ACK, and the identity card shows it full size with fewer
+   colours. Send a 64x64 Rgb565 one: unchanged from before.
+2. Send a 64x64 picture of 4,095 or 4,097 bytes: NACK over the cable, an error
+   from the relay, the stored picture untouched.
+3. On a tight board (T-Display with a stored 48x48 Rgb565 picture, 4,610 bytes)
+   send the 64x64 RGB332 one (4,098 bytes). Expected: the first write fails,
+   the log shows `removing the 4610-byte stored picture and retrying once`,
+   and the new picture lands. With less room than that, expected: the log shows
+   `stored picture kept` and the old picture stays on screen.
+4. The relay redraw after a relay `set_identity_meta` of an RGB332 picture does
+   not reboot the board (no expanded buffer is allocated).

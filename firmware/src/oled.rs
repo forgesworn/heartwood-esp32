@@ -298,6 +298,23 @@ pub fn show_npub(
                             .map(|c| Rgb565::from(RawU16::new(u16::from_be_bytes([c[0], c[1]]))));
                         display.fill_contiguous(&area, px).ok();
                     }
+                    // The RGB332 form (one byte a pixel, w*h bytes): expanded to
+                    // Rgb565 a pixel at a time inside the iterator, so no
+                    // expanded buffer is ever allocated (the relay path draws
+                    // from the bytes in hand at its heap peak).
+                    Some((w, h, bytes)) if bytes.len() == (w as usize) * (h as usize) => {
+                        let (aw, ah) = (w as i32, h as i32);
+                        let area = Rectangle::new(
+                            Point::new(cx - aw / 2, cy - ah / 2),
+                            Size::new(aw as u32, ah as u32),
+                        );
+                        let px = bytes.iter().map(|&b| {
+                            Rgb565::from(RawU16::new(
+                                heartwood_common::identity_avatar::rgb332_to_rgb565(b),
+                            ))
+                        });
+                        display.fill_contiguous(&area, px).ok();
+                    }
                     // No (valid) avatar yet: placeholder disc with the initial.
                     _ => {
                         Circle::new(Point::new(cx - r, cy - r), (r * 2) as u32)

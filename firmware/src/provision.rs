@@ -514,6 +514,10 @@ fn hold_to_confirm(
     let mut last_pct = 101u32; // force first bar draw
 
     loop {
+        // No timeout here (an unconfirmed phrase staying up is the safe
+        // failure), so the watchdog must be fed: an owner checking 31 written
+        // words on this screen for a minute would otherwise reset the board.
+        crate::wdt::feed();
         let low = buttons.a.is_low();
         if low && !pressed {
             pressed = true;
@@ -523,7 +527,10 @@ fn hold_to_confirm(
             let held = press_start.elapsed().as_millis() as u32;
             if held >= HOLD_MS {
                 oled::show_hold_progress(display, 100);
+                // Fed too: on a restore, store_master runs after this, so a
+                // watchdog reset during a long hold would lose the phrase.
                 while buttons.a.is_low() {
+                    crate::wdt::feed();
                     FreeRtos::delay_ms(POLL_MS);
                 }
                 // Press consumed here — drop the sampler's latched edge so it

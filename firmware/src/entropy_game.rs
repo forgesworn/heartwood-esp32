@@ -18,7 +18,10 @@
 //     must not feed back into their input.
 //   - Press timestamps are captured by busy-polling the GPIO between physics
 //     steps (no FreeRtos sleep in the edge path), so the recorded time is the
-//     true edge, not a 10 ms tick boundary.
+//     true edge, not a 10 ms tick boundary. The one exception is the single
+//     tick the idle task needs to keep the watchdog quiet: taken inside the
+//     debounce window after a press, where no edge can count, or at most
+//     once a second after a second with no press (see YIELD_EVERY_US).
 //   - Success/failure of a jump is NOT harvested — near-binary outcomes carry
 //     ~1 bit; the timing is where the entropy lives.
 //   - The game is OPTIONAL: hold-to-skip (or a 30 s intro timeout) falls back
@@ -66,6 +69,22 @@ const DEBOUNCE_US: i64 = 30_000;
 /// How long the intro screen waits before defaulting to skip.
 const INTRO_TIMEOUT_SECS: u64 = 30;
 
+/// Longest the loop runs without blocking when no press has given it a
+/// chance to.
+///
+/// Nothing else in the loop blocks: the edge capture busy-polls by design,
+/// and on the T-Display the SPI blit polls too. CPU0's idle task then never
+/// ran, and the task watchdog (60 s, CHECK_IDLE_TASK_CPU0) reset the board
+/// about a minute into a game whose cap is 90 s: players were cut off near
+/// 57/64. `wdt::feed` cannot help, since it feeds this task's subscription
+/// and not the idle task's.
+const YIELD_EVERY_US: i64 = 1_000_000;
+
+/// Block for one FreeRTOS tick (10 ms at 100 Hz) so the idle task runs.
+fn yield_to_idle() {
+    unsafe { esp_idf_svc::sys::vTaskDelay(1) }
+}
+
 /// Microsecond timestamp from the monotonic esp_timer.
 fn now_us() -> i64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() }
@@ -86,6 +105,7 @@ pub fn run(display: &mut Display<'_>, button: &PinDriver<'_, Input>) -> Option<[
     let start = now_us();
     let mut last_frame = start;
     let mut last_press_us = start - DEBOUNCE_US;
+    let mut last_yield = start;
     let mut pressed_since = -1i64; // -1 = not held; else edge timestamp
 
     // World state, all in baseline 128x64 coordinates (scaled at draw time).
@@ -114,6 +134,11 @@ pub fn run(display: &mut Display<'_>, button: &PinDriver<'_, Input>) -> Option<[
             if player_y >= ground_y {
                 vy = -9;
             }
+            // Let the idle task in now, while the debounce guard is up: no
+            // press can be accepted for DEBOUNCE_US after this one, and one
+            // tick ends well inside that, so no harvested edge is delayed.
+            yield_to_idle();
+            last_yield = now_us();
         }
         if !low && pressed_since >= 0 {
             pressed_since = -1;
@@ -121,6 +146,7 @@ pub fn run(display: &mut Display<'_>, button: &PinDriver<'_, Input>) -> Option<[
         // Abort on a deliberate hold (the button never came up).
         if pressed_since >= 0 && now - pressed_since >= ABORT_HOLD_MS * 1000 {
             while button.is_low() {
+                crate::wdt::feed();
                 esp_idf_hal::delay::FreeRtos::delay_ms(20);
             }
             log::info!("Entropy game aborted by hold — hardware-only stacking");
@@ -176,6 +202,14 @@ pub fn run(display: &mut Display<'_>, button: &PinDriver<'_, Input>) -> Option<[
             if scroll % FRAMES_PER_DRAW == 0 || now < hit_flash_until {
                 render(display, &l, player_x, player_y, ground_y, &obstacles, count, now < hit_flash_until);
             }
+        } else if now - last_yield >= YIELD_EVERY_US {
+            // Fallback for a stretch with no press (waiting for a block, or
+            // stopped playing), kept off the frame passes so it never adds to
+            // a blit's blind time. A press landing in this tick is timestamped
+            // at the tick, up to 10 ms late: at most once a second, and only
+            // after a second without a press.
+            yield_to_idle();
+            last_yield = now_us();
         }
 
         // --- End conditions ---

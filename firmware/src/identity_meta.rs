@@ -43,38 +43,14 @@ pub fn save(
     blob.push(w);
     blob.push(h);
     blob.extend_from_slice(avatar);
-    write_avatar_blob(nvs, &format!("imav{slot}"), &blob)
-}
-
-/// Write the avatar blob. ESP-IDF writes a new blob before it erases the one
-/// it replaces, so on a tight partition a smaller picture cannot land beside
-/// the stored one. When the write fails and an older picture is stored, erase
-/// it and write once more, but only if the room estimate says the new blob
-/// then fits (`identity_avatar::replace_verdict`): a working picture is never
-/// removed for a write that would still fail, or when the stats cannot be
-/// read. The picture is cosmetic; Sapwood can send it again.
-fn write_avatar_blob(nvs: &mut EspNvs<NvsDefault>, key: &str, blob: &[u8]) -> Result<(), String> {
-    let first = match nvs.set_blob(key, blob) {
-        Ok(_) => return Ok(()),
-        Err(e) => format!("avatar blob: {e:?}"),
-    };
-    let Ok(Some(old_len)) = nvs.blob_len(key) else {
-        return Err(first);
-    };
-    let room = crate::nvs_stats::read().map(|stats| heartwood_common::nvs_room::NvsRoom {
-        free_entries: stats.free_entries,
-        total_entries: stats.total_entries,
-        reclaimable_entries: 0,
-    });
-    let verdict = heartwood_common::identity_avatar::replace_verdict(blob.len(), old_len, room);
-    if !verdict.remove_and_retry() {
-        log::warn!("[idmeta] avatar write failed ({verdict:?}); stored picture kept");
-        return Err(first);
-    }
-    log::warn!("[idmeta] avatar write failed; removing the {old_len}-byte stored picture and retrying once");
-    nvs.remove(key).map_err(|e| format!("avatar blob: remove old: {e:?}"))?;
-    nvs.set_blob(key, blob)
-        .map_err(|e| format!("avatar blob (old picture removed): {e:?}"))
+    // esp-idf-svc's `set_blob` erases the key before it writes (nvs.rs
+    // `EspNvs::set_blob`, 0.52.1), so a failed picture write leaves NO stored
+    // picture: the old one is already gone. A smaller RGB332 blob makes a
+    // failure less likely, but nothing here keeps or restores the old picture.
+    // The picture is cosmetic; Sapwood can send it again.
+    nvs.set_blob(&format!("imav{slot}"), &blob)
+        .map_err(|e| format!("avatar blob: {e:?}"))?;
+    Ok(())
 }
 
 /// Load display metadata for the master at `slot`, if Sapwood has provisioned it.

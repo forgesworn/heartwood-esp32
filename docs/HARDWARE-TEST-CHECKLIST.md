@@ -3757,10 +3757,13 @@ method share the rule; the blob is stored as received.
    colours. Send a 64x64 Rgb565 one: unchanged from before.
 2. Send a 64x64 picture of 4,095 or 4,097 bytes: NACK over the cable, an error
    from the relay, the stored picture untouched.
-3. On a tight board (T-Display with a stored 48x48 Rgb565 picture, 4,610 bytes)
-   send the 64x64 RGB332 one (4,098 bytes). Expected: the first write fails,
-   the log shows `removing the 4610-byte stored picture and retrying once`,
-   and the new picture lands. With less room than that, expected: the log shows
-   `stored picture kept` and the old picture stays on screen.
+3. On a tight board (T-Display with a stored 48x48 Rgb565 picture, 4,610
+   bytes) send the 64x64 RGB332 one (4,098 bytes). The smaller blob makes the
+   write more likely to land; expect an ACK and the new picture. There is no
+   retry and no `removing the ... stored picture` or `stored picture kept` log
+   line. The storage wrapper erases the old picture before it writes, so if
+   the write fails the frame is NACKed and the old picture is already gone:
+   it disappears at the next redraw or reboot, and the identity card falls
+   back to npub only until a picture is sent again (as on base).
 4. The relay redraw after a relay `set_identity_meta` of an RGB332 picture does
    not reboot the board (no expanded buffer is allocated).

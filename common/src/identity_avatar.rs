@@ -1,5 +1,5 @@
 //! Identity picture formats for SET_IDENTITY_META (0x5B) and the relay
-//! `set_identity_meta` method, and the room check for replacing a stored one.
+//! `set_identity_meta` method.
 //!
 //! A picture is `w * h` pixels. Its byte length picks the pixel format:
 //!
@@ -7,14 +7,12 @@
 //!   (the format the signer has always taken).
 //! - `w * h`: [`AvatarFormat::Rgb332`], one byte a pixel, bits `RRRGGGBB`,
 //!   row-major. A 64x64 picture is a 4,098-byte blob (two bytes of size and
-//!   4,096 of pixels), against 8,194 for the same picture in Rgb565, so it
-//!   fits on a signer whose storage held only a 48x48 Rgb565 one (4,610).
+//!   4,096 of pixels), against 8,194 for the same picture in Rgb565: about half
+//!   the storage.
 //!
 //! Any other length is not a picture. The device stores the bytes as they
 //! came (`[w][h][pixels]`) and converts a pixel only as it draws it, so no
 //! expanded copy is ever allocated.
-
-use crate::nvs_room::{available_entries, blob_write_entries, min_blob_entries, NvsRoom};
 
 /// How a picture's pixels are packed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,64 +67,9 @@ pub fn pixel_rgb565(format: AvatarFormat, pixels: &[u8], index: usize) -> u16 {
     }
 }
 
-/// What to do when writing a new picture blob failed and an older one is
-/// stored under the same key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplaceVerdict {
-    /// The estimate says the new blob fits beside the old one. Removing the
-    /// old picture would not help the write that failed, so keep it and
-    /// refuse.
-    FitsBesideOld,
-    /// The new blob fits only once the old one is erased: remove it and
-    /// write again, once.
-    FitsAfterRemoval,
-    /// It does not fit even then. Keep the old picture and refuse.
-    DoesNotFit,
-}
-
-impl ReplaceVerdict {
-    /// Whether the caller should erase the stored picture and retry.
-    pub fn remove_and_retry(self) -> bool {
-        self == ReplaceVerdict::FitsAfterRemoval
-    }
-}
-
-/// Decide what a failed picture write does, from the blob lengths
-/// (`2 + pixel bytes` each) and the partition's room as read after the
-/// failure. ESP-IDF writes the new blob before it erases the old one (see
-/// [`crate::nvs_room`]), so the old picture's entries still count as used
-/// while the new one is written; erasing it first frees at least
-/// [`min_blob_entries`] of them.
-///
-/// A picture is cosmetic and can be sent again, but a working one is never
-/// removed for a write the estimate says will still fail, nor when the
-/// room is unknown (`None`).
-pub fn replace_verdict(new_len: usize, old_len: usize, room: Option<NvsRoom>) -> ReplaceVerdict {
-    let Some(room) = room else {
-        return ReplaceVerdict::DoesNotFit;
-    };
-    let needed = blob_write_entries(new_len, room.pages());
-    if room.fits_without_reclaim(needed) {
-        return ReplaceVerdict::FitsBesideOld;
-    }
-    let freed = room.reclaimable_entries.saturating_add(min_blob_entries(old_len));
-    if needed <= available_entries(room.free_entries.saturating_add(freed)) {
-        ReplaceVerdict::FitsAfterRemoval
-    } else {
-        ReplaceVerdict::DoesNotFit
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The bench T-Display's partition: 756 entries, 6 pages.
-    const BENCH_TOTAL: usize = 756;
-
-    fn room(free: usize) -> Option<NvsRoom> {
-        Some(NvsRoom { free_entries: free, total_entries: BENCH_TOTAL, reclaimable_entries: 0 })
-    }
 
     #[test]
     fn rgb332_expands_by_bit_replication() {
@@ -233,64 +176,5 @@ mod tests {
         assert_eq!(pixel_rgb565(AvatarFormat::Rgb332, &[0xFF], 1), 0);
         assert_eq!(pixel_rgb565(AvatarFormat::Rgb565, &[0xFF, 0xFF, 0xFF], 1), 0);
         assert_eq!(pixel_rgb565(AvatarFormat::Rgb565, &[], usize::MAX / 4), 0);
-    }
-
-    #[test]
-    fn a_picture_that_fits_beside_the_old_one_removes_nothing() {
-        // 4,098 incoming, 4,610 stored: 129 data + 6 headers + 1 index + 13
-        // slack = 149 entries needed, 6 pages. Plenty free.
-        let v = replace_verdict(4098, 4610, room(126 + 149));
-        assert_eq!(v, ReplaceVerdict::FitsBesideOld);
-        assert!(!v.remove_and_retry());
-        assert_eq!(replace_verdict(4098, 4610, room(126 + 148)), ReplaceVerdict::FitsAfterRemoval);
-    }
-
-    #[test]
-    fn a_picture_that_fits_only_after_removal_removes_and_retries() {
-        // The 48x48 Rgb565 blob frees 145 + 2 + 1 = 148 entries at least,
-        // so 149 needed is reached from 126 + 1 free upwards.
-        assert_eq!(min_blob_entries(4610), 148);
-        assert_eq!(blob_write_entries(4098, 6), 149);
-        let v = replace_verdict(4098, 4610, room(126 + 1));
-        assert_eq!(v, ReplaceVerdict::FitsAfterRemoval);
-        assert!(v.remove_and_retry());
-        assert_eq!(replace_verdict(4098, 4610, room(126 + 148)), ReplaceVerdict::FitsAfterRemoval);
-    }
-
-    #[test]
-    fn a_picture_that_does_not_fit_even_then_keeps_the_old_one() {
-        // At 126 free there is no available entry; the old blob's 148 give
-        // 148, one short of 149.
-        let v = replace_verdict(4098, 4610, room(126));
-        assert_eq!(v, ReplaceVerdict::DoesNotFit);
-        assert!(!v.remove_and_retry());
-        assert_eq!(replace_verdict(4098, 4610, room(0)), ReplaceVerdict::DoesNotFit);
-        // A big new picture against a small old one.
-        assert_eq!(replace_verdict(8194, 4610, room(200)), ReplaceVerdict::DoesNotFit);
-        // An old blob of nothing frees only its index entry.
-        assert_eq!(replace_verdict(4098, 0, room(126 + 147)), ReplaceVerdict::DoesNotFit);
-        assert_eq!(replace_verdict(4098, 0, room(126 + 148)), ReplaceVerdict::FitsAfterRemoval);
-    }
-
-    #[test]
-    fn unknown_room_never_removes_the_old_picture() {
-        assert_eq!(replace_verdict(4098, 4610, None), ReplaceVerdict::DoesNotFit);
-    }
-
-    #[test]
-    fn the_verdict_boundaries_match_the_estimate() {
-        // Walk free entries across both edges for the bench partition.
-        let needed = blob_write_entries(4098, 6);
-        let freed = min_blob_entries(4610);
-        for free in 0..800usize {
-            let expect = if needed <= free.saturating_sub(126) {
-                ReplaceVerdict::FitsBesideOld
-            } else if needed <= (free + freed).saturating_sub(126) {
-                ReplaceVerdict::FitsAfterRemoval
-            } else {
-                ReplaceVerdict::DoesNotFit
-            };
-            assert_eq!(replace_verdict(4098, 4610, room(free)), expect, "free {free}");
-        }
     }
 }

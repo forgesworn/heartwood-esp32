@@ -33,7 +33,7 @@ pub unsafe extern "C" fn heartwood_schnorr_sign(
     let seed = core::slice::from_raw_parts(seed32, 32);
     let msg = core::slice::from_raw_parts(msg32, 32);
 
-    let sk = match SigningKey::from_bytes(seed) {
+    let sk = match SigningKey::from_slice(seed) {
         Ok(k) => k,
         Err(_) => return -1,
     };

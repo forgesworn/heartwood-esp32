@@ -442,6 +442,7 @@ dependencies = [
  "bip39",
  "bitcoin_hashes",
  "crc32fast",
+ "crypto-bigint",
  "hmac 0.12.1",
  "k256",
  "serde",

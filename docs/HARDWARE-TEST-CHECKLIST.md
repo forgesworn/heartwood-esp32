@@ -2818,6 +2818,12 @@ dispatch without a card, so nothing parks.
 
 ## 34. Address proofs (LUD-25; added 2026-10-05, NOT YET BENCH-RUN)
 
+SUPERSEDED 2026-11-04 by section 39: the message, the signing key and the
+request shape below are gone (`note_address_proof_v1` is no longer
+advertised; `note_address_v2` replaces it). Items 3 to 9 (refusal before the card, decline, pinned
+always-ask, never batched, escalate refused, the USB-bridged card, unbound)
+still describe the gating, and section 39 reruns them on the new shape.
+
 Since LUD-25 `50d740a` (moneyer 0.17) a mint changes or clears a name's `cx1`
 only with `"sig"`: a BIP-340 signature by the purpose-0 index-0 key of the
 branch CURRENTLY on file, over `sha256("LNURLcash:<register|unregister>:
@@ -3247,7 +3253,42 @@ denylist). Otherwise heartwoodd loses every reply that follows a card.
 `echo on` was not tried, since it needs root on the bench laptop. The
 native-USB boards (V4, C6) were not checked.
 
-## 39. A PIN guess is counted before it is checked (#254; added 2026-10-28, NOT YET BENCH-RUN)
+**Bench 2026-11-08, T-Display, 7697b0c image: "the first FULL ACCESS card
+did not draw".** In the morning, with the board up about 2 h 20 min, the
+phone's first one-hold bundle left the panel backlit and black for about
+45 s. The phone then read "wasn't approved", and a retry 86 s after the
+first got `full access card shown recently`, so the card had opened and
+timed out. A retry about 90 s later drew normally. Rerun from the laptop
+in the afternoon, with a webcam on the panel at one frame a second and no
+button press at any point:
+
+| Run | Result |
+|---|---|
+| Fresh board (power-on 13:04), bundle at 13:10 | Card drew within about 1 s, paged its words, armed, and showed `Expired / no change made` at 45 s. |
+| `heartwood_capabilities` with the panel dark, 13:11 | **FAIL (fixed in this PR).** The backlight came on over a black frame and stayed on for the full 30 s blank timeout, with nothing drawn. Any request or cable frame that draws nothing does the same in the WiFi loop. That is the backlit-black screen seen in the morning, and probably the "screen read dark" ALLOW AS card above. |
+| Idle 13:12-15:45, untouched (webcam frame each minute) | The panel stayed dark throughout. |
+| Bundle after 2 h 33 min idle, uptime 2 h 40 min, 15:45 | **PASS, not reproduced.** The card drew, paged, and expired on time. It went up about 7 s after the send (1 s when fresh). The reply came in at 52.5 s, against 46.8 s when fresh. |
+
+The code agrees with what the webcam saw. A card that times out after
+45 s has been ticked, and every tick redraws it as the countdown changes.
+Nothing in the firmware sleeps or re-initialises the ST7789 controller, and
+there is no power management. So the morning's missing card is not
+explained. One possible reading: the phone's `connect` and capabilities
+requests had left the panel backlit and black, and the card came up some
+seconds later than expected (the afternoon's took 7 s after the idle; that
+run did not show whether the relay or the board's session was the slow
+part). Not proven. The fix
+draws the idle screen whenever a request or cable frame wakes the panel,
+so a backlit black panel no longer appears. If a FULL ACCESS card ever
+again fails to draw, it will now show as the idle screen staying up rather
+than as black.
+
+Bench setup notes: the save-room check refused the test bundle at 216 free
+entries (`no room to save this pairing`, before any card) until five old
+bench slots were revoked (330 free). Moving the board pulled its USB cable,
+which is a power-on reset that restarts any idle being measured.
+
+## 40. A PIN guess is counted before it is checked (#254; added 2026-10-28, NOT YET BENCH-RUN)
 
 Beta.29 wrote the wipe counter only after a wrong PIN was refused, so a power
 cut between the refusal and the write made that guess free, as often as
@@ -3287,3 +3328,233 @@ item 6), and USB.
 - The recovery phrase only ever appears on the device's OLED — never in the browser.
 - If a step wedges, RESET the board; an unsaved phrase staying on screen is the
   safe failure (nothing is stored until the final hold).
+
+## 38. Relay sign-in, NIP-42 (added 2026-10-22; benched 2026-10-22 on strfry; re-benched against khatru 2026-11-02)
+
+Benched 2026-10-22: a T-Display flashed with this build signed through the
+gated strfry relay (allowlisted masters) and served clients on it. The
+2026-11-01 review found the sign-in went out as an `["EVENT", …]` frame, which
+strfry accepts as auth but a strictly-NIP-42 relay does not; it now goes out
+as `["AUTH", <event>]`.
+
+**Re-bench against a strict relay, 2026-11-02.** Same T-Display, firmware
+0.18.0-beta.29 (merged main with the AUTH frame fix), bench relay a
+purpose-built khatru v0.19.1 service behind Caddy on the project box, at a
+throwaway DNS name created for the day (name and container removed after
+the run; the bench service itself was kept out of the repositories). khatru verifies
+the 22242's signature, challenge and relay tag itself (its `ServiceURL` was
+set to the exact URL the board dialled), so an accepted sign-in proves the
+frame end to end; the relay logged every REQ decision, every accepted
+identity per connection, and every event it was offered. One bench note for
+the next operator: this release artifact compiles logging out entirely
+(`log/release_max_level_off` is a default feature), so no serial lines
+exist on it; relay-side logs and read-only `net-config` runtime reads stand
+in below. The relay stored nothing except kind 24133 in its store mode, so
+the profile-name clause of step 2 had no profile to serve. Per step:
+
+1. **Relay that never asks — pass.** Gate off: the board's catch-up REQs
+   (kinds 0, 1059) were served, and not one kind-22242 arrived at the relay
+   in any frame. The board signs in when asked, never unasked.
+2. **Allowlisted masters — pass.** Gate on, the master in the allowance. A
+   clean dial: REQ closed `auth-required:` after the hold, the board
+   answered the challenge, the relay accepted the master first and the
+   per-boot probe key second (two valid 22242s), the REQ was re-sent and
+   served, and an unpaired bench client's NIP-46 `ping` over this relay was
+   answered (`pong`). No persona key ever signed in, then or in any step.
+   Recorded caveat: khatru keeps exactly one authed identity per connection
+   (the latest AUTH), so the probe, signing second, is the identity the
+   session then holds; on this union-style gate the master carried, on a
+   stricter one-identity gate it would not. Filed as #264 with the log.
+3. **Late sign-in** — not isolated this run; the REQ hold ran at 2 s
+   throughout and the re-send-after-OKs path fired on every gated dial,
+   which is the host-tested half of the step.
+4. **Refused — pass.** Authed but unserved `restricted:`: the session
+   dropped with runtime class `relay_refused`, the host cooled, and the
+   board redialled exactly once a minute (dials at 08:52:46, :53:46,
+   :54:46, :55:46, :56:46), never every 3 s, never restarting while a
+   session opened. Once the allowance returned, the next full sign-in was
+   served again (observed 60 s later).
+5. **Every key refused** — not reachable on stock khatru, which decides
+   AUTH validity itself and never answers a valid 22242 with OK false; the
+   same refusal family is covered by step 4 and the host tests.
+6. **Challenge spam — pass relay-side.** Ten repeat challenges, one a
+   second, from connect: the board signed its two sign-ins (master, probe)
+   at the start and answered none of the eight that followed, while the REQ
+   stayed served throughout.
+7. **Locked** — not re-run: the board is `at_rest: none`, and the locked
+   phase signs through the same `ws_send_auth` that steps 1-6 just proved.
+   Recorded, not re-proven.
+8. **Publish-only** — not re-run: this board has no phones enrolled
+   (`unlock_phone_count: 0`), so no relay-update round can run. The
+   publish-only connections still build no AUTH by construction, which the
+   framing fix did not touch.
+
+At the close the board was patched back to its live list
+(the project's own gated relay first, then relay.primal.net, nostr.mom and
+offchain.pub; revision 16)
+and returned home onto relay 1 through the NIP-42 gate as its first act —
+the gated path serving the strict-verified build.
+
+
+The relay loop answers a relay's `["AUTH", <challenge>]` itself (no button):
+kind 22242, tags `relay` (the URL the board dialled) and `challenge`, empty
+content; masters plus the per-boot probe key when unlocked, the one-time
+unlock key when locked. Needs a relay you control that sends a challenge on
+connect, holds a REQ about 5 s for a sign-in, and answers `auth-required:` /
+`restricted:` (below, `wss://auth.example.com`), with the serial tap open.
+
+1. Relay that never asks. On a relay that sends no `AUTH`, the serial log has
+   no `signing in` line, and the relay's own log shows no kind-22242 from the
+   board. Everything in section 35 behaves as before.
+2. Allowlisted masters. Add the board's masters to the relay's allowlist and
+   make it the only relay. The log shows `signing in to auth.example.com as
+   <masters + 1> key(s)`, the relay answers each with `OK true`, the held "hw"
+   REQ is served (EOSE, profile name on the idle screen), and an unpaired
+   client's NIP-46 `ping` is answered. In the relay's log every 22242 carries
+   exactly the two tags, `relay` equal to the configured URL as typed, and an
+   empty content; no persona key signs in.
+3. Late sign-in. Make the relay close the REQ at once (`["CLOSED","hw",
+   "auth-required: sign in"]`) before the `OK`s. The log shows `signed in to
+   auth.example.com; subscription re-sent` once, then EOSE.
+4. Refused. Take the masters off the allowlist (the board has personas, or
+   the relay applies only the allowlist): the REQ is closed `restricted:`,
+   re-sent once, closed again, and the log shows `relay refused us (sign-in
+   refused) on auth.example.com; leaving it 10 min`. With it the only relay,
+   the board redials it once a minute (`every relay refused us recently`),
+   never every 3 s, and never restarts while a session opens. Put the masters
+   back: within about a minute the board is served again.
+5. Every key refused. Make the relay answer every 22242 `OK false` and close
+   the REQ `auth-required:`: the same 10-minute back-off, no second sign-in on
+   that connection.
+6. Challenge spam. Make the relay send a fresh `AUTH` every second: the board
+   signs in at most twice per connection, and the log shows `not answered:
+   repeat, in flight, or past the per-connection cap` for the rest.
+7. Locked. With a vault-locked board and the relay requiring sign-in for the
+   `locked` REQ (`#p` = the unlock key) but not allowlisting it: the log shows
+   `locked: signing in to auth.example.com as the unlock key`, the 22242's
+   author is the same key the kind-24135 announcement carries, and a Sapwood
+   unlock (kind 24136) arrives and unlocks the board.
+8. Publish-only. During a phone relay-update round (section 29's relay
+   change) on this relay, the publish-only connection sends no 22242.
+
+## 39. LUD-26 shares and address proofs (added 2026-11-04; items 1-4 and 6-9 run in part 2026-11-05 on a T-Display)
+
+**Run 2026-11-05, on the owner's live T-Display, not the bench V4.** CI's
+`app-tdisplay` artifact from `01e2b5f`, app-only at 0x10000 (partitions-4mb:
+factory 0x10000, 3 MB) after a full 4 MB read-back kept as the rollback; the
+version string is unchanged (0.18.0-beta.29), so the build is told apart by
+behaviour. Driven by notecase's `feat/heartwood-lud26-shares` over the relay.
+- Item 1, partly: every stored note listed in the same state after the flash.
+  Not yet run: collecting a key note to show its `ck1` still releases.
+- Item 2: share 0 is a 113-character `cx1`, the same on a second ask; share 1
+  differs; share 20 is `bad_request`; `legacy` is the 112-character branch the
+  mint has on file, `superseded` another. The no-`share` and both-fields cases
+  were left to the host tests.
+- Item 3: two live names at moneyer.dev moved off the legacy branch, one card
+  each, onto shares 0 and 1; the mint then held each share's 113-character
+  `cx1`. A scan of 188 keys afterwards found nothing unpaid.
+- Item 7: all ten refusals (whole-branch register, wrong share, a stranger's
+  `cx1`, this npub's at another mint, update onto the share on file,
+  unregister with `cx1` or `share`, register with `on_file`, `moneyer.dev.`,
+  `:8443`) answered `bad_request` in 1.7 s each, a plain round trip: no card.
+- Item 9, junk half: ten gift-wrapped key notes for keys the device does not
+  hold, published to the relay it was serving (its own gated relay, found by
+  pinging through each relay alone; damus and nos.lol were unreachable from the
+  bench). A no-card ping every 1.5 s held at 1.7 s (worst 3.3 s, as before
+  the batch), none unanswered. After `espflash reset` it answered within about
+  30 s and then at 1.7 s throughout two minutes of catch-up: no stall, so no
+  RAM cache of share keys is needed for this. The timing of a real wrap on
+  share 0 against one on old keys waits on item 4.
+- Item 4, partly: a 26 sat payment to a moved name was minted to its share 1,
+  key 0, and the mint published the wrap 1 s later. No RECEIVE card was seen
+  (the device trusts no senders, and the card's 30 s had likely run out before
+  anyone looked), so the note came in by scan instead: `heartwood_note_claim`
+  derived share 1's key and stored it CONFIRMED (item 6's positive case). Then
+  the wrap itself: after `espflash reset` the catch-up re-read it and the
+  RECEIVE card for it was seen (a card follows only a key found, so it opened
+  on share 1); left to time out, the device still held the one note.
+- Item 8, partly, on the signed beta.30 image (same T-Display, same live
+  pairing), with register proofs for an unused name on shares 18 and 19, none
+  ever posted. Section 34 item 4: a decline answered `user denied` and a card
+  left alone answered `timeout` after its 30 s, neither with a `sig`. Item 6:
+  two proofs sent together from one client raised two cards, one after the
+  other, each with its own name and share; left to time out, they answered
+  separately at 32 s and 62 s. Item 9: a client key the device never bound got
+  `unauthorised` for a share and for a proof, with no card. Item 8, cable half:
+  this board runs WiFi-standalone, so the 0x70 frame NACKs `cash_address_proof`
+  and `cash_address` alike ("use heartwood_note_* over the relay") before
+  parsing them; the surface's own `bad_request` needs a board in the USB tier.
+  The relay answered at 1.7 s after the port was opened.
+- Not yet run: 5 (moneyer.dev has registration closed, and a fresh share is
+  spent for life); from item 8, section 34 items 5 (pinned always-ask on an
+  auto-approve slot), 7 (escalate slot) and the heartwoodd-bridged card, each
+  of which needs the board reconfigured (the gating code is unchanged since
+  beta.29; host tests pin `pinned_physical` and `device_press_only` for the
+  proof); and nothing on the V4 (only CI's size gate, 2,352 B spare).
+
+
+moneyer 0.22.0 and dni's lnurl-mint take only LUD-26 (luds `92e430f`): a
+name is registered to a share's 65-byte `cx1`, `S/0'/2/n'` below
+`S = m/139'/d1..d4` (d1..d4 hashed from the mint's hostname WITHOUT its
+port), and its notes are `S/0'/2/n'/i`, plain BIP-32. Advertised as
+`note_address_v2` in get_status (no `note_address_proof_v1`). Shares are 0 to 19. Drive it with
+scripts/nip46-client.mjs from a bound slot until notecase grows the
+commands. Release build only, app-only flash on the bench V4 (its one-off
+partition table, see the V4 notes); the stored notes must survive it.
+
+1. Stored notes survive: before flashing, record `heartwood_note_list`; after,
+   every note is still listed in the same state, and a key note collected
+   (`heartwood collect`) still releases a `ck1` the mint accepts (the key is
+   stored; nothing is re-derived).
+2. `heartwood_note_address` with `{"host":"moneyer.dev","share":0}` answers
+   `share` 0 and a 113-character `cx1` starting `cx1`,
+   with NO card; the same request again answers the same `cx1`; `share` 1
+   answers a different one. With no `share`, or `share` 20, it answers
+   `bad_request` and no `cx1`. `{"host":"moneyer.dev","branch":"legacy"}`
+   answers `branch` and the 112-character whole-branch `cx1` the bench names
+   are on file with (compare it with the mint's record); `superseded` the
+   older one; both `share` and `branch` is `bad_request`.
+3. Move a legacy name (one of the bench names at moneyer.dev, on file with the
+   64-byte whole branch): `heartwood_note_address_proof` with
+   `{"host":"moneyer.dev","name":"<name>","action":"update","share":0,
+   "cx1":"<share 0 cx1>","on_file":"<item 2's branch cx1>"}`. Expect ONE
+   ADDRESS PROOF card reading `<name>@moneyer.dev` over
+   `move: old keys > share 0` (watch the OLED); hold. The reply has `sig`,
+   `pubkey` (x(P) of the branch, the key its 64-byte cx1 carries) and
+   `newsig`, `newpubkey`. PUT `cx1`, `sig`, `newsig` to
+   `/.well-known/lnurlp/<name>`: moneyer answers `{"status":"OK"}` and the
+   name's cx1 is now the share's (moneyer's `shares.ts` takes a legacy row's
+   proof from the branch key x(P), the first of its `proofKeys`).
+4. Pay the moved name a few sats: the wrap opens to a note on share 0 (no
+   card from a trusted mint key, as in 15.2), and `heartwood_note_list` shows
+   it CONFIRMED with its `p` and `index`. A payment that landed on the old
+   branch before the move still opens (15.2 again, on old keys).
+5. Register a fresh name: `action` `register` with `share` 1 and its `cx1`
+   reads `register, share 1`; POST `cx1` and `sig` to the spec route (or
+   `/names` with NIP-98): moneyer answers OK (or a `pr` for the address fee).
+   A name of 30 characters reads as its head and tail around `..` beside the
+   whole `@moneyer.dev`.
+   Unregister it: `{"action":"unregister","on_file":"<share 1 cx1>"}` reads
+   `unregister, share 1`; DELETE with `sig` clears the share.
+6. `heartwood_note_claim` with `{"host":"moneyer.dev/w","index":<i>,
+   "amount_msat":<m>,"p":"<cp1>"}` for a share note found by a scan answers
+   `share` n; one for a note on old keys answers `branch` `legacy`. Without
+   `p` it needs `share`, else `bad_request`.
+7. Refused with NO card, `bad_request` each time: a register naming the
+   64-byte whole branch, a `cx1` that is not the named `share`, another npub's
+   `cx1` or this npub's at another mint, an update whose `on_file` is the
+   share it moves to, an unregister carrying `cx1` or `share` (the v1 shape),
+   a register carrying `on_file`, a host `moneyer.dev.` or `:8443`, and
+   section 34's name and host cases.
+8. Rerun section 34 items 4 to 9 on the new shape (decline and timeout sign
+   nothing; pinned always-ask with an auto-approve policy; two proofs back to
+   back raise two cards; an escalate slot refuses outright; the USB-bridged
+   card is the generic extension card; an unbound client is `unauthorised`).
+9. Timing: a wrap for a key on old keys is found only after all twenty
+   shares are tried. Note how long the RECEIVE toast takes for one on share 0
+   and one on old keys, and that the relay loop keeps answering meanwhile.
+   Then send a batch of ten junk wraps (a key note for a key the device does
+   not hold) and reboot: each is searched on all twenty shares and both old
+   branches before any card, and again on every catch-up after a reboot.
+   Time the relay loop through the batch; if it stalls noticeably, cache each
+   mint's share public keys in RAM before release.

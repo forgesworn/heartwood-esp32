@@ -350,6 +350,7 @@ version = "0.1.0"
 dependencies = [
  "bech32",
  "crc32fast",
+ "crypto-bigint",
  "ed25519-compact",
  "hmac 0.12.1",
  "k256",

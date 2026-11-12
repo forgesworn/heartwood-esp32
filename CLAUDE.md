@@ -8,9 +8,9 @@ Hardware signing device for Nostr on a Heltec WiFi LoRa 32 (ESP32-S3). Both the 
 
 ## Security model
 
-- **Physical approval required** — OLED shows the request, button press to sign. No silent signing. Applies in every mode, including WiFi-standalone.
+- **Physical approval required** — OLED shows the request, button press to sign. No silent signing. Applies in every mode, including WiFi-standalone. The one exception is the board's own NIP-42 relay sign-in (kind 22242, fixed shape, its own dialled URL, only when the relay challenges; see "Relay sign-in" below and docs/SECURITY-MODEL.md), which signs in its own connection rather than signing anything for anyone.
 - **USB-bridged mode (high-assurance default):** all radios disabled, USB serial only. Pi compromise is survivable — keys live on the ESP32, and in device-decrypts mode the Pi only ever sees ciphertext.
-- **WiFi-standalone mode (opt-in convenience tier):** WiFi *is* enabled and the device reaches relays directly — a deliberately larger attack surface, accepted in exchange for dropping the Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected. Don't enable this tier where the USB high-assurance model is required.
+- **WiFi-standalone mode (opt-in convenience tier):** WiFi *is* enabled and the device reaches relays directly — a deliberately larger attack surface, accepted in exchange for dropping the Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated, except the board's own NIP-42 sign-in to a relay that asks (kind 22242, fixed shape). Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected. Don't enable this tier where the USB high-assurance model is required.
 - **Portable mode** (roadmap, not built) — would enable only BLE (short range) and hold a child key, never the master.
 - **JTAG remains enabled** — disabling it requires eFuse burning, which permanently locks the chip and is deliberately rejected (see `docs/memory/feedback_no_efuse.md`); physical security is the protection model, including against debug-port key extraction.
 
@@ -237,8 +237,11 @@ included), which is what a violation counter punishes. `relay_cooldown::classify
 reads the relay's own words (a `NOTICE`, a `CLOSED`, an `OK false`, or the
 upgrade's status line): `banned` cools the host 60 min, `rate-limited:`, the
 same in words, or an HTTP 429 cools it 15 min; `blocked:`, `restricted:` and
-`auth-required:` are about an event or an author and keep their old handling
-(an allowlisted relay's `OK false` still only makes the probe inert). The
+`auth-required:` are about an event or an author and are never classified
+(an allowlisted relay's `OK false` still only makes the probe inert); a
+subscription closed `auth-required:`/`restricted:` is the NIP-42 sign-in's
+(below), which cools the host 10 min (`Refusal::AuthRefused`) only once a
+sign-in failed or did not help. The
 session drops with a `relay refused us` error (runtime class
 `relay_refused`; Sapwood has no label for it yet). A cooling host is never the
 secondary or a pinned dial, and the primary rotation passes it by; when every
@@ -268,7 +271,43 @@ ordinary rotation carrying on if home fails. Never while a card is open, an
 OTA, a network trial or a relay update round runs, a session is degraded, or
 relay 1 is cooling after refusing us.
 
-LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
+Relay sign-in, NIP-42 (2026-10-22, checklist section 38, benched 2026-10-22 on the T-Display against the gated strfry relay — sign-in confirmed through it; 2026-11-01 review then caught the answer framed as EVENT where the NIP says ["AUTH", event]: strfry tolerates both, a strict relay does not, so the frame is now AUTH; re-benched 2026-11-02 against a throwaway khatru bench relay, which verified each 22242 itself and served the board — one caveat recorded as #264: khatru keeps one authed identity per connection, and the probe signs last). A
+relay may refuse every REQ until the connection signs in: it sends `["AUTH",
+<challenge>]`, holds a REQ for a few seconds, then closes it `auth-required:`
+(or `restricted:` when the keys signed in may not read it). The board now
+answers on every subscribing session (primary, secondary, pinned, and the
+locked phase's), never on a publish-only `publish_once` connection (phone
+relay updates, old-relay lock announcements: nothing there may name the
+signer), and never unasked. No button: it is signing in its own connection.
+The event is `relay_auth::auth_event`'s fixed shape: kind 22242, tags exactly
+`relay` (the session's own dialled URL, `s.url`, never anything the relay
+sent) and `challenge`, empty content. Unlocked (relay.rs `answer_auth`): one
+per unlocked master plus one for the per-boot probe key, stamped from
+`session_wall_clock` (the probe's clock); the masters are what the relay's
+allowlist admits, and the probe key costs one signature and completes the
+24133 filter's `#p` on a relay applying only the authors/`#p` rule when the
+board has no personas. Personas are deliberately never signed in: a
+re-derivation and signature each per connect, and a shared challenge would
+prove persona and master are held together. Locked (`locked_relay_auth`):
+the one-time unlock key only, the `#p` of the `locked` REQ, from the Date
+header clock. Challenges must be printable ASCII up to 256 bytes, are never
+answered twice, at most two per connection. `relay_auth::RelayAuth` (pure,
+host-tested, one per session) then decides: a subscription closed for sign-in
+while the `OK`s are outstanding is re-sent when they arrive (any key
+accepted), one closed after sign-in is re-sent at once, each at most once per
+sign-in ("hw" goes out as the connect-time catch-up REQ again; a closed
+`wrappage` just ends the catch-up pass; the locked phase re-sends `locked`);
+a second refusal, every key refused or unanswered within 10 s with a
+subscription closed for it, or `auth-required:` with no challenge within 5 s
+backs off: the session drops as `relay refused us (sign-in refused)` and the
+host cools 10 min (`relay_cooldown::Refusal::AuthRefused`; in the locked
+phase, a phase-local `RelayCooldowns` drives its rotation). A sign-in refused
+with nothing closed changes nothing; any other `CLOSED`, and `restricted:`
+from a relay that never challenged, keep their old handling. The owner's
+relay needs the masters on its allowlist before this helps.
+
+LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats; the
+derivation below is now legacy, see LUD-26 shares further down): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =
 HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then LUD-25's
@@ -296,23 +335,81 @@ with; nothing new is handed out there, so re-register a name
 (`heartwood address keys`) to move it to the current branch. The ECDSA
 `recovery`/`ecdsa` backend features are gone.
 
-Address proofs (2026-10-05, checklist section 34, NOT YET BENCH-RUN): since
+LUD-26 shares (2026-11-04, luds `lnurlcash` `92e430f`, checklist section 39,
+NOT YET BENCH-RUN): moneyer 0.22.0 and lnurl-mint refuse the whole-branch
+`cx1` and the index-0 proof above, so the device now hands out shares. From
+the same seed, `S = m/139'/d1..d4` with `d1..d4` from HMAC(m/139'/0, domain),
+the domain being the mint's hostname lowercased WITHOUT its port (the whole
+branch hashed the host as stored, port included); share n is `S/0'/2/n'`,
+exported as the 65-byte `cx1 = bech32m("cx", chainCode || P)` (113 chars);
+note i of share n is `S/0'/2/n'/i`, plain BIP-32, no tweak; the ck1 is
+unchanged (`cash_key::share_node`, `share_cx1_of`, `share_note_key`, graded
+on both backends against lnurlcash-conformance 0.16.2's `part2.json`,
+`nostr-seed.json` and `spec-vectors.json` `lud26`, fixtures
+`common/tests/fixtures/lud26-*.json`). Account 0 only, and only its share
+chain: `S/0'/0` and `S/0'/1` (a wallet's own notes) are never derived here.
+Shares are 0 to 19 (`cash_key::SHARE_LIMIT`) everywhere, a lifetime budget
+per mint rather than a count of names: moneyer and lnurl-mint burn every share
+key they accept and keep it burnt after a move or unregister ("cx1 already
+used"), so each register and each move spends one for good. The device records
+none; hosts keep the count (notecase's `heartwoodShares`). A wrap names the
+note index and not the share, so `open_key_note` and a `p`-naming claim try
+every share the device can hand out, then both legacy branches on the purposed
+and the pre-purpose tweak (`cash_key::claim_note_key`), where the names
+registered before LUD-26 are still paid. Stored notes need no migration: a key note's secret IS
+its key, and nothing re-derives it to spend. Wire (one capability,
+`note_address_v2`, for all three methods, replacing `note_address_proof_v1`;
+a second string measured once at about 850 B of image, the capability list
+being a json! array):
+`heartwood_note_address` takes exactly one of `{host, share}`, answering
+`{ok, host, share, cx1, pubkey}` with the share's 65-byte cx1, or `{host,
+branch: "legacy"|"superseded"}`, answering `{ok, host, branch, cx1, pubkey}`
+with that whole branch's 64-byte cx1 (hashed on the host as stored), which a
+host needs as `on_file` to move or clear a name still registered to it and to
+scan it for payments whose wrap never arrived; neither (an old host) is
+`bad_request`. No card either way: both are watch-only, and go only to paired
+clients, as before; `heartwood_note_claim` takes an
+optional `share` (tried first; required when there is no `p`) and answers
+`share` or `branch` (`legacy`/`superseded`) for where the key was.
+`heartwood_note_address_proof {host, name, action, ...}`: `register` takes
+`cx1` and `share` (signed by that share's own key `p` over
+`LNURLcash:register:<domain>:<name>:<cx1>`); `update` takes `cx1` and `share`
+(the new share) plus `on_file`, the `cx1` on file (`on_file_share` optional;
+a 64-byte one is a legacy branch), and answers `sig` by the key on file over
+`LNURLcash:update:<domain>:<name>:<new cx1>` AND `newsig` by the new share
+over the register message, on ONE hold; `unregister` takes `on_file` only.
+A legacy branch signs with its branch key, x(P) of its 64-byte cx1 (what dni's
+reference reads; moneyer takes it or the old index-0 key). A field the action
+does not take, a whole-branch `cx1` to register, a bound `cx1` that is not the
+named share, an update onto the share on file, and any key not this
+identity's are refused by `note_cmd::address_proof_ask` before the card,
+relay precheck and dispatcher alike. Reply: `{ok, share?, cx1?, sig, pubkey,
+newsig?, newpubkey?}`, no echo of the request; the message is bound to the
+portless domain and the cx1 is the device's lowercase spelling. Release
+image cost of the change, CI's V4 gate at `24ad6f6`: +5,760 B, leaving 2,352 B
+spare (2,094,800 of 2,097,152; main had 8,112 B spare at `d4a59df`). The card is ADDRESS PROOF over
+`<name>@<domain>` and `register, share 3`, `move: old keys > share 3` or
+`unregister, share 3` (at most 25 chars, pinned by a test). Line one always
+shows the WHOLE domain; past 25 chars the name is cut to its head and tail
+around `..` (`note_cmd::card_address`), and a domain that leaves room for
+fewer than three of the name's characters is refused before the card rather
+than shown in part. A host whose portless domain is empty (`:8443`) or starts
+or ends with a dot is refused by `cash_key::valid_mint_host` in
+`cash_address` and `address_proof_ask` alike. Every gating rule
+below is unchanged.
+
+Address proofs (2026-10-05, checklist section 34; its message and key are
+superseded by LUD-26 above, its gating is not): since
 `50d740a` a mint changes or clears a name's cx1 only with `"sig"`, a BIP-340
-signature by the purpose-0 index-0 key of the branch CURRENTLY on file over
-sha256("LNURLcash:<register|unregister>:<domain>:<name>"), so a name on the
+signature by the key on file, so a name on the
 superseded branch can be moved only with that branch's agreement.
-`heartwood_note_address_proof {host, name, action, cx1}` (wire command
-`cash_address_proof`, capability `note_address_proof_v1`) signs it with
-whichever of the served identity's two branches at `host` has that exact cx1
-(`cash_key::address_proof_for`, compared as decoded bytes; any other cx1 is
-refused) over `spend_domain(host)`, aux_rand zero, which reproduces all four
-of part2.json's `addressProofs`. It answers the 64-byte `sig`, the index-0
-`pubkey` and `branch` (`current`/`superseded`), never a key. Everything that
-could refuse (mint, name rule `^[a-z0-9][a-z0-9._-]{2,31}$`, action, a cx1
-that is ours) is checked by the one pure `note_cmd::address_proof_ask` before
+`heartwood_note_address_proof` (wire command `cash_address_proof`) signs it
+only with keys of the served identity at `host` (compared as decoded bytes;
+any other cx1 is refused), aux_rand zero, and never answers a key.
+Everything that could refuse is checked by the one pure `note_cmd::address_proof_ask` before
 the card, on the relay precheck and in the dispatcher alike; the card
-(`note_cmd::address_proof_card`) is ADDRESS PROOF over `<name>@<domain>` and
-`<action>, current keys` or `old keys`. Pinned ButtonRequired like the other
+(`note_cmd::address_proof_card`) is ADDRESS PROOF over `<name>@<domain>`.
+Pinned ButtonRequired like the other
 note mutations, and device-press-only (`Nip46Method::device_press_only`, as a
 wallet pairing is): a proof never expires and decides where a name pays, so no
 guardian verdict may answer it and an escalate slot is refused outright. It

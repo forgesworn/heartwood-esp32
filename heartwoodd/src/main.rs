@@ -66,8 +66,10 @@ struct Cli {
     #[arg(long, default_value = "/var/lib/heartwood")]
     data_dir: String,
 
-    /// Relay URLs (comma-separated)
-    #[arg(short, long, default_value = "wss://relay.damus.io,wss://nos.lol")]
+    /// Relay URLs (comma-separated). damus kept, but not first: it
+    /// rate-limit-bans addresses outright, so a default that leads with it
+    /// leaves a fresh start dead on any address it has flagged.
+    #[arg(short, long, default_value = "wss://relay.primal.net,wss://relay.damus.io,wss://nos.lol")]
     relays: String,
 
     /// Master slot whose bunker URI is written to bunker-uri.txt (default: 0).

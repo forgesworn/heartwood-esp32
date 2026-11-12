@@ -10,15 +10,45 @@ authenticated local descriptor. Status Current, exact subject/sequence/digest,
 and nonzero challenge/signature remain mandatory. There is no fallback around
 an invalid present receipt, snapshot or anchor.
 
-The shared public core is pinned to reviewed commit
-`e6985dd9583207853ffa9f5224b33e05d5094010`, with default features disabled.
-The signing-key backend is `ed25519-dalek = 2.2.0`, with only its `zeroize`
-feature requested. Its key/expanded-secret Drop handlers and the owned HMAC seed
-buffer clear secret material. Temporary owned receipt fields are also cleared
-on success and error. This does not promise erasure of every library stack copy.
-The compact Ed25519 backend used elsewhere for OTA is not used for this path.
-The source audit allows only this first-party Git source; both manifests and
-locks pin the exact revision.
+The shared public core is pinned to merged commit
+`1c0adece2ec71ccfca0d98cafc7e3ddb0ebf33a2` (version 0.1.2), with default
+features disabled. The independent implementation/vector review target was
+`52a8e5dec502983ceeee410a681cd06681a47e1b`; final and post-merge CI also
+passed. This is reproducibility evidence, not named human or production
+approval. The signing-key backend is `ed25519-dalek = 2.2.0`, with only its
+`zeroize` feature requested. Its key/expanded-secret Drop handlers and the owned
+HMAC seed buffer clear secret material. Temporary owned receipt fields are also
+cleared on success and error. This does not promise erasure of every library
+stack copy. The compact Ed25519 backend used elsewhere for OTA is not used for
+this path. The source audit allows only this first-party Git source; both
+manifests and locks pin the exact revision.
+
+## Scoped downstream interoperability
+
+On 2026-11-06, using rustc 1.94.1 and the commands in `.github/workflows/ci.yml`,
+both Heartwood manifests and lockfiles resolved the same VMLS 0.1.2 revision.
+The full k256 host run passed 1230 unit tests and 13 integration tests. The
+secp256k1 baseline passed 359 unit tests and ten integration tests; its targeted
+allocation run passed 98 tests, and the fresh-R run passed five. These execute
+the real strict receipt/forwarding adapter, witness transitions, response and
+replay rejection, storage faults, independently generated Python journal
+fixtures, and 36 actual-ECDH VMLS Introduction exchanges. `cargo deny` reported
+advisories, bans, licences and sources OK. Existing deprecation and dead-code
+warnings remain unchanged.
+
+The V4 release firmware compiled with the local ESP toolchain. Its app image
+was 2,126,304 bytes, 352 bytes smaller than the old-pin local baseline of
+2,126,656 bytes, but both exceeded the 2,097,152-byte slot. The local size check
+is therefore not a pass. PR 272's hosted CI 42278785850 passed every job and
+produced a 2,094,800-byte V4 image, leaving 2,352 bytes. Post-merge CI
+42281172418 also passed at `472ae52`. No physical flash was performed.
+
+This is scoped unit/vector and cross-implementation evidence, not complete
+Heartwood acceptance. Binding/capability/Welcome, general record exchange,
+commit slots, manifest restore and lane behaviour have no production Heartwood
+MLS path and remain **not run**. Firmware compilation, image size and physical
+device behaviour are separate gates; compilation alone is not end-to-end or
+production approval.
 
 ## Boot and error behavior
 
@@ -63,9 +93,10 @@ authenticated seals containing bad signatures, wrong writer binding, a forgery
 accepted by the compact verifier but rejected by the actual anchor path, and
 cryptographically valid receipts on invalid transitions. Full board builds,
 image budgets, crypto-hold panel geometry and source review are required.
-The local linked V4 app image is 2,071,424 bytes against its 2,097,152-byte slot,
-leaving 25,728 bytes; the preceding main image was 1,999,664 bytes. This is a
-measured local build, pending independent review and per-board hosted CI.
+Before the 2026-11-06 interoperability update, an earlier local linked V4 app
+image was 2,071,424 bytes against its 2,097,152-byte slot, leaving 25,728 bytes;
+the preceding main image at that time was 1,999,664 bytes. These are historical
+local measurements, not candidate or current hosted CI results.
 Physical boot timing, stack/IRAM behavior, fault-feature hold, journal capacity
 and power-cut acceptance remain open. Linked image size does not establish those
 physical properties or the future writer's complete footprint.

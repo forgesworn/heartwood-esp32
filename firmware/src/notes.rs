@@ -1158,7 +1158,8 @@ pub fn relay_precheck(cmd: &serde_json::Value, identity: &[u8; 32]) -> Option<&'
     let name = cmd.get("cmd")?.as_str()?;
     if name == "cash_address_proof" {
         // Everything the dispatcher would refuse (the mint, the name, the
-        // action, and a cx1 that is not one of this identity's branches),
+        // action, a field the action does not take, a bound cx1 that is not
+        // the named share, a key on file that is not this identity's),
         // refused before the card by the same pure check.
         return note_cmd::address_proof_ask(cmd, identity).err().map(|_| "bad_request");
     }
@@ -1343,8 +1344,8 @@ fn handle_note_cmd_frame_inner(
         fw_version: env!("CARGO_PKG_VERSION"),
         board: crate::board::BOARD,
         storage_state,
-        // Nor any identity to derive an address branch from: cash_address
-        // and claim_key_note are relay methods, like send.
+        // Nor any identity to derive a share from: cash_address and
+        // claim_key_note are relay methods, like send.
         identity: None,
     };
     let response = note_cmd::handle_note_cmd(&mut ctx, msg);
@@ -1430,8 +1431,8 @@ fn handle_note_cmd_frame_locked_inner(
 pub fn run_note_cmd_approved(
     msg: &str,
     mut wrap: Option<&mut dyn FnMut(&[u8; SECRET_LEN], &NoteMeta, &[u8; 32]) -> Result<serde_json::Value, &'static str>>,
-    // The identity the request is served as: the root of its address
-    // branches, for `cash_address` and `claim_key_note`.
+    // The identity the request is served as: the root of its LUD-26 shares
+    // (and legacy branches), for `cash_address` and `claim_key_note`.
     identity: Option<&[u8; 32]>,
     // Which bound client is asking. An approved export leaves ITS client a
     // single-use grant for the matching spend mark (#129), so the two halves

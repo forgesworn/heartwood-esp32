@@ -228,6 +228,15 @@ selfcheck` crumb. All of it is `common/src/delivery_probe.rs`
 (`SessionProbe`, `SelfCheckLedger`), host-tested; relay.rs
 `delivery_selfcheck` is the glue.
 
+Heap-fall diagnostics: the full `get_status` reply (device operator only, not
+the low-heap fallback or either delegate shape) also carries `min_free_heap`,
+the free-heap low-water mark since boot (`esp_get_minimum_free_heap_size`), and
+`relay_connects`, how many relay sessions `connect_relay_raw` has returned
+`Ok` for since boot (relay.rs `RELAY_CONNECTS`; primary, secondary, pinned,
+publish-only and locked-boot dials all pass through it, so it includes sessions
+opened before unlock; a dial that fails part-way is not counted). Both are
+read-only and additive.
+
 A relay that refuses this client is left alone (2026-10-08, checklist section
 35 items 8-9, NOT YET BENCH-RUN). relay.damus.io was found answering `banned:
 too many rate-limit violations` to the owner's home address on 2026-10-08;

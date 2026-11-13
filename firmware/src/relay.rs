@@ -2598,6 +2598,10 @@ fn connect_secondary(url: &str, ctx: &mut SignCtx) -> Result<RelaySession, Strin
         })
 }
 
+/// Relay sessions opened since boot (every dial that returns `Ok`), reported by
+/// `get_status` as `relay_connects` to correlate heap drift with reconnects.
+static RELAY_CONNECTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Sentinel error: the relay socket could not be given a recv timeout and the
 /// caller required one (see [`connect_relay_raw`]).
 const RECV_TIMEOUT_REQUIRED: &str = "recv-timeout required";
@@ -2678,6 +2682,7 @@ fn connect_relay_raw(
     }
 
     let now = Instant::now();
+    RELAY_CONNECTS.fetch_add(1, Ordering::Relaxed);
     Ok(RelaySession {
         tls,
         url: url.to_string(),
@@ -11366,7 +11371,7 @@ fn dispatch_mgmt(
             // loop is actually running (same list `relays_at_boot` compared
             // against), and no extra heap parse per poll.
             let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
-            Ok(serde_json::json!({
+            let mut status = serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,
                 "mode": "wifi-standalone",
@@ -11425,7 +11430,12 @@ fn dispatch_mgmt(
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),
                 "board": crate::board::BOARD,
-            }))
+            });
+            // Heap-fall diagnostics, inserted after the literal: inside the
+            // `json!` they cost about 1.1 KB more app image than here.
+            status["min_free_heap"] = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() }.into();
+            status["relay_connects"] = RELAY_CONNECTS.load(Ordering::Relaxed).into();
+            Ok(status)
         }
 
         // C4 verdict (schema §1.4). Every case resolves cleanly: an unknown

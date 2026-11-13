@@ -279,6 +279,14 @@ jobs:
           name: app-${{ matrix.board }}
           path: /tmp/app.bin
           retention-days: 7
+      # The ELF that image came from, for the same week: which section a
+      # function landed in (an IRAM-only callback, say) and what an address
+      # in a crash report points at.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: elf-${{ matrix.board }}
+          path: firmware/target/${{ matrix.target }}/release/heartwood-esp32
+          retention-days: 7
 
   # ESP32-C6 (RISC-V rv32imac) firmware. The Xtensa toolchain action above cannot
   # install a RISC-V toolchain, so this job uses espup to install the Espressif

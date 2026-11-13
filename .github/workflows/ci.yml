@@ -97,7 +97,9 @@ jobs:
       # (the official NIP-44 vectors, NIP-04 round-trips, the synthetic nonce)
       # never run anywhere in CI. ota-sign covers the OTA release-signature
       # scheme (the on-device verifier and the CI signer share this module).
-      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes
+      # std adds the list_clients one-buffer encoder and its heap measurement
+      # (tests/list_clients_memory.rs).
+      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes,std
       # Execute the actual private allocation custody source on the firmware's
       # C curve backend as well as k256 above; no hardware or signing API.
       - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features firmware allocation_root
@@ -276,6 +278,14 @@ jobs:
         with:
           name: app-${{ matrix.board }}
           path: /tmp/app.bin
+          retention-days: 7
+      # The ELF that image came from, for the same week: which section a
+      # function landed in (an IRAM-only callback, say) and what an address
+      # in a crash report points at.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: elf-${{ matrix.board }}
+          path: firmware/target/${{ matrix.target }}/release/heartwood-esp32
           retention-days: 7
 
   # ESP32-C6 (RISC-V rv32imac) firmware. The Xtensa toolchain action above cannot

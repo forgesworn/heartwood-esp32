@@ -70,6 +70,10 @@ secp256k1-backend = ["dep:secp256k1"]
 # in the OS via os_perso_derive_node_bip32, never in-app).
 ledger-backend = ["dep:ledger_secure_sdk_sys"]
 nip46 = ["dep:serde", "dep:serde_json"]
+# std-only helpers for std consumers (the ESP-IDF firmware): serde_json's
+# writer API, which `mgmt::encode_list_clients_reply` uses to build a reply
+# in one exactly sized buffer. The crate itself stays no_std.
+std = ["serde_json?/std"]
 nip44 = ["dep:chacha20", "dep:hkdf", "dep:base64"]
 nip04 = ["dep:aes", "dep:cbc", "dep:base64"]
 # On-device recovery-phrase entry/derivation (BIP-39 mnemonic -> BIP-32 tree root).

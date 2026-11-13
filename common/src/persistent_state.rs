@@ -109,7 +109,7 @@ impl RemovalJournal {
             0,
             0,
         ];
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc32::Hasher::new();
         hasher.update(&encoded[..14]);
         encoded[14..18].copy_from_slice(&hasher.finalize().to_le_bytes());
         encoded
@@ -122,7 +122,7 @@ impl RemovalJournal {
         {
             return None;
         }
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc32::Hasher::new();
         hasher.update(&bytes[..14]);
         if bytes[14..18] != hasher.finalize().to_le_bytes() {
             return None;

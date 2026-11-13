@@ -244,7 +244,7 @@ fn frame_crc_valid(
     payload: &[u8],
     received: [u8; 4],
 ) -> bool {
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = heartwood_common::crc32::Hasher::new();
     hasher.update(&[frame_type]);
     hasher.update(length_bytes);
     hasher.update(payload);
@@ -295,7 +295,7 @@ pub fn write_json_frame<T: Serialize>(
     let length = (payload_len as u16).to_be_bytes();
     bytes[3..5].copy_from_slice(&length);
 
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = heartwood_common::crc32::Hasher::new();
     hasher.update(&bytes[2..]);
     bytes.extend_from_slice(&hasher.finalize().to_be_bytes());
     write_encoded_frame(usb, &bytes);
@@ -323,7 +323,7 @@ pub fn write_owned_frame(usb: &mut SerialPort<'_>, frame_type: u8, payload: Stri
     bytes[3..5].copy_from_slice(&(payload_len as u16).to_be_bytes());
 
     let crc_offset = FRAME_HEADER_SIZE + payload_len;
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = heartwood_common::crc32::Hasher::new();
     hasher.update(&bytes[2..crc_offset]);
     bytes[crc_offset..].copy_from_slice(&hasher.finalize().to_be_bytes());
     write_encoded_frame(usb, &bytes);

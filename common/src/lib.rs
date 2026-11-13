@@ -11,6 +11,8 @@ extern crate std;
 
 /// When a cable approval card starts listening to the A button.
 pub mod button_arm;
+/// CRC-32 for serial frames and checksummed records, with a 64-byte table.
+pub mod crc32;
 pub mod deadline;
 pub mod derive;
 pub mod encoding;

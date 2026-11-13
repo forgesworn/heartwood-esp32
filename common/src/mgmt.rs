@@ -159,8 +159,9 @@ pub fn client_summary(slot: &ConnectSlot) -> serde_json::Value {
 /// "relay mgmt list_clients". Keys come out in the order `serde_json`'s
 /// default map gives them, so the bytes match the old reply too.
 ///
-/// [`client_summary`] stays: the USB slot list edits its `Value` before
-/// sending.
+/// [`client_summary`] stays as the reference the tests compare against; the
+/// firmware no longer calls it. The USB slot list ([`UsbSlotList`]) uses the
+/// same per-slot serialiser.
 #[cfg(feature = "nip46")]
 pub struct ListClientsReply<'a> {
     pub id: &'a str,
@@ -190,7 +191,7 @@ impl serde::Serialize for ClientsResult<'_> {
             fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
                 let mut seq = s.serialize_seq(Some(self.0.len()))?;
                 for slot in self.0 {
-                    seq.serialize_element(&ClientSummaryView(slot))?;
+                    seq.serialize_element(&ClientSummaryView { slot, usb: false })?;
                 }
                 seq.end()
             }
@@ -202,16 +203,21 @@ impl serde::Serialize for ClientsResult<'_> {
 }
 
 /// One slot as [`client_summary`] shows it, serialised without the tree.
+/// With `usb`, also the three fields the USB slot list (frame 0x42) has
+/// always added to that summary: `secret` (empty), `ids` and `wb`.
 #[cfg(feature = "nip46")]
-struct ClientSummaryView<'a>(&'a ConnectSlot);
+struct ClientSummaryView<'a> {
+    slot: &'a ConnectSlot,
+    usb: bool,
+}
 
 #[cfg(feature = "nip46")]
 impl serde::Serialize for ClientSummaryView<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let slot = self.0;
+        let slot = self.slot;
         // Sorted, as serde_json's default (BTreeMap) map writes them.
-        let mut m = s.serialize_map(Some(17))?;
+        let mut m = s.serialize_map(Some(if self.usb { 20 } else { 17 }))?;
         m.serialize_entry("allowed_kinds", &slot.allowed_kinds)?;
         m.serialize_entry("allowed_methods", &slot.allowed_methods)?;
         m.serialize_entry("approved_identities", &crate::policy::approved_identity_tags(slot))?;
@@ -223,13 +229,40 @@ impl serde::Serialize for ClientSummaryView<'_> {
         m.serialize_entry("current_pubkey", &slot.current_pubkey)?;
         m.serialize_entry("escalate", &slot.escalate)?;
         m.serialize_entry("guardian_notice_wrap", &slot.guardian_notice_wrap)?;
+        if self.usb {
+            m.serialize_entry("ids", &slot.approved_identities)?;
+        }
         m.serialize_entry("label", &slot.label)?;
         m.serialize_entry("petition_on_deny", &slot.petition_on_deny)?;
+        if self.usb {
+            m.serialize_entry("secret", "")?;
+        }
         m.serialize_entry("secret_fingerprint", &credential_fingerprint(&slot.secret))?;
         m.serialize_entry("signing_approved", &slot.signing_approved)?;
         m.serialize_entry("slot_index", &slot.slot_index)?;
         m.serialize_entry("strict_permissions", &slot.strict_permissions)?;
+        if self.usb {
+            m.serialize_entry("wb", &slot.was_bound)?;
+        }
         m.end()
+    }
+}
+
+/// The USB slot list (frame 0x43's payload): a JSON array of each slot's
+/// summary plus `secret` (always empty), `ids` and `wb`, the same bytes the
+/// firmware built from [`client_summary`] trees before, without the trees.
+#[cfg(feature = "nip46")]
+pub struct UsbSlotList<'a>(pub &'a [ConnectSlot]);
+
+#[cfg(feature = "nip46")]
+impl serde::Serialize for UsbSlotList<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(Some(self.0.len()))?;
+        for slot in self.0 {
+            seq.serialize_element(&ClientSummaryView { slot, usb: true })?;
+        }
+        seq.end()
     }
 }
 
@@ -278,12 +311,13 @@ impl serde::Serialize for ClientApprovalsView<'_> {
 #[cfg(feature = "nip46")]
 pub const NIP44_MAX_PLAINTEXT: usize = 65_535;
 
-/// Why [`encode_list_clients_reply`] built nothing.
+/// Why [`encode_list_clients_reply`] or [`encode_usb_slot_list`] built
+/// nothing.
 #[cfg(all(feature = "nip46", any(test, feature = "std")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListClientsEncodeError {
-    /// The reply would be this many bytes, more than NIP-44 can carry in one
-    /// message. Retrying cannot help; only fewer or smaller slots can.
+    /// The reply would be this many bytes, more than its transport can carry
+    /// in one message. Retrying cannot help; only fewer or smaller slots can.
     TooLarge(usize),
     /// The one buffer, this many bytes, could not be reserved.
     OutOfMemory(usize),
@@ -292,24 +326,23 @@ pub enum ListClientsEncodeError {
     Encode,
 }
 
-/// Build the `list_clients` reply in one buffer, never regrown.
+/// Serialise `value` into one buffer reserved up front, never regrown.
 ///
-/// A first pass counts the bytes without storing them. The buffer is then
-/// reserved fallibly (a low-memory board gets an error, not an allocator
-/// abort) at the size NIP-44 encryption will need for that reply
-/// (`nip44::owned_capacity`, when the `nip44` feature is on), so
-/// `encrypt_owned` pads and frames it in place rather than copying it into a
-/// larger block. The second pass writes into it. The caller still runs its
-/// usual transport guard on the result. Peak heap is that buffer plus a few
-/// short-lived strings (a fingerprint, a hex key), where the tree it
-/// replaces was many times the reply.
+/// A first pass counts the bytes without storing them. Over `limit` is
+/// refused there. The buffer is then reserved fallibly (a low-memory board
+/// gets an error, not an allocator abort) at `capacity(len)`, room for what
+/// the transport does to it next, and the second pass writes into it. Both
+/// passes write through `&mut dyn Write`, so the slot serialiser is compiled
+/// once for every caller: the Heltec app slot has little room to spare.
 #[cfg(all(feature = "nip46", any(test, feature = "std")))]
-pub fn encode_list_clients_reply(
-    id: &str,
-    slots: &[ConnectSlot],
+fn encode_in_one_buffer<T: serde::Serialize>(
+    value: &T,
+    limit: usize,
+    capacity: fn(usize) -> usize,
 ) -> Result<String, ListClientsEncodeError> {
+    use std::io::Write;
     struct ByteCount(usize);
-    impl std::io::Write for ByteCount {
+    impl Write for ByteCount {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0 += buf.len();
             Ok(buf.len())
@@ -319,22 +352,53 @@ pub fn encode_list_clients_reply(
         }
     }
 
-    let reply = ListClientsReply { id, slots };
     let mut count = ByteCount(0);
-    serde_json::to_writer(&mut count, &reply).map_err(|_| ListClientsEncodeError::Encode)?;
+    serde_json::to_writer(&mut count as &mut dyn Write, value)
+        .map_err(|_| ListClientsEncodeError::Encode)?;
     let len = count.0;
-    if len > NIP44_MAX_PLAINTEXT {
+    if len > limit {
         return Err(ListClientsEncodeError::TooLarge(len));
     }
-    #[cfg(feature = "nip44")]
-    let capacity = crate::nip44::owned_capacity(len).unwrap_or(len);
-    #[cfg(not(feature = "nip44"))]
-    let capacity = len;
+    let capacity = capacity(len);
     let mut buf: Vec<u8> = Vec::new();
     buf.try_reserve_exact(capacity)
         .map_err(|_| ListClientsEncodeError::OutOfMemory(capacity))?;
-    serde_json::to_writer(&mut buf, &reply).map_err(|_| ListClientsEncodeError::Encode)?;
+    serde_json::to_writer(&mut buf as &mut dyn Write, value)
+        .map_err(|_| ListClientsEncodeError::Encode)?;
     String::from_utf8(buf).map_err(|_| ListClientsEncodeError::Encode)
+}
+
+/// Build the relay `list_clients` reply in one buffer, never regrown.
+///
+/// The buffer is sized for NIP-44 (`nip44::owned_capacity`, when the `nip44`
+/// feature is on), so `encrypt_owned` pads and frames the reply in place
+/// rather than copying it into a larger block, and a reply over NIP-44's
+/// plaintext limit is refused. The caller still runs its usual transport
+/// guard on the result. Peak heap is that buffer plus a few short-lived
+/// strings (a fingerprint, a hex key), where the trees it replaces were many
+/// times the reply.
+#[cfg(all(feature = "nip46", any(test, feature = "std")))]
+pub fn encode_list_clients_reply(
+    id: &str,
+    slots: &[ConnectSlot],
+) -> Result<String, ListClientsEncodeError> {
+    fn for_nip44(len: usize) -> usize {
+        #[cfg(feature = "nip44")]
+        let len = crate::nip44::owned_capacity(len).unwrap_or(len);
+        len
+    }
+    encode_in_one_buffer(&ListClientsReply { id, slots }, NIP44_MAX_PLAINTEXT, for_nip44)
+}
+
+/// Build the USB slot list ([`UsbSlotList`]) in one buffer with room for the
+/// frame around it, so the firmware's `write_owned_frame` frames it in place.
+/// Over the frame's payload limit is refused.
+#[cfg(all(feature = "nip46", any(test, feature = "std")))]
+pub fn encode_usb_slot_list(slots: &[ConnectSlot]) -> Result<String, ListClientsEncodeError> {
+    fn with_frame(len: usize) -> usize {
+        len + crate::types::FRAME_OVERHEAD
+    }
+    encode_in_one_buffer(&UsbSlotList(slots), crate::types::MAX_PAYLOAD_SIZE, with_frame)
 }
 
 /// Error for revoking a slot's bound identity: the binding is approved without
@@ -1087,6 +1151,54 @@ mod tests {
         #[cfg(not(feature = "nip44"))]
         let expected = encoded.len();
         assert_eq!(encoded.capacity(), expected);
+    }
+
+    /// The USB slot list as connslot.rs built it before: each summary tree
+    /// with `secret` blanked and `ids` and `wb` added.
+    #[cfg(feature = "nip46")]
+    fn usb_tree(slots: &[ConnectSlot]) -> serde_json::Value {
+        serde_json::Value::Array(
+            slots
+                .iter()
+                .map(|slot| {
+                    let mut view = client_summary(slot);
+                    view["secret"] = serde_json::Value::String(String::new());
+                    view["ids"] = serde_json::Value::String(slot.approved_identities.clone());
+                    view["wb"] = serde_json::Value::Bool(slot.was_bound);
+                    view
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(feature = "nip46")]
+    #[test]
+    fn usb_slot_list_matches_the_tree_it_replaces() {
+        let cases: Vec<Vec<ConnectSlot>> = vec![
+            vec![],
+            vec![identity_slot()],
+            vec![listed_slot(0, "plain", false), listed_slot(1, "with \"quotes\"", true)],
+        ];
+        for slots in &cases {
+            let encoded = encode_usb_slot_list(slots).unwrap();
+            let tree = usb_tree(slots);
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&encoded).unwrap(), tree);
+            assert_eq!(encoded, serde_json::to_string(&tree).unwrap());
+            // Room for the frame, so write_owned_frame never moves it.
+            assert_eq!(encoded.capacity(), encoded.len() + crate::types::FRAME_OVERHEAD);
+        }
+    }
+
+    #[cfg(feature = "nip46")]
+    #[test]
+    fn a_usb_slot_list_over_the_frame_limit_is_refused_unbuilt() {
+        let slots = vec![listed_slot(0, &"x".repeat(crate::types::MAX_PAYLOAD_SIZE), false)];
+        match encode_usb_slot_list(&slots) {
+            Err(ListClientsEncodeError::TooLarge(n)) => {
+                assert_eq!(n, serde_json::to_string(&usb_tree(&slots)).unwrap().len());
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "nip46")]

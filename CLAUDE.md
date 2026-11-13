@@ -457,8 +457,13 @@ state unchanged, retry shortly") at the size NIP-44 needs for it
 (`nip44::owned_capacity`, so `encrypt_owned` pads and frames it in place),
 then writes it without regrowing: about 6.4 KB at peak for that reply, and
 14.5 KB through encryption against the old 60 KB. The bytes are the same as
-before (host-tested against `client_summary`, which the USB slot list still
-uses). A reply NIP-44 cannot carry (over 65,535 bytes; 16
+before (host-tested against `client_summary`). The USB slot list (frame
+0x42) built the same trees and now goes through the same serialiser
+(`mgmt::encode_usb_slot_list`, sized for its frame and framed in place by
+`write_owned_frame`), so the firmware no longer links `client_summary` at
+all. Both passes of the encoder write through `&mut dyn Write`, and
+`crash_detail` is hand-written JSON rather than serde, to keep the Heltec
+images inside their 2 MB slot (main left the V4 about 2 KB spare). A reply NIP-44 cannot carry (over 65,535 bytes; 16
 maximum-size slots come to about 105 KB) is refused after the count as
 "client list too large for one reply", not "retry shortly". `relay.rs`
 handles the method before `dispatch_mgmt`, as it does phone enrolment, and

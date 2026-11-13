@@ -30,7 +30,7 @@
 //! location is part of the published firmware and carries none.
 
 #[allow(unused_imports)]
-use alloc::string::String;
+use alloc::{format, string::String};
 
 /// Room for a panic location, `path:line`, in the RTC record.
 pub const PANIC_SITE_CAP: usize = 40;
@@ -43,7 +43,8 @@ pub const PANIC_SITE_CAP: usize = 40;
 /// dependency's absolute build path never reaches the device's output and
 /// the record stays short. When it is still too long the tail is kept,
 /// since the file name and line are the parts that locate the panic. Bytes
-/// outside printable ASCII become `?`.
+/// outside printable ASCII, and `"`, become `?`; a `\\` becomes `/`. So the
+/// result needs no escaping inside a JSON string.
 pub fn format_panic_site(file: &str, line: u32, out: &mut [u8; PANIC_SITE_CAP]) -> usize {
     let path = short_path(file.as_bytes());
 
@@ -65,7 +66,12 @@ pub fn format_panic_site(file: &str, line: u32, out: &mut [u8; PANIC_SITE_CAP]) 
 
     let mut len = 0;
     for &b in path {
-        out[len] = if (0x21..=0x7e).contains(&b) { b } else { b'?' };
+        out[len] = match b {
+            b'\\' => b'/',
+            b'"' => b'?',
+            0x21..=0x7e => b,
+            _ => b'?',
+        };
         len += 1;
     }
     out[len] = b':';
@@ -163,22 +169,32 @@ impl CrashDetail {
     }
 }
 
-/// `{"cause", "panic_site", "alloc_failed_bytes", "alloc_failed_caps",
-/// "alloc_failures"}`, with `null` for what was not recorded and
-/// `alloc_failures` 0 when nothing failed. FIRMWARE_INFO and the device
-/// operator's `get_status` (full and low-heap) both carry it as
-/// `crash_detail`, next to `crashed_during`.
-#[cfg(feature = "nip46")]
-impl serde::Serialize for CrashDetail {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("CrashDetail", 5)?;
-        st.serialize_field("cause", self.cause.wire())?;
-        st.serialize_field("panic_site", &self.panic_site)?;
-        st.serialize_field("alloc_failed_bytes", &self.alloc.map(|a| a.bytes))?;
-        st.serialize_field("alloc_failed_caps", &self.alloc.map(|a| a.caps))?;
-        st.serialize_field("alloc_failures", &self.alloc.map_or(0, |a| a.failures))?;
-        st.end()
+impl CrashDetail {
+    /// `{"cause", "panic_site", "alloc_failed_bytes", "alloc_failed_caps",
+    /// "alloc_failures"}`, with `null` for what was not recorded and
+    /// `alloc_failures` 0 when nothing failed. FIRMWARE_INFO and the device
+    /// operator's `get_status` (full and low-heap) both carry it as
+    /// `crash_detail`, next to `crashed_during`. Written by hand rather than
+    /// through serde: the Heltec app slot has little room, and every value
+    /// here is a number, a fixed word or a [`format_panic_site`] string,
+    /// which never needs escaping.
+    pub fn to_json(&self) -> String {
+        fn num(v: Option<u32>) -> String {
+            v.map_or_else(|| String::from("null"), |n| format!("{n}"))
+        }
+        let site = match &self.panic_site {
+            Some(s) => format!("\"{s}\""),
+            None => String::from("null"),
+        };
+        format!(
+            "{{\"cause\":\"{}\",\"panic_site\":{},\"alloc_failed_bytes\":{},\
+             \"alloc_failed_caps\":{},\"alloc_failures\":{}}}",
+            self.cause.wire(),
+            site,
+            num(self.alloc.map(|a| a.bytes)),
+            num(self.alloc.map(|a| a.caps)),
+            self.alloc.map_or(0, |a| a.failures),
+        )
     }
 }
 
@@ -234,6 +250,12 @@ mod tests {
     }
 
     #[test]
+    fn nothing_in_a_site_needs_json_escaping() {
+        assert_eq!(site("C:\\b\\common\\src\\client_grants\\snapshot.rs", 3), "client_grants/snapshot.rs:3");
+        assert_eq!(site("src/a\"b.rs", 1), "a?b.rs:1");
+    }
+
+    #[test]
     fn a_panic_outranks_a_failed_allocation() {
         let alloc = AllocFailure { bytes: 9984, caps: 0x1804, failures: 2 };
         let d = CrashDetail::from_records(Some("relay.rs:1".into()), Some(alloc), true);
@@ -256,12 +278,14 @@ mod tests {
         assert_eq!(p.cause, CrashCause::RustPanic);
     }
 
-    #[cfg(feature = "nip46")]
+    fn parsed(d: &CrashDetail) -> serde_json::Value {
+        serde_json::from_str(&d.to_json()).expect("valid JSON")
+    }
+
     #[test]
-    fn serialises_every_state_with_stable_keys() {
-        let none = serde_json::to_value(CrashDetail::from_records(None, None, true)).unwrap();
+    fn renders_every_state_as_json_with_stable_keys() {
         assert_eq!(
-            none,
+            parsed(&CrashDetail::from_records(None, None, true)),
             serde_json::json!({
                 "cause": "unrecorded",
                 "panic_site": null,
@@ -276,7 +300,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            serde_json::to_value(oom).unwrap(),
+            parsed(&oom),
             serde_json::json!({
                 "cause": "alloc-failed",
                 "panic_site": null,
@@ -285,7 +309,12 @@ mod tests {
                 "alloc_failures": 1,
             })
         );
-        let panic = CrashDetail::from_records(Some("relay.rs:9180".into()), None, true);
-        assert_eq!(serde_json::to_value(panic).unwrap()["panic_site"], "relay.rs:9180");
+        let worst = CrashDetail::from_records(
+            Some(site("C:\\x\\src\\we\"ird\\\u{7f}.rs", u32::MAX)),
+            Some(AllocFailure { bytes: u32::MAX, caps: u32::MAX, failures: u32::MAX }),
+            true,
+        );
+        assert_eq!(parsed(&worst)["panic_site"], "we?ird/?.rs:4294967295");
+        assert_eq!(parsed(&worst)["alloc_failed_bytes"], u64::from(u32::MAX));
     }
 }

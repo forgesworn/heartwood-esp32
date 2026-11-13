@@ -198,8 +198,7 @@ pub fn firmware_info_json(
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
         .unwrap_or_default();
     let crash_detail = crash_detail()
-        .and_then(|d| serde_json::to_string(d).ok())
-        .map(|d| format!(",\"crash_detail\":{d}"))
+        .map(|d| format!(",\"crash_detail\":{}", d.to_json()))
         .unwrap_or_default();
     let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
     let largest_block = unsafe {
@@ -434,6 +433,15 @@ pub fn crash_context() -> Option<&'static str> {
 /// What kind of crash the last one was, after a crash reset.
 pub fn crash_detail() -> Option<&'static heartwood_common::crash_record::CrashDetail> {
     CRASH_DETAIL.get().and_then(|o| o.as_ref())
+}
+
+/// `crash_detail` as a `get_status` field: the object, or `null` when the
+/// last reset was not a crash. Parsed from its hand-written JSON rather than
+/// serialised by serde, which would cost the Heltec app slot more code.
+pub fn crash_detail_value() -> serde_json::Value {
+    crash_detail()
+        .and_then(|d| serde_json::from_str(&d.to_json()).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Fill `buf` with hardware-RNG bytes, guaranteeing a true entropy source for

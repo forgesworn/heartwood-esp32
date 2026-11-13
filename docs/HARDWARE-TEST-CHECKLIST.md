@@ -3553,7 +3553,8 @@ Crash detail:
 list_clients:
 6. Sapwood's clients view on the T-Display lists every app with the same
    fields as before (labels, kinds, methods, approvals), and the USB slot
-   list agrees.
+   list (frame 0x42, also rebuilt on the new serialiser; heartwoodd reads
+   it) agrees.
 7. Leave the clients view open for 10 minutes on the T-Display with all its
    relays live, polling as Sapwood does. No reset; note `get_status`
    `free_heap` and `largest_free_block` before and after.

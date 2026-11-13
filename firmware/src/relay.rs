@@ -8326,7 +8326,7 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op:
             "uptime_s": crate::uptime_s(),
             "last_reset": crate::reset_reason_str(),
             "crashed_during": crate::crash_context(),
-            "crash_detail": crate::crash_detail(),
+            "crash_detail": crate::crash_detail_value(),
             "free_heap": unsafe { esp_idf_svc::sys::esp_get_free_heap_size() },
             "largest_free_block": unsafe {
                 esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
@@ -11384,7 +11384,7 @@ fn dispatch_mgmt(
                 "crashed_during": crate::crash_context(),
                 // Panic site or failed allocation behind that crash, from the
                 // same final crumb window (heartwood_common::crash_record).
-                "crash_detail": crate::crash_detail(),
+                "crash_detail": crate::crash_detail_value(),
                 // Live memory health: total free and the largest single block.
                 // A largest block much smaller than free means a fragmented
                 // heap — the condition behind the bulk-decrypt crashes.

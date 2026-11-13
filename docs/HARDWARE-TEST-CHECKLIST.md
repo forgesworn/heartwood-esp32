@@ -3641,9 +3641,12 @@ not looked at.
   Free heap was 47,196, down 4,980 (about 725 bytes an hour, a third of the
   rate while polled), and the largest block 34,816, down 6,144. The fall goes
   on without these reads, more slowly, and the largest block is shrinking
-  faster than free heap. One client the board does not authorise was still
-  sending it a request every 30 seconds, which it refuses; whether that
-  traffic or time-based work accounts for the fall is not yet known.
+  faster than free heap. One client the board does not authorise was sending
+  it a request every 30 seconds throughout, logged as refused from 13:30Z on.
+  The same client had been failing at that rate, its error printed blank,
+  since before the beta.34 boot above, so it ran through the `d02223c` run
+  too. Whether that traffic or time-based work accounts for the fall is not
+  yet known.
 - Not run: items 2 to 5, as before; item 8's reply was not seen.
 - Settlement: the small-value mint-confirm-export-melt-spent round trip was not
   run; the owner set it aside.

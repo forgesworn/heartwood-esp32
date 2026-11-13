@@ -3525,7 +3525,7 @@ partition table, see the V4 notes); the stored notes must survive it.
    Time the relay loop through the batch; if it stalls noticeably, cache each
    mint's share public keys in RAM before release.
 
-## 40. Crash detail, and list_clients in one buffer (added 2026-11-13, NOT YET BENCH-RUN)
+## 40. Crash detail, and list_clients in one buffer (added 2026-11-13; items 1, 6 and 7 run in part 2026-11-13 on a T-Display)
 
 Why: a T-Display on 0.18.0-beta.34 reset with `last_reset` `panic` and
 `crashed_during` "relay mgmt list_clients", and recorded nothing more. The
@@ -3560,3 +3560,39 @@ list_clients:
    `free_heap` and `largest_free_block` before and after.
 8. If a reply ever reads "device low on memory; state unchanged, retry
    shortly", it should clear on a later poll; note the heap figures.
+
+**Run 2026-11-13, on the owner's live T-Display.** CI's `app-tdisplay`
+artifact from `d02223c` (app.bin SHA-256 `f2deea06…`), written app-only at
+0x10000 with esptool at 115,200 baud; esptool's hash check passed. A first
+attempt at 460,800 failed mid-read on the CH9102, before any write. The
+board's own partition table was read first (factory at 0x10000, 3 MB). Only
+the app slot was read back as the rollback, not the full 4 MB: with `at_rest`
+`none` the NVS holds the seed in the clear. That slot was the
+v0.18.0-beta.34 release's `app-tdisplay.bin` byte for byte, so the rollback
+is that asset at 0x10000. The version string is unchanged (0.18.0-beta.34).
+Before the flash, 25,575 s up on beta.34: free heap 62,432, largest block
+47,104. Driven by USB frames and by `scripts/mgmt-request.mjs` with the
+board's operator key over its own gated relay; Sapwood's screens were not
+looked at.
+- Item 1: after the flash's power-on reset, FIRMWARE_INFO had no
+  `crash_detail` key, and the operator's `get_status` had `crash_detail`
+  `null`, as it did in all 86 polls of item 7.
+- Item 6, without Sapwood: `list_clients` over the relay returned all five
+  apps, a reply of about 7.8 KB. The USB slot list (0x42) returned 7,914
+  bytes of valid JSON with every `secret` empty. Every field the two share
+  was equal, slot for slot; `ids`, `secret` and `wb` are USB-only, as
+  before. Free heap was the same before and after the USB read.
+- Item 7: `get_status` then `list_clients` every 4 s for 10 minutes, as
+  Sapwood's relay view polls. 86 of 86 rounds answered; uptime went from
+  2,541 s to 3,139 s with no reset. `free_heap` was 66,068 at the start and
+  settled at about 63,300 from round 30 (last 61,904); `largest_free_block`
+  was 61,440 in most rounds and dipped twice to 32,768. Idle over USB
+  afterwards: 70,896 free, largest block 65,536. Ten minutes does not rule out
+  a slow leak, and the cause of the original reset is still unconfirmed.
+- Item 8: the low-memory reply was never seen.
+- Not run: item 2 (it restarts the live signer), items 3 and 5 (no crash on
+  this build yet), item 4 (host-tested only).
+- Sapwood, from its code: a relay refusal shows in its log as "WiFi status
+  refresh failed: client list too large for one reply (…)", but over USB any
+  0x42 NACK shows as "Slot list read denied", dropping the reason ("slot list
+  too large", "low memory"). A Sapwood follow-up.

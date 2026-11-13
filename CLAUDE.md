@@ -422,8 +422,8 @@ identity, so `cash_address_proof` there refuses before the card, as
 `cash_address` does; on the USB-bridged NIP-46 path the card is the generic
 extension card, as for every note method.
 
-Crash detail beside the breadcrumb (2026-11-13, checklist section 40, NOT
-YET BENCH-RUN). A T-Display on beta.34 reset with `last_reset` `panic` and
+Crash detail beside the breadcrumb (2026-11-13, checklist section 40; item
+1 run on a T-Display, no crash yet to record). A T-Display on beta.34 reset with `last_reset` `panic` and
 the crumb "relay mgmt list_clients", and nothing else to go on: every board
 builds with its console off, so the panic message went nowhere. Two RTC
 noinit records now sit beside the crumb (`firmware/src/crash_crumb.rs`,
@@ -445,8 +445,8 @@ alloc_failed_bytes, alloc_failed_caps, alloc_failures}` beside
 `crashed_during`: in FIRMWARE_INFO, and in the device operator's
 `get_status`, full and low-heap, never a delegate's.
 
-`list_clients` in one buffer (2026-11-13, checklist section 40, NOT YET
-BENCH-RUN). The relay reply was a `serde_json` tree per slot, copied into a
+`list_clients` in one buffer (2026-11-13, checklist section 40; items 6-7
+run on a T-Display, 10 minutes at Sapwood's pace, no reset). The relay reply was a `serde_json` tree per slot, copied into a
 second tree by each `json!` wrap and serialised with two trees alive:
 `common/tests/list_clients_memory.rs` measures about 60 KB of heap for the
 5 KB reply of five ordinary apps (host, 64-bit). `mgmt::encode_list_clients_reply`

@@ -9181,6 +9181,9 @@ fn handle_mgmt_event(
     // The breadcrumb stays set across the response publish below too;
     // handle_relay_msg clears it once the whole event is processed.
 
+    // Whether the method returned a result: a mutation that did has been
+    // applied, which the low-memory error below must not deny.
+    let succeeded = dispatch_result.is_ok();
     let response_json = match dispatch_result {
         // Held on a card: nothing is owed until it resolves.
         Ok(None) => return Ok(()),
@@ -9199,7 +9202,8 @@ fn handle_mgmt_event(
     // audit ring plus relay lists (field-observed crash breadcrumb: "relay mgmt
     // get_status"). Rather than crash, degrade. For get_status, resend the vital
     // status without the heavy arrays, so the crash telemetry itself still
-    // reaches the manager; for any other method, a clean retryable error.
+    // reaches the manager; for any other method, a clean error that says
+    // whether a mutation was applied (`mgmt::low_memory_reply`).
     let response_json = if response_transportable(response_json.len()) {
         response_json
     } else if method == "get_status" {
@@ -9215,7 +9219,7 @@ fn handle_mgmt_event(
         );
         serde_json::json!({
             "id": id,
-            "error": LOW_MEMORY_REPLY,
+            "error": mgmt::low_memory_reply(&method, succeeded),
         })
         .to_string()
     };
@@ -9243,9 +9247,6 @@ enum MgmtReply {
     Encoded(String),
 }
 
-/// The retryable error a manager gets when a reply does not fit the heap.
-const LOW_MEMORY_REPLY: &str = "device low on memory; state unchanged, retry shortly";
-
 /// `list_clients` through `mgmt::encode_list_clients_reply`, its failures
 /// turned into replies a manager already understands. The caller's
 /// `response_transportable` guard still runs on the finished reply.
@@ -9264,7 +9265,7 @@ fn encode_list_clients(
         }
         ListClientsEncodeError::OutOfMemory(n) => {
             log::warn!("[relay] list_clients: no {n} B block free; returning the low-memory error");
-            LOW_MEMORY_REPLY.to_string()
+            mgmt::LOW_MEMORY_UNCHANGED.to_string()
         }
         ListClientsEncodeError::Encode => "list_clients reply could not be encoded".to_string(),
     })

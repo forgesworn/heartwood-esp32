@@ -502,6 +502,27 @@ pub fn requires_mutation_challenge(method: &str) -> bool {
     )
 }
 
+/// What a manager is told when a reply does not fit the heap and nothing
+/// else was learnt: a read, a refusal or a failure. Sapwood matches the
+/// "device low on memory" prefix.
+pub const LOW_MEMORY_UNCHANGED: &str = "device low on memory; state unchanged, retry shortly";
+
+/// What a manager is told when a mutation succeeded but its reply did not fit
+/// the heap. The change is on the board and the one-time challenge is spent,
+/// so "state unchanged, retry" would invite a second, unwanted change.
+pub const LOW_MEMORY_AFTER_CHANGE: &str =
+    "device low on memory; the change was applied but its reply could not be sent, read the state before retrying";
+
+/// The error that replaces a management reply too large for the heap.
+/// `succeeded` is whether the method returned a result rather than an error.
+pub fn low_memory_reply(method: &str, succeeded: bool) -> &'static str {
+    if succeeded && requires_mutation_challenge(method) {
+        LOW_MEMORY_AFTER_CHANGE
+    } else {
+        LOW_MEMORY_UNCHANGED
+    }
+}
+
 /// Pure validation for the persisted one-time mutation challenge. The firmware
 /// owns rotation/persistence; keeping this decision in `common` makes the
 /// fail-closed method classification host-testable.
@@ -795,6 +816,30 @@ mod tests {
             "",
         ] {
             assert!(requires_mutation_challenge(method), "{method}");
+        }
+    }
+
+    #[test]
+    fn low_memory_reply_says_unchanged_only_when_nothing_was_changed() {
+        // A read changes nothing, whatever it answered.
+        for method in ["get_status", "list_clients", "get_network_config"] {
+            assert_eq!(low_memory_reply(method, true), LOW_MEMORY_UNCHANGED, "{method}");
+            assert_eq!(low_memory_reply(method, false), LOW_MEMORY_UNCHANGED, "{method}");
+        }
+        // A mutation that returned a result has been applied.
+        for method in [
+            "update_client",
+            "revoke_client",
+            "stage_network_config",
+            "revoke_unlock_phone",
+            "no_such_method",
+        ] {
+            assert_eq!(low_memory_reply(method, true), LOW_MEMORY_AFTER_CHANGE, "{method}");
+            assert_eq!(low_memory_reply(method, false), LOW_MEMORY_UNCHANGED, "{method}");
+        }
+        // Sapwood keys its low-memory handling off this prefix.
+        for reply in [LOW_MEMORY_UNCHANGED, LOW_MEMORY_AFTER_CHANGE] {
+            assert!(reply.starts_with("device low on memory"), "{reply}");
         }
     }
 

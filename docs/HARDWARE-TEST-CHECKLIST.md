@@ -3596,3 +3596,47 @@ looked at.
   refresh failed: client list too large for one reply (…)", but over USB any
   0x42 NACK shows as "Slot list read denied", dropping the reason ("slot list
   too large", "low memory"). A Sapwood follow-up.
+
+**Run 2026-11-13, the v0.18.0-beta.35 release image, on the same T-Display.**
+beta.35 is #279 (the `d02223c` build above) plus #280, which makes a mutation
+whose reply does not fit the heap say the change was applied. The draft
+prerelease's `app-tdisplay.bin` (SHA-256 `f2566e6c…`; `image-info` reports
+0.18.0-beta.35 with a valid hash), its ed25519 signature checked locally
+against `firmware/ota-release-pubkey.hex` for board `tdisplay`. Before the
+write, the partition table read back byte-equal to the release's
+`partition-table-tdisplay.bin`, and `verify-flash` confirmed the installed app
+was the `d02223c` build, the rollback image. Written app-only at 0x10000 at
+115,200 baud; esptool's hash check passed. Checked against the release gates
+at the end of `docs/dev-state-recovery.md`, by USB frames and by
+`scripts/mgmt-request.mjs` over its own gated relay; Sapwood's screens were
+not looked at.
+- Retained state: 56 minutes after the flash, FIRMWARE_INFO reported
+  0.18.0-beta.35, `at_rest` `none` (so the gates' unlock steps do not apply)
+  and NVS 542 of 756 entries used. It read 544 at the `d02223c` flash, and no
+  reading in between places the change. One master with 5 apps, as before; the
+  USB slot list was 7,914 bytes with every `secret` empty. The note count was
+  not read: a WiFi-standalone board NACKs NOTE_CMD and relay management has no
+  note method, so it needs the switch to USB mode.
+- Reboot: a chip reset through esptool's RTS line at 11:54:39Z, with no
+  write; not a cable unplug. At 12 s up: `last_reset` `power-on`, no
+  `crash_detail` key (item 1 again), NVS 542, the same master and apps, the
+  same 7,914-byte slot list; free heap 107,176, largest block 106,496. The
+  first relay `get_status` timed out while WiFi came up; the retry answered at
+  103 s with beta.35 and `crash_detail` `null`, and `list_clients` returned all
+  five apps.
+- Heap, item 7's question over a longer span: relay `get_status` once a minute
+  for an hour. 60 of 60 answered; uptime went from 1,026 s to 4,390 s with no
+  reset, `crash_detail` `null` throughout. Free heap was 74,428 at 103 s and
+  54,224 at 1,026 s, then fell steadily to 52,176 at the end, about 35 bytes a
+  round (2 KB an hour); the lowest was 51,552. The largest block was 43,008,
+  then 40,960 from 28 minutes in. That is below the `d02223c` run (about
+  63,300 settled, under heavier polling) and beta.34 before the flash (62,432
+  after seven hours up), and it had not levelled off within the hour. Whether
+  the fall comes with each request or is state filling to a bound is not
+  known; the 32-entry sign audit ring records signing requests, not these
+  reads. A reading some hours on would tell.
+- Not run: items 2 to 5, as before; item 8's reply was not seen.
+- Settlement: the small-value mint-confirm-export-melt-spent round trip was not
+  run; the owner set it aside.
+- The Sapwood follow-up above is done: Sapwood shows why a 0x42 read was
+  refused (sapwood#192).

@@ -445,6 +445,28 @@ alloc_failed_bytes, alloc_failed_caps, alloc_failures}` beside
 `crashed_during`: in FIRMWARE_INFO, and in the device operator's
 `get_status`, full and low-heap, never a delegate's.
 
+`list_clients` in one buffer (2026-11-13, checklist section 40, NOT YET
+BENCH-RUN). The relay reply was a `serde_json` tree per slot, copied into a
+second tree by each `json!` wrap and serialised with two trees alive:
+`common/tests/list_clients_memory.rs` measures about 60 KB of heap for the
+5 KB reply of five ordinary apps (host, 64-bit). `mgmt::encode_list_clients_reply`
+(behind common's new `std` feature, which the firmware enables for
+serde_json's writer) counts the reply, reserves one buffer fallibly
+(`try_reserve_exact`; a failure returns the usual "device low on memory;
+state unchanged, retry shortly") at the size NIP-44 needs for it
+(`nip44::owned_capacity`, so `encrypt_owned` pads and frames it in place),
+then writes it without regrowing: about 6.4 KB at peak for that reply, and
+14.5 KB through encryption against the old 60 KB. The bytes are the same as
+before (host-tested against `client_summary`, which the USB slot list still
+uses). A reply NIP-44 cannot carry (over 65,535 bytes; 16
+maximum-size slots come to about 105 KB) is refused after the count as
+"client list too large for one reply", not "retry shortly". `relay.rs`
+handles the method before `dispatch_mgmt`, as it does phone enrolment, and
+the transport guard still runs on the finished reply. That heap exhaustion
+caused the T-Display reset is unconfirmed, since the board recorded nothing
+beyond the crumb. Paging the list would change the wire format Sapwood reads;
+it has not been done.
+
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
 ## Build & flash

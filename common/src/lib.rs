@@ -4,6 +4,10 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+// The `std` feature adds helpers that need serde_json's writer API (std-only);
+// the crate stays no_std otherwise. Tests are std already.
+#[cfg(all(feature = "std", not(test)))]
+extern crate std;
 
 /// When a cable approval card starts listening to the A button.
 pub mod button_arm;

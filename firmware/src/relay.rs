@@ -9157,6 +9157,15 @@ fn handle_mgmt_event(
             )
             .map(|()| None);
         }
+        // `list_clients` is serialised straight into one buffer of its exact
+        // size rather than built as a `Value` tree and wrapped again: on the
+        // no-PSRAM T-Display that tree was many times the reply, and a board
+        // reset under this method's breadcrumb.
+        if method == "list_clients" {
+            let master_slot = ctx.masters[master_idx].slot;
+            return encode_list_clients(&id, ctx.policy_engine.list_slots(master_slot))
+                .map(|reply| Some(MgmtReply::Encoded(reply)));
+        }
         dispatch_mgmt(
             &method,
             &req,
@@ -9167,7 +9176,7 @@ fn handle_mgmt_event(
             is_device_op,
             challenge_scope,
         )
-        .map(Some)
+        .map(|result| Some(MgmtReply::Value(result)))
     })();
     // The breadcrumb stays set across the response publish below too;
     // handle_relay_msg clears it once the whole event is processed.
@@ -9175,7 +9184,10 @@ fn handle_mgmt_event(
     let response_json = match dispatch_result {
         // Held on a card: nothing is owed until it resolves.
         Ok(None) => return Ok(()),
-        Ok(Some(result)) => serde_json::json!({ "id": id, "result": result }).to_string(),
+        Ok(Some(MgmtReply::Value(result))) => {
+            serde_json::json!({ "id": id, "result": result }).to_string()
+        }
+        Ok(Some(MgmtReply::Encoded(reply))) => reply,
         Err(e) => serde_json::json!({ "id": id, "error": e }).to_string(),
     };
 
@@ -9203,7 +9215,7 @@ fn handle_mgmt_event(
         );
         serde_json::json!({
             "id": id,
-            "error": "device low on memory; state unchanged, retry shortly"
+            "error": LOW_MEMORY_REPLY,
         })
         .to_string()
     };
@@ -9222,6 +9234,40 @@ fn handle_mgmt_event(
         stamped,
         response_json,
     )
+}
+
+/// What a management method answered: a `Value` the caller wraps with the
+/// request id, or a reply already serialised whole (`list_clients`).
+enum MgmtReply {
+    Value(serde_json::Value),
+    Encoded(String),
+}
+
+/// The retryable error a manager gets when a reply does not fit the heap.
+const LOW_MEMORY_REPLY: &str = "device low on memory; state unchanged, retry shortly";
+
+/// `list_clients` through `mgmt::encode_list_clients_reply`, its failures
+/// turned into replies a manager already understands. The caller's
+/// `response_transportable` guard still runs on the finished reply.
+fn encode_list_clients(
+    id: &str,
+    slots: &[heartwood_common::policy::ConnectSlot],
+) -> Result<String, String> {
+    use heartwood_common::mgmt::{encode_list_clients_reply, ListClientsEncodeError};
+    encode_list_clients_reply(id, slots).map_err(|e| match e {
+        ListClientsEncodeError::TooLarge(n) => {
+            log::warn!("[relay] list_clients reply would be {n} B, over the NIP-44 limit");
+            format!(
+                "client list too large for one reply ({n} bytes; the limit is {})",
+                mgmt::NIP44_MAX_PLAINTEXT
+            )
+        }
+        ListClientsEncodeError::OutOfMemory(n) => {
+            log::warn!("[relay] list_clients: no {n} B block free; returning the low-memory error");
+            LOW_MEMORY_REPLY.to_string()
+        }
+        ListClientsEncodeError::Encode => "list_clients reply could not be encoded".to_string(),
+    })
 }
 
 /// The identity a pairing mint is addressed to (D2 persona-addressed
@@ -10619,16 +10665,6 @@ fn dispatch_mgmt(
             } else {
                 Err(format!("no such slot: {slot_index}"))
             }
-        }
-
-        "list_clients" => {
-            let clients: Vec<serde_json::Value> = ctx
-                .policy_engine
-                .list_slots(master_slot)
-                .iter()
-                .map(mgmt::client_summary)
-                .collect();
-            Ok(serde_json::json!({ "clients": clients }))
         }
 
         "client_uri" => {

@@ -3525,10 +3525,14 @@ partition table, see the V4 notes); the stored notes must survive it.
    Time the relay loop through the batch; if it stalls noticeably, cache each
    mint's share public keys in RAM before release.
 
-## 40. Crash detail (added 2026-11-13, NOT YET BENCH-RUN)
+## 40. Crash detail, and list_clients in one buffer (added 2026-11-13, NOT YET BENCH-RUN)
 
 Why: a T-Display on 0.18.0-beta.34 reset with `last_reset` `panic` and
-`crashed_during` "relay mgmt list_clients", and recorded nothing more.
+`crashed_during` "relay mgmt list_clients", and recorded nothing more. The
+cause is not confirmed. Host measurement (`common/tests/list_clients_memory.rs`,
+64-bit) puts the old reply build at about 60 KB of heap for a 5 KB reply of
+five ordinary apps, which a no-PSRAM board with its TLS sessions up may not
+have; the new build peaks at about 6.4 KB, and 14.5 KB through encryption.
 
 Crash detail:
 1. Power-cycle the board. FIRMWARE_INFO carries no `crash_detail`, and
@@ -3545,3 +3549,13 @@ Crash detail:
    `crash_detail` key.
 5. `panic_site` never shows more than the path after `src/` and a line: no
    home directory, no message.
+
+list_clients:
+6. Sapwood's clients view on the T-Display lists every app with the same
+   fields as before (labels, kinds, methods, approvals), and the USB slot
+   list agrees.
+7. Leave the clients view open for 10 minutes on the T-Display with all its
+   relays live, polling as Sapwood does. No reset; note `get_status`
+   `free_heap` and `largest_free_block` before and after.
+8. If a reply ever reads "device low on memory; state unchanged, retry
+   shortly", it should clear on a later poll; note the heap figures.

@@ -9,8 +9,9 @@
 //!
 //! The trees it used to build are measured beside the one-buffer encoder
 //! that replaced them (`mgmt::encode_list_clients_reply`), which must cost
-//! one buffer sized for encryption plus a few short-lived strings, and the
-//! two are compared again through NIP-44 encryption.
+//! one buffer sized for encryption (or, while counting, a scratch buffer for
+//! the largest slot) plus a few short-lived strings, and the two are
+//! compared again through NIP-44 encryption.
 //!
 //! Its own test binary, with one test, so the counting allocator sees nothing
 //! but the code under measurement. Host figures are 64-bit; the ESP32 is
@@ -232,22 +233,31 @@ fn list_clients_reply_heap_cost() {
         report(&format!("{name}, old build"), tree.len(), &tree_cost);
         assert!(tree_cost.peak > 4 * tree.len(), "the trees were the cost");
 
+        // Counting runs each slot through one scratch buffer, which grows by
+        // doubling to the largest slot's JSON: under 3x that while it moves.
+        let largest_slot = slots
+            .iter()
+            .map(|slot| serde_json::to_string(&client_summary(slot)).unwrap().len())
+            .max()
+            .unwrap_or(0);
+        let scratch_bound = 3 * largest_slot;
+
         let (encoded, cost) = measure(|| encode_list_clients_reply(id, slots));
         if tree.len() > NIP44_MAX_PLAINTEXT {
             // Refused after the counting pass, before the reply exists.
             assert_eq!(encoded, Err(ListClientsEncodeError::TooLarge(tree.len())));
             println!("{name:<34} refused, peak {} B", cost.peak);
-            assert!(cost.peak <= TRANSIENT_ALLOWANCE, "peak {}", cost.peak);
+            assert!(cost.peak <= scratch_bound + TRANSIENT_ALLOWANCE, "peak {}", cost.peak);
             continue;
         }
         let encoded = encoded.expect("encodes");
         report(&format!("{name}, one buffer"), encoded.len(), &cost);
         assert_eq!(encoded, tree, "same reply, byte for byte");
         let capacity = nip44::owned_capacity(encoded.len()).unwrap();
-        assert_eq!(cost.largest, capacity, "one allocation, sized for encryption");
+        assert!(cost.largest <= capacity.max(2 * largest_slot), "largest {}", cost.largest);
         assert!(
-            cost.peak <= capacity + TRANSIENT_ALLOWANCE,
-            "peak {} for a {} B buffer",
+            cost.peak <= capacity.max(scratch_bound) + TRANSIENT_ALLOWANCE,
+            "peak {} for a {} B buffer (scratch bound {scratch_bound})",
             cost.peak,
             capacity
         );

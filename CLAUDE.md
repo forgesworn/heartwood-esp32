@@ -461,9 +461,12 @@ before (host-tested against `client_summary`). The USB slot list (frame
 0x42) built the same trees and now goes through the same serialiser
 (`mgmt::encode_usb_slot_list`, sized for its frame and framed in place by
 `write_owned_frame`), so the firmware no longer links `client_summary` at
-all. Both passes of the encoder write through `&mut dyn Write`, and
-`crash_detail` is hand-written JSON rather than serde, to keep the Heltec
-images inside their 2 MB slot (main left the V4 about 2 KB spare). A reply NIP-44 cannot carry (over 65,535 bytes; 16
+all. Both passes of the encoder write through serde_json's `Vec<u8>` writer,
+the one the rest of the firmware already uses (counting runs each slot
+through a scratch buffer, so it briefly holds up to about twice the largest
+slot's JSON), and `crash_detail` is hand-written JSON rather than serde, to
+keep the Heltec images inside their 2 MB slot (main left the V4 about 2 KB
+spare). A reply NIP-44 cannot carry (over 65,535 bytes; 16
 maximum-size slots come to about 105 KB) is refused after the count as
 "client list too large for one reply", not "retry shortly". `relay.rs`
 handles the method before `dispatch_mgmt`, as it does phone enrolment, and

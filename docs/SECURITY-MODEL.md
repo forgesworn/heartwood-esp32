@@ -628,7 +628,9 @@ changes hands:
   three call sites share, rather than each composing it separately.
   `FIRMWARE_INFO` answers this to any USB host, in any mode, including while
   locked (the same trust level as its other operational fields — uptime, RNG
-  state, crash context); `relay` `get_status` only once genuinely unlocked,
+  state, crash context, and since 2026-11-13 `crash_detail`: a panic's
+  source `file:line` or a failed allocation's size, never a panic message,
+  which can carry request data); `relay` `get_status` only once genuinely unlocked,
   and only to the device operator, never a per-identity delegate — including
   its low-heap `minimal_status_json` fallback, which used to leak
   `master_count`, `relay` and `crashed_during` to a delegate too (now fixed

@@ -422,6 +422,29 @@ identity, so `cash_address_proof` there refuses before the card, as
 `cash_address` does; on the USB-bridged NIP-46 path the card is the generic
 extension card, as for every note method.
 
+Crash detail beside the breadcrumb (2026-11-13, checklist section 40, NOT
+YET BENCH-RUN). A T-Display on beta.34 reset with `last_reset` `panic` and
+the crumb "relay mgmt list_clients", and nothing else to go on: every board
+builds with its console off, so the panic message went nowhere. Two RTC
+noinit records now sit beside the crumb (`firmware/src/crash_crumb.rs`,
+rules in `common/src/crash_record.rs`, host-tested). A Rust panic hook keeps
+the panic's `file:line`, the path after its last `src/`, at most 40 bytes,
+never the message: FIRMWARE_INFO answers any USB host while locked, and a
+formatted message can carry request data. ESP-IDF's failed-allocation
+callback (`heap_caps_register_failed_alloc_callback`; in IRAM, RTC writes
+only) keeps the last failed allocation's size and caps, and a count. Both are
+stamped with the crumb window, which every `set` and `clear` bumps, and only
+final-window records count, since TLS and WiFi survive failed allocations. A
+Rust out-of-memory never reaches the panic hook on stable std (it prints and
+aborts, which resets as a panic), so a failed allocation with no panic, on a
+panic reset, is the out-of-memory signature; after a watchdog or brownout it
+is only a fact about the window. A stack overflow, CPU exception, C abort or
+watchdog fires neither and reads `unrecorded`. Reported after a crash reset as
+`crash_detail` `{cause: rust-panic|alloc-failed|unrecorded, panic_site,
+alloc_failed_bytes, alloc_failed_caps, alloc_failures}` beside
+`crashed_during`: in FIRMWARE_INFO, and in the device operator's
+`get_status`, full and low-heap, never a delegate's.
+
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
 ## Build & flash

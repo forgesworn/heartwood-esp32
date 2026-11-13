@@ -197,6 +197,10 @@ pub fn firmware_info_json(
     let crash = crash_context()
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
         .unwrap_or_default();
+    let crash_detail = crash_detail()
+        .and_then(|d| serde_json::to_string(d).ok())
+        .map(|d| format!(",\"crash_detail\":{d}"))
+        .unwrap_or_default();
     let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
     let largest_block = unsafe {
         esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
@@ -231,7 +235,7 @@ pub fn firmware_info_json(
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
          \"free_heap\":{},\"largest_block\":{},\"display_flip\":{},\
-         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}}}",
+         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -247,6 +251,7 @@ pub fn firmware_info_json(
         json_usize_or_null(unlock_phones),
         phone_relays.wire(),
         crash,
+        crash_detail,
         nvs_stats,
     )
 }
@@ -367,6 +372,13 @@ use std::sync::OnceLock;
 /// crumb; reported in telemetry so the owner sees "crashed on: <op>".
 static CRASH_CONTEXT: OnceLock<Option<String>> = OnceLock::new();
 
+/// What kind of crash the last one was (`heartwood_common::crash_record`):
+/// a panic's `file:line`, or the failed allocation that preceded an
+/// out-of-memory abort, from the final crumb window. `Some` only after a
+/// crash reset; reported beside `crashed_during` as `crash_detail`.
+static CRASH_DETAIL: OnceLock<Option<heartwood_common::crash_record::CrashDetail>> =
+    OnceLock::new();
+
 /// Resolve the crash context once, at boot. If the last reset was a crash and
 /// a breadcrumb survived, keep it; otherwise clear any stale crumb so a later
 /// clean restart never inherits it. One planned restart is also attributed:
@@ -374,6 +386,19 @@ static CRASH_CONTEXT: OnceLock<Option<String>> = OnceLock::new();
 /// records why — its crumb rides the software reset so get_status can answer
 /// "why did my signer restart" without a serial console.
 fn init_crash_context() {
+    // The detail records are read first: they belong to the crumb window the
+    // last boot ended in, and the `clear` below starts a new one.
+    let detail = if reset_was_crash() {
+        let (panic_site, alloc) = crash_crumb::take_detail();
+        Some(heartwood_common::crash_record::CrashDetail::from_records(
+            panic_site,
+            alloc,
+            reset_reason_str() == "panic",
+        ))
+    } else {
+        crash_crumb::discard_detail();
+        None
+    };
     let ctx = if reset_was_crash() {
         crash_crumb::take()
     } else if reset_reason_str() == "software-restart" {
@@ -382,6 +407,15 @@ fn init_crash_context() {
         crash_crumb::clear();
         None
     };
+    if let Some(d) = &detail {
+        log::error!(
+            "Crash detail: {} site={:?} alloc={:?}",
+            d.cause.wire(),
+            d.panic_site,
+            d.alloc
+        );
+    }
+    let _ = CRASH_DETAIL.set(detail);
     if let Some(op) = &ctx {
         if op.starts_with("relay watchdog") {
             log::warn!("Planned recovery restart: {op}");
@@ -395,6 +429,11 @@ fn init_crash_context() {
 /// The operation the signer was doing when it last crashed, if known.
 pub fn crash_context() -> Option<&'static str> {
     CRASH_CONTEXT.get().and_then(|o| o.as_deref())
+}
+
+/// What kind of crash the last one was, after a crash reset.
+pub fn crash_detail() -> Option<&'static heartwood_common::crash_record::CrashDetail> {
+    CRASH_DETAIL.get().and_then(|o| o.as_ref())
 }
 
 /// Fill `buf` with hardware-RNG bytes, guaranteeing a true entropy source for
@@ -509,6 +548,7 @@ fn main() {
     log::info!("Heartwood ESP32 — Phase 4 (multi-master)");
     log::info!("Last reset: {}", reset_reason_str());
     init_crash_context();
+    crash_crumb::install_recorders();
     wdt::init();
 
     // Point the sealed-seed KDF at this board's SHA engine before anything can

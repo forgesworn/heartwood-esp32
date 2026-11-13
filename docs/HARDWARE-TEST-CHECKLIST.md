@@ -3524,3 +3524,24 @@ partition table, see the V4 notes); the stored notes must survive it.
    branches before any card, and again on every catch-up after a reboot.
    Time the relay loop through the batch; if it stalls noticeably, cache each
    mint's share public keys in RAM before release.
+
+## 40. Crash detail (added 2026-11-13, NOT YET BENCH-RUN)
+
+Why: a T-Display on 0.18.0-beta.34 reset with `last_reset` `panic` and
+`crashed_during` "relay mgmt list_clients", and recorded nothing more.
+
+Crash detail:
+1. Power-cycle the board. FIRMWARE_INFO carries no `crash_detail`, and
+   `get_status` (device operator) has `crash_detail` `null`.
+2. A planned restart (an identity change, or the relay watchdog) also shows
+   no `crash_detail`, while `crashed_during` keeps naming a watchdog restart
+   as before.
+3. After the next crash reset on any board on this build, record
+   `last_reset`, `crashed_during` and `crash_detail`. `alloc-failed` with
+   `alloc_failed_bytes` near a reply's size points at heap exhaustion in that
+   operation; `rust-panic` names the line; `unrecorded` means neither hook
+   fired (watchdog, stack overflow, CPU exception, C abort).
+4. A per-identity delegate's `get_status`, full and low-heap, carries no
+   `crash_detail` key.
+5. `panic_site` never shows more than the path after `src/` and a line: no
+   home directory, no message.

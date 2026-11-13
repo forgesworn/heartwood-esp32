@@ -63,6 +63,9 @@ pub mod net_config;
 
 pub mod mgmt;
 
+/// Crash cause and location recorded beside the firmware's breadcrumb.
+pub mod crash_record;
+
 pub mod persistent_state;
 
 pub mod persona_pack;

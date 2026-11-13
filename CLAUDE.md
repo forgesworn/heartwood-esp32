@@ -603,6 +603,6 @@ All crypto crates are no_std-compatible but we use the ESP-IDF std framework:
 | zeroize | Deterministic secret cleanup |
 | bech32 | npub encoding |
 | bip39 + bip32 | Mnemonic derivation (provision CLI only) |
-| crc32fast | Serial protocol integrity |
+| `common::crc32` (in-crate) | Serial protocol and record checksums: standard CRC-32 from a 64-byte table, in place of crc32fast's 16 KiB one |
 | esp-idf-svc + esp-idf-hal | ESP-IDF std framework (I2C, GPIO, NVS, logging) |
 | ssd1306 + embedded-graphics | OLED driver and text rendering |

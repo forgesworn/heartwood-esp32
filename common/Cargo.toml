@@ -17,7 +17,6 @@ hmac = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false, features = ["compress"] }
 zeroize = { version = "1", default-features = false, features = ["derive", "alloc"] }
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
-crc32fast = { version = "1", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
 hkdf = { version = "0.12", default-features = false, optional = true }
@@ -48,6 +47,8 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], opti
 ledger_secure_sdk_sys = { version = "1.16", optional = true }
 
 [dev-dependencies]
+# The reference the in-crate CRC-32 (src/crc32.rs) is checked against.
+crc32fast = { version = "1", default-features = false }
 # Executes the actual private firmware journal codec; no RNG/default features.
 chacha20poly1305 = { version = "=0.10.1", default-features = false }
 vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "1c0adece2ec71ccfca0d98cafc7e3ddb0ebf33a2", default-features = false }

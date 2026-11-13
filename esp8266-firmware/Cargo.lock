@@ -508,7 +508,6 @@ dependencies = [
  "base64 0.22.1",
  "bech32",
  "chacha20",
- "crc32fast",
  "crypto-bigint",
  "hkdf 0.12.4",
  "hmac 0.12.1",

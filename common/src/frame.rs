@@ -56,7 +56,7 @@ pub fn build_frame(frame_type: u8, payload: &[u8]) -> Result<Vec<u8>, FrameError
     let length_bytes = length.to_be_bytes();
 
     // CRC covers type + length bytes + payload.
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = crate::crc32::Hasher::new();
     hasher.update(&[frame_type]);
     hasher.update(&length_bytes);
     hasher.update(payload);
@@ -103,7 +103,7 @@ pub fn parse_frame(data: &[u8]) -> Result<Frame, FrameError> {
 
     // Recompute CRC over type + length bytes + payload.
     let length_bytes = (length as u16).to_be_bytes();
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = crate::crc32::Hasher::new();
     hasher.update(&[frame_type]);
     hasher.update(&length_bytes);
     hasher.update(payload);

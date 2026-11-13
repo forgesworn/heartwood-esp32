@@ -568,6 +568,29 @@ crate has a feature flag: `k256-backend` (default, for host tools/tests) and
 `secp256k1-backend` (for firmware). Both backends produce identical outputs —
 verified by the frozen test vector in `common/src/derive.rs`.
 
+### Toolchain and dependency pins (2026-10-28)
+
+- CI and release.yml run on `ubuntu-24.04`, not `ubuntu-latest`: 26.04 has no
+  `libxml2.so.2`, which the ESP toolchain's esp-clang 16.0.1 links against,
+  so every firmware build failed with `Could not install esp-idf`.
+- k256 is 0.14.0 (exact pin) with a crypto-bigint floor of 0.7.6 for
+  RUSTSEC-2026-0387, so the effective Rust floor is 1.87. `vmls-core` is pinned
+  by rev in common/ and firmware/ to `1c0adece` (6 Nov), a commit on vmls-core
+  main 13 commits after its v0.1.2 tag. vmls-core is a mirror published from
+  vennel (`scripts/publish-vmls-core.mjs`). deny.toml allows it only as a git
+  source (`[sources] allow-git`) and carries no advisory exception for it.
+- esp8266-firmware's pinned esp toolchain reports `1.87.0-nightly`, which Cargo
+  ranks below crypto-bigint's 1.87, so its CI build passes
+  `--ignore-rust-version`, and builds `--locked` on sha2 0.11.0 (0.11.1 needs
+  Rust 1.88's `slice_as_chunks`). esp 1.95 drops the build-std feature the
+  lx106 build needs, so the toolchain stays put.
+- Heavy builds and full test suites run on the M4 (workspace CLAUDE.md). Host
+  crates there need `--target aarch64-apple-darwin`; for firmware there,
+  esp-idf-sys's arm64 esp-clang libclang clashes with the x86_64 cargo, so move
+  `firmware/.embuild/espressif/tools/esp-clang/*/esp-clang/lib/libclang.*` aside
+  in the scratch copy. rsync keeps old mtimes: touch the sources after a branch
+  switch or cargo reuses stale binaries.
+
 ## Dependencies
 
 All crypto crates are no_std-compatible but we use the ESP-IDF std framework:
@@ -580,6 +603,6 @@ All crypto crates are no_std-compatible but we use the ESP-IDF std framework:
 | zeroize | Deterministic secret cleanup |
 | bech32 | npub encoding |
 | bip39 + bip32 | Mnemonic derivation (provision CLI only) |
-| crc32fast | Serial protocol integrity |
+| `common::crc32` (in-crate) | Serial protocol and record checksums: standard CRC-32 from a 64-byte table, in place of crc32fast's 16 KiB one |
 | esp-idf-svc + esp-idf-hal | ESP-IDF std framework (I2C, GPIO, NVS, logging) |
 | ssd1306 + embedded-graphics | OLED driver and text rendering |

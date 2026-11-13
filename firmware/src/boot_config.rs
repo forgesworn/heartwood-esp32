@@ -64,7 +64,7 @@ pub fn read_flash_config() -> Option<(Vec<u8>, u32)> {
             return None;
         }
 
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = heartwood_common::crc32::Hasher::new();
         hasher.update(&json);
         if hasher.finalize() != crc {
             log::warn!("[boot_config] config partition CRC mismatch — ignoring");

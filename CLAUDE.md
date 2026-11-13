@@ -415,10 +415,10 @@ verified by the frozen test vector in `common/src/derive.rs`.
   so every firmware build failed with `Could not install esp-idf`.
 - k256 is 0.14.0 (exact pin) with a crypto-bigint floor of 0.7.6 for
   RUSTSEC-2026-0387, so the effective Rust floor is 1.87. `vmls-core` is pinned
-  to `fa3776ea` (tag `heartwood-pin-fa3776ea` in forgesworn/vmls-core keeps it
-  reachable). vmls-core is a mirror published from vennel
-  (`scripts/publish-vmls-core.mjs`); move the pin to vmls-core main once vennel
-  publishes the same change. deny.toml carries no exception for it.
+  by rev in common/ and firmware/ to `1c0adece` (6 Nov), a commit on vmls-core
+  main 13 commits after its v0.1.2 tag. vmls-core is a mirror published from
+  vennel (`scripts/publish-vmls-core.mjs`). deny.toml allows it only as a git
+  source (`[sources] allow-git`) and carries no advisory exception for it.
 - esp8266-firmware's pinned esp toolchain reports `1.87.0-nightly`, which Cargo
   ranks below crypto-bigint's 1.87, so its CI build passes
   `--ignore-rust-version`, and builds `--locked` on sha2 0.11.0 (0.11.1 needs

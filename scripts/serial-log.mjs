@@ -12,6 +12,8 @@
 
 import { argv, env } from 'node:process'
 
+import { readPortArg } from './lib/port.mjs'
+
 const { SerialPort } = await (async () => {
   const candidates = [
     'serialport',
@@ -29,11 +31,14 @@ const { SerialPort } = await (async () => {
   process.exit(2)
 })()
 
-const PORT = argv[argv.indexOf('--port') + 1]
-if (!PORT || PORT.startsWith('--')) {
-  console.error('usage: node scripts/serial-log.mjs --port /dev/cu.usbmodemXXXX')
-  process.exit(2)
-}
+const PORT = (() => {
+  try {
+    return readPortArg(argv, 'usage: node scripts/serial-log.mjs --port /dev/cu.usbmodemXXXX')
+  } catch (error) {
+    console.error(error.message)
+    process.exit(2)
+  }
+})()
 
 const port = new SerialPort({ path: PORT, baudRate: 115200 })
 await new Promise((resolve, reject) => {

@@ -20,6 +20,8 @@
 
 import { argv, env } from 'node:process'
 
+import { readPortArg } from './lib/port.mjs'
+
 // This repo is Rust and carries no node_modules. node-serialport lives in the
 // sapwood checkout, which is the CLI that already speaks this frame protocol.
 // Try a plain resolve first (works if someone installs it here), then the
@@ -41,11 +43,14 @@ const { SerialPort } = await (async () => {
   process.exit(2)
 })()
 
-const PORT = argv[argv.indexOf('--port') + 1]
-if (!PORT || PORT.startsWith('--')) {
-  console.error('usage: node scripts/frame-size-probe.mjs --port /dev/cu.usbmodemXXXX')
-  process.exit(2)
-}
+const PORT = (() => {
+  try {
+    return readPortArg(argv, 'usage: node scripts/frame-size-probe.mjs --port /dev/cu.usbmodemXXXX')
+  } catch (error) {
+    console.error(error.message)
+    process.exit(2)
+  }
+})()
 
 const MAGIC = [0x48, 0x57]
 const NIP46_REQUEST = 0x02
@@ -168,8 +173,8 @@ const SIGN = argv.includes('--sign')
 // --sizes 20480,32000 narrows the sweep. Post-approval testing costs a human
 // button press per size, so being able to spend them only where the answer is
 // still unknown matters.
-const SIZES_ARG = argv[argv.indexOf('--sizes') + 1]
-const SIZES = argv.includes('--sizes')
+const SIZES_ARG = argv.includes('--sizes') ? argv[argv.indexOf('--sizes') + 1] : undefined
+const SIZES = SIZES_ARG && !SIZES_ARG.startsWith('--')
   ? SIZES_ARG.split(',').map((s) => Number(s.trim()))
   : SIGN
     ? [1024, 2048, 4096, 8192, 12288, 16384, 20480, 24576, 28672, 32000]

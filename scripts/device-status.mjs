@@ -11,18 +11,21 @@
 import { argv } from 'node:process'
 
 import { NACK } from './lib/frame.mjs'
-import { openFramedPort } from './lib/port.mjs'
+import { openFramedPort, readPortArg } from './lib/port.mjs'
 
 const FIRMWARE_INFO = 0x59
 const FIRMWARE_INFO_RESPONSE = 0x5a
 const PROVISION_LIST = 0x05
 const PROVISION_LIST_RESPONSE = 0x07
 
-const PORT = argv[argv.indexOf('--port') + 1]
-if (!PORT || PORT.startsWith('--')) {
-  console.error('usage: node scripts/device-status.mjs --port /dev/cu.usbmodemXXXX')
-  process.exit(2)
-}
+const PORT = (() => {
+  try {
+    return readPortArg(argv, 'usage: node scripts/device-status.mjs --port /dev/cu.usbmodemXXXX')
+  } catch (error) {
+    console.error(error.message)
+    process.exit(2)
+  }
+})()
 
 const session = await openFramedPort(PORT).catch((error) => {
   console.error(error.message)

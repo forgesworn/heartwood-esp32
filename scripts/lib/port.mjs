@@ -10,6 +10,34 @@
 
 import { buildFrame, createFrameReader, NACK, pollForReply } from './frame.mjs'
 
+/**
+ * Bench drivers must only ever open serial devices. 2026-11-02: a missing
+ * --port fell through `argv[argv.indexOf('--port') + 1]` to argv[0], and the
+ * driver opened the very node binary running it as the "port"; that inode was
+ * then refused at every later exec (Killed: 9) until the file was refreshed.
+ * Never let a flag parse choose a path again.
+ */
+export function checkSerialDevicePath(path) {
+  if (typeof path !== 'string' || !/^\/dev\/(cu|tty)\.[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)) {
+    return `port must be a serial device such as /dev/cu.usbserial-XXXX (got: ${path})`
+  }
+  return null
+}
+
+/** The --port flag of a bench driver, or a thrown usage error naming it. */
+export function readPortArg(argv, usage) {
+  const i = argv.indexOf('--port')
+  const raw = i === -1 ? undefined : argv[i + 1]
+  if (!raw || raw.startsWith('--')) {
+    throw new Error(usage)
+  }
+  const bad = checkSerialDevicePath(raw)
+  if (bad) {
+    throw new Error(bad)
+  }
+  return raw
+}
+
 async function resolveSerialPort(env) {
   const candidates = [
     'serialport',
@@ -37,6 +65,10 @@ async function resolveSerialPort(env) {
  * device's own screen.
  */
 export async function openFramedPort(path, { env = process.env, baudRate = 115200 } = {}) {
+  const badPath = checkSerialDevicePath(path)
+  if (badPath) {
+    throw new Error(badPath)
+  }
   const SerialPort = await resolveSerialPort(env)
   const port = new SerialPort({ path, baudRate })
   await new Promise((resolve, reject) => {

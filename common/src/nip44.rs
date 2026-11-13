@@ -234,6 +234,18 @@ fn calc_padded_len(msg_len: usize) -> usize {
     chunk * ((msg_len - 1) / chunk + 1)
 }
 
+/// Capacity a plaintext buffer needs for [`encrypt_owned`] to pad, encrypt
+/// and frame it without moving: the two-byte length prefix and the padded
+/// plaintext, then version, nonce and HMAC (65). A caller that builds the
+/// plaintext itself can reserve this up front, so encryption reuses that one
+/// allocation instead of copying it into a larger block.
+pub fn owned_capacity(msg_len: usize) -> Option<usize> {
+    if msg_len == 0 || msg_len > 65_535 {
+        return None;
+    }
+    Some(2 + calc_padded_len(msg_len) + 65)
+}
+
 /// Exact base64 wire length for a NIP-44 v2 plaintext of `msg_len` bytes.
 ///
 /// Hardware transports use this before encryption to decide whether the next
@@ -709,6 +721,21 @@ mod tests {
         let decrypted = decrypt(&conv_key_bob, &encrypted).unwrap();
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn a_plaintext_reserved_to_owned_capacity_is_padded_and_framed_in_place() {
+        for n in [1usize, 32, 33, 257, 5_194, 6_596, 65_535] {
+            let mut plaintext = String::with_capacity(owned_capacity(n).unwrap());
+            plaintext.extend(core::iter::repeat('x').take(n));
+            let ptr = plaintext.as_ptr();
+            let padded = pad_owned(plaintext).unwrap();
+            assert_eq!(padded.as_ptr(), ptr, "padding moved a {n} B plaintext");
+            // encrypt_padded then grows it by the 65-byte frame; room is there.
+            assert!(padded.capacity() >= padded.len() + 65, "{n} B");
+        }
+        assert_eq!(owned_capacity(0), None);
+        assert_eq!(owned_capacity(65_536), None);
     }
 
     #[test]

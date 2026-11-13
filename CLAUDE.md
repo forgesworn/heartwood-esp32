@@ -422,6 +422,59 @@ identity, so `cash_address_proof` there refuses before the card, as
 `cash_address` does; on the USB-bridged NIP-46 path the card is the generic
 extension card, as for every note method.
 
+Crash detail beside the breadcrumb (2026-11-13, checklist section 40; item
+1 run on a T-Display, no crash yet to record). A T-Display on beta.34 reset with `last_reset` `panic` and
+the crumb "relay mgmt list_clients", and nothing else to go on: every board
+builds with its console off, so the panic message went nowhere. Two RTC
+noinit records now sit beside the crumb (`firmware/src/crash_crumb.rs`,
+rules in `common/src/crash_record.rs`, host-tested). A Rust panic hook keeps
+the panic's `file:line`, the path after its last `src/`, at most 40 bytes,
+never the message: FIRMWARE_INFO answers any USB host while locked, and a
+formatted message can carry request data. ESP-IDF's failed-allocation
+callback (`heap_caps_register_failed_alloc_callback`; in IRAM, RTC writes
+only) keeps the last failed allocation's size and caps, and a count. Both are
+stamped with the crumb window, which every `set` and `clear` bumps, and only
+final-window records count, since TLS and WiFi survive failed allocations. A
+Rust out-of-memory never reaches the panic hook on stable std (it prints and
+aborts, which resets as a panic), so a failed allocation with no panic, on a
+panic reset, is the out-of-memory signature; after a watchdog or brownout it
+is only a fact about the window. A stack overflow, CPU exception, C abort or
+watchdog fires neither and reads `unrecorded`. Reported after a crash reset as
+`crash_detail` `{cause: rust-panic|alloc-failed|unrecorded, panic_site,
+alloc_failed_bytes, alloc_failed_caps, alloc_failures}` beside
+`crashed_during`: in FIRMWARE_INFO, and in the device operator's
+`get_status`, full and low-heap, never a delegate's.
+
+`list_clients` in one buffer (2026-11-13, checklist section 40; items 6-7
+run on a T-Display, 10 minutes at Sapwood's pace, no reset). The relay reply was a `serde_json` tree per slot, copied into a
+second tree by each `json!` wrap and serialised with two trees alive:
+`common/tests/list_clients_memory.rs` measures about 60 KB of heap for the
+5 KB reply of five ordinary apps (host, 64-bit). `mgmt::encode_list_clients_reply`
+(behind common's new `std` feature, which the firmware enables for
+serde_json's writer) counts the reply, reserves one buffer fallibly
+(`try_reserve_exact`; a failure returns the usual "device low on memory;
+state unchanged, retry shortly") at the size NIP-44 needs for it
+(`nip44::owned_capacity`, so `encrypt_owned` pads and frames it in place),
+then writes it without regrowing: about 6.4 KB at peak for that reply, and
+14.5 KB through encryption against the old 60 KB. The bytes are the same as
+before (host-tested against `client_summary`). The USB slot list (frame
+0x42) built the same trees and now goes through the same serialiser
+(`mgmt::encode_usb_slot_list`, sized for its frame and framed in place by
+`write_owned_frame`), so the firmware no longer links `client_summary` at
+all. Both passes of the encoder write through serde_json's `Vec<u8>` writer,
+the one the rest of the firmware already uses (counting runs each slot
+through a scratch buffer, so it briefly holds up to about twice the largest
+slot's JSON), and `crash_detail` is hand-written JSON rather than serde, to
+keep the Heltec images inside their 2 MB slot (main left the V4 about 2 KB
+spare). A reply NIP-44 cannot carry (over 65,535 bytes; 16
+maximum-size slots come to about 105 KB) is refused after the count as
+"client list too large for one reply", not "retry shortly". `relay.rs`
+handles the method before `dispatch_mgmt`, as it does phone enrolment, and
+the transport guard still runs on the finished reply. That heap exhaustion
+caused the T-Display reset is unconfirmed, since the board recorded nothing
+beyond the crumb. Paging the list would change the wire format Sapwood reads;
+it has not been done.
+
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
 ## Build & flash

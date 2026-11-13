@@ -3635,6 +3635,15 @@ not looked at.
   the fall comes with each request or is state filling to a bound is not
   known; the 32-entry sign audit ring records signing requests, not these
   reads. A reading some hours on would tell.
+- Heap, some hours on: one more relay `get_status` at 20:00:02Z, 6.87 hours
+  after the hour's last round, with nothing from this test polling the board
+  in between. Uptime 29,122 s, `last_reset` `power-on`, `crash_detail` `null`.
+  Free heap was 47,196, down 4,980 (about 725 bytes an hour, a third of the
+  rate while polled), and the largest block 34,816, down 6,144. The fall goes
+  on without these reads, more slowly, and the largest block is shrinking
+  faster than free heap. One client the board does not authorise was still
+  sending it a request every 30 seconds, which it refuses; whether that
+  traffic or time-based work accounts for the fall is not yet known.
 - Not run: items 2 to 5, as before; item 8's reply was not seen.
 - Settlement: the small-value mint-confirm-export-melt-spent round trip was not
   run; the owner set it aside.

@@ -209,13 +209,18 @@ pub fn firmware_info_json(
     // "unknown" stays distinguishable from "empty".
     let nvs_stats = crate::nvs_stats::read()
         .map(|s| {
+            // Read-only diagnostics beside the totals (counts only).
+            let diag = crate::nvs_stats::read_diag(s.total_entries);
             format!(
                 ",\"nvs_used_entries\":{},\"nvs_free_entries\":{},\
-                 \"nvs_total_entries\":{},\"max_personas\":{}",
+                 \"nvs_total_entries\":{},\"max_personas\":{},\
+                 \"nvs_ns_used\":{},\"nvs_dup_blob_keys\":{}",
                 s.used_entries,
                 s.free_entries,
                 s.total_entries,
                 personas::MAX_PERSONAS,
+                diag.ns_used_value(),
+                json_usize_or_null(diag.dup_blob_keys),
             )
         })
         .unwrap_or_default();

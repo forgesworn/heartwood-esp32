@@ -83,6 +83,9 @@ pub mod persona_pack;
 /// NVS entry arithmetic for a blob write (ESP-IDF's multi-page blob layout).
 pub mod nvs_room;
 
+/// Duplicate-key counting for the read-only NVS diagnostics.
+pub mod nvs_diag;
+
 pub mod reply_clock;
 
 pub mod approval_queue;

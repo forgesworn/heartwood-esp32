@@ -258,6 +258,15 @@ jobs:
           MCU: ${{ matrix.chip }}
           ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.${{ matrix.board }}"
         run: cargo build --release --target ${{ matrix.target }} --no-default-features --features ${{ matrix.board }}
+      # The board-check demo shares the T-Display's display driver, so a change
+      # there can break it; neither this job nor the release built it before.
+      - name: Build the board-check demo (tdisplay only)
+        if: matrix.board == 'tdisplay'
+        working-directory: firmware
+        env:
+          MCU: ${{ matrix.chip }}
+          ESP_IDF_SDKCONFIG_DEFAULTS: "sdkconfig.defaults;sdkconfig.defaults.${{ matrix.board }}"
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features tdisplay,demo-game --bin heartwood-demo
       - name: App image must fit the ${{ matrix.board }} app slot
         working-directory: firmware
         run: |

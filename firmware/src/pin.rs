@@ -24,11 +24,10 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
 use crate::data_key_store::{self, Board, NvsBlobs};
 use crate::protocol;
-use heartwood_common::data_key::{self, BlobStore, ChangeError, Pbkdf2};
+use heartwood_common::data_key::{self, BlobStore, ChangeError, Pbkdf2, PinCountStore, StoreError};
 use heartwood_common::types::{FRAME_TYPE_ACK, FRAME_TYPE_NACK};
 use zeroize::Zeroize;
 
-const NVS_PIN_ATTEMPTS_KEY: &str = data_key::PIN_ATTEMPTS_KEY;
 pub const MAX_FAILED_ATTEMPTS: u8 = 5;
 
 /// True if any loaded master's seed is encrypted and not yet decrypted — i.e.
@@ -37,98 +36,69 @@ pub fn is_locked(masters: &[LoadedMaster]) -> bool {
     masters.iter().any(|m| m.locked)
 }
 
-/// Read the persisted failed-attempt counter from NVS. Malformed/unreadable
-/// state stays distinct from absence so boot can fail closed into a wipe.
-pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str> {
-    let mut buf = [0u8; 1];
-    match nvs.get_blob(NVS_PIN_ATTEMPTS_KEY, &mut buf) {
-        Ok(Some(b)) if b.len() == 1 => Ok(buf[0]),
-        Ok(Some(_)) => Err("malformed PIN-attempt state"),
-        Ok(None) => Ok(0),
-        Err(_) => Err("could not read PIN-attempt state"),
+/// The failed-PIN count on NVS: a `u8` item (`nvs_set_u8` writes the new
+/// item before erasing the old one, so a cut leaves one of them, and it needs
+/// a single free entry), with the one-byte blob earlier firmware used read
+/// until the first raise or clear moves it (`data_key::PinCountStore`).
+struct PinCounter<'a>(&'a EspNvs<NvsDefault>);
+
+impl PinCountStore for PinCounter<'_> {
+    fn get_count(&self) -> Result<Option<u8>, StoreError> {
+        self.0.get_u8(data_key::PIN_COUNT_KEY).map_err(|_| StoreError)
+    }
+
+    fn set_count(&mut self, count: u8) -> Result<(), StoreError> {
+        self.0.set_u8(data_key::PIN_COUNT_KEY, count).map_err(|_| StoreError)
+    }
+
+    fn remove_count(&mut self) -> Result<(), StoreError> {
+        self.0.remove(data_key::PIN_COUNT_KEY).map(|_| ()).map_err(|_| StoreError)
+    }
+
+    fn get_legacy(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = data_key::PIN_ATTEMPTS_LEGACY_KEY;
+        let len = match self.0.blob_len(key) {
+            Ok(None) => return Ok(None),
+            Ok(Some(len)) if len <= 8 => len,
+            Ok(Some(_)) => return Ok(Some(vec![0; 9])), // malformed, and says so
+            Err(_) => return Err(StoreError),
+        };
+        let mut buf = vec![0u8; len.max(1)];
+        match self.0.get_blob(key, &mut buf) {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            Ok(None) => Ok(None),
+            Err(_) => Err(StoreError),
+        }
+    }
+
+    fn remove_legacy(&mut self) -> Result<(), StoreError> {
+        self.0.remove(data_key::PIN_ATTEMPTS_LEGACY_KEY).map(|_| ()).map_err(|_| StoreError)
     }
 }
 
-/// The PIN wipe counter as a [`BlobStore`] whose writes never erase first.
-///
-/// esp-idf-svc's `EspNvs::set_blob` removes the key before writing it, so a
-/// power cut between the two would leave no count, which reads as zero: a
-/// free reset of the wipe counter. ESP-IDF's own `nvs_set_blob` writes the
-/// new value before it retires the old one, so a cut leaves one or the other.
-/// If there is no room for the new copy the write is refused before it
-/// starts, the old count stays and `charge_pin_guess` refuses the guess untried.
-struct PinCounter<'a>(&'a mut EspNvs<NvsDefault>);
-
-impl BlobStore for PinCounter<'_> {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, data_key::StoreError> {
-        let mut buf = [0u8; 8];
-        match self.0.get_blob(key, &mut buf) {
-            Ok(Some(b)) => Ok(Some(b.to_vec())),
-            Ok(None) => Ok(None),
-            Err(_) => Err(data_key::StoreError),
-        }
-    }
-
-    fn set(&mut self, key: &str, value: &[u8]) -> Result<(), data_key::StoreError> {
-        use esp_idf_svc::handle::RawHandle;
-        use esp_idf_svc::sys;
-        use heartwood_common::nvs_room;
-        // Refuse before writing unless the new copy fits. ESP-IDF 5.3.2's
-        // cleanup after a write that runs out of pages can erase the OLD
-        // copy's data, which reads back as no count and wipes the board. A
-        // refusal here leaves the old count whole, and the guess goes untried.
-        let stats = crate::nvs_stats::read().ok_or(data_key::StoreError)?;
-        let pages = stats.total_entries / nvs_room::PAGE_ENTRIES;
-        if nvs_room::available_entries(stats.free_entries)
-            < nvs_room::blob_write_entries(value.len(), pages)
-        {
-            log::warn!("PIN counter: no room for a new copy, guess refused untried");
-            return Err(data_key::StoreError);
-        }
-        let c_key = std::ffi::CString::new(key).map_err(|_| data_key::StoreError)?;
-        // SAFETY: the handle is open for as long as `self.0` lives, the key is
-        // NUL-terminated, and `value` outlives the call.
-        let set = unsafe {
-            sys::nvs_set_blob(self.0.handle(), c_key.as_ptr(), value.as_ptr().cast(), value.len())
-        };
-        if set != sys::ESP_OK {
-            return Err(data_key::StoreError);
-        }
-        // SAFETY: as above.
-        if unsafe { sys::nvs_commit(self.0.handle()) } != sys::ESP_OK {
-            return Err(data_key::StoreError);
-        }
-        Ok(())
-    }
-
-    fn remove(&mut self, key: &str) -> Result<(), data_key::StoreError> {
-        self.0.remove(key).map(|_| ()).map_err(|_| data_key::StoreError)
-    }
+/// Read the persisted failed-attempt counter from NVS. Malformed/unreadable
+/// state stays distinct from absence so boot can fail closed into a wipe.
+pub fn read_failed_attempts(nvs: &EspNvs<NvsDefault>) -> Result<u8, &'static str> {
+    data_key::read_pin_attempts(&PinCounter(nvs))
 }
 
 /// Clear the PIN wipe counter after a proven-correct secret, and check that
 /// it took. The guess was counted before it was checked, so a correct fifth
 /// PIN sits on flash as 5 until this runs: a clear that silently failed would
-/// wipe the board at the next boot. Removal is tried twice, then an in-place
-/// write of 0, each judged by reading the count back. Returns whether the
-/// count now reads 0.
+/// wipe the board at the next boot. `data_key::clear_pin_attempts` judges
+/// each pass by reading the count back and tries once more. Returns whether
+/// the count now reads 0.
 pub(crate) fn clear_failed_attempts(nvs: &mut EspNvs<NvsDefault>) -> bool {
-    for _ in 0..2 {
-        let _ = nvs.remove(NVS_PIN_ATTEMPTS_KEY);
-        if read_failed_attempts(nvs) == Ok(0) {
-            return true;
+    match data_key::clear_pin_attempts(&mut PinCounter(nvs)) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!(
+                "PIN wipe counter could not be cleared after a correct unlock ({e}); \
+                 the next boot may wipe the board"
+            );
+            false
         }
     }
-    let mut counter = PinCounter(nvs);
-    let _ = counter.set(NVS_PIN_ATTEMPTS_KEY, &[0]);
-    if read_failed_attempts(counter.0) == Ok(0) {
-        return true;
-    }
-    log::error!(
-        "PIN wipe counter could not be cleared after a correct unlock; \
-         the next boot may wipe the board"
-    );
-    false
 }
 
 /// What an unlock is doing, for the OLED.

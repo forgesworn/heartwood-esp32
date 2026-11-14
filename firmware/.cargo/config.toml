@@ -29,7 +29,15 @@ build-std = ["std", "panic_abort"]
 # there is nowhere to print a trace either. Panics still abort into the ESP-IDF
 # panic handler, reset as ESP_RST_PANIC and leave the crash crumb exactly as
 # before; the target's panic strategy was already abort.
-build-std-features = ["panic-unwind", "default"]
+#
+# `optimize_for_size` swaps core's speed-tuned internals for their small
+# variants: heapsort and a small merge sort in place of ipnsort and driftsort
+# with their sorting networks (sort9/sort13_optimal), and integer formatting
+# without the two-digit lookup path. About 26 KB of app image on the Heltec
+# builds. The results are the same by std's contract (a stable sort stays
+# stable); only speed differs, and nothing here sorts or formats enough for
+# that to show.
+build-std-features = ["panic-unwind", "default", "optimize_for_size"]
 
 [env]
 MCU = "esp32s3"

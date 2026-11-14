@@ -422,11 +422,9 @@ fn approve_bundle(
     // USB has no client key and so no slot: the slot check refuses it.
     let board = op::BundleBoard {
         has_tree: derivation_secret(master_secret, master_mode).is_ok(),
-        registry_free: if crate::personas::capacity_check(nvs).is_err() {
-            0
-        } else {
-            usize::from(crate::personas::MAX_PERSONAS.saturating_sub(crate::personas::read_count(nvs)))
-        },
+        // Every name the press could register, each through the gate
+        // `personas::add` applies, as if the names before it were written.
+        registry_free: crate::personas::registrations_that_fit(nvs, op::MAX_BUNDLE_PERSONAS),
     };
     let slot = policy_engine.find_slot_by_pubkey(master_slot, client_hex);
     // The one-card rule on the passes that may raise the card. Never on the
@@ -2661,11 +2659,17 @@ fn dispatch_inner(
             let Some(slot_index) = policy_engine.create_slot(master_slot, label.clone(), secret_hex.clone()) else {
                 return build_error_json(&request.id, -1, "no free slot");
             };
-            if !policy_engine.persist_slots(nvs, master_slot) {
+            if let Err(why) = policy_engine.try_persist_slots(nvs, master_slot) {
                 // A slot that would not survive a reboot is one the other
                 // wallet binds to and then loses: refuse rather than mislead.
+                // `storage_full` only for the growth gate's refusal; a fault
+                // is not something freeing room would fix. The bare code, as
+                // the wallet's other methods (`note_cmd`) answer it.
                 policy_engine.revoke_slot(master_slot, slot_index);
-                return build_error_json(&request.id, -1, "storage_full");
+                return build_error_json(&request.id, -1, match why {
+                    crate::policy::SlotSaveError::NoRoom => "storage_full",
+                    crate::policy::SlotSaveError::Failed => "storage_unavailable: pairing was not saved",
+                });
             }
             let master_hex = match secp256k1::Keypair::from_seckey_slice(secp, master_secret) {
                 Ok(kp) => hex_encode(&kp.x_only_public_key().0.serialize()),

@@ -2287,6 +2287,14 @@ mod link_card_tests {
         let nack = transport.find("site_link::cable_nacks(&request.method, relay_loop)").expect("the cable NACK");
         assert!(nack < transport.find("if is_waiting_copy(").expect("the copy check"));
         assert!(nack < transport.find("nip46_handler::handle_parsed_request(").expect("the dispatch"));
+        // The cable NACK is empty and unlogged, so neither log names the method.
+        let block = &transport[nack..];
+        let block = &block[..block.find("\n    }\n").expect("the NACK block's end")];
+        assert!(
+            block.ends_with("{\n        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);\n        return;"),
+            "the cable site-link NACK must be empty and return at once"
+        );
+        assert!(!block.contains("log::"), "the cable site-link NACK must not be logged");
 
         let handler = src("nip46_handler.rs");
         assert_eq!(handler.matches("site_link::take_on_bind(").count(), 1);

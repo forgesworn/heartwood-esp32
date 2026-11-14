@@ -3748,8 +3748,9 @@ with the device operator key.
 ## 43. Site links made with a hold (added 2026-11-14, NOT YET BENCH-RUN)
 
 `heartwood_link_create`, `heartwood_link_status` and `heartwood_link_revoke`
-over the relay (WiFi-standalone only; the cable and the USB-bridged NIP-46
-path answer `site links are made over the board's relay connection`). A phone
+over the relay (WiFi-standalone only; the USB-bridged NIP-46 path answers
+`site links are made over the board's relay connection`, and in WiFi mode a
+copy heartwoodd bridges over the cable is NACKed, item 22). A phone
 paired with full access asks for a site's `bunker://` link; the board refuses
 everything it can before the card, shows `LINK ?<site>?`, `AS <identity>`
 (with ` M<n>` when the identity is on another master), the scope line and
@@ -3772,7 +3773,8 @@ KithMoot joins a room with no further press.
    design's `declined`), no slot is made, and a second ask from the phone within 60 s answers
    `shown recently` with no card.
 4. No press: `timeout`, no slot; a second ask within 60 s answers
-   `shown recently`.
+   `shown recently`. The same for a LINK card that waits out the 90 s queue
+   TTL behind other cards without reaching the screen.
 5. Table full (16 slots on the identity's master): `no room` before the card.
    NVS nearly full: `no room` before the card. A same-label retry of the link
    that took the last slot still answers that link (item 11).
@@ -3812,9 +3814,10 @@ KithMoot joins a room with no further press.
 18. Inherit window: a first bind 61 s after the hold gets `REMEMBER AS`; a
     same-label retry inside the window does not move the deadline; a revoke
     inside the window clears the entry.
-19. A slot-table change on the identity's master (not the asking one) between
-    the card and the hold: the hold answers `approval_changed` and no slot is
-    made.
+19. A slot-table change on the identity's master (not the asking one) while
+    the LINK card waits: the card closes at once as `NOT DONE / Link blocked /
+    Slots changed`, answers `approval_changed`, and no slot is made. The phone
+    is not cooled: sending again raises a fresh card.
 20. The `AS` line shows ` M1` for an identity on master 1 asked from master 0,
     and no master for one on the asking master. On every board and in both
     orientations the card stays inside the panel and the span (ui-preview
@@ -3823,3 +3826,8 @@ KithMoot joins a room with no further press.
     example `DECRYPT, NO SIGN, NO ASK`), whole, on every panel.
 21. Escalate or strict asking slot: refused before the card, never parked for
     a guardian verdict.
+22. WiFi mode with heartwoodd also bridging the board over the cable: a link
+    create raises one card; heartwoodd logs a NACK for the cable copy and
+    publishes nothing, and the phone hears only the card's outcome (check
+    the phone does not report `site links are made over the board's relay
+    connection`). The same for status and revoke.

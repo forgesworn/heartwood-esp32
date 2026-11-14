@@ -247,6 +247,26 @@ publish-only and locked-boot dials all pass through it, so it includes sessions
 opened before unlock; a dial that fails part-way is not counted). Both are
 read-only and additive.
 
+Stack diagnostics (2026-11-14, NOT YET BENCH-RUN): the same full reply
+carries `stack_free`, each task's FreeRTOS stack high-water mark, the bytes it
+has never used since it started (`uxTaskGetStackHighWaterMark`), keyed `main`
+(32,768 B, the USB and relay loops), `btn_latch` (3,072 B, the button sampler,
+which records its own task handle since std names every ESP-IDF thread
+"pthread"), `sys_evt` (2,304 B, the event loop task running the WiFi event
+subscription), and two C-only controls, `esp_timer` (3,584 B) and `tcpip`
+(lwIP's `tiT`, 3,072 B); `null` for a task not running. Keys and task names
+are `common/src/task_stacks.rs` (host-tested, including that neither delegate
+shape carries it), the read is relay.rs `stack_free`. Read-only and additive,
+like the two above; used as the baseline for the thin LTO bench. A reset starts
+the marks again, and get_status answers only in WiFi-standalone mode once
+unlocked, so the marks cover what the WiFi relay loop runs, including the
+cable frames it serves on the main task (Hard-mode requests, backup export and
+import, an OTA that fails its hash check); a USB-bridged session, and anything
+before the restart that ends a successful OTA, cannot be read this way. Its own
+bench is one read: on any board in WiFi-standalone mode, unlocked, the
+operator's `get_status` carries all five keys, none `null`, each a number below
+that task's stack size.
+
 A relay that refuses this client is left alone (2026-10-08, checklist section
 35 items 8-9, NOT YET BENCH-RUN). relay.damus.io was found answering `banned:
 too many rate-limit violations` to the owner's home address on 2026-10-08;

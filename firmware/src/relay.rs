@@ -2604,6 +2604,29 @@ fn connect_secondary(url: &str, ctx: &mut SignCtx) -> Result<RelaySession, Strin
 /// `get_status` as `relay_connects` to correlate heap drift with reconnects.
 static RELAY_CONNECTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Unused stack of each task that runs firmware Rust code, plus two C-only
+/// controls, as `get_status`'s `stack_free` (`heartwood_common::task_stacks`):
+/// bytes never touched since the task started, `null` for a task not running.
+/// Read here, on the main task, from each task's handle; a lookup that finds
+/// nothing is never passed on, since a null handle would read the caller's.
+fn stack_free() -> serde_json::Value {
+    use esp_idf_svc::sys::{uxTaskGetStackHighWaterMark, xTaskGetHandle, TaskHandle_t};
+    use heartwood_common::task_stacks::{BTN_LATCH_KEY, TASKS_BY_NAME};
+    let mark = |task: TaskHandle_t| -> serde_json::Value {
+        if task.is_null() {
+            serde_json::Value::Null
+        } else {
+            unsafe { uxTaskGetStackHighWaterMark(task) }.into()
+        }
+    };
+    let mut marks = serde_json::Map::new();
+    for (key, name) in TASKS_BY_NAME {
+        marks.insert((*key).into(), mark(unsafe { xTaskGetHandle(name.as_ptr()) }));
+    }
+    marks.insert(BTN_LATCH_KEY.into(), mark(crate::button::latch_task()));
+    marks.into()
+}
+
 /// Sentinel error: the relay socket could not be given a recv timeout and the
 /// caller required one (see [`connect_relay_raw`]).
 const RECV_TIMEOUT_REQUIRED: &str = "recv-timeout required";
@@ -11437,6 +11460,7 @@ fn dispatch_mgmt(
             // `json!` they cost about 1.1 KB more app image than here.
             status["min_free_heap"] = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() }.into();
             status["relay_connects"] = RELAY_CONNECTS.load(Ordering::Relaxed).into();
+            status[heartwood_common::task_stacks::STACK_FREE_KEY] = stack_free();
             Ok(status)
         }
 

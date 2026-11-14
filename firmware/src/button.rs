@@ -191,7 +191,7 @@ fn drain_release(pin: &PinDriver<'_, Input>) {
 // behaviour is type-visible. A = approve/select, B (where present) =
 // cancel/back.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 /// Whether the running board has a usable second button — read by screen
 /// code (which never sees `Buttons`) to pick two-button hint copy.
@@ -277,6 +277,18 @@ impl<'d> Buttons<'d> {
 static PRESS_EDGE: AtomicBool = AtomicBool::new(false);
 static LATCH_SPAWNED: AtomicBool = AtomicBool::new(false);
 
+/// The sampler's FreeRTOS task, recorded by the thread itself (std names
+/// every ESP-IDF thread "pthread"), so `get_status` can read its stack
+/// high-water mark. Null until it runs, and for good if the spawn failed.
+static LATCH_TASK: AtomicPtr<esp_idf_svc::sys::tskTaskControlBlock> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+/// The sampler's task handle, or null if it is not running. The thread never
+/// returns, so a handle once recorded stays valid.
+pub fn latch_task() -> esp_idf_svc::sys::TaskHandle_t {
+    LATCH_TASK.load(Ordering::Acquire)
+}
+
 /// Milliseconds the button has been held down continuously right now, or 0
 /// when it is up. Written only by the sampler thread.
 static HOLD_MS: AtomicU32 = AtomicU32::new(0);
@@ -312,6 +324,7 @@ fn spawn_press_latch(gpio: i32) {
         .name("btn-latch".into())
         .stack_size(3072)
         .spawn(move || {
+            LATCH_TASK.store(unsafe { esp_idf_svc::sys::xTaskGetCurrentTaskHandle() }, Ordering::Release);
             let mut raw_low = unsafe { esp_idf_svc::sys::gpio_get_level(gpio) } == 0;
             let mut stable_low = raw_low;
             let mut same_samples: u32 = 0;

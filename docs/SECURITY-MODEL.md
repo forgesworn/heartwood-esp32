@@ -333,16 +333,20 @@ site's sign-in link without holding the operator key, which manages
 everything and can only be taken back over USB. It is answered over the relay
 only, before any tier, policy or escalate routing, so an escalate slot can
 never park it for a guardian verdict (and is refused as not an owner pairing
-anyway). In WiFi mode a copy that heartwoodd bridges over the cable is NACKed
-unanswered, so no cable reply is published ahead of the relay card. Every refusal comes before the card: the identity must be served by
+anyway). In WiFi mode a copy that heartwoodd bridges over the cable gets an
+empty NACK, as a request that fails to decrypt does, so no cable reply is
+published ahead of the relay card and heartwoodd's log does not say which
+client used a site-link method. Every refusal comes before the card: the identity must be served by
 an unlocked master, the asking key must already sign as it there, neither slot
 may carry a family flag, Rule D real identities are refused, and the link may
 not be wider than what the phone's own slot on that master does silently. One
 LINK card at a time; a second ask refuses both and cools both phones, so
 asking again cannot keep a card up. The new slot is written only
-after a 2 s hold; nothing is written before it. Any slot-table write on any
-master while the card waits closes it at once, queued or on screen, answering
-`approval_changed`, and the hold checks the tables again before writing. The site name on the card
+after a 2 s hold; nothing is written before it. An authority change on any
+master's slots while the card waits (a new key, a revoke, a policy change; a
+label rename, for one, is not) closes it at once,
+queued or on screen, answering `approval_changed`, and the hold checks the
+tables again before writing. The site name on the card
 comes from the phone and the card does not claim the board checked it. The
 scope line is the board's own and leads with `DECRYPT` whenever the link may
 read the identity's DMs.
@@ -351,11 +355,15 @@ What it adds: a stolen phone with its PIN can ask, but each link costs a hold
 on the board, and any close of that phone's LINK card without a hold cools it
 for 60 s: a decline, the card's window running out, a queued card's 90 s TTL
 running out because other cards kept it off the screen, or a second link ask
-refusing it. The one exception is a card the slot tables overtook, whose phone
-is told to send the request again. The cooldown is per phone and restarted,
-not stacked, so it never runs past 60 s from the last close, and it starts
-only from that phone's own ask or its own card closing: nothing another client
-sends can cool a phone with no LINK card waiting. For 60 s
+refusing it. The one exception is the first card in a minute an authority
+change overtook, whose phone is told to send the request again; a second
+inside that minute cools it, so a phone that moves the epoch itself (by
+binding fresh keys to a non-signing link it made) cannot re-ask at relay
+speed. Two authority changes inside a minute, even ones other clients caused,
+can therefore cool a phone whose cards they overtook. The cooldown is per
+phone and restarted, not stacked, so it never runs past 60 s from the last
+close, and it starts only from that phone's own ask or its own card closing:
+nothing another client sends can cool a phone with no LINK card waiting. For 60 s
 after the hold the first key to bind the new slot also gets its identity
 grant, so a secret read before the site binds gains the grant only inside
 that minute, and the real site then sees `ADD DEVICE`. The window and the

@@ -3756,7 +3756,7 @@ with the device operator key.
 `heartwood_link_create`, `heartwood_link_status` and `heartwood_link_revoke`
 over the relay (WiFi-standalone only; the USB-bridged NIP-46 path answers
 `site links are made over the board's relay connection`, and in WiFi mode a
-copy heartwoodd bridges over the cable is NACKed, item 22). A phone
+copy heartwoodd bridges over the cable gets an empty NACK, item 22). A phone
 paired with full access asks for a site's `bunker://` link; the board refuses
 everything it can before the card, shows `LINK ?<site>?`, `AS <identity>`
 (with ` M<n>` when the identity is on another master), the scope line and
@@ -3820,10 +3820,13 @@ KithMoot joins a room with no further press.
 18. Inherit window: a first bind 61 s after the hold gets `REMEMBER AS`; a
     same-label retry inside the window does not move the deadline; a revoke
     inside the window clears the entry.
-19. A slot-table change on the identity's master (not the asking one) while
-    the LINK card waits: the card closes at once as `NOT DONE / Link blocked /
-    Slots changed`, answers `approval_changed`, and no slot is made. The phone
-    is not cooled: sending again raises a fresh card.
+19. An authority change (a new key, a revoke, a policy change) on the
+    identity's master (not the asking one) while the LINK card waits: the
+    card closes at once as `NOT DONE / Link blocked / Slots changed`, answers
+    `approval_changed`, and no slot is made. The phone is not cooled: sending
+    again raises a fresh card. A second such close inside the minute does
+    cool it (`shown recently` for 60 s). A label rename on that master does
+    not close the card.
 20. The `AS` line shows ` M1` for an identity on master 1 asked from master 0,
     and no master for one on the asking master. On every board and in both
     orientations the card stays inside the panel and the span (ui-preview
@@ -3833,7 +3836,7 @@ KithMoot joins a room with no further press.
 21. Escalate or strict asking slot: refused before the card, never parked for
     a guardian verdict.
 22. WiFi mode with heartwoodd also bridging the board over the cable: a link
-    create raises one card; heartwoodd logs a NACK for the cable copy and
-    publishes nothing, and the phone hears only the card's outcome (check
+    create raises one card; heartwoodd logs `request denied` for the cable
+    copy (no site-link wording) and publishes nothing, and the phone hears only the card's outcome (check
     the phone does not report `site links are made over the board's relay
     connection`). The same for status and revoke.

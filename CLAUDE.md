@@ -541,13 +541,15 @@ Rule D real identity, the policy within what that slot does silently
 retry answered with no card (before room, so a lost reply is answered even
 when its link took the last slot), room in the table and NVS, a 60 s cooldown
 after any close of the phone's LINK card without a hold (a decline, its window
-or the 90 s queue TTL running out, a second ask; not a card the slot tables
-overtook), and one LINK card at a time (a second ask refuses both and cools
+or the 90 s queue TTL running out, a second ask; not the first card in a
+minute an authority change overtook, `LinkLedger::card_closed`), and one LINK card at a time (a second ask refuses both and cools
 both phones; the waiting card closes as "Link blocked / 2nd request").
 `site_link::gate`, `before_card`, `check` (card or hold) and `card_step` (a
 copy of the waiting card's own request ignored first, then the gate, then
-refuse both) hold that order; `LinkClose` decides the cooldown and a refused
-card's words, `ask_weight` its queue weight (params plus 256 B); list sizes
+refuse both) hold that order; `against_waiting` (stale cards refused first,
+and not counted as a second ask), `refuse_both` and `refuse_stale` work on the
+queue through the `WaitingCard` trait; a refused card carries a typed
+`LinkRefusal`, which draws its words (`LinkClose::blocked`); `ask_weight` its queue weight (params plus 256 B); list sizes
 are capped while parsing (four methods, 64 kinds). The firmware glue only
 reads tables and the queue; `take_closed_card` cools before
 `resolve_button_card` does anything else. The card (`oled::show_link_request`, the extension card's rows via
@@ -556,10 +558,11 @@ reads tables and the queue; `take_closed_card` cools before
 `AS <identity>` with ` M<n>` for another master, the device's own scope line
 (led by `DECRYPT` whenever the link may decrypt, at most 24 characters), and `FROM <phone's slot label>` in the hint row, with no button tags. It rides
 the #64 queue (`AskCard::SiteLink`) and `resolve_button_card`'s own reply
-loop. A slot-table write on any master moves the approval epoch, and a LINK
-card it overtook is refused `approval_changed` while it waits
-(`site_link::refuse_stale`, drawn "Link blocked / Slots changed", no
-cooldown); the hold checks the epoch again, re-runs the gate against the
+loop. An authority change on any master's slots (a new key, a revoke, a
+policy change; a label rename, for one, is not) moves the approval
+epoch, and a LINK card it overtook is refused `approval_changed` while it
+waits (`site_link::refuse_stale`, drawn "Link blocked / Slots changed", no
+cooldown the first time in a minute); the hold checks the epoch again, re-runs the gate against the
 tables as they are then, and only then writes the strict slot.
 For 60 s after the hold the first key to bind that slot also gets the identity
 grant (the bind hook in `nip46_handler`, `LinkLedger::take_on_bind`, same
@@ -570,11 +573,10 @@ draft strings in two places: a decline answers every card's `user denied`, and
 the wider refusal is the plain text with no ceiling named. IMAGE COST, M4
 release builds against `52fc099` (the M4's absolute sizes run about 30 KB
 above CI's for the same source, so only the deltas carry over): heltec-v4
-+20,080 B (2,139,152), heltec-v3 +20,880 B (2,135,632); T-Display +19,536 B
-(2,358,336, of 3,145,728). Projected onto
-CI's `c94112f` figures that leaves the V4 about 11.2 KB and the V3 about
-7.6 KB over their 2,097,152 B slot, so the Heltec images do NOT fit on this branch
-alone and need room made before this merges.
++20,080 B, heltec-v3 +20,880 B, T-Display +19,536 B (of 3,145,728) before the
+merge of main; the third review round added V4 +112 B and V3 +160 B on top
+of that merge. The Heltec images do NOT fit on this branch alone: read the
+branch's CI sizes, and make room, before this merges.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

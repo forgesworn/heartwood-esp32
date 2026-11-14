@@ -237,6 +237,40 @@ publish-only and locked-boot dials all pass through it, so it includes sessions
 opened before unlock; a dial that fails part-way is not counted). Both are
 read-only and additive.
 
+NVS diagnostics: the storage stats (`nvs` in the operator's full `get_status`,
+flat `nvs_*` fields in FIRMWARE_INFO) also carry two read-only, additive
+counts, so a used-entry swing can be put to a namespace. They are diagnostics,
+not an explanation of any swing, and never carry key names, contents or
+values; the only names are the fixed list below.
+
+- `ns_used` (FIRMWARE_INFO: `nvs_ns_used`): used entries per namespace, an
+  object keyed `heartwood`, `hw_notes`, `hw_device`, `phy`, `nvs.net80211`
+  (`nvs_stats.rs` `DIAG_NAMESPACES`), each from a read-only handle and
+  `nvs_get_used_entry_count`. A namespace that does not exist is `0` (a
+  read-only open never creates one); `null` is an API failure. The count
+  includes every entry of the namespace, blob index and chunks too. The
+  allocation journal's derived namespace is not listed, so `used_entries`
+  less the sum of `ns_used` less `namespace_count` (one index entry each) is
+  whatever the list does not cover.
+- `dup_blob_keys` (FIRMWARE_INFO: `nvs_dup_blob_keys`): the number of
+  (namespace, key) pairs the `nvs_entry_find`/`nvs_entry_next` walk of the
+  default partition returned more than once, `null` if the walk could not
+  finish (hash buffer of 256 pairs full, more visits than `total_entries`, or
+  an API error). In IDF v5.3.2 the walk skips blob index entries and later
+  chunks, so a healthy blob appears once; two first chunks for one key is
+  direct evidence of an orphan, for example from a failed multi-page write
+  (`writeMultiPageBlob`'s cleanup erases chunk indexes from 0 while chunks
+  are written from the blob's chunk start). `0` does not rule an orphan out:
+  an orphan that is a later chunk, or the only first chunk for its key, is
+  not visible to the walk; `ns_used` is what would show it. Keys are hashed
+  into a fixed buffer (`common/src/nvs_diag.rs`, host-tested) and never kept
+  or emitted.
+
+Each call walks the partition under the NVS lock (five namespace counts and
+one iteration), on top of the existing `nvs_get_stats`. A count of set_blob
+failures is not kept: blob writes are spread over many modules with no single
+choke point.
+
 A relay that refuses this client is left alone (2026-10-08, checklist section
 35 items 8-9, NOT YET BENCH-RUN). relay.damus.io was found answering `banned:
 too many rate-limit violations` to the owner's home address on 2026-10-08;

@@ -140,10 +140,20 @@ jobs:
   # esp Rust channel + the matching riscv32-esp-elf GCC for the C FFI. 4 MB
   # single-OTA layout (3 MB factory, re-flash only — ota: false).
   build-c6:
+    # This job only builds and uploads an artifact, so it does not need the
+    # release's write scope. Keep that scope away from the downloaded espup
+    # binary and the token checkout leaves in .git/config.
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install the esp Rust toolchain (espup — nightly Rust + LLVM)
+        # Authenticate espup's one GitHub API lookup (the Xtensa Rust version) so it
+        # uses the token's limit, not the 60/hr unauthenticated one shared by every
+        # job on the runner's IP address. That limit has failed this job.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -eu
           curl -fL -o espup \

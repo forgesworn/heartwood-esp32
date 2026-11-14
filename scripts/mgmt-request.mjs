@@ -4,7 +4,10 @@
 // Relay operator client for the kind-24134 management channel: NIP-44
 // encrypts one {id, method, params} request to the master/operator
 // conversation key, publishes it #p-tagged to the master, and waits for the
-// master-authored response addressed back to the operator. With --challenge
+// master-authored response addressed back to the operator. On a timeout it
+// also prints, for each relay, whether that relay acknowledged the request
+// and whether the reply subscription was up, to show where a lost reply went
+// missing. With --challenge
 // it first fetches get_management_challenge and injects mutation_challenge —
 // required for every mutating method (unknown methods are fail-closed, so
 // when in doubt pass it).
@@ -64,10 +67,63 @@ const opPub = getPublicKey(sk)
 const ck = nip44.v2.utils.getConversationKey(sk, master)
 
 const ws = new RelayFanout(RELAYS)
+
+// What each relay said during the run, kept for the timeout report. A
+// timeout alone cannot say whether the relay took the request, so record its
+// OK for each request, the reply subscription's EOSE or CLOSED, NOTICEs and
+// any AUTH challenge (this client does not answer one). Times are ms from
+// start.
+const started = Date.now()
+const sinceStart = () => Date.now() - started
+const sentIds = new Set()
+let sentAt = null
+const heard = new Map()
+const heardFrom = (url) => {
+  if (!heard.has(url)) heard.set(url, { eose: null, closed: null, ok: null, notices: [], auth: false })
+  return heard.get(url)
+}
+ws.on((data, url) => {
+  let msg
+  try {
+    msg = JSON.parse(data.toString())
+  } catch {
+    return
+  }
+  if (!Array.isArray(msg)) return
+  const h = heardFrom(url)
+  if (msg[0] === 'EOSE' && msg[1] === 'mgmt' && h.eose === null) h.eose = sinceStart()
+  else if (msg[0] === 'CLOSED' && msg[1] === 'mgmt') h.closed = String(msg[2] ?? '')
+  else if (msg[0] === 'OK' && sentIds.has(msg[1])) {
+    h.ok = { accepted: msg[2] === true, reason: String(msg[3] ?? ''), at: sinceStart() }
+  } else if (msg[0] === 'NOTICE' && h.notices.length < 3) h.notices.push(String(msg[1] ?? ''))
+  else if (msg[0] === 'AUTH') h.auth = true
+})
+
+/** One line per relay: did it take the request, and was the reply subscription up? */
+function relayReport(liveUrls) {
+  return RELAYS.map((url) => {
+    if (!liveUrls.includes(url)) return `${url}: not connected`
+    const h = heardFrom(url)
+    const parts = []
+    if (!h.ok) parts.push('request not acknowledged')
+    else if (h.ok.accepted) parts.push(`request accepted at ${h.ok.at} ms`)
+    else parts.push(`request refused (${h.ok.reason})`)
+    if (h.closed !== null) parts.push(`reply subscription closed (${h.closed})`)
+    else if (h.eose === null) parts.push('no EOSE on the reply subscription')
+    else parts.push(`reply subscription up at ${h.eose} ms`)
+    parts.push(`last request sent at ${sentAt ?? '-'} ms`)
+    if (h.auth) parts.push('relay sent an AUTH challenge (not answered)')
+    for (const notice of h.notices) parts.push(`notice: ${notice}`)
+    return `${url}: ${parts.join('; ')}`
+  })
+}
+
+let liveUrls = []
 const deadline = setTimeout(() => {
   console.error(
     `timeout: no response within ${TIMEOUT} ms (tried ${RELAYS.join(', ')})`,
   )
+  for (const line of relayReport(liveUrls)) console.error(line)
   ws.close()
   exit(1)
 }, TIMEOUT)
@@ -109,12 +165,15 @@ function roundTrip(method, params, extra = {}) {
       else resolve(inner.result)
     }
     off = ws.on(onMessage)
+    sentIds.add(ev.id)
+    sentAt = sinceStart()
     ws.send(['EVENT', ev])
   })
 }
 
 try {
   const live = await ws.open()
+  liveUrls = live
   // Ephemeral kind: the forward-only subscription must be up before publishing.
   ws.req('mgmt', { kinds: [24134], authors: [master], '#p': [opPub], limit: 0 })
   if (live.length < RELAYS.length) {

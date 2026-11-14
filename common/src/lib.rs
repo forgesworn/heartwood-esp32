@@ -69,6 +69,10 @@ pub mod net_config;
 
 pub mod mgmt;
 
+/// Masked client WebSocket frames streamed through a small buffer.
+#[cfg(any(test, feature = "std"))]
+pub mod ws_frame;
+
 /// Crash cause and location recorded beside the firmware's breadcrumb.
 pub mod crash_record;
 

@@ -3764,14 +3764,21 @@ ships, not only the Heltec whose slot prompted it:
 - Heltec V3 or V4 (ESP32-S3), on the standard 2 MiB OTA layout (not a V4
   legacy-nvs board, which cannot OTA);
 - T-Display (classic ESP32), which matters most: one reset with `last_reset`
-  `panic` on beta.34 is still unexplained (section 40);
+  `panic` on beta.34 is still unexplained (section 40, "Crash detail, and
+  list_clients in one buffer"; the checklist has two sections numbered 40,
+  and "the crash-detail section 40" below always means this one);
 - C6 (ESP32-C6, RISC-V).
+
+The `heartwood-demo` bin (`scripts/build-firmware.sh demo --release`) is
+built with the same profile, so it gets thin LTO too; it has its own smoke
+step at the end.
 
 Each board runs in WiFi-standalone mode with a disposable identity, a PIN set,
 the operator key installed (`scripts/set-operator.mjs`), the bridge secret set
 for the cable steps (`scripts/set-bridge-secret.mjs`, or Sapwood's tethered
-wizard; section 7.4b covers bridge auth) and, if
-one is enrolled, an unlock phone. Spare boards only.
+wizard) and, if one is enrolled, an unlock phone. heartwoodd takes the same
+bridge secret as `HEARTWOOD_BRIDGE_SECRET` (README.md, "Run heartwoodd").
+Spare boards only.
 
 **Baseline.** Main firmware has no `stack_free`, so it cannot be the
 baseline, and nor can the current release image. The baseline is the stack
@@ -3782,17 +3789,43 @@ the image under test. The image under test is CI's `app-<board>` artifact
 from this branch's PR. CI artifacts are not release-signed, so both are
 written app-only (step 1), not by OTA.
 
-**Image check, before any board (each board class).** Take CI's
-`elf-<board>` artifact from this branch's PR and the baseline's, and run
-`objdump -t` on each (`xtensa-esp-elf-objdump` for the Heltec and T-Display,
-`riscv32-esp-elf-objdump` for the C6; both under
-`firmware/.embuild/espressif/tools`), filtering for
-`on_alloc_failed|crash_crumb.*(CRUMB|WINDOW|PANIC|ALLOC)| app_main$`. In both
-images `on_alloc_failed` must sit in `.iram0.text` (the failed-allocation
-callback can run with the flash cache off), all four crash records in
-`.rtc_noinit` (they must survive the reset they describe), and `app_main`
-must be present. LTO must not move or drop any of them. An M4 build on esp
-1.87.0.0 passed this check on all four boards; CI's toolchain is what ships.
+**Download every artifact first.** CI keeps `app-<board>` and `elf-<board>`
+for 7 days, which a run of this section on three board classes with its
+12-hour soaks can outlast. At the start, download both artifacts for every
+board class from both runs (the baseline's and this branch's), and record
+each `app-<board>.bin`'s SHA-256 and the CI run it came from.
+
+**Image check, before any board (each board class).** Take the
+`elf-<board>` artifacts of both images and use the toolchain under
+`firmware/.embuild/espressif/tools` (`xtensa-esp-elf-*` for the Heltec and
+T-Display, `riscv32-esp-elf-*` for the C6):
+
+- Same compiler: `readelf -p .comment` on each ELF. The `rustc version`
+  lines must be identical. CI installs the latest Xtensa Rust on every run,
+  so a toolchain release between the baseline's run and this branch's
+  changes code generation by itself and would confound the stack
+  comparison. If they differ, rebuild both images in one CI run (re-run the
+  baseline's workflow and this branch's back to back and check again) or
+  build both from this branch on one machine in one session, once with
+  `CARGO_PROFILE_RELEASE_LTO=false`, and use those.
+- Placement: `objdump -t`, filtering for
+  `on_alloc_failed|crash_crumb.*(CRUMB|WINDOW|PANIC|ALLOC)| app_main$`. In
+  both images `on_alloc_failed` must sit in `.iram0.text` (the
+  failed-allocation callback can run with the flash cache off), all four
+  crash records in `.rtc_noinit` (they must survive the reset they
+  describe), and `app_main` must be present. LTO must not move or drop any
+  of them.
+- Nothing it calls is in flash: disassemble `on_alloc_failed` (`objdump -d
+  --start-address=<its address> --stop-address=<address + size>`, both from
+  the `-t` line; `--disassemble=<symbol>` does not find the Rust symbol).
+  There must be no `call`/`callx` (Xtensa) or `jal`/`jalr` (RISC-V), nor a
+  jump, to any address outside IRAM or ROM; its `l32r` literals may point
+  only at the RTC records (0x5000xxxx) and constants.
+
+An M4 build on esp 1.87.0.0 passed all three on all four boards, baseline and
+LTO alike: identical `.comment` strings, the placements above, and an
+`on_alloc_failed` of a few loads and stores with no call at all, ending in
+`retw.n` (Xtensa) or `ret` (RISC-V). CI's toolchain is what ships.
 
 **Reading the marks:** `node scripts/mgmt-request.mjs --method get_status`
 (the device operator's full reply). `stack_free` gives each task's bytes of
@@ -3801,13 +3834,21 @@ mark:
 
 | Key | Task | Stack (bytes) | Set in |
 |-----|------|---------------|--------|
-| `main` | main: USB and relay loops, signing, TLS, the cable frames served in WiFi mode | 32,768 | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`, `firmware/sdkconfig.defaults` |
+| `main` | main: USB and relay loops, signing, TLS, the cable frames served in WiFi mode | 33,280 | `CONFIG_ESP_MAIN_TASK_STACK_SIZE` (32,768), `firmware/sdkconfig.defaults` |
 | `btn_latch` | button sampler (a std thread, "pthread" to FreeRTOS) | 3,072 | `.stack_size(3072)`, `firmware/src/button.rs` |
-| `sys_evt` | default event loop: the WiFi event subscription in `relay.rs` | 2,304 | `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE`, ESP-IDF default |
-| `esp_timer` | esp_timer callbacks, C only (control) | 3,584 | `CONFIG_ESP_TIMER_TASK_STACK_SIZE`, ESP-IDF default |
-| `tcpip` | lwIP `tiT`, C only (control) | 3,072 | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`, ESP-IDF default |
+| `sys_evt` | default event loop: the WiFi event subscription in `relay.rs` | 2,816 | `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE` (2,304), ESP-IDF default |
+| `esp_timer` | esp_timer callbacks, C only (control) | 4,096 | `CONFIG_ESP_TIMER_TASK_STACK_SIZE` (3,584), ESP-IDF default |
+| `tcpip` | lwIP `tiT`, C only (control) | 3,584 | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE` (3,072), ESP-IDF default |
 
-`null` means the task is not running (`btn_latch` failed to spawn, say). The
+ESP-IDF's `esp_task.h` adds `TASK_EXTRA_STACK_SIZE` (512 B) to each of its
+own tasks when `CONFIG_NEWLIB_NANO_FORMAT` is off, as it is on every board
+here, so those four are 512 B over their setting; `btn_latch` gets exactly
+what `button.rs` asks for. To raise one, change the setting named.
+
+`null` means the task is not running (`btn_latch` failed to spawn, say), or
+that it was on FreeRTOS's pending-ready list at that instant, which
+`xTaskGetHandle` does not search: read once more before treating a `null` as
+a failure. The
 marks only ever fall, and a reset of any kind starts them again, so read them
 after each step below and before anything that restarts the board. A reply
 with `truncated` (the low-heap fallback) carries no marks: read again. An
@@ -3831,11 +3872,12 @@ each step, in a table with one column per image.
      so the bootloader takes `ota_0` whichever slot ran before. Writing
      `ota_0` alone leaves a board that last booted `ota_1` running that.
    - T-Display and C6 (`firmware/partitions-4mb.csv`): write the image at
-     0x10000, the factory slot, as in section 40's runs.
+     0x10000, the factory slot, as in the crash-detail section 40's runs.
 
    Both images report the same version string, so FIRMWARE_INFO cannot tell
-   them apart: record each artifact's SHA-256 and confirm the write by hash
-   (esptool's hash check, or a verify of the app slot as in section 40).
+   them apart: confirm the write against the SHA-256 recorded at download
+   (esptool's hash check, or a verify of the app slot, as in the crash-detail
+   section 40's records).
    Power on: the board boots locked, and FIRMWARE_INFO reports the version,
    the board and `at_rest` `pin`.
 2. PIN unlock over USB: one wrong PIN (`Wrong PIN`, 4 attempts left), then
@@ -3851,7 +3893,8 @@ each step, in a table with one column per image.
    identities and client list, and leave it polling for 5 minutes. Read the
    marks over the relay.
 6. Hard-mode signing over the cable, the board still in WiFi mode: with
-   heartwoodd in Hard mode on the USB port (section 7.4b's setup), sign one
+   heartwoodd in Hard mode on the USB port (`--mode hard`, the bridge secret
+   in `HEARTWOOD_BRIDGE_SECRET`; README.md, "Run heartwoodd"), sign one
    event and run one NIP-44 decrypt through it. Each arrives as an
    `ENCRYPTED_REQUEST`, which the relay loop serves on the main task
    (`relay.rs`, `FRAME_TYPE_ENCRYPTED_REQUEST`). Read the marks over the
@@ -3878,36 +3921,72 @@ each step, in a table with one column per image.
      is refused after its signature check, before any card (`No OTA
      partition`, 0x12). Read the marks; that is all OTA reaches there.
    - If the transfer stalls in WiFi mode on either image, record it, and run
-     this step in USB mode instead (section 4); the marks cannot be read
-     there.
+     this step in USB-bridged mode instead (switched as in step 13); the
+     marks cannot be read there.
 10. Phone unlock, if a phone is enrolled: reboot and let the phone unlock it
     (kind 24136). Read the marks; the reboot reset them, so compare with the
     same step on the baseline.
-11. Crash records (section 40 item 2): take a planned restart (an identity
-    change, or the relay watchdog's controlled restart). Afterwards
-    FIRMWARE_INFO carries no `crash_detail` and `get_status` reads
-    `crash_detail` `null`, while `crashed_during` names a watchdog restart as
-    it does on the baseline. Then section 40 item 1: power-cycle, and neither
-    carries crash detail. Run it on both images; the image under test must
-    behave as the baseline does.
+11. Crash records (the crash-detail section 40, item 2): take a planned
+    restart (an identity change, or the relay watchdog's controlled
+    restart). Afterwards FIRMWARE_INFO carries no `crash_detail` and
+    `get_status` reads `crash_detail` `null`, while `crashed_during` names a
+    watchdog restart as it does on the baseline. Then that section's item 1:
+    power-cycle, and neither carries crash detail. Run it on both images;
+    the image under test must behave as the baseline does.
 12. Soak: 12 hours or more on the relays with Sapwood's poll and a few
     signatures through it. No reset (`uptime_s` keeps counting, `last_reset`
     unchanged). Read the marks at the end.
-13. A successful OTA (Heltec only; last, because it restarts): from the
-    image under test to the current signed release asset, no flipped byte.
-    It must verify, reboot into that release and rejoin WiFi with no
-    rollback. The restart clears the marks, so this step only checks that
-    the update completes. The board now runs `ota_1`. CI artifacts are
-    unsigned, so the way back is step 1's Heltec write, otadata erase
-    included, confirmed by hash; the first signed prerelease with thin LTO
-    repeats this step in the other direction.
+
+Steps 13 and 14 run on the image under test only. The USB-bridged loop runs
+the same signing and cable code on the main task with the radios off, and
+`get_status` is not served there, so they check only that nothing resets.
+
+13. USB-bridged smoke. Switch the board to `mode` `usb` (Sapwood's network
+    settings, or `scripts/net-config.mjs --set-config` with a file whose
+    `mode` is `usb`, which keeps the operator) and approve its card; the
+    board saves, restarts and comes up in the USB-bridged loop with its
+    radios off. Read FIRMWARE_INFO (`node scripts/device-status.mjs --port
+    <port>`) and record `last_reset` and `uptime_s`. Then:
+    - Hard-mode signing through heartwoodd (`--mode hard`, as in step 6,
+      with the PIN in `HEARTWOOD_PIN` so it unlocks the board): sign one
+      event and run one NIP-44 decrypt through its bunker URI. Stop
+      heartwoodd to free the port.
+    - A note command over the cable: `node scripts/note-cmd.mjs --port
+      <port> '{"cmd":"get_info"}'`, then `'{"cmd":"list_notes"}'`; both
+      answer (the crash-detail section 40 records note that a
+      WiFi-standalone board NACKs this frame, which is why it runs here).
+
+    Pass: FIRMWARE_INFO afterwards shows the same `last_reset` as before
+    and an `uptime_s` larger by at least the time the step took, so the
+    board did not reset.
+14. A successful USB OTA (Heltec only; last, because it restarts), the
+    board still in USB-bridged mode: from the image under test to the
+    current signed release asset and its `.sig`, as in step 9 without
+    `--flip-byte`. It must verify and reboot into that release with no
+    rollback: FIRMWARE_INFO then shows the release's version and
+    `last_reset` `software-restart`, not `panic` or a watchdog. The board
+    now runs `ota_1`. Step 9 already took the WiFi-mode transfer through
+    every write and the hash check; this one covers the switch of boot slot
+    and the restart. CI artifacts are unsigned, so the way back is step 1's
+    Heltec write, otadata erase included, confirmed by hash, then `mode`
+    `wifi` again; the first signed prerelease with thin LTO repeats this
+    step in the other direction.
+
+**Demo bin (T-Display, once).** Neither CI nor the release builds it, and
+on main as on this branch it does not compile: `st7789.rs` calls
+`crate::oled::note_draw()` (since #195), and the demo bin has no `oled`
+module. Once that is fixed, build `scripts/build-firmware.sh demo
+--release` from this branch, write it app-only at 0x10000 as in step 1, and
+boot it: the title screen comes up, the game plays with the button for a
+minute or two, and FIRMWARE_INFO is not needed (the demo is not the
+signer). No reset while playing. Write the signer image back afterwards.
 
 Pass, on every board class, on the image under test, after every step:
 `btn_latch` and `sys_evt` each keep at least 1,024 bytes unused, and `main` at
 least 4,096. Where the baseline is already under that floor on one of them,
 the image under test must be no more than 256 bytes below the baseline.
 `esp_timer` and `tcpip` are informational. No reset in any step except the
-planned ones (steps 10, 11 and 13), and no `last_reset` of `panic` or a
+planned ones (steps 10, 11, the mode switch in 13, and 14), and no `last_reset` of `panic` or a
 watchdog. The margin, because the bench samples paths, not the deepest one:
 rare branches (a restore, a failed TLS handshake, the panic hook) go
 unmeasured, and an extra mbedTLS or libsecp256k1 call chain on the main task

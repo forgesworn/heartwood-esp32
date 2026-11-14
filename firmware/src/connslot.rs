@@ -170,14 +170,14 @@ pub fn handle_update(
                 // changed from a stale management screen. No physical hold is
                 // needed to withdraw authority on an authenticated cable.
                 if let Some(withdrawal) = v.get("withdraw_consent_v1") {
-                    let result = (|| -> Result<(), String> {
-                        if !withdrawal.is_object() { return Err("invalid consent withdrawal".into()); }
+                    let result = (|| -> Result<crate::policy::RevocationSave, &'static str> {
+                        if !withdrawal.is_object() { return Err("invalid consent withdrawal"); }
                         let target = policy_engine.list_slots(ms).iter()
                             .find(|slot| slot.slot_index == idx).ok_or("pairing not found")?;
-                        if target.client_grants.is_none() { return Err("per-device consent unavailable".into()); }
+                        if target.client_grants.is_none() { return Err("per-device consent unavailable"); }
                         let fingerprint = heartwood_common::mgmt::credential_fingerprint(&target.secret);
                         if v.get("expected_secret_fingerprint").and_then(|value| value.as_str()) != Some(fingerprint.as_str()) {
-                            return Err("pairing_changed: refresh the signer".into());
+                            return Err("pairing_changed: refresh the signer");
                         }
                         let client = withdrawal.get("client_pubkey").map(|value| {
                             value.as_str().filter(|key| heartwood_common::policy::decode_client_key(key).is_some()
@@ -192,10 +192,13 @@ pub fn handle_update(
                         // save does; and never rolled back, which would
                         // restore the grant.
                         policy_engine.drop_withdrawn_verdicts(ms, idx, revoked.as_ref());
-                        policy_engine.persist_revocation(nvs, ms).describe("consent withdrawal")
+                        Ok(policy_engine.persist_revocation(nvs, ms))
                     })();
-                    match result {
-                        Ok(()) => protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"consent_withdrawn_v1"),
+                    // A refusal stays a static string; only a save that
+                    // failed is described.
+                    match result.map(|saved| saved.describe("consent withdrawal")) {
+                        Ok(Ok(())) => protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_UPDATE_RESP, b"consent_withdrawn_v1"),
+                        Ok(Err(reason)) => protocol::write_frame(usb, FRAME_TYPE_NACK, reason.as_bytes()),
                         Err(reason) => protocol::write_frame(usb, FRAME_TYPE_NACK, reason.as_bytes()),
                     }
                     return;

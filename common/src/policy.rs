@@ -1588,9 +1588,10 @@ pub fn narrows_only(before: &ConnectSlot, after: &ConnectSlot) -> bool {
         return false;
     }
     let mut probe = after.clone();
-    probe.label.clone_from(&before.label);
-    probe.allowed_methods.clone_from(&before.allowed_methods);
-    probe.allowed_kinds.clone_from(&before.allowed_kinds);
+    // Plain clones: `clone_from` would add its own copies of Vec's clone.
+    probe.label = before.label.clone();
+    probe.allowed_methods = before.allowed_methods.clone();
+    probe.allowed_kinds = before.allowed_kinds.clone();
     probe.auto_approve = before.auto_approve;
     // Byte comparison of the stored encoding: the same codec the slot table
     // is persisted with, so no second (Value) path through it.

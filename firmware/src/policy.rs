@@ -61,6 +61,12 @@ fn evict_avatar_cache(nvs: &mut EspNvs<NvsDefault>) -> usize {
         .count()
 }
 
+/// The NVS key of master `slot`'s pairing table.
+#[inline(never)]
+fn slots_key(slot: u8) -> String {
+    format!("connslots_{slot}")
+}
+
 /// How a slot-table write is judged against the NVS budget.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SlotWrite {
@@ -1278,7 +1284,7 @@ impl PolicyEngine {
     /// Whether this master's pairing table is blocked until a restart after a
     /// failed write (`nvs::write_blocked`). Replies about it should say so.
     pub fn restart_needed(&self, master_slot: u8) -> bool {
-        crate::nvs::write_blocked(&format!("connslots_{master_slot}"))
+        crate::nvs::write_blocked(&slots_key(master_slot))
     }
 
     /// Save a table that only lost authority (a revoked pairing, client key
@@ -1327,7 +1333,7 @@ impl PolicyEngine {
             _ => StoredSlotTable::Unreadable,
         };
         heartwood_common::policy::unsaved_revocation(
-            crate::nvs::write_blocked(&format!("connslots_{master_slot}")),
+            crate::nvs::write_blocked(&slots_key(master_slot)),
             self.storage_ready(master_slot),
             stored,
             why == SaveFailure::NoRoomInPlace,
@@ -1338,7 +1344,7 @@ impl PolicyEngine {
     /// The bytes of this master's stored table: `Some(None)` when the key is
     /// absent, `None` when it cannot be read or is over the load cap.
     fn stored_table_bytes(nvs: &EspNvs<NvsDefault>, master_slot: u8) -> Option<Option<Vec<u8>>> {
-        let key = format!("connslots_{master_slot}");
+        let key = slots_key(master_slot);
         match nvs.blob_len(&key) {
             Ok(None) => Some(None),
             Ok(Some(len)) if len <= MAX_SLOT_BLOB_BYTES => {
@@ -1428,7 +1434,7 @@ impl PolicyEngine {
         if !self.slots_dirty {
             return Ok(());
         }
-        let key = format!("connslots_{master_slot}");
+        let key = slots_key(master_slot);
         let ms = self
             .master_slots
             .iter()
@@ -1563,7 +1569,7 @@ impl PolicyEngine {
     /// Only the USB backup path, after its physical hold, may call this method.
     pub fn recover_pairings_for_backup_restore(&mut self, nvs: &mut EspNvs<NvsDefault>, master_slot: u8) -> bool {
         if self.storage_ready(master_slot) { return true; }
-        let key = format!("connslots_{master_slot}");
+        let key = slots_key(master_slot);
         let _ = nvs.replace_blob(&key, b"[]");
         let mut verify = [0u8; 2];
         let verified = matches!(nvs.blob_len(&key), Ok(Some(2)))
@@ -1588,7 +1594,7 @@ impl PolicyEngine {
         let mut persist_migrations: Vec<u8> = Vec::new();
 
         for slot in 0..master_count {
-            let new_key = format!("connslots_{slot}");
+            let new_key = slots_key(slot);
             // Size the read from the stored blob: per-slot approved identity
             // lists can take the table past a fixed buffer, and a blob that
             // does not fit must not read back as "no slots" (every pairing

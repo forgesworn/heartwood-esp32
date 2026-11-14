@@ -177,11 +177,14 @@ pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bo
     let Ok(old_len) = nvs.blob_len(key) else {
         return false;
     };
-    let largest_hot = nvs_budget::hot_keys()
-        .filter_map(|k| nvs.blob_len(&k).ok().flatten())
-        .max()
-        .unwrap_or(0);
-    nvs_budget::growth_allowed(stats.available_entries, old_len, new_len, largest_hot)
+    nvs_budget::growth_allowed(stats.available_entries, old_len, new_len, largest_hot(nvs))
+}
+
+/// The length of the largest hot blob stored (`nvs_budget::hot_keys`), 0 if
+/// none is. One copy for both gates.
+#[inline(never)]
+fn largest_hot(nvs: &EspNvs<NvsDefault>) -> usize {
+    nvs_budget::hot_keys().fold(0, |largest, k| largest.max(nvs.blob_len(&k).ok().flatten().unwrap_or(0)))
 }
 
 /// How many of `steps` growths written one after another (each a hot blob's
@@ -193,11 +196,7 @@ pub fn growth_run(nvs: &EspNvs<NvsDefault>, steps: &[(Option<usize>, usize)]) ->
     let Some(stats) = crate::nvs_stats::read() else {
         return 0;
     };
-    let largest_hot = nvs_budget::hot_keys()
-        .filter_map(|k| nvs.blob_len(&k).ok().flatten())
-        .max()
-        .unwrap_or(0);
-    nvs_budget::growth_run(stats.available_entries, largest_hot, steps.iter().copied())
+    nvs_budget::growth_run(stats.available_entries, largest_hot(nvs), steps.iter().copied())
 }
 
 const NVS_NAMESPACE: &str = "heartwood";

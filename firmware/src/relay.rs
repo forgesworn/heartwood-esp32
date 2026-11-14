@@ -9419,6 +9419,13 @@ fn persist_revocation(ctx: &mut SignCtx, master_slot: u8, action: &str) -> Resul
     outcome.describe(action)
 }
 
+/// The management error for a slot index the master does not have. One copy
+/// of the format for every method that takes a slot.
+#[inline(never)]
+fn no_such_slot(slot_index: u8) -> String {
+    format!("no such slot: {slot_index}")
+}
+
 /// `revoke_client` for a pairing RAM no longer has. If flash still has it, an
 /// earlier revocation's save failed (`RevocationSave::OnlyUntilRestart`), and
 /// repeating the revocation saves it now. The credential is checked against
@@ -9436,16 +9443,22 @@ fn save_unsaved_client_revocation(
     let stored = ctx
         .policy_engine
         .unsaved_slot_revocation(ctx.nvs, master_slot, slot_index)
-        .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+        .ok_or_else(|| no_such_slot(slot_index))?;
     let secret_fingerprint = require_expected_slot_fingerprint(req, &stored)?;
     ctx.policy_engine.mark_slots_unsaved();
     persist_revocation(ctx, master_slot, "client revocation")?;
     log::info!("[relay] mgmt: saved the earlier revocation of client slot {slot_index} (operator)");
-    Ok(serde_json::json!({
+    Ok(client_revoked_reply(slot_index, secret_fingerprint))
+}
+
+/// `revoke_client`'s reply, live or saving an earlier revocation.
+#[inline(never)]
+fn client_revoked_reply(slot_index: u8, secret_fingerprint: String) -> serde_json::Value {
+    serde_json::json!({
         "slot_index": slot_index,
         "secret_fingerprint": secret_fingerprint,
         "revoked": true,
-    }))
+    })
 }
 
 /// `remove_authorized_pubkey` for a key the pairing no longer has in RAM. If
@@ -9465,12 +9478,18 @@ fn save_unsaved_key_removal(
     }
     ctx.policy_engine.mark_slots_unsaved();
     persist_revocation(ctx, master_slot, "authorised client-key removal")?;
-    Ok(serde_json::json!({
+    Ok(key_removed_reply(slot_index, pubkey, secret_fingerprint))
+}
+
+/// `remove_authorized_pubkey`'s reply, live or saving an earlier removal.
+#[inline(never)]
+fn key_removed_reply(slot_index: u8, pubkey: &str, secret_fingerprint: String) -> serde_json::Value {
+    serde_json::json!({
         "slot_index": slot_index,
         "pubkey": pubkey,
         "secret_fingerprint": secret_fingerprint,
         "removed": true,
-    }))
+    })
 }
 
 /// The reply when a nostrconnect pairing's save failed and was rolled back.
@@ -10741,7 +10760,7 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
             if target.strict_permissions {
                 return Err(
@@ -10766,7 +10785,7 @@ fn dispatch_mgmt(
                     "signing_approved": true,
                 }))
             } else {
-                Err(format!("no such slot: {slot_index}"))
+                Err(no_such_slot(slot_index))
             }
         }
 
@@ -10780,7 +10799,7 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|s| s.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, slot)?;
             // D2: optional persona-addressed URI for an existing slot. The
             // method name is unversioned, so older firmware ignores the
@@ -10877,26 +10896,21 @@ fn dispatch_mgmt(
                 req.pointer("/params/slot_index")
                     .and_then(|v| v.as_u64())
                     .ok_or("revoke_client requires params.slot_index")? as u8;
-            if !ctx.policy_engine.list_slots(master_slot).iter().any(|slot| slot.slot_index == slot_index) {
-                return save_unsaved_client_revocation(ctx, req, master_slot, slot_index);
-            }
-            let target = ctx
+            let Some(target) = ctx
                 .policy_engine
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            else {
+                return save_unsaved_client_revocation(ctx, req, master_slot, slot_index);
+            };
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
             if ctx.policy_engine.revoke_slot(master_slot, slot_index) {
                 persist_revocation(ctx, master_slot, "client revocation")?;
                 log::info!("[relay] mgmt: revoked client slot {slot_index} (operator)");
-                Ok(serde_json::json!({
-                    "slot_index": slot_index,
-                    "secret_fingerprint": secret_fingerprint,
-                    "revoked": true,
-                }))
+                Ok(client_revoked_reply(slot_index, secret_fingerprint))
             } else {
-                Err(format!("no such slot: {slot_index}"))
+                Err(no_such_slot(slot_index))
             }
         }
 
@@ -10925,7 +10939,7 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
             match ctx
                 .policy_engine
@@ -10933,12 +10947,7 @@ fn dispatch_mgmt(
             {
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Removed) => {
                     persist_revocation(ctx, master_slot, "authorised client-key removal")?;
-                    Ok(serde_json::json!({
-                        "slot_index": slot_index,
-                        "pubkey": pubkey,
-                        "secret_fingerprint": secret_fingerprint,
-                        "removed": true,
-                    }))
+                    Ok(key_removed_reply(slot_index, pubkey, secret_fingerprint))
                 }
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Current) => {
                     Err("current_authorized_pubkey: revoke the slot to remove its current key".into())
@@ -10946,7 +10955,7 @@ fn dispatch_mgmt(
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Missing) => {
                     save_unsaved_key_removal(ctx, master_slot, slot_index, pubkey, secret_fingerprint)
                 }
-                None => Err(format!("no such slot: {slot_index}")),
+                None => Err(no_such_slot(slot_index)),
             }
         }
 
@@ -10983,7 +10992,7 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             require_expected_slot_fingerprint(req, target)?;
             let client = req.pointer("/params/client_pubkey").map(|value| {
                 let key = value.as_str().ok_or("invalid client_pubkey")?;
@@ -10999,14 +11008,14 @@ fn dispatch_mgmt(
                     let (revoked, changed) = ctx
                         .policy_engine
                         .revoke_identity(master_slot, slot_index, identity, client)
-                        .ok_or_else(|| format!("no such slot: {slot_index}"))??;
+                        .ok_or_else(|| no_such_slot(slot_index))??;
                     (Some(revoked), changed)
                 }
                 None => (
                     None,
                     ctx.policy_engine
                         .clear_identities(master_slot, slot_index, client)
-                        .ok_or_else(|| format!("no such slot: {slot_index}"))?,
+                        .ok_or_else(|| no_such_slot(slot_index))?,
                 ),
             };
             // Withdraw the live approve-once windows first, whatever the save
@@ -11028,7 +11037,7 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             Ok(mgmt::identity_revocation_result(slot, changed, dropped))
         }
 
@@ -11047,7 +11056,7 @@ fn dispatch_mgmt(
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
                 .cloned()
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, &target)?;
             let before = target.clone();
             let label = req
@@ -11208,7 +11217,7 @@ fn dispatch_mgmt(
                     "updated": true,
                 }))
             } else {
-                Err(format!("no such slot: {slot_index}"))
+                Err(no_such_slot(slot_index))
             }
         }
 

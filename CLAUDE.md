@@ -413,6 +413,11 @@ port, so nothing is lost. A legacy branch hashes the host as stored and was
 handed out under the old rule (any run of `:`, digits and letters), so
 `cash_address` for a branch, and a claim, wrap or proof whose key is on one,
 keep that rule (`valid_stored_mint_host`), as does the registry's decode.
+A registry entry stored under the old rule still loads, draws, lists and
+forgets, but cannot be provisioned again in place (nor after a torn blob):
+forget it and provision the host spelt correctly. Re-claiming a share note
+already stored at such a spelling gets `bad_request`; a claim at the correct
+spelling reaches the same note and returns `created: false`.
 Every gating rule below is unchanged.
 
 Address proofs (2026-10-05, checklist section 34; its message and key are

@@ -189,6 +189,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - run: cargo +stable test --manifest-path ota-sign/Cargo.toml
 
+  # The Pi-side serial OTA tool (ota/). Its pure helpers are tested here,
+  # including the bench-only --flip-byte transform, which otherwise runs only
+  # by hand against a board. `+stable`; its serialport has default features
+  # off, so no libudev.
+  ota-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - run: cargo +stable test --manifest-path ota/Cargo.toml
+
   # The Pi-side daemon. Nothing built it here, so it sat broken on main for a
   # while after a shared ConnectSlot field landed: the firmware and common crates
   # compiled, the daemon did not. Build plus test, so a struct change in common
@@ -356,6 +367,18 @@ jobs:
             echo "::error::c6 app image ($size B) exceeds its 3 MB app slot ($limit B)"
             exit 1
           fi
+      # The same week-long image and ELF as the Xtensa boards keep, so the C6
+      # can be benched (an app-only write at 0x10000) and its sections read.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: app-c6
+          path: /tmp/app.bin
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: elf-c6
+          path: firmware/target/riscv32imac-esp-espidf/release/heartwood-esp32
+          retention-days: 7
 
   # ESP8266 tethered-signer firmware — a SEPARATE crate (esp8266-firmware/), a
   # no_std lx106 binary with its own target, toolchain and linker. It shares the

@@ -50,6 +50,14 @@ struct Cli {
     #[arg(long)]
     legacy_unsigned: bool,
 
+    /// Bench only: flip the low bit of the byte at OFFSET in what is sent,
+    /// after the digest is taken, so the device writes every chunk and then
+    /// refuses the image at OTA_FINISH with "Hash mismatch", keeping the
+    /// running firmware without a restart. OFFSET must lie past the first
+    /// chunk, whose header the device checks on its first write.
+    #[arg(long, value_name = "OFFSET")]
+    flip_byte: Option<usize>,
+
     /// Baud rate (default 115200)
     #[arg(short, long, default_value_t = 115200)]
     baud: u32,
@@ -298,7 +306,7 @@ fn main() {
     // ------------------------------------------------------------------
     // Step 1: read firmware and compute SHA-256
     // ------------------------------------------------------------------
-    let firmware = std::fs::read(&cli.firmware).unwrap_or_else(|e| {
+    let mut firmware = std::fs::read(&cli.firmware).unwrap_or_else(|e| {
         eprintln!("error: cannot read firmware file '{}': {e}", cli.firmware);
         std::process::exit(1);
     });
@@ -313,6 +321,14 @@ fn main() {
     let digest: [u8; 32] = hasher.finalize().into();
 
     let total_size = firmware.len() as u32;
+
+    if let Some(offset) = cli.flip_byte {
+        if let Err(e) = flip_sent_byte(&mut firmware, offset) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        println!("Bench: byte {offset} flipped after hashing; expect the device to refuse the image (Hash mismatch)");
+    }
 
     // Release signature: explicit --sig path, else `<firmware>.sig` next to
     // the image, unless the caller explicitly opted into the legacy flow.
@@ -498,6 +514,47 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 /// Encode a byte slice as a lowercase hex string.
+/// `--flip-byte`: flips the low bit of `image[offset]` once the digest has
+/// been taken, so only the transferred bytes differ. Refuses an offset in
+/// the first chunk (the device checks the image header on its first write,
+/// which would fail the transfer before OTA_FINISH) or past the end.
+fn flip_sent_byte(image: &mut [u8], offset: usize) -> Result<(), String> {
+    if offset < CHUNK_DATA_SIZE {
+        return Err(format!("--flip-byte {offset} is inside the first {CHUNK_DATA_SIZE}-byte chunk"));
+    }
+    let len = image.len();
+    let byte = image
+        .get_mut(offset)
+        .ok_or_else(|| format!("--flip-byte {offset} is past the end of the {len}-byte image"))?;
+    *byte ^= 0x01;
+    Ok(())
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flip_sent_byte_changes_one_bit_past_the_first_chunk() {
+        let original = vec![0xA5u8; CHUNK_DATA_SIZE * 3];
+        let mut sent = original.clone();
+        flip_sent_byte(&mut sent, CHUNK_DATA_SIZE + 7).unwrap();
+        let differing: Vec<usize> = (0..sent.len()).filter(|&i| sent[i] != original[i]).collect();
+        assert_eq!(differing, [CHUNK_DATA_SIZE + 7]);
+        assert_eq!(sent[CHUNK_DATA_SIZE + 7], 0xA4);
+        assert_ne!(Sha256::digest(&sent), Sha256::digest(&original));
+    }
+
+    #[test]
+    fn flip_sent_byte_refuses_the_first_chunk_and_past_the_end() {
+        let mut image = vec![0u8; CHUNK_DATA_SIZE * 2];
+        assert!(flip_sent_byte(&mut image, 0).is_err());
+        assert!(flip_sent_byte(&mut image, CHUNK_DATA_SIZE - 1).is_err());
+        assert!(flip_sent_byte(&mut image, CHUNK_DATA_SIZE * 2).is_err());
+        assert!(image.iter().all(|&b| b == 0));
+    }
 }

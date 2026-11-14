@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "heartwood-esp8266"
-version = "0.18.0-beta.35"
+version = "0.18.0-beta.36"
 dependencies = [
  "crc32fast",
  "critical-section",

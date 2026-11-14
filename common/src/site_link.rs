@@ -217,19 +217,21 @@ pub fn parse_create(params: &[Value]) -> Result<CreateRequest, LinkError> {
         return Err(LinkError::Malformed);
     }
     let policy = map.get("policy").and_then(Value::as_object).ok_or(LinkError::Malformed)?;
-    let allowed_methods = match policy.get("allowed_methods") {
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|v| v.as_str().map(str::to_string))
-            .collect::<Option<Vec<_>>>()
-            .ok_or(LinkError::Malformed)?,
+    // Plain loops, not `collect::<Option<Vec<_>>>`: the image is tight.
+    let mut allowed_methods = Vec::new();
+    for item in policy.get("allowed_methods").and_then(Value::as_array).ok_or(LinkError::Malformed)? {
+        allowed_methods.push(item.as_str().ok_or(LinkError::Malformed)?.to_string());
+    }
+    let mut allowed_kinds = Vec::new();
+    match policy.get("allowed_kinds") {
+        Some(Value::Array(items)) => {
+            for item in items {
+                allowed_kinds.push(item.as_u64().ok_or(LinkError::Malformed)?);
+            }
+        }
+        None | Some(Value::Null) => {}
         _ => return Err(LinkError::Malformed),
-    };
-    let allowed_kinds = match policy.get("allowed_kinds") {
-        Some(Value::Array(items)) => items.iter().map(Value::as_u64).collect::<Option<Vec<_>>>().ok_or(LinkError::Malformed)?,
-        None | Some(Value::Null) => Vec::new(),
-        _ => return Err(LinkError::Malformed),
-    };
+    }
     let auto_approve = match policy.get("auto_approve") {
         Some(Value::Bool(b)) => *b,
         _ => return Err(LinkError::Malformed),
@@ -320,63 +322,27 @@ pub fn check_phone<'a>(
     Ok((phone, served))
 }
 
-/// What the phone's own slot does silently (rule 6): the link methods it
+/// Rule 6: whether a validated policy stays inside what the phone's own slot
+/// does silently. Each method must be one of the four and one the phone
 /// auto-approves (`get_public_key` always, as the caller answers it before
-/// any policy), and its kinds. `any_kind` only when its list is empty and it
-/// signs silently.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ceiling {
-    pub methods: Vec<&'static str>,
-    pub any_kind: bool,
-    pub kinds: Vec<u64>,
-}
-
-pub fn ceiling(phone: &ConnectSlot) -> Ceiling {
+/// any policy); each kind one the phone signs silently, any kind only when
+/// the phone's list is empty and it signs silently. The request's
+/// `auto_approve` does not loosen it: a link that asks each time still names
+/// only what the phone does silently.
+pub fn within_phone(phone: &ConnectSlot, policy: &ExactSlotPolicy) -> bool {
     let silent = |method: &str, kind: Option<u64>| {
         evaluate_slot_policy_for_event(phone, method, kind, false) == ApprovalTier::AutoApprove
     };
-    let methods: Vec<&'static str> = LINK_METHODS
-        .iter()
-        .copied()
-        .filter(|m| *m == "get_public_key" || silent(m, None))
-        .collect();
-    let signs = methods.contains(&"sign_event");
-    let any_kind = signs && phone.allowed_kinds.is_empty();
-    let mut kinds: Vec<u64> = if signs {
-        phone.allowed_kinds.iter().copied().filter(|k| silent("sign_event", Some(*k))).collect()
-    } else {
-        Vec::new()
-    };
-    kinds.sort_unstable();
-    kinds.dedup();
-    Ceiling { methods, any_kind, kinds }
-}
-
-impl Ceiling {
-    /// Whether a validated policy stays inside. The request's `auto_approve`
-    /// does not loosen it: a link that asks each time still names only what
-    /// the phone does silently.
-    pub fn admits(&self, policy: &ExactSlotPolicy) -> bool {
-        if !policy.allowed_methods.iter().all(|m| self.methods.iter().any(|c| c == m)) {
+    for method in &policy.allowed_methods {
+        if !LINK_METHODS.contains(&method.as_str()) || !(method == "get_public_key" || silent(method, None)) {
             return false;
         }
-        if !policy.signing_approved || self.any_kind {
-            return true;
-        }
-        !policy.allowed_kinds.is_empty() && policy.allowed_kinds.iter().all(|k| self.kinds.contains(k))
     }
-
-    /// The ceiling as the wider refusal names it, in the request's own
-    /// field names (an empty kinds list with `sign_event` is any kind).
-    pub fn json(&self) -> String {
-        let kinds: Vec<u64> = if self.any_kind { Vec::new() } else { self.kinds.clone() };
-        serde_json::json!({ "allowed_methods": self.methods, "allowed_kinds": kinds }).to_string()
+    if !policy.signing_approved || (phone.allowed_kinds.is_empty() && silent("sign_event", None)) {
+        return true;
     }
-}
-
-/// The refusal text for [`LinkError::WiderThanPhone`], naming the ceiling.
-pub fn wider_message(ceiling: &Ceiling) -> String {
-    format!("{}; ceiling {}", LinkError::WiderThanPhone.message(), ceiling.json())
+    !policy.allowed_kinds.is_empty()
+        && policy.allowed_kinds.iter().all(|k| phone.allowed_kinds.contains(k) && silent("sign_event", Some(*k)))
 }
 
 /// A create that passed rules 1 to 6 and the table check.
@@ -389,31 +355,33 @@ pub struct CreatePlan {
 }
 
 /// Rules 1 to 6, then room in the identity's table (rule 7's first half;
-/// NVS room is [`save_room_len`], the firmware's RNG its own). On a wider
-/// request the error carries the ceiling to name.
+/// NVS room is [`check_save_room`], the firmware's RNG its own).
 pub fn check_create(
     asking: Option<&ConnectSlot>,
     client_hex: &str,
     served: Option<ServedIdentity<'_>>,
     request: &CreateRequest,
-) -> Result<CreatePlan, (LinkError, Option<Ceiling>)> {
-    let (phone, served) = check_phone(asking, client_hex, &request.identity, served).map_err(|e| (e, None))?;
+) -> Result<CreatePlan, LinkError> {
+    let (phone, served) = check_phone(asking, client_hex, &request.identity, served)?;
     let mut policy = validate_exact_slot_policy(
         request.allowed_methods.clone(),
         request.allowed_kinds.clone(),
         request.auto_approve,
     )
-    .map_err(|_| (LinkError::Malformed, None))?;
-    let limit = ceiling(phone);
-    if !limit.admits(&policy) {
-        return Err((LinkError::WiderThanPhone, Some(limit)));
+    .map_err(|_| LinkError::Malformed)?;
+    if !within_phone(phone, &policy) {
+        return Err(LinkError::WiderThanPhone);
     }
     if next_slot_index(served.table).is_none() {
-        return Err((LinkError::NoRoom, None));
+        return Err(LinkError::NoRoom);
     }
     policy.bound_identity = Some(crate::hex::hex_encode(&request.identity));
     Ok(CreatePlan { master_slot: served.master_slot, policy })
 }
+
+/// A stand-in for a 64-hex secret or client key, where only its length
+/// counts.
+const STAND_IN: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
 /// The slot the hold will create, as `create_slot_with_exact_policy` builds
 /// it (strict, an empty grant snapshot), with a stand-in secret.
@@ -421,7 +389,7 @@ pub fn planned_slot(table: &[ConnectSlot], label: &str, policy: &ExactSlotPolicy
     Some(ConnectSlot {
         slot_index: next_slot_index(table)?,
         label: label.to_string(),
-        secret: "0".repeat(64),
+        secret: STAND_IN.to_string(),
         current_pubkey: None,
         allowed_methods: policy.allowed_methods.clone(),
         allowed_kinds: policy.allowed_kinds.clone(),
@@ -445,12 +413,12 @@ pub fn planned_slot(table: &[ConnectSlot], label: &str, policy: &ExactSlotPolicy
 /// writes it causes make it (`owner_pairing::save_room_need` takes it).
 pub fn save_room_len(table: &[ConnectSlot], label: &str, policy: &ExactSlotPolicy, identity: &[u8; 32]) -> Option<usize> {
     let mut slot = planned_slot(table, label, policy)?;
-    let stand_in = "f".repeat(64);
-    crate::policy::authorize_pubkey_on_slot(&mut slot, &stand_in);
-    crate::policy::record_client_identity(&mut slot, &stand_in, identity);
-    let mut projected = table.to_vec();
-    projected.push(slot);
-    serde_json::to_string(&projected).ok().map(|json| json.len())
+    crate::policy::authorize_pubkey_on_slot(&mut slot, STAND_IN);
+    crate::policy::record_client_identity(&mut slot, STAND_IN, identity);
+    // The table's array with one more element, without cloning the table.
+    let table_len = serde_json::to_string(table).ok()?.len();
+    let slot_len = serde_json::to_string(&slot).ok()?.len();
+    Some(table_len + slot_len + usize::from(!table.is_empty()))
 }
 
 /// Rule 7's NVS half: the projected table fits beside the old one. No stats
@@ -538,14 +506,23 @@ pub fn check_target(slot: &ConnectSlot) -> Result<(), LinkError> {
     Ok(())
 }
 
+/// `{ <first>: <is>, "bound": <bound> }`, the status reply and a revoke that
+/// changes nothing.
+fn flag_reply(first: &str, is: bool, bound: bool) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(first.into(), Value::Bool(is));
+    map.insert("bound".into(), Value::Bool(bound));
+    Value::Object(map)
+}
+
 /// The status reply `{ exists, bound }`.
 pub fn status_reply(found: Found<'_>) -> Result<Value, LinkError> {
     Ok(match found {
         Found::Slot(slot) => {
             check_target(slot)?;
-            serde_json::json!({ "exists": true, "bound": slot_is_bound(slot) })
+            flag_reply("exists", true, slot_is_bound(slot))
         }
-        Found::Missing | Found::Mismatch => serde_json::json!({ "exists": false, "bound": false }),
+        Found::Missing | Found::Mismatch => flag_reply("exists", false, false),
     })
 }
 
@@ -563,11 +540,11 @@ pub fn plan_revoke(found: Found<'_>, by_label: bool) -> Result<RevokePlan, LinkE
         Found::Slot(slot) => {
             check_target(slot)?;
             if by_label && slot_is_bound(slot) {
-                return Ok(RevokePlan::Keep(serde_json::json!({ "revoked": false, "bound": true })));
+                return Ok(RevokePlan::Keep(flag_reply("revoked", false, true)));
             }
             Ok(RevokePlan::Remove { slot_index: slot.slot_index, fingerprint: credential_fingerprint(&slot.secret) })
         }
-        Found::Missing if by_label => Ok(RevokePlan::Keep(serde_json::json!({ "revoked": false, "bound": false }))),
+        Found::Missing if by_label => Ok(RevokePlan::Keep(flag_reply("revoked", false, false))),
         Found::Missing => Err(LinkError::UnknownLink),
         Found::Mismatch => Err(LinkError::StaleFingerprint),
     }
@@ -621,9 +598,9 @@ fn printable(text: &str) -> String {
 /// The site a label names: the host of `<app>:<host>:<8 hex>` (My Signet's
 /// form), otherwise the whole label.
 pub fn site_of(label: &str) -> String {
-    let parts: Vec<&str> = label.split(':').collect();
-    let site = match parts.as_slice() {
-        [app, host, tag]
+    let mut parts = label.split(':');
+    let site = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(app), Some(host), Some(tag), None)
             if !app.is_empty()
                 && !host.is_empty()
                 && tag.len() == 8
@@ -750,11 +727,6 @@ impl LinkLedger {
         Self { entries: Vec::new(), cooldowns: Vec::new() }
     }
 
-    fn expire(&mut self, now_ms: u64) {
-        self.entries.retain(|e| now_ms < e.deadline_ms);
-        self.cooldowns.retain(|(_, until)| now_ms < *until);
-    }
-
     /// Record a link made by a hold that completed at `now_ms`.
     pub fn record(
         &mut self,
@@ -766,8 +738,9 @@ impl LinkLedger {
         label: &str,
         now_ms: u64,
     ) {
-        self.expire(now_ms);
         self.clear_slot(master_slot, slot_index);
+        // Entries expire in the order they were made, so the oldest is the
+        // one to drop, live or not; every read checks the deadline.
         if self.entries.len() >= MAX_LIVE_LINKS {
             self.entries.remove(0);
         }
@@ -802,13 +775,16 @@ impl LinkLedger {
 
     /// Any revoke of the slot.
     pub fn clear_slot(&mut self, master_slot: u8, slot_index: u8) {
-        self.entries.retain(|e| !(e.master_slot == master_slot && e.slot_index == slot_index));
+        // `record` clears a slot before adding it, so there is at most one.
+        if let Some(at) = self.entries.iter().position(|e| e.master_slot == master_slot && e.slot_index == slot_index) {
+            self.entries.remove(at);
+        }
     }
 
     /// A decline or a timeout from this client.
     pub fn start_cooldown(&mut self, client: &str, now_ms: u64) {
-        self.expire(now_ms);
-        self.cooldowns.retain(|(c, _)| c != client);
+        // A cooling client never reaches a card, so any earlier entry of its
+        // has run out; as with links, the oldest is the one to drop.
         if self.cooldowns.len() >= MAX_COOLDOWNS {
             self.cooldowns.remove(0);
         }
@@ -998,20 +974,20 @@ mod tests {
     fn rule_1_only_an_owner_pairing_may_ask() {
         let table = vec![owner(Style::Everyday)];
         let req = request(PERSONA, vec![]);
-        assert_eq!(check_create(None, PHONE, served(0, &table), &req).unwrap_err().0, LinkError::NotOwnerPairing);
+        assert_eq!(check_create(None, PHONE, served(0, &table), &req).unwrap_err(), LinkError::NotOwnerPairing);
         // A site link (strict) and a child slot (strict, escalate) never reach it.
         let site = strict_m1(vec![]);
-        assert_eq!(check_create(Some(&site), PHONE, served(0, &table), &req).unwrap_err().0, LinkError::NotOwnerPairing);
+        assert_eq!(check_create(Some(&site), PHONE, served(0, &table), &req).unwrap_err(), LinkError::NotOwnerPairing);
         let mut child = owner(Style::Everyday);
         child.escalate = true;
-        assert_eq!(check_create(Some(&child), PHONE, served(0, &table), &req).unwrap_err().0, LinkError::NotOwnerPairing);
+        assert_eq!(check_create(Some(&child), PHONE, served(0, &table), &req).unwrap_err(), LinkError::NotOwnerPairing);
         // An unmarked non-strict slot is no owner pairing either.
         let unmarked = base_slot(0, "plain");
-        assert_eq!(check_create(Some(&unmarked), PHONE, served(0, &table), &req).unwrap_err().0, LinkError::NotOwnerPairing);
+        assert_eq!(check_create(Some(&unmarked), PHONE, served(0, &table), &req).unwrap_err(), LinkError::NotOwnerPairing);
         // Row 9: an owner pairing carrying any other family flag.
         let mut flagged = owner(Style::Everyday);
         flagged.petition_on_deny = true;
-        assert_eq!(check_create(Some(&flagged), PHONE, served(0, &table), &req).unwrap_err().0, LinkError::FamilySlot);
+        assert_eq!(check_create(Some(&flagged), PHONE, served(0, &table), &req).unwrap_err(), LinkError::FamilySlot);
     }
 
     #[test]
@@ -1019,22 +995,22 @@ mod tests {
         let asking = owner(Style::Everyday);
         let table = vec![asking.clone()];
         let req = request(MASTER1, vec![]);
-        assert_eq!(check_create(Some(&asking), PHONE, None, &req).unwrap_err().0, LinkError::IdentityNotServed);
+        assert_eq!(check_create(Some(&asking), PHONE, None, &req).unwrap_err(), LinkError::IdentityNotServed);
         // Master 1 serves it, but the phone never signed as it there.
         let mut unapproved = strict_m1(vec![]);
         unapproved.client_grants = Some(crate::client_grants::GrantSnapshot::empty());
         assert!(crate::policy::authorize_pubkey_on_slot(&mut unapproved, PHONE));
         let m1 = vec![unapproved];
-        assert_eq!(check_create(Some(&asking), PHONE, served(1, &m1), &req).unwrap_err().0, LinkError::NotApprovedForIdentity);
+        assert_eq!(check_create(Some(&asking), PHONE, served(1, &m1), &req).unwrap_err(), LinkError::NotApprovedForIdentity);
         // Row 17: a key per master. The phone's master-1 slot holds another key.
         let mut other_key = strict_m1(vec![]);
         other_key.current_pubkey = Some(SITE.into());
         other_key.authorized_pubkeys = vec![SITE.into()];
         let m1 = vec![other_key];
-        assert_eq!(check_create(Some(&asking), PHONE, served(1, &m1), &req).unwrap_err().0, LinkError::NotApprovedForIdentity);
+        assert_eq!(check_create(Some(&asking), PHONE, served(1, &m1), &req).unwrap_err(), LinkError::NotApprovedForIdentity);
         // On its own master, the owner pairing must act as the identity too.
         assert_eq!(
-            check_create(Some(&asking), PHONE, served(0, &table), &request([0x55; 32], vec![])).unwrap_err().0,
+            check_create(Some(&asking), PHONE, served(0, &table), &request([0x55; 32], vec![])).unwrap_err(),
             LinkError::NotApprovedForIdentity
         );
     }
@@ -1046,10 +1022,10 @@ mod tests {
         child.audit_child_wrap = true;
         let m1 = vec![child];
         let req = request(MASTER1, vec![]);
-        assert_eq!(check_create(Some(&asking), PHONE, served(1, &m1), &req).unwrap_err().0, LinkError::FamilySlot);
+        assert_eq!(check_create(Some(&asking), PHONE, served(1, &m1), &req).unwrap_err(), LinkError::FamilySlot);
         let m1 = vec![strict_m1(vec![])];
         let real = Some(ServedIdentity { master_slot: 1, real: true, table: &m1 });
-        assert_eq!(check_create(Some(&asking), PHONE, real, &req).unwrap_err().0, LinkError::RealIdentity);
+        assert_eq!(check_create(Some(&asking), PHONE, real, &req).unwrap_err(), LinkError::RealIdentity);
     }
 
     #[test]
@@ -1057,15 +1033,9 @@ mod tests {
         let asking = owner(Style::Everyday);
         let m1 = vec![strict_m1(vec![1, 7])];
         // Any kind is wider than kinds 1 and 7.
-        let (err, ceiling) = check_create(Some(&asking), PHONE, served(1, &m1), &request(MASTER1, vec![])).unwrap_err();
+        let err = check_create(Some(&asking), PHONE, served(1, &m1), &request(MASTER1, vec![])).unwrap_err();
         assert_eq!(err, LinkError::WiderThanPhone);
-        let ceiling = ceiling.unwrap();
-        assert_eq!(ceiling.kinds, vec![1, 7]);
-        assert!(!ceiling.any_kind);
-        assert_eq!(
-            wider_message(&ceiling),
-            r#"wider than this phone's access; ceiling {"allowed_kinds":[1,7],"allowed_methods":["get_public_key","sign_event","nip44_encrypt","nip44_decrypt"]}"#
-        );
+        assert_eq!(err.message(), "wider than this phone's access");
         // Inside those kinds works, and so does a subset.
         assert!(check_create(Some(&asking), PHONE, served(1, &m1), &request(MASTER1, vec![7, 1])).is_ok());
         assert!(check_create(Some(&asking), PHONE, served(1, &m1), &request(MASTER1, vec![7])).is_ok());
@@ -1074,12 +1044,17 @@ mod tests {
         // An Extra careful owner pairing signs only backups and AUTH silently.
         let careful = owner(Style::Careful);
         let table = vec![careful.clone()];
-        let (err, ceiling) = check_create(Some(&careful), PHONE, served(0, &table), &request(PERSONA, vec![])).unwrap_err();
+        let err = check_create(Some(&careful), PHONE, served(0, &table), &request(PERSONA, vec![])).unwrap_err();
         assert_eq!(err, LinkError::WiderThanPhone);
-        let mut careful_kinds = CAREFUL_KINDS.to_vec();
-        careful_kinds.sort_unstable();
-        assert_eq!(ceiling.unwrap().kinds, careful_kinds);
         assert!(check_create(Some(&careful), PHONE, served(0, &table), &request(PERSONA, CAREFUL_KINDS.to_vec())).is_ok());
+        for kind in CAREFUL_KINDS.iter() {
+            assert!(check_create(Some(&careful), PHONE, served(0, &table), &request(PERSONA, vec![*kind])).is_ok());
+        }
+        // A kind the Careful pairing would ask about is wider.
+        assert_eq!(
+            check_create(Some(&careful), PHONE, served(0, &table), &request(PERSONA, vec![1])).unwrap_err(),
+            LinkError::WiderThanPhone
+        );
     }
 
     #[test]
@@ -1089,28 +1064,34 @@ mod tests {
         let mut asks = strict_m1(vec![]);
         asks.auto_approve = false;
         let m1 = vec![asks];
-        let ceiling = ceiling(&m1[0]);
-        assert_eq!(ceiling.methods, vec!["get_public_key"]);
-        assert!(!ceiling.any_kind);
+        for method in ["sign_event", "nip44_encrypt", "nip44_decrypt"] {
+            let mut one = request(MASTER1, vec![]);
+            one.allowed_methods = vec![method.into()];
+            assert_eq!(check_create(Some(&asking), PHONE, served(1, &m1), &one), Err(LinkError::WiderThanPhone), "{method}");
+        }
         // The request's own auto_approve does not loosen it.
         let mut req = request(MASTER1, vec![]);
         req.auto_approve = false;
-        assert_eq!(check_create(Some(&asking), PHONE, served(1, &m1), &req).unwrap_err().0, LinkError::WiderThanPhone);
+        assert_eq!(check_create(Some(&asking), PHONE, served(1, &m1), &req).unwrap_err(), LinkError::WiderThanPhone);
         let mut pubkey_only = request(MASTER1, vec![]);
         pubkey_only.allowed_methods = vec!["get_public_key".into()];
         assert!(check_create(Some(&asking), PHONE, served(1, &m1), &pubkey_only).is_ok());
         // A non-strict slot that has not yet earned sign_event cannot hand it on.
         let usb = base_slot(2, "usb");
-        assert_eq!(super::ceiling(&usb).methods, vec!["get_public_key", "nip44_encrypt", "nip44_decrypt"]);
+        let methods = |list: &[&str]| {
+            validate_exact_slot_policy(list.iter().map(|m| m.to_string()).collect(), vec![], true).unwrap()
+        };
+        assert!(within_phone(&usb, &methods(&["get_public_key", "nip44_encrypt", "nip44_decrypt"])));
+        assert!(!within_phone(&usb, &methods(&["get_public_key", "sign_event"])));
         // A method outside the four is wider, even one the phone has.
         let mut odd = request(PERSONA, vec![]);
         odd.allowed_methods.push("heartwood_list_identities".into());
         let table = vec![owner(Style::Everyday)];
-        assert_eq!(check_create(Some(&table[0]), PHONE, served(0, &table), &odd).unwrap_err().0, LinkError::WiderThanPhone);
+        assert_eq!(check_create(Some(&table[0]), PHONE, served(0, &table), &odd).unwrap_err(), LinkError::WiderThanPhone);
         // Kinds without sign_event are malformed, as for create_client_v2.
         let mut kinds_only = request(PERSONA, vec![1]);
         kinds_only.allowed_methods = vec!["get_public_key".into()];
-        assert_eq!(check_create(Some(&table[0]), PHONE, served(0, &table), &kinds_only).unwrap_err().0, LinkError::Malformed);
+        assert_eq!(check_create(Some(&table[0]), PHONE, served(0, &table), &kinds_only).unwrap_err(), LinkError::Malformed);
     }
 
     #[test]
@@ -1121,7 +1102,7 @@ mod tests {
             table.push(base_slot(i, "other"));
         }
         assert_eq!(
-            check_create(Some(&asking), PHONE, served(0, &table), &request(PERSONA, vec![])).unwrap_err().0,
+            check_create(Some(&asking), PHONE, served(0, &table), &request(PERSONA, vec![])).unwrap_err(),
             LinkError::NoRoom
         );
         let table = vec![asking];
@@ -1130,6 +1111,12 @@ mod tests {
         assert_eq!(check_save_room(&table, label, &plan.policy, &PERSONA, None), Ok(()));
         let roomy = crate::nvs_room::NvsRoom { free_entries: 400, total_entries: 630, reclaimable_entries: 0 };
         let len = save_room_len(&table, label, &plan.policy, &PERSONA).unwrap();
+        // The length is the projected table's, counted without cloning it.
+        let mut bound = planned_slot(&table, label, &plan.policy).unwrap();
+        crate::policy::authorize_pubkey_on_slot(&mut bound, STAND_IN);
+        crate::policy::record_client_identity(&mut bound, STAND_IN, &PERSONA);
+        assert_eq!(len, serde_json::to_string(&[table.clone(), vec![bound.clone()]].concat()).unwrap().len());
+        assert_eq!(save_room_len(&[], label, &plan.policy, &PERSONA), Some(serde_json::to_string(&[bound]).unwrap().len()));
         let need = crate::owner_pairing::save_room_need(&[], crate::owner_pairing::RegistryTail { count: 0, count_stored: true, chunk_len: None }, Some(len), roomy.pages());
         assert_eq!(check_save_room(&table, label, &plan.policy, &PERSONA, Some(roomy)), Ok(()), "{len} {need:?}");
         let full = crate::nvs_room::NvsRoom { free_entries: 130, total_entries: 630, reclaimable_entries: 0 };

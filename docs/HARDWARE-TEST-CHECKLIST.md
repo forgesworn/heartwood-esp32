@@ -3682,7 +3682,7 @@ with the device operator key.
   bytes while the event still held the ciphertext. `response_transportable`
   allows for one allocation that size, not two. Item 6's five-app reply (about
   7.8 KB) was in the band below and went out. #286 streams the frame through a
-  512-byte buffer instead; that build is not yet benched.
+  512-byte buffer instead (run below).
 - After the reset: free heap 66,256, largest block 65,536, and NVS 603 entries,
   up from 569. The crash record is kept in RTC memory, so this run does not
   account for the rise.
@@ -3696,3 +3696,15 @@ with the device operator key.
   overnight client's refusals in 90 minutes, with no fall, so refused
   `connect`s are unlikely to explain the evening's drop. Stopped at 90 of a
   planned 120 minutes once the dip had recovered.
+- #286, run: CI's `app-tdisplay` artifact from `0e3d511` (app.bin SHA-256
+  `c0a2068a…`) written app-only at 0x10000 at 11:02Z, replacing the signed
+  beta.35 release image, which `verify-flash` matched first and which is the
+  rollback. The version string is unchanged (0.18.0-beta.35). After the
+  power-on reset: no `crash_detail`, and NVS 569 entries, the figure before
+  the panic. At 1,046 s up, free heap 68,816 and largest block 59,392; one
+  relay `list_clients` then returned all six apps, about 8,680 B of plaintext
+  and so a 13,744-byte ciphertext, the size that panicked. No reset; 68,660
+  and 59,392 after, 68,748 five minutes on. With that much heap the old
+  whole-frame build might have passed too, so this shows the streamed frame
+  arriving intact; that the second content-sized allocation is gone rests on
+  `common/tests/ws_frame_memory.rs`.

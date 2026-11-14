@@ -576,7 +576,13 @@ at-rest encryption off: `SET_PIN` with an empty payload ("Remove PIN?") or
 That stores every seed in plaintext and drops the phone records, so enrolled
 phones must be enrolled again if encryption is turned back on. A WiFi-mode
 board refuses the change while it holds bearer notes ("at-rest changes need USB
-mode while notes are held"), so empty the note locker or switch to USB mode first. Turning it off
+mode while notes are held"), so empty the note locker or switch to USB mode first.
+A USB-mode board refuses it, before the card and before the seeds change,
+while any note record cannot be read this boot ("at-rest stays on while notes
+cannot be read"): such a record may be sealed under the note key, and turning
+at-rest off forgets the data key that note key is wrapped under, taking the
+note's value with it. There is
+no way yet to remove such a record short of a factory reset. Turning it off
 does not wipe the sealed bytes already on flash (see *Leftover bytes in NVS*).
 
 **Honest limitation:** with no secure element and no eFuses, the key is derived

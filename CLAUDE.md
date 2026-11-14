@@ -88,7 +88,11 @@ flash but this boot cannot read (a newer record format, a sealed blob
 that will not open, a failed read) keeps its index place, its slot and
 its id through every rewrite; get_info reports those as
 `unreadable_count` (omitted when zero; locked or unlocked, note_count
-plus it is what the cap counts). No delete path for them exists yet. Relay path: heartwood_note_* NIP-46 extensions
+plus it is what the cap counts), and turning at-rest off over USB
+(empty SET_PIN / VAULT_SET) is refused before the card while any exist,
+NACK `at-rest stays on while notes cannot be read`, because one may be
+sealed under the key that would be forgotten. No delete path for them
+exists yet. Relay path: heartwood_note_* NIP-46 extensions
 (advertised note_locker_v1), gated methods pinned ButtonRequired ahead of the
 generic extension gate so no slot policy can silence a disclosure, riding the
 #64 deferred machinery. heartwood_note_rename joined that set (#96, checklist

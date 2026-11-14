@@ -679,11 +679,11 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
     }
 }
 
-/// Whether the device holds any notes (loaded or sealed), for code with no
-/// locker in scope — the WiFi-standalone tier consults this before allowing
-/// an at-rest change it could not sync notes through. Set at init and
-/// re-stored after every note command (USB frame or relay method), so it
-/// stays fresh in both modes.
+/// Whether the device holds any notes (loaded, sealed or unreadable), for
+/// code with no locker in scope — the WiFi-standalone tier consults this
+/// before allowing an at-rest change it could not sync notes through. Set at
+/// init and re-stored after every note command (USB frame or relay method),
+/// so it stays fresh in both modes.
 static NOTES_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn any_notes_held() -> bool {
@@ -791,7 +791,7 @@ pub fn store_wrap_ledger(blob: &[u8]) {
 impl Notes {
     fn any_held(&self) -> bool {
         let (count, _) = self.store.counts();
-        count > 0 || self.sealed_count() > 0
+        count > 0 || self.sealed_count() > 0 || self.store.unreadable_count() > 0
     }
 
     /// Indexed notes this boot could not read beyond the sealed ones
@@ -802,6 +802,15 @@ impl Notes {
     /// measured against.
     pub fn unreadable_count(&self) -> usize {
         self.store.unreadable_count().saturating_sub(self.sealed_count())
+    }
+
+    /// Whether at-rest must stay on: a note this boot could not read may be
+    /// sealed under the note key, and turning at-rest off drops that key's
+    /// wrap (and the data key under it) for good. Sealed records with no key
+    /// are the long-standing case; an unreadable record is refused the same
+    /// way, because this boot cannot tell whether it is sealed.
+    fn at_rest_must_stay(&self) -> bool {
+        self.sealed_count() > 0 || self.store.unreadable_count() > 0
     }
 
     /// Sealed records awaiting a key this boot. Included in `get_info`'s
@@ -1009,9 +1018,24 @@ fn sync_sealed_inner(notes: &mut Notes, secret: Option<&[u8]>) {
     log::info!("[notes] sealed state in sync ({count} note(s) under the note key)");
 }
 
+/// The NACK reason for a `SET_PIN` or `VAULT_SET` that would turn at-rest off
+/// while [`at_rest_must_stay`] holds.
+pub const AT_REST_MUST_STAY: &[u8] = b"at-rest stays on while notes cannot be read";
+
+/// Whether turning at-rest off must be refused before the seeds change:
+/// some note this boot could not read may be sealed under the note key, and
+/// removing the PIN or vault key forgets the data key that key is wrapped
+/// under. The USB loop asks this before the "Remove PIN?" or "Disable vault?"
+/// card, so nothing changes and the host is told why.
+pub fn at_rest_must_stay() -> bool {
+    with_locker(|notes| notes.at_rest_must_stay())
+}
+
 /// Turn at-rest off for the locker: rewrite every record plaintext, then
 /// drop `nk` and the in-RAM key. Refusal, not destruction, when sealed
-/// records exist with no key. Order matters: records go plaintext BEFORE
+/// records exist with no key or records exist this boot could not read
+/// ([`at_rest_must_stay`]; the USB loop checks it before the seeds change,
+/// so this is the backstop). Order matters: records go plaintext BEFORE
 /// `nk` is removed, so a reset between the two leaves an orphan `nk`
 /// (harmless — overwritten by the next enable) rather than sealed records
 /// with no wrap.
@@ -1020,8 +1044,11 @@ pub fn disable_sealing() {
 }
 
 fn disable_sealing_inner(notes: &mut Notes) {
-    if notes.sealed_count() > 0 {
-        log::error!("[notes] at-rest disabled while sealed notes have no key — they stay sealed on flash");
+    if notes.at_rest_must_stay() {
+        log::error!(
+            "[notes] at-rest disabled while {} note(s) cannot be read; they stay sealed on flash",
+            notes.store.unreadable_count().max(notes.sealed_count())
+        );
         return;
     }
     {

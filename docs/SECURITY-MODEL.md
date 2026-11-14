@@ -58,8 +58,9 @@ commitments.
 
 A second optional top-level field, `note_inventory_unreadable`, counts the
 notes the exporting board held but could NOT read: records still sealed under
-an at-rest key that boot was never given, or a locker whose index would not
-load. It travels in the file and not only in a log, because otherwise an
+an at-rest key that boot was never given, records it could not read for any
+other reason (a newer record format, a sealed blob that would not open, a
+failed read), or a locker whose index would not load. It travels in the file and not only in a log, because otherwise an
 export taken on a locked board carries an empty inventory that is
 byte-identical to one taken on an empty locker. "I cannot see four of them" is
 a different statement from "there were none", and a backup that quietly
@@ -615,7 +616,13 @@ at-rest encryption off: `SET_PIN` with an empty payload ("Remove PIN?") or
 That stores every seed in plaintext and drops the phone records, so enrolled
 phones must be enrolled again if encryption is turned back on. A WiFi-mode
 board refuses the change while it holds bearer notes ("at-rest changes need USB
-mode while notes are held"), so empty the note locker or switch to USB mode first. Turning it off
+mode while notes are held"), so empty the note locker or switch to USB mode first.
+A USB-mode board refuses it, before the card and before the seeds change,
+while any note record cannot be read this boot ("at-rest stays on while notes
+cannot be read"): such a record may be sealed under the note key, and turning
+at-rest off forgets the data key that note key is wrapped under, taking the
+note's value with it. There is
+no way yet to remove such a record short of a factory reset. Turning it off
 does not wipe the sealed bytes already on flash (see *Leftover bytes in NVS*).
 
 **Honest limitation:** with no secure element and no eFuses, the key is derived

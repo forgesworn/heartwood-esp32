@@ -1201,7 +1201,12 @@ Sealing (enable at-rest with notes held):
    NEW pin (the note key was re-wrapped, not regenerated). NOT YET
    BENCH-RUN.
 10. Disable at-rest: notes return to plaintext `HWNB`, `nk` removed,
-    everything still spends. NOT YET BENCH-RUN.
+    everything still spends. With a note this boot cannot read (for
+    instance one written by a newer firmware), SET_PIN or VAULT_SET with an
+    empty payload instead NACKs with reason `at-rest stays on while notes
+    cannot be read` before any card, the seeds stay sealed, `nk` stays, and
+    `get_info` carries `unreadable_count` (note_count plus it reaches 16
+    before `storage_full`). NOT YET BENCH-RUN.
 11. Torn-enable self-heal: cut power between the seed-seal and note-seal
     passes (or flash a state with sealed seeds + plaintext notes + no
     `nk`); the next unlock seals the stragglers without losing any. NOT
@@ -1215,7 +1220,8 @@ WiFi-standalone tier:
 13. Every 0x70 frame NACKs with reason `use heartwood_note_* over the
     relay` (the frame surface is USB-mode; the locker itself is served as
     NIP-46 extensions there — items 15–17). NOT YET BENCH-RUN.
-14. With notes held, SET_PIN and VAULT_SET over the cable NACK with reason
+14. With notes held (notes this boot cannot read count), SET_PIN and
+    VAULT_SET over the cable NACK with reason
     `at-rest changes need USB mode while notes are held`; with no notes
     they behave as before. NOT YET BENCH-RUN.
 

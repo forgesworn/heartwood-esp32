@@ -566,11 +566,21 @@ pub struct NoteStore {
     cap: usize,
     /// The newest stamp any held record carries. See [`Self::stamp`].
     stamp_floor: u32,
+    /// Indexed ids whose blob is on flash but this boot could not read: a
+    /// record format newer than this firmware, a blob sealed under a key
+    /// this boot does not hold, a read that failed. Every index rewrite
+    /// keeps them, so a note this firmware cannot read is never dropped from
+    /// the index and orphaned for the firmware that can. They count against
+    /// the cap (the index blob holds at most `cap` ids) and no new note takes
+    /// their id, which would write over the blob. An id whose blob is simply
+    /// absent is not kept: there is nothing behind it to orphan.
+    unreadable: Vec<String>,
 }
 
 /// The outcome of loading: the store, plus any indexed ids whose blobs were
 /// missing or undecodable. The store skips them (their flash bytes are left
-/// alone for a firmware that understands them); the caller decides how loudly
+/// alone for a firmware that understands them, and those still on flash keep
+/// their place in the index); the caller decides how loudly
 /// to report — anything skipped means note counts are not statements about
 /// how many notes exist.
 pub struct LoadOutcome {
@@ -589,13 +599,14 @@ impl NoteStore {
             Ok(None) => Vec::new(),
             Err(_) => {
                 return LoadOutcome {
-                    store: NoteStore { notes: Vec::new(), index_known: false, cap, stamp_floor: 0 },
+                    store: NoteStore::storage_unavailable(cap),
                     skipped: Vec::new(),
                 }
             }
         };
         let mut notes = Vec::new();
         let mut skipped = Vec::new();
+        let mut unreadable = Vec::new();
         for id in ids {
             match storage.load_note(&id) {
                 Ok(Some(mut blob)) => {
@@ -603,19 +614,29 @@ impl NoteStore {
                     blob.zeroize(); // the raw blob embeds the secret
                     match decoded {
                         Some(note) if note.id == id => notes.push(note),
-                        _ => skipped.push(id),
+                        _ => {
+                            unreadable.push(id.clone());
+                            skipped.push(id);
+                        }
                     }
                 }
-                _ => skipped.push(id),
+                Ok(None) => skipped.push(id),
+                Err(_) => {
+                    unreadable.push(id.clone());
+                    skipped.push(id);
+                }
             }
         }
         let stamp_floor = notes.iter().map(|n| n.created_at.max(n.updated_at)).max().unwrap_or(0);
-        LoadOutcome { store: NoteStore { notes, index_known: true, cap, stamp_floor }, skipped }
+        LoadOutcome {
+            store: NoteStore { notes, index_known: true, cap, stamp_floor, unreadable },
+            skipped,
+        }
     }
 
     /// Fail-closed constructor for a boot whose storage never came up at all.
     pub fn storage_unavailable(cap: usize) -> NoteStore {
-        NoteStore { notes: Vec::new(), index_known: false, cap, stamp_floor: 0 }
+        NoteStore { notes: Vec::new(), index_known: false, cap, stamp_floor: 0, unreadable: Vec::new() }
     }
 
     /// The stamp a write carries: `now`, unless that would sort at or before
@@ -636,6 +657,15 @@ impl NoteStore {
 
     pub fn index_known(&self) -> bool {
         self.index_known
+    }
+
+    /// Indexed notes whose blob is on flash but this boot could not read
+    /// ([`Self::unreadable`]): not in [`Self::counts`], yet each holds a slot
+    /// against the cap, so `counts().0 + unreadable_count()` is what a
+    /// creation is measured against. A caller that also counts sealed
+    /// records awaiting a key should know those are among these.
+    pub fn unreadable_count(&self) -> usize {
+        self.unreadable.len()
     }
 
     pub fn counts(&self) -> (usize, usize) {
@@ -692,11 +722,20 @@ impl NoteStore {
     /// `needed` is how many slots the caller is about to use, so a split
     /// asking for two does not stop at one: the check is room for the WHOLE
     /// request, not for a first note that would then strand its second.
+    ///
+    /// A request eviction cannot satisfy is refused before anything goes:
+    /// evicting first and then finding too few spent records would destroy
+    /// a receipt for a refusal all the same. The notes this boot cannot read
+    /// hold their slots and are never evicted, so they count here too.
     fn evict_spent_for_room(
         &mut self,
         storage: &mut dyn NoteStorage,
         needed: usize,
     ) -> Result<(), NoteError> {
+        let spent = self.notes.iter().filter(|n| n.state == NoteState::Spent).count();
+        if self.notes.len() + self.unreadable.len() + needed > self.cap + spent {
+            return Err(NoteError::StorageFull);
+        }
         while self.admit_creation(needed).is_err() {
             let idx = self.oldest_spent().ok_or(NoteError::StorageFull)?;
             self.persist_remove(storage, idx)?;
@@ -1311,16 +1350,17 @@ impl NoteStore {
             // Creating would rewrite an index this boot cannot see.
             return Err(NoteError::StorageFull);
         }
-        if self.notes.len() + adding > self.cap {
+        if self.notes.len() + self.unreadable.len() + adding > self.cap {
             return Err(NoteError::StorageFull);
         }
         Ok(())
     }
 
-    /// A fresh random id not colliding with any held note (nor `also_not`,
-    /// for the second half of a pair). `None` only if the RNG hands back the
-    /// same collision repeatedly, which means something far worse than an id
-    /// clash is going on.
+    /// A fresh random id not colliding with any held note or any indexed id
+    /// this boot could not read (nor `also_not`, for the second half of a
+    /// pair). `None` only if the RNG hands back the same collision
+    /// repeatedly, which means something far worse than an id clash is going
+    /// on.
     fn fresh_id(
         &self,
         rng: &mut dyn FnMut(&mut [u8]),
@@ -1330,7 +1370,9 @@ impl NoteStore {
             let mut raw = [0u8; ID_LEN / 2];
             rng(&mut raw);
             let id = hex_encode(&raw);
-            let clashes = self.notes.iter().any(|n| n.id == id) || also_not == Some(id.as_str());
+            let clashes = self.notes.iter().any(|n| n.id == id)
+                || self.unreadable.contains(&id)
+                || also_not == Some(id.as_str());
             if !clashes {
                 return Some(id);
             }
@@ -1382,10 +1424,17 @@ impl NoteStore {
         })
     }
 
+    /// Every id the index names that this boot keeps: the notes it read, then
+    /// the ones it could not ([`Self::unreadable`]), so no rewrite drops those.
+    fn indexed_ids(&self) -> Vec<String> {
+        self.notes.iter().map(|n| n.id.clone()).chain(self.unreadable.iter().cloned()).collect()
+    }
+
     /// Persist freshly created notes: every blob first, then one index write,
     /// then RAM. A failure anywhere leaves RAM (and the index) without the
     /// new notes; stranded blobs are unreferenced and get overwritten by a
-    /// later note reusing the id.
+    /// later note reusing the id. Only an unreferenced id is reused: an
+    /// indexed note this boot could not read keeps its id and its blob.
     fn persist_new(
         &mut self,
         storage: &mut dyn NoteStorage,
@@ -1397,7 +1446,7 @@ impl NoteStore {
             blob.zeroize(); // the encoded record embeds the raw secret
             saved.map_err(|_| NoteError::StorageFull)?;
         }
-        let mut ids: Vec<String> = self.notes.iter().map(|n| n.id.clone()).collect();
+        let mut ids = self.indexed_ids();
         ids.extend(new_notes.iter().map(|n| n.id.clone()));
         storage.save_index(&ids).map_err(|_| NoteError::StorageFull)?;
         self.notes.extend(new_notes);
@@ -1428,15 +1477,12 @@ impl NoteStore {
             return Err(NoteError::StorageFull);
         }
         let removed_id = self.notes[idx].id.clone();
-        let ids: Vec<String> = self
-            .notes
-            .iter()
-            .filter(|n| n.id != removed_id)
-            .map(|n| n.id.clone())
-            .collect();
+        let mut ids = self.indexed_ids();
+        ids.retain(|id| *id != removed_id);
         storage.save_index(&ids).map_err(|_| NoteError::StorageFull)?;
         // The blob is unreferenced now; a failed delete strands bytes, not
-        // state, and the id-reuse path overwrites them.
+        // state, and the id-reuse path overwrites them. The unreadable ids
+        // stay indexed, so that path never reaches their blobs.
         let _ = storage.delete_note(&removed_id);
         self.notes.remove(idx); // Drop zeroises the secret.
         Ok(())
@@ -1509,6 +1555,9 @@ mod tests {
         index: Option<Vec<String>>,
         notes: BTreeMap<String, Vec<u8>>,
         index_read_fails: bool,
+        /// Ids whose blob is present but whose read fails, the way a blob
+        /// sealed under a key this boot does not hold reads on the board.
+        note_read_fails: Vec<String>,
         budget: Option<usize>,
         /// Successful mutations, so the torture test can count a flow's
         /// writes without abusing the budget.
@@ -1521,6 +1570,7 @@ mod tests {
                 index: None,
                 notes: BTreeMap::new(),
                 index_read_fails: false,
+                note_read_fails: Vec::new(),
                 budget: None,
                 writes: 0,
             }
@@ -1555,6 +1605,9 @@ mod tests {
             Ok(())
         }
         fn load_note(&mut self, id: &str) -> Result<Option<Vec<u8>>, StorageError> {
+            if self.note_read_fails.iter().any(|f| f == id) {
+                return Err(StorageError);
+            }
             Ok(self.notes.get(id).cloned())
         }
         fn save_note(&mut self, id: &str, blob: &[u8]) -> Result<(), StorageError> {
@@ -2337,6 +2390,330 @@ mod tests {
         // The corrupt bytes were not erased — left for a firmware that
         // understands them.
         assert!(storage.notes.contains_key(&id_a));
+    }
+
+    /// Confirmed notes with distinct secrets, for the unreadable-id tests.
+    fn seed_confirmed(
+        store: &mut NoteStore,
+        storage: &mut FakeStorage,
+        rng: &mut dyn FnMut(&mut [u8]),
+        secrets: &[&str],
+    ) -> Vec<String> {
+        secrets
+            .iter()
+            .map(|byte| {
+                store
+                    .import_secret(storage, rng, &byte.repeat(SECRET_LEN), "m.example/w", 1, "", 1)
+                    .unwrap()
+                    .0
+            })
+            .collect()
+    }
+
+    /// Make `id`'s record a version this firmware does not know, as a newer
+    /// firmware's would be. Returns the original bytes and the altered ones.
+    fn from_the_future(storage: &mut FakeStorage, id: &str) -> (Vec<u8>, Vec<u8>) {
+        let original = storage.notes.get(id).unwrap().clone();
+        let mut newer = original.clone();
+        newer[4] = 99;
+        storage.notes.insert(id.to_string(), newer.clone());
+        (original, newer)
+    }
+
+    #[test]
+    fn an_unreadable_note_survives_a_creation() {
+        // Two notes this boot cannot read: a record format from a newer
+        // firmware, and a blob whose read fails (on the board, one sealed
+        // under a key this boot does not hold). Both must stay indexed when
+        // a creation rewrites the index, or the firmware that can read them
+        // never finds them again.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let ids = seed_confirmed(&mut store, &mut storage, &mut rng, &["a1", "b2", "c3"]);
+        let (newer, sealed, kept) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        let (original, altered) = from_the_future(&mut storage, &newer);
+        storage.note_read_fails.push(sealed.clone());
+        let sealed_bytes = storage.notes.get(&sealed).unwrap().clone();
+
+        let outcome = NoteStore::load(&mut storage, MAX_NOTES);
+        assert_eq!(outcome.skipped, vec![newer.clone(), sealed.clone()]);
+        let mut store = outcome.store;
+        assert_eq!(store.counts(), (1, 0));
+
+        // The same RNG stream throughout, so no new id repeats an old one.
+        let (added, _) = store
+            .import_secret(&mut storage, &mut rng, &"d4".repeat(SECRET_LEN), "m.example/w", 1, "", 2)
+            .unwrap();
+        let (minted, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 3).unwrap();
+        let index = storage.index.clone().unwrap();
+        assert!(index.contains(&newer), "{index:?}");
+        assert!(index.contains(&sealed), "{index:?}");
+        assert!(index.contains(&kept) && index.contains(&added) && index.contains(&minted));
+        assert_eq!(storage.notes.get(&newer), Some(&altered));
+        assert_eq!(storage.notes.get(&sealed), Some(&sealed_bytes));
+
+        // The firmware, or the key, that reads them finds them again.
+        storage.notes.insert(newer.clone(), original);
+        storage.note_read_fails.clear();
+        let back = NoteStore::load(&mut storage, MAX_NOTES);
+        assert!(back.skipped.is_empty());
+        for id in [&newer, &sealed, &kept, &added, &minted] {
+            assert!(back.store.get_meta(id).is_some(), "{id} lost");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_note_survives_a_removal() {
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let ids = seed_confirmed(&mut store, &mut storage, &mut rng, &["a1", "b2", "c3", "d4"]);
+        let (newer, sealed, spent, kept) =
+            (ids[0].clone(), ids[1].clone(), ids[2].clone(), ids[3].clone());
+        store.mark_spent(&mut storage, &spent, 2).unwrap();
+        from_the_future(&mut storage, &newer);
+        storage.note_read_fails.push(sealed.clone());
+
+        let mut store = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert_eq!(store.counts(), (2, 0));
+
+        // A delete rewrites the index...
+        store.delete(&mut storage, &spent).unwrap();
+        let index = storage.index.clone().unwrap();
+        assert!(index.contains(&newer) && index.contains(&sealed), "{index:?}");
+        assert!(!index.contains(&spent));
+        // ...and so does a discard of a pending note.
+        let (pending, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 3).unwrap();
+        store.discard(&mut storage, &pending).unwrap();
+        let index = storage.index.clone().unwrap();
+        assert!(index.contains(&newer) && index.contains(&sealed), "{index:?}");
+        assert!(index.contains(&kept) && !index.contains(&pending));
+
+        // The store cannot remove what it cannot read.
+        assert_eq!(store.delete(&mut storage, &newer).err(), Some(NoteError::NotFound));
+        assert_eq!(store.discard(&mut storage, &sealed).err(), Some(NoteError::NotFound));
+        assert!(storage.notes.contains_key(&newer) && storage.notes.contains_key(&sealed));
+    }
+
+    #[test]
+    fn an_unreadable_note_counts_against_the_cap() {
+        // The index holds at most `cap` ids, the unreadable ones among them:
+        // a note this boot cannot read still occupies its slot.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = NoteStore::load(&mut storage, 3).store;
+        let ids = seed_confirmed(&mut store, &mut storage, &mut rng, &["a1", "b2", "c3"]);
+        let (newer, live, spent) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        store.mark_spent(&mut storage, &spent, 2).unwrap();
+        let (_, altered) = from_the_future(&mut storage, &newer);
+
+        let mut store = NoteStore::load(&mut storage, 3).store;
+        assert_eq!(store.counts(), (2, 0));
+        // Full, but the spent record can give way.
+        assert!(store.has_room_for_received(true));
+        let (added, _) = store
+            .import_secret(&mut storage, &mut rng, &"d4".repeat(SECRET_LEN), "m.example/w", 1, "", 4)
+            .unwrap();
+        // The spent record went, never the unreadable note.
+        let index = storage.index.clone().unwrap();
+        assert!(!index.contains(&spent), "{index:?}");
+        assert!(index.contains(&newer) && index.contains(&live) && index.contains(&added));
+        assert_eq!(index.len(), 3);
+
+        // Now nothing can give way.
+        assert!(!store.has_room_for_received(true));
+        assert_eq!(
+            test_new_secret_pair(&mut store, &mut storage, &mut rng, &[], "", 5).err(),
+            Some(NoteError::StorageFull)
+        );
+        assert_eq!(
+            store
+                .import_secret(&mut storage, &mut rng, &"e5".repeat(SECRET_LEN), "m.example/w", 1, "", 5)
+                .err(),
+            Some(NoteError::StorageFull)
+        );
+        assert_eq!(
+            test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 5).err(),
+            Some(NoteError::StorageFull)
+        );
+        assert_eq!(storage.index.clone().unwrap().len(), 3);
+        assert_eq!(storage.notes.get(&newer), Some(&altered));
+    }
+
+    #[test]
+    fn an_unreadable_note_never_lends_its_id() {
+        // Reusing the id would write the new note's blob over the one this
+        // boot cannot read: someone's money, destroyed by a creation.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let ids = seed_confirmed(&mut store, &mut storage, &mut rng, &["a1", "b2"]);
+        let (newer, sealed) = (ids[0].clone(), ids[1].clone());
+        let (_, altered) = from_the_future(&mut storage, &newer);
+        storage.note_read_fails.push(sealed.clone());
+        let sealed_bytes = storage.notes.get(&sealed).unwrap().clone();
+        let mut store = NoteStore::load(&mut storage, MAX_NOTES).store;
+
+        // Every id draw offers the two taken ids first, then a free one.
+        let taken = [hex_decode(&newer).unwrap(), hex_decode(&sealed).unwrap()];
+        let free: [&[u8]; 2] = [&[0x0f, 0x0e, 0x0d, 0x0c], &[0x0b, 0x0a, 0x09, 0x08]];
+        let mut draws = 0usize;
+        let mut other = 0u8;
+        let mut rigged = |buf: &mut [u8]| {
+            if buf.len() == ID_LEN / 2 {
+                let round = draws / 3;
+                match draws % 3 {
+                    0 => buf.copy_from_slice(&taken[0]),
+                    1 => buf.copy_from_slice(&taken[1]),
+                    _ => buf.copy_from_slice(free[round]),
+                }
+                draws += 1;
+            } else {
+                other = other.wrapping_add(1);
+                buf.fill(other);
+            }
+        };
+        let (imported, _) = store
+            .import_secret(&mut storage, &mut rigged, &"c3".repeat(SECRET_LEN), "m.example/w", 1, "", 2)
+            .unwrap();
+        assert_eq!(imported, "0f0e0d0c");
+        let (minted, _) = test_new_secret(&mut store, &mut storage, &mut rigged, &[], "", 3).unwrap();
+        assert_eq!(minted, "0b0a0908");
+
+        assert_eq!(storage.notes.get(&newer), Some(&altered));
+        assert_eq!(storage.notes.get(&sealed), Some(&sealed_bytes));
+        let index = storage.index.clone().unwrap();
+        assert!(index.contains(&newer) && index.contains(&sealed), "{index:?}");
+    }
+
+    #[test]
+    fn an_absent_blob_frees_its_id_and_its_slot() {
+        // An indexed id with no blob behind it has nothing to orphan: the
+        // next rewrite drops it and it takes no slot.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = NoteStore::load(&mut storage, 2).store;
+        let ids = seed_confirmed(&mut store, &mut storage, &mut rng, &["a1", "b2"]);
+        let (absent, kept) = (ids[0].clone(), ids[1].clone());
+        storage.notes.remove(&absent);
+
+        let outcome = NoteStore::load(&mut storage, 2);
+        assert_eq!(outcome.skipped, vec![absent.clone()]);
+        let mut store = outcome.store;
+        let (added, _) = store
+            .import_secret(&mut storage, &mut rng, &"c3".repeat(SECRET_LEN), "m.example/w", 1, "", 2)
+            .unwrap();
+        assert_eq!(storage.index.clone().unwrap(), vec![kept, added]);
+    }
+
+    #[test]
+    fn the_unreadable_count_is_every_slot_the_notes_cannot_show() {
+        // What a host is told about the notes it cannot see: the ones whose
+        // blob is on flash and would not read, never an absent one, through
+        // every rewrite, until a boot that can read them.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        assert_eq!(store.unreadable_count(), 0);
+        let ids = seed_confirmed(&mut store, &mut storage, &mut rng, &["a1", "b2", "c3", "d4"]);
+        let (newer, sealed, absent) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        let (original, _) = from_the_future(&mut storage, &newer);
+        storage.note_read_fails.push(sealed.clone());
+        storage.notes.remove(&absent);
+
+        let mut store = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert_eq!(store.counts(), (1, 0));
+        assert_eq!(store.unreadable_count(), 2);
+
+        let (pending, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 2).unwrap();
+        assert_eq!(store.unreadable_count(), 2);
+        store.discard(&mut storage, &pending).unwrap();
+        assert_eq!(store.unreadable_count(), 2);
+        // Every indexed id is a note shown or a note counted here.
+        let index = storage.index.clone().unwrap();
+        assert_eq!(index.len(), store.counts().0 + store.unreadable_count());
+
+        storage.notes.insert(newer, original);
+        storage.note_read_fails.clear();
+        let back = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert_eq!(back.unreadable_count(), 0);
+        assert_eq!(back.counts(), (3, 0));
+    }
+
+    #[test]
+    fn an_unindexed_store_counts_nothing_unreadable() {
+        // The fail-closed store knows nothing; the count says nothing rather
+        // than a guess. Callers read index_known for that case.
+        let mut storage = FakeStorage::new();
+        storage.index_read_fails = true;
+        let store = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert!(!store.index_known());
+        assert_eq!(store.unreadable_count(), 0);
+        assert_eq!(NoteStore::storage_unavailable(MAX_NOTES).unreadable_count(), 0);
+    }
+
+    /// A full locker: `MAX_NOTES` confirmed notes with distinct secrets.
+    fn seed_full(
+        store: &mut NoteStore,
+        storage: &mut FakeStorage,
+        rng: &mut dyn FnMut(&mut [u8]),
+    ) -> Vec<String> {
+        let bytes: Vec<String> = (0..MAX_NOTES).map(|i| format!("{:02x}", 0x10 + i)).collect();
+        let secrets: Vec<&str> = bytes.iter().map(String::as_str).collect();
+        seed_confirmed(store, storage, rng, &secrets)
+    }
+
+    #[test]
+    fn a_pair_that_cannot_fit_evicts_nothing() {
+        // Eviction makes at most as much room as there are spent records. A
+        // request needing more is refused before any of them goes, or the
+        // receipt is destroyed for a refusal all the same. Cap 16: two notes
+        // this boot cannot read, thirteen confirmed, one spent, and a pair.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let ids = seed_full(&mut store, &mut storage, &mut rng);
+        let (newer, sealed, spent) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        store.mark_spent(&mut storage, &spent, 2).unwrap();
+        from_the_future(&mut storage, &newer);
+        storage.note_read_fails.push(sealed.clone());
+        let mut store = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert_eq!(store.counts(), (MAX_NOTES - 2, 0));
+
+        assert_eq!(
+            test_new_secret_pair(&mut store, &mut storage, &mut rng, &[], "", 3).err(),
+            Some(NoteError::StorageFull)
+        );
+        assert!(store.get_meta(&spent).is_some(), "the spent record went for nothing");
+        let index = storage.index.clone().unwrap();
+        assert!(index.contains(&spent), "{index:?}");
+        assert_eq!(index.len(), MAX_NOTES);
+        assert!(storage.notes.contains_key(&spent));
+
+        // One slot can still be made, and then the spent record gives way.
+        let (single, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 4).unwrap();
+        assert!(store.get_meta(&spent).is_none());
+        assert!(store.get_meta(&single).is_some());
+    }
+
+    #[test]
+    fn a_pair_that_cannot_fit_keeps_the_spent_record_without_unreadable_notes() {
+        // The same refusal with every note readable: fifteen confirmed, one
+        // spent, and a pair needs two slots where one can be made.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let ids = seed_full(&mut store, &mut storage, &mut rng);
+        let spent = ids[0].clone();
+        store.mark_spent(&mut storage, &spent, 2).unwrap();
+
+        assert_eq!(
+            test_new_secret_pair(&mut store, &mut storage, &mut rng, &[], "", 3).err(),
+            Some(NoteError::StorageFull)
+        );
+        assert!(store.get_meta(&spent).is_some(), "the spent record went for nothing");
+        assert_eq!(storage.index.clone().unwrap().len(), MAX_NOTES);
     }
 
     #[test]

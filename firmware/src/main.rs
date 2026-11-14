@@ -1520,15 +1520,19 @@ fn main() {
 
             // 0x25 — set/change/clear boot PIN (encrypts/decrypts the seeds)
             FRAME_TYPE_SET_PIN => {
-                let changed = pin::handle_set_pin(
+                // Removing the PIN while a note cannot be read would forget
+                // the key it may be sealed under: refused before the card,
+                // so the seeds do not change either.
+                if frame.payload.is_empty() && notes::at_rest_must_stay() {
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, notes::AT_REST_MUST_STAY);
+                } else if pin::handle_set_pin(
                     &mut usb,
                     &frame.payload,
                     &mut nvs,
                     &loaded_masters,
                     &mut display,
                     &buttons,
-                );
-                if changed {
+                ) {
                     if frame.payload.is_empty() {
                         notes::disable_sealing();
                     } else {
@@ -1542,7 +1546,14 @@ fn main() {
 
             // 0x62 — set/clear the host-held vault key (re-wraps the seeds)
             FRAME_TYPE_VAULT_SET => {
-                let changed = pin::handle_vault_set(
+                // As SET_PIN above. An unauthenticated bridge still hears
+                // "bridge auth required" first, from the handler.
+                if frame.payload.is_empty()
+                    && policy_engine.bridge_authenticated
+                    && notes::at_rest_must_stay()
+                {
+                    protocol::write_frame(&mut usb, FRAME_TYPE_NACK, notes::AT_REST_MUST_STAY);
+                } else if pin::handle_vault_set(
                     &mut usb,
                     &frame.payload,
                     &mut nvs,
@@ -1550,8 +1561,7 @@ fn main() {
                     policy_engine.bridge_authenticated,
                     &mut display,
                     &buttons,
-                );
-                if changed {
+                ) {
                     if frame.payload.is_empty() {
                         notes::disable_sealing();
                     } else {

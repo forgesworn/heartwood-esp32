@@ -252,8 +252,10 @@ const RELAY_HEALTH_MIN_BLOCK: usize = 16_384;
 const RELAY_HEAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Whether the free heap can safely transport a response of `len` bytes.
 ///
-/// The owned encryption and direct WebSocket writers now reuse the plaintext
-/// allocation and keep at most one output-sized allocation beside it. Require
+/// Owned encryption pads and encrypts the plaintext in its own allocation and
+/// base64-encodes it into one output-sized allocation beside it; the
+/// WebSocket writer then streams the event through a 512-byte buffer
+/// (`ws_send_framed`) rather than copying it into a whole frame. Require
 /// one contiguous block large enough for the exact NIP-44 output plus envelope
 /// overhead, and enough total free heap for that allocation plus runtime
 /// working room. A genuinely starved or fragmented heap still degrades to a
@@ -2598,6 +2600,10 @@ fn connect_secondary(url: &str, ctx: &mut SignCtx) -> Result<RelaySession, Strin
         })
 }
 
+/// Relay sessions opened since boot (every dial that returns `Ok`), reported by
+/// `get_status` as `relay_connects` to correlate heap drift with reconnects.
+static RELAY_CONNECTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Sentinel error: the relay socket could not be given a recv timeout and the
 /// caller required one (see [`connect_relay_raw`]).
 const RECV_TIMEOUT_REQUIRED: &str = "recv-timeout required";
@@ -2678,6 +2684,7 @@ fn connect_relay_raw(
     }
 
     let now = Instant::now();
+    RELAY_CONNECTS.fetch_add(1, Ordering::Relaxed);
     Ok(RelaySession {
         tls,
         url: url.to_string(),
@@ -11366,7 +11373,7 @@ fn dispatch_mgmt(
             // loop is actually running (same list `relays_at_boot` compared
             // against), and no extra heap parse per poll.
             let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
-            Ok(serde_json::json!({
+            let mut status = serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,
                 "mode": "wifi-standalone",
@@ -11425,7 +11432,12 @@ fn dispatch_mgmt(
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),
                 "board": crate::board::BOARD,
-            }))
+            });
+            // Heap-fall diagnostics, inserted after the literal: inside the
+            // `json!` they cost about 1.1 KB more app image than here.
+            status["min_free_heap"] = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() }.into();
+            status["relay_connects"] = RELAY_CONNECTS.load(Ordering::Relaxed).into();
+            Ok(status)
         }
 
         // C4 verdict (schema §1.4). Every case resolves cleanly: an unknown
@@ -11874,9 +11886,9 @@ fn flush_held_replies(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
     }
 }
 
-/// Serialise and mask an EVENT command in one allocation. The generic
-/// `ws_send` path first builds a JSON String and then copies it into a masked
-/// frame; for a large NIP-46 response that second full copy is avoidable.
+/// Serialise and mask an EVENT command onto the socket. The generic `ws_send`
+/// path first builds a JSON String and then copies it into a masked frame;
+/// for a large NIP-46 response neither copy is needed.
 fn ws_send_event(tls: &mut Tls, event: &SignedEvent) -> Result<usize, String> {
     ws_send_framed(tls, "EVENT", event)
 }
@@ -11889,48 +11901,31 @@ fn ws_send_auth(tls: &mut Tls, event: &SignedEvent) -> Result<usize, String> {
     ws_send_framed(tls, "AUTH", event)
 }
 
-/// Serialise and mask one command frame in one allocation.
+/// Serialise and mask one command frame straight onto the socket.
+///
+/// The frame goes out a 512-byte piece at a time (`heartwood_common::ws_frame`)
+/// instead of as one masked copy. For a sealed reply that copy was a second
+/// allocation the size of the ciphertext, beside the one the event already
+/// holds, and on a fragmented no-PSRAM heap it aborted the allocator after
+/// `response_transportable` had passed the reply: a T-Display panic asking
+/// for 14,526 B under "relay envelope kind 24134". A send that fails part-way
+/// leaves a partial frame on the socket, as a failed whole-frame write could,
+/// so the session is not usable after an `Err`.
 fn ws_send_framed(tls: &mut Tls, command: &'static str, event: &SignedEvent) -> Result<usize, String> {
-    const MAX_HEADER_LEN: usize = 14;
-    let mut frame = Vec::with_capacity(
-        MAX_HEADER_LEN
-            .saturating_add(event.content.len())
-            .saturating_add(768),
-    );
-    frame.resize(MAX_HEADER_LEN, 0);
-    serde_json::to_writer(&mut frame, &(command, event))
-        .map_err(|e| format!("serialise: {e}"))?;
+    use heartwood_common::ws_frame::{event_payload_len, write_event_frame, CHUNK_LEN};
 
-    let payload_len = frame.len() - MAX_HEADER_LEN;
-    let header_len = if payload_len < 126 {
-        6
-    } else if payload_len < 65_536 {
-        8
-    } else {
-        14
-    };
-    frame.copy_within(MAX_HEADER_LEN.., header_len);
-    frame.truncate(header_len + payload_len);
-
-    frame[0] = 0x80 | OP_TEXT;
-    let mask_offset = header_len - 4;
-    if payload_len < 126 {
-        frame[1] = 0x80 | payload_len as u8;
-    } else if payload_len < 65_536 {
-        frame[1] = 0x80 | 126;
-        frame[2..4].copy_from_slice(&(payload_len as u16).to_be_bytes());
-    } else {
-        frame[1] = 0x80 | 127;
-        frame[2..10].copy_from_slice(&(payload_len as u64).to_be_bytes());
-    }
-    let mask = esp_random().to_le_bytes();
-    frame[mask_offset..header_len].copy_from_slice(&mask);
-    for (index, byte) in frame[header_len..].iter_mut().enumerate() {
-        *byte ^= mask[index & 3];
-    }
-
+    let payload_len = event_payload_len(command, event).map_err(|e| format!("serialise: {e}"))?;
     crate::crash_crumb::set(&format!("relay websocket kind {} {}B", event.kind, payload_len));
-    tls.write_all(&frame).map_err(|e| format!("ws send: {e:?}"))?;
+    let mut piece = Vec::new();
+    piece
+        .try_reserve_exact(CHUNK_LEN)
+        .map_err(|_| "ws send: no memory for the frame buffer".to_string())?;
+    piece.resize(CHUNK_LEN, 0);
+    let mask = esp_random().to_le_bytes();
+    write_event_frame(command, event, payload_len, mask, &mut piece, |bytes| {
+        tls.write_all(bytes)
+    })
+    .map_err(|e| format!("ws send: {e:?}"))?;
     Ok(payload_len)
 }
 

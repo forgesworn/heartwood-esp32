@@ -3559,7 +3559,7 @@ partition table, see the V4 notes); the stored notes must survive it.
    Time the relay loop through the batch; if it stalls noticeably, cache each
    mint's share public keys in RAM before release.
 
-## 40. Crash detail, and list_clients in one buffer (added 2026-11-13; items 1, 6 and 7 run in part 2026-11-13 on a T-Display)
+## 40. Crash detail, and list_clients in one buffer (added 2026-11-13; items 1, 6 and 7 run in part 2026-11-13, item 3 on 2026-11-14, on a T-Display)
 
 Why: a T-Display on 0.18.0-beta.34 reset with `last_reset` `panic` and
 `crashed_during` "relay mgmt list_clients", and recorded nothing more. The
@@ -3630,3 +3630,117 @@ looked at.
   refresh failed: client list too large for one reply (…)", but over USB any
   0x42 NACK shows as "Slot list read denied", dropping the reason ("slot list
   too large", "low memory"). A Sapwood follow-up.
+
+**Run 2026-11-13, the v0.18.0-beta.35 release image, on the same T-Display.**
+beta.35 is #279 (the `d02223c` build above) plus #280, which makes a mutation
+whose reply does not fit the heap say the change was applied. The draft
+prerelease's `app-tdisplay.bin` (SHA-256 `f2566e6c…`; `image-info` reports
+0.18.0-beta.35 with a valid hash), its ed25519 signature checked locally
+against `firmware/ota-release-pubkey.hex` for board `tdisplay`. Before the
+write, the partition table read back byte-equal to the release's
+`partition-table-tdisplay.bin`, and `verify-flash` confirmed the installed app
+was the `d02223c` build, the rollback image. Written app-only at 0x10000 at
+115,200 baud; esptool's hash check passed. Checked against the release gates
+at the end of `docs/dev-state-recovery.md`, by USB frames and by
+`scripts/mgmt-request.mjs` over its own gated relay; Sapwood's screens were
+not looked at.
+- Retained state: 56 minutes after the flash, FIRMWARE_INFO reported
+  0.18.0-beta.35, `at_rest` `none` (so the gates' unlock steps do not apply)
+  and NVS 542 of 756 entries used. It read 544 at the `d02223c` flash, and no
+  reading in between places the change. One master with 5 apps, as before; the
+  USB slot list was 7,914 bytes with every `secret` empty. The note count was
+  not read: a WiFi-standalone board NACKs NOTE_CMD and relay management has no
+  note method, so it needs the switch to USB mode.
+- Reboot: a chip reset through esptool's RTS line at 11:54:39Z, with no
+  write; not a cable unplug. At 12 s up: `last_reset` `power-on`, no
+  `crash_detail` key (item 1 again), NVS 542, the same master and apps, the
+  same 7,914-byte slot list; free heap 107,176, largest block 106,496. The
+  first relay `get_status` timed out while WiFi came up; the retry answered at
+  103 s with beta.35 and `crash_detail` `null`, and `list_clients` returned all
+  five apps.
+- Heap, item 7's question over a longer span: relay `get_status` once a minute
+  for an hour. 60 of 60 answered; uptime went from 1,026 s to 4,390 s with no
+  reset, `crash_detail` `null` throughout. Free heap was 74,428 at 103 s and
+  54,224 at 1,026 s, then fell steadily to 52,176 at the end, about 35 bytes a
+  round (2 KB an hour); the lowest was 51,552. The largest block was 43,008,
+  then 40,960 from 28 minutes in. That is below the `d02223c` run (about
+  63,300 settled, under heavier polling) and beta.34 before the flash (62,432
+  after seven hours up), and it had not levelled off within the hour. Whether
+  the fall comes with each request or is state filling to a bound is not
+  known; the 32-entry sign audit ring records signing requests, not these
+  reads. A reading some hours on would tell.
+- Heap, some hours on: one more relay `get_status` at 20:00:02Z, 6.87 hours
+  after the hour's last round, with nothing from this test polling the board
+  in between. Uptime 29,122 s, `last_reset` `power-on`, `crash_detail` `null`.
+  Free heap was 47,196, down 4,980 (about 725 bytes an hour, a third of the
+  rate while polled), and the largest block 34,816, down 6,144. The fall goes
+  on without these reads, more slowly, and the largest block is shrinking
+  faster than free heap. One client the board does not authorise was sending
+  it a request every 30 seconds throughout, logged as refused from 13:30Z on.
+  The same client had been failing at that rate, its error printed blank,
+  since before the beta.34 boot above, so it ran through the `d02223c` run
+  too. Whether that traffic or time-based work accounts for the fall is not
+  yet known.
+- Not run: items 2 to 5, as before; item 8's reply was not seen.
+- Settlement: the small-value mint-confirm-export-melt-spent round trip was not
+  run; the owner set it aside.
+- The Sapwood follow-up above is done: Sapwood shows why a 0x42 read was
+  refused (sapwood#192).
+
+**Overnight 2026-11-13 to 14, and a crash, on the same T-Display on beta.35.**
+Relay `get_status` every 30 minutes from 20:15Z, by `scripts/mgmt-request.mjs`
+with the device operator key.
+- A new pairing was made between 20:46Z and 21:49Z: a slot for the client the
+  board had been refusing (run above). NVS went from 543 to 567 entries across
+  it, and 569 by 22:19Z. That client's own log, which has no timestamps,
+  shows the same NIP-46 `connect` refused as "unauthorised" every 30 seconds
+  from its 13:30Z restart, 879 attempts, then a restart onto the new slot and
+  a successful connect. 879 attempts 30 s or more apart end at 20:50Z or
+  later, and its process started at 21:05:48Z, inside that window. After it
+  connected, five of its relay sign-in requests through the board timed out;
+  the log was last written at 08:12Z.
+- From 21:49Z to 07:53Z, 20 of 21 rounds answered (06:23Z timed out). Free
+  heap held at about 45,000: between 44,288 and 45,376, apart from 43,028 at
+  01:50Z and 41,520 at 07:23Z, each back by the next round. The largest block
+  was 32,768 in most rounds (34,816 in two early ones, 31,744 and 30,720 at the
+  two dips). No reset, `crash_detail` `null`, uptime 71,927 s at the last
+  round. The evening's fall did not go on overnight, with the refused
+  client gone.
+- Item 3, run: at about 08:09:35Z (uptime 834 s at 08:23:29Z) the board reset
+  with `last_reset` `panic`, `crashed_during` "relay envelope kind 24134" and
+  `crash_detail` `{"cause": "alloc-failed", "alloc_failed_bytes": 14526,
+  "alloc_failed_caps": 6144, "alloc_failures": 1, "panic_site": null}`. Three
+  seconds earlier a relay `list_clients` had been sent with the operator key;
+  it timed out. After the new pairing the reply's plaintext had grown into
+  NIP-44's 8,193 to 10,240 B padding band, a 13,744-byte ciphertext, and
+  `ws_send_framed` then asked for one frame of 14 + 13,744 + 768 = 14,526
+  bytes while the event still held the ciphertext. `response_transportable`
+  allows for one allocation that size, not two. Item 6's five-app reply (about
+  7.8 KB) was in the band below and went out. #286 streams the frame through a
+  512-byte buffer instead (run below).
+- After the reset: free heap 66,256, largest block 65,536, and NVS 603 entries,
+  up from 569. The crash record is kept in RTC memory, so this run does not
+  account for the rise.
+- Refused-connect soak, run 09:19Z to 10:49Z on the same boot: an unpaired
+  client key sent a NIP-46 `connect` with a wrong secret every 3 seconds, the
+  same request and "unauthorised" reply as the client refused overnight. 1,799
+  sent, every one answered, no reconnect, no reset. Relay `get_status` every
+  10 minutes: free heap 46,876 at the start and between 46,672 and 46,852 in
+  eight of the nine rounds after; 44,912 at 80 minutes, back to 46,676 by the
+  next. Largest block 34,816 throughout (36,864 at the start). Twice the
+  overnight client's refusals in 90 minutes, with no fall, so refused
+  `connect`s are unlikely to explain the evening's drop. Stopped at 90 of a
+  planned 120 minutes once the dip had recovered.
+- #286, run: CI's `app-tdisplay` artifact from `0e3d511` (app.bin SHA-256
+  `c0a2068a…`) written app-only at 0x10000 at 11:02Z, replacing the signed
+  beta.35 release image, which `verify-flash` matched first and which is the
+  rollback. The version string is unchanged (0.18.0-beta.35). After the
+  power-on reset: no `crash_detail`, and NVS 569 entries, the figure before
+  the panic. At 1,046 s up, free heap 68,816 and largest block 59,392; one
+  relay `list_clients` then listed six apps, an estimated 8,680 B of
+  plaintext and so a 13,744-byte ciphertext, the size that panicked (worked
+  from the decrypted reply, not measured on the wire). No reset; 68,660
+  and 59,392 after, 68,748 five minutes on. With that much heap the old
+  whole-frame build might have passed too, so this shows the streamed frame
+  arriving intact; that the second content-sized allocation is gone rests on
+  `common/tests/ws_frame_memory.rs`.

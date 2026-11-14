@@ -3751,7 +3751,7 @@ with the device operator key.
   arriving intact; that the second content-sized allocation is gone rests on
   `common/tests/ws_frame_memory.rs`.
 
-## 41. Thin LTO in the release profile (added 2026-11-14, NOT YET BENCH-RUN)
+## 44. Thin LTO in the release profile (added 2026-11-14, NOT YET BENCH-RUN)
 
 Why: the Heltec images sat about 9-13 KB under their 2 MiB app slot, and
 `lto = "thin"` buys lasting room there (figures in `firmware/Cargo.toml`'s

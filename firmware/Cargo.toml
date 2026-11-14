@@ -117,7 +117,7 @@ embuild = "0.33"
 # gives smaller images, so its figures will differ. LTO once broke the
 # secp256k1-sys C build; -mlongcalls in .cargo/config.toml is what lets it link.
 # Cross-crate inlining deepens Rust task stacks and shifts timing, so it ships
-# only after the bench pass in docs/HARDWARE-TEST-CHECKLIST.md section 41, read
+# only after the bench pass in docs/HARDWARE-TEST-CHECKLIST.md section 44, read
 # from get_status's `stack_free`. `lto = "fat"` (about 135 KB on the Heltec
 # image, measured on esp 1.87.0.0 before thin was on) is the next lever if the
 # slot fills again, and needs the same bench pass; std's backtrace (see

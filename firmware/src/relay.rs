@@ -4512,7 +4512,10 @@ fn poll_usb_frame(
         // copy of the card's own bundle (the same client, identity, inner id
         // and params) is not a second bundle: it is NACKed and the card
         // stays (review round 3, S2). With the screen busy, anything else is still refused "approval on
-        // screen", only now after the decrypt that tells the two apart.
+        // screen", only now after the decrypt that tells the two apart. A
+        // site-link request is NACKed too (`site_link::cable_nacks`): the
+        // board answers it on the relay, and a cable reply would be
+        // published as its answer.
         FRAME_TYPE_ENCRYPTED_REQUEST => {
             let waiting = full_access_waiting(ctx);
             let busy = cable_card_refused(ctx);
@@ -4549,6 +4552,7 @@ fn poll_usb_frame(
                         ctx.nvs,
                         busy,
                         &is_copy,
+                        true,
                     )
                 });
                 if raced {
@@ -6464,7 +6468,7 @@ fn queue_button_ask(
     let weight = match (&ask.event, &ask.card) {
         (Some(event), _) => event.content.len() + 256,
         (None, crate::nip46_handler::AskCard::SiteLink { .. }) => {
-            serde_json::to_string(&ask.request.params).map_or(CARD_BYTE_BUDGET, |p| p.len()) + 256
+            heartwood_common::site_link::ask_weight(&ask.request.params)
         }
         _ => 256,
     };
@@ -6975,30 +6979,32 @@ fn tick_button_card(ctx: &mut SignCtx) -> CardTick {
 /// out in the queue without ever reaching it, which draws nothing, or a
 /// FULL ACCESS card the one-card rule closed there, whose refusal draws
 /// over the card on screen (review round 3, S1).
-fn resolve_button_card(
+/// Take a closing card out of the queue, with what its close sets off before
+/// anything else can happen: a LINK card (site links design 4.4) cools its
+/// phone unless it was held ([`heartwood_common::site_link::LinkClose`]),
+/// and a FULL ACCESS card, whatever the outcome, starts the minute in which
+/// no other may be raised (review round W3). The LINK card's close is
+/// returned; its hold makes the slot in `site_link::complete`, and its reply
+/// goes the way every card's does.
+fn take_closed_card(
     ctx: &mut SignCtx,
-    sessions: &mut [RelaySession],
     index: usize,
     outcome: &CardTick,
-) {
+) -> Option<(ButtonCard, Option<heartwood_common::site_link::LinkClose>)> {
+    use heartwood_common::site_link::LinkClose;
     if index >= ctx.button_cards.len() {
-        return;
+        return None;
     }
     let card = ctx.button_cards.remove(index);
-    let full_access_unopened = is_full_access_card(&card) && card.opened_at.is_none();
-    // A LINK card (site links design 4.4): its hold makes the slot in
-    // `site_link::complete`; anything else that closes it (a decline, a
-    // timeout, a second ask refusing both) starts the phone's cooldown, here
-    // before any early return. Its reply goes the way every card's does.
-    let link = card
-        .asks
-        .first()
-        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::SiteLink { .. }));
-    if link {
-        site_link::card_closed(&card.key.client_hex, matches!(outcome, CardTick::Approved));
+    let link = site_link::is_link_card(&card).then(|| match outcome {
+        CardTick::Approved => LinkClose::Held,
+        CardTick::Denied => LinkClose::Declined,
+        CardTick::Refused((_, message)) => LinkClose::refused(message),
+        CardTick::Expired | CardTick::Pending => LinkClose::TimedOut,
+    });
+    if let Some(close) = link {
+        site_link::card_closed(&card.key.client_hex, close);
     }
-    // Whatever the outcome, a FULL ACCESS card closing starts the minute in
-    // which no other may be raised (review round W3).
     if is_full_access_card(&card) {
         crate::nip46_handler::full_access_closed(card.asks.first().map(|a| {
             heartwood_common::owner_pairing::BundleKey {
@@ -7009,6 +7015,19 @@ fn resolve_button_card(
             }
         }));
     }
+    Some((card, link))
+}
+
+fn resolve_button_card(
+    ctx: &mut SignCtx,
+    sessions: &mut [RelaySession],
+    index: usize,
+    outcome: &CardTick,
+) {
+    let Some((card, link)) = take_closed_card(ctx, index, outcome) else {
+        return;
+    };
+    let full_access_unopened = is_full_access_card(&card) && card.opened_at.is_none();
     if index == 0 {
         // Whatever the button did to decide this card is spent: the edge
         // that started the hold, and the hold itself if it is still going.
@@ -7034,13 +7053,20 @@ fn resolve_button_card(
         resolve_phone_enrol_card(ctx, sessions, card, outcome, index == 0);
         return;
     }
+    // A LINK card closed unanswered says why in its own words.
+    let blocked = link.and_then(|close| close.blocked());
     match outcome {
         // A FULL ACCESS card closed by a second bundle: the owner sees it
         // refused, not merely gone, whether or not it had reached the screen
         // (review round 3, S1). Its close restarts the minute, so a racer
         // could otherwise keep pairing blocked with nothing on the board.
-        // A LINK card a second link ask closed says so in its own words.
-        CardTick::Refused(_) if link => show_card_blocked(ctx, "Link blocked"),
+        // A LINK card a second link ask or the slot tables closed says so
+        // in its own words.
+        CardTick::Refused(_) if blocked.is_some() => {
+            if let Some((title, why)) = blocked {
+                show_card_blocked(ctx, title, why);
+            }
+        }
         CardTick::Refused(_) => show_full_access_blocked(ctx),
         // Closed without ever reaching the screen for any other reason (it
         // expired in the queue): its close restarts the minute just the
@@ -7116,7 +7142,7 @@ fn resolve_button_card(
         };
 
         let mut response_json = match outcome {
-            CardTick::Approved if link => site_link::complete(ctx, &ask.ask, slot, &card.key.client_hex),
+            CardTick::Approved if link.is_some() => site_link::complete(ctx, &ask.ask, slot, &card.key.client_hex),
             CardTick::Approved => {
                 match crate::nip46_handler::dispatch(
                     ask.ask.request,
@@ -8129,9 +8155,11 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
         return;
     }
 
-    // A FULL ACCESS card a second bundle closed (review round W3) is
-    // answered with that refusal before anything else, so the owner can
-    // never approve it.
+    // A LINK card the slot tables overtook is refused while it waits.
+    site_link::refuse_stale(ctx);
+    // A FULL ACCESS card a second bundle closed (review round W3), or a LINK
+    // card a second ask or the slot tables closed, is answered with that
+    // refusal before anything else, so the owner can never approve it.
     if let Some(index) = ctx.button_cards.iter().position(|card| card.refused.is_some()) {
         if let Some(refusal) = ctx.button_cards[index].refused {
             log::warn!("[relay] card closed: {}", refusal.1);
@@ -8188,11 +8216,11 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
 /// that has just appeared does. Nothing holds the refusal beyond that: over a
 /// live card it stays up until that card's first pass after the minimum.
 fn show_full_access_blocked(ctx: &mut SignCtx) {
-    show_card_blocked(ctx, "Pairing blocked");
+    show_card_blocked(ctx, "Pairing blocked", "2nd request");
 }
 
-/// The same refusal for any card a second ask closed, under its own title.
-fn show_card_blocked(ctx: &mut SignCtx, title: &'static str) {
+/// The same refusal for any card closed unanswered, in its own words.
+fn show_card_blocked(ctx: &mut SignCtx, title: &'static str, why: &'static str) {
     if !ctx.display_on {
         crate::oled::wake_display(ctx.display);
         ctx.display_on = true;
@@ -8206,7 +8234,7 @@ fn show_card_blocked(ctx: &mut SignCtx, title: &'static str) {
         _ => false,
     };
     log::info!("[relay] {title} refusal drawn (over a card: {over_card})");
-    show_card_not_done(ctx, title, "2nd request");
+    show_card_not_done(ctx, title, why);
     ctx.refusal_shown_until = Some(Instant::now() + REFUSAL_MIN_SHOWN);
 }
 

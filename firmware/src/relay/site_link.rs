@@ -38,9 +38,10 @@ pub(crate) fn take_on_bind(master_slot: u8, slot_index: u8, secret: &str) -> Opt
     links().take_on_bind(master_slot, slot_index, secret, crate::uptime_ms())
 }
 
-/// A LINK card closed: anything but the hold cools its phone (design 4.4).
-pub(super) fn card_closed(client_hex: &str, held: bool) {
-    links().card_closed(client_hex, held, crate::uptime_ms());
+/// A LINK card closed: anything but the hold cools its phone (design 4.4,
+/// [`sl::LinkClose::cools`]).
+pub(super) fn card_closed(client_hex: &str, close: sl::LinkClose) {
+    links().card_closed(client_hex, close, crate::uptime_ms());
 }
 
 /// The named identity as the gate sees it, and the name its card shows. A
@@ -130,34 +131,35 @@ fn nvs_room(ctx: &SignCtx) -> Option<heartwood_common::nvs_room::NvsRoom> {
 }
 
 /// Rules 1 to 6, the retry, room (rule 7), the cooldown and the one-card
-/// rule (design 4.3 to 4.5), in that order; nothing is written.
+/// rule (design 4.3 to 4.5), in `sl::card_step`'s order; nothing is written.
 fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &str) -> Result<Step, Refusal> {
     let create = sl::parse_create(&request.params).map_err(refusal)?;
-    let waiting_link = |card: &&super::ButtonCard| {
-        card.asks.first().is_some_and(|a| matches!(a.ask.card, AskCard::SiteLink { .. }))
-    };
-    if ctx.button_cards.iter().filter(waiting_link).any(|card| {
-        card.key.client_hex == client_hex
-            && card.asks.iter().any(|a| a.ask.request.id == request.id && a.ask.request.params == request.params)
-    }) {
-        return Ok(Step::Ignore);
-    }
-    let card = match gate(ctx, &create, slot, client_hex, true)? {
-        (sl::Gate::Retry(made), ..) => return Ok(Step::Reply(retry_reply(ctx, &create, made))),
-        (sl::Gate::Plan(plan), label, from) => {
+    let held = ctx.button_cards.iter().filter(|card| is_link_card(card)).flat_map(|card| {
+        card.asks.iter().map(|a| sl::HeldLink {
+            client_hex: &card.key.client_hex,
+            id: &a.ask.request.id,
+            params: &a.ask.request.params,
+        })
+    });
+    let waiting = sl::against_waiting(held, client_hex, &request.id, &request.params);
+    let step = sl::card_step(waiting, || {
+        gate(ctx, &create, slot, client_hex, sl::Check::Card).map(|(verdict, label, from)| (verdict, (label, from)))
+    });
+    let card = match step.map_err(refusal)? {
+        sl::CardStep::Ignore => return Ok(Step::Ignore),
+        sl::CardStep::Retry(made) => return Ok(Step::Reply(retry_reply(ctx, &create, made))),
+        sl::CardStep::Show(plan, (label, from)) => {
             sl::link_card(&create.label, &label, plan.master_slot, slot, &plan.policy, from)
         }
+        // Both are refused: the waiting cards close on the next pass, their
+        // phones cooling as they do, and the asker cools now.
+        sl::CardStep::RefuseBoth => {
+            for card in ctx.button_cards.iter_mut().filter(|card| is_link_card(card)) {
+                card.refused = Some(refusal_pair(LinkError::AnotherLink));
+            }
+            return Err(refusal(links().another_link(client_hex, crate::uptime_ms())));
+        }
     };
-    // A second link ask while one waits refuses both and cools the asker;
-    // the waiting card's phone cools as its card closes (design 4.4).
-    let mut another = false;
-    for card in ctx.button_cards.iter_mut().filter(|card| waiting_link(&&**card)) {
-        card.refused = Some(refusal_pair(LinkError::AnotherLink));
-        another = true;
-    }
-    if another {
-        return Err(refusal(links().another_link(client_hex, crate::uptime_ms())));
-    }
     if !crate::entropy::rng_ok() {
         return Err((-1, crate::entropy::rng_refusal().into()));
     }
@@ -174,24 +176,41 @@ fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &
     }))
 }
 
-/// `common::site_link`'s gate against the tables as they are now, shared
-/// by the card (`card`: then the cooldown) and the hold: the verdict, the
-/// identity's card name and the asking slot's label.
+/// A LINK card the slot tables overtook (any slot-table write on any master
+/// moves the approval epoch) is refused `approval_changed` as soon as the
+/// loop sees it, queued or on screen, not only at the hold, so the owner is
+/// never asked to hold a card that can only be refused. Its phone does not
+/// cool ([`sl::LinkClose::cools`]): it is told to send the request again.
+pub(super) fn refuse_stale(ctx: &mut SignCtx) {
+    let engine = &*ctx.policy_engine;
+    for card in ctx.button_cards.iter_mut().filter(|card| card.refused.is_none() && is_link_card(card)) {
+        if card.asks.iter().any(|a| !engine.approval_is_current(a.ask.resume.authority_epoch)) {
+            card.refused = Some(refusal_pair(LinkError::ApprovalChanged));
+        }
+    }
+}
+
+/// Whether a card is a LINK card.
+pub(super) fn is_link_card(card: &super::ButtonCard) -> bool {
+    card.asks.first().is_some_and(|a| matches!(a.ask.card, AskCard::SiteLink { .. }))
+}
+
+/// `common::site_link::check` against the tables as they are now, shared
+/// by the card and the hold: the verdict, the identity's card name and the
+/// asking slot's label.
 fn gate<'c>(
     ctx: &'c SignCtx,
     create: &sl::CreateRequest,
     asking_master: u8,
     client_hex: &str,
-    card: bool,
-) -> Result<(sl::Gate<'c>, String, &'c str), Refusal> {
+    check: sl::Check,
+) -> Result<(sl::Gate<'c>, String, &'c str), LinkError> {
     let asking = ctx.policy_engine.find_slot_by_pubkey(asking_master, client_hex);
     let (found, label) = match served(ctx, &create.identity) {
         Some((found, label)) => (Some(found), label),
         None => (None, String::new()),
     };
-    let check = if card { sl::before_card } else { sl::gate };
-    let verdict =
-        check(asking, client_hex, found, create, &links(), crate::uptime_ms(), nvs_room(ctx)).map_err(refusal)?;
+    let verdict = sl::check(check, asking, client_hex, found, create, &links(), crate::uptime_ms(), nvs_room(ctx))?;
     Ok((verdict, label, asking.map_or("", |a| a.label.as_str())))
 }
 
@@ -252,10 +271,8 @@ fn make(
     client_hex: &str,
 ) -> Result<Value, Refusal> {
     // One epoch covers every master's table.
-    if !ctx.policy_engine.approval_is_current(epoch) {
-        return Err((-1, sl::APPROVAL_CHANGED.into()));
-    }
-    let plan = match gate(ctx, create, asking_master, client_hex, false)?.0 {
+    let check = sl::Check::Hold { epoch_current: ctx.policy_engine.approval_is_current(epoch) };
+    let plan = match gate(ctx, create, asking_master, client_hex, check).map_err(refusal)?.0 {
         sl::Gate::Retry(made) => return Ok(retry_reply(ctx, create, made)),
         sl::Gate::Plan(plan) => plan,
     };

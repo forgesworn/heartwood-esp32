@@ -95,6 +95,9 @@ pub fn handle_encrypted_request(
     // (review round 3, S2). The USB-bridged loop has no relay cards and
     // passes a check that never matches.
     is_waiting_copy: &dyn Fn(&str, &[u8; 32], &nip46::Nip46Request) -> bool,
+    // WiFi loop only: site links are answered on the relay, so a cable copy
+    // of one is NACKed (`site_link::cable_nacks`).
+    relay_loop: bool,
 ) {
     if frame.payload.len() < 73 {
         log::warn!("Encrypted request too short ({} bytes)", frame.payload.len());
@@ -234,6 +237,18 @@ pub fn handle_encrypted_request(
     // publishes nothing, so the phone hears only the card's real outcome
     // for this request id. A NIP-46 error here would be signed and
     // published as that outcome.
+    // A site-link request over the cable in the WiFi loop is heartwoodd
+    // bridging the request the board also hears on the relay, where its
+    // card is raised. Answered here, its `RelayOnly` refusal would be
+    // published and could reach the phone before the relay card is held; a
+    // NACK is logged and publishes nothing. The USB-bridged loop dispatches
+    // it, and answers `RelayOnly`.
+    if heartwood_common::site_link::cable_nacks(&request.method, relay_loop) {
+        log::info!("{} over the cable is answered on the relay; NACK", request.method);
+        protocol::write_frame(usb, FRAME_TYPE_NACK, b"site links are answered on the relay");
+        return;
+    }
+
     if is_waiting_copy(&hex_encode(&client_pubkey), &master_pubkey, &request) {
         log::info!("heartwood_approve_bundle {} over the cable is a copy of the bundle on its card; NACK", request.id);
         protocol::write_frame(usb, FRAME_TYPE_NACK, b"bundle already on screen");

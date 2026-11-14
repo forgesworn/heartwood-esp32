@@ -437,6 +437,174 @@ pub fn before_card<'a>(
     Ok(gate)
 }
 
+/// Which gate a create meets: the card's, or the hold's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    /// Before the card: [`before_card`].
+    Card,
+    /// At the hold (design 4.4): a slot-table write on any master since the
+    /// card (`epoch_current` false) answers `approval_changed` before
+    /// anything else; otherwise [`gate`] again, with no cooldown, against
+    /// the tables as they are now.
+    Hold { epoch_current: bool },
+}
+
+/// [`before_card`] or the hold's check, as `check` says.
+#[allow(clippy::too_many_arguments)]
+pub fn check<'a>(
+    check: Check,
+    asking: Option<&ConnectSlot>,
+    client_hex: &str,
+    served: Option<ServedIdentity<'a>>,
+    request: &CreateRequest,
+    ledger: &LinkLedger,
+    now_ms: u64,
+    nvs: Option<crate::nvs_room::NvsRoom>,
+) -> Result<Gate<'a>, LinkError> {
+    match check {
+        Check::Card => before_card(asking, client_hex, served, request, ledger, now_ms, nvs),
+        Check::Hold { epoch_current: false } => Err(LinkError::ApprovalChanged),
+        Check::Hold { epoch_current: true } => gate(asking, client_hex, served, request, ledger, now_ms, nvs),
+    }
+}
+
+/// A request a waiting LINK card holds (queued or on screen).
+#[derive(Debug, Clone, Copy)]
+pub struct HeldLink<'a> {
+    pub client_hex: &'a str,
+    pub id: &'a str,
+    pub params: &'a [Value],
+}
+
+/// A create set against the LINK cards already waiting (design 4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    /// No LINK card waits.
+    Nothing,
+    /// A copy of a waiting card's own request (the same client, id and
+    /// params, heard again): no reply, and the card stays.
+    Copy,
+    /// Some other LINK ask waits.
+    Another,
+}
+
+pub fn against_waiting<'h>(
+    held: impl IntoIterator<Item = HeldLink<'h>>,
+    client_hex: &str,
+    id: &str,
+    params: &[Value],
+) -> Waiting {
+    let mut another = false;
+    for h in held {
+        if h.client_hex == client_hex && h.id == id && h.params == params {
+            return Waiting::Copy;
+        }
+        another = true;
+    }
+    if another {
+        Waiting::Another
+    } else {
+        Waiting::Nothing
+    }
+}
+
+/// What a parsed create does before any card.
+#[derive(Debug)]
+pub enum CardStep<'a, T> {
+    /// A copy of the waiting card's request: nothing is answered.
+    Ignore,
+    /// The same link again: answered with [`create_reply`], no card.
+    Retry(&'a ConnectSlot),
+    /// A second link ask: every waiting LINK card closes refused
+    /// [`LinkError::AnotherLink`] and the asker hears
+    /// [`LinkLedger::another_link`].
+    RefuseBoth,
+    /// The card, with what the gate's caller needs to draw it.
+    Show(CreatePlan, T),
+}
+
+/// The order before the card (design 4.3 to 4.5): a copy of the waiting
+/// card's own request is ignored before anything else; then the card's
+/// [`check`] (`gate`), whose refusals and retry come before the one-card
+/// rule, so an ask that would be refused anyway closes no one's card;
+/// then, with a LINK card waiting, both are refused.
+pub fn card_step<'a, T>(
+    waiting: Waiting,
+    gate: impl FnOnce() -> Result<(Gate<'a>, T), LinkError>,
+) -> Result<CardStep<'a, T>, LinkError> {
+    if waiting == Waiting::Copy {
+        return Ok(CardStep::Ignore);
+    }
+    Ok(match gate()? {
+        (Gate::Retry(made), _) => CardStep::Retry(made),
+        (Gate::Plan(_), _) if waiting == Waiting::Another => CardStep::RefuseBoth,
+        (Gate::Plan(plan), extra) => CardStep::Show(plan, extra),
+    })
+}
+
+/// How a LINK card closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkClose {
+    /// The 2 s hold: the slot is made (or the hold's check refuses it).
+    Held,
+    /// A short press or B.
+    Declined,
+    /// Its window ran out on screen, or it waited out the queue's TTL
+    /// behind other cards.
+    TimedOut,
+    /// Closed unanswered: [`LinkError::AnotherLink`] (a second ask), or
+    /// [`LinkError::ApprovalChanged`] (a slot-table write while it waited).
+    Refused(LinkError),
+}
+
+/// The title of a refused LINK card's NOT DONE screen.
+pub const LINK_BLOCKED: &str = "Link blocked";
+
+impl LinkClose {
+    /// The refusal a refused card carries, by its message.
+    pub fn refused(message: &str) -> Self {
+        Self::Refused(if message == APPROVAL_CHANGED { LinkError::ApprovalChanged } else { LinkError::AnotherLink })
+    }
+
+    /// Whether the close starts the phone's cooldown: anything but the hold,
+    /// except a card the slot tables overtook, whose phone is told to send
+    /// the request again.
+    pub fn cools(self) -> bool {
+        !matches!(self, Self::Held | Self::Refused(LinkError::ApprovalChanged))
+    }
+
+    /// The NOT DONE screen a refused card draws, whether it was on screen or
+    /// still queued: (title, reason). Any other close draws what every
+    /// card's does.
+    pub fn blocked(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Refused(LinkError::ApprovalChanged) => Some((LINK_BLOCKED, "Slots changed")),
+            Self::Refused(_) => Some((LINK_BLOCKED, "2nd request")),
+            _ => None,
+        }
+    }
+}
+
+/// What a LINK ask weighs against the card queue's byte budget: its
+/// params as they are (their compact JSON), which nothing else bounds as
+/// tightly, and the overhead every ask carries.
+pub fn ask_weight(params: &[Value]) -> usize {
+    serde_json::to_string(params).map_or(usize::MAX, |p| p.len()).saturating_add(ASK_OVERHEAD)
+}
+
+/// The overhead every queued ask is weighed with.
+pub const ASK_OVERHEAD: usize = 256;
+
+/// Whether a site-link request heard over the cable is NACKed unanswered.
+/// In the WiFi loop (`relay_loop`) the cable copy is heartwoodd bridging the
+/// same request the board also hears on the relay: a `RelayOnly` reply
+/// would be published and could reach the phone before the relay copy's
+/// card is held, so it gets a NACK, which heartwoodd does not publish. The
+/// USB-bridged loop has no relay, and answers `RelayOnly`.
+pub fn cable_nacks(method: &str, relay_loop: bool) -> bool {
+    relay_loop && crate::nip46::Nip46Method::from_str(method).is_site_link()
+}
+
 /// A stand-in for a 64-hex secret or client key, where only its length
 /// counts.
 const STAND_IN: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
@@ -882,9 +1050,10 @@ impl LinkLedger {
         LinkError::AnotherLink
     }
 
-    /// A LINK card closed: anything but a hold cools its client.
-    pub fn card_closed(&mut self, client: &str, held: bool, now_ms: u64) {
-        if !held {
+    /// A LINK card closed: anything but a hold cools its client
+    /// ([`LinkClose::cools`]).
+    pub fn card_closed(&mut self, client: &str, close: LinkClose, now_ms: u64) {
+        if close.cools() {
             self.start_cooldown(client, now_ms);
         }
     }
@@ -1456,15 +1625,121 @@ mod tests {
         // The asker cools at once; the waiting card's phone as its card
         // closes refused. Neither can raise a card for the minute.
         assert_eq!(ledger.another_link(SITE, 1_000), LinkError::AnotherLink);
-        ledger.card_closed(PHONE, false, 1_000);
+        ledger.card_closed(PHONE, LinkClose::Refused(LinkError::AnotherLink), 1_000);
         assert!(ledger.cooling(SITE, 60_999) && ledger.cooling(PHONE, 60_999));
         // The same phone asking twice: one entry.
         ledger.another_link(PHONE, 2_000);
         assert_eq!(ledger.cooldowns.len(), 2);
         // A hold cools no one.
         let mut held = LinkLedger::new();
-        held.card_closed(PHONE, true, 1_000);
+        held.card_closed(PHONE, LinkClose::Held, 1_000);
         assert!(!held.cooling(PHONE, 1_001));
+    }
+
+    #[test]
+    fn a_cable_copy_of_a_link_method_is_nacked_only_in_the_wifi_loop() {
+        for method in [METHOD_CREATE, METHOD_STATUS, METHOD_REVOKE] {
+            assert!(cable_nacks(method, true), "{method}");
+            // The USB-bridged loop answers RelayOnly.
+            assert!(!cable_nacks(method, false), "{method}");
+        }
+        for method in ["sign_event", "heartwood_approve_bundle", "heartwood_link_other", ""] {
+            assert!(!cable_nacks(method, true), "{method}");
+        }
+    }
+
+    #[test]
+    fn a_copy_of_the_waiting_request_is_ignored_and_any_other_ask_refuses_both() {
+        let params = vec![serde_json::json!({"identity": "33"})];
+        let other = vec![serde_json::json!({"identity": "44"})];
+        let held = |client_hex, id| HeldLink { client_hex, id, params: &params };
+        assert_eq!(against_waiting([], PHONE, "1", &params), Waiting::Nothing);
+        assert_eq!(against_waiting([held(PHONE, "1")], PHONE, "1", &params), Waiting::Copy);
+        // The same id with other params, another id, or another phone.
+        assert_eq!(against_waiting([held(PHONE, "1")], PHONE, "1", &other), Waiting::Another);
+        assert_eq!(against_waiting([held(PHONE, "1")], PHONE, "2", &params), Waiting::Another);
+        assert_eq!(against_waiting([held(SITE, "1")], PHONE, "1", &params), Waiting::Another);
+        // A copy of any waiting card's request, wherever it stands.
+        assert_eq!(against_waiting([held(SITE, "9"), held(PHONE, "1")], PHONE, "1", &params), Waiting::Copy);
+
+        let asking = owner(Style::Everyday);
+        let req = request(PERSONA, vec![]);
+        let plan = check_create(Some(&asking), PHONE, served(0, &[asking.clone()]), &req).unwrap();
+        let made = asking.clone();
+        let show = || Ok((Gate::Plan(plan.clone()), "drawn"));
+        // A copy never reaches the gate.
+        let never = || -> Result<(Gate<'_>, &str), LinkError> { panic!("a copy reached the gate") };
+        assert!(matches!(card_step(Waiting::Copy, never), Ok(CardStep::Ignore)));
+        assert!(matches!(card_step(Waiting::Nothing, show), Ok(CardStep::Show(p, "drawn")) if p == plan));
+        assert!(matches!(card_step(Waiting::Another, show), Ok(CardStep::RefuseBoth)));
+        // A retry or a refusal closes no one's card.
+        assert!(matches!(
+            card_step(Waiting::Another, || Ok((Gate::Retry(&made), "drawn"))),
+            Ok(CardStep::Retry(s)) if s.slot_index == made.slot_index
+        ));
+        let refused = card_step::<&str>(Waiting::Another, || Err(LinkError::ShownRecently));
+        assert_eq!(refused.unwrap_err(), LinkError::ShownRecently);
+    }
+
+    #[test]
+    fn a_link_card_cools_its_phone_and_draws_by_how_it_closed() {
+        use LinkClose::*;
+        for (close, cools, blocked) in [
+            (Held, false, None),
+            (Declined, true, None),
+            (TimedOut, true, None),
+            (Refused(LinkError::AnotherLink), true, Some((LINK_BLOCKED, "2nd request"))),
+            (Refused(LinkError::ApprovalChanged), false, Some((LINK_BLOCKED, "Slots changed"))),
+        ] {
+            assert_eq!(close.cools(), cools, "{close:?}");
+            assert_eq!(close.blocked(), blocked, "{close:?}");
+            if let Some((title, why)) = blocked {
+                assert!(title.len() <= SCOPE_CHARS && why.len() <= SCOPE_CHARS);
+            }
+            let mut ledger = LinkLedger::new();
+            ledger.card_closed(PHONE, close, 1_000);
+            assert_eq!(ledger.cooling(PHONE, 60_999), cools, "{close:?}");
+            assert!(!ledger.cooling(PHONE, 61_000));
+        }
+        // A refused card's refusal, read back from its message.
+        assert_eq!(LinkClose::refused(LinkError::AnotherLink.message()), Refused(LinkError::AnotherLink));
+        assert_eq!(LinkClose::refused(APPROVAL_CHANGED), Refused(LinkError::ApprovalChanged));
+    }
+
+    #[test]
+    fn the_hold_checks_the_epoch_first_then_the_gate_without_the_cooldown() {
+        let asking = owner(Style::Everyday);
+        let req = request(PERSONA, vec![]);
+        let table = vec![asking.clone()];
+        let mut ledger = LinkLedger::new();
+        ledger.start_cooldown(PHONE, 1_000);
+        let at = |c: Check, ledger: &LinkLedger| check(c, Some(&asking), PHONE, served(0, &table), &req, ledger, 2_000, None);
+        assert_eq!(at(Check::Card, &ledger).unwrap_err(), LinkError::ShownRecently);
+        assert!(matches!(at(Check::Hold { epoch_current: true }, &ledger), Ok(Gate::Plan(_))));
+        assert_eq!(at(Check::Hold { epoch_current: false }, &ledger).unwrap_err(), LinkError::ApprovalChanged);
+        // A stale epoch beats a retry and every rule.
+        let mut link = planned_slot(&table, &req.label, &check_create(Some(&asking), PHONE, served(0, &table), &req).unwrap().policy).unwrap();
+        link.secret = "ab".repeat(32);
+        let with_link = vec![asking.clone(), link.clone()];
+        ledger.record(0, link.slot_index, credential_fingerprint(&link.secret), PERSONA, PHONE, &req.label, 1_000);
+        let retry = |c| check(c, Some(&asking), PHONE, served(0, &with_link), &req, &ledger, 2_000, None);
+        assert!(matches!(retry(Check::Hold { epoch_current: true }), Ok(Gate::Retry(_))));
+        assert_eq!(retry(Check::Hold { epoch_current: false }).unwrap_err(), LinkError::ApprovalChanged);
+        assert_eq!(
+            check(Check::Hold { epoch_current: false }, None, PHONE, None, &req, &ledger, 2_000, None).unwrap_err(),
+            LinkError::ApprovalChanged
+        );
+    }
+
+    #[test]
+    fn a_link_ask_weighs_its_params_and_the_overhead() {
+        use serde_json::json;
+        let compact = |p: &[Value]| serde_json::to_string(p).unwrap().len();
+        let small = vec![json!({"identity": "33", "label": "x", "policy": {"allowed_methods": ["a", "b"]}})];
+        assert_eq!(ask_weight(&small), compact(&small) + ASK_OVERHEAD);
+        assert_eq!(ask_weight(&[]), 2 + ASK_OVERHEAD);
+        let big = vec![json!({"label": "y".repeat(9_000)})];
+        assert!(ask_weight(&big) > 9_000 + ASK_OVERHEAD);
     }
 
     #[test]

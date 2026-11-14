@@ -1352,8 +1352,10 @@ fn dispatch_inner(
     // guardian (escalate), and a status question must do none of those.
     // Site links (site links design 4.5) are made over the board's relay
     // connection, where the card queue and the ledger live; the relay loop
-    // answers them before dispatch. The cable and the Pi get this refusal,
-    // before any tier, card or slot is looked at.
+    // answers them before dispatch. The USB-bridged cable and the Pi get
+    // this refusal, before any tier, card or slot is looked at; in the WiFi
+    // loop a cable copy is NACKed before it gets here
+    // (`site_link::cable_nacks`), so nothing is published for it.
     if method.is_site_link() {
         let refusal = heartwood_common::site_link::LinkError::RelayOnly;
         return build_error_json(&request.id, refusal.code(), refusal.message());

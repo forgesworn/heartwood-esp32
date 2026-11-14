@@ -772,7 +772,10 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             let Some(host) = str_field(&cmd, "host") else {
                 return err_msg("bad_request", "host is required");
             };
-            if !crate::cash_key::valid_mint_host(host) {
+            // The old rule here, the port rule for a share below: a legacy
+            // branch hashes the host as stored, and may be on file under a
+            // spelling from before the port rule.
+            if !crate::cash_key::valid_stored_mint_host(host) {
                 return err_msg("bad_request", "host must be a lowercase mint host");
             }
             let share = match share_field(&cmd, "share") {
@@ -791,6 +794,9 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             obj.insert("host".into(), json!(host));
             let cx1 = match (share, branch) {
                 (Some(share), None) => {
+                    if !crate::cash_key::valid_mint_host(host) {
+                        return err_msg("bad_request", "host must be a lowercase mint host");
+                    }
                     obj.insert("share".into(), json!(share));
                     crate::cash_key::share_node(identity, host, share).and_then(|node| crate::cash_key::share_cx1_of(&node))
                 }
@@ -894,7 +900,9 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
             // `c` from LUD-25 `50d740a`; `sig` is the older name
             let sig = str_field(&cmd, "c").or_else(|| str_field(&cmd, "sig")).unwrap_or("");
             let branch = crate::cash_key::branch_host(host);
-            if !crate::cash_key::valid_mint_host(branch) {
+            // The old rule until the key is found: a note on a legacy branch
+            // was paid to a key hashed on the host as stored.
+            if !crate::cash_key::valid_stored_mint_host(branch) {
                 return err_msg("bad_request", "host must be a lowercase mint host");
             }
             // The key the wallet expected, if it says: a claim for a key this
@@ -911,6 +919,12 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
                     Ok(found) => found,
                     Err(m) => return err_msg("bad_request", m),
                 };
+            // A share hashes the domain without its port, so a note on one
+            // at a port no wallet could spell is refused, and is the same key
+            // claimed at the host spelt right.
+            if matches!(found.origin, crate::cash_key::KeyOrigin::Share(_)) && !crate::cash_key::valid_mint_host(branch) {
+                return err_msg("bad_request", "host must be a lowercase mint host");
+            }
             let key = crate::note_store::KeyNote { index, pubkey: found.pubkey };
             match ctx
                 .store
@@ -1238,13 +1252,14 @@ impl AddressProofAsk<'_> {
 /// The bound `cx1` must be exactly the named share's, compared as decoded
 /// bytes. The host is checked first because everything else is about it, and
 /// because it is what makes the card safe to draw: a valid host and a valid
-/// name are both lowercase ASCII.
+/// name are both lowercase ASCII. Its port is checked last, once the signer
+/// is known: a legacy branch on file keeps the rule it was handed out under.
 #[cfg(feature = "cash")]
 pub fn address_proof_ask<'a>(cmd: &'a Value, identity: &[u8; 32]) -> Result<AddressProofAsk<'a>, &'static str> {
     use crate::cash_key::{AddressAction, ProofKey};
     let host = str_field(cmd, "host").ok_or("host is required")?;
-    if !crate::cash_key::valid_mint_host(host) {
-        return Err("host must be a lowercase mint host");
+    if !crate::cash_key::valid_stored_mint_host(host) {
+        return Err(BAD_MINT_HOST);
     }
     let name = str_field(cmd, "name").ok_or("name is required")?;
     if !crate::cash_key::valid_username(name) {
@@ -1286,8 +1301,18 @@ pub fn address_proof_ask<'a>(cmd: &'a Value, identity: &[u8; 32]) -> Result<Addr
     if action == AddressAction::Update && share.map(ProofKey::Share) == Some(signer) {
         return Err("that share is the one on file already");
     }
+    // Only a legacy branch on file may be spelt under the old rule: it
+    // hashes the host as stored. A share does not, so a share signing at a
+    // port no wallet could spell is refused, and is the same key at the host
+    // spelt right.
+    if !matches!(signer, ProofKey::Branch(_)) && !crate::cash_key::valid_mint_host(host) {
+        return Err(BAD_MINT_HOST);
+    }
     Ok(AddressProofAsk { host, name, action, share, signer })
 }
+
+#[cfg(feature = "cash")]
+const BAD_MINT_HOST: &str = "host must be a lowercase mint host";
 
 /// A field the proof's action does not take: `cx1` or `share` on an
 /// unregister, `on_file` on a register.
@@ -1298,7 +1323,7 @@ const UNEXPECTED_FIELD: &str = "a field this action does not take";
 /// beside it, its head and tail around `..` when the two do not fit one card
 /// line together. `None` when the domain leaves room for fewer than three of
 /// the name's characters, which the card would have to guess at. Both are
-/// ASCII by then (valid_mint_host, valid_username), so byte slicing is safe.
+/// ASCII by then (valid_stored_mint_host, valid_username), so byte slicing is safe.
 #[cfg(feature = "cash")]
 fn card_address(name: &str, domain: &str) -> Option<String> {
     let line = crate::note_fmt::CARD_LINE_CHARS;
@@ -1890,6 +1915,55 @@ mod tests {
                 assert_eq!(res["error"], "bad_request", "{host} -> {res}");
             }
             assert!(h.cash_asked.is_empty(), "asked: {:?}", h.cash_asked);
+        }
+
+        #[test]
+        fn a_port_no_wallet_could_spell_is_never_provisioned() {
+            let mut h = Harness::new();
+            for host in super::UNSPELLABLE_PORTS.iter().copied().chain([":443"]) {
+                let res = provision(&mut h, host);
+                assert_eq!(res["error"], "bad_request", "{host} -> {res}");
+            }
+            assert!(h.cash_asked.is_empty(), "asked: {:?}", h.cash_asked);
+            assert!(h.cash.is_empty());
+            for host in ["mint.example:443", "mint.example:8080"] {
+                assert_eq!(provision(&mut h, host)["ok"], true, "{host}");
+                let res = h.run(&format!(r#"{{"cmd":"new_secret","host":"{host}"}}"#));
+                assert_eq!(res["h"], expected_h(host, 0), "{host}");
+            }
+        }
+
+        #[test]
+        fn a_mint_provisioned_before_the_port_rule_still_mints_and_forgets() {
+            // Stored when any run of `:`, digits and letters passed. Drawing,
+            // raising, listing and forgetting look the host up as stored, so
+            // the entry keeps its whole ladder: the secrets are the ones the
+            // wallet derives from the same seed and spelling.
+            for host in ["mint.example:0443", "mint.example:x"] {
+                let wallet_node = derive_cash_domain_node(&derive_cash_root(&seed()).unwrap(), host).unwrap();
+                let mut reg = crate::cash_store::CashRegistry::new();
+                let stand_in = format!("mint.example:{}", "1".repeat(host.len() - "mint.example:".len()));
+                reg.provision(&stand_in, wallet_node).unwrap();
+                reg.raise_index(&stand_in, 4).unwrap();
+                let mut blob = reg.encode();
+                let at = blob.windows(stand_in.len()).position(|w| w == stand_in.as_bytes()).unwrap();
+                blob[at..at + host.len()].copy_from_slice(host.as_bytes());
+
+                let mut h = Harness::new();
+                h.cash = crate::cash_store::CashRegistry::decode(&blob).expect("an old entry still decodes");
+                let res = h.run(&format!(r#"{{"cmd":"new_secret","host":"{host}"}}"#));
+                assert_eq!(res["ok"], true, "{host} -> {res}");
+                assert_eq!(res["h"], expected_h(host, 4), "{host}");
+                let res = h.run(&format!(r#"{{"cmd":"set_cash_index","host":"{host}","next_index":9}}"#));
+                assert_eq!(res["next_index"], 9, "{host} -> {res}");
+                assert_eq!(h.run(&format!(r#"{{"cmd":"new_secret","host":"{host}"}}"#))["h"], expected_h(host, 9));
+                assert_eq!(h.run(r#"{"cmd":"list_cash_mints"}"#)["mints"][0]["host"], host);
+                // it survives the save its own draws make
+                let saved = h.storage.cash.clone().expect("saved");
+                assert_eq!(crate::cash_store::CashRegistry::decode(&saved).unwrap().hosts().next(), Some((host, 10)));
+                let res = h.run(&format!(r#"{{"cmd":"forget_cash_node","host":"{host}"}}"#));
+                assert_eq!(res["changed"], true, "{host} -> {res}");
+            }
         }
 
         #[test]
@@ -3729,6 +3803,106 @@ mod tests {
         assert!(h.proof_asked.is_empty());
         for good in ["moneyer.dev", "moneyer.dev:8443", "127.0.0.1:8899", "localhost"] {
             assert!(crate::cash_key::valid_mint_host(good), "{good}");
+        }
+    }
+
+    /// Spellings the port rule refuses: a colon brings a decimal port, 1 to
+    /// 65535, no leading zero, and nothing else.
+    const UNSPELLABLE_PORTS: [&str; 7] = [
+        "moneyer.dev:x",
+        "moneyer.dev::443",
+        "moneyer.dev:44:3",
+        "moneyer.dev:0",
+        "moneyer.dev:65536",
+        "moneyer.dev:0443",
+        "moneyer.dev:",
+    ];
+
+    #[test]
+    fn a_port_no_wallet_could_spell_is_refused_wherever_a_share_is_named() {
+        // A share hashes the domain without its port, so refusing these
+        // strands nothing: the same keys are at the host spelt right.
+        let mut h = Harness::new();
+        let share = |n| share_cx1(&[7u8; 32], "moneyer.dev", n);
+        let on_three = share_key(3, 7).pubkey;
+        let claim_at = |host: &str, p: Option<&[u8; 32]>, extra: &str| {
+            claim(p, 7, extra).replace("moneyer.dev/w", &format!("{host}/w"))
+        };
+        let proofs = [
+            format!(r#""action":"register","share":0,"cx1":"{}""#, share(0)),
+            format!(r#""action":"update","share":1,"cx1":"{}","on_file":"{}""#, share(1), share(0)),
+            format!(r#""action":"unregister","on_file":"{}""#, share(0)),
+        ];
+        for host in UNSPELLABLE_PORTS {
+            let res = h.run(&format!(r#"{{"cmd":"cash_address","host":"{host}","share":0}}"#));
+            assert_eq!(res["error"], "bad_request", "{host} -> {res}");
+            for fields in &proofs {
+                let res = h.run(&format!(r#"{{"cmd":"cash_address_proof","host":"{host}","name":"alice",{fields}}}"#));
+                assert_eq!(res["error"], "bad_request", "{host} {fields} -> {res}");
+            }
+            for cmd in [claim_at(host, Some(&on_three), ""), claim_at(host, None, r#","share":6"#)] {
+                assert_eq!(h.run(&cmd)["error"], "bad_request", "{cmd}");
+            }
+            assert!(!crate::cash_key::valid_mint_host(host), "{host}");
+        }
+        assert!(h.proof_asked.is_empty(), "no refusal costs a hold");
+        assert_eq!(h.store.counts().0, 0);
+
+        // a port as a wallet spells one goes through, and is not in the share
+        for host in ["moneyer.dev:443", "moneyer.dev:8080"] {
+            let mut h = Harness::new();
+            let res = h.run(&format!(r#"{{"cmd":"cash_address","host":"{host}","share":0}}"#));
+            assert_eq!(res["cx1"], share(0), "{host} -> {res}");
+            for fields in &proofs {
+                let res = h.run(&format!(r#"{{"cmd":"cash_address_proof","host":"{host}","name":"alice",{fields}}}"#));
+                assert_eq!(res["ok"], true, "{host} {fields} -> {res}");
+            }
+            assert_eq!(h.run(&claim_at(host, Some(&on_three), ""))["share"], 3, "{host}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_branch_spelt_under_the_old_host_rule_is_still_reached() {
+        // A whole branch hashes the host as stored, port and all, and was
+        // handed out before the port rule under any run of `:`, digits and
+        // letters. A name may still be on file there and paid there, so
+        // every path that reaches one keeps the old rule: the branch, its
+        // notes and its proofs derive exactly as they did. Frozen from main
+        // before the port rule.
+        use crate::cash_key::{legacy_branch, note_pubkey, note_secret_key, BranchKind};
+        let frozen = [
+            (
+                "moneyer.dev:0443",
+                "cx103y0a0czjt6fsu5enpy2hq8fegmtqsteklesq0udg2hwrwudz8ahnw6narudxr2lks2ln0llc8zwn6xugawjft97crq4wjcjtswfgds8r55zp",
+                "cp13h3pg4m9wvftne3wmms7gdzhhpq0qmyd43mvx86rgtmgay2c9rssn87rma",
+            ),
+            (
+                "moneyer.dev:x",
+                "cx17kx0wpvqtj7tfwdmnv5uqu7ef5u0r4e2ymdf6pqhz24cum994s7kmhw2eykwdsffsldf8s8tt8dm4nswtx7jtdft7w66u9g95xgjcpqyv980j",
+                "cp1dz96wu3xm7kdvds0w2e48472750f3k5qet4v49yhagzdw6n972ts809gd6",
+            ),
+        ];
+        for (host, want_cx1, want_p) in frozen {
+            let mut h = Harness::new();
+            let res = h.run(&format!(r#"{{"cmd":"cash_address","host":"{host}","branch":"legacy"}}"#));
+            assert_eq!(res["cx1"], want_cx1, "{host} -> {res}");
+            let node = legacy_branch(&[7u8; 32], host, BranchKind::Legacy).unwrap();
+            let paid = note_pubkey(&note_secret_key(&node, LA, 3).unwrap()).unwrap();
+            let res = h.run(&claim(Some(&paid), 3, "").replace("moneyer.dev/w", &format!("{host}/w")));
+            assert_eq!((res["branch"].clone(), res["p"].clone()), (json!("legacy"), json!(want_p)), "{host} -> {res}");
+            // and the name on file there can still be moved off or cleared
+            let to = share_cx1(&[7u8; 32], "moneyer.dev", 0);
+            let at = |fields: String| format!(r#"{{"cmd":"cash_address_proof","host":"{host}","name":"alice",{fields}}}"#);
+            let res = h.run(&at(format!(r#""action":"update","share":0,"cx1":"{to}","on_file":"{want_cx1}""#)));
+            assert_eq!(res["ok"], true, "{host} -> {res}");
+            assert_eq!(res["pubkey"], hex_encode(&crate::cash_key::branch_of(&node).unwrap().pubkey));
+            let res = h.run(&at(format!(r#""action":"unregister","on_file":"{want_cx1}""#)));
+            assert_eq!(res["ok"], true, "{host} -> {res}");
+            // The card names the address, which has no port.
+            assert_eq!(
+                h.proof_asked.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+                vec!["alice@moneyer.dev\nmove: old keys > share 0", "alice@moneyer.dev\nunregister, old keys"]
+            );
         }
     }
 

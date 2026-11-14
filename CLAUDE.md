@@ -414,8 +414,21 @@ around `..` (`note_cmd::card_address`), and a domain that leaves room for
 fewer than three of the name's characters is refused before the card rather
 than shown in part. A host whose portless domain is empty (`:8443`) or starts
 or ends with a dot is refused by `cash_key::valid_mint_host` in
-`cash_address` and `address_proof_ask` alike. Every gating rule
-below is unchanged.
+`cash_address` and `address_proof_ask` alike. A `:` in a mint host brings a
+decimal port, 1 to 65535, no leading zero, and nothing else
+(`cash_store::valid_host`): `moneyer.dev:x`, `::443`, `:0`, `:0443` and
+`:65536` are refused at `provision_cash_node`, at `cash_address` for a share,
+and at a claim, a wrap or a proof whose key is a share. A share ignores the
+port, so nothing is lost. A legacy branch hashes the host as stored and was
+handed out under the old rule (any run of `:`, digits and letters), so
+`cash_address` for a branch, and a claim, wrap or proof whose key is on one,
+keep that rule (`valid_stored_mint_host`), as does the registry's decode.
+A registry entry stored under the old rule still loads, draws, lists and
+forgets, but cannot be provisioned again in place (nor after a torn blob):
+forget it and provision the host spelt correctly. Re-claiming a share note
+already stored at such a spelling gets `bad_request`; a claim at the correct
+spelling reaches the same note and returns `created: false`.
+Every gating rule below is unchanged.
 
 Address proofs (2026-10-05, checklist section 34; its message and key are
 superseded by LUD-26 above, its gating is not): since

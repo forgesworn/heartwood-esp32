@@ -46,7 +46,7 @@ namespace:
 | `master_N_conn`, `policy_N` | Legacy client secret/policy migration state |
 | `connslots_N` | Current client credentials and exact signing policy for master slot N |
 | `persona_count`, `pE_ms`, `pE_ix`, `pE_pk`, `pE_pp`, `pE_nm` | Compact persona registry; `pE_ms` owns entry E to a master slot |
-| `imanN`, `imavN` | Master-slot display name/avatar; `imavN` is `[w][h][pixels]` as received, Rgb565 (`w*h*2` bytes) or RGB332 (`w*h` bytes) |
+| `imanN`, `imavN` | Master-slot display name/avatar; `imavN` is `[w][h][pixels]` as received, Rgb565 (`w*h*2` bytes) or RGB332 (`w*h` bytes). Firmware before RGB332 rejects a stored RGB332 blob and loses the name with it until Sapwood syncs again |
 | `bridge_secret` | Authenticated USB bridge secret |
 | `pin_attempts` | Durable wrong-PIN counter |
 | `net_config`, `net_trial`, `net_rev`, `net_last`, `ncfg_crc` | Active/staged network configuration, outcome, and flash-seed marker |

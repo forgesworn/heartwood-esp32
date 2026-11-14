@@ -1737,7 +1737,8 @@ mod tests {
         let compact = |p: &[Value]| serde_json::to_string(p).unwrap().len();
         let small = vec![json!({"identity": "33", "label": "x", "policy": {"allowed_methods": ["a", "b"]}})];
         assert_eq!(ask_weight(&small), compact(&small) + ASK_OVERHEAD);
-        assert_eq!(ask_weight(&[]), 2 + ASK_OVERHEAD);
+        assert_eq!(ask_weight(&[]), 2 + 256);
+        assert_eq!(ASK_OVERHEAD, 256);
         let big = vec![json!({"label": "y".repeat(9_000)})];
         assert!(ask_weight(&big) > 9_000 + ASK_OVERHEAD);
     }

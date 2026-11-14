@@ -547,8 +547,8 @@ draft strings in two places: a decline answers every card's `user denied`, and
 the wider refusal is the plain text with no ceiling named. IMAGE COST, M4
 release builds against `52fc099` (the M4's absolute sizes run about 30 KB
 above CI's for the same source, so only the deltas carry over): heltec-v4
-+20,080 B (2,139,152), heltec-v3 +20,880 B (2,135,632); T-Display +18,032 B
-before the second review's fixes (2,356,832, of 3,145,728). Projected onto
++20,080 B (2,139,152), heltec-v3 +20,880 B (2,135,632); T-Display +19,536 B
+(2,358,336, of 3,145,728). Projected onto
 CI's `c94112f` figures that leaves the V4 about 11.2 KB and the V3 about
 7.6 KB over their 2,097,152 B slot, so the Heltec images do NOT fit on this branch
 alone and need room made before this merges.

@@ -25,6 +25,13 @@ mod palette;
 #[allow(dead_code)]
 mod cat_sprites;
 
+// st7789.rs records every flush with `crate::oled::note_draw`, which the
+// signer's approval cards read. The demo has no cards and no oled module, so
+// it gets a no-op in its place.
+mod oled {
+    pub fn note_draw() {}
+}
+
 use embedded_graphics::mono_font::{ascii, MonoTextStyleBuilder};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;

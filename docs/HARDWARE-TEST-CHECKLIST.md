@@ -3662,8 +3662,9 @@ with the device operator key.
   shows the same NIP-46 `connect` refused as "unauthorised" every 30 seconds
   from its 13:30Z restart, 879 attempts, then a restart onto the new slot and
   a successful connect. 879 attempts 30 s or more apart end at 20:50Z or
-  later, inside that window. After it connected, five of its relay sign-in
-  requests through the board timed out, at times the log does not record.
+  later, and its process started at 21:05:48Z, inside that window. After it
+  connected, five of its relay sign-in requests through the board timed out;
+  the log was last written at 08:12Z.
 - From 21:49Z to 07:53Z, 20 of 21 rounds answered (06:23Z timed out). Free
   heap held at about 45,000: between 44,288 and 45,376, apart from 43,028 at
   01:50Z and 41,520 at 07:23Z, each back by the next round. The largest block
@@ -3702,8 +3703,9 @@ with the device operator key.
   rollback. The version string is unchanged (0.18.0-beta.35). After the
   power-on reset: no `crash_detail`, and NVS 569 entries, the figure before
   the panic. At 1,046 s up, free heap 68,816 and largest block 59,392; one
-  relay `list_clients` then returned all six apps, about 8,680 B of plaintext
-  and so a 13,744-byte ciphertext, the size that panicked. No reset; 68,660
+  relay `list_clients` then listed six apps, an estimated 8,680 B of
+  plaintext and so a 13,744-byte ciphertext, the size that panicked (worked
+  from the decrypted reply, not measured on the wire). No reset; 68,660
   and 59,392 after, 68,748 five minutes on. With that much heap the old
   whole-frame build might have passed too, so this shows the streamed frame
   arriving intact; that the second content-sized allocation is gone rests on

@@ -1212,6 +1212,8 @@ pub fn charge_pin_guess<S: PinCountStore>(store: &mut S) -> GuessCharge {
 
 /// Clear the count after a right PIN. The integer goes to zero first, so no
 /// cut leaves the old blob authoritative once the integer has been cleared.
+/// With no room for the zero, the blob goes before the integer is removed,
+/// so a cut there leaves the old integer, never a stale blob behind it.
 ///
 /// The guess was counted before it was checked, so a right fifth PIN sits on
 /// flash at the wipe limit until this lands: a clear that silently failed
@@ -1222,7 +1224,12 @@ pub fn clear_pin_attempts<S: PinCountStore>(store: &mut S) -> Result<(), &'stati
     let mut result = Err("PIN-attempt state did not clear");
     for _ in 0..2 {
         if store.set_count(0).is_err() {
-            let _ = store.remove_count();
+            if matches!(store.get_legacy(), Ok(Some(_))) {
+                let _ = store.remove_legacy();
+            }
+            if matches!(store.get_legacy(), Ok(None)) {
+                let _ = store.remove_count();
+            }
         }
         if matches!(store.get_legacy(), Ok(Some(_))) {
             let _ = store.remove_legacy();
@@ -2899,6 +2906,61 @@ mod tests {
             let n = read_pin_attempts(m).unwrap();
             assert!(n == 0 || n == 5, "cut {cut} apply {apply}: {n}");
         });
+    }
+
+    #[test]
+    fn a_full_board_clear_never_hands_the_count_to_a_stale_blob() {
+        // A blob left behind by a failed best-effort removal, under a newer
+        // integer, on a board with no free entry for the zero.
+        let mut m = legacy_board(PIN_A);
+        m.set(PIN_ATTEMPTS_LEGACY_KEY, &[3]).unwrap();
+        m.set_count(4).unwrap();
+        let start = m.limited(m.reboot().used());
+        assert_eq!(read_pin_attempts(&start), Ok(4));
+
+        // Every cut leaves the integer's 4 or a clear, never the blob's 3.
+        sweep(&start, &|m| clear_pin_attempts(m).map_err(|_| ChangeError::Storage), &|m, cut, apply| {
+            let n = read_pin_attempts(m).unwrap();
+            assert!(n == 0 || n == 4, "cut {cut} apply {apply}: {n}");
+        });
+        let mut m = start.reboot();
+        assert_eq!(clear_pin_attempts(&mut m), Ok(()));
+        assert!(m.ints.is_empty() && !m.map.contains_key(PIN_ATTEMPTS_LEGACY_KEY));
+    }
+
+    /// A store that cannot remove the legacy blob.
+    struct KeepsLegacy(Mem);
+    impl PinCountStore for KeepsLegacy {
+        fn get_count(&self) -> Result<Option<u8>, StoreError> {
+            self.0.get_count()
+        }
+        fn set_count(&mut self, count: u8) -> Result<(), StoreError> {
+            self.0.set_count(count)
+        }
+        fn remove_count(&mut self) -> Result<(), StoreError> {
+            self.0.remove_count()
+        }
+        fn get_legacy(&self) -> Result<Option<Vec<u8>>, StoreError> {
+            self.0.get_legacy()
+        }
+        fn remove_legacy(&mut self) -> Result<(), StoreError> {
+            Err(StoreError)
+        }
+    }
+
+    #[test]
+    fn a_zeroed_integer_outranks_a_blob_that_would_not_go() {
+        let mut m = legacy_board(PIN_A);
+        m.set(PIN_ATTEMPTS_LEGACY_KEY, &[3]).unwrap();
+        m.set_count(4).unwrap();
+        let mut keeps = KeepsLegacy(m.reboot());
+        assert_eq!(clear_pin_attempts(&mut keeps), Ok(()));
+        let after = keeps.0.reboot();
+        assert_eq!(after.ints.get(PIN_COUNT_KEY), Some(&0));
+        assert_eq!(read_pin_attempts(&after), Ok(0), "the integer is read first");
+        // The next guess counts from the integer too.
+        let mut keeps = KeepsLegacy(after);
+        assert_eq!(charge_pin_guess(&mut keeps), GuessCharge::Charged(1));
     }
 
     #[test]

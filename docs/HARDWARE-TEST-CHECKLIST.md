@@ -3744,3 +3744,78 @@ with the device operator key.
   whole-frame build might have passed too, so this shows the streamed frame
   arriving intact; that the second content-sized allocation is gone rests on
   `common/tests/ws_frame_memory.rs`.
+
+## 43. Site links made with a hold (added 2026-11-14, NOT YET BENCH-RUN)
+
+`heartwood_link_create`, `heartwood_link_status` and `heartwood_link_revoke`
+over the relay (WiFi-standalone only; the cable and the USB-bridged NIP-46
+path answer `site links are made over the board's relay connection`). A phone
+paired with full access asks for a site's `bunker://` link; the board refuses
+everything it can before the card, shows `LINK ?<site>?`, `AS <identity>`
+(with ` M<n>` when the identity is on another master), the scope line and
+`FROM <phone's slot label>`, and writes the strict slot only on a 2 s hold.
+For 60 s after the hold the site's first bind of that slot also gets the
+identity grant, so its first signature asks nothing. RAM only: a restart
+forgets the window and the cooldowns. Use a test board in WiFi mode with two
+masters, a test phone paired with the one-hold pairing (full access) and
+**no** operator key, and My Signet or a scripted client.
+
+Acceptance: My Signet on the owner's phone, with no operator key, signs in
+to KithMoot desktop as the master-1 identity with one hold at sign-in, and
+KithMoot joins a room with no further press.
+
+1. Persona on master 0: one hold at creation; the first signature is silent,
+   and so are later ones.
+2. Identity on master 1 through a strict, relay-made slot: as item 1. Again
+   through a USB-made (non-strict) slot.
+3. Decline (short press or B): `user denied`, every card's denial (not the
+   design's `declined`), no slot is made, and a second ask from the phone within 60 s answers
+   `shown recently` with no card.
+4. No press: `timeout`, no slot; a second ask within 60 s answers
+   `shown recently`.
+5. Table full (16 slots on the identity's master): `no room` before the card.
+   NVS nearly full: `no room` before the card.
+6. Restart between the hold and the site's first bind: the first signature
+   shows `REMEMBER AS`.
+7. A second link ask while a LINK card is queued or up: the second answers
+   `another link request arrived`, and the waiting card closes as "Pairing
+   blocked / 2nd request" and answers the same.
+8. Ceiling: with the phone's master-1 slot limited to some kinds, an any-kind
+   request answers `wider than this phone's access` before the card, and a
+   request inside those kinds works. An owner pairing in Extra careful style
+   is refused an any-kind link.
+9. A child-direct slot and a site link (strict, unmarked) each ask: `not an
+   owner pairing`, no card. A slot with a family flag: `family slot`.
+10. A real identity (`natural-person`, `dependant-<n>-np`): `real identity`,
+    no card.
+11. A lost reply: a retry with the same label and identity inside the 60 s
+    answers the same link (same slot, same secret) with no card; status and
+    revoke by label work inside the 60 s and answer `unknown link` after it.
+12. Revoke by `slot_index` and `expected_secret_fingerprint`; a wrong
+    fingerprint answers `stale_client_slot`; an owner pairing answers `not a
+    site link: owner pairing`, and nothing is removed.
+13. Revoke a link made earlier through the operator route, with no operator
+    key on the phone.
+14. Older firmware: `heartwood_capabilities` does not list the three methods,
+    and My Signet shows "needs an update" (no operator key) or uses the
+    operator route (key present). heartwoodd Soft mode answers `method not
+    supported`.
+15. A site using one client key for two personas on one master: the second
+    link's bind takes the key from the first, as today
+    (`authorize_pubkey_on_unique_slot`).
+16. The first-sign press seen in the 2026-11-14 test is gone: time from
+    Approve to signed in.
+17. A phone whose master-1 slot uses a different client key from its owner
+    pairing: `not approved for identity`, before the card.
+18. Inherit window: a first bind 61 s after the hold gets `REMEMBER AS`; a
+    same-label retry inside the window does not move the deadline; a revoke
+    inside the window clears the entry.
+19. A slot-table change on the identity's master (not the asking one) between
+    the card and the hold: the hold answers `approval_changed` and no slot is
+    made.
+20. The `AS` line shows ` M1` for an identity on master 1 asked from master 0,
+    and no master for one on the asking master. On every board and in both
+    orientations the card stays inside the panel and the span (ui-preview
+    pins this; check the T-Display, which shows no button tags on this card).
+21. Escalate or strict asking slot: refused before the card, never parked for
+    a guardian verdict.

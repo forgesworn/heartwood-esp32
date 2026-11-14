@@ -324,6 +324,34 @@ behavior remains a button prompt. Approving signing on a legacy slot adds
 `sign_event` without silently broadening its existing encryption-method or
 event-kind ceiling.
 
+### Site links made with a hold (NOT YET BENCH-RUN)
+
+`heartwood_link_create` lets a phone paired with full access (an owner
+pairing: non-strict, not escalate, marked, no family flag) ask the board for a
+site's sign-in link without holding the operator key, which manages
+everything and can only be taken back over USB. It is answered over the relay
+only, before any tier, policy or escalate routing, so an escalate slot can
+never park it for a guardian verdict (and is refused as not an owner pairing
+anyway). Every refusal comes before the card: the identity must be served by
+an unlocked master, the asking key must already sign as it there, neither slot
+may carry a family flag, Rule D real identities are refused, and the link may
+not be wider than what the phone's own slot on that master does silently. One
+LINK card at a time; a second ask refuses both. The new slot is written only
+after a 2 s hold, re-checked against the tables at the hold (a change answers
+`approval_changed`); nothing is written before it. The site name on the card
+comes from the phone and the card does not claim the board checked it.
+
+What it adds: a stolen phone with its PIN can ask, but each link costs a hold
+on the board, and a decline or timeout cools that phone for 60 s. For 60 s
+after the hold the first key to bind the new slot also gets its identity
+grant, so a secret read before the site binds gains the grant only inside
+that minute, and the real site then sees `ADD DEVICE`. The window and the
+cooldowns are RAM only, so a restart forgets them (the first signature then
+asks, as before) and there is nothing on flash to downgrade. Status and revoke
+take the slot index and the secret's fingerprint ("knowing the fingerprint is
+the right to revoke"), or a label for a link this phone made inside the last
+minute, and never reach an owner pairing or a family slot.
+
 ## Threat: compromised operator key or browser — **bounded, recoverable**
 
 If the operator key leaks (or the browser is compromised), the attacker can do

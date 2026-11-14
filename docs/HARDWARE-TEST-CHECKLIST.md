@@ -3744,3 +3744,33 @@ with the device operator key.
   whole-frame build might have passed too, so this shows the streamed frame
   arriving intact; that the second content-sized allocation is gone rests on
   `common/tests/ws_frame_memory.rs`.
+
+## 41. RGB332 identity picture (added 2026-11-11, not bench-run)
+
+A 64x64 picture at one byte a pixel (RGB332, `RRRGGGBB`) as well as two (Rgb565).
+The byte length picks the format: `w*h*2` is Rgb565, `w*h` is RGB332, anything
+else is refused. SET_IDENTITY_META (0x5B) and the relay `set_identity_meta`
+method share the rule; the blob is stored as received.
+
+1. Send a 64x64 RGB332 picture (4,096 pixel bytes) over the cable and over
+   the relay. Both ACK, and the identity card shows it full size with fewer
+   colours. Send a 64x64 Rgb565 one: unchanged from before. Sapwood sends
+   RGB332 only over the cable, so for the relay half run
+   `node scripts/mgmt-request.mjs --method set_identity_meta --challenge
+   --params "$(node scripts/identity-meta-params.mjs --name bench)"`
+   (add `--format rgb565` for the Rgb565 case). The picture is red, green,
+   blue and white bands inside a black border.
+2. Send a 64x64 picture of 4,095 or 4,097 bytes (relay: add `--bytes 4095`
+   or `--bytes 4097` to the params script): NACK over the cable, an error
+   from the relay, the stored picture untouched.
+3. On a tight board (T-Display with a stored 48x48 Rgb565 picture, 4,610
+   bytes) send the 64x64 RGB332 one (4,098 bytes). The smaller blob makes the
+   write more likely to land; expect an ACK and the new picture. There is no
+   retry and no `removing the ... stored picture` or `stored picture kept` log
+   line. The storage wrapper erases the old picture before it writes, so if
+   the write fails the frame is NACKed and the old picture is already gone:
+   it disappears at the next redraw or reboot, and the identity card falls
+   back to npub only until a picture is sent again (as on base).
+4. The relay redraw after a relay `set_identity_meta` of an RGB332 picture does
+   not reboot the board (no expanded buffer is allocated). Same request as
+   step 1.

@@ -1,0 +1,8 @@
+# esp-idf-svc's EspNvs::set_blob and set_str erase the key before writing
+# it, so a power cut between the two leaves no value at all. Write blobs
+# through crate::nvs::ReplaceBlob instead (see src/nvs.rs).
+disallowed-methods = [
+    { path = "esp_idf_svc::nvs::EspNvs::set_blob", reason = "erases the key before writing; use crate::nvs::ReplaceBlob::replace_blob" },
+    { path = "esp_idf_svc::nvs::EspNvs::set_str", reason = "erases the key before writing; store a blob through crate::nvs::ReplaceBlob::replace_blob" },
+    { path = "esp_idf_svc::nvs::EspKeyValueStorage::set_raw", reason = "removes the key before writing; use crate::nvs::ReplaceBlob::replace_blob" },
+]

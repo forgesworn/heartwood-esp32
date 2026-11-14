@@ -949,10 +949,11 @@ pub struct SaveRoomNeed {
 /// Model the press's NVS writes in order (review S1, S2): each persona
 /// registration (`personas::add`: the whole packed chunk rewritten, then the
 /// 1-byte count blob), then the slot table. Each write's peak is its new
-/// blob beside the old ([`crate::nvs_room::blob_write_entries`]); what it
-/// leaves is its new blob less what erasing the old frees
-/// ([`crate::nvs_room::min_blob_entries`], never below 0). A step needs what
-/// the steps before it left plus its own peak.
+/// blob beside the old, charged as the write is planned
+/// ([`crate::nvs_room::replace_peak`]), so this cannot pass where
+/// `nvs::ReplaceBlob` would erase first; what it leaves is its new blob less
+/// what erasing the old frees ([`crate::nvs_room::min_blob_entries`], never
+/// below 0). A step needs what the steps before it left plus its own peak.
 ///
 /// - A registry step's peak is the new chunk plus the count blob's rewrite.
 ///   A chunk that starts (an add at a chunk boundary) has nothing to erase,
@@ -968,9 +969,9 @@ pub fn save_room_need(
     table_len: Option<usize>,
     pages: usize,
 ) -> SaveRoomNeed {
-    use crate::nvs_room::{blob_entries, blob_write_entries, min_blob_entries};
+    use crate::nvs_room::{blob_entries, min_blob_entries, replace_peak};
     use crate::persona_pack::{CHUNK_CAPACITY, CHUNK_FRAME_LEN};
-    let count_blob = blob_write_entries(1, pages);
+    let count_blob = replace_peak(1, pages);
     let mut left = 0usize;
     let mut worst_registry = 0usize;
     // The chunk the next add rewrites: its stored length and what erasing
@@ -991,12 +992,12 @@ pub fn save_room_need(
             (stored, chunk.map_or(0, min_blob_entries))
         };
         let new_len = base + entry_len;
-        let peak = blob_write_entries(new_len, pages) + count_blob;
+        let peak = replace_peak(new_len, pages) + count_blob;
         worst_registry = worst_registry.max(left + peak);
         left += blob_entries(new_len, pages).saturating_sub(old);
         chunk = Some(new_len);
     }
-    let table = table_len.map_or(0, |len| left + blob_write_entries(len, pages));
+    let table = table_len.map_or(0, |len| left + replace_peak(len, pages));
     SaveRoomNeed { registry: worst_registry, table }
 }
 
@@ -2216,10 +2217,11 @@ mod tests {
         let derive_len = projected_slot_table_len(&table, slot, CLIENT, &derive, &derive_plan).unwrap().unwrap();
         // The chunk grows from 77 to 158 bytes: 5 data + 5 headers (one per
         // data entry, under the 6 pages) + 1 index = 11, plus a skip of at
-        // most its 5 data entries, plus the count blob's rewrite (1 + 2 + 1,
-        // no slack for one data entry): a peak of 20. Erasing the old chunk
-        // frees 3 + 1 + 1 = 5, so it leaves 6.
-        let registry_peak = 20;
+        // most its 5 data entries, plus the count blob's rewrite at the 7
+        // its write is planned against (`replace_peak`: 1 data + 4 headers +
+        // 1 index + 1 abandoned, above the 1 + 2 + 1 of the layout): a peak
+        // of 23. Erasing the old chunk frees 3 + 1 + 1 = 5, so it leaves 6.
+        let registry_peak = 23;
         let table_needed = 6 + derive_len.div_ceil(32) + 6 + 1 + 13;
         let check = |nvs| check_bundle_save_room(&table, slot, CLIENT, &derive, &derive_plan, nvs, Some(ONE_PERSONA));
         assert_eq!(check(nvs(PAGE_ENTRIES + table_needed)), Ok(()));
@@ -2241,10 +2243,10 @@ mod tests {
         // 8 KB avatar cached, a 5 KB table. The avatar frees 256 data + 3
         // headers + 1 index = 260, so the table alone fits: 6 left by the
         // registry + 160 + 6 + 1 + 13 = 186 <= 140 + 260 - 126 = 274. The
-        // registry's peak of 11 + 5 + 4 = 20 does not fit in 14, and
-        // `personas::add` would have failed after the hold.
+        // registry's peak of 11 + 5 + 7 (the count blob) = 23 does not fit
+        // in 14, and `personas::add` would have failed after the hold.
         let need = save_room_need(&[NP_ENTRY], ONE_PERSONA, Some(5 * 1024), 6);
-        assert_eq!(need, SaveRoomNeed { registry: 20, table: 186 });
+        assert_eq!(need, SaveRoomNeed { registry: 23, table: 186 });
         let avatar = crate::nvs_room::min_blob_entries(8 * 1024);
         assert_eq!(avatar, 260);
         assert_eq!(save_room_verdict(need, room(140, 260)), Err(BundleError::NoRoomToSave));
@@ -2256,29 +2258,31 @@ mod tests {
     fn a_registry_chunk_rewrite_is_counted_at_its_peak() {
         // Review S2: 15 personas of ~80 bytes, a 1210-byte chunk; one more
         // makes it 1291: 41 data + 6 headers + 1 index + 13, plus the count
-        // blob's 4, a peak of 65. A small ~800-byte table: 25 + 6 + 1 + 13
+        // blob's 7, a peak of 68. A small ~800-byte table: 25 + 6 + 1 + 13
         // = 45, after the 48 - 40 = 8 the chunk grew by: 53. Net growth
         // alone (25 + 2 + 1 for the table, 3 + 2 + 1 for one entry, 34) fitted
         // in 40 available; the rewrite would have failed after the hold.
         let fifteen = RegistryTail { count: 15, count_stored: true, chunk_len: Some(10 + 15 * 80) };
         let need = save_room_need(&[NP_ENTRY], fifteen, Some(800), 6);
-        assert_eq!(need, SaveRoomNeed { registry: 65, table: 53 });
+        assert_eq!(need, SaveRoomNeed { registry: 68, table: 53 });
         assert_eq!(save_room_verdict(need, room(126 + 40, 0)), Err(BundleError::NoRoomToSave));
         assert_eq!(save_room_verdict(need, room(126 + 100, 0)), Ok(()));
 
         // Two names: the second starts chunk 1 (count 16), a 10-byte frame
-        // and a 61-byte entry ("work"): 3 + 3 + 1 = 7, peak 7 + 3 + 4 = 14
-        // on top of the 8 left. The first name's 65 is still the worst; the
-        // table comes after 8 + 7 = 15.
+        // and a 61-byte entry ("work"): 3 + 3 + 1 = 7, peak 11 (as planned:
+        // 3 data + 4 headers + 1 index + 3 abandoned) + 7 = 18 on top of the
+        // 8 left. The first name's 68 is still the worst; the table comes
+        // after 8 + 7 = 15.
         let need = save_room_need(&[NP_ENTRY, 61], fifteen, Some(800), 6);
-        assert_eq!(need, SaveRoomNeed { registry: 65, table: 15 + 45 });
+        assert_eq!(need, SaveRoomNeed { registry: 68, table: 15 + 45 });
 
-        // A fresh board writes the count blob first (peak 4, leaves 4),
-        // then a one-entry chunk of 91 bytes: 3 + 3 + 1 = 7, peak 7 + 3 + 4
-        // = 14, so 18 at the worst; the table comes after 4 + 7 = 11.
+        // A fresh board writes the count blob first (peak 7, leaves 4),
+        // then a one-entry chunk of 91 bytes: 3 + 3 + 1 = 7, peak 11 (as
+        // planned) + 7 = 18, so 22 at the worst; the table comes after
+        // 4 + 7 = 11.
         let fresh = RegistryTail { count: 0, count_stored: false, chunk_len: None };
         let need = save_room_need(&[NP_ENTRY], fresh, Some(800), 6);
-        assert_eq!(need, SaveRoomNeed { registry: 18, table: 11 + 45 });
+        assert_eq!(need, SaveRoomNeed { registry: 22, table: 11 + 45 });
         // Nothing registered: no registry step at all.
         assert_eq!(save_room_need(&[], fresh, Some(800), 6), SaveRoomNeed { registry: 0, table: 45 });
         assert_eq!(save_room_need(&[], fresh, None, 6), SaveRoomNeed { registry: 0, table: 0 });

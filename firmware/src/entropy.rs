@@ -31,6 +31,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use sha2::{Digest, Sha256};
 
 /// NVS blob key holding the SHA-256 of last boot's self-test draw.
@@ -131,7 +132,7 @@ pub fn boot_self_test(nvs: &mut EspNvs<NvsDefault>) {
     let stored = if matches!(proof, ProofLookup::Matched | ProofLookup::Unreadable) {
         None
     } else {
-        match nvs.set_blob(NVS_RNG_PROOF_KEY, &hash) {
+        match nvs.replace_blob(NVS_RNG_PROOF_KEY, &hash) {
             Ok(()) => Some(true),
             Err(e) => {
                 log::error!("RNG self-test: proof write failed ({e})");

@@ -99,6 +99,18 @@ pub fn blob_write_entries(len: usize, pages: usize) -> usize {
     blob_entries(len, pages) + first_chunk_skip_slack(len)
 }
 
+/// Entries a REPLACE of a blob with `len` bytes is charged before the card:
+/// the stricter of [`blob_write_entries`] and the bound
+/// `nvs::ReplaceBlob` plans the write against
+/// ([`crate::nvs_budget::blob_entries`]). The two model the same write in
+/// different ways and each is the higher somewhere (the budget for small
+/// blobs, and by 2 entries for a 4,001 to 8,000 byte blob on a 4-page
+/// partition), so a check against this one cannot pass where the write
+/// would find no room for a second copy and erase first.
+pub fn replace_peak(len: usize, pages: usize) -> usize {
+    blob_write_entries(len, pages).max(crate::nvs_budget::blob_entries(len))
+}
+
 /// The fewest entries a stored blob of `len` bytes can hold: its data
 /// entries, one chunk header per 4000 bytes and the index. What erasing it
 /// (or evicting it) can be counted on to free; a blob written across more
@@ -189,6 +201,28 @@ mod tests {
         assert_eq!(min_blob_entries(40), 2 + 1 + 1);
         assert_eq!(min_blob_entries(8000), 250 + 2 + 1);
         assert_eq!(min_blob_entries(8192), 256 + 3 + 1);
+    }
+
+    #[test]
+    fn a_replace_is_charged_at_least_what_the_write_is_planned_against() {
+        for pages in [1, 4, 6, 16] {
+            for len in (0..=64 * 1024).step_by(7) {
+                let peak = replace_peak(len, pages);
+                assert!(peak >= blob_write_entries(len, pages), "{len} on {pages}");
+                assert!(peak >= crate::nvs_budget::blob_entries(len), "{len} on {pages}");
+            }
+        }
+        // A 16 KB partition (4 pages): this estimate alone was 2 short of
+        // the plan for a 4,001 to 8,000 byte table.
+        for len in [4001, 5120, 8000] {
+            assert_eq!(blob_write_entries(len, 4) + 2, crate::nvs_budget::blob_entries(len));
+            assert_eq!(replace_peak(len, 4), crate::nvs_budget::blob_entries(len));
+        }
+        // Where this estimate is the higher it stands: 2.9 KB on 6 pages.
+        assert_eq!(replace_peak(2900, 6), 111);
+        // The 1-byte count blob: 7, not 4.
+        assert_eq!(replace_peak(1, 6), crate::nvs_budget::blob_entries(1));
+        assert_eq!(replace_peak(1, 6), 7);
     }
 
     #[test]

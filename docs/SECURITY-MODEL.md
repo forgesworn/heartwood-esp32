@@ -346,7 +346,10 @@ after a 2 s hold; nothing is written before it. An authority change on any
 master's slots while the card waits (a new key, a revoke, a policy change; a
 label rename, for one, is not) closes it at once,
 queued or on screen, answering `approval_changed`, and the hold checks the
-tables again before writing. The site name on the card
+tables again before writing. A few writes withdraw approvals without checking
+whether authority changed (the operator's identity revoke or clear, a FULL
+ACCESS press), so they close it too; none is open to a phone without the
+operator key or a hold. The site name on the card
 comes from the phone and the card does not claim the board checked it. The
 scope line is the board's own and leads with `DECRYPT` whenever the link may
 read the identity's DMs.

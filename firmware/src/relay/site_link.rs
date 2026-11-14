@@ -261,7 +261,7 @@ fn lookup(ctx: &mut SignCtx, request: &Nip46Request, slot: u8, client_hex: &str)
 
 /// The hold on a LINK card: the response `resolve_button_card` seals. The
 /// request is checked again against the tables as they are now (design 4.4:
-/// a slot-table change on either master since the card answers
+/// an authority change on any master's slots since the card answers
 /// `approval_changed`), and the slot is written only here.
 pub(super) fn complete(ctx: &mut SignCtx, ask: &DeferredAsk, asking_master: u8, client_hex: &str) -> String {
     let reply = match &ask.card {

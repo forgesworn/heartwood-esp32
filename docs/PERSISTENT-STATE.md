@@ -48,7 +48,7 @@ namespace:
 | `persona_count`, `pE_ms`, `pE_ix`, `pE_pk`, `pE_pp`, `pE_nm` | Compact persona registry; `pE_ms` owns entry E to a master slot |
 | `imanN`, `imavN` | Master-slot display name/avatar |
 | `bridge_secret` | Authenticated USB bridge secret |
-| `pin_attempts` | Durable wrong-PIN counter |
+| `pin_fails` | Durable wrong-PIN counter (`u8`); `pin_attempts` is the one-byte blob earlier firmware used, read until the first guess or unlock moves it. A downgrade reads only the blob, so it shows 0 |
 | `net_config`, `net_trial`, `net_rev`, `net_last`, `ncfg_crc` | Active/staged network configuration, outcome, and flash-seed marker |
 | `pinned_rly` | Client-requested relay reachability cache, with master/client slot coordinates |
 | `mgmt_nonce` | Legacy device-operator one-time remote-management mutation challenge, rotated and read back before dispatch |
@@ -58,6 +58,19 @@ namespace:
 | `rm_journal`, `rm_pinned` | Temporary power-loss journal and pinned-relay shadow during master removal |
 | `dk_sec`, `dk_ph`, `lk_boots`, `ann_op`, `ph_relays` | Phone unlock: the data key's PIN/vault wrapper, the packed phone records, the locked-restart count, the operator-announcement switch, and `ph_relays`, the relays the phones were last told about with the count of relay-update rounds sent (written when first needed, when a change only dropped relays, after each of a relay change's six update rounds, the last of which records the new list, and replaced at the first enrolment after every phone has gone; never on a network-trial boot, never over a record this firmware cannot read; removed with the last phone) |
 | `rng_proof` | SHA-256 of last boot's RNG self-test draw; a wipe clears it, costing one power-cycle before new key material (see above) |
+
+Every blob in this table is written through `ReplaceBlob`
+(`firmware/src/nvs.rs`), which calls ESP-IDF's `nvs_set_blob` with no erase
+in front of it when there is room for the new copy beside the old one: a
+power cut during the write then leaves the old value or the new one. With no
+room, the secrets and the keys whose loss weakens the board (`dk_sec`,
+`mN_seed_enc`, `master_N_secret`, `at_rest_kind`, `bridge_secret`,
+`rzrec_N`, `net_config`, `net_trial`) are refused and keep their value, and
+every other key is erased and then written, as all writes were before, so a
+cut there loses that key. `pin_fails`, `net_rev` and `ncfg_crc`
+are integer items, which ESP-IDF replaces new-before-old in a single entry.
+No write spans two keys, which is what the journals below are for. See
+"Power cuts and NVS writes" in SECURITY-MODEL.md for the per-key table.
 
 The factory/PIN wipe erases the partition rather than enumerating this table,
 so a future or unknown key cannot survive merely because a cleanup list was not

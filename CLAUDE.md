@@ -82,7 +82,8 @@ at the spend transition, and every creation path (both mint calls, receive,
 import and claim) makes room out of the oldest spent record first, so the
 locker cannot fill with dead records and no one has to prune by hand (#96,
 #111). Live notes are never evicted for any reason: a full locker of
-CONFIRMED notes still refuses. Relay path: heartwood_note_* NIP-46 extensions
+CONFIRMED notes still refuses, and a request eviction cannot make room
+for is refused before any spent record goes. Relay path: heartwood_note_* NIP-46 extensions
 (advertised note_locker_v1), gated methods pinned ButtonRequired ahead of the
 generic extension gate so no slot policy can silence a disclosure, riding the
 #64 deferred machinery. heartwood_note_rename joined that set (#96, checklist

@@ -713,11 +713,20 @@ impl NoteStore {
     /// `needed` is how many slots the caller is about to use, so a split
     /// asking for two does not stop at one: the check is room for the WHOLE
     /// request, not for a first note that would then strand its second.
+    ///
+    /// A request eviction cannot satisfy is refused before anything goes:
+    /// evicting first and then finding too few spent records would destroy
+    /// a receipt for a refusal all the same. The notes this boot cannot read
+    /// hold their slots and are never evicted, so they count here too.
     fn evict_spent_for_room(
         &mut self,
         storage: &mut dyn NoteStorage,
         needed: usize,
     ) -> Result<(), NoteError> {
+        let spent = self.notes.iter().filter(|n| n.state == NoteState::Spent).count();
+        if self.notes.len() + self.unreadable.len() + needed > self.cap + spent {
+            return Err(NoteError::StorageFull);
+        }
         while self.admit_creation(needed).is_err() {
             let idx = self.oldest_spent().ok_or(NoteError::StorageFull)?;
             self.persist_remove(storage, idx)?;
@@ -2587,6 +2596,69 @@ mod tests {
             .import_secret(&mut storage, &mut rng, &"c3".repeat(SECRET_LEN), "m.example/w", 1, "", 2)
             .unwrap();
         assert_eq!(storage.index.clone().unwrap(), vec![kept, added]);
+    }
+
+    /// A full locker: `MAX_NOTES` confirmed notes with distinct secrets.
+    fn seed_full(
+        store: &mut NoteStore,
+        storage: &mut FakeStorage,
+        rng: &mut dyn FnMut(&mut [u8]),
+    ) -> Vec<String> {
+        let bytes: Vec<String> = (0..MAX_NOTES).map(|i| format!("{:02x}", 0x10 + i)).collect();
+        let secrets: Vec<&str> = bytes.iter().map(String::as_str).collect();
+        seed_confirmed(store, storage, rng, &secrets)
+    }
+
+    #[test]
+    fn a_pair_that_cannot_fit_evicts_nothing() {
+        // Eviction makes at most as much room as there are spent records. A
+        // request needing more is refused before any of them goes, or the
+        // receipt is destroyed for a refusal all the same. Cap 16: two notes
+        // this boot cannot read, thirteen confirmed, one spent, and a pair.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let ids = seed_full(&mut store, &mut storage, &mut rng);
+        let (newer, sealed, spent) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        store.mark_spent(&mut storage, &spent, 2).unwrap();
+        from_the_future(&mut storage, &newer);
+        storage.note_read_fails.push(sealed.clone());
+        let mut store = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert_eq!(store.counts(), (MAX_NOTES - 2, 0));
+
+        assert_eq!(
+            test_new_secret_pair(&mut store, &mut storage, &mut rng, &[], "", 3).err(),
+            Some(NoteError::StorageFull)
+        );
+        assert!(store.get_meta(&spent).is_some(), "the spent record went for nothing");
+        let index = storage.index.clone().unwrap();
+        assert!(index.contains(&spent), "{index:?}");
+        assert_eq!(index.len(), MAX_NOTES);
+        assert!(storage.notes.contains_key(&spent));
+
+        // One slot can still be made, and then the spent record gives way.
+        let (single, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 4).unwrap();
+        assert!(store.get_meta(&spent).is_none());
+        assert!(store.get_meta(&single).is_some());
+    }
+
+    #[test]
+    fn a_pair_that_cannot_fit_keeps_the_spent_record_without_unreadable_notes() {
+        // The same refusal with every note readable: fifteen confirmed, one
+        // spent, and a pair needs two slots where one can be made.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        let ids = seed_full(&mut store, &mut storage, &mut rng);
+        let spent = ids[0].clone();
+        store.mark_spent(&mut storage, &spent, 2).unwrap();
+
+        assert_eq!(
+            test_new_secret_pair(&mut store, &mut storage, &mut rng, &[], "", 3).err(),
+            Some(NoteError::StorageFull)
+        );
+        assert!(store.get_meta(&spent).is_some(), "the spent record went for nothing");
+        assert_eq!(storage.index.clone().unwrap().len(), MAX_NOTES);
     }
 
     #[test]

@@ -3750,3 +3750,90 @@ with the device operator key.
   whole-frame build might have passed too, so this shows the streamed frame
   arriving intact; that the second content-sized allocation is gone rests on
   `common/tests/ws_frame_memory.rs`.
+
+## 41. Thin LTO in the release profile (added 2026-11-14, NOT YET BENCH-RUN)
+
+Why: the Heltec images sat about 9-13 KB under their 2 MiB app slot, and
+`lto = "thin"` buys lasting room there (figures in `firmware/Cargo.toml`'s
+release profile). It was held back because cross-crate inlining merges Rust
+frames, which changes how deep each task's stack goes and how long its work
+takes. This pass is that check, on a spare board. Use a Heltec V3 or V4 on the
+standard 2 MiB OTA layout (not a V4 legacy-nvs board, which cannot OTA) in
+WiFi-standalone mode, with a disposable identity, a PIN set, the operator key
+installed (`scripts/set-operator.mjs`) and, if one is enrolled, an unlock
+phone. A T-Display or C6 is worth a second run, since they build for other
+cores; their 3 MB slots were never the reason for this change.
+
+Reading the marks: `node scripts/mgmt-request.mjs --method get_status` (the
+device operator's full reply). `stack_free` gives each task's bytes of stack
+never used since it started, `min_free_heap` the free-heap low-water mark:
+
+| Key | Task | Stack (bytes) | Set in |
+|-----|------|---------------|--------|
+| `main` | main: USB and relay loops, signing, TLS | 32,768 | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`, `firmware/sdkconfig.defaults` |
+| `btn_latch` | button sampler (a std thread, "pthread" to FreeRTOS) | 3,072 | `.stack_size(3072)`, `firmware/src/button.rs` |
+| `sys_evt` | default event loop: the WiFi event subscription in `relay.rs` | 2,304 | `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE`, ESP-IDF default |
+| `esp_timer` | esp_timer callbacks, C only (control) | 3,584 | `CONFIG_ESP_TIMER_TASK_STACK_SIZE`, ESP-IDF default |
+| `tcpip` | lwIP `tiT`, C only (control) | 3,072 | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`, ESP-IDF default |
+
+`null` means the task is not running (`btn_latch` failed to spawn, say). The
+marks only ever fall, and a reset of any kind starts them again, so read them
+after each step below and before anything that restarts the board. A reply
+with `truncated` (the low-heap fallback) carries no marks: read again. The
+`esp_timer` and `tcpip` marks move with the workload, not with this change;
+if they differ much between the two runs, the runs were not alike.
+
+Run the steps twice on the same board, in the same order: first on main
+firmware (CI's `app-<board>` artifact from main, or the release image), then
+on this branch's artifact. Record every mark and `min_free_heap` after each
+step, in a table with one column per image.
+
+1. Write this branch's image app-only, as in earlier runs, or OTA to it as in
+   item 9. Power on: the board boots locked, and FIRMWARE_INFO reports the
+   version, the board and `at_rest` `pin`.
+2. PIN unlock over USB: one wrong PIN (`Wrong PIN`, 4 attempts left), then
+   the right one. The relay loop starts; read the marks.
+3. Signing: from a paired NIP-46 client, sign an event that needs the button
+   (hold PRG to approve), one denied with a short press, and an encrypt and
+   decrypt. Read the marks.
+4. Relay: let the board reach all its configured relays (the secondary up),
+   then run the management reads Sapwood polls (`get_status`, `list_clients`,
+   `get_network_config`) and one mutation with `--challenge` and its card.
+   Read the marks.
+5. Sapwood over USB, the board still in WiFi mode: open it, read the status,
+   identities and client list, and leave it polling for 5 minutes. Read the
+   marks over the relay.
+6. Phone unlock, if a phone is enrolled: reboot, let the phone unlock it
+   (kind 24136). Read the marks; the reboot reset them, so compare with the
+   same step on main.
+7. Note store: a note receive or claim, a list, and an export with its hold
+   (section 13). Read the marks.
+8. Soak: 12 hours or more on the relays with Sapwood's poll and a few
+   signatures through it. No reset (`uptime_s` keeps counting, `last_reset`
+   unchanged). Read the marks at the end.
+9. OTA: from this branch's image to main firmware and back again, over USB in
+   USB mode (section 4). Each must verify, reboot into the new version and
+   rejoin WiFi with no rollback. `get_status` does not answer in USB mode, so
+   an OTA's own stack depth cannot be read this way; a stack overflow there
+   would show as a `panic` reset, `crash_detail` `unrecorded`.
+
+Pass: on this branch's image, after every step, `btn_latch` and `sys_evt`
+each keep at least 1,024 bytes unused and `main` at least 4,096; where main
+firmware is already under that floor on one of them, this branch's mark must
+be no lower than main's. `esp_timer` and `tcpip` are informational. No reset
+in any step, and no `last_reset` of `panic` or a watchdog. The
+margin, because the bench samples paths, not the deepest one: rare branches
+(a restore, a backup import, a failed TLS handshake, the panic hook) go
+unmeasured, and an extra mbedTLS or libsecp256k1 call chain on the main task
+is a kilobyte or two. The overflow check (`CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY`)
+only notices at a context switch, after memory past the stack may already be
+overwritten, so the mark is the real safety margin. Also note, though not a
+failure on its own: a Rust task (`main`, `btn_latch`, `sys_evt`) using
+more than 1 KiB more on this branch than on main, and any change in how the
+button feels or how long a signature takes.
+
+On failure: record the step, the marks and `min_free_heap` for both images,
+and `last_reset`, `crashed_during` and `crash_detail` after any reset. OTA or
+write the board back to main firmware. Do not ship thin LTO; either revert
+`lto = "thin"` or raise the short task's stack (the setting in the table above;
+it costs internal RAM, not app image) and run this section again.

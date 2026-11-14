@@ -110,13 +110,20 @@ embuild = "0.33"
 
 # Size-optimise the release binary. The WiFi-standalone + on-device-generation
 # firmware must fit the 2 MB ota_0 slot; default release (opt-level=3) overflowed
-# it. opt-level="z" + a single codegen unit claws it back. LTO is not used. It
-# once broke the secp256k1-sys C build; with -mlongcalls in .cargo/config.toml
-# `lto = "fat"` now links on esp 1.87.0.0 and saves about 135 KB on the Heltec
-# image ("thin" about 45 KB), but it re-inlines every Rust frame, so task stack
-# depth and timing would need a bench pass before it ships. It is the next lever
-# if the slot fills again; std's backtrace (see .cargo/config.toml) and the C
-# log level (the Heltec sdkconfig fragments) were the cheaper ones.
+# it. opt-level="z" + a single codegen unit claws it back, and thin LTO across
+# the Rust crates (not ESP-IDF's C or secp256k1-sys's) takes more. Built as CI
+# builds them on esp 1.87.0.0, thin LTO saved 59,008 B on heltec-v4, 56,032 B
+# on heltec-v3, 60,064 B on tdisplay and 68,192 B on c6; CI's newer toolchain
+# gives smaller images, so its figures will differ. LTO once broke the
+# secp256k1-sys C build; -mlongcalls in .cargo/config.toml is what lets it link.
+# Cross-crate inlining deepens Rust task stacks and shifts timing, so it ships
+# only after the bench pass in docs/HARDWARE-TEST-CHECKLIST.md section 41, read
+# from get_status's `stack_free`. `lto = "fat"` (about 135 KB on the Heltec
+# image, measured on esp 1.87.0.0 before thin was on) is the next lever if the
+# slot fills again, and needs the same bench pass; std's backtrace (see
+# .cargo/config.toml) and the C log level (the Heltec sdkconfig fragments) were
+# the cheaper ones.
 [profile.release]
 opt-level = "z"
 codegen-units = 1
+lto = "thin"

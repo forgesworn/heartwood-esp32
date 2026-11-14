@@ -15,7 +15,7 @@
 //
 // Everything is a function of plain data (slots, the request params, a few
 // facts the firmware supplies), so it runs in host CI. The firmware glue is
-// `firmware/src/site_link.rs`.
+// `firmware/src/relay/site_link.rs`.
 
 use alloc::{
     format,

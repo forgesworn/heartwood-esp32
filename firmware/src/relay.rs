@@ -100,6 +100,8 @@ use crate::sign;
 
 type Tls = EspTls<InternalSocket>;
 
+pub(crate) mod site_link;
+
 const TLS_PORT: u16 = 443;
 /// One wall-clock budget for the complete HTTP Upgrade request and response.
 /// `TlsConfig::timeout_ms` covers `connect`; this separate deadline prevents a
@@ -6149,7 +6151,8 @@ fn full_access_queue_busy(ctx: &SignCtx) -> bool {
 /// `service_button_cards`, before any press on it is judged.
 fn refuse_waiting_full_access(ctx: &mut SignCtx) {
     for card in ctx.button_cards.iter_mut().filter(|card| is_full_access_card(card)) {
-        card.refused = Some(heartwood_common::owner_pairing::BundleError::AnotherFullAccess);
+        let refusal = heartwood_common::owner_pairing::BundleError::AnotherFullAccess;
+        card.refused = Some((refusal.code(), refusal.message()));
     }
 }
 
@@ -6284,10 +6287,14 @@ struct ButtonCard {
     /// review m1); unused by other cards.
     words: crate::card_hold::WordsShown,
     /// Closed before it was answered, with this refusal (review round W3: a
-    /// second bundle arrived while this FULL ACCESS card waited). Resolved on
-    /// the next pass of `service_button_cards`; nothing is granted.
-    refused: Option<heartwood_common::owner_pairing::BundleError>,
+    /// second bundle arrived while this FULL ACCESS card waited; or a second
+    /// link ask while this LINK card waited). Resolved on the next pass of
+    /// `service_button_cards`; nothing is granted.
+    refused: Option<CardRefusal>,
 }
+
+/// A refusal that closes a waiting card: its error code and message.
+type CardRefusal = (i32, &'static str);
 
 /// Whether this card has been on screen for its whole window.
 fn card_overdue(card: &ButtonCard) -> bool {
@@ -6307,7 +6314,7 @@ enum CardTick {
     Expired,
     /// Closed unanswered with this refusal (review round W3); nothing is
     /// granted and every ask on it gets the refusal's message.
-    Refused(heartwood_common::owner_pairing::BundleError),
+    Refused(CardRefusal),
 }
 
 /// Re-resolve a served identity to its signing key and owning master.
@@ -6613,6 +6620,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         Batch(String, String),
         Enrol([&'static str; heartwood_common::phone_unlock::REQUEST_CODE_WORDS], String),
         FullAccess(String, [u8; 32], Vec<String>, heartwood_common::owner_pairing::Style),
+        Link(heartwood_common::site_link::LinkCard),
     }
     // A paged card's page and whether a hold counts yet (its hint).
     let (card_page, card_armed) = view.unwrap_or((0, true));
@@ -6652,6 +6660,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
         crate::nip46_handler::AskCard::FullAccess { label, client_pubkey, act_as, style } => {
             Draw::FullAccess(label.clone(), *client_pubkey, act_as.clone(), *style)
         }
+        crate::nip46_handler::AskCard::SiteLink { card, .. } => Draw::Link(card.clone()),
     };
     // What the panel now READS, once per wording, so a bench can check an
     // amount or a mint without a camera on the OLED (checklist 13, 2b).
@@ -6684,6 +6693,10 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             Draw::FullAccess(label, client, act_as, style) => {
                 let card = heartwood_common::owner_pairing::full_access_card(label, 64, client, act_as, *style);
                 (card.header.to_string(), card.lines()[1..].join(" / "))
+            }
+            Draw::Link(card) => {
+                let [head, lines @ ..] = card.lines(64, 64, 64);
+                (head, lines.join(" / "))
             }
         };
         log::info!("[relay] card reads '{head}' / '{}'", body.replace('\n', " / "));
@@ -6729,6 +6742,7 @@ fn draw_button_card(ctx: &mut SignCtx, remaining: u32, hold_ms: u32) {
             card_page,
             card_armed,
         ),
+        Draw::Link(card) => crate::oled::show_link_request(ctx.display, &card, remaining),
         Draw::FullAccess(_label, client, act_as, style) => crate::oled::show_full_access(
             ctx.display,
             &client,
@@ -7065,6 +7079,17 @@ fn resolve_button_card(
         return;
     }
 
+    // A LINK card (site links design 4.4): its hold makes the slot in
+    // `site_link::complete`; a decline or a timeout starts the phone's
+    // cooldown. Its reply goes the way every card's does, below.
+    let link = card
+        .asks
+        .first()
+        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::SiteLink { .. }));
+    if link && matches!(outcome, CardTick::Denied | CardTick::Expired) {
+        site_link::cooldown(&card.key.client_hex);
+    }
+
     // A button-approved heartwood_derive_persona (or remove) changes the
     // registry here, long after the arrival path's growth check has run. Mirror
     // that check or the fresh persona never joins the live `#p` filters until
@@ -7085,6 +7110,7 @@ fn resolve_button_card(
         };
 
         let mut response_json = match outcome {
+            CardTick::Approved if link => site_link::complete(ctx, &ask.ask, slot, &card.key.client_hex),
             CardTick::Approved => {
                 match crate::nip46_handler::dispatch(
                     ask.ask.request,
@@ -7119,8 +7145,8 @@ fn resolve_button_card(
             }
             CardTick::Denied => nip46::build_error_response(&request_id, -1, "user denied")
                 .unwrap_or_default(),
-            CardTick::Refused(refusal) => {
-                nip46::build_error_response(&request_id, refusal.code(), refusal.message()).unwrap_or_default()
+            CardTick::Refused((code, message)) => {
+                nip46::build_error_response(&request_id, *code, message).unwrap_or_default()
             }
             _ => nip46::build_error_response(&request_id, -1, "timeout").unwrap_or_default(),
         };
@@ -8102,7 +8128,7 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
     // never approve it.
     if let Some(index) = ctx.button_cards.iter().position(|card| card.refused.is_some()) {
         if let Some(refusal) = ctx.button_cards[index].refused {
-            log::warn!("[relay] FULL ACCESS card closed: {}", refusal.message());
+            log::warn!("[relay] card closed: {}", refusal.1);
             resolve_button_card(ctx, sessions, index, &CardTick::Refused(refusal));
             return;
         }
@@ -8600,6 +8626,23 @@ fn handle_nip46_event(
             request.id
         );
         return Ok(());
+    }
+    // Site links (site links design 4.5) are answered here, where the card
+    // queue and the relays are, before any tier or policy is looked at.
+    if nip46::Nip46Method::from_str(&request.method).is_site_link() {
+        return site_link::handle(
+            tls,
+            ctx,
+            request,
+            slot,
+            target_pk,
+            &client_pubkey,
+            &ev.pubkey,
+            &conversation_key,
+            &signing_secret,
+            ev.created_at,
+            received_uptime,
+        );
     }
     let audit = sign_audit_draft(
         &request,

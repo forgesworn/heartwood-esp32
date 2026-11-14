@@ -449,11 +449,7 @@ fn approve_bundle(
         let Some(slot) = slot else {
             return Err(BundleError::Unauthorised);
         };
-        let room = crate::nvs_stats::read().map(|stats| heartwood_common::nvs_room::NvsRoom {
-            free_entries: stats.free_entries,
-            total_entries: stats.total_entries,
-            reclaimable_entries: crate::policy::avatar_cache_entries(nvs_read),
-        });
+        let room = nvs_room(nvs_read);
         let registry = crate::personas::registry_tail(nvs_read);
         let verdict = op::check_bundle_save_room(table, slot, client_hex, checked, plan, room, registry);
         if verdict.is_err() {
@@ -951,6 +947,14 @@ pub enum AskCard {
         act_as: Vec<String>,
         style: heartwood_common::owner_pairing::Style,
     },
+    /// A site link, `heartwood_link_create` (site links design 4.4): the
+    /// LINK card, a 2 s hold, a 30 s window, never shared. Relay only; the
+    /// relay loop raises and answers it itself (`relay::site_link`), and
+    /// the request is re-checked against the slot tables at the hold.
+    SiteLink {
+        card: heartwood_common::site_link::LinkCard,
+        create: heartwood_common::site_link::CreateRequest,
+    },
 }
 
 /// An ask handed back to a deferring caller, and handed in again once the
@@ -1346,6 +1350,14 @@ fn dispatch_inner(
     // own slot. The tier is decided from the method name alone, so left to
     // it they would prompt (legacy), be refused (strict) or be parked for a
     // guardian (escalate), and a status question must do none of those.
+    // Site links (site links design 4.5) are made over the board's relay
+    // connection, where the card queue and the ledger live; the relay loop
+    // answers them before dispatch. The cable and the Pi get this refusal,
+    // before any tier, card or slot is looked at.
+    if method.is_site_link() {
+        let refusal = heartwood_common::site_link::LinkError::RelayOnly;
+        return build_error_json(&request.id, refusal.code(), refusal.message());
+    }
     if method.answered_before_tier() {
         return answer_owner_method(&request, &method, policy_engine, nvs, master_slot, &client_hex, has_client, client_is_bound);
     }
@@ -1986,6 +1998,20 @@ fn dispatch_inner(
                                     client_hex.clone(),
                                 ) {
                                     return build_error_json(&request.id, -1, "client_capacity: remove an unused device from this pairing first");
+                                }
+                                // A site link's first bind inside the minute
+                                // after its hold (site links design 4.2):
+                                // this key also gets the identity grant, so
+                                // the site's first signature asks nothing.
+                                // The entry goes whatever the outcome; a
+                                // late bind or another credential gets none.
+                                // Written with the bind below.
+                                if let Some(identity) = crate::relay::site_link::take_on_bind(
+                                    master_slot,
+                                    slot_index,
+                                    client_secret,
+                                ) {
+                                    policy_engine.record_identity(master_slot, Ok(&client_hex), &identity);
                                 }
                                 // Update label from app metadata if slot is still "default".
                                 if !app_label.is_empty() {
@@ -2641,6 +2667,10 @@ fn dispatch_inner(
                 "heartwood_approve_bundle",
                 "heartwood_owner_status",
                 "heartwood_owner_narrow",
+                // Site links (site links design 4.5), relay only.
+                heartwood_common::site_link::METHOD_CREATE,
+                heartwood_common::site_link::METHOD_STATUS,
+                heartwood_common::site_link::METHOD_REVOKE,
             ];
             nip46::build_capabilities_response(&request.id, METHODS).unwrap_or_default()
         }
@@ -2858,6 +2888,18 @@ pub(crate) fn plan_gate(
         vault,
     );
     Ok((gate, identity))
+}
+
+/// The NVS room a pre-hold check reads (the bundle's and a site link's):
+/// FIRMWARE_INFO's entry stats, with the avatar cache counted reclaimable.
+pub(crate) fn nvs_room(
+    nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
+) -> Option<heartwood_common::nvs_room::NvsRoom> {
+    crate::nvs_stats::read().map(|stats| heartwood_common::nvs_room::NvsRoom {
+        free_entries: stats.free_entries,
+        total_entries: stats.total_entries,
+        reclaimable_entries: crate::policy::avatar_cache_entries(nvs),
+    })
 }
 
 /// The card label of an identity: a registered persona's name (or purpose

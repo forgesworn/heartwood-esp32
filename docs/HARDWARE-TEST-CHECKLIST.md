@@ -3755,9 +3755,13 @@ method share the rule; the blob is stored as received.
 1. Send a 64x64 RGB332 picture (4,096 pixel bytes) over the cable and over
    the relay. Both ACK, and the identity card shows it full size with fewer
    colours. Send a 64x64 Rgb565 one: unchanged from before. Sapwood sends
-   RGB332 only over the cable, so the relay half needs a hand-built
-   kind-24134 `set_identity_meta` request.
-2. Send a 64x64 picture of 4,095 or 4,097 bytes: NACK over the cable, an error
+   RGB332 only over the cable, so for the relay half run
+   `node scripts/mgmt-request.mjs --method set_identity_meta --challenge
+   --params "$(node scripts/identity-meta-params.mjs --name bench)"`
+   (add `--format rgb565` for the Rgb565 case). The picture is red, green,
+   blue and white bands inside a black border.
+2. Send a 64x64 picture of 4,095 or 4,097 bytes (relay: add `--bytes 4095`
+   or `--bytes 4097` to the params script): NACK over the cable, an error
    from the relay, the stored picture untouched.
 3. On a tight board (T-Display with a stored 48x48 Rgb565 picture, 4,610
    bytes) send the 64x64 RGB332 one (4,098 bytes). The smaller blob makes the
@@ -3768,5 +3772,5 @@ method share the rule; the blob is stored as received.
    it disappears at the next redraw or reboot, and the identity card falls
    back to npub only until a picture is sent again (as on base).
 4. The relay redraw after a relay `set_identity_meta` of an RGB332 picture does
-   not reboot the board (no expanded buffer is allocated). Needs the same
-   hand-built relay request as step 1.
+   not reboot the board (no expanded buffer is allocated). Same request as
+   step 1.

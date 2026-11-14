@@ -1177,6 +1177,34 @@ mod error_card_tests {
         }
     }
 
+    /// `oled::show_unseal_progress` swaps its header for a warning on the last
+    /// PIN guess the wipe counter allows. That screen is not mirrored here, so
+    /// this reads its words from oled.rs and checks the swapped header and the
+    /// unchanged "Keep power on" line sit inside the margins of every panel,
+    /// drawn where the firmware draws them.
+    #[test]
+    fn the_last_pin_attempt_warning_fits_every_panel() {
+        use super::{style, OK, WARN};
+        use embedded_graphics::{prelude::*, text::Text};
+        let oled = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/oled.rs")).unwrap();
+        let start = oled.find("pub fn show_unseal_progress(").expect("show_unseal_progress");
+        let body = &oled[start..start + oled[start..].find("\n}\n").unwrap()];
+        let literals = string_literals(body);
+        for expected in ["LAST ATTEMPT", "UNSEALING", "Keep power on"] {
+            assert!(literals.iter().any(|s| s == expected), "show_unseal_progress no longer draws {expected:?}");
+        }
+        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+            let l = Layout::new(w, h);
+            let (left, right) = l.text_span(None);
+            for (text, font, colour) in [("LAST ATTEMPT", l.font_header(), WARN), ("Keep power on", l.font_body(), OK)] {
+                let x = l.center_in_span(None, text.len() as i32 * Layout::glyph_w(font));
+                let bounds = Text::new(text, Point::new(x, l.sy(10)), style(font, colour)).bounding_box();
+                let end = bounds.bottom_right().unwrap().x;
+                assert!(bounds.top_left.x >= left && end < right, "{text:?} leaves the span on {w}x{h}: {bounds:?}");
+            }
+        }
+    }
+
     /// A FULL ACCESS card the one-card rule closes draws its refusal whether
     /// or not it reached the screen (review round 3, S1), and so does one
     /// that closes unopened for any other reason (F2): the `Refused` arm

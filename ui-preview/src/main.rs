@@ -267,6 +267,77 @@ fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     draw_countdown(d, &l, secs, total);
 }
 
+/// A site link's LINK card (mirrors `oled::show_link_request`, which draws
+/// on the extension card's rows, `FROM` where that card's hint goes). `part`
+/// draws one piece alone for the geometry test (0 header, 1 AS, 2 scope,
+/// 3 FROM, 4 countdown); `None` draws the card.
+fn draw_link<D: DrawTarget<Color = Rgb565>>(
+    d: &mut D,
+    card: &heartwood_common::site_link::LinkCard,
+    secs: u32,
+    part: Option<usize>,
+) {
+    let l = layout_of(d);
+    let [heading, as_line, scope, from] = link_lines(&l, card);
+    let show = |n: usize| part.is_none_or(|p| p == n);
+    if show(0) {
+        header(d, &l, &heading);
+    }
+    if show(1) {
+        Text::new(&as_line, Point::new(l.sx(2), l.sy(25)), style(l.font_body(), FG)).draw(d).ok();
+    }
+    if show(2) {
+        Text::new(&scope, Point::new(l.sx(2), l.sy(35)), style(l.font_small(), FG)).draw(d).ok();
+    }
+    if show(3) {
+        Text::new(&from, Point::new(l.sx(2), l.sy(45)), style(l.font_small(), ACCENT)).draw(d).ok();
+    }
+    if show(4) {
+        draw_countdown(d, &l, secs, 30);
+    }
+}
+
+/// The LINK card's lines as the firmware cuts them: to the span inside the
+/// margins, per row font.
+fn link_lines(l: &Layout, card: &heartwood_common::site_link::LinkCard) -> [String; 4] {
+    card.lines(
+        l.span_chars(None, l.font_header()),
+        l.span_chars(None, l.font_body()),
+        l.span_chars(None, l.font_small()),
+    )
+}
+
+/// LINK cards for the preview and its tests: an everyday one, the longest
+/// of everything, and one for an identity on another master.
+fn sample_link_cards() -> [(&'static str, heartwood_common::site_link::LinkCard); 3] {
+    use heartwood_common::policy::validate_exact_slot_policy;
+    use heartwood_common::site_link::link_card;
+    let sign = |kinds: Vec<u64>| {
+        validate_exact_slot_policy(
+            vec!["get_public_key".into(), "sign_event".into(), "nip44_encrypt".into(), "nip44_decrypt".into()],
+            kinds,
+            true,
+        )
+        .expect("a valid link policy")
+    };
+    let long = "W".repeat(64);
+    [
+        ("link", link_card("mysignet:kithmoot.com:1a2b3c4d", "master-1", 0, 0, &sign(vec![1, 7, 22242]), "My Signet phone")),
+        (
+            "link-longest",
+            link_card(
+                "mysignet:a-very-long-sign-in-host.example.co.uk:1a2b3c4d",
+                &long,
+                7,
+                0,
+                &sign(vec![]),
+                &long,
+            ),
+        ),
+        ("link-other-master", link_card("mysignet:kithmoot.com:1a2b3c4d", "persona", 3, 0, &sign(vec![1]), "phone")),
+    ]
+}
+
 /// Countdown bar: muted track + proportional fill coloured by urgency
 /// (mirrors `oled::draw_countdown_bar`).
 fn draw_countdown<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, secs: u32, total: u32) {
@@ -1016,6 +1087,9 @@ fn main() {
         render(&format!("login-longest-{b}"), w, h, |d| {
             draw_sign(d, "WWWWWWWWWWWWWWWWWWWW", "sign_event", 22242, "Log in to my-node", Some("88888888"), None, 18, 30)
         });
+        for (name, card) in sample_link_cards() {
+            render(&format!("{name}-{b}"), w, h, |d| draw_link(d, &card, 18, None));
+        }
         render(&format!("sign-urgent-{b}"), w, h, |d| {
             draw_sign(d, "primal", "sign_event", 30078, "Sync app settings", None, None, 4, 30)
         });
@@ -2058,5 +2132,87 @@ mod full_access_card_tests {
                 assert!(allowed_callers.contains(&f.as_str()), "{path}: {f} draws the FULL ACCESS bar");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod link_card_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const PANELS: [(u32, u32); 4] = [(128, 64), (240, 135), (172, 320), (320, 172)];
+
+    fn lit(draw: impl Fn(&mut SimulatorDisplay<Rgb565>), w: u32, h: u32) -> Vec<Point> {
+        let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
+        d.clear(BG).ok();
+        draw(&mut d);
+        d.bounding_box().points().filter(|p| d.get_pixel(*p) != BG).collect()
+    }
+
+    /// Site links design 4.4: every line of the LINK card, the longest of
+    /// everything included, is drawn whole inside the panel and the margins
+    /// on every panel and orientation, and no two pieces meet.
+    #[test]
+    fn the_link_card_fits_every_panel_and_never_overprints_itself() {
+        for (w, h) in PANELS {
+            let l = Layout::new(w as i32, h as i32);
+            let (left, right) = l.text_span(None);
+            for (name, card) in sample_link_cards() {
+                let pieces: Vec<(usize, Vec<Point>)> =
+                    (0..5).map(|n| (n, lit(|d| draw_link(d, &card, 18, Some(n)), w, h))).collect();
+                for (n, points) in &pieces {
+                    assert!(!points.is_empty(), "{w}x{h} {name}: piece {n} drew nothing");
+                    assert!(
+                        points.iter().all(|p| p.y >= 0 && p.y < h as i32 && p.x >= 0 && p.x < w as i32),
+                        "{w}x{h} {name}: piece {n} leaves the panel"
+                    );
+                    // The header's rule runs edge to edge; its text, and every
+                    // other line, stays inside the margins.
+                    if (1..4).contains(n) {
+                        assert!(
+                            points.iter().all(|p| p.x >= left && p.x < right),
+                            "{w}x{h} {name}: piece {n} leaves the margins"
+                        );
+                    }
+                }
+                let sets: Vec<HashSet<Point>> = pieces.iter().map(|(_, p)| p.iter().copied().collect()).collect();
+                for i in 0..pieces.len() {
+                    for j in i + 1..pieces.len() {
+                        let clash = pieces[i].1.iter().find(|p| sets[j].contains(p));
+                        assert!(clash.is_none(), "{w}x{h} {name}: pieces {i} and {j} meet at {clash:?}");
+                    }
+                }
+                let [heading, as_line, scope, from] = link_lines(&l, &card);
+                let glyph = |font| Layout::glyph_w(font);
+                assert!(l.sx(2) + heading.len() as i32 * glyph(l.font_header()) <= right, "{w}x{h} {name}: {heading}");
+                assert!(l.sx(2) + as_line.len() as i32 * glyph(l.font_body()) <= right, "{w}x{h} {name}: {as_line}");
+                for line in [&scope, &from] {
+                    assert!(l.sx(2) + line.len() as i32 * glyph(l.font_small()) <= right, "{w}x{h} {name}: {line}");
+                }
+                // The site is the phone's word, never shown as checked.
+                assert!(heading.starts_with("LINK ?") && heading.ends_with('?'), "{w}x{h} {name}: {heading}");
+                assert!(as_line.starts_with("AS "), "{w}x{h} {name}: {as_line}");
+                assert!(from.starts_with("FROM "), "{w}x{h} {name}: {from}");
+                if name == "link-other-master" {
+                    assert!(as_line.ends_with(" M3"), "{w}x{h}: {as_line}");
+                }
+            }
+        }
+    }
+
+    /// The firmware draws the card with `show_link_request` from the card's
+    /// own lines, at the extension card's rows; this pins the rows the mirror
+    /// copies, so the two cannot drift.
+    #[test]
+    fn the_mirror_uses_the_firmware_rows() {
+        let oled = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/oled.rs")).unwrap();
+        let start = oled.find("\nfn show_header_body_small(").expect("show_header_body_small");
+        let end = start + oled[start + 1..].find("\n}\n").expect("its end");
+        let body = &oled[start..end];
+        for row in ["l.sy(10)", "l.sy(14)", "l.sy(25)", "l.sy(35)", "l.sy(45)", "draw_countdown_bar(display, seconds_remaining, 30)"] {
+            assert!(body.contains(row), "show_header_body_small no longer has {row}");
+        }
+        let link = oled.find("pub fn show_link_request(").expect("show_link_request");
+        assert!(oled[link..].contains("l.span_chars(None, l.font_header())"), "the link card lines are cut to the span");
     }
 }

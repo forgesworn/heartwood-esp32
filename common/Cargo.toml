@@ -6,7 +6,9 @@ description = "Shared crypto for heartwood-esp32 — derivation, encoding, types
 license = "MIT"
 
 [dependencies]
-k256 = { version = "0.14", default-features = false, features = ["schnorr", "arithmetic", "ecdh"], optional = true }
+k256 = { version = "=0.14.0", default-features = false, features = ["schnorr", "arithmetic", "ecdh"], optional = true }
+# Security floor for the k256/elliptic-curve graph (RUSTSEC-2026-0387).
+crypto-bigint = { version = ">=0.7.6, <0.8", default-features = false, optional = true }
 secp256k1 = { version = "0.29", default-features = false, features = ["alloc"], optional = true }
 hmac = { version = "0.12", default-features = false }
 # `compress` exposes sha2's bare compression function, which common/src/kdf.rs
@@ -15,7 +17,6 @@ hmac = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false, features = ["compress"] }
 zeroize = { version = "1", default-features = false, features = ["derive", "alloc"] }
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
-crc32fast = { version = "1", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
 hkdf = { version = "0.12", default-features = false, optional = true }
@@ -46,9 +47,11 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], opti
 ledger_secure_sdk_sys = { version = "1.16", optional = true }
 
 [dev-dependencies]
+# The reference the in-crate CRC-32 (src/crc32.rs) is checked against.
+crc32fast = { version = "1", default-features = false }
 # Executes the actual private firmware journal codec; no RNG/default features.
 chacha20poly1305 = { version = "=0.10.1", default-features = false }
-vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "e6985dd9583207853ffa9f5224b33e05d5094010", default-features = false }
+vmls-core = { git = "https://github.com/forgesworn/vmls-core", rev = "1c0adece2ec71ccfca0d98cafc7e3ddb0ebf33a2", default-features = false }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -60,7 +63,7 @@ compact-hashes = ["sha2/force-soft-compact"]
 # Host fault test of the actual firmware boot-crypto guard. Bench only.
 allocation-crypto-selfcheck-fail = []
 default = ["k256-backend"]
-k256-backend = ["dep:k256"]
+k256-backend = ["dep:k256", "dep:crypto-bigint"]
 secp256k1-backend = ["dep:secp256k1"]
 # Curve ops on the Ledger secure element — the heartwood-ledger app's backend.
 # Mutually exclusive with the other two backends, like they are with each
@@ -68,6 +71,10 @@ secp256k1-backend = ["dep:secp256k1"]
 # in the OS via os_perso_derive_node_bip32, never in-app).
 ledger-backend = ["dep:ledger_secure_sdk_sys"]
 nip46 = ["dep:serde", "dep:serde_json"]
+# std-only helpers for std consumers (the ESP-IDF firmware): serde_json's
+# writer API, which `mgmt::encode_list_clients_reply` uses to build a reply
+# in one exactly sized buffer. The crate itself stays no_std.
+std = ["serde_json?/std"]
 nip44 = ["dep:chacha20", "dep:hkdf", "dep:base64"]
 nip04 = ["dep:aes", "dep:cbc", "dep:base64"]
 # On-device recovery-phrase entry/derivation (BIP-39 mnemonic -> BIP-32 tree root).

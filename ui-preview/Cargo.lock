@@ -363,7 +363,7 @@ dependencies = [
  "base64",
  "bech32",
  "chacha20",
- "crc32fast",
+ "crypto-bigint",
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "k256",

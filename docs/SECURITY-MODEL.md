@@ -232,6 +232,62 @@ legitimate managers can race for the same one-time challenge; one succeeds and
 the other receives an explicit stale-state error, refreshes, and asks the user
 to retry instead of applying an index-sensitive change to newer state.
 
+### Relay sign-in (NIP-42) — the one signature with no button
+
+A relay may refuse to serve a connection until it signs in (NIP-42): it sends
+`["AUTH", <challenge>]` and holds or closes subscriptions until the client
+answers with a kind-22242 event per key. In WiFi-standalone mode the board
+answers this itself, with no button and no card, because it is signing in its
+own connection, not signing for anyone; nobody but the relay at the other end
+of that connection can ask, and only for that connection.
+
+What bounds it (`common/src/relay_auth.rs`, host-tested; `firmware/src/relay.rs`
+`answer_auth` and `locked_relay_auth`):
+
+- **Fixed shape.** Kind 22242, tags exactly `["relay", <url>]` and
+  `["challenge", <challenge>]`, empty content. Nothing a relay sends can add a
+  tag, change the kind or put content in it.
+- **The board's own URL.** The `relay` tag is the URL the board dialled, from
+  its own configured relay list (or a relay pinned at a pairing the owner
+  approved), never anything the relay sent. A login challenge from some other
+  service, passed off as a relay challenge, comes back bound to this relay's
+  URL, which that service does not expect.
+- **Only when asked.** Nothing is sent until the relay challenges; a relay that
+  never asks sees exactly what it saw before. A challenge must be printable
+  ASCII of at most 256 bytes, the same challenge is never answered twice, and
+  at most two challenges are answered per connection, so a relay cannot make
+  the board sign without end.
+- **Which keys.** Unlocked: every master, and the per-boot delivery-probe key.
+  A relay that allowlists the masters then serves every subscription, and on a
+  relay that admits a filter only when every `authors`/`#p` key is signed in,
+  a board with no personas is fully covered. Personas are deliberately not
+  signed in: a persona's 22242 over the same challenge as its master would be a
+  proof, checkable by anyone the relay shows it to, that the two are held
+  together, and each costs a re-derivation and a signature on every connect.
+  Locked: only the boot's one-time unlock key, the one key the `locked`
+  subscription names, so a relay applying the `#p` rule lets the kind-24136
+  delivery through; the masters are sealed and never sign anything while
+  locked.
+- **Not on publish-only connections.** The connections that carry phone relay
+  updates and old-relay lock announcements exist so that nothing on them names
+  the signer; a master's sign-in there would. They never answer a challenge.
+- **No loop.** A subscription the relay closed `auth-required:` or
+  `restricted:` while the sign-in was outstanding is re-sent once the relay's
+  `OK`s arrive; one closed after sign-in is re-sent straight away; either
+  way, once per sign-in. A second refusal, every
+  key refused (or not answered within 10 s) with a subscription closed for it,
+  or an `auth-required:` with no challenge within 5 s, drops the connection and
+  leaves the relay alone for 10 minutes (`relay_cooldown::Refusal::AuthRefused`),
+  as for a relay that rate-limits the board. Any other closure, and a
+  `restricted:` from a relay that never challenged, is handled as before.
+
+**Residual:** the relay learns which keys the connection holds, which it
+already knew from the subscription's filters, and now holds a signature by
+each over its own challenge, bound to its own URL. Those signatures are proof
+to a third party that the keys signed in together (the reason personas are
+left out), and are worth nothing to any other relay or service that checks
+the `relay` tag and issues its own challenges, as NIP-42 requires.
+
 ### Exact v2 client policies
 
 Authenticated `create_client_v2` and `nostrconnect_v2` install the requested
@@ -558,7 +614,9 @@ changes hands:
   in RAM**, announces it over its relays (ephemeral kind 24135, p-tagged to
   the operator) every 60 s, and Sapwood pushes the vault key back live
   (ephemeral kind 24136, NIP-44 operator→unlock pubkey). Ephemeral kinds are
-  never stored by relays, so there is no standing ciphertext to scrape.
+  never stored by relays, so there is no standing ciphertext to scrape. A
+  relay that asks for a NIP-42 sign-in is answered as the one-time unlock key
+  only (see "Relay sign-in" above).
 - `VAULT_SET` (0x62) enables/disables the wrapping; it requires bridge
   authentication **and** physical button confirmation, so a remote party can
   never change the at-rest posture.
@@ -570,7 +628,9 @@ changes hands:
   three call sites share, rather than each composing it separately.
   `FIRMWARE_INFO` answers this to any USB host, in any mode, including while
   locked (the same trust level as its other operational fields — uptime, RNG
-  state, crash context); `relay` `get_status` only once genuinely unlocked,
+  state, crash context, and since 2026-11-13 `crash_detail`: a panic's
+  source `file:line` or a failed allocation's size, never a panic message,
+  which can carry request data); `relay` `get_status` only once genuinely unlocked,
   and only to the device operator, never a per-identity delegate — including
   its low-heap `minimal_status_json` fallback, which used to leak
   `master_count`, `relay` and `crashed_during` to a delegate too (now fixed
@@ -637,7 +697,11 @@ changes hands:
   proven correct, before migration or the marker repair (the two writes that
   can follow): a power cut during either can no longer catch the counter
   mid-way stale and leave an owner who just typed the right PIN one guess
-  from a wipe.
+  from a wipe. A guess is counted on flash before it is checked, so the one
+  case left is the last guess allowed: the count already reads 5 while the
+  PIN is stretched, and a power cut before that clear wipes the board at the
+  next boot even when the PIN was right. The unlock screen's header reads
+  LAST ATTEMPT for exactly that guess, above "Keep power on".
 
 Security properties and honest residuals:
 

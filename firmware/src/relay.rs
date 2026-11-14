@@ -60,6 +60,7 @@ use heartwood_common::delivery_probe::{
 use heartwood_common::hex::{hex_decode, hex_encode};
 use heartwood_common::mgmt;
 use heartwood_common::home_relay::{HomeAction, HomeReturn, HomeState};
+use heartwood_common::relay_auth::{self, RelayAuth};
 use heartwood_common::relay_cooldown::{self, RelayCooldowns};
 use heartwood_common::net_config::{
     apply_remote_net_config_patch, network_activation_source_allowed,
@@ -252,8 +253,10 @@ const RELAY_HEALTH_MIN_BLOCK: usize = 16_384;
 const RELAY_HEAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Whether the free heap can safely transport a response of `len` bytes.
 ///
-/// The owned encryption and direct WebSocket writers now reuse the plaintext
-/// allocation and keep at most one output-sized allocation beside it. Require
+/// Owned encryption pads and encrypts the plaintext in its own allocation and
+/// base64-encodes it into one output-sized allocation beside it; the
+/// WebSocket writer then streams the event through a 512-byte buffer
+/// (`ws_send_framed`) rather than copying it into a whole frame. Require
 /// one contiguous block large enough for the exact NIP-44 output plus envelope
 /// overhead, and enough total free heap for that allocation plus runtime
 /// working room. A genuinely starved or fragmented heap still degrades to a
@@ -667,6 +670,24 @@ fn draw_relay_idle_page(ctx: &mut SignCtx<'_, '_, '_>) {
         }
         _ => show_idle_identity(ctx),
     }
+}
+
+/// Light a blanked panel for a request or a cable frame, which may draw
+/// nothing at all. A wake alone is not enough: on the colour LCDs the sleep
+/// blanked the frame (`St7789Display::set_display_on`), so the backlight came
+/// on over black and stayed so for the whole blank timeout, which reads as a
+/// hung board (bench 2026-11-08, a `heartwood_capabilities` probe); on the
+/// mono panel it re-lit whatever was last in panel RAM, possibly a stale
+/// card. The idle screen goes up at once, as a button wake already does
+/// ([`service_button`]), and anything the request draws replaces it.
+fn wake_to_idle(ctx: &mut SignCtx<'_, '_, '_>) {
+    if ctx.display_on {
+        return;
+    }
+    crate::oled::wake_display(ctx.display);
+    ctx.display_on = true;
+    ctx.idle_page = 0;
+    show_idle_identity(ctx);
 }
 
 fn show_idle_identity(ctx: &mut SignCtx<'_, '_, '_>) {
@@ -1175,6 +1196,9 @@ struct RelaySession {
     probe: SessionProbe,
     /// Event id of the probe in flight, to match the relay's `OK` for it.
     probe_id: Option<String>,
+    /// NIP-42 sign-in on this connection (`heartwood_common::relay_auth`).
+    /// Fresh per connect; idle unless the relay sends a challenge.
+    auth: RelayAuth,
 }
 
 /// A relay joined at nostrconnect pairing because the client dictated it.
@@ -2577,6 +2601,10 @@ fn connect_secondary(url: &str, ctx: &mut SignCtx) -> Result<RelaySession, Strin
         })
 }
 
+/// Relay sessions opened since boot (every dial that returns `Ok`), reported by
+/// `get_status` as `relay_connects` to correlate heap drift with reconnects.
+static RELAY_CONNECTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Sentinel error: the relay socket could not be given a recv timeout and the
 /// caller required one (see [`connect_relay_raw`]).
 const RECV_TIMEOUT_REQUIRED: &str = "recv-timeout required";
@@ -2657,6 +2685,7 @@ fn connect_relay_raw(
     }
 
     let now = Instant::now();
+    RELAY_CONNECTS.fetch_add(1, Ordering::Relaxed);
     Ok(RelaySession {
         tls,
         url: url.to_string(),
@@ -2674,6 +2703,7 @@ fn connect_relay_raw(
         resubs: 0,
         probe: SessionProbe::new(uptime_ms()),
         probe_id: None,
+        auth: RelayAuth::new(),
     })
 }
 
@@ -2901,6 +2931,11 @@ fn locked_relay_phase(
     // listen there, not here, so each phone's announcement is repeated on
     // them. When, and how a dead one backs off: phone_relays::OldRelayDials.
     let mut old_dials = phone_relays::OldRelayDials::new(if phones.is_empty() { &[] } else { told_old });
+    // Relays whose NIP-42 sign-in failed or did not help this phase, passed
+    // by in the rotation for a while (`locked_relay_auth`). Empty, and so no
+    // change to the rotation, unless a relay asked for a sign-in.
+    let mut auth_cooldowns = RelayCooldowns::new();
+    let mut dial_after = Instant::now();
 
     loop {
         crate::wdt::feed();
@@ -2957,7 +2992,20 @@ fn locked_relay_phase(
             }
         }
         // (Re)connect round-robin until a relay holds.
-        if session.is_none() && !wifi_retry.needs_join(wifi.is_up().unwrap_or(false)) {
+        if session.is_none()
+            && !wifi_retry.needs_join(wifi.is_up().unwrap_or(false))
+            && Instant::now() >= dial_after
+        {
+            // Pass by a relay that refused the sign-in; when every one has,
+            // dial the soonest to cool, no more often than the main loop does.
+            let hosts: Vec<&str> = relays.iter().map(|r| relay_host(r)).collect();
+            if let Some(pick) = auth_cooldowns.pick(&hosts, relay_idx, uptime_ms()) {
+                relay_idx = pick.index;
+                if pick.all_cooling {
+                    dial_after = Instant::now() + COOLED_DIAL_SPACING;
+                }
+            }
+            drop(hosts);
             match connect_relay_raw(&relays[relay_idx], sub_req.clone(), false, true) {
                 Ok(s) => {
                     log::info!("[relay] locked: connected {}", relays[relay_idx]);
@@ -3022,11 +3070,47 @@ fn locked_relay_phase(
                 just_announced = !phones.is_empty();
             }
 
+            // Sign-in deadlines (see `locked_relay_auth`).
+            let step = s.auth.tick(uptime_ms());
+            match locked_auth_step(s, step) {
+                Ok(LockedAuth::Continue) => {}
+                Ok(LockedAuth::BackOff) => {
+                    auth_cooldowns.cool(relay_host(&s.url), relay_cooldown::Refusal::AuthRefused, uptime_ms());
+                    log::warn!("[relay] locked: {} refused the sign-in; rotating", relay_host(&s.url));
+                    relay_idx = (relay_idx + 1) % relays.len();
+                    session = None;
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("[relay] locked: re-subscribe failed: {e}");
+                    session = None;
+                    continue;
+                }
+            }
+
             // Drain one buffered frame, else one read (recv-timeout paced).
             match try_parse(&mut s.rx, &mut s.skip) {
                 Ok(Some(WsMsg::Text(raw))) => {
                     s.last_rx = Instant::now();
-                    if nip46::relay_message_tag(&raw) == Some("EVENT") {
+                    let tag = nip46::relay_message_tag(&raw);
+                    if let Some(tag @ ("AUTH" | "OK" | "CLOSED")) = tag {
+                        let wall = clock.projected(crate::uptime_s());
+                        match locked_relay_auth(s, tag, &raw, secp, &unlock_sk, &unlock_pk_hex, wall) {
+                            Ok(LockedAuth::Continue) => {}
+                            Ok(LockedAuth::BackOff) => {
+                                auth_cooldowns.cool(relay_host(&s.url), relay_cooldown::Refusal::AuthRefused, uptime_ms());
+                                log::warn!("[relay] locked: {} refused the sign-in; rotating", relay_host(&s.url));
+                                relay_idx = (relay_idx + 1) % relays.len();
+                                session = None;
+                                continue;
+                            }
+                            Err(e) => {
+                                log::warn!("[relay] locked: sign-in send failed: {e}");
+                                session = None;
+                                continue;
+                            }
+                        }
+                    } else if tag == Some("EVENT") {
                         if let Ok(msg) =
                             serde_json::from_slice::<nip46::RelayEventMessage>(&raw)
                         {
@@ -3223,6 +3307,90 @@ fn locked_relay_phase(
         }
 
         FreeRtos::delay_ms(10);
+    }
+}
+
+/// What the locked phase does with its session after a sign-in frame.
+enum LockedAuth {
+    Continue,
+    /// Drop the session and pass the relay by for a while.
+    BackOff,
+}
+
+/// NIP-42 on the locked phase's session: sign in as this boot's one-time
+/// unlock key, the one key the `locked` REQ names (`#p`), so a relay that
+/// applies the authors/`#p` rule lets the vault delivery through. The key is
+/// per boot and already on the wire as that `#p`, so the sign-in links
+/// nothing new. Only the relay's own challenge, only the URL this phase
+/// dialled. A closure that is not the sign-in's is ignored, as it always was
+/// here. `Err` is a send that failed: drop the session.
+fn locked_relay_auth(
+    s: &mut RelaySession,
+    tag: &str,
+    raw: &[u8],
+    secp: &Secp256k1<SignOnly>,
+    unlock_sk: &[u8; 32],
+    unlock_pk_hex: &str,
+    wall: u64,
+) -> Result<LockedAuth, String> {
+    let step = match tag {
+        "AUTH" => {
+            let Some(challenge) = relay_auth::parse_challenge(raw) else {
+                log::warn!("[relay] locked: AUTH not answered: not a challenge this board signs");
+                return Ok(LockedAuth::Continue);
+            };
+            if !s.auth.challenge(&challenge) {
+                return Ok(LockedAuth::Continue);
+            }
+            let mut ids = Vec::new();
+            if wall == 0 {
+                log::warn!("[relay] locked: no wall clock to stamp a sign-in with");
+            } else {
+                match sign_auth_event(secp, unlock_sk, unlock_pk_hex.to_string(), &s.url, &challenge, wall) {
+                    Ok(ev) => {
+                        ws_send_auth(&mut s.tls, &ev)?;
+                        ids.push(ev.id);
+                        log::info!("[relay] locked: signing in to {} as the unlock key", relay_host(&s.url));
+                    }
+                    Err(e) => log::warn!("[relay] locked: sign-in event not signed ({e})"),
+                }
+            }
+            s.auth.sent(ids, uptime_ms())
+        }
+        "OK" => match relay_auth::parse_ok(raw).and_then(|(id, ok)| s.auth.ok(&id, ok)) {
+            Some(step) => step,
+            None => return Ok(LockedAuth::Continue),
+        },
+        "CLOSED" => {
+            let step = relay_auth::parse_closed(raw).and_then(|(sub, message)| {
+                s.auth.closed(&sub, relay_auth::closed_reason(&message), uptime_ms())
+            });
+            match step {
+                Some(step) => step,
+                None => {
+                    log::warn!("[relay] locked: CLOSED: {}", snippet(raw, 160));
+                    return Ok(LockedAuth::Continue);
+                }
+            }
+        }
+        _ => return Ok(LockedAuth::Continue),
+    };
+    locked_auth_step(s, step)
+}
+
+/// Act on the sign-in state machine's step for the locked session: the only
+/// subscription it has is `locked`, re-sent as dialled.
+fn locked_auth_step(s: &mut RelaySession, step: relay_auth::Step) -> Result<LockedAuth, String> {
+    match step {
+        relay_auth::Step::Nothing => Ok(LockedAuth::Continue),
+        relay_auth::Step::Resend(subs) => {
+            if subs.iter().any(|sub| sub == "locked") {
+                ws_send(&mut s.tls, OP_TEXT, s.sub_req.as_bytes())?;
+                log::info!("[relay] locked: signed in to {}; subscription re-sent", relay_host(&s.url));
+            }
+            Ok(LockedAuth::Continue)
+        }
+        relay_auth::Step::BackOff => Ok(LockedAuth::BackOff),
     }
 }
 
@@ -3731,7 +3899,7 @@ fn handle_vault_delivery(
     // The unseal is the slow part of a WiFi unlock too, and this path has an
     // OLED in front of the owner just like the cabled one.
     let ok = crate::pin::try_unlock(nvs, masters, &vault_key, &mut |p| {
-        crate::pin::show_unlock_progress(display, p)
+        crate::pin::show_unlock_progress(display, p, false)
     });
     if ok {
         log::info!("[relay] vault key accepted — device unlocked");
@@ -3786,6 +3954,12 @@ fn session_step(
         s.last_rx = Instant::now();
         return Ok(());
     }
+
+    // Sign-in deadlines: OKs that never came, or a challenge that never
+    // followed an `auth-required:` closure. Nothing at all unless the relay
+    // asked for a sign-in or closed a subscription for one.
+    let step = s.auth.tick(uptime_ms());
+    apply_auth_step(s, step, ctx)?;
 
     // Idle tick (only meaningful when the recv timeout is active): keep the
     // relay link warm, refresh the subscription, and bail if it's gone quiet.
@@ -3853,13 +4027,7 @@ fn delivery_selfcheck(s: &mut RelaySession, ctx: &mut SignCtx) -> Result<(), Str
 /// as a miss, when there is no wall clock to stamp it with (relays reject an
 /// ephemeral event dated 1970) or a heap below the publish guard.
 fn send_probe(s: &mut RelaySession, ctx: &mut SignCtx, now_ms: u64) -> Result<(), String> {
-    let mut created_at = wall_clock_estimate();
-    if created_at == 0 {
-        created_at = s
-            .server_time
-            .map(|t| t + now_ms.saturating_sub(s.probe.connected_ms()) / 1_000)
-            .unwrap_or(0);
-    }
+    let created_at = session_wall_clock(s, now_ms);
     if created_at == 0 || !response_transportable(delivery_probe::PROBE_CONTENT.len()) {
         log::debug!("[relay] delivery probe deferred on {} (no clock or heap tight)", s.url);
         s.probe.skipped(now_ms);
@@ -3897,6 +4065,123 @@ fn send_probe(s: &mut RelaySession, ctx: &mut SignCtx, now_ms: u64) -> Result<()
     log::debug!("[relay] delivery probe {nonce} out on {}", relay_host(&s.url));
     s.probe_id = Some(signed.id);
     Ok(())
+}
+
+/// Best wall-clock reading for stamping an event on `s`: the loop's estimate,
+/// else this relay's own `Date` header plus the time since it connected.
+/// 0 when neither is known.
+fn session_wall_clock(s: &RelaySession, now_ms: u64) -> u64 {
+    let wall = wall_clock_estimate();
+    if wall > 0 {
+        return wall;
+    }
+    s.server_time
+        .map(|t| t + now_ms.saturating_sub(s.probe.connected_ms()) / 1_000)
+        .unwrap_or(0)
+}
+
+/// One NIP-42 sign-in event for `relay_url`, signed with `sk` (borrowed, not
+/// copied: the caller's key stays where it is zeroised). The shape is
+/// `relay_auth::auth_event`'s and nothing else.
+fn sign_auth_event(
+    secp: &Secp256k1<SignOnly>,
+    sk: &[u8; 32],
+    pubkey_hex: String,
+    relay_url: &str,
+    challenge: &str,
+    created_at: u64,
+) -> Result<SignedEvent, String> {
+    let unsigned = relay_auth::auth_event(&pubkey_hex, relay_url, challenge, created_at);
+    let event_id = nip46::compute_event_id(&unsigned);
+    let sig = sign::sign_hash(secp, sk, &event_id).map_err(|e| format!("sign: {e}"))?;
+    Ok(SignedEvent {
+        id: hex_encode(&event_id),
+        pubkey: unsigned.pubkey,
+        created_at: unsigned.created_at,
+        kind: unsigned.kind,
+        tags: unsigned.tags,
+        content: unsigned.content,
+        sig: hex_encode(&sig),
+    })
+}
+
+/// The relay sent `["AUTH", challenge]` on `s`: sign in as every unlocked
+/// master, and as this boot's delivery-probe key, with the URL this board
+/// dialled as the `relay` tag. No button: this answers the board's own
+/// connection, in a shape that carries nothing but that URL and the
+/// challenge.
+///
+/// Masters, because the owner's relay admits a REQ from any signed-in key on
+/// its allowlist. The probe key, because it costs one signature and makes the
+/// live 24133 filter's `#p` list fully signed in on a relay that applies only
+/// the authors/`#p` rule, whenever the board serves no personas. Personas are
+/// NOT signed in: each one is a re-derivation plus a signature on every
+/// connect to every relay (up to 64 of them on a T-Display), and a 22242 per
+/// persona over the same challenge as its master is a proof anyone can check
+/// that the two are held together, which a persona exists to avoid. A relay
+/// that needs them closes the subscription again and is backed off.
+fn answer_auth(s: &mut RelaySession, raw: &[u8], ctx: &mut SignCtx) -> Result<(), String> {
+    let Some(challenge) = relay_auth::parse_challenge(raw) else {
+        log::warn!("[relay] AUTH from {} not answered: not a challenge this board signs", relay_host(&s.url));
+        return Ok(());
+    };
+    if !s.auth.challenge(&challenge) {
+        log::info!("[relay] AUTH from {} not answered: repeat, in flight, or past the per-connection cap", relay_host(&s.url));
+        return Ok(());
+    }
+    let now_ms = uptime_ms();
+    let created_at = session_wall_clock(s, now_ms);
+    let mut ids = Vec::new();
+    if created_at == 0 {
+        log::warn!("[relay] AUTH from {}: no wall clock to stamp a sign-in with", relay_host(&s.url));
+    } else {
+        let keys = ctx
+            .masters
+            .iter()
+            .filter(|m| !m.locked)
+            .map(|m| (hex_encode(&m.pubkey), &m.secret))
+            .chain(core::iter::once((ctx.probe_key.pk_hex.clone(), &ctx.probe_key.sk)));
+        for (pk_hex, sk) in keys {
+            match sign_auth_event(ctx.secp, sk, pk_hex, &s.url, &challenge, created_at) {
+                Ok(ev) => {
+                    ws_send_auth(&mut s.tls, &ev)?;
+                    ids.push(ev.id);
+                }
+                Err(e) => log::warn!("[relay] sign-in event not signed ({e})"),
+            }
+        }
+        log::info!("[relay] signing in to {} as {} key(s)", relay_host(&s.url), ids.len());
+    }
+    let step = s.auth.sent(ids, now_ms);
+    apply_auth_step(s, step, ctx)
+}
+
+/// Act on what the sign-in state machine decided for `s`.
+fn apply_auth_step(s: &mut RelaySession, step: relay_auth::Step, ctx: &mut SignCtx) -> Result<(), String> {
+    match step {
+        relay_auth::Step::Nothing => Ok(()),
+        relay_auth::Step::Resend(subs) => {
+            if subs.iter().any(|sub| sub == "hw") {
+                // The connect-time REQ again, catch-up included: the one the
+                // relay closed delivered nothing. Stored copy stays live-only.
+                let sub_req = build_sub_req(ctx, true);
+                s.sub_req = build_sub_req(ctx, false);
+                ctx.catch_up = Some(CatchUp { delivered: 0, oldest: u64::MAX, pages: 0 });
+                s.last_resub = Instant::now();
+                ws_send(&mut s.tls, OP_TEXT, sub_req.as_bytes())?;
+                log::info!("[relay] signed in to {}; subscription re-sent", relay_host(&s.url));
+            } else if subs.iter().any(|sub| sub == CATCH_UP_PAGE_SUB) {
+                // A page is not worth a REQ of its own: the next catch-up
+                // starts from the top again.
+                ctx.catch_up = None;
+                log::info!("[relay] catch-up page closed on {} for sign-in; left to the next catch-up", relay_host(&s.url));
+            }
+            Ok(())
+        }
+        relay_auth::Step::BackOff => {
+            Err(refused(relay_host(&s.url), relay_cooldown::Refusal::AuthRefused, ctx))
+        }
+    }
 }
 
 /// A probe of ours arrived on `s`. It counts only if it is the one this
@@ -4076,10 +4361,7 @@ fn poll_usb_frame(
     };
 
     // USB activity wakes the panel, same as a relay request.
-    if !ctx.display_on {
-        crate::oled::wake_display(ctx.display);
-        ctx.display_on = true;
-    }
+    wake_to_idle(ctx);
     ctx.last_activity = Instant::now();
 
     // One screen, one button, one decision. A cable card answered while a
@@ -4730,6 +5012,12 @@ fn handle_relay_msg(
             if let Some(refusal) = refusal {
                 return Err(refused(relay_host(&s.url), refusal, ctx));
             }
+            // The OK for one of this connection's sign-in events.
+            if let Some((id, accepted)) = relay_auth::parse_ok(raw) {
+                if let Some(step) = s.auth.ok(&id, accepted) {
+                    return apply_auth_step(s, step, ctx);
+                }
+            }
             probe_ok(s, raw);
         }
         "NOTICE" => {
@@ -4743,13 +5031,26 @@ fn handle_relay_msg(
         // re-subscribe cleanly rather than sit with a dead subscription. Unless
         // it closed it because it is limiting us: reconnecting at once and
         // re-sending the connect-time REQ is what a violation counter punishes.
+        //
+        // `auth-required:` and `restricted:` are the NIP-42 sign-in's
+        // (`relay_auth`): held until the sign-in lands, re-sent once, or
+        // backed off. A `restricted:` from a relay that never asked for a
+        // sign-in, and every other closure, reconnects as it always did.
         "CLOSED" => {
-            log::warn!("[relay] CLOSED: {}; reconnecting", snippet(raw, 160));
+            log::warn!("[relay] CLOSED: {}", snippet(raw, 160));
             if let Some(refusal) = relay_cooldown::classify(&relay_message_text(raw)) {
                 return Err(refused(relay_host(&s.url), refusal, ctx));
             }
+            if let Some((sub, message)) = relay_auth::parse_closed(raw) {
+                let reason = relay_auth::closed_reason(&message);
+                if let Some(step) = s.auth.closed(&sub, reason, uptime_ms()) {
+                    return apply_auth_step(s, step, ctx);
+                }
+            }
             return Err("relay closed our subscription".into());
         }
+        // NIP-42: the relay wants this connection to sign in.
+        "AUTH" => answer_auth(s, raw, ctx)?,
         _ => {}
     }
     Ok(())
@@ -4864,13 +5165,12 @@ fn process_event(
     if ev.kind != NIP46_KIND && ev.kind != MGMT_KIND {
         return Ok(());
     }
-    // A real request is about to draw to the OLED — wake it and mark activity so
-    // the burn-in blank timer restarts. (Relay control traffic does NOT count,
-    // or the periodic re-REQ would keep the static screen lit forever.)
-    if !ctx.display_on {
-        crate::oled::wake_display(ctx.display);
-        ctx.display_on = true;
-    }
+    // A real request wakes the panel and marks activity so the burn-in blank
+    // timer restarts. (Relay control traffic does NOT count, or the periodic
+    // re-REQ would keep the static screen lit forever.) Many requests draw
+    // nothing (connect, capabilities, an auto-approved sign), so the wake puts
+    // the idle screen up itself.
+    wake_to_idle(ctx);
     ctx.last_activity = Instant::now();
 
     // The identity this request addresses — its `p` tag. NIP-46 (24133) can
@@ -6976,7 +7276,7 @@ fn handle_note_wrap(ev: SignedEvent, ctx: &mut SignCtx) {
         }
     };
     // Opened with the key it was addressed to, which is also the root of the
-    // address branch a note paid to a key sits on: one this device does not
+    // share a note paid to a key sits on: one this device does not
     // hold is refused here, before any card, and never comes back.
     let note = match heartwood_common::note_wrap::open_note_rumor(&opened.rumor, &secret) {
         Ok(n) => n,
@@ -8035,6 +8335,7 @@ fn minimal_status_json(id: &str, ctx: &SignCtx, master_idx: usize, is_device_op:
             "uptime_s": crate::uptime_s(),
             "last_reset": crate::reset_reason_str(),
             "crashed_during": crate::crash_context(),
+            "crash_detail": crate::crash_detail_value(),
             "free_heap": unsafe { esp_idf_svc::sys::esp_get_free_heap_size() },
             "largest_free_block": unsafe {
                 esp_idf_svc::sys::heap_caps_get_largest_free_block(esp_idf_svc::sys::MALLOC_CAP_8BIT)
@@ -8865,6 +9166,15 @@ fn handle_mgmt_event(
             )
             .map(|()| None);
         }
+        // `list_clients` is serialised straight into one buffer of its exact
+        // size rather than built as a `Value` tree and wrapped again: on the
+        // no-PSRAM T-Display that tree was many times the reply, and a board
+        // reset under this method's breadcrumb.
+        if method == "list_clients" {
+            let master_slot = ctx.masters[master_idx].slot;
+            return encode_list_clients(&id, ctx.policy_engine.list_slots(master_slot))
+                .map(|reply| Some(MgmtReply::Encoded(reply)));
+        }
         dispatch_mgmt(
             &method,
             &req,
@@ -8875,15 +9185,21 @@ fn handle_mgmt_event(
             is_device_op,
             challenge_scope,
         )
-        .map(Some)
+        .map(|result| Some(MgmtReply::Value(result)))
     })();
     // The breadcrumb stays set across the response publish below too;
     // handle_relay_msg clears it once the whole event is processed.
 
+    // Whether the method returned a result: a mutation that did has been
+    // applied, which the low-memory error below must not deny.
+    let succeeded = dispatch_result.is_ok();
     let response_json = match dispatch_result {
         // Held on a card: nothing is owed until it resolves.
         Ok(None) => return Ok(()),
-        Ok(Some(result)) => serde_json::json!({ "id": id, "result": result }).to_string(),
+        Ok(Some(MgmtReply::Value(result))) => {
+            serde_json::json!({ "id": id, "result": result }).to_string()
+        }
+        Ok(Some(MgmtReply::Encoded(reply))) => reply,
         Err(e) => serde_json::json!({ "id": id, "error": e }).to_string(),
     };
 
@@ -8895,7 +9211,8 @@ fn handle_mgmt_event(
     // audit ring plus relay lists (field-observed crash breadcrumb: "relay mgmt
     // get_status"). Rather than crash, degrade. For get_status, resend the vital
     // status without the heavy arrays, so the crash telemetry itself still
-    // reaches the manager; for any other method, a clean retryable error.
+    // reaches the manager; for any other method, a clean error that says
+    // whether a mutation was applied (`mgmt::low_memory_reply`).
     let response_json = if response_transportable(response_json.len()) {
         response_json
     } else if method == "get_status" {
@@ -8911,7 +9228,7 @@ fn handle_mgmt_event(
         );
         serde_json::json!({
             "id": id,
-            "error": "device low on memory; state unchanged, retry shortly"
+            "error": mgmt::low_memory_reply(&method, succeeded),
         })
         .to_string()
     };
@@ -8930,6 +9247,37 @@ fn handle_mgmt_event(
         stamped,
         response_json,
     )
+}
+
+/// What a management method answered: a `Value` the caller wraps with the
+/// request id, or a reply already serialised whole (`list_clients`).
+enum MgmtReply {
+    Value(serde_json::Value),
+    Encoded(String),
+}
+
+/// `list_clients` through `mgmt::encode_list_clients_reply`, its failures
+/// turned into replies a manager already understands. The caller's
+/// `response_transportable` guard still runs on the finished reply.
+fn encode_list_clients(
+    id: &str,
+    slots: &[heartwood_common::policy::ConnectSlot],
+) -> Result<String, String> {
+    use heartwood_common::mgmt::{encode_list_clients_reply, ListClientsEncodeError};
+    encode_list_clients_reply(id, slots).map_err(|e| match e {
+        ListClientsEncodeError::TooLarge(n) => {
+            log::warn!("[relay] list_clients reply would be {n} B, over the NIP-44 limit");
+            format!(
+                "client list too large for one reply ({n} bytes; the limit is {})",
+                mgmt::NIP44_MAX_PLAINTEXT
+            )
+        }
+        ListClientsEncodeError::OutOfMemory(n) => {
+            log::warn!("[relay] list_clients: no {n} B block free; returning the low-memory error");
+            mgmt::LOW_MEMORY_UNCHANGED.to_string()
+        }
+        ListClientsEncodeError::Encode => "list_clients reply could not be encoded".to_string(),
+    })
 }
 
 /// The identity a pairing mint is addressed to (D2 persona-addressed
@@ -10422,16 +10770,6 @@ fn dispatch_mgmt(
             }
         }
 
-        "list_clients" => {
-            let clients: Vec<serde_json::Value> = ctx
-                .policy_engine
-                .list_slots(master_slot)
-                .iter()
-                .map(mgmt::client_summary)
-                .collect();
-            Ok(serde_json::json!({ "clients": clients }))
-        }
-
         "client_uri" => {
             let slot_index = req
                 .pointer("/params/slot_index")
@@ -11067,11 +11405,17 @@ fn dispatch_mgmt(
                     // on-device, and a kind-1059 to a master npub puts a
                     // RECEIVE card up.
                     "note_wrap_v1",
-                    // LUD-25 address proofs: heartwood_note_address_proof
-                    // signs register/unregister for a lightning-address name
-                    // with this identity's current or superseded branch, on a
-                    // pinned ADDRESS PROOF card.
-                    "note_address_proof_v1",
+                    // LUD-26 shares, one string for the three methods that
+                    // changed together: heartwood_note_address hands out
+                    // share n's 65-byte cx1 (`share` required),
+                    // heartwood_note_claim takes an optional `share` and finds
+                    // a key on any share or legacy branch, and
+                    // heartwood_note_address_proof signs register, update
+                    // (sig and newsig on one hold) or unregister, by a share
+                    // or a legacy branch on file, on a pinned ADDRESS PROOF
+                    // card. Replaces note_address_proof_v1, whose message and
+                    // whole-branch answer are gone.
+                    "note_address_v2",
                     // revoke_client_identity / clear_client_identities withdraw
                     // identity approvals from a slot without revoking it.
                     "client_identity_revoke_v1",
@@ -11128,7 +11472,7 @@ fn dispatch_mgmt(
             // loop is actually running (same list `relays_at_boot` compared
             // against), and no extra heap parse per poll.
             let phone_relays = crate::pin::phone_relay_status(ctx.nvs, &ctx.relays, unlock_phone_count);
-            Ok(serde_json::json!({
+            let mut status = serde_json::json!({
                 "master_count": ctx.masters.len(),
                 "master_npub_hex": master_hex,
                 "mode": "wifi-standalone",
@@ -11145,6 +11489,9 @@ fn dispatch_mgmt(
                 "uptime_s": crate::uptime_s(),
                 "last_reset": crate::reset_reason_str(),
                 "crashed_during": crate::crash_context(),
+                // Panic site or failed allocation behind that crash, from the
+                // same final crumb window (heartwood_common::crash_record).
+                "crash_detail": crate::crash_detail_value(),
                 // Live memory health: total free and the largest single block.
                 // A largest block much smaller than free means a fragmented
                 // heap — the condition behind the bulk-decrypt crashes.
@@ -11184,7 +11531,12 @@ fn dispatch_mgmt(
                 // WiFi too — the FIRMWARE_INFO frame only answers over USB.
                 "version": env!("CARGO_PKG_VERSION"),
                 "board": crate::board::BOARD,
-            }))
+            });
+            // Heap-fall diagnostics, inserted after the literal: inside the
+            // `json!` they cost about 1.1 KB more app image than here.
+            status["min_free_heap"] = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() }.into();
+            status["relay_connects"] = RELAY_CONNECTS.load(Ordering::Relaxed).into();
+            Ok(status)
         }
 
         // C4 verdict (schema §1.4). Every case resolves cleanly: an unknown
@@ -11633,50 +11985,46 @@ fn flush_held_replies(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
     }
 }
 
-/// Serialise and mask an EVENT command in one allocation. The generic
-/// `ws_send` path first builds a JSON String and then copies it into a masked
-/// frame; for a large NIP-46 response that second full copy is avoidable.
+/// Serialise and mask an EVENT command onto the socket. The generic `ws_send`
+/// path first builds a JSON String and then copies it into a masked frame;
+/// for a large NIP-46 response neither copy is needed.
 fn ws_send_event(tls: &mut Tls, event: &SignedEvent) -> Result<usize, String> {
-    const MAX_HEADER_LEN: usize = 14;
-    let mut frame = Vec::with_capacity(
-        MAX_HEADER_LEN
-            .saturating_add(event.content.len())
-            .saturating_add(768),
-    );
-    frame.resize(MAX_HEADER_LEN, 0);
-    serde_json::to_writer(&mut frame, &("EVENT", event))
-        .map_err(|e| format!("serialise: {e}"))?;
+    ws_send_framed(tls, "EVENT", event)
+}
 
-    let payload_len = frame.len() - MAX_HEADER_LEN;
-    let header_len = if payload_len < 126 {
-        6
-    } else if payload_len < 65_536 {
-        8
-    } else {
-        14
-    };
-    frame.copy_within(MAX_HEADER_LEN.., header_len);
-    frame.truncate(header_len + payload_len);
+/// A NIP-42 sign-in goes out as `["AUTH", <event>]`. Carried as an ordinary
+/// EVENT instead, a relay written strictly from the NIP treats the 22242 as a
+/// publish: it OKs it, never authenticates the connection, and closes the REQ
+/// `auth-required:` again (strfry tolerates both, which hid this at bench).
+fn ws_send_auth(tls: &mut Tls, event: &SignedEvent) -> Result<usize, String> {
+    ws_send_framed(tls, "AUTH", event)
+}
 
-    frame[0] = 0x80 | OP_TEXT;
-    let mask_offset = header_len - 4;
-    if payload_len < 126 {
-        frame[1] = 0x80 | payload_len as u8;
-    } else if payload_len < 65_536 {
-        frame[1] = 0x80 | 126;
-        frame[2..4].copy_from_slice(&(payload_len as u16).to_be_bytes());
-    } else {
-        frame[1] = 0x80 | 127;
-        frame[2..10].copy_from_slice(&(payload_len as u64).to_be_bytes());
-    }
-    let mask = esp_random().to_le_bytes();
-    frame[mask_offset..header_len].copy_from_slice(&mask);
-    for (index, byte) in frame[header_len..].iter_mut().enumerate() {
-        *byte ^= mask[index & 3];
-    }
+/// Serialise and mask one command frame straight onto the socket.
+///
+/// The frame goes out a 512-byte piece at a time (`heartwood_common::ws_frame`)
+/// instead of as one masked copy. For a sealed reply that copy was a second
+/// allocation the size of the ciphertext, beside the one the event already
+/// holds, and on a fragmented no-PSRAM heap it aborted the allocator after
+/// `response_transportable` had passed the reply: a T-Display panic asking
+/// for 14,526 B under "relay envelope kind 24134". A send that fails part-way
+/// leaves a partial frame on the socket, as a failed whole-frame write could,
+/// so the session is not usable after an `Err`.
+fn ws_send_framed(tls: &mut Tls, command: &'static str, event: &SignedEvent) -> Result<usize, String> {
+    use heartwood_common::ws_frame::{event_payload_len, write_event_frame, CHUNK_LEN};
 
+    let payload_len = event_payload_len(command, event).map_err(|e| format!("serialise: {e}"))?;
     crate::crash_crumb::set(&format!("relay websocket kind {} {}B", event.kind, payload_len));
-    tls.write_all(&frame).map_err(|e| format!("ws send: {e:?}"))?;
+    let mut piece = Vec::new();
+    piece
+        .try_reserve_exact(CHUNK_LEN)
+        .map_err(|_| "ws send: no memory for the frame buffer".to_string())?;
+    piece.resize(CHUNK_LEN, 0);
+    let mask = esp_random().to_le_bytes();
+    write_event_frame(command, event, payload_len, mask, &mut piece, |bytes| {
+        tls.write_all(bytes)
+    })
+    .map_err(|e| format!("ws send: {e:?}"))?;
     Ok(payload_len)
 }
 

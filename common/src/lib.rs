@@ -4,9 +4,15 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+// The `std` feature adds helpers that need serde_json's writer API (std-only);
+// the crate stays no_std otherwise. Tests are std already.
+#[cfg(all(feature = "std", not(test)))]
+extern crate std;
 
 /// When a cable approval card starts listening to the A button.
 pub mod button_arm;
+/// CRC-32 for serial frames and checksummed records, with a 64-byte table.
+pub mod crc32;
 pub mod deadline;
 pub mod derive;
 pub mod encoding;
@@ -63,6 +69,13 @@ pub mod net_config;
 
 pub mod mgmt;
 
+/// Masked client WebSocket frames streamed through a small buffer.
+#[cfg(any(test, feature = "std"))]
+pub mod ws_frame;
+
+/// Crash cause and location recorded beside the firmware's breadcrumb.
+pub mod crash_record;
+
 pub mod persistent_state;
 
 /// NVS entry budget: room for an in-place replace, the per-key erase-first
@@ -90,6 +103,11 @@ pub mod relay_cooldown;
 
 /// Getting back to the first configured relay after the rotation moved off it.
 pub mod home_relay;
+
+/// NIP-42 sign-in for the relay loop: the fixed kind-22242 shape, the relay's
+/// AUTH/OK/CLOSED frames, and when to re-send a subscription or back off.
+#[cfg(feature = "nip46")]
+pub mod relay_auth;
 
 pub mod wrap_ledger;
 

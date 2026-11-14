@@ -66,3 +66,35 @@ test('the titles and frame type match the firmware', () => {
     assert.ok(netConfig.includes(line), `net_config.rs no longer draws ${line}`)
   }
 })
+
+// --- PATCH_NET_CONFIG (0x5e) relay replacement --------------------------------
+import { buildNetConfigPatchRelays, PATCH_NET_CONFIG } from './net-config.mjs'
+
+test('PATCH_NET_CONFIG is 0x5e, matching common/src/types.rs', () => {
+  assert.equal(PATCH_NET_CONFIG, 0x5e)
+})
+
+test('a relay replacement carries the board revision and only the relay list', () => {
+  const { payload } = buildNetConfigPatchRelays({ revision: 11 }, ['wss://relay.primal.net', 'wss://nostr.mom'])
+  assert.deepEqual(JSON.parse(payload.toString()), {
+    base_revision: 11,
+    patch: { relays: ['wss://relay.primal.net', 'wss://nostr.mom'] },
+  })
+})
+
+test('a board answer without a revision never builds a patch', () => {
+  assert.throws(() => buildNetConfigPatchRelays({}, ['wss://a.co']), /revision/)
+  assert.throws(() => buildNetConfigPatchRelays({ revision: 'x' }, ['wss://a.co']), /revision/)
+})
+
+test('relays are bounded the firmware way: count, scheme, length, host, port, duplicates', () => {
+  assert.throws(() => buildNetConfigPatchRelays({ revision: 1 }, []), /one to eight/)
+  assert.throws(() => buildNetConfigPatchRelays({ revision: 1 }, Array(9).fill('wss://x.co')), /one to eight/)
+  assert.throws(() => buildNetConfigPatchRelays({ revision: 1 }, ['http://x.co']), /wss:/)
+  assert.throws(() => buildNetConfigPatchRelays({ revision: 1 }, [`wss://${'d'.repeat(250)}.co`]), /255/)
+  assert.throws(() => buildNetConfigPatchRelays({ revision: 1 }, ['wss://:443/']), /host/)
+  assert.throws(() => buildNetConfigPatchRelays({ revision: 1 }, ['wss://a.co:8443']), /443/)
+  assert.throws(() => buildNetConfigPatchRelays({ revision: 1 }, ['wss://a@b.co']), /host/)
+  assert.throws(() => buildNetConfigPatchRelays({ revision: 1 }, ['wss://a.co', 'wss://a.co']), /duplicate/)
+  buildNetConfigPatchRelays({ revision: 1 }, ['wss://relay.trotters.cc', 'wss://a.co:443', 'wss://a.co/path?q=1'])
+})

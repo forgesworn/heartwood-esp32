@@ -66,8 +66,10 @@ struct Cli {
     #[arg(long, default_value = "/var/lib/heartwood")]
     data_dir: String,
 
-    /// Relay URLs (comma-separated)
-    #[arg(short, long, default_value = "wss://relay.damus.io,wss://nos.lol")]
+    /// Relay URLs (comma-separated). damus kept, but not first: it
+    /// rate-limit-bans addresses outright, so a default that leads with it
+    /// leaves a fresh start dead on any address it has flagged.
+    #[arg(short, long, default_value = "wss://relay.primal.net,wss://relay.damus.io,wss://nos.lol")]
     relays: String,
 
     /// Master slot whose bunker URI is written to bunker-uri.txt (default: 0).
@@ -252,6 +254,14 @@ fn unlock_pin(port: &mut RawSerial, pin: &str) -> Result<(), String> {
                         log::info!("PIN unlock accepted");
                         return Ok(());
                     } else if f.frame_type == FRAME_TYPE_NACK {
+                        // A guess the board could not count is refused untried
+                        // and costs no attempt; say so rather than "wrong PIN".
+                        if f.payload.starts_with(b"storage_full") {
+                            return Err(format!(
+                                "PIN not tried: {}",
+                                String::from_utf8_lossy(&f.payload)
+                            ));
+                        }
                         return Err("PIN unlock rejected (NACK) -- wrong PIN".into());
                     }
                 }

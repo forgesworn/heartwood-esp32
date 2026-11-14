@@ -2818,6 +2818,12 @@ dispatch without a card, so nothing parks.
 
 ## 34. Address proofs (LUD-25; added 2026-10-05, NOT YET BENCH-RUN)
 
+SUPERSEDED 2026-11-04 by section 39: the message, the signing key and the
+request shape below are gone (`note_address_proof_v1` is no longer
+advertised; `note_address_v2` replaces it). Items 3 to 9 (refusal before the card, decline, pinned
+always-ask, never batched, escalate refused, the USB-bridged card, unbound)
+still describe the gating, and section 39 reruns them on the new shape.
+
 Since LUD-25 `50d740a` (moneyer 0.17) a mint changes or clears a name's `cx1`
 only with `"sig"`: a BIP-340 signature by the purpose-0 index-0 key of the
 branch CURRENTLY on file, over `sha256("LNURLcash:<register|unregister>:
@@ -3247,7 +3253,77 @@ denylist). Otherwise heartwoodd loses every reply that follows a card.
 `echo on` was not tried, since it needs root on the bench laptop. The
 native-USB boards (V4, C6) were not checked.
 
-## 40. NVS values are replaced in place, under an entry budget (#197; added 2026-10-28, NOT YET BENCH-RUN)
+**Bench 2026-11-08, T-Display, 7697b0c image: "the first FULL ACCESS card
+did not draw".** In the morning, with the board up about 2 h 20 min, the
+phone's first one-hold bundle left the panel backlit and black for about
+45 s. The phone then read "wasn't approved", and a retry 86 s after the
+first got `full access card shown recently`, so the card had opened and
+timed out. A retry about 90 s later drew normally. Rerun from the laptop
+in the afternoon, with a webcam on the panel at one frame a second and no
+button press at any point:
+
+| Run | Result |
+|---|---|
+| Fresh board (power-on 13:04), bundle at 13:10 | Card drew within about 1 s, paged its words, armed, and showed `Expired / no change made` at 45 s. |
+| `heartwood_capabilities` with the panel dark, 13:11 | **FAIL (fixed in this PR).** The backlight came on over a black frame and stayed on for the full 30 s blank timeout, with nothing drawn. Any request or cable frame that draws nothing does the same in the WiFi loop. That is the backlit-black screen seen in the morning, and probably the "screen read dark" ALLOW AS card above. |
+| Idle 13:12-15:45, untouched (webcam frame each minute) | The panel stayed dark throughout. |
+| Bundle after 2 h 33 min idle, uptime 2 h 40 min, 15:45 | **PASS, not reproduced.** The card drew, paged, and expired on time. It went up about 7 s after the send (1 s when fresh). The reply came in at 52.5 s, against 46.8 s when fresh. |
+
+The code agrees with what the webcam saw. A card that times out after
+45 s has been ticked, and every tick redraws it as the countdown changes.
+Nothing in the firmware sleeps or re-initialises the ST7789 controller, and
+there is no power management. So the morning's missing card is not
+explained. One possible reading: the phone's `connect` and capabilities
+requests had left the panel backlit and black, and the card came up some
+seconds later than expected (the afternoon's took 7 s after the idle; that
+run did not show whether the relay or the board's session was the slow
+part). Not proven. The fix
+draws the idle screen whenever a request or cable frame wakes the panel,
+so a backlit black panel no longer appears. If a FULL ACCESS card ever
+again fails to draw, it will now show as the idle screen staying up rather
+than as black.
+
+Bench setup notes: the save-room check refused the test bundle at 216 free
+entries (`no room to save this pairing`, before any card) until five old
+bench slots were revoked (330 free). Moving the board pulled its USB cable,
+which is a power-on reset that restarts any idle being measured.
+
+## 40. A PIN guess is counted before it is checked (#254; added 2026-10-28, NOT YET BENCH-RUN)
+
+Beta.29 wrote the wipe counter only after a wrong PIN was refused, so a power
+cut between the refusal and the write made that guess free, as often as
+wanted. A guess is now counted on flash, and read back, before it is checked;
+the counter is written in place (never erased first); a vault key that is a
+PIN padded with zeros is refused on every unlock path; and the fifth guess
+warns on screen. Use a board with a PIN set (Heltec and T-Display both, for
+item 6), and USB.
+
+1. A wrong PIN raises the count: the log reads `PIN incorrect — attempt n/5`,
+   rising by one per wrong guess, and the screen shows `Wrong PIN` with the
+   attempts left.
+2. The count survives a power cut. Enter a wrong PIN, cut the power while the
+   board is checking it (during the key stretch), power on: the count includes
+   that guess.
+3. The right PIN clears the count. After two wrong guesses, enter the right
+   PIN: the board unlocks and the count reads 0 after a reboot.
+4. Five wrong PINs wipe the board, as before.
+5. A vault unlock with a zero-padded PIN is refused. Send VAULT_UNLOCK with the
+   PIN's ASCII digits followed by zero bytes to make 32 (for "1234",
+   31 32 33 34 then 28 x 00): NACK, the board stays locked, and the PIN count
+   is unchanged. On an unlocked board, VAULT_SET with such a key answers
+   `weak vault key`.
+6. The last attempt warns. After four wrong guesses, enter the right PIN: while
+   it is checked, the screen reads LAST ATTEMPT above "Keep power on", inside
+   the panel on both boards and in both orientations. The board unlocks and the
+   count reads 0. (Do not cut the power here: with the count at 5 on flash the
+   next boot wipes the board, which is the case the warning is for.)
+7. A guess the board cannot count is refused untried. Only if a board with a
+   full NVS is to hand (since #197 the count is a one-entry `u8` item, so a
+   raise needs one free entry and the refusal is rarer than it was): the PIN
+   is refused with `storage_full: the PIN was not tried` (heartwoodd says "PIN
+   not tried"), the count is unchanged, and nothing is wiped.
+
+## 42. NVS values are replaced in place, under an entry budget (#197; added 2026-10-28, NOT YET BENCH-RUN)
 
 esp-idf-svc's `set_blob`/`set_str` erase a key before writing it, so a power
 cut between the two left no value at all. Every blob write now replaces in
@@ -3255,8 +3331,9 @@ place, is planned against the partition's entry budget first, and falls back
 to erasing first only for keys whose old value is recoverable elsewhere. A
 refusal for lack of room now says `storage_full:` rather than reading as a
 fault. Use a spare V4 with the legacy-nvs-bigapp layout, filled to about 17
-available entries (the bench V4's state), never the owner's board. Section 39
-(#254) covers the PIN counter; run it first if #254 has merged.
+available entries (the bench V4's state), never the owner's board. The
+section 40 headed "A PIN guess is counted before it is checked" (#254) covers
+the PIN counter; run it first.
 
 1. Upgrade from beta.17 with one failed PIN guess recorded: the count carries
    over.
@@ -3296,3 +3373,419 @@ available entries (the bench V4's state), never the owner's board. Section 39
 - The recovery phrase only ever appears on the device's OLED — never in the browser.
 - If a step wedges, RESET the board; an unsaved phrase staying on screen is the
   safe failure (nothing is stored until the final hold).
+
+## 38. Relay sign-in, NIP-42 (added 2026-10-22; benched 2026-10-22 on strfry; re-benched against khatru 2026-11-02)
+
+Benched 2026-10-22: a T-Display flashed with this build signed through the
+gated strfry relay (allowlisted masters) and served clients on it. The
+2026-11-01 review found the sign-in went out as an `["EVENT", …]` frame, which
+strfry accepts as auth but a strictly-NIP-42 relay does not; it now goes out
+as `["AUTH", <event>]`.
+
+**Re-bench against a strict relay, 2026-11-02.** Same T-Display, firmware
+0.18.0-beta.29 (merged main with the AUTH frame fix), bench relay a
+purpose-built khatru v0.19.1 service behind Caddy on the project box, at a
+throwaway DNS name created for the day (name and container removed after
+the run; the bench service itself was kept out of the repositories). khatru verifies
+the 22242's signature, challenge and relay tag itself (its `ServiceURL` was
+set to the exact URL the board dialled), so an accepted sign-in proves the
+frame end to end; the relay logged every REQ decision, every accepted
+identity per connection, and every event it was offered. One bench note for
+the next operator: this release artifact compiles logging out entirely
+(`log/release_max_level_off` is a default feature), so no serial lines
+exist on it; relay-side logs and read-only `net-config` runtime reads stand
+in below. The relay stored nothing except kind 24133 in its store mode, so
+the profile-name clause of step 2 had no profile to serve. Per step:
+
+1. **Relay that never asks — pass.** Gate off: the board's catch-up REQs
+   (kinds 0, 1059) were served, and not one kind-22242 arrived at the relay
+   in any frame. The board signs in when asked, never unasked.
+2. **Allowlisted masters — pass.** Gate on, the master in the allowance. A
+   clean dial: REQ closed `auth-required:` after the hold, the board
+   answered the challenge, the relay accepted the master first and the
+   per-boot probe key second (two valid 22242s), the REQ was re-sent and
+   served, and an unpaired bench client's NIP-46 `ping` over this relay was
+   answered (`pong`). No persona key ever signed in, then or in any step.
+   Recorded caveat: khatru keeps exactly one authed identity per connection
+   (the latest AUTH), so the probe, signing second, is the identity the
+   session then holds; on this union-style gate the master carried, on a
+   stricter one-identity gate it would not. Filed as #264 with the log.
+3. **Late sign-in** — not isolated this run; the REQ hold ran at 2 s
+   throughout and the re-send-after-OKs path fired on every gated dial,
+   which is the host-tested half of the step.
+4. **Refused — pass.** Authed but unserved `restricted:`: the session
+   dropped with runtime class `relay_refused`, the host cooled, and the
+   board redialled exactly once a minute (dials at 08:52:46, :53:46,
+   :54:46, :55:46, :56:46), never every 3 s, never restarting while a
+   session opened. Once the allowance returned, the next full sign-in was
+   served again (observed 60 s later).
+5. **Every key refused** — not reachable on stock khatru, which decides
+   AUTH validity itself and never answers a valid 22242 with OK false; the
+   same refusal family is covered by step 4 and the host tests.
+6. **Challenge spam — pass relay-side.** Ten repeat challenges, one a
+   second, from connect: the board signed its two sign-ins (master, probe)
+   at the start and answered none of the eight that followed, while the REQ
+   stayed served throughout.
+7. **Locked** — not re-run: the board is `at_rest: none`, and the locked
+   phase signs through the same `ws_send_auth` that steps 1-6 just proved.
+   Recorded, not re-proven.
+8. **Publish-only** — not re-run: this board has no phones enrolled
+   (`unlock_phone_count: 0`), so no relay-update round can run. The
+   publish-only connections still build no AUTH by construction, which the
+   framing fix did not touch.
+
+At the close the board was patched back to its live list
+(the project's own gated relay first, then relay.primal.net, nostr.mom and
+offchain.pub; revision 16)
+and returned home onto relay 1 through the NIP-42 gate as its first act —
+the gated path serving the strict-verified build.
+
+
+The relay loop answers a relay's `["AUTH", <challenge>]` itself (no button):
+kind 22242, tags `relay` (the URL the board dialled) and `challenge`, empty
+content; masters plus the per-boot probe key when unlocked, the one-time
+unlock key when locked. Needs a relay you control that sends a challenge on
+connect, holds a REQ about 5 s for a sign-in, and answers `auth-required:` /
+`restricted:` (below, `wss://auth.example.com`), with the serial tap open.
+
+1. Relay that never asks. On a relay that sends no `AUTH`, the serial log has
+   no `signing in` line, and the relay's own log shows no kind-22242 from the
+   board. Everything in section 35 behaves as before.
+2. Allowlisted masters. Add the board's masters to the relay's allowlist and
+   make it the only relay. The log shows `signing in to auth.example.com as
+   <masters + 1> key(s)`, the relay answers each with `OK true`, the held "hw"
+   REQ is served (EOSE, profile name on the idle screen), and an unpaired
+   client's NIP-46 `ping` is answered. In the relay's log every 22242 carries
+   exactly the two tags, `relay` equal to the configured URL as typed, and an
+   empty content; no persona key signs in.
+3. Late sign-in. Make the relay close the REQ at once (`["CLOSED","hw",
+   "auth-required: sign in"]`) before the `OK`s. The log shows `signed in to
+   auth.example.com; subscription re-sent` once, then EOSE.
+4. Refused. Take the masters off the allowlist (the board has personas, or
+   the relay applies only the allowlist): the REQ is closed `restricted:`,
+   re-sent once, closed again, and the log shows `relay refused us (sign-in
+   refused) on auth.example.com; leaving it 10 min`. With it the only relay,
+   the board redials it once a minute (`every relay refused us recently`),
+   never every 3 s, and never restarts while a session opens. Put the masters
+   back: within about a minute the board is served again.
+5. Every key refused. Make the relay answer every 22242 `OK false` and close
+   the REQ `auth-required:`: the same 10-minute back-off, no second sign-in on
+   that connection.
+6. Challenge spam. Make the relay send a fresh `AUTH` every second: the board
+   signs in at most twice per connection, and the log shows `not answered:
+   repeat, in flight, or past the per-connection cap` for the rest.
+7. Locked. With a vault-locked board and the relay requiring sign-in for the
+   `locked` REQ (`#p` = the unlock key) but not allowlisting it: the log shows
+   `locked: signing in to auth.example.com as the unlock key`, the 22242's
+   author is the same key the kind-24135 announcement carries, and a Sapwood
+   unlock (kind 24136) arrives and unlocks the board.
+8. Publish-only. During a phone relay-update round (section 29's relay
+   change) on this relay, the publish-only connection sends no 22242.
+
+## 39. LUD-26 shares and address proofs (added 2026-11-04; items 1-4 and 6-9 run in part 2026-11-05 on a T-Display)
+
+**Run 2026-11-05, on the owner's live T-Display, not the bench V4.** CI's
+`app-tdisplay` artifact from `01e2b5f`, app-only at 0x10000 (partitions-4mb:
+factory 0x10000, 3 MB) after a full 4 MB read-back kept as the rollback; the
+version string is unchanged (0.18.0-beta.29), so the build is told apart by
+behaviour. Driven by notecase's `feat/heartwood-lud26-shares` over the relay.
+- Item 1, partly: every stored note listed in the same state after the flash.
+  Not yet run: collecting a key note to show its `ck1` still releases.
+- Item 2: share 0 is a 113-character `cx1`, the same on a second ask; share 1
+  differs; share 20 is `bad_request`; `legacy` is the 112-character branch the
+  mint has on file, `superseded` another. The no-`share` and both-fields cases
+  were left to the host tests.
+- Item 3: two live names at moneyer.dev moved off the legacy branch, one card
+  each, onto shares 0 and 1; the mint then held each share's 113-character
+  `cx1`. A scan of 188 keys afterwards found nothing unpaid.
+- Item 7: all ten refusals (whole-branch register, wrong share, a stranger's
+  `cx1`, this npub's at another mint, update onto the share on file,
+  unregister with `cx1` or `share`, register with `on_file`, `moneyer.dev.`,
+  `:8443`) answered `bad_request` in 1.7 s each, a plain round trip: no card.
+- Item 9, junk half: ten gift-wrapped key notes for keys the device does not
+  hold, published to the relay it was serving (its own gated relay, found by
+  pinging through each relay alone; damus and nos.lol were unreachable from the
+  bench). A no-card ping every 1.5 s held at 1.7 s (worst 3.3 s, as before
+  the batch), none unanswered. After `espflash reset` it answered within about
+  30 s and then at 1.7 s throughout two minutes of catch-up: no stall, so no
+  RAM cache of share keys is needed for this. The timing of a real wrap on
+  share 0 against one on old keys waits on item 4.
+- Item 4, partly: a 26 sat payment to a moved name was minted to its share 1,
+  key 0, and the mint published the wrap 1 s later. No RECEIVE card was seen
+  (the device trusts no senders, and the card's 30 s had likely run out before
+  anyone looked), so the note came in by scan instead: `heartwood_note_claim`
+  derived share 1's key and stored it CONFIRMED (item 6's positive case). Then
+  the wrap itself: after `espflash reset` the catch-up re-read it and the
+  RECEIVE card for it was seen (a card follows only a key found, so it opened
+  on share 1); left to time out, the device still held the one note.
+- Item 8, partly, on the signed beta.30 image (same T-Display, same live
+  pairing), with register proofs for an unused name on shares 18 and 19, none
+  ever posted. Section 34 item 4: a decline answered `user denied` and a card
+  left alone answered `timeout` after its 30 s, neither with a `sig`. Item 6:
+  two proofs sent together from one client raised two cards, one after the
+  other, each with its own name and share; left to time out, they answered
+  separately at 32 s and 62 s. Item 9: a client key the device never bound got
+  `unauthorised` for a share and for a proof, with no card. Item 8, cable half:
+  this board runs WiFi-standalone, so the 0x70 frame NACKs `cash_address_proof`
+  and `cash_address` alike ("use heartwood_note_* over the relay") before
+  parsing them; the surface's own `bad_request` needs a board in the USB tier.
+  The relay answered at 1.7 s after the port was opened.
+- Not yet run: 5 (moneyer.dev has registration closed, and a fresh share is
+  spent for life); from item 8, section 34 items 5 (pinned always-ask on an
+  auto-approve slot), 7 (escalate slot) and the heartwoodd-bridged card, each
+  of which needs the board reconfigured (the gating code is unchanged since
+  beta.29; host tests pin `pinned_physical` and `device_press_only` for the
+  proof); and nothing on the V4 (only CI's size gate, 2,352 B spare).
+
+
+moneyer 0.22.0 and dni's lnurl-mint take only LUD-26 (luds `92e430f`): a
+name is registered to a share's 65-byte `cx1`, `S/0'/2/n'` below
+`S = m/139'/d1..d4` (d1..d4 hashed from the mint's hostname WITHOUT its
+port), and its notes are `S/0'/2/n'/i`, plain BIP-32. Advertised as
+`note_address_v2` in get_status (no `note_address_proof_v1`). Shares are 0 to 19. Drive it with
+scripts/nip46-client.mjs from a bound slot until notecase grows the
+commands. Release build only, app-only flash on the bench V4 (its one-off
+partition table, see the V4 notes); the stored notes must survive it.
+
+1. Stored notes survive: before flashing, record `heartwood_note_list`; after,
+   every note is still listed in the same state, and a key note collected
+   (`heartwood collect`) still releases a `ck1` the mint accepts (the key is
+   stored; nothing is re-derived).
+2. `heartwood_note_address` with `{"host":"moneyer.dev","share":0}` answers
+   `share` 0 and a 113-character `cx1` starting `cx1`,
+   with NO card; the same request again answers the same `cx1`; `share` 1
+   answers a different one. With no `share`, or `share` 20, it answers
+   `bad_request` and no `cx1`. `{"host":"moneyer.dev","branch":"legacy"}`
+   answers `branch` and the 112-character whole-branch `cx1` the bench names
+   are on file with (compare it with the mint's record); `superseded` the
+   older one; both `share` and `branch` is `bad_request`.
+3. Move a legacy name (one of the bench names at moneyer.dev, on file with the
+   64-byte whole branch): `heartwood_note_address_proof` with
+   `{"host":"moneyer.dev","name":"<name>","action":"update","share":0,
+   "cx1":"<share 0 cx1>","on_file":"<item 2's branch cx1>"}`. Expect ONE
+   ADDRESS PROOF card reading `<name>@moneyer.dev` over
+   `move: old keys > share 0` (watch the OLED); hold. The reply has `sig`,
+   `pubkey` (x(P) of the branch, the key its 64-byte cx1 carries) and
+   `newsig`, `newpubkey`. PUT `cx1`, `sig`, `newsig` to
+   `/.well-known/lnurlp/<name>`: moneyer answers `{"status":"OK"}` and the
+   name's cx1 is now the share's (moneyer's `shares.ts` takes a legacy row's
+   proof from the branch key x(P), the first of its `proofKeys`).
+4. Pay the moved name a few sats: the wrap opens to a note on share 0 (no
+   card from a trusted mint key, as in 15.2), and `heartwood_note_list` shows
+   it CONFIRMED with its `p` and `index`. A payment that landed on the old
+   branch before the move still opens (15.2 again, on old keys).
+5. Register a fresh name: `action` `register` with `share` 1 and its `cx1`
+   reads `register, share 1`; POST `cx1` and `sig` to the spec route (or
+   `/names` with NIP-98): moneyer answers OK (or a `pr` for the address fee).
+   A name of 30 characters reads as its head and tail around `..` beside the
+   whole `@moneyer.dev`.
+   Unregister it: `{"action":"unregister","on_file":"<share 1 cx1>"}` reads
+   `unregister, share 1`; DELETE with `sig` clears the share.
+6. `heartwood_note_claim` with `{"host":"moneyer.dev/w","index":<i>,
+   "amount_msat":<m>,"p":"<cp1>"}` for a share note found by a scan answers
+   `share` n; one for a note on old keys answers `branch` `legacy`. Without
+   `p` it needs `share`, else `bad_request`.
+7. Refused with NO card, `bad_request` each time: a register naming the
+   64-byte whole branch, a `cx1` that is not the named `share`, another npub's
+   `cx1` or this npub's at another mint, an update whose `on_file` is the
+   share it moves to, an unregister carrying `cx1` or `share` (the v1 shape),
+   a register carrying `on_file`, a host `moneyer.dev.` or `:8443`, and
+   section 34's name and host cases.
+8. Rerun section 34 items 4 to 9 on the new shape (decline and timeout sign
+   nothing; pinned always-ask with an auto-approve policy; two proofs back to
+   back raise two cards; an escalate slot refuses outright; the USB-bridged
+   card is the generic extension card; an unbound client is `unauthorised`).
+9. Timing: a wrap for a key on old keys is found only after all twenty
+   shares are tried. Note how long the RECEIVE toast takes for one on share 0
+   and one on old keys, and that the relay loop keeps answering meanwhile.
+   Then send a batch of ten junk wraps (a key note for a key the device does
+   not hold) and reboot: each is searched on all twenty shares and both old
+   branches before any card, and again on every catch-up after a reboot.
+   Time the relay loop through the batch; if it stalls noticeably, cache each
+   mint's share public keys in RAM before release.
+
+## 40. Crash detail, and list_clients in one buffer (added 2026-11-13; items 1, 6 and 7 run in part 2026-11-13, item 3 on 2026-11-14, on a T-Display)
+
+Why: a T-Display on 0.18.0-beta.34 reset with `last_reset` `panic` and
+`crashed_during` "relay mgmt list_clients", and recorded nothing more. The
+cause is not confirmed. Host measurement (`common/tests/list_clients_memory.rs`,
+64-bit) puts the old reply build at about 60 KB of heap for a 5 KB reply of
+five ordinary apps, which a no-PSRAM board with its TLS sessions up may not
+have; the new build peaks at about 6.4 KB, and 14.5 KB through encryption.
+
+Crash detail:
+1. Power-cycle the board. FIRMWARE_INFO carries no `crash_detail`, and
+   `get_status` (device operator) has `crash_detail` `null`.
+2. A planned restart (an identity change, or the relay watchdog) also shows
+   no `crash_detail`, while `crashed_during` keeps naming a watchdog restart
+   as before.
+3. After the next crash reset on any board on this build, record
+   `last_reset`, `crashed_during` and `crash_detail`. `alloc-failed` with
+   `alloc_failed_bytes` near a reply's size points at heap exhaustion in that
+   operation; `rust-panic` names the line; `unrecorded` means neither hook
+   fired (watchdog, stack overflow, CPU exception, C abort).
+4. A per-identity delegate's `get_status`, full and low-heap, carries no
+   `crash_detail` key.
+5. `panic_site` never shows more than the path after `src/` and a line: no
+   home directory, no message.
+
+list_clients:
+6. Sapwood's clients view on the T-Display lists every app with the same
+   fields as before (labels, kinds, methods, approvals), and the USB slot
+   list (frame 0x42, also rebuilt on the new serialiser; heartwoodd reads
+   it) agrees.
+7. Leave the clients view open for 10 minutes on the T-Display with all its
+   relays live, polling as Sapwood does. No reset; note `get_status`
+   `free_heap` and `largest_free_block` before and after.
+8. If a reply ever reads "device low on memory; state unchanged, retry
+   shortly", it should clear on a later poll; note the heap figures.
+
+**Run 2026-11-13, on the owner's live T-Display.** CI's `app-tdisplay`
+artifact from `d02223c` (app.bin SHA-256 `f2deea06…`), written app-only at
+0x10000 with esptool at 115,200 baud; esptool's hash check passed. A first
+attempt at 460,800 failed mid-read on the CH9102, before any write. The
+board's own partition table was read first (factory at 0x10000, 3 MB). Only
+the app slot was read back as the rollback, not the full 4 MB: with `at_rest`
+`none` the NVS holds the seed in the clear. That slot was the
+v0.18.0-beta.34 release's `app-tdisplay.bin` byte for byte, so the rollback
+is that asset at 0x10000. The version string is unchanged (0.18.0-beta.34).
+Before the flash, 25,575 s up on beta.34: free heap 62,432, largest block
+47,104. Driven by USB frames and by `scripts/mgmt-request.mjs` with the
+board's operator key over its own gated relay; Sapwood's screens were not
+looked at.
+- Item 1: after the flash's power-on reset, FIRMWARE_INFO had no
+  `crash_detail` key, and the operator's `get_status` had `crash_detail`
+  `null`, as it did in all 86 polls of item 7.
+- Item 6, without Sapwood: `list_clients` over the relay returned all five
+  apps, a reply of about 7.8 KB. The USB slot list (0x42) returned 7,914
+  bytes of valid JSON with every `secret` empty. Every field the two share
+  was equal, slot for slot; `ids`, `secret` and `wb` are USB-only, as
+  before. Free heap was the same before and after the USB read.
+- Item 7: `get_status` then `list_clients` every 4 s for 10 minutes, as
+  Sapwood's relay view polls. 86 of 86 rounds answered; uptime went from
+  2,541 s to 3,139 s with no reset. `free_heap` was 66,068 at the start and
+  settled at about 63,300 from round 30 (last 61,904); `largest_free_block`
+  was 61,440 in most rounds and dipped twice to 32,768. Idle over USB
+  afterwards: 70,896 free, largest block 65,536. Ten minutes does not rule out
+  a slow leak, and the cause of the original reset is still unconfirmed.
+- Item 8: the low-memory reply was never seen.
+- Not run: item 2 (it restarts the live signer), items 3 and 5 (no crash on
+  this build yet), item 4 (host-tested only).
+- Sapwood, from its code: a relay refusal shows in its log as "WiFi status
+  refresh failed: client list too large for one reply (…)", but over USB any
+  0x42 NACK shows as "Slot list read denied", dropping the reason ("slot list
+  too large", "low memory"). A Sapwood follow-up.
+
+**Run 2026-11-13, the v0.18.0-beta.35 release image, on the same T-Display.**
+beta.35 is #279 (the `d02223c` build above) plus #280, which makes a mutation
+whose reply does not fit the heap say the change was applied. The draft
+prerelease's `app-tdisplay.bin` (SHA-256 `f2566e6c…`; `image-info` reports
+0.18.0-beta.35 with a valid hash), its ed25519 signature checked locally
+against `firmware/ota-release-pubkey.hex` for board `tdisplay`. Before the
+write, the partition table read back byte-equal to the release's
+`partition-table-tdisplay.bin`, and `verify-flash` confirmed the installed app
+was the `d02223c` build, the rollback image. Written app-only at 0x10000 at
+115,200 baud; esptool's hash check passed. Checked against the release gates
+at the end of `docs/dev-state-recovery.md`, by USB frames and by
+`scripts/mgmt-request.mjs` over its own gated relay; Sapwood's screens were
+not looked at.
+- Retained state: 56 minutes after the flash, FIRMWARE_INFO reported
+  0.18.0-beta.35, `at_rest` `none` (so the gates' unlock steps do not apply)
+  and NVS 542 of 756 entries used. It read 544 at the `d02223c` flash, and no
+  reading in between places the change. One master with 5 apps, as before; the
+  USB slot list was 7,914 bytes with every `secret` empty. The note count was
+  not read: a WiFi-standalone board NACKs NOTE_CMD and relay management has no
+  note method, so it needs the switch to USB mode.
+- Reboot: a chip reset through esptool's RTS line at 11:54:39Z, with no
+  write; not a cable unplug. At 12 s up: `last_reset` `power-on`, no
+  `crash_detail` key (item 1 again), NVS 542, the same master and apps, the
+  same 7,914-byte slot list; free heap 107,176, largest block 106,496. The
+  first relay `get_status` timed out while WiFi came up; the retry answered at
+  103 s with beta.35 and `crash_detail` `null`, and `list_clients` returned all
+  five apps.
+- Heap, item 7's question over a longer span: relay `get_status` once a minute
+  for an hour. 60 of 60 answered; uptime went from 1,026 s to 4,390 s with no
+  reset, `crash_detail` `null` throughout. Free heap was 74,428 at 103 s and
+  54,224 at 1,026 s, then fell steadily to 52,176 at the end, about 35 bytes a
+  round (2 KB an hour); the lowest was 51,552. The largest block was 43,008,
+  then 40,960 from 28 minutes in. That is below the `d02223c` run (about
+  63,300 settled, under heavier polling) and beta.34 before the flash (62,432
+  after seven hours up), and it had not levelled off within the hour. Whether
+  the fall comes with each request or is state filling to a bound is not
+  known; the 32-entry sign audit ring records signing requests, not these
+  reads. A reading some hours on would tell.
+- Heap, some hours on: one more relay `get_status` at 20:00:02Z, 6.87 hours
+  after the hour's last round, with nothing from this test polling the board
+  in between. Uptime 29,122 s, `last_reset` `power-on`, `crash_detail` `null`.
+  Free heap was 47,196, down 4,980 (about 725 bytes an hour, a third of the
+  rate while polled), and the largest block 34,816, down 6,144. The fall goes
+  on without these reads, more slowly, and the largest block is shrinking
+  faster than free heap. One client the board does not authorise was sending
+  it a request every 30 seconds throughout, logged as refused from 13:30Z on.
+  The same client had been failing at that rate, its error printed blank,
+  since before the beta.34 boot above, so it ran through the `d02223c` run
+  too. Whether that traffic or time-based work accounts for the fall is not
+  yet known.
+- Not run: items 2 to 5, as before; item 8's reply was not seen.
+- Settlement: the small-value mint-confirm-export-melt-spent round trip was not
+  run; the owner set it aside.
+- The Sapwood follow-up above is done: Sapwood shows why a 0x42 read was
+  refused (sapwood#192).
+
+**Overnight 2026-11-13 to 14, and a crash, on the same T-Display on beta.35.**
+Relay `get_status` every 30 minutes from 20:15Z, by `scripts/mgmt-request.mjs`
+with the device operator key.
+- A new pairing was made between 20:46Z and 21:49Z: a slot for the client the
+  board had been refusing (run above). NVS went from 543 to 567 entries across
+  it, and 569 by 22:19Z. That client's own log, which has no timestamps,
+  shows the same NIP-46 `connect` refused as "unauthorised" every 30 seconds
+  from its 13:30Z restart, 879 attempts, then a restart onto the new slot and
+  a successful connect. 879 attempts 30 s or more apart end at 20:50Z or
+  later, and its process started at 21:05:48Z, inside that window. After it
+  connected, five of its relay sign-in requests through the board timed out;
+  the log was last written at 08:12Z.
+- From 21:49Z to 07:53Z, 20 of 21 rounds answered (06:23Z timed out). Free
+  heap held at about 45,000: between 44,288 and 45,376, apart from 43,028 at
+  01:50Z and 41,520 at 07:23Z, each back by the next round. The largest block
+  was 32,768 in most rounds (34,816 in two early ones, 31,744 and 30,720 at the
+  two dips). No reset, `crash_detail` `null`, uptime 71,927 s at the last
+  round. The evening's fall did not go on overnight, with the refused
+  client gone.
+- Item 3, run: at about 08:09:35Z (uptime 834 s at 08:23:29Z) the board reset
+  with `last_reset` `panic`, `crashed_during` "relay envelope kind 24134" and
+  `crash_detail` `{"cause": "alloc-failed", "alloc_failed_bytes": 14526,
+  "alloc_failed_caps": 6144, "alloc_failures": 1, "panic_site": null}`. Three
+  seconds earlier a relay `list_clients` had been sent with the operator key;
+  it timed out. After the new pairing the reply's plaintext had grown into
+  NIP-44's 8,193 to 10,240 B padding band, a 13,744-byte ciphertext, and
+  `ws_send_framed` then asked for one frame of 14 + 13,744 + 768 = 14,526
+  bytes while the event still held the ciphertext. `response_transportable`
+  allows for one allocation that size, not two. Item 6's five-app reply (about
+  7.8 KB) was in the band below and went out. #286 streams the frame through a
+  512-byte buffer instead (run below).
+- After the reset: free heap 66,256, largest block 65,536, and NVS 603 entries,
+  up from 569. The crash record is kept in RTC memory, so this run does not
+  account for the rise.
+- Refused-connect soak, run 09:19Z to 10:49Z on the same boot: an unpaired
+  client key sent a NIP-46 `connect` with a wrong secret every 3 seconds, the
+  same request and "unauthorised" reply as the client refused overnight. 1,799
+  sent, every one answered, no reconnect, no reset. Relay `get_status` every
+  10 minutes: free heap 46,876 at the start and between 46,672 and 46,852 in
+  eight of the nine rounds after; 44,912 at 80 minutes, back to 46,676 by the
+  next. Largest block 34,816 throughout (36,864 at the start). Twice the
+  overnight client's refusals in 90 minutes, with no fall, so refused
+  `connect`s are unlikely to explain the evening's drop. Stopped at 90 of a
+  planned 120 minutes once the dip had recovered.
+- #286, run: CI's `app-tdisplay` artifact from `0e3d511` (app.bin SHA-256
+  `c0a2068a…`) written app-only at 0x10000 at 11:02Z, replacing the signed
+  beta.35 release image, which `verify-flash` matched first and which is the
+  rollback. The version string is unchanged (0.18.0-beta.35). After the
+  power-on reset: no `crash_detail`, and NVS 569 entries, the figure before
+  the panic. At 1,046 s up, free heap 68,816 and largest block 59,392; one
+  relay `list_clients` then listed six apps, an estimated 8,680 B of
+  plaintext and so a 13,744-byte ciphertext, the size that panicked (worked
+  from the decrypted reply, not measured on the wire). No reset; 68,660
+  and 59,392 after, 68,748 five minutes on. With that much heap the old
+  whole-frame build might have passed too, so this shows the streamed frame
+  arriving intact; that the second content-sized allocation is gone rests on
+  `common/tests/ws_frame_memory.rs`.

@@ -441,8 +441,8 @@ pub fn method_uses_identity_key(method: &str, has_context: bool) -> bool {
 }
 
 /// Bearer-note methods that act with the served identity's key (sealing a
-/// send, deriving an address or claim key, signing an address proof with an
-/// address branch's key). They are scoped like signing but
+/// send, deriving a share or claim key, signing an address proof with a
+/// share's or legacy branch's key). They are scoped like signing but
 /// have no identity card of their own: an unapproved identity is refused, and
 /// approval comes from a sign or crypto prompt.
 pub fn method_uses_served_key(method: &str) -> bool {

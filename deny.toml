@@ -17,14 +17,6 @@ ignore = [
     # instant (wasm time shim) pulled transitively into heartwoodd. Host-only
     # timekeeping, no security surface; superseded upstream by web-time.
     "RUSTSEC-2024-0384",
-    # crypto-bigint 0.5.5 secret-dependent branches (fixed in 0.7.6, which
-    # needs k256 0.14). Every host crate is on k256 0.14 now; the one 0.5.5
-    # left is in `common`'s lock, through vmls-core (a dev-dependency there),
-    # whose k256 0.13 only verifies BIP-340 signatures over public data, so
-    # nothing secret reaches the affected arithmetic (the firmware, which this
-    # gate does not cover, links the same vmls-core for the same use). Remove
-    # this entry when vmls-core's rev moves to its k256 0.14 release (2026-10-28).
-    "RUSTSEC-2026-0387",
 ]
 
 [licenses]

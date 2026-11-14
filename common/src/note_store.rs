@@ -135,8 +135,9 @@ pub enum Peer {
 /// key, and the note is spent with a `ck1`, an ownership signature the key
 /// makes, never with the key itself. The mint files the note under `pubkey`.
 ///
-/// `index` is where on the owner's address branch the key sits: kept so a
-/// wallet scanning that branch can tell which keys this locker already holds.
+/// `index` is the note's index on the owner's share (or legacy branch); the
+/// share is not recorded, since the stored key is what spends. Kept so a
+/// wallet scanning can tell which keys this locker already holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyNote {
     pub index: u32,
@@ -889,7 +890,10 @@ impl NoteStore {
     }
 
     /// PENDING → CONFIRMED once the mint answered OK. A blob-only rewrite:
-    /// allowed even when the index is unknown, like the vault.
+    /// allowed even when the index is unknown, like the vault. `sig` is
+    /// checked as every other certificate the locker keeps (`valid_sig`):
+    /// hex from a Part 1 mint, or the `cs1` a Part 2 mint returns and the
+    /// wallet passes straight through.
     pub fn confirm(
         &mut self,
         storage: &mut dyn NoteStorage,
@@ -904,7 +908,7 @@ impl NoteStore {
             return Err(NoteError::BadRequest);
         }
         let sig = sig.unwrap_or("");
-        if sig.len() > MAX_SIG_LEN || !is_lower_hex_or_empty(sig) {
+        if !valid_sig(sig) {
             return Err(NoteError::BadRequest);
         }
         let idx = self.find(id)?;
@@ -1030,7 +1034,7 @@ impl NoteStore {
         // The last creation path that did not do this. `receive`, the two
         // mint paths and `import_key` all make room out of spent records
         // first, so a full locker took a note someone sent, minted one of
-        // its own, and claimed one off the address branch, then refused the
+        // its own, and claimed one off a share, then refused the
         // import, which is how the browser wallet lands a note it has just
         // paid for. Same device, same locker, an answer that depended on
         // which call arrived. Nothing new is reachable by it:
@@ -2150,6 +2154,52 @@ mod tests {
         assert_eq!(store.discard(&mut storage, &id), Err(NoteError::InvalidState));
 
         assert_eq!(store.export_secret("00000000"), Err(NoteError::NotFound));
+    }
+
+    #[test]
+    fn confirm_takes_a_cs1_as_well_as_hex() {
+        // A Part 2 mint certifies a deposit with a cs1 and the wallet passes
+        // it straight to confirm. Refusing it left the deposited note PENDING.
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/lud25-part2.json")).unwrap();
+        let certs = vectors["certificates"].as_array().unwrap();
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+
+        let mut confirmed = Vec::new();
+        for (i, cert) in certs.iter().enumerate() {
+            let cs1 = cert["cs1"].as_str().unwrap();
+            let (id, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", i as u32).unwrap();
+            store.confirm(&mut storage, &id, 1_000, "mint.example/w", Some(cs1), 10).unwrap();
+            let meta = store.get_meta(&id).unwrap();
+            assert_eq!(meta.state, NoteState::Confirmed);
+            assert_eq!(meta.sig, cs1);
+            confirmed.push((id, cs1));
+        }
+        // hex from a Part 1 mint still goes in
+        let (hex_id, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 20).unwrap();
+        store.confirm(&mut storage, &hex_id, 1_000, "mint.example/w", Some("ab12"), 21).unwrap();
+
+        // what confirm stores, a reload reads back
+        let reloaded = fresh_store(&mut storage);
+        for (id, cs1) in &confirmed {
+            assert_eq!(reloaded.get_meta(id).unwrap().sig, *cs1);
+        }
+        assert_eq!(reloaded.get_meta(&hex_id).unwrap().sig, "ab12");
+
+        // still refused, and the note stays PENDING: an upper-case cs1, upper-case
+        // hex, an over-long sig, and a string that is neither
+        let cs1 = certs[0]["cs1"].as_str().unwrap();
+        let (id, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 30).unwrap();
+        for bad in [cs1.to_uppercase(), "AB12".to_string(), "a".repeat(MAX_SIG_LEN + 2), "cs1notacert".to_string()] {
+            assert_eq!(
+                store.confirm(&mut storage, &id, 1_000, "mint.example/w", Some(&bad), 31),
+                Err(NoteError::BadRequest),
+                "{bad}"
+            );
+        }
+        assert_eq!(store.get_meta(&id).unwrap().state, NoteState::Pending);
     }
 
     #[test]

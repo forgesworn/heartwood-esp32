@@ -121,18 +121,22 @@ pub fn handle_list(usb: &mut SerialPort<'_>, frame: &Frame, policy_engine: &mut 
     } else {
         let ms = frame.payload[0];
         let slots = policy_engine.list_slots(ms);
-        let redacted: Vec<_> = slots.iter().map(|slot| {
-            let mut view = heartwood_common::mgmt::client_summary(slot);
-            view["secret"] = serde_json::Value::String(String::new());
-            view["ids"] = serde_json::Value::String(slot.approved_identities.clone());
-            view["wb"] = serde_json::Value::Bool(slot.was_bound);
-            view
-        }).collect();
-        match serde_json::to_vec(&redacted) {
-            Ok(json) => protocol::write_frame(usb, FRAME_TYPE_CONNSLOT_LIST_RESP, &json),
+        // Written straight from the slots into one buffer with room for the
+        // frame (the same bytes as the summary trees this used to build, a
+        // fraction of their heap), then framed in place.
+        use heartwood_common::mgmt::{encode_usb_slot_list, ListClientsEncodeError};
+        match encode_usb_slot_list(slots) {
+            Ok(json) => {
+                protocol::write_owned_frame(usb, FRAME_TYPE_CONNSLOT_LIST_RESP, json);
+            }
             Err(e) => {
-                log::error!("Failed to serialise slot list: {e}");
-                protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
+                log::error!("Failed to serialise slot list: {e:?}");
+                let reason: &[u8] = match e {
+                    ListClientsEncodeError::TooLarge(_) => b"slot list too large",
+                    ListClientsEncodeError::OutOfMemory(_) => b"low memory",
+                    ListClientsEncodeError::Encode => b"",
+                };
+                protocol::write_frame(usb, FRAME_TYPE_NACK, reason);
             }
         }
     }

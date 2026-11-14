@@ -8,9 +8,9 @@ Hardware signing device for Nostr on a Heltec WiFi LoRa 32 (ESP32-S3). Both the 
 
 ## Security model
 
-- **Physical approval required** — OLED shows the request, button press to sign. No silent signing. Applies in every mode, including WiFi-standalone.
+- **Physical approval required** — OLED shows the request, button press to sign. No silent signing. Applies in every mode, including WiFi-standalone. The one exception is the board's own NIP-42 relay sign-in (kind 22242, fixed shape, its own dialled URL, only when the relay challenges; see "Relay sign-in" below and docs/SECURITY-MODEL.md), which signs in its own connection rather than signing anything for anyone.
 - **USB-bridged mode (high-assurance default):** all radios disabled, USB serial only. Pi compromise is survivable — keys live on the ESP32, and in device-decrypts mode the Pi only ever sees ciphertext.
-- **WiFi-standalone mode (opt-in convenience tier):** WiFi *is* enabled and the device reaches relays directly — a deliberately larger attack surface, accepted in exchange for dropping the Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated. Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected. Don't enable this tier where the USB high-assurance model is required.
+- **WiFi-standalone mode (opt-in convenience tier):** WiFi *is* enabled and the device reaches relays directly — a deliberately larger attack surface, accepted in exchange for dropping the Pi. Keys still never leave the chip, NIP-44 is still decrypted on-device, and every signature is still button-gated, except the board's own NIP-42 sign-in to a relay that asks (kind 22242, fixed shape). Relay-side device management (kind 24134) is authenticated to a provisioned operator pubkey and replay-protected. Don't enable this tier where the USB high-assurance model is required.
 - **Portable mode** (roadmap, not built) — would enable only BLE (short range) and hold a child key, never the master.
 - **JTAG remains enabled** — disabling it requires eFuse burning, which permanently locks the chip and is deliberately rejected (see `docs/memory/feedback_no_efuse.md`); physical security is the protection model, including against debug-port key extraction.
 
@@ -228,6 +228,15 @@ selfcheck` crumb. All of it is `common/src/delivery_probe.rs`
 (`SessionProbe`, `SelfCheckLedger`), host-tested; relay.rs
 `delivery_selfcheck` is the glue.
 
+Heap-fall diagnostics: the full `get_status` reply (device operator only, not
+the low-heap fallback or either delegate shape) also carries `min_free_heap`,
+the free-heap low-water mark since boot (`esp_get_minimum_free_heap_size`), and
+`relay_connects`, how many relay sessions `connect_relay_raw` has returned
+`Ok` for since boot (relay.rs `RELAY_CONNECTS`; primary, secondary, pinned,
+publish-only and locked-boot dials all pass through it, so it includes sessions
+opened before unlock; a dial that fails part-way is not counted). Both are
+read-only and additive.
+
 A relay that refuses this client is left alone (2026-10-08, checklist section
 35 items 8-9, NOT YET BENCH-RUN). relay.damus.io was found answering `banned:
 too many rate-limit violations` to the owner's home address on 2026-10-08;
@@ -237,8 +246,11 @@ included), which is what a violation counter punishes. `relay_cooldown::classify
 reads the relay's own words (a `NOTICE`, a `CLOSED`, an `OK false`, or the
 upgrade's status line): `banned` cools the host 60 min, `rate-limited:`, the
 same in words, or an HTTP 429 cools it 15 min; `blocked:`, `restricted:` and
-`auth-required:` are about an event or an author and keep their old handling
-(an allowlisted relay's `OK false` still only makes the probe inert). The
+`auth-required:` are about an event or an author and are never classified
+(an allowlisted relay's `OK false` still only makes the probe inert); a
+subscription closed `auth-required:`/`restricted:` is the NIP-42 sign-in's
+(below), which cools the host 10 min (`Refusal::AuthRefused`) only once a
+sign-in failed or did not help. The
 session drops with a `relay refused us` error (runtime class
 `relay_refused`; Sapwood has no label for it yet). A cooling host is never the
 secondary or a pinned dial, and the primary rotation passes it by; when every
@@ -268,7 +280,43 @@ ordinary rotation carrying on if home fails. Never while a card is open, an
 OTA, a network trial or a relay update round runs, a session is degraded, or
 relay 1 is cooling after refusing us.
 
-LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats): a
+Relay sign-in, NIP-42 (2026-10-22, checklist section 38, benched 2026-10-22 on the T-Display against the gated strfry relay — sign-in confirmed through it; 2026-11-01 review then caught the answer framed as EVENT where the NIP says ["AUTH", event]: strfry tolerates both, a strict relay does not, so the frame is now AUTH; re-benched 2026-11-02 against a throwaway khatru bench relay, which verified each 22242 itself and served the board — one caveat recorded as #264: khatru keeps one authed identity per connection, and the probe signs last). A
+relay may refuse every REQ until the connection signs in: it sends `["AUTH",
+<challenge>]`, holds a REQ for a few seconds, then closes it `auth-required:`
+(or `restricted:` when the keys signed in may not read it). The board now
+answers on every subscribing session (primary, secondary, pinned, and the
+locked phase's), never on a publish-only `publish_once` connection (phone
+relay updates, old-relay lock announcements: nothing there may name the
+signer), and never unasked. No button: it is signing in its own connection.
+The event is `relay_auth::auth_event`'s fixed shape: kind 22242, tags exactly
+`relay` (the session's own dialled URL, `s.url`, never anything the relay
+sent) and `challenge`, empty content. Unlocked (relay.rs `answer_auth`): one
+per unlocked master plus one for the per-boot probe key, stamped from
+`session_wall_clock` (the probe's clock); the masters are what the relay's
+allowlist admits, and the probe key costs one signature and completes the
+24133 filter's `#p` on a relay applying only the authors/`#p` rule when the
+board has no personas. Personas are deliberately never signed in: a
+re-derivation and signature each per connect, and a shared challenge would
+prove persona and master are held together. Locked (`locked_relay_auth`):
+the one-time unlock key only, the `#p` of the `locked` REQ, from the Date
+header clock. Challenges must be printable ASCII up to 256 bytes, are never
+answered twice, at most two per connection. `relay_auth::RelayAuth` (pure,
+host-tested, one per session) then decides: a subscription closed for sign-in
+while the `OK`s are outstanding is re-sent when they arrive (any key
+accepted), one closed after sign-in is re-sent at once, each at most once per
+sign-in ("hw" goes out as the connect-time catch-up REQ again; a closed
+`wrappage` just ends the catch-up pass; the locked phase re-sends `locked`);
+a second refusal, every key refused or unanswered within 10 s with a
+subscription closed for it, or `auth-required:` with no challenge within 5 s
+backs off: the session drops as `relay refused us (sign-in refused)` and the
+host cools 10 min (`relay_cooldown::Refusal::AuthRefused`; in the locked
+phase, a phase-local `RelayCooldowns` drives its rotation). A sign-in refused
+with nothing closed changes nothing; any other `CLOSED`, and `restricted:`
+from a relay that never challenged, keep their old handling. The owner's
+relay needs the masters on its allowlist before this helps.
+
+LUD-25 Part 2 key notes (2026-09-11, checklist section 15, receive/scan/spend bench-run on real sats; the
+derivation below is now legacy, see LUD-26 shares further down): a
 lightning address owned by a master npub can be paid to keys the device
 derives from that identity key (common/src/cash_key.rs: seed =
 HMAC-SHA256(identity key, "LNURLcash/nostr-seed"), then LUD-25's
@@ -296,23 +344,81 @@ with; nothing new is handed out there, so re-register a name
 (`heartwood address keys`) to move it to the current branch. The ECDSA
 `recovery`/`ecdsa` backend features are gone.
 
-Address proofs (2026-10-05, checklist section 34, NOT YET BENCH-RUN): since
+LUD-26 shares (2026-11-04, luds `lnurlcash` `92e430f`, checklist section 39,
+NOT YET BENCH-RUN): moneyer 0.22.0 and lnurl-mint refuse the whole-branch
+`cx1` and the index-0 proof above, so the device now hands out shares. From
+the same seed, `S = m/139'/d1..d4` with `d1..d4` from HMAC(m/139'/0, domain),
+the domain being the mint's hostname lowercased WITHOUT its port (the whole
+branch hashed the host as stored, port included); share n is `S/0'/2/n'`,
+exported as the 65-byte `cx1 = bech32m("cx", chainCode || P)` (113 chars);
+note i of share n is `S/0'/2/n'/i`, plain BIP-32, no tweak; the ck1 is
+unchanged (`cash_key::share_node`, `share_cx1_of`, `share_note_key`, graded
+on both backends against lnurlcash-conformance 0.16.2's `part2.json`,
+`nostr-seed.json` and `spec-vectors.json` `lud26`, fixtures
+`common/tests/fixtures/lud26-*.json`). Account 0 only, and only its share
+chain: `S/0'/0` and `S/0'/1` (a wallet's own notes) are never derived here.
+Shares are 0 to 19 (`cash_key::SHARE_LIMIT`) everywhere, a lifetime budget
+per mint rather than a count of names: moneyer and lnurl-mint burn every share
+key they accept and keep it burnt after a move or unregister ("cx1 already
+used"), so each register and each move spends one for good. The device records
+none; hosts keep the count (notecase's `heartwoodShares`). A wrap names the
+note index and not the share, so `open_key_note` and a `p`-naming claim try
+every share the device can hand out, then both legacy branches on the purposed
+and the pre-purpose tweak (`cash_key::claim_note_key`), where the names
+registered before LUD-26 are still paid. Stored notes need no migration: a key note's secret IS
+its key, and nothing re-derives it to spend. Wire (one capability,
+`note_address_v2`, for all three methods, replacing `note_address_proof_v1`;
+a second string measured once at about 850 B of image, the capability list
+being a json! array):
+`heartwood_note_address` takes exactly one of `{host, share}`, answering
+`{ok, host, share, cx1, pubkey}` with the share's 65-byte cx1, or `{host,
+branch: "legacy"|"superseded"}`, answering `{ok, host, branch, cx1, pubkey}`
+with that whole branch's 64-byte cx1 (hashed on the host as stored), which a
+host needs as `on_file` to move or clear a name still registered to it and to
+scan it for payments whose wrap never arrived; neither (an old host) is
+`bad_request`. No card either way: both are watch-only, and go only to paired
+clients, as before; `heartwood_note_claim` takes an
+optional `share` (tried first; required when there is no `p`) and answers
+`share` or `branch` (`legacy`/`superseded`) for where the key was.
+`heartwood_note_address_proof {host, name, action, ...}`: `register` takes
+`cx1` and `share` (signed by that share's own key `p` over
+`LNURLcash:register:<domain>:<name>:<cx1>`); `update` takes `cx1` and `share`
+(the new share) plus `on_file`, the `cx1` on file (`on_file_share` optional;
+a 64-byte one is a legacy branch), and answers `sig` by the key on file over
+`LNURLcash:update:<domain>:<name>:<new cx1>` AND `newsig` by the new share
+over the register message, on ONE hold; `unregister` takes `on_file` only.
+A legacy branch signs with its branch key, x(P) of its 64-byte cx1 (what dni's
+reference reads; moneyer takes it or the old index-0 key). A field the action
+does not take, a whole-branch `cx1` to register, a bound `cx1` that is not the
+named share, an update onto the share on file, and any key not this
+identity's are refused by `note_cmd::address_proof_ask` before the card,
+relay precheck and dispatcher alike. Reply: `{ok, share?, cx1?, sig, pubkey,
+newsig?, newpubkey?}`, no echo of the request; the message is bound to the
+portless domain and the cx1 is the device's lowercase spelling. Release
+image cost of the change, CI's V4 gate at `24ad6f6`: +5,760 B, leaving 2,352 B
+spare (2,094,800 of 2,097,152; main had 8,112 B spare at `d4a59df`). The card is ADDRESS PROOF over
+`<name>@<domain>` and `register, share 3`, `move: old keys > share 3` or
+`unregister, share 3` (at most 25 chars, pinned by a test). Line one always
+shows the WHOLE domain; past 25 chars the name is cut to its head and tail
+around `..` (`note_cmd::card_address`), and a domain that leaves room for
+fewer than three of the name's characters is refused before the card rather
+than shown in part. A host whose portless domain is empty (`:8443`) or starts
+or ends with a dot is refused by `cash_key::valid_mint_host` in
+`cash_address` and `address_proof_ask` alike. Every gating rule
+below is unchanged.
+
+Address proofs (2026-10-05, checklist section 34; its message and key are
+superseded by LUD-26 above, its gating is not): since
 `50d740a` a mint changes or clears a name's cx1 only with `"sig"`, a BIP-340
-signature by the purpose-0 index-0 key of the branch CURRENTLY on file over
-sha256("LNURLcash:<register|unregister>:<domain>:<name>"), so a name on the
+signature by the key on file, so a name on the
 superseded branch can be moved only with that branch's agreement.
-`heartwood_note_address_proof {host, name, action, cx1}` (wire command
-`cash_address_proof`, capability `note_address_proof_v1`) signs it with
-whichever of the served identity's two branches at `host` has that exact cx1
-(`cash_key::address_proof_for`, compared as decoded bytes; any other cx1 is
-refused) over `spend_domain(host)`, aux_rand zero, which reproduces all four
-of part2.json's `addressProofs`. It answers the 64-byte `sig`, the index-0
-`pubkey` and `branch` (`current`/`superseded`), never a key. Everything that
-could refuse (mint, name rule `^[a-z0-9][a-z0-9._-]{2,31}$`, action, a cx1
-that is ours) is checked by the one pure `note_cmd::address_proof_ask` before
+`heartwood_note_address_proof` (wire command `cash_address_proof`) signs it
+only with keys of the served identity at `host` (compared as decoded bytes;
+any other cx1 is refused), aux_rand zero, and never answers a key.
+Everything that could refuse is checked by the one pure `note_cmd::address_proof_ask` before
 the card, on the relay precheck and in the dispatcher alike; the card
-(`note_cmd::address_proof_card`) is ADDRESS PROOF over `<name>@<domain>` and
-`<action>, current keys` or `old keys`. Pinned ButtonRequired like the other
+(`note_cmd::address_proof_card`) is ADDRESS PROOF over `<name>@<domain>`.
+Pinned ButtonRequired like the other
 note mutations, and device-press-only (`Nip46Method::device_press_only`, as a
 wallet pairing is): a proof never expires and decides where a name pays, so no
 guardian verdict may answer it and an escalate slot is refused outright. It
@@ -324,6 +430,69 @@ speaks in notes and sats and could not name a second proof. The cable has no
 identity, so `cash_address_proof` there refuses before the card, as
 `cash_address` does; on the USB-bridged NIP-46 path the card is the generic
 extension card, as for every note method.
+
+Crash detail beside the breadcrumb (2026-11-13, checklist section 40; item
+1 run on a T-Display, no crash yet to record). A T-Display on beta.34 reset with `last_reset` `panic` and
+the crumb "relay mgmt list_clients", and nothing else to go on: every board
+builds with its console off, so the panic message went nowhere. Two RTC
+noinit records now sit beside the crumb (`firmware/src/crash_crumb.rs`,
+rules in `common/src/crash_record.rs`, host-tested). A Rust panic hook keeps
+the panic's `file:line`, the path after its last `src/`, at most 40 bytes,
+never the message: FIRMWARE_INFO answers any USB host while locked, and a
+formatted message can carry request data. ESP-IDF's failed-allocation
+callback (`heap_caps_register_failed_alloc_callback`; in IRAM, RTC writes
+only) keeps the last failed allocation's size and caps, and a count. Both are
+stamped with the crumb window, which every `set` and `clear` bumps, and only
+final-window records count, since TLS and WiFi survive failed allocations. A
+Rust out-of-memory never reaches the panic hook on stable std (it prints and
+aborts, which resets as a panic), so a failed allocation with no panic, on a
+panic reset, is the out-of-memory signature; after a watchdog or brownout it
+is only a fact about the window. A stack overflow, CPU exception, C abort or
+watchdog fires neither and reads `unrecorded`. Reported after a crash reset as
+`crash_detail` `{cause: rust-panic|alloc-failed|unrecorded, panic_site,
+alloc_failed_bytes, alloc_failed_caps, alloc_failures}` beside
+`crashed_during`: in FIRMWARE_INFO, and in the device operator's
+`get_status`, full and low-heap, never a delegate's.
+
+`list_clients` in one buffer (2026-11-13, checklist section 40; items 6-7
+run on a T-Display, 10 minutes at Sapwood's pace, no reset). The relay reply was a `serde_json` tree per slot, copied into a
+second tree by each `json!` wrap and serialised with two trees alive:
+`common/tests/list_clients_memory.rs` measures about 60 KB of heap for the
+5 KB reply of five ordinary apps (host, 64-bit). `mgmt::encode_list_clients_reply`
+(behind common's new `std` feature, which the firmware enables for
+serde_json's writer) counts the reply, reserves one buffer fallibly
+(`try_reserve_exact`; a failure returns the usual "device low on memory;
+state unchanged, retry shortly") at the size NIP-44 needs for it
+(`nip44::owned_capacity`, so `encrypt_owned` pads and frames it in place),
+then writes it without regrowing: about 6.4 KB at peak for that reply, and
+14.5 KB through encryption against the old 60 KB. The bytes are the same as
+before (host-tested against `client_summary`). The USB slot list (frame
+0x42) built the same trees and now goes through the same serialiser
+(`mgmt::encode_usb_slot_list`, sized for its frame and framed in place by
+`write_owned_frame`), so the firmware no longer links `client_summary` at
+all. Both passes of the encoder write through serde_json's `Vec<u8>` writer,
+the one the rest of the firmware already uses (counting runs each slot
+through a scratch buffer, so it briefly holds up to about twice the largest
+slot's JSON), and `crash_detail` is hand-written JSON rather than serde, to
+keep the Heltec images inside their 2 MB slot (main left the V4 about 2 KB
+spare). A reply NIP-44 cannot carry (over 65,535 bytes; 16
+maximum-size slots come to about 105 KB) is refused after the count as
+"client list too large for one reply", not "retry shortly". `relay.rs`
+handles the method before `dispatch_mgmt`, as it does phone enrolment, and
+the transport guard still runs on the finished reply. That heap exhaustion
+caused the T-Display reset is unconfirmed, since the board recorded nothing
+beyond the crumb. Paging the list would change the wire format Sapwood reads;
+it has not been done.
+
+The low-memory reply no longer denies a change (2026-11-13). When a
+management reply does not fit the heap, the guard in `relay.rs` used to
+answer "device low on memory; state unchanged, retry shortly" whatever the
+method had done, though a mutation that succeeded is already on the board
+with its one-time challenge spent. `mgmt::low_memory_reply` (host-tested)
+now answers "device low on memory; the change was applied but its reply
+could not be sent, read the state before retrying" for a mutating method
+that returned a result, and the old text for a read, a refusal or a failure.
+Both keep the "device low on memory" prefix Sapwood matches.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
@@ -408,6 +577,29 @@ crate has a feature flag: `k256-backend` (default, for host tools/tests) and
 `secp256k1-backend` (for firmware). Both backends produce identical outputs —
 verified by the frozen test vector in `common/src/derive.rs`.
 
+### Toolchain and dependency pins (2026-10-28)
+
+- CI and release.yml run on `ubuntu-24.04`, not `ubuntu-latest`: 26.04 has no
+  `libxml2.so.2`, which the ESP toolchain's esp-clang 16.0.1 links against,
+  so every firmware build failed with `Could not install esp-idf`.
+- k256 is 0.14.0 (exact pin) with a crypto-bigint floor of 0.7.6 for
+  RUSTSEC-2026-0387, so the effective Rust floor is 1.87. `vmls-core` is pinned
+  by rev in common/ and firmware/ to `1c0adece` (6 Nov), a commit on vmls-core
+  main 13 commits after its v0.1.2 tag. vmls-core is a mirror published from
+  vennel (`scripts/publish-vmls-core.mjs`). deny.toml allows it only as a git
+  source (`[sources] allow-git`) and carries no advisory exception for it.
+- esp8266-firmware's pinned esp toolchain reports `1.87.0-nightly`, which Cargo
+  ranks below crypto-bigint's 1.87, so its CI build passes
+  `--ignore-rust-version`, and builds `--locked` on sha2 0.11.0 (0.11.1 needs
+  Rust 1.88's `slice_as_chunks`). esp 1.95 drops the build-std feature the
+  lx106 build needs, so the toolchain stays put.
+- Heavy builds and full test suites run on the M4 (workspace CLAUDE.md). Host
+  crates there need `--target aarch64-apple-darwin`; for firmware there,
+  esp-idf-sys's arm64 esp-clang libclang clashes with the x86_64 cargo, so move
+  `firmware/.embuild/espressif/tools/esp-clang/*/esp-clang/lib/libclang.*` aside
+  in the scratch copy. rsync keeps old mtimes: touch the sources after a branch
+  switch or cargo reuses stale binaries.
+
 ## Dependencies
 
 All crypto crates are no_std-compatible but we use the ESP-IDF std framework:
@@ -420,6 +612,6 @@ All crypto crates are no_std-compatible but we use the ESP-IDF std framework:
 | zeroize | Deterministic secret cleanup |
 | bech32 | npub encoding |
 | bip39 + bip32 | Mnemonic derivation (provision CLI only) |
-| crc32fast | Serial protocol integrity |
+| `common::crc32` (in-crate) | Serial protocol and record checksums: standard CRC-32 from a 64-byte table, in place of crc32fast's 16 KiB one |
 | esp-idf-svc + esp-idf-hal | ESP-IDF std framework (I2C, GPIO, NVS, logging) |
 | ssd1306 + embedded-graphics | OLED driver and text rendering |

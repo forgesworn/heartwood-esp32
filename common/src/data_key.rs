@@ -1161,6 +1161,17 @@ pub fn read_pin_attempts<S: PinCountStore>(store: &S) -> Result<u8, &'static str
     }
 }
 
+/// Whether a 32-byte vault key would unwrap like a PIN. The wrap is
+/// PBKDF2-HMAC-SHA256 over the raw secret, and HMAC pads a short key with
+/// zeros, so `"1234"` and `"1234"` followed by 28 zero bytes derive the same
+/// key. A PIN is at most 8 digits, so any vault key whose bytes 8..32 are all
+/// zero could stand in for one. Such a key is refused on every unlock path
+/// (none of which counts towards the PIN wipe) and is never set. A random key
+/// has that shape with probability 2^-192.
+pub fn secret_aliases_a_pin(secret: &[u8]) -> bool {
+    secret.len() == 32 && secret[8..].iter().all(|&b| b == 0)
+}
+
 /// What raising the count for one guess achieved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum GuessCharge {
@@ -1201,17 +1212,28 @@ pub fn charge_pin_guess<S: PinCountStore>(store: &mut S) -> GuessCharge {
 
 /// Clear the count after a right PIN. The integer goes to zero first, so no
 /// cut leaves the old blob authoritative once the integer has been cleared.
+///
+/// The guess was counted before it was checked, so a right fifth PIN sits on
+/// flash at the wipe limit until this lands: a clear that silently failed
+/// would wipe the board at the next boot. Each pass is judged by reading the
+/// count back, not by what the writes returned, and a pass that leaves it
+/// non-zero is tried once more.
 pub fn clear_pin_attempts<S: PinCountStore>(store: &mut S) -> Result<(), &'static str> {
-    if store.set_count(0).is_err() {
-        store.remove_count().map_err(|_| "could not clear PIN-attempt state")?;
+    let mut result = Err("PIN-attempt state did not clear");
+    for _ in 0..2 {
+        if store.set_count(0).is_err() {
+            let _ = store.remove_count();
+        }
+        if matches!(store.get_legacy(), Ok(Some(_))) {
+            let _ = store.remove_legacy();
+        }
+        result = match read_pin_attempts(store) {
+            Ok(0) => return Ok(()),
+            Ok(_) => Err("PIN-attempt state did not clear"),
+            Err(e) => Err(e),
+        };
     }
-    if matches!(store.get_legacy(), Ok(Some(_))) {
-        store.remove_legacy().map_err(|_| "could not clear PIN-attempt state")?;
-    }
-    match read_pin_attempts(store)? {
-        0 => Ok(()),
-        _ => Err("PIN-attempt state did not clear"),
-    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -2782,6 +2804,119 @@ mod tests {
         let mut roomy = m.reboot();
         assert_eq!(charge_pin_guess(&mut roomy), GuessCharge::Charged(2));
         assert_eq!(charge_pin_guess(&mut roomy), GuessCharge::Charged(3));
+    }
+
+    /// A store whose failed raise also loses the old integer, the worst a
+    /// write that runs out of room could do.
+    struct LosesOldCount(Mem);
+    impl PinCountStore for LosesOldCount {
+        fn get_count(&self) -> Result<Option<u8>, StoreError> {
+            self.0.get_count()
+        }
+        fn set_count(&mut self, _: u8) -> Result<(), StoreError> {
+            self.0.ints.remove(PIN_COUNT_KEY);
+            Err(StoreError)
+        }
+        fn remove_count(&mut self) -> Result<(), StoreError> {
+            Err(StoreError)
+        }
+        fn get_legacy(&self) -> Result<Option<Vec<u8>>, StoreError> {
+            self.0.get_legacy()
+        }
+        fn remove_legacy(&mut self) -> Result<(), StoreError> {
+            Err(StoreError)
+        }
+    }
+
+    #[test]
+    fn a_write_that_loses_the_old_count_fails_closed_not_to_zero() {
+        let mut m = Mem::default();
+        m.set_count(3).unwrap();
+        let mut lossy = LosesOldCount(m.reboot());
+        assert!(matches!(charge_pin_guess(&mut lossy), GuessCharge::Damaged(_)));
+    }
+
+    /// A store whose first `fail` writes and removals report an error and
+    /// change nothing.
+    struct FailsFirst(Mem, Cell<usize>);
+    impl FailsFirst {
+        fn fails(&self) -> bool {
+            let left = self.1.get();
+            self.1.set(left.saturating_sub(1));
+            left > 0
+        }
+    }
+    impl PinCountStore for FailsFirst {
+        fn get_count(&self) -> Result<Option<u8>, StoreError> {
+            self.0.get_count()
+        }
+        fn set_count(&mut self, count: u8) -> Result<(), StoreError> {
+            if self.fails() {
+                return Err(StoreError);
+            }
+            self.0.set_count(count)
+        }
+        fn remove_count(&mut self) -> Result<(), StoreError> {
+            if self.fails() {
+                return Err(StoreError);
+            }
+            self.0.remove_count()
+        }
+        fn get_legacy(&self) -> Result<Option<Vec<u8>>, StoreError> {
+            self.0.get_legacy()
+        }
+        fn remove_legacy(&mut self) -> Result<(), StoreError> {
+            if self.fails() {
+                return Err(StoreError);
+            }
+            self.0.remove_legacy()
+        }
+    }
+
+    #[test]
+    fn a_clear_is_judged_by_read_back_and_tried_again() {
+        let mut m = legacy_board(PIN_A);
+        m.set_count(5).unwrap();
+        let m = m.reboot();
+
+        // The first pass's write and removal both fail: the second clears it.
+        let mut flaky = FailsFirst(m.reboot(), Cell::new(2));
+        assert_eq!(clear_pin_attempts(&mut flaky), Ok(()));
+        assert_eq!(read_pin_attempts(&flaky.0.reboot()), Ok(0));
+
+        // Both passes fail: the caller hears so, and the count still reads 5.
+        let mut stuck = FailsFirst(m.reboot(), Cell::new(4));
+        assert!(clear_pin_attempts(&mut stuck).is_err());
+        assert_eq!(read_pin_attempts(&stuck.0.reboot()), Ok(5));
+
+        // No free entry for a zero: removing the integer clears it instead.
+        let mut full = m.limited(m.used());
+        assert_eq!(clear_pin_attempts(&mut full), Ok(()));
+        assert_eq!(read_pin_attempts(&full.reboot()), Ok(0));
+
+        // Every cut through a clear at the wipe limit leaves 5 or 0.
+        sweep(&m, &|m| clear_pin_attempts(m).map_err(|_| ChangeError::Storage), &|m, cut, apply| {
+            let n = read_pin_attempts(m).unwrap();
+            assert!(n == 0 || n == 5, "cut {cut} apply {apply}: {n}");
+        });
+    }
+
+    #[test]
+    fn a_zero_padded_vault_key_would_open_a_pin_board() {
+        let m = legacy_board(PIN_A);
+        let mut padded = [0u8; 32];
+        padded[..PIN_A.len()].copy_from_slice(PIN_A);
+        // The alias is real: the padded key opens the PIN's wrap...
+        assert_eq!(boot_with(&m, &padded), Some(seeds()));
+        // ...so it is what the unlock paths refuse.
+        assert!(secret_aliases_a_pin(&padded));
+        let mut eight = [0u8; 32];
+        eight[..8].copy_from_slice(b"12345678");
+        assert!(secret_aliases_a_pin(&eight));
+        assert!(!secret_aliases_a_pin(PIN_A), "a PIN itself is not refused");
+        let mut random = [0u8; 32];
+        random[31] = 1;
+        assert!(!secret_aliases_a_pin(&random));
     }
 
     #[test]

@@ -328,6 +328,15 @@ pub fn handle_generate(
         return None;
     }
 
+    // The RNG self-test ran at boot, so its verdict is already known. Refuse
+    // now, not after the owner has played the whole game for nothing (a
+    // fresh install's full erase always lands here once). stacked_entropy
+    // below checks again after the game.
+    if !crate::entropy::rng_ok() {
+        refuse_generate_rng(usb, display);
+        return None;
+    }
+
     // Offer the entropy game: the owner's button timing becomes a second,
     // independent entropy source, stacked with the hardware RNG draw so
     // neither alone can bias the key. Optional — hold skips to hardware-only.
@@ -349,19 +358,7 @@ pub fn handle_generate(
         if let Some(mut d) = game_digest {
             d.iter_mut().for_each(|b| *b = 0);
         }
-        // Two very different situations share this exit. A post-wipe boot has
-        // simply not earned its continuity proof yet and needs one power-cycle;
-        // saying "self-test failed" there sends an owner hunting a dead board.
-        let state = crate::entropy::rng_state();
-        log::error!("on-device generate refused: {}", state.refusal());
-        oled::show_error(
-            display,
-            match state {
-                crate::entropy::RngState::NeedsSecondBoot => "Power-cycle once\nthen generate",
-                _ => "RNG CHECK FAILED\nrefusing new keys",
-            },
-        );
-        protocol::write_frame(usb, FRAME_TYPE_NACK, state.refusal().as_bytes());
+        refuse_generate_rng(usb, display);
         return None;
     }
     if let Some(mut d) = game_digest {
@@ -419,6 +416,25 @@ pub fn handle_generate(
             None
         }
     }
+}
+
+/// Refuse a GENERATE_IDENTITY because the boot RNG self-test does not allow
+/// new keys: screen, log and a NACK carrying the reason.
+///
+/// Two very different situations share this exit. A post-wipe boot has simply
+/// not earned its continuity proof yet and needs one power-cycle; saying
+/// "self-test failed" there sends an owner hunting a dead board.
+fn refuse_generate_rng(usb: &mut SerialPort<'_>, display: &mut Display<'_>) {
+    let state = crate::entropy::rng_state();
+    log::error!("on-device generate refused: {}", state.refusal());
+    oled::show_error(
+        display,
+        match state {
+            crate::entropy::RngState::NeedsSecondBoot => "Power-cycle once\nthen generate",
+            _ => "RNG CHECK FAILED\nrefusing new keys",
+        },
+    );
+    protocol::write_frame(usb, FRAME_TYPE_NACK, state.refusal().as_bytes());
 }
 
 /// Walk the owner through the freshly-generated typed recovery sequence one large word
@@ -514,6 +530,10 @@ fn hold_to_confirm(
     let mut last_pct = 101u32; // force first bar draw
 
     loop {
+        // No timeout here (an unconfirmed phrase staying up is the safe
+        // failure), so the watchdog must be fed: an owner checking 31 written
+        // words on this screen for a minute would otherwise reset the board.
+        crate::wdt::feed();
         let low = buttons.a.is_low();
         if low && !pressed {
             pressed = true;
@@ -523,7 +543,10 @@ fn hold_to_confirm(
             let held = press_start.elapsed().as_millis() as u32;
             if held >= HOLD_MS {
                 oled::show_hold_progress(display, 100);
+                // Fed too: on a restore, store_master runs after this, so a
+                // watchdog reset during a long hold would lose the phrase.
                 while buttons.a.is_low() {
+                    crate::wdt::feed();
                     FreeRtos::delay_ms(POLL_MS);
                 }
                 // Press consumed here — drop the sampler's latched edge so it

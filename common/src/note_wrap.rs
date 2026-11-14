@@ -47,9 +47,10 @@ impl Drop for NoteRumor {
 }
 
 /// A note paid to a key (LUD-25 Part 2), as its wrap names it. There is no
-/// secret in it: the wrap says where the note is filed (`pubkey`), where on
-/// the recipient's address branch its key sits (`index`), and the mint's
-/// certificate. moneyer sends these for a name that has a `cx1`.
+/// secret in it: the wrap says where the note is filed (`pubkey`), which
+/// note of the recipient's share its key is (`index`; the share itself is
+/// not named), and the mint's certificate. moneyer sends these for a name
+/// that has a `cx1`.
 #[cfg_attr(not(feature = "cash"), allow(dead_code))]
 struct KeyNoteRef {
     pubkey: [u8; 32],
@@ -85,7 +86,8 @@ impl Drop for IncomingNote {
 
 /// Read a note out of an opened rumor, deriving the key for one paid to a
 /// key. `identity_secret` is the key the wrap was opened with: the npub the
-/// lightning address belongs to, whose address branch the note is on.
+/// lightning address belongs to, whose share (or legacy branch) the note is
+/// on.
 ///
 /// A key note naming a key this device does not hold is refused, before any
 /// card: it is either for another device or not a note at all, and either
@@ -116,18 +118,21 @@ fn open_key_note(key: KeyNoteRef, identity_secret: &[u8; 32]) -> Result<Incoming
     if !crate::cash_store::valid_host(host) {
         return Err("bad host");
     }
-    // A mint mints to a holder's keys only by Lightning Address, so a wrapped
-    // key note is on that purpose.
-    let (secret, pubkey) = crate::cash_key::claim_note_key(
+    // A wrap names the note's index but not its share, so every share this
+    // device hands out is tried, then the legacy branches a name registered
+    // before LUD-26 is still paid on, which a mint mints to only on the
+    // Lightning Address purpose.
+    let found = crate::cash_key::claim_note_key(
         identity_secret,
         host,
-        crate::cash_key::PURPOSE_LIGHTNING_ADDRESS,
         key.index,
         Some(&key.pubkey),
+        None,
+        crate::cash_key::PURPOSE_LIGHTNING_ADDRESS,
     )?;
     Ok(IncomingNote {
-        secret: *secret,
-        key: Some(KeyNote { index: key.index, pubkey }),
+        secret: *found.secret,
+        key: Some(KeyNote { index: key.index, pubkey: found.pubkey }),
         host: key.host,
         amount_msat: key.amount_msat,
         sig: key.sig,
@@ -511,10 +516,16 @@ mod tests {
 
         const PURPOSE_LA: u32 = crate::cash_key::PURPOSE_LIGHTNING_ADDRESS;
 
+        /// Note `index` of share 0, where a name registered with this
+        /// device's first share is paid.
         fn key_at(index: u32) -> ([u8; 32], [u8; 32]) {
-            let (secret, pubkey) =
-                crate::cash_key::claim_note_key(&IDENTITY, "moneyer.dev", PURPOSE_LA, index, None).unwrap();
-            (*secret, pubkey)
+            key_on(0, index)
+        }
+
+        fn key_on(share: u32, index: u32) -> ([u8; 32], [u8; 32]) {
+            let found =
+                crate::cash_key::claim_note_key(&IDENTITY, "moneyer.dev", index, None, Some(share), PURPOSE_LA).unwrap();
+            (*found.secret, found.pubkey)
         }
 
         // What moneyer (0.17, LUD-25 `50d740a`) puts in the wrap for a name
@@ -556,6 +567,30 @@ mod tests {
         }
 
         #[test]
+        fn a_note_paid_to_any_share_opens_without_naming_it() {
+            // a wrap carries the index and not the share
+            for share in [1, crate::cash_key::SHARE_LIMIT - 1] {
+                let (secret, pubkey) = key_on(share, 4);
+                let note = open_note_rumor(&moneyer_wrap(&pubkey, 4), &IDENTITY).unwrap();
+                assert_eq!(note.secret, secret);
+                assert_eq!(note.key, Some(KeyNote { index: 4, pubkey }));
+            }
+        }
+
+        #[test]
+        fn a_note_paid_to_the_legacy_branch_still_opens() {
+            // A live name registered with the whole branch
+            // before LUD-26, which the mint keeps crediting on purpose 2.
+            let node = crate::cash_key::legacy_branch(&IDENTITY, "moneyer.dev", crate::cash_key::BranchKind::Legacy)
+                .unwrap();
+            let secret = crate::cash_key::note_secret_key(&node, PURPOSE_LA, 3).unwrap();
+            let pubkey = crate::cash_key::note_pubkey(&secret).unwrap();
+            let note = open_note_rumor(&moneyer_wrap(&pubkey, 3), &IDENTITY).unwrap();
+            assert_eq!(note.secret, *secret);
+            assert_eq!(note.key, Some(KeyNote { index: 3, pubkey }));
+        }
+
+        #[test]
         fn a_note_paid_to_a_cx1_from_before_purposes_opens() {
             // The case that stranded a zap on 2026-10-04: a name registered
             // with a cx1 on the superseded m/139'/1' branch, paid by a mint
@@ -573,7 +608,7 @@ mod tests {
             .unwrap();
             let secret = crate::cash_key::note_secret_key(&old, PURPOSE_LA, 0).unwrap();
             let pubkey = crate::cash_key::note_pubkey(&secret).unwrap();
-            assert_ne!(pubkey, key_at(0).1, "the current branch must not already hold it");
+            assert_ne!(pubkey, key_at(0).1, "a share must not already hold it");
             let note = open_note_rumor(&moneyer_wrap(&pubkey, 0), &IDENTITY).unwrap();
             assert_eq!(note.secret, *secret);
             assert_eq!(note.key, Some(KeyNote { index: 0, pubkey }));

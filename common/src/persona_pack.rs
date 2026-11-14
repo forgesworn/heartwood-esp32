@@ -93,7 +93,7 @@ pub fn encode_chunk(entries: &[PackedPersona]) -> Result<Vec<u8>, &'static str> 
         out.push(name.len() as u8);
         out.extend_from_slice(name);
     }
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = crate::crc32::Hasher::new();
     hasher.update(&out);
     out.extend_from_slice(&hasher.finalize().to_le_bytes());
     Ok(out)
@@ -106,7 +106,7 @@ pub fn decode_chunk(bytes: &[u8]) -> Option<Vec<PackedPersona>> {
         return None;
     }
     let (body, crc) = bytes.split_at(bytes.len() - 4);
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = crate::crc32::Hasher::new();
     hasher.update(body);
     if crc != hasher.finalize().to_le_bytes() {
         return None;
@@ -235,7 +235,7 @@ impl MigrationJournal {
             0,
             0,
         ];
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc32::Hasher::new();
         hasher.update(&encoded[..8]);
         encoded[8..12].copy_from_slice(&hasher.finalize().to_le_bytes());
         encoded
@@ -248,7 +248,7 @@ impl MigrationJournal {
         {
             return None;
         }
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc32::Hasher::new();
         hasher.update(&bytes[..8]);
         if bytes[8..12] != hasher.finalize().to_le_bytes() {
             return None;
@@ -340,7 +340,7 @@ impl PersonaRemovalJournal {
             0,
             0,
         ];
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc32::Hasher::new();
         hasher.update(&encoded[..9]);
         encoded[9..13].copy_from_slice(&hasher.finalize().to_le_bytes());
         encoded
@@ -353,7 +353,7 @@ impl PersonaRemovalJournal {
         {
             return None;
         }
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc32::Hasher::new();
         hasher.update(&bytes[..9]);
         if bytes[9..13] != hasher.finalize().to_le_bytes() {
             return None;

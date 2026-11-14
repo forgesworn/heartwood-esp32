@@ -1415,6 +1415,24 @@ fn a_revocation_that_fails_with_the_old_table_intact_holds_until_restart() {
 }
 
 #[test]
+fn each_revocation_outcome_is_described_word_for_word() {
+    // The replies are wire text: pin every one of them exactly.
+    let what = "pairing revocation";
+    assert_eq!(RevocationSave::Saved.describe(what), Ok(()));
+    let cases = [
+        (RevocationSave::OnlyUntilRestart, "storage_unavailable: pairing revocation holds until the next restart only; it could not be saved; repeat the request to try the save again"),
+        (RevocationSave::RestartFirst, "storage_unavailable: pairing revocation holds until the next restart only; it could not be saved, and this identity's pairing table cannot be read or written again before a restart; restart the device, then repeat the request if the pairing is still listed"),
+        (RevocationSave::NoRoom, "storage_full: pairing revocation holds until the next restart only; there was no room to save it; free some room (remove an unused pairing, persona or avatar), then repeat the request"),
+        (RevocationSave::TableLost, "storage_full: pairing revocation is saved, but this identity's other pairings could not be rewritten and are lost at the next restart unless a later change saves them"),
+        (RevocationSave::TableGone, "storage_full: pairing revocation is saved, but every pairing of this identity is gone after a restart; restart the device before making any other change, then re-pair or restore a backup"),
+        (RevocationSave::Uncertain, "storage_failed: pairing revocation holds until the next restart; the pairing table could not be written and after a restart it is either as it was or gone; restart the device before making any other change, then check and revoke again"),
+    ];
+    for (outcome, reply) in cases {
+        assert_eq!(outcome.describe(what).unwrap_err(), reply, "{outcome:?}");
+    }
+}
+
+#[test]
 fn a_cut_inside_an_erase_first_rewrite_leaves_no_pairings_not_a_legacy_one() {
     // Why the legacy credential is removed first: an absent table with it
     // still present brings back a default pairing on the next boot.

@@ -6156,7 +6156,7 @@ fn full_access_queue_busy(ctx: &SignCtx) -> bool {
 fn refuse_waiting_full_access(ctx: &mut SignCtx) {
     for card in ctx.button_cards.iter_mut().filter(|card| is_full_access_card(card)) {
         let refusal = heartwood_common::owner_pairing::BundleError::AnotherFullAccess;
-        card.refused = Some((refusal.code(), refusal.message()));
+        card.refused = Some(CardRefusal::FullAccess(refusal));
     }
 }
 
@@ -6297,8 +6297,30 @@ struct ButtonCard {
     refused: Option<CardRefusal>,
 }
 
-/// A refusal that closes a waiting card: its error code and message.
-type CardRefusal = (i32, &'static str);
+/// A refusal that closes a waiting card.
+#[derive(Debug, Clone, Copy)]
+enum CardRefusal {
+    /// A FULL ACCESS card a second bundle closed.
+    FullAccess(heartwood_common::owner_pairing::BundleError),
+    /// A LINK card a second ask or the slot tables closed.
+    Link(heartwood_common::site_link::LinkRefusal),
+}
+
+impl CardRefusal {
+    fn code(self) -> i32 {
+        match self {
+            Self::FullAccess(e) => e.code(),
+            Self::Link(why) => why.error().code(),
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::FullAccess(e) => e.message(),
+            Self::Link(why) => why.error().message(),
+        }
+    }
+}
 
 /// Whether this card has been on screen for its whole window.
 fn card_overdue(card: &ButtonCard) -> bool {
@@ -6991,7 +7013,7 @@ fn take_closed_card(
     index: usize,
     outcome: &CardTick,
 ) -> Option<(ButtonCard, Option<heartwood_common::site_link::LinkClose>)> {
-    use heartwood_common::site_link::LinkClose;
+    use heartwood_common::site_link::{LinkClose, LinkRefusal};
     if index >= ctx.button_cards.len() {
         return None;
     }
@@ -6999,7 +7021,9 @@ fn take_closed_card(
     let link = site_link::is_link_card(&card).then(|| match outcome {
         CardTick::Approved => LinkClose::Held,
         CardTick::Denied => LinkClose::Declined,
-        CardTick::Refused((_, message)) => LinkClose::refused(message),
+        CardTick::Refused(CardRefusal::Link(why)) => LinkClose::Refused(*why),
+        // Never set on a LINK card; were it, it would cool like a second ask.
+        CardTick::Refused(CardRefusal::FullAccess(_)) => LinkClose::Refused(LinkRefusal::AnotherLink),
         CardTick::Expired | CardTick::Pending => LinkClose::TimedOut,
     });
     if let Some(close) = link {
@@ -7177,8 +7201,8 @@ fn resolve_button_card(
             }
             CardTick::Denied => nip46::build_error_response(&request_id, -1, "user denied")
                 .unwrap_or_default(),
-            CardTick::Refused((code, message)) => {
-                nip46::build_error_response(&request_id, *code, message).unwrap_or_default()
+            CardTick::Refused(refusal) => {
+                nip46::build_error_response(&request_id, refusal.code(), refusal.message()).unwrap_or_default()
             }
             _ => nip46::build_error_response(&request_id, -1, "timeout").unwrap_or_default(),
         };
@@ -8162,7 +8186,7 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
     // refusal before anything else, so the owner can never approve it.
     if let Some(index) = ctx.button_cards.iter().position(|card| card.refused.is_some()) {
         if let Some(refusal) = ctx.button_cards[index].refused {
-            log::warn!("[relay] card closed: {}", refusal.1);
+            log::warn!("[relay] card closed: {}", refusal.message());
             resolve_button_card(ctx, sessions, index, &CardTick::Refused(refusal));
             return;
         }

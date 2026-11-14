@@ -1015,9 +1015,9 @@ const FULL_ACCESS_BLOCKED: (&str, &str) = ("Pairing blocked", "2nd request");
 /// (`show_card_blocked` in relay.rs, site links design 4.4): the same
 /// refusal in its own words, `common::site_link::LinkClose::blocked`'s.
 fn link_blocked() -> [(&'static str, (&'static str, &'static str)); 2] {
-    use heartwood_common::site_link::{LinkClose, LinkError};
-    let words = |e| LinkClose::Refused(e).blocked().expect("a refused LINK card draws a refusal");
-    [("link-blocked", words(LinkError::AnotherLink)), ("link-stale", words(LinkError::ApprovalChanged))]
+    use heartwood_common::site_link::{LinkClose, LinkRefusal};
+    let words = |why| LinkClose::Refused(why).blocked().expect("a refused LINK card draws a refusal");
+    [("link-blocked", words(LinkRefusal::AnotherLink)), ("link-stale", words(LinkRefusal::SlotsChanged))]
 }
 
 fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565>)) {
@@ -2271,6 +2271,17 @@ mod link_card_tests {
         let stale = service.find("site_link::refuse_stale(ctx);").expect("stale LINK cards are refused");
         assert!(stale < service.find("card.refused.is_some()").expect("the refusal scan"));
         assert!(relay.contains("&is_copy,\n                        true,\n"), "the WiFi loop NACKs a cable site link");
+        // The USB-bridged loop dispatches a cable site link (its RelayOnly
+        // answer is the only one), and never passes `true`.
+        let main = src("main.rs");
+        assert_eq!(main.matches("transport::handle_encrypted_request(").count(), 1);
+        let call = &main[main.find("transport::handle_encrypted_request(").unwrap()..];
+        let call = &call[..call.find(");").expect("the call's end")];
+        assert!(
+            call.trim_end().ends_with("&nip46_handler::is_closed_bundle_copy,\n                        false,"),
+            "the USB-bridged loop must pass relay_loop false"
+        );
+        assert!(!call.contains("true"), "the USB-bridged loop passes no true");
 
         let transport = body_of(&src("transport.rs"), "handle_encrypted_request");
         let nack = transport.find("site_link::cable_nacks(&request.method, relay_loop)").expect("the cable NACK");

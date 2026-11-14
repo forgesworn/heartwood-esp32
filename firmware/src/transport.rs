@@ -241,11 +241,13 @@ pub fn handle_encrypted_request(
     // bridging the request the board also hears on the relay, where its
     // card is raised. Answered here, its `RelayOnly` refusal would be
     // published and could reach the phone before the relay card is held; a
-    // NACK is logged and publishes nothing. The USB-bridged loop dispatches
-    // it, and answers `RelayOnly`.
+    // NACK publishes nothing. It is empty and unlogged, as a request that
+    // fails to decrypt or parse is NACKed, so neither heartwoodd's log (it
+    // reads an empty NACK as `request denied`) nor the device's says which
+    // client used a site-link method. The USB-bridged loop dispatches it,
+    // and answers `RelayOnly`.
     if heartwood_common::site_link::cable_nacks(&request.method, relay_loop) {
-        log::info!("{} over the cable is answered on the relay; NACK", request.method);
-        protocol::write_frame(usb, FRAME_TYPE_NACK, b"site links are answered on the relay");
+        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);
         return;
     }
 

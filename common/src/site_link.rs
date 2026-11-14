@@ -109,7 +109,8 @@ pub enum LinkError {
     FamilySlot,
     /// Rule 5: the owner's or a child's real identity.
     RealIdentity,
-    /// A slot-table change between the card and the hold.
+    /// An authority change (a new key, a revoke, a policy change) on any
+    /// master's slots between the card and the hold.
     ApprovalChanged,
     /// A label lookup with no live link from this client (the 60 s are up,
     /// or it was never made here).
@@ -442,8 +443,8 @@ pub fn before_card<'a>(
 pub enum Check {
     /// Before the card: [`before_card`].
     Card,
-    /// At the hold (design 4.4): a slot-table write on any master since the
-    /// card (`epoch_current` false) answers `approval_changed` before
+    /// At the hold (design 4.4): an authority change on any master's slots
+    /// since the card (`epoch_current` false) answers `approval_changed` before
     /// anything else; otherwise [`gate`] again, with no cooldown, against
     /// the tables as they are now.
     Hold { epoch_current: bool },
@@ -474,12 +475,64 @@ pub struct HeldLink<'a> {
     pub client_hex: &'a str,
     pub id: &'a str,
     pub params: &'a [Value],
+    /// The approval epoch it was raised under.
+    pub epoch: Option<u32>,
+}
+
+/// Why a waiting LINK card closed unanswered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRefusal {
+    /// A second link ask arrived while it waited: both are refused.
+    AnotherLink,
+    /// An authority change (a new key, a revoke, a policy change) on any
+    /// master moved the approval epoch while it waited.
+    SlotsChanged,
+}
+
+impl LinkRefusal {
+    /// What every ask on the card is answered.
+    pub fn error(self) -> LinkError {
+        match self {
+            Self::AnotherLink => LinkError::AnotherLink,
+            Self::SlotsChanged => LinkError::ApprovalChanged,
+        }
+    }
+}
+
+/// A card on the queue, as the one-card rule sees it (design 4.4).
+pub trait WaitingCard {
+    /// Its `i`th request, if it is a LINK card.
+    fn held(&self, i: usize) -> Option<HeldLink<'_>>;
+    /// The refusal that has closed it, if it is a LINK card one has closed.
+    fn link_refusal(&self) -> Option<LinkRefusal>;
+    /// Close it unanswered; called on LINK cards only.
+    fn refuse_link(&mut self, why: LinkRefusal);
+}
+
+fn is_link<C: WaitingCard>(card: &C) -> bool {
+    card.held(0).is_some()
+}
+
+fn requests<C: WaitingCard>(card: &C) -> impl Iterator<Item = HeldLink<'_>> {
+    (0..).map_while(|i| card.held(i))
+}
+
+/// Close every open LINK card whose request the slot tables overtook
+/// (`current` is false for its epoch) refused [`LinkRefusal::SlotsChanged`],
+/// queued or on screen, so the owner is never asked to hold a card that can
+/// only be refused. A card a second ask already closed keeps that refusal.
+pub fn refuse_stale<C: WaitingCard>(cards: &mut [C], current: impl Fn(Option<u32>) -> bool) {
+    for card in cards.iter_mut() {
+        if is_link(card) && card.link_refusal().is_none() && requests(card).any(|h| !current(h.epoch)) {
+            card.refuse_link(LinkRefusal::SlotsChanged);
+        }
+    }
 }
 
 /// A create set against the LINK cards already waiting (design 4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waiting {
-    /// No LINK card waits.
+    /// No LINK card waits that a second ask would close.
     Nothing,
     /// A copy of a waiting card's own request (the same client, id and
     /// params, heard again): no reply, and the card stays.
@@ -488,24 +541,46 @@ pub enum Waiting {
     Another,
 }
 
-pub fn against_waiting<'h>(
-    held: impl IntoIterator<Item = HeldLink<'h>>,
+/// [`refuse_stale`] first, then the create against what waits: a copy of
+/// any LINK card's own request, even a dead one's, is [`Waiting::Copy`] (one
+/// request id, one answer); a card the slot tables closed does not count as
+/// [`Waiting::Another`], so it is answered `approval_changed` and not taken
+/// down as a second ask's.
+pub fn against_waiting<C: WaitingCard>(
+    cards: &mut [C],
+    current: impl Fn(Option<u32>) -> bool,
     client_hex: &str,
     id: &str,
     params: &[Value],
 ) -> Waiting {
+    refuse_stale(cards, current);
     let mut another = false;
-    for h in held {
-        if h.client_hex == client_hex && h.id == id && h.params == params {
-            return Waiting::Copy;
+    for card in cards.iter() {
+        for h in requests(card) {
+            if h.client_hex == client_hex && h.id == id && h.params == params {
+                return Waiting::Copy;
+            }
+            another |= card.link_refusal() != Some(LinkRefusal::SlotsChanged);
         }
-        another = true;
     }
     if another {
         Waiting::Another
     } else {
         Waiting::Nothing
     }
+}
+
+/// [`CardStep::RefuseBoth`]: every open LINK card closes refused
+/// [`LinkRefusal::AnotherLink`] (a card the slot tables closed keeps its
+/// refusal; each phone cools as its card closes, [`LinkLedger::card_closed`]),
+/// and the asker cools now. Returns the asker's refusal.
+pub fn refuse_both<C: WaitingCard>(cards: &mut [C], ledger: &mut LinkLedger, client_hex: &str, now_ms: u64) -> LinkError {
+    for card in cards.iter_mut() {
+        if is_link(card) && card.link_refusal().is_none() {
+            card.refuse_link(LinkRefusal::AnotherLink);
+        }
+    }
+    ledger.another_link(client_hex, now_ms)
 }
 
 /// What a parsed create does before any card.
@@ -552,35 +627,22 @@ pub enum LinkClose {
     /// Its window ran out on screen, or it waited out the queue's TTL
     /// behind other cards.
     TimedOut,
-    /// Closed unanswered: [`LinkError::AnotherLink`] (a second ask), or
-    /// [`LinkError::ApprovalChanged`] (a slot-table write while it waited).
-    Refused(LinkError),
+    /// Closed unanswered.
+    Refused(LinkRefusal),
 }
 
 /// The title of a refused LINK card's NOT DONE screen.
 pub const LINK_BLOCKED: &str = "Link blocked";
 
 impl LinkClose {
-    /// The refusal a refused card carries, by its message.
-    pub fn refused(message: &str) -> Self {
-        Self::Refused(if message == APPROVAL_CHANGED { LinkError::ApprovalChanged } else { LinkError::AnotherLink })
-    }
-
-    /// Whether the close starts the phone's cooldown: anything but the hold,
-    /// except a card the slot tables overtook, whose phone is told to send
-    /// the request again.
-    pub fn cools(self) -> bool {
-        !matches!(self, Self::Held | Self::Refused(LinkError::ApprovalChanged))
-    }
-
     /// The NOT DONE screen a refused card draws, whether it was on screen or
     /// still queued: (title, reason). Any other close draws what every
     /// card's does.
     pub fn blocked(self) -> Option<(&'static str, &'static str)> {
         match self {
-            Self::Refused(LinkError::ApprovalChanged) => Some((LINK_BLOCKED, "Slots changed")),
-            Self::Refused(_) => Some((LINK_BLOCKED, "2nd request")),
-            _ => None,
+            Self::Refused(LinkRefusal::SlotsChanged) => Some((LINK_BLOCKED, "Slots changed")),
+            Self::Refused(LinkRefusal::AnotherLink) => Some((LINK_BLOCKED, "2nd request")),
+            Self::Held | Self::Declined | Self::TimedOut => None,
         }
     }
 }
@@ -968,11 +1030,14 @@ pub struct LinkEntry {
 pub struct LinkLedger {
     entries: Vec<LinkEntry>,
     cooldowns: Vec<(String, u64)>,
+    /// Per client, until when its one uncooled
+    /// [`LinkRefusal::SlotsChanged`] close is spent.
+    stale_passes: Vec<(String, u64)>,
 }
 
 impl LinkLedger {
     pub const fn new() -> Self {
-        Self { entries: Vec::new(), cooldowns: Vec::new() }
+        Self { entries: Vec::new(), cooldowns: Vec::new(), stale_passes: Vec::new() }
     }
 
     /// Record a link made by a hold that completed at `now_ms`.
@@ -1050,12 +1115,29 @@ impl LinkLedger {
         LinkError::AnotherLink
     }
 
-    /// A LINK card closed: anything but a hold cools its client
-    /// ([`LinkClose::cools`]).
+    /// A LINK card closed (design 4.4): anything but a hold cools its
+    /// client, except the first card in a minute the slot tables closed,
+    /// whose phone is told to send the request again. A second inside the
+    /// minute cools it: otherwise a phone that moves the epoch itself (by
+    /// binding fresh keys to a non-signing link) could re-ask at relay speed.
     pub fn card_closed(&mut self, client: &str, close: LinkClose, now_ms: u64) {
-        if close.cools() {
-            self.start_cooldown(client, now_ms);
+        match close {
+            LinkClose::Held => {}
+            LinkClose::Refused(LinkRefusal::SlotsChanged) if self.stale_pass(client, now_ms) => {}
+            _ => self.start_cooldown(client, now_ms),
         }
+    }
+
+    /// Spend this client's uncooled stale close for the minute, if it has
+    /// one. With the list full of live passes it has none: forgetting one
+    /// must never hand a phone a second pass.
+    fn stale_pass(&mut self, client: &str, now_ms: u64) -> bool {
+        self.stale_passes.retain(|(_, until)| now_ms < *until);
+        if self.stale_passes.len() >= MAX_COOLDOWNS || self.stale_passes.iter().any(|(c, _)| c == client) {
+            return false;
+        }
+        self.stale_passes.push((client.to_string(), now_ms.saturating_add(COOLDOWN_MS)));
+        true
     }
 
     pub fn cooling(&self, client: &str, now_ms: u64) -> bool {
@@ -1625,7 +1707,7 @@ mod tests {
         // The asker cools at once; the waiting card's phone as its card
         // closes refused. Neither can raise a card for the minute.
         assert_eq!(ledger.another_link(SITE, 1_000), LinkError::AnotherLink);
-        ledger.card_closed(PHONE, LinkClose::Refused(LinkError::AnotherLink), 1_000);
+        ledger.card_closed(PHONE, LinkClose::Refused(LinkRefusal::AnotherLink), 1_000);
         assert!(ledger.cooling(SITE, 60_999) && ledger.cooling(PHONE, 60_999));
         // The same phone asking twice: one entry.
         ledger.another_link(PHONE, 2_000);
@@ -1648,19 +1730,60 @@ mod tests {
         }
     }
 
+    /// A card on the queue: a LINK card's requests and refusal, or another
+    /// card (`link` false), which the link rules never touch.
+    struct Card {
+        link: bool,
+        client: &'static str,
+        asks: Vec<(&'static str, Vec<Value>, Option<u32>)>,
+        refused: Option<LinkRefusal>,
+    }
+
+    impl WaitingCard for Card {
+        fn held(&self, i: usize) -> Option<HeldLink<'_>> {
+            let (id, params, epoch) = self.asks.get(i).filter(|_| self.link)?;
+            Some(HeldLink { client_hex: self.client, id, params, epoch: *epoch })
+        }
+        fn link_refusal(&self) -> Option<LinkRefusal> {
+            self.refused
+        }
+        fn refuse_link(&mut self, why: LinkRefusal) {
+            assert!(self.link, "a card that is not a LINK card was closed");
+            self.refused = Some(why);
+        }
+    }
+
+    fn link(client: &'static str, id: &'static str, params: &[Value], epoch: u32) -> Card {
+        Card { link: true, client, asks: vec![(id, params.to_vec(), Some(epoch))], refused: None }
+    }
+
+    fn other_card(epoch: u32) -> Card {
+        Card { link: false, ..link(SITE, "1", &[], epoch) }
+    }
+
+    /// The epoch is 7 now.
+    fn current(epoch: Option<u32>) -> bool {
+        epoch == Some(7)
+    }
+
     #[test]
     fn a_copy_of_the_waiting_request_is_ignored_and_any_other_ask_refuses_both() {
         let params = vec![serde_json::json!({"identity": "33"})];
         let other = vec![serde_json::json!({"identity": "44"})];
-        let held = |client_hex, id| HeldLink { client_hex, id, params: &params };
-        assert_eq!(against_waiting([], PHONE, "1", &params), Waiting::Nothing);
-        assert_eq!(against_waiting([held(PHONE, "1")], PHONE, "1", &params), Waiting::Copy);
+        let at = |mut cards: Vec<Card>, client, id, p: &[Value]| against_waiting(&mut cards, current, client, id, p);
+        assert_eq!(at(vec![], PHONE, "1", &params), Waiting::Nothing);
+        assert_eq!(at(vec![other_card(7)], PHONE, "1", &params), Waiting::Nothing);
+        assert_eq!(at(vec![link(PHONE, "1", &params, 7)], PHONE, "1", &params), Waiting::Copy);
         // The same id with other params, another id, or another phone.
-        assert_eq!(against_waiting([held(PHONE, "1")], PHONE, "1", &other), Waiting::Another);
-        assert_eq!(against_waiting([held(PHONE, "1")], PHONE, "2", &params), Waiting::Another);
-        assert_eq!(against_waiting([held(SITE, "1")], PHONE, "1", &params), Waiting::Another);
+        assert_eq!(at(vec![link(PHONE, "1", &params, 7)], PHONE, "1", &other), Waiting::Another);
+        assert_eq!(at(vec![link(PHONE, "1", &params, 7)], PHONE, "2", &params), Waiting::Another);
+        assert_eq!(at(vec![link(SITE, "1", &params, 7)], PHONE, "1", &params), Waiting::Another);
         // A copy of any waiting card's request, wherever it stands.
-        assert_eq!(against_waiting([held(SITE, "9"), held(PHONE, "1")], PHONE, "1", &params), Waiting::Copy);
+        let two = vec![link(SITE, "9", &params, 7), link(PHONE, "1", &params, 7)];
+        assert_eq!(at(two, PHONE, "1", &params), Waiting::Copy);
+        // A card a second ask closed, not yet answered, still counts.
+        let closed = Card { refused: Some(LinkRefusal::AnotherLink), ..link(SITE, "9", &params, 7) };
+        assert_eq!(at(vec![closed], PHONE, "1", &params), Waiting::Another);
 
         let asking = owner(Style::Everyday);
         let req = request(PERSONA, vec![]);
@@ -1682,16 +1805,71 @@ mod tests {
     }
 
     #[test]
+    fn a_card_the_tables_overtook_is_refused_slots_changed_and_is_not_a_second_ask() {
+        let params = vec![serde_json::json!({"identity": "33"})];
+        let mut cards = vec![
+            link(SITE, "9", &params, 6),
+            other_card(6),
+            Card { refused: Some(LinkRefusal::AnotherLink), ..link(SITE, "8", &params, 6) },
+            link(SITE, "5", &params, 7),
+        ];
+        refuse_stale(&mut cards, current);
+        assert_eq!(cards[0].refused, Some(LinkRefusal::SlotsChanged));
+        assert_eq!(cards[1].refused, None, "only LINK cards");
+        assert_eq!(cards[2].refused, Some(LinkRefusal::AnotherLink), "the first refusal stands");
+        assert_eq!(cards[3].refused, None, "a current card stays");
+        // Any stale request on the card closes it.
+        let mut two = Card { asks: vec![("1", params.clone(), Some(7)), ("2", params.clone(), None)], ..link(SITE, "1", &params, 7) };
+        refuse_stale(core::slice::from_mut(&mut two), current);
+        assert_eq!(two.refused, Some(LinkRefusal::SlotsChanged));
+
+        // A create set against a dead card alone sees nothing to refuse,
+        // and the dead card is marked as it is set against it, so it is
+        // answered `approval_changed` and not "2nd request".
+        let mut dead = vec![link(SITE, "9", &params, 6), other_card(7)];
+        assert_eq!(against_waiting(&mut dead, current, PHONE, "1", &params), Waiting::Nothing);
+        assert_eq!(dead[0].refused, Some(LinkRefusal::SlotsChanged));
+        // A copy of a dead card's own request is still a copy: one request
+        // id, one answer.
+        let mut dead = vec![link(PHONE, "1", &params, 6)];
+        assert_eq!(against_waiting(&mut dead, current, PHONE, "1", &params), Waiting::Copy);
+        // Beside a live card, the live one is the second ask's.
+        let mut both = vec![link(SITE, "9", &params, 6), link(SITE, "5", &params, 7)];
+        assert_eq!(against_waiting(&mut both, current, PHONE, "1", &params), Waiting::Another);
+    }
+
+    #[test]
+    fn row_7_a_second_ask_closes_every_open_link_card_and_cools_the_asker() {
+        let params = vec![serde_json::json!({"identity": "33"})];
+        let mut cards = vec![
+            Card { refused: Some(LinkRefusal::SlotsChanged), ..link(SITE, "9", &params, 6) },
+            other_card(7),
+            link(SITE, "5", &params, 7),
+            Card { refused: Some(LinkRefusal::AnotherLink), ..link(SITE, "4", &params, 7) },
+        ];
+        let mut ledger = LinkLedger::new();
+        assert_eq!(refuse_both(&mut cards, &mut ledger, PHONE, 1_000), LinkError::AnotherLink);
+        assert_eq!(cards[0].refused, Some(LinkRefusal::SlotsChanged), "a dead card keeps its refusal");
+        assert_eq!(cards[1].refused, None, "only LINK cards");
+        assert_eq!(cards[2].refused, Some(LinkRefusal::AnotherLink));
+        assert_eq!(cards[3].refused, Some(LinkRefusal::AnotherLink));
+        // The asker cools now; the waiting card's phone as its card closes.
+        assert!(ledger.cooling(PHONE, 60_999) && !ledger.cooling(PHONE, 61_000));
+        assert!(!ledger.cooling(SITE, 1_000));
+        ledger.card_closed(SITE, LinkClose::Refused(LinkRefusal::AnotherLink), 1_500);
+        assert!(ledger.cooling(SITE, 61_499));
+    }
+
+    #[test]
     fn a_link_card_cools_its_phone_and_draws_by_how_it_closed() {
         use LinkClose::*;
         for (close, cools, blocked) in [
             (Held, false, None),
             (Declined, true, None),
             (TimedOut, true, None),
-            (Refused(LinkError::AnotherLink), true, Some((LINK_BLOCKED, "2nd request"))),
-            (Refused(LinkError::ApprovalChanged), false, Some((LINK_BLOCKED, "Slots changed"))),
+            (Refused(LinkRefusal::AnotherLink), true, Some((LINK_BLOCKED, "2nd request"))),
+            (Refused(LinkRefusal::SlotsChanged), false, Some((LINK_BLOCKED, "Slots changed"))),
         ] {
-            assert_eq!(close.cools(), cools, "{close:?}");
             assert_eq!(close.blocked(), blocked, "{close:?}");
             if let Some((title, why)) = blocked {
                 assert!(title.len() <= SCOPE_CHARS && why.len() <= SCOPE_CHARS);
@@ -1701,9 +1879,52 @@ mod tests {
             assert_eq!(ledger.cooling(PHONE, 60_999), cools, "{close:?}");
             assert!(!ledger.cooling(PHONE, 61_000));
         }
-        // A refused card's refusal, read back from its message.
-        assert_eq!(LinkClose::refused(LinkError::AnotherLink.message()), Refused(LinkError::AnotherLink));
-        assert_eq!(LinkClose::refused(APPROVAL_CHANGED), Refused(LinkError::ApprovalChanged));
+        assert_eq!(LinkRefusal::AnotherLink.error(), LinkError::AnotherLink);
+        assert_eq!(LinkRefusal::SlotsChanged.error().message(), APPROVAL_CHANGED);
+    }
+
+    #[test]
+    fn a_phone_gets_one_uncooled_slots_changed_close_a_minute() {
+        let stale = LinkClose::Refused(LinkRefusal::SlotsChanged);
+        let mut ledger = LinkLedger::new();
+        ledger.card_closed(PHONE, stale, 1_000);
+        assert!(!ledger.cooling(PHONE, 1_000), "the first is told to ask again");
+        // A second inside the minute cools it, and its next ask waits.
+        ledger.card_closed(PHONE, stale, 60_999);
+        assert!(ledger.cooling(PHONE, 120_998) && !ledger.cooling(PHONE, 120_999));
+        let asking = owner(Style::Everyday);
+        let req = request(PERSONA, vec![]);
+        let table = vec![asking.clone()];
+        let ask = |ledger: &LinkLedger, now| before_card(Some(&asking), PHONE, served(0, &table), &req, ledger, now, None);
+        assert_eq!(ask(&ledger, 61_000).unwrap_err(), LinkError::ShownRecently);
+        assert!(matches!(ask(&ledger, 121_000), Ok(Gate::Plan(_))));
+        // Once the minute is up the pass is back.
+        let mut ledger = LinkLedger::new();
+        ledger.card_closed(PHONE, stale, 1_000);
+        ledger.card_closed(PHONE, stale, 61_000);
+        assert!(!ledger.cooling(PHONE, 61_000));
+        // Another phone's spends nothing of this phone's.
+        let mut ledger = LinkLedger::new();
+        ledger.card_closed(SITE, stale, 1_000);
+        ledger.card_closed(PHONE, stale, 2_000);
+        assert!(!ledger.cooling(PHONE, 2_000) && !ledger.cooling(SITE, 2_000));
+        // With every pass live and the list full, a phone it cannot
+        // remember cools: no pass is handed back by forgetting one.
+        let mut ledger = LinkLedger::new();
+        let client = |i: u64| format!("{i:064x}");
+        for i in 0..MAX_COOLDOWNS as u64 {
+            ledger.card_closed(&client(i), stale, 1_000 + i);
+            assert!(!ledger.cooling(&client(i), 1_000 + i));
+        }
+        ledger.card_closed(PHONE, stale, 2_000);
+        assert!(ledger.cooling(PHONE, 2_000));
+        for i in 0..MAX_COOLDOWNS as u64 {
+            ledger.card_closed(&client(i), stale, 3_000);
+            assert!(ledger.cooling(&client(i), 3_000), "{i} kept its spent pass");
+        }
+        // Expired passes make room.
+        ledger.card_closed(SITE, stale, 70_000);
+        assert!(!ledger.cooling(SITE, 70_000));
     }
 
     #[test]

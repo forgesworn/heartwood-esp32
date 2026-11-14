@@ -38,8 +38,9 @@ pub(crate) fn take_on_bind(master_slot: u8, slot_index: u8, secret: &str) -> Opt
     links().take_on_bind(master_slot, slot_index, secret, crate::uptime_ms())
 }
 
-/// A LINK card closed: anything but the hold cools its phone (design 4.4,
-/// [`sl::LinkClose::cools`]).
+/// A LINK card closed: anything but the hold cools its phone, but for one
+/// card a minute the slot tables closed (design 4.4,
+/// [`sl::LinkLedger::card_closed`]).
 pub(super) fn card_closed(client_hex: &str, close: sl::LinkClose) {
     links().card_closed(client_hex, close, crate::uptime_ms());
 }
@@ -134,14 +135,9 @@ fn nvs_room(ctx: &SignCtx) -> Option<heartwood_common::nvs_room::NvsRoom> {
 /// rule (design 4.3 to 4.5), in `sl::card_step`'s order; nothing is written.
 fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &str) -> Result<Step, Refusal> {
     let create = sl::parse_create(&request.params).map_err(refusal)?;
-    let held = ctx.button_cards.iter().filter(|card| is_link_card(card)).flat_map(|card| {
-        card.asks.iter().map(|a| sl::HeldLink {
-            client_hex: &card.key.client_hex,
-            id: &a.ask.request.id,
-            params: &a.ask.request.params,
-        })
-    });
-    let waiting = sl::against_waiting(held, client_hex, &request.id, &request.params);
+    let engine = &*ctx.policy_engine;
+    let current = |epoch| engine.approval_is_current(epoch);
+    let waiting = sl::against_waiting(&mut ctx.button_cards, current, client_hex, &request.id, &request.params);
     let step = sl::card_step(waiting, || {
         gate(ctx, &create, slot, client_hex, sl::Check::Card).map(|(verdict, label, from)| (verdict, (label, from)))
     });
@@ -154,10 +150,8 @@ fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &
         // Both are refused: the waiting cards close on the next pass, their
         // phones cooling as they do, and the asker cools now.
         sl::CardStep::RefuseBoth => {
-            for card in ctx.button_cards.iter_mut().filter(|card| is_link_card(card)) {
-                card.refused = Some(refusal_pair(LinkError::AnotherLink));
-            }
-            return Err(refusal(links().another_link(client_hex, crate::uptime_ms())));
+            let refused = sl::refuse_both(&mut ctx.button_cards, &mut links(), client_hex, crate::uptime_ms());
+            return Err(refusal(refused));
         }
     };
     if !crate::entropy::rng_ok() {
@@ -176,17 +170,35 @@ fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &
     }))
 }
 
-/// A LINK card the slot tables overtook (any slot-table write on any master
-/// moves the approval epoch) is refused `approval_changed` as soon as the
-/// loop sees it, queued or on screen, not only at the hold, so the owner is
-/// never asked to hold a card that can only be refused. Its phone does not
-/// cool ([`sl::LinkClose::cools`]): it is told to send the request again.
+/// LINK cards the slot tables overtook (an authority change on any master's
+/// slots moves the approval epoch) are refused `approval_changed` as soon as
+/// the loop sees them, queued or on screen, not only at the hold
+/// ([`sl::refuse_stale`]).
 pub(super) fn refuse_stale(ctx: &mut SignCtx) {
     let engine = &*ctx.policy_engine;
-    for card in ctx.button_cards.iter_mut().filter(|card| card.refused.is_none() && is_link_card(card)) {
-        if card.asks.iter().any(|a| !engine.approval_is_current(a.ask.resume.authority_epoch)) {
-            card.refused = Some(refusal_pair(LinkError::ApprovalChanged));
+    sl::refuse_stale(&mut ctx.button_cards, |epoch| engine.approval_is_current(epoch));
+}
+
+impl sl::WaitingCard for super::ButtonCard {
+    fn held(&self, i: usize) -> Option<sl::HeldLink<'_>> {
+        let a = self.asks.get(i).filter(|_| is_link_card(self))?;
+        Some(sl::HeldLink {
+            client_hex: &self.key.client_hex,
+            id: &a.ask.request.id,
+            params: &a.ask.request.params,
+            epoch: a.ask.resume.authority_epoch,
+        })
+    }
+
+    fn link_refusal(&self) -> Option<sl::LinkRefusal> {
+        match self.refused {
+            Some(super::CardRefusal::Link(why)) => Some(why),
+            Some(super::CardRefusal::FullAccess(_)) | None => None,
         }
+    }
+
+    fn refuse_link(&mut self, why: sl::LinkRefusal) {
+        self.refused = Some(super::CardRefusal::Link(why));
     }
 }
 
@@ -219,10 +231,6 @@ fn retry_reply(ctx: &SignCtx, create: &sl::CreateRequest, made: &heartwood_commo
     let identity = hex_encode(&create.identity);
     let uri = mgmt::bunker_uri(&identity, &ctx.relays, Some(&made.secret));
     sl::create_reply(made, &identity, &uri)
-}
-
-fn refusal_pair(e: LinkError) -> super::CardRefusal {
-    (e.code(), e.message())
 }
 
 /// Status and revoke (design 4.5): rules 1 to 5 for the identity, then the

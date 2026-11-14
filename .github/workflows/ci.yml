@@ -298,6 +298,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install the esp Rust toolchain (espup — nightly Rust + LLVM)
+        # Authenticate espup's one GitHub API lookup (the Xtensa Rust version) so it
+        # uses the token's limit, not the 60/hr unauthenticated one shared by every
+        # job on the runner's IP address. That limit has failed this job.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -eu
           curl -fL -o espup \

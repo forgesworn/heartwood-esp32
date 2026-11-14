@@ -587,7 +587,7 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
 
         "get_info" => {
             let (note_count, pending_count) = ctx.store.counts();
-            json!({
+            let mut info = json!({
                 "ok": true,
                 "fw_version": ctx.fw_version,
                 "board": ctx.board,
@@ -596,7 +596,14 @@ fn dispatch(ctx: &mut NoteCmdContext<'_>, cmd: &Value) -> Value {
                 "pending_count": pending_count,
                 "received_count": ctx.store.received_count(),
                 "trusted_count": ctx.trust.len(),
-            })
+            });
+            // Notes this boot cannot read hold slots too, so note_count plus
+            // this is what the cap is measured against. Omitted when zero.
+            let unreadable = ctx.store.unreadable_count();
+            if unreadable > 0 {
+                info["unreadable_count"] = json!(unreadable);
+            }
+            info
         }
 
         // ---- trusted senders: wraps from these are stored without a hold ----
@@ -2140,6 +2147,26 @@ mod tests {
         assert_eq!(res["pending_count"], 1);
         assert_eq!(res["storage"], "ok");
         assert_eq!(res["board"], "host");
+    }
+
+    #[test]
+    fn get_info_counts_the_notes_this_boot_cannot_read() {
+        // A note this boot cannot read still holds a slot: without the count
+        // a wallet reads note_count 1 of 2 and is still told storage_full.
+        let mut h = Harness::new();
+        let newer = h.confirmed_note();
+        h.confirmed_note();
+        let res = h.run(r#"{"cmd":"get_info"}"#);
+        assert!(res.get("unreadable_count").is_none(), "zero is omitted: {res}");
+
+        // A record format newer than this firmware, as an upgrade-then-
+        // rollback leaves one.
+        h.storage.notes.get_mut(&newer).unwrap()[4] = 99;
+        h.store = NoteStore::load(&mut h.storage, MAX_NOTES).store;
+        let res = h.run(r#"{"cmd":"get_info"}"#);
+        assert_eq!(res["note_count"], 1, "{res}");
+        assert_eq!(res["unreadable_count"], 1, "{res}");
+        assert_eq!(res["pending_count"], 0);
     }
 
     #[cfg(feature = "device-identity")]

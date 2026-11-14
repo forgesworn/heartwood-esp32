@@ -58,8 +58,9 @@ commitments.
 
 A second optional top-level field, `note_inventory_unreadable`, counts the
 notes the exporting board held but could NOT read: records still sealed under
-an at-rest key that boot was never given, or a locker whose index would not
-load. It travels in the file and not only in a log, because otherwise an
+an at-rest key that boot was never given, records it could not read for any
+other reason (a newer record format, a sealed blob that would not open, a
+failed read), or a locker whose index would not load. It travels in the file and not only in a log, because otherwise an
 export taken on a locked board carries an empty inventory that is
 byte-identical to one taken on an empty locker. "I cannot see four of them" is
 a different statement from "there were none", and a backup that quietly

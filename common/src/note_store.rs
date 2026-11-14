@@ -659,6 +659,15 @@ impl NoteStore {
         self.index_known
     }
 
+    /// Indexed notes whose blob is on flash but this boot could not read
+    /// ([`Self::unreadable`]): not in [`Self::counts`], yet each holds a slot
+    /// against the cap, so `counts().0 + unreadable_count()` is what a
+    /// creation is measured against. A caller that also counts sealed
+    /// records awaiting a key should know those are among these.
+    pub fn unreadable_count(&self) -> usize {
+        self.unreadable.len()
+    }
+
     pub fn counts(&self) -> (usize, usize) {
         let pending = self.notes.iter().filter(|n| n.state == NoteState::Pending).count();
         (self.notes.len(), pending)
@@ -2596,6 +2605,52 @@ mod tests {
             .import_secret(&mut storage, &mut rng, &"c3".repeat(SECRET_LEN), "m.example/w", 1, "", 2)
             .unwrap();
         assert_eq!(storage.index.clone().unwrap(), vec![kept, added]);
+    }
+
+    #[test]
+    fn the_unreadable_count_is_every_slot_the_notes_cannot_show() {
+        // What a host is told about the notes it cannot see: the ones whose
+        // blob is on flash and would not read, never an absent one, through
+        // every rewrite, until a boot that can read them.
+        let mut storage = FakeStorage::new();
+        let mut rng = test_rng();
+        let mut store = fresh_store(&mut storage);
+        assert_eq!(store.unreadable_count(), 0);
+        let ids = seed_confirmed(&mut store, &mut storage, &mut rng, &["a1", "b2", "c3", "d4"]);
+        let (newer, sealed, absent) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        let (original, _) = from_the_future(&mut storage, &newer);
+        storage.note_read_fails.push(sealed.clone());
+        storage.notes.remove(&absent);
+
+        let mut store = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert_eq!(store.counts(), (1, 0));
+        assert_eq!(store.unreadable_count(), 2);
+
+        let (pending, _) = test_new_secret(&mut store, &mut storage, &mut rng, &[], "", 2).unwrap();
+        assert_eq!(store.unreadable_count(), 2);
+        store.discard(&mut storage, &pending).unwrap();
+        assert_eq!(store.unreadable_count(), 2);
+        // Every indexed id is a note shown or a note counted here.
+        let index = storage.index.clone().unwrap();
+        assert_eq!(index.len(), store.counts().0 + store.unreadable_count());
+
+        storage.notes.insert(newer, original);
+        storage.note_read_fails.clear();
+        let back = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert_eq!(back.unreadable_count(), 0);
+        assert_eq!(back.counts(), (3, 0));
+    }
+
+    #[test]
+    fn an_unindexed_store_counts_nothing_unreadable() {
+        // The fail-closed store knows nothing; the count says nothing rather
+        // than a guess. Callers read index_known for that case.
+        let mut storage = FakeStorage::new();
+        storage.index_read_fails = true;
+        let store = NoteStore::load(&mut storage, MAX_NOTES).store;
+        assert!(!store.index_known());
+        assert_eq!(store.unreadable_count(), 0);
+        assert_eq!(NoteStore::storage_unavailable(MAX_NOTES).unreadable_count(), 0);
     }
 
     /// A full locker: `MAX_NOTES` confirmed notes with distinct secrets.

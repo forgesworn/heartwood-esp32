@@ -699,6 +699,11 @@ pub struct IdleSummary {
     pub held: usize,
     pub received: usize,
     pub pending: usize,
+    /// Notes this boot could not read beyond the sealed ones in `held` (see
+    /// [`Notes::unreadable_count`]): each holds a slot. Not drawn yet; the
+    /// panel's lines are unchanged.
+    #[allow(dead_code)]
+    pub unreadable: usize,
 }
 
 /// Take a momentary, read-only locker summary for the local idle display.
@@ -713,6 +718,7 @@ pub fn idle_summary() -> IdleSummary {
             held: notes.store.live_count() + notes.sealed_count(),
             received: notes.store.received_count(),
             pending,
+            unreadable: notes.unreadable_count(),
         }
     })
 }
@@ -721,23 +727,27 @@ pub fn idle_summary() -> IdleSummary {
 /// inventory line per readable note, and the count of notes it could NOT
 /// read so the caller can say so out loud.
 ///
-/// Sealed records awaiting an unlock key, and a boot whose index would not
-/// read, both mean the locker knows less than the board holds. Neither is
-/// guessed at: the inventory lists what is readable, and `unreadable` is how
-/// many notes are known to be missing from it. An operator exporting on a
-/// locked board should unlock first.
+/// Sealed records awaiting an unlock key, records this boot could not read
+/// for any other reason (a newer record format, a sealed blob that would not
+/// open, a failed read), and a boot whose index would not read, all mean the
+/// locker knows less than the board holds. None is guessed at: the inventory
+/// lists what is readable, and `unreadable` is how many notes are known to be
+/// missing from it. An operator exporting on a locked board should unlock
+/// first.
 pub fn backup_inventory() -> (
     alloc_vec::Vec<heartwood_common::backup::NoteInventoryEntry>,
     usize,
 ) {
     with_locker(|notes| {
-        let sealed = notes.sealed_count();
+        // The sealed records are among the store's unreadable ids (their
+        // load failed too), so the larger of the two, never the sum.
+        let missing = notes.sealed_count().max(notes.store.unreadable_count());
         let unreadable = if notes.store.index_known() {
-            sealed
+            missing
         } else {
             // An unreadable index means the store came up empty and refuses
             // creation; there is no honest count, only "not none".
-            sealed.max(1)
+            missing.max(1)
         };
         (
             heartwood_common::backup::build_note_inventory(&notes.store),
@@ -782,6 +792,16 @@ impl Notes {
     fn any_held(&self) -> bool {
         let (count, _) = self.store.counts();
         count > 0 || self.sealed_count() > 0
+    }
+
+    /// Indexed notes this boot could not read beyond the sealed ones
+    /// awaiting a key ([`Self::sealed_count`], which are among the store's
+    /// unreadable ids too): a newer record format, a sealed blob that would
+    /// not open under the key, a failed read. They hold slots, so a count of
+    /// notes that includes the sealed ones plus this is what the cap is
+    /// measured against.
+    pub fn unreadable_count(&self) -> usize {
+        self.store.unreadable_count().saturating_sub(self.sealed_count())
     }
 
     /// Sealed records awaiting a key this boot. Included in `get_info`'s
@@ -1409,7 +1429,7 @@ fn handle_note_cmd_frame_locked_inner(
     // (pending_count only covers decodable records — a sealed note's state
     // is inside the ciphertext, and a locked boot cannot know it.)
     let (note_count, pending_count) = notes.store.counts();
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "ok": true,
         "fw_version": env!("CARGO_PKG_VERSION"),
         "board": crate::board::BOARD,
@@ -1417,6 +1437,13 @@ fn handle_note_cmd_frame_locked_inner(
         "note_count": note_count + notes.sealed_count(),
         "pending_count": pending_count,
     });
+    // Notes unreadable for a reason other than the missing key hold slots
+    // too; note_count plus this is what the cap is measured against, as on
+    // an unlocked board. Omitted when zero.
+    let unreadable = notes.unreadable_count();
+    if unreadable > 0 {
+        response["unreadable_count"] = serde_json::json!(unreadable);
+    }
     let bytes = serde_json::to_vec(&response)
         .unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"bad_request\"}".to_vec());
     protocol::write_frame(usb, FRAME_TYPE_NOTE_RESP, &bytes);

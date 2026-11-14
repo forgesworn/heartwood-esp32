@@ -370,10 +370,19 @@ pub fn branch_host(note_host: &str) -> &str {
 /// bound to that domain, so one that no mint can have is refused before
 /// anything is derived or shown.
 pub fn valid_mint_host(host: &str) -> bool {
-    if !crate::cash_store::valid_host(host) {
-        return false;
-    }
-    // valid_host admits no `/` and no uppercase, so this is spend_domain
+    crate::cash_store::valid_host(host) && names_a_domain(host)
+}
+
+/// [`valid_mint_host`] under the character rule from before the port rule
+/// ([`crate::cash_store::valid_stored_host`]), for a path that may reach a
+/// legacy branch: those hash the host as stored and were handed out under
+/// that rule, so a name may still be on file, and paid, at `moneyer.dev:x`.
+pub fn valid_stored_mint_host(host: &str) -> bool {
+    crate::cash_store::valid_stored_host(host) && names_a_domain(host)
+}
+
+fn names_a_domain(host: &str) -> bool {
+    // valid_stored_host admits no `/` and no uppercase, so this is spend_domain
     let domain = host.split(':').next().unwrap_or(host);
     !domain.is_empty() && !domain.starts_with('.') && !domain.ends_with('.')
 }

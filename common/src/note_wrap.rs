@@ -115,7 +115,9 @@ pub fn open_note_rumor(
 #[cfg(feature = "cash")]
 fn open_key_note(key: KeyNoteRef, identity_secret: &[u8; 32]) -> Result<IncomingNote, &'static str> {
     let host = crate::cash_key::branch_host(&key.host);
-    if !crate::cash_store::valid_host(host) {
+    // The old rule until the key is found: a legacy branch hashes the host
+    // as stored, and was handed out under it.
+    if !crate::cash_store::valid_stored_host(host) {
         return Err("bad host");
     }
     // A wrap names the note's index but not its share, so every share this
@@ -130,6 +132,11 @@ fn open_key_note(key: KeyNoteRef, identity_secret: &[u8; 32]) -> Result<Incoming
         None,
         crate::cash_key::PURPOSE_LIGHTNING_ADDRESS,
     )?;
+    // A share hashes the domain without its port: one at a port no wallet
+    // could spell is no mint's, and the key is the one at the host spelt right.
+    if matches!(found.origin, crate::cash_key::KeyOrigin::Share(_)) && !crate::cash_store::valid_host(host) {
+        return Err("bad host");
+    }
     Ok(IncomingNote {
         secret: *found.secret,
         key: Some(KeyNote { index: key.index, pubkey: found.pubkey }),
@@ -655,6 +662,45 @@ mod tests {
                 assert!(good.content.contains(&from), "{from}");
                 rumor.content = good.content.replace(&from, &to);
                 assert!(open_note_rumor(&rumor, &IDENTITY).is_err(), "{}", rumor.content);
+            }
+        }
+
+        fn wrap_at(host: &str, pubkey: &[u8; 32], index: u32) -> UnsignedEvent {
+            let mut rumor = moneyer_wrap(pubkey, index);
+            rumor.content = rumor.content.replace("moneyer.dev", host);
+            for tag in rumor.tags.iter_mut().filter(|t| t[0] == "u") {
+                tag[1] = format!("{host}/w");
+            }
+            rumor
+        }
+
+        #[test]
+        fn a_wrap_onto_a_share_at_a_port_no_wallet_could_spell_is_refused() {
+            // A share hashes the domain without its port, so no key is lost:
+            // no mint is at `moneyer.dev:x`, and the keys are `moneyer.dev`'s.
+            let (_, pubkey) = key_at(5);
+            for host in ["moneyer.dev:x", "moneyer.dev::443", "moneyer.dev:0", "moneyer.dev:65536", "moneyer.dev:0443", "moneyer.dev:"] {
+                assert_eq!(open_note_rumor(&wrap_at(host, &pubkey, 5), &IDENTITY).err(), Some("bad host"), "{host}");
+            }
+            for host in ["moneyer.dev:443", "moneyer.dev:8080"] {
+                let note = open_note_rumor(&wrap_at(host, &pubkey, 5), &IDENTITY).unwrap();
+                assert_eq!(note.key, Some(KeyNote { index: 5, pubkey }), "{host}");
+            }
+        }
+
+        #[test]
+        fn a_wrap_onto_a_legacy_branch_spelt_under_the_old_rule_still_opens() {
+            // A legacy branch hashes the host as stored, and was handed out
+            // before the port rule, so a note paid to one at such a spelling
+            // is still this device's.
+            use crate::cash_key::{legacy_branch, note_pubkey, note_secret_key, BranchKind};
+            for host in ["moneyer.dev:x", "moneyer.dev::443", "moneyer.dev:0", "moneyer.dev:65536", "moneyer.dev:0443", "moneyer.dev:"] {
+                let node = legacy_branch(&IDENTITY, host, BranchKind::Legacy).unwrap();
+                let secret = note_secret_key(&node, PURPOSE_LA, 3).unwrap();
+                let pubkey = note_pubkey(&secret).unwrap();
+                let note = open_note_rumor(&wrap_at(host, &pubkey, 3), &IDENTITY).unwrap();
+                assert_eq!((note.secret, note.key), (*secret, Some(KeyNote { index: 3, pubkey })), "{host}");
+                assert_eq!(note.host, format!("{host}/w"));
             }
         }
 

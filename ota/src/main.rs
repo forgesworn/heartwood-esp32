@@ -513,7 +513,6 @@ fn main() {
 // Utility
 // ---------------------------------------------------------------------------
 
-/// Encode a byte slice as a lowercase hex string.
 /// `--flip-byte`: flips the low bit of `image[offset]` once the digest has
 /// been taken, so only the transferred bytes differ. Refuses an offset in
 /// the first chunk (the device checks the image header on its first write,
@@ -530,6 +529,7 @@ fn flip_sent_byte(image: &mut [u8], offset: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Encode a byte slice as a lowercase hex string.
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

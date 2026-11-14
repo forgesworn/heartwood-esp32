@@ -3324,9 +3324,54 @@ item 6), and USB.
    count reads 0. (Do not cut the power here: with the count at 5 on flash the
    next boot wipes the board, which is the case the warning is for.)
 7. A guess the board cannot count is refused untried. Only if a board with a
-   nearly full NVS is to hand: the PIN is refused with `storage_full: the PIN
-   was not tried` (heartwoodd says "PIN not tried"), the count is unchanged,
-   and nothing is wiped.
+   full NVS is to hand (since #197 the count is a one-entry `u8` item, so a
+   raise needs one free entry and the refusal is rarer than it was): the PIN
+   is refused with `storage_full: the PIN was not tried` (heartwoodd says "PIN
+   not tried"), the count is unchanged, and nothing is wiped.
+
+## 42. NVS values are replaced in place, under an entry budget (#197; added 2026-10-28, NOT YET BENCH-RUN)
+
+esp-idf-svc's `set_blob`/`set_str` erase a key before writing it, so a power
+cut between the two left no value at all. Every blob write now replaces in
+place, is planned against the partition's entry budget first, and falls back
+to erasing first only for keys whose old value is recoverable elsewhere. A
+refusal for lack of room now says `storage_full:` rather than reading as a
+fault. Use a spare V4 with the legacy-nvs-bigapp layout, filled to about 17
+available entries (the bench V4's state), never the owner's board. The
+section 40 headed "A PIN guess is counted before it is checked" (#254) covers
+the PIN counter; run it first.
+
+1. Upgrade from beta.17 with one failed PIN guess recorded: the count carries
+   over.
+2. Revoke a pairing over USB and over the relay: the client stays refused after
+   a power cycle, and no legacy default pairing appears.
+3. Cut the power during that revoke: after the boot the table is the narrower
+   one or empty, never the wider one, and the board does not boot-loop.
+4. Remove a persona, then an identity, on the full board.
+5. Make a relay management change with 5 to 8 entries available.
+6. Try a network change and a bridge-secret replace on the full board: both
+   come back storage full, and the old values are kept after a reboot.
+7. Reconnect a client with a new key on the full board.
+8. A new pairing on the full board is refused before any card with `storage_full:
+   not enough storage left for another pairing; remove an unused pairing, persona
+   or avatar first` (USB CONNSLOT_CREATE, and relay `create_client` /
+   `nostrconnect`). A new phone and an avatar are refused the same way, with
+   their own wording.
+9. A persona bundle that would not fit is refused before its card, not after
+   the hold: with room for one registration but a two-name bundle, the
+   approval is refused up front. The refusal threshold is about 3 entries
+   higher than before (section 36 item 6 was recorded at 149 free).
+10. A revocation whose save failed says what helps. Hard to stage; record what
+    the board answers if it happens:
+    - lack of room: `storage_full: ... there was no room to save it; free some
+      room (remove an unused pairing, persona or avatar), then repeat the
+      request`; after freeing room, the repeated revoke answers success and
+      the client stays refused after a power cycle;
+    - an identity whose table cannot be read or written: `storage_unavailable:
+      ... restart the device, then repeat the request if the pairing is still
+      listed`;
+    - any other failure: `storage_unavailable: ... repeat the request to try
+      the save again`, and the repeat then saves it.
 
 ## Notes
 

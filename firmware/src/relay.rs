@@ -42,6 +42,7 @@ use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::modem::Modem;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+use crate::nvs::ReplaceBlob;
 use esp_idf_svc::tls::{Config as TlsConfig, EspTls, InternalSocket, KeepAliveConfig};
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfig, EspWifi,
@@ -1242,7 +1243,7 @@ fn load_pinned(nvs: &mut EspNvs<NvsDefault>) -> Vec<PinnedRelay> {
 fn save_pinned(nvs: &mut EspNvs<NvsDefault>, pinned: &[PinnedRelay]) -> bool {
     match serde_json::to_vec(pinned) {
         Ok(json) => {
-            if let Err(e) = nvs.set_blob(PINNED_NVS_KEY, &json) {
+            if let Err(e) = nvs.replace_blob(PINNED_NVS_KEY, &json) {
                 log::error!("[relay] persist pinned relays: {e:?}");
             }
             match nvs.blob_len(PINNED_NVS_KEY) {
@@ -2605,6 +2606,29 @@ fn connect_secondary(url: &str, ctx: &mut SignCtx) -> Result<RelaySession, Strin
 /// Relay sessions opened since boot (every dial that returns `Ok`), reported by
 /// `get_status` as `relay_connects` to correlate heap drift with reconnects.
 static RELAY_CONNECTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Unused stack of each task that runs firmware Rust code, plus two C-only
+/// controls, as `get_status`'s `stack_free` (`heartwood_common::task_stacks`):
+/// bytes never touched since the task started, `null` for a task not running.
+/// Read here, on the main task, from each task's handle; a lookup that finds
+/// nothing is never passed on, since a null handle would read the caller's.
+fn stack_free() -> serde_json::Value {
+    use esp_idf_svc::sys::{uxTaskGetStackHighWaterMark, xTaskGetHandle, TaskHandle_t};
+    use heartwood_common::task_stacks::{BTN_LATCH_KEY, TASKS_BY_NAME};
+    let mark = |task: TaskHandle_t| -> serde_json::Value {
+        if task.is_null() {
+            serde_json::Value::Null
+        } else {
+            unsafe { uxTaskGetStackHighWaterMark(task) }.into()
+        }
+    };
+    let mut marks = serde_json::Map::new();
+    for (key, name) in TASKS_BY_NAME {
+        marks.insert((*key).into(), mark(unsafe { xTaskGetHandle(name.as_ptr()) }));
+    }
+    marks.insert(BTN_LATCH_KEY.into(), mark(crate::button::latch_task()));
+    marks.into()
+}
 
 /// Sentinel error: the relay socket could not be given a recv timeout and the
 /// caller required one (see [`connect_relay_raw`]).
@@ -4426,11 +4450,12 @@ fn poll_usb_frame(
                 log::warn!("[relay] SET_IDENTITY_META rejected — bridge not authenticated");
                 crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"bridge auth required");
             } else {
-            let ok = crate::identity_meta::handle_frame(&frame.payload, ctx.masters, ctx.nvs);
+            let stored = crate::identity_meta::handle_frame(&frame.payload, ctx.masters, ctx.nvs);
+            let ok = stored.is_ok();
             crate::protocol::write_frame(
                 usb,
                 if ok { FRAME_TYPE_ACK } else { FRAME_TYPE_NACK },
-                &[],
+                stored.as_ref().err().map_or(&[][..], |reason| reason.as_bytes()),
             );
             // Not over a card or a held result: the identity card would hide
             // the words the owner is reading.
@@ -9507,23 +9532,135 @@ fn persist_slot_mutation_or_rollback(
     snapshot: crate::policy::SlotStateSnapshot,
     action: &str,
 ) -> Result<(), String> {
-    if ctx.policy_engine.persist_slots(ctx.nvs, master_slot) {
-        return Ok(());
+    let persisted = ctx.policy_engine.try_persist_slots(ctx.nvs, master_slot);
+    finish_slot_mutation(ctx, persisted, snapshot, action)
+}
+
+/// Save a mutation that only removes authority (a revoked pairing, client
+/// key or identity grant, or narrowed permissions). Never rolled back on
+/// failure, since that would re-authorise the revoked party; the error says
+/// what a restart would find (`PolicyEngine::persist_revocation`).
+fn persist_revocation(ctx: &mut SignCtx, master_slot: u8, action: &str) -> Result<(), String> {
+    let outcome = ctx.policy_engine.persist_revocation(ctx.nvs, master_slot);
+    if outcome != crate::policy::RevocationSave::Saved {
+        log::error!("[relay] {action} not fully saved: {outcome:?}");
     }
-    if ctx
+    outcome.describe(action)
+}
+
+/// The management error for a slot index the master does not have. One copy
+/// of the format for every method that takes a slot.
+#[inline(never)]
+fn no_such_slot(slot_index: u8) -> String {
+    format!("no such slot: {slot_index}")
+}
+
+/// `revoke_client` for a pairing RAM no longer has. If flash still has it, an
+/// earlier revocation's save failed (`RevocationSave::OnlyUntilRestart`), and
+/// repeating the revocation saves it now. The credential is checked against
+/// the stored copy, so a stale screen cannot confirm some other pairing's
+/// revocation. Otherwise "no such slot", as before. Kept out of
+/// `dispatch_mgmt`, which is already as large as the Xtensa debug build copes
+/// with.
+#[inline(never)]
+fn save_unsaved_client_revocation(
+    ctx: &mut SignCtx,
+    req: &serde_json::Value,
+    master_slot: u8,
+    slot_index: u8,
+) -> Result<serde_json::Value, String> {
+    let stored = ctx
         .policy_engine
-        .restore_slot_state_durably(ctx.nvs, snapshot)
-    {
+        .unsaved_slot_revocation(ctx.nvs, master_slot, slot_index)
+        .ok_or_else(|| no_such_slot(slot_index))?;
+    let secret_fingerprint = require_expected_slot_fingerprint(req, &stored)?;
+    ctx.policy_engine.mark_slots_unsaved();
+    persist_revocation(ctx, master_slot, "client revocation")?;
+    log::info!("[relay] mgmt: saved the earlier revocation of client slot {slot_index} (operator)");
+    Ok(client_revoked_reply(slot_index, secret_fingerprint))
+}
+
+/// `revoke_client`'s reply, live or saving an earlier revocation.
+#[inline(never)]
+fn client_revoked_reply(slot_index: u8, secret_fingerprint: String) -> serde_json::Value {
+    serde_json::json!({
+        "slot_index": slot_index,
+        "secret_fingerprint": secret_fingerprint,
+        "revoked": true,
+    })
+}
+
+/// `remove_authorized_pubkey` for a key the pairing no longer has in RAM. If
+/// the stored copy of the same pairing still has it, an earlier removal's
+/// save failed, and repeating the removal saves it now; otherwise
+/// `authorized_pubkey_not_found`, as before.
+#[inline(never)]
+fn save_unsaved_key_removal(
+    ctx: &mut SignCtx,
+    master_slot: u8,
+    slot_index: u8,
+    pubkey: &str,
+    secret_fingerprint: String,
+) -> Result<serde_json::Value, String> {
+    if !ctx.policy_engine.unsaved_key_removal(ctx.nvs, master_slot, slot_index, pubkey) {
+        return Err("authorized_pubkey_not_found".into());
+    }
+    ctx.policy_engine.mark_slots_unsaved();
+    persist_revocation(ctx, master_slot, "authorised client-key removal")?;
+    Ok(key_removed_reply(slot_index, pubkey, secret_fingerprint))
+}
+
+/// `remove_authorized_pubkey`'s reply, live or saving an earlier removal.
+#[inline(never)]
+fn key_removed_reply(slot_index: u8, pubkey: &str, secret_fingerprint: String) -> serde_json::Value {
+    serde_json::json!({
+        "slot_index": slot_index,
+        "pubkey": pubkey,
+        "secret_fingerprint": secret_fingerprint,
+        "removed": true,
+    })
+}
+
+/// The reply when a nostrconnect pairing's save failed and was rolled back.
+#[inline(never)]
+fn nostrconnect_not_applied(why: crate::policy::SlotSaveError) -> String {
+    if why == crate::policy::SlotSaveError::NoRoom {
+        format!("{}; pairing was not applied", crate::policy::PAIRING_STORAGE_FULL)
+    } else {
+        "could not persist nostrconnect policy; pairing was not applied".into()
+    }
+}
+
+fn finish_slot_mutation(
+    ctx: &mut SignCtx,
+    persisted: Result<(), crate::policy::SlotSaveError>,
+    snapshot: crate::policy::SlotStateSnapshot,
+    action: &str,
+) -> Result<(), String> {
+    let Err(why) = persisted else {
+        return Ok(());
+    };
+    let master_slot = snapshot.master_slot();
+    let restored = ctx.policy_engine.restore_slot_state_durably(ctx.nvs, snapshot);
+    let advice = if ctx.policy_engine.restart_needed(master_slot) {
+        format!("; {}", crate::policy::RESTART_ADVICE)
+    } else {
+        String::new()
+    };
+    if restored && why == crate::policy::SlotSaveError::NoRoom {
+        // The growth gate refused before anything was written: say so, so a
+        // client can tell "free some room" from a fault.
+        log::warn!("[relay] {action} refused: not enough NVS room for another pairing");
+        Err(format!("{}; {action} was not applied{advice}", crate::policy::PAIRING_STORAGE_FULL))
+    } else if restored {
         log::error!("[relay] {action} was not durable; prior slot authority restored durably");
-        Err(format!(
-            "could not persist {action}; request was not applied"
-        ))
+        Err(format!("could not persist {action}; request was not applied{advice}"))
     } else {
         log::error!(
             "[relay] FATAL: {action} failed and prior slot authority could not be restored durably"
         );
         Err(format!(
-            "fatal storage error: could not restore prior client policy after {action}; take the device offline for USB recovery"
+            "fatal storage error: could not restore prior client policy after {action}; take the device offline for USB recovery{advice}"
         ))
     }
 }
@@ -10667,7 +10804,7 @@ fn dispatch_mgmt(
             // success until the complete policy is durable. If NVS rejects the
             // write, restore RAM and the prior pin; boot-time pruning is an
             // additional fail-closed guard if pin rollback itself cannot write.
-            if !ctx.policy_engine.persist_slots(ctx.nvs, master_slot) {
+            if let Err(why) = ctx.policy_engine.try_persist_slots(ctx.nvs, master_slot) {
                 let slot_rollback_durable = ctx
                     .policy_engine
                     .restore_slot_state_durably(ctx.nvs, slot_snapshot);
@@ -10678,7 +10815,7 @@ fn dispatch_mgmt(
                     true
                 };
                 return if slot_rollback_durable && pin_rollback_durable {
-                    Err("could not persist nostrconnect policy; pairing was not applied".into())
+                    Err(nostrconnect_not_applied(why))
                 } else {
                     Err("fatal storage error: could not restore prior pairing state; take the device offline for USB recovery".into())
                 };
@@ -10752,7 +10889,7 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
             if target.strict_permissions {
                 return Err(
@@ -10777,7 +10914,7 @@ fn dispatch_mgmt(
                     "signing_approved": true,
                 }))
             } else {
-                Err(format!("no such slot: {slot_index}"))
+                Err(no_such_slot(slot_index))
             }
         }
 
@@ -10791,7 +10928,7 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|s| s.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, slot)?;
             // D2: optional persona-addressed URI for an existing slot. The
             // method name is unversioned, so older firmware ignores the
@@ -10888,29 +11025,21 @@ fn dispatch_mgmt(
                 req.pointer("/params/slot_index")
                     .and_then(|v| v.as_u64())
                     .ok_or("revoke_client requires params.slot_index")? as u8;
-            let target = ctx
+            let Some(target) = ctx
                 .policy_engine
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+            else {
+                return save_unsaved_client_revocation(ctx, req, master_slot, slot_index);
+            };
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
-            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             if ctx.policy_engine.revoke_slot(master_slot, slot_index) {
-                persist_slot_mutation_or_rollback(
-                    ctx,
-                    master_slot,
-                    slot_snapshot,
-                    "client revocation",
-                )?;
+                persist_revocation(ctx, master_slot, "client revocation")?;
                 log::info!("[relay] mgmt: revoked client slot {slot_index} (operator)");
-                Ok(serde_json::json!({
-                    "slot_index": slot_index,
-                    "secret_fingerprint": secret_fingerprint,
-                    "revoked": true,
-                }))
+                Ok(client_revoked_reply(slot_index, secret_fingerprint))
             } else {
-                Err(format!("no such slot: {slot_index}"))
+                Err(no_such_slot(slot_index))
             }
         }
 
@@ -10939,34 +11068,23 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, target)?;
-            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             match ctx
                 .policy_engine
                 .remove_authorized_pubkey(master_slot, slot_index, pubkey)
             {
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Removed) => {
-                    persist_slot_mutation_or_rollback(
-                        ctx,
-                        master_slot,
-                        slot_snapshot,
-                        "authorised client-key removal",
-                    )?;
-                    Ok(serde_json::json!({
-                        "slot_index": slot_index,
-                        "pubkey": pubkey,
-                        "secret_fingerprint": secret_fingerprint,
-                        "removed": true,
-                    }))
+                    persist_revocation(ctx, master_slot, "authorised client-key removal")?;
+                    Ok(key_removed_reply(slot_index, pubkey, secret_fingerprint))
                 }
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Current) => {
                     Err("current_authorized_pubkey: revoke the slot to remove its current key".into())
                 }
                 Some(heartwood_common::policy::RemoveAuthorizedPubkey::Missing) => {
-                    Err("authorized_pubkey_not_found".into())
+                    save_unsaved_key_removal(ctx, master_slot, slot_index, pubkey, secret_fingerprint)
                 }
-                None => Err(format!("no such slot: {slot_index}")),
+                None => Err(no_such_slot(slot_index)),
             }
         }
 
@@ -11003,7 +11121,7 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             require_expected_slot_fingerprint(req, target)?;
             let client = req.pointer("/params/client_pubkey").map(|value| {
                 let key = value.as_str().ok_or("invalid client_pubkey")?;
@@ -11014,33 +11132,32 @@ fn dispatch_mgmt(
                 }
                 Ok(key)
             }).transpose()?;
-            let slot_snapshot = ctx.policy_engine.snapshot_slot_state(master_slot);
             let (revoked, changed) = match identity {
                 Some(identity) => {
                     let (revoked, changed) = ctx
                         .policy_engine
                         .revoke_identity(master_slot, slot_index, identity, client)
-                        .ok_or_else(|| format!("no such slot: {slot_index}"))??;
+                        .ok_or_else(|| no_such_slot(slot_index))??;
                     (Some(revoked), changed)
                 }
                 None => (
                     None,
                     ctx.policy_engine
                         .clear_identities(master_slot, slot_index, client)
-                        .ok_or_else(|| format!("no such slot: {slot_index}"))?,
+                        .ok_or_else(|| no_such_slot(slot_index))?,
                 ),
             };
-            if changed {
-                persist_slot_mutation_or_rollback(
-                    ctx,
-                    master_slot,
-                    slot_snapshot,
-                    "identity approval revocation",
-                )?;
-            }
+            // Withdraw the live approve-once windows first, whatever the save
+            // does: an unsaved revocation must not leave them running.
             let dropped =
                 ctx.policy_engine
                     .drop_withdrawn_verdicts(master_slot, slot_index, revoked.as_ref());
+            // Also when nothing changed but the table is unsaved: an
+            // earlier withdrawal whose save failed is saved by repeating it.
+            if changed || ctx.policy_engine.table_unsaved(ctx.nvs, master_slot) {
+                ctx.policy_engine.mark_slots_unsaved();
+                persist_revocation(ctx, master_slot, "identity approval revocation")?;
+            }
             log::info!(
                 "[relay] mgmt: {method} on slot {slot_index} (changed {changed}, verdicts dropped {dropped})"
             );
@@ -11049,7 +11166,7 @@ fn dispatch_mgmt(
                 .list_slots(master_slot)
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             Ok(mgmt::identity_revocation_result(slot, changed, dropped))
         }
 
@@ -11068,8 +11185,9 @@ fn dispatch_mgmt(
                 .iter()
                 .find(|slot| slot.slot_index == slot_index)
                 .cloned()
-                .ok_or_else(|| format!("no such slot: {slot_index}"))?;
+                .ok_or_else(|| no_such_slot(slot_index))?;
             let secret_fingerprint = require_expected_slot_fingerprint(req, &target)?;
+            let before = target.clone();
             let label = req
                 .pointer("/params/label")
                 .and_then(|v| v.as_str())
@@ -11202,12 +11320,25 @@ fn dispatch_mgmt(
                 updated
             };
             if updated {
-                persist_slot_mutation_or_rollback(
-                    ctx,
-                    master_slot,
-                    slot_snapshot,
-                    "client update",
-                )?;
+                let narrowing = ctx
+                    .policy_engine
+                    .list_slots(master_slot)
+                    .iter()
+                    .find(|slot| slot.slot_index == slot_index)
+                    .is_some_and(|after| heartwood_common::policy::narrows_only(&before, after));
+                if narrowing {
+                    // Only takes permissions away: saved as a revocation,
+                    // never rolled back to the wider ones.
+                    drop(slot_snapshot);
+                    persist_revocation(ctx, master_slot, "client permission change")?;
+                } else {
+                    persist_slot_mutation_or_rollback(
+                        ctx,
+                        master_slot,
+                        slot_snapshot,
+                        "client update",
+                    )?;
+                }
                 log::info!("[relay] mgmt: updated client slot {slot_index} (operator)");
                 Ok(serde_json::json!({
                     "slot_index": slot_index,
@@ -11215,7 +11346,7 @@ fn dispatch_mgmt(
                     "updated": true,
                 }))
             } else {
-                Err(format!("no such slot: {slot_index}"))
+                Err(no_such_slot(slot_index))
             }
         }
 
@@ -11543,6 +11674,7 @@ fn dispatch_mgmt(
             // `json!` they cost about 1.1 KB more app image than here.
             status["min_free_heap"] = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() }.into();
             status["relay_connects"] = RELAY_CONNECTS.load(Ordering::Relaxed).into();
+            status[heartwood_common::task_stacks::STACK_FREE_KEY] = stack_free();
             Ok(status)
         }
 

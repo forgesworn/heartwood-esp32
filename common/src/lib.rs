@@ -22,6 +22,8 @@ pub mod hex;
 pub mod http_date;
 pub mod kinds;
 pub mod ota_target;
+/// The tasks whose unused stack get_status reports, and their wire keys.
+pub mod task_stacks;
 pub mod types;
 pub mod validate;
 

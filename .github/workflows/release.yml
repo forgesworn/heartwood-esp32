@@ -46,6 +46,10 @@ jobs:
           default: true
           buildtargets: ${{ matrix.chip }}
           ldproxy: true
+          # Pinned, not latest, so every board builds with the toolchain that
+          # built the last release. Change it together with the C6 job's
+          # --toolchain-version, in this file and ci.yml.
+          version: "1.97.0.0"
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: firmware
@@ -156,13 +160,17 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          # espup is pinned by release and checksum (GitHub's digest for this asset).
+          # Its version also fixes the GCC it installs.
           curl -fL -o espup \
-            https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu
+            https://github.com/esp-rs/espup/releases/download/v0.19.0/espup-x86_64-unknown-linux-gnu
+          echo "f31411c64dffff4da0f0e23c432b9a5fda48942ff8695b8b21009ceb7007bcc0  espup" | sha256sum -c -  # pragma: allow-secret -- public espup v0.19.0 SHA-256
           chmod +x espup
           # The xtensa chip (esp32) pulls the NIGHTLY-based "esp" Rust toolchain that
           # firmware/rust-toolchain.toml pins — build-std (-Zbuild-std) is nightly-only,
           # riscv-on-stable can't build `core` — plus the esp LLVM (libclang for bindgen).
-          ./espup install --targets esp32 --export-file "$HOME/export-esp.sh"
+          # Same Xtensa Rust version as the toolchain action's `version` input.
+          ./espup install --targets esp32 --toolchain-version 1.97.0.0 --export-file "$HOME/export-esp.sh"
       - name: Install the riscv32-esp-elf gcc (the C FFI cross-compiler)
         run: |
           set -eu

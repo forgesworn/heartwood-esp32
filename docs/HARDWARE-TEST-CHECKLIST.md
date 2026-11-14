@@ -3525,7 +3525,7 @@ partition table, see the V4 notes); the stored notes must survive it.
    Time the relay loop through the batch; if it stalls noticeably, cache each
    mint's share public keys in RAM before release.
 
-## 40. Crash detail, and list_clients in one buffer (added 2026-11-13; items 1, 6 and 7 run in part 2026-11-13 on a T-Display)
+## 40. Crash detail, and list_clients in one buffer (added 2026-11-13; items 1, 6 and 7 run in part 2026-11-13, item 3 on 2026-11-14, on a T-Display)
 
 Why: a T-Display on 0.18.0-beta.34 reset with `last_reset` `panic` and
 `crashed_during` "relay mgmt list_clients", and recorded nothing more. The
@@ -3652,3 +3652,47 @@ not looked at.
   run; the owner set it aside.
 - The Sapwood follow-up above is done: Sapwood shows why a 0x42 read was
   refused (sapwood#192).
+
+**Overnight 2026-11-13 to 14, and a crash, on the same T-Display on beta.35.**
+Relay `get_status` every 30 minutes from 20:15Z, by `scripts/mgmt-request.mjs`
+with the device operator key.
+- A new pairing was made between 20:46Z and 21:49Z: a slot for the client the
+  board had been refusing (run above). NVS went from 543 to 567 entries across
+  it, and 569 by 22:19Z. That client's own log, which has no timestamps,
+  shows the same NIP-46 `connect` refused as "unauthorised" every 30 seconds
+  from its 13:30Z restart, 879 attempts, then a restart onto the new slot and
+  a successful connect. 879 attempts 30 s or more apart end at 20:50Z or
+  later, inside that window. After it connected, five of its relay sign-in
+  requests through the board timed out, at times the log does not record.
+- From 21:49Z to 07:53Z, 20 of 21 rounds answered (06:23Z timed out). Free
+  heap held at about 45,000: between 44,288 and 45,376, apart from 43,028 at
+  01:50Z and 41,520 at 07:23Z, each back by the next round. The largest block
+  was 32,768 in most rounds (34,816 in two early ones, 31,744 and 30,720 at the
+  two dips). No reset, `crash_detail` `null`, uptime 71,927 s at the last
+  round. The evening's fall did not go on overnight, with the refused
+  client gone.
+- Item 3, run: at about 08:09:35Z (uptime 834 s at 08:23:29Z) the board reset
+  with `last_reset` `panic`, `crashed_during` "relay envelope kind 24134" and
+  `crash_detail` `{"cause": "alloc-failed", "alloc_failed_bytes": 14526,
+  "alloc_failed_caps": 6144, "alloc_failures": 1, "panic_site": null}`. Three
+  seconds earlier a relay `list_clients` had been sent with the operator key;
+  it timed out. After the new pairing the reply's plaintext had grown into
+  NIP-44's 8,193 to 10,240 B padding band, a 13,744-byte ciphertext, and
+  `ws_send_framed` then asked for one frame of 14 + 13,744 + 768 = 14,526
+  bytes while the event still held the ciphertext. `response_transportable`
+  allows for one allocation that size, not two. Item 6's five-app reply (about
+  7.8 KB) was in the band below and went out. #286 streams the frame through a
+  512-byte buffer instead; that build is not yet benched.
+- After the reset: free heap 66,256, largest block 65,536, and NVS 603 entries,
+  up from 569. The crash record is kept in RTC memory, so this run does not
+  account for the rise.
+- Refused-connect soak, run 09:19Z to 10:49Z on the same boot: an unpaired
+  client key sent a NIP-46 `connect` with a wrong secret every 3 seconds, the
+  same request and "unauthorised" reply as the client refused overnight. 1,799
+  sent, every one answered, no reconnect, no reset. Relay `get_status` every
+  10 minutes: free heap 46,876 at the start and between 46,672 and 46,852 in
+  eight of the nine rounds after; 44,912 at 80 minutes, back to 46,676 by the
+  next. Largest block 34,816 throughout (36,864 at the start). Twice the
+  overnight client's refusals in 90 minutes, with no fall, so refused
+  `connect`s are unlikely to explain the evening's drop. Stopped at 90 of a
+  planned 120 minutes once the dip had recovered.

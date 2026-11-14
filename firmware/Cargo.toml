@@ -116,14 +116,13 @@ embuild = "0.33"
 # on heltec-v3, 60,064 B on tdisplay and 68,192 B on c6; CI's newer toolchain
 # gives smaller images, so its figures will differ. LTO once broke the
 # secp256k1-sys C build; -mlongcalls in .cargo/config.toml is what lets it link.
-# Cross-crate inlining deepens Rust task stacks and shifts timing, and this
-# profile is every board's: merging the `lto` line ships thin LTO in the next
-# tagged release on the Heltecs, the T-Display and the C6 alike. So the PR that
-# adds it stays unmerged until docs/HARDWARE-TEST-CHECKLIST.md section 44 (read
-# from get_status's `stack_free`) has passed on all three board classes.
-# `lto = "fat"` (about 135 KB on the Heltec
-# image, measured on esp 1.87.0.0 before thin was on) is the next lever if the
-# slot fills again, and needs the same bench pass; std's backtrace (see
+# Cross-crate inlining deepens Rust task stacks and shifts timing. This profile
+# is every release build's, so thin LTO applies to the Heltecs, the T-Display
+# and the C6 alike, and to the heartwood-demo bin. Its bench is
+# docs/HARDWARE-TEST-CHECKLIST.md section 44, read from get_status's
+# `stack_free`, on each of those board classes. `lto = "fat"` (about 135 KB on
+# the Heltec image, measured on esp 1.87.0.0 before thin was on) is the next
+# lever if the slot fills again, and needs the same bench; std's backtrace (see
 # .cargo/config.toml) and the C log level (the Heltec sdkconfig fragments) were
 # the cheaper ones.
 [profile.release]

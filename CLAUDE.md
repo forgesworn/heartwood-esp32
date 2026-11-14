@@ -511,15 +511,18 @@ before the card: an owner pairing with no family flag asking
 (`owner_pairing::is_owner_pairing`), an identity served by an unlocked master,
 the asking key already signing as it there, no family flag on that slot, no
 Rule D real identity, the policy within what that slot does silently
-(`within_phone`, the policy evaluator itself), room in the table and NVS, an
-idempotent same-label retry answered with no card, a 60 s cooldown after a
-decline or timeout, and one LINK card at a time (a second ask refuses both;
-the waiting card closes as the FULL ACCESS card's "Pairing blocked / 2nd
-request"). The card (`oled::show_link_request`, the extension card's rows via
+(`within_phone`, the policy evaluator itself), an idempotent same-label
+retry answered with no card (before room, so a lost reply is answered even
+when its link took the last slot), room in the table and NVS, a 60 s cooldown
+after a decline, a timeout or a refused card, and one LINK card at a time (a
+second ask refuses both and cools both phones; the waiting card closes as
+"Link blocked / 2nd request"). `site_link::gate` and `before_card` hold that
+order; list sizes are capped while parsing (four methods, 64 kinds) and a
+held ask is weighed by its params. The card (`oled::show_link_request`, the extension card's rows via
 `show_header_body_small`; ui-preview checks every panel and orientation) shows
 `LINK ?<site>?` (the site from the phone's label, unchecked, tail kept),
-`AS <identity>` with ` M<n>` for another master, the device's own scope line,
-and `FROM <phone's slot label>` in the hint row, with no button tags. It rides
+`AS <identity>` with ` M<n>` for another master, the device's own scope line
+(led by `DECRYPT` whenever the link may decrypt, at most 24 characters), and `FROM <phone's slot label>` in the hint row, with no button tags. It rides
 the #64 queue (`AskCard::SiteLink`) and `resolve_button_card`'s own reply
 loop; the hold re-runs the gate against the tables as they are then, checks
 the approval epoch (`approval_changed`), and only then writes the strict slot.
@@ -530,11 +533,13 @@ field, marker or codec change, nothing in PERSISTENT-STATE. Advertised by name
 in `heartwood_capabilities`' methods list. Replies differ from the design's
 draft strings in two places: a decline answers every card's `user denied`, and
 the wider refusal is the plain text with no ceiling named. IMAGE COST, M4
-release builds against `52fc099`: heltec-v4 +17,584 B (2,136,656), heltec-v3
-+18,288 B (2,133,040), T-Display +17,104 B (2,355,904). On CI's `c94112f`
-figures that leaves the V4 about 8.7 KB and the V3 about 5.0 KB over their
-2,097,152 B slot, so the Heltec images do NOT fit as built; how to make room
-is an open decision.
+release builds against `52fc099` (the M4's absolute sizes run about 30 KB
+above CI's for the same source, so only the deltas carry over): heltec-v4
++18,336 B (2,137,408), heltec-v3 +19,088 B (2,133,840); T-Display +17,104 B
+before the review fixes (2,355,904, of 3,145,728). Projected onto CI's
+`c94112f` figures that leaves the V4 about 9.4 KB and the V3 about 5.8 KB
+over their 2,097,152 B slot, so the Heltec images do NOT fit on this branch
+alone; room is being made separately (`optimize_for_size`, thin LTO).
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

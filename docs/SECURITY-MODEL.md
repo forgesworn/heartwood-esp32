@@ -336,10 +336,13 @@ anyway). Every refusal comes before the card: the identity must be served by
 an unlocked master, the asking key must already sign as it there, neither slot
 may carry a family flag, Rule D real identities are refused, and the link may
 not be wider than what the phone's own slot on that master does silently. One
-LINK card at a time; a second ask refuses both. The new slot is written only
+LINK card at a time; a second ask refuses both and cools both phones, so
+asking again cannot keep a card up. The new slot is written only
 after a 2 s hold, re-checked against the tables at the hold (a change answers
 `approval_changed`); nothing is written before it. The site name on the card
-comes from the phone and the card does not claim the board checked it.
+comes from the phone and the card does not claim the board checked it. The
+scope line is the board's own and leads with `DECRYPT` whenever the link may
+read the identity's DMs.
 
 What it adds: a stolen phone with its PIN can ask, but each link costs a hold
 on the board, and a decline or timeout cools that phone for 60 s. For 60 s

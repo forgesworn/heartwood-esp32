@@ -3774,12 +3774,14 @@ KithMoot joins a room with no further press.
 4. No press: `timeout`, no slot; a second ask within 60 s answers
    `shown recently`.
 5. Table full (16 slots on the identity's master): `no room` before the card.
-   NVS nearly full: `no room` before the card.
+   NVS nearly full: `no room` before the card. A same-label retry of the link
+   that took the last slot still answers that link (item 11).
 6. Restart between the hold and the site's first bind: the first signature
    shows `REMEMBER AS`.
 7. A second link ask while a LINK card is queued or up: the second answers
-   `another link request arrived`, and the waiting card closes as "Pairing
-   blocked / 2nd request" and answers the same.
+   `another link request arrived`, and the waiting card closes as `NOT DONE /
+   Link blocked / 2nd request` and answers the same. Both phones then answer
+   `shown recently` for 60 s, so asking again cannot keep a card up.
 8. Ceiling: with the phone's master-1 slot limited to some kinds, an any-kind
    request answers `wider than this phone's access` before the card, and a
    request inside those kinds works. An owner pairing in Extra careful style
@@ -3817,5 +3819,7 @@ KithMoot joins a room with no further press.
     and no master for one on the asking master. On every board and in both
     orientations the card stays inside the panel and the span (ui-preview
     pins this; check the T-Display, which shows no button tags on this card).
+    A link with `nip44_decrypt` shows a scope line starting `DECRYPT` (for
+    example `DECRYPT, NO SIGN, NO ASK`), whole, on every panel.
 21. Escalate or strict asking slot: refused before the card, never parked for
     a guardian verdict.

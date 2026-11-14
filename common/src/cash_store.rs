@@ -440,9 +440,9 @@ mod tests {
         // the same secrets, or every note that mint's ladder found is lost.
         // The secret is frozen from main before the port rule.
         let frozen = [
-            ("mint.example:0443", "7b99233f1427526d23b156381807fb32a8ea1cd15e1282ce709f8ae816c99fb8"),
-            ("mint.example:x", "158101d97eba97a5f106fefb67ac1463b67a2dda8a85edc94571cb474926464d"),
-            ("mint.example::1", "f37e28ea03de542df40c3981df77dde5a8126efde686f641c90a97c974695e3c"),
+            ("mint.example:0443", "7b99233f1427526d23b156381807fb32a8ea1cd15e1282ce709f8ae816c99fb8"), // pragma: allow-secret, BIP-39 test-vector seed
+            ("mint.example:x", "158101d97eba97a5f106fefb67ac1463b67a2dda8a85edc94571cb474926464d"), // pragma: allow-secret, BIP-39 test-vector seed
+            ("mint.example::1", "f37e28ea03de542df40c3981df77dde5a8126efde686f641c90a97c974695e3c"), // pragma: allow-secret, BIP-39 test-vector seed
         ];
         for (host, want) in frozen {
             let mut reg = CashRegistry::decode(&stored_entry(host, 7)).expect("an old entry still decodes");

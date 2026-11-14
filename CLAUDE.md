@@ -542,7 +542,8 @@ retry answered with no card (before room, so a lost reply is answered even
 when its link took the last slot), room in the table and NVS, a 60 s cooldown
 after any close of the phone's LINK card without a hold (a decline, its window
 or the 90 s queue TTL running out, a second ask; not the first card in a
-minute an authority change overtook, `LinkLedger::card_closed`), and one LINK card at a time (a second ask refuses both and cools
+minute an authority change overtook, counted as `refuse_stale` marks it,
+`LinkLedger::overtaken`), and one LINK card at a time (a second ask refuses both and cools
 both phones; the waiting card closes as "Link blocked / 2nd request").
 `site_link::gate`, `before_card`, `check` (card or hold) and `card_step` (a
 copy of the waiting card's own request ignored first, then the gate, then

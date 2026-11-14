@@ -362,7 +362,9 @@ refusing it. The one exception is the first card in a minute an authority
 change overtook, whose phone is told to send the request again; a second
 inside that minute cools it, so a phone that moves the epoch itself (by
 binding fresh keys to a non-signing link it made) cannot re-ask at relay
-speed. Two authority changes inside a minute, even ones other clients caused,
+speed. The close is counted when the card is marked, not when the loop later
+takes it, so a re-ask in the same relay batch as the bind already meets it:
+such a phone gets at most two cards a minute. Two authority changes inside a minute, even ones other clients caused,
 can therefore cool a phone whose cards they overtook. The cooldown is per
 phone and restarted, not stacked, so it never runs past 60 s from the last
 close, and it starts only from that phone's own ask or its own card closing:

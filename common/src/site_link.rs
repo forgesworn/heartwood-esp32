@@ -521,9 +521,20 @@ fn requests<C: WaitingCard>(card: &C) -> impl Iterator<Item = HeldLink<'_>> {
 /// (`current` is false for its epoch) refused [`LinkRefusal::SlotsChanged`],
 /// queued or on screen, so the owner is never asked to hold a card that can
 /// only be refused. A card a second ask already closed keeps that refusal.
-pub fn refuse_stale<C: WaitingCard>(cards: &mut [C], current: impl Fn(Option<u32>) -> bool) {
+/// Its phone's close is counted here, as it is marked
+/// ([`LinkLedger::overtaken`]), not when the loop later takes the card, so
+/// an ask in the same relay batch as the bind that moved the epoch already
+/// meets the cooldown it earned.
+pub fn refuse_stale<C: WaitingCard>(
+    cards: &mut [C],
+    current: impl Fn(Option<u32>) -> bool,
+    ledger: &mut LinkLedger,
+    now_ms: u64,
+) {
     for card in cards.iter_mut() {
-        if is_link(card) && card.link_refusal().is_none() && requests(card).any(|h| !current(h.epoch)) {
+        let Some(first) = card.held(0) else { continue };
+        if card.link_refusal().is_none() && requests(card).any(|h| !current(h.epoch)) {
+            ledger.overtaken(first.client_hex, now_ms);
             card.refuse_link(LinkRefusal::SlotsChanged);
         }
     }
@@ -546,14 +557,17 @@ pub enum Waiting {
 /// request id, one answer); a card the slot tables closed does not count as
 /// [`Waiting::Another`], so it is answered `approval_changed` and not taken
 /// down as a second ask's.
+#[allow(clippy::too_many_arguments)]
 pub fn against_waiting<C: WaitingCard>(
     cards: &mut [C],
     current: impl Fn(Option<u32>) -> bool,
+    ledger: &mut LinkLedger,
+    now_ms: u64,
     client_hex: &str,
     id: &str,
     params: &[Value],
 ) -> Waiting {
-    refuse_stale(cards, current);
+    refuse_stale(cards, current, ledger, now_ms);
     let mut another = false;
     for card in cards.iter() {
         for h in requests(card) {
@@ -1116,15 +1130,25 @@ impl LinkLedger {
     }
 
     /// A LINK card closed (design 4.4): anything but a hold cools its
-    /// client, except the first card in a minute the slot tables closed,
-    /// whose phone is told to send the request again. A second inside the
-    /// minute cools it: otherwise a phone that moves the epoch itself (by
-    /// binding fresh keys to a non-signing link) could re-ask at relay speed.
+    /// client. A card the slot tables closed was counted when it was marked
+    /// ([`LinkLedger::overtaken`]), so its close adds nothing.
     pub fn card_closed(&mut self, client: &str, close: LinkClose, now_ms: u64) {
         match close {
-            LinkClose::Held => {}
-            LinkClose::Refused(LinkRefusal::SlotsChanged) if self.stale_pass(client, now_ms) => {}
-            _ => self.start_cooldown(client, now_ms),
+            LinkClose::Held | LinkClose::Refused(LinkRefusal::SlotsChanged) => {}
+            LinkClose::Declined | LinkClose::TimedOut | LinkClose::Refused(LinkRefusal::AnotherLink) => {
+                self.start_cooldown(client, now_ms)
+            }
+        }
+    }
+
+    /// A LINK card of this client's the slot tables overtook, as
+    /// [`refuse_stale`] marks it: the first in a minute is uncooled, as its
+    /// phone is told to send the request again; a second inside the minute
+    /// cools it, as otherwise a phone that moves the epoch itself (by binding
+    /// fresh keys to a non-signing link) could re-ask at relay speed.
+    pub fn overtaken(&mut self, client: &str, now_ms: u64) {
+        if !self.stale_pass(client, now_ms) {
+            self.start_cooldown(client, now_ms);
         }
     }
 
@@ -1770,7 +1794,9 @@ mod tests {
     fn a_copy_of_the_waiting_request_is_ignored_and_any_other_ask_refuses_both() {
         let params = vec![serde_json::json!({"identity": "33"})];
         let other = vec![serde_json::json!({"identity": "44"})];
-        let at = |mut cards: Vec<Card>, client, id, p: &[Value]| against_waiting(&mut cards, current, client, id, p);
+        let at = |mut cards: Vec<Card>, client, id, p: &[Value]| {
+            against_waiting(&mut cards, current, &mut LinkLedger::new(), 0, client, id, p)
+        };
         assert_eq!(at(vec![], PHONE, "1", &params), Waiting::Nothing);
         assert_eq!(at(vec![other_card(7)], PHONE, "1", &params), Waiting::Nothing);
         assert_eq!(at(vec![link(PHONE, "1", &params, 7)], PHONE, "1", &params), Waiting::Copy);
@@ -1813,29 +1839,30 @@ mod tests {
             Card { refused: Some(LinkRefusal::AnotherLink), ..link(SITE, "8", &params, 6) },
             link(SITE, "5", &params, 7),
         ];
-        refuse_stale(&mut cards, current);
+        let mut ledger = LinkLedger::new();
+        refuse_stale(&mut cards, current, &mut ledger, 1_000);
         assert_eq!(cards[0].refused, Some(LinkRefusal::SlotsChanged));
         assert_eq!(cards[1].refused, None, "only LINK cards");
         assert_eq!(cards[2].refused, Some(LinkRefusal::AnotherLink), "the first refusal stands");
         assert_eq!(cards[3].refused, None, "a current card stays");
         // Any stale request on the card closes it.
         let mut two = Card { asks: vec![("1", params.clone(), Some(7)), ("2", params.clone(), None)], ..link(SITE, "1", &params, 7) };
-        refuse_stale(core::slice::from_mut(&mut two), current);
+        refuse_stale(core::slice::from_mut(&mut two), current, &mut ledger, 1_000);
         assert_eq!(two.refused, Some(LinkRefusal::SlotsChanged));
 
         // A create set against a dead card alone sees nothing to refuse,
         // and the dead card is marked as it is set against it, so it is
         // answered `approval_changed` and not "2nd request".
         let mut dead = vec![link(SITE, "9", &params, 6), other_card(7)];
-        assert_eq!(against_waiting(&mut dead, current, PHONE, "1", &params), Waiting::Nothing);
+        assert_eq!(against_waiting(&mut dead, current, &mut LinkLedger::new(), 1_000, PHONE, "1", &params), Waiting::Nothing);
         assert_eq!(dead[0].refused, Some(LinkRefusal::SlotsChanged));
         // A copy of a dead card's own request is still a copy: one request
         // id, one answer.
         let mut dead = vec![link(PHONE, "1", &params, 6)];
-        assert_eq!(against_waiting(&mut dead, current, PHONE, "1", &params), Waiting::Copy);
+        assert_eq!(against_waiting(&mut dead, current, &mut LinkLedger::new(), 1_000, PHONE, "1", &params), Waiting::Copy);
         // Beside a live card, the live one is the second ask's.
         let mut both = vec![link(SITE, "9", &params, 6), link(SITE, "5", &params, 7)];
-        assert_eq!(against_waiting(&mut both, current, PHONE, "1", &params), Waiting::Another);
+        assert_eq!(against_waiting(&mut both, current, &mut LinkLedger::new(), 1_000, PHONE, "1", &params), Waiting::Another);
     }
 
     #[test]
@@ -1884,13 +1911,55 @@ mod tests {
     }
 
     #[test]
-    fn a_phone_gets_one_uncooled_slots_changed_close_a_minute() {
-        let stale = LinkClose::Refused(LinkRefusal::SlotsChanged);
+    fn a_bind_and_a_re_ask_in_one_batch_get_the_phone_two_cards_a_minute() {
+        // The phone's card waits under epoch 6; each fresh-key bind to its
+        // non-signing link moves the epoch, and the re-ask is handled in
+        // the same relay batch, before the loop takes the dead card.
+        let params = vec![serde_json::json!({"identity": "33"})];
+        let asking = owner(Style::Everyday);
+        let req = request(PERSONA, vec![]);
+        let table = vec![asking.clone()];
         let mut ledger = LinkLedger::new();
-        ledger.card_closed(PHONE, stale, 1_000);
+        let mut cards = vec![link(PHONE, "1", &params, 6)];
+        let ask = |cards: &mut Vec<Card>, ledger: &mut LinkLedger, epoch: u32, id: &str, now: u64| {
+            let waiting = against_waiting(cards, |e| e == Some(epoch), ledger, now, PHONE, id, &params);
+            card_step(waiting, || {
+                before_card(Some(&asking), PHONE, served(0, &table), &req, ledger, now, None).map(|g| (g, ()))
+            })
+            .map(|step| matches!(step, CardStep::Show(..)))
+        };
+        // Bind 1 (epoch 7) and re-ask: card 1 dies uncooled, card 2 goes up.
+        assert_eq!(ask(&mut cards, &mut ledger, 7, "2", 1_000), Ok(true));
+        assert_eq!(cards[0].refused, Some(LinkRefusal::SlotsChanged));
+        cards.push(link(PHONE, "2", &params, 7));
+        // Bind 2 (epoch 8) and re-ask, still before any card is taken:
+        // card 2 dies and cools the phone, so no third card.
+        assert_eq!(ask(&mut cards, &mut ledger, 8, "3", 1_100), Err(LinkError::ShownRecently));
+        assert_eq!(cards[1].refused, Some(LinkRefusal::SlotsChanged));
+        // The loop then takes both dead cards: nothing is counted twice,
+        // and the cooldown runs from the second mark.
+        for card in cards.drain(..) {
+            ledger.card_closed(card.client, LinkClose::Refused(card.refused.unwrap()), 2_000);
+        }
+        assert!(ledger.cooling(PHONE, 61_099) && !ledger.cooling(PHONE, 61_100));
+        // A copy of a dead card's own request is still a copy, answered
+        // once (by its card's approval_changed), and counts nothing.
+        let mut ledger = LinkLedger::new();
+        let mut dead = vec![link(PHONE, "1", &params, 6)];
+        let waiting = against_waiting(&mut dead, current, &mut ledger, 1_000, PHONE, "1", &params);
+        assert_eq!(waiting, Waiting::Copy);
+        let again = against_waiting(&mut dead, current, &mut ledger, 1_001, PHONE, "1", &params);
+        assert_eq!(again, Waiting::Copy);
+        assert!(!ledger.cooling(PHONE, 1_001), "one dead card is one stale close");
+    }
+
+    #[test]
+    fn a_phone_gets_one_uncooled_slots_changed_close_a_minute() {
+        let mut ledger = LinkLedger::new();
+        ledger.overtaken(PHONE, 1_000);
         assert!(!ledger.cooling(PHONE, 1_000), "the first is told to ask again");
         // A second inside the minute cools it, and its next ask waits.
-        ledger.card_closed(PHONE, stale, 60_999);
+        ledger.overtaken(PHONE, 60_999);
         assert!(ledger.cooling(PHONE, 120_998) && !ledger.cooling(PHONE, 120_999));
         let asking = owner(Style::Everyday);
         let req = request(PERSONA, vec![]);
@@ -1900,30 +1969,30 @@ mod tests {
         assert!(matches!(ask(&ledger, 121_000), Ok(Gate::Plan(_))));
         // Once the minute is up the pass is back.
         let mut ledger = LinkLedger::new();
-        ledger.card_closed(PHONE, stale, 1_000);
-        ledger.card_closed(PHONE, stale, 61_000);
+        ledger.overtaken(PHONE, 1_000);
+        ledger.overtaken(PHONE, 61_000);
         assert!(!ledger.cooling(PHONE, 61_000));
         // Another phone's spends nothing of this phone's.
         let mut ledger = LinkLedger::new();
-        ledger.card_closed(SITE, stale, 1_000);
-        ledger.card_closed(PHONE, stale, 2_000);
+        ledger.overtaken(SITE, 1_000);
+        ledger.overtaken(PHONE, 2_000);
         assert!(!ledger.cooling(PHONE, 2_000) && !ledger.cooling(SITE, 2_000));
         // With every pass live and the list full, a phone it cannot
         // remember cools: no pass is handed back by forgetting one.
         let mut ledger = LinkLedger::new();
         let client = |i: u64| format!("{i:064x}");
         for i in 0..MAX_COOLDOWNS as u64 {
-            ledger.card_closed(&client(i), stale, 1_000 + i);
+            ledger.overtaken(&client(i), 1_000 + i);
             assert!(!ledger.cooling(&client(i), 1_000 + i));
         }
-        ledger.card_closed(PHONE, stale, 2_000);
+        ledger.overtaken(PHONE, 2_000);
         assert!(ledger.cooling(PHONE, 2_000));
         for i in 0..MAX_COOLDOWNS as u64 {
-            ledger.card_closed(&client(i), stale, 3_000);
+            ledger.overtaken(&client(i), 3_000);
             assert!(ledger.cooling(&client(i), 3_000), "{i} kept its spent pass");
         }
         // Expired passes make room.
-        ledger.card_closed(SITE, stale, 70_000);
+        ledger.overtaken(SITE, 70_000);
         assert!(!ledger.cooling(SITE, 70_000));
     }
 

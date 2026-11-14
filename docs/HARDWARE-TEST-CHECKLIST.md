@@ -3825,7 +3825,8 @@ KithMoot joins a room with no further press.
     card closes at once as `NOT DONE / Link blocked / Slots changed`, answers
     `approval_changed`, and no slot is made. The phone is not cooled: sending
     again raises a fresh card. A second such close inside the minute does
-    cool it (`shown recently` for 60 s). A label rename on that master does
+    cool it (`shown recently` for 60 s), even when the bind that moved the
+    epoch and the re-ask arrive together: two cards a minute, never three. A label rename on that master does
     not close the card.
 20. The `AS` line shows ` M1` for an identity on master 1 asked from master 0,
     and no master for one on the asking master. On every board and in both

@@ -38,8 +38,8 @@ pub(crate) fn take_on_bind(master_slot: u8, slot_index: u8, secret: &str) -> Opt
     links().take_on_bind(master_slot, slot_index, secret, crate::uptime_ms())
 }
 
-/// A LINK card closed: anything but the hold cools its phone, but for one
-/// card a minute the slot tables closed (design 4.4,
+/// A LINK card closed: anything but the hold cools its phone; a card the
+/// slot tables closed was counted when it was marked (design 4.4,
 /// [`sl::LinkLedger::card_closed`]).
 pub(super) fn card_closed(client_hex: &str, close: sl::LinkClose) {
     links().card_closed(client_hex, close, crate::uptime_ms());
@@ -137,7 +137,9 @@ fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &
     let create = sl::parse_create(&request.params).map_err(refusal)?;
     let engine = &*ctx.policy_engine;
     let current = |epoch| engine.approval_is_current(epoch);
-    let waiting = sl::against_waiting(&mut ctx.button_cards, current, client_hex, &request.id, &request.params);
+    let now = crate::uptime_ms();
+    let waiting =
+        sl::against_waiting(&mut ctx.button_cards, current, &mut links(), now, client_hex, &request.id, &request.params);
     let step = sl::card_step(waiting, || {
         gate(ctx, &create, slot, client_hex, sl::Check::Card).map(|(verdict, label, from)| (verdict, (label, from)))
     });
@@ -172,11 +174,11 @@ fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &
 
 /// LINK cards the slot tables overtook (an authority change on any master's
 /// slots moves the approval epoch) are refused `approval_changed` as soon as
-/// the loop sees them, queued or on screen, not only at the hold
-/// ([`sl::refuse_stale`]).
+/// the loop sees them, queued or on screen, not only at the hold, and their
+/// phones' closes counted then ([`sl::refuse_stale`]).
 pub(super) fn refuse_stale(ctx: &mut SignCtx) {
     let engine = &*ctx.policy_engine;
-    sl::refuse_stale(&mut ctx.button_cards, |epoch| engine.approval_is_current(epoch));
+    sl::refuse_stale(&mut ctx.button_cards, |epoch| engine.approval_is_current(epoch), &mut links(), crate::uptime_ms());
 }
 
 impl sl::WaitingCard for super::ButtonCard {

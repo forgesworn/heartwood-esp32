@@ -1403,6 +1403,7 @@ fn main() {
                         // here too (review round 3, F3), as in the WiFi loop.
                         false,
                         &nip46_handler::is_closed_bundle_copy,
+                        false,
                     );
                 }
             }

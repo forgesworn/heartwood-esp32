@@ -49,6 +49,10 @@ ALLOW_HEX = {
     # Dummy note-inventory commitment used inside JSON fixtures in
     # common/src/backup.rs tests: all ones, not a key, hash or secret.
     "1111111111111111111111111111111111111111111111111111111111111111",
+    # Dummy identity and stand-in key in common/src/site_link.rs tests and its
+    # placeholder constant: repeated digits, not a key, hash or secret.
+    "3333333333333333333333333333333333333333333333333333333333333333",
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     # BIP-32 published test vector 1 (the spec's own chain, seed 000102..0f).
     # Walked in common/src/cash.rs to prove the UNHARDENED step, which no other
     # path in this firmware exercises.

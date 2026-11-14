@@ -267,6 +267,90 @@ fn draw_sign<D: DrawTarget<Color = Rgb565>>(
     draw_countdown(d, &l, secs, total);
 }
 
+/// A site link's LINK card (mirrors `oled::show_link_request`, which draws
+/// on the extension card's rows, `FROM` where that card's hint goes). `part`
+/// draws one piece alone for the geometry test (0 header, 1 AS, 2 scope,
+/// 3 FROM, 4 countdown); `None` draws the card.
+fn draw_link<D: DrawTarget<Color = Rgb565>>(
+    d: &mut D,
+    card: &heartwood_common::site_link::LinkCard,
+    secs: u32,
+    part: Option<usize>,
+) {
+    let l = layout_of(d);
+    let [heading, as_line, scope, from] = link_lines(&l, card);
+    let show = |n: usize| part.is_none_or(|p| p == n);
+    if show(0) {
+        header(d, &l, &heading);
+    }
+    if show(1) {
+        Text::new(&as_line, Point::new(l.sx(2), l.sy(25)), style(l.font_body(), FG)).draw(d).ok();
+    }
+    if show(2) {
+        Text::new(&scope, Point::new(l.sx(2), l.sy(35)), style(l.font_small(), FG)).draw(d).ok();
+    }
+    if show(3) {
+        Text::new(&from, Point::new(l.sx(2), l.sy(45)), style(l.font_small(), ACCENT)).draw(d).ok();
+    }
+    if show(4) {
+        draw_countdown(d, &l, secs, 30);
+    }
+}
+
+/// The LINK card's lines as the firmware cuts them: to the span inside the
+/// margins, per row font.
+fn link_lines(l: &Layout, card: &heartwood_common::site_link::LinkCard) -> [String; 4] {
+    card.lines(
+        l.span_chars(None, l.font_header()),
+        l.span_chars(None, l.font_body()),
+        l.span_chars(None, l.font_small()),
+    )
+}
+
+/// LINK cards for the preview and its tests: an everyday one, the longest
+/// of everything, and one for an identity on another master.
+fn sample_link_cards() -> [(&'static str, heartwood_common::site_link::LinkCard); 4] {
+    use heartwood_common::policy::validate_exact_slot_policy;
+    use heartwood_common::site_link::link_card;
+    let sign = |kinds: Vec<u64>| {
+        validate_exact_slot_policy(
+            vec!["get_public_key".into(), "sign_event".into(), "nip44_encrypt".into(), "nip44_decrypt".into()],
+            kinds,
+            true,
+        )
+        .expect("a valid link policy")
+    };
+    let long = "W".repeat(64);
+    [
+        ("link", link_card("mysignet:kithmoot.com:1a2b3c4d", "master-1", 0, 0, &sign(vec![1, 7, 22242]), "My Signet phone")),
+        (
+            "link-longest",
+            link_card(
+                "mysignet:a-very-long-sign-in-host.example.co.uk:1a2b3c4d",
+                &long,
+                7,
+                0,
+                &sign(vec![]),
+                &long,
+            ),
+        ),
+        ("link-other-master", link_card("mysignet:kithmoot.com:1a2b3c4d", "persona", 3, 0, &sign(vec![1]), "phone")),
+        // A link that only reads DMs, silently: the scope says so first.
+        (
+            "link-decrypt-only",
+            link_card(
+                "mysignet:kithmoot.com:1a2b3c4d",
+                "persona",
+                0,
+                0,
+                &validate_exact_slot_policy(vec!["get_public_key".into(), "nip44_decrypt".into()], vec![], true)
+                    .expect("a valid link policy"),
+                "phone",
+            ),
+        ),
+    ]
+}
+
 /// Countdown bar: muted track + proportional fill coloured by urgency
 /// (mirrors `oled::draw_countdown_bar`).
 fn draw_countdown<D: DrawTarget<Color = Rgb565>>(d: &mut D, l: &Layout, secs: u32, total: u32) {
@@ -927,6 +1011,15 @@ fn longest_pair_words() -> [&'static str; heartwood_common::owner_pairing::PAIR_
 /// the firmware's own words.
 const FULL_ACCESS_BLOCKED: (&str, &str) = ("Pairing blocked", "2nd request");
 
+/// A LINK card a second link ask closed, and one the slot tables overtook
+/// (`show_card_blocked` in relay.rs, site links design 4.4): the same
+/// refusal in its own words, `common::site_link::LinkClose::blocked`'s.
+fn link_blocked() -> [(&'static str, (&'static str, &'static str)); 2] {
+    use heartwood_common::site_link::{LinkClose, LinkRefusal};
+    let words = |why| LinkClose::Refused(why).blocked().expect("a refused LINK card draws a refusal");
+    [("link-blocked", words(LinkRefusal::AnotherLink)), ("link-stale", words(LinkRefusal::SlotsChanged))]
+}
+
 fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565>)) {
     let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
     d.clear(BG).ok();
@@ -1016,6 +1109,9 @@ fn main() {
         render(&format!("login-longest-{b}"), w, h, |d| {
             draw_sign(d, "WWWWWWWWWWWWWWWWWWWW", "sign_event", 22242, "Log in to my-node", Some("88888888"), None, 18, 30)
         });
+        for (name, card) in sample_link_cards() {
+            render(&format!("{name}-{b}"), w, h, |d| draw_link(d, &card, 18, None));
+        }
         render(&format!("sign-urgent-{b}"), w, h, |d| {
             draw_sign(d, "primal", "sign_event", 30078, "Sync app settings", None, None, 4, 30)
         });
@@ -1025,6 +1121,9 @@ fn main() {
         render(&format!("full-access-blocked-{b}"), w, h, |d| {
             draw_status_card(d, "NOT DONE", FULL_ACCESS_BLOCKED.0, FULL_ACCESS_BLOCKED.1, DANGER)
         });
+        for (name, (title, why)) in link_blocked() {
+            render(&format!("{name}-{b}"), w, h, |d| draw_status_card(d, "NOT DONE", title, why, DANGER));
+        }
         // The recovery walkthrough at its three captions, on every panel: the
         // caption sits between the rule and the word and must clear both.
         render(&format!("recovery-notice-{b}"), w, h, |d| {
@@ -1230,18 +1329,31 @@ mod error_card_tests {
         assert!(unopened < silent, "a FULL ACCESS card expired in the queue would close without a refusal");
         assert!(!body.contains("opened_at.is_some()"), "the refusal is drawn only for an opened card");
 
-        let start = relay.find("\nfn show_full_access_blocked(").expect("show_full_access_blocked");
-        let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
-        let call = body.find("show_card_not_done(").expect("the refusal is a NOT DONE card");
-        let words = string_literals(&body[call..]);
-        assert_eq!(&words[..2], &[super::FULL_ACCESS_BLOCKED.0.to_string(), super::FULL_ACCESS_BLOCKED.1.to_string()]);
+        // A LINK card's refusal (site links design 4.4) has its own arm,
+        // before the FULL ACCESS one, so its words are its own.
+        let link = body
+            .find("CardTick::Refused(_) if blocked.is_some() => {")
+            .expect("a refused LINK card draws its own refusal");
+        assert!(link < refused, "a refused LINK card would draw the FULL ACCESS refusal");
+        assert!(body[link..refused].contains("show_card_blocked(ctx, title, why);"));
 
-        let (title, hint) = super::FULL_ACCESS_BLOCKED;
-        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
-            let l = Layout::new(w, h);
-            let available = l.w - l.sx(4);
-            assert!(title.len() as i32 * Layout::glyph_w(l.font_body()) <= available, "{title:?} drops to the small font on {w}x{h}");
-            assert!(hint.len() as i32 * Layout::glyph_w(l.font_small()) <= available, "{hint:?} clips on {w}x{h}");
+        let fn_body = |name: &str| {
+            let start = relay.find(&format!("\nfn {name}(")).unwrap_or_else(|| panic!("{name}"));
+            relay[start..start + relay[start..].find("\n}\n").unwrap()].to_string()
+        };
+        let words = string_literals(&fn_body("show_full_access_blocked"));
+        assert_eq!(words, [super::FULL_ACCESS_BLOCKED.0.to_string(), super::FULL_ACCESS_BLOCKED.1.to_string()]);
+        let shared = fn_body("show_card_blocked");
+        assert!(shared.contains("show_card_not_done(ctx, title, why);"), "the refusal is a NOT DONE card");
+
+        let link_words = super::link_blocked().map(|(_, words)| words);
+        for (title, hint) in [super::FULL_ACCESS_BLOCKED].into_iter().chain(link_words) {
+            for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+                let l = Layout::new(w, h);
+                let available = l.w - l.sx(4);
+                assert!(title.len() as i32 * Layout::glyph_w(l.font_body()) <= available, "{title:?} drops to the small font on {w}x{h}");
+                assert!(hint.len() as i32 * Layout::glyph_w(l.font_small()) <= available, "{hint:?} clips on {w}x{h}");
+            }
         }
     }
 
@@ -2058,5 +2170,154 @@ mod full_access_card_tests {
                 assert!(allowed_callers.contains(&f.as_str()), "{path}: {f} draws the FULL ACCESS bar");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod link_card_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const PANELS: [(u32, u32); 4] = [(128, 64), (240, 135), (172, 320), (320, 172)];
+
+    fn lit(draw: impl Fn(&mut SimulatorDisplay<Rgb565>), w: u32, h: u32) -> Vec<Point> {
+        let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
+        d.clear(BG).ok();
+        draw(&mut d);
+        d.bounding_box().points().filter(|p| d.get_pixel(*p) != BG).collect()
+    }
+
+    /// Site links design 4.4: every line of the LINK card, the longest of
+    /// everything included, is drawn whole inside the panel and the margins
+    /// on every panel and orientation, and no two pieces meet.
+    #[test]
+    fn the_link_card_fits_every_panel_and_never_overprints_itself() {
+        for (w, h) in PANELS {
+            let l = Layout::new(w as i32, h as i32);
+            let (left, right) = l.text_span(None);
+            for (name, card) in sample_link_cards() {
+                let pieces: Vec<(usize, Vec<Point>)> =
+                    (0..5).map(|n| (n, lit(|d| draw_link(d, &card, 18, Some(n)), w, h))).collect();
+                for (n, points) in &pieces {
+                    assert!(!points.is_empty(), "{w}x{h} {name}: piece {n} drew nothing");
+                    assert!(
+                        points.iter().all(|p| p.y >= 0 && p.y < h as i32 && p.x >= 0 && p.x < w as i32),
+                        "{w}x{h} {name}: piece {n} leaves the panel"
+                    );
+                    // The header's rule runs edge to edge; its text, and every
+                    // other line, stays inside the margins.
+                    if (1..4).contains(n) {
+                        assert!(
+                            points.iter().all(|p| p.x >= left && p.x < right),
+                            "{w}x{h} {name}: piece {n} leaves the margins"
+                        );
+                    }
+                }
+                let sets: Vec<HashSet<Point>> = pieces.iter().map(|(_, p)| p.iter().copied().collect()).collect();
+                for i in 0..pieces.len() {
+                    for j in i + 1..pieces.len() {
+                        let clash = pieces[i].1.iter().find(|p| sets[j].contains(p));
+                        assert!(clash.is_none(), "{w}x{h} {name}: pieces {i} and {j} meet at {clash:?}");
+                    }
+                }
+                let [heading, as_line, scope, from] = link_lines(&l, &card);
+                let glyph = |font| Layout::glyph_w(font);
+                assert!(l.sx(2) + heading.len() as i32 * glyph(l.font_header()) <= right, "{w}x{h} {name}: {heading}");
+                assert!(l.sx(2) + as_line.len() as i32 * glyph(l.font_body()) <= right, "{w}x{h} {name}: {as_line}");
+                for line in [&scope, &from] {
+                    assert!(l.sx(2) + line.len() as i32 * glyph(l.font_small()) <= right, "{w}x{h} {name}: {line}");
+                }
+                // The site is the phone's word, never shown as checked.
+                assert!(heading.starts_with("LINK ?") && heading.ends_with('?'), "{w}x{h} {name}: {heading}");
+                assert!(as_line.starts_with("AS "), "{w}x{h} {name}: {as_line}");
+                assert!(from.starts_with("FROM "), "{w}x{h} {name}: {from}");
+                if name == "link-other-master" {
+                    assert!(as_line.ends_with(" M3"), "{w}x{h}: {as_line}");
+                }
+                // The scope is drawn whole: a link that may decrypt says so
+                // on every panel.
+                assert_eq!(scope, card.scope, "{w}x{h} {name}");
+                assert!(scope.starts_with("DECRYPT"), "{w}x{h} {name}: {scope}");
+            }
+        }
+    }
+
+    /// What of the site-link glue genuinely cannot move into `common`
+    /// (site links design 4.2 to 4.4); the decisions themselves are
+    /// `common::site_link`'s, with their own tests. Every LINK card's close
+    /// reaches the cooldown in the helper that takes it out of the queue,
+    /// before `resolve_button_card` does anything else; stale LINK cards are
+    /// refused before the refusal scan; the cable NACKs a site-link copy
+    /// before anything is dispatched, in the WiFi loop only; and only a
+    /// slot's first-ever bind spends a link's identity grant.
+    #[test]
+    fn the_site_link_glue_keeps_its_order() {
+        let src = |path: &str| {
+            std::fs::read_to_string(format!("{}/../firmware/src/{path}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        };
+        let body_of = |src: &str, name: &str| {
+            let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("{name}"));
+            src[start..start + src[start..].find("\n}\n").unwrap()].to_string()
+        };
+        let relay = src("relay.rs");
+        let take = body_of(&relay, "take_closed_card");
+        let removed = take.find("let card = ctx.button_cards.remove(index);").expect("the card is taken");
+        let closed = take.find("site_link::card_closed(&card.key.client_hex, close);").expect("the LINK cooldown");
+        assert!(removed < closed && !take[removed..].contains("return"), "a LINK card could close without cooling its phone");
+        let resolve = body_of(&relay, "resolve_button_card");
+        let first = resolve.find(" = take_closed_card(ctx, index, outcome) else {").expect("taken by the helper");
+        assert!(!resolve[..first].contains("button_cards"), "the card is touched before the helper takes it");
+        let service = body_of(&relay, "service_button_cards");
+        let stale = service.find("site_link::refuse_stale(ctx);").expect("stale LINK cards are refused");
+        assert!(stale < service.find("card.refused.is_some()").expect("the refusal scan"));
+        assert!(relay.contains("&is_copy,\n                        true,\n"), "the WiFi loop NACKs a cable site link");
+        // The USB-bridged loop dispatches a cable site link (its RelayOnly
+        // answer is the only one), and never passes `true`.
+        let main = src("main.rs");
+        assert_eq!(main.matches("transport::handle_encrypted_request(").count(), 1);
+        let call = &main[main.find("transport::handle_encrypted_request(").unwrap()..];
+        let call = &call[..call.find(");").expect("the call's end")];
+        assert!(
+            call.trim_end().ends_with("&nip46_handler::is_closed_bundle_copy,\n                        false,"),
+            "the USB-bridged loop must pass relay_loop false"
+        );
+        assert!(!call.contains("true"), "the USB-bridged loop passes no true");
+
+        let transport = body_of(&src("transport.rs"), "handle_encrypted_request");
+        let nack = transport.find("site_link::cable_nacks(&request.method, relay_loop)").expect("the cable NACK");
+        assert!(nack < transport.find("if is_waiting_copy(").expect("the copy check"));
+        assert!(nack < transport.find("nip46_handler::handle_parsed_request(").expect("the dispatch"));
+        // The cable NACK is empty and unlogged, so neither log names the method.
+        let block = &transport[nack..];
+        let block = &block[..block.find("\n    }\n").expect("the NACK block's end")];
+        assert!(
+            block.ends_with("{\n        protocol::write_frame(usb, FRAME_TYPE_NACK, &[]);\n        return;"),
+            "the cable site-link NACK must be empty and return at once"
+        );
+        assert!(!block.contains("log::"), "the cable site-link NACK must not be logged");
+
+        let handler = src("nip46_handler.rs");
+        assert_eq!(handler.matches("site_link::take_on_bind(").count(), 1);
+        let hook = handler.find("site_link::take_on_bind(").unwrap();
+        let first_use = handler.find("ConnectPubkeyClass::FirstUse =>").expect("the first-use arm");
+        let unknown = handler.find("ConnectPubkeyClass::Unknown =>").expect("the arm after it");
+        assert!(first_use < hook && hook < unknown, "a link's grant must be spent only by a first-ever bind");
+        assert!(handler.find("ConnectPubkeyClass::Known =>").unwrap() < first_use);
+    }
+
+    /// The firmware draws the card with `show_link_request` from the card's
+    /// own lines, at the extension card's rows; this pins the rows the mirror
+    /// copies, so the two cannot drift.
+    #[test]
+    fn the_mirror_uses_the_firmware_rows() {
+        let oled = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../firmware/src/oled.rs")).unwrap();
+        let start = oled.find("\nfn show_header_body_small(").expect("show_header_body_small");
+        let end = start + oled[start + 1..].find("\n}\n").expect("its end");
+        let body = &oled[start..end];
+        for row in ["l.sy(10)", "l.sy(14)", "l.sy(25)", "l.sy(35)", "l.sy(45)", "draw_countdown_bar(display, seconds_remaining, 30)"] {
+            assert!(body.contains(row), "show_header_body_small no longer has {row}");
+        }
+        let link = oled.find("pub fn show_link_request(").expect("show_link_request");
+        assert!(oled[link..].contains("l.span_chars(None, l.font_header())"), "the link card lines are cut to the span");
     }
 }

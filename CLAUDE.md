@@ -517,6 +517,68 @@ could not be sent, read the state before retrying" for a mutating method
 that returned a result, and the old text for a read, a refusal or a failure.
 Both keep the "device low on memory" prefix Sapwood matches.
 
+Site links made with a hold (2026-11-14, checklist section 43, NOT YET
+BENCH-RUN; design: signet-plans "Site links made by the Heartwood, with a
+hold"). A phone paired with full access can ask the board for a site's
+`bunker://` sign-in link with no operator key: `heartwood_link_create
+{identity, label, policy: {allowed_methods, allowed_kinds, auto_approve}}`
+answers `create_client_v2`'s fields (less `note`) after a 2 s hold, and
+`heartwood_link_status` / `heartwood_link_revoke` take `{identity, slot_index,
+expected_secret_fingerprint}` or, for a link this phone made inside the last
+minute, `{identity, label}`. Relay only: `relay.rs` answers them in
+`handle_nip46_event` before any tier, policy or escalate routing
+(`firmware/src/relay/site_link.rs`), and `nip46_handler::dispatch` refuses
+them on the USB-bridged path. In the WiFi loop a cable copy (heartwoodd
+bridging the same request) is NACKed before dispatch
+(`site_link::cable_nacks`), so nothing is published ahead of the relay
+card. All rules are pure and
+host-tested in `common/src/site_link.rs`, in the design's order, every one
+before the card: an owner pairing with no family flag asking
+(`owner_pairing::is_owner_pairing`), an identity served by an unlocked master,
+the asking key already signing as it there, no family flag on that slot, no
+Rule D real identity, the policy within what that slot does silently
+(`within_phone`, the policy evaluator itself), an idempotent same-label
+retry answered with no card (before room, so a lost reply is answered even
+when its link took the last slot), room in the table and NVS, a 60 s cooldown
+after any close of the phone's LINK card without a hold (a decline, its window
+or the 90 s queue TTL running out, a second ask; not the first card in a
+minute an authority change overtook, counted as `refuse_stale` marks it,
+`LinkLedger::overtaken`), and one LINK card at a time (a second ask refuses both and cools
+both phones; the waiting card closes as "Link blocked / 2nd request").
+`site_link::gate`, `before_card`, `check` (card or hold) and `card_step` (a
+copy of the waiting card's own request ignored first, then the gate, then
+refuse both) hold that order; `against_waiting` (stale cards refused first,
+and not counted as a second ask), `refuse_both` and `refuse_stale` work on the
+queue through the `WaitingCard` trait; a refused card carries a typed
+`LinkRefusal`, which draws its words (`LinkClose::blocked`); `ask_weight` its queue weight (params plus 256 B); list sizes
+are capped while parsing (four methods, 64 kinds). The firmware glue only
+reads tables and the queue; `take_closed_card` cools before
+`resolve_button_card` does anything else. The card (`oled::show_link_request`, the extension card's rows via
+`show_header_body_small`; ui-preview checks every panel and orientation) shows
+`LINK ?<site>?` (the site from the phone's label, unchecked, tail kept),
+`AS <identity>` with ` M<n>` for another master, the device's own scope line
+(led by `DECRYPT` whenever the link may decrypt, at most 24 characters), and `FROM <phone's slot label>` in the hint row, with no button tags. It rides
+the #64 queue (`AskCard::SiteLink`) and `resolve_button_card`'s own reply
+loop. An authority change on any master's slots (a new key, a revoke, a
+policy change; a label rename, for one, is not) moves the approval
+epoch, and a LINK card it overtook is refused `approval_changed` while it
+waits (`site_link::refuse_stale`, drawn "Link blocked / Slots changed", no
+cooldown the first time in a minute); the hold checks the epoch again, re-runs the gate against the
+tables as they are then, and only then writes the strict slot.
+For 60 s after the hold the first key to bind that slot also gets the identity
+grant (the bind hook in `nip46_handler`, `LinkLedger::take_on_bind`, same
+credential only). The ledger and cooldowns are a RAM-only static: no slot
+field, marker or codec change, nothing in PERSISTENT-STATE. Advertised by name
+in `heartwood_capabilities`' methods list. Replies differ from the design's
+draft strings in two places: a decline answers every card's `user denied`, and
+the wider refusal is the plain text with no ceiling named. IMAGE COST, M4
+release builds against `52fc099` (the M4's absolute sizes run about 30 KB
+above CI's for the same source, so only the deltas carry over): heltec-v4
++20,080 B, heltec-v3 +20,880 B, T-Display +19,536 B (of 3,145,728) before the
+merge of main; the third review round added V4 +112 B and V3 +160 B on top
+of that merge. The Heltec images do NOT fit on this branch alone: read the
+branch's CI sizes, and make room, before this merges.
+
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 
 ## Build & flash

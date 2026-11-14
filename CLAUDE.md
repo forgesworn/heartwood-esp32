@@ -82,7 +82,17 @@ at the spend transition, and every creation path (both mint calls, receive,
 import and claim) makes room out of the oldest spent record first, so the
 locker cannot fill with dead records and no one has to prune by hand (#96,
 #111). Live notes are never evicted for any reason: a full locker of
-CONFIRMED notes still refuses. Relay path: heartwood_note_* NIP-46 extensions
+CONFIRMED notes still refuses, and a request eviction cannot make room
+for is refused before any spent record goes. A note whose blob is on
+flash but this boot cannot read (a newer record format, a sealed blob
+that will not open, a failed read) keeps its index place, its slot and
+its id through every rewrite; get_info reports those as
+`unreadable_count` (omitted when zero; locked or unlocked, note_count
+plus it is what the cap counts), and turning at-rest off over USB
+(empty SET_PIN / VAULT_SET) is refused before the card while any exist,
+NACK `at-rest stays on while notes cannot be read`, because one may be
+sealed under the key that would be forgotten. No delete path for them
+exists yet. Relay path: heartwood_note_* NIP-46 extensions
 (advertised note_locker_v1), gated methods pinned ButtonRequired ahead of the
 generic extension gate so no slot policy can silence a disclosure, riding the
 #64 deferred machinery. heartwood_note_rename joined that set (#96, checklist
@@ -102,8 +112,8 @@ own x-only pubkey for a Part 2 key note, since that is what the mint recovers
 from a ck1; key_index non-null tells them apart). It is NOT called
 `secret_hash`: for a key note it is not a hash of anything. A second optional
 top-level `note_inventory_unreadable` (u32, omitted when zero) counts notes
-the exporting board held but could not read - sealed at rest, or an unloadable
-index - because otherwise an export from a locked board is byte-identical to
+the exporting board held but could not read - sealed at rest, a record this
+boot could not read for another reason, or an unloadable index - because otherwise an export from a locked board is byte-identical to
 one from an empty locker, which is the false completeness the feature exists
 to remove; the export card shows it as `<u> UNREAD`. It restores NOTHING -
 BACKUP_IMPORT shape-checks via inspect_imported_inventory, logs and drops, and

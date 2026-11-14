@@ -679,11 +679,11 @@ fn build(partition: EspNvsPartition<NvsDefault>) -> Notes {
     }
 }
 
-/// Whether the device holds any notes (loaded or sealed), for code with no
-/// locker in scope — the WiFi-standalone tier consults this before allowing
-/// an at-rest change it could not sync notes through. Set at init and
-/// re-stored after every note command (USB frame or relay method), so it
-/// stays fresh in both modes.
+/// Whether the device holds any notes (loaded, sealed or unreadable), for
+/// code with no locker in scope — the WiFi-standalone tier consults this
+/// before allowing an at-rest change it could not sync notes through. Set at
+/// init and re-stored after every note command (USB frame or relay method),
+/// so it stays fresh in both modes.
 static NOTES_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn any_notes_held() -> bool {
@@ -699,6 +699,11 @@ pub struct IdleSummary {
     pub held: usize,
     pub received: usize,
     pub pending: usize,
+    /// Notes this boot could not read beyond the sealed ones in `held` (see
+    /// [`Notes::unreadable_count`]): each holds a slot. Not drawn yet; the
+    /// panel's lines are unchanged.
+    #[allow(dead_code)]
+    pub unreadable: usize,
 }
 
 /// Take a momentary, read-only locker summary for the local idle display.
@@ -713,6 +718,7 @@ pub fn idle_summary() -> IdleSummary {
             held: notes.store.live_count() + notes.sealed_count(),
             received: notes.store.received_count(),
             pending,
+            unreadable: notes.unreadable_count(),
         }
     })
 }
@@ -721,23 +727,27 @@ pub fn idle_summary() -> IdleSummary {
 /// inventory line per readable note, and the count of notes it could NOT
 /// read so the caller can say so out loud.
 ///
-/// Sealed records awaiting an unlock key, and a boot whose index would not
-/// read, both mean the locker knows less than the board holds. Neither is
-/// guessed at: the inventory lists what is readable, and `unreadable` is how
-/// many notes are known to be missing from it. An operator exporting on a
-/// locked board should unlock first.
+/// Sealed records awaiting an unlock key, records this boot could not read
+/// for any other reason (a newer record format, a sealed blob that would not
+/// open, a failed read), and a boot whose index would not read, all mean the
+/// locker knows less than the board holds. None is guessed at: the inventory
+/// lists what is readable, and `unreadable` is how many notes are known to be
+/// missing from it. An operator exporting on a locked board should unlock
+/// first.
 pub fn backup_inventory() -> (
     alloc_vec::Vec<heartwood_common::backup::NoteInventoryEntry>,
     usize,
 ) {
     with_locker(|notes| {
-        let sealed = notes.sealed_count();
+        // The sealed records are among the store's unreadable ids (their
+        // load failed too), so the larger of the two, never the sum.
+        let missing = notes.sealed_count().max(notes.store.unreadable_count());
         let unreadable = if notes.store.index_known() {
-            sealed
+            missing
         } else {
             // An unreadable index means the store came up empty and refuses
             // creation; there is no honest count, only "not none".
-            sealed.max(1)
+            missing.max(1)
         };
         (
             heartwood_common::backup::build_note_inventory(&notes.store),
@@ -781,7 +791,26 @@ pub fn store_wrap_ledger(blob: &[u8]) {
 impl Notes {
     fn any_held(&self) -> bool {
         let (count, _) = self.store.counts();
-        count > 0 || self.sealed_count() > 0
+        count > 0 || self.sealed_count() > 0 || self.store.unreadable_count() > 0
+    }
+
+    /// Indexed notes this boot could not read beyond the sealed ones
+    /// awaiting a key ([`Self::sealed_count`], which are among the store's
+    /// unreadable ids too): a newer record format, a sealed blob that would
+    /// not open under the key, a failed read. They hold slots, so a count of
+    /// notes that includes the sealed ones plus this is what the cap is
+    /// measured against.
+    pub fn unreadable_count(&self) -> usize {
+        self.store.unreadable_count().saturating_sub(self.sealed_count())
+    }
+
+    /// Whether at-rest must stay on: a note this boot could not read may be
+    /// sealed under the note key, and turning at-rest off drops that key's
+    /// wrap (and the data key under it) for good. Sealed records with no key
+    /// are the long-standing case; an unreadable record is refused the same
+    /// way, because this boot cannot tell whether it is sealed.
+    fn at_rest_must_stay(&self) -> bool {
+        self.sealed_count() > 0 || self.store.unreadable_count() > 0
     }
 
     /// Sealed records awaiting a key this boot. Included in `get_info`'s
@@ -989,9 +1018,24 @@ fn sync_sealed_inner(notes: &mut Notes, secret: Option<&[u8]>) {
     log::info!("[notes] sealed state in sync ({count} note(s) under the note key)");
 }
 
+/// The NACK reason for a `SET_PIN` or `VAULT_SET` that would turn at-rest off
+/// while [`at_rest_must_stay`] holds.
+pub const AT_REST_MUST_STAY: &[u8] = b"at-rest stays on while notes cannot be read";
+
+/// Whether turning at-rest off must be refused before the seeds change:
+/// some note this boot could not read may be sealed under the note key, and
+/// removing the PIN or vault key forgets the data key that key is wrapped
+/// under. The USB loop asks this before the "Remove PIN?" or "Disable vault?"
+/// card, so nothing changes and the host is told why.
+pub fn at_rest_must_stay() -> bool {
+    with_locker(|notes| notes.at_rest_must_stay())
+}
+
 /// Turn at-rest off for the locker: rewrite every record plaintext, then
 /// drop `nk` and the in-RAM key. Refusal, not destruction, when sealed
-/// records exist with no key. Order matters: records go plaintext BEFORE
+/// records exist with no key or records exist this boot could not read
+/// ([`at_rest_must_stay`]; the USB loop checks it before the seeds change,
+/// so this is the backstop). Order matters: records go plaintext BEFORE
 /// `nk` is removed, so a reset between the two leaves an orphan `nk`
 /// (harmless — overwritten by the next enable) rather than sealed records
 /// with no wrap.
@@ -1000,8 +1044,11 @@ pub fn disable_sealing() {
 }
 
 fn disable_sealing_inner(notes: &mut Notes) {
-    if notes.sealed_count() > 0 {
-        log::error!("[notes] at-rest disabled while sealed notes have no key — they stay sealed on flash");
+    if notes.at_rest_must_stay() {
+        log::error!(
+            "[notes] at-rest disabled while {} note(s) cannot be read; they stay sealed on flash",
+            notes.store.unreadable_count().max(notes.sealed_count())
+        );
         return;
     }
     {
@@ -1409,7 +1456,7 @@ fn handle_note_cmd_frame_locked_inner(
     // (pending_count only covers decodable records — a sealed note's state
     // is inside the ciphertext, and a locked boot cannot know it.)
     let (note_count, pending_count) = notes.store.counts();
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "ok": true,
         "fw_version": env!("CARGO_PKG_VERSION"),
         "board": crate::board::BOARD,
@@ -1417,6 +1464,13 @@ fn handle_note_cmd_frame_locked_inner(
         "note_count": note_count + notes.sealed_count(),
         "pending_count": pending_count,
     });
+    // Notes unreadable for a reason other than the missing key hold slots
+    // too; note_count plus this is what the cap is measured against, as on
+    // an unlocked board. Omitted when zero.
+    let unreadable = notes.unreadable_count();
+    if unreadable > 0 {
+        response["unreadable_count"] = serde_json::json!(unreadable);
+    }
     let bytes = serde_json::to_vec(&response)
         .unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"bad_request\"}".to_vec());
     protocol::write_frame(usb, FRAME_TYPE_NOTE_RESP, &bytes);

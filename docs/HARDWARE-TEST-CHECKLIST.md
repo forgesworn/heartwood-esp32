@@ -3769,7 +3769,8 @@ ships, not only the Heltec whose slot prompted it:
 
 Each board runs in WiFi-standalone mode with a disposable identity, a PIN set,
 the operator key installed (`scripts/set-operator.mjs`), the bridge secret set
-for the cable steps (`scripts/set-bridge-secret.mjs`, as in section 7) and, if
+for the cable steps (`scripts/set-bridge-secret.mjs`, or Sapwood's tethered
+wizard; section 7.4b covers bridge auth) and, if
 one is enrolled, an unlock phone. Spare boards only.
 
 **Baseline.** Main firmware has no `stack_free`, so it cannot be the
@@ -3779,7 +3780,7 @@ reporting on its own: CI's `app-<board>` artifact from the
 branch built with `CARGO_PROFILE_RELEASE_LTO=false` on the same toolchain as
 the image under test. The image under test is CI's `app-<board>` artifact
 from this branch's PR. CI artifacts are not release-signed, so both are
-written app-only (as in section 40's runs), not by OTA.
+written app-only (step 1), not by OTA.
 
 **Image check, before any board (each board class).** Take CI's
 `elf-<board>` artifact from this branch's PR and the baseline's, and run
@@ -3823,8 +3824,20 @@ then on the image under test. Record every mark and `min_free_heap` after
 each step, in a table with one column per image.
 
 1. Write the image for this run (the baseline, then the image under test)
-   app-only. Power on: the board boots locked, and FIRMWARE_INFO reports the
-   version, the board and `at_rest` `pin`.
+   app-only, after reading the board's partition table back and confirming
+   it is the standard one for its class.
+   - Heltec (`firmware/partitions.csv`: otadata at 0xd000, `ota_0` at
+     0x10000): write the image at 0x10000 and erase otadata (0xd000, 8 KB),
+     so the bootloader takes `ota_0` whichever slot ran before. Writing
+     `ota_0` alone leaves a board that last booted `ota_1` running that.
+   - T-Display and C6 (`firmware/partitions-4mb.csv`): write the image at
+     0x10000, the factory slot, as in section 40's runs.
+
+   Both images report the same version string, so FIRMWARE_INFO cannot tell
+   them apart: record each artifact's SHA-256 and confirm the write by hash
+   (esptool's hash check, or a verify of the app slot as in section 40).
+   Power on: the board boots locked, and FIRMWARE_INFO reports the version,
+   the board and `at_rest` `pin`.
 2. PIN unlock over USB: one wrong PIN (`Wrong PIN`, 4 attempts left), then
    the right one. The relay loop starts; read the marks.
 3. Signing: from a paired NIP-46 client, sign an event that needs the button
@@ -3838,7 +3851,7 @@ each step, in a table with one column per image.
    identities and client list, and leave it polling for 5 minutes. Read the
    marks over the relay.
 6. Hard-mode signing over the cable, the board still in WiFi mode: with
-   heartwoodd in Hard mode on the USB port (section 7's setup), sign one
+   heartwoodd in Hard mode on the USB port (section 7.4b's setup), sign one
    event and run one NIP-44 decrypt through it. Each arrives as an
    `ENCRYPTED_REQUEST`, which the relay loop serves on the main task
    (`relay.rs`, `FRAME_TYPE_ENCRYPTED_REQUEST`). Read the marks over the
@@ -3862,8 +3875,8 @@ each step, in a table with one column per image.
      counting). This covers the signature check, every flash write and the
      SHA-256 of the whole image. Read the marks.
    - T-Display and C6: their 4 MB layout has one app slot, so `OTA_BEGIN`
-     is refused after its signature check, before any card (`no spare
-     slot`, 0x12). Read the marks; that is all OTA reaches there.
+     is refused after its signature check, before any card (`No OTA
+     partition`, 0x12). Read the marks; that is all OTA reaches there.
    - If the transfer stalls in WiFi mode on either image, record it, and run
      this step in USB mode instead (section 4); the marks cannot be read
      there.
@@ -3875,7 +3888,8 @@ each step, in a table with one column per image.
     FIRMWARE_INFO carries no `crash_detail` and `get_status` reads
     `crash_detail` `null`, while `crashed_during` names a watchdog restart as
     it does on the baseline. Then section 40 item 1: power-cycle, and neither
-    carries crash detail. Only the image under test needs this step.
+    carries crash detail. Run it on both images; the image under test must
+    behave as the baseline does.
 12. Soak: 12 hours or more on the relays with Sapwood's poll and a few
     signatures through it. No reset (`uptime_s` keeps counting, `last_reset`
     unchanged). Read the marks at the end.
@@ -3883,9 +3897,10 @@ each step, in a table with one column per image.
     image under test to the current signed release asset, no flipped byte.
     It must verify, reboot into that release and rejoin WiFi with no
     rollback. The restart clears the marks, so this step only checks that
-    the update completes. CI artifacts are unsigned, so the way back is an
-    app-only write; the first signed prerelease with thin LTO repeats this
-    step in the other direction.
+    the update completes. The board now runs `ota_1`. CI artifacts are
+    unsigned, so the way back is step 1's Heltec write, otadata erase
+    included, confirmed by hash; the first signed prerelease with thin LTO
+    repeats this step in the other direction.
 
 Pass, on every board class, on the image under test, after every step:
 `btn_latch` and `sys_evt` each keep at least 1,024 bytes unused, and `main` at

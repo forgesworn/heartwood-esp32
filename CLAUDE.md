@@ -535,11 +535,11 @@ draft strings in two places: a decline answers every card's `user denied`, and
 the wider refusal is the plain text with no ceiling named. IMAGE COST, M4
 release builds against `52fc099` (the M4's absolute sizes run about 30 KB
 above CI's for the same source, so only the deltas carry over): heltec-v4
-+18,336 B (2,137,408), heltec-v3 +19,088 B (2,133,840); T-Display +17,104 B
-before the review fixes (2,355,904, of 3,145,728). Projected onto CI's
++18,336 B (2,137,408), heltec-v3 +19,088 B (2,133,840); T-Display +18,032 B
+(2,356,832, of 3,145,728). Projected onto CI's
 `c94112f` figures that leaves the V4 about 9.4 KB and the V3 about 5.8 KB
 over their 2,097,152 B slot, so the Heltec images do NOT fit on this branch
-alone; room is being made separately (`optimize_for_size`, thin LTO).
+alone and need room made before this merges.
 
 Next: bench the note locker (checklist section 13) and the remaining hardware verification of the encrypted-at-rest flows (USB auto-unlock and Hard-mode signing passed on real hardware 2026-08-13; see docs/HARDWARE-TEST-CHECKLIST.md section 7), the 2026-08-14 fixes and features (checklist section 8, not yet bench-run), and the Soft-mode approval path (fixed 2026-08-08: approvals were re-queued and the signed envelope dropped). Task watchdog landed 2026-08-08 (60 s, panic → crash crumb, fed by every blocking loop). JTAG disable is deliberately excluded — it requires eFuse burning, which permanently locks the chip (see docs/memory/feedback_no_efuse.md); physical security is the model. Sapwood tier badge/unlock/approvals/backup UI is in the sapwood repo.
 

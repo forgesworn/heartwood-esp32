@@ -65,6 +65,11 @@ pub mod slot_codec;
 #[cfg(feature = "nip46")]
 pub mod owner_pairing;
 
+/// Site links made by the Heartwood, with a hold: the gate, the ceiling,
+/// the LINK card text and the RAM inherit and cooldown state.
+#[cfg(feature = "nip46")]
+pub mod site_link;
+
 pub mod net_config;
 
 pub mod mgmt;

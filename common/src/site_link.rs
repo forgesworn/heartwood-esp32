@@ -18,6 +18,7 @@
 // `firmware/src/relay/site_link.rs`.
 
 use alloc::{
+    borrow::Cow,
     format,
     string::{String, ToString},
     vec::Vec,
@@ -29,7 +30,7 @@ use crate::mgmt::{classify_credential_fingerprint, credential_fingerprint, Crede
 use crate::owner_pairing::is_owner_pairing;
 use crate::policy::{
     client_identity_approved, evaluate_slot_policy_for_event, find_slot_by_pubkey, next_slot_index,
-    validate_exact_slot_policy, ApprovalTier, ConnectSlot, ExactSlotPolicy,
+    validate_exact_slot_policy, ApprovalTier, ConnectSlot, ExactSlotPolicy, MAX_ALLOWED_KINDS,
 };
 
 // ---------------------------------------------------------------------------
@@ -184,12 +185,12 @@ pub struct LookupRequest {
 }
 
 /// `params[0]` as an object, also accepting it JSON-encoded in a string, as
-/// the other object-taking extensions do.
-fn first_object(params: &[Value]) -> Option<serde_json::Map<String, Value>> {
+/// the other object-taking extensions do. Borrowed when it is one already.
+fn first_object(params: &[Value]) -> Option<Cow<'_, serde_json::Map<String, Value>>> {
     match params.first()? {
-        Value::Object(map) => Some(map.clone()),
+        Value::Object(map) => Some(Cow::Borrowed(map)),
         Value::String(text) => match serde_json::from_str::<Value>(text).ok()? {
-            Value::Object(map) => Some(map),
+            Value::Object(map) => Some(Cow::Owned(map)),
             _ => None,
         },
         _ => None,
@@ -218,13 +219,19 @@ pub fn parse_create(params: &[Value]) -> Result<CreateRequest, LinkError> {
     }
     let policy = map.get("policy").and_then(Value::as_object).ok_or(LinkError::Malformed)?;
     // Plain loops, not `collect::<Option<Vec<_>>>`: the image is tight.
+    // Both lists are capped before anything is copied: no link names more
+    // than the four methods, nor more kinds than any slot may hold.
+    let methods = policy.get("allowed_methods").and_then(Value::as_array).ok_or(LinkError::Malformed)?;
+    if methods.len() > LINK_METHODS.len() {
+        return Err(LinkError::Malformed);
+    }
     let mut allowed_methods = Vec::new();
-    for item in policy.get("allowed_methods").and_then(Value::as_array).ok_or(LinkError::Malformed)? {
+    for item in methods {
         allowed_methods.push(item.as_str().ok_or(LinkError::Malformed)?.to_string());
     }
     let mut allowed_kinds = Vec::new();
     match policy.get("allowed_kinds") {
-        Some(Value::Array(items)) => {
+        Some(Value::Array(items)) if items.len() <= MAX_ALLOWED_KINDS => {
             for item in items {
                 allowed_kinds.push(item.as_u64().ok_or(LinkError::Malformed)?);
             }
@@ -354,8 +361,7 @@ pub struct CreatePlan {
     pub policy: ExactSlotPolicy,
 }
 
-/// Rules 1 to 6, then room in the identity's table (rule 7's first half;
-/// NVS room is [`check_save_room`], the firmware's RNG its own).
+/// Rules 1 to 6. Room (rule 7) and the retry are [`gate`]'s.
 pub fn check_create(
     asking: Option<&ConnectSlot>,
     client_hex: &str,
@@ -372,11 +378,63 @@ pub fn check_create(
     if !within_phone(phone, &policy) {
         return Err(LinkError::WiderThanPhone);
     }
-    if next_slot_index(served.table).is_none() {
-        return Err(LinkError::NoRoom);
-    }
     policy.bound_identity = Some(crate::hex::hex_encode(&request.identity));
     Ok(CreatePlan { master_slot: served.master_slot, policy })
+}
+
+/// What a create that passed the gate does.
+#[derive(Debug, Clone)]
+pub enum Gate<'a> {
+    /// The same link again (design 4.5): answered with [`create_reply`] for
+    /// this slot, no card, nothing written.
+    Retry(&'a ConnectSlot),
+    /// A new link: the card, then the hold.
+    Plan(CreatePlan),
+}
+
+/// Rules 1 to 6, then the idempotent retry, then room in the table and NVS
+/// (rule 7; the firmware's RNG is its own). The retry comes before room so
+/// a lost reply is always answered, even when its link took the last slot.
+/// The hold runs this again against the tables as they are then.
+pub fn gate<'a>(
+    asking: Option<&ConnectSlot>,
+    client_hex: &str,
+    served: Option<ServedIdentity<'a>>,
+    request: &CreateRequest,
+    ledger: &LinkLedger,
+    now_ms: u64,
+    nvs: Option<crate::nvs_room::NvsRoom>,
+) -> Result<Gate<'a>, LinkError> {
+    let plan = check_create(asking, client_hex, served, request)?;
+    let table = served.ok_or(LinkError::IdentityNotServed)?.table;
+    if let Some(made) = retry_target(ledger, client_hex, request, plan.master_slot, table, now_ms) {
+        return Ok(Gate::Retry(made));
+    }
+    if next_slot_index(table).is_none() {
+        return Err(LinkError::NoRoom);
+    }
+    check_save_room(table, &request.label, &plan.policy, &request.identity, nvs)?;
+    Ok(Gate::Plan(plan))
+}
+
+/// Before the card (design 4.3 to 4.5): [`gate`], then the cooldown. A
+/// cooling client still gets its retry and every rule's own refusal; only
+/// a new card waits out the minute. The one-card rule is the caller's, as
+/// it reads the card queue.
+pub fn before_card<'a>(
+    asking: Option<&ConnectSlot>,
+    client_hex: &str,
+    served: Option<ServedIdentity<'a>>,
+    request: &CreateRequest,
+    ledger: &LinkLedger,
+    now_ms: u64,
+    nvs: Option<crate::nvs_room::NvsRoom>,
+) -> Result<Gate<'a>, LinkError> {
+    let gate = gate(asking, client_hex, served, request, ledger, now_ms, nvs)?;
+    if matches!(gate, Gate::Plan(_)) && ledger.cooling(client_hex, now_ms) {
+        return Err(LinkError::ShownRecently);
+    }
+    Ok(gate)
 }
 
 /// A stand-in for a 64-hex secret or client key, where only its length
@@ -613,19 +671,41 @@ pub fn site_of(label: &str) -> String {
     printable(site.trim())
 }
 
-/// The scope line.
+/// The longest scope line: the narrowest panel's small row (128 px, 5 px
+/// glyphs, inside the margins) holds 24.
+pub const SCOPE_CHARS: usize = 24;
+
+/// The scope line. A link that may decrypt says so first, whatever else it
+/// may do: `DECRYPT, NO SIGN, NO ASK`, `DECRYPT+3 KINDS, NO ASK`. Every
+/// line fits [`SCOPE_CHARS`].
 pub fn scope_line(policy: &ExactSlotPolicy) -> String {
+    let decrypt = policy.allowed_methods.iter().any(|m| m == "nip44_decrypt");
+    let auto = policy.auto_approve;
+    let mut line = String::from(if decrypt { "DECRYPT" } else { "" });
     if !policy.signing_approved {
-        return if policy.auto_approve { "NO SIGNING, NO ASKING" } else { "NO SIGNING, ASKS" }.to_string();
+        line.push_str(if decrypt { ", NO SIGN, " } else { "NO SIGNING, " });
+        line.push_str(match (auto, decrypt) {
+            (true, true) => "NO ASK",
+            (true, false) => "NO ASKING",
+            _ => "ASKS",
+        });
+    } else if !auto {
+        line.push_str(if decrypt { ", ASKS EACH TIME" } else { "ASKS EACH TIME" });
+    } else {
+        if decrypt {
+            line.push('+');
+        }
+        match policy.allowed_kinds.len() {
+            0 => line.push_str("ANY KIND"),
+            1 => line.push_str("1 KIND"),
+            n => {
+                line.push_str(&n.to_string());
+                line.push_str(" KINDS");
+            }
+        }
+        line.push_str(if decrypt { ", NO ASK" } else { ", NO ASKING" });
     }
-    if !policy.auto_approve {
-        return "ASKS EACH TIME".to_string();
-    }
-    match policy.allowed_kinds.len() {
-        0 => "ANY KIND, NO ASKING".to_string(),
-        1 => "1 KIND, NO ASKING".to_string(),
-        n => format!("{n} KINDS, NO ASKING"),
-    }
+    line
 }
 
 pub fn link_card(
@@ -781,14 +861,32 @@ impl LinkLedger {
         }
     }
 
-    /// A decline or a timeout from this client.
+    /// A decline, a timeout or a refused card from this client (design
+    /// 4.4). One entry per client, restarted; beyond the cap the oldest is
+    /// dropped.
     pub fn start_cooldown(&mut self, client: &str, now_ms: u64) {
-        // A cooling client never reaches a card, so any earlier entry of its
-        // has run out; as with links, the oldest is the one to drop.
-        if self.cooldowns.len() >= MAX_COOLDOWNS {
+        if let Some(at) = self.cooldowns.iter().position(|(c, _)| c == client) {
+            self.cooldowns.remove(at);
+        } else if self.cooldowns.len() >= MAX_COOLDOWNS {
             self.cooldowns.remove(0);
         }
         self.cooldowns.push((client.to_string(), now_ms.saturating_add(COOLDOWN_MS)));
+    }
+
+    /// A second link ask while a LINK card waits (design 4.4): both are
+    /// refused, and the asker cools, so asking again cannot keep a card up.
+    /// The waiting card's client cools when its card closes
+    /// ([`LinkLedger::card_closed`]).
+    pub fn another_link(&mut self, client: &str, now_ms: u64) -> LinkError {
+        self.start_cooldown(client, now_ms);
+        LinkError::AnotherLink
+    }
+
+    /// A LINK card closed: anything but a hold cools its client.
+    pub fn card_closed(&mut self, client: &str, held: bool, now_ms: u64) {
+        if !held {
+            self.start_cooldown(client, now_ms);
+        }
     }
 
     pub fn cooling(&self, client: &str, now_ms: u64) -> bool {
@@ -923,6 +1021,21 @@ mod tests {
         let long = "a".repeat(MAX_LABEL_LEN + 1);
         assert!(!valid_label(&long));
         assert!(valid_label(&"a".repeat(MAX_LABEL_LEN)));
+        // Both lists are capped while parsing: four methods, 64 kinds.
+        let with = |methods: &str, kinds: &str| {
+            params(&format!(
+                r#"{{"identity":"{}","label":"x","policy":{{"allowed_methods":{methods},"allowed_kinds":{kinds},"auto_approve":true}}}}"#,
+                "33".repeat(32)
+            ))
+        };
+        let four = r#"["get_public_key","sign_event","nip44_encrypt","nip44_decrypt"]"#;
+        let five = r#"["get_public_key","sign_event","nip44_encrypt","nip44_decrypt","sign_event"]"#;
+        let kinds = |n: usize| serde_json::to_string(&(0..n as u64).collect::<Vec<_>>()).unwrap();
+        assert!(parse_create(&with(four, &kinds(MAX_ALLOWED_KINDS))).is_ok());
+        assert_eq!(parse_create(&with(five, "[]")), Err(LinkError::Malformed));
+        assert_eq!(parse_create(&with(four, &kinds(MAX_ALLOWED_KINDS + 1))), Err(LinkError::Malformed));
+        // An object param is read in place, not copied.
+        assert!(matches!(first_object(&with(four, "[]")), Some(Cow::Borrowed(_))));
     }
 
     #[test]
@@ -1101,8 +1214,10 @@ mod tests {
         for i in 1..16 {
             table.push(base_slot(i, "other"));
         }
+        let ledger = LinkLedger::new();
+        assert!(check_create(Some(&asking), PHONE, served(0, &table), &request(PERSONA, vec![])).is_ok());
         assert_eq!(
-            check_create(Some(&asking), PHONE, served(0, &table), &request(PERSONA, vec![])).unwrap_err(),
+            gate(Some(&asking), PHONE, served(0, &table), &request(PERSONA, vec![]), &ledger, 0, None).unwrap_err(),
             LinkError::NoRoom
         );
         let table = vec![asking];
@@ -1121,6 +1236,14 @@ mod tests {
         assert_eq!(check_save_room(&table, label, &plan.policy, &PERSONA, Some(roomy)), Ok(()), "{len} {need:?}");
         let full = crate::nvs_room::NvsRoom { free_entries: 130, total_entries: 630, reclaimable_entries: 0 };
         assert_eq!(check_save_room(&table, label, &plan.policy, &PERSONA, Some(full)), Err(LinkError::NoRoom));
+        assert_eq!(
+            gate(Some(&table[0]), PHONE, served(0, &table), &request(PERSONA, vec![]), &ledger, 0, Some(full)).unwrap_err(),
+            LinkError::NoRoom
+        );
+        assert!(matches!(
+            gate(Some(&table[0]), PHONE, served(0, &table), &request(PERSONA, vec![]), &ledger, 0, Some(roomy)),
+            Ok(Gate::Plan(p)) if p == plan
+        ));
         // The projection covers the bind and the grant that follow.
         let bare = serde_json::to_string(&[table.clone(), vec![planned_slot(&table, label, &plan.policy).unwrap()]].concat()).unwrap();
         assert!(save_room_len(&table, label, &plan.policy, &PERSONA).unwrap() > bare.len());
@@ -1146,7 +1269,7 @@ mod tests {
         let table = vec![owner(Style::Everyday)];
         let plan = check_create(Some(&table[0]), PHONE, served(0, &table), &request(PERSONA, vec![])).unwrap();
         let card = link_card("mysignet:kithmoot.com:0123abcd", "persona", 0, 0, &plan.policy, "My Signet");
-        assert_eq!(card.lines(21, 18, 25), ["LINK ?kithmoot.com?", "AS persona", "ANY KIND, NO ASKING", "FROM My Signet"]);
+        assert_eq!(card.lines(21, 18, 25), ["LINK ?kithmoot.com?", "AS persona", "DECRYPT+ANY KIND, NO ASK", "FROM My Signet"]);
         // Row 20: another master is named; the same master is not.
         let card = link_card("mysignet:kithmoot.com:0123abcd", "master1", 1, 0, &plan.policy, "My Signet");
         assert_eq!(card.as_line(18), "AS master1 M1");
@@ -1169,12 +1292,17 @@ mod tests {
                     validate_exact_slot_policy(vec!["sign_event".into()], (0..64).collect(), true).unwrap(),
                     validate_exact_slot_policy(vec!["sign_event".into()], vec![], false).unwrap(),
                     validate_exact_slot_policy(vec!["nip44_decrypt".into()], vec![], false).unwrap(),
+                    validate_exact_slot_policy(vec!["nip44_decrypt".into()], vec![], true).unwrap(),
+                    validate_exact_slot_policy(vec!["sign_event".into(), "nip44_decrypt".into()], (0..64).collect(), true)
+                        .unwrap(),
                 ] {
                     let card = link_card(&long, "?abcdefgh", master, 0, &policy, &long);
                     let lines = card.lines(header, body, small);
                     assert!(lines[0].len() <= header.min(crate::encoding::HEADING_CHARS), "{lines:?}");
                     assert!(lines[1].len() <= body, "{lines:?}");
                     assert!(lines[2].len() <= small && lines[3].len() <= small, "{lines:?}");
+                    // The scope is never cut, so its decryption word survives.
+                    assert_eq!(lines[2], scope_line(&policy), "{lines:?}");
                     assert!(lines[0].starts_with("LINK ?") && lines[0].ends_with('?'));
                     assert!(lines.iter().all(|l| l.bytes().all(|b| b == b' ' || b.is_ascii_graphic())));
                 }
@@ -1197,6 +1325,35 @@ mod tests {
         assert_eq!(p(&["sign_event"], vec![1], false), "ASKS EACH TIME");
         assert_eq!(p(&["get_public_key"], vec![], true), "NO SIGNING, NO ASKING");
         assert_eq!(p(&["nip44_encrypt"], vec![], false), "NO SIGNING, ASKS");
+        // Decryption is always named, first (review: the card once read
+        // "NO SIGNING, NO ASKING" for a link that reads DMs silently).
+        assert_eq!(p(&["get_public_key", "nip44_decrypt"], vec![], true), "DECRYPT, NO SIGN, NO ASK");
+        assert_eq!(p(&["nip44_decrypt"], vec![], false), "DECRYPT, NO SIGN, ASKS");
+        assert_eq!(p(&["sign_event", "nip44_decrypt"], vec![1], false), "DECRYPT, ASKS EACH TIME");
+        assert_eq!(p(&["sign_event", "nip44_decrypt"], vec![], true), "DECRYPT+ANY KIND, NO ASK");
+        assert_eq!(p(&["sign_event", "nip44_decrypt"], vec![1], true), "DECRYPT+1 KIND, NO ASK");
+        assert_eq!(p(&["sign_event", "nip44_decrypt"], (0..64).collect(), true), "DECRYPT+64 KINDS, NO ASK");
+        // Every combination fits the narrowest small row and names
+        // decryption exactly when the link may decrypt.
+        for methods in [&["get_public_key"][..], &["nip44_encrypt"], &["sign_event"], &["sign_event", "nip44_encrypt"]] {
+            for decrypt in [false, true] {
+                let mut m: Vec<&str> = methods.to_vec();
+                if decrypt {
+                    m.push("nip44_decrypt");
+                }
+                let signs = m.contains(&"sign_event");
+                for kinds in [vec![], vec![1], (0..64).collect::<Vec<u64>>()] {
+                    if !signs && !kinds.is_empty() {
+                        continue;
+                    }
+                    for auto in [false, true] {
+                        let line = p(&m, kinds.clone(), auto);
+                        assert!(line.len() <= SCOPE_CHARS, "{line}");
+                        assert_eq!(line.contains("DECRYPT"), decrypt, "{line}");
+                    }
+                }
+            }
+        }
     }
 
     // --- the ledger, rows 3, 4, 6, 11, 18 ---
@@ -1274,11 +1431,92 @@ mod tests {
         assert!(ledger.cooling(PHONE, 64_999));
         assert!(!ledger.cooling(PHONE, 65_000));
         assert!(!ledger.cooling(SITE, 6_000));
-        // The cap drops the oldest, never grows.
-        for i in 0..(MAX_COOLDOWNS as u64 + 2) {
-            ledger.start_cooldown(&format!("{i:064x}"), 10_000);
+        // The cap drops the oldest, and only it.
+        let mut ledger = LinkLedger::new();
+        let client = |i: u64| format!("{i:064x}");
+        for i in 0..=(MAX_COOLDOWNS as u64) {
+            ledger.start_cooldown(&client(i), 10_000 + i);
         }
-        assert!(ledger.cooldowns.len() <= MAX_COOLDOWNS);
+        assert_eq!(ledger.cooldowns.len(), MAX_COOLDOWNS);
+        assert!(!ledger.cooling(&client(0), 10_100), "the oldest went");
+        for i in 1..=(MAX_COOLDOWNS as u64) {
+            assert!(ledger.cooling(&client(i), 10_100), "{i} kept");
+        }
+        // A client cooled again keeps one entry, restarted, and pushes no
+        // one else out.
+        ledger.start_cooldown(&client(1), 20_000);
+        assert_eq!(ledger.cooldowns.len(), MAX_COOLDOWNS);
+        assert!(ledger.cooling(&client(1), 79_999) && !ledger.cooling(&client(1), 80_000));
+        assert!(ledger.cooling(&client(2), 10_100));
+    }
+
+    #[test]
+    fn row_7_a_second_ask_refuses_both_and_cools_both_phones() {
+        let mut ledger = LinkLedger::new();
+        // The asker cools at once; the waiting card's phone as its card
+        // closes refused. Neither can raise a card for the minute.
+        assert_eq!(ledger.another_link(SITE, 1_000), LinkError::AnotherLink);
+        ledger.card_closed(PHONE, false, 1_000);
+        assert!(ledger.cooling(SITE, 60_999) && ledger.cooling(PHONE, 60_999));
+        // The same phone asking twice: one entry.
+        ledger.another_link(PHONE, 2_000);
+        assert_eq!(ledger.cooldowns.len(), 2);
+        // A hold cools no one.
+        let mut held = LinkLedger::new();
+        held.card_closed(PHONE, true, 1_000);
+        assert!(!held.cooling(PHONE, 1_001));
+    }
+
+    #[test]
+    fn the_gate_runs_rules_then_retry_then_room_then_cooldown() {
+        let asking = owner(Style::Everyday);
+        let req = request(PERSONA, vec![]);
+        let plan = check_create(Some(&asking), PHONE, served(0, &[asking.clone()]), &req).unwrap();
+        // The link that took the last slot, its reply lost.
+        let mut link = planned_slot(&[asking.clone()], &req.label, &plan.policy).unwrap();
+        link.secret = "ab".repeat(32);
+        let mut full = vec![asking.clone(), link.clone()];
+        for i in 2..16 {
+            full.push(base_slot(i, "other"));
+        }
+        let none = crate::nvs_room::NvsRoom { free_entries: 0, total_entries: 630, reclaimable_entries: 0 };
+        let mut ledger = LinkLedger::new();
+        ledger.record(0, 1, credential_fingerprint(&link.secret), PERSONA, PHONE, &req.label, 1_000);
+        // The retry beats a full table, full NVS and a cooldown.
+        ledger.start_cooldown(PHONE, 2_000);
+        let retry = before_card(Some(&asking), PHONE, served(0, &full), &req, &ledger, 30_000, Some(none));
+        assert_eq!(retry.map(|g| matches!(g, Gate::Retry(s) if s.slot_index == 1)), Ok(true));
+        assert!(matches!(gate(Some(&asking), PHONE, served(0, &full), &req, &ledger, 30_000, Some(none)), Ok(Gate::Retry(_))));
+        // Rules come first: a cooling stranger hears the rule, not the minute.
+        assert_eq!(
+            before_card(None, PHONE, served(0, &full), &req, &ledger, 30_000, None).unwrap_err(),
+            LinkError::NotOwnerPairing
+        );
+        let mut wide = req.clone();
+        wide.allowed_methods.push("heartwood_list_identities".into());
+        assert_eq!(
+            before_card(Some(&asking), PHONE, served(0, &full), &wide, &ledger, 30_000, None).unwrap_err(),
+            LinkError::WiderThanPhone
+        );
+        // Another label: room before the cooldown.
+        let mut other = req.clone();
+        other.label = "mysignet:other.example:0123abcd".into();
+        assert_eq!(
+            before_card(Some(&asking), PHONE, served(0, &full), &other, &ledger, 30_000, None).unwrap_err(),
+            LinkError::NoRoom
+        );
+        // With room, the cooldown; after it, the card's plan.
+        let roomy = vec![asking.clone(), link];
+        assert_eq!(
+            before_card(Some(&asking), PHONE, served(0, &roomy), &other, &ledger, 30_000, None).unwrap_err(),
+            LinkError::ShownRecently
+        );
+        assert!(matches!(
+            before_card(Some(&asking), PHONE, served(0, &roomy), &other, &ledger, 62_000, None),
+            Ok(Gate::Plan(_))
+        ));
+        // The hold's gate ignores the cooldown.
+        assert!(matches!(gate(Some(&asking), PHONE, served(0, &roomy), &other, &ledger, 30_000, None), Ok(Gate::Plan(_))));
     }
 
     #[test]

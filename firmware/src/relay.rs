@@ -6459,11 +6459,15 @@ fn queue_button_ask(
     // different decisions and never share one hold.
     kind_key.push_str(heartwood_common::policy::card_batch_marker(ask.resume.shown.card));
     let key = AskKey::new(slot, client_hex.to_string(), hex_encode(target_pk), kind_key);
-    let weight = ask
-        .event
-        .as_ref()
-        .map(|event| event.content.len() + 256)
-        .unwrap_or(256);
+    // A LINK ask holds its request's params, which nothing else bounds as
+    // tightly: weigh them as they are.
+    let weight = match (&ask.event, &ask.card) {
+        (Some(event), _) => event.content.len() + 256,
+        (None, crate::nip46_handler::AskCard::SiteLink { .. }) => {
+            serde_json::to_string(&ask.request.params).map_or(CARD_BYTE_BUDGET, |p| p.len()) + 256
+        }
+        _ => 256,
+    };
     let held_bytes: usize = ctx
         .button_cards
         .iter()
@@ -6982,6 +6986,17 @@ fn resolve_button_card(
     }
     let card = ctx.button_cards.remove(index);
     let full_access_unopened = is_full_access_card(&card) && card.opened_at.is_none();
+    // A LINK card (site links design 4.4): its hold makes the slot in
+    // `site_link::complete`; anything else that closes it (a decline, a
+    // timeout, a second ask refusing both) starts the phone's cooldown, here
+    // before any early return. Its reply goes the way every card's does.
+    let link = card
+        .asks
+        .first()
+        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::SiteLink { .. }));
+    if link {
+        site_link::card_closed(&card.key.client_hex, matches!(outcome, CardTick::Approved));
+    }
     // Whatever the outcome, a FULL ACCESS card closing starts the minute in
     // which no other may be raised (review round W3).
     if is_full_access_card(&card) {
@@ -7024,6 +7039,8 @@ fn resolve_button_card(
         // refused, not merely gone, whether or not it had reached the screen
         // (review round 3, S1). Its close restarts the minute, so a racer
         // could otherwise keep pairing blocked with nothing on the board.
+        // A LINK card a second link ask closed says so in its own words.
+        CardTick::Refused(_) if link => show_card_blocked(ctx, "Link blocked"),
         CardTick::Refused(_) => show_full_access_blocked(ctx),
         // Closed without ever reaching the screen for any other reason (it
         // expired in the queue): its close restarts the minute just the
@@ -7077,17 +7094,6 @@ fn resolve_button_card(
             show_card_not_done(ctx, "Offline", "Nothing was done");
         }
         return;
-    }
-
-    // A LINK card (site links design 4.4): its hold makes the slot in
-    // `site_link::complete`; a decline or a timeout starts the phone's
-    // cooldown. Its reply goes the way every card's does, below.
-    let link = card
-        .asks
-        .first()
-        .is_some_and(|a| matches!(a.ask.card, crate::nip46_handler::AskCard::SiteLink { .. }));
-    if link && matches!(outcome, CardTick::Denied | CardTick::Expired) {
-        site_link::cooldown(&card.key.client_hex);
     }
 
     // A button-approved heartwood_derive_persona (or remove) changes the
@@ -8182,6 +8188,11 @@ fn service_button_cards(ctx: &mut SignCtx, sessions: &mut [RelaySession]) {
 /// that has just appeared does. Nothing holds the refusal beyond that: over a
 /// live card it stays up until that card's first pass after the minimum.
 fn show_full_access_blocked(ctx: &mut SignCtx) {
+    show_card_blocked(ctx, "Pairing blocked");
+}
+
+/// The same refusal for any card a second ask closed, under its own title.
+fn show_card_blocked(ctx: &mut SignCtx, title: &'static str) {
     if !ctx.display_on {
         crate::oled::wake_display(ctx.display);
         ctx.display_on = true;
@@ -8194,8 +8205,8 @@ fn show_full_access_blocked(ctx: &mut SignCtx) {
         }
         _ => false,
     };
-    log::info!("[relay] FULL ACCESS refusal drawn (over a card: {over_card})");
-    show_card_not_done(ctx, "Pairing blocked", "2nd request");
+    log::info!("[relay] {title} refusal drawn (over a card: {over_card})");
+    show_card_not_done(ctx, title, "2nd request");
     ctx.refusal_shown_until = Some(Instant::now() + REFUSAL_MIN_SHOWN);
 }
 

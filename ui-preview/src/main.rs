@@ -309,7 +309,7 @@ fn link_lines(l: &Layout, card: &heartwood_common::site_link::LinkCard) -> [Stri
 
 /// LINK cards for the preview and its tests: an everyday one, the longest
 /// of everything, and one for an identity on another master.
-fn sample_link_cards() -> [(&'static str, heartwood_common::site_link::LinkCard); 3] {
+fn sample_link_cards() -> [(&'static str, heartwood_common::site_link::LinkCard); 4] {
     use heartwood_common::policy::validate_exact_slot_policy;
     use heartwood_common::site_link::link_card;
     let sign = |kinds: Vec<u64>| {
@@ -335,6 +335,19 @@ fn sample_link_cards() -> [(&'static str, heartwood_common::site_link::LinkCard)
             ),
         ),
         ("link-other-master", link_card("mysignet:kithmoot.com:1a2b3c4d", "persona", 3, 0, &sign(vec![1]), "phone")),
+        // A link that only reads DMs, silently: the scope says so first.
+        (
+            "link-decrypt-only",
+            link_card(
+                "mysignet:kithmoot.com:1a2b3c4d",
+                "persona",
+                0,
+                0,
+                &validate_exact_slot_policy(vec!["get_public_key".into(), "nip44_decrypt".into()], vec![], true)
+                    .expect("a valid link policy"),
+                "phone",
+            ),
+        ),
     ]
 }
 
@@ -998,6 +1011,10 @@ fn longest_pair_words() -> [&'static str; heartwood_common::owner_pairing::PAIR_
 /// the firmware's own words.
 const FULL_ACCESS_BLOCKED: (&str, &str) = ("Pairing blocked", "2nd request");
 
+/// A LINK card a second link ask closed (`show_card_blocked` in relay.rs,
+/// site links design 4.4): the same refusal under its own title.
+const LINK_BLOCKED: (&str, &str) = ("Link blocked", "2nd request");
+
 fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565>)) {
     let mut d = SimulatorDisplay::<Rgb565>::new(Size::new(w, h));
     d.clear(BG).ok();
@@ -1098,6 +1115,9 @@ fn main() {
         render(&format!("denied-{b}"), w, h, |d| draw_result(d, "DENIED", DANGER));
         render(&format!("full-access-blocked-{b}"), w, h, |d| {
             draw_status_card(d, "NOT DONE", FULL_ACCESS_BLOCKED.0, FULL_ACCESS_BLOCKED.1, DANGER)
+        });
+        render(&format!("link-blocked-{b}"), w, h, |d| {
+            draw_status_card(d, "NOT DONE", LINK_BLOCKED.0, LINK_BLOCKED.1, DANGER)
         });
         // The recovery walkthrough at its three captions, on every panel: the
         // caption sits between the rule and the word and must clear both.
@@ -1304,18 +1324,31 @@ mod error_card_tests {
         assert!(unopened < silent, "a FULL ACCESS card expired in the queue would close without a refusal");
         assert!(!body.contains("opened_at.is_some()"), "the refusal is drawn only for an opened card");
 
-        let start = relay.find("\nfn show_full_access_blocked(").expect("show_full_access_blocked");
-        let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
-        let call = body.find("show_card_not_done(").expect("the refusal is a NOT DONE card");
-        let words = string_literals(&body[call..]);
-        assert_eq!(&words[..2], &[super::FULL_ACCESS_BLOCKED.0.to_string(), super::FULL_ACCESS_BLOCKED.1.to_string()]);
+        // A LINK card's refusal (site links design 4.4) has its own arm,
+        // before the FULL ACCESS one, so its words are its own.
+        let link = body
+            .find(&format!("CardTick::Refused(_) if link => show_card_blocked(ctx, \"{}\"),", super::LINK_BLOCKED.0))
+            .expect("a refused LINK card draws its own refusal");
+        assert!(link < refused, "a refused LINK card would draw the FULL ACCESS refusal");
 
-        let (title, hint) = super::FULL_ACCESS_BLOCKED;
-        for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
-            let l = Layout::new(w, h);
-            let available = l.w - l.sx(4);
-            assert!(title.len() as i32 * Layout::glyph_w(l.font_body()) <= available, "{title:?} drops to the small font on {w}x{h}");
-            assert!(hint.len() as i32 * Layout::glyph_w(l.font_small()) <= available, "{hint:?} clips on {w}x{h}");
+        let fn_body = |name: &str| {
+            let start = relay.find(&format!("\nfn {name}(")).unwrap_or_else(|| panic!("{name}"));
+            relay[start..start + relay[start..].find("\n}\n").unwrap()].to_string()
+        };
+        let words = string_literals(&fn_body("show_full_access_blocked"));
+        assert_eq!(words, [super::FULL_ACCESS_BLOCKED.0.to_string()]);
+        let shared = fn_body("show_card_blocked");
+        let call = shared.find("show_card_not_done(ctx, title, ").expect("the refusal is a NOT DONE card");
+        assert_eq!(string_literals(&shared[call..])[0], super::FULL_ACCESS_BLOCKED.1);
+        assert_eq!(super::LINK_BLOCKED.1, super::FULL_ACCESS_BLOCKED.1);
+
+        for (title, hint) in [super::FULL_ACCESS_BLOCKED, super::LINK_BLOCKED] {
+            for (w, h) in [(128, 64), (240, 135), (172, 320), (320, 172)] {
+                let l = Layout::new(w, h);
+                let available = l.w - l.sx(4);
+                assert!(title.len() as i32 * Layout::glyph_w(l.font_body()) <= available, "{title:?} drops to the small font on {w}x{h}");
+                assert!(hint.len() as i32 * Layout::glyph_w(l.font_small()) <= available, "{hint:?} clips on {w}x{h}");
+            }
         }
     }
 
@@ -2196,8 +2229,49 @@ mod link_card_tests {
                 if name == "link-other-master" {
                     assert!(as_line.ends_with(" M3"), "{w}x{h}: {as_line}");
                 }
+                // The scope is drawn whole: a link that may decrypt says so
+                // on every panel.
+                assert_eq!(scope, card.scope, "{w}x{h} {name}");
+                assert!(scope.starts_with("DECRYPT"), "{w}x{h} {name}: {scope}");
             }
         }
+    }
+
+    /// The firmware glue's order (site links design 4.2 to 4.4), which no
+    /// host test can run: the pure gate comes before the one-card rule, a
+    /// second ask cools its asker, every LINK card's close reaches the
+    /// cooldown before `resolve_button_card` can return early, and only a
+    /// slot's first-ever bind spends a link's identity grant.
+    #[test]
+    fn the_site_link_glue_keeps_its_order() {
+        let src = |path: &str| {
+            std::fs::read_to_string(format!("{}/../firmware/src/{path}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        };
+        let glue = src("relay/site_link.rs");
+        let start = glue.find("\nfn before_card(").expect("before_card");
+        let body = &glue[start..start + glue[start..].find("\n}\n").unwrap()];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("before_card: {needle}"));
+        assert!(at("gate(ctx, &create, slot, client_hex, true)?") < at("LinkError::AnotherLink"));
+        assert!(at("card.refused = Some(") < at("links().another_link(client_hex,"));
+        assert!(at("links().another_link(client_hex,") < at("Step::Queue("));
+
+        let relay = src("relay.rs");
+        let start = relay.find("\nfn resolve_button_card(").expect("resolve_button_card");
+        let body = &relay[start..start + relay[start..].find("\n}\n").unwrap()];
+        let closed = body
+            .find("site_link::card_closed(&card.key.client_hex, matches!(outcome, CardTick::Approved));")
+            .expect("every LINK card's close reaches the cooldown");
+        let removed = body.find("let card = ctx.button_cards.remove(index);").expect("the card is taken");
+        let first_return = removed + body[removed..].find("return;").expect("an early return");
+        assert!(closed < first_return, "a LINK card could close without cooling its phone");
+
+        let handler = src("nip46_handler.rs");
+        assert_eq!(handler.matches("site_link::take_on_bind(").count(), 1);
+        let hook = handler.find("site_link::take_on_bind(").unwrap();
+        let first_use = handler.find("ConnectPubkeyClass::FirstUse =>").expect("the first-use arm");
+        let unknown = handler.find("ConnectPubkeyClass::Unknown =>").expect("the arm after it");
+        assert!(first_use < hook && hook < unknown, "a link's grant must be spent only by a first-ever bind");
+        assert!(handler.find("ConnectPubkeyClass::Known =>").unwrap() < first_use);
     }
 
     /// The firmware draws the card with `show_link_request` from the card's

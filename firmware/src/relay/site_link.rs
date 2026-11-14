@@ -38,9 +38,9 @@ pub(crate) fn take_on_bind(master_slot: u8, slot_index: u8, secret: &str) -> Opt
     links().take_on_bind(master_slot, slot_index, secret, crate::uptime_ms())
 }
 
-/// A LINK card declined or timed out (design 4.4).
-pub(super) fn cooldown(client_hex: &str) {
-    links().start_cooldown(client_hex, crate::uptime_ms());
+/// A LINK card closed: anything but the hold cools its phone (design 4.4).
+pub(super) fn card_closed(client_hex: &str, held: bool) {
+    links().card_closed(client_hex, held, crate::uptime_ms());
 }
 
 /// The named identity as the gate sees it, and the name its card shows. A
@@ -129,8 +129,8 @@ fn nvs_room(ctx: &SignCtx) -> Option<heartwood_common::nvs_room::NvsRoom> {
     crate::nip46_handler::nvs_room(ctx.nvs)
 }
 
-/// Rules 1 to 7, the retry, the cooldown and the one-card rule (design 4.3
-/// to 4.5), in that order; nothing is written.
+/// Rules 1 to 6, the retry, room (rule 7), the cooldown and the one-card
+/// rule (design 4.3 to 4.5), in that order; nothing is written.
 fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &str) -> Result<Step, Refusal> {
     let create = sl::parse_create(&request.params).map_err(refusal)?;
     let waiting_link = |card: &&super::ButtonCard| {
@@ -142,27 +142,21 @@ fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &
     }) {
         return Ok(Step::Ignore);
     }
-    let now = crate::uptime_ms();
-    let card = {
-        let (plan, table, label, from) = gate(ctx, &create, slot, client_hex)?;
-        if let Some(made) = sl::retry_target(&links(), client_hex, &create, plan.master_slot, table, now) {
-            let identity = hex_encode(&create.identity);
-            let uri = mgmt::bunker_uri(&identity, &ctx.relays, Some(&made.secret));
-            return Ok(Step::Reply(sl::create_reply(made, &identity, &uri)));
+    let card = match gate(ctx, &create, slot, client_hex, true)? {
+        (sl::Gate::Retry(made), ..) => return Ok(Step::Reply(retry_reply(ctx, &create, made))),
+        (sl::Gate::Plan(plan), label, from) => {
+            sl::link_card(&create.label, &label, plan.master_slot, slot, &plan.policy, from)
         }
-        if links().cooling(client_hex, now) {
-            return Err(refusal(LinkError::ShownRecently));
-        }
-        sl::link_card(&create.label, &label, plan.master_slot, slot, &plan.policy, from)
     };
-    // A second link ask while one waits refuses both (design 4.4).
+    // A second link ask while one waits refuses both and cools the asker;
+    // the waiting card's phone cools as its card closes (design 4.4).
     let mut another = false;
     for card in ctx.button_cards.iter_mut().filter(|card| waiting_link(&&**card)) {
         card.refused = Some(refusal_pair(LinkError::AnotherLink));
         another = true;
     }
     if another {
-        return Err(refusal(LinkError::AnotherLink));
+        return Err(refusal(links().another_link(client_hex, crate::uptime_ms())));
     }
     if !crate::entropy::rng_ok() {
         return Err((-1, crate::entropy::rng_refusal().into()));
@@ -180,26 +174,32 @@ fn before_card(ctx: &mut SignCtx, request: Nip46Request, slot: u8, client_hex: &
     }))
 }
 
-/// Rules 1 to 7 against the tables as they are now, shared by the card and
-/// the hold: the plan, the identity's table, its card name and the asking
-/// slot's label. Room is checked before the retry, so a retry on a board
-/// with no room left is refused `no room` rather than answered.
-#[allow(clippy::type_complexity)]
+/// `common::site_link`'s gate against the tables as they are now, shared
+/// by the card (`card`: then the cooldown) and the hold: the verdict, the
+/// identity's card name and the asking slot's label.
 fn gate<'c>(
     ctx: &'c SignCtx,
     create: &sl::CreateRequest,
     asking_master: u8,
     client_hex: &str,
-) -> Result<(sl::CreatePlan, &'c [heartwood_common::policy::ConnectSlot], String, &'c str), Refusal> {
+    card: bool,
+) -> Result<(sl::Gate<'c>, String, &'c str), Refusal> {
     let asking = ctx.policy_engine.find_slot_by_pubkey(asking_master, client_hex);
-    let found = served(ctx, &create.identity);
-    let plan = sl::check_create(asking, client_hex, found.as_ref().map(|f| f.0), create).map_err(refusal)?;
-    // check_create passed, so both are there.
-    let (Some(asking), Some((served, label))) = (asking, found) else {
-        return Err(refusal(LinkError::IdentityNotServed));
+    let (found, label) = match served(ctx, &create.identity) {
+        Some((found, label)) => (Some(found), label),
+        None => (None, String::new()),
     };
-    sl::check_save_room(served.table, &create.label, &plan.policy, &create.identity, nvs_room(ctx)).map_err(refusal)?;
-    Ok((plan, served.table, label, asking.label.as_str()))
+    let check = if card { sl::before_card } else { sl::gate };
+    let verdict =
+        check(asking, client_hex, found, create, &links(), crate::uptime_ms(), nvs_room(ctx)).map_err(refusal)?;
+    Ok((verdict, label, asking.map_or("", |a| a.label.as_str())))
+}
+
+/// The same link again, answered as the hold answered it.
+fn retry_reply(ctx: &SignCtx, create: &sl::CreateRequest, made: &heartwood_common::policy::ConnectSlot) -> Value {
+    let identity = hex_encode(&create.identity);
+    let uri = mgmt::bunker_uri(&identity, &ctx.relays, Some(&made.secret));
+    sl::create_reply(made, &identity, &uri)
 }
 
 fn refusal_pair(e: LinkError) -> super::CardRefusal {
@@ -255,7 +255,10 @@ fn make(
     if !ctx.policy_engine.approval_is_current(epoch) {
         return Err((-1, sl::APPROVAL_CHANGED.into()));
     }
-    let plan = gate(ctx, create, asking_master, client_hex)?.0;
+    let plan = match gate(ctx, create, asking_master, client_hex, false)?.0 {
+        sl::Gate::Retry(made) => return Ok(retry_reply(ctx, create, made)),
+        sl::Gate::Plan(plan) => plan,
+    };
     if !crate::entropy::rng_ok() {
         return Err((-1, crate::entropy::rng_refusal().into()));
     }

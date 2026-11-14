@@ -3822,10 +3822,12 @@ T-Display, `riscv32-esp-elf-*` for the C6):
   jump, to any address outside IRAM or ROM; its `l32r` literals may point
   only at the RTC records (0x5000xxxx) and constants.
 
-An M4 build on esp 1.87.0.0 passed all three on all four boards, baseline and
-LTO alike: identical `.comment` strings, the placements above, and an
-`on_alloc_failed` of a few loads and stores with no call at all, ending in
-`retw.n` (Xtensa) or `ret` (RISC-V). CI's toolchain is what ships.
+M4 builds on esp 1.87.0.0 (heltec-v4, heltec-v3, tdisplay and c6, each with
+and without LTO, eight ELFs) passed all three: one `rustc version` string
+across all eight, the placements above, and an `on_alloc_failed` with no
+call or jump, ending in `retw.n` (Xtensa, whose only `l32r` literals are the
+two RTC records and one constant) or `ret` (RISC-V). CI's toolchain is what
+ships.
 
 **Reading the marks:** `node scripts/mgmt-request.mjs --method get_status`
 (the device operator's full reply). `stack_free` gives each task's bytes of
@@ -3958,7 +3960,16 @@ the same signing and cable code on the main task with the radios off, and
 
     Pass: FIRMWARE_INFO afterwards shows the same `last_reset` as before
     and an `uptime_s` larger by at least the time the step took, so the
-    board did not reset.
+    board did not reset. On a board behind a USB-UART bridge (the V3's
+    CP2102, the T-Display's CH9102) the bench scripts release DTR and RTS
+    after opening the port (`scripts/lib/port.mjs`) and heartwoodd never
+    asserts them, but a port open can still reset the chip there: a reset
+    reading `external-reset` or `usb-peripheral-reset` at a port open is the
+    cable, not the firmware. Any reset here (one of those included, if it
+    recurs) is checked by repeating the step on the baseline before it
+    counts against thin LTO; `panic` or a watchdog that the baseline does
+    not show is a failure. Boards that skip step 14 go back to `mode`
+    `wifi` the same way afterwards.
 14. A successful USB OTA (Heltec only; last, because it restarts), the
     board still in USB-bridged mode: from the image under test to the
     current signed release asset and its `.sig`, as in step 9 without

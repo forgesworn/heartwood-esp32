@@ -84,7 +84,7 @@ impl core::fmt::Debug for CashRegistry {
 /// "that host is not a host" cannot fix either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CashError {
-    /// The host is empty, too long, or not lowercase.
+    /// The host is empty, too long, not lowercase, or its port is not one.
     BadHost,
     /// No more room; forget a mint first.
     Full,
@@ -105,7 +105,37 @@ pub enum CashError {
 /// `Mint.Example` and `mint.example` would each hold notes the other cannot
 /// see. Uppercase is refused rather than folded, because folding it silently
 /// would leave the caller believing it provisioned what it typed.
+///
+/// A `:` brings a port and nothing else: a decimal 1 to 65535 with no sign,
+/// no leading zero and nothing after it, so `moneyer.dev:x` or a second `:`
+/// is refused. A port the host is stored with names a different registry
+/// entry and a different legacy branch, so it has to be one a wallet could
+/// spell.
 pub fn valid_host(host: &str) -> bool {
+    if !valid_stored_host(host) {
+        return false;
+    }
+    match host.split_once(':') {
+        Some((name, port)) => !name.is_empty() && valid_port(port),
+        None => true,
+    }
+}
+
+/// A port as a wallet spells one: 1 to 65535 in decimal, no leading zero.
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.len() <= 5
+        && !port.starts_with('0')
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u32>().is_ok_and(|p| (1..=65535).contains(&p))
+}
+
+/// The character rule hosts were stored under before [`valid_host`] also
+/// checked the port. A registry entry and a legacy branch handed out then
+/// keep to it, so a mint provisioned under it still loads with every secret
+/// its ladder derives, and a branch hashed on such a spelling is still
+/// found. Only new hosts meet the port rule.
+pub fn valid_stored_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= MAX_HOST_LEN
         && host
@@ -247,7 +277,7 @@ impl CashRegistry {
                 return None;
             }
             let host = core::str::from_utf8(&rest[1..1 + host_len]).ok()?;
-            if !valid_host(host) {
+            if !valid_stored_host(host) {
                 return None;
             }
             let mut node_bytes = [0u8; 64];
@@ -366,6 +396,66 @@ mod tests {
         // and the ones that are hosts go in, port included
         assert!(reg.provision("mint.example", node("mint.example")).is_ok());
         assert!(reg.provision("127.0.0.1:8899", node("127.0.0.1:8899")).is_ok());
+    }
+
+    #[test]
+    fn a_colon_brings_a_port_and_nothing_else() {
+        for good in ["moneyer.dev", "moneyer.dev:1", "moneyer.dev:443", "moneyer.dev:8080", "127.0.0.1:65535"] {
+            assert!(valid_host(good), "{good}");
+            assert!(CashRegistry::new().provision(good, node(good)).is_ok(), "{good}");
+        }
+        for bad in [
+            "moneyer.dev:x",
+            "moneyer.dev:",
+            "moneyer.dev:0",
+            "moneyer.dev:0443",
+            "moneyer.dev:65536",
+            "moneyer.dev:99999",
+            "moneyer.dev:123456",
+            "moneyer.dev:443x",
+            "moneyer.dev:44:3",
+            "moneyer.dev::443",
+            ":443",
+            ":",
+        ] {
+            assert!(!valid_host(bad), "{bad}");
+            assert_eq!(CashRegistry::new().provision(bad, node("a")), Err(CashError::BadHost), "{bad}");
+        }
+    }
+
+    /// One registry entry exactly as `encode` lays it down, for a host the
+    /// port rule would now refuse at the door.
+    fn stored_entry(host: &str, next_index: u32) -> Vec<u8> {
+        let mut blob = alloc::vec![VERSION, host.len() as u8];
+        blob.extend_from_slice(host.as_bytes());
+        blob.extend_from_slice(cash_node_to_bytes(&node(host)).as_ref());
+        blob.extend_from_slice(&next_index.to_be_bytes());
+        blob
+    }
+
+    #[test]
+    fn a_mint_stored_before_the_port_rule_still_loads_and_derives() {
+        // Written when any run of `:`, digits and letters passed: the entry
+        // must still decode, walk its ladder from where it was and derive
+        // the same secrets, or every note that mint's ladder found is lost.
+        // The secret is frozen from main before the port rule.
+        let frozen = [
+            ("mint.example:0443", "7b99233f1427526d23b156381807fb32a8ea1cd15e1282ce709f8ae816c99fb8"),
+            ("mint.example:x", "158101d97eba97a5f106fefb67ac1463b67a2dda8a85edc94571cb474926464d"),
+            ("mint.example::1", "f37e28ea03de542df40c3981df77dde5a8126efde686f641c90a97c974695e3c"),
+        ];
+        for (host, want) in frozen {
+            let mut reg = CashRegistry::decode(&stored_entry(host, 7)).expect("an old entry still decodes");
+            assert_eq!(reg.hosts().collect::<Vec<_>>(), [(host, 7)]);
+            assert_eq!(reg.take_index(host), Ok(7));
+            let secret = crate::cash::cash_secret_at(&reg.get(host).unwrap().node, 7).unwrap();
+            assert_eq!(crate::hex::hex_encode(secret.as_ref()), want, "{host}");
+            assert_eq!(reg.raise_index(host, 20), Ok(20));
+            // and it round-trips, so a save after a draw keeps it
+            let again = CashRegistry::decode(&reg.encode()).expect("re-encoded");
+            assert_eq!(again.hosts().collect::<Vec<_>>(), [(host, 20)]);
+            assert!(reg.forget(host));
+        }
     }
 
     #[test]

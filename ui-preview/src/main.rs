@@ -2325,3 +2325,21 @@ mod link_card_tests {
         assert!(oled[link..].contains("l.span_chars(None, l.font_header())"), "the link card lines are cut to the span");
     }
 }
+
+#[cfg(test)]
+mod identity_picture_tests {
+    use heartwood_common::identity_avatar::{rgb332_to_rgb565, rgb565_to_rgb332};
+
+    #[test]
+    fn the_stored_picture_format_is_the_framebuffer_cube() {
+        // The signer stores an identity picture at one byte a pixel with
+        // common's conversion, and the colour panels' framebuffer quantises
+        // with pixel8's. One implementation in effect: equal on every value.
+        for byte in 0..=255u8 {
+            assert_eq!(rgb332_to_rgb565(byte), crate::pixel8::cube_to_raw(byte), "{byte:#04x}");
+        }
+        for raw in 0..=u16::MAX {
+            assert_eq!(rgb565_to_rgb332(raw), crate::pixel8::raw_to_cube(raw), "{raw:#06x}");
+        }
+    }
+}

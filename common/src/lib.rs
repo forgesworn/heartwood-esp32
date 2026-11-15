@@ -89,6 +89,9 @@ pub mod persistent_state;
 /// fallback policy, and the gate on writes that grow the store.
 pub mod nvs_budget;
 
+/// Identity pictures: pixel formats and the one-byte-a-pixel stored form.
+pub mod identity_avatar;
+
 pub mod persona_pack;
 
 /// NVS entry arithmetic for a blob write (ESP-IDF's multi-page blob layout).

@@ -3313,7 +3313,7 @@ fn locked_relay_phase(
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
                     // `Some(relays)`: the locked phase's own list, the same
                     // one `relays_at_boot` compared against this boot.
-                    crate::firmware_info_json(nvs, Some(relays)).as_bytes(),
+                    crate::firmware_info_json(nvs, Some(relays), false).as_bytes(),
                 ),
                 FRAME_TYPE_PROVISION_LIST => {
                     // Safe while locked (npubs only, no secrets) and REQUIRED
@@ -4434,7 +4434,7 @@ fn poll_usb_frame(
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
             // `Some(&ctx.relays)`: the list this relay loop is actually
             // running, not a fresh net-config read.
-            crate::firmware_info_json(ctx.nvs, Some(&ctx.relays)).as_bytes(),
+            crate::firmware_info_json(ctx.nvs, Some(&ctx.relays), ctx.policy_engine.bridge_authenticated).as_bytes(),
         ),
 
         // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
@@ -11396,8 +11396,9 @@ fn dispatch_mgmt(
 
         // The cable-free twin of the USB SET_IDENTITY_META (0x5b) frame:
         // Sapwood resolves the kind-0 and shrinks the picture in-browser,
-        // then hands over ready Rgb565 bytes (base64 inside the NIP-44
-        // ciphertext). The signer still never fetches or decodes images.
+        // then hands over ready bytes (base64 inside the NIP-44 ciphertext):
+        // Rgb565 (w*h*2) or RGB332 (w*h), the length picking the format. The
+        // signer still never fetches or decodes images.
         "set_identity_meta" => {
             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
             let name = req
@@ -11426,8 +11427,8 @@ fn dispatch_mgmt(
                         .unwrap_or(""),
                 )
                 .map_err(|e| format!("avatar_b64: {e}"))?;
-            if avatar.len() != (w as usize) * (h as usize) * 2 {
-                return Err(format!("avatar length {} != w*h*2", avatar.len()));
+            if heartwood_common::identity_avatar::classify(w as u8, h as u8, avatar.len()).is_none() {
+                return Err(format!("avatar length {} is neither w*h*2 nor w*h", avatar.len()));
             }
             crate::identity_meta::save(ctx.nvs, master_slot, name, w as u8, h as u8, &avatar)?;
             log::info!(
@@ -11675,6 +11676,11 @@ fn dispatch_mgmt(
             status["min_free_heap"] = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() }.into();
             status["relay_connects"] = RELAY_CONNECTS.load(Ordering::Relaxed).into();
             status[heartwood_common::task_stacks::STACK_FREE_KEY] = stack_free();
+            // Stored lengths of the largest hot blob and each cached picture
+            // (`nvs_budget::BlobSizes`): lengths only, full reply only.
+            status[heartwood_common::nvs_budget::BLOB_SIZES_KEY] =
+                serde_json::from_str(&crate::nvs::blob_sizes(ctx.nvs).to_json(true))
+                    .unwrap_or(serde_json::Value::Null);
             Ok(status)
         }
 

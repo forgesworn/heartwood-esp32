@@ -194,9 +194,14 @@ use secp256k1::Secp256k1;
 /// mode, or before WiFi-standalone's own boot decision has run); the only
 /// case that falls back to `net_config_store::committed_or_active_relays`,
 /// which reads NVS instead of RAM.
+///
+/// `bridge_authenticated`: whether this USB host has proved the bridge
+/// secret (`SESSION_AUTH`). Without it `nvs_blobs` is the bare largest
+/// length (`nvs_budget::BlobSizes::to_json`).
 pub fn firmware_info_json(
     nvs: &esp_idf_svc::nvs::EspNvs<esp_idf_svc::nvs::NvsDefault>,
     running_relays: Option<&[String]>,
+    bridge_authenticated: bool,
 ) -> String {
     let crash = crash_context()
         .map(|op| format!(",\"crashed_during\":{}", json_string(op)))
@@ -223,6 +228,14 @@ pub fn firmware_info_json(
             )
         })
         .unwrap_or_default();
+    // Stored lengths of the largest hot blob and each cached picture, so a
+    // refused write can be explained without reading NVS. Lengths only; the
+    // key name and the pictures only to an authenticated bridge.
+    let nvs_blobs = format!(
+        ",\"{}\":{}",
+        heartwood_common::nvs_budget::BLOB_SIZES_KEY,
+        crate::nvs::blob_sizes(nvs).to_json(bridge_authenticated),
+    );
     let (at_rest, unlock_phones) = pin::at_rest_status(nvs);
     let fallback_relays;
     let current_relays: &[String] = match running_relays {
@@ -238,7 +251,7 @@ pub fn firmware_info_json(
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
          \"free_heap\":{},\"largest_block\":{},\"display_flip\":{},\
-         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}{}}}",
+         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -256,6 +269,7 @@ pub fn firmware_info_json(
         crash,
         crash_detail,
         nvs_stats,
+        nvs_blobs,
     )
 }
 
@@ -747,7 +761,7 @@ fn main() {
                     protocol::write_frame(
                         &mut usb,
                         FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                        firmware_info_json(&nvs, None).as_bytes(),
+                        firmware_info_json(&nvs, None, false).as_bytes(),
                     );
                 }
                 FRAME_TYPE_PROVISION | FRAME_TYPE_GENERATE_IDENTITY | FRAME_TYPE_RESTORE_IDENTITY => {
@@ -963,7 +977,7 @@ fn main() {
                     protocol::write_frame(
                         &mut usb,
                         FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                        firmware_info_json(&nvs, None).as_bytes(),
+                        firmware_info_json(&nvs, None, false).as_bytes(),
                     );
                 }
                 FRAME_TYPE_FACTORY_RESET => {
@@ -1275,7 +1289,7 @@ fn main() {
                 protocol::write_frame(
                     &mut usb,
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
-                    firmware_info_json(&nvs, None).as_bytes(),
+                    firmware_info_json(&nvs, None, policy_engine.bridge_authenticated).as_bytes(),
                 );
             }
 

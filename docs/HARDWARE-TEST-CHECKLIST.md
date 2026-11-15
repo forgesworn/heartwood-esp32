@@ -4197,3 +4197,105 @@ step 5 for `free_heap` if a board is to hand. Spare board, WiFi-standalone with 
 On failure: record the screen, a photo of it beside beta.38's, and the heap
 figures. A wrong palette colour is a bug in `pixel8.rs` (the host test should
 have caught it: add the case there).
+
+## 46. Identity pictures kept beside a full pairing table (added 2026-11-15, NOT YET BENCH-RUN)
+
+Why: a T-Display on 0.18.0-beta.38 with six pairings on master 0 lost its
+identity picture and could not take it back: Sapwood got `storage_full: not
+enough storage left for the avatar; the pairings need the room`. #197 dropped
+cached pictures before every tight pairing-table save, and stored a 48x48
+picture as 4,610 bytes of Rgb565 (charged 165 entries at write time). Now a
+picture is dropped only when the save would otherwise be refused or lost
+after its erase, or could then be rewritten in place rather than erased
+first (an in-place-only save, such as the network config, only when that
+lets it land); a persona or phone the growth gate would refuse drops it first when
+that alone makes the room (not a bundle's personas); a picture must leave
+room for a full-size network config rewrite (50 entries), and counts the
+name written before it when the name changes; and a picture is stored at one
+byte a pixel, `[0x00][0x01][w][h]` then RGB332, so 48x48 is 2,308 bytes and
+64x64 is 4,100. The gate charges a write its worst case (`blob_entries`: 91
+entries for 48x48, 149 for 64x64); what a stored 48x48 picture keeps in use
+is 75 entries, or 76 if it spans a page. On the wire (0x5B and the relay
+`set_identity_meta`) the length picks the format, #278's rule: `w*h*2` bytes
+is Rgb565, converted on the device; `w*h` is RGB332, stored as it came; any
+other length is refused. Host tests: `common/src/identity_avatar.rs`,
+`nvs_budget.rs` and the board model in `firmware_policy_host_tests.rs`
+(`BOARD_AVAILABLE` = 176). The model's six-pairing table is 5,280 bytes; the
+real `connslots_0` length is not known here, and 48x48 is accepted at 176
+free entries only beside a table of at least 4,993 bytes, one that could not
+go in place anyway. Step 1 reads it from the new `nvs_blobs` status field,
+which reports stored lengths only (`largest_hot`, `largest_hot_key`, and
+`avatars` by master slot), never contents. FIRMWARE_INFO gives the key name
+and `avatars` only once the bridge has passed `SESSION_AUTH`, which needs a
+stored bridge secret (a board paired to heartwoodd); before that, and on a
+board with no bridge secret, it reports `largest_hot` alone. The 48x48
+acceptance also needs at least 159 available entries beside that table (166
+when Sapwood sends a changed 15-byte name), and no other hot blob (the phone
+records, a persona chunk) between 1,729 and 4,992 bytes, which `nvs_blobs`
+does not show, since it names only the largest.
+
+The owner's T-Display (beta.38, one master, six pairings, `get_status` about
+176 available entries). Over the cable or the relay, as Sapwood does it.
+
+1. Flash this image (app only, 0x10000). The board boots with its six
+   pairings and no picture. Read `get_status` (relay, device operator):
+   record the `nvs` figures (available is free less one
+   page, 126 entries) and `nvs_blobs`. Expected: `largest_hot_key`
+   `connslots_0`, `avatars` `{}`. Record `largest_hot`: at 4,993 bytes or
+   more step 2 should be accepted, below that it is refused. If
+   `largest_hot_key` is anything else, record the key and length: the field
+   then does not give the `connslots_0` length, so make no prediction and
+   record step 2's outcome as it comes. Also read FIRMWARE_INFO over the
+   cable without `SESSION_AUTH`: expected `"nvs_blobs":{"largest_hot":N}`,
+   the same N, and no key name or `avatars`. Nothing here reads NVS beyond
+   what the board reports.
+2. Re-provision the 48x48 picture from Sapwood: ACK, the npub screen shows it,
+   colours close to the source with the RGB332 steps already seen on section
+   45's screens. Record available entries after: the model predicts 75 or
+   76 fewer, so about 100 left (the gate charged it 91 before the write).
+   `nvs_blobs.avatars` reads `{"0":2308}`. Optional, if the #278 Sapwood
+   draft is to hand (it sends RGB332 over the cable only): send the same
+   picture that way (2,304 pixel bytes): ACK, the same 2,308 stored. The
+   refusal half needs #278's `scripts/identity-meta-params.mjs`, which is
+   not on this branch; run it from a checkout of `feat/avatar-rgb332`
+   through `scripts/mgmt-request.mjs` over the relay, with
+   `--format rgb332 --size 48 --bytes 2303`, then `--bytes 2305`: both
+   refused, the picture kept. Without that checkout, skip the refusal half;
+   the host tests cover it.
+   If it is refused with the same `storage_full` text, record the free entries
+   and the table length. Below 159 available entries (166 with a changed
+   name; the same name sent again costs nothing) the board is too full
+   whatever the table. Otherwise either the table is shorter than 4,993
+   bytes, and freeing one pairing will not help (the band 3,489 to 5,120
+   bytes refuses it too), or, with `largest_hot` at 4,993 or more, another
+   hot blob of 1,729 to 4,992 bytes (the phone records or a persona chunk)
+   could go in place without the picture and not with it; record the
+   enrolled phone and persona counts.
+3. A change to one of the six: rename a pairing, or change its policy. It
+   saves, and the picture is still there after a reboot. Only adding a
+   pairing is growth-gated; a six-pairing table this size erases first
+   whether the picture is there or not, so nothing drops it, even for a
+   change that lengthens the table a little.
+4. A seventh pairing is refused (`no room to save this pairing`), with or
+   without the picture; the picture is still there afterwards. The model needs
+   272 available entries for it.
+5. A revocation that drops one of the six may drop the picture (the five-pairing
+   table then goes in place only without it); the log shows `dropped cached
+   avatars` with a count. Re-sending the picture is then refused with the
+   `storage_full` text. Record the free entries at both points. Re-add the
+   pairing afterwards.
+6. 64x64 is refused at 176 available (41 entries short of the table's
+   erase-first rewrite with room for a network config; it would need 347
+   beside this table); record the reply.
+7. With the 48x48 picture stored, make a real network config change over
+   the cable or the relay (`scripts/net-config.mjs`; for instance move a
+   fallback network up the list, then back in a second change, recording
+   the revision each time): both are written, `net-config` reads each back,
+   and the picture is still there.
+8. Downgrade note, do not run on the owner's board: beta.38 reads the new
+   picture as none and shows no npub card name either until the picture is
+   sent again; a picture stored by beta.38 is read by this image as it is.
+
+On failure: record the reply, the `get_status` NVS figures before and after,
+and the `connslots_0` length; the threshold arithmetic is
+`nvs_budget::avatar_allowed`.

@@ -43,8 +43,23 @@ const NVS_SEEDED_CRC_KEY: &str = "ncfg_crc";
 // Raised from 512 when the fallback-network list landed: eight credential
 // pairs plus relays no longer fit half a kilobyte. Bounded to keep the NVS
 // footprint honest — the active blob and a staged trial candidate can coexist.
-const NET_CONFIG_MAX_LEN: usize = 1024;
-const NET_TRIAL_MAX_LEN: usize = 1024;
+// The figure lives in `nvs_budget`, which keeps room for one rewrite of it
+// beside a cached picture (`avatar_reserve`).
+const NET_CONFIG_MAX_LEN: usize = heartwood_common::nvs_budget::NET_CONFIG_MAX_LEN;
+const NET_TRIAL_MAX_LEN: usize = heartwood_common::nvs_budget::NET_CONFIG_MAX_LEN;
+
+/// Before a rewrite of `key`, which never erases first: drop the cached
+/// pictures if the write would otherwise be refused (`nvs::make_room_to_replace`).
+/// A picture must never be what keeps a remote board from changing network;
+/// Sapwood can send it again.
+fn make_room(nvs: &mut EspNvs<NvsDefault>, key: &str, value: &[u8]) {
+    let fallback = heartwood_common::nvs_budget::fallback_for(key);
+    let dropped = crate::nvs::make_room_to_replace(nvs, key, value, fallback);
+    if dropped > 0 {
+        log::warn!("{key} short of room: dropped {dropped} cached avatar(s)");
+    }
+}
+
 const NET_LAST_MAX_LEN: usize = 192;
 
 #[derive(Debug, Clone)]
@@ -60,6 +75,7 @@ pub fn write_net_config(nvs: &mut EspNvs<NvsDefault>, json: &[u8]) -> Result<(),
     if json.len() > NET_CONFIG_MAX_LEN {
         return Err("net config too large");
     }
+    make_room(nvs, NVS_NET_CONFIG_KEY, json);
     nvs.replace_blob(NVS_NET_CONFIG_KEY, json)
         .map_err(|_| "nvs write failed")?;
     if read_net_config(nvs).as_deref() != Some(json) {
@@ -136,6 +152,7 @@ fn write_trial(
     if json.len() > NET_TRIAL_MAX_LEN {
         return Err("network trial too large");
     }
+    make_room(nvs, NVS_TRIAL_KEY, &json);
     nvs.replace_blob(NVS_TRIAL_KEY, &json)
         .map_err(|_| "network trial nvs write failed")
 }

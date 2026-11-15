@@ -227,11 +227,14 @@ fn register_bundle_persona(
         return Err(bundle_err(e));
     }
     if !crate::personas::contains_pubkey(personas, &pubkey) {
-        if crate::personas::capacity_check(nvs).is_err() {
+        // `Keep`: the pre-card check counted the cached pictures as room for
+        // the slot table this press saves next, not for these names.
+        let room = crate::personas::AvatarRoom::Keep;
+        if crate::personas::capacity_check(nvs, room).is_err() {
             undo(cache);
             return Err(bundle_err(BundleError::StorageFull));
         }
-        if let Err(e) = crate::personas::add(nvs, master_slot, &purpose, 0, Some(name), &pubkey) {
+        if let Err(e) = crate::personas::add(nvs, master_slot, &purpose, 0, Some(name), &pubkey, room) {
             undo(cache);
             log::warn!("heartwood_approve_bundle: registry write failed — {e}");
             return Err(if e.starts_with("identity storage full") {
@@ -2189,7 +2192,7 @@ fn dispatch_inner(
                     // post-request sweep remains as a retry for strays only.
                     let pubkey = cache.identities[idx].public_key;
                     if !crate::personas::contains_pubkey(personas, &pubkey) {
-                        if let Err(full) = crate::personas::capacity_check(nvs) {
+                        if let Err(full) = crate::personas::capacity_check(nvs, crate::personas::AvatarRoom::Drop) {
                             if cache.identities.len() > len_before {
                                 cache.identities.truncate(len_before);
                             }
@@ -2207,6 +2210,7 @@ fn dispatch_inner(
                             index,
                             name.as_deref(),
                             &pubkey,
+                            crate::personas::AvatarRoom::Drop,
                         ) {
                             if cache.identities.len() > len_before {
                                 cache.identities.truncate(len_before);
@@ -2293,7 +2297,7 @@ fn dispatch_inner(
                     let pubkey = cache.identities[idx].public_key;
                     let newly_registered = !crate::personas::contains_pubkey(personas, &pubkey);
                     if newly_registered {
-                        if let Err(full) = crate::personas::capacity_check(nvs) {
+                        if let Err(full) = crate::personas::capacity_check(nvs, crate::personas::AvatarRoom::Drop) {
                             if cache.identities.len() > len_before {
                                 cache.identities.truncate(len_before);
                             }
@@ -2311,6 +2315,7 @@ fn dispatch_inner(
                             reg_index,
                             reg_name.as_deref(),
                             &pubkey,
+                            crate::personas::AvatarRoom::Drop,
                         ) {
                             if cache.identities.len() > len_before {
                                 cache.identities.truncate(len_before);
@@ -2904,7 +2909,7 @@ pub(crate) fn nvs_room(
     crate::nvs_stats::read().map(|stats| heartwood_common::nvs_room::NvsRoom {
         free_entries: stats.free_entries,
         total_entries: stats.total_entries,
-        reclaimable_entries: crate::policy::avatar_cache_entries(nvs),
+        reclaimable_entries: crate::nvs::avatar_reclaim(nvs),
     })
 }
 

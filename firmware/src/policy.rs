@@ -33,34 +33,6 @@ use heartwood_common::policy::{
 /// that every logically permitted combination fits physically.
 const MAX_SLOT_BLOB_BYTES: usize = 64 * 1024;
 
-/// NVS entries [`evict_avatar_cache`] can be counted on to free: what a
-/// slot write that does not fit reclaims before its second try, so the
-/// setup hold's save-room check counts it as room. Each avatar at its
-/// fewest entries (`heartwood_common::nvs_room::min_blob_entries`).
-pub(crate) fn avatar_cache_entries(nvs: &EspNvs<NvsDefault>) -> usize {
-    // masters::MAX_MASTERS
-    (0..8u8)
-        .filter_map(|slot| nvs.blob_len(&format!("imav{slot}")).ok().flatten())
-        .map(heartwood_common::nvs_room::min_blob_entries)
-        .sum()
-}
-
-/// Drop every cached avatar (`imav<slot>`, written by identity_meta.rs) and
-/// keep the names. Returns how many went.
-///
-/// An avatar is a display nicety Sapwood can send again; the pairing table it
-/// competes with for NVS cannot be re-created. On a 24 KiB partition an
-/// 8 KiB avatar left no room for an 11-pairing table, so a restore the owner
-/// had approved failed with "Storage error" (T-Display, 2026-09-24). Called
-/// only when a pairing write fails. Spelt out here rather than in
-/// identity_meta.rs because this file is also host-tested on its own.
-fn evict_avatar_cache(nvs: &mut EspNvs<NvsDefault>) -> usize {
-    // masters::MAX_MASTERS
-    (0..8u8)
-        .filter(|slot| matches!(nvs.remove(&format!("imav{slot}")), Ok(true)))
-        .count()
-}
-
 /// The NVS key of master `slot`'s pairing table.
 #[inline(never)]
 fn slots_key(slot: u8) -> String {
@@ -113,8 +85,9 @@ pub enum RevocationSave {
 /// Why a pairing-table save did not happen ([`PolicyEngine::try_persist_slots`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotSaveError {
-    /// A new pairing was refused by the NVS growth gate (`nvs::growth_allowed`)
-    /// even after the cached avatars were dropped. Nothing was written: the
+    /// A new pairing was refused by the NVS growth gate (`nvs::growth_allowed`),
+    /// and dropping the cached avatars would not have let it through (they
+    /// are kept then, `nvs::make_room_to_grow`). Nothing was written: the
     /// board is short of room, not faulty.
     NoRoom,
     /// The table was invalid or the master unavailable, or the write or its
@@ -1265,7 +1238,7 @@ impl PolicyEngine {
     ///
     /// A new pairing must leave room to rewrite the largest pairing table in
     /// place afterwards (`nvs::growth_allowed`, headroom hygiene);
-    /// cached avatars are dropped first if that makes the room. Otherwise
+    /// cached avatars are dropped first only if that makes the room. Otherwise
     /// nothing is written and this returns false, so the caller rolls back.
     /// A table with no room for a second copy is erased before its rewrite
     /// (`nvs::ReplaceBlob`), so a cut there leaves this master with no
@@ -1460,8 +1433,7 @@ impl PolicyEngine {
                     if mode == SlotWrite::Change
                         && adding
                         && growing
-                        && !crate::nvs::growth_allowed(nvs, &key, json.len())
-                        && (evict_avatar_cache(nvs) == 0 || !crate::nvs::growth_allowed(nvs, &key, json.len()))
+                        && !crate::nvs::make_room_to_grow(nvs, &key, json.len())
                     {
                         log::error!(
                             "Slot table for slot {master_slot} would leave too little room to rewrite it in place; not written"
@@ -1481,13 +1453,29 @@ impl PolicyEngine {
                             nvs.replace_blob_in_place(&key, json.as_bytes())
                         }
                     };
-                    // Pairings outrank the avatar cache: if the table has no
-                    // room beside what is stored, drop the avatars BEFORE
-                    // writing. Not after a failure: a table is several chunks,
-                    // and a failed multi-chunk write must not be repeated in
-                    // the same boot (`nvs::write_blocked`).
-                    if !crate::nvs::fits(nvs, json.len()) && evict_avatar_cache(nvs) > 0 {
-                        log::warn!("Slot table for slot {master_slot} short of room: dropped cached avatars");
+                    // Pairings outrank the avatar cache (an avatar is a
+                    // display nicety Sapwood can send again; a pairing cannot
+                    // be re-created): drop the avatars BEFORE writing when the
+                    // write is predicted to be refused or lost with them kept
+                    // (the bound is a worst case, so their room may be what
+                    // lets it land; an in-place-only save, never tried past
+                    // the bound, only when their room does), or when dropping
+                    // them takes it from an erase to in place
+                    // (`nvs::make_room_to_replace`). A table
+                    // predicted to land after its erase either way keeps them:
+                    // on a full T-Display every save dropped the picture
+                    // (beta.38). Not
+                    // after a failure: a table is several chunks, and a failed
+                    // multi-chunk write must not be repeated in the same boot
+                    // (`nvs::write_blocked`).
+                    let fallback = if may_erase {
+                        heartwood_common::nvs_budget::fallback_for(&key)
+                    } else {
+                        heartwood_common::nvs_budget::Fallback::Never
+                    };
+                    let dropped = crate::nvs::make_room_to_replace(nvs, &key, json.as_bytes(), fallback);
+                    if dropped > 0 {
+                        log::warn!("Slot table for slot {master_slot} short of room: dropped {dropped} cached avatar(s)");
                     }
                     let written = write(nvs);
                     if let Err(e) = written {

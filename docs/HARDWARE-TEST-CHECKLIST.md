@@ -4197,3 +4197,53 @@ step 5 for `free_heap` if a board is to hand. Spare board, WiFi-standalone with 
 On failure: record the screen, a photo of it beside beta.38's, and the heap
 figures. A wrong palette colour is a bug in `pixel8.rs` (the host test should
 have caught it: add the case there).
+
+## 46. Identity pictures kept beside a full pairing table (added 2026-11-15, NOT YET BENCH-RUN)
+
+Why: a T-Display on 0.18.0-beta.38 with six pairings on master 0 lost its
+identity picture and could not take it back: Sapwood got `storage_full: not
+enough storage left for the avatar; the pairings need the room`. #197 dropped
+cached pictures before every tight pairing-table save, and stored a 48x48
+picture as 4,610 bytes of Rgb565 (165 entries). Now a picture is dropped only
+when the save would otherwise be refused, or could then be rewritten in place
+rather than erased first; a persona or phone the growth gate would refuse
+drops it first when that alone makes the room; and a picture is stored at one
+byte a pixel, `[0x00][0x01][w][h]` then RGB332, so 48x48 is 2,308 bytes (91
+entries) and 64x64 is 4,100 (149). The 0x5B wire is unchanged (Rgb565); the
+device converts. Host tests: `common/src/identity_avatar.rs`,
+`nvs_budget.rs` and the board model in `firmware_policy_host_tests.rs`
+(`BOARD_AVAILABLE` = 176). The model's six-pairing table is 5,280 bytes; the
+real `connslots_0` length is not known here, and 48x48 is accepted at 176
+free entries only beside a table of at least 4,993 bytes, one that could not
+go in place anyway. Record that length in step 1.
+
+The owner's T-Display (beta.38, one master, six pairings, `get_status` about
+176 available entries). Over the cable or the relay, as Sapwood does it.
+
+1. Before flashing, read `get_status` NVS figures (used, free, available) and,
+   if the bench host can, the `connslots_0` length. Flash this image (app
+   only, 0x10000). The board boots with its six pairings and no picture.
+2. Re-provision the 48x48 picture from Sapwood: ACK, the npub screen shows it,
+   colours close to the source with the RGB332 steps already seen on section
+   45's screens. Record available entries after (the model predicts 91 fewer).
+   If it is refused with the same `storage_full` text, record the free entries
+   and the table length: the table is shorter than 4,993 bytes, and freeing one
+   pairing will not help (the band 3,489 to 5,120 bytes refuses it too).
+3. A change that keeps the table's size: rename a pairing, or change one
+   pairing's policy. It saves, and the picture is still there after a reboot.
+4. A seventh pairing is refused (`no room to save this pairing`), with or
+   without the picture; the picture is still there afterwards. The model needs
+   272 available entries for it.
+5. A revocation that drops one of the six may drop the picture (the five-pairing
+   table then goes in place only without it); the log shows `dropped cached
+   avatars` with a count. Re-sending the picture is then refused with the
+   `storage_full` text. Record the free entries at both points. Re-add the
+   pairing afterwards.
+6. 64x64 is refused at 176 available (four entries short); record the reply.
+7. Downgrade note, do not run on the owner's board: beta.38 reads the new
+   picture as none and shows no npub card name either until the picture is
+   sent again; a picture stored by beta.38 is read by this image as it is.
+
+On failure: record the reply, the `get_status` NVS figures before and after,
+and the `connslots_0` length; the threshold arithmetic is
+`nvs_budget::avatar_allowed`.

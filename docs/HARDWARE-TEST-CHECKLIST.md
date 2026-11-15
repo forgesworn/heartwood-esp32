@@ -4211,24 +4211,36 @@ drops it first when that alone makes the room; and a picture is stored at one
 byte a pixel, `[0x00][0x01][w][h]` then RGB332, so 48x48 is 2,308 bytes and
 64x64 is 4,100. The gate charges a write its worst case (`blob_entries`: 91
 entries for 48x48, 149 for 64x64); what a stored 48x48 picture keeps in use
-is 75 entries, or 76 if it spans a page. The 0x5B wire is unchanged (Rgb565); the
-device converts. Host tests: `common/src/identity_avatar.rs`,
+is 75 entries, or 76 if it spans a page. On the wire (0x5B and the relay
+`set_identity_meta`) the length picks the format, #278's rule: `w*h*2` bytes
+is Rgb565, converted on the device; `w*h` is RGB332, stored as it came; any
+other length is refused. Host tests: `common/src/identity_avatar.rs`,
 `nvs_budget.rs` and the board model in `firmware_policy_host_tests.rs`
 (`BOARD_AVAILABLE` = 176). The model's six-pairing table is 5,280 bytes; the
 real `connslots_0` length is not known here, and 48x48 is accepted at 176
 free entries only beside a table of at least 4,993 bytes, one that could not
-go in place anyway. Record that length in step 1.
+go in place anyway. Step 1 reads it from the new `nvs_blobs` status field,
+which reports stored lengths only (`largest_hot`, `largest_hot_key`, and
+`avatars` by master slot), never contents.
 
 The owner's T-Display (beta.38, one master, six pairings, `get_status` about
 176 available entries). Over the cable or the relay, as Sapwood does it.
 
-1. Before flashing, read `get_status` NVS figures (used, free, available) and,
-   if the bench host can, the `connslots_0` length. Flash this image (app
-   only, 0x10000). The board boots with its six pairings and no picture.
+1. Flash this image (app only, 0x10000). The board boots with its six
+   pairings and no picture. Read `get_status` (relay, device operator) or
+   FIRMWARE_INFO (USB): record the `nvs` figures (available is free less one
+   page, 126 entries) and `nvs_blobs`. Expected: `largest_hot_key`
+   `connslots_0`, `avatars` `{}`. Record `largest_hot`: at 4,993 bytes or
+   more step 2 should be accepted, below that it is refused. Nothing here
+   reads NVS beyond what the board reports.
 2. Re-provision the 48x48 picture from Sapwood: ACK, the npub screen shows it,
    colours close to the source with the RGB332 steps already seen on section
    45's screens. Record available entries after: the model predicts 75 or
    76 fewer, so about 100 left (the gate charged it 91 before the write).
+   `nvs_blobs.avatars` reads `{"0":2308}`. If a Sapwood build that sends
+   RGB332 (the #278 draft) is to hand, send the same picture that way
+   (2,304 pixel bytes): ACK, the same 2,308 stored, and a 2,303- or
+   2,305-byte picture is refused with the picture kept.
    If it is refused with the same `storage_full` text, record the free entries
    and the table length: the table is shorter than 4,993 bytes, and freeing one
    pairing will not help (the band 3,489 to 5,120 bytes refuses it too).

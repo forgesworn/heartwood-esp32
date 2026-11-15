@@ -690,7 +690,9 @@ changes hands:
   locked (the same trust level as its other operational fields — uptime, RNG
   state, crash context, and since 2026-11-13 `crash_detail`: a panic's
   source `file:line` or a failed allocation's size, never a panic message,
-  which can carry request data); `relay` `get_status` only once genuinely unlocked,
+  which can carry request data; since 2026-11-15 `nvs_blobs`, the stored
+  byte lengths of the largest pairing table, phone record or persona chunk
+  (with its key name) and of each cached picture, never their contents); `relay` `get_status` only once genuinely unlocked,
   and only to the device operator, never a per-identity delegate — including
   its low-heap `minimal_status_json` fallback, which used to leak
   `master_count`, `relay` and `crashed_during` to a delegate too (now fixed

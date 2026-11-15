@@ -252,6 +252,62 @@ pub fn evict_avatars(mut remove: impl FnMut(&str) -> bool) -> usize {
     avatar_keys().filter(|key| remove(key)).count()
 }
 
+/// The status key [`BlobSizes`] is reported under: FIRMWARE_INFO and the
+/// device operator's full `get_status`, never a delegate's reply nor the
+/// low-heap fallback.
+pub const BLOB_SIZES_KEY: &str = "nvs_blobs";
+
+/// Stored lengths, in bytes, of the blobs the growth gates weigh: the
+/// largest hot one ([`hot_keys`]) and each cached picture. Lengths and key
+/// names only, never contents, so a manager or the bench can see why a
+/// write is refused without reading NVS.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlobSizes {
+    /// The largest stored hot blob: its key and length. The first in
+    /// [`hot_keys`] order on a tie; `None` if none is stored.
+    pub largest_hot: Option<(String, usize)>,
+    /// `(master slot, length)` of each stored picture, by slot.
+    pub avatars: Vec<(usize, usize)>,
+}
+
+impl BlobSizes {
+    /// Read through `blob_len`, which answers a key's stored length, `None`
+    /// if absent or unreadable.
+    pub fn read(blob_len: impl Fn(&str) -> Option<usize>) -> Self {
+        let mut largest_hot: Option<(String, usize)> = None;
+        for key in hot_keys() {
+            if let Some(len) = blob_len(&key) {
+                if largest_hot.as_ref().is_none_or(|(_, best)| len > *best) {
+                    largest_hot = Some((key, len));
+                }
+            }
+        }
+        let avatars = avatar_keys()
+            .enumerate()
+            .filter_map(|(slot, key)| blob_len(&key).map(|len| (slot, len)))
+            .collect();
+        BlobSizes { largest_hot, avatars }
+    }
+
+    /// The JSON object, written by hand like `crash_detail` (the Heltec app
+    /// slot is tight): `{"largest_hot":5280,"largest_hot_key":"connslots_0",
+    /// "avatars":{"0":2308}}`. With nothing stored, `largest_hot` is 0, its
+    /// key `null` and `avatars` empty. Every key is a fixed ASCII name, so
+    /// nothing needs escaping.
+    pub fn to_json(&self) -> String {
+        let (bytes, key) = match &self.largest_hot {
+            Some((key, len)) => (*len, format!("\"{key}\"")),
+            None => (0, String::from("null")),
+        };
+        let avatars: Vec<String> =
+            self.avatars.iter().map(|(slot, len)| format!("\"{slot}\":{len}")).collect();
+        format!(
+            "{{\"largest_hot\":{bytes},\"largest_hot_key\":{key},\"avatars\":{{{}}}}}",
+            avatars.join(",")
+        )
+    }
+}
+
 /// What a replace leaves behind, worst first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Outcome {
@@ -403,6 +459,52 @@ pub fn growth_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_sizes_name_the_largest_hot_blob_and_each_picture() {
+        let stored = |key: &str| match key {
+            "connslots_0" => Some(5280),
+            "connslots_2" => Some(5280),
+            "dk_ph" => Some(140),
+            "pc0" => Some(900),
+            "imav0" => Some(2308),
+            "imav3" => Some(4610),
+            "iman0" => Some(15),
+            _ => None,
+        };
+        let sizes = BlobSizes::read(stored);
+        // A tie keeps the first in hot_keys order.
+        assert_eq!(sizes.largest_hot, Some((String::from("connslots_0"), 5280)));
+        assert_eq!(sizes.avatars, [(0, 2308), (3, 4610)]);
+        assert_eq!(
+            sizes.to_json(),
+            r#"{"largest_hot":5280,"largest_hot_key":"connslots_0","avatars":{"0":2308,"3":4610}}"#
+        );
+        let phones = BlobSizes::read(|key| (key == "dk_ph").then_some(2166));
+        assert_eq!(phones.to_json(), r#"{"largest_hot":2166,"largest_hot_key":"dk_ph","avatars":{}}"#);
+        assert_eq!(
+            BlobSizes::read(|_| None).to_json(),
+            r#"{"largest_hot":0,"largest_hot_key":null,"avatars":{}}"#
+        );
+    }
+
+    #[test]
+    fn blob_sizes_parse_as_json_and_stay_small() {
+        // Every slot holding a picture and the largest table there can be:
+        // the reply grows by well under 200 bytes.
+        let full = BlobSizes::read(|key| Some(if key.starts_with("imav") { 8194 } else { 16_000 }));
+        let json = full.to_json();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["avatars"].as_object().unwrap().len(), usize::from(MAX_MASTER_SLOTS));
+        assert!(json.len() < 200, "{} bytes: {json}", json.len());
+    }
+
+    #[cfg(feature = "seed-encrypt")]
+    #[test]
+    fn neither_delegate_reply_carries_the_blob_sizes() {
+        assert!(!crate::at_rest_status::DELEGATE_STATUS_KEYS.contains(&BLOB_SIZES_KEY));
+        assert!(!crate::at_rest_status::DELEGATE_STATUS_FALLBACK_KEYS.contains(&BLOB_SIZES_KEY));
+    }
 
     #[test]
     fn the_entry_bound_covers_every_part_of_a_write() {

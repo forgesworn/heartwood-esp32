@@ -223,6 +223,13 @@ pub fn firmware_info_json(
             )
         })
         .unwrap_or_default();
+    // Stored lengths of the largest hot blob and each cached picture, so a
+    // refused write can be explained without reading NVS. Lengths only.
+    let nvs_blobs = format!(
+        ",\"{}\":{}",
+        heartwood_common::nvs_budget::BLOB_SIZES_KEY,
+        crate::nvs::blob_sizes(nvs).to_json(),
+    );
     let (at_rest, unlock_phones) = pin::at_rest_status(nvs);
     let fallback_relays;
     let current_relays: &[String] = match running_relays {
@@ -238,7 +245,7 @@ pub fn firmware_info_json(
          \"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
          \"free_heap\":{},\"largest_block\":{},\"display_flip\":{},\
-         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}{}}}",
+         \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}{}{}}}",
         env!("CARGO_PKG_VERSION"),
         board::BOARD,
         uptime_s(),
@@ -256,6 +263,7 @@ pub fn firmware_info_json(
         crash,
         crash_detail,
         nvs_stats,
+        nvs_blobs,
     )
 }
 

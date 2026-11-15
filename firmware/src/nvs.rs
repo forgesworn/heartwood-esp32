@@ -184,6 +184,12 @@ pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bo
 /// The length of the largest hot blob stored (`nvs_budget::hot_keys`), 0 if
 /// none is. One copy for both gates.
 #[inline(never)]
+/// Stored lengths of the largest hot blob and each cached picture, for
+/// FIRMWARE_INFO and `get_status` (`nvs_budget::BlobSizes`). Lengths only.
+pub fn blob_sizes(nvs: &EspNvs<NvsDefault>) -> nvs_budget::BlobSizes {
+    nvs_budget::BlobSizes::read(|key| nvs.blob_len(key).ok().flatten())
+}
+
 fn largest_hot(nvs: &EspNvs<NvsDefault>) -> usize {
     nvs_budget::hot_keys().fold(0, |largest, k| largest.max(nvs.blob_len(&k).ok().flatten().unwrap_or(0)))
 }

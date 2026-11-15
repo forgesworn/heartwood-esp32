@@ -11676,6 +11676,11 @@ fn dispatch_mgmt(
             status["min_free_heap"] = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() }.into();
             status["relay_connects"] = RELAY_CONNECTS.load(Ordering::Relaxed).into();
             status[heartwood_common::task_stacks::STACK_FREE_KEY] = stack_free();
+            // Stored lengths of the largest hot blob and each cached picture
+            // (`nvs_budget::BlobSizes`): lengths only, full reply only.
+            status[heartwood_common::nvs_budget::BLOB_SIZES_KEY] =
+                serde_json::from_str(&crate::nvs::blob_sizes(ctx.nvs).to_json())
+                    .unwrap_or(serde_json::Value::Null);
             Ok(status)
         }
 

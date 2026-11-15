@@ -11396,8 +11396,9 @@ fn dispatch_mgmt(
 
         // The cable-free twin of the USB SET_IDENTITY_META (0x5b) frame:
         // Sapwood resolves the kind-0 and shrinks the picture in-browser,
-        // then hands over ready Rgb565 bytes (base64 inside the NIP-44
-        // ciphertext). The signer still never fetches or decodes images.
+        // then hands over ready bytes (base64 inside the NIP-44 ciphertext):
+        // Rgb565 (w*h*2) or RGB332 (w*h), the length picking the format. The
+        // signer still never fetches or decodes images.
         "set_identity_meta" => {
             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
             let name = req
@@ -11426,8 +11427,8 @@ fn dispatch_mgmt(
                         .unwrap_or(""),
                 )
                 .map_err(|e| format!("avatar_b64: {e}"))?;
-            if avatar.len() != (w as usize) * (h as usize) * 2 {
-                return Err(format!("avatar length {} != w*h*2", avatar.len()));
+            if heartwood_common::identity_avatar::classify(w as u8, h as u8, avatar.len()).is_none() {
+                return Err(format!("avatar length {} is neither w*h*2 nor w*h", avatar.len()));
             }
             crate::identity_meta::save(ctx.nvs, master_slot, name, w as u8, h as u8, &avatar)?;
             log::info!(

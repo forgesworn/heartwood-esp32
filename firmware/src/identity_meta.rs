@@ -4,13 +4,15 @@
 // bitmap — provisioned by Sapwood at setup (SET_IDENTITY_META, 0x5B) and stored
 // on the signer. The device never fetches or JPEG-decodes an image itself (that
 // won't fit ESP32 RAM); Sapwood does the shrink in-browser and hands over ready
-// Rgb565 bytes. See docs / memory: signer-display-metadata-provisioned.
+// pixels: Rgb565 (w*h*2 bytes) or RGB332 (w*h), the length picking
+// (`heartwood_common::identity_avatar::classify`). See docs / memory:
+// signer-display-metadata-provisioned.
 //
 // Stored in NVS keyed by MASTER SLOT (master-only display for now). The picture
-// arrives as Rgb565 and is stored at one byte a pixel, RGB332, behind a version
-// header (`heartwood_common::identity_avatar`), so a 48x48 one takes 2,308 bytes
-// of a 16-24 KB partition rather than 4,610; pictures stored by earlier firmware
-// are still read. Per-persona avatars will need a dedicated flash region rather
+// is stored at one byte a pixel, RGB332 (Rgb565 converted, RGB332 as it came),
+// behind a version header (`heartwood_common::identity_avatar`), so a 48x48 one
+// takes 2,308 bytes of a 16-24 KB partition rather than 4,610; pictures stored
+// by earlier firmware are still read. Per-persona avatars will need a dedicated flash region rather
 // than NVS.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
@@ -39,10 +41,10 @@ pub fn save(
     avatar: &[u8],
 ) -> Result<(), String> {
     use heartwood_common::identity_avatar::{encode_stored, StoreError};
-    // `avatar` is the wire's Rgb565; one buffer of w*h + 4 bytes holds what
-    // is stored.
+    // `avatar` is as on the wire, Rgb565 or RGB332; one buffer of w*h + 4
+    // bytes holds what is stored.
     let blob = encode_stored(w, h, avatar).map_err(|e| match e {
-        StoreError::BadLength => format!("avatar length {} != {w}*{h}*2", avatar.len()),
+        StoreError::BadLength => format!("avatar length {} is neither {w}*{h}*2 nor {w}*{h}", avatar.len()),
         StoreError::NoMemory => "avatar: device low on memory".to_string(),
     })?;
     // An avatar is the one large write a user makes besides a pairing; it
@@ -95,7 +97,8 @@ pub fn load(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<IdentityMeta> {
 /// carries the NACK's payload, empty except for the growth gate's
 /// `storage_full:` refusal, so a host can tell "free some room" from a bad
 /// frame or a fault.
-/// Payload: `[pubkey 32][w 1][h 1][name_len 1][name UTF-8][avatar w*h*2]`.
+/// Payload: `[pubkey 32][w 1][h 1][name_len 1][name UTF-8][avatar]`, the
+/// avatar `w*h*2` bytes (Rgb565) or `w*h` bytes (RGB332).
 /// The pubkey must match a loaded master (persona display is a later phase).
 pub fn handle_frame(
     payload: &[u8],
@@ -121,8 +124,8 @@ pub fn handle_frame(
         Err(_) => return Err(String::new()),
     };
     let avatar = &payload[35 + name_len..];
-    if avatar.len() != (w as usize) * (h as usize) * 2 {
-        log::warn!("[idmeta] avatar len {} != {}*{}*2", avatar.len(), w, h);
+    if heartwood_common::identity_avatar::classify(w, h, avatar.len()).is_none() {
+        log::warn!("[idmeta] avatar len {} is not {}*{}*2 or {}*{}", avatar.len(), w, h, w, h);
         return Err(String::new());
     }
     let slot = match masters.iter().find(|m| m.pubkey == pubkey) {

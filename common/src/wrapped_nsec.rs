@@ -22,6 +22,16 @@ pub struct UnwrappedNsec {
     pub npub: String,
 }
 
+/// Check the slot's actual key against its displayed identity before applying
+/// the mode-specific root conversion. Cached metadata is not a key check.
+pub fn verify_slot_key(secret: &[u8; 32], expected_npub: &str) -> Result<(), &'static str> {
+    let public = public_key_xonly(secret).map_err(|_| INVALID)?;
+    if encode_npub(&public) != expected_npub {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
 fn cipher(root: &[u8; 32], salt: &[u8]) -> Result<Aes256Gcm, &'static str> {
     let mut key = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(salt), root)

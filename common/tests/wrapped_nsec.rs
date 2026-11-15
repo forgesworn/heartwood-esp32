@@ -10,6 +10,22 @@ fn fixture() -> serde_json::Value {
 }
 
 #[test]
+fn stored_slot_key_must_match_the_displayed_identity_before_root_conversion() {
+    use heartwood_common::wrapped_nsec::verify_slot_key;
+    let expected = encode_npub(&[
+        0x4f, 0x35, 0x5b, 0xdc, 0xb7, 0xcc, 0x0a, 0xf7, 0x28, 0xef, 0x3c, 0xce, 0xb9, 0x61, 0x5d,
+        0x90, 0x68, 0x4b, 0xb5, 0xb2, 0xca, 0x5f, 0x85, 0x9a, 0xb0, 0xf0, 0xb7, 0x04, 0x07, 0x58,
+        0x71, 0xaa,
+    ]);
+    assert!(verify_slot_key(&[0x11; 32], &expected).is_ok());
+    for corrupt in [[0x33; 32], [0u8; 32]] {
+        assert!(verify_slot_key(&corrupt, &expected).is_err());
+    }
+    let converted = derive::nsec_to_tree_root(&[0x11; 32]).unwrap();
+    assert!(verify_slot_key(&converted, &expected).is_err());
+}
+
+#[test]
 fn shared_vector_preserves_exact_raw_key() {
     let root = derive::nsec_to_tree_root(&[0x11; 32]).unwrap();
     let record = wrap_nsec(&root, &[0x22; 32], |bytes| {

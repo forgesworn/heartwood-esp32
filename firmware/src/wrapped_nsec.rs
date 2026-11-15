@@ -12,14 +12,14 @@ use heartwood_common::types::{MasterMode, FRAME_TYPE_NACK, FRAME_TYPE_WRAPPED_NS
 use heartwood_common::{
     encoding::encode_npub,
     wrapped_command::{parse_command, SlotReference, WrappedCommand},
-    wrapped_nsec::{unwrap_nsec, wrap_nsec},
+    wrapped_nsec::{unwrap_nsec, verify_slot_key, wrap_nsec},
 };
 
 fn selected<'a>(
     masters: &'a [LoadedMaster],
     reference: &SlotReference,
 ) -> Result<&'a LoadedMaster, &'static str> {
-    masters
+    let master = masters
         .iter()
         .find(|m| {
             m.slot == reference.slot
@@ -27,7 +27,10 @@ fn selected<'a>(
                 && encode_npub(&m.pubkey) == reference.npub
                 && !m.locked
         })
-        .ok_or("identity changed or locked: refresh the signer")
+        .ok_or("identity changed or locked: refresh the signer")?;
+    verify_slot_key(&master.secret, &reference.npub)
+        .map_err(|_| "stored identity key does not match its npub")?;
+    Ok(master)
 }
 
 fn confirm(

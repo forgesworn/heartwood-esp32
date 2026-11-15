@@ -28,7 +28,9 @@ refreshing the identity list before another attempt.
 
 Each root/target reference is `{slot, npub, mode}` and must match an unlocked,
 currently loaded master exactly. Personas are not raw-key slots. Distinct root
-and target slots are required. Commands:
+and target slots are required. The device also derives each selected slot's
+actual public key and compares it with that reference before root conversion;
+cached identity metadata alone is insufficient. Commands:
 
 ```json
 {"op":"wrap","root":{"slot":0,"npub":"<A npub>","mode":1},"target":{"slot":1,"npub":"<B npub>","mode":0}}

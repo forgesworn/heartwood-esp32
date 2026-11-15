@@ -1458,8 +1458,10 @@ impl PolicyEngine {
                     // be re-created): drop the avatars BEFORE writing when the
                     // write is predicted to be refused or lost with them kept
                     // (the bound is a worst case, so their room may be what
-                    // lets it land), or when dropping them takes it from an
-                    // erase to in place (`nvs::make_room_to_replace`). A table
+                    // lets it land; an in-place-only save, never tried past
+                    // the bound, only when their room does), or when dropping
+                    // them takes it from an erase to in place
+                    // (`nvs::make_room_to_replace`). A table
                     // predicted to land after its erase either way keeps them:
                     // on a full T-Display every save dropped the picture
                     // (beta.38). Not

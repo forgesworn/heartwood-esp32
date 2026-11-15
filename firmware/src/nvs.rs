@@ -259,13 +259,16 @@ pub fn make_room_to_grow(nvs: &mut EspNvs<NvsDefault>, key: &str, new_len: usize
 }
 
 /// Before `value` replaces `key` under `fallback`: drop the cached avatars
-/// when the write is predicted to be refused or to lose the key, or when
-/// dropping them lets one that would erase first go in place
-/// (`nvs_budget::evict_for_replace`). The prediction counts their room at
-/// its fewest entries, so a write it calls refused or lost is tried with
-/// them gone rather than given up. A write predicted to land either way
-/// keeps them, so a pairing table that erases before every rewrite on a
-/// full board does not cost the owner the picture each time. How many went.
+/// when that changes how the write ends by the bound (a refused or lost
+/// write then lands, an erase-first rewrite goes in place), or when a write
+/// ESP-IDF is asked to make (a first write, an erase-first rewrite) is
+/// predicted to be refused or to lose the key: the prediction counts their
+/// room at its fewest entries, so it is tried with them gone rather than
+/// given up (`nvs_budget::evict_for_replace`). An in-place-only rewrite the
+/// bound refuses either way keeps them: `write_blob` refuses it before
+/// ESP-IDF is asked. A write predicted to land either way keeps them, so a
+/// pairing table that erases before every rewrite on a full board does not
+/// cost the owner the picture each time. How many went.
 pub fn make_room_to_replace(nvs: &mut EspNvs<NvsDefault>, key: &str, value: &[u8], fallback: Fallback) -> usize {
     if write_blocked(key) {
         return 0;

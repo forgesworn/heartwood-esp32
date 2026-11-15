@@ -2193,6 +2193,24 @@ fn a_network_config_rewrite_drops_a_picture_in_its_way() {
 }
 
 #[test]
+fn a_network_config_rewrite_refused_either_way_keeps_the_picture() {
+    // A config at its largest (50 entries) with 20 free and a 24px picture
+    // (21): short with the picture and without it. The rewrite is in place
+    // only, so `write_blob` refuses it before ESP-IDF is asked, and dropping
+    // the picture would lose it for nothing.
+    use heartwood_common::nvs_budget::NET_CONFIG_MAX_LEN;
+    let p24 = picture(24);
+    assert_eq!(heartwood_common::nvs_room::min_blob_entries(p24.len()), 21);
+    let (mut nvs, _) = the_board();
+    nvs.backend.seed("net_config", &vec![b'a'; NET_CONFIG_MAX_LEN]);
+    nvs.backend.seed("imav0", &p24);
+    nvs.backend.limit_headroom(20);
+    assert!(write_net_config_like(&mut nvs, &vec![b'b'; NET_CONFIG_MAX_LEN]).is_err());
+    assert_eq!(nvs.backend.get("imav0").unwrap(), p24, "the picture stays");
+    assert_eq!(nvs.backend.get("net_config").unwrap(), vec![b'a'; NET_CONFIG_MAX_LEN]);
+}
+
+#[test]
 fn a_phone_drops_the_picture_only_when_that_makes_the_room() {
     // The phone records' save meets the same gate (phone_unlock_cmd.rs,
     // firmware only): a record of about 140 bytes on a board with none.

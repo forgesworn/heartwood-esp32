@@ -371,15 +371,20 @@ pub fn replace_outcome(fallback: Fallback, available: usize, old_len: Option<usi
 }
 
 /// Whether to drop the cached avatars (`reclaim` entries, [`avatar_reclaim`])
-/// before a replace. Always when, kept, the write is predicted to be refused
-/// or to lose the key (`NoRoom`, `Lost`): both bounds are worst cases
+/// before a replace. When the drop changes how it ends by the bound (a
+/// refused rewrite or a lost key then lands, an erase-first rewrite goes in
+/// place). Also, for a write ESP-IDF is asked to make (a first write, or an
+/// erase-first rewrite), whenever it is predicted, kept, to be refused or to
+/// lose the key (`NoRoom`, `Lost`): both bounds are worst cases
 /// (`blob_entries` for the new copy, the fewest entries for what an erase
 /// or a dropped picture frees), so the real write may still land with
 /// their room and not without it, and a lost key after an erase is far
-/// worse than a lost cache. Otherwise only when the drop changes how it
-/// ends: a replace that would erase first then goes in place. A write
-/// predicted to land either way (in place, or after its erase) keeps them:
-/// a table that erases first either way gains nothing from their loss.
+/// worse than a lost cache. An in-place-only rewrite of a stored key
+/// ([`Fallback::Never`] with an old copy) is not asked of ESP-IDF at all
+/// when the bound refuses it ([`Plan::Refuse`]), so refused with them and
+/// without, they stay. A write predicted to land either way (in place, or
+/// after its erase) keeps them: a table that erases first either way gains
+/// nothing from their loss.
 pub fn evict_for_replace(
     fallback: Fallback,
     available: usize,
@@ -391,7 +396,10 @@ pub fn evict_for_replace(
         return false;
     }
     let kept = replace_outcome(fallback, available, old_len, new_len);
-    kept <= Outcome::NoRoom || replace_outcome(fallback, available.saturating_add(reclaim), old_len, new_len) > kept
+    let with = replace_outcome(fallback, available.saturating_add(reclaim), old_len, new_len);
+    // Refused by the bound alone, before ESP-IDF is asked (`Plan::Refuse`).
+    let refused_unasked = matches!(fallback, Fallback::Never) && old_len.is_some();
+    with > kept || (kept <= Outcome::NoRoom && !refused_unasked)
 }
 
 /// Whether to drop the cached avatars before a growth [`growth_allowed`]
@@ -926,10 +934,11 @@ mod tests {
             assert_eq!(replace_outcome(Fallback::EraseFirst, available, Some(TABLE_6), TABLE_6), Outcome::AfterErase);
             assert!(!evict_for_replace(Fallback::EraseFirst, available, 75, Some(TABLE_6), TABLE_6));
             // In place only (a legacy credential still to clear): refused by
-            // the bound with the picture or without, but the bound is a worst
-            // case, so the picture goes and the write is tried.
+            // the bound with the picture or without, and a refused in-place
+            // rewrite is never asked of ESP-IDF, so the picture stays and
+            // every save is refused as it would be without it.
             assert_eq!(replace_outcome(Fallback::Never, available + 75, Some(TABLE_6), TABLE_6), Outcome::NoRoom);
-            assert!(evict_for_replace(Fallback::Never, available, 75, Some(TABLE_6), TABLE_6));
+            assert!(!evict_for_replace(Fallback::Never, available, 75, Some(TABLE_6), TABLE_6));
         }
     }
 
@@ -972,9 +981,17 @@ mod tests {
         assert_eq!(replace_outcome(Fallback::EraseFirst, 6, Some(4000), 4300), Outcome::Lost);
         assert_eq!(replace_outcome(Fallback::EraseFirst, 6 + 21, Some(4000), 4300), Outcome::Lost);
         assert!(evict_for_replace(Fallback::EraseFirst, 6, 21, Some(4000), 4300));
-        // Refused with them and without: the same.
+        // An in-place-only rewrite refused with them and without: the bound
+        // refuses it before ESP-IDF is asked, so they stay.
         assert_eq!(replace_outcome(Fallback::Never, 20 + 21, Some(4000), 4300), Outcome::NoRoom);
-        assert!(evict_for_replace(Fallback::Never, 20, 21, Some(4000), 4300));
+        assert!(!evict_for_replace(Fallback::Never, 20, 21, Some(4000), 4300));
+        // A network config at its largest (1,024 B, 50 entries) with 20 free
+        // and a 24px picture (21): refused either way, the picture kept.
+        assert_eq!(blob_entries(NET_CONFIG_MAX_LEN), 50);
+        assert_eq!(replace_outcome(Fallback::Never, 20 + 21, Some(NET_CONFIG_MAX_LEN), NET_CONFIG_MAX_LEN), Outcome::NoRoom);
+        assert!(!evict_for_replace(Fallback::Never, 20, 21, Some(NET_CONFIG_MAX_LEN), NET_CONFIG_MAX_LEN));
+        // A first write of the same key is asked of ESP-IDF, so they go.
+        assert!(evict_for_replace(Fallback::Never, 20, 21, None, NET_CONFIG_MAX_LEN));
         // Landing either way keeps them.
         assert!(!evict_for_replace(Fallback::EraseFirst, 40, 21, Some(4000), 4300));
         // Nothing to drop, or already in place: no.
@@ -997,9 +1014,9 @@ mod tests {
         // used less `stored_entries_min` of the old freed, and
         // `min_blob_entries` of each; the drop counts the pictures at
         // `min_blob_entries`, this one and the other masters' (`others`).
-        // An in-place-only rewrite (a legacy credential still to clear) that
-        // the bound refuses drops them whatever they are, so it is held to
-        // this only where the blob would go in place with no picture at all.
+        // An in-place-only rewrite (a legacy credential still to clear) is
+        // held to the same: a refused one keeps them unless their room lets
+        // it go in place, and the gate leaves no such case.
         let mut checked = 0;
         for available in (0..500).step_by(3) {
             for hot in [0, 300, 1500, 3000, TABLE_6, TABLE_7, 8000] {
@@ -1015,7 +1032,6 @@ mod tests {
                             let low = available + old.map_or(0, stored_entries_min) - blob_entries(new);
                             let high = available + old.map_or(0, mbe) - mbe(new);
                             let after_reclaim = others + mbe(new);
-                            let bare = available + reclaim;
                             for after in low..=high {
                                 let what = format!(
                                     "available {available}, hot {hot}, picture {new}, old {old:?}, others {others}, after {after}"
@@ -1024,12 +1040,10 @@ mod tests {
                                     !evict_for_replace(Fallback::EraseFirst, after, after_reclaim, Some(hot), hot),
                                     "{what}"
                                 );
-                                if blob_entries(hot) <= bare {
-                                    assert!(
-                                        !evict_for_replace(Fallback::Never, after, after_reclaim, Some(hot), hot),
-                                        "{what}"
-                                    );
-                                }
+                                assert!(
+                                    !evict_for_replace(Fallback::Never, after, after_reclaim, Some(hot), hot),
+                                    "{what}"
+                                );
                             }
                         }
                     }

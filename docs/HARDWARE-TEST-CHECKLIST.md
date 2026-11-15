@@ -4207,7 +4207,8 @@ cached pictures before every tight pairing-table save, and stored a 48x48
 picture as 4,610 bytes of Rgb565 (charged 165 entries at write time). Now a
 picture is dropped only when the save would otherwise be refused or lost
 after its erase, or could then be rewritten in place rather than erased
-first; a persona or phone the growth gate would refuse drops it first when
+first (an in-place-only save, such as the network config, only when that
+lets it land); a persona or phone the growth gate would refuse drops it first when
 that alone makes the room (not a bundle's personas); a picture must leave
 room for a full-size network config rewrite (50 entries), and counts the
 name written before it when the name changes; and a picture is stored at one

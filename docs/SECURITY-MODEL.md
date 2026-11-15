@@ -863,7 +863,11 @@ erase, or when dropping them lets it be rewritten in place instead of
 erased first (`nvs_budget::evict_for_replace`). The prediction is a worst
 case on both sides, so a write it calls refused or lost with the pictures
 and without them is still tried with them gone: an erase that then needs
-their room would otherwise lose the table. A save predicted to land as it
+their room would otherwise lose the table. The exception is an
+in-place-only rewrite of a stored key (the network config, the network
+trial, a pairing table while a legacy credential is still to clear), which
+`nvs::write_blob` refuses by the same bound before ESP-IDF is asked: it
+drops them only when their room lets it go in place. A save predicted to land as it
 is, in place or after its erase, keeps them, which is what #197 did not:
 it dropped the avatar before every tight save, and a board with six
 pairings lost its picture at the next change and could not take it back.

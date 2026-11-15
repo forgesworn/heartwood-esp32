@@ -4164,9 +4164,9 @@ T-Display: about 32 KB of heap. The screens are unchanged. Host tests pin the
 table (palette round trip, cube round trip, error bound, flip order); only the
 look and the heap need a board.
 
-T-Display first (the change is there). The C6 (`jd9853.rs`) takes the same
-change in its own commit if the branch carries it; run steps 1-4 on it too in
-that case. Spare board, WiFi-standalone with the relay online for step 5.
+T-Display first (the change is there). The C6 (`jd9853.rs`, 110 KB down to
+55 KB) takes the same change in its own commit; run steps 1-4 on it too, and
+step 5 for `free_heap` if a board is to hand. Spare board, WiFi-standalone with the relay online for step 5.
 
 1. Walk every screen the board can show (ready, npub with and without a
    picture, approval cards of each kind, enrol card and PHONE ADDED, network

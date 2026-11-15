@@ -50,13 +50,26 @@ pub fn save(
     // An avatar is the one large write a user makes besides a pairing; it
     // must not take the room that keeps the pairing tables and phone records
     // rewritable, nor be what the next save of them has to drop
-    // (`nvs::avatar_allowed`).
+    // (`nvs::avatar_allowed`). Judged with the name written first, as it is
+    // below. The order is the old one, and a cut between the two is sane
+    // either way: it leaves this master's new name over its old picture, or
+    // no card at all for a first picture (`load` needs both).
+    // A name already stored as sent is not written again, nor counted.
+    let name_key = format!("iman{slot}");
     let avatar_key = format!("imav{slot}");
-    if !crate::nvs::avatar_allowed(nvs, &avatar_key, blob.len()) {
+    let mut stored_name = [0u8; 256];
+    let name_changed = !matches!(
+        nvs.get_blob(&name_key, &mut stored_name),
+        Ok(Some(stored)) if stored == name.as_bytes()
+    );
+    let name_write = name_changed.then_some((name_key.as_str(), name.len()));
+    if !crate::nvs::avatar_allowed(nvs, &avatar_key, blob.len(), name_write) {
         return Err("storage_full: not enough storage left for the avatar; the pairings need the room".into());
     }
-    nvs.replace_blob(&format!("iman{slot}"), name.as_bytes())
-        .map_err(|e| format!("name blob: {e:?}"))?;
+    if name_changed {
+        nvs.replace_blob(&name_key, name.as_bytes())
+            .map_err(|e| format!("name blob: {e:?}"))?;
+    }
     nvs.replace_blob(&avatar_key, &blob)
         .map_err(|e| format!("avatar blob: {e:?}"))?;
     Ok(())

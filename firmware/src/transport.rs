@@ -49,7 +49,15 @@ pub fn persist_fresh_identities(
         .map(|id| (id.purpose.clone(), id.index, id.persona_name.clone(), id.public_key))
         .collect();
     for (purpose, index, name, pubkey) in fresh {
-        match crate::personas::add(nvs, owning_slot, &purpose, index, name.as_deref(), &pubkey) {
+        match crate::personas::add(
+            nvs,
+            owning_slot,
+            &purpose,
+            index,
+            name.as_deref(),
+            &pubkey,
+            crate::personas::AvatarRoom::Drop,
+        ) {
             Ok(()) => personas.push(crate::personas::LoadedPersona {
                 master_slot: owning_slot,
                 purpose,

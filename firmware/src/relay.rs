@@ -3313,7 +3313,7 @@ fn locked_relay_phase(
                     FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
                     // `Some(relays)`: the locked phase's own list, the same
                     // one `relays_at_boot` compared against this boot.
-                    crate::firmware_info_json(nvs, Some(relays)).as_bytes(),
+                    crate::firmware_info_json(nvs, Some(relays), false).as_bytes(),
                 ),
                 FRAME_TYPE_PROVISION_LIST => {
                     // Safe while locked (npubs only, no secrets) and REQUIRED
@@ -4434,7 +4434,7 @@ fn poll_usb_frame(
             FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
             // `Some(&ctx.relays)`: the list this relay loop is actually
             // running, not a fresh net-config read.
-            crate::firmware_info_json(ctx.nvs, Some(&ctx.relays)).as_bytes(),
+            crate::firmware_info_json(ctx.nvs, Some(&ctx.relays), ctx.policy_engine.bridge_authenticated).as_bytes(),
         ),
 
         // 0x5B — Sapwood-provisioned display metadata (name + avatar), stored in
@@ -11679,7 +11679,7 @@ fn dispatch_mgmt(
             // Stored lengths of the largest hot blob and each cached picture
             // (`nvs_budget::BlobSizes`): lengths only, full reply only.
             status[heartwood_common::nvs_budget::BLOB_SIZES_KEY] =
-                serde_json::from_str(&crate::nvs::blob_sizes(ctx.nvs).to_json())
+                serde_json::from_str(&crate::nvs::blob_sizes(ctx.nvs).to_json(true))
                     .unwrap_or(serde_json::Value::Null);
             Ok(status)
         }

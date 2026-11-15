@@ -1455,12 +1455,14 @@ impl PolicyEngine {
                     };
                     // Pairings outrank the avatar cache (an avatar is a
                     // display nicety Sapwood can send again; a pairing cannot
-                    // be re-created): drop the avatars BEFORE writing, and only
-                    // when that changes how the write ends, so the table fits,
-                    // goes in place rather than erasing first, or lands rather
-                    // than being lost (`nvs::make_room_to_replace`). A table
-                    // that erases first either way keeps them: on a full
-                    // T-Display every save dropped the picture (beta.38). Not
+                    // be re-created): drop the avatars BEFORE writing when the
+                    // write is predicted to be refused or lost with them kept
+                    // (the bound is a worst case, so their room may be what
+                    // lets it land), or when dropping them takes it from an
+                    // erase to in place (`nvs::make_room_to_replace`). A table
+                    // predicted to land after its erase either way keeps them:
+                    // on a full T-Display every save dropped the picture
+                    // (beta.38). Not
                     // after a failure: a table is several chunks, and a failed
                     // multi-chunk write must not be repeated in the same boot
                     // (`nvs::write_blocked`).

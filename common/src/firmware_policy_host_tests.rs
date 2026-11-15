@@ -461,13 +461,21 @@ pub fn make_room_to_replace(
 }
 
 /// Stands in for the firmware's `crate::nvs::avatar_allowed`.
-pub fn avatar_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+pub fn avatar_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize, name: Option<(&str, usize)>) -> bool {
     let reclaim = avatar_reclaim(nvs);
     let state = nvs.backend.inner.borrow();
     let hot: Vec<usize> = heartwood_common::nvs_budget::hot_keys()
         .filter_map(|k| state.store.get(&k).map(Vec::len))
         .collect();
-    heartwood_common::nvs_budget::avatar_allowed(state.available(), reclaim, state.store.get(key).map(Vec::len), new_len, &hot)
+    let name = name.map(|(k, len)| (state.store.get(k).map(Vec::len), len));
+    heartwood_common::nvs_budget::avatar_after_name_allowed(
+        state.available(),
+        reclaim,
+        name,
+        state.store.get(key).map(Vec::len),
+        new_len,
+        &hot,
+    )
 }
 
 /// Stands in for the firmware's `crate::nvs::is_no_room`: the mock's
@@ -492,6 +500,7 @@ pub mod personas;
 #[path = "../../firmware/src/masters.rs"]
 pub mod masters;
 use engine::{PolicyEngine, RevocationSave};
+use personas::AvatarRoom::{Drop, Keep};
 
 // ---------------------------------------------------------------------------
 // Fixtures / helpers
@@ -1749,7 +1758,7 @@ fn persona_key(n: u8) -> [u8; 32] {
 fn board_with_personas(n: u8) -> EspNvs<NvsDefault> {
     let (mut nvs, _) = full_table(8);
     for i in 0..n {
-        personas::add(&mut nvs, 0, "purpose-of-some-length", i as u32, Some("a persona name"), &persona_key(i + 1)).unwrap();
+        personas::add(&mut nvs, 0, "purpose-of-some-length", i as u32, Some("a persona name"), &persona_key(i + 1), Drop).unwrap();
     }
     nvs
 }
@@ -1764,11 +1773,11 @@ fn a_bundle_pre_check_gates_every_name_as_add_will() {
         let mut nvs = board_with_personas(3);
         nvs.backend.limit_headroom(headroom);
         let one = personas::registrations_that_fit(&nvs, 1);
-        assert_eq!(one == 1, personas::capacity_check(&nvs).is_ok(), "one name is capacity_check ({headroom})");
+        assert_eq!(one == 1, personas::capacity_check(&nvs, Keep).is_ok(), "one name is capacity_check ({headroom})");
         let promised = personas::registrations_that_fit(&nvs, 2);
         let mut added = 0;
         for i in 0..2u8 {
-            match personas::add(&mut nvs, 0, "purpose-of-some-length", 10 + u32::from(i), Some("a persona name"), &persona_key(0x40 + i)) {
+            match personas::add(&mut nvs, 0, "purpose-of-some-length", 10 + u32::from(i), Some("a persona name"), &persona_key(0x40 + i), Keep) {
                 Ok(()) => added += 1,
                 Err(_) => break,
             }
@@ -1810,7 +1819,7 @@ fn removing_an_identity_on_a_full_partition_completes() {
             assert!(engine.assign_pubkey_to_slot(m, slot, pubkey_hex(0x60 + i + m * 8)));
         }
         assert!(engine.persist_slots(&mut nvs, m));
-        personas::add(&mut nvs, m, "purpose", 0, None, &persona_key(m + 1)).unwrap();
+        personas::add(&mut nvs, m, "purpose", 0, None, &persona_key(m + 1), Drop).unwrap();
     }
     let table_1 = nvs.backend.get("connslots_1").unwrap();
     nvs.backend.limit_headroom(BENCH_HEADROOM);
@@ -1957,7 +1966,7 @@ fn picture(side: u8) -> Vec<u8> {
 
 #[test]
 fn the_board_takes_a_48px_picture_and_not_a_64px_one() {
-    use heartwood_common::nvs_budget::{blob_entries, stored_entries_min};
+    use heartwood_common::nvs_budget::{avatar_reserve, blob_entries, stored_entries_min};
     let (nvs, _) = the_board();
     let table = nvs.backend.get(CONNSLOTS_0).unwrap().len();
     // The modelled table is in the board's size class: too large to rewrite
@@ -1966,14 +1975,14 @@ fn the_board_takes_a_48px_picture_and_not_a_64px_one() {
     assert!((4500..6000).contains(&table), "{table} bytes");
     let (p48, p64) = (picture(48), picture(64));
     assert_eq!((p48.len(), p64.len()), (2308, 4100));
-    assert!(nvs::avatar_allowed(&nvs, "imav0", p48.len()));
+    assert!(nvs::avatar_allowed(&nvs, "imav0", p48.len(), None));
     // 64px: the table's rewrite after its erase would no longer fit with
-    // the reserve to spare.
+    // the reserve (room for a network config rewrite) to spare.
     let after_64 = BOARD_AVAILABLE - blob_entries(p64.len());
-    assert!(after_64 + stored_entries_min(table) < blob_entries(table) + 13);
-    assert!(!nvs::avatar_allowed(&nvs, "imav0", p64.len()));
+    assert!(after_64 + stored_entries_min(table) < blob_entries(table) + avatar_reserve());
+    assert!(!nvs::avatar_allowed(&nvs, "imav0", p64.len(), None));
     // As beta.38 stored a 48px one (Rgb565, 4,610 bytes): refused too.
-    assert!(!nvs::avatar_allowed(&nvs, "imav0", 2 + 48 * 48 * 2));
+    assert!(!nvs::avatar_allowed(&nvs, "imav0", 2 + 48 * 48 * 2, None));
     // Once stored, the 48px picture keeps 75 entries in use (the gate
     // charged it 91 before the write): checklist section 46, step 2.
     nvs.backend.seed("imav0", &p48);
@@ -1997,7 +2006,7 @@ fn a_six_pairing_save_keeps_the_picture() {
 
 #[test]
 fn a_revocation_drops_the_picture_only_to_go_in_place() {
-    use heartwood_common::nvs_budget::{blob_entries, replace_outcome, small_write_reserve, Fallback, Outcome};
+    use heartwood_common::nvs_budget::{avatar_reserve, blob_entries, replace_outcome, Fallback, Outcome};
     let (mut nvs, mut engine) = the_board();
     let p48 = picture(48);
     nvs.backend.seed("imav0", &p48);
@@ -2014,14 +2023,14 @@ fn a_revocation_drops_the_picture_only_to_go_in_place() {
     assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
     assert!(!nvs.backend.contains("imav0"));
     // Sent again, the picture is refused while it would stop that: the
-    // five-pairing table now goes in place with room to spare, and would not
-    // with the picture stored. On this board it is the picture or in-place
-    // pairing saves, from five pairings down.
+    // five-pairing table now goes in place, and would not with the picture
+    // stored and room for a network config to spare. On this board it is the
+    // picture or in-place pairing saves, from five pairings down.
     let after = available(&nvs);
     let table = blob_entries(nvs.backend.get(CONNSLOTS_0).unwrap().len());
-    assert!(table + small_write_reserve() <= after);
-    assert!(after - blob_entries(p48.len()) < table + small_write_reserve());
-    assert!(!nvs::avatar_allowed(&nvs, "imav0", p48.len()));
+    assert!(table <= after);
+    assert!(after - blob_entries(p48.len()) < table + avatar_reserve());
+    assert!(!nvs::avatar_allowed(&nvs, "imav0", p48.len(), None));
 }
 
 #[test]
@@ -2071,8 +2080,8 @@ fn a_persona_drops_the_picture_only_when_that_makes_the_room() {
     let (mut nvs, _) = the_board();
     let p48 = picture(48);
     nvs.backend.seed("imav0", &p48);
-    assert!(personas::capacity_check(&nvs).is_err());
-    assert!(personas::add(&mut nvs, 0, "purpose", 0, Some("a persona"), &persona_key(1)).is_err());
+    assert!(personas::capacity_check(&nvs, Drop).is_err());
+    assert!(personas::add(&mut nvs, 0, "purpose", 0, Some("a persona"), &persona_key(1), Drop).is_err());
     assert_eq!(nvs.backend.get("imav0").unwrap(), p48);
     // Across a sweep of room, the same persona added beside a picture and
     // without one: the picture goes only when it is what the add lacked,
@@ -2080,7 +2089,7 @@ fn a_persona_drops_the_picture_only_when_that_makes_the_room() {
     let mut evicted = 0;
     for headroom in 0..600 {
         let add = |nvs: &mut EspNvs<NvsDefault>| {
-            personas::add(nvs, 0, "purpose", 0, Some("a persona"), &persona_key(1)).is_ok()
+            personas::add(nvs, 0, "purpose", 0, Some("a persona"), &persona_key(1), Drop).is_ok()
         };
         let (mut bare, _) = the_board();
         bare.backend.limit_headroom(headroom);
@@ -2102,6 +2111,33 @@ fn a_persona_drops_the_picture_only_when_that_makes_the_room() {
         evicted += usize::from(!kept);
     }
     assert!(evicted > 0, "some headroom needs the picture's room");
+}
+
+#[test]
+fn a_bundle_registration_never_drops_the_picture() {
+    // Review item 7: the bundle press registers its names with the pictures
+    // kept, since its pairing table was judged with them counted. Wherever a
+    // name would land only by dropping the picture, `Keep` refuses it and the
+    // picture stays; wherever it fits beside the picture, it lands.
+    let p48 = picture(48);
+    let mut kept_refusals = 0;
+    for headroom in 0..600 {
+        let (mut nvs, _) = the_board();
+        nvs.backend.seed("imav0", &p48);
+        nvs.backend.limit_headroom(headroom);
+        let allowed = personas::capacity_check(&nvs, Keep).is_ok();
+        let lands = personas::add(&mut nvs, 0, "purpose", 0, Some("a persona"), &persona_key(1), Keep).is_ok();
+        assert_eq!(nvs.backend.get("imav0").unwrap(), p48, "{headroom}: the picture stays");
+        assert_eq!(allowed, lands, "{headroom}: the pre-check is the add's own");
+        let (mut dropping, _) = the_board();
+        dropping.backend.seed("imav0", &p48);
+        dropping.backend.limit_headroom(headroom);
+        let lands_dropping =
+            personas::add(&mut dropping, 0, "purpose", 0, Some("a persona"), &persona_key(1), Drop).is_ok();
+        assert!(!lands || lands_dropping, "{headroom}");
+        kept_refusals += usize::from(lands_dropping && !lands);
+    }
+    assert!(kept_refusals > 0, "some headroom lands only by dropping the picture");
 }
 
 #[test]
@@ -2142,7 +2178,7 @@ fn an_accepted_picture_survives_the_next_save_of_the_same_pairings() {
         let (mut nvs, mut engine) = the_board();
         nvs.backend.limit_headroom(headroom);
         let p48 = picture(48);
-        if !nvs::avatar_allowed(&nvs, "imav0", p48.len()) {
+        if !nvs::avatar_allowed(&nvs, "imav0", p48.len(), None) {
             continue;
         }
         nvs.backend.seed("imav0", &p48);

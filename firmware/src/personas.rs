@@ -350,19 +350,36 @@ pub fn registry_tail(nvs: &EspNvs<NvsDefault>) -> Option<heartwood_common::owner
     Some(heartwood_common::owner_pairing::RegistryTail { count, count_stored, chunk_len })
 }
 
+/// Whether a registration may drop the cached pictures to make its room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AvatarRoom {
+    /// The registration is the press's one growth: the pictures count as
+    /// room and go if that is what lets it through (`nvs::make_room_to_grow`).
+    Drop,
+    /// The press also saves a pairing table that its pre-card check judged
+    /// with the pictures counted (the bundle), and they can go only once: a
+    /// registration fits without them or is refused, as the pre-check
+    /// (`registrations_that_fit`) judged it.
+    Keep,
+}
+
 /// Whether the registry (and the NVS partition behind it) can take another
 /// persona. `Err` carries the actionable refusal — the "storage full" NACK
 /// text the design doc requires — so callers can pre-check before deriving.
-pub fn capacity_check(nvs: &EspNvs<NvsDefault>) -> Result<(), &'static str> {
+pub fn capacity_check(nvs: &EspNvs<NvsDefault>, room: AvatarRoom) -> Result<(), &'static str> {
     if read_count(nvs) >= MAX_PERSONAS {
         return Err("identity storage full: this device holds its maximum number of personas — remove an unused one first");
     }
     // The chunk the next persona lands in grows by at most one entry.
     let key = chunk_key(chunk_index(read_count(nvs)));
     let grown = nvs.blob_len(&key).ok().flatten().unwrap_or(0) + MAX_ENTRY_LEN;
-    // Cached avatars count as room: `add` drops them if that is what lets
-    // the persona through (`nvs::make_room_to_grow`).
-    if !crate::nvs::growth_possible(nvs, &key, grown) {
+    // With `AvatarRoom::Drop` cached avatars count as room: `add` drops
+    // them if that is what lets the persona through (`nvs::make_room_to_grow`).
+    let fits = match room {
+        AvatarRoom::Drop => crate::nvs::growth_possible(nvs, &key, grown),
+        AvatarRoom::Keep => crate::nvs::growth_allowed(nvs, &key, grown),
+    };
+    if !fits {
         return Err(STORAGE_FULL);
     }
     Ok(())
@@ -373,10 +390,10 @@ pub fn capacity_check(nvs: &EspNvs<NvsDefault>) -> Result<(), &'static str> {
 /// full-size entry, as [`capacity_check`] judges one (`nvs::growth_run`).
 /// The pre-card check for a press that registers several names, so the
 /// second cannot pass the card on the first's room and fail after the hold.
-/// Stops at a chunk whose length cannot be read. Unlike [`capacity_check`]
-/// it does not count the cached avatars as room: the bundle press that asks
-/// it also saves a pairing table, judged with the avatars counted, and they
-/// can be dropped only once.
+/// Stops at a chunk whose length cannot be read. It does not count the
+/// cached avatars as room: the bundle press that asks it also saves a
+/// pairing table, judged with the avatars counted, and they can be dropped
+/// only once, so the press registers with [`AvatarRoom::Keep`].
 pub fn registrations_that_fit(nvs: &EspNvs<NvsDefault>, wanted: usize) -> usize {
     let count = read_count(nvs);
     let room = usize::from(MAX_PERSONAS.saturating_sub(count)).min(wanted);
@@ -407,7 +424,7 @@ const STORAGE_FULL: &str =
 /// Persist a new persona. The caller is responsible for checking the
 /// in-memory registry first (`contains_pubkey`) so the same identity isn't
 /// stored twice. Refuses cleanly (never mid-write) when the registry or the
-/// partition is full.
+/// partition is full. `room` says whether the cached pictures may go.
 pub fn add(
     nvs: &mut EspNvs<NvsDefault>,
     master_slot: u8,
@@ -415,9 +432,10 @@ pub fn add(
     index: u32,
     name: Option<&str>,
     pubkey: &[u8; 32],
+    room: AvatarRoom,
 ) -> Result<(), &'static str> {
     resume_pending_removal(nvs)?;
-    capacity_check(nvs)?;
+    capacity_check(nvs, room)?;
 
     if !packed_format(nvs)? {
         // First persona on a fresh (or freshly-wiped) device adopts the packed
@@ -443,8 +461,13 @@ pub fn add(
     });
     let grown = encode_chunk(&entries)?.len();
     // A persona outranks the avatar cache, as a pairing does: the avatars go
-    // if, and only if, that makes the room.
-    if !crate::nvs::make_room_to_grow(nvs, &chunk_key(chunk), grown) {
+    // if, and only if, that makes the room, unless the press needs them for
+    // its pairing table (`AvatarRoom::Keep`).
+    let fits = match room {
+        AvatarRoom::Drop => crate::nvs::make_room_to_grow(nvs, &chunk_key(chunk), grown),
+        AvatarRoom::Keep => crate::nvs::growth_allowed(nvs, &chunk_key(chunk), grown),
+    };
+    if !fits {
         return Err(STORAGE_FULL);
     }
     write_chunk(nvs, chunk, &entries)?;

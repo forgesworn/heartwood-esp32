@@ -168,9 +168,9 @@ pub fn fits(_nvs: &EspNvs<NvsDefault>, len: usize) -> bool {
 }
 
 /// Whether a write that grows `key` to `new_len` bytes (a new pairing, a
-/// persona, an unlock phone, an avatar) may go ahead: after it, a rewrite of
-/// the largest blob that is replaced in place must still fit in place
-/// (`nvs_budget::growth_allowed`). Refuses when the numbers cannot be read.
+/// persona, an unlock phone; a picture is [`avatar_allowed`]'s) may go
+/// ahead: after it, a rewrite of the largest blob that is replaced in place
+/// must still fit in place (`nvs_budget::growth_allowed`). Refuses when the numbers cannot be read.
 pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
     let Some(stats) = crate::nvs_stats::read() else {
         return false;
@@ -181,15 +181,15 @@ pub fn growth_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bo
     nvs_budget::growth_allowed(stats.available_entries, old_len, new_len, largest_hot(nvs))
 }
 
-/// The length of the largest hot blob stored (`nvs_budget::hot_keys`), 0 if
-/// none is. One copy for both gates.
-#[inline(never)]
 /// Stored lengths of the largest hot blob and each cached picture, for
 /// FIRMWARE_INFO and `get_status` (`nvs_budget::BlobSizes`). Lengths only.
 pub fn blob_sizes(nvs: &EspNvs<NvsDefault>) -> nvs_budget::BlobSizes {
     nvs_budget::BlobSizes::read(|key| nvs.blob_len(key).ok().flatten())
 }
 
+/// The length of the largest hot blob stored (`nvs_budget::hot_keys`), 0 if
+/// none is. One copy for both gates.
+#[inline(never)]
 fn largest_hot(nvs: &EspNvs<NvsDefault>) -> usize {
     nvs_budget::hot_keys().fold(0, |largest, k| largest.max(nvs.blob_len(&k).ok().flatten().unwrap_or(0)))
 }
@@ -259,11 +259,13 @@ pub fn make_room_to_grow(nvs: &mut EspNvs<NvsDefault>, key: &str, new_len: usize
 }
 
 /// Before `value` replaces `key` under `fallback`: drop the cached avatars
-/// only if that changes how the write ends (`nvs_budget::evict_for_replace`:
-/// a write that would not fit then does, one that would erase first then
-/// goes in place, one that would lose the key then lands). Otherwise they
-/// stay, so a pairing table that erases before every rewrite on a full board
-/// does not cost the owner the picture each time. How many went.
+/// when the write is predicted to be refused or to lose the key, or when
+/// dropping them lets one that would erase first go in place
+/// (`nvs_budget::evict_for_replace`). The prediction counts their room at
+/// its fewest entries, so a write it calls refused or lost is tried with
+/// them gone rather than given up. A write predicted to land either way
+/// keeps them, so a pairing table that erases before every rewrite on a
+/// full board does not cost the owner the picture each time. How many went.
 pub fn make_room_to_replace(nvs: &mut EspNvs<NvsDefault>, key: &str, value: &[u8], fallback: Fallback) -> usize {
     if write_blocked(key) {
         return 0;
@@ -283,15 +285,24 @@ pub fn make_room_to_replace(nvs: &mut EspNvs<NvsDefault>, key: &str, value: &[u8
 }
 
 /// Whether a stored avatar blob of `new_len` bytes may replace `key`'s
-/// (`nvs_budget::avatar_allowed`): it fits with the small-key reserve, and no
-/// later rewrite of a hot blob would find the picture is what it has to
-/// drop. Refuses when the numbers cannot be read.
-pub fn avatar_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+/// (`nvs_budget::avatar_after_name_allowed`), once `name` (its key and new
+/// length, `None` if it is not being written) has been written first: it
+/// fits with `nvs_budget::avatar_reserve` to spare, and no later rewrite of
+/// a hot blob would find the picture is what it has to drop. Refuses when
+/// the numbers cannot be read.
+pub fn avatar_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize, name: Option<(&str, usize)>) -> bool {
     let (Some(stats), Ok(old_len)) = (crate::nvs_stats::read(), nvs.blob_len(key)) else {
         return false;
     };
+    let name = match name {
+        Some((name_key, len)) => match nvs.blob_len(name_key) {
+            Ok(old) => Some((old, len)),
+            Err(_) => return false,
+        },
+        None => None,
+    };
     let hot: Vec<usize> = nvs_budget::hot_keys().filter_map(|k| nvs.blob_len(&k).ok().flatten()).collect();
-    nvs_budget::avatar_allowed(stats.available_entries, avatar_reclaim(nvs), old_len, new_len, &hot)
+    nvs_budget::avatar_after_name_allowed(stats.available_entries, avatar_reclaim(nvs), name, old_len, new_len, &hot)
 }
 
 const NVS_NAMESPACE: &str = "heartwood";

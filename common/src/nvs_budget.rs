@@ -76,6 +76,33 @@ pub fn small_write_reserve() -> usize {
     blob_entries(SMALL_WRITE_MAX)
 }
 
+/// The largest stored network config, and the largest staged trial
+/// (`net_config_store`). Both keys are [`Fallback::Never`], so a rewrite of
+/// either is written in place or refused.
+pub const NET_CONFIG_MAX_LEN: usize = 1024;
+
+/// Entries a cached picture must leave free: a rewrite of the largest of the
+/// keys that never erase first, the small keys or a full-size network config,
+/// one at a time as their old copies are freed. So a picture never stands
+/// between the owner and a `PATCH_NET_CONFIG` or `SET_NET_CONFIG`, which in
+/// WiFi-standalone mode are the only way back to a remote board. A trial's
+/// commit holds the staged record beside the config, which this does not
+/// cover; that write drops the pictures if they are in the way
+/// (`net_config_store`, [`evict_for_replace`]).
+pub fn avatar_reserve() -> usize {
+    small_write_reserve().max(blob_entries(NET_CONFIG_MAX_LEN))
+}
+
+/// The entries certainly still available after `old_len` (or nothing) is
+/// replaced by `new_len` bytes, in place or after an erase: at most
+/// [`blob_entries`] used, at least [`stored_entries_min`] freed. `None` if
+/// that bound does not fit.
+pub fn available_after_replace(available: usize, old_len: Option<usize>, new_len: usize) -> Option<usize> {
+    available
+        .saturating_add(old_len.map_or(0, stored_entries_min))
+        .checked_sub(blob_entries(new_len))
+}
+
 /// What a replace that does not fit beside the old copy does instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fallback {
@@ -212,8 +239,8 @@ pub fn plan_replace(fallback: Fallback, available: usize, old_len: Option<usize>
 }
 
 /// Whether a write that grows the store (a new pairing, a persona, an unlock
-/// phone, an avatar) may go ahead: it must fit, and afterwards there must
-/// still be room to rewrite the largest hot blob in place, plus the small-key
+/// phone; a picture has its own gate, [`avatar_allowed`]) may go ahead: it
+/// must fit, and afterwards there must still be room to rewrite the largest hot blob in place, plus the small-key
 /// reserve. `old_len` is the growing key's current size (its old copy is
 /// freed once the write completes); `largest_hot` is the largest of the blobs
 /// that are rewritten in place (the pairing tables, `dk_ph`, the persona
@@ -252,9 +279,11 @@ pub fn evict_avatars(mut remove: impl FnMut(&str) -> bool) -> usize {
     avatar_keys().filter(|key| remove(key)).count()
 }
 
-/// The status key [`BlobSizes`] is reported under: FIRMWARE_INFO and the
-/// device operator's full `get_status`, never a delegate's reply nor the
-/// low-heap fallback.
+/// The status key [`BlobSizes`] is reported under: the device operator's
+/// full `get_status` and FIRMWARE_INFO, never a delegate's reply nor the
+/// low-heap fallback. FIRMWARE_INFO to a USB host that has not authenticated
+/// to the bridge carries the bare largest length only
+/// ([`BlobSizes::to_json`] with `full` false).
 pub const BLOB_SIZES_KEY: &str = "nvs_blobs";
 
 /// Stored lengths, in bytes, of the blobs the growth gates weigh: the
@@ -293,12 +322,18 @@ impl BlobSizes {
     /// slot is tight): `{"largest_hot":5280,"largest_hot_key":"connslots_0",
     /// "avatars":{"0":2308}}`. With nothing stored, `largest_hot` is 0, its
     /// key `null` and `avatars` empty. Every key is a fixed ASCII name, so
-    /// nothing needs escaping.
-    pub fn to_json(&self) -> String {
+    /// nothing needs escaping. Not `full`: `{"largest_hot":5280}` alone, for
+    /// a USB host that has not authenticated to the bridge, which is not
+    /// told which identity's table it is nor which identities have a
+    /// picture.
+    pub fn to_json(&self, full: bool) -> String {
         let (bytes, key) = match &self.largest_hot {
             Some((key, len)) => (*len, format!("\"{key}\"")),
             None => (0, String::from("null")),
         };
+        if !full {
+            return format!("{{\"largest_hot\":{bytes}}}");
+        }
         let avatars: Vec<String> =
             self.avatars.iter().map(|(slot, len)| format!("\"{slot}\":{len}")).collect();
         format!(
@@ -336,12 +371,15 @@ pub fn replace_outcome(fallback: Fallback, available: usize, old_len: Option<usi
 }
 
 /// Whether to drop the cached avatars (`reclaim` entries, [`avatar_reclaim`])
-/// before a replace: only when that changes how it ends. A write that does
-/// not fit then fits, a replace that would erase first then goes in place
-/// (or one refused in place is then written), or an erase-first rewrite that
-/// would lose the key then lands. When the avatars would not change the
-/// outcome they stay: a table that erases first either way gains nothing
-/// from their loss.
+/// before a replace. Always when, kept, the write is predicted to be refused
+/// or to lose the key (`NoRoom`, `Lost`): both bounds are worst cases
+/// (`blob_entries` for the new copy, the fewest entries for what an erase
+/// or a dropped picture frees), so the real write may still land with
+/// their room and not without it, and a lost key after an erase is far
+/// worse than a lost cache. Otherwise only when the drop changes how it
+/// ends: a replace that would erase first then goes in place. A write
+/// predicted to land either way (in place, or after its erase) keeps them:
+/// a table that erases first either way gains nothing from their loss.
 pub fn evict_for_replace(
     fallback: Fallback,
     available: usize,
@@ -349,9 +387,11 @@ pub fn evict_for_replace(
     old_len: Option<usize>,
     new_len: usize,
 ) -> bool {
-    reclaim > 0
-        && replace_outcome(fallback, available.saturating_add(reclaim), old_len, new_len)
-            > replace_outcome(fallback, available, old_len, new_len)
+    if reclaim == 0 {
+        return false;
+    }
+    let kept = replace_outcome(fallback, available, old_len, new_len);
+    kept <= Outcome::NoRoom || replace_outcome(fallback, available.saturating_add(reclaim), old_len, new_len) > kept
 }
 
 /// Whether to drop the cached avatars before a growth [`growth_allowed`]
@@ -388,12 +428,13 @@ pub fn growth_allowed_with_reclaim(
 /// old copy included, as [`avatar_reclaim`] counts it) and the lengths of the
 /// hot blobs stored (`hot_keys`).
 ///
-/// It must fit and leave the small-key reserve. And it must never be what a
+/// It must fit and leave [`avatar_reserve`]. And it must never be what a
 /// later rewrite of a hot blob at its present size drops at once, so for
 /// every hot blob:
 ///
 /// - erased and rewritten, it still fits with the reserve to spare (so
-///   [`evict_for_replace`] never finds the rewrite would lose the key);
+///   [`evict_for_replace`] never finds the rewrite would lose the key, nor
+///   a network config rewrite then refused);
 /// - if it could be rewritten in place with every avatar gone, it still can
 ///   with this one stored, with the reserve to spare (so the eviction never
 ///   finds the avatar is what stands between it and an in-place write).
@@ -412,17 +453,60 @@ pub fn avatar_allowed(
     new_len: usize,
     hot: &[usize],
 ) -> bool {
-    let room = available.saturating_add(old_len.map_or(0, stored_entries_min));
+    avatar_allowed_within(available, available, reclaim, old_len, new_len, hot)
+}
+
+/// [`avatar_allowed`] for a picture written after its identity's name:
+/// `name` is the name's stored length (or `None`) and its new length, or
+/// `None` when the name is unchanged and not written. The name's rewrite
+/// leaves the board somewhere between two bounds, so the picture must fit
+/// and keep the reserve at the lower ([`available_after_replace`]), and is
+/// judged against an in-place table rewrite at the upper (at least
+/// [`stored_entries_min`] of the new copy used, at most [`blob_entries`] of
+/// the old one freed), so neither bound lets in a picture the board itself
+/// would refuse.
+pub fn avatar_after_name_allowed(
+    available: usize,
+    reclaim: usize,
+    name: Option<(Option<usize>, usize)>,
+    old_len: Option<usize>,
+    new_len: usize,
+    hot: &[usize],
+) -> bool {
+    let Some((old_name, new_name)) = name else {
+        return avatar_allowed(available, reclaim, old_len, new_len, hot);
+    };
+    let Some(lower) = available_after_replace(available, old_name, new_name) else {
+        return false;
+    };
+    let upper = available
+        .saturating_add(old_name.map_or(0, blob_entries))
+        .saturating_sub(stored_entries_min(new_name));
+    avatar_allowed_within(lower, upper.max(lower), reclaim, old_len, new_len, hot)
+}
+
+/// The gate with the board's available entries known only between `lower`
+/// and `upper`: fit and reserves at the lower, the in-place question (could
+/// the hot blob go in place with no picture?) at the upper.
+fn avatar_allowed_within(
+    lower: usize,
+    upper: usize,
+    reclaim: usize,
+    old_len: Option<usize>,
+    new_len: usize,
+    hot: &[usize],
+) -> bool {
+    let room = lower.saturating_add(old_len.map_or(0, stored_entries_min));
     let need = blob_entries(new_len);
     if need > room {
         return false;
     }
     let after = room - need;
-    let reserve = small_write_reserve();
+    let reserve = avatar_reserve();
     if after < reserve {
         return false;
     }
-    let bare = available.saturating_add(reclaim);
+    let bare = upper.saturating_add(reclaim);
     hot.iter().all(|&len| {
         let rewrite = blob_entries(len);
         let erased_fits = after + stored_entries_min(len) >= rewrite + reserve;
@@ -477,15 +561,28 @@ mod tests {
         assert_eq!(sizes.largest_hot, Some((String::from("connslots_0"), 5280)));
         assert_eq!(sizes.avatars, [(0, 2308), (3, 4610)]);
         assert_eq!(
-            sizes.to_json(),
+            sizes.to_json(true),
             r#"{"largest_hot":5280,"largest_hot_key":"connslots_0","avatars":{"0":2308,"3":4610}}"#
         );
         let phones = BlobSizes::read(|key| (key == "dk_ph").then_some(2166));
-        assert_eq!(phones.to_json(), r#"{"largest_hot":2166,"largest_hot_key":"dk_ph","avatars":{}}"#);
+        assert_eq!(phones.to_json(true), r#"{"largest_hot":2166,"largest_hot_key":"dk_ph","avatars":{}}"#);
         assert_eq!(
-            BlobSizes::read(|_| None).to_json(),
+            BlobSizes::read(|_| None).to_json(true),
             r#"{"largest_hot":0,"largest_hot_key":null,"avatars":{}}"#
         );
+    }
+
+    #[test]
+    fn an_unauthenticated_host_gets_the_bare_length() {
+        // No key name, no pictures: which identity's table, and which
+        // identities have a picture, are for an authenticated host.
+        let stored = |key: &str| match key {
+            "connslots_3" => Some(5280),
+            "imav3" => Some(2308),
+            _ => None,
+        };
+        assert_eq!(BlobSizes::read(stored).to_json(false), r#"{"largest_hot":5280}"#);
+        assert_eq!(BlobSizes::read(|_| None).to_json(false), r#"{"largest_hot":0}"#);
     }
 
     #[test]
@@ -493,7 +590,7 @@ mod tests {
         // Every slot holding a picture and the largest table there can be:
         // the reply grows by well under 200 bytes.
         let full = BlobSizes::read(|key| Some(if key.starts_with("imav") { 8194 } else { 16_000 }));
-        let json = full.to_json();
+        let json = full.to_json(true);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["avatars"].as_object().unwrap().len(), usize::from(MAX_MASTER_SLOTS));
         assert!(json.len() < 200, "{} bytes: {json}", json.len());
@@ -696,8 +793,10 @@ mod tests {
 
     #[test]
     fn a_48px_one_byte_picture_is_accepted_on_the_board() {
+        assert_eq!(avatar_reserve(), blob_entries(NET_CONFIG_MAX_LEN));
+        assert_eq!(avatar_reserve(), 50);
         // 91 entries at most, 85 left: the table still rewrites after its
-        // erase (85 + 167 >= 185 + 13), and it could not go in place even
+        // erase (85 + 167 >= 185 + 50), and it could not go in place even
         // with no picture (185 > 176).
         assert!(avatar_allowed(BOARD_AVAILABLE, 0, None, AVATAR_48, &[TABLE_6]));
         // Replacing one: its old copy is freed.
@@ -706,38 +805,109 @@ mod tests {
         // Over a legacy Rgb565 one.
         let legacy = BOARD_AVAILABLE - crate::nvs_room::min_blob_entries(LEGACY_48);
         assert!(avatar_allowed(legacy, crate::nvs_room::min_blob_entries(LEGACY_48), Some(LEGACY_48), AVATAR_48, &[TABLE_6]));
+        // The least room beside this table: 159 (68 + 167 = 235 after).
+        assert!(!avatar_allowed(158, 0, None, AVATAR_48, &[TABLE_6]));
+        assert!(avatar_allowed(159, 0, None, AVATAR_48, &[TABLE_6]));
+    }
+
+    #[test]
+    fn the_name_written_first_counts_against_the_picture() {
+        // An unchanged name is not written, and the gate is avatar_allowed's.
+        for available in [158, 159, 176] {
+            assert_eq!(
+                avatar_after_name_allowed(available, 0, None, None, AVATAR_48, &[TABLE_6]),
+                avatar_allowed(available, 0, None, AVATAR_48, &[TABLE_6])
+            );
+        }
+        let least = |name| (0..600).find(|&a| avatar_after_name_allowed(a, 0, name, None, AVATAR_48, &[TABLE_6]));
+        // A first name of 15 bytes takes up to 7 entries: 166, not 159.
+        assert_eq!(least(Some((None, 15))), Some(166));
+        // Renamed at the same length: 7 used, at least 3 freed.
+        assert_eq!(least(Some((Some(15), 15))), Some(163));
+        // The longest name (255 bytes, 21 entries) is refused on the board.
+        assert_eq!(least(Some((None, 255))), Some(180));
+        assert!(!avatar_after_name_allowed(BOARD_AVAILABLE, 0, Some((None, 255)), None, AVATAR_48, &[TABLE_6]));
+        assert!(avatar_after_name_allowed(BOARD_AVAILABLE, 0, Some((None, 15)), None, AVATAR_48, &[TABLE_6]));
+        // A name that does not fit at all.
+        assert!(!avatar_after_name_allowed(3, 0, Some((None, 255)), None, AVATAR_48, &[]));
+    }
+
+    #[test]
+    fn the_room_after_a_replace_is_its_worst_case() {
+        assert_eq!(available_after_replace(100, None, 15), Some(100 - 7));
+        assert_eq!(available_after_replace(100, Some(15), 15), Some(100 + 3 - 7));
+        assert_eq!(available_after_replace(6, None, 15), None);
+    }
+
+    #[test]
+    fn an_accepted_picture_leaves_room_for_a_network_config_rewrite() {
+        // Review item 2: `net_config` and `net_trial` never erase first and
+        // are never gated, so a picture must leave a full-size rewrite of
+        // either in place: straight after it, and after any hot blob's
+        // erase-first rewrite at its present size.
+        let mut accepted = 0;
+        for available in 0..500 {
+            for hot in [0, 300, 1500, 3000, TABLE_6, TABLE_7, 8000] {
+                for new in [AVATAR_48, AVATAR_64, LEGACY_48] {
+                    for old in [None, Some(AVATAR_48), Some(LEGACY_48)] {
+                        let reclaim = old.map_or(0, crate::nvs_room::min_blob_entries);
+                        if !avatar_allowed(available, reclaim, old, new, &[hot]) {
+                            continue;
+                        }
+                        accepted += 1;
+                        let after = available_after_replace(available, old, new).unwrap();
+                        let erased = after + stored_entries_min(hot) - blob_entries(hot);
+                        for room in [after, erased] {
+                            assert_eq!(
+                                replace_outcome(Fallback::Never, room, Some(NET_CONFIG_MAX_LEN), NET_CONFIG_MAX_LEN),
+                                Outcome::InPlace,
+                                "available {available}, hot {hot}, picture {new}, old {old:?}, room {room}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(accepted > 100);
     }
 
     #[test]
     fn a_64px_picture_and_a_two_byte_48px_one_do_not_fit_the_board() {
         // 64px, one byte a pixel: 149 entries, 27 left. The table's
-        // erase-first rewrite needs 185 + 13 = 198 of 27 + 167 = 194: four
+        // erase-first rewrite needs 185 + 50 = 235 of 27 + 167 = 194: 41
         // short.
         assert!(!avatar_allowed(BOARD_AVAILABLE, 0, None, AVATAR_64, &[TABLE_6]));
         // 48px as beta.38 stored it: 165 entries, 11 left, under the reserve.
         assert!(!avatar_allowed(BOARD_AVAILABLE, 0, None, LEGACY_48, &[TABLE_6]));
         assert!(!avatar_allowed(BOARD_AVAILABLE, 0, None, LEGACY_64, &[TABLE_6]));
-        // Four more entries and 64px fits.
-        assert!(avatar_allowed(BOARD_AVAILABLE + 4, 0, None, AVATAR_64, &[TABLE_6]));
+        // 41 more entries and the erased rewrite fits, but by then (217) the
+        // table would go in place without the picture and not with it: 64px
+        // needs 384 beside this table, where it still goes in place after.
+        assert!(!avatar_allowed(BOARD_AVAILABLE + 41, 0, None, AVATAR_64, &[TABLE_6]));
+        assert!(!avatar_allowed(383, 0, None, AVATAR_64, &[TABLE_6]));
+        assert!(avatar_allowed(384, 0, None, AVATAR_64, &[TABLE_6]));
     }
 
     #[test]
     fn where_the_table_could_go_in_place_the_picture_must_not_take_that() {
-        // 300 available: the table rewrites in place (185 <= 300). A 64px
-        // picture would leave 151, short of 185 + 13, so it is refused; a
-        // 48px one leaves 209 and is not.
+        // 300 available: the table rewrites in place (185 <= 300). A 48px
+        // picture would leave 209, short of 185 + 50, so it is refused; from
+        // 326 it leaves 235 and is not.
         assert!(!avatar_allowed(300, 0, None, AVATAR_64, &[TABLE_6]));
-        assert!(avatar_allowed(300, 0, None, AVATAR_48, &[TABLE_6]));
+        assert!(!avatar_allowed(300, 0, None, AVATAR_48, &[TABLE_6]));
+        assert!(!avatar_allowed(325, 0, None, AVATAR_48, &[TABLE_6]));
+        assert!(avatar_allowed(326, 0, None, AVATAR_48, &[TABLE_6]));
         // Every hot blob is judged, not only the largest: a small one that
         // goes in place keeps doing so.
-        // At 140 the table erases first either way; a 1500-byte blob (65
-        // entries) goes in place without the picture and would not with it.
-        assert!(avatar_allowed(140, 0, None, AVATAR_48, &[TABLE_6]));
-        assert!(!avatar_allowed(140, 0, None, AVATAR_48, &[TABLE_6, 1500]));
-        assert!(avatar_allowed(140, 0, None, AVATAR_48, &[TABLE_6, 300]));
+        // At 160 the table erases first either way; a 1500-byte blob (67
+        // entries) goes in place without the picture and would not with it
+        // (69 left); a 100-byte one (13) still does.
+        assert!(avatar_allowed(160, 0, None, AVATAR_48, &[TABLE_6]));
+        assert!(!avatar_allowed(160, 0, None, AVATAR_48, &[TABLE_6, 1500]));
+        assert!(avatar_allowed(160, 0, None, AVATAR_48, &[TABLE_6, 100]));
         // No hot blob: fit and the reserve.
-        assert!(avatar_allowed(blob_entries(AVATAR_48) + small_write_reserve(), 0, None, AVATAR_48, &[]));
-        assert!(!avatar_allowed(blob_entries(AVATAR_48) + small_write_reserve() - 1, 0, None, AVATAR_48, &[]));
+        assert!(avatar_allowed(blob_entries(AVATAR_48) + avatar_reserve(), 0, None, AVATAR_48, &[]));
+        assert!(!avatar_allowed(blob_entries(AVATAR_48) + avatar_reserve() - 1, 0, None, AVATAR_48, &[]));
     }
 
     #[test]
@@ -749,9 +919,11 @@ mod tests {
         for available in [85, 101] {
             assert_eq!(replace_outcome(Fallback::EraseFirst, available, Some(TABLE_6), TABLE_6), Outcome::AfterErase);
             assert!(!evict_for_replace(Fallback::EraseFirst, available, 75, Some(TABLE_6), TABLE_6));
-            // In place only (a legacy credential still to clear): refused
-            // with the picture or without.
-            assert!(!evict_for_replace(Fallback::Never, available, 75, Some(TABLE_6), TABLE_6));
+            // In place only (a legacy credential still to clear): refused by
+            // the bound with the picture or without, but the bound is a worst
+            // case, so the picture goes and the write is tried.
+            assert_eq!(replace_outcome(Fallback::Never, available + 75, Some(TABLE_6), TABLE_6), Outcome::NoRoom);
+            assert!(evict_for_replace(Fallback::Never, available, 75, Some(TABLE_6), TABLE_6));
         }
     }
 
@@ -774,10 +946,12 @@ mod tests {
 
     #[test]
     fn the_pictures_go_only_when_that_changes_how_a_write_ends() {
-        // A first write with no room fits once they go.
+        // A first write with no room fits once they go. With too few to
+        // make the difference by the bound they go too: a first write is
+        // always tried, and may need less than the bound.
         assert_eq!(replace_outcome(Fallback::EraseFirst, 20, None, 877), Outcome::NoRoom);
         assert!(evict_for_replace(Fallback::EraseFirst, 20, 300, None, 877));
-        assert!(!evict_for_replace(Fallback::EraseFirst, 20, 10, None, 877));
+        assert!(evict_for_replace(Fallback::EraseFirst, 20, 10, None, 877));
         // Erase-first becomes in place.
         assert!(evict_for_replace(Fallback::EraseFirst, 100, 90, Some(TABLE_6), TABLE_6));
         // Refused in place becomes in place.
@@ -785,6 +959,18 @@ mod tests {
         // An erase-first rewrite that would lose the key lands instead.
         assert_eq!(replace_outcome(Fallback::EraseFirst, 10, Some(TABLE_6), TABLE_7), Outcome::Lost);
         assert!(evict_for_replace(Fallback::EraseFirst, 10, 40, Some(TABLE_6), TABLE_7));
+        // Review item 1: predicted lost with the pictures and without them.
+        // The bound is a worst case, so the real write may need their room
+        // after its erase: they go (main's rule).
+        assert_eq!(blob_entries(4300), 155);
+        assert_eq!(replace_outcome(Fallback::EraseFirst, 6, Some(4000), 4300), Outcome::Lost);
+        assert_eq!(replace_outcome(Fallback::EraseFirst, 6 + 21, Some(4000), 4300), Outcome::Lost);
+        assert!(evict_for_replace(Fallback::EraseFirst, 6, 21, Some(4000), 4300));
+        // Refused with them and without: the same.
+        assert_eq!(replace_outcome(Fallback::Never, 20 + 21, Some(4000), 4300), Outcome::NoRoom);
+        assert!(evict_for_replace(Fallback::Never, 20, 21, Some(4000), 4300));
+        // Landing either way keeps them.
+        assert!(!evict_for_replace(Fallback::EraseFirst, 40, 21, Some(4000), 4300));
         // Nothing to drop, or already in place: no.
         assert!(!evict_for_replace(Fallback::EraseFirst, 20, 0, None, 877));
         assert!(!evict_for_replace(Fallback::EraseFirst, 400, 90, Some(TABLE_6), TABLE_6));
@@ -800,26 +986,51 @@ mod tests {
     fn an_accepted_picture_is_not_dropped_by_a_same_size_rewrite() {
         // Whatever the board, a picture `avatar_allowed` lets in leaves a
         // board where rewriting any hot blob at its size does not call for
-        // the drop. A rewrite that shrinks it may (a revocation, below). The board after the write has between `blob_entries` and
-        // `min_blob_entries` fewer entries; the drop counts the latter.
+        // the drop. A rewrite that shrinks it may (a revocation, below). The
+        // board after the write has between `blob_entries` of the new copy
+        // used less `stored_entries_min` of the old freed, and
+        // `min_blob_entries` of each; the drop counts the pictures at
+        // `min_blob_entries`, this one and the other masters' (`others`).
+        // An in-place-only rewrite (a legacy credential still to clear) that
+        // the bound refuses drops them whatever they are, so it is held to
+        // this only where the blob would go in place with no picture at all.
+        let mut checked = 0;
         for available in (0..500).step_by(3) {
             for hot in [0, 300, 1500, 3000, TABLE_6, TABLE_7, 8000] {
                 for new in [AVATAR_48, AVATAR_64, LEGACY_48] {
-                    if !avatar_allowed(available, 0, None, new, &[hot]) {
-                        continue;
-                    }
-                    let min = crate::nvs_room::min_blob_entries(new);
-                    for after in (available - blob_entries(new))..=(available - min) {
-                        for fallback in [Fallback::EraseFirst, Fallback::Never] {
-                            assert!(
-                                !evict_for_replace(fallback, after, min, Some(hot), hot),
-                                "available {available}, hot {hot}, picture {new}, after {after}"
-                            );
+                    for old in [None, Some(AVATAR_48), Some(LEGACY_48)] {
+                        for others in [0, 75, 150] {
+                            let mbe = crate::nvs_room::min_blob_entries;
+                            let reclaim = others + old.map_or(0, mbe);
+                            if !avatar_allowed(available, reclaim, old, new, &[hot]) {
+                                continue;
+                            }
+                            checked += 1;
+                            let low = available + old.map_or(0, stored_entries_min) - blob_entries(new);
+                            let high = available + old.map_or(0, mbe) - mbe(new);
+                            let after_reclaim = others + mbe(new);
+                            let bare = available + reclaim;
+                            for after in low..=high {
+                                let what = format!(
+                                    "available {available}, hot {hot}, picture {new}, old {old:?}, others {others}, after {after}"
+                                );
+                                assert!(
+                                    !evict_for_replace(Fallback::EraseFirst, after, after_reclaim, Some(hot), hot),
+                                    "{what}"
+                                );
+                                if blob_entries(hot) <= bare {
+                                    assert!(
+                                        !evict_for_replace(Fallback::Never, after, after_reclaim, Some(hot), hot),
+                                        "{what}"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        assert!(checked > 100);
     }
 
     #[test]
@@ -833,11 +1044,11 @@ mod tests {
         assert!(avatar_allowed(BOARD_AVAILABLE, 0, None, AVATAR_48, &[4993]));
         // Hold the rest of the board fixed instead (343 entries besides the
         // modelled table) and let the table's length change, as revoking
-        // pairings does: a 48px picture is refused from 3,489 to 5,120
-        // bytes (about four to five pairings), where the table goes in place
-        // only without it, and again from 7,009, where its erased rewrite no
-        // longer fits beside the picture. 64px fits only up to 2,560 bytes
-        // and at 5,121 to 5,152.
+        // pairings does: a 48px picture is refused from 2,913 to 5,120
+        // bytes (about three to five pairings), where the table goes in place
+        // only without it, and again from 5,825, where its erased rewrite no
+        // longer fits beside the picture with room for a network config.
+        // 64px fits only up to 1,984 bytes.
         let base = BOARD_AVAILABLE + stored_entries_min(TABLE_6);
         let accepted = |picture: usize, table: usize| {
             avatar_allowed(base - stored_entries_min(table), 0, None, picture, &[table])
@@ -854,8 +1065,8 @@ mod tests {
             }
             edges
         };
-        assert_eq!(edges(AVATAR_48), [3489, 5121, 7009]);
-        assert_eq!(edges(AVATAR_64), [2561, 5121, 5153]);
+        assert_eq!(edges(AVATAR_48), [2913, 5121, 5825]);
+        assert_eq!(edges(AVATAR_64), [1985]);
     }
 
     #[test]

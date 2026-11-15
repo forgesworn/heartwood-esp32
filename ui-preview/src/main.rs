@@ -11,6 +11,10 @@
 mod layout;
 #[path = "../../firmware/src/palette.rs"]
 mod palette;
+// The colour panels' one-byte-a-pixel framebuffer codec; included so its tests
+// (every palette colour exact, flip order) run in the ui-preview CI job.
+#[path = "../../firmware/src/pixel8.rs"]
+mod pixel8;
 #[path = "../../firmware/src/bigtext.rs"]
 mod bigtext;
 #[path = "../../firmware/src/network_screen.rs"]

@@ -151,8 +151,8 @@ jobs:
       - run: cargo +stable test --manifest-path provision/Cargo.toml
 
   # Screen geometry (ui-preview/) — it includes firmware/src/{layout,palette,
-  # bigtext}.rs verbatim via #[path], so its tests are the firmware's own layout
-  # tests plus a scan of every show_error card in firmware/src. `show_error`
+  # bigtext,pixel8}.rs verbatim via #[path], so its tests are the firmware's own
+  # layout and framebuffer-codec tests plus a scan of every show_error card in firmware/src. `show_error`
   # does not wrap: five cards were silently clipped on the 128x64 OLED, two of
   # them the ones that tell an owner whether their RNG is trustworthy. Nothing
   # ran these before — the crate appeared only under cargo-deny.

@@ -16,6 +16,8 @@
 
 // The shared modules expose the full signer-facing API; the demo uses a
 // slice of it, so unused-item warnings are expected and silenced.
+#[path = "../pixel8.rs"]
+mod pixel8;
 #[path = "../st7789.rs"]
 #[allow(dead_code)]
 mod st7789;

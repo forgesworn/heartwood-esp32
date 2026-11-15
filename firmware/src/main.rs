@@ -83,6 +83,10 @@ mod release_key;
 mod serial;
 mod net_config_store;
 mod boot_config;
+// One-byte-a-pixel framebuffer codec shared by both colour panels; pure, and
+// tested on the host through ui-preview.
+#[cfg(any(feature = "st7789", feature = "c6"))]
+mod pixel8;
 #[cfg(feature = "st7789")]
 mod st7789;
 #[cfg(feature = "c6")]

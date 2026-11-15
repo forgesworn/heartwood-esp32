@@ -1974,6 +1974,11 @@ fn the_board_takes_a_48px_picture_and_not_a_64px_one() {
     assert!(!nvs::avatar_allowed(&nvs, "imav0", p64.len()));
     // As beta.38 stored a 48px one (Rgb565, 4,610 bytes): refused too.
     assert!(!nvs::avatar_allowed(&nvs, "imav0", 2 + 48 * 48 * 2));
+    // Once stored, the 48px picture keeps 75 entries in use (the gate
+    // charged it 91 before the write): checklist section 46, step 2.
+    nvs.backend.seed("imav0", &p48);
+    assert_eq!(stored_entries_min(p48.len()), 75);
+    assert_eq!(available(&nvs), BOARD_AVAILABLE - 75);
 }
 
 #[test]

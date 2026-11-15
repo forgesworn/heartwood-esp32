@@ -4204,12 +4204,14 @@ Why: a T-Display on 0.18.0-beta.38 with six pairings on master 0 lost its
 identity picture and could not take it back: Sapwood got `storage_full: not
 enough storage left for the avatar; the pairings need the room`. #197 dropped
 cached pictures before every tight pairing-table save, and stored a 48x48
-picture as 4,610 bytes of Rgb565 (165 entries). Now a picture is dropped only
+picture as 4,610 bytes of Rgb565 (charged 165 entries at write time). Now a picture is dropped only
 when the save would otherwise be refused, or could then be rewritten in place
 rather than erased first; a persona or phone the growth gate would refuse
 drops it first when that alone makes the room; and a picture is stored at one
-byte a pixel, `[0x00][0x01][w][h]` then RGB332, so 48x48 is 2,308 bytes (91
-entries) and 64x64 is 4,100 (149). The 0x5B wire is unchanged (Rgb565); the
+byte a pixel, `[0x00][0x01][w][h]` then RGB332, so 48x48 is 2,308 bytes and
+64x64 is 4,100. The gate charges a write its worst case (`blob_entries`: 91
+entries for 48x48, 149 for 64x64); what a stored 48x48 picture keeps in use
+is 75 entries, or 76 if it spans a page. The 0x5B wire is unchanged (Rgb565); the
 device converts. Host tests: `common/src/identity_avatar.rs`,
 `nvs_budget.rs` and the board model in `firmware_policy_host_tests.rs`
 (`BOARD_AVAILABLE` = 176). The model's six-pairing table is 5,280 bytes; the
@@ -4225,12 +4227,16 @@ The owner's T-Display (beta.38, one master, six pairings, `get_status` about
    only, 0x10000). The board boots with its six pairings and no picture.
 2. Re-provision the 48x48 picture from Sapwood: ACK, the npub screen shows it,
    colours close to the source with the RGB332 steps already seen on section
-   45's screens. Record available entries after (the model predicts 91 fewer).
+   45's screens. Record available entries after: the model predicts 75 or
+   76 fewer, so about 100 left (the gate charged it 91 before the write).
    If it is refused with the same `storage_full` text, record the free entries
    and the table length: the table is shorter than 4,993 bytes, and freeing one
    pairing will not help (the band 3,489 to 5,120 bytes refuses it too).
-3. A change that keeps the table's size: rename a pairing, or change one
-   pairing's policy. It saves, and the picture is still there after a reboot.
+3. A change to one of the six: rename a pairing, or change its policy. It
+   saves, and the picture is still there after a reboot. Only adding a
+   pairing is growth-gated; a six-pairing table this size erases first
+   whether the picture is there or not, so nothing drops it, even for a
+   change that lengthens the table a little.
 4. A seventh pairing is refused (`no room to save this pairing`), with or
    without the picture; the picture is still there afterwards. The model needs
    272 available entries for it.

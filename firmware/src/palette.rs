@@ -16,6 +16,10 @@
 // Rgb565 channels are 5/6/5 bits, so each constant is the 8-bit hex right-
 // shifted by 3 / 2 / 3.
 
+// The colour panels' framebuffer (pixel8.rs) stores these colours exactly.
+// Add every new colour here to `pixel8::PALETTE` too; a test fails if one is
+// missing.
+//
 // Not every colour is consumed by every board build (e.g. BG is only used by
 // the mono threshold adapter) or every consumer (the host ui-preview uses all
 // of them). This is a shared design palette, so allow unused constants.

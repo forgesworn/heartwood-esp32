@@ -4151,3 +4151,49 @@ Write the board back to the image it ran before. Do not merge this branch;
 either revert `lto = "thin"` or raise the short task's stack (the setting in
 the table above; it costs internal RAM, not app image) and run this section
 again on every board class.
+
+## 45. One-byte-a-pixel framebuffer on the colour panels (added 2026-11-15, NOT YET BENCH-RUN)
+
+Why: the T-Display kept its colour framebuffer as `Rgb565`, 64.8 KB of a
+classic ESP32 that settles near 45 KB free heap with a ~32 KB largest block on
+the relay. The framebuffer now stores one byte a pixel, an index into the
+256-entry table in `firmware/src/pixel8.rs`: every `palette.rs` colour (and
+black and white) stored exactly, the rest of the table the RGB332 cube, and is
+widened back to `Rgb565` as `flush()` streams it. Expected gain on the
+T-Display: about 32 KB of heap. The screens are unchanged. Host tests pin the
+table (palette round trip, cube round trip, error bound, flip order); only the
+look and the heap need a board.
+
+T-Display first (the change is there). The C6 (`jd9853.rs`, 110 KB down to
+55 KB) takes the same change in its own commit; run steps 1-4 on it too, and
+step 5 for `free_heap` if a board is to hand. Spare board, WiFi-standalone with the relay online for step 5.
+
+1. Walk every screen the board can show (ready, npub with and without a
+   picture, approval cards of each kind, enrol card and PHONE ADDED, network
+   screen, offline QR, an error card, the idle sleep and wake). Colours read
+   the same as beta.38: text white-ish, muted grey, green accent and OK,
+   amber warning, red danger. No screen shows banding, a wrong tint or a
+   dark/bright edge round text.
+2. Boot animation and the entropy game: cat sprites and the rainbow bar look
+   right (orange ghost cat, purple Nostr cat). The rainbow's magenta and
+   indigo bands may sit a shade off the beta.38 colours (two blue levels in
+   the cube); note it if it looks wrong rather than slightly different.
+3. Identity picture: provision a 64x64 picture (Rgb565) and, with the RGB332
+   picture format if that is on the board, an RGB332 one. Each should look
+   like the source, smooth areas without visible steps beyond the RGB332 look
+   already seen on the picture format.
+4. Flip: turn the picture through 180 degrees (display flip) and back. Every
+   screen above is the right way up, nothing mirrored, none of it shifted.
+5. Heap: with the relay online, read `get_status` `free_heap` and
+   `largest_block` at 12 s after boot and again once the relay is connected
+   and settled, on this image and on beta.38 (same board, same relays, same
+   identity). Record all four pairs. Expected: roughly 32 KB more free heap
+   and a larger largest block on this image. Leave it running for an hour
+   and note the settled figures; no `last_reset` of `panic`.
+6. `scripts/build-firmware.sh tdisplay --release` app image size is no larger
+   than beta.38's (the table and codec add a few hundred bytes of code and
+   512 bytes of RAM).
+
+On failure: record the screen, a photo of it beside beta.38's, and the heap
+figures. A wrong palette colour is a bug in `pixel8.rs` (the host test should
+have caught it: add the case there).

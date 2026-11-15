@@ -15,17 +15,25 @@
 //   * `clear_buffer()` / `flush()` / `set_display_on()` inherent methods with
 //     the same shapes the screens already call.
 //
-// Drawing goes into an in-RAM `Rgb565` framebuffer; `flush()` blits the whole
+// Drawing goes into an in-RAM framebuffer; `flush()` blits the whole
 // frame to the panel in one sweep. That preserves the existing
 // clear -> draw -> flush double-buffered model and avoids the flicker of
-// clearing the panel directly before each redraw. RAM cost is `w * h * 2`
-// bytes (240x135 -> 64.8 KB; 172x320 -> 110 KB), comfortably within the
-// classic ESP32 / C6 SRAM budget.
+// clearing the panel directly before each redraw.
+//
+// RAM cost: the screens draw in `Rgb565`, but the framebuffer stores one byte
+// a pixel, an index into the 256-entry table in pixel8.rs (every palette.rs
+// colour exact, the rest an RGB332 cube), widened back to Rgb565 as `flush()`
+// streams it. That is `w * h` bytes: 240x135 -> 32.4 KB, down from 64.8 KB
+// (`w * h * 2`), plus the 0.6 KB table. The classic ESP32 has no PSRAM and
+// settles near 45 KB free heap on the relay, so the 32 KB saved matters.
 
 use core::convert::Infallible;
 
 use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::Rectangle;
+
+use crate::pixel8::Codec;
 
 use esp_idf_hal::delay::Ets;
 use esp_idf_hal::gpio::{Output, PinDriver};
@@ -55,8 +63,8 @@ type Panel<'a> = mipidsi::Display<Iface<'a>, ST7789, PinDriver<'a, Output>>;
 #[derive(Debug)]
 pub struct St7789Error;
 
-/// Colour ST7789 display presented as a mono `DrawTarget` over an `Rgb565`
-/// framebuffer. Drop-in for the SSD1306 `oled::Display` alias.
+/// Colour ST7789 display presented as an `Rgb565` `DrawTarget` over a
+/// one-byte-a-pixel framebuffer. Drop-in for the SSD1306 `oled::Display` alias.
 pub struct St7789Display<'a> {
     panel: Panel<'a>,
     /// Backlight pin. Polarity is board-specific (see `backlight_active_low`).
@@ -64,8 +72,12 @@ pub struct St7789Display<'a> {
     /// When true, the backlight is ON when the pin is LOW (P-MOSFET driver).
     /// When false, the backlight is ON when the pin is HIGH (direct or NPN).
     backlight_active_low: bool,
-    /// In-RAM frame, `w * h` pixels, blitted on `flush`.
-    framebuffer: Vec<Rgb565>,
+    /// In-RAM frame, `w * h` bytes (indices into `codec`), blitted on `flush`.
+    framebuffer: Vec<u8>,
+    /// Rgb565 <-> framebuffer byte (pixel8.rs).
+    codec: Codec,
+    /// The byte for black, what `clear_buffer` fills with.
+    black: u8,
     width: i32,
     height: i32,
     /// Send the frame reversed: the picture turned through 180 degrees
@@ -121,13 +133,17 @@ impl<'a> St7789Display<'a> {
 
         let size = panel.size();
         let (width, height) = (size.width as i32, size.height as i32);
-        let framebuffer = vec![Rgb565::BLACK; (width * height) as usize];
+        let codec = Codec::new();
+        let black = codec.encode(Rgb565::BLACK);
+        let framebuffer = vec![black; (width * height) as usize];
 
         Self {
             panel,
             backlight,
             backlight_active_low,
             framebuffer,
+            codec,
+            black,
             width,
             height,
             flipped: false,
@@ -136,19 +152,16 @@ impl<'a> St7789Display<'a> {
 
     /// Clear the back buffer to black. Mirrors `Ssd1306::clear_buffer`.
     pub fn clear_buffer(&mut self) {
-        self.framebuffer.fill(Rgb565::BLACK);
+        self.framebuffer.fill(self.black);
     }
 
     /// Blit the whole back buffer to the panel. Mirrors `Ssd1306::flush`.
     pub fn flush(&mut self) -> Result<(), St7789Error> {
         crate::oled::note_draw();
         let (ex, ey) = ((self.width - 1) as u16, (self.height - 1) as u16);
-        let sent = if self.flipped {
-            self.panel.set_pixels(0, 0, ex, ey, self.framebuffer.iter().rev().copied())
-        } else {
-            self.panel.set_pixels(0, 0, ex, ey, self.framebuffer.iter().copied())
-        };
-        sent.map_err(|_| St7789Error)
+        // Decoded a pixel at a time as it is sent; reversed when flipped.
+        let pixels = self.codec.stream(&self.framebuffer, self.flipped);
+        self.panel.set_pixels(0, 0, ex, ey, pixels).map_err(|_| St7789Error)
     }
 
     /// Turn the picture through 180 degrees, or back. Takes effect on the
@@ -214,13 +227,43 @@ impl DrawTarget for St7789Display<'_> {
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
+        // Runs of one colour (text, rules, fills) are the norm, so the last
+        // colour's byte is remembered rather than looked up again.
+        let mut last: Option<(Rgb565, u8)> = None;
         for Pixel(p, colour) in pixels {
             // Clip to the panel; out-of-range pixels are silently dropped, as
             // the `DrawTarget` contract requires.
             if p.x >= 0 && p.y >= 0 && p.x < self.width && p.y < self.height {
+                let byte = match last {
+                    Some((c, b)) if c == colour => b,
+                    _ => {
+                        let b = self.codec.encode(colour);
+                        last = Some((colour, b));
+                        b
+                    }
+                };
                 let idx = (p.y * self.width + p.x) as usize;
-                self.framebuffer[idx] = colour;
+                self.framebuffer[idx] = byte;
             }
+        }
+        Ok(())
+    }
+
+    /// A solid rectangle (and so `clear`) encodes its colour once.
+    fn fill_solid(&mut self, area: &Rectangle, colour: Self::Color) -> Result<(), Self::Error> {
+        let area = area.intersection(&Rectangle::new(
+            Point::zero(),
+            Size::new(self.width as u32, self.height as u32),
+        ));
+        let Some(bottom_right) = area.bottom_right() else {
+            return Ok(()); // empty after clipping
+        };
+        let byte = self.codec.encode(colour);
+        let w = self.width as usize;
+        for y in area.top_left.y..=bottom_right.y {
+            let row = y as usize * w;
+            self.framebuffer[row + area.top_left.x as usize..=row + bottom_right.x as usize]
+                .fill(byte);
         }
         Ok(())
     }

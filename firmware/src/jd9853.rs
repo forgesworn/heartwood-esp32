@@ -7,11 +7,17 @@
 // init sequence directly and then uses standard MIPI DCS commands (CASET /
 // RASET / RAMWR) for pixel writes. The public interface mirrors St7789Display
 // so oled.rs can use it unchanged.
+//
+// The framebuffer is one byte a pixel (an index into the table in pixel8.rs,
+// every palette colour exact), widened to big-endian Rgb565 as flush() sends
+// it: W*H = 55 KB instead of the 110 KB two bytes a pixel took.
 
 use core::convert::Infallible;
 
 use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
 use embedded_graphics::prelude::*;
+
+use crate::pixel8::Codec;
 
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::{Output, PinDriver};
@@ -34,14 +40,17 @@ type Spi<'a> = SpiDeviceDriver<'a, SpiDriver<'a>>;
 #[derive(Debug)]
 pub struct Jd9853Error;
 
-/// JD9853 display presented as a mono DrawTarget over a big-endian RGB565
-/// byte framebuffer. Drop-in for St7789Display on the Waveshare C6 board.
+/// JD9853 display presented as an Rgb565 DrawTarget over a one-byte-a-pixel
+/// framebuffer. Drop-in for St7789Display on the Waveshare C6 board.
 pub struct Jd9853Display<'a> {
     spi: Spi<'a>,
     dc: PinDriver<'a, Output>,
     backlight: LedcDriver<'a>,
-    // Framebuffer: W*H pixels stored as big-endian RGB565 bytes (2 bytes/pixel).
+    // Framebuffer: W*H bytes, each an index into `codec` (pixel8.rs).
     framebuffer: Vec<u8>,
+    codec: Codec,
+    // The byte for black, what `clear_buffer` fills with.
+    black: u8,
     // Send the pixels in reverse order: the picture turned through 180
     // degrees (display_flip.rs). The panel window is centred, but reversing
     // here keeps MADCTL and the window exactly as they are.
@@ -63,11 +72,15 @@ impl<'a> Jd9853Display<'a> {
         // RST is leaked: must stay HIGH for the display's lifetime.
         core::mem::forget(rst);
 
+        let codec = Codec::new();
+        let black = codec.encode(Rgb565::BLACK);
         let mut disp = Self {
             spi,
             dc,
             backlight,
-            framebuffer: vec![0u8; (W as usize) * (H as usize) * 2],
+            framebuffer: vec![black; (W as usize) * (H as usize)],
+            codec,
+            black,
             flipped: false,
         };
 
@@ -172,7 +185,7 @@ impl<'a> Jd9853Display<'a> {
 
     /// Clear the back-buffer to black.
     pub fn clear_buffer(&mut self) {
-        self.framebuffer.fill(0x00);
+        self.framebuffer.fill(self.black);
     }
 
     /// Blit the back-buffer to the panel.
@@ -193,26 +206,22 @@ impl<'a> Jd9853Display<'a> {
         self.dc.set_low().ok();
         self.spi.write(&[0x2C]).ok();
         self.dc.set_high().ok();
-        if self.flipped {
-            // Pixel order reversed, each pixel's two bytes kept in order.
-            let mut chunk = [0u8; 512];
-            let mut n = 0;
-            for px in self.framebuffer.chunks_exact(2).rev() {
-                chunk[n] = px[0];
-                chunk[n + 1] = px[1];
-                n += 2;
-                if n == chunk.len() {
-                    self.spi.write(&chunk).ok();
-                    n = 0;
-                }
+        // Decoded to big-endian Rgb565 two bytes a pixel, 512 bytes a send;
+        // the whole picture reversed when flipped, each pixel's bytes in order.
+        let mut chunk = [0u8; 512];
+        let mut n = 0;
+        for px in self.codec.stream(&self.framebuffer, self.flipped) {
+            let raw = px.into_storage();
+            chunk[n] = (raw >> 8) as u8;
+            chunk[n + 1] = (raw & 0xFF) as u8;
+            n += 2;
+            if n == chunk.len() {
+                self.spi.write(&chunk).ok();
+                n = 0;
             }
-            if n > 0 {
-                self.spi.write(&chunk[..n]).ok();
-            }
-        } else {
-            for chunk in self.framebuffer.chunks(512) {
-                self.spi.write(chunk).ok();
-            }
+        }
+        if n > 0 {
+            self.spi.write(&chunk[..n]).ok();
         }
         Ok(())
     }
@@ -263,15 +272,19 @@ impl DrawTarget for Jd9853Display<'_> {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         let (w, h) = (W as i32, H as i32);
+        // Runs of one colour are the norm, so the last colour's byte is kept.
+        let mut last: Option<(Rgb565, u8)> = None;
         for Pixel(p, colour) in pixels {
             if p.x >= 0 && p.y >= 0 && p.x < w && p.y < h {
-                let idx = (p.y * w + p.x) as usize * 2;
-                // Pack Rgb565 (5/6/5) into a big-endian u16 for the panel RAM.
-                let raw = ((colour.r() as u16) << 11)
-                    | ((colour.g() as u16) << 5)
-                    | (colour.b() as u16);
-                self.framebuffer[idx] = (raw >> 8) as u8;
-                self.framebuffer[idx + 1] = (raw & 0xFF) as u8;
+                let byte = match last {
+                    Some((c, b)) if c == colour => b,
+                    _ => {
+                        let b = self.codec.encode(colour);
+                        last = Some((colour, b));
+                        b
+                    }
+                };
+                self.framebuffer[(p.y * w + p.x) as usize] = byte;
             }
         }
         Ok(())

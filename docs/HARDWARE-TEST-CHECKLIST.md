@@ -4204,10 +4204,13 @@ Why: a T-Display on 0.18.0-beta.38 with six pairings on master 0 lost its
 identity picture and could not take it back: Sapwood got `storage_full: not
 enough storage left for the avatar; the pairings need the room`. #197 dropped
 cached pictures before every tight pairing-table save, and stored a 48x48
-picture as 4,610 bytes of Rgb565 (charged 165 entries at write time). Now a picture is dropped only
-when the save would otherwise be refused, or could then be rewritten in place
-rather than erased first; a persona or phone the growth gate would refuse
-drops it first when that alone makes the room; and a picture is stored at one
+picture as 4,610 bytes of Rgb565 (charged 165 entries at write time). Now a
+picture is dropped only when the save would otherwise be refused or lost
+after its erase, or could then be rewritten in place rather than erased
+first; a persona or phone the growth gate would refuse drops it first when
+that alone makes the room (not a bundle's personas); a picture must leave
+room for a full-size network config rewrite (50 entries), and counts the
+name written before it when the name changes; and a picture is stored at one
 byte a pixel, `[0x00][0x01][w][h]` then RGB332, so 48x48 is 2,308 bytes and
 64x64 is 4,100. The gate charges a write its worst case (`blob_entries`: 91
 entries for 48x48, 149 for 64x64); what a stored 48x48 picture keeps in use
@@ -4221,14 +4224,18 @@ real `connslots_0` length is not known here, and 48x48 is accepted at 176
 free entries only beside a table of at least 4,993 bytes, one that could not
 go in place anyway. Step 1 reads it from the new `nvs_blobs` status field,
 which reports stored lengths only (`largest_hot`, `largest_hot_key`, and
-`avatars` by master slot), never contents.
+`avatars` by master slot), never contents. FIRMWARE_INFO gives the key name
+and `avatars` only once the bridge has passed `SESSION_AUTH`; before that it
+reports `largest_hot` alone.
 
 The owner's T-Display (beta.38, one master, six pairings, `get_status` about
 176 available entries). Over the cable or the relay, as Sapwood does it.
 
 1. Flash this image (app only, 0x10000). The board boots with its six
    pairings and no picture. Read `get_status` (relay, device operator) or
-   FIRMWARE_INFO (USB): record the `nvs` figures (available is free less one
+   FIRMWARE_INFO (USB, after Sapwood's bridge authentication; an
+   unauthenticated FIRMWARE_INFO answers `{"largest_hot":N}` only, which is
+   also expected and worth recording once): record the `nvs` figures (available is free less one
    page, 126 entries) and `nvs_blobs`. Expected: `largest_hot_key`
    `connslots_0`, `avatars` `{}`. Record `largest_hot`: at 4,993 bytes or
    more step 2 should be accepted, below that it is refused. If
@@ -4251,7 +4258,10 @@ The owner's T-Display (beta.38, one master, six pairings, `get_status` about
    the host tests cover it.
    If it is refused with the same `storage_full` text, record the free entries
    and the table length: the table is shorter than 4,993 bytes, and freeing one
-   pairing will not help (the band 3,489 to 5,120 bytes refuses it too).
+   pairing will not help (the band 2,913 to 5,120 bytes refuses it too). With
+   a name Sapwood has changed since the board stored it, the 48x48 picture
+   needs a few more entries (166 for a new 15-byte name); the same name sent
+   again costs nothing.
 3. A change to one of the six: rename a pairing, or change its policy. It
    saves, and the picture is still there after a reboot. Only adding a
    pairing is growth-gated; a six-pairing table this size erases first
@@ -4265,7 +4275,12 @@ The owner's T-Display (beta.38, one master, six pairings, `get_status` about
    avatars` with a count. Re-sending the picture is then refused with the
    `storage_full` text. Record the free entries at both points. Re-add the
    pairing afterwards.
-6. 64x64 is refused at 176 available (four entries short); record the reply.
+6. 64x64 is refused at 176 available (41 entries short of the table's
+   erase-first rewrite with room for a network config); record the reply.
+6a. With the 48x48 picture stored, change the network config over the cable
+   or the relay (`scripts/net-config.mjs`, re-saving the same networks is
+   enough): it is written, `net-config` reads it back, and the picture is
+   still there.
 7. Downgrade note, do not run on the owner's board: beta.38 reads the new
    picture as none and shows no npub card name either until the picture is
    sent again; a picture stored by beta.38 is read by this image as it is.

@@ -691,8 +691,14 @@ changes hands:
   state, crash context, and since 2026-11-13 `crash_detail`: a panic's
   source `file:line` or a failed allocation's size, never a panic message,
   which can carry request data; since 2026-11-15 `nvs_blobs`, the stored
-  byte lengths of the largest pairing table, phone record or persona chunk
-  (with its key name) and of each cached picture, never their contents); `relay` `get_status` only once genuinely unlocked,
+  byte length of the largest pairing table, phone record or persona chunk,
+  never its contents. Only that one number goes to a host that has not
+  passed bridge authentication (`SESSION_AUTH`), which includes every reply
+  from the setup screen and the locked loop: which key it is (and so which
+  identity's table) and the length of each identity's cached picture (and
+  so which identities have one) go only to an authenticated
+  `FIRMWARE_INFO` and to the device operator's `get_status`); `relay`
+  `get_status` only once genuinely unlocked,
   and only to the device operator, never a per-identity delegate — including
   its low-heap `minimal_status_json` fallback, which used to leak
   `master_count`, `relay` and `crashed_during` to a delegate too (now fixed
@@ -850,14 +856,19 @@ write can move such a page, leaving a chunk behind as a live stray that a
 rewrite in the same boot would collide with, and boot would then drop the
 key's index. So a key whose multi-chunk write failed is not written again
 until a restart has run ESP-IDF's orphan cleanup (`nvs::write_blocked`).
-For the same reason cached avatars are dropped before a pairing table is
-written, not after the write fails: only when the table would otherwise be
-refused, or when dropping them lets it be rewritten in place instead of
-erased first (`nvs_budget::evict_for_replace`). A save that fits as it is
-keeps them, which is what #197 did not: it dropped the avatar before every
-tight save, and a board with six pairings lost its picture at the next
-change and could not take it back. A rewrite that shrinks the table, such
-as a revocation, can still drop the picture to go in place.
+For the same reason cached avatars are dropped before a pairing table or
+network config is written, not after the write fails: when the write is
+predicted, with them kept, to be refused or to lose the key after its
+erase, or when dropping them lets it be rewritten in place instead of
+erased first (`nvs_budget::evict_for_replace`). The prediction is a worst
+case on both sides, so a write it calls refused or lost with the pictures
+and without them is still tried with them gone: an erase that then needs
+their room would otherwise lose the table. A save predicted to land as it
+is, in place or after its erase, keeps them, which is what #197 did not:
+it dropped the avatar before every tight save, and a board with six
+pairings lost its picture at the next change and could not take it back.
+A rewrite that shrinks the table, such as a revocation, can still drop the
+picture to go in place.
 
 So the residuals are these:
 
@@ -902,14 +913,22 @@ So the residuals are these:
   write has failed part-way the identity's pairings cannot change until a
   restart, so those replies, and any other slot-change reply for that
   identity, end by asking for one.
-- **Growth is gated for hygiene.** A new pairing, a persona, an unlock phone
-  and an avatar are written only if afterwards the largest pairing table,
-  phone record set or persona chunk can still be rewritten in place, plus a
+- **Growth is gated for hygiene.** A new pairing, a persona and an unlock
+  phone are written only if afterwards the largest pairing table, phone
+  record set or persona chunk can still be rewritten in place, plus a
   reserve for the small keys (`nvs::growth_allowed`). A pairing, persona
   or phone the gate would refuse drops the cached avatars first when that
-  alone makes the room (`nvs::make_room_to_grow`); an avatar is refused if
-  the next save of what is already stored would have to drop it
-  (`nvs::avatar_allowed`). Other writes are not
+  alone makes the room (`nvs::make_room_to_grow`), except a persona
+  registered by a bundle press, whose pairing table was judged with the
+  pictures counted and so may not spend them first. An avatar has its own
+  gate (`nvs::avatar_allowed`), judged after its identity's name is
+  written: it must leave room for a full-size network config rewrite
+  (`nvs_budget::avatar_reserve`, 50 entries), every hot blob must still
+  rewrite after its erase with that room to spare, and one that could be
+  rewritten in place with no picture must still be with this one. The
+  network config and trial never erase first and are not gated; a rewrite
+  of either that would be refused drops the pictures first
+  (`net_config_store`). Other writes are not
   gated, so this keeps boards off the fallback most of the time, not always.
   A refusal by the gate is reported as a full board, not a fault: the reply
   starts `storage_full:` for a pairing (USB NACK, management reply), a

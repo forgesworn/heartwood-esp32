@@ -88,11 +88,15 @@ pub fn login_kind_key(base: &str, seq: u32) -> String {
 /// on a hold that showed the owner neither. The FULL ACCESS card
 /// (`heartwood_approve_bundle`, one-hold pairing spec 4.2) names one phone's
 /// five words and one scope: a second bundle sharing its hold would grant a
-/// phone the owner never compared.
+/// phone the owner never compared. A LINK card (`heartwood_link_create`)
+/// names one site and one identity.
 pub fn never_shares_card(method: &str) -> bool {
     matches!(
         method,
-        "heartwood_note_address_proof" | "heartwood_note_trust" | "heartwood_approve_bundle"
+        "heartwood_note_address_proof"
+            | "heartwood_note_trust"
+            | "heartwood_approve_bundle"
+            | "heartwood_link_create"
     )
 }
 

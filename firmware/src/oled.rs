@@ -1951,6 +1951,46 @@ pub fn show_master_sign_request(
     content_preview: &str,
     seconds_remaining: u32,
 ) {
+    // Method + kind (friendly kind name when known)
+    let method_str = match kind {
+        Some(k) => match heartwood_common::kinds::kind_label(k) {
+            Some(name) => format!("{method} · {name}"),
+            None => format!("{} k:{}", method, k),
+        },
+        None => method.to_string(),
+    };
+    // How to approve: a 2-second HOLD signs, while a tap denies.
+    show_header_body_small(display, heading, &method_str, content_preview, "Hold=sign tap=no", seconds_remaining);
+}
+
+/// A site link's LINK card (site links design 4.4), on the rows of the
+/// extension card above: `LINK ?<site>?`, `AS <identity>`, the scope line
+/// and `FROM <phone's slot label>` where that card has its hint. Every line
+/// is cut to the span inside the margins by `site_link::LinkCard::lines`.
+pub fn show_link_request(
+    display: &mut Display<'_>,
+    card: &heartwood_common::site_link::LinkCard,
+    seconds_remaining: u32,
+) {
+    let l = layout(display);
+    let [heading, as_line, scope, from] = card.lines(
+        l.span_chars(None, l.font_header()),
+        l.span_chars(None, l.font_body()),
+        l.span_chars(None, l.font_small()),
+    );
+    show_header_body_small(display, &heading, &as_line, &scope, &from, seconds_remaining);
+}
+
+/// The extension card's rows: a header, a body line, a small line, an
+/// accent small line and the 30 s countdown.
+fn show_header_body_small(
+    display: &mut Display<'_>,
+    heading: &str,
+    body_line: &str,
+    content_preview: &str,
+    foot: &str,
+    seconds_remaining: u32,
+) {
     let l = layout(display);
     display.clear_buffer();
 
@@ -1974,16 +2014,8 @@ pub fn show_master_sign_request(
         .into_styled(PrimitiveStyle::with_fill(ACCENT))
         .draw(display).ok();
 
-    // Method + kind (friendly kind name when known)
-    let method_str = match kind {
-        Some(k) => match heartwood_common::kinds::kind_label(k) {
-            Some(name) => format!("{method} · {name}"),
-            None => format!("{} k:{}", method, k),
-        },
-        None => method.to_string(),
-    };
-    let method_str = truncate_str(&method_str, l.chars_per_line(l.font_body()));
-    Text::new(method_str, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
+    let body_line = truncate_str(body_line, l.chars_per_line(l.font_body()));
+    Text::new(body_line, Point::new(l.sx(2), l.sy(25)), body).draw(display).ok();
 
     // Content preview (small font)
     let max_preview = l.chars_per_line(l.font_small());
@@ -1994,14 +2026,12 @@ pub fn show_master_sign_request(
     };
     Text::new(&preview, Point::new(l.sx(2), l.sy(35)), small).draw(display).ok();
 
-    // How to approve: a 2-second HOLD signs, while a tap denies.
     let hint = MonoTextStyleBuilder::new()
         .font(l.font_small())
         .text_color(ACCENT)
         .build();
-    let hold = "Hold=sign tap=no";
-    let hold = truncate_str(hold, l.chars_per_line(l.font_small()));
-    Text::new(hold, Point::new(l.sx(2), l.sy(45)), hint).draw(display).ok();
+    let foot = truncate_str(foot, l.chars_per_line(l.font_small()));
+    Text::new(foot, Point::new(l.sx(2), l.sy(45)), hint).draw(display).ok();
 
     // Graphical countdown bar
     draw_countdown_bar(display, seconds_remaining, 30);

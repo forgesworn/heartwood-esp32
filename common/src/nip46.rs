@@ -134,6 +134,13 @@ pub enum Nip46Method {
     /// Narrow the caller's own owner pairing to Extra careful (spec 4.6).
     /// Never widens, so it is answered before the tier check, no card.
     HeartwoodOwnerNarrow,
+    /// Site links made by the Heartwood, with a hold (signet-plans
+    /// 2026-11-14 design): an owner pairing asks for a site's sign-in link,
+    /// checks it, or removes it. Handled by the relay loop ahead of every
+    /// tier, never by the dispatcher ([`Self::is_site_link`]).
+    HeartwoodLinkCreate,
+    HeartwoodLinkStatus,
+    HeartwoodLinkRevoke,
     // Unknown method
     Unknown(String),
 }
@@ -185,6 +192,9 @@ impl Nip46Method {
             "heartwood_approve_bundle" => Self::HeartwoodApproveBundle,
             "heartwood_owner_status" => Self::HeartwoodOwnerStatus,
             "heartwood_owner_narrow" => Self::HeartwoodOwnerNarrow,
+            "heartwood_link_create" => Self::HeartwoodLinkCreate,
+            "heartwood_link_status" => Self::HeartwoodLinkStatus,
+            "heartwood_link_revoke" => Self::HeartwoodLinkRevoke,
             // `heartwood_owner_vault` (the owner mark) is deliberately NOT a
             // method: it is only ever a name in a slot's `allowed_methods`,
             // and a request naming it is an unknown method.
@@ -233,6 +243,9 @@ impl Nip46Method {
             Self::HeartwoodApproveBundle => "heartwood_approve_bundle",
             Self::HeartwoodOwnerStatus => "heartwood_owner_status",
             Self::HeartwoodOwnerNarrow => "heartwood_owner_narrow",
+            Self::HeartwoodLinkCreate => "heartwood_link_create",
+            Self::HeartwoodLinkStatus => "heartwood_link_status",
+            Self::HeartwoodLinkRevoke => "heartwood_link_revoke",
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -337,6 +350,17 @@ impl Nip46Method {
     /// would prompt on a legacy slot and be denied on a strict one.
     pub fn answered_before_tier(&self) -> bool {
         matches!(self, Self::HeartwoodOwnerStatus | Self::HeartwoodOwnerNarrow)
+    }
+
+    /// The three site-link methods. The relay loop answers them itself,
+    /// before the tier, the escalate route and the rail: their gate is
+    /// `site_link::check_create` / `check_phone` (an owner pairing only, so
+    /// a strict or escalate slot never reaches them), and the create's card
+    /// is the LINK card. The cable and the Pi refuse them. They are in
+    /// neither [`Self::always_requires_button`] nor
+    /// [`Self::device_press_only`]: no slot policy decides them.
+    pub fn is_site_link(&self) -> bool {
+        matches!(self, Self::HeartwoodLinkCreate | Self::HeartwoodLinkStatus | Self::HeartwoodLinkRevoke)
     }
 
     /// Whether a guardian verdict may answer this method's OWN card (#160).
@@ -1749,6 +1773,28 @@ mod tests {
         assert!(!Nip46Method::HeartwoodPairWallet.always_shows_own_card());
         assert!(!Nip46Method::HeartwoodDerivePersona.always_shows_own_card());
         assert!(!bundle.requires_fresh_physical_approval());
+    }
+
+    #[test]
+    fn site_link_methods_round_trip_and_bypass_every_policy_pin() {
+        for (name, method) in [
+            ("heartwood_link_create", Nip46Method::HeartwoodLinkCreate),
+            ("heartwood_link_status", Nip46Method::HeartwoodLinkStatus),
+            ("heartwood_link_revoke", Nip46Method::HeartwoodLinkRevoke),
+        ] {
+            assert_eq!(Nip46Method::from_str(name), method, "{name}");
+            assert_eq!(method.as_str(), name);
+            assert!(method.is_site_link(), "{name}");
+            assert!(!method.answered_before_tier(), "{name}");
+            assert!(!method.always_auto_approve(), "{name}");
+            assert!(!method.always_requires_button(), "{name}");
+            assert!(!method.device_press_only(), "{name}");
+            assert!(!method.always_shows_own_card(), "{name}");
+            assert!(!method.verdict_may_answer_card(), "{name}");
+            assert!(!method.requires_tree_mode(), "{name}");
+        }
+        assert!(!Nip46Method::HeartwoodApproveBundle.is_site_link());
+        assert!(!Nip46Method::from_str("heartwood_link_other").is_site_link());
     }
 
     #[test]

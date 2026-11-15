@@ -6,21 +6,26 @@
 // won't fit ESP32 RAM); Sapwood does the shrink in-browser and hands over ready
 // Rgb565 bytes. See docs / memory: signer-display-metadata-provisioned.
 //
-// Stored in NVS keyed by MASTER SLOT (master-only display for now). NVS is only
-// 16-24KB, so one ~8KB avatar is fine; per-persona avatars will need a dedicated
-// flash region rather than NVS.
+// Stored in NVS keyed by MASTER SLOT (master-only display for now). The picture
+// arrives as Rgb565 and is stored at one byte a pixel, RGB332, behind a version
+// header (`heartwood_common::identity_avatar`), so a 48x48 one takes 2,308 bytes
+// of a 16-24 KB partition rather than 4,610; pictures stored by earlier firmware
+// are still read. Per-persona avatars will need a dedicated flash region rather
+// than NVS.
 
 use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 use crate::nvs::ReplaceBlob;
 
 use crate::masters::LoadedMaster;
 
-/// A signer identity's display metadata: name + a square Rgb565 avatar.
+/// A signer identity's display metadata: name + a square avatar.
 pub struct IdentityMeta {
     pub name: String,
     pub w: u8,
     pub h: u8,
-    /// `w*h*2` bytes, Rgb565 big-endian (each pixel high byte first).
+    /// The pixels, header stripped: `w*h` bytes of RGB332, or `w*h*2` of
+    /// Rgb565 big-endian for a picture stored by earlier firmware. The length
+    /// says which (`identity_avatar::classify`).
     pub avatar: Vec<u8>,
 }
 
@@ -33,15 +38,19 @@ pub fn save(
     h: u8,
     avatar: &[u8],
 ) -> Result<(), String> {
-    let mut blob = Vec::with_capacity(2 + avatar.len());
-    blob.push(w);
-    blob.push(h);
-    blob.extend_from_slice(avatar);
-    // An avatar (up to about 8 KB) is the one large write a user makes
-    // besides a pairing; it must not take the room that keeps the pairing
-    // tables and phone records rewritable in place.
+    use heartwood_common::identity_avatar::{encode_stored, StoreError};
+    // `avatar` is the wire's Rgb565; one buffer of w*h + 4 bytes holds what
+    // is stored.
+    let blob = encode_stored(w, h, avatar).map_err(|e| match e {
+        StoreError::BadLength => format!("avatar length {} != {w}*{h}*2", avatar.len()),
+        StoreError::NoMemory => "avatar: device low on memory".to_string(),
+    })?;
+    // An avatar is the one large write a user makes besides a pairing; it
+    // must not take the room that keeps the pairing tables and phone records
+    // rewritable, nor be what the next save of them has to drop
+    // (`nvs::avatar_allowed`).
     let avatar_key = format!("imav{slot}");
-    if !crate::nvs::growth_allowed(nvs, &avatar_key, blob.len()) {
+    if !crate::nvs::avatar_allowed(nvs, &avatar_key, blob.len()) {
         return Err("storage_full: not enough storage left for the avatar; the pairings need the room".into());
     }
     nvs.replace_blob(&format!("iman{slot}"), name.as_bytes())
@@ -58,24 +67,28 @@ pub fn load(nvs: &EspNvs<NvsDefault>, slot: u8) -> Option<IdentityMeta> {
         Ok(Some(b)) => String::from_utf8_lossy(b).into_owned(),
         _ => return None,
     };
-    // Heap buffer sized to the stored blob (a 64x64 avatar is ~8KB — too big
-    // for the task stack). Asking NVS for the exact length matters: a fixed
-    // 24KB buffer needed a contiguous block a fragmented mid-TLS heap could
-    // not supply, and OOM-aborted the relay loop (rst:0xc on the T-Display).
+    // Heap buffer sized to the stored blob (a legacy 64x64 avatar is ~8KB,
+    // too big for the task stack). Asking NVS for the exact length matters: a
+    // fixed 24KB buffer needed a contiguous block a fragmented mid-TLS heap
+    // could not supply, and OOM-aborted the relay loop (rst:0xc on the
+    // T-Display). The one buffer is read into and then trimmed in place.
     let avatar_key = format!("imav{slot}");
     let blob_len = match nvs.blob_len(&avatar_key) {
         Ok(Some(n)) if n >= 2 => n,
         _ => return None,
     };
-    let mut avatar_buf = vec![0u8; blob_len];
-    let (w, h, avatar) = match nvs.get_blob(&avatar_key, &mut avatar_buf) {
-        Ok(Some(b)) if b.len() >= 2 => (b[0], b[1], b[2..].to_vec()),
+    let mut avatar = Vec::new();
+    avatar.try_reserve_exact(blob_len).ok()?;
+    avatar.resize(blob_len, 0);
+    let read = match nvs.get_blob(&avatar_key, &mut avatar) {
+        Ok(Some(b)) => b.len(),
         _ => return None,
     };
-    if avatar.len() != (w as usize) * (h as usize) * 2 {
-        return None; // corrupt / partial
-    }
-    Some(IdentityMeta { name, w, h, avatar })
+    avatar.truncate(read);
+    // A version-1 or legacy picture; anything else is corrupt or partial.
+    let stored = heartwood_common::identity_avatar::decode_stored(&avatar)?;
+    avatar.drain(..stored.pixels_at);
+    Some(IdentityMeta { name, w: stored.w, h: stored.h, avatar })
 }
 
 /// Parse + store a SET_IDENTITY_META payload. `Ok` (ACK) on success; `Err`

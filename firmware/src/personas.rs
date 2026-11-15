@@ -360,7 +360,9 @@ pub fn capacity_check(nvs: &EspNvs<NvsDefault>) -> Result<(), &'static str> {
     // The chunk the next persona lands in grows by at most one entry.
     let key = chunk_key(chunk_index(read_count(nvs)));
     let grown = nvs.blob_len(&key).ok().flatten().unwrap_or(0) + MAX_ENTRY_LEN;
-    if !crate::nvs::growth_allowed(nvs, &key, grown) {
+    // Cached avatars count as room: `add` drops them if that is what lets
+    // the persona through (`nvs::make_room_to_grow`).
+    if !crate::nvs::growth_possible(nvs, &key, grown) {
         return Err(STORAGE_FULL);
     }
     Ok(())
@@ -371,7 +373,10 @@ pub fn capacity_check(nvs: &EspNvs<NvsDefault>) -> Result<(), &'static str> {
 /// full-size entry, as [`capacity_check`] judges one (`nvs::growth_run`).
 /// The pre-card check for a press that registers several names, so the
 /// second cannot pass the card on the first's room and fail after the hold.
-/// Stops at a chunk whose length cannot be read.
+/// Stops at a chunk whose length cannot be read. Unlike [`capacity_check`]
+/// it does not count the cached avatars as room: the bundle press that asks
+/// it also saves a pairing table, judged with the avatars counted, and they
+/// can be dropped only once.
 pub fn registrations_that_fit(nvs: &EspNvs<NvsDefault>, wanted: usize) -> usize {
     let count = read_count(nvs);
     let room = usize::from(MAX_PERSONAS.saturating_sub(count)).min(wanted);
@@ -437,7 +442,9 @@ pub fn add(
         name: name.map(|n| clamp_label(n).to_string()),
     });
     let grown = encode_chunk(&entries)?.len();
-    if !crate::nvs::growth_allowed(nvs, &chunk_key(chunk), grown) {
+    // A persona outranks the avatar cache, as a pairing does: the avatars go
+    // if, and only if, that makes the room.
+    if !crate::nvs::make_room_to_grow(nvs, &chunk_key(chunk), grown) {
         return Err(STORAGE_FULL);
     }
     write_chunk(nvs, chunk, &entries)?;

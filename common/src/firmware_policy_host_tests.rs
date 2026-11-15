@@ -377,13 +377,111 @@ pub fn growth_run(nvs: &EspNvs<NvsDefault>, steps: &[(Option<usize>, usize)]) ->
     heartwood_common::nvs_budget::growth_run(state.available(), largest, steps.iter().copied())
 }
 
+fn mock_largest_hot(nvs: &EspNvs<NvsDefault>) -> usize {
+    let state = nvs.backend.inner.borrow();
+    heartwood_common::nvs_budget::hot_keys()
+        .filter_map(|k| state.store.get(&k).map(Vec::len))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Stands in for the firmware's `crate::nvs::avatar_reclaim`.
+pub fn avatar_reclaim(nvs: &EspNvs<NvsDefault>) -> usize {
+    let state = nvs.backend.inner.borrow();
+    heartwood_common::nvs_budget::avatar_reclaim(|key| state.store.get(key).map(Vec::len))
+}
+
+fn evict_avatars(nvs: &mut EspNvs<NvsDefault>) -> usize {
+    heartwood_common::nvs_budget::evict_avatars(|key| matches!(nvs.remove(key), Ok(true)))
+}
+
+/// Stands in for the firmware's `crate::nvs::growth_possible`.
+pub fn growth_possible(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+    let reclaim = avatar_reclaim(nvs);
+    let largest = mock_largest_hot(nvs);
+    let state = nvs.backend.inner.borrow();
+    heartwood_common::nvs_budget::growth_allowed_with_reclaim(
+        state.available(),
+        reclaim,
+        state.store.get(key).map(Vec::len),
+        new_len,
+        largest,
+    )
+}
+
+/// Stands in for the firmware's `crate::nvs::make_room_to_grow`.
+pub fn make_room_to_grow(nvs: &mut EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+    if growth_allowed(nvs, key, new_len) {
+        return true;
+    }
+    let reclaim = avatar_reclaim(nvs);
+    let largest = mock_largest_hot(nvs);
+    let evict = {
+        let state = nvs.backend.inner.borrow();
+        heartwood_common::nvs_budget::evict_for_growth(
+            state.available(),
+            reclaim,
+            state.store.get(key).map(Vec::len),
+            new_len,
+            largest,
+        )
+    };
+    if !evict {
+        return false;
+    }
+    evict_avatars(nvs);
+    growth_allowed(nvs, key, new_len)
+}
+
+/// Stands in for the firmware's `crate::nvs::make_room_to_replace`.
+pub fn make_room_to_replace(
+    nvs: &mut EspNvs<NvsDefault>,
+    key: &str,
+    value: &[u8],
+    fallback: heartwood_common::nvs_budget::Fallback,
+) -> usize {
+    if write_blocked(key) {
+        return 0;
+    }
+    let reclaim = avatar_reclaim(nvs);
+    let evict = {
+        let state = nvs.backend.inner.borrow();
+        let old = state.store.get(key);
+        state.capacity.is_some()
+            && old.map(Vec::as_slice) != Some(value)
+            && heartwood_common::nvs_budget::evict_for_replace(
+                fallback,
+                state.available(),
+                reclaim,
+                old.map(Vec::len),
+                value.len(),
+            )
+    };
+    if evict { evict_avatars(nvs) } else { 0 }
+}
+
+/// Stands in for the firmware's `crate::nvs::avatar_allowed`.
+pub fn avatar_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+    let reclaim = avatar_reclaim(nvs);
+    let state = nvs.backend.inner.borrow();
+    let hot: Vec<usize> = heartwood_common::nvs_budget::hot_keys()
+        .filter_map(|k| state.store.get(&k).map(Vec::len))
+        .collect();
+    heartwood_common::nvs_budget::avatar_allowed(state.available(), reclaim, state.store.get(key).map(Vec::len), new_len, &hot)
+}
+
 /// Stands in for the firmware's `crate::nvs::is_no_room`: the mock's
 /// refusal for lack of room, from a planned write or one that does not fit.
 pub fn is_no_room(e: &&'static str) -> bool {
     *e == "not enough space"
 }
 
-pub mod nvs { pub use super::{fits, growth_allowed, growth_run, is_no_room, write_blocked, EspNvs, NvsDefault, ReplaceBlob}; }
+pub mod nvs {
+    pub use super::{
+        avatar_allowed, avatar_reclaim, fits, growth_allowed, growth_possible, growth_run, is_no_room,
+        make_room_to_grow, make_room_to_replace, write_blocked, EspNvs, NvsDefault, ReplaceBlob,
+    };
+}
 
 #[path = "../../firmware/src/policy.rs"]
 pub mod engine;
@@ -837,8 +935,9 @@ fn durable_rollback_restores_prior_authority_after_failed_write() {
 
 #[test]
 fn full_storage_drops_the_avatar_cache_before_refusing_pairings() {
-    // A pairing write that fails is retried once after the cached avatars go:
-    // they can be sent again, the pairings cannot. Names stay.
+    // A pairing write with no room drops the cached avatars first when that
+    // is what lets it land: they can be sent again, the pairings cannot.
+    // Names stay.
     let mut nvs = EspNvs::new();
     nvs.backend.seed("imav0", &[1, 1, 0, 0]);
     nvs.backend.seed("imav2", &[1, 1, 0, 0]);
@@ -870,11 +969,11 @@ fn the_avatar_cache_counts_as_room_for_a_slot_write() {
     // 40 bytes: 2 data + 1 chunk header + 1 index. 5000 bytes: 157 data +
     // 2 chunk headers + 1 index. No phantom header for the first chunk.
     let nvs = EspNvs::new();
-    assert_eq!(engine::avatar_cache_entries(&nvs), 0);
+    assert_eq!(avatar_reclaim(&nvs), 0);
     nvs.backend.seed("imav0", &[1u8; 40]);
     nvs.backend.seed("imav7", &[1u8; 5000]);
     nvs.backend.seed("iman0", b"TheCryptoDonkey");
-    assert_eq!(engine::avatar_cache_entries(&nvs), (2 + 1 + 1) + (157 + 2 + 1));
+    assert_eq!(avatar_reclaim(&nvs), (2 + 1 + 1) + (157 + 2 + 1));
 }
 
 #[test]
@@ -1814,4 +1913,236 @@ fn a_login_press_records_no_identity_grant() {
     // Control: had a normal press recorded it, the next request would pass.
     assert!(engine.record_identity(0, Ok(&client), &persona));
     assert_eq!(gate(&engine, 1, false), Gate::Allow);
+}
+
+// ---------------------------------------------------------------------------
+// The owner's T-Display on beta.38: 176 entries available with no picture
+// stored, one master, six pairings. Its table is modelled here (bound,
+// signing slots, each with an identity grant), not read from the board.
+// ---------------------------------------------------------------------------
+
+const BOARD_AVAILABLE: usize = 176;
+const BOARD_LABELS: [&str; 7] =
+    ["Sapwood", "nostrudel desktop", "Amethyst phone", "Coracle", "Primal web", "signet-app", "seventh app"];
+
+fn add_board_pairing(engine: &mut PolicyEngine, i: usize) {
+    let b = 0x10 + i as u8;
+    let slot = engine.create_slot(0, BOARD_LABELS[i].to_string(), secret_hex(b)).unwrap();
+    assert!(engine.assign_pubkey_to_slot(0, slot, pubkey_hex(b + 0x40)));
+    assert!(engine.upgrade_to_signing(0, slot));
+    engine.record_identity(0, Ok(&pubkey_hex(b + 0x40)), &[0x99; 32]);
+}
+
+/// The board: six pairings saved, then 176 entries left.
+fn the_board() -> (EspNvs<NvsDefault>, PolicyEngine) {
+    let mut nvs = EspNvs::new();
+    let mut engine = PolicyEngine::new();
+    for i in 0..6 {
+        add_board_pairing(&mut engine, i);
+    }
+    assert!(engine.persist_slots(&mut nvs, 0));
+    nvs.backend.limit_headroom(BOARD_AVAILABLE);
+    (nvs, engine)
+}
+
+fn available(nvs: &EspNvs<NvsDefault>) -> usize {
+    nvs.backend.inner.borrow().available()
+}
+
+/// A `side` x `side` picture as the signer now stores it.
+fn picture(side: u8) -> Vec<u8> {
+    let wire = vec![0x5Au8; usize::from(side) * usize::from(side) * 2];
+    heartwood_common::identity_avatar::encode_stored(side, side, &wire).unwrap()
+}
+
+#[test]
+fn the_board_takes_a_48px_picture_and_not_a_64px_one() {
+    use heartwood_common::nvs_budget::{blob_entries, stored_entries_min};
+    let (nvs, _) = the_board();
+    let table = nvs.backend.get(CONNSLOTS_0).unwrap().len();
+    // The modelled table is in the board's size class: too large to rewrite
+    // beside itself in 176 entries.
+    assert!(blob_entries(table) > BOARD_AVAILABLE, "{table} bytes");
+    assert!((4500..6000).contains(&table), "{table} bytes");
+    let (p48, p64) = (picture(48), picture(64));
+    assert_eq!((p48.len(), p64.len()), (2308, 4100));
+    assert!(nvs::avatar_allowed(&nvs, "imav0", p48.len()));
+    // 64px: the table's rewrite after its erase would no longer fit with
+    // the reserve to spare.
+    let after_64 = BOARD_AVAILABLE - blob_entries(p64.len());
+    assert!(after_64 + stored_entries_min(table) < blob_entries(table) + 13);
+    assert!(!nvs::avatar_allowed(&nvs, "imav0", p64.len()));
+    // As beta.38 stored a 48px one (Rgb565, 4,610 bytes): refused too.
+    assert!(!nvs::avatar_allowed(&nvs, "imav0", 2 + 48 * 48 * 2));
+}
+
+#[test]
+fn a_six_pairing_save_keeps_the_picture() {
+    let (mut nvs, mut engine) = the_board();
+    let p48 = picture(48);
+    nvs.backend.seed("imav0", &p48);
+    nvs.backend.seed("iman0", b"TheCryptoDonkey");
+    // A change to a pairing that adds none (another key on it): the table
+    // erases first with the picture or without it, so the picture stays.
+    assert!(engine.assign_pubkey_to_slot(0, 0, pubkey_hex(0x7E)));
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Ok(()));
+    assert_eq!(nvs.backend.get("imav0").unwrap(), p48);
+    assert!(nvs.backend.contains("iman0"));
+}
+
+#[test]
+fn a_revocation_drops_the_picture_only_to_go_in_place() {
+    use heartwood_common::nvs_budget::{blob_entries, replace_outcome, small_write_reserve, Fallback, Outcome};
+    let (mut nvs, mut engine) = the_board();
+    let p48 = picture(48);
+    nvs.backend.seed("imav0", &p48);
+    // Five pairings fit beside the six-pairing table once the picture's
+    // room is back, and not before: so the picture goes, and the revocation
+    // is written beside the old table rather than after erasing it.
+    assert!(engine.revoke_slot(0, 5));
+    let five = serde_json::to_string(engine.list_slots(0)).unwrap().len();
+    let with = available(&nvs);
+    assert!(blob_entries(five) > with && blob_entries(five) <= with + 75, "{five} bytes, {with} available");
+    let six = nvs.backend.get(CONNSLOTS_0).unwrap().len();
+    assert_eq!(replace_outcome(Fallback::EraseFirst, with, Some(six), five), Outcome::AfterErase);
+    assert_eq!(replace_outcome(Fallback::EraseFirst, with + 75, Some(six), five), Outcome::InPlace);
+    assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
+    assert!(!nvs.backend.contains("imav0"));
+    // Sent again, the picture is refused while it would stop that: the
+    // five-pairing table now goes in place with room to spare, and would not
+    // with the picture stored. On this board it is the picture or in-place
+    // pairing saves, from five pairings down.
+    let after = available(&nvs);
+    let table = blob_entries(nvs.backend.get(CONNSLOTS_0).unwrap().len());
+    assert!(table + small_write_reserve() <= after);
+    assert!(after - blob_entries(p48.len()) < table + small_write_reserve());
+    assert!(!nvs::avatar_allowed(&nvs, "imav0", p48.len()));
+}
+
+#[test]
+fn the_seventh_pairing_is_refused_with_or_without_a_picture() {
+    use engine::SlotSaveError;
+    use heartwood_common::nvs_budget::{blob_entries, growth_allowed, stored_entries_min};
+    let (mut nvs, mut engine) = the_board();
+    let table = nvs.backend.get(CONNSLOTS_0).unwrap();
+    nvs.backend.seed("imav0", &picture(48));
+    let snapshot = engine.snapshot_slot_state(0);
+    add_board_pairing(&mut engine, 6);
+    let grown = serde_json::to_string(engine.list_slots(0)).unwrap().len();
+    // Even with the picture's room back (176 entries), the seventh is
+    // refused: the picture stays, nothing is written.
+    assert!(!growth_allowed(BOARD_AVAILABLE, Some(table.len()), grown, table.len()));
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::NoRoom));
+    assert!(nvs.backend.contains("imav0"));
+    assert!(engine.restore_slot_state_durably(&mut nvs, snapshot.clone()));
+    assert_eq!(nvs.backend.get(CONNSLOTS_0).unwrap(), table);
+    // Without a picture, the same.
+    nvs.remove("imav0").unwrap();
+    add_board_pairing(&mut engine, 6);
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::NoRoom));
+    assert!(engine.restore_slot_state_durably(&mut nvs, snapshot.clone()));
+    // The least room that takes it: the grown copy beside the old, then room
+    // to rewrite the grown table in place.
+    let least = blob_entries(grown) * 2 + 13 - stored_entries_min(table.len());
+    assert!(growth_allowed(least, Some(table.len()), grown, table.len()));
+    assert!(!growth_allowed(least - 1, Some(table.len()), grown, table.len()));
+    nvs.backend.limit_headroom(least - 1);
+    add_board_pairing(&mut engine, 6);
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Err(SlotSaveError::NoRoom));
+    assert!(engine.restore_slot_state_durably(&mut nvs, snapshot.clone()));
+    // With a picture whose room makes the difference, it goes, and the
+    // pairing lands.
+    nvs.backend.seed("imav0", &picture(48));
+    nvs.backend.limit_headroom(least - 1);
+    add_board_pairing(&mut engine, 6);
+    assert_eq!(engine.try_persist_slots(&mut nvs, 0), Ok(()));
+    assert!(!nvs.backend.contains("imav0"), "dropped for the pairing");
+}
+
+#[test]
+fn a_persona_drops_the_picture_only_when_that_makes_the_room() {
+    // At the board's figures no persona fits, picture or not: refused, and
+    // the picture stays.
+    let (mut nvs, _) = the_board();
+    let p48 = picture(48);
+    nvs.backend.seed("imav0", &p48);
+    assert!(personas::capacity_check(&nvs).is_err());
+    assert!(personas::add(&mut nvs, 0, "purpose", 0, Some("a persona"), &persona_key(1)).is_err());
+    assert_eq!(nvs.backend.get("imav0").unwrap(), p48);
+    // Across a sweep of room, the same persona added beside a picture and
+    // without one: the picture goes only when it is what the add lacked,
+    // and with it there the add lands wherever its room would let it.
+    let mut evicted = 0;
+    for headroom in 0..600 {
+        let add = |nvs: &mut EspNvs<NvsDefault>| {
+            personas::add(nvs, 0, "purpose", 0, Some("a persona"), &persona_key(1)).is_ok()
+        };
+        let (mut bare, _) = the_board();
+        bare.backend.limit_headroom(headroom);
+        let lands_bare = add(&mut bare);
+        let (mut nvs, _) = the_board();
+        nvs.backend.seed("imav0", &p48);
+        nvs.backend.limit_headroom(headroom);
+        let lands = add(&mut nvs);
+        let kept = nvs.backend.contains("imav0");
+        // With the picture's room back (75 entries) it lands wherever it
+        // would have with that room free.
+        let (mut roomy, _) = the_board();
+        roomy.backend.limit_headroom(headroom + 75);
+        let lands_roomy = add(&mut roomy);
+        assert_eq!(lands, lands_roomy, "{headroom}");
+        if !lands || lands_bare {
+            assert!(kept, "{headroom}: dropped only when that made the room");
+        }
+        evicted += usize::from(!kept);
+    }
+    assert!(evicted > 0, "some headroom needs the picture's room");
+}
+
+#[test]
+fn a_phone_drops_the_picture_only_when_that_makes_the_room() {
+    // The phone records' save meets the same gate (phone_unlock_cmd.rs,
+    // firmware only): a record of about 140 bytes on a board with none.
+    let grown = 140;
+    let (mut nvs, _) = the_board();
+    nvs.backend.seed("imav0", &picture(48));
+    assert!(!nvs::growth_possible(&nvs, "dk_ph", grown));
+    assert!(!nvs::make_room_to_grow(&mut nvs, "dk_ph", grown));
+    assert!(nvs.backend.contains("imav0"), "refused either way, so kept");
+    let mut evicted = false;
+    for headroom in 0..600 {
+        let (mut nvs, _) = the_board();
+        nvs.backend.limit_headroom(headroom);
+        if nvs::growth_possible(&nvs, "dk_ph", grown) {
+            break;
+        }
+        nvs.backend.seed("imav0", &picture(48));
+        nvs.backend.limit_headroom(headroom);
+        if nvs::growth_possible(&nvs, "dk_ph", grown) {
+            assert!(nvs.backend.contains("imav0"), "the check drops nothing");
+            assert!(nvs::make_room_to_grow(&mut nvs, "dk_ph", grown));
+            assert!(!nvs.backend.contains("imav0"));
+            evicted = true;
+        }
+    }
+    assert!(evicted);
+}
+
+#[test]
+fn an_accepted_picture_survives_the_next_save_of_the_same_pairings() {
+    // Across a sweep of room: whenever the picture is accepted, a later
+    // save of the same six pairings (one more key on one) neither drops it
+    // nor fails.
+    for headroom in 90..500 {
+        let (mut nvs, mut engine) = the_board();
+        nvs.backend.limit_headroom(headroom);
+        let p48 = picture(48);
+        if !nvs::avatar_allowed(&nvs, "imav0", p48.len()) {
+            continue;
+        }
+        nvs.backend.seed("imav0", &p48);
+        assert!(engine.assign_pubkey_to_slot(0, 1, pubkey_hex(0x7D)));
+        assert_eq!(engine.try_persist_slots(&mut nvs, 0), Ok(()), "{headroom}");
+        assert!(nvs.backend.contains("imav0"), "{headroom}");
+    }
 }

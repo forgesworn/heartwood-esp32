@@ -849,7 +849,13 @@ rewrite in the same boot would collide with, and boot would then drop the
 key's index. So a key whose multi-chunk write failed is not written again
 until a restart has run ESP-IDF's orphan cleanup (`nvs::write_blocked`).
 For the same reason cached avatars are dropped before a pairing table is
-written, when it has no room, not after the write fails.
+written, not after the write fails: only when the table would otherwise be
+refused, or when dropping them lets it be rewritten in place instead of
+erased first (`nvs_budget::evict_for_replace`). A save that fits as it is
+keeps them, which is what #197 did not: it dropped the avatar before every
+tight save, and a board with six pairings lost its picture at the next
+change and could not take it back. A rewrite that shrinks the table, such
+as a revocation, can still drop the picture to go in place.
 
 So the residuals are these:
 
@@ -897,7 +903,11 @@ So the residuals are these:
 - **Growth is gated for hygiene.** A new pairing, a persona, an unlock phone
   and an avatar are written only if afterwards the largest pairing table,
   phone record set or persona chunk can still be rewritten in place, plus a
-  reserve for the small keys (`nvs::growth_allowed`). Other writes are not
+  reserve for the small keys (`nvs::growth_allowed`). A pairing, persona
+  or phone the gate would refuse drops the cached avatars first when that
+  alone makes the room (`nvs::make_room_to_grow`); an avatar is refused if
+  the next save of what is already stored would have to drop it
+  (`nvs::avatar_allowed`). Other writes are not
   gated, so this keeps boards off the fallback most of the time, not always.
   A refusal by the gate is reported as a full board, not a fault: the reply
   starts `storage_full:` for a pairing (USB NACK, management reply), a

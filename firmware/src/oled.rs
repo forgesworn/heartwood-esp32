@@ -284,18 +284,21 @@ pub fn show_npub(
                     None => (area_h * 36 / 100).min(40),
                 };
                 let cx = l.sx(5) + r;
-                match avatar {
-                    // Blit the pre-resized Rgb565 avatar (Sapwood circular-cropped
-                    // it on black, so it reads as a disc on the black background).
-                    Some((w, h, bytes)) if bytes.len() == (w as usize) * (h as usize) * 2 => {
+                use heartwood_common::identity_avatar::{classify, pixel_rgb565};
+                let format = avatar.and_then(|(w, h, bytes)| classify(w, h, bytes.len()));
+                match (avatar, format) {
+                    // Blit the pre-resized avatar (Sapwood circular-cropped it
+                    // on black, so it reads as a disc on the black background):
+                    // Rgb565 as sent, or one byte a pixel as the signer now
+                    // stores it, widened a pixel at a time (no second buffer).
+                    (Some((w, h, bytes)), Some(format)) => {
                         let (aw, ah) = (w as i32, h as i32);
                         let area = Rectangle::new(
                             Point::new(cx - aw / 2, cy - ah / 2),
                             Size::new(aw as u32, ah as u32),
                         );
-                        let px = bytes
-                            .chunks_exact(2)
-                            .map(|c| Rgb565::from(RawU16::new(u16::from_be_bytes([c[0], c[1]]))));
+                        let px = (0..usize::from(w) * usize::from(h))
+                            .map(|i| Rgb565::from(RawU16::new(pixel_rgb565(format, bytes, i))));
                         display.fill_contiguous(&area, px).ok();
                     }
                     // No (valid) avatar yet: placeholder disc with the initial.

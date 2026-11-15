@@ -1,8 +1,9 @@
 // firmware/src/nvs.rs
 //
 // NVS storage for root secret. Plaintext NVS, encryption deferred. Also the
-// one blob write every module uses ([`ReplaceBlob`]) and the gate on writes
-// that grow the store ([`growth_allowed`]).
+// one blob write every module uses ([`ReplaceBlob`]), the gate on writes
+// that grow the store ([`growth_allowed`]) and the rules for dropping the
+// cached avatars to make room ([`make_room_to_grow`], [`make_room_to_replace`]).
 
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -197,6 +198,94 @@ pub fn growth_run(nvs: &EspNvs<NvsDefault>, steps: &[(Option<usize>, usize)]) ->
         return 0;
     };
     nvs_budget::growth_run(stats.available_entries, largest_hot(nvs), steps.iter().copied())
+}
+
+/// Entries dropping every cached avatar (`imav<slot>`) can be counted on to
+/// free (`nvs_budget::avatar_reclaim`). What a pre-card check counts as room,
+/// since the write after the press drops them when that is what lets it
+/// through.
+pub fn avatar_reclaim(nvs: &EspNvs<NvsDefault>) -> usize {
+    nvs_budget::avatar_reclaim(|key| nvs.blob_len(key).ok().flatten())
+}
+
+/// Drop every cached avatar, keeping the names. How many went.
+fn evict_avatars(nvs: &mut EspNvs<NvsDefault>) -> usize {
+    nvs_budget::evict_avatars(|key| matches!(nvs.remove(key), Ok(true)))
+}
+
+/// [`growth_allowed`] with the cached avatars counted as room: the check a
+/// card is put up on, for a write that goes through [`make_room_to_grow`].
+/// Drops nothing.
+pub fn growth_possible(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+    let Some(stats) = crate::nvs_stats::read() else {
+        return false;
+    };
+    let Ok(old_len) = nvs.blob_len(key) else {
+        return false;
+    };
+    nvs_budget::growth_allowed_with_reclaim(
+        stats.available_entries,
+        avatar_reclaim(nvs),
+        old_len,
+        new_len,
+        largest_hot(nvs),
+    )
+}
+
+/// The growth gate a pressed write meets: [`growth_allowed`], and when that
+/// refuses, the cached avatars are dropped if, and only if, their room lets
+/// it through (`nvs_budget::evict_for_growth`). A growth that would be
+/// refused either way is refused with the avatars kept.
+pub fn make_room_to_grow(nvs: &mut EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+    if growth_allowed(nvs, key, new_len) {
+        return true;
+    }
+    let (Some(stats), Ok(old_len)) = (crate::nvs_stats::read(), nvs.blob_len(key)) else {
+        return false;
+    };
+    let reclaim = avatar_reclaim(nvs);
+    if !nvs_budget::evict_for_growth(stats.available_entries, reclaim, old_len, new_len, largest_hot(nvs)) {
+        return false;
+    }
+    let dropped = evict_avatars(nvs);
+    log::warn!("nvs: {key} short of room to grow: dropped {dropped} cached avatar(s)");
+    growth_allowed(nvs, key, new_len)
+}
+
+/// Before `value` replaces `key` under `fallback`: drop the cached avatars
+/// only if that changes how the write ends (`nvs_budget::evict_for_replace`:
+/// a write that would not fit then does, one that would erase first then
+/// goes in place, one that would lose the key then lands). Otherwise they
+/// stay, so a pairing table that erases before every rewrite on a full board
+/// does not cost the owner the picture each time. How many went.
+pub fn make_room_to_replace(nvs: &mut EspNvs<NvsDefault>, key: &str, value: &[u8], fallback: Fallback) -> usize {
+    if write_blocked(key) {
+        return 0;
+    }
+    let (Some(stats), Ok(old_len)) = (crate::nvs_stats::read(), nvs.blob_len(key)) else {
+        return 0;
+    };
+    let reclaim = avatar_reclaim(nvs);
+    if !nvs_budget::evict_for_replace(fallback, stats.available_entries, reclaim, old_len, value.len()) {
+        return 0;
+    }
+    // A write of what is stored already is skipped (`write_blob`).
+    if old_len == Some(value.len()) && stored_equals(nvs, key, value).unwrap_or(false) {
+        return 0;
+    }
+    evict_avatars(nvs)
+}
+
+/// Whether a stored avatar blob of `new_len` bytes may replace `key`'s
+/// (`nvs_budget::avatar_allowed`): it fits with the small-key reserve, and no
+/// later rewrite of a hot blob would find the picture is what it has to
+/// drop. Refuses when the numbers cannot be read.
+pub fn avatar_allowed(nvs: &EspNvs<NvsDefault>, key: &str, new_len: usize) -> bool {
+    let (Some(stats), Ok(old_len)) = (crate::nvs_stats::read(), nvs.blob_len(key)) else {
+        return false;
+    };
+    let hot: Vec<usize> = nvs_budget::hot_keys().filter_map(|k| nvs.blob_len(&k).ok().flatten()).collect();
+    nvs_budget::avatar_allowed(stats.available_entries, avatar_reclaim(nvs), old_len, new_len, &hot)
 }
 
 const NVS_NAMESPACE: &str = "heartwood";

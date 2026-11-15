@@ -325,14 +325,31 @@ pub fn check_enrol(nvs: &mut EspNvs<NvsDefault>, masters: &[LoadedMaster], label
     }
 }
 
+/// Refusal when a phone would leave too little room to rewrite the records
+/// and the pairing tables in place.
+const PHONE_STORAGE_FULL: &str =
+    "storage_full: not enough storage left to add a phone; remove an unused pairing, persona or avatar first";
+
 /// Leave room to rewrite the records (and the pairing tables) in place
-/// afterwards, so a later revocation is cut-safe.
+/// afterwards, so a later revocation is cut-safe. Asked before the card and
+/// again after the press, the cached avatars counted as room (the save drops
+/// them if that is what lets the phone through, [`make_room_for_phone`]).
 fn check_room_for_phone(nvs: &EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(), String> {
     let grown = phones.encode().len() + data_key::MAX_RECORD_LEN;
-    if crate::nvs::growth_allowed(nvs, data_key::PHONES_KEY, grown) {
+    if crate::nvs::growth_possible(nvs, data_key::PHONES_KEY, grown) {
         Ok(())
     } else {
-        Err("storage_full: not enough storage left to add a phone; remove an unused pairing, persona or avatar first".into())
+        Err(PHONE_STORAGE_FULL.into())
+    }
+}
+
+/// The gate the save itself meets, with the phone added: the cached avatars
+/// are dropped only if that makes the room (`nvs::make_room_to_grow`).
+fn make_room_for_phone(nvs: &mut EspNvs<NvsDefault>, phones: &PhoneSet) -> Result<(), String> {
+    if crate::nvs::make_room_to_grow(nvs, data_key::PHONES_KEY, phones.encode().len()) {
+        Ok(())
+    } else {
+        Err(PHONE_STORAGE_FULL.into())
     }
 }
 
@@ -384,6 +401,8 @@ pub fn complete_enrol(
     if !fits(&enrolment) {
         return Err(EnrolRefusal::LowMemory.message());
     }
+    // Last, so nothing is dropped for an enrolment refused on memory.
+    make_room_for_phone(nvs, &phones)?;
     save(nvs, &phones)?;
     PHONES_CHANGED.store(true, Ordering::Release);
     log::info!("phone unlock: enrolled phone {} ({label})", enrolment.id);

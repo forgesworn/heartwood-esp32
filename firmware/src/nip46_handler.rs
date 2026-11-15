@@ -2904,7 +2904,7 @@ pub(crate) fn nvs_room(
     crate::nvs_stats::read().map(|stats| heartwood_common::nvs_room::NvsRoom {
         free_entries: stats.free_entries,
         total_entries: stats.total_entries,
-        reclaimable_entries: crate::policy::avatar_cache_entries(nvs),
+        reclaimable_entries: crate::nvs::avatar_reclaim(nvs),
     })
 }
 

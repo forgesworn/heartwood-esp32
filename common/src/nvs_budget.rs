@@ -436,8 +436,10 @@ pub fn growth_allowed_with_reclaim(
 ///   [`evict_for_replace`] never finds the rewrite would lose the key, nor
 ///   a network config rewrite then refused);
 /// - if it could be rewritten in place with every avatar gone, it still can
-///   with this one stored, with the reserve to spare (so the eviction never
-///   finds the avatar is what stands between it and an in-place write).
+///   with this one stored, with [`small_write_reserve`] to spare (so the
+///   eviction never finds the avatar is what stands between it and an
+///   in-place write). The network config needs nothing more here: an
+///   in-place rewrite leaves at least what the erased one does.
 ///
 /// A hot blob that cannot be rewritten in place even with no avatar at all
 /// erases first either way, so a picture costs it nothing. A rewrite that
@@ -510,7 +512,7 @@ fn avatar_allowed_within(
     hot.iter().all(|&len| {
         let rewrite = blob_entries(len);
         let erased_fits = after + stored_entries_min(len) >= rewrite + reserve;
-        let in_place_kept = rewrite > bare || after >= rewrite + reserve;
+        let in_place_kept = rewrite > bare || after >= rewrite + small_write_reserve();
         erased_fits && in_place_kept
     })
 }
@@ -882,29 +884,33 @@ mod tests {
         assert!(!avatar_allowed(BOARD_AVAILABLE, 0, None, LEGACY_64, &[TABLE_6]));
         // 41 more entries and the erased rewrite fits, but by then (217) the
         // table would go in place without the picture and not with it: 64px
-        // needs 384 beside this table, where it still goes in place after.
+        // needs 347 beside this table, where it still goes in place after
+        // (198 left, 185 + 13).
         assert!(!avatar_allowed(BOARD_AVAILABLE + 41, 0, None, AVATAR_64, &[TABLE_6]));
-        assert!(!avatar_allowed(383, 0, None, AVATAR_64, &[TABLE_6]));
-        assert!(avatar_allowed(384, 0, None, AVATAR_64, &[TABLE_6]));
+        assert!(!avatar_allowed(346, 0, None, AVATAR_64, &[TABLE_6]));
+        assert!(avatar_allowed(347, 0, None, AVATAR_64, &[TABLE_6]));
     }
 
     #[test]
     fn where_the_table_could_go_in_place_the_picture_must_not_take_that() {
-        // 300 available: the table rewrites in place (185 <= 300). A 48px
-        // picture would leave 209, short of 185 + 50, so it is refused; from
-        // 326 it leaves 235 and is not.
+        // 300 available: the table rewrites in place (185 <= 300). A 64px
+        // picture would leave 151, short of 185 + 13, so it is refused; a
+        // 48px one leaves 209 and is not.
         assert!(!avatar_allowed(300, 0, None, AVATAR_64, &[TABLE_6]));
-        assert!(!avatar_allowed(300, 0, None, AVATAR_48, &[TABLE_6]));
-        assert!(!avatar_allowed(325, 0, None, AVATAR_48, &[TABLE_6]));
-        assert!(avatar_allowed(326, 0, None, AVATAR_48, &[TABLE_6]));
+        assert!(avatar_allowed(300, 0, None, AVATAR_48, &[TABLE_6]));
         // Every hot blob is judged, not only the largest: a small one that
         // goes in place keeps doing so.
         // At 160 the table erases first either way; a 1500-byte blob (67
         // entries) goes in place without the picture and would not with it
-        // (69 left); a 100-byte one (13) still does.
+        // (69 left, short of 67 + 13); a 300-byte one (25) still does.
         assert!(avatar_allowed(160, 0, None, AVATAR_48, &[TABLE_6]));
         assert!(!avatar_allowed(160, 0, None, AVATAR_48, &[TABLE_6, 1500]));
-        assert!(avatar_allowed(160, 0, None, AVATAR_48, &[TABLE_6, 100]));
+        assert!(avatar_allowed(160, 0, None, AVATAR_48, &[TABLE_6, 300]));
+        // On the board itself (85 left after the picture), a second hot blob
+        // (the phones, a persona chunk) refuses it from 1,729 bytes until it
+        // is too large to go in place anyway (4,993).
+        let second = |len| avatar_allowed(BOARD_AVAILABLE, 0, None, AVATAR_48, &[TABLE_6, len]);
+        assert!(second(1728) && !second(1729) && !second(4992) && second(4993));
         // No hot blob: fit and the reserve.
         assert!(avatar_allowed(blob_entries(AVATAR_48) + avatar_reserve(), 0, None, AVATAR_48, &[]));
         assert!(!avatar_allowed(blob_entries(AVATAR_48) + avatar_reserve() - 1, 0, None, AVATAR_48, &[]));
@@ -1044,11 +1050,11 @@ mod tests {
         assert!(avatar_allowed(BOARD_AVAILABLE, 0, None, AVATAR_48, &[4993]));
         // Hold the rest of the board fixed instead (343 entries besides the
         // modelled table) and let the table's length change, as revoking
-        // pairings does: a 48px picture is refused from 2,913 to 5,120
-        // bytes (about three to five pairings), where the table goes in place
+        // pairings does: a 48px picture is refused from 3,489 to 5,120
+        // bytes (about four to five pairings), where the table goes in place
         // only without it, and again from 5,825, where its erased rewrite no
         // longer fits beside the picture with room for a network config.
-        // 64px fits only up to 1,984 bytes.
+        // 64px fits only up to 2,560 bytes.
         let base = BOARD_AVAILABLE + stored_entries_min(TABLE_6);
         let accepted = |picture: usize, table: usize| {
             avatar_allowed(base - stored_entries_min(table), 0, None, picture, &[table])
@@ -1065,8 +1071,8 @@ mod tests {
             }
             edges
         };
-        assert_eq!(edges(AVATAR_48), [2913, 5121, 5825]);
-        assert_eq!(edges(AVATAR_64), [1985]);
+        assert_eq!(edges(AVATAR_48), [3489, 5121, 5825]);
+        assert_eq!(edges(AVATAR_64), [2561]);
     }
 
     #[test]

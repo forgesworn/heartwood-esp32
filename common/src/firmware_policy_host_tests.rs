@@ -2006,7 +2006,7 @@ fn a_six_pairing_save_keeps_the_picture() {
 
 #[test]
 fn a_revocation_drops_the_picture_only_to_go_in_place() {
-    use heartwood_common::nvs_budget::{avatar_reserve, blob_entries, replace_outcome, Fallback, Outcome};
+    use heartwood_common::nvs_budget::{blob_entries, replace_outcome, small_write_reserve, Fallback, Outcome};
     let (mut nvs, mut engine) = the_board();
     let p48 = picture(48);
     nvs.backend.seed("imav0", &p48);
@@ -2023,13 +2023,13 @@ fn a_revocation_drops_the_picture_only_to_go_in_place() {
     assert_eq!(engine.persist_revocation(&mut nvs, 0), RevocationSave::Saved);
     assert!(!nvs.backend.contains("imav0"));
     // Sent again, the picture is refused while it would stop that: the
-    // five-pairing table now goes in place, and would not with the picture
-    // stored and room for a network config to spare. On this board it is the
-    // picture or in-place pairing saves, from five pairings down.
+    // five-pairing table now goes in place with room to spare, and would not
+    // with the picture stored. On this board it is the picture or in-place
+    // pairing saves, from five pairings down.
     let after = available(&nvs);
     let table = blob_entries(nvs.backend.get(CONNSLOTS_0).unwrap().len());
-    assert!(table <= after);
-    assert!(after - blob_entries(p48.len()) < table + avatar_reserve());
+    assert!(table + small_write_reserve() <= after);
+    assert!(after - blob_entries(p48.len()) < table + small_write_reserve());
     assert!(!nvs::avatar_allowed(&nvs, "imav0", p48.len(), None));
 }
 
@@ -2138,6 +2138,58 @@ fn a_bundle_registration_never_drops_the_picture() {
         kept_refusals += usize::from(lands_dropping && !lands);
     }
     assert!(kept_refusals > 0, "some headroom lands only by dropping the picture");
+}
+
+/// As `net_config_store::write_net_config` writes (firmware only): drop the
+/// pictures if the rewrite would otherwise be refused, then write.
+fn write_net_config_like(nvs: &mut EspNvs<NvsDefault>, json: &[u8]) -> Result<usize, &'static str> {
+    use heartwood_common::nvs_budget::fallback_for;
+    let dropped = nvs::make_room_to_replace(nvs, "net_config", json, fallback_for("net_config"));
+    nvs.replace_blob("net_config", json).map(|()| dropped)
+}
+
+#[test]
+fn a_full_size_network_config_still_writes_beside_an_accepted_picture() {
+    // Review item 2. On the board with a stored config, wherever the gate
+    // takes a 48px picture, a rewrite of the config at its largest still goes
+    // in place and keeps the picture.
+    use heartwood_common::nvs_budget::NET_CONFIG_MAX_LEN;
+    let p48 = picture(48);
+    let mut accepted = 0;
+    for headroom in 0..600 {
+        let (mut nvs, _) = the_board();
+        nvs.backend.seed("net_config", &vec![b'a'; NET_CONFIG_MAX_LEN]);
+        nvs.backend.limit_headroom(headroom);
+        if !nvs::avatar_allowed(&nvs, "imav0", p48.len(), None) {
+            continue;
+        }
+        accepted += 1;
+        nvs.replace_blob("imav0", &p48).unwrap();
+        assert_eq!(write_net_config_like(&mut nvs, &vec![b'b'; NET_CONFIG_MAX_LEN]), Ok(0), "{headroom}");
+        assert_eq!(nvs.backend.get("imav0").unwrap(), p48, "{headroom}");
+    }
+    assert!(accepted > 0);
+}
+
+#[test]
+fn a_network_config_rewrite_drops_a_picture_in_its_way() {
+    // A picture stored before this gate (or by older firmware) on a board
+    // with too little room for the config's in-place rewrite: it goes, and
+    // the config is written rather than refused.
+    use heartwood_common::nvs_budget::NET_CONFIG_MAX_LEN;
+    let (mut nvs, _) = the_board();
+    nvs.backend.seed("net_config", &vec![b'a'; NET_CONFIG_MAX_LEN]);
+    nvs.backend.seed("imav0", &picture(48));
+    nvs.backend.limit_headroom(20);
+    assert_eq!(write_net_config_like(&mut nvs, &vec![b'b'; NET_CONFIG_MAX_LEN]), Ok(1));
+    assert!(!nvs.backend.contains("imav0"));
+    assert_eq!(nvs.backend.get("net_config").unwrap(), vec![b'b'; NET_CONFIG_MAX_LEN]);
+    // Without a picture to drop it is refused, and the old config stays.
+    let (mut nvs, _) = the_board();
+    nvs.backend.seed("net_config", &vec![b'a'; NET_CONFIG_MAX_LEN]);
+    nvs.backend.limit_headroom(20);
+    assert!(write_net_config_like(&mut nvs, &vec![b'b'; NET_CONFIG_MAX_LEN]).is_err());
+    assert_eq!(nvs.backend.get("net_config").unwrap(), vec![b'a'; NET_CONFIG_MAX_LEN]);
 }
 
 #[test]

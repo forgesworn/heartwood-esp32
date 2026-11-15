@@ -764,7 +764,7 @@ fn connect_app_label(params: &[Value]) -> String {
 /// the tree root — use it directly. In Bunker mode the stored secret is a raw
 /// nsec, so apply the intermediate HMAC to produce the tree root on demand.
 /// The returned bytes are wrapped in `Zeroizing` for automatic cleanup.
-fn derivation_secret(
+pub(crate) fn derivation_secret(
     master_secret: &[u8; 32],
     master_mode: MasterMode,
 ) -> Result<zeroize::Zeroizing<[u8; 32]>, &'static str> {

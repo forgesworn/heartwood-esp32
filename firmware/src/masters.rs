@@ -239,6 +239,59 @@ pub fn add_master(
     Ok(slot)
 }
 
+/// Restore only into the exact next empty slot. The count is the publication
+/// boundary: clear stale authority, write and verify the whole raw identity,
+/// then commit the count atomically. A cut before it leaves the old slot set.
+pub fn add_wrapped_master(
+    nvs: &mut EspNvs<NvsDefault>,
+    destination: u8,
+    secret: &[u8; 32],
+    label: &str,
+    pubkey: &[u8; 32],
+) -> Result<(), &'static str> {
+    let count = read_master_count_strict(nvs)?;
+    if destination != count || count >= MAX_MASTERS {
+        return Err("destination is not the next empty slot");
+    }
+    // No session-held encryption key exists for installing a newly sealed
+    // seed. Like normal provisioning, refuse rather than write plaintext next
+    // to encrypted seeds. Malformed blobs and read errors fail closed too.
+    for slot in 0..count {
+        if nvs
+            .blob_len(&secret_enc_key(slot))
+            .map_err(|_| "could not inspect at-rest state")?
+            .is_some()
+        {
+            return Err(
+                "at-rest encryption active: clear the PIN/vault key before adding an identity",
+            );
+        }
+    }
+    clear_slot_bundle(nvs, destination)?;
+    let prefix = format!("master_{destination}");
+    for (suffix, value) in [
+        ("secret", secret.as_slice()),
+        ("label", label.as_bytes()),
+        ("mode", &[0u8][..]),
+        ("deriv", &[0u8][..]),
+        ("pubkey", pubkey.as_slice()),
+    ] {
+        let key = format!("{prefix}_{suffix}");
+        nvs.replace_blob(&key, value)
+            .map_err(|_| "failed to store wrapped identity")?;
+        let mut check = zeroize::Zeroizing::new([0u8; 32]);
+        match nvs.get_blob(&key, check.as_mut()) {
+            Ok(Some(stored)) if stored == value => {}
+            _ => return Err("wrapped identity read-back failed"),
+        }
+    }
+    write_master_count(nvs, count + 1)?;
+    if read_master_count_strict(nvs)? != count + 1 {
+        return Err("wrapped slot commit failed");
+    }
+    Ok(())
+}
+
 /// Remove a master and shift every associated slot-indexed record down with it.
 /// A durable cursor is written before the first mutation and after every
 /// idempotent step. Boot calls `resume_pending_removal` before loading any

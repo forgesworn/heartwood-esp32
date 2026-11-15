@@ -499,6 +499,108 @@ pub mod engine;
 pub mod personas;
 #[path = "../../firmware/src/masters.rs"]
 pub mod masters;
+
+#[test]
+fn wrapped_restore_publishes_only_complete_unapproved_raw_slot() {
+    use heartwood_common::types::MasterMode;
+    let mut nvs = EspNvs {
+        backend: NvsDefault::new(),
+    };
+    nvs.backend.seed("master_count", &[1]);
+    nvs.backend.seed("master_0_secret", &[0x11; 32]);
+    for key in ["master_1_op", "connslots_1", "policy_1", "m1_seed_enc"] {
+        nvs.backend.seed(key, b"stale authority");
+    }
+    masters::add_wrapped_master(&mut nvs, 1, &[0x22; 32], "imported", &[0x33; 32]).unwrap();
+    assert_eq!(nvs.backend.get("master_count"), Some(vec![2]));
+    assert_eq!(nvs.backend.get("master_1_secret"), Some(vec![0x22; 32]));
+    assert_eq!(
+        nvs.backend.get("master_1_mode"),
+        Some(vec![MasterMode::Bunker as u8])
+    );
+    for key in ["master_1_op", "connslots_1", "policy_1", "m1_seed_enc"] {
+        assert!(!nvs.backend.contains(key));
+    }
+    assert!(
+        masters::add_wrapped_master(&mut nvs, 1, &[0x44; 32], "overwrite", &[0x55; 32]).is_err()
+    );
+    assert_eq!(nvs.backend.get("master_1_secret"), Some(vec![0x22; 32]));
+}
+
+#[test]
+fn wrapped_restore_faults_never_publish_a_partial_slot() {
+    for key in [
+        "master_1_secret",
+        "master_1_label",
+        "master_1_mode",
+        "master_1_deriv",
+        "master_1_pubkey",
+        "master_count",
+    ] {
+        for kind in [
+            FaultKind::WriteFailBeforeCommit,
+            FaultKind::WriteCommitsWithError,
+        ] {
+            let mut nvs = EspNvs {
+                backend: NvsDefault::new(),
+            };
+            nvs.backend.seed("master_count", &[1]);
+            nvs.backend.seed("master_0_secret", &[0x11; 32]);
+            nvs.backend.fail_once(NvsOp::SetBlob, key, kind);
+            let _ = masters::add_wrapped_master(&mut nvs, 1, &[0x22; 32], "imported", &[0x33; 32]);
+            assert_eq!(nvs.backend.get("master_0_secret"), Some(vec![0x11; 32]));
+            if nvs.backend.get("master_count") == Some(vec![2]) {
+                assert_eq!(nvs.backend.get("master_1_secret"), Some(vec![0x22; 32]));
+                assert_eq!(
+                    nvs.backend.get("master_1_label"),
+                    Some(b"imported".to_vec())
+                );
+                assert_eq!(nvs.backend.get("master_1_mode"), Some(vec![0]));
+                assert_eq!(nvs.backend.get("master_1_deriv"), Some(vec![0]));
+                assert_eq!(nvs.backend.get("master_1_pubkey"), Some(vec![0x33; 32]));
+            } else {
+                assert_eq!(nvs.backend.get("master_count"), Some(vec![1]));
+            }
+        }
+    }
+}
+
+#[test]
+fn wrapped_restore_refuses_unreadable_protection_stale_authority_and_bad_readback() {
+    for (op, key, fault) in [
+        (NvsOp::BlobLen, "m0_seed_enc", FaultKind::ReadError),
+        (NvsOp::Remove, "master_1_op", FaultKind::RemoveFail),
+        (
+            NvsOp::GetBlob,
+            "master_1_secret",
+            FaultKind::CorruptReadBackOnce,
+        ),
+    ] {
+        let mut nvs = EspNvs {
+            backend: NvsDefault::new(),
+        };
+        nvs.backend.seed("master_count", &[1]);
+        nvs.backend.seed("master_0_secret", &[0x11; 32]);
+        nvs.backend.seed("master_1_op", b"stale authority");
+        nvs.backend.fail_once(op, key, fault);
+        assert!(
+            masters::add_wrapped_master(&mut nvs, 1, &[0x22; 32], "imported", &[0x33; 32]).is_err()
+        );
+        assert_eq!(nvs.backend.get("master_count"), Some(vec![1]));
+        assert_eq!(nvs.backend.get("master_0_secret"), Some(vec![0x11; 32]));
+    }
+    let mut nvs = EspNvs {
+        backend: NvsDefault::new(),
+    };
+    nvs.backend.seed("master_count", &[1]);
+    nvs.backend.seed("m0_seed_enc", b"sealed seed");
+    assert!(
+        masters::add_wrapped_master(&mut nvs, 1, &[0x22; 32], "imported", &[0x33; 32]).is_err()
+    );
+    assert_eq!(nvs.backend.get("master_count"), Some(vec![1]));
+    assert!(!nvs.backend.contains("master_1_secret"));
+}
+
 use engine::{PolicyEngine, RevocationSave};
 use personas::AvatarRoom::{Drop, Keep};
 

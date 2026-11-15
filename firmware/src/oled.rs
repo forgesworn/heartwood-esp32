@@ -1020,6 +1020,31 @@ fn show_status_card(
     }
 }
 
+/// Show the exact shared wrapped-account approval renderer.
+pub fn show_wrapped_approval(
+    display: &mut Display<'_>,
+    action: &str,
+    root_title: &str,
+    root_npub: &str,
+    target_npub: &str,
+    remaining: u32,
+    page: usize,
+    armed: bool,
+) {
+    display.clear_buffer();
+    crate::wrapped_card::draw(
+        display,
+        action,
+        root_title,
+        root_npub,
+        target_npub,
+        remaining,
+        page,
+        armed,
+    );
+    display.flush().ok();
+}
+
 /// Neutral, amber confirmation screen for a normal settings change. A network
 /// or operator update is not an error, so it must not use the red fault screen.
 /// `total_secs` is the caller's approval-window length, so the countdown bar

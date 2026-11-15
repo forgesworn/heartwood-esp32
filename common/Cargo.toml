@@ -23,6 +23,7 @@ hkdf = { version = "0.12", default-features = false, optional = true }
 base64 = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
 chacha20 = { version = "0.9", default-features = false, optional = true }
 aes = { version = "0.8", default-features = false, optional = true }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"], optional = true }
 cbc = { version = "0.1", default-features = false, features = ["alloc", "block-padding"], optional = true }
 # BIP-39 wordlist + PBKDF2 seed for on-device phrase entry/generation. The BIP-32
 # step is hand-rolled (derive::backend::tweak_add) to avoid the bip32 crate's
@@ -77,6 +78,7 @@ nip46 = ["dep:serde", "dep:serde_json"]
 std = ["serde_json?/std"]
 nip44 = ["dep:chacha20", "dep:hkdf", "dep:base64"]
 nip04 = ["dep:aes", "dep:cbc", "dep:base64"]
+wrapped-nsec = ["dep:aes-gcm", "dep:aes", "aes/zeroize", "dep:hkdf", "dep:base64", "dep:serde", "dep:serde_json"]
 # On-device recovery-phrase entry/derivation (BIP-39 mnemonic -> BIP-32 tree root).
 # Backend-agnostic: the BIP-32 scalar step goes through derive::backend::tweak_add,
 # so it derives the same key on either curve backend. bip39 is used with ZERO of
@@ -103,4 +105,4 @@ device-identity = ["dep:ed25519-compact"]
 # PIN-derived seed encryption at rest (P5). Pulls PBKDF2 + reuses chacha20.
 seed-encrypt = ["dep:pbkdf2", "dep:chacha20", "dep:hkdf"]
 # Convenience alias for secp256k1 backend with full feature set (used by firmware)
-firmware = ["compact-hashes", "secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen", "ota-sign", "seed-encrypt", "cash"]
+firmware = ["compact-hashes", "secp256k1-backend", "nip46", "nip44", "nip04", "mnemonic-gen", "ota-sign", "seed-encrypt", "cash", "wrapped-nsec"]

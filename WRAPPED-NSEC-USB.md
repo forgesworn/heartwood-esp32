@@ -59,6 +59,8 @@ Only mode-0 targets can be wrapped. Fresh salt and nonce come from the device's
 strong RNG after its boot self-test; the host cannot supply either. RustCrypto
 AES-256-GCM/HKDF implement the frozen format, with the existing secp256k1 backend
 on the device. Owned key, payload and read-back buffers zeroise on drop.
+AES, GHASH and POLYVAL erasure features are enabled explicitly: AES-GCM's
+own `zeroize` feature does not enable all retained authenticator erasure.
 
 Restore refuses existing master or persona npubs and accepts only the next
 empty master slot. It clears that slot's complete stale bundle, including

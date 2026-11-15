@@ -1144,6 +1144,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -1244,9 +1245,11 @@ dependencies = [
  "cbc",
  "chacha20",
  "ed25519-compact",
+ "ghash",
  "hkdf",
  "hmac",
  "pbkdf2",
+ "polyval",
  "secp256k1",
  "serde",
  "serde_json",
@@ -1696,6 +1699,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]

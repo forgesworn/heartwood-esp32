@@ -4231,16 +4231,24 @@ The owner's T-Display (beta.38, one master, six pairings, `get_status` about
    FIRMWARE_INFO (USB): record the `nvs` figures (available is free less one
    page, 126 entries) and `nvs_blobs`. Expected: `largest_hot_key`
    `connslots_0`, `avatars` `{}`. Record `largest_hot`: at 4,993 bytes or
-   more step 2 should be accepted, below that it is refused. Nothing here
-   reads NVS beyond what the board reports.
+   more step 2 should be accepted, below that it is refused. If
+   `largest_hot_key` is anything else, record the key and length: the field
+   then does not give the `connslots_0` length, so make no prediction and
+   record step 2's outcome as it comes. Nothing here reads NVS beyond what
+   the board reports.
 2. Re-provision the 48x48 picture from Sapwood: ACK, the npub screen shows it,
    colours close to the source with the RGB332 steps already seen on section
    45's screens. Record available entries after: the model predicts 75 or
    76 fewer, so about 100 left (the gate charged it 91 before the write).
-   `nvs_blobs.avatars` reads `{"0":2308}`. If a Sapwood build that sends
-   RGB332 (the #278 draft) is to hand, send the same picture that way
-   (2,304 pixel bytes): ACK, the same 2,308 stored, and a 2,303- or
-   2,305-byte picture is refused with the picture kept.
+   `nvs_blobs.avatars` reads `{"0":2308}`. Optional, if the #278 Sapwood
+   draft is to hand (it sends RGB332 over the cable only): send the same
+   picture that way (2,304 pixel bytes): ACK, the same 2,308 stored. The
+   refusal half needs #278's `scripts/identity-meta-params.mjs`, which is
+   not on this branch; run it from a checkout of `feat/avatar-rgb332`
+   through `scripts/mgmt-request.mjs` over the relay, with
+   `--format rgb332 --size 48 --bytes 2303`, then `--bytes 2305`: both
+   refused, the picture kept. Without that checkout, skip the refusal half;
+   the host tests cover it.
    If it is refused with the same `storage_full` text, record the free entries
    and the table length: the table is shorter than 4,993 bytes, and freeing one
    pairing will not help (the band 3,489 to 5,120 bytes refuses it too).

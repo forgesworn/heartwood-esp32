@@ -224,15 +224,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Paused: heltec-v4 and heltec-v3 (xtensa-esp32s3-espidf, esp32s3,
+        # limit 2097152) are left out while work focuses on the T-Display.
+        # release.yml still builds every board. Restore both entries here.
         include:
-          - board: heltec-v4
-            target: xtensa-esp32s3-espidf
-            chip: esp32s3
-            limit: 2097152
-          - board: heltec-v3
-            target: xtensa-esp32s3-espidf
-            chip: esp32s3
-            limit: 2097152
           - board: tdisplay
             target: xtensa-esp32-espidf
             chip: esp32
@@ -318,6 +313,9 @@ jobs:
   # riscv32-esp-elf GCC for the C FFI (secp256k1-sys, esp-idf). The -fno-pic CFLAGS
   # fix lives in firmware/.cargo/config.toml. 4 MB single-OTA layout, 3 MB factory.
   firmware-build-c6:
+    # Paused while work focuses on the T-Display; release.yml still builds the
+    # C6. Remove this line to restore it.
+    if: false
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

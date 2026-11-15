@@ -29,9 +29,11 @@ jobs:
     strategy:
       fail-fast: true # a release is all-or-nothing — never publish a partial set
       matrix:
+        # Paused: heltec-v4 and heltec-v3 are not released while work focuses
+        # on the T-Display (their 2 MB slots have no room left). Restore:
+        #   - { board: heltec-v4, target: xtensa-esp32s3-espidf, chip: esp32s3, limit: 2097152, ota: true }
+        #   - { board: heltec-v3, target: xtensa-esp32s3-espidf, chip: esp32s3, limit: 2097152, ota: true }
         include:
-          - { board: heltec-v4, target: xtensa-esp32s3-espidf, chip: esp32s3, limit: 2097152, ota: true }
-          - { board: heltec-v3, target: xtensa-esp32s3-espidf, chip: esp32s3, limit: 2097152, ota: true }
           - { board: tdisplay, target: xtensa-esp32-espidf, chip: esp32, limit: 3145728, ota: false }
     runs-on: ubuntu-24.04
     steps:
@@ -408,7 +410,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          notes="Firmware ${GITHUB_REF_NAME} for every supported board. Each esp-idf board ships \`app-<board>.bin\` + \`bootloader-<board>.bin\` + \`partition-table-<board>.bin\`; the esp8266 ships a single \`app-esp8266.bin\` (flash at 0x0). Every app image carries an ed25519 release signature (\`app-<board>.bin.sig\`, also embedded in \`version.json\`) that signature-enforcing firmware verifies before installing an OTA. \`version.json\` describes them, including a per-board \`ota\` flag — heltec-v3/v4 are OTA-updatable (2 MB A/B), the T-Display/C6 are 4 MB factory (USB re-flash), the esp8266 has no OTA. The extra \`partition-table-heltec-v4-legacy-nvs-bigapp.bin\` is only for the explicit encrypted-backup migration in \`scripts/migrate-legacy-v4.mjs\`; it preserves that one development board's 24 KiB NVS and is not a fleet table. Pull into Sapwood with \`npm run sync:firmware\`."
+          notes="Firmware ${GITHUB_REF_NAME} for the T-Display, C6 and esp8266 (the Heltec V3 and V4 are paused for now; take them from beta.39). Each esp-idf board ships \`app-<board>.bin\` + \`bootloader-<board>.bin\` + \`partition-table-<board>.bin\`; the esp8266 ships a single \`app-esp8266.bin\` (flash at 0x0). Every app image carries an ed25519 release signature (\`app-<board>.bin.sig\`, also embedded in \`version.json\`) that signature-enforcing firmware verifies before installing an OTA. \`version.json\` describes them, including a per-board \`ota\` flag: the T-Display/C6 are 4 MB factory (USB re-flash), the esp8266 has no OTA. Pull into Sapwood with \`npm run sync:firmware\`."
           release_args=()
           case "$GITHUB_REF_NAME" in
             *-alpha.*)

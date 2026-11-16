@@ -83,7 +83,7 @@ use heartwood_common::types::{
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_GET_NET_CONFIG, FRAME_TYPE_NACK,
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PATCH_NET_CONFIG, FRAME_TYPE_PROVISION,
-    FRAME_TYPE_DERIVE_IDENTITY,
+    FRAME_TYPE_DERIVE_IDENTITY, FRAME_TYPE_WRAPPED_NSEC_CMD,
     FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_END, FRAME_TYPE_DISPLAY_FLIP,
     FRAME_TYPE_SET_BRIDGE_SECRET, FRAME_TYPE_SET_IDENTITY_META,
@@ -4892,6 +4892,13 @@ fn poll_usb_frame(
                 .is_some()
             {
                 reboot_after_state_change("identity derived");
+            }
+        }
+        FRAME_TYPE_WRAPPED_NSEC_CMD => {
+            if cable_card_refused(ctx) {
+                crate::protocol::write_frame(usb, FRAME_TYPE_NACK, b"approval on screen");
+            } else if crate::wrapped_nsec::handle(usb, &frame.payload, ctx.policy_engine.bridge_authenticated, ctx.nvs, ctx.masters, ctx.personas, ctx.display, ctx.buttons).is_some() {
+                reboot_after_state_change("wrapped identity restored");
             }
         }
         // 0x04 — remove a master. Routes through the same handler as the

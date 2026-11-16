@@ -566,6 +566,44 @@ fn wrapped_restore_faults_never_publish_a_partial_slot() {
 }
 
 #[test]
+fn wrapped_restore_requires_reload_after_an_uncertain_publication() {
+    for kind in [
+        FaultKind::WriteFailBeforeCommit,
+        FaultKind::WriteCommitsWithError,
+    ] {
+        let mut nvs = EspNvs {
+            backend: NvsDefault::new(),
+        };
+        nvs.backend.seed("master_count", &[1]);
+        nvs.backend.fail_once(NvsOp::SetBlob, "master_count", kind);
+        let error = masters::add_wrapped_master(&mut nvs, 1, &[0x22; 32], "imported", &[0x33; 32])
+            .unwrap_err();
+        // A failed acknowledgement cannot establish which master set is live.
+        // The cable handler must reload from durable state before serving again.
+        assert!(error.requires_reload());
+        let expected_count = if kind == FaultKind::WriteCommitsWithError {
+            2
+        } else {
+            1
+        };
+        assert_eq!(nvs.backend.get("master_count"), Some(vec![expected_count]));
+    }
+    let mut nvs = EspNvs {
+        backend: NvsDefault::new(),
+    };
+    nvs.backend.seed("master_count", &[1]);
+    nvs.backend.fail_once(
+        NvsOp::SetBlob,
+        "master_1_secret",
+        FaultKind::WriteCommitsWithError,
+    );
+    let error =
+        masters::add_wrapped_master(&mut nvs, 1, &[0x22; 32], "imported", &[0x33; 32]).unwrap_err();
+    assert!(!error.requires_reload());
+    assert_eq!(nvs.backend.get("master_count"), Some(vec![1]));
+}
+
+#[test]
 fn wrapped_restore_refuses_unreadable_protection_stale_authority_and_bad_readback() {
     for (op, key, fault) in [
         (NvsOp::BlobLen, "m0_seed_enc", FaultKind::ReadError),

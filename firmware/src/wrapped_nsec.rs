@@ -102,8 +102,20 @@ pub fn handle(
             );
             added
         }
-        Err(reason) => {
+        Err(error) => {
+            let reload = error.requires_reload();
+            let reason = if reload {
+                "restore outcome uncertain; signer restarting, reconnect and refresh identities"
+            } else {
+                error.reason()
+            };
             protocol::write_frame(usb, FRAME_TYPE_NACK, reason.as_bytes());
+            if reload {
+                // The count write may have committed. Never serve another
+                // command against a master set loaded before that publication.
+                esp_idf_hal::delay::FreeRtos::delay_ms(400);
+                unsafe { esp_idf_svc::sys::esp_restart() };
+            }
             None
         }
     }
@@ -117,9 +129,9 @@ fn execute(
     personas: &[crate::personas::LoadedPersona],
     display: &mut Display<'_>,
     buttons: &Buttons<'_>,
-) -> Result<(serde_json::Value, Option<LoadedMaster>), &'static str> {
+) -> Result<(serde_json::Value, Option<LoadedMaster>), masters::WrappedRestoreError> {
     if !authenticated {
-        return Err("bridge auth required");
+        return Err("bridge auth required".into());
     }
     let command = parse_command(payload)?;
     let root = selected(masters, command.root())?;
@@ -129,15 +141,15 @@ fn execute(
         WrappedCommand::Wrap { target, .. } => {
             let target = selected(masters, target)?;
             if target.mode != MasterMode::Bunker {
-                return Err("only raw-key slots can be wrapped");
+                return Err("only raw-key slots can be wrapped".into());
             }
             if !crate::entropy::rng_ok() {
-                return Err(crate::entropy::rng_refusal());
+                return Err(crate::entropy::rng_refusal().into());
             }
             let npub = encode_npub(&target.pubkey);
             confirm(display, buttons, "wrap", root, &npub, None)?;
             let record = wrap_nsec(&root_secret, &target.secret, |bytes| {
-                crate::fill_random_strong(bytes);
+                crate::fill_random(bytes);
                 Ok(())
             })?;
             // Verify the exact encrypted result on-chip before returning it.
@@ -170,13 +182,13 @@ fn execute(
             if masters.iter().any(|m| m.pubkey == restored.public_key)
                 || personas.iter().any(|p| p.pubkey == restored.public_key)
             {
-                return Err("identity already exists; no slot was overwritten");
+                return Err("identity already exists; no slot was overwritten".into());
             }
             if masters.len() != masters::read_master_count(nvs) as usize
                 || *destination as usize != masters.len()
                 || *destination >= masters::MAX_MASTERS
             {
-                return Err("destination changed: refresh the signer");
+                return Err("destination changed: refresh the signer".into());
             }
             confirm(
                 display,

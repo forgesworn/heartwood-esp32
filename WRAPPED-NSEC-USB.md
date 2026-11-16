@@ -58,7 +58,9 @@ semantics; the wrap code calls the same helper. Choosing another construction
 does not recover the record.
 
 Only mode-0 targets can be wrapped. Fresh salt and nonce come from the device's
-strong RNG after its boot self-test; the host cannot supply either. RustCrypto
+strong RNG after its boot self-test; the host cannot supply either. The draw
+uses the existing radio-aware `fill_random` helper in both operating tiers.
+RustCrypto
 AES-256-GCM/HKDF implement the frozen format, with the existing secp256k1 backend
 on the device. Owned key, payload and read-back buffers zeroise on drop.
 AES, GHASH and POLYVAL erasure features are enabled explicitly: AES-GCM's
@@ -71,6 +73,9 @@ display/receipt state. It writes and reads back the raw secret and public
 metadata before atomically publishing `master_count`. An interrupted restore
 leaves the previous visible slot set or the complete new raw slot. A lost
 commit acknowledgement may mean success: refresh/reboot, never overwrite.
+An error at or after count publication sends an uncertain-outcome NACK and
+reboots before another command can use the old in-memory master set. Errors
+before publication leave the old visible slots loaded.
 Host tests inject pre-commit failures, commits that return errors, unreadable
 protection state, failed authority cleanup and corrupted secret read-back.
 

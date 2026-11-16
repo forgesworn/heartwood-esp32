@@ -239,6 +239,32 @@ pub fn add_master(
     Ok(slot)
 }
 
+/// Publication errors require a reboot before any further operation can use
+/// the in-memory master set: the final write may have committed despite error.
+#[derive(Debug)]
+pub enum WrappedRestoreError {
+    Refused(&'static str),
+    ReloadRequired(&'static str),
+}
+
+impl WrappedRestoreError {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Refused(reason) | Self::ReloadRequired(reason) => reason,
+        }
+    }
+
+    pub fn requires_reload(&self) -> bool {
+        matches!(self, Self::ReloadRequired(_))
+    }
+}
+
+impl From<&'static str> for WrappedRestoreError {
+    fn from(reason: &'static str) -> Self {
+        Self::Refused(reason)
+    }
+}
+
 /// Restore only into the exact next empty slot. The count is the publication
 /// boundary: clear stale authority, write and verify the whole raw identity,
 /// then commit the count atomically. A cut before it leaves the old slot set.
@@ -248,10 +274,10 @@ pub fn add_wrapped_master(
     secret: &[u8; 32],
     label: &str,
     pubkey: &[u8; 32],
-) -> Result<(), &'static str> {
+) -> Result<(), WrappedRestoreError> {
     let count = read_master_count_strict(nvs)?;
     if destination != count || count >= MAX_MASTERS {
-        return Err("destination is not the next empty slot");
+        return Err("destination is not the next empty slot".into());
     }
     // No session-held encryption key exists for installing a newly sealed
     // seed. Like normal provisioning, refuse rather than write plaintext next
@@ -263,7 +289,8 @@ pub fn add_wrapped_master(
             .is_some()
         {
             return Err(
-                "at-rest encryption active: clear the PIN/vault key before adding an identity",
+                "at-rest encryption active: clear the PIN/vault key before adding an identity"
+                    .into(),
             );
         }
     }
@@ -282,12 +309,14 @@ pub fn add_wrapped_master(
         let mut check = zeroize::Zeroizing::new([0u8; 32]);
         match nvs.get_blob(&key, check.as_mut()) {
             Ok(Some(stored)) if stored == value => {}
-            _ => return Err("wrapped identity read-back failed"),
+            _ => return Err("wrapped identity read-back failed".into()),
         }
     }
-    write_master_count(nvs, count + 1)?;
-    if read_master_count_strict(nvs)? != count + 1 {
-        return Err("wrapped slot commit failed");
+    write_master_count(nvs, count + 1).map_err(WrappedRestoreError::ReloadRequired)?;
+    if read_master_count_strict(nvs).map_err(WrappedRestoreError::ReloadRequired)? != count + 1 {
+        return Err(WrappedRestoreError::ReloadRequired(
+            "wrapped slot commit failed",
+        ));
     }
     Ok(())
 }

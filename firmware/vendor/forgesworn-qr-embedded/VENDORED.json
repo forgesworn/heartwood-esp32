@@ -1,0 +1,20 @@
+{
+  "repository": "https://github.com/forgesworn/qr",
+  "base_commit": "e2aa7f2d6dab4cd7c5b234e507a7020c69b0df52",
+  "source_has_local_changes": false,
+  "package": "forgesworn-qr-embedded",
+  "version": "0.1.0",
+  "exporter_sha256_base64": "T9+riZvxn/k1FM9PVrgJ+1ylurIRLZ5wrBw4TCghJ/M=",
+  "files_sha256_base64": {
+    "Cargo.toml": "xI9U72JmdaD8khC+IQWYqJ9LYOHZV1JihiCOWluIOsA=",
+    "README.md": "H5XqMH7uw68llQRfmndORnK1gElkn1/4dzwBD3ufAgs=",
+    "LICENSE": "YntZDV8qJUcRw9XggkZ3Fp8dR1hhPkESDGALUNKo4Io=",
+    "SPEC.md": "UFE2j1J/aoHIjIFON5Smyge9PETAz3y6OygulCUFqvA=",
+    "src/lib.rs": "6LKzHHoHnEIEdGzA7Q3yccugr8IAMk3Um6DEAnDnibg=",
+    "src/tables.rs": "O/T9+dfySFG+PIOGgguMoU0Zj9kIiHul/v6jxwt+8T0="
+  },
+  "transformations": [
+    "Disable publication of the local snapshot and omit the release profile",
+    "Prefix README with snapshot context and localise its SPEC link"
+  ]
+}

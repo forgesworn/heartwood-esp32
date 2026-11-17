@@ -1,0 +1,21 @@
+[package]
+name = "heartwood-note-qr-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "../src/note_qr.rs"
+
+[features]
+default = []
+qr-compact = ["dep:forgesworn-qr-embedded"]
+qr-optimal = ["qr-compact", "forgesworn-qr-embedded/optimal"]
+
+[dependencies]
+qrcodegen-no-heap = "=1.8.1"
+forgesworn-qr-embedded = { version = "=0.1.0", path = "../vendor/forgesworn-qr-embedded", optional = true, default-features = false }
+zeroize = { version = "1", default-features = false }
+
+[dev-dependencies]
+heartwood-common = { path = "../../common", default-features = false, features = ["nip46", "secp256k1-backend"] }

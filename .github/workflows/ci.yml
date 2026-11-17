@@ -85,6 +85,12 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Check the opt-in note QR adapter and vendored source
+        run: |
+          python3 scripts/check-note-qr-vendor.py
+          cargo +stable test --locked --manifest-path firmware/qr-check/Cargo.toml --target-dir common/target --no-default-features
+          cargo +stable test --locked --manifest-path firmware/qr-check/Cargo.toml --target-dir common/target --features qr-compact
+          cargo +stable test --locked --manifest-path firmware/qr-check/Cargo.toml --target-dir common/target --features qr-optimal
       # Pass 1 — secp256k1 backend (the firmware's curve) + BIP-39 mnemonic/derive,
       # and LUD-25's note derivation on that same curve. `cash` has to run under
       # BOTH backends: it is the only path here with an unhardened level, so it

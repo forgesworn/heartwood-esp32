@@ -36,6 +36,10 @@ c6 = ["dep:qrcodegen-no-heap", "log/release_max_level_warn", "sha-accel"]
 # with no resume, so it leaves this off and keeps the pure-Rust path. See
 # firmware/src/sha_accel.rs and docs/2026-09-18-pbkdf2-cost-and-sha-acceleration.md.
 sha-accel = []
+# Opt-in encoder evaluation; normal board builds retain qrcodegen-no-heap.
+qr-compact = ["dep:forgesworn-qr-embedded"]
+# Mixed-mode planning uses extra caller memory only for colour-panel URLs.
+qr-optimal = ["qr-compact", "forgesworn-qr-embedded/optimal"]
 # BENCH ONLY. Corrupts one bit of every hardware compression so the boot-time
 # known-answer self-check fails, which is how HARDWARE-TEST-CHECKLIST section 25
 # exercises the mismatch path (log, fall back to software, never derive a key
@@ -84,6 +88,7 @@ embedded-graphics = "0.8"
 # Heap-free QR encoder for the physical bearer-note handover screen. The
 # bounded v2/v8 output buffers live on the stack and are scrubbed after use.
 qrcodegen-no-heap = { version = "1.8.1", optional = true }
+forgesworn-qr-embedded = { version = "=0.1.0", path = "vendor/forgesworn-qr-embedded", default-features = false, optional = true }
 
 # ST7789 colour TFT driver -- only compiled in for the `st7789` feature
 # (colour-panel boards). Mono-OLED Heltec builds never pull it in.

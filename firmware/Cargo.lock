@@ -1082,6 +1082,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "forgesworn-qr-embedded"
+version = "0.1.0"
+
+[[package]]
 name = "fs_at"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1268,6 +1272,7 @@ dependencies = [
  "embuild",
  "esp-idf-hal",
  "esp-idf-svc",
+ "forgesworn-qr-embedded",
  "heartwood-common",
  "hmac",
  "log",

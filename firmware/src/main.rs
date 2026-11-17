@@ -69,6 +69,8 @@ mod personas;
 mod nvs;
 mod nvs_stats;
 #[cfg(not(feature = "heltec-v3"))]
+mod note_qr;
+#[cfg(not(feature = "heltec-v3"))]
 mod offline_qr;
 mod cat_sprites;
 mod oled;

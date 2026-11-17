@@ -1,0 +1,27 @@
+[package]
+publish = false
+name = "forgesworn-qr-embedded"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+description = "Allocation-free no_std QR encoder with fixed caller-owned buffers and optional optimal text segmentation"
+readme = "README.md"
+repository = "https://github.com/forgesworn/qr"
+homepage = "https://forgesworn.github.io/qr/"
+documentation = "https://docs.rs/forgesworn-qr-embedded"
+keywords = ["qr", "qrcode", "no-std", "embedded", "encoder"]
+categories = ["encoding", "embedded", "no-std"]
+include = ["Cargo.toml", "Cargo.lock", "src/**", "README.md", "LICENSE", "SPEC.md"]
+autotests = false
+autoexamples = false
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+default = []
+optimal = []
+
+[dependencies]

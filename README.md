@@ -161,6 +161,11 @@ The wrapper script also writes a board-tagged ELF copy to
 builds) so you cannot accidentally flash the wrong binary onto the wrong
 hardware. `<board>` is the argument you passed (`v3`, `v4`, `tdisplay`, `c6`).
 
+The local [note QR encoder evaluation](docs/QR-ENCODER-EVALUATION.md) offers
+opt-in `qr-compact` and `qr-optimal` features for firmware comparison. Normal
+board builds retain the existing encoder; physical scan and stack acceptance
+remain pending for the experimental variants.
+
 ## Flash & provision
 
 ### Direct flash (USB cable to build machine)

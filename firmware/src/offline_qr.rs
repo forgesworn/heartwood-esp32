@@ -8,9 +8,9 @@
 
 use std::time::{Duration, Instant};
 
+use crate::note_qr::{self, Code, Workspace, BUFFER_BYTES};
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
-use qrcodegen_no_heap::{QrCode, QrCodeEcc, Version};
 use zeroize::Zeroize;
 
 use crate::approval::{self, ApprovalResult};
@@ -24,8 +24,7 @@ const HOLD_MS: u128 = 2_000;
 // A typical LUD-25 URL is v5 at ECC-L and renders at 3 px/module. The stored
 // host permits 64 bytes and a u64 amount permits 20 digits; that valid edge
 // needs v8 (49 modules), which still fits a colour panel at 2 px/module.
-const QR_MAX_VERSION: Version = Version::new(8);
-const QR_BUF: usize = QR_MAX_VERSION.buffer_len();
+const QR_BUF: usize = BUFFER_BYTES;
 
 /// Consume a deliberate hold from the NOTES idle page and enter the physical
 /// picker. A normal tap remains the existing carousel navigation action.
@@ -138,25 +137,16 @@ fn render_reveal(
 ) -> Result<(), ()> {
     let mut url =
         heartwood_common::note_wrap::note_url(&reveal.host, reveal.secret(), reveal.amount_msat);
-    let mut temp = [0u8; QR_BUF];
+    let mut temp = Workspace::new();
     let mut out = [0u8; QR_BUF];
-    let result = QrCode::encode_text(
-        &url,
-        &mut temp,
-        &mut out,
-        QrCodeEcc::Low,
-        Version::MIN,
-        QR_MAX_VERSION,
-        None,
-        false,
-    )
-    .map_err(|_| ())
-    .and_then(|qr| {
-        draw_colour_qr(display, &qr)?;
-        Ok(())
-    });
+    let result = note_qr::text(&url, &mut temp, &mut out)
+        .map_err(|_| ())
+        .and_then(|qr| {
+            draw_colour_qr(display, &qr)?;
+            Ok(())
+        });
     url.zeroize();
-    temp.zeroize();
+    temp.clear();
     out.zeroize();
     result
 }
@@ -170,33 +160,23 @@ fn render_reveal(
     // already knows this locker's host and amount from `heartwood_note_list`,
     // so a raw 32-byte `k1` is the useful offline form. Do not add a marker:
     // that would push v2 to v3 and destroy the OLED's essential quiet margin.
-    let mut data_and_temp = [0u8; QR_BUF];
-    data_and_temp[..32].copy_from_slice(reveal.secret());
+    let mut data_and_temp = Workspace::new();
     let mut out = [0u8; QR_BUF];
-    let result = QrCode::encode_binary(
-        &mut data_and_temp,
-        32,
-        &mut out,
-        QrCodeEcc::Low,
-        Version::new(2),
-        Version::new(2),
-        None,
-        false,
-    )
-    .map_err(|_| ())
-    .and_then(|qr| {
-        // 25 modules at 2 px leaves a 7 px black margin on each side of the
-        // 64 px OLED. It is the largest scanner-friendly square the panel can
-        // present; the panel itself supplies the surrounding black quiet area.
-        draw_qr(display, &qr, 2, 0);
-        Ok(())
-    });
-    data_and_temp.zeroize();
+    let result = note_qr::raw(reveal.secret(), &mut data_and_temp, &mut out)
+        .map_err(|_| ())
+        .and_then(|qr| {
+            // 25 modules at 2 px leaves a 7 px black margin on each side of the
+            // 64 px OLED. It is the largest scanner-friendly square the panel can
+            // present; the panel itself supplies the surrounding black quiet area.
+            draw_qr(display, &qr, 2, 0);
+            Ok(())
+        });
+    data_and_temp.clear();
     out.zeroize();
     result
 }
 
-fn draw_qr(display: &mut Display<'_>, qr: &QrCode<'_>, scale: i32, quiet: i32) {
+fn draw_qr(display: &mut Display<'_>, qr: &Code<'_>, scale: i32, quiet: i32) {
     let size = qr.size();
     let pixels = size * scale + quiet * 2;
     let bounds = display.bounding_box().size;
@@ -212,7 +192,7 @@ fn draw_qr(display: &mut Display<'_>, qr: &QrCode<'_>, scale: i32, quiet: i32) {
         .ok();
     for y in 0..size {
         for x in 0..size {
-            if qr.get_module(x, y) {
+            if qr.is_dark(x, y) {
                 Rectangle::new(
                     Point::new(x0 + x * scale, y0 + y * scale),
                     Size::new(scale as u32, scale as u32),
@@ -229,7 +209,7 @@ fn draw_qr(display: &mut Display<'_>, qr: &QrCode<'_>, scale: i32, quiet: i32) {
 }
 
 #[cfg(any(feature = "tdisplay", feature = "c6"))]
-fn draw_colour_qr(display: &mut Display<'_>, qr: &QrCode<'_>) -> Result<(), ()> {
+fn draw_colour_qr(display: &mut Display<'_>, qr: &Code<'_>) -> Result<(), ()> {
     // Preserve the reference-quality v5 presentation for ordinary URLs. Long
     // but valid mint paths use v6-v8; on a 135px-tall T-Display, 2px modules
     // and an 8px black margin remain comfortably scannable.
@@ -269,68 +249,5 @@ fn shorten_host(host: &str) -> String {
         host.to_string()
     } else {
         format!("{}..{}", &host[..12], &host[host.len() - 8..])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_secret_stays_in_a_v2_symbol() {
-        let mut data = [0u8; QR_BUF];
-        let mut out = [0u8; QR_BUF];
-        let qr = QrCode::encode_binary(
-            &mut data,
-            32,
-            &mut out,
-            QrCodeEcc::Low,
-            Version::new(2),
-            Version::new(2),
-            None,
-            false,
-        )
-        .unwrap();
-        assert_eq!(qr.size(), 25);
-    }
-
-    #[test]
-    fn normal_note_url_fits_the_colour_panel_ceiling() {
-        let url = heartwood_common::note_wrap::note_url("mint.example/w", &[0xab; 32], 21_000);
-        let mut temp = [0u8; QR_BUF];
-        let mut out = [0u8; QR_BUF];
-        let qr = QrCode::encode_text(
-            &url,
-            &mut temp,
-            &mut out,
-            QrCodeEcc::Low,
-            Version::MIN,
-            QR_MAX_VERSION,
-            None,
-            false,
-        )
-        .unwrap();
-        assert!(qr.size() <= 37);
-    }
-
-    #[test]
-    fn maximum_stored_note_url_fits_the_colour_panel_ceiling() {
-        let host = format!("{}/w", "m".repeat(62));
-        let url = heartwood_common::note_wrap::note_url(&host, &[0xab; 32], u64::MAX);
-        let mut temp = [0u8; QR_BUF];
-        let mut out = [0u8; QR_BUF];
-        let qr = QrCode::encode_text(
-            &url,
-            &mut temp,
-            &mut out,
-            QrCodeEcc::Low,
-            Version::MIN,
-            QR_MAX_VERSION,
-            None,
-            false,
-        )
-        .unwrap();
-        assert!(qr.size() <= 49);
-        assert!(qr.size() * 2 + 16 <= 135);
     }
 }

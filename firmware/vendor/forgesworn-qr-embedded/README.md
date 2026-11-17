@@ -9,9 +9,8 @@ encoder with fixed caller-owned buffers. It is a separate crate in the
 [SPEC.md](SPEC.md), standard tables and conformance vectors as the full encoder.
 It needs Rust 1.87 or newer and no allocator, operating system or display driver.
 
-Version 0.1.0 is prepared locally and has not yet been published to crates.io.
-Until publication, use the source path or the verified vendor exporter below.
-Once available, the package dependency is:
+Add the package to your application, or use the source path or verified vendor
+exporter below when working from a source checkout:
 
 ```toml
 [dependencies]
@@ -100,7 +99,7 @@ has been added as a dependency. Tests cover:
 The full QR APIs and vectors are unchanged. CI checks both feature
 configurations and the actual extracted crate, including a fresh dependency
 consumer and Rust 1.87 builds. The specification and standard-table copies
-must match their originals. Remote CI has not run for this branch.
+must match their originals.
 Library target builds need no ESP-IDF or connected board, using an installed
 Espressif Rust toolchain and its Rust sources:
 
@@ -216,5 +215,6 @@ Board latency, physical scanning and task high-water marks remain unmeasured.
 
 The separate `release-rust-embedded.yml` workflow checks an existing
 `embedded-v0.1.0` GitHub release tag, verifies the extracted package and defaults
-to a dry run. Initial registry setup and public publication are still pending.
+to a dry run. Initial publication requires bootstrap authentication; later
+releases use the crate's configured trusted publisher.
 It does not publish the full QR crate or change its release version.

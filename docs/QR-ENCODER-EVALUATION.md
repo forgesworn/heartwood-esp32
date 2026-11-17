@@ -4,7 +4,10 @@ Local experiment, 17 November 2026. Base Heartwood revision: `ef13faf` on the
 wrapped-account recovery branch. The separate embedded encoder is
 `forgesworn-qr-embedded` 0.1.0. Its current QR revision and runtime snapshot
 are recorded in `firmware/vendor/forgesworn-qr-embedded/VENDORED.json`. The
-new package and this firmware integration have not been published. The measurements
+library is published on [crates.io](https://crates.io/crates/forgesworn-qr-embedded/0.1.0)
+with [release artefacts and checks](https://github.com/forgesworn/qr/releases/tag/embedded-v0.1.0).
+The vendor snapshot pins the released QR revision `85aec980b5c29f53a3c6d94b38d352fbe7237e97`.
+This firmware integration remains unreleased and opt-in. The measurements
 below used the earlier `forgesworn-qr-embedded-prototype` 0.0.0 snapshot; their
 source and artefact hashes remain unchanged in the historical JSON record.
 They are not fresh size measurements of the renamed 0.1.0 package.
@@ -57,7 +60,8 @@ The upstream embedded crate checks all 82 applicable existing ZXing matrices and
 round trips, all version/level/mask combinations against the main encoder,
 capacity boundaries and allocations. Its bundled tables match the original
 encoder tables byte for byte. CI is configured for the three adapter host
-configurations; remote CI has not run for this local branch.
+configurations. [CI on the initial integration revision](https://github.com/forgesworn/heartwood-esp32/actions/runs/44090161232)
+passed all 12 executed jobs; the C6 job was skipped by its existing workflow condition.
 
 Refresh the vendor directory with the QR repository's
 `rust/embedded/vendor.py`, after running its conformance checks. The source

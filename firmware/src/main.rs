@@ -79,6 +79,8 @@ mod phone_unlock_cmd;
 mod policy;
 mod protocol;
 mod provision;
+mod wrapped_nsec;
+mod wrapped_card;
 mod release_key;
 mod serial;
 mod net_config_store;
@@ -123,7 +125,7 @@ use heartwood_common::types::{
     FRAME_TYPE_NIP46_REQUEST, FRAME_TYPE_NIP46_RESPONSE, FRAME_TYPE_OTA_BEGIN,
     FRAME_TYPE_OTA_CHUNK, FRAME_TYPE_OTA_FINISH, FRAME_TYPE_PIN_UNLOCK,
     FRAME_TYPE_PROVISION, FRAME_TYPE_PROVISION_LIST, FRAME_TYPE_PROVISION_REMOVE,
-    FRAME_TYPE_DERIVE_IDENTITY,
+    FRAME_TYPE_DERIVE_IDENTITY, FRAME_TYPE_WRAPPED_NSEC_CMD,
     FRAME_TYPE_GENERATE_IDENTITY, FRAME_TYPE_RESTORE_IDENTITY,
     FRAME_TYPE_FIRMWARE_INFO, FRAME_TYPE_FIRMWARE_INFO_RESPONSE,
     FRAME_TYPE_SESSION_ACK, FRAME_TYPE_SESSION_AUTH, FRAME_TYPE_SESSION_END, FRAME_TYPE_SET_BRIDGE_SECRET,
@@ -248,7 +250,7 @@ pub fn firmware_info_json(
     let phone_relays = pin::phone_relay_status(nvs, current_relays, unlock_phones);
     format!(
         "{{\"version\":\"{}\",\"board\":\"{}\",\"uptime_s\":{},\"last_reset\":\"{}\",\
-         \"rng\":\"{}\",\"rng_cause\":\"{}\",\
+         \"capabilities\":[\"wrapped_nsec_usb_v1\"],\"rng\":\"{}\",\"rng_cause\":\"{}\",\
          \"max_sign_bytes\":{},\"max_sign_bytes_object\":{},\
          \"free_heap\":{},\"largest_block\":{},\"display_flip\":{},\
          \"at_rest\":\"{}\",\"unlock_phone_count\":{},\"phone_relays\":\"{}\"{}{}{}{}}}",
@@ -1280,6 +1282,12 @@ fn main() {
                     &buttons,
                     &loaded_masters,
                 ) {
+                    loaded_masters.push(master);
+                }
+            }
+
+            FRAME_TYPE_WRAPPED_NSEC_CMD => {
+                if let Some(master) = wrapped_nsec::handle(&mut usb, &frame.payload, policy_engine.bridge_authenticated, &mut nvs, &loaded_masters, &loaded_personas, &mut display, &buttons) {
                     loaded_masters.push(master);
                 }
             }

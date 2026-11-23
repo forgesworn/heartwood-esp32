@@ -91,7 +91,7 @@ jobs:
       # is the only one that touches a compressed public key, and the two
       # backends compute that separately. A secret that differs between them is
       # a note one build of this firmware can spend and the other cannot.
-      - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen,cash
+      - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features mnemonic-gen,cash,wrapped-nsec
       # Pass 2 — k256 backend with the full data-plane crypto. Without this the
       # nip44/nip46/nip04/backup modules stay feature-gated OFF, so their tests
       # (the official NIP-44 vectors, NIP-04 round-trips, the synthetic nonce)
@@ -99,7 +99,7 @@ jobs:
       # scheme (the on-device verifier and the CI signer share this module).
       # std adds the list_clients one-buffer encoder and its heap measurement
       # (tests/list_clients_memory.rs).
-      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes,std
+      - run: cargo +stable test --manifest-path common/Cargo.toml --features nip44,nip46,nip04,ota-sign,device-identity,seed-encrypt,cash,compact-hashes,std,wrapped-nsec
       # Execute the actual private allocation custody source on the firmware's
       # C curve backend as well as k256 above; no hardware or signing API.
       - run: cargo +stable test --manifest-path common/Cargo.toml --no-default-features --features firmware allocation_root

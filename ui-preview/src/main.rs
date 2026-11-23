@@ -19,6 +19,8 @@ mod pixel8;
 mod bigtext;
 #[path = "../../firmware/src/network_screen.rs"]
 mod network_screen;
+#[path = "../../firmware/src/wrapped_card.rs"]
+mod wrapped_card;
 // Shared verbatim so its tests pin both holds (5 s FULL ACCESS, 2 s else).
 #[path = "../../firmware/src/card_hold.rs"]
 #[allow(dead_code)]
@@ -1036,11 +1038,22 @@ fn render(name: &str, w: u32, h: u32, draw: impl Fn(&mut SimulatorDisplay<Rgb565
 
 fn main() {
     std::fs::create_dir_all("out").unwrap();
+    let wrapped_only = std::env::args().any(|arg| arg == "--wrapped-only");
     let network_only = std::env::args().any(|arg| arg == "--network-only");
     let npub = "npub1sg6plzptd64u62a878hep2kev88swjh3tw00gjsfl8f237lmu63q0uf63m";
+    let wrapped_target = "npub1gekhljh9v0jukzdq6xrshdvqx3yqgctc0xs5jjw0yg597xaw8uns47vduw";
     let boards = [("heltec", 128u32, 64u32), ("tdisplay", 240, 135), ("c6", 172, 320), ("c6-landscape", 320, 172)];
 
     for (b, w, h) in boards {
+        if wrapped_only {
+            for page in 0..3 {
+                render(&format!("wrapped-restore-p{}-{b}", page + 1), w, h, |d| {
+                    wrapped_card::draw(d, "RESTORE RAW SLOT 7", "ROOT 0 MODE 1", npub, wrapped_target, 45, page, true)
+                });
+            }
+            continue;
+        }
+
         for (name, ssid, status, rssi) in [
             ("online", "BOTEL-MARINA", "online", Some(-58)),
             ("weak", "Pixel_4748", "online", Some(-83)),
@@ -1057,6 +1070,12 @@ fn main() {
             continue;
         }
         render(&format!("ready-{b}"), w, h, |d| draw_ready(d));
+        for page in 0..3 {
+            render(&format!("wrapped-restore-p{}-{b}", page + 1), w, h, |d| {
+                wrapped_card::draw(d, "RESTORE RAW SLOT 7", "ROOT 0 MODE 1", npub, wrapped_target, 45, page, true)
+            });
+        }
+
         // The FULL ACCESS card (one-hold pairing spec 4.2): every words page
         // at rest with the longest words, Extra careful once armed, then the
         // hold screen with a label past the panel's width.
@@ -1174,7 +1193,7 @@ fn main() {
         });
     }
 
-    if network_only {
+    if network_only || wrapped_only {
         return;
     }
 

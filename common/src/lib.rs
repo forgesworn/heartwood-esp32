@@ -27,6 +27,11 @@ pub mod task_stacks;
 pub mod types;
 pub mod validate;
 
+#[cfg(feature = "wrapped-nsec")]
+pub mod wrapped_nsec;
+#[cfg(feature = "wrapped-nsec")]
+pub mod wrapped_command;
+
 #[cfg(feature = "nip46")]
 pub mod backup;
 

@@ -3,7 +3,7 @@
 Hardware signing device for Nostr on a Heltec WiFi LoRa 32 (ESP32-S3). Both the V3 (CP2102 UART bridge) and V4 (native USB-Serial-JTAG) boards are supported from the same codebase via the `heltec-v3` / `heltec-v4` cargo features. See `firmware/src/serial.rs` for the transport abstraction. The operating mode is selected at runtime from the NVS network config (`NetConfig.mode`), not a build flag:
 
 - **USB-bridged mode** (default) — USB-attached to a Pi, holds master secrets, all radios disabled; the Pi handles networking.
-- **WiFi-standalone mode** (opt-in) — the ESP32 joins WiFi and talks to Nostr relays directly, running the full NIP-46 signing loop on-chip with no Pi. Enabled only when provisioned with an SSID + relay list; the USB cable stays fully live in parallel. See `firmware/src/relay.rs`.
+- **WiFi-standalone mode** (opt-in) — the ESP32 joins WiFi and talks to Nostr relays directly, running the full NIP-46 signing loop on-chip with no Pi. Enabled only when provisioned with an SSID + relay list; the USB cable stays fully live in parallel. See `firmware/src/relay.rs`. NIP-46 `switch_relays` answers that relay list, in order, to a client with a slot on the addressed identity, and `null` to anyone else, on a network-trial boot and on the USB paths (`nip46::switch_relays_result`; checklist section 47). It cannot carry a client across a change that drops every relay the client knows, so add a new relay before removing an old one.
 - **Portable mode** (roadmap, not built) — battery-powered, holds a child key, BLE for phone signing.
 
 ## Security model

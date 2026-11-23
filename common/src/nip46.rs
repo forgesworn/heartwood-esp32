@@ -1719,6 +1719,27 @@ pub fn build_result_response(request_id: &str, result: &str) -> Result<String, S
         .map_err(|e| format!("failed to serialise response: {e}"))
 }
 
+/// The `result` string of a NIP-46 `switch_relays` answer: the board's
+/// configured relays, in preference order, as a JSON array; or `null`, NIP-46's
+/// "nothing to change".
+///
+/// `null` is answered in three cases. A client with no slot on the addressed
+/// identity has no session to move. That rule is the board's own, not NIP-46's:
+/// it keeps the relay list to clients that were given it in their bunker URI.
+/// A network-trial boot is running candidate relays that roll back unless they
+/// are committed, so they are not handed out. And a board with no relays (the
+/// USB path, where heartwoodd owns the transport) has nothing to offer.
+///
+/// `null` goes out as the JSON text `null` in the result string, which is how
+/// a client reads a JSON-stringified result. An absent result would be a
+/// malformed answer rather than "nothing to change".
+pub fn switch_relays_result(relays: &[String], client_has_slot: bool, network_trial: bool) -> String {
+    if !client_has_slot || network_trial || relays.is_empty() {
+        return "null".to_string();
+    }
+    serde_json::to_string(relays).unwrap_or_else(|_| "null".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2540,6 +2561,46 @@ mod tests {
 
         assert!(Nip46Method::HeartwoodDerive.requires_tree_mode());
         assert!(!Nip46Method::SignEvent.requires_tree_mode());
+    }
+
+    #[test]
+    fn switch_relays_answers_the_configured_relays_in_order() {
+        let relays = vec![
+            "wss://relay.one.example".to_string(),
+            "wss://relay.two.example/path".to_string(),
+        ];
+        let result = switch_relays_result(&relays, true, false);
+        // A client reads the result string as JSON: the same relays, in preference order.
+        let decoded: Vec<String> = serde_json::from_str(&result).unwrap();
+        assert_eq!(decoded, relays);
+
+        // The whole answer is an ordinary result response carrying that string.
+        let response: serde_json::Value =
+            serde_json::from_str(&build_result_response("switch-1", &result).unwrap()).unwrap();
+        assert_eq!(response["id"], "switch-1");
+        assert!(response.get("error").is_none());
+        let carried: Vec<String> =
+            serde_json::from_str(response["result"].as_str().unwrap()).unwrap();
+        assert_eq!(carried, relays);
+    }
+
+    #[test]
+    fn switch_relays_answers_null_when_there_is_nothing_to_offer() {
+        let relays = vec!["wss://relay.one.example".to_string()];
+        // No slot on the addressed identity: no session to move.
+        assert_eq!(switch_relays_result(&relays, false, false), "null");
+        // A network-trial boot: its candidate relays may roll back.
+        assert_eq!(switch_relays_result(&relays, true, true), "null");
+        // No relays at all: the USB path, where heartwoodd owns the transport.
+        assert_eq!(switch_relays_result(&[], true, false), "null");
+
+        // "null" is a result a client parses to JSON null, never an error.
+        let response: serde_json::Value =
+            serde_json::from_str(&build_result_response("switch-2", "null").unwrap()).unwrap();
+        assert!(response.get("error").is_none());
+        let decoded: serde_json::Value =
+            serde_json::from_str(response["result"].as_str().unwrap()).unwrap();
+        assert!(decoded.is_null());
     }
 
     #[test]

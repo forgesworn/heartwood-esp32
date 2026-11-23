@@ -2620,9 +2620,14 @@ fn dispatch_inner(
         }
 
         "switch_relays" => {
-            // Non-standard method sent by some clients (e.g. Coracle).
-            // Return success to avoid blocking the handshake.
-            nip46::build_result_response(&request.id, "{}").unwrap_or_default()
+            // NIP-46: the signer's relays, or null for nothing to change. The
+            // relay loop answers it itself from its own relay list (relay.rs),
+            // so this arm serves only the USB paths, where heartwoodd or the
+            // cable owns the transport and the board has no relays to offer.
+            // Clients such as Coracle send it during their handshake, and a
+            // null result keeps that handshake working.
+            nip46::build_result_response(&request.id, &nip46::switch_relays_result(&[], false, false))
+                .unwrap_or_default()
         }
 
         "heartwood_capabilities" => {
@@ -3844,15 +3849,19 @@ mod tests {
         assert_eq!(paired["result"], secret);
     }
 
-    /// switch_relays is a non-standard method sent by Coracle during its
-    /// NIP-46 handshake. The handler must return a success response (not an
-    /// error) so the handshake can complete normally.
+    /// Coracle sends switch_relays during its NIP-46 handshake. On the USB
+    /// paths the handler must answer a success with NIP-46's "nothing to
+    /// change" (null), never an error, so that handshake completes normally.
     #[test]
     fn switch_relays_returns_success() {
         let request_id = "test-switch-relays-1";
 
         // Simulate what the handler does for the switch_relays arm.
-        let response_json = nip46::build_result_response(request_id, "{}").unwrap();
+        let response_json = nip46::build_result_response(
+            request_id,
+            &nip46::switch_relays_result(&[], false, false),
+        )
+        .unwrap();
 
         let parsed: serde_json::Value =
             serde_json::from_str(&response_json).expect("response should be valid JSON");
@@ -3869,8 +3878,8 @@ mod tests {
             "switch_relays must not return an error field"
         );
         assert_eq!(
-            parsed["result"], "{}",
-            "switch_relays result should be an empty JSON object string"
+            parsed["result"], "null",
+            "switch_relays result should be the JSON text null"
         );
     }
 }

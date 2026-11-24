@@ -8967,26 +8967,49 @@ fn handle_nip46_event(
     // for it closes that card.
     let waiting = full_access_waiting(ctx);
     let queue_busy = full_access_queue_busy(ctx);
-    let (dispatched, raced) = crate::nip46_handler::with_full_access_waiting(waiting, queue_busy, || {
-        crate::nip46_handler::dispatch(
-            request,
-            None,
-            None,
-            &signing_secret,
-            &label,
-            mode,
-            slot,
-            ctx.secp,
-            ctx.display,
-            ctx.buttons,
-            ctx.policy_engine,
-            ctx.identity_caches,
-            Some(&client_pubkey),
-            ctx.nvs,
-            ctx.personas,
-            crate::nip46_handler::ApprovalDecision::Deferred,
+    // NIP-46 switch_relays is answered here, from this loop's own relay list,
+    // which the shared handler never sees: the configured relays for a client
+    // with a slot on the addressed identity, "null" for anyone else and on a
+    // network-trial boot (nip46::switch_relays_result). A request the gate
+    // refused still goes to the handler, which answers "unauthorised" as
+    // before; otherwise nothing is skipped but the handler's USB-path answer.
+    let (dispatched, raced) = if request.method == "switch_relays"
+        && !matches!(tier, heartwood_common::policy::ApprovalTier::Denied)
+    {
+        let client_has_slot = ctx.policy_engine.find_slot_by_pubkey(slot, &ev.pubkey).is_some();
+        let result = nip46::switch_relays_result(
+            &ctx.relays,
+            client_has_slot,
+            ctx.network_trial_id.is_some(),
+        );
+        (
+            crate::nip46_handler::Dispatch::Answered(
+                nip46::build_result_response(&request.id, &result).unwrap_or_default(),
+            ),
+            false,
         )
-    });
+    } else {
+        crate::nip46_handler::with_full_access_waiting(waiting, queue_busy, || {
+            crate::nip46_handler::dispatch(
+                request,
+                None,
+                None,
+                &signing_secret,
+                &label,
+                mode,
+                slot,
+                ctx.secp,
+                ctx.display,
+                ctx.buttons,
+                ctx.policy_engine,
+                ctx.identity_caches,
+                Some(&client_pubkey),
+                ctx.nvs,
+                ctx.personas,
+                crate::nip46_handler::ApprovalDecision::Deferred,
+            )
+        })
+    };
     if raced {
         refuse_waiting_full_access(ctx);
     }

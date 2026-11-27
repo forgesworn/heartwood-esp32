@@ -1151,8 +1151,7 @@ fn relay_host(url: &str) -> &str {
     h.split(':').next().unwrap_or(h)
 }
 
-/// Two relay URLs naming the same endpoint, ignoring scheme case and a
-/// trailing slash. Used to decide whether a client's relay is already served.
+/// Compare caller-supplied and configured URLs for the same relay endpoint.
 fn same_relay(a: &str, b: &str) -> bool {
     relay_pins::same_relay(a, b)
 }
@@ -1218,6 +1217,24 @@ struct PinnedRelay {
     /// Not persisted: consecutive dial failures, drives the exponential backoff.
     #[serde(skip)]
     fails: u32,
+}
+
+impl PinnedRelay {
+    fn back_off(&mut self) -> Duration {
+        self.fails = self.fails.saturating_add(1);
+        let delay = (PINNED_BACKOFF * (1u32 << self.fails.min(6))).min(PINNED_BACKOFF_MAX);
+        self.next_attempt = Instant::now() + delay;
+        delay
+    }
+
+    fn connected(&mut self) {
+        self.fails = 0;
+        self.next_attempt = Instant::now();
+    }
+}
+
+fn pin_dial_ready(pinned: &[PinnedRelay], url: &str, now: Instant) -> bool {
+    !pinned.iter().any(|p| now < p.next_attempt && same_relay(&p.url, url))
 }
 
 /// The relay sessions OTHER than the one currently being pumped, plus the
@@ -1291,19 +1308,16 @@ fn prune_pinned(pinned: &mut Vec<PinnedRelay>, policy_engine: &PolicyEngine) -> 
     })
 }
 
-/// A session dropped: if a pin is on its relay, back that pin's redial off.
-/// Pinned or promoted (to the primary or a secondary) alike, once per drop
-/// (`relay_pins::pin_charged_by_drop`). A connect succeeded (fails reset
-/// then), so this counts one failure: flaky relays settle at ~30s.
-fn charge_pin_for_drop(pinned: &mut [PinnedRelay], s: &RelaySession) {
-    let charged = {
-        let urls: Vec<&str> = pinned.iter().map(|p| p.url.as_str()).collect();
-        relay_pins::pin_charged_by_drop(&urls, (&s.url, s.pinned))
-    };
-    if let Some(p) = charged.map(|i| &mut pinned[i]) {
-        p.fails = p.fails.saturating_add(1);
-        let delay = (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
-        p.next_attempt = Instant::now() + delay;
+/// Charge a failed dial or a dropped session to its pin, regardless of role.
+fn back_off_pin(pinned: &mut [PinnedRelay], url: &str) {
+    if let Some(p) = pinned.iter_mut().find(|p| same_relay(&p.url, url)) {
+        p.back_off();
+    }
+}
+
+fn reset_pin_retry(pinned: &mut [PinnedRelay], url: &str) {
+    if let Some(p) = pinned.iter_mut().find(|p| same_relay(&p.url, url)) {
+        p.connected();
     }
 }
 
@@ -1903,27 +1917,14 @@ pub fn run_wifi_standalone<'d, 'b>(
             }
         }
 
+        let on_trial = ctx.network_trial_id.is_some();
+
         // Ensure the primary session (rotates over the configured set).
         if !sessions.iter().any(|s| !s.pinned && !s.secondary) && Instant::now() >= primary_next {
-            // Same heap guard as the pinned dial below: a fresh mbedTLS
-            // session costs ~40-50KB and an allocation failure deep inside
-            // the TLS or WiFi stack can abort the chip rather than error.
-            // Skipping the dial keeps USB served; the relay-health watchdog
-            // bounds how long a heap this tight may keep the signer offline.
-            let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
-            let largest = unsafe {
-                esp_idf_svc::sys::heap_caps_get_largest_free_block(
-                    esp_idf_svc::sys::MALLOC_CAP_8BIT,
-                )
-            };
-            // Pass by a relay that refused us. When every one is cooling, dial
-            // the one whose cooldown ends soonest rather than none (no session
-            // at all is the relay-health watchdog's restart, which forgets
-            // every cooldown), but only once per COOLED_DIAL_SPACING.
-            // A pick already served by a live (pinned) session is promoted
-            // to the primary in place rather than dialled a second time
-            // (`heartwood_common::relay_pins::primary_step`). Its pin stays,
-            // so if it drops and the rotation moves on, the pin redials it.
+            // Skip pin retries that are still waiting. Apply relay refusal
+            // cooldowns to the remaining picks, with a spaced last-resort
+            // probe when every eligible endpoint is cooling.
+            let now = Instant::now();
             let step = {
                 let urls: Vec<&str> = relays.iter().map(String::as_str).collect();
                 let hosts: Vec<&str> = relays.iter().map(|r| relay_host(r)).collect();
@@ -1935,15 +1936,20 @@ pub fn run_wifi_standalone<'d, 'b>(
                     &ctx.relay_cooldowns,
                     relay_idx % relays.len(),
                     uptime_ms(),
+                    |url| pin_dial_ready(&pinned, url, now),
                 )
             };
-            let pick = match step {
-                relay_pins::PrimaryStep::Dial(p) => Some(p),
-                relay_pins::PrimaryStep::Promote { session, relay } => {
+            let (pick, replace_pin) = match step {
+                relay_pins::PrimaryStep::Dial(pick) => (Some(pick), None),
+                relay_pins::PrimaryStep::Promote { session, pick } if on_trial => {
+                    // The configured dial is the trial's reachability proof.
+                    (Some(pick), Some(session))
+                }
+                relay_pins::PrimaryStep::Promote { session, pick } => {
                     let promoted = &mut sessions[session];
                     promoted.pinned = false;
                     promoted.secondary = false;
-                    relay_idx = relay;
+                    relay_idx = pick.index;
                     log::info!(
                         "[relay] pinned {} takes over as the primary",
                         relay_host(&promoted.url)
@@ -1959,9 +1965,9 @@ pub fn run_wifi_standalone<'d, 'b>(
                     );
                     secondary_idx = relay_idx.wrapping_add(1);
                     secondary_next = Instant::now() + PRIMARY_BACKOFF;
-                    None
+                    (None, None)
                 }
-                relay_pins::PrimaryStep::Idle => None,
+                relay_pins::PrimaryStep::Idle => (None, None),
             };
             let all_cooling = pick.is_some_and(|p| p.all_cooling);
             if let Some(p) = pick {
@@ -1969,8 +1975,21 @@ pub fn run_wifi_standalone<'d, 'b>(
             }
             let cooled_wait = all_cooling
                 && last_cooled_dial.is_some_and(|t: Instant| t.elapsed() < COOLED_DIAL_SPACING);
+            if let Some(session) = replace_pin.filter(|_| !cooled_wait) {
+                // Release the existing socket before the trial's dial.
+                drop(sessions.remove(session));
+                retune_recv_timeouts(&mut sessions);
+            }
+            // A fresh mbedTLS session costs ~40-50 KB. Guard the dial to
+            // avoid an allocation abort inside the TLS or WiFi stack.
+            let free = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            let largest = unsafe {
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                    esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                )
+            };
             if pick.is_none() {
-                // Promoted a live session, or nothing is configured.
+                // Promoted a live session, or every pick is waiting to retry.
                 primary_next = Instant::now() + PRIMARY_BACKOFF;
             } else if cooled_wait {
                 primary_next = last_cooled_dial.map_or_else(Instant::now, |t| t + COOLED_DIAL_SPACING);
@@ -1983,7 +2002,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 if all_cooling {
                     last_cooled_dial = Some(Instant::now());
                     log::warn!(
-                        "[relay] every relay refused us recently; trying {} (its cooldown ends soonest)",
+                        "[relay] eligible relays refused us recently; trying {} (its cooldown ends soonest)",
                         relay_host(&relays[relay_idx % relays.len()])
                     );
                 }
@@ -2006,6 +2025,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 }
                 match connect_relay(&url, false, &mut ctx) {
                     Ok(s) => {
+                        reset_pin_retry(&mut pinned, &url);
                         ctx.relay_url = url;
                         sessions.push(s);
                         retune_recv_timeouts(&mut sessions);
@@ -2023,6 +2043,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                         );
                     }
                     Err(e) => {
+                        back_off_pin(&mut pinned, &url);
                         note_dial_refusal(&url, &e, &mut ctx);
                         log::error!("[relay] {e}; failing over in 3s");
                         let error_class = runtime_error_class(&e);
@@ -2043,10 +2064,15 @@ pub fn run_wifi_standalone<'d, 'b>(
         // A pinned relay is one a client needs; the secondary is only
         // redundancy. When a pinned relay is due and the secondary holds the
         // last slot, the secondary gives it back.
+        let pin_due = |p: &PinnedRelay, sessions: &[RelaySession], cooldowns: &RelayCooldowns| {
+            Instant::now() >= p.next_attempt
+                && !sessions.iter().any(|s| same_relay(&s.url, &p.url))
+                && !cooldowns.cooling(relay_host(&p.url), uptime_ms())
+                // During a trial the configured rotation opens these routes.
+                && !(on_trial && relays.iter().any(|url| same_relay(url, &p.url)))
+        };
         if sessions.len() >= MAX_SESSIONS
-            && pinned.iter().any(|p| {
-                Instant::now() >= p.next_attempt && !sessions.iter().any(|s| same_relay(&s.url, &p.url))
-            })
+            && pinned.iter().any(|p| pin_due(p, &sessions, &ctx.relay_cooldowns))
         {
             if let Some(pos) = sessions.iter().position(|s| s.secondary) {
                 let yielded = sessions.remove(pos);
@@ -2066,14 +2092,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             if sessions.len() >= MAX_SESSIONS || any_degraded {
                 break;
             }
-            if sessions.iter().any(|s| same_relay(&s.url, &p.url))
-                || Instant::now() < p.next_attempt
-            {
-                continue;
-            }
-            let cooling_ms = ctx.relay_cooldowns.remaining_ms(relay_host(&p.url), uptime_ms());
-            if cooling_ms > 0 {
-                p.next_attempt = Instant::now() + Duration::from_millis(cooling_ms);
+            if !pin_due(p, &sessions, &ctx.relay_cooldowns) {
                 continue;
             }
             // Same heap guard as the pairing-time dial: never let an automatic
@@ -2086,33 +2105,29 @@ pub fn run_wifi_standalone<'d, 'b>(
                 )
             };
             if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
-                p.fails = p.fails.saturating_add(1);
-                let delay = (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
+                let delay = p.back_off();
                 log::warn!(
                     "[relay] pinned {}: heap too tight for a second session (free {free} B, largest {largest} B); retry in {}s",
                     p.url,
                     delay.as_secs()
                 );
-                p.next_attempt = Instant::now() + delay;
                 continue;
             }
             match connect_relay(&p.url, true, &mut ctx) {
                 Ok(s) => {
                     log::info!("[relay] pinned relay joined: {}", p.url);
-                    p.fails = 0;
+                    p.connected();
                     sessions.push(s);
                     retune_recv_timeouts(&mut sessions);
                 }
                 Err(e) => {
                     note_dial_refusal(&p.url, &e, &mut ctx);
-                    p.fails = p.fails.saturating_add(1);
-                    let delay = (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
+                    let delay = p.back_off();
                     log::warn!(
                         "[relay] pinned {}: {e}; retry in {}s",
                         p.url,
                         delay.as_secs()
                     );
-                    p.next_attempt = Instant::now() + delay;
                 }
             }
         }
@@ -2140,11 +2155,13 @@ pub fn run_wifi_standalone<'d, 'b>(
             };
             // Never a cooling relay: the secondary is only redundancy, and the
             // primary already guarantees the board something to listen on.
+            let now = Instant::now();
             let now_ms = uptime_ms();
             let candidate = (0..relays.len())
                 .map(|k| (secondary_idx.wrapping_add(k)) % relays.len())
                 .find(|&k| {
                     !sessions.iter().any(|s| same_relay(&s.url, &relays[k]))
+                        && pin_dial_ready(&pinned, &relays[k], now)
                         && !ctx.relay_cooldowns.cooling(relay_host(&relays[k]), now_ms)
                 });
             if free < SECONDARY_MIN_FREE_HEAP || largest < SECONDARY_MIN_LARGEST_BLOCK {
@@ -2154,6 +2171,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                 let url = relays[k].clone();
                 match connect_secondary(&url, &mut ctx) {
                     Ok(s) => {
+                        reset_pin_retry(&mut pinned, &url);
                         log::info!(
                             "[relay] also listening on {} (relay {} of {})",
                             relay_host(&url),
@@ -2167,6 +2185,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                         ctx.network_runtime.secondary_index = u8::try_from(k).ok();
                     }
                     Err(e) => {
+                        back_off_pin(&mut pinned, &url);
                         note_dial_refusal(&url, &e, &mut ctx);
                         secondary_fails = secondary_fails.saturating_add(1);
                         let delay = (PINNED_BACKOFF * (1u32 << secondary_fails.min(6))).min(PINNED_BACKOFF_MAX);
@@ -2289,7 +2308,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                     i += 1;
                 }
                 Err(e) if s.secondary => {
-                    charge_pin_for_drop(&mut pinned, &s);
+                    back_off_pin(&mut pinned, &s.url);
                     secondary_fails = secondary_fails.saturating_add(1);
                     let delay = (PINNED_BACKOFF * (1u32 << secondary_fails.min(6))).min(PINNED_BACKOFF_MAX);
                     log::warn!("[relay] secondary {} dropped: {e}; next in {}s", relay_host(&s.url), delay.as_secs());
@@ -2299,7 +2318,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                     retune_recv_timeouts(&mut sessions);
                 }
                 Err(e) => {
-                    charge_pin_for_drop(&mut pinned, &s);
+                    back_off_pin(&mut pinned, &s.url);
                     if s.pinned {
                         log::warn!("[relay] pinned {} dropped: {e}", s.url);
                     } else {
@@ -10842,8 +10861,7 @@ fn dispatch_mgmt(
                     Some(p) => {
                         p.ms = master_slot;
                         p.si = index;
-                        p.next_attempt = Instant::now();
-                        p.fails = 0;
+                        p.connected();
                     }
                     None => pool.pinned.push(PinnedRelay {
                         url: ns.url.clone(),

@@ -12,21 +12,31 @@
 //! dialled and pinned, and dropping that pin on the next pass closed the
 //! app's relay straight after its ACK (2026-11-27).
 //!
-//! The primary rotation is unchanged by a pin: it picks as ever. When its
-//! pick is a relay a live pinned session already serves, that session is
-//! promoted to the primary in place (no second socket to one relay). The pin
-//! record stays, so if the promoted session later drops and the rotation
-//! moves on, the pin's own redial brings the app's relay back.
+//! The primary rotation shares the pin's retry deadline for a fresh dial.
+//! When its pick is a relay a live pinned session already serves, it can
+//! promote the session in place. The pin record stays so the app's relay
+//! can reconnect if the primary rotates away after a drop.
 
 use alloc::vec::Vec;
 
 use crate::relay_cooldown::{Pick, RelayCooldowns};
 
-/// Two relay URLs naming the same endpoint, ignoring case and a trailing
-/// slash. The relay loop's one comparison for "the same relay".
+/// Two relay URLs naming the same endpoint, ignoring case, a trailing
+/// slash, and the default WSS port on a root URL.
 pub fn same_relay(a: &str, b: &str) -> bool {
-    let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
-    norm(a) == norm(b)
+    fn endpoint(url: &str) -> &str {
+        let url = url.trim().trim_end_matches('/');
+        if url
+            .get(..6)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("wss://"))
+            && !url[6..].contains(['/', '?', '#'])
+        {
+            url.strip_suffix(":443").unwrap_or(url)
+        } else {
+            url
+        }
+    }
+    endpoint(a).eq_ignore_ascii_case(endpoint(b))
 }
 
 /// Drop the pins whose creating slot no longer exists (revoked). A pin's
@@ -38,33 +48,22 @@ pub fn prune_pins<P>(pins: &mut Vec<P>, slot_alive: impl Fn(&P) -> bool) -> bool
     pins.len() != before
 }
 
-/// Which pin, if any, a dropped session's failure is charged to (an index
-/// into `pin_urls`): the pin on the same relay. `dropped` is the session's
-/// URL and whether it was still flagged pinned when it dropped. The flag does
-/// not decide it: a pinned session promoted to the primary has it cleared,
-/// and its drops must still back the pin's redial off. One drop, one charge.
-pub fn pin_charged_by_drop(pin_urls: &[&str], dropped: (&str, bool)) -> Option<usize> {
-    let (url, _still_flagged_pinned) = dropped;
-    pin_urls.iter().position(|p| same_relay(p, url))
-}
-
 /// What the loop does about a missing primary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimaryStep {
     /// Dial the configured relay the rotation picked.
     Dial(Pick),
-    /// The picked relay (`relay`, an index into the configured set) already
-    /// has live session `session`: make that session the primary rather than
-    /// open a second socket to the same relay.
-    Promote { session: usize, relay: usize },
-    /// Nothing configured to serve.
+    /// The picked relay already has live session `session` to promote.
+    Promote { session: usize, pick: Pick },
+    /// No configured endpoint is eligible yet.
     Idle,
 }
 
 /// The primary's next step, with no primary live. `configured` are the
 /// relay URLs in rotation order and `hosts` their hosts (for the cooldowns);
 /// `live` are the URLs of the live sessions, all of them pinned or secondary
-/// since there is no primary. `start` is where the rotation stands.
+/// since there is no primary. `ready_to_dial` checks the pin retry deadline
+/// for a new connection.
 pub fn primary_step(
     configured: &[&str],
     hosts: &[&str],
@@ -72,18 +71,17 @@ pub fn primary_step(
     cooldowns: &RelayCooldowns,
     start: usize,
     now_ms: u64,
+    ready_to_dial: impl Fn(&str) -> bool,
 ) -> PrimaryStep {
-    let Some(pick) = cooldowns.pick(hosts, start, now_ms) else {
+    let live_for = |url: &str| live.iter().position(|l| same_relay(l, url));
+    let Some(pick) = cooldowns.pick_eligible(hosts, start, now_ms, |index| {
+        let url = configured[index];
+        ready_to_dial(url) || live_for(url).is_some()
+    }) else {
         return PrimaryStep::Idle;
     };
-    match live
-        .iter()
-        .position(|l| same_relay(l, configured[pick.index]))
-    {
-        Some(session) => PrimaryStep::Promote {
-            session,
-            relay: pick.index,
-        },
+    match live_for(configured[pick.index]) {
+        Some(session) => PrimaryStep::Promote { session, pick },
         None => PrimaryStep::Dial(pick),
     }
 }
@@ -118,53 +116,24 @@ mod tests {
         assert!(pins.is_empty());
     }
 
-    #[test]
-    fn a_promoted_session_dropping_charges_its_pin() {
-        // B was promoted from its pin to the primary (flag cleared) and
-        // dropped: the pin's backoff must still grow, or a flapping B is
-        // redialled at once, forever.
-        assert_eq!(pin_charged_by_drop(&[APP, B], (B, false)), Some(1));
-    }
-
-    #[test]
-    fn a_pinned_session_dropping_charges_its_pin_once() {
-        // One charge per drop, to the one pin on that relay.
-        assert_eq!(pin_charged_by_drop(&[B, APP], (B, true)), Some(0));
-        assert_eq!(pin_charged_by_drop(&[APP], (APP, true)), Some(0));
-    }
-
-    #[test]
-    fn a_drop_on_a_relay_with_no_pin_charges_nothing() {
-        assert_eq!(pin_charged_by_drop(&[B], (A, false)), None);
-        assert_eq!(pin_charged_by_drop(&[], (A, false)), None);
-    }
-
-    #[test]
-    fn a_drop_matches_its_pin_across_spellings() {
-        for dropped in [
-            "WSS://relay.primal.net/",
-            "wss://Relay.Primal.Net",
-            " wss://relay.primal.net/ ",
-        ] {
-            assert_eq!(
-                pin_charged_by_drop(&[APP, B], (dropped, false)),
-                Some(1),
-                "{dropped}"
-            );
-        }
-    }
-
     const A: &str = "wss://relay.ditto.pub";
     const B: &str = "wss://relay.primal.net";
     const C: &str = "wss://nostr.net";
     const APP: &str = "wss://relay.app.example";
+
+    fn rotation_pick(index: usize) -> Pick {
+        Pick {
+            index,
+            all_cooling: false,
+        }
+    }
 
     fn step(configured: &[&str], live: &[&str], c: &RelayCooldowns, start: usize) -> PrimaryStep {
         let hosts: Vec<&str> = configured
             .iter()
             .map(|u| u.trim_start_matches("wss://").trim_end_matches('/'))
             .collect();
-        primary_step(configured, &hosts, live, c, start, 10)
+        primary_step(configured, &hosts, live, c, start, 10, |_| true)
     }
 
     #[test]
@@ -176,16 +145,7 @@ mod tests {
             step(&[A, B], &[B], &c, 1),
             PrimaryStep::Promote {
                 session: 0,
-                relay: 1
-            }
-        );
-        // A trial whose candidate set is B alone: the pinned session is the
-        // primary, not a reason to have none.
-        assert_eq!(
-            step(&[B], &[B], &c, 0),
-            PrimaryStep::Promote {
-                session: 0,
-                relay: 0
+                pick: rotation_pick(1),
             }
         );
         // A refused us and is cooling: the rotation passes it by onto B.
@@ -195,7 +155,7 @@ mod tests {
             step(&[A, B], &[B], &c, 0),
             PrimaryStep::Promote {
                 session: 0,
-                relay: 1
+                pick: rotation_pick(1),
             }
         );
     }
@@ -207,16 +167,60 @@ mod tests {
             "WSS://relay.primal.net/",
             "wss://Relay.Primal.Net",
             " wss://relay.primal.net/ ",
+            "wss://relay.primal.net:443/",
         ] {
             assert_eq!(
                 step(&[A, B], &[APP, live], &c, 1),
                 PrimaryStep::Promote {
                     session: 1,
-                    relay: 1
+                    pick: rotation_pick(1),
                 },
                 "{live}"
             );
         }
+    }
+
+    #[test]
+    fn default_port_aliases_only_match_root_wss_urls() {
+        assert!(same_relay(B, "WSS://Relay.Primal.Net:443/"));
+        assert!(!same_relay(B, "wss://relay.primal.net:444/"));
+        assert!(!same_relay(B, "wss://relay.primal.net:443/other"));
+    }
+
+    #[test]
+    fn primary_waits_for_a_dropped_pins_retry_deadline() {
+        let c = RelayCooldowns::new();
+        let hosts = ["relay.primal.net", "relay.ditto.pub"];
+        let pin_ready_at = 30_000;
+        let pick = |configured: &[&str], hosts: &[&str], now_ms| {
+            primary_step(configured, hosts, &[], &c, 0, now_ms, |url| {
+                !same_relay(url, B) || now_ms >= pin_ready_at
+            })
+        };
+        assert_eq!(
+            pick(&[B, A], &hosts, 6_000),
+            PrimaryStep::Dial(rotation_pick(1))
+        );
+        assert_eq!(pick(&[B], &hosts[..1], 6_000), PrimaryStep::Idle);
+        assert_eq!(
+            pick(&[B, A], &hosts, pin_ready_at),
+            PrimaryStep::Dial(rotation_pick(0))
+        );
+    }
+
+    #[test]
+    fn cooldown_fallback_only_probes_a_relay_eligible_to_dial() {
+        let mut c = RelayCooldowns::new();
+        let hosts = ["relay.primal.net", "relay.ditto.pub"];
+        c.cool(hosts[0], Refusal::Throttled, 0);
+        c.cool(hosts[1], Refusal::Banned, 0);
+        assert_eq!(
+            primary_step(&[B, A], &hosts, &[], &c, 0, 10, |url| url != B),
+            PrimaryStep::Dial(Pick {
+                index: 1,
+                all_cooling: true
+            })
+        );
     }
 
     #[test]

@@ -165,20 +165,26 @@ impl RelayCooldowns {
     /// ends soonest (the earliest in rotation order on a tie). Never none, so
     /// the board always has something to dial. `None` only for no hosts.
     pub fn pick(&self, hosts: &[&str], start: usize, now_ms: u64) -> Option<Pick> {
+        self.pick_eligible(hosts, start, now_ms, |_| true)
+    }
+
+    /// Apply the same rotation and cooldown rules to eligible endpoints only.
+    pub(crate) fn pick_eligible(
+        &self,
+        hosts: &[&str],
+        start: usize,
+        now_ms: u64,
+        eligible: impl Fn(usize) -> bool,
+    ) -> Option<Pick> {
         let n = hosts.len();
-        if n == 0 {
-            return None;
-        }
-        let order = (0..n).map(|k| (start + k) % n);
+        let order = (0..n).map(|k| (start + k) % n).filter(|&i| eligible(i));
         if let Some(index) = order.clone().find(|&i| !self.cooling(hosts[i], now_ms)) {
             return Some(Pick {
                 index,
                 all_cooling: false,
             });
         }
-        let index = order
-            .min_by_key(|&i| self.remaining_ms(hosts[i], now_ms))
-            .unwrap_or(start % n);
+        let index = order.min_by_key(|&i| self.remaining_ms(hosts[i], now_ms))?;
         Some(Pick {
             index,
             all_cooling: true,

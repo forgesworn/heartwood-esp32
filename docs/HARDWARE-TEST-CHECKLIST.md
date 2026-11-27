@@ -4299,3 +4299,47 @@ The owner's T-Display (beta.38, one master, six pairings, `get_status` about
 On failure: record the reply, the `get_status` NVS figures before and after,
 and the `connslots_0` length; the threshold arithmetic is
 `nvs_budget::avatar_allowed`.
+
+## 47. NIP-46 switch_relays answers the configured relays (added 2026-11-23, NOT YET BENCH-RUN)
+
+Why: `switch_relays` answered `"{}"`, which no client can read as a relay list
+(Cambium rejects it as invalid), although `heartwood_capabilities` advertises
+the method. NIP-46 has the signer answer its relays, or `null` for nothing to
+change. The relay loop now answers from its own configured relays
+(`ctx.relays`, the list its bunker URIs carry), in preference order, to a
+client with a slot on the addressed identity. It answers `null` to a client
+without one, which is the board's own rule rather than NIP-46's, and on a
+network-trial boot, whose candidate relays roll back unless committed. The USB
+paths answer `null` too, since heartwoodd or the cable owns the transport
+there. Host tests: `nip46::switch_relays_result` in `common/src/nip46.rs`.
+
+What it does not do: carry a client across a relay change that removes every
+relay the client knows. The board restarts onto its new list and listens
+nowhere else (only the phone-unlock notice goes out on old relays). To move a
+board's relays, add the new relay first, let the apps check in, and remove the
+old one later.
+
+One board in WiFi mode with two configured relays, and the bench client
+`scripts/nip46-client.mjs`.
+
+1. Flash this image. Pair a bench client over the first relay only
+   (`--relay` set to it, `--method connect` with a slot secret), then send
+   `--method switch_relays --params '[]'` the same way. Expected: a result
+   string that parses to both configured relays, the first relay first, and
+   no error.
+2. Send the same from a fresh client key that has not run `connect`.
+   Expected: the result `"null"`, no error.
+3. Through heartwoodd or the cable, send `switch_relays`. Expected: `"null"`.
+4. Optional: stage and activate a Sapwood network change that adds a third
+   relay, and send `switch_relays` during the trial boot, before it commits.
+   Expected: `"null"`. After the commit: all three relays.
+5. Cambium 0.9.x paired with a one-relay URI: force-stop and reopen Cambium,
+   then tap Reconnect on the pairing. Cambium checks relays on a reconnect at
+   most once an hour per session, and reopening starts a new one. Expected: the
+   pairing then lists both relays.
+6. Coracle, logging in with the bunker URI. Expected: the handshake completes,
+   and Coracle then talks to the board on its configured relays (it switches
+   on any non-empty list).
+
+On failure: record the raw result string, the relay the request went out on,
+and whether the client had a slot (`list_clients`).

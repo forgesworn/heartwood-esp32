@@ -165,24 +165,38 @@ impl RelayCooldowns {
     /// ends soonest (the earliest in rotation order on a tie). Never none, so
     /// the board always has something to dial. `None` only for no hosts.
     pub fn pick(&self, hosts: &[&str], start: usize, now_ms: u64) -> Option<Pick> {
+        self.pick_except(hosts, start, now_ms, |_| false)
+    }
+
+    /// [`Self::pick`] for the primary, passing by every host for which
+    /// `served` is true: a relay that already has a live session (a pinned
+    /// one, joined at pairing) is served, and a second socket to it would
+    /// only spend the heap and the board's other slot. `None` when every host
+    /// is served, or for no hosts: the live sessions stand in for the primary.
+    pub fn pick_except(
+        &self,
+        hosts: &[&str],
+        start: usize,
+        now_ms: u64,
+        served: impl Fn(usize) -> bool,
+    ) -> Option<Pick> {
         let n = hosts.len();
         if n == 0 {
             return None;
         }
-        let order = (0..n).map(|k| (start + k) % n);
+        let order = (0..n).map(|k| (start + k) % n).filter(|&i| !served(i));
         if let Some(index) = order.clone().find(|&i| !self.cooling(hosts[i], now_ms)) {
             return Some(Pick {
                 index,
                 all_cooling: false,
             });
         }
-        let index = order
+        order
             .min_by_key(|&i| self.remaining_ms(hosts[i], now_ms))
-            .unwrap_or(start % n);
-        Some(Pick {
-            index,
-            all_cooling: true,
-        })
+            .map(|index| Pick {
+                index,
+                all_cooling: true,
+            })
     }
 
     /// Hosts cooling now, for status reporting.
@@ -349,6 +363,41 @@ mod tests {
                 all_cooling: true
             })
         );
+    }
+
+    #[test]
+    fn pick_except_never_returns_a_relay_already_served() {
+        // ditto, primal, nostr.net; primal already has a live (pinned)
+        // session. The rotation arriving at primal moves on past it.
+        let hosts = ["relay.ditto.pub", "relay.primal.net", "nostr.net"];
+        let served = |i: usize| i == 1;
+        let mut c = RelayCooldowns::new();
+        assert_eq!(
+            c.pick_except(&hosts, 1, 10, served),
+            Some(Pick {
+                index: 2,
+                all_cooling: false
+            })
+        );
+        // Every other relay cooling: still never the served one.
+        c.cool("relay.ditto.pub", Refusal::Throttled, 0);
+        c.cool("nostr.net", Refusal::Banned, 0);
+        assert_eq!(
+            c.pick_except(&hosts, 1, 10, served),
+            Some(Pick {
+                index: 0,
+                all_cooling: true
+            })
+        );
+        // Every relay served: nothing to dial.
+        assert_eq!(c.pick_except(&hosts, 0, 10, |_| true), None);
+        // Nothing served: the same answer as `pick`.
+        for start in 0..hosts.len() {
+            assert_eq!(
+                c.pick_except(&hosts, start, 10, |_| false),
+                c.pick(&hosts, start, 10)
+            );
+        }
     }
 
     #[test]

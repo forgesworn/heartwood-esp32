@@ -1278,24 +1278,17 @@ fn save_pinned(nvs: &mut EspNvs<NvsDefault>, pinned: &[PinnedRelay]) -> bool {
     }
 }
 
-/// Drop pinned relays whose creating slot no longer exists (revoked), and any
-/// duplicates of a configured relay (nothing to pin if the primary set covers
-/// it). Returns true when the list changed.
-fn prune_pinned(
-    pinned: &mut Vec<PinnedRelay>,
-    policy_engine: &PolicyEngine,
-    cfg_relays: &[String],
-) -> bool {
-    let before = pinned.len();
-    pinned.retain(|p| {
-        let slot_alive = policy_engine
+/// Drop pinned relays whose creating slot no longer exists (revoked). A pin on
+/// a configured relay is kept: the rotation serves one configured relay at a
+/// time, so the pin is what keeps the board on the relay its app named
+/// (`heartwood_common::relay_pins`). Returns true when the list changed.
+fn prune_pinned(pinned: &mut Vec<PinnedRelay>, policy_engine: &PolicyEngine) -> bool {
+    heartwood_common::relay_pins::prune_pins(pinned, |p| {
+        policy_engine
             .list_slots(p.ms)
             .iter()
-            .any(|s| s.slot_index == p.si);
-        let already_configured = cfg_relays.iter().any(|r| same_relay(r, &p.url));
-        slot_alive && !already_configured
-    });
-    pinned.len() != before
+            .any(|s| s.slot_index == p.si)
+    })
 }
 
 /// Bring up wifi and serve the relay forever. Never returns.
@@ -1537,7 +1530,7 @@ pub fn run_wifi_standalone<'d, 'b>(
     // Pinned relays joined at nostrconnect pairing, restored from NVS. Prune
     // entries whose creating slot has since been revoked over USB.
     let mut pinned = load_pinned(ctx.nvs);
-    if prune_pinned(&mut pinned, ctx.policy_engine, &relays) {
+    if prune_pinned(&mut pinned, ctx.policy_engine) {
         let _ = save_pinned(ctx.nvs, &pinned);
     }
     if !pinned.is_empty() {
@@ -1911,8 +1904,17 @@ pub fn run_wifi_standalone<'d, 'b>(
             // the one whose cooldown ends soonest rather than none (no session
             // at all is the relay-health watchdog's restart, which forgets
             // every cooldown), but only once per COOLED_DIAL_SPACING.
+            // Pass by a relay a live (pinned) session already serves, too:
+            // since a pin may sit on a configured relay, the rotation could
+            // otherwise open a second socket to it. When every configured
+            // relay is served, the pinned session stands in for the primary.
             let hosts: Vec<&str> = relays.iter().map(|r| relay_host(r)).collect();
-            let pick = ctx.relay_cooldowns.pick(&hosts, relay_idx % relays.len(), uptime_ms());
+            let pick = ctx.relay_cooldowns.pick_except(
+                &hosts,
+                relay_idx % relays.len(),
+                uptime_ms(),
+                |i| sessions.iter().any(|s| same_relay(&s.url, &relays[i])),
+            );
             drop(hosts);
             let all_cooling = pick.is_some_and(|p| p.all_cooling);
             if let Some(p) = pick {
@@ -1920,7 +1922,10 @@ pub fn run_wifi_standalone<'d, 'b>(
             }
             let cooled_wait = all_cooling
                 && last_cooled_dial.is_some_and(|t: Instant| t.elapsed() < COOLED_DIAL_SPACING);
-            if cooled_wait {
+            if pick.is_none() {
+                // Every configured relay already has a live session.
+                primary_next = Instant::now() + PRIMARY_BACKOFF;
+            } else if cooled_wait {
                 primary_next = last_cooled_dial.map_or_else(Instant::now, |t| t + COOLED_DIAL_SPACING);
             } else if free < DIAL_MIN_FREE_HEAP || largest < DIAL_MIN_LARGEST_BLOCK {
                 log::warn!(
@@ -2327,7 +2332,7 @@ pub fn run_wifi_standalone<'d, 'b>(
         // A revoke (relay or USB) may have orphaned a pinned relay: prune the
         // list when its creating slot is gone, and close any session whose pin
         // was dropped. Cheap (slots × pinned, pinned ≤ 1) so it runs each pass.
-        if prune_pinned(&mut pinned, ctx.policy_engine, &relays) {
+        if prune_pinned(&mut pinned, ctx.policy_engine) {
             let _ = save_pinned(ctx.nvs, &pinned);
         }
         let before = sessions.len();

@@ -62,6 +62,7 @@ use heartwood_common::mgmt;
 use heartwood_common::home_relay::{HomeAction, HomeReturn, HomeState};
 use heartwood_common::relay_auth::{self, RelayAuth};
 use heartwood_common::relay_cooldown::{self, RelayCooldowns};
+use heartwood_common::relay_pins;
 use heartwood_common::net_config::{
     apply_remote_net_config_patch, network_activation_source_allowed,
     network_commit_source_allowed, NetConfig, NetworkConfigTransactionParams, NetworkRuntimeError,
@@ -1153,8 +1154,7 @@ fn relay_host(url: &str) -> &str {
 /// Two relay URLs naming the same endpoint, ignoring scheme case and a
 /// trailing slash. Used to decide whether a client's relay is already served.
 fn same_relay(a: &str, b: &str) -> bool {
-    let norm = |u: &str| u.trim().trim_end_matches('/').to_ascii_lowercase();
-    norm(a) == norm(b)
+    relay_pins::same_relay(a, b)
 }
 
 /// One live relay connection: TLS + WS + subscription plus its keepalive
@@ -1283,7 +1283,7 @@ fn save_pinned(nvs: &mut EspNvs<NvsDefault>, pinned: &[PinnedRelay]) -> bool {
 /// time, so the pin is what keeps the board on the relay its app named
 /// (`heartwood_common::relay_pins`). Returns true when the list changed.
 fn prune_pinned(pinned: &mut Vec<PinnedRelay>, policy_engine: &PolicyEngine) -> bool {
-    heartwood_common::relay_pins::prune_pins(pinned, |p| {
+    relay_pins::prune_pins(pinned, |p| {
         policy_engine
             .list_slots(p.ms)
             .iter()
@@ -1904,18 +1904,49 @@ pub fn run_wifi_standalone<'d, 'b>(
             // the one whose cooldown ends soonest rather than none (no session
             // at all is the relay-health watchdog's restart, which forgets
             // every cooldown), but only once per COOLED_DIAL_SPACING.
-            // Pass by a relay a live (pinned) session already serves, too:
-            // since a pin may sit on a configured relay, the rotation could
-            // otherwise open a second socket to it. When every configured
-            // relay is served, the pinned session stands in for the primary.
-            let hosts: Vec<&str> = relays.iter().map(|r| relay_host(r)).collect();
-            let pick = ctx.relay_cooldowns.pick_except(
-                &hosts,
-                relay_idx % relays.len(),
-                uptime_ms(),
-                |i| sessions.iter().any(|s| same_relay(&s.url, &relays[i])),
-            );
-            drop(hosts);
+            // A pick already served by a live (pinned) session is promoted
+            // to the primary in place rather than dialled a second time
+            // (`heartwood_common::relay_pins::primary_step`). Its pin stays,
+            // so if it drops and the rotation moves on, the pin redials it.
+            let step = {
+                let urls: Vec<&str> = relays.iter().map(String::as_str).collect();
+                let hosts: Vec<&str> = relays.iter().map(|r| relay_host(r)).collect();
+                let live: Vec<&str> = sessions.iter().map(|s| s.url.as_str()).collect();
+                relay_pins::primary_step(
+                    &urls,
+                    &hosts,
+                    &live,
+                    &ctx.relay_cooldowns,
+                    relay_idx % relays.len(),
+                    uptime_ms(),
+                )
+            };
+            let pick = match step {
+                relay_pins::PrimaryStep::Dial(p) => Some(p),
+                relay_pins::PrimaryStep::Promote { session, relay } => {
+                    let promoted = &mut sessions[session];
+                    promoted.pinned = false;
+                    promoted.secondary = false;
+                    relay_idx = relay;
+                    log::info!(
+                        "[relay] pinned {} takes over as the primary",
+                        relay_host(&promoted.url)
+                    );
+                    ctx.relay_url = promoted.url.clone();
+                    ctx.network_runtime.relay_index = u8::try_from(relay_idx % relays.len()).ok();
+                    set_network_runtime(
+                        &mut ctx,
+                        NetworkRuntimeStage::Online,
+                        true,
+                        true,
+                        NetworkRuntimeError::None,
+                    );
+                    secondary_idx = relay_idx.wrapping_add(1);
+                    secondary_next = Instant::now() + PRIMARY_BACKOFF;
+                    None
+                }
+                relay_pins::PrimaryStep::Idle => None,
+            };
             let all_cooling = pick.is_some_and(|p| p.all_cooling);
             if let Some(p) = pick {
                 relay_idx = p.index;
@@ -1923,7 +1954,7 @@ pub fn run_wifi_standalone<'d, 'b>(
             let cooled_wait = all_cooling
                 && last_cooled_dial.is_some_and(|t: Instant| t.elapsed() < COOLED_DIAL_SPACING);
             if pick.is_none() {
-                // Every configured relay already has a live session.
+                // Promoted a live session, or nothing is configured.
                 primary_next = Instant::now() + PRIMARY_BACKOFF;
             } else if cooled_wait {
                 primary_next = last_cooled_dial.map_or_else(Instant::now, |t| t + COOLED_DIAL_SPACING);

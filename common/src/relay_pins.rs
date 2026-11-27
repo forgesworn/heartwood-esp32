@@ -38,6 +38,16 @@ pub fn prune_pins<P>(pins: &mut Vec<P>, slot_alive: impl Fn(&P) -> bool) -> bool
     pins.len() != before
 }
 
+/// Which pin, if any, a dropped session's failure is charged to (an index
+/// into `pin_urls`): the pin on the same relay. `dropped` is the session's
+/// URL and whether it was still flagged pinned when it dropped. The flag does
+/// not decide it: a pinned session promoted to the primary has it cleared,
+/// and its drops must still back the pin's redial off. One drop, one charge.
+pub fn pin_charged_by_drop(pin_urls: &[&str], dropped: (&str, bool)) -> Option<usize> {
+    let (url, _still_flagged_pinned) = dropped;
+    pin_urls.iter().position(|p| same_relay(p, url))
+}
+
 /// What the loop does about a missing primary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimaryStep {
@@ -106,6 +116,42 @@ mod tests {
         assert_eq!((pins[0].ms, pins[0].si), (1, 2));
         assert!(prune_pins(&mut pins, |_| false));
         assert!(pins.is_empty());
+    }
+
+    #[test]
+    fn a_promoted_session_dropping_charges_its_pin() {
+        // B was promoted from its pin to the primary (flag cleared) and
+        // dropped: the pin's backoff must still grow, or a flapping B is
+        // redialled at once, forever.
+        assert_eq!(pin_charged_by_drop(&[APP, B], (B, false)), Some(1));
+    }
+
+    #[test]
+    fn a_pinned_session_dropping_charges_its_pin_once() {
+        // One charge per drop, to the one pin on that relay.
+        assert_eq!(pin_charged_by_drop(&[B, APP], (B, true)), Some(0));
+        assert_eq!(pin_charged_by_drop(&[APP], (APP, true)), Some(0));
+    }
+
+    #[test]
+    fn a_drop_on_a_relay_with_no_pin_charges_nothing() {
+        assert_eq!(pin_charged_by_drop(&[B], (A, false)), None);
+        assert_eq!(pin_charged_by_drop(&[], (A, false)), None);
+    }
+
+    #[test]
+    fn a_drop_matches_its_pin_across_spellings() {
+        for dropped in [
+            "WSS://relay.primal.net/",
+            "wss://Relay.Primal.Net",
+            " wss://relay.primal.net/ ",
+        ] {
+            assert_eq!(
+                pin_charged_by_drop(&[APP, B], (dropped, false)),
+                Some(1),
+                "{dropped}"
+            );
+        }
     }
 
     const A: &str = "wss://relay.ditto.pub";

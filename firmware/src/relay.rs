@@ -1291,6 +1291,22 @@ fn prune_pinned(pinned: &mut Vec<PinnedRelay>, policy_engine: &PolicyEngine) -> 
     })
 }
 
+/// A session dropped: if a pin is on its relay, back that pin's redial off.
+/// Pinned or promoted (to the primary or a secondary) alike, once per drop
+/// (`relay_pins::pin_charged_by_drop`). A connect succeeded (fails reset
+/// then), so this counts one failure: flaky relays settle at ~30s.
+fn charge_pin_for_drop(pinned: &mut [PinnedRelay], s: &RelaySession) {
+    let charged = {
+        let urls: Vec<&str> = pinned.iter().map(|p| p.url.as_str()).collect();
+        relay_pins::pin_charged_by_drop(&urls, (&s.url, s.pinned))
+    };
+    if let Some(p) = charged.map(|i| &mut pinned[i]) {
+        p.fails = p.fails.saturating_add(1);
+        let delay = (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
+        p.next_attempt = Instant::now() + delay;
+    }
+}
+
 /// Bring up wifi and serve the relay forever. Never returns.
 #[allow(clippy::too_many_arguments)]
 pub fn run_wifi_standalone<'d, 'b>(
@@ -2273,6 +2289,7 @@ pub fn run_wifi_standalone<'d, 'b>(
                     i += 1;
                 }
                 Err(e) if s.secondary => {
+                    charge_pin_for_drop(&mut pinned, &s);
                     secondary_fails = secondary_fails.saturating_add(1);
                     let delay = (PINNED_BACKOFF * (1u32 << secondary_fails.min(6))).min(PINNED_BACKOFF_MAX);
                     log::warn!("[relay] secondary {} dropped: {e}; next in {}s", relay_host(&s.url), delay.as_secs());
@@ -2282,16 +2299,9 @@ pub fn run_wifi_standalone<'d, 'b>(
                     retune_recv_timeouts(&mut sessions);
                 }
                 Err(e) => {
+                    charge_pin_for_drop(&mut pinned, &s);
                     if s.pinned {
                         log::warn!("[relay] pinned {} dropped: {e}", s.url);
-                        if let Some(p) = pinned.iter_mut().find(|p| same_relay(&p.url, &s.url)) {
-                            // A connect succeeded (fails reset then), so this
-                            // counts one failure: flaky relays settle at ~30s.
-                            p.fails = p.fails.saturating_add(1);
-                            let delay =
-                                (PINNED_BACKOFF * (1u32 << p.fails.min(6))).min(PINNED_BACKOFF_MAX);
-                            p.next_attempt = Instant::now() + delay;
-                        }
                     } else {
                         log::error!("[relay] {e}; failing over in 3s");
                         let error_class = runtime_error_class(&e);
